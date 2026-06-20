@@ -50,6 +50,10 @@ Unlike traditional Git-based plugins, this tool interacts directly with the GitH
     -   **Branch**: Typically `main`.
 3.  **Sync Options**: Enable "Auto Sync" for the real-time experience.
 
+## ❓ FAQ
+
+For detailed information about synchronization mechanisms, incremental sync, and conflict resolution, please refer to our [FAQ Document](docs/FAQ.md).
+
 ---
 
 <a name="chinese"></a>
@@ -93,6 +97,10 @@ Unlike traditional Git-based plugins, this tool interacts directly with the GitH
     -   **Repo**: 您的私有笔记仓库名称。
     -   **Branch**: 默认为 `main`。
 3.  **Sync Options**: 开启“启用同步”即可享受实时同步体验。
+
+## ❓ 常见问题 (FAQ)
+
+关于同步机制、增量同步以及多设备冲突处理的详细说明，请参阅 [常见问题解答 (FAQ)](docs/FAQ.md)。
 
 ---
 
