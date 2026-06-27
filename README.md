@@ -55,6 +55,13 @@ Unlike traditional Git-based plugins, this tool interacts directly with the GitH
 Encrypted sync mode stores only non-secret format metadata in GitHub. Note contents, attachment bytes, filenames, and folder structure are encrypted before upload. Use the same passphrase on every device.
 
 Do not enable encrypted mode against a repository that already contains plaintext notes unless you are intentionally running a migration. The first encrypted version does not silently remove old plaintext files.
+### Encrypted Sync Controls
+
+- Manual sync runs a normal encrypted sync immediately.
+- Force push makes the encrypted remote match the local vault.
+- Force pull makes the local vault match the encrypted remote and can delete local files in sync scope.
+- Ignore regex rules match plaintext vault paths before encryption.
+- Files whose encrypted payload would exceed 50 MiB are stored as encrypted chunks.
 
 ## ❓ FAQ
 

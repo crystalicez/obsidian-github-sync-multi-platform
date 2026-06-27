@@ -9,7 +9,7 @@ import { ForeignRemoteError, WrongPassphraseError } from "./sync-errors";
 const DEFAULT_PBKDF2_ITERATIONS = 600000;
 
 export class EncryptedManifestStore {
-  constructor(private readonly github: GitHubClient, private readonly passphrase: string) {}
+  constructor(private readonly github: GitHubClient, private readonly passphrase: string, private readonly allowForeignInit: boolean = false) {}
 
   async loadOrCreate(): Promise<{ config: EncryptedRepoConfig; manifest: EncryptedManifest; manifestSha?: string; key: CryptoKey }> {
     const config = await this.loadOrCreateConfig();
@@ -41,7 +41,7 @@ export class EncryptedManifestStore {
     if (remoteConfig) return JSON.parse(GitHubClient.decodeContent(remoteConfig.content)) as EncryptedRepoConfig;
 
     const state = await classifyRemoteRepo(this.github);
-    if (state.kind === "foreign-nonempty") throw new ForeignRemoteError();
+    if (state.kind === "foreign-nonempty" && !this.allowForeignInit) throw new ForeignRemoteError();
     if (state.kind === "corrupt-plugin") throw new Error(state.message ?? "Encrypted repository metadata is corrupt.");
 
     const now = Date.now();

@@ -25,3 +25,11 @@ export function reportSyncError(operation: EncryptedSyncOperation, error: unknow
   console.error(`Encrypted ${operation} failed`, { path, error });
   new Notice(userMessageForSyncError(operation, error, path));
 }
+
+export function isForeignRemoteError(error: unknown): boolean {
+  return error instanceof ForeignRemoteError;
+}
+
+export function isWrongPassphraseError(error: unknown): boolean {
+  return error instanceof WrongPassphraseError;
+}

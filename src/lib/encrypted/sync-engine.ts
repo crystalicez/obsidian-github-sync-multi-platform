@@ -1,4 +1,4 @@
-import { Notice, TAbstractFile, TFile } from "obsidian";
+import { Modal, Notice, TAbstractFile, TFile } from "obsidian";
 import FastSync from "../../main";
 import { OBJECT_ID_BYTES } from "./constants";
 import { chooseConflictResolution, mergeTextContent } from "./conflicts";
@@ -6,7 +6,7 @@ import { compileIgnorePathRegex } from "./ignore";
 import { downloadEncryptedFileObject, uploadEncryptedFileObject } from "./large-objects";
 import { EncryptedManifestStore } from "./manifest-store";
 import { conflictPathFor, normalizeVaultPath } from "./paths";
-import { reportSyncError } from "./sync-errors";
+import { isForeignRemoteError, reportSyncError } from "./sync-errors";
 import { ConflictPolicy, EncryptedLocalFileState, EncryptedManifest, EncryptedObjectRecord, EncryptedSyncOperation } from "./types";
 import { deleteVaultFileIfExists, listEncryptedSyncCandidates, readVaultFileBytes, shouldSyncEncryptedFile, writeVaultFileBytes } from "./vault";
 import { randomBytes, sha256Hex, toBase64Url } from "./bytes";
@@ -35,8 +35,8 @@ function configuredIgnoreRules(plugin: FastSync) {
   return compileIgnorePathRegex((plugin.settings as { ignorePathRegex?: string }).ignorePathRegex ?? "");
 }
 
-async function loadStore(plugin: FastSync) {
-  const store = new EncryptedManifestStore(plugin.githubClient, requireEncryptedPassphrase(plugin));
+async function loadStore(plugin: FastSync, allowForeignInit: boolean = false) {
+  const store = new EncryptedManifestStore(plugin.githubClient, requireEncryptedPassphrase(plugin), allowForeignInit);
   return { store, ...(await store.loadOrCreate()) };
 }
 
@@ -56,13 +56,26 @@ export async function encryptedForcePull(plugin: FastSync): Promise<void> {
   return encryptedSync(plugin, { operation: "forcePull" });
 }
 
+async function promptForeignRemoteForcePush(plugin: FastSync): Promise<boolean> {
+  return new Promise(resolve => {
+    const modal = new Modal(plugin.app);
+    modal.titleEl.setText("Remote repository is not empty");
+    modal.contentEl.createEl("p", { text: "This repository does not look like it belongs to this encrypted sync plugin. Force push will initialize encrypted sync metadata and may overwrite remote encrypted state managed by this plugin." });
+    const buttons = modal.contentEl.createDiv();
+    buttons.createEl("button", { text: "Cancel" }).onclick = () => { modal.close(); resolve(false); };
+    const confirm = buttons.createEl("button", { text: "Force push local to remote" });
+    confirm.addClass("mod-warning");
+    confirm.onclick = () => { modal.close(); resolve(true); };
+    modal.open();
+  });
+}
 export async function encryptedSync(plugin: FastSync, options: EncryptedSyncOptions): Promise<void> {
   if (plugin.isSyncInProgress || !plugin.githubClient) return;
   plugin.isSyncInProgress = true;
   plugin.disableWatch();
   try {
     const ignoreRules = configuredIgnoreRules(plugin);
-    const { store, key, manifest, manifestSha } = await loadStore(plugin);
+    const { store, key, manifest, manifestSha } = await loadStore(plugin, options.operation === "forcePush");
 
     if (options.operation === "forcePull") {
       await pullEncryptedChanges(plugin, key, manifest, true);
