@@ -8,6 +8,7 @@
     "dev": "node esbuild.config.mjs",
     "devcss": "sass --watch src/styles.scss styles.css && tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
     "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
+    "test": "node --test tests/**/*.test.mjs",
     "ver": "node ./scripts/update-version.js"
   },
   "keywords": [],
