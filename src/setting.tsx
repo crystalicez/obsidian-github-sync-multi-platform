@@ -12,6 +12,8 @@ export interface PluginSettings {
   githubRepo: string
   githubBranch: string
   githubToken: string
+  encryptionMode: "plaintext" | "encrypted"
+  encryptionPassphrase: string
 
   vault: string
   lastSyncTime: number
@@ -35,6 +37,8 @@ export const DEFAULT_SETTINGS: PluginSettings = {
   githubRepo: "",
   githubBranch: "main",
   githubToken: "",
+  encryptionMode: "plaintext",
+  encryptionPassphrase: "",
   lastSyncTime: 0,
   vault: "defaultVault",
   // 剪贴板读取提示
@@ -201,6 +205,29 @@ export class SettingTab extends PluginSettingTab {
           })
       })
 
+    new Setting(set)
+      .setName("Encrypted sync")
+      .setDesc("Encrypt file contents, filenames, and folder structure before uploading to GitHub")
+      .addToggle(toggle =>
+        toggle.setValue(this.plugin.settings.encryptionMode === "encrypted").onChange(async value => {
+          this.plugin.settings.encryptionMode = value ? "encrypted" : "plaintext"
+          await this.plugin.saveSettings()
+          this.display()
+        })
+      )
+
+    if (this.plugin.settings.encryptionMode === "encrypted") {
+      new Setting(set)
+        .setName("Encryption passphrase")
+        .setDesc("Enter the same passphrase on every device. Losing it means the encrypted repo cannot be decrypted.")
+        .addText(text => {
+          text.inputEl.type = "password"
+          text.setValue(this.plugin.settings.encryptionPassphrase).onChange(async value => {
+            this.plugin.settings.encryptionPassphrase = value
+            await this.plugin.saveSettings()
+          })
+        })
+    }
     new Setting(set)
       .setName($("远端仓库名"))
       .setDesc($("远端仓库名"))

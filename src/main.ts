@@ -189,6 +189,7 @@ export default class FastSync extends Plugin {
   }
 
   async updateStats() {
+    if (this.settings.encryptionMode === "encrypted") return;
     if (!this.githubClient) return;
 
     const stats: { [month: string]: number } = {};

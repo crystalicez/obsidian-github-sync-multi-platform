@@ -3,6 +3,7 @@ import { TFile, TAbstractFile, Notice, requestUrl } from "obsidian";
 import { hashContent, dump } from "./helps";
 import FastSync from "../main";
 import { GitHubClient, GitHubTreeNode } from "./github-api";
+import { encryptedDelete, encryptedFullSync, encryptedModify, encryptedRename } from "./encrypted/sync-engine";
 
 const IMAGE_EXTENSIONS = ["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "tiff"];
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
@@ -11,6 +12,10 @@ const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
  * 核心修改逻辑，包含防抖和哈希校验
  */
 export const NoteModify = function (file: TAbstractFile, plugin: FastSync, eventEnter: boolean = false) {
+  if (plugin.settings.encryptionMode === "encrypted") {
+    void encryptedModify(file, plugin, eventEnter);
+    return;
+  }
   if (!(file instanceof TFile)) return;
   if (!plugin.isWatchEnabled && eventEnter) return;
   if (plugin.ignoredFiles.has(file.path) && eventEnter) return;
@@ -87,6 +92,10 @@ const performSync = async (file: TFile, plugin: FastSync) => {
 };
 
 export const NoteDelete = async function (file: TAbstractFile, plugin: FastSync, eventEnter: boolean = false) {
+  if (plugin.settings.encryptionMode === "encrypted") {
+    await encryptedDelete(file, plugin, eventEnter);
+    return;
+  }
   if (!plugin.isWatchEnabled && eventEnter) return;
   if (plugin.ignoredFiles.has(file.path) && eventEnter) return;
   if (!plugin.githubClient) return;
@@ -114,6 +123,10 @@ export const NoteDelete = async function (file: TAbstractFile, plugin: FastSync,
 };
 
 export const NoteRename = async function (file: TAbstractFile, oldfile: string, plugin: FastSync, eventEnter: boolean = false) {
+  if (plugin.settings.encryptionMode === "encrypted") {
+    await encryptedRename(file, oldfile, plugin, eventEnter);
+    return;
+  }
   if (!(file instanceof TFile)) return;
   if (!plugin.isWatchEnabled && eventEnter) return;
   if (!plugin.githubClient) return;
@@ -160,6 +173,10 @@ export const NoteRename = async function (file: TAbstractFile, oldfile: string, 
  */
 
 export async function overrideRemoteAllFilesImpl(plugin: FastSync): Promise<void> {
+  if (plugin.settings.encryptionMode === "encrypted") {
+    await encryptedFullSync(plugin);
+    return;
+  }
   if (plugin.isSyncInProgress) {
     new Notice("Sync in progress...");
     return;
@@ -216,6 +233,10 @@ export const StartupFullNotesForceOverSync = (plugin: FastSync): void => {
 };
 
 export async function syncAllFilesImpl(plugin: FastSync): Promise<void> {
+  if (plugin.settings.encryptionMode === "encrypted") {
+    await encryptedFullSync(plugin);
+    return;
+  }
   if (plugin.isSyncInProgress) return;
   if (!plugin.githubClient) return;
 
