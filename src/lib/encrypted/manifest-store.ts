@@ -1,8 +1,10 @@
 import { GitHubClient } from "../github-api";
 import { ENCRYPTED_CONFIG_PATH, ENCRYPTED_FORMAT_VERSION, ENCRYPTED_INDEX_MODE, ENCRYPTED_MANIFEST_PATH } from "./constants";
 import { decryptJson, deriveEncryptionKey, encryptJson } from "./crypto";
-import { bytesToUtf8, randomBytes, toBase64Url } from "./bytes";
+import { randomBytes, toBase64Url } from "./bytes";
 import { EncryptedManifest, EncryptedRepoConfig } from "./types";
+import { classifyRemoteRepo } from "./remote-state";
+import { ForeignRemoteError, WrongPassphraseError } from "./sync-errors";
 
 const DEFAULT_PBKDF2_ITERATIONS = 600000;
 
@@ -20,8 +22,12 @@ export class EncryptedManifestStore {
         manifest: { formatVersion: ENCRYPTED_FORMAT_VERSION, indexMode: ENCRYPTED_INDEX_MODE, updatedAt: Date.now(), files: {} },
       };
     }
-    const manifest = await decryptJson<EncryptedManifest>(key, GitHubClient.decodeContent(remoteManifest.content));
-    return { config, key, manifest, manifestSha: remoteManifest.sha };
+    try {
+      const manifest = await decryptJson<EncryptedManifest>(key, GitHubClient.decodeContent(remoteManifest.content));
+      return { config, key, manifest, manifestSha: remoteManifest.sha };
+    } catch (_error) {
+      throw new WrongPassphraseError();
+    }
   }
 
   async save(manifest: EncryptedManifest, key: CryptoKey, manifestSha?: string): Promise<string> {
@@ -34,15 +40,10 @@ export class EncryptedManifestStore {
     const remoteConfig = await this.github.getFile(ENCRYPTED_CONFIG_PATH);
     if (remoteConfig) return JSON.parse(GitHubClient.decodeContent(remoteConfig.content)) as EncryptedRepoConfig;
 
-    const tree = await this.github.getTree().catch(() => null);
-    const plaintextBlob = tree?.tree.find(node =>
-      node.type === "blob" &&
-      !node.path.startsWith(".obsidian-github-sync-encrypted/") &&
-      (node.path.endsWith(".md") || node.path.includes("/"))
-    );
-    if (plaintextBlob) {
-      throw new Error("Encrypted sync cannot initialize in a repo that already contains plaintext files. Use an explicit migration flow first.");
-    }
+    const state = await classifyRemoteRepo(this.github);
+    if (state.kind === "foreign-nonempty") throw new ForeignRemoteError();
+    if (state.kind === "corrupt-plugin") throw new Error(state.message ?? "Encrypted repository metadata is corrupt.");
+
     const now = Date.now();
     const config: EncryptedRepoConfig = {
       formatVersion: ENCRYPTED_FORMAT_VERSION,
