@@ -50,6 +50,12 @@ Unlike traditional Git-based plugins, this tool interacts directly with the GitH
     -   **Branch**: Typically `main`.
 3.  **Sync Options**: Enable "Auto Sync" for the real-time experience.
 
+## 🔐 Encrypted Sync Mode
+
+Encrypted sync mode stores only non-secret format metadata in GitHub. Note contents, attachment bytes, filenames, and folder structure are encrypted before upload. Use the same passphrase on every device.
+
+Do not enable encrypted mode against a repository that already contains plaintext notes unless you are intentionally running a migration. The first encrypted version does not silently remove old plaintext files.
+
 ## ❓ FAQ
 
 For detailed information about synchronization mechanisms, incremental sync, and conflict resolution, please refer to our [FAQ Document](docs/FAQ.md).

@@ -34,6 +34,15 @@ export class EncryptedManifestStore {
     const remoteConfig = await this.github.getFile(ENCRYPTED_CONFIG_PATH);
     if (remoteConfig) return JSON.parse(GitHubClient.decodeContent(remoteConfig.content)) as EncryptedRepoConfig;
 
+    const tree = await this.github.getTree().catch(() => null);
+    const plaintextBlob = tree?.tree.find(node =>
+      node.type === "blob" &&
+      !node.path.startsWith(".obsidian-github-sync-encrypted/") &&
+      (node.path.endsWith(".md") || node.path.includes("/"))
+    );
+    if (plaintextBlob) {
+      throw new Error("Encrypted sync cannot initialize in a repo that already contains plaintext files. Use an explicit migration flow first.");
+    }
     const now = Date.now();
     const config: EncryptedRepoConfig = {
       formatVersion: ENCRYPTED_FORMAT_VERSION,

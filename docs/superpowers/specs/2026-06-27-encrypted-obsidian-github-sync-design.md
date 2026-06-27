@@ -54,6 +54,8 @@ The plugin derives encryption keys from the passphrase using Argon2id if a well-
 
 If the passphrase is wrong, decrypting `manifest.enc` must fail authentication and stop sync before any local or remote writes occur.
 
+Implementation note: the first implementation uses the PBKDF2-SHA-256 fallback because WebCrypto provides it consistently across supported Obsidian runtimes without adding a new native or WebAssembly dependency.
+
 ## Encryption Model
 
 Every encrypted payload uses authenticated encryption. Preferred algorithms are AES-GCM via WebCrypto where available, or XChaCha20-Poly1305 if the project adopts a well-maintained library that works across the supported Obsidian platforms.
