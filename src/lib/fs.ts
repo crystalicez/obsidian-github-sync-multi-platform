@@ -13,6 +13,7 @@ const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
  */
 export const NoteModify = function (file: TAbstractFile, plugin: FastSync, eventEnter: boolean = false) {
   if (plugin.settings.encryptionMode === "encrypted") {
+    if (!plugin.settings.syncOnLocalChange && eventEnter) return;
     void encryptedModify(file, plugin, eventEnter);
     return;
   }
@@ -93,6 +94,7 @@ const performSync = async (file: TFile, plugin: FastSync) => {
 
 export const NoteDelete = async function (file: TAbstractFile, plugin: FastSync, eventEnter: boolean = false) {
   if (plugin.settings.encryptionMode === "encrypted") {
+    if (!plugin.settings.syncOnLocalChange && eventEnter) return;
     await encryptedDelete(file, plugin, eventEnter);
     return;
   }
@@ -124,6 +126,7 @@ export const NoteDelete = async function (file: TAbstractFile, plugin: FastSync,
 
 export const NoteRename = async function (file: TAbstractFile, oldfile: string, plugin: FastSync, eventEnter: boolean = false) {
   if (plugin.settings.encryptionMode === "encrypted") {
+    if (!plugin.settings.syncOnLocalChange && eventEnter) return;
     await encryptedRename(file, oldfile, plugin, eventEnter);
     return;
   }

@@ -50,6 +50,7 @@ export default class FastSync extends Plugin {
 
   isWatchEnabled: boolean = true
   ignoredFiles: Set<string> = new Set()
+  scheduledSyncTimer: number | null = null
 
   enableWatch() {
     this.isWatchEnabled = true
@@ -78,6 +79,7 @@ export default class FastSync extends Plugin {
     this.addSettingTab(this.settingTab)
     
     this.initGitHubClient()
+    this.registerScheduledSync()
 
     // Create Ribbon Icon once
     this.ribbonIcon = this.addRibbonIcon("loader-circle", "Obsidian-Github-Sync-Multi-Platform: " + $("同步全部笔记"), () => {
@@ -142,6 +144,18 @@ export default class FastSync extends Plugin {
     // 清理所有防抖计时器，防止插件卸载后仍有回调触发（内存泄漏）
     this.debounceTimers.forEach(timer => clearTimeout(timer));
     this.debounceTimers.clear();
+    if (this.scheduledSyncTimer) window.clearInterval(this.scheduledSyncTimer);
+    this.scheduledSyncTimer = null;
+  }
+
+  registerScheduledSync() {
+    if (this.scheduledSyncTimer) window.clearInterval(this.scheduledSyncTimer);
+    this.scheduledSyncTimer = null;
+    if (!this.settings.syncEnabled || !this.settings.scheduledSyncEnabled) return;
+    const seconds = Math.max(1, Number(this.settings.scheduledSyncIntervalSeconds || 0));
+    this.scheduledSyncTimer = window.setInterval(() => {
+      if (!this.isSyncInProgress) StartupFullNotesSync(this);
+    }, seconds * 1000);
   }
 
   updateRibbonIcon(status: boolean) {
@@ -174,7 +188,9 @@ export default class FastSync extends Plugin {
 
   async saveSettings() {
     this.initGitHubClient()
+    this.registerScheduledSync()
     this.updateRibbonIcon(!!(this.settings.githubToken && this.settings.githubOwner && this.settings.githubRepo))
+    this.registerScheduledSync()
     await this.persistData()
   }
 

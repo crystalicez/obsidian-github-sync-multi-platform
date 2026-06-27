@@ -1,8 +1,9 @@
-import { App, PluginSettingTab, Notice, Setting, Platform } from "obsidian";
+import { App, Modal, PluginSettingTab, Notice, Setting, Platform } from "obsidian";
 import { KofiImage } from "./lib/icons";
 import { $ } from "./lang/lang";
 import FastSync from "./main";
 import { dump } from "./lib/helps";
+import { encryptedForcePull, encryptedForcePush, encryptedManualSync } from "./lib/encrypted/sync-engine";
 
 export interface PluginSettings {
   //是否自动上传
@@ -14,6 +15,12 @@ export interface PluginSettings {
   githubToken: string
   encryptionMode: "plaintext" | "encrypted"
   encryptionPassphrase: string
+  syncOnStartup: boolean
+  syncOnLocalChange: boolean
+  scheduledSyncEnabled: boolean
+  scheduledSyncIntervalSeconds: number
+  ignorePathRegex: string
+  conflictPolicy: "copy" | "newer" | "merge" | "ask"
 
   vault: string
   lastSyncTime: number
@@ -39,6 +46,12 @@ export const DEFAULT_SETTINGS: PluginSettings = {
   githubToken: "",
   encryptionMode: "plaintext",
   encryptionPassphrase: "",
+  syncOnStartup: true,
+  syncOnLocalChange: true,
+  scheduledSyncEnabled: false,
+  scheduledSyncIntervalSeconds: 300,
+  ignorePathRegex: "",
+  conflictPolicy: "copy",
   lastSyncTime: 0,
   vault: "defaultVault",
   // 剪贴板读取提示
@@ -54,6 +67,27 @@ export class SettingTab extends PluginSettingTab {
     this.plugin.clipboardReadTip = ""
   }
 
+  async confirmForce(title: string, message: string, operation: "forcePush" | "forcePull"): Promise<void> {
+    await new Promise<void>((resolve) => {
+      const modal = new Modal(this.app)
+      modal.titleEl.setText(title)
+      modal.contentEl.createEl("p", { text: message })
+      const buttons = modal.contentEl.createDiv()
+      buttons.createEl("button", { text: "Cancel" }).onclick = () => {
+        modal.close()
+        resolve()
+      }
+      const confirmButton = buttons.createEl("button", { text: operation === "forcePush" ? "Force push" : "Force pull" })
+      confirmButton.addClass("mod-warning")
+      confirmButton.onclick = () => {
+        modal.close()
+        if (operation === "forcePush") void encryptedForcePush(this.plugin)
+        else void encryptedForcePull(this.plugin)
+        resolve()
+      }
+      modal.open()
+    })
+  }
   hide(): void {
     // 不再需要 React root.unmount()
   }
@@ -228,6 +262,73 @@ export class SettingTab extends PluginSettingTab {
           })
         })
     }
+    new Setting(set).setName("Manual sync").setDesc("Sync encrypted vault with the remote repository now.").addButton(button =>
+      button.setButtonText("Sync now").onClick(() => void encryptedManualSync(this.plugin))
+    )
+
+    new Setting(set).setName("Force push local to remote").setDesc("Overwrite the encrypted remote state with this local vault.").addButton(button =>
+      button.setWarning().setButtonText("Force push").onClick(() => void this.confirmForce("Force push local vault to remote?", "Remote encrypted files not present locally may be deleted.", "forcePush"))
+    )
+
+    new Setting(set).setName("Force pull remote to local").setDesc("Overwrite this local vault with the encrypted remote state.").addButton(button =>
+      button.setWarning().setButtonText("Force pull").onClick(() => void this.confirmForce("Force pull remote vault to local?", "Local synced files not present remotely will be deleted.", "forcePull"))
+    )
+
+    new Setting(set)
+      .setName("Sync when Obsidian opens")
+      .setDesc("Run encrypted sync after the workspace is ready.")
+      .addToggle(toggle => toggle.setValue(this.plugin.settings.syncOnStartup).onChange(async value => {
+        this.plugin.settings.syncOnStartup = value
+        await this.plugin.saveSettings()
+      }))
+
+    new Setting(set)
+      .setName("Sync when local files change")
+      .setDesc("Sync when a local file is created, modified, deleted, or renamed.")
+      .addToggle(toggle => toggle.setValue(this.plugin.settings.syncOnLocalChange).onChange(async value => {
+        this.plugin.settings.syncOnLocalChange = value
+        await this.plugin.saveSettings()
+      }))
+
+    new Setting(set)
+      .setName("Scheduled sync")
+      .setDesc("Run encrypted sync repeatedly at the configured interval.")
+      .addToggle(toggle => toggle.setValue(this.plugin.settings.scheduledSyncEnabled).onChange(async value => {
+        this.plugin.settings.scheduledSyncEnabled = value
+        await this.plugin.saveSettings()
+        this.display()
+      }))
+
+    new Setting(set)
+      .setName("Scheduled sync interval")
+      .setDesc("Interval in seconds between scheduled sync attempts.")
+      .addText(text => text.setPlaceholder("300").setValue(String(this.plugin.settings.scheduledSyncIntervalSeconds)).onChange(async value => {
+        const seconds = Number(value)
+        this.plugin.settings.scheduledSyncIntervalSeconds = Number.isFinite(seconds) && seconds > 0 ? Math.floor(seconds) : 300
+        await this.plugin.saveSettings()
+      }))
+
+    new Setting(set)
+      .setName("Regex of path to ignore")
+      .setDesc("One regex per line, matched against plaintext vault paths before encryption. Examples: ^Archive/ ignores a folder, (^|/)\\.DS_Store$ ignores .DS_Store, \\.tmp$ ignores .tmp files.")
+      .addTextArea(text => text.setPlaceholder("^Archive/\n(^|/)\\.DS_Store$\n\\.tmp$").setValue(this.plugin.settings.ignorePathRegex).onChange(async value => {
+        this.plugin.settings.ignorePathRegex = value
+        await this.plugin.saveSettings()
+      }))
+
+    new Setting(set)
+      .setName("File conflict policy")
+      .setDesc("Choose what to do when both local and remote changed since last sync.")
+      .addDropdown(dropdown => dropdown
+        .addOption("copy", "Copy policy")
+        .addOption("newer", "Newer")
+        .addOption("merge", "Merge text")
+        .addOption("ask", "Always ask")
+        .setValue(this.plugin.settings.conflictPolicy)
+        .onChange(async value => {
+          this.plugin.settings.conflictPolicy = value as "copy" | "newer" | "merge" | "ask"
+          await this.plugin.saveSettings()
+        }))
     new Setting(set)
       .setName($("远端仓库名"))
       .setDesc($("远端仓库名"))
