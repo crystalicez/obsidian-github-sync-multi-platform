@@ -13,6 +13,7 @@ export interface RemoteRepoState {
   kind: RemoteRepoStateKind;
   message?: string;
 }
+
 export interface EncryptedRepoConfig {
   formatVersion: 1;
   indexMode: "single";
@@ -29,6 +30,8 @@ export interface EncryptedObjectRecord {
   objectPath: string;
   plaintextSha256: string;
   remoteSha?: string;
+  storage?: EncryptedStorageKind;
+  chunks?: EncryptedChunkRecord[];
   size: number;
   mtime: number;
   deleted?: boolean;
@@ -46,5 +49,7 @@ export interface EncryptedLocalFileState {
   plaintextSha256: string;
   objectPath: string;
   remoteSha?: string;
+  storage?: EncryptedStorageKind;
+  chunks?: EncryptedChunkRecord[];
   manifestUpdatedAt: number;
 }

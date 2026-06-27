@@ -7,3 +7,6 @@ export const ENCRYPTED_INDEX_MODE = "single";
 export const AES_GCM_NONCE_BYTES = 12;
 export const OBJECT_ID_BYTES = 24;
 export const MAX_ENCRYPTED_FILE_SIZE = 10 * 1024 * 1024;
+
+export const GITHUB_RECOMMENDED_MAX_BYTES = 50 * 1024 * 1024;
+export const ENCRYPTED_CHUNK_PLAINTEXT_BYTES = 32 * 1024 * 1024;
