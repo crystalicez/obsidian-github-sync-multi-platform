@@ -1,3 +1,18 @@
+export type EncryptedStorageKind = "single" | "chunked";
+export type EncryptedSyncOperation = "normal" | "manual" | "forcePush" | "forcePull" | "startup" | "scheduled" | "localChange";
+export type ConflictPolicy = "copy" | "newer" | "merge" | "ask";
+export type RemoteRepoStateKind = "empty" | "encrypted-plugin" | "foreign-nonempty" | "corrupt-plugin" | "wrong-passphrase";
+
+export interface EncryptedChunkRecord {
+  index: number;
+  path: string;
+  remoteSha?: string;
+}
+
+export interface RemoteRepoState {
+  kind: RemoteRepoStateKind;
+  message?: string;
+}
 export interface EncryptedRepoConfig {
   formatVersion: 1;
   indexMode: "single";
