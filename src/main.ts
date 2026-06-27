@@ -5,6 +5,7 @@ import { SettingTab, PluginSettings, DEFAULT_SETTINGS } from "./setting";
 import { GitHubClient } from "./lib/github-api";
 import { $, moment } from "./lang/lang";
 import { calculateWordCount } from "./lib/helps";
+import type { EncryptedLocalFileState } from "./lib/encrypted/types";
 
 
 interface SyncSkipFiles {
@@ -22,6 +23,10 @@ export interface FileState {
 
 export interface SyncData {
   files: { [path: string]: FileState };
+  encrypted?: {
+    files: { [path: string]: EncryptedLocalFileState };
+    manifestSha?: string;
+  };
 }
 
 export default class FastSync extends Plugin {
@@ -176,6 +181,7 @@ export default class FastSync extends Plugin {
   async loadSyncData() {
     const data = await this.loadData() ?? {};
     this.syncData = data.syncData ?? { files: {} };
+    if (!this.syncData.encrypted) this.syncData.encrypted = { files: {} };
   }
 
   async saveSyncData() {
