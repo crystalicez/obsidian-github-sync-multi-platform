@@ -71,6 +71,19 @@ export class GitHubClient {
     }
   }
 
+  async getFileBytes(path: string): Promise<{ bytes: Uint8Array; sha: string } | null> {
+    const file = await this.getFile(path);
+    if (!file) return null;
+    if (!file.content && file.download_url) {
+      const response = await requestUrl({
+        url: file.download_url,
+        headers: this.headers,
+      });
+      return { bytes: new Uint8Array(response.arrayBuffer), sha: file.sha };
+    }
+    return { bytes: GitHubClient.decodeContentBytes(file.content), sha: file.sha };
+  }
+
   async putFile(path: string, content: string | ArrayBuffer, sha?: string): Promise<string> {
     const response = await this._doPutRequest(path, content, sha);
 
@@ -214,4 +227,12 @@ export class GitHubClient {
     }
     return new TextDecoder().decode(bytes);
   }
-}
+
+  static decodeContentBytes(base64Content: string): Uint8Array {
+    const binary = atob(base64Content.replace(/\n/g, ""));
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    return bytes;
+  }}
