@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { Notice, TFile } from "obsidian";
+import { modalButtons, modalEvents, Notice, resetModalTestState, TFile } from "obsidian";
 import { encryptedDelete, encryptedForcePull, encryptedForcePush, encryptedFullSync, encryptedModify, encryptedRename } from "../../src/lib/encrypted/sync-engine";
 import { NoteModify, NoteRename, overrideRemoteAllFilesImpl, syncAllFilesImpl } from "../../src/lib/fs";
 import { hashContent } from "../../src/lib/helps";
@@ -184,6 +184,10 @@ function manyFileEntries(count: number, prefix = "v1"): Record<string, string> {
   const entries: Record<string, string> = {};
   for (let index = 0; index < count; index++) entries[`Notes/note-${String(index).padStart(5, "0")}.md`] = `${prefix}-${index}`;
   return entries;
+}
+
+async function waitForAsyncWork(): Promise<void> {
+  await new Promise(resolve => setTimeout(resolve, 0));
 }
 
 async function withMutedConsoleError(run: () => Promise<void>): Promise<void> {
@@ -596,4 +600,47 @@ test("plaintext full sync refuses truncated remote trees before pushing local fi
 
   assert.equal(github.putCounts.size, 0);
   assert.match(Notice.messages.at(-1) ?? "", /truncated/i);
+});
+
+
+test("force push asks before initializing a foreign non-empty remote", async () => {
+  const github = new MemoryGitHub();
+  await github.putFile("README.md", "foreign");
+  const vault = new MemoryVault({ "Notes/a.md": "local" });
+  const instance = plugin(vault, github) as never;
+  resetModalTestState();
+  Notice.messages.length = 0;
+
+  const cancelled = encryptedForcePush(instance);
+  await waitForAsyncWork();
+  assert.equal(modalEvents.filter(event => event === "open").length, 1);
+  modalButtons.filter(button => button.text === "Cancel").at(-1)?.click();
+  await cancelled;
+  assert.equal(github.blobs.has(".obsidian-github-sync-encrypted/config.json"), false);
+  assert.match(Notice.messages.at(-1) ?? "", /cancelled/i);
+
+  resetModalTestState();
+  const confirmed = encryptedForcePush(instance);
+  await waitForAsyncWork();
+  modalButtons.filter(button => button.text === "Force push local to remote").at(-1)?.click();
+  await confirmed;
+  assert.equal(github.blobs.has(".obsidian-github-sync-encrypted/config.json"), true);
+});
+
+test("normal encrypted sync migrates a gradually grown vault into pack mode", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault({ "Notes/seed.md": "seed" });
+  const instance = plugin(vault, github) as never;
+  await encryptedForcePush(instance);
+
+  vault.files.clear();
+  vault.mtimes.clear();
+  for (const [path, content] of Object.entries(manyFileEntries(10_001, "grown"))) vault.set(path, new TextEncoder().encode(content));
+  await encryptedFullSync(instance);
+
+  assert.equal([...github.blobs.keys()].some(path => path.startsWith(".obsidian-github-sync-encrypted/packs/")), true);
+  const store = new EncryptedManifestStore(github as unknown as GitHubClient, "correct horse battery staple");
+  const loaded = await store.loadOrCreate();
+  assert.equal(Object.keys(loaded.manifest.packs ?? {}).length > 0, true);
+  assert.equal(Object.values(loaded.manifest.files).every(record => record.storage === "pack"), true);
 });

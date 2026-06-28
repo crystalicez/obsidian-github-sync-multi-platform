@@ -107,3 +107,10 @@ test("ask conflict policy queues modals instead of opening stacked dialogs", asy
   modalButtons.filter(button => button.text === "Keep local").at(-1)?.click();
   assert.equal(await second, "keep-local");
 });
+
+
+test("encrypted sync candidates allow files large enough to require chunking", () => {
+  const file = new TFile("Media/big.bin", new Uint8Array());
+  file.stat.size = 120 * 1024 * 1024;
+  assert.equal(shouldSyncEncryptedFile(file), true);
+});

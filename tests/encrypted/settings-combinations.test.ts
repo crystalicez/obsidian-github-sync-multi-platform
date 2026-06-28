@@ -10,7 +10,7 @@ import {
   syncModeUsesEncryption,
 } from "../../src/lib/encrypted/settings-policy";
 import type { ConflictPolicy } from "../../src/lib/encrypted/types";
-import { sanitizeDebugSettings } from "../../src/lib/debug";
+import { createDebugPayload, sanitizeDebugSettings } from "../../src/lib/debug";
 
 type Mode = "plaintext" | "encrypted";
 
@@ -123,6 +123,20 @@ test("debug settings sanitization hides every secret", () => {
   const json = JSON.stringify(sanitized);
   assert.equal(sanitized.githubToken, "***HIDDEN***");
   assert.equal(sanitized.encryptionPassphrase, "***HIDDEN***");
+  assert.equal(json.includes("ghp_secret"), false);
+  assert.equal(json.includes("vault passphrase"), false);
+});
+
+
+test("debug payload hides every secret copied from settings", () => {
+  const payload = createDebugPayload({
+    githubToken: "ghp_secret",
+    encryptionPassphrase: "vault passphrase",
+    githubOwner: "owner",
+  }, "1.2.3");
+  const json = JSON.stringify(payload);
+  assert.equal((payload.settings as Record<string, unknown>).githubToken, "***HIDDEN***");
+  assert.equal((payload.settings as Record<string, unknown>).encryptionPassphrase, "***HIDDEN***");
   assert.equal(json.includes("ghp_secret"), false);
   assert.equal(json.includes("vault passphrase"), false);
 });

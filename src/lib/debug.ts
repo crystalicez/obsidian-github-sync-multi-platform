@@ -7,3 +7,10 @@ export function sanitizeDebugSettings(settings: Record<string, unknown>): Record
   }
   return sanitized;
 }
+
+export function createDebugPayload(settings: Record<string, unknown>, pluginVersion: string): Record<string, unknown> {
+  return {
+    settings: sanitizeDebugSettings(settings),
+    pluginVersion,
+  };
+}

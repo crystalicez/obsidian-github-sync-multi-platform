@@ -1,6 +1,6 @@
 import { Modal, Notice, TAbstractFile, TFile } from "obsidian";
 import FastSync from "../../main";
-import { OBJECT_ID_BYTES } from "./constants";
+import { ENCRYPTED_PACK_PLAINTEXT_BYTES, OBJECT_ID_BYTES } from "./constants";
 import { chooseConflictResolution, mergeTextContent } from "./conflicts";
 import { compileIgnorePathRegex } from "./ignore";
 import { downloadEncryptedFileObject, uploadEncryptedFileObject } from "./large-objects";
@@ -8,6 +8,7 @@ import { planEncryptedPacks } from "./pack-planner";
 import { downloadEncryptedPack, uploadEncryptedPack } from "./pack-sync";
 import { chooseEncryptedStorageMode } from "./scale-policy";
 import { EncryptedManifestStore } from "./manifest-store";
+import { classifyRemoteRepo } from "./remote-state";
 import { conflictPathFor, normalizeVaultPath } from "./paths";
 import { reportSyncError } from "./sync-errors";
 import { ConflictPolicy, EncryptedLocalFileState, EncryptedManifest, EncryptedPackManifestRecord, EncryptedSyncOperation } from "./types";
@@ -133,12 +134,23 @@ async function promptForeignRemoteForcePush(plugin: FastSync): Promise<boolean> 
   });
 }
 
+async function confirmForeignRemoteBeforeForcePush(plugin: FastSync, operation: EncryptedSyncOperation): Promise<boolean> {
+  if (operation !== "forcePush") return true;
+  const state = await classifyRemoteRepo(plugin.githubClient);
+  if (state.kind !== "foreign-nonempty") return true;
+  return promptForeignRemoteForcePush(plugin);
+}
+
 export async function encryptedSync(plugin: FastSync, options: EncryptedSyncOptions): Promise<void> {
   if (plugin.isSyncInProgress || !plugin.githubClient) return;
   if (blockIfEncryptedForcePushRequired(plugin, options.operation)) return;
   plugin.isSyncInProgress = true;
   plugin.disableWatch();
   try {
+    if (!await confirmForeignRemoteBeforeForcePush(plugin, options.operation)) {
+      new Notice("Force push cancelled");
+      return;
+    }
     const ignoreRules = configuredIgnoreRules(plugin);
     const { store, key, manifest, manifestSha } = await loadStore(plugin, options.operation === "forcePush");
 
@@ -155,7 +167,9 @@ export async function encryptedSync(plugin: FastSync, options: EncryptedSyncOpti
     } else {
       if (manifest.packs && Object.keys(manifest.packs).length > 0) await pullEncryptedPackChanges(plugin, key, manifest, ignoreRules, false);
       await pullEncryptedChanges(plugin, key, manifest, false);
-      manifestChanged = await pushEncryptedLocalChanges(plugin, key, manifest, ignoreRules, false);
+      const pushResult = await pushEncryptedAutoLocalChanges(plugin, key, manifest, ignoreRules);
+      manifestChanged = pushResult.changed;
+      packsToDeleteAfterSave = pushResult.packsToDeleteAfterSave;
     }
 
     const newManifestSha = manifestChanged || !manifestSha ? await store.save(manifest, key, manifestSha) : manifestSha;
@@ -341,6 +355,16 @@ async function pushEncryptedForceLocalChanges(plugin: FastSync, key: CryptoKey, 
   return { changed: await pushEncryptedLocalChanges(plugin, key, manifest, ignoreRules, true), packsToDeleteAfterSave: previousPacks };
 }
 
+async function pushEncryptedAutoLocalChanges(plugin: FastSync, key: CryptoKey, manifest: EncryptedManifest, ignoreRules: ReturnType<typeof compileIgnorePathRegex>): Promise<{ changed: boolean; packsToDeleteAfterSave: EncryptedPackManifestRecord[] }> {
+  const localFiles = listEncryptedSyncCandidates(plugin.app.vault, ignoreRules);
+  const totalBytes = localFiles.reduce((sum, file) => sum + file.stat.size, 0);
+  const previousPacks = Object.values(manifest.packs ?? {});
+  if (chooseEncryptedStorageMode({ fileCount: localFiles.length, totalBytes }) === "pack") {
+    return { changed: await pushEncryptedPackLocalChanges(plugin, key, manifest, localFiles), packsToDeleteAfterSave: previousPacks };
+  }
+  return { changed: await pushEncryptedLocalChanges(plugin, key, manifest, ignoreRules, false), packsToDeleteAfterSave: [] };
+}
+
 async function deleteObsoleteRemotePacks(plugin: FastSync, previousPacks: EncryptedPackManifestRecord[], manifest: EncryptedManifest): Promise<void> {
   const currentPackPaths = new Set(Object.values(manifest.packs ?? {}).map(pack => pack.objectPath));
   for (const pack of previousPacks) {
@@ -349,7 +373,10 @@ async function deleteObsoleteRemotePacks(plugin: FastSync, previousPacks: Encryp
 }
 
 async function pushEncryptedPackLocalChanges(plugin: FastSync, key: CryptoKey, manifest: EncryptedManifest, localFiles: TFile[]): Promise<boolean> {
-  const plan = planEncryptedPacks(localFiles.map(file => ({ path: normalizeVaultPath(file.path), size: file.stat.size, mtime: file.stat.mtime })));
+  const previousFiles = manifest.files;
+  const packFiles = localFiles.filter(file => file.stat.size <= ENCRYPTED_PACK_PLAINTEXT_BYTES);
+  const objectFiles = localFiles.filter(file => file.stat.size > ENCRYPTED_PACK_PLAINTEXT_BYTES);
+  const plan = planEncryptedPacks(packFiles.map(file => ({ path: normalizeVaultPath(file.path), size: file.stat.size, mtime: file.stat.mtime })));
   const filesByPath = new Map(localFiles.map(file => [normalizeVaultPath(file.path), file] as const));
   manifest.files = {};
   manifest.packs = {};
@@ -376,6 +403,17 @@ async function pushEncryptedPackLocalChanges(plugin: FastSync, key: CryptoKey, m
       };
     }
     manifest.packs[pack.id] = await uploadEncryptedPack(plugin.githubClient, key, pack.id, archiveFiles, manifest.packs[pack.id]);
+  }
+
+  for (const file of objectFiles) {
+    const path = normalizeVaultPath(file.path);
+    const plaintext = await readVaultFileBytes(plugin.app.vault, file);
+    const plaintextSha256 = await sha256Hex(plaintext);
+    const existing = previousFiles[path];
+    const reusableExisting = existing?.storage === "pack" ? undefined : existing;
+    const objectId = reusableExisting?.id ?? toBase64Url(randomBytes(OBJECT_ID_BYTES));
+    const uploaded = await uploadEncryptedFileObject(plugin.githubClient, key, objectId, plaintext, reusableExisting);
+    manifest.files[path] = { ...uploaded, path, plaintextSha256, mtime: file.stat.mtime, deleted: false, deletedAt: undefined };
   }
   return true;
 }

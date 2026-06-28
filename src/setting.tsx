@@ -4,7 +4,7 @@ import { $ } from "./lang/lang";
 import FastSync from "./main";
 import { dump } from "./lib/helps";
 import { encryptedForcePull, encryptedForcePush, encryptedManualSync } from "./lib/encrypted/sync-engine";
-import { sanitizeDebugSettings } from "./lib/debug";
+import { createDebugPayload } from "./lib/debug";
 
 export interface PluginSettings {
   //是否自动上传
@@ -371,13 +371,7 @@ export class SettingTab extends PluginSettingTab {
     debugButton.onclick = async () => {
       await window.navigator.clipboard.writeText(
         JSON.stringify(
-          {
-            settings: {
-              ...this.plugin.settings,
-              githubToken: this.plugin.settings.githubToken ? "***HIDDEN***" : "",
-            },
-            pluginVersion: this.plugin.manifest.version,
-          },
+          createDebugPayload(this.plugin.settings as unknown as Record<string, unknown>, this.plugin.manifest.version),
           null,
           4
         )
