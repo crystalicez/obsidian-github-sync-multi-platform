@@ -11,6 +11,7 @@ class MemoryGitHub {
   blobs = new Map<string, { content: string; sha: string }>();
   counter = 0;
   putCounts = new Map<string, number>();
+  getCounts = new Map<string, number>();
   deletedPaths: string[] = [];
   failPutPathPrefix?: string;
   truncated = false;
@@ -25,6 +26,7 @@ class MemoryGitHub {
   }
 
   async getFile(path: string) {
+    this.getCounts.set(path, (this.getCounts.get(path) ?? 0) + 1);
     const item = this.blobs.get(path);
     if (!item) return null;
     return { content: item.content, sha: item.sha, path, size: item.content.length };
@@ -263,6 +265,31 @@ test("encrypted sync requires force push after enabling encryption from plaintex
   assert.equal((instance as { settings: { encryptedForcePushRequired?: boolean } }).settings.encryptedForcePushRequired, false);
 });
 
+test("normal encrypted sync skips remote pack downloads and uploads when pack state is unchanged", async () => {
+  const github = new MemoryGitHub();
+  const sourceVault = new MemoryVault(manyFileEntries(10_001, "stable"));
+  await encryptedForcePush(plugin(sourceVault, github) as never);
+
+  const targetVault = new MemoryVault({});
+  const target = plugin(targetVault, github) as never;
+  await encryptedForcePull(target);
+
+  const packPaths = [...github.blobs.keys()].filter(path => path.startsWith(".obsidian-github-sync-encrypted/packs/"));
+  assert.equal(packPaths.length > 0, true);
+  const packGetsAfterPull = new Map(packPaths.map(path => [path, github.getCounts.get(path) ?? 0]));
+  const packPutsAfterPull = new Map(packPaths.map(path => [path, github.putCounts.get(path) ?? 0]));
+  const manifestPutsAfterPull = github.putCounts.get(".obsidian-github-sync-encrypted/manifest.enc") ?? 0;
+  targetVault.readBinaryCount = 0;
+
+  await encryptedFullSync(target);
+
+  assert.equal(targetVault.readBinaryCount, 0);
+  assert.equal(github.putCounts.get(".obsidian-github-sync-encrypted/manifest.enc") ?? 0, manifestPutsAfterPull);
+  for (const path of packPaths) {
+    assert.equal(github.getCounts.get(path) ?? 0, packGetsAfterPull.get(path));
+    assert.equal(github.putCounts.get(path) ?? 0, packPutsAfterPull.get(path));
+  }
+});
 test("normal encrypted sync restores changed files from pack mode without writing archive bytes", async () => {
   const github = new MemoryGitHub();
   const sourceVault = new MemoryVault(manyFileEntries(10_001, "v1"));

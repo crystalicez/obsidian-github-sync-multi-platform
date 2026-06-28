@@ -71,6 +71,28 @@ async function writeIgnoredVaultBytes(plugin: FastSync, path: string, bytes: Uin
   }
 }
 
+function localStatForRecord(plugin: FastSync, path: string, record: EncryptedManifest["files"][string]): { size: number; mtime: number } {
+  const localFile = plugin.app.vault.getAbstractFileByPath(path);
+  if (localFile instanceof TFile) return { size: localFile.stat.size, mtime: localFile.stat.mtime };
+  return { size: record.size, mtime: record.mtime };
+}
+
+function cacheEncryptedStateForRecord(plugin: FastSync, path: string, record: EncryptedManifest["files"][string]): void {
+  const state = ensureEncryptedState(plugin);
+  const stat = localStatForRecord(plugin, path, record);
+  state.files[path] = {
+    plaintextSha256: record.plaintextSha256,
+    objectPath: record.objectPath,
+    remoteSha: record.remoteSha,
+    storage: record.storage,
+    chunks: record.chunks,
+    packId: record.packId,
+    manifestUpdatedAt: Date.now(),
+    size: stat.size,
+    mtime: stat.mtime,
+  };
+}
+
 async function resolveRemoteChangedBeforeLocalMutation(
   plugin: FastSync,
   key: CryptoKey,
@@ -177,6 +199,7 @@ export async function encryptedSync(plugin: FastSync, options: EncryptedSyncOpti
     plugin.syncData.encrypted = { files: {}, manifestSha: newManifestSha };
     for (const [path, record] of Object.entries(manifest.files)) {
       if (!record.deleted) {
+        const stat = localStatForRecord(plugin, path, record);
         plugin.syncData.encrypted.files[path] = {
           plaintextSha256: record.plaintextSha256,
           objectPath: record.objectPath,
@@ -185,8 +208,8 @@ export async function encryptedSync(plugin: FastSync, options: EncryptedSyncOpti
           chunks: record.chunks,
           packId: record.packId,
           manifestUpdatedAt: manifest.updatedAt,
-          size: record.size,
-          mtime: record.mtime,
+          size: stat.size,
+          mtime: stat.mtime,
         };
       }
     }
@@ -360,6 +383,7 @@ async function pushEncryptedAutoLocalChanges(plugin: FastSync, key: CryptoKey, m
   const totalBytes = localFiles.reduce((sum, file) => sum + file.stat.size, 0);
   const previousPacks = Object.values(manifest.packs ?? {});
   if (chooseEncryptedStorageMode({ fileCount: localFiles.length, totalBytes }) === "pack") {
+    if (canSkipPackUpload(plugin, manifest, localFiles)) return { changed: false, packsToDeleteAfterSave: [] };
     return { changed: await pushEncryptedPackLocalChanges(plugin, key, manifest, localFiles), packsToDeleteAfterSave: previousPacks };
   }
   return { changed: await pushEncryptedLocalChanges(plugin, key, manifest, ignoreRules, false), packsToDeleteAfterSave: [] };
@@ -418,9 +442,38 @@ async function pushEncryptedPackLocalChanges(plugin: FastSync, key: CryptoKey, m
   return true;
 }
 
+function packRecordsFor(manifest: EncryptedManifest, packId: string): Array<[string, EncryptedManifest["files"][string]]> {
+  return Object.entries(manifest.files).filter(([, record]) => !record.deleted && record.storage === "pack" && record.packId === packId);
+}
+
+function canSkipPackDownload(plugin: FastSync, manifest: EncryptedManifest, packId: string, force: boolean): boolean {
+  if (force) return false;
+  const records = packRecordsFor(manifest, packId);
+  if (records.length === 0) return false;
+  const state = ensureEncryptedState(plugin);
+  return records.every(([path, record]) => state.files[path]?.plaintextSha256 === record.plaintextSha256);
+}
+
+function canSkipPackUpload(plugin: FastSync, manifest: EncryptedManifest, localFiles: TFile[]): boolean {
+  if (!manifest.packs || Object.keys(manifest.packs).length === 0) return false;
+  const activeRecords = Object.entries(manifest.files).filter(([, record]) => !record.deleted);
+  if (activeRecords.length !== localFiles.length) return false;
+  const recordsByPath = new Map(activeRecords.map(([path, record]) => [path, record] as const));
+  const state = ensureEncryptedState(plugin);
+  for (const file of localFiles) {
+    const path = normalizeVaultPath(file.path);
+    const record = recordsByPath.get(path);
+    const cached = state.files[path];
+    if (!record || record.storage !== "pack" || !cached) return false;
+    if (cached.plaintextSha256 !== record.plaintextSha256) return false;
+    if (cached.size !== file.stat.size || cached.mtime !== file.stat.mtime) return false;
+  }
+  return true;
+}
 async function pullEncryptedPackChanges(plugin: FastSync, key: CryptoKey, manifest: EncryptedManifest, ignoreRules: ReturnType<typeof compileIgnorePathRegex>, force: boolean): Promise<void> {
   const state = ensureEncryptedState(plugin);
   for (const pack of Object.values(manifest.packs ?? {})) {
+    if (canSkipPackDownload(plugin, manifest, pack.id, force)) continue;
     const files = await downloadEncryptedPack(plugin.githubClient, key, pack);
     for (const file of files) {
       const record = manifest.files[file.path];
@@ -455,6 +508,7 @@ async function pullEncryptedPackChanges(plugin: FastSync, key: CryptoKey, manife
       } finally {
         plugin.removeIgnoredFile(file.path);
       }
+      cacheEncryptedStateForRecord(plugin, file.path, record);
     }
   }
 }
