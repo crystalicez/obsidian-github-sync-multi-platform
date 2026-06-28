@@ -9,6 +9,7 @@ export interface PackArchiveFileInput {
   path: string;
   mtime: number;
   bytes: Uint8Array;
+  plaintextSha256?: string;
 }
 
 export interface PackArchiveFileOutput extends PackArchiveFileInput {}
@@ -18,11 +19,22 @@ interface PackArchiveHeaderFile {
   mtime: number;
   offset: number;
   size: number;
+  checksum: number;
+  plaintextSha256?: string;
 }
 
 interface PackArchiveHeader {
   magic: typeof PACK_ARCHIVE_MAGIC;
   files: PackArchiveHeaderFile[];
+}
+
+function checksum32(bytes: Uint8Array): number {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < bytes.byteLength; i++) {
+    hash ^= bytes[i];
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash >>> 0;
 }
 
 export function packObjectPathForId(id: string): string {
@@ -35,7 +47,7 @@ export function encodePackArchive(files: PackArchiveFileInput[]): Uint8Array {
   const header: PackArchiveHeader = {
     magic: PACK_ARCHIVE_MAGIC,
     files: sorted.map(file => {
-      const entry = { path: file.path, mtime: file.mtime, offset, size: file.bytes.byteLength };
+      const entry = { path: file.path, mtime: file.mtime, offset, size: file.bytes.byteLength, checksum: checksum32(file.bytes), plaintextSha256: file.plaintextSha256 };
       offset += file.bytes.byteLength;
       return entry;
     }),
@@ -65,6 +77,8 @@ export function decodePackArchive(archive: Uint8Array): PackArchiveFileOutput[] 
     const start = dataStart + file.offset;
     const end = start + file.size;
     if (end > archive.byteLength) throw new Error(`Invalid encrypted pack archive: truncated file ${file.path}.`);
-    return { path: file.path, mtime: file.mtime, bytes: archive.subarray(start, end) };
+    const bytes = archive.subarray(start, end);
+    if (checksum32(bytes) !== file.checksum) throw new Error(`Encrypted pack archive integrity check failed for ${file.path}.`);
+    return { path: file.path, mtime: file.mtime, bytes, plaintextSha256: file.plaintextSha256 };
   });
 }

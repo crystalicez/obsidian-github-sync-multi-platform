@@ -21,6 +21,7 @@ export interface PluginSettings {
   scheduledSyncIntervalSeconds: number
   ignorePathRegex: string
   conflictPolicy: "copy" | "newer" | "merge" | "ask"
+  encryptedForcePushRequired: boolean
 
   vault: string
   lastSyncTime: number
@@ -52,6 +53,7 @@ export const DEFAULT_SETTINGS: PluginSettings = {
   scheduledSyncIntervalSeconds: 300,
   ignorePathRegex: "",
   conflictPolicy: "copy",
+  encryptedForcePushRequired: false,
   lastSyncTime: 0,
   vault: "defaultVault",
   // 剪贴板读取提示
@@ -244,6 +246,7 @@ export class SettingTab extends PluginSettingTab {
       .setDesc("Encrypt file contents, filenames, and folder structure before uploading to GitHub")
       .addToggle(toggle =>
         toggle.setValue(this.plugin.settings.encryptionMode === "encrypted").onChange(async value => {
+          if (value && this.plugin.settings.encryptionMode !== "encrypted") this.plugin.settings.encryptedForcePushRequired = true
           this.plugin.settings.encryptionMode = value ? "encrypted" : "plaintext"
           await this.plugin.saveSettings()
           this.display()

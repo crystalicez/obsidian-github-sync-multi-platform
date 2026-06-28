@@ -7,6 +7,7 @@ import { decodePackArchive, encodePackArchive, packObjectPathForId } from "../..
 import { planEncryptedPacks } from "../../src/lib/encrypted/pack-planner";
 import { chooseEncryptedStorageMode } from "../../src/lib/encrypted/scale-policy";
 import { deriveEncryptionKey } from "../../src/lib/encrypted/crypto";
+import { sha256Hex } from "../../src/lib/encrypted/bytes";
 import { uploadEncryptedPack, downloadEncryptedPack } from "../../src/lib/encrypted/pack-sync";
 import type { GitHubClient } from "../../src/lib/github-api";
 import type { EncryptedRepoConfig } from "../../src/lib/encrypted/types";
@@ -130,4 +131,22 @@ test("encrypted pack upload and download round trip a whole shard", async () => 
   assert.equal(restored.length, 2);
   assert.equal(new TextDecoder().decode(restored.find(file => file.path === "Notes/a.md")?.bytes), "alpha");
   assert.deepEqual(restored.find(file => file.path === "Notes/b.md")?.bytes, new Uint8Array([1, 2, 3, 4]));
+});
+
+test("pack archive detects corrupted file bytes with per-file hashes", async () => {
+  const bytes = new TextEncoder().encode("original");
+  const archive = encodePackArchive([{ path: "Notes/a.md", mtime: 1, bytes, plaintextSha256: await sha256Hex(bytes) }]);
+  archive[archive.byteLength - 1] ^= 0xff;
+
+  assert.throws(() => decodePackArchive(archive), /integrity check failed/u);
+});
+
+test("encrypted pack download reports missing remote pack", async () => {
+  const github = new PackMemoryGitHub();
+  const key = await testPackKey();
+
+  await assert.rejects(
+    () => downloadEncryptedPack(github as unknown as GitHubClient, key, { id: "missing", objectPath: ".obsidian-github-sync-encrypted/packs/missing.pack.enc", totalBytes: 1, fileCount: 1, updatedAt: 1 }),
+    /Missing encrypted pack/u,
+  );
 });

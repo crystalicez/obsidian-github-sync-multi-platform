@@ -128,6 +128,7 @@ test("normal encrypted sync skips unchanged file reads and manifest writes", asy
 
   await encryptedFullSync(instance);
 
+
   assert.equal(vault.readBinaryCount, 0);
   assert.equal(github.putCounts.get(".obsidian-github-sync-encrypted/manifest.enc") ?? 0, manifestPutsAfterInitialPush);
 });
@@ -146,4 +147,24 @@ test("encrypted local modify pushes only the changed file without scanning the v
 
   assert.equal(vault.getFilesCount, 0);
   assert.equal(vault.readBinaryCount, 1);
+});
+
+test("encrypted sync requires force push after enabling encryption from plaintext mode", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault({ "Notes/a.md": "needs migration" });
+  const instance = plugin(vault, github) as never;
+  (instance as { settings: { encryptedForcePushRequired?: boolean } }).settings.encryptedForcePushRequired = true;
+
+  const originalConsoleError = console.error;
+  console.error = () => {};
+  try {
+    await encryptedFullSync(instance);
+  } finally {
+    console.error = originalConsoleError;
+  }
+  assert.equal(github.blobs.has(".obsidian-github-sync-encrypted/manifest.enc"), false);
+
+  await encryptedForcePush(instance);
+  assert.equal(github.blobs.has(".obsidian-github-sync-encrypted/manifest.enc"), true);
+  assert.equal((instance as { settings: { encryptedForcePushRequired?: boolean } }).settings.encryptedForcePushRequired, false);
 });

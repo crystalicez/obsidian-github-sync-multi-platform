@@ -76,6 +76,10 @@ async function promptForeignRemoteForcePush(plugin: FastSync): Promise<boolean> 
 
 export async function encryptedSync(plugin: FastSync, options: EncryptedSyncOptions): Promise<void> {
   if (plugin.isSyncInProgress || !plugin.githubClient) return;
+  if ((plugin.settings as { encryptedForcePushRequired?: boolean }).encryptedForcePushRequired && options.operation !== "forcePush") {
+    reportSyncError(options.operation, new Error("Encrypted sync was just enabled. Run Force push once to initialize the encrypted remote state."));
+    return;
+  }
   plugin.isSyncInProgress = true;
   plugin.disableWatch();
   try {
@@ -110,6 +114,10 @@ export async function encryptedSync(plugin: FastSync, options: EncryptedSyncOpti
           mtime: record.mtime,
         };
       }
+    }
+    if (options.operation === "forcePush") {
+      (plugin.settings as { encryptedForcePushRequired?: boolean }).encryptedForcePushRequired = false;
+      if (typeof (plugin as FastSync & { saveSettings?: () => Promise<void> }).saveSettings === "function") await (plugin as FastSync & { saveSettings: () => Promise<void> }).saveSettings();
     }
     await plugin.saveSyncData();
     new Notice(`Encrypted ${options.operation} completed`);
