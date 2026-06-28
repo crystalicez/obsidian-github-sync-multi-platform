@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { Notice, TFile } from "obsidian";
-import { encryptedForcePull, encryptedForcePush, encryptedFullSync, encryptedModify, encryptedRename } from "../../src/lib/encrypted/sync-engine";
+import { encryptedDelete, encryptedForcePull, encryptedForcePush, encryptedFullSync, encryptedModify, encryptedRename } from "../../src/lib/encrypted/sync-engine";
 import { NoteModify } from "../../src/lib/fs";
 import { GitHubClient } from "../../src/lib/github-api";
 import { EncryptedManifestStore } from "../../src/lib/encrypted/manifest-store";
@@ -324,4 +324,73 @@ test("encrypted modify events are debounced and only push the final file state",
   const pulledVault = new MemoryVault({});
   await encryptedForcePull(plugin(pulledVault, github) as never);
   assert.equal(new TextDecoder().decode(pulledVault.files.get("Notes/a.md")), "draft 2");
+});
+
+test("encrypted local modify checks conflict before pushing over remote changes", async () => {
+  const github = new MemoryGitHub();
+  const remoteVault = new MemoryVault({ "Notes/a.md": "base" });
+  const remote = plugin(remoteVault, github) as never;
+  await encryptedForcePush(remote);
+
+  const localVault = new MemoryVault({});
+  const local = plugin(localVault, github) as never;
+  await encryptedForcePull(local);
+
+  remoteVault.set("Notes/a.md", new TextEncoder().encode("remote edit"));
+  await encryptedModify(remoteVault.getAbstractFileByPath("Notes/a.md") as TFile, remote, true);
+
+  localVault.set("Notes/a.md", new TextEncoder().encode("local edit"));
+  await encryptedModify(localVault.getAbstractFileByPath("Notes/a.md") as TFile, local, true);
+
+  const pulledVault = new MemoryVault({});
+  await encryptedForcePull(plugin(pulledVault, github) as never);
+  assert.equal(new TextDecoder().decode(pulledVault.files.get("Notes/a.md")), "remote edit");
+  assert.equal([...localVault.files.keys()].some(path => path.includes(".sync-conflict-") && path.endsWith(".md")), true);
+});
+
+test("encrypted local delete checks conflict before deleting a remotely changed file", async () => {
+  const github = new MemoryGitHub();
+  const remoteVault = new MemoryVault({ "Notes/a.md": "base" });
+  const remote = plugin(remoteVault, github) as never;
+  await encryptedForcePush(remote);
+
+  const localVault = new MemoryVault({});
+  const local = plugin(localVault, github) as never;
+  await encryptedForcePull(local);
+
+  remoteVault.set("Notes/a.md", new TextEncoder().encode("remote survives"));
+  await encryptedModify(remoteVault.getAbstractFileByPath("Notes/a.md") as TFile, remote, true);
+
+  const deletedFile = localVault.getAbstractFileByPath("Notes/a.md") as TFile;
+  localVault.files.delete("Notes/a.md");
+  await encryptedDelete(deletedFile, local, true);
+
+  const pulledVault = new MemoryVault({});
+  await encryptedForcePull(plugin(pulledVault, github) as never);
+  assert.equal(new TextDecoder().decode(pulledVault.files.get("Notes/a.md")), "remote survives");
+  assert.equal([...localVault.files.keys()].some(path => path.includes(".sync-conflict-") && path.endsWith(".md")), true);
+});
+
+test("encrypted rename checks conflict before deleting a remotely changed source path", async () => {
+  const github = new MemoryGitHub();
+  const remoteVault = new MemoryVault({ "Notes/old.md": "base" });
+  const remote = plugin(remoteVault, github) as never;
+  await encryptedForcePush(remote);
+
+  const localVault = new MemoryVault({});
+  const local = plugin(localVault, github) as never;
+  await encryptedForcePull(local);
+
+  remoteVault.set("Notes/old.md", new TextEncoder().encode("remote old edit"));
+  await encryptedModify(remoteVault.getAbstractFileByPath("Notes/old.md") as TFile, remote, true);
+
+  const bytes = localVault.files.get("Notes/old.md") ?? new Uint8Array();
+  localVault.files.delete("Notes/old.md");
+  localVault.set("Notes/new.md", bytes);
+  await encryptedRename(localVault.getAbstractFileByPath("Notes/new.md") as TFile, "Notes/old.md", local, true);
+
+  const pulledVault = new MemoryVault({});
+  await encryptedForcePull(plugin(pulledVault, github) as never);
+  assert.equal(new TextDecoder().decode(pulledVault.files.get("Notes/old.md")), "remote old edit");
+  assert.equal(new TextDecoder().decode(pulledVault.files.get("Notes/new.md")), "base");
 });
