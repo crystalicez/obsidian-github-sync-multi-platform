@@ -7,16 +7,18 @@ import { GitHubClient } from "../../src/lib/github-api";
 
 class FakeGitHub {
   blobs: Map<string, string>;
+  truncated = false;
 
-  constructor(entries: Record<string, string> = {}) {
+  constructor(entries: Record<string, string> = {}, options: { truncated?: boolean } = {}) {
     this.blobs = new Map(Object.entries(entries));
+    this.truncated = options.truncated ?? false;
   }
 
   async getTree() {
     return {
       sha: "tree",
       url: "",
-      truncated: false,
+      truncated: this.truncated,
       tree: [...this.blobs.keys()].map(path => ({ path, mode: "100644", type: "blob" as const, sha: `sha-${path}`, url: "" })),
     };
   }
@@ -38,6 +40,13 @@ test("classifyRemoteRepo detects empty, encrypted, foreign, and corrupt states",
   assert.equal((await classifyRemoteRepo(new FakeGitHub({ ".obsidian-github-sync-encrypted/config.json": "{}" }) as unknown as GitHubClient)).kind, "encrypted-plugin");
   assert.equal((await classifyRemoteRepo(new FakeGitHub({ "Notes/a.md": "plain" }) as unknown as GitHubClient)).kind, "foreign-nonempty");
   assert.equal((await classifyRemoteRepo(new FakeGitHub({ ".obsidian-github-sync-encrypted/orphan": "x" }) as unknown as GitHubClient)).kind, "corrupt-plugin");
+});
+
+test("classifyRemoteRepo refuses truncated GitHub trees instead of guessing repo state", async () => {
+  await assert.rejects(
+    () => classifyRemoteRepo(new FakeGitHub({}, { truncated: true }) as unknown as GitHubClient),
+    /truncated/i,
+  );
 });
 
 test("manifest store blocks foreign non-empty repos unless explicitly allowed", async () => {
@@ -71,6 +80,50 @@ test("manifest store reuses derived encryption keys for the same passphrase and 
   } finally {
     crypto.subtle.deriveKey = originalDeriveKey as SubtleCrypto["deriveKey"];
   }
+});
+
+test("manifest store bounds the derived key cache", async () => {
+  const originalDeriveKey = crypto.subtle.deriveKey.bind(crypto.subtle);
+  let deriveKeyCalls = 0;
+  crypto.subtle.deriveKey = ((...args: Parameters<SubtleCrypto["deriveKey"]>) => {
+    deriveKeyCalls += 1;
+    return originalDeriveKey(...args);
+  }) as SubtleCrypto["deriveKey"];
+
+  try {
+    const githubs: GitHubClient[] = [];
+    for (let index = 0; index < 40; index++) {
+      const github = new FakeGitHub() as unknown as GitHubClient;
+      githubs.push(github);
+      await new EncryptedManifestStore(github, "cache-passphrase-" + index, true).loadOrCreate();
+    }
+    await new EncryptedManifestStore(githubs[0], "cache-passphrase-0", true).loadOrCreate();
+    assert.equal(deriveKeyCalls, 41);
+  } finally {
+    crypto.subtle.deriveKey = originalDeriveKey as SubtleCrypto["deriveKey"];
+  }
+});
+
+test("manifest store rejects malformed remote encrypted config", async () => {
+  const configPath = ".obsidian-github-sync-encrypted/config.json";
+  await assert.rejects(
+    () => new EncryptedManifestStore(new FakeGitHub({ [configPath]: "{not-json" }) as unknown as GitHubClient, "pw").loadOrCreate(),
+    /Invalid encrypted config/i,
+  );
+
+  const badConfig = {
+    formatVersion: 1,
+    indexMode: "single",
+    algorithm: "AES-GCM",
+    kdf: "PBKDF2-SHA-256",
+    kdfParams: { iterations: 1_000_000_000, salt: "not base64 url" },
+    createdAt: 1,
+    updatedAt: 1,
+  };
+  await assert.rejects(
+    () => new EncryptedManifestStore(new FakeGitHub({ [configPath]: JSON.stringify(badConfig) }) as unknown as GitHubClient, "pw").loadOrCreate(),
+    /Invalid encrypted config/i,
+  );
 });
 
 test("manifest store rejects decrypted manifests with unsafe paths", async () => {

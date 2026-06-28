@@ -10,6 +10,8 @@ class MemoryGitHub {
   blobs = new Map<string, { content: string; sha: string }>();
   counter = 0;
   putCounts = new Map<string, number>();
+  deletedPaths: string[] = [];
+  failPutPathPrefix?: string;
 
   async getTree() {
     return {
@@ -27,6 +29,7 @@ class MemoryGitHub {
   }
 
   async putFile(path: string, content: string | ArrayBuffer, _sha?: string) {
+    if (this.failPutPathPrefix && path.startsWith(this.failPutPathPrefix)) throw new Error("Injected put failure for " + path);
     const bytes = typeof content === "string" ? new TextEncoder().encode(content) : new Uint8Array(content);
     const base64 = Buffer.from(bytes).toString("base64");
     const sha = `sha-${++this.counter}`;
@@ -36,8 +39,61 @@ class MemoryGitHub {
   }
 
   async deleteFile(path: string) {
+    this.deletedPaths.push(path);
     this.blobs.delete(path);
   }
+}
+
+class StrictFolderVault {
+  files = new Map<string, Uint8Array>();
+  mtimes = new Map<string, number>();
+  folders = new Set<string>();
+
+  getFiles() {
+    return [...this.files.entries()].map(([path, bytes]) => {
+      const file = new TFile(path, bytes);
+      file.stat.mtime = this.mtimes.get(path) ?? Date.now();
+      return file;
+    });
+  }
+
+  getAbstractFileByPath(path: string) {
+    const bytes = this.files.get(path);
+    if (bytes) {
+      const file = new TFile(path, bytes);
+      file.stat.mtime = this.mtimes.get(path) ?? Date.now();
+      return file;
+    }
+    return this.folders.has(path) ? { path } : null;
+  }
+
+  async readBinary(file: TFile) {
+    return this.files.get(file.path)?.buffer.slice(0) ?? new ArrayBuffer(0);
+  }
+
+  async read(file: TFile) {
+    return new TextDecoder().decode(this.files.get(file.path) ?? new Uint8Array());
+  }
+
+  async createFolder(path: string) {
+    const parent = path.split("/").slice(0, -1).join("/");
+    if (parent && !this.folders.has(parent)) throw new Error("Missing parent folder: " + parent);
+    this.folders.add(path);
+  }
+
+  async createBinary(path: string, buffer: ArrayBuffer) {
+    const parent = path.split("/").slice(0, -1).join("/");
+    if (parent && !this.folders.has(parent)) throw new Error("Missing folder: " + parent);
+    this.files.set(path, new Uint8Array(buffer));
+    this.mtimes.set(path, Date.now());
+  }
+
+  async modifyBinary(file: TFile, buffer: ArrayBuffer) {
+    this.files.set(file.path, new Uint8Array(buffer));
+    this.mtimes.set(file.path, Date.now());
+  }
+
+  async delete(file: TFile) { this.files.delete(file.path); }
 }
 
 class MemoryVault {
@@ -393,4 +449,54 @@ test("encrypted rename checks conflict before deleting a remotely changed source
   await encryptedForcePull(plugin(pulledVault, github) as never);
   assert.equal(new TextDecoder().decode(pulledVault.files.get("Notes/old.md")), "remote old edit");
   assert.equal(new TextDecoder().decode(pulledVault.files.get("Notes/new.md")), "base");
+});
+
+
+test("encrypted local modify treats missing local state as a conflict before overwriting remote", async () => {
+  const github = new MemoryGitHub();
+  const remoteVault = new MemoryVault({ "Notes/a.md": "remote original" });
+  await encryptedForcePush(plugin(remoteVault, github) as never);
+
+  const localVault = new MemoryVault({ "Notes/a.md": "local unknown ancestry" });
+  const local = plugin(localVault, github) as never;
+  await encryptedModify(localVault.getAbstractFileByPath("Notes/a.md") as TFile, local, true);
+
+  const pulledVault = new MemoryVault({});
+  await encryptedForcePull(plugin(pulledVault, github) as never);
+  assert.equal(new TextDecoder().decode(pulledVault.files.get("Notes/a.md")), "remote original");
+  assert.equal([...localVault.files.keys()].some(path => path.includes(".sync-conflict-") && path.endsWith(".md")), true);
+});
+
+test("force push shrink keeps old remote packs available if object migration upload fails", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault(manyFileEntries(10_001, "large"));
+  const instance = plugin(vault, github) as never;
+  await encryptedForcePush(instance);
+  const packPathsBefore = [...github.blobs.keys()].filter(path => path.startsWith(".obsidian-github-sync-encrypted/packs/"));
+  assert.equal(packPathsBefore.length > 0, true);
+
+  vault.files.clear();
+  vault.mtimes.clear();
+  vault.set("Notes/only.md", new TextEncoder().encode("small"));
+  github.failPutPathPrefix = ".obsidian-github-sync-encrypted/objects/";
+  await withMutedConsoleError(async () => {
+    await encryptedForcePush(instance);
+  });
+
+  for (const packPath of packPathsBefore) assert.equal(github.blobs.has(packPath), true);
+  assert.deepEqual(github.deletedPaths.filter(path => path.startsWith(".obsidian-github-sync-encrypted/packs/")), []);
+});
+
+test("force pull creates nested folders recursively before writing deep paths", async () => {
+  const github = new MemoryGitHub();
+  const sourceVault = new MemoryVault({ "a/b/c/deep.md": "deep content" });
+  await encryptedForcePush(plugin(sourceVault, github) as never);
+
+  const targetVault = new StrictFolderVault();
+  await encryptedForcePull(plugin(targetVault as unknown as MemoryVault, github) as never);
+
+  assert.equal(new TextDecoder().decode(targetVault.files.get("a/b/c/deep.md")), "deep content");
+  assert.equal(targetVault.folders.has("a"), true);
+  assert.equal(targetVault.folders.has("a/b"), true);
+  assert.equal(targetVault.folders.has("a/b/c"), true);
 });

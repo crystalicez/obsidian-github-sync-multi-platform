@@ -1,15 +1,23 @@
 import { GitHubClient } from "../github-api";
 import { ENCRYPTED_CONFIG_PATH, ENCRYPTED_FORMAT_VERSION, ENCRYPTED_INDEX_MODE, ENCRYPTED_MANIFEST_PATH, ENCRYPTED_OBJECTS_ROOT, ENCRYPTED_PACKS_ROOT, ENCRYPTED_ROOT } from "./constants";
 import { decryptJson, deriveEncryptionKey, encryptJson } from "./crypto";
-import { randomBytes, toBase64Url } from "./bytes";
+import { fromBase64Url, randomBytes, sha256Hex, toBase64Url, utf8ToBytes } from "./bytes";
 import { EncryptedManifest, EncryptedObjectRecord, EncryptedPackManifestRecord, EncryptedRepoConfig } from "./types";
 import { classifyRemoteRepo } from "./remote-state";
 import { ForeignRemoteError, WrongPassphraseError } from "./sync-errors";
 
 const DEFAULT_PBKDF2_ITERATIONS = 600000;
+const MIN_PBKDF2_ITERATIONS = 100000;
+const MAX_PBKDF2_ITERATIONS = 2000000;
+const DERIVED_KEY_CACHE_LIMIT = 32;
 const derivedKeyCache = new Map<string, Promise<CryptoKey>>();
+
 function invalidManifest(reason: string): Error {
   return new Error(`Invalid encrypted manifest: ${reason}`);
+}
+
+function invalidConfig(reason: string): Error {
+  return new Error(`Invalid encrypted config: ${reason}`);
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -79,12 +87,33 @@ function validateEncryptedManifest(value: unknown): EncryptedManifest {
   return value as unknown as EncryptedManifest;
 }
 
-function cachedEncryptionKey(passphrase: string, config: EncryptedRepoConfig): Promise<CryptoKey> {
-  const cacheKey = `${config.kdf}:${config.kdfParams.iterations}:${config.kdfParams.salt}:${passphrase}`;
+function validateEncryptedConfig(value: unknown): EncryptedRepoConfig {
+  if (!isObject(value)) throw invalidConfig("config is not an object");
+  if (value.formatVersion !== ENCRYPTED_FORMAT_VERSION || value.indexMode !== ENCRYPTED_INDEX_MODE) throw invalidConfig("unsupported format");
+  if (value.algorithm !== "AES-GCM") throw invalidConfig("unsupported encryption algorithm");
+  if (value.kdf !== "PBKDF2-SHA-256") throw invalidConfig("unsupported key derivation function");
+  if (!isObject(value.kdfParams)) throw invalidConfig("missing key derivation parameters");
+  const iterations = value.kdfParams.iterations;
+  if (typeof iterations !== "number" || !Number.isInteger(iterations) || iterations < MIN_PBKDF2_ITERATIONS || iterations > MAX_PBKDF2_ITERATIONS) throw invalidConfig("PBKDF2 iterations out of supported range");
+  const salt = value.kdfParams.salt;
+  if (typeof salt !== "string" || !/^[A-Za-z0-9_-]+$/u.test(salt)) throw invalidConfig("salt is not base64url");
+  const saltBytes = fromBase64Url(salt);
+  if (saltBytes.byteLength < 16 || saltBytes.byteLength > 64) throw invalidConfig("salt length is unsupported");
+  if (typeof value.createdAt !== "number" || value.createdAt < 0 || typeof value.updatedAt !== "number" || value.updatedAt < 0) throw invalidConfig("invalid timestamps");
+  return value as unknown as EncryptedRepoConfig;
+}
+
+async function cachedEncryptionKey(passphrase: string, config: EncryptedRepoConfig): Promise<CryptoKey> {
+  const cacheMaterial = `${config.kdf}:${config.kdfParams.iterations}:${config.kdfParams.salt}:${passphrase}`;
+  const cacheKey = await sha256Hex(utf8ToBytes(cacheMaterial));
   let key = derivedKeyCache.get(cacheKey);
   if (!key) {
     key = deriveEncryptionKey(passphrase, config);
     derivedKeyCache.set(cacheKey, key);
+    if (derivedKeyCache.size > DERIVED_KEY_CACHE_LIMIT) {
+      const oldestKey = derivedKeyCache.keys().next().value;
+      if (oldestKey) derivedKeyCache.delete(oldestKey);
+    }
   }
   return key;
 }
@@ -120,7 +149,14 @@ export class EncryptedManifestStore {
 
   private async loadOrCreateConfig(): Promise<EncryptedRepoConfig> {
     const remoteConfig = await this.github.getFile(ENCRYPTED_CONFIG_PATH);
-    if (remoteConfig) return JSON.parse(GitHubClient.decodeContent(remoteConfig.content)) as EncryptedRepoConfig;
+    if (remoteConfig) {
+      try {
+        return validateEncryptedConfig(JSON.parse(GitHubClient.decodeContent(remoteConfig.content)));
+      } catch (error) {
+        if (error instanceof Error && error.message.startsWith("Invalid encrypted config:")) throw error;
+        throw invalidConfig(error instanceof Error ? error.message : "config could not be parsed");
+      }
+    }
 
     const state = await classifyRemoteRepo(this.github);
     if (state.kind === "foreign-nonempty" && !this.allowForeignInit) throw new ForeignRemoteError();

@@ -10,7 +10,7 @@ import { chooseEncryptedStorageMode } from "./scale-policy";
 import { EncryptedManifestStore } from "./manifest-store";
 import { conflictPathFor, normalizeVaultPath } from "./paths";
 import { reportSyncError } from "./sync-errors";
-import { ConflictPolicy, EncryptedLocalFileState, EncryptedManifest, EncryptedSyncOperation } from "./types";
+import { ConflictPolicy, EncryptedLocalFileState, EncryptedManifest, EncryptedPackManifestRecord, EncryptedSyncOperation } from "./types";
 import { effectiveConflictPolicy } from "./settings-policy";
 import { deleteVaultFileIfExists, listEncryptedSyncCandidates, readVaultFileBytes, shouldSyncEncryptedFile, writeVaultFileBytes } from "./vault";
 import { randomBytes, sha256Hex, toBase64Url } from "./bytes";
@@ -80,7 +80,12 @@ async function resolveRemoteChangedBeforeLocalMutation(
   localFile: TFile | null,
   localBytes?: Uint8Array,
 ): Promise<boolean> {
-  if (!record || record.deleted || !localState || localState.plaintextSha256 === record.plaintextSha256) return false;
+  if (!record || record.deleted) return false;
+  if (localState?.plaintextSha256 === record.plaintextSha256) return false;
+  if (!localState && (localFile || localBytes)) {
+    const bytes = localBytes ?? await readVaultFileBytes(plugin.app.vault, localFile as TFile);
+    if (await sha256Hex(bytes) === record.plaintextSha256) return false;
+  }
   const remoteBytes = await downloadManifestRecordBytes(plugin, key, manifest, record);
   const resolution = await chooseConflictResolution(plugin, configuredConflictPolicy(plugin), path, localFile, record.mtime);
   if (resolution === "keep-local") return false;
@@ -138,12 +143,15 @@ export async function encryptedSync(plugin: FastSync, options: EncryptedSyncOpti
     const { store, key, manifest, manifestSha } = await loadStore(plugin, options.operation === "forcePush");
 
     let manifestChanged = false;
+    let packsToDeleteAfterSave: EncryptedPackManifestRecord[] = [];
     if (options.operation === "forcePull") {
       if (manifest.packs && Object.keys(manifest.packs).length > 0) await pullEncryptedPackChanges(plugin, key, manifest, ignoreRules, true);
       await pullEncryptedChanges(plugin, key, manifest, true);
       await deleteLocalFilesMissingFromRemote(plugin, manifest, ignoreRules);
     } else if (options.operation === "forcePush") {
-      manifestChanged = await pushEncryptedForceLocalChanges(plugin, key, manifest, ignoreRules);
+      const forcePushResult = await pushEncryptedForceLocalChanges(plugin, key, manifest, ignoreRules);
+      manifestChanged = forcePushResult.changed;
+      packsToDeleteAfterSave = forcePushResult.packsToDeleteAfterSave;
     } else {
       if (manifest.packs && Object.keys(manifest.packs).length > 0) await pullEncryptedPackChanges(plugin, key, manifest, ignoreRules, false);
       await pullEncryptedChanges(plugin, key, manifest, false);
@@ -151,6 +159,7 @@ export async function encryptedSync(plugin: FastSync, options: EncryptedSyncOpti
     }
 
     const newManifestSha = manifestChanged || !manifestSha ? await store.save(manifest, key, manifestSha) : manifestSha;
+    if (packsToDeleteAfterSave.length > 0) await deleteObsoleteRemotePacks(plugin, packsToDeleteAfterSave, manifest);
     plugin.syncData.encrypted = { files: {}, manifestSha: newManifestSha };
     for (const [path, record] of Object.entries(manifest.files)) {
       if (!record.deleted) {
@@ -320,20 +329,21 @@ async function pullEncryptedChanges(plugin: FastSync, key: CryptoKey, manifest: 
   }
 }
 
-async function pushEncryptedForceLocalChanges(plugin: FastSync, key: CryptoKey, manifest: EncryptedManifest, ignoreRules: ReturnType<typeof compileIgnorePathRegex>): Promise<boolean> {
+async function pushEncryptedForceLocalChanges(plugin: FastSync, key: CryptoKey, manifest: EncryptedManifest, ignoreRules: ReturnType<typeof compileIgnorePathRegex>): Promise<{ changed: boolean; packsToDeleteAfterSave: EncryptedPackManifestRecord[] }> {
   const localFiles = listEncryptedSyncCandidates(plugin.app.vault, ignoreRules);
   const totalBytes = localFiles.reduce((sum, file) => sum + file.stat.size, 0);
   const mode = chooseEncryptedStorageMode({ fileCount: localFiles.length, totalBytes });
-  if (mode === "pack") return pushEncryptedPackLocalChanges(plugin, key, manifest, localFiles);
-  await deleteRemotePacks(plugin, manifest);
+  const previousPacks = Object.values(manifest.packs ?? {});
+  if (mode === "pack") return { changed: await pushEncryptedPackLocalChanges(plugin, key, manifest, localFiles), packsToDeleteAfterSave: previousPacks };
   manifest.files = {};
   manifest.packs = {};
-  return pushEncryptedLocalChanges(plugin, key, manifest, ignoreRules, true);
+  return { changed: await pushEncryptedLocalChanges(plugin, key, manifest, ignoreRules, true), packsToDeleteAfterSave: previousPacks };
 }
 
-async function deleteRemotePacks(plugin: FastSync, manifest: EncryptedManifest): Promise<void> {
-  for (const pack of Object.values(manifest.packs ?? {})) {
-    if (pack.remoteSha) await plugin.githubClient.deleteFile(pack.objectPath, pack.remoteSha);
+async function deleteObsoleteRemotePacks(plugin: FastSync, previousPacks: EncryptedPackManifestRecord[], manifest: EncryptedManifest): Promise<void> {
+  const currentPackPaths = new Set(Object.values(manifest.packs ?? {}).map(pack => pack.objectPath));
+  for (const pack of previousPacks) {
+    if (pack.remoteSha && !currentPackPaths.has(pack.objectPath)) await plugin.githubClient.deleteFile(pack.objectPath, pack.remoteSha);
   }
 }
 
