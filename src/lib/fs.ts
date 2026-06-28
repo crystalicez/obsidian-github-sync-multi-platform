@@ -3,12 +3,32 @@ import { TFile, TAbstractFile, Notice, requestUrl } from "obsidian";
 import { hashContent, dump } from "./helps";
 import FastSync from "../main";
 import { GitHubClient, GitHubTreeNode } from "./github-api";
-import { encryptedDelete, encryptedFullSync, encryptedModify, encryptedRename } from "./encrypted/sync-engine";
+import { encryptedDelete, encryptedForcePush, encryptedFullSync, encryptedModify, encryptedRename } from "./encrypted/sync-engine";
 import { shouldHandleEncryptedLocalChange } from "./encrypted/settings-policy";
+import { conflictPathFor } from "./encrypted/paths";
 
 const IMAGE_EXTENSIONS = ["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "tiff"];
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
 const ENCRYPTED_MODIFY_DEBOUNCE_MS = 5000;
+
+function shouldSyncPlaintextFile(file: TFile): boolean {
+  const isMarkdown = file.extension === "md";
+  const isImage = IMAGE_EXTENSIONS.includes(file.extension.toLowerCase());
+  return (isMarkdown || isImage) && !file.path.includes(".sync-conflict-") && file.stat.size <= MAX_FILE_SIZE;
+}
+
+async function writePlaintextConflictCopy(plugin: FastSync, path: string, content: string | ArrayBuffer): Promise<void> {
+  const conflictPath = conflictPathFor(path, Date.now(), "remote");
+  const folderPath = conflictPath.split("/").slice(0, -1).join("/");
+  if (folderPath && !plugin.app.vault.getAbstractFileByPath(folderPath)) await plugin.app.vault.createFolder(folderPath);
+  if (typeof content === "string") await plugin.app.vault.create(conflictPath, content);
+  else await plugin.app.vault.createBinary(conflictPath, content);
+}
+
+async function currentPlaintextHash(plugin: FastSync, file: TFile): Promise<string> {
+  if (file.extension === "md") return hashContent(await plugin.app.vault.read(file));
+  return file.stat.size + "_" + file.stat.mtime;
+}
 
 function encryptedDebounceKey(path: string): string {
   return `encrypted:${path}`;
@@ -43,6 +63,7 @@ export const NoteModify = function (file: TAbstractFile, plugin: FastSync, event
     return;
   }
   if (!(file instanceof TFile)) return;
+  if (eventEnter && !plugin.settings.syncEnabled) return;
   if (!plugin.isWatchEnabled && eventEnter) return;
   if (plugin.ignoredFiles.has(file.path) && eventEnter) return;
   if (!plugin.githubClient) return;
@@ -159,19 +180,15 @@ export const NoteRename = async function (file: TAbstractFile, oldfile: string, 
     return;
   }
   if (!(file instanceof TFile)) return;
+  if (eventEnter && !plugin.settings.syncEnabled) return;
   if (!plugin.isWatchEnabled && eventEnter) return;
   if (!plugin.githubClient) return;
 
   plugin.addIgnoredFile(file.path);
   try {
-    // 1. 删除旧路径
     const oldSha = plugin.syncData.files[oldfile]?.sha;
-    if (oldSha) {
-      await plugin.githubClient.deleteFile(oldfile, oldSha);
-      delete plugin.syncData.files[oldfile];
-    }
 
-    // 2. 上传新路径
+    // 1. 上传新路径
     const isMarkdown = file.extension === "md";
     let content: string | ArrayBuffer;
     let currentHash: string;
@@ -190,6 +207,10 @@ export const NoteRename = async function (file: TAbstractFile, oldfile: string, 
       lastSync: Date.now(),
       hash: currentHash
     };
+    if (oldSha) {
+      await plugin.githubClient.deleteFile(oldfile, oldSha);
+      delete plugin.syncData.files[oldfile];
+    }
     await plugin.saveSyncData();
     dump(`Renamed ${oldfile} -> ${file.path}`);
   } catch (error) {
@@ -205,7 +226,7 @@ export const NoteRename = async function (file: TAbstractFile, oldfile: string, 
 
 export async function overrideRemoteAllFilesImpl(plugin: FastSync): Promise<void> {
   if (plugin.settings.encryptionMode === "encrypted") {
-    await encryptedFullSync(plugin);
+    await encryptedForcePush(plugin);
     return;
   }
   if (plugin.isSyncInProgress) {
@@ -220,11 +241,9 @@ export async function overrideRemoteAllFilesImpl(plugin: FastSync): Promise<void
   try {
     const files = plugin.app.vault.getFiles();
     for (const file of files) {
-       if (file.stat.size > MAX_FILE_SIZE) continue;
+       if (!shouldSyncPlaintextFile(file)) continue;
        
        const isMarkdown = file.extension === "md";
-       const isImage = IMAGE_EXTENSIONS.includes(file.extension.toLowerCase());
-       if (!isMarkdown && !isImage) continue;
 
        let content: string | ArrayBuffer;
        let currentHash: string;
@@ -279,7 +298,7 @@ export async function syncAllFilesImpl(plugin: FastSync): Promise<void> {
     // 过滤 Markdown 和 图片
     const remoteFiles = remoteTree.tree.filter((node: GitHubTreeNode) => {
       const ext = node.path.split(".").pop()?.toLowerCase();
-      return node.type === "blob" && (ext === "md" || IMAGE_EXTENSIONS.includes(ext || ""));
+      return node.type === "blob" && (ext === "md" || IMAGE_EXTENSIONS.includes(ext || "")) && !node.path.includes(".sync-conflict-");
     });
     const remoteFilesMap = new Map<string, string>(remoteFiles.map((f: GitHubTreeNode) => [f.path, f.sha] as [string, string]));
 
@@ -324,6 +343,12 @@ export async function syncAllFilesImpl(plugin: FastSync): Promise<void> {
                 ? GitHubClient.decodeContent(finalContent)
                 : new TextDecoder().decode(finalContent);
                 
+              if (localFile && localState && localState.hash && localState.hash !== await currentPlaintextHash(plugin, localFile)) {
+                await writePlaintextConflictCopy(plugin, path, content);
+                plugin.syncData.files[path] = { sha: remoteSha, lastSync: Date.now(), hash: await currentPlaintextHash(plugin, localFile) };
+                step1Count++;
+                continue;
+              }
               if (localFile) await plugin.app.vault.modify(localFile, content);
               else await plugin.app.vault.create(path, content);
               
@@ -344,6 +369,12 @@ export async function syncAllFilesImpl(plugin: FastSync): Promise<void> {
                 buffer = finalContent;
               }
               
+              if (localFile && localState && localState.hash && localState.hash !== await currentPlaintextHash(plugin, localFile)) {
+                await writePlaintextConflictCopy(plugin, path, buffer);
+                plugin.syncData.files[path] = { sha: remoteSha, lastSync: Date.now(), hash: await currentPlaintextHash(plugin, localFile) };
+                step1Count++;
+                continue;
+              }
               if (localFile) await plugin.app.vault.modifyBinary(localFile, buffer);
               else await plugin.app.vault.createBinary(path, buffer);
               
@@ -370,10 +401,8 @@ export async function syncAllFilesImpl(plugin: FastSync): Promise<void> {
     // 2. 推送本地文件：新增文件 + 本地内容有变化的已有文件
     let step2Push = 0, step2Skip = 0, step2Fail = 0;
     for (const file of allLocalFiles) {
+      if (!shouldSyncPlaintextFile(file)) continue;
       const isMarkdown = file.extension === "md";
-      const isImage = IMAGE_EXTENSIONS.includes(file.extension.toLowerCase());
-      if (!isMarkdown && !isImage) continue;
-      if (file.stat.size > MAX_FILE_SIZE) continue;
 
       try {
         const remoteSha = remoteFilesMap.get(file.path);

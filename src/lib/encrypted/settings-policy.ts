@@ -15,6 +15,7 @@ export interface SyncSettingsPolicyInput {
 }
 
 const CONFLICT_POLICIES: ConflictPolicy[] = ["copy", "newer", "merge", "ask"];
+const MIN_SCHEDULED_SYNC_INTERVAL_SECONDS = 30;
 
 export function hasGitHubSyncConfig(settings: SyncSettingsPolicyInput): boolean {
   return Boolean(settings.githubToken && settings.githubOwner && settings.githubRepo);
@@ -41,7 +42,7 @@ export function shouldHandleEncryptedLocalChange(settings: SyncSettingsPolicyInp
 export function normalizeScheduledSyncIntervalSeconds(value: unknown): number {
   const seconds = Number(value);
   if (!Number.isFinite(seconds) || seconds <= 0) return 300;
-  return Math.floor(seconds);
+  return Math.max(MIN_SCHEDULED_SYNC_INTERVAL_SECONDS, Math.floor(seconds));
 }
 
 export function effectiveConflictPolicy(value: unknown): ConflictPolicy {

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { setRequestUrlHandler } from "obsidian";
 import { classifyRemoteRepo } from "../../src/lib/encrypted/remote-state";
 import { ForeignRemoteError, userMessageForSyncError, WrongPassphraseError } from "../../src/lib/encrypted/sync-errors";
 import { EncryptedManifestStore } from "../../src/lib/encrypted/manifest-store";
@@ -145,4 +146,21 @@ test("manifest store rejects decrypted manifests with unsafe paths", async () =>
     () => new EncryptedManifestStore(github, "pw").loadOrCreate(),
     /Invalid encrypted manifest/u,
   );
+});
+
+
+test("GitHubClient.getFile returns null only for 404 and throws for other HTTP errors", async () => {
+  const client = new GitHubClient({ token: "token", owner: "owner", repo: "repo", branch: "main" });
+  try {
+    setRequestUrlHandler(async () => ({ status: 404, text: "missing", json: {} }));
+    assert.equal(await client.getFile("Notes/missing.md"), null);
+
+    setRequestUrlHandler(async () => ({ status: 403, text: "rate limited", json: {} }));
+    await assert.rejects(() => client.getFile("Notes/a.md"), /HTTP 403.*rate limited/u);
+
+    setRequestUrlHandler(async () => ({ status: 500, text: "server error", json: {} }));
+    await assert.rejects(() => client.getFile("Notes/a.md"), /HTTP 500.*server error/u);
+  } finally {
+    setRequestUrlHandler(null);
+  }
 });

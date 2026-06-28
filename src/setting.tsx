@@ -4,6 +4,7 @@ import { $ } from "./lang/lang";
 import FastSync from "./main";
 import { dump } from "./lib/helps";
 import { encryptedForcePull, encryptedForcePush, encryptedManualSync } from "./lib/encrypted/sync-engine";
+import { sanitizeDebugSettings } from "./lib/debug";
 
 export interface PluginSettings {
   //是否自动上传

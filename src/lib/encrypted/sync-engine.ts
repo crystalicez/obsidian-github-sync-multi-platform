@@ -303,9 +303,10 @@ async function pullEncryptedChanges(plugin: FastSync, key: CryptoKey, manifest: 
     if (!force && localState?.plaintextSha256 === record.plaintextSha256) continue;
     const plaintext = await downloadEncryptedFileObject(plugin.githubClient, key, record);
     const localFile = plugin.app.vault.getAbstractFileByPath(path);
-    if (!force && localFile instanceof TFile && localState) {
+    if (!force && localFile instanceof TFile) {
       const localHash = await sha256Hex(await readVaultFileBytes(plugin.app.vault, localFile));
-      if (localState.plaintextSha256 !== localHash) {
+      const localChanged = localState ? localState.plaintextSha256 !== localHash : localHash !== record.plaintextSha256;
+      if (localChanged) {
         const resolution = await chooseConflictResolution(plugin, configuredConflictPolicy(plugin), path, localFile, record.mtime);
         if (resolution === "keep-local") continue;
         if (resolution === "copy-remote") {
@@ -392,9 +393,10 @@ async function pullEncryptedPackChanges(plugin: FastSync, key: CryptoKey, manife
       const localState = state.files[file.path];
       if (!force && localState?.plaintextSha256 === record.plaintextSha256) continue;
       const localFile = plugin.app.vault.getAbstractFileByPath(file.path);
-      if (!force && localFile instanceof TFile && localState) {
+      if (!force && localFile instanceof TFile) {
         const localHash = await sha256Hex(await readVaultFileBytes(plugin.app.vault, localFile));
-        if (localState.plaintextSha256 !== localHash) {
+        const localChanged = localState ? localState.plaintextSha256 !== localHash : localHash !== record.plaintextSha256;
+        if (localChanged) {
           const resolution = await chooseConflictResolution(plugin, configuredConflictPolicy(plugin), file.path, localFile, record.mtime);
           if (resolution === "keep-local") continue;
           if (resolution === "copy-remote") {

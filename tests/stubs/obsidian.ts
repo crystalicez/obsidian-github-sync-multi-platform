@@ -86,7 +86,12 @@ export class Setting {
 
 export const Platform = { isDesktopApp: true, isMacOS: false };
 export function setIcon(_el: unknown, _icon: string) {}
-export async function requestUrl(_options: unknown): Promise<unknown> {
+let requestUrlHandler: ((options: unknown) => Promise<unknown>) | null = null;
+export function setRequestUrlHandler(handler: ((options: unknown) => Promise<unknown>) | null) {
+  requestUrlHandler = handler;
+}
+export async function requestUrl(options: unknown): Promise<unknown> {
+  if (requestUrlHandler) return requestUrlHandler(options);
   throw new Error("requestUrl is not implemented in tests");
 }
 export const moment = (value: number) => ({ format: (_format: string) => String(value) });

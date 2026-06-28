@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { Notice, TFile } from "obsidian";
 import { encryptedDelete, encryptedForcePull, encryptedForcePush, encryptedFullSync, encryptedModify, encryptedRename } from "../../src/lib/encrypted/sync-engine";
-import { NoteModify } from "../../src/lib/fs";
+import { NoteModify, NoteRename, overrideRemoteAllFilesImpl, syncAllFilesImpl } from "../../src/lib/fs";
+import { hashContent } from "../../src/lib/helps";
 import { GitHubClient } from "../../src/lib/github-api";
 import { EncryptedManifestStore } from "../../src/lib/encrypted/manifest-store";
 
@@ -138,6 +139,8 @@ class MemoryVault {
   }
 
   async createFolder(_path: string) {}
+  async create(path: string, content: string) { this.set(path, new TextEncoder().encode(content)); }
+  async modify(file: TFile, content: string) { this.set(file.path, new TextEncoder().encode(content)); }
   async createBinary(path: string, buffer: ArrayBuffer) { this.set(path, new Uint8Array(buffer)); }
   async modifyBinary(file: TFile, buffer: ArrayBuffer) { this.set(file.path, new Uint8Array(buffer)); }
   async delete(file: TFile) { this.files.delete(file.path); }
@@ -165,7 +168,14 @@ function plugin(vault: MemoryVault, github: MemoryGitHub) {
     addIgnoredFile(_path: string) {},
     removeIgnoredFile(_path: string) {},
     async saveSyncData() {},
+    updateStats() { return Promise.resolve(); },
   };
+}
+
+function plaintextPlugin(vault: MemoryVault, github: MemoryGitHub) {
+  const instance = plugin(vault, github) as ReturnType<typeof plugin>;
+  instance.settings.encryptionMode = "plaintext";
+  return instance;
 }
 
 
@@ -499,4 +509,74 @@ test("force pull creates nested folders recursively before writing deep paths", 
   assert.equal(targetVault.folders.has("a"), true);
   assert.equal(targetVault.folders.has("a/b"), true);
   assert.equal(targetVault.folders.has("a/b/c"), true);
+});
+
+
+test("plaintext local modify honors the syncEnabled master switch", () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault({ "Notes/a.md": "local" });
+  const instance = plaintextPlugin(vault, github);
+  instance.settings.syncEnabled = false;
+
+  NoteModify(vault.getAbstractFileByPath("Notes/a.md") as TFile, instance as never, true);
+
+  assert.equal(instance.debounceTimers.size, 0);
+  assert.equal(github.putCounts.size, 0);
+});
+
+test("plaintext full sync preserves local edits when remote changed since last sync", async () => {
+  const github = new MemoryGitHub();
+  await github.putFile("Notes/a.md", "remote edit");
+  const remoteSha = github.blobs.get("Notes/a.md")?.sha ?? "";
+  const vault = new MemoryVault({ "Notes/a.md": "local edit" });
+  const instance = plaintextPlugin(vault, github);
+  instance.syncData.files["Notes/a.md"] = { sha: "old-sha", lastSync: Date.now(), hash: hashContent("base") };
+
+  await syncAllFilesImpl(instance as never);
+
+  assert.equal(new TextDecoder().decode(vault.files.get("Notes/a.md")), "local edit");
+  assert.equal([...vault.files.keys()].some(path => path.includes(".sync-conflict-") && path.endsWith(".md")), true);
+  assert.equal(instance.syncData.files["Notes/a.md"].sha, remoteSha);
+});
+
+test("plaintext rename keeps old remote file if new upload fails", async () => {
+  const github = new MemoryGitHub();
+  const oldSha = await github.putFile("Notes/old.md", "old remote");
+  const vault = new MemoryVault({ "Notes/new.md": "new local" });
+  const instance = plaintextPlugin(vault, github);
+  instance.syncData.files["Notes/old.md"] = { sha: oldSha, lastSync: Date.now(), hash: hashContent("old remote") };
+  github.failPutPathPrefix = "Notes/new.md";
+
+  await withMutedConsoleError(async () => {
+    await NoteRename(vault.getAbstractFileByPath("Notes/new.md") as TFile, "Notes/old.md", instance as never, true);
+  });
+
+  assert.equal(github.blobs.has("Notes/old.md"), true);
+  assert.equal(github.blobs.has("Notes/new.md"), false);
+});
+
+test("encrypted normal pull treats existing local file without state as a conflict", async () => {
+  const github = new MemoryGitHub();
+  const remoteVault = new MemoryVault({ "Notes/a.md": "remote original" });
+  await encryptedForcePush(plugin(remoteVault, github) as never);
+
+  const localVault = new MemoryVault({ "Notes/a.md": "local unknown" });
+  await encryptedFullSync(plugin(localVault, github) as never);
+
+  assert.equal(new TextDecoder().decode(localVault.files.get("Notes/a.md")), "local unknown");
+  assert.equal([...localVault.files.keys()].some(path => path.includes(".sync-conflict-") && path.endsWith(".md")), true);
+});
+
+test("encrypted overwrite command path performs force push semantics", async () => {
+  const github = new MemoryGitHub();
+  const remoteVault = new MemoryVault({ "Notes/a.md": "remote" });
+  await encryptedForcePush(plugin(remoteVault, github) as never);
+
+  const localVault = new MemoryVault({ "Notes/a.md": "local" });
+  const instance = plugin(localVault, github) as never;
+  await overrideRemoteAllFilesImpl(instance);
+
+  const pulledVault = new MemoryVault({});
+  await encryptedForcePull(plugin(pulledVault, github) as never);
+  assert.equal(new TextDecoder().decode(pulledVault.files.get("Notes/a.md")), "local");
 });
