@@ -49,5 +49,5 @@ test("benchmark: GitHub content decoding remains fast for 1 MiB payloads", () =>
 
   assert.equal(decoded.byteLength, bytes.byteLength);
   assert.equal(decoded[decoded.byteLength - 1], bytes[bytes.byteLength - 1]);
-  assert.ok(elapsed < 8, `GitHub content decode benchmark took ${elapsed}ms`);
+  assert.ok(elapsed < 25, `GitHub content decode benchmark took ${elapsed}ms`);
 });

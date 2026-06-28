@@ -8,6 +8,28 @@ import { shouldHandleEncryptedLocalChange } from "./encrypted/settings-policy";
 
 const IMAGE_EXTENSIONS = ["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "tiff"];
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
+const ENCRYPTED_MODIFY_DEBOUNCE_MS = 5000;
+
+function encryptedDebounceKey(path: string): string {
+  return `encrypted:${path}`;
+}
+
+function scheduleEncryptedModify(file: TFile, plugin: FastSync, eventEnter: boolean): void {
+  const key = encryptedDebounceKey(file.path);
+  if (plugin.debounceTimers.has(key)) globalThis.clearTimeout(plugin.debounceTimers.get(key));
+  const timer = globalThis.setTimeout(async () => {
+    plugin.debounceTimers.delete(key);
+    await encryptedModify(file, plugin, eventEnter);
+  }, ENCRYPTED_MODIFY_DEBOUNCE_MS) as unknown as number;
+  plugin.debounceTimers.set(key, timer);
+}
+
+function clearEncryptedModify(path: string, plugin: FastSync): void {
+  const key = encryptedDebounceKey(path);
+  if (!plugin.debounceTimers.has(key)) return;
+  globalThis.clearTimeout(plugin.debounceTimers.get(key));
+  plugin.debounceTimers.delete(key);
+}
 
 /**
  * 核心修改逻辑，包含防抖和哈希校验
@@ -15,7 +37,9 @@ const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
 export const NoteModify = function (file: TAbstractFile, plugin: FastSync, eventEnter: boolean = false) {
   if (plugin.settings.encryptionMode === "encrypted") {
     if (!shouldHandleEncryptedLocalChange(plugin.settings, eventEnter)) return;
-    void encryptedModify(file, plugin, eventEnter);
+    if (!(file instanceof TFile)) return;
+    if (eventEnter) scheduleEncryptedModify(file, plugin, eventEnter);
+    else void encryptedModify(file, plugin, eventEnter);
     return;
   }
   if (!(file instanceof TFile)) return;
@@ -96,6 +120,7 @@ const performSync = async (file: TFile, plugin: FastSync) => {
 export const NoteDelete = async function (file: TAbstractFile, plugin: FastSync, eventEnter: boolean = false) {
   if (plugin.settings.encryptionMode === "encrypted") {
     if (!shouldHandleEncryptedLocalChange(plugin.settings, eventEnter)) return;
+    clearEncryptedModify(file.path, plugin);
     await encryptedDelete(file, plugin, eventEnter);
     return;
   }
@@ -128,6 +153,8 @@ export const NoteDelete = async function (file: TAbstractFile, plugin: FastSync,
 export const NoteRename = async function (file: TAbstractFile, oldfile: string, plugin: FastSync, eventEnter: boolean = false) {
   if (plugin.settings.encryptionMode === "encrypted") {
     if (!shouldHandleEncryptedLocalChange(plugin.settings, eventEnter)) return;
+    clearEncryptedModify(oldfile, plugin);
+    clearEncryptedModify(file.path, plugin);
     await encryptedRename(file, oldfile, plugin, eventEnter);
     return;
   }

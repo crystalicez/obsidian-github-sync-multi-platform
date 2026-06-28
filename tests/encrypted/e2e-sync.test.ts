@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { Notice, TFile } from "obsidian";
-import { encryptedForcePull, encryptedForcePush, encryptedFullSync, encryptedModify } from "../../src/lib/encrypted/sync-engine";
+import { encryptedForcePull, encryptedForcePush, encryptedFullSync, encryptedModify, encryptedRename } from "../../src/lib/encrypted/sync-engine";
+import { NoteModify } from "../../src/lib/fs";
 import { GitHubClient } from "../../src/lib/github-api";
 import { EncryptedManifestStore } from "../../src/lib/encrypted/manifest-store";
 
@@ -25,13 +26,17 @@ class MemoryGitHub {
     return { content: item.content, sha: item.sha, path, size: item.content.length };
   }
 
-  async putFile(path: string, content: string | ArrayBuffer) {
+  async putFile(path: string, content: string | ArrayBuffer, _sha?: string) {
     const bytes = typeof content === "string" ? new TextEncoder().encode(content) : new Uint8Array(content);
     const base64 = Buffer.from(bytes).toString("base64");
     const sha = `sha-${++this.counter}`;
     this.putCounts.set(path, (this.putCounts.get(path) ?? 0) + 1);
     this.blobs.set(path, { content: base64, sha });
     return sha;
+  }
+
+  async deleteFile(path: string) {
+    this.blobs.delete(path);
   }
 }
 
@@ -87,6 +92,9 @@ function plugin(vault: MemoryVault, github: MemoryGitHub) {
     app: { vault },
     githubClient: github as unknown as GitHubClient,
     settings: {
+      encryptionMode: "encrypted",
+      syncEnabled: true,
+      syncOnLocalChange: true,
       encryptionPassphrase: "correct horse battery staple",
       ignorePathRegex: "",
       conflictPolicy: "copy",
@@ -94,6 +102,8 @@ function plugin(vault: MemoryVault, github: MemoryGitHub) {
     syncData: { files: {}, encrypted: { files: {} } },
     isSyncInProgress: false,
     isWatchEnabled: true,
+    debounceTimers: new Map<string, ReturnType<typeof setTimeout>>(),
+    ignoredFiles: new Set<string>(),
     disableWatch() {},
     enableWatch() {},
     addIgnoredFile(_path: string) {},
@@ -233,4 +243,85 @@ test("force pull refuses pack files whose plaintext hash differs from the manife
 
   assert.equal(targetVault.files.has("Notes/note-00000.md"), false);
   assert.match(Notice.messages.at(-1) ?? "", /integrity|hash/i);
+});
+
+test("encrypted rename moves manifest state without scanning the whole vault", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault({ "Notes/old.md": "same content", "Notes/other.md": "stable" });
+  const instance = plugin(vault, github) as never;
+  await encryptedForcePush(instance);
+
+  const oldObjectCount = [...github.blobs.keys()].filter(path => path.startsWith(".obsidian-github-sync-encrypted/objects/")).length;
+  const bytes = vault.files.get("Notes/old.md") ?? new Uint8Array();
+  vault.files.delete("Notes/old.md");
+  vault.set("Archive/new.md", bytes);
+  vault.getFilesCount = 0;
+  vault.readBinaryCount = 0;
+
+  await encryptedRename(vault.getAbstractFileByPath("Archive/new.md") as TFile, "Notes/old.md", instance, true);
+
+  assert.equal(vault.getFilesCount, 0);
+  assert.equal(vault.readBinaryCount, 1);
+  const store = new EncryptedManifestStore(github as unknown as GitHubClient, "correct horse battery staple");
+  const loaded = await store.loadOrCreate();
+  assert.equal(loaded.manifest.files["Notes/old.md"].deleted, true);
+  assert.equal(loaded.manifest.files["Archive/new.md"].deleted, false);
+  assert.equal(loaded.manifest.files["Archive/new.md"].objectPath, loaded.manifest.files["Notes/old.md"].objectPath);
+  assert.equal([...github.blobs.keys()].filter(path => path.startsWith(".obsidian-github-sync-encrypted/objects/")).length, oldObjectCount);
+});
+
+test("force push after a large vault shrinks clears obsolete pack metadata and remote pack objects", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault(manyFileEntries(10_001, "large"));
+  const instance = plugin(vault, github) as never;
+  await encryptedForcePush(instance);
+  assert.equal([...github.blobs.keys()].some(path => path.startsWith(".obsidian-github-sync-encrypted/packs/")), true);
+
+  vault.files.clear();
+  vault.mtimes.clear();
+  vault.set("Notes/only.md", new TextEncoder().encode("small"));
+  await encryptedForcePush(instance);
+
+  const store = new EncryptedManifestStore(github as unknown as GitHubClient, "correct horse battery staple");
+  const loaded = await store.loadOrCreate();
+  assert.equal(Object.keys(loaded.manifest.packs ?? {}).length, 0);
+  assert.deepEqual(Object.keys(loaded.manifest.files), ["Notes/only.md"]);
+  assert.equal([...github.blobs.keys()].some(path => path.startsWith(".obsidian-github-sync-encrypted/packs/")), false);
+});
+
+test("encrypted modify events are debounced and only push the final file state", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault({ "Notes/a.md": "initial" });
+  const instance = plugin(vault, github) as ReturnType<typeof plugin>;
+  await encryptedForcePush(instance as never);
+  const manifestPutsAfterInitialPush = github.putCounts.get(".obsidian-github-sync-encrypted/manifest.enc") ?? 0;
+
+  const originalSetTimeout = globalThis.setTimeout;
+  const originalClearTimeout = globalThis.clearTimeout;
+  const callbacks: Array<() => void> = [];
+  globalThis.setTimeout = ((callback: () => void) => {
+    callbacks.push(callback);
+    return callbacks.length as unknown as ReturnType<typeof setTimeout>;
+  }) as typeof setTimeout;
+  globalThis.clearTimeout = ((timer: ReturnType<typeof setTimeout>) => {
+    const index = Number(timer) - 1;
+    if (callbacks[index]) callbacks[index] = () => {};
+  }) as typeof clearTimeout;
+
+  try {
+    vault.set("Notes/a.md", new TextEncoder().encode("draft 1"));
+    NoteModify(vault.getAbstractFileByPath("Notes/a.md") as TFile, instance as never, true);
+    vault.set("Notes/a.md", new TextEncoder().encode("draft 2"));
+    NoteModify(vault.getAbstractFileByPath("Notes/a.md") as TFile, instance as never, true);
+    assert.equal(github.putCounts.get(".obsidian-github-sync-encrypted/manifest.enc") ?? 0, manifestPutsAfterInitialPush);
+    await callbacks.at(-1)?.();
+  } finally {
+    globalThis.setTimeout = originalSetTimeout;
+    globalThis.clearTimeout = originalClearTimeout;
+  }
+
+  assert.equal(github.putCounts.get(".obsidian-github-sync-encrypted/manifest.enc") ?? 0, manifestPutsAfterInitialPush + 1);
+  const pulledVault = new MemoryVault({});
+  await encryptedForcePull(plugin(pulledVault, github) as never);
+  assert.equal(new TextDecoder().decode(pulledVault.files.get("Notes/a.md")), "draft 2");
 });
