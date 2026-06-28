@@ -39,6 +39,12 @@ function configuredIgnoreRules(plugin: FastSync) {
   return compileIgnorePathRegex((plugin.settings as { ignorePathRegex?: string }).ignorePathRegex ?? "");
 }
 
+function blockIfEncryptedForcePushRequired(plugin: FastSync, operation: EncryptedSyncOperation, path?: string): boolean {
+  if (!(plugin.settings as { encryptedForcePushRequired?: boolean }).encryptedForcePushRequired || operation === "forcePush") return false;
+  reportSyncError(operation, new Error("Encrypted sync was just enabled. Run Force push once to initialize the encrypted remote state."), path);
+  return true;
+}
+
 async function loadStore(plugin: FastSync, allowForeignInit: boolean = false) {
   const store = new EncryptedManifestStore(plugin.githubClient, requireEncryptedPassphrase(plugin), allowForeignInit);
   return { store, ...(await store.loadOrCreate()) };
@@ -76,10 +82,7 @@ async function promptForeignRemoteForcePush(plugin: FastSync): Promise<boolean> 
 
 export async function encryptedSync(plugin: FastSync, options: EncryptedSyncOptions): Promise<void> {
   if (plugin.isSyncInProgress || !plugin.githubClient) return;
-  if ((plugin.settings as { encryptedForcePushRequired?: boolean }).encryptedForcePushRequired && options.operation !== "forcePush") {
-    reportSyncError(options.operation, new Error("Encrypted sync was just enabled. Run Force push once to initialize the encrypted remote state."));
-    return;
-  }
+  if (blockIfEncryptedForcePushRequired(plugin, options.operation)) return;
   plugin.isSyncInProgress = true;
   plugin.disableWatch();
   try {
@@ -88,12 +91,13 @@ export async function encryptedSync(plugin: FastSync, options: EncryptedSyncOpti
 
     let manifestChanged = false;
     if (options.operation === "forcePull") {
-      if (manifest.packs && Object.keys(manifest.packs).length > 0) await pullEncryptedPackChanges(plugin, key, manifest, ignoreRules);
-      else await pullEncryptedChanges(plugin, key, manifest, true);
+      if (manifest.packs && Object.keys(manifest.packs).length > 0) await pullEncryptedPackChanges(plugin, key, manifest, ignoreRules, true);
+      await pullEncryptedChanges(plugin, key, manifest, true);
       await deleteLocalFilesMissingFromRemote(plugin, manifest, ignoreRules);
     } else if (options.operation === "forcePush") {
       manifestChanged = await pushEncryptedForceLocalChanges(plugin, key, manifest, ignoreRules);
     } else {
+      if (manifest.packs && Object.keys(manifest.packs).length > 0) await pullEncryptedPackChanges(plugin, key, manifest, ignoreRules, false);
       await pullEncryptedChanges(plugin, key, manifest, false);
       manifestChanged = await pushEncryptedLocalChanges(plugin, key, manifest, ignoreRules, false);
     }
@@ -133,6 +137,7 @@ export async function encryptedModify(file: TAbstractFile, plugin: FastSync, eve
   if (!(file instanceof TFile)) return;
   if (!plugin.isWatchEnabled && eventEnter) return;
   if (!shouldSyncEncryptedFile(file, configuredIgnoreRules(plugin)) || !plugin.githubClient) return;
+  if (blockIfEncryptedForcePushRequired(plugin, "localChange", file.path)) return;
   try {
     const { store, key, manifest, manifestSha } = await loadStore(plugin);
     const path = normalizeVaultPath(file.path);
@@ -149,8 +154,9 @@ export async function encryptedModify(file: TAbstractFile, plugin: FastSync, eve
       return;
     }
 
-    const objectId = existing?.id ?? toBase64Url(randomBytes(OBJECT_ID_BYTES));
-    const uploaded = await uploadEncryptedFileObject(plugin.githubClient, key, objectId, plaintext, existing);
+    const reusableExisting = existing?.storage === "pack" ? undefined : existing;
+    const objectId = reusableExisting?.id ?? toBase64Url(randomBytes(OBJECT_ID_BYTES));
+    const uploaded = await uploadEncryptedFileObject(plugin.githubClient, key, objectId, plaintext, reusableExisting);
     manifest.files[path] = { ...uploaded, path, plaintextSha256, mtime: file.stat.mtime, deleted: false, deletedAt: undefined };
     const newManifestSha = await store.save(manifest, key, manifestSha);
     state.manifestSha = newManifestSha;
@@ -164,6 +170,7 @@ export async function encryptedModify(file: TAbstractFile, plugin: FastSync, eve
 export async function encryptedDelete(file: TAbstractFile, plugin: FastSync, eventEnter = false): Promise<void> {
   if (!plugin.isWatchEnabled && eventEnter) return;
   if (!plugin.githubClient) return;
+  if (blockIfEncryptedForcePushRequired(plugin, "localChange", file.path)) return;
   try {
     const { store, key, manifest, manifestSha } = await loadStore(plugin);
     const path = normalizeVaultPath(file.path);
@@ -182,13 +189,14 @@ export async function encryptedDelete(file: TAbstractFile, plugin: FastSync, eve
 
 export async function encryptedRename(_file: TAbstractFile, _oldfile: string, plugin: FastSync, eventEnter = false): Promise<void> {
   if (!plugin.isWatchEnabled && eventEnter) return;
+  if (blockIfEncryptedForcePushRequired(plugin, "localChange", _file.path)) return;
   await encryptedSync(plugin, { operation: "localChange" });
 }
 
 async function pullEncryptedChanges(plugin: FastSync, key: CryptoKey, manifest: EncryptedManifest, force: boolean): Promise<void> {
   const state = ensureEncryptedState(plugin);
   for (const [path, record] of Object.entries(manifest.files)) {
-    if (record.deleted) continue;
+    if (record.deleted || record.storage === "pack") continue;
     const localState = state.files[path];
     if (!force && localState?.plaintextSha256 === record.plaintextSha256) continue;
     const plaintext = await downloadEncryptedFileObject(plugin.githubClient, key, record);
@@ -240,7 +248,7 @@ async function pushEncryptedPackLocalChanges(plugin: FastSync, key: CryptoKey, m
       if (!file) continue;
       const bytes = await readVaultFileBytes(plugin.app.vault, file);
       const plaintextSha256 = await sha256Hex(bytes);
-      archiveFiles.push({ path: entry.path, mtime: entry.mtime, bytes });
+      archiveFiles.push({ path: entry.path, mtime: entry.mtime, bytes, plaintextSha256 });
       manifest.files[entry.path] = {
         id: `${pack.id}:${entry.path}`,
         path: entry.path,
@@ -259,16 +267,36 @@ async function pushEncryptedPackLocalChanges(plugin: FastSync, key: CryptoKey, m
   return true;
 }
 
-async function pullEncryptedPackChanges(plugin: FastSync, key: CryptoKey, manifest: EncryptedManifest, ignoreRules: ReturnType<typeof compileIgnorePathRegex>): Promise<void> {
+async function pullEncryptedPackChanges(plugin: FastSync, key: CryptoKey, manifest: EncryptedManifest, ignoreRules: ReturnType<typeof compileIgnorePathRegex>, force: boolean): Promise<void> {
   const state = ensureEncryptedState(plugin);
   for (const pack of Object.values(manifest.packs ?? {})) {
     const files = await downloadEncryptedPack(plugin.githubClient, key, pack);
     for (const file of files) {
       const record = manifest.files[file.path];
-      if (!record || record.deleted) continue;
-      const localState = state.files[file.path];
-      if (localState?.plaintextSha256 === record.plaintextSha256) continue;
+      if (!record || record.deleted || record.storage !== "pack" || record.packId !== pack.id) continue;
       if (!shouldSyncEncryptedFile({ path: file.path, stat: { size: file.bytes.byteLength, mtime: file.mtime } } as TFile, ignoreRules)) continue;
+      const plaintextSha256 = await sha256Hex(file.bytes);
+      if (plaintextSha256 !== record.plaintextSha256) throw new Error(`Encrypted pack file failed integrity check for ${file.path}.`);
+      const localState = state.files[file.path];
+      if (!force && localState?.plaintextSha256 === record.plaintextSha256) continue;
+      const localFile = plugin.app.vault.getAbstractFileByPath(file.path);
+      if (!force && localFile instanceof TFile && localState) {
+        const localHash = await sha256Hex(await readVaultFileBytes(plugin.app.vault, localFile));
+        if (localState.plaintextSha256 !== localHash) {
+          const resolution = await chooseConflictResolution(plugin, configuredConflictPolicy(plugin), file.path, localFile, record.mtime);
+          if (resolution === "keep-local") continue;
+          if (resolution === "copy-remote") {
+            await writeVaultFileBytes(plugin.app.vault, conflictPathFor(file.path, Date.now(), "remote"), file.bytes);
+            continue;
+          }
+          if (resolution === "merged") {
+            const localText = await plugin.app.vault.read(localFile);
+            const remoteText = new TextDecoder().decode(file.bytes);
+            await writeVaultFileBytes(plugin.app.vault, file.path, new TextEncoder().encode(mergeTextContent(localText, remoteText)));
+            continue;
+          }
+        }
+      }
       plugin.addIgnoredFile(file.path);
       try {
         await writeVaultFileBytes(plugin.app.vault, file.path, file.bytes);
@@ -298,8 +326,9 @@ async function pushEncryptedLocalChanges(plugin: FastSync, key: CryptoKey, manif
     const plaintext = await readVaultFileBytes(plugin.app.vault, file);
     const plaintextSha256 = await sha256Hex(plaintext);
     if (!force && existing && !existing.deleted && existing.plaintextSha256 === plaintextSha256) continue;
-    const objectId = existing?.id ?? toBase64Url(randomBytes(OBJECT_ID_BYTES));
-    const uploaded = await uploadEncryptedFileObject(plugin.githubClient, key, objectId, plaintext, existing);
+    const reusableExisting = existing?.storage === "pack" ? undefined : existing;
+    const objectId = reusableExisting?.id ?? toBase64Url(randomBytes(OBJECT_ID_BYTES));
+    const uploaded = await uploadEncryptedFileObject(plugin.githubClient, key, objectId, plaintext, reusableExisting);
     manifest.files[path] = { ...uploaded, path, plaintextSha256, mtime: file.stat.mtime, deleted: false, deletedAt: undefined };
     changed = true;
   }

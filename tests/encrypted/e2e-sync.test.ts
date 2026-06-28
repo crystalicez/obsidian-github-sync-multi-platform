@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { TFile } from "obsidian";
+import { Notice, TFile } from "obsidian";
 import { encryptedForcePull, encryptedForcePush, encryptedFullSync, encryptedModify } from "../../src/lib/encrypted/sync-engine";
 import { GitHubClient } from "../../src/lib/github-api";
+import { EncryptedManifestStore } from "../../src/lib/encrypted/manifest-store";
 
 class MemoryGitHub {
   blobs = new Map<string, { content: string; sha: string }>();
@@ -101,6 +102,22 @@ function plugin(vault: MemoryVault, github: MemoryGitHub) {
   };
 }
 
+
+function manyFileEntries(count: number, prefix = "v1"): Record<string, string> {
+  const entries: Record<string, string> = {};
+  for (let index = 0; index < count; index++) entries[`Notes/note-${String(index).padStart(5, "0")}.md`] = `${prefix}-${index}`;
+  return entries;
+}
+
+async function withMutedConsoleError(run: () => Promise<void>): Promise<void> {
+  const originalConsoleError = console.error;
+  console.error = () => {};
+  try {
+    await run();
+  } finally {
+    console.error = originalConsoleError;
+  }
+}
 test("force push then force pull round trips encrypted vault bytes", async () => {
   const github = new MemoryGitHub();
   const sourceVault = new MemoryVault({ "Notes/a.md": "hello encrypted world" });
@@ -155,16 +172,65 @@ test("encrypted sync requires force push after enabling encryption from plaintex
   const instance = plugin(vault, github) as never;
   (instance as { settings: { encryptedForcePushRequired?: boolean } }).settings.encryptedForcePushRequired = true;
 
-  const originalConsoleError = console.error;
-  console.error = () => {};
-  try {
+  await withMutedConsoleError(async () => {
     await encryptedFullSync(instance);
-  } finally {
-    console.error = originalConsoleError;
-  }
+  });
   assert.equal(github.blobs.has(".obsidian-github-sync-encrypted/manifest.enc"), false);
 
   await encryptedForcePush(instance);
   assert.equal(github.blobs.has(".obsidian-github-sync-encrypted/manifest.enc"), true);
   assert.equal((instance as { settings: { encryptedForcePushRequired?: boolean } }).settings.encryptedForcePushRequired, false);
+});
+
+test("normal encrypted sync restores changed files from pack mode without writing archive bytes", async () => {
+  const github = new MemoryGitHub();
+  const sourceVault = new MemoryVault(manyFileEntries(10_001, "v1"));
+  const source = plugin(sourceVault, github) as never;
+  await encryptedForcePush(source);
+
+  const targetVault = new MemoryVault({});
+  const target = plugin(targetVault, github) as never;
+  await encryptedForcePull(target);
+  assert.equal(new TextDecoder().decode(targetVault.files.get("Notes/note-00000.md")), "v1-0");
+
+  sourceVault.set("Notes/note-00000.md", new TextEncoder().encode("v2-0"));
+  await encryptedForcePush(source);
+  await encryptedFullSync(target);
+
+  assert.equal(new TextDecoder().decode(targetVault.files.get("Notes/note-00000.md")), "v2-0");
+});
+
+test("encrypted local modify is blocked until force push after enabling encryption", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault({ "Notes/a.md": "needs migration" });
+  const instance = plugin(vault, github) as never;
+  (instance as { settings: { encryptedForcePushRequired?: boolean } }).settings.encryptedForcePushRequired = true;
+
+  await withMutedConsoleError(async () => {
+    await encryptedModify(vault.getAbstractFileByPath("Notes/a.md") as TFile, instance, true);
+  });
+
+  assert.equal(github.blobs.has(".obsidian-github-sync-encrypted/manifest.enc"), false);
+});
+
+test("force pull refuses pack files whose plaintext hash differs from the manifest", async () => {
+  const github = new MemoryGitHub();
+  const sourceVault = new MemoryVault(manyFileEntries(10_001, "hash"));
+  const source = plugin(sourceVault, github) as never;
+  await encryptedForcePush(source);
+
+  const store = new EncryptedManifestStore(github as unknown as GitHubClient, "correct horse battery staple");
+  const loaded = await store.loadOrCreate();
+  loaded.manifest.files["Notes/note-00000.md"].plaintextSha256 = "0".repeat(64);
+  await store.save(loaded.manifest, loaded.key, loaded.manifestSha);
+
+  const targetVault = new MemoryVault({});
+  const target = plugin(targetVault, github) as never;
+  Notice.messages.length = 0;
+  await withMutedConsoleError(async () => {
+    await encryptedForcePull(target);
+  });
+
+  assert.equal(targetVault.files.has("Notes/note-00000.md"), false);
+  assert.match(Notice.messages.at(-1) ?? "", /integrity|hash/i);
 });

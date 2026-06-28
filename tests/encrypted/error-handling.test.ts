@@ -72,3 +72,24 @@ test("manifest store reuses derived encryption keys for the same passphrase and 
     crypto.subtle.deriveKey = originalDeriveKey as SubtleCrypto["deriveKey"];
   }
 });
+
+test("manifest store rejects decrypted manifests with unsafe paths", async () => {
+  const github = new FakeGitHub() as unknown as GitHubClient;
+  const first = new EncryptedManifestStore(github, "pw", true);
+  const loaded = await first.loadOrCreate();
+  loaded.manifest.files["../escape.md"] = {
+    id: "unsafe",
+    path: "../escape.md",
+    objectPath: ".obsidian-github-sync-encrypted/objects/un/safe/unsafe.enc",
+    plaintextSha256: "0".repeat(64),
+    size: 1,
+    mtime: 1,
+    storage: "single",
+  };
+  await first.save(loaded.manifest, loaded.key, loaded.manifestSha);
+
+  await assert.rejects(
+    () => new EncryptedManifestStore(github, "pw").loadOrCreate(),
+    /Invalid encrypted manifest/u,
+  );
+});

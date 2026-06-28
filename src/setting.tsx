@@ -72,8 +72,19 @@ export class SettingTab extends PluginSettingTab {
   async confirmForce(title: string, message: string, operation: "forcePush" | "forcePull"): Promise<void> {
     await new Promise<void>((resolve) => {
       const modal = new Modal(this.app)
+      const repo = `${this.plugin.settings.githubOwner}/${this.plugin.settings.githubRepo}`
+      const branch = this.plugin.settings.githubBranch || "main"
+      const localFileCount = this.app.vault.getFiles().filter(file => !file.path.startsWith(`${this.app.vault.configDir}/`)).length
+      const confirmPhrase = `${operation === "forcePush" ? "push" : "pull"} ${repo} ${branch}`
       modal.titleEl.setText(title)
       modal.contentEl.createEl("p", { text: message })
+      modal.contentEl.createEl("p", { text: `Repository: ${repo}` })
+      modal.contentEl.createEl("p", { text: `Branch: ${branch}` })
+      modal.contentEl.createEl("p", { text: `Local vault files: ${localFileCount}` })
+      modal.contentEl.createEl("p", { text: `Type "${confirmPhrase}" to confirm.` })
+      const input = modal.contentEl.createEl("input")
+      input.type = "text"
+      input.placeholder = confirmPhrase
       const buttons = modal.contentEl.createDiv()
       buttons.createEl("button", { text: "Cancel" }).onclick = () => {
         modal.close()
@@ -81,7 +92,12 @@ export class SettingTab extends PluginSettingTab {
       }
       const confirmButton = buttons.createEl("button", { text: operation === "forcePush" ? "Force push" : "Force pull" })
       confirmButton.addClass("mod-warning")
+      confirmButton.disabled = true
+      input.oninput = () => {
+        confirmButton.disabled = input.value.trim() !== confirmPhrase
+      }
       confirmButton.onclick = () => {
+        if (input.value.trim() !== confirmPhrase) return
         modal.close()
         if (operation === "forcePush") void encryptedForcePush(this.plugin)
         else void encryptedForcePull(this.plugin)
@@ -90,6 +106,7 @@ export class SettingTab extends PluginSettingTab {
       modal.open()
     })
   }
+
   hide(): void {
     // 不再需要 React root.unmount()
   }
