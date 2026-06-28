@@ -12,6 +12,7 @@ const requiredModules = [
   "manifest-store",
   "paths",
   "remote-state",
+  "settings-policy",
   "sync-engine",
   "sync-errors",
   "types",
@@ -23,6 +24,7 @@ const testFiles = [
   "tests/encrypted/error-handling.test.ts",
   "tests/encrypted/e2e-sync.test.ts",
   "tests/encrypted/benchmark.test.ts",
+  "tests/encrypted/settings-combinations.test.ts",
 ];
 
 const contents = await Promise.all(testFiles.map(file => readFile(path.join(root, file), "utf8")));

@@ -10,6 +10,7 @@ const tsEntries = [
   "tests/encrypted/error-handling.test.ts",
   "tests/encrypted/e2e-sync.test.ts",
   "tests/encrypted/benchmark.test.ts",
+  "tests/encrypted/settings-combinations.test.ts",
 ];
 
 await rm(outDir, { recursive: true, force: true });

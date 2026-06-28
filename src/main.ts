@@ -6,6 +6,7 @@ import { GitHubClient } from "./lib/github-api";
 import { $, moment } from "./lang/lang";
 import { calculateWordCount } from "./lib/helps";
 import type { EncryptedLocalFileState } from "./lib/encrypted/types";
+import { normalizeScheduledSyncIntervalSeconds, shouldRunScheduledSync, shouldRunStartupSync } from "./lib/encrypted/settings-policy";
 
 
 interface SyncSkipFiles {
@@ -111,12 +112,7 @@ export default class FastSync extends Plugin {
 
     // 布局加载完成后统一执行启动同步，完成后再开启实时 watch
     this.app.workspace.onLayoutReady(() => {
-      if (
-        this.settings.syncEnabled &&
-        this.settings.githubToken &&
-        this.settings.githubOwner &&
-        this.settings.githubRepo
-      ) {
+      if (shouldRunStartupSync(this.settings)) {
         // 延迟 1.5 秒，等待 Obsidian 初始化完成
         setTimeout(() => {
           // syncAllFilesImpl 内部完成后会调用 enableWatch()
@@ -151,8 +147,8 @@ export default class FastSync extends Plugin {
   registerScheduledSync() {
     if (this.scheduledSyncTimer) window.clearInterval(this.scheduledSyncTimer);
     this.scheduledSyncTimer = null;
-    if (!this.settings.syncEnabled || !this.settings.scheduledSyncEnabled) return;
-    const seconds = Math.max(1, Number(this.settings.scheduledSyncIntervalSeconds || 0));
+    if (!shouldRunScheduledSync(this.settings)) return;
+    const seconds = normalizeScheduledSyncIntervalSeconds(this.settings.scheduledSyncIntervalSeconds);
     this.scheduledSyncTimer = window.setInterval(() => {
       if (!this.isSyncInProgress) StartupFullNotesSync(this);
     }, seconds * 1000);

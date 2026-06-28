@@ -8,6 +8,7 @@ import { EncryptedManifestStore } from "./manifest-store";
 import { conflictPathFor, normalizeVaultPath } from "./paths";
 import { isForeignRemoteError, reportSyncError } from "./sync-errors";
 import { ConflictPolicy, EncryptedLocalFileState, EncryptedManifest, EncryptedObjectRecord, EncryptedSyncOperation } from "./types";
+import { effectiveConflictPolicy } from "./settings-policy";
 import { deleteVaultFileIfExists, listEncryptedSyncCandidates, readVaultFileBytes, shouldSyncEncryptedFile, writeVaultFileBytes } from "./vault";
 import { randomBytes, sha256Hex, toBase64Url } from "./bytes";
 
@@ -28,7 +29,7 @@ function requireEncryptedPassphrase(plugin: FastSync): string {
 }
 
 function configuredConflictPolicy(plugin: FastSync): ConflictPolicy {
-  return ((plugin.settings as { conflictPolicy?: ConflictPolicy }).conflictPolicy ?? "copy") as ConflictPolicy;
+  return effectiveConflictPolicy((plugin.settings as { conflictPolicy?: ConflictPolicy }).conflictPolicy);
 }
 
 function configuredIgnoreRules(plugin: FastSync) {

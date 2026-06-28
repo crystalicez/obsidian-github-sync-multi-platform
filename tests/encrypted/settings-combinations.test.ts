@@ -1,0 +1,111 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+
+import {
+  effectiveConflictPolicy,
+  normalizeScheduledSyncIntervalSeconds,
+  shouldHandleEncryptedLocalChange,
+  shouldRunScheduledSync,
+  shouldRunStartupSync,
+  syncModeUsesEncryption,
+} from "../../src/lib/encrypted/settings-policy";
+import type { ConflictPolicy } from "../../src/lib/encrypted/types";
+
+type Mode = "plaintext" | "encrypted";
+
+interface SettingsCase {
+  syncEnabled: boolean;
+  encryptionMode: Mode;
+  githubToken: string;
+  githubOwner: string;
+  githubRepo: string;
+  syncOnStartup: boolean;
+  syncOnLocalChange: boolean;
+  scheduledSyncEnabled: boolean;
+  scheduledSyncIntervalSeconds: number;
+  conflictPolicy: ConflictPolicy;
+  ignorePathRegex: string;
+}
+
+const bools = [false, true];
+const modes: Mode[] = ["plaintext", "encrypted"];
+const policies: ConflictPolicy[] = ["copy", "newer", "merge", "ask"];
+
+function settingsFor(options: {
+  syncEnabled: boolean;
+  mode: Mode;
+  hasConfig: boolean;
+  syncOnStartup: boolean;
+  syncOnLocalChange: boolean;
+  scheduledSyncEnabled: boolean;
+  conflictPolicy: ConflictPolicy;
+}): SettingsCase {
+  return {
+    syncEnabled: options.syncEnabled,
+    encryptionMode: options.mode,
+    githubToken: options.hasConfig ? "token" : "",
+    githubOwner: options.hasConfig ? "owner" : "",
+    githubRepo: options.hasConfig ? "repo" : "",
+    syncOnStartup: options.syncOnStartup,
+    syncOnLocalChange: options.syncOnLocalChange,
+    scheduledSyncEnabled: options.scheduledSyncEnabled,
+    scheduledSyncIntervalSeconds: 300,
+    conflictPolicy: options.conflictPolicy,
+    ignorePathRegex: "",
+  };
+}
+
+test("settings policy covers every automatic-sync boolean/mode/conflict combination", () => {
+  let combinations = 0;
+
+  for (const syncEnabled of bools) {
+    for (const mode of modes) {
+      for (const hasConfig of bools) {
+        for (const syncOnStartup of bools) {
+          for (const syncOnLocalChange of bools) {
+            for (const scheduledSyncEnabled of bools) {
+              for (const conflictPolicy of policies) {
+                combinations += 1;
+                const settings = settingsFor({
+                  syncEnabled,
+                  mode,
+                  hasConfig,
+                  syncOnStartup,
+                  syncOnLocalChange,
+                  scheduledSyncEnabled,
+                  conflictPolicy,
+                });
+
+                assert.equal(syncModeUsesEncryption(settings), mode === "encrypted");
+                assert.equal(shouldRunStartupSync(settings), syncEnabled && syncOnStartup && hasConfig);
+                assert.equal(shouldRunScheduledSync(settings), syncEnabled && scheduledSyncEnabled);
+                assert.equal(shouldHandleEncryptedLocalChange(settings, true), mode === "encrypted" && syncEnabled && syncOnLocalChange);
+                assert.equal(shouldHandleEncryptedLocalChange(settings, false), mode === "encrypted");
+                assert.equal(effectiveConflictPolicy(settings.conflictPolicy), conflictPolicy);
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  assert.equal(combinations, 2 * 2 * 2 * 2 * 2 * 2 * 4);
+});
+
+test("settings policy normalizes schedule intervals and invalid conflict policies", () => {
+  assert.equal(normalizeScheduledSyncIntervalSeconds(300), 300);
+  assert.equal(normalizeScheduledSyncIntervalSeconds(1), 1);
+  assert.equal(normalizeScheduledSyncIntervalSeconds(2.9), 2);
+  assert.equal(normalizeScheduledSyncIntervalSeconds(0), 300);
+  assert.equal(normalizeScheduledSyncIntervalSeconds(-10), 300);
+  assert.equal(normalizeScheduledSyncIntervalSeconds(Number.NaN), 300);
+  assert.equal(normalizeScheduledSyncIntervalSeconds("15"), 15);
+  assert.equal(normalizeScheduledSyncIntervalSeconds(""), 300);
+
+  assert.equal(effectiveConflictPolicy("copy"), "copy");
+  assert.equal(effectiveConflictPolicy("newer"), "newer");
+  assert.equal(effectiveConflictPolicy("merge"), "merge");
+  assert.equal(effectiveConflictPolicy("ask"), "ask");
+  assert.equal(effectiveConflictPolicy("overwrite"), "copy");
+});
