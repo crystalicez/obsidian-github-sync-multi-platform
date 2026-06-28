@@ -54,3 +54,21 @@ test("wrong passphrase and user-facing error messages are specific", () => {
   assert.match(wrong.message, /passphrase is wrong/u);
   assert.equal(userMessageForSyncError("forcePull", wrong, "Notes/a.md"), `Encrypted forcePull failed for Notes/a.md: ${wrong.message}`);
 });
+
+test("manifest store reuses derived encryption keys for the same passphrase and config", async () => {
+  const originalDeriveKey = crypto.subtle.deriveKey.bind(crypto.subtle);
+  let deriveKeyCalls = 0;
+  crypto.subtle.deriveKey = ((...args: Parameters<SubtleCrypto["deriveKey"]>) => {
+    deriveKeyCalls += 1;
+    return originalDeriveKey(...args);
+  }) as SubtleCrypto["deriveKey"];
+
+  try {
+    const github = new FakeGitHub() as unknown as GitHubClient;
+    await new EncryptedManifestStore(github, "cache-test-passphrase", true).loadOrCreate();
+    await new EncryptedManifestStore(github, "cache-test-passphrase", true).loadOrCreate();
+    assert.equal(deriveKeyCalls, 1);
+  } finally {
+    crypto.subtle.deriveKey = originalDeriveKey as SubtleCrypto["deriveKey"];
+  }
+});

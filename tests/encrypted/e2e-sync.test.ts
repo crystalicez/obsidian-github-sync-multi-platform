@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { TFile } from "obsidian";
-import { encryptedForcePull, encryptedForcePush } from "../../src/lib/encrypted/sync-engine";
+import { encryptedForcePull, encryptedForcePush, encryptedFullSync, encryptedModify } from "../../src/lib/encrypted/sync-engine";
 import { GitHubClient } from "../../src/lib/github-api";
 
 class MemoryGitHub {
   blobs = new Map<string, { content: string; sha: string }>();
   counter = 0;
+  putCounts = new Map<string, number>();
 
   async getTree() {
     return {
@@ -27,6 +28,7 @@ class MemoryGitHub {
     const bytes = typeof content === "string" ? new TextEncoder().encode(content) : new Uint8Array(content);
     const base64 = Buffer.from(bytes).toString("base64");
     const sha = `sha-${++this.counter}`;
+    this.putCounts.set(path, (this.putCounts.get(path) ?? 0) + 1);
     this.blobs.set(path, { content: base64, sha });
     return sha;
   }
@@ -35,6 +37,8 @@ class MemoryGitHub {
 class MemoryVault {
   files = new Map<string, Uint8Array>();
   mtimes = new Map<string, number>();
+  readBinaryCount = 0;
+  getFilesCount = 0;
 
   constructor(entries: Record<string, string> = {}) {
     for (const [path, content] of Object.entries(entries)) this.set(path, new TextEncoder().encode(content));
@@ -46,6 +50,7 @@ class MemoryVault {
   }
 
   getFiles() {
+    this.getFilesCount += 1;
     return [...this.files.entries()].map(([path, bytes]) => {
       const file = new TFile(path, bytes);
       file.stat.mtime = this.mtimes.get(path) ?? Date.now();
@@ -62,6 +67,7 @@ class MemoryVault {
   }
 
   async readBinary(file: TFile) {
+    this.readBinaryCount += 1;
     return this.files.get(file.path)?.buffer.slice(0) ?? new ArrayBuffer(0);
   }
 
@@ -86,6 +92,7 @@ function plugin(vault: MemoryVault, github: MemoryGitHub) {
     },
     syncData: { files: {}, encrypted: { files: {} } },
     isSyncInProgress: false,
+    isWatchEnabled: true,
     disableWatch() {},
     enableWatch() {},
     addIgnoredFile(_path: string) {},
@@ -108,4 +115,35 @@ test("force push then force pull round trips encrypted vault bytes", async () =>
 
   assert.equal(new TextDecoder().decode(targetVault.files.get("Notes/a.md")), "hello encrypted world");
   assert.equal(targetVault.files.has("local-only.md"), false);
+});
+
+test("normal encrypted sync skips unchanged file reads and manifest writes", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault({ "Notes/a.md": "stable content" });
+  const instance = plugin(vault, github) as never;
+
+  await encryptedForcePush(instance);
+  const manifestPutsAfterInitialPush = github.putCounts.get(".obsidian-github-sync-encrypted/manifest.enc") ?? 0;
+  vault.readBinaryCount = 0;
+
+  await encryptedFullSync(instance);
+
+  assert.equal(vault.readBinaryCount, 0);
+  assert.equal(github.putCounts.get(".obsidian-github-sync-encrypted/manifest.enc") ?? 0, manifestPutsAfterInitialPush);
+});
+test("encrypted local modify pushes only the changed file without scanning the vault", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault({ "Notes/a.md": "old", "Notes/b.md": "stable" });
+  const instance = plugin(vault, github) as never;
+
+  await encryptedForcePush(instance);
+  vault.set("Notes/a.md", new TextEncoder().encode("new"));
+  vault.readBinaryCount = 0;
+  vault.getFilesCount = 0;
+
+  const changedFile = vault.getAbstractFileByPath("Notes/a.md") as TFile;
+  await encryptedModify(changedFile, instance, true);
+
+  assert.equal(vault.getFilesCount, 0);
+  assert.equal(vault.readBinaryCount, 1);
 });

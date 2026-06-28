@@ -52,4 +52,6 @@ export interface EncryptedLocalFileState {
   storage?: EncryptedStorageKind;
   chunks?: EncryptedChunkRecord[];
   manifestUpdatedAt: number;
+  size?: number;
+  mtime?: number;
 }

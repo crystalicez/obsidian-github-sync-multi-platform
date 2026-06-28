@@ -1,4 +1,5 @@
 import { requestUrl } from "obsidian";
+import { bytesToUtf8, fromBase64, toBase64, utf8ToBytes } from "./encrypted/bytes";
 
 export interface GitHubConfig {
   owner: string;
@@ -118,22 +119,7 @@ export class GitHubClient {
     const encodedPath = path.split('/').map(encodeURIComponent).join('/');
     const url = `${this.baseUrl}/contents/${encodedPath}`;
 
-    let base64Content: string;
-    if (typeof content === "string") {
-      const uint8 = new TextEncoder().encode(content);
-      let binary = "";
-      for (let i = 0; i < uint8.byteLength; i++) {
-        binary += String.fromCharCode(uint8[i]);
-      }
-      base64Content = btoa(binary);
-    } else {
-      const bytes = new Uint8Array(content);
-      let binary = "";
-      for (let i = 0; i < bytes.byteLength; i++) {
-        binary += String.fromCharCode(bytes[i]);
-      }
-      base64Content = btoa(binary);
-    }
+    const base64Content = typeof content === "string" ? toBase64(utf8ToBytes(content)) : toBase64(content);
 
     const body: Record<string, unknown> = {
       message: `sync: ${sha ? "update" : "create"} ${path}`,
@@ -220,19 +206,10 @@ export class GitHubClient {
 
   // Helper to decode base64 content from GitHub
   static decodeContent(base64Content: string): string {
-    const binary = atob(base64Content.replace(/\n/g, ""));
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) {
-      bytes[i] = binary.charCodeAt(i);
-    }
-    return new TextDecoder().decode(bytes);
+    return bytesToUtf8(GitHubClient.decodeContentBytes(base64Content));
   }
 
   static decodeContentBytes(base64Content: string): Uint8Array {
-    const binary = atob(base64Content.replace(/\n/g, ""));
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) {
-      bytes[i] = binary.charCodeAt(i);
-    }
-    return bytes;
-  }}
+    return fromBase64(base64Content);
+  }
+}

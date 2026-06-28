@@ -4,6 +4,7 @@ import { performance } from "node:perf_hooks";
 import { compileIgnorePathRegex, isIgnoredPath } from "../../src/lib/encrypted/ignore";
 import { toBase64Url, toHex } from "../../src/lib/encrypted/bytes";
 import { chunkPathForId } from "../../src/lib/encrypted/large-objects";
+import { GitHubClient } from "../../src/lib/github-api";
 
 test("benchmark: ignore regex matching remains comfortably fast", () => {
   const rules = compileIgnorePathRegex(Array.from({ length: 500 }, (_, index) => `^Folder${index}/`).join("\n"));
@@ -35,4 +36,18 @@ test("benchmark: byte encoding remains fast for 1 MiB payloads", () => {
   const hexElapsed = performance.now() - hexStart;
   assert.equal(hex.length, 2 * bytes.byteLength);
   assert.ok(hexElapsed < 45, `hex encoding benchmark took ${hexElapsed}ms`);
+});
+
+test("benchmark: GitHub content decoding remains fast for 1 MiB payloads", () => {
+  const bytes = new Uint8Array(1024 * 1024);
+  for (let i = 0; i < bytes.byteLength; i++) bytes[i] = i & 0xff;
+  const base64 = Buffer.from(bytes).toString("base64");
+
+  const start = performance.now();
+  const decoded = GitHubClient.decodeContentBytes(base64);
+  const elapsed = performance.now() - start;
+
+  assert.equal(decoded.byteLength, bytes.byteLength);
+  assert.equal(decoded[decoded.byteLength - 1], bytes[bytes.byteLength - 1]);
+  assert.ok(elapsed < 8, `GitHub content decode benchmark took ${elapsed}ms`);
 });

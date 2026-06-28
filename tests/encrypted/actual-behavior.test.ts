@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { TFile } from "obsidian";
-import { bytesToUtf8, fromBase64Url, sha256Hex, toBase64Url, utf8ToBytes } from "../../src/lib/encrypted/bytes";
+import { bytesToUtf8, fromBase64, fromBase64Url, sha256Hex, toBase64, toBase64Url, utf8ToBytes } from "../../src/lib/encrypted/bytes";
 import { chooseNewerResolution, isTextLikePath, mergeTextContent } from "../../src/lib/encrypted/conflicts";
 import { GITHUB_RECOMMENDED_MAX_BYTES } from "../../src/lib/encrypted/constants";
 import { decryptJson, deriveEncryptionKey, encryptJson } from "../../src/lib/encrypted/crypto";
@@ -15,6 +15,7 @@ test("bytes helpers round trip UTF-8 and hash deterministically", async () => {
   const bytes = utf8ToBytes("ภาษาไทย/emoji 🚀");
   assert.equal(bytesToUtf8(bytes), "ภาษาไทย/emoji 🚀");
   assert.deepEqual(fromBase64Url(toBase64Url(bytes)), bytes);
+  assert.deepEqual(fromBase64(toBase64(bytes)), bytes);
   assert.equal(await sha256Hex(bytes), await sha256Hex(bytes));
 });
 

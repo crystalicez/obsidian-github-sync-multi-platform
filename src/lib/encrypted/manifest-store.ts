@@ -7,13 +7,24 @@ import { classifyRemoteRepo } from "./remote-state";
 import { ForeignRemoteError, WrongPassphraseError } from "./sync-errors";
 
 const DEFAULT_PBKDF2_ITERATIONS = 600000;
+const derivedKeyCache = new Map<string, Promise<CryptoKey>>();
+
+function cachedEncryptionKey(passphrase: string, config: EncryptedRepoConfig): Promise<CryptoKey> {
+  const cacheKey = `${config.kdf}:${config.kdfParams.iterations}:${config.kdfParams.salt}:${passphrase}`;
+  let key = derivedKeyCache.get(cacheKey);
+  if (!key) {
+    key = deriveEncryptionKey(passphrase, config);
+    derivedKeyCache.set(cacheKey, key);
+  }
+  return key;
+}
 
 export class EncryptedManifestStore {
   constructor(private readonly github: GitHubClient, private readonly passphrase: string, private readonly allowForeignInit: boolean = false) {}
 
   async loadOrCreate(): Promise<{ config: EncryptedRepoConfig; manifest: EncryptedManifest; manifestSha?: string; key: CryptoKey }> {
     const config = await this.loadOrCreateConfig();
-    const key = await deriveEncryptionKey(this.passphrase, config);
+    const key = await cachedEncryptionKey(this.passphrase, config);
     const remoteManifest = await this.github.getFile(ENCRYPTED_MANIFEST_PATH);
     if (!remoteManifest) {
       return {
