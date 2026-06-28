@@ -6,7 +6,11 @@ import { EncryptedChunkRecord, EncryptedObjectRecord } from "./types";
 import { sha256Hex } from "./bytes";
 
 export function chunkPathForId(id: string, index: number): string {
-  return `${objectPathForId(id).replace(/\.enc$/u, ".parts")}/${String(index).padStart(6, "0")}.enc`;
+  return `${encryptedChunkObjectsRoot(id)}/${String(index).padStart(6, "0")}.enc`;
+}
+
+function encryptedChunkObjectsRoot(id: string): string {
+  return `${objectPathForId(id).slice(0, -4)}.parts`;
 }
 
 export function shouldChunkEncryptedPayload(payload: string): boolean {
@@ -29,10 +33,11 @@ export async function uploadEncryptedFileObject(
   }
 
   const chunks: EncryptedChunkRecord[] = [];
+  const previousChunksByIndex = new Map((existing?.chunks ?? []).map(chunk => [chunk.index, chunk] as const));
   for (let offset = 0, index = 1; offset < plaintext.byteLength; offset += ENCRYPTED_CHUNK_PLAINTEXT_BYTES, index++) {
-    const part = plaintext.slice(offset, Math.min(offset + ENCRYPTED_CHUNK_PLAINTEXT_BYTES, plaintext.byteLength));
+    const part = plaintext.subarray(offset, Math.min(offset + ENCRYPTED_CHUNK_PLAINTEXT_BYTES, plaintext.byteLength));
     const path = chunkPathForId(id, index);
-    const previous = existing?.chunks?.find(chunk => chunk.index === index);
+    const previous = previousChunksByIndex.get(index);
     const remoteSha = await github.putFile(path, JSON.stringify(await encryptBytes(key, part)), previous?.remoteSha);
     chunks.push({ index, path, remoteSha });
   }

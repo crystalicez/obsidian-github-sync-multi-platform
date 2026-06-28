@@ -1,16 +1,59 @@
+const textEncoder = new TextEncoder();
+const textDecoder = new TextDecoder();
+const BYTE_STRING_CHUNK_SIZE = 0x8000;
+const BASE64URL_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+const HEX_TABLE = Array.from({ length: 256 }, (_, byte) => byte.toString(16).padStart(2, "0"));
+
+function asArrayBuffer(bytes: Uint8Array): ArrayBuffer {
+  if (bytes.buffer instanceof ArrayBuffer && bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength) return bytes.buffer;
+  if (bytes.buffer instanceof ArrayBuffer) return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+  return new Uint8Array(bytes).buffer;
+}
+function asUint8Array(value: ArrayBuffer | Uint8Array): Uint8Array {
+  return value instanceof Uint8Array ? value : new Uint8Array(value);
+}
+
+function encodeBase64UrlBytes(bytes: Uint8Array): string {
+  const chunks: string[] = [];
+  let chunk = "";
+  let i = 0;
+  for (; i + 2 < bytes.byteLength; i += 3) {
+    const value = (bytes[i] << 16) | (bytes[i + 1] << 8) | bytes[i + 2];
+    chunk += BASE64URL_ALPHABET[(value >>> 18) & 63]
+      + BASE64URL_ALPHABET[(value >>> 12) & 63]
+      + BASE64URL_ALPHABET[(value >>> 6) & 63]
+      + BASE64URL_ALPHABET[value & 63];
+    if (chunk.length >= BYTE_STRING_CHUNK_SIZE) {
+      chunks.push(chunk);
+      chunk = "";
+    }
+  }
+
+  if (i < bytes.byteLength) {
+    const first = bytes[i];
+    const second = i + 1 < bytes.byteLength ? bytes[i + 1] : 0;
+    const value = (first << 16) | (second << 8);
+    chunk += BASE64URL_ALPHABET[(value >>> 18) & 63] + BASE64URL_ALPHABET[(value >>> 12) & 63];
+    if (i + 1 < bytes.byteLength) chunk += BASE64URL_ALPHABET[(value >>> 6) & 63];
+  }
+
+  if (chunk.length > 0) chunks.push(chunk);
+  return chunks.join("");
+}
+
 export function utf8ToBytes(value: string): Uint8Array {
-  return new TextEncoder().encode(value);
+  return textEncoder.encode(value);
 }
 
 export function bytesToUtf8(value: ArrayBuffer | Uint8Array): string {
-  return new TextDecoder().decode(value instanceof Uint8Array ? value : new Uint8Array(value));
+  return textDecoder.decode(asUint8Array(value));
 }
 
 export function toBase64Url(value: ArrayBuffer | Uint8Array): string {
-  const bytes = value instanceof Uint8Array ? value : new Uint8Array(value);
-  let binary = "";
-  for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
-  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/u, "");
+  const bytes = asUint8Array(value);
+  const bufferConstructor = (globalThis as typeof globalThis & { Buffer?: { from(input: Uint8Array): { toString(encoding: "base64"): string } } }).Buffer;
+  if (bufferConstructor) return bufferConstructor.from(bytes).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/u, "");
+  return encodeBase64UrlBytes(bytes);
 }
 
 export function fromBase64Url(value: string): Uint8Array {
@@ -22,8 +65,17 @@ export function fromBase64Url(value: string): Uint8Array {
 }
 
 export function toHex(value: ArrayBuffer | Uint8Array): string {
-  const bytes = value instanceof Uint8Array ? value : new Uint8Array(value);
-  return Array.from(bytes, byte => byte.toString(16).padStart(2, "0")).join("");
+  const bytes = asUint8Array(value);
+  const bufferConstructor = (globalThis as typeof globalThis & { Buffer?: { from(input: Uint8Array): { toString(encoding: "hex"): string } } }).Buffer;
+  if (bufferConstructor) return bufferConstructor.from(bytes).toString("hex");
+  const chunks: string[] = [];
+  for (let offset = 0; offset < bytes.byteLength; offset += BYTE_STRING_CHUNK_SIZE) {
+    let chunk = "";
+    const end = Math.min(offset + BYTE_STRING_CHUNK_SIZE, bytes.byteLength);
+    for (let i = offset; i < end; i++) chunk += HEX_TABLE[bytes[i]];
+    chunks.push(chunk);
+  }
+  return chunks.join("");
 }
 
 export function randomBytes(length: number): Uint8Array {
@@ -33,7 +85,6 @@ export function randomBytes(length: number): Uint8Array {
 }
 
 export async function sha256Hex(value: ArrayBuffer | Uint8Array): Promise<string> {
-  const bytes = value instanceof Uint8Array ? value : new Uint8Array(value);
-  return toHex(await crypto.subtle.digest("SHA-256", new Uint8Array(bytes)));
+  const bytes = asUint8Array(value);
+  return toHex(await crypto.subtle.digest("SHA-256", asArrayBuffer(bytes)));
 }
-
