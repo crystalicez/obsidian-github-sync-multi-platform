@@ -1,4 +1,4 @@
-export type EncryptedStorageKind = "single" | "chunked";
+export type EncryptedStorageKind = "single" | "chunked" | "pack";
 export type EncryptedSyncOperation = "normal" | "manual" | "forcePush" | "forcePull" | "startup" | "scheduled" | "localChange";
 export type ConflictPolicy = "copy" | "newer" | "merge" | "ask";
 export type RemoteRepoStateKind = "empty" | "encrypted-plugin" | "foreign-nonempty" | "corrupt-plugin" | "wrong-passphrase";
@@ -32,6 +32,7 @@ export interface EncryptedObjectRecord {
   remoteSha?: string;
   storage?: EncryptedStorageKind;
   chunks?: EncryptedChunkRecord[];
+  packId?: string;
   size: number;
   mtime: number;
   deleted?: boolean;
@@ -43,6 +44,7 @@ export interface EncryptedManifest {
   indexMode: "single";
   updatedAt: number;
   files: Record<string, EncryptedObjectRecord>;
+  packs?: Record<string, EncryptedPackManifestRecord>;
 }
 
 export interface EncryptedLocalFileState {
@@ -51,7 +53,39 @@ export interface EncryptedLocalFileState {
   remoteSha?: string;
   storage?: EncryptedStorageKind;
   chunks?: EncryptedChunkRecord[];
+  packId?: string;
   manifestUpdatedAt: number;
   size?: number;
   mtime?: number;
+}
+
+export type EncryptedStorageMode = "object" | "pack";
+
+export interface EncryptedPackFileEntry {
+  path: string;
+  size: number;
+  mtime: number;
+  plaintextSha256?: string;
+}
+
+export interface EncryptedPackPlanRecord {
+  id: string;
+  objectPath: string;
+  totalBytes: number;
+  files: EncryptedPackFileEntry[];
+}
+
+export interface EncryptedPackPlan {
+  totalFiles: number;
+  totalBytes: number;
+  packs: EncryptedPackPlanRecord[];
+}
+
+export interface EncryptedPackManifestRecord {
+  id: string;
+  objectPath: string;
+  remoteSha?: string;
+  totalBytes: number;
+  fileCount: number;
+  updatedAt: number;
 }

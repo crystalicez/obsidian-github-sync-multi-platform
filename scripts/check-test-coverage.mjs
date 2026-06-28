@@ -13,6 +13,10 @@ const requiredModules = [
   "paths",
   "remote-state",
   "settings-policy",
+  "pack-format",
+  "pack-planner",
+  "pack-sync",
+  "scale-policy",
   "sync-engine",
   "sync-errors",
   "types",
@@ -25,6 +29,7 @@ const testFiles = [
   "tests/encrypted/e2e-sync.test.ts",
   "tests/encrypted/benchmark.test.ts",
   "tests/encrypted/settings-combinations.test.ts",
+  "tests/encrypted/pack-planner.test.ts",
 ];
 
 const contents = await Promise.all(testFiles.map(file => readFile(path.join(root, file), "utf8")));
