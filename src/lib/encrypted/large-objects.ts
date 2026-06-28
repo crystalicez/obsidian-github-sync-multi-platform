@@ -17,6 +17,17 @@ export function shouldChunkEncryptedPayload(payload: string): boolean {
   return new TextEncoder().encode(payload).byteLength > GITHUB_RECOMMENDED_MAX_BYTES;
 }
 
+async function deleteStaleChunks(
+  github: GitHubClient,
+  existing: EncryptedObjectRecord | undefined,
+  activeChunkPaths: Set<string>
+): Promise<void> {
+  for (const chunk of existing?.chunks ?? []) {
+    if (activeChunkPaths.has(chunk.path) || !chunk.remoteSha) continue;
+    await github.deleteFile(chunk.path, chunk.remoteSha);
+  }
+}
+
 export async function uploadEncryptedFileObject(
   github: GitHubClient,
   key: CryptoKey,
@@ -29,6 +40,7 @@ export async function uploadEncryptedFileObject(
   if (!shouldChunkEncryptedPayload(singlePayload)) {
     const objectPath = existing?.objectPath ?? objectPathForId(id);
     const remoteSha = await github.putFile(objectPath, singlePayload, existing?.remoteSha);
+    await deleteStaleChunks(github, existing, new Set());
     return { id, path: existing?.path ?? "", objectPath, plaintextSha256: fullHash, remoteSha, size: plaintext.byteLength, mtime: Date.now(), storage: "single" };
   }
 
@@ -41,6 +53,7 @@ export async function uploadEncryptedFileObject(
     const remoteSha = await github.putFile(path, JSON.stringify(await encryptBytes(key, part)), previous?.remoteSha);
     chunks.push({ index, path, remoteSha });
   }
+  await deleteStaleChunks(github, existing, new Set(chunks.map(chunk => chunk.path)));
   return { id, path: existing?.path ?? "", objectPath: objectPathForId(id), plaintextSha256: fullHash, size: plaintext.byteLength, mtime: Date.now(), storage: "chunked", chunks };
 }
 

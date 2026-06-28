@@ -25,6 +25,13 @@ export class Notice {
   }
 }
 
+export const modalEvents: string[] = [];
+export const modalButtons: Array<{ text: string; click: () => void }> = [];
+export function resetModalTestState() {
+  modalEvents.length = 0;
+  modalButtons.length = 0;
+}
+
 class ElementStub {
   text = "";
   onclick?: () => void;
@@ -33,9 +40,10 @@ class ElementStub {
     this.text = text;
   }
 
-  createEl(_tag: string, options?: { text?: string }) {
+  createEl(tag: string, options?: { text?: string }) {
     const child = new ElementStub();
     if (options?.text) child.setText(options.text);
+    if (tag === "button") modalButtons.push({ text: options?.text ?? "", click: () => child.onclick?.() });
     return child;
   }
 
@@ -53,10 +61,11 @@ export class Modal {
 
   constructor(app: unknown) {
     this.app = app;
+    modalEvents.push("construct");
   }
 
-  open() {}
-  close() {}
+  open() { modalEvents.push("open"); }
+  close() { modalEvents.push("close"); }
 }
 
 export class Plugin {}

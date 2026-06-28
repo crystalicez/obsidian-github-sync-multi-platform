@@ -9,8 +9,9 @@ import { chooseEncryptedStorageMode } from "../../src/lib/encrypted/scale-policy
 import { deriveEncryptionKey } from "../../src/lib/encrypted/crypto";
 import { sha256Hex } from "../../src/lib/encrypted/bytes";
 import { uploadEncryptedPack, downloadEncryptedPack } from "../../src/lib/encrypted/pack-sync";
+import { uploadEncryptedFileObject } from "../../src/lib/encrypted/large-objects";
 import type { GitHubClient } from "../../src/lib/github-api";
-import type { EncryptedRepoConfig } from "../../src/lib/encrypted/types";
+import type { EncryptedObjectRecord, EncryptedRepoConfig } from "../../src/lib/encrypted/types";
 
 const FIVE_GIB = 5 * 1024 * 1024 * 1024;
 
@@ -87,6 +88,7 @@ test("pack archive round trips binary file entries without base64-in-json expans
 class PackMemoryGitHub {
   blobs = new Map<string, { content: string; sha: string }>();
   counter = 0;
+  deletedPaths: string[] = [];
 
   async putFile(path: string, content: string) {
     const sha = `pack-sha-${++this.counter}`;
@@ -98,6 +100,11 @@ class PackMemoryGitHub {
     const item = this.blobs.get(path);
     if (!item) return null;
     return { path, content: item.content, sha: item.sha, size: item.content.length };
+  }
+
+  async deleteFile(path: string) {
+    this.deletedPaths.push(path);
+    this.blobs.delete(path);
   }
 }
 
@@ -149,4 +156,30 @@ test("encrypted pack download reports missing remote pack", async () => {
     () => downloadEncryptedPack(github as unknown as GitHubClient, key, { id: "missing", objectPath: ".obsidian-github-sync-encrypted/packs/missing.pack.enc", totalBytes: 1, fileCount: 1, updatedAt: 1 }),
     /Missing encrypted pack/u,
   );
+});
+
+
+test("large object upload removes stale chunks when a chunked file shrinks to a single object", async () => {
+  const github = new PackMemoryGitHub();
+  const key = await testPackKey();
+  const existing: EncryptedObjectRecord = {
+    id: "abcdef1234567890abcdef12",
+    path: "Notes/large.bin",
+    objectPath: ".obsidian-github-sync-encrypted/objects/ab/cd/abcdef1234567890abcdef12.enc",
+    plaintextSha256: "0".repeat(64),
+    size: 100,
+    mtime: 1,
+    storage: "chunked",
+    chunks: [
+      { index: 1, path: ".obsidian-github-sync-encrypted/objects/ab/cd/abcdef1234567890abcdef12.parts/000001.enc", remoteSha: "sha-1" },
+      { index: 2, path: ".obsidian-github-sync-encrypted/objects/ab/cd/abcdef1234567890abcdef12.parts/000002.enc", remoteSha: "sha-2" },
+    ],
+  };
+  for (const chunk of existing.chunks ?? []) github.blobs.set(chunk.path, { content: "old", sha: chunk.remoteSha ?? "old" });
+
+  const uploaded = await uploadEncryptedFileObject(github as unknown as GitHubClient, key, existing.id, new TextEncoder().encode("small"), existing);
+
+  assert.equal(uploaded.storage, "single");
+  assert.deepEqual(github.deletedPaths.sort(), (existing.chunks ?? []).map(chunk => chunk.path).sort());
+  for (const chunk of existing.chunks ?? []) assert.equal(github.blobs.has(chunk.path), false);
 });

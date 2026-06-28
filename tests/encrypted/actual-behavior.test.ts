@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { TFile } from "obsidian";
+import { modalButtons, modalEvents, resetModalTestState, TFile } from "obsidian";
 import { bytesToUtf8, fromBase64, fromBase64Url, sha256Hex, toBase64, toBase64Url, utf8ToBytes } from "../../src/lib/encrypted/bytes";
-import { chooseNewerResolution, isTextLikePath, mergeTextContent } from "../../src/lib/encrypted/conflicts";
+import { chooseConflictResolution, chooseNewerResolution, isTextLikePath, mergeTextContent } from "../../src/lib/encrypted/conflicts";
 import { GITHUB_RECOMMENDED_MAX_BYTES } from "../../src/lib/encrypted/constants";
 import { decryptJson, deriveEncryptionKey, encryptJson } from "../../src/lib/encrypted/crypto";
 import { compileIgnorePathRegex, isIgnoredPath } from "../../src/lib/encrypted/ignore";
@@ -87,4 +87,23 @@ test("encrypted object record type accepts chunk metadata", () => {
     mtime: 1,
   };
   assert.equal(record.chunks?.[0].index, 1);
+});
+
+
+test("ask conflict policy queues modals instead of opening stacked dialogs", async () => {
+  resetModalTestState();
+  const plugin = { app: {} };
+  const localFile = new TFile("Notes/a.md", new TextEncoder().encode("local"));
+
+  const first = chooseConflictResolution(plugin as never, "ask", "Notes/a.md", localFile, Date.now());
+  const second = chooseConflictResolution(plugin as never, "ask", "Notes/b.md", localFile, Date.now());
+  await Promise.resolve();
+
+  assert.equal(modalEvents.filter(event => event === "open").length, 1);
+  modalButtons.find(button => button.text === "Copy remote")?.click();
+  assert.equal(await first, "copy-remote");
+  await Promise.resolve();
+  assert.equal(modalEvents.filter(event => event === "open").length, 2);
+  modalButtons.filter(button => button.text === "Keep local").at(-1)?.click();
+  assert.equal(await second, "keep-local");
 });

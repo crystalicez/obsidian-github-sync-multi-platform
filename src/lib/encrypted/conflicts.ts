@@ -32,6 +32,17 @@ export async function resolveAskConflict(plugin: FastSync, path: string): Promis
   });
 }
 
+let askConflictQueue: Promise<void> = Promise.resolve();
+
+function enqueueAskConflict(plugin: FastSync, path: string): Promise<ConflictResolution> {
+  const result = askConflictQueue.then(() => resolveAskConflict(plugin, path));
+  askConflictQueue = result.then(
+    () => undefined,
+    () => undefined
+  );
+  return result;
+}
+
 export async function chooseConflictResolution(
   plugin: FastSync,
   policy: ConflictPolicy,
@@ -40,7 +51,7 @@ export async function chooseConflictResolution(
   remoteMtime: number | undefined
 ): Promise<ConflictResolution> {
   if (policy === "newer") return chooseNewerResolution(localFile?.stat.mtime, remoteMtime);
-  if (policy === "ask") return resolveAskConflict(plugin, path);
+  if (policy === "ask") return enqueueAskConflict(plugin, path);
   if (policy === "merge" && isTextLikePath(path)) return "merged";
   return "copy-remote";
 }

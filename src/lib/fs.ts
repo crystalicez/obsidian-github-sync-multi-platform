@@ -295,6 +295,9 @@ export async function syncAllFilesImpl(plugin: FastSync): Promise<void> {
 
   try {
     const remoteTree = await plugin.githubClient.getTree();
+    if (remoteTree.truncated) {
+      throw new Error("GitHub tree response was truncated; plaintext sync cannot safely sync this repository.");
+    }
     // 过滤 Markdown 和 图片
     const remoteFiles = remoteTree.tree.filter((node: GitHubTreeNode) => {
       const ext = node.path.split(".").pop()?.toLowerCase();

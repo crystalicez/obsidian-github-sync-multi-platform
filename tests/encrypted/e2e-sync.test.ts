@@ -13,12 +13,13 @@ class MemoryGitHub {
   putCounts = new Map<string, number>();
   deletedPaths: string[] = [];
   failPutPathPrefix?: string;
+  truncated = false;
 
   async getTree() {
     return {
       sha: "tree",
       url: "",
-      truncated: false,
+      truncated: this.truncated,
       tree: [...this.blobs.entries()].map(([path, value]) => ({ path, mode: "100644", type: "blob" as const, sha: value.sha, url: "" })),
     };
   }
@@ -579,4 +580,20 @@ test("encrypted overwrite command path performs force push semantics", async () 
   const pulledVault = new MemoryVault({});
   await encryptedForcePull(plugin(pulledVault, github) as never);
   assert.equal(new TextDecoder().decode(pulledVault.files.get("Notes/a.md")), "local");
+});
+
+
+test("plaintext full sync refuses truncated remote trees before pushing local files", async () => {
+  const github = new MemoryGitHub();
+  github.truncated = true;
+  const vault = new MemoryVault({ "Notes/local.md": "local" });
+  const instance = plaintextPlugin(vault, github);
+  Notice.messages.length = 0;
+
+  await withMutedConsoleError(async () => {
+    await syncAllFilesImpl(instance as never);
+  });
+
+  assert.equal(github.putCounts.size, 0);
+  assert.match(Notice.messages.at(-1) ?? "", /truncated/i);
 });
