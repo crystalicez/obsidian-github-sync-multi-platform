@@ -1,9 +1,9 @@
 {
-  "name": "github-sync-multi-platform",
-  "version": "1.0.6",
-  "description": "Real-time note synchronization with GitHub API, supporting desktop and mobile devices.",
+  "name": "encrypted-github-sync-multi-platform",
+  "version": "1.0.7",
+  "description": "Encrypted real-time note synchronization with GitHub API, supporting desktop and mobile devices.",
   "main": "main.js",
-  "author": "thiter",
+  "author": "Crystalicez",
   "scripts": {
     "dev": "node esbuild.config.mjs",
     "devcss": "sass --watch src/styles.scss styles.css && tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
@@ -14,9 +14,9 @@
   "keywords": [],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/thiter/obsidian-github-sync-multi-platform.git"
+    "url": "git+https://github.com/crystalicez/obsidian-github-sync-multi-platform.git"
   },
-  "license": "MIT",
+  "license": "Apache-2.0",
   "devDependencies": {
     "@types/node": "^22.19.12",
     "@typescript-eslint/eslint-plugin": "^8.57.1",

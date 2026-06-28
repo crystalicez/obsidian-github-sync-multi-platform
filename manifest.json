@@ -1,10 +1,10 @@
 {
-  "id": "github-sync-multi-platform",
-  "name": "GitHub Sync (Multi-Platform)",
-  "version": "1.0.6",
+  "id": "encrypted-github-sync-multi-platform",
+  "name": "Encrypted GitHub Sync (Multi-Platform)",
+  "version": "1.0.7",
   "minAppVersion": "1.6.5",
-  "description": "Sync your notes to GitHub with real-time file monitoring, supporting desktop and mobile.",
-  "author": "thiter",
-  "authorUrl": "https://github.com/thiter",
+  "description": "Encrypted real-time note synchronization with GitHub across desktop and mobile.",
+  "author": "Crystalicez",
+  "authorUrl": "https://github.com/crystalicez",
   "isDesktopOnly": false
 }

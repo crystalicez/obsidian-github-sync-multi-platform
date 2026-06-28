@@ -1,8 +1,8 @@
-# Obsidian-Github-Sync-Multi-Platform
+# Encrypted GitHub Sync (Multi-Platform)
 
-[![GitHub release (latest by date)](https://img.shields.io/github/v/release/Zhang-cm/Obsidian-Github-Sync-Multi-Platform?style=flat-square)](https://github.com/Zhang-cm/Obsidian-Github-Sync-Multi-Platform/releases)
-[![Obsidian Downloads](https://img.shields.io/badge/dynamic/json?logo=obsidian&color=9437ff&label=downloads&query=obsidian-github-sync-multi-platform.downloads&url=https%3A%2F%2Fraw.githubusercontent.com%2Fobsidianmd%2Fobsidian-releases%2Fmaster%2Fcommunity-plugin-stats.json&style=flat-square)](https://obsidian.md/plugins?id=obsidian-github-sync-multi-platform)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](https://opensource.org/licenses/MIT)
+[![GitHub release (latest by date)](https://img.shields.io/github/v/release/crystalicez/obsidian-github-sync-multi-platform?style=flat-square)](https://github.com/crystalicez/obsidian-github-sync-multi-platform/releases)
+[![Obsidian Downloads](https://img.shields.io/badge/dynamic/json?logo=obsidian&color=9437ff&label=downloads&query=encrypted-github-sync-multi-platform.downloads&url=https%3A%2F%2Fraw.githubusercontent.com%2Fobsidianmd%2Fobsidian-releases%2Fmaster%2Fcommunity-plugin-stats.json&style=flat-square)](https://obsidian.md/plugins?id=encrypted-github-sync-multi-platform)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg?style=flat-square)](https://www.apache.org/licenses/LICENSE-2.0)
 
 [English](#english) | [简体中文](#chinese)
 
@@ -12,7 +12,7 @@
 
 ## 🚀 Overview
 
-**Obsidian-Github-Sync-Multi-Platform** is a high-performance, serverless synchronization solution designed for Obsidian. It leverages the GitHub REST API to provide seamless, real-time note synchronization across Desktop (Windows/macOS/Linux) and Mobile (iOS/Android) devices.
+**Encrypted GitHub Sync (Multi-Platform)** is a high-performance, serverless synchronization solution designed for Obsidian. It leverages the GitHub REST API to provide seamless, real-time note synchronization across Desktop (Windows/macOS/Linux) and Mobile (iOS/Android) devices.
 
 Unlike traditional Git-based plugins, this tool interacts directly with the GitHub API, eliminating the need for a local Git environment on mobile devices and providing a faster, more stable experience.
 
@@ -36,10 +36,10 @@ Unlike traditional Git-based plugins, this tool interacts directly with the GitH
 
 1.  Open **Obsidian** > **Settings** > **Community plugins**.
 2.  Disable **Restricted mode**.
-3.  Click **Browse** and search for `Obsidian-Github-Sync-Multi-Platform`.
+3.  Click **Browse** and search for `Encrypted GitHub Sync (Multi-Platform)`.
 4.  Click **Install**, then **Enable**.
 
-*(Alternatively, download the latest release and place `main.js`, `manifest.json`, and `styles.css` into `.obsidian/plugins/obsidian-github-sync-multi-platform/`)*
+*(Alternatively, download the latest release and place `main.js`, `manifest.json`, and `styles.css` into `.obsidian/plugins/encrypted-github-sync-multi-platform/`)*
 
 ## ⚙️ Configuration
 
@@ -56,7 +56,7 @@ Unlike traditional Git-based plugins, this tool interacts directly with the GitH
 
 ## 🚀 项目简介
 
-**Obsidian-Github-Sync-Multi-Platform** 是一款专为 Obsidian 打造的高性能、无服务器同步方案。它直接利用 GitHub REST API，在桌面端（Windows/macOS/Linux）与移动端（iOS/Android）之间提供流畅的实时笔记同步体验。
+**Encrypted GitHub Sync (Multi-Platform)** 是一款专为 Obsidian 打造的高性能、无服务器同步方案。它直接利用 GitHub REST API，在桌面端（Windows/macOS/Linux）与移动端（iOS/Android）之间提供流畅的实时笔记同步体验。
 
 与传统的基于 Git 命令行工具的插件不同，本项目通过 API 直接操作，在移动端无需安装 Git 环境，运行更轻快、更稳定。
 
@@ -80,10 +80,10 @@ Unlike traditional Git-based plugins, this tool interacts directly with the GitH
 
 1.  打开 **Obsidian** > **设置** > **第三方插件**。
 2.  关闭 **安全模式**。
-3.  点击 **浏览** 并搜索 `Obsidian-Github-Sync-Multi-Platform`。
+3.  点击 **浏览** 并搜索 `Encrypted GitHub Sync (Multi-Platform)`。
 4.  点击 **安装**，随后 **启用**。
 
-*(或从 Release 页面下载最新版本，将 `main.js`、`manifest.json`、`styles.css` 放入 `.obsidian/plugins/obsidian-github-sync-multi-platform/` 目录)*
+*(或从 Release 页面下载最新版本，将 `main.js`、`manifest.json`、`styles.css` 放入 `.obsidian/plugins/encrypted-github-sync-multi-platform/` 目录)*
 
 ## ⚙️ 配置指南
 
@@ -104,10 +104,10 @@ If this plugin has helped you with multi-device synchronization, please consider
 
 | Ko-fi (International / 国际) | WeChat (China / 微信支付) |
 | :---: | :---: |
-| [<img src="images/kofi.png" height="36" alt="Buy Me a Coffee at ko-fi.com" />](https://ko-fi.com/thiter) | <img src="images/qrcode.png" width="180" alt="WeChat Support" /> |
+| [<img src="images/kofi.png" height="36" alt="Buy Me a Coffee at ko-fi.com" />](https://github.com/crystalicez) | <img src="images/qrcode.png" width="180" alt="WeChat Support" /> |
 
 ---
 
 ## 📄 License
 
-MIT © [Thiter](https://github.com/thiter)
+Apache-2.0 © [Crystalicez](https://github.com/crystalicez)

@@ -83,7 +83,7 @@ export default class FastSync extends Plugin {
     this.registerScheduledSync()
 
     // Create Ribbon Icon once
-    this.ribbonIcon = this.addRibbonIcon("loader-circle", "Obsidian-Github-Sync-Multi-Platform: " + $("同步全部笔记"), () => {
+    this.ribbonIcon = this.addRibbonIcon("loader-circle", "Encrypted GitHub Sync (Multi-Platform): " + $("同步全部笔记"), () => {
       StartupFullNotesSync(this)
     })
 
@@ -157,10 +157,10 @@ export default class FastSync extends Plugin {
   updateRibbonIcon(status: boolean) {
     if (status) {
       setIcon(this.ribbonIcon, "rotate-cw")
-      this.ribbonIcon.setAttribute("aria-label", "Obsidian-Github-Sync-Multi-Platform: " + $("同步全部笔记") + " (Configured)")
+      this.ribbonIcon.setAttribute("aria-label", "Encrypted GitHub Sync (Multi-Platform): " + $("同步全部笔记") + " (Configured)")
     } else {
       setIcon(this.ribbonIcon, "loader-circle")
-      this.ribbonIcon.setAttribute("aria-label", "Obsidian-Github-Sync-Multi-Platform: " + $("同步全部笔记") + " (Not Configured)")
+      this.ribbonIcon.setAttribute("aria-label", "Encrypted GitHub Sync (Multi-Platform): " + $("同步全部笔记") + " (Not Configured)")
     }
   }
 
