@@ -1,4 +1,4 @@
-import { GitHubClient, readGitHubFileBytes } from "../github-api";
+import { GitHubClient, readGitHubFileBytes, readGitHubBlobOrFileBytes } from "../github-api";
 import { ENCRYPTED_CONFIG_PATH, ENCRYPTED_FORMAT_VERSION, ENCRYPTED_INDEX_MODE, ENCRYPTED_MANIFEST_PATH, ENCRYPTED_OBJECTS_ROOT, ENCRYPTED_PACKS_ROOT, ENCRYPTED_ROOT } from "./constants";
 import { decryptJson, deriveEncryptionKey, encryptJson } from "./crypto";
 import { fromBase64Url, randomBytes, sha256Hex, toBase64Url, utf8ToBytes } from "./bytes";
@@ -124,7 +124,7 @@ export class EncryptedManifestStore {
   async loadOrCreate(): Promise<{ config: EncryptedRepoConfig; manifest: EncryptedManifest; manifestSha?: string; key: CryptoKey }> {
     const config = await this.loadOrCreateConfig();
     const key = await cachedEncryptionKey(this.passphrase, config);
-    const remoteManifest = await readGitHubFileBytes(this.github, ENCRYPTED_MANIFEST_PATH);
+    const remoteManifest = await readGitHubBlobOrFileBytes(this.github, ENCRYPTED_MANIFEST_PATH, undefined);
     if (!remoteManifest) {
       return {
         config,
@@ -148,7 +148,7 @@ export class EncryptedManifestStore {
   }
 
   private async loadOrCreateConfig(): Promise<EncryptedRepoConfig> {
-    const remoteConfig = await readGitHubFileBytes(this.github, ENCRYPTED_CONFIG_PATH);
+    const remoteConfig = await readGitHubBlobOrFileBytes(this.github, ENCRYPTED_CONFIG_PATH);
     if (remoteConfig) {
       try {
         return validateEncryptedConfig(JSON.parse(new TextDecoder().decode(remoteConfig.bytes)));

@@ -20,6 +20,7 @@ class MemoryGitHub {
   deletedPaths: string[] = [];
   failPutPathPrefix?: string;
   truncated = false;
+  getBlobCount = 0;
 
   async getRemoteHeadSha() {
     this.getRemoteHeadCount += 1;
@@ -44,6 +45,17 @@ class MemoryGitHub {
     const item = this.blobs.get(path);
     if (!item) return null;
     return { content: item.content, sha: item.sha, path, size: item.content.length };
+  }
+
+  async getBlob(sha: string): Promise<Uint8Array> {
+    this.getBlobCount += 1;
+    for (const [path, blob] of this.blobs.entries()) {
+      if (blob.sha === sha) {
+        this.getCounts.set(path, (this.getCounts.get(path) ?? 0) + 1);
+        return GitHubClient.decodeContentBytes(blob.content);
+      }
+    }
+    throw new Error("HTTP 404 - Blob not found: " + sha);
   }
 
   async putFile(path: string, content: string | ArrayBuffer, _sha?: string) {
@@ -999,4 +1011,20 @@ test("normal encrypted sync overwrites local file when remote is newer and local
     assert.equal(github.getCounts.get(path) ?? 0, 1); // exactly 1 download
   }
   assert.equal(new TextDecoder().decode(targetVault.files.get("Notes/a.md")), "new remote content");
+});
+
+test("normal encrypted sync downloads files using 1-request getBlob when SHA is available", async () => {
+  const github = new MemoryGitHub();
+  const sourceVault = new MemoryVault({ "Notes/a.md": "some remote content" });
+  await encryptedForcePush(plugin(sourceVault, github) as never);
+
+  const targetVault = new MemoryVault(); // Empty target
+  const target = plugin(targetVault, github) as ReturnType<typeof plugin>;
+
+  github.getBlobCount = 0;
+
+  await encryptedFullSync(target as never);
+
+  assert.ok(github.getBlobCount > 0);
+  assert.equal(new TextDecoder().decode(targetVault.files.get("Notes/a.md")), "some remote content");
 });

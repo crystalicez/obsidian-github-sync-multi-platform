@@ -177,3 +177,68 @@ test("GitHubClient.deleteFile tolerates 404 and throws on other HTTP errors", as
     setRequestUrlHandler(null);
   }
 });
+
+test("GitHubClient.getFileBytes parses ETags and handles HTTP errors", async () => {
+  const client = new GitHubClient({ token: "token", owner: "owner", repo: "repo", branch: "main" });
+  const rawBytes = new TextEncoder().encode("file content").buffer;
+
+  try {
+    // 1. Valid ETag response
+    setRequestUrlHandler(async () => ({
+      status: 200,
+      headers: { etag: '"sha12345"' },
+      arrayBuffer: rawBytes,
+      text: "file content",
+      json: {}
+    }));
+    const res = await client.getFileBytes("Notes/a.md");
+    assert.ok(res);
+    assert.equal(res.sha, "sha12345");
+    assert.deepEqual(res.bytes, new Uint8Array(rawBytes));
+
+    // 2. Weak ETag response
+    setRequestUrlHandler(async () => ({
+      status: 200,
+      headers: { ETag: 'W/"sha54321"' },
+      arrayBuffer: rawBytes,
+      text: "file content",
+      json: {}
+    }));
+    const resWeak = await client.getFileBytes("Notes/a.md");
+    assert.ok(resWeak);
+    assert.equal(resWeak.sha, "sha54321");
+
+    // 3. 404 Missing response
+    setRequestUrlHandler(async () => ({ status: 404, text: "missing", json: {} }));
+    assert.equal(await client.getFileBytes("Notes/missing.md"), null);
+
+    // 4. 403 Rate limited response
+    setRequestUrlHandler(async () => ({ status: 403, text: "rate limited", json: {} }));
+    await assert.rejects(() => client.getFileBytes("Notes/a.md"), /HTTP 403.*rate limited/u);
+  } finally {
+    setRequestUrlHandler(null);
+  }
+});
+
+test("GitHubClient.getBlob handles 200 and HTTP errors", async () => {
+  const client = new GitHubClient({ token: "token", owner: "owner", repo: "repo", branch: "main" });
+  const rawBytes = new TextEncoder().encode("blob data").buffer;
+
+  try {
+    // 1. Success 200
+    setRequestUrlHandler(async () => ({
+      status: 200,
+      arrayBuffer: rawBytes,
+      text: "blob data",
+      json: {}
+    }));
+    const bytes = await client.getBlob("sha123");
+    assert.deepEqual(bytes, new Uint8Array(rawBytes));
+
+    // 2. Error 500
+    setRequestUrlHandler(async () => ({ status: 500, text: "server error", json: {} }));
+    await assert.rejects(() => client.getBlob("sha123"), /HTTP 500.*server error/u);
+  } finally {
+    setRequestUrlHandler(null);
+  }
+});

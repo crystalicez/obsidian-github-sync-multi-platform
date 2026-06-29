@@ -1,4 +1,4 @@
-import { GitHubClient, readGitHubFileBytes } from "../github-api";
+import { GitHubClient, readGitHubFileBytes, readGitHubBlobOrFileBytes } from "../github-api";
 import { decryptBytes, encryptBytes, EncryptedPayload } from "./crypto";
 import { decodePackArchive, encodePackArchive, PackArchiveFileInput, PackArchiveFileOutput, packObjectPathForId } from "./pack-format";
 import { EncryptedPackManifestRecord } from "./types";
@@ -29,7 +29,7 @@ export async function downloadEncryptedPack(
   key: CryptoKey,
   record: EncryptedPackManifestRecord
 ): Promise<PackArchiveFileOutput[]> {
-  const remote = await readGitHubFileBytes(github, record.objectPath);
+  const remote = await readGitHubBlobOrFileBytes(github, record.objectPath, record.remoteSha);
   if (!remote) throw new Error(`Missing encrypted pack: ${record.objectPath}`);
   const archive = await decryptBytes(key, JSON.parse(new TextDecoder().decode(remote.bytes)) as EncryptedPayload);
   return decodePackArchive(archive);

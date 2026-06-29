@@ -75,16 +75,53 @@ export class GitHubClient {
   }
 
   async getFileBytes(path: string): Promise<{ bytes: Uint8Array; sha: string } | null> {
-    const file = await this.getFile(path);
-    if (!file) return null;
-    if (!file.content && file.download_url) {
+    const encodedPath = path.split('/').map(encodeURIComponent).join('/');
+    const url = `${this.baseUrl}/contents/${encodedPath}?ref=${this.config.branch}`;
+    try {
       const response = await requestUrl({
-        url: file.download_url,
-        headers: this.headers,
+        url,
+        method: "GET",
+        headers: {
+          ...this.headers,
+          Accept: "application/vnd.github.v3.raw",
+        },
+        throw: false,
       });
-      return { bytes: new Uint8Array(response.arrayBuffer), sha: file.sha };
+
+      if (response.status === 200) {
+        const etag = response.headers["etag"] || response.headers["ETag"];
+        const sha = etag ? etag.replace(/^(W\/)?"|"/g, "") : "";
+        return { bytes: new Uint8Array(response.arrayBuffer), sha };
+      }
+      if (response.status === 404) return null;
+      throw new Error("Failed to get file bytes " + path + ": HTTP " + response.status + " - " + response.text);
+    } catch (error) {
+      const httpError = error as { status?: number };
+      if (httpError.status === 404) return null;
+      throw error;
     }
-    return { bytes: GitHubClient.decodeContentBytes(file.content), sha: file.sha };
+  }
+
+  async getBlob(sha: string): Promise<Uint8Array> {
+    const url = `${this.baseUrl}/git/blobs/${sha}`;
+    try {
+      const response = await requestUrl({
+        url,
+        method: "GET",
+        headers: {
+          ...this.headers,
+          Accept: "application/vnd.github.v3.raw",
+        },
+        throw: false,
+      });
+
+      if (response.status === 200) {
+        return new Uint8Array(response.arrayBuffer);
+      }
+      throw new Error("Failed to get blob " + sha + ": HTTP " + response.status + " - " + response.text);
+    } catch (error) {
+      throw error;
+    }
   }
 
   async putFile(path: string, content: string | ArrayBuffer, sha?: string): Promise<string> {
@@ -242,4 +279,17 @@ export async function readGitHubFileBytes(github: GitHubClient, path: string): P
   const file = await github.getFile(path);
   if (!file) return null;
   return { bytes: GitHubClient.decodeContentBytes(file.content), sha: file.sha };
+}
+
+export async function readGitHubBlobOrFileBytes(github: GitHubClient, path: string, sha?: string): Promise<{ bytes: Uint8Array; sha: string } | null> {
+  if (sha && typeof (github as any).getBlob === "function") {
+    try {
+      const bytes = await (github as any).getBlob(sha);
+      return { bytes, sha };
+    } catch (e) {
+      if ((e as Error).message?.includes("HTTP 404")) return null;
+      throw e;
+    }
+  }
+  return readGitHubFileBytes(github, path);
 }
