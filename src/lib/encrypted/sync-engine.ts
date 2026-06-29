@@ -148,7 +148,7 @@ async function resolveRemoteChangedBeforeLocalMutation(
 ): Promise<boolean> {
   if (!record || record.deleted) return false;
   if (localState?.plaintextSha256 === record.plaintextSha256) return false;
-  if (!localState && (localFile || localBytes)) {
+  if (localFile || localBytes) {
     const bytes = localBytes ?? await readVaultFileBytes(plugin.app.vault, localFile as TFile);
     if (await sha256Hex(bytes) === record.plaintextSha256) return false;
   }
@@ -408,10 +408,20 @@ async function pullEncryptedChanges(plugin: FastSync, key: CryptoKey, manifest: 
     if (record.deleted || record.storage === "pack") continue;
     const localState = state.files[path];
     if (!force && localState?.plaintextSha256 === record.plaintextSha256) continue;
-    const plaintext = await downloadEncryptedFileObject(plugin.githubClient, key, record);
+
     const localFile = plugin.app.vault.getAbstractFileByPath(path);
+    let localHash: string | undefined;
+    let localBytes: Uint8Array | undefined;
+
     if (!force && localFile instanceof TFile) {
-      const localHash = await sha256Hex(await readVaultFileBytes(plugin.app.vault, localFile));
+      localBytes = await readVaultFileBytes(plugin.app.vault, localFile);
+      localHash = await sha256Hex(localBytes);
+      if (localHash === record.plaintextSha256) continue;
+    }
+
+    const plaintext = await downloadEncryptedFileObject(plugin.githubClient, key, record);
+
+    if (!force && localFile instanceof TFile && localHash !== undefined) {
       const localChanged = localState ? localState.plaintextSha256 !== localHash : localHash !== record.plaintextSha256;
       if (localChanged) {
         const resolution = await chooseConflictResolution(plugin, configuredConflictPolicy(plugin), path, localFile, record.mtime);
@@ -421,7 +431,7 @@ async function pullEncryptedChanges(plugin: FastSync, key: CryptoKey, manifest: 
           continue;
         }
         if (resolution === "merged") {
-          const localText = await plugin.app.vault.read(localFile);
+          const localText = localBytes ? new TextDecoder().decode(localBytes) : await plugin.app.vault.read(localFile);
           const remoteText = new TextDecoder().decode(plaintext);
           await writeVaultFileBytes(plugin.app.vault, path, new TextEncoder().encode(mergeTextContent(localText, remoteText)));
           continue;
@@ -530,12 +540,19 @@ function packRecordsFor(manifest: EncryptedManifest, packId: string): Array<[str
   return Object.entries(manifest.files).filter(([, record]) => !record.deleted && record.storage === "pack" && record.packId === packId);
 }
 
-function canSkipPackDownload(plugin: FastSync, manifest: EncryptedManifest, packId: string, force: boolean): boolean {
+async function canSkipPackDownload(plugin: FastSync, manifest: EncryptedManifest, packId: string, force: boolean): Promise<boolean> {
   if (force) return false;
   const records = packRecordsFor(manifest, packId);
   if (records.length === 0) return false;
   const state = ensureEncryptedState(plugin);
-  return records.every(([path, record]) => state.files[path]?.plaintextSha256 === record.plaintextSha256);
+  for (const [path, record] of records) {
+    if (state.files[path]?.plaintextSha256 === record.plaintextSha256) continue;
+    const localFile = plugin.app.vault.getAbstractFileByPath(path);
+    if (!(localFile instanceof TFile)) return false;
+    const localHash = await sha256Hex(await readVaultFileBytes(plugin.app.vault, localFile));
+    if (localHash !== record.plaintextSha256) return false;
+  }
+  return true;
 }
 
 function canSkipPackUpload(plugin: FastSync, manifest: EncryptedManifest, localFiles: TFile[]): boolean {
@@ -557,7 +574,7 @@ function canSkipPackUpload(plugin: FastSync, manifest: EncryptedManifest, localF
 async function pullEncryptedPackChanges(plugin: FastSync, key: CryptoKey, manifest: EncryptedManifest, ignoreRules: ReturnType<typeof compileIgnorePathRegex>, force: boolean): Promise<void> {
   const state = ensureEncryptedState(plugin);
   for (const pack of Object.values(manifest.packs ?? {})) {
-    if (canSkipPackDownload(plugin, manifest, pack.id, force)) continue;
+    if (await canSkipPackDownload(plugin, manifest, pack.id, force)) continue;
     const files = await downloadEncryptedPack(plugin.githubClient, key, pack);
     for (const file of files) {
       const record = manifest.files[file.path];

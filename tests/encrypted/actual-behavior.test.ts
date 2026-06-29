@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { modalButtons, modalEvents, resetModalTestState, TFile } from "obsidian";
-import { bytesToUtf8, fromBase64, fromBase64Url, sha256Hex, toBase64, toBase64Url, utf8ToBytes } from "../../src/lib/encrypted/bytes";
+import { bytesToUtf8, fromBase64, fromBase64Url, sha256Hex, toBase64, toBase64Url, toHex, utf8ToBytes } from "../../src/lib/encrypted/bytes";
 import { chooseConflictResolution, chooseNewerResolution, isTextLikePath, mergeTextContent } from "../../src/lib/encrypted/conflicts";
 import { GITHUB_RECOMMENDED_MAX_BYTES } from "../../src/lib/encrypted/constants";
 import { decryptJson, deriveEncryptionKey, encryptJson } from "../../src/lib/encrypted/crypto";
@@ -113,4 +113,46 @@ test("encrypted sync candidates allow files large enough to require chunking", (
   const file = new TFile("Media/big.bin", new Uint8Array());
   file.stat.size = 120 * 1024 * 1024;
   assert.equal(shouldSyncEncryptedFile(file), true);
+});
+
+test("bytes helpers handle sliced Uint8Arrays and fallback without Buffer", async () => {
+  const rawBytes = new Uint8Array([65, 66, 67, 68, 69, 70, 71, 72]); // "ABCDEFGH"
+  const sliced = rawBytes.subarray(2, 6); // "CDEF" = [67, 68, 69, 70]
+  
+  // 1. With Buffer (default Node environment)
+  assert.equal(toBase64(sliced), "Q0RFRg==");
+  assert.equal(toBase64Url(sliced), "Q0RFRg");
+  assert.equal(toHex(sliced), "43444546");
+  assert.equal(await sha256Hex(sliced), await sha256Hex(new Uint8Array([67, 68, 69, 70])));
+
+  // 2. Without Buffer (fallback pure JS environment)
+  const originalBuffer = globalThis.Buffer;
+  try {
+    (globalThis as any).Buffer = undefined;
+    
+    assert.equal(toBase64(sliced), "Q0RFRg==");
+    assert.equal(toBase64Url(sliced), "Q0RFRg");
+    assert.equal(toHex(sliced), "43444546");
+    assert.equal(await sha256Hex(sliced), await sha256Hex(new Uint8Array([67, 68, 69, 70])));
+  } finally {
+    globalThis.Buffer = originalBuffer;
+  }
+});
+
+test("chooseConflictResolution respects policies and text-like fallback", async () => {
+  const plugin = { app: {} };
+  const localFile = new TFile("note.md", new Uint8Array(10));
+  localFile.stat.mtime = 1000;
+  
+  // newer policy
+  assert.equal(await chooseConflictResolution(plugin as any, "newer", "note.md", localFile, 500), "keep-local");
+  assert.equal(await chooseConflictResolution(plugin as any, "newer", "note.md", localFile, 1500), "use-remote");
+  assert.equal(await chooseConflictResolution(plugin as any, "newer", "note.md", localFile, 1000), "copy-remote");
+  
+  // merge policy
+  assert.equal(await chooseConflictResolution(plugin as any, "merge", "note.md", localFile, 500), "merged");
+  assert.equal(await chooseConflictResolution(plugin as any, "merge", "image.png", localFile, 500), "copy-remote"); // fallback for non-text
+  
+  // copy policy
+  assert.equal(await chooseConflictResolution(plugin as any, "copy", "note.md", localFile, 500), "copy-remote");
 });

@@ -864,3 +864,139 @@ test("concurrent local modifications do not overwrite remote manifest changes", 
   assert.equal(loaded.manifest.files["Notes/a.md"].plaintextSha256, await sha256Hex(utf8ToBytes("updated a")));
   assert.equal(loaded.manifest.files["Notes/b.md"].plaintextSha256, await sha256Hex(utf8ToBytes("updated b")));
 });
+
+test("normal encrypted sync skips download for identical single objects when cache is empty", async () => {
+  const github = new MemoryGitHub();
+  const sourceVault = new MemoryVault({ "Notes/a.md": "stable content" });
+  await encryptedForcePush(plugin(sourceVault, github) as never);
+
+  const targetVault = new MemoryVault({ "Notes/a.md": "stable content" });
+  const target = plugin(targetVault, github) as ReturnType<typeof plugin>;
+  
+  // Clear any cache if it got populated during initialization
+  target.syncData.encrypted = { files: {} };
+  github.getCounts.clear();
+
+  await encryptedFullSync(target as never);
+
+  const objectPaths = [...github.blobs.keys()].filter(path => path.includes("/objects/"));
+  assert.equal(objectPaths.length > 0, true);
+  for (const path of objectPaths) {
+    assert.equal(github.getCounts.get(path) ?? 0, 0);
+  }
+  assert.equal(new TextDecoder().decode(targetVault.files.get("Notes/a.md")), "stable content");
+  assert.ok(target.syncData.encrypted?.files["Notes/a.md"]);
+});
+
+test("normal encrypted sync skips download for identical packs when cache is empty", async () => {
+  const github = new MemoryGitHub();
+  const sourceVault = new MemoryVault(manyFileEntries(10_001, "stable"));
+  await encryptedForcePush(plugin(sourceVault, github) as never);
+
+  const targetVault = new MemoryVault(manyFileEntries(10_001, "stable"));
+  const target = plugin(targetVault, github) as ReturnType<typeof plugin>;
+  
+  // Clear cache and counts
+  target.syncData.encrypted = { files: {} };
+  github.getCounts.clear();
+
+  await encryptedFullSync(target as never);
+
+  const packPaths = [...github.blobs.keys()].filter(path => path.includes("/packs/"));
+  assert.equal(packPaths.length > 0, true);
+  for (const path of packPaths) {
+    assert.equal(github.getCounts.get(path) ?? 0, 0);
+  }
+  assert.ok(target.syncData.encrypted?.files["Notes/note-00000.md"]);
+});
+
+test("normal encrypted sync skips download for identical single objects when cache is outdated", async () => {
+  const github = new MemoryGitHub();
+  const sourceVault = new MemoryVault({ "Notes/a.md": "stable content" });
+  await encryptedForcePush(plugin(sourceVault, github) as never);
+
+  const targetVault = new MemoryVault({ "Notes/a.md": "stable content" });
+  const target = plugin(targetVault, github) as ReturnType<typeof plugin>;
+  
+  // Populate cache with outdated/mismatching hash
+  target.syncData.encrypted = {
+    files: {
+      "Notes/a.md": {
+        plaintextSha256: "0".repeat(64), // mismatching hash
+        objectPath: ".obsidian-github-sync-encrypted/objects/something.enc",
+        manifestUpdatedAt: 1,
+      }
+    }
+  };
+  github.getCounts.clear();
+
+  await encryptedFullSync(target as never);
+
+  const objectPaths = [...github.blobs.keys()].filter(path => path.includes("/objects/"));
+  assert.equal(objectPaths.length > 0, true);
+  for (const path of objectPaths) {
+    assert.equal(github.getCounts.get(path) ?? 0, 0);
+  }
+  assert.equal(new TextDecoder().decode(targetVault.files.get("Notes/a.md")), "stable content");
+});
+
+test("normal encrypted sync skips download for identical packs when cache is outdated", async () => {
+  const github = new MemoryGitHub();
+  const sourceVault = new MemoryVault(manyFileEntries(10_001, "stable"));
+  await encryptedForcePush(plugin(sourceVault, github) as never);
+
+  const targetVault = new MemoryVault(manyFileEntries(10_001, "stable"));
+  const target = plugin(targetVault, github) as ReturnType<typeof plugin>;
+  
+  // Populate cache with outdated/mismatching hash for one of the files
+  target.syncData.encrypted = {
+    files: {
+      "Notes/note-00000.md": {
+        plaintextSha256: "0".repeat(64), // mismatching hash
+        objectPath: ".obsidian-github-sync-encrypted/packs/000001.pack.enc",
+        manifestUpdatedAt: 1,
+      }
+    }
+  };
+  github.getCounts.clear();
+
+  await encryptedFullSync(target as never);
+
+  const packPaths = [...github.blobs.keys()].filter(path => path.includes("/packs/"));
+  assert.equal(packPaths.length > 0, true);
+  for (const path of packPaths) {
+    assert.equal(github.getCounts.get(path) ?? 0, 0);
+  }
+});
+
+test("normal encrypted sync overwrites local file when remote is newer and local matches outdated cache", async () => {
+  const github = new MemoryGitHub();
+  const sourceVault = new MemoryVault({ "Notes/a.md": "new remote content" });
+  await encryptedForcePush(plugin(sourceVault, github) as never);
+
+  const targetVault = new MemoryVault({ "Notes/a.md": "old local content" });
+  const target = plugin(targetVault, github) as ReturnType<typeof plugin>;
+  
+  // Populate cache with "old local content" hash to indicate it wasn't modified locally
+  const oldHash = await sha256Hex(new TextEncoder().encode("old local content"));
+  target.syncData.encrypted = {
+    files: {
+      "Notes/a.md": {
+        plaintextSha256: oldHash,
+        objectPath: ".obsidian-github-sync-encrypted/objects/something.enc",
+        manifestUpdatedAt: 1,
+      }
+    }
+  };
+  github.getCounts.clear();
+
+  await encryptedFullSync(target as never);
+
+  // It should download the file and overwrite
+  const objectPaths = [...github.blobs.keys()].filter(path => path.includes("/objects/"));
+  assert.equal(objectPaths.length > 0, true);
+  for (const path of objectPaths) {
+    assert.equal(github.getCounts.get(path) ?? 0, 1); // exactly 1 download
+  }
+  assert.equal(new TextDecoder().decode(targetVault.files.get("Notes/a.md")), "new remote content");
+});
