@@ -87,6 +87,19 @@ function encryptedDebounceKey(path: string): string {
 function scheduleEncryptedModify(file: TFile, plugin: FastSync, eventEnter: boolean): void {
   const key = encryptedDebounceKey(file.path);
   if (plugin.debounceTimers.has(key)) globalThis.clearTimeout(plugin.debounceTimers.get(key));
+
+  if (plugin.syncProgress) {
+    plugin.syncProgress = {
+      status: "waiting",
+      pushCount: 0,
+      totalPush: 0,
+      pullCount: 0,
+      totalPull: 0,
+      lastSyncTime: plugin.syncProgress.lastSyncTime
+    };
+    if (typeof plugin.updateStatusBar === "function") plugin.updateStatusBar();
+  }
+
   const timer = globalThis.setTimeout(async () => {
     plugin.debounceTimers.delete(key);
     await encryptedModify(file, plugin, eventEnter);
@@ -130,6 +143,18 @@ export const NoteModify = function (file: TAbstractFile, plugin: FastSync, event
     globalThis.clearTimeout(plugin.debounceTimers.get(file.path));
   }
 
+  if (plugin.syncProgress) {
+    plugin.syncProgress = {
+      status: "waiting",
+      pushCount: 0,
+      totalPush: 0,
+      pullCount: 0,
+      totalPull: 0,
+      lastSyncTime: plugin.syncProgress.lastSyncTime
+    };
+    if (typeof plugin.updateStatusBar === "function") plugin.updateStatusBar();
+  }
+
   const timer = globalThis.setTimeout(() => {
     void (async () => {
       plugin.debounceTimers.delete(file.path);
@@ -146,6 +171,17 @@ const performSync = async (file: TFile, plugin: FastSync) => {
     return;
   }
   plugin.isSyncInProgress = true;
+  if (plugin.syncProgress) {
+    plugin.syncProgress = {
+      status: "syncing",
+      pushCount: 0,
+      totalPush: 1,
+      pullCount: 0,
+      totalPull: 0,
+      lastSyncTime: plugin.syncProgress.lastSyncTime
+    };
+    if (typeof plugin.updateStatusBar === "function") plugin.updateStatusBar();
+  }
   try {
     assertNoPlaintextPathCollisions(plugin);
     plugin.addIgnoredFile(file.path);
@@ -155,6 +191,9 @@ const performSync = async (file: TFile, plugin: FastSync) => {
     // 只同步 Markdown 笔记和图片，其余类型（.zip .canvas .base 等）跳过
     // 避免向 GitHub API 发送无法处理的文件类型导致 422
     if (!isMarkdown && !isImage) {
+      if (plugin.syncProgress) {
+        plugin.syncProgress.status = "success";
+      }
       return;
     }
 
@@ -173,6 +212,9 @@ const performSync = async (file: TFile, plugin: FastSync) => {
     // 3. 检查内容是否真正变化 (对比缓存的哈希)
     if (plugin.syncData.files[file.path]?.hash === currentHash) {
       dump(`No content change for ${file.path}, skip sync.`);
+      if (plugin.syncProgress) {
+        plugin.syncProgress.status = "success";
+      }
       return;
     }
 
@@ -183,12 +225,34 @@ const performSync = async (file: TFile, plugin: FastSync) => {
     await plugin.saveSyncData();
     dump(`Synced ${file.path} to GitHub`, newSha);
 
+    if (plugin.syncProgress) {
+      plugin.syncProgress = {
+        status: "success",
+        pushCount: 1,
+        totalPush: 1,
+        pullCount: 0,
+        totalPull: 0,
+        lastSyncTime: Date.now()
+      };
+    }
   } catch (error) {
     console.error("Sync failed:", error);
     new Notice(`Sync failed for ${file.path}: ${error.message}`);
+    if (plugin.syncProgress) {
+      plugin.syncProgress = {
+        status: "fail",
+        pushCount: 0,
+        totalPush: 0,
+        pullCount: 0,
+        totalPull: 0,
+        lastSyncTime: plugin.syncProgress.lastSyncTime,
+        errorMessage: (error as Error).message
+      };
+    }
   } finally {
     plugin.isSyncInProgress = false;
     plugin.removeIgnoredFile(file.path);
+    if (typeof plugin.updateStatusBar === "function") plugin.updateStatusBar();
   }
 };
 

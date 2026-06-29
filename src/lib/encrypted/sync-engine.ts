@@ -362,20 +362,58 @@ async function encryptedModifyImpl(file: TAbstractFile, plugin: FastSync, eventE
   if (blockIfEncryptedForcePushRequired(plugin, "localChange", file.path)) return;
   if (plugin.isSyncInProgress) return;
   plugin.isSyncInProgress = true;
+  if (plugin.syncProgress) {
+    plugin.syncProgress = {
+      status: "syncing",
+      pushCount: 0,
+      totalPush: 1,
+      pullCount: 0,
+      totalPull: 0,
+      lastSyncTime: plugin.syncProgress.lastSyncTime
+    };
+    if (typeof plugin.updateStatusBar === "function") plugin.updateStatusBar();
+  }
   try {
     const { store, key, manifest, manifestSha } = await loadStore(plugin);
     const path = normalizeVaultPath(file.path);
     const state = ensureEncryptedState(plugin);
     const existing = manifest.files[path];
     const cached = state.files[path];
-    if (!eventEnter && existing && !existing.deleted && cached?.plaintextSha256 === existing.plaintextSha256 && cached.size === file.stat.size && cached.mtime === file.stat.mtime) return;
+    if (!eventEnter && existing && !existing.deleted && cached?.plaintextSha256 === existing.plaintextSha256 && cached.size === file.stat.size && cached.mtime === file.stat.mtime) {
+      if (plugin.syncProgress) {
+        plugin.syncProgress.status = "success";
+      }
+      return;
+    }
 
     const plaintext = await readVaultFileBytes(plugin.app.vault, file);
     const plaintextSha256 = await sha256Hex(plaintext);
-    if (await resolveRemoteChangedBeforeLocalMutation(plugin, key, manifest, path, existing, cached, file, plaintext)) return;
+    if (await resolveRemoteChangedBeforeLocalMutation(plugin, key, manifest, path, existing, cached, file, plaintext)) {
+      if (plugin.syncProgress) {
+        plugin.syncProgress = {
+          status: "success",
+          pushCount: 1,
+          totalPush: 1,
+          pullCount: 0,
+          totalPull: 0,
+          lastSyncTime: Date.now()
+        };
+      }
+      return;
+    }
     if (existing && !existing.deleted && existing.plaintextSha256 === plaintextSha256) {
       state.files[path] = { ...cached, plaintextSha256, objectPath: existing.objectPath, remoteSha: existing.remoteSha, storage: existing.storage, chunks: existing.chunks, manifestUpdatedAt: manifest.updatedAt, size: file.stat.size, mtime: file.stat.mtime };
       await plugin.saveSyncData();
+      if (plugin.syncProgress) {
+        plugin.syncProgress = {
+          status: "success",
+          pushCount: 1,
+          totalPush: 1,
+          pullCount: 0,
+          totalPull: 0,
+          lastSyncTime: Date.now()
+        };
+      }
       return;
     }
 
@@ -387,10 +425,33 @@ async function encryptedModifyImpl(file: TAbstractFile, plugin: FastSync, eventE
     state.manifestSha = newManifestSha;
     state.files[path] = { plaintextSha256, objectPath: manifest.files[path].objectPath, remoteSha: manifest.files[path].remoteSha, storage: manifest.files[path].storage, chunks: manifest.files[path].chunks, manifestUpdatedAt: manifest.updatedAt, size: file.stat.size, mtime: file.stat.mtime };
     await plugin.saveSyncData();
+
+    if (plugin.syncProgress) {
+      plugin.syncProgress = {
+        status: "success",
+        pushCount: 1,
+        totalPush: 1,
+        pullCount: 0,
+        totalPull: 0,
+        lastSyncTime: Date.now()
+      };
+    }
   } catch (error) {
     reportSyncError("localChange", error, file.path);
+    if (plugin.syncProgress) {
+      plugin.syncProgress = {
+        status: "fail",
+        pushCount: 0,
+        totalPush: 0,
+        pullCount: 0,
+        totalPull: 0,
+        lastSyncTime: plugin.syncProgress.lastSyncTime,
+        errorMessage: (error as Error).message
+      };
+    }
   } finally {
     plugin.isSyncInProgress = false;
+    if (typeof plugin.updateStatusBar === "function") plugin.updateStatusBar();
   }
 }
 
