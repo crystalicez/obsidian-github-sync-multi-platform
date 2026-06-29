@@ -16,6 +16,24 @@ import { effectiveConflictPolicy } from "./settings-policy";
 import { deleteVaultFileIfExists, listEncryptedSyncCandidates, readVaultFileBytes, shouldSyncEncryptedFile, writeVaultFileBytes } from "./vault";
 import { randomBytes, sha256Hex, toBase64Url } from "./bytes";
 
+const syncQueues = new WeakMap<FastSync, Promise<any>>();
+
+function getSyncQueue(plugin: FastSync): Promise<any> {
+  let queue = syncQueues.get(plugin);
+  if (!queue) {
+    queue = Promise.resolve();
+    syncQueues.set(plugin, queue);
+  }
+  return queue;
+}
+
+function enqueue<T>(plugin: FastSync, task: () => Promise<T>): Promise<T> {
+  const queue = getSyncQueue(plugin);
+  const next = queue.then(task);
+  syncQueues.set(plugin, next.then(() => undefined, () => undefined));
+  return next;
+}
+
 export interface EncryptedSyncOptions {
   operation: EncryptedSyncOperation;
 }
@@ -163,7 +181,7 @@ async function confirmForeignRemoteBeforeForcePush(plugin: FastSync, operation: 
   return promptForeignRemoteForcePush(plugin);
 }
 
-export async function encryptedSync(plugin: FastSync, options: EncryptedSyncOptions): Promise<void> {
+async function encryptedSyncImpl(plugin: FastSync, options: EncryptedSyncOptions): Promise<void> {
   if (plugin.isSyncInProgress || !plugin.githubClient) return;
   if (blockIfEncryptedForcePushRequired(plugin, options.operation)) return;
   plugin.isSyncInProgress = true;
@@ -227,7 +245,11 @@ export async function encryptedSync(plugin: FastSync, options: EncryptedSyncOpti
   }
 }
 
-export async function encryptedModify(file: TAbstractFile, plugin: FastSync, eventEnter = false): Promise<void> {
+export async function encryptedSync(plugin: FastSync, options: EncryptedSyncOptions): Promise<void> {
+  return enqueue(plugin, () => encryptedSyncImpl(plugin, options));
+}
+
+async function encryptedModifyImpl(file: TAbstractFile, plugin: FastSync, eventEnter = false): Promise<void> {
   if (!(file instanceof TFile)) return;
   if (!plugin.isWatchEnabled && eventEnter) return;
   if (!shouldSyncEncryptedFile(file, configuredIgnoreRules(plugin)) || !plugin.githubClient) return;
@@ -262,7 +284,11 @@ export async function encryptedModify(file: TAbstractFile, plugin: FastSync, eve
   }
 }
 
-export async function encryptedDelete(file: TAbstractFile, plugin: FastSync, eventEnter = false): Promise<void> {
+export async function encryptedModify(file: TAbstractFile, plugin: FastSync, eventEnter = false): Promise<void> {
+  return enqueue(plugin, () => encryptedModifyImpl(file, plugin, eventEnter));
+}
+
+async function encryptedDeleteImpl(file: TAbstractFile, plugin: FastSync, eventEnter = false): Promise<void> {
   if (!plugin.isWatchEnabled && eventEnter) return;
   if (!plugin.githubClient) return;
   if (blockIfEncryptedForcePushRequired(plugin, "localChange", file.path)) return;
@@ -284,7 +310,11 @@ export async function encryptedDelete(file: TAbstractFile, plugin: FastSync, eve
   }
 }
 
-export async function encryptedRename(file: TAbstractFile, oldfile: string, plugin: FastSync, eventEnter = false): Promise<void> {
+export async function encryptedDelete(file: TAbstractFile, plugin: FastSync, eventEnter = false): Promise<void> {
+  return enqueue(plugin, () => encryptedDeleteImpl(file, plugin, eventEnter));
+}
+
+async function encryptedRenameImpl(file: TAbstractFile, oldfile: string, plugin: FastSync, eventEnter = false): Promise<void> {
   if (!(file instanceof TFile)) return;
   if (!plugin.isWatchEnabled && eventEnter) return;
   if (blockIfEncryptedForcePushRequired(plugin, "localChange", file.path)) return;
@@ -294,7 +324,7 @@ export async function encryptedRename(file: TAbstractFile, oldfile: string, plug
     const oldPath = normalizeVaultPath(oldfile);
     const newPath = normalizeVaultPath(file.path);
     if (oldPath === newPath) {
-      await encryptedModify(file, plugin, eventEnter);
+      await encryptedModifyImpl(file, plugin, eventEnter);
       return;
     }
 
@@ -330,6 +360,10 @@ export async function encryptedRename(file: TAbstractFile, oldfile: string, plug
   } catch (error) {
     reportSyncError("localChange", error, file.path);
   }
+}
+
+export async function encryptedRename(file: TAbstractFile, oldfile: string, plugin: FastSync, eventEnter = false): Promise<void> {
+  return enqueue(plugin, () => encryptedRenameImpl(file, oldfile, plugin, eventEnter));
 }
 
 async function pullEncryptedChanges(plugin: FastSync, key: CryptoKey, manifest: EncryptedManifest, force: boolean): Promise<void> {

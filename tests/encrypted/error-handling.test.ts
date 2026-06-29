@@ -164,3 +164,16 @@ test("GitHubClient.getFile returns null only for 404 and throws for other HTTP e
     setRequestUrlHandler(null);
   }
 });
+
+test("GitHubClient.deleteFile tolerates 404 and throws on other HTTP errors", async () => {
+  const client = new GitHubClient({ token: "token", owner: "owner", repo: "repo", branch: "main" });
+  try {
+    setRequestUrlHandler(async () => ({ status: 404, text: "missing", json: {} }));
+    await assert.doesNotReject(() => client.deleteFile("Notes/missing.md", "sha"));
+
+    setRequestUrlHandler(async () => ({ status: 403, text: "forbidden", json: {} }));
+    await assert.rejects(() => client.deleteFile("Notes/a.md", "sha"), /HTTP 403|forbidden/i);
+  } finally {
+    setRequestUrlHandler(null);
+  }
+});

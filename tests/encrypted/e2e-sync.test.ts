@@ -6,6 +6,7 @@ import { NoteModify, NoteRename, overrideRemoteAllFilesImpl, syncAllFilesImpl } 
 import { hashContent } from "../../src/lib/helps";
 import { GitHubClient } from "../../src/lib/github-api";
 import { EncryptedManifestStore } from "../../src/lib/encrypted/manifest-store";
+import { sha256Hex, utf8ToBytes } from "../../src/lib/encrypted/bytes";
 
 class MemoryGitHub {
   blobs = new Map<string, { content: string; sha: string }>();
@@ -556,6 +557,51 @@ test("plaintext local modify honors the syncEnabled master switch", () => {
   assert.equal(github.putCounts.size, 0);
 });
 
+test("plaintext local modify refuses case-insensitive path collisions before upload", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault({ "Notes/File.md": "upper", "Notes/file.md": "lower" });
+  const instance = plaintextPlugin(vault, github);
+  Notice.messages.length = 0;
+  const callbacks: Array<() => void> = [];
+  const originalSetTimeout = globalThis.setTimeout;
+  const originalClearTimeout = globalThis.clearTimeout;
+  const originalWindow = (globalThis as typeof globalThis & { window?: typeof globalThis }).window;
+  globalThis.setTimeout = ((callback: () => void) => {
+    callbacks.push(callback);
+    return callbacks.length as unknown as ReturnType<typeof setTimeout>;
+  }) as typeof setTimeout;
+  globalThis.clearTimeout = (() => {}) as typeof clearTimeout;
+  (globalThis as typeof globalThis & { window?: typeof globalThis }).window = globalThis;
+
+  try {
+    NoteModify(vault.getAbstractFileByPath("Notes/File.md") as TFile, instance as never, true);
+    await withMutedConsoleError(async () => {
+      await callbacks.at(-1)?.();
+    });
+  } finally {
+    globalThis.setTimeout = originalSetTimeout;
+    globalThis.clearTimeout = originalClearTimeout;
+    (globalThis as typeof globalThis & { window?: typeof globalThis }).window = originalWindow;
+  }
+
+  assert.equal(github.putCounts.size, 0);
+  assert.match(Notice.messages.at(-1) ?? "", /case-insensitive path collision/i);
+});
+
+test("plaintext rename refuses case-insensitive path collisions before upload", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault({ "Notes/File.md": "upper", "Notes/file.md": "lower" });
+  const instance = plaintextPlugin(vault, github);
+  Notice.messages.length = 0;
+
+  await withMutedConsoleError(async () => {
+    await NoteRename(vault.getAbstractFileByPath("Notes/file.md") as TFile, "Notes/old.md", instance as never, true);
+  });
+
+  assert.equal(github.putCounts.size, 0);
+  assert.match(Notice.messages.at(-1) ?? "", /case-insensitive path collision/i);
+});
+
 test("plaintext full sync preserves local edits when remote changed since last sync", async () => {
   const github = new MemoryGitHub();
   await github.putFile("Notes/a.md", "remote edit");
@@ -670,4 +716,28 @@ test("normal encrypted sync migrates a gradually grown vault into pack mode", as
   const loaded = await store.loadOrCreate();
   assert.equal(Object.keys(loaded.manifest.packs ?? {}).length > 0, true);
   assert.equal(Object.values(loaded.manifest.files).every(record => record.storage === "pack"), true);
+});
+
+test("concurrent local modifications do not overwrite remote manifest changes", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault({ "Notes/a.md": "initial a", "Notes/b.md": "initial b" });
+  const instance = plugin(vault, github) as never;
+  await encryptedForcePush(instance);
+
+  vault.set("Notes/a.md", new TextEncoder().encode("updated a"));
+  vault.set("Notes/b.md", new TextEncoder().encode("updated b"));
+
+  const fileA = vault.getAbstractFileByPath("Notes/a.md") as TFile;
+  const fileB = vault.getAbstractFileByPath("Notes/b.md") as TFile;
+
+  await Promise.all([
+    encryptedModify(fileA, instance, false),
+    encryptedModify(fileB, instance, false),
+  ]);
+
+  const store = new EncryptedManifestStore(github as unknown as GitHubClient, "correct horse battery staple");
+  const loaded = await store.loadOrCreate();
+
+  assert.equal(loaded.manifest.files["Notes/a.md"].plaintextSha256, await sha256Hex(utf8ToBytes("updated a")));
+  assert.equal(loaded.manifest.files["Notes/b.md"].plaintextSha256, await sha256Hex(utf8ToBytes("updated b")));
 });

@@ -5,7 +5,7 @@ import FastSync from "../main";
 import { GitHubClient, GitHubTreeNode } from "./github-api";
 import { encryptedDelete, encryptedForcePush, encryptedFullSync, encryptedModify, encryptedRename } from "./encrypted/sync-engine";
 import { shouldHandleEncryptedLocalChange } from "./encrypted/settings-policy";
-import { conflictPathFor } from "./encrypted/paths";
+import { conflictPathFor, detectCaseInsensitiveCollisions } from "./encrypted/paths";
 
 const IMAGE_EXTENSIONS = ["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "tiff"];
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
@@ -15,6 +15,23 @@ function shouldSyncPlaintextFile(file: TFile): boolean {
   const isMarkdown = file.extension === "md";
   const isImage = IMAGE_EXTENSIONS.includes(file.extension.toLowerCase());
   return (isMarkdown || isImage) && !file.path.includes(".sync-conflict-") && file.stat.size <= MAX_FILE_SIZE;
+}
+
+function throwIfPlaintextPathCollisions(files: TFile[]): void {
+  const collisions = detectCaseInsensitiveCollisions(files.map(file => file.path));
+  if (collisions.length > 0) {
+    throw new Error(`Case-insensitive path collision: ${collisions.map(pair => pair.join(" <-> ")).join(", ")}`);
+  }
+}
+
+function assertNoPlaintextPathCollisions(plugin: FastSync): void {
+  throwIfPlaintextPathCollisions(plugin.app.vault.getFiles().filter(shouldSyncPlaintextFile));
+}
+
+function listPlaintextSyncCandidates(plugin: FastSync): TFile[] {
+  const files = plugin.app.vault.getFiles().filter(shouldSyncPlaintextFile);
+  throwIfPlaintextPathCollisions(files);
+  return files;
 }
 
 async function writePlaintextConflictCopy(plugin: FastSync, path: string, content: string | ArrayBuffer): Promise<void> {
@@ -56,6 +73,7 @@ function clearEncryptedModify(path: string, plugin: FastSync): void {
  */
 export const NoteModify = function (file: TAbstractFile, plugin: FastSync, eventEnter: boolean = false) {
   if (plugin.settings.encryptionMode === "encrypted") {
+    if (!plugin.isWatchEnabled && eventEnter) return;
     if (!shouldHandleEncryptedLocalChange(plugin.settings, eventEnter)) return;
     if (!(file instanceof TFile)) return;
     if (eventEnter) scheduleEncryptedModify(file, plugin, eventEnter);
@@ -90,8 +108,9 @@ export const NoteModify = function (file: TAbstractFile, plugin: FastSync, event
 };
 
 const performSync = async (file: TFile, plugin: FastSync) => {
-  plugin.addIgnoredFile(file.path);
   try {
+    assertNoPlaintextPathCollisions(plugin);
+    plugin.addIgnoredFile(file.path);
     const isMarkdown = file.extension === "md";
     const isImage = IMAGE_EXTENSIONS.includes(file.extension.toLowerCase());
     
@@ -140,6 +159,7 @@ const performSync = async (file: TFile, plugin: FastSync) => {
 
 export const NoteDelete = async function (file: TAbstractFile, plugin: FastSync, eventEnter: boolean = false) {
   if (plugin.settings.encryptionMode === "encrypted") {
+    if (!plugin.isWatchEnabled && eventEnter) return;
     if (!shouldHandleEncryptedLocalChange(plugin.settings, eventEnter)) return;
     clearEncryptedModify(file.path, plugin);
     await encryptedDelete(file, plugin, eventEnter);
@@ -173,19 +193,29 @@ export const NoteDelete = async function (file: TAbstractFile, plugin: FastSync,
 
 export const NoteRename = async function (file: TAbstractFile, oldfile: string, plugin: FastSync, eventEnter: boolean = false) {
   if (plugin.settings.encryptionMode === "encrypted") {
+    if (!plugin.isWatchEnabled && eventEnter) return;
     if (!shouldHandleEncryptedLocalChange(plugin.settings, eventEnter)) return;
     clearEncryptedModify(oldfile, plugin);
     clearEncryptedModify(file.path, plugin);
     await encryptedRename(file, oldfile, plugin, eventEnter);
     return;
   }
+  if (plugin.debounceTimers.has(oldfile)) {
+    clearTimeout(plugin.debounceTimers.get(oldfile));
+    plugin.debounceTimers.delete(oldfile);
+  }
+  if (plugin.debounceTimers.has(file.path)) {
+    clearTimeout(plugin.debounceTimers.get(file.path));
+    plugin.debounceTimers.delete(file.path);
+  }
   if (!(file instanceof TFile)) return;
   if (eventEnter && !plugin.settings.syncEnabled) return;
   if (!plugin.isWatchEnabled && eventEnter) return;
   if (!plugin.githubClient) return;
 
-  plugin.addIgnoredFile(file.path);
   try {
+    assertNoPlaintextPathCollisions(plugin);
+    plugin.addIgnoredFile(file.path);
     const oldSha = plugin.syncData.files[oldfile]?.sha;
 
     // 1. 上传新路径
@@ -215,6 +245,7 @@ export const NoteRename = async function (file: TAbstractFile, oldfile: string, 
     dump(`Renamed ${oldfile} -> ${file.path}`);
   } catch (error) {
     console.error("Rename failed:", error);
+    new Notice(`Rename failed for ${file.path}: ${(error as Error).message}`);
   } finally {
     plugin.removeIgnoredFile(file.path);
   }
@@ -239,10 +270,8 @@ export async function overrideRemoteAllFilesImpl(plugin: FastSync): Promise<void
   plugin.disableWatch();
   
   try {
-    const files = plugin.app.vault.getFiles();
+    const files = listPlaintextSyncCandidates(plugin);
     for (const file of files) {
-       if (!shouldSyncPlaintextFile(file)) continue;
-       
        const isMarkdown = file.extension === "md";
 
        let content: string | ArrayBuffer;
@@ -305,7 +334,7 @@ export async function syncAllFilesImpl(plugin: FastSync): Promise<void> {
     });
     const remoteFilesMap = new Map<string, string>(remoteFiles.map((f: GitHubTreeNode) => [f.path, f.sha] as [string, string]));
 
-    const allLocalFiles = plugin.app.vault.getFiles();
+    const allLocalFiles = listPlaintextSyncCandidates(plugin);
     const localFilesMap = new Map<string, TFile>(allLocalFiles.map(f => [f.path, f]));
 
     // 1. 下拉远端变更

@@ -161,16 +161,23 @@ export class GitHubClient {
       branch: this.config.branch,
     };
 
-    const response = await requestUrl({
-      url,
-      method: "DELETE",
-      headers: this.headers,
-      body: JSON.stringify(body),
-    });
+    try {
+      const response = await requestUrl({
+        url,
+        method: "DELETE",
+        headers: this.headers,
+        body: JSON.stringify(body),
+        throw: false,
+      });
 
-    // B5: GitHub DELETE 成功返回 200（有响应体）或 204（无内容）
-    if (response.status !== 200 && response.status !== 204) {
-      throw new Error(`Failed to delete file: ${response.status} ${response.text}`);
+      if (response.status === 200 || response.status === 204 || response.status === 404) {
+        return;
+      }
+      throw new Error(`Failed to delete file: HTTP ${response.status} - ${response.text}`);
+    } catch (error) {
+      const httpError = error as { status?: number };
+      if (httpError.status === 404) return;
+      throw error;
     }
   }
 
