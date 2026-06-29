@@ -3,10 +3,10 @@ import test from "node:test";
 import { modalButtons, modalEvents, resetModalTestState, TFile } from "obsidian";
 import { bytesToUtf8, fromBase64, fromBase64Url, sha256Hex, toBase64, toBase64Url, toHex, utf8ToBytes } from "../../src/lib/encrypted/bytes";
 import { chooseConflictResolution, chooseNewerResolution, isTextLikePath, mergeTextContent } from "../../src/lib/encrypted/conflicts";
+import { decryptJson, deriveEncryptionKey, encryptJson, encryptBytes, decryptBytes } from "../../src/lib/encrypted/crypto";
 import { GITHUB_RECOMMENDED_MAX_BYTES } from "../../src/lib/encrypted/constants";
-import { decryptJson, deriveEncryptionKey, encryptJson } from "../../src/lib/encrypted/crypto";
 import { compileIgnorePathRegex, isIgnoredPath } from "../../src/lib/encrypted/ignore";
-import { chunkPathForId, shouldChunkEncryptedPayload } from "../../src/lib/encrypted/large-objects";
+import { chunkPathForId, shouldChunkEncryptedPayload, shouldChunkPlaintext } from "../../src/lib/encrypted/large-objects";
 import { conflictPathFor, detectCaseInsensitiveCollisions, normalizeVaultPath, objectPathForId } from "../../src/lib/encrypted/paths";
 import { EncryptedObjectRecord } from "../../src/lib/encrypted/types";
 import { listEncryptedSyncCandidates, shouldSyncEncryptedFile } from "../../src/lib/encrypted/vault";
@@ -155,4 +155,81 @@ test("chooseConflictResolution respects policies and text-like fallback", async 
   
   // copy policy
   assert.equal(await chooseConflictResolution(plugin as any, "copy", "note.md", localFile, 500), "copy-remote");
+});
+
+test("shouldChunkPlaintext correctly predicts chunking threshold", () => {
+  const belowBoundary = new Uint8Array(37 * 1024 * 1024); // 37MB < 37.5MB
+  const aboveBoundary = new Uint8Array(38 * 1024 * 1024); // 38MB > 37.5MB
+
+  assert.equal(shouldChunkPlaintext(belowBoundary), false);
+  assert.equal(shouldChunkPlaintext(aboveBoundary), true);
+});
+
+test("Web Crypto operations process offset-sliced Uint8Array views correctly without buffer copy", async () => {
+  const config = {
+    formatVersion: 1 as const,
+    indexMode: "single" as const,
+    algorithm: "AES-GCM",
+    kdf: "PBKDF2-SHA-256",
+    kdfParams: { iterations: 10, salt: "c2FsdHNhbHQ" }, // "saltsalt" in base64url
+    createdAt: 1,
+    updatedAt: 1
+  };
+  const key = await deriveEncryptionKey("testpassphrase", config);
+
+  const rawBytes = new Uint8Array([9, 9, 83, 69, 67, 82, 69, 84, 9, 9]); // padding + "SECRET" + padding
+  const slicedBytes = rawBytes.subarray(2, 8); // "SECRET"
+
+  // Encrypt slicedBytes (Uint8Array view with offset=2, length=6)
+  const payload = await encryptBytes(key, slicedBytes);
+  const decrypted = await decryptBytes(key, payload);
+
+  assert.deepEqual(decrypted, new Uint8Array([83, 69, 67, 82, 69, 84]));
+});
+
+test("uploadEncryptedFileObject skips single encryption entirely for large files", async () => {
+  // Mock GitHubClient
+  const putFiles: { path: string; content: string }[] = [];
+  const mockGithub = {
+    putFile: async (path: string, content: string) => {
+      putFiles.push({ path, content });
+      return "mock-sha";
+    },
+    deleteFile: async () => {}
+  };
+
+  const config = {
+    formatVersion: 1 as const,
+    indexMode: "single" as const,
+    algorithm: "AES-GCM",
+    kdf: "PBKDF2-SHA-256",
+    kdfParams: { iterations: 10, salt: "c2FsdHNhbHQ" },
+    createdAt: 1,
+    updatedAt: 1
+  };
+  const key = await deriveEncryptionKey("testpassphrase", config);
+
+  let encryptCallCount = 0;
+  const originalCryptoSubtleEncrypt = crypto.subtle.encrypt;
+  
+  // 39MB of empty bytes
+  const largePlaintext = new Uint8Array(39 * 1024 * 1024);
+
+  const spyEncrypt = async (algorithm: any, key: any, data: any) => {
+    encryptCallCount++;
+    return originalCryptoSubtleEncrypt.call(crypto.subtle, algorithm, key, data);
+  };
+  
+  (crypto.subtle as any).encrypt = spyEncrypt;
+
+  try {
+    const { uploadEncryptedFileObject } = await import("../../src/lib/encrypted/large-objects");
+    await uploadEncryptedFileObject(mockGithub as any, key, "large-id", largePlaintext);
+  } finally {
+    (crypto.subtle as any).encrypt = originalCryptoSubtleEncrypt;
+  }
+
+  // The number of chunks for 39MB (with chunk size = 24MB) is 2 chunks.
+  // Since we bypass the single payload encryption check, encrypt should be called exactly 2 times (once per chunk).
+  assert.equal(encryptCallCount, 2);
 });

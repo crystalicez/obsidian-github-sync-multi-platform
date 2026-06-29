@@ -5,11 +5,7 @@ const BASE64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz012
 const BASE64URL_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 const HEX_TABLE = Array.from({ length: 256 }, (_, byte) => byte.toString(16).padStart(2, "0"));
 
-function asArrayBuffer(bytes: Uint8Array): ArrayBuffer {
-  if (bytes.buffer instanceof ArrayBuffer && bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength) return bytes.buffer;
-  if (bytes.buffer instanceof ArrayBuffer) return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
-  return new Uint8Array(bytes).buffer;
-}
+
 function asUint8Array(value: ArrayBuffer | Uint8Array): Uint8Array {
   return value instanceof Uint8Array ? value : new Uint8Array(value);
 }
@@ -102,6 +98,5 @@ export function randomBytes(length: number): Uint8Array {
 }
 
 export async function sha256Hex(value: ArrayBuffer | Uint8Array): Promise<string> {
-  const bytes = asUint8Array(value);
-  return toHex(await crypto.subtle.digest("SHA-256", asArrayBuffer(bytes)));
+  return toHex(await crypto.subtle.digest("SHA-256", value));
 }

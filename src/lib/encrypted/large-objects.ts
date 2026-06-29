@@ -17,6 +17,11 @@ export function shouldChunkEncryptedPayload(payload: string): boolean {
   return new TextEncoder().encode(payload).byteLength > GITHUB_RECOMMENDED_MAX_BYTES;
 }
 
+export function shouldChunkPlaintext(plaintext: Uint8Array): boolean {
+  const estimatedEncryptedSize = 50 + 16 + (plaintext.byteLength + 16) * 4 / 3;
+  return estimatedEncryptedSize > GITHUB_RECOMMENDED_MAX_BYTES;
+}
+
 async function deleteStaleChunks(
   github: GitHubClient,
   existing: EncryptedObjectRecord | undefined,
@@ -36,8 +41,8 @@ export async function uploadEncryptedFileObject(
   existing?: EncryptedObjectRecord
 ): Promise<EncryptedObjectRecord> {
   const fullHash = await sha256Hex(plaintext);
-  const singlePayload = JSON.stringify(await encryptBytes(key, plaintext));
-  if (!shouldChunkEncryptedPayload(singlePayload)) {
+  if (!shouldChunkPlaintext(plaintext)) {
+    const singlePayload = JSON.stringify(await encryptBytes(key, plaintext));
     const objectPath = existing?.objectPath ?? objectPathForId(id);
     const remoteSha = await github.putFile(objectPath, singlePayload, existing?.remoteSha);
     await deleteStaleChunks(github, existing, new Set());

@@ -421,11 +421,7 @@ export async function syncAllFilesImpl(plugin: FastSync): Promise<void> {
             } else {
               let buffer: ArrayBuffer;
               if (typeof finalContent === "string") {
-                const binaryString = atob(finalContent.replace(/\n/g, ""));
-                const len = binaryString.length;
-                const bytes = new Uint8Array(len);
-                for (let i = 0; i < len; i++) bytes[i] = binaryString.charCodeAt(i);
-                buffer = bytes.buffer;
+                buffer = GitHubClient.decodeContentBytes(finalContent).buffer;
               } else {
                 buffer = finalContent;
               }
