@@ -432,6 +432,8 @@ async function deleteObsoleteRemotePacks(plugin: FastSync, previousPacks: Encryp
 
 async function pushEncryptedPackLocalChanges(plugin: FastSync, key: CryptoKey, manifest: EncryptedManifest, localFiles: TFile[]): Promise<boolean> {
   const previousFiles = manifest.files;
+  const previousPacks = manifest.packs ?? {};
+  const state = ensureEncryptedState(plugin);
   const packFiles = localFiles.filter(file => file.stat.size <= ENCRYPTED_PACK_PLAINTEXT_BYTES);
   const objectFiles = localFiles.filter(file => file.stat.size > ENCRYPTED_PACK_PLAINTEXT_BYTES);
   const plan = planEncryptedPacks(packFiles.map(file => ({ path: normalizeVaultPath(file.path), size: file.stat.size, mtime: file.stat.mtime })));
@@ -440,6 +442,18 @@ async function pushEncryptedPackLocalChanges(plugin: FastSync, key: CryptoKey, m
   manifest.packs = {};
 
   for (const pack of plan.packs) {
+    const reusablePack = previousPacks[pack.id];
+    const canReusePack = !!reusablePack && pack.files.every(entry => {
+      const previous = previousFiles[entry.path];
+      const cached = state.files[entry.path];
+      return previous && cached && !previous.deleted && previous.storage === "pack" && previous.packId === pack.id && previous.size === entry.size && previous.mtime === entry.mtime && cached.plaintextSha256 === previous.plaintextSha256 && cached.size === entry.size && cached.mtime === entry.mtime;
+    });
+    if (canReusePack) {
+      manifest.packs[pack.id] = reusablePack;
+      for (const entry of pack.files) manifest.files[entry.path] = { ...previousFiles[entry.path], deleted: false, deletedAt: undefined };
+      continue;
+    }
+
     const archiveFiles = [];
     for (const entry of pack.files) {
       const file = filesByPath.get(entry.path);
@@ -460,7 +474,7 @@ async function pushEncryptedPackLocalChanges(plugin: FastSync, key: CryptoKey, m
         deletedAt: undefined,
       };
     }
-    manifest.packs[pack.id] = await uploadEncryptedPack(plugin.githubClient, key, pack.id, archiveFiles, manifest.packs[pack.id]);
+    manifest.packs[pack.id] = await uploadEncryptedPack(plugin.githubClient, key, pack.id, archiveFiles, previousPacks[pack.id]);
   }
 
   for (const file of objectFiles) {

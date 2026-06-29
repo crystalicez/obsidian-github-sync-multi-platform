@@ -1,7 +1,7 @@
 import { TFile, TAbstractFile, Notice, requestUrl } from "obsidian";
 
 import { hashContent, dump } from "./helps";
-import FastSync from "../main";
+import FastSync, { FileState } from "../main";
 import { GitHubClient, GitHubTreeNode } from "./github-api";
 import { encryptedDelete, encryptedForcePush, encryptedFullSync, encryptedModify, encryptedRename } from "./encrypted/sync-engine";
 import { shouldHandleEncryptedLocalChange } from "./encrypted/settings-policy";
@@ -10,6 +10,17 @@ import { conflictPathFor, detectCaseInsensitiveCollisions } from "./encrypted/pa
 const IMAGE_EXTENSIONS = ["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "tiff"];
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
 const ENCRYPTED_MODIFY_DEBOUNCE_MS = 5000;
+
+
+type PlaintextSyncEntry = FileState & { size?: number; mtime?: number };
+
+function cachedPlaintextStatMatches(file: TFile, entry?: PlaintextSyncEntry): boolean {
+  return entry?.size === file.stat.size && entry?.mtime === file.stat.mtime;
+}
+
+function plaintextSyncEntry(sha: string, file: TFile, hash: string, lastSync: number = Date.now()): PlaintextSyncEntry {
+  return { sha, lastSync, hash, size: file.stat.size, mtime: file.stat.mtime };
+}
 
 function shouldSyncPlaintextFile(file: TFile): boolean {
   const isMarkdown = file.extension === "md";
@@ -141,11 +152,7 @@ const performSync = async (file: TFile, plugin: FastSync) => {
     const sha = plugin.syncData.files[file.path]?.sha;
     const newSha = await plugin.githubClient.putFile(file.path, content, sha);
 
-    plugin.syncData.files[file.path] = {
-      sha: newSha,
-      lastSync: Date.now(),
-      hash: currentHash
-    };
+    plugin.syncData.files[file.path] = plaintextSyncEntry(newSha, file, currentHash);
     await plugin.saveSyncData();
     dump(`Synced ${file.path} to GitHub`, newSha);
 
@@ -232,11 +239,7 @@ export const NoteRename = async function (file: TAbstractFile, oldfile: string, 
     }
 
     const newSha = await plugin.githubClient.putFile(file.path, content);
-    plugin.syncData.files[file.path] = {
-      sha: newSha,
-      lastSync: Date.now(),
-      hash: currentHash
-    };
+    plugin.syncData.files[file.path] = plaintextSyncEntry(newSha, file, currentHash);
     if (oldSha) {
       await plugin.githubClient.deleteFile(oldfile, oldSha);
       delete plugin.syncData.files[oldfile];
@@ -287,11 +290,7 @@ export async function overrideRemoteAllFilesImpl(plugin: FastSync): Promise<void
 
        const sha = plugin.syncData.files[file.path]?.sha;
        const newSha = await plugin.githubClient.putFile(file.path, content, sha);
-       plugin.syncData.files[file.path] = {
-         sha: newSha,
-         lastSync: Date.now(),
-         hash: currentHash
-       };
+       plugin.syncData.files[file.path] = plaintextSyncEntry(newSha, file, currentHash);
     }
     await plugin.saveSyncData();
     // B6: updateStats 异步执行，不阻塞主流程
@@ -440,6 +439,12 @@ export async function syncAllFilesImpl(plugin: FastSync): Promise<void> {
         const remoteSha = remoteFilesMap.get(file.path);
         const localState = plugin.syncData.files[file.path];
 
+        if (remoteSha && localState?.sha === remoteSha && localState.hash && cachedPlaintextStatMatches(file, localState)) {
+          plugin.syncData.files[file.path] = plaintextSyncEntry(remoteSha, file, localState.hash, localState.lastSync ?? Date.now());
+          step2Skip++;
+          continue;
+        }
+
         // 计算当前内容 hash
         let content: string | ArrayBuffer;
         let currentHash: string;
@@ -454,28 +459,16 @@ export async function syncAllFilesImpl(plugin: FastSync): Promise<void> {
         if (!remoteSha) {
           // 远端没有 → 新增文件，直接上传
           const newSha = await plugin.githubClient.putFile(file.path, content);
-          plugin.syncData.files[file.path] = {
-            sha: newSha,
-            lastSync: Date.now(),
-            hash: currentHash
-          };
+          plugin.syncData.files[file.path] = plaintextSyncEntry(newSha, file, currentHash);
           step2Push++;
         } else if (!localState || localState.hash !== currentHash) {
           // B2: 远端有、但本地内容发生了变化 → 推送本地改动
           const newSha = await plugin.githubClient.putFile(file.path, content, remoteSha);
-          plugin.syncData.files[file.path] = {
-            sha: newSha,
-            lastSync: Date.now(),
-            hash: currentHash
-          };
+          plugin.syncData.files[file.path] = plaintextSyncEntry(newSha, file, currentHash);
           step2Push++;
         } else {
           // 两端内容一致，只更新本地 sha 缓存（防止 performSync 重复触发）
-          plugin.syncData.files[file.path] = {
-            sha: remoteSha,
-            lastSync: plugin.syncData.files[file.path]?.lastSync ?? Date.now(),
-            hash: currentHash  // 更新为当前真实 hash
-          };
+          plugin.syncData.files[file.path] = plaintextSyncEntry(remoteSha, file, currentHash, plugin.syncData.files[file.path]?.lastSync ?? Date.now());
           step2Skip++;
         }
       } catch (fileError) {

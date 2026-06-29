@@ -104,6 +104,7 @@ class StrictFolderVault {
 class MemoryVault {
   files = new Map<string, Uint8Array>();
   mtimes = new Map<string, number>();
+  readCount = 0;
   readBinaryCount = 0;
   getFilesCount = 0;
 
@@ -139,6 +140,7 @@ class MemoryVault {
   }
 
   async read(file: TFile) {
+    this.readCount += 1;
     return new TextDecoder().decode(this.files.get(file.path) ?? new Uint8Array());
   }
 
@@ -309,6 +311,23 @@ test("normal encrypted sync restores changed files from pack mode without writin
   assert.equal(new TextDecoder().decode(targetVault.files.get("Notes/note-00000.md")), "v2-0");
 });
 
+test("normal encrypted sync uploads only changed packs in a large vault", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault(manyFileEntries(10_001, "v1"));
+  const instance = plugin(vault, github) as never;
+  await encryptedForcePush(instance);
+
+  const packPaths = [...github.blobs.keys()].filter(path => path.startsWith(".obsidian-github-sync-encrypted/packs/"));
+  const packPutsBefore = new Map(packPaths.map(path => [path, github.putCounts.get(path) ?? 0]));
+  vault.set("Notes/note-00000.md", new TextEncoder().encode("v2-0"));
+  vault.readBinaryCount = 0;
+
+  await encryptedFullSync(instance);
+
+  const changedPackUploads = packPaths.filter(path => (github.putCounts.get(path) ?? 0) > (packPutsBefore.get(path) ?? 0));
+  assert.equal(changedPackUploads.length, 1);
+  assert.equal(vault.readBinaryCount <= 1_000, true);
+});
 test("encrypted local modify is blocked until force push after enabling encryption", async () => {
   const github = new MemoryGitHub();
   const vault = new MemoryVault({ "Notes/a.md": "needs migration" });
@@ -660,6 +679,32 @@ test("encrypted overwrite command path performs force push semantics", async () 
 });
 
 
+test("plaintext full sync skips unchanged cached markdown reads at scale", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault(manyFileEntries(100_000, "stable"));
+  const instance = plaintextPlugin(vault, github);
+  const files = vault.getFiles();
+
+  for (const file of files) {
+    const sha = `remote-${file.path}`;
+    github.blobs.set(file.path, { content: "", sha });
+    instance.syncData.files[file.path] = {
+      sha,
+      lastSync: Date.now(),
+      hash: "cached",
+      size: file.stat.size,
+      mtime: file.stat.mtime,
+    };
+  }
+  vault.readCount = 0;
+  vault.readBinaryCount = 0;
+
+  await syncAllFilesImpl(instance as never);
+
+  assert.equal(vault.readCount, 0);
+  assert.equal(vault.readBinaryCount, 0);
+  assert.equal(github.putCounts.size, 0);
+});
 test("plaintext full sync refuses truncated remote trees before pushing local files", async () => {
   const github = new MemoryGitHub();
   github.truncated = true;

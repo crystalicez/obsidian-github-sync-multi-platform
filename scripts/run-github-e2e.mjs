@@ -5,6 +5,10 @@ import { spawnSync } from "node:child_process";
 import path from "node:path";
 
 const root = process.cwd();
+for (const arg of process.argv.slice(2)) {
+  if (arg.startsWith("--profile=")) process.env.GITHUB_E2E_PROFILE = arg.slice("--profile=".length);
+  if (arg === "--benchmarks") process.env.GITHUB_E2E_RUN_BENCHMARKS = "1";
+}
 const envFile = process.env.GITHUB_E2E_ENV_FILE ?? ".env.github-e2e";
 const envPath = path.isAbsolute(envFile) ? envFile : path.join(root, envFile);
 

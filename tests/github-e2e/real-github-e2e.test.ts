@@ -15,6 +15,10 @@ interface BenchRecord {
 }
 
 const benchRecords: BenchRecord[] = [];
+const profile = process.env.GITHUB_E2E_PROFILE ?? "quick";
+const runBenchmarks = process.env.GITHUB_E2E_RUN_BENCHMARKS === "1" || profile === "full" || profile === "stress";
+const benchmarkTest = runBenchmarks ? test : test.skip;
+const regressionTest = profile === "quick" ? test.skip : test;
 const forbiddenBranches = new Set(["main", "master", "production", "prod", "release", "stable"]);
 const passphrase = "github real e2e passphrase";
 
@@ -376,7 +380,7 @@ installRequestUrlBridge();
 
 after(async () => {
   await mkdir(path.join(process.cwd(), ".tmp"), { recursive: true });
-  await writeFile(path.join(process.cwd(), ".tmp", "github-e2e-results.json"), JSON.stringify({ generatedAt: new Date().toISOString(), records: benchRecords }, null, 2));
+  await writeFile(path.join(process.cwd(), ".tmp", "github-e2e-results.json"), JSON.stringify({ generatedAt: new Date().toISOString(), profile, runBenchmarks, records: benchRecords }, null, 2));
 });
 
 test("github e2e: encrypted force push/pull round trips real vault content without plaintext remote paths", { timeout: 120000 }, async () => {
@@ -433,7 +437,7 @@ test("github e2e: modify rename delete and normal sync behave against real GitHu
   assert.equal(loaded.manifest.files["Notes/delete-me.md"].deleted, true);
 });
 
-test("github e2e: regression cases cover wrong passphrase, foreign remote prompt, stale sha retry, and missing delete", { timeout: 240000 }, async () => {
+regressionTest("github e2e: regression cases cover wrong passphrase, foreign remote prompt, stale sha retry, and missing delete", { timeout: 240000 }, async () => {
   const config = githubConfig();
   const client = await resetTestBranch(config);
 
@@ -469,7 +473,7 @@ test("github e2e: regression cases cover wrong passphrase, foreign remote prompt
   assert.match(Notice.messages.at(-1) ?? "", /passphrase|decrypt|wrong/i);
 });
 
-test("github e2e: benchmark pack mode on real GitHub", { timeout: 600000 }, async () => {
+benchmarkTest("github e2e: benchmark pack mode on real GitHub", { timeout: 600000 }, async () => {
   const config = githubConfig();
   const client = await resetTestBranch(config);
   const fileCount = Number(process.env.GITHUB_E2E_PACK_FILES ?? "10050");
@@ -477,10 +481,15 @@ test("github e2e: benchmark pack mode on real GitHub", { timeout: 600000 }, asyn
   for (let index = 0; index < fileCount; index++) entries[`many/note-${String(index).padStart(5, "0")}.md`] = `note-${index}`;
   const source = new RealE2EVault(entries);
 
-  await measure("forcePush.packMode", () => encryptedForcePush(plugin(source, client) as never), { files: fileCount });
+  const sourceInstance = plugin(source, client) as never;
+
+  await measure("forcePush.packMode", () => encryptedForcePush(sourceInstance), { files: fileCount });
   const tree = await client.getTree();
   assert.equal(tree.tree.some(node => node.path.startsWith(".obsidian-github-sync-encrypted/packs/")), true);
   assert.equal(tree.tree.some(node => node.path.includes("many/note-00000.md")), false);
+
+  source.set("many/note-00000.md", new TextEncoder().encode("note-0 changed once"));
+  await measure("sync.packModeOneFile", () => encryptedFullSync(sourceInstance), { files: fileCount, changedFiles: 1 });
 
   const pulled = new RealE2EVault();
   await measure("forcePull.packMode", () => encryptedForcePull(plugin(pulled, client) as never), { files: fileCount });
@@ -494,7 +503,7 @@ test("github e2e: benchmark pack mode on real GitHub", { timeout: 600000 }, asyn
   assert.equal(shrinkTree.tree.some(node => node.path.startsWith(".obsidian-github-sync-encrypted/packs/")), false);
 });
 
-test("github e2e: benchmark large chunked object on real GitHub", { timeout: 600000 }, async () => {
+benchmarkTest("github e2e: benchmark large chunked object on real GitHub", { timeout: 600000 }, async () => {
   const config = githubConfig();
   const client = await resetTestBranch(config);
   const largeMiB = Number(process.env.GITHUB_E2E_LARGE_MIB ?? "51");

@@ -20,6 +20,8 @@ export interface FileState {
   sha: string;
   lastSync: number;
   hash?: string; // Cache the content hash
+  size?: number;
+  mtime?: number;
 }
 
 export interface SyncData {
