@@ -43,6 +43,31 @@ function ensureEncryptedState(plugin: FastSync): { files: { [path: string]: Encr
   return plugin.syncData.encrypted;
 }
 
+
+async function getRemoteHeadShaIfAvailable(plugin: FastSync): Promise<string | null> {
+  const getter = (plugin.githubClient as { getRemoteHeadSha?: () => Promise<string | null> }).getRemoteHeadSha;
+  if (typeof getter !== "function") return null;
+  try {
+    return await getter.call(plugin.githubClient);
+  } catch (error) {
+    console.warn("Remote HEAD lookup failed; falling back to full encrypted sync", error);
+    return null;
+  }
+}
+
+function encryptedLocalStateMatchesCache(plugin: FastSync, localFiles: TFile[]): boolean {
+  const state = ensureEncryptedState(plugin);
+  const cachedPaths = new Set(Object.keys(state.files));
+  if (cachedPaths.size !== localFiles.length) return false;
+  for (const file of localFiles) {
+    const path = normalizeVaultPath(file.path);
+    const cached = state.files[path];
+    if (!cached || cached.size !== file.stat.size || cached.mtime !== file.stat.mtime) return false;
+    cachedPaths.delete(path);
+  }
+  return cachedPaths.size === 0;
+}
+
 function requireEncryptedPassphrase(plugin: FastSync): string {
   const settings = plugin.settings as { encryptionPassphrase?: string };
   const passphrase = settings.encryptionPassphrase?.trim();
@@ -187,11 +212,21 @@ async function encryptedSyncImpl(plugin: FastSync, options: EncryptedSyncOptions
   plugin.isSyncInProgress = true;
   plugin.disableWatch();
   try {
+    const ignoreRules = configuredIgnoreRules(plugin);
+    let remoteHeadBeforeSync: string | null = null;
+    if (options.operation === "normal" || options.operation === "manual") {
+      const localFiles = listEncryptedSyncCandidates(plugin.app.vault, ignoreRules);
+      remoteHeadBeforeSync = await getRemoteHeadShaIfAvailable(plugin);
+      if (remoteHeadBeforeSync && plugin.syncData.lastRemoteHeadSha === remoteHeadBeforeSync && encryptedLocalStateMatchesCache(plugin, localFiles)) {
+        new Notice("Encrypted sync skipped: no local or remote changes");
+        return;
+      }
+    }
+
     if (!await confirmForeignRemoteBeforeForcePush(plugin, options.operation)) {
       new Notice("Force push cancelled");
       return;
     }
-    const ignoreRules = configuredIgnoreRules(plugin);
     const { store, key, manifest, manifestSha } = await loadStore(plugin, options.operation === "forcePush");
 
     let manifestChanged = false;
@@ -235,6 +270,7 @@ async function encryptedSyncImpl(plugin: FastSync, options: EncryptedSyncOptions
       (plugin.settings as { encryptedForcePushRequired?: boolean }).encryptedForcePushRequired = false;
       if (typeof (plugin as FastSync & { saveSettings?: () => Promise<void> }).saveSettings === "function") await (plugin as FastSync & { saveSettings: () => Promise<void> }).saveSettings();
     }
+    plugin.syncData.lastRemoteHeadSha = options.operation === "forcePush" ? (await getRemoteHeadShaIfAvailable(plugin) ?? plugin.syncData.lastRemoteHeadSha) : (manifestChanged ? (remoteHeadBeforeSync ? (await getRemoteHeadShaIfAvailable(plugin) ?? plugin.syncData.lastRemoteHeadSha) : plugin.syncData.lastRemoteHeadSha) : (remoteHeadBeforeSync ?? plugin.syncData.lastRemoteHeadSha));
     await plugin.saveSyncData();
     new Notice(`Encrypted ${options.operation} completed`);
   } catch (error) {

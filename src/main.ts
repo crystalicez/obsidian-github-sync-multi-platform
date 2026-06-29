@@ -26,6 +26,7 @@ export interface FileState {
 
 export interface SyncData {
   files: { [path: string]: FileState };
+  lastRemoteHeadSha?: string;
   encrypted?: {
     files: { [path: string]: EncryptedLocalFileState };
     manifestSha?: string;

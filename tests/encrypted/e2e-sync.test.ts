@@ -11,13 +11,26 @@ import { sha256Hex, utf8ToBytes } from "../../src/lib/encrypted/bytes";
 class MemoryGitHub {
   blobs = new Map<string, { content: string; sha: string }>();
   counter = 0;
+  headSha = "head-1";
+  getRemoteHeadCount = 0;
+  getTreeCount = 0;
+  failRemoteHead = false;
   putCounts = new Map<string, number>();
   getCounts = new Map<string, number>();
   deletedPaths: string[] = [];
   failPutPathPrefix?: string;
   truncated = false;
 
+  async getRemoteHeadSha() {
+    this.getRemoteHeadCount += 1;
+    if (this.failRemoteHead) throw new Error("Injected remote head failure");
+    return this.headSha;
+  }
+
+
+
   async getTree() {
+    this.getTreeCount += 1;
     return {
       sha: "tree",
       url: "",
@@ -38,6 +51,7 @@ class MemoryGitHub {
     const bytes = typeof content === "string" ? new TextEncoder().encode(content) : new Uint8Array(content);
     const base64 = Buffer.from(bytes).toString("base64");
     const sha = `sha-${++this.counter}`;
+    this.headSha = `head-${this.counter}`;
     this.putCounts.set(path, (this.putCounts.get(path) ?? 0) + 1);
     this.blobs.set(path, { content: base64, sha });
     return sha;
@@ -46,6 +60,7 @@ class MemoryGitHub {
   async deleteFile(path: string) {
     this.deletedPaths.push(path);
     this.blobs.delete(path);
+    this.headSha = `head-${++this.counter}`;
   }
 }
 
@@ -204,6 +219,15 @@ async function withMutedConsoleError(run: () => Promise<void>): Promise<void> {
     console.error = originalConsoleError;
   }
 }
+async function withMutedConsoleWarn(run: () => Promise<void>): Promise<void> {
+  const originalConsoleWarn = console.warn;
+  console.warn = () => {};
+  try {
+    await run();
+  } finally {
+    console.warn = originalConsoleWarn;
+  }
+}
 test("force push then force pull round trips encrypted vault bytes", async () => {
   const github = new MemoryGitHub();
   const sourceVault = new MemoryVault({ "Notes/a.md": "hello encrypted world" });
@@ -268,6 +292,22 @@ test("encrypted sync requires force push after enabling encryption from plaintex
   assert.equal((instance as { settings: { encryptedForcePushRequired?: boolean } }).settings.encryptedForcePushRequired, false);
 });
 
+test("normal encrypted sync skips manifest load when remote head and local encrypted state are unchanged", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault({ "Notes/a.md": "stable" });
+  const instance = plugin(vault, github) as ReturnType<typeof plugin>;
+  await encryptedForcePush(instance as never);
+  instance.syncData.lastRemoteHeadSha = github.headSha;
+  github.getRemoteHeadCount = 0;
+  github.getCounts.clear();
+  vault.readBinaryCount = 0;
+
+  await encryptedFullSync(instance as never);
+
+  assert.equal(github.getRemoteHeadCount, 1);
+  assert.equal(github.getCounts.size, 0);
+  assert.equal(vault.readBinaryCount, 0);
+});
 test("normal encrypted sync skips remote pack downloads and uploads when pack state is unchanged", async () => {
   const github = new MemoryGitHub();
   const sourceVault = new MemoryVault(manyFileEntries(10_001, "stable"));
@@ -704,6 +744,44 @@ test("plaintext full sync skips unchanged cached markdown reads at scale", async
   assert.equal(vault.readCount, 0);
   assert.equal(vault.readBinaryCount, 0);
   assert.equal(github.putCounts.size, 0);
+});
+test("plaintext full sync falls back to tree sync when remote head lookup fails", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault({ "Notes/a.md": "stable" });
+  const instance = plaintextPlugin(vault, github);
+  const file = vault.getAbstractFileByPath("Notes/a.md") as TFile;
+  const sha = await github.putFile("Notes/a.md", "stable");
+  instance.syncData.files["Notes/a.md"] = { sha, lastSync: Date.now(), hash: hashContent("stable"), size: file.stat.size, mtime: file.stat.mtime };
+  instance.syncData.lastRemoteHeadSha = github.headSha;
+  github.failRemoteHead = true;
+  github.getTreeCount = 0;
+
+  await withMutedConsoleWarn(async () => {
+    await syncAllFilesImpl(instance as never);
+  });
+
+  assert.equal(github.getRemoteHeadCount, 1);
+  assert.equal(github.getTreeCount, 1);
+});
+test("plaintext full sync skips remote tree when remote head and local stat cache are unchanged", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault({ "Notes/a.md": "stable" });
+  const instance = plaintextPlugin(vault, github);
+  const file = vault.getAbstractFileByPath("Notes/a.md") as TFile;
+  const sha = await github.putFile("Notes/a.md", "stable");
+  instance.syncData.files["Notes/a.md"] = { sha, lastSync: Date.now(), hash: hashContent("stable"), size: file.stat.size, mtime: file.stat.mtime };
+  instance.syncData.lastRemoteHeadSha = github.headSha;
+  github.getRemoteHeadCount = 0;
+  github.getTreeCount = 0;
+  vault.readCount = 0;
+
+  await withMutedConsoleWarn(async () => {
+    await syncAllFilesImpl(instance as never);
+  });
+
+  assert.equal(github.getRemoteHeadCount, 1);
+  assert.equal(github.getTreeCount, 0);
+  assert.equal(vault.readCount, 0);
 });
 test("plaintext full sync refuses truncated remote trees before pushing local files", async () => {
   const github = new MemoryGitHub();

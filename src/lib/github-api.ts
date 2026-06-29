@@ -181,6 +181,18 @@ export class GitHubClient {
     }
   }
 
+  async getRemoteHeadSha(): Promise<string | null> {
+    const encodedBranch = this.config.branch.split("/").map(encodeURIComponent).join("/");
+    const response = await requestUrl({
+      url: `${this.baseUrl}/git/ref/heads/${encodedBranch}`,
+      method: "GET",
+      headers: this.headers,
+      throw: false,
+    });
+    if (response.status === 200) return (response.json as { object?: { sha?: string } }).object?.sha ?? null;
+    if (response.status === 404) return null;
+    throw new Error(`Failed to get branch head: HTTP ${response.status} - ${response.text}`);
+  }
   async getLatestCommit(path?: string): Promise<string | null> {
     let url = `${this.baseUrl}/commits?sha=${this.config.branch}&per_page=1`;
     if (path) {

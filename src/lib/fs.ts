@@ -22,6 +22,28 @@ function plaintextSyncEntry(sha: string, file: TFile, hash: string, lastSync: nu
   return { sha, lastSync, hash, size: file.stat.size, mtime: file.stat.mtime };
 }
 
+
+async function getRemoteHeadShaIfAvailable(plugin: FastSync): Promise<string | null> {
+  const getter = (plugin.githubClient as GitHubClient & { getRemoteHeadSha?: () => Promise<string | null> }).getRemoteHeadSha;
+  if (typeof getter !== "function") return null;
+  try {
+    return await getter.call(plugin.githubClient);
+  } catch (error) {
+    console.warn("Remote HEAD lookup failed; falling back to full sync", error);
+    return null;
+  }
+}
+
+function plaintextLocalStateMatchesCache(plugin: FastSync, files: TFile[]): boolean {
+  const cachedPaths = new Set(Object.keys(plugin.syncData.files));
+  if (cachedPaths.size !== files.length) return false;
+  for (const file of files) {
+    const cached = plugin.syncData.files[file.path];
+    if (!cached?.hash || !cachedPlaintextStatMatches(file, cached)) return false;
+    cachedPaths.delete(file.path);
+  }
+  return cachedPaths.size === 0;
+}
 function shouldSyncPlaintextFile(file: TFile): boolean {
   const isMarkdown = file.extension === "md";
   const isImage = IMAGE_EXTENSIONS.includes(file.extension.toLowerCase());
@@ -124,7 +146,7 @@ const performSync = async (file: TFile, plugin: FastSync) => {
     plugin.addIgnoredFile(file.path);
     const isMarkdown = file.extension === "md";
     const isImage = IMAGE_EXTENSIONS.includes(file.extension.toLowerCase());
-    
+
     // 只同步 Markdown 笔记和图片，其余类型（.zip .canvas .base 等）跳过
     // 避免向 GitHub API 发送无法处理的文件类型导致 422
     if (!isMarkdown && !isImage) {
@@ -271,7 +293,7 @@ export async function overrideRemoteAllFilesImpl(plugin: FastSync): Promise<void
 
   plugin.isSyncInProgress = true;
   plugin.disableWatch();
-  
+
   try {
     const files = listPlaintextSyncCandidates(plugin);
     for (const file of files) {
@@ -292,7 +314,10 @@ export async function overrideRemoteAllFilesImpl(plugin: FastSync): Promise<void
        const newSha = await plugin.githubClient.putFile(file.path, content, sha);
        plugin.syncData.files[file.path] = plaintextSyncEntry(newSha, file, currentHash);
     }
+    plugin.syncData.lastRemoteHeadSha = await getRemoteHeadShaIfAvailable(plugin) ?? plugin.syncData.lastRemoteHeadSha;
+
     await plugin.saveSyncData();
+
     // B6: updateStats 异步执行，不阻塞主流程
     plugin.updateStats().catch(e => console.error("Stats update failed:", e));
     new Notice("All assets synced to GitHub");
@@ -322,6 +347,13 @@ export async function syncAllFilesImpl(plugin: FastSync): Promise<void> {
   plugin.disableWatch();
 
   try {
+    const allLocalFiles = listPlaintextSyncCandidates(plugin);
+    const remoteHeadBeforeSync = await getRemoteHeadShaIfAvailable(plugin);
+    if (remoteHeadBeforeSync && plugin.syncData.lastRemoteHeadSha === remoteHeadBeforeSync && plaintextLocalStateMatchesCache(plugin, allLocalFiles)) {
+      new Notice("Sync skipped: no local or remote changes");
+      return;
+    }
+
     const remoteTree = await plugin.githubClient.getTree();
     if (remoteTree.truncated) {
       throw new Error("GitHub tree response was truncated; plaintext sync cannot safely sync this repository.");
@@ -332,8 +364,6 @@ export async function syncAllFilesImpl(plugin: FastSync): Promise<void> {
       return node.type === "blob" && (ext === "md" || IMAGE_EXTENSIONS.includes(ext || "")) && !node.path.includes(".sync-conflict-");
     });
     const remoteFilesMap = new Map<string, string>(remoteFiles.map((f: GitHubTreeNode) => [f.path, f.sha] as [string, string]));
-
-    const allLocalFiles = listPlaintextSyncCandidates(plugin);
     const localFilesMap = new Map<string, TFile>(allLocalFiles.map(f => [f.path, f]));
 
     // 1. 下拉远端变更
@@ -344,15 +374,15 @@ export async function syncAllFilesImpl(plugin: FastSync): Promise<void> {
         const localState = plugin.syncData.files[path];
 
         const isLocalFileEmpty = localFile && localFile.stat.size === 0;
-        
+
         if (!localFile || (localState && localState.sha !== remoteSha) || isLocalFileEmpty) {
           const remoteData = await plugin.githubClient.getFile(path);
           if (remoteData) {
             const ext = path.split(".").pop()?.toLowerCase();
             const isMarkdown = ext === "md";
-            
+
             plugin.addIgnoredFile(path);
-            
+
             const folderPath = path.split("/").slice(0, -1).join("/");
             if (folderPath && !plugin.app.vault.getAbstractFileByPath(folderPath)) {
               await plugin.app.vault.createFolder(folderPath);
@@ -360,7 +390,7 @@ export async function syncAllFilesImpl(plugin: FastSync): Promise<void> {
 
             let finalContent: string | ArrayBuffer;
             if (!remoteData.content && remoteData.download_url) {
-              const downloadRes = await requestUrl({ 
+              const downloadRes = await requestUrl({
                 url: remoteData.download_url,
                 headers: plugin.githubClient.headers
               });
@@ -370,10 +400,10 @@ export async function syncAllFilesImpl(plugin: FastSync): Promise<void> {
             }
 
             if (isMarkdown) {
-              const content = typeof finalContent === "string" 
+              const content = typeof finalContent === "string"
                 ? GitHubClient.decodeContent(finalContent)
                 : new TextDecoder().decode(finalContent);
-                
+
               if (localFile && localState && localState.hash && localState.hash !== await currentPlaintextHash(plugin, localFile)) {
                 await writePlaintextConflictCopy(plugin, path, content);
                 plugin.syncData.files[path] = { sha: remoteSha, lastSync: Date.now(), hash: await currentPlaintextHash(plugin, localFile) };
@@ -382,7 +412,7 @@ export async function syncAllFilesImpl(plugin: FastSync): Promise<void> {
               }
               if (localFile) await plugin.app.vault.modify(localFile, content);
               else await plugin.app.vault.create(path, content);
-              
+
               plugin.syncData.files[path] = {
                 sha: remoteSha,
                 lastSync: Date.now(),
@@ -399,7 +429,7 @@ export async function syncAllFilesImpl(plugin: FastSync): Promise<void> {
               } else {
                 buffer = finalContent;
               }
-              
+
               if (localFile && localState && localState.hash && localState.hash !== await currentPlaintextHash(plugin, localFile)) {
                 await writePlaintextConflictCopy(plugin, path, buffer);
                 plugin.syncData.files[path] = { sha: remoteSha, lastSync: Date.now(), hash: await currentPlaintextHash(plugin, localFile) };
@@ -408,7 +438,7 @@ export async function syncAllFilesImpl(plugin: FastSync): Promise<void> {
               }
               if (localFile) await plugin.app.vault.modifyBinary(localFile, buffer);
               else await plugin.app.vault.createBinary(path, buffer);
-              
+
               const newlyCreatedFile = plugin.app.vault.getAbstractFileByPath(path);
               if (newlyCreatedFile instanceof TFile) {
                  plugin.syncData.files[path] = {
@@ -477,8 +507,13 @@ export async function syncAllFilesImpl(plugin: FastSync): Promise<void> {
         step2Fail++;
       }
     }
-    
+
+    plugin.syncData.lastRemoteHeadSha = step2Push === 0 ? (remoteHeadBeforeSync ?? plugin.syncData.lastRemoteHeadSha) : (remoteHeadBeforeSync ? (await getRemoteHeadShaIfAvailable(plugin) ?? plugin.syncData.lastRemoteHeadSha) : plugin.syncData.lastRemoteHeadSha);
+
+
     await plugin.saveSyncData();
+
+
     // B6: updateStats 异步执行，不阻塞主同步流程
     plugin.updateStats().catch(e => console.error("Stats update failed:", e));
     new Notice("Sync completed");
