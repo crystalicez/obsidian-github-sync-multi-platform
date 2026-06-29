@@ -25,10 +25,8 @@ class MemoryGitHub {
   async getRemoteHeadSha() {
     this.getRemoteHeadCount += 1;
     if (this.failRemoteHead) throw new Error("Injected remote head failure");
-    return this.headSha;
+    return this.blobs.size === 0 ? null : this.headSha;
   }
-
-
 
   async getTree() {
     this.getTreeCount += 1;

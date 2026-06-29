@@ -9,7 +9,7 @@ import { compileIgnorePathRegex, isIgnoredPath } from "../../src/lib/encrypted/i
 import { chunkPathForId, shouldChunkEncryptedPayload, shouldChunkPlaintext } from "../../src/lib/encrypted/large-objects";
 import { conflictPathFor, detectCaseInsensitiveCollisions, normalizeVaultPath, objectPathForId } from "../../src/lib/encrypted/paths";
 import { EncryptedObjectRecord } from "../../src/lib/encrypted/types";
-import { listEncryptedSyncCandidates, shouldSyncEncryptedFile } from "../../src/lib/encrypted/vault";
+import { listEncryptedSyncCandidates, shouldSyncEncryptedFile, writeVaultFileBytes } from "../../src/lib/encrypted/vault";
 
 test("bytes helpers round trip UTF-8 and hash deterministically", async () => {
   const bytes = utf8ToBytes("ภาษาไทย/emoji 🚀");
@@ -232,4 +232,29 @@ test("uploadEncryptedFileObject skips single encryption entirely for large files
   // The number of chunks for 39MB (with chunk size = 24MB) is 2 chunks.
   // Since we bypass the single payload encryption check, encrypt should be called exactly 2 times (once per chunk).
   assert.equal(encryptCallCount, 2);
+});
+
+test("writeVaultFileBytes avoids ArrayBuffer.slice for full arrays (zero-copy)", async () => {
+  const writtenBuffers: ArrayBuffer[] = [];
+  const mockVault = {
+    getAbstractFileByPath: () => null,
+    createFolder: async () => {},
+    createBinary: async (path: string, buffer: ArrayBuffer) => {
+      writtenBuffers.push(buffer);
+    }
+  };
+
+  // 1. Full Uint8Array (no slice)
+  const fullBytes = new Uint8Array([1, 2, 3, 4]);
+  await writeVaultFileBytes(mockVault as any, "Notes/a.md", fullBytes);
+  assert.equal(writtenBuffers.length, 1);
+  assert.equal(writtenBuffers[0], fullBytes.buffer); // identical reference (zero-copy!)
+
+  // 2. Sliced Uint8Array (must slice)
+  const parentBytes = new Uint8Array([1, 2, 3, 4, 5, 6]);
+  const slicedBytes = parentBytes.subarray(2, 5); // [3, 4, 5]
+  await writeVaultFileBytes(mockVault as any, "Notes/b.md", slicedBytes);
+  assert.equal(writtenBuffers.length, 2);
+  assert.notEqual(writtenBuffers[1], parentBytes.buffer); // sliced (new reference)
+  assert.deepEqual(new Uint8Array(writtenBuffers[1]), new Uint8Array([3, 4, 5]));
 });

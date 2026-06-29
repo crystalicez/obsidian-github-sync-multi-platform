@@ -15,6 +15,10 @@ class FakeGitHub {
     this.truncated = options.truncated ?? false;
   }
 
+  async getRemoteHeadSha() {
+    return this.blobs.size > 0 ? "head" : null;
+  }
+
   async getTree() {
     return {
       sha: "tree",
@@ -25,6 +29,10 @@ class FakeGitHub {
   }
 
   async getFile(path: string) {
+    if (path === ".obsidian-github-sync-encrypted") {
+      const exists = [...this.blobs.keys()].some(p => p.startsWith(".obsidian-github-sync-encrypted/"));
+      return exists ? [] : null;
+    }
     const content = this.blobs.get(path);
     if (content === undefined) return null;
     return { content: Buffer.from(content, "utf8").toString("base64"), sha: `sha-${path}`, path, size: content.length };
@@ -43,11 +51,13 @@ test("classifyRemoteRepo detects empty, encrypted, foreign, and corrupt states",
   assert.equal((await classifyRemoteRepo(new FakeGitHub({ ".obsidian-github-sync-encrypted/orphan": "x" }) as unknown as GitHubClient)).kind, "corrupt-plugin");
 });
 
-test("classifyRemoteRepo refuses truncated GitHub trees instead of guessing repo state", async () => {
-  await assert.rejects(
-    () => classifyRemoteRepo(new FakeGitHub({}, { truncated: true }) as unknown as GitHubClient),
-    /truncated/i,
-  );
+test("classifyRemoteRepo operates successfully without using getTree", async () => {
+  const fake = new FakeGitHub({ ".obsidian-github-sync-encrypted/config.json": "{}" });
+  fake.getTree = async () => {
+    throw new Error("getTree should not be called!");
+  };
+  const result = await classifyRemoteRepo(fake as unknown as GitHubClient);
+  assert.equal(result.kind, "encrypted-plugin");
 });
 
 test("manifest store blocks foreign non-empty repos unless explicitly allowed", async () => {
