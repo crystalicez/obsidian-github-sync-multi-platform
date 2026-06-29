@@ -146,12 +146,28 @@ async function resolveRemoteChangedBeforeLocalMutation(
   localFile: TFile | null,
   localBytes?: Uint8Array,
 ): Promise<boolean> {
-  if (!record || record.deleted) return false;
-  if (localState?.plaintextSha256 === record.plaintextSha256) return false;
+  console.log(`[GitHub Sync Debug] resolveRemoteChangedBeforeLocalMutation: path=${path}`);
+  console.log(`[GitHub Sync Debug] record=${JSON.stringify(record)}`);
+  console.log(`[GitHub Sync Debug] localState=${JSON.stringify(localState)}`);
+
+  if (!record || record.deleted) {
+    console.log(`[GitHub Sync Debug] No active remote record, skipping conflict check.`);
+    return false;
+  }
+  if (localState?.plaintextSha256 === record.plaintextSha256) {
+    console.log(`[GitHub Sync Debug] Cache hash matches remote hash (${record.plaintextSha256}), skipping conflict.`);
+    return false;
+  }
   if (localFile || localBytes) {
     const bytes = localBytes ?? await readVaultFileBytes(plugin.app.vault, localFile as TFile);
-    if (await sha256Hex(bytes) === record.plaintextSha256) return false;
+    const localHash = await sha256Hex(bytes);
+    console.log(`[GitHub Sync Debug] Checking local file hash: local=${localHash} vs remote=${record.plaintextSha256}`);
+    if (localHash === record.plaintextSha256) {
+      console.log(`[GitHub Sync Debug] Local file content matches remote, skipping conflict.`);
+      return false;
+    }
   }
+  console.warn(`[GitHub Sync Debug] Conflict detected for ${path}! Local hash differs and cache does not match remote.`);
   const remoteBytes = await downloadManifestRecordBytes(plugin, key, manifest, record);
   const resolution = await chooseConflictResolution(plugin, configuredConflictPolicy(plugin), path, localFile, record.mtime);
   if (resolution === "keep-local") return false;

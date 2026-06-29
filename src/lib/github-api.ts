@@ -48,12 +48,14 @@ export class GitHubClient {
       Authorization: `Bearer ${this.config.token}`,
       Accept: "application/vnd.github.v3+json",
       "Content-Type": "application/json",
+      "Cache-Control": "no-cache, no-store, must-revalidate",
+      "Pragma": "no-cache",
     };
   }
 
   async getFile(path: string): Promise<GitHubFileResponse | null> {
     const encodedPath = path.split('/').map(encodeURIComponent).join('/');
-    const url = `${this.baseUrl}/contents/${encodedPath}?ref=${this.config.branch}`;
+    const url = `${this.baseUrl}/contents/${encodedPath}?ref=${this.config.branch}&_=${Date.now()}`;
     try {
       const response = await requestUrl({
         url,
@@ -76,7 +78,7 @@ export class GitHubClient {
 
   async getFileBytes(path: string): Promise<{ bytes: Uint8Array; sha: string } | null> {
     const encodedPath = path.split('/').map(encodeURIComponent).join('/');
-    const url = `${this.baseUrl}/contents/${encodedPath}?ref=${this.config.branch}`;
+    const url = `${this.baseUrl}/contents/${encodedPath}?ref=${this.config.branch}&_=${Date.now()}`;
     try {
       const response = await requestUrl({
         url,
@@ -221,7 +223,7 @@ export class GitHubClient {
   async getRemoteHeadSha(): Promise<string | null> {
     const encodedBranch = this.config.branch.split("/").map(encodeURIComponent).join("/");
     const response = await requestUrl({
-      url: `${this.baseUrl}/git/ref/heads/${encodedBranch}`,
+      url: `${this.baseUrl}/git/ref/heads/${encodedBranch}?_=${Date.now()}`,
       method: "GET",
       headers: this.headers,
       throw: false,
@@ -231,7 +233,7 @@ export class GitHubClient {
     throw new Error(`Failed to get branch head: HTTP ${response.status} - ${response.text}`);
   }
   async getLatestCommit(path?: string): Promise<string | null> {
-    let url = `${this.baseUrl}/commits?sha=${this.config.branch}&per_page=1`;
+    let url = `${this.baseUrl}/commits?sha=${this.config.branch}&per_page=1&_=${Date.now()}`;
     if (path) {
       url += `&path=${encodeURIComponent(path)}`;
     }
@@ -249,7 +251,7 @@ export class GitHubClient {
   }
 
   async getTree(): Promise<GitHubTree> {
-    const url = `${this.baseUrl}/git/trees/${this.config.branch}?recursive=1`;
+    const url = `${this.baseUrl}/git/trees/${this.config.branch}?recursive=1&_=${Date.now()}`;
     const response = await requestUrl({
       url,
       method: "GET",

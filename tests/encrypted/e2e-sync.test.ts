@@ -745,6 +745,34 @@ test("encrypted sync does not trigger conflict when local file is edited and syn
   assert.equal([...vault.files.keys()].some(p => p.includes(".sync-conflict-")), false);
 });
 
+test("encrypted auto-sync does not trigger conflict when local file is edited and auto-synced twice consecutively", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault({ "Notes/a.md": "initial" });
+  const instance = plugin(vault, github);
+
+  // Enable encryption
+  instance.settings.encryptionMode = "encrypted";
+  instance.settings.encryptionPassphrase = "correct horse battery staple";
+
+  // Initial Sync (requires force push because remote is empty/new)
+  await encryptedForcePush(instance as never);
+  assert.equal(github.blobs.has(".obsidian-github-sync-encrypted/config.json"), true);
+
+  // First edit and immediate auto-sync (eventEnter = false runs immediately)
+  vault.files.set("Notes/a.md", new TextEncoder().encode("first edit"));
+  await NoteModify(vault.getAbstractFileByPath("Notes/a.md") as TFile, instance as never, false);
+
+  // Verify no conflict copies created
+  assert.equal([...vault.files.keys()].some(p => p.includes(".sync-conflict-")), false);
+
+  // Second edit and immediate auto-sync
+  vault.files.set("Notes/a.md", new TextEncoder().encode("second edit"));
+  await NoteModify(vault.getAbstractFileByPath("Notes/a.md") as TFile, instance as never, false);
+
+  // Verify STILL no conflict copies created
+  assert.equal([...vault.files.keys()].some(p => p.includes(".sync-conflict-")), false);
+});
+
 test("plaintext manual sync cancels pending debounce auto-sync timers", async () => {
   const github = new MemoryGitHub();
   const vault = new MemoryVault({ "Notes/a.md": "initial" });
