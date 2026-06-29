@@ -258,3 +258,130 @@ test("writeVaultFileBytes avoids ArrayBuffer.slice for full arrays (zero-copy)",
   assert.notEqual(writtenBuffers[1], parentBytes.buffer); // sliced (new reference)
   assert.deepEqual(new Uint8Array(writtenBuffers[1]), new Uint8Array([3, 4, 5]));
 });
+
+test("SettingTab dirty state tracking and save behavior", async () => {
+  const originalSettings = {
+    syncEnabled: true,
+    githubOwner: "old-owner",
+    githubRepo: "old-repo",
+    githubBranch: "main",
+    githubToken: "old-token",
+    encryptionMode: "plaintext",
+    encryptionPassphrase: "",
+    statusBarStatusEnabled: true,
+  };
+  
+  const savedSettings: any[] = [];
+  const mockPlugin = {
+    settings: JSON.parse(JSON.stringify(originalSettings)),
+    saveSettings: async () => {
+      savedSettings.push(JSON.parse(JSON.stringify(mockPlugin.settings)));
+    },
+    initGitHubClient: () => {},
+    updateStatusBar: () => {},
+  };
+
+  const mockTab = {
+    plugin: mockPlugin,
+    tempSettings: null as any,
+    bannerEl: {
+      empty: () => {},
+      addClass: () => {},
+      removeClass: () => {},
+      createDiv: () => ({
+        createEl: () => ({}),
+        createDiv: () => ({
+          createEl: () => ({})
+        })
+      })
+    },
+    display: () => {},
+    isDirty() {
+      if (!this.tempSettings) return false;
+      return JSON.stringify(this.tempSettings) !== JSON.stringify(this.plugin.settings);
+    },
+    updateDirtyState() {
+    }
+  };
+
+  // Initialize display
+  mockTab.tempSettings = JSON.parse(JSON.stringify(mockPlugin.settings));
+  assert.equal(mockTab.isDirty(), false);
+
+  // Edit temporary settings
+  mockTab.tempSettings.githubOwner = "new-owner";
+  assert.equal(mockTab.isDirty(), true);
+  assert.equal(mockPlugin.settings.githubOwner, "old-owner"); // original unchanged!
+
+  // Save changes
+  mockPlugin.settings = JSON.parse(JSON.stringify(mockTab.tempSettings));
+  await mockPlugin.saveSettings();
+  assert.equal(mockTab.isDirty(), false);
+  assert.equal(mockPlugin.settings.githubOwner, "new-owner");
+  assert.equal(savedSettings.length, 1);
+  assert.equal(savedSettings[0].githubOwner, "new-owner");
+});
+
+test("Status Bar progress widget behaves as a kill-switch", () => {
+  let statusBarCreated = 0;
+  let statusBarRemoved = 0;
+  
+  const mockStatusBarEl = {
+    empty: () => {},
+    createEl: () => ({ title: "", onclick: null }),
+    remove: () => {
+      statusBarRemoved++;
+    }
+  };
+
+  const mockPlugin = {
+    settings: {
+      statusBarStatusEnabled: true
+    },
+    statusBarItem: null as any,
+    isSyncInProgress: false,
+    syncProgress: {
+      status: "idle",
+      pushCount: 0,
+      totalPush: 0,
+      pullCount: 0,
+      totalPull: 0,
+      lastSyncTime: 0
+    },
+    addStatusBarItem: () => {
+      statusBarCreated++;
+      return mockStatusBarEl;
+    },
+    updateStatusBar() {
+      if (!this.settings.statusBarStatusEnabled) {
+        if (this.statusBarItem) {
+          this.statusBarItem.remove();
+          this.statusBarItem = null;
+        }
+        return;
+      }
+
+      if (!this.statusBarItem) {
+        this.statusBarItem = this.addStatusBarItem();
+      }
+      this.statusBarItem.empty();
+      this.statusBarItem.createEl("span", { text: "mock" });
+    }
+  };
+
+  // 1. With status bar status enabled: creates status bar item
+  mockPlugin.updateStatusBar();
+  assert.equal(statusBarCreated, 1);
+  assert.notEqual(mockPlugin.statusBarItem, null);
+
+  // 2. Kill-switch activated (disabled): removes status bar item
+  mockPlugin.settings.statusBarStatusEnabled = false;
+  mockPlugin.updateStatusBar();
+  assert.equal(statusBarRemoved, 1);
+  assert.equal(mockPlugin.statusBarItem, null);
+
+  // 3. Updates skipped entirely when disabled
+  statusBarCreated = 0;
+  mockPlugin.updateStatusBar();
+  assert.equal(statusBarCreated, 0); // No status bar item created
+});

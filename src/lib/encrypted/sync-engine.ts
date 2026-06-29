@@ -207,10 +207,31 @@ async function confirmForeignRemoteBeforeForcePush(plugin: FastSync, operation: 
 }
 
 async function encryptedSyncImpl(plugin: FastSync, options: EncryptedSyncOptions): Promise<void> {
-  if (plugin.isSyncInProgress || !plugin.githubClient) return;
+  if (plugin.isSyncInProgress) {
+    new Notice("Sync is already in progress. Please wait.");
+    return;
+  }
+  if (!plugin.githubClient) return;
   if (blockIfEncryptedForcePushRequired(plugin, options.operation)) return;
+
+  for (const timer of plugin.debounceTimers.values()) {
+    globalThis.clearTimeout(timer);
+  }
+  plugin.debounceTimers.clear();
+
   plugin.isSyncInProgress = true;
   plugin.disableWatch();
+  if (plugin.syncProgress) {
+    plugin.syncProgress = {
+      status: "syncing",
+      pushCount: 0,
+      totalPush: 0,
+      pullCount: 0,
+      totalPull: 0,
+      lastSyncTime: plugin.syncProgress.lastSyncTime
+    };
+  }
+  if (typeof plugin.updateStatusBar === "function") plugin.updateStatusBar();
   try {
     const ignoreRules = configuredIgnoreRules(plugin);
     let remoteHeadBeforeSync: string | null = null;
@@ -218,6 +239,17 @@ async function encryptedSyncImpl(plugin: FastSync, options: EncryptedSyncOptions
       const localFiles = listEncryptedSyncCandidates(plugin.app.vault, ignoreRules);
       remoteHeadBeforeSync = await getRemoteHeadShaIfAvailable(plugin);
       if (remoteHeadBeforeSync && plugin.syncData.lastRemoteHeadSha === remoteHeadBeforeSync && encryptedLocalStateMatchesCache(plugin, localFiles)) {
+        if (plugin.syncProgress) {
+          plugin.syncProgress = {
+            status: "success",
+            pushCount: 0,
+            totalPush: 0,
+            pullCount: 0,
+            totalPull: 0,
+            lastSyncTime: plugin.syncProgress.lastSyncTime ?? Date.now()
+          };
+        }
+        if (typeof plugin.updateStatusBar === "function") plugin.updateStatusBar();
         new Notice("Encrypted sync skipped: no local or remote changes");
         return;
       }
@@ -273,11 +305,33 @@ async function encryptedSyncImpl(plugin: FastSync, options: EncryptedSyncOptions
     plugin.syncData.lastRemoteHeadSha = options.operation === "forcePush" ? (await getRemoteHeadShaIfAvailable(plugin) ?? plugin.syncData.lastRemoteHeadSha) : (manifestChanged ? (remoteHeadBeforeSync ? (await getRemoteHeadShaIfAvailable(plugin) ?? plugin.syncData.lastRemoteHeadSha) : plugin.syncData.lastRemoteHeadSha) : (remoteHeadBeforeSync ?? plugin.syncData.lastRemoteHeadSha));
     await plugin.saveSyncData();
     new Notice(`Encrypted ${options.operation} completed`);
+    if (plugin.syncProgress) {
+      plugin.syncProgress = {
+        status: "success",
+        pushCount: plugin.syncProgress.pushCount,
+        totalPush: plugin.syncProgress.totalPush,
+        pullCount: plugin.syncProgress.pullCount,
+        totalPull: plugin.syncProgress.totalPull,
+        lastSyncTime: Date.now()
+      };
+    }
   } catch (error) {
+    if (plugin.syncProgress) {
+      plugin.syncProgress = {
+        status: "fail",
+        pushCount: 0,
+        totalPush: 0,
+        pullCount: 0,
+        totalPull: 0,
+        lastSyncTime: plugin.syncProgress.lastSyncTime,
+        errorMessage: (error as Error).message
+      };
+    }
     reportSyncError(options.operation, error);
   } finally {
     plugin.isSyncInProgress = false;
     plugin.enableWatch();
+    if (typeof plugin.updateStatusBar === "function") plugin.updateStatusBar();
   }
 }
 
@@ -290,6 +344,8 @@ async function encryptedModifyImpl(file: TAbstractFile, plugin: FastSync, eventE
   if (!plugin.isWatchEnabled && eventEnter) return;
   if (!shouldSyncEncryptedFile(file, configuredIgnoreRules(plugin)) || !plugin.githubClient) return;
   if (blockIfEncryptedForcePushRequired(plugin, "localChange", file.path)) return;
+  if (plugin.isSyncInProgress) return;
+  plugin.isSyncInProgress = true;
   try {
     const { store, key, manifest, manifestSha } = await loadStore(plugin);
     const path = normalizeVaultPath(file.path);
@@ -317,6 +373,8 @@ async function encryptedModifyImpl(file: TAbstractFile, plugin: FastSync, eventE
     await plugin.saveSyncData();
   } catch (error) {
     reportSyncError("localChange", error, file.path);
+  } finally {
+    plugin.isSyncInProgress = false;
   }
 }
 
@@ -328,6 +386,8 @@ async function encryptedDeleteImpl(file: TAbstractFile, plugin: FastSync, eventE
   if (!plugin.isWatchEnabled && eventEnter) return;
   if (!plugin.githubClient) return;
   if (blockIfEncryptedForcePushRequired(plugin, "localChange", file.path)) return;
+  if (plugin.isSyncInProgress) return;
+  plugin.isSyncInProgress = true;
   try {
     const { store, key, manifest, manifestSha } = await loadStore(plugin);
     const path = normalizeVaultPath(file.path);
@@ -343,6 +403,8 @@ async function encryptedDeleteImpl(file: TAbstractFile, plugin: FastSync, eventE
     }
   } catch (error) {
     reportSyncError("localChange", error, file.path);
+  } finally {
+    plugin.isSyncInProgress = false;
   }
 }
 
@@ -355,11 +417,14 @@ async function encryptedRenameImpl(file: TAbstractFile, oldfile: string, plugin:
   if (!plugin.isWatchEnabled && eventEnter) return;
   if (blockIfEncryptedForcePushRequired(plugin, "localChange", file.path)) return;
   if (!shouldSyncEncryptedFile(file, configuredIgnoreRules(plugin)) || !plugin.githubClient) return;
+  if (plugin.isSyncInProgress) return;
+  plugin.isSyncInProgress = true;
   try {
     const { store, key, manifest, manifestSha } = await loadStore(plugin);
     const oldPath = normalizeVaultPath(oldfile);
     const newPath = normalizeVaultPath(file.path);
     if (oldPath === newPath) {
+      plugin.isSyncInProgress = false;
       await encryptedModifyImpl(file, plugin, eventEnter);
       return;
     }
@@ -395,6 +460,8 @@ async function encryptedRenameImpl(file: TAbstractFile, oldfile: string, plugin:
     await plugin.saveSyncData();
   } catch (error) {
     reportSyncError("localChange", error, file.path);
+  } finally {
+    plugin.isSyncInProgress = false;
   }
 }
 
@@ -404,45 +471,53 @@ export async function encryptedRename(file: TAbstractFile, oldfile: string, plug
 
 async function pullEncryptedChanges(plugin: FastSync, key: CryptoKey, manifest: EncryptedManifest, force: boolean): Promise<void> {
   const state = ensureEncryptedState(plugin);
-  for (const [path, record] of Object.entries(manifest.files)) {
-    if (record.deleted || record.storage === "pack") continue;
-    const localState = state.files[path];
-    if (!force && localState?.plaintextSha256 === record.plaintextSha256) continue;
+  const candidateEntries = Object.entries(manifest.files).filter(([_, record]) => !record.deleted && record.storage !== "pack");
+  if (plugin.syncProgress) plugin.syncProgress.totalPull += candidateEntries.length;
+  if (typeof plugin.updateStatusBar === "function") plugin.updateStatusBar();
 
-    const localFile = plugin.app.vault.getAbstractFileByPath(path);
-    let localHash: string | undefined;
-    let localBytes: Uint8Array | undefined;
+  for (const [path, record] of candidateEntries) {
+    try {
+      const localState = state.files[path];
+      if (!force && localState?.plaintextSha256 === record.plaintextSha256) continue;
 
-    if (!force && localFile instanceof TFile) {
-      localBytes = await readVaultFileBytes(plugin.app.vault, localFile);
-      localHash = await sha256Hex(localBytes);
-      if (localHash === record.plaintextSha256) continue;
-    }
+      const localFile = plugin.app.vault.getAbstractFileByPath(path);
+      let localHash: string | undefined;
+      let localBytes: Uint8Array | undefined;
 
-    const plaintext = await downloadEncryptedFileObject(plugin.githubClient, key, record);
+      if (!force && localFile instanceof TFile) {
+        localBytes = await readVaultFileBytes(plugin.app.vault, localFile);
+        localHash = await sha256Hex(localBytes);
+        if (localHash === record.plaintextSha256) continue;
+      }
 
-    if (!force && localFile instanceof TFile && localHash !== undefined) {
-      const localChanged = localState ? localState.plaintextSha256 !== localHash : localHash !== record.plaintextSha256;
-      if (localChanged) {
-        const resolution = await chooseConflictResolution(plugin, configuredConflictPolicy(plugin), path, localFile, record.mtime);
-        if (resolution === "keep-local") continue;
-        if (resolution === "copy-remote") {
-          await writeVaultFileBytes(plugin.app.vault, conflictPathFor(path, Date.now(), "remote"), plaintext);
-          continue;
-        }
-        if (resolution === "merged") {
-          const localText = localBytes ? new TextDecoder().decode(localBytes) : await plugin.app.vault.read(localFile);
-          const remoteText = new TextDecoder().decode(plaintext);
-          await writeVaultFileBytes(plugin.app.vault, path, new TextEncoder().encode(mergeTextContent(localText, remoteText)));
-          continue;
+      const plaintext = await downloadEncryptedFileObject(plugin.githubClient, key, record);
+
+      if (!force && localFile instanceof TFile && localHash !== undefined) {
+        const localChanged = localState ? localState.plaintextSha256 !== localHash : localHash !== record.plaintextSha256;
+        if (localChanged) {
+          const resolution = await chooseConflictResolution(plugin, configuredConflictPolicy(plugin), path, localFile, record.mtime);
+          if (resolution === "keep-local") continue;
+          if (resolution === "copy-remote") {
+            await writeVaultFileBytes(plugin.app.vault, conflictPathFor(path, Date.now(), "remote"), plaintext);
+            continue;
+          }
+          if (resolution === "merged") {
+            const localText = localBytes ? new TextDecoder().decode(localBytes) : await plugin.app.vault.read(localFile);
+            const remoteText = new TextDecoder().decode(plaintext);
+            await writeVaultFileBytes(plugin.app.vault, path, new TextEncoder().encode(mergeTextContent(localText, remoteText)));
+            continue;
+          }
         }
       }
-    }
-    plugin.addIgnoredFile(path);
-    try {
-      await writeVaultFileBytes(plugin.app.vault, path, plaintext);
+      plugin.addIgnoredFile(path);
+      try {
+        await writeVaultFileBytes(plugin.app.vault, path, plaintext);
+      } finally {
+        plugin.removeIgnoredFile(path);
+      }
     } finally {
-      plugin.removeIgnoredFile(path);
+      if (plugin.syncProgress) plugin.syncProgress.pullCount++;
+      if (typeof plugin.updateStatusBar === "function") plugin.updateStatusBar();
     }
   }
 }
@@ -487,51 +562,64 @@ async function pushEncryptedPackLocalChanges(plugin: FastSync, key: CryptoKey, m
   manifest.files = {};
   manifest.packs = {};
 
-  for (const pack of plan.packs) {
-    const reusablePack = previousPacks[pack.id];
-    const canReusePack = !!reusablePack && pack.files.every(entry => {
-      const previous = previousFiles[entry.path];
-      const cached = state.files[entry.path];
-      return previous && cached && !previous.deleted && previous.storage === "pack" && previous.packId === pack.id && previous.size === entry.size && previous.mtime === entry.mtime && cached.plaintextSha256 === previous.plaintextSha256 && cached.size === entry.size && cached.mtime === entry.mtime;
-    });
-    if (canReusePack) {
-      manifest.packs[pack.id] = reusablePack;
-      for (const entry of pack.files) manifest.files[entry.path] = { ...previousFiles[entry.path], deleted: false, deletedAt: undefined };
-      continue;
-    }
+  if (plugin.syncProgress) plugin.syncProgress.totalPush += plan.packs.length + objectFiles.length;
+  if (typeof plugin.updateStatusBar === "function") plugin.updateStatusBar();
 
-    const archiveFiles = [];
-    for (const entry of pack.files) {
-      const file = filesByPath.get(entry.path);
-      if (!file) continue;
-      const bytes = await readVaultFileBytes(plugin.app.vault, file);
-      const plaintextSha256 = await sha256Hex(bytes);
-      archiveFiles.push({ path: entry.path, mtime: entry.mtime, bytes, plaintextSha256 });
-      manifest.files[entry.path] = {
-        id: `${pack.id}:${entry.path}`,
-        path: entry.path,
-        objectPath: pack.objectPath,
-        plaintextSha256,
-        storage: "pack",
-        packId: pack.id,
-        size: entry.size,
-        mtime: entry.mtime,
-        deleted: false,
-        deletedAt: undefined,
-      };
+  for (const pack of plan.packs) {
+    try {
+      const reusablePack = previousPacks[pack.id];
+      const canReusePack = !!reusablePack && pack.files.every(entry => {
+        const previous = previousFiles[entry.path];
+        const cached = state.files[entry.path];
+        return previous && cached && !previous.deleted && previous.storage === "pack" && previous.packId === pack.id && previous.size === entry.size && previous.mtime === entry.mtime && cached.plaintextSha256 === previous.plaintextSha256 && cached.size === entry.size && cached.mtime === entry.mtime;
+      });
+      if (canReusePack) {
+        manifest.packs[pack.id] = reusablePack;
+        for (const entry of pack.files) manifest.files[entry.path] = { ...previousFiles[entry.path], deleted: false, deletedAt: undefined };
+        continue;
+      }
+
+      const archiveFiles = [];
+      for (const entry of pack.files) {
+        const file = filesByPath.get(entry.path);
+        if (!file) continue;
+        const bytes = await readVaultFileBytes(plugin.app.vault, file);
+        const plaintextSha256 = await sha256Hex(bytes);
+        archiveFiles.push({ path: entry.path, mtime: entry.mtime, bytes, plaintextSha256 });
+        manifest.files[entry.path] = {
+          id: `${pack.id}:${entry.path}`,
+          path: entry.path,
+          objectPath: pack.objectPath,
+          plaintextSha256,
+          storage: "pack",
+          packId: pack.id,
+          size: entry.size,
+          mtime: entry.mtime,
+          deleted: false,
+          deletedAt: undefined,
+        };
+      }
+      manifest.packs[pack.id] = await uploadEncryptedPack(plugin.githubClient, key, pack.id, archiveFiles, previousPacks[pack.id]);
+    } finally {
+      if (plugin.syncProgress) plugin.syncProgress.pushCount++;
+      if (typeof plugin.updateStatusBar === "function") plugin.updateStatusBar();
     }
-    manifest.packs[pack.id] = await uploadEncryptedPack(plugin.githubClient, key, pack.id, archiveFiles, previousPacks[pack.id]);
   }
 
   for (const file of objectFiles) {
-    const path = normalizeVaultPath(file.path);
-    const plaintext = await readVaultFileBytes(plugin.app.vault, file);
-    const plaintextSha256 = await sha256Hex(plaintext);
-    const existing = previousFiles[path];
-    const reusableExisting = existing?.storage === "pack" ? undefined : existing;
-    const objectId = reusableExisting?.id ?? toBase64Url(randomBytes(OBJECT_ID_BYTES));
-    const uploaded = await uploadEncryptedFileObject(plugin.githubClient, key, objectId, plaintext, reusableExisting);
-    manifest.files[path] = { ...uploaded, path, plaintextSha256, mtime: file.stat.mtime, deleted: false, deletedAt: undefined };
+    try {
+      const path = normalizeVaultPath(file.path);
+      const plaintext = await readVaultFileBytes(plugin.app.vault, file);
+      const plaintextSha256 = await sha256Hex(plaintext);
+      const existing = previousFiles[path];
+      const reusableExisting = existing?.storage === "pack" ? undefined : existing;
+      const objectId = reusableExisting?.id ?? toBase64Url(randomBytes(OBJECT_ID_BYTES));
+      const uploaded = await uploadEncryptedFileObject(plugin.githubClient, key, objectId, plaintext, reusableExisting);
+      manifest.files[path] = { ...uploaded, path, plaintextSha256, mtime: file.stat.mtime, deleted: false, deletedAt: undefined };
+    } finally {
+      if (plugin.syncProgress) plugin.syncProgress.pushCount++;
+      if (typeof plugin.updateStatusBar === "function") plugin.updateStatusBar();
+    }
   }
   return true;
 }
@@ -573,43 +661,52 @@ function canSkipPackUpload(plugin: FastSync, manifest: EncryptedManifest, localF
 }
 async function pullEncryptedPackChanges(plugin: FastSync, key: CryptoKey, manifest: EncryptedManifest, ignoreRules: ReturnType<typeof compileIgnorePathRegex>, force: boolean): Promise<void> {
   const state = ensureEncryptedState(plugin);
-  for (const pack of Object.values(manifest.packs ?? {})) {
-    if (await canSkipPackDownload(plugin, manifest, pack.id, force)) continue;
-    const files = await downloadEncryptedPack(plugin.githubClient, key, pack);
-    for (const file of files) {
-      const record = manifest.files[file.path];
-      if (!record || record.deleted || record.storage !== "pack" || record.packId !== pack.id) continue;
-      if (!shouldSyncEncryptedFile({ path: file.path, stat: { size: file.bytes.byteLength, mtime: file.mtime } } as TFile, ignoreRules)) continue;
-      const plaintextSha256 = await sha256Hex(file.bytes);
-      if (plaintextSha256 !== record.plaintextSha256) throw new Error(`Encrypted pack file failed integrity check for ${file.path}.`);
-      const localState = state.files[file.path];
-      if (!force && localState?.plaintextSha256 === record.plaintextSha256) continue;
-      const localFile = plugin.app.vault.getAbstractFileByPath(file.path);
-      if (!force && localFile instanceof TFile) {
-        const localHash = await sha256Hex(await readVaultFileBytes(plugin.app.vault, localFile));
-        const localChanged = localState ? localState.plaintextSha256 !== localHash : localHash !== record.plaintextSha256;
-        if (localChanged) {
-          const resolution = await chooseConflictResolution(plugin, configuredConflictPolicy(plugin), file.path, localFile, record.mtime);
-          if (resolution === "keep-local") continue;
-          if (resolution === "copy-remote") {
-            await writeVaultFileBytes(plugin.app.vault, conflictPathFor(file.path, Date.now(), "remote"), file.bytes);
-            continue;
-          }
-          if (resolution === "merged") {
-            const localText = await plugin.app.vault.read(localFile);
-            const remoteText = new TextDecoder().decode(file.bytes);
-            await writeVaultFileBytes(plugin.app.vault, file.path, new TextEncoder().encode(mergeTextContent(localText, remoteText)));
-            continue;
+  const packs = Object.values(manifest.packs ?? {});
+  if (plugin.syncProgress) plugin.syncProgress.totalPull += packs.length;
+  if (typeof plugin.updateStatusBar === "function") plugin.updateStatusBar();
+
+  for (const pack of packs) {
+    try {
+      if (await canSkipPackDownload(plugin, manifest, pack.id, force)) continue;
+      const files = await downloadEncryptedPack(plugin.githubClient, key, pack);
+      for (const file of files) {
+        const record = manifest.files[file.path];
+        if (!record || record.deleted || record.storage !== "pack" || record.packId !== pack.id) continue;
+        if (!shouldSyncEncryptedFile({ path: file.path, stat: { size: file.bytes.byteLength, mtime: file.mtime } } as TFile, ignoreRules)) continue;
+        const plaintextSha256 = await sha256Hex(file.bytes);
+        if (plaintextSha256 !== record.plaintextSha256) throw new Error(`Encrypted pack file failed integrity check for ${file.path}.`);
+        const localState = state.files[file.path];
+        if (!force && localState?.plaintextSha256 === record.plaintextSha256) continue;
+        const localFile = plugin.app.vault.getAbstractFileByPath(file.path);
+        if (!force && localFile instanceof TFile) {
+          const localHash = await sha256Hex(await readVaultFileBytes(plugin.app.vault, localFile));
+          const localChanged = localState ? localState.plaintextSha256 !== localHash : localHash !== record.plaintextSha256;
+          if (localChanged) {
+            const resolution = await chooseConflictResolution(plugin, configuredConflictPolicy(plugin), file.path, localFile, record.mtime);
+            if (resolution === "keep-local") continue;
+            if (resolution === "copy-remote") {
+              await writeVaultFileBytes(plugin.app.vault, conflictPathFor(file.path, Date.now(), "remote"), file.bytes);
+              continue;
+            }
+            if (resolution === "merged") {
+              const localText = await plugin.app.vault.read(localFile);
+              const remoteText = new TextDecoder().decode(file.bytes);
+              await writeVaultFileBytes(plugin.app.vault, file.path, new TextEncoder().encode(mergeTextContent(localText, remoteText)));
+              continue;
+            }
           }
         }
+        plugin.addIgnoredFile(file.path);
+        try {
+          await writeVaultFileBytes(plugin.app.vault, file.path, file.bytes);
+        } finally {
+          plugin.removeIgnoredFile(file.path);
+        }
+        cacheEncryptedStateForRecord(plugin, file.path, record);
       }
-      plugin.addIgnoredFile(file.path);
-      try {
-        await writeVaultFileBytes(plugin.app.vault, file.path, file.bytes);
-      } finally {
-        plugin.removeIgnoredFile(file.path);
-      }
-      cacheEncryptedStateForRecord(plugin, file.path, record);
+    } finally {
+      if (plugin.syncProgress) plugin.syncProgress.pullCount++;
+      if (typeof plugin.updateStatusBar === "function") plugin.updateStatusBar();
     }
   }
 }
@@ -626,20 +723,27 @@ async function pushEncryptedLocalChanges(plugin: FastSync, key: CryptoKey, manif
       changed = true;
     }
   }
+  if (plugin.syncProgress) plugin.syncProgress.totalPush += localFiles.length;
+  if (typeof plugin.updateStatusBar === "function") plugin.updateStatusBar();
   for (const file of localFiles) {
-    const path = normalizeVaultPath(file.path);
-    const existing = manifest.files[path];
-    const cached = state.files[path];
-    if (!force && existing && !existing.deleted && cached?.plaintextSha256 === existing.plaintextSha256 && cached.size === file.stat.size && cached.mtime === file.stat.mtime) continue;
-    const plaintext = await readVaultFileBytes(plugin.app.vault, file);
-    const plaintextSha256 = await sha256Hex(plaintext);
-    if (!force && await resolveRemoteChangedBeforeLocalMutation(plugin, key, manifest, path, existing, cached, file, plaintext)) continue;
-    if (!force && existing && !existing.deleted && existing.plaintextSha256 === plaintextSha256) continue;
-    const reusableExisting = existing?.storage === "pack" ? undefined : existing;
-    const objectId = reusableExisting?.id ?? toBase64Url(randomBytes(OBJECT_ID_BYTES));
-    const uploaded = await uploadEncryptedFileObject(plugin.githubClient, key, objectId, plaintext, reusableExisting);
-    manifest.files[path] = { ...uploaded, path, plaintextSha256, mtime: file.stat.mtime, deleted: false, deletedAt: undefined };
-    changed = true;
+    try {
+      const path = normalizeVaultPath(file.path);
+      const existing = manifest.files[path];
+      const cached = state.files[path];
+      if (!force && existing && !existing.deleted && cached?.plaintextSha256 === existing.plaintextSha256 && cached.size === file.stat.size && cached.mtime === file.stat.mtime) continue;
+      const plaintext = await readVaultFileBytes(plugin.app.vault, file);
+      const plaintextSha256 = await sha256Hex(plaintext);
+      if (!force && await resolveRemoteChangedBeforeLocalMutation(plugin, key, manifest, path, existing, cached, file, plaintext)) continue;
+      if (!force && existing && !existing.deleted && existing.plaintextSha256 === plaintextSha256) continue;
+      const reusableExisting = existing?.storage === "pack" ? undefined : existing;
+      const objectId = reusableExisting?.id ?? toBase64Url(randomBytes(OBJECT_ID_BYTES));
+      const uploaded = await uploadEncryptedFileObject(plugin.githubClient, key, objectId, plaintext, reusableExisting);
+      manifest.files[path] = { ...uploaded, path, plaintextSha256, mtime: file.stat.mtime, deleted: false, deletedAt: undefined };
+      changed = true;
+    } finally {
+      if (plugin.syncProgress) plugin.syncProgress.pushCount++;
+      if (typeof plugin.updateStatusBar === "function") plugin.updateStatusBar();
+    }
   }
   return changed;
 }

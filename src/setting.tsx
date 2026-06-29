@@ -5,6 +5,7 @@ import FastSync from "./main";
 import { dump } from "./lib/helps";
 import { encryptedForcePull, encryptedForcePush, encryptedManualSync } from "./lib/encrypted/sync-engine";
 import { createDebugPayload } from "./lib/debug";
+import { StartupFullNotesSync } from "./lib/fs";
 
 export interface PluginSettings {
   //是否自动上传
@@ -23,6 +24,7 @@ export interface PluginSettings {
   ignorePathRegex: string
   conflictPolicy: "copy" | "newer" | "merge" | "ask"
   encryptedForcePushRequired: boolean
+  statusBarStatusEnabled: boolean
 
   vault: string
   lastSyncTime: number
@@ -57,12 +59,15 @@ export const DEFAULT_SETTINGS: PluginSettings = {
   encryptedForcePushRequired: false,
   lastSyncTime: 0,
   vault: "defaultVault",
+  statusBarStatusEnabled: true,
   // 剪贴板读取提示
   clipboardReadTip: "",
 }
 
 export class SettingTab extends PluginSettingTab {
   plugin: FastSync
+  tempSettings: PluginSettings | null = null
+  bannerEl: HTMLElement | null = null
 
   constructor(app: App, plugin: FastSync) {
     super(app, plugin)
@@ -70,46 +75,44 @@ export class SettingTab extends PluginSettingTab {
     this.plugin.clipboardReadTip = ""
   }
 
-  async confirmForce(title: string, message: string, operation: "forcePush" | "forcePull"): Promise<void> {
-    await new Promise<void>((resolve) => {
-      const modal = new Modal(this.app)
-      const repo = `${this.plugin.settings.githubOwner}/${this.plugin.settings.githubRepo}`
-      const branch = this.plugin.settings.githubBranch || "main"
-      const localFileCount = this.app.vault.getFiles().filter(file => !file.path.startsWith(`${this.app.vault.configDir}/`)).length
-      const confirmPhrase = `${operation === "forcePush" ? "push" : "pull"} ${repo} ${branch}`
-      modal.titleEl.setText(title)
-      modal.contentEl.createEl("p", { text: message })
-      modal.contentEl.createEl("p", { text: `Repository: ${repo}` })
-      modal.contentEl.createEl("p", { text: `Branch: ${branch}` })
-      modal.contentEl.createEl("p", { text: `Local vault files: ${localFileCount}` })
-      modal.contentEl.createEl("p", { text: `Type "${confirmPhrase}" to confirm.` })
-      const input = modal.contentEl.createEl("input")
-      input.type = "text"
-      input.placeholder = confirmPhrase
-      const buttons = modal.contentEl.createDiv()
-      buttons.createEl("button", { text: "Cancel" }).onclick = () => {
-        modal.close()
-        resolve()
+  isDirty(): boolean {
+    if (!this.tempSettings) return false
+    return JSON.stringify(this.tempSettings) !== JSON.stringify(this.plugin.settings)
+  }
+
+  updateDirtyState(): void {
+    if (!this.bannerEl) return
+    this.bannerEl.empty()
+    if (this.isDirty()) {
+      this.bannerEl.addClass("is-dirty")
+      const banner = this.bannerEl.createDiv("github-sync-settings-dirty-banner")
+      banner.createEl("span", { text: "You have unsaved changes!", cls: "github-sync-settings-dirty-text" })
+      
+      const btnContainer = banner.createDiv("github-sync-settings-dirty-buttons")
+      const saveBtn = btnContainer.createEl("button", { text: "Save changes", cls: "mod-cta" })
+      saveBtn.onclick = async () => {
+        if (this.tempSettings) {
+          this.plugin.settings = JSON.parse(JSON.stringify(this.tempSettings))
+          await this.plugin.saveSettings()
+          this.plugin.initGitHubClient()
+          this.plugin.updateStatusBar()
+          new Notice("GitHub Sync: Settings saved")
+          this.display()
+        }
       }
-      const confirmButton = buttons.createEl("button", { text: operation === "forcePush" ? "Force push" : "Force pull" })
-      confirmButton.addClass("mod-warning")
-      confirmButton.disabled = true
-      input.oninput = () => {
-        confirmButton.disabled = input.value.trim() !== confirmPhrase
+
+      const discardBtn = btnContainer.createEl("button", { text: "Discard", cls: "mod-warning" })
+      discardBtn.onclick = () => {
+        this.tempSettings = JSON.parse(JSON.stringify(this.plugin.settings))
+        this.display()
       }
-      confirmButton.onclick = () => {
-        if (input.value.trim() !== confirmPhrase) return
-        modal.close()
-        if (operation === "forcePush") void encryptedForcePush(this.plugin)
-        else void encryptedForcePull(this.plugin)
-        resolve()
-      }
-      modal.open()
-    })
+    } else {
+      this.bannerEl.removeClass("is-dirty")
+    }
   }
 
   hide(): void {
-    // 不再需要 React root.unmount()
+    this.tempSettings = null
   }
 
   /**
@@ -133,11 +136,12 @@ export class SettingTab extends PluginSettingTab {
         const hasRepo = "githubRepo" in parsed || "repo" in parsed
         const hasToken = "githubToken" in parsed || "token" in parsed
         if (hasOwner && hasRepo && hasToken) {
-          this.plugin.settings.githubOwner = parsed.githubOwner || parsed.owner
-          this.plugin.settings.githubRepo = parsed.githubRepo || parsed.repo
-          this.plugin.settings.githubBranch = parsed.githubBranch || parsed.branch || "main"
-          this.plugin.settings.githubToken = parsed.githubToken || parsed.token
-          await this.plugin.saveSettings()
+          if (this.tempSettings) {
+            this.tempSettings.githubOwner = parsed.githubOwner || parsed.owner
+            this.tempSettings.githubRepo = parsed.githubRepo || parsed.repo
+            this.tempSettings.githubBranch = parsed.githubBranch || parsed.branch || "main"
+            this.tempSettings.githubToken = parsed.githubToken || parsed.token
+          }
           this.display()
           showTip($("接口配置信息已经粘贴到设置中!"))
           return
@@ -155,30 +159,48 @@ export class SettingTab extends PluginSettingTab {
 
     set.empty()
 
-    // new Setting(set).setName("Fast Note Sync").setDesc($("Fast sync")).setHeading()
+    if (!this.tempSettings) {
+      this.tempSettings = JSON.parse(JSON.stringify(this.plugin.settings))
+    }
+
+    this.bannerEl = set.createDiv()
+    this.updateDirtyState()
+
+    // ==========================================
+    // Section 1: General Settings
+    // ==========================================
+    new Setting(set)
+      .setName($("General Settings"))
+      .setHeading()
+      .setClass("github-sync-settings-header")
 
     new Setting(set)
       .setName($("启用同步"))
       .setDesc($("关闭后您的笔记将不做任何同步"))
       .addToggle((toggle) =>
-        toggle.setValue(this.plugin.settings.syncEnabled).onChange(async (value) => {
-          if (value != this.plugin.settings.syncEnabled) {
-            this.plugin.settings.syncEnabled = value
-            this.display()
-            await this.plugin.saveSettings()
-          }
+        toggle.setValue(this.tempSettings!.syncEnabled).onChange((value) => {
+          this.tempSettings!.syncEnabled = value
+          this.updateDirtyState()
         })
       )
 
     new Setting(set)
-      .setName("| " + $("远端"))
-      .setHeading()
-      .setClass("obsidian-github-sync-multi-platform-settings-tag")
+      .setName($("Show sync status in status bar"))
+      .setDesc($("Display real-time sync progress, last sync time, or errors in the Obsidian status bar. Disable (kill-switch) to save system resources."))
+      .addToggle((toggle) =>
+        toggle.setValue(this.tempSettings!.statusBarStatusEnabled).onChange((value) => {
+          this.tempSettings!.statusBarStatusEnabled = value
+          this.updateDirtyState()
+        })
+      )
 
-    // 用 Obsidian 原生 API 替换 React 组件（移除 react-dom 依赖）
+    // ==========================================
+    // Section 2: GitHub Connection Settings
+    // ==========================================
     new Setting(set)
-      .setName($("GitHub 同步配置"))
-      .setDesc($("使用 GitHub API 进行同步"))
+      .setName($("GitHub Connection Settings"))
+      .setHeading()
+      .setClass("github-sync-settings-header")
 
     const apiInfoDiv = set.createDiv("obsidian-github-sync-multi-platform-settings")
     const table = apiInfoDiv.createEl("table", { cls: "obsidian-github-sync-multi-platform-settings-openapi" })
@@ -190,11 +212,10 @@ export class SettingTab extends PluginSettingTab {
     const tbody = table.createEl("tbody")
     const row = tbody.createEl("tr")
     row.createEl("td", { text: "GitHub" })
-    row.createEl("td", { text: $("使用 GitHub 仓库存储和同步笔记") })
+    row.createEl("td", { text: $("使用 GitHub 仓库存储และ同步笔记") })
     const linkTd = row.createEl("td")
     linkTd.createEl("a", { text: "GitHub PAT Settings", href: "https://github.com/settings/tokens" })
 
-    // 粘贴配置按鈕
     const clipboardDiv = set.createDiv("clipboard-read")
     const clipboardBtn = clipboardDiv.createEl("button", {
       text: $("粘贴的远端配置"),
@@ -212,10 +233,10 @@ export class SettingTab extends PluginSettingTab {
       .addText((text) =>
         text
           .setPlaceholder($("输入您的 GitHub 用户名"))
-          .setValue(this.plugin.settings.githubOwner)
-          .onChange(async (value) => {
-            this.plugin.settings.githubOwner = value
-            await this.plugin.saveSettings()
+          .setValue(this.tempSettings!.githubOwner)
+          .onChange((value) => {
+            this.tempSettings!.githubOwner = value
+            this.updateDirtyState()
           })
       )
 
@@ -225,10 +246,10 @@ export class SettingTab extends PluginSettingTab {
       .addText((text) =>
         text
           .setPlaceholder($("输入您的 GitHub 仓库名"))
-          .setValue(this.plugin.settings.githubRepo)
-          .onChange(async (value) => {
-            this.plugin.settings.githubRepo = value
-            await this.plugin.saveSettings()
+          .setValue(this.tempSettings!.githubRepo)
+          .onChange((value) => {
+            this.tempSettings!.githubRepo = value
+            this.updateDirtyState()
           })
       )
 
@@ -238,10 +259,10 @@ export class SettingTab extends PluginSettingTab {
       .addText((text) =>
         text
           .setPlaceholder($("输入您的 GitHub 分支名"))
-          .setValue(this.plugin.settings.githubBranch)
-          .onChange(async (value) => {
-            this.plugin.settings.githubBranch = value
-            await this.plugin.saveSettings()
+          .setValue(this.tempSettings!.githubBranch)
+          .onChange((value) => {
+            this.tempSettings!.githubBranch = value
+            this.updateDirtyState()
           })
       )
 
@@ -249,119 +270,193 @@ export class SettingTab extends PluginSettingTab {
       .setName($("GitHub 访问令牌"))
       .setDesc($("用于访问 GitHub API 的 Personal Access Token"))
       .addText((text) => {
-        text.inputEl.type = "password"  // C4: mask 显示，防止 Token 明文泄露
+        text.inputEl.type = "password"
         text
           .setPlaceholder($("输入您的 GitHub 访问令牌"))
-          .setValue(this.plugin.settings.githubToken)
-          .onChange(async (value) => {
-            this.plugin.settings.githubToken = value
-            await this.plugin.saveSettings()
+          .setValue(this.tempSettings!.githubToken)
+          .onChange((value) => {
+            this.tempSettings!.githubToken = value
+            this.updateDirtyState()
           })
       })
 
-    new Setting(set)
-      .setName("Encrypted sync")
-      .setDesc("Encrypt file contents, filenames, and folder structure before uploading to GitHub")
-      .addToggle(toggle =>
-        toggle.setValue(this.plugin.settings.encryptionMode === "encrypted").onChange(async value => {
-          if (value && this.plugin.settings.encryptionMode !== "encrypted") this.plugin.settings.encryptedForcePushRequired = true
-          this.plugin.settings.encryptionMode = value ? "encrypted" : "plaintext"
-          await this.plugin.saveSettings()
-          this.display()
-        })
-      )
-
-    if (this.plugin.settings.encryptionMode === "encrypted") {
-      new Setting(set)
-        .setName("Encryption passphrase")
-        .setDesc("Enter the same passphrase on every device. Losing it means the encrypted repo cannot be decrypted.")
-        .addText(text => {
-          text.inputEl.type = "password"
-          text.setValue(this.plugin.settings.encryptionPassphrase).onChange(async value => {
-            this.plugin.settings.encryptionPassphrase = value
-            await this.plugin.saveSettings()
-          })
-        })
-    }
-    new Setting(set).setName("Manual sync").setDesc("Sync encrypted vault with the remote repository now.").addButton(button =>
-      button.setButtonText("Sync now").onClick(() => void encryptedManualSync(this.plugin))
-    )
-
-    new Setting(set).setName("Force push local to remote").setDesc("Overwrite the encrypted remote state with this local vault.").addButton(button =>
-      button.setWarning().setButtonText("Force push").onClick(() => void this.confirmForce("Force push local vault to remote?", "Remote encrypted files not present locally may be deleted.", "forcePush"))
-    )
-
-    new Setting(set).setName("Force pull remote to local").setDesc("Overwrite this local vault with the encrypted remote state.").addButton(button =>
-      button.setWarning().setButtonText("Force pull").onClick(() => void this.confirmForce("Force pull remote vault to local?", "Local synced files not present remotely will be deleted.", "forcePull"))
-    )
-
-    new Setting(set)
-      .setName("Sync when Obsidian opens")
-      .setDesc("Run encrypted sync after the workspace is ready.")
-      .addToggle(toggle => toggle.setValue(this.plugin.settings.syncOnStartup).onChange(async value => {
-        this.plugin.settings.syncOnStartup = value
-        await this.plugin.saveSettings()
-      }))
-
-    new Setting(set)
-      .setName("Sync when local files change")
-      .setDesc("Sync when a local file is created, modified, deleted, or renamed.")
-      .addToggle(toggle => toggle.setValue(this.plugin.settings.syncOnLocalChange).onChange(async value => {
-        this.plugin.settings.syncOnLocalChange = value
-        await this.plugin.saveSettings()
-      }))
-
-    new Setting(set)
-      .setName("Scheduled sync")
-      .setDesc("Run encrypted sync repeatedly at the configured interval.")
-      .addToggle(toggle => toggle.setValue(this.plugin.settings.scheduledSyncEnabled).onChange(async value => {
-        this.plugin.settings.scheduledSyncEnabled = value
-        await this.plugin.saveSettings()
-        this.display()
-      }))
-
-    new Setting(set)
-      .setName("Scheduled sync interval")
-      .setDesc("Interval in seconds between scheduled sync attempts.")
-      .addText(text => text.setPlaceholder("300").setValue(String(this.plugin.settings.scheduledSyncIntervalSeconds)).onChange(async value => {
-        const seconds = Number(value)
-        this.plugin.settings.scheduledSyncIntervalSeconds = Number.isFinite(seconds) && seconds > 0 ? Math.floor(seconds) : 300
-        await this.plugin.saveSettings()
-      }))
-
-    new Setting(set)
-      .setName("Regex of path to ignore")
-      .setDesc("One regex per line, matched against plaintext vault paths before encryption. Examples: ^Archive/ ignores a folder, (^|/)\\.DS_Store$ ignores .DS_Store, \\.tmp$ ignores .tmp files.")
-      .addTextArea(text => text.setPlaceholder("^Archive/\n(^|/)\\.DS_Store$\n\\.tmp$").setValue(this.plugin.settings.ignorePathRegex).onChange(async value => {
-        this.plugin.settings.ignorePathRegex = value
-        await this.plugin.saveSettings()
-      }))
-
-    new Setting(set)
-      .setName("File conflict policy")
-      .setDesc("Choose what to do when both local and remote changed since last sync.")
-      .addDropdown(dropdown => dropdown
-        .addOption("copy", "Copy policy")
-        .addOption("newer", "Newer")
-        .addOption("merge", "Merge text")
-        .addOption("ask", "Always ask")
-        .setValue(this.plugin.settings.conflictPolicy)
-        .onChange(async value => {
-          this.plugin.settings.conflictPolicy = value as "copy" | "newer" | "merge" | "ask"
-          await this.plugin.saveSettings()
-        }))
     new Setting(set)
       .setName($("远端仓库名"))
       .setDesc($("远端仓库名"))
       .addText((text) =>
         text
           .setPlaceholder($("远端仓库名"))
-          .setValue(this.plugin.settings.vault)
-          .onChange(async (value) => {
-            this.plugin.settings.vault = value
-            await this.plugin.saveSettings()
+          .setValue(this.tempSettings!.vault)
+          .onChange((value) => {
+            this.tempSettings!.vault = value
+            this.updateDirtyState()
           })
       )
+
+    // ==========================================
+    // Section 3: Encryption Settings
+    // ==========================================
+    new Setting(set)
+      .setName($("Encryption Settings"))
+      .setHeading()
+      .setClass("github-sync-settings-header")
+
+    new Setting(set)
+      .setName("Encrypted sync")
+      .setDesc("Encrypt file contents, filenames, and folder structure before uploading to GitHub")
+      .addToggle((toggle) =>
+        toggle.setValue(this.tempSettings!.encryptionMode === "encrypted").onChange((value) => {
+          if (value && this.tempSettings!.encryptionMode !== "encrypted") {
+            this.tempSettings!.encryptedForcePushRequired = true
+          }
+          this.tempSettings!.encryptionMode = value ? "encrypted" : "plaintext"
+          this.display()
+        })
+      )
+
+    if (this.tempSettings!.encryptionMode === "encrypted") {
+      new Setting(set)
+        .setName("Encryption passphrase")
+        .setDesc("Enter the same passphrase on every device. Losing it means the encrypted repo cannot be decrypted.")
+        .addText((text) => {
+          text.inputEl.type = "password"
+          text.setValue(this.tempSettings!.encryptionPassphrase).onChange((value) => {
+            this.tempSettings!.encryptionPassphrase = value
+            this.updateDirtyState()
+          })
+        })
+    }
+
+    // ==========================================
+    // Section 4: Manual & Force Operations
+    // ==========================================
+    new Setting(set)
+      .setName($("Manual & Force Operations"))
+      .setHeading()
+      .setClass("github-sync-settings-header")
+
+    new Setting(set)
+      .setName("Manual sync")
+      .setDesc("Sync encrypted vault with the remote repository now.")
+      .addButton((button) =>
+        button.setButtonText("Sync now").onClick(() => {
+          StartupFullNotesSync(this.plugin)
+        })
+      )
+
+    new Setting(set)
+      .setName("Force push local to remote")
+      .setDesc("Overwrite the remote state with this local vault.")
+      .addButton((button) =>
+        button
+          .setWarning()
+          .setButtonText("Force push")
+          .onClick(() => void this.plugin.showForceConfirm("forcePush"))
+      )
+
+    new Setting(set)
+      .setName("Force pull remote to local")
+      .setDesc("Overwrite this local vault with the remote state.")
+      .addButton((button) =>
+        button
+          .setWarning()
+          .setButtonText("Force pull")
+          .onClick(() => void this.plugin.showForceConfirm("forcePull"))
+      )
+
+    // ==========================================
+    // Section 5: Automation & Exclusions
+    // ==========================================
+    new Setting(set)
+      .setName($("Automation & Exclusions"))
+      .setHeading()
+      .setClass("github-sync-settings-header")
+
+    new Setting(set)
+      .setName("Sync when Obsidian opens")
+      .setDesc("Run encrypted sync after the workspace is ready.")
+      .addToggle((toggle) =>
+        toggle.setValue(this.tempSettings!.syncOnStartup).onChange((value) => {
+          this.tempSettings!.syncOnStartup = value
+          this.updateDirtyState()
+        })
+      )
+
+    new Setting(set)
+      .setName("Sync when local files change")
+      .setDesc("Sync when a local file is created, modified, deleted, or renamed.")
+      .addToggle((toggle) =>
+        toggle.setValue(this.tempSettings!.syncOnLocalChange).onChange((value) => {
+          this.tempSettings!.syncOnLocalChange = value
+          this.updateDirtyState()
+        })
+      )
+
+    new Setting(set)
+      .setName("Scheduled sync")
+      .setDesc("Run encrypted sync repeatedly at the configured interval.")
+      .addToggle((toggle) =>
+        toggle.setValue(this.tempSettings!.scheduledSyncEnabled).onChange((value) => {
+          this.tempSettings!.scheduledSyncEnabled = value
+          this.display()
+        })
+      )
+
+    if (this.tempSettings!.scheduledSyncEnabled) {
+      new Setting(set)
+        .setName("Scheduled sync interval")
+        .setDesc("Interval in seconds between scheduled sync attempts.")
+        .addText((text) =>
+          text
+            .setPlaceholder("300")
+            .setValue(String(this.tempSettings!.scheduledSyncIntervalSeconds))
+            .onChange((value) => {
+              const seconds = Number(value)
+              this.tempSettings!.scheduledSyncIntervalSeconds =
+                Number.isFinite(seconds) && seconds > 0 ? Math.floor(seconds) : 300
+              this.updateDirtyState()
+            })
+        )
+    }
+
+    new Setting(set)
+      .setName("Regex of path to ignore")
+      .setDesc(
+        "One regex per line, matched against plaintext vault paths before encryption. Examples: ^Archive/ ignores a folder, (^|/)\\.DS_Store$ ignores .DS_Store, \\.tmp$ ignores .tmp files."
+      )
+      .addTextArea((text) =>
+        text
+          .setPlaceholder("^Archive/\n(^|/)\\.DS_Store$\n\\.tmp$")
+          .setValue(this.tempSettings!.ignorePathRegex)
+          .onChange((value) => {
+            this.tempSettings!.ignorePathRegex = value
+            this.updateDirtyState()
+          })
+      )
+
+    new Setting(set)
+      .setName("File conflict policy")
+      .setDesc("Choose what to do when both local and remote changed since last sync.")
+      .addDropdown((dropdown) =>
+        dropdown
+          .addOption("copy", "Copy policy")
+          .addOption("newer", "Newer")
+          .addOption("merge", "Merge text")
+          .addOption("ask", "Always ask")
+          .setValue(this.tempSettings!.conflictPolicy)
+          .onChange((value) => {
+            this.tempSettings!.conflictPolicy = value as "copy" | "newer" | "merge" | "ask"
+            this.updateDirtyState()
+          })
+      )
+
+    // ==========================================
+    // Section 6: Support & Debug
+    // ==========================================
+    new Setting(set)
+      .setName($("Support & Debug"))
+      .setHeading()
+      .setClass("github-sync-settings-header")
 
     const debugDiv = set.createDiv()
     debugDiv.addClass("obsidian-github-sync-multi-platform-settings-debug")
@@ -371,7 +466,10 @@ export class SettingTab extends PluginSettingTab {
     debugButton.onclick = async () => {
       await window.navigator.clipboard.writeText(
         JSON.stringify(
-          createDebugPayload(this.plugin.settings as unknown as Record<string, unknown>, this.plugin.manifest.version),
+          createDebugPayload(
+            this.plugin.settings as unknown as Record<string, unknown>,
+            this.plugin.manifest.version
+          ),
           null,
           4
         )
@@ -381,7 +479,7 @@ export class SettingTab extends PluginSettingTab {
 
     if (Platform.isDesktopApp) {
       const info = debugDiv.createDiv()
-      info.setText($("通过快捷键打开控制台，你可以看到这个插件和其他插件的日志"))
+      info.setText($("通过快捷键打开控制台，你可以看到这个插件和其他插件의日志"))
 
       const keys = debugDiv.createDiv()
       keys.addClass("custom-shortcuts")
@@ -392,16 +490,12 @@ export class SettingTab extends PluginSettingTab {
       }
     }
 
-    // Support section
-    new Setting(set).setName($("支持")).setHeading()
     const supportDiv = set.createDiv("github-sync-support-section")
 
-    // Add donation title
     new Setting(supportDiv).setName($("捐赠")).setHeading()
 
-    // Add donation text
-    supportDiv.createEl("p", { 
-      text: $("如果您喜欢这个插件，请考虑捐赠以支持继续开发。") 
+    supportDiv.createEl("p", {
+      text: $("如果您喜欢这个插件，请考虑捐赠以支持继续开发。")
     })
 
     const kofiLink = supportDiv.createEl("a", {

@@ -127,20 +127,25 @@ export const NoteModify = function (file: TAbstractFile, plugin: FastSync, event
 
   // 2. 防抖处理
   if (plugin.debounceTimers.has(file.path)) {
-    clearTimeout(plugin.debounceTimers.get(file.path));
+    globalThis.clearTimeout(plugin.debounceTimers.get(file.path));
   }
 
-  const timer = window.setTimeout(() => {
+  const timer = globalThis.setTimeout(() => {
     void (async () => {
       plugin.debounceTimers.delete(file.path);
       await performSync(file, plugin);
     })();
-  }, 5000); // 5秒防抖
+  }, 5000) as unknown as number; // 5秒防抖
 
   plugin.debounceTimers.set(file.path, timer);
 };
 
 const performSync = async (file: TFile, plugin: FastSync) => {
+  if (plugin.isSyncInProgress) {
+    dump(`Sync already in progress, skipping performSync for ${file.path}`);
+    return;
+  }
+  plugin.isSyncInProgress = true;
   try {
     assertNoPlaintextPathCollisions(plugin);
     plugin.addIgnoredFile(file.path);
@@ -182,6 +187,7 @@ const performSync = async (file: TFile, plugin: FastSync) => {
     console.error("Sync failed:", error);
     new Notice(`Sync failed for ${file.path}: ${error.message}`);
   } finally {
+    plugin.isSyncInProgress = false;
     plugin.removeIgnoredFile(file.path);
   }
 };
@@ -286,10 +292,15 @@ export async function overrideRemoteAllFilesImpl(plugin: FastSync): Promise<void
     return;
   }
   if (plugin.isSyncInProgress) {
-    new Notice("Sync in progress...");
+    new Notice("Sync is already in progress. Please wait.");
     return;
   }
   if (!plugin.githubClient) return;
+
+  for (const timer of plugin.debounceTimers.values()) {
+    globalThis.clearTimeout(timer);
+  }
+  plugin.debounceTimers.clear();
 
   plugin.isSyncInProgress = true;
   plugin.disableWatch();
@@ -340,16 +351,46 @@ export async function syncAllFilesImpl(plugin: FastSync): Promise<void> {
     await encryptedFullSync(plugin);
     return;
   }
-  if (plugin.isSyncInProgress) return;
+  if (plugin.isSyncInProgress) {
+    new Notice("Sync is already in progress. Please wait.");
+    return;
+  }
   if (!plugin.githubClient) return;
+
+  for (const timer of plugin.debounceTimers.values()) {
+    globalThis.clearTimeout(timer);
+  }
+  plugin.debounceTimers.clear();
 
   plugin.isSyncInProgress = true;
   plugin.disableWatch();
+  if (plugin.syncProgress) {
+    plugin.syncProgress = {
+      status: "syncing",
+      pushCount: 0,
+      totalPush: 0,
+      pullCount: 0,
+      totalPull: 0,
+      lastSyncTime: plugin.syncProgress.lastSyncTime
+    };
+  }
+  if (typeof plugin.updateStatusBar === "function") plugin.updateStatusBar();
 
   try {
     const allLocalFiles = listPlaintextSyncCandidates(plugin);
     const remoteHeadBeforeSync = await getRemoteHeadShaIfAvailable(plugin);
     if (remoteHeadBeforeSync && plugin.syncData.lastRemoteHeadSha === remoteHeadBeforeSync && plaintextLocalStateMatchesCache(plugin, allLocalFiles)) {
+      if (plugin.syncProgress) {
+        plugin.syncProgress = {
+          status: "success",
+          pushCount: 0,
+          totalPush: 0,
+          pullCount: 0,
+          totalPull: 0,
+          lastSyncTime: plugin.syncProgress.lastSyncTime ?? Date.now()
+        };
+      }
+      if (typeof plugin.updateStatusBar === "function") plugin.updateStatusBar();
       new Notice("Sync skipped: no local or remote changes");
       return;
     }
@@ -366,6 +407,9 @@ export async function syncAllFilesImpl(plugin: FastSync): Promise<void> {
     const remoteFilesMap = new Map<string, string>(remoteFiles.map((f: GitHubTreeNode) => [f.path, f.sha] as [string, string]));
     const localFilesMap = new Map<string, TFile>(allLocalFiles.map(f => [f.path, f]));
 
+    if (plugin.syncProgress) plugin.syncProgress.totalPull = remoteFilesMap.size;
+    if (typeof plugin.updateStatusBar === "function") plugin.updateStatusBar();
+
     // 1. 下拉远端变更
     let step1Count = 0;
     for (const [path, remoteSha] of Array.from(remoteFilesMap.entries())) {
@@ -376,6 +420,8 @@ export async function syncAllFilesImpl(plugin: FastSync): Promise<void> {
         const isLocalFileEmpty = localFile && localFile.stat.size === 0;
 
         if (!localFile || (localState && localState.sha !== remoteSha) || isLocalFileEmpty) {
+          if (plugin.syncProgress) plugin.syncProgress.pullCount++;
+          if (typeof plugin.updateStatusBar === "function") plugin.updateStatusBar();
           const remoteData = await plugin.githubClient.getFile(path);
           if (remoteData) {
             const ext = path.split(".").pop()?.toLowerCase();
@@ -457,8 +503,11 @@ export async function syncAllFilesImpl(plugin: FastSync): Promise<void> {
 
     // 2. 推送本地文件：新增文件 + 本地内容有变化的已有文件
     let step2Push = 0, step2Skip = 0, step2Fail = 0;
-    for (const file of allLocalFiles) {
-      if (!shouldSyncPlaintextFile(file)) continue;
+    const candidateFiles = allLocalFiles.filter(shouldSyncPlaintextFile);
+    if (plugin.syncProgress) plugin.syncProgress.totalPush = candidateFiles.length;
+    if (typeof plugin.updateStatusBar === "function") plugin.updateStatusBar();
+
+    for (const file of candidateFiles) {
       const isMarkdown = file.extension === "md";
 
       try {
@@ -501,25 +550,47 @@ export async function syncAllFilesImpl(plugin: FastSync): Promise<void> {
         // 单个文件失败不中断整个同步
         console.error(`Step2 failed for ${file.path}:`, fileError);
         step2Fail++;
+      } finally {
+        if (plugin.syncProgress) plugin.syncProgress.pushCount++;
+        if (typeof plugin.updateStatusBar === "function") plugin.updateStatusBar();
       }
     }
 
     plugin.syncData.lastRemoteHeadSha = step2Push === 0 ? (remoteHeadBeforeSync ?? plugin.syncData.lastRemoteHeadSha) : (remoteHeadBeforeSync ? (await getRemoteHeadShaIfAvailable(plugin) ?? plugin.syncData.lastRemoteHeadSha) : plugin.syncData.lastRemoteHeadSha);
 
-
     await plugin.saveSyncData();
-
 
     // B6: updateStats 异步执行，不阻塞主同步流程
     plugin.updateStats().catch(e => console.error("Stats update failed:", e));
     new Notice("Sync completed");
+
+    if (plugin.syncProgress) {
+      plugin.syncProgress = {
+        status: "success",
+        pushCount: step2Push,
+        totalPush: candidateFiles.length,
+        pullCount: step1Count,
+        totalPull: remoteFilesMap.size,
+        lastSyncTime: Date.now()
+      };
+    }
   } catch (error) {
     console.error("Sync failed:", error);
     // B3: 同步失败时弹出通知
     new Notice(`❌ Sync failed: ${(error as Error).message}`);
+    plugin.syncProgress = {
+      status: "fail",
+      pushCount: 0,
+      totalPush: 0,
+      pullCount: 0,
+      totalPull: 0,
+      lastSyncTime: plugin.syncProgress?.lastSyncTime ?? 0,
+      errorMessage: (error as Error).message
+    };
   } finally {
     plugin.isSyncInProgress = false;
     plugin.enableWatch();
+    if (typeof plugin.updateStatusBar === "function") plugin.updateStatusBar();
   }
 }
 

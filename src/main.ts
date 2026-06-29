@@ -1,10 +1,11 @@
-import { Plugin, setIcon } from "obsidian";
+import { Plugin, setIcon, Modal, Notice, TFile } from "obsidian";
 
 import { NoteModify, NoteDelete, NoteRename, StartupFullNotesForceOverSync, StartupFullNotesSync } from "./lib/fs";
 import { SettingTab, PluginSettings, DEFAULT_SETTINGS } from "./setting";
 import { GitHubClient } from "./lib/github-api";
 import { $, moment } from "./lang/lang";
 import { calculateWordCount } from "./lib/helps";
+import { encryptedForcePush, encryptedForcePull } from "./lib/encrypted/sync-engine";
 import type { EncryptedLocalFileState } from "./lib/encrypted/types";
 import { normalizeScheduledSyncIntervalSeconds, shouldRunScheduledSync, shouldRunStartupSync } from "./lib/encrypted/settings-policy";
 
@@ -51,6 +52,24 @@ export default class FastSync extends Plugin {
 
   ribbonIcon: HTMLElement
   ribbonIconStatus: boolean = false
+  statusBarItem: HTMLElement | null = null
+  saveNoticeTimeout: number | null = null
+  syncProgress: {
+    status: "idle" | "syncing" | "success" | "fail"
+    pushCount: number
+    totalPush: number
+    pullCount: number
+    totalPull: number
+    lastSyncTime: number
+    errorMessage?: string
+  } = {
+    status: "idle",
+    pushCount: 0,
+    totalPush: 0,
+    pullCount: 0,
+    totalPull: 0,
+    lastSyncTime: 0
+  }
 
   isWatchEnabled: boolean = true
   ignoredFiles: Set<string> = new Set()
@@ -85,9 +104,20 @@ export default class FastSync extends Plugin {
     this.initGitHubClient()
     this.registerScheduledSync()
 
-    // Create Ribbon Icon once
-    this.ribbonIcon = this.addRibbonIcon("loader-circle", "Encrypted GitHub Sync (Multi-Platform): " + $("同步全部笔记"), () => {
+    // Initialize status bar widget
+    this.updateStatusBar()
+
+    // Create Ribbon Icons
+    this.ribbonIcon = this.addRibbonIcon("loader-circle", "GitHub Sync: Sync", () => {
       StartupFullNotesSync(this)
+    })
+
+    this.addRibbonIcon("arrow-up-circle", "GitHub Sync: Force Push", () => {
+      void this.showForceConfirm("forcePush")
+    })
+
+    this.addRibbonIcon("arrow-down-circle", "GitHub Sync: Force Pull", () => {
+      void this.showForceConfirm("forcePull")
     })
 
     this.updateRibbonIcon(!!(this.settings.githubToken && this.settings.githubOwner && this.settings.githubRepo))
@@ -103,13 +133,13 @@ export default class FastSync extends Plugin {
     // 注册命令
     this.addCommand({
       id: "init-all-files",
-      name: $("同步全部笔记(覆盖远端)"),
+      name: "GitHub Sync: Force Push (Overwrite Remote)",
       callback: () => StartupFullNotesForceOverSync(this),
     })
 
     this.addCommand({
       id: "sync-all-files",
-      name: $("同步全部笔记"),
+      name: "GitHub Sync: Sync",
       callback: () => StartupFullNotesSync(this),
     })
 
@@ -234,5 +264,113 @@ export default class FastSync extends Plugin {
     } catch (e) {
       console.error("Failed to update stats on GitHub", e);
     }
+  }
+
+  showSavedFeedback() {
+    if (this.saveNoticeTimeout) window.clearTimeout(this.saveNoticeTimeout);
+    this.saveNoticeTimeout = window.setTimeout(() => {
+      new Notice("GitHub Sync: Settings saved");
+    }, 800);
+  }
+
+  updateStatusBar() {
+    if (!this.settings.statusBarStatusEnabled) {
+      if (this.statusBarItem) {
+        this.statusBarItem.remove();
+        this.statusBarItem = null;
+      }
+      return;
+    }
+
+    if (!this.statusBarItem) {
+      this.statusBarItem = this.addStatusBarItem();
+    }
+    this.statusBarItem.empty();
+
+    const { status, pushCount, totalPush, pullCount, totalPull, lastSyncTime, errorMessage } = this.syncProgress;
+    let text = "";
+    let title = "";
+    let cls = "github-sync-status-bar";
+
+    if (this.isSyncInProgress || status === "syncing") {
+      text = `⏳ GH Sync: ↑${pushCount}/${totalPush} ↓${pullCount}/${totalPull}`;
+      title = "GitHub Sync: Syncing in progress...";
+      cls += " is-syncing";
+    } else if (status === "success") {
+      const timeStr = moment(lastSyncTime || Date.now()).format("HH:mm:ss");
+      const relativeTime = lastSyncTime ? moment(lastSyncTime).fromNow() : "just now";
+      text = `🟢 GH Sync (${relativeTime})`;
+      title = `GitHub Sync: Sync completed successfully at ${timeStr}.`;
+    } else if (status === "fail") {
+      text = "🔴 GH Sync (Failed)";
+      title = `GitHub Sync: Last sync failed. Error: ${errorMessage || "Unknown error"}`;
+    } else {
+      const timeStr = lastSyncTime ? moment(lastSyncTime).format("HH:mm:ss") : "Never";
+      const relativeTime = lastSyncTime ? moment(lastSyncTime).fromNow() : "Never";
+      text = `🟢 GH Sync (${relativeTime})`;
+      title = `GitHub Sync: Idle. Last sync: ${timeStr}.`;
+    }
+
+    const span = this.statusBarItem.createEl("span", { text, cls });
+    span.title = title;
+    span.onclick = () => {
+      if (!this.isSyncInProgress) {
+        StartupFullNotesSync(this);
+      }
+    };
+  }
+
+  async showForceConfirm(operation: "forcePush" | "forcePull"): Promise<void> {
+    await new Promise<void>((resolve) => {
+      const modal = new Modal(this.app)
+      const repo = `${this.settings.githubOwner}/${this.settings.githubRepo}`
+      const branch = this.settings.githubBranch || "main"
+      const localFileCount = this.app.vault.getFiles().filter(file => !file.path.startsWith(`${this.app.vault.configDir}/`)).length
+      const confirmPhrase = `${operation === "forcePush" ? "push" : "pull"} ${repo} ${branch}`
+      
+      const title = operation === "forcePush" ? "Force push local vault to remote?" : "Force pull remote vault to local?";
+      const message = operation === "forcePush" 
+        ? "Overwrite the remote state with this local vault. Remote files not present locally may be deleted." 
+        : "Overwrite this local vault with the remote state. Local synced files not present remotely will be deleted.";
+
+      modal.titleEl.setText(title)
+      modal.contentEl.createEl("p", { text: message })
+      modal.contentEl.createEl("p", { text: `Repository: ${repo}` })
+      modal.contentEl.createEl("p", { text: `Branch: ${branch}` })
+      modal.contentEl.createEl("p", { text: `Local vault files: ${localFileCount}` })
+      modal.contentEl.createEl("p", { text: `Type "${confirmPhrase}" to confirm.` })
+      
+      const input = modal.contentEl.createEl("input")
+      input.type = "text"
+      input.placeholder = confirmPhrase
+      
+      const buttons = modal.contentEl.createDiv()
+      buttons.createEl("button", { text: "Cancel" }).onclick = () => {
+        modal.close()
+        resolve()
+      }
+      
+      const confirmButton = buttons.createEl("button", { text: operation === "forcePush" ? "Force push" : "Force pull" })
+      confirmButton.addClass("mod-warning")
+      confirmButton.disabled = true
+      
+      input.oninput = () => {
+        confirmButton.disabled = input.value.trim() !== confirmPhrase
+      }
+      
+      confirmButton.onclick = () => {
+        if (input.value.trim() !== confirmPhrase) return
+        modal.close()
+        if (this.settings.encryptionMode === "encrypted") {
+          if (operation === "forcePush") void encryptedForcePush(this)
+          else void encryptedForcePull(this)
+        } else {
+          if (operation === "forcePush") void StartupFullNotesForceOverSync(this)
+          else new Notice("Force pull is not supported in plaintext mode.")
+        }
+        resolve()
+      }
+      modal.open()
+    })
   }
 }

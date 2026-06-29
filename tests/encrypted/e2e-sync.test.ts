@@ -690,6 +690,160 @@ test("plaintext full sync preserves local edits when remote changed since last s
   assert.equal(instance.syncData.files["Notes/a.md"].sha, remoteSha);
 });
 
+test("plaintext sync does not trigger conflict when local file is edited and synced twice consecutively", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault({ "Notes/a.md": "initial" });
+  const instance = plaintextPlugin(vault, github);
+
+  // Initial Sync
+  await syncAllFilesImpl(instance as never);
+  assert.equal(github.blobs.has("Notes/a.md"), true);
+  assert.equal(new TextDecoder().decode(GitHubClient.decodeContentBytes(github.blobs.get("Notes/a.md")!.content)), "initial");
+
+  // First edit
+  vault.files.set("Notes/a.md", new TextEncoder().encode("first edit"));
+  await syncAllFilesImpl(instance as never);
+  assert.equal(new TextDecoder().decode(GitHubClient.decodeContentBytes(github.blobs.get("Notes/a.md")!.content)), "first edit");
+  
+  // Verify no conflict copies created
+  assert.equal([...vault.files.keys()].some(p => p.includes(".sync-conflict-")), false);
+
+  // Second edit
+  vault.files.set("Notes/a.md", new TextEncoder().encode("second edit"));
+  await syncAllFilesImpl(instance as never);
+  assert.equal(new TextDecoder().decode(GitHubClient.decodeContentBytes(github.blobs.get("Notes/a.md")!.content)), "second edit");
+
+  // Verify STILL no conflict copies created
+  assert.equal([...vault.files.keys()].some(p => p.includes(".sync-conflict-")), false);
+});
+
+test("encrypted sync does not trigger conflict when local file is edited and synced twice consecutively", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault({ "Notes/a.md": "initial" });
+  const instance = plugin(vault, github);
+
+  // Enable encryption
+  instance.settings.encryptionMode = "encrypted";
+  instance.settings.encryptionPassphrase = "correct horse battery staple";
+
+  // Initial Sync (requires force push because remote is empty/new)
+  await encryptedForcePush(instance as never);
+  assert.equal(github.blobs.has(".obsidian-github-sync-encrypted/config.json"), true);
+
+  // First edit
+  vault.files.set("Notes/a.md", new TextEncoder().encode("first edit"));
+  await encryptedFullSync(instance as never);
+  
+  // Verify no conflict copies created
+  assert.equal([...vault.files.keys()].some(p => p.includes(".sync-conflict-")), false);
+
+  // Second edit
+  vault.files.set("Notes/a.md", new TextEncoder().encode("second edit"));
+  await encryptedFullSync(instance as never);
+
+  // Verify STILL no conflict copies created
+  assert.equal([...vault.files.keys()].some(p => p.includes(".sync-conflict-")), false);
+});
+
+test("plaintext manual sync cancels pending debounce auto-sync timers", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault({ "Notes/a.md": "initial" });
+  const instance = plaintextPlugin(vault, github);
+
+  // Initial Sync
+  await syncAllFilesImpl(instance as never);
+  assert.equal(github.blobs.has("Notes/a.md"), true);
+
+  // Simulate local modification trigger NoteModify
+  vault.files.set("Notes/a.md", new TextEncoder().encode("first edit"));
+  NoteModify(vault.getAbstractFileByPath("Notes/a.md") as TFile, instance as never, true);
+
+  // Verify debounce timer is scheduled
+  assert.equal(instance.debounceTimers.has("Notes/a.md"), true);
+
+  // Immediately run manual sync
+  await syncAllFilesImpl(instance as never);
+
+  // Verify debounce timer has been cancelled and cleared
+  assert.equal(instance.debounceTimers.has("Notes/a.md"), false);
+  assert.equal([...vault.files.keys()].some(p => p.includes(".sync-conflict-")), false);
+});
+
+test("encrypted manual sync cancels pending debounce auto-sync timers", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault({ "Notes/a.md": "initial" });
+  const instance = plugin(vault, github);
+
+  instance.settings.encryptionMode = "encrypted";
+  instance.settings.encryptionPassphrase = "correct horse battery staple";
+
+  // Initial Sync
+  await encryptedForcePush(instance as never);
+
+  // Simulate local modification trigger NoteModify
+  vault.files.set("Notes/a.md", new TextEncoder().encode("first edit"));
+  NoteModify(vault.getAbstractFileByPath("Notes/a.md") as TFile, instance as never, true);
+
+  // Verify debounce timer is scheduled
+  const debounceKey = `encrypted:Notes/a.md`;
+  assert.equal(instance.debounceTimers.has(debounceKey), true);
+
+  // Immediately run manual sync
+  await encryptedFullSync(instance as never);
+
+  // Verify debounce timer has been cancelled and cleared
+  assert.equal(instance.debounceTimers.has(debounceKey), false);
+  assert.equal([...vault.files.keys()].some(p => p.includes(".sync-conflict-")), false);
+});
+
+test("plaintext auto-sync performs isSyncInProgress concurrency check", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault({ "Notes/a.md": "initial" });
+  const instance = plaintextPlugin(vault, github);
+
+  // Initial sync
+  await syncAllFilesImpl(instance as never);
+
+  // Simulate local change
+  vault.files.set("Notes/a.md", new TextEncoder().encode("first edit"));
+
+  // Set sync in progress
+  instance.isSyncInProgress = true;
+
+  // Attempt auto-sync performSync
+  // It should exit early without pushing or changing stats
+  const putCountsBefore = github.putCounts.get("Notes/a.md") ?? 0;
+  await NoteModify(vault.getAbstractFileByPath("Notes/a.md") as TFile, instance as never, false); // eventEnter = false runs performSync immediately
+
+  assert.equal(github.putCounts.get("Notes/a.md") ?? 0, putCountsBefore);
+  instance.isSyncInProgress = false;
+});
+
+test("encrypted auto-sync performs isSyncInProgress concurrency check", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault({ "Notes/a.md": "initial" });
+  const instance = plugin(vault, github);
+  instance.settings.encryptionMode = "encrypted";
+  instance.settings.encryptionPassphrase = "correct horse battery staple";
+
+  // Initial sync
+  await encryptedForcePush(instance as never);
+
+  // Simulate local change
+  vault.files.set("Notes/a.md", new TextEncoder().encode("first edit"));
+
+  // Set sync in progress
+  instance.isSyncInProgress = true;
+
+  // Attempt auto-sync encryptedModify
+  const initialManifestSha = instance.syncData.encrypted?.manifestSha;
+  await NoteModify(vault.getAbstractFileByPath("Notes/a.md") as TFile, instance as never, false); // eventEnter = false runs encryptedModify immediately
+
+  // Manifest should not have been updated since auto-sync was skipped
+  assert.equal(instance.syncData.encrypted?.manifestSha, initialManifestSha);
+  instance.isSyncInProgress = false;
+});
+
 test("plaintext rename keeps old remote file if new upload fails", async () => {
   const github = new MemoryGitHub();
   const oldSha = await github.putFile("Notes/old.md", "old remote");

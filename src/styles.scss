@@ -149,3 +149,43 @@
         width: 100%; /* 移动端默认撑满宽度 */
     }
 }
+
+.github-sync-settings-header {
+  border-bottom: 2px solid var(--interactive-accent);
+  padding-bottom: 4px;
+  margin-top: 24px;
+  margin-bottom: 12px;
+  .setting-item-name {
+    font-size: 1.15em !important;
+    font-weight: bold !important;
+    color: var(--interactive-accent) !important;
+  }
+  .setting-item-description {
+    display: none;
+  }
+}
+
+.github-sync-settings-dirty-banner {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  background-color: var(--background-secondary-alt);
+  border: 1px solid var(--interactive-accent);
+  border-left: 5px solid var(--interactive-accent);
+  border-radius: var(--radius-m);
+  padding: var(--size-4-3) var(--size-4-5);
+  margin-bottom: var(--size-4-5);
+  
+  .github-sync-settings-dirty-text {
+    font-weight: bold;
+    color: var(--text-normal);
+  }
+  
+  .github-sync-settings-dirty-buttons {
+    display: flex;
+    gap: var(--size-4-2);
+    button {
+      margin-left: 4px;
+    }
+  }
+}

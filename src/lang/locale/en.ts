@@ -47,6 +47,14 @@ const en: Partial<LangMap> = {
   "使用 GitHub API 进行同步": "Sync using the GitHub API",
   "使用 GitHub 仓库存储和同步笔记": "Use a GitHub repository to store and sync notes",
   "用于访问 GitHub API 的 Personal Access Token": "Personal Access Token used to access the GitHub API",
+  "General Settings": "General Settings",
+  "GitHub Connection Settings": "GitHub Connection Settings",
+  "Encryption Settings": "Encryption Settings",
+  "Manual & Force Operations": "Manual & Force Operations",
+  "Automation & Exclusions": "Automation & Exclusions",
+  "Support & Debug": "Support & Debug",
+  "Show sync status in status bar": "Show sync status in status bar",
+  "Display real-time sync progress, last sync time, or errors in the Obsidian status bar. Disable (kill-switch) to save system resources.": "Display real-time sync progress, last sync time, or errors in the Obsidian status bar. Disable (kill-switch) to save system resources.",
 }
 
 export default en;
