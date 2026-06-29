@@ -421,7 +421,7 @@ export async function syncAllFilesImpl(plugin: FastSync): Promise<void> {
             } else {
               let buffer: ArrayBuffer;
               if (typeof finalContent === "string") {
-                buffer = GitHubClient.decodeContentBytes(finalContent).buffer;
+                buffer = GitHubClient.decodeContentBytes(finalContent).buffer as ArrayBuffer;
               } else {
                 buffer = finalContent;
               }

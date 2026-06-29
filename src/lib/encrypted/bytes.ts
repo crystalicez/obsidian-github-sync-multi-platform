@@ -98,5 +98,5 @@ export function randomBytes(length: number): Uint8Array {
 }
 
 export async function sha256Hex(value: ArrayBuffer | Uint8Array): Promise<string> {
-  return toHex(await crypto.subtle.digest("SHA-256", value));
+  return toHex(await crypto.subtle.digest("SHA-256", value as any));
 }

@@ -39,9 +39,9 @@ async function ensureVaultFolder(vault: Vault, folderPath: string): Promise<void
 export async function writeVaultFileBytes(vault: Vault, path: string, bytes: Uint8Array): Promise<void> {
   await ensureVaultFolder(vault, path.split("/").slice(0, -1).join("/"));
   const existing = vault.getAbstractFileByPath(path);
-  const buffer = (bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength)
+  const buffer = ((bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength)
     ? bytes.buffer
-    : bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+    : bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength)) as ArrayBuffer;
   if (existing instanceof TFile) await vault.modifyBinary(existing, buffer);
   else await vault.createBinary(path, buffer);
 }

@@ -43,6 +43,10 @@ const en: Partial<LangMap> = {
   "输入您的 GitHub 仓库名": "Enter your GitHub repository name",
   "输入您的 GitHub 分支名": "Enter your GitHub branch name (e.g., main)",
   "输入您的 GitHub 访问令牌": "Enter your GitHub personal access token",
+  "GitHub 同步配置": "GitHub sync configuration",
+  "使用 GitHub API 进行同步": "Sync using the GitHub API",
+  "使用 GitHub 仓库存储和同步笔记": "Use a GitHub repository to store and sync notes",
+  "用于访问 GitHub API 的 Personal Access Token": "Personal Access Token used to access the GitHub API",
 }
 
 export default en;
