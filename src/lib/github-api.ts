@@ -222,3 +222,12 @@ export class GitHubClient {
     return fromBase64(base64Content);
   }
 }
+
+export async function readGitHubFileBytes(github: GitHubClient, path: string): Promise<{ bytes: Uint8Array; sha: string } | null> {
+  if (typeof (github as GitHubClient & { getFileBytes?: GitHubClient["getFileBytes"] }).getFileBytes === "function") {
+    return (github as GitHubClient & { getFileBytes: GitHubClient["getFileBytes"] }).getFileBytes(path);
+  }
+  const file = await github.getFile(path);
+  if (!file) return null;
+  return { bytes: GitHubClient.decodeContentBytes(file.content), sha: file.sha };
+}

@@ -1,4 +1,4 @@
-import { GitHubClient } from "../github-api";
+import { GitHubClient, readGitHubFileBytes } from "../github-api";
 import { ENCRYPTED_CHUNK_PLAINTEXT_BYTES, GITHUB_RECOMMENDED_MAX_BYTES } from "./constants";
 import { decryptBytes, encryptBytes, EncryptedPayload } from "./crypto";
 import { objectPathForId } from "./paths";
@@ -59,16 +59,16 @@ export async function uploadEncryptedFileObject(
 
 export async function downloadEncryptedFileObject(github: GitHubClient, key: CryptoKey, record: EncryptedObjectRecord): Promise<Uint8Array> {
   if (record.storage !== "chunked") {
-    const remote = await github.getFile(record.objectPath);
+    const remote = await readGitHubFileBytes(github, record.objectPath);
     if (!remote) throw new Error(`Missing encrypted object: ${record.objectPath}`);
-    return decryptBytes(key, JSON.parse(GitHubClient.decodeContent(remote.content)) as EncryptedPayload);
+    return decryptBytes(key, JSON.parse(new TextDecoder().decode(remote.bytes)) as EncryptedPayload);
   }
 
   const parts: Uint8Array[] = [];
   for (const chunk of [...(record.chunks ?? [])].sort((a, b) => a.index - b.index)) {
-    const remote = await github.getFile(chunk.path);
+    const remote = await readGitHubFileBytes(github, chunk.path);
     if (!remote) throw new Error(`Missing encrypted chunk: ${chunk.path}`);
-    parts.push(await decryptBytes(key, JSON.parse(GitHubClient.decodeContent(remote.content)) as EncryptedPayload));
+    parts.push(await decryptBytes(key, JSON.parse(new TextDecoder().decode(remote.bytes)) as EncryptedPayload));
   }
   const total = parts.reduce((sum, part) => sum + part.byteLength, 0);
   const output = new Uint8Array(total);

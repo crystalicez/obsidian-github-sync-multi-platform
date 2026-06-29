@@ -9,7 +9,8 @@
     "devcss": "sass --watch src/styles.scss styles.css && tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
     "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
     "test": "node scripts/check-test-coverage.mjs && node scripts/run-tests.mjs",
-    "ver": "node ./scripts/update-version.js"
+    "ver": "node ./scripts/update-version.js",
+    "test:github-e2e": "node scripts/run-github-e2e.mjs"
   },
   "keywords": [],
   "repository": {

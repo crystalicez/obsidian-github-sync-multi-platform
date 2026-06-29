@@ -23,3 +23,7 @@ data.json
 .DS_Store
 /src/dist
 /src/views/dist
+
+# local secrets for real GitHub E2E tests
+.env.github-e2e
+.env.github-e2e.local
