@@ -40,6 +40,10 @@ class MemoryGitHub {
 
   async getFile(path: string) {
     this.getCounts.set(path, (this.getCounts.get(path) ?? 0) + 1);
+    if (path === ".obsidian-github-sync-encrypted") {
+      const exists = [...this.blobs.keys()].some(p => p.startsWith(".obsidian-github-sync-encrypted/"));
+      return exists ? [] as any : null;
+    }
     const item = this.blobs.get(path);
     if (!item) return null;
     return { content: item.content, sha: item.sha, path, size: item.content.length };
