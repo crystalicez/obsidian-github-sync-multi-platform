@@ -187,12 +187,14 @@ function snapshotToManifest(snapshot: EncryptedSnapshotManifest): EncryptedManif
   };
 }
 
-async function saveEncryptedSnapshotFromManifest(plugin: FastSync, key: CryptoKey, manifest: EncryptedManifest): Promise<string | undefined> {
+async function saveEncryptedSnapshotFromManifest(plugin: FastSync, key: CryptoKey, manifest: EncryptedManifest, options: { requireHeadCas?: boolean } = {}): Promise<string | undefined> {
   const snapshotStore = new EncryptedSnapshotStore(plugin.githubClient, key);
   const previousHead = await snapshotStore.loadHead();
   const snapshot = manifestToSnapshot(manifest, previousHead);
-  const written = await snapshotStore.writeSnapshot(snapshot);
-  return snapshotStore.updateHeadCas({ formatVersion: 2, snapshotId: written.snapshot.snapshotId, generation: written.snapshot.generation, updatedAt: Date.now() }, previousHead?.sha);
+  const head = { formatVersion: 2 as const, snapshotId: snapshot.snapshotId, generation: snapshot.generation, updatedAt: Date.now() };
+  const expectedHeadSha = options.requireHeadCas === false ? undefined : previousHead?.sha;
+  const written = await snapshotStore.writeSnapshotAndHeadAtomic(snapshot, head, expectedHeadSha);
+  return written.headSha;
 }
 
 function emptyEncryptedManifest(): EncryptedManifest {
@@ -412,7 +414,7 @@ async function encryptedSyncImpl(plugin: FastSync, options: EncryptedSyncOptions
       const forcePushResult = await pushEncryptedForceLocalChanges(plugin, key, manifest, ignoreRules);
       manifestChanged = forcePushResult.changed;
       packsToDeleteAfterSave = previousPacks.length > 0 ? previousPacks : forcePushResult.packsToDeleteAfterSave;
-      await saveEncryptedSnapshotFromManifest(plugin, key, manifest);
+      await saveEncryptedSnapshotFromManifest(plugin, key, manifest, { requireHeadCas: false });
     } else {
       if (manifest.packs && Object.keys(manifest.packs).length > 0) await pullEncryptedPackChanges(plugin, key, manifest, ignoreRules, false);
       await pullEncryptedChanges(plugin, key, manifest, false);

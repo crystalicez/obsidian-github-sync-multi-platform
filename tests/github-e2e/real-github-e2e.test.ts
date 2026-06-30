@@ -9,6 +9,7 @@ import { EncryptedSnapshotStore } from "../../src/lib/encrypted/snapshot-store";
 import type { EncryptedSnapshotManifest } from "../../src/lib/encrypted/snapshot-types";
 import { GitHubClient, GitHubConfig } from "../../src/lib/github-api";
 import { ENCRYPTED_CONFIG_PATH, ENCRYPTED_FORMAT_VERSION, ENCRYPTED_INDEX_MODE } from "../../src/lib/encrypted/constants";
+import { chooseRandomAction, chooseRandomSyncMode, readRandomActionConfig, readRandomActionLimits, type RandomActionKind, type RandomSyncMode } from "./random-actions";
 
 interface BenchRecord {
   name: string;
@@ -593,41 +594,53 @@ function cloneBytes(bytes: Uint8Array): Uint8Array {
   return new Uint8Array(bytes);
 }
 
-randomTest("github e2e: random real-usage actions preserve vault state", { timeout: envNumber("GITHUB_E2E_RANDOM_TIMEOUT_MS", envNumber("GITHUB_E2E_RANDOM_DURATION_MS", 600000) + 600000) }, async () => {
+type RandomEventOperation =
+  | { type: "modify"; path: string }
+  | { type: "delete"; path: string }
+  | { type: "rename"; oldPath: string; path: string };
+
+randomTest("github e2e: random real-usage actions preserve vault state", { timeout: envNumber("GITHUB_E2E_RANDOM_TIMEOUT_MS", 900000) }, async () => {
   const config = githubConfig();
   const client = await resetTestBranch(config);
-  const durationMs = envNumber("GITHUB_E2E_RANDOM_DURATION_MS", 600000);
+  const { actionCount, verifyEvery } = readRandomActionConfig(process.env);
   const seed = envNumber("GITHUB_E2E_RANDOM_SEED", Date.now() >>> 0);
   const random = new DeterministicRandom(seed);
-  const maxAddFiles = envNumber("GITHUB_E2E_RANDOM_MAX_ADD_FILES", 5000);
-  const maxEditFiles = envNumber("GITHUB_E2E_RANDOM_MAX_EDIT_FILES", 2000);
-  const maxEditChars = envNumber("GITHUB_E2E_RANDOM_MAX_EDIT_CHARS", 100);
-  const maxDeleteFiles = envNumber("GITHUB_E2E_RANDOM_MAX_DELETE_FILES", 2000);
-  const maxRenameFiles = envNumber("GITHUB_E2E_RANDOM_MAX_RENAME_FILES", 1000);
-  const maxMoveFiles = envNumber("GITHUB_E2E_RANDOM_MAX_MOVE_FILES", 1000);
-  const maxImages = envNumber("GITHUB_E2E_RANDOM_MAX_IMAGES", 25);
-  const loopMaxAddFiles = envNumber("GITHUB_E2E_RANDOM_LOOP_MAX_ADD_FILES", Math.min(maxAddFiles, 500));
-  const loopMaxEditFiles = envNumber("GITHUB_E2E_RANDOM_LOOP_MAX_EDIT_FILES", Math.min(maxEditFiles, 500));
-  const loopMaxDeleteFiles = envNumber("GITHUB_E2E_RANDOM_LOOP_MAX_DELETE_FILES", Math.min(maxDeleteFiles, 500));
-  const loopMaxRenameFiles = envNumber("GITHUB_E2E_RANDOM_LOOP_MAX_RENAME_FILES", Math.min(maxRenameFiles, 250));
-  const loopMaxMoveFiles = envNumber("GITHUB_E2E_RANDOM_LOOP_MAX_MOVE_FILES", Math.min(maxMoveFiles, 250));
-  const loopMaxImages = envNumber("GITHUB_E2E_RANDOM_LOOP_MAX_IMAGES", maxImages);
-  const verifyEvery = Math.floor(envNumber("GITHUB_E2E_RANDOM_VERIFY_EVERY", 0));
+  const { maxAddFiles, maxEditFiles, maxEditChars, maxDeleteFiles, maxRenameFiles, maxMoveFiles, maxImages, loopMaxAddFiles, loopMaxEditFiles, loopMaxDeleteFiles, loopMaxRenameFiles, loopMaxMoveFiles, loopMaxImages } = readRandomActionLimits(process.env);
   const source = new RealE2EVault();
   const expected = new Map<string, Uint8Array>();
   const instance = plugin(source, client) as never;
   let fileSerial = 0;
   let imageSerial = 0;
-  let step = 0;
 
   await resetRandomDebug();
-  await appendRandomDebug({ phase: "start", seed, durationMs, maxAddFiles, maxEditFiles, maxEditChars, maxDeleteFiles, maxRenameFiles, maxMoveFiles, maxImages, loopMaxAddFiles, loopMaxEditFiles, loopMaxDeleteFiles, loopMaxRenameFiles, loopMaxMoveFiles, loopMaxImages, verifyEvery });
+  await appendRandomDebug({ phase: "start", seed, actionCount, maxAddFiles, maxEditFiles, maxEditChars, maxDeleteFiles, maxRenameFiles, maxMoveFiles, maxImages, loopMaxAddFiles, loopMaxEditFiles, loopMaxDeleteFiles, loopMaxRenameFiles, loopMaxMoveFiles, loopMaxImages, verifyEvery });
   await measure("random.initialForcePush", () => encryptedForcePush(instance));
 
-  async function syncRandomStep(action: string, changedCount: number, samples: string[]): Promise<void> {
-    const afterMutation = { files: expected.size, bytes: randomTotalBytes(expected), changedCount, samples };
-    await appendRandomDebug({ phase: "after-mutation-before-sync", step, action, afterMutation });
-    await measure(`random.step.${step}.${action}`, () => encryptedFullSync(instance), { step, action, files: afterMutation.files, bytes: afterMutation.bytes });
+  async function runEventOperation(event: RandomEventOperation): Promise<void> {
+    if (event.type === "modify") {
+      const file = source.getAbstractFileByPath(event.path);
+      assert.ok(file instanceof TFile, `Expected modified file to exist: ${event.path}`);
+      await encryptedModify(file, instance, true);
+      return;
+    }
+    if (event.type === "delete") {
+      await encryptedDelete(event.path, instance, true);
+      return;
+    }
+    await encryptedRename(event.path, event.oldPath, instance, true);
+  }
+
+  async function syncRandomStep(step: number, action: RandomActionKind, changedCount: number, samples: string[], events: RandomEventOperation[]): Promise<void> {
+    const syncMode: RandomSyncMode = chooseRandomSyncMode(action, changedCount, random);
+    const afterMutation = { files: expected.size, bytes: randomTotalBytes(expected), changedCount, samples, syncMode };
+    await appendRandomDebug({ phase: "after-mutation-before-sync", step, action, afterMutation, events: events.slice(0, 10) });
+    await measure(`random.step.${step}.${action}.${syncMode}`, async () => {
+      if (syncMode === "event" && events.length > 0) {
+        for (const event of events) await runEventOperation(event);
+      } else {
+        await encryptedFullSync(instance);
+      }
+    }, { step, action, syncMode, files: afterMutation.files, bytes: afterMutation.bytes, changedCount });
     if (verifyEvery > 0 && step % verifyEvery === 0) {
       const pulled = new RealE2EVault();
       await measure(`random.verify.${step}`, () => encryptedForcePull(plugin(pulled, client) as never), { step, expectedFiles: expected.size });
@@ -639,62 +652,12 @@ randomTest("github e2e: random real-usage actions preserve vault state", { timeo
     }
   }
 
-  step += 1;
-  await appendRandomDebug({ phase: "before", step, action: "mandatoryAddFiles", before: { files: expected.size, bytes: randomTotalBytes(expected) } });
-  {
-    const samples: string[] = [];
-    for (let index = 0; index < maxAddFiles; index++) {
-      const filePath = `notes/bulk/note-${String(fileSerial++).padStart(6, "0")}-${random.int(0, 999999)}.md`;
-      const bytes = new TextEncoder().encode(randomAscii(random, random.int(1, Math.max(1, maxEditChars))));
-      source.set(filePath, bytes);
-      expected.set(filePath, cloneBytes(bytes));
-      if (samples.length < 10) samples.push(filePath);
-    }
-    await syncRandomStep("mandatoryAddFiles", maxAddFiles, samples);
-  }
-
-  step += 1;
-  await appendRandomDebug({ phase: "before", step, action: "mandatoryEditText", before: { files: expected.size, bytes: randomTotalBytes(expected) } });
-  {
-    const samples: string[] = [];
-    const textPaths = [...expected.keys()].filter(filePath => /\.(md|txt)$/iu.test(filePath));
-    const count = Math.min(textPaths.length, maxEditFiles);
-    for (let index = 0; index < count; index++) {
-      const filePath = textPaths[index];
-      const current = new TextDecoder().decode(expected.get(filePath) ?? new Uint8Array());
-      const next = `${current}${randomAscii(random, Math.max(1, maxEditChars))}`;
-      const bytes = new TextEncoder().encode(next);
-      source.set(filePath, bytes);
-      expected.set(filePath, cloneBytes(bytes));
-      if (samples.length < 10) samples.push(filePath);
-    }
-    await syncRandomStep("mandatoryEditText", count, samples);
-  }
-
-  step += 1;
-  await appendRandomDebug({ phase: "before", step, action: "mandatoryDeleteFiles", before: { files: expected.size, bytes: randomTotalBytes(expected) } });
-  {
-    const samples: string[] = [];
-    const paths = [...expected.keys()];
-    const count = Math.min(paths.length, maxDeleteFiles);
-    for (let index = 0; index < count; index++) {
-      const filePath = paths[index];
-      source.files.delete(filePath);
-      source.mtimes.delete(filePath);
-      expected.delete(filePath);
-      if (samples.length < 10) samples.push(filePath);
-    }
-    await syncRandomStep("mandatoryDeleteFiles", count, samples);
-  }
-
-  const started = performance.now();
-  while (performance.now() - started < durationMs) {
-    step += 1;
+  for (let step = 1; step <= actionCount; step++) {
     const existingPaths = [...expected.keys()];
     const textPaths = existingPaths.filter(filePath => /\.(md|txt)$/iu.test(filePath));
-    const actionPool = existingPaths.length === 0 ? ["addFiles"] : ["addFiles", "editText", "addImages", "deleteFiles", "renameFiles", "moveFiles"];
-    const action = random.pick(actionPool);
+    const action = chooseRandomAction(existingPaths.length, random);
     const samples: string[] = [];
+    const events: RandomEventOperation[] = [];
     const before = { files: expected.size, bytes: randomTotalBytes(expected) };
 
     await appendRandomDebug({ phase: "before", step, action, before });
@@ -707,6 +670,7 @@ randomTest("github e2e: random real-usage actions preserve vault state", { timeo
         const bytes = new TextEncoder().encode(randomAscii(random, random.int(1, Math.max(1, maxEditChars))));
         source.set(filePath, bytes);
         expected.set(filePath, cloneBytes(bytes));
+        events.push({ type: "modify", path: filePath });
         if (samples.length < 5) samples.push(filePath);
       }
     } else if (action === "editText" && textPaths.length > 0) {
@@ -722,6 +686,7 @@ randomTest("github e2e: random real-usage actions preserve vault state", { timeo
         const bytes = new TextEncoder().encode(next);
         source.set(filePath, bytes);
         expected.set(filePath, cloneBytes(bytes));
+        events.push({ type: "modify", path: filePath });
         if (samples.length < 5) samples.push(filePath);
       }
     } else if (action === "addImages") {
@@ -732,6 +697,7 @@ randomTest("github e2e: random real-usage actions preserve vault state", { timeo
         const bytes = randomImageBytes(random, random.int(1024, 64 * 1024));
         source.set(filePath, bytes);
         expected.set(filePath, cloneBytes(bytes));
+        events.push({ type: "modify", path: filePath });
         if (samples.length < 5) samples.push(filePath);
       }
     } else if (action === "deleteFiles" && existingPaths.length > 0) {
@@ -742,6 +708,7 @@ randomTest("github e2e: random real-usage actions preserve vault state", { timeo
         source.files.delete(filePath);
         source.mtimes.delete(filePath);
         expected.delete(filePath);
+        events.push({ type: "delete", path: filePath });
         if (samples.length < 5) samples.push(filePath);
       }
     } else if ((action === "renameFiles" || action === "moveFiles") && existingPaths.length > 0) {
@@ -761,20 +728,20 @@ randomTest("github e2e: random real-usage actions preserve vault state", { timeo
         source.set(newPath, cloneBytes(bytes));
         expected.delete(oldPath);
         expected.set(newPath, cloneBytes(bytes));
+        events.push({ type: "rename", oldPath, path: newPath });
         if (samples.length < 5) samples.push(`${oldPath} -> ${newPath}`);
       }
     }
 
-    await syncRandomStep(action, changedCount, samples);
+    await syncRandomStep(step, action, changedCount, samples, events);
   }
 
   const pulled = new RealE2EVault();
   await measure("random.finalVerify", () => encryptedForcePull(plugin(pulled, client) as never), { expectedFiles: expected.size });
   const comparison = mapsEqualBytes(pulled.files, expected);
-  await appendRandomDebug({ phase: "complete", seed, steps: step, files: expected.size, bytes: randomTotalBytes(expected), comparison });
+  await appendRandomDebug({ phase: "complete", seed, steps: actionCount, files: expected.size, bytes: randomTotalBytes(expected), comparison });
   assert.equal(comparison.ok, true, comparison.ok ? undefined : comparison.reason);
-});
-benchmarkTest("github e2e: benchmark large chunked object on real GitHub", { timeout: 600000 }, async () => {
+});benchmarkTest("github e2e: benchmark large chunked object on real GitHub", { timeout: 600000 }, async () => {
   const config = githubConfig();
   const client = await resetTestBranch(config);
   const largeMiB = Number(process.env.GITHUB_E2E_LARGE_MIB ?? "51");

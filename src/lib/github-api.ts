@@ -1,5 +1,6 @@
 import { requestUrl } from "obsidian";
 import { bytesToUtf8, fromBase64, toBase64, utf8ToBytes } from "./encrypted/bytes";
+import type { GitHubCreateTreeEntry, GitHubGitCommit, GitHubGitRef } from "./github-git-types";
 
 export interface GitHubConfig {
   owner: string;
@@ -271,6 +272,91 @@ export class GitHubClient {
       return response.json as GitHubTree;
     }
     throw new Error(`Failed to get tree: HTTP ${response.status} - ${response.text}`);
+  }
+
+
+  private branchRefPath(): string {
+    return this.config.branch.split("/").map(encodeURIComponent).join("/");
+  }
+
+  private gitHttpError(action: string, status: number, text: string): Error & { status?: number } {
+    const error = new Error(`${action}: HTTP ${status} - ${text}`) as Error & { status?: number };
+    error.status = status;
+    return error;
+  }
+
+  async getGitRef(): Promise<GitHubGitRef> {
+    const response = await requestUrl({
+      url: `${this.baseUrl}/git/ref/heads/${this.branchRefPath()}?_=${Date.now()}`,
+      method: "GET",
+      headers: this.headers,
+      throw: false,
+    });
+    if (response.status !== 200) throw this.gitHttpError("Failed to get git ref", response.status, response.text);
+    const json = response.json as { ref?: string; object?: { sha?: string; type?: string } };
+    return { ref: json.ref ?? `refs/heads/${this.config.branch}`, sha: json.object?.sha ?? "", type: json.object?.type ?? "commit" };
+  }
+
+
+  async getGitCommit(sha: string): Promise<GitHubGitCommit> {
+    const response = await requestUrl({
+      url: `${this.baseUrl}/git/commits/${encodeURIComponent(sha)}?_=${Date.now()}`,
+      method: "GET",
+      headers: this.headers,
+      throw: false,
+    });
+    if (response.status !== 200) throw this.gitHttpError("Failed to get git commit", response.status, response.text);
+    const json = response.json as { sha?: string; tree?: { sha?: string }; parents?: Array<{ sha?: string }> };
+    return { sha: json.sha ?? sha, treeSha: json.tree?.sha ?? "", parentShas: (json.parents ?? []).map(parent => parent.sha ?? "").filter(Boolean) };
+  }
+  async createGitBlob(content: Uint8Array | ArrayBuffer): Promise<string> {
+    const bytes = content instanceof Uint8Array ? content : new Uint8Array(content);
+    const response = await requestUrl({
+      url: `${this.baseUrl}/git/blobs`,
+      method: "POST",
+      headers: this.headers,
+      body: JSON.stringify({ content: toBase64(bytes), encoding: "base64" }),
+      throw: false,
+    });
+    if (response.status !== 201) throw this.gitHttpError("Failed to create git blob", response.status, response.text);
+    return (response.json as { sha?: string }).sha ?? "";
+  }
+
+  async createGitTree(tree: GitHubCreateTreeEntry[], baseTree?: string): Promise<string> {
+    const body: { tree: GitHubCreateTreeEntry[]; base_tree?: string } = { tree };
+    if (baseTree) body.base_tree = baseTree;
+    const response = await requestUrl({
+      url: `${this.baseUrl}/git/trees`,
+      method: "POST",
+      headers: this.headers,
+      body: JSON.stringify(body),
+      throw: false,
+    });
+    if (response.status !== 201) throw this.gitHttpError("Failed to create git tree", response.status, response.text);
+    return (response.json as { sha?: string }).sha ?? "";
+  }
+
+  async createGitCommit(message: string, tree: string, parents: string[]): Promise<string> {
+    const response = await requestUrl({
+      url: `${this.baseUrl}/git/commits`,
+      method: "POST",
+      headers: this.headers,
+      body: JSON.stringify({ message, tree, parents }),
+      throw: false,
+    });
+    if (response.status !== 201) throw this.gitHttpError("Failed to create git commit", response.status, response.text);
+    return (response.json as { sha?: string }).sha ?? "";
+  }
+
+  async updateGitRef(sha: string, _expectedSha?: string): Promise<void> {
+    const response = await requestUrl({
+      url: `${this.baseUrl}/git/refs/heads/${this.branchRefPath()}`,
+      method: "PATCH",
+      headers: this.headers,
+      body: JSON.stringify({ sha, force: false }),
+      throw: false,
+    });
+    if (response.status !== 200) throw this.gitHttpError("Failed to update git ref", response.status, response.text);
   }
 
   // Helper to decode base64 content from GitHub

@@ -1,5 +1,6 @@
 import { GitHubClient, readGitHubFileBytes } from "../github-api";
-import { bytesToUtf8, randomBytes, toBase64Url } from "./bytes";
+import { commitGitTreeChanges, GitAtomicRefConflictError } from "../v3/git-atomic-writer";
+import { bytesToUtf8, randomBytes, toBase64Url, utf8ToBytes } from "./bytes";
 import { decryptJson, encryptJson } from "./crypto";
 import { WrongPassphraseError } from "./sync-errors";
 import type { EncryptedSnapshotHead, EncryptedSnapshotManifest, StoredEncryptedSnapshot, StoredEncryptedSnapshotHead } from "./snapshot-types";
@@ -24,6 +25,31 @@ function isCasFailure(error: unknown): boolean {
   return maybe?.status === 409 || maybe?.status === 412 || /stale|conflict|409|sha/i.test(maybe?.message ?? "");
 }
 
+
+interface RecentSnapshotWrite {
+  commitSha: string;
+  files: Map<string, { bytes: Uint8Array; sha: string }>;
+}
+
+const recentSnapshotWrites = new WeakMap<object, RecentSnapshotWrite>();
+
+async function readRecentSnapshotWrite(github: object, path: string): Promise<{ bytes: Uint8Array; sha: string } | null> {
+  const recent = recentSnapshotWrites.get(github);
+  if (!recent) return null;
+  const getGitRef = (github as { getGitRef?: () => Promise<{ sha: string }> }).getGitRef;
+  if (typeof getGitRef === "function") {
+    const ref = await getGitRef.call(github);
+    if (ref.sha !== recent.commitSha) {
+      recentSnapshotWrites.delete(github);
+      return null;
+    }
+  }
+  return recent.files.get(path) ?? null;
+}
+
+function rememberRecentSnapshotWrite(github: object, commitSha: string, files: Array<{ path: string; bytes: Uint8Array; sha: string }>): void {
+  recentSnapshotWrites.set(github, { commitSha, files: new Map(files.map(file => [file.path, { bytes: file.bytes, sha: file.sha }])) });
+}
 function snapshotPath(snapshotId: string): string {
   return `${V2_SNAPSHOTS_ROOT}/${snapshotId}.enc`;
 }
@@ -44,6 +70,8 @@ export class EncryptedSnapshotStore {
   constructor(private readonly github: GitHubClient, private readonly key: CryptoKey) {}
 
   async loadHead(): Promise<StoredEncryptedSnapshotHead | null> {
+    const cached = await readRecentSnapshotWrite(this.github, V2_HEAD_PATH);
+    if (cached) return { head: await decryptSnapshotJson<EncryptedSnapshotHead>(this.key, bytesToUtf8(cached.bytes)), sha: cached.sha };
     const remote = await readGitHubFileBytes(this.github, V2_HEAD_PATH);
     if (!remote) return null;
     return { head: await decryptSnapshotJson<EncryptedSnapshotHead>(this.key, bytesToUtf8(remote.bytes)), sha: remote.sha };
@@ -69,8 +97,64 @@ export class EncryptedSnapshotStore {
     return { snapshot, path, sha };
   }
 
+
+  async writeSnapshotAndHeadAtomic(input: EncryptedSnapshotManifest, head: EncryptedSnapshotHead, expectedHeadSha?: string): Promise<StoredEncryptedSnapshot & { headSha: string }> {
+    const snapshot = ensureSnapshotId(input);
+    const path = snapshotPath(snapshot.snapshotId);
+    const encryptedSnapshot = await encryptJson(this.key, snapshot);
+    const encryptedHead = await encryptJson(this.key, head);
+    const github = this.github as SnapshotGitHubClient & {
+      getGitRef?: unknown;
+      getTree?: unknown;
+      createGitBlob?: unknown;
+      createGitTree?: unknown;
+      createGitCommit?: unknown;
+      updateGitRef?: unknown;
+    };
+    const hasGitApi = typeof github.getGitRef === "function"
+      && typeof github.getTree === "function"
+      && typeof github.createGitBlob === "function"
+      && typeof github.createGitTree === "function"
+      && typeof github.createGitCommit === "function"
+      && typeof github.updateGitRef === "function";
+
+    if (hasGitApi) {
+      const snapshotBytes = utf8ToBytes(encryptedSnapshot);
+      const headBytes = utf8ToBytes(encryptedHead);
+      const maxAttempts = expectedHeadSha ? 1 : 3;
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+          const result = await commitGitTreeChanges(github as any, {
+            message: `sync: encrypted snapshot ${snapshot.snapshotId}`,
+            files: [
+              { path, bytes: snapshotBytes },
+              { path: V2_HEAD_PATH, bytes: headBytes },
+            ],
+          });
+          rememberRecentSnapshotWrite(this.github, result.commitSha, [
+            { path, bytes: snapshotBytes, sha: result.fileShas[path] },
+            { path: V2_HEAD_PATH, bytes: headBytes, sha: result.fileShas[V2_HEAD_PATH] },
+          ]);
+          return { snapshot, path, sha: result.fileShas[path], headSha: result.fileShas[V2_HEAD_PATH] };
+        } catch (error) {
+          const isConflict = error instanceof GitAtomicRefConflictError || isCasFailure(error);
+          if (isConflict && attempt < maxAttempts) continue;
+          if (isConflict) throw new SnapshotHeadCasError();
+          throw error;
+        }
+      }
+    }
+
+    const written = await this.writeSnapshot(snapshot);
+    const headSha = await this.updateHeadCas(head, expectedHeadSha);
+    return { ...written, headSha };
+  }
+
   async loadSnapshot(snapshotId: string): Promise<EncryptedSnapshotManifest | null> {
-    const remote = await readGitHubFileBytes(this.github, snapshotPath(snapshotId));
+    const path = snapshotPath(snapshotId);
+    const cached = await readRecentSnapshotWrite(this.github, path);
+    if (cached) return decryptSnapshotJson<EncryptedSnapshotManifest>(this.key, bytesToUtf8(cached.bytes));
+    const remote = await readGitHubFileBytes(this.github, path);
     if (!remote) return null;
     return decryptSnapshotJson<EncryptedSnapshotManifest>(this.key, bytesToUtf8(remote.bytes));
   }

@@ -132,3 +132,119 @@ test("snapshot store reports wrong passphrase for undecryptable v2 metadata", as
   await assert.rejects(() => wrong.loadHead(), WrongPassphraseError);
   await assert.rejects(() => wrong.loadSnapshot("secret-snap"), WrongPassphraseError);
 });
+
+class SnapshotGitAtomicMemoryGitHub extends SnapshotMemoryGitHub {
+  pendingBlobs = new Map<string, string>();
+  commits: Array<{ message: string; tree: string; parents: string[] }> = [];
+  trees: Array<{ tree: Array<{ path: string; sha?: string | null }>; baseTree?: string }> = [];
+  updatedRefs: Array<{ sha: string; expectedSha?: string }> = [];
+  headCommitSha = "commit-0";
+  failUpdateStatus?: number;
+  failUpdateStatusOnce?: number;
+
+  async getGitRef() {
+    return { ref: "refs/heads/main", sha: this.headCommitSha, type: "commit" };
+  }
+
+  async getTree() {
+    return { sha: "tree-current", url: "", truncated: false, tree: [] };
+  }
+
+  async createGitBlob(bytes: Uint8Array) {
+    const sha = `git-blob-${++this.counter}`;
+    this.pendingBlobs.set(sha, new TextDecoder().decode(bytes));
+    return sha;
+  }
+
+  async createGitTree(tree: Array<{ path: string; sha?: string | null }>, baseTree?: string) {
+    this.trees.push({ tree, baseTree });
+    for (const entry of tree) {
+      if (entry.sha === null) {
+        this.blobs.delete(entry.path);
+      } else if (entry.sha) {
+        const content = this.pendingBlobs.get(entry.sha);
+        if (content !== undefined) this.blobs.set(entry.path, { content, sha: entry.sha });
+      }
+    }
+    return `git-tree-${this.trees.length}`;
+  }
+
+  async createGitCommit(message: string, tree: string, parents: string[]) {
+    this.commits.push({ message, tree, parents });
+    return `git-commit-${this.commits.length}`;
+  }
+
+  async updateGitRef(sha: string, expectedSha?: string) {
+    if (this.failUpdateStatusOnce) {
+      const status = this.failUpdateStatusOnce;
+      this.failUpdateStatusOnce = undefined;
+      const error = new Error("transient stale git ref") as Error & { status?: number };
+      error.status = status;
+      throw error;
+    }
+    if (this.failUpdateStatus) {
+      const error = new Error("stale git ref") as Error & { status?: number };
+      error.status = this.failUpdateStatus;
+      throw error;
+    }
+    this.updatedRefs.push({ sha, expectedSha });
+    this.headCommitSha = sha;
+  }
+}
+
+test("snapshot store can write snapshot and head in one atomic Git commit", async () => {
+  const github = new SnapshotGitAtomicMemoryGitHub();
+  const store = new EncryptedSnapshotStore(github as unknown as GitHubClient, await snapshotKey());
+  const snapshot = sampleSnapshot("atomic-snap", 1);
+
+  const written = await store.writeSnapshotAndHeadAtomic(snapshot, { formatVersion: 2, snapshotId: snapshot.snapshotId, generation: 1, updatedAt: 2 });
+  const loadedHead = await store.loadHead();
+  const loadedSnapshot = await store.loadSnapshot(snapshot.snapshotId);
+
+  assert.equal(github.commits.length, 1);
+  assert.equal(github.trees.length, 1);
+  assert.deepEqual(github.updatedRefs, [{ sha: "git-commit-1", expectedSha: "commit-0" }]);
+  assert.equal(written.headSha, github.blobs.get(V2_HEAD_PATH)?.sha);
+  assert.equal(loadedHead?.head.snapshotId, snapshot.snapshotId);
+  assert.deepEqual(loadedSnapshot, snapshot);
+});
+
+test("snapshot atomic write maps stale Git ref to SnapshotHeadCasError", async () => {
+  const github = new SnapshotGitAtomicMemoryGitHub();
+  github.failUpdateStatus = 409;
+  const store = new EncryptedSnapshotStore(github as unknown as GitHubClient, await snapshotKey());
+  const snapshot = sampleSnapshot("atomic-stale", 1);
+  await assert.rejects(
+    () => store.writeSnapshotAndHeadAtomic(snapshot, { formatVersion: 2, snapshotId: snapshot.snapshotId, generation: 1, updatedAt: 2 }, "expected-head"),
+    SnapshotHeadCasError,
+  );
+});
+
+test("snapshot atomic write retries a transient Git ref conflict when no expected head is required", async () => {
+  const github = new SnapshotGitAtomicMemoryGitHub();
+  github.failUpdateStatusOnce = 409;
+  const store = new EncryptedSnapshotStore(github as unknown as GitHubClient, await snapshotKey());
+  const snapshot = sampleSnapshot("atomic-retry", 1);
+
+  const written = await store.writeSnapshotAndHeadAtomic(snapshot, { formatVersion: 2, snapshotId: snapshot.snapshotId, generation: 1, updatedAt: 2 });
+
+  assert.equal(github.commits.length, 2);
+  assert.equal(github.updatedRefs.length, 1);
+  assert.equal(written.snapshot.snapshotId, snapshot.snapshotId);
+});
+test("snapshot atomic write serves fresh metadata from cache while GitHub contents reads lag", async () => {
+  const github = new SnapshotGitAtomicMemoryGitHub();
+  const store = new EncryptedSnapshotStore(github as unknown as GitHubClient, await snapshotKey());
+  const snapshot = sampleSnapshot("atomic-cache", 1);
+
+  await store.writeSnapshotAndHeadAtomic(snapshot, { formatVersion: 2, snapshotId: snapshot.snapshotId, generation: 1, updatedAt: 2 });
+  github.blobs.clear();
+
+  const loadedHead = await store.loadHead();
+  const loadedSnapshot = await store.loadSnapshot(snapshot.snapshotId);
+  assert.equal(loadedHead?.head.snapshotId, snapshot.snapshotId);
+  assert.deepEqual(loadedSnapshot, snapshot);
+
+  github.headCommitSha = "external-commit";
+  assert.equal(await store.loadHead(), null);
+});
