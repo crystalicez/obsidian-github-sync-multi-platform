@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { modalButtons, modalEvents, Notice, resetModalTestState, TFile } from "obsidian";
 import { encryptedDelete, encryptedForcePull, encryptedForcePush, encryptedFullSync, encryptedModify, encryptedRename } from "../../src/lib/encrypted/sync-engine";
-import { NoteModify, NoteRename, overrideRemoteAllFilesImpl, syncAllFilesImpl } from "../../src/lib/fs";
+import { NoteDelete, NoteModify, NoteRename, overrideLocalAllFilesImpl, overrideRemoteAllFilesImpl, syncAllFilesImpl } from "../../src/lib/fs";
 import { hashContent } from "../../src/lib/helps";
 import { GitHubClient } from "../../src/lib/github-api";
 import { EncryptedManifestStore } from "../../src/lib/encrypted/manifest-store";
@@ -91,6 +91,9 @@ class StrictFolderVault {
     });
   }
 
+  getMarkdownFiles() {
+    return this.getFiles().filter(file => file.extension === "md");
+  }
   getAbstractFileByPath(path: string) {
     const bytes = this.files.get(path);
     if (bytes) {
@@ -155,6 +158,9 @@ class MemoryVault {
     });
   }
 
+  getMarkdownFiles() {
+    return this.getFiles().filter(file => file.extension === "md");
+  }
   getAbstractFileByPath(path: string) {
     const bytes = this.files.get(path);
     if (!bytes) return null;
@@ -942,6 +948,113 @@ test("plaintext full sync skips unchanged cached markdown reads at scale", async
   assert.equal(vault.readBinaryCount, 0);
   assert.equal(github.putCounts.size, 0);
 });
+test("plaintext fast path ignores plugin stats metadata and does not rescan unchanged vaults", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault({ "Notes/a.md": "stable" });
+  const instance = plaintextPlugin(vault, github);
+  const file = vault.getAbstractFileByPath("Notes/a.md") as TFile;
+  const sha = await github.putFile("Notes/a.md", "stable");
+  instance.syncData.files["Notes/a.md"] = { sha, lastSync: Date.now(), hash: hashContent("stable"), size: file.stat.size, mtime: file.stat.mtime };
+  instance.syncData.files[".obsidian/sync-stats.json"] = { sha: "stats-sha", lastSync: Date.now() };
+  instance.syncData.lastRemoteHeadSha = github.headSha;
+  let statsCalls = 0;
+  instance.updateStats = async () => {
+    statsCalls += 1;
+    for (const markdown of vault.getMarkdownFiles()) await vault.read(markdown);
+  };
+  vault.readCount = 0;
+  vault.getFilesCount = 0;
+  github.getTreeCount = 0;
+
+  await syncAllFilesImpl(instance as never);
+
+  assert.equal(github.getTreeCount, 0);
+  assert.equal(vault.readCount, 0);
+  assert.equal(statsCalls, 0);
+});
+
+test("plaintext force pull mirrors remote files to local vault", async () => {
+  const github = new MemoryGitHub();
+  await github.putFile("Notes/a.md", "remote");
+  await github.putFile("Notes/Nested/b.md", "nested remote");
+  const vault = new MemoryVault({ "Notes/a.md": "local", "Notes/local-only.md": "delete me" });
+  const instance = plaintextPlugin(vault, github);
+
+  await overrideLocalAllFilesImpl(instance as never);
+
+  assert.equal(new TextDecoder().decode(vault.files.get("Notes/a.md")), "remote");
+  assert.equal(new TextDecoder().decode(vault.files.get("Notes/Nested/b.md")), "nested remote");
+  assert.equal(vault.files.has("Notes/local-only.md"), false);
+});
+
+test("plaintext force pull respects ignore path regex for remote downloads and local deletes", async () => {
+  const github = new MemoryGitHub();
+  await github.putFile("Notes/a.md", "remote");
+  await github.putFile("Archive/ignored.md", "remote ignored");
+  const vault = new MemoryVault({ "Archive/local.md": "keep ignored local" });
+  const instance = plaintextPlugin(vault, github);
+  instance.settings.ignorePathRegex = "^Archive/";
+
+  await overrideLocalAllFilesImpl(instance as never);
+
+  assert.equal(vault.files.has("Archive/ignored.md"), false);
+  assert.equal(new TextDecoder().decode(vault.files.get("Archive/local.md")), "keep ignored local");
+  assert.equal(new TextDecoder().decode(vault.files.get("Notes/a.md")), "remote");
+});
+test("plaintext rename debounce cleanup supports paths containing colons", () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault({ "Notes/a:b-new.md": "content" });
+  const instance = plaintextPlugin(vault, github);
+  instance.isTesting = false;
+  const originalSetTimeout = globalThis.setTimeout;
+  const originalClearTimeout = globalThis.clearTimeout;
+  let nextTimer = 1;
+  const cleared = new Set<number>();
+  globalThis.setTimeout = ((callback: () => void) => nextTimer++ as unknown as ReturnType<typeof setTimeout>) as typeof setTimeout;
+  globalThis.clearTimeout = ((timer: number) => { cleared.add(timer); }) as typeof clearTimeout;
+
+  try {
+    NoteRename(vault.getAbstractFileByPath("Notes/a:b-new.md") as TFile, "Notes/a:b.md", instance as never, true);
+    assert.equal([...instance.debounceTimers.keys()].some(key => key.includes("Notes/a:b.md")), true);
+
+    NoteDelete({ path: "Notes/a:b.md" } as never, instance as never, true);
+
+    assert.equal([...instance.debounceTimers.keys()].some(key => key.includes("Notes/a:b-new.md")), false);
+    assert.equal(cleared.size > 0, true);
+  } finally {
+    globalThis.setTimeout = originalSetTimeout;
+    globalThis.clearTimeout = originalClearTimeout;
+  }
+});
+
+test("encrypted conflict handling does not log plaintext metadata by default", async () => {
+  const github = new MemoryGitHub();
+  const remoteVault = new MemoryVault({ "Secret/path.md": "remote base" });
+  await encryptedForcePush(plugin(remoteVault, github) as never);
+
+  remoteVault.set("Secret/path.md", new TextEncoder().encode("remote changed"));
+  await encryptedForcePush(plugin(remoteVault, github) as never);
+
+  const localVault = new MemoryVault({ "Secret/path.md": "local changed" });
+  const instance = plugin(localVault, github);
+  const logLines: string[] = [];
+  const warnLines: string[] = [];
+  const originalLog = console.log;
+  const originalWarn = console.warn;
+  console.log = (...args: unknown[]) => { logLines.push(args.map(String).join(" ")); };
+  console.warn = (...args: unknown[]) => { warnLines.push(args.map(String).join(" ")); };
+
+  try {
+    await encryptedModify(localVault.getAbstractFileByPath("Secret/path.md") as TFile, instance as never, true);
+  } finally {
+    console.log = originalLog;
+    console.warn = originalWarn;
+  }
+
+  const combined = [...logLines, ...warnLines].join("\n");
+  assert.equal(combined.includes("Secret/path.md"), false);
+  assert.equal(combined.includes("plaintextSha256"), false);
+});
 test("plaintext full sync falls back to tree sync when remote head lookup fails", async () => {
   const github = new MemoryGitHub();
   const vault = new MemoryVault({ "Notes/a.md": "stable" });
@@ -1020,6 +1133,83 @@ test("force push asks before initializing a foreign non-empty remote", async () 
   assert.equal(github.blobs.has(".obsidian-github-sync-encrypted/config.json"), true);
 });
 
+test("encrypted local change in a 2000-file vault migrates to pack mode instead of continuing single-object uploads", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault(manyFileEntries(2_000, "bulk"));
+  const instance = plugin(vault, github) as ReturnType<typeof plugin>;
+  const state = instance.syncData.encrypted!;
+  for (const file of vault.getFiles().slice(0, 1_000)) {
+    state.files[file.path] = {
+      plaintextSha256: "0".repeat(64),
+      objectPath: `.obsidian-github-sync-encrypted/objects/legacy/${file.path}.enc`,
+      remoteSha: `legacy-${file.path}`,
+      storage: "single",
+      manifestUpdatedAt: Date.now(),
+      size: file.stat.size,
+      mtime: file.stat.mtime,
+    };
+  }
+  vault.getFilesCount = 0;
+
+  await encryptedModify(vault.getAbstractFileByPath("Notes/note-00000.md") as TFile, instance as never, true);
+
+  const packPaths = [...github.blobs.keys()].filter(path => path.startsWith(".obsidian-github-sync-encrypted/packs/"));
+  const objectPaths = [...github.blobs.keys()].filter(path => path.startsWith(".obsidian-github-sync-encrypted/objects/"));
+  assert.equal(packPaths.length > 0, true);
+  assert.equal(objectPaths.length, 0);
+  assert.equal(vault.getFilesCount > 0, true);
+  const store = new EncryptedManifestStore(github as unknown as GitHubClient, "correct horse battery staple");
+  const loaded = await store.loadOrCreate();
+  assert.equal(Object.values(loaded.manifest.files).every(record => record.storage === "pack"), true);
+});
+
+test("normal encrypted sync migrates legacy 2000 single-object cache after app restart", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault(manyFileEntries(2_000, "legacy"));
+  const instance = plugin(vault, github) as ReturnType<typeof plugin>;
+  const store = new EncryptedManifestStore(github as unknown as GitHubClient, "correct horse battery staple", true);
+  const loaded = await store.loadOrCreate();
+  const manifest = loaded.manifest;
+  const state = instance.syncData.encrypted!;
+
+  for (const file of vault.getFiles()) {
+    const bytes = new Uint8Array(await vault.readBinary(file));
+    const plaintextSha256 = await sha256Hex(bytes);
+    const id = plaintextSha256.slice(0, 24);
+    const objectPath = `.obsidian-github-sync-encrypted/objects/${id.slice(0, 2)}/${id.slice(2, 4)}/${id}.enc`;
+    manifest.files[file.path] = {
+      id,
+      path: file.path,
+      objectPath,
+      plaintextSha256,
+      remoteSha: `legacy-${id}`,
+      storage: "single",
+      size: file.stat.size,
+      mtime: file.stat.mtime,
+      deleted: false,
+    };
+    state.files[file.path] = {
+      plaintextSha256,
+      objectPath,
+      remoteSha: `legacy-${id}`,
+      storage: "single",
+      manifestUpdatedAt: manifest.updatedAt,
+      size: file.stat.size,
+      mtime: file.stat.mtime,
+    };
+  }
+  const manifestSha = await store.save(manifest, loaded.key, loaded.manifestSha);
+  state.manifestSha = manifestSha;
+  instance.syncData.lastRemoteHeadSha = github.headSha;
+  vault.readBinaryCount = 0;
+
+  await encryptedFullSync(instance as never);
+
+  const packPaths = [...github.blobs.keys()].filter(path => path.startsWith(".obsidian-github-sync-encrypted/packs/"));
+  assert.equal(packPaths.length > 0, true);
+  const migrated = await store.loadOrCreate();
+  assert.equal(Object.values(migrated.manifest.files).every(record => record.storage === "pack"), true);
+});
 test("normal encrypted sync migrates a gradually grown vault into pack mode", async () => {
   const github = new MemoryGitHub();
   const vault = new MemoryVault({ "Notes/seed.md": "seed" });

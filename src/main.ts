@@ -1,6 +1,6 @@
 import { Plugin, setIcon, Modal, Notice, TFile } from "obsidian";
 
-import { NoteModify, NoteDelete, NoteRename, StartupFullNotesForceOverSync, StartupFullNotesSync } from "./lib/fs";
+import { NoteModify, NoteDelete, NoteRename, StartupFullNotesForceOverSync, StartupFullNotesSync, overrideLocalAllFilesImpl } from "./lib/fs";
 import { SettingTab, PluginSettings, DEFAULT_SETTINGS } from "./setting";
 import { GitHubClient } from "./lib/github-api";
 import { $, moment } from "./lang/lang";
@@ -370,7 +370,7 @@ export default class FastSync extends Plugin {
           else void encryptedForcePull(this)
         } else {
           if (operation === "forcePush") void StartupFullNotesForceOverSync(this)
-          else new Notice("Force pull is not supported in plaintext mode.")
+          else void overrideLocalAllFilesImpl(this)
         }
         resolve()
       }

@@ -68,6 +68,23 @@ function encryptedLocalStateMatchesCache(plugin: FastSync, localFiles: TFile[]):
   return cachedPaths.size === 0;
 }
 
+function encryptedLocalFilesStorageMode(localFiles: TFile[]): ReturnType<typeof chooseEncryptedStorageMode> {
+  const totalBytes = localFiles.reduce((sum, file) => sum + file.stat.size, 0);
+  return chooseEncryptedStorageMode({ fileCount: localFiles.length, totalBytes });
+}
+
+function encryptedStateNeedsPackMigration(plugin: FastSync, localFiles: TFile[]): boolean {
+  if (encryptedLocalFilesStorageMode(localFiles) !== "pack") return false;
+  const state = ensureEncryptedState(plugin);
+  return localFiles.some(file => state.files[normalizeVaultPath(file.path)]?.storage !== "pack");
+}
+function encryptedCachedStateSuggestsPackSync(plugin: FastSync): boolean {
+  const cached = Object.values(ensureEncryptedState(plugin).files);
+  if (cached.some(file => file.storage === "pack")) return true;
+  const totalBytes = cached.reduce((sum, file) => sum + (file.size ?? 0), 0);
+  return chooseEncryptedStorageMode({ fileCount: cached.length, totalBytes }) === "pack";
+}
+
 function requireEncryptedPassphrase(plugin: FastSync): string {
   const settings = plugin.settings as { encryptionPassphrase?: string };
   const passphrase = settings.encryptionPassphrase?.trim();
@@ -146,28 +163,20 @@ async function resolveRemoteChangedBeforeLocalMutation(
   localFile: TFile | null,
   localBytes?: Uint8Array,
 ): Promise<boolean> {
-  console.log(`[GitHub Sync Debug] resolveRemoteChangedBeforeLocalMutation: path=${path}`);
-  console.log(`[GitHub Sync Debug] record=${JSON.stringify(record)}`);
-  console.log(`[GitHub Sync Debug] localState=${JSON.stringify(localState)}`);
 
   if (!record || record.deleted) {
-    console.log(`[GitHub Sync Debug] No active remote record, skipping conflict check.`);
     return false;
   }
   if (localState?.plaintextSha256 === record.plaintextSha256) {
-    console.log(`[GitHub Sync Debug] Cache hash matches remote hash (${record.plaintextSha256}), skipping conflict.`);
     return false;
   }
   if (localFile || localBytes) {
     const bytes = localBytes ?? await readVaultFileBytes(plugin.app.vault, localFile as TFile);
     const localHash = await sha256Hex(bytes);
-    console.log(`[GitHub Sync Debug] Checking local file hash: local=${localHash} vs remote=${record.plaintextSha256}`);
     if (localHash === record.plaintextSha256) {
-      console.log(`[GitHub Sync Debug] Local file content matches remote, skipping conflict.`);
       return false;
     }
   }
-  console.warn(`[GitHub Sync Debug] Conflict detected for ${path}! Local hash differs and cache does not match remote.`);
   const remoteBytes = await downloadManifestRecordBytes(plugin, key, manifest, record);
   const resolution = await chooseConflictResolution(plugin, configuredConflictPolicy(plugin), path, localFile, record.mtime);
   if (resolution === "keep-local") return false;
@@ -254,7 +263,7 @@ async function encryptedSyncImpl(plugin: FastSync, options: EncryptedSyncOptions
     if (options.operation === "normal" || options.operation === "manual") {
       const localFiles = listEncryptedSyncCandidates(plugin.app.vault, ignoreRules);
       remoteHeadBeforeSync = await getRemoteHeadShaIfAvailable(plugin);
-      if (remoteHeadBeforeSync && plugin.syncData.lastRemoteHeadSha === remoteHeadBeforeSync && encryptedLocalStateMatchesCache(plugin, localFiles)) {
+      if (remoteHeadBeforeSync && plugin.syncData.lastRemoteHeadSha === remoteHeadBeforeSync && encryptedLocalStateMatchesCache(plugin, localFiles) && !encryptedStateNeedsPackMigration(plugin, localFiles)) {
         if (plugin.syncProgress) {
           plugin.syncProgress = {
             status: "success",
@@ -358,9 +367,14 @@ export async function encryptedSync(plugin: FastSync, options: EncryptedSyncOpti
 async function encryptedModifyImpl(file: TAbstractFile, plugin: FastSync, eventEnter = false): Promise<void> {
   if (!(file instanceof TFile)) return;
   if (!plugin.isWatchEnabled && eventEnter) return;
-  if (!shouldSyncEncryptedFile(file, configuredIgnoreRules(plugin)) || !plugin.githubClient) return;
+  const ignoreRules = configuredIgnoreRules(plugin);
+  if (!shouldSyncEncryptedFile(file, ignoreRules) || !plugin.githubClient) return;
   if (blockIfEncryptedForcePushRequired(plugin, "localChange", file.path)) return;
   if (plugin.isSyncInProgress) return;
+  if (encryptedCachedStateSuggestsPackSync(plugin)) {
+    await encryptedSyncImpl(plugin, { operation: "localChange" });
+    return;
+  }
   plugin.isSyncInProgress = true;
   if (plugin.syncProgress) {
     plugin.syncProgress = {

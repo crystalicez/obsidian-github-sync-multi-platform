@@ -3,9 +3,10 @@ import { TFile, TAbstractFile, Notice, requestUrl } from "obsidian";
 import { hashContent, dump } from "./helps";
 import FastSync, { FileState } from "../main";
 import { GitHubClient, GitHubTreeNode } from "./github-api";
-import { encryptedDelete, encryptedForcePush, encryptedFullSync, encryptedModify, encryptedRename } from "./encrypted/sync-engine";
+import { encryptedDelete, encryptedForcePull, encryptedForcePush, encryptedFullSync, encryptedModify, encryptedRename } from "./encrypted/sync-engine";
 import { shouldHandleEncryptedLocalChange } from "./encrypted/settings-policy";
 import { conflictPathFor, detectCaseInsensitiveCollisions } from "./encrypted/paths";
+import { compileIgnorePathRegex, isIgnoredPath } from "./encrypted/ignore";
 
 const IMAGE_EXTENSIONS = ["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "tiff"];
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
@@ -34,20 +35,32 @@ async function getRemoteHeadShaIfAvailable(plugin: FastSync): Promise<string | n
   }
 }
 
+function isPlaintextSyncPath(path: string): boolean {
+  const ext = path.split(".").pop()?.toLowerCase() ?? "";
+  return (ext === "md" || IMAGE_EXTENSIONS.includes(ext)) && !path.includes(".sync-conflict-");
+}
+
+function shouldSyncPlaintextPath(plugin: FastSync, path: string): boolean {
+  if (!isPlaintextSyncPath(path)) return false;
+  const rules = compileIgnorePathRegex((plugin.settings as { ignorePathRegex?: string }).ignorePathRegex ?? "");
+  return !isIgnoredPath(path, rules);
+}
+
 function plaintextLocalStateMatchesCache(plugin: FastSync, files: TFile[]): boolean {
-  const cachedPaths = new Set(Object.keys(plugin.syncData.files));
-  if (cachedPaths.size !== files.length) return false;
+  const localPaths = new Set(files.map(file => file.path));
   for (const file of files) {
     const cached = plugin.syncData.files[file.path];
     if (!cached?.hash || !cachedPlaintextStatMatches(file, cached)) return false;
-    cachedPaths.delete(file.path);
   }
-  return cachedPaths.size === 0;
+  for (const cachedPath of Object.keys(plugin.syncData.files)) {
+    if (isPlaintextSyncPath(cachedPath) && !localPaths.has(cachedPath)) return false;
+  }
+  return true;
 }
-function shouldSyncPlaintextFile(file: TFile): boolean {
-  const isMarkdown = file.extension === "md";
-  const isImage = IMAGE_EXTENSIONS.includes(file.extension.toLowerCase());
-  return (isMarkdown || isImage) && !file.path.includes(".sync-conflict-") && file.stat.size <= MAX_FILE_SIZE;
+function shouldSyncPlaintextFile(file: TFile, plugin?: FastSync): boolean {
+  if (!isPlaintextSyncPath(file.path) || file.stat.size > MAX_FILE_SIZE) return false;
+  if (!plugin) return true;
+  return shouldSyncPlaintextPath(plugin, file.path);
 }
 
 function throwIfPlaintextPathCollisions(files: TFile[]): void {
@@ -58,19 +71,29 @@ function throwIfPlaintextPathCollisions(files: TFile[]): void {
 }
 
 function assertNoPlaintextPathCollisions(plugin: FastSync): void {
-  throwIfPlaintextPathCollisions(plugin.app.vault.getFiles().filter(shouldSyncPlaintextFile));
+  throwIfPlaintextPathCollisions(plugin.app.vault.getFiles().filter(file => shouldSyncPlaintextFile(file, plugin)));
 }
 
 function listPlaintextSyncCandidates(plugin: FastSync): TFile[] {
-  const files = plugin.app.vault.getFiles().filter(shouldSyncPlaintextFile);
+  const files = plugin.app.vault.getFiles().filter(file => shouldSyncPlaintextFile(file, plugin));
   throwIfPlaintextPathCollisions(files);
   return files;
+}
+
+async function ensureVaultFolder(plugin: FastSync, folderPath: string): Promise<void> {
+  if (!folderPath) return;
+  const parts = folderPath.split("/").filter(Boolean);
+  let current = "";
+  for (const part of parts) {
+    current = current ? `${current}/${part}` : part;
+    if (!plugin.app.vault.getAbstractFileByPath(current)) await plugin.app.vault.createFolder(current);
+  }
 }
 
 async function writePlaintextConflictCopy(plugin: FastSync, path: string, content: string | ArrayBuffer): Promise<void> {
   const conflictPath = conflictPathFor(path, Date.now(), "remote");
   const folderPath = conflictPath.split("/").slice(0, -1).join("/");
-  if (folderPath && !plugin.app.vault.getAbstractFileByPath(folderPath)) await plugin.app.vault.createFolder(folderPath);
+  await ensureVaultFolder(plugin, folderPath);
   if (typeof content === "string") await plugin.app.vault.create(conflictPath, content);
   else await plugin.app.vault.createBinary(conflictPath, content);
 }
@@ -82,6 +105,26 @@ async function currentPlaintextHash(plugin: FastSync, file: TFile): Promise<stri
 
 function encryptedDebounceKey(path: string): string {
   return `encrypted:${path}`;
+}
+
+function renameDebounceKey(prefix: "rename" | "encrypted-rename", oldPath: string, newPath: string): string {
+  return `${prefix}:${JSON.stringify([oldPath, newPath])}`;
+}
+
+function parseRenameDebounceKey(key: string, prefix: "rename" | "encrypted-rename"): { oldPath: string; newPath: string } | null {
+  const marker = `${prefix}:`;
+  if (!key.startsWith(marker)) return null;
+  const encoded = key.slice(marker.length);
+  try {
+    const parsed = JSON.parse(encoded) as unknown;
+    if (Array.isArray(parsed) && typeof parsed[0] === "string" && typeof parsed[1] === "string") {
+      return { oldPath: parsed[0], newPath: parsed[1] };
+    }
+  } catch (_error) {
+    const parts = key.split(":");
+    if (parts.length >= 3) return { oldPath: parts[1], newPath: parts.slice(2).join(":") };
+  }
+  return null;
 }
 
 function scheduleEncryptedModify(file: TFile, plugin: FastSync, eventEnter: boolean): void {
@@ -269,11 +312,9 @@ function clearPlaintextTimers(path: string, plugin: FastSync): void {
     plugin.debounceTimers.delete(deleteKey);
   }
   for (const key of plugin.debounceTimers.keys()) {
-    if (key.startsWith("rename:")) {
-      const parts = key.split(":");
-      const oldP = parts[1];
-      const newP = parts[2];
-      if (oldP === path || newP === path) {
+    const rename = parseRenameDebounceKey(key, "rename");
+    if (rename) {
+      if (rename.oldPath === path || rename.newPath === path) {
         globalThis.clearTimeout(plugin.debounceTimers.get(key));
         plugin.debounceTimers.delete(key);
       }
@@ -293,11 +334,9 @@ function clearEncryptedTimers(path: string, plugin: FastSync): void {
     plugin.debounceTimers.delete(deleteKey);
   }
   for (const key of plugin.debounceTimers.keys()) {
-    if (key.startsWith("encrypted-rename:")) {
-      const parts = key.split(":");
-      const oldP = parts[1];
-      const newP = parts[2];
-      if (oldP === path || newP === path) {
+    const rename = parseRenameDebounceKey(key, "encrypted-rename");
+    if (rename) {
+      if (rename.oldPath === path || rename.newPath === path) {
         globalThis.clearTimeout(plugin.debounceTimers.get(key));
         plugin.debounceTimers.delete(key);
       }
@@ -329,7 +368,7 @@ function schedulePlaintextDelete(path: string, plugin: FastSync): void {
 }
 
 function schedulePlaintextRename(oldPath: string, newPath: string, plugin: FastSync): void {
-  const key = `rename:${oldPath}:${newPath}`;
+  const key = renameDebounceKey("rename", oldPath, newPath);
   if (plugin.debounceTimers.has(key)) globalThis.clearTimeout(plugin.debounceTimers.get(key));
 
   if (plugin.syncProgress) {
@@ -375,7 +414,7 @@ function scheduleEncryptedDelete(path: string, plugin: FastSync, eventEnter: boo
 }
 
 function scheduleEncryptedRename(newPath: string, oldPath: string, plugin: FastSync, eventEnter: boolean): void {
-  const key = `encrypted-rename:${oldPath}:${newPath}`;
+  const key = renameDebounceKey("encrypted-rename", oldPath, newPath);
   if (plugin.debounceTimers.has(key)) globalThis.clearTimeout(plugin.debounceTimers.get(key));
 
   if (plugin.syncProgress) {
@@ -634,9 +673,6 @@ export async function overrideRemoteAllFilesImpl(plugin: FastSync): Promise<void
     plugin.syncData.lastRemoteHeadSha = await getRemoteHeadShaIfAvailable(plugin) ?? plugin.syncData.lastRemoteHeadSha;
 
     await plugin.saveSyncData();
-
-    // B6: updateStats 异步执行，不阻塞主流程
-    plugin.updateStats().catch(e => console.error("Stats update failed:", e));
     new Notice("All assets synced to GitHub");
   } catch (error) {
     console.error("Force sync failed:", error);
@@ -651,6 +687,154 @@ export async function overrideRemoteAllFilesImpl(plugin: FastSync): Promise<void
 export const StartupFullNotesForceOverSync = (plugin: FastSync): void => {
   void overrideRemoteAllFilesImpl(plugin);
 };
+export async function overrideLocalAllFilesImpl(plugin: FastSync): Promise<void> {
+  if (plugin.settings.encryptionMode === "encrypted") {
+    await encryptedForcePull(plugin);
+    return;
+  }
+  if (plugin.isSyncInProgress) {
+    new Notice("Sync is already in progress. Please wait.");
+    return;
+  }
+  if (!plugin.githubClient) return;
+
+  for (const timer of plugin.debounceTimers.values()) globalThis.clearTimeout(timer);
+  plugin.debounceTimers.clear();
+
+  plugin.isSyncInProgress = true;
+  plugin.disableWatch();
+  if (plugin.syncProgress) {
+    plugin.syncProgress = {
+      status: "syncing",
+      pushCount: 0,
+      totalPush: 0,
+      pullCount: 0,
+      totalPull: 0,
+      lastSyncTime: plugin.syncProgress.lastSyncTime
+    };
+  }
+  if (typeof plugin.updateStatusBar === "function") plugin.updateStatusBar();
+
+  try {
+    const remoteTree = await plugin.githubClient.getTree();
+    if (remoteTree.truncated) throw new Error("GitHub tree response was truncated; force pull cannot safely mirror this repository.");
+
+    const remoteFiles = remoteTree.tree.filter((node: GitHubTreeNode) => node.type === "blob" && shouldSyncPlaintextPath(plugin, node.path));
+    const remotePaths = new Set(remoteFiles.map((node: GitHubTreeNode) => node.path));
+    const localFiles = listPlaintextSyncCandidates(plugin);
+    const localFilesMap = new Map(localFiles.map(file => [file.path, file] as [string, TFile]));
+
+    if (plugin.syncProgress) plugin.syncProgress.totalPull = remoteFiles.length;
+    for (const remote of remoteFiles) {
+      const remoteData = await plugin.githubClient.getFile(remote.path);
+      if (!remoteData) continue;
+      const ext = remote.path.split(".").pop()?.toLowerCase();
+      const isMarkdown = ext === "md";
+      const folderPath = remote.path.split("/").slice(0, -1).join("/");
+      await ensureVaultFolder(plugin, folderPath);
+
+      let finalContent: string | ArrayBuffer;
+      if (!remoteData.content && remoteData.download_url) {
+        const downloadRes = await requestUrl({ url: remoteData.download_url, headers: plugin.githubClient.headers });
+        finalContent = downloadRes.arrayBuffer;
+      } else {
+        finalContent = remoteData.content;
+      }
+
+      plugin.addIgnoredFile(remote.path);
+      try {
+        const localFile = localFilesMap.get(remote.path);
+        if (isMarkdown) {
+          const content = typeof finalContent === "string"
+            ? GitHubClient.decodeContent(finalContent)
+            : new TextDecoder().decode(finalContent);
+          if (localFile) await plugin.app.vault.modify(localFile, content);
+          else await plugin.app.vault.create(remote.path, content);
+          const written = plugin.app.vault.getAbstractFileByPath(remote.path);
+          if (written instanceof TFile) {
+            plugin.syncData.files[remote.path] = plaintextSyncEntry(remote.sha, written, hashContent(content));
+          } else if (localFile) {
+            plugin.syncData.files[remote.path] = plaintextSyncEntry(remote.sha, localFile, hashContent(content));
+          } else {
+            plugin.syncData.files[remote.path] = {
+              sha: remote.sha,
+              lastSync: Date.now(),
+              hash: hashContent(content),
+              size: new TextEncoder().encode(content).byteLength,
+              mtime: Date.now()
+            };
+          }
+        } else {
+          const buffer = typeof finalContent === "string" ? GitHubClient.decodeContentBytes(finalContent).buffer as ArrayBuffer : finalContent;
+          if (localFile) await plugin.app.vault.modifyBinary(localFile, buffer);
+          else await plugin.app.vault.createBinary(remote.path, buffer);
+          const written = plugin.app.vault.getAbstractFileByPath(remote.path);
+          if (written instanceof TFile) {
+            plugin.syncData.files[remote.path] = plaintextSyncEntry(remote.sha, written, `${written.stat.size}_${written.stat.mtime}`);
+          } else {
+            plugin.syncData.files[remote.path] = {
+              sha: remote.sha,
+              lastSync: Date.now(),
+              hash: `${buffer.byteLength}_${Date.now()}`,
+              size: buffer.byteLength,
+              mtime: Date.now()
+            };
+          }
+        }
+      } finally {
+        plugin.removeIgnoredFile(remote.path);
+      }
+      if (plugin.syncProgress) plugin.syncProgress.pullCount++;
+      if (typeof plugin.updateStatusBar === "function") plugin.updateStatusBar();
+    }
+
+    for (const file of localFiles) {
+      if (remotePaths.has(file.path)) continue;
+      plugin.addIgnoredFile(file.path);
+      try {
+        await plugin.app.vault.delete(file);
+        delete plugin.syncData.files[file.path];
+      } finally {
+        plugin.removeIgnoredFile(file.path);
+      }
+    }
+
+    for (const cachedPath of Object.keys(plugin.syncData.files)) {
+      if (isPlaintextSyncPath(cachedPath) && !remotePaths.has(cachedPath)) delete plugin.syncData.files[cachedPath];
+    }
+    plugin.syncData.lastRemoteHeadSha = await getRemoteHeadShaIfAvailable(plugin) ?? plugin.syncData.lastRemoteHeadSha;
+    await plugin.saveSyncData();
+    if (plugin.syncProgress) {
+      plugin.syncProgress = {
+        status: "success",
+        pushCount: 0,
+        totalPush: 0,
+        pullCount: remoteFiles.length,
+        totalPull: remoteFiles.length,
+        lastSyncTime: Date.now()
+      };
+    }
+    new Notice("Force pull completed");
+  } catch (error) {
+    console.error("Force pull failed:", error);
+    new Notice(`Force pull failed: ${(error as Error).message}`);
+    if (plugin.syncProgress) {
+      plugin.syncProgress = {
+        status: "fail",
+        pushCount: 0,
+        totalPush: 0,
+        pullCount: 0,
+        totalPull: 0,
+        lastSyncTime: plugin.syncProgress.lastSyncTime,
+        errorMessage: (error as Error).message
+      };
+    }
+  } finally {
+    plugin.isSyncInProgress = false;
+    plugin.enableWatch();
+    if (typeof plugin.updateStatusBar === "function") plugin.updateStatusBar();
+  }
+}
 
 export async function syncAllFilesImpl(plugin: FastSync): Promise<void> {
   if (plugin.settings.encryptionMode === "encrypted") {
@@ -809,7 +993,7 @@ export async function syncAllFilesImpl(plugin: FastSync): Promise<void> {
 
     // 2. 推送本地文件：新增文件 + 本地内容有变化的已有文件
     let step2Push = 0, step2Skip = 0, step2Fail = 0;
-    const candidateFiles = allLocalFiles.filter(shouldSyncPlaintextFile);
+    const candidateFiles = allLocalFiles.filter(file => shouldSyncPlaintextFile(file, plugin));
     if (plugin.syncProgress) plugin.syncProgress.totalPush = candidateFiles.length;
     if (typeof plugin.updateStatusBar === "function") plugin.updateStatusBar();
 
@@ -865,9 +1049,6 @@ export async function syncAllFilesImpl(plugin: FastSync): Promise<void> {
     plugin.syncData.lastRemoteHeadSha = step2Push === 0 ? (remoteHeadBeforeSync ?? plugin.syncData.lastRemoteHeadSha) : (remoteHeadBeforeSync ? (await getRemoteHeadShaIfAvailable(plugin) ?? plugin.syncData.lastRemoteHeadSha) : plugin.syncData.lastRemoteHeadSha);
 
     await plugin.saveSyncData();
-
-    // B6: updateStats 异步执行，不阻塞主同步流程
-    plugin.updateStats().catch(e => console.error("Stats update failed:", e));
     new Notice("Sync completed");
 
     if (plugin.syncProgress) {
