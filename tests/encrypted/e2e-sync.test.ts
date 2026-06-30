@@ -183,6 +183,7 @@ class MemoryVault {
 
 function plugin(vault: MemoryVault, github: MemoryGitHub) {
   return {
+    isTesting: true,
     app: { vault },
     githubClient: github as unknown as GitHubClient,
     settings: {

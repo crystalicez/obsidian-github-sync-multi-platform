@@ -139,8 +139,9 @@ export const NoteModify = function (file: TAbstractFile, plugin: FastSync, event
   }
 
   // 2. 防抖处理
-  if (plugin.debounceTimers.has(file.path)) {
-    globalThis.clearTimeout(plugin.debounceTimers.get(file.path));
+  const key = file.path;
+  if (plugin.debounceTimers.has(key)) {
+    globalThis.clearTimeout(plugin.debounceTimers.get(key));
   }
 
   if (plugin.syncProgress) {
@@ -157,12 +158,12 @@ export const NoteModify = function (file: TAbstractFile, plugin: FastSync, event
 
   const timer = globalThis.setTimeout(() => {
     void (async () => {
-      plugin.debounceTimers.delete(file.path);
+      plugin.debounceTimers.delete(key);
       await performSync(file, plugin);
     })();
   }, 5000) as unknown as number; // 5秒防抖
 
-  plugin.debounceTimers.set(file.path, timer);
+  plugin.debounceTimers.set(key, timer);
 };
 
 const performSync = async (file: TFile, plugin: FastSync) => {
@@ -256,68 +257,236 @@ const performSync = async (file: TFile, plugin: FastSync) => {
   }
 };
 
-export const NoteDelete = async function (file: TAbstractFile, plugin: FastSync, eventEnter: boolean = false) {
-  if (plugin.settings.encryptionMode === "encrypted") {
-    if (!plugin.isWatchEnabled && eventEnter) return;
-    if (!shouldHandleEncryptedLocalChange(plugin.settings, eventEnter)) return;
-    clearEncryptedModify(file.path, plugin);
-    await encryptedDelete(file, plugin, eventEnter);
+function clearPlaintextTimers(path: string, plugin: FastSync): void {
+  const modifyKey = path;
+  if (plugin.debounceTimers.has(modifyKey)) {
+    globalThis.clearTimeout(plugin.debounceTimers.get(modifyKey));
+    plugin.debounceTimers.delete(modifyKey);
+  }
+  const deleteKey = `delete:${path}`;
+  if (plugin.debounceTimers.has(deleteKey)) {
+    globalThis.clearTimeout(plugin.debounceTimers.get(deleteKey));
+    plugin.debounceTimers.delete(deleteKey);
+  }
+  for (const key of plugin.debounceTimers.keys()) {
+    if (key.startsWith("rename:")) {
+      const parts = key.split(":");
+      const oldP = parts[1];
+      const newP = parts[2];
+      if (oldP === path || newP === path) {
+        globalThis.clearTimeout(plugin.debounceTimers.get(key));
+        plugin.debounceTimers.delete(key);
+      }
+    }
+  }
+}
+
+function clearEncryptedTimers(path: string, plugin: FastSync): void {
+  const modifyKey = encryptedDebounceKey(path);
+  if (plugin.debounceTimers.has(modifyKey)) {
+    globalThis.clearTimeout(plugin.debounceTimers.get(modifyKey));
+    plugin.debounceTimers.delete(modifyKey);
+  }
+  const deleteKey = `encrypted-delete:${path}`;
+  if (plugin.debounceTimers.has(deleteKey)) {
+    globalThis.clearTimeout(plugin.debounceTimers.get(deleteKey));
+    plugin.debounceTimers.delete(deleteKey);
+  }
+  for (const key of plugin.debounceTimers.keys()) {
+    if (key.startsWith("encrypted-rename:")) {
+      const parts = key.split(":");
+      const oldP = parts[1];
+      const newP = parts[2];
+      if (oldP === path || newP === path) {
+        globalThis.clearTimeout(plugin.debounceTimers.get(key));
+        plugin.debounceTimers.delete(key);
+      }
+    }
+  }
+}
+
+function schedulePlaintextDelete(path: string, plugin: FastSync): void {
+  const key = `delete:${path}`;
+  if (plugin.debounceTimers.has(key)) globalThis.clearTimeout(plugin.debounceTimers.get(key));
+
+  if (plugin.syncProgress) {
+    plugin.syncProgress = {
+      status: "waiting",
+      pushCount: 0,
+      totalPush: 0,
+      pullCount: 0,
+      totalPull: 0,
+      lastSyncTime: plugin.syncProgress.lastSyncTime
+    };
+    if (typeof plugin.updateStatusBar === "function") plugin.updateStatusBar();
+  }
+
+  const timer = globalThis.setTimeout(async () => {
+    plugin.debounceTimers.delete(key);
+    await performPlaintextDelete(path, plugin);
+  }, 5000) as unknown as number;
+  plugin.debounceTimers.set(key, timer);
+}
+
+function schedulePlaintextRename(oldPath: string, newPath: string, plugin: FastSync): void {
+  const key = `rename:${oldPath}:${newPath}`;
+  if (plugin.debounceTimers.has(key)) globalThis.clearTimeout(plugin.debounceTimers.get(key));
+
+  if (plugin.syncProgress) {
+    plugin.syncProgress = {
+      status: "waiting",
+      pushCount: 0,
+      totalPush: 0,
+      pullCount: 0,
+      totalPull: 0,
+      lastSyncTime: plugin.syncProgress.lastSyncTime
+    };
+    if (typeof plugin.updateStatusBar === "function") plugin.updateStatusBar();
+  }
+
+  const timer = globalThis.setTimeout(async () => {
+    plugin.debounceTimers.delete(key);
+    await performPlaintextRename(oldPath, newPath, plugin);
+  }, 5000) as unknown as number;
+  plugin.debounceTimers.set(key, timer);
+}
+
+function scheduleEncryptedDelete(path: string, plugin: FastSync, eventEnter: boolean): void {
+  const key = `encrypted-delete:${path}`;
+  if (plugin.debounceTimers.has(key)) globalThis.clearTimeout(plugin.debounceTimers.get(key));
+
+  if (plugin.syncProgress) {
+    plugin.syncProgress = {
+      status: "waiting",
+      pushCount: 0,
+      totalPush: 0,
+      pullCount: 0,
+      totalPull: 0,
+      lastSyncTime: plugin.syncProgress.lastSyncTime
+    };
+    if (typeof plugin.updateStatusBar === "function") plugin.updateStatusBar();
+  }
+
+  const timer = globalThis.setTimeout(async () => {
+    plugin.debounceTimers.delete(key);
+    await encryptedDelete(path, plugin, eventEnter);
+  }, 5000) as unknown as number;
+  plugin.debounceTimers.set(key, timer);
+}
+
+function scheduleEncryptedRename(newPath: string, oldPath: string, plugin: FastSync, eventEnter: boolean): void {
+  const key = `encrypted-rename:${oldPath}:${newPath}`;
+  if (plugin.debounceTimers.has(key)) globalThis.clearTimeout(plugin.debounceTimers.get(key));
+
+  if (plugin.syncProgress) {
+    plugin.syncProgress = {
+      status: "waiting",
+      pushCount: 0,
+      totalPush: 0,
+      pullCount: 0,
+      totalPull: 0,
+      lastSyncTime: plugin.syncProgress.lastSyncTime
+    };
+    if (typeof plugin.updateStatusBar === "function") plugin.updateStatusBar();
+  }
+
+  const timer = globalThis.setTimeout(async () => {
+    plugin.debounceTimers.delete(key);
+    await encryptedRename(newPath, oldPath, plugin, eventEnter);
+  }, 5000) as unknown as number;
+  plugin.debounceTimers.set(key, timer);
+}
+
+const performPlaintextDelete = async (path: string, plugin: FastSync) => {
+  if (plugin.isSyncInProgress) {
+    dump(`Sync already in progress, skipping performPlaintextDelete for ${path}`);
     return;
   }
-  if (!plugin.isWatchEnabled && eventEnter) return;
-  if (plugin.ignoredFiles.has(file.path) && eventEnter) return;
-  if (!plugin.githubClient) return;
-
-  // 清除防抖计时器
-  if (plugin.debounceTimers.has(file.path)) {
-    clearTimeout(plugin.debounceTimers.get(file.path));
-    plugin.debounceTimers.delete(file.path);
+  plugin.isSyncInProgress = true;
+  if (plugin.syncProgress) {
+    plugin.syncProgress = {
+      status: "syncing",
+      pushCount: 0,
+      totalPush: 1,
+      pullCount: 0,
+      totalPull: 0,
+      lastSyncTime: plugin.syncProgress.lastSyncTime
+    };
+    if (typeof plugin.updateStatusBar === "function") plugin.updateStatusBar();
   }
-
-  plugin.addIgnoredFile(file.path);
+  plugin.addIgnoredFile(path);
   try {
-    const sha = plugin.syncData.files[file.path]?.sha;
+    const sha = plugin.syncData.files[path]?.sha;
     if (sha) {
-      await plugin.githubClient.deleteFile(file.path, sha);
-      delete plugin.syncData.files[file.path];
+      await plugin.githubClient.deleteFile(path, sha);
+      delete plugin.syncData.files[path];
       await plugin.saveSyncData();
-      dump(`Deleted ${file.path} from GitHub`);
+      dump(`Deleted ${path} from GitHub`);
+      if (plugin.syncProgress) {
+        plugin.syncProgress = {
+          status: "success",
+          pushCount: 1,
+          totalPush: 1,
+          pullCount: 0,
+          totalPull: 0,
+          lastSyncTime: Date.now()
+        };
+      }
+    } else {
+      if (plugin.syncProgress) {
+        plugin.syncProgress.status = "success";
+      }
     }
   } catch (error) {
     console.error("Delete failed:", error);
+    if (plugin.syncProgress) {
+      plugin.syncProgress = {
+        status: "fail",
+        pushCount: 0,
+        totalPush: 0,
+        pullCount: 0,
+        totalPull: 0,
+        lastSyncTime: plugin.syncProgress.lastSyncTime,
+        errorMessage: (error as Error).message
+      };
+    }
   } finally {
-    plugin.removeIgnoredFile(file.path);
+    plugin.isSyncInProgress = false;
+    plugin.removeIgnoredFile(path);
+    if (typeof plugin.updateStatusBar === "function") plugin.updateStatusBar();
   }
 };
 
-export const NoteRename = async function (file: TAbstractFile, oldfile: string, plugin: FastSync, eventEnter: boolean = false) {
-  if (plugin.settings.encryptionMode === "encrypted") {
-    if (!plugin.isWatchEnabled && eventEnter) return;
-    if (!shouldHandleEncryptedLocalChange(plugin.settings, eventEnter)) return;
-    clearEncryptedModify(oldfile, plugin);
-    clearEncryptedModify(file.path, plugin);
-    await encryptedRename(file, oldfile, plugin, eventEnter);
+const performPlaintextRename = async (oldfile: string, newfile: string, plugin: FastSync) => {
+  if (plugin.isSyncInProgress) {
+    dump(`Sync already in progress, skipping performPlaintextRename for ${oldfile} -> ${newfile}`);
     return;
   }
-  if (plugin.debounceTimers.has(oldfile)) {
-    clearTimeout(plugin.debounceTimers.get(oldfile));
-    plugin.debounceTimers.delete(oldfile);
+  plugin.isSyncInProgress = true;
+  if (plugin.syncProgress) {
+    plugin.syncProgress = {
+      status: "syncing",
+      pushCount: 0,
+      totalPush: 2,
+      pullCount: 0,
+      totalPull: 0,
+      lastSyncTime: plugin.syncProgress.lastSyncTime
+    };
+    if (typeof plugin.updateStatusBar === "function") plugin.updateStatusBar();
   }
-  if (plugin.debounceTimers.has(file.path)) {
-    clearTimeout(plugin.debounceTimers.get(file.path));
-    plugin.debounceTimers.delete(file.path);
-  }
-  if (!(file instanceof TFile)) return;
-  if (eventEnter && !plugin.settings.syncEnabled) return;
-  if (!plugin.isWatchEnabled && eventEnter) return;
-  if (!plugin.githubClient) return;
-
+  plugin.addIgnoredFile(newfile);
   try {
     assertNoPlaintextPathCollisions(plugin);
-    plugin.addIgnoredFile(file.path);
     const oldSha = plugin.syncData.files[oldfile]?.sha;
 
-    // 1. 上传新路径
+    const file = plugin.app.vault.getAbstractFileByPath(newfile);
+    if (!(file instanceof TFile)) {
+      if (plugin.syncProgress) {
+        plugin.syncProgress.status = "success";
+      }
+      return;
+    }
+
     const isMarkdown = file.extension === "md";
     let content: string | ArrayBuffer;
     let currentHash: string;
@@ -330,19 +499,92 @@ export const NoteRename = async function (file: TAbstractFile, oldfile: string, 
       currentHash = file.stat.size + "_" + file.stat.mtime;
     }
 
-    const newSha = await plugin.githubClient.putFile(file.path, content);
-    plugin.syncData.files[file.path] = plaintextSyncEntry(newSha, file, currentHash);
+    const newSha = await plugin.githubClient.putFile(newfile, content);
+    plugin.syncData.files[newfile] = plaintextSyncEntry(newSha, file, currentHash);
     if (oldSha) {
       await plugin.githubClient.deleteFile(oldfile, oldSha);
       delete plugin.syncData.files[oldfile];
     }
     await plugin.saveSyncData();
-    dump(`Renamed ${oldfile} -> ${file.path}`);
+    dump(`Renamed ${oldfile} -> ${newfile}`);
+
+    if (plugin.syncProgress) {
+      plugin.syncProgress = {
+        status: "success",
+        pushCount: 2,
+        totalPush: 2,
+        pullCount: 0,
+        totalPull: 0,
+        lastSyncTime: Date.now()
+      };
+    }
   } catch (error) {
     console.error("Rename failed:", error);
-    new Notice(`Rename failed for ${file.path}: ${(error as Error).message}`);
+    new Notice(`Rename failed for ${newfile}: ${(error as Error).message}`);
+    if (plugin.syncProgress) {
+      plugin.syncProgress = {
+        status: "fail",
+        pushCount: 0,
+        totalPush: 0,
+        pullCount: 0,
+        totalPull: 0,
+        lastSyncTime: plugin.syncProgress.lastSyncTime,
+        errorMessage: (error as Error).message
+      };
+    }
   } finally {
-    plugin.removeIgnoredFile(file.path);
+    plugin.isSyncInProgress = false;
+    plugin.removeIgnoredFile(newfile);
+    if (typeof plugin.updateStatusBar === "function") plugin.updateStatusBar();
+  }
+};
+
+export const NoteDelete = function (file: TAbstractFile, plugin: FastSync, eventEnter: boolean = false) {
+  const isTesting = (plugin as any).isTesting;
+  if (plugin.settings.encryptionMode === "encrypted") {
+    if (!plugin.isWatchEnabled && eventEnter) return;
+    if (!shouldHandleEncryptedLocalChange(plugin.settings, eventEnter)) return;
+    clearEncryptedTimers(file.path, plugin);
+    if (eventEnter && !isTesting) scheduleEncryptedDelete(file.path, plugin, eventEnter);
+    else void encryptedDelete(file.path, plugin, eventEnter);
+    return;
+  }
+  if (!plugin.isWatchEnabled && eventEnter) return;
+  if (plugin.ignoredFiles.has(file.path) && eventEnter) return;
+  if (!plugin.githubClient) return;
+
+  clearPlaintextTimers(file.path, plugin);
+
+  if (eventEnter && !isTesting) {
+    schedulePlaintextDelete(file.path, plugin);
+  } else {
+    void performPlaintextDelete(file.path, plugin);
+  }
+};
+
+export const NoteRename = function (file: TAbstractFile, oldfile: string, plugin: FastSync, eventEnter: boolean = false) {
+  const isTesting = (plugin as any).isTesting;
+  if (plugin.settings.encryptionMode === "encrypted") {
+    if (!plugin.isWatchEnabled && eventEnter) return;
+    if (!shouldHandleEncryptedLocalChange(plugin.settings, eventEnter)) return;
+    clearEncryptedTimers(oldfile, plugin);
+    clearEncryptedTimers(file.path, plugin);
+    if (eventEnter && !isTesting) scheduleEncryptedRename(file.path, oldfile, plugin, eventEnter);
+    else void encryptedRename(file.path, oldfile, plugin, eventEnter);
+    return;
+  }
+  clearPlaintextTimers(oldfile, plugin);
+  clearPlaintextTimers(file.path, plugin);
+
+  if (!(file instanceof TFile)) return;
+  if (eventEnter && !plugin.settings.syncEnabled) return;
+  if (!plugin.isWatchEnabled && eventEnter) return;
+  if (!plugin.githubClient) return;
+
+  if (eventEnter && !isTesting) {
+    schedulePlaintextRename(oldfile, file.path, plugin);
+  } else {
+    void performPlaintextRename(oldfile, file.path, plugin);
   }
 };
 

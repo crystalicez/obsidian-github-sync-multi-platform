@@ -459,18 +459,42 @@ export async function encryptedModify(file: TAbstractFile, plugin: FastSync, eve
   return enqueue(plugin, () => encryptedModifyImpl(file, plugin, eventEnter));
 }
 
-async function encryptedDeleteImpl(file: TAbstractFile, plugin: FastSync, eventEnter = false): Promise<void> {
+async function encryptedDeleteImpl(fileOrPath: string | TAbstractFile, plugin: FastSync, eventEnter = false): Promise<void> {
+  const filePath = typeof fileOrPath === "string" ? fileOrPath : fileOrPath.path;
   if (!plugin.isWatchEnabled && eventEnter) return;
   if (!plugin.githubClient) return;
-  if (blockIfEncryptedForcePushRequired(plugin, "localChange", file.path)) return;
+  if (blockIfEncryptedForcePushRequired(plugin, "localChange", filePath)) return;
   if (plugin.isSyncInProgress) return;
   plugin.isSyncInProgress = true;
+  if (plugin.syncProgress) {
+    plugin.syncProgress = {
+      status: "syncing",
+      pushCount: 0,
+      totalPush: 1,
+      pullCount: 0,
+      totalPull: 0,
+      lastSyncTime: plugin.syncProgress.lastSyncTime
+    };
+    if (typeof plugin.updateStatusBar === "function") plugin.updateStatusBar();
+  }
   try {
     const { store, key, manifest, manifestSha } = await loadStore(plugin);
-    const path = normalizeVaultPath(file.path);
+    const path = normalizeVaultPath(filePath);
     const record = manifest.files[path];
     const state = ensureEncryptedState(plugin);
-    if (await resolveRemoteChangedBeforeLocalMutation(plugin, key, manifest, path, record, state.files[path], null)) return;
+    if (await resolveRemoteChangedBeforeLocalMutation(plugin, key, manifest, path, record, state.files[path], null)) {
+      if (plugin.syncProgress) {
+        plugin.syncProgress = {
+          status: "success",
+          pushCount: 1,
+          totalPush: 1,
+          pullCount: 0,
+          totalPull: 0,
+          lastSyncTime: Date.now()
+        };
+      }
+      return;
+    }
     if (record) {
       record.deleted = true;
       record.deletedAt = Date.now();
@@ -478,28 +502,67 @@ async function encryptedDeleteImpl(file: TAbstractFile, plugin: FastSync, eventE
       delete state.files[path];
       await plugin.saveSyncData();
     }
+    if (plugin.syncProgress) {
+      plugin.syncProgress = {
+        status: "success",
+        pushCount: 1,
+        totalPush: 1,
+        pullCount: 0,
+        totalPull: 0,
+        lastSyncTime: Date.now()
+      };
+    }
   } catch (error) {
-    reportSyncError("localChange", error, file.path);
+    reportSyncError("localChange", error, filePath);
+    if (plugin.syncProgress) {
+      plugin.syncProgress = {
+        status: "fail",
+        pushCount: 0,
+        totalPush: 0,
+        pullCount: 0,
+        totalPull: 0,
+        lastSyncTime: plugin.syncProgress.lastSyncTime,
+        errorMessage: (error as Error).message
+      };
+    }
   } finally {
     plugin.isSyncInProgress = false;
+    if (typeof plugin.updateStatusBar === "function") plugin.updateStatusBar();
   }
 }
 
-export async function encryptedDelete(file: TAbstractFile, plugin: FastSync, eventEnter = false): Promise<void> {
-  return enqueue(plugin, () => encryptedDeleteImpl(file, plugin, eventEnter));
+export async function encryptedDelete(fileOrPath: string | TAbstractFile, plugin: FastSync, eventEnter = false): Promise<void> {
+  return enqueue(plugin, () => encryptedDeleteImpl(fileOrPath, plugin, eventEnter));
 }
 
-async function encryptedRenameImpl(file: TAbstractFile, oldfile: string, plugin: FastSync, eventEnter = false): Promise<void> {
-  if (!(file instanceof TFile)) return;
+async function encryptedRenameImpl(newFileOrPath: string | TAbstractFile, oldFileOrPath: string | TAbstractFile, plugin: FastSync, eventEnter = false): Promise<void> {
+  const oldfile = typeof oldFileOrPath === "string" ? oldFileOrPath : oldFileOrPath.path;
+  const newfile = typeof newFileOrPath === "string" ? newFileOrPath : newFileOrPath.path;
   if (!plugin.isWatchEnabled && eventEnter) return;
-  if (blockIfEncryptedForcePushRequired(plugin, "localChange", file.path)) return;
-  if (!shouldSyncEncryptedFile(file, configuredIgnoreRules(plugin)) || !plugin.githubClient) return;
+  if (blockIfEncryptedForcePushRequired(plugin, "localChange", newfile)) return;
+  if (!plugin.githubClient) return;
+
+  const file = plugin.app.vault.getAbstractFileByPath(newfile);
+  if (!(file instanceof TFile)) return;
+  if (!shouldSyncEncryptedFile(file, configuredIgnoreRules(plugin))) return;
+
   if (plugin.isSyncInProgress) return;
   plugin.isSyncInProgress = true;
+  if (plugin.syncProgress) {
+    plugin.syncProgress = {
+      status: "syncing",
+      pushCount: 0,
+      totalPush: 2,
+      pullCount: 0,
+      totalPull: 0,
+      lastSyncTime: plugin.syncProgress.lastSyncTime
+    };
+    if (typeof plugin.updateStatusBar === "function") plugin.updateStatusBar();
+  }
   try {
     const { store, key, manifest, manifestSha } = await loadStore(plugin);
     const oldPath = normalizeVaultPath(oldfile);
-    const newPath = normalizeVaultPath(file.path);
+    const newPath = normalizeVaultPath(newfile);
     if (oldPath === newPath) {
       plugin.isSyncInProgress = false;
       await encryptedModifyImpl(file, plugin, eventEnter);
@@ -535,15 +598,38 @@ async function encryptedRenameImpl(file: TAbstractFile, oldfile: string, plugin:
     delete state.files[oldPath];
     state.files[newPath] = { plaintextSha256, objectPath: newRecord.objectPath, remoteSha: newRecord.remoteSha, storage: newRecord.storage, chunks: newRecord.chunks, packId: newRecord.packId, manifestUpdatedAt: manifest.updatedAt, size: file.stat.size, mtime: file.stat.mtime };
     await plugin.saveSyncData();
+
+    if (plugin.syncProgress) {
+      plugin.syncProgress = {
+        status: "success",
+        pushCount: 2,
+        totalPush: 2,
+        pullCount: 0,
+        totalPull: 0,
+        lastSyncTime: Date.now()
+      };
+    }
   } catch (error) {
-    reportSyncError("localChange", error, file.path);
+    reportSyncError("localChange", error, newfile);
+    if (plugin.syncProgress) {
+      plugin.syncProgress = {
+        status: "fail",
+        pushCount: 0,
+        totalPush: 0,
+        pullCount: 0,
+        totalPull: 0,
+        lastSyncTime: plugin.syncProgress.lastSyncTime,
+        errorMessage: (error as Error).message
+      };
+    }
   } finally {
     plugin.isSyncInProgress = false;
+    if (typeof plugin.updateStatusBar === "function") plugin.updateStatusBar();
   }
 }
 
-export async function encryptedRename(file: TAbstractFile, oldfile: string, plugin: FastSync, eventEnter = false): Promise<void> {
-  return enqueue(plugin, () => encryptedRenameImpl(file, oldfile, plugin, eventEnter));
+export async function encryptedRename(newFileOrPath: string | TAbstractFile, oldFileOrPath: string | TAbstractFile, plugin: FastSync, eventEnter = false): Promise<void> {
+  return enqueue(plugin, () => encryptedRenameImpl(newFileOrPath, oldFileOrPath, plugin, eventEnter));
 }
 
 async function pullEncryptedChanges(plugin: FastSync, key: CryptoKey, manifest: EncryptedManifest, force: boolean): Promise<void> {
