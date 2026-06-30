@@ -4,6 +4,7 @@ import path from "node:path";
 const root = process.cwd();
 const requiredModules = [
   "bytes",
+  "change-queue",
   "conflicts",
   "constants",
   "crypto",
@@ -18,7 +19,11 @@ const requiredModules = [
   "pack-sync",
   "scale-policy",
   "sync-engine",
+  "sync-planner",
   "sync-errors",
+  "snapshot-store",
+  "snapshot-merge",
+  "snapshot-types",
   "types",
   "vault",
 ];
@@ -30,6 +35,10 @@ const testFiles = [
   "tests/encrypted/benchmark.test.ts",
   "tests/encrypted/settings-combinations.test.ts",
   "tests/encrypted/pack-planner.test.ts",
+  "tests/encrypted/snapshot-store.test.ts",
+  "tests/encrypted/snapshot-merge.test.ts",
+  "tests/encrypted/change-queue.test.ts",
+  "tests/encrypted/sync-planner.test.ts",
 ];
 
 const contents = await Promise.all(testFiles.map(file => readFile(path.join(root, file), "utf8")));

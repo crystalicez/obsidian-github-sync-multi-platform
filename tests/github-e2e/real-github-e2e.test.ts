@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
 import test, { after } from "node:test";
-import { mkdir, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { modalButtons, Notice, resetModalTestState, setRequestUrlHandler, TFile } from "obsidian";
 import { encryptedDelete, encryptedForcePull, encryptedForcePush, encryptedFullSync, encryptedModify, encryptedRename } from "../../src/lib/encrypted/sync-engine";
 import { EncryptedManifestStore } from "../../src/lib/encrypted/manifest-store";
+import { EncryptedSnapshotStore } from "../../src/lib/encrypted/snapshot-store";
+import type { EncryptedSnapshotManifest } from "../../src/lib/encrypted/snapshot-types";
 import { GitHubClient, GitHubConfig } from "../../src/lib/github-api";
 import { ENCRYPTED_CONFIG_PATH, ENCRYPTED_FORMAT_VERSION, ENCRYPTED_INDEX_MODE } from "../../src/lib/encrypted/constants";
 
@@ -16,9 +18,12 @@ interface BenchRecord {
 
 const benchRecords: BenchRecord[] = [];
 const profile = process.env.GITHUB_E2E_PROFILE ?? "quick";
+const isRandomProfile = profile === "random";
 const runBenchmarks = process.env.GITHUB_E2E_RUN_BENCHMARKS === "1" || profile === "full" || profile === "stress";
-const benchmarkTest = runBenchmarks ? test : test.skip;
-const regressionTest = profile === "quick" ? test.skip : test;
+const baseTest = isRandomProfile && process.env.GITHUB_E2E_RANDOM_INCLUDE_BASE !== "1" ? test.skip : test;
+const benchmarkTest = !isRandomProfile && runBenchmarks ? test : test.skip;
+const regressionTest = profile === "quick" || isRandomProfile ? test.skip : test;
+const randomTest = process.env.GITHUB_E2E_RUN_RANDOM === "1" || isRandomProfile || profile === "stress" ? test : test.skip;
 const forbiddenBranches = new Set(["main", "master", "production", "prod", "release", "stable"]);
 const passphrase = "github real e2e passphrase";
 
@@ -356,19 +361,30 @@ async function waitForRemoteTree(config: GitHubConfig, predicate: (paths: string
   }
   throw new Error(`Timed out waiting for remote tree: ${label}`);
 }
-async function waitForRemoteManifest(config: GitHubConfig, predicate: (store: Awaited<ReturnType<EncryptedManifestStore["loadOrCreate"]>>) => boolean, label: string): Promise<void> {
+async function loadRemoteSnapshot(config: GitHubConfig): Promise<EncryptedSnapshotManifest> {
+  const client = new GitHubClient(config);
+  const loaded = await new EncryptedManifestStore(client, passphrase, true).loadOrCreateKey();
+  const snapshotStore = new EncryptedSnapshotStore(client, loaded.key);
+  const head = await snapshotStore.loadHead();
+  if (!head) throw new Error("remote v2 snapshot head is missing");
+  const snapshot = await snapshotStore.loadSnapshot(head.head.snapshotId);
+  if (!snapshot) throw new Error("remote v2 snapshot is missing");
+  return snapshot;
+}
+
+async function waitForRemoteSnapshot(config: GitHubConfig, predicate: (snapshot: EncryptedSnapshotManifest) => boolean, label: string): Promise<void> {
   const started = Date.now();
   let lastError: unknown;
   while (Date.now() - started < 30000) {
     try {
-      const loaded = await new EncryptedManifestStore(new GitHubClient(config), passphrase).loadOrCreate();
-      if (predicate(loaded)) return;
+      const snapshot = await loadRemoteSnapshot(config);
+      if (predicate(snapshot)) return;
     } catch (error) {
       lastError = error;
     }
     await sleep(1000);
   }
-  throw new Error(`Timed out waiting for remote manifest: ${label}${lastError instanceof Error ? ` (${lastError.message})` : ""}`);
+  throw new Error(`Timed out waiting for remote snapshot: ${label}${lastError instanceof Error ? ` (${lastError.message})` : ""}`);
 }
 function repeatedBytes(size: number, seed: number): Uint8Array {
   const bytes = new Uint8Array(size);
@@ -383,7 +399,7 @@ after(async () => {
   await writeFile(path.join(process.cwd(), ".tmp", "github-e2e-results.json"), JSON.stringify({ generatedAt: new Date().toISOString(), profile, runBenchmarks, records: benchRecords }, null, 2));
 });
 
-test("github e2e: encrypted force push/pull round trips real vault content without plaintext remote paths", { timeout: 120000 }, async () => {
+baseTest("github e2e: encrypted force push/pull round trips real vault content without plaintext remote paths", { timeout: 120000 }, async () => {
   const config = githubConfig();
   const client = await resetTestBranch(config);
   const source = new RealE2EVault({
@@ -406,7 +422,7 @@ test("github e2e: encrypted force push/pull round trips real vault content witho
   assert.equal(pulled.files.get("assets/pixel.png")?.byteLength, 1024);
 });
 
-test("github e2e: modify rename delete and normal sync behave against real GitHub", { timeout: 120000 }, async () => {
+baseTest("github e2e: modify rename delete and normal sync behave against real GitHub", { timeout: 120000 }, async () => {
   const config = githubConfig();
   const client = await resetTestBranch(config);
   const source = new RealE2EVault({ "Notes/a.md": "a1", "Notes/delete-me.md": "bye" });
@@ -423,7 +439,7 @@ test("github e2e: modify rename delete and normal sync behave against real GitHu
   source.files.delete("Notes/delete-me.md");
   await measure("localDelete.singleFile", () => encryptedDelete(new TFile("Notes/delete-me.md"), instance, false));
 
-  await waitForRemoteManifest(config, loaded => loaded.manifest.files["Notes/a.md"]?.deleted === true && loaded.manifest.files["Notes/delete-me.md"]?.deleted === true && loaded.manifest.files["Notes/renamed.md"]?.deleted !== true, "rename/delete reflected");
+  await waitForRemoteSnapshot(config, snapshot => snapshot.files["Notes/a.md"]?.deleted === true && snapshot.files["Notes/delete-me.md"]?.deleted === true && snapshot.files["Notes/renamed.md"]?.deleted !== true, "rename/delete reflected");
 
   const pulled = new RealE2EVault();
   await encryptedForcePull(plugin(pulled, client) as never);
@@ -431,10 +447,9 @@ test("github e2e: modify rename delete and normal sync behave against real GitHu
   assert.equal(pulled.files.has("Notes/a.md"), false);
   assert.equal(pulled.files.has("Notes/delete-me.md"), false);
 
-  const store = new EncryptedManifestStore(client, passphrase);
-  const loaded = await store.loadOrCreate();
-  assert.equal(loaded.manifest.files["Notes/a.md"].deleted, true);
-  assert.equal(loaded.manifest.files["Notes/delete-me.md"].deleted, true);
+  const snapshot = await loadRemoteSnapshot(config);
+  assert.equal(snapshot.files["Notes/a.md"].deleted, true);
+  assert.equal(snapshot.files["Notes/delete-me.md"].deleted, true);
 });
 
 regressionTest("github e2e: regression cases cover wrong passphrase, foreign remote prompt, stale sha retry, and missing delete", { timeout: 240000 }, async () => {
@@ -503,6 +518,262 @@ benchmarkTest("github e2e: benchmark pack mode on real GitHub", { timeout: 60000
   assert.equal(shrinkTree.tree.some(node => node.path.startsWith(".obsidian-github-sync-encrypted/packs/")), false);
 });
 
+class DeterministicRandom {
+  constructor(private state: number) {}
+
+  next(): number {
+    this.state |= 0;
+    this.state = (this.state + 0x6D2B79F5) | 0;
+    let value = Math.imul(this.state ^ (this.state >>> 15), 1 | this.state);
+    value = (value + Math.imul(value ^ (value >>> 7), 61 | value)) ^ value;
+    return ((value ^ (value >>> 14)) >>> 0) / 4294967296;
+  }
+
+  int(min: number, max: number): number {
+    return Math.floor(this.next() * (max - min + 1)) + min;
+  }
+
+  pick<T>(items: T[]): T {
+    return items[this.int(0, items.length - 1)];
+  }
+}
+
+function envNumber(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+function randomAscii(random: DeterministicRandom, length: number): string {
+  const alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 \n-_*[]()#";
+  let output = "";
+  for (let index = 0; index < length; index++) output += alphabet[random.int(0, alphabet.length - 1)];
+  return output;
+}
+
+function randomImageBytes(random: DeterministicRandom, size: number): Uint8Array {
+  const bytes = new Uint8Array(size);
+  for (let index = 0; index < bytes.length; index++) bytes[index] = random.int(0, 255);
+  return bytes;
+}
+
+function randomTotalBytes(files: Map<string, Uint8Array>): number {
+  let total = 0;
+  for (const bytes of files.values()) total += bytes.byteLength;
+  return total;
+}
+
+function mapsEqualBytes(actual: Map<string, Uint8Array>, expected: Map<string, Uint8Array>): { ok: true } | { ok: false; reason: string } {
+  if (actual.size !== expected.size) return { ok: false, reason: `file count mismatch actual=${actual.size} expected=${expected.size}` };
+  for (const [filePath, expectedBytes] of expected.entries()) {
+    const actualBytes = actual.get(filePath);
+    if (!actualBytes) return { ok: false, reason: `missing file ${filePath}` };
+    if (actualBytes.byteLength !== expectedBytes.byteLength) return { ok: false, reason: `size mismatch ${filePath} actual=${actualBytes.byteLength} expected=${expectedBytes.byteLength}` };
+    for (let index = 0; index < expectedBytes.byteLength; index++) {
+      if (actualBytes[index] !== expectedBytes[index]) return { ok: false, reason: `byte mismatch ${filePath} at ${index}` };
+    }
+  }
+  return { ok: true };
+}
+
+const randomDebugPath = path.join(process.cwd(), ".tmp", "github-e2e-random-debug.jsonl");
+
+async function resetRandomDebug(): Promise<void> {
+  await mkdir(path.dirname(randomDebugPath), { recursive: true });
+  await writeFile(randomDebugPath, "");
+}
+
+async function appendRandomDebug(event: Record<string, unknown>): Promise<void> {
+  await mkdir(path.dirname(randomDebugPath), { recursive: true });
+  await appendFile(randomDebugPath, `${JSON.stringify({ at: new Date().toISOString(), ...event })}\n`);
+}
+
+function cloneBytes(bytes: Uint8Array): Uint8Array {
+  return new Uint8Array(bytes);
+}
+
+randomTest("github e2e: random real-usage actions preserve vault state", { timeout: envNumber("GITHUB_E2E_RANDOM_TIMEOUT_MS", envNumber("GITHUB_E2E_RANDOM_DURATION_MS", 600000) + 600000) }, async () => {
+  const config = githubConfig();
+  const client = await resetTestBranch(config);
+  const durationMs = envNumber("GITHUB_E2E_RANDOM_DURATION_MS", 600000);
+  const seed = envNumber("GITHUB_E2E_RANDOM_SEED", Date.now() >>> 0);
+  const random = new DeterministicRandom(seed);
+  const maxAddFiles = envNumber("GITHUB_E2E_RANDOM_MAX_ADD_FILES", 5000);
+  const maxEditFiles = envNumber("GITHUB_E2E_RANDOM_MAX_EDIT_FILES", 2000);
+  const maxEditChars = envNumber("GITHUB_E2E_RANDOM_MAX_EDIT_CHARS", 100);
+  const maxDeleteFiles = envNumber("GITHUB_E2E_RANDOM_MAX_DELETE_FILES", 2000);
+  const maxRenameFiles = envNumber("GITHUB_E2E_RANDOM_MAX_RENAME_FILES", 1000);
+  const maxMoveFiles = envNumber("GITHUB_E2E_RANDOM_MAX_MOVE_FILES", 1000);
+  const maxImages = envNumber("GITHUB_E2E_RANDOM_MAX_IMAGES", 25);
+  const loopMaxAddFiles = envNumber("GITHUB_E2E_RANDOM_LOOP_MAX_ADD_FILES", Math.min(maxAddFiles, 500));
+  const loopMaxEditFiles = envNumber("GITHUB_E2E_RANDOM_LOOP_MAX_EDIT_FILES", Math.min(maxEditFiles, 500));
+  const loopMaxDeleteFiles = envNumber("GITHUB_E2E_RANDOM_LOOP_MAX_DELETE_FILES", Math.min(maxDeleteFiles, 500));
+  const loopMaxRenameFiles = envNumber("GITHUB_E2E_RANDOM_LOOP_MAX_RENAME_FILES", Math.min(maxRenameFiles, 250));
+  const loopMaxMoveFiles = envNumber("GITHUB_E2E_RANDOM_LOOP_MAX_MOVE_FILES", Math.min(maxMoveFiles, 250));
+  const loopMaxImages = envNumber("GITHUB_E2E_RANDOM_LOOP_MAX_IMAGES", maxImages);
+  const verifyEvery = Math.floor(envNumber("GITHUB_E2E_RANDOM_VERIFY_EVERY", 0));
+  const source = new RealE2EVault();
+  const expected = new Map<string, Uint8Array>();
+  const instance = plugin(source, client) as never;
+  let fileSerial = 0;
+  let imageSerial = 0;
+  let step = 0;
+
+  await resetRandomDebug();
+  await appendRandomDebug({ phase: "start", seed, durationMs, maxAddFiles, maxEditFiles, maxEditChars, maxDeleteFiles, maxRenameFiles, maxMoveFiles, maxImages, loopMaxAddFiles, loopMaxEditFiles, loopMaxDeleteFiles, loopMaxRenameFiles, loopMaxMoveFiles, loopMaxImages, verifyEvery });
+  await measure("random.initialForcePush", () => encryptedForcePush(instance));
+
+  async function syncRandomStep(action: string, changedCount: number, samples: string[]): Promise<void> {
+    const afterMutation = { files: expected.size, bytes: randomTotalBytes(expected), changedCount, samples };
+    await appendRandomDebug({ phase: "after-mutation-before-sync", step, action, afterMutation });
+    await measure(`random.step.${step}.${action}`, () => encryptedFullSync(instance), { step, action, files: afterMutation.files, bytes: afterMutation.bytes });
+    if (verifyEvery > 0 && step % verifyEvery === 0) {
+      const pulled = new RealE2EVault();
+      await measure(`random.verify.${step}`, () => encryptedForcePull(plugin(pulled, client) as never), { step, expectedFiles: expected.size });
+      const comparison = mapsEqualBytes(pulled.files, expected);
+      await appendRandomDebug({ phase: "verify", step, action, afterMutation, comparison });
+      assert.equal(comparison.ok, true, comparison.ok ? undefined : comparison.reason);
+    } else {
+      await appendRandomDebug({ phase: "after", step, action, afterMutation });
+    }
+  }
+
+  step += 1;
+  await appendRandomDebug({ phase: "before", step, action: "mandatoryAddFiles", before: { files: expected.size, bytes: randomTotalBytes(expected) } });
+  {
+    const samples: string[] = [];
+    for (let index = 0; index < maxAddFiles; index++) {
+      const filePath = `notes/bulk/note-${String(fileSerial++).padStart(6, "0")}-${random.int(0, 999999)}.md`;
+      const bytes = new TextEncoder().encode(randomAscii(random, random.int(1, Math.max(1, maxEditChars))));
+      source.set(filePath, bytes);
+      expected.set(filePath, cloneBytes(bytes));
+      if (samples.length < 10) samples.push(filePath);
+    }
+    await syncRandomStep("mandatoryAddFiles", maxAddFiles, samples);
+  }
+
+  step += 1;
+  await appendRandomDebug({ phase: "before", step, action: "mandatoryEditText", before: { files: expected.size, bytes: randomTotalBytes(expected) } });
+  {
+    const samples: string[] = [];
+    const textPaths = [...expected.keys()].filter(filePath => /\.(md|txt)$/iu.test(filePath));
+    const count = Math.min(textPaths.length, maxEditFiles);
+    for (let index = 0; index < count; index++) {
+      const filePath = textPaths[index];
+      const current = new TextDecoder().decode(expected.get(filePath) ?? new Uint8Array());
+      const next = `${current}${randomAscii(random, Math.max(1, maxEditChars))}`;
+      const bytes = new TextEncoder().encode(next);
+      source.set(filePath, bytes);
+      expected.set(filePath, cloneBytes(bytes));
+      if (samples.length < 10) samples.push(filePath);
+    }
+    await syncRandomStep("mandatoryEditText", count, samples);
+  }
+
+  step += 1;
+  await appendRandomDebug({ phase: "before", step, action: "mandatoryDeleteFiles", before: { files: expected.size, bytes: randomTotalBytes(expected) } });
+  {
+    const samples: string[] = [];
+    const paths = [...expected.keys()];
+    const count = Math.min(paths.length, maxDeleteFiles);
+    for (let index = 0; index < count; index++) {
+      const filePath = paths[index];
+      source.files.delete(filePath);
+      source.mtimes.delete(filePath);
+      expected.delete(filePath);
+      if (samples.length < 10) samples.push(filePath);
+    }
+    await syncRandomStep("mandatoryDeleteFiles", count, samples);
+  }
+
+  const started = performance.now();
+  while (performance.now() - started < durationMs) {
+    step += 1;
+    const existingPaths = [...expected.keys()];
+    const textPaths = existingPaths.filter(filePath => /\.(md|txt)$/iu.test(filePath));
+    const actionPool = existingPaths.length === 0 ? ["addFiles"] : ["addFiles", "editText", "addImages", "deleteFiles", "renameFiles", "moveFiles"];
+    const action = random.pick(actionPool);
+    const samples: string[] = [];
+    const before = { files: expected.size, bytes: randomTotalBytes(expected) };
+
+    await appendRandomDebug({ phase: "before", step, action, before });
+    let changedCount = 0;
+    if (action === "addFiles") {
+      const count = random.int(1, Math.max(1, loopMaxAddFiles));
+      changedCount = count;
+      for (let index = 0; index < count; index++) {
+        const filePath = `notes/b${random.int(0, 99)}/note-${String(fileSerial++).padStart(6, "0")}-${random.int(0, 999999)}.md`;
+        const bytes = new TextEncoder().encode(randomAscii(random, random.int(1, Math.max(1, maxEditChars))));
+        source.set(filePath, bytes);
+        expected.set(filePath, cloneBytes(bytes));
+        if (samples.length < 5) samples.push(filePath);
+      }
+    } else if (action === "editText" && textPaths.length > 0) {
+      const count = Math.min(textPaths.length, random.int(1, Math.max(1, loopMaxEditFiles)));
+      changedCount = count;
+      for (let index = 0; index < count; index++) {
+        const filePath = random.pick(textPaths);
+        const current = new TextDecoder().decode(expected.get(filePath) ?? new Uint8Array());
+        const editLength = random.int(1, Math.max(1, maxEditChars));
+        const next = random.next() < 0.5
+          ? current.slice(0, Math.max(0, current.length - editLength))
+          : `${current}${randomAscii(random, editLength)}`;
+        const bytes = new TextEncoder().encode(next);
+        source.set(filePath, bytes);
+        expected.set(filePath, cloneBytes(bytes));
+        if (samples.length < 5) samples.push(filePath);
+      }
+    } else if (action === "addImages") {
+      const count = random.int(1, Math.max(1, loopMaxImages));
+      changedCount = count;
+      for (let index = 0; index < count; index++) {
+        const filePath = `assets/random-${String(imageSerial++).padStart(5, "0")}-${random.int(0, 999999)}.png`;
+        const bytes = randomImageBytes(random, random.int(1024, 64 * 1024));
+        source.set(filePath, bytes);
+        expected.set(filePath, cloneBytes(bytes));
+        if (samples.length < 5) samples.push(filePath);
+      }
+    } else if (action === "deleteFiles" && existingPaths.length > 0) {
+      const count = Math.min(existingPaths.length, random.int(1, Math.max(1, loopMaxDeleteFiles)));
+      changedCount = count;
+      for (let index = 0; index < count; index++) {
+        const filePath = random.pick([...expected.keys()]);
+        source.files.delete(filePath);
+        source.mtimes.delete(filePath);
+        expected.delete(filePath);
+        if (samples.length < 5) samples.push(filePath);
+      }
+    } else if ((action === "renameFiles" || action === "moveFiles") && existingPaths.length > 0) {
+      const limit = action === "renameFiles" ? loopMaxRenameFiles : loopMaxMoveFiles;
+      const count = Math.min(existingPaths.length, random.int(1, Math.max(1, limit)));
+      changedCount = count;
+      for (let index = 0; index < count; index++) {
+        const oldPath = random.pick([...expected.keys()]);
+        const bytes = expected.get(oldPath);
+        if (!bytes) continue;
+        const extension = oldPath.endsWith(".png") ? "png" : "md";
+        const newPath = action === "moveFiles"
+          ? `moved/f${random.int(0, 50)}/${String(fileSerial++).padStart(6, "0")}-${random.int(0, 999999)}.${extension}`
+          : oldPath.replace(/[^/]+$/u, `renamed-${String(fileSerial++).padStart(6, "0")}-${random.int(0, 999999)}.${extension}`);
+        source.files.delete(oldPath);
+        source.mtimes.delete(oldPath);
+        source.set(newPath, cloneBytes(bytes));
+        expected.delete(oldPath);
+        expected.set(newPath, cloneBytes(bytes));
+        if (samples.length < 5) samples.push(`${oldPath} -> ${newPath}`);
+      }
+    }
+
+    await syncRandomStep(action, changedCount, samples);
+  }
+
+  const pulled = new RealE2EVault();
+  await measure("random.finalVerify", () => encryptedForcePull(plugin(pulled, client) as never), { expectedFiles: expected.size });
+  const comparison = mapsEqualBytes(pulled.files, expected);
+  await appendRandomDebug({ phase: "complete", seed, steps: step, files: expected.size, bytes: randomTotalBytes(expected), comparison });
+  assert.equal(comparison.ok, true, comparison.ok ? undefined : comparison.reason);
+});
 benchmarkTest("github e2e: benchmark large chunked object on real GitHub", { timeout: 600000 }, async () => {
   const config = githubConfig();
   const client = await resetTestBranch(config);

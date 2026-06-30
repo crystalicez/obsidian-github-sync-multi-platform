@@ -8,10 +8,12 @@ import { planEncryptedPacks } from "./pack-planner";
 import { downloadEncryptedPack, uploadEncryptedPack } from "./pack-sync";
 import { chooseEncryptedStorageMode } from "./scale-policy";
 import { EncryptedManifestStore } from "./manifest-store";
+import { EncryptedSnapshotStore } from "./snapshot-store";
 import { classifyRemoteRepo } from "./remote-state";
 import { conflictPathFor, normalizeVaultPath } from "./paths";
 import { reportSyncError } from "./sync-errors";
-import { ConflictPolicy, EncryptedLocalFileState, EncryptedManifest, EncryptedPackManifestRecord, EncryptedSyncOperation } from "./types";
+import { ConflictPolicy, EncryptedLocalFileState, EncryptedManifest, EncryptedObjectRecord, EncryptedPackManifestRecord, EncryptedSyncOperation } from "./types";
+import type { EncryptedSnapshotFileRecord, EncryptedSnapshotManifest, EncryptedSnapshotPackRecord } from "./snapshot-types";
 import { effectiveConflictPolicy } from "./settings-policy";
 import { deleteVaultFileIfExists, listEncryptedSyncCandidates, readVaultFileBytes, shouldSyncEncryptedFile, writeVaultFileBytes } from "./vault";
 import { randomBytes, sha256Hex, toBase64Url } from "./bytes";
@@ -106,9 +108,120 @@ function blockIfEncryptedForcePushRequired(plugin: FastSync, operation: Encrypte
   return true;
 }
 
-async function loadStore(plugin: FastSync, allowForeignInit: boolean = false) {
+async function loadKey(plugin: FastSync, allowForeignInit: boolean = false) {
   const store = new EncryptedManifestStore(plugin.githubClient, requireEncryptedPassphrase(plugin), allowForeignInit);
-  return { store, ...(await store.loadOrCreate()) };
+  return store.loadOrCreateKey();
+}
+
+function snapshotStorageForRecord(record: EncryptedObjectRecord): EncryptedSnapshotFileRecord["storage"] {
+  if (record.storage === "pack") return "pack";
+  if (record.storage === "chunked") return "chunked";
+  return "object";
+}
+
+function snapshotRecordFromManifestRecord(record: EncryptedObjectRecord): EncryptedSnapshotFileRecord {
+  return {
+    path: record.path,
+    objectId: record.id,
+    storage: snapshotStorageForRecord(record),
+    objectPath: record.objectPath,
+    remoteSha: record.remoteSha,
+    plaintextSha256: record.plaintextSha256,
+    size: record.size,
+    mtime: record.mtime,
+    packId: record.packId,
+    chunkIds: record.chunks?.map(chunk => `${record.id}:${chunk.index}`),
+    chunks: record.chunks,
+    deleted: record.deleted,
+    deletedAt: record.deletedAt,
+  };
+}
+
+function manifestPackToSnapshotPack(pack: EncryptedPackManifestRecord): EncryptedSnapshotPackRecord {
+  return { ...pack };
+}
+
+function snapshotPackToManifestPack(pack: EncryptedSnapshotPackRecord): EncryptedPackManifestRecord {
+  return { ...pack };
+}
+
+function snapshotRecordToManifestRecord(record: EncryptedSnapshotFileRecord): EncryptedObjectRecord {
+  return {
+    id: record.objectId,
+    path: record.path,
+    objectPath: record.objectPath ?? "",
+    plaintextSha256: record.plaintextSha256,
+    remoteSha: record.remoteSha,
+    storage: record.storage === "object" ? "single" : record.storage,
+    chunks: record.chunks,
+    packId: record.packId,
+    size: record.size,
+    mtime: record.mtime,
+    deleted: record.deleted,
+    deletedAt: record.deletedAt,
+  };
+}
+
+function manifestToSnapshot(manifest: EncryptedManifest, previousHead: { head: { snapshotId: string; generation: number } } | null): EncryptedSnapshotManifest {
+  const now = Date.now();
+  const packs = manifest.packs ? Object.fromEntries(Object.entries(manifest.packs).map(([id, pack]) => [id, manifestPackToSnapshotPack(pack)])) : undefined;
+  return {
+    formatVersion: 2,
+    snapshotId: toBase64Url(randomBytes(18)),
+    parentSnapshotIds: previousHead ? [previousHead.head.snapshotId] : [],
+    generation: (previousHead?.head.generation ?? 0) + 1,
+    createdAt: now,
+    files: Object.fromEntries(Object.entries(manifest.files).map(([path, record]) => [path, snapshotRecordFromManifestRecord(record)])),
+    packs,
+  };
+}
+
+function snapshotToManifest(snapshot: EncryptedSnapshotManifest): EncryptedManifest {
+  const packs = snapshot.packs ? Object.fromEntries(Object.entries(snapshot.packs).map(([id, pack]) => [id, snapshotPackToManifestPack(pack)])) : undefined;
+  return {
+    formatVersion: 1,
+    indexMode: "single",
+    updatedAt: snapshot.createdAt,
+    files: Object.fromEntries(Object.entries(snapshot.files).map(([path, record]) => [path, snapshotRecordToManifestRecord(record)])),
+    packs,
+  };
+}
+
+async function saveEncryptedSnapshotFromManifest(plugin: FastSync, key: CryptoKey, manifest: EncryptedManifest): Promise<string | undefined> {
+  const snapshotStore = new EncryptedSnapshotStore(plugin.githubClient, key);
+  const previousHead = await snapshotStore.loadHead();
+  const snapshot = manifestToSnapshot(manifest, previousHead);
+  const written = await snapshotStore.writeSnapshot(snapshot);
+  return snapshotStore.updateHeadCas({ formatVersion: 2, snapshotId: written.snapshot.snapshotId, generation: written.snapshot.generation, updatedAt: Date.now() }, previousHead?.sha);
+}
+
+function emptyEncryptedManifest(): EncryptedManifest {
+  return { formatVersion: 1, indexMode: "single", updatedAt: Date.now(), files: {}, packs: {} };
+}
+
+async function loadEncryptedSnapshotManifest(plugin: FastSync, key: CryptoKey, options: { tolerateMissingSnapshot?: boolean } = {}): Promise<EncryptedManifest | null> {
+  const snapshotStore = new EncryptedSnapshotStore(plugin.githubClient, key);
+  const head = await snapshotStore.loadHead();
+  if (!head) return null;
+  const snapshot = await snapshotStore.loadSnapshot(head.head.snapshotId);
+  if (!snapshot) {
+    if (options.tolerateMissingSnapshot) return null;
+    throw new Error("Encrypted snapshot head points to a missing snapshot.");
+  }
+  return snapshotToManifest(snapshot);
+}
+
+async function pullEncryptedSnapshotIfAvailable(plugin: FastSync, key: CryptoKey, ignoreRules: ReturnType<typeof compileIgnorePathRegex>): Promise<EncryptedManifest | null> {
+  const snapshotStore = new EncryptedSnapshotStore(plugin.githubClient, key);
+  const head = await snapshotStore.loadHead();
+  if (!head) return null;
+  const snapshot = await snapshotStore.loadSnapshot(head.head.snapshotId);
+  if (!snapshot) throw new Error("Encrypted snapshot head points to a missing snapshot.");
+  const manifest = snapshotToManifest(snapshot);
+  if (manifest.packs && Object.keys(manifest.packs).length > 0) await pullEncryptedPackChanges(plugin, key, manifest, ignoreRules, true);
+  await pullEncryptedChanges(plugin, key, manifest, true);
+  await deleteLocalFilesMissingFromRemote(plugin, manifest, ignoreRules);
+  return manifest;
 }
 async function downloadManifestRecordBytes(plugin: FastSync, key: CryptoKey, manifest: EncryptedManifest, record: EncryptedManifest["files"][string]): Promise<Uint8Array> {
   if (record.storage === "pack") {
@@ -284,29 +397,34 @@ async function encryptedSyncImpl(plugin: FastSync, options: EncryptedSyncOptions
       new Notice("Force push cancelled");
       return;
     }
-    const { store, key, manifest, manifestSha } = await loadStore(plugin, options.operation === "forcePush");
+    const { key } = await loadKey(plugin, options.operation === "forcePush");
 
+    let manifest = await loadEncryptedSnapshotManifest(plugin, key, { tolerateMissingSnapshot: options.operation === "forcePush" }) ?? emptyEncryptedManifest();
     let manifestChanged = false;
     let packsToDeleteAfterSave: EncryptedPackManifestRecord[] = [];
     if (options.operation === "forcePull") {
-      if (manifest.packs && Object.keys(manifest.packs).length > 0) await pullEncryptedPackChanges(plugin, key, manifest, ignoreRules, true);
-      await pullEncryptedChanges(plugin, key, manifest, true);
-      await deleteLocalFilesMissingFromRemote(plugin, manifest, ignoreRules);
+      const pulledManifest = await pullEncryptedSnapshotIfAvailable(plugin, key, ignoreRules);
+      if (!pulledManifest) throw new Error("No encrypted v2 snapshot found on remote. Run Force push to initialize encrypted sync.");
+      manifest = pulledManifest;
     } else if (options.operation === "forcePush") {
+      const previousPacks = Object.values(manifest.packs ?? {});
+      manifest = emptyEncryptedManifest();
       const forcePushResult = await pushEncryptedForceLocalChanges(plugin, key, manifest, ignoreRules);
       manifestChanged = forcePushResult.changed;
-      packsToDeleteAfterSave = forcePushResult.packsToDeleteAfterSave;
+      packsToDeleteAfterSave = previousPacks.length > 0 ? previousPacks : forcePushResult.packsToDeleteAfterSave;
+      await saveEncryptedSnapshotFromManifest(plugin, key, manifest);
     } else {
       if (manifest.packs && Object.keys(manifest.packs).length > 0) await pullEncryptedPackChanges(plugin, key, manifest, ignoreRules, false);
       await pullEncryptedChanges(plugin, key, manifest, false);
       const pushResult = await pushEncryptedAutoLocalChanges(plugin, key, manifest, ignoreRules);
       manifestChanged = pushResult.changed;
       packsToDeleteAfterSave = pushResult.packsToDeleteAfterSave;
+      if (manifestChanged || !(await loadEncryptedSnapshotManifest(plugin, key))) await saveEncryptedSnapshotFromManifest(plugin, key, manifest);
     }
 
-    const newManifestSha = manifestChanged || !manifestSha ? await store.save(manifest, key, manifestSha) : manifestSha;
     if (packsToDeleteAfterSave.length > 0) await deleteObsoleteRemotePacks(plugin, packsToDeleteAfterSave, manifest);
-    plugin.syncData.encrypted = { files: {}, manifestSha: newManifestSha };
+    const encryptedHead = await new EncryptedSnapshotStore(plugin.githubClient, key).loadHead();
+    plugin.syncData.encrypted = { files: {}, manifestSha: encryptedHead?.sha };
     for (const [path, record] of Object.entries(manifest.files)) {
       if (!record.deleted) {
         const stat = localStatForRecord(plugin, path, record);
@@ -388,7 +506,8 @@ async function encryptedModifyImpl(file: TAbstractFile, plugin: FastSync, eventE
     if (typeof plugin.updateStatusBar === "function") plugin.updateStatusBar();
   }
   try {
-    const { store, key, manifest, manifestSha } = await loadStore(plugin);
+    const { key } = await loadKey(plugin);
+    const manifest = await loadEncryptedSnapshotManifest(plugin, key) ?? emptyEncryptedManifest();
     const path = normalizeVaultPath(file.path);
     const state = ensureEncryptedState(plugin);
     const existing = manifest.files[path];
@@ -435,8 +554,7 @@ async function encryptedModifyImpl(file: TAbstractFile, plugin: FastSync, eventE
     const objectId = reusableExisting?.id ?? toBase64Url(randomBytes(OBJECT_ID_BYTES));
     const uploaded = await uploadEncryptedFileObject(plugin.githubClient, key, objectId, plaintext, reusableExisting);
     manifest.files[path] = { ...uploaded, path, plaintextSha256, mtime: file.stat.mtime, deleted: false, deletedAt: undefined };
-    const newManifestSha = await store.save(manifest, key, manifestSha);
-    state.manifestSha = newManifestSha;
+    state.manifestSha = await saveEncryptedSnapshotFromManifest(plugin, key, manifest);
     state.files[path] = { plaintextSha256, objectPath: manifest.files[path].objectPath, remoteSha: manifest.files[path].remoteSha, storage: manifest.files[path].storage, chunks: manifest.files[path].chunks, manifestUpdatedAt: manifest.updatedAt, size: file.stat.size, mtime: file.stat.mtime };
     await plugin.saveSyncData();
 
@@ -492,7 +610,8 @@ async function encryptedDeleteImpl(fileOrPath: string | TAbstractFile, plugin: F
     if (typeof plugin.updateStatusBar === "function") plugin.updateStatusBar();
   }
   try {
-    const { store, key, manifest, manifestSha } = await loadStore(plugin);
+    const { key } = await loadKey(plugin);
+    const manifest = await loadEncryptedSnapshotManifest(plugin, key) ?? emptyEncryptedManifest();
     const path = normalizeVaultPath(filePath);
     const record = manifest.files[path];
     const state = ensureEncryptedState(plugin);
@@ -512,7 +631,7 @@ async function encryptedDeleteImpl(fileOrPath: string | TAbstractFile, plugin: F
     if (record) {
       record.deleted = true;
       record.deletedAt = Date.now();
-      await store.save(manifest, key, manifestSha);
+      state.manifestSha = await saveEncryptedSnapshotFromManifest(plugin, key, manifest);
       delete state.files[path];
       await plugin.saveSyncData();
     }
@@ -574,7 +693,8 @@ async function encryptedRenameImpl(newFileOrPath: string | TAbstractFile, oldFil
     if (typeof plugin.updateStatusBar === "function") plugin.updateStatusBar();
   }
   try {
-    const { store, key, manifest, manifestSha } = await loadStore(plugin);
+    const { key } = await loadKey(plugin);
+    const manifest = await loadEncryptedSnapshotManifest(plugin, key) ?? emptyEncryptedManifest();
     const oldPath = normalizeVaultPath(oldfile);
     const newPath = normalizeVaultPath(newfile);
     if (oldPath === newPath) {
@@ -607,8 +727,7 @@ async function encryptedRenameImpl(newFileOrPath: string | TAbstractFile, oldFil
       newRecord = { ...uploaded, path: newPath, plaintextSha256, mtime: file.stat.mtime, deleted: false, deletedAt: undefined };
     }
     manifest.files[newPath] = newRecord;
-    const newManifestSha = await store.save(manifest, key, manifestSha);
-    state.manifestSha = newManifestSha;
+    state.manifestSha = await saveEncryptedSnapshotFromManifest(plugin, key, manifest);
     delete state.files[oldPath];
     state.files[newPath] = { plaintextSha256, objectPath: newRecord.objectPath, remoteSha: newRecord.remoteSha, storage: newRecord.storage, chunks: newRecord.chunks, packId: newRecord.packId, manifestUpdatedAt: manifest.updatedAt, size: file.stat.size, mtime: file.stat.mtime };
     await plugin.saveSyncData();
@@ -714,7 +833,8 @@ async function pushEncryptedAutoLocalChanges(plugin: FastSync, key: CryptoKey, m
   const localFiles = listEncryptedSyncCandidates(plugin.app.vault, ignoreRules);
   const totalBytes = localFiles.reduce((sum, file) => sum + file.stat.size, 0);
   const previousPacks = Object.values(manifest.packs ?? {});
-  if (chooseEncryptedStorageMode({ fileCount: localFiles.length, totalBytes }) === "pack") {
+  const remoteAlreadyPacked = previousPacks.length > 0 || Object.values(manifest.files).some(record => !record.deleted && record.storage === "pack");
+  if (remoteAlreadyPacked || chooseEncryptedStorageMode({ fileCount: localFiles.length, totalBytes }) === "pack") {
     if (canSkipPackUpload(plugin, manifest, localFiles)) return { changed: false, packsToDeleteAfterSave: [] };
     return { changed: await pushEncryptedPackLocalChanges(plugin, key, manifest, localFiles), packsToDeleteAfterSave: previousPacks };
   }

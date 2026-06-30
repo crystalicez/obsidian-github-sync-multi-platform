@@ -121,9 +121,13 @@ async function cachedEncryptionKey(passphrase: string, config: EncryptedRepoConf
 export class EncryptedManifestStore {
   constructor(private readonly github: GitHubClient, private readonly passphrase: string, private readonly allowForeignInit: boolean = false) {}
 
-  async loadOrCreate(): Promise<{ config: EncryptedRepoConfig; manifest: EncryptedManifest; manifestSha?: string; key: CryptoKey }> {
+  async loadOrCreateKey(): Promise<{ config: EncryptedRepoConfig; key: CryptoKey }> {
     const config = await this.loadOrCreateConfig();
-    const key = await cachedEncryptionKey(this.passphrase, config);
+    return { config, key: await cachedEncryptionKey(this.passphrase, config) };
+  }
+
+  async loadOrCreate(): Promise<{ config: EncryptedRepoConfig; manifest: EncryptedManifest; manifestSha?: string; key: CryptoKey }> {
+    const { config, key } = await this.loadOrCreateKey();
     const remoteManifest = await readGitHubBlobOrFileBytes(this.github, ENCRYPTED_MANIFEST_PATH, undefined);
     if (!remoteManifest) {
       return {

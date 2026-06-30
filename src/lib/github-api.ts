@@ -126,6 +126,15 @@ export class GitHubClient {
     }
   }
 
+  async putFileCas(path: string, content: string | ArrayBuffer, sha?: string): Promise<string> {
+    const response = await this._doPutRequest(path, content, sha);
+    if (response.status === 200 || response.status === 201) {
+      return (response.json as { content: { sha: string } }).content.sha;
+    }
+    const error = new Error(`Failed to put file with CAS: ${response.status} ${response.text}`) as Error & { status?: number };
+    error.status = response.status;
+    throw error;
+  }
   async putFile(path: string, content: string | ArrayBuffer, sha?: string): Promise<string> {
     const response = await this._doPutRequest(path, content, sha);
 

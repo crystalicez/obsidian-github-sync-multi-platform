@@ -12,6 +12,10 @@ const tsEntries = [
   "tests/encrypted/benchmark.test.ts",
   "tests/encrypted/settings-combinations.test.ts",
   "tests/encrypted/pack-planner.test.ts",
+  "tests/encrypted/snapshot-store.test.ts",
+  "tests/encrypted/snapshot-merge.test.ts",
+  "tests/encrypted/change-queue.test.ts",
+  "tests/encrypted/sync-planner.test.ts",
 ];
 
 await rm(outDir, { recursive: true, force: true });

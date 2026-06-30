@@ -6,7 +6,9 @@ import { NoteDelete, NoteModify, NoteRename, overrideLocalAllFilesImpl, override
 import { hashContent } from "../../src/lib/helps";
 import { GitHubClient } from "../../src/lib/github-api";
 import { EncryptedManifestStore } from "../../src/lib/encrypted/manifest-store";
+import { EncryptedSnapshotStore, V2_HEAD_PATH, V2_SNAPSHOTS_ROOT } from "../../src/lib/encrypted/snapshot-store";
 import { sha256Hex, utf8ToBytes } from "../../src/lib/encrypted/bytes";
+import { ENCRYPTED_MANIFEST_PATH } from "../../src/lib/encrypted/constants";
 
 class MemoryGitHub {
   blobs = new Map<string, { content: string; sha: string }>();
@@ -214,6 +216,26 @@ function plugin(vault: MemoryVault, github: MemoryGitHub) {
   };
 }
 
+async function loadV2Snapshot(github: MemoryGitHub) {
+  const loaded = await new EncryptedManifestStore(github as unknown as GitHubClient, "correct horse battery staple", true).loadOrCreateKey();
+  const snapshotStore = new EncryptedSnapshotStore(github as unknown as GitHubClient, loaded.key);
+  const head = await snapshotStore.loadHead();
+  assert.ok(head);
+  const snapshot = await snapshotStore.loadSnapshot(head.head.snapshotId);
+  assert.ok(snapshot);
+  return { loaded, snapshotStore, head, snapshot };
+}
+
+async function mutateV2Snapshot(github: MemoryGitHub, mutate: (snapshot: Awaited<ReturnType<typeof loadV2Snapshot>>["snapshot"]) => void | Promise<void>) {
+  const { snapshotStore, head, snapshot } = await loadV2Snapshot(github);
+  await mutate(snapshot);
+  snapshot.snapshotId = `${snapshot.snapshotId}-mutated-${Date.now()}`;
+  snapshot.parentSnapshotIds = [head.head.snapshotId];
+  snapshot.generation = head.head.generation + 1;
+  const written = await snapshotStore.writeSnapshot(snapshot);
+  await snapshotStore.updateHeadCas({ formatVersion: 2, snapshotId: written.snapshot.snapshotId, generation: written.snapshot.generation, updatedAt: Date.now() }, head.sha);
+  return written.snapshot;
+}
 function plaintextPlugin(vault: MemoryVault, github: MemoryGitHub) {
   const instance = plugin(vault, github) as ReturnType<typeof plugin>;
   instance.settings.encryptionMode = "plaintext";
@@ -256,7 +278,7 @@ test("force push then force pull round trips encrypted vault bytes", async () =>
 
   assert.equal([...github.blobs.keys()].some(path => path.includes("Notes/a.md")), false);
   assert.equal(github.blobs.has(".obsidian-github-sync-encrypted/config.json"), true);
-  assert.equal(github.blobs.has(".obsidian-github-sync-encrypted/manifest.enc"), true);
+  assert.equal(github.blobs.has(ENCRYPTED_MANIFEST_PATH), false);
 
   const targetVault = new MemoryVault({ "local-only.md": "delete me" });
   await encryptedForcePull(plugin(targetVault, github) as never);
@@ -265,20 +287,71 @@ test("force push then force pull round trips encrypted vault bytes", async () =>
   assert.equal(targetVault.files.has("local-only.md"), false);
 });
 
+test("encrypted force push writes a v2 snapshot head without plaintext remote paths", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault({ "Notes/private.md": "secret v2 snapshot" });
+  const instance = plugin(vault, github) as never;
+
+  await encryptedForcePush(instance);
+
+  assert.equal(github.blobs.has(V2_HEAD_PATH), true);
+  assert.equal(github.blobs.has(ENCRYPTED_MANIFEST_PATH), false);
+  const snapshotPath = [...github.blobs.keys()].find(path => path.startsWith(`${V2_SNAPSHOTS_ROOT}/`));
+  assert.equal(typeof snapshotPath, "string");
+  assert.equal(github.blobs.get(V2_HEAD_PATH)?.content.includes("Notes/private.md"), false);
+  assert.equal(github.blobs.get(snapshotPath!)?.content.includes("Notes/private.md"), false);
+});
+
+test("encrypted force push overwrites a dangling v2 snapshot head", async () => {
+  const github = new MemoryGitHub();
+  const loaded = await new EncryptedManifestStore(github as unknown as GitHubClient, "correct horse battery staple", true).loadOrCreateKey();
+  const snapshotStore = new EncryptedSnapshotStore(github as unknown as GitHubClient, loaded.key);
+  await snapshotStore.updateHeadCas({ formatVersion: 2, snapshotId: "missing-snapshot", generation: 1, updatedAt: Date.now() });
+
+  const vault = new MemoryVault({ "Notes/a.md": "replacement" });
+  await encryptedForcePush(plugin(vault, github) as never);
+
+  const { snapshot } = await loadV2Snapshot(github);
+  assert.equal(snapshot.files["Notes/a.md"].deleted, false);
+  assert.equal(github.blobs.has(ENCRYPTED_MANIFEST_PATH), false);
+});
+test("encrypted force push ignores corrupt legacy v1 manifest metadata", async () => {
+  const github = new MemoryGitHub();
+  await new EncryptedManifestStore(github as unknown as GitHubClient, "correct horse battery staple", true).loadOrCreateKey();
+  await github.putFile(ENCRYPTED_MANIFEST_PATH, "not a decryptable v1 manifest");
+
+  const vault = new MemoryVault({ "Notes/a.md": "v2 wins" });
+  await encryptedForcePush(plugin(vault, github) as never);
+
+  const { snapshot } = await loadV2Snapshot(github);
+  assert.equal(snapshot.files["Notes/a.md"].deleted, false);
+  assert.equal(github.blobs.has(V2_HEAD_PATH), true);
+});
+test("encrypted force pull prefers v2 snapshot when available", async () => {
+  const github = new MemoryGitHub();
+  const sourceVault = new MemoryVault({ "Notes/private.md": "from v2 snapshot" });
+  await encryptedForcePush(plugin(sourceVault, github) as never);
+
+  const targetVault = new MemoryVault({ "local-only.md": "delete me" });
+  await encryptedForcePull(plugin(targetVault, github) as never);
+
+  assert.equal(new TextDecoder().decode(targetVault.files.get("Notes/private.md")), "from v2 snapshot");
+  assert.equal(targetVault.files.has("local-only.md"), false);
+});
 test("normal encrypted sync skips unchanged file reads and manifest writes", async () => {
   const github = new MemoryGitHub();
   const vault = new MemoryVault({ "Notes/a.md": "stable content" });
   const instance = plugin(vault, github) as never;
 
   await encryptedForcePush(instance);
-  const manifestPutsAfterInitialPush = github.putCounts.get(".obsidian-github-sync-encrypted/manifest.enc") ?? 0;
+  const headPutsAfterInitialPush = github.putCounts.get(V2_HEAD_PATH) ?? 0;
   vault.readBinaryCount = 0;
 
   await encryptedFullSync(instance);
 
 
   assert.equal(vault.readBinaryCount, 0);
-  assert.equal(github.putCounts.get(".obsidian-github-sync-encrypted/manifest.enc") ?? 0, manifestPutsAfterInitialPush);
+  assert.equal(github.putCounts.get(V2_HEAD_PATH) ?? 0, headPutsAfterInitialPush);
 });
 test("encrypted local modify pushes only the changed file without scanning the vault", async () => {
   const github = new MemoryGitHub();
@@ -306,10 +379,10 @@ test("encrypted sync requires force push after enabling encryption from plaintex
   await withMutedConsoleError(async () => {
     await encryptedFullSync(instance);
   });
-  assert.equal(github.blobs.has(".obsidian-github-sync-encrypted/manifest.enc"), false);
+  assert.equal(github.blobs.has(ENCRYPTED_MANIFEST_PATH), false);
 
   await encryptedForcePush(instance);
-  assert.equal(github.blobs.has(".obsidian-github-sync-encrypted/manifest.enc"), true);
+  assert.equal(github.blobs.has(ENCRYPTED_MANIFEST_PATH), false);
   assert.equal((instance as { settings: { encryptedForcePushRequired?: boolean } }).settings.encryptedForcePushRequired, false);
 });
 
@@ -342,13 +415,13 @@ test("normal encrypted sync skips remote pack downloads and uploads when pack st
   assert.equal(packPaths.length > 0, true);
   const packGetsAfterPull = new Map(packPaths.map(path => [path, github.getCounts.get(path) ?? 0]));
   const packPutsAfterPull = new Map(packPaths.map(path => [path, github.putCounts.get(path) ?? 0]));
-  const manifestPutsAfterPull = github.putCounts.get(".obsidian-github-sync-encrypted/manifest.enc") ?? 0;
+  const headPutsAfterPull = github.putCounts.get(V2_HEAD_PATH) ?? 0;
   targetVault.readBinaryCount = 0;
 
   await encryptedFullSync(target);
 
   assert.equal(targetVault.readBinaryCount, 0);
-  assert.equal(github.putCounts.get(".obsidian-github-sync-encrypted/manifest.enc") ?? 0, manifestPutsAfterPull);
+  assert.equal(github.putCounts.get(V2_HEAD_PATH) ?? 0, headPutsAfterPull);
   for (const path of packPaths) {
     assert.equal(github.getCounts.get(path) ?? 0, packGetsAfterPull.get(path));
     assert.equal(github.putCounts.get(path) ?? 0, packPutsAfterPull.get(path));
@@ -399,7 +472,7 @@ test("encrypted local modify is blocked until force push after enabling encrypti
     await encryptedModify(vault.getAbstractFileByPath("Notes/a.md") as TFile, instance, true);
   });
 
-  assert.equal(github.blobs.has(".obsidian-github-sync-encrypted/manifest.enc"), false);
+  assert.equal(github.blobs.has(ENCRYPTED_MANIFEST_PATH), false);
 });
 
 test("force pull refuses pack files whose plaintext hash differs from the manifest", async () => {
@@ -408,10 +481,9 @@ test("force pull refuses pack files whose plaintext hash differs from the manife
   const source = plugin(sourceVault, github) as never;
   await encryptedForcePush(source);
 
-  const store = new EncryptedManifestStore(github as unknown as GitHubClient, "correct horse battery staple");
-  const loaded = await store.loadOrCreate();
-  loaded.manifest.files["Notes/note-00000.md"].plaintextSha256 = "0".repeat(64);
-  await store.save(loaded.manifest, loaded.key, loaded.manifestSha);
+  await mutateV2Snapshot(github, snapshot => {
+    snapshot.files["Notes/note-00000.md"].plaintextSha256 = "0".repeat(64);
+  });
 
   const targetVault = new MemoryVault({});
   const target = plugin(targetVault, github) as never;
@@ -441,11 +513,10 @@ test("encrypted rename moves manifest state without scanning the whole vault", a
 
   assert.equal(vault.getFilesCount, 0);
   assert.equal(vault.readBinaryCount, 1);
-  const store = new EncryptedManifestStore(github as unknown as GitHubClient, "correct horse battery staple");
-  const loaded = await store.loadOrCreate();
-  assert.equal(loaded.manifest.files["Notes/old.md"].deleted, true);
-  assert.equal(loaded.manifest.files["Archive/new.md"].deleted, false);
-  assert.equal(loaded.manifest.files["Archive/new.md"].objectPath, loaded.manifest.files["Notes/old.md"].objectPath);
+  const { snapshot } = await loadV2Snapshot(github);
+  assert.equal(snapshot.files["Notes/old.md"].deleted, true);
+  assert.equal(snapshot.files["Archive/new.md"].deleted, false);
+  assert.equal(snapshot.files["Archive/new.md"].objectPath, snapshot.files["Notes/old.md"].objectPath);
   assert.equal([...github.blobs.keys()].filter(path => path.startsWith(".obsidian-github-sync-encrypted/objects/")).length, oldObjectCount);
 });
 
@@ -461,10 +532,9 @@ test("force push after a large vault shrinks clears obsolete pack metadata and r
   vault.set("Notes/only.md", new TextEncoder().encode("small"));
   await encryptedForcePush(instance);
 
-  const store = new EncryptedManifestStore(github as unknown as GitHubClient, "correct horse battery staple");
-  const loaded = await store.loadOrCreate();
-  assert.equal(Object.keys(loaded.manifest.packs ?? {}).length, 0);
-  assert.deepEqual(Object.keys(loaded.manifest.files), ["Notes/only.md"]);
+  const { snapshot } = await loadV2Snapshot(github);
+  assert.equal(Object.keys(snapshot.packs ?? {}).length, 0);
+  assert.deepEqual(Object.keys(snapshot.files), ["Notes/only.md"]);
   assert.equal([...github.blobs.keys()].some(path => path.startsWith(".obsidian-github-sync-encrypted/packs/")), false);
 });
 
@@ -473,7 +543,7 @@ test("encrypted modify events are debounced and only push the final file state",
   const vault = new MemoryVault({ "Notes/a.md": "initial" });
   const instance = plugin(vault, github) as ReturnType<typeof plugin>;
   await encryptedForcePush(instance as never);
-  const manifestPutsAfterInitialPush = github.putCounts.get(".obsidian-github-sync-encrypted/manifest.enc") ?? 0;
+  const headPutsAfterInitialPush = github.putCounts.get(V2_HEAD_PATH) ?? 0;
 
   const originalSetTimeout = globalThis.setTimeout;
   const originalClearTimeout = globalThis.clearTimeout;
@@ -492,14 +562,14 @@ test("encrypted modify events are debounced and only push the final file state",
     NoteModify(vault.getAbstractFileByPath("Notes/a.md") as TFile, instance as never, true);
     vault.set("Notes/a.md", new TextEncoder().encode("draft 2"));
     NoteModify(vault.getAbstractFileByPath("Notes/a.md") as TFile, instance as never, true);
-    assert.equal(github.putCounts.get(".obsidian-github-sync-encrypted/manifest.enc") ?? 0, manifestPutsAfterInitialPush);
+    assert.equal(github.putCounts.get(V2_HEAD_PATH) ?? 0, headPutsAfterInitialPush);
     await callbacks.at(-1)?.();
   } finally {
     globalThis.setTimeout = originalSetTimeout;
     globalThis.clearTimeout = originalClearTimeout;
   }
 
-  assert.equal(github.putCounts.get(".obsidian-github-sync-encrypted/manifest.enc") ?? 0, manifestPutsAfterInitialPush + 1);
+  assert.equal(github.putCounts.get(V2_HEAD_PATH) ?? 0, headPutsAfterInitialPush + 1);
   const pulledVault = new MemoryVault({});
   await encryptedForcePull(plugin(pulledVault, github) as never);
   assert.equal(new TextDecoder().decode(pulledVault.files.get("Notes/a.md")), "draft 2");
@@ -1158,12 +1228,28 @@ test("encrypted local change in a 2000-file vault migrates to pack mode instead 
   assert.equal(packPaths.length > 0, true);
   assert.equal(objectPaths.length, 0);
   assert.equal(vault.getFilesCount > 0, true);
-  const store = new EncryptedManifestStore(github as unknown as GitHubClient, "correct horse battery staple");
-  const loaded = await store.loadOrCreate();
-  assert.equal(Object.values(loaded.manifest.files).every(record => record.storage === "pack"), true);
+  const { snapshot } = await loadV2Snapshot(github);
+  assert.equal(Object.values(snapshot.files).every(record => record.storage === "pack"), true);
 });
 
-test("normal encrypted sync migrates legacy 2000 single-object cache after app restart", async () => {
+test("normal encrypted sync keeps pack mode after a packed vault shrinks below object threshold", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault(manyFileEntries(2_000, "packed"));
+  const instance = plugin(vault, github) as never;
+  await encryptedForcePush(instance);
+
+  vault.files.clear();
+  vault.mtimes.clear();
+  for (let index = 0; index < 878; index++) vault.set(`moved/note-${String(index).padStart(5, "0")}.md`, new TextEncoder().encode(`moved-${index}`));
+
+  await encryptedFullSync(instance);
+
+  const objectPaths = [...github.blobs.keys()].filter(path => path.startsWith(".obsidian-github-sync-encrypted/objects/"));
+  const { snapshot } = await loadV2Snapshot(github);
+  assert.equal(Object.values(snapshot.files).every(record => record.storage === "pack"), true);
+  assert.equal(objectPaths.length, 0);
+});
+test("normal encrypted sync migrates 2000-file local cache into v2 pack snapshot after app restart", async () => {
   const github = new MemoryGitHub();
   const vault = new MemoryVault(manyFileEntries(2_000, "legacy"));
   const instance = plugin(vault, github) as ReturnType<typeof plugin>;
@@ -1207,8 +1293,8 @@ test("normal encrypted sync migrates legacy 2000 single-object cache after app r
 
   const packPaths = [...github.blobs.keys()].filter(path => path.startsWith(".obsidian-github-sync-encrypted/packs/"));
   assert.equal(packPaths.length > 0, true);
-  const migrated = await store.loadOrCreate();
-  assert.equal(Object.values(migrated.manifest.files).every(record => record.storage === "pack"), true);
+  const { snapshot } = await loadV2Snapshot(github);
+  assert.equal(Object.values(snapshot.files).every(record => record.storage === "pack"), true);
 });
 test("normal encrypted sync migrates a gradually grown vault into pack mode", async () => {
   const github = new MemoryGitHub();
@@ -1222,10 +1308,9 @@ test("normal encrypted sync migrates a gradually grown vault into pack mode", as
   await encryptedFullSync(instance);
 
   assert.equal([...github.blobs.keys()].some(path => path.startsWith(".obsidian-github-sync-encrypted/packs/")), true);
-  const store = new EncryptedManifestStore(github as unknown as GitHubClient, "correct horse battery staple");
-  const loaded = await store.loadOrCreate();
-  assert.equal(Object.keys(loaded.manifest.packs ?? {}).length > 0, true);
-  assert.equal(Object.values(loaded.manifest.files).every(record => record.storage === "pack"), true);
+  const { snapshot } = await loadV2Snapshot(github);
+  assert.equal(Object.keys(snapshot.packs ?? {}).length > 0, true);
+  assert.equal(Object.values(snapshot.files).every(record => record.storage === "pack"), true);
 });
 
 test("concurrent local modifications do not overwrite remote manifest changes", async () => {
@@ -1245,11 +1330,10 @@ test("concurrent local modifications do not overwrite remote manifest changes", 
     encryptedModify(fileB, instance, false),
   ]);
 
-  const store = new EncryptedManifestStore(github as unknown as GitHubClient, "correct horse battery staple");
-  const loaded = await store.loadOrCreate();
+  const { snapshot } = await loadV2Snapshot(github);
 
-  assert.equal(loaded.manifest.files["Notes/a.md"].plaintextSha256, await sha256Hex(utf8ToBytes("updated a")));
-  assert.equal(loaded.manifest.files["Notes/b.md"].plaintextSha256, await sha256Hex(utf8ToBytes("updated b")));
+  assert.equal(snapshot.files["Notes/a.md"].plaintextSha256, await sha256Hex(utf8ToBytes("updated a")));
+  assert.equal(snapshot.files["Notes/b.md"].plaintextSha256, await sha256Hex(utf8ToBytes("updated b")));
 });
 
 test("normal encrypted sync skips download for identical single objects when cache is empty", async () => {

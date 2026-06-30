@@ -66,7 +66,7 @@ if (!compileOnly) {
   }
 }
 
-const outDir = path.join(root, ".tmp", "github-e2e");
+const outDir = path.join(root, ".tmp", "github-e2e", `${process.pid}-${Date.now()}`);
 const entry = "tests/github-e2e/real-github-e2e.test.ts";
 const outfile = path.join(outDir, "real-github-e2e.test.mjs");
 
