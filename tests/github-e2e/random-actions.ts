@@ -85,3 +85,39 @@ export function chooseRandomSyncMode(kind: RandomActionKind, changedCount: numbe
   }
   return "bulk";
 }
+
+export interface TimingRecordDetails {
+  operation?: string;
+  phase?: string;
+  files?: number;
+  changedFiles?: number;
+  bytes?: number;
+  [key: string]: number | string | boolean | undefined;
+}
+
+export interface TimingRecord extends TimingRecordDetails {
+  name: string;
+  elapsedMs: number;
+  msPerFile?: number;
+  msPerChangedFile?: number;
+}
+
+function round3(value: number): number {
+  return Math.round(value * 1000) / 1000;
+}
+
+export function formatTimingRecord(name: string, elapsedMs: number, details: TimingRecordDetails = {}): TimingRecord {
+  const files = typeof details.files === "number" ? details.files : undefined;
+  const changedFiles = typeof details.changedFiles === "number" ? details.changedFiles : undefined;
+  return {
+    ...details,
+    name,
+    elapsedMs,
+    msPerFile: files && files > 0 ? round3(elapsedMs / files) : undefined,
+    msPerChangedFile: changedFiles && changedFiles > 0 ? round3(elapsedMs / changedFiles) : undefined,
+  };
+}
+
+export function requiredChangedFileCounts(): number[] {
+  return [1, 2, 3, 4, 5, 6, 7, 8, 10, 2000];
+}

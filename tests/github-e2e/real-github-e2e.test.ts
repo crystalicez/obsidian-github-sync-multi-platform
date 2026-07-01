@@ -9,15 +9,9 @@ import { EncryptedSnapshotStore } from "../../src/lib/encrypted/snapshot-store";
 import type { EncryptedSnapshotManifest } from "../../src/lib/encrypted/snapshot-types";
 import { GitHubClient, GitHubConfig } from "../../src/lib/github-api";
 import { ENCRYPTED_CONFIG_PATH, ENCRYPTED_FORMAT_VERSION, ENCRYPTED_INDEX_MODE } from "../../src/lib/encrypted/constants";
-import { chooseRandomAction, chooseRandomSyncMode, readRandomActionConfig, readRandomActionLimits, type RandomActionKind, type RandomSyncMode } from "./random-actions";
+import { chooseRandomAction, chooseRandomSyncMode, formatTimingRecord, readRandomActionConfig, readRandomActionLimits, requiredChangedFileCounts, type RandomActionKind, type RandomSyncMode, type TimingRecord, type TimingRecordDetails } from "./random-actions";
 
-interface BenchRecord {
-  name: string;
-  elapsedMs: number;
-  details?: Record<string, number | string | boolean>;
-}
-
-const benchRecords: BenchRecord[] = [];
+const benchRecords: TimingRecord[] = [];
 const profile = process.env.GITHUB_E2E_PROFILE ?? "quick";
 const isRandomProfile = profile === "random";
 const runBenchmarks = process.env.GITHUB_E2E_RUN_BENCHMARKS === "1" || profile === "full" || profile === "stress";
@@ -334,8 +328,22 @@ function plugin(vault: RealE2EVault, githubClient: GitHubClient) {
   };
 }
 
-async function measure<T>(name: string, run: () => Promise<T>, details: BenchRecord["details"] = {}): Promise<T> {
-  console.log(`[github-e2e] start ${name}`);
+function inferOperation(name: string): string | undefined {
+  if (/forcePush/iu.test(name)) return "forcePush";
+  if (/forcePull|verify/iu.test(name)) return "forcePull";
+  if (/localModify|localDelete|localRename/iu.test(name)) return "push";
+  if (/sync|random\.step/iu.test(name)) return "push";
+  return undefined;
+}
+
+function phaseName(operation: string | undefined, boundary: "before" | "after"): string {
+  return operation ? `${boundary}-${operation.replace(/[A-Z]/gu, match => `-${match.toLowerCase()}`).replace(/^-/, "")}` : boundary;
+}
+
+async function measure<T>(name: string, run: () => Promise<T>, details: TimingRecordDetails = {}): Promise<T> {
+  const operation = details.operation ?? inferOperation(name);
+  const beforePhase = phaseName(operation, "before");
+  console.log(`[github-e2e] ${beforePhase} ${name} files=${details.files ?? "?"} changed=${details.changedFiles ?? "?"} bytes=${details.bytes ?? "?"}`);
   Notice.messages.length = 0;
   const started = performance.now();
   try {
@@ -343,15 +351,16 @@ async function measure<T>(name: string, run: () => Promise<T>, details: BenchRec
     const syncFailure = Notice.messages.find(message => /Encrypted .* failed/i.test(message));
     if (syncFailure) throw new Error(syncFailure);
     const elapsedMs = Math.round((performance.now() - started) * 100) / 100;
-    benchRecords.push({ name, elapsedMs, details });
-    console.log(`[github-e2e] done ${name}: ${elapsedMs}ms`);
+    const record = formatTimingRecord(name, elapsedMs, { ...details, operation, phase: details.phase ?? phaseName(operation, "after") });
+    benchRecords.push(record);
+    console.log(`[github-e2e] ${record.phase} ${name}: ${record.elapsedMs}ms files=${record.files ?? "?"} changed=${record.changedFiles ?? "?"} ms/file=${record.msPerFile ?? "?"} ms/changed=${record.msPerChangedFile ?? "?"}`);
+    if (name.startsWith("random.")) await appendRandomDebug({ phase: "timing", timing: record });
     return result;
   } catch (error) {
     console.error(`[github-e2e] failed ${name}: ${(error as Error).message}`);
     throw error;
   }
 }
-
 async function waitForRemoteTree(config: GitHubConfig, predicate: (paths: string[]) => boolean, label: string): Promise<void> {
   const started = Date.now();
   while (Date.now() - started < 30000) {
@@ -613,9 +622,36 @@ randomTest("github e2e: random real-usage actions preserve vault state", { timeo
   let imageSerial = 0;
 
   await resetRandomDebug();
-  await appendRandomDebug({ phase: "start", seed, actionCount, maxAddFiles, maxEditFiles, maxEditChars, maxDeleteFiles, maxRenameFiles, maxMoveFiles, maxImages, loopMaxAddFiles, loopMaxEditFiles, loopMaxDeleteFiles, loopMaxRenameFiles, loopMaxMoveFiles, loopMaxImages, verifyEvery });
-  await measure("random.initialForcePush", () => encryptedForcePush(instance));
+  await appendRandomDebug({ phase: "start", seed, actionCount, maxAddFiles, maxEditFiles, maxEditChars, maxDeleteFiles, maxRenameFiles, maxMoveFiles, maxImages, loopMaxAddFiles, loopMaxEditFiles, loopMaxDeleteFiles, loopMaxRenameFiles, loopMaxMoveFiles, loopMaxImages, verifyEvery, requiredChangedFileCounts: requiredChangedFileCounts() });
+  await measure("random.initialForcePush", () => encryptedForcePush(instance), { operation: "forcePush", files: 0, changedFiles: 0, bytes: 0 });
 
+
+  async function runRequiredCopyBatch(count: number, label: string): Promise<void> {
+    const samples: string[] = [];
+    const before = { files: expected.size, bytes: randomTotalBytes(expected) };
+    await appendRandomDebug({ phase: "before-required-copy", label, count, before });
+    for (let index = 0; index < count; index++) {
+      const filePath = `required-copy/${label}/copied-${String(fileSerial++).padStart(6, "0")}.md`;
+      const bytes = new TextEncoder().encode(`copied-${label}-${index}-${randomAscii(random, Math.max(1, Math.min(maxEditChars, 32)))}`);
+      source.set(filePath, bytes);
+      expected.set(filePath, cloneBytes(bytes));
+      if (samples.length < 5) samples.push(filePath);
+    }
+    const afterMutation = { files: expected.size, bytes: randomTotalBytes(expected), changedCount: count, samples, syncMode: "bulk" as const };
+    await appendRandomDebug({ phase: "after-required-copy-before-sync", label, afterMutation });
+    await measure(`random.requiredCopy.${label}.${count}`, () => encryptedFullSync(instance), { operation: "push", phase: "after-push", action: "requiredCopy", files: afterMutation.files, bytes: afterMutation.bytes, changedFiles: count, batchLabel: label });
+  }
+
+  for (const count of requiredChangedFileCounts()) {
+    const label = count >= 2000 ? "copy-2000-plus" : `changed-${count}`;
+    await runRequiredCopyBatch(count, label);
+  }
+
+  const requiredPulled = new RealE2EVault();
+  await measure("random.requiredCopy.verify", () => encryptedForcePull(plugin(requiredPulled, client) as never), { operation: "forcePull", files: expected.size, changedFiles: expected.size, bytes: randomTotalBytes(expected) });
+  const requiredComparison = mapsEqualBytes(requiredPulled.files, expected);
+  await appendRandomDebug({ phase: "required-copy-verify", files: expected.size, bytes: randomTotalBytes(expected), comparison: requiredComparison });
+  assert.equal(requiredComparison.ok, true, requiredComparison.ok ? undefined : requiredComparison.reason);
   async function runEventOperation(event: RandomEventOperation): Promise<void> {
     if (event.type === "modify") {
       const file = source.getAbstractFileByPath(event.path);
@@ -640,10 +676,10 @@ randomTest("github e2e: random real-usage actions preserve vault state", { timeo
       } else {
         await encryptedFullSync(instance);
       }
-    }, { step, action, syncMode, files: afterMutation.files, bytes: afterMutation.bytes, changedCount });
+    }, { step, action, syncMode, files: afterMutation.files, bytes: afterMutation.bytes, changedFiles: changedCount });
     if (verifyEvery > 0 && step % verifyEvery === 0) {
       const pulled = new RealE2EVault();
-      await measure(`random.verify.${step}`, () => encryptedForcePull(plugin(pulled, client) as never), { step, expectedFiles: expected.size });
+      await measure(`random.verify.${step}`, () => encryptedForcePull(plugin(pulled, client) as never), { step, files: expected.size, changedFiles: expected.size });
       const comparison = mapsEqualBytes(pulled.files, expected);
       await appendRandomDebug({ phase: "verify", step, action, afterMutation, comparison });
       assert.equal(comparison.ok, true, comparison.ok ? undefined : comparison.reason);
@@ -737,7 +773,7 @@ randomTest("github e2e: random real-usage actions preserve vault state", { timeo
   }
 
   const pulled = new RealE2EVault();
-  await measure("random.finalVerify", () => encryptedForcePull(plugin(pulled, client) as never), { expectedFiles: expected.size });
+  await measure("random.finalVerify", () => encryptedForcePull(plugin(pulled, client) as never), { files: expected.size, changedFiles: expected.size });
   const comparison = mapsEqualBytes(pulled.files, expected);
   await appendRandomDebug({ phase: "complete", seed, steps: actionCount, files: expected.size, bytes: randomTotalBytes(expected), comparison });
   assert.equal(comparison.ok, true, comparison.ok ? undefined : comparison.reason);

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { chooseRandomAction, chooseRandomSyncMode, readRandomActionConfig, readRandomActionLimits } from "./random-actions";
+import { chooseRandomAction, chooseRandomSyncMode, formatTimingRecord, requiredChangedFileCounts, readRandomActionConfig, readRandomActionLimits } from "./random-actions";
 
 test("github random e2e defaults to ten random actions instead of a duration loop", () => {
   const config = readRandomActionConfig({});
@@ -65,4 +65,25 @@ test("github random e2e keeps multi-file event-like actions bulk-synced", () => 
     pick: items => items[0],
   });
   assert.equal(mode, "bulk");
+});
+test("github e2e timing records include phase boundaries and per-file averages", () => {
+  const record = formatTimingRecord("forcePush.smallVault", 1234.56, {
+    operation: "forcePush",
+    phase: "after-force-push",
+    files: 10,
+    changedFiles: 2,
+    bytes: 4096,
+  });
+
+  assert.equal(record.operation, "forcePush");
+  assert.equal(record.phase, "after-force-push");
+  assert.equal(record.files, 10);
+  assert.equal(record.changedFiles, 2);
+  assert.equal(record.elapsedMs, 1234.56);
+  assert.equal(record.msPerFile, 123.456);
+  assert.equal(record.msPerChangedFile, 617.28);
+});
+
+test("github random e2e includes required changed-file batch counts", () => {
+  assert.deepEqual(requiredChangedFileCounts(), [1, 2, 3, 4, 5, 6, 7, 8, 10, 2000]);
 });
