@@ -538,6 +538,29 @@ test("encrypted auto local change updates cached remote head after pushing loose
   assert.equal(instance.syncData.lastRemoteHeadSha, github.headSha);
 });
 
+test("normal encrypted startup sync skips after a packed vault receives a loose delta", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault(manyFileEntries(2_059, "v1"));
+  const instance = plugin(vault, github) as ReturnType<typeof plugin>;
+  await encryptedForcePush(instance);
+
+  vault.set("Notes/note-00000.md", new TextEncoder().encode("v2-0"));
+  await encryptedModify(vault.getAbstractFileByPath("Notes/note-00000.md") as TFile, instance as never, true);
+
+  const headPutsAfterLocalChange = github.putCounts.get(V2_HEAD_PATH) ?? 0;
+  const snapshotGetsBeforeStartup = [...github.getCounts.entries()].filter(([path]) => path.startsWith(".obsidian-github-sync-v2/snapshots/")).reduce((sum, [, count]) => sum + count, 0);
+  vault.readBinaryCount = 0;
+  vault.getFilesCount = 0;
+
+  await encryptedFullSync(instance as never);
+
+  const snapshotGetsAfterStartup = [...github.getCounts.entries()].filter(([path]) => path.startsWith(".obsidian-github-sync-v2/snapshots/")).reduce((sum, [, count]) => sum + count, 0);
+  assert.equal(github.putCounts.get(V2_HEAD_PATH) ?? 0, headPutsAfterLocalChange);
+  assert.equal(snapshotGetsAfterStartup, snapshotGetsBeforeStartup);
+  assert.equal(vault.readBinaryCount, 0);
+  assert.equal(vault.getFilesCount, 1);
+});
+
 test("encrypted verbose logging includes duration and phase timings", async () => {
   const github = new MemoryGitHub();
   const vault = new MemoryVault({ "Notes/a.md": "stable" });

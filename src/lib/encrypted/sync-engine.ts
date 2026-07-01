@@ -51,8 +51,12 @@ class SyncTimer {
     this.phases.push({ name, durationMs: Date.now() - startedAt, ...(details ?? {}) });
   }
 
-  summary(): { durationMs: number; phases: SyncPhaseTiming[] } {
-    return { durationMs: Date.now() - this.startedAt, phases: this.phases };
+  summary(): { durationMs: number; phases: SyncPhaseTiming[]; phaseSummary: string } {
+    return {
+      durationMs: Date.now() - this.startedAt,
+      phases: this.phases,
+      phaseSummary: this.phases.map(phase => `${phase.name}=${phase.durationMs}ms`).join(", "),
+    };
   }
 }
 
@@ -162,7 +166,9 @@ function encryptedLocalFilesStorageMode(localFiles: TFile[]): ReturnType<typeof 
 function encryptedStateNeedsPackMigration(plugin: FastSync, localFiles: TFile[]): boolean {
   if (encryptedLocalFilesStorageMode(localFiles) !== "pack") return false;
   const state = ensureEncryptedState(plugin);
-  return localFiles.some(file => state.files[normalizeVaultPath(file.path)]?.storage !== "pack");
+  const cached = localFiles.map(file => state.files[normalizeVaultPath(file.path)]);
+  if (cached.some(file => !file)) return true;
+  return !cached.some(file => file?.storage === "pack");
 }
 function encryptedCachedStateSuggestsPackSync(plugin: FastSync): boolean {
   const cached = Object.values(ensureEncryptedState(plugin).files);
