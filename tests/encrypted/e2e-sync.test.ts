@@ -595,6 +595,8 @@ test("encrypted auto local change caches atomic commit head even when remote hea
   const instance = plugin(vault, github) as ReturnType<typeof plugin>;
   await encryptedForcePush(instance as never);
   const staleHead = github.headSha;
+  const commitsBeforeModify = github.gitCommitCounter;
+  github.putCounts.clear();
 
   vault.set("Notes/note-00000.md", new TextEncoder().encode("v2-0"));
   github.staleRemoteHeadSha = staleHead;
@@ -604,6 +606,8 @@ test("encrypted auto local change caches atomic commit head even when remote hea
   assert.notEqual(github.headSha, staleHead);
   assert.equal(instance.syncData.lastRemoteHeadSha, github.headSha);
   assert.equal(github.getRemoteHeadCount, 0);
+  assert.equal(github.gitCommitCounter, commitsBeforeModify + 1);
+  assert.equal([...github.putCounts.keys()].some(path => path.startsWith(".obsidian-github-sync-encrypted/objects/")), false);
 });
 
 test("normal encrypted startup sync skips after a packed vault receives a loose delta", async () => {

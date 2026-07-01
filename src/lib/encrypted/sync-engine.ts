@@ -3,14 +3,14 @@ import FastSync from "../../main";
 import { ENCRYPTED_CONFIG_PATH, ENCRYPTED_OBJECTS_ROOT, ENCRYPTED_PACK_PLAINTEXT_BYTES, ENCRYPTED_PACKS_ROOT, ENCRYPTED_ROOT, OBJECT_ID_BYTES } from "./constants";
 import { chooseConflictResolution, mergeTextContent } from "./conflicts";
 import { compileIgnorePathRegex } from "./ignore";
-import { downloadEncryptedFileObject, uploadEncryptedFileObject } from "./large-objects";
+import { downloadEncryptedFileObject, shouldChunkPlaintext, uploadEncryptedFileObject } from "./large-objects";
 import { planEncryptedPacks } from "./pack-planner";
 import { downloadEncryptedPack, uploadEncryptedPack } from "./pack-sync";
 import { chooseEncryptedStorageMode } from "./scale-policy";
 import { EncryptedManifestStore } from "./manifest-store";
-import { EncryptedSnapshotStore, SnapshotHeadCasError, V2_HEAD_PATH, V2_ROOT, V2_SNAPSHOTS_ROOT } from "./snapshot-store";
+import { EncryptedSnapshotExtraFile, EncryptedSnapshotStore, SnapshotHeadCasError, V2_HEAD_PATH, V2_ROOT, V2_SNAPSHOTS_ROOT } from "./snapshot-store";
 import { classifyRemoteRepo } from "./remote-state";
-import { conflictPathFor, normalizeVaultPath } from "./paths";
+import { conflictPathFor, normalizeVaultPath, objectPathForId } from "./paths";
 import { reportSyncError } from "./sync-errors";
 import { ConflictPolicy, EncryptedLocalFileState, EncryptedManifest, EncryptedObjectRecord, EncryptedPackManifestRecord, EncryptedSyncOperation } from "./types";
 import type { EncryptedSnapshotFileRecord, EncryptedSnapshotManifest, EncryptedSnapshotPackRecord } from "./snapshot-types";
@@ -18,6 +18,7 @@ import { effectiveConflictPolicy } from "./settings-policy";
 import { deleteVaultFileIfExists, listEncryptedSyncCandidates, readVaultFileBytes, readVaultFileText, shouldSyncEncryptedFile, writeVaultFileBytes } from "./vault";
 import { randomBytes, sha256Hex, toBase64Url } from "./bytes";
 import { syncConsoleLog } from "../debug";
+import { encryptBytes } from "./crypto";
 
 const syncQueues = new WeakMap<FastSync, Promise<any>>();
 const ENCRYPTED_LOOSE_DELTA_MAX_FILES = 32;
@@ -177,6 +178,23 @@ function encryptedCachedStateSuggestsPackSync(plugin: FastSync): boolean {
   return chooseEncryptedStorageMode({ fileCount: cached.length, totalBytes }) === "pack";
 }
 
+function supportsAtomicGitWrites(plugin: FastSync): boolean {
+  const github = plugin.githubClient as {
+    getGitRef?: unknown;
+    getTree?: unknown;
+    createGitBlob?: unknown;
+    createGitTree?: unknown;
+    createGitCommit?: unknown;
+    updateGitRef?: unknown;
+  };
+  return typeof github.getGitRef === "function"
+    && typeof github.getTree === "function"
+    && typeof github.createGitBlob === "function"
+    && typeof github.createGitTree === "function"
+    && typeof github.createGitCommit === "function"
+    && typeof github.updateGitRef === "function";
+}
+
 function requireEncryptedPassphrase(plugin: FastSync): string {
   const settings = plugin.settings as { encryptionPassphrase?: string };
   const passphrase = settings.encryptionPassphrase?.trim();
@@ -277,14 +295,14 @@ function snapshotToManifest(snapshot: EncryptedSnapshotManifest): EncryptedManif
   };
 }
 
-async function saveEncryptedSnapshotFromManifest(plugin: FastSync, key: CryptoKey, manifest: EncryptedManifest, options: { requireHeadCas?: boolean } = {}): Promise<{ headSha?: string; headCommitSha?: string }> {
+async function saveEncryptedSnapshotFromManifest(plugin: FastSync, key: CryptoKey, manifest: EncryptedManifest, options: { requireHeadCas?: boolean; extraFiles?: EncryptedSnapshotExtraFile[] } = {}): Promise<{ headSha?: string; headCommitSha?: string; fileShas?: Record<string, string> }> {
   const snapshotStore = new EncryptedSnapshotStore(plugin.githubClient, key);
   const previousHead = await snapshotStore.loadHead();
   const snapshot = manifestToSnapshot(manifest, previousHead);
   const head = { formatVersion: 2 as const, snapshotId: snapshot.snapshotId, generation: snapshot.generation, updatedAt: Date.now() };
   const expectedHeadSha = options.requireHeadCas === false ? undefined : previousHead?.sha;
-  const written = await snapshotStore.writeSnapshotAndHeadAtomic(snapshot, head, expectedHeadSha);
-  return { headSha: written.headSha, headCommitSha: written.headCommitSha };
+  const written = await snapshotStore.writeSnapshotAndHeadAtomic(snapshot, head, expectedHeadSha, options.extraFiles);
+  return { headSha: written.headSha, headCommitSha: written.headCommitSha, fileShas: written.fileShas };
 }
 
 function emptyEncryptedManifest(): EncryptedManifest {
@@ -743,9 +761,18 @@ async function encryptedModifyImpl(file: TAbstractFile, plugin: FastSync, eventE
     const reusableExisting = existing?.storage === "pack" ? undefined : existing;
     const objectId = reusableExisting?.id ?? toBase64Url(randomBytes(OBJECT_ID_BYTES));
     syncConsoleLog(plugin.settings, "info", "encrypted local modify using direct loose delta", { path, storage: existing?.storage, bytes: file.stat.size });
-    const uploaded = await timer.measure("uploadLooseObject", () => uploadEncryptedFileObject(plugin.githubClient, key, objectId, plaintext, reusableExisting), () => ({ bytes: file.stat.size }));
-    manifest.files[path] = { ...uploaded, path, plaintextSha256, mtime: file.stat.mtime, deleted: false, deletedAt: undefined };
-    const written = await timer.measure("writeSnapshotHead", () => saveEncryptedSnapshotFromManifest(plugin, key, manifest));
+    let written: { headSha?: string; headCommitSha?: string; fileShas?: Record<string, string> };
+    if (supportsAtomicGitWrites(plugin) && !shouldChunkPlaintext(plaintext) && reusableExisting?.storage !== "chunked") {
+      const objectPath = reusableExisting?.objectPath ?? objectPathForId(objectId);
+      const objectBytes = await timer.measure("prepareLooseObject", async () => new TextEncoder().encode(JSON.stringify(await encryptBytes(key, plaintext))), () => ({ bytes: file.stat.size }));
+      manifest.files[path] = { id: objectId, path, objectPath, plaintextSha256, mtime: file.stat.mtime, size: plaintext.byteLength, deleted: false, deletedAt: undefined, storage: "single" };
+      written = await timer.measure("writeLooseObjectSnapshotHead", () => saveEncryptedSnapshotFromManifest(plugin, key, manifest, { extraFiles: [{ path: objectPath, bytes: objectBytes }] }));
+      manifest.files[path].remoteSha = written.fileShas?.[objectPath];
+    } else {
+      const uploaded = await timer.measure("uploadLooseObject", () => uploadEncryptedFileObject(plugin.githubClient, key, objectId, plaintext, reusableExisting), () => ({ bytes: file.stat.size }));
+      manifest.files[path] = { ...uploaded, path, plaintextSha256, mtime: file.stat.mtime, deleted: false, deletedAt: undefined };
+      written = await timer.measure("writeSnapshotHead", () => saveEncryptedSnapshotFromManifest(plugin, key, manifest));
+    }
     state.manifestSha = written.headSha;
     state.files[path] = { plaintextSha256, objectPath: manifest.files[path].objectPath, remoteSha: manifest.files[path].remoteSha, storage: manifest.files[path].storage, chunks: manifest.files[path].chunks, manifestUpdatedAt: manifest.updatedAt, size: file.stat.size, mtime: file.stat.mtime };
     plugin.syncData.lastRemoteHeadSha = written.headCommitSha ?? await timer.measure("refreshRemoteHeadCache", () => getRemoteHeadShaIfAvailable(plugin)) ?? plugin.syncData.lastRemoteHeadSha;

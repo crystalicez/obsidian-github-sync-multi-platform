@@ -20,6 +20,11 @@ type SnapshotGitHubClient = GitHubClient & {
   putFileCas?: (path: string, content: string | ArrayBuffer, expectedSha?: string) => Promise<string>;
 };
 
+export interface EncryptedSnapshotExtraFile {
+  path: string;
+  bytes: Uint8Array;
+}
+
 function isCasFailure(error: unknown): boolean {
   const maybe = error as { status?: number; message?: string };
   return maybe?.status === 409 || maybe?.status === 412 || /stale|conflict|409|sha/i.test(maybe?.message ?? "");
@@ -98,7 +103,7 @@ export class EncryptedSnapshotStore {
   }
 
 
-  async writeSnapshotAndHeadAtomic(input: EncryptedSnapshotManifest, head: EncryptedSnapshotHead, expectedHeadSha?: string): Promise<StoredEncryptedSnapshot & { headSha: string; headCommitSha?: string }> {
+  async writeSnapshotAndHeadAtomic(input: EncryptedSnapshotManifest, head: EncryptedSnapshotHead, expectedHeadSha?: string, extraFiles: EncryptedSnapshotExtraFile[] = []): Promise<StoredEncryptedSnapshot & { headSha: string; headCommitSha?: string; fileShas?: Record<string, string> }> {
     const snapshot = ensureSnapshotId(input);
     const path = snapshotPath(snapshot.snapshotId);
     const encryptedSnapshot = await encryptJson(this.key, snapshot);
@@ -127,15 +132,17 @@ export class EncryptedSnapshotStore {
           const result = await commitGitTreeChanges(github as any, {
             message: `sync: encrypted snapshot ${snapshot.snapshotId}`,
             files: [
+              ...extraFiles,
               { path, bytes: snapshotBytes },
               { path: V2_HEAD_PATH, bytes: headBytes },
             ],
           });
           rememberRecentSnapshotWrite(this.github, result.commitSha, [
+            ...extraFiles.map(file => ({ path: file.path, bytes: file.bytes, sha: result.fileShas[file.path] })),
             { path, bytes: snapshotBytes, sha: result.fileShas[path] },
             { path: V2_HEAD_PATH, bytes: headBytes, sha: result.fileShas[V2_HEAD_PATH] },
           ]);
-          return { snapshot, path, sha: result.fileShas[path], headSha: result.fileShas[V2_HEAD_PATH], headCommitSha: result.commitSha };
+          return { snapshot, path, sha: result.fileShas[path], headSha: result.fileShas[V2_HEAD_PATH], headCommitSha: result.commitSha, fileShas: result.fileShas };
         } catch (error) {
           const isConflict = error instanceof GitAtomicRefConflictError || isCasFailure(error);
           if (isConflict && attempt < maxAttempts) continue;
