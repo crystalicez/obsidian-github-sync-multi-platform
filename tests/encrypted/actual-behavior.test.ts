@@ -9,7 +9,7 @@ import { compileIgnorePathRegex, isIgnoredPath } from "../../src/lib/encrypted/i
 import { chunkPathForId, shouldChunkEncryptedPayload, shouldChunkPlaintext } from "../../src/lib/encrypted/large-objects";
 import { conflictPathFor, detectCaseInsensitiveCollisions, normalizeVaultPath, objectPathForId } from "../../src/lib/encrypted/paths";
 import { EncryptedObjectRecord } from "../../src/lib/encrypted/types";
-import { listEncryptedSyncCandidates, shouldSyncEncryptedFile, writeVaultFileBytes } from "../../src/lib/encrypted/vault";
+import { listEncryptedSyncCandidates, readVaultFileBytes, shouldSyncEncryptedFile, writeVaultFileBytes } from "../../src/lib/encrypted/vault";
 
 test("bytes helpers round trip UTF-8 and hash deterministically", async () => {
   const bytes = utf8ToBytes("ภาษาไทย/emoji 🚀");
@@ -257,6 +257,24 @@ test("writeVaultFileBytes avoids ArrayBuffer.slice for full arrays (zero-copy)",
   assert.equal(writtenBuffers.length, 2);
   assert.notEqual(writtenBuffers[1], parentBytes.buffer); // sliced (new reference)
   assert.deepEqual(new Uint8Array(writtenBuffers[1]), new Uint8Array([3, 4, 5]));
+});
+test("readVaultFileBytes retries transient Windows EBUSY locks", async () => {
+  const file = new TFile("Notes/locked.md", new Uint8Array());
+  let attempts = 0;
+  const mockVault = {
+    readBinary: async () => {
+      attempts++;
+      if (attempts < 3) {
+        const error = new Error("EBUSY: resource busy or locked, open 'Notes/locked.md'") as NodeJS.ErrnoException;
+        error.code = "EBUSY";
+        throw error;
+      }
+      return new Uint8Array([1, 2, 3]).buffer;
+    },
+  };
+
+  assert.deepEqual(await readVaultFileBytes(mockVault as any, file), new Uint8Array([1, 2, 3]));
+  assert.equal(attempts, 3);
 });
 
 test("SettingTab dirty state tracking and save behavior", async () => {

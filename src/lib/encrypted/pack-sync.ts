@@ -1,4 +1,5 @@
 import { GitHubClient, readGitHubFileBytes, readGitHubBlobOrFileBytes } from "../github-api";
+import { GITHUB_RECOMMENDED_MAX_BYTES } from "./constants";
 import { decryptBytes, encryptBytes, EncryptedPayload } from "./crypto";
 import { decodePackArchive, encodePackArchive, PackArchiveFileInput, PackArchiveFileOutput, packObjectPathForId } from "./pack-format";
 import { EncryptedPackManifestRecord } from "./types";
@@ -13,6 +14,7 @@ export async function uploadEncryptedPack(
   const archive = encodePackArchive(files);
   const payload = JSON.stringify(await encryptBytes(key, archive));
   const objectPath = existing?.objectPath ?? packObjectPathForId(id);
+  if (new TextEncoder().encode(payload).byteLength > GITHUB_RECOMMENDED_MAX_BYTES) throw new Error(`Encrypted pack ${objectPath} is too large for GitHub upload after encryption; split planning failed.`);
   const remoteSha = await github.putFile(objectPath, payload, existing?.remoteSha);
   return {
     id,

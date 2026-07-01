@@ -21,8 +21,42 @@ export function listEncryptedSyncCandidates(vault: Vault, ignoreRules?: Compiled
   return files;
 }
 
+const TRANSIENT_VAULT_READ_ERROR_CODES = new Set(["EBUSY", "EPERM", "EAGAIN", "EMFILE"]);
+const VAULT_READ_RETRY_DELAYS_MS = [25, 50, 100, 200, 400, 800];
+
+function isTransientVaultReadError(error: unknown): boolean {
+  const maybe = error as { code?: string; message?: string };
+  return TRANSIENT_VAULT_READ_ERROR_CODES.has(maybe?.code ?? "") || /\b(EBUSY|EPERM|EAGAIN|EMFILE)\b/u.test(maybe?.message ?? "");
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => globalThis.setTimeout(resolve, ms));
+}
+
+async function retryTransientVaultRead<T>(read: () => Promise<T>): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= VAULT_READ_RETRY_DELAYS_MS.length; attempt++) {
+    try {
+      return await read();
+    } catch (error) {
+      lastError = error;
+      if (!isTransientVaultReadError(error) || attempt === VAULT_READ_RETRY_DELAYS_MS.length) throw error;
+      await sleep(VAULT_READ_RETRY_DELAYS_MS[attempt]);
+    }
+  }
+  throw lastError;
+}
+
+export async function readVaultFileBinary(vault: Vault, file: TFile): Promise<ArrayBuffer> {
+  return retryTransientVaultRead(() => vault.readBinary(file));
+}
+
 export async function readVaultFileBytes(vault: Vault, file: TFile): Promise<Uint8Array> {
-  return new Uint8Array(await vault.readBinary(file));
+  return new Uint8Array(await readVaultFileBinary(vault, file));
+}
+
+export async function readVaultFileText(vault: Vault, file: TFile): Promise<string> {
+  return retryTransientVaultRead(() => vault.read(file));
 }
 
 async function ensureVaultFolder(vault: Vault, folderPath: string): Promise<void> {

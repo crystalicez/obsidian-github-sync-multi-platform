@@ -7,6 +7,7 @@ import { encryptedDelete, encryptedForcePull, encryptedForcePush, encryptedFullS
 import { shouldHandleEncryptedLocalChange } from "./encrypted/settings-policy";
 import { conflictPathFor, detectCaseInsensitiveCollisions } from "./encrypted/paths";
 import { compileIgnorePathRegex, isIgnoredPath } from "./encrypted/ignore";
+import { readVaultFileBinary, readVaultFileText } from "./encrypted/vault";
 
 const IMAGE_EXTENSIONS = ["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "tiff"];
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
@@ -99,7 +100,7 @@ async function writePlaintextConflictCopy(plugin: FastSync, path: string, conten
 }
 
 async function currentPlaintextHash(plugin: FastSync, file: TFile): Promise<string> {
-  if (file.extension === "md") return hashContent(await plugin.app.vault.read(file));
+  if (file.extension === "md") return hashContent(await readVaultFileText(plugin.app.vault, file));
   return file.stat.size + "_" + file.stat.mtime;
 }
 
@@ -245,10 +246,10 @@ const performSync = async (file: TFile, plugin: FastSync) => {
     let currentHash: string;
 
     if (isMarkdown) {
-      content = await plugin.app.vault.read(file);
+      content = await readVaultFileText(plugin.app.vault, file);
       currentHash = hashContent(content);
     } else {
-      content = await plugin.app.vault.readBinary(file);
+      content = await readVaultFileBinary(plugin.app.vault, file);
       // 对二进制文件使用简单的摘要校验
       currentHash = file.stat.size + "_" + file.stat.mtime;
     }
@@ -531,10 +532,10 @@ const performPlaintextRename = async (oldfile: string, newfile: string, plugin: 
     let currentHash: string;
 
     if (isMarkdown) {
-      content = await plugin.app.vault.read(file);
+      content = await readVaultFileText(plugin.app.vault, file);
       currentHash = hashContent(content);
     } else {
-      content = await plugin.app.vault.readBinary(file);
+      content = await readVaultFileBinary(plugin.app.vault, file);
       currentHash = file.stat.size + "_" + file.stat.mtime;
     }
 
@@ -659,10 +660,10 @@ export async function overrideRemoteAllFilesImpl(plugin: FastSync): Promise<void
        let currentHash: string;
 
        if (isMarkdown) {
-         content = await plugin.app.vault.read(file);
+         content = await readVaultFileText(plugin.app.vault, file);
          currentHash = hashContent(content);
        } else {
-         content = await plugin.app.vault.readBinary(file);
+         content = await readVaultFileBinary(plugin.app.vault, file);
          currentHash = file.stat.size + "_" + file.stat.mtime;
        }
 
@@ -1014,10 +1015,10 @@ export async function syncAllFilesImpl(plugin: FastSync): Promise<void> {
         let content: string | ArrayBuffer;
         let currentHash: string;
         if (isMarkdown) {
-          content = await plugin.app.vault.read(file);
+          content = await readVaultFileText(plugin.app.vault, file);
           currentHash = hashContent(content);
         } else {
-          content = await plugin.app.vault.readBinary(file);
+          content = await readVaultFileBinary(plugin.app.vault, file);
           currentHash = file.stat.size + "_" + file.stat.mtime;
         }
 

@@ -147,19 +147,19 @@ export class GitHubClient {
       const freshSha = remoteFile?.sha;
       if (!freshSha && response.status === 422) {
         // 422 且远端也没有这个文件 → 真正的验证失败，不重试
-        throw new Error(`Failed to put file (422 validation error): ${response.text}`);
+        throw new Error(`Failed to put file ${path} (422 validation error): ${response.text}`);
       }
       const retry = await this._doPutRequest(path, content, freshSha);
       if (retry.status === 200 || retry.status === 201) {
         return (retry.json as { content: { sha: string } }).content.sha;
       }
-      throw new Error(`Failed to put file after sha retry (${response.status}→${retry.status}): ${retry.text}`);
+      throw new Error(`Failed to put file ${path} after sha retry (${response.status}→${retry.status}): ${retry.text}`);
     }
 
     if (response.status === 200 || response.status === 201) {
       return (response.json as { content: { sha: string } }).content.sha;
     }
-    throw new Error(`Failed to put file: ${response.status} ${response.text}`);
+    throw new Error(`Failed to put file ${path}: ${response.status} ${response.text}`);
   }
 
   private async _doPutRequest(

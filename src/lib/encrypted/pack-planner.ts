@@ -1,5 +1,5 @@
 import { ENCRYPTED_PACK_MAX_FILES, ENCRYPTED_PACK_PLAINTEXT_BYTES } from "./constants";
-import { packObjectPathForId } from "./pack-format";
+import { estimateEncryptedPackPayloadBytes, estimateEncryptedPayloadJsonBytes, estimatePackArchiveBytesFromParts, estimatePackHeaderEntryBytes, packObjectPathForId } from "./pack-format";
 import { EncryptedPackFileEntry, EncryptedPackPlan, EncryptedPackPlanRecord } from "./types";
 
 export interface PackPlanningOptions {
@@ -41,18 +41,28 @@ export function planEncryptedPacks(files: PackPlanningFile[], options: PackPlann
   const sorted = files.map(normalizePlanningFile).sort((a, b) => a.path.localeCompare(b.path));
   const packs: EncryptedPackPlanRecord[] = [];
   let current = createPack(1);
+  let currentHeaderEntriesBytes = 0;
   let totalBytes = 0;
 
   for (const file of sorted) {
-    if (file.size > maxPackBytes) throw new Error(`File is too large for encrypted pack mode: ${file.path}`);
-    const wouldExceedBytes = current.files.length > 0 && current.totalBytes + file.size > maxPackBytes;
+    const singleEntryBytes = estimatePackHeaderEntryBytes(file, 0);
+    const singlePayloadBytes = estimateEncryptedPayloadJsonBytes(estimatePackArchiveBytesFromParts(file.size, 1, singleEntryBytes));
+    if (singlePayloadBytes > maxPackBytes) throw new Error(`File is too large for encrypted pack mode: ${file.path}`);
+
+    const candidateEntryBytes = estimatePackHeaderEntryBytes(file, current.totalBytes);
+    const candidatePayloadBytes = estimateEncryptedPayloadJsonBytes(estimatePackArchiveBytesFromParts(current.totalBytes + file.size, current.files.length + 1, currentHeaderEntriesBytes + candidateEntryBytes));
+    const wouldExceedBytes = current.files.length > 0 && candidatePayloadBytes > maxPackBytes;
     const wouldExceedCount = current.files.length >= maxFilesPerPack;
     if (wouldExceedBytes || wouldExceedCount) {
       packs.push(current);
       current = createPack(packs.length + 1);
+      currentHeaderEntriesBytes = 0;
     }
+
+    const entryBytes = estimatePackHeaderEntryBytes(file, current.totalBytes);
     current.files.push(file);
     current.totalBytes += file.size;
+    currentHeaderEntriesBytes += entryBytes;
     totalBytes += file.size;
   }
 

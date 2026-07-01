@@ -3,7 +3,7 @@ import test from "node:test";
 import { performance } from "node:perf_hooks";
 
 import { ENCRYPTED_PACK_MAX_FILES, ENCRYPTED_PACK_PLAINTEXT_BYTES } from "../../src/lib/encrypted/constants";
-import { decodePackArchive, encodePackArchive, packObjectPathForId } from "../../src/lib/encrypted/pack-format";
+import { decodePackArchive, encodePackArchive, estimateEncryptedPackPayloadBytes, packObjectPathForId } from "../../src/lib/encrypted/pack-format";
 import { planEncryptedPacks } from "../../src/lib/encrypted/pack-planner";
 import { chooseEncryptedStorageMode } from "../../src/lib/encrypted/scale-policy";
 import { deriveEncryptionKey } from "../../src/lib/encrypted/crypto";
@@ -48,14 +48,29 @@ test("pack planner handles 100,000 files totaling 5 GiB without oversized shards
   }
 });
 
+test("pack planner accounts for archive metadata and encrypted upload size", () => {
+  const longName = "x".repeat(220);
+  const files = Array.from({ length: 10 }, (_, index) => ({
+    path: `VeryLongFolder/${longName}-${String(index).padStart(2, "0")}.md`,
+    size: 100,
+    mtime: 1_800_000_000_000 + index,
+  }));
+
+  const plan = planEncryptedPacks(files, { maxPackBytes: 1_024, maxFilesPerPack: 10 });
+
+  assert.ok(plan.packs.length > 1, "metadata overhead should split the pack before GitHub rejects it");
+  for (const pack of plan.packs) {
+    assert.ok(estimateEncryptedPackPayloadBytes(pack.files) <= 1_024, `pack ${pack.id} upload payload is too large`);
+  }
+});
 test("pack planning is deterministic and uses opaque pack object paths", () => {
   const files = [
     { path: "b.md", size: 10, mtime: 2 },
     { path: "a.md", size: 10, mtime: 1 },
   ];
 
-  const first = planEncryptedPacks(files, { maxPackBytes: 10, maxFilesPerPack: 1 });
-  const second = planEncryptedPacks([...files].reverse(), { maxPackBytes: 10, maxFilesPerPack: 1 });
+  const first = planEncryptedPacks(files, { maxFilesPerPack: 1 });
+  const second = planEncryptedPacks([...files].reverse(), { maxFilesPerPack: 1 });
 
   assert.deepEqual(first, second);
   assert.equal(first.packs.map(pack => pack.files[0].path).join(","), "a.md,b.md");

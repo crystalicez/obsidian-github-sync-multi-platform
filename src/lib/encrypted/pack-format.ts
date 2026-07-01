@@ -5,6 +5,13 @@ const HEADER_LENGTH_BYTES = 4;
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
 
+export interface PackArchivePlanningInput {
+  path: string;
+  mtime: number;
+  size: number;
+  plaintextSha256?: string;
+}
+
 export interface PackArchiveFileInput {
   path: string;
   mtime: number;
@@ -28,6 +35,43 @@ interface PackArchiveHeader {
   files: PackArchiveHeaderFile[];
 }
 
+function base64UrlEncodedLength(byteLength: number): number {
+  const padded = Math.ceil(byteLength / 3) * 4;
+  const remainder = byteLength % 3;
+  return remainder === 0 ? padded : padded - (3 - remainder);
+}
+
+const ENCRYPTED_PAYLOAD_JSON_OVERHEAD_BYTES = textEncoder.encode(JSON.stringify({ nonce: "", ciphertext: "" })).byteLength;
+
+export function estimateEncryptedPayloadJsonBytes(plaintextBytes: number): number {
+  return ENCRYPTED_PAYLOAD_JSON_OVERHEAD_BYTES + base64UrlEncodedLength(12) + base64UrlEncodedLength(plaintextBytes + 16);
+}
+
+const PACK_HEADER_PREFIX_BYTES = textEncoder.encode(`{"magic":"${PACK_ARCHIVE_MAGIC}","files":[`).byteLength;
+const PACK_HEADER_SUFFIX_BYTES = textEncoder.encode("]}").byteLength;
+
+export function estimatePackHeaderEntryBytes(file: PackArchivePlanningInput, offset: number): number {
+  return textEncoder.encode(JSON.stringify({ path: file.path, mtime: file.mtime, offset, size: file.size, checksum: 4294967295, plaintextSha256: file.plaintextSha256 })).byteLength;
+}
+
+export function estimatePackArchiveBytesFromParts(totalFileBytes: number, fileCount: number, headerEntriesBytes: number): number {
+  const commaBytes = Math.max(0, fileCount - 1);
+  return HEADER_LENGTH_BYTES + PACK_HEADER_PREFIX_BYTES + headerEntriesBytes + commaBytes + PACK_HEADER_SUFFIX_BYTES + totalFileBytes;
+}
+
+export function estimatePackArchiveBytes(files: PackArchivePlanningInput[]): number {
+  let offset = 0;
+  let headerEntriesBytes = 0;
+  for (const file of files) {
+    headerEntriesBytes += estimatePackHeaderEntryBytes(file, offset);
+    offset += file.size;
+  }
+  return estimatePackArchiveBytesFromParts(offset, files.length, headerEntriesBytes);
+}
+
+export function estimateEncryptedPackPayloadBytes(files: PackArchivePlanningInput[]): number {
+  return estimateEncryptedPayloadJsonBytes(estimatePackArchiveBytes(files));
+}
 function checksum32(bytes: Uint8Array): number {
   let hash = 0x811c9dc5;
   for (let i = 0; i < bytes.byteLength; i++) {

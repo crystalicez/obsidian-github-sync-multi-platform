@@ -1232,6 +1232,33 @@ test("encrypted local change in a 2000-file vault migrates to pack mode instead 
   assert.equal(Object.values(snapshot.files).every(record => record.storage === "pack"), true);
 });
 
+test("encrypted force push of a 2100-file vault retries transient EBUSY reads", async () => {
+  class BusyOnceVault extends MemoryVault {
+    attemptsByPath = new Map<string, number>();
+    lockedPaths = new Set(["Notes/note-00017.md", "Notes/note-01024.md", "Notes/note-02099.md"]);
+
+    async readBinary(file: TFile) {
+      const attempts = this.attemptsByPath.get(file.path) ?? 0;
+      this.attemptsByPath.set(file.path, attempts + 1);
+      if (this.lockedPaths.has(file.path) && attempts < 2) {
+        const error = new Error(`EBUSY: resource busy or locked, open '${file.path}'`) as NodeJS.ErrnoException;
+        error.code = "EBUSY";
+        throw error;
+      }
+      return super.readBinary(file);
+    }
+  }
+
+  const github = new MemoryGitHub();
+  const vault = new BusyOnceVault(manyFileEntries(2_100, "busy"));
+  const instance = plugin(vault, github) as never;
+
+  await encryptedForcePush(instance);
+
+  const { snapshot } = await loadV2Snapshot(github);
+  assert.equal(Object.values(snapshot.files).filter(record => !record.deleted).length, 2_100);
+  for (const path of vault.lockedPaths) assert.equal((vault.attemptsByPath.get(path) ?? 0) >= 3, true);
+});
 test("normal encrypted sync keeps pack mode after a packed vault shrinks below object threshold", async () => {
   const github = new MemoryGitHub();
   const vault = new MemoryVault(manyFileEntries(2_000, "packed"));

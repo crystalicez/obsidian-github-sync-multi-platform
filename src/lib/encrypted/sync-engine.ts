@@ -15,7 +15,7 @@ import { reportSyncError } from "./sync-errors";
 import { ConflictPolicy, EncryptedLocalFileState, EncryptedManifest, EncryptedObjectRecord, EncryptedPackManifestRecord, EncryptedSyncOperation } from "./types";
 import type { EncryptedSnapshotFileRecord, EncryptedSnapshotManifest, EncryptedSnapshotPackRecord } from "./snapshot-types";
 import { effectiveConflictPolicy } from "./settings-policy";
-import { deleteVaultFileIfExists, listEncryptedSyncCandidates, readVaultFileBytes, shouldSyncEncryptedFile, writeVaultFileBytes } from "./vault";
+import { deleteVaultFileIfExists, listEncryptedSyncCandidates, readVaultFileBytes, readVaultFileText, shouldSyncEncryptedFile, writeVaultFileBytes } from "./vault";
 import { randomBytes, sha256Hex, toBase64Url } from "./bytes";
 
 const syncQueues = new WeakMap<FastSync, Promise<any>>();
@@ -300,7 +300,7 @@ async function resolveRemoteChangedBeforeLocalMutation(
     return true;
   }
   if (resolution === "merged" && localFile) {
-    const localText = localBytes ? new TextDecoder().decode(localBytes) : await plugin.app.vault.read(localFile);
+    const localText = localBytes ? new TextDecoder().decode(localBytes) : await readVaultFileText(plugin.app.vault, localFile);
     const remoteText = new TextDecoder().decode(remoteBytes);
     await writeIgnoredVaultBytes(plugin, path, new TextEncoder().encode(mergeTextContent(localText, remoteText)));
     return true;
@@ -800,7 +800,7 @@ async function pullEncryptedChanges(plugin: FastSync, key: CryptoKey, manifest: 
             continue;
           }
           if (resolution === "merged") {
-            const localText = localBytes ? new TextDecoder().decode(localBytes) : await plugin.app.vault.read(localFile);
+            const localText = localBytes ? new TextDecoder().decode(localBytes) : await readVaultFileText(plugin.app.vault, localFile);
             const remoteText = new TextDecoder().decode(plaintext);
             await writeVaultFileBytes(plugin.app.vault, path, new TextEncoder().encode(mergeTextContent(localText, remoteText)));
             continue;
@@ -988,7 +988,7 @@ async function pullEncryptedPackChanges(plugin: FastSync, key: CryptoKey, manife
               continue;
             }
             if (resolution === "merged") {
-              const localText = await plugin.app.vault.read(localFile);
+              const localText = await readVaultFileText(plugin.app.vault, localFile);
               const remoteText = new TextDecoder().decode(file.bytes);
               await writeVaultFileBytes(plugin.app.vault, file.path, new TextEncoder().encode(mergeTextContent(localText, remoteText)));
               continue;
