@@ -96,6 +96,57 @@ class HeadCasConflictOnceGitHub extends MemoryGitHub {
   }
 }
 
+class AtomicMemoryGitHub extends MemoryGitHub {
+  gitBlobs = new Map<string, Uint8Array>();
+  gitBlobCounter = 0;
+  gitTreeCounter = 0;
+  gitCommitCounter = 0;
+  treeSha = "tree-0";
+  staleRemoteHeadSha: string | null = null;
+
+  async getGitRef() {
+    return { ref: "refs/heads/main", sha: this.headSha, type: "commit" };
+  }
+
+  async getGitCommit(_sha: string) {
+    return { sha: this.headSha, treeSha: this.treeSha, parentShas: [] };
+  }
+
+  async createGitBlob(bytes: Uint8Array | ArrayBuffer) {
+    const normalized = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+    const sha = `git-blob-${++this.gitBlobCounter}`;
+    this.gitBlobs.set(sha, normalized);
+    return sha;
+  }
+
+  async createGitTree(tree: Array<{ path: string; sha: string | null }>, _baseTree?: string) {
+    for (const entry of tree) {
+      if (entry.sha === null) {
+        this.blobs.delete(entry.path);
+        continue;
+      }
+      const bytes = this.gitBlobs.get(entry.sha) ?? new Uint8Array();
+      this.blobs.set(entry.path, { content: Buffer.from(bytes).toString("base64"), sha: entry.sha });
+    }
+    this.treeSha = `git-tree-${++this.gitTreeCounter}`;
+    return this.treeSha;
+  }
+
+  async createGitCommit(_message: string, _tree: string, _parents: string[]) {
+    return `git-commit-${++this.gitCommitCounter}`;
+  }
+
+  async updateGitRef(sha: string) {
+    this.headSha = sha;
+  }
+
+  async getRemoteHeadSha() {
+    this.getRemoteHeadCount += 1;
+    if (this.failRemoteHead) throw new Error("Injected remote head failure");
+    return this.staleRemoteHeadSha ?? (this.blobs.size === 0 ? null : this.headSha);
+  }
+}
+
 class StrictFolderVault {
   files = new Map<string, Uint8Array>();
   mtimes = new Map<string, number>();
@@ -536,6 +587,23 @@ test("encrypted auto local change updates cached remote head after pushing loose
 
   assert.notEqual(github.headSha, headBefore);
   assert.equal(instance.syncData.lastRemoteHeadSha, github.headSha);
+});
+
+test("encrypted auto local change caches atomic commit head even when remote head lookup is stale", async () => {
+  const github = new AtomicMemoryGitHub();
+  const vault = new MemoryVault(manyFileEntries(2_059, "v1"));
+  const instance = plugin(vault, github) as ReturnType<typeof plugin>;
+  await encryptedForcePush(instance as never);
+  const staleHead = github.headSha;
+
+  vault.set("Notes/note-00000.md", new TextEncoder().encode("v2-0"));
+  github.staleRemoteHeadSha = staleHead;
+  github.getRemoteHeadCount = 0;
+  await encryptedModify(vault.getAbstractFileByPath("Notes/note-00000.md") as TFile, instance as never, true);
+
+  assert.notEqual(github.headSha, staleHead);
+  assert.equal(instance.syncData.lastRemoteHeadSha, github.headSha);
+  assert.equal(github.getRemoteHeadCount, 0);
 });
 
 test("normal encrypted startup sync skips after a packed vault receives a loose delta", async () => {

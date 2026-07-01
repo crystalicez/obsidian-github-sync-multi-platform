@@ -205,6 +205,7 @@ test("snapshot store can write snapshot and head in one atomic Git commit", asyn
   assert.equal(github.trees.length, 1);
   assert.deepEqual(github.updatedRefs, [{ sha: "git-commit-1", expectedSha: "commit-0" }]);
   assert.equal(written.headSha, github.blobs.get(V2_HEAD_PATH)?.sha);
+  assert.equal(written.headCommitSha, "git-commit-1");
   assert.equal(loadedHead?.head.snapshotId, snapshot.snapshotId);
   assert.deepEqual(loadedSnapshot, snapshot);
 });

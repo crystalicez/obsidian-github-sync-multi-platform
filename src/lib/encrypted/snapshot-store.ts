@@ -98,7 +98,7 @@ export class EncryptedSnapshotStore {
   }
 
 
-  async writeSnapshotAndHeadAtomic(input: EncryptedSnapshotManifest, head: EncryptedSnapshotHead, expectedHeadSha?: string): Promise<StoredEncryptedSnapshot & { headSha: string }> {
+  async writeSnapshotAndHeadAtomic(input: EncryptedSnapshotManifest, head: EncryptedSnapshotHead, expectedHeadSha?: string): Promise<StoredEncryptedSnapshot & { headSha: string; headCommitSha?: string }> {
     const snapshot = ensureSnapshotId(input);
     const path = snapshotPath(snapshot.snapshotId);
     const encryptedSnapshot = await encryptJson(this.key, snapshot);
@@ -135,7 +135,7 @@ export class EncryptedSnapshotStore {
             { path, bytes: snapshotBytes, sha: result.fileShas[path] },
             { path: V2_HEAD_PATH, bytes: headBytes, sha: result.fileShas[V2_HEAD_PATH] },
           ]);
-          return { snapshot, path, sha: result.fileShas[path], headSha: result.fileShas[V2_HEAD_PATH] };
+          return { snapshot, path, sha: result.fileShas[path], headSha: result.fileShas[V2_HEAD_PATH], headCommitSha: result.commitSha };
         } catch (error) {
           const isConflict = error instanceof GitAtomicRefConflictError || isCasFailure(error);
           if (isConflict && attempt < maxAttempts) continue;

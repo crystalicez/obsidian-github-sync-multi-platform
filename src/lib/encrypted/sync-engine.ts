@@ -277,14 +277,14 @@ function snapshotToManifest(snapshot: EncryptedSnapshotManifest): EncryptedManif
   };
 }
 
-async function saveEncryptedSnapshotFromManifest(plugin: FastSync, key: CryptoKey, manifest: EncryptedManifest, options: { requireHeadCas?: boolean } = {}): Promise<string | undefined> {
+async function saveEncryptedSnapshotFromManifest(plugin: FastSync, key: CryptoKey, manifest: EncryptedManifest, options: { requireHeadCas?: boolean } = {}): Promise<{ headSha?: string; headCommitSha?: string }> {
   const snapshotStore = new EncryptedSnapshotStore(plugin.githubClient, key);
   const previousHead = await snapshotStore.loadHead();
   const snapshot = manifestToSnapshot(manifest, previousHead);
   const head = { formatVersion: 2 as const, snapshotId: snapshot.snapshotId, generation: snapshot.generation, updatedAt: Date.now() };
   const expectedHeadSha = options.requireHeadCas === false ? undefined : previousHead?.sha;
   const written = await snapshotStore.writeSnapshotAndHeadAtomic(snapshot, head, expectedHeadSha);
-  return written.headSha;
+  return { headSha: written.headSha, headCommitSha: written.headCommitSha };
 }
 
 function emptyEncryptedManifest(): EncryptedManifest {
@@ -534,6 +534,7 @@ async function encryptedSyncImpl(plugin: FastSync, options: EncryptedSyncOptions
       });
     }
     let manifestChanged = false;
+    let writtenHeadCommitSha: string | undefined;
     let packsToDeleteAfterSave: EncryptedPackManifestRecord[] = [];
     let objectsToDeleteAfterSave: Array<EncryptedManifest["files"][string]> = [];
     if (options.operation === "forcePull") {
@@ -547,7 +548,8 @@ async function encryptedSyncImpl(plugin: FastSync, options: EncryptedSyncOptions
       const forcePushResult = await timer.measure("forcePush.pushLocalChanges", () => pushEncryptedForceLocalChanges(plugin, key, manifest, ignoreRules));
       manifestChanged = forcePushResult.changed;
       packsToDeleteAfterSave = previousPacks.length > 0 ? previousPacks : forcePushResult.packsToDeleteAfterSave;
-      await timer.measure("writeSnapshotHead", () => saveEncryptedSnapshotFromManifest(plugin, key, manifest, { requireHeadCas: false }));
+      const written = await timer.measure("writeSnapshotHead", () => saveEncryptedSnapshotFromManifest(plugin, key, manifest, { requireHeadCas: false }));
+      writtenHeadCommitSha = written.headCommitSha;
     } else {
       if (manifest.packs && Object.keys(manifest.packs).length > 0) await timer.measure("pullPacks", () => pullEncryptedPackChanges(plugin, key, manifest, ignoreRules, false, locallyDirtyPaths));
       await timer.measure("pullObjects", () => pullEncryptedChanges(plugin, key, manifest, false));
@@ -560,7 +562,10 @@ async function encryptedSyncImpl(plugin: FastSync, options: EncryptedSyncOptions
         fileCount: Object.keys(manifest.files).length,
         packCount: Object.keys(manifest.packs ?? {}).length,
       });
-      if (manifestChanged || !(await timer.measure("verifySnapshotExists", () => loadEncryptedSnapshotManifest(plugin, key)))) await timer.measure("writeSnapshotHead", () => saveEncryptedSnapshotFromManifest(plugin, key, manifest));
+      if (manifestChanged || !(await timer.measure("verifySnapshotExists", () => loadEncryptedSnapshotManifest(plugin, key)))) {
+        const written = await timer.measure("writeSnapshotHead", () => saveEncryptedSnapshotFromManifest(plugin, key, manifest));
+        writtenHeadCommitSha = written.headCommitSha;
+      }
     }
 
     if (packsToDeleteAfterSave.length > 0) await timer.measure("deleteObsoletePacks", () => deleteObsoleteRemotePacks(plugin, packsToDeleteAfterSave, manifest));
@@ -591,7 +596,7 @@ async function encryptedSyncImpl(plugin: FastSync, options: EncryptedSyncOptions
       if (typeof (plugin as FastSync & { saveSettings?: () => Promise<void> }).saveSettings === "function") await (plugin as FastSync & { saveSettings: () => Promise<void> }).saveSettings();
     }
     plugin.syncData.lastRemoteHeadSha = options.operation === "forcePush" || manifestChanged
-      ? (await timer.measure("refreshRemoteHeadCache", () => getRemoteHeadShaIfAvailable(plugin)) ?? plugin.syncData.lastRemoteHeadSha)
+      ? (writtenHeadCommitSha ?? await timer.measure("refreshRemoteHeadCache", () => getRemoteHeadShaIfAvailable(plugin)) ?? plugin.syncData.lastRemoteHeadSha)
       : (remoteHeadBeforeSync ?? plugin.syncData.lastRemoteHeadSha);
     await timer.measure("saveSyncData", () => plugin.saveSyncData());
     syncConsoleLog(plugin.settings, "info", "encrypted sync completed", {
@@ -740,9 +745,10 @@ async function encryptedModifyImpl(file: TAbstractFile, plugin: FastSync, eventE
     syncConsoleLog(plugin.settings, "info", "encrypted local modify using direct loose delta", { path, storage: existing?.storage, bytes: file.stat.size });
     const uploaded = await timer.measure("uploadLooseObject", () => uploadEncryptedFileObject(plugin.githubClient, key, objectId, plaintext, reusableExisting), () => ({ bytes: file.stat.size }));
     manifest.files[path] = { ...uploaded, path, plaintextSha256, mtime: file.stat.mtime, deleted: false, deletedAt: undefined };
-    state.manifestSha = await timer.measure("writeSnapshotHead", () => saveEncryptedSnapshotFromManifest(plugin, key, manifest));
+    const written = await timer.measure("writeSnapshotHead", () => saveEncryptedSnapshotFromManifest(plugin, key, manifest));
+    state.manifestSha = written.headSha;
     state.files[path] = { plaintextSha256, objectPath: manifest.files[path].objectPath, remoteSha: manifest.files[path].remoteSha, storage: manifest.files[path].storage, chunks: manifest.files[path].chunks, manifestUpdatedAt: manifest.updatedAt, size: file.stat.size, mtime: file.stat.mtime };
-    plugin.syncData.lastRemoteHeadSha = await timer.measure("refreshRemoteHeadCache", () => getRemoteHeadShaIfAvailable(plugin)) ?? plugin.syncData.lastRemoteHeadSha;
+    plugin.syncData.lastRemoteHeadSha = written.headCommitSha ?? await timer.measure("refreshRemoteHeadCache", () => getRemoteHeadShaIfAvailable(plugin)) ?? plugin.syncData.lastRemoteHeadSha;
     await timer.measure("saveSyncData", () => plugin.saveSyncData());
 
     if (plugin.syncProgress) {
@@ -828,7 +834,9 @@ async function encryptedDeleteImpl(fileOrPath: string | TAbstractFile, plugin: F
     if (record) {
       record.deleted = true;
       record.deletedAt = Date.now();
-      state.manifestSha = await saveEncryptedSnapshotFromManifest(plugin, key, manifest);
+      const written = await saveEncryptedSnapshotFromManifest(plugin, key, manifest);
+      state.manifestSha = written.headSha;
+      plugin.syncData.lastRemoteHeadSha = written.headCommitSha ?? await getRemoteHeadShaIfAvailable(plugin) ?? plugin.syncData.lastRemoteHeadSha;
       delete state.files[path];
       await plugin.saveSyncData();
     }
@@ -924,7 +932,9 @@ async function encryptedRenameImpl(newFileOrPath: string | TAbstractFile, oldFil
       newRecord = { ...uploaded, path: newPath, plaintextSha256, mtime: file.stat.mtime, deleted: false, deletedAt: undefined };
     }
     manifest.files[newPath] = newRecord;
-    state.manifestSha = await saveEncryptedSnapshotFromManifest(plugin, key, manifest);
+    const written = await saveEncryptedSnapshotFromManifest(plugin, key, manifest);
+    state.manifestSha = written.headSha;
+    plugin.syncData.lastRemoteHeadSha = written.headCommitSha ?? await getRemoteHeadShaIfAvailable(plugin) ?? plugin.syncData.lastRemoteHeadSha;
     delete state.files[oldPath];
     state.files[newPath] = { plaintextSha256, objectPath: newRecord.objectPath, remoteSha: newRecord.remoteSha, storage: newRecord.storage, chunks: newRecord.chunks, packId: newRecord.packId, manifestUpdatedAt: manifest.updatedAt, size: file.stat.size, mtime: file.stat.mtime };
     await plugin.saveSyncData();
