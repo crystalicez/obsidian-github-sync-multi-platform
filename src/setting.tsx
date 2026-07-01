@@ -1,6 +1,6 @@
 import { App, Modal, PluginSettingTab, Notice, Setting, Platform } from "obsidian";
 import { KofiImage } from "./lib/icons";
-import { $ } from "./lang/lang";
+
 import FastSync from "./main";
 import { dump } from "./lib/helps";
 import { encryptedForcePull, encryptedForcePush, encryptedManualSync } from "./lib/encrypted/sync-engine";
@@ -8,9 +8,9 @@ import { createDebugPayload } from "./lib/debug";
 import { StartupFullNotesSync } from "./lib/fs";
 
 export interface PluginSettings {
-  //是否自动上传
+  // Whether auto-upload is enabled
   syncEnabled: boolean
-  // GitHub 配置
+  // GitHub configuration
   githubOwner: string
   githubRepo: string
   githubBranch: string
@@ -29,22 +29,18 @@ export interface PluginSettings {
 
   vault: string
   lastSyncTime: number
-  //  [propName: string]: any;
   clipboardReadTip: string
 }
 
 /**
- *
-
-![这是图片](https://markdown.com.cn/assets/img/philly-magic-garden.9c0b4415.jpg)
-
+ * @see https://github.com/settings/tokens for PAT setup
  */
 
-// 默认插件设置
+// Default plugin settings
 export const DEFAULT_SETTINGS: PluginSettings = {
-  // 是否自动上传
+  // Whether auto-upload is enabled
   syncEnabled: true,
-  // GitHub 默认值
+  // GitHub defaults
   githubOwner: "",
   githubRepo: "",
   githubBranch: "main",
@@ -62,7 +58,7 @@ export const DEFAULT_SETTINGS: PluginSettings = {
   vault: "defaultVault",
   statusBarStatusEnabled: true,
   consoleLoggingEnabled: false,
-  // 剪贴板读取提示
+  // Clipboard read tip message
   clipboardReadTip: "",
 }
 
@@ -118,7 +114,7 @@ export class SettingTab extends PluginSettingTab {
   }
 
   /**
-   * 从剪贴板读取 GitHub 配置 JSON 并自动填入设置
+   * Read GitHub configuration JSON from the clipboard and populate settings automatically
    */
   async handleClipboardPaste(tipEl: HTMLElement): Promise<void> {
     const showTip = (msg: string) => {
@@ -128,7 +124,7 @@ export class SettingTab extends PluginSettingTab {
 
     try {
       if (!navigator.clipboard) {
-        showTip($("未检测到配置信息!"))
+        showTip("No configuration detected!")
         return
       }
       const text = await navigator.clipboard.readText()
@@ -145,14 +141,14 @@ export class SettingTab extends PluginSettingTab {
             this.tempSettings.githubToken = parsed.githubToken || parsed.token
           }
           this.display()
-          showTip($("接口配置信息已经粘贴到设置中!"))
+          showTip("Configuration pasted into settings!")
           return
         }
       }
-      showTip($("未检测到配置信息!"))
+      showTip("No configuration detected!")
     } catch (err) {
       dump(err)
-      showTip($("未检测到配置信息!"))
+      showTip("No configuration detected!")
     }
   }
 
@@ -172,13 +168,13 @@ export class SettingTab extends PluginSettingTab {
     // Section 1: General Settings
     // ==========================================
     new Setting(set)
-      .setName($("General Settings"))
+      .setName("General Settings")
       .setHeading()
       .setClass("github-sync-settings-header")
 
     new Setting(set)
-      .setName($("启用同步"))
-      .setDesc($("关闭后您的笔记将不做任何同步"))
+      .setName("Enable synchronization")
+      .setDesc("After closing, your notes will not be synced.")
       .addToggle((toggle) =>
         toggle.setValue(this.tempSettings!.syncEnabled).onChange((value) => {
           this.tempSettings!.syncEnabled = value
@@ -187,8 +183,8 @@ export class SettingTab extends PluginSettingTab {
       )
 
     new Setting(set)
-      .setName($("Show sync status in status bar"))
-      .setDesc($("Display real-time sync progress, last sync time, or errors in the Obsidian status bar. Disable (kill-switch) to save system resources."))
+      .setName("Show sync status in status bar")
+      .setDesc("Display real-time sync progress, last sync time, or errors in the Obsidian status bar. Disable (kill-switch) to save system resources.")
       .addToggle((toggle) =>
         toggle.setValue(this.tempSettings!.statusBarStatusEnabled).onChange((value) => {
           this.tempSettings!.statusBarStatusEnabled = value
@@ -200,7 +196,7 @@ export class SettingTab extends PluginSettingTab {
     // Section 2: GitHub Connection Settings
     // ==========================================
     new Setting(set)
-      .setName($("GitHub Connection Settings"))
+      .setName("GitHub Connection Settings")
       .setHeading()
       .setClass("github-sync-settings-header")
 
@@ -208,19 +204,19 @@ export class SettingTab extends PluginSettingTab {
     const table = apiInfoDiv.createEl("table", { cls: "obsidian-github-sync-multi-platform-settings-openapi" })
     const thead = table.createEl("thead")
     const headerRow = thead.createEl("tr")
-    headerRow.createEl("th", { text: $("方式") })
-    headerRow.createEl("th", { text: $("说明") })
-    headerRow.createEl("th", { text: $("详情参考") })
+    headerRow.createEl("th", { text: "Method" })
+    headerRow.createEl("th", { text: "Description" })
+    headerRow.createEl("th", { text: "Details" })
     const tbody = table.createEl("tbody")
     const row = tbody.createEl("tr")
     row.createEl("td", { text: "GitHub" })
-    row.createEl("td", { text: $("使用 GitHub 仓库存储และ同步笔记") })
+    row.createEl("td", { text: "Use a GitHub repository to store and sync notes" })
     const linkTd = row.createEl("td")
     linkTd.createEl("a", { text: "GitHub PAT Settings", href: "https://github.com/settings/tokens" })
 
     const clipboardDiv = set.createDiv("clipboard-read")
     const clipboardBtn = clipboardDiv.createEl("button", {
-      text: $("粘贴的远端配置"),
+      text: "Paste remote configuration",
       cls: "clipboard-read-button"
     })
     const clipboardTip = clipboardDiv.createEl("div", { cls: "clipboard-read-description" })
@@ -230,11 +226,11 @@ export class SettingTab extends PluginSettingTab {
     })
 
     new Setting(set)
-      .setName($("GitHub 用户名"))
-      .setDesc($("输入您的 GitHub 用户名"))
+      .setName("GitHub owner")
+      .setDesc("Enter your GitHub username or organization name")
       .addText((text) =>
         text
-          .setPlaceholder($("输入您的 GitHub 用户名"))
+          .setPlaceholder("Enter your GitHub username or organization name")
           .setValue(this.tempSettings!.githubOwner)
           .onChange((value) => {
             this.tempSettings!.githubOwner = value
@@ -243,11 +239,11 @@ export class SettingTab extends PluginSettingTab {
       )
 
     new Setting(set)
-      .setName($("GitHub 仓库名"))
-      .setDesc($("输入您的 GitHub 仓库名"))
+      .setName("GitHub repo")
+      .setDesc("Enter your GitHub repository name")
       .addText((text) =>
         text
-          .setPlaceholder($("输入您的 GitHub 仓库名"))
+          .setPlaceholder("Enter your GitHub repository name")
           .setValue(this.tempSettings!.githubRepo)
           .onChange((value) => {
             this.tempSettings!.githubRepo = value
@@ -256,11 +252,11 @@ export class SettingTab extends PluginSettingTab {
       )
 
     new Setting(set)
-      .setName($("GitHub 分支名"))
-      .setDesc($("输入您的 GitHub 分支名"))
+      .setName("GitHub branch")
+      .setDesc("Enter your GitHub branch name (e.g., main)")
       .addText((text) =>
         text
-          .setPlaceholder($("输入您的 GitHub 分支名"))
+          .setPlaceholder("Enter your GitHub branch name (e.g., main)")
           .setValue(this.tempSettings!.githubBranch)
           .onChange((value) => {
             this.tempSettings!.githubBranch = value
@@ -269,12 +265,12 @@ export class SettingTab extends PluginSettingTab {
       )
 
     new Setting(set)
-      .setName($("GitHub 访问令牌"))
-      .setDesc($("用于访问 GitHub API 的 Personal Access Token"))
+      .setName("GitHub token")
+      .setDesc("Personal Access Token used to access the GitHub API")
       .addText((text) => {
         text.inputEl.type = "password"
         text
-          .setPlaceholder($("输入您的 GitHub 访问令牌"))
+          .setPlaceholder("Enter your GitHub personal access token")
           .setValue(this.tempSettings!.githubToken)
           .onChange((value) => {
             this.tempSettings!.githubToken = value
@@ -283,11 +279,11 @@ export class SettingTab extends PluginSettingTab {
       })
 
     new Setting(set)
-      .setName($("远端仓库名"))
-      .setDesc($("远端仓库名"))
+      .setName("Remote repository name")
+      .setDesc("Remote repository name")
       .addText((text) =>
         text
-          .setPlaceholder($("远端仓库名"))
+          .setPlaceholder("Remote repository name")
           .setValue(this.tempSettings!.vault)
           .onChange((value) => {
             this.tempSettings!.vault = value
@@ -299,7 +295,7 @@ export class SettingTab extends PluginSettingTab {
     // Section 3: Encryption Settings
     // ==========================================
     new Setting(set)
-      .setName($("Encryption Settings"))
+      .setName("Encryption Settings")
       .setHeading()
       .setClass("github-sync-settings-header")
 
@@ -333,7 +329,7 @@ export class SettingTab extends PluginSettingTab {
     // Section 4: Manual & Force Operations
     // ==========================================
     new Setting(set)
-      .setName($("Manual & Force Operations"))
+      .setName("Manual & Force Operations")
       .setHeading()
       .setClass("github-sync-settings-header")
 
@@ -370,7 +366,7 @@ export class SettingTab extends PluginSettingTab {
     // Section 5: Automation & Exclusions
     // ==========================================
     new Setting(set)
-      .setName($("Automation & Exclusions"))
+      .setName("Automation & Exclusions")
       .setHeading()
       .setClass("github-sync-settings-header")
 
@@ -456,7 +452,7 @@ export class SettingTab extends PluginSettingTab {
     // Section 6: Support & Debug
     // ==========================================
     new Setting(set)
-      .setName($("Support & Debug"))
+      .setName("Support & Debug")
       .setHeading()
       .setClass("github-sync-settings-header")
 
@@ -474,7 +470,7 @@ export class SettingTab extends PluginSettingTab {
     debugDiv.addClass("obsidian-github-sync-multi-platform-settings-debug")
 
     const debugButton = debugDiv.createEl("button")
-    debugButton.setText($("复制 Debug 信息"))
+    debugButton.setText("Copy debug information")
     debugButton.onclick = async () => {
       await window.navigator.clipboard.writeText(
         JSON.stringify(
@@ -486,28 +482,28 @@ export class SettingTab extends PluginSettingTab {
           4
         )
       )
-      new Notice($("将调试信息复制到剪贴板, 可能包含敏感信!"))
+      new Notice("Copy debug information to the clipboard, may contain sensitive information!")
     }
 
     if (Platform.isDesktopApp) {
       const info = debugDiv.createDiv()
-      info.setText($("通过快捷键打开控制台，你可以看到这个插件和其他插件의日志"))
+      info.setText("Open the console with the shortcut key to see this plugin's logs and other plugin logs.")
 
       const keys = debugDiv.createDiv()
       keys.addClass("custom-shortcuts")
       if (Platform.isMacOS === true) {
-        keys.createEl("kbd", { text: $("console_mac") })
+        keys.createEl("kbd", { text: "Cmd (⌘) + option (⌥) + i" })
       } else {
-        keys.createEl("kbd", { text: $("console_windows") })
+        keys.createEl("kbd", { text: "Ctrl (⌃) + shift (⇧) + i" })
       }
     }
 
     const supportDiv = set.createDiv("github-sync-support-section")
 
-    new Setting(supportDiv).setName($("捐赠")).setHeading()
+    new Setting(supportDiv).setName("Donation").setHeading()
 
     supportDiv.createEl("p", {
-      text: $("如果您喜欢这个插件，请考虑捐赠以支持继续开发。")
+      text: "If you like this plugin, please consider donating to support continued development."
     })
 
     const kofiLink = supportDiv.createEl("a", {

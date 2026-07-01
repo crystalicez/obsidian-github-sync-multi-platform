@@ -1,9 +1,6 @@
 import { dump } from "src/lib/helps";
 import FastSync from "src/main";
 
-import { $ } from "../lang/lang";
-
-
 async function getClipboardContent(plugin: FastSync): Promise<void> {
   const clipboardReadTipSave = async (owner: string, repo: string, branch: string, token: string, tip: string) => {
     plugin.settings.githubOwner = owner
@@ -33,18 +30,18 @@ async function getClipboardContent(plugin: FastSync): Promise<void> {
   }
 
   try {
-    // 检查浏览器是否支持 Clipboard API
+    // Check whether the Clipboard API is supported
     if (!navigator.clipboard) {
       return
     }
 
-    // 获取剪贴板文本内容
+    // Read clipboard text content
     const text = await navigator.clipboard.readText()
 
-    // 检查是否为 JSON 格式
+    // Check whether the text is valid JSON
     let parsedData = JSON.parse(text)
 
-    // 检查是否为对象且包含 GitHub 配置
+    // Check whether the object contains a GitHub configuration
     if (typeof parsedData === "object" && parsedData !== null) {
       const hasOwner = "githubOwner" in parsedData || "owner" in parsedData
       const hasRepo = "githubRepo" in parsedData || "repo" in parsedData
@@ -56,16 +53,16 @@ async function getClipboardContent(plugin: FastSync): Promise<void> {
           parsedData.githubRepo || parsedData.repo,
           parsedData.githubBranch || parsedData.branch || "main",
           parsedData.githubToken || parsedData.token,
-          $("接口配置信息已经粘贴到设置中!")
+          "Configuration pasted into settings!",
         )
         return
       }
     }
-    void clipboardReadTipTipSave($("未检测到配置信息!"))
+    void clipboardReadTipTipSave("No configuration detected!")
     return
   } catch (err) {
     dump(err)
-    void clipboardReadTipTipSave($("未检测到配置信息!"))
+    void clipboardReadTipTipSave("No configuration detected!")
     return
   }
 }
@@ -77,23 +74,23 @@ export const SettingsView = ({ plugin }: { plugin: FastSync }) => {
     <>
       <div className="setting-item">
         <div className="setting-item-info">
-          <div className="setting-item-name">{$("GitHub 同步配置")}</div>
-          <div className="setting-item-description">{$("使用 GitHub API 进行同步")}</div>
+          <div className="setting-item-name">GitHub sync configuration</div>
+          <div className="setting-item-description">Sync using the GitHub API</div>
         </div>
       </div>
       <div>
         <table className="obsidian-github-sync-multi-platform-settings-openapi">
           <thead>
             <tr>
-              <th>{$("方式")}</th>
-              <th>{$("说明")}</th>
-              <th>{$("详情参考")}</th>
+              <th>Method</th>
+              <th>Description</th>
+              <th>Details</th>
             </tr>
           </thead>
           <tbody>
             <tr>
               <td>GitHub</td>
-              <td>{$("使用 GitHub 仓库存储和同步笔记")}</td>
+              <td>Use a GitHub repository to store and sync notes</td>
               <td>
                 <a href="https://github.com/settings/tokens">GitHub PAT Settings</a>
               </td>
@@ -104,7 +101,7 @@ export const SettingsView = ({ plugin }: { plugin: FastSync }) => {
       </div>
       <div className="clipboard-read">
         <button className="clipboard-read-button" onClick={() => handleClipboardClick(plugin)}>
-          {$("粘贴的远端配置")}
+          Paste remote configuration
         </button>
         <div className="clipboard-read-description">{plugin.clipboardReadTip}</div>
       </div>

@@ -3,7 +3,7 @@ import { Plugin, setIcon, Modal, Notice, TFile } from "obsidian";
 import { NoteModify, NoteDelete, NoteRename, StartupFullNotesForceOverSync, StartupFullNotesSync, overrideLocalAllFilesImpl } from "./lib/fs";
 import { SettingTab, PluginSettings, DEFAULT_SETTINGS } from "./setting";
 import { GitHubClient } from "./lib/github-api";
-import { $, moment } from "./lang/lang";
+import { moment } from "./lang/lang";
 import { calculateWordCount } from "./lib/helps";
 import { encryptedForcePush, encryptedForcePull } from "./lib/encrypted/sync-engine";
 import type { EncryptedLocalFileState } from "./lib/encrypted/types";
@@ -122,15 +122,16 @@ export default class FastSync extends Plugin {
 
     this.updateRibbonIcon(!!(this.settings.githubToken && this.settings.githubOwner && this.settings.githubRepo))
 
-    // 注册文件事件（只监听 md 和图片，过滤其他类型在 performSync 内完成）
-    // 启动时先禁用 watch，防止 vault 索引触发大量文件事件并发打 API 被 GitHub 限速（422）
+    // Register file events (only .md and images; other types are filtered inside performSync)
+    // Disable watch on startup to prevent vault indexing from triggering many concurrent API calls
+    // that could hit the GitHub rate limit (422)
     this.disableWatch()
     this.registerEvent(this.app.vault.on("create", (file) => NoteModify(file, this, true)))
     this.registerEvent(this.app.vault.on("modify", (file) => NoteModify(file, this, true)))
     this.registerEvent(this.app.vault.on("delete", (file) => NoteDelete(file, this, true)))
     this.registerEvent(this.app.vault.on("rename", (file, oldfile) => NoteRename(file, oldfile, this, true)))
 
-    // 注册命令
+    // Register commands
     this.addCommand({
       id: "init-all-files",
       name: "GitHub Sync: Force Push (Overwrite Remote)",
@@ -143,16 +144,16 @@ export default class FastSync extends Plugin {
       callback: () => StartupFullNotesSync(this),
     })
 
-    // 布局加载完成后统一执行启动同步，完成后再开启实时 watch
+    // After the workspace layout is ready, run the startup sync once, then enable real-time watch
     this.app.workspace.onLayoutReady(() => {
       if (shouldRunStartupSync(this.settings)) {
-        // 延迟 1.5 秒，等待 Obsidian 初始化完成
+        // Delay 1.5 s to let Obsidian finish initialising
         setTimeout(() => {
-          // syncAllFilesImpl 内部完成后会调用 enableWatch()
+          // syncAllFilesImpl calls enableWatch() internally after it completes
           StartupFullNotesSync(this);
         }, 1500);
       } else {
-        // 未配置则直接开启 watch
+        // Not configured – enable watch immediately
         this.enableWatch();
       }
     });
@@ -170,7 +171,7 @@ export default class FastSync extends Plugin {
   }
 
   onunload() {
-    // 清理所有防抖计时器，防止插件卸载后仍有回调触发（内存泄漏）
+    // Clear all debounce timers to prevent callbacks from firing after the plugin is unloaded (memory leak)
     this.debounceTimers.forEach(timer => clearTimeout(timer));
     this.debounceTimers.clear();
     if (this.scheduledSyncTimer) window.clearInterval(this.scheduledSyncTimer);
@@ -190,16 +191,16 @@ export default class FastSync extends Plugin {
   updateRibbonIcon(status: boolean) {
     if (status) {
       setIcon(this.ribbonIcon, "rotate-cw")
-      this.ribbonIcon.setAttribute("aria-label", "Encrypted GitHub Sync (Multi-Platform): " + $("同步全部笔记") + " (Configured)")
+      this.ribbonIcon.setAttribute("aria-label", "Encrypted GitHub Sync (Multi-Platform): Sync all notes (Configured)")
     } else {
       setIcon(this.ribbonIcon, "loader-circle")
-      this.ribbonIcon.setAttribute("aria-label", "Encrypted GitHub Sync (Multi-Platform): " + $("同步全部笔记") + " (Not Configured)")
+      this.ribbonIcon.setAttribute("aria-label", "Encrypted GitHub Sync (Multi-Platform): Sync all notes (Not Configured)")
     }
   }
 
   /**
-   * 统一持久化入口：settings 和 syncData 始终存储在同一个对象中，
-   * 避免 saveSettings / saveSyncData 互相覆盖对方的数据。
+   * Unified persistence entry point: settings and syncData are always stored in the same object
+   * to prevent saveSettings / saveSyncData from overwriting each other's data.
    */
   async persistData() {
     await this.saveData({
@@ -210,7 +211,7 @@ export default class FastSync extends Plugin {
 
   async loadSettings() {
     const data = await this.loadData() ?? {};
-    // 兼容旧版本：旧版直接把 settings 字段铺在顶层
+    // Backward compatibility: older versions stored settings fields directly at the top level
     const savedSettings = data.settings ?? data;
     this.settings = Object.assign({}, DEFAULT_SETTINGS, savedSettings);
   }

@@ -3,9 +3,9 @@ import { Notice, moment } from "obsidian";
 
 /**
  * timestampToDate
- * 将时间戳转换为格式化的日期字符串（YYYY-MM-DD HH:mm:ss）
- * @param timestamp - 时间戳（以毫秒为单位）
- * @returns 格式化的日期字符串
+ * Converts timestamp to formatted date string (YYYY-MM-DD HH:mm:ss)
+ * @param timestamp - Timestamp in milliseconds
+ * @returns Formatted date string
  */
 export const timestampToDate = function (timestamp: number): string {
   return moment(timestamp).format("YYYY-MM-DD HH:mm:ss")
@@ -13,10 +13,10 @@ export const timestampToDate = function (timestamp: number): string {
 
 /**
  * stringToDate
- * 将日期字符串转换为格式化的日期字符串（YYYY-MM-DD HH:mm:ss）
- * 如果输入的日期字符串为空，则使用默认日期 "1970-01-01 00:00:00"
- * @param date - 日期字符串
- * @returns 格式化的日期字符串
+ * Converts date string to formatted date string (YYYY-MM-DD HH:mm:ss)
+ * If the input date string is empty, default date "1970-01-01 00:00:00" is used.
+ * @param date - Date string
+ * @returns Formatted date string
  */
 export const stringToDate = function (date: string): string {
   if (!date || date == "") {
@@ -27,12 +27,12 @@ export const stringToDate = function (date: string): string {
 
 /**
  * hashContent
- * 使用简单的哈希函数生成输入字符串的哈希值
- * @param content - 要哈希的字符串内容
- * @returns 字符串内容的哈希值
+ * Uses a simple hash function to generate the hash value of the input string
+ * @param content - String content to hash
+ * @returns Hash value of the string content
  */
 export const hashContent = function (content: string): string {
-  // 使用简单的哈希函数生成哈希值
+  // Uses a simple hash function to generate the hash value
   let hash = 0
   for (let i = 0; i < content.length; i++) {
     const char = content.charCodeAt(i)
@@ -44,8 +44,8 @@ export const hashContent = function (content: string): string {
 
 /**
  * showErrorDialog
- * 显示一个错误对话框，内容为传入的消息
- * @param message - 要显示的错误消息
+ * Displays an error dialog with the passed message
+ * @param message - Error message to display
  */
 export const showErrorDialog = function (message: string): void {
   new Notice(message)
@@ -53,8 +53,8 @@ export const showErrorDialog = function (message: string): void {
 
 /**
  * dump
- * 将传入的消息打印到控制台
- * @param message - 要打印的消息，可以是多个参数
+ * Prints the passed message to the console
+ * @param message - Message to print, can be multiple parameters
  */
 export const dump = function (..._message: unknown[]): void {
   // intentionally empty in production

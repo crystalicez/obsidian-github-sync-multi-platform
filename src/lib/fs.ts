@@ -159,7 +159,7 @@ function clearEncryptedModify(path: string, plugin: FastSync): void {
 }
 
 /**
- * 核心修改逻辑，包含防抖和哈希校验
+ * Core file modification handler with debouncing and hash validation
  */
 export const NoteModify = function (file: TAbstractFile, plugin: FastSync, eventEnter: boolean = false) {
   if (plugin.settings.encryptionMode === "encrypted") {
@@ -176,13 +176,13 @@ export const NoteModify = function (file: TAbstractFile, plugin: FastSync, event
   if (plugin.ignoredFiles.has(file.path) && eventEnter) return;
   if (!plugin.githubClient) return;
 
-  // 1. 文件大小限制 (10MB)
+  // 1. File size limit (10MB)
   if (file.stat.size > MAX_FILE_SIZE) {
     new Notice(`File too large (>10MB): ${file.path}. Skipped sync.`);
     return;
   }
 
-  // 2. 防抖处理
+  // 2. Debounce
   const key = file.path;
   if (plugin.debounceTimers.has(key)) {
     globalThis.clearTimeout(plugin.debounceTimers.get(key));
@@ -205,7 +205,7 @@ export const NoteModify = function (file: TAbstractFile, plugin: FastSync, event
       plugin.debounceTimers.delete(key);
       await performSync(file, plugin);
     })();
-  }, 5000) as unknown as number; // 5秒防抖
+  }, 5000) as unknown as number; // 5-second debounce
 
   plugin.debounceTimers.set(key, timer);
 };
@@ -233,8 +233,8 @@ const performSync = async (file: TFile, plugin: FastSync) => {
     const isMarkdown = file.extension === "md";
     const isImage = IMAGE_EXTENSIONS.includes(file.extension.toLowerCase());
 
-    // 只同步 Markdown 笔记和图片，其余类型（.zip .canvas .base 等）跳过
-    // 避免向 GitHub API 发送无法处理的文件类型导致 422
+    // Only sync Markdown notes and images; skip other types (.zip .canvas .base etc.)
+    // to avoid sending unsupported file types to the GitHub API which causes 422 errors
     if (!isMarkdown && !isImage) {
       if (plugin.syncProgress) {
         plugin.syncProgress.status = "success";
@@ -250,11 +250,11 @@ const performSync = async (file: TFile, plugin: FastSync) => {
       currentHash = hashContent(content);
     } else {
       content = await readVaultFileBinary(plugin.app.vault, file);
-      // 对二进制文件使用简单的摘要校验
+      // Use a simple checksum for binary files
       currentHash = file.stat.size + "_" + file.stat.mtime;
     }
 
-    // 3. 检查内容是否真正变化 (对比缓存的哈希)
+    // 3. Check whether content has actually changed (compare cached hash)
     if (plugin.syncData.files[file.path]?.hash === currentHash) {
       dump(`No content change for ${file.path}, skip sync.`);
       if (plugin.syncProgress) {
@@ -629,7 +629,7 @@ export const NoteRename = function (file: TAbstractFile, oldfile: string, plugin
 };
 
 /**
- * 初始化与同步逻辑 (保持之前实现的 Full Sync, 稍作修改以适配 hash)
+ * Initialization and sync logic (Full Sync, adapted to work with content hashes)
  */
 
 export async function overrideRemoteAllFilesImpl(plugin: FastSync): Promise<void> {
@@ -686,7 +686,7 @@ export async function overrideRemoteAllFilesImpl(plugin: FastSync): Promise<void
     new Notice("All assets synced to GitHub");
   } catch (error) {
     console.error("Force sync failed:", error);
-    // B3: 失败时弹出通知，用户可感知
+    // B3: Notify user on failure
     new Notice(`Sync failed: ${(error as Error).message}`);
   } finally {
     plugin.isSyncInProgress = false;
@@ -899,7 +899,7 @@ export async function syncAllFilesImpl(plugin: FastSync): Promise<void> {
     if (remoteTree.truncated) {
       throw new Error("GitHub tree response was truncated; plaintext sync cannot safely sync this repository.");
     }
-    // 过滤 Markdown 和 图片
+    // Filter to Markdown and images
     const remoteFiles = remoteTree.tree.filter((node: GitHubTreeNode) => {
       const ext = node.path.split(".").pop()?.toLowerCase();
       return node.type === "blob" && (ext === "md" || IMAGE_EXTENSIONS.includes(ext || "")) && !node.path.includes(".sync-conflict-");
@@ -910,7 +910,7 @@ export async function syncAllFilesImpl(plugin: FastSync): Promise<void> {
     if (plugin.syncProgress) plugin.syncProgress.totalPull = remoteFilesMap.size;
     if (typeof plugin.updateStatusBar === "function") plugin.updateStatusBar();
 
-    // 1. 下拉远端变更
+    // Step 1: Pull remote changes
     let step1Count = 0;
     for (const [path, remoteSha] of Array.from(remoteFilesMap.entries())) {
       try {
@@ -995,13 +995,13 @@ export async function syncAllFilesImpl(plugin: FastSync): Promise<void> {
           }
         }
       } catch (fileError) {
-        // 单个文件失败不中断整个同步
+        // A failure for a single file should not interrupt the overall sync
         console.error(`Step1 failed for ${path}:`, fileError);
       }
     }
 
 
-    // 2. 推送本地文件：新增文件 + 本地内容有变化的已有文件
+    // Step 2: Push local files – new files and files whose local content has changed
     let step2Push = 0, step2Skip = 0, step2Fail = 0;
     const candidateFiles = allLocalFiles.filter(file => shouldSyncPlaintextFile(file, plugin));
     if (plugin.syncProgress) plugin.syncProgress.totalPush = candidateFiles.length;
@@ -1020,7 +1020,7 @@ export async function syncAllFilesImpl(plugin: FastSync): Promise<void> {
           continue;
         }
 
-        // 计算当前内容 hash
+        // Compute current content hash
         let content: string | ArrayBuffer;
         let currentHash: string;
         if (isMarkdown) {
@@ -1032,22 +1032,22 @@ export async function syncAllFilesImpl(plugin: FastSync): Promise<void> {
         }
 
         if (!remoteSha) {
-          // 远端没有 → 新增文件，直接上传
+          // Not on remote -> new file, upload directly
           const newSha = await plugin.githubClient.putFile(file.path, content);
           plugin.syncData.files[file.path] = plaintextSyncEntry(newSha, file, currentHash);
           step2Push++;
         } else if (!localState || localState.hash !== currentHash) {
-          // B2: 远端有、但本地内容发生了变化 → 推送本地改动
+          // B2: File exists on remote but local content has changed -> push local changes
           const newSha = await plugin.githubClient.putFile(file.path, content, remoteSha);
           plugin.syncData.files[file.path] = plaintextSyncEntry(newSha, file, currentHash);
           step2Push++;
         } else {
-          // 两端内容一致，只更新本地 sha 缓存（防止 performSync 重复触发）
+          // Both sides match; only update local sha cache (prevents performSync from firing again)
           plugin.syncData.files[file.path] = plaintextSyncEntry(remoteSha, file, currentHash, plugin.syncData.files[file.path]?.lastSync ?? Date.now());
           step2Skip++;
         }
       } catch (fileError) {
-        // 单个文件失败不中断整个同步
+        // A failure for a single file should not interrupt the overall sync
         console.error(`Step2 failed for ${file.path}:`, fileError);
         step2Fail++;
       } finally {
@@ -1073,7 +1073,7 @@ export async function syncAllFilesImpl(plugin: FastSync): Promise<void> {
     }
   } catch (error) {
     console.error("Sync failed:", error);
-    // B3: 同步失败时弹出通知
+    // B3: Notify user on sync failure
     new Notice(`❌ Sync failed: ${(error as Error).message}`);
     plugin.syncProgress = {
       status: "fail",

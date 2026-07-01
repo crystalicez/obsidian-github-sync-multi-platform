@@ -139,14 +139,14 @@ export class GitHubClient {
   async putFile(path: string, content: string | ArrayBuffer, sha?: string): Promise<string> {
     const response = await this._doPutRequest(path, content, sha);
 
-    // 409 = 本地缓存 sha 已过期（SHA 冲突）
-    // 422 = 验证失败，常见原因：文件已存在但未传 sha（GitHub 不一致行为）
-    // 两种情况均用相同策略：重新 GET 最新 sha 后重试一次
+    // 409 = local cached sha is outdated (SHA conflict)
+    // 422 = validation failed; common reason: file already exists but sha was not provided (GitHub inconsistent behavior)
+    // Both cases use the same strategy: re-GET the latest sha and retry once
     if (response.status === 409 || response.status === 422) {
       const remoteFile = await this.getFile(path);
       const freshSha = remoteFile?.sha;
       if (!freshSha && response.status === 422) {
-        // 422 且远端也没有这个文件 → 真正的验证失败，不重试
+        // 422 and the remote file does not exist -> real validation failure, do not retry
         throw new Error(`Failed to put file ${path} (422 validation error): ${response.text}`);
       }
       const retry = await this._doPutRequest(path, content, freshSha);
@@ -179,8 +179,8 @@ export class GitHubClient {
     };
     if (sha) body.sha = sha;
 
-    // requestUrl 在收到 4xx/5xx 时默认抛出异常而非返回
-    // 加 throw: false 确保始终返回响应对象，使 409/422 状态码判断 100% 生效
+    // requestUrl defaults to throwing on 4xx/5xx; throw: false ensures we always get a response object
+    // so that 409/422 status code checks work 100% of the time
     try {
       const res = await requestUrl({
         url,
@@ -191,7 +191,7 @@ export class GitHubClient {
       });
       return { status: res.status, json: res.json as Record<string, unknown>, text: res.text };
     } catch (err: unknown) {
-      // 备用分支：如果 throw:false 不生效，捕获异常并返回
+      // Fallback: if throw: false is ignored, catch the exception and return a synthetic response
       const e = err as { status?: number; message?: string };
       return {
         status: e.status ?? 0,

@@ -1,60 +1,62 @@
-// 英语
+// English locale
 import type { LangMap } from "../lang";
 
-
 const en: Partial<LangMap> = {
-  "Fast sync": "Obsidian GitHub sync multi platform",
-  "同步全部笔记(覆盖远端)": "Sync all notes (overwrite remote)",
-  "同步全部笔记": "Sync all notes",
-  "远端": "Remote",
-  "接口配置信息已经粘贴到设置中!": "The interface configuration information has been pasted into the settings!",
-  "未检测到配置信息!": "Configuration information not detected!",
-  "远端服务搭建与选择": "Remote service setup and selection",
-  "选择一个适合自己的远端": "Choose a remote that suits you",
-  "方式": "Method",
-  "说明": "Instructions",
-  "详情参考": "Details reference",
-  "私有服务搭建": "Private service setup",
-  "速度好, 自由配置, 无隐私风险": "Fast speed, customizable, no privacy risks",
-  "粘贴的远端配置": "Pasted remote configuration",
-  "启用同步": "Enable synchronization",
-  "关闭后您的笔记将不做任何同步": "After closing, your notes will not be synced.",
-  "远端服务地址": "Remote service address",
-  "选择一个 Fast note sync service 服务地址": "Choose a fast note sync service address",
-  "输入您的 Fast note sync service 服务地址": "Enter your fast note sync service address",
-  "远端服务令牌": "Remote service token",
-  "用于远端服务的访问授权令牌": "Access authorization token for remote services",
-  "输入您的 API 访问令牌": "Enter your API access token",
-  "远端仓库名": "Remote repository name",
-  "支持": "Support",
-  "捐赠": "Donation",
-  "如果您喜欢这个插件，请考虑捐赠以支持继续开发。": "If you like this plugin, please consider donating to support continued development.",
-  "Buy me a coffee at ko-fi.com": "Buy me a coffee at ko-fi.com",
-  "复制 Debug 信息": "Copy debug information",
-  "将调试信息复制到剪贴板, 可能包含敏感信!": "Copy debug information to the clipboard, may contain sensitive information!",
-  "通过快捷键打开控制台，你可以看到这个插件和其他插件的日志": "By using the shortcut key to open the console, you can see the logs of this plugin and other plugins.",
-  "console_mac": "Cmd (⌘) + option (⌥) + i",
-  "console_windows": "Ctrl (⌃) + shift (⇧) + i",
-  "GitHub 用户名": "GitHub owner",
-  "GitHub 仓库名": "GitHub repo",
-  "GitHub 分支名": "GitHub branch",
-  "GitHub 访问令牌": "GitHub token",
-  "输入您的 GitHub 用户名": "Enter your GitHub username or organization name",
-  "输入您的 GitHub 仓库名": "Enter your GitHub repository name",
-  "输入您的 GitHub 分支名": "Enter your GitHub branch name (e.g., main)",
-  "输入您的 GitHub 访问令牌": "Enter your GitHub personal access token",
-  "GitHub 同步配置": "GitHub sync configuration",
-  "使用 GitHub API 进行同步": "Sync using the GitHub API",
-  "使用 GitHub 仓库存储和同步笔记": "Use a GitHub repository to store and sync notes",
-  "用于访问 GitHub API 的 Personal Access Token": "Personal Access Token used to access the GitHub API",
-  "General Settings": "General Settings",
+  // General
+  "Sync all notes (overwrite remote)": "Sync all notes (overwrite remote)",
+  "Sync all notes": "Sync all notes",
+  "Remote": "Remote",
+
+  // Clipboard paste feedback
+  "Configuration pasted into settings!": "Configuration pasted into settings!",
+  "No configuration detected!": "No configuration detected!",
+
+  // Connection info table
+  "Method": "Method",
+  "Description": "Description",
+  "Details": "Details",
+  "Use a GitHub repository to store and sync notes": "Use a GitHub repository to store and sync notes",
+  "Paste remote configuration": "Paste remote configuration",
+
+  // General settings
+  "Enable synchronization": "Enable synchronization",
+  "After closing, your notes will not be synced.": "After closing, your notes will not be synced.",
+  "Show sync status in status bar": "Show sync status in status bar",
+  "Display real-time sync progress, last sync time, or errors in the Obsidian status bar. Disable (kill-switch) to save system resources.": "Display real-time sync progress, last sync time, or errors in the Obsidian status bar. Disable (kill-switch) to save system resources.",
+
+  // GitHub connection
   "GitHub Connection Settings": "GitHub Connection Settings",
+  "GitHub owner": "GitHub owner",
+  "Enter your GitHub username or organization name": "Enter your GitHub username or organization name",
+  "GitHub repo": "GitHub repo",
+  "Enter your GitHub repository name": "Enter your GitHub repository name",
+  "GitHub branch": "GitHub branch",
+  "Enter your GitHub branch name (e.g., main)": "Enter your GitHub branch name (e.g., main)",
+  "GitHub token": "GitHub token",
+  "Personal Access Token used to access the GitHub API": "Personal Access Token used to access the GitHub API",
+  "Enter your GitHub personal access token": "Enter your GitHub personal access token",
+  "Remote repository name": "Remote repository name",
+
+  // Sections
+  "General Settings": "General Settings",
   "Encryption Settings": "Encryption Settings",
   "Manual & Force Operations": "Manual & Force Operations",
   "Automation & Exclusions": "Automation & Exclusions",
   "Support & Debug": "Support & Debug",
-  "Show sync status in status bar": "Show sync status in status bar",
-  "Display real-time sync progress, last sync time, or errors in the Obsidian status bar. Disable (kill-switch) to save system resources.": "Display real-time sync progress, last sync time, or errors in the Obsidian status bar. Disable (kill-switch) to save system resources.",
+
+  // Debug / support
+  "Copy debug information": "Copy debug information",
+  "Copy debug information to the clipboard, may contain sensitive information!": "Copy debug information to the clipboard, may contain sensitive information!",
+  "Open the console with the shortcut key to see this plugin's logs and other plugin logs.": "Open the console with the shortcut key to see this plugin's logs and other plugin logs.",
+  "console_mac": "Cmd (⌘) + option (⌥) + i",
+  "console_windows": "Ctrl (⌃) + shift (⇧) + i",
+  "Donation": "Donation",
+  "If you like this plugin, please consider donating to support continued development.": "If you like this plugin, please consider donating to support continued development.",
+  "Buy me a coffee at ko-fi.com": "Buy me a coffee at ko-fi.com",
+
+  // GitHub sync config (settings-view.tsx)
+  "GitHub sync configuration": "GitHub sync configuration",
+  "Sync using the GitHub API": "Sync using the GitHub API",
 }
 
 export default en;

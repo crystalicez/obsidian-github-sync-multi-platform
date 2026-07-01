@@ -1,6 +1,6 @@
 .obsidian-github-sync-multi-platform-ribbon-icon{
     animation: rotate 2s linear infinite;
-    /* 旋转动画：2秒一圈，线性，无限循环 */
+    /* Rotation animation: one full turn every 2 s, linear, infinite */
 }
 
 @keyframes rotate {
@@ -126,7 +126,7 @@
     }
 }
 
-/* 移动端图片展示优化 */
+/* Image display optimisation for mobile */
 .markdown-rendered img, 
 .markdown-source-view.mod-cm6 .cm-content img {
     display: block;
@@ -137,16 +137,16 @@
     box-shadow: var(--shadow-s);
 }
 
-/* 如果图片被显式设置了宽度（如 ![|100]），保持原样，否则默认更宽一点 */
+/* If the image has an explicit width set (e.g. ![|100]), keep it as-is; otherwise default to a wider display */
 .markdown-rendered img:not([width]),
 .markdown-source-view.mod-cm6 .cm-content img:not([width]) {
-    min-width: 200px; /* 设置一个合理的最小宽度 */
+    min-width: 200px; /* reasonable minimum width */
 }
 
 @media (max-width: 480px) {
     .markdown-rendered img:not([width]),
     .markdown-source-view.mod-cm6 .cm-content img:not([width]) {
-        width: 100%; /* 移动端默认撑满宽度 */
+        width: 100%; /* fill viewport width on mobile */
     }
 }
 
