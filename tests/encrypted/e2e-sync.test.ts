@@ -507,6 +507,7 @@ test("encrypted auto local change uploads one loose object instead of rewriting 
   vault.set("Notes/note-00000.md", new TextEncoder().encode("v2-0"));
   const changedFile = vault.getAbstractFileByPath("Notes/note-00000.md") as TFile;
   vault.readBinaryCount = 0;
+  vault.getFilesCount = 0;
 
   await encryptedModify(changedFile, instance as never, true);
 
@@ -520,6 +521,7 @@ test("encrypted auto local change uploads one loose object instead of rewriting 
   assert.equal(instance.syncProgress.totalPull, 0);
   assert.equal(instance.syncProgress.totalPush, 1);
   assert.equal(vault.readBinaryCount <= 2, true);
+  assert.equal(vault.getFilesCount, 0);
 });
 
 test("encrypted auto local change updates cached remote head after pushing loose delta", async () => {
@@ -534,6 +536,31 @@ test("encrypted auto local change updates cached remote head after pushing loose
 
   assert.notEqual(github.headSha, headBefore);
   assert.equal(instance.syncData.lastRemoteHeadSha, github.headSha);
+});
+
+test("encrypted verbose logging includes duration and phase timings", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault({ "Notes/a.md": "stable" });
+  const instance = plugin(vault, github) as ReturnType<typeof plugin>;
+  instance.settings.consoleLoggingEnabled = true;
+  const logDetails: Array<Record<string, unknown>> = [];
+  const originalInfo = console.info;
+  console.info = (...args: unknown[]) => {
+    const details = args.at(-1);
+    if (details && typeof details === "object") logDetails.push(details as Record<string, unknown>);
+  };
+
+  try {
+    await encryptedForcePush(instance as never);
+    await encryptedFullSync(instance as never);
+  } finally {
+    console.info = originalInfo;
+  }
+
+  const completed = logDetails.find(details => details.operation === "normal" && typeof details.durationMs === "number");
+  assert.ok(completed);
+  assert.ok(Array.isArray(completed.phases));
+  assert.equal((completed.phases as Array<Record<string, unknown>>).some(phase => String(phase.name).startsWith("preflight.")), true);
 });
 test("encrypted local modify is blocked until force push after enabling encryption", async () => {
   const github = new MemoryGitHub();

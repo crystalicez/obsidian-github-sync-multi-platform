@@ -24,6 +24,38 @@ const ENCRYPTED_LOOSE_DELTA_MAX_FILES = 32;
 const ENCRYPTED_LOOSE_DELTA_MAX_BYTES = 64 * 1024 * 1024;
 const ENCRYPTED_LOOSE_DELTA_COMPACT_AFTER_FILES = 256;
 
+interface SyncPhaseTiming {
+  name: string;
+  durationMs: number;
+  [key: string]: unknown;
+}
+
+class SyncTimer {
+  readonly startedAt = Date.now();
+  readonly phases: SyncPhaseTiming[] = [];
+
+  async measure<T>(name: string, task: () => Promise<T>, details?: () => Record<string, unknown>): Promise<T> {
+    const startedAt = Date.now();
+    try {
+      return await task();
+    } finally {
+      this.phases.push({
+        name,
+        durationMs: Date.now() - startedAt,
+        ...(details ? details() : {}),
+      });
+    }
+  }
+
+  mark(name: string, startedAt: number, details?: Record<string, unknown>): void {
+    this.phases.push({ name, durationMs: Date.now() - startedAt, ...(details ?? {}) });
+  }
+
+  summary(): { durationMs: number; phases: SyncPhaseTiming[] } {
+    return { durationMs: Date.now() - this.startedAt, phases: this.phases };
+  }
+}
+
 function getSyncQueue(plugin: FastSync): Promise<any> {
   let queue = syncQueues.get(plugin);
   if (!queue) {
@@ -399,6 +431,7 @@ async function confirmForeignRemoteBeforeForcePush(plugin: FastSync, operation: 
 }
 
 async function encryptedSyncImpl(plugin: FastSync, options: EncryptedSyncOptions): Promise<void> {
+  const timer = new SyncTimer();
   if (plugin.isSyncInProgress) {
     new Notice("Sync is already in progress. Please wait.");
     return;
@@ -430,16 +463,28 @@ async function encryptedSyncImpl(plugin: FastSync, options: EncryptedSyncOptions
     let locallyDirtyPaths = new Set<string>();
     let preflightLocalFiles: TFile[] | null = null;
     if (options.operation === "normal" || options.operation === "manual") {
-      const localFiles = listEncryptedSyncCandidates(plugin.app.vault, ignoreRules);
-      preflightLocalFiles = localFiles;
-      remoteHeadBeforeSync = await getRemoteHeadShaIfAvailable(plugin);
+      let measuredLocalFileCount = 0;
+      preflightLocalFiles = await timer.measure("preflight.listLocalFiles", async () => {
+        const files = listEncryptedSyncCandidates(plugin.app.vault, ignoreRules);
+        measuredLocalFileCount = files.length;
+        return files;
+      }, () => ({ localFileCount: measuredLocalFileCount }));
+      const localFileCount = preflightLocalFiles.length;
+      let measuredRemoteHead: string | null = null;
+      remoteHeadBeforeSync = await timer.measure("preflight.remoteHead", async () => {
+        measuredRemoteHead = await getRemoteHeadShaIfAvailable(plugin);
+        return measuredRemoteHead;
+      }, () => ({ remoteHeadBeforeSync: measuredRemoteHead }));
       syncConsoleLog(plugin.settings, "debug", "encrypted sync preflight", {
         operation: options.operation,
-        localFileCount: localFiles.length,
+        localFileCount,
         remoteHeadBeforeSync,
         cachedRemoteHead: plugin.syncData.lastRemoteHeadSha,
       });
-      if (remoteHeadBeforeSync && plugin.syncData.lastRemoteHeadSha === remoteHeadBeforeSync && encryptedLocalStateMatchesCache(plugin, localFiles) && !encryptedStateNeedsPackMigration(plugin, localFiles)) {
+      const cacheMatches = encryptedLocalStateMatchesCache(plugin, preflightLocalFiles);
+      const packMigrationNeeded = encryptedStateNeedsPackMigration(plugin, preflightLocalFiles);
+      timer.mark("preflight.cacheCheck", Date.now(), { cacheMatches, packMigrationNeeded });
+      if (remoteHeadBeforeSync && plugin.syncData.lastRemoteHeadSha === remoteHeadBeforeSync && cacheMatches && !packMigrationNeeded) {
         if (plugin.syncProgress) {
           plugin.syncProgress = {
             status: "success",
@@ -453,8 +498,9 @@ async function encryptedSyncImpl(plugin: FastSync, options: EncryptedSyncOptions
         if (typeof plugin.updateStatusBar === "function") plugin.updateStatusBar();
         syncConsoleLog(plugin.settings, "info", "encrypted sync skipped: no local or remote changes", {
           operation: options.operation,
-          localFileCount: localFiles.length,
+          localFileCount,
           remoteHeadBeforeSync,
+          ...timer.summary(),
         });
         new Notice("Encrypted sync skipped: no local or remote changes");
         return;
@@ -465,12 +511,17 @@ async function encryptedSyncImpl(plugin: FastSync, options: EncryptedSyncOptions
       new Notice("Force push cancelled");
       return;
     }
-    const { key } = await loadKey(plugin, options.operation === "forcePush");
+    const { key } = await timer.measure("loadKey", () => loadKey(plugin, options.operation === "forcePush"));
 
-    let manifest = await loadEncryptedSnapshotManifest(plugin, key, { tolerateMissingSnapshot: options.operation === "forcePush" }) ?? emptyEncryptedManifest();
+    let manifest = await timer.measure("loadSnapshotManifest", () => loadEncryptedSnapshotManifest(plugin, key, { tolerateMissingSnapshot: options.operation === "forcePush" })) ?? emptyEncryptedManifest();
     if (options.operation !== "forcePull" && options.operation !== "forcePush") {
       const localFiles = preflightLocalFiles ?? listEncryptedSyncCandidates(plugin.app.vault, ignoreRules);
-      locallyDirtyPaths = detectLocallyDirtyPackedPaths(plugin, manifest, localFiles);
+      let measuredDirtyPathCount = 0;
+      locallyDirtyPaths = await timer.measure("detectLocalDirtyPaths", async () => {
+        const dirtyPaths = detectLocallyDirtyPackedPaths(plugin, manifest, localFiles);
+        measuredDirtyPathCount = dirtyPaths.size;
+        return dirtyPaths;
+      }, () => ({ dirtyPathCount: measuredDirtyPathCount }));
       syncConsoleLog(plugin.settings, "debug", "encrypted sync local dirty paths detected", {
         operation: options.operation,
         dirtyPathCount: locallyDirtyPaths.size,
@@ -480,21 +531,21 @@ async function encryptedSyncImpl(plugin: FastSync, options: EncryptedSyncOptions
     let packsToDeleteAfterSave: EncryptedPackManifestRecord[] = [];
     let objectsToDeleteAfterSave: Array<EncryptedManifest["files"][string]> = [];
     if (options.operation === "forcePull") {
-      const pulledManifest = await pullEncryptedSnapshotIfAvailable(plugin, key, ignoreRules);
+      const pulledManifest = await timer.measure("forcePull.pullSnapshot", () => pullEncryptedSnapshotIfAvailable(plugin, key, ignoreRules));
       if (!pulledManifest) throw new Error("No encrypted v2 snapshot found on remote. Run Force push to initialize encrypted sync.");
       manifest = pulledManifest;
     } else if (options.operation === "forcePush") {
       const previousPacks = Object.values(manifest.packs ?? {});
       objectsToDeleteAfterSave = Object.values(manifest.files ?? {});
       manifest = emptyEncryptedManifest();
-      const forcePushResult = await pushEncryptedForceLocalChanges(plugin, key, manifest, ignoreRules);
+      const forcePushResult = await timer.measure("forcePush.pushLocalChanges", () => pushEncryptedForceLocalChanges(plugin, key, manifest, ignoreRules));
       manifestChanged = forcePushResult.changed;
       packsToDeleteAfterSave = previousPacks.length > 0 ? previousPacks : forcePushResult.packsToDeleteAfterSave;
-      await saveEncryptedSnapshotFromManifest(plugin, key, manifest, { requireHeadCas: false });
+      await timer.measure("writeSnapshotHead", () => saveEncryptedSnapshotFromManifest(plugin, key, manifest, { requireHeadCas: false }));
     } else {
-      if (manifest.packs && Object.keys(manifest.packs).length > 0) await pullEncryptedPackChanges(plugin, key, manifest, ignoreRules, false, locallyDirtyPaths);
-      await pullEncryptedChanges(plugin, key, manifest, false);
-      const pushResult = await pushEncryptedAutoLocalChanges(plugin, key, manifest, ignoreRules);
+      if (manifest.packs && Object.keys(manifest.packs).length > 0) await timer.measure("pullPacks", () => pullEncryptedPackChanges(plugin, key, manifest, ignoreRules, false, locallyDirtyPaths));
+      await timer.measure("pullObjects", () => pullEncryptedChanges(plugin, key, manifest, false));
+      const pushResult = await timer.measure("pushLocalChanges", () => pushEncryptedAutoLocalChanges(plugin, key, manifest, ignoreRules));
       manifestChanged = pushResult.changed;
       packsToDeleteAfterSave = pushResult.packsToDeleteAfterSave;
       syncConsoleLog(plugin.settings, "debug", "encrypted sync local changes evaluated", {
@@ -503,14 +554,15 @@ async function encryptedSyncImpl(plugin: FastSync, options: EncryptedSyncOptions
         fileCount: Object.keys(manifest.files).length,
         packCount: Object.keys(manifest.packs ?? {}).length,
       });
-      if (manifestChanged || !(await loadEncryptedSnapshotManifest(plugin, key))) await saveEncryptedSnapshotFromManifest(plugin, key, manifest);
+      if (manifestChanged || !(await timer.measure("verifySnapshotExists", () => loadEncryptedSnapshotManifest(plugin, key)))) await timer.measure("writeSnapshotHead", () => saveEncryptedSnapshotFromManifest(plugin, key, manifest));
     }
 
-    if (packsToDeleteAfterSave.length > 0) await deleteObsoleteRemotePacks(plugin, packsToDeleteAfterSave, manifest);
-    if (objectsToDeleteAfterSave.length > 0) await deleteObsoleteRemoteObjects(plugin, objectsToDeleteAfterSave, manifest);
-    const encryptedHead = await new EncryptedSnapshotStore(plugin.githubClient, key).loadHead();
-    if (options.operation === "forcePush" && encryptedHead) await pruneEncryptedRemoteAfterForcePush(plugin, manifest, encryptedHead.head.snapshotId);
+    if (packsToDeleteAfterSave.length > 0) await timer.measure("deleteObsoletePacks", () => deleteObsoleteRemotePacks(plugin, packsToDeleteAfterSave, manifest));
+    if (objectsToDeleteAfterSave.length > 0) await timer.measure("deleteObsoleteObjects", () => deleteObsoleteRemoteObjects(plugin, objectsToDeleteAfterSave, manifest));
+    const encryptedHead = await timer.measure("loadWrittenHead", () => new EncryptedSnapshotStore(plugin.githubClient, key).loadHead());
+    if (options.operation === "forcePush" && encryptedHead) await timer.measure("forcePush.pruneRemote", () => pruneEncryptedRemoteAfterForcePush(plugin, manifest, encryptedHead.head.snapshotId));
     plugin.syncData.encrypted = { files: {}, manifestSha: encryptedHead?.sha };
+    const cacheStartedAt = Date.now();
     for (const [path, record] of Object.entries(manifest.files)) {
       if (!record.deleted) {
         const stat = localStatForRecord(plugin, path, record);
@@ -527,14 +579,15 @@ async function encryptedSyncImpl(plugin: FastSync, options: EncryptedSyncOptions
         };
       }
     }
+    timer.mark("refreshLocalSyncCache", cacheStartedAt, { cachedFileCount: Object.keys(plugin.syncData.encrypted.files).length });
     if (options.operation === "forcePush") {
       (plugin.settings as { encryptedForcePushRequired?: boolean }).encryptedForcePushRequired = false;
       if (typeof (plugin as FastSync & { saveSettings?: () => Promise<void> }).saveSettings === "function") await (plugin as FastSync & { saveSettings: () => Promise<void> }).saveSettings();
     }
     plugin.syncData.lastRemoteHeadSha = options.operation === "forcePush" || manifestChanged
-      ? (await getRemoteHeadShaIfAvailable(plugin) ?? plugin.syncData.lastRemoteHeadSha)
+      ? (await timer.measure("refreshRemoteHeadCache", () => getRemoteHeadShaIfAvailable(plugin)) ?? plugin.syncData.lastRemoteHeadSha)
       : (remoteHeadBeforeSync ?? plugin.syncData.lastRemoteHeadSha);
-    await plugin.saveSyncData();
+    await timer.measure("saveSyncData", () => plugin.saveSyncData());
     syncConsoleLog(plugin.settings, "info", "encrypted sync completed", {
       operation: options.operation,
       manifestChanged,
@@ -545,6 +598,7 @@ async function encryptedSyncImpl(plugin: FastSync, options: EncryptedSyncOptions
       totalPush: plugin.syncProgress?.totalPush,
       pullCount: plugin.syncProgress?.pullCount,
       totalPull: plugin.syncProgress?.totalPull,
+      ...timer.summary(),
     });
     new Notice(`Encrypted ${options.operation} completed`);
     if (plugin.syncProgress) {
@@ -576,10 +630,11 @@ async function encryptedSyncImpl(plugin: FastSync, options: EncryptedSyncOptions
 async function runEncryptedSyncWithCasRetry(plugin: FastSync, options: EncryptedSyncOptions): Promise<void> {
   const maxAttempts = isCasRetryableOperation(options.operation) ? 3 : 1;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const attemptStartedAt = Date.now();
     try {
       syncConsoleLog(plugin.settings, "info", "encrypted sync attempt started", { operation: options.operation, attempt, maxAttempts });
       await encryptedSyncImpl(plugin, options);
-      if (plugin.syncProgress?.status !== "fail") syncConsoleLog(plugin.settings, "info", "encrypted sync attempt completed", { operation: options.operation, attempt });
+      if (plugin.syncProgress?.status !== "fail") syncConsoleLog(plugin.settings, "info", "encrypted sync attempt completed", { operation: options.operation, attempt, durationMs: Date.now() - attemptStartedAt });
       return;
     } catch (error) {
       if (error instanceof SnapshotHeadCasError && attempt < maxAttempts) {
@@ -588,6 +643,7 @@ async function runEncryptedSyncWithCasRetry(plugin: FastSync, options: Encrypted
           attempt,
           nextAttempt: attempt + 1,
           maxAttempts,
+          durationMs: Date.now() - attemptStartedAt,
           error,
         });
         continue;
@@ -603,13 +659,17 @@ export async function encryptedSync(plugin: FastSync, options: EncryptedSyncOpti
 }
 
 async function encryptedModifyImpl(file: TAbstractFile, plugin: FastSync, eventEnter = false): Promise<void> {
+  const timer = new SyncTimer();
   if (!(file instanceof TFile)) return;
   if (!plugin.isWatchEnabled && eventEnter) return;
   const ignoreRules = configuredIgnoreRules(plugin);
   if (!shouldSyncEncryptedFile(file, ignoreRules) || !plugin.githubClient) return;
   if (blockIfEncryptedForcePushRequired(plugin, "localChange", file.path)) return;
   if (plugin.isSyncInProgress) return;
-  if (encryptedCachedStateSuggestsPackSync(plugin)) {
+  const path = normalizeVaultPath(file.path);
+  const initialState = ensureEncryptedState(plugin);
+  const canUseDirectPackedDelta = !!plugin.syncData.lastRemoteHeadSha && !!initialState.files[path];
+  if (encryptedCachedStateSuggestsPackSync(plugin) && !canUseDirectPackedDelta) {
     await runEncryptedSyncWithCasRetry(plugin, { operation: "localChange" });
     return;
   }
@@ -626,9 +686,8 @@ async function encryptedModifyImpl(file: TAbstractFile, plugin: FastSync, eventE
     if (typeof plugin.updateStatusBar === "function") plugin.updateStatusBar();
   }
   try {
-    const { key } = await loadKey(plugin);
-    const manifest = await loadEncryptedSnapshotManifest(plugin, key) ?? emptyEncryptedManifest();
-    const path = normalizeVaultPath(file.path);
+    const { key } = await timer.measure("loadKey", () => loadKey(plugin));
+    const manifest = await timer.measure("loadSnapshotManifest", () => loadEncryptedSnapshotManifest(plugin, key)) ?? emptyEncryptedManifest();
     const state = ensureEncryptedState(plugin);
     const existing = manifest.files[path];
     const cached = state.files[path];
@@ -639,9 +698,9 @@ async function encryptedModifyImpl(file: TAbstractFile, plugin: FastSync, eventE
       return;
     }
 
-    const plaintext = await readVaultFileBytes(plugin.app.vault, file);
-    const plaintextSha256 = await sha256Hex(plaintext);
-    if (await resolveRemoteChangedBeforeLocalMutation(plugin, key, manifest, path, existing, cached, file, plaintext)) {
+    const plaintext = await timer.measure("readLocalFile", () => readVaultFileBytes(plugin.app.vault, file), () => ({ bytes: file.stat.size }));
+    const plaintextSha256 = await timer.measure("hashLocalFile", () => sha256Hex(plaintext));
+    if (await timer.measure("checkRemoteConflict", () => resolveRemoteChangedBeforeLocalMutation(plugin, key, manifest, path, existing, cached, file, plaintext))) {
       if (plugin.syncProgress) {
         plugin.syncProgress = {
           status: "success",
@@ -672,11 +731,13 @@ async function encryptedModifyImpl(file: TAbstractFile, plugin: FastSync, eventE
 
     const reusableExisting = existing?.storage === "pack" ? undefined : existing;
     const objectId = reusableExisting?.id ?? toBase64Url(randomBytes(OBJECT_ID_BYTES));
-    const uploaded = await uploadEncryptedFileObject(plugin.githubClient, key, objectId, plaintext, reusableExisting);
+    syncConsoleLog(plugin.settings, "info", "encrypted local modify using direct loose delta", { path, storage: existing?.storage, bytes: file.stat.size });
+    const uploaded = await timer.measure("uploadLooseObject", () => uploadEncryptedFileObject(plugin.githubClient, key, objectId, plaintext, reusableExisting), () => ({ bytes: file.stat.size }));
     manifest.files[path] = { ...uploaded, path, plaintextSha256, mtime: file.stat.mtime, deleted: false, deletedAt: undefined };
-    state.manifestSha = await saveEncryptedSnapshotFromManifest(plugin, key, manifest);
+    state.manifestSha = await timer.measure("writeSnapshotHead", () => saveEncryptedSnapshotFromManifest(plugin, key, manifest));
     state.files[path] = { plaintextSha256, objectPath: manifest.files[path].objectPath, remoteSha: manifest.files[path].remoteSha, storage: manifest.files[path].storage, chunks: manifest.files[path].chunks, manifestUpdatedAt: manifest.updatedAt, size: file.stat.size, mtime: file.stat.mtime };
-    await plugin.saveSyncData();
+    plugin.syncData.lastRemoteHeadSha = await timer.measure("refreshRemoteHeadCache", () => getRemoteHeadShaIfAvailable(plugin)) ?? plugin.syncData.lastRemoteHeadSha;
+    await timer.measure("saveSyncData", () => plugin.saveSyncData());
 
     if (plugin.syncProgress) {
       plugin.syncProgress = {
@@ -688,6 +749,16 @@ async function encryptedModifyImpl(file: TAbstractFile, plugin: FastSync, eventE
         lastSyncTime: Date.now()
       };
     }
+    syncConsoleLog(plugin.settings, "info", "encrypted local modify completed", {
+      operation: "localChange",
+      path,
+      fileCount: Object.keys(manifest.files).length,
+      packCount: Object.keys(manifest.packs ?? {}).length,
+      lastRemoteHeadSha: plugin.syncData.lastRemoteHeadSha,
+      pushCount: plugin.syncProgress?.pushCount,
+      totalPush: plugin.syncProgress?.totalPush,
+      ...timer.summary(),
+    });
   } catch (error) {
     reportSyncError("localChange", error, file.path);
     if (plugin.syncProgress) {
