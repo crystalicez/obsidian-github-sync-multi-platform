@@ -25,6 +25,7 @@ export interface PluginSettings {
   conflictPolicy: "copy" | "newer" | "merge" | "ask"
   encryptedForcePushRequired: boolean
   statusBarStatusEnabled: boolean
+  consoleLoggingEnabled: boolean
 
   vault: string
   lastSyncTime: number
@@ -60,6 +61,7 @@ export const DEFAULT_SETTINGS: PluginSettings = {
   lastSyncTime: 0,
   vault: "defaultVault",
   statusBarStatusEnabled: true,
+  consoleLoggingEnabled: false,
   // 剪贴板读取提示
   clipboardReadTip: "",
 }
@@ -457,6 +459,16 @@ export class SettingTab extends PluginSettingTab {
       .setName($("Support & Debug"))
       .setHeading()
       .setClass("github-sync-settings-header")
+
+    new Setting(set)
+      .setName("Verbose console logging")
+      .setDesc("Log sync info, debug details, and warnings to the Obsidian developer console. Secrets are hidden before logging.")
+      .addToggle((toggle) =>
+        toggle.setValue(this.tempSettings!.consoleLoggingEnabled).onChange((value) => {
+          this.tempSettings!.consoleLoggingEnabled = value
+          this.updateDirtyState()
+        })
+      )
 
     const debugDiv = set.createDiv()
     debugDiv.addClass("obsidian-github-sync-multi-platform-settings-debug")

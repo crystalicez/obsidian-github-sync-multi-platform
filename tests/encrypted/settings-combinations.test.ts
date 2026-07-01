@@ -10,7 +10,7 @@ import {
   syncModeUsesEncryption,
 } from "../../src/lib/encrypted/settings-policy";
 import type { ConflictPolicy } from "../../src/lib/encrypted/types";
-import { createDebugPayload, sanitizeDebugSettings } from "../../src/lib/debug";
+import { createDebugPayload, sanitizeDebugSettings, syncConsoleLog } from "../../src/lib/debug";
 
 type Mode = "plaintext" | "encrypted";
 
@@ -139,4 +139,25 @@ test("debug payload hides every secret copied from settings", () => {
   assert.equal((payload.settings as Record<string, unknown>).encryptionPassphrase, "***HIDDEN***");
   assert.equal(json.includes("ghp_secret"), false);
   assert.equal(json.includes("vault passphrase"), false);
+});
+
+test("sync console logging is opt-in and hides secrets", () => {
+  const lines: unknown[][] = [];
+  const originalWarn = console.warn;
+  console.warn = (...args: unknown[]) => { lines.push(args); };
+  try {
+    syncConsoleLog({ consoleLoggingEnabled: false }, "warn", "hidden", { githubToken: "ghp_secret" });
+    syncConsoleLog({ consoleLoggingEnabled: true }, "warn", "visible", {
+      githubToken: "ghp_secret",
+      nested: { encryptionPassphrase: "vault passphrase", count: 2 },
+    });
+  } finally {
+    console.warn = originalWarn;
+  }
+  const json = JSON.stringify(lines);
+  assert.equal(lines.length, 1);
+  assert.equal(json.includes("visible"), true);
+  assert.equal(json.includes("ghp_secret"), false);
+  assert.equal(json.includes("vault passphrase"), false);
+  assert.equal(json.includes("***HIDDEN***"), true);
 });

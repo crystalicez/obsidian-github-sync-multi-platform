@@ -1,6 +1,6 @@
 import { Modal, Notice, TAbstractFile, TFile } from "obsidian";
 import FastSync from "../../main";
-import { ENCRYPTED_PACK_PLAINTEXT_BYTES, OBJECT_ID_BYTES } from "./constants";
+import { ENCRYPTED_CONFIG_PATH, ENCRYPTED_OBJECTS_ROOT, ENCRYPTED_PACK_PLAINTEXT_BYTES, ENCRYPTED_PACKS_ROOT, ENCRYPTED_ROOT, OBJECT_ID_BYTES } from "./constants";
 import { chooseConflictResolution, mergeTextContent } from "./conflicts";
 import { compileIgnorePathRegex } from "./ignore";
 import { downloadEncryptedFileObject, uploadEncryptedFileObject } from "./large-objects";
@@ -8,7 +8,7 @@ import { planEncryptedPacks } from "./pack-planner";
 import { downloadEncryptedPack, uploadEncryptedPack } from "./pack-sync";
 import { chooseEncryptedStorageMode } from "./scale-policy";
 import { EncryptedManifestStore } from "./manifest-store";
-import { EncryptedSnapshotStore } from "./snapshot-store";
+import { EncryptedSnapshotStore, SnapshotHeadCasError, V2_HEAD_PATH, V2_ROOT, V2_SNAPSHOTS_ROOT } from "./snapshot-store";
 import { classifyRemoteRepo } from "./remote-state";
 import { conflictPathFor, normalizeVaultPath } from "./paths";
 import { reportSyncError } from "./sync-errors";
@@ -17,6 +17,7 @@ import type { EncryptedSnapshotFileRecord, EncryptedSnapshotManifest, EncryptedS
 import { effectiveConflictPolicy } from "./settings-policy";
 import { deleteVaultFileIfExists, listEncryptedSyncCandidates, readVaultFileBytes, readVaultFileText, shouldSyncEncryptedFile, writeVaultFileBytes } from "./vault";
 import { randomBytes, sha256Hex, toBase64Url } from "./bytes";
+import { syncConsoleLog } from "../debug";
 
 const syncQueues = new WeakMap<FastSync, Promise<any>>();
 
@@ -40,6 +41,26 @@ export interface EncryptedSyncOptions {
   operation: EncryptedSyncOperation;
 }
 
+function isCasRetryableOperation(operation: EncryptedSyncOperation): boolean {
+  return operation === "normal" || operation === "manual" || operation === "localChange";
+}
+
+function markEncryptedSyncFailure(plugin: FastSync, operation: EncryptedSyncOperation, error: unknown): void {
+  if (plugin.syncProgress) {
+    plugin.syncProgress = {
+      status: "fail",
+      pushCount: 0,
+      totalPush: 0,
+      pullCount: 0,
+      totalPull: 0,
+      lastSyncTime: plugin.syncProgress.lastSyncTime,
+      errorMessage: (error as Error).message
+    };
+  }
+  syncConsoleLog(plugin.settings, "warn", "encrypted sync failed", { operation, error });
+  reportSyncError(operation, error);
+}
+
 function ensureEncryptedState(plugin: FastSync): { files: { [path: string]: EncryptedLocalFileState }; manifestSha?: string } {
   if (!plugin.syncData.encrypted) plugin.syncData.encrypted = { files: {} };
   return plugin.syncData.encrypted;
@@ -52,7 +73,7 @@ async function getRemoteHeadShaIfAvailable(plugin: FastSync): Promise<string | n
   try {
     return await getter.call(plugin.githubClient);
   } catch (error) {
-    console.warn("Remote HEAD lookup failed; falling back to full encrypted sync", error);
+    syncConsoleLog(plugin.settings, "warn", "remote HEAD lookup failed; falling back to full encrypted sync", { error });
     return null;
   }
 }
@@ -378,6 +399,12 @@ async function encryptedSyncImpl(plugin: FastSync, options: EncryptedSyncOptions
     if (options.operation === "normal" || options.operation === "manual") {
       const localFiles = listEncryptedSyncCandidates(plugin.app.vault, ignoreRules);
       remoteHeadBeforeSync = await getRemoteHeadShaIfAvailable(plugin);
+      syncConsoleLog(plugin.settings, "debug", "encrypted sync preflight", {
+        operation: options.operation,
+        localFileCount: localFiles.length,
+        remoteHeadBeforeSync,
+        cachedRemoteHead: plugin.syncData.lastRemoteHeadSha,
+      });
       if (remoteHeadBeforeSync && plugin.syncData.lastRemoteHeadSha === remoteHeadBeforeSync && encryptedLocalStateMatchesCache(plugin, localFiles) && !encryptedStateNeedsPackMigration(plugin, localFiles)) {
         if (plugin.syncProgress) {
           plugin.syncProgress = {
@@ -390,6 +417,11 @@ async function encryptedSyncImpl(plugin: FastSync, options: EncryptedSyncOptions
           };
         }
         if (typeof plugin.updateStatusBar === "function") plugin.updateStatusBar();
+        syncConsoleLog(plugin.settings, "info", "encrypted sync skipped: no local or remote changes", {
+          operation: options.operation,
+          localFileCount: localFiles.length,
+          remoteHeadBeforeSync,
+        });
         new Notice("Encrypted sync skipped: no local or remote changes");
         return;
       }
@@ -404,12 +436,14 @@ async function encryptedSyncImpl(plugin: FastSync, options: EncryptedSyncOptions
     let manifest = await loadEncryptedSnapshotManifest(plugin, key, { tolerateMissingSnapshot: options.operation === "forcePush" }) ?? emptyEncryptedManifest();
     let manifestChanged = false;
     let packsToDeleteAfterSave: EncryptedPackManifestRecord[] = [];
+    let objectsToDeleteAfterSave: Array<EncryptedManifest["files"][string]> = [];
     if (options.operation === "forcePull") {
       const pulledManifest = await pullEncryptedSnapshotIfAvailable(plugin, key, ignoreRules);
       if (!pulledManifest) throw new Error("No encrypted v2 snapshot found on remote. Run Force push to initialize encrypted sync.");
       manifest = pulledManifest;
     } else if (options.operation === "forcePush") {
       const previousPacks = Object.values(manifest.packs ?? {});
+      objectsToDeleteAfterSave = Object.values(manifest.files ?? {});
       manifest = emptyEncryptedManifest();
       const forcePushResult = await pushEncryptedForceLocalChanges(plugin, key, manifest, ignoreRules);
       manifestChanged = forcePushResult.changed;
@@ -421,11 +455,19 @@ async function encryptedSyncImpl(plugin: FastSync, options: EncryptedSyncOptions
       const pushResult = await pushEncryptedAutoLocalChanges(plugin, key, manifest, ignoreRules);
       manifestChanged = pushResult.changed;
       packsToDeleteAfterSave = pushResult.packsToDeleteAfterSave;
+      syncConsoleLog(plugin.settings, "debug", "encrypted sync local changes evaluated", {
+        operation: options.operation,
+        manifestChanged,
+        fileCount: Object.keys(manifest.files).length,
+        packCount: Object.keys(manifest.packs ?? {}).length,
+      });
       if (manifestChanged || !(await loadEncryptedSnapshotManifest(plugin, key))) await saveEncryptedSnapshotFromManifest(plugin, key, manifest);
     }
 
     if (packsToDeleteAfterSave.length > 0) await deleteObsoleteRemotePacks(plugin, packsToDeleteAfterSave, manifest);
+    if (objectsToDeleteAfterSave.length > 0) await deleteObsoleteRemoteObjects(plugin, objectsToDeleteAfterSave, manifest);
     const encryptedHead = await new EncryptedSnapshotStore(plugin.githubClient, key).loadHead();
+    if (options.operation === "forcePush" && encryptedHead) await pruneEncryptedRemoteAfterForcePush(plugin, manifest, encryptedHead.head.snapshotId);
     plugin.syncData.encrypted = { files: {}, manifestSha: encryptedHead?.sha };
     for (const [path, record] of Object.entries(manifest.files)) {
       if (!record.deleted) {
@@ -449,6 +491,17 @@ async function encryptedSyncImpl(plugin: FastSync, options: EncryptedSyncOptions
     }
     plugin.syncData.lastRemoteHeadSha = options.operation === "forcePush" ? (await getRemoteHeadShaIfAvailable(plugin) ?? plugin.syncData.lastRemoteHeadSha) : (manifestChanged ? (remoteHeadBeforeSync ? (await getRemoteHeadShaIfAvailable(plugin) ?? plugin.syncData.lastRemoteHeadSha) : plugin.syncData.lastRemoteHeadSha) : (remoteHeadBeforeSync ?? plugin.syncData.lastRemoteHeadSha));
     await plugin.saveSyncData();
+    syncConsoleLog(plugin.settings, "info", "encrypted sync completed", {
+      operation: options.operation,
+      manifestChanged,
+      fileCount: Object.keys(manifest.files).length,
+      packCount: Object.keys(manifest.packs ?? {}).length,
+      lastRemoteHeadSha: plugin.syncData.lastRemoteHeadSha,
+      pushCount: plugin.syncProgress?.pushCount,
+      totalPush: plugin.syncProgress?.totalPush,
+      pullCount: plugin.syncProgress?.pullCount,
+      totalPull: plugin.syncProgress?.totalPull,
+    });
     new Notice(`Encrypted ${options.operation} completed`);
     if (plugin.syncProgress) {
       plugin.syncProgress = {
@@ -461,18 +514,14 @@ async function encryptedSyncImpl(plugin: FastSync, options: EncryptedSyncOptions
       };
     }
   } catch (error) {
-    if (plugin.syncProgress) {
-      plugin.syncProgress = {
-        status: "fail",
-        pushCount: 0,
-        totalPush: 0,
-        pullCount: 0,
-        totalPull: 0,
-        lastSyncTime: plugin.syncProgress.lastSyncTime,
-        errorMessage: (error as Error).message
-      };
+    if (error instanceof SnapshotHeadCasError && isCasRetryableOperation(options.operation)) {
+      syncConsoleLog(plugin.settings, "warn", "encrypted sync snapshot head changed; will retry with fresh remote state", {
+        operation: options.operation,
+        error,
+      });
+      throw error;
     }
-    reportSyncError(options.operation, error);
+    markEncryptedSyncFailure(plugin, options.operation, error);
   } finally {
     plugin.isSyncInProgress = false;
     plugin.enableWatch();
@@ -480,8 +529,33 @@ async function encryptedSyncImpl(plugin: FastSync, options: EncryptedSyncOptions
   }
 }
 
+async function runEncryptedSyncWithCasRetry(plugin: FastSync, options: EncryptedSyncOptions): Promise<void> {
+  const maxAttempts = isCasRetryableOperation(options.operation) ? 3 : 1;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      syncConsoleLog(plugin.settings, "info", "encrypted sync attempt started", { operation: options.operation, attempt, maxAttempts });
+      await encryptedSyncImpl(plugin, options);
+      if (plugin.syncProgress?.status !== "fail") syncConsoleLog(plugin.settings, "info", "encrypted sync attempt completed", { operation: options.operation, attempt });
+      return;
+    } catch (error) {
+      if (error instanceof SnapshotHeadCasError && attempt < maxAttempts) {
+        syncConsoleLog(plugin.settings, "warn", "encrypted sync CAS conflict; retrying full attempt", {
+          operation: options.operation,
+          attempt,
+          nextAttempt: attempt + 1,
+          maxAttempts,
+          error,
+        });
+        continue;
+      }
+      markEncryptedSyncFailure(plugin, options.operation, error);
+      return;
+    }
+  }
+}
+
 export async function encryptedSync(plugin: FastSync, options: EncryptedSyncOptions): Promise<void> {
-  return enqueue(plugin, () => encryptedSyncImpl(plugin, options));
+  return enqueue(plugin, () => runEncryptedSyncWithCasRetry(plugin, options));
 }
 
 async function encryptedModifyImpl(file: TAbstractFile, plugin: FastSync, eventEnter = false): Promise<void> {
@@ -492,7 +566,7 @@ async function encryptedModifyImpl(file: TAbstractFile, plugin: FastSync, eventE
   if (blockIfEncryptedForcePushRequired(plugin, "localChange", file.path)) return;
   if (plugin.isSyncInProgress) return;
   if (encryptedCachedStateSuggestsPackSync(plugin)) {
-    await encryptedSyncImpl(plugin, { operation: "localChange" });
+    await runEncryptedSyncWithCasRetry(plugin, { operation: "localChange" });
     return;
   }
   plugin.isSyncInProgress = true;
@@ -850,6 +924,60 @@ async function deleteObsoleteRemotePacks(plugin: FastSync, previousPacks: Encryp
   }
 }
 
+async function deleteObsoleteRemoteObjects(plugin: FastSync, previousRecords: Array<EncryptedManifest["files"][string]>, manifest: EncryptedManifest): Promise<void> {
+  const currentObjectPaths = new Set<string>();
+  for (const record of Object.values(manifest.files)) {
+    if (record.deleted || record.storage === "pack") continue;
+    if (record.storage === "chunked") {
+      for (const chunk of record.chunks ?? []) currentObjectPaths.add(chunk.path);
+    } else {
+      currentObjectPaths.add(record.objectPath);
+    }
+  }
+
+  for (const record of previousRecords) {
+    if (record.deleted || record.storage === "pack") continue;
+    if (record.storage === "chunked") {
+      for (const chunk of record.chunks ?? []) {
+        if (chunk.remoteSha && !currentObjectPaths.has(chunk.path)) await plugin.githubClient.deleteFile(chunk.path, chunk.remoteSha);
+      }
+      continue;
+    }
+    if (record.remoteSha && !currentObjectPaths.has(record.objectPath)) await plugin.githubClient.deleteFile(record.objectPath, record.remoteSha);
+  }
+}
+
+function encryptedLiveRemotePaths(manifest: EncryptedManifest, currentSnapshotId: string): Set<string> {
+  const paths = new Set<string>([
+    ENCRYPTED_CONFIG_PATH,
+    V2_HEAD_PATH,
+    `${V2_SNAPSHOTS_ROOT}/${currentSnapshotId}.enc`,
+  ]);
+  for (const pack of Object.values(manifest.packs ?? {})) paths.add(pack.objectPath);
+  for (const record of Object.values(manifest.files)) {
+    if (record.deleted) continue;
+    if (record.storage === "chunked") {
+      for (const chunk of record.chunks ?? []) paths.add(chunk.path);
+    } else if (record.storage !== "pack") {
+      paths.add(record.objectPath);
+    }
+  }
+  return paths;
+}
+
+async function pruneEncryptedRemoteAfterForcePush(plugin: FastSync, manifest: EncryptedManifest, currentSnapshotId: string): Promise<void> {
+  const livePaths = encryptedLiveRemotePaths(manifest, currentSnapshotId);
+  const remoteTree = await plugin.githubClient.getTree();
+  if (remoteTree.truncated) throw new Error("GitHub tree response was truncated; encrypted force push cannot safely mirror this repository.");
+  for (const remote of remoteTree.tree) {
+    if (remote.type !== "blob") continue;
+    const path = remote.path;
+    const isEncryptedPluginPath = path.startsWith(`${ENCRYPTED_ROOT}/`) || path.startsWith(`${V2_ROOT}/`);
+    const isManagedDataPath = path.startsWith(`${ENCRYPTED_OBJECTS_ROOT}/`) || path.startsWith(`${ENCRYPTED_PACKS_ROOT}/`) || isEncryptedPluginPath;
+    if (!isManagedDataPath || livePaths.has(path)) continue;
+    await plugin.githubClient.deleteFile(path, remote.sha);
+  }
+}
 async function pushEncryptedPackLocalChanges(plugin: FastSync, key: CryptoKey, manifest: EncryptedManifest, localFiles: TFile[]): Promise<boolean> {
   const previousFiles = manifest.files;
   const previousPacks = manifest.packs ?? {};

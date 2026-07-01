@@ -35,6 +35,12 @@ export function resetModalTestState() {
 class ElementStub {
   text = "";
   onclick?: () => void;
+  onpointerdown?: (event: PointerEvent) => void;
+  onpointermove?: (event: PointerEvent) => void;
+  onpointerup?: (event: PointerEvent) => void;
+  onpointercancel?: (event: PointerEvent) => void;
+  offsetWidth = 120;
+  style: Record<string, string> = {};
 
   setText(text: string) {
     this.text = text;
@@ -47,11 +53,14 @@ class ElementStub {
     return child;
   }
 
-  createDiv() {
+  createDiv(_options?: unknown) {
     return new ElementStub();
   }
 
   addClass(_className: string) {}
+  getBoundingClientRect() { return { left: 0, width: 300 }; }
+  setPointerCapture(_pointerId: number) {}
+  releasePointerCapture(_pointerId: number) {}
 }
 
 export class Modal {

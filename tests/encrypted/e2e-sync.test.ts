@@ -80,6 +80,22 @@ class MemoryGitHub {
   }
 }
 
+class HeadCasConflictOnceGitHub extends MemoryGitHub {
+  failNextHeadCas = false;
+  headCasFailures = 0;
+
+  async putFile(path: string, content: string | ArrayBuffer, sha?: string) {
+    if (this.failNextHeadCas && path === V2_HEAD_PATH && sha) {
+      this.failNextHeadCas = false;
+      this.headCasFailures += 1;
+      const error = new Error("409 sha does not match") as Error & { status: number };
+      error.status = 409;
+      throw error;
+    }
+    return super.putFile(path, content, sha);
+  }
+}
+
 class StrictFolderVault {
   files = new Map<string, Uint8Array>();
   mtimes = new Map<string, number>();
@@ -992,6 +1008,30 @@ test("encrypted overwrite command path performs force push semantics", async () 
 });
 
 
+test("encrypted force push removes remote encrypted objects absent from local vault", async () => {
+  const github = new MemoryGitHub();
+  const remoteVault = new MemoryVault({ "Notes/a.md": "keep remote", "Notes/remote-only.md": "delete remote object" });
+  await encryptedForcePush(plugin(remoteVault, github) as never);
+  const before = await loadV2Snapshot(github);
+  const staleObjectPath = before.snapshot.files["Notes/remote-only.md"].objectPath;
+  const staleSnapshotPath = `${V2_SNAPSHOTS_ROOT}/${before.snapshot.snapshotId}.enc`;
+  const orphanObjectPath = ".obsidian-github-sync-encrypted/objects/aa/bb/orphan.enc";
+  const orphanPackPath = ".obsidian-github-sync-encrypted/packs/999999.pack.enc";
+  await github.putFile(orphanObjectPath, "orphan object");
+  await github.putFile(orphanPackPath, "orphan pack");
+  assert.equal(github.blobs.has(staleObjectPath), true);
+  assert.equal(github.blobs.has(staleSnapshotPath), true);
+
+  const localVault = new MemoryVault({ "Notes/a.md": "keep local" });
+  await encryptedForcePush(plugin(localVault, github) as never);
+
+  const after = await loadV2Snapshot(github);
+  assert.equal(after.snapshot.files["Notes/remote-only.md"], undefined);
+  assert.equal(github.blobs.has(staleObjectPath), false);
+  assert.equal(github.blobs.has(staleSnapshotPath), false);
+  assert.equal(github.blobs.has(orphanObjectPath), false);
+  assert.equal(github.blobs.has(orphanPackPath), false);
+});
 test("plaintext full sync skips unchanged cached markdown reads at scale", async () => {
   const github = new MemoryGitHub();
   const vault = new MemoryVault(manyFileEntries(100_000, "stable"));
@@ -1043,6 +1083,20 @@ test("plaintext fast path ignores plugin stats metadata and does not rescan unch
   assert.equal(statsCalls, 0);
 });
 
+test("plaintext force push mirrors local files to remote and deletes remote-only files", async () => {
+  const github = new MemoryGitHub();
+  await github.putFile("Notes/a.md", "old remote");
+  await github.putFile("Notes/remote-only.md", "delete me");
+  const vault = new MemoryVault({ "Notes/a.md": "local" });
+  const instance = plaintextPlugin(vault, github);
+  instance.syncData.files["Notes/a.md"] = { sha: github.blobs.get("Notes/a.md")?.sha ?? "", lastSync: Date.now(), hash: "old" };
+  instance.syncData.files["Notes/remote-only.md"] = { sha: github.blobs.get("Notes/remote-only.md")?.sha ?? "", lastSync: Date.now(), hash: "old" };
+
+  await overrideRemoteAllFilesImpl(instance as never);
+
+  assert.equal(github.blobs.has("Notes/remote-only.md"), false);
+  assert.equal(GitHubClient.decodeContent(github.blobs.get("Notes/a.md")?.content ?? ""), "local");
+});
 test("plaintext force pull mirrors remote files to local vault", async () => {
   const github = new MemoryGitHub();
   await github.putFile("Notes/a.md", "remote");
@@ -1361,6 +1415,23 @@ test("concurrent local modifications do not overwrite remote manifest changes", 
 
   assert.equal(snapshot.files["Notes/a.md"].plaintextSha256, await sha256Hex(utf8ToBytes("updated a")));
   assert.equal(snapshot.files["Notes/b.md"].plaintextSha256, await sha256Hex(utf8ToBytes("updated b")));
+});
+
+test("normal encrypted sync retries snapshot head CAS conflict with a fresh attempt", async () => {
+  const github = new HeadCasConflictOnceGitHub();
+  const vault = new MemoryVault({ "Notes/a.md": "initial" });
+  const instance = plugin(vault, github) as never;
+  await encryptedForcePush(instance);
+
+  vault.set("Notes/a.md", utf8ToBytes("updated after CAS conflict"));
+  github.failNextHeadCas = true;
+
+  await encryptedFullSync(instance);
+
+  const { snapshot } = await loadV2Snapshot(github);
+  assert.equal(github.headCasFailures, 1);
+  assert.equal(snapshot.files["Notes/a.md"].plaintextSha256, await sha256Hex(utf8ToBytes("updated after CAS conflict")));
+  assert.equal(Notice.messages.some(message => message.includes("SnapshotHeadCasError")), false);
 });
 
 test("normal encrypted sync skips download for identical single objects when cache is empty", async () => {

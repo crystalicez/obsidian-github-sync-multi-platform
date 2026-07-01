@@ -653,6 +653,15 @@ export async function overrideRemoteAllFilesImpl(plugin: FastSync): Promise<void
 
   try {
     const files = listPlaintextSyncCandidates(plugin);
+    const localPaths = new Set(files.map(file => file.path));
+    const remoteTree = await plugin.githubClient.getTree();
+    if (remoteTree.truncated) throw new Error("GitHub tree response was truncated; force push cannot safely mirror this repository.");
+    for (const remote of remoteTree.tree) {
+      if (remote.type !== "blob" || !shouldSyncPlaintextPath(plugin, remote.path) || localPaths.has(remote.path)) continue;
+      await plugin.githubClient.deleteFile(remote.path, remote.sha);
+      delete plugin.syncData.files[remote.path];
+    }
+
     for (const file of files) {
        const isMarkdown = file.extension === "md";
 

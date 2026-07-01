@@ -39,10 +39,10 @@ export default class FastSync extends Plugin {
   settings: PluginSettings
   githubClient: GitHubClient
   syncData: SyncData = { files: {} }
-  
+
   isSyncInProgress: boolean = false
   debounceTimers: Map<string, number> = new Map()
-  
+
   syncSkipFiles: SyncSkipFiles = {}
   syncSkipDelFiles: SyncSkipFiles = {}
   syncSkipModifyFiles: SyncSkipFiles = {}
@@ -97,10 +97,10 @@ export default class FastSync extends Plugin {
 
     await this.loadSettings()
     await this.loadSyncData()
-    
+
     this.settingTab = new SettingTab(this.app, this)
     this.addSettingTab(this.settingTab)
-    
+
     this.initGitHubClient()
     this.registerScheduledSync()
 
@@ -330,40 +330,55 @@ export default class FastSync extends Plugin {
       const repo = `${this.settings.githubOwner}/${this.settings.githubRepo}`
       const branch = this.settings.githubBranch || "main"
       const localFileCount = this.app.vault.getFiles().filter(file => !file.path.startsWith(`${this.app.vault.configDir}/`)).length
-      const confirmPhrase = `${operation === "forcePush" ? "push" : "pull"} ${repo} ${branch}`
-      
+
       const title = operation === "forcePush" ? "Force push local vault to remote?" : "Force pull remote vault to local?";
-      const message = operation === "forcePush" 
-        ? "Overwrite the remote state with this local vault. Remote files not present locally may be deleted." 
-        : "Overwrite this local vault with the remote state. Local synced files not present remotely will be deleted.";
+      const message = operation === "forcePush"
+        ? "Make the remote repository exactly match this local vault. Remote files not present locally will be deleted."
+        : "Make this local vault exactly match the remote repository. Local synced files not present remotely will be deleted.";
 
       modal.titleEl.setText(title)
       modal.contentEl.createEl("p", { text: message })
       modal.contentEl.createEl("p", { text: `Repository: ${repo}` })
       modal.contentEl.createEl("p", { text: `Branch: ${branch}` })
       modal.contentEl.createEl("p", { text: `Local vault files: ${localFileCount}` })
-      modal.contentEl.createEl("p", { text: `Type "${confirmPhrase}" to confirm.` })
-      
-      const input = modal.contentEl.createEl("input")
-      input.type = "text"
-      input.placeholder = confirmPhrase
-      
+      modal.contentEl.createEl("p", { text: "Drag the confirmation control fully to the right, then click the unlocked action button." })
+
+      const slider = modal.contentEl.createDiv({ cls: "github-sync-force-confirm-slider" })
+      const fill = slider.createDiv({ cls: "github-sync-force-confirm-fill" })
+      const handle = slider.createDiv({ cls: "github-sync-force-confirm-handle" })
+      const sliderLabel = handle.createEl("span", { text: operation === "forcePush" ? "Slide to unlock force push" : "Slide to unlock force pull" })
+      const unlockMessage = modal.contentEl.createEl("p", { text: "Unlocked. Review the target above, then click the force action button." })
+      unlockMessage.addClass("github-sync-force-confirm-unlocked")
+      unlockMessage.style.display = "none"
+
       const buttons = modal.contentEl.createDiv()
       buttons.createEl("button", { text: "Cancel" }).onclick = () => {
         modal.close()
         resolve()
       }
-      
       const confirmButton = buttons.createEl("button", { text: operation === "forcePush" ? "Force push" : "Force pull" })
       confirmButton.addClass("mod-warning")
-      confirmButton.disabled = true
-      
-      input.oninput = () => {
-        confirmButton.disabled = input.value.trim() !== confirmPhrase
+      confirmButton.style.display = "none"
+
+      let dragging = false
+      let unlocked = false
+      let resolved = false
+      const resetSlider = () => {
+        fill.style.width = "0%"
+        handle.style.transform = "translateX(0)"
       }
-      
-      confirmButton.onclick = () => {
-        if (input.value.trim() !== confirmPhrase) return
+      const unlockConfirmButton = () => {
+        if (unlocked) return
+        unlocked = true
+        fill.style.width = "100%"
+        slider.addClass("is-complete")
+        sliderLabel.setText("Unlocked")
+        confirmButton.style.display = ""
+        unlockMessage.style.display = ""
+      }
+      const runConfirmedOperation = () => {
+        if (resolved || !unlocked) return
+        resolved = true
         modal.close()
         if (this.settings.encryptionMode === "encrypted") {
           if (operation === "forcePush") void encryptedForcePush(this)
@@ -373,6 +388,33 @@ export default class FastSync extends Plugin {
           else void overrideLocalAllFilesImpl(this)
         }
         resolve()
+      }
+      confirmButton.onclick = runConfirmedOperation
+      const setProgress = (clientX: number) => {
+        const rect = slider.getBoundingClientRect()
+        const progress = rect.width > 0 ? Math.max(0, Math.min(1, (clientX - rect.left) / rect.width)) : 0
+        fill.style.width = `${progress * 100}%`
+        handle.style.transform = `translateX(${progress * Math.max(0, rect.width - handle.offsetWidth)}px)`
+        if (progress >= 0.97) unlockConfirmButton()
+      }
+      slider.onpointerdown = (event: PointerEvent) => {
+        if (unlocked) return
+        dragging = true
+        slider.setPointerCapture?.(event.pointerId)
+        setProgress(event.clientX)
+      }
+      slider.onpointermove = (event: PointerEvent) => {
+        if (dragging && !unlocked) setProgress(event.clientX)
+      }
+      slider.onpointerup = (event: PointerEvent) => {
+        if (!dragging) return
+        dragging = false
+        slider.releasePointerCapture?.(event.pointerId)
+        if (!unlocked) resetSlider()
+      }
+      slider.onpointercancel = () => {
+        dragging = false
+        if (!unlocked) resetSlider()
       }
       modal.open()
     })
