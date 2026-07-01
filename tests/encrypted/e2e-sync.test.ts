@@ -12,8 +12,13 @@ import { ENCRYPTED_MANIFEST_PATH } from "../../src/lib/encrypted/constants";
 
 class MemoryGitHub {
   blobs = new Map<string, { content: string; sha: string }>();
+  gitBlobs = new Map<string, Uint8Array>();
   counter = 0;
   headSha = "head-1";
+  treeSha = "tree-1";
+  gitBlobCounter = 0;
+  gitTreeCounter = 0;
+  gitCommitCounter = 0;
   getRemoteHeadCount = 0;
   getTreeCount = 0;
   failRemoteHead = false;
@@ -78,31 +83,6 @@ class MemoryGitHub {
     this.blobs.delete(path);
     this.headSha = `head-${++this.counter}`;
   }
-}
-
-class HeadCasConflictOnceGitHub extends MemoryGitHub {
-  failNextHeadCas = false;
-  headCasFailures = 0;
-
-  async putFile(path: string, content: string | ArrayBuffer, sha?: string) {
-    if (this.failNextHeadCas && path === V2_HEAD_PATH && sha) {
-      this.failNextHeadCas = false;
-      this.headCasFailures += 1;
-      const error = new Error("409 sha does not match") as Error & { status: number };
-      error.status = 409;
-      throw error;
-    }
-    return super.putFile(path, content, sha);
-  }
-}
-
-class AtomicMemoryGitHub extends MemoryGitHub {
-  gitBlobs = new Map<string, Uint8Array>();
-  gitBlobCounter = 0;
-  gitTreeCounter = 0;
-  gitCommitCounter = 0;
-  treeSha = "tree-0";
-  staleRemoteHeadSha: string | null = null;
 
   async getGitRef() {
     return { ref: "refs/heads/main", sha: this.headSha, type: "commit" };
@@ -136,9 +116,29 @@ class AtomicMemoryGitHub extends MemoryGitHub {
     return `git-commit-${++this.gitCommitCounter}`;
   }
 
-  async updateGitRef(sha: string) {
+  async updateGitRef(sha: string, _expectedSha?: string) {
     this.headSha = sha;
   }
+}
+
+class HeadCasConflictOnceGitHub extends MemoryGitHub {
+  failNextHeadCas = false;
+  headCasFailures = 0;
+
+  async updateGitRef(sha: string, expectedSha?: string) {
+    if (this.failNextHeadCas && expectedSha) {
+      this.failNextHeadCas = false;
+      this.headCasFailures += 1;
+      const error = new Error("409 sha does not match") as Error & { status: number };
+      error.status = 409;
+      throw error;
+    }
+    return super.updateGitRef(sha, expectedSha);
+  }
+}
+
+class StaleRemoteHeadMemoryGitHub extends MemoryGitHub {
+  staleRemoteHeadSha: string | null = null;
 
   async getRemoteHeadSha() {
     this.getRemoteHeadCount += 1;
@@ -590,7 +590,7 @@ test("encrypted auto local change updates cached remote head after pushing loose
 });
 
 test("encrypted auto local change caches atomic commit head even when remote head lookup is stale", async () => {
-  const github = new AtomicMemoryGitHub();
+  const github = new StaleRemoteHeadMemoryGitHub();
   const vault = new MemoryVault(manyFileEntries(2_059, "v1"));
   const instance = plugin(vault, github) as ReturnType<typeof plugin>;
   await encryptedForcePush(instance as never);
@@ -738,7 +738,7 @@ test("encrypted modify events are debounced and only push the final file state",
   const vault = new MemoryVault({ "Notes/a.md": "initial" });
   const instance = plugin(vault, github) as ReturnType<typeof plugin>;
   await encryptedForcePush(instance as never);
-  const headPutsAfterInitialPush = github.putCounts.get(V2_HEAD_PATH) ?? 0;
+  const commitsAfterInitialPush = github.gitCommitCounter;
 
   const originalSetTimeout = globalThis.setTimeout;
   const originalClearTimeout = globalThis.clearTimeout;
@@ -757,14 +757,14 @@ test("encrypted modify events are debounced and only push the final file state",
     NoteModify(vault.getAbstractFileByPath("Notes/a.md") as TFile, instance as never, true);
     vault.set("Notes/a.md", new TextEncoder().encode("draft 2"));
     NoteModify(vault.getAbstractFileByPath("Notes/a.md") as TFile, instance as never, true);
-    assert.equal(github.putCounts.get(V2_HEAD_PATH) ?? 0, headPutsAfterInitialPush);
+    assert.equal(github.gitCommitCounter, commitsAfterInitialPush);
     await callbacks.at(-1)?.();
   } finally {
     globalThis.setTimeout = originalSetTimeout;
     globalThis.clearTimeout = originalClearTimeout;
   }
 
-  assert.equal(github.putCounts.get(V2_HEAD_PATH) ?? 0, headPutsAfterInitialPush + 1);
+  assert.equal(github.gitCommitCounter, commitsAfterInitialPush + 1);
   const pulledVault = new MemoryVault({});
   await encryptedForcePull(plugin(pulledVault, github) as never);
   assert.equal(new TextDecoder().decode(pulledVault.files.get("Notes/a.md")), "draft 2");

@@ -178,23 +178,6 @@ function encryptedCachedStateSuggestsPackSync(plugin: FastSync): boolean {
   return chooseEncryptedStorageMode({ fileCount: cached.length, totalBytes }) === "pack";
 }
 
-function supportsAtomicGitWrites(plugin: FastSync): boolean {
-  const github = plugin.githubClient as {
-    getGitRef?: unknown;
-    getTree?: unknown;
-    createGitBlob?: unknown;
-    createGitTree?: unknown;
-    createGitCommit?: unknown;
-    updateGitRef?: unknown;
-  };
-  return typeof github.getGitRef === "function"
-    && typeof github.getTree === "function"
-    && typeof github.createGitBlob === "function"
-    && typeof github.createGitTree === "function"
-    && typeof github.createGitCommit === "function"
-    && typeof github.updateGitRef === "function";
-}
-
 function requireEncryptedPassphrase(plugin: FastSync): string {
   const settings = plugin.settings as { encryptionPassphrase?: string };
   const passphrase = settings.encryptionPassphrase?.trim();
@@ -762,7 +745,7 @@ async function encryptedModifyImpl(file: TAbstractFile, plugin: FastSync, eventE
     const objectId = reusableExisting?.id ?? toBase64Url(randomBytes(OBJECT_ID_BYTES));
     syncConsoleLog(plugin.settings, "info", "encrypted local modify using direct loose delta", { path, storage: existing?.storage, bytes: file.stat.size });
     let written: { headSha?: string; headCommitSha?: string; fileShas?: Record<string, string> };
-    if (supportsAtomicGitWrites(plugin) && !shouldChunkPlaintext(plaintext) && reusableExisting?.storage !== "chunked") {
+    if (!shouldChunkPlaintext(plaintext) && reusableExisting?.storage !== "chunked") {
       const objectPath = reusableExisting?.objectPath ?? objectPathForId(objectId);
       const objectBytes = await timer.measure("prepareLooseObject", async () => new TextEncoder().encode(JSON.stringify(await encryptBytes(key, plaintext))), () => ({ bytes: file.stat.size }));
       manifest.files[path] = { id: objectId, path, objectPath, plaintextSha256, mtime: file.stat.mtime, size: plaintext.byteLength, deleted: false, deletedAt: undefined, storage: "single" };
