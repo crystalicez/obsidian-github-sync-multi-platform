@@ -521,6 +521,20 @@ test("encrypted auto local change uploads one loose object instead of rewriting 
   assert.equal(instance.syncProgress.totalPush, 1);
   assert.equal(vault.readBinaryCount <= 2, true);
 });
+
+test("encrypted auto local change updates cached remote head after pushing loose delta", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault(manyFileEntries(2_059, "v1"));
+  const instance = plugin(vault, github) as ReturnType<typeof plugin>;
+  await encryptedForcePush(instance);
+  const headBefore = github.headSha;
+
+  vault.set("Notes/note-00000.md", new TextEncoder().encode("v2-0"));
+  await encryptedModify(vault.getAbstractFileByPath("Notes/note-00000.md") as TFile, instance as never, true);
+
+  assert.notEqual(github.headSha, headBefore);
+  assert.equal(instance.syncData.lastRemoteHeadSha, github.headSha);
+});
 test("encrypted local modify is blocked until force push after enabling encryption", async () => {
   const github = new MemoryGitHub();
   const vault = new MemoryVault({ "Notes/a.md": "needs migration" });

@@ -531,7 +531,9 @@ async function encryptedSyncImpl(plugin: FastSync, options: EncryptedSyncOptions
       (plugin.settings as { encryptedForcePushRequired?: boolean }).encryptedForcePushRequired = false;
       if (typeof (plugin as FastSync & { saveSettings?: () => Promise<void> }).saveSettings === "function") await (plugin as FastSync & { saveSettings: () => Promise<void> }).saveSettings();
     }
-    plugin.syncData.lastRemoteHeadSha = options.operation === "forcePush" ? (await getRemoteHeadShaIfAvailable(plugin) ?? plugin.syncData.lastRemoteHeadSha) : (manifestChanged ? (remoteHeadBeforeSync ? (await getRemoteHeadShaIfAvailable(plugin) ?? plugin.syncData.lastRemoteHeadSha) : plugin.syncData.lastRemoteHeadSha) : (remoteHeadBeforeSync ?? plugin.syncData.lastRemoteHeadSha));
+    plugin.syncData.lastRemoteHeadSha = options.operation === "forcePush" || manifestChanged
+      ? (await getRemoteHeadShaIfAvailable(plugin) ?? plugin.syncData.lastRemoteHeadSha)
+      : (remoteHeadBeforeSync ?? plugin.syncData.lastRemoteHeadSha);
     await plugin.saveSyncData();
     syncConsoleLog(plugin.settings, "info", "encrypted sync completed", {
       operation: options.operation,
