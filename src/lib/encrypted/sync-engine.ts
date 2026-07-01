@@ -20,6 +20,9 @@ import { randomBytes, sha256Hex, toBase64Url } from "./bytes";
 import { syncConsoleLog } from "../debug";
 
 const syncQueues = new WeakMap<FastSync, Promise<any>>();
+const ENCRYPTED_LOOSE_DELTA_MAX_FILES = 32;
+const ENCRYPTED_LOOSE_DELTA_MAX_BYTES = 64 * 1024 * 1024;
+const ENCRYPTED_LOOSE_DELTA_COMPACT_AFTER_FILES = 256;
 
 function getSyncQueue(plugin: FastSync): Promise<any> {
   let queue = syncQueues.get(plugin);
@@ -89,6 +92,34 @@ function encryptedLocalStateMatchesCache(plugin: FastSync, localFiles: TFile[]):
     cachedPaths.delete(path);
   }
   return cachedPaths.size === 0;
+}
+
+function localFilesByPath(localFiles: TFile[]): Map<string, TFile> {
+  return new Map(localFiles.map(file => [normalizeVaultPath(file.path), file] as const));
+}
+
+function detectLocallyDirtyPackedPaths(plugin: FastSync, manifest: EncryptedManifest, localFiles: TFile[]): Set<string> {
+  const state = ensureEncryptedState(plugin);
+  const dirtyPaths = new Set<string>();
+  const activePaths = new Set(Object.entries(manifest.files).filter(([, record]) => !record.deleted).map(([path]) => path));
+  for (const file of localFiles) {
+    const path = normalizeVaultPath(file.path);
+    activePaths.delete(path);
+    const record = manifest.files[path];
+    const cached = state.files[path];
+    if (!record || record.deleted || !cached) {
+      dirtyPaths.add(path);
+      continue;
+    }
+    if (cached.plaintextSha256 !== record.plaintextSha256) continue;
+    if (cached.size !== file.stat.size || cached.mtime !== file.stat.mtime) dirtyPaths.add(path);
+  }
+  for (const path of activePaths) {
+    const record = manifest.files[path];
+    const cached = state.files[path];
+    if (record && !record.deleted && cached?.plaintextSha256 === record.plaintextSha256) dirtyPaths.add(path);
+  }
+  return dirtyPaths;
 }
 
 function encryptedLocalFilesStorageMode(localFiles: TFile[]): ReturnType<typeof chooseEncryptedStorageMode> {
@@ -396,8 +427,11 @@ async function encryptedSyncImpl(plugin: FastSync, options: EncryptedSyncOptions
   try {
     const ignoreRules = configuredIgnoreRules(plugin);
     let remoteHeadBeforeSync: string | null = null;
+    let locallyDirtyPaths = new Set<string>();
+    let preflightLocalFiles: TFile[] | null = null;
     if (options.operation === "normal" || options.operation === "manual") {
       const localFiles = listEncryptedSyncCandidates(plugin.app.vault, ignoreRules);
+      preflightLocalFiles = localFiles;
       remoteHeadBeforeSync = await getRemoteHeadShaIfAvailable(plugin);
       syncConsoleLog(plugin.settings, "debug", "encrypted sync preflight", {
         operation: options.operation,
@@ -434,6 +468,14 @@ async function encryptedSyncImpl(plugin: FastSync, options: EncryptedSyncOptions
     const { key } = await loadKey(plugin, options.operation === "forcePush");
 
     let manifest = await loadEncryptedSnapshotManifest(plugin, key, { tolerateMissingSnapshot: options.operation === "forcePush" }) ?? emptyEncryptedManifest();
+    if (options.operation !== "forcePull" && options.operation !== "forcePush") {
+      const localFiles = preflightLocalFiles ?? listEncryptedSyncCandidates(plugin.app.vault, ignoreRules);
+      locallyDirtyPaths = detectLocallyDirtyPackedPaths(plugin, manifest, localFiles);
+      syncConsoleLog(plugin.settings, "debug", "encrypted sync local dirty paths detected", {
+        operation: options.operation,
+        dirtyPathCount: locallyDirtyPaths.size,
+      });
+    }
     let manifestChanged = false;
     let packsToDeleteAfterSave: EncryptedPackManifestRecord[] = [];
     let objectsToDeleteAfterSave: Array<EncryptedManifest["files"][string]> = [];
@@ -450,7 +492,7 @@ async function encryptedSyncImpl(plugin: FastSync, options: EncryptedSyncOptions
       packsToDeleteAfterSave = previousPacks.length > 0 ? previousPacks : forcePushResult.packsToDeleteAfterSave;
       await saveEncryptedSnapshotFromManifest(plugin, key, manifest, { requireHeadCas: false });
     } else {
-      if (manifest.packs && Object.keys(manifest.packs).length > 0) await pullEncryptedPackChanges(plugin, key, manifest, ignoreRules, false);
+      if (manifest.packs && Object.keys(manifest.packs).length > 0) await pullEncryptedPackChanges(plugin, key, manifest, ignoreRules, false, locallyDirtyPaths);
       await pullEncryptedChanges(plugin, key, manifest, false);
       const pushResult = await pushEncryptedAutoLocalChanges(plugin, key, manifest, ignoreRules);
       manifestChanged = pushResult.changed;
@@ -844,10 +886,9 @@ export async function encryptedRename(newFileOrPath: string | TAbstractFile, old
 async function pullEncryptedChanges(plugin: FastSync, key: CryptoKey, manifest: EncryptedManifest, force: boolean): Promise<void> {
   const state = ensureEncryptedState(plugin);
   const candidateEntries = Object.entries(manifest.files).filter(([_, record]) => !record.deleted && record.storage !== "pack");
-  if (plugin.syncProgress) plugin.syncProgress.totalPull += candidateEntries.length;
-  if (typeof plugin.updateStatusBar === "function") plugin.updateStatusBar();
 
   for (const [path, record] of candidateEntries) {
+    let countedPull = false;
     try {
       const localState = state.files[path];
       if (!force && localState?.plaintextSha256 === record.plaintextSha256) continue;
@@ -862,6 +903,11 @@ async function pullEncryptedChanges(plugin: FastSync, key: CryptoKey, manifest: 
         if (localHash === record.plaintextSha256) continue;
       }
 
+      if (plugin.syncProgress) {
+        plugin.syncProgress.totalPull++;
+        countedPull = true;
+      }
+      if (typeof plugin.updateStatusBar === "function") plugin.updateStatusBar();
       const plaintext = await downloadEncryptedFileObject(plugin.githubClient, key, record);
 
       if (!force && localFile instanceof TFile && localHash !== undefined) {
@@ -888,7 +934,7 @@ async function pullEncryptedChanges(plugin: FastSync, key: CryptoKey, manifest: 
         plugin.removeIgnoredFile(path);
       }
     } finally {
-      if (plugin.syncProgress) plugin.syncProgress.pullCount++;
+      if (countedPull && plugin.syncProgress) plugin.syncProgress.pullCount++;
       if (typeof plugin.updateStatusBar === "function") plugin.updateStatusBar();
     }
   }
@@ -911,10 +957,81 @@ async function pushEncryptedAutoLocalChanges(plugin: FastSync, key: CryptoKey, m
   const previousPacks = Object.values(manifest.packs ?? {});
   const remoteAlreadyPacked = previousPacks.length > 0 || Object.values(manifest.files).some(record => !record.deleted && record.storage === "pack");
   if (remoteAlreadyPacked || chooseEncryptedStorageMode({ fileCount: localFiles.length, totalBytes }) === "pack") {
+    const looseDeltaResult = await pushEncryptedLooseDeltaLocalChanges(plugin, key, manifest, localFiles);
+    if (looseDeltaResult) return looseDeltaResult;
     if (canSkipPackUpload(plugin, manifest, localFiles)) return { changed: false, packsToDeleteAfterSave: [] };
     return { changed: await pushEncryptedPackLocalChanges(plugin, key, manifest, localFiles), packsToDeleteAfterSave: previousPacks };
   }
   return { changed: await pushEncryptedLocalChanges(plugin, key, manifest, ignoreRules, false), packsToDeleteAfterSave: [] };
+}
+
+async function pushEncryptedLooseDeltaLocalChanges(plugin: FastSync, key: CryptoKey, manifest: EncryptedManifest, localFiles: TFile[]): Promise<{ changed: boolean; packsToDeleteAfterSave: EncryptedPackManifestRecord[] } | null> {
+  const state = ensureEncryptedState(plugin);
+  const filesByPath = localFilesByPath(localFiles);
+  const localPaths = new Set(filesByPath.keys());
+  const dirtyFiles: TFile[] = [];
+  const deletedPaths: string[] = [];
+  let dirtyBytes = 0;
+
+  for (const file of localFiles) {
+    const path = normalizeVaultPath(file.path);
+    const record = manifest.files[path];
+    const cached = state.files[path];
+    if (record && !record.deleted && cached?.plaintextSha256 === record.plaintextSha256 && cached.size === file.stat.size && cached.mtime === file.stat.mtime) continue;
+    dirtyFiles.push(file);
+    dirtyBytes += file.stat.size;
+  }
+
+  for (const [path, record] of Object.entries(manifest.files)) {
+    if (!record.deleted && !localPaths.has(path) && state.files[path]?.plaintextSha256 === record.plaintextSha256) deletedPaths.push(path);
+  }
+
+  const existingLooseRecords = Object.values(manifest.files).filter(record => !record.deleted && record.storage !== "pack").length;
+  const deltaCount = dirtyFiles.length + deletedPaths.length;
+  if (deltaCount === 0) return { changed: false, packsToDeleteAfterSave: [] };
+  if (deltaCount > ENCRYPTED_LOOSE_DELTA_MAX_FILES || dirtyBytes > ENCRYPTED_LOOSE_DELTA_MAX_BYTES || existingLooseRecords + dirtyFiles.length > ENCRYPTED_LOOSE_DELTA_COMPACT_AFTER_FILES) {
+    syncConsoleLog(plugin.settings, "info", "encrypted sync using pack compaction instead of loose delta", {
+      deltaCount,
+      dirtyBytes,
+      existingLooseRecords,
+      maxDeltaFiles: ENCRYPTED_LOOSE_DELTA_MAX_FILES,
+      maxDeltaBytes: ENCRYPTED_LOOSE_DELTA_MAX_BYTES,
+    });
+    return null;
+  }
+
+  if (plugin.syncProgress) plugin.syncProgress.totalPush += dirtyFiles.length;
+  if (typeof plugin.updateStatusBar === "function") plugin.updateStatusBar();
+  syncConsoleLog(plugin.settings, "info", "encrypted sync using loose delta", { dirtyFileCount: dirtyFiles.length, deletedPathCount: deletedPaths.length, dirtyBytes });
+
+  for (const file of dirtyFiles) {
+    try {
+      const path = normalizeVaultPath(file.path);
+      const existing = manifest.files[path];
+      const plaintext = await readVaultFileBytes(plugin.app.vault, file);
+      const plaintextSha256 = await sha256Hex(plaintext);
+      if (existing && !existing.deleted && existing.plaintextSha256 === plaintextSha256) {
+        state.files[path] = { ...state.files[path], plaintextSha256, objectPath: existing.objectPath, remoteSha: existing.remoteSha, storage: existing.storage, chunks: existing.chunks, packId: existing.packId, manifestUpdatedAt: manifest.updatedAt, size: file.stat.size, mtime: file.stat.mtime };
+        continue;
+      }
+      const reusableExisting = existing && existing.storage !== "pack" ? existing : undefined;
+      const objectId = reusableExisting?.id ?? toBase64Url(randomBytes(OBJECT_ID_BYTES));
+      const uploaded = await uploadEncryptedFileObject(plugin.githubClient, key, objectId, plaintext, reusableExisting);
+      manifest.files[path] = { ...uploaded, path, plaintextSha256, mtime: file.stat.mtime, deleted: false, deletedAt: undefined };
+      state.files[path] = { plaintextSha256, objectPath: manifest.files[path].objectPath, remoteSha: manifest.files[path].remoteSha, storage: manifest.files[path].storage, chunks: manifest.files[path].chunks, manifestUpdatedAt: manifest.updatedAt, size: file.stat.size, mtime: file.stat.mtime };
+    } finally {
+      if (plugin.syncProgress) plugin.syncProgress.pushCount++;
+      if (typeof plugin.updateStatusBar === "function") plugin.updateStatusBar();
+    }
+  }
+
+  for (const path of deletedPaths) {
+    const previous = manifest.files[path];
+    manifest.files[path] = { ...previous, deleted: true, deletedAt: Date.now() };
+    delete state.files[path];
+  }
+
+  return { changed: true, packsToDeleteAfterSave: [] };
 }
 
 async function deleteObsoleteRemotePacks(plugin: FastSync, previousPacks: EncryptedPackManifestRecord[], manifest: EncryptedManifest): Promise<void> {
@@ -1055,13 +1172,14 @@ function packRecordsFor(manifest: EncryptedManifest, packId: string): Array<[str
   return Object.entries(manifest.files).filter(([, record]) => !record.deleted && record.storage === "pack" && record.packId === packId);
 }
 
-async function canSkipPackDownload(plugin: FastSync, manifest: EncryptedManifest, packId: string, force: boolean): Promise<boolean> {
+async function canSkipPackDownload(plugin: FastSync, manifest: EncryptedManifest, packId: string, force: boolean, locallyDirtyPaths: Set<string> = new Set()): Promise<boolean> {
   if (force) return false;
   const records = packRecordsFor(manifest, packId);
   if (records.length === 0) return false;
   const state = ensureEncryptedState(plugin);
   for (const [path, record] of records) {
     if (state.files[path]?.plaintextSha256 === record.plaintextSha256) continue;
+    if (locallyDirtyPaths.has(path) && state.files[path]?.plaintextSha256 === record.plaintextSha256) continue;
     const localFile = plugin.app.vault.getAbstractFileByPath(path);
     if (!(localFile instanceof TFile)) return false;
     const localHash = await sha256Hex(await readVaultFileBytes(plugin.app.vault, localFile));
@@ -1086,15 +1204,19 @@ function canSkipPackUpload(plugin: FastSync, manifest: EncryptedManifest, localF
   }
   return true;
 }
-async function pullEncryptedPackChanges(plugin: FastSync, key: CryptoKey, manifest: EncryptedManifest, ignoreRules: ReturnType<typeof compileIgnorePathRegex>, force: boolean): Promise<void> {
+async function pullEncryptedPackChanges(plugin: FastSync, key: CryptoKey, manifest: EncryptedManifest, ignoreRules: ReturnType<typeof compileIgnorePathRegex>, force: boolean, locallyDirtyPaths: Set<string> = new Set()): Promise<void> {
   const state = ensureEncryptedState(plugin);
   const packs = Object.values(manifest.packs ?? {});
-  if (plugin.syncProgress) plugin.syncProgress.totalPull += packs.length;
-  if (typeof plugin.updateStatusBar === "function") plugin.updateStatusBar();
 
   for (const pack of packs) {
+    let countedPull = false;
     try {
-      if (await canSkipPackDownload(plugin, manifest, pack.id, force)) continue;
+      if (await canSkipPackDownload(plugin, manifest, pack.id, force, locallyDirtyPaths)) continue;
+      if (plugin.syncProgress) {
+        plugin.syncProgress.totalPull++;
+        countedPull = true;
+      }
+      if (typeof plugin.updateStatusBar === "function") plugin.updateStatusBar();
       const files = await downloadEncryptedPack(plugin.githubClient, key, pack);
       for (const file of files) {
         const record = manifest.files[file.path];
@@ -1132,7 +1254,7 @@ async function pullEncryptedPackChanges(plugin: FastSync, key: CryptoKey, manife
         cacheEncryptedStateForRecord(plugin, file.path, record);
       }
     } finally {
-      if (plugin.syncProgress) plugin.syncProgress.pullCount++;
+      if (countedPull && plugin.syncProgress) plugin.syncProgress.pullCount++;
       if (typeof plugin.updateStatusBar === "function") plugin.updateStatusBar();
     }
   }

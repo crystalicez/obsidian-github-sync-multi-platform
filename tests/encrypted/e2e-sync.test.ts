@@ -219,6 +219,14 @@ function plugin(vault: MemoryVault, github: MemoryGitHub) {
       conflictPolicy: "copy",
     },
     syncData: { files: {}, encrypted: { files: {} } },
+    syncProgress: {
+      status: "idle",
+      pushCount: 0,
+      totalPush: 0,
+      pullCount: 0,
+      totalPull: 0,
+      lastSyncTime: 0,
+    },
     isSyncInProgress: false,
     isWatchEnabled: true,
     debounceTimers: new Map<string, ReturnType<typeof setTimeout>>(),
@@ -461,22 +469,57 @@ test("normal encrypted sync restores changed files from pack mode without writin
   assert.equal(new TextDecoder().decode(targetVault.files.get("Notes/note-00000.md")), "v2-0");
 });
 
-test("normal encrypted sync uploads only changed packs in a large vault", async () => {
+test("normal encrypted sync uploads one loose object instead of rewriting packs for one changed packed file", async () => {
   const github = new MemoryGitHub();
   const vault = new MemoryVault(manyFileEntries(10_001, "v1"));
-  const instance = plugin(vault, github) as never;
+  const instance = plugin(vault, github) as ReturnType<typeof plugin>;
   await encryptedForcePush(instance);
 
   const packPaths = [...github.blobs.keys()].filter(path => path.startsWith(".obsidian-github-sync-encrypted/packs/"));
   const packPutsBefore = new Map(packPaths.map(path => [path, github.putCounts.get(path) ?? 0]));
+  const objectPathsBefore = new Set([...github.blobs.keys()].filter(path => path.startsWith(".obsidian-github-sync-encrypted/objects/")));
   vault.set("Notes/note-00000.md", new TextEncoder().encode("v2-0"));
   vault.readBinaryCount = 0;
 
   await encryptedFullSync(instance);
 
   const changedPackUploads = packPaths.filter(path => (github.putCounts.get(path) ?? 0) > (packPutsBefore.get(path) ?? 0));
-  assert.equal(changedPackUploads.length, 1);
-  assert.equal(vault.readBinaryCount <= 1_000, true);
+  const newObjectPaths = [...github.blobs.keys()].filter(path => path.startsWith(".obsidian-github-sync-encrypted/objects/") && !objectPathsBefore.has(path));
+  const { snapshot } = await loadV2Snapshot(github);
+  assert.equal(changedPackUploads.length, 0);
+  assert.equal(newObjectPaths.length, 1);
+  assert.equal(snapshot.files["Notes/note-00000.md"].storage, "object");
+  assert.equal(Object.keys(snapshot.packs ?? {}).length, packPaths.length);
+  assert.equal(instance.syncProgress.totalPull, 0);
+  assert.equal(instance.syncProgress.totalPush, 1);
+  assert.equal(vault.readBinaryCount <= 2, true);
+});
+
+test("encrypted auto local change uploads one loose object instead of rewriting packs for one changed packed file", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault(manyFileEntries(2_059, "v1"));
+  const instance = plugin(vault, github) as ReturnType<typeof plugin>;
+  await encryptedForcePush(instance);
+
+  const packPaths = [...github.blobs.keys()].filter(path => path.startsWith(".obsidian-github-sync-encrypted/packs/"));
+  const packPutsBefore = new Map(packPaths.map(path => [path, github.putCounts.get(path) ?? 0]));
+  const objectPathsBefore = new Set([...github.blobs.keys()].filter(path => path.startsWith(".obsidian-github-sync-encrypted/objects/")));
+  vault.set("Notes/note-00000.md", new TextEncoder().encode("v2-0"));
+  const changedFile = vault.getAbstractFileByPath("Notes/note-00000.md") as TFile;
+  vault.readBinaryCount = 0;
+
+  await encryptedModify(changedFile, instance as never, true);
+
+  const changedPackUploads = packPaths.filter(path => (github.putCounts.get(path) ?? 0) > (packPutsBefore.get(path) ?? 0));
+  const newObjectPaths = [...github.blobs.keys()].filter(path => path.startsWith(".obsidian-github-sync-encrypted/objects/") && !objectPathsBefore.has(path));
+  const { snapshot } = await loadV2Snapshot(github);
+  assert.equal(changedPackUploads.length, 0);
+  assert.equal(newObjectPaths.length, 1);
+  assert.equal(snapshot.files["Notes/note-00000.md"].storage, "object");
+  assert.equal(Object.keys(snapshot.packs ?? {}).length, packPaths.length);
+  assert.equal(instance.syncProgress.totalPull, 0);
+  assert.equal(instance.syncProgress.totalPush, 1);
+  assert.equal(vault.readBinaryCount <= 2, true);
 });
 test("encrypted local modify is blocked until force push after enabling encryption", async () => {
   const github = new MemoryGitHub();
