@@ -30,7 +30,19 @@ class FakeV3GitHub {
 
   async getTree() {
     this.getTreeCount += 1;
-    return { sha: this.treeSha, url: "", truncated: false, tree: [] };
+    return {
+      sha: this.treeSha,
+      url: "",
+      truncated: false,
+      tree: [...this.files.entries()].map(([path, file]) => ({
+        path,
+        mode: "100644",
+        type: "blob" as const,
+        sha: file.sha,
+        size: file.bytes.byteLength,
+        url: "",
+      })),
+    };
   }
 
   async createGitBlob(bytes: Uint8Array) {
@@ -247,7 +259,7 @@ test("v3 force pull mirrors remote records to local vault and deletes local extr
   assert.equal(targetVault.deleteCount, 1);
 });
 
-test("v3 normal sync pulls remote changes when local index is clean", async () => {
+test("v3 normal sync pulls remote changes without deleting local-only files", async () => {
   const github = new FakeV3GitHub();
   const sourceVault = new FakeV3Vault(new Map([["Notes/remote.md", new TextEncoder().encode("remote wins")]]));
   const sourceIndex = createEmptyV3LocalIndex({ repoId: "repo", deviceId: "source" });
@@ -276,7 +288,40 @@ test("v3 normal sync pulls remote changes when local index is clean", async () =
   assert.equal(result.operation, "normal");
   assert.equal(result.mode, "force-pull");
   assert.equal(new TextDecoder().decode(targetVault.files.get("Notes/remote.md")), "remote wins");
-  assert.equal(targetVault.files.has("local-only.md"), false);
+  assert.equal(new TextDecoder().decode(targetVault.files.get("local-only.md")), "old");
+});
+
+test("v3 normal sync copies remote conflict instead of overwriting different local content", async () => {
+  const github = new FakeV3GitHub();
+  const sourceVault = new FakeV3Vault(new Map([["Notes/a.md", new TextEncoder().encode("remote")]]));
+  const sourceIndex = createEmptyV3LocalIndex({ repoId: "repo", deviceId: "source" });
+  sourceIndex.remoteCommitSha = "commit-0";
+  await new EncryptedV3SyncSession({
+    github,
+    vault: sourceVault,
+    adapter: memoryAdapter(),
+    indexRoot: ".idx-source",
+    index: sourceIndex,
+    keyMaterial: new TextEncoder().encode("key"),
+  }).sync({ operation: "forcePush" });
+
+  const targetVault = new FakeV3Vault(new Map([["Notes/a.md", new TextEncoder().encode("local")]]));
+  const targetIndex = createEmptyV3LocalIndex({ repoId: "repo", deviceId: "target" });
+  targetIndex.remoteCommitSha = "commit-0";
+  await new EncryptedV3SyncSession({
+    github,
+    vault: targetVault,
+    adapter: memoryAdapter(),
+    indexRoot: ".idx-target",
+    index: targetIndex,
+    keyMaterial: new TextEncoder().encode("key"),
+    conflictPolicy: "copy",
+  }).sync({ operation: "normal" });
+
+  assert.equal(new TextDecoder().decode(targetVault.files.get("Notes/a.md")), "local");
+  const conflictPath = [...targetVault.files.keys()].find(path => path.includes(".sync-conflict-") && path.includes("-remote"));
+  assert.ok(conflictPath);
+  assert.equal(new TextDecoder().decode(targetVault.files.get(conflictPath)), "remote");
 });
 
 test("v3 normal sync refuses to overwrite remote changes when local index is dirty", async () => {
@@ -317,6 +362,30 @@ test("v3 normal sync refuses to overwrite remote changes when local index is dir
   assert.equal(vault.listCount, 0);
 });
 
+test("v3 local change refuses to push when the remote head changed first", async () => {
+  const github = new FakeV3GitHub();
+  github.refSha = "commit-remote";
+  const vault = new FakeV3Vault(new Map([["Notes/local.md", new TextEncoder().encode("local")]]));
+  const index = createEmptyV3LocalIndex({ repoId: "repo", deviceId: "target" });
+  index.remoteCommitSha = "commit-old";
+
+  await assert.rejects(
+    () => new EncryptedV3SyncSession({
+      github,
+      vault,
+      adapter: memoryAdapter(),
+      indexRoot: ".idx",
+      index,
+      keyMaterial: new TextEncoder().encode("key"),
+    }).flushLocalChanges([{ type: "modify", path: "Notes/local.md", mtime: 1 }]),
+    /remote changed/u,
+  );
+
+  assert.equal(github.getGitRefCount, 1);
+  assert.equal(github.commits.length, 0);
+  assert.equal(vault.readCount, 0);
+});
+
 test("v3 force push packs thousands of small files instead of writing one object per file", async () => {
   const github = new FakeV3GitHub();
   const entries = new Map<string, Uint8Array>();
@@ -339,6 +408,29 @@ test("v3 force push packs thousands of small files instead of writing one object
   assert.equal(github.commits[0].files.filter(path => path.includes("/objects/")).length, 0);
   assert.equal(github.commits[0].files.filter(path => path.includes("/packs/base/")).length, 1);
   assert.ok(github.commits[0].files.length < 270);
+});
+
+test("v3 force push deletes obsolete encrypted v3 remote objects", async () => {
+  const github = new FakeV3GitHub();
+  github.files.set(".obsidian-github-sync-v3/objects/aa/bb/old.bin.enc", { sha: "old-object", bytes: new TextEncoder().encode("old") });
+  github.files.set(".obsidian-github-sync-v3/packs/base/old.pack.enc", { sha: "old-pack", bytes: new TextEncoder().encode("old") });
+  github.files.set("README.md", { sha: "readme", bytes: new TextEncoder().encode("keep") });
+  const vault = new FakeV3Vault(new Map([["Notes/a.md", new TextEncoder().encode("new")]]));
+  const index = createEmptyV3LocalIndex({ repoId: "repo", deviceId: "source" });
+  index.remoteCommitSha = "commit-0";
+
+  await new EncryptedV3SyncSession({
+    github,
+    vault,
+    adapter: memoryAdapter(),
+    indexRoot: ".idx",
+    index,
+    keyMaterial: new TextEncoder().encode("key"),
+  }).sync({ operation: "forcePush" });
+
+  assert.equal(github.files.has(".obsidian-github-sync-v3/objects/aa/bb/old.bin.enc"), false);
+  assert.equal(github.files.has(".obsidian-github-sync-v3/packs/base/old.pack.enc"), false);
+  assert.equal(github.files.has("README.md"), true);
 });
 
 test("v3 local modify chunks large files and force pull reassembles them", async () => {

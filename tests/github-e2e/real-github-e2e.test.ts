@@ -396,6 +396,29 @@ async function waitForRemoteSnapshot(config: GitHubConfig, predicate: (snapshot:
   }
   throw new Error(`Timed out waiting for remote snapshot: ${label}${lastError instanceof Error ? ` (${lastError.message})` : ""}`);
 }
+async function loadRemoteV3Vault(config: GitHubConfig): Promise<RealE2EVault> {
+  const vault = new RealE2EVault();
+  Notice.messages.length = 0;
+  await encryptedForcePull(plugin(vault, new GitHubClient(config)) as never);
+  const syncFailure = Notice.messages.find(message => /Encrypted .* failed/i.test(message));
+  if (syncFailure) throw new Error(syncFailure);
+  return vault;
+}
+
+async function waitForRemoteV3Vault(config: GitHubConfig, predicate: (vault: RealE2EVault) => boolean, label: string): Promise<RealE2EVault> {
+  const started = Date.now();
+  let lastError: unknown;
+  while (Date.now() - started < 30000) {
+    try {
+      const vault = await loadRemoteV3Vault(config);
+      if (predicate(vault)) return vault;
+    } catch (error) {
+      lastError = error;
+    }
+    await sleep(1000);
+  }
+  throw new Error(`Timed out waiting for remote v3 vault: ${label}${lastError instanceof Error ? ` (${lastError.message})` : ""}`);
+}
 function repeatedBytes(size: number, seed: number): Uint8Array {
   const bytes = new Uint8Array(size);
   for (let index = 0; index < bytes.length; index++) bytes[index] = (index + seed) % 251;
@@ -422,7 +445,7 @@ baseTest("github e2e: encrypted force push/pull round trips real vault content w
 
   const treeAfterPush = await client.getTree();
   assert.equal(treeAfterPush.tree.some(node => node.path.includes("Notes/hello.md")), false);
-  assert.equal(treeAfterPush.tree.some(node => node.path === ".obsidian-github-sync-encrypted/config.json"), true);
+  assert.equal(treeAfterPush.tree.some(node => node.path === ".obsidian-github-sync-v3/head.enc"), true);
 
   const pulled = new RealE2EVault();
   await measure("forcePull.smallVault", () => encryptedForcePull(plugin(pulled, client) as never), { files: source.files.size });
@@ -449,17 +472,15 @@ baseTest("github e2e: modify rename delete and normal sync behave against real G
   source.files.delete("Notes/delete-me.md");
   await measure("localDelete.singleFile", () => encryptedDelete(new TFile("Notes/delete-me.md"), instance, false));
 
-  await waitForRemoteSnapshot(config, snapshot => snapshot.files["Notes/a.md"]?.deleted === true && snapshot.files["Notes/delete-me.md"]?.deleted === true && snapshot.files["Notes/renamed.md"]?.deleted !== true, "rename/delete reflected");
-
-  const pulled = new RealE2EVault();
-  await encryptedForcePull(plugin(pulled, client) as never);
+  const pulled = await waitForRemoteV3Vault(config, vault =>
+    vault.getText("Notes/renamed.md") === "renamed body"
+    && !vault.files.has("Notes/a.md")
+    && !vault.files.has("Notes/delete-me.md"),
+    "rename/delete reflected",
+  );
   assert.equal(pulled.getText("Notes/renamed.md"), "renamed body");
   assert.equal(pulled.files.has("Notes/a.md"), false);
   assert.equal(pulled.files.has("Notes/delete-me.md"), false);
-
-  const snapshot = await loadRemoteSnapshot(config);
-  assert.equal(snapshot.files["Notes/a.md"].deleted, true);
-  assert.equal(snapshot.files["Notes/delete-me.md"].deleted, true);
 });
 
 regressionTest("github e2e: regression cases cover wrong passphrase, foreign remote prompt, stale sha retry, and missing delete", { timeout: 240000 }, async () => {

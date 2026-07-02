@@ -10,12 +10,28 @@ class RuntimeGitHub {
   treeSha = "tree-0";
   blobs = new Map<string, Uint8Array>();
   files = new Map<string, { sha: string; bytes: Uint8Array }>();
+  getTreeCount = 0;
   private nextBlob = 0;
   private pendingTree: GitHubCreateTreeEntry[] = [];
 
   async getGitRef() { return { ref: "refs/heads/main", sha: this.refSha, type: "commit" }; }
   async getGitCommit(sha: string) { return { sha, treeSha: this.treeSha, parentShas: [] }; }
-  async getTree() { throw new Error("v3 runtime must not use recursive tree"); }
+  async getTree() {
+    this.getTreeCount += 1;
+    return {
+      sha: this.treeSha,
+      url: "",
+      truncated: false,
+      tree: [...this.files.entries()].map(([path, file]) => ({
+        path,
+        mode: "100644",
+        type: "blob" as const,
+        sha: file.sha,
+        size: file.bytes.byteLength,
+        url: "",
+      })),
+    };
+  }
   async createGitBlob(bytes: Uint8Array) {
     const sha = `blob-${++this.nextBlob}`;
     this.blobs.set(sha, new Uint8Array(bytes));
@@ -43,8 +59,30 @@ class RuntimeGitHub {
 
 class RuntimeVault {
   files = new Map<string, Uint8Array>();
+  indexFiles = new Map<string, string>();
   getFilesCount = 0;
   readBinaryCount = 0;
+  adapterWriteCount = 0;
+  adapterReadCount = 0;
+  adapterExistsCount = 0;
+  configDir = ".obsidian";
+  adapter = {
+    read: async (path: string) => {
+      this.adapterReadCount += 1;
+      const value = this.indexFiles.get(path);
+      if (value === undefined) throw new Error(`missing adapter file ${path}`);
+      return value;
+    },
+    write: async (path: string, data: string) => {
+      this.adapterWriteCount += 1;
+      this.indexFiles.set(path, data);
+    },
+    exists: async (path: string) => {
+      this.adapterExistsCount += 1;
+      return this.indexFiles.has(path);
+    },
+    mkdir: async (_path: string) => {},
+  };
   constructor(entries: Record<string, string>) {
     for (const [path, text] of Object.entries(entries)) this.files.set(path, new TextEncoder().encode(text));
   }
@@ -66,8 +104,14 @@ class RuntimeVault {
   async delete(file: TFile) { this.files.delete(file.path); }
 }
 
+class RuntimeVaultWithoutAdapter extends RuntimeVault {
+  adapter = undefined as never;
+}
+
 function plugin(vault: RuntimeVault, github: RuntimeGitHub) {
+  let saveSyncDataCount = 0;
   return {
+    manifest: { id: "encrypted-github-sync-multi-platform" },
     app: { vault },
     githubClient: github,
     settings: {
@@ -85,7 +129,8 @@ function plugin(vault: RuntimeVault, github: RuntimeGitHub) {
     syncProgress: { status: "idle", pushCount: 0, totalPush: 0, pullCount: 0, totalPull: 0, lastSyncTime: 0 },
     isSyncInProgress: false,
     isWatchEnabled: true,
-    async saveSyncData() {},
+    get saveSyncDataCount() { return saveSyncDataCount; },
+    async saveSyncData() { saveSyncDataCount += 1; },
     updateStatusBar() {},
   };
 }
@@ -118,4 +163,34 @@ test("encrypted v3 runtime local modify reads only the changed file", async () =
 
   assert.equal(vault.getFilesCount, 0);
   assert.equal(vault.readBinaryCount, 1);
+});
+
+test("encrypted v3 runtime stores local index in physical sharded adapter files without saveData churn", async () => {
+  const github = new RuntimeGitHub();
+  const vault = new RuntimeVault({ "Notes/a.md": "one" });
+  const instance = plugin(vault, github);
+
+  await encryptedV3ForcePush(instance as never);
+
+  assert.equal(instance.saveSyncDataCount, 0);
+  assert.ok(vault.adapterWriteCount > 0);
+  assert.ok(vault.indexFiles.has(".obsidian/plugins/encrypted-github-sync-multi-platform/encrypted-v3-index/index.json"));
+  assert.ok([...vault.indexFiles.keys()].some(path => path.startsWith(".obsidian/plugins/encrypted-github-sync-multi-platform/encrypted-v3-index/shards/")));
+
+  vault.files.set("Notes/a.md", new TextEncoder().encode("two"));
+  await encryptedV3Modify(vault.getAbstractFileByPath("Notes/a.md") as TFile, instance as never, false);
+
+  assert.equal(instance.saveSyncDataCount, 0);
+});
+
+test("encrypted v3 runtime falls back to non-persistent memory index when vault adapter is unavailable", async () => {
+  const github = new RuntimeGitHub();
+  const vault = new RuntimeVaultWithoutAdapter({ "Notes/a.md": "one" });
+  const instance = plugin(vault, github);
+
+  await encryptedV3ForcePush(instance as never);
+
+  assert.equal(instance.saveSyncDataCount, 0);
+  assert.ok(github.committedPaths().some(path => path.endsWith("/head.enc")));
+  assert.equal(vault.files.has("Notes/a.md"), true);
 });

@@ -1,13 +1,16 @@
 import { commitGitTreeChanges, type GitAtomicGithub } from "../v3/git-atomic-writer";
 import { bytesToUtf8, fromBase64, fromBase64Url, sha256Hex, toBase64Url, utf8ToBytes } from "../encrypted/bytes";
+import { isTextLikePath, mergeTextContent } from "../encrypted/conflicts";
 import type { PackArchiveFileInput } from "../encrypted/pack-format";
+import { conflictPathFor } from "../encrypted/paths";
+import type { ConflictPolicy } from "../encrypted/types";
 import { decryptV3BinaryPayload, encryptV3BinaryPayload } from "./binary-format";
 import { coalesceV3Changes, type EncryptedV3QueuedChange } from "./change-batcher";
 import { type V3LocalIndex, type V3LocalIndexAdapter, saveV3LocalIndexShard } from "./local-index";
 import { ENCRYPTED_V3_LOOSE_OBJECT_MAX_BYTES, encryptV3ChunkedObject, encryptV3LooseObject } from "./object-store";
 import { decryptV3BasePack, encryptV3BasePack } from "./pack-store";
 import { bucketForV3PathId, createV3PathId, normalizeV3VaultPath } from "./paths";
-import { ENCRYPTED_V3_HEAD_PATH, type EncryptedV3RemoteHead, type EncryptedV3Shard, type EncryptedV3ShardRecord } from "./protocol-types";
+import { ENCRYPTED_V3_HEAD_PATH, ENCRYPTED_V3_ROOT, type EncryptedV3RemoteHead, type EncryptedV3Shard, type EncryptedV3ShardRecord } from "./protocol-types";
 import { encryptV3LocalShard, encryptV3Path } from "./shard-store";
 
 const OBJECT_ID_BYTES = 18;
@@ -28,6 +31,7 @@ export interface EncryptedV3Vault {
 
 export interface EncryptedV3RemoteReadable {
   getFile(path: string): Promise<{ content: string; sha: string; path: string; size?: number } | null>;
+  getBlob?(sha: string): Promise<Uint8Array>;
 }
 
 export interface EncryptedV3SyncSessionInput {
@@ -38,6 +42,7 @@ export interface EncryptedV3SyncSessionInput {
   index: V3LocalIndex;
   keyMaterial: Uint8Array;
   looseObjectMaxBytes?: number;
+  conflictPolicy?: ConflictPolicy;
 }
 
 export interface EncryptedV3SyncResult {
@@ -94,7 +99,7 @@ export class EncryptedV3SyncSession {
     }
     if (options.operation === "normal" && this.input.index.remoteCommitSha !== ref.sha) {
       if (this.hasDirtyLocalRecords()) throw new Error("Encrypted v3 conflict: remote changed while local encrypted index has dirty records.");
-      return this.forcePull(ref.sha, phases, "normal");
+      return this.forcePull(ref.sha, phases, "normal", false);
     }
 
     const files = await timed(phases, "force.listLocalFiles", () => this.input.vault.listFiles());
@@ -113,6 +118,12 @@ export class EncryptedV3SyncSession {
     context: { operation?: "localChange" | "forcePush"; phases?: Array<[string, number]>; mode?: EncryptedV3SyncResult["mode"] } = {},
   ): Promise<EncryptedV3SyncResult> {
     const phases = context.phases ?? [];
+    if ((context.operation ?? "localChange") !== "forcePush" && this.input.index.remoteCommitSha) {
+      const ref = await timed(phases, "preflight.remoteRef", () => this.input.github.getGitRef());
+      if (ref.sha !== this.input.index.remoteCommitSha) {
+        throw new Error("Encrypted v3 conflict: remote changed before local changes could be pushed.");
+      }
+    }
     const batch = await timed(phases, "queue.collect", async () => coalesceV3Changes(changes));
     const deletes = batch.filter((change): change is Extract<EncryptedV3QueuedChange, { type: "delete" }> => change.type === "delete");
     const renames = batch.filter((change): change is Extract<EncryptedV3QueuedChange, { type: "rename" }> => change.type === "rename");
@@ -258,9 +269,13 @@ export class EncryptedV3SyncSession {
     }));
     remoteFiles.push({ path: ENCRYPTED_V3_HEAD_PATH, bytes: headBytes });
 
+    const deletions = context.operation === "forcePush"
+      ? await timed(phases, "forcePush.planRemotePrune", () => this.planForcePushRemotePrune(remoteFiles))
+      : [];
     const commit = await timed(phases, "git.atomicCommit", () => commitGitTreeChanges(this.input.github, {
       message: `sync: encrypted v3 ${context.operation ?? "localChange"}`,
       files: remoteFiles,
+      deletions,
     }));
     this.input.index.remoteCommitSha = commit.commitSha;
 
@@ -282,7 +297,12 @@ export class EncryptedV3SyncSession {
     return Object.values(this.input.index.shards).some(shard => Object.values(shard.records).some(record => record.dirty));
   }
 
-  private async forcePull(remoteCommitSha: string, phases: Array<[string, number]>, operation: "forcePull" | "normal" = "forcePull"): Promise<EncryptedV3SyncResult> {
+  private async forcePull(
+    remoteCommitSha: string,
+    phases: Array<[string, number]>,
+    operation: "forcePull" | "normal" = "forcePull",
+    deleteLocalExtras = true,
+  ): Promise<EncryptedV3SyncResult> {
     if (typeof this.input.vault.write !== "function" || typeof this.input.vault.delete !== "function") {
       throw new Error("Encrypted v3 force pull requires vault write/delete support.");
     }
@@ -291,6 +311,7 @@ export class EncryptedV3SyncSession {
     const remotePaths = new Set<string>();
     let changedBytes = 0;
     let changedFiles = 0;
+    const previousShards = this.input.index.shards;
 
     this.input.index.epoch = head.epoch;
     this.input.index.generation = head.generation;
@@ -323,19 +344,28 @@ export class EncryptedV3SyncSession {
           : record.storage === "chunked"
             ? await this.readChunkedRecord(record, phases)
             : await this.readLooseRecord(record, phases);
-        await timed(phases, "vault.write", () => this.input.vault.write!(path, plaintext));
+        const applied = await timed(phases, "vault.applyRemote", () => this.applyRemoteRecord({
+          path,
+          pathId: record.pathId,
+          plaintext,
+          remoteMtime: record.mtime,
+          previousShards,
+          force: operation === "forcePull",
+        }));
         remotePaths.add(path);
         changedBytes += plaintext.byteLength;
-        changedFiles += 1;
+        if (applied) changedFiles += 1;
       }
       this.input.index.shards[bucket] = localShard;
       await timed(phases, "localIndex.save", () => saveV3LocalIndexShard(this.input.adapter, this.input.indexRoot, this.input.index, bucket));
     }
 
-    const localFiles = await timed(phases, "forcePull.listLocalFiles", () => this.input.vault.listFiles());
-    for (const file of localFiles) {
-      const path = normalizeV3VaultPath(file.path);
-      if (!remotePaths.has(path)) await timed(phases, "vault.deleteExtra", () => this.input.vault.delete!(path));
+    if (deleteLocalExtras) {
+      const localFiles = await timed(phases, "forcePull.listLocalFiles", () => this.input.vault.listFiles());
+      for (const file of localFiles) {
+        const path = normalizeV3VaultPath(file.path);
+        if (!remotePaths.has(path)) await timed(phases, "vault.deleteExtra", () => this.input.vault.delete!(path));
+      }
     }
     this.input.index.remoteCommitSha = remoteCommitSha;
     return {
@@ -345,6 +375,56 @@ export class EncryptedV3SyncSession {
       changedBytes,
       phaseSummary: phaseSummary(phases),
     };
+  }
+
+  private async applyRemoteRecord(input: {
+    path: string;
+    pathId: string;
+    plaintext: Uint8Array;
+    remoteMtime: number;
+    previousShards: V3LocalIndex["shards"];
+    force: boolean;
+  }): Promise<boolean> {
+    if (input.force) {
+      await this.input.vault.write!(input.path, input.plaintext);
+      return true;
+    }
+    const existing = await this.readLocalIfExists(input.path);
+    if (!existing) {
+      await this.input.vault.write!(input.path, input.plaintext);
+      return true;
+    }
+    const remoteHash = await sha256Hex(input.plaintext);
+    const localHash = await sha256Hex(existing);
+    if (localHash === remoteHash) return false;
+    const previous = Object.values(input.previousShards).map(shard => shard.records[input.pathId]).find(Boolean);
+    if (previous && !previous.deleted && previous.plaintextSha256 === localHash) {
+      await this.input.vault.write!(input.path, input.plaintext);
+      return true;
+    }
+
+    const policy = this.input.conflictPolicy ?? "copy";
+    if (policy === "newer" && previous?.mtime && previous.mtime > input.remoteMtime) return false;
+    if (policy === "newer" && previous?.mtime && previous.mtime < input.remoteMtime) {
+      await this.input.vault.write!(input.path, input.plaintext);
+      return true;
+    }
+    if (policy === "merge" && isTextLikePath(input.path)) {
+      const merged = utf8ToBytes(mergeTextContent(bytesToUtf8(existing), bytesToUtf8(input.plaintext)));
+      await this.input.vault.write!(input.path, merged);
+      return true;
+    }
+
+    await this.input.vault.write!(conflictPathFor(input.path, Date.now(), "remote"), input.plaintext);
+    return true;
+  }
+
+  private async readLocalIfExists(path: string): Promise<Uint8Array | null> {
+    try {
+      return await this.input.vault.read(path);
+    } catch {
+      return null;
+    }
   }
 
   private async decryptRecordPath(record: EncryptedV3ShardRecord): Promise<string> {
@@ -396,10 +476,25 @@ export class EncryptedV3SyncSession {
 
   private async readRemoteFile(path: string): Promise<Uint8Array> {
     const readable = this.input.github as GitAtomicGithub & EncryptedV3RemoteReadable;
+    if (typeof readable.getBlob === "function") {
+      const sha = await this.findRemoteBlobSha(path);
+      if (sha) return readable.getBlob(sha);
+    }
     if (typeof readable.getFile !== "function") throw new Error("Encrypted v3 pull requires GitHub getFile support.");
     const file = await readable.getFile(path);
     if (!file) throw new Error(`Missing encrypted v3 remote file: ${path}`);
     return fromBase64(file.content);
+  }
+
+  private remoteBlobShaCache: Map<string, string> | null = null;
+
+  private async findRemoteBlobSha(path: string): Promise<string | null> {
+    if (!this.remoteBlobShaCache) {
+      const tree = await this.input.github.getTree();
+      if (tree.truncated) throw new Error("Cannot read encrypted v3 remote files from a truncated remote tree.");
+      this.remoteBlobShaCache = new Map(tree.tree.filter(node => node.type === "blob").map(node => [node.path, node.sha]));
+    }
+    return this.remoteBlobShaCache.get(path) ?? null;
   }
 
   private async forcePushPacked(files: EncryptedV3VaultFile[], phases: Array<[string, number]>): Promise<EncryptedV3SyncResult> {
@@ -458,9 +553,11 @@ export class EncryptedV3SyncSession {
       kind: "head",
     }));
     remoteFiles.push({ path: ENCRYPTED_V3_HEAD_PATH, bytes: headBytes });
+    const deletions = await timed(phases, "forcePush.planRemotePrune", () => this.planForcePushRemotePrune(remoteFiles));
     const commit = await timed(phases, "git.atomicCommit", () => commitGitTreeChanges(this.input.github, {
       message: "sync: encrypted v3 forcePush pack",
       files: remoteFiles,
+      deletions,
     }));
     this.input.index.remoteCommitSha = commit.commitSha;
     for (const bucket of changedBuckets) await timed(phases, "localIndex.save", () => saveV3LocalIndexShard(this.input.adapter, this.input.indexRoot, this.input.index, bucket));
@@ -484,6 +581,15 @@ export class EncryptedV3SyncSession {
       writes.push({ bucket, path: encrypted.path, bytes: encrypted.bytes });
     }
     return writes;
+  }
+
+  private async planForcePushRemotePrune(remoteFiles: Array<{ path: string; bytes: Uint8Array }>): Promise<string[]> {
+    const nextPaths = new Set(remoteFiles.map(file => file.path));
+    const tree = await this.input.github.getTree();
+    if (tree.truncated) throw new Error("Cannot force push encrypted v3 mirror from a truncated remote tree.");
+    return tree.tree
+      .filter(node => node.type === "blob" && node.path.startsWith(`${ENCRYPTED_V3_ROOT}/`) && !nextPaths.has(node.path))
+      .map(node => node.path);
   }
 }
 

@@ -9,16 +9,10 @@ import { createEmptyV3LocalIndex, loadV3LocalIndex, type V3LocalIndex, type V3Lo
 import { EncryptedV3SyncSession, type EncryptedV3Vault } from "./sync-session";
 import { normalizeV3VaultPath } from "./paths";
 import type { EncryptedV3QueuedChange } from "./change-batcher";
+import { effectiveConflictPolicy } from "../encrypted/settings-policy";
 
 const V3_INDEX_ROOT = "encrypted-v3-index";
-
-interface V3SyncDataHost {
-  syncData: {
-    encryptedV3?: {
-      localIndexFiles: Record<string, string>;
-    };
-  };
-}
+const fallbackIndexStores = new WeakMap<object, Map<string, string>>();
 
 function encryptedV3Enabled(plugin: FastSync): boolean {
   if ((plugin as FastSync & { isTesting?: boolean }).isTesting
@@ -32,25 +26,55 @@ export function shouldUseEncryptedV3(plugin: FastSync): boolean {
   return encryptedV3Enabled(plugin);
 }
 
-function ensureV3Store(plugin: FastSync): Record<string, string> {
-  const host = plugin as FastSync & V3SyncDataHost;
-  if (!host.syncData.encryptedV3) host.syncData.encryptedV3 = { localIndexFiles: {} };
-  return host.syncData.encryptedV3.localIndexFiles;
-}
-
 function createPluginIndexAdapter(plugin: FastSync): V3LocalIndexAdapter {
+  const vault = plugin.app.vault as FastSync["app"]["vault"] & {
+    configDir?: string;
+    adapter?: {
+      read(path: string): Promise<string>;
+      write(path: string, data: string): Promise<void>;
+      exists(path: string): Promise<boolean>;
+      mkdir(path: string): Promise<void>;
+    };
+  };
+  const adapter = vault.adapter;
+  if (!adapter) return createMemoryIndexAdapter(plugin as object);
+  const configDir = vault.configDir || ".obsidian";
+  const pluginId = (plugin as FastSync & { manifest?: { id?: string } }).manifest?.id || "encrypted-github-sync-multi-platform";
+  const base = `${configDir}/plugins/${pluginId}`;
+  const resolvePath = (path: string) => `${base}/${path.replace(/^\/+/u, "")}`;
   return {
     async read(path: string) {
-      const value = ensureV3Store(plugin)[path];
+      return adapter.read(resolvePath(path));
+    },
+    async write(path: string, data: string) {
+      await adapter.write(resolvePath(path), data);
+    },
+    async exists(path: string) {
+      return adapter.exists(resolvePath(path));
+    },
+    async mkdir(path: string) {
+      await adapter.mkdir(resolvePath(path));
+    },
+  };
+}
+
+function createMemoryIndexAdapter(owner: object): V3LocalIndexAdapter {
+  let store = fallbackIndexStores.get(owner);
+  if (!store) {
+    store = new Map<string, string>();
+    fallbackIndexStores.set(owner, store);
+  }
+  return {
+    async read(path: string) {
+      const value = store.get(path);
       if (value === undefined) throw new Error(`Missing encrypted v3 local index file: ${path}`);
       return value;
     },
     async write(path: string, data: string) {
-      ensureV3Store(plugin)[path] = data;
-      await plugin.saveSyncData();
+      store.set(path, data);
     },
     async exists(path: string) {
-      return ensureV3Store(plugin)[path] !== undefined;
+      return store.has(path);
     },
     async mkdir(_path: string) {},
   };
@@ -104,6 +128,7 @@ async function createSession(plugin: FastSync): Promise<EncryptedV3SyncSession> 
     indexRoot: V3_INDEX_ROOT,
     index,
     keyMaterial: keys.masterKey,
+    conflictPolicy: effectiveConflictPolicy(plugin.settings.conflictPolicy),
   });
 }
 
