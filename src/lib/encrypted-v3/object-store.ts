@@ -1,7 +1,7 @@
 import { encryptV3BinaryPayload } from "./binary-format";
 import { ENCRYPTED_V3_ROOT } from "./protocol-types";
 
-export const ENCRYPTED_V3_LOOSE_OBJECT_MAX_BYTES = 64 * 1024 * 1024;
+export const ENCRYPTED_V3_LOOSE_OBJECT_MAX_BYTES = 24 * 1024 * 1024;
 
 export function encryptedV3ObjectPath(objectId: string): string {
   return `${ENCRYPTED_V3_ROOT}/objects/${objectId.slice(0, 2)}/${objectId.slice(2, 4)}/${objectId}.bin.enc`;

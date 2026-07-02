@@ -84,6 +84,11 @@ export async function saveV3LocalIndexShard(adapter: V3LocalIndexAdapter, root: 
   await adapter.write(joinPath(root, `shards/${bucket}.json`), JSON.stringify(shard));
 }
 
+export async function saveV3LocalIndexHeader(adapter: V3LocalIndexAdapter, root: string, index: V3LocalIndex): Promise<void> {
+  await adapter.mkdir(root);
+  await adapter.write(joinPath(root, "index.json"), JSON.stringify(headerFromIndex(index)));
+}
+
 export async function loadV3LocalIndex(adapter: V3LocalIndexAdapter, root: string): Promise<V3LocalIndex> {
   const headerPath = joinPath(root, "index.json");
   if (!(await adapter.exists(headerPath))) return createEmptyV3LocalIndex({ repoId: "", deviceId: "" });

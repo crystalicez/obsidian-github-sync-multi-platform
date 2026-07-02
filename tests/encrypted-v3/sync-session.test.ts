@@ -381,7 +381,7 @@ test("v3 local change refuses to push when the remote head changed first", async
     /remote changed/u,
   );
 
-  assert.equal(github.getGitRefCount, 1);
+  assert.equal(github.getGitRefCount, 5);
   assert.equal(github.commits.length, 0);
   assert.equal(vault.readCount, 0);
 });
@@ -410,6 +410,35 @@ test("v3 force push packs thousands of small files instead of writing one object
   assert.ok(github.commits[0].files.length < 270);
 });
 
+test("v3 local batch packs thousands of copied files instead of writing one object per file", async () => {
+  const github = new FakeV3GitHub();
+  const entries = new Map<string, Uint8Array>();
+  const changes = [];
+  for (let index = 0; index < 2_000; index++) {
+    const path = `Copied/file-${index}.md`;
+    entries.set(path, new TextEncoder().encode(`copied ${index}`));
+    changes.push({ type: "modify" as const, path, mtime: 1 });
+  }
+  const vault = new FakeV3Vault(entries);
+  const index = createEmptyV3LocalIndex({ repoId: "repo", deviceId: "source" });
+  index.remoteCommitSha = "commit-0";
+
+  const result = await new EncryptedV3SyncSession({
+    github,
+    vault,
+    adapter: memoryAdapter(),
+    indexRoot: ".idx",
+    index,
+    keyMaterial: new TextEncoder().encode("key"),
+  }).flushLocalChanges(changes);
+
+  assert.equal(result.mode, "base-pack");
+  assert.equal(github.commits.length, 1);
+  assert.equal(github.commits[0].files.filter(path => path.includes("/objects/")).length, 0);
+  assert.equal(github.commits[0].files.filter(path => path.includes("/packs/base/")).length, 2);
+  assert.ok(github.commits[0].files.length < 270);
+});
+
 test("v3 force push deletes obsolete encrypted v3 remote objects", async () => {
   const github = new FakeV3GitHub();
   github.files.set(".obsidian-github-sync-v3/objects/aa/bb/old.bin.enc", { sha: "old-object", bytes: new TextEncoder().encode("old") });
@@ -431,6 +460,26 @@ test("v3 force push deletes obsolete encrypted v3 remote objects", async () => {
   assert.equal(github.files.has(".obsidian-github-sync-v3/objects/aa/bb/old.bin.enc"), false);
   assert.equal(github.files.has(".obsidian-github-sync-v3/packs/base/old.pack.enc"), false);
   assert.equal(github.files.has("README.md"), true);
+});
+
+test("v3 force push of an empty vault still initializes a remote head", async () => {
+  const github = new FakeV3GitHub();
+  const vault = new FakeV3Vault(new Map());
+  const index = createEmptyV3LocalIndex({ repoId: "repo", deviceId: "source" });
+  index.remoteCommitSha = "commit-0";
+
+  const result = await new EncryptedV3SyncSession({
+    github,
+    vault,
+    adapter: memoryAdapter(),
+    indexRoot: ".idx",
+    index,
+    keyMaterial: new TextEncoder().encode("key"),
+  }).sync({ operation: "forcePush" });
+
+  assert.equal(result.mode, "force-push");
+  assert.equal(github.commits.length, 1);
+  assert.equal(github.commits[0].files.some(path => path.endsWith("/head.enc")), true);
 });
 
 test("v3 local modify chunks large files and force pull reassembles them", async () => {

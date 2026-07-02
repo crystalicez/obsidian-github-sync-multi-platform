@@ -4,6 +4,7 @@ import { appendFile, mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { modalButtons, Notice, resetModalTestState, setRequestUrlHandler, TFile } from "obsidian";
 import { encryptedDelete, encryptedForcePull, encryptedForcePush, encryptedFullSync, encryptedModify, encryptedRename } from "../../src/lib/encrypted/sync-engine";
+import { flushEncryptedV3PendingChanges } from "../../src/lib/encrypted-v3/runtime";
 import { EncryptedManifestStore } from "../../src/lib/encrypted/manifest-store";
 import { EncryptedSnapshotStore } from "../../src/lib/encrypted/snapshot-store";
 import type { EncryptedSnapshotManifest } from "../../src/lib/encrypted/snapshot-types";
@@ -531,7 +532,7 @@ benchmarkTest("github e2e: benchmark pack mode on real GitHub", { timeout: 60000
 
   await measure("forcePush.packMode", () => encryptedForcePush(sourceInstance), { files: fileCount });
   const tree = await client.getTree();
-  assert.equal(tree.tree.some(node => node.path.startsWith(".obsidian-github-sync-encrypted/packs/")), true);
+  assert.equal(tree.tree.some(node => node.path.startsWith(".obsidian-github-sync-v3/packs/base/")), true);
   assert.equal(tree.tree.some(node => node.path.includes("many/note-00000.md")), false);
 
   source.set("many/note-00000.md", new TextEncoder().encode("note-0 changed once"));
@@ -546,7 +547,7 @@ benchmarkTest("github e2e: benchmark pack mode on real GitHub", { timeout: 60000
   source.set("small/only.md", new TextEncoder().encode("shrunk"));
   await measure("forcePush.shrinkVault", () => encryptedForcePush(plugin(source, client) as never), { files: 1 });
   const shrinkTree = await client.getTree();
-  assert.equal(shrinkTree.tree.some(node => node.path.startsWith(".obsidian-github-sync-encrypted/packs/")), false);
+  assert.equal(shrinkTree.tree.some(node => node.path.startsWith(".obsidian-github-sync-v3/packs/base/")), false);
 });
 
 class DeterministicRandom {
@@ -649,6 +650,7 @@ randomTest("github e2e: random real-usage actions preserve vault state", { timeo
 
   async function runRequiredCopyBatch(count: number, label: string): Promise<void> {
     const samples: string[] = [];
+    const createdPaths: string[] = [];
     const before = { files: expected.size, bytes: randomTotalBytes(expected) };
     await appendRandomDebug({ phase: "before-required-copy", label, count, before });
     for (let index = 0; index < count; index++) {
@@ -656,11 +658,19 @@ randomTest("github e2e: random real-usage actions preserve vault state", { timeo
       const bytes = new TextEncoder().encode(`copied-${label}-${index}-${randomAscii(random, Math.max(1, Math.min(maxEditChars, 32)))}`);
       source.set(filePath, bytes);
       expected.set(filePath, cloneBytes(bytes));
+      createdPaths.push(filePath);
       if (samples.length < 5) samples.push(filePath);
     }
     const afterMutation = { files: expected.size, bytes: randomTotalBytes(expected), changedCount: count, samples, syncMode: "bulk" as const };
     await appendRandomDebug({ phase: "after-required-copy-before-sync", label, afterMutation });
-    await measure(`random.requiredCopy.${label}.${count}`, () => encryptedFullSync(instance), { operation: "push", phase: "after-push", action: "requiredCopy", files: afterMutation.files, bytes: afterMutation.bytes, changedFiles: count, batchLabel: label });
+    await measure(`random.requiredCopy.${label}.${count}`, async () => {
+      for (const filePath of createdPaths) {
+        const file = source.getAbstractFileByPath(filePath);
+        assert.ok(file instanceof TFile, `Expected copied file to exist: ${filePath}`);
+        await encryptedModify(file, instance, true);
+      }
+      await flushEncryptedV3PendingChanges(instance);
+    }, { operation: "push", phase: "after-push", action: "requiredCopy", files: afterMutation.files, bytes: afterMutation.bytes, changedFiles: count, batchLabel: label });
   }
 
   for (const count of requiredChangedFileCounts()) {
@@ -692,8 +702,9 @@ randomTest("github e2e: random real-usage actions preserve vault state", { timeo
     const afterMutation = { files: expected.size, bytes: randomTotalBytes(expected), changedCount, samples, syncMode };
     await appendRandomDebug({ phase: "after-mutation-before-sync", step, action, afterMutation, events: events.slice(0, 10) });
     await measure(`random.step.${step}.${action}.${syncMode}`, async () => {
-      if (syncMode === "event" && events.length > 0) {
+      if (events.length > 0) {
         for (const event of events) await runEventOperation(event);
+        await flushEncryptedV3PendingChanges(instance);
       } else {
         await encryptedFullSync(instance);
       }
@@ -807,7 +818,7 @@ randomTest("github e2e: random real-usage actions preserve vault state", { timeo
   await measure("forcePush.chunkedObject", () => encryptedForcePush(plugin(source, client) as never), { files: 1, largeMiB });
   const tree = await client.getTree();
   assert.equal(tree.tree.some(node => node.path.includes("large/blob.bin")), false);
-  assert.equal(tree.tree.some(node => node.path.includes(".parts/")), true);
+  assert.equal(tree.tree.some(node => node.path.includes(".obsidian-github-sync-v3/chunks/")), true);
 
   const pulled = new RealE2EVault();
   await measure("forcePull.chunkedObject", () => encryptedForcePull(plugin(pulled, client) as never), { files: 1, largeMiB });

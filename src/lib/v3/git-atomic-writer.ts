@@ -46,6 +46,19 @@ function isRefConflict(error: unknown): boolean {
   return status === 409 || status === 422;
 }
 
+async function mapWithConcurrency<T, R>(items: T[], concurrency: number, mapper: (item: T, index: number) => Promise<R>): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+  const workerCount = Math.max(1, Math.min(concurrency, items.length));
+  await Promise.all(Array.from({ length: workerCount }, async () => {
+    while (nextIndex < items.length) {
+      const index = nextIndex++;
+      results[index] = await mapper(items[index], index);
+    }
+  }));
+  return results;
+}
+
 export async function commitGitTreeChanges(github: GitAtomicGithub, input: GitAtomicWriteInput): Promise<GitAtomicWriteResult> {
   const ref = await github.getGitRef();
   let baseTreeSha: string;
@@ -59,8 +72,11 @@ export async function commitGitTreeChanges(github: GitAtomicGithub, input: GitAt
 
   const tree: GitHubCreateTreeEntry[] = [];
   const fileShas: Record<string, string> = {};
-  for (const file of input.files) {
-    const sha = await github.createGitBlob(file.bytes);
+  const blobWrites = await mapWithConcurrency(input.files, 8, async (file) => ({
+    file,
+    sha: await github.createGitBlob(file.bytes),
+  }));
+  for (const { file, sha } of blobWrites) {
     fileShas[file.path] = sha;
     tree.push({ path: file.path, mode: "100644", type: "blob", sha });
   }

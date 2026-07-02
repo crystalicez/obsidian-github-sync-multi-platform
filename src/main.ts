@@ -55,7 +55,7 @@ export default class FastSync extends Plugin {
   statusBarItem: HTMLElement | null = null
   saveNoticeTimeout: number | null = null
   syncProgress: {
-    status: "idle" | "syncing" | "success" | "fail" | "waiting"
+    status: "idle" | "pending" | "syncing" | "success" | "fail" | "waiting"
     pushCount: number
     totalPush: number
     pullCount: number
@@ -293,7 +293,11 @@ export default class FastSync extends Plugin {
     let title = "";
     let cls = "github-sync-status-bar";
 
-    if (status === "waiting") {
+    if (status === "pending") {
+      text = `⏳ GH Sync (queued ${totalPush})`;
+      title = `GitHub Sync: ${totalPush} local change(s) queued for the next encrypted sync.`;
+      cls += " is-syncing";
+    } else if (status === "waiting") {
       text = `⏳ GH Sync (waiting...)`;
       title = "GitHub Sync: Waiting for local changes to settle...";
       cls += " is-syncing";

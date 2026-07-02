@@ -412,7 +412,13 @@ export async function encryptedManualSync(plugin: FastSync): Promise<void> {
 }
 
 export async function encryptedForcePush(plugin: FastSync): Promise<void> {
-  if (shouldUseEncryptedV3(plugin)) return encryptedV3ForcePush(plugin);
+  if (shouldUseEncryptedV3(plugin)) {
+    if (!(await confirmForeignRemoteBeforeForcePush(plugin, "forcePush"))) {
+      new Notice("Encrypted force push cancelled.");
+      return;
+    }
+    return encryptedV3ForcePush(plugin);
+  }
   return encryptedSync(plugin, { operation: "forcePush" });
 }
 

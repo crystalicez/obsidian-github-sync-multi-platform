@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { TFile } from "obsidian";
 
-import { encryptedV3ForcePull, encryptedV3ForcePush, encryptedV3Modify, shouldUseEncryptedV3 } from "../../src/lib/encrypted-v3/runtime";
+import { encryptedV3ForcePull, encryptedV3ForcePush, encryptedV3Modify, flushEncryptedV3PendingChanges, shouldUseEncryptedV3 } from "../../src/lib/encrypted-v3/runtime";
 import type { GitHubCreateTreeEntry } from "../../src/lib/github-git-types";
 
 class RuntimeGitHub {
@@ -13,6 +13,7 @@ class RuntimeGitHub {
   getTreeCount = 0;
   private nextBlob = 0;
   private pendingTree: GitHubCreateTreeEntry[] = [];
+  commitCount = 0;
 
   async getGitRef() { return { ref: "refs/heads/main", sha: this.refSha, type: "commit" }; }
   async getGitCommit(sha: string) { return { sha, treeSha: this.treeSha, parentShas: [] }; }
@@ -46,7 +47,10 @@ class RuntimeGitHub {
     this.treeSha = `tree-${this.nextBlob}`;
     return this.treeSha;
   }
-  async createGitCommit() { return `commit-${this.nextBlob}`; }
+  async createGitCommit() {
+    this.commitCount += 1;
+    return `commit-${this.nextBlob}`;
+  }
   async updateGitRef(sha: string) { this.refSha = sha; }
   async putFile() { throw new Error("v3 runtime must not use Contents API putFile"); }
   async getFile(path: string) {
@@ -163,6 +167,28 @@ test("encrypted v3 runtime local modify reads only the changed file", async () =
 
   assert.equal(vault.getFilesCount, 0);
   assert.equal(vault.readBinaryCount, 1);
+});
+
+test("encrypted v3 runtime batches watcher modify events into one commit", async () => {
+  const github = new RuntimeGitHub();
+  const vault = new RuntimeVault({ "Notes/a.md": "one", "Notes/b.md": "two", "Notes/c.md": "three" });
+  const instance = plugin(vault, github);
+  await encryptedV3ForcePush(instance as never);
+  github.commitCount = 0;
+  vault.readBinaryCount = 0;
+
+  vault.files.set("Notes/a.md", new TextEncoder().encode("changed a"));
+  vault.files.set("Notes/b.md", new TextEncoder().encode("changed b"));
+  vault.files.set("Notes/c.md", new TextEncoder().encode("changed c"));
+  await encryptedV3Modify(vault.getAbstractFileByPath("Notes/a.md") as TFile, instance as never, true);
+  await encryptedV3Modify(vault.getAbstractFileByPath("Notes/b.md") as TFile, instance as never, true);
+  await encryptedV3Modify(vault.getAbstractFileByPath("Notes/c.md") as TFile, instance as never, true);
+
+  assert.equal(github.commitCount, 0);
+  await flushEncryptedV3PendingChanges(instance as never);
+
+  assert.equal(github.commitCount, 1);
+  assert.equal(vault.readBinaryCount, 3);
 });
 
 test("encrypted v3 runtime stores local index in physical sharded adapter files without saveData churn", async () => {

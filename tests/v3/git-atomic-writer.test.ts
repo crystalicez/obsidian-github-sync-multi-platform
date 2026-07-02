@@ -51,6 +51,19 @@ class FakeGitHubForAtomicWriter {
   }
 }
 
+class DelayedBlobGitHubForAtomicWriter extends FakeGitHubForAtomicWriter {
+  inFlight = 0;
+  maxInFlight = 0;
+
+  async createGitBlob(bytes: Uint8Array) {
+    this.inFlight += 1;
+    this.maxInFlight = Math.max(this.maxInFlight, this.inFlight);
+    await new Promise(resolve => setTimeout(resolve, 10));
+    this.inFlight -= 1;
+    return super.createGitBlob(bytes);
+  }
+}
+
 test("commitGitTreeChanges writes multiple files and deletions as one atomic commit", async () => {
   const github = new FakeGitHubForAtomicWriter();
   const result = await commitGitTreeChanges(github, {
@@ -92,4 +105,15 @@ test("commitGitTreeChanges maps stale ref update to GitAtomicRefConflictError", 
       return true;
     },
   );
+});
+
+test("commitGitTreeChanges creates blobs concurrently for large atomic commits", async () => {
+  const github = new DelayedBlobGitHubForAtomicWriter();
+  await commitGitTreeChanges(github, {
+    message: "sync: many blobs",
+    files: Array.from({ length: 24 }, (_, index) => ({ path: `file-${index}.bin`, bytes: new Uint8Array([index]) })),
+  });
+
+  assert.ok(github.maxInFlight > 1, `expected concurrent blob creation, got maxInFlight=${github.maxInFlight}`);
+  assert.equal(github.blobs.length, 24);
 });

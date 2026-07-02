@@ -6,7 +6,7 @@ import { conflictPathFor } from "../encrypted/paths";
 import type { ConflictPolicy } from "../encrypted/types";
 import { decryptV3BinaryPayload, encryptV3BinaryPayload } from "./binary-format";
 import { coalesceV3Changes, type EncryptedV3QueuedChange } from "./change-batcher";
-import { type V3LocalIndex, type V3LocalIndexAdapter, saveV3LocalIndexShard } from "./local-index";
+import { type V3LocalIndex, type V3LocalIndexAdapter, saveV3LocalIndexHeader, saveV3LocalIndexShard } from "./local-index";
 import { ENCRYPTED_V3_LOOSE_OBJECT_MAX_BYTES, encryptV3ChunkedObject, encryptV3LooseObject } from "./object-store";
 import { decryptV3BasePack, encryptV3BasePack } from "./pack-store";
 import { bucketForV3PathId, createV3PathId, normalizeV3VaultPath } from "./paths";
@@ -15,6 +15,8 @@ import { encryptV3LocalShard, encryptV3Path } from "./shard-store";
 
 const OBJECT_ID_BYTES = 18;
 const V3_PACK_FORCE_PUSH_FILE_THRESHOLD = 256;
+const V3_PACK_LOCAL_BATCH_FILE_THRESHOLD = 64;
+const V3_PACK_MAX_FILES = 1000;
 
 export interface EncryptedV3VaultFile {
   path: string;
@@ -81,6 +83,19 @@ async function timed<T>(phases: Array<[string, number]>, name: string, fn: () =>
   }
 }
 
+async function mapWithConcurrency<T, R>(items: T[], concurrency: number, mapper: (item: T, index: number) => Promise<R>): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+  const workerCount = Math.max(1, Math.min(concurrency, items.length));
+  await Promise.all(Array.from({ length: workerCount }, async () => {
+    while (nextIndex < items.length) {
+      const index = nextIndex++;
+      results[index] = await mapper(items[index], index);
+    }
+  }));
+  return results;
+}
+
 export class EncryptedV3SyncSession {
   constructor(private readonly input: EncryptedV3SyncSessionInput) {}
 
@@ -103,6 +118,7 @@ export class EncryptedV3SyncSession {
     }
 
     const files = await timed(phases, "force.listLocalFiles", () => this.input.vault.listFiles());
+    if (options.operation === "forcePush" && files.length === 0) return this.forcePushEmpty(phases);
     if (options.operation === "forcePush" && files.length >= V3_PACK_FORCE_PUSH_FILE_THRESHOLD) {
       return this.forcePushPacked(files, phases);
     }
@@ -118,12 +134,7 @@ export class EncryptedV3SyncSession {
     context: { operation?: "localChange" | "forcePush"; phases?: Array<[string, number]>; mode?: EncryptedV3SyncResult["mode"] } = {},
   ): Promise<EncryptedV3SyncResult> {
     const phases = context.phases ?? [];
-    if ((context.operation ?? "localChange") !== "forcePush" && this.input.index.remoteCommitSha) {
-      const ref = await timed(phases, "preflight.remoteRef", () => this.input.github.getGitRef());
-      if (ref.sha !== this.input.index.remoteCommitSha) {
-        throw new Error("Encrypted v3 conflict: remote changed before local changes could be pushed.");
-      }
-    }
+    if ((context.operation ?? "localChange") !== "forcePush") await this.reconcileRemoteBeforeLocalPush(phases);
     const batch = await timed(phases, "queue.collect", async () => coalesceV3Changes(changes));
     const deletes = batch.filter((change): change is Extract<EncryptedV3QueuedChange, { type: "delete" }> => change.type === "delete");
     const renames = batch.filter((change): change is Extract<EncryptedV3QueuedChange, { type: "rename" }> => change.type === "rename");
@@ -132,7 +143,7 @@ export class EncryptedV3SyncSession {
       return { mode: "noop", operation: context.operation ?? "localChange", changedFiles: 0, changedBytes: 0, phaseSummary: phaseSummary(phases) };
     }
 
-    const files = [];
+    const files: Array<{ path: string; mtime: number; bytes: Uint8Array }> = [];
     const remoteFiles: Array<{ path: string; bytes: Uint8Array }> = [];
     const changedBuckets = new Set<string>();
 
@@ -201,7 +212,16 @@ export class EncryptedV3SyncSession {
 
     const changedBytes = files.reduce((sum, file) => sum + file.bytes.byteLength, 0);
 
-    for (const file of files) {
+    let resultMode = context.mode ?? "loose-delta";
+    let looseFiles = files;
+    if (context.operation !== "forcePush" && files.length >= V3_PACK_LOCAL_BATCH_FILE_THRESHOLD) {
+      const packed = await timed(phases, "push.planPacks", () => this.preparePackedLocalFiles(files, changedBuckets));
+      remoteFiles.push(...packed.remoteFiles);
+      looseFiles = packed.looseFiles;
+      if (packed.remoteFiles.length > 0) resultMode = "base-pack";
+    }
+
+    for (const file of looseFiles) {
       const pathId = await timed(phases, "path.id", () => createV3PathId(this.input.keyMaterial, file.path));
       const bucket = bucketForV3PathId(pathId);
       changedBuckets.add(bucket);
@@ -284,7 +304,7 @@ export class EncryptedV3SyncSession {
     }
 
     return {
-      mode: context.mode ?? "loose-delta",
+      mode: resultMode,
       operation: context.operation ?? "localChange",
       changedFiles: batch.length,
       changedBytes,
@@ -295,6 +315,26 @@ export class EncryptedV3SyncSession {
 
   private hasDirtyLocalRecords(): boolean {
     return Object.values(this.input.index.shards).some(shard => Object.values(shard.records).some(record => record.dirty));
+  }
+
+  private async reconcileRemoteBeforeLocalPush(phases: Array<[string, number]>): Promise<void> {
+    const expectedSha = this.input.index.remoteCommitSha;
+    if (!expectedSha) return;
+    const conflictError = new Error("Encrypted v3 conflict: remote changed before local changes could be pushed.");
+    const delays = [0, 250, 500, 1000, 2000];
+    for (const delay of delays) {
+      if (delay > 0) await new Promise(resolve => setTimeout(resolve, delay));
+      const ref = await timed(phases, "preflight.remoteRef", () => this.input.github.getGitRef());
+      if (ref.sha === expectedSha) return;
+      try {
+        await timed(phases, "preflight.mergeRemoteBeforePush", () => this.forcePull(ref.sha, phases, "normal", false));
+        return;
+      } catch {
+        // GitHub can briefly expose an older branch ref while contents/blob reads
+        // are not coherent yet. Retry before surfacing a real conflict.
+      }
+    }
+    throw conflictError;
   }
 
   private async forcePull(
@@ -318,9 +358,13 @@ export class EncryptedV3SyncSession {
     this.input.index.shardHashes = { ...head.shardHashes };
     this.input.index.shards = {};
 
-    for (const bucket of Object.keys(head.shardHashes)) {
-      const shardFile = await timed(phases, "pull.shard", () => this.readRemoteFile(`.obsidian-github-sync-v3/shards/${bucket}.enc`));
+    const remoteShards = await timed(phases, "pull.changedShards", () => mapWithConcurrency(Object.keys(head.shardHashes), 8, async (bucket) => {
+      const shardFile = await this.readRemoteFile(`.obsidian-github-sync-v3/shards/${bucket}.enc`);
       const shard = JSON.parse(bytesToUtf8(await decryptV3BinaryPayload(this.input.keyMaterial, shardFile, `${this.input.index.repoId}:${bucket}:shard`))) as EncryptedV3Shard;
+      return { bucket, shard };
+    }));
+
+    for (const { bucket, shard } of remoteShards) {
       const localShard = { hash: head.shardHashes[bucket], records: {} as V3LocalIndex["shards"][string]["records"] };
       for (const record of Object.values(shard.records)) {
         const path = await this.decryptRecordPath(record);
@@ -433,13 +477,21 @@ export class EncryptedV3SyncSession {
   }
 
   private readonly packCache = new Map<string, Map<string, Uint8Array>>();
+  private readonly packPromises = new Map<string, Promise<Map<string, Uint8Array>>>();
 
   private async readPackedRecord(record: EncryptedV3ShardRecord, path: string, phases: Array<[string, number]>): Promise<Uint8Array> {
     let pack = this.packCache.get(record.objectPath);
     if (!pack) {
-      const packBytes = await timed(phases, "pull.pack", () => this.readRemoteFile(record.objectPath));
-      const files = await decryptV3BasePack({ keyMaterial: this.input.keyMaterial, repoId: this.input.index.repoId, packPath: record.objectPath, bytes: packBytes });
-      pack = new Map(files.map(file => [normalizeV3VaultPath(file.path), file.bytes]));
+      let promise = this.packPromises.get(record.objectPath);
+      if (!promise) {
+        promise = (async () => {
+          const packBytes = await timed(phases, "pull.pack", () => this.readRemoteFile(record.objectPath));
+          const files = await decryptV3BasePack({ keyMaterial: this.input.keyMaterial, repoId: this.input.index.repoId, packPath: record.objectPath, bytes: packBytes });
+          return new Map(files.map(file => [normalizeV3VaultPath(file.path), file.bytes]));
+        })();
+        this.packPromises.set(record.objectPath, promise);
+      }
+      pack = await promise;
       this.packCache.set(record.objectPath, pack);
     }
     const bytes = pack.get(path);
@@ -472,6 +524,70 @@ export class EncryptedV3SyncSession {
       offset += chunk.byteLength;
     }
     return merged;
+  }
+
+  private async preparePackedLocalFiles(
+    files: Array<{ path: string; mtime: number; bytes: Uint8Array }>,
+    changedBuckets: Set<string>,
+  ): Promise<{ remoteFiles: Array<{ path: string; bytes: Uint8Array }>; looseFiles: Array<{ path: string; mtime: number; bytes: Uint8Array }> }> {
+    const maxPackBytes = this.input.looseObjectMaxBytes ?? ENCRYPTED_V3_LOOSE_OBJECT_MAX_BYTES;
+    const remoteFiles: Array<{ path: string; bytes: Uint8Array }> = [];
+    const looseFiles: Array<{ path: string; mtime: number; bytes: Uint8Array }> = [];
+    const groups: Array<Array<{ path: string; mtime: number; bytes: Uint8Array }>> = [];
+    let current: Array<{ path: string; mtime: number; bytes: Uint8Array }> = [];
+    let currentBytes = 0;
+
+    for (const file of files) {
+      if (file.bytes.byteLength > maxPackBytes) {
+        looseFiles.push(file);
+        continue;
+      }
+      if (current.length > 0 && (currentBytes + file.bytes.byteLength > maxPackBytes || current.length >= V3_PACK_MAX_FILES)) {
+        groups.push(current);
+        current = [];
+        currentBytes = 0;
+      }
+      current.push(file);
+      currentBytes += file.bytes.byteLength;
+    }
+    if (current.length > 0) groups.push(current);
+
+    for (const [groupIndex, group] of groups.entries()) {
+      const packId = `${this.input.index.deviceId}-${Date.now()}-${this.input.index.generation + 1}-${groupIndex}-${group.length}`;
+      const packPath = `.obsidian-github-sync-v3/packs/base/${packId}.pack.enc`;
+      const packFiles: PackArchiveFileInput[] = [];
+      for (const file of group) {
+        const pathId = await createV3PathId(this.input.keyMaterial, file.path);
+        const bucket = bucketForV3PathId(pathId);
+        const plaintextSha256 = await sha256Hex(file.bytes);
+        const generation = this.input.index.generation + 1;
+        const shard = this.input.index.shards[bucket] ?? { hash: "", records: {} };
+        const existing = shard.records[pathId];
+        shard.records[pathId] = {
+          path: file.path,
+          pathId,
+          fileId: existing?.fileId ?? pathId,
+          plaintextSha256,
+          size: file.bytes.byteLength,
+          mtime: file.mtime,
+          remoteVersion: `${generation}:${plaintextSha256}`,
+          encryptedPath: await encryptV3Path({ keyMaterial: this.input.keyMaterial, repoId: this.input.index.repoId, pathId, path: file.path }),
+          objectPath: packPath,
+          storage: "base-pack",
+        };
+        this.input.index.shards[bucket] = shard;
+        changedBuckets.add(bucket);
+        packFiles.push({ path: file.path, mtime: file.mtime, bytes: file.bytes, plaintextSha256 });
+      }
+      remoteFiles.push(await encryptV3BasePack({
+        keyMaterial: this.input.keyMaterial,
+        repoId: this.input.index.repoId,
+        packId,
+        files: packFiles,
+      }));
+    }
+
+    return { remoteFiles, looseFiles };
   }
 
   private async readRemoteFile(path: string): Promise<Uint8Array> {
@@ -562,6 +678,35 @@ export class EncryptedV3SyncSession {
     this.input.index.remoteCommitSha = commit.commitSha;
     for (const bucket of changedBuckets) await timed(phases, "localIndex.save", () => saveV3LocalIndexShard(this.input.adapter, this.input.indexRoot, this.input.index, bucket));
     return { mode: "force-push", operation: "forcePush", changedFiles: files.length, changedBytes, commitSha: commit.commitSha, phaseSummary: phaseSummary(phases) };
+  }
+
+  private async forcePushEmpty(phases: Array<[string, number]>): Promise<EncryptedV3SyncResult> {
+    this.input.index.generation += 1;
+    this.input.index.shardHashes = {};
+    this.input.index.shards = {};
+    const head: EncryptedV3RemoteHead = {
+      formatVersion: 3,
+      epoch: this.input.index.epoch,
+      generation: this.input.index.generation,
+      headId: `${this.input.index.deviceId}:${this.input.index.generation}`,
+      shardHashes: {},
+      deviceId: this.input.index.deviceId,
+      updatedAt: Date.now(),
+    };
+    const headBytes = await timed(phases, "push.encryptHead", () => encryptV3BinaryPayload(this.input.keyMaterial, encodeJson(head), {
+      aad: `${this.input.index.repoId}:head`,
+      kind: "head",
+    }));
+    const remoteFiles = [{ path: ENCRYPTED_V3_HEAD_PATH, bytes: headBytes }];
+    const deletions = await timed(phases, "forcePush.planRemotePrune", () => this.planForcePushRemotePrune(remoteFiles));
+    const commit = await timed(phases, "git.atomicCommit", () => commitGitTreeChanges(this.input.github, {
+      message: "sync: encrypted v3 forcePush empty",
+      files: remoteFiles,
+      deletions,
+    }));
+    this.input.index.remoteCommitSha = commit.commitSha;
+    await timed(phases, "localIndex.save", () => saveV3LocalIndexHeader(this.input.adapter, this.input.indexRoot, this.input.index));
+    return { mode: "force-push", operation: "forcePush", changedFiles: 0, changedBytes: 0, commitSha: commit.commitSha, phaseSummary: phaseSummary(phases) };
   }
 
   private async prepareChangedShardWrites(changedBuckets: Set<string>): Promise<PreparedShardWrite[]> {

@@ -8,11 +8,19 @@ import { deriveEncryptedV3Keyring } from "./keyring";
 import { createEmptyV3LocalIndex, loadV3LocalIndex, type V3LocalIndex, type V3LocalIndexAdapter } from "./local-index";
 import { EncryptedV3SyncSession, type EncryptedV3Vault } from "./sync-session";
 import { normalizeV3VaultPath } from "./paths";
-import type { EncryptedV3QueuedChange } from "./change-batcher";
+import { EncryptedV3ChangeBatcher, type EncryptedV3QueuedChange } from "./change-batcher";
 import { effectiveConflictPolicy } from "../encrypted/settings-policy";
 
 const V3_INDEX_ROOT = "encrypted-v3-index";
+const V3_WATCH_FLUSH_DELAY_MS = 350;
 const fallbackIndexStores = new WeakMap<object, Map<string, string>>();
+const pendingChangeBatches = new WeakMap<object, PendingV3ChangeBatch>();
+
+interface PendingV3ChangeBatch {
+  batcher: EncryptedV3ChangeBatcher;
+  timer?: ReturnType<typeof setTimeout>;
+  flushing?: Promise<void>;
+}
 
 function encryptedV3Enabled(plugin: FastSync): boolean {
   if ((plugin as FastSync & { isTesting?: boolean }).isTesting
@@ -157,11 +165,66 @@ async function runV3(plugin: FastSync, label: string, operation: () => Promise<{
   }
 }
 
+function getPendingBatch(plugin: FastSync): PendingV3ChangeBatch {
+  let state = pendingChangeBatches.get(plugin as object);
+  if (!state) {
+    state = { batcher: new EncryptedV3ChangeBatcher() };
+    pendingChangeBatches.set(plugin as object, state);
+  }
+  return state;
+}
+
+function schedulePendingFlush(plugin: FastSync): void {
+  const state = getPendingBatch(plugin);
+  if (state.timer) clearTimeout(state.timer);
+  state.timer = setTimeout(() => {
+    state.timer = undefined;
+    void flushEncryptedV3PendingChanges(plugin);
+  }, V3_WATCH_FLUSH_DELAY_MS);
+}
+
+function enqueuePendingChange(plugin: FastSync, change: EncryptedV3QueuedChange): void {
+  const state = getPendingBatch(plugin);
+  state.batcher.enqueue(change);
+  if (plugin.syncProgress) {
+    plugin.syncProgress = {
+      ...plugin.syncProgress,
+      status: "pending",
+      totalPush: state.batcher.size,
+      pushCount: 0,
+    };
+  }
+  if (typeof plugin.updateStatusBar === "function") plugin.updateStatusBar();
+  schedulePendingFlush(plugin);
+}
+
+export async function flushEncryptedV3PendingChanges(plugin: FastSync): Promise<void> {
+  const state = getPendingBatch(plugin);
+  if (state.timer) {
+    clearTimeout(state.timer);
+    state.timer = undefined;
+  }
+  if (state.flushing) {
+    await state.flushing;
+    if (state.batcher.size === 0) return;
+  }
+  const changes = state.batcher.flush();
+  if (changes.length === 0) return;
+  state.flushing = runV3(plugin, "local batch", async () => (await createSession(plugin)).flushLocalChanges(changes))
+    .finally(() => {
+      state.flushing = undefined;
+      if (state.batcher.size > 0) schedulePendingFlush(plugin);
+    });
+  await state.flushing;
+}
+
 export async function encryptedV3FullSync(plugin: FastSync): Promise<void> {
+  await flushEncryptedV3PendingChanges(plugin);
   await runV3(plugin, "sync", async () => (await createSession(plugin)).sync({ operation: "normal" }));
 }
 
 export async function encryptedV3ForcePush(plugin: FastSync): Promise<void> {
+  await flushEncryptedV3PendingChanges(plugin);
   await runV3(plugin, "force push", async () => (await createSession(plugin)).sync({ operation: "forcePush" }));
 }
 
@@ -173,12 +236,20 @@ export async function encryptedV3Modify(file: TAbstractFile, plugin: FastSync, e
   if (!(file instanceof TFile)) return;
   if (!plugin.isWatchEnabled && eventEnter) return;
   if (!shouldSyncEncryptedFile(file, compileIgnorePathRegex(plugin.settings.ignorePathRegex ?? ""))) return;
+  if (eventEnter) {
+    enqueuePendingChange(plugin, { type: "modify", path: file.path, mtime: file.stat.mtime });
+    return;
+  }
   await runV3(plugin, "local change", async () => (await createSession(plugin)).flushLocalChanges([{ type: "modify", path: file.path, mtime: file.stat.mtime }]));
 }
 
 export async function encryptedV3Delete(fileOrPath: string | TAbstractFile, plugin: FastSync, eventEnter = false): Promise<void> {
   if (!plugin.isWatchEnabled && eventEnter) return;
   const path = typeof fileOrPath === "string" ? fileOrPath : fileOrPath.path;
+  if (eventEnter) {
+    enqueuePendingChange(plugin, { type: "delete", path, mtime: Date.now() });
+    return;
+  }
   await runV3(plugin, "local delete", async () => (await createSession(plugin)).flushLocalChanges([{ type: "delete", path, mtime: Date.now() }]));
 }
 
@@ -187,5 +258,9 @@ export async function encryptedV3Rename(newFileOrPath: string | TAbstractFile, o
   const path = typeof newFileOrPath === "string" ? newFileOrPath : newFileOrPath.path;
   const oldPath = typeof oldFileOrPath === "string" ? oldFileOrPath : oldFileOrPath.path;
   const change: EncryptedV3QueuedChange = { type: "rename", oldPath, path, mtime: Date.now() };
+  if (eventEnter) {
+    enqueuePendingChange(plugin, change);
+    return;
+  }
   await runV3(plugin, "local rename", async () => (await createSession(plugin)).flushLocalChanges([change]));
 }

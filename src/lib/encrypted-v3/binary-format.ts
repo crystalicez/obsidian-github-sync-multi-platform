@@ -56,12 +56,16 @@ export async function decryptV3BinaryPayload(keyMaterial: Uint8Array, payload: U
   const kind = new TextDecoder().decode(payload.slice(kindStart, ciphertextStart));
   const ciphertext = payload.slice(ciphertextStart);
   const key = await importAesKey(keyMaterial);
-  const plaintext = await crypto.subtle.decrypt(
-    { name: "AES-GCM", iv: nonce as any, additionalData: aadBytes(kind, aad) as any },
-    key,
-    ciphertext as any,
-  );
-  return new Uint8Array(plaintext);
+  try {
+    const plaintext = await crypto.subtle.decrypt(
+      { name: "AES-GCM", iv: nonce as any, additionalData: aadBytes(kind, aad) as any },
+      key,
+      ciphertext as any,
+    );
+    return new Uint8Array(plaintext);
+  } catch (error) {
+    throw new Error("Encrypted v3 payload could not be decrypted. The passphrase is wrong or the remote data is corrupt.", { cause: error });
+  }
 }
 
 export async function v3PayloadSha256(payload: Uint8Array): Promise<string> {
