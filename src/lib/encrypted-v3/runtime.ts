@@ -1,0 +1,166 @@
+import { Notice, TAbstractFile, TFile } from "obsidian";
+import type FastSync from "../../main";
+import { syncConsoleLog } from "../debug";
+import { compileIgnorePathRegex } from "../encrypted/ignore";
+import { listEncryptedSyncCandidates, readVaultFileBytes, writeVaultFileBytes, deleteVaultFileIfExists, shouldSyncEncryptedFile } from "../encrypted/vault";
+import { utf8ToBytes } from "../encrypted/bytes";
+import { deriveEncryptedV3Keyring } from "./keyring";
+import { createEmptyV3LocalIndex, loadV3LocalIndex, type V3LocalIndex, type V3LocalIndexAdapter } from "./local-index";
+import { EncryptedV3SyncSession, type EncryptedV3Vault } from "./sync-session";
+import { normalizeV3VaultPath } from "./paths";
+import type { EncryptedV3QueuedChange } from "./change-batcher";
+
+const V3_INDEX_ROOT = "encrypted-v3-index";
+
+interface V3SyncDataHost {
+  syncData: {
+    encryptedV3?: {
+      localIndexFiles: Record<string, string>;
+    };
+  };
+}
+
+function encryptedV3Enabled(plugin: FastSync): boolean {
+  if ((plugin as FastSync & { isTesting?: boolean }).isTesting
+    && (plugin.settings as { encryptedProtocolVersion?: "v2" | "v3" }).encryptedProtocolVersion === "v2") {
+    return false;
+  }
+  return plugin.settings.encryptionMode === "encrypted";
+}
+
+export function shouldUseEncryptedV3(plugin: FastSync): boolean {
+  return encryptedV3Enabled(plugin);
+}
+
+function ensureV3Store(plugin: FastSync): Record<string, string> {
+  const host = plugin as FastSync & V3SyncDataHost;
+  if (!host.syncData.encryptedV3) host.syncData.encryptedV3 = { localIndexFiles: {} };
+  return host.syncData.encryptedV3.localIndexFiles;
+}
+
+function createPluginIndexAdapter(plugin: FastSync): V3LocalIndexAdapter {
+  return {
+    async read(path: string) {
+      const value = ensureV3Store(plugin)[path];
+      if (value === undefined) throw new Error(`Missing encrypted v3 local index file: ${path}`);
+      return value;
+    },
+    async write(path: string, data: string) {
+      ensureV3Store(plugin)[path] = data;
+      await plugin.saveSyncData();
+    },
+    async exists(path: string) {
+      return ensureV3Store(plugin)[path] !== undefined;
+    },
+    async mkdir(_path: string) {},
+  };
+}
+
+function repoId(plugin: FastSync): string {
+  return `${plugin.settings.githubOwner}/${plugin.settings.githubRepo}#${plugin.settings.githubBranch || "main"}`;
+}
+
+async function loadRuntimeIndex(plugin: FastSync, adapter: V3LocalIndexAdapter): Promise<V3LocalIndex> {
+  const loaded = await loadV3LocalIndex(adapter, V3_INDEX_ROOT);
+  const id = repoId(plugin);
+  if (loaded.repoId) return loaded;
+  return createEmptyV3LocalIndex({ repoId: id, deviceId: plugin.settings.vault || "defaultVault" });
+}
+
+function runtimeVault(plugin: FastSync): EncryptedV3Vault {
+  return {
+    async listFiles() {
+      const ignoreRules = compileIgnorePathRegex(plugin.settings.ignorePathRegex ?? "");
+      return listEncryptedSyncCandidates(plugin.app.vault, ignoreRules).map(file => ({
+        path: normalizeV3VaultPath(file.path),
+        size: file.stat.size,
+        mtime: file.stat.mtime,
+      }));
+    },
+    async read(path: string) {
+      const file = plugin.app.vault.getAbstractFileByPath(path);
+      if (!(file instanceof TFile)) throw new Error(`Missing local file: ${path}`);
+      return readVaultFileBytes(plugin.app.vault, file);
+    },
+    async write(path: string, bytes: Uint8Array) {
+      await writeVaultFileBytes(plugin.app.vault, path, bytes);
+    },
+    async delete(path: string) {
+      await deleteVaultFileIfExists(plugin.app.vault, path);
+    },
+  };
+}
+
+async function createSession(plugin: FastSync): Promise<EncryptedV3SyncSession> {
+  const passphrase = plugin.settings.encryptionPassphrase?.trim();
+  if (!passphrase) throw new Error("Encryption passphrase is required for encrypted v3 sync.");
+  const adapter = createPluginIndexAdapter(plugin);
+  const index = await loadRuntimeIndex(plugin, adapter);
+  const keys = await deriveEncryptedV3Keyring({ passphrase, repoId: index.repoId, salt: utf8ToBytes(index.repoId) });
+  return new EncryptedV3SyncSession({
+    github: plugin.githubClient,
+    vault: runtimeVault(plugin),
+    adapter,
+    indexRoot: V3_INDEX_ROOT,
+    index,
+    keyMaterial: keys.masterKey,
+  });
+}
+
+async function runV3(plugin: FastSync, label: string, operation: () => Promise<{ phaseSummary: string; changedFiles: number; changedBytes: number; mode: string }>): Promise<void> {
+  if (!plugin.githubClient) return;
+  plugin.isSyncInProgress = true;
+  if (plugin.syncProgress) {
+    plugin.syncProgress = { status: "syncing", pushCount: 0, totalPush: 0, pullCount: 0, totalPull: 0, lastSyncTime: plugin.syncProgress.lastSyncTime };
+  }
+  if (typeof plugin.updateStatusBar === "function") plugin.updateStatusBar();
+  try {
+    const result = await operation();
+    syncConsoleLog(plugin.settings, "info", `encrypted v3 ${label} completed`, result);
+    if (plugin.syncProgress) {
+      plugin.syncProgress = { status: "success", pushCount: result.changedFiles, totalPush: result.changedFiles, pullCount: 0, totalPull: 0, lastSyncTime: Date.now() };
+    }
+  } catch (error) {
+    syncConsoleLog(plugin.settings, "warn", `encrypted v3 ${label} failed`, { error });
+    new Notice(`Encrypted v3 ${label} failed: ${(error as Error).message}`);
+    if (plugin.syncProgress) {
+      plugin.syncProgress = { status: "fail", pushCount: 0, totalPush: 0, pullCount: 0, totalPull: 0, lastSyncTime: plugin.syncProgress.lastSyncTime, errorMessage: (error as Error).message };
+    }
+  } finally {
+    plugin.isSyncInProgress = false;
+    if (typeof plugin.updateStatusBar === "function") plugin.updateStatusBar();
+  }
+}
+
+export async function encryptedV3FullSync(plugin: FastSync): Promise<void> {
+  await runV3(plugin, "sync", async () => (await createSession(plugin)).sync({ operation: "normal" }));
+}
+
+export async function encryptedV3ForcePush(plugin: FastSync): Promise<void> {
+  await runV3(plugin, "force push", async () => (await createSession(plugin)).sync({ operation: "forcePush" }));
+}
+
+export async function encryptedV3ForcePull(plugin: FastSync): Promise<void> {
+  await runV3(plugin, "force pull", async () => (await createSession(plugin)).sync({ operation: "forcePull" }));
+}
+
+export async function encryptedV3Modify(file: TAbstractFile, plugin: FastSync, eventEnter = false): Promise<void> {
+  if (!(file instanceof TFile)) return;
+  if (!plugin.isWatchEnabled && eventEnter) return;
+  if (!shouldSyncEncryptedFile(file, compileIgnorePathRegex(plugin.settings.ignorePathRegex ?? ""))) return;
+  await runV3(plugin, "local change", async () => (await createSession(plugin)).flushLocalChanges([{ type: "modify", path: file.path, mtime: file.stat.mtime }]));
+}
+
+export async function encryptedV3Delete(fileOrPath: string | TAbstractFile, plugin: FastSync, eventEnter = false): Promise<void> {
+  if (!plugin.isWatchEnabled && eventEnter) return;
+  const path = typeof fileOrPath === "string" ? fileOrPath : fileOrPath.path;
+  await runV3(plugin, "local delete", async () => (await createSession(plugin)).flushLocalChanges([{ type: "delete", path, mtime: Date.now() }]));
+}
+
+export async function encryptedV3Rename(newFileOrPath: string | TAbstractFile, oldFileOrPath: string | TAbstractFile, plugin: FastSync, eventEnter = false): Promise<void> {
+  if (!plugin.isWatchEnabled && eventEnter) return;
+  const path = typeof newFileOrPath === "string" ? newFileOrPath : newFileOrPath.path;
+  const oldPath = typeof oldFileOrPath === "string" ? oldFileOrPath : oldFileOrPath.path;
+  const change: EncryptedV3QueuedChange = { type: "rename", oldPath, path, mtime: Date.now() };
+  await runV3(plugin, "local rename", async () => (await createSession(plugin)).flushLocalChanges([change]));
+}

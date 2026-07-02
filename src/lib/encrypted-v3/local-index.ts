@@ -6,6 +6,10 @@ export interface V3IndexFileRecord {
   size: number;
   mtime: number;
   remoteVersion: string;
+  encryptedPath?: string;
+  objectPath?: string;
+  chunkPaths?: string[];
+  storage?: "loose" | "chunked" | "base-pack" | "delta-pack";
   dirty?: boolean;
   deleted?: boolean;
 }

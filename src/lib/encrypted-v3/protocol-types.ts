@@ -20,6 +20,7 @@ export interface EncryptedV3ShardRecord {
   mtime: number;
   storage: "loose" | "chunked" | "base-pack" | "delta-pack";
   objectPath: string;
+  chunkPaths?: string[];
   version: string;
   updatedBy: string;
   updatedAt: number;

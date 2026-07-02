@@ -42,6 +42,7 @@ const testFiles = [
   "tests/encrypted-v3/protocol-core.test.ts",
   "tests/encrypted-v3/sync-session.test.ts",
   "tests/encrypted-v3/store-modules.test.ts",
+  "tests/encrypted-v3/runtime.test.ts",
 ];
 
 const contents = await Promise.all(testFiles.map(file => readFile(path.join(root, file), "utf8")));
@@ -61,8 +62,10 @@ const requiredV3Modules = [
   "keyring",
   "local-index",
   "object-store",
+  "pack-store",
   "paths",
   "protocol-types",
+  "runtime",
   "shard-store",
   "sync-session",
 ];

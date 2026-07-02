@@ -32,6 +32,9 @@ export interface SyncData {
     files: { [path: string]: EncryptedLocalFileState };
     manifestSha?: string;
   };
+  encryptedV3?: {
+    localIndexFiles: Record<string, string>;
+  };
 }
 
 export default class FastSync extends Plugin {

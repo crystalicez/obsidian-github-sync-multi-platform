@@ -4,6 +4,7 @@ import test from "node:test";
 import { decryptV3BinaryPayload } from "../../src/lib/encrypted-v3/binary-format";
 import { createEmptyV3LocalIndex } from "../../src/lib/encrypted-v3/local-index";
 import { encryptedV3ObjectPath, encryptV3LooseObject } from "../../src/lib/encrypted-v3/object-store";
+import { decryptV3BasePack, encryptV3BasePack } from "../../src/lib/encrypted-v3/pack-store";
 import { ENCRYPTED_V3_HEAD_PATH, ENCRYPTED_V3_ROOT } from "../../src/lib/encrypted-v3/protocol-types";
 import { encryptV3LocalShard, encryptV3Path } from "../../src/lib/encrypted-v3/shard-store";
 
@@ -24,6 +25,24 @@ test("v3 object store encrypts loose objects under opaque non-plaintext paths", 
 test("v3 protocol constants use the dedicated v3 root", () => {
   assert.equal(ENCRYPTED_V3_ROOT, ".obsidian-github-sync-v3");
   assert.equal(ENCRYPTED_V3_HEAD_PATH, ".obsidian-github-sync-v3/head.enc");
+});
+
+test("v3 pack store encrypts many files into one opaque pack", async () => {
+  const keyMaterial = new TextEncoder().encode("key");
+  const pack = await encryptV3BasePack({
+    keyMaterial,
+    repoId: "repo",
+    packId: "pack-1",
+    files: [
+      { path: "Secret/a.md", mtime: 1, size: 1, bytes: new TextEncoder().encode("a") },
+      { path: "Secret/b.md", mtime: 2, size: 1, bytes: new TextEncoder().encode("b") },
+    ],
+  });
+  const files = await decryptV3BasePack({ keyMaterial, repoId: "repo", packPath: pack.path, bytes: pack.bytes });
+
+  assert.equal(pack.path, ".obsidian-github-sync-v3/packs/base/pack-1.pack.enc");
+  assert.equal(new TextDecoder().decode(pack.bytes).includes("Secret"), false);
+  assert.deepEqual(files.map(file => file.path), ["Secret/a.md", "Secret/b.md"]);
 });
 
 test("v3 shard store encrypts records without plaintext paths in remote bytes", async () => {

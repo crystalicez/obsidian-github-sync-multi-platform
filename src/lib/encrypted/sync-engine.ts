@@ -19,6 +19,7 @@ import { deleteVaultFileIfExists, listEncryptedSyncCandidates, readVaultFileByte
 import { randomBytes, sha256Hex, toBase64Url } from "./bytes";
 import { syncConsoleLog } from "../debug";
 import { encryptBytes } from "./crypto";
+import { encryptedV3Delete, encryptedV3ForcePull, encryptedV3ForcePush, encryptedV3FullSync, encryptedV3Modify, encryptedV3Rename, shouldUseEncryptedV3 } from "../encrypted-v3/runtime";
 
 const syncQueues = new WeakMap<FastSync, Promise<any>>();
 const ENCRYPTED_LOOSE_DELTA_MAX_FILES = 32;
@@ -401,18 +402,22 @@ async function resolveRemoteChangedBeforeLocalMutation(
 }
 
 export async function encryptedFullSync(plugin: FastSync): Promise<void> {
+  if (shouldUseEncryptedV3(plugin)) return encryptedV3FullSync(plugin);
   return encryptedSync(plugin, { operation: "normal" });
 }
 
 export async function encryptedManualSync(plugin: FastSync): Promise<void> {
+  if (shouldUseEncryptedV3(plugin)) return encryptedV3FullSync(plugin);
   return encryptedSync(plugin, { operation: "manual" });
 }
 
 export async function encryptedForcePush(plugin: FastSync): Promise<void> {
+  if (shouldUseEncryptedV3(plugin)) return encryptedV3ForcePush(plugin);
   return encryptedSync(plugin, { operation: "forcePush" });
 }
 
 export async function encryptedForcePull(plugin: FastSync): Promise<void> {
+  if (shouldUseEncryptedV3(plugin)) return encryptedV3ForcePull(plugin);
   return encryptedSync(plugin, { operation: "forcePull" });
 }
 
@@ -801,6 +806,7 @@ async function encryptedModifyImpl(file: TAbstractFile, plugin: FastSync, eventE
 }
 
 export async function encryptedModify(file: TAbstractFile, plugin: FastSync, eventEnter = false): Promise<void> {
+  if (shouldUseEncryptedV3(plugin)) return encryptedV3Modify(file, plugin, eventEnter);
   return enqueue(plugin, () => encryptedModifyImpl(file, plugin, eventEnter));
 }
 
@@ -880,6 +886,7 @@ async function encryptedDeleteImpl(fileOrPath: string | TAbstractFile, plugin: F
 }
 
 export async function encryptedDelete(fileOrPath: string | TAbstractFile, plugin: FastSync, eventEnter = false): Promise<void> {
+  if (shouldUseEncryptedV3(plugin)) return encryptedV3Delete(fileOrPath, plugin, eventEnter);
   return enqueue(plugin, () => encryptedDeleteImpl(fileOrPath, plugin, eventEnter));
 }
 
@@ -979,6 +986,7 @@ async function encryptedRenameImpl(newFileOrPath: string | TAbstractFile, oldFil
 }
 
 export async function encryptedRename(newFileOrPath: string | TAbstractFile, oldFileOrPath: string | TAbstractFile, plugin: FastSync, eventEnter = false): Promise<void> {
+  if (shouldUseEncryptedV3(plugin)) return encryptedV3Rename(newFileOrPath, oldFileOrPath, plugin, eventEnter);
   return enqueue(plugin, () => encryptedRenameImpl(newFileOrPath, oldFileOrPath, plugin, eventEnter));
 }
 

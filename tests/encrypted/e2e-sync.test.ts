@@ -263,6 +263,7 @@ function plugin(vault: MemoryVault, github: MemoryGitHub) {
     githubClient: github as unknown as GitHubClient,
     settings: {
       encryptionMode: "encrypted",
+      encryptedProtocolVersion: "v2",
       syncEnabled: true,
       syncOnLocalChange: true,
       encryptionPassphrase: "correct horse battery staple",

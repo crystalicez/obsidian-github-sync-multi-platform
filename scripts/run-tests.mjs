@@ -20,6 +20,7 @@ const tsEntries = [
   "tests/encrypted-v3/protocol-core.test.ts",
   "tests/encrypted-v3/sync-session.test.ts",
   "tests/encrypted-v3/store-modules.test.ts",
+  "tests/encrypted-v3/runtime.test.ts",
   "tests/github-e2e/random-actions.test.ts",
   "tests/v3/git-atomic-writer.test.ts",
   "tests/v3/remote-cache.test.ts",
