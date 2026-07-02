@@ -39,6 +39,9 @@ const testFiles = [
   "tests/encrypted/snapshot-merge.test.ts",
   "tests/encrypted/change-queue.test.ts",
   "tests/encrypted/sync-planner.test.ts",
+  "tests/encrypted-v3/protocol-core.test.ts",
+  "tests/encrypted-v3/sync-session.test.ts",
+  "tests/encrypted-v3/store-modules.test.ts",
 ];
 
 const contents = await Promise.all(testFiles.map(file => readFile(path.join(root, file), "utf8")));
@@ -51,3 +54,23 @@ if (missing.length > 0) {
 }
 
 console.log(`Encrypted module coverage gate passed for ${requiredModules.length}/${requiredModules.length} modules.`);
+
+const requiredV3Modules = [
+  "binary-format",
+  "change-batcher",
+  "keyring",
+  "local-index",
+  "object-store",
+  "paths",
+  "protocol-types",
+  "shard-store",
+  "sync-session",
+];
+const missingV3 = requiredV3Modules.filter(moduleName => !joined.includes(`src/lib/encrypted-v3/${moduleName}`) && !joined.includes(`../../src/lib/encrypted-v3/${moduleName}`));
+
+if (missingV3.length > 0) {
+  console.error(`Missing encrypted-v3 module test references: ${missingV3.join(", ")}`);
+  process.exit(1);
+}
+
+console.log(`Encrypted-v3 module coverage gate passed for ${requiredV3Modules.length}/${requiredV3Modules.length} modules.`);
