@@ -5,6 +5,7 @@ import { GitHubClient } from "./lib/github-api";
 import { normalizeScheduledSyncIntervalSeconds, shouldRunScheduledSync, shouldRunStartupSync } from "./lib/sync-policy";
 import { migrateV4Secrets, sanitizeV4SettingsForPersistence, storeV4Secrets } from "./lib/v4/secrets";
 import { V4PluginRuntime } from "./lib/v4/runtime";
+import { formatV4ActiveSyncStatus } from "./lib/v4/status";
 import { V4SyncCenterView, V4_SYNC_CENTER_VIEW } from "./views/sync-center";
 
 
@@ -268,8 +269,9 @@ export default class FastSync extends Plugin {
       title = "GitHub Sync: Waiting for local changes to settle...";
       cls += " is-syncing";
     } else if (this.isSyncInProgress || status === "syncing") {
-      text = `⏳ GH Sync: ↑${pushCount}/${totalPush} ↓${pullCount}/${totalPull}`;
-      title = "GitHub Sync: Syncing in progress...";
+      const active = formatV4ActiveSyncStatus({ pushCount, totalPush, pullCount, totalPull });
+      text = active.text;
+      title = active.title;
       cls += " is-syncing";
     } else if (status === "success") {
       const timeStr = moment(lastSyncTime || Date.now()).format("HH:mm:ss");

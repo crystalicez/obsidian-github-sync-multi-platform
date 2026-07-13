@@ -18,6 +18,7 @@ const tsEntries = [
   "tests/v4/storage-codec.test.ts",
   "tests/v4/remote-index.test.ts",
   "tests/v4/sync-coordinator.test.ts",
+  "tests/v4/status.test.ts",
   "tests/v4/sync-session.test.ts",
   "tests/v4/settings-secrets.test.ts",
   "tests/v4/history-service.test.ts",
