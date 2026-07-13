@@ -1,11 +1,9 @@
-import { App, Modal, PluginSettingTab, Notice, Setting, Platform } from "obsidian";
+import { App, PluginSettingTab, Notice, Setting, Platform } from "obsidian";
 import { KofiImage } from "./lib/icons";
 
 import FastSync from "./main";
 import { dump } from "./lib/helps";
-import { encryptedForcePull, encryptedForcePush, encryptedManualSync } from "./lib/encrypted/sync-engine";
 import { createDebugPayload } from "./lib/debug";
-import { StartupFullNotesSync } from "./lib/fs";
 
 export interface PluginSettings {
   // Whether auto-upload is enabled
@@ -15,15 +13,20 @@ export interface PluginSettings {
   githubRepo: string
   githubBranch: string
   githubToken: string
+  githubTokenSecretId: string
   encryptionMode: "plaintext" | "encrypted"
   encryptionPassphrase: string
+  encryptionPassphraseSecretId: string
   syncOnStartup: boolean
   syncOnLocalChange: boolean
   scheduledSyncEnabled: boolean
   scheduledSyncIntervalSeconds: number
   ignorePathRegex: string
+  syncObsidianConfig: boolean
+  syncBookmarks: boolean
+  syncPlugins: boolean
+  abortChangePercent: number
   conflictPolicy: "copy" | "newer" | "merge" | "ask"
-  encryptedForcePushRequired: boolean
   statusBarStatusEnabled: boolean
   consoleLoggingEnabled: boolean
 
@@ -45,15 +48,20 @@ export const DEFAULT_SETTINGS: PluginSettings = {
   githubRepo: "",
   githubBranch: "main",
   githubToken: "",
+  githubTokenSecretId: "",
   encryptionMode: "plaintext",
   encryptionPassphrase: "",
+  encryptionPassphraseSecretId: "",
   syncOnStartup: true,
   syncOnLocalChange: true,
   scheduledSyncEnabled: false,
   scheduledSyncIntervalSeconds: 300,
   ignorePathRegex: "",
+  syncObsidianConfig: false,
+  syncBookmarks: false,
+  syncPlugins: false,
+  abortChangePercent: 0,
   conflictPolicy: "copy",
-  encryptedForcePushRequired: false,
   lastSyncTime: 0,
   vault: "defaultVault",
   statusBarStatusEnabled: true,
@@ -301,12 +309,9 @@ export class SettingTab extends PluginSettingTab {
 
     new Setting(set)
       .setName("Encrypted sync")
-      .setDesc("Encrypt file contents, filenames, and folder structure before uploading to GitHub")
+      .setDesc("Encrypt file contents and basenames before uploading to GitHub. Folder paths remain readable.")
       .addToggle((toggle) =>
         toggle.setValue(this.tempSettings!.encryptionMode === "encrypted").onChange((value) => {
-          if (value && this.tempSettings!.encryptionMode !== "encrypted") {
-            this.tempSettings!.encryptedForcePushRequired = true
-          }
           this.tempSettings!.encryptionMode = value ? "encrypted" : "plaintext"
           this.display()
         })
@@ -335,10 +340,10 @@ export class SettingTab extends PluginSettingTab {
 
     new Setting(set)
       .setName("Manual sync")
-      .setDesc("Sync encrypted vault with the remote repository now.")
+      .setDesc("Pull remote changes, resolve conflicts, then push only the required local changes.")
       .addButton((button) =>
         button.setButtonText("Sync now").onClick(() => {
-          StartupFullNotesSync(this.plugin)
+          void this.plugin.v4Runtime.manualSync()
         })
       )
 
@@ -372,7 +377,7 @@ export class SettingTab extends PluginSettingTab {
 
     new Setting(set)
       .setName("Sync when Obsidian opens")
-      .setDesc("Run encrypted sync after the workspace is ready.")
+      .setDesc("Run sync after the workspace is ready.")
       .addToggle((toggle) =>
         toggle.setValue(this.tempSettings!.syncOnStartup).onChange((value) => {
           this.tempSettings!.syncOnStartup = value
@@ -392,7 +397,7 @@ export class SettingTab extends PluginSettingTab {
 
     new Setting(set)
       .setName("Scheduled sync")
-      .setDesc("Run encrypted sync repeatedly at the configured interval.")
+      .setDesc("Run sync repeatedly at the configured interval.")
       .addToggle((toggle) =>
         toggle.setValue(this.tempSettings!.scheduledSyncEnabled).onChange((value) => {
           this.tempSettings!.scheduledSyncEnabled = value
@@ -403,7 +408,7 @@ export class SettingTab extends PluginSettingTab {
     if (this.tempSettings!.scheduledSyncEnabled) {
       new Setting(set)
         .setName("Scheduled sync interval")
-        .setDesc("Interval in seconds between scheduled sync attempts.")
+        .setDesc("Interval in seconds between scheduled sync attempts (minimum 30 seconds).")
         .addText((text) =>
           text
             .setPlaceholder("300")
@@ -421,6 +426,52 @@ export class SettingTab extends PluginSettingTab {
       .setName("Regex of path to ignore")
       .setDesc(
         "One regex per line, matched against plaintext vault paths before encryption. Examples: ^Archive/ ignores a folder, (^|/)\\.DS_Store$ ignores .DS_Store, \\.tmp$ ignores .tmp files."
+      )
+
+    new Setting(set)
+      .setName("Sync .obsidian configuration")
+      .setDesc("Sync eligible files in .obsidian. The sync plugin's own directory is always excluded.")
+      .addToggle((toggle) =>
+        toggle.setValue(this.tempSettings!.syncObsidianConfig).onChange((value) => {
+          this.tempSettings!.syncObsidianConfig = value
+          this.updateDirtyState()
+        })
+      )
+
+    new Setting(set)
+      .setName("Sync bookmarks")
+      .setDesc("Sync .obsidian/bookmarks.json independently of the other .obsidian settings.")
+      .addToggle((toggle) =>
+        toggle.setValue(this.tempSettings!.syncBookmarks).onChange((value) => {
+          this.tempSettings!.syncBookmarks = value
+          this.updateDirtyState()
+        })
+      )
+
+    new Setting(set)
+      .setName("Sync installed plugins")
+      .setDesc("Sync other .obsidian/plugins directories. In plaintext mode these files and settings are visible in GitHub.")
+      .addToggle((toggle) =>
+        toggle.setValue(this.tempSettings!.syncPlugins).onChange((value) => {
+          this.tempSettings!.syncPlugins = value
+          this.updateDirtyState()
+        })
+      )
+
+    new Setting(set)
+      .setName("Abort when too many files change")
+      .setDesc("Abort any sync when changed logical files exceed this percentage (1–100). Use 0 to disable.")
+      .addText((text) =>
+        text
+          .setPlaceholder("0")
+          .setValue(String(this.tempSettings!.abortChangePercent))
+          .onChange((value) => {
+            const parsed = Number(value)
+            this.tempSettings!.abortChangePercent = Number.isFinite(parsed)
+              ? Math.max(0, Math.min(100, Math.floor(parsed)))
+              : 0
+            this.updateDirtyState()
+          })
       )
       .addTextArea((text) =>
         text

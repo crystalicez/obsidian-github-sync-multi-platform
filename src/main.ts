@@ -1,13 +1,14 @@
 import { Plugin, setIcon, Modal, Notice, TFile } from "obsidian";
 
-import { NoteModify, NoteDelete, NoteRename, StartupFullNotesForceOverSync, StartupFullNotesSync, overrideLocalAllFilesImpl } from "./lib/fs";
 import { SettingTab, PluginSettings, DEFAULT_SETTINGS } from "./setting";
 import { GitHubClient } from "./lib/github-api";
 import { moment } from "./lang/lang";
 import { calculateWordCount } from "./lib/helps";
-import { encryptedForcePush, encryptedForcePull } from "./lib/encrypted/sync-engine";
 import type { EncryptedLocalFileState } from "./lib/encrypted/types";
 import { normalizeScheduledSyncIntervalSeconds, shouldRunScheduledSync, shouldRunStartupSync } from "./lib/encrypted/settings-policy";
+import { migrateV4Secrets, sanitizeV4SettingsForPersistence, storeV4Secrets } from "./lib/v4/secrets";
+import { V4PluginRuntime } from "./lib/v4/runtime";
+import { V4SyncCenterView, V4_SYNC_CENTER_VIEW } from "./views/sync-center";
 
 
 interface SyncSkipFiles {
@@ -38,6 +39,7 @@ export default class FastSync extends Plugin {
   settingTab: SettingTab
   settings: PluginSettings
   githubClient: GitHubClient
+  v4Runtime: V4PluginRuntime
   syncData: SyncData = { files: {} }
 
   isSyncInProgress: boolean = false
@@ -74,6 +76,7 @@ export default class FastSync extends Plugin {
   isWatchEnabled: boolean = true
   ignoredFiles: Set<string> = new Set()
   scheduledSyncTimer: number | null = null
+  secretsMigrated: boolean = false
 
   enableWatch() {
     this.isWatchEnabled = true
@@ -97,11 +100,14 @@ export default class FastSync extends Plugin {
 
     await this.loadSettings()
     await this.loadSyncData()
+    if (this.secretsMigrated) await this.persistData()
 
     this.settingTab = new SettingTab(this.app, this)
     this.addSettingTab(this.settingTab)
 
     this.initGitHubClient()
+    this.v4Runtime = new V4PluginRuntime(this)
+    this.registerView(V4_SYNC_CENTER_VIEW, leaf => new V4SyncCenterView(leaf, this))
     this.registerScheduledSync()
 
     // Initialize status bar widget
@@ -109,7 +115,7 @@ export default class FastSync extends Plugin {
 
     // Create Ribbon Icons
     this.ribbonIcon = this.addRibbonIcon("loader-circle", "GitHub Sync: Sync", () => {
-      StartupFullNotesSync(this)
+      void this.v4Runtime.manualSync()
     })
 
     this.addRibbonIcon("arrow-up-circle", "GitHub Sync: Force Push", () => {
@@ -120,28 +126,48 @@ export default class FastSync extends Plugin {
       void this.showForceConfirm("forcePull")
     })
 
+    this.addRibbonIcon("history", "GitHub Sync: Open Sync Center", () => {
+      void this.openSyncCenter()
+    })
+
     this.updateRibbonIcon(!!(this.settings.githubToken && this.settings.githubOwner && this.settings.githubRepo))
 
-    // Register file events (only .md and images; other types are filtered inside performSync)
+    // Register every vault file event; the V4 scope policy applies exclusions and .obsidian options.
     // Disable watch on startup to prevent vault indexing from triggering many concurrent API calls
     // that could hit the GitHub rate limit (422)
     this.disableWatch()
-    this.registerEvent(this.app.vault.on("create", (file) => NoteModify(file, this, true)))
-    this.registerEvent(this.app.vault.on("modify", (file) => NoteModify(file, this, true)))
-    this.registerEvent(this.app.vault.on("delete", (file) => NoteDelete(file, this, true)))
-    this.registerEvent(this.app.vault.on("rename", (file, oldfile) => NoteRename(file, oldfile, this, true)))
+    this.registerEvent(this.app.vault.on("create", (file) => {
+      if (file instanceof TFile) this.v4Runtime.enqueueModify(file.path, file.stat.mtime)
+    }))
+    this.registerEvent(this.app.vault.on("modify", (file) => {
+      if (file instanceof TFile) this.v4Runtime.enqueueModify(file.path, file.stat.mtime)
+    }))
+    this.registerEvent(this.app.vault.on("delete", (file) => this.v4Runtime.enqueueDelete(file.path)))
+    this.registerEvent(this.app.vault.on("rename", (file, oldfile) => this.v4Runtime.enqueueRename(oldfile, file.path)))
 
     // Register commands
     this.addCommand({
       id: "init-all-files",
       name: "GitHub Sync: Force Push (Overwrite Remote)",
-      callback: () => StartupFullNotesForceOverSync(this),
+      callback: () => void this.showForceConfirm("forcePush"),
     })
 
     this.addCommand({
       id: "sync-all-files",
       name: "GitHub Sync: Sync",
-      callback: () => StartupFullNotesSync(this),
+      callback: () => void this.v4Runtime.manualSync(),
+    })
+
+    this.addCommand({
+      id: "force-pull-all-files",
+      name: "GitHub Sync: Force Pull (Overwrite Local)",
+      callback: () => void this.showForceConfirm("forcePull"),
+    })
+
+    this.addCommand({
+      id: "open-sync-center",
+      name: "GitHub Sync: Open Sync Center",
+      callback: () => void this.openSyncCenter(),
     })
 
     // After the workspace layout is ready, run the startup sync once, then enable real-time watch
@@ -150,7 +176,7 @@ export default class FastSync extends Plugin {
         // Delay 1.5 s to let Obsidian finish initialising
         setTimeout(() => {
           // syncAllFilesImpl calls enableWatch() internally after it completes
-          StartupFullNotesSync(this);
+          void this.v4Runtime.startupSync();
         }, 1500);
       } else {
         // Not configured – enable watch immediately
@@ -167,7 +193,7 @@ export default class FastSync extends Plugin {
         repo: this.settings.githubRepo,
         branch: this.settings.githubBranch || "main",
       });
-    }
+    } else this.githubClient = undefined as unknown as GitHubClient
   }
 
   onunload() {
@@ -176,6 +202,7 @@ export default class FastSync extends Plugin {
     this.debounceTimers.clear();
     if (this.scheduledSyncTimer) window.clearInterval(this.scheduledSyncTimer);
     this.scheduledSyncTimer = null;
+    this.v4Runtime?.dispose()
   }
 
   registerScheduledSync() {
@@ -184,7 +211,7 @@ export default class FastSync extends Plugin {
     if (!shouldRunScheduledSync(this.settings)) return;
     const seconds = normalizeScheduledSyncIntervalSeconds(this.settings.scheduledSyncIntervalSeconds);
     this.scheduledSyncTimer = window.setInterval(() => {
-      if (!this.isSyncInProgress) StartupFullNotesSync(this);
+      void this.v4Runtime.scheduledSync()
     }, seconds * 1000);
   }
 
@@ -204,23 +231,46 @@ export default class FastSync extends Plugin {
    */
   async persistData() {
     await this.saveData({
-      settings: this.settings,
+      settings: sanitizeV4SettingsForPersistence(this.settings),
       syncData: this.syncData,
     });
+  }
+
+  async openSyncCenter(): Promise<void> {
+    const existing = this.app.workspace.getLeavesOfType(V4_SYNC_CENTER_VIEW)[0]
+    const leaf = existing ?? this.app.workspace.getRightLeaf(false)
+    if (!leaf) {
+      return
+    }
+    if (!existing) await leaf.setViewState({ type: V4_SYNC_CENTER_VIEW, active: true })
+    await this.app.workspace.revealLeaf(leaf)
+  }
+
+  private createSecretId(prefix: string): string {
+    const bytes = new Uint8Array(16)
+    crypto.getRandomValues(bytes)
+    return `${prefix}-${Array.from(bytes, byte => byte.toString(16).padStart(2, "0")).join("")}`
   }
 
   async loadSettings() {
     const data = await this.loadData() ?? {};
     // Backward compatibility: older versions stored settings fields directly at the top level
     const savedSettings = data.settings ?? data;
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, savedSettings);
+    const merged = Object.assign({}, DEFAULT_SETTINGS, savedSettings);
+    const result = migrateV4Secrets(
+      merged,
+      this.app.secretStorage,
+      prefix => this.createSecretId(prefix),
+    )
+    this.settings = result.settings as PluginSettings
+    this.secretsMigrated = result.migrated
   }
 
   async saveSettings() {
+    storeV4Secrets(this.settings, this.app.secretStorage)
     this.initGitHubClient()
     this.registerScheduledSync()
     this.updateRibbonIcon(!!(this.settings.githubToken && this.settings.githubOwner && this.settings.githubRepo))
-    this.registerScheduledSync()
     await this.persistData()
   }
 
@@ -295,7 +345,7 @@ export default class FastSync extends Plugin {
 
     if (status === "pending") {
       text = `⏳ GH Sync (queued ${totalPush})`;
-      title = `GitHub Sync: ${totalPush} local change(s) queued for the next encrypted sync.`;
+      title = `GitHub Sync: ${totalPush} local change(s) queued for the next sync.`;
       cls += " is-syncing";
     } else if (status === "waiting") {
       text = `⏳ GH Sync (waiting...)`;
@@ -324,7 +374,7 @@ export default class FastSync extends Plugin {
     span.title = title;
     span.onclick = () => {
       if (!this.isSyncInProgress) {
-        StartupFullNotesSync(this);
+        void this.v4Runtime.manualSync()
       }
     };
   }
@@ -332,6 +382,13 @@ export default class FastSync extends Plugin {
   async showForceConfirm(operation: "forcePush" | "forcePull"): Promise<void> {
     await new Promise<void>((resolve) => {
       const modal = new Modal(this.app)
+      let settled = false
+      const finish = () => {
+        if (settled) return
+        settled = true
+        resolve()
+      }
+      modal.onClose = finish
       const repo = `${this.settings.githubOwner}/${this.settings.githubRepo}`
       const branch = this.settings.githubBranch || "main"
       const localFileCount = this.app.vault.getFiles().filter(file => !file.path.startsWith(`${this.app.vault.configDir}/`)).length
@@ -359,7 +416,7 @@ export default class FastSync extends Plugin {
       const buttons = modal.contentEl.createDiv()
       buttons.createEl("button", { text: "Cancel" }).onclick = () => {
         modal.close()
-        resolve()
+        finish()
       }
       const confirmButton = buttons.createEl("button", { text: operation === "forcePush" ? "Force push" : "Force pull" })
       confirmButton.addClass("mod-warning")
@@ -385,14 +442,9 @@ export default class FastSync extends Plugin {
         if (resolved || !unlocked) return
         resolved = true
         modal.close()
-        if (this.settings.encryptionMode === "encrypted") {
-          if (operation === "forcePush") void encryptedForcePush(this)
-          else void encryptedForcePull(this)
-        } else {
-          if (operation === "forcePush") void StartupFullNotesForceOverSync(this)
-          else void overrideLocalAllFilesImpl(this)
-        }
-        resolve()
+        if (operation === "forcePush") void this.v4Runtime.forcePush()
+        else void this.v4Runtime.forcePull()
+        finish()
       }
       confirmButton.onclick = runConfirmedOperation
       const setProgress = (clientX: number) => {

@@ -24,6 +24,22 @@ const tsEntries = [
   "tests/github-e2e/random-actions.test.ts",
   "tests/v3/git-atomic-writer.test.ts",
   "tests/v3/remote-cache.test.ts",
+  "tests/v4/protocol-core.test.ts",
+  "tests/v4/scope.test.ts",
+  "tests/v4/local-index.test.ts",
+  "tests/v4/github-transport.test.ts",
+  "tests/v4/git-tree-writer.test.ts",
+  "tests/v4/change-guard.test.ts",
+  "tests/v4/planner.test.ts",
+  "tests/v4/conflicts.test.ts",
+  "tests/v4/storage-history.test.ts",
+  "tests/v4/storage-codec.test.ts",
+  "tests/v4/remote-index.test.ts",
+  "tests/v4/sync-coordinator.test.ts",
+  "tests/v4/sync-session.test.ts",
+  "tests/v4/settings-secrets.test.ts",
+  "tests/v4/history-service.test.ts",
+  "tests/v4/benchmark.test.ts",
 ];
 
 await rm(outDir, { recursive: true, force: true });

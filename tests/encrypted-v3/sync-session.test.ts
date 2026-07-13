@@ -223,6 +223,20 @@ test("v3 rename reuses the existing file identity and object when content is unc
   assert.equal(liveRecords[0].fileId, oldRecord.fileId);
   assert.equal(liveRecords[0].remoteVersion, oldRecord.remoteVersion);
   assert.equal(github.commits.at(-1)?.files.some(path => path.includes("old.md") || path.includes("new.md")), false);
+
+  const pulledVault = new FakeV3Vault(new Map());
+  const pulledIndex = createEmptyV3LocalIndex({ repoId: "repo", deviceId: "target" });
+  await new EncryptedV3SyncSession({
+    github,
+    vault: pulledVault,
+    adapter: memoryAdapter(),
+    indexRoot: ".idx-target",
+    index: pulledIndex,
+    keyMaterial: new TextEncoder().encode("key"),
+  }).sync({ operation: "forcePull" });
+
+  assert.equal(new TextDecoder().decode(pulledVault.files.get("Notes/new.md")), "same content");
+  assert.equal(pulledVault.files.has("Notes/old.md"), false);
 });
 
 test("v3 force pull mirrors remote records to local vault and deletes local extras", async () => {

@@ -1,0 +1,139 @@
+import { normalizeV4VaultPath } from "./paths";
+import type { V4SyncOperation } from "./planner";
+
+export type V4SyncTrigger = "startup" | "localChange" | "scheduled" | "manual" | "forcePush" | "forcePull";
+export type V4QueuedChange =
+  | { type: "modify"; path: string; mtime: number }
+  | { type: "delete"; path: string; mtime: number }
+  | { type: "rename"; oldPath: string; path: string; mtime: number };
+
+export interface V4SyncRequest {
+  operation: V4SyncOperation;
+  trigger: V4SyncTrigger;
+  allowThresholdOverride?: boolean;
+}
+
+export interface V4CoordinatorExecutionResult { changedFiles: number; }
+export interface V4CoordinatorRunResult extends V4CoordinatorExecutionResult { status: "completed" | "busy" | "skipped"; }
+
+export interface V4SyncCoordinatorOptions {
+  execute(request: V4SyncRequest, changes: V4QueuedChange[]): Promise<V4CoordinatorExecutionResult>;
+  notice?: (message: string) => void;
+  schedule?: (callback: () => void, delay: number) => unknown;
+  cancel?: (handle: any) => void;
+  debounceMs?: number;
+}
+
+export function coalesceV4Changes(changes: V4QueuedChange[]): V4QueuedChange[] {
+  const byPath = new Map<string, V4QueuedChange>();
+  for (const raw of changes) {
+    const change: V4QueuedChange = raw.type === "rename"
+      ? { ...raw, oldPath: normalizeV4VaultPath(raw.oldPath), path: normalizeV4VaultPath(raw.path) }
+      : { ...raw, path: normalizeV4VaultPath(raw.path) };
+    if (change.type === "rename") {
+      const previous = byPath.get(change.oldPath);
+      const oldPath = previous?.type === "rename" ? previous.oldPath : change.oldPath;
+      byPath.delete(change.oldPath);
+      byPath.delete(change.path);
+      byPath.set(change.path, { type: "rename", oldPath, path: change.path, mtime: Math.max(change.mtime, previous?.mtime ?? change.mtime) });
+      continue;
+    }
+    if (change.type === "delete") {
+      byPath.set(change.path, { ...change });
+      continue;
+    }
+    const previous = byPath.get(change.path);
+    if (previous?.type === "delete") continue;
+    if (previous?.type === "rename") {
+      byPath.set(change.path, { ...previous, mtime: Math.max(previous.mtime, change.mtime) });
+      continue;
+    }
+    byPath.set(change.path, { ...change });
+  }
+  return [...byPath.values()];
+}
+
+export class V4SyncCoordinator {
+  private readonly pending: V4QueuedChange[] = [];
+  private active?: Promise<V4CoordinatorRunResult>;
+  private timer?: unknown;
+  private flushAfterActive = false;
+  private readonly schedule: (callback: () => void, delay: number) => unknown;
+  private readonly cancel: (handle: any) => void;
+  private readonly debounceMs: number;
+
+  constructor(private readonly options: V4SyncCoordinatorOptions) {
+    this.schedule = options.schedule ?? ((callback, delay) => globalThis.setTimeout(callback, delay));
+    this.cancel = options.cancel ?? (handle => globalThis.clearTimeout(handle));
+    this.debounceMs = options.debounceMs ?? 5_000;
+  }
+
+  get isSyncing(): boolean { return this.active !== undefined; }
+  get pendingCount(): number { return coalesceV4Changes(this.pending).length; }
+
+  dispose(): void {
+    if (this.timer !== undefined) this.cancel(this.timer)
+    this.timer = undefined
+    this.pending.length = 0
+  }
+
+  enqueue(change: V4QueuedChange): void {
+    this.pending.push(change);
+    if (this.timer !== undefined) this.cancel(this.timer);
+    this.timer = this.schedule(() => {
+      this.timer = undefined;
+      void this.flushLocalChanges();
+    }, this.debounceMs);
+  }
+
+  async run(request: V4SyncRequest): Promise<V4CoordinatorRunResult> {
+    if (this.active) {
+      if (request.trigger === "scheduled" || request.trigger === "startup") return { status: "skipped", changedFiles: 0 };
+      this.options.notice?.("GitHub Sync: Sync already in progress");
+      return { status: "busy", changedFiles: 0 };
+    }
+    if (this.timer !== undefined && (request.trigger === "scheduled" || request.trigger === "startup")) {
+      return { status: "skipped", changedFiles: 0 };
+    }
+    if (this.timer !== undefined) {
+      this.cancel(this.timer);
+      this.timer = undefined;
+    }
+    const changes = this.flushPending();
+    return this.start(request, changes);
+  }
+
+  async whenIdle(): Promise<void> {
+    while (this.active) await this.active;
+  }
+
+  private async flushLocalChanges(): Promise<V4CoordinatorRunResult> {
+    if (this.active) {
+      this.flushAfterActive = true;
+      return { status: "busy", changedFiles: 0 };
+    }
+    const changes = this.flushPending();
+    if (changes.length === 0) return { status: "completed", changedFiles: 0 };
+    return this.start({ operation: "normal", trigger: "localChange" }, changes);
+  }
+
+  private flushPending(): V4QueuedChange[] {
+    const changes = coalesceV4Changes(this.pending);
+    this.pending.length = 0;
+    return changes;
+  }
+
+  private start(request: V4SyncRequest, changes: V4QueuedChange[]): Promise<V4CoordinatorRunResult> {
+    const execution = this.options.execute(request, changes).then(result => ({ status: "completed" as const, ...result }));
+    let tracked!: Promise<V4CoordinatorRunResult>;
+    tracked = execution.finally(() => {
+      if (this.active === tracked) this.active = undefined;
+      if (this.pending.length > 0 && this.flushAfterActive) {
+        this.flushAfterActive = false;
+        void this.flushLocalChanges();
+      }
+    });
+    this.active = tracked;
+    return tracked;
+  }
+}

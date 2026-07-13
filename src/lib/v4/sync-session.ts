@@ -1,0 +1,560 @@
+import { randomBytes, sha256Hex, toBase64Url, utf8ToBytes } from "../encrypted/bytes"
+import type { GitHubTree } from "../github-api"
+import { evaluateV4ChangeGuard } from "./change-guard"
+import { resolveV4Conflict, type V4ConflictPolicy, type V4ConflictResolution } from "./conflicts"
+import type { V4Keyring } from "./crypto"
+import { encryptV4Payload } from "./crypto"
+import { publishV4TreeChanges, type V4GitTreeGithub } from "./git-tree-writer"
+import { buildV4JournalPages, type V4JournalChange } from "./history-journal"
+import type { V4IndexFileRecord, V4LocalIndex } from "./local-index"
+import { bucketForV4PathId } from "./paths"
+import { planV4Sync, type V4LogicalFile, type V4PlannedChange, type V4SyncOperation } from "./planner"
+import {
+  buildV4RemoteMetadata,
+  decodeV4RemoteConfig,
+  decodeV4RemoteHead,
+  decodeV4RemoteShard,
+  v4RemoteShardPath,
+} from "./remote-index"
+import { V4_CONFIG_PATH, V4_HEAD_PATH, V4_ROOT, type V4RemoteConfig, type V4RemoteHead } from "./protocol-types"
+import { V4StorageCodec } from "./storage-codec"
+import type { V4QueuedChange } from "./sync-coordinator"
+
+export interface V4SessionVaultFile { path: string; size: number; mtime: number }
+export interface V4SessionVault {
+  listFiles(): Promise<V4SessionVaultFile[]>
+  stat?(path: string): Promise<V4SessionVaultFile | null>
+  read(path: string): Promise<Uint8Array>
+  write(path: string, bytes: Uint8Array, mtime?: number): Promise<void>
+  delete(path: string): Promise<void>
+}
+
+export interface V4SessionGithub extends V4GitTreeGithub {
+  getFileBytes(path: string): Promise<{ bytes: Uint8Array; sha: string } | null>
+  getTree?(): Promise<GitHubTree>
+}
+
+export interface V4SyncSessionInput {
+  github: V4SessionGithub
+  vault: V4SessionVault
+  index: V4LocalIndex
+  config: V4RemoteConfig
+  keyring?: V4Keyring
+  conflictPolicy: V4ConflictPolicy
+  abortChangePercent: number
+  now?: () => number
+  askConflict?: (input: { path: string; localMtime: number; remoteMtime: number }) => Promise<V4ConflictResolution>
+  includePath?: (path: string) => boolean
+}
+
+export interface V4SessionSyncResult {
+  mode: "noop" | "pull" | "push" | "pull-push" | "force-pull" | "force-push"
+  operation: V4SyncOperation
+  changedFiles: number
+  pushedFiles: number
+  pulledFiles: number
+  commitSha?: string
+}
+
+interface V4RemoteState {
+  config: V4RemoteConfig
+  head: V4RemoteHead
+  records: V4IndexFileRecord[]
+  commitSha: string
+}
+
+export class V4ChangeGuardError extends Error {
+  constructor(public readonly changePercent: number, public readonly thresholdPercent: number) {
+    super(`V4 change guard blocked sync: ${changePercent}% exceeds ${thresholdPercent}%.`)
+    this.name = "V4ChangeGuardError"
+  }
+}
+
+function recordsFromIndex(index: V4LocalIndex): V4IndexFileRecord[] {
+  return Object.values(index.shards).flatMap(shard => Object.values(shard.records)).filter(record => !record.deleted)
+}
+
+function logical(records: V4IndexFileRecord[]): V4LogicalFile[] {
+  return records.filter(record => !record.deleted).map(record => ({
+    path: record.path,
+    fileId: record.fileId,
+    hash: record.plaintextSha256,
+    size: record.size,
+    mtime: record.mtime,
+  }))
+}
+
+function assertNoCaseInsensitiveCollisions(files: V4LogicalFile[]): void {
+  const seen = new Map<string, string>()
+  for (const file of files) {
+    const key = file.path.normalize("NFC").toLowerCase()
+    const previous = seen.get(key)
+    if (previous && previous !== file.path) throw new Error(`Case-insensitive path collision: ${previous} <-> ${file.path}`)
+    seen.set(key, file.path)
+  }
+}
+
+function recordPaths(record: V4IndexFileRecord): string[] {
+  return record.storage === "chunked" ? record.partPaths ?? [] : [record.remotePath]
+}
+
+function descriptorFor(record: V4IndexFileRecord) {
+  return {
+    remotePath: record.remotePath,
+    sha: "",
+    size: record.size,
+    pathId: record.pathId,
+    plaintextSha256: record.plaintextSha256,
+    remoteVersion: record.remoteVersion,
+    storage: record.storage,
+    partPaths: record.partPaths,
+    mtime: record.mtime,
+  }
+}
+
+function recordsByBucket(records: V4IndexFileRecord[]): Map<string, V4IndexFileRecord[]> {
+  const grouped = new Map<string, V4IndexFileRecord[]>()
+  for (const record of records) {
+    const bucket = bucketForV4PathId(record.pathId)
+    const values = grouped.get(bucket) ?? []
+    values.push(record)
+    grouped.set(bucket, values)
+  }
+  for (const values of grouped.values()) values.sort((left, right) => left.pathId.localeCompare(right.pathId))
+  return grouped
+}
+
+function bucketSignature(records: V4IndexFileRecord[] | undefined): string {
+  return JSON.stringify(records ?? [])
+}
+
+function journalPath(journalId: string, page: number, encrypted: boolean): string {
+  return `${V4_ROOT}/journals/${journalId}/${String(page).padStart(6, "0")}.${encrypted ? "enc" : "json"}`
+}
+
+const PACK_MIN_CHANGED_FILES = 64
+const PACK_MAX_FILES = 500
+const PACK_MAX_PLAINTEXT_BYTES = 32 * 1024 * 1024
+const PACK_MAX_ENTRY_BYTES = 1024 * 1024
+
+export class V4SyncSession {
+  private readonly codec: V4StorageCodec
+  private readonly now: () => number
+  private readonly localReadCache = new Map<string, Uint8Array>()
+
+  constructor(private readonly input: V4SyncSessionInput) {
+    this.codec = new V4StorageCodec({ mode: input.config.mode, keyring: input.keyring })
+    this.now = input.now ?? (() => Date.now())
+  }
+
+  async sync(options: {
+    operation: V4SyncOperation
+    allowThresholdOverride: boolean
+    changes?: V4QueuedChange[]
+  }): Promise<V4SessionSyncResult> {
+    this.localReadCache.clear()
+    const ref = await this.input.github.getGitRefOrNull()
+    const remote = await this.loadRemote(ref?.sha, options.operation)
+    if (!remote && options.operation !== "forcePush") {
+      throw new Error("Remote is not V4. Force Push is required before sync or Force Pull.")
+    }
+    if (!remote && ref && this.input.config.mode === "encrypted") {
+      throw new Error("Encrypted V4 requires a new empty repository or branch to avoid retaining plaintext history.")
+    }
+    if (remote && remote.config.mode !== this.input.config.mode) {
+      if (this.input.config.mode === "encrypted") {
+        throw new Error("Encrypted V4 requires a new empty repository or branch; plaintext history cannot be retained.")
+      }
+      if (options.operation !== "forcePush") throw new Error("Remote storage mode differs. Force Push is required.")
+    }
+    const metadataRemoteRecords = (remote?.records ?? []).map(record => ({ ...record, partPaths: record.partPaths ? [...record.partPaths] : undefined }))
+    let externalReconciled = false
+    if (remote && this.input.index.remoteCommitSha && remote.commitSha !== this.input.index.remoteCommitSha && remote.head.generation === this.input.index.generation) {
+      await this.reconcileExternalCommit(remote)
+      externalReconciled = true
+    }
+
+    const includePath = this.input.includePath ?? (() => true)
+    const allBaseRecords = recordsFromIndex(this.input.index)
+    const baseRecords = allBaseRecords.filter(record => includePath(record.path))
+    const localFiles = (await this.scanLocal(baseRecords, options.changes ?? [])).filter(file => includePath(file.path))
+    const allRemoteRecords = remote?.records ?? []
+    const remoteRecords = allRemoteRecords.filter(record => includePath(record.path))
+    assertNoCaseInsensitiveCollisions(localFiles)
+    assertNoCaseInsensitiveCollisions(logical(remoteRecords))
+    const plan = planV4Sync({
+      operation: options.operation,
+      base: logical(baseRecords),
+      local: localFiles,
+      remote: logical(remoteRecords),
+    })
+    const guard = evaluateV4ChangeGuard({
+      thresholdPercent: this.input.abortChangePercent,
+      changedFiles: plan.changedFiles,
+      baseFiles: baseRecords.length,
+      localFiles: localFiles.length,
+      remoteFiles: remoteRecords.length,
+    })
+    if (guard.blocked && !options.allowThresholdOverride) {
+      throw new V4ChangeGuardError(guard.changePercent, guard.thresholdPercent)
+    }
+    if (plan.changedFiles === 0 && options.operation !== "forcePush") {
+      if (remote) this.replaceIndex(allRemoteRecords, remote.head, remote.commitSha)
+      return { mode: "noop", operation: options.operation, changedFiles: 0, pushedFiles: 0, pulledFiles: 0 }
+    }
+
+    const recordsById = new Map(allRemoteRecords.map(record => [record.fileId, record]))
+    let pulledFiles = 0
+    for (const change of plan.pulls) {
+      await this.applyPull(change, recordsById)
+      pulledFiles++
+    }
+
+    const pushes = [...plan.pushes]
+    for (const conflict of plan.conflicts) {
+      const localBytes = conflict.local ? await this.readLocal(conflict.local.path) : undefined
+      const remoteRecord = recordsById.get(conflict.fileId)
+      const remoteBytes = remoteRecord ? await this.readRecord(remoteRecord) : undefined
+      const baseRecord = baseRecords.find(record => record.fileId === conflict.fileId)
+      const baseBytes = baseRecord && remoteRecord?.remoteVersion === baseRecord.remoteVersion
+        ? remoteBytes
+        : undefined
+      let resolution = resolveV4Conflict({
+        policy: this.input.conflictPolicy,
+        path: conflict.path,
+        localMtime: conflict.local?.mtime ?? 0,
+        remoteMtime: conflict.remote?.mtime ?? 0,
+        baseBytes,
+        localBytes,
+        remoteBytes,
+      })
+      if (resolution.action === "ask") {
+        if (!this.input.askConflict) throw new Error(`Conflict requires user decision: ${conflict.path}`)
+        resolution = await this.input.askConflict({ path: conflict.path, localMtime: conflict.local?.mtime ?? 0, remoteMtime: conflict.remote?.mtime ?? 0 })
+        if (resolution.action === "ask") throw new Error(`Conflict cancelled: ${conflict.path}`)
+      }
+      if (resolution.action === "use-remote") {
+        const pull = this.changeBetween(conflict.local, conflict.remote)
+        if (pull) { await this.applyPull(pull, recordsById); pulledFiles++ }
+        continue
+      }
+      if (resolution.action === "merged" && conflict.local && resolution.mergedBytes) {
+        await this.input.vault.write(conflict.local.path, resolution.mergedBytes, this.now())
+        this.localReadCache.set(conflict.local.path, resolution.mergedBytes)
+      }
+      if (resolution.action === "keep-local-copy-remote" && remoteBytes && conflict.remote) {
+        const copyPath = this.conflictCopyPath(conflict.remote.path)
+        await this.input.vault.write(copyPath, remoteBytes, conflict.remote.mtime)
+        this.localReadCache.set(copyPath, remoteBytes)
+        const copyHash = await sha256Hex(remoteBytes)
+        const copyFileId = await this.newFileId(copyPath)
+        pushes.push({
+          fileId: copyFileId,
+          kind: "create",
+          path: copyPath,
+          after: { path: copyPath, fileId: copyFileId, hash: copyHash, size: remoteBytes.byteLength, mtime: conflict.remote.mtime },
+        })
+      }
+      const localAfter = conflict.local
+      const localPush = this.changeBetween(conflict.remote, localAfter)
+      if (localPush) pushes.push(localPush)
+    }
+
+    if (pushes.length === 0 && options.operation !== "forcePush" && !externalReconciled) {
+      this.replaceIndex(allRemoteRecords, remote!.head, remote!.commitSha)
+      return { mode: options.operation === "forcePull" ? "force-pull" : "pull", operation: options.operation, changedFiles: plan.changedFiles, pushedFiles: 0, pulledFiles }
+    }
+
+    const latestLocal = new Map((await this.scanLocal(baseRecords, options.changes ?? [])).map(file => [file.fileId, file]))
+    const files: Array<{ path: string; bytes: Uint8Array }> = []
+    const deletions = new Set<string>()
+    const journalChanges: V4JournalChange[] = []
+    if (externalReconciled) {
+      const beforeById = new Map(metadataRemoteRecords.map(record => [record.fileId, record]))
+      const afterById = new Map(allRemoteRecords.map(record => [record.fileId, record]))
+      for (const change of plan.pulls) {
+        const before = beforeById.get(change.fileId)
+        const after = afterById.get(change.fileId)
+        journalChanges.push({
+          fileId: change.fileId,
+          kind: change.kind,
+          path: change.path,
+          previousPath: change.previousPath,
+          before: before ? descriptorFor(before) : undefined,
+          after: after ? descriptorFor(after) : undefined,
+        })
+      }
+    }
+    const packCandidates: Array<{ record: V4IndexFileRecord; plaintext: Uint8Array; loosePaths: string[] }> = []
+    const journalId = `${this.now()}-${toBase64Url(randomBytes(6))}`
+    for (const change of pushes) {
+      const previous = recordsById.get(change.fileId)
+      if (change.kind === "delete") {
+        recordsById.delete(change.fileId)
+        journalChanges.push({ fileId: change.fileId, kind: "delete", path: change.path, before: previous ? descriptorFor(previous) : undefined })
+        continue
+      }
+      const after = latestLocal.get(change.fileId) ?? change.after
+      if (!after) continue
+      const bytes = await this.readLocal(after.path)
+      const prepared = await this.codec.prepare(after.path, bytes, journalId, after.mtime, after.fileId)
+      const record: V4IndexFileRecord = { path: after.path, ...prepared.record }
+      recordsById.set(after.fileId, record)
+      files.push(...prepared.files)
+      if (this.input.config.mode === "encrypted" && record.storage === "single" && bytes.byteLength <= PACK_MAX_ENTRY_BYTES) {
+        packCandidates.push({ record, plaintext: bytes, loosePaths: prepared.files.map(file => file.path) })
+      }
+      journalChanges.push({
+        fileId: after.fileId,
+        kind: change.kind,
+        path: after.path,
+        previousPath: change.previousPath,
+        before: previous ? descriptorFor(previous) : undefined,
+        after: descriptorFor(record),
+      })
+    }
+
+    if (packCandidates.length >= PACK_MIN_CHANGED_FILES) {
+      const loosePaths = new Set<string>()
+      for (const candidate of packCandidates) for (const path of candidate.loosePaths) loosePaths.add(path)
+      for (let start = 0, packNumber = 0; start < packCandidates.length; packNumber++) {
+        const first = packCandidates[start]
+        const folder = first.record.path.split("/").slice(0, -1).join("/")
+        const group: typeof packCandidates = []
+        let bytes = 0
+        while (start < packCandidates.length && group.length < PACK_MAX_FILES) {
+          const candidate = packCandidates[start]
+          const candidateFolder = candidate.record.path.split("/").slice(0, -1).join("/")
+          if (group.length > 0 && candidateFolder !== folder) break
+          if (group.length > 0 && bytes + candidate.plaintext.byteLength > PACK_MAX_PLAINTEXT_BYTES) break
+          group.push(candidate)
+          bytes += candidate.plaintext.byteLength
+          start++
+        }
+        const packed = await this.codec.preparePack(folder, `${journalId}-${packNumber}`, group)
+        files.push(packed.file)
+        for (const record of packed.records) {
+          recordsById.set(record.fileId, { ...record, path: group.find(item => item.record.fileId === record.fileId)!.record.path })
+          const journal = journalChanges.find(change => change.fileId === record.fileId)
+          if (journal) journal.after = descriptorFor({ ...record, path: journal.path })
+        }
+      }
+      for (let index = files.length - 1; index >= 0; index--) if (loosePaths.has(files[index].path)) files.splice(index, 1)
+    }
+
+    const finalRecords = [...recordsById.values()]
+    const finalObjectPaths = new Set(finalRecords.flatMap(recordPaths))
+    for (const path of allRemoteRecords.flatMap(recordPaths)) if (!finalObjectPaths.has(path)) deletions.add(path)
+    const finalByBucket = recordsByBucket(finalRecords)
+    const oldByBucket = recordsByBucket(metadataRemoteRecords)
+    const buckets = new Set(finalByBucket.keys())
+    const oldBuckets = new Set(remote ? Object.keys(remote.head.shardHashes) : [])
+    for (const bucket of oldBuckets) if (!buckets.has(bucket)) deletions.add(v4RemoteShardPath(bucket, remote!.config.mode))
+    const generation = (remote?.head.generation ?? 0) + 1
+    const changedBuckets = new Set<string>()
+    for (const bucket of new Set([...oldByBucket.keys(), ...finalByBucket.keys()])) {
+      if (bucketSignature(oldByBucket.get(bucket)) !== bucketSignature(finalByBucket.get(bucket))) changedBuckets.add(bucket)
+    }
+    const shardHashes = { ...(remote?.head.shardHashes ?? {}) }
+    for (const bucket of oldBuckets) if (!buckets.has(bucket)) delete shardHashes[bucket]
+    for (const bucket of changedBuckets) {
+      if (buckets.has(bucket)) shardHashes[bucket] = await sha256Hex(utf8ToBytes(bucketSignature(finalByBucket.get(bucket))))
+    }
+    const head: V4RemoteHead = {
+      formatVersion: 4,
+      mode: this.input.config.mode,
+      epoch: remote?.head.epoch ?? 1,
+      generation,
+      journalId,
+      shardHashes,
+      updatedAt: this.now(),
+      deviceId: this.input.index.deviceId,
+    }
+    files.push(...await buildV4RemoteMetadata({ config: this.input.config, head, records: finalRecords, keyring: this.input.keyring, buckets: changedBuckets }))
+    const pages = buildV4JournalPages(journalId, journalChanges)
+    for (const page of pages) {
+      const raw = utf8ToBytes(JSON.stringify(page))
+      files.push({
+        path: journalPath(journalId, page.page, this.input.config.mode === "encrypted"),
+        bytes: this.input.config.mode === "encrypted"
+          ? await encryptV4Payload(this.input.keyring!.journalKey, raw, { kind: "journal", aad: `${this.input.config.repoId}:${journalId}:${page.page}` })
+          : raw,
+      })
+    }
+    if (options.operation === "forcePush" && ref && this.input.github.getTree) {
+      const tree = await this.input.github.getTree()
+      if (tree.truncated) throw new Error("GitHub tree is truncated; Force Push cannot safely mirror the repository.")
+      const written = new Set([
+        ...files.map(file => file.path),
+        ...finalObjectPaths,
+        ...[...buckets].map(bucket => v4RemoteShardPath(bucket, this.input.config.mode)),
+      ])
+      for (const node of tree.tree) {
+        const internal = node.path.startsWith(`${V4_ROOT}/`)
+        if (node.type !== "blob" || (!internal && !includePath(node.path)) || written.has(node.path) || node.path.startsWith(`${V4_ROOT}/journals/`)) continue
+        deletions.add(node.path)
+      }
+    }
+    const published = await publishV4TreeChanges(this.input.github, {
+      message: `obsidian-sync-v4:${journalId}`,
+      files,
+      deletions: [...deletions],
+      expectedHeadSha: ref?.sha ?? null,
+    })
+    this.replaceIndex(finalRecords, head, published.commitSha)
+    const mode = options.operation === "forcePush" ? "force-push" : pulledFiles > 0 ? "pull-push" : "push"
+    return { mode, operation: options.operation, changedFiles: plan.changedFiles, pushedFiles: pushes.length, pulledFiles, commitSha: published.commitSha }
+  }
+
+  private async loadRemote(commitSha: string | undefined, operation: V4SyncOperation): Promise<V4RemoteState | null> {
+    const configFile = await this.input.github.getFileBytes(V4_CONFIG_PATH)
+    if (!configFile) return null
+    const config = decodeV4RemoteConfig(configFile.bytes)
+    if (config.repoId !== this.input.config.repoId) throw new Error("V4 remote repository identity mismatch.")
+    if (config.mode !== this.input.config.mode && operation === "forcePush" && this.input.config.mode === "plaintext") return null
+    const headFile = await this.input.github.getFileBytes(V4_HEAD_PATH)
+    if (!headFile) throw new Error("V4 remote head is missing.")
+    const head = await decodeV4RemoteHead(headFile.bytes, config, this.input.keyring)
+    const records: V4IndexFileRecord[] = []
+    for (const bucket of Object.keys(head.shardHashes)) {
+      const file = await this.input.github.getFileBytes(v4RemoteShardPath(bucket, config.mode))
+      if (!file) throw new Error(`V4 remote shard is missing: ${bucket}`)
+      records.push(...Object.values((await decodeV4RemoteShard(file.bytes, bucket, config, this.input.keyring)).records))
+    }
+    return { config, head, records, commitSha: commitSha ?? "" }
+  }
+
+  private async reconcileExternalCommit(remote: V4RemoteState): Promise<void> {
+    if (remote.config.mode === "encrypted") {
+      throw new Error("External GitHub changes touched an encrypted V4 branch without updating its journal. Use Force Push or Force Pull after reviewing the commit.")
+    }
+    if (!this.input.github.getTree) throw new Error("External GitHub changes require recursive tree support.")
+    if (remote.records.some(record => record.storage !== "single")) {
+      throw new Error("External GitHub changes cannot be safely reconciled while large or packed V4 objects exist.")
+    }
+    const tree = await this.input.github.getTree()
+    if (tree.truncated) throw new Error("External GitHub tree is truncated; sync is unsafe.")
+    const existingByPath = new Map(remote.records.map(record => [record.path, record]))
+    const includePath = this.input.includePath ?? (() => true)
+    const reconciled: V4IndexFileRecord[] = remote.records.filter(record => !includePath(record.path))
+    for (const node of tree.tree) {
+      if (node.type !== "blob" || node.path === V4_CONFIG_PATH || node.path.startsWith(`${V4_ROOT}/`)) continue
+      if (!includePath(node.path)) continue
+      const file = await this.input.github.getFileBytes(node.path)
+      if (!file) continue
+      const previous = existingByPath.get(node.path)
+      const pathId = previous?.pathId ?? await sha256Hex(utf8ToBytes(`path:${node.path}`))
+      reconciled.push({
+        path: node.path,
+        pathId,
+        fileId: previous?.fileId ?? pathId,
+        plaintextSha256: await sha256Hex(file.bytes),
+        size: file.bytes.byteLength,
+        mtime: this.now(),
+        remoteVersion: `external:${remote.commitSha}`,
+        remotePath: node.path,
+        storage: "single",
+      })
+    }
+    remote.records = reconciled
+  }
+
+  private async scanLocal(baseRecords: V4IndexFileRecord[], changes: V4QueuedChange[]): Promise<V4LogicalFile[]> {
+    if (changes.length > 0 && baseRecords.length > 0 && this.input.vault.stat) {
+      const byPath = new Map(logical(baseRecords).map(file => [file.path, file]))
+      for (const change of changes) {
+        if (change.type === "delete") { byPath.delete(change.path); continue }
+        const previous = change.type === "rename" ? byPath.get(change.oldPath) : byPath.get(change.path)
+        if (change.type === "rename") byPath.delete(change.oldPath)
+        const stat = await this.input.vault.stat(change.path)
+        if (!stat) { byPath.delete(change.path); continue }
+        const content = await this.readLocal(change.path)
+        byPath.set(change.path, {
+          path: change.path,
+          fileId: previous?.fileId ?? await this.newFileId(change.path),
+          hash: await sha256Hex(content),
+          size: stat.size,
+          mtime: stat.mtime,
+        })
+      }
+      return [...byPath.values()]
+    }
+    const identityByPath = new Map(baseRecords.map(record => [record.path, record]))
+    for (const change of changes) {
+      if (change.type !== "rename") continue
+      const record = identityByPath.get(change.oldPath)
+      if (record) { identityByPath.delete(change.oldPath); identityByPath.set(change.path, record) }
+    }
+    const files = await this.input.vault.listFiles()
+    return Promise.all(files.map(async file => {
+      const existing = identityByPath.get(file.path)
+      const unchangedStat = existing && existing.size === file.size && existing.mtime === file.mtime
+      return {
+        path: file.path,
+        fileId: existing?.fileId ?? await this.newFileId(file.path),
+        hash: unchangedStat ? existing.plaintextSha256 : await sha256Hex(await this.readLocal(file.path)),
+        size: file.size,
+        mtime: file.mtime,
+      }
+    }))
+  }
+
+  private async applyPull(change: V4PlannedChange, records: Map<string, V4IndexFileRecord>): Promise<void> {
+    if (change.kind === "delete") { await this.input.vault.delete(change.path); return }
+    const record = records.get(change.fileId)
+    if (!record) throw new Error(`Missing V4 remote record for ${change.path}`)
+    const bytes = await this.readRecord(record)
+    if (change.kind === "rename" && change.previousPath) await this.input.vault.delete(change.previousPath)
+    await this.input.vault.write(change.path, bytes, record.mtime)
+    this.localReadCache.set(change.path, bytes)
+  }
+
+  private async readLocal(path: string): Promise<Uint8Array> {
+    const cached = this.localReadCache.get(path)
+    if (cached) return cached
+    const bytes = await this.input.vault.read(path)
+    this.localReadCache.set(path, bytes)
+    return bytes
+  }
+
+  private async readRecord(record: V4IndexFileRecord): Promise<Uint8Array> {
+    return this.codec.read(record, async path => {
+      const file = await this.input.github.getFileBytes(path)
+      if (!file) throw new Error(`Missing V4 remote object: ${path}`)
+      return file.bytes
+    })
+  }
+
+  private changeBetween(before?: V4LogicalFile, after?: V4LogicalFile): V4PlannedChange | null {
+    if (!before && after) return { fileId: after.fileId, kind: "create", path: after.path, after }
+    if (before && !after) return { fileId: before.fileId, kind: "delete", path: before.path, before }
+    if (!before || !after) return null
+    if (before.path !== after.path) return { fileId: after.fileId, kind: "rename", path: after.path, previousPath: before.path, before, after }
+    return { fileId: after.fileId, kind: "modify", path: after.path, before, after }
+  }
+
+  private conflictCopyPath(path: string): string {
+    const dot = path.lastIndexOf(".")
+    const suffix = `.conflict-remote-${this.input.index.deviceId}-${this.now()}`
+    return dot > path.lastIndexOf("/") ? `${path.slice(0, dot)}${suffix}${path.slice(dot)}` : `${path}${suffix}`
+  }
+
+  private async newFileId(seed: string): Promise<string> {
+    return (await sha256Hex(utf8ToBytes(`${seed}:${this.input.index.deviceId}:${this.now()}:${toBase64Url(randomBytes(8))}`))).slice(0, 32)
+  }
+
+  private replaceIndex(records: V4IndexFileRecord[], head: V4RemoteHead, commitSha: string): void {
+    this.input.index.shards = {}
+    for (const record of records) {
+      const bucket = bucketForV4PathId(record.pathId)
+      const shard = this.input.index.shards[bucket] ?? { hash: head.shardHashes[bucket] ?? "", records: {} }
+      shard.records[record.pathId] = { ...record, dirty: false }
+      this.input.index.shards[bucket] = shard
+    }
+    this.input.index.remoteCommitSha = commitSha
+    this.input.index.epoch = head.epoch
+    this.input.index.generation = head.generation
+    this.input.index.shardHashes = { ...head.shardHashes }
+    this.input.index.mode = head.mode
+  }
+}

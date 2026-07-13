@@ -1,6 +1,7 @@
-import { requestUrl } from "obsidian";
+import { requestUrl, type RequestUrlParam, type RequestUrlResponse } from "obsidian";
 import { bytesToUtf8, fromBase64, toBase64, utf8ToBytes } from "./encrypted/bytes";
 import type { GitHubCreateTreeEntry, GitHubGitCommit, GitHubGitRef } from "./github-git-types";
+import { V4RequestScheduler } from "./v4/request-scheduler";
 
 export interface GitHubConfig {
   owner: string;
@@ -33,11 +34,41 @@ export interface GitHubTree {
   truncated: boolean;
 }
 
+export interface GitHubCommitSummary {
+  sha: string;
+  message: string;
+  authorName: string;
+  authoredAt: string;
+  parentShas: string[];
+}
+
 export class GitHubClient {
   private config: GitHubConfig;
+  private readonly requestScheduler = new V4RequestScheduler({ readConcurrency: 4, writeConcurrency: 2 });
 
   constructor(config: GitHubConfig) {
     this.config = config;
+  }
+
+  private async request(options: RequestUrlParam): Promise<RequestUrlResponse> {
+    const method = (options.method ?? "GET").toUpperCase();
+    const kind = method === "GET" || method === "HEAD" ? "read" : "write";
+    return this.requestScheduler.run(kind, async () => {
+      const response = await requestUrl(options);
+      const responseHeaders = Object.fromEntries(Object.entries(response.headers ?? {}).map(([key, value]) => [key.toLowerCase(), value]));
+      const rateLimited = response.status === 429 || (response.status === 403 && (
+        responseHeaders["retry-after"] !== undefined
+        || responseHeaders["x-ratelimit-reset"] !== undefined
+        || responseHeaders["x-ratelimit-remaining"] === "0"
+      ));
+      if (rateLimited) {
+        const error = new Error(`GitHub request failed: HTTP ${response.status} - ${response.text || "rate limited"}`) as Error & { status?: number; headers?: Record<string, string> };
+        error.status = response.status;
+        error.headers = responseHeaders;
+        throw error;
+      }
+      return response;
+    });
   }
 
   private get baseUrl() {
@@ -47,7 +78,8 @@ export class GitHubClient {
   public get headers() {
     return {
       Authorization: `Bearer ${this.config.token}`,
-      Accept: "application/vnd.github.v3+json",
+      Accept: "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2026-03-10",
       "Content-Type": "application/json",
       "Cache-Control": "no-cache, no-store, must-revalidate",
       "Pragma": "no-cache",
@@ -58,7 +90,7 @@ export class GitHubClient {
     const encodedPath = path.split('/').map(encodeURIComponent).join('/');
     const url = `${this.baseUrl}/contents/${encodedPath}?ref=${this.config.branch}&_=${Date.now()}`;
     try {
-      const response = await requestUrl({
+      const response = await this.request({
         url,
         method: "GET",
         headers: this.headers,
@@ -81,7 +113,7 @@ export class GitHubClient {
     const encodedPath = path.split('/').map(encodeURIComponent).join('/');
     const url = `${this.baseUrl}/contents/${encodedPath}?ref=${this.config.branch}&_=${Date.now()}`;
     try {
-      const response = await requestUrl({
+      const response = await this.request({
         url,
         method: "GET",
         headers: {
@@ -108,7 +140,7 @@ export class GitHubClient {
   async getBlob(sha: string): Promise<Uint8Array> {
     const url = `${this.baseUrl}/git/blobs/${sha}`;
     try {
-      const response = await requestUrl({
+      const response = await this.request({
         url,
         method: "GET",
         headers: {
@@ -182,7 +214,7 @@ export class GitHubClient {
     // requestUrl defaults to throwing on 4xx/5xx; throw: false ensures we always get a response object
     // so that 409/422 status code checks work 100% of the time
     try {
-      const res = await requestUrl({
+      const res = await this.request({
         url,
         method: "PUT",
         headers: this.headers,
@@ -211,7 +243,7 @@ export class GitHubClient {
     };
 
     try {
-      const response = await requestUrl({
+      const response = await this.request({
         url,
         method: "DELETE",
         headers: this.headers,
@@ -232,7 +264,7 @@ export class GitHubClient {
 
   async getRemoteHeadSha(): Promise<string | null> {
     const encodedBranch = this.config.branch.split("/").map(encodeURIComponent).join("/");
-    const response = await requestUrl({
+    const response = await this.request({
       url: `${this.baseUrl}/git/ref/heads/${encodedBranch}?_=${Date.now()}`,
       method: "GET",
       headers: this.headers,
@@ -248,7 +280,7 @@ export class GitHubClient {
       url += `&path=${encodeURIComponent(path)}`;
     }
 
-    const response = await requestUrl({
+    const response = await this.request({
       url,
       method: "GET",
       headers: this.headers,
@@ -260,9 +292,33 @@ export class GitHubClient {
     return null;
   }
 
+  async listCommits(options: { page?: number; perPage?: number } = {}): Promise<GitHubCommitSummary[]> {
+    const page = Math.max(1, Math.floor(options.page ?? 1));
+    const perPage = Math.max(1, Math.min(100, Math.floor(options.perPage ?? 50)));
+    const response = await this.request({
+      url: `${this.baseUrl}/commits?sha=${encodeURIComponent(this.config.branch)}&per_page=${perPage}&page=${page}`,
+      method: "GET",
+      headers: this.headers,
+      throw: false,
+    });
+    if (response.status !== 200) throw this.gitHttpError("Failed to list commits", response.status, response.text);
+    const commits = response.json as Array<{
+      sha?: string;
+      commit?: { message?: string; author?: { name?: string; date?: string } };
+      parents?: Array<{ sha?: string }>;
+    }>;
+    return commits.map(commit => ({
+      sha: commit.sha ?? "",
+      message: commit.commit?.message ?? "",
+      authorName: commit.commit?.author?.name ?? "",
+      authoredAt: commit.commit?.author?.date ?? "",
+      parentShas: (commit.parents ?? []).map(parent => parent.sha ?? "").filter(Boolean),
+    }));
+  }
+
   async getTree(): Promise<GitHubTree> {
     const url = `${this.baseUrl}/git/trees/${this.config.branch}?recursive=1&_=${Date.now()}`;
-    const response = await requestUrl({
+    const response = await this.request({
       url,
       method: "GET",
       headers: this.headers,
@@ -272,6 +328,17 @@ export class GitHubClient {
       return response.json as GitHubTree;
     }
     throw new Error(`Failed to get tree: HTTP ${response.status} - ${response.text}`);
+  }
+
+  async getTreeAt(treeSha: string, recursive = true): Promise<GitHubTree> {
+    const response = await this.request({
+      url: `${this.baseUrl}/git/trees/${encodeURIComponent(treeSha)}${recursive ? "?recursive=1" : ""}`,
+      method: "GET",
+      headers: this.headers,
+      throw: false,
+    });
+    if (response.status !== 200) throw this.gitHttpError("Failed to get historical tree", response.status, response.text);
+    return response.json as GitHubTree;
   }
 
 
@@ -286,7 +353,7 @@ export class GitHubClient {
   }
 
   async getGitRef(): Promise<GitHubGitRef> {
-    const response = await requestUrl({
+    const response = await this.request({
       url: `${this.baseUrl}/git/ref/heads/${this.branchRefPath()}?_=${Date.now()}`,
       method: "GET",
       headers: this.headers,
@@ -297,9 +364,18 @@ export class GitHubClient {
     return { ref: json.ref ?? `refs/heads/${this.config.branch}`, sha: json.object?.sha ?? "", type: json.object?.type ?? "commit" };
   }
 
+  async getGitRefOrNull(): Promise<GitHubGitRef | null> {
+    try {
+      return await this.getGitRef();
+    } catch (error) {
+      if ((error as { status?: number }).status === 404) return null;
+      throw error;
+    }
+  }
+
 
   async getGitCommit(sha: string): Promise<GitHubGitCommit> {
-    const response = await requestUrl({
+    const response = await this.request({
       url: `${this.baseUrl}/git/commits/${encodeURIComponent(sha)}?_=${Date.now()}`,
       method: "GET",
       headers: this.headers,
@@ -311,7 +387,7 @@ export class GitHubClient {
   }
   async createGitBlob(content: Uint8Array | ArrayBuffer): Promise<string> {
     const bytes = content instanceof Uint8Array ? content : new Uint8Array(content);
-    const response = await requestUrl({
+    const response = await this.request({
       url: `${this.baseUrl}/git/blobs`,
       method: "POST",
       headers: this.headers,
@@ -325,7 +401,7 @@ export class GitHubClient {
   async createGitTree(tree: GitHubCreateTreeEntry[], baseTree?: string): Promise<string> {
     const body: { tree: GitHubCreateTreeEntry[]; base_tree?: string } = { tree };
     if (baseTree) body.base_tree = baseTree;
-    const response = await requestUrl({
+    const response = await this.request({
       url: `${this.baseUrl}/git/trees`,
       method: "POST",
       headers: this.headers,
@@ -337,7 +413,7 @@ export class GitHubClient {
   }
 
   async createGitCommit(message: string, tree: string, parents: string[]): Promise<string> {
-    const response = await requestUrl({
+    const response = await this.request({
       url: `${this.baseUrl}/git/commits`,
       method: "POST",
       headers: this.headers,
@@ -349,7 +425,7 @@ export class GitHubClient {
   }
 
   async updateGitRef(sha: string, _expectedSha?: string): Promise<void> {
-    const response = await requestUrl({
+    const response = await this.request({
       url: `${this.baseUrl}/git/refs/heads/${this.branchRefPath()}`,
       method: "PATCH",
       headers: this.headers,
@@ -357,6 +433,17 @@ export class GitHubClient {
       throw: false,
     });
     if (response.status !== 200) throw this.gitHttpError("Failed to update git ref", response.status, response.text);
+  }
+
+  async createGitRef(sha: string): Promise<void> {
+    const response = await this.request({
+      url: `${this.baseUrl}/git/refs`,
+      method: "POST",
+      headers: this.headers,
+      body: JSON.stringify({ ref: `refs/heads/${this.config.branch}`, sha }),
+      throw: false,
+    });
+    if (response.status !== 201) throw this.gitHttpError("Failed to create git ref", response.status, response.text);
   }
 
   // Helper to decode base64 content from GitHub

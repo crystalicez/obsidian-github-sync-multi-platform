@@ -83,6 +83,15 @@ async function timed<T>(phases: Array<[string, number]>, name: string, fn: () =>
   }
 }
 
+async function withDecryptContext<T>(context: string, fn: () => Promise<T>): Promise<T> {
+  try {
+    return await fn();
+  } catch (error) {
+    const message = (error as Error).message || String(error);
+    throw new Error(`${message} [${context}]`, { cause: error });
+  }
+}
+
 async function mapWithConcurrency<T, R>(items: T[], concurrency: number, mapper: (item: T, index: number) => Promise<R>): Promise<R[]> {
   const results = new Array<R>(items.length);
   let nextIndex = 0;
@@ -188,6 +197,7 @@ export class EncryptedV3SyncSession {
           path: newPath,
           pathId: newPathId,
           mtime: change.mtime,
+          encryptedPath: await encryptV3Path({ keyMaterial: this.input.keyMaterial, repoId: this.input.index.repoId, pathId: newPathId, path: newPath }),
           deleted: false,
         };
         this.input.index.shards[oldBucket] = oldShard;
@@ -347,7 +357,7 @@ export class EncryptedV3SyncSession {
       throw new Error("Encrypted v3 force pull requires vault write/delete support.");
     }
     const headFile = await timed(phases, "pull.head", () => this.readRemoteFile(ENCRYPTED_V3_HEAD_PATH));
-    const head = JSON.parse(bytesToUtf8(await decryptV3BinaryPayload(this.input.keyMaterial, headFile, `${this.input.index.repoId}:head`))) as EncryptedV3RemoteHead;
+    const head = JSON.parse(bytesToUtf8(await withDecryptContext("head", () => decryptV3BinaryPayload(this.input.keyMaterial, headFile, `${this.input.index.repoId}:head`)))) as EncryptedV3RemoteHead;
     const remotePaths = new Set<string>();
     let changedBytes = 0;
     let changedFiles = 0;
@@ -360,7 +370,7 @@ export class EncryptedV3SyncSession {
 
     const remoteShards = await timed(phases, "pull.changedShards", () => mapWithConcurrency(Object.keys(head.shardHashes), 8, async (bucket) => {
       const shardFile = await this.readRemoteFile(`.obsidian-github-sync-v3/shards/${bucket}.enc`);
-      const shard = JSON.parse(bytesToUtf8(await decryptV3BinaryPayload(this.input.keyMaterial, shardFile, `${this.input.index.repoId}:${bucket}:shard`))) as EncryptedV3Shard;
+      const shard = JSON.parse(bytesToUtf8(await withDecryptContext(`shard:${bucket}`, () => decryptV3BinaryPayload(this.input.keyMaterial, shardFile, `${this.input.index.repoId}:${bucket}:shard`)))) as EncryptedV3Shard;
       return { bucket, shard };
     }));
 
@@ -473,7 +483,7 @@ export class EncryptedV3SyncSession {
 
   private async decryptRecordPath(record: EncryptedV3ShardRecord): Promise<string> {
     const encryptedPath = fromBase64Url(record.encryptedPath);
-    return bytesToUtf8(await decryptV3BinaryPayload(this.input.keyMaterial, encryptedPath, `${this.input.index.repoId}:${record.pathId}:path`));
+    return bytesToUtf8(await withDecryptContext(`path:${record.pathId}`, () => decryptV3BinaryPayload(this.input.keyMaterial, encryptedPath, `${this.input.index.repoId}:${record.pathId}:path`)));
   }
 
   private readonly packCache = new Map<string, Map<string, Uint8Array>>();
@@ -486,7 +496,7 @@ export class EncryptedV3SyncSession {
       if (!promise) {
         promise = (async () => {
           const packBytes = await timed(phases, "pull.pack", () => this.readRemoteFile(record.objectPath));
-          const files = await decryptV3BasePack({ keyMaterial: this.input.keyMaterial, repoId: this.input.index.repoId, packPath: record.objectPath, bytes: packBytes });
+          const files = await withDecryptContext(`pack:${record.objectPath}`, () => decryptV3BasePack({ keyMaterial: this.input.keyMaterial, repoId: this.input.index.repoId, packPath: record.objectPath, bytes: packBytes }));
           return new Map(files.map(file => [normalizeV3VaultPath(file.path), file.bytes]));
         })();
         this.packPromises.set(record.objectPath, promise);
@@ -502,7 +512,7 @@ export class EncryptedV3SyncSession {
   private async readLooseRecord(record: EncryptedV3ShardRecord, phases: Array<[string, number]>): Promise<Uint8Array> {
     const objectBytes = await timed(phases, "pull.object", () => this.readRemoteFile(record.objectPath));
     const objectId = objectIdFromPath(record.objectPath);
-    return decryptV3BinaryPayload(this.input.keyMaterial, objectBytes, `${this.input.index.repoId}:${objectId}`);
+    return withDecryptContext(`object:${record.objectPath}`, () => decryptV3BinaryPayload(this.input.keyMaterial, objectBytes, `${this.input.index.repoId}:${objectId}`));
   }
 
   private async readChunkedRecord(record: EncryptedV3ShardRecord, phases: Array<[string, number]>): Promise<Uint8Array> {
@@ -513,7 +523,7 @@ export class EncryptedV3SyncSession {
     let total = 0;
     for (const [index, path] of chunkPaths.entries()) {
       const chunkBytes = await timed(phases, "pull.chunk", () => this.readRemoteFile(path));
-      const plaintext = await decryptV3BinaryPayload(this.input.keyMaterial, chunkBytes, `${this.input.index.repoId}:${objectId}:chunk:${index}`);
+      const plaintext = await withDecryptContext(`chunk:${path}`, () => decryptV3BinaryPayload(this.input.keyMaterial, chunkBytes, `${this.input.index.repoId}:${objectId}:chunk:${index}`));
       chunks.push(plaintext);
       total += plaintext.byteLength;
     }

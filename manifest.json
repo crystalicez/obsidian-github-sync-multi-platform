@@ -2,7 +2,7 @@
   "id": "encrypted-github-sync-multi-platform",
   "name": "Encrypted GitHub Sync (Multi-Platform)",
   "version": "1.0.7",
-  "minAppVersion": "1.6.5",
+  "minAppVersion": "1.11.4",
   "description": "Encrypted real-time note synchronization with GitHub across desktop and mobile.",
   "author": "Crystalicez",
   "authorUrl": "https://github.com/crystalicez",

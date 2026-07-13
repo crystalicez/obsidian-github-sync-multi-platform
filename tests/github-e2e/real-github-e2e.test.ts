@@ -678,8 +678,11 @@ randomTest("github e2e: random real-usage actions preserve vault state", { timeo
     await runRequiredCopyBatch(count, label);
   }
 
-  const requiredPulled = new RealE2EVault();
-  await measure("random.requiredCopy.verify", () => encryptedForcePull(plugin(requiredPulled, client) as never), { operation: "forcePull", files: expected.size, changedFiles: expected.size, bytes: randomTotalBytes(expected) });
+  const requiredPulled = await measure(
+    "random.requiredCopy.verify",
+    () => waitForRemoteV3Vault(config, vault => mapsEqualBytes(vault.files, expected).ok, "required-copy"),
+    { operation: "forcePull", files: expected.size, changedFiles: expected.size, bytes: randomTotalBytes(expected) },
+  );
   const requiredComparison = mapsEqualBytes(requiredPulled.files, expected);
   await appendRandomDebug({ phase: "required-copy-verify", files: expected.size, bytes: randomTotalBytes(expected), comparison: requiredComparison });
   assert.equal(requiredComparison.ok, true, requiredComparison.ok ? undefined : requiredComparison.reason);
@@ -710,8 +713,11 @@ randomTest("github e2e: random real-usage actions preserve vault state", { timeo
       }
     }, { step, action, syncMode, files: afterMutation.files, bytes: afterMutation.bytes, changedFiles: changedCount });
     if (verifyEvery > 0 && step % verifyEvery === 0) {
-      const pulled = new RealE2EVault();
-      await measure(`random.verify.${step}`, () => encryptedForcePull(plugin(pulled, client) as never), { step, files: expected.size, changedFiles: expected.size });
+      const pulled = await measure(
+        `random.verify.${step}`,
+        () => waitForRemoteV3Vault(config, vault => mapsEqualBytes(vault.files, expected).ok, `step-${step}`),
+        { step, operation: "forcePull", files: expected.size, changedFiles: expected.size },
+      );
       const comparison = mapsEqualBytes(pulled.files, expected);
       await appendRandomDebug({ phase: "verify", step, action, afterMutation, comparison });
       assert.equal(comparison.ok, true, comparison.ok ? undefined : comparison.reason);
@@ -804,8 +810,11 @@ randomTest("github e2e: random real-usage actions preserve vault state", { timeo
     await syncRandomStep(step, action, changedCount, samples, events);
   }
 
-  const pulled = new RealE2EVault();
-  await measure("random.finalVerify", () => encryptedForcePull(plugin(pulled, client) as never), { files: expected.size, changedFiles: expected.size });
+  const pulled = await measure(
+    "random.finalVerify",
+    () => waitForRemoteV3Vault(config, vault => mapsEqualBytes(vault.files, expected).ok, "final"),
+    { operation: "forcePull", files: expected.size, changedFiles: expected.size },
+  );
   const comparison = mapsEqualBytes(pulled.files, expected);
   await appendRandomDebug({ phase: "complete", seed, steps: actionCount, files: expected.size, bytes: randomTotalBytes(expected), comparison });
   assert.equal(comparison.ok, true, comparison.ok ? undefined : comparison.reason);

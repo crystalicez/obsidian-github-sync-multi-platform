@@ -140,6 +140,11 @@ async function createSession(plugin: FastSync): Promise<EncryptedV3SyncSession> 
   });
 }
 
+function isRetryableV3SyncError(error: unknown): boolean {
+  const message = (error as Error).message ?? "";
+  return /branch head changed|remote changed before local changes/i.test(message);
+}
+
 async function runV3(plugin: FastSync, label: string, operation: () => Promise<{ phaseSummary: string; changedFiles: number; changedBytes: number; mode: string }>): Promise<void> {
   if (!plugin.githubClient) return;
   plugin.isSyncInProgress = true;
@@ -148,9 +153,20 @@ async function runV3(plugin: FastSync, label: string, operation: () => Promise<{
   }
   if (typeof plugin.updateStatusBar === "function") plugin.updateStatusBar();
   try {
-    const result = await operation();
-    syncConsoleLog(plugin.settings, "info", `encrypted v3 ${label} completed`, result);
-    if (plugin.syncProgress) {
+    let result: { phaseSummary: string; changedFiles: number; changedBytes: number; mode: string } | undefined;
+    const maxAttempts = 3;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        result = await operation();
+        syncConsoleLog(plugin.settings, "info", `encrypted v3 ${label} completed`, { ...result, attempt });
+        break;
+      } catch (error) {
+        if (attempt >= maxAttempts || !isRetryableV3SyncError(error)) throw error;
+        syncConsoleLog(plugin.settings, "warn", `encrypted v3 ${label} retrying`, { attempt, error });
+        await new Promise(resolve => setTimeout(resolve, 250 * attempt));
+      }
+    }
+    if (result && plugin.syncProgress) {
       plugin.syncProgress = { status: "success", pushCount: result.changedFiles, totalPush: result.changedFiles, pullCount: 0, totalPull: 0, lastSyncTime: Date.now() };
     }
   } catch (error) {
