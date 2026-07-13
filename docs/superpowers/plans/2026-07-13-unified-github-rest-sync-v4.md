@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- Preserve the four user-owned dirty files until their retry and decrypt-context behavior is ported or retained.
+- Retire all V1–V3 runtime modules and tests after equivalent V4 behavior is covered.
 - Use TDD for every production behavior: add a failing test, observe the expected failure, implement minimally, then run the focused and full relevant suites.
 - No git binary is required at plugin runtime; desktop and mobile use GitHub REST.
 - One published Git commit contains all remote changes for one sync operation.
@@ -36,7 +36,7 @@
 ### Task 2: GitHub transport and atomic publishing
 
 **Files:**
-- Modify: `src/lib/github-api.ts`, `src/lib/v3/git-atomic-writer.ts`
+- Modify: `src/lib/github-api.ts`
 - Create: `src/lib/v4/request-scheduler.ts`, `git-tree-writer.ts`
 - Test: `tests/v4/github-transport.test.ts`, `git-tree-writer.test.ts`
 
@@ -113,7 +113,7 @@
 **Files:**
 - Modify routing and documentation; remove legacy runtime modules only after equivalent tests and dirty behavior are ported.
 
-- [ ] Test remote classification, V1/V2/V3 force-push-only behavior, plaintext-history refusal, empty target initialization, settings migration, and legacy route absence.
-- [ ] Port retry/decrypt-context behavior from the current dirty V3 diff, remove dead routing, and keep regression tests.
+- [ ] Test non-V4 force-push-only behavior, plaintext-history refusal, empty target initialization, settings migration, and legacy route absence.
+- [ ] Move reusable byte, vault, ignore, and scheduling helpers out of legacy namespaces; remove all V1–V3 source, tests, runners, and superseded design documents.
 - [ ] Run `npm test`, `npm run build`, quick real-GitHub E2E when credentials are configured, and the 100k/5 GiB benchmark.
 - [ ] Review the final diff against every requirement and document any environment-dependent E2E that could not run.

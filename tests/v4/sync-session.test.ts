@@ -4,7 +4,7 @@ import test from "node:test";
 import type { GitHubCreateTreeEntry } from "../../src/lib/github-git-types";
 import { createEmptyV4LocalIndex } from "../../src/lib/v4/local-index";
 import { V4SyncSession, type V4SessionVault } from "../../src/lib/v4/sync-session";
-import { V4_FORMAT_VERSION, type V4RemoteConfig } from "../../src/lib/v4/protocol-types";
+import { V4_CONFIG_PATH, V4_FORMAT_VERSION, V4_HEAD_PATH, type V4RemoteConfig, type V4RemoteHead } from "../../src/lib/v4/protocol-types";
 import { deriveV4Keyring } from "../../src/lib/v4/crypto";
 
 const enc = (value: string) => new TextEncoder().encode(value);
@@ -26,12 +26,27 @@ class MemoryGitHub {
   files = new Map<string, Uint8Array>();
   blobs = new Map<string, Uint8Array>();
   trees = new Map<string, Map<string, Uint8Array>>();
-  commits = new Map<string, { treeSha: string; parents: string[] }>();
+  commits = new Map<string, { treeSha: string; parents: string[]; message: string }>();
   commitMessages: string[] = [];
   lastEntries: GitHubCreateTreeEntry[] = [];
-  async getFileBytes(path: string) { const value = this.files.get(path); return value ? { bytes: new Uint8Array(value), sha: `sha-${path}` } : null; }
+  readRefs: Array<string | undefined> = [];
+  readPaths: string[] = [];
+  treeReads: string[] = [];
+  async getFileBytes(path: string, ref?: string) {
+    this.readRefs.push(ref);
+    this.readPaths.push(path);
+    const commit = ref ? this.commits.get(ref) : undefined;
+    const value = commit ? this.trees.get(commit.treeSha)?.get(path) : this.files.get(path);
+    return value ? { bytes: new Uint8Array(value), sha: `sha-${path}` } : null;
+  }
   async getGitRefOrNull() { return this.ref; }
-  async getGitCommit(sha: string) { const value = this.commits.get(sha)!; return { sha, treeSha: value.treeSha, parentShas: value.parents }; }
+  async ensureGitRepositoryInitialized() { return null; }
+  async getGitCommit(sha: string) { const value = this.commits.get(sha)!; return { sha, treeSha: value.treeSha, parentShas: value.parents, message: value.message }; }
+  async getTreeAt(treeSha: string) {
+    this.treeReads.push(treeSha);
+    const tree = this.trees.get(treeSha) ?? new Map();
+    return { sha: treeSha, url: "", truncated: false, tree: [...tree.entries()].map(([path, bytes], index) => ({ path, mode: "100644", type: "blob" as const, sha: `tree-blob-${index}`, size: bytes.byteLength, url: "" })) };
+  }
   async createGitBlob(bytes: Uint8Array) { const sha = `blob-${this.blobs.size + 1}`; this.blobs.set(sha, new Uint8Array(bytes)); return sha; }
   async createGitTree(entries: GitHubCreateTreeEntry[], baseTree?: string) {
     this.lastEntries = entries;
@@ -39,7 +54,7 @@ class MemoryGitHub {
     for (const entry of entries) entry.sha === null ? tree.delete(entry.path) : tree.set(entry.path, new Uint8Array(this.blobs.get(entry.sha)!));
     const sha = `tree-${this.trees.size + 1}`; this.trees.set(sha, tree); return sha;
   }
-  async createGitCommit(message: string, tree: string, parents: string[]) { const sha = `commit-${this.commits.size + 1}`; this.commits.set(sha, { treeSha: tree, parents }); this.commitMessages.push(message); return sha; }
+  async createGitCommit(message: string, tree: string, parents: string[]) { const sha = `commit-${this.commits.size + 1}`; this.commits.set(sha, { treeSha: tree, parents, message }); this.commitMessages.push(message); return sha; }
   async createGitRef(sha: string) { this.ref = { ref: "refs/heads/main", sha, type: "commit" }; this.files = new Map(this.trees.get(this.commits.get(sha)!.treeSha)); }
   async updateGitRef(sha: string, expected?: string) { if (expected && this.ref?.sha !== expected) throw new Error("stale ref"); await this.createGitRef(sha); }
 }
@@ -68,6 +83,21 @@ test("v4 session force-pushes one atomic commit, no-ops unchanged, and force-pul
   assert.equal(pulled.changedFiles, 3);
   assert.equal(dec(target.files.get("a.md")!.bytes), "one");
   assert.equal(target.files.has("old.md"), false);
+});
+
+test("v4 session performs no blob or tree reads when the remote commit is unchanged", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault();
+  vault.files.set("a.md", { bytes: enc("one"), mtime: 1 });
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "d1", mode: "plaintext" });
+  const session = new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 });
+  await session.sync({ operation: "forcePush", allowThresholdOverride: false });
+
+  github.readRefs.length = 0;
+  await session.sync({ operation: "normal", allowThresholdOverride: false });
+
+  assert.deepEqual(github.readRefs, []);
+  assert.deepEqual(github.treeReads, []);
 });
 
 test("v4 force push initializes an empty vault instead of returning a no-op", async () => {
@@ -177,4 +207,122 @@ test("v4 ignore scope stops tracking a path without treating it as a remote dele
   const result = await new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0, includePath: path => path !== "ignored.md" }).sync({ operation: "normal", allowThresholdOverride: false });
   assert.equal(result.changedFiles, 0);
   assert.equal(dec(github.files.get("ignored.md")!), "preserve remotely");
+});
+
+test("v4 merge policy reads the common base commit and publishes a clean three-way merge", async () => {
+  const github = new MemoryGitHub();
+  const first = new MemoryVault();
+  first.files.set("merge.md", { bytes: enc("one\ntwo\nthree"), mtime: 1 });
+  const firstIndex = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "a", mode: "plaintext" });
+  await new V4SyncSession({ github, vault: first, index: firstIndex, config: config(), conflictPolicy: "merge", abortChangePercent: 0 }).sync({ operation: "forcePush", allowThresholdOverride: false });
+
+  const second = new MemoryVault();
+  second.files.set("merge.md", { bytes: enc("one\ntwo\nthree"), mtime: 1 });
+  const secondIndex = structuredClone(firstIndex);
+  secondIndex.deviceId = "b";
+
+  first.files.set("merge.md", { bytes: enc("ONE\ntwo\nthree"), mtime: 2 });
+  await new V4SyncSession({ github, vault: first, index: firstIndex, config: config(), conflictPolicy: "merge", abortChangePercent: 0 }).sync({ operation: "normal", allowThresholdOverride: false });
+  second.files.set("merge.md", { bytes: enc("one\ntwo\nTHREE"), mtime: 3 });
+  await new V4SyncSession({ github, vault: second, index: secondIndex, config: config(), conflictPolicy: "merge", abortChangePercent: 0 }).sync({ operation: "normal", allowThresholdOverride: false });
+
+  assert.equal(dec(second.files.get("merge.md")!.bytes), "ONE\ntwo\nTHREE");
+  assert.equal(dec(github.files.get("merge.md")!), "ONE\ntwo\nTHREE");
+  assert.equal([...second.files.keys()].some(path => path.includes(".conflict-")), false);
+});
+
+test("v4 full rescan handles nested folder rename and delete events", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault();
+  vault.files.set("Folder/a.md", { bytes: enc("a"), mtime: 1 });
+  vault.files.set("Folder/Nested/b.md", { bytes: enc("b"), mtime: 1 });
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "d", mode: "plaintext" });
+  const session = () => new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy" as const, abortChangePercent: 0 });
+  await session().sync({ operation: "forcePush", allowThresholdOverride: false });
+
+  const a = vault.files.get("Folder/a.md")!;
+  const b = vault.files.get("Folder/Nested/b.md")!;
+  vault.files.delete("Folder/a.md");
+  vault.files.delete("Folder/Nested/b.md");
+  vault.files.set("Renamed/a.md", { ...a, mtime: 2 });
+  vault.files.set("Renamed/Nested/b.md", { ...b, mtime: 2 });
+  vault.listCount = 0;
+  await session().sync({ operation: "normal", allowThresholdOverride: false, changes: [{ type: "rescan", mtime: 2 }] });
+  assert.ok(vault.listCount > 0);
+  assert.equal(github.files.has("Folder/a.md"), false);
+  assert.equal(dec(github.files.get("Renamed/Nested/b.md")!), "b");
+
+  vault.files.delete("Renamed/a.md");
+  vault.files.delete("Renamed/Nested/b.md");
+  await session().sync({ operation: "normal", allowThresholdOverride: false, changes: [{ type: "rescan", mtime: 3 }] });
+  assert.equal(github.files.has("Renamed/a.md"), false);
+  assert.equal(github.files.has("Renamed/Nested/b.md"), false);
+});
+
+test("v4 stale device reconciles a direct GitHub edit after a newer plugin commit", async () => {
+  const github = new MemoryGitHub();
+  const first = new MemoryVault();
+  first.files.set("external.md", { bytes: enc("base"), mtime: 1 });
+  first.files.set("plugin.md", { bytes: enc("base"), mtime: 1 });
+  const firstIndex = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "a", mode: "plaintext" });
+  await new V4SyncSession({ github, vault: first, index: firstIndex, config: config(), conflictPolicy: "copy", abortChangePercent: 0 }).sync({ operation: "forcePush", allowThresholdOverride: false });
+
+  const staleVault = new MemoryVault();
+  staleVault.files = new Map([...first.files].map(([path, file]) => [path, { bytes: new Uint8Array(file.bytes), mtime: file.mtime }]));
+  const staleIndex = structuredClone(firstIndex);
+  staleIndex.deviceId = "stale";
+
+  first.files.set("plugin.md", { bytes: enc("plugin gen2"), mtime: 2 });
+  await new V4SyncSession({ github, vault: first, index: firstIndex, config: config(), conflictPolicy: "copy", abortChangePercent: 0 }).sync({ operation: "normal", allowThresholdOverride: false });
+
+  const pluginTip = github.ref!.sha;
+  const pluginTree = github.commits.get(pluginTip)!.treeSha;
+  const externalTree = new Map(github.trees.get(pluginTree));
+  externalTree.set("external.md", enc("edited on GitHub"));
+  github.trees.set("tree-external", externalTree);
+  github.commits.set("commit-external", { treeSha: "tree-external", parents: [pluginTip], message: "Edit external.md on GitHub" });
+  github.ref = { ref: "refs/heads/main", sha: "commit-external", type: "commit" };
+  github.files = new Map(externalTree);
+
+  await new V4SyncSession({ github, vault: staleVault, index: staleIndex, config: config(), conflictPolicy: "copy", abortChangePercent: 0 }).sync({ operation: "normal", allowThresholdOverride: false });
+
+  assert.equal(dec(staleVault.files.get("plugin.md")!.bytes), "plugin gen2");
+  assert.equal(dec(staleVault.files.get("external.md")!.bytes), "edited on GitHub");
+  assert.ok(github.treeReads.includes("tree-external"));
+});
+
+test("v4 no-op reuses all 256 unchanged local index shards", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault();
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "d", mode: "plaintext" });
+  const shardHashes: Record<string, string> = {};
+  for (let value = 0; value < 256; value++) {
+    const bucket = value.toString(16).padStart(2, "0");
+    const path = `notes/${bucket}.md`;
+    const pathId = `${bucket}${"0".repeat(62)}`;
+    const record = { path, pathId, fileId: `file-${bucket}`, plaintextSha256: `hash-${bucket}`, size: 1, mtime: 1, remoteVersion: "j1", remotePath: path, storage: "single" as const };
+    const hash = `shard-${bucket}`;
+    shardHashes[bucket] = hash;
+    index.shardHashes[bucket] = hash;
+    index.shards[bucket] = { hash, records: { [pathId]: record } };
+    vault.files.set(path, { bytes: enc("x"), mtime: 1 });
+  }
+  index.remoteCommitSha = "commit-previous";
+  index.epoch = 1;
+  index.generation = 1;
+  const head: V4RemoteHead = { formatVersion: 4, mode: "plaintext", epoch: 1, generation: 1, journalId: "j1", shardHashes, updatedAt: 1, deviceId: "other" };
+  const tree = new Map<string, Uint8Array>([
+    [V4_CONFIG_PATH, enc(JSON.stringify(config()))],
+    [V4_HEAD_PATH, enc(JSON.stringify(head))],
+  ]);
+  github.trees.set("tree-noop", tree);
+  github.commits.set("commit-noop", { treeSha: "tree-noop", parents: [], message: "obsidian-sync-v4:j1" });
+  github.ref = { ref: "refs/heads/main", sha: "commit-noop", type: "commit" };
+  github.files = new Map(tree);
+
+  const result = await new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 }).sync({ operation: "normal", allowThresholdOverride: false });
+
+  assert.equal(result.mode, "noop");
+  assert.deepEqual(github.readPaths, [V4_CONFIG_PATH, V4_HEAD_PATH]);
+  assert.equal(vault.operations.length, 0);
 });

@@ -1,4 +1,4 @@
-import { bytesToUtf8, utf8ToBytes } from "../encrypted/bytes"
+import { bytesToUtf8, utf8ToBytes } from "../bytes"
 import { decryptV4Payload, encryptV4Payload, type V4Keyring } from "./crypto"
 import type { V4IndexFileRecord } from "./local-index"
 import { V4_CONFIG_PATH, V4_HEAD_PATH, V4_ROOT, type V4RemoteConfig, type V4RemoteHead } from "./protocol-types"

@@ -108,3 +108,30 @@ test("v4 coordinator does not let a scheduled tick cut short a pending local deb
   await coordinator.whenIdle();
   assert.deepEqual(executions, ["localChange:1"]);
 });
+
+test("v4 coalescing follows the final filesystem state for replacement and rename-delete sequences", async () => {
+  const executions: V4QueuedChange[][] = [];
+  const coordinator = new V4SyncCoordinator({ execute: async (_request, changes) => { executions.push(changes); return { changedFiles: changes.length }; } });
+
+  coordinator.enqueue({ type: "delete", path: "replaced.md", mtime: 1 });
+  coordinator.enqueue({ type: "modify", path: "replaced.md", mtime: 2 });
+  await coordinator.run({ operation: "normal", trigger: "manual" });
+
+  coordinator.enqueue({ type: "rename", oldPath: "old.md", path: "new.md", mtime: 3 });
+  coordinator.enqueue({ type: "delete", path: "new.md", mtime: 4 });
+  await coordinator.run({ operation: "normal", trigger: "manual" });
+
+  assert.deepEqual(executions, [
+    [{ type: "modify", path: "replaced.md", mtime: 2 }],
+    [{ type: "delete", path: "old.md", mtime: 4 }],
+  ]);
+});
+
+test("v4 coordinator collapses folder events to one full rescan", async () => {
+  const executions: V4QueuedChange[][] = [];
+  const coordinator = new V4SyncCoordinator({ execute: async (_request, changes) => { executions.push(changes); return { changedFiles: changes.length }; } });
+  coordinator.enqueue({ type: "rescan", mtime: 1 });
+  coordinator.enqueue({ type: "modify", path: "Folder/note.md", mtime: 2 });
+  await coordinator.run({ operation: "normal", trigger: "manual" });
+  assert.deepEqual(executions, [[{ type: "rescan", mtime: 2 }]]);
+});

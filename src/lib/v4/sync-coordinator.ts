@@ -5,7 +5,9 @@ export type V4SyncTrigger = "startup" | "localChange" | "scheduled" | "manual" |
 export type V4QueuedChange =
   | { type: "modify"; path: string; mtime: number }
   | { type: "delete"; path: string; mtime: number }
-  | { type: "rename"; oldPath: string; path: string; mtime: number };
+  | { type: "rename"; oldPath: string; path: string; mtime: number }
+  | { type: "rescan"; mtime: number };
+type V4PathChange = Exclude<V4QueuedChange, { type: "rescan" }>;
 
 export interface V4SyncRequest {
   operation: V4SyncOperation;
@@ -25,9 +27,13 @@ export interface V4SyncCoordinatorOptions {
 }
 
 export function coalesceV4Changes(changes: V4QueuedChange[]): V4QueuedChange[] {
+  if (changes.some(change => change.type === "rescan")) {
+    return [{ type: "rescan", mtime: Math.max(...changes.map(change => change.mtime)) }];
+  }
   const byPath = new Map<string, V4QueuedChange>();
-  for (const raw of changes) {
-    const change: V4QueuedChange = raw.type === "rename"
+  const pathChanges = changes.filter((change): change is V4PathChange => change.type !== "rescan");
+  for (const raw of pathChanges) {
+    const change: V4PathChange = raw.type === "rename"
       ? { ...raw, oldPath: normalizeV4VaultPath(raw.oldPath), path: normalizeV4VaultPath(raw.path) }
       : { ...raw, path: normalizeV4VaultPath(raw.path) };
     if (change.type === "rename") {
@@ -39,11 +45,16 @@ export function coalesceV4Changes(changes: V4QueuedChange[]): V4QueuedChange[] {
       continue;
     }
     if (change.type === "delete") {
+      const previous = byPath.get(change.path);
+      if (previous?.type === "rename") {
+        byPath.delete(change.path);
+        byPath.set(previous.oldPath, { type: "delete", path: previous.oldPath, mtime: Math.max(previous.mtime, change.mtime) });
+        continue;
+      }
       byPath.set(change.path, { ...change });
       continue;
     }
     const previous = byPath.get(change.path);
-    if (previous?.type === "delete") continue;
     if (previous?.type === "rename") {
       byPath.set(change.path, { ...previous, mtime: Math.max(previous.mtime, change.mtime) });
       continue;

@@ -93,3 +93,116 @@ test("GitHubClient routes REST calls through rate-limit retries", async () => {
     setRequestUrlHandler(null);
   }
 });
+
+test("GitHubClient pins file reads to an explicit commit SHA", async () => {
+  const requestUrls: string[] = [];
+  let accept = "";
+  setRequestUrlHandler(async (options: unknown) => {
+    const request = options as { url: string; headers: Record<string, string> };
+    requestUrls.push(request.url);
+    if (request.url.includes("/contents/")) {
+      accept = request.headers.Accept;
+      return {
+        status: 200,
+        text: "",
+        headers: {},
+        json: { content: "dHJhbnNmb3JtZWQ=", encoding: "base64", sha: "blob-sha" },
+        arrayBuffer: new ArrayBuffer(0),
+      };
+    }
+    return {
+      status: 200,
+      text: "payload",
+      headers: {},
+      json: undefined,
+      arrayBuffer: new TextEncoder().encode("payload").buffer,
+    };
+  });
+  try {
+    const client = new GitHubClient({ token: "token", owner: "owner", repo: "repo", branch: "main" });
+    const file = await client.getFileBytes(".obsidian-github-sync-v4/head", "commit/sha");
+    assert.match(requestUrls[0], /ref=commit%2Fsha/u);
+    assert.equal(accept, "application/vnd.github.object+json");
+    assert.equal(new TextDecoder().decode(file!.bytes), "payload");
+    assert.equal(file!.sha, "blob-sha");
+    assert.equal(requestUrls[1].endsWith("/git/blobs/blob-sha"), true);
+  } finally {
+    setRequestUrlHandler(null);
+  }
+});
+
+test("GitHubClient bootstraps a truly empty repository before Git ref writes", async () => {
+  const requests: Array<Record<string, any>> = [];
+  setRequestUrlHandler(async (options: unknown) => {
+    const request = options as Record<string, any>;
+    requests.push(request);
+    if (request.url.includes("/git/refs?")) return { status: 409, text: "Git Repository is empty.", headers: {}, json: {} };
+    if (request.method === "PUT") return { status: 201, text: "", headers: {}, json: { commit: { sha: "bootstrap-commit" } } };
+    if (request.method === "GET" && request.url.includes("/git/ref/heads/")) {
+      return { status: 200, text: "", headers: {}, json: { ref: "refs/heads/main", object: { sha: "bootstrap-commit", type: "commit" } } };
+    }
+    throw new Error(`Unexpected request: ${request.method} ${request.url}`);
+  });
+  try {
+    const client = new GitHubClient({ token: "token", owner: "owner", repo: "repo", branch: "main" });
+    const ref = await client.ensureGitRepositoryInitialized();
+
+    assert.equal(ref?.sha, "bootstrap-commit");
+    const put = requests.find(request => request.method === "PUT")!;
+    assert.match(put.url, /\/contents\/\.obsidian-github-sync-v4\/bootstrap$/u);
+    const body = JSON.parse(put.body);
+    assert.equal(body.branch, undefined);
+    assert.equal(body.message, "obsidian-sync-v4:bootstrap");
+  } finally {
+    setRequestUrlHandler(null);
+  }
+});
+
+test("GitHubClient creates a configured custom branch after empty-repository bootstrap", async () => {
+  const requests: Array<Record<string, any>> = [];
+  let customRefReads = 0;
+  setRequestUrlHandler(async (options: unknown) => {
+    const request = options as Record<string, any>;
+    requests.push(request);
+    if (request.url.includes("/git/refs?")) return { status: 409, text: "empty", headers: {}, json: {} };
+    if (request.method === "PUT") return { status: 201, text: "", headers: {}, json: { commit: { sha: "bootstrap-commit" } } };
+    if (request.method === "GET" && request.url.includes("/git/ref/heads/v4-sync")) {
+      customRefReads++;
+      return customRefReads === 1
+        ? { status: 404, text: "missing", headers: {}, json: {} }
+        : { status: 200, text: "", headers: {}, json: { ref: "refs/heads/v4-sync", object: { sha: "bootstrap-commit", type: "commit" } } };
+    }
+    if (request.method === "POST" && request.url.endsWith("/git/refs")) return { status: 201, text: "", headers: {}, json: {} };
+    throw new Error(`Unexpected request: ${request.method} ${request.url}`);
+  });
+  try {
+    const client = new GitHubClient({ token: "token", owner: "owner", repo: "repo", branch: "v4-sync" });
+    const ref = await client.ensureGitRepositoryInitialized();
+    assert.equal(ref?.ref, "refs/heads/v4-sync");
+    const createRef = requests.find(request => request.method === "POST")!;
+    assert.deepEqual(JSON.parse(createRef.body), { ref: "refs/heads/v4-sync", sha: "bootstrap-commit" });
+  } finally {
+    setRequestUrlHandler(null);
+  }
+});
+
+test("GitHubClient falls back to Git Blob bytes when Contents omits a large payload", async () => {
+  const requests: string[] = [];
+  setRequestUrlHandler(async (options: unknown) => {
+    const url = (options as { url: string }).url;
+    requests.push(url);
+    if (url.includes("/contents/")) {
+      return { status: 200, text: "", headers: {}, json: { content: "", encoding: "none", sha: "large-blob" }, arrayBuffer: new ArrayBuffer(0) };
+    }
+    return { status: 200, text: "payload", headers: {}, json: undefined, arrayBuffer: new TextEncoder().encode("large payload").buffer };
+  });
+  try {
+    const client = new GitHubClient({ token: "token", owner: "owner", repo: "repo", branch: "main" });
+    const file = await client.getFileBytes("large.bin", "commit-sha");
+    assert.equal(new TextDecoder().decode(file!.bytes), "large payload");
+    assert.equal(file!.sha, "large-blob");
+    assert.equal(requests.some(url => url.endsWith("/git/blobs/large-blob")), true);
+  } finally {
+    setRequestUrlHandler(null);
+  }
+});

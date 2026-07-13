@@ -1,4 +1,4 @@
-import { bytesToUtf8, fromBase64, sha256Hex, toBase64, utf8ToBytes } from "../encrypted/bytes"
+import { bytesToUtf8, fromBase64, sha256Hex, toBase64, utf8ToBytes } from "../bytes"
 import { decryptV4Payload, encryptV4Payload, type V4Keyring } from "./crypto"
 import {
   buildV4PartPaths,

@@ -1,7 +1,7 @@
 import { Modal, Notice, TFile } from "obsidian"
 import type FastSync from "../../main"
-import { fromBase64Url, randomBytes, toBase64Url } from "../encrypted/bytes"
-import { readVaultFileBytes, writeVaultFileBytes, deleteVaultFileIfExists } from "../encrypted/vault"
+import { fromBase64Url, randomBytes, toBase64Url } from "../bytes"
+import { readVaultFileBytes, writeVaultFileBytes, deleteVaultFileIfExists } from "../vault"
 import { deriveV4Keyring } from "./crypto"
 import {
   createEmptyV4LocalIndex,
@@ -74,7 +74,8 @@ export class V4PluginRuntime {
 
   async createHistoryService(): Promise<V4HistoryService> {
     if (!this.plugin.githubClient) throw new Error("GitHub connection is not configured.")
-    const remote = await this.plugin.githubClient.getFileBytes(V4_CONFIG_PATH)
+    const ref = await this.plugin.githubClient.getGitRefOrNull()
+    const remote = ref ? await this.plugin.githubClient.getFileBytes(V4_CONFIG_PATH, ref.sha) : null
     if (!remote) throw new Error("V4 history is not initialized. Force Push first.")
     const config = decodeV4RemoteConfig(remote.bytes)
     const keyring = config.mode === "encrypted"
@@ -100,9 +101,15 @@ export class V4PluginRuntime {
   enqueueModify(path: string, mtime: number): void { this.enqueue({ type: "modify", path, mtime }) }
   enqueueDelete(path: string): void { this.enqueue({ type: "delete", path, mtime: Date.now() }) }
   enqueueRename(oldPath: string, path: string): void { this.enqueue({ type: "rename", oldPath, path, mtime: Date.now() }) }
+  enqueueRescan(): void { this.enqueue({ type: "rescan", mtime: Date.now() }) }
 
   private enqueue(change: V4QueuedChange): void {
     if (!this.plugin.settings.syncEnabled || !this.plugin.settings.syncOnLocalChange || !this.plugin.isWatchEnabled) return
+    if (change.type === "rescan") {
+      this.coordinator.enqueue(change)
+      this.markWaiting()
+      return
+    }
     if (this.plugin.ignoredFiles.has(change.path)) return
     try {
       if (!this.inScope(change.path) && (change.type !== "rename" || !this.inScope(change.oldPath))) return
@@ -111,6 +118,10 @@ export class V4PluginRuntime {
       return
     }
     this.coordinator.enqueue(change)
+    this.markWaiting()
+  }
+
+  private markWaiting(): void {
     this.plugin.syncProgress = {
       ...this.plugin.syncProgress,
       status: "waiting",
@@ -147,7 +158,8 @@ export class V4PluginRuntime {
   }
 
   private async remoteOrNewConfig(): Promise<V4RemoteConfig> {
-    const remote = await this.plugin.githubClient.getFileBytes(V4_CONFIG_PATH)
+    const ref = await this.plugin.githubClient.getGitRefOrNull()
+    const remote = ref ? await this.plugin.githubClient.getFileBytes(V4_CONFIG_PATH, ref.sha) : null
     if (remote) return decodeV4RemoteConfig(remote.bytes)
     const mode = this.plugin.settings.encryptionMode
     if (mode === "plaintext") return { formatVersion: V4_FORMAT_VERSION, mode, repoId: this.repoId() }

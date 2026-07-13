@@ -1,59 +1,23 @@
-import { Plugin, setIcon, Modal, Notice, TFile } from "obsidian";
+import { Plugin, setIcon, Modal, Notice, TFile, TFolder, moment } from "obsidian";
 
 import { SettingTab, PluginSettings, DEFAULT_SETTINGS } from "./setting";
 import { GitHubClient } from "./lib/github-api";
-import { moment } from "./lang/lang";
-import { calculateWordCount } from "./lib/helps";
-import type { EncryptedLocalFileState } from "./lib/encrypted/types";
-import { normalizeScheduledSyncIntervalSeconds, shouldRunScheduledSync, shouldRunStartupSync } from "./lib/encrypted/settings-policy";
+import { normalizeScheduledSyncIntervalSeconds, shouldRunScheduledSync, shouldRunStartupSync } from "./lib/sync-policy";
 import { migrateV4Secrets, sanitizeV4SettingsForPersistence, storeV4Secrets } from "./lib/v4/secrets";
 import { V4PluginRuntime } from "./lib/v4/runtime";
 import { V4SyncCenterView, V4_SYNC_CENTER_VIEW } from "./views/sync-center";
 
-
-interface SyncSkipFiles {
-  [key: string]: string
-}
-interface EditorChangeTimeout {
-  [key: string]: unknown
-}
-
-export interface FileState {
-  sha: string;
-  lastSync: number;
-  hash?: string; // Cache the content hash
-  size?: number;
-  mtime?: number;
-}
-
-export interface SyncData {
-  files: { [path: string]: FileState };
-  lastRemoteHeadSha?: string;
-  encrypted?: {
-    files: { [path: string]: EncryptedLocalFileState };
-    manifestSha?: string;
-  };
-}
 
 export default class FastSync extends Plugin {
   settingTab: SettingTab
   settings: PluginSettings
   githubClient: GitHubClient
   v4Runtime: V4PluginRuntime
-  syncData: SyncData = { files: {} }
 
   isSyncInProgress: boolean = false
-  debounceTimers: Map<string, number> = new Map()
-
-  syncSkipFiles: SyncSkipFiles = {}
-  syncSkipDelFiles: SyncSkipFiles = {}
-  syncSkipModifyFiles: SyncSkipFiles = {}
   clipboardReadTip: string = ""
 
-  editorChangeTimeout: EditorChangeTimeout = {}
-
   ribbonIcon: HTMLElement
-  ribbonIconStatus: boolean = false
   statusBarItem: HTMLElement | null = null
   saveNoticeTimeout: number | null = null
   syncProgress: {
@@ -96,10 +60,7 @@ export default class FastSync extends Plugin {
 
 
   async onload() {
-    this.syncSkipFiles = {}
-
     await this.loadSettings()
-    await this.loadSyncData()
     if (this.secretsMigrated) await this.persistData()
 
     this.settingTab = new SettingTab(this.app, this)
@@ -142,8 +103,14 @@ export default class FastSync extends Plugin {
     this.registerEvent(this.app.vault.on("modify", (file) => {
       if (file instanceof TFile) this.v4Runtime.enqueueModify(file.path, file.stat.mtime)
     }))
-    this.registerEvent(this.app.vault.on("delete", (file) => this.v4Runtime.enqueueDelete(file.path)))
-    this.registerEvent(this.app.vault.on("rename", (file, oldfile) => this.v4Runtime.enqueueRename(oldfile, file.path)))
+    this.registerEvent(this.app.vault.on("delete", (file) => {
+      if (file instanceof TFile) this.v4Runtime.enqueueDelete(file.path)
+      else if (file instanceof TFolder) this.v4Runtime.enqueueRescan()
+    }))
+    this.registerEvent(this.app.vault.on("rename", (file, oldfile) => {
+      if (file instanceof TFile) this.v4Runtime.enqueueRename(oldfile, file.path)
+      else if (file instanceof TFolder) this.v4Runtime.enqueueRescan()
+    }))
 
     // Register commands
     this.addCommand({
@@ -175,7 +142,6 @@ export default class FastSync extends Plugin {
       if (shouldRunStartupSync(this.settings)) {
         // Delay 1.5 s to let Obsidian finish initialising
         setTimeout(() => {
-          // syncAllFilesImpl calls enableWatch() internally after it completes
           void this.v4Runtime.startupSync();
         }, 1500);
       } else {
@@ -197,9 +163,6 @@ export default class FastSync extends Plugin {
   }
 
   onunload() {
-    // Clear all debounce timers to prevent callbacks from firing after the plugin is unloaded (memory leak)
-    this.debounceTimers.forEach(timer => clearTimeout(timer));
-    this.debounceTimers.clear();
     if (this.scheduledSyncTimer) window.clearInterval(this.scheduledSyncTimer);
     this.scheduledSyncTimer = null;
     this.v4Runtime?.dispose()
@@ -225,14 +188,10 @@ export default class FastSync extends Plugin {
     }
   }
 
-  /**
-   * Unified persistence entry point: settings and syncData are always stored in the same object
-   * to prevent saveSettings / saveSyncData from overwriting each other's data.
-   */
+  /** Persist only current V4 settings; the V4 local index uses its own sharded adapter storage. */
   async persistData() {
     await this.saveData({
       settings: sanitizeV4SettingsForPersistence(this.settings),
-      syncData: this.syncData,
     });
   }
 
@@ -272,49 +231,6 @@ export default class FastSync extends Plugin {
     this.registerScheduledSync()
     this.updateRibbonIcon(!!(this.settings.githubToken && this.settings.githubOwner && this.settings.githubRepo))
     await this.persistData()
-  }
-
-  async loadSyncData() {
-    const data = await this.loadData() ?? {};
-    this.syncData = data.syncData ?? { files: {} };
-    if (!this.syncData.encrypted) this.syncData.encrypted = { files: {} };
-  }
-
-  async saveSyncData() {
-    await this.persistData();
-  }
-
-  async updateStats() {
-    if (this.settings.encryptionMode === "encrypted") return;
-    if (!this.githubClient) return;
-
-    const stats: { [month: string]: number } = {};
-    const files = this.app.vault.getMarkdownFiles();
-
-    for (const file of files) {
-      const content = await this.app.vault.read(file);
-      const wordCount = calculateWordCount(content);
-      const month = moment(file.stat.mtime).format("YYYY-MM");
-      stats[month] = (stats[month] || 0) + wordCount;
-    }
-
-    const statsJson = JSON.stringify({
-      lastUpdate: Date.now(),
-      monthlyStats: stats
-    }, null, 2);
-
-    const path = `${this.app.vault.configDir}/sync-stats.json`;
-    try {
-      const existingSha = this.syncData.files[path]?.sha;
-      const newSha = await this.githubClient.putFile(path, statsJson, existingSha);
-      this.syncData.files[path] = {
-        sha: newSha,
-        lastSync: Date.now()
-      };
-      await this.saveSyncData();
-    } catch (e) {
-      console.error("Failed to update stats on GitHub", e);
-    }
   }
 
   showSavedFeedback() {

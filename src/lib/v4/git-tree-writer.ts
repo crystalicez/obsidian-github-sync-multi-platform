@@ -12,6 +12,7 @@ export interface V4GitTreeWriteResult {
 
 export interface V4GitTreeGithub {
   getGitRefOrNull(): Promise<GitHubGitRef | null>;
+  ensureGitRepositoryInitialized?(): Promise<GitHubGitRef | null>;
   getGitCommit(sha: string): Promise<GitHubGitCommit>;
   createGitBlob(bytes: Uint8Array): Promise<string>;
   createGitTree(entries: GitHubCreateTreeEntry[], baseTree?: string): Promise<string>;
@@ -33,10 +34,11 @@ async function mapWithConcurrency<T, R>(items: T[], concurrency: number, mapper:
 }
 
 export async function publishV4TreeChanges(github: V4GitTreeGithub, input: V4GitTreeWriteInput): Promise<V4GitTreeWriteResult> {
-  const ref = await github.getGitRefOrNull();
+  let ref = await github.getGitRefOrNull();
   if (input.expectedHeadSha !== undefined && (ref?.sha ?? null) !== input.expectedHeadSha) {
     throw new Error("V4 branch head changed before atomic publish.")
   }
+  if (!ref && github.ensureGitRepositoryInitialized) ref = await github.ensureGitRepositoryInitialized();
   const baseTreeSha = ref ? (await github.getGitCommit(ref.sha)).treeSha : undefined;
   const blobWrites = await mapWithConcurrency(input.files, 4, async file => ({ file, sha: await github.createGitBlob(file.bytes) }));
   const fileShas: Record<string, string> = {};

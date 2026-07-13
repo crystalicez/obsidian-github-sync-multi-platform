@@ -1,4 +1,4 @@
-import { sha256Hex } from "../encrypted/bytes";
+import { sha256Hex } from "../bytes";
 import { normalizeV4VaultPath } from "./paths";
 import { V4_ROOT, type V4StorageMode } from "./protocol-types";
 

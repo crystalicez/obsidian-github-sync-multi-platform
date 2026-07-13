@@ -1,21 +1,15 @@
 import { requestUrl, type RequestUrlParam, type RequestUrlResponse } from "obsidian";
-import { bytesToUtf8, fromBase64, toBase64, utf8ToBytes } from "./encrypted/bytes";
+import { fromBase64, toBase64, utf8ToBytes } from "./bytes";
 import type { GitHubCreateTreeEntry, GitHubGitCommit, GitHubGitRef } from "./github-git-types";
 import { V4RequestScheduler } from "./v4/request-scheduler";
+
+const V4_BOOTSTRAP_PATH = ".obsidian-github-sync-v4/bootstrap";
 
 export interface GitHubConfig {
   owner: string;
   repo: string;
   branch: string;
   token: string;
-}
-
-export interface GitHubFileResponse {
-  content: string;
-  sha: string;
-  path: string;
-  size: number;
-  download_url?: string;
 }
 
 export interface GitHubTreeNode {
@@ -86,47 +80,25 @@ export class GitHubClient {
     };
   }
 
-  async getFile(path: string): Promise<GitHubFileResponse | null> {
+  async getFileBytes(path: string, ref = this.config.branch): Promise<{ bytes: Uint8Array; sha: string } | null> {
     const encodedPath = path.split('/').map(encodeURIComponent).join('/');
-    const url = `${this.baseUrl}/contents/${encodedPath}?ref=${this.config.branch}&_=${Date.now()}`;
+    const url = `${this.baseUrl}/contents/${encodedPath}?ref=${encodeURIComponent(ref)}&_=${Date.now()}`;
     try {
       const response = await this.request({
         url,
         method: "GET",
-        headers: this.headers,
+        headers: { ...this.headers, Accept: "application/vnd.github.object+json" },
         throw: false,
       });
 
       if (response.status === 200) {
-        return response.json as GitHubFileResponse;
-      }
-      if (response.status === 404) return null;
-      throw new Error("Failed to get file " + path + ": HTTP " + response.status + " - " + response.text);
-    } catch (error) {
-      const httpError = error as { status?: number };
-      if (httpError.status === 404) return null;
-      throw error;
-    }
-  }
-
-  async getFileBytes(path: string): Promise<{ bytes: Uint8Array; sha: string } | null> {
-    const encodedPath = path.split('/').map(encodeURIComponent).join('/');
-    const url = `${this.baseUrl}/contents/${encodedPath}?ref=${this.config.branch}&_=${Date.now()}`;
-    try {
-      const response = await this.request({
-        url,
-        method: "GET",
-        headers: {
-          ...this.headers,
-          Accept: "application/vnd.github.v3.raw",
-        },
-        throw: false,
-      });
-
-      if (response.status === 200) {
-        const etag = response.headers["etag"] || response.headers["ETag"];
-        const sha = etag ? etag.replace(/^(W\/)?"|"/g, "") : "";
-        return { bytes: new Uint8Array(response.arrayBuffer), sha };
+        const json = response.json as { content?: string; encoding?: string; sha?: string };
+        const sha = json.sha ?? "";
+        if (sha) return { bytes: await this.getBlob(sha), sha };
+        if (json.encoding === "base64" && typeof json.content === "string") {
+          return { bytes: fromBase64(json.content), sha };
+        }
+        throw new Error(`GitHub Contents response has no decodable payload for ${path}.`);
       }
       if (response.status === 404) return null;
       throw new Error("Failed to get file bytes " + path + ": HTTP " + response.status + " - " + response.text);
@@ -145,7 +117,7 @@ export class GitHubClient {
         method: "GET",
         headers: {
           ...this.headers,
-          Accept: "application/vnd.github.v3.raw",
+          Accept: "application/vnd.github.raw+json",
         },
         throw: false,
       });
@@ -157,139 +129,6 @@ export class GitHubClient {
     } catch (error) {
       throw error;
     }
-  }
-
-  async putFileCas(path: string, content: string | ArrayBuffer, sha?: string): Promise<string> {
-    const response = await this._doPutRequest(path, content, sha);
-    if (response.status === 200 || response.status === 201) {
-      return (response.json as { content: { sha: string } }).content.sha;
-    }
-    const error = new Error(`Failed to put file with CAS: ${response.status} ${response.text}`) as Error & { status?: number };
-    error.status = response.status;
-    throw error;
-  }
-  async putFile(path: string, content: string | ArrayBuffer, sha?: string): Promise<string> {
-    const response = await this._doPutRequest(path, content, sha);
-
-    // 409 = local cached sha is outdated (SHA conflict)
-    // 422 = validation failed; common reason: file already exists but sha was not provided (GitHub inconsistent behavior)
-    // Both cases use the same strategy: re-GET the latest sha and retry once
-    if (response.status === 409 || response.status === 422) {
-      const remoteFile = await this.getFile(path);
-      const freshSha = remoteFile?.sha;
-      if (!freshSha && response.status === 422) {
-        // 422 and the remote file does not exist -> real validation failure, do not retry
-        throw new Error(`Failed to put file ${path} (422 validation error): ${response.text}`);
-      }
-      const retry = await this._doPutRequest(path, content, freshSha);
-      if (retry.status === 200 || retry.status === 201) {
-        return (retry.json as { content: { sha: string } }).content.sha;
-      }
-      throw new Error(`Failed to put file ${path} after sha retry (${response.status}→${retry.status}): ${retry.text}`);
-    }
-
-    if (response.status === 200 || response.status === 201) {
-      return (response.json as { content: { sha: string } }).content.sha;
-    }
-    throw new Error(`Failed to put file ${path}: ${response.status} ${response.text}`);
-  }
-
-  private async _doPutRequest(
-    path: string,
-    content: string | ArrayBuffer,
-    sha?: string
-  ): Promise<{ status: number; json: Record<string, unknown>; text: string }> {
-    const encodedPath = path.split('/').map(encodeURIComponent).join('/');
-    const url = `${this.baseUrl}/contents/${encodedPath}`;
-
-    const base64Content = typeof content === "string" ? toBase64(utf8ToBytes(content)) : toBase64(content);
-
-    const body: Record<string, unknown> = {
-      message: `sync: ${sha ? "update" : "create"} ${path}`,
-      content: base64Content,
-      branch: this.config.branch,
-    };
-    if (sha) body.sha = sha;
-
-    // requestUrl defaults to throwing on 4xx/5xx; throw: false ensures we always get a response object
-    // so that 409/422 status code checks work 100% of the time
-    try {
-      const res = await this.request({
-        url,
-        method: "PUT",
-        headers: this.headers,
-        body: JSON.stringify(body),
-        throw: false,
-      });
-      return { status: res.status, json: res.json as Record<string, unknown>, text: res.text };
-    } catch (err: unknown) {
-      // Fallback: if throw: false is ignored, catch the exception and return a synthetic response
-      const e = err as { status?: number; message?: string };
-      return {
-        status: e.status ?? 0,
-        json: {} as Record<string, unknown>,
-        text: e.message ?? String(err),
-      };
-    }
-  }
-
-  async deleteFile(path: string, sha: string): Promise<void> {
-    const encodedPath = path.split('/').map(encodeURIComponent).join('/');
-    const url = `${this.baseUrl}/contents/${encodedPath}`;
-    const body = {
-      message: `sync: delete ${path}`,
-      sha,
-      branch: this.config.branch,
-    };
-
-    try {
-      const response = await this.request({
-        url,
-        method: "DELETE",
-        headers: this.headers,
-        body: JSON.stringify(body),
-        throw: false,
-      });
-
-      if (response.status === 200 || response.status === 204 || response.status === 404) {
-        return;
-      }
-      throw new Error(`Failed to delete file: HTTP ${response.status} - ${response.text}`);
-    } catch (error) {
-      const httpError = error as { status?: number };
-      if (httpError.status === 404) return;
-      throw error;
-    }
-  }
-
-  async getRemoteHeadSha(): Promise<string | null> {
-    const encodedBranch = this.config.branch.split("/").map(encodeURIComponent).join("/");
-    const response = await this.request({
-      url: `${this.baseUrl}/git/ref/heads/${encodedBranch}?_=${Date.now()}`,
-      method: "GET",
-      headers: this.headers,
-      throw: false,
-    });
-    if (response.status === 200) return (response.json as { object?: { sha?: string } }).object?.sha ?? null;
-    if (response.status === 404) return null;
-    throw new Error(`Failed to get branch head: HTTP ${response.status} - ${response.text}`);
-  }
-  async getLatestCommit(path?: string): Promise<string | null> {
-    let url = `${this.baseUrl}/commits?sha=${this.config.branch}&per_page=1&_=${Date.now()}`;
-    if (path) {
-      url += `&path=${encodeURIComponent(path)}`;
-    }
-
-    const response = await this.request({
-      url,
-      method: "GET",
-      headers: this.headers,
-    });
-
-    if (response.status === 200 && response.json.length > 0) {
-      return response.json[0].sha;
-    }
-    return null;
   }
 
   async listCommits(options: { page?: number; perPage?: number } = {}): Promise<GitHubCommitSummary[]> {
@@ -314,20 +153,6 @@ export class GitHubClient {
       authoredAt: commit.commit?.author?.date ?? "",
       parentShas: (commit.parents ?? []).map(parent => parent.sha ?? "").filter(Boolean),
     }));
-  }
-
-  async getTree(): Promise<GitHubTree> {
-    const url = `${this.baseUrl}/git/trees/${this.config.branch}?recursive=1&_=${Date.now()}`;
-    const response = await this.request({
-      url,
-      method: "GET",
-      headers: this.headers,
-      throw: false,
-    });
-    if (response.status === 200) {
-      return response.json as GitHubTree;
-    }
-    throw new Error(`Failed to get tree: HTTP ${response.status} - ${response.text}`);
   }
 
   async getTreeAt(treeSha: string, recursive = true): Promise<GitHubTree> {
@@ -373,6 +198,40 @@ export class GitHubClient {
     }
   }
 
+  async ensureGitRepositoryInitialized(): Promise<GitHubGitRef | null> {
+    const refs = await this.request({
+      url: `${this.baseUrl}/git/refs?per_page=1&_=${Date.now()}`,
+      method: "GET",
+      headers: this.headers,
+      throw: false,
+    });
+    if (refs.status === 200 && Array.isArray(refs.json) && refs.json.length > 0) return null;
+    if (refs.status !== 200 && refs.status !== 404 && refs.status !== 409) {
+      throw this.gitHttpError("Failed to inspect git refs", refs.status, refs.text);
+    }
+
+    const encodedPath = V4_BOOTSTRAP_PATH.split("/").map(encodeURIComponent).join("/");
+    const response = await this.request({
+      url: `${this.baseUrl}/contents/${encodedPath}`,
+      method: "PUT",
+      headers: this.headers,
+      body: JSON.stringify({
+        message: "obsidian-sync-v4:bootstrap",
+        content: toBase64(utf8ToBytes("obsidian-github-sync-v4\n")),
+      }),
+      throw: false,
+    });
+    if (response.status !== 200 && response.status !== 201) {
+      throw this.gitHttpError("Failed to bootstrap empty repository", response.status, response.text);
+    }
+    const commitSha = (response.json as { commit?: { sha?: string } }).commit?.sha;
+    if (!commitSha) throw new Error("GitHub bootstrap response is missing its commit SHA.");
+    const configured = await this.getGitRefOrNull();
+    if (configured) return configured;
+    await this.createGitRef(commitSha);
+    return this.getGitRef();
+  }
+
 
   async getGitCommit(sha: string): Promise<GitHubGitCommit> {
     const response = await this.request({
@@ -382,8 +241,8 @@ export class GitHubClient {
       throw: false,
     });
     if (response.status !== 200) throw this.gitHttpError("Failed to get git commit", response.status, response.text);
-    const json = response.json as { sha?: string; tree?: { sha?: string }; parents?: Array<{ sha?: string }> };
-    return { sha: json.sha ?? sha, treeSha: json.tree?.sha ?? "", parentShas: (json.parents ?? []).map(parent => parent.sha ?? "").filter(Boolean) };
+    const json = response.json as { sha?: string; message?: string; tree?: { sha?: string }; parents?: Array<{ sha?: string }> };
+    return { sha: json.sha ?? sha, treeSha: json.tree?.sha ?? "", parentShas: (json.parents ?? []).map(parent => parent.sha ?? "").filter(Boolean), message: json.message };
   }
   async createGitBlob(content: Uint8Array | ArrayBuffer): Promise<string> {
     const bytes = content instanceof Uint8Array ? content : new Uint8Array(content);
@@ -446,34 +305,4 @@ export class GitHubClient {
     if (response.status !== 201) throw this.gitHttpError("Failed to create git ref", response.status, response.text);
   }
 
-  // Helper to decode base64 content from GitHub
-  static decodeContent(base64Content: string): string {
-    return bytesToUtf8(GitHubClient.decodeContentBytes(base64Content));
-  }
-
-  static decodeContentBytes(base64Content: string): Uint8Array {
-    return fromBase64(base64Content);
-  }
-}
-
-export async function readGitHubFileBytes(github: GitHubClient, path: string): Promise<{ bytes: Uint8Array; sha: string } | null> {
-  if (typeof (github as GitHubClient & { getFileBytes?: GitHubClient["getFileBytes"] }).getFileBytes === "function") {
-    return (github as GitHubClient & { getFileBytes: GitHubClient["getFileBytes"] }).getFileBytes(path);
-  }
-  const file = await github.getFile(path);
-  if (!file) return null;
-  return { bytes: GitHubClient.decodeContentBytes(file.content), sha: file.sha };
-}
-
-export async function readGitHubBlobOrFileBytes(github: GitHubClient, path: string, sha?: string): Promise<{ bytes: Uint8Array; sha: string } | null> {
-  if (sha && typeof (github as any).getBlob === "function") {
-    try {
-      const bytes = await (github as any).getBlob(sha);
-      return { bytes, sha };
-    } catch (e) {
-      if ((e as Error).message?.includes("HTTP 404")) return null;
-      throw e;
-    }
-  }
-  return readGitHubFileBytes(github, path);
 }

@@ -5,10 +5,6 @@ import { spawnSync } from "node:child_process";
 import path from "node:path";
 
 const root = process.cwd();
-for (const arg of process.argv.slice(2)) {
-  if (arg.startsWith("--profile=")) process.env.GITHUB_E2E_PROFILE = arg.slice("--profile=".length);
-  if (arg === "--benchmarks") process.env.GITHUB_E2E_RUN_BENCHMARKS = "1";
-}
 const envFile = process.env.GITHUB_E2E_ENV_FILE ?? ".env.github-e2e";
 const envPath = path.isAbsolute(envFile) ? envFile : path.join(root, envFile);
 
@@ -67,8 +63,8 @@ if (!compileOnly) {
 }
 
 const outDir = path.join(root, ".tmp", "github-e2e", `${process.pid}-${Date.now()}`);
-const entry = "tests/github-e2e/real-github-e2e.test.ts";
-const outfile = path.join(outDir, "real-github-e2e.test.mjs");
+const entry = "tests/github-e2e/v4-real-github-e2e.test.ts";
+const outfile = path.join(outDir, "v4-real-github-e2e.test.mjs");
 
 await rm(outDir, { recursive: true, force: true });
 await mkdir(outDir, { recursive: true });

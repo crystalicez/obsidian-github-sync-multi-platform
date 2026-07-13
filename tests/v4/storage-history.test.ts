@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { buildV4PartPaths, joinAndVerifyV4Parts, splitV4Parts } from "../../src/lib/v4/large-files";
 import { buildV4JournalPages, fileVersionsFromV4Journals } from "../../src/lib/v4/history-journal";
-import { sha256Hex } from "../../src/lib/encrypted/bytes";
+import { sha256Hex } from "../../src/lib/bytes";
 
 test("v4 large-file helpers create ordered parts and verify the full hash", async () => {
   const bytes = new Uint8Array([1, 2, 3, 4, 5, 6, 7]);

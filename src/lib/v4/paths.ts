@@ -1,4 +1,4 @@
-import { toBase64Url, toHex, utf8ToBytes } from "../encrypted/bytes";
+import { toBase64Url, toHex, utf8ToBytes } from "../bytes";
 import { V4_ROOT } from "./protocol-types";
 
 export function normalizeV4VaultPath(path: string): string {

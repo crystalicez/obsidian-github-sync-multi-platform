@@ -1,4 +1,4 @@
-import { randomBytes, toHex, utf8ToBytes } from "../encrypted/bytes";
+import { randomBytes, toHex, utf8ToBytes } from "../bytes";
 
 const MAGIC = new Uint8Array([0x4f, 0x47, 0x53, 0x34]);
 const PAYLOAD_VERSION = 1;

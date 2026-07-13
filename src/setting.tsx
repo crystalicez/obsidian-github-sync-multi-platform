@@ -427,6 +427,15 @@ export class SettingTab extends PluginSettingTab {
       .setDesc(
         "One regex per line, matched against plaintext vault paths before encryption. Examples: ^Archive/ ignores a folder, (^|/)\\.DS_Store$ ignores .DS_Store, \\.tmp$ ignores .tmp files."
       )
+      .addTextArea((text) =>
+        text
+          .setPlaceholder("^Archive/\n(^|/)\\.DS_Store$\n\\.tmp$")
+          .setValue(this.tempSettings!.ignorePathRegex)
+          .onChange((value) => {
+            this.tempSettings!.ignorePathRegex = value
+            this.updateDirtyState()
+          })
+      )
 
     new Setting(set)
       .setName("Sync .obsidian configuration")
@@ -470,15 +479,6 @@ export class SettingTab extends PluginSettingTab {
             this.tempSettings!.abortChangePercent = Number.isFinite(parsed)
               ? Math.max(0, Math.min(100, Math.floor(parsed)))
               : 0
-            this.updateDirtyState()
-          })
-      )
-      .addTextArea((text) =>
-        text
-          .setPlaceholder("^Archive/\n(^|/)\\.DS_Store$\n\\.tmp$")
-          .setValue(this.tempSettings!.ignorePathRegex)
-          .onChange((value) => {
-            this.tempSettings!.ignorePathRegex = value
             this.updateDirtyState()
           })
       )

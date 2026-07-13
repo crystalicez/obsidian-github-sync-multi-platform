@@ -1,4 +1,4 @@
-import { randomBytes, sha256Hex, toBase64Url, utf8ToBytes } from "../encrypted/bytes"
+import { randomBytes, sha256Hex, toBase64Url, utf8ToBytes } from "../bytes"
 import type { GitHubTree } from "../github-api"
 import { evaluateV4ChangeGuard } from "./change-guard"
 import { resolveV4Conflict, type V4ConflictPolicy, type V4ConflictResolution } from "./conflicts"
@@ -30,8 +30,8 @@ export interface V4SessionVault {
 }
 
 export interface V4SessionGithub extends V4GitTreeGithub {
-  getFileBytes(path: string): Promise<{ bytes: Uint8Array; sha: string } | null>
-  getTree?(): Promise<GitHubTree>
+  getFileBytes(path: string, ref?: string): Promise<{ bytes: Uint8Array; sha: string } | null>
+  getTreeAt?(treeSha: string, recursive?: boolean): Promise<GitHubTree>
 }
 
 export interface V4SyncSessionInput {
@@ -153,8 +153,11 @@ export class V4SyncSession {
     changes?: V4QueuedChange[]
   }): Promise<V4SessionSyncResult> {
     this.localReadCache.clear()
+    const baseCommitSha = this.input.index.remoteCommitSha
     const ref = await this.input.github.getGitRefOrNull()
-    const remote = await this.loadRemote(ref?.sha, options.operation)
+    const remote = ref && ref.sha === this.input.index.remoteCommitSha
+      ? this.remoteFromLocalIndex(ref.sha)
+      : await this.loadRemote(ref?.sha, options.operation)
     if (!remote && options.operation !== "forcePush") {
       throw new Error("Remote is not V4. Force Push is required before sync or Force Pull.")
     }
@@ -169,9 +172,13 @@ export class V4SyncSession {
     }
     const metadataRemoteRecords = (remote?.records ?? []).map(record => ({ ...record, partPaths: record.partPaths ? [...record.partPaths] : undefined }))
     let externalReconciled = false
-    if (remote && this.input.index.remoteCommitSha && remote.commitSha !== this.input.index.remoteCommitSha && remote.head.generation === this.input.index.generation) {
-      await this.reconcileExternalCommit(remote)
-      externalReconciled = true
+    if (remote && this.input.index.remoteCommitSha && remote.commitSha !== this.input.index.remoteCommitSha) {
+      const tip = await this.input.github.getGitCommit(remote.commitSha)
+      const pluginMessage = `obsidian-sync-v4:${remote.head.journalId}`
+      if (tip.message?.split("\n", 1)[0] !== pluginMessage) {
+        await this.reconcileExternalCommit(remote, tip.treeSha)
+        externalReconciled = true
+      }
     }
 
     const includePath = this.input.includePath ?? (() => true)
@@ -204,9 +211,10 @@ export class V4SyncSession {
     }
 
     const recordsById = new Map(allRemoteRecords.map(record => [record.fileId, record]))
+    const remoteCommitSha = remote?.commitSha
     let pulledFiles = 0
     for (const change of plan.pulls) {
-      await this.applyPull(change, recordsById)
+      await this.applyPull(change, recordsById, remoteCommitSha)
       pulledFiles++
     }
 
@@ -214,10 +222,14 @@ export class V4SyncSession {
     for (const conflict of plan.conflicts) {
       const localBytes = conflict.local ? await this.readLocal(conflict.local.path) : undefined
       const remoteRecord = recordsById.get(conflict.fileId)
-      const remoteBytes = remoteRecord ? await this.readRecord(remoteRecord) : undefined
+      const remoteBytes = remoteRecord ? await this.readRecord(remoteRecord, remoteCommitSha) : undefined
       const baseRecord = baseRecords.find(record => record.fileId === conflict.fileId)
-      const baseBytes = baseRecord && remoteRecord?.remoteVersion === baseRecord.remoteVersion
-        ? remoteBytes
+      const baseBytes = baseRecord
+        ? remoteRecord?.remoteVersion === baseRecord.remoteVersion
+          ? remoteBytes
+          : baseCommitSha
+            ? await this.readRecord(baseRecord, baseCommitSha)
+            : undefined
         : undefined
       let resolution = resolveV4Conflict({
         policy: this.input.conflictPolicy,
@@ -235,7 +247,7 @@ export class V4SyncSession {
       }
       if (resolution.action === "use-remote") {
         const pull = this.changeBetween(conflict.local, conflict.remote)
-        if (pull) { await this.applyPull(pull, recordsById); pulledFiles++ }
+        if (pull) { await this.applyPull(pull, recordsById, remoteCommitSha); pulledFiles++ }
         continue
       }
       if (resolution.action === "merged" && conflict.local && resolution.mergedBytes) {
@@ -381,8 +393,9 @@ export class V4SyncSession {
           : raw,
       })
     }
-    if (options.operation === "forcePush" && ref && this.input.github.getTree) {
-      const tree = await this.input.github.getTree()
+    if (options.operation === "forcePush" && ref && this.input.github.getTreeAt) {
+      const commit = await this.input.github.getGitCommit(ref.sha)
+      const tree = await this.input.github.getTreeAt(commit.treeSha, true)
       if (tree.truncated) throw new Error("GitHub tree is truncated; Force Push cannot safely mirror the repository.")
       const written = new Set([
         ...files.map(file => file.path),
@@ -407,32 +420,57 @@ export class V4SyncSession {
   }
 
   private async loadRemote(commitSha: string | undefined, operation: V4SyncOperation): Promise<V4RemoteState | null> {
-    const configFile = await this.input.github.getFileBytes(V4_CONFIG_PATH)
+    const configFile = await this.input.github.getFileBytes(V4_CONFIG_PATH, commitSha)
     if (!configFile) return null
     const config = decodeV4RemoteConfig(configFile.bytes)
     if (config.repoId !== this.input.config.repoId) throw new Error("V4 remote repository identity mismatch.")
     if (config.mode !== this.input.config.mode && operation === "forcePush" && this.input.config.mode === "plaintext") return null
-    const headFile = await this.input.github.getFileBytes(V4_HEAD_PATH)
+    const headFile = await this.input.github.getFileBytes(V4_HEAD_PATH, commitSha)
     if (!headFile) throw new Error("V4 remote head is missing.")
     const head = await decodeV4RemoteHead(headFile.bytes, config, this.input.keyring)
     const records: V4IndexFileRecord[] = []
     for (const bucket of Object.keys(head.shardHashes)) {
-      const file = await this.input.github.getFileBytes(v4RemoteShardPath(bucket, config.mode))
+      const cached = this.input.index.shardHashes[bucket] === head.shardHashes[bucket]
+        ? this.input.index.shards[bucket]
+        : undefined
+      if (cached) {
+        records.push(...Object.values(cached.records))
+        continue
+      }
+      const file = await this.input.github.getFileBytes(v4RemoteShardPath(bucket, config.mode), commitSha)
       if (!file) throw new Error(`V4 remote shard is missing: ${bucket}`)
       records.push(...Object.values((await decodeV4RemoteShard(file.bytes, bucket, config, this.input.keyring)).records))
     }
     return { config, head, records, commitSha: commitSha ?? "" }
   }
 
-  private async reconcileExternalCommit(remote: V4RemoteState): Promise<void> {
+  private remoteFromLocalIndex(commitSha: string): V4RemoteState {
+    return {
+      config: this.input.config,
+      head: {
+        formatVersion: 4,
+        mode: this.input.index.mode,
+        epoch: this.input.index.epoch,
+        generation: this.input.index.generation,
+        journalId: "",
+        shardHashes: { ...this.input.index.shardHashes },
+        updatedAt: 0,
+        deviceId: this.input.index.deviceId,
+      },
+      records: recordsFromIndex(this.input.index).map(record => ({ ...record, partPaths: record.partPaths ? [...record.partPaths] : undefined })),
+      commitSha,
+    }
+  }
+
+  private async reconcileExternalCommit(remote: V4RemoteState, treeSha: string): Promise<void> {
     if (remote.config.mode === "encrypted") {
       throw new Error("External GitHub changes touched an encrypted V4 branch without updating its journal. Use Force Push or Force Pull after reviewing the commit.")
     }
-    if (!this.input.github.getTree) throw new Error("External GitHub changes require recursive tree support.")
+    if (!this.input.github.getTreeAt) throw new Error("External GitHub changes require recursive tree support.")
     if (remote.records.some(record => record.storage !== "single")) {
       throw new Error("External GitHub changes cannot be safely reconciled while large or packed V4 objects exist.")
     }
-    const tree = await this.input.github.getTree()
+    const tree = await this.input.github.getTreeAt(treeSha, true)
     if (tree.truncated) throw new Error("External GitHub tree is truncated; sync is unsafe.")
     const existingByPath = new Map(remote.records.map(record => [record.path, record]))
     const includePath = this.input.includePath ?? (() => true)
@@ -440,7 +478,7 @@ export class V4SyncSession {
     for (const node of tree.tree) {
       if (node.type !== "blob" || node.path === V4_CONFIG_PATH || node.path.startsWith(`${V4_ROOT}/`)) continue
       if (!includePath(node.path)) continue
-      const file = await this.input.github.getFileBytes(node.path)
+      const file = await this.input.github.getFileBytes(node.path, remote.commitSha)
       if (!file) continue
       const previous = existingByPath.get(node.path)
       const pathId = previous?.pathId ?? await sha256Hex(utf8ToBytes(`path:${node.path}`))
@@ -460,9 +498,10 @@ export class V4SyncSession {
   }
 
   private async scanLocal(baseRecords: V4IndexFileRecord[], changes: V4QueuedChange[]): Promise<V4LogicalFile[]> {
-    if (changes.length > 0 && baseRecords.length > 0 && this.input.vault.stat) {
+    const pathChanges = changes.filter((change): change is Exclude<V4QueuedChange, { type: "rescan" }> => change.type !== "rescan")
+    if (changes.length > 0 && pathChanges.length === changes.length && baseRecords.length > 0 && this.input.vault.stat) {
       const byPath = new Map(logical(baseRecords).map(file => [file.path, file]))
-      for (const change of changes) {
+      for (const change of pathChanges) {
         if (change.type === "delete") { byPath.delete(change.path); continue }
         const previous = change.type === "rename" ? byPath.get(change.oldPath) : byPath.get(change.path)
         if (change.type === "rename") byPath.delete(change.oldPath)
@@ -499,11 +538,11 @@ export class V4SyncSession {
     }))
   }
 
-  private async applyPull(change: V4PlannedChange, records: Map<string, V4IndexFileRecord>): Promise<void> {
+  private async applyPull(change: V4PlannedChange, records: Map<string, V4IndexFileRecord>, remoteCommitSha?: string): Promise<void> {
     if (change.kind === "delete") { await this.input.vault.delete(change.path); return }
     const record = records.get(change.fileId)
     if (!record) throw new Error(`Missing V4 remote record for ${change.path}`)
-    const bytes = await this.readRecord(record)
+    const bytes = await this.readRecord(record, remoteCommitSha)
     if (change.kind === "rename" && change.previousPath) await this.input.vault.delete(change.previousPath)
     await this.input.vault.write(change.path, bytes, record.mtime)
     this.localReadCache.set(change.path, bytes)
@@ -517,9 +556,9 @@ export class V4SyncSession {
     return bytes
   }
 
-  private async readRecord(record: V4IndexFileRecord): Promise<Uint8Array> {
+  private async readRecord(record: V4IndexFileRecord, remoteCommitSha?: string): Promise<Uint8Array> {
     return this.codec.read(record, async path => {
-      const file = await this.input.github.getFileBytes(path)
+      const file = await this.input.github.getFileBytes(path, remoteCommitSha)
       if (!file) throw new Error(`Missing V4 remote object: ${path}`)
       return file.bytes
     })

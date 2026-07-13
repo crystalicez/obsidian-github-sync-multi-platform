@@ -1,4 +1,4 @@
-import { compileIgnorePathRegex, isIgnoredPath } from "../encrypted/ignore";
+import { compileV4IgnorePathRegex, isV4IgnoredPath } from "./ignore";
 import { normalizeV4VaultPath } from "./paths";
 import { V4_ROOT } from "./protocol-types";
 
@@ -23,12 +23,12 @@ export function isPathInV4SyncScope(path: string, settings: V4ScopeSettings): bo
 }
 
 export function createV4ScopePredicate(settings: V4ScopeSettings): (path: string) => boolean {
-  const rules = compileIgnorePathRegex(settings.ignorePathRegex);
+  const rules = compileV4IgnorePathRegex(settings.ignorePathRegex);
   const configDir = normalizeV4VaultPath(settings.configDir);
   return (path: string) => {
   const normalized = normalizeV4VaultPath(path);
   if (normalized === V4_ROOT || normalized.startsWith(`${V4_ROOT}/`)) return false;
-  if (isIgnoredPath(normalized, rules)) return false;
+  if (isV4IgnoredPath(normalized, rules)) return false;
   if (normalized !== configDir && !normalized.startsWith(`${configDir}/`)) return true;
   if (normalized === configDir || isHardExcludedConfigPath(normalized, configDir, settings.pluginId)) return false;
   const relative = normalized.slice(configDir.length + 1);

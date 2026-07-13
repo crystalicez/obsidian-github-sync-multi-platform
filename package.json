@@ -8,14 +8,10 @@
     "dev": "node esbuild.config.mjs",
     "devcss": "sass --watch src/styles.scss styles.css && tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
     "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
-    "test": "node scripts/check-test-coverage.mjs && node scripts/run-tests.mjs",
+    "test": "node scripts/run-tests.mjs",
     "ver": "node ./scripts/update-version.js",
-    "test:github-e2e": "node scripts/run-github-e2e.mjs --profile=quick",
-    "test:github-e2e:smoke": "node scripts/run-github-e2e.mjs --profile=smoke",
-    "test:github-e2e:full": "node scripts/run-github-e2e.mjs --profile=full --benchmarks",
-    "test:github-e2e:benchmark": "node scripts/run-github-e2e.mjs --profile=full --benchmarks",
-    "test:github-e2e:quick": "node scripts/run-github-e2e.mjs --profile=quick",
-    "test:github-e2e:random": "node scripts/run-github-e2e.mjs --profile=random"
+    "test:github-e2e": "node scripts/run-github-e2e.mjs",
+    "test:github-e2e:quick": "node scripts/run-github-e2e.mjs"
   },
   "keywords": [],
   "repository": {

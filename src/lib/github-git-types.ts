@@ -24,4 +24,5 @@ export interface GitHubGitCommit {
   sha: string;
   treeSha: string;
   parentShas: string[];
+  message?: string;
 }

@@ -1,5 +1,5 @@
 import type { GitHubCommitSummary, GitHubTree } from "../github-api"
-import { bytesToUtf8 } from "../encrypted/bytes"
+import { bytesToUtf8 } from "../bytes"
 import { decryptV4Payload, type V4Keyring } from "./crypto"
 import type { V4JournalChange, V4JournalPage, V4VersionDescriptor } from "./history-journal"
 import type { V4IndexFileRecord } from "./local-index"
@@ -8,7 +8,7 @@ import { V4StorageCodec } from "./storage-codec"
 
 export interface V4HistoryGithub {
   listCommits(options?: { page?: number; perPage?: number }): Promise<GitHubCommitSummary[]>
-  getFileBytes(path: string): Promise<{ bytes: Uint8Array; sha: string } | null>
+  getFileBytes(path: string, ref?: string): Promise<{ bytes: Uint8Array; sha: string } | null>
   getGitCommit(sha: string): Promise<{ sha: string; treeSha: string; parentShas: string[] }>
   getTreeAt(treeSha: string, recursive?: boolean): Promise<GitHubTree>
   getBlob(sha: string): Promise<Uint8Array>
@@ -47,7 +47,7 @@ export class V4HistoryService {
   }
 
   async getCommitChanges(commit: V4HistoryCommit): Promise<V4HistoryChange[]> {
-    if (commit.source === "plugin" && commit.journalId) return this.readJournal(commit.journalId)
+    if (commit.source === "plugin" && commit.journalId) return this.readJournal(commit.journalId, commit.sha)
     return this.diffExternalCommit(commit)
   }
 
@@ -55,7 +55,10 @@ export class V4HistoryService {
     const descriptor = change.after ?? change.before
     if (!descriptor) return { kind: "binary", bytes: new Uint8Array() }
     const gitCommit = await this.input.github.getGitCommit(commit.sha)
-    const tree = await this.input.github.getTreeAt(gitCommit.treeSha, true)
+    const parentSha = gitCommit.parentShas[0] ?? commit.parentShas[0]
+    if (!change.after && !parentSha) throw new Error("Deleted version has no parent commit.")
+    const versionCommit = change.after ? gitCommit : await this.input.github.getGitCommit(parentSha!)
+    const tree = await this.input.github.getTreeAt(versionCommit.treeSha, true)
     if (tree.truncated) throw new Error("Historical Git tree is truncated; preview is unsafe.")
     const shas = new Map(tree.tree.filter(node => node.type === "blob").map(node => [node.path, node.sha]))
     const record = this.recordFromDescriptor(change, descriptor)
@@ -82,17 +85,17 @@ export class V4HistoryService {
     return versions
   }
 
-  private async readJournal(journalId: string): Promise<V4HistoryChange[]> {
-    const first = await this.readJournalPage(journalId, 0)
+  private async readJournal(journalId: string, commitSha: string): Promise<V4HistoryChange[]> {
+    const first = await this.readJournalPage(journalId, 0, commitSha)
     const pages = [first]
-    for (let page = 1; page < first.pageCount; page++) pages.push(await this.readJournalPage(journalId, page))
+    for (let page = 1; page < first.pageCount; page++) pages.push(await this.readJournalPage(journalId, page, commitSha))
     return pages.flatMap(page => page.changes.map(change => ({ ...change, source: "plugin" as const })))
   }
 
-  private async readJournalPage(journalId: string, page: number): Promise<V4JournalPage> {
+  private async readJournalPage(journalId: string, page: number, commitSha: string): Promise<V4JournalPage> {
     const encrypted = this.input.config.mode === "encrypted"
     const path = `${V4_ROOT}/journals/${journalId}/${String(page).padStart(6, "0")}.${encrypted ? "enc" : "json"}`
-    const file = await this.input.github.getFileBytes(path)
+    const file = await this.input.github.getFileBytes(path, commitSha)
     if (!file) throw new Error(`V4 history journal is missing: ${journalId}/${page}`)
     const bytes = encrypted
       ? await decryptV4Payload(this.input.keyring!.journalKey, file.bytes, { kind: "journal", aad: `${this.input.config.repoId}:${journalId}:${page}` })
