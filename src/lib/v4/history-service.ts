@@ -89,7 +89,7 @@ export class V4HistoryService {
       }
       if (!commits.hasMore) break
     }
-    return versions
+    return versions.reverse()
   }
 
   private async readJournal(journalId: string, commitSha: string): Promise<V4HistoryChange[]> {

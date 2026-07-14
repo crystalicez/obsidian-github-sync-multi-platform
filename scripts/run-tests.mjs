@@ -22,6 +22,7 @@ const tsEntries = [
   "tests/v4/sync-session.test.ts",
   "tests/v4/settings-secrets.test.ts",
   "tests/v4/history-service.test.ts",
+  "tests/v4/opaque-leakage.test.ts",
   "tests/v4/benchmark.test.ts",
 ];
 

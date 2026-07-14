@@ -1,12 +1,82 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import type { GitHubCreateTreeEntry } from "../../src/lib/github-git-types";
 import { V4HistoryService } from "../../src/lib/v4/history-service";
+import { createEmptyV4LocalIndex, type V4LocalIndex } from "../../src/lib/v4/local-index";
 import { expectedV4PathLayout, V4_FORMAT_VERSION, type V4RemoteConfig } from "../../src/lib/v4/protocol-types";
 import { deriveV4Keyring } from "../../src/lib/v4/crypto";
 import { V4StorageCodec } from "../../src/lib/v4/storage-codec";
+import { V4SyncSession, type V4SessionVault } from "../../src/lib/v4/sync-session";
 
 const enc = (value: string) => new TextEncoder().encode(value);
+
+class HistoryMemoryVault implements V4SessionVault {
+  files = new Map<string, { bytes: Uint8Array; mtime: number }>();
+  async listFiles() { return [...this.files].map(([path, file]) => ({ path, size: file.bytes.byteLength, mtime: file.mtime })); }
+  async stat(path: string) { const file = this.files.get(path); return file ? { path, size: file.bytes.byteLength, mtime: file.mtime } : null; }
+  async read(path: string) { return new Uint8Array(this.files.get(path)!.bytes); }
+  async write(path: string, bytes: Uint8Array, mtime?: number) { this.files.set(path, { bytes: new Uint8Array(bytes), mtime: mtime ?? 0 }); }
+  async delete(path: string) { this.files.delete(path); }
+}
+
+class HistoryMemoryGitHub {
+  ref: { ref: string; sha: string; type: string } | null = null;
+  files = new Map<string, Uint8Array>();
+  blobs = new Map<string, Uint8Array>();
+  trees = new Map<string, Map<string, Uint8Array>>();
+  commits = new Map<string, { treeSha: string; parents: string[]; message: string }>();
+
+  reachableCommits() {
+    const reachable: Array<[string, { treeSha: string; parents: string[]; message: string }]> = [];
+    const pending = this.ref ? [this.ref.sha] : [];
+    const seen = new Set<string>();
+    while (pending.length > 0) {
+      const sha = pending.shift()!;
+      if (seen.has(sha)) continue;
+      seen.add(sha);
+      const commit = this.commits.get(sha);
+      if (!commit) continue;
+      reachable.push([sha, commit]);
+      pending.push(...commit.parents);
+    }
+    return reachable;
+  }
+  async listCommits({ page = 1, perPage = 50 }: { page?: number; perPage?: number } = {}) {
+    const commits = this.reachableCommits().map(([sha, commit], index) => ({ sha, message: commit.message, authorName: "A", authoredAt: new Date(this.commits.size - index).toISOString(), parentShas: commit.parents }));
+    return commits.slice((page - 1) * perPage, page * perPage);
+  }
+  async getFileBytes(path: string, ref?: string) {
+    const commit = ref ? this.commits.get(ref) : undefined;
+    const value = commit ? this.trees.get(commit.treeSha)?.get(path) : this.files.get(path);
+    return value ? { bytes: new Uint8Array(value), sha: `sha-${path}` } : null;
+  }
+  async getGitRefOrNull() { return this.ref; }
+  async ensureGitRepositoryInitialized() { return null; }
+  async getGitCommit(sha: string) { const commit = this.commits.get(sha)!; return { sha, treeSha: commit.treeSha, parentShas: commit.parents, message: commit.message }; }
+  async getTreeAt(treeSha: string) {
+    const tree = this.trees.get(treeSha) ?? new Map();
+    return { sha: treeSha, url: "", truncated: false, tree: [...tree.entries()].map(([path, bytes], index) => ({ path, mode: "100644", type: "blob" as const, sha: `tree-blob-${index}`, size: bytes.byteLength, url: "" })) };
+  }
+  async getBlob() { throw new Error("History rename test does not load previews."); }
+  async createGitBlob(bytes: Uint8Array) { const sha = `blob-${this.blobs.size + 1}`; this.blobs.set(sha, new Uint8Array(bytes)); return sha; }
+  async createGitTree(entries: GitHubCreateTreeEntry[], baseTree?: string) {
+    const tree = new Map(baseTree ? this.trees.get(baseTree) : undefined);
+    for (const entry of entries) entry.sha === null ? tree.delete(entry.path) : tree.set(entry.path, new Uint8Array(this.blobs.get(entry.sha)!));
+    const sha = `tree-${this.trees.size + 1}`;
+    this.trees.set(sha, tree);
+    return sha;
+  }
+  async createGitCommit(message: string, treeSha: string, parents: string[]) { const sha = `commit-${this.commits.size + 1}`; this.commits.set(sha, { treeSha, parents, message }); return sha; }
+  async createGitRef(sha: string) { this.ref = { ref: "refs/heads/main", sha, type: "commit" }; this.files = new Map(this.trees.get(this.commits.get(sha)!.treeSha)); }
+  async updateGitRef(sha: string, expected?: string) { assert.equal(this.ref?.sha, expected); await this.createGitRef(sha); }
+}
+
+function historyRecordByPath(index: V4LocalIndex, path: string) {
+  const record = Object.values(index.shards).flatMap(shard => Object.values(shard.records)).find(candidate => !candidate.deleted && candidate.path === path);
+  assert.ok(record, `missing history record for ${path}`);
+  return record;
+}
 
 test("v4 history paginates 50 commits, reads journal changes, and loads preview lazily", async () => {
   let blobReads = 0;
@@ -68,3 +138,44 @@ for (const mode of ["plaintext", "encrypted"] as const) {
     assert.equal(preview.text, "before delete");
   });
 }
+
+test("v4 encrypted history follows one fileId across file and folder renames", async () => {
+  const repoId = "o/r#main";
+  const keyring = await deriveV4Keyring({ passphrase: "pass", repoId, salt: enc("salt"), iterations: 10 });
+  const config: V4RemoteConfig = {
+    formatVersion: V4_FORMAT_VERSION,
+    mode: "encrypted",
+    repoId,
+    pathLayout: "opaque-stable-v1",
+    algorithm: "AES-GCM",
+    kdf: "PBKDF2-SHA-256",
+    kdfParams: { iterations: 10, salt: "c2FsdA" },
+  };
+  const github = new HistoryMemoryGitHub();
+  const vault = new HistoryMemoryVault();
+  const index = createEmptyV4LocalIndex({ repoId, deviceId: "history-device", mode: "encrypted", pathLayout: "opaque-stable-v1" });
+  let clock = 100;
+  const session = () => new V4SyncSession({ github, vault, index, config, keyring, conflictPolicy: "copy", abortChangePercent: 0, now: () => clock++ });
+
+  vault.files.set("Projects/Secret/note.md", { bytes: enc("private body"), mtime: 1 });
+  await session().sync({ operation: "forcePush", allowThresholdOverride: false });
+  const initial = { ...historyRecordByPath(index, "Projects/Secret/note.md") };
+
+  const file = vault.files.get("Projects/Secret/note.md")!;
+  vault.files.delete("Projects/Secret/note.md");
+  vault.files.set("Archive/Secret/note.md", { ...file, mtime: 2 });
+  await session().sync({ operation: "normal", allowThresholdOverride: false, changes: [{ type: "folderRename", oldPath: "Projects", path: "Archive", mtime: 2 }] });
+
+  vault.files.delete("Archive/Secret/note.md");
+  vault.files.set("Archive/Secret/renamed.txt", { ...file, mtime: 3 });
+  await session().sync({ operation: "normal", allowThresholdOverride: false, changes: [{ type: "rename", oldPath: "Archive/Secret/note.md", path: "Archive/Secret/renamed.txt", mtime: 3 }] });
+
+  const versions = await new V4HistoryService({ github, config, keyring }).getFileVersions(initial.fileId);
+  assert.deepEqual(versions.map(version => version.change.path), [
+    "Projects/Secret/note.md",
+    "Archive/Secret/note.md",
+    "Archive/Secret/renamed.txt",
+  ]);
+  assert.equal(new Set(versions.map(version => (version.change.after ?? version.change.before)!.remotePath)).size, 1);
+  assert.equal((versions.at(-1)!.change.after ?? versions.at(-1)!.change.before)!.remotePath, initial.remotePath);
+});
