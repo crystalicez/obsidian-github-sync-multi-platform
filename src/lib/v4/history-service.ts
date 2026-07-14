@@ -150,6 +150,7 @@ export class V4HistoryService {
       remotePath: descriptor.remotePath,
       storage: descriptor.storage ?? "single",
       partPaths: descriptor.partPaths,
+      packId: descriptor.packId,
     }
   }
 }

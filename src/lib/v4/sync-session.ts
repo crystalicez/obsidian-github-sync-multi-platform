@@ -108,6 +108,7 @@ function descriptorFor(record: V4IndexFileRecord) {
     remoteVersion: record.remoteVersion,
     storage: record.storage,
     partPaths: record.partPaths,
+    packId: record.packId,
     mtime: record.mtime,
   }
 }

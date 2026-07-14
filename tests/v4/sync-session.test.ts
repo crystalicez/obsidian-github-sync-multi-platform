@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import type { GitHubCreateTreeEntry } from "../../src/lib/github-git-types";
+import { V4HistoryService } from "../../src/lib/v4/history-service";
 import { createEmptyV4LocalIndex } from "../../src/lib/v4/local-index";
 import { V4SyncSession, type V4SessionVault } from "../../src/lib/v4/sync-session";
 import { V4_CONFIG_PATH, V4_FORMAT_VERSION, V4_HEAD_PATH, type V4RemoteConfig, type V4RemoteHead } from "../../src/lib/v4/protocol-types";
@@ -178,7 +179,7 @@ test("v4 local event sync reads and stats only the changed path", async () => {
   assert.equal(github.lastEntries.filter(entry => entry.path.includes("/index/")).length, 1);
 });
 
-test("v4 encrypted force push packs a large small-file batch and force pull restores it", async () => {
+test("v4 encrypted pack round trips through force pull and version-history preview", async () => {
   const github = new MemoryGitHub();
   const source = new MemoryVault();
   for (let index = 0; index < 64; index++) source.files.set(`Folder/private-${index}.md`, { bytes: enc(`secret-${index}`), mtime: 1 });
@@ -189,6 +190,47 @@ test("v4 encrypted force push packs a large small-file batch and force pull rest
   const packPaths = [...github.files.keys()].filter(path => path.includes("/packs/"));
   assert.equal(packPaths.length, 1);
   assert.equal([...github.files.keys()].some(path => path.includes("private-")), false);
+
+  const commitSha = github.ref!.sha;
+  const published = github.commits.get(commitSha)!;
+  const journalId = /^obsidian-sync-v4:(.+)$/u.exec(published.message)![1];
+  const blobPaths = new Map<string, string>();
+  const history = new V4HistoryService({
+    config: encryptedConfig,
+    keyring: keys,
+    github: {
+      async listCommits() { return []; },
+      async getFileBytes(path: string, ref?: string) { return github.getFileBytes(path, ref); },
+      async getGitCommit(sha: string) { return github.getGitCommit(sha); },
+      async getTreeAt(treeSha: string) {
+        const tree = github.trees.get(treeSha) ?? new Map();
+        return {
+          sha: treeSha,
+          url: "",
+          truncated: false,
+          tree: [...tree.entries()].map(([path, bytes], index) => {
+            const sha = `history-blob-${index}`;
+            blobPaths.set(sha, path);
+            return { path, mode: "100644", type: "blob" as const, sha, size: bytes.byteLength, url: "" };
+          }),
+        };
+      },
+      async getBlob(sha: string) { return new Uint8Array(github.trees.get(published.treeSha)!.get(blobPaths.get(sha)!)!); },
+    },
+  });
+  const historyCommit = {
+    sha: commitSha,
+    message: published.message,
+    authorName: "A",
+    authoredAt: "",
+    parentShas: published.parents,
+    source: "plugin" as const,
+    journalId,
+  };
+  const packedChange = (await history.getCommitChanges(historyCommit)).find(change => change.path === "Folder/private-42.md")!;
+  const preview = await history.previewChange(historyCommit, packedChange);
+  assert.equal(preview.kind, "text");
+  assert.equal(preview.text, "secret-42");
 
   const target = new MemoryVault();
   const targetIndex = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "b", mode: "encrypted" });
