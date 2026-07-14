@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { V4HistoryService } from "../../src/lib/v4/history-service";
-import { V4_FORMAT_VERSION, type V4RemoteConfig } from "../../src/lib/v4/protocol-types";
+import { expectedV4PathLayout, V4_FORMAT_VERSION, type V4RemoteConfig } from "../../src/lib/v4/protocol-types";
 import { deriveV4Keyring } from "../../src/lib/v4/crypto";
 import { V4StorageCodec } from "../../src/lib/v4/storage-codec";
 
@@ -45,7 +45,7 @@ for (const mode of ["plaintext", "encrypted"] as const) {
     const config: V4RemoteConfig = mode === "encrypted"
       ? { formatVersion: V4_FORMAT_VERSION, mode, repoId, algorithm: "AES-GCM", kdf: "PBKDF2-SHA-256", kdfParams: { iterations: 10, salt: "c2FsdA" } }
       : { formatVersion: V4_FORMAT_VERSION, mode, repoId };
-    const prepared = await new V4StorageCodec({ mode, keyring }).prepare("deleted.md", enc("before delete"), "version-1", 1, "file-1");
+    const prepared = await new V4StorageCodec({ mode, pathLayout: expectedV4PathLayout(mode), keyring }).prepare("deleted.md", enc("before delete"), "version-1", 1, "file-1");
     const stored = prepared.files[0];
     const descriptor = { ...prepared.record, sha: "blob-before" };
     const github = {

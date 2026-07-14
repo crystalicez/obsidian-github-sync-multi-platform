@@ -16,7 +16,7 @@ import {
   decodeV4RemoteShard,
   v4RemoteShardPath,
 } from "./remote-index"
-import { V4_CONFIG_PATH, V4_HEAD_PATH, V4_ROOT, type V4RemoteConfig, type V4RemoteHead } from "./protocol-types"
+import { expectedV4PathLayout, V4_CONFIG_PATH, V4_HEAD_PATH, V4_ROOT, type V4RemoteConfig, type V4RemoteHead } from "./protocol-types"
 import { V4StorageCodec } from "./storage-codec"
 import type { V4QueuedChange } from "./sync-coordinator"
 
@@ -143,7 +143,11 @@ export class V4SyncSession {
   private readonly localReadCache = new Map<string, Uint8Array>()
 
   constructor(private readonly input: V4SyncSessionInput) {
-    this.codec = new V4StorageCodec({ mode: input.config.mode, keyring: input.keyring })
+    this.codec = new V4StorageCodec({
+      mode: input.config.mode,
+      pathLayout: input.config.pathLayout ?? expectedV4PathLayout(input.config.mode),
+      keyring: input.keyring,
+    })
     this.now = input.now ?? (() => Date.now())
   }
 
@@ -343,7 +347,7 @@ export class V4SyncSession {
           bytes += candidate.plaintext.byteLength
           start++
         }
-        const packed = await this.codec.preparePack(folder, `${journalId}-${packNumber}`, group)
+        const packed = await this.codec.preparePack(`${journalId}-${packNumber}`, group)
         files.push(packed.file)
         for (const record of packed.records) {
           recordsById.set(record.fileId, { ...record, path: group.find(item => item.record.fileId === record.fileId)!.record.path })

@@ -3,7 +3,7 @@ import { bytesToUtf8 } from "../bytes"
 import { decryptV4Payload, type V4Keyring } from "./crypto"
 import type { V4JournalChange, V4JournalPage, V4VersionDescriptor } from "./history-journal"
 import type { V4IndexFileRecord } from "./local-index"
-import { V4_ROOT, type V4RemoteConfig } from "./protocol-types"
+import { expectedV4PathLayout, V4_ROOT, type V4RemoteConfig } from "./protocol-types"
 import { V4StorageCodec } from "./storage-codec"
 
 export interface V4HistoryGithub {
@@ -35,7 +35,11 @@ export class V4HistoryService {
   private readonly codec: V4StorageCodec
 
   constructor(private readonly input: { github: V4HistoryGithub; config: V4RemoteConfig; keyring?: V4Keyring }) {
-    this.codec = new V4StorageCodec({ mode: input.config.mode, keyring: input.keyring })
+    this.codec = new V4StorageCodec({
+      mode: input.config.mode,
+      pathLayout: input.config.pathLayout ?? expectedV4PathLayout(input.config.mode),
+      keyring: input.keyring,
+    })
   }
 
   async listCommits(page = 1): Promise<V4CommitPage> {

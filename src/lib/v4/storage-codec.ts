@@ -6,8 +6,8 @@ import {
   shouldUseV4Parts,
   splitV4Parts,
 } from "./large-files"
-import { encryptedV4RemotePath, normalizeV4VaultPath, pathIdForV4Path } from "./paths"
-import { V4_ROOT, type V4FileRecord, type V4StorageMode } from "./protocol-types"
+import { normalizeV4VaultPath, objectIdForV4File, opaqueV4ObjectPath, opaqueV4PackPath, pathIdForV4Path } from "./paths"
+import { type V4FileRecord, type V4PathLayout, type V4StorageMode } from "./protocol-types"
 
 export interface V4PreparedFile {
   path: string
@@ -27,10 +27,16 @@ export interface V4PreparedPack {
 export type V4RemoteBytesReader = (path: string) => Promise<Uint8Array>
 
 export class V4StorageCodec {
-  constructor(private readonly options: { mode: V4StorageMode; keyring?: V4Keyring }) {
+  constructor(private readonly options: { mode: V4StorageMode; pathLayout: V4PathLayout; keyring?: V4Keyring }) {
     if (options.mode === "encrypted" && !options.keyring) {
       throw new Error("Encrypted V4 storage requires a keyring.")
     }
+  }
+
+  private contentAad(record: { fileId: string; pathId: string; remoteVersion: string }): string {
+    return this.options.pathLayout === "opaque-stable-v1"
+      ? `${record.fileId}:${record.remoteVersion}`
+      : `${record.pathId}:${record.remoteVersion}`
   }
 
   private async pathId(path: string): Promise<string> {
@@ -49,25 +55,26 @@ export class V4StorageCodec {
   ): Promise<V4PreparedRemoteWrite> {
     const path = normalizeV4VaultPath(logicalPath)
     const pathId = await this.pathId(path)
+    const stableFileId = fileId ?? pathId
     const plaintextSha256 = await sha256Hex(plaintext)
     const predictedBytes = plaintext.byteLength + (this.options.mode === "encrypted" ? 33 : 0)
     if (shouldUseV4Parts(plaintext.byteLength, predictedBytes)) {
-      return this.prepareParts(path, pathId, fileId ?? pathId, plaintext, plaintextSha256, version, mtime)
+      return this.prepareParts(path, pathId, stableFileId, plaintext, plaintextSha256, version, mtime)
     }
 
     const remotePath = this.options.mode === "plaintext"
       ? path
-      : await encryptedV4RemotePath(this.options.keyring!.pathKey, path)
+      : await opaqueV4ObjectPath(this.options.keyring!.pathKey, stableFileId)
     const bytes = this.options.mode === "plaintext"
       ? plaintext
       : await encryptV4Payload(this.options.keyring!.contentKey, plaintext, {
         kind: "content",
-        aad: `${pathId}:${version}`,
+        aad: this.contentAad({ fileId: stableFileId, pathId, remoteVersion: version }),
       })
     return {
       record: {
         pathId,
-        fileId: fileId ?? pathId,
+        fileId: stableFileId,
         plaintextSha256,
         size: plaintext.byteLength,
         mtime,
@@ -81,15 +88,13 @@ export class V4StorageCodec {
   }
 
   async preparePack(
-    folder: string,
     packId: string,
     entries: Array<{ record: V4FileRecord; plaintext: Uint8Array }>,
   ): Promise<V4PreparedPack> {
     if (this.options.mode !== "encrypted") throw new Error("V4 packs are available only in encrypted mode.")
     if (entries.length === 0) throw new Error("Cannot create an empty V4 pack.")
     if (!/^[A-Za-z0-9_-]+$/u.test(packId)) throw new Error("Unsafe V4 pack id.")
-    const normalizedFolder = folder ? normalizeV4VaultPath(folder) : ""
-    const remotePath = `${V4_ROOT}/packs/${normalizedFolder ? `${normalizedFolder}/` : ""}${packId}.pack.enc`
+    const remotePath = await opaqueV4PackPath(this.options.keyring!.pathKey, packId)
     const archive = utf8ToBytes(JSON.stringify({
       version: 1,
       entries: Object.fromEntries(entries.map(entry => [entry.record.fileId, toBase64(entry.plaintext)])),
@@ -111,12 +116,15 @@ export class V4StorageCodec {
     mtime: number,
   ): Promise<V4PreparedRemoteWrite> {
     const parts = splitV4Parts(plaintext)
+    const opaqueId = this.options.mode === "encrypted"
+      ? await objectIdForV4File(this.options.keyring!.pathKey, fileId)
+      : undefined
     const partPaths = buildV4PartPaths({
       mode: this.options.mode,
       logicalPath: path,
       version,
       partCount: parts.length,
-      opaqueId: this.options.mode === "encrypted" ? pathId.slice(0, 32) : undefined,
+      opaqueId,
     })
     const files = await Promise.all(parts.map(async (part, index) => ({
       path: partPaths[index],
@@ -124,7 +132,7 @@ export class V4StorageCodec {
         ? part
         : await encryptV4Payload(this.options.keyring!.contentKey, part, {
           kind: "part",
-          aad: `${pathId}:${version}:${index}`,
+          aad: `${this.contentAad({ fileId, pathId, remoteVersion: version })}:${index}`,
         }),
     })))
     return {
@@ -161,7 +169,7 @@ export class V4StorageCodec {
         ? bytes
         : await decryptV4Payload(this.options.keyring!.contentKey, bytes, {
           kind: "content",
-          aad: `${record.pathId}:${record.remoteVersion}`,
+          aad: this.contentAad(record),
         })
       if (record.plaintextSha256 && await sha256Hex(plaintext) !== record.plaintextSha256) {
         throw new Error(`V4 content hash mismatch: ${record.remotePath}`)
@@ -176,7 +184,7 @@ export class V4StorageCodec {
         ? bytes
         : decryptV4Payload(this.options.keyring!.contentKey, bytes, {
           kind: "part",
-          aad: `${record.pathId}:${record.remoteVersion}:${index}`,
+          aad: `${this.contentAad(record)}:${index}`,
         })
     }))
     return joinAndVerifyV4Parts(parts, record.plaintextSha256)

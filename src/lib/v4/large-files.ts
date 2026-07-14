@@ -30,7 +30,10 @@ export function buildV4PartPaths(input: {
   const visibleName = input.mode === "plaintext" ? basename : input.opaqueId;
   if (!visibleName) throw new Error("Encrypted V4 part paths require an opaque id.");
   const root = input.mode === "plaintext" ? `${V4_ROOT}/large` : `${V4_ROOT}/parts`;
-  const prefix = `${root}/${folder ? `${folder}/` : ""}${visibleName}/${input.version}`;
+  const coordinates = input.mode === "plaintext"
+    ? `${folder ? `${folder}/` : ""}${visibleName}`
+    : `${visibleName.slice(0, 2)}/${visibleName}`;
+  const prefix = `${root}/${coordinates}/${input.version}`;
   return Array.from({ length: input.partCount }, (_, index) => `${prefix}/${String(index + 1).padStart(6, "0")}.${input.mode === "plaintext" ? "part" : "enc"}`);
 }
 

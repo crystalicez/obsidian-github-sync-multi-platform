@@ -6,7 +6,7 @@ import { GitHubClient, type GitHubConfig } from "../../src/lib/github-api";
 import { randomBytes, toBase64Url } from "../../src/lib/bytes";
 import { deriveV4Keyring } from "../../src/lib/v4/crypto";
 import { createEmptyV4LocalIndex } from "../../src/lib/v4/local-index";
-import { V4_FORMAT_VERSION, type V4RemoteConfig, type V4StorageMode } from "../../src/lib/v4/protocol-types";
+import { expectedV4PathLayout, V4_FORMAT_VERSION, type V4RemoteConfig, type V4StorageMode } from "../../src/lib/v4/protocol-types";
 import { V4StorageCodec } from "../../src/lib/v4/storage-codec";
 import { V4SyncSession, type V4SessionVault } from "../../src/lib/v4/sync-session";
 
@@ -243,7 +243,7 @@ async function runRoundTrip(mode: V4StorageMode, config: GitHubConfig): Promise<
         `Encrypted V4 object has an invalid header at ${record.remotePath}; length=${remote.bytes.byteLength}`,
       );
       try {
-        const decoded = await new V4StorageCodec({ mode, keyring }).read(record, async path => {
+        const decoded = await new V4StorageCodec({ mode, pathLayout: expectedV4PathLayout(mode), keyring }).read(record, async path => {
           const node = tree.tree.find(item => item.path === path);
           if (!node) throw new Error(`Encrypted V4 object is missing: ${path}`);
           return client.getBlob(node.sha);
