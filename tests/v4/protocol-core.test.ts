@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { decryptV4Payload, deriveV4Keyring, encryptV4Payload } from "../../src/lib/v4/crypto";
-import { opaqueV4ObjectPath } from "../../src/lib/v4/paths";
+import { objectIdForV4File, opaqueV4ObjectPath, opaqueV4PackPath } from "../../src/lib/v4/paths";
 import { effectiveV4PathLayout, expectedV4PathLayout } from "../../src/lib/v4/protocol-types";
 
 test("v4 keyring is stable for one repository and domain-separated", async () => {
@@ -36,6 +36,25 @@ test("v4 encrypted object identity is stable by file identity and repository key
   assert.notEqual(first, await opaqueV4ObjectPath(keyB, "file-1"));
   assert.match(first, /^\.obsidian-github-sync-v4\/data\/[0-9a-f]{2}\/[0-9a-f]{64}\.enc$/u);
   assert.doesNotMatch(first, /Projects|Secret|note|\.md/u);
+});
+
+test("v4 opaque object identity requires a non-empty file identity", async () => {
+  const pathKey = new Uint8Array(32).fill(3);
+  await assert.rejects(() => objectIdForV4File(pathKey, ""), /V4 file identity is required/u);
+  await assert.rejects(() => opaqueV4ObjectPath(pathKey, ""), /V4 file identity is required/u);
+});
+
+test("v4 opaque pack identity is stable, domain-separated, and protocol-shaped", async () => {
+  const keyA = new Uint8Array(32).fill(3);
+  const keyB = new Uint8Array(32).fill(4);
+  const first = await opaqueV4PackPath(keyA, "pack-1");
+  const objectPath = await opaqueV4ObjectPath(keyA, "pack-1");
+
+  assert.equal(first, await opaqueV4PackPath(keyA, "pack-1"));
+  assert.notEqual(first, await opaqueV4PackPath(keyA, "pack-2"));
+  assert.notEqual(first, await opaqueV4PackPath(keyB, "pack-1"));
+  assert.notEqual(first.split("/").at(-1), objectPath.split("/").at(-1));
+  assert.match(first, /^\.obsidian-github-sync-v4\/packs\/[0-9a-f]{2}\/[0-9a-f]{64}\.enc$/u);
 });
 
 test("v4 path layout distinguishes new plaintext, new encrypted, and legacy encrypted configs", () => {

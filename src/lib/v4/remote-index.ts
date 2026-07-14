@@ -23,6 +23,9 @@ export function decodeV4RemoteConfig(bytes: Uint8Array): V4RemoteConfig {
   if (config.formatVersion !== 4 || (config.mode !== "plaintext" && config.mode !== "encrypted")) {
     throw new Error("Unsupported remote format. Force Push is required to initialize V4.")
   }
+  if (config.pathLayout !== undefined && config.pathLayout !== "plaintext-v1" && config.pathLayout !== "opaque-stable-v1") {
+    throw new Error("Unsupported V4 path layout.")
+  }
   return config
 }
 
