@@ -519,7 +519,8 @@ export class V4SyncSession {
 
   private async scanLocal(baseRecords: V4IndexFileRecord[], changes: V4QueuedChange[]): Promise<V4LogicalFile[]> {
     const pathChanges = changes.filter((change): change is Exclude<V4QueuedChange, { type: "rescan" }> => change.type !== "rescan")
-    if (changes.length > 0 && pathChanges.length === changes.length && baseRecords.length > 0 && this.input.vault.stat) {
+    const hasFolderChange = pathChanges.some(change => change.type === "folderRename" || change.type === "folderDelete")
+    if (changes.length > 0 && pathChanges.length === changes.length && !hasFolderChange && baseRecords.length > 0 && this.input.vault.stat) {
       const byPath = new Map(logical(baseRecords).map(file => [file.path, file]))
       for (const change of pathChanges) {
         if (change.type === "delete") { byPath.delete(change.path); continue }
@@ -540,9 +541,19 @@ export class V4SyncSession {
     }
     const identityByPath = new Map(baseRecords.map(record => [record.path, record]))
     for (const change of changes) {
-      if (change.type !== "rename") continue
-      const record = identityByPath.get(change.oldPath)
-      if (record) { identityByPath.delete(change.oldPath); identityByPath.set(change.path, record) }
+      if (change.type === "rename") {
+        const record = identityByPath.get(change.oldPath)
+        if (record) { identityByPath.delete(change.oldPath); identityByPath.set(change.path, record) }
+        continue
+      }
+      if (change.type !== "folderRename") continue
+      const oldPrefix = `${change.oldPath}/`
+      for (const [path, record] of [...identityByPath]) {
+        if (path !== change.oldPath && !path.startsWith(oldPrefix)) continue
+        const suffix = path.slice(change.oldPath.length)
+        identityByPath.delete(path)
+        identityByPath.set(`${change.path}${suffix}`, record)
+      }
     }
     const files = await this.input.vault.listFiles()
     return Promise.all(files.map(async file => {

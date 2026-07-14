@@ -6,6 +6,8 @@ export type V4QueuedChange =
   | { type: "modify"; path: string; mtime: number }
   | { type: "delete"; path: string; mtime: number }
   | { type: "rename"; oldPath: string; path: string; mtime: number }
+  | { type: "folderRename"; oldPath: string; path: string; mtime: number }
+  | { type: "folderDelete"; path: string; mtime: number }
   | { type: "rescan"; mtime: number };
 type V4PathChange = Exclude<V4QueuedChange, { type: "rescan" }>;
 
@@ -33,22 +35,23 @@ export function coalesceV4Changes(changes: V4QueuedChange[]): V4QueuedChange[] {
   const byPath = new Map<string, V4QueuedChange>();
   const pathChanges = changes.filter((change): change is V4PathChange => change.type !== "rescan");
   for (const raw of pathChanges) {
-    const change: V4PathChange = raw.type === "rename"
+    const change: V4PathChange = raw.type === "rename" || raw.type === "folderRename"
       ? { ...raw, oldPath: normalizeV4VaultPath(raw.oldPath), path: normalizeV4VaultPath(raw.path) }
       : { ...raw, path: normalizeV4VaultPath(raw.path) };
-    if (change.type === "rename") {
+    if (change.type === "rename" || change.type === "folderRename") {
       const previous = byPath.get(change.oldPath);
-      const oldPath = previous?.type === "rename" ? previous.oldPath : change.oldPath;
+      const oldPath = previous?.type === change.type ? previous.oldPath : change.oldPath;
       byPath.delete(change.oldPath);
       byPath.delete(change.path);
-      byPath.set(change.path, { type: "rename", oldPath, path: change.path, mtime: Math.max(change.mtime, previous?.mtime ?? change.mtime) });
+      byPath.set(change.path, { type: change.type, oldPath, path: change.path, mtime: Math.max(change.mtime, previous?.mtime ?? change.mtime) });
       continue;
     }
-    if (change.type === "delete") {
+    if (change.type === "delete" || change.type === "folderDelete") {
       const previous = byPath.get(change.path);
-      if (previous?.type === "rename") {
+      const renameType = change.type === "delete" ? "rename" : "folderRename";
+      if (previous?.type === renameType) {
         byPath.delete(change.path);
-        byPath.set(previous.oldPath, { type: "delete", path: previous.oldPath, mtime: Math.max(previous.mtime, change.mtime) });
+        byPath.set(previous.oldPath, { type: change.type, path: previous.oldPath, mtime: Math.max(previous.mtime, change.mtime) });
         continue;
       }
       byPath.set(change.path, { ...change });

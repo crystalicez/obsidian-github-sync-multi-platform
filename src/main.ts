@@ -106,11 +106,11 @@ export default class FastSync extends Plugin {
     }))
     this.registerEvent(this.app.vault.on("delete", (file) => {
       if (file instanceof TFile) this.v4Runtime.enqueueDelete(file.path)
-      else if (file instanceof TFolder) this.v4Runtime.enqueueRescan()
+      else if (file instanceof TFolder) this.v4Runtime.enqueueFolderDelete(file.path)
     }))
     this.registerEvent(this.app.vault.on("rename", (file, oldfile) => {
       if (file instanceof TFile) this.v4Runtime.enqueueRename(oldfile, file.path)
-      else if (file instanceof TFolder) this.v4Runtime.enqueueRescan()
+      else if (file instanceof TFolder) this.v4Runtime.enqueueFolderRename(oldfile, file.path)
     }))
 
     // Register commands

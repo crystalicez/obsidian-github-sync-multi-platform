@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { V4SyncCoordinator, type V4QueuedChange, type V4SyncRequest } from "../../src/lib/v4/sync-coordinator";
+import { coalesceV4Changes, V4SyncCoordinator, type V4QueuedChange, type V4SyncRequest } from "../../src/lib/v4/sync-coordinator";
 
 class FakeTimers {
   next = 1;
@@ -134,4 +134,14 @@ test("v4 coordinator collapses folder events to one full rescan", async () => {
   coordinator.enqueue({ type: "modify", path: "Folder/note.md", mtime: 2 });
   await coordinator.run({ operation: "normal", trigger: "manual" });
   assert.deepEqual(executions, [[{ type: "rescan", mtime: 2 }]]);
+});
+
+test("v4 folder rename keeps descendant changes as one prefix mapping", () => {
+  assert.deepEqual(coalesceV4Changes([
+    { type: "folderRename", oldPath: "A", path: "B", mtime: 1 },
+    { type: "modify", path: "B/note.md", mtime: 2 },
+  ]), [
+    { type: "folderRename", oldPath: "A", path: "B", mtime: 1 },
+    { type: "modify", path: "B/note.md", mtime: 2 },
+  ]);
 });

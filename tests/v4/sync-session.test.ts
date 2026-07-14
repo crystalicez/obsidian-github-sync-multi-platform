@@ -3,7 +3,7 @@ import test from "node:test";
 
 import type { GitHubCreateTreeEntry } from "../../src/lib/github-git-types";
 import { V4HistoryService } from "../../src/lib/v4/history-service";
-import { createEmptyV4LocalIndex } from "../../src/lib/v4/local-index";
+import { createEmptyV4LocalIndex, type V4IndexFileRecord, type V4LocalIndex } from "../../src/lib/v4/local-index";
 import { assertV4PathLayoutCompatible, V4SyncSession, type V4SessionVault } from "../../src/lib/v4/sync-session";
 import { V4_CONFIG_PATH, V4_FORMAT_VERSION, V4_HEAD_PATH, type V4RemoteConfig, type V4RemoteHead } from "../../src/lib/v4/protocol-types";
 import { deriveV4Keyring } from "../../src/lib/v4/crypto";
@@ -61,6 +61,12 @@ class MemoryGitHub {
 }
 
 function config(): V4RemoteConfig { return { formatVersion: V4_FORMAT_VERSION, mode: "plaintext", repoId: "o/r#main" }; }
+
+function indexRecordByPath(index: V4LocalIndex, path: string): V4IndexFileRecord {
+  const record = Object.values(index.shards).flatMap(shard => Object.values(shard.records)).find(candidate => !candidate.deleted && candidate.path === path);
+  assert.ok(record, `missing index record for ${path}`);
+  return record;
+}
 
 test("v4 rejects legacy encrypted layout except for Force Push migration", () => {
   const legacy = { formatVersion: 4 as const, mode: "encrypted" as const, repoId: "o/r#main" };
@@ -402,6 +408,53 @@ test("v4 full rescan handles nested folder rename and delete events", async () =
   await session().sync({ operation: "normal", allowThresholdOverride: false, changes: [{ type: "rescan", mtime: 3 }] });
   assert.equal(github.files.has("Renamed/a.md"), false);
   assert.equal(github.files.has("Renamed/Nested/b.md"), false);
+});
+
+test("v4 nested folder rename preserves descendant fileId and opaque remotePath", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault();
+  vault.files.set("A/Nested/note.md", { bytes: enc("secret"), mtime: 1 });
+  const encryptedConfig: V4RemoteConfig = { formatVersion: V4_FORMAT_VERSION, mode: "encrypted", repoId: "o/r#main", pathLayout: "opaque-stable-v1", algorithm: "AES-GCM", kdf: "PBKDF2-SHA-256", kdfParams: { iterations: 10, salt: "c2FsdA" } };
+  const keys = await deriveV4Keyring({ passphrase: "pass", repoId: "o/r#main", salt: enc("salt"), iterations: 10 });
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "d", mode: "encrypted", pathLayout: "opaque-stable-v1" });
+  const session = () => new V4SyncSession({ github, vault, index, config: encryptedConfig, keyring: keys, conflictPolicy: "copy" as const, abortChangePercent: 0 });
+  await session().sync({ operation: "forcePush", allowThresholdOverride: false });
+
+  const before = indexRecordByPath(index, "A/Nested/note.md");
+  const file = vault.files.get("A/Nested/note.md")!;
+  vault.files.delete("A/Nested/note.md");
+  vault.files.set("B/Nested/note.md", { ...file, mtime: 2 });
+  await session().sync({
+    operation: "normal",
+    allowThresholdOverride: false,
+    changes: [{ type: "folderRename", oldPath: "A", path: "B", mtime: 2 }],
+  });
+
+  const after = indexRecordByPath(index, "B/Nested/note.md");
+  assert.equal(after.fileId, before.fileId);
+  assert.equal(after.remotePath, before.remotePath);
+});
+
+test("v4 nested folder delete removes descendants from the final state", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault();
+  vault.files.set("Folder/a.md", { bytes: enc("a"), mtime: 1 });
+  vault.files.set("Folder/Nested/b.md", { bytes: enc("b"), mtime: 1 });
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "d", mode: "plaintext" });
+  const session = () => new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy" as const, abortChangePercent: 0 });
+  await session().sync({ operation: "forcePush", allowThresholdOverride: false });
+
+  vault.files.delete("Folder/a.md");
+  vault.files.delete("Folder/Nested/b.md");
+  await session().sync({
+    operation: "normal",
+    allowThresholdOverride: false,
+    changes: [{ type: "folderDelete", path: "Folder", mtime: 2 }],
+  });
+
+  assert.equal(github.files.has("Folder/a.md"), false);
+  assert.equal(github.files.has("Folder/Nested/b.md"), false);
+  assert.equal(Object.values(index.shards).flatMap(shard => Object.values(shard.records)).some(record => record.path.startsWith("Folder/")), false);
 });
 
 test("v4 stale device reconciles a direct GitHub edit after a newer plugin commit", async () => {

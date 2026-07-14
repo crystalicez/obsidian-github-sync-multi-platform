@@ -17,6 +17,8 @@ export class TFile extends TAbstractFile {
   }
 }
 
+export class TFolder extends TAbstractFile {}
+
 export class Notice {
   static messages: string[] = [];
 

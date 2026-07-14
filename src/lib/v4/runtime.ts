@@ -117,6 +117,8 @@ export class V4PluginRuntime {
   enqueueModify(path: string, mtime: number): void { this.enqueue({ type: "modify", path, mtime }) }
   enqueueDelete(path: string): void { this.enqueue({ type: "delete", path, mtime: Date.now() }) }
   enqueueRename(oldPath: string, path: string): void { this.enqueue({ type: "rename", oldPath, path, mtime: Date.now() }) }
+  enqueueFolderRename(oldPath: string, path: string): void { this.enqueue({ type: "folderRename", oldPath, path, mtime: Date.now() }) }
+  enqueueFolderDelete(path: string): void { this.enqueue({ type: "folderDelete", path, mtime: Date.now() }) }
   enqueueRescan(): void { this.enqueue({ type: "rescan", mtime: Date.now() }) }
 
   private enqueue(change: V4QueuedChange): void {
@@ -128,7 +130,8 @@ export class V4PluginRuntime {
     }
     if (this.plugin.ignoredFiles.has(change.path)) return
     try {
-      if (!this.inScope(change.path) && (change.type !== "rename" || !this.inScope(change.oldPath))) return
+      const oldPath = change.type === "rename" || change.type === "folderRename" ? change.oldPath : undefined
+      if (!this.inScope(change.path) && (!oldPath || !this.inScope(oldPath))) return
     } catch (error) {
       new Notice(`GitHub Sync: Invalid ignore regex: ${(error as Error).message}`)
       return
