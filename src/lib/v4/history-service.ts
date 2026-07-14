@@ -5,6 +5,7 @@ import type { V4JournalChange, V4JournalPage, V4VersionDescriptor } from "./hist
 import type { V4IndexFileRecord } from "./local-index"
 import { expectedV4PathLayout, V4_ROOT, type V4RemoteConfig } from "./protocol-types"
 import { V4StorageCodec } from "./storage-codec"
+import { assertV4PathLayoutCompatible } from "./sync-session"
 
 export interface V4HistoryGithub {
   listCommits(options?: { page?: number; perPage?: number }): Promise<GitHubCommitSummary[]>
@@ -35,9 +36,11 @@ export class V4HistoryService {
   private readonly codec: V4StorageCodec
 
   constructor(private readonly input: { github: V4HistoryGithub; config: V4RemoteConfig; keyring?: V4Keyring }) {
+    assertV4PathLayoutCompatible(input.config, { ...input.config, pathLayout: expectedV4PathLayout(input.config.mode) }, "normal")
+    const pathLayout = input.config.pathLayout ?? expectedV4PathLayout(input.config.mode)
     this.codec = new V4StorageCodec({
       mode: input.config.mode,
-      pathLayout: input.config.pathLayout ?? expectedV4PathLayout(input.config.mode),
+      pathLayout,
       keyring: input.keyring,
     })
   }

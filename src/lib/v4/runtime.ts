@@ -13,14 +13,28 @@ import {
 } from "./local-index"
 import { decodeV4RemoteConfig } from "./remote-index"
 import { createV4ScopePredicate, isPathInV4SyncScope } from "./scope"
-import { V4ChangeGuardError, V4SyncSession } from "./sync-session"
+import { assertV4PathLayoutCompatible, V4ChangeGuardError, V4SyncSession } from "./sync-session"
 import type { V4ConflictResolution } from "./conflicts"
 import { V4SyncCoordinator, type V4QueuedChange, type V4SyncRequest } from "./sync-coordinator"
-import { V4_FORMAT_VERSION, V4_CONFIG_PATH, type V4RemoteConfig } from "./protocol-types"
+import { expectedV4PathLayout, V4_FORMAT_VERSION, V4_CONFIG_PATH, type V4RemoteConfig, type V4StorageMode } from "./protocol-types"
 import { V4HistoryService } from "./history-service"
 
 const V4_INDEX_ROOT = "github-sync-v4-index"
 const fallbackStores = new WeakMap<object, Map<string, string>>()
+
+export function selectV4RuntimeConfig(discovered: V4RemoteConfig | null, mode: V4StorageMode, repoId: string): V4RemoteConfig {
+  if (discovered?.mode === mode) return { ...discovered, pathLayout: expectedV4PathLayout(mode) }
+  if (mode === "plaintext") return { formatVersion: V4_FORMAT_VERSION, mode, repoId, pathLayout: expectedV4PathLayout(mode) }
+  return {
+    formatVersion: V4_FORMAT_VERSION,
+    mode,
+    repoId,
+    pathLayout: expectedV4PathLayout(mode),
+    algorithm: "AES-GCM",
+    kdf: "PBKDF2-SHA-256",
+    kdfParams: { iterations: 600_000, salt: toBase64Url(randomBytes(16)) },
+  }
+}
 
 function createMemoryAdapter(owner: object): V4LocalIndexAdapter {
   let store = fallbackStores.get(owner)
@@ -77,7 +91,9 @@ export class V4PluginRuntime {
     const ref = await this.plugin.githubClient.getGitRefOrNull()
     const remote = ref ? await this.plugin.githubClient.getFileBytes(V4_CONFIG_PATH, ref.sha) : null
     if (!remote) throw new Error("V4 history is not initialized. Force Push first.")
-    const config = decodeV4RemoteConfig(remote.bytes)
+    const remoteConfig = decodeV4RemoteConfig(remote.bytes)
+    const config = selectV4RuntimeConfig(remoteConfig, remoteConfig.mode, remoteConfig.repoId)
+    assertV4PathLayoutCompatible(remoteConfig, config, "normal")
     const keyring = config.mode === "encrypted"
       ? await deriveV4Keyring({
         passphrase: this.plugin.settings.encryptionPassphrase,
@@ -160,23 +176,18 @@ export class V4PluginRuntime {
   private async remoteOrNewConfig(): Promise<V4RemoteConfig> {
     const ref = await this.plugin.githubClient.getGitRefOrNull()
     const remote = ref ? await this.plugin.githubClient.getFileBytes(V4_CONFIG_PATH, ref.sha) : null
-    if (remote) return decodeV4RemoteConfig(remote.bytes)
-    const mode = this.plugin.settings.encryptionMode
-    if (mode === "plaintext") return { formatVersion: V4_FORMAT_VERSION, mode, repoId: this.repoId() }
-    return {
-      formatVersion: V4_FORMAT_VERSION,
-      mode,
-      repoId: this.repoId(),
-      algorithm: "AES-GCM",
-      kdf: "PBKDF2-SHA-256",
-      kdfParams: { iterations: 600_000, salt: toBase64Url(randomBytes(16)) },
+    if (remote) {
+      const discovered = decodeV4RemoteConfig(remote.bytes)
+      return selectV4RuntimeConfig(discovered, discovered.mode, discovered.repoId)
     }
+    const mode = this.plugin.settings.encryptionMode
+    return selectV4RuntimeConfig(null, mode, this.repoId())
   }
 
   private async loadIndex(config: V4RemoteConfig): Promise<V4LocalIndex> {
     const loaded = await loadV4LocalIndex(this.adapter, V4_INDEX_ROOT)
-    if (loaded.repoId === config.repoId && loaded.mode === config.mode) return loaded
-    return createEmptyV4LocalIndex({ repoId: config.repoId, deviceId: this.plugin.settings.vault || "defaultVault", mode: config.mode })
+    if (loaded.repoId === config.repoId && loaded.mode === config.mode && loaded.pathLayout === config.pathLayout) return loaded
+    return createEmptyV4LocalIndex({ repoId: config.repoId, deviceId: this.plugin.settings.vault || "defaultVault", mode: config.mode, pathLayout: config.pathLayout })
   }
 
   private async saveIndex(index: V4LocalIndex, previousShardHashes: Record<string, string> = {}): Promise<void> {
@@ -235,9 +246,7 @@ export class V4PluginRuntime {
           if (discovered.mode !== desiredMode && request.operation !== "forcePush") {
             throw new Error("Remote storage mode differs. Force Push is required.")
           }
-          const config: V4RemoteConfig = discovered.mode === desiredMode
-            ? discovered
-            : { formatVersion: V4_FORMAT_VERSION, mode: "plaintext", repoId: this.repoId() }
+          const config = selectV4RuntimeConfig(discovered, desiredMode, this.repoId())
           const index = await this.loadIndex(config)
           const previousShardHashes = { ...index.shardHashes }
           const passphrase = this.plugin.settings.encryptionPassphrase

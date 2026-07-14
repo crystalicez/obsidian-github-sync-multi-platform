@@ -4,7 +4,7 @@ import test from "node:test";
 import type { GitHubCreateTreeEntry } from "../../src/lib/github-git-types";
 import { V4HistoryService } from "../../src/lib/v4/history-service";
 import { createEmptyV4LocalIndex } from "../../src/lib/v4/local-index";
-import { V4SyncSession, type V4SessionVault } from "../../src/lib/v4/sync-session";
+import { assertV4PathLayoutCompatible, V4SyncSession, type V4SessionVault } from "../../src/lib/v4/sync-session";
 import { V4_CONFIG_PATH, V4_FORMAT_VERSION, V4_HEAD_PATH, type V4RemoteConfig, type V4RemoteHead } from "../../src/lib/v4/protocol-types";
 import { deriveV4Keyring } from "../../src/lib/v4/crypto";
 
@@ -62,6 +62,107 @@ class MemoryGitHub {
 
 function config(): V4RemoteConfig { return { formatVersion: V4_FORMAT_VERSION, mode: "plaintext", repoId: "o/r#main" }; }
 
+test("v4 rejects legacy encrypted layout except for Force Push migration", () => {
+  const legacy = { formatVersion: 4 as const, mode: "encrypted" as const, repoId: "o/r#main" };
+  const desired = { ...legacy, pathLayout: "opaque-stable-v1" as const };
+  assert.throws(() => assertV4PathLayoutCompatible(legacy, desired, "normal"), /Force Push/iu);
+  assert.throws(() => assertV4PathLayoutCompatible(legacy, desired, "forcePull"), /Force Push/iu);
+  assert.doesNotThrow(() => assertV4PathLayoutCompatible(legacy, desired, "forcePush"));
+});
+
+test("v4 rejects legacy encrypted normal sync and Force Pull before vault or content writes", async () => {
+  const github = new MemoryGitHub();
+  github.ref = { ref: "refs/heads/main", sha: "legacy", type: "commit" };
+  github.files.set(V4_CONFIG_PATH, enc(JSON.stringify({
+    formatVersion: V4_FORMAT_VERSION,
+    mode: "encrypted",
+    repoId: "o/r#main",
+    algorithm: "AES-GCM",
+    kdf: "PBKDF2-SHA-256",
+    kdfParams: { iterations: 10, salt: "c2FsdA" },
+  })));
+  const vault = new MemoryVault();
+  vault.files.set("local.md", { bytes: enc("must remain untouched"), mtime: 1 });
+  const desired: V4RemoteConfig = {
+    formatVersion: V4_FORMAT_VERSION,
+    mode: "encrypted",
+    repoId: "o/r#main",
+    pathLayout: "opaque-stable-v1",
+    algorithm: "AES-GCM",
+    kdf: "PBKDF2-SHA-256",
+    kdfParams: { iterations: 10, salt: "c2FsdA" },
+  };
+  const keys = await deriveV4Keyring({ passphrase: "pass", repoId: "o/r#main", salt: enc("salt"), iterations: 10 });
+
+  for (const operation of ["normal", "forcePull"] as const) {
+    const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "d", mode: "encrypted", pathLayout: "opaque-stable-v1" });
+    const session = new V4SyncSession({ github, vault, index, config: desired, keyring: keys, conflictPolicy: "copy", abortChangePercent: 0 });
+    github.readPaths.length = 0;
+    await assert.rejects(() => session.sync({ operation, allowThresholdOverride: false }), /Force Push/iu);
+    assert.deepEqual(github.readPaths, [V4_CONFIG_PATH]);
+    assert.deepEqual(vault.operations, []);
+    assert.equal(github.commitMessages.length, 0);
+  }
+});
+
+test("v4 validates the remote layout even when the commit SHA matches the local index", async () => {
+  const github = new MemoryGitHub();
+  github.ref = { ref: "refs/heads/main", sha: "legacy", type: "commit" };
+  github.files.set(V4_CONFIG_PATH, enc(JSON.stringify({
+    formatVersion: V4_FORMAT_VERSION,
+    mode: "encrypted",
+    repoId: "o/r#main",
+    algorithm: "AES-GCM",
+    kdf: "PBKDF2-SHA-256",
+    kdfParams: { iterations: 10, salt: "c2FsdA" },
+  })));
+  const vault = new MemoryVault();
+  vault.files.set("local.md", { bytes: enc("must remain untouched"), mtime: 1 });
+  const desired: V4RemoteConfig = {
+    formatVersion: V4_FORMAT_VERSION,
+    mode: "encrypted",
+    repoId: "o/r#main",
+    pathLayout: "opaque-stable-v1",
+    algorithm: "AES-GCM",
+    kdf: "PBKDF2-SHA-256",
+    kdfParams: { iterations: 10, salt: "c2FsdA" },
+  };
+  const keys = await deriveV4Keyring({ passphrase: "pass", repoId: "o/r#main", salt: enc("salt"), iterations: 10 });
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "d", mode: "encrypted", pathLayout: "opaque-stable-v1" });
+  index.remoteCommitSha = "legacy";
+
+  await assert.rejects(
+    () => new V4SyncSession({ github, vault, index, config: desired, keyring: keys, conflictPolicy: "copy", abortChangePercent: 0 }).sync({ operation: "normal", allowThresholdOverride: false }),
+    /Force Push/iu,
+  );
+  assert.deepEqual(github.readPaths, [V4_CONFIG_PATH]);
+  assert.deepEqual(vault.operations, []);
+  assert.equal(github.commitMessages.length, 0);
+});
+
+test("v4 history rejects a legacy encrypted path layout", async () => {
+  const legacy: V4RemoteConfig = {
+    formatVersion: V4_FORMAT_VERSION,
+    mode: "encrypted",
+    repoId: "o/r#main",
+    algorithm: "AES-GCM",
+    kdf: "PBKDF2-SHA-256",
+    kdfParams: { iterations: 10, salt: "c2FsdA" },
+  };
+  const keys = await deriveV4Keyring({ passphrase: "pass", repoId: "o/r#main", salt: enc("salt"), iterations: 10 });
+  assert.throws(() => new V4HistoryService({
+    config: legacy,
+    keyring: keys,
+    github: {
+      async listCommits() { return []; },
+      async getFileBytes() { return null; },
+      async getGitCommit() { throw new Error("not reached"); },
+      async getTreeAt() { throw new Error("not reached"); },
+      async getBlob() { throw new Error("not reached"); },
+    },
+  }), /Force Push/iu);
+});
+
 test("v4 session force-pushes one atomic commit, no-ops unchanged, and force-pulls", async () => {
   const github = new MemoryGitHub();
   const source = new MemoryVault();
@@ -86,7 +187,7 @@ test("v4 session force-pushes one atomic commit, no-ops unchanged, and force-pul
   assert.equal(target.files.has("old.md"), false);
 });
 
-test("v4 session performs no blob or tree reads when the remote commit is unchanged", async () => {
+test("v4 session validates only the config when the remote commit is unchanged", async () => {
   const github = new MemoryGitHub();
   const vault = new MemoryVault();
   vault.files.set("a.md", { bytes: enc("one"), mtime: 1 });
@@ -95,9 +196,11 @@ test("v4 session performs no blob or tree reads when the remote commit is unchan
   await session.sync({ operation: "forcePush", allowThresholdOverride: false });
 
   github.readRefs.length = 0;
+  github.readPaths.length = 0;
   await session.sync({ operation: "normal", allowThresholdOverride: false });
 
-  assert.deepEqual(github.readRefs, []);
+  assert.deepEqual(github.readRefs, [github.ref!.sha]);
+  assert.deepEqual(github.readPaths, [V4_CONFIG_PATH]);
   assert.deepEqual(github.treeReads, []);
 });
 
@@ -122,7 +225,7 @@ test("v4 cutover refuses legacy force pull and encrypted force push onto populat
     () => new V4SyncSession({ github, vault, index: plaintextIndex, config: config(), conflictPolicy: "copy", abortChangePercent: 0 }).sync({ operation: "forcePull", allowThresholdOverride: false }),
     /Force Push is required/u,
   );
-  const encryptedConfig: V4RemoteConfig = { formatVersion: V4_FORMAT_VERSION, mode: "encrypted", repoId: "o/r#main", algorithm: "AES-GCM", kdf: "PBKDF2-SHA-256", kdfParams: { iterations: 10, salt: "c2FsdA" } };
+  const encryptedConfig: V4RemoteConfig = { formatVersion: V4_FORMAT_VERSION, mode: "encrypted", repoId: "o/r#main", pathLayout: "opaque-stable-v1", algorithm: "AES-GCM", kdf: "PBKDF2-SHA-256", kdfParams: { iterations: 10, salt: "c2FsdA" } };
   const keys = await deriveV4Keyring({ passphrase: "pass", repoId: "o/r#main", salt: enc("salt"), iterations: 10 });
   const encryptedIndex = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "d", mode: "encrypted" });
   await assert.rejects(
@@ -183,7 +286,7 @@ test("v4 encrypted pack round trips through force pull and version-history previ
   const github = new MemoryGitHub();
   const source = new MemoryVault();
   for (let index = 0; index < 64; index++) source.files.set(`Folder/private-${index}.md`, { bytes: enc(`secret-${index}`), mtime: 1 });
-  const encryptedConfig: V4RemoteConfig = { formatVersion: V4_FORMAT_VERSION, mode: "encrypted", repoId: "o/r#main", algorithm: "AES-GCM", kdf: "PBKDF2-SHA-256", kdfParams: { iterations: 10, salt: "c2FsdA" } };
+  const encryptedConfig: V4RemoteConfig = { formatVersion: V4_FORMAT_VERSION, mode: "encrypted", repoId: "o/r#main", pathLayout: "opaque-stable-v1", algorithm: "AES-GCM", kdf: "PBKDF2-SHA-256", kdfParams: { iterations: 10, salt: "c2FsdA" } };
   const keys = await deriveV4Keyring({ passphrase: "pass", repoId: "o/r#main", salt: enc("salt"), iterations: 10 });
   const sourceIndex = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "a", mode: "encrypted" });
   await new V4SyncSession({ github, vault: source, index: sourceIndex, config: encryptedConfig, keyring: keys, conflictPolicy: "copy", abortChangePercent: 0 }).sync({ operation: "forcePush", allowThresholdOverride: false });

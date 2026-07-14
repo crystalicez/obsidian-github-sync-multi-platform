@@ -16,7 +16,7 @@ import {
   decodeV4RemoteShard,
   v4RemoteShardPath,
 } from "./remote-index"
-import { expectedV4PathLayout, V4_CONFIG_PATH, V4_HEAD_PATH, V4_ROOT, type V4RemoteConfig, type V4RemoteHead } from "./protocol-types"
+import { effectiveV4PathLayout, expectedV4PathLayout, V4_CONFIG_PATH, V4_HEAD_PATH, V4_ROOT, type V4RemoteConfig, type V4RemoteHead } from "./protocol-types"
 import { V4StorageCodec } from "./storage-codec"
 import type { V4QueuedChange } from "./sync-coordinator"
 
@@ -133,6 +133,14 @@ function journalPath(journalId: string, page: number, encrypted: boolean): strin
   return `${V4_ROOT}/journals/${journalId}/${String(page).padStart(6, "0")}.${encrypted ? "enc" : "json"}`
 }
 
+export function assertV4PathLayoutCompatible(remote: V4RemoteConfig, desired: V4RemoteConfig, operation: V4SyncOperation): void {
+  const actual = effectiveV4PathLayout(remote)
+  const expected = expectedV4PathLayout(desired.mode)
+  if (actual === expected) return
+  if (operation === "forcePush") return
+  throw new Error(`Remote encrypted path layout is ${actual}; confirmed Force Push is required to migrate to ${expected}.`)
+}
+
 const PACK_MIN_CHANGED_FILES = 64
 const PACK_MAX_FILES = 500
 const PACK_MAX_PLAINTEXT_BYTES = 32 * 1024 * 1024
@@ -160,9 +168,10 @@ export class V4SyncSession {
     this.localReadCache.clear()
     const baseCommitSha = this.input.index.remoteCommitSha
     const ref = await this.input.github.getGitRefOrNull()
-    const remote = ref && ref.sha === this.input.index.remoteCommitSha
-      ? this.remoteFromLocalIndex(ref.sha)
-      : await this.loadRemote(ref?.sha, options.operation)
+    const remoteConfig = await this.loadRemoteConfig(ref?.sha, options.operation)
+    const remote = ref && remoteConfig && ref.sha === this.input.index.remoteCommitSha && this.input.index.pathLayout === effectiveV4PathLayout(remoteConfig)
+      ? this.remoteFromLocalIndex(ref.sha, remoteConfig)
+      : await this.loadRemote(ref?.sha, remoteConfig, options.operation)
     if (!remote && options.operation !== "forcePush") {
       throw new Error("Remote is not V4. Force Push is required before sync or Force Pull.")
     }
@@ -424,11 +433,17 @@ export class V4SyncSession {
     return { mode, operation: options.operation, changedFiles: plan.changedFiles, pushedFiles: pushes.length, pulledFiles, commitSha: published.commitSha }
   }
 
-  private async loadRemote(commitSha: string | undefined, operation: V4SyncOperation): Promise<V4RemoteState | null> {
+  private async loadRemoteConfig(commitSha: string | undefined, operation: V4SyncOperation): Promise<V4RemoteConfig | null> {
     const configFile = await this.input.github.getFileBytes(V4_CONFIG_PATH, commitSha)
     if (!configFile) return null
     const config = decodeV4RemoteConfig(configFile.bytes)
     if (config.repoId !== this.input.config.repoId) throw new Error("V4 remote repository identity mismatch.")
+    assertV4PathLayoutCompatible(config, this.input.config, operation)
+    return config
+  }
+
+  private async loadRemote(commitSha: string | undefined, config: V4RemoteConfig | null, operation: V4SyncOperation): Promise<V4RemoteState | null> {
+    if (!config) return null
     if (config.mode !== this.input.config.mode && operation === "forcePush" && this.input.config.mode === "plaintext") return null
     const headFile = await this.input.github.getFileBytes(V4_HEAD_PATH, commitSha)
     if (!headFile) throw new Error("V4 remote head is missing.")
@@ -449,9 +464,9 @@ export class V4SyncSession {
     return { config, head, records, commitSha: commitSha ?? "" }
   }
 
-  private remoteFromLocalIndex(commitSha: string): V4RemoteState {
+  private remoteFromLocalIndex(commitSha: string, config: V4RemoteConfig): V4RemoteState {
     return {
-      config: this.input.config,
+      config,
       head: {
         formatVersion: 4,
         mode: this.input.index.mode,

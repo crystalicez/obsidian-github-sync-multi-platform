@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { createEmptyV4LocalIndex, loadV4LocalIndex, saveV4LocalIndexShard } from "../../src/lib/v4/local-index";
+import { createEmptyV4LocalIndex, loadV4LocalIndex, saveV4LocalIndexHeader, saveV4LocalIndexShard } from "../../src/lib/v4/local-index";
 
 test("v4 local index persists only the header and changed shard", async () => {
   const writes = new Map<string, string>();
@@ -39,4 +39,23 @@ test("v4 local index persists only the header and changed shard", async () => {
   assert.deepEqual([...writes.keys()].sort(), [".v4-index/index.json", ".v4-index/shards/ab.json"]);
   assert.equal(loaded.mode, "encrypted");
   assert.equal(loaded.shards.ab.records.pathid.path, "Notes/a.md");
+});
+
+test("v4 local index persists the selected path layout", async () => {
+  const writes = new Map<string, string>();
+  const adapter = {
+    async read(path: string) {
+      const value = writes.get(path);
+      if (value === undefined) throw new Error(`missing ${path}`);
+      return value;
+    },
+    async write(path: string, value: string) { writes.set(path, value); },
+    async exists(path: string) { return writes.has(path); },
+    async mkdir(_path: string) {},
+  };
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "d", mode: "encrypted", pathLayout: "opaque-stable-v1" });
+
+  await saveV4LocalIndexHeader(adapter, "index", index);
+
+  assert.equal((await loadV4LocalIndex(adapter, "index")).pathLayout, "opaque-stable-v1");
 });

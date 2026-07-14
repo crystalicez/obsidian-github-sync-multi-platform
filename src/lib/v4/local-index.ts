@@ -1,4 +1,4 @@
-import { V4_FORMAT_VERSION, type V4ObjectStorage, type V4StorageMode } from "./protocol-types";
+import { expectedV4PathLayout, V4_FORMAT_VERSION, type V4ObjectStorage, type V4PathLayout, type V4StorageMode } from "./protocol-types";
 
 export interface V4IndexFileRecord {
   path: string;
@@ -26,6 +26,7 @@ export interface V4LocalIndex {
   repoId: string;
   deviceId: string;
   mode: V4StorageMode;
+  pathLayout: V4PathLayout;
   remoteCommitSha?: string;
   epoch: number;
   generation: number;
@@ -51,12 +52,13 @@ function header(index: V4LocalIndex): V4LocalIndexHeader {
   return value;
 }
 
-export function createEmptyV4LocalIndex(input: { repoId: string; deviceId: string; mode: V4StorageMode }): V4LocalIndex {
+export function createEmptyV4LocalIndex(input: { repoId: string; deviceId: string; mode: V4StorageMode; pathLayout?: V4PathLayout }): V4LocalIndex {
   return {
     formatVersion: V4_FORMAT_VERSION,
     repoId: input.repoId,
     deviceId: input.deviceId,
     mode: input.mode,
+    pathLayout: input.pathLayout ?? expectedV4PathLayout(input.mode),
     epoch: 0,
     generation: 0,
     shardHashes: {},

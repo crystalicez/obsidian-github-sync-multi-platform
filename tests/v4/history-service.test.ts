@@ -43,7 +43,7 @@ for (const mode of ["plaintext", "encrypted"] as const) {
       ? await deriveV4Keyring({ passphrase: "pass", repoId, salt: enc("salt"), iterations: 10 })
       : undefined;
     const config: V4RemoteConfig = mode === "encrypted"
-      ? { formatVersion: V4_FORMAT_VERSION, mode, repoId, algorithm: "AES-GCM", kdf: "PBKDF2-SHA-256", kdfParams: { iterations: 10, salt: "c2FsdA" } }
+      ? { formatVersion: V4_FORMAT_VERSION, mode, repoId, pathLayout: "opaque-stable-v1", algorithm: "AES-GCM", kdf: "PBKDF2-SHA-256", kdfParams: { iterations: 10, salt: "c2FsdA" } }
       : { formatVersion: V4_FORMAT_VERSION, mode, repoId };
     const prepared = await new V4StorageCodec({ mode, pathLayout: expectedV4PathLayout(mode), keyring }).prepare("deleted.md", enc("before delete"), "version-1", 1, "file-1");
     const stored = prepared.files[0];
