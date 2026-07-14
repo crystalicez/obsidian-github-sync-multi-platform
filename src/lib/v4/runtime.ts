@@ -23,7 +23,7 @@ const V4_INDEX_ROOT = "github-sync-v4-index"
 const fallbackStores = new WeakMap<object, Map<string, string>>()
 
 export function selectV4RuntimeConfig(discovered: V4RemoteConfig | null, mode: V4StorageMode, repoId: string): V4RemoteConfig {
-  if (discovered?.mode === mode) return { ...discovered, pathLayout: expectedV4PathLayout(mode) }
+  if (discovered?.mode === mode) return { ...discovered, repoId, pathLayout: expectedV4PathLayout(mode) }
   if (mode === "plaintext") return { formatVersion: V4_FORMAT_VERSION, mode, repoId, pathLayout: expectedV4PathLayout(mode) }
   return {
     formatVersion: V4_FORMAT_VERSION,
@@ -87,12 +87,9 @@ export class V4PluginRuntime {
   forcePull(allowThresholdOverride = false): Promise<unknown> { return this.coordinator.run({ operation: "forcePull", trigger: "forcePull", allowThresholdOverride }) }
 
   async createHistoryService(): Promise<V4HistoryService> {
-    if (!this.plugin.githubClient) throw new Error("GitHub connection is not configured.")
-    const ref = await this.plugin.githubClient.getGitRefOrNull()
-    const remote = ref ? await this.plugin.githubClient.getFileBytes(V4_CONFIG_PATH, ref.sha) : null
-    if (!remote) throw new Error("V4 history is not initialized. Force Push first.")
-    const remoteConfig = decodeV4RemoteConfig(remote.bytes)
-    const config = selectV4RuntimeConfig(remoteConfig, remoteConfig.mode, remoteConfig.repoId)
+    const loaded = await this.loadConfiguredRemoteConfig()
+    if (!loaded) throw new Error("V4 history is not initialized. Force Push first.")
+    const { remoteConfig, config } = loaded
     assertV4PathLayoutCompatible(remoteConfig, config, "normal")
     const keyring = config.mode === "encrypted"
       ? await deriveV4Keyring({
@@ -106,7 +103,10 @@ export class V4PluginRuntime {
   }
 
   async fileIdForPath(path: string): Promise<string | null> {
-    const config = await this.remoteOrNewConfig()
+    const loaded = await this.loadConfiguredRemoteConfig()
+    if (!loaded) throw new Error("V4 history is not initialized. Force Push first.")
+    assertV4PathLayoutCompatible(loaded.remoteConfig, loaded.config, "normal")
+    const config = loaded.config
     const index = await this.loadIndex(config)
     for (const shard of Object.values(index.shards)) {
       for (const record of Object.values(shard.records)) if (!record.deleted && record.path === path) return record.fileId
@@ -173,13 +173,20 @@ export class V4PluginRuntime {
     return `${this.plugin.settings.githubOwner}/${this.plugin.settings.githubRepo}#${this.plugin.settings.githubBranch || "main"}`
   }
 
-  private async remoteOrNewConfig(): Promise<V4RemoteConfig> {
+  private async loadConfiguredRemoteConfig(): Promise<{ remoteConfig: V4RemoteConfig; config: V4RemoteConfig } | null> {
+    if (!this.plugin.githubClient) throw new Error("GitHub connection is not configured.")
     const ref = await this.plugin.githubClient.getGitRefOrNull()
     const remote = ref ? await this.plugin.githubClient.getFileBytes(V4_CONFIG_PATH, ref.sha) : null
-    if (remote) {
-      const discovered = decodeV4RemoteConfig(remote.bytes)
-      return selectV4RuntimeConfig(discovered, discovered.mode, discovered.repoId)
-    }
+    if (!remote) return null
+    const remoteConfig = decodeV4RemoteConfig(remote.bytes)
+    const config = selectV4RuntimeConfig(remoteConfig, remoteConfig.mode, this.repoId())
+    if (remoteConfig.repoId !== config.repoId) throw new Error("V4 remote repository identity mismatch.")
+    return { remoteConfig, config }
+  }
+
+  private async remoteOrNewConfig(): Promise<V4RemoteConfig> {
+    const loaded = await this.loadConfiguredRemoteConfig()
+    if (loaded) return loaded.config
     const mode = this.plugin.settings.encryptionMode
     return selectV4RuntimeConfig(null, mode, this.repoId())
   }
