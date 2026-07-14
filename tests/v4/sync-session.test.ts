@@ -5,6 +5,7 @@ import type { GitHubCreateTreeEntry } from "../../src/lib/github-git-types";
 import { V4HistoryService } from "../../src/lib/v4/history-service";
 import { createEmptyV4LocalIndex, type V4IndexFileRecord, type V4LocalIndex } from "../../src/lib/v4/local-index";
 import { assertV4PathLayoutCompatible, V4SyncSession, type V4SessionVault } from "../../src/lib/v4/sync-session";
+import { coalesceV4Changes } from "../../src/lib/v4/sync-coordinator";
 import { V4_CONFIG_PATH, V4_FORMAT_VERSION, V4_HEAD_PATH, type V4RemoteConfig, type V4RemoteHead } from "../../src/lib/v4/protocol-types";
 import { deriveV4Keyring } from "../../src/lib/v4/crypto";
 
@@ -431,6 +432,35 @@ test("v4 nested folder rename preserves descendant fileId and opaque remotePath"
   });
 
   const after = indexRecordByPath(index, "B/Nested/note.md");
+  assert.equal(after.fileId, before.fileId);
+  assert.equal(after.remotePath, before.remotePath);
+});
+
+test("v4 chained nested folder renames preserve descendant fileId and opaque remotePath", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault();
+  vault.files.set("A/N/x.md", { bytes: enc("secret"), mtime: 1 });
+  const encryptedConfig: V4RemoteConfig = { formatVersion: V4_FORMAT_VERSION, mode: "encrypted", repoId: "o/r#main", pathLayout: "opaque-stable-v1", algorithm: "AES-GCM", kdf: "PBKDF2-SHA-256", kdfParams: { iterations: 10, salt: "c2FsdA" } };
+  const keys = await deriveV4Keyring({ passphrase: "pass", repoId: "o/r#main", salt: enc("salt"), iterations: 10 });
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "d", mode: "encrypted", pathLayout: "opaque-stable-v1" });
+  const session = () => new V4SyncSession({ github, vault, index, config: encryptedConfig, keyring: keys, conflictPolicy: "copy" as const, abortChangePercent: 0 });
+  await session().sync({ operation: "forcePush", allowThresholdOverride: false });
+
+  const before = indexRecordByPath(index, "A/N/x.md");
+  const file = vault.files.get("A/N/x.md")!;
+  vault.files.delete("A/N/x.md");
+  vault.files.set("C/M/x.md", { ...file, mtime: 2 });
+  await session().sync({
+    operation: "normal",
+    allowThresholdOverride: false,
+    changes: coalesceV4Changes([
+      { type: "folderRename", oldPath: "A", path: "B", mtime: 1 },
+      { type: "folderRename", oldPath: "B/N", path: "B/M", mtime: 2 },
+      { type: "folderRename", oldPath: "B", path: "C", mtime: 3 },
+    ]),
+  });
+
+  const after = indexRecordByPath(index, "C/M/x.md");
   assert.equal(after.fileId, before.fileId);
   assert.equal(after.remotePath, before.remotePath);
 });

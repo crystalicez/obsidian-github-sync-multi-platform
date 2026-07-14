@@ -145,3 +145,12 @@ test("v4 folder rename keeps descendant changes as one prefix mapping", () => {
     { type: "modify", path: "B/note.md", mtime: 2 },
   ]);
 });
+
+test("v4 chained folder renames preserve parent-before-descendant causal order", () => {
+  const changes: V4QueuedChange[] = [
+    { type: "folderRename", oldPath: "A", path: "B", mtime: 1 },
+    { type: "folderRename", oldPath: "B/N", path: "B/M", mtime: 2 },
+    { type: "folderRename", oldPath: "B", path: "C", mtime: 3 },
+  ];
+  assert.deepEqual(coalesceV4Changes(changes), changes);
+});

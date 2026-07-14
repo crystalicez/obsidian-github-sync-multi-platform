@@ -32,13 +32,17 @@ export function coalesceV4Changes(changes: V4QueuedChange[]): V4QueuedChange[] {
   if (changes.some(change => change.type === "rescan")) {
     return [{ type: "rescan", mtime: Math.max(...changes.map(change => change.mtime)) }];
   }
-  const byPath = new Map<string, V4QueuedChange>();
+  const byPath = new Map<string | symbol, V4QueuedChange>();
   const pathChanges = changes.filter((change): change is V4PathChange => change.type !== "rescan");
   for (const raw of pathChanges) {
     const change: V4PathChange = raw.type === "rename" || raw.type === "folderRename"
       ? { ...raw, oldPath: normalizeV4VaultPath(raw.oldPath), path: normalizeV4VaultPath(raw.path) }
       : { ...raw, path: normalizeV4VaultPath(raw.path) };
-    if (change.type === "rename" || change.type === "folderRename") {
+    if (change.type === "folderRename") {
+      byPath.set(Symbol("folderRename"), change);
+      continue;
+    }
+    if (change.type === "rename") {
       const previous = byPath.get(change.oldPath);
       const oldPath = previous?.type === change.type ? previous.oldPath : change.oldPath;
       byPath.delete(change.oldPath);
