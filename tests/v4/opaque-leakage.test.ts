@@ -9,6 +9,7 @@ import { createEmptyV4LocalIndex, type V4IndexFileRecord } from "../../src/lib/v
 import { V4_LARGE_FILE_THRESHOLD_BYTES } from "../../src/lib/v4/large-files";
 import { V4_CONFIG_PATH, V4_FORMAT_VERSION, V4_HEAD_PATH, type V4RemoteConfig } from "../../src/lib/v4/protocol-types";
 import { decodeV4RemoteHead, decodeV4RemoteShard, v4RemoteShardPath } from "../../src/lib/v4/remote-index";
+import { V4StorageCodec } from "../../src/lib/v4/storage-codec";
 import { V4SyncSession, type V4SessionVault } from "../../src/lib/v4/sync-session";
 
 const encode = (value: string) => new TextEncoder().encode(value);
@@ -190,14 +191,37 @@ test("encrypted V4 remote paths and payloads contain no logical path or content 
   }
 
   const head = await decodeV4RemoteHead(github.files.get(V4_HEAD_PATH)!, config, keyring);
-  const livePaths: string[] = [];
+  const liveRecords: V4IndexFileRecord[] = [];
   for (const bucket of Object.keys(head.shardHashes)) {
     const shard = await decodeV4RemoteShard(github.files.get(v4RemoteShardPath(bucket, "encrypted"))!, bucket, config, keyring);
-    livePaths.push(...Object.values(shard.records).map(record => record.path));
+    liveRecords.push(...Object.values(shard.records));
   }
+  const livePaths = liveRecords.map(record => record.path);
   assert.equal(livePaths.includes(chunkPath), true);
   assert.equal(livePaths.includes(singlePath), true);
   assert.equal(livePaths.includes(deletedPath), false);
+
+  const tipCommit = github.commits.get(github.ref!.sha)!;
+  const tipTree = github.trees.get(tipCommit.treeSha)!;
+  const readFromReachableTip = async (path: string) => {
+    const bytes = tipTree.get(path);
+    assert.ok(bytes, `descriptor path missing from reachable tip tree: ${path}`);
+    return new Uint8Array(bytes);
+  };
+  const codec = new V4StorageCodec({ mode: "encrypted", pathLayout: "opaque-stable-v1", keyring });
+  const singleRecord = liveRecords.find(record => record.path === singlePath);
+  const chunkedRecord = liveRecords.find(record => record.path === chunkPath);
+  const packedPath = `${packFolder}/private-record-42.opaque-note-fixture`;
+  const packedRecord = liveRecords.find(record => record.path === packedPath);
+  assert.ok(singleRecord, `missing single record for ${singlePath}`);
+  assert.ok(chunkedRecord, `missing chunked record for ${chunkPath}`);
+  assert.ok(packedRecord, `missing packed record for ${packedPath}`);
+  assert.equal(singleRecord.storage, "single");
+  assert.equal(chunkedRecord.storage, "chunked");
+  assert.equal(packedRecord.storage, "pack");
+  assert.deepEqual(await codec.read(singleRecord, readFromReachableTip), encode(singleMarker));
+  assert.equal(Buffer.from(await codec.read(chunkedRecord, readFromReachableTip)).equals(Buffer.from(chunkBytes)), true);
+  assert.deepEqual(await codec.read(packedRecord, readFromReachableTip), encode(`${packMarker}-42`));
 
   const history = new V4HistoryService({ github, config, keyring });
   const deletedVersions = await history.getFileVersions(deletedRecord.fileId);

@@ -26,6 +26,7 @@ class HistoryMemoryGitHub {
   blobs = new Map<string, Uint8Array>();
   trees = new Map<string, Map<string, Uint8Array>>();
   commits = new Map<string, { treeSha: string; parents: string[]; message: string }>();
+  commitPageRequests: number[] = [];
 
   reachableCommits() {
     const reachable: Array<[string, { treeSha: string; parents: string[]; message: string }]> = [];
@@ -43,6 +44,7 @@ class HistoryMemoryGitHub {
     return reachable;
   }
   async listCommits({ page = 1, perPage = 50 }: { page?: number; perPage?: number } = {}) {
+    this.commitPageRequests.push(page);
     const commits = this.reachableCommits().map(([sha, commit], index) => ({ sha, message: commit.message, authorName: "A", authoredAt: new Date(this.commits.size - index).toISOString(), parentShas: commit.parents }));
     return commits.slice((page - 1) * perPage, page * perPage);
   }
@@ -170,7 +172,15 @@ test("v4 encrypted history follows one fileId across file and folder renames", a
   vault.files.set("Archive/Secret/renamed.txt", { ...file, mtime: 3 });
   await session().sync({ operation: "normal", allowThresholdOverride: false, changes: [{ type: "rename", oldPath: "Archive/Secret/note.md", path: "Archive/Secret/renamed.txt", mtime: 3 }] });
 
+  for (let filler = 0; filler < 49; filler++) {
+    const parentSha = github.ref!.sha;
+    const treeSha = github.commits.get(parentSha)!.treeSha;
+    const fillerSha = await github.createGitCommit(`external filler ${filler}`, treeSha, [parentSha]);
+    await github.updateGitRef(fillerSha, parentSha);
+  }
+
   const versions = await new V4HistoryService({ github, config, keyring }).getFileVersions(initial.fileId);
+  assert.deepEqual(github.commitPageRequests, [1, 2]);
   assert.deepEqual(versions.map(version => version.change.path), [
     "Projects/Secret/note.md",
     "Archive/Secret/note.md",
