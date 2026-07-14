@@ -19,6 +19,11 @@ export async function pathIdForV4Path(pathKey: Uint8Array, path: string): Promis
   return toHex(await hmac(pathKey, `path-id:${normalizeV4VaultPath(path)}`));
 }
 
+export async function objectIdForV4File(pathKey: Uint8Array, fileId: string): Promise<string> {
+  if (!fileId) throw new Error("V4 file identity is required for an opaque object path.");
+  return toHex(await hmac(pathKey, `object-id:${fileId}`));
+}
+
 export function bucketForV4PathId(pathId: string): string {
   if (!/^[0-9a-f]{64}$/u.test(pathId)) throw new Error("Invalid V4 path id.");
   return pathId.slice(0, 2);
@@ -31,4 +36,14 @@ export async function encryptedV4RemotePath(pathKey: Uint8Array, path: string): 
   const folder = segments.join("/");
   const token = toBase64Url(await hmac(pathKey, `remote-basename:${normalized}`)).slice(0, 32);
   return `${V4_ROOT}/data/${folder ? `${folder}/` : ""}${token}.enc`;
+}
+
+export async function opaqueV4ObjectPath(pathKey: Uint8Array, fileId: string): Promise<string> {
+  const objectId = await objectIdForV4File(pathKey, fileId);
+  return `${V4_ROOT}/data/${objectId.slice(0, 2)}/${objectId}.enc`;
+}
+
+export async function opaqueV4PackPath(pathKey: Uint8Array, packId: string): Promise<string> {
+  const objectId = toHex(await hmac(pathKey, `pack-id:${packId}`));
+  return `${V4_ROOT}/packs/${objectId.slice(0, 2)}/${objectId}.enc`;
 }

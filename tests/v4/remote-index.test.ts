@@ -3,13 +3,13 @@ import test from "node:test";
 
 import { deriveV4Keyring } from "../../src/lib/v4/crypto";
 import { buildV4RemoteMetadata, decodeV4RemoteHead, decodeV4RemoteShard } from "../../src/lib/v4/remote-index";
-import { V4_FORMAT_VERSION, type V4RemoteConfig, type V4RemoteHead } from "../../src/lib/v4/protocol-types";
+import { expectedV4PathLayout, V4_FORMAT_VERSION, type V4RemoteConfig, type V4RemoteHead } from "../../src/lib/v4/protocol-types";
 
 const enc = (value: string) => new TextEncoder().encode(value);
 
 test("v4 encrypted remote metadata does not expose paths and round trips", async () => {
   const keys = await deriveV4Keyring({ passphrase: "pass", repoId: "o/r#main", salt: enc("salt"), iterations: 10 });
-  const config: V4RemoteConfig = { formatVersion: V4_FORMAT_VERSION, mode: "encrypted", repoId: "o/r#main", algorithm: "AES-GCM", kdf: "PBKDF2-SHA-256", kdfParams: { iterations: 10, salt: "c2FsdA" } };
+  const config: V4RemoteConfig = { formatVersion: V4_FORMAT_VERSION, mode: "encrypted", repoId: "o/r#main", pathLayout: expectedV4PathLayout("encrypted"), algorithm: "AES-GCM", kdf: "PBKDF2-SHA-256", kdfParams: { iterations: 10, salt: "c2FsdA" } };
   const head: V4RemoteHead = { formatVersion: V4_FORMAT_VERSION, mode: "encrypted", epoch: 1, generation: 2, journalId: "j2", shardHashes: { aa: "h" }, updatedAt: 3, deviceId: "d" };
   const record = { path: "Folder/private.md", pathId: "aa".padEnd(64, "0"), fileId: "f", plaintextSha256: "hash", size: 4, mtime: 3, remoteVersion: "v", remotePath: "opaque", storage: "single" as const };
   const files = await buildV4RemoteMetadata({ config, head, records: [record], keyring: keys });

@@ -2,8 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { decryptV4Payload, deriveV4Keyring, encryptV4Payload } from "../../src/lib/v4/crypto";
-import { encryptedV4RemotePath, normalizeV4VaultPath, pathIdForV4Path } from "../../src/lib/v4/paths";
-import { V4_FORMAT_VERSION, V4_ROOT } from "../../src/lib/v4/protocol-types";
+import { opaqueV4ObjectPath } from "../../src/lib/v4/paths";
+import { effectiveV4PathLayout, expectedV4PathLayout } from "../../src/lib/v4/protocol-types";
 
 test("v4 keyring is stable for one repository and domain-separated", async () => {
   const salt = new Uint8Array(16).fill(7);
@@ -27,16 +27,19 @@ test("v4 payload authentication hides bytes and rejects a wrong key", async () =
   await assert.rejects(() => decryptV4Payload(wrongKey, encrypted, { kind: "content", aad: "repo:file:1" }));
 });
 
-test("v4 encrypted remote paths preserve folders but hide basenames", async () => {
-  const pathKey = new Uint8Array(32).fill(3);
-  const path = normalizeV4VaultPath("\\Projects\\Secret Note.md");
-  const pathId = await pathIdForV4Path(pathKey, path);
-  const remotePath = await encryptedV4RemotePath(pathKey, path);
+test("v4 encrypted object identity is stable by file identity and repository key", async () => {
+  const keyA = new Uint8Array(32).fill(3);
+  const keyB = new Uint8Array(32).fill(4);
+  const first = await opaqueV4ObjectPath(keyA, "file-1");
+  assert.equal(first, await opaqueV4ObjectPath(keyA, "file-1"));
+  assert.notEqual(first, await opaqueV4ObjectPath(keyA, "file-2"));
+  assert.notEqual(first, await opaqueV4ObjectPath(keyB, "file-1"));
+  assert.match(first, /^\.obsidian-github-sync-v4\/data\/[0-9a-f]{2}\/[0-9a-f]{64}\.enc$/u);
+  assert.doesNotMatch(first, /Projects|Secret|note|\.md/u);
+});
 
-  assert.equal(path, "Projects/Secret Note.md");
-  assert.match(pathId, /^[0-9a-f]{64}$/u);
-  assert.equal(remotePath.startsWith(`${V4_ROOT}/data/Projects/`), true);
-  assert.equal(remotePath.includes("Secret Note"), false);
-  assert.match(remotePath.split("/").at(-1) ?? "", /^[A-Za-z0-9_-]{32}\.enc$/u);
-  assert.equal(V4_FORMAT_VERSION, 4);
+test("v4 path layout distinguishes new plaintext, new encrypted, and legacy encrypted configs", () => {
+  assert.equal(expectedV4PathLayout("plaintext"), "plaintext-v1");
+  assert.equal(expectedV4PathLayout("encrypted"), "opaque-stable-v1");
+  assert.equal(effectiveV4PathLayout({ formatVersion: 4, mode: "encrypted", repoId: "o/r#main" }), "encrypted-folders-v0");
 });
