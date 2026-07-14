@@ -87,6 +87,13 @@ export class V4StorageCodec {
     }
   }
 
+  async relocate(record: V4FileRecord, logicalPath: string): Promise<V4FileRecord> {
+    return {
+      ...record,
+      pathId: await this.pathId(normalizeV4VaultPath(logicalPath)),
+    }
+  }
+
   async preparePack(
     packId: string,
     entries: Array<{ record: V4FileRecord; plaintext: Uint8Array }>,

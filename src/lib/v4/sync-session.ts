@@ -196,10 +196,15 @@ export class V4SyncSession {
     }
 
     const includePath = this.input.includePath ?? (() => true)
+    const allRemoteRecords = remote?.records ?? []
+    const isLayoutMigration = !!remote
+      && effectiveV4PathLayout(remote.config) !== expectedV4PathLayout(this.input.config.mode)
+    if (isLayoutMigration && allRemoteRecords.some(record => !includePath(record.path))) {
+      throw new Error("Legacy V4 migration cannot continue while encrypted records are excluded by sync scope. Include all legacy paths and retry Force Push.")
+    }
     const allBaseRecords = recordsFromIndex(this.input.index)
     const baseRecords = allBaseRecords.filter(record => includePath(record.path))
     const localFiles = (await this.scanLocal(baseRecords, options.changes ?? [])).filter(file => includePath(file.path))
-    const allRemoteRecords = remote?.records ?? []
     const remoteRecords = allRemoteRecords.filter(record => includePath(record.path))
     assertNoCaseInsensitiveCollisions(localFiles)
     assertNoCaseInsensitiveCollisions(logical(remoteRecords))
@@ -207,11 +212,14 @@ export class V4SyncSession {
       operation: options.operation,
       base: logical(baseRecords),
       local: localFiles,
-      remote: logical(remoteRecords),
+      remote: isLayoutMigration ? [] : logical(remoteRecords),
     })
+    const changedFiles = isLayoutMigration
+      ? new Set([...localFiles.map(file => file.fileId), ...remoteRecords.map(record => record.fileId)]).size
+      : plan.changedFiles
     const guard = evaluateV4ChangeGuard({
       thresholdPercent: this.input.abortChangePercent,
-      changedFiles: plan.changedFiles,
+      changedFiles,
       baseFiles: baseRecords.length,
       localFiles: localFiles.length,
       remoteFiles: remoteRecords.length,
@@ -219,12 +227,12 @@ export class V4SyncSession {
     if (guard.blocked && !options.allowThresholdOverride) {
       throw new V4ChangeGuardError(guard.changePercent, guard.thresholdPercent)
     }
-    if (plan.changedFiles === 0 && options.operation !== "forcePush") {
+    if (changedFiles === 0 && options.operation !== "forcePush") {
       if (remote) this.replaceIndex(allRemoteRecords, remote.head, remote.commitSha)
       return { mode: "noop", operation: options.operation, changedFiles: 0, pushedFiles: 0, pulledFiles: 0 }
     }
 
-    const recordsById = new Map(allRemoteRecords.map(record => [record.fileId, record]))
+    const recordsById = new Map((isLayoutMigration ? [] : allRemoteRecords).map(record => [record.fileId, record]))
     const remoteCommitSha = remote?.commitSha
     let pulledFiles = 0
     for (const change of plan.pulls) {
@@ -288,7 +296,7 @@ export class V4SyncSession {
 
     if (pushes.length === 0 && options.operation !== "forcePush" && !externalReconciled) {
       this.replaceIndex(allRemoteRecords, remote!.head, remote!.commitSha)
-      return { mode: options.operation === "forcePull" ? "force-pull" : "pull", operation: options.operation, changedFiles: plan.changedFiles, pushedFiles: 0, pulledFiles }
+      return { mode: options.operation === "forcePull" ? "force-pull" : "pull", operation: options.operation, changedFiles, pushedFiles: 0, pulledFiles }
     }
 
     const latestLocal = new Map((await this.scanLocal(baseRecords, options.changes ?? [])).map(file => [file.fileId, file]))
@@ -322,6 +330,23 @@ export class V4SyncSession {
       }
       const after = latestLocal.get(change.fileId) ?? change.after
       if (!after) continue
+      if (change.kind === "rename"
+        && previous
+        && after.hash === previous.plaintextSha256
+        && this.input.config.mode === "encrypted") {
+        const relocated = await this.codec.relocate(previous, after.path)
+        const record: V4IndexFileRecord = { ...relocated, path: after.path, mtime: after.mtime }
+        recordsById.set(after.fileId, record)
+        journalChanges.push({
+          fileId: after.fileId,
+          kind: change.kind,
+          path: after.path,
+          previousPath: change.previousPath,
+          before: descriptorFor(previous),
+          after: descriptorFor(record),
+        })
+        continue
+      }
       const bytes = await this.readLocal(after.path)
       const prepared = await this.codec.prepare(after.path, bytes, journalId, after.mtime, after.fileId)
       const record: V4IndexFileRecord = { path: after.path, ...prepared.record }
@@ -430,7 +455,7 @@ export class V4SyncSession {
     })
     this.replaceIndex(finalRecords, head, published.commitSha)
     const mode = options.operation === "forcePush" ? "force-push" : pulledFiles > 0 ? "pull-push" : "push"
-    return { mode, operation: options.operation, changedFiles: plan.changedFiles, pushedFiles: pushes.length, pulledFiles, commitSha: published.commitSha }
+    return { mode, operation: options.operation, changedFiles, pushedFiles: pushes.length, pulledFiles, commitSha: published.commitSha }
   }
 
   private async loadRemoteConfig(commitSha: string | undefined, operation: V4SyncOperation): Promise<V4RemoteConfig | null> {
