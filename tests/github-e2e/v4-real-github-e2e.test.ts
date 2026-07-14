@@ -112,7 +112,7 @@ async function waitForBranchHead(config: GitHubConfig, expectedSha: string, time
   throw new Error(`Timed out waiting for GitHub E2E branch head ${expectedSha} after ${timeoutMs}ms.`);
 }
 
-async function deleteTestBranch(config: GitHubConfig, required: boolean): Promise<void> {
+async function deleteTestBranch(config: GitHubConfig): Promise<void> {
   const repository = await githubRequest(config, "");
   if (!repository.ok) throw new Error(`Cannot inspect GitHub E2E repository: HTTP ${repository.status}`);
   const metadata = await repository.json() as { default_branch: string };
@@ -135,7 +135,7 @@ async function deleteTestBranch(config: GitHubConfig, required: boolean): Promis
       // Fall through so malformed validation responses remain visible.
     }
   }
-  if (required) throw new Error(`Cannot reset GitHub E2E branch: HTTP ${response.status} ${responseText}`);
+  throw new Error(`Cannot reset GitHub E2E branch: HTTP ${response.status} ${responseText}`);
 }
 
 class MemoryVault implements V4SessionVault {
@@ -174,7 +174,7 @@ function repoId(config: GitHubConfig): string {
 }
 
 async function runRoundTrip(mode: V4StorageMode, config: GitHubConfig): Promise<void> {
-  await deleteTestBranch(config, true);
+  await deleteTestBranch(config);
   const client = new GitHubClient(config);
   const salt = randomBytes(16);
   const remoteConfig: V4RemoteConfig = mode === "encrypted"
@@ -182,11 +182,13 @@ async function runRoundTrip(mode: V4StorageMode, config: GitHubConfig): Promise<
       formatVersion: V4_FORMAT_VERSION,
       mode,
       repoId: repoId(config),
+      pathLayout: expectedV4PathLayout(mode),
       algorithm: "AES-GCM",
       kdf: "PBKDF2-SHA-256",
       kdfParams: { iterations: 10_000, salt: toBase64Url(salt) },
     }
-    : { formatVersion: V4_FORMAT_VERSION, mode, repoId: repoId(config) };
+    : { formatVersion: V4_FORMAT_VERSION, mode, repoId: repoId(config), pathLayout: expectedV4PathLayout(mode) };
+  assert.equal(remoteConfig.pathLayout, mode === "encrypted" ? "opaque-stable-v1" : "plaintext-v1");
   const keyring = mode === "encrypted"
     ? await deriveV4Keyring({ passphrase: "v4-real-github-e2e", repoId: remoteConfig.repoId, salt, iterations: 10_000 })
     : undefined;
@@ -194,7 +196,12 @@ async function runRoundTrip(mode: V4StorageMode, config: GitHubConfig): Promise<
   const source = new MemoryVault();
   source.set("Notes/hello.md", new TextEncoder().encode(`hello from ${mode}`), 1);
   source.set("Assets/pixel.bin", new Uint8Array([0, 1, 2, 255]), 2);
-  const sourceIndex = createEmptyV4LocalIndex({ repoId: remoteConfig.repoId, deviceId: `source-${mode}`, mode });
+  const sourceIndex = createEmptyV4LocalIndex({
+    repoId: remoteConfig.repoId,
+    deviceId: `source-${mode}`,
+    mode,
+    pathLayout: expectedV4PathLayout(mode),
+  });
   const sourceSession = new V4SyncSession({
     github: client,
     vault: source,
@@ -208,6 +215,28 @@ async function runRoundTrip(mode: V4StorageMode, config: GitHubConfig): Promise<
   const pushed = await sourceSession.sync({ operation: "forcePush", allowThresholdOverride: false });
   assert.equal(pushed.mode, "force-push");
   await waitForBranchHead(config, sourceIndex.remoteCommitSha!);
+
+  if (mode === "encrypted") {
+    const beforeRename = Object.values(sourceIndex.shards)
+      .flatMap(shard => Object.values(shard.records))
+      .find(record => record.path === "Notes/hello.md")!;
+    const renamedFile = source.files.get("Notes/hello.md")!;
+    source.files.delete("Notes/hello.md");
+    source.set("Notes/hello-renamed.md", renamedFile.bytes, 3);
+    await sourceSession.sync({
+      operation: "normal",
+      allowThresholdOverride: false,
+      changes: [{ type: "rename", oldPath: "Notes/hello.md", path: "Notes/hello-renamed.md", mtime: 3 }],
+    });
+    await waitForBranchHead(config, sourceIndex.remoteCommitSha!);
+    const afterRename = Object.values(sourceIndex.shards)
+      .flatMap(shard => Object.values(shard.records))
+      .find(record => record.path === "Notes/hello-renamed.md")!;
+    assert.equal(afterRename.fileId, beforeRename.fileId);
+    assert.equal(afterRename.remotePath, beforeRename.remotePath);
+  }
+
+  assert.equal((await sourceSession.sync({ operation: "normal", allowThresholdOverride: false })).mode, "noop");
   const publishedCommitSha = sourceIndex.remoteCommitSha!;
   const publishedCommit = await client.getGitCommit(publishedCommitSha);
   const tree = await client.getTreeAt(publishedCommit.treeSha, true);
@@ -223,12 +252,13 @@ async function runRoundTrip(mode: V4StorageMode, config: GitHubConfig): Promise<
     assert.deepEqual([...headByBlob.subarray(0, 4)], [0x4f, 0x47, 0x53, 0x34], "Encrypted V4 head blob was stored without its payload header.");
     assert.deepEqual([...headByPath.bytes.subarray(0, 4)], [0x4f, 0x47, 0x53, 0x34], "Encrypted V4 head path read lost its payload header.");
   }
-  assert.equal((await sourceSession.sync({ operation: "normal", allowThresholdOverride: false })).mode, "noop");
-
   const paths = tree.tree.map(entry => entry.path);
   if (mode === "plaintext") assert.equal(paths.includes("Notes/hello.md"), true);
   else {
-    assert.equal(paths.some(path => path.includes("hello.md")), false);
+    assert.equal(paths.some(path => /^\.obsidian-github-sync-v4\/data\/[0-9a-f]{2}\/[0-9a-f]{64}\.enc$/u.test(path)), true);
+    for (const segment of ["Notes", "Assets", "hello", "pixel", "md", "bin"]) {
+      assert.equal(paths.some(path => path.includes(segment)), false);
+    }
     const records = Object.values(sourceIndex.shards).flatMap(shard => Object.values(shard.records));
     for (const record of records) {
       const remote = await client.getFileBytes(record.remotePath, publishedCommitSha);
@@ -257,7 +287,12 @@ async function runRoundTrip(mode: V4StorageMode, config: GitHubConfig): Promise<
 
   const target = new MemoryVault();
   target.set("remove-me.md", new TextEncoder().encode("old"));
-  const targetIndex = createEmptyV4LocalIndex({ repoId: remoteConfig.repoId, deviceId: `target-${mode}`, mode });
+  const targetIndex = createEmptyV4LocalIndex({
+    repoId: remoteConfig.repoId,
+    deviceId: `target-${mode}`,
+    mode,
+    pathLayout: expectedV4PathLayout(mode),
+  });
   const pulled = await new V4SyncSession({
     github: client,
     vault: target,
@@ -269,17 +304,32 @@ async function runRoundTrip(mode: V4StorageMode, config: GitHubConfig): Promise<
   }).sync({ operation: "forcePull", allowThresholdOverride: false });
 
   assert.equal(pulled.mode, "force-pull");
-  assert.equal(new TextDecoder().decode(target.files.get("Notes/hello.md")!.bytes), `hello from ${mode}`);
-  assert.deepEqual([...target.files.get("Assets/pixel.bin")!.bytes], [0, 1, 2, 255]);
+  for (const [path, sourceFile] of source.files) {
+    assert.deepEqual(target.files.get(path)!.bytes, sourceFile.bytes, `Pulled bytes differ at ${path}`);
+  }
   assert.equal(target.files.has("remove-me.md"), false);
+
+  if (mode === "encrypted") {
+    const pushedRecords = Object.values(sourceIndex.shards).flatMap(shard => Object.values(shard.records));
+    const pulledRecords = Object.values(targetIndex.shards).flatMap(shard => Object.values(shard.records));
+    for (const pushedRecord of pushedRecords) {
+      const pulledRecord = pulledRecords.find(record => record.path === pushedRecord.path)!;
+      assert.equal(pulledRecord.fileId, pushedRecord.fileId);
+      assert.equal(pulledRecord.remotePath, pushedRecord.remotePath);
+    }
+  }
 }
 
 const config = githubConfig();
 installRequestUrlBridge();
 
 after(async () => {
-  setRequestUrlHandler(null);
-  await deleteTestBranch(config, false).catch(() => undefined);
+  try {
+    await deleteTestBranch(config);
+    console.log(`GitHub E2E branch cleanup verified: ${config.branch}`);
+  } finally {
+    setRequestUrlHandler(null);
+  }
 });
 
 test("V4 real GitHub REST round trips plaintext and encrypted vaults", { timeout: 120_000 }, async () => {

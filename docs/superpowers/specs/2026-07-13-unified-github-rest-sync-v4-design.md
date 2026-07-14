@@ -6,11 +6,13 @@ Replace the split plaintext and encrypted sync paths with one GitHub REST based 
 
 ## Remote Format
 
-V4 reserves `.obsidian-github-sync-v4/` for configuration, sharded indexes, history journals, encrypted data, large-file parts, and directory-local packs. Plaintext files at or below the large-file threshold remain at their vault paths. Encrypted files retain their plaintext folder hierarchy under the V4 data root while their basenames, contents, indexes, and journals remain opaque.
+V4 reserves `.obsidian-github-sync-v4/` for configuration, sharded indexes, history journals, encrypted data, large-file parts, and packs. Plaintext files at or below the large-file threshold remain at their vault paths. Encrypted files use stable opaque object paths that reveal no plaintext directory segment, basename, or extension; complete logical paths exist only inside authenticated encrypted indexes and journals. The detailed layout and migration contract are defined in the [opaque stable encrypted paths implementation plan](../plans/2026-07-13-opaque-stable-encrypted-paths.md).
+
+Encrypted mode hides every directory name, filename, extension, and file content. GitHub stores stable opaque objects in fixed technical buckets; the plugin reconstructs logical paths from authenticated encrypted metadata. Repositories created by the earlier encrypted V4 layout require a confirmed Force Push before normal sync or Force Pull.
 
 `config.json` contains format version, storage mode, random salt, and KDF parameters. It never contains a token, passphrase, plaintext basename, file content, or plaintext content hash. Encryption uses PBKDF2-SHA-256 with 600,000 iterations, a random per-repository salt, domain-separated keys, and AES-256-GCM with fresh nonces.
 
-Files whose logical or encrypted payload exceeds 50 MiB use ordered parts no larger than 48 MiB. A full-file SHA-256 protects reassembly. Small encrypted files may use directory-local packs capped below the same remote blob threshold.
+Files whose logical or encrypted payload exceeds 50 MiB use ordered parts no larger than 48 MiB. A full-file SHA-256 protects reassembly. Small encrypted files may use bounded opaque packs capped below the same remote blob threshold.
 
 ## Sync Model
 

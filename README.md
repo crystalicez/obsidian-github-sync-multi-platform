@@ -23,7 +23,7 @@ Unlike traditional Git-based plugins, this tool interacts directly with the GitH
 -   **Serverless Architecture**: No middle-man server required. Your data goes directly to your private GitHub repository.
 -   **Atomic two-way sync**: Pulls first, plans with a three-way index, and publishes all required remote updates in one Git commit.
 -   **All vault file types**: Syncs notes, media, archives, Canvas files, and other files. Files over 50 MiB are split into verified parts automatically.
--   **Optional encryption**: Encrypts file contents and basenames while deliberately preserving folder paths; plaintext mode stores normal paths and bytes.
+-   **Optional encryption**: Hides every directory name, filename, extension, and file content behind stable opaque objects; plaintext mode stores normal paths and bytes.
 -   **Sync Center**: Browse 50 commits per page, inspect commit changes, and lazily preview commit or current-file versions.
 
 ## 🛠 Tech Stack
@@ -54,9 +54,10 @@ Unlike traditional Git-based plugins, this tool interacts directly with the GitH
 
 ## 🔐 Encrypted Sync Mode
 
-Encrypted sync mode encrypts note contents, attachment bytes, and file basenames. Folder paths remain visible so the remote hierarchy stays recognizable. Object sizes, commit timing, and enabled plugin folders may also be observable. Use the same passphrase on every device. GitHub tokens and passphrases are stored with Obsidian SecretStorage rather than in plugin `data.json`.
+Encrypted mode hides every directory name, filename, extension, and file content. GitHub stores stable opaque objects in fixed technical buckets; the plugin reconstructs logical paths from authenticated encrypted metadata. Repositories created by the earlier encrypted V4 layout require a confirmed Force Push before normal sync or Force Pull.
 
-Encrypted V4 must start on a new empty repository or branch. The plugin refuses to retain plaintext Git history while switching a populated branch to encryption. Existing V1/V2/V3 remotes must be replaced with an explicitly confirmed V4 Force Push; V4 Force Pull never guesses how to read a legacy layout.
+Object sizes, commit timing, and plugin use may remain observable. Use the same passphrase on every device. GitHub tokens and passphrases are stored with Obsidian SecretStorage rather than in plugin `data.json`. Encrypted V4 must start on a new empty repository or branch. The plugin refuses to retain plaintext Git history while switching a populated branch to encryption. Existing V1/V2/V3 remotes must be replaced with an explicitly confirmed V4 Force Push; V4 Force Pull never guesses how to read a legacy layout.
+
 ### Encrypted Sync Controls
 
 - Manual sync runs a normal pull-before-push operation immediately.
@@ -87,7 +88,7 @@ For detailed information about synchronization mechanisms, incremental sync, and
 -   **无服务器架构**：数据直接点对点传输至您的私有 GitHub 仓库，隐私安全。
 -   **冲突检测**：基于内容哈希的智能检测，最大限度减少同步冲突。
 -   **全部文件类型**：同步笔记、图片、压缩包、Canvas 与其他附件；超过 50 MiB 的文件会自动拆分并校验。
--   **可选加密**：加密文件内容与文件名，同时保留可读的文件夹路径；明文模式直接保存原路径与内容。
+-   **可选加密**：隐藏所有目录名、文件名、扩展名和文件内容，并在固定技术分桶中保存稳定的不透明对象；明文模式直接保存原路径与内容。
 -   **同步中心**：分页查看提交、变更列表，以及按需加载的提交/当前文件历史预览。
 -   **可视化看板**：配套数据看板，直观展示写作进度与同步状态。
 

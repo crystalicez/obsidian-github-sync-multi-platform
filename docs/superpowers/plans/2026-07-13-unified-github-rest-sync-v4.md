@@ -14,8 +14,10 @@
 - Use TDD for every production behavior: add a failing test, observe the expected failure, implement minimally, then run the focused and full relevant suites.
 - No git binary is required at plugin runtime; desktop and mobile use GitHub REST.
 - One published Git commit contains all remote changes for one sync operation.
-- Encrypted remote data may reveal folder hierarchy, object sizes, commit timing, and plugin use, but not basenames, contents, plaintext hashes, or secrets.
+- Encrypted remote data may reveal stable opaque object relationships, technical buckets, object sizes, commit timing, and plugin use, but not directory depth, path segments, basenames, extensions, contents, plaintext hashes, or secrets.
 - Do not silently read or migrate plaintext history into encrypted mode.
+
+Encrypted mode hides every directory name, filename, extension, and file content. GitHub stores stable opaque objects in fixed technical buckets; the plugin reconstructs logical paths from authenticated encrypted metadata. Repositories created by the earlier encrypted V4 layout require a confirmed Force Push before normal sync or Force Pull.
 
 ---
 
@@ -26,9 +28,9 @@
 - Test: `tests/v4/protocol-core.test.ts`, `scope.test.ts`, `local-index.test.ts`
 
 **Interfaces:**
-- Produces `V4RemoteConfig`, `V4RemoteHead`, `V4FileRecord`, `V4LocalIndex`, `deriveV4Keyring`, `encryptedRemotePath`, `isPathInSyncScope`, and sharded load/save helpers.
+- Produces `V4RemoteConfig`, `V4RemoteHead`, `V4FileRecord`, `V4LocalIndex`, `deriveV4Keyring`, `opaqueV4ObjectPath`, `isPathInSyncScope`, and sharded load/save helpers.
 
-- [ ] Write tests for random-salt key derivation, domain separation, authenticated encryption, opaque basename mapping, folder preservation, scope truth tables, exclusions, and changed-shard persistence.
+- [ ] Write tests for random-salt key derivation, domain separation, authenticated encryption, stable opaque path mapping, folder-hiding behavior, scope truth tables, exclusions, and changed-shard persistence.
 - [ ] Run focused tests and confirm they fail because V4 modules do not exist.
 - [ ] Implement minimal protocol, crypto/path codecs, scope policy, and index persistence.
 - [ ] Run focused tests and the encrypted coverage gate.
