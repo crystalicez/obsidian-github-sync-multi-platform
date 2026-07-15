@@ -16,6 +16,8 @@ The runtime owns one `V4SyncProgressSnapshot` and exposes read and subscribe ope
 - an optional current direction, pull or push;
 - independent pull and push counters, each with completed and optional total values;
 - the operation and trigger for the active run;
+- a monotonic timing ledger for every phase that occurred in the current or most recently completed run;
+- total elapsed run time;
 - the last completion timestamp;
 - failure context containing the phase, path, counters, and error message at the point of failure.
 
@@ -40,6 +42,20 @@ The active phases are:
 Terminal states are no change, success, and failed. Idle is used before the first run and after no retained result is available.
 
 Totals are optional until the engine knows them. Unknown totals render as an indeterminate phase rather than `0/0`. Counters are clamped so completed is never negative and never exceeds a known total.
+
+## Phase Timing
+
+The progress snapshot includes an ordered timing ledger. Each entry contains the phase, accumulated elapsed milliseconds, and occurrence count. Entries retain the order in which their phase first appeared.
+
+Timing uses a monotonic clock such as `performance.now()`, not wall-clock time. A wall-clock adjustment must not produce a negative or inflated phase duration.
+
+When a phase transition occurs, the store closes the previous phase interval and adds its elapsed time to that phase entry. If the phase occurs again, including after a compare-and-swap retry, the store adds another interval to the existing entry and increments its occurrence count. The currently active interval is included in the displayed elapsed value without closing it.
+
+The Sync Center refreshes the active phase duration once per second. This timer is independent from the 400-millisecond path/counter throttle. A phase transition or terminal state flushes the exact duration immediately.
+
+Success, no change, and failure close the final active interval. The completed timing ledger and total elapsed time remain in memory until the next sync or debounce cycle starts, at which point a new ledger replaces them. Timing data is never persisted.
+
+Durations render with one decimal second of precision. Positive durations below 100 milliseconds render as `<0.1s`. A phase that occurs more than once appends its count, for example `Checking remote 2.4s · 2 attempts`.
 
 ## Counter Semantics
 
@@ -78,7 +94,7 @@ Throttling happens in the runtime progress publisher, not in sync correctness co
 
 The first path in a new phase may render immediately. Subsequent paths and counters within that phase are batched. A path is cleared immediately when entering a phase that has no file context.
 
-Closing the Sync Center unsubscribes its listener and cancels view-owned rendering callbacks. The runtime clears its throttle timer on plugin unload.
+Closing the Sync Center unsubscribes its listener and cancels view-owned rendering callbacks. The runtime clears both its throttle timer and one-second timing refresh timer on plugin unload.
 
 ## Status Bar
 
@@ -105,7 +121,25 @@ The card shows:
 - pull completed, total, and remaining values when known;
 - push completed, total, and remaining values when known;
 - final completion time;
+- total elapsed run time;
+- an ordered per-phase timing summary, omitting phases that did not occur and appending attempt counts only when greater than one;
 - failure phase, path, and error message.
+
+An example completed timing summary is:
+
+```text
+Total                         8.9s
+Checking remote              2.4s · 2 attempts
+Loading local index          <0.1s
+Scanning local               1.8s
+Planning                     0.3s
+Downloading                  1.1s
+Applying local changes       0.4s
+Encryption                   1.2s
+Uploading                    1.5s
+Committing                   0.2s
+Saving local index           <0.1s
+```
 
 The view renders only its status-card subtree on progress updates. Commit pagination, selected commit, file history, and previews retain their state.
 
@@ -136,7 +170,9 @@ Tests must prove:
 - retries reset attempt-local progress;
 - failures retain the last phase and path;
 - path/counter updates are deduplicated, throttled to 400 milliseconds, and flushed at phase boundaries;
+- phase timing uses a monotonic clock, aggregates repeated phases, refreshes the active interval every second, and flushes exact values at phase and terminal boundaries;
+- completed phase timings remain available for the latest run until the next run begins and are never persisted;
+- duration formatting handles sub-100-millisecond phases and attempt counts;
 - Sync Center subscriptions are removed on close and progress updates do not reload history;
 - progress paths are absent from persisted plugin data and local-index serialization;
 - existing sync, encryption, history, migration, and GitHub E2E suites remain green.
-
