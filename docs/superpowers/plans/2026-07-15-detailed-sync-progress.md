@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Show the real sync phase, current logical path, and independent pull/push completed and remaining counts in the status bar and Sync Center without rapid UI flicker.
+**Goal:** Show the real sync phase, current logical path, and independent pull/push completed and remaining counts across the status bar and Sync Center, plus a per-phase timing summary in the Sync Center, without rapid UI flicker.
 
 **Architecture:** Add one typed progress model and throttled runtime store. `V4SyncSession` and the atomic Git writer emit observational events from the work they actually perform; `V4PluginRuntime` owns the snapshot and lifecycle, while the status bar and Sync Center subscribe to the same source. Logical paths remain memory-only.
 
@@ -17,12 +17,15 @@
 - Push progress may reach its total during staging/upload, but success appears only after atomic branch publication and local-index persistence succeed.
 - Unknown totals render as unknown, never as `0/0`.
 - Current logical paths live only in runtime memory and local UI; they are never persisted or sent as plaintext metadata in encrypted mode.
+- Phase timing uses a monotonic clock, aggregates repeated phases, refreshes the active interval every 1,000 milliseconds, and flushes exact durations at phase and terminal boundaries.
+- A completed timing summary remains in memory until the next run starts; timing data is never persisted.
+- Durations render to one decimal second; positive durations below 100 milliseconds render as `<0.1s`; occurrence counts render as attempts only when greater than one.
 - Existing sync ordering, conflict policies, modification guard, debounce, retry, encryption, history, and atomic compare-and-swap behavior must not change.
 - No new runtime dependency is added.
 
 ## File Structure
 
-- Create `src/lib/v4/progress.ts`: progress types, normalization, throttled store, subscriptions, and pure display model.
+- Create `src/lib/v4/progress.ts`: progress types, normalization, throttled store, monotonic phase timing, subscriptions, and pure display model.
 - Modify `src/lib/v4/status.ts`: format compact status-bar text and detailed tooltip from a progress snapshot.
 - Modify `src/lib/v4/git-tree-writer.ts`: report logical-file blob completion and the transition from upload to commit.
 - Modify `src/lib/v4/sync-session.ts`: emit phase/path/directional progress at actual work boundaries.
@@ -32,7 +35,7 @@
 - Modify `src/styles.scss` and generated `styles.css`: style the live status card and middle-truncated path.
 - Modify `tests/stubs/obsidian.ts`: provide only the minimal ItemView/element behavior required by the Sync Center lifecycle test.
 - Modify `scripts/run-tests.mjs`: register new progress and Sync Center tests.
-- Create `tests/v4/progress.test.ts`: normalization, throttling, deduplication, flushing, subscription isolation, and persistence-safe shape.
+- Create `tests/v4/progress.test.ts`: normalization, throttling, deduplication, flushing, monotonic timing aggregation, one-second refresh, subscription isolation, and persistence-safe shape.
 - Modify `tests/v4/status.test.ts`: compact text, tooltip, unknown totals, remaining counts, failure context.
 - Modify `tests/v4/git-tree-writer.test.ts`: logical completion across single blobs, parts, and shared packs.
 - Modify `tests/v4/sync-session.test.ts`: phase ordering and pull/push counters for normal and force operations.
@@ -52,7 +55,7 @@
 - Modify: `scripts/run-tests.mjs`
 
 **Interfaces:**
-- Produces: `V4SyncPhase`, `V4SyncProgressSnapshot`, `V4SyncProgressPatch`, `V4ProgressStore`, `createIdleV4Progress()`, `middleTruncateV4Path(path, maximumLength)`, and `formatV4ActiveSyncStatus(snapshot)`.
+- Produces: `V4SyncPhase`, `V4PhaseTiming`, `V4SyncProgressSnapshot`, `V4SyncProgressPatch`, `V4ProgressStore`, `createIdleV4Progress()`, `formatV4Duration(elapsedMs)`, `formatV4PhaseTiming(timing)`, `middleTruncateV4Path(path, maximumLength)`, and `formatV4ActiveSyncStatus(snapshot)`.
 - Consumes: `V4SyncOperation` from `src/lib/v4/planner.ts` and `V4SyncTrigger` from `src/lib/v4/sync-coordinator.ts` as type-only imports.
 
 - [ ] **Step 1: Register and write failing progress-store tests**
@@ -60,15 +63,32 @@
 Add `tests/v4/progress.test.ts` to `tsEntries` in `scripts/run-tests.mjs`, then create tests using a fake scheduler:
 
 ```ts
-const scheduled: Array<() => void> = []
-const store = new V4ProgressStore({
-  throttleMs: 400,
-  schedule: callback => { scheduled.push(callback); return callback },
-  cancel: handle => { const index = scheduled.indexOf(handle); if (index >= 0) scheduled.splice(index, 1) },
-  now: () => 1_000,
-})
+function createProgressFixture() {
+  let monotonicNow = 0
+  let nextHandle = 1
+  const scheduled = new Map<number, { callback: () => void; delay: number }>()
+  const store = new V4ProgressStore({
+    throttleMs: 400,
+    timingRefreshMs: 1_000,
+    schedule: (callback, delay) => { const handle = nextHandle++; scheduled.set(handle, { callback, delay }); return handle },
+    cancel: handle => { scheduled.delete(handle as number) },
+    monotonicNow: () => monotonicNow,
+  })
+  return {
+    store,
+    scheduled,
+    setNow(value: number) { monotonicNow = value },
+    runScheduledCallbackAt(delay: number) {
+      const entry = [...scheduled.entries()].find(([, value]) => value.delay === delay)
+      assert.ok(entry, `no callback scheduled at ${delay}ms`)
+      scheduled.delete(entry[0])
+      entry[1].callback()
+    },
+  }
+}
 
 test("phase changes publish immediately while path and counters throttle", () => {
+  const { store, scheduled, runScheduledCallbackAt } = createProgressFixture()
   const seen: V4SyncProgressSnapshot[] = []
   store.subscribe(snapshot => seen.push(snapshot))
   store.update({ lifecycle: "active", phase: "checking-remote", operation: "normal", trigger: "manual" })
@@ -77,13 +97,14 @@ test("phase changes publish immediately while path and counters throttle", () =>
   store.update({ currentPath: "C.md", pull: { completed: 2, total: 3 } })
 
   assert.equal(seen.at(-1)?.currentPath, "A.md")
-  assert.equal(scheduled.length, 1)
-  scheduled.shift()!()
+  assert.equal([...scheduled.values()].some(item => item.delay === 400), true)
+  runScheduledCallbackAt(400)
   assert.equal(seen.at(-1)?.currentPath, "C.md")
   assert.deepEqual(seen.at(-1)?.pull, { completed: 2, total: 3 })
 })
 
 test("a phase transition flushes the pending path before publishing the next phase", () => {
+  const { store } = createProgressFixture()
   const seen: V4SyncProgressSnapshot[] = []
   store.subscribe(snapshot => seen.push(snapshot))
   store.update({ lifecycle: "active", phase: "hashing", currentPath: "A.md" })
@@ -96,14 +117,63 @@ test("a phase transition flushes the pending path before publishing the next pha
 })
 
 test("normalization clamps counts and computes remaining only for known totals", () => {
+  const { store } = createProgressFixture()
   store.update({ lifecycle: "active", phase: "uploading", push: { completed: 7, total: 5 } })
   assert.deepEqual(store.snapshot.push, { completed: 5, total: 5 })
   assert.equal(remainingV4Progress(store.snapshot.push), 0)
   assert.equal(remainingV4Progress({ completed: 2 }), undefined)
 })
+
+test("phase timing aggregates retries with a monotonic clock", () => {
+  const { store, setNow } = createProgressFixture()
+  store.beginRun({ lifecycle: "active", phase: "checking-remote", attempt: 1 })
+  setNow(600)
+  store.update({ phase: "scanning-local" })
+  setNow(1_000)
+  store.update({ phase: "checking-remote", attempt: 2 })
+  setNow(2_800)
+  store.finish("success", { lastSyncTime: 123 })
+
+  assert.deepEqual(store.snapshot.timings, [
+    { phase: "checking-remote", elapsedMs: 2_400, occurrences: 2 },
+    { phase: "scanning-local", elapsedMs: 400, occurrences: 1 },
+  ])
+  assert.equal(store.snapshot.totalElapsedMs, 2_800)
+})
+
+test("active timing refreshes once per second and terminal transition flushes exact time", () => {
+  const { store, setNow, runScheduledCallbackAt } = createProgressFixture()
+  const seen: V4SyncProgressSnapshot[] = []
+  store.subscribe(snapshot => seen.push(snapshot))
+  store.beginRun({ lifecycle: "active", phase: "encrypting" })
+  setNow(1_000)
+  runScheduledCallbackAt(1_000)
+  assert.equal(seen.at(-1)?.timings[0].elapsedMs, 1_000)
+  setNow(1_250)
+  store.finish("success", { lastSyncTime: 999 })
+  assert.equal(store.snapshot.timings[0].elapsedMs, 1_250)
+})
+
+test("completed timings remain until the next run begins", () => {
+  const { store, setNow } = createProgressFixture()
+  store.beginRun({ lifecycle: "active", phase: "planning" })
+  setNow(300)
+  store.finish("success", { lastSyncTime: 1 })
+  const completed = structuredClone(store.snapshot.timings)
+  store.update({ currentPath: undefined })
+  assert.deepEqual(store.snapshot.timings, completed)
+  store.beginRun({ lifecycle: "active", phase: "checking-remote" })
+  assert.deepEqual(store.snapshot.timings, [{ phase: "checking-remote", elapsedMs: 0, occurrences: 1 }])
+})
+
+test("duration formatting shows sub-tenth and repeated attempts", () => {
+  assert.equal(formatV4Duration(50), "<0.1s")
+  assert.equal(formatV4Duration(1_240), "1.2s")
+  assert.equal(formatV4PhaseTiming({ phase: "checking-remote", elapsedMs: 2_400, occurrences: 2 }), "Checking remote 2.4s · 2 attempts")
+})
 ```
 
-Also test equal-patch deduplication, subscriber exceptions not escaping `update`, unsubscribe stopping delivery, `dispose()` cancelling a pending timer, and no arbitrary persistence/serialization method existing on the store.
+Also test equal-patch deduplication, subscriber exceptions not escaping `update`, unsubscribe stopping delivery, `dispose()` cancelling both pending timers, a decreasing fake clock clamping elapsed deltas at zero, and no arbitrary persistence/serialization method existing on the store.
 
 Add a pure path-display test so UI truncation never mutates the actual value:
 
@@ -174,6 +244,7 @@ export type V4SyncPhase =
   | "encrypting" | "uploading" | "committing" | "saving-index" | "retrying"
 export type V4SyncDirection = "pull" | "push"
 export interface V4DirectionalProgress { completed: number; total?: number }
+export interface V4PhaseTiming { phase: V4SyncPhase; elapsedMs: number; occurrences: number }
 export interface V4SyncProgressSnapshot {
   lifecycle: V4SyncLifecycle
   phase?: V4SyncPhase
@@ -184,18 +255,20 @@ export interface V4SyncProgressSnapshot {
   operation?: V4SyncOperation
   trigger?: V4SyncTrigger
   attempt: number
+  timings: V4PhaseTiming[]
+  totalElapsedMs: number
   lastSyncTime: number
   errorMessage?: string
   failurePhase?: V4SyncPhase
   failurePath?: string
 }
-export type V4SyncProgressPatch = Partial<Omit<V4SyncProgressSnapshot, "pull" | "push">> & {
+export type V4SyncProgressPatch = Partial<Omit<V4SyncProgressSnapshot, "pull" | "push" | "timings" | "totalElapsedMs">> & {
   pull?: Partial<V4DirectionalProgress>
   push?: Partial<V4DirectionalProgress>
 }
 ```
 
-Implement `V4ProgressStore` with `snapshot`, `subscribe`, `update`, `flush`, and `dispose`. Merge directional patches, clamp counts, freeze/copy snapshots before notifying, publish phase/lifecycle transitions immediately, and throttle only same-phase path/counter changes. Notify each subscriber inside its own `try/catch`. Implement `middleTruncateV4Path` by preserving a head segment and the filename/tail segment around one `…`; return the original string when it already fits.
+Implement `V4ProgressStore` with `snapshot`, `subscribe`, `beginRun`, `update`, `finish`, `flush`, and `dispose`. Keep `runStartedAt`, `activePhaseStartedAt`, first-seen phase order, and accumulated closed intervals internally. Use only `monotonicNow` for elapsed durations; clamp each delta with `Math.max(0, now - startedAt)`. `beginRun` replaces the previous timing ledger, `update` closes and opens intervals on phase transitions, and `finish` closes the active interval but retains the completed snapshot. A separate 1,000-millisecond timer publishes the active interval without closing it. Merge directional patches, clamp counts, freeze/copy snapshots before notifying, publish phase/lifecycle transitions immediately, and throttle only same-phase path/counter changes. Notify each subscriber inside its own `try/catch`. Implement `formatV4Duration` and `formatV4PhaseTiming` from one shared phase-label map; implement `middleTruncateV4Path` by preserving a head segment and the filename/tail segment around one `…`.
 
 - [ ] **Step 5: Implement snapshot-based formatting**
 
@@ -452,6 +525,18 @@ test("CAS retry resets attempt counters", async () => {
   assert.equal(retry.attempt, 2)
   assert.deepEqual(retry.pull, { completed: 0 })
   assert.deepEqual(retry.push, { completed: 0 })
+  assert.equal(racingRuntime.progressSnapshot.timings.find(item => item.phase === "checking-remote")?.occurrences, 2)
+})
+
+test("runtime retains the latest completed timing summary until a new run starts", async () => {
+  await runtime.forcePush()
+  const completed = structuredClone(runtime.progressSnapshot.timings)
+  assert.equal(completed.length > 0, true)
+  await Promise.resolve()
+  assert.deepEqual(runtime.progressSnapshot.timings, completed)
+  const nextRun = runtime.manualSync()
+  assert.notDeepEqual(runtime.progressSnapshot.timings, completed)
+  await nextRun
 })
 ```
 
@@ -475,13 +560,13 @@ subscribeProgress(listener: (snapshot: V4SyncProgressSnapshot) => void): () => v
 }
 ```
 
-Change `dispose()` to dispose both coordinator and store. `markWaiting()` publishes `{ lifecycle: "waiting", phase: "debouncing" }`. At execute start publish active operation/trigger, zero completed values, unknown totals, and attempt 1.
+Change `dispose()` to dispose both coordinator and store, including its 400-millisecond throttle and 1,000-millisecond timing timer. `markWaiting()` starts a new run with `{ lifecycle: "waiting", phase: "debouncing" }` only when the coordinator enters a new debounce cycle; repeated events in the same debounce update counts without clearing timings. For manual, startup, scheduled, and force operations without an existing debounce run, call `beginRun` before checking remote. At execute start publish active operation/trigger, zero completed values, unknown totals, and attempt 1 without clearing a ledger already started by debouncing.
 
 Publish `checking-remote` before `remoteOrNewConfig`, `loading-index` before `loadIndex`, forward session patches, `saving-index` before `saveIndex`, then terminal `no-change` or `success`. Preserve the existing manual no-change notice.
 
 - [ ] **Step 4: Preserve retry and failure context**
 
-Before a CAS retry, publish `retrying` immediately with incremented attempt and reset directional completed values, then start checking remote again. Before the threshold override modal publish `blocked` while retaining totals. On catch, copy the current phase/path into `failurePhase`/`failurePath`, set lifecycle failed and error message, and publish immediately.
+Before a CAS retry, publish `retrying` immediately with incremented attempt and reset directional completed values, then start checking remote again without starting a new timing ledger. This makes repeated phase occurrences aggregate across attempts. Before the threshold override modal publish `blocked` while retaining totals. On catch, copy the current phase/path into `failurePhase`/`failurePath`, call `finish("failed", ...)`, and retain the closed timing ledger. Successful and no-change paths call `finish` only after local-index persistence is complete.
 
 Remove all writes to `plugin.syncProgress`. Remove the mutable `syncProgress` field from `FastSync`; status rendering will be migrated in Task 5. During this task, keep `updateStatusBar()` compiling by reading `this.v4Runtime?.progressSnapshot ?? createIdleV4Progress()`.
 
@@ -544,7 +629,7 @@ const plugin = createSyncCenterPluginFixture(source, () => { historyLoadCount++ 
 const view = new V4SyncCenterView(new WorkspaceLeaf(), plugin)
 await view.onOpen()
 source.publish(uploadingFixture)
-assert.match(view.contentEl.flattenText(), /Uploading.*Pull 10\/10.*Push 2\/7.*Notes\/project\.md/su)
+assert.match(view.contentEl.flattenText(), /Uploading.*Pull 10\/10.*Push 2\/7.*Notes\/project\.md.*Total 8\.9s.*Checking remote 2\.4s · 2 attempts.*Encryption 1\.2s/su)
 assert.equal(historyLoadCount, 1)
 
 const rendersBeforeClose = view.contentEl.mutationCount
@@ -553,7 +638,9 @@ source.publish(committingFixture)
 assert.equal(view.contentEl.mutationCount, rendersBeforeClose)
 ```
 
-Implement `FakeProgressSource` with production-shaped `progressSnapshot` and `subscribeProgress`; implement `createSyncCenterPluginFixture` with a history service whose `listCommits` invokes the supplied counter. Extend `ElementStub` with child tracking, `empty`, `remove`, `setAttribute`, `title`, `flattenText()`, and a root-shared `mutationCount`. Also switch between Commit and Current file modes, publish another progress snapshot, and assert selected/page/history state remains unchanged.
+Define `uploadingFixture.timings` in first-seen order with checking remote at 2,400 milliseconds and two occurrences, then encryption at 1,200 milliseconds; set `totalElapsedMs` to 8,900. Implement `FakeProgressSource` with production-shaped `progressSnapshot` and `subscribeProgress`; implement `createSyncCenterPluginFixture` with a history service whose `listCommits` invokes the supplied counter. Extend `ElementStub` with child tracking, `empty`, `remove`, `setAttribute`, `title`, `flattenText()`, and a root-shared `mutationCount`. Also switch between Commit and Current file modes, publish another progress snapshot, and assert selected/page/history state remains unchanged.
+
+Add a fake-scheduler assertion that a store timing tick updates only the status card once per second, does not reload history, and stops mutating the view after `onClose`.
 
 - [ ] **Step 3: Run RED**
 
@@ -591,11 +678,11 @@ async onClose(): Promise<void> {
 }
 ```
 
-`shell()` creates or replaces only the card container and then calls `renderProgressCard(currentSnapshot)`. `renderProgressCard` empties only that element, renders phase, path, pull and push rows with completed/total/remaining, final time, and failure details. Set the full path as `title`; render a child with the truncation class. Do not call `renderCommitMode`, `renderFileMode`, history service methods, or preview methods from the progress callback.
+`shell()` creates or replaces only the card container and then calls `renderProgressCard(currentSnapshot)`. `renderProgressCard` empties only that element, renders phase, path, pull and push rows with completed/total/remaining, final time, total elapsed time, and failure details. Render the ordered timing ledger with `formatV4PhaseTiming`; omit phases that never occurred and omit the attempts suffix when occurrences equals one. Set the full path as `title`; render a child with the truncation class. Do not call `renderCommitMode`, `renderFileMode`, history service methods, or preview methods from the progress callback.
 
 - [ ] **Step 6: Add responsive card styles and documentation**
 
-Add SCSS for `.github-sync-center__progress`, directional rows, terminal/error modifiers, and:
+Add SCSS for `.github-sync-center__progress`, directional rows, `.github-sync-center__timings`, timing rows with aligned labels/durations, terminal/error modifiers, and:
 
 ```scss
 .github-sync-center__progress-path {
@@ -605,7 +692,7 @@ Add SCSS for `.github-sync-center__progress`, directional rows, terminal/error m
 }
 ```
 
-Render `middleTruncateV4Path(fullPath, 72)` as the visible path while assigning `fullPath` to the element title. Mirror the same declarations in `styles.css`, because the existing production build does not compile Sass. Update README status documentation with phase/path display, separate pull/push counts, 400 ms UI batching, and memory-only paths.
+Render `middleTruncateV4Path(fullPath, 72)` as the visible path while assigning `fullPath` to the element title. Mirror the same declarations in `styles.css`, because the existing production build does not compile Sass. Update README status documentation with phase/path display, separate pull/push counts, 400 ms UI batching, one-second active timing refresh, aggregated phase attempts, latest-run memory retention, and memory-only paths/timings.
 
 - [ ] **Step 7: Run GREEN, production build, and commit**
 
@@ -662,15 +749,15 @@ Expected: plaintext and encrypted V4 round trip passes and `e2e-destructive` cle
 Run:
 
 ```bash
-rg -n "currentPath|failurePath|V4SyncProgressSnapshot" src
-rg -n "currentPath|failurePath|syncProgress" src/setting.tsx src/lib/v4/secrets.ts src/lib/v4/local-index.ts
+rg -n "currentPath|failurePath|timings|totalElapsedMs|V4SyncProgressSnapshot" src
+rg -n "currentPath|failurePath|timings|totalElapsedMs|syncProgress" src/setting.tsx src/lib/v4/secrets.ts src/lib/v4/local-index.ts
 ```
 
-Expected: progress paths occur only in progress/session/runtime/UI code; no settings, secret, or local-index serializer accepts them.
+Expected: progress paths and timing ledgers occur only in progress/session/runtime/UI code; no settings, secret, or local-index serializer accepts them.
 
 - [ ] **Step 4: Request whole-feature review**
 
-Review the complete feature range against `docs/superpowers/specs/2026-07-15-detailed-sync-progress-design.md`. Reject completion for any inaccurate phase, counter that can reach completion before its documented boundary, path persistence, subscriber leak, status-card history reload, or Critical/Important runtime finding.
+Review the complete feature range against `docs/superpowers/specs/2026-07-15-detailed-sync-progress-design.md`. Reject completion for any inaccurate phase, counter that can reach completion before its documented boundary, non-monotonic or double-counted timing, lost repeated-phase attempts, timer leak, path/timing persistence, subscriber leak, status-card history reload, or Critical/Important runtime finding.
 
 - [ ] **Step 5: Fix findings with a fresh RED/GREEN cycle, then rerun all gates**
 
