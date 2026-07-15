@@ -73,6 +73,148 @@ function indexRecordByPath(index: V4LocalIndex, path: string): V4IndexFileRecord
   return record;
 }
 
+async function unknownBaseFixture(mode: "plaintext" | "encrypted", localContent: string | null) {
+  const github = new MemoryGitHub();
+  const remoteVault = new MemoryVault();
+  remoteVault.files.set("note.md", { bytes: enc("remote-newer"), mtime: 20 });
+  const remoteConfig: V4RemoteConfig = mode === "plaintext"
+    ? config()
+    : {
+        formatVersion: V4_FORMAT_VERSION,
+        mode: "encrypted",
+        repoId: "o/r#main",
+        pathLayout: "opaque-stable-v1",
+        algorithm: "AES-GCM",
+        kdf: "PBKDF2-SHA-256",
+        kdfParams: { iterations: 10, salt: "c2FsdA" },
+      };
+  const keyring = mode === "encrypted"
+    ? await deriveV4Keyring({ passphrase: "correct", repoId: "o/r#main", salt: enc("salt"), iterations: 10 })
+    : undefined;
+  const remoteIndex = createEmptyV4LocalIndex({
+    repoId: "o/r#main",
+    deviceId: "remote",
+    mode,
+    pathLayout: mode === "encrypted" ? "opaque-stable-v1" : "plaintext-v1",
+  });
+  await new V4SyncSession({ github, vault: remoteVault, index: remoteIndex, config: remoteConfig, keyring, conflictPolicy: "newer", abortChangePercent: 0 })
+    .sync({ operation: "forcePush", allowThresholdOverride: false });
+  const remoteRecord = { ...indexRecordByPath(remoteIndex, "note.md") };
+  const bucket = remoteRecord.pathId.slice(0, 2);
+  const index = structuredClone(remoteIndex);
+  index.deviceId = "recovering";
+  index.shards[bucket].hash = "inconsistent-local-cache";
+  const vault = new MemoryVault();
+  if (localContent !== null) vault.files.set("note.md", { bytes: enc(localContent), mtime: localContent === "remote-newer" ? 20 : 10 });
+  const remoteBytes = new Uint8Array(github.files.get(remoteRecord.remotePath)!);
+  return { github, vault, index, remoteConfig, keyring, remoteRecord, remoteBytes };
+}
+
+for (const mode of ["plaintext", "encrypted"] as const) {
+  test(`v4 ${mode} unknown-base sync resolves stale local content through conflict policy without overwriting remote`, async () => {
+    const fixture = await unknownBaseFixture(mode, "local-stale");
+    const commitBefore = fixture.github.ref!.sha;
+    const commitsBefore = fixture.github.commits.size;
+
+    const result = await new V4SyncSession({
+      github: fixture.github,
+      vault: fixture.vault,
+      index: fixture.index,
+      config: fixture.remoteConfig,
+      keyring: fixture.keyring,
+      conflictPolicy: "newer",
+      abortChangePercent: 0,
+    }).sync({ operation: "normal", allowThresholdOverride: false });
+
+    assert.equal(result.mode, "pull");
+    assert.equal(dec(fixture.vault.files.get("note.md")!.bytes), "remote-newer");
+    assert.equal(fixture.github.ref!.sha, commitBefore);
+    assert.equal(fixture.github.commits.size, commitsBefore);
+    assert.deepEqual(fixture.github.files.get(fixture.remoteRecord.remotePath), fixture.remoteBytes);
+    assert.equal(indexRecordByPath(fixture.index, "note.md").fileId, fixture.remoteRecord.fileId);
+
+    const verifierVault = new MemoryVault();
+    const verifierIndex = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "verifier", mode, pathLayout: mode === "encrypted" ? "opaque-stable-v1" : "plaintext-v1" });
+    await new V4SyncSession({ github: fixture.github, vault: verifierVault, index: verifierIndex, config: fixture.remoteConfig, keyring: fixture.keyring, conflictPolicy: "newer", abortChangePercent: 0 })
+      .sync({ operation: "forcePull", allowThresholdOverride: false });
+    assert.equal(dec(verifierVault.files.get("note.md")!.bytes), "remote-newer");
+  });
+
+  test(`v4 ${mode} unknown-base sync no-ops identical content and preserves current remote identity`, async () => {
+    const fixture = await unknownBaseFixture(mode, "remote-newer");
+    const commitBefore = fixture.github.ref!.sha;
+    const commitsBefore = fixture.github.commits.size;
+
+    const result = await new V4SyncSession({
+      github: fixture.github,
+      vault: fixture.vault,
+      index: fixture.index,
+      config: fixture.remoteConfig,
+      keyring: fixture.keyring,
+      conflictPolicy: "newer",
+      abortChangePercent: 0,
+    }).sync({ operation: "normal", allowThresholdOverride: false });
+
+    assert.equal(result.mode, "noop");
+    assert.equal(fixture.github.ref!.sha, commitBefore);
+    assert.equal(fixture.github.commits.size, commitsBefore);
+    assert.deepEqual(fixture.github.files.get(fixture.remoteRecord.remotePath), fixture.remoteBytes);
+    assert.equal(indexRecordByPath(fixture.index, "note.md").fileId, fixture.remoteRecord.fileId);
+  });
+
+  test(`v4 ${mode} unknown-base sync pulls current remote content into an empty vault`, async () => {
+    const fixture = await unknownBaseFixture(mode, null);
+    const commitBefore = fixture.github.ref!.sha;
+    const commitsBefore = fixture.github.commits.size;
+
+    const result = await new V4SyncSession({
+      github: fixture.github,
+      vault: fixture.vault,
+      index: fixture.index,
+      config: fixture.remoteConfig,
+      keyring: fixture.keyring,
+      conflictPolicy: "newer",
+      abortChangePercent: 0,
+    }).sync({ operation: "normal", allowThresholdOverride: false });
+
+    assert.equal(result.mode, "pull");
+    assert.equal(dec(fixture.vault.files.get("note.md")!.bytes), "remote-newer");
+    assert.equal(fixture.github.ref!.sha, commitBefore);
+    assert.equal(fixture.github.commits.size, commitsBefore);
+    assert.deepEqual(fixture.github.files.get(fixture.remoteRecord.remotePath), fixture.remoteBytes);
+    assert.equal(indexRecordByPath(fixture.index, "note.md").fileId, fixture.remoteRecord.fileId);
+  });
+}
+
+test("v4 plaintext unknown-base sync pulls remote state before publishing a distinct local-only path", async () => {
+  const fixture = await unknownBaseFixture("plaintext", null);
+  fixture.vault.files.set("local-only.md", { bytes: enc("local-only"), mtime: 10 });
+  const commitBefore = fixture.github.ref!.sha;
+
+  const result = await new V4SyncSession({
+    github: fixture.github,
+    vault: fixture.vault,
+    index: fixture.index,
+    config: fixture.remoteConfig,
+    conflictPolicy: "newer",
+    abortChangePercent: 0,
+  }).sync({ operation: "normal", allowThresholdOverride: false });
+
+  assert.equal(result.mode, "pull-push");
+  assert.notEqual(fixture.github.ref!.sha, commitBefore);
+  assert.equal(dec(fixture.vault.files.get("note.md")!.bytes), "remote-newer");
+  assert.equal(dec(fixture.github.files.get("note.md")!), "remote-newer");
+  assert.equal(dec(fixture.github.files.get("local-only.md")!), "local-only");
+  assert.equal(indexRecordByPath(fixture.index, "note.md").fileId, fixture.remoteRecord.fileId);
+
+  const verifierVault = new MemoryVault();
+  const verifierIndex = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "verifier", mode: "plaintext" });
+  await new V4SyncSession({ github: fixture.github, vault: verifierVault, index: verifierIndex, config: config(), conflictPolicy: "newer", abortChangePercent: 0 })
+    .sync({ operation: "forcePull", allowThresholdOverride: false });
+  assert.equal(dec(verifierVault.files.get("note.md")!.bytes), "remote-newer");
+  assert.equal(dec(verifierVault.files.get("local-only.md")!.bytes), "local-only");
+});
+
 test("v4 rejects legacy encrypted layout except for Force Push migration", () => {
   const legacy = { formatVersion: 4 as const, mode: "encrypted" as const, repoId: "o/r#main" };
   const desired = { ...legacy, pathLayout: "opaque-stable-v1" as const };

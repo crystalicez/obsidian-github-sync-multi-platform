@@ -242,17 +242,16 @@ export class V4SyncSession {
     if (isLayoutMigration && allRemoteRecords.some(record => !includePath(record.path))) {
       throw new Error("Legacy V4 migration cannot continue while encrypted records are excluded by sync scope. Include all legacy paths and retry Force Push.")
     }
-    const allBaseRecords = isLayoutMigration
+    const hasKnownBase = localCacheComplete && !!this.input.index.remoteCommitSha
+    const allBaseRecords = isLayoutMigration || !hasKnownBase
       ? []
-      : localCacheComplete && this.input.index.remoteCommitSha
-        ? recordsFromIndex(this.input.index)
-        : allRemoteRecords
+      : recordsFromIndex(this.input.index)
     const baseRecords = allBaseRecords.filter(record => includePath(record.path))
     const remoteRecords = allRemoteRecords.filter(record => includePath(record.path))
-    const migrationIdentityByPath = isLayoutMigration
+    const identitySeedByPath = isLayoutMigration || !hasKnownBase
       ? migrationIdentitySeed(remoteRecords, options.changes ?? [])
       : undefined
-    const localFiles = (await this.scanLocal(baseRecords, options.changes ?? [], migrationIdentityByPath)).filter(file => includePath(file.path))
+    const localFiles = (await this.scanLocal(baseRecords, options.changes ?? [], identitySeedByPath)).filter(file => includePath(file.path))
     assertNoCaseInsensitiveCollisions(localFiles)
     assertNoCaseInsensitiveCollisions(logical(remoteRecords))
     const plan = planV4Sync({
@@ -346,7 +345,7 @@ export class V4SyncSession {
       return { mode: options.operation === "forcePull" ? "force-pull" : "pull", operation: options.operation, changedFiles, pushedFiles: 0, pulledFiles }
     }
 
-    const latestLocal = new Map((await this.scanLocal(baseRecords, options.changes ?? [], migrationIdentityByPath)).map(file => [file.fileId, file]))
+    const latestLocal = new Map((await this.scanLocal(baseRecords, options.changes ?? [], identitySeedByPath)).map(file => [file.fileId, file]))
     const files: Array<{ path: string; bytes: Uint8Array }> = []
     const deletions = new Set<string>()
     const journalChanges: V4JournalChange[] = []
