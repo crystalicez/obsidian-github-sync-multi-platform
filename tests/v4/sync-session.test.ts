@@ -765,16 +765,8 @@ test("v4 confirmed Force Push migrates legacy encrypted paths in one commit", as
   legacyFiles.push({ path: orphanRecord.remotePath, bytes: await encryptV4Payload(keys.contentKey, orphanPlaintext, { kind: "content", aad: `${orphanRecord.pathId}:legacy-v` }) });
   await publishV4TreeChanges(github, { message: "obsidian-sync-v4:legacy-v", files: legacyFiles });
   const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "new", mode: "encrypted", pathLayout: "opaque-stable-v1" });
-  index.remoteCommitSha = github.ref!.sha;
-  index.epoch = legacyHead.epoch;
-  index.generation = legacyHead.generation;
-  index.shardHashes = { ...legacyHead.shardHashes };
-  for (const record of [legacyRecord, orphanRecord]) {
-    const bucket = record.pathId.slice(0, 2);
-    const shard = index.shards[bucket] ?? { hash: legacyHead.shardHashes[bucket], records: {} };
-    shard.records[record.pathId] = record;
-    index.shards[bucket] = shard;
-  }
+  assert.equal(index.remoteCommitSha, undefined);
+  assert.deepEqual(index.shards, {});
   const legacyEncryptedSession = new V4SyncSession({ github, vault, index, config: desiredConfig, keyring: keys, conflictPolicy: "copy", abortChangePercent: 60 });
   github.commitMessages.length = 0;
 
@@ -787,6 +779,41 @@ test("v4 confirmed Force Push migrates legacy encrypted paths in one commit", as
   assert.equal(github.commitMessages.length, 1);
   assert.equal([...github.files.keys()].some(path => path.includes("PrivateFolder")), false);
   assert.equal([...github.files.keys()].some(path => /^\.obsidian-github-sync-v4\/data\/[0-9a-f]{2}\/[0-9a-f]{64}\.enc$/u.test(path)), true);
+  assert.equal(github.files.has(legacyRecord.remotePath), false);
+  assert.equal(github.files.has(orphanRecord.remotePath), false);
+  const migrated = indexRecordByPath(index, legacyRecord.path);
+  assert.equal(migrated.fileId, legacyRecord.fileId);
+  assert.notEqual(migrated.remoteVersion, legacyRecord.remoteVersion);
+  assert.notEqual(migrated.remotePath, legacyRecord.remotePath);
+  assert.equal(migrated.encryptedPath, migrated.remotePath);
+  assert.match(migrated.remotePath, /^\.obsidian-github-sync-v4\/data\/[0-9a-f]{2}\/[0-9a-f]{64}\.enc$/u);
+  assert.equal(Object.values(index.shards).flatMap(shard => Object.values(shard.records)).some(record => record.remoteVersion === "legacy-v" || record.remotePath.includes("PrivateFolder")), false);
+  assert.equal(github.lastEntries.some(entry => entry.path === legacyRecord.remotePath && entry.sha === null), true);
+  assert.equal(github.lastEntries.some(entry => entry.path === orphanRecord.remotePath && entry.sha === null), true);
+  assert.equal(github.lastEntries.some(entry => entry.path === V4_CONFIG_PATH && entry.sha !== null), true);
+  assert.equal(github.lastEntries.some(entry => entry.path === V4_HEAD_PATH && entry.sha !== null), true);
+  assert.equal(github.lastEntries.some(entry => entry.path.includes("/index/") && entry.sha !== null), true);
+  assert.equal(github.lastEntries.some(entry => entry.path.includes("/journals/") && entry.sha !== null), true);
+  const tip = github.ref!.sha;
+  const published = github.commits.get(tip)!;
+  const journalId = /^obsidian-sync-v4:(.+)$/u.exec(published.message)![1];
+  const journal = await new V4HistoryService({ config: desiredConfig, keyring: keys, github: {
+    async listCommits() { return []; }, async getFileBytes(path: string, ref?: string) { return github.getFileBytes(path, ref); },
+    async getGitCommit() { throw new Error("not reached"); }, async getTreeAt() { throw new Error("not reached"); }, async getBlob() { throw new Error("not reached"); },
+  } }).getCommitChanges({ sha: tip, message: published.message, authorName: "A", authoredAt: "", parentShas: published.parents, source: "plugin", journalId });
+  const migratedChange = journal.find(change => change.path === legacyRecord.path)!;
+  assert.equal(migratedChange.fileId, legacyRecord.fileId);
+  assert.equal(migratedChange.before, undefined);
+  assert.equal(migratedChange.after?.remotePath, migrated.remotePath);
+  const target = new MemoryVault();
+  const targetIndex = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "target", mode: "encrypted", pathLayout: "opaque-stable-v1" });
+  await new V4SyncSession({ github, vault: target, index: targetIndex, config: desiredConfig, keyring: keys, conflictPolicy: "copy", abortChangePercent: 0 }).sync({ operation: "forcePull", allowThresholdOverride: false });
+  assert.equal(dec(target.files.get(legacyRecord.path)!.bytes), "legacy secret");
+  const pulled = indexRecordByPath(targetIndex, legacyRecord.path);
+  assert.equal(pulled.fileId, legacyRecord.fileId);
+  assert.equal(pulled.remotePath, migrated.remotePath);
+  assert.equal(pulled.remoteVersion, migrated.remoteVersion);
+  assert.equal(Object.values(targetIndex.shards).flatMap(shard => Object.values(shard.records)).some(record => record.remoteVersion === "legacy-v" || record.remotePath.includes("PrivateFolder")), false);
 });
 
 test("v4 confirmed migration accepts legacy packed records with retained loose encryptedPath", async () => {
@@ -800,10 +827,11 @@ test("v4 confirmed migration accepts legacy packed records with retained loose e
   const codec = new (await import("../../src/lib/v4/storage-codec")).V4StorageCodec({ mode: "encrypted", pathLayout: "opaque-stable-v1", keyring: keys });
   const loose = await codec.prepare("Legacy/note.md", plaintext, "legacy-packed-v", 1, "legacy-packed-file");
   const packed = await codec.preparePack("legacy-pack", [{ record: loose.record, plaintext }]);
-  const legacyRecord: V4IndexFileRecord = { path: "Legacy/note.md", ...packed.records[0], encryptedPath: loose.record.remotePath };
+  const retainedLegacyLoosePath = ".obsidian-github-sync-v4/data/Legacy/retained.enc";
+  const legacyRecord: V4IndexFileRecord = { path: "Legacy/note.md", ...packed.records[0], encryptedPath: retainedLegacyLoosePath };
   const bucket = legacyRecord.pathId.slice(0, 2);
   const head: V4RemoteHead = { formatVersion: 4, mode: "encrypted", epoch: 1, generation: 1, journalId: "legacy-packed-v", shardHashes: { [bucket]: "legacy-pack-shard" }, updatedAt: 1, deviceId: "old" };
-  await publishV4TreeChanges(github, { message: "obsidian-sync-v4:legacy-packed-v", files: [...loose.files, packed.file, ...await buildV4RemoteMetadata({ config: legacyConfig, head, records: [legacyRecord], keyring: keys })] });
+  await publishV4TreeChanges(github, { message: "obsidian-sync-v4:legacy-packed-v", files: [{ path: retainedLegacyLoosePath, bytes: loose.files[0].bytes }, packed.file, ...await buildV4RemoteMetadata({ config: legacyConfig, head, records: [legacyRecord], keyring: keys })] });
   assert.deepEqual(await codec.read(legacyRecord, async path => (await github.getFileBytes(path, github.ref!.sha))!.bytes), plaintext);
   const oldPackPath = legacyRecord.remotePath;
   const oldLoosePath = legacyRecord.encryptedPath!;

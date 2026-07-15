@@ -204,10 +204,13 @@ export class V4SyncSession {
     if (isLayoutMigration && allRemoteRecords.some(record => !includePath(record.path))) {
       throw new Error("Legacy V4 migration cannot continue while encrypted records are excluded by sync scope. Include all legacy paths and retry Force Push.")
     }
-    const allBaseRecords = recordsFromIndex(this.input.index)
+    const allBaseRecords = isLayoutMigration ? [] : recordsFromIndex(this.input.index)
     const baseRecords = allBaseRecords.filter(record => includePath(record.path))
-    const localFiles = (await this.scanLocal(baseRecords, options.changes ?? [])).filter(file => includePath(file.path))
     const remoteRecords = allRemoteRecords.filter(record => includePath(record.path))
+    const migrationIdentityByPath = isLayoutMigration
+      ? new Map(remoteRecords.map(record => [record.path, record.fileId]))
+      : undefined
+    const localFiles = (await this.scanLocal(baseRecords, options.changes ?? [], migrationIdentityByPath)).filter(file => includePath(file.path))
     assertNoCaseInsensitiveCollisions(localFiles)
     assertNoCaseInsensitiveCollisions(logical(remoteRecords))
     const plan = planV4Sync({
@@ -301,7 +304,7 @@ export class V4SyncSession {
       return { mode: options.operation === "forcePull" ? "force-pull" : "pull", operation: options.operation, changedFiles, pushedFiles: 0, pulledFiles }
     }
 
-    const latestLocal = new Map((await this.scanLocal(baseRecords, options.changes ?? [])).map(file => [file.fileId, file]))
+    const latestLocal = new Map((await this.scanLocal(baseRecords, options.changes ?? [], migrationIdentityByPath)).map(file => [file.fileId, file]))
     const files: Array<{ path: string; bytes: Uint8Array }> = []
     const deletions = new Set<string>()
     const journalChanges: V4JournalChange[] = []
@@ -545,7 +548,7 @@ export class V4SyncSession {
     remote.records = reconciled
   }
 
-  private async scanLocal(baseRecords: V4IndexFileRecord[], changes: V4QueuedChange[]): Promise<V4LogicalFile[]> {
+  private async scanLocal(baseRecords: V4IndexFileRecord[], changes: V4QueuedChange[], identitySeedByPath?: ReadonlyMap<string, string>): Promise<V4LogicalFile[]> {
     const pathChanges = changes.filter((change): change is Exclude<V4QueuedChange, { type: "rescan" }> => change.type !== "rescan")
     const hasFolderChange = pathChanges.some(change => change.type === "folderRename" || change.type === "folderDelete")
     if (changes.length > 0 && pathChanges.length === changes.length && !hasFolderChange && baseRecords.length > 0 && this.input.vault.stat) {
@@ -595,7 +598,7 @@ export class V4SyncSession {
       const unchangedStat = existing && existing.size === file.size && existing.mtime === file.mtime
       return {
         path: file.path,
-        fileId: existing?.fileId ?? await this.newFileId(file.path),
+        fileId: identitySeedByPath?.get(file.path) ?? existing?.fileId ?? await this.newFileId(file.path),
         hash: unchangedStat ? existing.plaintextSha256 : await sha256Hex(await this.readLocal(file.path)),
         size: file.size,
         mtime: file.mtime,

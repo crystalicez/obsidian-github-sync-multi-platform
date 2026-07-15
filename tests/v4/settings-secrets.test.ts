@@ -11,7 +11,8 @@ import { migrateV4Secrets, sanitizeV4SettingsForPersistence } from "../../src/li
 import { selectV4RuntimeConfig, V4PluginRuntime } from "../../src/lib/v4/runtime";
 import { buildV4RemoteMetadata } from "../../src/lib/v4/remote-index";
 import { V4StorageCodec } from "../../src/lib/v4/storage-codec";
-import { V4_CONFIG_PATH, V4_FORMAT_VERSION, type V4RemoteConfig, type V4RemoteHead } from "../../src/lib/v4/protocol-types";
+import { V4_CONFIG_PATH, V4_FORMAT_VERSION, type V4PathLayout, type V4RemoteConfig, type V4RemoteHead } from "../../src/lib/v4/protocol-types";
+import type { V4LocalIndex } from "../../src/lib/v4/local-index";
 
 test("v4 settings defaults keep sensitive scopes and modification guard disabled", () => {
   assert.equal(DEFAULT_SETTINGS.syncObsidianConfig, false);
@@ -138,9 +139,10 @@ test("v4 runtime authenticates encrypted remote before confirmed plaintext Force
   wrong.runtime.dispose();
 });
 
-function runtimeFixture(input: { remoteConfig: V4RemoteConfig; localIndexRepoId: string; localIndexPathLayout?: "opaque-stable-v1" }) {
+function runtimeFixture(input: { remoteConfig: V4RemoteConfig; localIndexRepoId: string; localIndexPathLayout?: V4PathLayout; cachedShard?: boolean }) {
   const files = new Map<string, string>();
   const indexPath = ".obsidian/plugins/test/github-sync-v4-index/index.json";
+  const shardHashes = input.cachedShard ? { aa: "legacy-hash" } : {};
   files.set(indexPath, JSON.stringify({
     formatVersion: V4_FORMAT_VERSION,
     repoId: input.localIndexRepoId,
@@ -150,8 +152,11 @@ function runtimeFixture(input: { remoteConfig: V4RemoteConfig; localIndexRepoId:
     remoteCommitSha: "remote",
     epoch: 1,
     generation: 1,
-    shardHashes: {},
+    shardHashes,
   }));
+  if (input.cachedShard) files.set(".obsidian/plugins/test/github-sync-v4-index/shards/aa.json", JSON.stringify({ hash: "legacy-hash", records: {
+    legacy: { path: "Legacy/note.md", pathId: "aa".padEnd(64, "0"), fileId: "legacy-file", plaintextSha256: "legacy-sha", size: 1, mtime: 1, remoteVersion: "legacy-v", remotePath: ".obsidian-github-sync-v4/data/Legacy/token.enc", storage: "single" },
+  } }));
   let vaultLists = 0;
   const plugin = {
     app: {
@@ -203,6 +208,41 @@ function runtimeFixture(input: { remoteConfig: V4RemoteConfig; localIndexRepoId:
   };
   return { runtime: new V4PluginRuntime(plugin as never), plugin, get vaultLists() { return vaultLists; } };
 }
+
+test("v4 runtime reuses a local index only when repository, mode, and path layout all match", async () => {
+  const remote: V4RemoteConfig = {
+    formatVersion: V4_FORMAT_VERSION,
+    mode: "encrypted",
+    repoId: "b/r#main",
+    pathLayout: "opaque-stable-v1",
+    algorithm: "AES-GCM",
+    kdf: "PBKDF2-SHA-256",
+    kdfParams: { iterations: 10, salt: "c2FsdA" },
+  };
+  const desired = selectV4RuntimeConfig(remote, "encrypted", remote.repoId);
+  const loadIndex = async (fixture: ReturnType<typeof runtimeFixture>) => (
+    fixture.runtime as unknown as { loadIndex(config: V4RemoteConfig): Promise<V4LocalIndex> }
+  ).loadIndex(desired);
+
+  for (const localIndexPathLayout of [undefined, "plaintext-v1"] as const) {
+    const fixture = runtimeFixture({ remoteConfig: remote, localIndexRepoId: remote.repoId, localIndexPathLayout, cachedShard: true });
+    const rebuilt = await loadIndex(fixture);
+    assert.equal(rebuilt.pathLayout, "opaque-stable-v1");
+    assert.equal(rebuilt.remoteCommitSha, undefined);
+    assert.equal(rebuilt.epoch, 0);
+    assert.equal(rebuilt.generation, 0);
+    assert.deepEqual(rebuilt.shardHashes, {});
+    assert.deepEqual(rebuilt.shards, {});
+    fixture.runtime.dispose();
+  }
+
+  const matching = runtimeFixture({ remoteConfig: remote, localIndexRepoId: remote.repoId, localIndexPathLayout: "opaque-stable-v1", cachedShard: true });
+  const reused = await loadIndex(matching);
+  assert.equal(reused.remoteCommitSha, "remote");
+  assert.equal(reused.generation, 1);
+  assert.equal(reused.shards.aa.records.legacy.fileId, "legacy-file");
+  matching.runtime.dispose();
+});
 
 test("v4 runtime rejects a remote repo identity mismatch before vault access or A-scoped index reuse", async () => {
   const remote: V4RemoteConfig = {
