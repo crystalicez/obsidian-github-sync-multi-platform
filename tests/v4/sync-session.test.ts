@@ -279,6 +279,21 @@ test("v4 encrypted correct-key matching-SHA no-op reads only config and authenti
   assert.deepEqual(github.readPaths, [V4_CONFIG_PATH, V4_HEAD_PATH]);
   assert.deepEqual(github.treeReads, []);
   assert.deepEqual(vault.operations, []);
+
+  const bucket = Object.keys(index.shards)[0];
+  const cachedRecord = Object.values(index.shards[bucket].records)[0];
+  const originalFileId = cachedRecord.fileId;
+  index.shards[bucket].hash = "stale-local-hash";
+  cachedRecord.fileId = "stale-local-identity";
+  const commitsBeforeRecovery = github.commits.size;
+  github.readPaths.length = 0;
+
+  const recovered = await session.sync({ operation: "normal", allowThresholdOverride: false });
+
+  assert.equal(recovered.mode, "noop");
+  assert.equal(github.commits.size, commitsBeforeRecovery);
+  assert.deepEqual(github.readPaths, [V4_CONFIG_PATH, V4_HEAD_PATH, `.obsidian-github-sync-v4/index/${bucket}.enc`]);
+  assert.equal(indexRecordByPath(index, "secret.md").fileId, originalFileId);
 });
 
 test("v4 force push initializes an empty vault instead of returning a no-op", async () => {
@@ -1055,7 +1070,7 @@ test("v4 no-op reuses all 256 unchanged local index shards", async () => {
     const hash = `shard-${bucket}`;
     shardHashes[bucket] = hash;
     index.shardHashes[bucket] = hash;
-    index.shards[bucket] = { hash, records: { [pathId]: record } };
+    index.shards[bucket] = { bucket, hash, records: { [pathId]: record } };
     vault.files.set(path, { bytes: enc("x"), mtime: 1 });
   }
   index.remoteCommitSha = "commit-previous";

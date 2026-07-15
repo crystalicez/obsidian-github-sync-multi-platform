@@ -6,7 +6,7 @@ import type { V4Keyring } from "./crypto"
 import { encryptV4Payload } from "./crypto"
 import { publishV4TreeChanges, type V4GitTreeGithub } from "./git-tree-writer"
 import { buildV4JournalPages, type V4JournalChange } from "./history-journal"
-import type { V4IndexFileRecord, V4LocalIndex } from "./local-index"
+import { isV4LocalIndexCacheComplete, isV4LocalIndexShardConsistent, type V4IndexFileRecord, type V4LocalIndex } from "./local-index"
 import { bucketForV4PathId } from "./paths"
 import { planV4Sync, type V4LogicalFile, type V4PlannedChange, type V4SyncOperation } from "./planner"
 import {
@@ -208,7 +208,8 @@ export class V4SyncSession {
     const baseCommitSha = this.input.index.remoteCommitSha
     const ref = await this.input.github.getGitRefOrNull()
     const remoteConfig = await this.loadRemoteConfig(ref?.sha, options.operation)
-    const remote = ref && remoteConfig && remoteConfig.mode !== "encrypted" && ref.sha === this.input.index.remoteCommitSha && this.input.index.pathLayout === effectiveV4PathLayout(remoteConfig)
+    const localCacheComplete = isV4LocalIndexCacheComplete(this.input.index)
+    const remote = ref && remoteConfig && remoteConfig.mode !== "encrypted" && localCacheComplete && ref.sha === this.input.index.remoteCommitSha && this.input.index.pathLayout === effectiveV4PathLayout(remoteConfig)
       ? this.remoteFromLocalIndex(ref.sha, remoteConfig)
       : await this.loadRemote(ref?.sha, remoteConfig, options.operation)
     if (!remote && options.operation !== "forcePush") {
@@ -241,7 +242,11 @@ export class V4SyncSession {
     if (isLayoutMigration && allRemoteRecords.some(record => !includePath(record.path))) {
       throw new Error("Legacy V4 migration cannot continue while encrypted records are excluded by sync scope. Include all legacy paths and retry Force Push.")
     }
-    const allBaseRecords = isLayoutMigration ? [] : recordsFromIndex(this.input.index)
+    const allBaseRecords = isLayoutMigration
+      ? []
+      : localCacheComplete && this.input.index.remoteCommitSha
+        ? recordsFromIndex(this.input.index)
+        : allRemoteRecords
     const baseRecords = allBaseRecords.filter(record => includePath(record.path))
     const remoteRecords = allRemoteRecords.filter(record => includePath(record.path))
     const migrationIdentityByPath = isLayoutMigration
@@ -516,7 +521,7 @@ export class V4SyncSession {
     const head = await decodeV4RemoteHead(headFile.bytes, config, this.input.keyring)
     const records: V4IndexFileRecord[] = []
     for (const bucket of Object.keys(head.shardHashes)) {
-      const cached = this.input.index.shardHashes[bucket] === head.shardHashes[bucket]
+      const cached = isV4LocalIndexShardConsistent(this.input.index, bucket, head.shardHashes[bucket])
         ? this.input.index.shards[bucket]
         : undefined
       if (cached) {
@@ -691,7 +696,7 @@ export class V4SyncSession {
     this.input.index.shards = {}
     for (const record of records) {
       const bucket = bucketForV4PathId(record.pathId)
-      const shard = this.input.index.shards[bucket] ?? { hash: head.shardHashes[bucket] ?? "", records: {} }
+      const shard = this.input.index.shards[bucket] ?? { bucket, hash: head.shardHashes[bucket] ?? "", records: {} }
       shard.records[record.pathId] = { ...record, dirty: false }
       this.input.index.shards[bucket] = shard
     }

@@ -205,6 +205,31 @@ test("v4 runtime recovers after a published commit whose second local shard save
   assert.equal(github.commits.size, commitsAfterPublish);
   assert.equal(github.readPaths.includes(V4_HEAD_PATH), true);
   assert.equal(github.readPaths.some(path => path.includes("/index/")), true);
+
+  const currentHeader = JSON.parse(indexFiles.get(".obsidian/plugins/test/github-sync-v4-index/index.json")!);
+  const expectedIdentities = Object.fromEntries(Object.keys(currentHeader.shardHashes).flatMap(bucket => {
+    const shard = JSON.parse(indexFiles.get(`.obsidian/plugins/test/github-sync-v4-index/shards/${bucket}.json`)!);
+    return Object.values(shard.records as Record<string, { path: string; fileId: string }>).map(record => [record.path, record.fileId]);
+  }));
+  const missingBucket = Object.keys(currentHeader.shardHashes)[0];
+  indexFiles.delete(`.obsidian/plugins/test/github-sync-v4-index/shards/${missingBucket}.json`);
+  const commitsBeforeCacheRecovery = github.commits.size;
+  runtime.dispose();
+  github.readPaths.length = 0;
+  runtime = new V4PluginRuntime(plugin as never);
+
+  await runtime.manualSync();
+
+  assert.equal(plugin.syncProgress.status, "success");
+  assert.equal(github.commits.size, commitsBeforeCacheRecovery);
+  assert.equal(github.readPaths.includes(V4_HEAD_PATH), true);
+  assert.equal(github.readPaths.some(path => path.includes("/index/")), true);
+  const repairedHeader = JSON.parse(indexFiles.get(".obsidian/plugins/test/github-sync-v4-index/index.json")!);
+  const repairedIdentities = Object.fromEntries(Object.keys(repairedHeader.shardHashes).flatMap(bucket => {
+    const shard = JSON.parse(indexFiles.get(`.obsidian/plugins/test/github-sync-v4-index/shards/${bucket}.json`)!);
+    return Object.values(shard.records as Record<string, { path: string; fileId: string }>).map(record => [record.path, record.fileId]);
+  }));
+  assert.deepEqual(repairedIdentities, expectedIdentities);
   runtime.dispose();
 });
 
@@ -223,8 +248,9 @@ function runtimeFixture(input: { remoteConfig: V4RemoteConfig; localIndexRepoId:
     generation: 1,
     shardHashes,
   }));
-  if (input.cachedShard) files.set(".obsidian/plugins/test/github-sync-v4-index/shards/aa.json", JSON.stringify({ hash: "legacy-hash", records: {
-    legacy: { path: "Legacy/note.md", pathId: "aa".padEnd(64, "0"), fileId: "legacy-file", plaintextSha256: "legacy-sha", size: 1, mtime: 1, remoteVersion: "legacy-v", remotePath: ".obsidian-github-sync-v4/data/Legacy/token.enc", storage: "single" },
+  const legacyPathId = "aa".padEnd(64, "0");
+  if (input.cachedShard) files.set(".obsidian/plugins/test/github-sync-v4-index/shards/aa.json", JSON.stringify({ bucket: "aa", hash: "legacy-hash", records: {
+    [legacyPathId]: { path: "Legacy/note.md", pathId: legacyPathId, fileId: "legacy-file", plaintextSha256: "legacy-sha", size: 1, mtime: 1, remoteVersion: "legacy-v", remotePath: ".obsidian-github-sync-v4/data/Legacy/token.enc", storage: "single" },
   } }));
   let vaultLists = 0;
   const plugin = {
@@ -309,7 +335,7 @@ test("v4 runtime reuses a local index only when repository, mode, and path layou
   const reused = await loadIndex(matching);
   assert.equal(reused.remoteCommitSha, "remote");
   assert.equal(reused.generation, 1);
-  assert.equal(reused.shards.aa.records.legacy.fileId, "legacy-file");
+  assert.equal(Object.values(reused.shards.aa.records)[0].fileId, "legacy-file");
   matching.runtime.dispose();
 });
 

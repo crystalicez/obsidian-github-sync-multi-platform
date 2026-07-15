@@ -6,6 +6,7 @@ import { createEmptyV4LocalIndex, loadV4LocalIndex, saveV4LocalIndex } from "../
 function addShard(index: ReturnType<typeof createEmptyV4LocalIndex>, bucket: string, version: string) {
   const pathId = `${bucket}${"0".repeat(62)}`;
   const shard = {
+    bucket,
     hash: `hash-${version}-${bucket}`,
     records: {
       [pathId]: {
@@ -47,7 +48,7 @@ test("v4 local index writes all changed shards before one final header", async (
   assert.equal(loaded.shards.cd.hash, "hash-v2-cd");
 });
 
-test("v4 local index shard failure preserves the previous header and reload state", async () => {
+test("v4 local index shard failure preserves the previous header but invalidates the mixed-generation cache", async () => {
   const stored = new Map<string, string>();
   const writeOrder: string[] = [];
   let failPath: string | undefined;
@@ -88,10 +89,98 @@ test("v4 local index shard failure preserves the previous header and reload stat
   assert.deepEqual(writeOrder, ["index/shards/ab.json", "index/shards/cd.json"]);
   assert.equal(stored.get("index/index.json"), previousHeader);
   const reloaded = await loadV4LocalIndex(adapter, "index");
-  assert.equal(reloaded.remoteCommitSha, "previous-commit");
-  assert.equal(reloaded.generation, 1);
-  assert.deepEqual(reloaded.shardHashes, previous.shardHashes);
-  assert.notEqual(reloaded.remoteCommitSha, final.remoteCommitSha);
+  assert.equal(reloaded.remoteCommitSha, undefined);
+  assert.equal(reloaded.generation, 0);
+  assert.deepEqual(reloaded.shardHashes, {});
+  assert.deepEqual(reloaded.shards, {});
+});
+
+test("v4 local index invalidates a current header whose advertised shard is missing", async () => {
+  const stored = new Map<string, string>();
+  const adapter = {
+    async read(path: string) { return stored.get(path)!; },
+    async write(path: string, value: string) { stored.set(path, value); },
+    async exists(path: string) { return stored.has(path); },
+    async mkdir(_path: string) {},
+  };
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "d", mode: "plaintext" });
+  index.remoteCommitSha = "current-commit";
+  addShard(index, "ab", "current");
+  await saveV4LocalIndex(adapter, "index", index);
+  stored.delete("index/shards/ab.json");
+
+  const loaded = await loadV4LocalIndex(adapter, "index");
+
+  assert.equal(loaded.remoteCommitSha, undefined);
+  assert.deepEqual(loaded.shardHashes, {});
+  assert.deepEqual(loaded.shards, {});
+});
+
+test("v4 local index invalidates stale, mis-bucketed, mis-keyed, and malformed cached shards", async () => {
+  const pathId = `ab${"0".repeat(62)}`;
+  const record = {
+    path: "note.md", pathId, fileId: "file-ab", plaintextSha256: "sha", size: 1, mtime: 2,
+    remoteVersion: "current", remotePath: "note.md", storage: "single" as const,
+  };
+  const corruptions: Array<[string, string]> = [
+    ["stale hash", JSON.stringify({ bucket: "ab", hash: "stale", records: { [pathId]: record } })],
+    ["mis-bucketed shard", JSON.stringify({ bucket: "cd", hash: "current-hash", records: { [pathId]: record } })],
+    ["mis-keyed record", JSON.stringify({ bucket: "ab", hash: "current-hash", records: { wrong: record } })],
+    ["malformed JSON", "{not-json"],
+  ];
+
+  for (const [label, shardJson] of corruptions) {
+    const stored = new Map<string, string>([
+      ["index/index.json", JSON.stringify({
+        formatVersion: 4,
+        repoId: "o/r#main",
+        deviceId: "d",
+        mode: "plaintext",
+        pathLayout: "plaintext-v1",
+        remoteCommitSha: "current-commit",
+        epoch: 1,
+        generation: 1,
+        shardHashes: { ab: "current-hash" },
+      })],
+      ["index/shards/ab.json", shardJson],
+    ]);
+    const adapter = {
+      async read(path: string) { return stored.get(path)!; },
+      async write(path: string, value: string) { stored.set(path, value); },
+      async exists(path: string) { return stored.has(path); },
+      async mkdir(_path: string) {},
+    };
+
+    const loaded = await loadV4LocalIndex(adapter, "index");
+
+    assert.equal(loaded.remoteCommitSha, undefined, label);
+    assert.deepEqual(loaded.shards, {}, label);
+  }
+});
+
+test("v4 local index propagates unexpected shard read errors", async () => {
+  const header = JSON.stringify({
+    formatVersion: 4,
+    repoId: "o/r#main",
+    deviceId: "d",
+    mode: "plaintext",
+    pathLayout: "plaintext-v1",
+    remoteCommitSha: "current-commit",
+    epoch: 1,
+    generation: 1,
+    shardHashes: { ab: "current-hash" },
+  });
+  const adapter = {
+    async read(path: string) {
+      if (path.endsWith("index.json")) return header;
+      throw new Error("storage device unavailable");
+    },
+    async write(_path: string, _value: string) {},
+    async exists(_path: string) { return true; },
+    async mkdir(_path: string) {},
+  };
+
+  await assert.rejects(() => loadV4LocalIndex(adapter, "index"), /storage device unavailable/iu);
 });
 
 test("v4 local index writes changed header metadata once when no shards changed", async () => {
