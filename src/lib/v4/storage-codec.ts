@@ -108,7 +108,7 @@ export class V4StorageCodec {
     }))
     const bytes = await encryptV4Payload(this.options.keyring!.contentKey, archive, { kind: "pack", aad: packId })
     return {
-      records: entries.map(entry => ({ ...entry.record, storage: "pack", remotePath, packId, partPaths: undefined })),
+      records: entries.map(entry => ({ ...entry.record, storage: "pack", remotePath, encryptedPath: remotePath, packId, partPaths: undefined })),
       file: { path: remotePath, bytes },
     }
   }

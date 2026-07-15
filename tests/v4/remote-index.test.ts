@@ -31,11 +31,40 @@ test("v4 encrypted remote metadata does not expose paths and round trips", async
   const keys = await deriveV4Keyring({ passphrase: "pass", repoId: "o/r#main", salt: enc("salt"), iterations: 10 });
   const config: V4RemoteConfig = { formatVersion: V4_FORMAT_VERSION, mode: "encrypted", repoId: "o/r#main", pathLayout: expectedV4PathLayout("encrypted"), algorithm: "AES-GCM", kdf: "PBKDF2-SHA-256", kdfParams: { iterations: 10, salt: "c2FsdA" } };
   const head: V4RemoteHead = { formatVersion: V4_FORMAT_VERSION, mode: "encrypted", epoch: 1, generation: 2, journalId: "j2", shardHashes: { aa: "h" }, updatedAt: 3, deviceId: "d" };
-  const record = { path: "Folder/private.md", pathId: "aa".padEnd(64, "0"), fileId: "f", plaintextSha256: "hash", size: 4, mtime: 3, remoteVersion: "v", remotePath: "opaque", storage: "single" as const };
+  const record = { path: "Folder/private.md", pathId: "aa".padEnd(64, "0"), fileId: "f", plaintextSha256: "hash", size: 4, mtime: 3, remoteVersion: "v", remotePath: `.obsidian-github-sync-v4/data/aa/${"a".repeat(64)}.enc`, storage: "single" as const };
   const files = await buildV4RemoteMetadata({ config, head, records: [record], keyring: keys });
   const shard = files.find(file => file.path.includes("/index/"))!;
   assert.equal(new TextDecoder().decode(shard.bytes).includes("private.md"), false);
   assert.deepEqual((await decodeV4RemoteShard(shard.bytes, "aa", config, keys)).records[record.pathId], record);
   const headFile = files.find(file => file.path.endsWith("/head"))!;
   assert.deepEqual(await decodeV4RemoteHead(headFile.bytes, config, keys), head);
+});
+
+test("v4 remote shard rejects record keys and path ids outside its bucket", async () => {
+  const config: V4RemoteConfig = { formatVersion: V4_FORMAT_VERSION, mode: "plaintext", repoId: "o/r#main", pathLayout: "plaintext-v1" };
+  const record = { path: "note.md", pathId: "bb".padEnd(64, "0"), fileId: "f", plaintextSha256: "hash", size: 4, mtime: 3, remoteVersion: "v", remotePath: "note.md", storage: "single" as const };
+  await assert.rejects(
+    () => decodeV4RemoteShard(enc(JSON.stringify({ bucket: "aa", records: { ["aa".padEnd(64, "0")]: record } })), "aa", config),
+    /path id|bucket|record key/iu,
+  );
+});
+
+test("v4 remote shard rejects unsafe or non-normalized logical paths", async () => {
+  const config: V4RemoteConfig = { formatVersion: V4_FORMAT_VERSION, mode: "plaintext", repoId: "o/r#main", pathLayout: "plaintext-v1" };
+  const pathId = "aa".padEnd(64, "0");
+  const record = { path: "Folder\\note.md", pathId, fileId: "f", plaintextSha256: "hash", size: 4, mtime: 3, remoteVersion: "v", remotePath: "Folder\\note.md", storage: "single" as const };
+  await assert.rejects(
+    () => decodeV4RemoteShard(enc(JSON.stringify({ bucket: "aa", records: { [pathId]: record } })), "aa", config),
+    /normalized|unsafe/iu,
+  );
+});
+
+test("v4 remote shard rejects inconsistent storage descriptors", async () => {
+  const config: V4RemoteConfig = { formatVersion: V4_FORMAT_VERSION, mode: "plaintext", repoId: "o/r#main", pathLayout: "plaintext-v1" };
+  const pathId = "aa".padEnd(64, "0");
+  const record = { path: "large.bin", pathId, fileId: "f", plaintextSha256: "hash", size: 4, mtime: 3, remoteVersion: "v", remotePath: "wrong.part", storage: "chunked" as const, partPaths: [] };
+  await assert.rejects(
+    () => decodeV4RemoteShard(enc(JSON.stringify({ bucket: "aa", records: { [pathId]: record } })), "aa", config),
+    /chunked|storage|parts/iu,
+  );
 });

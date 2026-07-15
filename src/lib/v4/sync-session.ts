@@ -11,6 +11,8 @@ import { bucketForV4PathId } from "./paths"
 import { planV4Sync, type V4LogicalFile, type V4PlannedChange, type V4SyncOperation } from "./planner"
 import {
   buildV4RemoteMetadata,
+  assertV4RemoteRecordSet,
+  assertV4RemoteShardRecords,
   decodeV4RemoteConfig,
   decodeV4RemoteHead,
   decodeV4RemoteShard,
@@ -169,7 +171,7 @@ export class V4SyncSession {
     const baseCommitSha = this.input.index.remoteCommitSha
     const ref = await this.input.github.getGitRefOrNull()
     const remoteConfig = await this.loadRemoteConfig(ref?.sha, options.operation)
-    const remote = ref && remoteConfig && ref.sha === this.input.index.remoteCommitSha && this.input.index.pathLayout === effectiveV4PathLayout(remoteConfig)
+    const remote = ref && remoteConfig && remoteConfig.mode !== "encrypted" && ref.sha === this.input.index.remoteCommitSha && this.input.index.pathLayout === effectiveV4PathLayout(remoteConfig)
       ? this.remoteFromLocalIndex(ref.sha, remoteConfig)
       : await this.loadRemote(ref?.sha, remoteConfig, options.operation)
     if (!remote && options.operation !== "forcePush") {
@@ -469,7 +471,6 @@ export class V4SyncSession {
 
   private async loadRemote(commitSha: string | undefined, config: V4RemoteConfig | null, operation: V4SyncOperation): Promise<V4RemoteState | null> {
     if (!config) return null
-    if (config.mode !== this.input.config.mode && operation === "forcePush" && this.input.config.mode === "plaintext") return null
     const headFile = await this.input.github.getFileBytes(V4_HEAD_PATH, commitSha)
     if (!headFile) throw new Error("V4 remote head is missing.")
     const head = await decodeV4RemoteHead(headFile.bytes, config, this.input.keyring)
@@ -479,6 +480,7 @@ export class V4SyncSession {
         ? this.input.index.shards[bucket]
         : undefined
       if (cached) {
+        assertV4RemoteShardRecords({ bucket, records: cached.records }, bucket, config)
         records.push(...Object.values(cached.records))
         continue
       }
@@ -486,6 +488,7 @@ export class V4SyncSession {
       if (!file) throw new Error(`V4 remote shard is missing: ${bucket}`)
       records.push(...Object.values((await decodeV4RemoteShard(file.bytes, bucket, config, this.input.keyring)).records))
     }
+    await assertV4RemoteRecordSet(records, config, this.input.keyring)
     return { config, head, records, commitSha: commitSha ?? "" }
   }
 
@@ -549,7 +552,8 @@ export class V4SyncSession {
       const byPath = new Map(logical(baseRecords).map(file => [file.path, file]))
       for (const change of pathChanges) {
         if (change.type === "delete") { byPath.delete(change.path); continue }
-        const previous = change.type === "rename" ? byPath.get(change.oldPath) : byPath.get(change.path)
+        const previous = change.type === "replace" ? undefined : change.type === "rename" ? byPath.get(change.oldPath) : byPath.get(change.path)
+        if (change.type === "replace") byPath.delete(change.path)
         if (change.type === "rename") byPath.delete(change.oldPath)
         const stat = await this.input.vault.stat(change.path)
         if (!stat) { byPath.delete(change.path); continue }
@@ -566,6 +570,10 @@ export class V4SyncSession {
     }
     const identityByPath = new Map(baseRecords.map(record => [record.path, record]))
     for (const change of changes) {
+      if (change.type === "replace") {
+        identityByPath.delete(change.path)
+        continue
+      }
       if (change.type === "rename") {
         const record = identityByPath.get(change.oldPath)
         if (record) { identityByPath.delete(change.oldPath); identityByPath.set(change.path, record) }

@@ -11,6 +11,7 @@ import { deriveV4Keyring, encryptV4Payload } from "../../src/lib/v4/crypto";
 import { sha256Hex } from "../../src/lib/bytes";
 import { buildV4RemoteMetadata } from "../../src/lib/v4/remote-index";
 import { publishV4TreeChanges } from "../../src/lib/v4/git-tree-writer";
+import { V4_LARGE_FILE_THRESHOLD_BYTES } from "../../src/lib/v4/large-files";
 
 const enc = (value: string) => new TextEncoder().encode(value);
 const dec = (value: Uint8Array) => new TextDecoder().decode(value);
@@ -214,6 +215,72 @@ test("v4 session validates only the config when the remote commit is unchanged",
   assert.deepEqual(github.treeReads, []);
 });
 
+test("v4 encrypted matching-SHA sync authenticates the remote head before publishing with a derived key", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault();
+  vault.files.set("secret.md", { bytes: enc("key A content"), mtime: 1 });
+  const encryptedConfig: V4RemoteConfig = { formatVersion: V4_FORMAT_VERSION, mode: "encrypted", repoId: "o/r#main", pathLayout: "opaque-stable-v1", algorithm: "AES-GCM", kdf: "PBKDF2-SHA-256", kdfParams: { iterations: 10, salt: "c2FsdA" } };
+  const keyA = await deriveV4Keyring({ passphrase: "key-a", repoId: "o/r#main", salt: enc("salt"), iterations: 10 });
+  const keyB = await deriveV4Keyring({ passphrase: "key-b", repoId: "o/r#main", salt: enc("salt"), iterations: 10 });
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "d", mode: "encrypted", pathLayout: "opaque-stable-v1" });
+  await new V4SyncSession({ github, vault, index, config: encryptedConfig, keyring: keyA, conflictPolicy: "copy", abortChangePercent: 0 }).sync({ operation: "forcePush", allowThresholdOverride: false });
+  vault.files.set("secret.md", { bytes: enc("modified under key B"), mtime: 2 });
+  vault.operations.length = 0;
+  const before = { ref: github.ref!.sha, blobs: github.blobs.size, trees: github.trees.size, commits: github.commits.size, messages: github.commitMessages.length };
+
+  await assert.rejects(
+    () => new V4SyncSession({ github, vault, index, config: encryptedConfig, keyring: keyB, conflictPolicy: "copy", abortChangePercent: 0 }).sync({ operation: "normal", allowThresholdOverride: false, changes: [{ type: "modify", path: "secret.md", mtime: 2 }] }),
+    /decrypt|authentication|passphrase/iu,
+  );
+
+  assert.deepEqual({ ref: github.ref!.sha, blobs: github.blobs.size, trees: github.trees.size, commits: github.commits.size, messages: github.commitMessages.length }, before);
+  assert.equal(vault.operations.some(operation => operation.startsWith("write:") || operation.startsWith("delete:")), false);
+  assert.equal(dec(vault.files.get("secret.md")!.bytes), "modified under key B");
+});
+
+test("v4 Force Push cannot overwrite an encrypted remote without authenticating its head", async () => {
+  const github = new MemoryGitHub();
+  const encryptedVault = new MemoryVault();
+  encryptedVault.files.set("secret.md", { bytes: enc("encrypted"), mtime: 1 });
+  const encryptedConfig: V4RemoteConfig = { formatVersion: V4_FORMAT_VERSION, mode: "encrypted", repoId: "o/r#main", pathLayout: "opaque-stable-v1", algorithm: "AES-GCM", kdf: "PBKDF2-SHA-256", kdfParams: { iterations: 10, salt: "c2FsdA" } };
+  const keys = await deriveV4Keyring({ passphrase: "key-a", repoId: "o/r#main", salt: enc("salt"), iterations: 10 });
+  const encryptedIndex = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "encrypted", mode: "encrypted", pathLayout: "opaque-stable-v1" });
+  await new V4SyncSession({ github, vault: encryptedVault, index: encryptedIndex, config: encryptedConfig, keyring: keys, conflictPolicy: "copy", abortChangePercent: 0 }).sync({ operation: "forcePush", allowThresholdOverride: false });
+  const plaintextVault = new MemoryVault();
+  plaintextVault.files.set("replacement.md", { bytes: enc("plaintext"), mtime: 2 });
+  const plaintextIndex = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "plaintext", mode: "plaintext", pathLayout: "plaintext-v1" });
+  const before = { ref: github.ref!.sha, blobs: github.blobs.size, trees: github.trees.size, commits: github.commits.size };
+
+  await assert.rejects(
+    () => new V4SyncSession({ github, vault: plaintextVault, index: plaintextIndex, config: config(), conflictPolicy: "copy", abortChangePercent: 0 }).sync({ operation: "forcePush", allowThresholdOverride: true }),
+    /decrypt|passphrase|authentication/iu,
+  );
+
+  assert.deepEqual({ ref: github.ref!.sha, blobs: github.blobs.size, trees: github.trees.size, commits: github.commits.size }, before);
+  assert.equal(plaintextVault.operations.some(operation => operation.startsWith("write:") || operation.startsWith("delete:")), false);
+});
+
+test("v4 encrypted correct-key matching-SHA no-op reads only config and authenticated head", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault();
+  vault.files.set("secret.md", { bytes: enc("secret"), mtime: 1 });
+  const encryptedConfig: V4RemoteConfig = { formatVersion: V4_FORMAT_VERSION, mode: "encrypted", repoId: "o/r#main", pathLayout: "opaque-stable-v1", algorithm: "AES-GCM", kdf: "PBKDF2-SHA-256", kdfParams: { iterations: 10, salt: "c2FsdA" } };
+  const keys = await deriveV4Keyring({ passphrase: "correct", repoId: "o/r#main", salt: enc("salt"), iterations: 10 });
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "d", mode: "encrypted", pathLayout: "opaque-stable-v1" });
+  const session = new V4SyncSession({ github, vault, index, config: encryptedConfig, keyring: keys, conflictPolicy: "copy", abortChangePercent: 0 });
+  await session.sync({ operation: "forcePush", allowThresholdOverride: false });
+  github.readPaths.length = 0;
+  github.treeReads.length = 0;
+  vault.operations.length = 0;
+
+  const result = await session.sync({ operation: "normal", allowThresholdOverride: false });
+
+  assert.equal(result.mode, "noop");
+  assert.deepEqual(github.readPaths, [V4_CONFIG_PATH, V4_HEAD_PATH]);
+  assert.deepEqual(github.treeReads, []);
+  assert.deepEqual(vault.operations, []);
+});
+
 test("v4 force push initializes an empty vault instead of returning a no-op", async () => {
   const github = new MemoryGitHub();
   const vault = new MemoryVault();
@@ -351,6 +418,89 @@ test("v4 encrypted pack round trips through force pull and version-history previ
   assert.equal(dec(target.files.get("Folder/private-42.md")!.bytes), "secret-42");
 });
 
+test("v4 encrypted chunked rename reuses identity and parts without uploading content", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault();
+  const content = new Uint8Array(V4_LARGE_FILE_THRESHOLD_BYTES + 1);
+  content[0] = 17;
+  content[content.length - 1] = 29;
+  vault.files.set("large.bin", { bytes: content, mtime: 1 });
+  const encryptedConfig: V4RemoteConfig = { formatVersion: V4_FORMAT_VERSION, mode: "encrypted", repoId: "o/r#main", pathLayout: "opaque-stable-v1", algorithm: "AES-GCM", kdf: "PBKDF2-SHA-256", kdfParams: { iterations: 10, salt: "c2FsdA" } };
+  const keys = await deriveV4Keyring({ passphrase: "pass", repoId: "o/r#main", salt: enc("salt"), iterations: 10 });
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "d", mode: "encrypted", pathLayout: "opaque-stable-v1" });
+  const session = () => new V4SyncSession({ github, vault, index, config: encryptedConfig, keyring: keys, conflictPolicy: "copy" as const, abortChangePercent: 0 });
+  await session().sync({ operation: "forcePush", allowThresholdOverride: false });
+  const before = structuredClone(indexRecordByPath(index, "large.bin"));
+  assert.equal(before.storage, "chunked");
+  const file = vault.files.get("large.bin")!;
+  vault.files.delete("large.bin");
+  vault.files.set("renamed.bin", { ...file, mtime: 2 });
+
+  await session().sync({ operation: "normal", allowThresholdOverride: false, changes: [{ type: "rename", oldPath: "large.bin", path: "renamed.bin", mtime: 2 }] });
+
+  const after = indexRecordByPath(index, "renamed.bin");
+  assert.equal(after.fileId, before.fileId);
+  assert.equal(after.remotePath, before.remotePath);
+  assert.deepEqual(after.partPaths, before.partPaths);
+  assert.equal(github.lastEntries.some(entry => entry.path.includes("/parts/")), false);
+  const target = new MemoryVault();
+  const targetIndex = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "target", mode: "encrypted", pathLayout: "opaque-stable-v1" });
+  await new V4SyncSession({ github, vault: target, index: targetIndex, config: encryptedConfig, keyring: keys, conflictPolicy: "copy", abortChangePercent: 0 }).sync({ operation: "forcePull", allowThresholdOverride: false });
+  assert.equal(await sha256Hex(target.files.get("renamed.bin")!.bytes), await sha256Hex(content));
+});
+
+test("v4 encrypted packed-member rename reuses its pack and remains previewable", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault();
+  for (let index = 0; index < 64; index++) vault.files.set(`Folder/private-${index}.md`, { bytes: enc(`secret-${index}`), mtime: 1 });
+  const encryptedConfig: V4RemoteConfig = { formatVersion: V4_FORMAT_VERSION, mode: "encrypted", repoId: "o/r#main", pathLayout: "opaque-stable-v1", algorithm: "AES-GCM", kdf: "PBKDF2-SHA-256", kdfParams: { iterations: 10, salt: "c2FsdA" } };
+  const keys = await deriveV4Keyring({ passphrase: "pass", repoId: "o/r#main", salt: enc("salt"), iterations: 10 });
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "d", mode: "encrypted", pathLayout: "opaque-stable-v1" });
+  const session = () => new V4SyncSession({ github, vault, index, config: encryptedConfig, keyring: keys, conflictPolicy: "copy" as const, abortChangePercent: 0 });
+  await session().sync({ operation: "forcePush", allowThresholdOverride: false });
+  const before = structuredClone(indexRecordByPath(index, "Folder/private-42.md"));
+  assert.equal(before.storage, "pack");
+  const file = vault.files.get("Folder/private-42.md")!;
+  vault.files.delete("Folder/private-42.md");
+  vault.files.set("Folder/renamed-42.md", { ...file, mtime: 2 });
+
+  await session().sync({ operation: "normal", allowThresholdOverride: false, changes: [{ type: "rename", oldPath: "Folder/private-42.md", path: "Folder/renamed-42.md", mtime: 2 }] });
+
+  const after = indexRecordByPath(index, "Folder/renamed-42.md");
+  assert.equal(after.fileId, before.fileId);
+  assert.equal(after.remotePath, before.remotePath);
+  assert.equal(after.packId, before.packId);
+  assert.equal(github.lastEntries.some(entry => entry.path.includes("/packs/")), false);
+  const tip = github.ref!.sha;
+  const published = github.commits.get(tip)!;
+  const journalId = /^obsidian-sync-v4:(.+)$/u.exec(published.message)![1];
+  const blobPaths = new Map<string, { treeSha: string; path: string }>();
+  const history = new V4HistoryService({
+    config: encryptedConfig,
+    keyring: keys,
+    github: {
+      async listCommits() { return []; },
+      async getFileBytes(path: string, ref?: string) { return github.getFileBytes(path, ref); },
+      async getGitCommit(sha: string) { return github.getGitCommit(sha); },
+      async getTreeAt(treeSha: string) {
+        const tree = github.trees.get(treeSha) ?? new Map();
+        return { sha: treeSha, url: "", truncated: false, tree: [...tree.entries()].map(([path, bytes], index) => {
+          const sha = `preview-${treeSha}-${index}`;
+          blobPaths.set(sha, { treeSha, path });
+          return { path, mode: "100644", type: "blob" as const, sha, size: bytes.byteLength, url: "" };
+        }) };
+      },
+      async getBlob(sha: string) { const blob = blobPaths.get(sha)!; return new Uint8Array(github.trees.get(blob.treeSha)!.get(blob.path)!); },
+    },
+  });
+  const commit = { sha: tip, message: published.message, authorName: "A", authoredAt: "", parentShas: published.parents, source: "plugin" as const, journalId };
+  const change = (await history.getCommitChanges(commit)).find(candidate => candidate.path === "Folder/renamed-42.md")!;
+  assert.equal(change.kind, "rename");
+  const preview = await history.previewChange(commit, change);
+  assert.equal(preview.kind, "text");
+  if (preview.kind === "text") assert.equal(preview.text, "secret-42");
+});
+
 test("v4 ignore scope stops tracking a path without treating it as a remote deletion", async () => {
   const github = new MemoryGitHub();
   const vault = new MemoryVault();
@@ -466,6 +616,56 @@ test("v4 content-preserving rename writes metadata and journal without uploading
   assert.equal(github.lastEntries.some(entry => entry.path === oldRemotePath), false);
   assert.equal(github.lastEntries.some(entry => entry.path.includes("/index/")), true);
   assert.equal(github.lastEntries.some(entry => entry.path.includes("/journals/")), true);
+});
+
+test("v4 delete then recreate in one debounce window creates a new encrypted identity atomically", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault();
+  vault.files.set("same.md", { bytes: enc("old content"), mtime: 1 });
+  const encryptedConfig: V4RemoteConfig = { formatVersion: V4_FORMAT_VERSION, mode: "encrypted", repoId: "o/r#main", pathLayout: "opaque-stable-v1", algorithm: "AES-GCM", kdf: "PBKDF2-SHA-256", kdfParams: { iterations: 10, salt: "c2FsdA" } };
+  const keys = await deriveV4Keyring({ passphrase: "pass", repoId: "o/r#main", salt: enc("salt"), iterations: 10 });
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "d", mode: "encrypted", pathLayout: "opaque-stable-v1" });
+  const session = () => new V4SyncSession({ github, vault, index, config: encryptedConfig, keyring: keys, conflictPolicy: "copy" as const, abortChangePercent: 0 });
+  await session().sync({ operation: "forcePush", allowThresholdOverride: false });
+  const before = { ...indexRecordByPath(index, "same.md") };
+  vault.files.set("same.md", { bytes: enc("new content"), mtime: 2 });
+
+  await session().sync({
+    operation: "normal",
+    allowThresholdOverride: false,
+    changes: coalesceV4Changes([
+      { type: "delete", path: "same.md", mtime: 1 },
+      { type: "modify", path: "same.md", mtime: 2 },
+    ]),
+  });
+
+  const after = indexRecordByPath(index, "same.md");
+  assert.notEqual(after.fileId, before.fileId);
+  assert.notEqual(after.remotePath, before.remotePath);
+  assert.equal(github.files.has(before.remotePath), false);
+  assert.equal(github.files.has(after.remotePath), true);
+  const tip = github.ref!.sha;
+  const published = github.commits.get(tip)!;
+  const journalId = /^obsidian-sync-v4:(.+)$/u.exec(published.message)![1];
+  const changes = await new V4HistoryService({
+    config: encryptedConfig,
+    keyring: keys,
+    github: {
+      async listCommits() { return []; },
+      async getFileBytes(path: string, ref?: string) { return github.getFileBytes(path, ref); },
+      async getGitCommit() { throw new Error("not reached"); },
+      async getTreeAt() { throw new Error("not reached"); },
+      async getBlob() { throw new Error("not reached"); },
+    },
+  }).getCommitChanges({ sha: tip, message: published.message, authorName: "A", authoredAt: "", parentShas: published.parents, source: "plugin", journalId });
+  assert.deepEqual(changes.map(change => ({ kind: change.kind, fileId: change.fileId, path: change.path })), [
+    { kind: "delete", fileId: before.fileId, path: "same.md" },
+    { kind: "create", fileId: after.fileId, path: "same.md" },
+  ]);
+  const target = new MemoryVault();
+  const targetIndex = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "target", mode: "encrypted", pathLayout: "opaque-stable-v1" });
+  await new V4SyncSession({ github, vault: target, index: targetIndex, config: encryptedConfig, keyring: keys, conflictPolicy: "copy", abortChangePercent: 0 }).sync({ operation: "forcePull", allowThresholdOverride: false });
+  assert.equal(dec(target.files.get("same.md")!.bytes), "new content");
 });
 
 test("v4 confirmed Force Push migrates legacy encrypted paths in one commit", async () => {
@@ -682,4 +882,34 @@ test("v4 no-op reuses all 256 unchanged local index shards", async () => {
   assert.equal(result.mode, "noop");
   assert.deepEqual(github.readPaths, [V4_CONFIG_PATH, V4_HEAD_PATH]);
   assert.equal(vault.operations.length, 0);
+});
+
+test("v4 authenticated remote duplicate fileIds are rejected before normal or Force Pull mutation", async () => {
+  const github = new MemoryGitHub();
+  const encryptedConfig: V4RemoteConfig = { formatVersion: V4_FORMAT_VERSION, mode: "encrypted", repoId: "o/r#main", pathLayout: "opaque-stable-v1", algorithm: "AES-GCM", kdf: "PBKDF2-SHA-256", kdfParams: { iterations: 10, salt: "c2FsdA" } };
+  const keys = await deriveV4Keyring({ passphrase: "pass", repoId: "o/r#main", salt: enc("salt"), iterations: 10 });
+  const firstPathId = await (await import("../../src/lib/v4/paths")).pathIdForV4Path(keys.pathKey, "one.md");
+  const secondPathId = await (await import("../../src/lib/v4/paths")).pathIdForV4Path(keys.pathKey, "two.md");
+  const remotePath = await (await import("../../src/lib/v4/paths")).opaqueV4ObjectPath(keys.pathKey, "duplicate-id");
+  const records: V4IndexFileRecord[] = [
+    { path: "one.md", pathId: firstPathId, fileId: "duplicate-id", plaintextSha256: "a".repeat(64), size: 1, mtime: 1, remoteVersion: "v", remotePath, storage: "single" },
+    { path: "two.md", pathId: secondPathId, fileId: "duplicate-id", plaintextSha256: "b".repeat(64), size: 1, mtime: 1, remoteVersion: "v", remotePath, storage: "single" },
+  ];
+  const shardHashes = Object.fromEntries([...new Set(records.map(record => record.pathId.slice(0, 2)))].map(bucket => [bucket, `hash-${bucket}`]));
+  const head: V4RemoteHead = { formatVersion: 4, mode: "encrypted", epoch: 1, generation: 1, journalId: "malicious", shardHashes, updatedAt: 1, deviceId: "attacker" };
+  await publishV4TreeChanges(github, { message: "obsidian-sync-v4:malicious", files: await buildV4RemoteMetadata({ config: encryptedConfig, head, records, keyring: keys }) });
+  const before = { ref: github.ref!.sha, blobs: github.blobs.size, trees: github.trees.size, commits: github.commits.size };
+
+  for (const operation of ["normal", "forcePull"] as const) {
+    const vault = new MemoryVault();
+    vault.files.set("keep.md", { bytes: enc("keep"), mtime: 1 });
+    const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: operation, mode: "encrypted", pathLayout: "opaque-stable-v1" });
+    await assert.rejects(
+      () => new V4SyncSession({ github, vault, index, config: encryptedConfig, keyring: keys, conflictPolicy: "copy", abortChangePercent: 0 }).sync({ operation, allowThresholdOverride: false }),
+      /duplicate.*file.*id/iu,
+    );
+    assert.deepEqual(vault.operations, []);
+    assert.equal(dec(vault.files.get("keep.md")!.bytes), "keep");
+    assert.deepEqual({ ref: github.ref!.sha, blobs: github.blobs.size, trees: github.trees.size, commits: github.commits.size }, before);
+  }
 });

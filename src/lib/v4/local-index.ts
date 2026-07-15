@@ -9,6 +9,7 @@ export interface V4IndexFileRecord {
   mtime: number;
   remoteVersion: string;
   remotePath: string;
+  encryptedPath?: string;
   storage: V4ObjectStorage;
   partPaths?: string[];
   packId?: string;

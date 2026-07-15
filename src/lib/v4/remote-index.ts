@@ -1,12 +1,75 @@
 import { bytesToUtf8, utf8ToBytes } from "../bytes"
 import { decryptV4Payload, encryptV4Payload, type V4Keyring } from "./crypto"
+import { buildV4PartPaths } from "./large-files"
 import type { V4IndexFileRecord } from "./local-index"
-import { V4_CONFIG_PATH, V4_HEAD_PATH, V4_ROOT, type V4RemoteConfig, type V4RemoteHead } from "./protocol-types"
+import { bucketForV4PathId, normalizeV4VaultPath, objectIdForV4File, opaqueV4ObjectPath, opaqueV4PackPath } from "./paths"
+import { effectiveV4PathLayout, V4_CONFIG_PATH, V4_HEAD_PATH, V4_ROOT, type V4RemoteConfig, type V4RemoteHead } from "./protocol-types"
 import type { V4PreparedFile } from "./storage-codec"
 
 export interface V4RemoteShard {
   bucket: string
   records: Record<string, V4IndexFileRecord>
+}
+
+function assertNormalizedRemoteRecord(record: V4IndexFileRecord, config: V4RemoteConfig): void {
+  let normalized: string
+  try {
+    normalized = normalizeV4VaultPath(record.path)
+  } catch (error) {
+    throw new Error(`Unsafe V4 remote record path: ${record.path}`, { cause: error })
+  }
+  if (normalized !== record.path) throw new Error(`V4 remote record path is not normalized: ${record.path}`)
+  if (!record.fileId) throw new Error("V4 remote record has an empty fileId.")
+  if (record.encryptedPath !== undefined && record.encryptedPath !== record.remotePath) throw new Error("V4 encryptedPath does not match remotePath.")
+  if (record.storage === "single") {
+    if (record.partPaths !== undefined || record.packId !== undefined) throw new Error("V4 single storage has inconsistent part or pack descriptors.")
+    if (config.mode === "plaintext" && record.remotePath !== record.path) throw new Error("V4 plaintext single storage path does not match its logical path.")
+    return
+  }
+  if (record.storage === "chunked") {
+    if (!record.partPaths?.length || record.remotePath !== record.partPaths[0] || record.packId !== undefined) {
+      throw new Error("V4 chunked storage has inconsistent part descriptors.")
+    }
+    if (!/^[A-Za-z0-9_-]+$/u.test(record.remoteVersion)) throw new Error("V4 chunked storage has an unsafe remote version.")
+    return
+  }
+  if (record.storage === "pack") {
+    if (config.mode !== "encrypted" || !record.packId || !/^[A-Za-z0-9_-]+$/u.test(record.packId) || record.partPaths !== undefined) {
+      throw new Error("V4 pack storage has inconsistent descriptors.")
+    }
+    return
+  }
+  throw new Error("V4 remote record has an unsupported storage descriptor.")
+}
+
+export function assertV4RemoteShardRecords(shard: V4RemoteShard, bucket: string, config: V4RemoteConfig): void {
+  for (const [recordKey, record] of Object.entries(shard.records)) {
+    if (recordKey !== record.pathId) throw new Error(`V4 shard record key does not match pathId: ${recordKey}`)
+    if (bucketForV4PathId(record.pathId) !== bucket) throw new Error(`V4 record pathId is outside shard bucket: ${bucket}`)
+    assertNormalizedRemoteRecord(record, config)
+  }
+}
+
+export async function assertV4RemoteRecordSet(records: V4IndexFileRecord[], config: V4RemoteConfig, keyring?: V4Keyring): Promise<void> {
+  const fileIds = new Set<string>()
+  for (const record of records) {
+    assertNormalizedRemoteRecord(record, config)
+    if (fileIds.has(record.fileId)) throw new Error(`Duplicate V4 remote fileId: ${record.fileId}`)
+    fileIds.add(record.fileId)
+    if (config.mode !== "encrypted" || effectiveV4PathLayout(config) !== "opaque-stable-v1") continue
+    if (!keyring) throw new Error("Encryption passphrase is required to validate encrypted V4 records.")
+    if (record.storage === "single") {
+      if (record.remotePath !== await opaqueV4ObjectPath(keyring.pathKey, record.fileId)) throw new Error("V4 encrypted single storage path is inconsistent with fileId.")
+      continue
+    }
+    if (record.storage === "chunked") {
+      const opaqueId = await objectIdForV4File(keyring.pathKey, record.fileId)
+      const expected = buildV4PartPaths({ mode: "encrypted", logicalPath: record.path, version: record.remoteVersion, partCount: record.partPaths!.length, opaqueId })
+      if (JSON.stringify(record.partPaths) !== JSON.stringify(expected)) throw new Error("V4 encrypted chunked storage paths are inconsistent with fileId.")
+      continue
+    }
+    if (record.remotePath !== await opaqueV4PackPath(keyring.pathKey, record.packId!)) throw new Error("V4 encrypted pack storage path is inconsistent with packId.")
+  }
 }
 
 export function v4RemoteShardPath(bucket: string, mode: V4RemoteConfig["mode"]): string {
@@ -78,6 +141,7 @@ export async function decodeV4RemoteShard(
 ): Promise<V4RemoteShard> {
   const shard = await decodeMetadata<V4RemoteShard>(bytes, config, keyring, "index", `${config.repoId}:${bucket}`)
   if (shard.bucket !== bucket) throw new Error(`V4 shard bucket mismatch: ${bucket}`)
+  assertV4RemoteShardRecords(shard, bucket, config)
   return shard
 }
 

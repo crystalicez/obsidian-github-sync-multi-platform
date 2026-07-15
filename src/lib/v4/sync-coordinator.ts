@@ -4,6 +4,7 @@ import type { V4SyncOperation } from "./planner";
 export type V4SyncTrigger = "startup" | "localChange" | "scheduled" | "manual" | "forcePush" | "forcePull";
 export type V4QueuedChange =
   | { type: "modify"; path: string; mtime: number }
+  | { type: "replace"; path: string; mtime: number }
   | { type: "delete"; path: string; mtime: number }
   | { type: "rename"; oldPath: string; path: string; mtime: number }
   | { type: "folderRename"; oldPath: string; path: string; mtime: number }
@@ -64,6 +65,10 @@ export function coalesceV4Changes(changes: V4QueuedChange[]): V4QueuedChange[] {
     const previous = byPath.get(change.path);
     if (previous?.type === "rename") {
       byPath.set(change.path, { ...previous, mtime: Math.max(previous.mtime, change.mtime) });
+      continue;
+    }
+    if (change.type === "modify" && (previous?.type === "delete" || previous?.type === "replace")) {
+      byPath.set(change.path, { type: "replace", path: change.path, mtime: Math.max(previous.mtime, change.mtime) });
       continue;
     }
     byPath.set(change.path, { ...change });

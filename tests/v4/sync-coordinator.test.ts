@@ -109,7 +109,7 @@ test("v4 coordinator does not let a scheduled tick cut short a pending local deb
   assert.deepEqual(executions, ["localChange:1"]);
 });
 
-test("v4 coalescing follows the final filesystem state for replacement and rename-delete sequences", async () => {
+test("v4 coalescing preserves identity discontinuity for replacement and rename-delete sequences", async () => {
   const executions: V4QueuedChange[][] = [];
   const coordinator = new V4SyncCoordinator({ execute: async (_request, changes) => { executions.push(changes); return { changedFiles: changes.length }; } });
 
@@ -122,7 +122,7 @@ test("v4 coalescing follows the final filesystem state for replacement and renam
   await coordinator.run({ operation: "normal", trigger: "manual" });
 
   assert.deepEqual(executions, [
-    [{ type: "modify", path: "replaced.md", mtime: 2 }],
+    [{ type: "replace", path: "replaced.md", mtime: 2 }],
     [{ type: "delete", path: "old.md", mtime: 4 }],
   ]);
 });
