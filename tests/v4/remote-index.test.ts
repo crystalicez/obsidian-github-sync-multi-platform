@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { sha256Hex } from "../../src/lib/bytes";
 import { deriveV4Keyring } from "../../src/lib/v4/crypto";
-import { buildV4RemoteMetadata, decodeV4RemoteConfig, decodeV4RemoteHead, decodeV4RemoteShard, encodeV4RemoteConfig } from "../../src/lib/v4/remote-index";
+import { assertV4RemoteRecordSet, buildV4RemoteMetadata, decodeV4RemoteConfig, decodeV4RemoteHead, decodeV4RemoteShard, encodeV4RemoteConfig } from "../../src/lib/v4/remote-index";
 import { expectedV4PathLayout, V4_FORMAT_VERSION, type V4RemoteConfig, type V4RemoteHead } from "../../src/lib/v4/protocol-types";
 
 const enc = (value: string) => new TextEncoder().encode(value);
@@ -67,4 +68,18 @@ test("v4 remote shard rejects inconsistent storage descriptors", async () => {
     () => decodeV4RemoteShard(enc(JSON.stringify({ bucket: "aa", records: { [pathId]: record } })), "aa", config),
     /chunked|storage|parts/iu,
   );
+});
+
+test("v4 complete remote record validation rejects duplicate logical paths", async () => {
+  const config: V4RemoteConfig = { formatVersion: 4, mode: "plaintext", repoId: "o/r#main", pathLayout: "plaintext-v1" };
+  const path = "duplicate.md";
+  const pathId = await sha256Hex(enc(`path:${path}`));
+  const base = { path, pathId, plaintextSha256: "a".repeat(64), size: 1, mtime: 1, remoteVersion: "v", remotePath: path, storage: "single" as const };
+  await assert.rejects(() => assertV4RemoteRecordSet([{ ...base, fileId: "first" }, { ...base, fileId: "second" }], config), /duplicate.*path/iu);
+});
+
+test("v4 complete remote record validation rejects pathId not derived from logical path", async () => {
+  const config: V4RemoteConfig = { formatVersion: 4, mode: "plaintext", repoId: "o/r#main", pathLayout: "plaintext-v1" };
+  const record = { path: "note.md", pathId: "ff".repeat(32), fileId: "file", plaintextSha256: "a".repeat(64), size: 1, mtime: 1, remoteVersion: "v", remotePath: "note.md", storage: "single" as const };
+  await assert.rejects(() => assertV4RemoteRecordSet([record], config), /path.*id|logical path/iu);
 });

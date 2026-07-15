@@ -130,7 +130,7 @@ export class V4PluginRuntime {
     }
     if (this.plugin.ignoredFiles.has(change.path)) return
     try {
-      const oldPath = change.type === "rename" || change.type === "folderRename" ? change.oldPath : undefined
+      const oldPath = change.type === "rename" || change.type === "replace" || change.type === "folderRename" ? change.oldPath : undefined
       if (!this.inScope(change.path) && (!oldPath || !this.inScope(oldPath))) return
     } catch (error) {
       new Notice(`GitHub Sync: Invalid ignore regex: ${(error as Error).message}`)
@@ -263,9 +263,10 @@ export class V4PluginRuntime {
           const index = await this.loadIndex(config)
           const previousShardHashes = { ...index.shardHashes }
           const passphrase = this.plugin.settings.encryptionPassphrase
-          if (config.mode === "encrypted" && !passphrase) throw new Error("Encryption passphrase is required.")
-          const keyring = config.mode === "encrypted"
-            ? await deriveV4Keyring({ passphrase, repoId: config.repoId, salt: fromBase64Url(config.kdfParams!.salt), iterations: config.kdfParams!.iterations })
+          const authenticationConfig = discovered.mode === "encrypted" ? discovered : config.mode === "encrypted" ? config : null
+          if (authenticationConfig && !passphrase) throw new Error("Encryption passphrase is required.")
+          const keyring = authenticationConfig
+            ? await deriveV4Keyring({ passphrase, repoId: authenticationConfig.repoId, salt: fromBase64Url(authenticationConfig.kdfParams!.salt), iterations: authenticationConfig.kdfParams!.iterations })
             : undefined
           const inScope = this.scopePredicate()
           const result = await new V4SyncSession({

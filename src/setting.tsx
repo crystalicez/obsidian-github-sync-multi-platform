@@ -309,7 +309,7 @@ export class SettingTab extends PluginSettingTab {
 
     new Setting(set)
       .setName("Encrypted sync")
-      .setDesc("Encrypt file contents and basenames before uploading to GitHub. Folder paths remain readable.")
+      .setDesc("Encrypted mode hides directory names, filenames, extensions, and content behind stable opaque objects.")
       .addToggle((toggle) =>
         toggle.setValue(this.tempSettings!.encryptionMode === "encrypted").onChange((value) => {
           this.tempSettings!.encryptionMode = value ? "encrypted" : "plaintext"

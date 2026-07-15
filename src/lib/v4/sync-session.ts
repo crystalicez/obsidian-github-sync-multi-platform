@@ -553,7 +553,7 @@ export class V4SyncSession {
       for (const change of pathChanges) {
         if (change.type === "delete") { byPath.delete(change.path); continue }
         const previous = change.type === "replace" ? undefined : change.type === "rename" ? byPath.get(change.oldPath) : byPath.get(change.path)
-        if (change.type === "replace") byPath.delete(change.path)
+        if (change.type === "replace") { byPath.delete(change.oldPath); byPath.delete(change.path) }
         if (change.type === "rename") byPath.delete(change.oldPath)
         const stat = await this.input.vault.stat(change.path)
         if (!stat) { byPath.delete(change.path); continue }
@@ -571,6 +571,7 @@ export class V4SyncSession {
     const identityByPath = new Map(baseRecords.map(record => [record.path, record]))
     for (const change of changes) {
       if (change.type === "replace") {
+        identityByPath.delete(change.oldPath)
         identityByPath.delete(change.path)
         continue
       }

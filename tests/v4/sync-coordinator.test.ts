@@ -122,8 +122,18 @@ test("v4 coalescing preserves identity discontinuity for replacement and rename-
   await coordinator.run({ operation: "normal", trigger: "manual" });
 
   assert.deepEqual(executions, [
-    [{ type: "replace", path: "replaced.md", mtime: 2 }],
+    [{ type: "replace", oldPath: "replaced.md", path: "replaced.md", mtime: 2 }],
     [{ type: "delete", path: "old.md", mtime: 4 }],
+  ]);
+});
+
+test("v4 coalescing preserves replacement identity break through a subsequent rename", () => {
+  assert.deepEqual(coalesceV4Changes([
+    { type: "delete", path: "A.md", mtime: 1 },
+    { type: "modify", path: "A.md", mtime: 2 },
+    { type: "rename", oldPath: "A.md", path: "B.md", mtime: 3 },
+  ]), [
+    { type: "replace", oldPath: "A.md", path: "B.md", mtime: 3 },
   ]);
 });
 

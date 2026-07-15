@@ -4,7 +4,7 @@ import type { V4SyncOperation } from "./planner";
 export type V4SyncTrigger = "startup" | "localChange" | "scheduled" | "manual" | "forcePush" | "forcePull";
 export type V4QueuedChange =
   | { type: "modify"; path: string; mtime: number }
-  | { type: "replace"; path: string; mtime: number }
+  | { type: "replace"; oldPath: string; path: string; mtime: number }
   | { type: "delete"; path: string; mtime: number }
   | { type: "rename"; oldPath: string; path: string; mtime: number }
   | { type: "folderRename"; oldPath: string; path: string; mtime: number }
@@ -36,7 +36,7 @@ export function coalesceV4Changes(changes: V4QueuedChange[]): V4QueuedChange[] {
   const byPath = new Map<string | symbol, V4QueuedChange>();
   const pathChanges = changes.filter((change): change is V4PathChange => change.type !== "rescan");
   for (const raw of pathChanges) {
-    const change: V4PathChange = raw.type === "rename" || raw.type === "folderRename"
+    const change: V4PathChange = raw.type === "rename" || raw.type === "replace" || raw.type === "folderRename"
       ? { ...raw, oldPath: normalizeV4VaultPath(raw.oldPath), path: normalizeV4VaultPath(raw.path) }
       : { ...raw, path: normalizeV4VaultPath(raw.path) };
     if (change.type === "folderRename") {
@@ -45,6 +45,12 @@ export function coalesceV4Changes(changes: V4QueuedChange[]): V4QueuedChange[] {
     }
     if (change.type === "rename") {
       const previous = byPath.get(change.oldPath);
+      if (previous?.type === "replace") {
+        byPath.delete(change.oldPath);
+        byPath.delete(change.path);
+        byPath.set(change.path, { type: "replace", oldPath: previous.oldPath, path: change.path, mtime: Math.max(change.mtime, previous.mtime) });
+        continue;
+      }
       const oldPath = previous?.type === change.type ? previous.oldPath : change.oldPath;
       byPath.delete(change.oldPath);
       byPath.delete(change.path);
@@ -53,6 +59,11 @@ export function coalesceV4Changes(changes: V4QueuedChange[]): V4QueuedChange[] {
     }
     if (change.type === "delete" || change.type === "folderDelete") {
       const previous = byPath.get(change.path);
+      if (change.type === "delete" && previous?.type === "replace") {
+        byPath.delete(change.path);
+        byPath.set(previous.oldPath, { type: "delete", path: previous.oldPath, mtime: Math.max(previous.mtime, change.mtime) });
+        continue;
+      }
       const renameType = change.type === "delete" ? "rename" : "folderRename";
       if (previous?.type === renameType) {
         byPath.delete(change.path);
@@ -68,7 +79,7 @@ export function coalesceV4Changes(changes: V4QueuedChange[]): V4QueuedChange[] {
       continue;
     }
     if (change.type === "modify" && (previous?.type === "delete" || previous?.type === "replace")) {
-      byPath.set(change.path, { type: "replace", path: change.path, mtime: Math.max(previous.mtime, change.mtime) });
+      byPath.set(change.path, { type: "replace", oldPath: previous.type === "replace" ? previous.oldPath : change.path, path: change.path, mtime: Math.max(previous.mtime, change.mtime) });
       continue;
     }
     byPath.set(change.path, { ...change });

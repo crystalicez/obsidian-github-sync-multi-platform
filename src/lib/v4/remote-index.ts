@@ -1,8 +1,8 @@
-import { bytesToUtf8, utf8ToBytes } from "../bytes"
+import { bytesToUtf8, sha256Hex, utf8ToBytes } from "../bytes"
 import { decryptV4Payload, encryptV4Payload, type V4Keyring } from "./crypto"
 import { buildV4PartPaths } from "./large-files"
 import type { V4IndexFileRecord } from "./local-index"
-import { bucketForV4PathId, normalizeV4VaultPath, objectIdForV4File, opaqueV4ObjectPath, opaqueV4PackPath } from "./paths"
+import { bucketForV4PathId, normalizeV4VaultPath, objectIdForV4File, opaqueV4ObjectPath, opaqueV4PackPath, pathIdForV4Path } from "./paths"
 import { effectiveV4PathLayout, V4_CONFIG_PATH, V4_HEAD_PATH, V4_ROOT, type V4RemoteConfig, type V4RemoteHead } from "./protocol-types"
 import type { V4PreparedFile } from "./storage-codec"
 
@@ -20,7 +20,17 @@ function assertNormalizedRemoteRecord(record: V4IndexFileRecord, config: V4Remot
   }
   if (normalized !== record.path) throw new Error(`V4 remote record path is not normalized: ${record.path}`)
   if (!record.fileId) throw new Error("V4 remote record has an empty fileId.")
-  if (record.encryptedPath !== undefined && record.encryptedPath !== record.remotePath) throw new Error("V4 encryptedPath does not match remotePath.")
+  if (record.encryptedPath !== undefined && record.encryptedPath !== record.remotePath) {
+    const legacyPackedArtifact = effectiveV4PathLayout(config) === "encrypted-folders-v0"
+      && record.storage === "pack"
+      && normalizeV4VaultPath(record.encryptedPath) === record.encryptedPath
+      && normalizeV4VaultPath(record.remotePath) === record.remotePath
+      && record.encryptedPath.startsWith(`${V4_ROOT}/data/`)
+      && record.remotePath.startsWith(`${V4_ROOT}/packs/`)
+      && record.encryptedPath.endsWith(".enc")
+      && record.remotePath.endsWith(".enc")
+    if (!legacyPackedArtifact) throw new Error("V4 encryptedPath does not match remotePath.")
+  }
   if (record.storage === "single") {
     if (record.partPaths !== undefined || record.packId !== undefined) throw new Error("V4 single storage has inconsistent part or pack descriptors.")
     if (config.mode === "plaintext" && record.remotePath !== record.path) throw new Error("V4 plaintext single storage path does not match its logical path.")
@@ -52,23 +62,31 @@ export function assertV4RemoteShardRecords(shard: V4RemoteShard, bucket: string,
 
 export async function assertV4RemoteRecordSet(records: V4IndexFileRecord[], config: V4RemoteConfig, keyring?: V4Keyring): Promise<void> {
   const fileIds = new Set<string>()
+  const logicalPaths = new Set<string>()
   for (const record of records) {
     assertNormalizedRemoteRecord(record, config)
     if (fileIds.has(record.fileId)) throw new Error(`Duplicate V4 remote fileId: ${record.fileId}`)
     fileIds.add(record.fileId)
+    if (logicalPaths.has(record.path)) throw new Error(`Duplicate V4 remote logical path: ${record.path}`)
+    logicalPaths.add(record.path)
+    if (config.mode === "encrypted" && !keyring) throw new Error("Encryption passphrase is required to validate encrypted V4 records.")
+    const expectedPathId = config.mode === "encrypted"
+      ? await pathIdForV4Path(keyring!.pathKey, record.path)
+      : await sha256Hex(utf8ToBytes(`path:${record.path}`))
+    if (record.pathId !== expectedPathId) throw new Error(`V4 remote pathId does not match logical path: ${record.path}`)
     if (config.mode !== "encrypted" || effectiveV4PathLayout(config) !== "opaque-stable-v1") continue
-    if (!keyring) throw new Error("Encryption passphrase is required to validate encrypted V4 records.")
+    const opaqueKeyring = keyring!
     if (record.storage === "single") {
-      if (record.remotePath !== await opaqueV4ObjectPath(keyring.pathKey, record.fileId)) throw new Error("V4 encrypted single storage path is inconsistent with fileId.")
+      if (record.remotePath !== await opaqueV4ObjectPath(opaqueKeyring.pathKey, record.fileId)) throw new Error("V4 encrypted single storage path is inconsistent with fileId.")
       continue
     }
     if (record.storage === "chunked") {
-      const opaqueId = await objectIdForV4File(keyring.pathKey, record.fileId)
+      const opaqueId = await objectIdForV4File(opaqueKeyring.pathKey, record.fileId)
       const expected = buildV4PartPaths({ mode: "encrypted", logicalPath: record.path, version: record.remoteVersion, partCount: record.partPaths!.length, opaqueId })
       if (JSON.stringify(record.partPaths) !== JSON.stringify(expected)) throw new Error("V4 encrypted chunked storage paths are inconsistent with fileId.")
       continue
     }
-    if (record.remotePath !== await opaqueV4PackPath(keyring.pathKey, record.packId!)) throw new Error("V4 encrypted pack storage path is inconsistent with packId.")
+    if (record.remotePath !== await opaqueV4PackPath(opaqueKeyring.pathKey, record.packId!)) throw new Error("V4 encrypted pack storage path is inconsistent with packId.")
   }
 }
 
