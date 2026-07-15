@@ -501,7 +501,129 @@ for (const mode of ["plaintext", "encrypted"] as const) {
     assert.equal(indexRecordByPath(pulled.index, "Moved/a.md").fileId, afterA.fileId);
     assert.equal(indexRecordByPath(pulled.index, "Moved/sub/b.md").fileId, beforeB.fileId);
   });
+
+  test(`v4 ${mode} unknown-base coalesced file rename cycle invokes conflict policy without overwriting remote`, async () => {
+    const fixture = await queuedUnknownBaseFixture(mode, [["A.md", "remote-newer"]], [["A.md", "local-stale"]]);
+    fixture.vault.files.get("A.md")!.mtime = 10;
+    const before = fixture.remoteRecords["A.md"];
+    const remoteObjectBefore = new Uint8Array(fixture.github.files.get(before.remotePath)!);
+    const commitBefore = fixture.github.ref!.sha;
+    const commitsBefore = fixture.github.commits.size;
+    const journalPathsBefore = [...fixture.github.files.keys()].filter(path => path.startsWith(`${V4_ROOT}/journals/`)).sort();
+    const changes = coalesceV4Changes([
+      { type: "rename", oldPath: "A.md", path: "B.md", mtime: 29 },
+      { type: "rename", oldPath: "B.md", path: "A.md", mtime: 30 },
+    ]);
+    assert.deepEqual(changes, [{ type: "rename", oldPath: "A.md", path: "A.md", mtime: 30 }]);
+    const asked: Array<{ path: string; localMtime: number; remoteMtime: number }> = [];
+
+    const result = await new V4SyncSession({
+      github: fixture.github,
+      vault: fixture.vault,
+      index: fixture.index,
+      config: fixture.remoteConfig,
+      keyring: fixture.keyring,
+      conflictPolicy: "ask",
+      askConflict: async input => { asked.push(input); return { action: "use-remote" }; },
+      abortChangePercent: 0,
+    }).sync({ operation: "normal", allowThresholdOverride: false, changes });
+
+    assert.equal(result.mode, "pull");
+    assert.deepEqual(asked, [{ path: "A.md", localMtime: 10, remoteMtime: 20 }]);
+    assert.equal(fixture.github.ref!.sha, commitBefore);
+    assert.equal(fixture.github.commits.size, commitsBefore);
+    assert.deepEqual([...fixture.github.files.keys()].filter(path => path.startsWith(`${V4_ROOT}/journals/`)).sort(), journalPathsBefore);
+    assert.deepEqual(fixture.github.files.get(before.remotePath), remoteObjectBefore);
+    assert.equal(dec(fixture.vault.files.get("A.md")!.bytes), "remote-newer");
+    assert.equal(indexRecordByPath(fixture.index, "A.md").fileId, before.fileId);
+    const pulled = await forcePullQueuedFixture(fixture);
+    assert.equal(dec(pulled.vault.files.get("A.md")!.bytes), "remote-newer");
+    assert.equal(indexRecordByPath(pulled.index, "A.md").fileId, before.fileId);
+  });
+
+  test(`v4 ${mode} unknown-base unchanged file rename cycle no-ops and preserves identity`, async () => {
+    const fixture = await queuedUnknownBaseFixture(mode, [["A.md", "same-content"]], [["A.md", "same-content"]]);
+    const before = fixture.remoteRecords["A.md"];
+    const remoteObjectBefore = new Uint8Array(fixture.github.files.get(before.remotePath)!);
+    const commitBefore = fixture.github.ref!.sha;
+    const journalPathsBefore = [...fixture.github.files.keys()].filter(path => path.startsWith(`${V4_ROOT}/journals/`)).sort();
+    const changes = coalesceV4Changes([
+      { type: "rename", oldPath: "A.md", path: "B.md", mtime: 29 },
+      { type: "rename", oldPath: "B.md", path: "A.md", mtime: 30 },
+    ]);
+
+    const result = await new V4SyncSession({
+      github: fixture.github,
+      vault: fixture.vault,
+      index: fixture.index,
+      config: fixture.remoteConfig,
+      keyring: fixture.keyring,
+      conflictPolicy: "ask",
+      askConflict: async () => { throw new Error("unchanged rename cycle must not conflict"); },
+      abortChangePercent: 0,
+    }).sync({ operation: "normal", allowThresholdOverride: false, changes });
+
+    assert.equal(result.mode, "noop");
+    assert.equal(fixture.github.ref!.sha, commitBefore);
+    assert.deepEqual([...fixture.github.files.keys()].filter(path => path.startsWith(`${V4_ROOT}/journals/`)).sort(), journalPathsBefore);
+    assert.deepEqual(fixture.github.files.get(before.remotePath), remoteObjectBefore);
+    assert.equal(indexRecordByPath(fixture.index, "A.md").fileId, before.fileId);
+    const pulled = await forcePullQueuedFixture(fixture);
+    assert.equal(dec(pulled.vault.files.get("A.md")!.bytes), "same-content");
+    assert.equal(indexRecordByPath(pulled.index, "A.md").fileId, before.fileId);
+  });
 }
+
+test("v4 encrypted unknown-base folder rename cycle applies conflict policy to surviving descendants", async () => {
+  const fixture = await queuedUnknownBaseFixture("encrypted",
+    [["A/divergent.md", "remote-newer"], ["A/sub/unchanged.md", "same-content"]],
+    [["A/divergent.md", "local-stale"], ["A/sub/unchanged.md", "same-content"]]);
+  fixture.vault.files.get("A/divergent.md")!.mtime = 10;
+  const divergentBefore = fixture.remoteRecords["A/divergent.md"];
+  const unchangedBefore = fixture.remoteRecords["A/sub/unchanged.md"];
+  const divergentObjectBefore = new Uint8Array(fixture.github.files.get(divergentBefore.remotePath)!);
+  const unchangedObjectBefore = new Uint8Array(fixture.github.files.get(unchangedBefore.remotePath)!);
+  const commitBefore = fixture.github.ref!.sha;
+  const commitsBefore = fixture.github.commits.size;
+  const journalPathsBefore = [...fixture.github.files.keys()].filter(path => path.startsWith(`${V4_ROOT}/journals/`)).sort();
+  const changes = coalesceV4Changes([
+    { type: "folderRename", oldPath: "A", path: "B", mtime: 29 },
+    { type: "folderRename", oldPath: "B", path: "A", mtime: 30 },
+  ]);
+  assert.deepEqual(changes, [
+    { type: "folderRename", oldPath: "A", path: "B", mtime: 29 },
+    { type: "folderRename", oldPath: "B", path: "A", mtime: 30 },
+  ]);
+  const asked: string[] = [];
+
+  const result = await new V4SyncSession({
+    github: fixture.github,
+    vault: fixture.vault,
+    index: fixture.index,
+    config: fixture.remoteConfig,
+    keyring: fixture.keyring,
+    conflictPolicy: "ask",
+    askConflict: async input => { asked.push(input.path); return { action: "use-remote" }; },
+    abortChangePercent: 0,
+  }).sync({ operation: "normal", allowThresholdOverride: false, changes });
+
+  assert.equal(result.mode, "pull");
+  assert.deepEqual(asked, ["A/divergent.md"]);
+  assert.equal(fixture.github.ref!.sha, commitBefore);
+  assert.equal(fixture.github.commits.size, commitsBefore);
+  assert.deepEqual([...fixture.github.files.keys()].filter(path => path.startsWith(`${V4_ROOT}/journals/`)).sort(), journalPathsBefore);
+  assert.deepEqual(fixture.github.files.get(divergentBefore.remotePath), divergentObjectBefore);
+  assert.deepEqual(fixture.github.files.get(unchangedBefore.remotePath), unchangedObjectBefore);
+  assert.equal(dec(fixture.vault.files.get("A/divergent.md")!.bytes), "remote-newer");
+  assert.equal(dec(fixture.vault.files.get("A/sub/unchanged.md")!.bytes), "same-content");
+  assert.equal(indexRecordByPath(fixture.index, "A/divergent.md").fileId, divergentBefore.fileId);
+  assert.equal(indexRecordByPath(fixture.index, "A/sub/unchanged.md").fileId, unchangedBefore.fileId);
+  const pulled = await forcePullQueuedFixture(fixture);
+  assert.equal(dec(pulled.vault.files.get("A/divergent.md")!.bytes), "remote-newer");
+  assert.equal(dec(pulled.vault.files.get("A/sub/unchanged.md")!.bytes), "same-content");
+  assert.equal(indexRecordByPath(pulled.index, "A/divergent.md").fileId, divergentBefore.fileId);
+  assert.equal(indexRecordByPath(pulled.index, "A/sub/unchanged.md").fileId, unchangedBefore.fileId);
+});
 
 test("v4 rejects legacy encrypted layout except for Force Push migration", () => {
   const legacy = { formatVersion: 4 as const, mode: "encrypted" as const, repoId: "o/r#main" };

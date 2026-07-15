@@ -142,6 +142,7 @@ function causalIdentityState(records: V4IndexFileRecord[], changes: V4QueuedChan
 } {
   const identities = new Map(records.map(record => [record.path, record]))
   const touched = new Map<string, V4IndexFileRecord>()
+  const passedThroughRenameFileIds = new Set<string>()
   const atOrBelow = (path: string, root: string) => path === root || path.startsWith(`${root}/`)
   const remove = (path: string) => {
     const record = identities.get(path)
@@ -163,6 +164,7 @@ function causalIdentityState(records: V4IndexFileRecord[], changes: V4QueuedChan
       remove(change.oldPath)
       remove(change.path)
       if (record) {
+        passedThroughRenameFileIds.add(record.fileId)
         identities.set(change.path, record)
       }
       continue
@@ -176,6 +178,7 @@ function causalIdentityState(records: V4IndexFileRecord[], changes: V4QueuedChan
     for (const [path, record] of [...identities]) {
       if (!atOrBelow(path, change.oldPath)) continue
       remove(path)
+      passedThroughRenameFileIds.add(record.fileId)
       moved.push([`${change.path}${path.slice(change.oldPath.length)}`, record])
     }
     for (const path of [...identities.keys()]) if (atOrBelow(path, change.path)) remove(path)
@@ -184,9 +187,9 @@ function causalIdentityState(records: V4IndexFileRecord[], changes: V4QueuedChan
   return {
     identityByPath: new Map([...identities].map(([path, record]) => [path, record.fileId])),
     touchedBaseRecords: [...touched.values()],
-    survivingCausallyRenamedFileIds: new Set([...identities]
-      .filter(([path, record]) => path !== record.path)
-      .map(([, record]) => record.fileId)),
+    survivingCausallyRenamedFileIds: new Set([...identities.values()]
+      .filter(record => passedThroughRenameFileIds.has(record.fileId))
+      .map(record => record.fileId)),
   }
 }
 
