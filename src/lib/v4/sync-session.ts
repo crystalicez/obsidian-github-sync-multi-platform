@@ -138,11 +138,10 @@ function journalPath(journalId: string, page: number, encrypted: boolean): strin
 function causalIdentityState(records: V4IndexFileRecord[], changes: V4QueuedChange[]): {
   identityByPath: Map<string, string>
   touchedBaseRecords: V4IndexFileRecord[]
-  causallyRenamedFileIds: Set<string>
+  survivingCausallyRenamedFileIds: Set<string>
 } {
   const identities = new Map(records.map(record => [record.path, record]))
   const touched = new Map<string, V4IndexFileRecord>()
-  const causallyRenamedFileIds = new Set<string>()
   const atOrBelow = (path: string, root: string) => path === root || path.startsWith(`${root}/`)
   const remove = (path: string) => {
     const record = identities.get(path)
@@ -164,7 +163,6 @@ function causalIdentityState(records: V4IndexFileRecord[], changes: V4QueuedChan
       remove(change.oldPath)
       remove(change.path)
       if (record) {
-        causallyRenamedFileIds.add(record.fileId)
         identities.set(change.path, record)
       }
       continue
@@ -178,7 +176,6 @@ function causalIdentityState(records: V4IndexFileRecord[], changes: V4QueuedChan
     for (const [path, record] of [...identities]) {
       if (!atOrBelow(path, change.oldPath)) continue
       remove(path)
-      causallyRenamedFileIds.add(record.fileId)
       moved.push([`${change.path}${path.slice(change.oldPath.length)}`, record])
     }
     for (const path of [...identities.keys()]) if (atOrBelow(path, change.path)) remove(path)
@@ -187,7 +184,9 @@ function causalIdentityState(records: V4IndexFileRecord[], changes: V4QueuedChan
   return {
     identityByPath: new Map([...identities].map(([path, record]) => [path, record.fileId])),
     touchedBaseRecords: [...touched.values()],
-    causallyRenamedFileIds,
+    survivingCausallyRenamedFileIds: new Set([...identities]
+      .filter(([path, record]) => path !== record.path)
+      .map(([, record]) => record.fileId)),
   }
 }
 
@@ -266,7 +265,7 @@ export class V4SyncSession {
     const causalState = isLayoutMigration || !hasKnownBase
       ? causalIdentityState(remoteRecords, options.changes ?? [])
       : undefined
-    const scanBaseRecords = isLayoutMigration
+    const identityBaseRecords = isLayoutMigration
       ? []
       : hasKnownBase
         ? recordsFromIndex(this.input.index)
@@ -274,12 +273,12 @@ export class V4SyncSession {
           ? causalState!.touchedBaseRecords
           : []
     const identitySeedByPath = causalState?.identityByPath
-    const localFiles = (await this.scanLocal(scanBaseRecords, options.changes ?? [], identitySeedByPath)).filter(file => includePath(file.path))
+    const localFiles = (await this.scanLocal(identityBaseRecords, options.changes ?? [], identitySeedByPath)).filter(file => includePath(file.path))
     const localById = new Map(localFiles.map(file => [file.fileId, file]))
     const baseRecords = !hasKnownBase && options.operation === "normal" && causalState
-      ? scanBaseRecords.filter(record => !causalState.causallyRenamedFileIds.has(record.fileId)
+      ? identityBaseRecords.filter(record => !causalState.survivingCausallyRenamedFileIds.has(record.fileId)
         || localById.get(record.fileId)?.hash === record.plaintextSha256)
-      : scanBaseRecords
+      : identityBaseRecords.filter(record => includePath(record.path))
     assertNoCaseInsensitiveCollisions(localFiles)
     assertNoCaseInsensitiveCollisions(logical(remoteRecords))
     const plan = planV4Sync({
@@ -373,7 +372,7 @@ export class V4SyncSession {
       return { mode: options.operation === "forcePull" ? "force-pull" : "pull", operation: options.operation, changedFiles, pushedFiles: 0, pulledFiles }
     }
 
-    const latestLocal = new Map((await this.scanLocal(baseRecords, options.changes ?? [], identitySeedByPath)).map(file => [file.fileId, file]))
+    const latestLocal = new Map((await this.scanLocal(identityBaseRecords, options.changes ?? [], identitySeedByPath)).map(file => [file.fileId, file]))
     const files: Array<{ path: string; bytes: Uint8Array }> = []
     const deletions = new Set<string>()
     const journalChanges: V4JournalChange[] = []

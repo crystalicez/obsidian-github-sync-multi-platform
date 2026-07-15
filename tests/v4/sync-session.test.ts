@@ -5,7 +5,7 @@ import type { GitHubCreateTreeEntry } from "../../src/lib/github-git-types";
 import { V4HistoryService } from "../../src/lib/v4/history-service";
 import type { V4JournalChange } from "../../src/lib/v4/history-journal";
 import { createEmptyV4LocalIndex, type V4IndexFileRecord, type V4LocalIndex } from "../../src/lib/v4/local-index";
-import { assertV4PathLayoutCompatible, V4SyncSession, type V4SessionVault } from "../../src/lib/v4/sync-session";
+import { assertV4PathLayoutCompatible, V4ChangeGuardError, V4SyncSession, type V4SessionVault } from "../../src/lib/v4/sync-session";
 import { coalesceV4Changes, type V4QueuedChange } from "../../src/lib/v4/sync-coordinator";
 import { V4_CONFIG_PATH, V4_FORMAT_VERSION, V4_HEAD_PATH, V4_ROOT, type V4RemoteConfig, type V4RemoteHead } from "../../src/lib/v4/protocol-types";
 import { decryptV4Payload, deriveV4Keyring, encryptV4Payload } from "../../src/lib/v4/crypto";
@@ -405,6 +405,102 @@ for (const mode of ["plaintext", "encrypted"] as const) {
     assert.equal(indexRecordByPath(pulled.index, "Moved/a.md").fileId, beforeA.fileId);
     assert.equal(indexRecordByPath(pulled.index, "Moved/sub/b.md").fileId, beforeB.fileId);
   });
+
+  test(`v4 ${mode} unknown-base queued folder rename then delete removes every terminal identity`, async () => {
+    const fixture = await queuedUnknownBaseFixture(mode,
+      [["Folder/a.md", "a-content"], ["Folder/sub/b.md", "b-content"]],
+      []);
+    const beforeA = fixture.remoteRecords["Folder/a.md"];
+    const beforeB = fixture.remoteRecords["Folder/sub/b.md"];
+
+    const result = await new V4SyncSession({ github: fixture.github, vault: fixture.vault, index: fixture.index, config: fixture.remoteConfig, keyring: fixture.keyring, conflictPolicy: "ask", abortChangePercent: 0 })
+      .sync({ operation: "normal", allowThresholdOverride: false, changes: [
+        { type: "folderRename", oldPath: "Folder", path: "Moved", mtime: 29 },
+        { type: "folderDelete", path: "Moved", mtime: 30 },
+      ] });
+
+    assert.equal(result.mode, "push");
+    const finalRecords = Object.values(fixture.index.shards).flatMap(shard => Object.values(shard.records)).filter(record => !record.deleted);
+    assert.deepEqual(finalRecords, []);
+    assert.equal(fixture.github.files.has(beforeA.remotePath), false);
+    assert.equal(fixture.github.files.has(beforeB.remotePath), false);
+    const changes = (await latestJournalChanges(fixture)).map(change => ({ fileId: change.fileId, kind: change.kind, path: change.path, hasBefore: !!change.before, hasAfter: !!change.after }))
+      .sort((left, right) => left.path.localeCompare(right.path));
+    assert.deepEqual(changes, [
+      { fileId: beforeA.fileId, kind: "delete", path: "Folder/a.md", hasBefore: true, hasAfter: false },
+      { fileId: beforeB.fileId, kind: "delete", path: "Folder/sub/b.md", hasBefore: true, hasAfter: false },
+    ]);
+    const pulled = await forcePullQueuedFixture(fixture);
+    assert.deepEqual([...pulled.vault.files.keys()], []);
+  });
+
+  test(`v4 ${mode} unknown-base queued folder rename then descendant delete preserves the surviving identity`, async () => {
+    const fixture = await queuedUnknownBaseFixture(mode,
+      [["Folder/a.md", "delete-me"], ["Folder/sub/b.md", "keep-me"]],
+      [["Moved/sub/b.md", "keep-me"]]);
+    const beforeA = fixture.remoteRecords["Folder/a.md"];
+    const beforeB = fixture.remoteRecords["Folder/sub/b.md"];
+
+    const result = await new V4SyncSession({ github: fixture.github, vault: fixture.vault, index: fixture.index, config: fixture.remoteConfig, keyring: fixture.keyring, conflictPolicy: "ask", abortChangePercent: 0 })
+      .sync({ operation: "normal", allowThresholdOverride: false, changes: [
+        { type: "folderRename", oldPath: "Folder", path: "Moved", mtime: 29 },
+        { type: "delete", path: "Moved/a.md", mtime: 30 },
+      ] });
+
+    assert.equal(result.mode, "push");
+    assert.equal(fixture.github.files.has(beforeA.remotePath), false);
+    const afterB = indexRecordByPath(fixture.index, "Moved/sub/b.md");
+    assert.equal(afterB.fileId, beforeB.fileId);
+    if (mode === "encrypted") assert.equal(afterB.remotePath, beforeB.remotePath);
+    else assert.equal(fixture.github.files.has(beforeB.remotePath), false);
+    const changes = (await latestJournalChanges(fixture)).map(change => ({ fileId: change.fileId, kind: change.kind, path: change.path, previousPath: change.previousPath }))
+      .sort((left, right) => left.path.localeCompare(right.path));
+    assert.deepEqual(changes, [
+      { fileId: beforeA.fileId, kind: "delete", path: "Folder/a.md", previousPath: undefined },
+      { fileId: beforeB.fileId, kind: "rename", path: "Moved/sub/b.md", previousPath: "Folder/sub/b.md" },
+    ]);
+    const pulled = await forcePullQueuedFixture(fixture);
+    assert.equal(pulled.vault.files.has("Folder/a.md"), false);
+    assert.equal(pulled.vault.files.has("Folder/sub/b.md"), false);
+    assert.equal(pulled.vault.files.has("Moved/a.md"), false);
+    assert.equal(dec(pulled.vault.files.get("Moved/sub/b.md")!.bytes), "keep-me");
+    assert.equal(indexRecordByPath(pulled.index, "Moved/sub/b.md").fileId, beforeB.fileId);
+  });
+
+  test(`v4 ${mode} unknown-base queued folder rename then descendant replacement deletes the old identity`, async () => {
+    const fixture = await queuedUnknownBaseFixture(mode,
+      [["Folder/a.md", "old-content"], ["Folder/sub/b.md", "keep-me"]],
+      [["Moved/a.md", "replacement-content"], ["Moved/sub/b.md", "keep-me"]]);
+    const beforeA = fixture.remoteRecords["Folder/a.md"];
+    const beforeB = fixture.remoteRecords["Folder/sub/b.md"];
+
+    const result = await new V4SyncSession({ github: fixture.github, vault: fixture.vault, index: fixture.index, config: fixture.remoteConfig, keyring: fixture.keyring, conflictPolicy: "ask", abortChangePercent: 0 })
+      .sync({ operation: "normal", allowThresholdOverride: false, changes: [
+        { type: "folderRename", oldPath: "Folder", path: "Moved", mtime: 29 },
+        { type: "replace", oldPath: "Moved/a.md", path: "Moved/a.md", mtime: 30 },
+      ] });
+
+    assert.equal(result.mode, "push");
+    assert.equal(fixture.github.files.has(beforeA.remotePath), false);
+    const afterA = indexRecordByPath(fixture.index, "Moved/a.md");
+    const afterB = indexRecordByPath(fixture.index, "Moved/sub/b.md");
+    assert.notEqual(afterA.fileId, beforeA.fileId);
+    assert.equal(afterB.fileId, beforeB.fileId);
+    const changes = await latestJournalChanges(fixture);
+    const deleted = changes.find(change => change.fileId === beforeA.fileId)!;
+    const created = changes.find(change => change.fileId === afterA.fileId)!;
+    const renamed = changes.find(change => change.fileId === beforeB.fileId)!;
+    assert.deepEqual({ kind: deleted.kind, path: deleted.path, hasBefore: !!deleted.before, hasAfter: !!deleted.after }, { kind: "delete", path: "Folder/a.md", hasBefore: true, hasAfter: false });
+    assert.deepEqual({ kind: created.kind, path: created.path, hasBefore: !!created.before, hasAfter: !!created.after }, { kind: "create", path: "Moved/a.md", hasBefore: false, hasAfter: true });
+    assert.deepEqual({ kind: renamed.kind, path: renamed.path, previousPath: renamed.previousPath }, { kind: "rename", path: "Moved/sub/b.md", previousPath: "Folder/sub/b.md" });
+    const pulled = await forcePullQueuedFixture(fixture);
+    assert.equal(pulled.vault.files.has("Folder/a.md"), false);
+    assert.equal(pulled.vault.files.has("Folder/sub/b.md"), false);
+    assert.equal(dec(pulled.vault.files.get("Moved/a.md")!.bytes), "replacement-content");
+    assert.equal(dec(pulled.vault.files.get("Moved/sub/b.md")!.bytes), "keep-me");
+    assert.equal(indexRecordByPath(pulled.index, "Moved/a.md").fileId, afterA.fileId);
+    assert.equal(indexRecordByPath(pulled.index, "Moved/sub/b.md").fileId, beforeB.fileId);
+  });
 }
 
 test("v4 rejects legacy encrypted layout except for Force Push migration", () => {
@@ -690,6 +786,34 @@ test("v4 session blocks operations over the configured modification percentage",
   const session = new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 10 });
   await assert.rejects(() => session.sync({ operation: "forcePush", allowThresholdOverride: false }), /change guard blocked/i);
   await session.sync({ operation: "forcePush", allowThresholdOverride: true });
+});
+
+test("v4 known-base scoped change guard measures only the in-scope population", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault();
+  vault.files.set("in-scope.md", { bytes: enc("before"), mtime: 1 });
+  for (let file = 0; file < 999; file++) vault.files.set(`excluded-${file}.md`, { bytes: enc(`excluded-${file}`), mtime: 1 });
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "d", mode: "plaintext" });
+  await new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "forcePush", allowThresholdOverride: false });
+  const commitBefore = github.ref!.sha;
+  vault.files.set("in-scope.md", { bytes: enc("after"), mtime: 2 });
+
+  await assert.rejects(
+    () => new V4SyncSession({
+      github,
+      vault,
+      index,
+      config: config(),
+      conflictPolicy: "copy",
+      abortChangePercent: 10,
+      includePath: path => path === "in-scope.md",
+    }).sync({ operation: "normal", allowThresholdOverride: false, changes: [{ type: "modify", path: "in-scope.md", mtime: 2 }] }),
+    (error: unknown) => error instanceof V4ChangeGuardError && error.changePercent === 100 && error.thresholdPercent === 10,
+  );
+  assert.equal(github.ref!.sha, commitBefore);
+  assert.equal(dec(github.files.get("in-scope.md")!), "before");
+  assert.equal(dec(github.files.get("excluded-998.md")!), "excluded-998");
 });
 
 test("v4 local event sync reads and stats only the changed path", async () => {
