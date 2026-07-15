@@ -135,41 +135,60 @@ function journalPath(journalId: string, page: number, encrypted: boolean): strin
   return `${V4_ROOT}/journals/${journalId}/${String(page).padStart(6, "0")}.${encrypted ? "enc" : "json"}`
 }
 
-function migrationIdentitySeed(records: V4IndexFileRecord[], changes: V4QueuedChange[]): Map<string, string> {
-  const identities = new Map(records.map(record => [record.path, record.fileId]))
+function causalIdentityState(records: V4IndexFileRecord[], changes: V4QueuedChange[]): {
+  identityByPath: Map<string, string>
+  touchedBaseRecords: V4IndexFileRecord[]
+  causallyRenamedFileIds: Set<string>
+} {
+  const identities = new Map(records.map(record => [record.path, record]))
+  const touched = new Map<string, V4IndexFileRecord>()
+  const causallyRenamedFileIds = new Set<string>()
   const atOrBelow = (path: string, root: string) => path === root || path.startsWith(`${root}/`)
+  const remove = (path: string) => {
+    const record = identities.get(path)
+    if (record) touched.set(record.fileId, record)
+    identities.delete(path)
+  }
   for (const change of changes) {
     if (change.type === "delete") {
-      identities.delete(change.path)
+      remove(change.path)
       continue
     }
     if (change.type === "replace") {
-      identities.delete(change.oldPath)
-      identities.delete(change.path)
+      remove(change.oldPath)
+      remove(change.path)
       continue
     }
     if (change.type === "rename") {
-      const fileId = identities.get(change.oldPath)
-      identities.delete(change.oldPath)
-      identities.delete(change.path)
-      if (fileId) identities.set(change.path, fileId)
+      const record = identities.get(change.oldPath)
+      remove(change.oldPath)
+      remove(change.path)
+      if (record) {
+        causallyRenamedFileIds.add(record.fileId)
+        identities.set(change.path, record)
+      }
       continue
     }
     if (change.type === "folderDelete") {
-      for (const path of [...identities.keys()]) if (atOrBelow(path, change.path)) identities.delete(path)
+      for (const path of [...identities.keys()]) if (atOrBelow(path, change.path)) remove(path)
       continue
     }
     if (change.type !== "folderRename") continue
-    const moved: Array<[string, string]> = []
-    for (const [path, fileId] of [...identities]) {
+    const moved: Array<[string, V4IndexFileRecord]> = []
+    for (const [path, record] of [...identities]) {
       if (!atOrBelow(path, change.oldPath)) continue
-      identities.delete(path)
-      moved.push([`${change.path}${path.slice(change.oldPath.length)}`, fileId])
+      remove(path)
+      causallyRenamedFileIds.add(record.fileId)
+      moved.push([`${change.path}${path.slice(change.oldPath.length)}`, record])
     }
-    for (const path of [...identities.keys()]) if (atOrBelow(path, change.path)) identities.delete(path)
-    for (const [path, fileId] of moved) identities.set(path, fileId)
+    for (const path of [...identities.keys()]) if (atOrBelow(path, change.path)) remove(path)
+    for (const [path, record] of moved) identities.set(path, record)
   }
-  return identities
+  return {
+    identityByPath: new Map([...identities].map(([path, record]) => [path, record.fileId])),
+    touchedBaseRecords: [...touched.values()],
+    causallyRenamedFileIds,
+  }
 }
 
 export function assertV4PathLayoutCompatible(remote: V4RemoteConfig, desired: V4RemoteConfig, operation: V4SyncOperation): void {
@@ -242,16 +261,25 @@ export class V4SyncSession {
     if (isLayoutMigration && allRemoteRecords.some(record => !includePath(record.path))) {
       throw new Error("Legacy V4 migration cannot continue while encrypted records are excluded by sync scope. Include all legacy paths and retry Force Push.")
     }
-    const hasKnownBase = localCacheComplete && !!this.input.index.remoteCommitSha
-    const allBaseRecords = isLayoutMigration || !hasKnownBase
-      ? []
-      : recordsFromIndex(this.input.index)
-    const baseRecords = allBaseRecords.filter(record => includePath(record.path))
     const remoteRecords = allRemoteRecords.filter(record => includePath(record.path))
-    const identitySeedByPath = isLayoutMigration || !hasKnownBase
-      ? migrationIdentitySeed(remoteRecords, options.changes ?? [])
+    const hasKnownBase = localCacheComplete && !!this.input.index.remoteCommitSha
+    const causalState = isLayoutMigration || !hasKnownBase
+      ? causalIdentityState(remoteRecords, options.changes ?? [])
       : undefined
-    const localFiles = (await this.scanLocal(baseRecords, options.changes ?? [], identitySeedByPath)).filter(file => includePath(file.path))
+    const scanBaseRecords = isLayoutMigration
+      ? []
+      : hasKnownBase
+        ? recordsFromIndex(this.input.index)
+        : options.operation === "normal"
+          ? causalState!.touchedBaseRecords
+          : []
+    const identitySeedByPath = causalState?.identityByPath
+    const localFiles = (await this.scanLocal(scanBaseRecords, options.changes ?? [], identitySeedByPath)).filter(file => includePath(file.path))
+    const localById = new Map(localFiles.map(file => [file.fileId, file]))
+    const baseRecords = !hasKnownBase && options.operation === "normal" && causalState
+      ? scanBaseRecords.filter(record => !causalState.causallyRenamedFileIds.has(record.fileId)
+        || localById.get(record.fileId)?.hash === record.plaintextSha256)
+      : scanBaseRecords
     assertNoCaseInsensitiveCollisions(localFiles)
     assertNoCaseInsensitiveCollisions(logical(remoteRecords))
     const plan = planV4Sync({
@@ -440,6 +468,7 @@ export class V4SyncSession {
     }
 
     const finalRecords = [...recordsById.values()]
+    await assertV4RemoteRecordSet(finalRecords, this.input.config, this.input.keyring)
     const finalObjectPaths = new Set(finalRecords.flatMap(recordPaths))
     for (const path of allRemoteRecords.flatMap(recordPaths)) if (!finalObjectPaths.has(path)) deletions.add(path)
     const finalByBucket = recordsByBucket(finalRecords)

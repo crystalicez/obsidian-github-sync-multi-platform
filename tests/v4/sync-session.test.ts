@@ -3,11 +3,12 @@ import test from "node:test";
 
 import type { GitHubCreateTreeEntry } from "../../src/lib/github-git-types";
 import { V4HistoryService } from "../../src/lib/v4/history-service";
+import type { V4JournalChange } from "../../src/lib/v4/history-journal";
 import { createEmptyV4LocalIndex, type V4IndexFileRecord, type V4LocalIndex } from "../../src/lib/v4/local-index";
 import { assertV4PathLayoutCompatible, V4SyncSession, type V4SessionVault } from "../../src/lib/v4/sync-session";
 import { coalesceV4Changes, type V4QueuedChange } from "../../src/lib/v4/sync-coordinator";
-import { V4_CONFIG_PATH, V4_FORMAT_VERSION, V4_HEAD_PATH, type V4RemoteConfig, type V4RemoteHead } from "../../src/lib/v4/protocol-types";
-import { deriveV4Keyring, encryptV4Payload } from "../../src/lib/v4/crypto";
+import { V4_CONFIG_PATH, V4_FORMAT_VERSION, V4_HEAD_PATH, V4_ROOT, type V4RemoteConfig, type V4RemoteHead } from "../../src/lib/v4/protocol-types";
+import { decryptV4Payload, deriveV4Keyring, encryptV4Payload } from "../../src/lib/v4/crypto";
 import { sha256Hex } from "../../src/lib/bytes";
 import { buildV4RemoteMetadata } from "../../src/lib/v4/remote-index";
 import { publishV4TreeChanges } from "../../src/lib/v4/git-tree-writer";
@@ -108,6 +109,73 @@ async function unknownBaseFixture(mode: "plaintext" | "encrypted", localContent:
   if (localContent !== null) vault.files.set("note.md", { bytes: enc(localContent), mtime: localContent === "remote-newer" ? 20 : 10 });
   const remoteBytes = new Uint8Array(github.files.get(remoteRecord.remotePath)!);
   return { github, vault, index, remoteConfig, keyring, remoteRecord, remoteBytes };
+}
+
+async function queuedUnknownBaseFixture(
+  mode: "plaintext" | "encrypted",
+  remoteFiles: Array<[path: string, content: string]>,
+  localFiles: Array<[path: string, content: string]>,
+) {
+  const github = new MemoryGitHub();
+  const remoteVault = new MemoryVault();
+  for (const [path, content] of remoteFiles) remoteVault.files.set(path, { bytes: enc(content), mtime: 20 });
+  const remoteConfig: V4RemoteConfig = mode === "plaintext"
+    ? config()
+    : {
+        formatVersion: V4_FORMAT_VERSION,
+        mode: "encrypted",
+        repoId: "o/r#main",
+        pathLayout: "opaque-stable-v1",
+        algorithm: "AES-GCM",
+        kdf: "PBKDF2-SHA-256",
+        kdfParams: { iterations: 10, salt: "c2FsdA" },
+      };
+  const keyring = mode === "encrypted"
+    ? await deriveV4Keyring({ passphrase: "correct", repoId: "o/r#main", salt: enc("salt"), iterations: 10 })
+    : undefined;
+  const remoteIndex = createEmptyV4LocalIndex({
+    repoId: "o/r#main",
+    deviceId: "remote",
+    mode,
+    pathLayout: mode === "encrypted" ? "opaque-stable-v1" : "plaintext-v1",
+  });
+  await new V4SyncSession({ github, vault: remoteVault, index: remoteIndex, config: remoteConfig, keyring, conflictPolicy: "newer", abortChangePercent: 0 })
+    .sync({ operation: "forcePush", allowThresholdOverride: false });
+  const remoteRecords = Object.fromEntries(remoteFiles.map(([path]) => [path, { ...indexRecordByPath(remoteIndex, path) }]));
+  const index = structuredClone(remoteIndex);
+  index.deviceId = "recovering";
+  index.shards[Object.keys(index.shards)[0]].hash = "inconsistent-local-cache";
+  const vault = new MemoryVault();
+  for (const [path, content] of localFiles) vault.files.set(path, { bytes: enc(content), mtime: 30 });
+  return { mode, github, vault, index, remoteConfig, keyring, remoteRecords };
+}
+
+type QueuedUnknownBaseFixture = Awaited<ReturnType<typeof queuedUnknownBaseFixture>>;
+
+async function latestJournalChanges(fixture: QueuedUnknownBaseFixture): Promise<V4JournalChange[]> {
+  const tip = fixture.github.ref!.sha;
+  const published = fixture.github.commits.get(tip)!;
+  const journalId = /^obsidian-sync-v4:(.+)$/u.exec(published.message)![1];
+  const encrypted = fixture.mode === "encrypted";
+  const path = `${V4_ROOT}/journals/${journalId}/000000.${encrypted ? "enc" : "json"}`;
+  const stored = fixture.github.files.get(path)!;
+  const bytes = encrypted
+    ? await decryptV4Payload(fixture.keyring!.journalKey, stored, { kind: "journal", aad: `${fixture.remoteConfig.repoId}:${journalId}:0` })
+    : stored;
+  return (JSON.parse(dec(bytes)) as { changes: V4JournalChange[] }).changes;
+}
+
+async function forcePullQueuedFixture(fixture: QueuedUnknownBaseFixture) {
+  const vault = new MemoryVault();
+  const index = createEmptyV4LocalIndex({
+    repoId: "o/r#main",
+    deviceId: "verifier",
+    mode: fixture.mode,
+    pathLayout: fixture.mode === "encrypted" ? "opaque-stable-v1" : "plaintext-v1",
+  });
+  await new V4SyncSession({ github: fixture.github, vault, index, config: fixture.remoteConfig, keyring: fixture.keyring, conflictPolicy: "newer", abortChangePercent: 0 })
+    .sync({ operation: "forcePull", allowThresholdOverride: false });
+  return { vault, index };
 }
 
 for (const mode of ["plaintext", "encrypted"] as const) {
@@ -214,6 +282,130 @@ test("v4 plaintext unknown-base sync pulls remote state before publishing a dist
   assert.equal(dec(verifierVault.files.get("note.md")!.bytes), "remote-newer");
   assert.equal(dec(verifierVault.files.get("local-only.md")!.bytes), "local-only");
 });
+
+for (const mode of ["plaintext", "encrypted"] as const) {
+  test(`v4 ${mode} unknown-base queued delete removes the remote identity, object, and journal entry`, async () => {
+    const fixture = await queuedUnknownBaseFixture(mode, [["note.md", "delete-me"]], []);
+    const before = fixture.remoteRecords["note.md"];
+
+    const result = await new V4SyncSession({ github: fixture.github, vault: fixture.vault, index: fixture.index, config: fixture.remoteConfig, keyring: fixture.keyring, conflictPolicy: "newer", abortChangePercent: 0 })
+      .sync({ operation: "normal", allowThresholdOverride: false, changes: [{ type: "delete", path: "note.md", mtime: 30 }] });
+
+    assert.equal(result.mode, "push");
+    assert.equal(fixture.github.files.has(before.remotePath), false);
+    assert.equal(Object.values(fixture.index.shards).flatMap(shard => Object.values(shard.records)).some(record => record.fileId === before.fileId), false);
+    const changes = await latestJournalChanges(fixture);
+    assert.deepEqual(changes.map(change => ({ fileId: change.fileId, kind: change.kind, path: change.path, hasBefore: !!change.before, hasAfter: !!change.after })), [
+      { fileId: before.fileId, kind: "delete", path: "note.md", hasBefore: true, hasAfter: false },
+    ]);
+    const pulled = await forcePullQueuedFixture(fixture);
+    assert.equal(pulled.vault.files.has("note.md"), false);
+  });
+
+  test(`v4 ${mode} unknown-base queued same-path replacement deletes the old identity and publishes one new record`, async () => {
+    const fixture = await queuedUnknownBaseFixture(mode, [["note.md", "old-content"]], [["note.md", "replacement-content"]]);
+    const before = fixture.remoteRecords["note.md"];
+
+    const result = await new V4SyncSession({ github: fixture.github, vault: fixture.vault, index: fixture.index, config: fixture.remoteConfig, keyring: fixture.keyring, conflictPolicy: "newer", abortChangePercent: 0 })
+      .sync({ operation: "normal", allowThresholdOverride: false, changes: [{ type: "replace", oldPath: "note.md", path: "note.md", mtime: 30 }] });
+
+    assert.equal(result.mode, "push");
+    const finalRecords = Object.values(fixture.index.shards).flatMap(shard => Object.values(shard.records)).filter(record => !record.deleted);
+    assert.equal(finalRecords.length, 1);
+    assert.equal(finalRecords[0].path, "note.md");
+    assert.notEqual(finalRecords[0].fileId, before.fileId);
+    if (mode === "encrypted") assert.equal(fixture.github.files.has(before.remotePath), false);
+    const changes = await latestJournalChanges(fixture);
+    const deleted = changes.find(change => change.fileId === before.fileId)!;
+    const created = changes.find(change => change.fileId === finalRecords[0].fileId)!;
+    assert.deepEqual({ kind: deleted.kind, path: deleted.path, hasBefore: !!deleted.before, hasAfter: !!deleted.after }, { kind: "delete", path: "note.md", hasBefore: true, hasAfter: false });
+    assert.deepEqual({ kind: created.kind, path: created.path, hasBefore: !!created.before, hasAfter: !!created.after }, { kind: "create", path: "note.md", hasBefore: false, hasAfter: true });
+    const pulled = await forcePullQueuedFixture(fixture);
+    assert.equal(dec(pulled.vault.files.get("note.md")!.bytes), "replacement-content");
+    assert.equal(indexRecordByPath(pulled.index, "note.md").fileId, finalRecords[0].fileId);
+  });
+
+  test(`v4 ${mode} unknown-base queued file rename preserves identity without conflict fallback`, async () => {
+    const fixture = await queuedUnknownBaseFixture(mode, [["old.md", "rename-content"]], [["new.md", "rename-content"]]);
+    const before = fixture.remoteRecords["old.md"];
+
+    const result = await new V4SyncSession({ github: fixture.github, vault: fixture.vault, index: fixture.index, config: fixture.remoteConfig, keyring: fixture.keyring, conflictPolicy: "ask", abortChangePercent: 0 })
+      .sync({ operation: "normal", allowThresholdOverride: false, changes: [{ type: "rename", oldPath: "old.md", path: "new.md", mtime: 30 }] });
+
+    assert.equal(result.mode, "push");
+    const after = indexRecordByPath(fixture.index, "new.md");
+    assert.equal(after.fileId, before.fileId);
+    if (mode === "encrypted") assert.equal(after.remotePath, before.remotePath);
+    else assert.equal(fixture.github.files.has("old.md"), false);
+    const changes = await latestJournalChanges(fixture);
+    assert.deepEqual(changes.map(change => ({ fileId: change.fileId, kind: change.kind, path: change.path, previousPath: change.previousPath })), [
+      { fileId: before.fileId, kind: "rename", path: "new.md", previousPath: "old.md" },
+    ]);
+    const pulled = await forcePullQueuedFixture(fixture);
+    assert.equal(pulled.vault.files.has("old.md"), false);
+    assert.equal(dec(pulled.vault.files.get("new.md")!.bytes), "rename-content");
+    assert.equal(indexRecordByPath(pulled.index, "new.md").fileId, before.fileId);
+  });
+
+  test(`v4 ${mode} unknown-base queued rename still conflicts when local content diverges`, async () => {
+    const fixture = await queuedUnknownBaseFixture(mode, [["old.md", "remote-newer"]], [["new.md", "local-stale"]]);
+    fixture.vault.files.get("new.md")!.mtime = 10;
+    const before = fixture.remoteRecords["old.md"];
+    const commitBefore = fixture.github.ref!.sha;
+
+    const result = await new V4SyncSession({ github: fixture.github, vault: fixture.vault, index: fixture.index, config: fixture.remoteConfig, keyring: fixture.keyring, conflictPolicy: "newer", abortChangePercent: 0 })
+      .sync({ operation: "normal", allowThresholdOverride: false, changes: [{ type: "rename", oldPath: "old.md", path: "new.md", mtime: 30 }] });
+
+    assert.equal(result.mode, "pull");
+    assert.equal(fixture.github.ref!.sha, commitBefore);
+    assert.equal(fixture.vault.files.has("new.md"), false);
+    assert.equal(dec(fixture.vault.files.get("old.md")!.bytes), "remote-newer");
+    assert.equal(indexRecordByPath(fixture.index, "old.md").fileId, before.fileId);
+    const pulled = await forcePullQueuedFixture(fixture);
+    assert.equal(pulled.vault.files.has("new.md"), false);
+    assert.equal(dec(pulled.vault.files.get("old.md")!.bytes), "remote-newer");
+  });
+
+  test(`v4 ${mode} unknown-base queued chained folder rename preserves descendant identities without conflicts`, async () => {
+    const fixture = await queuedUnknownBaseFixture(mode,
+      [["Folder/a.md", "a-content"], ["Folder/sub/b.md", "b-content"]],
+      [["Moved/a.md", "a-content"], ["Moved/sub/b.md", "b-content"]]);
+    const beforeA = fixture.remoteRecords["Folder/a.md"];
+    const beforeB = fixture.remoteRecords["Folder/sub/b.md"];
+
+    const result = await new V4SyncSession({ github: fixture.github, vault: fixture.vault, index: fixture.index, config: fixture.remoteConfig, keyring: fixture.keyring, conflictPolicy: "ask", abortChangePercent: 0 })
+      .sync({ operation: "normal", allowThresholdOverride: false, changes: [
+        { type: "folderRename", oldPath: "Folder", path: "Middle", mtime: 29 },
+        { type: "folderRename", oldPath: "Middle", path: "Moved", mtime: 30 },
+      ] });
+
+    assert.equal(result.mode, "push");
+    const afterA = indexRecordByPath(fixture.index, "Moved/a.md");
+    const afterB = indexRecordByPath(fixture.index, "Moved/sub/b.md");
+    assert.equal(afterA.fileId, beforeA.fileId);
+    assert.equal(afterB.fileId, beforeB.fileId);
+    if (mode === "encrypted") {
+      assert.equal(afterA.remotePath, beforeA.remotePath);
+      assert.equal(afterB.remotePath, beforeB.remotePath);
+    } else {
+      assert.equal(fixture.github.files.has("Folder/a.md"), false);
+      assert.equal(fixture.github.files.has("Folder/sub/b.md"), false);
+    }
+    const changes = (await latestJournalChanges(fixture)).map(change => ({ fileId: change.fileId, kind: change.kind, path: change.path, previousPath: change.previousPath }))
+      .sort((left, right) => left.path.localeCompare(right.path));
+    assert.deepEqual(changes, [
+      { fileId: beforeA.fileId, kind: "rename", path: "Moved/a.md", previousPath: "Folder/a.md" },
+      { fileId: beforeB.fileId, kind: "rename", path: "Moved/sub/b.md", previousPath: "Folder/sub/b.md" },
+    ]);
+    const pulled = await forcePullQueuedFixture(fixture);
+    assert.equal(pulled.vault.files.has("Folder/a.md"), false);
+    assert.equal(pulled.vault.files.has("Folder/sub/b.md"), false);
+    assert.equal(dec(pulled.vault.files.get("Moved/a.md")!.bytes), "a-content");
+    assert.equal(dec(pulled.vault.files.get("Moved/sub/b.md")!.bytes), "b-content");
+    assert.equal(indexRecordByPath(pulled.index, "Moved/a.md").fileId, beforeA.fileId);
+    assert.equal(indexRecordByPath(pulled.index, "Moved/sub/b.md").fileId, beforeB.fileId);
+  });
+}
 
 test("v4 rejects legacy encrypted layout except for Force Push migration", () => {
   const legacy = { formatVersion: 4 as const, mode: "encrypted" as const, repoId: "o/r#main" };
