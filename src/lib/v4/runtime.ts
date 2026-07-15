@@ -6,8 +6,7 @@ import { deriveV4Keyring } from "./crypto"
 import {
   createEmptyV4LocalIndex,
   loadV4LocalIndex,
-  saveV4LocalIndexHeader,
-  saveV4LocalIndexShard,
+  saveV4LocalIndex,
   type V4LocalIndex,
   type V4LocalIndexAdapter,
 } from "./local-index"
@@ -202,10 +201,7 @@ export class V4PluginRuntime {
   }
 
   private async saveIndex(index: V4LocalIndex, previousShardHashes: Record<string, string> = {}): Promise<void> {
-    for (const bucket of Object.keys(index.shards)) {
-      if (previousShardHashes[bucket] !== index.shardHashes[bucket]) await saveV4LocalIndexShard(this.adapter, V4_INDEX_ROOT, index, bucket)
-    }
-    await saveV4LocalIndexHeader(this.adapter, V4_INDEX_ROOT, index)
+    await saveV4LocalIndex(this.adapter, V4_INDEX_ROOT, index, previousShardHashes)
   }
 
   private sessionVault(inScope = this.scopePredicate()) {

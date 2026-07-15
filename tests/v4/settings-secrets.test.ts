@@ -11,7 +11,7 @@ import { migrateV4Secrets, sanitizeV4SettingsForPersistence } from "../../src/li
 import { selectV4RuntimeConfig, V4PluginRuntime } from "../../src/lib/v4/runtime";
 import { buildV4RemoteMetadata } from "../../src/lib/v4/remote-index";
 import { V4StorageCodec } from "../../src/lib/v4/storage-codec";
-import { V4_CONFIG_PATH, V4_FORMAT_VERSION, type V4PathLayout, type V4RemoteConfig, type V4RemoteHead } from "../../src/lib/v4/protocol-types";
+import { V4_CONFIG_PATH, V4_FORMAT_VERSION, V4_HEAD_PATH, type V4PathLayout, type V4RemoteConfig, type V4RemoteHead } from "../../src/lib/v4/protocol-types";
 import type { V4LocalIndex } from "../../src/lib/v4/local-index";
 
 test("v4 settings defaults keep sensitive scopes and modification guard disabled", () => {
@@ -76,7 +76,8 @@ class RuntimeMemoryGitHub {
   blobs = new Map<string, Uint8Array>();
   trees = new Map<string, Map<string, Uint8Array>>();
   commits = new Map<string, { treeSha: string; parents: string[]; message: string }>();
-  async getFileBytes(path: string, ref?: string) { const commit = ref ? this.commits.get(ref) : undefined; const value = commit ? this.trees.get(commit.treeSha)?.get(path) : this.files.get(path); return value ? { bytes: new Uint8Array(value), sha: `sha-${path}` } : null; }
+  readPaths: string[] = [];
+  async getFileBytes(path: string, ref?: string) { this.readPaths.push(path); const commit = ref ? this.commits.get(ref) : undefined; const value = commit ? this.trees.get(commit.treeSha)?.get(path) : this.files.get(path); return value ? { bytes: new Uint8Array(value), sha: `sha-${path}` } : null; }
   async getGitRefOrNull() { return this.ref; }
   async ensureGitRepositoryInitialized() { return null; }
   async getGitCommit(sha: string) { const value = this.commits.get(sha)!; return { sha, treeSha: value.treeSha, parentShas: value.parents, message: value.message }; }
@@ -137,6 +138,74 @@ test("v4 runtime authenticates encrypted remote before confirmed plaintext Force
   assert.deepEqual({ ref: wrong.github.ref!.sha, blobs: wrong.github.blobs.size, trees: wrong.github.trees.size, commits: wrong.github.commits.size }, before);
   assert.equal(wrong.github.files.has(wrong.oldObjectPath), true);
   wrong.runtime.dispose();
+});
+
+test("v4 runtime recovers after a published commit whose second local shard save fails", async () => {
+  const github = new RuntimeMemoryGitHub();
+  const indexFiles = new Map<string, string>();
+  const contents = new Map([["a.md", new TextEncoder().encode("old-a")], ["b.md", new TextEncoder().encode("old-b")]]);
+  const files = [new TFile("a.md", contents.get("a.md")!), new TFile("b.md", contents.get("b.md")!)];
+  files[0].stat = { size: 5, mtime: 1 };
+  files[1].stat = { size: 5, mtime: 1 };
+  let failShardWrite = 0;
+  let shardWrites = 0;
+  const plugin = {
+    app: { vault: {
+      configDir: ".obsidian",
+      adapter: {
+        async read(path: string) { const value = indexFiles.get(path); if (value === undefined) throw new Error(`missing ${path}`); return value; },
+        async write(path: string, value: string) {
+          if (path.includes("/shards/") && ++shardWrites === failShardWrite) throw new Error("simulated second shard persistence failure");
+          indexFiles.set(path, value);
+        },
+        async exists(path: string) { return indexFiles.has(path); },
+        async mkdir() {},
+      },
+      getFiles() { return files; },
+      getAbstractFileByPath(path: string) { return files.find(file => file.path === path) ?? null; },
+      async readBinary(file: TFile) { return contents.get(file.path)!.buffer; },
+    } },
+    manifest: { id: "test" },
+    githubClient: github,
+    settings: { githubOwner: "o", githubRepo: "r", githubBranch: "main", vault: "device", encryptionMode: "plaintext", encryptionPassphrase: "", conflictPolicy: "copy", abortChangePercent: 0, ignorePathRegex: "", syncObsidianConfig: false, syncBookmarks: false, syncPlugins: false, syncEnabled: true, syncOnLocalChange: false },
+    ignoredFiles: new Set<string>(), isWatchEnabled: false, isSyncInProgress: false,
+    syncProgress: { status: "idle", pushCount: 0, totalPush: 0, pullCount: 0, totalPull: 0, lastSyncTime: 0 },
+    enableWatch() {}, updateStatusBar() {}, addIgnoredFile() {}, removeIgnoredFile() {},
+  };
+  let runtime = new V4PluginRuntime(plugin as never);
+  await runtime.forcePush(true);
+  assert.equal(plugin.syncProgress.status, "success");
+  const previousCommit = github.ref!.sha;
+  contents.set("a.md", new TextEncoder().encode("new-a"));
+  contents.set("b.md", new TextEncoder().encode("new-b"));
+  files[0].stat = { size: 5, mtime: 2 };
+  files[1].stat = { size: 5, mtime: 2 };
+  shardWrites = 0;
+  failShardWrite = 2;
+
+  await runtime.manualSync();
+
+  assert.equal(plugin.syncProgress.status, "fail");
+  assert.match(plugin.syncProgress.errorMessage ?? "", /second shard persistence failure/iu);
+  const publishedCommit = github.ref!.sha;
+  assert.notEqual(publishedCommit, previousCommit);
+  const commitsAfterPublish = github.commits.size;
+  const persistedHeaderAfterFailure = JSON.parse(indexFiles.get(".obsidian/plugins/test/github-sync-v4-index/index.json")!);
+  runtime.dispose();
+  failShardWrite = 0;
+  shardWrites = 0;
+  github.readPaths.length = 0;
+  runtime = new V4PluginRuntime(plugin as never);
+
+  await runtime.manualSync();
+
+  assert.equal(persistedHeaderAfterFailure.remoteCommitSha, previousCommit);
+  assert.equal(plugin.syncProgress.status, "success");
+  assert.equal(github.ref!.sha, publishedCommit);
+  assert.equal(github.commits.size, commitsAfterPublish);
+  assert.equal(github.readPaths.includes(V4_HEAD_PATH), true);
+  assert.equal(github.readPaths.some(path => path.includes("/index/")), true);
+  runtime.dispose();
 });
 
 function runtimeFixture(input: { remoteConfig: V4RemoteConfig; localIndexRepoId: string; localIndexPathLayout?: V4PathLayout; cachedShard?: boolean }) {

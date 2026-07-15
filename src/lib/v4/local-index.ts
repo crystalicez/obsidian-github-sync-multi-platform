@@ -67,18 +67,29 @@ export function createEmptyV4LocalIndex(input: { repoId: string; deviceId: strin
   };
 }
 
-export async function saveV4LocalIndexShard(adapter: V4LocalIndexAdapter, root: string, index: V4LocalIndex, bucket: string): Promise<void> {
+async function saveV4LocalIndexShard(adapter: V4LocalIndexAdapter, root: string, index: V4LocalIndex, bucket: string): Promise<void> {
   const shard = index.shards[bucket] ?? { hash: "", records: {} };
   index.shardHashes[bucket] = shard.hash;
   await adapter.mkdir(root);
   await adapter.mkdir(join(root, "shards"));
-  await adapter.write(join(root, "index.json"), JSON.stringify(header(index)));
   await adapter.write(join(root, `shards/${bucket}.json`), JSON.stringify(shard));
 }
 
-export async function saveV4LocalIndexHeader(adapter: V4LocalIndexAdapter, root: string, index: V4LocalIndex): Promise<void> {
+async function saveV4LocalIndexHeader(adapter: V4LocalIndexAdapter, root: string, index: V4LocalIndex): Promise<void> {
   await adapter.mkdir(root);
   await adapter.write(join(root, "index.json"), JSON.stringify(header(index)));
+}
+
+export async function saveV4LocalIndex(
+  adapter: V4LocalIndexAdapter,
+  root: string,
+  index: V4LocalIndex,
+  previousShardHashes: Record<string, string> = {},
+): Promise<void> {
+  for (const bucket of Object.keys(index.shards)) {
+    if (previousShardHashes[bucket] !== index.shardHashes[bucket]) await saveV4LocalIndexShard(adapter, root, index, bucket);
+  }
+  await saveV4LocalIndexHeader(adapter, root, index);
 }
 
 export async function loadV4LocalIndex(adapter: V4LocalIndexAdapter, root: string): Promise<V4LocalIndex> {
