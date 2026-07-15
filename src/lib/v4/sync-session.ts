@@ -135,6 +135,43 @@ function journalPath(journalId: string, page: number, encrypted: boolean): strin
   return `${V4_ROOT}/journals/${journalId}/${String(page).padStart(6, "0")}.${encrypted ? "enc" : "json"}`
 }
 
+function migrationIdentitySeed(records: V4IndexFileRecord[], changes: V4QueuedChange[]): Map<string, string> {
+  const identities = new Map(records.map(record => [record.path, record.fileId]))
+  const atOrBelow = (path: string, root: string) => path === root || path.startsWith(`${root}/`)
+  for (const change of changes) {
+    if (change.type === "delete") {
+      identities.delete(change.path)
+      continue
+    }
+    if (change.type === "replace") {
+      identities.delete(change.oldPath)
+      identities.delete(change.path)
+      continue
+    }
+    if (change.type === "rename") {
+      const fileId = identities.get(change.oldPath)
+      identities.delete(change.oldPath)
+      identities.delete(change.path)
+      if (fileId) identities.set(change.path, fileId)
+      continue
+    }
+    if (change.type === "folderDelete") {
+      for (const path of [...identities.keys()]) if (atOrBelow(path, change.path)) identities.delete(path)
+      continue
+    }
+    if (change.type !== "folderRename") continue
+    const moved: Array<[string, string]> = []
+    for (const [path, fileId] of [...identities]) {
+      if (!atOrBelow(path, change.oldPath)) continue
+      identities.delete(path)
+      moved.push([`${change.path}${path.slice(change.oldPath.length)}`, fileId])
+    }
+    for (const path of [...identities.keys()]) if (atOrBelow(path, change.path)) identities.delete(path)
+    for (const [path, fileId] of moved) identities.set(path, fileId)
+  }
+  return identities
+}
+
 export function assertV4PathLayoutCompatible(remote: V4RemoteConfig, desired: V4RemoteConfig, operation: V4SyncOperation): void {
   const actual = effectiveV4PathLayout(remote)
   const expected = expectedV4PathLayout(desired.mode)
@@ -208,7 +245,7 @@ export class V4SyncSession {
     const baseRecords = allBaseRecords.filter(record => includePath(record.path))
     const remoteRecords = allRemoteRecords.filter(record => includePath(record.path))
     const migrationIdentityByPath = isLayoutMigration
-      ? new Map(remoteRecords.map(record => [record.path, record.fileId]))
+      ? migrationIdentitySeed(remoteRecords, options.changes ?? [])
       : undefined
     const localFiles = (await this.scanLocal(baseRecords, options.changes ?? [], migrationIdentityByPath)).filter(file => includePath(file.path))
     assertNoCaseInsensitiveCollisions(localFiles)

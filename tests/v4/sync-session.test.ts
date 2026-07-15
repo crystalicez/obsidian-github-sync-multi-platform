@@ -5,7 +5,7 @@ import type { GitHubCreateTreeEntry } from "../../src/lib/github-git-types";
 import { V4HistoryService } from "../../src/lib/v4/history-service";
 import { createEmptyV4LocalIndex, type V4IndexFileRecord, type V4LocalIndex } from "../../src/lib/v4/local-index";
 import { assertV4PathLayoutCompatible, V4SyncSession, type V4SessionVault } from "../../src/lib/v4/sync-session";
-import { coalesceV4Changes } from "../../src/lib/v4/sync-coordinator";
+import { coalesceV4Changes, type V4QueuedChange } from "../../src/lib/v4/sync-coordinator";
 import { V4_CONFIG_PATH, V4_FORMAT_VERSION, V4_HEAD_PATH, type V4RemoteConfig, type V4RemoteHead } from "../../src/lib/v4/protocol-types";
 import { deriveV4Keyring, encryptV4Payload } from "../../src/lib/v4/crypto";
 import { sha256Hex } from "../../src/lib/bytes";
@@ -814,6 +814,91 @@ test("v4 confirmed Force Push migrates legacy encrypted paths in one commit", as
   assert.equal(pulled.remotePath, migrated.remotePath);
   assert.equal(pulled.remoteVersion, migrated.remoteVersion);
   assert.equal(Object.values(targetIndex.shards).flatMap(shard => Object.values(shard.records)).some(record => record.remoteVersion === "legacy-v" || record.remotePath.includes("PrivateFolder")), false);
+});
+
+async function legacyMigrationEventFixture(input: { remotePath: string; localPath: string; remoteContent: string; localContent?: string; fileId: string }) {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault();
+  vault.files.set(input.localPath, { bytes: enc(input.localContent ?? input.remoteContent), mtime: 2 });
+  const legacyConfig: V4RemoteConfig = { formatVersion: V4_FORMAT_VERSION, mode: "encrypted", repoId: "o/r#main", algorithm: "AES-GCM", kdf: "PBKDF2-SHA-256", kdfParams: { iterations: 10, salt: "c2FsdA" } };
+  const desiredConfig = { ...legacyConfig, pathLayout: "opaque-stable-v1" as const };
+  const keys = await deriveV4Keyring({ passphrase: "pass", repoId: "o/r#main", salt: enc("salt"), iterations: 10 });
+  const pathId = await (await import("../../src/lib/v4/paths")).pathIdForV4Path(keys.pathKey, input.remotePath);
+  const folder = input.remotePath.split("/").slice(0, -1).join("/");
+  const legacyObjectPath = `.obsidian-github-sync-v4/data/${folder ? `${folder}/` : ""}legacy.enc`;
+  const remoteBytes = enc(input.remoteContent);
+  const legacyRecord: V4IndexFileRecord = {
+    path: input.remotePath, pathId, fileId: input.fileId, plaintextSha256: await sha256Hex(remoteBytes), size: remoteBytes.byteLength, mtime: 1,
+    remoteVersion: "legacy-v", remotePath: legacyObjectPath, storage: "single",
+  };
+  const head: V4RemoteHead = { formatVersion: 4, mode: "encrypted", epoch: 1, generation: 1, journalId: "legacy-v", shardHashes: { [pathId.slice(0, 2)]: "legacy-shard" }, updatedAt: 1, deviceId: "old" };
+  const files = await buildV4RemoteMetadata({ config: legacyConfig, head, records: [legacyRecord], keyring: keys });
+  files.push({ path: legacyObjectPath, bytes: await encryptV4Payload(keys.contentKey, remoteBytes, { kind: "content", aad: `${pathId}:legacy-v` }) });
+  await publishV4TreeChanges(github, { message: "obsidian-sync-v4:legacy-v", files });
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "new", mode: "encrypted", pathLayout: "opaque-stable-v1" });
+  return { github, vault, legacyConfig, desiredConfig, keys, legacyRecord, index };
+}
+
+async function assertMigratedEventPull(
+  fixture: Awaited<ReturnType<typeof legacyMigrationEventFixture>>,
+  expected: { path: string; content: string; fileId: string },
+) {
+  const migrated = indexRecordByPath(fixture.index, expected.path);
+  assert.equal(migrated.fileId, expected.fileId);
+  assert.notEqual(migrated.remotePath, fixture.legacyRecord.remotePath);
+  assert.notEqual(migrated.remoteVersion, fixture.legacyRecord.remoteVersion);
+  assert.equal(migrated.encryptedPath, migrated.remotePath);
+  assert.match(migrated.remotePath, /^\.obsidian-github-sync-v4\/data\/[0-9a-f]{2}\/[0-9a-f]{64}\.enc$/u);
+  assert.equal(Object.values(fixture.index.shards).flatMap(shard => Object.values(shard.records)).some(record => record.remoteVersion === "legacy-v" || record.remotePath === fixture.legacyRecord.remotePath), false);
+  assert.equal(fixture.github.files.has(fixture.legacyRecord.remotePath), false);
+  assert.equal(fixture.github.lastEntries.some(entry => entry.path === fixture.legacyRecord.remotePath && entry.sha === null), true);
+  assert.equal(fixture.github.lastEntries.some(entry => entry.path === migrated.remotePath && entry.sha !== null), true);
+  const target = new MemoryVault();
+  const targetIndex = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "target", mode: "encrypted", pathLayout: "opaque-stable-v1" });
+  await new V4SyncSession({ github: fixture.github, vault: target, index: targetIndex, config: fixture.desiredConfig, keyring: fixture.keys, conflictPolicy: "copy", abortChangePercent: 0 }).sync({ operation: "forcePull", allowThresholdOverride: false });
+  assert.equal(dec(target.files.get(expected.path)!.bytes), expected.content);
+  if (expected.path !== fixture.legacyRecord.path) assert.equal(target.files.has(fixture.legacyRecord.path), false);
+  const pulled = indexRecordByPath(targetIndex, expected.path);
+  assert.equal(pulled.fileId, expected.fileId);
+  assert.equal(pulled.remotePath, migrated.remotePath);
+  assert.equal(pulled.remoteVersion, migrated.remoteVersion);
+  assert.equal(Object.values(targetIndex.shards).flatMap(shard => Object.values(shard.records)).some(record => record.remoteVersion === "legacy-v" || record.remotePath === fixture.legacyRecord.remotePath), false);
+}
+
+test("v4 legacy migration queued replacement creates a new opaque identity", async () => {
+  const fixture = await legacyMigrationEventFixture({ remotePath: "same.md", localPath: "same.md", remoteContent: "old", localContent: "new", fileId: "legacy-replaced" });
+  const changes = coalesceV4Changes([
+    { type: "delete", path: "same.md", mtime: 1 },
+    { type: "modify", path: "same.md", mtime: 2 },
+  ]);
+
+  await new V4SyncSession({ github: fixture.github, vault: fixture.vault, index: fixture.index, config: fixture.desiredConfig, keyring: fixture.keys, conflictPolicy: "copy", abortChangePercent: 0 }).sync({ operation: "forcePush", allowThresholdOverride: true, changes });
+
+  const migrated = indexRecordByPath(fixture.index, "same.md");
+  assert.notEqual(migrated.fileId, fixture.legacyRecord.fileId);
+  await assertMigratedEventPull(fixture, { path: "same.md", content: "new", fileId: migrated.fileId });
+});
+
+test("v4 legacy migration queued file rename preserves the authenticated identity", async () => {
+  const fixture = await legacyMigrationEventFixture({ remotePath: "Old/note.md", localPath: "New/note.md", remoteContent: "renamed", fileId: "legacy-renamed" });
+  const changes: V4QueuedChange[] = [{ type: "rename", oldPath: "Old/note.md", path: "New/note.md", mtime: 2 }];
+
+  await new V4SyncSession({ github: fixture.github, vault: fixture.vault, index: fixture.index, config: fixture.desiredConfig, keyring: fixture.keys, conflictPolicy: "copy", abortChangePercent: 0 }).sync({ operation: "forcePush", allowThresholdOverride: true, changes: coalesceV4Changes(changes) });
+
+  await assertMigratedEventPull(fixture, { path: "New/note.md", content: "renamed", fileId: fixture.legacyRecord.fileId });
+});
+
+test("v4 legacy migration queued chained nested folder renames preserve descendant identity", async () => {
+  const fixture = await legacyMigrationEventFixture({ remotePath: "A/N/note.md", localPath: "C/M/N/note.md", remoteContent: "nested", fileId: "legacy-nested" });
+  const changes: V4QueuedChange[] = [
+    { type: "folderRename", oldPath: "A", path: "B", mtime: 2 },
+    { type: "folderRename", oldPath: "B", path: "C", mtime: 3 },
+    { type: "folderRename", oldPath: "C/N", path: "C/M/N", mtime: 4 },
+  ];
+
+  await new V4SyncSession({ github: fixture.github, vault: fixture.vault, index: fixture.index, config: fixture.desiredConfig, keyring: fixture.keys, conflictPolicy: "copy", abortChangePercent: 0 }).sync({ operation: "forcePush", allowThresholdOverride: true, changes: coalesceV4Changes(changes) });
+
+  await assertMigratedEventPull(fixture, { path: "C/M/N/note.md", content: "nested", fileId: fixture.legacyRecord.fileId });
 });
 
 test("v4 confirmed migration accepts legacy packed records with retained loose encryptedPath", async () => {
