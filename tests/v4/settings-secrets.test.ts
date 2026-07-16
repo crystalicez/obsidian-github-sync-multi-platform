@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { readFile } from "node:fs/promises";
-import { modalButtons, resetModalTestState, TFile } from "obsidian";
+import { modalButtons, Notice, resetModalTestState, TFile } from "obsidian";
 
 import { DEFAULT_SETTINGS } from "../../src/setting";
 import type { GitHubCreateTreeEntry } from "../../src/lib/github-git-types";
@@ -257,6 +257,62 @@ test("v4 runtime keeps the active snapshot when another user operation is reject
   assert.deepEqual(fixture.runtime.progressSnapshot, before);
   release();
   await active;
+  fixture.runtime.dispose();
+});
+
+test("v4 runtime rejects a user operation synchronously re-entered by active progress", async () => {
+  const fixture = plaintextRuntimeFixture();
+  Notice.messages.length = 0;
+  let vaultReads = 0;
+  let activeVaultReads = 0;
+  let maxConcurrentVaultReads = 0;
+  const originalReadBinary = fixture.plugin.app.vault.readBinary.bind(fixture.plugin.app.vault);
+  fixture.plugin.app.vault.readBinary = async file => {
+    vaultReads++;
+    activeVaultReads++;
+    maxConcurrentVaultReads = Math.max(maxConcurrentVaultReads, activeVaultReads);
+    try {
+      await Promise.resolve();
+      return await originalReadBinary(file);
+    } finally {
+      activeVaultReads--;
+    }
+  };
+  let casWrites = 0;
+  let activeCasWrites = 0;
+  let maxConcurrentCasWrites = 0;
+  const originalCreateGitRef = fixture.github.createGitRef.bind(fixture.github);
+  fixture.github.createGitRef = async sha => {
+    casWrites++;
+    activeCasWrites++;
+    maxConcurrentCasWrites = Math.max(maxConcurrentCasWrites, activeCasWrites);
+    try {
+      await Promise.resolve();
+      await originalCreateGitRef(sha);
+    } finally {
+      activeCasWrites--;
+    }
+  };
+  let reentered = false;
+  let nested: Promise<unknown> | undefined;
+  fixture.runtime.subscribeProgress(snapshot => {
+    if (snapshot.lifecycle !== "active" || reentered) return;
+    reentered = true;
+    nested = fixture.runtime.manualSync();
+  });
+
+  const result = await fixture.runtime.forcePush();
+  assert.ok(nested);
+  const nestedResult = await nested;
+
+  assert.equal((result as { status: string }).status, "completed");
+  assert.equal((nestedResult as { status: string }).status, "busy");
+  assert.deepEqual(Notice.messages, ["GitHub Sync: Sync already in progress"]);
+  assert.equal(fixture.github.commits.size, 1);
+  assert.equal(vaultReads, 1);
+  assert.equal(maxConcurrentVaultReads, 1);
+  assert.equal(casWrites, 1);
+  assert.equal(maxConcurrentCasWrites, 1);
   fixture.runtime.dispose();
 });
 

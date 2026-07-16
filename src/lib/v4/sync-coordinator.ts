@@ -166,7 +166,12 @@ export class V4SyncCoordinator {
 
   private start(request: V4SyncRequest, changes: V4QueuedChange[]): Promise<V4CoordinatorRunResult> {
     if (this.disposed) return Promise.resolve({ status: "skipped", changedFiles: 0 });
-    const execution = this.options.execute(request, changes).then(result => ({ status: "completed" as const, ...result }));
+    let resolveExecution!: (result: V4CoordinatorRunResult) => void;
+    let rejectExecution!: (error: unknown) => void;
+    const execution = new Promise<V4CoordinatorRunResult>((resolve, reject) => {
+      resolveExecution = resolve;
+      rejectExecution = reject;
+    });
     let tracked!: Promise<V4CoordinatorRunResult>;
     tracked = execution.finally(() => {
       if (this.active === tracked) this.active = undefined;
@@ -181,6 +186,14 @@ export class V4SyncCoordinator {
       }
     });
     this.active = tracked;
+    try {
+      this.options.execute(request, changes).then(
+        result => resolveExecution({ status: "completed", ...result }),
+        rejectExecution,
+      );
+    } catch (error) {
+      rejectExecution(error);
+    }
     return tracked;
   }
 }

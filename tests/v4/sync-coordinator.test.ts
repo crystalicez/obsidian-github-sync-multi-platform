@@ -57,6 +57,43 @@ test("v4 coordinator rejects repeated user operations while a sync is active", a
   await active;
 });
 
+test("v4 coordinator rejects synchronous execute re-entry before starting another sync", async () => {
+  let executions = 0;
+  let nested: Promise<{ status: "completed" | "busy" | "skipped"; changedFiles: number }> | undefined;
+  const notices: string[] = [];
+  let coordinator!: V4SyncCoordinator;
+  coordinator = new V4SyncCoordinator({
+    execute: async () => {
+      executions++;
+      if (executions === 1) nested = coordinator.run({ operation: "forcePull", trigger: "forcePull" });
+      return { changedFiles: 0 };
+    },
+    notice: message => notices.push(message),
+  });
+
+  const result = await coordinator.run({ operation: "normal", trigger: "manual" });
+  assert.ok(nested);
+  const nestedResult = await nested;
+
+  assert.equal(result.status, "completed");
+  assert.equal(nestedResult.status, "busy");
+  assert.equal(executions, 1);
+  assert.deepEqual(notices, ["GitHub Sync: Sync already in progress"]);
+});
+
+test("v4 coordinator propagates a synchronous execute error and clears the active guard", async () => {
+  const coordinator = new V4SyncCoordinator({
+    execute: () => { throw new Error("synchronous execute failure"); },
+  });
+
+  await assert.rejects(
+    coordinator.run({ operation: "normal", trigger: "manual" }),
+    /synchronous execute failure/iu,
+  );
+
+  assert.equal(coordinator.isSyncing, false);
+});
+
 test("v4 coordinator preserves local events arriving during a sync", async () => {
   const timers = new FakeTimers();
   const executions: V4QueuedChange[][] = [];
