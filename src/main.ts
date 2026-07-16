@@ -1,10 +1,11 @@
-import { Plugin, setIcon, Modal, Notice, TFile, TFolder, moment } from "obsidian";
+import { Plugin, setIcon, Modal, Notice, TFile, TFolder } from "obsidian";
 
 import { SettingTab, PluginSettings, DEFAULT_SETTINGS } from "./setting";
 import { GitHubClient } from "./lib/github-api";
 import { normalizeScheduledSyncIntervalSeconds, shouldRunScheduledSync, shouldRunStartupSync } from "./lib/sync-policy";
 import { migrateV4Secrets, sanitizeV4SettingsForPersistence, storeV4Secrets } from "./lib/v4/secrets";
 import { V4PluginRuntime } from "./lib/v4/runtime";
+import { createIdleV4Progress } from "./lib/v4/progress";
 import { formatV4ActiveSyncStatus } from "./lib/v4/status";
 import { V4SyncCenterView, V4_SYNC_CENTER_VIEW } from "./views/sync-center";
 
@@ -21,23 +22,6 @@ export default class FastSync extends Plugin {
   ribbonIcon: HTMLElement
   statusBarItem: HTMLElement | null = null
   saveNoticeTimeout: number | null = null
-  syncProgress: {
-    status: "idle" | "pending" | "syncing" | "success" | "fail" | "waiting"
-    pushCount: number
-    totalPush: number
-    pullCount: number
-    totalPull: number
-    lastSyncTime: number
-    errorMessage?: string
-  } = {
-    status: "idle",
-    pushCount: 0,
-    totalPush: 0,
-    pullCount: 0,
-    totalPull: 0,
-    lastSyncTime: 0
-  }
-
   isWatchEnabled: boolean = true
   ignoredFiles: Set<string> = new Set()
   scheduledSyncTimer: number | null = null
@@ -255,43 +239,16 @@ export default class FastSync extends Plugin {
     }
     this.statusBarItem.empty();
 
-    const { status, pushCount, totalPush, pullCount, totalPull, lastSyncTime, errorMessage } = this.syncProgress;
-    let text = "";
-    let title = "";
+    const snapshot = this.v4Runtime?.progressSnapshot ?? createIdleV4Progress();
+    const { text, title } = formatV4ActiveSyncStatus(snapshot);
     let cls = "github-sync-status-bar";
 
-    if (status === "pending") {
-      text = `⏳ GH Sync (queued ${totalPush})`;
-      title = `GitHub Sync: ${totalPush} local change(s) queued for the next sync.`;
-      cls += " is-syncing";
-    } else if (status === "waiting") {
-      text = `⏳ GH Sync (waiting...)`;
-      title = "GitHub Sync: Waiting for local changes to settle...";
-      cls += " is-syncing";
-    } else if (this.isSyncInProgress || status === "syncing") {
-      const active = formatV4ActiveSyncStatus({ pushCount, totalPush, pullCount, totalPull });
-      text = active.text;
-      title = active.title;
-      cls += " is-syncing";
-    } else if (status === "success") {
-      const timeStr = moment(lastSyncTime || Date.now()).format("HH:mm:ss");
-      const relativeTime = lastSyncTime ? moment(lastSyncTime).fromNow() : "just now";
-      text = `🟢 GH Sync (${relativeTime})`;
-      title = `GitHub Sync: Sync completed successfully at ${timeStr}.`;
-    } else if (status === "fail") {
-      text = "🔴 GH Sync (Failed)";
-      title = `GitHub Sync: Last sync failed. Error: ${errorMessage || "Unknown error"}`;
-    } else {
-      const timeStr = lastSyncTime ? moment(lastSyncTime).format("HH:mm:ss") : "Never";
-      const relativeTime = lastSyncTime ? moment(lastSyncTime).fromNow() : "Never";
-      text = `🟢 GH Sync (${relativeTime})`;
-      title = `GitHub Sync: Idle. Last sync: ${timeStr}.`;
-    }
+    if (snapshot.lifecycle === "waiting" || snapshot.lifecycle === "active") cls += " is-syncing";
 
     const span = this.statusBarItem.createEl("span", { text, cls });
     span.title = title;
     span.onclick = () => {
-      if (!this.isSyncInProgress) {
+      if (!this.v4Runtime?.isSyncing) {
         void this.v4Runtime.manualSync()
       }
     };

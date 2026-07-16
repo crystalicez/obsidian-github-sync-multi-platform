@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { readFile } from "node:fs/promises";
-import { TFile } from "obsidian";
+import { modalButtons, resetModalTestState, TFile } from "obsidian";
 
 import { DEFAULT_SETTINGS } from "../../src/setting";
 import type { GitHubCreateTreeEntry } from "../../src/lib/github-git-types";
@@ -13,6 +13,7 @@ import { buildV4RemoteMetadata } from "../../src/lib/v4/remote-index";
 import { V4StorageCodec } from "../../src/lib/v4/storage-codec";
 import { V4_CONFIG_PATH, V4_FORMAT_VERSION, V4_HEAD_PATH, type V4PathLayout, type V4RemoteConfig, type V4RemoteHead } from "../../src/lib/v4/protocol-types";
 import type { V4LocalIndex } from "../../src/lib/v4/local-index";
+import type { V4SyncProgressSnapshot } from "../../src/lib/v4/progress";
 
 test("v4 settings defaults keep sensitive scopes and modification guard disabled", () => {
   assert.equal(DEFAULT_SETTINGS.syncObsidianConfig, false);
@@ -77,17 +78,255 @@ class RuntimeMemoryGitHub {
   trees = new Map<string, Map<string, Uint8Array>>();
   commits = new Map<string, { treeSha: string; parents: string[]; message: string }>();
   readPaths: string[] = [];
+  updateFailuresRemaining = 0;
+  blobFailuresRemaining = 0;
+  refReadBarrier?: Promise<void>;
   async getFileBytes(path: string, ref?: string) { this.readPaths.push(path); const commit = ref ? this.commits.get(ref) : undefined; const value = commit ? this.trees.get(commit.treeSha)?.get(path) : this.files.get(path); return value ? { bytes: new Uint8Array(value), sha: `sha-${path}` } : null; }
-  async getGitRefOrNull() { return this.ref; }
+  async getGitRefOrNull() { await this.refReadBarrier; return this.ref; }
   async ensureGitRepositoryInitialized() { return null; }
   async getGitCommit(sha: string) { const value = this.commits.get(sha)!; return { sha, treeSha: value.treeSha, parentShas: value.parents, message: value.message }; }
   async getTreeAt(treeSha: string) { const tree = this.trees.get(treeSha) ?? new Map(); return { sha: treeSha, url: "", truncated: false, tree: [...tree.entries()].map(([path, bytes], index) => ({ path, mode: "100644", type: "blob" as const, sha: `tree-blob-${index}`, size: bytes.byteLength, url: "" })) }; }
-  async createGitBlob(bytes: Uint8Array) { const sha = `blob-${this.blobs.size + 1}`; this.blobs.set(sha, new Uint8Array(bytes)); return sha; }
+  async createGitBlob(bytes: Uint8Array) { if (this.blobFailuresRemaining-- > 0) throw new Error("simulated upload failure"); const sha = `blob-${this.blobs.size + 1}`; this.blobs.set(sha, new Uint8Array(bytes)); return sha; }
   async createGitTree(entries: GitHubCreateTreeEntry[], baseTree?: string) { const tree = new Map(baseTree ? this.trees.get(baseTree) : undefined); for (const entry of entries) entry.sha === null ? tree.delete(entry.path) : tree.set(entry.path, new Uint8Array(this.blobs.get(entry.sha)!)); const sha = `tree-${this.trees.size + 1}`; this.trees.set(sha, tree); return sha; }
   async createGitCommit(message: string, treeSha: string, parents: string[]) { const sha = `commit-${this.commits.size + 1}`; this.commits.set(sha, { treeSha, parents, message }); return sha; }
   async createGitRef(sha: string) { this.ref = { ref: "refs/heads/main", sha, type: "commit" }; this.files = new Map(this.trees.get(this.commits.get(sha)!.treeSha)); }
-  async updateGitRef(sha: string, expected?: string) { if (expected && this.ref?.sha !== expected) throw new Error("stale ref"); await this.createGitRef(sha); }
+  async updateGitRef(sha: string, expected?: string) { if (this.updateFailuresRemaining-- > 0) throw new Error("stale ref"); if (expected && this.ref?.sha !== expected) throw new Error("stale ref"); await this.createGitRef(sha); }
 }
+
+function plaintextRuntimeFixture(path = "secret.md") {
+  const github = new RuntimeMemoryGitHub();
+  const contents = new Map([[path, new TextEncoder().encode("body")]]);
+  const vaultFile = new TFile(path, contents.get(path));
+  vaultFile.stat = { size: 4, mtime: 1 };
+  const indexFiles = new Map<string, string>();
+  const plugin = {
+    app: { vault: {
+      configDir: ".obsidian",
+      adapter: {
+        async read(indexPath: string) { const value = indexFiles.get(indexPath); if (value === undefined) throw new Error(`missing ${indexPath}`); return value; },
+        async write(indexPath: string, value: string) { indexFiles.set(indexPath, value); },
+        async exists(indexPath: string) { return indexFiles.has(indexPath); },
+        async mkdir() {},
+      },
+      getFiles() { return [vaultFile]; },
+      getAbstractFileByPath(candidate: string) { return candidate === path ? vaultFile : null; },
+      async readBinary(file: TFile) { return contents.get(file.path)!.buffer; },
+    } },
+    manifest: { id: "test" },
+    githubClient: github,
+    settings: { githubOwner: "o", githubRepo: "r", githubBranch: "main", vault: "device", encryptionMode: "plaintext", encryptionPassphrase: "", conflictPolicy: "copy", abortChangePercent: 0, ignorePathRegex: "", syncObsidianConfig: false, syncBookmarks: false, syncPlugins: false, syncEnabled: true, syncOnLocalChange: true },
+    ignoredFiles: new Set<string>(), isWatchEnabled: true, isSyncInProgress: false,
+    enableWatch() { this.isWatchEnabled = true; }, updateStatusBar() {}, addIgnoredFile() {}, removeIgnoredFile() {},
+  };
+  return { runtime: new V4PluginRuntime(plugin as never), plugin, github, contents, vaultFile, indexFiles };
+}
+
+function assertNoProgressPersistence(value: unknown): void {
+  const forbidden = new Set(["phase", "currentPath", "failurePath", "pull", "push", "timings", "totalElapsedMs"]);
+  const visit = (candidate: unknown): void => {
+    if (!candidate || typeof candidate !== "object") return;
+    for (const [key, child] of Object.entries(candidate as Record<string, unknown>)) {
+      assert.equal(forbidden.has(key), false, `persisted runtime progress field: ${key}`);
+      visit(child);
+    }
+  };
+  visit(value);
+}
+
+test("v4 runtime publishes loading, saving, and terminal lifecycle phases", async () => {
+  const fixture = plaintextRuntimeFixture();
+  const seen: V4SyncProgressSnapshot[] = [];
+  const unsubscribe = fixture.runtime.subscribeProgress(snapshot => seen.push(structuredClone(snapshot)));
+
+  await fixture.runtime.forcePush();
+  unsubscribe();
+
+  const actual = seen.flatMap(snapshot => snapshot.phase ? [snapshot.phase] : []);
+  let cursor = -1;
+  for (const phase of ["checking-remote", "loading-index", "scanning-local", "planning", "uploading", "committing", "saving-index"]) {
+    cursor = actual.indexOf(phase as never, cursor + 1);
+    assert.notEqual(cursor, -1, `missing ordered phase ${phase}: ${actual.join(", ")}`);
+  }
+  assert.equal(seen.at(-1)?.lifecycle, "success");
+  assert.equal(fixture.runtime.progressSnapshot.operation, "forcePush");
+  assert.equal(fixture.runtime.progressSnapshot.trigger, "forcePush");
+  fixture.runtime.dispose();
+});
+
+test("v4 runtime keeps the exact upload failure phase and logical path", async () => {
+  const fixture = plaintextRuntimeFixture();
+  fixture.github.blobFailuresRemaining = 1;
+
+  await fixture.runtime.forcePush();
+
+  assert.equal(fixture.runtime.progressSnapshot.lifecycle, "failed");
+  assert.equal(fixture.runtime.progressSnapshot.failurePhase, "uploading");
+  assert.equal(fixture.runtime.progressSnapshot.failurePath, "secret.md");
+  assert.match(fixture.runtime.progressSnapshot.errorMessage ?? "", /upload failure/iu);
+  fixture.runtime.dispose();
+});
+
+test("v4 runtime publishes blocked with planned totals before the force override modal", async () => {
+  const fixture = plaintextRuntimeFixture();
+  fixture.plugin.settings.abortChangePercent = 1;
+  resetModalTestState();
+
+  const run = fixture.runtime.forcePush();
+  for (let tick = 0; modalButtons.length === 0 && tick < 50; tick++) {
+    await new Promise<void>(resolve => setImmediate(resolve));
+  }
+
+  assert.equal(fixture.runtime.progressSnapshot.phase, "blocked");
+  assert.deepEqual(fixture.runtime.progressSnapshot.push, { completed: 0, total: 1 });
+  const cancel = modalButtons.find(button => button.text === "Cancel");
+  assert.ok(cancel);
+  cancel.click();
+  await run;
+  assert.equal(fixture.runtime.progressSnapshot.lifecycle, "failed");
+  assert.equal(fixture.runtime.progressSnapshot.failurePhase, "blocked");
+  fixture.runtime.dispose();
+});
+
+test("v4 runtime CAS retry resets attempt-local counters and aggregates checking remote", async () => {
+  const fixture = plaintextRuntimeFixture();
+  await fixture.runtime.forcePush();
+  fixture.contents.set("secret.md", new TextEncoder().encode("changed"));
+  fixture.vaultFile.stat = { size: 7, mtime: 2 };
+  fixture.github.updateFailuresRemaining = 1;
+  const seen: V4SyncProgressSnapshot[] = [];
+  const unsubscribe = fixture.runtime.subscribeProgress(snapshot => seen.push(structuredClone(snapshot)));
+
+  await fixture.runtime.manualSync();
+  unsubscribe();
+
+  const retry = seen.find(snapshot => snapshot.phase === "retrying");
+  assert.ok(retry);
+  assert.equal(retry.attempt, 2);
+  assert.deepEqual(retry.pull, { completed: 0 });
+  assert.deepEqual(retry.push, { completed: 0 });
+  assert.equal(fixture.runtime.progressSnapshot.lifecycle, "success");
+  assert.equal(fixture.runtime.progressSnapshot.timings.find(item => item.phase === "checking-remote")?.occurrences, 2);
+  fixture.runtime.dispose();
+});
+
+test("v4 runtime retains terminal timings until the next run begins", async () => {
+  const fixture = plaintextRuntimeFixture();
+  await fixture.runtime.forcePush();
+  const completed = structuredClone(fixture.runtime.progressSnapshot.timings);
+  assert.equal(completed.length > 0, true);
+
+  await Promise.resolve();
+  assert.deepEqual(fixture.runtime.progressSnapshot.timings, completed);
+  const nextRun = fixture.runtime.manualSync();
+  assert.notDeepEqual(fixture.runtime.progressSnapshot.timings, completed);
+  await nextRun;
+  fixture.runtime.dispose();
+});
+
+test("v4 runtime reports every operation and automatic trigger without replacing terminal semantics", async () => {
+  const fixture = plaintextRuntimeFixture();
+  const cases = [
+    [() => fixture.runtime.forcePush(), "forcePush", "forcePush", "success"],
+    [() => fixture.runtime.manualSync(), "normal", "manual", "no-change"],
+    [() => fixture.runtime.forcePull(), "forcePull", "forcePull", "no-change"],
+    [() => fixture.runtime.startupSync(), "normal", "startup", "no-change"],
+    [() => fixture.runtime.scheduledSync(), "normal", "scheduled", "no-change"],
+  ] as const;
+
+  for (const [run, operation, trigger, lifecycle] of cases) {
+    await run();
+    assert.equal(fixture.runtime.progressSnapshot.operation, operation);
+    assert.equal(fixture.runtime.progressSnapshot.trigger, trigger);
+    assert.equal(fixture.runtime.progressSnapshot.lifecycle, lifecycle);
+  }
+  fixture.runtime.dispose();
+});
+
+test("v4 runtime keeps the active snapshot when another user operation is rejected as busy", async () => {
+  const fixture = plaintextRuntimeFixture();
+  await fixture.runtime.forcePush();
+  let release!: () => void;
+  fixture.github.refReadBarrier = new Promise<void>(resolve => { release = resolve; });
+
+  const active = fixture.runtime.manualSync();
+  const before = structuredClone(fixture.runtime.progressSnapshot);
+  const repeated = await fixture.runtime.forcePull();
+
+  assert.equal((repeated as { status: string }).status, "busy");
+  assert.deepEqual(fixture.runtime.progressSnapshot, before);
+  release();
+  await active;
+  fixture.runtime.dispose();
+});
+
+test("v4 runtime reveals a pending debounce after the active sync completes", async () => {
+  const fixture = plaintextRuntimeFixture();
+  await fixture.runtime.forcePush();
+  let release!: () => void;
+  fixture.github.refReadBarrier = new Promise<void>(resolve => { release = resolve; });
+  const active = fixture.runtime.manualSync();
+  const activeSnapshot = structuredClone(fixture.runtime.progressSnapshot);
+
+  fixture.runtime.enqueueModify("secret.md", 2);
+  assert.deepEqual(fixture.runtime.progressSnapshot, activeSnapshot);
+  release();
+  await active;
+
+  assert.equal(fixture.runtime.progressSnapshot.lifecycle, "waiting");
+  assert.equal(fixture.runtime.progressSnapshot.phase, "debouncing");
+  fixture.runtime.dispose();
+});
+
+test("v4 runtime starts one waiting ledger per debounce cycle and disposes subscriptions safely", () => {
+  const fixture = plaintextRuntimeFixture();
+  const seen: V4SyncProgressSnapshot[] = [];
+  fixture.runtime.subscribeProgress(snapshot => seen.push(structuredClone(snapshot)));
+
+  fixture.runtime.enqueueModify("secret.md", 2);
+  const first = fixture.runtime.progressSnapshot;
+  fixture.runtime.enqueueModify("secret.md", 3);
+  const second = fixture.runtime.progressSnapshot;
+
+  assert.equal(first.lifecycle, "waiting");
+  assert.equal(first.phase, "debouncing");
+  assert.equal(first.timings.find(item => item.phase === "debouncing")?.occurrences, 1);
+  assert.equal(second.timings.find(item => item.phase === "debouncing")?.occurrences, 1);
+  fixture.runtime.dispose();
+  fixture.runtime.dispose();
+  const countAfterDispose = seen.length;
+  fixture.runtime.enqueueModify("secret.md", 4);
+  assert.equal(seen.length, countAfterDispose);
+});
+
+test("v4 runtime progress subscribers are observational", async () => {
+  const fixture = plaintextRuntimeFixture();
+  fixture.runtime.subscribeProgress(() => { throw new Error("render failed"); });
+
+  await fixture.runtime.forcePush();
+
+  assert.equal(fixture.runtime.progressSnapshot.lifecycle, "success");
+  fixture.runtime.dispose();
+});
+
+test("v4 runtime progress stays out of plugin data, local index files, and the retired main field", async () => {
+  const fixture = plaintextRuntimeFixture();
+  const seen: V4SyncProgressSnapshot[] = [];
+  fixture.runtime.subscribeProgress(snapshot => seen.push(structuredClone(snapshot)));
+  await fixture.runtime.forcePush();
+  assert.equal(seen.some(snapshot => snapshot.currentPath === "secret.md"), true);
+  for (const serialized of fixture.indexFiles.values()) assertNoProgressPersistence(JSON.parse(serialized));
+
+  const persisted = {
+    settings: sanitizeV4SettingsForPersistence({ ...DEFAULT_SETTINGS, githubToken: "token", encryptionPassphrase: "passphrase" }),
+  };
+  assertNoProgressPersistence(persisted);
+
+  const mainSource = await readFile("src/main.ts", "utf8");
+  assert.doesNotMatch(mainSource, /\bsyncProgress\b/u);
+  assert.match(mainSource, /v4Runtime\?\.progressSnapshot\s*\?\?\s*createIdleV4Progress/u);
+  assert.match(mainSource, /async persistData\(\)[\s\S]*?saveData\(\{[\s\S]*?settings:\s*sanitizeV4SettingsForPersistence\(this\.settings\)/u);
+  fixture.runtime.dispose();
+});
 
 async function encryptedToPlaintextRuntimeFixture(savedPassphrase: string) {
   const github = new RuntimeMemoryGitHub();
@@ -115,7 +354,6 @@ async function encryptedToPlaintextRuntimeFixture(savedPassphrase: string) {
     githubClient: github,
     settings: { githubOwner: "o", githubRepo: "r", githubBranch: "main", vault: "device", encryptionMode: "plaintext", encryptionPassphrase: savedPassphrase, conflictPolicy: "copy", abortChangePercent: 0, ignorePathRegex: "", syncObsidianConfig: false, syncBookmarks: false, syncPlugins: false, syncEnabled: true, syncOnLocalChange: false },
     ignoredFiles: new Set<string>(), isWatchEnabled: false, isSyncInProgress: false,
-    syncProgress: { status: "idle", pushCount: 0, totalPush: 0, pullCount: 0, totalPull: 0, lastSyncTime: 0 },
     enableWatch() {}, updateStatusBar() {}, addIgnoredFile() {}, removeIgnoredFile() {},
   };
   return { runtime: new V4PluginRuntime(plugin as never), plugin, github, oldObjectPath };
@@ -124,7 +362,7 @@ async function encryptedToPlaintextRuntimeFixture(savedPassphrase: string) {
 test("v4 runtime authenticates encrypted remote before confirmed plaintext Force Push", async () => {
   const correct = await encryptedToPlaintextRuntimeFixture("correct");
   await correct.runtime.forcePush(true);
-  assert.equal(correct.plugin.syncProgress.status, "success");
+  assert.equal(correct.runtime.progressSnapshot.lifecycle, "success");
   assert.equal(JSON.parse(new TextDecoder().decode(correct.github.files.get(V4_CONFIG_PATH)!)).mode, "plaintext");
   assert.equal(new TextDecoder().decode(correct.github.files.get("note.md")!), "plaintext body");
   assert.equal(correct.github.files.has(correct.oldObjectPath), false);
@@ -133,8 +371,8 @@ test("v4 runtime authenticates encrypted remote before confirmed plaintext Force
   const wrong = await encryptedToPlaintextRuntimeFixture("wrong");
   const before = { ref: wrong.github.ref!.sha, blobs: wrong.github.blobs.size, trees: wrong.github.trees.size, commits: wrong.github.commits.size };
   await wrong.runtime.forcePush(true);
-  assert.equal(wrong.plugin.syncProgress.status, "fail");
-  assert.match(wrong.plugin.syncProgress.errorMessage ?? "", /decrypt|passphrase|authentication/iu);
+  assert.equal(wrong.runtime.progressSnapshot.lifecycle, "failed");
+  assert.match(wrong.runtime.progressSnapshot.errorMessage ?? "", /decrypt|passphrase|authentication/iu);
   assert.deepEqual({ ref: wrong.github.ref!.sha, blobs: wrong.github.blobs.size, trees: wrong.github.trees.size, commits: wrong.github.commits.size }, before);
   assert.equal(wrong.github.files.has(wrong.oldObjectPath), true);
   wrong.runtime.dispose();
@@ -169,12 +407,11 @@ test("v4 runtime recovers after a published commit whose second local shard save
     githubClient: github,
     settings: { githubOwner: "o", githubRepo: "r", githubBranch: "main", vault: "device", encryptionMode: "plaintext", encryptionPassphrase: "", conflictPolicy: "copy", abortChangePercent: 0, ignorePathRegex: "", syncObsidianConfig: false, syncBookmarks: false, syncPlugins: false, syncEnabled: true, syncOnLocalChange: false },
     ignoredFiles: new Set<string>(), isWatchEnabled: false, isSyncInProgress: false,
-    syncProgress: { status: "idle", pushCount: 0, totalPush: 0, pullCount: 0, totalPull: 0, lastSyncTime: 0 },
     enableWatch() {}, updateStatusBar() {}, addIgnoredFile() {}, removeIgnoredFile() {},
   };
   let runtime = new V4PluginRuntime(plugin as never);
   await runtime.forcePush(true);
-  assert.equal(plugin.syncProgress.status, "success");
+  assert.equal(runtime.progressSnapshot.lifecycle, "success");
   const previousCommit = github.ref!.sha;
   contents.set("a.md", new TextEncoder().encode("new-a"));
   contents.set("b.md", new TextEncoder().encode("new-b"));
@@ -185,8 +422,8 @@ test("v4 runtime recovers after a published commit whose second local shard save
 
   await runtime.manualSync();
 
-  assert.equal(plugin.syncProgress.status, "fail");
-  assert.match(plugin.syncProgress.errorMessage ?? "", /second shard persistence failure/iu);
+  assert.equal(runtime.progressSnapshot.lifecycle, "failed");
+  assert.match(runtime.progressSnapshot.errorMessage ?? "", /second shard persistence failure/iu);
   const publishedCommit = github.ref!.sha;
   assert.notEqual(publishedCommit, previousCommit);
   const commitsAfterPublish = github.commits.size;
@@ -200,7 +437,7 @@ test("v4 runtime recovers after a published commit whose second local shard save
   await runtime.manualSync();
 
   assert.equal(persistedHeaderAfterFailure.remoteCommitSha, previousCommit);
-  assert.equal(plugin.syncProgress.status, "success");
+  assert.equal(runtime.progressSnapshot.lifecycle, "no-change");
   assert.equal(github.ref!.sha, publishedCommit);
   assert.equal(github.commits.size, commitsAfterPublish);
   assert.equal(github.readPaths.includes(V4_HEAD_PATH), true);
@@ -220,7 +457,7 @@ test("v4 runtime recovers after a published commit whose second local shard save
 
   await runtime.manualSync();
 
-  assert.equal(plugin.syncProgress.status, "success");
+  assert.equal(runtime.progressSnapshot.lifecycle, "no-change");
   assert.equal(github.commits.size, commitsBeforeCacheRecovery);
   assert.equal(github.readPaths.includes(V4_HEAD_PATH), true);
   assert.equal(github.readPaths.some(path => path.includes("/index/")), true);
@@ -295,7 +532,6 @@ function runtimeFixture(input: { remoteConfig: V4RemoteConfig; localIndexRepoId:
     ignoredFiles: new Set<string>(),
     isWatchEnabled: false,
     isSyncInProgress: false,
-    syncProgress: { status: "idle", pushCount: 0, totalPush: 0, pullCount: 0, totalPull: 0, lastSyncTime: 0 },
     enableWatch() {},
     updateStatusBar() {},
     addIgnoredFile() {},
@@ -354,7 +590,7 @@ test("v4 runtime rejects a remote repo identity mismatch before vault access or 
   assert.equal(selectV4RuntimeConfig(remote, "encrypted", "b/r#main").repoId, "b/r#main");
   await fixture.runtime.manualSync();
 
-  assert.match(fixture.plugin.syncProgress.errorMessage ?? "", /repository identity mismatch/iu);
+  assert.match(fixture.runtime.progressSnapshot.errorMessage ?? "", /repository identity mismatch/iu);
   assert.equal(fixture.vaultLists, 0);
   fixture.runtime.dispose();
 });

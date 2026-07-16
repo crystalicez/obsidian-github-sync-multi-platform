@@ -17,6 +17,7 @@ import type { V4ConflictResolution } from "./conflicts"
 import { V4SyncCoordinator, type V4QueuedChange, type V4SyncRequest } from "./sync-coordinator"
 import { expectedV4PathLayout, V4_FORMAT_VERSION, V4_CONFIG_PATH, type V4RemoteConfig, type V4StorageMode } from "./protocol-types"
 import { V4HistoryService } from "./history-service"
+import { V4ProgressStore, type V4SyncProgressSnapshot } from "./progress"
 
 const V4_INDEX_ROOT = "github-sync-v4-index"
 const fallbackStores = new WeakMap<object, Map<string, string>>()
@@ -65,6 +66,9 @@ function createIndexAdapter(plugin: FastSync): V4LocalIndexAdapter {
 export class V4PluginRuntime {
   private readonly coordinator: V4SyncCoordinator
   private readonly adapter: V4LocalIndexAdapter
+  private readonly progressStore = new V4ProgressStore()
+  private debounceRunActive = false
+  private disposed = false
 
   constructor(private readonly plugin: FastSync) {
     this.adapter = createIndexAdapter(plugin)
@@ -75,9 +79,22 @@ export class V4PluginRuntime {
     })
   }
 
-  dispose(): void { this.coordinator.dispose() }
+  dispose(): void {
+    if (this.disposed) return
+    this.disposed = true
+    this.debounceRunActive = false
+    this.coordinator.dispose()
+    this.progressStore.dispose()
+  }
   get isSyncing(): boolean { return this.coordinator.isSyncing }
   get pendingCount(): number { return this.coordinator.pendingCount }
+  get progressSnapshot(): V4SyncProgressSnapshot {
+    return this.snapshotForConsumers(this.progressStore.snapshot)
+  }
+
+  subscribeProgress(listener: (snapshot: V4SyncProgressSnapshot) => void): () => void {
+    return this.progressStore.subscribe(snapshot => listener(this.snapshotForConsumers(snapshot)))
+  }
 
   manualSync(): Promise<unknown> { return this.coordinator.run({ operation: "normal", trigger: "manual" }) }
   startupSync(): Promise<unknown> { return this.coordinator.run({ operation: "normal", trigger: "startup" }) }
@@ -121,6 +138,7 @@ export class V4PluginRuntime {
   enqueueRescan(): void { this.enqueue({ type: "rescan", mtime: Date.now() }) }
 
   private enqueue(change: V4QueuedChange): void {
+    if (this.disposed) return
     if (!this.plugin.settings.syncEnabled || !this.plugin.settings.syncOnLocalChange || !this.plugin.isWatchEnabled) return
     if (change.type === "rescan") {
       this.coordinator.enqueue(change)
@@ -140,13 +158,32 @@ export class V4PluginRuntime {
   }
 
   private markWaiting(): void {
-    this.plugin.syncProgress = {
-      ...this.plugin.syncProgress,
-      status: "waiting",
-      totalPush: this.coordinator.pendingCount,
-      pushCount: 0,
-    }
+    if (this.coordinator.isSyncing) return
+    this.beginWaitingRun()
     this.plugin.updateStatusBar()
+  }
+
+  private beginWaitingRun(): void {
+    const push = { completed: 0, total: this.coordinator.pendingCount }
+    if (!this.debounceRunActive) {
+      this.debounceRunActive = true
+      this.progressStore.beginRun({
+        phase: "debouncing",
+        operation: "normal",
+        trigger: "localChange",
+        attempt: 0,
+        pull: { completed: 0 },
+        push,
+      })
+    } else {
+      this.progressStore.update({ push })
+    }
+  }
+
+  private snapshotForConsumers(snapshot: V4SyncProgressSnapshot): V4SyncProgressSnapshot {
+    return this.debounceRunActive && snapshot.lifecycle === "active" && snapshot.phase === "debouncing"
+      ? Object.freeze({ ...snapshot, lifecycle: "waiting" as const })
+      : snapshot
   }
 
   private inScope(path: string): boolean {
@@ -230,21 +267,39 @@ export class V4PluginRuntime {
   }
 
   private async execute(request: V4SyncRequest, changes: V4QueuedChange[]): Promise<{ changedFiles: number }> {
-    if (!this.plugin.githubClient) {
-      const message = "GitHub connection is not configured."
-      this.plugin.syncProgress = { status: "fail", pushCount: 0, totalPush: 0, pullCount: 0, totalPull: 0, lastSyncTime: this.plugin.syncProgress.lastSyncTime, errorMessage: message }
-      new Notice(`GitHub Sync failed: ${message}`)
-      this.plugin.updateStatusBar()
-      return { changedFiles: 0 }
+    const continuingDebounceRun = this.debounceRunActive
+    this.debounceRunActive = false
+    const runPatch = {
+      operation: request.operation,
+      trigger: request.trigger,
+      attempt: 1,
+      currentPath: undefined,
+      currentDirection: undefined,
+      pull: { completed: 0, total: undefined },
+      push: { completed: 0, total: undefined },
+      errorMessage: undefined,
+      failurePhase: undefined,
+      failurePath: undefined,
+    } as const
+    if (continuingDebounceRun) this.progressStore.update({ ...runPatch, lifecycle: "active", phase: "checking-remote" })
+    else {
+      this.progressStore.beginRun(runPatch)
+      this.progressStore.update({ phase: "checking-remote" })
     }
     if (request.trigger === "startup") this.plugin.enableWatch()
     this.plugin.isSyncInProgress = true
-    this.plugin.syncProgress = { status: "syncing", pushCount: 0, totalPush: changes.length, pullCount: 0, totalPull: 0, lastSyncTime: this.plugin.syncProgress.lastSyncTime }
     this.plugin.updateStatusBar()
     try {
+      if (!this.plugin.githubClient) throw new Error("GitHub connection is not configured.")
       let lastError: unknown
       for (let attempt = 1; attempt <= 3; attempt++) {
         try {
+          this.progressStore.update({
+            phase: "checking-remote",
+            attempt,
+            currentPath: undefined,
+            currentDirection: undefined,
+          })
           const discovered = await this.remoteOrNewConfig()
           const desiredMode = this.plugin.settings.encryptionMode
           if (discovered.mode !== desiredMode && desiredMode === "encrypted") {
@@ -254,6 +309,7 @@ export class V4PluginRuntime {
             throw new Error("Remote storage mode differs. Force Push is required.")
           }
           const config = selectV4RuntimeConfig(discovered, desiredMode, this.repoId())
+          this.progressStore.update({ phase: "loading-index", currentPath: undefined, currentDirection: undefined })
           const index = await this.loadIndex(config)
           const previousShardHashes = { ...index.shardHashes }
           const passphrase = this.plugin.settings.encryptionPassphrase
@@ -273,21 +329,20 @@ export class V4PluginRuntime {
             abortChangePercent: this.plugin.settings.abortChangePercent,
             askConflict: input => this.askConflict(input.path),
             includePath: inScope,
+            onProgress: patch => {
+              if (patch.phase === "checking-remote") return
+              this.progressStore.update(patch)
+            },
           }).sync({ operation: request.operation, allowThresholdOverride: !!request.allowThresholdOverride, changes })
+          this.progressStore.update({ phase: "saving-index", currentPath: undefined, currentDirection: undefined })
           await this.saveIndex(index, previousShardHashes)
-          this.plugin.syncProgress = {
-            status: "success",
-            pushCount: result.pushedFiles,
-            totalPush: result.pushedFiles,
-            pullCount: result.pulledFiles,
-            totalPull: result.pulledFiles,
-            lastSyncTime: Date.now(),
-          }
           if (result.changedFiles === 0 && request.trigger === "manual") new Notice("GitHub Sync: No changes")
+          this.progressStore.finish(result.changedFiles === 0 ? "no-change" : "success", { lastSyncTime: Date.now() })
           return { changedFiles: result.changedFiles }
         } catch (error) {
           lastError = error
           if (error instanceof V4ChangeGuardError && !request.allowThresholdOverride && request.operation !== "normal") {
+            this.progressStore.update({ phase: "blocked", currentPath: undefined, currentDirection: undefined })
             const confirmed = await this.confirmThresholdOverride(error, request.operation)
             if (!confirmed) throw new Error("Sync cancelled because the modification threshold was exceeded.")
             request.allowThresholdOverride = true
@@ -295,17 +350,26 @@ export class V4PluginRuntime {
             continue
           }
           if (attempt === 3 || !/branch head changed|stale ref/i.test((error as Error).message)) throw error
+          this.progressStore.update({
+            phase: "retrying",
+            attempt: attempt + 1,
+            currentPath: undefined,
+            currentDirection: undefined,
+            pull: { completed: 0, total: undefined },
+            push: { completed: 0, total: undefined },
+          })
         }
       }
       throw lastError
     } catch (error) {
       const message = (error as Error).message
-      this.plugin.syncProgress = { status: "fail", pushCount: 0, totalPush: 0, pullCount: 0, totalPull: 0, lastSyncTime: this.plugin.syncProgress.lastSyncTime, errorMessage: message }
+      this.progressStore.finish("failed", { errorMessage: message })
       new Notice(`GitHub Sync failed: ${message}`)
       return { changedFiles: 0 }
     } finally {
       this.plugin.isSyncInProgress = false
       this.plugin.enableWatch()
+      if (this.coordinator.pendingCount > 0) this.beginWaitingRun()
       this.plugin.updateStatusBar()
     }
   }

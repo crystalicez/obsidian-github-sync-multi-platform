@@ -10,13 +10,6 @@ export interface V4StatusDisplay {
   title: string;
 }
 
-export interface V4ActiveSyncStatusInput {
-  pushCount: number;
-  totalPush: number;
-  pullCount: number;
-  totalPull: number;
-}
-
 function formatCounter(progress: V4DirectionalProgress): string | undefined {
   if (progress.total === undefined) return progress.completed > 0 ? `${progress.completed}/?` : undefined;
   if (progress.total === 0 && progress.completed === 0) return undefined;
@@ -30,28 +23,7 @@ function formatCounterTitle(label: string, progress: V4DirectionalProgress): str
   return remaining === undefined ? `${label}: ${counter}` : `${label}: ${counter} · remaining ${remaining}`;
 }
 
-function isLegacyStatusInput(input: V4SyncProgressSnapshot | V4ActiveSyncStatusInput): input is V4ActiveSyncStatusInput {
-  return "pushCount" in input;
-}
-
-export function formatV4ActiveSyncStatus(snapshot: V4SyncProgressSnapshot): V4StatusDisplay;
-/** Transitional overload for the existing main.ts caller; Task 4 replaces it with the progress store. */
-export function formatV4ActiveSyncStatus(input: V4ActiveSyncStatusInput): V4StatusDisplay;
-export function formatV4ActiveSyncStatus(input: V4SyncProgressSnapshot | V4ActiveSyncStatusInput): V4StatusDisplay {
-  if (isLegacyStatusInput(input)) {
-    if (input.totalPush === 0 && input.totalPull === 0) {
-      return {
-        text: "⏳ GH Sync: Checking remote...",
-        title: "GitHub Sync: Checking remote and planning changes...",
-      };
-    }
-    return {
-      text: `⏳ GH Sync: ↑${input.pushCount}/${input.totalPush} ↓${input.pullCount}/${input.totalPull}`,
-      title: "GitHub Sync: Syncing in progress...",
-    };
-  }
-
-  const snapshot = input;
+export function formatV4ActiveSyncStatus(snapshot: V4SyncProgressSnapshot): V4StatusDisplay {
   const phase = snapshot.phase ? formatV4PhaseLabel(snapshot.phase) : "Syncing";
   const pull = formatCounter(snapshot.pull);
   const push = formatCounter(snapshot.push);

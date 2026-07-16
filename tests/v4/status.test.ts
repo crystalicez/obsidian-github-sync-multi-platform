@@ -38,10 +38,3 @@ test("failure tooltip keeps phase path counters and error", () => {
   };
   assert.match(formatV4ActiveSyncStatus(snapshot).title, /Failed during Uploading.*A\.md.*network down/su);
 });
-
-test("legacy main status input remains supported until progress-store integration", () => {
-  assert.deepEqual(formatV4ActiveSyncStatus({ pushCount: 1, totalPush: 3, pullCount: 2, totalPull: 4 }), {
-    text: "⏳ GH Sync: ↑1/3 ↓2/4",
-    title: "GitHub Sync: Syncing in progress...",
-  });
-});
