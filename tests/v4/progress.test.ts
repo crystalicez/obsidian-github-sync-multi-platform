@@ -212,6 +212,110 @@ test("metadata publications and new subscribers cannot bypass a pending throttle
   assert.deepEqual(seen.at(-1)?.push, { completed: 1, total: 2 });
 });
 
+for (const scenario of [
+  {
+    name: "an unchanged phase with path and counter changes",
+    arrange: (_store: V4ProgressStore) => undefined,
+    update: { phase: "uploading", currentPath: "B.md", push: { completed: 1 } } as V4SyncProgressPatch,
+    expectedPath: "B.md",
+    expectedCompleted: 1,
+  },
+  {
+    name: "an unchanged lifecycle with path and counter changes",
+    arrange: (_store: V4ProgressStore) => undefined,
+    update: { lifecycle: "active", currentPath: "B.md", push: { completed: 1 } } as V4SyncProgressPatch,
+    expectedPath: "B.md",
+    expectedCompleted: 1,
+  },
+  {
+    name: "attempt metadata mixed with path and counter changes",
+    arrange: (_store: V4ProgressStore) => undefined,
+    update: { attempt: 2, currentPath: "B.md", push: { completed: 1 } } as V4SyncProgressPatch,
+    expectedPath: "B.md",
+    expectedCompleted: 1,
+  },
+  {
+    name: "mixed metadata and sensitive changes while a throttle is already pending",
+    arrange: (store: V4ProgressStore) => store.update({ currentPath: "B.md", push: { completed: 1 } }),
+    update: { attempt: 2, currentPath: "C.md", push: { completed: 2 } } as V4SyncProgressPatch,
+    expectedPath: "C.md",
+    expectedCompleted: 2,
+  },
+]) {
+  test(`${scenario.name} retains eligible sensitive fields until exactly 400 milliseconds`, () => {
+    const { store, setNow, runScheduledCallbackAt } = createProgressFixture();
+    const seen: V4SyncProgressSnapshot[] = [];
+    store.beginRun({ phase: "uploading", currentPath: "A.md", push: { completed: 0, total: 3 } });
+    store.subscribe(snapshot => seen.push(snapshot));
+
+    scenario.arrange(store);
+    store.update(scenario.update);
+
+    assert.equal(store.snapshot.currentPath, "A.md");
+    assert.deepEqual(store.snapshot.push, { completed: 0, total: 3 });
+    assert.equal(seen.at(-1)?.currentPath, "A.md");
+    assert.deepEqual(seen.at(-1)?.push, { completed: 0, total: 3 });
+
+    let initialForLateSubscriber: V4SyncProgressSnapshot | undefined;
+    store.subscribe(snapshot => { initialForLateSubscriber ??= snapshot; });
+    assert.equal(initialForLateSubscriber?.currentPath, "A.md");
+    assert.deepEqual(initialForLateSubscriber?.push, { completed: 0, total: 3 });
+
+    const publicationsBeforeMetadata = seen.length;
+    store.update({ attempt: 9 });
+    assert.equal(seen.length, publicationsBeforeMetadata + 1);
+    assert.equal(seen.at(-1)?.attempt, 9);
+    assert.equal(seen.at(-1)?.currentPath, "A.md");
+    assert.deepEqual(seen.at(-1)?.push, { completed: 0, total: 3 });
+
+    setNow(1_000);
+    runScheduledCallbackAt(1_000);
+    assert.equal(store.snapshot.timings[0].elapsedMs, 1_000);
+    assert.equal(store.snapshot.currentPath, "A.md");
+    assert.deepEqual(store.snapshot.push, { completed: 0, total: 3 });
+    assert.equal(seen.at(-1)?.currentPath, "A.md");
+    assert.deepEqual(seen.at(-1)?.push, { completed: 0, total: 3 });
+
+    runScheduledCallbackAt(400);
+    assert.equal(store.snapshot.currentPath, scenario.expectedPath);
+    assert.deepEqual(store.snapshot.push, { completed: scenario.expectedCompleted, total: 3 });
+    assert.equal(seen.at(-1)?.currentPath, scenario.expectedPath);
+    assert.deepEqual(seen.at(-1)?.push, { completed: scenario.expectedCompleted, total: 3 });
+  });
+}
+
+test("actual phase and lifecycle transitions flush pending sensitive state and publish their next state immediately", () => {
+  {
+    const { store } = createProgressFixture();
+    const seen: V4SyncProgressSnapshot[] = [];
+    store.beginRun({ phase: "uploading", currentPath: "A.md", push: { completed: 0, total: 3 } });
+    store.subscribe(snapshot => seen.push(snapshot));
+    store.update({ currentPath: "B.md", push: { completed: 1 } });
+
+    store.update({ phase: "committing", currentPath: "C.md", push: { completed: 2 } });
+
+    assert.deepEqual(seen.slice(-2).map(snapshot => [snapshot.lifecycle, snapshot.phase, snapshot.currentPath, snapshot.push.completed]), [
+      ["active", "uploading", "B.md", 1],
+      ["active", "committing", "C.md", 2],
+    ]);
+  }
+
+  {
+    const { store } = createProgressFixture();
+    const seen: V4SyncProgressSnapshot[] = [];
+    store.beginRun({ phase: "uploading", currentPath: "A.md", push: { completed: 0, total: 3 } });
+    store.subscribe(snapshot => seen.push(snapshot));
+    store.update({ currentPath: "B.md", push: { completed: 1 } });
+
+    store.update({ lifecycle: "success", currentPath: "C.md", push: { completed: 2 } });
+
+    assert.deepEqual(seen.slice(-2).map(snapshot => [snapshot.lifecycle, snapshot.phase, snapshot.currentPath, snapshot.push.completed]), [
+      ["active", "uploading", "B.md", 1],
+      ["success", "uploading", "C.md", 2],
+    ]);
+  }
+});
+
 test("public snapshot is initialized before any working state is published", () => {
   const { store } = createProgressFixture();
   store.update({ currentPath: "unpublished.md", push: { completed: 1 } });

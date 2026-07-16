@@ -85,10 +85,6 @@ const phaseLabels: Record<V4SyncPhase, string> = {
   "retrying": "Retrying",
 };
 
-function hasOwn<T extends object>(value: T, key: PropertyKey): boolean {
-  return Object.prototype.hasOwnProperty.call(value, key);
-}
-
 function normalizeCount(value: number): number {
   return Math.max(0, Number.isFinite(value) ? Math.floor(value) : 0);
 }
@@ -109,23 +105,50 @@ function mergePatch(snapshot: V4SyncProgressSnapshot, patch: V4SyncProgressPatch
   };
 }
 
-function snapshotsEqual(left: V4SyncProgressSnapshot, right: V4SyncProgressSnapshot): boolean {
-  return left.lifecycle === right.lifecycle
-    && left.phase === right.phase
-    && left.currentPath === right.currentPath
+function directionalProgressEqual(left: V4DirectionalProgress, right: V4DirectionalProgress): boolean {
+  return left.completed === right.completed && left.total === right.total;
+}
+
+function sensitiveProgressEqual(left: V4SyncProgressSnapshot, right: V4SyncProgressSnapshot): boolean {
+  return left.currentPath === right.currentPath
     && left.currentDirection === right.currentDirection
-    && left.pull.completed === right.pull.completed
-    && left.pull.total === right.pull.total
-    && left.push.completed === right.push.completed
-    && left.push.total === right.push.total
-    && left.operation === right.operation
+    && directionalProgressEqual(left.pull, right.pull)
+    && directionalProgressEqual(left.push, right.push);
+}
+
+function immediateMetadataEqual(left: V4SyncProgressSnapshot, right: V4SyncProgressSnapshot): boolean {
+  return left.operation === right.operation
     && left.trigger === right.trigger
     && left.attempt === right.attempt
-    && left.totalElapsedMs === right.totalElapsedMs
     && left.lastSyncTime === right.lastSyncTime
     && left.errorMessage === right.errorMessage
     && left.failurePhase === right.failurePhase
-    && left.failurePath === right.failurePath
+    && left.failurePath === right.failurePath;
+}
+
+function phaseOrLifecycleTransitioned(left: V4SyncProgressSnapshot, right: V4SyncProgressSnapshot): boolean {
+  return left.phase !== right.phase || left.lifecycle !== right.lifecycle;
+}
+
+function withEligibleSensitiveProgress(
+  source: V4SyncProgressSnapshot,
+  eligible: V4SyncProgressSnapshot,
+): V4SyncProgressSnapshot {
+  return {
+    ...source,
+    currentPath: eligible.currentPath,
+    currentDirection: eligible.currentDirection,
+    pull: eligible.pull,
+    push: eligible.push,
+  };
+}
+
+function snapshotsEqual(left: V4SyncProgressSnapshot, right: V4SyncProgressSnapshot): boolean {
+  return left.lifecycle === right.lifecycle
+    && left.phase === right.phase
+    && sensitiveProgressEqual(left, right)
+    && immediateMetadataEqual(left, right)
+    && left.totalElapsedMs === right.totalElapsedMs
     && left.timings.length === right.timings.length
     && left.timings.every((timing, index) => {
       const other = right.timings[index];
@@ -264,14 +287,17 @@ export class V4ProgressStore {
 
   update(patch: V4SyncProgressPatch): void {
     if (this.disposed) return;
-    const phaseChanged = hasOwn(patch, "phase") && patch.phase !== this.state.phase;
-    const lifecycleChanged = hasOwn(patch, "lifecycle") && patch.lifecycle !== this.state.lifecycle;
-    if ((phaseChanged || lifecycleChanged) && this.throttlePending) this.flush();
-
     const now = this.observeMonotonicNow();
-    const previousLifecycle = this.state.lifecycle;
-    const next = mergePatch(this.state, patch);
-    if (snapshotsEqual(this.state, next)) return;
+    const working = this.state;
+    const next = mergePatch(working, patch);
+    if (snapshotsEqual(working, next)) return;
+
+    const phaseChanged = working.phase !== next.phase;
+    const immediateTransition = phaseOrLifecycleTransitioned(working, next);
+    const metadataChanged = !immediateMetadataEqual(working, next);
+    if (immediateTransition && this.throttlePending) this.flush();
+
+    const previousLifecycle = working.lifecycle;
     const runEnded = previousLifecycle === "active" && next.lifecycle !== "active";
 
     if (previousLifecycle !== "active" && next.lifecycle === "active" && this.runStartedAt === undefined) {
@@ -293,17 +319,20 @@ export class V4ProgressStore {
     if (runEnded) this.runStartedAt = undefined;
 
     if (this.state.lifecycle === "active") this.scheduleTimingRefresh();
-    if (!phaseChanged && !lifecycleChanged && this.isThrottleOnlyPatch(patch)) {
+    if (immediateTransition) {
+      this.cancelThrottle();
+      this.publish();
+      return;
+    }
+
+    const sensitivePending = !sensitiveProgressEqual(this.state, this.publishedSnapshot);
+    if (sensitivePending) {
       this.throttlePending = true;
       this.scheduleThrottle();
-      return;
+    } else {
+      this.cancelThrottle();
     }
-    if (this.throttlePending) {
-      this.publishEligibleState();
-      return;
-    }
-    this.cancelThrottle();
-    this.publish();
+    if (metadataChanged) this.publishEligibleState();
   }
 
   finish(lifecycle: Extract<V4SyncLifecycle, "success" | "no-change" | "failed">, patch: V4SyncProgressPatch = {}): void {
@@ -337,11 +366,6 @@ export class V4ProgressStore {
     this.cancelThrottle();
     this.cancelTimingRefresh();
     this.subscribers.clear();
-  }
-
-  private isThrottleOnlyPatch(patch: V4SyncProgressPatch): boolean {
-    const keys = Object.keys(patch);
-    return keys.length > 0 && keys.every(key => key === "currentPath" || key === "currentDirection" || key === "pull" || key === "push");
   }
 
   private observeMonotonicNow(): number {
@@ -411,13 +435,7 @@ export class V4ProgressStore {
       this.publish();
       return;
     }
-    this.publish({
-      ...this.state,
-      currentPath: this.publishedSnapshot.currentPath,
-      currentDirection: this.publishedSnapshot.currentDirection,
-      pull: this.publishedSnapshot.pull,
-      push: this.publishedSnapshot.push,
-    });
+    this.publish(withEligibleSensitiveProgress(this.state, this.publishedSnapshot));
   }
 
   private cancelThrottle(): void {
