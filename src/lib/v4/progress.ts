@@ -295,7 +295,7 @@ export class V4ProgressStore {
     const phaseChanged = working.phase !== next.phase;
     const immediateTransition = phaseOrLifecycleTransitioned(working, next);
     const metadataChanged = !immediateMetadataEqual(working, next);
-    if (immediateTransition && this.throttlePending) this.flush();
+    if (immediateTransition && this.throttlePending) this.flushPendingSensitive(now);
 
     const previousLifecycle = working.lifecycle;
     const runEnded = previousLifecycle === "active" && next.lifecycle !== "active";
@@ -337,8 +337,8 @@ export class V4ProgressStore {
 
   finish(lifecycle: Extract<V4SyncLifecycle, "success" | "no-change" | "failed">, patch: V4SyncProgressPatch = {}): void {
     if (this.disposed) return;
-    if (this.throttlePending) this.flush();
     const now = this.observeMonotonicNow();
+    if (this.throttlePending) this.flushPendingSensitive(now);
     this.closeActivePhase(now);
     this.cancelTimingRefresh();
     const failurePatch = lifecycle === "failed"
@@ -355,9 +355,8 @@ export class V4ProgressStore {
 
   flush(): void {
     if (this.disposed || !this.throttlePending) return;
-    this.cancelThrottle();
     this.refreshTimingSnapshot(this.observeMonotonicNow());
-    this.publish();
+    this.publishEligibleState();
   }
 
   dispose(): void {
@@ -413,10 +412,15 @@ export class V4ProgressStore {
     this.throttleHandle = this.schedule(() => {
       this.throttleHandle = undefined;
       if (this.disposed || !this.throttlePending) return;
-      this.throttlePending = false;
-      this.refreshTimingSnapshot(this.observeMonotonicNow());
-      this.publish();
+      this.flushPendingSensitive(this.observeMonotonicNow());
     }, this.throttleMs);
+  }
+
+  private flushPendingSensitive(now: number): void {
+    if (!this.throttlePending) return;
+    this.cancelThrottle();
+    this.refreshTimingSnapshot(now);
+    this.publish();
   }
 
   private scheduleTimingRefresh(): void {

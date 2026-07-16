@@ -44,6 +44,29 @@ function createProgressFixture() {
   };
 }
 
+function createAdvancingClockFixture() {
+  let now = 0;
+  let clockCalls = 0;
+  const scheduled = new Map<number, { callback: () => void; delay: number }>();
+  let nextHandle = 1;
+  const store = new V4ProgressStore({
+    throttleMs: 400,
+    timingRefreshMs: 1_000,
+    schedule: (callback, delay) => {
+      const handle = nextHandle++;
+      scheduled.set(handle, { callback, delay });
+      return handle;
+    },
+    cancel: handle => { scheduled.delete(handle as number); },
+    monotonicNow: () => {
+      clockCalls += 1;
+      now += 100;
+      return now;
+    },
+  });
+  return { store, scheduled, clockCalls: () => clockCalls };
+}
+
 test("phase changes publish immediately while path and counters throttle", () => {
   const { store, scheduled, runScheduledCallbackAt } = createProgressFixture();
   const seen: V4SyncProgressSnapshot[] = [];
@@ -87,6 +110,113 @@ test("a phase transition flushes the pending path before publishing the next pha
     ["hashing", "B.md"],
     ["encrypting", "B.md"],
   ]);
+});
+
+test("a phase transition uses one atomic timestamp while flushing pending sensitive state", () => {
+  const { store, clockCalls } = createAdvancingClockFixture();
+  const seen: V4SyncProgressSnapshot[] = [];
+  store.beginRun({ phase: "uploading", currentPath: "A.md" });
+  store.subscribe(snapshot => seen.push(snapshot));
+  store.update({ currentPath: "B.md" });
+
+  store.update({ phase: "committing", currentPath: "C.md" });
+
+  assert.equal(clockCalls(), 3);
+  assert.deepEqual(seen.slice(-2).map(snapshot => ({
+    phase: snapshot.phase,
+    path: snapshot.currentPath,
+    uploadingElapsedMs: snapshot.timings.find(timing => timing.phase === "uploading")?.elapsedMs,
+    totalElapsedMs: snapshot.totalElapsedMs,
+  })), [
+    { phase: "uploading", path: "B.md", uploadingElapsedMs: 200, totalElapsedMs: 200 },
+    { phase: "committing", path: "C.md", uploadingElapsedMs: 200, totalElapsedMs: 200 },
+  ]);
+});
+
+test("a terminal update closes at its atomic timestamp without a preceding timing regression", () => {
+  const { store, clockCalls } = createAdvancingClockFixture();
+  const seen: V4SyncProgressSnapshot[] = [];
+  store.beginRun({ phase: "uploading", currentPath: "A.md" });
+  store.subscribe(snapshot => seen.push(snapshot));
+  store.update({ currentPath: "B.md" });
+
+  store.update({ lifecycle: "success", currentPath: "C.md" });
+
+  assert.equal(clockCalls(), 3);
+  assert.deepEqual(seen.slice(-2).map(snapshot => ({
+    lifecycle: snapshot.lifecycle,
+    path: snapshot.currentPath,
+    elapsedMs: snapshot.timings[0]?.elapsedMs,
+    totalElapsedMs: snapshot.totalElapsedMs,
+  })), [
+    { lifecycle: "active", path: "B.md", elapsedMs: 200, totalElapsedMs: 200 },
+    { lifecycle: "success", path: "C.md", elapsedMs: 200, totalElapsedMs: 200 },
+  ]);
+});
+
+test("finish closes at its one accepted atomic timestamp while flushing pending sensitive state", () => {
+  const { store, clockCalls } = createAdvancingClockFixture();
+  const seen: V4SyncProgressSnapshot[] = [];
+  store.beginRun({ phase: "uploading", currentPath: "A.md" });
+  store.subscribe(snapshot => seen.push(snapshot));
+  store.update({ currentPath: "B.md" });
+
+  store.finish("success", { currentPath: "C.md" });
+
+  assert.equal(clockCalls(), 3);
+  assert.deepEqual(seen.slice(-2).map(snapshot => ({
+    lifecycle: snapshot.lifecycle,
+    path: snapshot.currentPath,
+    elapsedMs: snapshot.timings[0]?.elapsedMs,
+    totalElapsedMs: snapshot.totalElapsedMs,
+  })), [
+    { lifecycle: "active", path: "B.md", elapsedMs: 200, totalElapsedMs: 200 },
+    { lifecycle: "success", path: "C.md", elapsedMs: 200, totalElapsedMs: 200 },
+  ]);
+});
+
+test("public flush keeps sensitive progress throttled until the scheduler boundary", () => {
+  const { store, scheduled, cancelled, setNow, runScheduledCallbackAt } = createProgressFixture();
+  const seen: V4SyncProgressSnapshot[] = [];
+  store.beginRun({ phase: "uploading", currentPath: "A.md", push: { completed: 0, total: 2 } });
+  store.subscribe(snapshot => seen.push(snapshot));
+  setNow(100);
+  store.update({ currentPath: "B.md", push: { completed: 1 } });
+
+  setNow(250);
+  store.flush();
+
+  assert.equal(store.snapshot.currentPath, "A.md");
+  assert.deepEqual(store.snapshot.push, { completed: 0, total: 2 });
+  assert.equal(store.snapshot.timings[0].elapsedMs, 250);
+  assert.equal([...scheduled.values()].some(item => item.delay === 400), true);
+  assert.equal(cancelled.length, 0);
+  assert.equal(seen.at(-1)?.currentPath, "A.md");
+
+  let initialForLateSubscriber: V4SyncProgressSnapshot | undefined;
+  store.subscribe(snapshot => { initialForLateSubscriber ??= snapshot; });
+  assert.equal(initialForLateSubscriber?.currentPath, "A.md");
+  assert.deepEqual(initialForLateSubscriber?.push, { completed: 0, total: 2 });
+
+  setNow(500);
+  runScheduledCallbackAt(400);
+  assert.equal(store.snapshot.currentPath, "B.md");
+  assert.deepEqual(store.snapshot.push, { completed: 1, total: 2 });
+  assert.equal(store.snapshot.timings[0].elapsedMs, 500);
+});
+
+test("dispose still cancels both timers after a public flush preserves the pending throttle", () => {
+  const { store, scheduled, cancelled, setNow } = createProgressFixture();
+  store.beginRun({ phase: "uploading", currentPath: "A.md" });
+  setNow(100);
+  store.update({ currentPath: "B.md" });
+  setNow(250);
+  store.flush();
+
+  assert.equal(scheduled.size, 2);
+  store.dispose();
+  assert.equal(scheduled.size, 0);
+  assert.equal(cancelled.length, 2);
 });
 
 test("normalization clamps counts and computes remaining only for known totals", () => {
