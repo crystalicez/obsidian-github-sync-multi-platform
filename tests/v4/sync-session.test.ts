@@ -1605,15 +1605,33 @@ test("v4 confirmed Force Push migrates legacy encrypted paths in one commit", as
   const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "new", mode: "encrypted", pathLayout: "opaque-stable-v1" });
   assert.equal(index.remoteCommitSha, undefined);
   assert.deepEqual(index.shards, {});
-  const legacyEncryptedSession = new V4SyncSession({ github, vault, index, config: desiredConfig, keyring: keys, conflictPolicy: "copy", abortChangePercent: 60 });
+  const events: V4SyncProgressPatch[] = [];
+  const legacyEncryptedSession = new V4SyncSession({
+    github,
+    vault,
+    index,
+    config: desiredConfig,
+    keyring: keys,
+    conflictPolicy: "copy",
+    abortChangePercent: 60,
+    onProgress: event => events.push(structuredClone(event)),
+  });
   github.commitMessages.length = 0;
 
   await assert.rejects(() => legacyEncryptedSession.sync({ operation: "forcePush", allowThresholdOverride: false }), /change guard blocked/iu);
   assert.equal(github.commitMessages.length, 0);
+  events.length = 0;
   const result = await legacyEncryptedSession.sync({ operation: "forcePush", allowThresholdOverride: true });
 
   assert.equal(result.mode, "force-push");
   assert.equal(result.changedFiles, 2);
+  assert.deepEqual(lastDirectional(events, "push"), { completed: 2, total: 2 });
+  assert.equal(Math.max(...events.map(event => event.push?.completed ?? 0)), 2);
+  const orphanCompletion = events.find(event => event.currentPath === orphanRecord.path && event.currentDirection === "push" && event.push?.completed === 1);
+  assert.ok(orphanCompletion);
+  assert.deepEqual(orphanCompletion.push, { completed: 1, total: 2 });
+  assert.notEqual(orphanCompletion.phase, "uploading");
+  assert.equal(events.some(event => event.phase === "uploading" && event.currentPath === orphanRecord.path), false);
   assert.equal(github.commitMessages.length, 1);
   assert.equal([...github.files.keys()].some(path => path.includes("PrivateFolder")), false);
   assert.equal([...github.files.keys()].some(path => /^\.obsidian-github-sync-v4\/data\/[0-9a-f]{2}\/[0-9a-f]{64}\.enc$/u.test(path)), true);

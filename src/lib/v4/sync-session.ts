@@ -302,10 +302,16 @@ export class V4SyncSession {
       local: localFiles,
       remote: isLayoutMigration ? [] : logical(remoteRecords),
     })
+    const finalLocalFileIds = new Set(localFiles.map(file => file.fileId))
+    const migrationDeletionPushItems: V4GitTreeProgressItem[] = isLayoutMigration
+      ? [...new Map(remoteRecords
+        .filter(record => !finalLocalFileIds.has(record.fileId))
+        .map(record => [record.fileId, { fileId: record.fileId, path: record.path }])).values()]
+      : []
     let pullCompleted = 0
     let pushCompleted = 0
     let pullTotal = plan.pulls.length
-    let pushTotal = plan.pushes.length
+    let pushTotal = plan.pushes.length + migrationDeletionPushItems.length
     const directional = (completed: number, total: number | undefined): V4DirectionalProgress => total === undefined
       ? { completed }
       : { completed, total }
@@ -602,8 +608,12 @@ export class V4SyncSession {
       this.report({ currentPath, currentDirection: "push", push: directional(pushCompleted, pushTotal) })
     }
     const uploadedPushIds = new Set(files.flatMap(file => (file.progressItems ?? []).map(item => item.fileId)))
-    for (const change of pushes) {
-      if (!uploadedPushIds.has(change.fileId)) completePush({ fileId: change.fileId, path: change.path })
+    const stagedPushItems: V4GitTreeProgressItem[] = [
+      ...pushes.map(change => ({ fileId: change.fileId, path: change.path })),
+      ...migrationDeletionPushItems,
+    ]
+    for (const item of stagedPushItems) {
+      if (!uploadedPushIds.has(item.fileId)) completePush(item)
     }
     let latestUploadPath: string | undefined
     const published = await publishV4TreeChanges(this.input.github, {
