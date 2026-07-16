@@ -16,11 +16,12 @@ function formatCounter(progress: V4DirectionalProgress): string | undefined {
   return `${progress.completed}/${progress.total}`;
 }
 
-function formatCounterTitle(label: string, progress: V4DirectionalProgress): string | undefined {
-  const counter = formatCounter(progress);
-  if (!counter) return undefined;
+function formatCounterTitle(label: string, progress: V4DirectionalProgress): string {
+  const counter = progress.total === undefined ? `${progress.completed}/?` : `${progress.completed}/${progress.total}`;
   const remaining = remainingV4Progress(progress);
-  return remaining === undefined ? `${label}: ${counter}` : `${label}: ${counter} · remaining ${remaining}`;
+  return remaining === undefined
+    ? `${label}: ${counter} · remaining unknown`
+    : `${label}: ${counter} · remaining ${remaining}`;
 }
 
 export function formatV4ActiveSyncStatus(snapshot: V4SyncProgressSnapshot): V4StatusDisplay {

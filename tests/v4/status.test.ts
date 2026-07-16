@@ -24,6 +24,8 @@ test("unknown totals never render as zero totals", () => {
   const display = formatV4ActiveSyncStatus(snapshot);
   assert.equal(display.text, "⏳ GH Sync: Scanning local…");
   assert.doesNotMatch(display.title, /0\/0/u);
+  assert.match(display.title, /Pull: 0\/\? · remaining unknown/u);
+  assert.match(display.title, /Push: 0\/\? · remaining unknown/u);
 });
 
 test("failure tooltip keeps phase path counters and error", () => {

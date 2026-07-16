@@ -1,6 +1,15 @@
 import { ItemView, Notice, WorkspaceLeaf } from "obsidian"
 import type FastSync from "../main"
 import type { V4HistoryChange, V4HistoryCommit, V4HistoryService, V4VersionPreview } from "../lib/v4/history-service"
+import {
+  formatV4Duration,
+  formatV4PhaseLabel,
+  formatV4PhaseTiming,
+  middleTruncateV4Path,
+  remainingV4Progress,
+  type V4DirectionalProgress,
+  type V4SyncProgressSnapshot,
+} from "../lib/v4/progress"
 
 export const V4_SYNC_CENTER_VIEW = "github-sync-v4-center"
 
@@ -9,14 +18,25 @@ export class V4SyncCenterView extends ItemView {
   private page = 1
   private selected?: V4HistoryCommit
   private objectUrl?: string
+  private progressCard?: HTMLElement
+  private unsubscribeProgress?: () => void
 
   constructor(leaf: WorkspaceLeaf, private readonly plugin: FastSync) { super(leaf) }
   getViewType(): string { return V4_SYNC_CENTER_VIEW }
   getDisplayText(): string { return "GitHub Sync Center" }
   getIcon(): string { return "git-compare-arrows" }
 
-  async onOpen(): Promise<void> { await this.renderCommitMode() }
-  async onClose(): Promise<void> { this.releaseObjectUrl() }
+  async onOpen(): Promise<void> {
+    this.unsubscribeProgress?.()
+    this.unsubscribeProgress = this.plugin.v4Runtime.subscribeProgress(snapshot => this.renderProgressCard(snapshot))
+    await this.renderCommitMode()
+  }
+  async onClose(): Promise<void> {
+    this.unsubscribeProgress?.()
+    this.unsubscribeProgress = undefined
+    this.progressCard = undefined
+    this.releaseObjectUrl()
+  }
 
   private async ensureService(): Promise<V4HistoryService> {
     this.service ??= await this.plugin.v4Runtime.createHistoryService()
@@ -33,11 +53,117 @@ export class V4SyncCenterView extends ItemView {
     actions.createEl("button", { text: "Commits" }).onclick = () => void this.renderCommitMode()
     actions.createEl("button", { text: "Current file" }).onclick = () => void this.renderFileMode()
     actions.createEl("button", { text: "Sync now", cls: "mod-cta" }).onclick = () => void this.plugin.v4Runtime.manualSync()
+    this.progressCard = this.contentEl.createDiv({ cls: "github-sync-center__progress" })
+    this.progressCard.setAttribute("role", "status")
+    this.progressCard.setAttribute("aria-live", "polite")
+    this.progressCard.setAttribute("aria-atomic", "true")
+    this.renderProgressCard(this.plugin.v4Runtime.progressSnapshot)
     const layout = this.contentEl.createDiv({ cls: "github-sync-center__layout" })
     return {
       body: layout.createDiv({ cls: "github-sync-center__master" }),
       detail: layout.createDiv({ cls: "github-sync-center__detail" }),
     }
+  }
+
+  private renderProgressCard(snapshot: V4SyncProgressSnapshot): void {
+    const card = this.progressCard
+    if (!card) return
+    card.empty()
+    for (const lifecycle of ["idle", "waiting", "active", "success", "no-change", "failed"]) {
+      card.removeClass(`is-${lifecycle}`)
+    }
+    const lifecycleClass = `is-${snapshot.lifecycle}`
+    card.addClass(lifecycleClass)
+
+    const heading = card.createDiv({ cls: "github-sync-center__progress-heading" })
+    heading.createEl("strong", { text: this.progressHeading(snapshot) })
+    const context = [
+      snapshot.operation && this.operationLabel(snapshot.operation),
+      snapshot.trigger && this.triggerLabel(snapshot.trigger),
+      snapshot.attempt > 0 && `Attempt ${snapshot.attempt}`,
+    ].filter((value): value is string => Boolean(value))
+    if (context.length > 0) heading.createEl("span", { text: context.join(" · "), cls: "github-sync-center__muted" })
+
+    if (snapshot.lifecycle === "failed") {
+      const failure = card.createDiv({ cls: "github-sync-center__failure" })
+      if (snapshot.failurePhase) failure.createDiv({ text: `Failed phase: ${formatV4PhaseLabel(snapshot.failurePhase)}` })
+      if (snapshot.failurePath) this.renderPath(failure, snapshot.failurePath, "Failed path")
+      if (snapshot.errorMessage) failure.createDiv({ text: `Error: ${snapshot.errorMessage}`, cls: "github-sync-center__error" })
+    }
+
+    const directions = card.createDiv({ cls: "github-sync-center__progress-directions" })
+    this.renderDirection(directions, "Pull", snapshot.pull)
+    this.renderDirection(directions, "Push", snapshot.push)
+
+    if (snapshot.currentPath && (snapshot.lifecycle !== "failed" || snapshot.currentPath !== snapshot.failurePath)) {
+      this.renderPath(card, snapshot.currentPath)
+    }
+
+    if (snapshot.lastSyncTime > 0) {
+      card.createDiv({ text: `Completed ${new Date(snapshot.lastSyncTime).toLocaleString()}`, cls: "github-sync-center__progress-completed github-sync-center__muted" })
+    }
+
+    if (snapshot.totalElapsedMs > 0 || snapshot.timings.length > 0) {
+      const timings = card.createDiv({ cls: "github-sync-center__timings" })
+      this.renderTiming(timings, "Total", formatV4Duration(snapshot.totalElapsedMs), true)
+      for (const timing of snapshot.timings) {
+        const phaseLabel = formatV4PhaseLabel(timing.phase)
+        const label = timing.phase === "encrypting" ? "Encryption" : phaseLabel
+        this.renderTiming(timings, label, formatV4PhaseTiming(timing).slice(phaseLabel.length + 1))
+      }
+    }
+
+  }
+
+  private renderTiming(container: HTMLElement, label: string, duration: string, total = false): void {
+    const row = container.createDiv({ cls: `github-sync-center__timing${total ? " is-total" : ""}` })
+    row.createEl("span", { text: label })
+    row.createEl("span", { text: duration, cls: "github-sync-center__timing-duration" })
+  }
+
+  private progressHeading(snapshot: V4SyncProgressSnapshot): string {
+    if (snapshot.lifecycle === "failed") return "Failed"
+    if (snapshot.lifecycle === "success") return "Success"
+    if (snapshot.lifecycle === "no-change") return "No changes"
+    if (snapshot.lifecycle === "idle") return "Idle"
+    return snapshot.phase ? formatV4PhaseLabel(snapshot.phase) : "Syncing"
+  }
+
+  private renderDirection(container: HTMLElement, label: string, progress: V4DirectionalProgress): void {
+    const remaining = remainingV4Progress(progress)
+    const count = progress.total === undefined ? `${progress.completed}/?` : `${progress.completed}/${progress.total}`
+    const detail = remaining === undefined ? "total unknown" : `${remaining} remaining`
+    const row = container.createDiv({ cls: "github-sync-center__progress-direction" })
+    row.createEl("span", { text: `${label} ${count}`, cls: "github-sync-center__progress-count" })
+    row.createEl("span", { text: detail, cls: "github-sync-center__muted" })
+  }
+
+  private renderPath(container: HTMLElement, fullPath: string, label = "Path"): void {
+    const row = container.createDiv({ cls: "github-sync-center__progress-path-row" })
+    row.createEl("span", { text: `${label}:`, cls: "github-sync-center__muted" })
+    const path = row.createEl("span", {
+      text: middleTruncateV4Path(fullPath, 72),
+      cls: "github-sync-center__progress-path",
+    })
+    path.title = fullPath
+  }
+
+  private operationLabel(operation: V4SyncProgressSnapshot["operation"]): string {
+    if (operation === "forcePush") return "Force push"
+    if (operation === "forcePull") return "Force pull"
+    return "Normal"
+  }
+
+  private triggerLabel(trigger: V4SyncProgressSnapshot["trigger"]): string {
+    const labels = {
+      manual: "Manual",
+      startup: "Startup",
+      scheduled: "Scheduled",
+      localChange: "Local change",
+      forcePush: "Force push",
+      forcePull: "Force pull",
+    } as const
+    return trigger ? labels[trigger] : ""
   }
 
   private async renderCommitMode(): Promise<void> {

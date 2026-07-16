@@ -194,6 +194,8 @@
   padding: var(--size-4-3);
   height: 100%;
   overflow: hidden;
+  display: flex;
+  flex-direction: column;
 }
 
 .github-sync-center__header,
@@ -206,6 +208,7 @@
 
 .github-sync-center__header { justify-content: space-between; flex-wrap: wrap; }
 .github-sync-center__layout { display: grid; grid-template-columns: minmax(220px, 0.8fr) minmax(300px, 1.2fr); gap: var(--size-4-3); height: calc(100% - 54px); }
+.github-sync-center__layout { flex: 1; min-height: 0; height: auto; }
 .github-sync-center__master,
 .github-sync-center__detail { overflow: auto; border: 1px solid var(--background-modifier-border); border-radius: var(--radius-m); padding: var(--size-4-2); }
 .github-sync-center__row,
@@ -219,9 +222,47 @@
 .github-sync-center__text-preview { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 60vh; overflow: auto; }
 .github-sync-center__preview img { max-width: 100%; height: auto; }
 
+.github-sync-center__progress {
+  flex: 0 0 auto;
+  margin: var(--size-4-2) 0 var(--size-4-3);
+  padding: var(--size-4-3);
+  border: 1px solid var(--background-modifier-border);
+  border-left: 3px solid var(--interactive-accent);
+  border-radius: var(--radius-m);
+  background: var(--background-secondary);
+}
+.github-sync-center__progress.is-success,
+.github-sync-center__progress.is-no-change { border-left-color: var(--color-green); }
+.github-sync-center__progress.is-failed { border-left-color: var(--color-red); }
+.github-sync-center__progress-heading,
+.github-sync-center__progress-direction,
+.github-sync-center__progress-path-row,
+.github-sync-center__timing { display: flex; align-items: baseline; gap: var(--size-4-2); }
+.github-sync-center__progress-heading { justify-content: space-between; flex-wrap: wrap; }
+.github-sync-center__progress-directions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--size-4-2); margin-top: var(--size-4-2); }
+.github-sync-center__progress-direction { justify-content: space-between; min-width: 0; }
+.github-sync-center__progress-count { font-variant-numeric: tabular-nums; }
+.github-sync-center__progress-path-row { min-width: 0; margin-top: var(--size-4-2); }
+.github-sync-center__progress-path {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.github-sync-center__progress-completed { margin-top: var(--size-4-2); }
+.github-sync-center__failure { margin-top: var(--size-4-2); padding: var(--size-4-2); border-radius: var(--radius-s); background: var(--background-modifier-error); }
+.github-sync-center__timings { margin-top: var(--size-4-3); padding-top: var(--size-4-2); border-top: 1px solid var(--background-modifier-border); }
+.github-sync-center__timing { justify-content: space-between; }
+.github-sync-center__timing.is-total { font-weight: var(--font-semibold); }
+.github-sync-center__timing-duration { flex: 0 0 auto; font-variant-numeric: tabular-nums; text-align: right; }
+
 @media (max-width: 700px) {
   .github-sync-center { overflow: auto; }
   .github-sync-center__layout { grid-template-columns: 1fr; height: auto; }
   .github-sync-center__master,
   .github-sync-center__detail { max-height: 55vh; }
+}
+
+@media (max-width: 480px) {
+  .github-sync-center__progress-directions { grid-template-columns: 1fr; }
 }

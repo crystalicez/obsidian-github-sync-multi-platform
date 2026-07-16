@@ -34,8 +34,10 @@ export function resetModalTestState() {
   modalButtons.length = 0;
 }
 
-class ElementStub {
+export class ElementStub {
   text = "";
+  title = "";
+  disabled = false;
   onclick?: () => void;
   onpointerdown?: (event: PointerEvent) => void;
   onpointermove?: (event: PointerEvent) => void;
@@ -43,23 +45,83 @@ class ElementStub {
   onpointercancel?: (event: PointerEvent) => void;
   offsetWidth = 120;
   style: Record<string, string> = {};
+  children: ElementStub[] = [];
+  attributes: Record<string, string> = {};
+  classes = new Set<string>();
+  private parent?: ElementStub;
+  private readonly root: { mutations: number };
+
+  constructor(root?: { mutations: number }, parent?: ElementStub) {
+    this.root = root ?? { mutations: 0 };
+    this.parent = parent;
+  }
+
+  get mutationCount(): number { return this.root.mutations; }
+
+  private mutate(): void { this.root.mutations++; }
 
   setText(text: string) {
     this.text = text;
+    this.mutate();
   }
 
-  createEl(tag: string, options?: { text?: string }) {
-    const child = new ElementStub();
+  createEl(tag: string, options?: { text?: string; cls?: string; attr?: Record<string, string> }) {
+    const child = new ElementStub(this.root, this);
+    this.children.push(child);
+    this.mutate();
     if (options?.text) child.setText(options.text);
+    if (options?.cls) child.addClass(options.cls);
+    for (const [name, value] of Object.entries(options?.attr ?? {})) child.setAttribute(name, value);
     if (tag === "button") modalButtons.push({ text: options?.text ?? "", click: () => child.onclick?.() });
     return child;
   }
 
-  createDiv(_options?: unknown) {
-    return new ElementStub();
+  createDiv(options?: string | { text?: string; cls?: string }) {
+    return this.createEl("div", typeof options === "string" ? { cls: options } : options);
   }
 
-  addClass(_className: string) {}
+  empty() {
+    this.children = [];
+    this.text = "";
+    this.mutate();
+  }
+
+  remove() {
+    if (!this.parent) return;
+    this.parent.children = this.parent.children.filter(child => child !== this);
+    this.parent = undefined;
+    this.mutate();
+  }
+
+  setAttribute(name: string, value: string) {
+    this.attributes[name] = value;
+    if (name === "title") this.title = value;
+    this.mutate();
+  }
+
+  addClass(className: string) {
+    for (const name of className.split(/\s+/u).filter(Boolean)) this.classes.add(name);
+    this.mutate();
+  }
+
+  removeClass(className: string) {
+    this.classes.delete(className);
+    this.mutate();
+  }
+
+  flattenText(): string {
+    return [this.text, ...this.children.map(child => child.flattenText())].filter(Boolean).join(" ");
+  }
+
+  findByText(text: string): ElementStub | undefined {
+    if (this.text === text) return this;
+    for (const child of this.children) {
+      const found = child.findByText(text);
+      if (found) return found;
+    }
+    return undefined;
+  }
+
   getBoundingClientRect() { return { left: 0, width: 300 }; }
   setPointerCapture(_pointerId: number) {}
   releasePointerCapture(_pointerId: number) {}
@@ -77,6 +139,17 @@ export class Modal {
 
   open() { modalEvents.push("open"); }
   close() { modalEvents.push("close"); }
+}
+
+export class WorkspaceLeaf {
+  app: unknown;
+  constructor(app: unknown = { workspace: { getActiveFile: () => null } }) { this.app = app; }
+}
+
+export class ItemView {
+  app: any;
+  contentEl = new ElementStub();
+  constructor(public readonly leaf: WorkspaceLeaf) { this.app = leaf.app; }
 }
 
 export class Plugin {}

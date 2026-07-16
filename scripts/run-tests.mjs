@@ -27,6 +27,8 @@ const tsEntries = [
   "tests/v4/sync-coordinator.test.ts",
   "tests/v4/progress.test.ts",
   "tests/v4/status.test.ts",
+  "tests/v4/main-progress.test.ts",
+  "tests/v4/sync-center-progress.test.ts",
   "tests/v4/sync-session.test.ts",
   "tests/v4/settings-secrets.test.ts",
   "tests/v4/history-service.test.ts",

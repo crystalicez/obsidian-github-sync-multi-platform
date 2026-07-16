@@ -27,6 +27,7 @@ export default class FastSync extends Plugin {
   scheduledSyncTimer: number | null = null
   startupSyncTimeout: number | null = null
   secretsMigrated: boolean = false
+  private unloaded = false
 
   enableWatch() {
     this.isWatchEnabled = true
@@ -46,6 +47,7 @@ export default class FastSync extends Plugin {
 
 
   async onload() {
+    this.unloaded = false
     await this.loadSettings()
     if (this.secretsMigrated) await this.persistData()
 
@@ -53,12 +55,10 @@ export default class FastSync extends Plugin {
     this.addSettingTab(this.settingTab)
 
     this.initGitHubClient()
-    this.v4Runtime = new V4PluginRuntime(this)
+    this.v4Runtime = this.createV4Runtime()
+    this.register(this.v4Runtime.subscribeProgress(() => this.updateStatusBar()))
     this.registerView(V4_SYNC_CENTER_VIEW, leaf => new V4SyncCenterView(leaf, this))
     this.registerScheduledSync()
-
-    // Initialize status bar widget
-    this.updateStatusBar()
 
     // Create Ribbon Icons
     this.ribbonIcon = this.addRibbonIcon("loader-circle", "GitHub Sync: Sync", () => {
@@ -151,11 +151,16 @@ export default class FastSync extends Plugin {
   }
 
   onunload() {
+    this.unloaded = true
     if (this.scheduledSyncTimer) window.clearInterval(this.scheduledSyncTimer);
     this.scheduledSyncTimer = null;
     if (this.startupSyncTimeout !== null) window.clearTimeout(this.startupSyncTimeout);
     this.startupSyncTimeout = null;
     this.v4Runtime?.dispose()
+  }
+
+  protected createV4Runtime(): V4PluginRuntime {
+    return new V4PluginRuntime(this)
   }
 
   registerScheduledSync() {
@@ -255,6 +260,7 @@ export default class FastSync extends Plugin {
     const runtime = this.v4Runtime;
     span.onclick = () => {
       if (runtime && !runtime.isSyncing) {
+        if (this.unloaded) return
         void runtime.manualSync()
       }
     };
