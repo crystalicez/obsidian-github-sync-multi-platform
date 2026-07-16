@@ -4,7 +4,7 @@ import { evaluateV4ChangeGuard } from "./change-guard"
 import { resolveV4Conflict, type V4ConflictPolicy, type V4ConflictResolution } from "./conflicts"
 import type { V4Keyring } from "./crypto"
 import { encryptV4Payload } from "./crypto"
-import { publishV4TreeChanges, type V4GitTreeGithub } from "./git-tree-writer"
+import { publishV4TreeChanges, type V4GitTreeFile, type V4GitTreeGithub, type V4GitTreeProgressItem } from "./git-tree-writer"
 import { buildV4JournalPages, type V4JournalChange } from "./history-journal"
 import { isV4LocalIndexCacheComplete, isV4LocalIndexShardConsistent, type V4IndexFileRecord, type V4LocalIndex } from "./local-index"
 import { bucketForV4PathId } from "./paths"
@@ -21,6 +21,7 @@ import {
 import { effectiveV4PathLayout, expectedV4PathLayout, V4_CONFIG_PATH, V4_HEAD_PATH, V4_ROOT, type V4RemoteConfig, type V4RemoteHead } from "./protocol-types"
 import { V4StorageCodec } from "./storage-codec"
 import type { V4QueuedChange } from "./sync-coordinator"
+import type { V4DirectionalProgress, V4SyncProgressPatch } from "./progress"
 
 export interface V4SessionVaultFile { path: string; size: number; mtime: number }
 export interface V4SessionVault {
@@ -47,6 +48,7 @@ export interface V4SyncSessionInput {
   now?: () => number
   askConflict?: (input: { path: string; localMtime: number; remoteMtime: number }) => Promise<V4ConflictResolution>
   includePath?: (path: string) => boolean
+  onProgress?: (patch: V4SyncProgressPatch) => void
 }
 
 export interface V4SessionSyncResult {
@@ -220,6 +222,14 @@ export class V4SyncSession {
     this.now = input.now ?? (() => Date.now())
   }
 
+  private report(patch: V4SyncProgressPatch): void {
+    try {
+      this.input.onProgress?.(patch)
+    } catch {
+      // Progress is observational and must never affect sync behavior.
+    }
+  }
+
   async sync(options: {
     operation: V4SyncOperation
     allowThresholdOverride: boolean
@@ -227,6 +237,7 @@ export class V4SyncSession {
   }): Promise<V4SessionSyncResult> {
     this.localReadCache.clear()
     const baseCommitSha = this.input.index.remoteCommitSha
+    this.report({ phase: "checking-remote", currentPath: undefined, currentDirection: undefined })
     const ref = await this.input.github.getGitRefOrNull()
     const remoteConfig = await this.loadRemoteConfig(ref?.sha, options.operation)
     const localCacheComplete = isV4LocalIndexCacheComplete(this.input.index)
@@ -284,11 +295,30 @@ export class V4SyncSession {
       : identityBaseRecords.filter(record => includePath(record.path))
     assertNoCaseInsensitiveCollisions(localFiles)
     assertNoCaseInsensitiveCollisions(logical(remoteRecords))
+    this.report({ phase: "planning", currentPath: undefined, currentDirection: undefined })
     const plan = planV4Sync({
       operation: options.operation,
       base: logical(baseRecords),
       local: localFiles,
       remote: isLayoutMigration ? [] : logical(remoteRecords),
+    })
+    let pullCompleted = 0
+    let pushCompleted = 0
+    let pullTotal = plan.pulls.length
+    let pushTotal = plan.pushes.length
+    const directional = (completed: number, total: number | undefined): V4DirectionalProgress => total === undefined
+      ? { completed }
+      : { completed, total }
+    const counters = (totalsKnown: boolean) => ({
+      pull: directional(pullCompleted, totalsKnown ? pullTotal : undefined),
+      push: directional(pushCompleted, totalsKnown ? pushTotal : undefined),
+    })
+    const conflictsResolved = plan.conflicts.length === 0
+    this.report({
+      phase: "planning",
+      currentPath: undefined,
+      currentDirection: undefined,
+      ...counters(conflictsResolved),
     })
     const changedFiles = isLayoutMigration
       ? new Set([...localFiles.map(file => file.fileId), ...remoteRecords.map(record => record.fileId)]).size
@@ -301,6 +331,7 @@ export class V4SyncSession {
       remoteFiles: remoteRecords.length,
     })
     if (guard.blocked && !options.allowThresholdOverride) {
+      this.report({ phase: "blocked", currentPath: undefined, currentDirection: undefined, ...counters(conflictsResolved) })
       throw new V4ChangeGuardError(guard.changePercent, guard.thresholdPercent)
     }
     if (changedFiles === 0 && options.operation !== "forcePush") {
@@ -312,12 +343,21 @@ export class V4SyncSession {
     const remoteCommitSha = remote?.commitSha
     let pulledFiles = 0
     for (const change of plan.pulls) {
-      await this.applyPull(change, recordsById, remoteCommitSha)
+      await this.applyPull(change, recordsById, remoteCommitSha, () => {
+        pullCompleted++
+        this.report({ currentPath: change.path, currentDirection: "pull", pull: directional(pullCompleted, conflictsResolved ? pullTotal : undefined) })
+      })
       pulledFiles++
     }
 
     const pushes = [...plan.pushes]
-    for (const conflict of plan.conflicts) {
+    for (const [conflictIndex, conflict] of plan.conflicts.entries()) {
+      this.report({
+        phase: "resolving-conflicts",
+        currentPath: conflict.path,
+        currentDirection: undefined,
+        ...counters(false),
+      })
       const localBytes = conflict.local ? await this.readLocal(conflict.local.path) : undefined
       const remoteRecord = recordsById.get(conflict.fileId)
       const remoteBytes = remoteRecord ? await this.readRecord(remoteRecord, remoteCommitSha) : undefined
@@ -343,9 +383,29 @@ export class V4SyncSession {
         resolution = await this.input.askConflict({ path: conflict.path, localMtime: conflict.local?.mtime ?? 0, remoteMtime: conflict.remote?.mtime ?? 0 })
         if (resolution.action === "ask") throw new Error(`Conflict cancelled: ${conflict.path}`)
       }
+      const pull = resolution.action === "use-remote" ? this.changeBetween(conflict.local, conflict.remote) : null
+      const localPush = resolution.action === "use-remote" ? null : this.changeBetween(conflict.remote, conflict.local)
+      const copyPushes = resolution.action === "keep-local-copy-remote" && remoteBytes && conflict.remote ? 1 : 0
+      if (pull) pullTotal++
+      if (localPush) pushTotal++
+      pushTotal += copyPushes
+      const isFinalConflict = conflictIndex === plan.conflicts.length - 1
+      if (isFinalConflict) {
+        this.report({
+          phase: "resolving-conflicts",
+          currentPath: conflict.path,
+          currentDirection: undefined,
+          ...counters(true),
+        })
+      }
       if (resolution.action === "use-remote") {
-        const pull = this.changeBetween(conflict.local, conflict.remote)
-        if (pull) { await this.applyPull(pull, recordsById, remoteCommitSha); pulledFiles++ }
+        if (pull) {
+          await this.applyPull(pull, recordsById, remoteCommitSha, () => {
+            pullCompleted++
+            this.report({ currentPath: pull.path, currentDirection: "pull", pull: directional(pullCompleted, isFinalConflict ? pullTotal : undefined) })
+          })
+          pulledFiles++
+        }
         continue
       }
       if (resolution.action === "merged" && conflict.local && resolution.mergedBytes) {
@@ -365,8 +425,6 @@ export class V4SyncSession {
           after: { path: copyPath, fileId: copyFileId, hash: copyHash, size: remoteBytes.byteLength, mtime: conflict.remote.mtime },
         })
       }
-      const localAfter = conflict.local
-      const localPush = this.changeBetween(conflict.remote, localAfter)
       if (localPush) pushes.push(localPush)
     }
 
@@ -376,7 +434,7 @@ export class V4SyncSession {
     }
 
     const latestLocal = new Map((await this.scanLocal(identityBaseRecords, options.changes ?? [], identitySeedByPath)).map(file => [file.fileId, file]))
-    const files: Array<{ path: string; bytes: Uint8Array }> = []
+    const files: V4GitTreeFile[] = []
     const deletions = new Set<string>()
     const journalChanges: V4JournalChange[] = []
     if (externalReconciled) {
@@ -424,10 +482,19 @@ export class V4SyncSession {
         continue
       }
       const bytes = await this.readLocal(after.path)
+      this.report({
+        phase: this.input.config.mode === "encrypted" ? "encrypting" : "hashing",
+        currentPath: after.path,
+        currentDirection: "push",
+        push: directional(pushCompleted, pushTotal),
+      })
       const prepared = await this.codec.prepare(after.path, bytes, journalId, after.mtime, after.fileId)
       const record: V4IndexFileRecord = { path: after.path, ...prepared.record }
       recordsById.set(after.fileId, record)
-      files.push(...prepared.files)
+      files.push(...prepared.files.map(file => ({
+        ...file,
+        progressItems: [{ fileId: after.fileId, path: after.path }],
+      })))
       if (this.input.config.mode === "encrypted" && record.storage === "single" && bytes.byteLength <= PACK_MAX_ENTRY_BYTES) {
         packCandidates.push({ record, plaintext: bytes, loosePaths: prepared.files.map(file => file.path) })
       }
@@ -459,7 +526,10 @@ export class V4SyncSession {
           start++
         }
         const packed = await this.codec.preparePack(`${journalId}-${packNumber}`, group)
-        files.push(packed.file)
+        files.push({
+          ...packed.file,
+          progressItems: group.map(candidate => ({ fileId: candidate.record.fileId, path: candidate.record.path })),
+        })
         for (const record of packed.records) {
           recordsById.set(record.fileId, { ...record, path: group.find(item => item.record.fileId === record.fileId)!.record.path })
           const journal = journalChanges.find(change => change.fileId === record.fileId)
@@ -524,11 +594,39 @@ export class V4SyncSession {
         deletions.add(node.path)
       }
     }
+    const completedPushIds = new Set<string>()
+    const completePush = (item: V4GitTreeProgressItem, currentPath = item.path): void => {
+      if (completedPushIds.has(item.fileId)) return
+      completedPushIds.add(item.fileId)
+      pushCompleted++
+      this.report({ currentPath, currentDirection: "push", push: directional(pushCompleted, pushTotal) })
+    }
+    const uploadedPushIds = new Set(files.flatMap(file => (file.progressItems ?? []).map(item => item.fileId)))
+    for (const change of pushes) {
+      if (!uploadedPushIds.has(change.fileId)) completePush({ fileId: change.fileId, path: change.path })
+    }
+    let latestUploadPath: string | undefined
     const published = await publishV4TreeChanges(this.input.github, {
       message: `obsidian-sync-v4:${journalId}`,
       files,
       deletions: [...deletions],
       expectedHeadSha: ref?.sha ?? null,
+      onLogicalFileUploadStarted: item => {
+        latestUploadPath = item.path
+        this.report({
+          phase: "uploading",
+          currentPath: item.path,
+          currentDirection: "push",
+          push: directional(pushCompleted, pushTotal),
+        })
+      },
+      onLogicalFileUploaded: item => completePush(item, latestUploadPath ?? item.path),
+      onUploadsComplete: () => this.report({
+        phase: "committing",
+        currentPath: undefined,
+        currentDirection: undefined,
+        push: directional(pushCompleted, pushTotal),
+      }),
     })
     this.replaceIndex(finalRecords, head, published.commitSha)
     const mode = options.operation === "forcePush" ? "force-push" : pulledFiles > 0 ? "pull-push" : "push"
@@ -621,6 +719,7 @@ export class V4SyncSession {
   }
 
   private async scanLocal(baseRecords: V4IndexFileRecord[], changes: V4QueuedChange[], identitySeedByPath?: ReadonlyMap<string, string>): Promise<V4LogicalFile[]> {
+    this.report({ phase: "scanning-local", currentPath: undefined, currentDirection: undefined })
     const pathChanges = changes.filter((change): change is Exclude<V4QueuedChange, { type: "rescan" }> => change.type !== "rescan")
     const hasFolderChange = pathChanges.some(change => change.type === "folderRename" || change.type === "folderDelete")
     if (changes.length > 0 && pathChanges.length === changes.length && !hasFolderChange && baseRecords.length > 0 && this.input.vault.stat) {
@@ -630,8 +729,10 @@ export class V4SyncSession {
         const previous = change.type === "replace" ? undefined : change.type === "rename" ? byPath.get(change.oldPath) : byPath.get(change.path)
         if (change.type === "replace") { byPath.delete(change.oldPath); byPath.delete(change.path) }
         if (change.type === "rename") byPath.delete(change.oldPath)
+        this.report({ phase: "scanning-local", currentPath: change.path, currentDirection: undefined })
         const stat = await this.input.vault.stat(change.path)
         if (!stat) { byPath.delete(change.path); continue }
+        this.report({ phase: "hashing", currentPath: change.path, currentDirection: undefined })
         const content = await this.readLocal(change.path)
         byPath.set(change.path, {
           path: change.path,
@@ -666,8 +767,10 @@ export class V4SyncSession {
     }
     const files = await this.input.vault.listFiles()
     return Promise.all(files.map(async file => {
+      this.report({ phase: "scanning-local", currentPath: file.path, currentDirection: undefined })
       const existing = identityByPath.get(file.path)
       const unchangedStat = existing && existing.size === file.size && existing.mtime === file.mtime
+      if (!unchangedStat) this.report({ phase: "hashing", currentPath: file.path, currentDirection: undefined })
       return {
         path: file.path,
         fileId: identitySeedByPath?.get(file.path) ?? existing?.fileId ?? await this.newFileId(file.path),
@@ -678,14 +781,27 @@ export class V4SyncSession {
     }))
   }
 
-  private async applyPull(change: V4PlannedChange, records: Map<string, V4IndexFileRecord>, remoteCommitSha?: string): Promise<void> {
-    if (change.kind === "delete") { await this.input.vault.delete(change.path); return }
+  private async applyPull(
+    change: V4PlannedChange,
+    records: Map<string, V4IndexFileRecord>,
+    remoteCommitSha: string | undefined,
+    onCompleted: () => void,
+  ): Promise<void> {
+    if (change.kind === "delete") {
+      this.report({ phase: "applying", currentPath: change.path, currentDirection: "pull" })
+      await this.input.vault.delete(change.path)
+      onCompleted()
+      return
+    }
     const record = records.get(change.fileId)
     if (!record) throw new Error(`Missing V4 remote record for ${change.path}`)
+    this.report({ phase: "downloading", currentPath: change.path, currentDirection: "pull" })
     const bytes = await this.readRecord(record, remoteCommitSha)
+    this.report({ phase: "applying", currentPath: change.path, currentDirection: "pull" })
     if (change.kind === "rename" && change.previousPath) await this.input.vault.delete(change.previousPath)
     await this.input.vault.write(change.path, bytes, record.mtime)
     this.localReadCache.set(change.path, bytes)
+    onCompleted()
   }
 
   private async readLocal(path: string): Promise<Uint8Array> {

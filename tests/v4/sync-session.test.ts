@@ -13,9 +13,27 @@ import { sha256Hex } from "../../src/lib/bytes";
 import { buildV4RemoteMetadata } from "../../src/lib/v4/remote-index";
 import { publishV4TreeChanges } from "../../src/lib/v4/git-tree-writer";
 import { V4_LARGE_FILE_THRESHOLD_BYTES } from "../../src/lib/v4/large-files";
+import type { V4SyncProgressPatch } from "../../src/lib/v4/progress";
 
 const enc = (value: string) => new TextEncoder().encode(value);
 const dec = (value: Uint8Array) => new TextDecoder().decode(value);
+
+function phases(events: V4SyncProgressPatch[]): string[] {
+  return events.flatMap(event => event.phase ? [event.phase] : []);
+}
+
+function assertOrderedPhases(events: V4SyncProgressPatch[], expected: string[]): void {
+  const actual = phases(events);
+  let cursor = -1;
+  for (const phase of expected) {
+    cursor = actual.indexOf(phase, cursor + 1);
+    assert.notEqual(cursor, -1, `missing ordered phase ${phase}: ${actual.join(", ")}`);
+  }
+}
+
+function lastDirectional(events: V4SyncProgressPatch[], direction: "pull" | "push") {
+  return [...events].reverse().find(event => event[direction])?.[direction];
+}
 
 class MemoryVault implements V4SessionVault {
   files = new Map<string, { bytes: Uint8Array; mtime: number }>();
@@ -732,22 +750,64 @@ test("v4 session force-pushes one atomic commit, no-ops unchanged, and force-pul
   source.files.set("a.md", { bytes: enc("one"), mtime: 1 });
   source.files.set("asset.bin", { bytes: new Uint8Array([1, 2]), mtime: 2 });
   const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "d1", mode: "plaintext" });
-  const session = new V4SyncSession({ github, vault: source, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 });
+  const forcePushEvents: V4SyncProgressPatch[] = [];
+  const session = new V4SyncSession({
+    github,
+    vault: source,
+    index,
+    config: config(),
+    conflictPolicy: "copy",
+    abortChangePercent: 0,
+    onProgress: event => {
+      forcePushEvents.push(structuredClone(event));
+      throw new Error("progress callback failure must be isolated");
+    },
+  });
   const pushed = await session.sync({ operation: "forcePush", allowThresholdOverride: false });
   assert.equal(pushed.changedFiles, 2);
   assert.equal(github.commitMessages.length, 1);
   assert.equal(dec(github.files.get("a.md")!), "one");
-  const noop = await session.sync({ operation: "normal", allowThresholdOverride: false });
+  assert.equal(forcePushEvents.some(event => (event.pull?.completed ?? 0) > 0), false);
+  assert.equal(forcePushEvents.some(event => event.currentDirection === "pull"), false);
+  assert.equal(forcePushEvents.some(event => (event.push?.total ?? 0) > 0), true);
+  assert.deepEqual(lastDirectional(forcePushEvents, "push"), { completed: 2, total: 2 });
+  const noChangeEvents: V4SyncProgressPatch[] = [];
+  const noChangeSession = new V4SyncSession({
+    github,
+    vault: source,
+    index,
+    config: config(),
+    conflictPolicy: "copy",
+    abortChangePercent: 0,
+    onProgress: event => noChangeEvents.push(structuredClone(event)),
+  });
+  const noop = await noChangeSession.sync({ operation: "normal", allowThresholdOverride: false });
   assert.equal(noop.changedFiles, 0);
   assert.equal(github.commitMessages.length, 1);
+  assert.equal(noChangeEvents.at(-1)?.phase, "planning");
+  assert.deepEqual(lastDirectional(noChangeEvents, "pull"), { completed: 0, total: 0 });
+  assert.deepEqual(lastDirectional(noChangeEvents, "push"), { completed: 0, total: 0 });
 
   const target = new MemoryVault();
   target.files.set("old.md", { bytes: enc("old"), mtime: 1 });
   const targetIndex = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "d2", mode: "plaintext" });
-  const pulled = await new V4SyncSession({ github, vault: target, index: targetIndex, config: config(), conflictPolicy: "copy", abortChangePercent: 0 }).sync({ operation: "forcePull", allowThresholdOverride: false });
+  const forcePullEvents: V4SyncProgressPatch[] = [];
+  const pulled = await new V4SyncSession({
+    github,
+    vault: target,
+    index: targetIndex,
+    config: config(),
+    conflictPolicy: "copy",
+    abortChangePercent: 0,
+    onProgress: event => forcePullEvents.push(structuredClone(event)),
+  }).sync({ operation: "forcePull", allowThresholdOverride: false });
   assert.equal(pulled.changedFiles, 3);
   assert.equal(dec(target.files.get("a.md")!.bytes), "one");
   assert.equal(target.files.has("old.md"), false);
+  assert.equal(forcePullEvents.some(event => (event.push?.completed ?? 0) > 0), false);
+  assert.equal(forcePullEvents.some(event => event.currentDirection === "push"), false);
+  assert.equal(forcePullEvents.some(event => (event.pull?.total ?? 0) > 0), true);
+  assert.deepEqual(lastDirectional(forcePullEvents, "pull"), { completed: 3, total: 3 });
 });
 
 test("v4 session validates only the config when the remote commit is unchanged", async () => {
@@ -893,11 +953,118 @@ test("v4 normal sync pulls before it publishes independent local changes", async
   first.files.set("remote.md", { bytes: enc("from remote"), mtime: 2 });
   await new V4SyncSession({ github, vault: first, index: firstIndex, config: config(), conflictPolicy: "copy", abortChangePercent: 0 }).sync({ operation: "normal", allowThresholdOverride: false });
   second.files.set("local.md", { bytes: enc("from local"), mtime: 2 });
-  const session = new V4SyncSession({ github, vault: second, index: secondIndex, config: config(), conflictPolicy: "copy", abortChangePercent: 0 });
-  await session.sync({ operation: "normal", allowThresholdOverride: false });
+  const events: V4SyncProgressPatch[] = [];
+  const session = new V4SyncSession({
+    github,
+    vault: second,
+    index: secondIndex,
+    config: config(),
+    conflictPolicy: "copy",
+    abortChangePercent: 0,
+    onProgress: event => events.push(structuredClone(event)),
+  });
+  const result = await session.sync({ operation: "normal", allowThresholdOverride: false });
+  assert.equal(result.mode, "pull-push");
+  assertOrderedPhases(events, [
+    "checking-remote", "scanning-local", "hashing", "planning",
+    "downloading", "applying", "uploading", "committing",
+  ]);
+  assert.deepEqual(lastDirectional(events, "pull"), { completed: 1, total: 1 });
+  assert.deepEqual(lastDirectional(events, "push"), { completed: 1, total: 1 });
+  assert.equal(events.some(event => event.currentPath === "remote.md" && event.currentDirection === "pull"), true);
+  assert.equal(events.some(event => event.currentPath === "local.md" && event.currentDirection === "push"), true);
   assert.ok(second.operations.indexOf("write:remote.md") < github.commitMessages.length + second.operations.length);
   assert.equal(dec(second.files.get("remote.md")!.bytes), "from remote");
   assert.equal(dec(github.files.get("local.md")!), "from local");
+});
+
+for (const resolution of ["use-remote", "use-local"] as const) {
+  test(`v4 conflict progress keeps totals unknown then finalizes ${resolution} before transfer`, async () => {
+    const github = new MemoryGitHub();
+    const remoteVault = new MemoryVault();
+    remoteVault.files.set("conflict.md", { bytes: enc("base"), mtime: 1 });
+    const remoteIndex = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "remote", mode: "plaintext" });
+    await new V4SyncSession({ github, vault: remoteVault, index: remoteIndex, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+      .sync({ operation: "forcePush", allowThresholdOverride: false });
+
+    const localVault = new MemoryVault();
+    localVault.files.set("conflict.md", { bytes: enc("base"), mtime: 1 });
+    const localIndex = structuredClone(remoteIndex);
+    localIndex.deviceId = "local";
+    remoteVault.files.set("conflict.md", { bytes: enc("remote"), mtime: 2 });
+    await new V4SyncSession({ github, vault: remoteVault, index: remoteIndex, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+      .sync({ operation: "normal", allowThresholdOverride: false, changes: [{ type: "modify", path: "conflict.md", mtime: 2 }] });
+    localVault.files.set("conflict.md", { bytes: enc("local"), mtime: 3 });
+
+    const events: V4SyncProgressPatch[] = [];
+    const result = await new V4SyncSession({
+      github,
+      vault: localVault,
+      index: localIndex,
+      config: config(),
+      conflictPolicy: "ask",
+      abortChangePercent: 0,
+      onProgress: event => events.push(structuredClone(event)),
+      askConflict: async input => {
+        assert.equal(input.path, "conflict.md");
+        const resolving = [...events].reverse().find(event => event.phase === "resolving-conflicts");
+        assert.ok(resolving);
+        assert.equal(resolving.currentPath, "conflict.md");
+        assert.equal(resolving.pull?.total, undefined);
+        assert.equal(resolving.push?.total, undefined);
+        return { action: resolution };
+      },
+    }).sync({ operation: "normal", allowThresholdOverride: false, changes: [{ type: "modify", path: "conflict.md", mtime: 3 }] });
+
+    assert.equal(events.some(event => event.phase === "resolving-conflicts" && event.currentPath === "conflict.md"), true);
+    const resolvingIndex = events.findIndex(event => event.phase === "resolving-conflicts");
+    if (resolution === "use-remote") {
+      assert.equal(result.mode, "pull");
+      const exactIndex = events.findIndex((event, index) => index > resolvingIndex && event.pull?.total === 1);
+      const applyingIndex = events.findIndex((event, index) => index > resolvingIndex && event.phase === "applying");
+      assert.ok(exactIndex > resolvingIndex && exactIndex < applyingIndex);
+      assert.deepEqual(lastDirectional(events, "pull"), { completed: 1, total: 1 });
+      assert.deepEqual(lastDirectional(events, "push"), { completed: 0, total: 0 });
+    } else {
+      assert.equal(result.mode, "push");
+      const exactIndex = events.findIndex((event, index) => index > resolvingIndex && event.push?.total === 1);
+      const preparationIndex = events.findIndex((event, index) => index > resolvingIndex && event.phase === "hashing" && event.currentPath === "conflict.md");
+      assert.ok(exactIndex > resolvingIndex && exactIndex < preparationIndex);
+      assert.deepEqual(lastDirectional(events, "pull"), { completed: 0, total: 0 });
+      assert.deepEqual(lastDirectional(events, "push"), { completed: 1, total: 1 });
+    }
+  });
+}
+
+test("v4 failed pull progress retains the active logical path", async () => {
+  const github = new MemoryGitHub();
+  const source = new MemoryVault();
+  source.files.set("broken.md", { bytes: enc("remote"), mtime: 1 });
+  const sourceIndex = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "source", mode: "plaintext" });
+  await new V4SyncSession({ github, vault: source, index: sourceIndex, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "forcePush", allowThresholdOverride: false });
+  github.files.delete("broken.md");
+  github.trees.get(github.commits.get(github.ref!.sha)!.treeSha)!.delete("broken.md");
+
+  const events: V4SyncProgressPatch[] = [];
+  const target = new MemoryVault();
+  const targetIndex = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "target", mode: "plaintext" });
+  await assert.rejects(
+    () => new V4SyncSession({
+      github,
+      vault: target,
+      index: targetIndex,
+      config: config(),
+      conflictPolicy: "copy",
+      abortChangePercent: 0,
+      onProgress: event => events.push(structuredClone(event)),
+    }).sync({ operation: "forcePull", allowThresholdOverride: false }),
+    /Missing V4 remote object/iu,
+  );
+  assert.equal(events.at(-1)?.phase, "downloading");
+  assert.equal(events.at(-1)?.currentPath, "broken.md");
+  assert.equal(events.at(-1)?.currentDirection, "pull");
+  assert.deepEqual(lastDirectional(events, "pull"), { completed: 0, total: 1 });
 });
 
 test("v4 session blocks operations over the configured modification percentage", async () => {
@@ -905,8 +1072,18 @@ test("v4 session blocks operations over the configured modification percentage",
   const vault = new MemoryVault();
   vault.files.set("a.md", { bytes: enc("a"), mtime: 1 });
   const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "d", mode: "plaintext" });
-  const session = new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 10 });
+  const events: V4SyncProgressPatch[] = [];
+  const session = new V4SyncSession({
+    github,
+    vault,
+    index,
+    config: config(),
+    conflictPolicy: "copy",
+    abortChangePercent: 10,
+    onProgress: event => events.push(structuredClone(event)),
+  });
   await assert.rejects(() => session.sync({ operation: "forcePush", allowThresholdOverride: false }), /change guard blocked/i);
+  assert.equal(events.at(-1)?.phase, "blocked");
   await session.sync({ operation: "forcePush", allowThresholdOverride: true });
 });
 
@@ -961,10 +1138,23 @@ test("v4 encrypted pack round trips through force pull and version-history previ
   const encryptedConfig: V4RemoteConfig = { formatVersion: V4_FORMAT_VERSION, mode: "encrypted", repoId: "o/r#main", pathLayout: "opaque-stable-v1", algorithm: "AES-GCM", kdf: "PBKDF2-SHA-256", kdfParams: { iterations: 10, salt: "c2FsdA" } };
   const keys = await deriveV4Keyring({ passphrase: "pass", repoId: "o/r#main", salt: enc("salt"), iterations: 10 });
   const sourceIndex = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "a", mode: "encrypted" });
-  await new V4SyncSession({ github, vault: source, index: sourceIndex, config: encryptedConfig, keyring: keys, conflictPolicy: "copy", abortChangePercent: 0 }).sync({ operation: "forcePush", allowThresholdOverride: false });
+  const events: V4SyncProgressPatch[] = [];
+  await new V4SyncSession({
+    github,
+    vault: source,
+    index: sourceIndex,
+    config: encryptedConfig,
+    keyring: keys,
+    conflictPolicy: "copy",
+    abortChangePercent: 0,
+    onProgress: event => events.push(structuredClone(event)),
+  }).sync({ operation: "forcePush", allowThresholdOverride: false });
   const packPaths = [...github.files.keys()].filter(path => path.includes("/packs/"));
   assert.equal(packPaths.length, 1);
   assert.equal([...github.files.keys()].some(path => path.includes("private-")), false);
+  assert.deepEqual(lastDirectional(events, "push"), { completed: 64, total: 64 });
+  assert.equal(Math.max(...events.map(event => event.push?.completed ?? 0)), 64);
+  assert.equal(new Set(events.filter(event => event.phase === "uploading").map(event => event.currentPath).filter(Boolean)).size, 64);
 
   const commitSha = github.ref!.sha;
   const published = github.commits.get(commitSha)!;
@@ -1023,21 +1213,36 @@ test("v4 encrypted chunked rename reuses identity and parts without uploading co
   const encryptedConfig: V4RemoteConfig = { formatVersion: V4_FORMAT_VERSION, mode: "encrypted", repoId: "o/r#main", pathLayout: "opaque-stable-v1", algorithm: "AES-GCM", kdf: "PBKDF2-SHA-256", kdfParams: { iterations: 10, salt: "c2FsdA" } };
   const keys = await deriveV4Keyring({ passphrase: "pass", repoId: "o/r#main", salt: enc("salt"), iterations: 10 });
   const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "d", mode: "encrypted", pathLayout: "opaque-stable-v1" });
-  const session = () => new V4SyncSession({ github, vault, index, config: encryptedConfig, keyring: keys, conflictPolicy: "copy" as const, abortChangePercent: 0 });
-  await session().sync({ operation: "forcePush", allowThresholdOverride: false });
+  const initialEvents: V4SyncProgressPatch[] = [];
+  const session = (events?: V4SyncProgressPatch[]) => new V4SyncSession({
+    github,
+    vault,
+    index,
+    config: encryptedConfig,
+    keyring: keys,
+    conflictPolicy: "copy" as const,
+    abortChangePercent: 0,
+    onProgress: events ? event => events.push(structuredClone(event)) : undefined,
+  });
+  await session(initialEvents).sync({ operation: "forcePush", allowThresholdOverride: false });
+  assert.deepEqual(lastDirectional(initialEvents, "push"), { completed: 1, total: 1 });
+  assert.equal(Math.max(...initialEvents.map(event => event.push?.completed ?? 0)), 1);
   const before = structuredClone(indexRecordByPath(index, "large.bin"));
   assert.equal(before.storage, "chunked");
   const file = vault.files.get("large.bin")!;
   vault.files.delete("large.bin");
   vault.files.set("renamed.bin", { ...file, mtime: 2 });
 
-  await session().sync({ operation: "normal", allowThresholdOverride: false, changes: [{ type: "rename", oldPath: "large.bin", path: "renamed.bin", mtime: 2 }] });
+  const renameEvents: V4SyncProgressPatch[] = [];
+  await session(renameEvents).sync({ operation: "normal", allowThresholdOverride: false, changes: [{ type: "rename", oldPath: "large.bin", path: "renamed.bin", mtime: 2 }] });
 
   const after = indexRecordByPath(index, "renamed.bin");
   assert.equal(after.fileId, before.fileId);
   assert.equal(after.remotePath, before.remotePath);
   assert.deepEqual(after.partPaths, before.partPaths);
   assert.equal(github.lastEntries.some(entry => entry.path.includes("/parts/")), false);
+  assert.deepEqual(lastDirectional(renameEvents, "push"), { completed: 1, total: 1 });
+  assert.equal(Math.max(...renameEvents.map(event => event.push?.completed ?? 0)), 1);
   const target = new MemoryVault();
   const targetIndex = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "target", mode: "encrypted", pathLayout: "opaque-stable-v1" });
   await new V4SyncSession({ github, vault: target, index: targetIndex, config: encryptedConfig, keyring: keys, conflictPolicy: "copy", abortChangePercent: 0 }).sync({ operation: "forcePull", allowThresholdOverride: false });
@@ -1191,7 +1396,16 @@ test("v4 content-preserving rename writes metadata and journal without uploading
   const encryptedConfig: V4RemoteConfig = { formatVersion: V4_FORMAT_VERSION, mode: "encrypted", repoId: "o/r#main", pathLayout: "opaque-stable-v1", algorithm: "AES-GCM", kdf: "PBKDF2-SHA-256", kdfParams: { iterations: 10, salt: "c2FsdA" } };
   const keys = await deriveV4Keyring({ passphrase: "pass", repoId: "o/r#main", salt: enc("salt"), iterations: 10 });
   const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "d", mode: "encrypted", pathLayout: "opaque-stable-v1" });
-  const session = () => new V4SyncSession({ github, vault, index, config: encryptedConfig, keyring: keys, conflictPolicy: "copy" as const, abortChangePercent: 0 });
+  const session = (events?: V4SyncProgressPatch[]) => new V4SyncSession({
+    github,
+    vault,
+    index,
+    config: encryptedConfig,
+    keyring: keys,
+    conflictPolicy: "copy" as const,
+    abortChangePercent: 0,
+    onProgress: events ? event => events.push(structuredClone(event)) : undefined,
+  });
   await session().sync({ operation: "forcePush", allowThresholdOverride: false });
 
   const oldRecord = indexRecordByPath(index, "old.md");
@@ -1199,7 +1413,8 @@ test("v4 content-preserving rename writes metadata and journal without uploading
   const file = vault.files.get("old.md")!;
   vault.files.delete("old.md");
   vault.files.set("new.md", { ...file, mtime: 2 });
-  await session().sync({
+  const events: V4SyncProgressPatch[] = [];
+  await session(events).sync({
     operation: "normal",
     allowThresholdOverride: false,
     changes: [{ type: "rename", oldPath: "old.md", path: "new.md", mtime: 2 }],
@@ -1211,6 +1426,34 @@ test("v4 content-preserving rename writes metadata and journal without uploading
   assert.equal(github.lastEntries.some(entry => entry.path === oldRemotePath), false);
   assert.equal(github.lastEntries.some(entry => entry.path.includes("/index/")), true);
   assert.equal(github.lastEntries.some(entry => entry.path.includes("/journals/")), true);
+  assert.deepEqual(lastDirectional(events, "push"), { completed: 1, total: 1 });
+  assert.equal(Math.max(...events.map(event => event.push?.completed ?? 0)), 1);
+  assert.equal(events.some(event => event.phase === "uploading" && event.currentPath === "new.md"), false);
+});
+
+test("v4 deletion progress completes one logical push without a content upload", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault();
+  vault.files.set("delete.md", { bytes: enc("delete me"), mtime: 1 });
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "d", mode: "plaintext" });
+  await new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "forcePush", allowThresholdOverride: false });
+  vault.files.delete("delete.md");
+  const events: V4SyncProgressPatch[] = [];
+
+  await new V4SyncSession({
+    github,
+    vault,
+    index,
+    config: config(),
+    conflictPolicy: "copy",
+    abortChangePercent: 0,
+    onProgress: event => events.push(structuredClone(event)),
+  }).sync({ operation: "normal", allowThresholdOverride: false, changes: [{ type: "delete", path: "delete.md", mtime: 2 }] });
+
+  assert.deepEqual(lastDirectional(events, "push"), { completed: 1, total: 1 });
+  assert.equal(Math.max(...events.map(event => event.push?.completed ?? 0)), 1);
+  assert.equal(events.some(event => event.phase === "uploading" && event.currentPath === "delete.md"), false);
 });
 
 test("v4 delete then recreate in one debounce window creates a new encrypted identity atomically", async () => {
