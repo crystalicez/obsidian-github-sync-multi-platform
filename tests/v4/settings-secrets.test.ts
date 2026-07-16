@@ -365,46 +365,17 @@ test("v4 runtime progress subscribers are observational", async () => {
   fixture.runtime.dispose();
 });
 
-test("v4 runtime treats an initial status renderer failure as observational", async () => {
-  const fixture = plaintextRuntimeFixture();
-  let renders = 0;
-  fixture.plugin.updateStatusBar = () => {
-    if (++renders === 1) throw new Error("initial render failed");
-  };
-
-  const result = await fixture.runtime.forcePush();
-
-  assert.equal((result as { status: string }).status, "completed");
-  assert.equal(fixture.runtime.progressSnapshot.lifecycle, "success");
-  assert.equal(fixture.plugin.isSyncInProgress, false);
-  assert.equal(fixture.github.ref !== null, true);
-  fixture.runtime.dispose();
-});
-
-test("v4 runtime treats a final status renderer failure as observational", async () => {
-  const fixture = plaintextRuntimeFixture();
-  let renders = 0;
-  fixture.plugin.updateStatusBar = () => {
-    if (++renders === 2) throw new Error("final render failed");
-  };
-
-  const result = await fixture.runtime.forcePush();
-
-  assert.equal((result as { status: string }).status, "completed");
-  assert.equal(fixture.runtime.progressSnapshot.lifecycle, "success");
-  assert.equal(fixture.plugin.isSyncInProgress, false);
-  fixture.runtime.dispose();
-});
-
-test("v4 runtime hands a synchronously reentrant final render to one waiting ledger", async () => {
+test("v4 runtime hands a synchronously reentrant terminal subscriber to one waiting ledger", async () => {
   const fixture = plaintextRuntimeFixture();
   const seen: V4SyncProgressSnapshot[] = [];
-  fixture.runtime.subscribeProgress(snapshot => seen.push(structuredClone(snapshot)));
-  let renders = 0;
-  fixture.plugin.updateStatusBar = () => {
-    renders++;
-    if (renders === 2) fixture.runtime.enqueueModify("secret.md", 2);
-  };
+  let queued = false;
+  fixture.runtime.subscribeProgress(snapshot => {
+    seen.push(structuredClone(snapshot));
+    if (snapshot.lifecycle === "success" && !queued) {
+      queued = true;
+      fixture.runtime.enqueueModify("secret.md", 2);
+    }
+  });
 
   await fixture.runtime.forcePush();
 
@@ -414,7 +385,6 @@ test("v4 runtime hands a synchronously reentrant final render to one waiting led
   assert.equal(fixture.runtime.pendingCount, 1);
   assert.equal(fixture.runtime.progressSnapshot.lifecycle, "waiting");
   assert.equal(fixture.runtime.progressSnapshot.timings.find(item => item.phase === "debouncing")?.occurrences, 1);
-  assert.equal(renders, 3);
   fixture.runtime.dispose();
 });
 

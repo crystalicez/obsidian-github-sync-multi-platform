@@ -13,13 +13,30 @@ import {
 
 export const V4_SYNC_CENTER_VIEW = "github-sync-v4-center"
 
+interface V4ViewRenderGeneration {
+  open: number
+  render: number
+}
+
 export class V4SyncCenterView extends ItemView {
   private service?: V4HistoryService
   private page = 1
   private selected?: V4HistoryCommit
   private objectUrl?: string
   private progressCard?: HTMLElement
+  private progressLive?: HTMLElement
+  private progressContext?: HTMLElement
+  private progressDetails?: HTMLElement
+  private progressTimings?: HTMLElement
+  private progressLifecycle?: V4SyncProgressSnapshot["lifecycle"]
+  private progressLiveSignature?: string
+  private progressContextSignature?: string
+  private progressDetailsSignature?: string
+  private progressTimingsSignature?: string
   private unsubscribeProgress?: () => void
+  private openGeneration = 0
+  private renderGeneration = 0
+  private isOpen = false
 
   constructor(leaf: WorkspaceLeaf, private readonly plugin: FastSync) { super(leaf) }
   getViewType(): string { return V4_SYNC_CENTER_VIEW }
@@ -27,15 +44,32 @@ export class V4SyncCenterView extends ItemView {
   getIcon(): string { return "git-compare-arrows" }
 
   async onOpen(): Promise<void> {
+    this.isOpen = true
+    this.openGeneration++
+    this.renderGeneration++
     this.unsubscribeProgress?.()
     this.unsubscribeProgress = this.plugin.v4Runtime.subscribeProgress(snapshot => this.renderProgressCard(snapshot))
     await this.renderCommitMode()
   }
   async onClose(): Promise<void> {
+    this.isOpen = false
+    this.openGeneration++
+    this.renderGeneration++
     this.unsubscribeProgress?.()
     this.unsubscribeProgress = undefined
-    this.progressCard = undefined
+    this.clearProgressElements()
     this.releaseObjectUrl()
+  }
+
+  private beginRender(): V4ViewRenderGeneration | undefined {
+    if (!this.isOpen) return undefined
+    return { open: this.openGeneration, render: ++this.renderGeneration }
+  }
+
+  private isCurrent(generation: V4ViewRenderGeneration): boolean {
+    return this.isOpen
+      && generation.open === this.openGeneration
+      && generation.render === this.renderGeneration
   }
 
   private async ensureService(): Promise<V4HistoryService> {
@@ -53,10 +87,16 @@ export class V4SyncCenterView extends ItemView {
     actions.createEl("button", { text: "Commits" }).onclick = () => void this.renderCommitMode()
     actions.createEl("button", { text: "Current file" }).onclick = () => void this.renderFileMode()
     actions.createEl("button", { text: "Sync now", cls: "mod-cta" }).onclick = () => void this.plugin.v4Runtime.manualSync()
+    this.clearProgressElements()
     this.progressCard = this.contentEl.createDiv({ cls: "github-sync-center__progress" })
-    this.progressCard.setAttribute("role", "status")
-    this.progressCard.setAttribute("aria-live", "polite")
-    this.progressCard.setAttribute("aria-atomic", "true")
+    const progressHeading = this.progressCard.createDiv({ cls: "github-sync-center__progress-heading" })
+    this.progressLive = progressHeading.createEl("strong", { cls: "github-sync-center__progress-live" })
+    this.progressLive.setAttribute("role", "status")
+    this.progressLive.setAttribute("aria-live", "polite")
+    this.progressLive.setAttribute("aria-atomic", "true")
+    this.progressContext = progressHeading.createEl("span", { cls: "github-sync-center__muted" })
+    this.progressDetails = this.progressCard.createDiv({ cls: "github-sync-center__progress-details" })
+    this.progressTimings = this.progressCard.createDiv({ cls: "github-sync-center__timings" })
     this.renderProgressCard(this.plugin.v4Runtime.progressSnapshot)
     const layout = this.contentEl.createDiv({ cls: "github-sync-center__layout" })
     return {
@@ -67,52 +107,103 @@ export class V4SyncCenterView extends ItemView {
 
   private renderProgressCard(snapshot: V4SyncProgressSnapshot): void {
     const card = this.progressCard
-    if (!card) return
-    card.empty()
-    for (const lifecycle of ["idle", "waiting", "active", "success", "no-change", "failed"]) {
-      card.removeClass(`is-${lifecycle}`)
-    }
-    const lifecycleClass = `is-${snapshot.lifecycle}`
-    card.addClass(lifecycleClass)
+    const live = this.progressLive
+    const contextElement = this.progressContext
+    const details = this.progressDetails
+    const timingsElement = this.progressTimings
+    if (!card || !live || !contextElement || !details || !timingsElement) return
 
-    const heading = card.createDiv({ cls: "github-sync-center__progress-heading" })
-    heading.createEl("strong", { text: this.progressHeading(snapshot) })
+    if (snapshot.lifecycle !== this.progressLifecycle) {
+      if (this.progressLifecycle) card.removeClass(`is-${this.progressLifecycle}`)
+      card.addClass(`is-${snapshot.lifecycle}`)
+      this.progressLifecycle = snapshot.lifecycle
+    }
+
+    const heading = this.progressHeading(snapshot)
+    const liveSignature = `${snapshot.lifecycle}\u0000${snapshot.phase ?? ""}\u0000${heading}`
+    if (liveSignature !== this.progressLiveSignature) {
+      live.setText(heading)
+      this.progressLiveSignature = liveSignature
+    }
     const context = [
       snapshot.operation && this.operationLabel(snapshot.operation),
       snapshot.trigger && this.triggerLabel(snapshot.trigger),
       snapshot.attempt > 0 && `Attempt ${snapshot.attempt}`,
     ].filter((value): value is string => Boolean(value))
-    if (context.length > 0) heading.createEl("span", { text: context.join(" · "), cls: "github-sync-center__muted" })
+    const contextText = context.join(" · ")
+    if (contextText !== this.progressContextSignature) {
+      contextElement.setText(contextText)
+      this.progressContextSignature = contextText
+    }
 
+    const detailsSignature = JSON.stringify({
+      lifecycle: snapshot.lifecycle,
+      currentPath: snapshot.currentPath,
+      pull: snapshot.pull,
+      push: snapshot.push,
+      lastSyncTime: snapshot.lastSyncTime,
+      errorMessage: snapshot.errorMessage,
+      failurePhase: snapshot.failurePhase,
+      failurePath: snapshot.failurePath,
+    })
+    if (detailsSignature !== this.progressDetailsSignature) {
+      details.empty()
+      this.renderProgressDetails(details, snapshot)
+      this.progressDetailsSignature = detailsSignature
+    }
+
+    const timingRows = snapshot.totalElapsedMs > 0 || snapshot.timings.length > 0
+      ? [
+          ["Total", formatV4Duration(snapshot.totalElapsedMs), true] as const,
+          ...snapshot.timings.map(timing => {
+            const phaseLabel = formatV4PhaseLabel(timing.phase)
+            const label = timing.phase === "encrypting" ? "Encryption" : phaseLabel
+            return [label, formatV4PhaseTiming(timing).slice(phaseLabel.length + 1), false] as const
+          }),
+        ]
+      : []
+    const timingsSignature = JSON.stringify(timingRows)
+    if (timingsSignature !== this.progressTimingsSignature) {
+      timingsElement.empty()
+      for (const [label, duration, total] of timingRows) this.renderTiming(timingsElement, label, duration, total)
+      this.progressTimingsSignature = timingsSignature
+    }
+  }
+
+  private renderProgressDetails(container: HTMLElement, snapshot: V4SyncProgressSnapshot): void {
     if (snapshot.lifecycle === "failed") {
-      const failure = card.createDiv({ cls: "github-sync-center__failure" })
+      const failure = container.createDiv({ cls: "github-sync-center__failure" })
       if (snapshot.failurePhase) failure.createDiv({ text: `Failed phase: ${formatV4PhaseLabel(snapshot.failurePhase)}` })
       if (snapshot.failurePath) this.renderPath(failure, snapshot.failurePath, "Failed path")
       if (snapshot.errorMessage) failure.createDiv({ text: `Error: ${snapshot.errorMessage}`, cls: "github-sync-center__error" })
     }
 
-    const directions = card.createDiv({ cls: "github-sync-center__progress-directions" })
-    this.renderDirection(directions, "Pull", snapshot.pull)
-    this.renderDirection(directions, "Push", snapshot.push)
+    if (snapshot.lifecycle !== "idle") {
+      const directions = container.createDiv({ cls: "github-sync-center__progress-directions" })
+      this.renderDirection(directions, "Pull", snapshot.pull)
+      this.renderDirection(directions, "Push", snapshot.push)
+    }
 
     if (snapshot.currentPath && (snapshot.lifecycle !== "failed" || snapshot.currentPath !== snapshot.failurePath)) {
-      this.renderPath(card, snapshot.currentPath)
+      this.renderPath(container, snapshot.currentPath)
     }
 
     if (snapshot.lastSyncTime > 0) {
-      card.createDiv({ text: `Completed ${new Date(snapshot.lastSyncTime).toLocaleString()}`, cls: "github-sync-center__progress-completed github-sync-center__muted" })
+      container.createDiv({ text: `Completed ${new Date(snapshot.lastSyncTime).toLocaleString()}`, cls: "github-sync-center__progress-completed github-sync-center__muted" })
     }
+  }
 
-    if (snapshot.totalElapsedMs > 0 || snapshot.timings.length > 0) {
-      const timings = card.createDiv({ cls: "github-sync-center__timings" })
-      this.renderTiming(timings, "Total", formatV4Duration(snapshot.totalElapsedMs), true)
-      for (const timing of snapshot.timings) {
-        const phaseLabel = formatV4PhaseLabel(timing.phase)
-        const label = timing.phase === "encrypting" ? "Encryption" : phaseLabel
-        this.renderTiming(timings, label, formatV4PhaseTiming(timing).slice(phaseLabel.length + 1))
-      }
-    }
-
+  private clearProgressElements(): void {
+    this.progressCard = undefined
+    this.progressLive = undefined
+    this.progressContext = undefined
+    this.progressDetails = undefined
+    this.progressTimings = undefined
+    this.progressLifecycle = undefined
+    this.progressLiveSignature = undefined
+    this.progressContextSignature = undefined
+    this.progressDetailsSignature = undefined
+    this.progressTimingsSignature = undefined
   }
 
   private renderTiming(container: HTMLElement, label: string, duration: string, total = false): void {
@@ -167,10 +258,15 @@ export class V4SyncCenterView extends ItemView {
   }
 
   private async renderCommitMode(): Promise<void> {
+    const generation = this.beginRender()
+    if (!generation) return
     const { body, detail } = this.shell("Commit history")
     body.createEl("p", { text: "Loading commits…", cls: "github-sync-center__muted" })
     try {
-      const page = await (await this.ensureService()).listCommits(this.page)
+      const service = await this.ensureService()
+      if (!this.isCurrent(generation)) return
+      const page = await service.listCommits(this.page)
+      if (!this.isCurrent(generation)) return
       body.empty()
       const pager = body.createDiv({ cls: "github-sync-center__pager" })
       const previous = pager.createEl("button", { text: "Previous" })
@@ -187,18 +283,27 @@ export class V4SyncCenterView extends ItemView {
         row.createDiv({ text: `${commit.source === "plugin" ? "Synced" : "External"} · ${commit.authoredAt || commit.sha.slice(0, 8)}`, cls: "github-sync-center__muted" })
         row.onclick = () => void this.renderCommitDetail(commit, detail)
       }
-      if (this.selected) await this.renderCommitDetail(this.selected, detail)
+      if (this.selected) {
+        await this.renderCommitDetail(this.selected, detail)
+        if (!this.isCurrent(generation)) return
+      }
       else detail.createEl("p", { text: "Select a commit to inspect its changes.", cls: "github-sync-center__muted" })
-    } catch (error) { this.renderError(body, error) }
+    } catch (error) { if (this.isCurrent(generation)) this.renderError(body, error) }
   }
 
   private async renderCommitDetail(commit: V4HistoryCommit, detail: HTMLElement): Promise<void> {
+    const generation = this.beginRender()
+    if (!generation) return
     this.selected = commit
+    this.releaseObjectUrl()
     detail.empty()
     detail.createEl("h4", { text: commit.message.split("\n", 1)[0] })
     detail.createEl("p", { text: "Loading changes…", cls: "github-sync-center__muted" })
     try {
-      const changes = await (await this.ensureService()).getCommitChanges(commit)
+      const service = await this.ensureService()
+      if (!this.isCurrent(generation)) return
+      const changes = await service.getCommitChanges(commit)
+      if (!this.isCurrent(generation)) return
       detail.empty()
       detail.createEl("h4", { text: `${changes.length} changed file${changes.length === 1 ? "" : "s"}` })
       const list = detail.createDiv({ cls: "github-sync-center__changes" })
@@ -209,18 +314,24 @@ export class V4SyncCenterView extends ItemView {
         row.createEl("span", { text: change.previousPath ? `${change.previousPath} → ${change.path}` : change.path })
         row.onclick = () => void this.renderPreview(commit, change, preview)
       }
-    } catch (error) { this.renderError(detail, error) }
+    } catch (error) { if (this.isCurrent(generation)) this.renderError(detail, error) }
   }
 
   private async renderFileMode(): Promise<void> {
+    const generation = this.beginRender()
+    if (!generation) return
     const active = this.app.workspace.getActiveFile()
     const { body, detail } = this.shell(active ? `Versions of ${active.path}` : "File versions")
     if (!active) { body.createEl("p", { text: "Open a file to view its versions." }); return }
     body.createEl("p", { text: "Loading versions…", cls: "github-sync-center__muted" })
     try {
       const fileId = await this.plugin.v4Runtime.fileIdForPath(active.path)
+      if (!this.isCurrent(generation)) return
       if (!fileId) { body.empty(); body.createEl("p", { text: "This file has not been synced by V4 yet." }); return }
-      const versions = await (await this.ensureService()).getFileVersions(fileId)
+      const service = await this.ensureService()
+      if (!this.isCurrent(generation)) return
+      const versions = await service.getFileVersions(fileId)
+      if (!this.isCurrent(generation)) return
       body.empty()
       for (const version of versions) {
         const row = body.createEl("button", { cls: "github-sync-center__row" })
@@ -229,19 +340,25 @@ export class V4SyncCenterView extends ItemView {
         row.onclick = () => void this.renderPreview(version.commit, version.change, detail)
       }
       if (versions.length === 0) body.createEl("p", { text: "No versions found in the loaded history." })
-    } catch (error) { this.renderError(body, error) }
+    } catch (error) { if (this.isCurrent(generation)) this.renderError(body, error) }
   }
 
   private async renderPreview(commit: V4HistoryCommit, change: V4HistoryChange, container: HTMLElement): Promise<void> {
+    const generation = this.beginRender()
+    if (!generation) return
+    this.releaseObjectUrl()
     container.empty()
     container.createEl("h4", { text: change.path })
     container.createEl("p", { text: "Loading preview…", cls: "github-sync-center__muted" })
     try {
-      const preview = await (await this.ensureService()).previewChange(commit, change)
+      const service = await this.ensureService()
+      if (!this.isCurrent(generation)) return
+      const preview = await service.previewChange(commit, change)
+      if (!this.isCurrent(generation)) return
       container.empty()
       container.createEl("h4", { text: change.path })
       this.appendPreview(container, preview)
-    } catch (error) { this.renderError(container, error) }
+    } catch (error) { if (this.isCurrent(generation)) this.renderError(container, error) }
   }
 
   private appendPreview(container: HTMLElement, preview: V4VersionPreview): void {

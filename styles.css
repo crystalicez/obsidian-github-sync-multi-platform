@@ -334,6 +334,10 @@
   border-top: 1px solid var(--background-modifier-border);
 }
 
+.github-sync-center__timings:empty {
+  display: none;
+}
+
 .github-sync-center__timing {
   justify-content: space-between;
 }

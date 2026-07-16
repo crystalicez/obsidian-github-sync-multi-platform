@@ -28,6 +28,7 @@ export default class FastSync extends Plugin {
   startupSyncTimeout: number | null = null
   secretsMigrated: boolean = false
   private unloaded = false
+  private statusDisplaySignature?: string
 
   enableWatch() {
     this.isWatchEnabled = true
@@ -241,19 +242,23 @@ export default class FastSync extends Plugin {
         this.statusBarItem.remove();
         this.statusBarItem = null;
       }
+      this.statusDisplaySignature = undefined;
       return;
     }
 
     if (!this.statusBarItem) {
       this.statusBarItem = this.addStatusBarItem();
+      this.statusDisplaySignature = undefined;
     }
-    this.statusBarItem.empty();
 
     const snapshot = this.v4Runtime?.progressSnapshot ?? createIdleV4Progress();
     const { text, title } = formatV4ActiveSyncStatus(snapshot);
     let cls = "github-sync-status-bar";
 
     if (snapshot.lifecycle === "waiting" || snapshot.lifecycle === "active") cls += " is-syncing";
+    const signature = `${text}\u0000${title}\u0000${cls}`;
+    if (signature === this.statusDisplaySignature) return;
+    this.statusBarItem.empty();
 
     const span = this.statusBarItem.createEl("span", { text, cls });
     span.title = title;
@@ -264,6 +269,7 @@ export default class FastSync extends Plugin {
         void runtime.manualSync()
       }
     };
+    this.statusDisplaySignature = signature;
   }
 
   async showForceConfirm(operation: "forcePush" | "forcePull"): Promise<void> {

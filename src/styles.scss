@@ -252,6 +252,7 @@
 .github-sync-center__progress-completed { margin-top: var(--size-4-2); }
 .github-sync-center__failure { margin-top: var(--size-4-2); padding: var(--size-4-2); border-radius: var(--radius-s); background: var(--background-modifier-error); }
 .github-sync-center__timings { margin-top: var(--size-4-3); padding-top: var(--size-4-2); border-top: 1px solid var(--background-modifier-border); }
+.github-sync-center__timings:empty { display: none; }
 .github-sync-center__timing { justify-content: space-between; }
 .github-sync-center__timing.is-total { font-weight: var(--font-semibold); }
 .github-sync-center__timing-duration { flex: 0 0 auto; font-variant-numeric: tabular-nums; text-align: right; }

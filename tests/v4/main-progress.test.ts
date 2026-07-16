@@ -107,3 +107,30 @@ test("status bar subscribes to detailed progress and cleans up once", async () =
   fixture.statusSpan.click();
   assert.equal(fixture.manualSyncCalls, 1);
 });
+
+test("status bar skips timing-only and duplicate lifecycle DOM updates", async () => {
+  const fixture = createMainProgressFixture();
+  await fixture.plugin.onload();
+
+  fixture.runtime.publishProgressForTest(uploadingFixture);
+  const afterUploading = (fixture.plugin.statusBarItem as unknown as ElementStub).mutationCount;
+  fixture.runtime.publishProgressForTest({
+    ...uploadingFixture,
+    timings: [{ phase: "uploading", elapsedMs: 1_000, occurrences: 1 }],
+    totalElapsedMs: 1_000,
+  });
+  assert.equal((fixture.plugin.statusBarItem as unknown as ElementStub).mutationCount, afterUploading);
+
+  for (const snapshot of [
+    { ...createIdleV4Progress(), lifecycle: "waiting" as const, phase: "debouncing" as const },
+    { ...createIdleV4Progress(), lifecycle: "active" as const, phase: "checking-remote" as const },
+    { ...createIdleV4Progress(), lifecycle: "success" as const, lastSyncTime: 1 },
+  ]) {
+    fixture.runtime.publishProgressForTest(snapshot);
+    const afterFirst = (fixture.plugin.statusBarItem as unknown as ElementStub).mutationCount;
+    fixture.runtime.publishProgressForTest(structuredClone(snapshot));
+    assert.equal((fixture.plugin.statusBarItem as unknown as ElementStub).mutationCount, afterFirst);
+  }
+
+  fixture.plugin.onunload();
+});

@@ -50,6 +50,7 @@ export class ElementStub {
   classes = new Set<string>();
   private parent?: ElementStub;
   private readonly root: { mutations: number };
+  private ownMutations = 0;
 
   constructor(root?: { mutations: number }, parent?: ElementStub) {
     this.root = root ?? { mutations: 0 };
@@ -57,8 +58,9 @@ export class ElementStub {
   }
 
   get mutationCount(): number { return this.root.mutations; }
+  get ownMutationCount(): number { return this.ownMutations; }
 
-  private mutate(): void { this.root.mutations++; }
+  private mutate(): void { this.root.mutations++; this.ownMutations++; }
 
   setText(text: string) {
     this.text = text;
@@ -117,6 +119,24 @@ export class ElementStub {
     if (this.text === text) return this;
     for (const child of this.children) {
       const found = child.findByText(text);
+      if (found) return found;
+    }
+    return undefined;
+  }
+
+  findByClass(className: string): ElementStub | undefined {
+    if (this.classes.has(className)) return this;
+    for (const child of this.children) {
+      const found = child.findByClass(className);
+      if (found) return found;
+    }
+    return undefined;
+  }
+
+  findByAttribute(name: string, value: string): ElementStub | undefined {
+    if (this.attributes[name] === value) return this;
+    for (const child of this.children) {
+      const found = child.findByAttribute(name, value);
       if (found) return found;
     }
     return undefined;

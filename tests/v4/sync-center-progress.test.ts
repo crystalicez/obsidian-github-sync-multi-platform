@@ -61,6 +61,12 @@ function createSyncCenterPluginFixture(source: FakeProgressSource | { progressSn
   return { app, v4Runtime: runtime };
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>(accept => { resolve = accept; });
+  return { promise, resolve };
+}
+
 test("Sync Center progress card updates in isolation and unsubscribes on close", async () => {
   const source = new FakeProgressSource();
   let historyLoadCount = 0;
@@ -146,4 +152,107 @@ test("store timing ticks update only the live card and stop after close", async 
   assert.equal(view.contentEl.mutationCount, mutationsAfterClose);
   assert.equal(historyLoadCount, 1);
   store.dispose();
+});
+
+test("timing ticks leave the concise live region untouched while phase and lifecycle changes announce", async () => {
+  const source = new FakeProgressSource();
+  const plugin = createSyncCenterPluginFixture(source, () => undefined);
+  const view = new V4SyncCenterView(new WorkspaceLeaf(plugin.app), plugin as never);
+  await view.onOpen();
+  source.publish(uploadingFixture);
+
+  const live = view.contentEl.findByAttribute("role", "status");
+  assert.ok(live);
+  const liveMutations = live.ownMutationCount;
+  const text = live.flattenText();
+  const rootMutations = view.contentEl.mutationCount;
+  source.publish({
+    ...uploadingFixture,
+    timings: uploadingFixture.timings.map(timing => ({ ...timing, elapsedMs: timing.elapsedMs + 1_000 })),
+    totalElapsedMs: uploadingFixture.totalElapsedMs + 1_000,
+  });
+  assert.equal(view.contentEl.findByAttribute("role", "status"), live);
+  assert.equal(live.flattenText(), text);
+  assert.equal(live.ownMutationCount, liveMutations);
+  assert.ok(view.contentEl.mutationCount > rootMutations);
+  assert.match(view.contentEl.flattenText(), /Total 9\.9s/u);
+
+  source.publish({ ...uploadingFixture, phase: "committing", currentPath: undefined });
+  assert.equal(view.contentEl.findByAttribute("role", "status"), live);
+  assert.equal(live.flattenText(), "Committing");
+  assert.ok(live.ownMutationCount > liveMutations);
+  source.publish({ ...uploadingFixture, lifecycle: "success", phase: undefined, currentPath: undefined });
+  assert.equal(live.flattenText(), "Success");
+  await view.onClose();
+});
+
+test("idle progress card omits run context and direction rows", async () => {
+  const source = new FakeProgressSource();
+  const plugin = createSyncCenterPluginFixture(source, () => undefined);
+  const view = new V4SyncCenterView(new WorkspaceLeaf(plugin.app), plugin as never);
+  await view.onOpen();
+  const text = view.contentEl.flattenText();
+  assert.match(text, /Idle/u);
+  assert.doesNotMatch(text, /Pull 0\/\?|Push 0\/\?|Normal|Attempt/u);
+  await view.onClose();
+});
+
+test("stale image preview completion cannot revoke or replace a reopened view URL", async () => {
+  const source = new FakeProgressSource();
+  const previews = [deferred<any>(), deferred<any>()];
+  let previewIndex = 0;
+  const commit = { sha: "abc12345", message: "sync", authoredAt: "2026-07-16", source: "plugin" } as const;
+  const change = { kind: "modify", path: "image.png" } as const;
+  const service = {
+    async listCommits() { return { items: [commit], hasMore: false }; },
+    async getCommitChanges() { return [change]; },
+    async getFileVersions() { return []; },
+    previewChange() { return previews[previewIndex++].promise; },
+  };
+  const plugin = createSyncCenterPluginFixture(source, () => undefined) as any;
+  plugin.v4Runtime.createHistoryService = async () => service;
+  const created: string[] = [];
+  const revoked: string[] = [];
+  const originalCreate = URL.createObjectURL;
+  const originalRevoke = URL.revokeObjectURL;
+  URL.createObjectURL = () => { const value = `blob:test-${created.length + 1}`; created.push(value); return value; };
+  URL.revokeObjectURL = value => { revoked.push(value); };
+  try {
+    const view = new V4SyncCenterView(new WorkspaceLeaf(plugin.app), plugin);
+    await view.onOpen();
+    const stalePreview = (view as any).renderPreview(
+      commit,
+      change,
+      view.contentEl.findByClass("github-sync-center__detail"),
+    ) as Promise<void>;
+    await Promise.resolve();
+    assert.equal(previewIndex, 1);
+
+    await view.onClose();
+    await view.onOpen();
+    const currentPreview = (view as any).renderPreview(
+      commit,
+      change,
+      view.contentEl.findByClass("github-sync-center__detail"),
+    ) as Promise<void>;
+    await Promise.resolve();
+    assert.equal(previewIndex, 2);
+
+    previews[1].resolve({ kind: "image", bytes: new Uint8Array([2]), mime: "image/png" });
+    await currentPreview;
+    assert.deepEqual(created, ["blob:test-1"]);
+    assert.deepEqual(revoked, []);
+
+    previews[0].resolve({ kind: "image", bytes: new Uint8Array([1]), mime: "image/png" });
+    await stalePreview;
+    assert.deepEqual(created, ["blob:test-1"]);
+    assert.deepEqual(revoked, []);
+    assert.equal(view.contentEl.findByAttribute("src", "blob:test-1") !== undefined, true);
+
+    await view.onClose();
+    assert.deepEqual(revoked, ["blob:test-1"]);
+  } finally {
+    URL.createObjectURL = originalCreate;
+    URL.revokeObjectURL = originalRevoke;
+  }
 });

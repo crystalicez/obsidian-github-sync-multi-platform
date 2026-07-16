@@ -162,19 +162,10 @@ export class V4PluginRuntime {
   private markWaiting(): void {
     if (this.coordinator.isSyncing) return
     this.beginWaitingRun()
-    this.updateStatusBarSafely()
   }
 
   private assertNotDisposed(): void {
     if (this.disposed) throw new Error("V4 runtime is disposed.")
-  }
-
-  private updateStatusBarSafely(): void {
-    try {
-      this.plugin.updateStatusBar()
-    } catch {
-      // Rendering is observational and must never affect sync control flow.
-    }
   }
 
   private beginWaitingRun(): void {
@@ -302,7 +293,6 @@ export class V4PluginRuntime {
     }
     if (request.trigger === "startup") this.plugin.enableWatch()
     this.plugin.isSyncInProgress = true
-    this.updateStatusBarSafely()
     try {
       if (!this.plugin.githubClient) throw new Error("GitHub connection is not configured.")
       let lastError: unknown
@@ -386,19 +376,7 @@ export class V4PluginRuntime {
       this.plugin.isSyncInProgress = false
       if (!this.disposed) {
         this.plugin.enableWatch()
-        let renderedWaiting = false
-        if (this.coordinator.pendingCount > 0) {
-          this.beginWaitingRun()
-          renderedWaiting = true
-        }
-        this.updateStatusBarSafely()
-        if (this.coordinator.pendingCount > 0) {
-          this.beginWaitingRun()
-          if (!renderedWaiting) {
-            this.updateStatusBarSafely()
-            if (this.coordinator.pendingCount > 0) this.beginWaitingRun()
-          }
-        }
+        if (this.coordinator.pendingCount > 0) this.beginWaitingRun()
       }
     }
   }
