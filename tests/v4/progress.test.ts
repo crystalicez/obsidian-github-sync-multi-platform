@@ -59,6 +59,22 @@ test("phase changes publish immediately while path and counters throttle", () =>
   assert.deepEqual(seen.at(-1)?.pull, { completed: 2, total: 3 });
 });
 
+test("the default path and counter throttle is exactly 400 milliseconds", () => {
+  const scheduledDelays: number[] = [];
+  const store = new V4ProgressStore({
+    schedule: (_callback, delay) => {
+      scheduledDelays.push(delay);
+      return scheduledDelays.length;
+    },
+    cancel: () => undefined,
+    monotonicNow: () => 0,
+  });
+  store.beginRun({ phase: "uploading", currentPath: "A.md" });
+  store.update({ currentPath: "B.md", push: { completed: 1 } });
+
+  assert.deepEqual(scheduledDelays, [1_000, 400]);
+});
+
 test("a phase transition flushes the pending path before publishing the next phase", () => {
   const { store } = createProgressFixture();
   const seen: V4SyncProgressSnapshot[] = [];
@@ -110,6 +126,51 @@ test("active timing refreshes once per second and terminal transition flushes ex
   assert.equal(store.snapshot.timings[0].elapsedMs, 1_250);
 });
 
+test("a timing refresh cannot publish path or counter changes before the throttle boundary", () => {
+  const { store, setNow, runScheduledCallbackAt } = createProgressFixture();
+  const seen: V4SyncProgressSnapshot[] = [];
+  store.subscribe(snapshot => seen.push(snapshot));
+  store.beginRun({ lifecycle: "active", phase: "uploading", currentPath: "A.md", push: { completed: 0, total: 2 } });
+
+  setNow(900);
+  store.update({ currentPath: "B.md", push: { completed: 1 } });
+  setNow(1_000);
+  runScheduledCallbackAt(1_000);
+
+  assert.equal(seen.at(-1)?.timings[0].elapsedMs, 1_000);
+  assert.equal(seen.at(-1)?.currentPath, "A.md");
+  assert.deepEqual(seen.at(-1)?.push, { completed: 0, total: 2 });
+
+  setNow(1_300);
+  runScheduledCallbackAt(400);
+  assert.equal(seen.at(-1)?.currentPath, "B.md");
+  assert.deepEqual(seen.at(-1)?.push, { completed: 1, total: 2 });
+});
+
+test("metadata publications and new subscribers cannot bypass a pending throttle", () => {
+  const { store, setNow, runScheduledCallbackAt } = createProgressFixture();
+  const seen: V4SyncProgressSnapshot[] = [];
+  store.subscribe(snapshot => seen.push(snapshot));
+  store.beginRun({ phase: "uploading", currentPath: "A.md", push: { completed: 0, total: 2 } });
+
+  setNow(900);
+  store.update({ currentPath: "B.md", push: { completed: 1 } });
+  store.update({ attempt: 2 });
+  assert.equal(seen.at(-1)?.attempt, 2);
+  assert.equal(seen.at(-1)?.currentPath, "A.md");
+  assert.deepEqual(seen.at(-1)?.push, { completed: 0, total: 2 });
+
+  let initialForLateSubscriber: V4SyncProgressSnapshot | undefined;
+  store.subscribe(snapshot => { initialForLateSubscriber ??= snapshot; });
+  assert.equal(initialForLateSubscriber?.currentPath, "A.md");
+  assert.deepEqual(initialForLateSubscriber?.push, { completed: 0, total: 2 });
+
+  setNow(1_300);
+  runScheduledCallbackAt(400);
+  assert.equal(seen.at(-1)?.currentPath, "B.md");
+  assert.deepEqual(seen.at(-1)?.push, { completed: 1, total: 2 });
+});
+
 test("completed timings remain until the next run begins", () => {
   const { store, setNow } = createProgressFixture();
   store.beginRun({ lifecycle: "active", phase: "planning", currentPath: "A.md" });
@@ -122,6 +183,21 @@ test("completed timings remain until the next run begins", () => {
   assert.equal(store.snapshot.totalElapsedMs, 300);
   store.beginRun({ lifecycle: "active", phase: "checking-remote" });
   assert.deepEqual(store.snapshot.timings, [{ phase: "checking-remote", elapsedMs: 0, occurrences: 1 }]);
+});
+
+test("terminal lifecycle updates freeze elapsed time before later metadata updates", () => {
+  for (const lifecycle of ["success", "no-change", "failed"] as const) {
+    const { store, setNow } = createProgressFixture();
+    store.beginRun({ phase: "committing" });
+    setNow(250);
+    store.update({ lifecycle });
+    assert.equal(store.snapshot.totalElapsedMs, 250, lifecycle);
+
+    setNow(900);
+    store.update({ lastSyncTime: 123 });
+    assert.equal(store.snapshot.totalElapsedMs, 250, lifecycle);
+    assert.deepEqual(store.snapshot.timings, [{ phase: "committing", elapsedMs: 250, occurrences: 1 }], lifecycle);
+  }
 });
 
 test("duration formatting shows sub-tenth and repeated attempts", () => {
@@ -147,6 +223,47 @@ test("subscriber exceptions do not escape updates or stop other subscribers", ()
   store.subscribe(() => { delivered = true; });
   assert.doesNotThrow(() => store.update({ lifecycle: "active", phase: "planning" }));
   assert.equal(delivered, true);
+});
+
+test("snapshot getter returns deeply frozen copies that cannot mutate store state", () => {
+  const { store, setNow } = createProgressFixture();
+  store.beginRun({ phase: "uploading", push: { completed: 1, total: 3 } });
+  setNow(200);
+  store.finish("success");
+
+  const first = store.snapshot;
+  const second = store.snapshot;
+  assert.notEqual(first.push, second.push);
+  assert.notEqual(first.timings, second.timings);
+  assert.notEqual(first.timings[0], second.timings[0]);
+  assert.equal(Object.isFrozen(first.push), true);
+  assert.equal(Object.isFrozen(first.timings), true);
+  assert.equal(Object.isFrozen(first.timings[0]), true);
+  assert.equal(Reflect.set(first.push, "completed", 99), false);
+  assert.equal(Reflect.set(first.timings[0], "elapsedMs", 99), false);
+  assert.deepEqual(store.snapshot.push, { completed: 1, total: 3 });
+  assert.deepEqual(store.snapshot.timings, [{ phase: "uploading", elapsedMs: 200, occurrences: 1 }]);
+});
+
+test("nested mutation attempts in one subscriber cannot affect later subscribers", () => {
+  const { store } = createProgressFixture();
+  let laterPushCompleted = -1;
+  let laterTimingElapsed = -1;
+  store.subscribe(snapshot => {
+    Reflect.set(snapshot.push, "completed", 99);
+    if (snapshot.timings[0]) Reflect.set(snapshot.timings[0], "elapsedMs", 99);
+  });
+  store.subscribe(snapshot => {
+    laterPushCompleted = snapshot.push.completed;
+    laterTimingElapsed = snapshot.timings[0]?.elapsedMs ?? -1;
+  });
+
+  store.beginRun({ phase: "uploading", push: { completed: 1, total: 3 } });
+
+  assert.equal(laterPushCompleted, 1);
+  assert.equal(laterTimingElapsed, 0);
+  assert.equal(store.snapshot.push.completed, 1);
+  assert.equal(store.snapshot.timings[0].elapsedMs, 0);
 });
 
 test("unsubscribe stops later delivery", () => {

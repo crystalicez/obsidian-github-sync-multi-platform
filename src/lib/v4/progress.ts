@@ -223,7 +223,7 @@ export class V4ProgressStore {
     this.schedule = options.schedule ?? ((callback, delay) => globalThis.setTimeout(callback, delay));
     this.cancel = options.cancel ?? (handle => globalThis.clearTimeout(handle as ReturnType<typeof setTimeout>));
     this.monotonicNow = options.monotonicNow ?? (() => globalThis.performance?.now() ?? Date.now());
-    this.throttleMs = options.throttleMs ?? 250;
+    this.throttleMs = options.throttleMs ?? 400;
     this.timingRefreshMs = options.timingRefreshMs ?? 1_000;
   }
 
@@ -234,7 +234,7 @@ export class V4ProgressStore {
   subscribe(subscriber: V4ProgressSubscriber): () => void {
     if (this.disposed) return () => undefined;
     this.subscribers.add(subscriber);
-    this.notifyOne(subscriber, this.snapshot);
+    this.notifyOne(subscriber, this.lastPublished ?? this.snapshot);
     return () => { this.subscribers.delete(subscriber); };
   }
 
@@ -266,6 +266,7 @@ export class V4ProgressStore {
     const previousLifecycle = this.state.lifecycle;
     const next = mergePatch(this.state, patch);
     if (snapshotsEqual(this.state, next)) return;
+    const runEnded = previousLifecycle === "active" && next.lifecycle !== "active";
 
     if (previousLifecycle !== "active" && next.lifecycle === "active" && this.runStartedAt === undefined) {
       this.runStartedAt = now;
@@ -278,16 +279,21 @@ export class V4ProgressStore {
     if (previousLifecycle !== "active" && this.state.lifecycle === "active" && this.state.phase && this.activePhaseStartedAt === undefined) {
       this.openPhase(this.state.phase, now);
     }
-    if (previousLifecycle === "active" && this.state.lifecycle !== "active") {
+    if (runEnded) {
       this.closeActivePhase(now);
       this.cancelTimingRefresh();
     }
     this.refreshTimingSnapshot(now);
+    if (runEnded) this.runStartedAt = undefined;
 
     if (this.state.lifecycle === "active") this.scheduleTimingRefresh();
     if (!phaseChanged && !lifecycleChanged && this.isThrottleOnlyPatch(patch)) {
       this.throttlePending = true;
       this.scheduleThrottle();
+      return;
+    }
+    if (this.throttlePending) {
+      this.publishEligibleState();
       return;
     }
     this.cancelThrottle();
@@ -383,9 +389,23 @@ export class V4ProgressStore {
       this.timingRefreshHandle = undefined;
       if (this.disposed || this.state.lifecycle !== "active") return;
       this.refreshTimingSnapshot(this.monotonicNow());
-      this.publish();
+      this.publishEligibleState();
       this.scheduleTimingRefresh();
     }, this.timingRefreshMs);
+  }
+
+  private publishEligibleState(): void {
+    if (!this.throttlePending || !this.lastPublished) {
+      this.publish();
+      return;
+    }
+    this.publish({
+      ...this.state,
+      currentPath: this.lastPublished.currentPath,
+      currentDirection: this.lastPublished.currentDirection,
+      pull: this.lastPublished.pull,
+      push: this.lastPublished.push,
+    });
   }
 
   private cancelThrottle(): void {
@@ -399,8 +419,8 @@ export class V4ProgressStore {
     this.timingRefreshHandle = undefined;
   }
 
-  private publish(): void {
-    const snapshot = freezeSnapshot(this.state);
+  private publish(source: V4SyncProgressSnapshot = this.state): void {
+    const snapshot = freezeSnapshot(source);
     if (this.lastPublished && snapshotsEqual(this.lastPublished, snapshot)) return;
     this.lastPublished = snapshot;
     for (const subscriber of this.subscribers) this.notifyOne(subscriber, snapshot);
