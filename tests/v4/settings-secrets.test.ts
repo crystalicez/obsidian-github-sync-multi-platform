@@ -81,8 +81,9 @@ class RuntimeMemoryGitHub {
   updateFailuresRemaining = 0;
   blobFailuresRemaining = 0;
   refReadBarrier?: Promise<void>;
+  refReads = 0;
   async getFileBytes(path: string, ref?: string) { this.readPaths.push(path); const commit = ref ? this.commits.get(ref) : undefined; const value = commit ? this.trees.get(commit.treeSha)?.get(path) : this.files.get(path); return value ? { bytes: new Uint8Array(value), sha: `sha-${path}` } : null; }
-  async getGitRefOrNull() { await this.refReadBarrier; return this.ref; }
+  async getGitRefOrNull() { this.refReads++; await this.refReadBarrier; return this.ref; }
   async ensureGitRepositoryInitialized() { return null; }
   async getGitCommit(sha: string) { const value = this.commits.get(sha)!; return { sha, treeSha: value.treeSha, parentShas: value.parents, message: value.message }; }
   async getTreeAt(treeSha: string) { const tree = this.trees.get(treeSha) ?? new Map(); return { sha: treeSha, url: "", truncated: false, tree: [...tree.entries()].map(([path, bytes], index) => ({ path, mode: "100644", type: "blob" as const, sha: `tree-blob-${index}`, size: bytes.byteLength, url: "" })) }; }
@@ -308,6 +309,141 @@ test("v4 runtime progress subscribers are observational", async () => {
   fixture.runtime.dispose();
 });
 
+test("v4 runtime treats an initial status renderer failure as observational", async () => {
+  const fixture = plaintextRuntimeFixture();
+  let renders = 0;
+  fixture.plugin.updateStatusBar = () => {
+    if (++renders === 1) throw new Error("initial render failed");
+  };
+
+  const result = await fixture.runtime.forcePush();
+
+  assert.equal((result as { status: string }).status, "completed");
+  assert.equal(fixture.runtime.progressSnapshot.lifecycle, "success");
+  assert.equal(fixture.plugin.isSyncInProgress, false);
+  assert.equal(fixture.github.ref !== null, true);
+  fixture.runtime.dispose();
+});
+
+test("v4 runtime treats a final status renderer failure as observational", async () => {
+  const fixture = plaintextRuntimeFixture();
+  let renders = 0;
+  fixture.plugin.updateStatusBar = () => {
+    if (++renders === 2) throw new Error("final render failed");
+  };
+
+  const result = await fixture.runtime.forcePush();
+
+  assert.equal((result as { status: string }).status, "completed");
+  assert.equal(fixture.runtime.progressSnapshot.lifecycle, "success");
+  assert.equal(fixture.plugin.isSyncInProgress, false);
+  fixture.runtime.dispose();
+});
+
+test("v4 runtime hands a synchronously reentrant final render to one waiting ledger", async () => {
+  const fixture = plaintextRuntimeFixture();
+  const seen: V4SyncProgressSnapshot[] = [];
+  fixture.runtime.subscribeProgress(snapshot => seen.push(structuredClone(snapshot)));
+  let renders = 0;
+  fixture.plugin.updateStatusBar = () => {
+    renders++;
+    if (renders === 2) fixture.runtime.enqueueModify("secret.md", 2);
+  };
+
+  await fixture.runtime.forcePush();
+
+  const waiting = seen.filter(snapshot => snapshot.lifecycle === "waiting" && snapshot.phase === "debouncing");
+  assert.equal(waiting.length, 1);
+  assert.equal(waiting[0].push.total, 1);
+  assert.equal(fixture.runtime.pendingCount, 1);
+  assert.equal(fixture.runtime.progressSnapshot.lifecycle, "waiting");
+  assert.equal(fixture.runtime.progressSnapshot.timings.find(item => item.phase === "debouncing")?.occurrences, 1);
+  assert.equal(renders, 3);
+  fixture.runtime.dispose();
+});
+
+test("v4 runtime skips every sync entry point after disposal without I/O", async () => {
+  const fixture = plaintextRuntimeFixture();
+  fixture.runtime.dispose();
+  const before = {
+    refReads: fixture.github.refReads,
+    readPaths: fixture.github.readPaths.length,
+    indexFiles: fixture.indexFiles.size,
+  };
+
+  const results = await Promise.all([
+    fixture.runtime.manualSync(),
+    fixture.runtime.startupSync(),
+    fixture.runtime.scheduledSync(),
+    fixture.runtime.forcePush(),
+    fixture.runtime.forcePull(),
+  ]);
+
+  assert.deepEqual(results.map(result => (result as { status: string }).status), ["skipped", "skipped", "skipped", "skipped", "skipped"]);
+  assert.deepEqual({
+    refReads: fixture.github.refReads,
+    readPaths: fixture.github.readPaths.length,
+    indexFiles: fixture.indexFiles.size,
+  }, before);
+  assert.equal(fixture.plugin.isSyncInProgress, false);
+});
+
+test("v4 runtime rejects history I/O after disposal before touching GitHub", async () => {
+  const fixture = plaintextRuntimeFixture();
+  fixture.runtime.dispose();
+
+  await assert.rejects(() => fixture.runtime.createHistoryService(), /disposed/iu);
+  await assert.rejects(() => fixture.runtime.fileIdForPath("secret.md"), /disposed/iu);
+
+  assert.equal(fixture.github.refReads, 0);
+  assert.deepEqual(fixture.github.readPaths, []);
+});
+
+test("v4 guard confirmation counts each checking entry as a displayed attempt", async () => {
+  const fixture = plaintextRuntimeFixture();
+  fixture.plugin.settings.abortChangePercent = 1;
+  resetModalTestState();
+  const seen: V4SyncProgressSnapshot[] = [];
+  fixture.runtime.subscribeProgress(snapshot => seen.push(structuredClone(snapshot)));
+
+  const run = fixture.runtime.forcePush();
+  for (let tick = 0; modalButtons.length === 0 && tick < 50; tick++) await new Promise<void>(resolve => setImmediate(resolve));
+  const confirm = modalButtons.find(button => button.text === "Override and force push");
+  assert.ok(confirm);
+  confirm.click();
+  await run;
+
+  const checks = seen.filter(snapshot => snapshot.phase === "checking-remote");
+  assert.deepEqual([...new Set(checks.map(snapshot => snapshot.attempt))], [1, 2]);
+  assert.equal(fixture.runtime.progressSnapshot.attempt, 2);
+  assert.equal(fixture.runtime.progressSnapshot.timings.find(item => item.phase === "checking-remote")?.occurrences, 2);
+  fixture.runtime.dispose();
+});
+
+test("v4 guard confirmation plus CAS retry keeps displayed attempts and occurrences aligned", async () => {
+  const fixture = plaintextRuntimeFixture();
+  await fixture.runtime.forcePush(true);
+  fixture.contents.set("secret.md", new TextEncoder().encode("changed"));
+  fixture.vaultFile.stat = { size: 7, mtime: 2 };
+  fixture.plugin.settings.abortChangePercent = 1;
+  fixture.github.updateFailuresRemaining = 1;
+  resetModalTestState();
+  const seen: V4SyncProgressSnapshot[] = [];
+  fixture.runtime.subscribeProgress(snapshot => seen.push(structuredClone(snapshot)));
+
+  const run = fixture.runtime.forcePush();
+  for (let tick = 0; modalButtons.length === 0 && tick < 50; tick++) await new Promise<void>(resolve => setImmediate(resolve));
+  const confirm = modalButtons.find(button => button.text === "Override and force push");
+  assert.ok(confirm);
+  confirm.click();
+  await run;
+
+  assert.equal(seen.find(snapshot => snapshot.phase === "retrying")?.attempt, 3);
+  assert.equal(fixture.runtime.progressSnapshot.attempt, 3);
+  assert.equal(fixture.runtime.progressSnapshot.timings.find(item => item.phase === "checking-remote")?.occurrences, 3);
+  fixture.runtime.dispose();
+});
+
 test("v4 runtime progress stays out of plugin data, local index files, and the retired main field", async () => {
   const fixture = plaintextRuntimeFixture();
   const seen: V4SyncProgressSnapshot[] = [];
@@ -325,6 +461,10 @@ test("v4 runtime progress stays out of plugin data, local index files, and the r
   assert.doesNotMatch(mainSource, /\bsyncProgress\b/u);
   assert.match(mainSource, /v4Runtime\?\.progressSnapshot\s*\?\?\s*createIdleV4Progress/u);
   assert.match(mainSource, /async persistData\(\)[\s\S]*?saveData\(\{[\s\S]*?settings:\s*sanitizeV4SettingsForPersistence\(this\.settings\)/u);
+  assert.match(mainSource, /startupSyncTimeout:\s*number\s*\|\s*null/u);
+  assert.match(mainSource, /if \(this\.startupSyncTimeout !== null\) window\.clearTimeout\(this\.startupSyncTimeout\)/u);
+  assert.match(mainSource, /onunload\(\)[\s\S]*?clearTimeout\(this\.startupSyncTimeout\)/u);
+  assert.match(mainSource, /const runtime = this\.v4Runtime;?[\s\S]*?if \(runtime && !runtime\.isSyncing\)/u);
   fixture.runtime.dispose();
 });
 

@@ -103,6 +103,7 @@ export class V4PluginRuntime {
   forcePull(allowThresholdOverride = false): Promise<unknown> { return this.coordinator.run({ operation: "forcePull", trigger: "forcePull", allowThresholdOverride }) }
 
   async createHistoryService(): Promise<V4HistoryService> {
+    this.assertNotDisposed()
     const loaded = await this.loadConfiguredRemoteConfig()
     if (!loaded) throw new Error("V4 history is not initialized. Force Push first.")
     const { remoteConfig, config } = loaded
@@ -119,6 +120,7 @@ export class V4PluginRuntime {
   }
 
   async fileIdForPath(path: string): Promise<string | null> {
+    this.assertNotDisposed()
     const loaded = await this.loadConfiguredRemoteConfig()
     if (!loaded) throw new Error("V4 history is not initialized. Force Push first.")
     assertV4PathLayoutCompatible(loaded.remoteConfig, loaded.config, "normal")
@@ -160,7 +162,19 @@ export class V4PluginRuntime {
   private markWaiting(): void {
     if (this.coordinator.isSyncing) return
     this.beginWaitingRun()
-    this.plugin.updateStatusBar()
+    this.updateStatusBarSafely()
+  }
+
+  private assertNotDisposed(): void {
+    if (this.disposed) throw new Error("V4 runtime is disposed.")
+  }
+
+  private updateStatusBarSafely(): void {
+    try {
+      this.plugin.updateStatusBar()
+    } catch {
+      // Rendering is observational and must never affect sync control flow.
+    }
   }
 
   private beginWaitingRun(): void {
@@ -288,15 +302,17 @@ export class V4PluginRuntime {
     }
     if (request.trigger === "startup") this.plugin.enableWatch()
     this.plugin.isSyncInProgress = true
-    this.plugin.updateStatusBar()
+    this.updateStatusBarSafely()
     try {
       if (!this.plugin.githubClient) throw new Error("GitHub connection is not configured.")
       let lastError: unknown
-      for (let attempt = 1; attempt <= 3; attempt++) {
+      let progressAttempt = 0
+      for (let casAttempt = 1; casAttempt <= 3; casAttempt++) {
         try {
+          progressAttempt++
           this.progressStore.update({
             phase: "checking-remote",
-            attempt,
+            attempt: progressAttempt,
             currentPath: undefined,
             currentDirection: undefined,
           })
@@ -346,13 +362,13 @@ export class V4PluginRuntime {
             const confirmed = await this.confirmThresholdOverride(error, request.operation)
             if (!confirmed) throw new Error("Sync cancelled because the modification threshold was exceeded.")
             request.allowThresholdOverride = true
-            attempt--
+            casAttempt--
             continue
           }
-          if (attempt === 3 || !/branch head changed|stale ref/i.test((error as Error).message)) throw error
+          if (casAttempt === 3 || !/branch head changed|stale ref/i.test((error as Error).message)) throw error
           this.progressStore.update({
             phase: "retrying",
-            attempt: attempt + 1,
+            attempt: progressAttempt + 1,
             currentPath: undefined,
             currentDirection: undefined,
             pull: { completed: 0, total: undefined },
@@ -368,9 +384,22 @@ export class V4PluginRuntime {
       return { changedFiles: 0 }
     } finally {
       this.plugin.isSyncInProgress = false
-      this.plugin.enableWatch()
-      if (this.coordinator.pendingCount > 0) this.beginWaitingRun()
-      this.plugin.updateStatusBar()
+      if (!this.disposed) {
+        this.plugin.enableWatch()
+        let renderedWaiting = false
+        if (this.coordinator.pendingCount > 0) {
+          this.beginWaitingRun()
+          renderedWaiting = true
+        }
+        this.updateStatusBarSafely()
+        if (this.coordinator.pendingCount > 0) {
+          this.beginWaitingRun()
+          if (!renderedWaiting) {
+            this.updateStatusBarSafely()
+            if (this.coordinator.pendingCount > 0) this.beginWaitingRun()
+          }
+        }
+      }
     }
   }
 

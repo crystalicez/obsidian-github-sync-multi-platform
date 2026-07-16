@@ -25,6 +25,7 @@ export default class FastSync extends Plugin {
   isWatchEnabled: boolean = true
   ignoredFiles: Set<string> = new Set()
   scheduledSyncTimer: number | null = null
+  startupSyncTimeout: number | null = null
   secretsMigrated: boolean = false
 
   enableWatch() {
@@ -126,8 +127,10 @@ export default class FastSync extends Plugin {
     this.app.workspace.onLayoutReady(() => {
       if (shouldRunStartupSync(this.settings)) {
         // Delay 1.5 s to let Obsidian finish initialising
-        setTimeout(() => {
-          void this.v4Runtime.startupSync();
+        this.startupSyncTimeout = window.setTimeout(() => {
+          this.startupSyncTimeout = null;
+          const runtime = this.v4Runtime;
+          if (runtime) void runtime.startupSync();
         }, 1500);
       } else {
         // Not configured – enable watch immediately
@@ -150,6 +153,8 @@ export default class FastSync extends Plugin {
   onunload() {
     if (this.scheduledSyncTimer) window.clearInterval(this.scheduledSyncTimer);
     this.scheduledSyncTimer = null;
+    if (this.startupSyncTimeout !== null) window.clearTimeout(this.startupSyncTimeout);
+    this.startupSyncTimeout = null;
     this.v4Runtime?.dispose()
   }
 
@@ -247,9 +252,10 @@ export default class FastSync extends Plugin {
 
     const span = this.statusBarItem.createEl("span", { text, cls });
     span.title = title;
+    const runtime = this.v4Runtime;
     span.onclick = () => {
-      if (!this.v4Runtime?.isSyncing) {
-        void this.v4Runtime.manualSync()
+      if (runtime && !runtime.isSyncing) {
+        void runtime.manualSync()
       }
     };
   }

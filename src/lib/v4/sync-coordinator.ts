@@ -92,6 +92,7 @@ export class V4SyncCoordinator {
   private active?: Promise<V4CoordinatorRunResult>;
   private timer?: unknown;
   private flushAfterActive = false;
+  private disposed = false;
   private readonly schedule: (callback: () => void, delay: number) => unknown;
   private readonly cancel: (handle: any) => void;
   private readonly debounceMs: number;
@@ -103,15 +104,19 @@ export class V4SyncCoordinator {
   }
 
   get isSyncing(): boolean { return this.active !== undefined; }
-  get pendingCount(): number { return coalesceV4Changes(this.pending).length; }
+  get pendingCount(): number { return this.disposed ? 0 : coalesceV4Changes(this.pending).length; }
 
   dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
     if (this.timer !== undefined) this.cancel(this.timer)
     this.timer = undefined
+    this.flushAfterActive = false
     this.pending.length = 0
   }
 
   enqueue(change: V4QueuedChange): void {
+    if (this.disposed) return;
     this.pending.push(change);
     if (this.timer !== undefined) this.cancel(this.timer);
     this.timer = this.schedule(() => {
@@ -121,6 +126,7 @@ export class V4SyncCoordinator {
   }
 
   async run(request: V4SyncRequest): Promise<V4CoordinatorRunResult> {
+    if (this.disposed) return { status: "skipped", changedFiles: 0 };
     if (this.active) {
       if (request.trigger === "scheduled" || request.trigger === "startup") return { status: "skipped", changedFiles: 0 };
       this.options.notice?.("GitHub Sync: Sync already in progress");
@@ -142,6 +148,7 @@ export class V4SyncCoordinator {
   }
 
   private async flushLocalChanges(): Promise<V4CoordinatorRunResult> {
+    if (this.disposed) return { status: "skipped", changedFiles: 0 };
     if (this.active) {
       this.flushAfterActive = true;
       return { status: "busy", changedFiles: 0 };
@@ -158,10 +165,16 @@ export class V4SyncCoordinator {
   }
 
   private start(request: V4SyncRequest, changes: V4QueuedChange[]): Promise<V4CoordinatorRunResult> {
+    if (this.disposed) return Promise.resolve({ status: "skipped", changedFiles: 0 });
     const execution = this.options.execute(request, changes).then(result => ({ status: "completed" as const, ...result }));
     let tracked!: Promise<V4CoordinatorRunResult>;
     tracked = execution.finally(() => {
       if (this.active === tracked) this.active = undefined;
+      if (this.disposed) {
+        this.pending.length = 0;
+        this.flushAfterActive = false;
+        return;
+      }
       if (this.pending.length > 0 && this.flushAfterActive) {
         this.flushAfterActive = false;
         void this.flushLocalChanges();

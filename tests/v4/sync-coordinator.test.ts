@@ -93,6 +93,62 @@ test("v4 coordinator skips scheduled ticks while busy", async () => {
   await active;
 });
 
+test("v4 coordinator permanently skips runs and enqueues after disposal", async () => {
+  const timers = new FakeTimers();
+  let executions = 0;
+  const notices: string[] = [];
+  const coordinator = new V4SyncCoordinator({
+    execute: async () => { executions++; return { changedFiles: 1 }; },
+    notice: message => notices.push(message),
+    schedule: timers.schedule,
+    cancel: timers.cancel,
+  });
+
+  coordinator.dispose();
+  coordinator.enqueue({ type: "modify", path: "after.md", mtime: 1 });
+  const results = await Promise.all([
+    coordinator.run({ operation: "normal", trigger: "manual" }),
+    coordinator.run({ operation: "normal", trigger: "startup" }),
+    coordinator.run({ operation: "normal", trigger: "scheduled" }),
+    coordinator.run({ operation: "forcePush", trigger: "forcePush" }),
+    coordinator.run({ operation: "forcePull", trigger: "forcePull" }),
+  ]);
+
+  assert.deepEqual(results.map(result => result.status), ["skipped", "skipped", "skipped", "skipped", "skipped"]);
+  assert.equal(coordinator.pendingCount, 0);
+  assert.equal(timers.timers.size, 0);
+  assert.equal(executions, 0);
+  assert.deepEqual(notices, []);
+});
+
+test("v4 coordinator disposed gate covers stale timers and active finalizers", async () => {
+  let staleTimer: (() => void) | undefined;
+  let release!: () => void;
+  const blocker = new Promise<void>(resolve => { release = resolve; });
+  const executions: V4QueuedChange[][] = [];
+  const coordinator = new V4SyncCoordinator({
+    execute: async (_request, changes) => {
+      executions.push(changes);
+      if (executions.length === 1) await blocker;
+      return { changedFiles: changes.length };
+    },
+    schedule: callback => { staleTimer = callback; return 1; },
+    cancel: () => undefined,
+  });
+
+  const active = coordinator.run({ operation: "normal", trigger: "manual" });
+  coordinator.enqueue({ type: "modify", path: "pending.md", mtime: 1 });
+  coordinator.dispose();
+  staleTimer?.();
+  coordinator.enqueue({ type: "modify", path: "after-dispose.md", mtime: 2 });
+  release();
+  await active;
+  await coordinator.whenIdle();
+
+  assert.deepEqual(executions, [[]]);
+  assert.equal(coordinator.pendingCount, 0);
+});
+
 test("v4 coordinator does not let a scheduled tick cut short a pending local debounce", async () => {
   const timers = new FakeTimers();
   const executions: string[] = [];
