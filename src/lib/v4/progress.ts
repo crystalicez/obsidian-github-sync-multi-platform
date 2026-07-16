@@ -54,6 +54,8 @@ export type V4SyncProgressPatch = Partial<Omit<V4SyncProgressSnapshot, "pull" | 
   push?: Partial<V4DirectionalProgress>;
 };
 
+export type V4BeginRunPatch = Omit<V4SyncProgressPatch, "lifecycle"> & { lifecycle?: never };
+
 export interface V4ProgressStoreOptions {
   throttleMs?: number;
   timingRefreshMs?: number;
@@ -203,6 +205,7 @@ export function middleTruncateV4Path(path: string, maximumLength: number): strin
 
 export class V4ProgressStore {
   private state = createIdleV4Progress();
+  private publishedSnapshot = freezeSnapshot(createIdleV4Progress());
   private readonly subscribers = new Set<V4ProgressSubscriber>();
   private readonly schedule: (callback: () => void, delay: number) => unknown;
   private readonly cancel: (handle: unknown) => void;
@@ -213,9 +216,9 @@ export class V4ProgressStore {
   private timingRefreshHandle?: unknown;
   private throttlePending = false;
   private disposed = false;
-  private lastPublished?: V4SyncProgressSnapshot;
   private runStartedAt?: number;
   private activePhaseStartedAt?: number;
+  private lastAcceptedNow?: number;
   private readonly timingOrder: V4SyncPhase[] = [];
   private readonly timingByPhase = new Map<V4SyncPhase, TimingAccumulator>();
 
@@ -228,28 +231,31 @@ export class V4ProgressStore {
   }
 
   get snapshot(): V4SyncProgressSnapshot {
-    return freezeSnapshot(this.state);
+    return freezeSnapshot(this.publishedSnapshot);
   }
 
   subscribe(subscriber: V4ProgressSubscriber): () => void {
     if (this.disposed) return () => undefined;
     this.subscribers.add(subscriber);
-    this.notifyOne(subscriber, this.lastPublished ?? this.snapshot);
+    this.notifyOne(subscriber, this.publishedSnapshot);
     return () => { this.subscribers.delete(subscriber); };
   }
 
-  beginRun(patch: V4SyncProgressPatch = {}): void {
+  beginRun(patch: V4BeginRunPatch = {}): void {
     if (this.disposed) return;
     this.cancelThrottle();
     this.cancelTimingRefresh();
     this.timingOrder.length = 0;
     this.timingByPhase.clear();
 
-    const now = this.monotonicNow();
+    const now = this.observeMonotonicNow();
     this.runStartedAt = now;
     this.activePhaseStartedAt = undefined;
     const previousLastSyncTime = this.state.lastSyncTime;
-    this.state = mergePatch({ ...createIdleV4Progress(), lifecycle: "active", lastSyncTime: previousLastSyncTime }, patch);
+    this.state = mergePatch(
+      { ...createIdleV4Progress(), lifecycle: "active", lastSyncTime: previousLastSyncTime },
+      { ...patch, lifecycle: "active" },
+    );
     if (this.state.phase) this.openPhase(this.state.phase, now);
     this.refreshTimingSnapshot(now);
     this.publish();
@@ -262,7 +268,7 @@ export class V4ProgressStore {
     const lifecycleChanged = hasOwn(patch, "lifecycle") && patch.lifecycle !== this.state.lifecycle;
     if ((phaseChanged || lifecycleChanged) && this.throttlePending) this.flush();
 
-    const now = this.monotonicNow();
+    const now = this.observeMonotonicNow();
     const previousLifecycle = this.state.lifecycle;
     const next = mergePatch(this.state, patch);
     if (snapshotsEqual(this.state, next)) return;
@@ -303,7 +309,7 @@ export class V4ProgressStore {
   finish(lifecycle: Extract<V4SyncLifecycle, "success" | "no-change" | "failed">, patch: V4SyncProgressPatch = {}): void {
     if (this.disposed) return;
     if (this.throttlePending) this.flush();
-    const now = this.monotonicNow();
+    const now = this.observeMonotonicNow();
     this.closeActivePhase(now);
     this.cancelTimingRefresh();
     const failurePatch = lifecycle === "failed"
@@ -321,7 +327,7 @@ export class V4ProgressStore {
   flush(): void {
     if (this.disposed || !this.throttlePending) return;
     this.cancelThrottle();
-    this.refreshTimingSnapshot(this.monotonicNow());
+    this.refreshTimingSnapshot(this.observeMonotonicNow());
     this.publish();
   }
 
@@ -336,6 +342,12 @@ export class V4ProgressStore {
   private isThrottleOnlyPatch(patch: V4SyncProgressPatch): boolean {
     const keys = Object.keys(patch);
     return keys.length > 0 && keys.every(key => key === "currentPath" || key === "currentDirection" || key === "pull" || key === "push");
+  }
+
+  private observeMonotonicNow(): number {
+    const observed = this.monotonicNow();
+    if (this.lastAcceptedNow === undefined || observed > this.lastAcceptedNow) this.lastAcceptedNow = observed;
+    return this.lastAcceptedNow;
   }
 
   private openPhase(phase: V4SyncPhase, now: number): void {
@@ -378,7 +390,7 @@ export class V4ProgressStore {
       this.throttleHandle = undefined;
       if (this.disposed || !this.throttlePending) return;
       this.throttlePending = false;
-      this.refreshTimingSnapshot(this.monotonicNow());
+      this.refreshTimingSnapshot(this.observeMonotonicNow());
       this.publish();
     }, this.throttleMs);
   }
@@ -388,23 +400,23 @@ export class V4ProgressStore {
     this.timingRefreshHandle = this.schedule(() => {
       this.timingRefreshHandle = undefined;
       if (this.disposed || this.state.lifecycle !== "active") return;
-      this.refreshTimingSnapshot(this.monotonicNow());
+      this.refreshTimingSnapshot(this.observeMonotonicNow());
       this.publishEligibleState();
       this.scheduleTimingRefresh();
     }, this.timingRefreshMs);
   }
 
   private publishEligibleState(): void {
-    if (!this.throttlePending || !this.lastPublished) {
+    if (!this.throttlePending) {
       this.publish();
       return;
     }
     this.publish({
       ...this.state,
-      currentPath: this.lastPublished.currentPath,
-      currentDirection: this.lastPublished.currentDirection,
-      pull: this.lastPublished.pull,
-      push: this.lastPublished.push,
+      currentPath: this.publishedSnapshot.currentPath,
+      currentDirection: this.publishedSnapshot.currentDirection,
+      pull: this.publishedSnapshot.pull,
+      push: this.publishedSnapshot.push,
     });
   }
 
@@ -421,8 +433,8 @@ export class V4ProgressStore {
 
   private publish(source: V4SyncProgressSnapshot = this.state): void {
     const snapshot = freezeSnapshot(source);
-    if (this.lastPublished && snapshotsEqual(this.lastPublished, snapshot)) return;
-    this.lastPublished = snapshot;
+    if (snapshotsEqual(this.publishedSnapshot, snapshot)) return;
+    this.publishedSnapshot = snapshot;
     for (const subscriber of this.subscribers) this.notifyOne(subscriber, snapshot);
   }
 

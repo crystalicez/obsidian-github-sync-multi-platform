@@ -7,6 +7,7 @@ import {
   formatV4PhaseTiming,
   middleTruncateV4Path,
   remainingV4Progress,
+  type V4SyncProgressPatch,
   type V4SyncProgressSnapshot,
 } from "../../src/lib/v4/progress";
 
@@ -98,7 +99,7 @@ test("normalization clamps counts and computes remaining only for known totals",
 
 test("phase timing aggregates retries with a monotonic clock", () => {
   const { store, setNow } = createProgressFixture();
-  store.beginRun({ lifecycle: "active", phase: "checking-remote", attempt: 1 });
+  store.beginRun({ phase: "checking-remote", attempt: 1 });
   setNow(600);
   store.update({ phase: "scanning-local" });
   setNow(1_000);
@@ -117,7 +118,7 @@ test("active timing refreshes once per second and terminal transition flushes ex
   const { store, setNow, runScheduledCallbackAt } = createProgressFixture();
   const seen: V4SyncProgressSnapshot[] = [];
   store.subscribe(snapshot => seen.push(snapshot));
-  store.beginRun({ lifecycle: "active", phase: "encrypting" });
+  store.beginRun({ phase: "encrypting" });
   setNow(1_000);
   runScheduledCallbackAt(1_000);
   assert.equal(seen.at(-1)?.timings[0].elapsedMs, 1_000);
@@ -126,11 +127,51 @@ test("active timing refreshes once per second and terminal transition flushes ex
   assert.equal(store.snapshot.timings[0].elapsedMs, 1_250);
 });
 
+test("timing publications never move backward when the supplied clock regresses", () => {
+  const { store, setNow, runScheduledCallbackAt } = createProgressFixture();
+  store.beginRun({ phase: "encrypting" });
+
+  const observed: Array<[phase: number, total: number]> = [];
+  for (const now of [1_000, 500, 1_200]) {
+    setNow(now);
+    runScheduledCallbackAt(1_000);
+    observed.push([store.snapshot.timings[0].elapsedMs, store.snapshot.totalElapsedMs]);
+  }
+
+  assert.deepEqual(observed, [
+    [1_000, 1_000],
+    [1_000, 1_000],
+    [1_200, 1_200],
+  ]);
+});
+
+test("the default clock prefers performance.now without consulting wall time", () => {
+  const performanceDescriptor = Object.getOwnPropertyDescriptor(globalThis, "performance");
+  const originalDateNow = Date.now;
+  let performanceCalls = 0;
+  Object.defineProperty(globalThis, "performance", {
+    configurable: true,
+    value: { now: () => { performanceCalls += 1; return 123; } },
+  });
+  Date.now = () => { throw new Error("wall time must not be used when performance.now is available"); };
+
+  try {
+    const store = new V4ProgressStore();
+    assert.doesNotThrow(() => store.beginRun({ phase: "planning" }));
+    assert.equal(performanceCalls, 1);
+    store.dispose();
+  } finally {
+    Date.now = originalDateNow;
+    if (performanceDescriptor) Object.defineProperty(globalThis, "performance", performanceDescriptor);
+    else Reflect.deleteProperty(globalThis, "performance");
+  }
+});
+
 test("a timing refresh cannot publish path or counter changes before the throttle boundary", () => {
   const { store, setNow, runScheduledCallbackAt } = createProgressFixture();
   const seen: V4SyncProgressSnapshot[] = [];
   store.subscribe(snapshot => seen.push(snapshot));
-  store.beginRun({ lifecycle: "active", phase: "uploading", currentPath: "A.md", push: { completed: 0, total: 2 } });
+  store.beginRun({ phase: "uploading", currentPath: "A.md", push: { completed: 0, total: 2 } });
 
   setNow(900);
   store.update({ currentPath: "B.md", push: { completed: 1 } });
@@ -171,9 +212,42 @@ test("metadata publications and new subscribers cannot bypass a pending throttle
   assert.deepEqual(seen.at(-1)?.push, { completed: 1, total: 2 });
 });
 
+test("public snapshot is initialized before any working state is published", () => {
+  const { store } = createProgressFixture();
+  store.update({ currentPath: "unpublished.md", push: { completed: 1 } });
+
+  assert.equal(store.snapshot.currentPath, undefined);
+  assert.deepEqual(store.snapshot.push, { completed: 0 });
+
+  let initialForSubscriber: V4SyncProgressSnapshot | undefined;
+  store.subscribe(snapshot => { initialForSubscriber ??= snapshot; });
+  assert.equal(initialForSubscriber?.currentPath, undefined);
+  assert.deepEqual(initialForSubscriber?.push, { completed: 0 });
+});
+
+test("getter and first subscriber keep the eligible run snapshot until the exact throttle boundary", () => {
+  const { store, runScheduledCallbackAt } = createProgressFixture();
+  store.beginRun({ phase: "uploading", currentPath: "A.md", push: { completed: 0, total: 2 } });
+  store.update({ currentPath: "B.md", push: { completed: 1 } });
+
+  assert.equal(store.snapshot.currentPath, "A.md");
+  assert.deepEqual(store.snapshot.push, { completed: 0, total: 2 });
+
+  const seen: V4SyncProgressSnapshot[] = [];
+  store.subscribe(snapshot => seen.push(snapshot));
+  assert.equal(seen.at(-1)?.currentPath, "A.md");
+  assert.deepEqual(seen.at(-1)?.push, { completed: 0, total: 2 });
+
+  runScheduledCallbackAt(400);
+  assert.equal(store.snapshot.currentPath, "B.md");
+  assert.deepEqual(store.snapshot.push, { completed: 1, total: 2 });
+  assert.equal(seen.at(-1)?.currentPath, "B.md");
+  assert.deepEqual(seen.at(-1)?.push, { completed: 1, total: 2 });
+});
+
 test("completed timings remain until the next run begins", () => {
   const { store, setNow } = createProgressFixture();
-  store.beginRun({ lifecycle: "active", phase: "planning", currentPath: "A.md" });
+  store.beginRun({ phase: "planning", currentPath: "A.md" });
   setNow(300);
   store.finish("success", { lastSyncTime: 1 });
   const completed = structuredClone(store.snapshot.timings);
@@ -181,7 +255,7 @@ test("completed timings remain until the next run begins", () => {
   store.update({ currentPath: undefined });
   assert.deepEqual(store.snapshot.timings, completed);
   assert.equal(store.snapshot.totalElapsedMs, 300);
-  store.beginRun({ lifecycle: "active", phase: "checking-remote" });
+  store.beginRun({ phase: "checking-remote" });
   assert.deepEqual(store.snapshot.timings, [{ phase: "checking-remote", elapsedMs: 0, occurrences: 1 }]);
 });
 
@@ -197,6 +271,17 @@ test("terminal lifecycle updates freeze elapsed time before later metadata updat
     store.update({ lastSyncTime: 123 });
     assert.equal(store.snapshot.totalElapsedMs, 250, lifecycle);
     assert.deepEqual(store.snapshot.timings, [{ phase: "committing", elapsedMs: 250, occurrences: 1 }], lifecycle);
+  }
+});
+
+test("beginRun cannot create a terminal lifecycle through runtime patch input", () => {
+  for (const lifecycle of ["success", "no-change", "failed"] as const) {
+    const { store, scheduled } = createProgressFixture();
+    store.beginRun({ lifecycle, phase: "planning" } as V4SyncProgressPatch);
+
+    assert.equal(store.snapshot.lifecycle, "active", lifecycle);
+    assert.deepEqual(store.snapshot.timings, [{ phase: "planning", elapsedMs: 0, occurrences: 1 }], lifecycle);
+    assert.equal([...scheduled.values()].some(item => item.delay === 1_000), true, lifecycle);
   }
 });
 
@@ -278,7 +363,7 @@ test("unsubscribe stops later delivery", () => {
 
 test("dispose cancels pending throttle and timing refresh timers", () => {
   const { store, scheduled, cancelled } = createProgressFixture();
-  store.beginRun({ lifecycle: "active", phase: "hashing", currentPath: "A.md" });
+  store.beginRun({ phase: "hashing", currentPath: "A.md" });
   store.update({ currentPath: "B.md" });
   assert.equal(scheduled.size, 2);
   store.dispose();
@@ -289,7 +374,7 @@ test("dispose cancels pending throttle and timing refresh timers", () => {
 test("a decreasing monotonic clock clamps elapsed deltas at zero", () => {
   const { store, setNow } = createProgressFixture();
   setNow(1_000);
-  store.beginRun({ lifecycle: "active", phase: "planning" });
+  store.beginRun({ phase: "planning" });
   setNow(500);
   store.finish("success");
   assert.deepEqual(store.snapshot.timings, [{ phase: "planning", elapsedMs: 0, occurrences: 1 }]);

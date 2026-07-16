@@ -5,6 +5,13 @@ import path from "node:path";
 
 const root = process.cwd();
 const outDir = path.join(root, ".tmp", "tests");
+const typeCheck = spawnSync(
+  process.execPath,
+  [path.join(root, "node_modules", "typescript", "bin", "tsc"), "-p", path.join(root, "tests", "tsconfig.type-tests.json"), "--pretty", "false"],
+  { cwd: root, stdio: "inherit" },
+);
+if (typeCheck.status !== 0) process.exit(typeCheck.status ?? 1);
+
 const tsEntries = [
   "tests/v4/protocol-core.test.ts",
   "tests/v4/scope.test.ts",

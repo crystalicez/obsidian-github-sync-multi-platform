@@ -1,0 +1,9 @@
+{
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "allowJs": false,
+    "noEmit": true,
+    "skipLibCheck": true
+  },
+  "include": ["v4/progress.typecheck.ts"]
+}
