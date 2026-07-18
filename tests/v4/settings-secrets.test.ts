@@ -11,8 +11,8 @@ import { migrateV4Secrets, sanitizeV4SettingsForPersistence } from "../../src/li
 import { selectV4RuntimeConfig, V4PluginRuntime } from "../../src/lib/v4/runtime";
 import { buildV4RemoteMetadata } from "../../src/lib/v4/remote-index";
 import { V4StorageCodec } from "../../src/lib/v4/storage-codec";
-import { V4_CONFIG_PATH, V4_FORMAT_VERSION, V4_HEAD_PATH, type V4PathLayout, type V4RemoteConfig, type V4RemoteHead } from "../../src/lib/v4/protocol-types";
-import { loadV4LocalIndex, type V4LocalIndex, type V4LocalIndexAdapter } from "../../src/lib/v4/local-index";
+import { V4_CONFIG_PATH, V4_FORMAT_VERSION, V4_HEAD_PATH, V4_ROOT, type V4PathLayout, type V4RemoteConfig, type V4RemoteHead } from "../../src/lib/v4/protocol-types";
+import { loadV4LocalIndex, type V4IndexFileRecord, type V4LocalIndex, type V4LocalIndexAdapter } from "../../src/lib/v4/local-index";
 import type { V4SyncProgressSnapshot } from "../../src/lib/v4/progress";
 
 function deferred<T>() {
@@ -86,6 +86,7 @@ class RuntimeMemoryGitHub {
   readPaths: string[] = [];
   updateFailuresRemaining = 0;
   updateFailureDelayMs = 0;
+  onUpdateFailure?: () => void;
   blobFailuresRemaining = 0;
   blobAttempts = 0;
   createBlobOverride?: (bytes: Uint8Array, attempt: number) => Promise<string>;
@@ -100,7 +101,7 @@ class RuntimeMemoryGitHub {
   async createGitTree(entries: GitHubCreateTreeEntry[], baseTree?: string) { const tree = new Map(baseTree ? this.trees.get(baseTree) : undefined); for (const entry of entries) entry.sha === null ? tree.delete(entry.path) : tree.set(entry.path, new Uint8Array(this.blobs.get(entry.sha)!)); const sha = `tree-${this.trees.size + 1}`; this.trees.set(sha, tree); return sha; }
   async createGitCommit(message: string, treeSha: string, parents: string[]) { const sha = `commit-${this.commits.size + 1}`; this.commits.set(sha, { treeSha, parents, message }); return sha; }
   async createGitRef(sha: string) { this.ref = { ref: "refs/heads/main", sha, type: "commit" }; this.files = new Map(this.trees.get(this.commits.get(sha)!.treeSha)); }
-  async updateGitRef(sha: string, expected?: string) { if (this.updateFailuresRemaining-- > 0) { if (this.updateFailureDelayMs > 0) await new Promise(resolve => setTimeout(resolve, this.updateFailureDelayMs)); throw new Error("stale ref"); } if (expected && this.ref?.sha !== expected) throw new Error("stale ref"); await this.createGitRef(sha); }
+  async updateGitRef(sha: string, expected?: string) { if (this.updateFailuresRemaining-- > 0) { this.onUpdateFailure?.(); if (this.updateFailureDelayMs > 0) await new Promise(resolve => setTimeout(resolve, this.updateFailureDelayMs)); throw new Error("stale ref"); } if (expected && this.ref?.sha !== expected) throw new Error("stale ref"); await this.createGitRef(sha); }
 }
 
 function plaintextRuntimeFixture(pathInput: string | string[] = "secret.md", github = new RuntimeMemoryGitHub(), deviceId = "device") {
@@ -307,6 +308,53 @@ test("v4 runtime CAS retry reuses one keep-local-copy-remote conflict copy", asy
   assert.deepEqual(remoteCopyPaths, localCopyPaths, `remote copies: ${remoteCopyPaths.join(", ")}`);
   assert.deepEqual(indexCopyPaths, localCopyPaths, `index copies: ${indexCopyPaths.join(", ")}`);
   assert.deepEqual(local.runtime.progressSnapshot.pull, { completed: 1, total: 1 });
+  assert.deepEqual(local.runtime.progressSnapshot.push, { completed: 2, total: 2 });
+  assert.equal(local.runtime.progressSnapshot.timings.find(item => item.phase === "checking-remote")?.occurrences, 2);
+});
+
+test("v4 incremental CAS retry publishes an applied conflict copy when retry chooses use-local", async t => {
+  const github = new RuntimeMemoryGitHub();
+  const local = plaintextRuntimeFixture("conflict.md", github, "local");
+  const remote = plaintextRuntimeFixture([], github, "remote");
+  t.after(() => {
+    local.runtime.dispose();
+    remote.runtime.dispose();
+  });
+  await local.runtime.forcePush();
+  await remote.runtime.forcePull();
+
+  const remoteFile = remote.vaultFiles.find(file => file.path === "conflict.md");
+  assert.ok(remoteFile);
+  remote.contents.set("conflict.md", new TextEncoder().encode("remote change"));
+  remoteFile.stat = { size: 13, mtime: 2 };
+  await remote.runtime.manualSync();
+
+  local.contents.set("conflict.md", new TextEncoder().encode("local change"));
+  local.vaultFile.stat = { size: 12, mtime: 3 };
+  github.updateFailuresRemaining = 1;
+  github.onUpdateFailure = () => { local.plugin.settings.conflictPolicy = "newer"; };
+  local.runtime.enqueueModify("conflict.md", 3);
+
+  await local.runtime.manualSync();
+
+  const localCopyPaths = [...local.contents.keys()].filter(path => path.includes(".conflict-remote-"));
+  const remoteCopyPaths = [...github.files.keys()].filter(path => path.includes(".conflict-remote-"));
+  const index = await loadV4LocalIndex(local.indexAdapter, ".obsidian/plugins/test/github-sync-v4-index");
+  const indexCopyRecords = Object.values(index.shards)
+    .flatMap(shard => Object.values(shard.records))
+    .filter(record => !record.deleted && record.path.includes(".conflict-remote-"));
+  const remoteCopyRecords = [...github.files]
+    .filter(([path]) => path.startsWith(`${V4_ROOT}/index/`) && path.endsWith(".json"))
+    .flatMap(([, bytes]) => Object.values((JSON.parse(new TextDecoder().decode(bytes)) as { records: Record<string, V4IndexFileRecord> }).records))
+    .filter(record => !record.deleted && record.path.includes(".conflict-remote-"));
+
+  assert.equal(local.runtime.progressSnapshot.lifecycle, "success");
+  assert.equal(localCopyPaths.length, 1, `local copies: ${localCopyPaths.join(", ")}`);
+  assert.deepEqual(remoteCopyPaths, localCopyPaths, `remote copies: ${remoteCopyPaths.join(", ")}`);
+  assert.deepEqual(indexCopyRecords.map(record => record.path), localCopyPaths);
+  assert.deepEqual(remoteCopyRecords.map(record => record.path), localCopyPaths);
+  assert.deepEqual(remoteCopyRecords.map(record => record.fileId), indexCopyRecords.map(record => record.fileId));
+  assert.deepEqual(local.runtime.progressSnapshot.pull, { completed: 0, total: 0 });
   assert.deepEqual(local.runtime.progressSnapshot.push, { completed: 2, total: 2 });
   assert.equal(local.runtime.progressSnapshot.timings.find(item => item.phase === "checking-remote")?.occurrences, 2);
 });

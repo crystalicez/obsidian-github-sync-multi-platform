@@ -303,11 +303,10 @@ export class V4SyncSession {
         : options.operation === "normal"
           ? causalState!.touchedBaseRecords
           : []
-    const identitySeedByPath = new Map(causalState?.identityByPath ?? [])
-    for (const copy of this.input.runState?.conflictCopies.values() ?? []) {
-      identitySeedByPath.set(copy.path, copy.fileId)
-    }
-    const localFiles = (await this.scanLocal(identityBaseRecords, options.changes ?? [], identitySeedByPath)).filter(file => includePath(file.path))
+    const runCopyIdentityByPath = new Map([...this.input.runState?.conflictCopies.values() ?? []]
+      .map(copy => [copy.path, copy.fileId] as const))
+    const identitySeedByPath = new Map([...causalState?.identityByPath ?? [], ...runCopyIdentityByPath])
+    const localFiles = (await this.scanLocal(identityBaseRecords, options.changes ?? [], identitySeedByPath, runCopyIdentityByPath)).filter(file => includePath(file.path))
     const localById = new Map(localFiles.map(file => [file.fileId, file]))
     const baseRecords = !hasKnownBase && options.operation === "normal" && causalState
       ? identityBaseRecords.filter(record => !causalState.survivingCausallyRenamedFileIds.has(record.fileId)
@@ -475,7 +474,7 @@ export class V4SyncSession {
       return { mode: options.operation === "forcePull" ? "force-pull" : "pull", operation: options.operation, changedFiles, pushedFiles: 0, pulledFiles }
     }
 
-    const latestLocal = new Map((await this.scanLocal(identityBaseRecords, options.changes ?? [], identitySeedByPath)).map(file => [file.fileId, file]))
+    const latestLocal = new Map((await this.scanLocal(identityBaseRecords, options.changes ?? [], identitySeedByPath, runCopyIdentityByPath)).map(file => [file.fileId, file]))
     const files: V4GitTreeFile[] = []
     const deletions = new Set<string>()
     const journalChanges: V4JournalChange[] = []
@@ -764,7 +763,12 @@ export class V4SyncSession {
     remote.records = reconciled
   }
 
-  private async scanLocal(baseRecords: V4IndexFileRecord[], changes: V4QueuedChange[], identitySeedByPath?: ReadonlyMap<string, string>): Promise<V4LogicalFile[]> {
+  private async scanLocal(
+    baseRecords: V4IndexFileRecord[],
+    changes: V4QueuedChange[],
+    identitySeedByPath?: ReadonlyMap<string, string>,
+    additionalFilesByPath?: ReadonlyMap<string, string>,
+  ): Promise<V4LogicalFile[]> {
     this.report({ phase: "scanning-local", currentPath: undefined, currentDirection: undefined })
     const pathChanges = changes.filter((change): change is Exclude<V4QueuedChange, { type: "rescan" }> => change.type !== "rescan")
     const hasFolderChange = pathChanges.some(change => change.type === "folderRename" || change.type === "folderDelete")
@@ -783,6 +787,21 @@ export class V4SyncSession {
         byPath.set(change.path, {
           path: change.path,
           fileId: previous?.fileId ?? await this.newFileId(change.path),
+          hash: await sha256Hex(content),
+          size: stat.size,
+          mtime: stat.mtime,
+        })
+      }
+      for (const [path, fileId] of additionalFilesByPath ?? []) {
+        if (byPath.has(path)) continue
+        this.report({ phase: "scanning-local", currentPath: path, currentDirection: undefined })
+        const stat = await this.input.vault.stat(path)
+        if (!stat) continue
+        this.report({ phase: "hashing", currentPath: path, currentDirection: undefined })
+        const content = await this.readLocal(path)
+        byPath.set(path, {
+          path,
+          fileId,
           hash: await sha256Hex(content),
           size: stat.size,
           mtime: stat.mtime,
