@@ -12,7 +12,7 @@ import {
 } from "./local-index"
 import { decodeV4RemoteConfig } from "./remote-index"
 import { createV4ScopePredicate, isPathInV4SyncScope } from "./scope"
-import { assertV4PathLayoutCompatible, V4ChangeGuardError, V4SyncSession } from "./sync-session"
+import { assertV4PathLayoutCompatible, V4ChangeGuardError, V4SyncSession, type V4SyncRunState } from "./sync-session"
 import type { V4ConflictResolution } from "./conflicts"
 import { V4SyncCoordinator, type V4QueuedChange, type V4SyncRequest } from "./sync-coordinator"
 import { expectedV4PathLayout, V4_FORMAT_VERSION, V4_CONFIG_PATH, type V4RemoteConfig, type V4StorageMode } from "./protocol-types"
@@ -297,6 +297,7 @@ export class V4PluginRuntime {
       if (!this.plugin.githubClient) throw new Error("GitHub connection is not configured.")
       let lastError: unknown
       let progressAttempt = 0
+      const runState: V4SyncRunState = { conflictCopies: new Map() }
       for (let casAttempt = 1; casAttempt <= 3; casAttempt++) {
         try {
           progressAttempt++
@@ -335,6 +336,7 @@ export class V4PluginRuntime {
             abortChangePercent: this.plugin.settings.abortChangePercent,
             askConflict: input => this.askConflict(input.path),
             includePath: inScope,
+            runState,
             onProgress: patch => {
               if (patch.phase === "checking-remote") return
               this.progressStore.update(patch)

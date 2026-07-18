@@ -49,6 +49,11 @@ export interface V4SyncSessionInput {
   askConflict?: (input: { path: string; localMtime: number; remoteMtime: number }) => Promise<V4ConflictResolution>
   includePath?: (path: string) => boolean
   onProgress?: (patch: V4SyncProgressPatch) => void
+  runState?: V4SyncRunState
+}
+
+export interface V4SyncRunState {
+  conflictCopies: Map<string, { path: string; fileId: string }>
 }
 
 export interface V4SessionSyncResult {
@@ -298,7 +303,10 @@ export class V4SyncSession {
         : options.operation === "normal"
           ? causalState!.touchedBaseRecords
           : []
-    const identitySeedByPath = causalState?.identityByPath
+    const identitySeedByPath = new Map(causalState?.identityByPath ?? [])
+    for (const copy of this.input.runState?.conflictCopies.values() ?? []) {
+      identitySeedByPath.set(copy.path, copy.fileId)
+    }
     const localFiles = (await this.scanLocal(identityBaseRecords, options.changes ?? [], identitySeedByPath)).filter(file => includePath(file.path))
     const localById = new Map(localFiles.map(file => [file.fileId, file]))
     const baseRecords = !hasKnownBase && options.operation === "normal" && causalState
@@ -404,19 +412,29 @@ export class V4SyncSession {
         deferredLocalApplies.push({ path: conflict.local.path, bytes: resolution.mergedBytes, mtime: this.now() })
       }
       if (resolution.action === "keep-local-copy-remote" && remoteBytes && conflict.remote) {
-        const copyPath = this.conflictCopyPath(conflict.remote.path)
+        let reservedCopy = this.input.runState?.conflictCopies.get(conflict.fileId)
+        if (!reservedCopy) {
+          const path = this.conflictCopyPath(conflict.remote.path)
+          reservedCopy = { path, fileId: await this.newFileId(path) }
+          this.input.runState?.conflictCopies.set(conflict.fileId, reservedCopy)
+        }
+        const copyPath = reservedCopy.path
         const copyHash = await sha256Hex(remoteBytes)
-        const copyFileId = await this.newFileId(copyPath)
+        const copyFileId = reservedCopy.fileId
+        const existingCopy = localById.get(copyFileId)
         const copyChange: V4PlannedChange = {
           fileId: copyFileId,
-          kind: "create",
+          kind: existingCopy ? "modify" : "create",
           path: copyPath,
+          before: existingCopy,
           after: { path: copyPath, fileId: copyFileId, hash: copyHash, size: remoteBytes.byteLength, mtime: conflict.remote.mtime },
         }
         pullTotal++
-        pushTotal++
         effectivePulls.push({ change: copyChange, cachedBytes: remoteBytes, cachedMtime: conflict.remote.mtime })
-        pushes.push(copyChange)
+        if (!pushes.some(change => change.fileId === copyFileId)) {
+          pushTotal++
+          pushes.push(copyChange)
+        }
       }
       if (localPush) {
         pushTotal++
