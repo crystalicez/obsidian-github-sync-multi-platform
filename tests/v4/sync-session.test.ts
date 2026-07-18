@@ -18,6 +18,12 @@ import type { V4SyncProgressPatch } from "../../src/lib/v4/progress";
 const enc = (value: string) => new TextEncoder().encode(value);
 const dec = (value: Uint8Array) => new TextDecoder().decode(value);
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>(fulfill => { resolve = fulfill; });
+  return { promise, resolve };
+}
+
 function phases(events: V4SyncProgressPatch[]): string[] {
   return events.flatMap(event => event.phase ? [event.phase] : []);
 }
@@ -90,6 +96,34 @@ function indexRecordByPath(index: V4LocalIndex, path: string): V4IndexFileRecord
   const record = Object.values(index.shards).flatMap(shard => Object.values(shard.records)).find(candidate => !candidate.deleted && candidate.path === path);
   assert.ok(record, `missing index record for ${path}`);
   return record;
+}
+
+async function divergedConflictFixture(conflictPaths: string[], ordinaryPullPaths: string[] = []) {
+  const github = new MemoryGitHub();
+  const remoteVault = new MemoryVault();
+  for (const path of [...conflictPaths, ...ordinaryPullPaths]) {
+    remoteVault.files.set(path, { bytes: enc(`base:${path}`), mtime: 1 });
+  }
+  const remoteIndex = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "remote", mode: "plaintext" });
+  await new V4SyncSession({ github, vault: remoteVault, index: remoteIndex, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "forcePush", allowThresholdOverride: false });
+
+  const localVault = new MemoryVault();
+  localVault.files = new Map([...remoteVault.files].map(([path, file]) => [path, { bytes: new Uint8Array(file.bytes), mtime: file.mtime }]));
+  const localIndex = structuredClone(remoteIndex);
+  localIndex.deviceId = "local";
+  for (const path of [...conflictPaths, ...ordinaryPullPaths]) {
+    remoteVault.files.set(path, { bytes: enc(`remote:${path}`), mtime: 2 });
+  }
+  await new V4SyncSession({ github, vault: remoteVault, index: remoteIndex, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({
+      operation: "normal",
+      allowThresholdOverride: false,
+      changes: [...conflictPaths, ...ordinaryPullPaths].map(path => ({ type: "modify" as const, path, mtime: 2 })),
+    });
+  for (const path of conflictPaths) localVault.files.set(path, { bytes: enc(`local:${path}`), mtime: 3 });
+  localVault.operations.length = 0;
+  return { github, localVault, localIndex };
 }
 
 async function unknownBaseFixture(mode: "plaintext" | "encrypted", localContent: string | null) {
@@ -1035,6 +1069,180 @@ for (const resolution of ["use-remote", "use-local"] as const) {
     }
   });
 }
+
+test("v4 resolves every conflict and exact total before an ordinary pull mutates the vault", async () => {
+  const fixture = await divergedConflictFixture(["conflict.md"], ["ordinary.md"]);
+  const prompt = deferred<{ action: "use-remote" }>();
+  const events: V4SyncProgressPatch[] = [];
+  let promptPending = false;
+  const run = new V4SyncSession({
+    github: fixture.github,
+    vault: fixture.localVault,
+    index: fixture.localIndex,
+    config: config(),
+    conflictPolicy: "ask",
+    abortChangePercent: 0,
+    onProgress: event => events.push(structuredClone(event)),
+    askConflict: async input => {
+      assert.equal(input.path, "conflict.md");
+      promptPending = true;
+      return prompt.promise;
+    },
+  }).sync({ operation: "normal", allowThresholdOverride: false, changes: [{ type: "modify", path: "conflict.md", mtime: 3 }] });
+
+  for (let tick = 0; !promptPending && tick < 50; tick++) await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(promptPending, true);
+  const operationsBeforeDecision = [...fixture.localVault.operations];
+  const eventsBeforeDecision = events.map(event => structuredClone(event));
+  prompt.resolve({ action: "use-remote" });
+  const result = await run;
+
+  assert.deepEqual(operationsBeforeDecision.filter(operation => /^(?:write|delete):/u.test(operation)), []);
+  assert.equal(eventsBeforeDecision.some(event => event.phase === "downloading" || event.phase === "applying"), false);
+  assert.equal(eventsBeforeDecision.some(event => (event.pull?.completed ?? 0) > 0), false);
+  const exactIndex = events.findIndex(event => event.phase === "resolving-conflicts"
+    && event.pull?.completed === 0 && event.pull.total === 2
+    && event.push?.completed === 0 && event.push.total === 0);
+  const firstTransferIndex = events.findIndex(event => event.phase === "downloading" || event.phase === "applying");
+  assert.ok(exactIndex >= 0 && exactIndex < firstTransferIndex, `exact=${exactIndex}, transfer=${firstTransferIndex}`);
+  assert.equal(result.mode, "pull");
+  assert.equal(result.pulledFiles, 2);
+  assert.deepEqual(lastDirectional(events, "pull"), { completed: 2, total: 2 });
+  assert.equal(dec(fixture.localVault.files.get("ordinary.md")!.bytes), "remote:ordinary.md");
+  assert.equal(dec(fixture.localVault.files.get("conflict.md")!.bytes), "remote:conflict.md");
+});
+
+test("v4 keep-local-copy-remote counts the cached conflict copy as one pull and two pushes", async () => {
+  const fixture = await divergedConflictFixture(["conflict.md"]);
+  const events: V4SyncProgressPatch[] = [];
+  const timeline: Array<{ kind: "progress"; event: V4SyncProgressPatch } | { kind: "write"; path: string }> = [];
+  const write = fixture.localVault.write.bind(fixture.localVault);
+  fixture.localVault.write = async (path, data, mtime) => {
+    timeline.push({ kind: "write", path });
+    await write(path, data, mtime);
+  };
+
+  const result = await new V4SyncSession({
+    github: fixture.github,
+    vault: fixture.localVault,
+    index: fixture.localIndex,
+    config: config(),
+    conflictPolicy: "ask",
+    abortChangePercent: 0,
+    now: () => 100,
+    onProgress: event => {
+      const copy = structuredClone(event);
+      events.push(copy);
+      timeline.push({ kind: "progress", event: copy });
+    },
+    askConflict: async () => ({ action: "keep-local-copy-remote" }),
+  }).sync({ operation: "normal", allowThresholdOverride: false, changes: [{ type: "modify", path: "conflict.md", mtime: 3 }] });
+
+  const copyPath = [...fixture.localVault.files.keys()].find(path => path.includes(".conflict-remote-"));
+  assert.equal(copyPath, "conflict.conflict-remote-local-100.md");
+  const exactIndex = timeline.findIndex(item => item.kind === "progress"
+    && item.event.phase === "resolving-conflicts"
+    && item.event.pull?.completed === 0 && item.event.pull.total === 1
+    && item.event.push?.completed === 0 && item.event.push.total === 2);
+  const writeIndex = timeline.findIndex(item => item.kind === "write" && item.path === copyPath);
+  const completionIndex = timeline.findIndex(item => item.kind === "progress"
+    && item.event.currentPath === copyPath && item.event.pull?.completed === 1);
+  assert.ok(exactIndex >= 0 && exactIndex < writeIndex && writeIndex < completionIndex, `exact=${exactIndex}, write=${writeIndex}, completion=${completionIndex}`);
+  assert.equal(events.some(event => event.phase === "applying" && event.currentPath === copyPath && event.currentDirection === "pull"), true);
+  assert.equal(events.some(event => event.phase === "downloading" && event.currentPath === copyPath), false);
+  assert.deepEqual(lastDirectional(events, "pull"), { completed: 1, total: 1 });
+  assert.deepEqual(lastDirectional(events, "push"), { completed: 2, total: 2 });
+  assert.equal(result.pulledFiles, 1);
+  assert.equal(result.pushedFiles, 2);
+  assert.equal(dec(fixture.localVault.files.get("conflict.md")!.bytes), "local:conflict.md");
+  assert.equal(dec(fixture.localVault.files.get(copyPath!)!.bytes), "remote:conflict.md");
+  assert.equal(dec(fixture.github.files.get("conflict.md")!), "local:conflict.md");
+  assert.equal(dec(fixture.github.files.get(copyPath!)!), "remote:conflict.md");
+});
+
+test("v4 keep-local-copy-remote leaves pull incomplete with applying context when the copy write fails", async () => {
+  const fixture = await divergedConflictFixture(["conflict.md"]);
+  const events: V4SyncProgressPatch[] = [];
+  const write = fixture.localVault.write.bind(fixture.localVault);
+  fixture.localVault.write = async (path, data, mtime) => {
+    if (path.includes(".conflict-remote-")) throw new Error("copy write failed");
+    await write(path, data, mtime);
+  };
+
+  await assert.rejects(
+    () => new V4SyncSession({
+      github: fixture.github,
+      vault: fixture.localVault,
+      index: fixture.localIndex,
+      config: config(),
+      conflictPolicy: "ask",
+      abortChangePercent: 0,
+      now: () => 100,
+      onProgress: event => events.push(structuredClone(event)),
+      askConflict: async () => ({ action: "keep-local-copy-remote" }),
+    }).sync({ operation: "normal", allowThresholdOverride: false, changes: [{ type: "modify", path: "conflict.md", mtime: 3 }] }),
+    /copy write failed/iu,
+  );
+
+  assert.equal(events.at(-1)?.phase, "applying");
+  assert.equal(events.at(-1)?.currentPath, "conflict.conflict-remote-local-100.md");
+  assert.equal(events.at(-1)?.currentDirection, "pull");
+  assert.deepEqual(lastDirectional(events, "pull"), { completed: 0, total: 1 });
+});
+
+test("v4 defers a merged local write until every conflict decision and exact total are final", async () => {
+  const fixture = await divergedConflictFixture(["A.md", "B.md"]);
+  const secondDecision = deferred<{ action: "use-local" }>();
+  const events: V4SyncProgressPatch[] = [];
+  const timeline: Array<{ kind: "progress"; event: V4SyncProgressPatch } | { kind: "write"; path: string }> = [];
+  const write = fixture.localVault.write.bind(fixture.localVault);
+  fixture.localVault.write = async (path, data, mtime) => {
+    timeline.push({ kind: "write", path });
+    await write(path, data, mtime);
+  };
+  let secondPromptPending = false;
+  const run = new V4SyncSession({
+    github: fixture.github,
+    vault: fixture.localVault,
+    index: fixture.localIndex,
+    config: config(),
+    conflictPolicy: "ask",
+    abortChangePercent: 0,
+    onProgress: event => {
+      const copy = structuredClone(event);
+      events.push(copy);
+      timeline.push({ kind: "progress", event: copy });
+    },
+    askConflict: async input => {
+      if (input.path === "A.md") return { action: "merged", mergedBytes: enc("merged:A.md") };
+      secondPromptPending = true;
+      return secondDecision.promise;
+    },
+  }).sync({
+    operation: "normal",
+    allowThresholdOverride: false,
+    changes: ["A.md", "B.md"].map(path => ({ type: "modify" as const, path, mtime: 3 })),
+  });
+
+  for (let tick = 0; !secondPromptPending && tick < 50; tick++) await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(secondPromptPending, true);
+  const writesBeforeFinalDecision = timeline.filter(item => item.kind === "write").map(item => item.path);
+  secondDecision.resolve({ action: "use-local" });
+  const result = await run;
+
+  assert.deepEqual(writesBeforeFinalDecision, []);
+  const exactIndex = timeline.findIndex(item => item.kind === "progress"
+    && item.event.phase === "resolving-conflicts"
+    && item.event.pull?.total === 0 && item.event.push?.total === 2);
+  const mergedWriteIndex = timeline.findIndex(item => item.kind === "write" && item.path === "A.md");
+  assert.ok(exactIndex >= 0 && exactIndex < mergedWriteIndex, `exact=${exactIndex}, write=${mergedWriteIndex}`);
+  assert.equal(events.some(event => event.phase === "applying" && event.currentPath === "A.md"), true);
+  assert.deepEqual(lastDirectional(events, "pull"), { completed: 0, total: 0 });
+  assert.deepEqual(lastDirectional(events, "push"), { completed: 2, total: 2 });
+  assert.equal(result.pushedFiles, 2);
+  assert.equal(dec(fixture.localVault.files.get("A.md")!.bytes), "merged:A.md");
+  assert.equal(dec(fixture.github.files.get("A.md")!), "merged:A.md");
+});
 
 test("v4 failed pull progress retains the active logical path", async () => {
   const github = new MemoryGitHub();

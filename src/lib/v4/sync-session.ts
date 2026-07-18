@@ -67,6 +67,18 @@ interface V4RemoteState {
   commitSha: string
 }
 
+interface V4EffectivePull {
+  change: V4PlannedChange
+  cachedBytes?: Uint8Array
+  cachedMtime?: number
+}
+
+interface V4DeferredLocalApply {
+  path: string
+  bytes: Uint8Array
+  mtime: number
+}
+
 export class V4ChangeGuardError extends Error {
   constructor(public readonly changePercent: number, public readonly thresholdPercent: number) {
     super(`V4 change guard blocked sync: ${changePercent}% exceeds ${thresholdPercent}%.`)
@@ -347,16 +359,9 @@ export class V4SyncSession {
 
     const recordsById = new Map((isLayoutMigration ? [] : allRemoteRecords).map(record => [record.fileId, record]))
     const remoteCommitSha = remote?.commitSha
-    let pulledFiles = 0
-    for (const change of plan.pulls) {
-      await this.applyPull(change, recordsById, remoteCommitSha, () => {
-        pullCompleted++
-        this.report({ currentPath: change.path, currentDirection: "pull", pull: directional(pullCompleted, conflictsResolved ? pullTotal : undefined) })
-      })
-      pulledFiles++
-    }
-
+    const effectivePulls: V4EffectivePull[] = plan.pulls.map(change => ({ change }))
     const pushes = [...plan.pushes]
+    const deferredLocalApplies: V4DeferredLocalApply[] = []
     for (const [conflictIndex, conflict] of plan.conflicts.entries()) {
       this.report({
         phase: "resolving-conflicts",
@@ -391,10 +396,32 @@ export class V4SyncSession {
       }
       const pull = resolution.action === "use-remote" ? this.changeBetween(conflict.local, conflict.remote) : null
       const localPush = resolution.action === "use-remote" ? null : this.changeBetween(conflict.remote, conflict.local)
-      const copyPushes = resolution.action === "keep-local-copy-remote" && remoteBytes && conflict.remote ? 1 : 0
-      if (pull) pullTotal++
-      if (localPush) pushTotal++
-      pushTotal += copyPushes
+      if (pull) {
+        pullTotal++
+        effectivePulls.push({ change: pull, cachedBytes: remoteBytes, cachedMtime: remoteRecord?.mtime })
+      }
+      if (resolution.action === "merged" && conflict.local && resolution.mergedBytes) {
+        deferredLocalApplies.push({ path: conflict.local.path, bytes: resolution.mergedBytes, mtime: this.now() })
+      }
+      if (resolution.action === "keep-local-copy-remote" && remoteBytes && conflict.remote) {
+        const copyPath = this.conflictCopyPath(conflict.remote.path)
+        const copyHash = await sha256Hex(remoteBytes)
+        const copyFileId = await this.newFileId(copyPath)
+        const copyChange: V4PlannedChange = {
+          fileId: copyFileId,
+          kind: "create",
+          path: copyPath,
+          after: { path: copyPath, fileId: copyFileId, hash: copyHash, size: remoteBytes.byteLength, mtime: conflict.remote.mtime },
+        }
+        pullTotal++
+        pushTotal++
+        effectivePulls.push({ change: copyChange, cachedBytes: remoteBytes, cachedMtime: conflict.remote.mtime })
+        pushes.push(copyChange)
+      }
+      if (localPush) {
+        pushTotal++
+        pushes.push(localPush)
+      }
       const isFinalConflict = conflictIndex === plan.conflicts.length - 1
       if (isFinalConflict) {
         this.report({
@@ -404,34 +431,25 @@ export class V4SyncSession {
           ...counters(true),
         })
       }
-      if (resolution.action === "use-remote") {
-        if (pull) {
-          await this.applyPull(pull, recordsById, remoteCommitSha, () => {
-            pullCompleted++
-            this.report({ currentPath: pull.path, currentDirection: "pull", pull: directional(pullCompleted, isFinalConflict ? pullTotal : undefined) })
-          })
-          pulledFiles++
-        }
-        continue
-      }
-      if (resolution.action === "merged" && conflict.local && resolution.mergedBytes) {
-        await this.input.vault.write(conflict.local.path, resolution.mergedBytes, this.now())
-        this.localReadCache.set(conflict.local.path, resolution.mergedBytes)
-      }
-      if (resolution.action === "keep-local-copy-remote" && remoteBytes && conflict.remote) {
-        const copyPath = this.conflictCopyPath(conflict.remote.path)
-        await this.input.vault.write(copyPath, remoteBytes, conflict.remote.mtime)
-        this.localReadCache.set(copyPath, remoteBytes)
-        const copyHash = await sha256Hex(remoteBytes)
-        const copyFileId = await this.newFileId(copyPath)
-        pushes.push({
-          fileId: copyFileId,
-          kind: "create",
-          path: copyPath,
-          after: { path: copyPath, fileId: copyFileId, hash: copyHash, size: remoteBytes.byteLength, mtime: conflict.remote.mtime },
-        })
-      }
-      if (localPush) pushes.push(localPush)
+    }
+
+    let pulledFiles = 0
+    for (const action of effectivePulls) {
+      await this.applyPull(action.change, recordsById, remoteCommitSha, () => {
+        pullCompleted++
+        this.report({ currentPath: action.change.path, currentDirection: "pull", pull: directional(pullCompleted, pullTotal) })
+      }, action.cachedBytes, action.cachedMtime)
+      pulledFiles++
+    }
+    for (const apply of deferredLocalApplies) {
+      this.report({
+        phase: "applying",
+        currentPath: apply.path,
+        currentDirection: "push",
+        ...counters(true),
+      })
+      await this.input.vault.write(apply.path, apply.bytes, apply.mtime)
+      this.localReadCache.set(apply.path, apply.bytes)
     }
 
     if (pushes.length === 0 && options.operation !== "forcePush" && !externalReconciled) {
@@ -796,6 +814,8 @@ export class V4SyncSession {
     records: Map<string, V4IndexFileRecord>,
     remoteCommitSha: string | undefined,
     onCompleted: () => void,
+    cachedBytes?: Uint8Array,
+    cachedMtime?: number,
   ): Promise<void> {
     if (change.kind === "delete") {
       this.report({ phase: "applying", currentPath: change.path, currentDirection: "pull" })
@@ -804,12 +824,15 @@ export class V4SyncSession {
       return
     }
     const record = records.get(change.fileId)
-    if (!record) throw new Error(`Missing V4 remote record for ${change.path}`)
-    this.report({ phase: "downloading", currentPath: change.path, currentDirection: "pull" })
-    const bytes = await this.readRecord(record, remoteCommitSha)
+    if (!record && cachedBytes === undefined) throw new Error(`Missing V4 remote record for ${change.path}`)
+    let bytes = cachedBytes
+    if (bytes === undefined) {
+      this.report({ phase: "downloading", currentPath: change.path, currentDirection: "pull" })
+      bytes = await this.readRecord(record!, remoteCommitSha)
+    }
     this.report({ phase: "applying", currentPath: change.path, currentDirection: "pull" })
     if (change.kind === "rename" && change.previousPath) await this.input.vault.delete(change.previousPath)
-    await this.input.vault.write(change.path, bytes, record.mtime)
+    await this.input.vault.write(change.path, bytes, cachedMtime ?? record!.mtime)
     this.localReadCache.set(change.path, bytes)
     onCompleted()
   }
