@@ -15,6 +15,12 @@ import { V4_CONFIG_PATH, V4_FORMAT_VERSION, V4_HEAD_PATH, type V4PathLayout, typ
 import type { V4LocalIndex } from "../../src/lib/v4/local-index";
 import type { V4SyncProgressSnapshot } from "../../src/lib/v4/progress";
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>(fulfill => { resolve = fulfill; });
+  return { promise, resolve };
+}
+
 test("v4 settings defaults keep sensitive scopes and modification guard disabled", () => {
   assert.equal(DEFAULT_SETTINGS.syncObsidianConfig, false);
   assert.equal(DEFAULT_SETTINGS.syncBookmarks, false);
@@ -80,6 +86,8 @@ class RuntimeMemoryGitHub {
   readPaths: string[] = [];
   updateFailuresRemaining = 0;
   blobFailuresRemaining = 0;
+  blobAttempts = 0;
+  createBlobOverride?: (bytes: Uint8Array, attempt: number) => Promise<string>;
   refReadBarrier?: Promise<void>;
   refReads = 0;
   async getFileBytes(path: string, ref?: string) { this.readPaths.push(path); const commit = ref ? this.commits.get(ref) : undefined; const value = commit ? this.trees.get(commit.treeSha)?.get(path) : this.files.get(path); return value ? { bytes: new Uint8Array(value), sha: `sha-${path}` } : null; }
@@ -87,18 +95,23 @@ class RuntimeMemoryGitHub {
   async ensureGitRepositoryInitialized() { return null; }
   async getGitCommit(sha: string) { const value = this.commits.get(sha)!; return { sha, treeSha: value.treeSha, parentShas: value.parents, message: value.message }; }
   async getTreeAt(treeSha: string) { const tree = this.trees.get(treeSha) ?? new Map(); return { sha: treeSha, url: "", truncated: false, tree: [...tree.entries()].map(([path, bytes], index) => ({ path, mode: "100644", type: "blob" as const, sha: `tree-blob-${index}`, size: bytes.byteLength, url: "" })) }; }
-  async createGitBlob(bytes: Uint8Array) { if (this.blobFailuresRemaining-- > 0) throw new Error("simulated upload failure"); const sha = `blob-${this.blobs.size + 1}`; this.blobs.set(sha, new Uint8Array(bytes)); return sha; }
+  async createGitBlob(bytes: Uint8Array) { const attempt = ++this.blobAttempts; if (this.createBlobOverride) return this.createBlobOverride(bytes, attempt); if (this.blobFailuresRemaining-- > 0) throw new Error("simulated upload failure"); const sha = `blob-${this.blobs.size + 1}`; this.blobs.set(sha, new Uint8Array(bytes)); return sha; }
   async createGitTree(entries: GitHubCreateTreeEntry[], baseTree?: string) { const tree = new Map(baseTree ? this.trees.get(baseTree) : undefined); for (const entry of entries) entry.sha === null ? tree.delete(entry.path) : tree.set(entry.path, new Uint8Array(this.blobs.get(entry.sha)!)); const sha = `tree-${this.trees.size + 1}`; this.trees.set(sha, tree); return sha; }
   async createGitCommit(message: string, treeSha: string, parents: string[]) { const sha = `commit-${this.commits.size + 1}`; this.commits.set(sha, { treeSha, parents, message }); return sha; }
   async createGitRef(sha: string) { this.ref = { ref: "refs/heads/main", sha, type: "commit" }; this.files = new Map(this.trees.get(this.commits.get(sha)!.treeSha)); }
   async updateGitRef(sha: string, expected?: string) { if (this.updateFailuresRemaining-- > 0) throw new Error("stale ref"); if (expected && this.ref?.sha !== expected) throw new Error("stale ref"); await this.createGitRef(sha); }
 }
 
-function plaintextRuntimeFixture(path = "secret.md") {
+function plaintextRuntimeFixture(pathInput: string | string[] = "secret.md") {
   const github = new RuntimeMemoryGitHub();
-  const contents = new Map([[path, new TextEncoder().encode("body")]]);
-  const vaultFile = new TFile(path, contents.get(path));
-  vaultFile.stat = { size: 4, mtime: 1 };
+  const paths = Array.isArray(pathInput) ? pathInput : [pathInput];
+  const contents = new Map(paths.map(path => [path, new TextEncoder().encode("body")]));
+  const vaultFiles = paths.map(path => {
+    const file = new TFile(path, contents.get(path));
+    file.stat = { size: 4, mtime: 1 };
+    return file;
+  });
+  const vaultFile = vaultFiles[0];
   const indexFiles = new Map<string, string>();
   const plugin = {
     app: { vault: {
@@ -109,8 +122,8 @@ function plaintextRuntimeFixture(path = "secret.md") {
         async exists(indexPath: string) { return indexFiles.has(indexPath); },
         async mkdir() {},
       },
-      getFiles() { return [vaultFile]; },
-      getAbstractFileByPath(candidate: string) { return candidate === path ? vaultFile : null; },
+      getFiles() { return vaultFiles; },
+      getAbstractFileByPath(candidate: string) { return vaultFiles.find(file => file.path === candidate) ?? null; },
       async readBinary(file: TFile) { return contents.get(file.path)!.buffer; },
     } },
     manifest: { id: "test" },
@@ -119,7 +132,7 @@ function plaintextRuntimeFixture(path = "secret.md") {
     ignoredFiles: new Set<string>(), isWatchEnabled: true, isSyncInProgress: false,
     enableWatch() { this.isWatchEnabled = true; }, updateStatusBar() {}, addIgnoredFile() {}, removeIgnoredFile() {},
   };
-  return { runtime: new V4PluginRuntime(plugin as never), plugin, github, contents, vaultFile, indexFiles };
+  return { runtime: new V4PluginRuntime(plugin as never), plugin, github, contents, vaultFile, vaultFiles, indexFiles };
 }
 
 function assertNoProgressPersistence(value: unknown): void {
@@ -165,6 +178,34 @@ test("v4 runtime keeps the exact upload failure phase and logical path", async (
   assert.equal(fixture.runtime.progressSnapshot.failurePath, "secret.md");
   assert.match(fixture.runtime.progressSnapshot.errorMessage ?? "", /upload failure/iu);
   fixture.runtime.dispose();
+});
+
+test("v4 runtime terminal upload failure snapshot cannot mutate after delayed workers settle", async t => {
+  const fixture = plaintextRuntimeFixture(["A.md", "B.md", "C.md", "D.md"]);
+  t.after(() => fixture.runtime.dispose());
+  const delayed = [deferred<string>(), deferred<string>(), deferred<string>()];
+  fixture.github.createBlobOverride = async (_bytes, attempt) => {
+    if (attempt === 1) throw new Error("simulated upload failure");
+    if (attempt <= 4) return delayed[attempt - 2].promise;
+    return `unexpected-blob-${attempt}`;
+  };
+  const seen: V4SyncProgressSnapshot[] = [];
+  fixture.runtime.subscribeProgress(snapshot => seen.push(structuredClone(snapshot)));
+
+  const run = fixture.runtime.forcePush();
+  for (let tick = 0; fixture.github.blobAttempts < 4 && tick < 500; tick++) {
+    await new Promise<void>(resolve => setImmediate(resolve));
+  }
+  assert.equal(fixture.github.blobAttempts, 4, JSON.stringify(fixture.runtime.progressSnapshot));
+  delayed.forEach((gate, index) => gate.resolve(`blob-${index + 2}`));
+  await run;
+  await new Promise<void>(resolve => setTimeout(resolve, 450));
+
+  const terminalSnapshots = seen.filter(snapshot => snapshot.lifecycle === "failed");
+  assert.ok(terminalSnapshots.length > 0);
+  for (const snapshot of terminalSnapshots.slice(1)) assert.deepEqual(snapshot, terminalSnapshots[0]);
+  assert.deepEqual(fixture.runtime.progressSnapshot, terminalSnapshots[0]);
+  assert.equal(fixture.github.blobAttempts, 4);
 });
 
 test("v4 runtime publishes blocked with planned totals before the force override modal", async () => {

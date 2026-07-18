@@ -34,6 +34,12 @@ class MemoryV4GitHub {
 
 const bytes = (value: string) => new TextEncoder().encode(value);
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>(fulfill => { resolve = fulfill; });
+  return { promise, resolve };
+}
+
 test("V4 tree writer initializes an empty branch with a root commit", async () => {
   const github = new MemoryV4GitHub();
   const result = await publishV4TreeChanges(github, {
@@ -142,4 +148,53 @@ test("V4 tree writer ignores progress callback errors and completes Git writes",
   assert.deepEqual(callbackEvents, ["started", "uploaded", "complete"]);
   assert.equal(result.commitSha, "commit-1");
   assert.deepEqual(github.createdRefs, ["commit-1"]);
+});
+
+test("V4 tree writer settles already-started uploads before rejecting the first failure", async () => {
+  const github = new MemoryV4GitHub();
+  const delayed = [deferred<string>(), deferred<string>(), deferred<string>()];
+  const events: string[] = [];
+  const firstFailure = new Error("first upload failed");
+  let upload = 0;
+  github.createGitBlob = async data => {
+    const current = upload++;
+    events.push(`blob-started:${current}`);
+    if (current === 0) throw firstFailure;
+    const sha = await delayed[current - 1].promise;
+    events.push(`blob-settled:${current}`);
+    github.blobs.push(new Uint8Array(data));
+    return sha;
+  };
+
+  const write = publishV4TreeChanges(github, {
+    message: "obsidian-sync-v4:stable-failure-boundary",
+    files: ["A", "B", "C", "D"].map(value => ({
+      path: `${value}.enc`,
+      bytes: bytes(value),
+      progressItems: [{ fileId: value, path: `${value}.md` }],
+    })),
+    onLogicalFileUploaded: item => events.push(`uploaded:${item.fileId}`),
+    onUploadsComplete: () => events.push("uploads-complete"),
+  });
+  const observed = write.then(
+    () => { throw new Error("writer unexpectedly succeeded"); },
+    error => { events.push("rejected"); return error as Error; },
+  );
+
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(upload, 4);
+  delayed.forEach((gate, index) => gate.resolve(`blob-${index + 2}`));
+  const error = await observed;
+
+  assert.equal(error, firstFailure);
+  assert.match(error.message, /first upload failed/iu);
+  const rejectionIndex = events.indexOf("rejected");
+  assert.notEqual(rejectionIndex, -1);
+  assert.equal(events.slice(rejectionIndex + 1).some(event => event.startsWith("uploaded:")), false, events.join(", "));
+  assert.equal(events.slice(0, rejectionIndex).filter(event => event.startsWith("uploaded:")).length, 3);
+  assert.equal(events.includes("uploads-complete"), false);
+  assert.equal(github.trees.length, 0);
+  assert.equal(github.commits.length, 0);
+  assert.deepEqual(github.createdRefs, []);
+  assert.deepEqual(github.updatedRefs, []);
 });
