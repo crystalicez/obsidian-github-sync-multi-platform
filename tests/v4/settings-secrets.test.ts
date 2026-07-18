@@ -155,6 +155,12 @@ function plaintextRuntimeFixture(pathInput: string | string[] = "secret.md", git
   return { runtime: new V4PluginRuntime(plugin as never), plugin, github, contents, vaultFile, vaultFiles, indexFiles, indexAdapter };
 }
 
+function runtimeRemoteIndexRecords(github: RuntimeMemoryGitHub): V4IndexFileRecord[] {
+  return [...github.files]
+    .filter(([path]) => path.startsWith(`${V4_ROOT}/index/`) && path.endsWith(".json"))
+    .flatMap(([, bytes]) => Object.values((JSON.parse(new TextDecoder().decode(bytes)) as { records: Record<string, V4IndexFileRecord> }).records));
+}
+
 function assertNoProgressPersistence(value: unknown): void {
   const forbidden = new Set(["phase", "currentPath", "failurePath", "pull", "push", "timings", "totalElapsedMs"]);
   const visit = (candidate: unknown): void => {
@@ -332,7 +338,10 @@ test("v4 incremental CAS retry publishes an applied conflict copy when retry cho
   local.contents.set("conflict.md", new TextEncoder().encode("local change"));
   local.vaultFile.stat = { size: 12, mtime: 3 };
   github.updateFailuresRemaining = 1;
-  github.onUpdateFailure = () => { local.plugin.settings.conflictPolicy = "newer"; };
+  github.onUpdateFailure = () => {
+    local.plugin.settings.conflictPolicy = "newer";
+    local.plugin.settings.ignorePathRegex = "\\.conflict-remote-";
+  };
   local.runtime.enqueueModify("conflict.md", 3);
 
   await local.runtime.manualSync();
@@ -343,9 +352,7 @@ test("v4 incremental CAS retry publishes an applied conflict copy when retry cho
   const indexCopyRecords = Object.values(index.shards)
     .flatMap(shard => Object.values(shard.records))
     .filter(record => !record.deleted && record.path.includes(".conflict-remote-"));
-  const remoteCopyRecords = [...github.files]
-    .filter(([path]) => path.startsWith(`${V4_ROOT}/index/`) && path.endsWith(".json"))
-    .flatMap(([, bytes]) => Object.values((JSON.parse(new TextDecoder().decode(bytes)) as { records: Record<string, V4IndexFileRecord> }).records))
+  const remoteCopyRecords = runtimeRemoteIndexRecords(github)
     .filter(record => !record.deleted && record.path.includes(".conflict-remote-"));
 
   assert.equal(local.runtime.progressSnapshot.lifecycle, "success");
@@ -356,6 +363,95 @@ test("v4 incremental CAS retry publishes an applied conflict copy when retry cho
   assert.deepEqual(remoteCopyRecords.map(record => record.fileId), indexCopyRecords.map(record => record.fileId));
   assert.deepEqual(local.runtime.progressSnapshot.pull, { completed: 0, total: 0 });
   assert.deepEqual(local.runtime.progressSnapshot.push, { completed: 2, total: 2 });
+  assert.equal(local.runtime.progressSnapshot.timings.find(item => item.phase === "checking-remote")?.occurrences, 2);
+});
+
+test("v4 direct keep-local-copy keeps an out-of-scope generated copy local only", async t => {
+  const github = new RuntimeMemoryGitHub();
+  const local = plaintextRuntimeFixture("conflict.md", github, "local");
+  const remote = plaintextRuntimeFixture([], github, "remote");
+  t.after(() => {
+    local.runtime.dispose();
+    remote.runtime.dispose();
+  });
+  await local.runtime.forcePush();
+  await remote.runtime.forcePull();
+
+  const remoteFile = remote.vaultFiles.find(file => file.path === "conflict.md");
+  assert.ok(remoteFile);
+  remote.contents.set("conflict.md", new TextEncoder().encode("remote change"));
+  remoteFile.stat = { size: 13, mtime: 2 };
+  await remote.runtime.manualSync();
+
+  local.contents.set("conflict.md", new TextEncoder().encode("local change"));
+  local.vaultFile.stat = { size: 12, mtime: 3 };
+  local.plugin.settings.ignorePathRegex = "\\.conflict-remote-";
+
+  await local.runtime.manualSync();
+
+  const localCopyPaths = [...local.contents.keys()].filter(path => path.includes(".conflict-remote-"));
+  const remoteCopyPaths = [...github.files.keys()].filter(path => path.includes(".conflict-remote-"));
+  const index = await loadV4LocalIndex(local.indexAdapter, ".obsidian/plugins/test/github-sync-v4-index");
+  const indexCopyRecords = Object.values(index.shards)
+    .flatMap(shard => Object.values(shard.records))
+    .filter(record => !record.deleted && record.path.includes(".conflict-remote-"));
+  const remoteCopyRecords = runtimeRemoteIndexRecords(github)
+    .filter(record => !record.deleted && record.path.includes(".conflict-remote-"));
+
+  assert.equal(local.runtime.progressSnapshot.lifecycle, "success");
+  assert.equal(localCopyPaths.length, 1, `local copies: ${localCopyPaths.join(", ")}`);
+  assert.deepEqual(remoteCopyPaths, []);
+  assert.deepEqual(remoteCopyRecords, []);
+  assert.deepEqual(indexCopyRecords, []);
+  assert.deepEqual(local.runtime.progressSnapshot.pull, { completed: 1, total: 1 });
+  assert.deepEqual(local.runtime.progressSnapshot.push, { completed: 1, total: 1 });
+});
+
+test("v4 incremental CAS retry keeps an out-of-scope copy local when policy and settings change", async t => {
+  const github = new RuntimeMemoryGitHub();
+  const local = plaintextRuntimeFixture("conflict.md", github, "local");
+  const remote = plaintextRuntimeFixture([], github, "remote");
+  t.after(() => {
+    local.runtime.dispose();
+    remote.runtime.dispose();
+  });
+  await local.runtime.forcePush();
+  await remote.runtime.forcePull();
+
+  const remoteFile = remote.vaultFiles.find(file => file.path === "conflict.md");
+  assert.ok(remoteFile);
+  remote.contents.set("conflict.md", new TextEncoder().encode("remote change"));
+  remoteFile.stat = { size: 13, mtime: 2 };
+  await remote.runtime.manualSync();
+
+  local.contents.set("conflict.md", new TextEncoder().encode("local change"));
+  local.vaultFile.stat = { size: 12, mtime: 3 };
+  local.plugin.settings.ignorePathRegex = "\\.conflict-remote-";
+  github.updateFailuresRemaining = 1;
+  github.onUpdateFailure = () => {
+    local.plugin.settings.conflictPolicy = "newer";
+    local.plugin.settings.ignorePathRegex = "";
+  };
+  local.runtime.enqueueModify("conflict.md", 3);
+
+  await local.runtime.manualSync();
+
+  const localCopyPaths = [...local.contents.keys()].filter(path => path.includes(".conflict-remote-"));
+  const remoteCopyPaths = [...github.files.keys()].filter(path => path.includes(".conflict-remote-"));
+  const index = await loadV4LocalIndex(local.indexAdapter, ".obsidian/plugins/test/github-sync-v4-index");
+  const indexCopyRecords = Object.values(index.shards)
+    .flatMap(shard => Object.values(shard.records))
+    .filter(record => !record.deleted && record.path.includes(".conflict-remote-"));
+  const remoteCopyRecords = runtimeRemoteIndexRecords(github)
+    .filter(record => !record.deleted && record.path.includes(".conflict-remote-"));
+
+  assert.equal(local.runtime.progressSnapshot.lifecycle, "success");
+  assert.equal(localCopyPaths.length, 1, `local copies: ${localCopyPaths.join(", ")}`);
+  assert.deepEqual(remoteCopyPaths, []);
+  assert.deepEqual(remoteCopyRecords, []);
+  assert.deepEqual(indexCopyRecords, []);
+  assert.deepEqual(local.runtime.progressSnapshot.pull, { completed: 0, total: 0 });
+  assert.deepEqual(local.runtime.progressSnapshot.push, { completed: 1, total: 1 });
   assert.equal(local.runtime.progressSnapshot.timings.find(item => item.phase === "checking-remote")?.occurrences, 2);
 });
 

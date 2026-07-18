@@ -53,7 +53,7 @@ export interface V4SyncSessionInput {
 }
 
 export interface V4SyncRunState {
-  conflictCopies: Map<string, { path: string; fileId: string }>
+  conflictCopies: Map<string, { path: string; fileId: string; includeInSync: boolean }>
 }
 
 export interface V4SessionSyncResult {
@@ -304,6 +304,7 @@ export class V4SyncSession {
           ? causalState!.touchedBaseRecords
           : []
     const runCopyIdentityByPath = new Map([...this.input.runState?.conflictCopies.values() ?? []]
+      .filter(copy => copy.includeInSync)
       .map(copy => [copy.path, copy.fileId] as const))
     const identitySeedByPath = new Map([...causalState?.identityByPath ?? [], ...runCopyIdentityByPath])
     const localFiles = (await this.scanLocal(identityBaseRecords, options.changes ?? [], identitySeedByPath, runCopyIdentityByPath)).filter(file => includePath(file.path))
@@ -414,7 +415,7 @@ export class V4SyncSession {
         let reservedCopy = this.input.runState?.conflictCopies.get(conflict.fileId)
         if (!reservedCopy) {
           const path = this.conflictCopyPath(conflict.remote.path)
-          reservedCopy = { path, fileId: await this.newFileId(path) }
+          reservedCopy = { path, fileId: await this.newFileId(path), includeInSync: includePath(path) }
           this.input.runState?.conflictCopies.set(conflict.fileId, reservedCopy)
         }
         const copyPath = reservedCopy.path
@@ -430,7 +431,7 @@ export class V4SyncSession {
         }
         pullTotal++
         effectivePulls.push({ change: copyChange, cachedBytes: remoteBytes, cachedMtime: conflict.remote.mtime })
-        if (!pushes.some(change => change.fileId === copyFileId)) {
+        if (reservedCopy.includeInSync && !pushes.some(change => change.fileId === copyFileId)) {
           pushTotal++
           pushes.push(copyChange)
         }

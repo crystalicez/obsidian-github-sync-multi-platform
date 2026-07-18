@@ -326,16 +326,22 @@ export class V4PluginRuntime {
             ? await deriveV4Keyring({ passphrase, repoId: authenticationConfig.repoId, salt: fromBase64Url(authenticationConfig.kdfParams!.salt), iterations: authenticationConfig.kdfParams!.iterations })
             : undefined
           const inScope = this.scopePredicate()
+          const includePath = (path: string): boolean => {
+            for (const copy of runState.conflictCopies.values()) {
+              if (copy.path === path) return copy.includeInSync
+            }
+            return inScope(path)
+          }
           const result = await new V4SyncSession({
             github: this.plugin.githubClient,
-            vault: this.sessionVault(inScope),
+            vault: this.sessionVault(includePath),
             index,
             config,
             keyring,
             conflictPolicy: this.plugin.settings.conflictPolicy,
             abortChangePercent: this.plugin.settings.abortChangePercent,
             askConflict: input => this.askConflict(input.path),
-            includePath: inScope,
+            includePath,
             runState,
             onProgress: patch => {
               if (patch.phase === "checking-remote") return
