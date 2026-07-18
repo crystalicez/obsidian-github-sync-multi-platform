@@ -271,3 +271,24 @@ Output: empty; exit code `0`.
 - No known functional concerns remain.
 - The runtime regression intentionally waits 450 ms to cross the production 400 ms progress throttle boundary.
 - Live GitHub E2E was not rerun in this fix wave; the exact fix brief required focused RED/GREEN plus `npm test`, `npm run build`, and `git diff --check`, all of which passed.
+
+## Post-Report Final Review Closure
+
+The whole-feature review found and drove three additional CAS conflict-copy fixes:
+
+- `1710347` reuses one conflict-copy path and file identity across CAS attempts.
+- `ea372de` retains a successfully applied copy in incremental retry planning when the conflict topology or decision changes.
+- `0598387` reserves the copy's scope decision so ignored copies remain local-only and in-scope copies remain publishable throughout the logical run.
+
+The final independent re-review reported no findings, `Spec compliance: PASS`, `Task quality: APPROVED`, and `Verdict: SHIP`.
+
+Fresh controller verification at `0598387`:
+
+- `npm test`: 225/225 passed.
+- `npm run build`: passed.
+- `git diff --check`: passed.
+- GitHub E2E bundle compilation: passed.
+- Live GitHub REST E2E: plaintext and encrypted round trips passed; destructive test branch cleanup was verified.
+- Privacy trace: no runtime progress state was found in settings, secrets, or local-index persistence files.
+
+Residual manual validation is limited to real Obsidian desktop/mobile presentation, screen-reader behavior, and a realistic high-cardinality vault profile. The automated suite includes a 100,000-logical-file planner test and 5 GiB large-file prediction coverage.
