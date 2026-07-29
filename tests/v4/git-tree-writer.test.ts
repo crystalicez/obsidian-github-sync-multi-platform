@@ -277,3 +277,19 @@ test("V4 tree writer wraps each Git blob creation in the supplied transport rese
   assert.equal(events.filter(event => event.startsWith("reserve:")).length, 2);
   assert.equal(events.filter(event => event.startsWith("release:")).length, 2);
 });
+
+test("V4 candidate ref publication re-reads the branch head immediately before mutation", async () => {
+  const github = new MemoryV4GitHub();
+  github.ref = { ref: "refs/heads/main", sha: "commit-old", type: "commit" };
+  const candidate = await createV4CandidateCommit(github, {
+    base: { ref: github.ref, previousHeadSha: "commit-old", baseTreeSha: "base-tree" },
+    message: "obsidian-sync-v4:late-cas",
+    entries: [],
+  });
+  github.ref = { ref: "refs/heads/main", sha: "commit-raced", type: "commit" };
+
+  await assert.rejects(publishV4CandidateRef(github, candidate), /branch head changed/iu);
+  assert.deepEqual(github.updatedRefs, []);
+  assert.deepEqual(github.createdRefs, []);
+  assert.equal(github.commits.length, 1);
+});

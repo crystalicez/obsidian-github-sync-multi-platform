@@ -4,7 +4,16 @@ import { evaluateV4ChangeGuard } from "./change-guard"
 import { canAttemptV4TextMerge, resolveV4Conflict, type V4ConflictPolicy, type V4ConflictResolution } from "./conflicts"
 import type { V4Keyring } from "./crypto"
 import { encryptV4Payload } from "./crypto"
-import { publishV4TreeChanges, type V4GitTreeFile, type V4GitTreeGithub, type V4GitTreeProgressItem } from "./git-tree-writer"
+import {
+  createV4CandidateCommit,
+  publishV4CandidateRef,
+  resolveV4PublicationBase,
+  uploadV4ObjectStream,
+  uploadV4TreeFiles,
+  type V4GitTreeFile,
+  type V4GitTreeGithub,
+  type V4GitTreeProgressItem,
+} from "./git-tree-writer"
 import { buildV4JournalPages, type V4JournalChange } from "./history-journal"
 import { isV4LocalIndexCacheComplete, type V4IndexFileRecord, type V4LocalIndex } from "./local-index"
 import { createV4LocalIo, type V4LocalIo, type V4SessionVault } from "./local-io"
@@ -15,9 +24,12 @@ import { assertV4RemoteRecordSet, buildV4RemoteMetadata, v4RemoteShardPath } fro
 import { effectiveV4PathLayout, expectedV4PathLayout, V4_CONFIG_PATH, V4_ROOT, type V4RemoteConfig, type V4RemoteHead } from "./protocol-types"
 import { loadV4RemoteConfig, loadV4RemoteState, remoteV4StateFromLocalIndex, type V4RemoteState } from "./remote-loader"
 import { V4StorageCodec } from "./storage-codec"
-import { collectV4ContentSource, createV4WholeBufferContentSource, DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES, type V4ContentHandle } from "./content-source"
+import { collectV4ContentSource, createV4WholeBufferContentSource, DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES, type V4ContentHandle, type V4ContentSource } from "./content-source"
 import type { V4StageRef } from "./staging-store"
 import { V4BoundedIoUnavailableError } from "./platform-io"
+import { shouldUseV4Parts, V4_PART_BYTES } from "./large-files"
+import { hashV4StableContentSource, V4SourceChangedError } from "./object-stream"
+import { selectV4WriterPartBytes } from "./part-write-policy"
 import type { V4PullBinding, V4PushBinding, V4ResolvedBatch, V4StagedWriteBinding } from "./resolved-batch"
 import { boundedMap } from "./bounded-map"
 import { V4ByteCache } from "./byte-cache"
@@ -295,7 +307,7 @@ export class V4SyncSession {
       .filter(copy => copy.includeInSync)
       .map(copy => [copy.path, copy.fileId] as const))
     const identitySeedByPath = new Map([...causalState?.identityByPath ?? [], ...runCopyIdentityByPath])
-    const localFiles = (await this.scanLocal(identityBaseRecords, options.changes ?? [], identitySeedByPath, runCopyIdentityByPath)).filter(file => includePath(file.path))
+    const localFiles = (await this.scanLocalStable(identityBaseRecords, options.changes ?? [], identitySeedByPath, runCopyIdentityByPath)).filter(file => includePath(file.path))
     const localById = new Map(localFiles.map(file => [file.fileId, file]))
     const baseRecords = !hasKnownBase && options.operation === "normal" && causalState
       ? identityBaseRecords.filter(record => !causalState.survivingCausallyRenamedFileIds.has(record.fileId)
@@ -533,6 +545,29 @@ export class V4SyncSession {
     }
     const journalId = `${this.now()}-${toBase64Url(randomBytes(6))}`
     batch.journalId = journalId
+    const publicationBase = await resolveV4PublicationBase(this.input.github, ref?.sha ?? null)
+    const completedPushIds = new Set<string>()
+    const completePush = (item: V4GitTreeProgressItem, currentPath = item.path): void => {
+      if (completedPushIds.has(item.fileId)) return
+      completedPushIds.add(item.fileId)
+      pushCompleted++
+      this.report({ currentPath, currentDirection: "push", push: directional(pushCompleted, pushTotal) })
+    }
+    let latestUploadPath: string | undefined
+    const onUploadStarted = (item: V4GitTreeProgressItem): void => {
+      latestUploadPath = item.path
+      this.report({
+        phase: "uploading",
+        currentPath: item.path,
+        currentDirection: "push",
+        push: directional(pushCompleted, pushTotal),
+      })
+    }
+    const onUploaded = (item: V4GitTreeProgressItem): void => completePush(item, latestUploadPath ?? item.path)
+    const withBlobTransport = (bytes: Uint8Array, task: () => Promise<string>): Promise<string> =>
+      this.resources.withTransportBytes(estimateV4GitBlobTransportBytes(bytes.byteLength), task)
+    const streamedEntries: Array<{ path: string; mode: "100644"; type: "blob"; sha: string }> = []
+    const streamedUploadedPushIds = new Set<string>()
     const pushContexts = batch.pushes.map(binding => {
       const change = binding.change
       const previous = recordsById.get(change.fileId)
@@ -632,6 +667,46 @@ export class V4SyncSession {
         continue
       }
 
+      const predictedRemoteBytes = after.size + (this.input.config.mode === "encrypted" ? 33 : 0)
+      const usesV4Parts = shouldUseV4Parts(after.size, predictedRemoteBytes)
+      if (usesV4Parts || after.size > DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES) {
+        const source = await this.openPushContentSource(context.binding)
+        const partBytes = usesV4Parts
+          ? selectV4WriterPartBytes({
+              logicalBytes: after.size,
+              maxTransportTransientBytes: this.resources.limits.maxTransportTransientBytes,
+            })
+          : V4_PART_BYTES
+        const prepared = await this.codec.prepareFromSource({
+          logicalPath: after.path,
+          source,
+          expectedHash: after.hash,
+          version: journalId,
+          mtime: after.mtime,
+          fileId: after.fileId,
+          partBytes,
+          checkSourceStable: context.binding.source?.kind === "vault"
+            ? () => this.assertVaultSnapshot(context.binding.source as Extract<V4ContentHandle, { kind: "vault" }>)
+            : undefined,
+        })
+        const progressItem = { fileId: after.fileId, path: after.path }
+        const uploaded = await uploadV4ObjectStream(this.input.github, {
+          objects: prepared.objects(),
+          progressItem,
+          onLogicalFileUploadStarted: onUploadStarted,
+          onLogicalFileUploaded: onUploaded,
+          withBlobTransport,
+        })
+        streamedEntries.push(...uploaded.entries as Array<{ path: string; mode: "100644"; type: "blob"; sha: string }>)
+        streamedUploadedPushIds.add(after.fileId)
+        const streamedRecord = await prepared.finalize()
+        const record: V4IndexFileRecord = { path: after.path, ...streamedRecord }
+        recordsById.set(after.fileId, record)
+        journal.after = descriptorFor(record)
+        this.localReadCache.delete(after.path)
+        continue
+      }
+
       const prepared = await this.resources.withResidentBytes(after.size, async () => {
         const bytes = await this.readPushBinding(context.binding)
         this.report({
@@ -707,14 +782,10 @@ export class V4SyncSession {
         deletions.add(node.path)
       }
     }
-    const completedPushIds = new Set<string>()
-    const completePush = (item: V4GitTreeProgressItem, currentPath = item.path): void => {
-      if (completedPushIds.has(item.fileId)) return
-      completedPushIds.add(item.fileId)
-      pushCompleted++
-      this.report({ currentPath, currentDirection: "push", push: directional(pushCompleted, pushTotal) })
-    }
-    const uploadedPushIds = new Set(files.flatMap(file => (file.progressItems ?? []).map(item => item.fileId)))
+    const uploadedPushIds = new Set([
+      ...streamedUploadedPushIds,
+      ...files.flatMap(file => (file.progressItems ?? []).map(item => item.fileId)),
+    ])
     const stagedPushItems: V4GitTreeProgressItem[] = [
       ...batch.pushes.map(binding => ({ fileId: binding.change.fileId, path: binding.change.path })),
       ...migrationDeletionPushItems,
@@ -722,23 +793,11 @@ export class V4SyncSession {
     for (const item of stagedPushItems) {
       if (!uploadedPushIds.has(item.fileId)) completePush(item)
     }
-    let latestUploadPath: string | undefined
-    const published = await publishV4TreeChanges(this.input.github, {
-      message: `obsidian-sync-v4:${journalId}`,
+    const uploaded = await uploadV4TreeFiles(this.input.github, {
       files,
-      deletions: [...deletions],
-      expectedHeadSha: ref?.sha ?? null,
-      onLogicalFileUploadStarted: item => {
-        latestUploadPath = item.path
-        this.report({
-          phase: "uploading",
-          currentPath: item.path,
-          currentDirection: "push",
-          push: directional(pushCompleted, pushTotal),
-        })
-      },
-      onLogicalFileUploaded: item => completePush(item, latestUploadPath ?? item.path),
-      withBlobTransport: (bytes, task) => this.resources.withTransportBytes(estimateV4GitBlobTransportBytes(bytes.byteLength), task),
+      onLogicalFileUploadStarted: onUploadStarted,
+      onLogicalFileUploaded: onUploaded,
+      withBlobTransport,
       onUploadsComplete: () => this.report({
         phase: "committing",
         currentPath: undefined,
@@ -746,6 +805,14 @@ export class V4SyncSession {
         push: directional(pushCompleted, pushTotal),
       }),
     })
+    const candidate = await createV4CandidateCommit(this.input.github, {
+      base: publicationBase,
+      message: `obsidian-sync-v4:${journalId}`,
+      entries: [...streamedEntries, ...uploaded.entries],
+      deletions: [...deletions],
+    })
+    await publishV4CandidateRef(this.input.github, candidate)
+    const published = { ...candidate, fileShas: uploaded.fileShas }
     this.replaceIndex(finalRecords, head, published.commitSha)
     const mode = options.operation === "forcePush" ? "force-push" : pulledFiles > 0 ? "pull-push" : "push"
     this.localReadCache.clear()
@@ -791,6 +858,25 @@ export class V4SyncSession {
     remote.records = reconciled
   }
 
+  private async scanLocalStable(
+    baseRecords: V4IndexFileRecord[],
+    changes: V4QueuedChange[],
+    identitySeedByPath?: ReadonlyMap<string, string>,
+    additionalFilesByPath?: ReadonlyMap<string, string>,
+  ): Promise<V4LogicalFile[]> {
+    let lastError: unknown
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        return await this.scanLocal(baseRecords, changes, identitySeedByPath, additionalFilesByPath)
+      } catch (error) {
+        if (!(error instanceof V4SourceChangedError)) throw error
+        lastError = error
+        this.localReadCache.clear()
+      }
+    }
+    throw lastError
+  }
+
   private async scanLocal(
     baseRecords: V4IndexFileRecord[],
     changes: V4QueuedChange[],
@@ -811,7 +897,7 @@ export class V4SyncSession {
         const stat = await this.localIo.stat(change.path)
         if (!stat) { byPath.delete(change.path); continue }
         this.report({ phase: "hashing", currentPath: change.path, currentDirection: undefined })
-        const hash = await this.hashLocal(change.path, stat.size)
+        const hash = await this.hashLocal(change.path, stat.size, stat.mtime)
         byPath.set(change.path, {
           path: change.path,
           fileId: previous?.fileId ?? await this.newFileId(change.path),
@@ -826,7 +912,7 @@ export class V4SyncSession {
         const stat = await this.localIo.stat(path)
         if (!stat) continue
         this.report({ phase: "hashing", currentPath: path, currentDirection: undefined })
-        const hash = await this.hashLocal(path, stat.size)
+        const hash = await this.hashLocal(path, stat.size, stat.mtime)
         byPath.set(path, {
           path,
           fileId,
@@ -867,7 +953,7 @@ export class V4SyncSession {
       return {
         path: file.path,
         fileId: identitySeedByPath?.get(file.path) ?? existing?.fileId ?? await this.newFileId(file.path),
-        hash: unchangedStat ? existing.plaintextSha256 : await this.hashLocal(file.path, file.size),
+        hash: unchangedStat ? existing.plaintextSha256 : await this.hashLocal(file.path, file.size, file.mtime),
         size: file.size,
         mtime: file.mtime,
       }
@@ -965,7 +1051,8 @@ export class V4SyncSession {
     const after = binding.change.after
     if (!after) throw new Error(`Missing V4 push content metadata for ${binding.change.path}`)
     const source = binding.source
-    if (!source || source.kind === "vault") return this.readLocal(source?.path ?? after.path)
+    if (!source) return this.readLocal(after.path)
+    if (source.kind === "vault") return this.readLocal(source.path)
     const stage: V4StageRef = { stageId: source.stageId, hash: source.expectedHash, size: source.expectedSize, mtime: after.mtime }
     return this.readStage(stage)
   }
@@ -1018,10 +1105,49 @@ export class V4SyncSession {
     return bytes
   }
 
-  private async hashLocal(path: string, expectedBytes: number): Promise<string> {
+  private async assertVaultSnapshot(handle: Extract<V4ContentHandle, { kind: "vault" }>): Promise<void> {
+    if (!this.localIo.stat) return
+    const stat = await this.localIo.stat(handle.path)
+    if (!stat || stat.size !== handle.expectedSize || stat.mtime !== handle.expectedMtime) {
+      throw new V4SourceChangedError(handle.path, "size or mtime changed")
+    }
+  }
+
+  private async openPushContentSource(binding: V4PushBinding): Promise<V4ContentSource> {
+    const after = binding.change.after
+    const handle = binding.source
+    if (!after || !handle) throw new Error(`Missing V4 push source for ${binding.change.path}`)
+    if (this.localIo.openContentSource) return this.localIo.openContentSource(handle)
+    if (handle.kind === "stage" && this.localIo.staging) {
+      return this.localIo.staging.open({ stageId: handle.stageId, size: handle.expectedSize })
+    }
+    throw new V4BoundedIoUnavailableError("bounded-read", handle.kind === "vault" ? handle.path : undefined)
+  }
+
+  private async hashLocal(path: string, expectedBytes: number, expectedMtime: number): Promise<string> {
+    const handle: Extract<V4ContentHandle, { kind: "vault" }> = {
+      kind: "vault",
+      path,
+      expectedHash: "scan-pending",
+      expectedSize: expectedBytes,
+      expectedMtime,
+    }
+    await this.assertVaultSnapshot(handle)
+    if (expectedBytes > DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES) {
+      if (!this.localIo.openContentSource) throw new V4BoundedIoUnavailableError("bounded-read", path)
+      const source = await this.localIo.openContentSource(handle)
+      return hashV4StableContentSource(source, {
+        chunkBytes: Math.min(4 * 1024 * 1024, Math.max(1, expectedBytes)),
+        checkStable: () => this.assertVaultSnapshot(handle),
+      })
+    }
     return this.resources.withResidentBytes(expectedBytes, async () => {
-      const bytes = await this.readLocal(path)
-      return this.resources.withCrypto(() => sha256Hex(bytes))
+      const bytes = await this.resources.withVaultRead(() => this.localIo.read(path))
+      if (bytes.byteLength !== expectedBytes) throw new V4SourceChangedError(path, `read ${bytes.byteLength} bytes; expected ${expectedBytes}`)
+      const hash = await this.resources.withCrypto(() => sha256Hex(bytes))
+      await this.assertVaultSnapshot(handle)
+      this.localReadCache.set(path, bytes)
+      return hash
     })
   }
 

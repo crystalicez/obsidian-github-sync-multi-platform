@@ -11,6 +11,7 @@ import { V4_CONFIG_PATH, V4_FORMAT_VERSION, V4_HEAD_PATH, type V4RemoteConfig } 
 import { decodeV4RemoteHead, decodeV4RemoteShard, v4RemoteShardPath } from "../../src/lib/v4/remote-index";
 import { V4StorageCodec } from "../../src/lib/v4/storage-codec";
 import { V4SyncSession, type V4SessionVault } from "../../src/lib/v4/sync-session";
+import type { V4ContentHandle, V4ContentSource } from "../../src/lib/v4/content-source";
 
 const encode = (value: string) => new TextEncoder().encode(value);
 
@@ -19,6 +20,19 @@ class MemoryVault implements V4SessionVault {
   async listFiles() { return [...this.files].map(([path, file]) => ({ path, size: file.bytes.byteLength, mtime: file.mtime })); }
   async stat(path: string) { const file = this.files.get(path); return file ? { path, size: file.bytes.byteLength, mtime: file.mtime } : null; }
   async read(path: string) { return new Uint8Array(this.files.get(path)!.bytes); }
+  async openContentSource(handle: V4ContentHandle): Promise<V4ContentSource> {
+    if (handle.kind !== "vault") throw new Error("MemoryVault only opens vault handles.");
+    const file = this.files.get(handle.path);
+    if (!file) throw new Error(`Missing local file: ${handle.path}`);
+    return {
+      size: file.bytes.byteLength,
+      async *chunks(chunkBytes: number) {
+        for (let offset = 0; offset < file.bytes.byteLength; offset += chunkBytes) {
+          yield file.bytes.subarray(offset, Math.min(file.bytes.byteLength, offset + chunkBytes));
+        }
+      },
+    };
+  }
   async write(path: string, bytes: Uint8Array, mtime?: number) { this.files.set(path, { bytes: new Uint8Array(bytes), mtime: mtime ?? 0 }); }
   async trash(path: string) { this.files.delete(path); }
 }

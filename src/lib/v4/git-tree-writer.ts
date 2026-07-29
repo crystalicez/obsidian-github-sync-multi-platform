@@ -1,4 +1,5 @@
 import type { GitHubCreateTreeEntry, GitHubGitCommit, GitHubGitRef } from "../github-git-types";
+import type { V4StreamObject } from "./object-stream";
 
 export interface V4GitTreeProgressItem { fileId: string; path: string; }
 export interface V4GitTreeFile { path: string; bytes: Uint8Array; progressItems?: V4GitTreeProgressItem[]; }
@@ -137,6 +138,40 @@ export async function uploadV4TreeFiles(
   return { entries, fileShas };
 }
 
+
+export async function uploadV4ObjectStream(
+  github: V4GitTreeGithub,
+  input: {
+    objects: AsyncIterable<V4StreamObject>;
+    progressItem?: V4GitTreeProgressItem;
+    onLogicalFileUploadStarted?: (item: V4GitTreeProgressItem) => void;
+    onLogicalFileUploaded?: (item: V4GitTreeProgressItem) => void;
+    withBlobTransport?: (bytes: Uint8Array, task: () => Promise<string>) => Promise<string>;
+  },
+): Promise<V4UploadedTreeFiles> {
+  const entries: GitHubCreateTreeEntry[] = [];
+  const fileShas: Record<string, string> = {};
+  let started = false;
+  for await (const object of input.objects) {
+    if (!started && input.progressItem) {
+      started = true;
+      invokeProgressCallback(() => input.onLogicalFileUploadStarted?.(input.progressItem!));
+    }
+    try {
+      const createBlob = () => github.createGitBlob(object.bytes);
+      const sha = input.withBlobTransport
+        ? await input.withBlobTransport(object.bytes, createBlob)
+        : await createBlob();
+      fileShas[object.path] = sha;
+      entries.push({ path: object.path, mode: "100644", type: "blob", sha });
+    } finally {
+      object.release?.();
+    }
+  }
+  if (input.progressItem && started) invokeProgressCallback(() => input.onLogicalFileUploaded?.(input.progressItem!));
+  return { entries, fileShas };
+}
+
 export async function createV4CandidateCommit(
   github: V4GitTreeGithub,
   input: {
@@ -160,6 +195,10 @@ export async function createV4CandidateCommit(
 }
 
 export async function publishV4CandidateRef(github: V4GitTreeGithub, candidate: V4CandidateCommit): Promise<void> {
+  const current = await github.getGitRefOrNull();
+  if ((current?.sha ?? null) !== (candidate.previousHeadSha ?? null)) {
+    throw new Error("V4 branch head changed before atomic publish.");
+  }
   if (candidate.previousHeadSha !== undefined) await github.updateGitRef(candidate.commitSha, candidate.previousHeadSha);
   else await github.createGitRef(candidate.commitSha);
 }

@@ -14,6 +14,7 @@ import { buildV4RemoteMetadata } from "../../src/lib/v4/remote-index";
 import { publishV4TreeChanges } from "../../src/lib/v4/git-tree-writer";
 import { V4_LARGE_FILE_THRESHOLD_BYTES } from "../../src/lib/v4/large-files";
 import type { V4SyncProgressPatch } from "../../src/lib/v4/progress";
+import { DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES, type V4ContentHandle, type V4ContentSource } from "../../src/lib/v4/content-source";
 import { waitForCondition } from "../helpers/wait-for";
 
 const enc = (value: string) => new TextEncoder().encode(value);
@@ -49,6 +50,19 @@ class MemoryVault implements V4SessionVault {
   async listFiles() { this.listCount++; return [...this.files].map(([path, file]) => ({ path, size: file.bytes.byteLength, mtime: file.mtime })); }
   async stat(path: string) { const file = this.files.get(path); return file ? { path, size: file.bytes.byteLength, mtime: file.mtime } : null; }
   async read(path: string) { this.operations.push(`read:${path}`); return new Uint8Array(this.files.get(path)!.bytes); }
+  async openContentSource(handle: V4ContentHandle): Promise<V4ContentSource> {
+    if (handle.kind !== "vault") throw new Error("MemoryVault only opens vault handles.");
+    const file = this.files.get(handle.path);
+    if (!file) throw new Error(`Missing local file: ${handle.path}`);
+    return {
+      size: file.bytes.byteLength,
+      async *chunks(chunkBytes: number) {
+        for (let offset = 0; offset < file.bytes.byteLength; offset += chunkBytes) {
+          yield file.bytes.subarray(offset, Math.min(file.bytes.byteLength, offset + chunkBytes));
+        }
+      },
+    };
+  }
   async write(path: string, bytes: Uint8Array, mtime?: number) { this.operations.push(`write:${path}`); this.files.set(path, { bytes: new Uint8Array(bytes), mtime: mtime ?? Date.now() }); }
   async delete(path: string) { this.operations.push(`delete:${path}`); this.files.delete(path); }
   async trash(path: string) { this.operations.push(`trash:${path}`); this.files.delete(path); }
@@ -2352,7 +2366,7 @@ test("v4 merged conflict output does not trigger a second changed-path stat resc
   });
 
   assert.equal(result.pushedFiles, 2);
-  assert.equal(statCalls, 2, `expected one initial stat per changed path, got ${statCalls}`);
+  assert.equal(statCalls, 6, `expected initial stat plus pre/post hash snapshot checks only, got ${statCalls}`);
   assert.equal(dec(fixture.localVault.files.get("A.md")!.bytes), "merged:A.md");
   assert.equal(dec(fixture.github.files.get("A.md")!), "merged:A.md");
 });
@@ -2374,9 +2388,50 @@ test("v4 keep-both staged copy does not trigger a second changed-path stat resca
   }).sync({ operation: "normal", allowThresholdOverride: false, changes: [{ type: "modify", path: "conflict.md", mtime: 3 }] });
 
   const copyPath = [...fixture.localVault.files.keys()].find(path => path.includes(".conflict-remote-"));
-  assert.equal(statCalls, 1, `expected only the initial changed-path stat, got ${statCalls}`);
+  assert.equal(statCalls, 3, `expected initial stat plus pre/post hash snapshot checks only, got ${statCalls}`);
   assert.ok(copyPath);
   assert.equal(dec(fixture.localVault.files.get(copyPath!)!.bytes), "remote:conflict.md");
   assert.equal(dec(fixture.github.files.get(copyPath!)!), "remote:conflict.md");
   assert.equal(result.pushedFiles, 2);
+});
+
+test("v4 scan discards a changed hash snapshot and replans from fresh local metadata", async () => {
+  class MutatingScanVault extends MemoryVault {
+    reads = 0;
+    override async read(path: string) {
+      const result = await super.read(path);
+      this.reads++;
+      if (this.reads === 1) this.files.set(path, { bytes: enc("second"), mtime: 2 });
+      return result;
+    }
+  }
+  const github = new MemoryGitHub();
+  const vault = new MutatingScanVault();
+  vault.files.set("note.md", { bytes: enc("first"), mtime: 1 });
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "d", mode: "plaintext" });
+
+  const result = await new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "forcePush", allowThresholdOverride: false });
+
+  assert.equal(result.changedFiles, 1);
+  assert.equal(vault.reads, 2);
+  assert.equal(dec(github.files.get("note.md")!), "second");
+  assert.equal(indexRecordByPath(index, "note.md").mtime, 2);
+});
+
+test("v4 medium single-object push uses bounded source instead of whole-buffer vault read", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault();
+  const payload = new Uint8Array(DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES + 1);
+  payload[0] = 7;
+  payload[payload.length - 1] = 9;
+  vault.files.set("medium.bin", { bytes: payload, mtime: 1 });
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "local", mode: "plaintext" });
+
+  const result = await new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "forcePush", allowThresholdOverride: false });
+
+  assert.equal(result.pushedFiles, 1);
+  assert.equal(indexRecordByPath(index, "medium.bin").storage, "single");
+  assert.equal(vault.operations.includes("read:medium.bin"), false);
 });

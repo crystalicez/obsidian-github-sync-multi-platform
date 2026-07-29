@@ -41,13 +41,23 @@ class FifoWeightedPool {
   }
 
   async run<T>(weight: number, task: () => Promise<T>): Promise<T> {
-    if (!Number.isSafeInteger(weight) || weight < 0) throw new TypeError(`${this.resource} reservation must be a non-negative safe integer`)
-    if (weight > this.maximum) throw new V4ResourceReservationTooLargeError(this.resource, weight, this.maximum)
-    if (weight === 0) return task()
-    await this.acquire(weight)
+    const release = await this.reserve(weight)
     try {
       return await task()
     } finally {
+      release()
+    }
+  }
+
+  async reserve(weight: number): Promise<() => void> {
+    if (!Number.isSafeInteger(weight) || weight < 0) throw new TypeError(`${this.resource} reservation must be a non-negative safe integer`)
+    if (weight > this.maximum) throw new V4ResourceReservationTooLargeError(this.resource, weight, this.maximum)
+    if (weight === 0) return () => {}
+    await this.acquire(weight)
+    let released = false
+    return () => {
+      if (released) return
+      released = true
       this.inUse -= weight
       this.drain()
     }
@@ -80,6 +90,7 @@ export interface V4ResourceController {
   withVaultRead<T>(task: () => Promise<T>): Promise<T>
   withCrypto<T>(task: () => Promise<T>): Promise<T>
   withResidentBytes<T>(bytes: number, task: () => Promise<T>): Promise<T>
+  reserveResidentBytes(bytes: number): Promise<() => void>
   withTransportBytes<T>(bytes: number, task: () => Promise<T>): Promise<T>
 }
 
@@ -102,6 +113,7 @@ export function createV4ResourceController(limits: V4ResourceLimits): V4Resource
     withVaultRead: task => vaultReads.run(1, task),
     withCrypto: task => cryptoJobs.run(1, task),
     withResidentBytes: (bytes, task) => residentBytes.run(bytes, task),
+    reserveResidentBytes: bytes => residentBytes.reserve(bytes),
     withTransportBytes: (bytes, task) => transportBytes.run(bytes, task),
   }
 }

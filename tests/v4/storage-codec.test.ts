@@ -4,6 +4,7 @@ import test from "node:test";
 import { deriveV4Keyring } from "../../src/lib/v4/crypto";
 import { V4StorageCodec } from "../../src/lib/v4/storage-codec";
 import { V4_LARGE_FILE_THRESHOLD_BYTES } from "../../src/lib/v4/large-files";
+import { sha256Hex } from "../../src/lib/bytes";
 
 const bytes = (value: string) => new TextEncoder().encode(value);
 
@@ -50,4 +51,36 @@ test("v4 encrypted part and pack paths contain only protocol coordinates", async
   assert.match(chunked.record.partPaths![0], /^\.obsidian-github-sync-v4\/parts\/[0-9a-f]{2}\/[0-9a-f]{64}\/v-large\/000001\.enc$/u);
   assert.match(packed.file.path, /^\.obsidian-github-sync-v4\/packs\/[0-9a-f]{2}\/[0-9a-f]{64}\.enc$/u);
   assert.doesNotMatch([...chunked.record.partPaths!, packed.file.path].join("\n"), /Private|Folder|secret|\.md/u);
+});
+
+test("v4 streamed encrypted parts preserve existing part paths AAD and read compatibility", async () => {
+  const partBytes = 4 * 1024 * 1024;
+  const logicalBytes = V4_LARGE_FILE_THRESHOLD_BYTES + 1;
+  const keys = await deriveV4Keyring({ passphrase: "pass", repoId: "o/r#main", salt: bytes("salt"), iterations: 10 });
+  const hash = (await import("../../src/lib/v4/incremental-hash")).createV4IncrementalSha256();
+  for (let offset = 0; offset < logicalBytes; offset += partBytes) hash.update(new Uint8Array(Math.min(partBytes, logicalBytes - offset)));
+  const source = {
+    size: logicalBytes,
+    async *chunks() {
+      for (let offset = 0; offset < logicalBytes; offset += partBytes) yield new Uint8Array(Math.min(partBytes, logicalBytes - offset));
+    },
+  };
+  const codec = new V4StorageCodec({ mode: "encrypted", pathLayout: "opaque-stable-v1", keyring: keys });
+  const prepared = await codec.prepareFromSource({
+    logicalPath: "Private/stream.bin",
+    source,
+    expectedHash: hash.digestHex(),
+    version: "stream-v1",
+    mtime: 10,
+    fileId: "stream-file",
+    partBytes,
+  });
+  const objects = new Map<string, Uint8Array>();
+  for await (const object of prepared.objects()) { objects.set(object.path, new Uint8Array(object.bytes)); object.release?.(); }
+  const record = await prepared.finalize();
+  assert.equal(record.storage, "chunked");
+  assert.deepEqual(record.partPaths, prepared.objectPaths);
+  const restored = await codec.read(record, async path => objects.get(path)!);
+  assert.equal(restored.byteLength, logicalBytes);
+  assert.equal(await sha256Hex(restored), record.plaintextSha256);
 });
