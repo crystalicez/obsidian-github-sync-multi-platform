@@ -1,3 +1,5 @@
+import { throwIfV4Aborted, v4CancellationError } from "./cancellation"
+
 export interface V4ResourceLimits {
   maxVaultReads: number
   maxCryptoJobs: number
@@ -26,6 +28,9 @@ export class V4ResourceReservationTooLargeError extends Error {
 interface Waiter {
   weight: number
   resolve: () => void
+  reject: (error: unknown) => void
+  signal?: AbortSignal
+  onAbort?: () => void
 }
 
 class FifoWeightedPool {
@@ -40,8 +45,8 @@ class FifoWeightedPool {
     this.maximum = maximum
   }
 
-  async run<T>(weight: number, task: () => Promise<T>): Promise<T> {
-    const release = await this.reserve(weight)
+  async run<T>(weight: number, task: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+    const release = await this.reserve(weight, signal)
     try {
       return await task()
     } finally {
@@ -49,11 +54,12 @@ class FifoWeightedPool {
     }
   }
 
-  async reserve(weight: number): Promise<() => void> {
+  async reserve(weight: number, signal?: AbortSignal): Promise<() => void> {
     if (!Number.isSafeInteger(weight) || weight < 0) throw new TypeError(`${this.resource} reservation must be a non-negative safe integer`)
     if (weight > this.maximum) throw new V4ResourceReservationTooLargeError(this.resource, weight, this.maximum)
+    throwIfV4Aborted(signal)
     if (weight === 0) return () => {}
-    await this.acquire(weight)
+    await this.acquire(weight, signal)
     let released = false
     return () => {
       if (released) return
@@ -63,13 +69,23 @@ class FifoWeightedPool {
     }
   }
 
-  private acquire(weight: number): Promise<void> {
+  private acquire(weight: number, signal?: AbortSignal): Promise<void> {
     if (this.queue.length === 0 && this.inUse + weight <= this.maximum) {
       this.inUse += weight
       return Promise.resolve()
     }
-    return new Promise<void>(resolve => {
-      this.queue.push({ weight, resolve })
+    return new Promise<void>((resolve, reject) => {
+      const waiter: Waiter = { weight, resolve, reject, signal }
+      if (signal) {
+        waiter.onAbort = () => {
+          const index = this.queue.indexOf(waiter)
+          if (index >= 0) this.queue.splice(index, 1)
+          reject(v4CancellationError(signal))
+          this.drain()
+        }
+        signal.addEventListener("abort", waiter.onAbort, { once: true })
+      }
+      this.queue.push(waiter)
       this.drain()
     })
   }
@@ -79,6 +95,8 @@ class FifoWeightedPool {
       const next = this.queue[0]
       if (this.inUse + next.weight > this.maximum) return
       this.queue.shift()
+      if (next.onAbort && next.signal) next.signal.removeEventListener("abort", next.onAbort)
+      if (next.signal?.aborted) { next.reject(v4CancellationError(next.signal)); continue }
       this.inUse += next.weight
       next.resolve()
     }
@@ -87,11 +105,11 @@ class FifoWeightedPool {
 
 export interface V4ResourceController {
   readonly limits: V4ResourceLimits
-  withVaultRead<T>(task: () => Promise<T>): Promise<T>
-  withCrypto<T>(task: () => Promise<T>): Promise<T>
-  withResidentBytes<T>(bytes: number, task: () => Promise<T>): Promise<T>
-  reserveResidentBytes(bytes: number): Promise<() => void>
-  withTransportBytes<T>(bytes: number, task: () => Promise<T>): Promise<T>
+  withVaultRead<T>(task: () => Promise<T>, signal?: AbortSignal): Promise<T>
+  withCrypto<T>(task: () => Promise<T>, signal?: AbortSignal): Promise<T>
+  withResidentBytes<T>(bytes: number, task: () => Promise<T>, signal?: AbortSignal): Promise<T>
+  reserveResidentBytes(bytes: number, signal?: AbortSignal): Promise<() => void>
+  withTransportBytes<T>(bytes: number, task: () => Promise<T>, signal?: AbortSignal): Promise<T>
 }
 
 export const DEFAULT_V4_RESOURCE_LIMITS: V4ResourceLimits = {
@@ -110,11 +128,11 @@ export function createV4ResourceController(limits: V4ResourceLimits): V4Resource
   const transportBytes = new FifoWeightedPool("transport-bytes", limits.maxTransportTransientBytes)
   return {
     limits,
-    withVaultRead: task => vaultReads.run(1, task),
-    withCrypto: task => cryptoJobs.run(1, task),
-    withResidentBytes: (bytes, task) => residentBytes.run(bytes, task),
-    reserveResidentBytes: bytes => residentBytes.reserve(bytes),
-    withTransportBytes: (bytes, task) => transportBytes.run(bytes, task),
+    withVaultRead: (task, signal) => vaultReads.run(1, task, signal),
+    withCrypto: (task, signal) => cryptoJobs.run(1, task, signal),
+    withResidentBytes: (bytes, task, signal) => residentBytes.run(bytes, task, signal),
+    reserveResidentBytes: (bytes, signal) => residentBytes.reserve(bytes, signal),
+    withTransportBytes: (bytes, task, signal) => transportBytes.run(bytes, task, signal),
   }
 }
 

@@ -2,7 +2,7 @@ import { Modal, Notice, Platform, TFile } from "obsidian"
 import type FastSync from "../../main"
 import { fromBase64Url, randomBytes, sha256Hex, toBase64Url, utf8ToBytes } from "../bytes"
 import { readVaultFileBytes, writeVaultFileBytes, trashVaultFileIfExists } from "../vault"
-import { deriveV4Keyring } from "./crypto"
+import { deriveV4Keyring, type V4Keyring } from "./crypto"
 import {
   createEmptyV4LocalIndex,
   loadV4LocalIndex,
@@ -23,6 +23,8 @@ import { createV4PlatformIo, type V4BinaryAdapterLike, type V4PlatformIo } from 
 import { createV4StagingStore, type V4StagingStore } from "./staging-store"
 import { V4ProgressStore, type V4SyncProgressSnapshot } from "./progress"
 import { createV4RecoveryStore, discardV4RecoveryStages, markV4RecoveryIndexCommitted, recoverV4PendingState } from "./recovery-store"
+import { V4KeyringCache } from "./keyring-cache"
+import { V4CancelledError, throwIfV4Aborted } from "./cancellation"
 
 const V4_INDEX_ROOT = "github-sync-v4-index"
 const V4_STAGE_ROOT = "github-sync-v4-stage"
@@ -120,6 +122,8 @@ export class V4PluginRuntime {
   private readonly progressStore = new V4ProgressStore()
   private readonly platformIo: V4PlatformIo
   private readonly stagingStore: V4StagingStore
+  private readonly keyringCache = new V4KeyringCache()
+  private credentialGeneration = 0
   private debounceRunActive = false
   private disposed = false
 
@@ -129,7 +133,7 @@ export class V4PluginRuntime {
     this.platformIo = executionIo.io
     this.stagingStore = createRuntimeStagingStore(this.platformIo, executionIo.stageRoot)
     this.coordinator = new V4SyncCoordinator({
-      execute: (request, changes) => this.execute(request, changes),
+      execute: (request, changes, signal) => this.execute(request, changes, signal),
       notice: message => new Notice(message),
       debounceMs: 5_000,
     })
@@ -141,7 +145,39 @@ export class V4PluginRuntime {
     this.debounceRunActive = false
     this.coordinator.dispose()
     this.progressStore.dispose()
+    void this.coordinator.whenIdle().finally(() => this.keyringCache.dispose())
   }
+
+  credentialsChanged(): void {
+    if (this.disposed) return
+    this.credentialGeneration++
+    this.keyringCache.invalidate()
+  }
+
+  private async keyringForConfig(config: V4RemoteConfig, passphrase: string, signal?: AbortSignal): Promise<V4Keyring> {
+    if (config.mode !== "encrypted" || !config.kdfParams) throw new Error("V4 encrypted keyring requires KDF parameters.")
+    throwIfV4Aborted(signal)
+    const keyring = await this.keyringCache.get({
+      repoId: config.repoId,
+      salt: config.kdfParams.salt,
+      iterations: config.kdfParams.iterations,
+      mode: config.mode,
+      credentialGeneration: this.credentialGeneration,
+    }, async () => {
+      throwIfV4Aborted(signal)
+      const derived = await deriveV4Keyring({
+        passphrase,
+        repoId: config.repoId,
+        salt: fromBase64Url(config.kdfParams!.salt),
+        iterations: config.kdfParams!.iterations,
+      })
+      throwIfV4Aborted(signal)
+      return derived
+    })
+    throwIfV4Aborted(signal)
+    return keyring
+  }
+
   get isSyncing(): boolean { return this.coordinator.isSyncing }
   get pendingCount(): number { return this.coordinator.pendingCount }
   get progressSnapshot(): V4SyncProgressSnapshot {
@@ -165,12 +201,7 @@ export class V4PluginRuntime {
     const { remoteConfig, config } = loaded
     assertV4PathLayoutCompatible(remoteConfig, config, "normal")
     const keyring = config.mode === "encrypted"
-      ? await deriveV4Keyring({
-        passphrase: this.plugin.settings.encryptionPassphrase,
-        repoId: config.repoId,
-        salt: fromBase64Url(config.kdfParams!.salt),
-        iterations: config.kdfParams!.iterations,
-      })
+      ? await this.keyringForConfig(config, this.plugin.settings.encryptionPassphrase)
       : undefined
     return new V4HistoryService({ github: this.plugin.githubClient, config, keyring })
   }
@@ -324,7 +355,7 @@ export class V4PluginRuntime {
         try { await trashVaultFileIfExists(this.plugin.app.vault, this.plugin.app.fileManager, path) }
         finally { this.plugin.removeIgnoredFile(path) }
       },
-      openContentSource: handle => createV4ContentSource(handle, {
+      openContentSource: (handle, signal) => createV4ContentSource(handle, {
         wholeBufferCeilingBytes: DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES,
         readVaultWhole: async path => {
           const file = this.plugin.app.vault.getAbstractFileByPath(path)
@@ -335,7 +366,7 @@ export class V4PluginRuntime {
           ? (path, expectedSize) => this.platformIo.openBoundedSource(path, expectedSize)
           : undefined,
         openStage: (stageId, expectedSize) => this.stagingStore.open({ stageId, size: expectedSize }),
-      }),
+      }, signal),
       staging: this.stagingStore,
       commitStage: async ({ stage, path, precondition }) => {
         this.plugin.addIgnoredFile(path)
@@ -352,7 +383,8 @@ export class V4PluginRuntime {
     }
   }
 
-  private async execute(request: V4SyncRequest, changes: V4QueuedChange[]): Promise<{ changedFiles: number }> {
+  private async execute(request: V4SyncRequest, changes: V4QueuedChange[], signal: AbortSignal): Promise<{ changedFiles: number }> {
+    throwIfV4Aborted(signal)
     const continuingDebounceRun = this.debounceRunActive
     this.debounceRunActive = false
     const runPatch = {
@@ -376,11 +408,14 @@ export class V4PluginRuntime {
     this.plugin.isSyncInProgress = true
     try {
       if (!this.plugin.githubClient) throw new Error("GitHub connection is not configured.")
+      ;(this.plugin.githubClient as unknown as { setV4AbortSignal?(signal?: AbortSignal): void }).setV4AbortSignal?.(signal)
+      throwIfV4Aborted(signal)
       let lastError: unknown
       let progressAttempt = 0
       const runState: V4SyncRunState = { runId: toBase64Url(randomBytes(12)), conflictCopies: new Map(), conflictCopyStages: new Map() }
       for (let casAttempt = 1; casAttempt <= 3; casAttempt++) {
         try {
+          throwIfV4Aborted(signal)
           progressAttempt++
           this.progressStore.update({
             phase: "checking-remote",
@@ -404,7 +439,7 @@ export class V4PluginRuntime {
           const authenticationConfig = discovered.mode === "encrypted" ? discovered : config.mode === "encrypted" ? config : null
           if (authenticationConfig && !passphrase) throw new Error("Encryption passphrase is required.")
           const keyring = authenticationConfig
-            ? await deriveV4Keyring({ passphrase, repoId: authenticationConfig.repoId, salt: fromBase64Url(authenticationConfig.kdfParams!.salt), iterations: authenticationConfig.kdfParams!.iterations })
+            ? await this.keyringForConfig(authenticationConfig, passphrase, signal)
             : undefined
           const recoveryNamespace = (await sha256Hex(utf8ToBytes(config.repoId))).slice(0, 32)
           const recoveryStore = createV4RecoveryStore({
@@ -423,6 +458,7 @@ export class V4PluginRuntime {
               io: this.sessionVault(() => true),
               currentRemoteHead: recoveryHead,
               publicationGithub: this.plugin.githubClient,
+              signal,
             })
             reconciledRecovery = recovered.snapshot
             if (recovered.replanRequired) {
@@ -451,6 +487,7 @@ export class V4PluginRuntime {
             includePath,
             runState,
             recoveryStore,
+            signal,
             onProgress: patch => {
               if (patch.phase === "checking-remote") return
               this.progressStore.update(patch)
@@ -493,11 +530,13 @@ export class V4PluginRuntime {
       }
       throw lastError
     } catch (error) {
+      if (error instanceof V4CancelledError) return { changedFiles: 0 }
       const message = (error as Error).message
       this.progressStore.finish("failed", { errorMessage: message })
       new Notice(`GitHub Sync failed: ${message}`)
       return { changedFiles: 0 }
     } finally {
+      ;(this.plugin.githubClient as unknown as { setV4AbortSignal?(signal?: AbortSignal): void } | undefined)?.setV4AbortSignal?.(undefined)
       this.plugin.isSyncInProgress = false
       if (!this.disposed) {
         this.plugin.enableWatch()

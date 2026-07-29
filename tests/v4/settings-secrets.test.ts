@@ -1041,3 +1041,32 @@ test("v4 file-history lookup rejects legacy encrypted layout before returning no
   assert.equal(fixture.vaultLists, 0);
   fixture.runtime.dispose();
 });
+
+test("v4 runtime keyring cache reuses one derived keyring until credential generation changes", async () => {
+  const fixture = plaintextRuntimeFixture()
+  const runtime = fixture.runtime as unknown as {
+    keyringForConfig(config: V4RemoteConfig, passphrase: string, signal?: AbortSignal): Promise<unknown>
+    credentialsChanged(): void
+  }
+  const config: V4RemoteConfig = {
+    formatVersion: 4,
+    mode: "encrypted",
+    repoId: "o/r#main",
+    pathLayout: "opaque-stable-v1",
+    algorithm: "AES-GCM",
+    kdf: "PBKDF2-SHA-256",
+    kdfParams: { iterations: 10, salt: "c2FsdA" },
+  }
+  const first = await runtime.keyringForConfig(config, "pass")
+  const second = await runtime.keyringForConfig(config, "pass")
+  assert.equal(first, second)
+  runtime.credentialsChanged()
+  const third = await runtime.keyringForConfig(config, "pass")
+  assert.notEqual(first, third)
+  fixture.runtime.dispose()
+})
+
+test("main settings save invalidates the runtime credential generation before future sync work", async () => {
+  const source = await readFile("src/main.ts", "utf8")
+  assert.match(source, /async saveSettings\(\)[\s\S]*?v4Runtime\?\.credentialsChanged\(\)/u)
+})

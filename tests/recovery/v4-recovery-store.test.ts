@@ -108,3 +108,96 @@ test("recovery store creates nested local directories without relying on recursi
   assert.equal(adapter.directories.has("recovery"), true)
   assert.equal(adapter.directories.has("recovery/repo-hash"), true)
 })
+
+test("v4 recovery cancellation waits for the current local mutation receipt before exiting", async () => {
+  const { applyV4RecoveryLocalMutations, createV4RecoveryStore } = await import("../../src/lib/v4/recovery-store")
+  const controller = new AbortController()
+  const adapter = new MemoryAdapter()
+  const store = createV4RecoveryStore({ adapter, root: "recovery", repoId: "repo" })
+  let snapshot = await store.save({
+    runId: "run-cancel",
+    phase: "remote-verified",
+    expectedRemoteHead: "old",
+    candidateCommitSha: "candidate",
+    verifiedRemoteHead: "candidate",
+    payload: {
+      mutations: [{ id: "trash:one", kind: "trash", path: "one.md", precondition: { path: "one.md", exists: true, size: 1, mtime: 1 } }],
+      completedMutationIds: [],
+    },
+  })
+  const events: string[] = []
+  await assert.rejects(
+    applyV4RecoveryLocalMutations({
+      store,
+      snapshot,
+      signal: controller.signal,
+      io: {
+        async read() { return new Uint8Array([1]) },
+        async write() {},
+        async trash() { events.push("trash"); controller.abort("dispose") },
+        async stat() { return { path: "one.md", size: 1, mtime: 1 } },
+      },
+    }),
+    /dispose|cancel/iu,
+  )
+  snapshot = (await store.load())!
+  assert.deepEqual(events, ["trash"])
+  assert.deepEqual(snapshot.payload?.completedMutationIds, ["trash:one"])
+  assert.equal(snapshot.header.phase, "local-committing")
+})
+
+test("v4 recovery cancellation during a large staged final commit waits for the durable receipt", async () => {
+  const { applyV4RecoveryLocalMutations, createV4RecoveryStore } = await import("../../src/lib/v4/recovery-store")
+  const { DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES } = await import("../../src/lib/v4/content-source")
+  const controller = new AbortController()
+  const adapter = new MemoryAdapter()
+  const store = createV4RecoveryStore({ adapter, root: "recovery", repoId: "repo" })
+  const stage = {
+    stageId: "stage-large",
+    hash: "f".repeat(64),
+    size: DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES + 1,
+    mtime: 22,
+  }
+  let current = { path: "large.bin", size: 1, mtime: 1 }
+  let snapshot = await store.save({
+    runId: "run-stage-cancel",
+    phase: "remote-verified",
+    expectedRemoteHead: "old",
+    candidateCommitSha: "candidate",
+    verifiedRemoteHead: "candidate",
+    payload: {
+      mutations: [{
+        id: "stage:large",
+        kind: "stage-write",
+        path: "large.bin",
+        stage,
+        precondition: { path: "large.bin", exists: true, size: 1, mtime: 1 },
+      }],
+      completedMutationIds: [],
+    },
+  })
+  const events: string[] = []
+  await assert.rejects(
+    applyV4RecoveryLocalMutations({
+      store,
+      snapshot,
+      signal: controller.signal,
+      io: {
+        async read() { return new Uint8Array([1]) },
+        async write() {},
+        async trash() {},
+        async stat() { return current },
+        async commitStage() {
+          events.push("commit-stage")
+          current = { path: "large.bin", size: stage.size, mtime: stage.mtime }
+          controller.abort("dispose-during-swap")
+        },
+      },
+    }),
+    /dispose-during-swap|cancel/iu,
+  )
+  snapshot = (await store.load())!
+  assert.deepEqual(events, ["commit-stage"])
+  assert.deepEqual(snapshot.payload?.completedMutationIds, ["stage:large"])
+  assert.equal(snapshot.header.phase, "local-committing")
+})

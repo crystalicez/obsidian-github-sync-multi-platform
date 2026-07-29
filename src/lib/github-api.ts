@@ -77,6 +77,7 @@ export class GitHubClient {
   private readonly transportPolicy: V4TransportPolicy;
   private readonly transportMetrics: V4TransportMetrics;
   private readonly transportResources: Pick<V4ResourceController, "withTransportBytes">;
+  private operationSignal?: AbortSignal;
 
   constructor(config: GitHubConfig, options: GitHubClientOptions = {}) {
     this.config = config;
@@ -93,6 +94,8 @@ export class GitHubClient {
         : this.transportMetrics.recordPacing(delay.milliseconds),
     });
   }
+
+  setV4AbortSignal(signal?: AbortSignal): void { this.operationSignal = signal; }
 
   get transportMetricsSnapshot(): V4TransportMetricsSnapshot {
     return this.transportMetrics.snapshot;
@@ -126,7 +129,7 @@ export class GitHubClient {
         throw error;
       }
       return response;
-    });
+    }, this.operationSignal);
   }
 
   private async mutationRequest(input: MutationRequestInput): Promise<RequestUrlResponse> {
@@ -154,7 +157,7 @@ export class GitHubClient {
       }
       throw new V4GitMutationOutcomeUnknownError(input.retryClass, lastUnknown);
     };
-    return input.reservationAlreadyHeld ? execute() : this.transportResources.withTransportBytes(transientBytes, execute);
+    return input.reservationAlreadyHeld ? execute() : this.transportResources.withTransportBytes(transientBytes, execute, this.operationSignal);
   }
 
   private get baseUrl() {

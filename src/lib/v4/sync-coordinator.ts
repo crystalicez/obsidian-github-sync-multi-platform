@@ -1,5 +1,6 @@
 import { normalizeV4VaultPath } from "./paths";
 import type { V4SyncOperation } from "./planner";
+import { V4CancelledError } from "./cancellation";
 
 export type V4SyncTrigger = "startup" | "localChange" | "scheduled" | "manual" | "forcePush" | "forcePull";
 export type V4QueuedChange =
@@ -22,7 +23,7 @@ export interface V4CoordinatorExecutionResult { changedFiles: number; }
 export interface V4CoordinatorRunResult extends V4CoordinatorExecutionResult { status: "completed" | "busy" | "skipped"; }
 
 export interface V4SyncCoordinatorOptions {
-  execute(request: V4SyncRequest, changes: V4QueuedChange[]): Promise<V4CoordinatorExecutionResult>;
+  execute(request: V4SyncRequest, changes: V4QueuedChange[], signal: AbortSignal): Promise<V4CoordinatorExecutionResult>;
   notice?: (message: string) => void;
   schedule?: (callback: () => void, delay: number) => unknown;
   cancel?: (handle: any) => void;
@@ -90,6 +91,7 @@ export function coalesceV4Changes(changes: V4QueuedChange[]): V4QueuedChange[] {
 export class V4SyncCoordinator {
   private readonly pending: V4QueuedChange[] = [];
   private active?: Promise<V4CoordinatorRunResult>;
+  private activeController?: AbortController;
   private timer?: unknown;
   private flushAfterActive = false;
   private disposed = false;
@@ -109,6 +111,7 @@ export class V4SyncCoordinator {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    this.activeController?.abort(new V4CancelledError("V4 coordinator disposed."))
     if (this.timer !== undefined) this.cancel(this.timer)
     this.timer = undefined
     this.flushAfterActive = false
@@ -166,6 +169,8 @@ export class V4SyncCoordinator {
 
   private start(request: V4SyncRequest, changes: V4QueuedChange[]): Promise<V4CoordinatorRunResult> {
     if (this.disposed) return Promise.resolve({ status: "skipped", changedFiles: 0 });
+    const controller = new AbortController();
+    this.activeController = controller;
     let resolveExecution!: (result: V4CoordinatorRunResult) => void;
     let rejectExecution!: (error: unknown) => void;
     const execution = new Promise<V4CoordinatorRunResult>((resolve, reject) => {
@@ -175,6 +180,7 @@ export class V4SyncCoordinator {
     let tracked!: Promise<V4CoordinatorRunResult>;
     tracked = execution.finally(() => {
       if (this.active === tracked) this.active = undefined;
+      if (this.activeController === controller) this.activeController = undefined;
       if (this.disposed) {
         this.pending.length = 0;
         this.flushAfterActive = false;
@@ -187,7 +193,7 @@ export class V4SyncCoordinator {
     });
     this.active = tracked;
     try {
-      this.options.execute(request, changes).then(
+      this.options.execute(request, changes, controller.signal).then(
         result => resolveExecution({ status: "completed", ...result }),
         rejectExecution,
       );

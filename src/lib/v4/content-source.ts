@@ -1,4 +1,5 @@
 import { V4BoundedIoUnavailableError } from "./platform-io"
+import { throwIfV4Aborted } from "./cancellation"
 
 export const DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES = 32 * 1024 * 1024
 
@@ -40,18 +41,22 @@ function assertSourceSize(source: V4ContentSource, expectedSize: number): V4Cont
   return source
 }
 
-export async function createV4ContentSource(handle: V4ContentHandle, resolver: V4ContentSourceResolver): Promise<V4ContentSource> {
+export async function createV4ContentSource(handle: V4ContentHandle, resolver: V4ContentSourceResolver, signal?: AbortSignal): Promise<V4ContentSource> {
+  throwIfV4Aborted(signal)
   assertSize(handle.expectedSize, "expectedSize")
   const ceiling = resolver.wholeBufferCeilingBytes ?? DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES
   if (!Number.isSafeInteger(ceiling) || ceiling < 1) throw new TypeError("wholeBufferCeilingBytes must be a positive safe integer.")
-  if (handle.kind === "stage") return assertSourceSize(await resolver.openStage(handle.stageId, handle.expectedSize), handle.expectedSize)
+  if (handle.kind === "stage") { const source = await resolver.openStage(handle.stageId, handle.expectedSize); throwIfV4Aborted(signal); return assertSourceSize(source, handle.expectedSize) }
   if (handle.expectedSize <= ceiling) {
     const bytes = await resolver.readVaultWhole(handle.path)
+    throwIfV4Aborted(signal)
     if (bytes.byteLength !== handle.expectedSize) throw new Error(`V4 vault content size changed: expected ${handle.expectedSize}, got ${bytes.byteLength}.`)
     return createV4WholeBufferContentSource(bytes)
   }
   if (!resolver.openVaultBounded) throw new V4BoundedIoUnavailableError("bounded-read", handle.path)
-  return assertSourceSize(await resolver.openVaultBounded(handle.path, handle.expectedSize), handle.expectedSize)
+  const source = await resolver.openVaultBounded(handle.path, handle.expectedSize)
+  throwIfV4Aborted(signal)
+  return assertSourceSize(source, handle.expectedSize)
 }
 
 export async function collectV4ContentSource(source: V4ContentSource, maximumBytes: number, signal?: AbortSignal): Promise<Uint8Array> {

@@ -2,6 +2,7 @@ import type { GitHubCreateTreeEntry, GitHubGitCommit, GitHubGitRef } from "../gi
 import type { V4StreamObject } from "./object-stream";
 import { isV4GitMutationOutcomeUnknownError } from "./git-mutation-policy";
 import { reconcileV4CandidatePublication } from "./publish-reconciler";
+import { throwIfV4Aborted } from "./cancellation";
 
 export interface V4GitTreeProgressItem { fileId: string; path: string; }
 export interface V4GitTreeFile { path: string; bytes: Uint8Array; progressItems?: V4GitTreeProgressItem[]; }
@@ -198,10 +199,12 @@ export async function createV4CandidateCommit(
   };
 }
 
-export async function publishV4CandidateRef(github: V4GitTreeGithub, candidate: V4CandidateCommit): Promise<void> {
+export async function publishV4CandidateRef(github: V4GitTreeGithub, candidate: V4CandidateCommit, signal?: AbortSignal): Promise<void> {
+  throwIfV4Aborted(signal);
   const expectedHead = candidate.previousHeadSha ?? null;
   const journalId = candidate.message.startsWith("obsidian-sync-v4:") ? candidate.message.slice("obsidian-sync-v4:".length) : undefined;
   const mutate = async (): Promise<void> => {
+    throwIfV4Aborted(signal);
     const current = await github.getGitRefOrNull();
     if ((current?.sha ?? null) !== expectedHead) throw new Error("V4 branch head changed before atomic publish.");
     if (candidate.previousHeadSha !== undefined) await github.updateGitRef(candidate.commitSha, candidate.previousHeadSha);
@@ -211,9 +214,11 @@ export async function publishV4CandidateRef(github: V4GitTreeGithub, candidate: 
     candidateCommitSha: candidate.commitSha,
     expectedHeadSha: expectedHead,
     journalId,
+    signal,
   });
 
   for (let attempt = 1; attempt <= 2; attempt++) {
+    throwIfV4Aborted(signal);
     try {
       await mutate();
       return;

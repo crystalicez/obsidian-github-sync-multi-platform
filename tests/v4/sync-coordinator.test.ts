@@ -257,3 +257,25 @@ test("v4 chained folder renames preserve parent-before-descendant causal order",
   ];
   assert.deepEqual(coalesceV4Changes(changes), changes);
 });
+
+test("v4 coordinator aborts the active execution on dispose and starts no follow-up work", async () => {
+  let observedSignal: AbortSignal | undefined
+  let executions = 0
+  const coordinator = new V4SyncCoordinator({
+    execute: async (_request, _changes, signal) => {
+      executions++
+      observedSignal = signal
+      await new Promise<void>((resolve, reject) => {
+        if (signal.aborted) return reject(signal.reason)
+        signal.addEventListener("abort", () => reject(signal.reason), { once: true })
+      })
+      return { changedFiles: 0 }
+    },
+  })
+  const active = coordinator.run({ operation: "normal", trigger: "manual" })
+  coordinator.dispose()
+  await assert.rejects(active)
+  assert.equal(observedSignal?.aborted, true)
+  assert.equal((await coordinator.run({ operation: "normal", trigger: "manual" })).status, "skipped")
+  assert.equal(executions, 1)
+})

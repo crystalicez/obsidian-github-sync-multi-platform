@@ -8,6 +8,7 @@ import type { V4StageRef } from "./staging-store"
 import type { V4RecoveryHeader, V4RecoveryPayload, V4RecoveryPhase, V4RecoverySnapshot } from "./recovery-types"
 import { reconcileV4CandidatePublication, type V4PublishReconcileResult, type V4PublishReconcilerGithub } from "./publish-reconciler"
 
+import { throwIfV4Aborted } from "./cancellation"
 const V4_RECOVERY_SCHEMA_VERSION = 1 as const
 const VALID_PHASES = new Set<V4RecoveryPhase>([
   "publish-intent",
@@ -238,6 +239,7 @@ export async function applyV4RecoveryLocalMutations(input: {
   io: V4LocalIo
   onApplying?: (mutation: V4RecoveryPayload["mutations"][number]) => void
   onApplied?: (mutation: V4RecoveryPayload["mutations"][number]) => void
+  signal?: AbortSignal
 }): Promise<V4RecoveryLocalApplyResult> {
   let snapshot = input.snapshot
   const payload: V4RecoveryPayload = snapshot.payload
@@ -255,6 +257,7 @@ export async function applyV4RecoveryLocalMutations(input: {
   }
 
   for (const mutation of payload.mutations) {
+    throwIfV4Aborted(input.signal)
     if (completed.has(mutation.id)) continue
     input.onApplying?.(mutation)
     try {
@@ -262,12 +265,14 @@ export async function applyV4RecoveryLocalMutations(input: {
         const current = input.io.stat ? await input.io.stat(mutation.path) : undefined
         if (input.io.stat && !current) {
           await receipt(mutation.id)
+          throwIfV4Aborted(input.signal)
           input.onApplied?.(mutation)
           continue
         }
         await assertV4LocalTargetPrecondition(input.io, mutation.precondition)
         await input.io.trash(mutation.path)
         await receipt(mutation.id)
+        throwIfV4Aborted(input.signal)
         input.onApplied?.(mutation)
         continue
       }
@@ -285,11 +290,12 @@ export async function applyV4RecoveryLocalMutations(input: {
       } else {
         if (!input.io.staging) throw new V4RecoveryRequiredError(`V4 recovery stage is unavailable: ${mutation.id}`)
         const source = await input.io.staging.open(mutation.stage)
-        const bytes = await collectV4ContentSource(source, DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES)
+        const bytes = await collectV4ContentSource(source, DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES, input.signal)
         if (await sha256Hex(bytes) !== mutation.stage.hash) throw new V4RecoveryRequiredError(`V4 recovery stage hash mismatch: ${mutation.id}`)
         await input.io.write(mutation.path, bytes, mutation.stage.mtime)
       }
       await receipt(mutation.id)
+      throwIfV4Aborted(input.signal)
       try { await input.io.staging?.remove(mutation.stage) } catch {}
       input.onApplied?.(mutation)
     } catch (error) {
@@ -306,7 +312,9 @@ export async function recoverV4PendingState(input: {
   io: V4LocalIo
   currentRemoteHead: string | null
   publicationGithub?: V4PublishReconcilerGithub
+  signal?: AbortSignal
 }): Promise<V4RecoveryLocalApplyResult> {
+  throwIfV4Aborted(input.signal)
   let snapshot = input.snapshot
   const header = snapshot.header
   if (header.phase === "index-committed") return { snapshot, replanRequired: false }
@@ -318,6 +326,7 @@ export async function recoverV4PendingState(input: {
         candidateCommitSha: header.candidateCommitSha,
         expectedHeadSha: header.expectedRemoteHead,
         journalId: header.journalId,
+        signal: input.signal,
       })
       snapshot = await reconcileV4RecoveryPublishIntent({ store: input.store, snapshot, result })
       if (snapshot.header.phase === "replan-required") return { snapshot, replanRequired: true }
@@ -344,7 +353,7 @@ export async function recoverV4PendingState(input: {
       snapshot = await saveFromSnapshot(input.store, snapshot, "replan-required", snapshot.payload)
       return { snapshot, replanRequired: true }
     }
-    const applied = await applyV4RecoveryLocalMutations({ store: input.store, snapshot, io: input.io })
+    const applied = await applyV4RecoveryLocalMutations({ store: input.store, snapshot, io: input.io, signal: input.signal })
     if (applied.replanRequired) return applied
     snapshot = await saveFromSnapshot(input.store, applied.snapshot, "replan-required", applied.snapshot.payload)
     return { snapshot, replanRequired: true }

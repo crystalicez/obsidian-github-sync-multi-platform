@@ -13,7 +13,7 @@ export interface V4SessionVault {
   read(path: string): Promise<Uint8Array>
   write(path: string, bytes: Uint8Array, mtime?: number): Promise<void>
   trash(path: string): Promise<void>
-  openContentSource?(handle: V4ContentHandle): Promise<V4ContentSource>
+  openContentSource?(handle: V4ContentHandle, signal?: AbortSignal): Promise<V4ContentSource>
   staging?: V4StagingStore
   commitStage?(input: { stage: V4StageRef; path: string; precondition: V4LocalTargetPrecondition }): Promise<void>
 }
@@ -28,7 +28,7 @@ export function createV4LocalIo(vault: V4SessionVault): V4LocalIo {
     trash: path => vault.trash(path),
   }
   if (vault.stat) localIo.stat = path => vault.stat!(path)
-  if (vault.openContentSource) localIo.openContentSource = handle => vault.openContentSource!(handle)
+  if (vault.openContentSource) localIo.openContentSource = (handle, signal) => vault.openContentSource!(handle, signal)
   if (vault.staging) localIo.staging = vault.staging
   if (vault.commitStage) localIo.commitStage = input => vault.commitStage!(input)
   return localIo

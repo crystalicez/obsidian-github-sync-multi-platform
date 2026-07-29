@@ -49,6 +49,7 @@ import type { V4QueuedChange } from "./sync-coordinator"
 import { applyV4RecoveryLocalMutations, type V4RecoveryStore } from "./recovery-store"
 import type { V4RecoveryLocalMutation, V4RecoveryPayload } from "./recovery-types"
 import type { V4DirectionalProgress, V4SyncProgressPatch } from "./progress"
+import { deferV4Cancellation, throwIfV4Aborted } from "./cancellation"
 
 export type { V4SessionVault, V4SessionVaultFile } from "./local-io"
 export { assertV4PathLayoutCompatible } from "./remote-loader"
@@ -74,6 +75,7 @@ export interface V4SyncSessionInput {
   runState?: V4SyncRunState
   recoveryStore?: V4RecoveryStore
   resourceLimits?: Partial<V4ResourceLimits>
+  signal?: AbortSignal
 }
 
 export interface V4SyncRunState {
@@ -246,6 +248,7 @@ export class V4SyncSession {
       pathLayout: input.config.pathLayout ?? expectedV4PathLayout(input.config.mode),
       keyring: input.keyring,
       resources: this.resources,
+      signal: input.signal,
     })
     this.now = input.now ?? (() => Date.now())
     this.localIo = createV4LocalIo(input.vault)
@@ -264,6 +267,7 @@ export class V4SyncSession {
     allowThresholdOverride: boolean
     changes?: V4QueuedChange[]
   }): Promise<V4SessionSyncResult> {
+    throwIfV4Aborted(this.input.signal)
     this.localReadCache.clear()
     const ownedStages: V4StageRef[] = []
     let preserveStagesForRecovery = false
@@ -570,6 +574,7 @@ export class V4SyncSession {
           snapshot: recovery,
           io: this.localIo,
           onApplying: mutation => this.report({ phase: "applying", currentPath: mutation.path, currentDirection: mutation.id.startsWith("pull:") ? "pull" : "push" }),
+          signal: this.input.signal,
           onApplied: mutation => {
             if (!recoveryPlan!.pullCompletionIds.has(mutation.id)) return
             pullCompleted++
@@ -638,7 +643,7 @@ export class V4SyncSession {
     }
     const onUploaded = (item: V4GitTreeProgressItem): void => completePush(item, latestUploadPath ?? item.path)
     const withBlobTransport = (bytes: Uint8Array, task: () => Promise<string>): Promise<string> =>
-      this.resources.withTransportBytes(estimateV4GitBlobTransportBytes(bytes.byteLength), task)
+      this.resources.withTransportBytes(estimateV4GitBlobTransportBytes(bytes.byteLength), task, this.input.signal)
     const streamedEntries: Array<{ path: string; mode: "100644"; type: "blob"; sha: string }> = []
     const streamedUploadedPushIds = new Set<string>()
     const pushContexts = batch.pushes.map(binding => {
@@ -730,10 +735,11 @@ export class V4SyncSession {
                   ? () => this.assertVaultSnapshot(sourceHandle)
                   : undefined,
               }
-            }))
+            }), this.input.signal)
             const sha = await this.input.github.createGitBlob(packed.file.bytes)
             return { packed, sha }
-          }),
+          }, this.input.signal),
+          this.input.signal,
         )
         streamedEntries.push({ path: uploadedPack.packed.file.path, mode: "100644", type: "blob", sha: uploadedPack.sha })
         for (const item of progressItems) {
@@ -775,7 +781,7 @@ export class V4SyncSession {
         })
         const progressItem = { fileId: after.fileId, path: after.path }
         const uploaded = await uploadV4ObjectStream(this.input.github, {
-          objects: prepared.objects(),
+          objects: prepared.objects(this.input.signal),
           progressItem,
           onLogicalFileUploadStarted: onUploadStarted,
           onLogicalFileUploaded: onUploaded,
@@ -800,7 +806,7 @@ export class V4SyncSession {
           push: directional(pushCompleted, pushTotal),
         })
         return this.codec.prepare(after.path, bytes, journalId, after.mtime, after.fileId)
-      })
+      }, this.input.signal)
       const record: V4IndexFileRecord = { path: after.path, ...prepared.record }
       recordsById.set(after.fileId, record)
       files.push(...prepared.files.map(file => ({
@@ -906,7 +912,7 @@ export class V4SyncSession {
       })
       : undefined
     preserveStagesForRecovery = !!recoverySnapshot && (recoveryPlan?.payload.mutations.length ?? 0) > 0
-    await publishV4CandidateRef(this.input.github, candidate)
+    await deferV4Cancellation(this.input.signal, () => publishV4CandidateRef(this.input.github, candidate, this.input.signal))
     if (this.input.recoveryStore && recoverySnapshot) {
       const verifiedRef = await this.input.github.getGitRefOrNull()
       if (verifiedRef?.sha !== candidate.commitSha) throw new Error("V4 candidate publication could not be verified.")
@@ -925,6 +931,7 @@ export class V4SyncSession {
           snapshot: recoverySnapshot,
           io: this.localIo,
           onApplying: mutation => this.report({ phase: "applying", currentPath: mutation.path, currentDirection: mutation.id.startsWith("pull:") ? "pull" : "push" }),
+          signal: this.input.signal,
           onApplied: mutation => {
             if (!recoveryPlan!.pullCompletionIds.has(mutation.id)) return
             pullCompleted++
@@ -1143,6 +1150,7 @@ export class V4SyncSession {
           mtime,
           existingTargetBytes,
           atomicReplace: false,
+          signal: this.input.signal,
         })
       } catch (error) {
         const capabilityUnavailable = error instanceof V4BoundedIoUnavailableError
@@ -1195,7 +1203,7 @@ export class V4SyncSession {
           bytes = await session.readStage({ stageId: source.stageId, hash: source.expectedHash, size: source.expectedSize, mtime: after.mtime })
         } else {
           const path = source?.kind === "vault" ? source.path : after.path
-          bytes = await session.resources.withVaultRead(() => session.localIo.read(path))
+          bytes = await session.resources.withVaultRead(() => session.localIo.read(path), session.input.signal)
         }
         if (bytes.byteLength !== after.size) throw new V4SourceChangedError(after.path, `read ${bytes.byteLength} bytes; expected ${after.size}`)
         for (let offset = 0; offset < bytes.byteLength; offset += chunkBytes) {
@@ -1226,6 +1234,7 @@ export class V4SyncSession {
       mtime: record.mtime,
       existingTargetBytes,
       atomicReplace: false,
+      signal: this.input.signal,
     })
     try {
       const result = await this.codec.readToSink({
@@ -1236,6 +1245,7 @@ export class V4SyncSession {
           return file.bytes
         },
         sink,
+        signal: this.input.signal,
       })
       const stage = await sink.finish(result)
       ownedStages.push(stage)
@@ -1396,7 +1406,7 @@ export class V4SyncSession {
   private async readLocal(path: string): Promise<Uint8Array> {
     const cached = this.localReadCache.get(path)
     if (cached) return cached
-    const bytes = await this.resources.withVaultRead(() => this.localIo.read(path))
+    const bytes = await this.resources.withVaultRead(() => this.localIo.read(path), this.input.signal)
     this.localReadCache.set(path, bytes)
     return bytes
   }
@@ -1413,7 +1423,7 @@ export class V4SyncSession {
     const after = binding.change.after
     const handle = binding.source
     if (!after || !handle) throw new Error(`Missing V4 push source for ${binding.change.path}`)
-    if (this.localIo.openContentSource) return this.localIo.openContentSource(handle)
+    if (this.localIo.openContentSource) return this.localIo.openContentSource(handle, this.input.signal)
     if (handle.kind === "stage" && this.localIo.staging) {
       return this.localIo.staging.open({ stageId: handle.stageId, size: handle.expectedSize })
     }
@@ -1431,20 +1441,21 @@ export class V4SyncSession {
     await this.assertVaultSnapshot(handle)
     if (expectedBytes > DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES) {
       if (!this.localIo.openContentSource) throw new V4BoundedIoUnavailableError("bounded-read", path)
-      const source = await this.localIo.openContentSource(handle)
+      const source = await this.localIo.openContentSource(handle, this.input.signal)
       return hashV4StableContentSource(source, {
         chunkBytes: Math.min(4 * 1024 * 1024, Math.max(1, expectedBytes)),
         checkStable: () => this.assertVaultSnapshot(handle),
+        signal: this.input.signal,
       })
     }
     return this.resources.withResidentBytes(expectedBytes, async () => {
-      const bytes = await this.resources.withVaultRead(() => this.localIo.read(path))
+      const bytes = await this.resources.withVaultRead(() => this.localIo.read(path), this.input.signal)
       if (bytes.byteLength !== expectedBytes) throw new V4SourceChangedError(path, `read ${bytes.byteLength} bytes; expected ${expectedBytes}`)
-      const hash = await this.resources.withCrypto(() => sha256Hex(bytes))
+      const hash = await this.resources.withCrypto(() => sha256Hex(bytes), this.input.signal)
       await this.assertVaultSnapshot(handle)
       this.localReadCache.set(path, bytes)
       return hash
-    })
+    }, this.input.signal)
   }
 
   private async readRecord(record: V4IndexFileRecord, remoteCommitSha?: string): Promise<Uint8Array> {
@@ -1452,7 +1463,7 @@ export class V4SyncSession {
       const file = await this.input.github.getFileBytes(path, remoteCommitSha)
       if (!file) throw new Error(`Missing V4 remote object: ${path}`)
       return file.bytes
-    })
+    }, this.input.signal)
   }
 
   private changeBetween(before?: V4LogicalFile, after?: V4LogicalFile): V4PlannedChange | null {

@@ -1,6 +1,7 @@
 import { bytesToUtf8, fromBase64, sha256Hex, toBase64, utf8ToBytes } from "../bytes"
 import { collectV4ContentSource, type V4ContentSource } from "./content-source"
 import { decryptV4Payload, encryptV4Payload, type V4Keyring } from "./crypto"
+import { throwIfV4Aborted } from "./cancellation"
 import {
   buildV4PartPaths,
   joinAndVerifyV4Parts,
@@ -49,14 +50,18 @@ export class V4StorageCodec {
     pathLayout: V4PathLayout
     keyring?: V4Keyring
     resources?: Pick<V4ResourceController, "withCrypto"> & Partial<Pick<V4ResourceController, "reserveResidentBytes">>
+    signal?: AbortSignal
   }) {
     if (options.mode === "encrypted" && !options.keyring) {
       throw new Error("Encrypted V4 storage requires a keyring.")
     }
   }
 
-  private crypto<T>(task: () => Promise<T>): Promise<T> {
-    return this.options.resources ? this.options.resources.withCrypto(task) : task()
+  private async crypto<T>(task: () => Promise<T>): Promise<T> {
+    throwIfV4Aborted(this.options.signal)
+    const value = this.options.resources ? await this.options.resources.withCrypto(task, this.options.signal) : await task()
+    throwIfV4Aborted(this.options.signal)
+    return value
   }
 
   private contentAad(record: { fileId: string; pathId: string; remoteVersion: string }): string {
@@ -152,7 +157,7 @@ export class V4StorageCodec {
       if (!reserveResidentBytes) return () => {}
       const multiplier = this.options.mode === "encrypted" ? 3 : 2
       const estimated = plainBytes * multiplier + (this.options.mode === "encrypted" ? 64 : 0)
-      return reserveResidentBytes(estimated)
+      return reserveResidentBytes(estimated, this.options.signal)
     }
 
     const objects = async function* (this: V4StorageCodec, signal?: AbortSignal) {
@@ -273,6 +278,7 @@ export class V4StorageCodec {
     entries: readonly V4PackSourceEntry[],
     signal?: AbortSignal,
   ): Promise<V4PreparedPack> {
+    signal ??= this.options.signal
     if (this.options.mode !== "encrypted") throw new Error("V4 packs are available only in encrypted mode.")
     if (entries.length === 0) throw new Error("Cannot create an empty V4 pack.")
     if (!/^[A-Za-z0-9_-]+$/u.test(packId)) throw new Error("Unsafe V4 pack id.")
@@ -414,7 +420,8 @@ export class V4StorageCodec {
     sink: V4StagedSink
     signal?: AbortSignal
   }): Promise<{ plaintextSha256: string; size: number }> {
-    const { record, reader, sink, signal } = input
+    const { record, reader, sink } = input
+    const signal = input.signal ?? this.options.signal
     const hash = createV4IncrementalSha256()
     let total = 0
     const append = async (plaintext: Uint8Array) => {
@@ -449,10 +456,12 @@ export class V4StorageCodec {
     return { plaintextSha256, size: total }
   }
 
-  async read(record: V4FileRecord, reader: V4RemoteBytesReader): Promise<Uint8Array> {
+  async read(record: V4FileRecord, reader: V4RemoteBytesReader, signal: AbortSignal | undefined = this.options.signal): Promise<Uint8Array> {
+    throwIfV4Aborted(signal)
     if (record.storage === "pack") {
       if (this.options.mode !== "encrypted" || !record.packId) throw new Error("Invalid V4 pack record.")
       const payload = await reader(record.remotePath)
+      throwIfV4Aborted(signal)
       const archive = await this.crypto(() => decryptV4Payload(this.options.keyring!.contentKey, payload, { kind: "pack", aad: record.packId! }))
       const parsed = JSON.parse(bytesToUtf8(archive)) as { version?: number; entries?: Record<string, string> }
       const encoded = parsed.version === 1 ? parsed.entries?.[record.fileId] : undefined
@@ -463,6 +472,7 @@ export class V4StorageCodec {
     }
     if (record.storage === "single") {
       const bytes = await reader(record.remotePath)
+      throwIfV4Aborted(signal)
       const plaintext = this.options.mode === "plaintext"
         ? bytes
         : await this.crypto(() => decryptV4Payload(this.options.keyring!.contentKey, bytes, {
@@ -477,7 +487,9 @@ export class V4StorageCodec {
     const partPaths = record.partPaths ?? []
     if (partPaths.length === 0) throw new Error("V4 chunked record has no parts.")
     const parts = await Promise.all(partPaths.map(async (path, index) => {
+      throwIfV4Aborted(signal)
       const bytes = await reader(path)
+      throwIfV4Aborted(signal)
       return this.options.mode === "plaintext"
         ? bytes
         : this.crypto(() => decryptV4Payload(this.options.keyring!.contentKey, bytes, {

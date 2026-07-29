@@ -28,7 +28,14 @@ export async function deriveV4Keyring(input: {
   salt: Uint8Array;
   iterations?: number;
 }): Promise<V4Keyring> {
-  const material = await crypto.subtle.importKey("raw", utf8ToBytes(input.passphrase) as any, "PBKDF2", false, ["deriveBits"]);
+  const passphraseBytes = utf8ToBytes(input.passphrase);
+  let material: CryptoKey;
+  try {
+    material = await crypto.subtle.importKey("raw", passphraseBytes as any, "PBKDF2", false, ["deriveBits"]);
+  } finally {
+    // Best-effort only; the JS engine/WebCrypto implementation may retain internal copies.
+    passphraseBytes.fill(0);
+  }
   const masterKey = new Uint8Array(await crypto.subtle.deriveBits({
     name: "PBKDF2",
     hash: "SHA-256",

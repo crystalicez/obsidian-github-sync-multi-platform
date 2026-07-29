@@ -222,6 +222,7 @@ export default class FastSync extends Plugin {
   }
 
   async saveSettings() {
+    this.v4Runtime?.credentialsChanged()
     storeV4Secrets(this.settings, this.app.secretStorage)
     this.initGitHubClient()
     this.registerScheduledSync()

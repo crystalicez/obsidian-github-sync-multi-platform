@@ -1,4 +1,5 @@
 import type { GitHubGitCommit, GitHubGitRef } from "../github-git-types"
+import { throwIfV4Aborted } from "./cancellation"
 
 export interface V4PublishReconcilerGithub {
   getGitRefOrNull(): Promise<GitHubGitRef | null>
@@ -26,6 +27,7 @@ export interface V4PublishReconcileInput {
   expectedHeadSha: string | null
   journalId?: string
   maxCommits?: number
+  signal?: AbortSignal
 }
 
 function sameParents(left: string[], right: string[]): boolean {
@@ -40,7 +42,9 @@ export async function reconcileV4CandidatePublication(
   github: V4PublishReconcilerGithub,
   input: V4PublishReconcileInput,
 ): Promise<V4PublishReconcileResult> {
+  throwIfV4Aborted(input.signal)
   const ref = await github.getGitRefOrNull()
+  throwIfV4Aborted(input.signal)
   const currentHeadSha = ref?.sha ?? null
   if (currentHeadSha === input.candidateCommitSha) {
     return {
@@ -65,6 +69,7 @@ export async function reconcileV4CandidatePublication(
   let markerEquivalent: GitHubGitCommit | undefined
 
   while (queue.length > 0 && visited.size < maxCommits) {
+    throwIfV4Aborted(input.signal)
     const sha = queue.shift()!
     if (visited.has(sha)) continue
     visited.add(sha)
@@ -79,7 +84,7 @@ export async function reconcileV4CandidatePublication(
     }
     if (sha === input.expectedHeadSha) continue
     let current: GitHubGitCommit
-    try { current = await github.getGitCommit(sha) } catch { continue }
+    try { current = await github.getGitCommit(sha); throwIfV4Aborted(input.signal) } catch (error) { if (input.signal?.aborted) throw error; continue }
     if (
       !markerEquivalent
       && marker
