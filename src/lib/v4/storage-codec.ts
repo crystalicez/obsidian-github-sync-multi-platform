@@ -13,6 +13,7 @@ import { streamV4SourceParts, type V4PreparedObjectStream, V4SourceChangedError 
 import { normalizeV4VaultPath, objectIdForV4File, opaqueV4ObjectPath, opaqueV4PackPath, pathIdForV4Path } from "./paths"
 import { type V4FileRecord, type V4PathLayout, type V4StorageMode } from "./protocol-types"
 import type { V4ResourceController } from "./resource-controller"
+import type { V4StagedSink } from "./staging-store"
 
 export interface V4PreparedFile {
   path: string
@@ -405,6 +406,47 @@ export class V4StorageCodec {
       },
       files,
     }
+  }
+
+  async readToSink(input: {
+    record: V4FileRecord
+    reader: V4RemoteBytesReader
+    sink: V4StagedSink
+    signal?: AbortSignal
+  }): Promise<{ plaintextSha256: string; size: number }> {
+    const { record, reader, sink, signal } = input
+    const hash = createV4IncrementalSha256()
+    let total = 0
+    const append = async (plaintext: Uint8Array) => {
+      if (signal?.aborted) throw signal.reason ?? new Error("V4 remote read aborted.")
+      if (total + plaintext.byteLength > record.size) throw new Error(`V4 content size mismatch: ${record.remotePath}`)
+      hash.update(plaintext)
+      total += plaintext.byteLength
+      await sink.append(plaintext)
+    }
+
+    if (record.storage === "chunked") {
+      const partPaths = record.partPaths ?? []
+      if (partPaths.length === 0) throw new Error("V4 chunked record has no parts.")
+      for (let index = 0; index < partPaths.length; index++) {
+        if (signal?.aborted) throw signal.reason ?? new Error("V4 remote read aborted.")
+        const bytes = await reader(partPaths[index])
+        const plaintext = this.options.mode === "plaintext"
+          ? bytes
+          : await this.crypto(() => decryptV4Payload(this.options.keyring!.contentKey, bytes, {
+            kind: "part",
+            aad: `${this.contentAad(record)}:${index}`,
+          }))
+        await append(plaintext)
+      }
+    } else {
+      await append(await this.read(record, reader))
+    }
+
+    const plaintextSha256 = hash.digestHex()
+    if (total !== record.size) throw new Error(`V4 content size mismatch: expected ${record.size}, got ${total}.`)
+    if (record.plaintextSha256 && plaintextSha256 !== record.plaintextSha256) throw new Error(`V4 content hash mismatch: ${record.remotePath}`)
+    return { plaintextSha256, size: total }
   }
 
   async read(record: V4FileRecord, reader: V4RemoteBytesReader): Promise<Uint8Array> {

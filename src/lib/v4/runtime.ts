@@ -335,6 +335,18 @@ export class V4PluginRuntime {
         openStage: (stageId, expectedSize) => this.stagingStore.open({ stageId, size: expectedSize }),
       }),
       staging: this.stagingStore,
+      commitStage: async ({ stage, path, precondition }) => {
+        this.plugin.addIgnoredFile(path)
+        try {
+          await this.platformIo.commitStage(this.stagingStore.pathFor(stage.stageId), path, {
+            expectedTarget: precondition,
+            expectedStageSize: stage.size,
+            expectedStageSha256: stage.hash,
+          })
+        } finally {
+          this.plugin.removeIgnoredFile(path)
+        }
+      },
     }
   }
 

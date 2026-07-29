@@ -107,3 +107,23 @@ test("v4 source-built pack preserves version-1 archive and existing read compati
   assert.deepEqual(fromBase64(archive.entries["source-pack-file"]), plaintext);
   assert.deepEqual(await codec.read(packed.records[0], async () => packed.file.bytes), plaintext);
 });
+
+
+test("v4 streamed sink size mismatch identifies the remote object without requiring a logical path", async () => {
+  const codec = new V4StorageCodec({ mode: "plaintext", pathLayout: "plaintext-v1" });
+  const record = {
+    pathId: "pid",
+    fileId: "fid",
+    plaintextSha256: "",
+    size: 1,
+    mtime: 1,
+    remoteVersion: "v1",
+    remotePath: ".obsidian-github-sync-v4/objects/opaque.bin",
+    storage: "single" as const,
+  };
+  const sink = { append: async () => {}, finish: async () => { throw new Error("unexpected finish") }, abort: async () => {} };
+  await assert.rejects(
+    () => codec.readToSink({ record, reader: async () => new Uint8Array([1, 2]), sink }),
+    /V4 content size mismatch: \.obsidian-github-sync-v4\/objects\/opaque\.bin/u,
+  );
+});

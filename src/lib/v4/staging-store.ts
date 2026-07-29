@@ -48,7 +48,14 @@ export class V4InsufficientStagingSpaceError extends Error {
   }
 }
 
+export interface V4StagedSink {
+  append(bytes: Uint8Array): Promise<void>
+  finish(result: { plaintextSha256: string; size: number }): Promise<V4StageRef>
+  abort(): Promise<void>
+}
+
 export interface V4StagingStore {
+  beginStage(options: { expectedSize: number; mtime: number; existingTargetBytes: number; atomicReplace: boolean; signal?: AbortSignal }): Promise<V4StagedSink>
   stageSource(source: V4ContentSource, options: { mtime: number; existingTargetBytes: number; atomicReplace: boolean; signal?: AbortSignal }): Promise<V4StageRef>
   open(ref: Pick<V4StageRef, "stageId" | "size">): Promise<V4ContentSource>
   remove(ref: Pick<V4StageRef, "stageId">): Promise<void>
@@ -93,49 +100,85 @@ export function createV4StagingStore(options: {
     return `${root}/${stageId}.bin`
   }
 
+  const beginStage = async (stageOptions: { expectedSize: number; mtime: number; existingTargetBytes: number; atomicReplace: boolean; signal?: AbortSignal }): Promise<V4StagedSink> => {
+    const stageId = randomId()
+    const path = pathFor(stageId)
+    const large = stageOptions.expectedSize > ceiling
+    if (large && !options.backend.boundedAppend) throw new Error("V4 bounded append is unavailable for large staging.")
+    if (large) {
+      const estimate = estimateV4StagingSpace({
+        stageBytes: stageOptions.expectedSize,
+        existingTargetBytes: stageOptions.existingTargetBytes,
+        atomicReplace: stageOptions.atomicReplace,
+      })
+      const available = await options.backend.freeBytes(path)
+      if (available === undefined) throw new V4UnknownStagingSpaceError(estimate.additionalFreeBytesRequired)
+      if (available < estimate.additionalFreeBytesRequired) throw new V4InsufficientStagingSpaceError(estimate.additionalFreeBytesRequired, available)
+    }
+
+    let total = 0
+    let first = true
+    let closed = false
+    const removePartial = async () => { try { await options.backend.remove(path) } catch {} }
+    return {
+      async append(bytes) {
+        if (closed) throw new Error("V4 staged sink is already closed.")
+        if (stageOptions.signal?.aborted) throw stageOptions.signal.reason ?? new Error("V4 staging aborted.")
+        if (total + bytes.byteLength > stageOptions.expectedSize) throw new Error("V4 staged sink received more bytes than declared.")
+        try {
+          if (first) { await options.backend.write(path, bytes); first = false }
+          else await options.backend.append(path, bytes)
+          total += bytes.byteLength
+        } catch (error) {
+          closed = true
+          await removePartial()
+          throw error
+        }
+      },
+      async finish(result) {
+        if (closed) throw new Error("V4 staged sink is already closed.")
+        if (!/^[0-9a-f]{64}$/u.test(result.plaintextSha256)) throw new Error("V4 staged sink requires a SHA-256 hash.")
+        if (result.size !== total || total !== stageOptions.expectedSize) {
+          closed = true
+          await removePartial()
+          throw new Error(`V4 staged sink received ${total} bytes; expected ${stageOptions.expectedSize}.`)
+        }
+        if (first) { await options.backend.write(path, new Uint8Array()); first = false }
+        closed = true
+        return { stageId, hash: result.plaintextSha256, size: total, mtime: stageOptions.mtime }
+      },
+      async abort() {
+        if (closed) return
+        closed = true
+        await removePartial()
+      },
+    }
+  }
+
   return {
     pathFor,
+    beginStage,
     async stageSource(source, stageOptions) {
-      const stageId = randomId()
-      const path = pathFor(stageId)
-      const large = source.size > ceiling
-      if (large && !options.backend.boundedAppend) throw new Error("V4 bounded append is unavailable for large staging.")
-      if (large) {
-        const estimate = estimateV4StagingSpace({
-          stageBytes: source.size,
-          existingTargetBytes: stageOptions.existingTargetBytes,
-          atomicReplace: stageOptions.atomicReplace,
-        })
-        const available = await options.backend.freeBytes(path)
-        if (available === undefined) throw new V4UnknownStagingSpaceError(estimate.additionalFreeBytesRequired)
-        if (available < estimate.additionalFreeBytesRequired) throw new V4InsufficientStagingSpaceError(estimate.additionalFreeBytesRequired, available)
-      }
-
+      const sink = await beginStage({ expectedSize: source.size, ...stageOptions })
+      const hash = createV4IncrementalSha256()
+      let total = 0
       try {
+        if (!options.backend.boundedAppend && source.size > ceiling) throw new Error("V4 bounded append is unavailable for large staging.")
         if (!options.backend.boundedAppend) {
           const bytes = await collectV4ContentSource(source, ceiling, stageOptions.signal)
-          const hash = createV4IncrementalSha256()
           hash.update(bytes)
-          await options.backend.write(path, bytes)
-          return { stageId, hash: hash.digestHex(), size: bytes.byteLength, mtime: stageOptions.mtime }
+          await sink.append(bytes)
+          total = bytes.byteLength
+        } else {
+          for await (const chunk of source.chunks(Math.min(4 * 1024 * 1024, Math.max(1, ceiling)), stageOptions.signal)) {
+            hash.update(chunk)
+            await sink.append(chunk)
+            total += chunk.byteLength
+          }
         }
-
-        const hash = createV4IncrementalSha256()
-        let total = 0
-        let first = true
-        for await (const chunk of source.chunks(Math.min(4 * 1024 * 1024, Math.max(1, ceiling)), stageOptions.signal)) {
-          if (stageOptions.signal?.aborted) throw stageOptions.signal.reason ?? new Error("V4 staging aborted.")
-          if (total + chunk.byteLength > source.size) throw new Error("V4 staging source produced more bytes than declared.")
-          hash.update(chunk)
-          if (first) { await options.backend.write(path, chunk); first = false }
-          else await options.backend.append(path, chunk)
-          total += chunk.byteLength
-        }
-        if (first) await options.backend.write(path, new Uint8Array())
-        if (total !== source.size) throw new Error(`V4 staging source produced ${total} bytes; expected ${source.size}.`)
-        return { stageId, hash: hash.digestHex(), size: total, mtime: stageOptions.mtime }
+        return await sink.finish({ plaintextSha256: hash.digestHex(), size: total })
       } catch (error) {
-        try { await options.backend.remove(path) } catch {}
+        await sink.abort()
         throw error
       }
     },

@@ -1,7 +1,8 @@
 import type { V4ContentSource } from "./content-source"
+import { createV4IncrementalSha256 } from "./incremental-hash"
 
 export type V4PlatformKind = "desktop" | "mobile" | "other"
-export type V4BoundedIoCapability = "bounded-read" | "bounded-append" | "free-space"
+export type V4BoundedIoCapability = "bounded-read" | "bounded-append" | "free-space" | "stage-commit"
 
 export class V4BoundedIoUnavailableError extends Error {
   readonly capability: V4BoundedIoCapability
@@ -39,6 +40,11 @@ export interface V4PlatformIo {
   appendStage(path: string, bytes: Uint8Array): Promise<void>
   removeStage(path: string): Promise<void>
   freeBytes(path: string): Promise<number | undefined>
+  commitStage(stagePath: string, targetPath: string, options: {
+    expectedTarget: { exists: boolean; size?: number; mtime?: number }
+    expectedStageSize: number
+    expectedStageSha256: string
+  }): Promise<void>
 }
 
 export interface V4PlatformIoOptions {
@@ -170,6 +176,41 @@ export function createV4PlatformIo(options: V4PlatformIoOptions): V4PlatformIo {
       const [fs, pathModule] = await Promise.all([desktopFs(), desktopPath()])
       const stats = await fs.statfs(pathModule.dirname(target))
       return Number(stats.bavail) * Number(stats.bsize)
+    },
+    async commitStage(stagePath, targetPath, commitOptions) {
+      if (!desktopReady) throw new V4BoundedIoUnavailableError("stage-commit", targetPath)
+      const fs = await desktopFs()
+      const stage = full(stagePath)
+      const target = full(targetPath)
+      const backup = `${stage}.target-backup`
+      await ensureDesktopParent(target)
+      const statOrNull = async (path: string) => { try { return await fs.stat(path) } catch (error) { if ((error as { code?: string }).code === "ENOENT") return null; throw error } }
+      const targetBefore = await statOrNull(target)
+      const expected = commitOptions.expectedTarget
+      if (expected.exists !== !!targetBefore
+        || (expected.exists && expected.size !== undefined && targetBefore!.size !== expected.size)
+        || (expected.exists && expected.mtime !== undefined && Math.trunc(targetBefore!.mtimeMs) !== Math.trunc(expected.mtime))) {
+        throw new Error(`V4 local target changed before staged commit: ${targetPath}`)
+      }
+      const stageStat = await fs.stat(stage)
+      if (stageStat.size !== commitOptions.expectedStageSize) throw new Error(`V4 staged content size changed before commit: ${stagePath}`)
+      await fs.rm(backup, { force: true })
+      let backedUp = false
+      let stageMoved = false
+      try {
+        if (targetBefore) { await fs.rename(target, backup); backedUp = true }
+        await fs.rename(stage, target); stageMoved = true
+        const after = await fs.stat(target)
+        if (after.size !== commitOptions.expectedStageSize) throw new Error(`V4 committed target size mismatch: ${targetPath}`)
+        const hash = createV4IncrementalSha256()
+        for await (const chunk of desktopBoundedSource(target, commitOptions.expectedStageSize).chunks(4 * 1024 * 1024)) hash.update(chunk)
+        if (hash.digestHex() !== commitOptions.expectedStageSha256) throw new Error(`V4 committed target hash mismatch: ${targetPath}`)
+        if (backedUp) await fs.rm(backup, { force: true })
+      } catch (error) {
+        if (stageMoved) { try { await fs.rm(target, { force: true }) } catch {} }
+        if (backedUp) { try { await fs.rename(backup, target) } catch {} }
+        throw error
+      }
     },
   }
 }

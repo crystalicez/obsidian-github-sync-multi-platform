@@ -28,6 +28,8 @@ export type V4VersionPreview =
   | { kind: "binary"; bytes: Uint8Array }
 
 const TEXT_EXTENSIONS = new Set(["md", "txt", "json", "canvas", "yaml", "yml", "csv", "css", "scss", "js", "ts", "tsx", "jsx", "html", "xml"])
+export const V4_HISTORY_PREVIEW_MAX_BYTES = 5 * 1024 * 1024
+
 const IMAGE_MIME: Record<string, string> = { png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp", svg: "image/svg+xml", bmp: "image/bmp" }
 
 function extension(path: string): string { return path.split(".").at(-1)?.toLowerCase() ?? "" }
@@ -61,6 +63,9 @@ export class V4HistoryService {
   async previewChange(commit: V4HistoryCommit, change: V4HistoryChange): Promise<V4VersionPreview> {
     const descriptor = change.after ?? change.before
     if (!descriptor) return { kind: "binary", bytes: new Uint8Array() }
+    if (descriptor.size > V4_HISTORY_PREVIEW_MAX_BYTES) {
+      throw new Error(`V4 history preview exceeds the ${V4_HISTORY_PREVIEW_MAX_BYTES}-byte preview limit.`)
+    }
     const gitCommit = await this.input.github.getGitCommit(commit.sha)
     const parentSha = gitCommit.parentShas[0] ?? commit.parentShas[0]
     if (!change.after && !parentSha) throw new Error("Deleted version has no parent commit.")

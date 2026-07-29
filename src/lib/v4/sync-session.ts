@@ -16,7 +16,7 @@ import {
 } from "./git-tree-writer"
 import { buildV4JournalPages, type V4JournalChange } from "./history-journal"
 import { isV4LocalIndexCacheComplete, type V4IndexFileRecord, type V4LocalIndex } from "./local-index"
-import { createV4LocalIo, type V4LocalIo, type V4SessionVault } from "./local-io"
+import { assertV4LocalTargetPrecondition, createV4LocalIo, type V4LocalIo, type V4LocalTargetPrecondition, type V4SessionVault } from "./local-io"
 import { trashV4LocalUserFile } from "./local-delete-policy"
 import { bucketForV4PathId } from "./paths"
 import { planV4Sync, type V4LogicalFile, type V4PlannedChange, type V4SyncOperation } from "./planner"
@@ -507,7 +507,7 @@ export class V4SyncSession {
 
     let pulledFiles = 0
     for (const binding of batch.pulls) {
-      await this.applyPullBinding(binding, () => {
+      await this.applyPullBinding(binding, ownedStages, () => {
         pullCompleted++
         this.report({ currentPath: binding.change.path, currentDirection: "pull", pull: directional(pullCompleted, pullTotal) })
       })
@@ -1093,11 +1093,73 @@ export class V4SyncSession {
     return this.readStage(stage)
   }
 
-  private async applyPullBinding(binding: V4PullBinding, onCompleted: () => void): Promise<void> {
+  private async stageRemotePull(binding: V4PullBinding, ownedStages: V4StageRef[]): Promise<V4StageRef> {
+    const record = binding.remoteRecord
+    if (!record) throw new Error(`Missing V4 remote record for ${binding.change.path}`)
+    if (!this.localIo.staging) throw new V4BoundedIoUnavailableError("bounded-append", binding.change.path)
+    const existingTargetBytes = binding.change.before?.path === binding.change.path ? binding.change.before.size : 0
+    const sink = await this.localIo.staging.beginStage({
+      expectedSize: record.size,
+      mtime: record.mtime,
+      existingTargetBytes,
+      atomicReplace: false,
+    })
+    try {
+      const result = await this.codec.readToSink({
+        record,
+        reader: async path => {
+          const file = await this.input.github.getFileBytes(path, binding.remoteCommitSha)
+          if (!file) throw new Error(`Missing V4 remote object: ${path}`)
+          return file.bytes
+        },
+        sink,
+      })
+      const stage = await sink.finish(result)
+      ownedStages.push(stage)
+      return stage
+    } catch (error) {
+      await sink.abort()
+      throw error
+    }
+  }
+
+  private pullPrecondition(change: V4PlannedChange, path = change.path): V4LocalTargetPrecondition {
+    const before = change.before
+    if (before && before.path === path) return { path, exists: true, size: before.size, mtime: before.mtime }
+    return { path, exists: false }
+  }
+
+  private async applyPullBinding(binding: V4PullBinding, ownedStages: V4StageRef[], onCompleted: () => void): Promise<void> {
     const change = binding.change
     if (change.kind === "delete") {
+      await assertV4LocalTargetPrecondition(this.localIo, this.pullPrecondition(change))
       this.report({ phase: "applying", currentPath: change.path, currentDirection: "pull" })
       await trashV4LocalUserFile(this.localIo, change.path)
+      onCompleted()
+      return
+    }
+    const record = binding.remoteRecord
+    if (!binding.stage && record?.storage === "chunked") {
+      this.report({ phase: "downloading", currentPath: change.path, currentDirection: "pull" })
+      binding.stage = await this.stageRemotePull(binding, ownedStages)
+    }
+    const targetPrecondition = this.pullPrecondition(change)
+    if (binding.stage && binding.stage.size > DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES) {
+      await assertV4LocalTargetPrecondition(this.localIo, targetPrecondition)
+      if (change.kind === "rename" && change.previousPath) {
+        await assertV4LocalTargetPrecondition(this.localIo, {
+          path: change.previousPath, exists: true, size: change.before?.size, mtime: change.before?.mtime,
+        })
+      }
+      if (!this.localIo.commitStage) throw new V4BoundedIoUnavailableError("stage-commit", change.path)
+      this.report({ phase: "applying", currentPath: change.path, currentDirection: "pull" })
+      await this.localIo.commitStage({ stage: binding.stage, path: change.path, precondition: targetPrecondition })
+      if (change.kind === "rename" && change.previousPath) {
+        await assertV4LocalTargetPrecondition(this.localIo, {
+          path: change.previousPath, exists: true, size: change.before?.size, mtime: change.before?.mtime,
+        })
+        await trashV4LocalUserFile(this.localIo, change.previousPath)
+      }
       onCompleted()
       return
     }
@@ -1107,14 +1169,19 @@ export class V4SyncSession {
       bytes = await this.readStage(binding.stage)
       mtime = binding.stage.mtime
     } else {
-      const record = binding.remoteRecord
       if (!record) throw new Error(`Missing V4 remote record for ${change.path}`)
       this.report({ phase: "downloading", currentPath: change.path, currentDirection: "pull" })
       bytes = await this.readRecord(record, binding.remoteCommitSha)
       mtime = record.mtime
     }
+    await assertV4LocalTargetPrecondition(this.localIo, targetPrecondition)
     this.report({ phase: "applying", currentPath: change.path, currentDirection: "pull" })
-    if (change.kind === "rename" && change.previousPath) await trashV4LocalUserFile(this.localIo, change.previousPath)
+    if (change.kind === "rename" && change.previousPath) {
+      await assertV4LocalTargetPrecondition(this.localIo, {
+        path: change.previousPath, exists: true, size: change.before?.size, mtime: change.before?.mtime,
+      })
+      await trashV4LocalUserFile(this.localIo, change.previousPath)
+    }
     await this.localIo.write(change.path, bytes, mtime)
     if (!binding.stage) this.localReadCache.set(change.path, bytes)
     onCompleted()

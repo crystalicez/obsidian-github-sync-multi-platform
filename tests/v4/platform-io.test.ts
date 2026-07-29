@@ -76,3 +76,19 @@ test("desktop dynamic Node IO is externalized and mobile minimum stays feature-g
   assert.equal(io.capabilities.requiresObsidian1123ForAppend, false);
   assert.equal(io.capabilities.boundedAppend, false);
 });
+
+test("desktop stage commit swaps through backup and verifies the final target", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "v4-stage-commit-"));
+  const stagePath = path.join(root, "stage.bin");
+  const targetPath = path.join(root, "target.bin");
+  await writeFile(stagePath, new Uint8Array([9, 8, 7, 6]));
+  await writeFile(targetPath, new Uint8Array([1, 2, 3]));
+  const io = createV4PlatformIo({ platform: "desktop", resolveDesktopPath: value => value });
+  await io.commitStage(stagePath, targetPath, {
+    expectedTarget: { exists: true, size: 3 },
+    expectedStageSize: 4,
+    expectedStageSha256: "63d987d1c6d69751c17297f410f5b3547a65d096a8993b35bcb4f9cad054f176",
+  });
+  assert.deepEqual(new Uint8Array(await readFile(targetPath)), new Uint8Array([9, 8, 7, 6]));
+  await assert.rejects(readFile(stagePath));
+});

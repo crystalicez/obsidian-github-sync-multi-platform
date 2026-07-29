@@ -189,3 +189,24 @@ test("v4 encrypted history follows one fileId across file and folder renames", a
   assert.equal(new Set(versions.map(version => (version.change.after ?? version.change.before)!.remotePath)).size, 1);
   assert.equal((versions.at(-1)!.change.after ?? versions.at(-1)!.change.before)!.remotePath, initial.remotePath);
 });
+
+test("v4 history refuses an oversized preview before loading blob bytes", async () => {
+  let blobReads = 0;
+  const github = {
+    async listCommits() { return []; },
+    async getFileBytes() { return null; },
+    async getGitCommit(sha: string) { return { sha, treeSha: "tree", parentShas: [] }; },
+    async getTreeAt() { return { sha: "tree", url: "", truncated: false, tree: [{ path: "huge.bin", mode: "100644", type: "blob" as const, sha: "huge", size: 6 * 1024 * 1024, url: "" }] }; },
+    async getBlob() { blobReads++; return new Uint8Array(6 * 1024 * 1024); },
+  };
+  const service = new V4HistoryService({ github, config: { formatVersion: V4_FORMAT_VERSION, mode: "plaintext", repoId: "o/r#main" } });
+  const commit = { sha: "c1", message: "obsidian-sync-v4:j1", authorName: "A", authoredAt: "", parentShas: [], source: "plugin" as const, journalId: "j1" };
+  await assert.rejects(service.previewChange(commit, {
+    source: "plugin",
+    fileId: "huge",
+    kind: "create",
+    path: "huge.bin",
+    after: { remotePath: "huge.bin", sha: "huge", size: 6 * 1024 * 1024 },
+  }), /preview.*limit|too large/iu);
+  assert.equal(blobReads, 0);
+});

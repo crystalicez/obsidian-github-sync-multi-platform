@@ -3,6 +3,7 @@ import test from "node:test";
 import { buildV4PartPaths, joinAndVerifyV4Parts, splitV4Parts } from "../../src/lib/v4/large-files";
 import { buildV4JournalPages, fileVersionsFromV4Journals } from "../../src/lib/v4/history-journal";
 import { sha256Hex } from "../../src/lib/bytes";
+import { V4StorageCodec } from "../../src/lib/v4/storage-codec";
 
 test("v4 large-file helpers create ordered parts and verify the full hash", async () => {
   const bytes = new Uint8Array([1, 2, 3, 4, 5, 6, 7]);
@@ -29,4 +30,25 @@ test("v4 journals page large changes and preserve file history across rename", (
 
   assert.equal(pages.length, 2);
   assert.deepEqual(versions.map(version => version.path), ["old.md", "new.md"]);
+});
+
+test("v4 whole-buffer codec read remains available for bounded history compatibility", async () => {
+  const codec = new V4StorageCodec({ mode: "plaintext", pathLayout: "plaintext-v1" });
+  const first = new Uint8Array([1, 2, 3]);
+  const second = new Uint8Array([4, 5]);
+  const plaintext = new Uint8Array([...first, ...second]);
+  const record = {
+    pathId: "path",
+    fileId: "file",
+    plaintextSha256: await sha256Hex(plaintext),
+    size: plaintext.byteLength,
+    mtime: 1,
+    remoteVersion: "v1",
+    remotePath: "unused",
+    storage: "chunked" as const,
+    partPaths: ["part-1", "part-2"],
+  };
+  const parts = new Map([["part-1", first], ["part-2", second]]);
+
+  assert.deepEqual(await codec.read(record, async path => parts.get(path)!), plaintext);
 });

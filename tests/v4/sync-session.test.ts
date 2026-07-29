@@ -18,6 +18,7 @@ import { DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES, type V4ContentHandle, type V4Con
 import { planV4PackGroups } from "../../src/lib/v4/pack-planner";
 import { waitForCondition } from "../helpers/wait-for";
 import { V4SourceChangedError } from "../../src/lib/v4/object-stream";
+import { createV4StagingStore, type V4StageRef } from "../../src/lib/v4/staging-store";
 
 const enc = (value: string) => new TextEncoder().encode(value);
 const dec = (value: Uint8Array) => new TextDecoder().decode(value);
@@ -49,6 +50,27 @@ class MemoryVault implements V4SessionVault {
   files = new Map<string, { bytes: Uint8Array; mtime: number }>();
   operations: string[] = [];
   listCount = 0;
+  private stageChunks = new Map<string, Uint8Array[]>();
+  staging = createV4StagingStore({
+    root: "private/stage",
+    wholeBufferCeilingBytes: DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES,
+    backend: {
+      boundedAppend: true,
+      write: async (path, bytes) => { this.stageChunks.set(path, [new Uint8Array(bytes)]); },
+      append: async (path, bytes) => { (this.stageChunks.get(path) ?? []).push(new Uint8Array(bytes)); },
+      remove: async path => { this.stageChunks.delete(path); },
+      openSource: async (path, size) => {
+        const owner = this;
+        return { size, async *chunks(chunkBytes: number) {
+          for (const stored of owner.stageChunks.get(path) ?? []) {
+            for (let offset = 0; offset < stored.byteLength; offset += chunkBytes) yield stored.subarray(offset, Math.min(stored.byteLength, offset + chunkBytes));
+          }
+        } };
+      },
+      freeBytes: async () => Number.MAX_SAFE_INTEGER,
+    },
+    randomId: () => `stage${this.stageChunks.size + 1}`,
+  });
   async listFiles() { this.listCount++; return [...this.files].map(([path, file]) => ({ path, size: file.bytes.byteLength, mtime: file.mtime })); }
   async stat(path: string) { const file = this.files.get(path); return file ? { path, size: file.bytes.byteLength, mtime: file.mtime } : null; }
   async read(path: string) { this.operations.push(`read:${path}`); return new Uint8Array(this.files.get(path)!.bytes); }
@@ -64,6 +86,16 @@ class MemoryVault implements V4SessionVault {
         }
       },
     };
+  }
+  async commitStage({ stage, path }: { stage: V4StageRef; path: string }) {
+    const source = await this.staging.open(stage);
+    const chunks: Uint8Array[] = []; let total = 0;
+    for await (const chunk of source.chunks(4 * 1024 * 1024)) { chunks.push(new Uint8Array(chunk)); total += chunk.byteLength; }
+    const bytes = new Uint8Array(total); let offset = 0;
+    for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+    this.operations.push(`commit-stage:${path}`);
+    this.files.set(path, { bytes, mtime: stage.mtime });
+    await this.staging.remove(stage);
   }
   async write(path: string, bytes: Uint8Array, mtime?: number) { this.operations.push(`write:${path}`); this.files.set(path, { bytes: new Uint8Array(bytes), mtime: mtime ?? Date.now() }); }
   async delete(path: string) { this.operations.push(`delete:${path}`); this.files.delete(path); }
@@ -2390,7 +2422,7 @@ test("v4 keep-both staged copy does not trigger a second changed-path stat resca
   }).sync({ operation: "normal", allowThresholdOverride: false, changes: [{ type: "modify", path: "conflict.md", mtime: 3 }] });
 
   const copyPath = [...fixture.localVault.files.keys()].find(path => path.includes(".conflict-remote-"));
-  assert.equal(statCalls, 3, `expected initial stat plus pre/post hash snapshot checks only, got ${statCalls}`);
+  assert.equal(statCalls, 4, `expected initial stat, pre/post hash checks, and final pull precondition only, got ${statCalls}`);
   assert.ok(copyPath);
   assert.equal(dec(fixture.localVault.files.get(copyPath!)!.bytes), "remote:conflict.md");
   assert.equal(dec(fixture.github.files.get(copyPath!)!), "remote:conflict.md");
@@ -2517,4 +2549,78 @@ test("v4 changed pack member aborts before the first pack blob candidate or ref 
   assert.equal(github.blobs.size, 0);
   assert.equal(github.commits.size, 0);
   assert.equal(github.ref, null);
+});
+
+
+test("v4 pull preserves a local user edit that appears while remote bytes are in flight", async () => {
+  const github = new MemoryGitHub();
+  const remoteVault = new MemoryVault();
+  remoteVault.files.set("note.md", { bytes: enc("base"), mtime: 1 });
+  const remoteIndex = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "remote", mode: "plaintext" });
+  await new V4SyncSession({ github, vault: remoteVault, index: remoteIndex, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "forcePush", allowThresholdOverride: false });
+
+  const localIndex = structuredClone(remoteIndex);
+  localIndex.deviceId = "local";
+  const localVault = new MemoryVault();
+  localVault.files.set("note.md", { bytes: enc("base"), mtime: 1 });
+
+  remoteVault.files.set("note.md", { bytes: enc("remote-new"), mtime: 2 });
+  await new V4SyncSession({ github, vault: remoteVault, index: remoteIndex, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "normal", allowThresholdOverride: false, changes: [{ type: "modify", path: "note.md", mtime: 2 }] });
+
+  const originalGetFileBytes = github.getFileBytes.bind(github);
+  let injected = false;
+  github.getFileBytes = async (path: string, ref?: string) => {
+    if (!injected && path === "note.md") {
+      injected = true;
+      localVault.files.set("note.md", { bytes: enc("user-edit"), mtime: 99 });
+    }
+    return originalGetFileBytes(path, ref);
+  };
+
+  await assert.rejects(
+    new V4SyncSession({ github, vault: localVault, index: localIndex, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+      .sync({ operation: "normal", allowThresholdOverride: false }),
+    /local target changed/iu,
+  );
+  assert.equal(dec(localVault.files.get("note.md")!.bytes), "user-edit");
+});
+
+
+test("v4 pull rename preserves an old-path user edit that appears while remote bytes are in flight", async () => {
+  const github = new MemoryGitHub();
+  const remoteVault = new MemoryVault();
+  remoteVault.files.set("old.md", { bytes: enc("base"), mtime: 1 });
+  const remoteIndex = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "remote", mode: "plaintext" });
+  await new V4SyncSession({ github, vault: remoteVault, index: remoteIndex, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "forcePush", allowThresholdOverride: false });
+
+  const localIndex = structuredClone(remoteIndex);
+  localIndex.deviceId = "local";
+  const localVault = new MemoryVault();
+  localVault.files.set("old.md", { bytes: enc("base"), mtime: 1 });
+
+  const old = remoteVault.files.get("old.md")!;
+  remoteVault.files.delete("old.md");
+  remoteVault.files.set("new.md", { ...old, mtime: 2 });
+  await new V4SyncSession({ github, vault: remoteVault, index: remoteIndex, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "normal", allowThresholdOverride: false, changes: [{ type: "rename", oldPath: "old.md", path: "new.md", mtime: 2 }] });
+
+  const originalGetFileBytes = github.getFileBytes.bind(github);
+  let injected = false;
+  github.getFileBytes = async (path: string, ref?: string) => {
+    if (!injected && path === "new.md") {
+      injected = true;
+      localVault.files.set("old.md", { bytes: enc("user-edit"), mtime: 99 });
+    }
+    return originalGetFileBytes(path, ref);
+  };
+
+  await assert.rejects(
+    new V4SyncSession({ github, vault: localVault, index: localIndex, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+      .sync({ operation: "normal", allowThresholdOverride: false }),
+    /local target changed/iu,
+  );
+  assert.equal(dec(localVault.files.get("old.md")!.bytes), "user-edit");
 });
