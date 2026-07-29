@@ -19,3 +19,20 @@ test("v4 planner isolates one change across 100,000 logical files", () => {
 test("v4 predicts part storage for a 5 GiB logical file without allocating it", () => {
   assert.equal(shouldUseV4Parts(5 * 1024 * 1024 * 1024), true);
 });
+
+import { boundedMap } from "../../src/lib/v4/bounded-map";
+
+test("v4 bounded mapping holds 10,000 scan-like jobs to the configured concurrency", async () => {
+  const items = Array.from({ length: 10_000 }, (_, index) => index);
+  let active = 0;
+  let peak = 0;
+  const output = await boundedMap(items, 8, async value => {
+    active++;
+    peak = Math.max(peak, active);
+    if ((value & 255) === 0) await new Promise<void>(resolve => setImmediate(resolve));
+    active--;
+    return value;
+  });
+  assert.equal(peak <= 8, true);
+  assert.deepEqual(output, items);
+});

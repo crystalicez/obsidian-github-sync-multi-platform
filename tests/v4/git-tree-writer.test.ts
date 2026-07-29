@@ -256,3 +256,24 @@ test("V4 publication base rejects a stale expected head before uploads or bootst
   assert.deepEqual(github.createdRefs, []);
   assert.deepEqual(github.updatedRefs, []);
 });
+
+
+test("V4 tree writer wraps each Git blob creation in the supplied transport reservation", async () => {
+  const github = new MemoryV4GitHub();
+  const events: string[] = [];
+  await publishV4TreeChanges(github, {
+    message: "obsidian-sync-v4:transport-budget",
+    files: [
+      { path: "A.enc", bytes: bytes("A") },
+      { path: "B.enc", bytes: bytes("BB") },
+    ],
+    withBlobTransport: async (payload, task) => {
+      events.push(`reserve:${payload.byteLength}`);
+      const sha = await task();
+      events.push(`release:${payload.byteLength}`);
+      return sha;
+    },
+  });
+  assert.equal(events.filter(event => event.startsWith("reserve:")).length, 2);
+  assert.equal(events.filter(event => event.startsWith("release:")).length, 2);
+});

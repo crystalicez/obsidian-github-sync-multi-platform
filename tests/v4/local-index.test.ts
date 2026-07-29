@@ -158,6 +158,87 @@ test("v4 local index invalidates stale, mis-bucketed, mis-keyed, and malformed c
   }
 });
 
+test("v4 local index treats malformed header JSON as invalid rebuild state", async () => {
+  const adapter = {
+    async read(_path: string) { return "{not-json"; },
+    async write(_path: string, _value: string) {},
+    async exists(_path: string) { return true; },
+    async mkdir(_path: string) {},
+  };
+
+  const loaded = await loadV4LocalIndex(adapter, "index");
+
+  assert.equal(loaded.remoteCommitSha, undefined);
+  assert.equal(loaded.generation, 0);
+  assert.deepEqual(loaded.shardHashes, {});
+  assert.deepEqual(loaded.shards, {});
+});
+
+test("v4 local index treats a structurally corrupt valid-JSON header as invalid rebuild state", async () => {
+  const serializedHeader = JSON.stringify({
+    formatVersion: 4,
+    repoId: "o/r#main",
+    deviceId: "d",
+    mode: "plaintext",
+    pathLayout: "plaintext-v1",
+    remoteCommitSha: "must-not-be-trusted",
+    epoch: 1,
+    generation: "broken",
+    shardHashes: {},
+  });
+  const adapter = {
+    async read(_path: string) { return serializedHeader; },
+    async write(_path: string, _value: string) {},
+    async exists(_path: string) { return true; },
+    async mkdir(_path: string) {},
+  };
+
+  const loaded = await loadV4LocalIndex(adapter, "index");
+
+  assert.equal(loaded.remoteCommitSha, undefined);
+  assert.equal(loaded.generation, 0);
+  assert.deepEqual(loaded.shardHashes, {});
+});
+
+test("v4 local index rejects a header-to-shard mixed generation through the advertised shard hash", async () => {
+  const pathId = `ab${"0".repeat(62)}`;
+  const stored = new Map<string, string>([
+    ["index/index.json", JSON.stringify({
+      formatVersion: 4,
+      repoId: "o/r#main",
+      deviceId: "d",
+      mode: "plaintext",
+      pathLayout: "plaintext-v1",
+      remoteCommitSha: "generation-1-commit",
+      epoch: 1,
+      generation: 1,
+      shardHashes: { ab: "generation-1-hash" },
+    })],
+    ["index/shards/ab.json", JSON.stringify({
+      bucket: "ab",
+      hash: "generation-2-hash",
+      records: {
+        [pathId]: {
+          path: "note.md", pathId, fileId: "file-ab", plaintextSha256: "sha-v2", size: 1, mtime: 2,
+          remoteVersion: "generation-2", remotePath: "note.md", storage: "single",
+        },
+      },
+    })],
+  ]);
+  const adapter = {
+    async read(path: string) { return stored.get(path)!; },
+    async write(path: string, value: string) { stored.set(path, value); },
+    async exists(path: string) { return stored.has(path); },
+    async mkdir(_path: string) {},
+  };
+
+  const loaded = await loadV4LocalIndex(adapter, "index");
+
+  assert.equal(loaded.remoteCommitSha, undefined);
+  assert.equal(loaded.generation, 0);
+  assert.deepEqual(loaded.shardHashes, {});
+});
+
 test("v4 local index propagates unexpected shard read errors", async () => {
   const header = JSON.stringify({
     formatVersion: 4,

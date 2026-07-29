@@ -7,7 +7,12 @@ export interface V4ConflictResolution {
 }
 
 const TEXT_EXTENSIONS = new Set(["md", "txt", "json", "canvas", "yaml", "yml", "csv", "css", "scss", "js", "ts", "tsx", "jsx", "html", "xml"]);
-const MAX_MERGE_BYTES = 2 * 1024 * 1024;
+export const V4_MAX_MERGE_BYTES = 2 * 1024 * 1024;
+
+export function canAttemptV4TextMerge(path: string, sizes: readonly number[]): boolean {
+  const extension = path.split(".").at(-1)?.toLowerCase() ?? "";
+  return TEXT_EXTENSIONS.has(extension) && sizes.every(size => Number.isSafeInteger(size) && size >= 0 && size <= V4_MAX_MERGE_BYTES);
+}
 
 interface LineChange { start: number; end: number; replacement: string[]; }
 
@@ -43,7 +48,7 @@ function cleanThreeWayMerge(baseText: string, localText: string, remoteText: str
 }
 
 function decodeText(bytes: Uint8Array): string | null {
-  if (bytes.byteLength > MAX_MERGE_BYTES) return null;
+  if (bytes.byteLength > V4_MAX_MERGE_BYTES) return null;
   try {
     return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
   } catch {
@@ -67,8 +72,8 @@ export function resolveV4Conflict(input: {
     return { action: "keep-local-copy-remote" };
   }
   if (input.policy === "merge") {
-    const extension = input.path.split(".").at(-1)?.toLowerCase() ?? "";
-    if (TEXT_EXTENSIONS.has(extension) && input.baseBytes && input.localBytes && input.remoteBytes) {
+    if (input.baseBytes && input.localBytes && input.remoteBytes
+      && canAttemptV4TextMerge(input.path, [input.baseBytes.byteLength, input.localBytes.byteLength, input.remoteBytes.byteLength])) {
       const base = decodeText(input.baseBytes);
       const local = decodeText(input.localBytes);
       const remote = decodeText(input.remoteBytes);

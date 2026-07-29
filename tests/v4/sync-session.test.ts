@@ -51,6 +51,7 @@ class MemoryVault implements V4SessionVault {
   async read(path: string) { this.operations.push(`read:${path}`); return new Uint8Array(this.files.get(path)!.bytes); }
   async write(path: string, bytes: Uint8Array, mtime?: number) { this.operations.push(`write:${path}`); this.files.set(path, { bytes: new Uint8Array(bytes), mtime: mtime ?? Date.now() }); }
   async delete(path: string) { this.operations.push(`delete:${path}`); this.files.delete(path); }
+  async trash(path: string) { this.operations.push(`trash:${path}`); this.files.delete(path); }
 }
 
 class MemoryGitHub {
@@ -839,10 +840,63 @@ test("v4 session force-pushes one atomic commit, no-ops unchanged, and force-pul
   assert.equal(pulled.changedFiles, 3);
   assert.equal(dec(target.files.get("a.md")!.bytes), "one");
   assert.equal(target.files.has("old.md"), false);
+  assert.equal(target.operations.includes("trash:old.md"), true);
+  assert.equal(target.operations.some(operation => operation === "delete:old.md"), false);
   assert.equal(forcePullEvents.some(event => (event.push?.completed ?? 0) > 0), false);
   assert.equal(forcePullEvents.some(event => event.currentDirection === "push"), false);
   assert.equal(forcePullEvents.some(event => (event.pull?.total ?? 0) > 0), true);
   assert.deepEqual(lastDirectional(forcePullEvents, "pull"), { completed: 3, total: 3 });
+});
+
+test("v4 normal pull routes remote deletion through local trash semantics", async () => {
+  const github = new MemoryGitHub();
+  const source = new MemoryVault();
+  const sourceIndex = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "source", mode: "plaintext" });
+  source.files.set("remote-delete.md", { bytes: enc("one"), mtime: 1 });
+  await new V4SyncSession({ github, vault: source, index: sourceIndex, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "forcePush", allowThresholdOverride: false });
+
+  const target = new MemoryVault();
+  const targetIndex = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "target", mode: "plaintext" });
+  await new V4SyncSession({ github, vault: target, index: targetIndex, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "forcePull", allowThresholdOverride: false });
+  target.operations.length = 0;
+
+  source.files.delete("remote-delete.md");
+  await new V4SyncSession({ github, vault: source, index: sourceIndex, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "normal", allowThresholdOverride: false, changes: [{ type: "delete", path: "remote-delete.md" }] });
+  await new V4SyncSession({ github, vault: target, index: targetIndex, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "normal", allowThresholdOverride: false });
+
+  assert.equal(target.files.has("remote-delete.md"), false);
+  assert.deepEqual(target.operations.filter(operation => /^(?:trash|delete):remote-delete\.md$/u.test(operation)), ["trash:remote-delete.md"]);
+});
+
+test("v4 normal pull routes rename cleanup through local trash semantics", async () => {
+  const github = new MemoryGitHub();
+  const source = new MemoryVault();
+  const sourceIndex = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "source", mode: "plaintext" });
+  source.files.set("old-name.md", { bytes: enc("rename-me"), mtime: 1 });
+  await new V4SyncSession({ github, vault: source, index: sourceIndex, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "forcePush", allowThresholdOverride: false });
+
+  const target = new MemoryVault();
+  const targetIndex = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "target", mode: "plaintext" });
+  await new V4SyncSession({ github, vault: target, index: targetIndex, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "forcePull", allowThresholdOverride: false });
+  target.operations.length = 0;
+
+  const original = source.files.get("old-name.md")!;
+  source.files.delete("old-name.md");
+  source.files.set("new-name.md", { ...original, mtime: 2 });
+  await new V4SyncSession({ github, vault: source, index: sourceIndex, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "normal", allowThresholdOverride: false, changes: [{ type: "rename", oldPath: "old-name.md", path: "new-name.md", mtime: 2 }] });
+  await new V4SyncSession({ github, vault: target, index: targetIndex, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "normal", allowThresholdOverride: false });
+
+  assert.equal(target.files.has("old-name.md"), false);
+  assert.equal(dec(target.files.get("new-name.md")!.bytes), "rename-me");
+  assert.deepEqual(target.operations.filter(operation => /^(?:trash|delete):old-name\.md$/u.test(operation)), ["trash:old-name.md"]);
 });
 
 test("v4 session validates only the config when the remote commit is unchanged", async () => {
@@ -881,7 +935,7 @@ test("v4 encrypted matching-SHA sync authenticates the remote head before publis
   );
 
   assert.deepEqual({ ref: github.ref!.sha, blobs: github.blobs.size, trees: github.trees.size, commits: github.commits.size, messages: github.commitMessages.length }, before);
-  assert.equal(vault.operations.some(operation => operation.startsWith("write:") || operation.startsWith("delete:")), false);
+  assert.equal(vault.operations.some(operation => operation.startsWith("write:") || operation.startsWith("delete:") || operation.startsWith("trash:")), false);
   assert.equal(dec(vault.files.get("secret.md")!.bytes), "modified under key B");
 });
 
@@ -904,7 +958,7 @@ test("v4 Force Push cannot overwrite an encrypted remote without authenticating 
   );
 
   assert.deepEqual({ ref: github.ref!.sha, blobs: github.blobs.size, trees: github.trees.size, commits: github.commits.size }, before);
-  assert.equal(plaintextVault.operations.some(operation => operation.startsWith("write:") || operation.startsWith("delete:")), false);
+  assert.equal(plaintextVault.operations.some(operation => operation.startsWith("write:") || operation.startsWith("delete:") || operation.startsWith("trash:")), false);
 });
 
 test("v4 encrypted correct-key matching-SHA no-op reads only config and authenticated head", async () => {
@@ -1098,7 +1152,7 @@ test("v4 resolves every conflict and exact total before an ordinary pull mutates
   prompt.resolve({ action: "use-remote" });
   const result = await run;
 
-  assert.deepEqual(operationsBeforeDecision.filter(operation => /^(?:write|delete):/u.test(operation)), []);
+  assert.deepEqual(operationsBeforeDecision.filter(operation => /^(?:write|delete|trash):/u.test(operation)), []);
   assert.equal(eventsBeforeDecision.some(event => event.phase === "downloading" || event.phase === "applying"), false);
   assert.equal(eventsBeforeDecision.some(event => (event.pull?.completed ?? 0) > 0), false);
   const exactIndex = events.findIndex(event => event.phase === "resolving-conflicts"
@@ -2205,4 +2259,124 @@ test("v4 authenticated remote duplicate paths and fabricated pathIds reject befo
       assert.deepEqual({ ref: github.ref!.sha, blobs: github.blobs.size, trees: github.trees.size, commits: github.commits.size }, before);
     }
   }
+});
+
+test("v4 newer local conflict resolves from metadata without fetching the remote body", async () => {
+  const fixture = await divergedConflictFixture(["conflict.md"]);
+  fixture.github.readPaths.length = 0;
+  fixture.github.readRefs.length = 0;
+  fixture.localVault.operations.length = 0;
+
+  const result = await new V4SyncSession({
+    github: fixture.github,
+    vault: fixture.localVault,
+    index: fixture.localIndex,
+    config: config(),
+    conflictPolicy: "newer",
+    abortChangePercent: 0,
+  }).sync({ operation: "normal", allowThresholdOverride: false, changes: [{ type: "modify", path: "conflict.md", mtime: 3 }] });
+
+  assert.equal(result.mode, "push");
+  assert.equal(fixture.github.readPaths.filter(path => path === "conflict.md").length, 0);
+  assert.equal(dec(fixture.github.files.get("conflict.md")!), "local:conflict.md");
+});
+
+test("v4 keep-both conflict fetches the remote body only after exact totals are final", async () => {
+  const fixture = await divergedConflictFixture(["conflict.md"]);
+  const timeline: Array<{ kind: "progress"; event: V4SyncProgressPatch } | { kind: "body-read" }> = [];
+  const getFileBytes = fixture.github.getFileBytes.bind(fixture.github);
+  fixture.github.getFileBytes = async (path, ref) => {
+    if (path === "conflict.md") timeline.push({ kind: "body-read" });
+    return getFileBytes(path, ref);
+  };
+
+  await new V4SyncSession({
+    github: fixture.github,
+    vault: fixture.localVault,
+    index: fixture.localIndex,
+    config: config(),
+    conflictPolicy: "copy",
+    abortChangePercent: 0,
+    now: () => 100,
+    onProgress: event => timeline.push({ kind: "progress", event: structuredClone(event) }),
+  }).sync({ operation: "normal", allowThresholdOverride: false, changes: [{ type: "modify", path: "conflict.md", mtime: 3 }] });
+
+  const exactIndex = timeline.findIndex(item => item.kind === "progress"
+    && item.event.phase === "resolving-conflicts"
+    && item.event.pull?.total === 1 && item.event.push?.total === 2);
+  const bodyReadIndex = timeline.findIndex(item => item.kind === "body-read");
+  assert.ok(exactIndex >= 0 && bodyReadIndex > exactIndex, `exact=${exactIndex}, body=${bodyReadIndex}`);
+});
+
+test("v4 merge fallback for a non-text conflict never reads the historical base body", async () => {
+  const fixture = await divergedConflictFixture(["conflict.bin"]);
+  fixture.github.readPaths.length = 0;
+  fixture.github.readRefs.length = 0;
+
+  await new V4SyncSession({
+    github: fixture.github,
+    vault: fixture.localVault,
+    index: fixture.localIndex,
+    config: config(),
+    conflictPolicy: "merge",
+    abortChangePercent: 0,
+    now: () => 100,
+  }).sync({ operation: "normal", allowThresholdOverride: false, changes: [{ type: "modify", path: "conflict.bin", mtime: 3 }] });
+
+  const contentReads = fixture.github.readPaths
+    .map((path, index) => ({ path, ref: fixture.github.readRefs[index] }))
+    .filter(read => read.path === "conflict.bin");
+  assert.equal(contentReads.length, 1, JSON.stringify(contentReads));
+});
+
+test("v4 merged conflict output does not trigger a second changed-path stat rescan", async () => {
+  const fixture = await divergedConflictFixture(["A.md", "B.md"]);
+  let statCalls = 0;
+  const stat = fixture.localVault.stat.bind(fixture.localVault);
+  fixture.localVault.stat = async path => { statCalls++; return stat(path); };
+
+  const result = await new V4SyncSession({
+    github: fixture.github,
+    vault: fixture.localVault,
+    index: fixture.localIndex,
+    config: config(),
+    conflictPolicy: "ask",
+    abortChangePercent: 0,
+    askConflict: async input => input.path === "A.md"
+      ? { action: "merged", mergedBytes: enc("merged:A.md") }
+      : { action: "use-local" },
+  }).sync({
+    operation: "normal",
+    allowThresholdOverride: false,
+    changes: ["A.md", "B.md"].map(path => ({ type: "modify" as const, path, mtime: 3 })),
+  });
+
+  assert.equal(result.pushedFiles, 2);
+  assert.equal(statCalls, 2, `expected one initial stat per changed path, got ${statCalls}`);
+  assert.equal(dec(fixture.localVault.files.get("A.md")!.bytes), "merged:A.md");
+  assert.equal(dec(fixture.github.files.get("A.md")!), "merged:A.md");
+});
+
+test("v4 keep-both staged copy does not trigger a second changed-path stat rescan", async () => {
+  const fixture = await divergedConflictFixture(["conflict.md"]);
+  let statCalls = 0;
+  const stat = fixture.localVault.stat.bind(fixture.localVault);
+  fixture.localVault.stat = async path => { statCalls++; return stat(path); };
+
+  const result = await new V4SyncSession({
+    github: fixture.github,
+    vault: fixture.localVault,
+    index: fixture.localIndex,
+    config: config(),
+    conflictPolicy: "copy",
+    abortChangePercent: 0,
+    now: () => 100,
+  }).sync({ operation: "normal", allowThresholdOverride: false, changes: [{ type: "modify", path: "conflict.md", mtime: 3 }] });
+
+  const copyPath = [...fixture.localVault.files.keys()].find(path => path.includes(".conflict-remote-"));
+  assert.equal(statCalls, 1, `expected only the initial changed-path stat, got ${statCalls}`);
+  assert.ok(copyPath);
+  assert.equal(dec(fixture.localVault.files.get(copyPath!)!.bytes), "remote:conflict.md");
+  assert.equal(dec(fixture.github.files.get(copyPath!)!), "remote:conflict.md");
+  assert.equal(result.pushedFiles, 2);
 });

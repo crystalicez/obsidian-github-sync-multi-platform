@@ -1,7 +1,7 @@
-import { Modal, Notice, TFile } from "obsidian"
+import { Modal, Notice, Platform, TFile } from "obsidian"
 import type FastSync from "../../main"
 import { fromBase64Url, randomBytes, toBase64Url } from "../bytes"
-import { readVaultFileBytes, writeVaultFileBytes, deleteVaultFileIfExists } from "../vault"
+import { readVaultFileBytes, writeVaultFileBytes, trashVaultFileIfExists } from "../vault"
 import { deriveV4Keyring } from "./crypto"
 import {
   createEmptyV4LocalIndex,
@@ -18,9 +18,13 @@ import { V4SyncCoordinator, type V4QueuedChange, type V4SyncRequest } from "./sy
 import { expectedV4PathLayout, V4_FORMAT_VERSION, V4_CONFIG_PATH, type V4RemoteConfig, type V4StorageMode } from "./protocol-types"
 import { V4HistoryService } from "./history-service"
 import type { V4SessionVault } from "./local-io"
+import { createV4ContentSource, createV4WholeBufferContentSource, DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES, type V4ContentSource } from "./content-source"
+import { createV4PlatformIo, type V4BinaryAdapterLike, type V4PlatformIo } from "./platform-io"
+import { createV4StagingStore, type V4StagingStore } from "./staging-store"
 import { V4ProgressStore, type V4SyncProgressSnapshot } from "./progress"
 
 const V4_INDEX_ROOT = "github-sync-v4-index"
+const V4_STAGE_ROOT = "github-sync-v4-stage"
 const fallbackStores = new WeakMap<object, Map<string, string>>()
 
 export function selectV4RuntimeConfig(discovered: V4RemoteConfig | null, mode: V4StorageMode, repoId: string): V4RemoteConfig {
@@ -48,6 +52,50 @@ function createMemoryAdapter(owner: object): V4LocalIndexAdapter {
   }
 }
 
+
+function createRuntimePlatformIo(plugin: FastSync): { io: V4PlatformIo; stageRoot: string } {
+  const vault = plugin.app.vault as FastSync["app"]["vault"] & {
+    configDir?: string
+    adapter?: V4BinaryAdapterLike & { getFullPath?(path: string): string }
+  }
+  const adapter = vault.adapter
+  const configDir = vault.configDir || ".obsidian"
+  const stageRoot = `${configDir}/plugins/${plugin.manifest.id}/${V4_STAGE_ROOT}`
+  const desktop = Platform.isDesktopApp === true
+  const resolveDesktopPath = desktop && typeof adapter?.getFullPath === "function"
+    ? (path: string) => adapter.getFullPath!(path)
+    : undefined
+  return {
+    io: createV4PlatformIo({
+      platform: desktop ? "desktop" : "mobile",
+      adapter,
+      resolveDesktopPath,
+    }),
+    stageRoot,
+  }
+}
+
+function createRuntimeStagingStore(platformIo: V4PlatformIo, stageRoot: string): V4StagingStore {
+  const ceiling = DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES
+  return createV4StagingStore({
+    root: stageRoot,
+    wholeBufferCeilingBytes: ceiling,
+    backend: {
+      boundedAppend: platformIo.capabilities.boundedAppend,
+      write: (path, bytes) => platformIo.writeStage(path, bytes),
+      append: (path, bytes) => platformIo.appendStage(path, bytes),
+      remove: path => platformIo.removeStage(path),
+      freeBytes: path => platformIo.freeBytes(path),
+      openSource: async (path, size): Promise<V4ContentSource> => {
+        if (size > ceiling) return platformIo.openBoundedSource(path, size)
+        const bytes = await platformIo.readWhole(path)
+        if (bytes.byteLength !== size) throw new Error(`V4 staged content size changed: expected ${size}, got ${bytes.byteLength}.`)
+        return createV4WholeBufferContentSource(bytes)
+      },
+    },
+  })
+}
+
 function createIndexAdapter(plugin: FastSync): V4LocalIndexAdapter {
   const vault = plugin.app.vault as FastSync["app"]["vault"] & {
     configDir?: string
@@ -68,11 +116,16 @@ export class V4PluginRuntime {
   private readonly coordinator: V4SyncCoordinator
   private readonly adapter: V4LocalIndexAdapter
   private readonly progressStore = new V4ProgressStore()
+  private readonly platformIo: V4PlatformIo
+  private readonly stagingStore: V4StagingStore
   private debounceRunActive = false
   private disposed = false
 
   constructor(private readonly plugin: FastSync) {
     this.adapter = createIndexAdapter(plugin)
+    const executionIo = createRuntimePlatformIo(plugin)
+    this.platformIo = executionIo.io
+    this.stagingStore = createRuntimeStagingStore(this.platformIo, executionIo.stageRoot)
     this.coordinator = new V4SyncCoordinator({
       execute: (request, changes) => this.execute(request, changes),
       notice: message => new Notice(message),
@@ -264,11 +317,24 @@ export class V4PluginRuntime {
         try { await writeVaultFileBytes(this.plugin.app.vault, path, bytes) }
         finally { this.plugin.removeIgnoredFile(path) }
       },
-      delete: async (path: string) => {
+      trash: async (path: string) => {
         this.plugin.addIgnoredFile(path)
-        try { await deleteVaultFileIfExists(this.plugin.app.vault, path) }
+        try { await trashVaultFileIfExists(this.plugin.app.vault, this.plugin.app.fileManager, path) }
         finally { this.plugin.removeIgnoredFile(path) }
       },
+      openContentSource: handle => createV4ContentSource(handle, {
+        wholeBufferCeilingBytes: DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES,
+        readVaultWhole: async path => {
+          const file = this.plugin.app.vault.getAbstractFileByPath(path)
+          if (!(file instanceof TFile)) throw new Error(`Missing local file: ${path}`)
+          return readVaultFileBytes(this.plugin.app.vault, file)
+        },
+        openVaultBounded: this.platformIo.capabilities.boundedRead
+          ? (path, expectedSize) => this.platformIo.openBoundedSource(path, expectedSize)
+          : undefined,
+        openStage: (stageId, expectedSize) => this.stagingStore.open({ stageId, size: expectedSize }),
+      }),
+      staging: this.stagingStore,
     }
   }
 

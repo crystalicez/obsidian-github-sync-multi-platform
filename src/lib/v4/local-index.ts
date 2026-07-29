@@ -59,6 +59,20 @@ function invalidV4LocalIndex(): V4LocalIndex {
   return createEmptyV4LocalIndex({ repoId: "", deviceId: "", mode: "plaintext" });
 }
 
+function isV4LocalIndexHeader(value: unknown): value is V4LocalIndexHeader {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const candidate = value as Partial<V4LocalIndexHeader>;
+  if (candidate.formatVersion !== V4_FORMAT_VERSION) return false;
+  if (typeof candidate.repoId !== "string" || typeof candidate.deviceId !== "string") return false;
+  if (candidate.mode !== "plaintext" && candidate.mode !== "encrypted") return false;
+  if (candidate.pathLayout !== expectedV4PathLayout(candidate.mode)) return false;
+  if (candidate.remoteCommitSha !== undefined && typeof candidate.remoteCommitSha !== "string") return false;
+  if (!Number.isSafeInteger(candidate.epoch) || (candidate.epoch ?? -1) < 0) return false;
+  if (!Number.isSafeInteger(candidate.generation) || (candidate.generation ?? -1) < 0) return false;
+  if (!candidate.shardHashes || typeof candidate.shardHashes !== "object" || Array.isArray(candidate.shardHashes)) return false;
+  return Object.entries(candidate.shardHashes).every(([bucket, hash]) => /^[0-9a-f]{2}$/u.test(bucket) && typeof hash === "string");
+}
+
 function isRecordMap(value: unknown, bucket: string): value is Record<string, V4IndexFileRecord> {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   for (const [recordKey, record] of Object.entries(value)) {
@@ -140,9 +154,19 @@ export async function saveV4LocalIndex(
 export async function loadV4LocalIndex(adapter: V4LocalIndexAdapter, root: string): Promise<V4LocalIndex> {
   const headerPath = join(root, "index.json");
   if (!(await adapter.exists(headerPath))) return invalidV4LocalIndex();
-  const parsed = JSON.parse(await adapter.read(headerPath)) as V4LocalIndexHeader;
-  if (parsed.formatVersion !== V4_FORMAT_VERSION) throw new Error("Unsupported V4 local index version.");
-  if (!parsed.shardHashes || typeof parsed.shardHashes !== "object" || Array.isArray(parsed.shardHashes)) return invalidV4LocalIndex();
+  const serializedHeader = await adapter.read(headerPath);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(serializedHeader);
+  } catch (error) {
+    if (error instanceof SyntaxError) return invalidV4LocalIndex();
+    throw error;
+  }
+  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+    const formatVersion = (parsed as { formatVersion?: unknown }).formatVersion;
+    if (formatVersion !== undefined && formatVersion !== V4_FORMAT_VERSION) throw new Error("Unsupported V4 local index version.");
+  }
+  if (!isV4LocalIndexHeader(parsed)) return invalidV4LocalIndex();
   const index: V4LocalIndex = { ...parsed, shards: {} };
   for (const bucket of Object.keys(index.shardHashes)) {
     const path = join(root, `shards/${bucket}.json`);

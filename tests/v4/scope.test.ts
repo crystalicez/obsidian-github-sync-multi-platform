@@ -29,6 +29,7 @@ test("v4 .obsidian settings are independent and hard exclusions always win", () 
   assert.equal(isPathInV4SyncScope(".obsidian/workspace.json", { ...base, syncObsidianConfig: true }), false);
   assert.equal(isPathInV4SyncScope(".obsidian/workspace-mobile.json", { ...base, syncObsidianConfig: true }), false);
   assert.equal(isPathInV4SyncScope(".obsidian/plugins/encrypted-github-sync-multi-platform/data.json", { ...base, syncPlugins: true }), false);
+  assert.equal(isPathInV4SyncScope(".obsidian/plugins/encrypted-github-sync-multi-platform/github-sync-v4-stage/opaque.bin", { ...base, syncPlugins: true, syncObsidianConfig: true }), false);
   assert.equal(isPathInV4SyncScope(".obsidian-github-sync-v4/head", { ...base, syncObsidianConfig: true, syncPlugins: true }), false);
 });
 

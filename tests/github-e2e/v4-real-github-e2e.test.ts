@@ -164,7 +164,7 @@ class MemoryVault implements V4SessionVault {
     this.set(path, bytes, mtime);
   }
 
-  async delete(path: string) {
+  async trash(path: string) {
     this.files.delete(path);
   }
 }

@@ -10,6 +10,7 @@ export interface V4GitTreeWriteInput {
   onLogicalFileUploadStarted?: (item: V4GitTreeProgressItem) => void;
   onLogicalFileUploaded?: (item: V4GitTreeProgressItem) => void;
   onUploadsComplete?: () => void;
+  withBlobTransport?: (bytes: Uint8Array, task: () => Promise<string>) => Promise<string>;
 }
 export interface V4GitTreeWriteResult {
   previousHeadSha?: string;
@@ -93,7 +94,7 @@ export async function resolveV4PublicationBase(
 
 export async function uploadV4TreeFiles(
   github: V4GitTreeGithub,
-  input: Pick<V4GitTreeWriteInput, "files" | "onLogicalFileUploadStarted" | "onLogicalFileUploaded" | "onUploadsComplete">,
+  input: Pick<V4GitTreeWriteInput, "files" | "onLogicalFileUploadStarted" | "onLogicalFileUploaded" | "onUploadsComplete" | "withBlobTransport">,
 ): Promise<V4UploadedTreeFiles> {
   const progressItemsByFile = input.files.map(file => {
     const seen = new Set<string>();
@@ -116,7 +117,10 @@ export async function uploadV4TreeFiles(
       startedFileIds.add(item.fileId);
       invokeProgressCallback(() => input.onLogicalFileUploadStarted?.(item));
     }
-    const sha = await github.createGitBlob(file.bytes);
+    const createBlob = () => github.createGitBlob(file.bytes);
+    const sha = input.withBlobTransport
+      ? await input.withBlobTransport(file.bytes, createBlob)
+      : await createBlob();
     for (const item of progressItems) {
       const remaining = (remainingBlobsByFileId.get(item.fileId) ?? 1) - 1;
       remainingBlobsByFileId.set(item.fileId, remaining);

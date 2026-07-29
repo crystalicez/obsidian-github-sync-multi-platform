@@ -17,7 +17,7 @@ class HistoryMemoryVault implements V4SessionVault {
   async stat(path: string) { const file = this.files.get(path); return file ? { path, size: file.bytes.byteLength, mtime: file.mtime } : null; }
   async read(path: string) { return new Uint8Array(this.files.get(path)!.bytes); }
   async write(path: string, bytes: Uint8Array, mtime?: number) { this.files.set(path, { bytes: new Uint8Array(bytes), mtime: mtime ?? 0 }); }
-  async delete(path: string) { this.files.delete(path); }
+  async trash(path: string) { this.files.delete(path); }
 }
 
 class HistoryMemoryGitHub {

@@ -110,3 +110,14 @@ Current evidence supports the following decision:
 5. Source-snapshot guard proves a file changed during streaming cannot reach the branch.
 6. Transport-memory budget is measured on the actual Android target before selecting a writer part size.
 7. One disposable GitHub Free large-file run validates request counts/pacing and compares repository growth to the model.
+
+## 7. Task 7 implementation decision
+
+Task 7 keeps the declared `minAppVersion` at `1.11.4` and does not make `appendBinary()` an unconditional runtime requirement.
+
+- Desktop bounded reads use the adapter's public desktop path resolver when present and load Node file I/O lazily only after the desktop capability check succeeds.
+- Desktop staging uses the same lazy desktop path for bounded append and free-space preflight.
+- Mobile staging feature-detects `appendBinary()`. When it exists, the capability record marks that this append path is a 1.12.3+ runtime capability; when it does not exist, large staged append fails instead of falling back to an unbounded whole-buffer write.
+- Mobile bounded reads remain unavailable because Phase 0 did not prove a stable/public bounded-read path. Large mobile vault content therefore raises a capability error instead of calling `readBinary()` for the whole file.
+- Small-file compatibility reads/writes remain allowed only under the explicit whole-buffer ceiling.
+- This implementation is infrastructure only. It does not yet constitute a Windows or Android 5 GiB support claim; source-snapshot guards, streamed remote upload/download, physical-device proof, and GitHub qualification remain later gates.
