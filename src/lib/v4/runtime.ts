@@ -1,6 +1,6 @@
 import { Modal, Notice, Platform, TFile } from "obsidian"
 import type FastSync from "../../main"
-import { fromBase64Url, randomBytes, toBase64Url } from "../bytes"
+import { fromBase64Url, randomBytes, sha256Hex, toBase64Url, utf8ToBytes } from "../bytes"
 import { readVaultFileBytes, writeVaultFileBytes, trashVaultFileIfExists } from "../vault"
 import { deriveV4Keyring } from "./crypto"
 import {
@@ -12,7 +12,7 @@ import {
 } from "./local-index"
 import { decodeV4RemoteConfig } from "./remote-index"
 import { createV4ScopePredicate, isPathInV4SyncScope } from "./scope"
-import { assertV4PathLayoutCompatible, V4ChangeGuardError, V4SyncSession, type V4SyncRunState } from "./sync-session"
+import { assertV4PathLayoutCompatible, V4ChangeGuardError, V4RecoveryReplanRequiredError, V4SyncSession, type V4SyncRunState } from "./sync-session"
 import type { V4ConflictResolution } from "./conflicts"
 import { V4SyncCoordinator, type V4QueuedChange, type V4SyncRequest } from "./sync-coordinator"
 import { expectedV4PathLayout, V4_FORMAT_VERSION, V4_CONFIG_PATH, type V4RemoteConfig, type V4StorageMode } from "./protocol-types"
@@ -22,9 +22,11 @@ import { createV4ContentSource, createV4WholeBufferContentSource, DEFAULT_V4_WHO
 import { createV4PlatformIo, type V4BinaryAdapterLike, type V4PlatformIo } from "./platform-io"
 import { createV4StagingStore, type V4StagingStore } from "./staging-store"
 import { V4ProgressStore, type V4SyncProgressSnapshot } from "./progress"
+import { createV4RecoveryStore, discardV4RecoveryStages, markV4RecoveryIndexCommitted, recoverV4PendingState } from "./recovery-store"
 
 const V4_INDEX_ROOT = "github-sync-v4-index"
 const V4_STAGE_ROOT = "github-sync-v4-stage"
+const V4_RECOVERY_ROOT = "github-sync-v4-recovery"
 const fallbackStores = new WeakMap<object, Map<string, string>>()
 
 export function selectV4RuntimeConfig(discovered: V4RemoteConfig | null, mode: V4StorageMode, repoId: string): V4RemoteConfig {
@@ -376,7 +378,7 @@ export class V4PluginRuntime {
       if (!this.plugin.githubClient) throw new Error("GitHub connection is not configured.")
       let lastError: unknown
       let progressAttempt = 0
-      const runState: V4SyncRunState = { conflictCopies: new Map() }
+      const runState: V4SyncRunState = { runId: toBase64Url(randomBytes(12)), conflictCopies: new Map(), conflictCopyStages: new Map() }
       for (let casAttempt = 1; casAttempt <= 3; casAttempt++) {
         try {
           progressAttempt++
@@ -404,6 +406,31 @@ export class V4PluginRuntime {
           const keyring = authenticationConfig
             ? await deriveV4Keyring({ passphrase, repoId: authenticationConfig.repoId, salt: fromBase64Url(authenticationConfig.kdfParams!.salt), iterations: authenticationConfig.kdfParams!.iterations })
             : undefined
+          const recoveryNamespace = (await sha256Hex(utf8ToBytes(config.repoId))).slice(0, 32)
+          const recoveryStore = createV4RecoveryStore({
+            adapter: this.adapter,
+            root: `${V4_RECOVERY_ROOT}/${recoveryNamespace}`,
+            repoId: config.repoId,
+            payloadKey: config.mode === "encrypted" ? keyring?.journalKey : undefined,
+          })
+          const pendingRecovery = await recoveryStore.load()
+          let reconciledRecovery = pendingRecovery
+          if (pendingRecovery && pendingRecovery.header.phase !== "index-committed") {
+            const recoveryHead = (await this.plugin.githubClient.getGitRefOrNull())?.sha ?? null
+            const recovered = await recoverV4PendingState({
+              store: recoveryStore,
+              snapshot: pendingRecovery,
+              io: this.sessionVault(() => true),
+              currentRemoteHead: recoveryHead,
+            })
+            reconciledRecovery = recovered.snapshot
+            if (recovered.replanRequired) {
+              const keepStageIds = pendingRecovery.header.runId === runState.runId
+                ? new Set([...runState.conflictCopyStages?.values() ?? []].map(copy => copy.stage.stageId))
+                : new Set<string>()
+              await discardV4RecoveryStages(recovered.snapshot, this.sessionVault(() => true), keepStageIds)
+            }
+          }
           const inScope = this.scopePredicate()
           const includePath = (path: string): boolean => {
             for (const copy of runState.conflictCopies.values()) {
@@ -422,6 +449,7 @@ export class V4PluginRuntime {
             askConflict: input => this.askConflict(input.path),
             includePath,
             runState,
+            recoveryStore,
             onProgress: patch => {
               if (patch.phase === "checking-remote") return
               this.progressStore.update(patch)
@@ -429,6 +457,14 @@ export class V4PluginRuntime {
           }).sync({ operation: request.operation, allowThresholdOverride: !!request.allowThresholdOverride, changes })
           this.progressStore.update({ phase: "saving-index", currentPath: undefined, currentDirection: undefined })
           await this.saveIndex(index, previousShardHashes)
+          const recoveredRunId = !result.recoveryRunId
+            && reconciledRecovery?.header.phase !== "index-committed"
+            && !!reconciledRecovery?.header.verifiedRemoteHead
+            && index.remoteCommitSha === reconciledRecovery.header.verifiedRemoteHead
+            ? reconciledRecovery.header.runId
+            : undefined
+          const recoveryRunId = result.recoveryRunId ?? recoveredRunId
+          if (recoveryRunId) await markV4RecoveryIndexCommitted(recoveryStore, recoveryRunId)
           if (result.changedFiles === 0 && request.trigger === "manual") new Notice("GitHub Sync: No changes")
           this.progressStore.finish(result.changedFiles === 0 ? "no-change" : "success", { lastSyncTime: Date.now() })
           return { changedFiles: result.changedFiles }
@@ -442,7 +478,8 @@ export class V4PluginRuntime {
             casAttempt--
             continue
           }
-          if (casAttempt === 3 || !/branch head changed|stale ref/i.test((error as Error).message)) throw error
+          const recoveryReplan = error instanceof V4RecoveryReplanRequiredError && request.operation === "normal"
+          if (casAttempt === 3 || (!recoveryReplan && !/branch head changed|stale ref/i.test((error as Error).message))) throw error
           this.progressStore.update({
             phase: "retrying",
             attempt: progressAttempt + 1,

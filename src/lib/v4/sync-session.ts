@@ -46,6 +46,8 @@ import {
   type V4ResourceLimits,
 } from "./resource-controller"
 import type { V4QueuedChange } from "./sync-coordinator"
+import { applyV4RecoveryLocalMutations, type V4RecoveryStore } from "./recovery-store"
+import type { V4RecoveryLocalMutation, V4RecoveryPayload } from "./recovery-types"
 import type { V4DirectionalProgress, V4SyncProgressPatch } from "./progress"
 
 export type { V4SessionVault, V4SessionVaultFile } from "./local-io"
@@ -70,11 +72,14 @@ export interface V4SyncSessionInput {
   includePath?: (path: string) => boolean
   onProgress?: (patch: V4SyncProgressPatch) => void
   runState?: V4SyncRunState
+  recoveryStore?: V4RecoveryStore
   resourceLimits?: Partial<V4ResourceLimits>
 }
 
 export interface V4SyncRunState {
+  runId?: string
   conflictCopies: Map<string, { path: string; fileId: string; includeInSync: boolean }>
+  conflictCopyStages?: Map<string, { path: string; fileId: string; includeInSync: boolean; stage: V4StageRef }>
 }
 
 export interface V4SessionSyncResult {
@@ -84,12 +89,20 @@ export interface V4SessionSyncResult {
   pushedFiles: number
   pulledFiles: number
   commitSha?: string
+  recoveryRunId?: string
 }
 
 export class V4ChangeGuardError extends Error {
   constructor(public readonly changePercent: number, public readonly thresholdPercent: number) {
     super(`V4 change guard blocked sync: ${changePercent}% exceeds ${thresholdPercent}%.`)
     this.name = "V4ChangeGuardError"
+  }
+}
+
+export class V4RecoveryReplanRequiredError extends Error {
+  constructor(public readonly verifiedRemoteHead: string) {
+    super(`V4 local recovery requires replanning against verified remote head ${verifiedRemoteHead}.`)
+    this.name = "V4RecoveryReplanRequiredError"
   }
 }
 
@@ -253,6 +266,7 @@ export class V4SyncSession {
   }): Promise<V4SessionSyncResult> {
     this.localReadCache.clear()
     const ownedStages: V4StageRef[] = []
+    let preserveStagesForRecovery = false
     try {
     const baseCommitSha = this.input.index.remoteCommitSha
     this.report({ phase: "checking-remote", currentPath: undefined, currentDirection: undefined })
@@ -309,6 +323,12 @@ export class V4SyncSession {
       .map(copy => [copy.path, copy.fileId] as const))
     const identitySeedByPath = new Map([...causalState?.identityByPath ?? [], ...runCopyIdentityByPath])
     const localFiles = (await this.scanLocalStable(identityBaseRecords, options.changes ?? [], identitySeedByPath, runCopyIdentityByPath)).filter(file => includePath(file.path))
+    const syntheticConflictCopyIds = new Set<string>()
+    for (const copy of this.input.runState?.conflictCopyStages?.values() ?? []) {
+      if (!copy.includeInSync || localFiles.some(file => file.fileId === copy.fileId || file.path === copy.path)) continue
+      localFiles.push({ path: copy.path, fileId: copy.fileId, hash: copy.stage.hash, size: copy.stage.size, mtime: copy.stage.mtime })
+      syntheticConflictCopyIds.add(copy.fileId)
+    }
     const localById = new Map(localFiles.map(file => [file.fileId, file]))
     const baseRecords = !hasKnownBase && options.operation === "normal" && causalState
       ? identityBaseRecords.filter(record => !causalState.survivingCausallyRenamedFileIds.has(record.fileId)
@@ -371,13 +391,17 @@ export class V4SyncSession {
     const baseRecordsById = new Map(baseRecords.map(record => [record.fileId, record]))
     const remoteCommitSha = remote?.commitSha
     const batch: V4ResolvedBatch = {
-      runId: toBase64Url(randomBytes(12)),
+      runId: this.input.runState?.runId ?? toBase64Url(randomBytes(12)),
       pulls: plan.pulls.map(change => this.bindPull(change, recordsById, remoteCommitSha)),
       pushes: plan.pushes.map(change => this.bindPush(change, recordsById)),
       stagedWrites: [],
     }
+    for (const binding of batch.pushes) {
+      const copy = this.input.runState?.conflictCopyStages?.get(binding.change.fileId)
+      if (copy && binding.change.after?.hash === copy.stage.hash) binding.source = this.stageHandle(copy.stage)
+    }
     const prefetchedRemoteBodies = new Map<string, Uint8Array>()
-    const stagedCopyPulls: Array<{ pull: V4PullBinding; push?: V4PushBinding }> = []
+    const stagedCopyPulls: Array<{ pull: V4PullBinding; push?: V4PushBinding; reserved: { path: string; fileId: string; includeInSync: boolean } }> = []
     for (const [conflictIndex, conflict] of plan.conflicts.entries()) {
       this.report({
         phase: "resolving-conflicts",
@@ -455,7 +479,10 @@ export class V4SyncSession {
           }
           const copyPath = reservedCopy.path
           const copyFileId = reservedCopy.fileId
-          const existingCopy = localById.get(copyFileId)
+          const carriedStage = syntheticConflictCopyIds.has(copyFileId)
+            ? this.input.runState?.conflictCopyStages?.get(copyFileId)?.stage
+            : undefined
+          const existingCopy = carriedStage ? undefined : localById.get(copyFileId)
           const copyChange: V4PlannedChange = {
             fileId: copyFileId,
             kind: existingCopy ? "modify" : "create",
@@ -470,7 +497,7 @@ export class V4SyncSession {
             },
           }
           pullTotal++
-          const pullBinding: V4PullBinding = { change: copyChange, remoteRecord, remoteCommitSha }
+          const pullBinding: V4PullBinding = { change: copyChange, remoteRecord, remoteCommitSha, stage: carriedStage }
           batch.pulls.push(pullBinding)
           let pushBinding: V4PushBinding | undefined
           if (reservedCopy.includeInSync && !batch.pushes.some(binding => binding.change.fileId === copyFileId)) {
@@ -478,7 +505,7 @@ export class V4SyncSession {
             pushBinding = { change: copyChange }
             batch.pushes.push(pushBinding)
           }
-          stagedCopyPulls.push({ pull: pullBinding, push: pushBinding })
+          if (!carriedStage) stagedCopyPulls.push({ pull: pullBinding, push: pushBinding, reserved: reservedCopy })
         }
         const localPush = this.changeBetween(conflict.remote, conflict.local)
         if (localPush) {
@@ -503,24 +530,69 @@ export class V4SyncSession {
       const stage = await this.stageBytes(bytes, remoteRecord.mtime, stagedCopy.pull.change.before?.size ?? 0, ownedStages)
       stagedCopy.pull.stage = stage
       if (stagedCopy.push) stagedCopy.push.source = this.stageHandle(stage)
+      if (this.input.runState) {
+        const stages = this.input.runState.conflictCopyStages ?? new Map()
+        stages.set(stagedCopy.reserved.fileId, { ...stagedCopy.reserved, stage })
+        this.input.runState.conflictCopyStages = stages
+      }
     }
 
     let pulledFiles = 0
-    for (const binding of batch.pulls) {
-      await this.applyPullBinding(binding, ownedStages, () => {
-        pullCompleted++
-        this.report({ currentPath: binding.change.path, currentDirection: "pull", pull: directional(pullCompleted, pullTotal) })
-      })
-      pulledFiles++
-    }
-    for (const binding of batch.stagedWrites) {
-      await this.applyStagedWrite(binding)
+    let recoveryPlan: { payload: V4RecoveryPayload; pullCompletionIds: Set<string> } | undefined
+    if (this.input.recoveryStore) {
+      recoveryPlan = await this.prepareRecoveryLocalPayload(batch, ownedStages, localById)
+      pulledFiles = batch.pulls.length
+    } else {
+      for (const binding of batch.pulls) {
+        await this.applyPullBinding(binding, ownedStages, () => {
+          pullCompleted++
+          this.report({ currentPath: binding.change.path, currentDirection: "pull", pull: directional(pullCompleted, pullTotal) })
+        })
+        pulledFiles++
+      }
+      for (const binding of batch.stagedWrites) {
+        await this.applyStagedWrite(binding)
+      }
     }
 
     if (batch.pushes.length === 0 && options.operation !== "forcePush" && !externalReconciled) {
+      if (this.input.recoveryStore && recoveryPlan) {
+        preserveStagesForRecovery = recoveryPlan.payload.mutations.length > 0
+        let recovery = await this.input.recoveryStore.save({
+          runId: batch.runId,
+          phase: "remote-verified",
+          expectedRemoteHead: baseCommitSha ?? null,
+          verifiedRemoteHead: remote!.commitSha,
+          payload: recoveryPlan.payload,
+        })
+        const applied = await applyV4RecoveryLocalMutations({
+          store: this.input.recoveryStore,
+          snapshot: recovery,
+          io: this.localIo,
+          onApplying: mutation => this.report({ phase: "applying", currentPath: mutation.path, currentDirection: mutation.id.startsWith("pull:") ? "pull" : "push" }),
+          onApplied: mutation => {
+            if (!recoveryPlan!.pullCompletionIds.has(mutation.id)) return
+            pullCompleted++
+            this.report({ currentPath: mutation.path, currentDirection: "pull", pull: directional(pullCompleted, pullTotal) })
+          },
+        })
+        recovery = applied.snapshot
+        if (applied.replanRequired) {
+          preserveStagesForRecovery = false
+          throw new V4RecoveryReplanRequiredError(remote!.commitSha)
+        }
+        preserveStagesForRecovery = false
+      }
       this.replaceIndex(allRemoteRecords, remote!.head, remote!.commitSha)
       this.localReadCache.clear()
-      return { mode: options.operation === "forcePull" ? "force-pull" : "pull", operation: options.operation, changedFiles, pushedFiles: 0, pulledFiles }
+      return {
+        mode: options.operation === "forcePull" ? "force-pull" : "pull",
+        operation: options.operation,
+        changedFiles,
+        pushedFiles: 0,
+        pulledFiles,
+        recoveryRunId: this.input.recoveryStore ? batch.runId : undefined,
+      }
     }
 
     const pushContentPaths = new Set(batch.pushes.flatMap(binding => binding.source?.kind === "vault" ? [binding.source.path] : []))
@@ -823,14 +895,65 @@ export class V4SyncSession {
       entries: [...streamedEntries, ...uploaded.entries],
       deletions: [...deletions],
     })
+    let recoverySnapshot = this.input.recoveryStore
+      ? await this.input.recoveryStore.save({
+        runId: batch.runId,
+        journalId,
+        phase: "publish-intent",
+        expectedRemoteHead: candidate.previousHeadSha ?? null,
+        candidateCommitSha: candidate.commitSha,
+        payload: recoveryPlan?.payload ?? { mutations: [], completedMutationIds: [] },
+      })
+      : undefined
+    preserveStagesForRecovery = !!recoverySnapshot && (recoveryPlan?.payload.mutations.length ?? 0) > 0
     await publishV4CandidateRef(this.input.github, candidate)
+    if (this.input.recoveryStore && recoverySnapshot) {
+      const verifiedRef = await this.input.github.getGitRefOrNull()
+      if (verifiedRef?.sha !== candidate.commitSha) throw new Error("V4 candidate publication could not be verified.")
+      recoverySnapshot = await this.input.recoveryStore.save({
+        runId: batch.runId,
+        journalId,
+        phase: "remote-verified",
+        expectedRemoteHead: candidate.previousHeadSha ?? null,
+        candidateCommitSha: candidate.commitSha,
+        verifiedRemoteHead: candidate.commitSha,
+        payload: recoveryPlan?.payload ?? { mutations: [], completedMutationIds: [] },
+      })
+      if (recoveryPlan) {
+        const applied = await applyV4RecoveryLocalMutations({
+          store: this.input.recoveryStore,
+          snapshot: recoverySnapshot,
+          io: this.localIo,
+          onApplying: mutation => this.report({ phase: "applying", currentPath: mutation.path, currentDirection: mutation.id.startsWith("pull:") ? "pull" : "push" }),
+          onApplied: mutation => {
+            if (!recoveryPlan!.pullCompletionIds.has(mutation.id)) return
+            pullCompleted++
+            this.report({ currentPath: mutation.path, currentDirection: "pull", pull: directional(pullCompleted, pullTotal) })
+          },
+        })
+        recoverySnapshot = applied.snapshot
+        if (applied.replanRequired) {
+          preserveStagesForRecovery = false
+          throw new V4RecoveryReplanRequiredError(candidate.commitSha)
+        }
+      }
+      preserveStagesForRecovery = false
+    }
     const published = { ...candidate, fileShas: uploaded.fileShas }
     this.replaceIndex(finalRecords, head, published.commitSha)
     const mode = options.operation === "forcePush" ? "force-push" : pulledFiles > 0 ? "pull-push" : "push"
     this.localReadCache.clear()
-    return { mode, operation: options.operation, changedFiles, pushedFiles: batch.pushes.length, pulledFiles, commitSha: published.commitSha }
+    return {
+      mode,
+      operation: options.operation,
+      changedFiles,
+      pushedFiles: batch.pushes.length,
+      pulledFiles,
+      commitSha: published.commitSha,
+      recoveryRunId: this.input.recoveryStore ? batch.runId : undefined,
+    }
     } finally {
-      await this.cleanupStages(ownedStages)
+      if (!preserveStagesForRecovery) await this.cleanupStages(ownedStages)
       this.localReadCache.clear()
     }
   }
@@ -1121,6 +1244,76 @@ export class V4SyncSession {
       await sink.abort()
       throw error
     }
+  }
+
+  private async prepareRecoveryLocalPayload(
+    batch: V4ResolvedBatch,
+    ownedStages: V4StageRef[],
+    localById: ReadonlyMap<string, V4LogicalFile>,
+  ): Promise<{ payload: V4RecoveryPayload; pullCompletionIds: Set<string> }> {
+    const mutations: V4RecoveryLocalMutation[] = []
+    const pullCompletionIds = new Set<string>()
+    const addPull = async (binding: V4PullBinding) => {
+      const change = binding.change
+      if (change.kind === "delete") {
+        const id = `pull:${change.fileId}:delete`
+        mutations.push({ id, kind: "trash", path: change.path, precondition: this.pullPrecondition(change) })
+        pullCompletionIds.add(id)
+        return
+      }
+      if (!binding.stage) {
+        this.report({ phase: "downloading", currentPath: change.path, currentDirection: "pull" })
+        binding.stage = await this.stageRemotePull(binding, ownedStages)
+      }
+      if (this.ephemeralStages.has(binding.stage.stageId)) throw new V4BoundedIoUnavailableError("bounded-append", change.path)
+      const writeId = `pull:${change.fileId}:write`
+      mutations.push({ id: writeId, kind: "stage-write", path: change.path, stage: binding.stage, precondition: this.pullPrecondition(change) })
+      if (change.kind === "rename" && change.previousPath) {
+        const trashId = `pull:${change.fileId}:rename-trash`
+        mutations.push({ id: trashId, kind: "trash", path: change.previousPath, precondition: this.pullPrecondition(change, change.previousPath) })
+        pullCompletionIds.add(trashId)
+      } else {
+        pullCompletionIds.add(writeId)
+      }
+    }
+    for (const binding of batch.pulls) await addPull(binding)
+
+    for (const binding of batch.stagedWrites) {
+      if (this.ephemeralStages.has(binding.stage.stageId)) throw new V4BoundedIoUnavailableError("bounded-append", binding.change.path)
+      const current = localById.get(binding.change.fileId)
+      const path = binding.change.path
+      const precondition: V4LocalTargetPrecondition = current && current.path === path
+        ? { path, exists: true, size: current.size, mtime: current.mtime }
+        : { path, exists: false }
+      mutations.push({ id: `local:${binding.change.fileId}:write`, kind: "stage-write", path, stage: binding.stage, precondition })
+      if (binding.change.kind === "rename" && binding.change.previousPath) {
+        const previous = localById.get(binding.change.fileId)
+        mutations.push({
+          id: `local:${binding.change.fileId}:rename-trash`,
+          kind: "trash",
+          path: binding.change.previousPath,
+          precondition: previous && previous.path === binding.change.previousPath
+            ? { path: binding.change.previousPath, exists: true, size: previous.size, mtime: previous.mtime }
+            : { path: binding.change.previousPath, exists: false },
+        })
+      }
+    }
+    const stagedIds = new Set(mutations.flatMap(mutation => mutation.kind === "stage-write" ? [mutation.stage.stageId] : []))
+    for (const copy of this.input.runState?.conflictCopyStages?.values() ?? []) {
+      if (stagedIds.has(copy.stage.stageId)) continue
+      const stat = this.localIo.stat ? await this.localIo.stat(copy.path) : null
+      const precondition: V4LocalTargetPrecondition = stat
+        ? { path: copy.path, exists: true, size: stat.size, mtime: stat.mtime }
+        : { path: copy.path, exists: false }
+      mutations.push({
+        id: `conflict-copy:${copy.fileId}:write`,
+        kind: "stage-write",
+        path: copy.path,
+        stage: copy.stage,
+        precondition,
+      })
+    }
+    return { payload: { mutations, completedMutationIds: [] }, pullCompletionIds }
   }
 
   private pullPrecondition(change: V4PlannedChange, path = change.path): V4LocalTargetPrecondition {

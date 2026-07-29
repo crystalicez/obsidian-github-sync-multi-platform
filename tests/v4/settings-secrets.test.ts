@@ -115,11 +115,19 @@ function plaintextRuntimeFixture(pathInput: string | string[] = "secret.md", git
   });
   const vaultFile = vaultFiles[0];
   const indexFiles = new Map<string, string>();
-  const indexAdapter: V4LocalIndexAdapter = {
+  const binaryFiles = new Map<string, Uint8Array>();
+  const indexAdapter: V4LocalIndexAdapter & {
+    readBinary(path: string): Promise<ArrayBuffer>;
+    writeBinary(path: string, data: ArrayBuffer): Promise<void>;
+    remove(path: string): Promise<void>;
+  } = {
     async read(indexPath: string) { const value = indexFiles.get(indexPath); if (value === undefined) throw new Error(`missing ${indexPath}`); return value; },
     async write(indexPath: string, value: string) { indexFiles.set(indexPath, value); },
-    async exists(indexPath: string) { return indexFiles.has(indexPath); },
+    async exists(indexPath: string) { return indexFiles.has(indexPath) || binaryFiles.has(indexPath); },
     async mkdir() {},
+    async readBinary(path: string) { const value = binaryFiles.get(path); if (!value) throw new Error(`missing binary ${path}`); return value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength); },
+    async writeBinary(path: string, data: ArrayBuffer) { binaryFiles.set(path, new Uint8Array(data.slice(0))); },
+    async remove(path: string) { binaryFiles.delete(path); },
   };
   const plugin = {
     app: { vault: {
@@ -719,7 +727,15 @@ test("v4 runtime progress stays out of plugin data, local index files, and the r
   fixture.runtime.subscribeProgress(snapshot => seen.push(structuredClone(snapshot)));
   await fixture.runtime.forcePush();
   assert.equal(seen.some(snapshot => snapshot.currentPath === "secret.md"), true);
-  for (const serialized of fixture.indexFiles.values()) assertNoProgressPersistence(JSON.parse(serialized));
+  const recoveryProgressFields = new Set(["currentPath", "failurePath", "pull", "push", "timings", "totalElapsedMs"]);
+  for (const [path, serialized] of fixture.indexFiles) {
+    const parsed = JSON.parse(serialized) as Record<string, unknown>;
+    if (path.includes("github-sync-v4-recovery")) {
+      for (const key of Object.keys(parsed)) assert.equal(recoveryProgressFields.has(key), false, `persisted recovery progress field: ${key}`);
+      continue;
+    }
+    assertNoProgressPersistence(parsed);
+  }
 
   const persisted = {
     settings: sanitizeV4SettingsForPersistence({ ...DEFAULT_SETTINGS, githubToken: "token", encryptionPassphrase: "passphrase" }),
@@ -851,6 +867,12 @@ test("v4 runtime recovers after a published commit whose second local shard save
   assert.equal(github.commits.size, commitsAfterPublish);
   assert.equal(github.readPaths.includes(V4_HEAD_PATH), true);
   assert.equal(github.readPaths.some(path => path.includes("/index/")), true);
+
+  const recoveryHeaders = [...indexFiles.entries()]
+    .filter(([path]) => path.includes("github-sync-v4-recovery") && path.endsWith(".json"))
+    .map(([, value]) => JSON.parse(value) as { generation: number; phase: string });
+  const latestRecovery = recoveryHeaders.sort((a, b) => b.generation - a.generation)[0];
+  assert.equal(latestRecovery?.phase, "index-committed");
 
   const currentHeader = JSON.parse(indexFiles.get(".obsidian/plugins/test/github-sync-v4-index/index.json")!);
   const expectedIdentities = Object.fromEntries(Object.keys(currentHeader.shardHashes).flatMap(bucket => {

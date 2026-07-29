@@ -5,10 +5,11 @@ import test from "node:test";
 import type { GitHubCreateTreeEntry } from "../../src/lib/github-git-types";
 import { deriveV4Keyring } from "../../src/lib/v4/crypto";
 import { V4HistoryService } from "../../src/lib/v4/history-service";
-import { createEmptyV4LocalIndex, type V4IndexFileRecord } from "../../src/lib/v4/local-index";
+import { createEmptyV4LocalIndex, type V4IndexFileRecord, type V4LocalIndexAdapter } from "../../src/lib/v4/local-index";
 import { V4_LARGE_FILE_THRESHOLD_BYTES } from "../../src/lib/v4/large-files";
 import { V4_CONFIG_PATH, V4_FORMAT_VERSION, V4_HEAD_PATH, type V4RemoteConfig } from "../../src/lib/v4/protocol-types";
 import { decodeV4RemoteHead, decodeV4RemoteShard, v4RemoteShardPath } from "../../src/lib/v4/remote-index";
+import { createV4RecoveryStore } from "../../src/lib/v4/recovery-store";
 import { V4StorageCodec } from "../../src/lib/v4/storage-codec";
 import { V4SyncSession, type V4SessionVault } from "../../src/lib/v4/sync-session";
 import type { V4ContentHandle, V4ContentSource } from "../../src/lib/v4/content-source";
@@ -246,4 +247,38 @@ test("encrypted V4 remote paths and payloads contain no logical path or content 
   assert.equal(reachableShas.has(parentSha), true);
   const parentTree = github.trees.get(github.commits.get(parentSha)!.treeSha)!;
   assert.equal(parentTree.has(deletion!.change.before!.remotePath), true);
+});
+
+class RecoveryLeakageAdapter implements V4LocalIndexAdapter {
+  readonly values = new Map<string, string>();
+  async read(path: string) { const value = this.values.get(path); if (value === undefined) throw new Error(`missing:${path}`); return value; }
+  async write(path: string, value: string) { this.values.set(path, value); }
+  async exists(path: string) { return this.values.has(path); }
+  async mkdir() {}
+}
+
+test("encrypted V4 local recovery keeps logical paths and secrets out of clear slots", async () => {
+  const repoId = "recovery-owner/recovery-private-repo#main";
+  const passphrase = "recovery-private-passphrase";
+  const secretPath = "RecoveryPrivateFolder/top-secret-note.md";
+  const keyring = await deriveV4Keyring({ passphrase, repoId, salt: encode("recovery-salt"), iterations: 10 });
+  const adapter = new RecoveryLeakageAdapter();
+  const store = createV4RecoveryStore({ adapter, root: "recovery", repoId, payloadKey: keyring.journalKey });
+  await store.save({
+    runId: "opaque-recovery-run",
+    journalId: "opaque-journal",
+    phase: "publish-intent",
+    expectedRemoteHead: "old-sha",
+    candidateCommitSha: "candidate-sha",
+    payload: {
+      mutations: [{ id: "trash-secret", kind: "trash", path: secretPath, precondition: { path: secretPath, exists: true, size: 17, mtime: 42 } }],
+      completedMutationIds: [],
+    },
+  });
+  const serialized = [...adapter.values.values()].join("\n");
+  for (const forbidden of [secretPath, "RecoveryPrivateFolder", repoId, passphrase]) {
+    assert.equal(serialized.includes(forbidden), false, `local recovery slot leaked ${forbidden}`);
+  }
+  const recovered = await store.load();
+  assert.equal(recovered?.payload?.mutations[0]?.path, secretPath);
 });
