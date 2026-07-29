@@ -6,6 +6,7 @@ import { assertV4LocalTargetPrecondition, V4LocalTargetChangedError, type V4Loca
 import { hashV4StableContentSource } from "./object-stream"
 import type { V4StageRef } from "./staging-store"
 import type { V4RecoveryHeader, V4RecoveryPayload, V4RecoveryPhase, V4RecoverySnapshot } from "./recovery-types"
+import { reconcileV4CandidatePublication, type V4PublishReconcileResult, type V4PublishReconcilerGithub } from "./publish-reconciler"
 
 const V4_RECOVERY_SCHEMA_VERSION = 1 as const
 const VALID_PHASES = new Set<V4RecoveryPhase>([
@@ -304,6 +305,7 @@ export async function recoverV4PendingState(input: {
   snapshot: V4RecoverySnapshot
   io: V4LocalIo
   currentRemoteHead: string | null
+  publicationGithub?: V4PublishReconcilerGithub
 }): Promise<V4RecoveryLocalApplyResult> {
   let snapshot = input.snapshot
   const header = snapshot.header
@@ -311,19 +313,29 @@ export async function recoverV4PendingState(input: {
   if (header.phase === "replan-required") return { snapshot, replanRequired: true }
 
   if (header.phase === "publish-intent") {
-    if (!header.candidateCommitSha || input.currentRemoteHead !== header.candidateCommitSha) {
-      snapshot = await saveFromSnapshot(input.store, snapshot, "replan-required", snapshot.payload)
-      return { snapshot, replanRequired: true }
+    if (header.candidateCommitSha && input.publicationGithub) {
+      const result = await reconcileV4CandidatePublication(input.publicationGithub, {
+        candidateCommitSha: header.candidateCommitSha,
+        expectedHeadSha: header.expectedRemoteHead,
+        journalId: header.journalId,
+      })
+      snapshot = await reconcileV4RecoveryPublishIntent({ store: input.store, snapshot, result })
+      if (snapshot.header.phase === "replan-required") return { snapshot, replanRequired: true }
+    } else {
+      if (!header.candidateCommitSha || input.currentRemoteHead !== header.candidateCommitSha) {
+        snapshot = await saveFromSnapshot(input.store, snapshot, "replan-required", snapshot.payload)
+        return { snapshot, replanRequired: true }
+      }
+      snapshot = await input.store.save({
+        runId: header.runId,
+        journalId: header.journalId,
+        phase: "remote-verified",
+        expectedRemoteHead: header.expectedRemoteHead,
+        candidateCommitSha: header.candidateCommitSha,
+        verifiedRemoteHead: header.candidateCommitSha,
+        payload: snapshot.payload,
+      })
     }
-    snapshot = await input.store.save({
-      runId: header.runId,
-      journalId: header.journalId,
-      phase: "remote-verified",
-      expectedRemoteHead: header.expectedRemoteHead,
-      candidateCommitSha: header.candidateCommitSha,
-      verifiedRemoteHead: header.candidateCommitSha,
-      payload: snapshot.payload,
-    })
   }
 
   if (snapshot.header.phase === "remote-verified" || snapshot.header.phase === "local-committing") {
@@ -355,4 +367,39 @@ export async function discardV4RecoveryStages(snapshot: V4RecoverySnapshot, io: 
     if (keepStageIds.has(stageId)) continue
     try { await io.staging?.remove({ stageId }) } catch {}
   }
+}
+
+export async function reconcileV4RecoveryPublishIntent(input: {
+  store: V4RecoveryStore
+  snapshot: V4RecoverySnapshot
+  result: V4PublishReconcileResult
+}): Promise<V4RecoverySnapshot> {
+  const { snapshot, result } = input
+  if (snapshot.header.phase !== "publish-intent") return snapshot
+  const candidate = snapshot.header.candidateCommitSha
+  if (
+    result.status === "published"
+    && candidate
+    && result.publishedCommitSha === candidate
+    && result.currentHeadSha === candidate
+  ) {
+    return input.store.save({
+      runId: snapshot.header.runId,
+      journalId: snapshot.header.journalId,
+      phase: "remote-verified",
+      expectedRemoteHead: snapshot.header.expectedRemoteHead,
+      candidateCommitSha: candidate,
+      verifiedRemoteHead: candidate,
+      payload: snapshot.payload,
+    })
+  }
+  return input.store.save({
+    runId: snapshot.header.runId,
+    journalId: snapshot.header.journalId,
+    phase: "replan-required",
+    expectedRemoteHead: snapshot.header.expectedRemoteHead,
+    candidateCommitSha: candidate,
+    verifiedRemoteHead: result.status === "published-advanced" ? result.publishedCommitSha : snapshot.header.verifiedRemoteHead,
+    payload: snapshot.payload,
+  })
 }

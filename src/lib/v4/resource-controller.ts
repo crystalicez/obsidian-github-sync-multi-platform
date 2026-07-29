@@ -128,3 +128,43 @@ export function estimateV4GitBlobTransportBytes(rawBytes: number): number {
   const jsonBodyBytes = base64Bytes + 64
   return rawBytes + rawBytes + base64Bytes + jsonBodyBytes
 }
+
+function estimateV4JsonUtf8UpperBound(value: unknown, seen: Set<object>): number {
+  if (value === null) return 4
+  if (typeof value === "boolean") return value ? 4 : 5
+  if (typeof value === "number") return 32
+  if (typeof value === "string") return 2 + value.length * 6
+  if (Array.isArray(value)) {
+    if (seen.has(value)) throw new TypeError("Cannot estimate cyclic JSON value")
+    seen.add(value)
+    let total = 2
+    for (let index = 0; index < value.length; index++) {
+      if (index > 0) total++
+      total += estimateV4JsonUtf8UpperBound(value[index], seen)
+    }
+    seen.delete(value)
+    return total
+  }
+  if (typeof value === "object") {
+    if (seen.has(value as object)) throw new TypeError("Cannot estimate cyclic JSON value")
+    seen.add(value as object)
+    let total = 2
+    let first = true
+    for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+      if (entry === undefined || typeof entry === "function" || typeof entry === "symbol") continue
+      if (!first) total++
+      first = false
+      total += 2 + key.length * 6 + 1 + estimateV4JsonUtf8UpperBound(entry, seen)
+    }
+    seen.delete(value as object)
+    return total
+  }
+  return 4
+}
+
+export function estimateV4JsonValueTransportBytes(value: unknown): number {
+  const bodyUpperBound = estimateV4JsonUtf8UpperBound(value, new Set())
+  const estimate = bodyUpperBound * 2 + 256
+  if (!Number.isSafeInteger(estimate)) throw new RangeError("V4 JSON transport estimate exceeds safe integer range")
+  return estimate
+}

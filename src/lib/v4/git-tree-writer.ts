@@ -1,5 +1,7 @@
 import type { GitHubCreateTreeEntry, GitHubGitCommit, GitHubGitRef } from "../github-git-types";
 import type { V4StreamObject } from "./object-stream";
+import { isV4GitMutationOutcomeUnknownError } from "./git-mutation-policy";
+import { reconcileV4CandidatePublication } from "./publish-reconciler";
 
 export interface V4GitTreeProgressItem { fileId: string; path: string; }
 export interface V4GitTreeFile { path: string; bytes: Uint8Array; progressItems?: V4GitTreeProgressItem[]; }
@@ -27,7 +29,7 @@ export interface V4GitTreeGithub {
   getGitCommit(sha: string): Promise<GitHubGitCommit>;
   createGitBlob(bytes: Uint8Array): Promise<string>;
   createGitTree(entries: GitHubCreateTreeEntry[], baseTree?: string): Promise<string>;
-  createGitCommit(message: string, tree: string, parents: string[]): Promise<string>;
+  createGitCommit(message: string, tree: string, parents: string[], options?: { originalCannotBeReachable?: boolean }): Promise<string>;
   createGitRef(sha: string): Promise<void>;
   updateGitRef(sha: string, expectedSha?: string): Promise<void>;
 }
@@ -48,6 +50,7 @@ export interface V4CandidateCommit {
   baseTreeSha?: string;
   treeSha: string;
   commitSha: string;
+  message: string;
 }
 
 async function mapWithConcurrency<T, R>(items: T[], concurrency: number, mapper: (item: T) => Promise<R>): Promise<R[]> {
@@ -185,22 +188,47 @@ export async function createV4CandidateCommit(
   for (const path of input.deletions ?? []) entries.push({ path, mode: "100644", type: "blob", sha: null });
   const treeSha = await github.createGitTree(entries, input.base.baseTreeSha);
   const parents = input.base.ref ? [input.base.ref.sha] : [];
-  const commitSha = await github.createGitCommit(input.message, treeSha, parents);
+  const commitSha = await github.createGitCommit(input.message, treeSha, parents, { originalCannotBeReachable: true });
   return {
     previousHeadSha: input.base.previousHeadSha,
     baseTreeSha: input.base.baseTreeSha,
     treeSha,
     commitSha,
+    message: input.message,
   };
 }
 
 export async function publishV4CandidateRef(github: V4GitTreeGithub, candidate: V4CandidateCommit): Promise<void> {
-  const current = await github.getGitRefOrNull();
-  if ((current?.sha ?? null) !== (candidate.previousHeadSha ?? null)) {
-    throw new Error("V4 branch head changed before atomic publish.");
+  const expectedHead = candidate.previousHeadSha ?? null;
+  const journalId = candidate.message.startsWith("obsidian-sync-v4:") ? candidate.message.slice("obsidian-sync-v4:".length) : undefined;
+  const mutate = async (): Promise<void> => {
+    const current = await github.getGitRefOrNull();
+    if ((current?.sha ?? null) !== expectedHead) throw new Error("V4 branch head changed before atomic publish.");
+    if (candidate.previousHeadSha !== undefined) await github.updateGitRef(candidate.commitSha, candidate.previousHeadSha);
+    else await github.createGitRef(candidate.commitSha);
+  };
+  const reconcileUnknown = async () => reconcileV4CandidatePublication(github, {
+    candidateCommitSha: candidate.commitSha,
+    expectedHeadSha: expectedHead,
+    journalId,
+  });
+
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      await mutate();
+      return;
+    } catch (error) {
+      if (!isV4GitMutationOutcomeUnknownError(error)) throw error;
+      const reconciled = await reconcileUnknown();
+      if (reconciled.status === "published" && reconciled.publishedCommitSha === candidate.commitSha) return;
+      if (reconciled.status === "published-advanced") {
+        throw new Error("V4 branch head changed after candidate publication; replan against the advanced head.");
+      }
+      if (reconciled.status === "diverged") throw new Error("V4 branch head changed during ambiguous candidate publication.");
+      if (attempt === 2) throw error;
+      // The expected head was re-observed after the unknown outcome. One retry is now evidence-based, not blind.
+    }
   }
-  if (candidate.previousHeadSha !== undefined) await github.updateGitRef(candidate.commitSha, candidate.previousHeadSha);
-  else await github.createGitRef(candidate.commitSha);
 }
 
 export async function publishV4TreeChanges(github: V4GitTreeGithub, input: V4GitTreeWriteInput): Promise<V4GitTreeWriteResult> {

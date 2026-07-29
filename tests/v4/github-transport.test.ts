@@ -21,7 +21,7 @@ test("GitHubClient pins the API version and paginates commit history", async () 
     };
   });
   try {
-    const client = new GitHubClient({ token: "token", owner: "owner", repo: "repo", branch: "main" });
+    const client = new GitHubClient({ token: "token", owner: "owner", repo: "repo", branch: "main" }, { transportPolicy: { mutationSpacingMs: 0 } });
     const commits = await client.listCommits({ page: 2, perPage: 50 });
 
     assert.equal(commits[0].sha, "commit-1");
@@ -42,7 +42,7 @@ test("GitHubClient reads historical trees and can create a branch ref", async ()
     return { status: 200, text: "", headers: {}, json: { sha: "tree-old", url: "", tree: [], truncated: false } };
   });
   try {
-    const client = new GitHubClient({ token: "token", owner: "owner", repo: "repo", branch: "v4" });
+    const client = new GitHubClient({ token: "token", owner: "owner", repo: "repo", branch: "v4" }, { transportPolicy: { mutationSpacingMs: 0 } });
     const tree = await client.getTreeAt("tree-old", false);
     await client.createGitRef("root");
 
@@ -86,7 +86,7 @@ test("GitHubClient routes REST calls through rate-limit retries", async () => {
     return { status: 200, text: "", headers: {}, json: [] };
   });
   try {
-    const client = new GitHubClient({ token: "token", owner: "owner", repo: "repo", branch: "main" });
+    const client = new GitHubClient({ token: "token", owner: "owner", repo: "repo", branch: "main" }, { transportPolicy: { mutationSpacingMs: 0 } });
     assert.deepEqual(await client.listCommits(), []);
     assert.equal(attempts, 2);
   } finally {
@@ -119,13 +119,13 @@ test("GitHubClient pins file reads to an explicit commit SHA", async () => {
     };
   });
   try {
-    const client = new GitHubClient({ token: "token", owner: "owner", repo: "repo", branch: "main" });
+    const client = new GitHubClient({ token: "token", owner: "owner", repo: "repo", branch: "main" }, { transportPolicy: { mutationSpacingMs: 0 } });
     const file = await client.getFileBytes(".obsidian-github-sync-v4/head", "commit/sha");
     assert.match(requestUrls[0], /ref=commit%2Fsha/u);
     assert.equal(accept, "application/vnd.github.object+json");
-    assert.equal(new TextDecoder().decode(file!.bytes), "payload");
+    assert.equal(new TextDecoder().decode(file!.bytes), "transformed");
     assert.equal(file!.sha, "blob-sha");
-    assert.equal(requestUrls[1].endsWith("/git/blobs/blob-sha"), true);
+    assert.equal(requestUrls.length, 1);
   } finally {
     setRequestUrlHandler(null);
   }
@@ -144,7 +144,7 @@ test("GitHubClient bootstraps a truly empty repository before Git ref writes", a
     throw new Error(`Unexpected request: ${request.method} ${request.url}`);
   });
   try {
-    const client = new GitHubClient({ token: "token", owner: "owner", repo: "repo", branch: "main" });
+    const client = new GitHubClient({ token: "token", owner: "owner", repo: "repo", branch: "main" }, { transportPolicy: { mutationSpacingMs: 0 } });
     const ref = await client.ensureGitRepositoryInitialized();
 
     assert.equal(ref?.sha, "bootstrap-commit");
@@ -176,7 +176,7 @@ test("GitHubClient creates a configured custom branch after empty-repository boo
     throw new Error(`Unexpected request: ${request.method} ${request.url}`);
   });
   try {
-    const client = new GitHubClient({ token: "token", owner: "owner", repo: "repo", branch: "v4-sync" });
+    const client = new GitHubClient({ token: "token", owner: "owner", repo: "repo", branch: "v4-sync" }, { transportPolicy: { mutationSpacingMs: 0 } });
     const ref = await client.ensureGitRepositoryInitialized();
     assert.equal(ref?.ref, "refs/heads/v4-sync");
     const createRef = requests.find(request => request.method === "POST")!;
@@ -197,7 +197,7 @@ test("GitHubClient falls back to Git Blob bytes when Contents omits a large payl
     return { status: 200, text: "payload", headers: {}, json: undefined, arrayBuffer: new TextEncoder().encode("large payload").buffer };
   });
   try {
-    const client = new GitHubClient({ token: "token", owner: "owner", repo: "repo", branch: "main" });
+    const client = new GitHubClient({ token: "token", owner: "owner", repo: "repo", branch: "main" }, { transportPolicy: { mutationSpacingMs: 0 } });
     const file = await client.getFileBytes("large.bin", "commit-sha");
     assert.equal(new TextDecoder().decode(file!.bytes), "large payload");
     assert.equal(file!.sha, "large-blob");
@@ -206,3 +206,260 @@ test("GitHubClient falls back to Git Blob bytes when Contents omits a large payl
     setRequestUrlHandler(null);
   }
 });
+
+test("GitHubClient retries a lost blob response because the immutable mutation is idempotent", async () => {
+  let attempts = 0
+  setRequestUrlHandler(async () => {
+    attempts++
+    if (attempts === 1) throw new Error("blob response lost")
+    return { status: 201, text: "", headers: {}, json: { sha: "blob-stable" } }
+  })
+  try {
+    const client = new GitHubClient(
+      { token: "token", owner: "owner", repo: "repo", branch: "main" },
+      { transportPolicy: { mutationSpacingMs: 0 } },
+    )
+    assert.equal(await client.createGitBlob(new TextEncoder().encode("body")), "blob-stable")
+    assert.equal(attempts, 2)
+  } finally {
+    setRequestUrlHandler(null)
+  }
+})
+
+test("GitHubClient retries a lost tree response because the immutable mutation is idempotent", async () => {
+  let attempts = 0
+  setRequestUrlHandler(async () => {
+    attempts++
+    if (attempts === 1) throw new Error("tree response lost")
+    return { status: 201, text: "", headers: {}, json: { sha: "tree-stable" } }
+  })
+  try {
+    const client = new GitHubClient(
+      { token: "token", owner: "owner", repo: "repo", branch: "main" },
+      { transportPolicy: { mutationSpacingMs: 0 } },
+    )
+    assert.equal(await client.createGitTree([{ path: "A", mode: "100644", type: "blob", sha: "blob-stable" }]), "tree-stable")
+    assert.equal(attempts, 2)
+  } finally {
+    setRequestUrlHandler(null)
+  }
+})
+
+test("GitHubClient retries a lost commit response only with explicit orphan-safe evidence", async () => {
+  let attempts = 0
+  setRequestUrlHandler(async () => {
+    attempts++
+    if (attempts === 1) throw new Error("commit response lost")
+    return { status: 201, text: "", headers: {}, json: { sha: "commit-second" } }
+  })
+  try {
+    const client = new GitHubClient(
+      { token: "token", owner: "owner", repo: "repo", branch: "main" },
+      { transportPolicy: { mutationSpacingMs: 0 } },
+    )
+    assert.equal(
+      await client.createGitCommit("obsidian-sync-v4:j", "tree", ["base"], { originalCannotBeReachable: true }),
+      "commit-second",
+    )
+    assert.equal(attempts, 2)
+  } finally {
+    setRequestUrlHandler(null)
+  }
+})
+
+test("GitHubClient never blindly retries a normal ref mutation after a lost response", async () => {
+  let attempts = 0
+  setRequestUrlHandler(async () => {
+    attempts++
+    throw new Error("ref response lost")
+  })
+  try {
+    const client = new GitHubClient(
+      { token: "token", owner: "owner", repo: "repo", branch: "main" },
+      { transportPolicy: { mutationSpacingMs: 0 } },
+    )
+    await assert.rejects(
+      () => client.updateGitRef("candidate", "base"),
+      error => (error as Error).name === "V4GitMutationOutcomeUnknownError",
+    )
+    assert.equal(attempts, 1)
+  } finally {
+    setRequestUrlHandler(null)
+  }
+})
+
+test("empty-repository bootstrap observes initialization before retrying a lost Contents PUT", async () => {
+  const requests: Array<Record<string, any>> = []
+  let initialized = false
+  let puts = 0
+  setRequestUrlHandler(async (options: unknown) => {
+    const request = options as Record<string, any>
+    requests.push(request)
+    if (request.url.includes("/git/refs?")) {
+      return initialized
+        ? { status: 200, text: "", headers: {}, json: [{ ref: "refs/heads/main", object: { sha: "bootstrap-commit", type: "commit" } }] }
+        : { status: 409, text: "empty", headers: {}, json: {} }
+    }
+    if (request.method === "PUT") {
+      puts++
+      initialized = true
+      throw new Error("bootstrap response lost")
+    }
+    if (request.method === "GET" && request.url.includes("/git/ref/heads/main")) {
+      return { status: 200, text: "", headers: {}, json: { ref: "refs/heads/main", object: { sha: "bootstrap-commit", type: "commit" } } }
+    }
+    throw new Error(`Unexpected request: ${request.method} ${request.url}`)
+  })
+  try {
+    const client = new GitHubClient(
+      { token: "token", owner: "owner", repo: "repo", branch: "main" },
+      { transportPolicy: { mutationSpacingMs: 0 } },
+    )
+    const ref = await client.ensureGitRepositoryInitialized()
+    assert.equal(ref?.sha, "bootstrap-commit")
+    assert.equal(puts, 1)
+  } finally {
+    setRequestUrlHandler(null)
+  }
+})
+
+test("bootstrap branch creation observes the configured ref before retrying a lost create-ref response", async () => {
+  let customExists = false
+  let posts = 0
+  setRequestUrlHandler(async (options: unknown) => {
+    const request = options as Record<string, any>
+    if (request.url.includes("/git/refs?")) return { status: 409, text: "empty", headers: {}, json: {} }
+    if (request.method === "PUT") return { status: 201, text: "", headers: {}, json: { commit: { sha: "bootstrap-commit" } } }
+    if (request.method === "GET" && request.url.includes("/git/ref/heads/v4-sync")) {
+      return customExists
+        ? { status: 200, text: "", headers: {}, json: { ref: "refs/heads/v4-sync", object: { sha: "bootstrap-commit", type: "commit" } } }
+        : { status: 404, text: "missing", headers: {}, json: {} }
+    }
+    if (request.method === "POST" && request.url.endsWith("/git/refs")) {
+      posts++
+      customExists = true
+      throw new Error("create-ref response lost")
+    }
+    throw new Error(`Unexpected request: ${request.method} ${request.url}`)
+  })
+  try {
+    const client = new GitHubClient(
+      { token: "token", owner: "owner", repo: "repo", branch: "v4-sync" },
+      { transportPolicy: { mutationSpacingMs: 0 } },
+    )
+    const ref = await client.ensureGitRepositoryInitialized()
+    assert.equal(ref?.sha, "bootstrap-commit")
+    assert.equal(posts, 1)
+  } finally {
+    setRequestUrlHandler(null)
+  }
+})
+
+test("transport metrics are in-memory and contain no request path or response body", async () => {
+  setRequestUrlHandler(async () => ({ status: 201, text: "SECRET RESPONSE", headers: {}, json: { sha: "blob" } }))
+  try {
+    const client = new GitHubClient(
+      { token: "token", owner: "owner", repo: "repo", branch: "main" },
+      { transportPolicy: { mutationSpacingMs: 0 } },
+    )
+    await client.createGitBlob(new TextEncoder().encode("PRIVATE BODY"))
+    const serialized = JSON.stringify(client.transportMetricsSnapshot)
+    assert.equal(serialized.includes("PRIVATE BODY"), false)
+    assert.equal(serialized.includes("SECRET RESPONSE"), false)
+    assert.equal(serialized.includes("/git/blobs"), false)
+    assert.equal(client.transportMetricsSnapshot.mutations >= 1, true)
+    assert.equal(client.transportMetricsSnapshot.transientBytesPeak > 0, true)
+  } finally {
+    setRequestUrlHandler(null)
+  }
+})
+
+test("GitHubClient never blindly retries a normal create-ref mutation after a lost response", async () => {
+  let attempts = 0
+  setRequestUrlHandler(async () => {
+    attempts++
+    throw new Error("create-ref response lost")
+  })
+  try {
+    const client = new GitHubClient(
+      { token: "token", owner: "owner", repo: "repo", branch: "main" },
+      { transportPolicy: { mutationSpacingMs: 0 } },
+    )
+    await assert.rejects(
+      () => client.createGitRef("candidate"),
+      error => (error as Error).name === "V4GitMutationOutcomeUnknownError",
+    )
+    assert.equal(attempts, 1)
+  } finally {
+    setRequestUrlHandler(null)
+  }
+})
+
+test("immutable commit and content reads omit timestamp cache-busting while ref reads stay fresh", async () => {
+  const urls: string[] = []
+  setRequestUrlHandler(async (options: unknown) => {
+    const request = options as Record<string, any>
+    urls.push(request.url)
+    if (request.url.includes("/contents/")) return { status: 200, text: "", headers: {}, json: { content: "YQ==", encoding: "base64", sha: "blob" }, arrayBuffer: new ArrayBuffer(0) }
+    if (request.url.includes("/git/commits/")) return { status: 200, text: "", headers: {}, json: { sha: "commit-sha", tree: { sha: "tree" }, parents: [] } }
+    if (request.url.includes("/git/ref/heads/")) return { status: 200, text: "", headers: {}, json: { ref: "refs/heads/main", object: { sha: "commit-sha", type: "commit" } } }
+    throw new Error(`unexpected:${request.url}`)
+  })
+  try {
+    const client = new GitHubClient(
+      { token: "token", owner: "owner", repo: "repo", branch: "main" },
+      { transportPolicy: { mutationSpacingMs: 0 } },
+    )
+    await client.getFileBytes("A.md", "commit-sha")
+    await client.getGitCommit("commit-sha")
+    await client.getGitRef()
+    assert.equal(urls[0].includes("&_="), false)
+    assert.equal(urls[1].includes("?_="), false)
+    assert.match(urls[2], /\?_=/u)
+  } finally {
+    setRequestUrlHandler(null)
+  }
+})
+
+test("GitHubClient holds the transport reservation across mutation serialization and request", async () => {
+  let active = false
+  let reserved = 0
+  setRequestUrlHandler(async () => {
+    assert.equal(active, true)
+    return { status: 201, text: "", headers: {}, json: { sha: "blob" } }
+  })
+  try {
+    const client = new GitHubClient(
+      { token: "token", owner: "owner", repo: "repo", branch: "main" },
+      {
+        transportPolicy: { mutationSpacingMs: 0 },
+        transportResources: {
+          withTransportBytes: async <T>(bytes: number, task: () => Promise<T>) => {
+            reserved = bytes
+            active = true
+            try { return await task() } finally { active = false }
+          },
+        },
+      },
+    )
+    await client.createGitBlob(new TextEncoder().encode("bounded"))
+    assert.equal(active, false)
+    assert.equal(reserved > "bounded".length, true)
+  } finally {
+    setRequestUrlHandler(null)
+  }
+})
+
+test("transport metrics count response text as UTF-8 bytes", async () => {
+  setRequestUrlHandler(async () => ({ status: 201, text: "é", headers: {}, json: { sha: "blob" } }))
+  try {
+    const client = new GitHubClient(
+      { token: "token", owner: "owner", repo: "repo", branch: "main" },
+      { transportPolicy: { mutationSpacingMs: 0 } },
+    )
+    await client.createGitBlob(new Uint8Array([1]))
+    assert.equal(client.transportMetricsSnapshot.responseBytes, 2)
+  } finally {
+    setRequestUrlHandler(null)
+  }
+})

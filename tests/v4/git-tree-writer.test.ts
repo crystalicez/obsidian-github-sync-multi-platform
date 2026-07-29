@@ -293,3 +293,64 @@ test("V4 candidate ref publication re-reads the branch head immediately before m
   assert.deepEqual(github.createdRefs, []);
   assert.equal(github.commits.length, 1);
 });
+
+test("V4 ref publication reconciles a lost update response from the exact candidate SHA without replay", async () => {
+  const github = new MemoryV4GitHub()
+  github.ref = { ref: "refs/heads/main", sha: "base", type: "commit" }
+  const candidate = await createV4CandidateCommit(github, {
+    base: { ref: github.ref, previousHeadSha: "base", baseTreeSha: "base-tree" },
+    message: "obsidian-sync-v4:lost-update",
+    entries: [],
+  })
+  let calls = 0
+  github.updateGitRef = async (sha: string, expected?: string) => {
+    calls++
+    assert.equal(expected, "base")
+    github.ref = { ref: "refs/heads/main", sha, type: "commit" }
+    throw Object.assign(new Error("lost response"), { name: "V4GitMutationOutcomeUnknownError", retryClass: "reachable-ref" })
+  }
+
+  await publishV4CandidateRef(github, candidate)
+  assert.equal(calls, 1)
+  assert.equal(github.ref.sha, candidate.commitSha)
+})
+
+test("V4 ref publication retries once only after reconciliation proves the expected head is unchanged", async () => {
+  const github = new MemoryV4GitHub()
+  github.ref = { ref: "refs/heads/main", sha: "base", type: "commit" }
+  const candidate = await createV4CandidateCommit(github, {
+    base: { ref: github.ref, previousHeadSha: "base", baseTreeSha: "base-tree" },
+    message: "obsidian-sync-v4:retry-update",
+    entries: [],
+  })
+  let calls = 0
+  github.updateGitRef = async (sha: string, expected?: string) => {
+    calls++
+    if (calls === 1) throw Object.assign(new Error("lost before server mutation"), { name: "V4GitMutationOutcomeUnknownError", retryClass: "reachable-ref" })
+    github.ref = { ref: "refs/heads/main", sha, type: "commit" }
+    github.updatedRefs.push({ sha, expected })
+  }
+
+  await publishV4CandidateRef(github, candidate)
+  assert.equal(calls, 2)
+  assert.equal(github.ref.sha, candidate.commitSha)
+})
+
+test("V4 ref publication never replays an ambiguous mutation after an unrelated head advance", async () => {
+  const github = new MemoryV4GitHub()
+  github.ref = { ref: "refs/heads/main", sha: "base", type: "commit" }
+  const candidate = await createV4CandidateCommit(github, {
+    base: { ref: github.ref, previousHeadSha: "base", baseTreeSha: "base-tree" },
+    message: "obsidian-sync-v4:diverged-update",
+    entries: [],
+  })
+  let calls = 0
+  github.updateGitRef = async () => {
+    calls++
+    github.ref = { ref: "refs/heads/main", sha: "external", type: "commit" }
+    throw Object.assign(new Error("lost and raced"), { name: "V4GitMutationOutcomeUnknownError", retryClass: "reachable-ref" })
+  }
+
+  await assert.rejects(() => publishV4CandidateRef(github, candidate), /branch head changed/iu)
+  assert.equal(calls, 1)
+})

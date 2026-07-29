@@ -114,3 +114,12 @@ test("Git blob transport reservation uses the Phase-0 raw plus base64 plus JSON 
   assert.equal(estimateV4GitBlobTransportBytes(3), 78);
   assert.equal(estimateV4GitBlobTransportBytes(48 * 1024 * 1024) > 48 * 1024 * 1024 * 4, true);
 });
+
+test("JSON transport estimate is computed before serialization from a conservative value bound", async () => {
+  const { estimateV4JsonValueTransportBytes } = await import("../../src/lib/v4/resource-controller")
+  const value = { ref: "refs/heads/main", sha: "abc", force: false }
+  const actual = new TextEncoder().encode(JSON.stringify(value)).byteLength
+  const estimate = estimateV4JsonValueTransportBytes(value)
+  assert.equal(estimate >= actual * 2, true)
+  assert.equal(Number.isSafeInteger(estimate), true)
+})

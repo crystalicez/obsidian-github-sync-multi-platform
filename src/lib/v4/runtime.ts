@@ -422,6 +422,7 @@ export class V4PluginRuntime {
               snapshot: pendingRecovery,
               io: this.sessionVault(() => true),
               currentRemoteHead: recoveryHead,
+              publicationGithub: this.plugin.githubClient,
             })
             reconciledRecovery = recovered.snapshot
             if (recovered.replanRequired) {
