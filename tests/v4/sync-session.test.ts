@@ -15,7 +15,9 @@ import { publishV4TreeChanges } from "../../src/lib/v4/git-tree-writer";
 import { V4_LARGE_FILE_THRESHOLD_BYTES } from "../../src/lib/v4/large-files";
 import type { V4SyncProgressPatch } from "../../src/lib/v4/progress";
 import { DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES, type V4ContentHandle, type V4ContentSource } from "../../src/lib/v4/content-source";
+import { planV4PackGroups } from "../../src/lib/v4/pack-planner";
 import { waitForCondition } from "../helpers/wait-for";
+import { V4SourceChangedError } from "../../src/lib/v4/object-stream";
 
 const enc = (value: string) => new TextEncoder().encode(value);
 const dec = (value: Uint8Array) => new TextDecoder().decode(value);
@@ -2434,4 +2436,85 @@ test("v4 medium single-object push uses bounded source instead of whole-buffer v
   assert.equal(result.pushedFiles, 1);
   assert.equal(indexRecordByPath(index, "medium.bin").storage, "single");
   assert.equal(vault.operations.includes("read:medium.bin"), false);
+});
+
+
+test("v4 pack session uploads the current bounded group before opening the next group", async () => {
+  const MiB = 1024 * 1024;
+  const fileBytes = 512 * 1024;
+  const fileCount = 64;
+  const vault = new MemoryVault();
+  for (let index = 0; index < fileCount; index++) {
+    const bytes = new Uint8Array(fileBytes);
+    bytes.fill(index & 0xff);
+    vault.files.set(`Folder/file-${index}.bin`, { bytes, mtime: 1 });
+  }
+  const readsAtBlob: number[] = [];
+  class TrackingGitHub extends MemoryGitHub {
+    async createGitBlob(bytes: Uint8Array) {
+      readsAtBlob.push(vault.operations.filter(operation => operation.startsWith("read:")).length);
+      return super.createGitBlob(bytes);
+    }
+  }
+  const github = new TrackingGitHub();
+  const encryptedConfig: V4RemoteConfig = {
+    formatVersion: V4_FORMAT_VERSION, mode: "encrypted", repoId: "o/r#main", pathLayout: "opaque-stable-v1",
+    algorithm: "AES-GCM", kdf: "PBKDF2-SHA-256", kdfParams: { iterations: 10, salt: "c2FsdA" },
+  };
+  const keyring = await deriveV4Keyring({ passphrase: "pass", repoId: "o/r#main", salt: enc("salt"), iterations: 10 });
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "d", mode: "encrypted", pathLayout: "opaque-stable-v1" });
+  const candidates = [...vault.files].map(([path, file], fileIndex) => ({ fileId: `planned-${fileIndex}`, path, size: file.bytes.byteLength }));
+  const expectedGroups = planV4PackGroups(candidates, {
+    maxPlaintextBytes: 32 * MiB,
+    maxResidentBytes: 18 * MiB,
+    maxTransportTransientBytes: 24 * MiB,
+  });
+  assert.ok(expectedGroups.length > 1);
+
+  await new V4SyncSession({
+    github, vault, index, config: encryptedConfig, keyring, conflictPolicy: "copy", abortChangePercent: 0,
+    resourceLimits: { maxResidentBytes: 18 * MiB, maxTransportTransientBytes: 24 * MiB },
+  }).sync({ operation: "forcePush", allowThresholdOverride: false });
+
+  assert.ok(readsAtBlob.length >= expectedGroups.length);
+  assert.equal(readsAtBlob[0], fileCount + expectedGroups[0].length);
+  assert.ok(readsAtBlob[0] < fileCount * 2, "the next pack group was opened before the first pack blob upload");
+  assert.equal([...github.files.keys()].filter(path => path.includes("/packs/")).length, expectedGroups.length);
+});
+
+
+test("v4 changed pack member aborts before the first pack blob candidate or ref publication", async () => {
+  class MutatingPackVault extends MemoryVault {
+    private readonly reads = new Map<string, number>();
+    async read(path: string) {
+      const count = (this.reads.get(path) ?? 0) + 1;
+      this.reads.set(path, count);
+      this.operations.push(`read:${path}`);
+      const file = this.files.get(path)!;
+      const bytes = new Uint8Array(file.bytes);
+      if (path === "Folder/file-0.bin" && count >= 2) bytes[0] ^= 0xff;
+      return bytes;
+    }
+  }
+  const vault = new MutatingPackVault();
+  for (let index = 0; index < 64; index++) {
+    const bytes = new Uint8Array(32);
+    bytes.fill(index);
+    vault.files.set(`Folder/file-${index}.bin`, { bytes, mtime: 1 });
+  }
+  const github = new MemoryGitHub();
+  const encryptedConfig: V4RemoteConfig = {
+    formatVersion: V4_FORMAT_VERSION, mode: "encrypted", repoId: "o/r#main", pathLayout: "opaque-stable-v1",
+    algorithm: "AES-GCM", kdf: "PBKDF2-SHA-256", kdfParams: { iterations: 10, salt: "c2FsdA" },
+  };
+  const keyring = await deriveV4Keyring({ passphrase: "pass", repoId: "o/r#main", salt: enc("salt"), iterations: 10 });
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "d", mode: "encrypted", pathLayout: "opaque-stable-v1" });
+
+  await assert.rejects(new V4SyncSession({
+    github, vault, index, config: encryptedConfig, keyring, conflictPolicy: "copy", abortChangePercent: 0,
+  }).sync({ operation: "forcePush", allowThresholdOverride: false }), error => error instanceof V4SourceChangedError);
+
+  assert.equal(github.blobs.size, 0);
+  assert.equal(github.commits.size, 0);
+  assert.equal(github.ref, null);
 });

@@ -31,6 +31,17 @@ export interface V4PreparedPack {
 
 export type V4RemoteBytesReader = (path: string) => Promise<Uint8Array>
 
+export interface V4PackSourceEntry {
+  logicalPath: string
+  fileId: string
+  source: V4ContentSource
+  expectedHash: string
+  expectedSize?: number
+  version: string
+  mtime: number
+  checkSourceStable?: () => Promise<void>
+}
+
 export class V4StorageCodec {
   constructor(private readonly options: {
     mode: V4StorageMode
@@ -253,6 +264,82 @@ export class V4StorageCodec {
     return {
       ...record,
       pathId: await this.pathId(normalizeV4VaultPath(logicalPath)),
+    }
+  }
+
+  async preparePackFromSources(
+    packId: string,
+    entries: readonly V4PackSourceEntry[],
+    signal?: AbortSignal,
+  ): Promise<V4PreparedPack> {
+    if (this.options.mode !== "encrypted") throw new Error("V4 packs are available only in encrypted mode.")
+    if (entries.length === 0) throw new Error("Cannot create an empty V4 pack.")
+    if (!/^[A-Za-z0-9_-]+$/u.test(packId)) throw new Error("Unsafe V4 pack id.")
+
+    const prefix = utf8ToBytes('{"version":1,"entries":{')
+    const suffix = utf8ToBytes('}}')
+    const layouts = entries.map((entry, index) => {
+      const expectedSize = entry.expectedSize ?? entry.source.size
+      if (!Number.isSafeInteger(expectedSize) || expectedSize < 0) throw new TypeError("V4 pack entry size must be a non-negative safe integer.")
+      if (entry.source.size !== expectedSize) throw new V4SourceChangedError(entry.logicalPath, `source size ${entry.source.size} differs from expected ${expectedSize}`)
+      const key = utf8ToBytes(JSON.stringify(entry.fileId))
+      const encodedBytes = 4 * Math.ceil(expectedSize / 3)
+      return { entry, index, expectedSize, key, encodedBytes }
+    })
+    const archiveBytes = layouts.reduce((sum, layout) => sum + (layout.index > 0 ? 1 : 0) + layout.key.byteLength + 2 + layout.encodedBytes + 1, prefix.byteLength + suffix.byteLength)
+    if (!Number.isSafeInteger(archiveBytes)) throw new RangeError("V4 pack archive is too large.")
+    const archive = new Uint8Array(archiveBytes)
+    let archiveOffset = 0
+    const writeBytes = (bytes: Uint8Array): void => { archive.set(bytes, archiveOffset); archiveOffset += bytes.byteLength }
+    const writeAscii = (value: string): void => {
+      for (let index = 0; index < value.length; index++) archive[archiveOffset++] = value.charCodeAt(index)
+    }
+    writeBytes(prefix)
+
+    const records: V4FileRecord[] = []
+    for (const layout of layouts) {
+      if (signal?.aborted) throw signal.reason ?? new Error("V4 pack preparation aborted.")
+      await layout.entry.checkSourceStable?.()
+      const plaintext = new Uint8Array(layout.expectedSize)
+      const hasher = createV4IncrementalSha256()
+      let offset = 0
+      const chunkBytes = Math.max(1, Math.min(1024 * 1024, layout.expectedSize || 1))
+      for await (const chunk of layout.entry.source.chunks(chunkBytes, signal)) {
+        if (offset + chunk.byteLength > plaintext.byteLength) throw new V4SourceChangedError(layout.entry.logicalPath, "source produced more bytes than expected")
+        plaintext.set(chunk, offset)
+        hasher.update(chunk)
+        offset += chunk.byteLength
+        await layout.entry.checkSourceStable?.()
+      }
+      if (offset !== plaintext.byteLength) throw new V4SourceChangedError(layout.entry.logicalPath, `source produced ${offset} bytes; expected ${plaintext.byteLength}`)
+      await layout.entry.checkSourceStable?.()
+      const actualHash = hasher.digestHex()
+      if (actualHash !== layout.entry.expectedHash) throw new V4SourceChangedError(layout.entry.logicalPath, "content hash differs from planned snapshot")
+      const record = await this.preparePackEntryRecord(
+        layout.entry.logicalPath,
+        actualHash,
+        plaintext.byteLength,
+        layout.entry.version,
+        layout.entry.mtime,
+        layout.entry.fileId,
+      )
+      records.push(record)
+      if (layout.index > 0) writeAscii(",")
+      writeBytes(layout.key)
+      writeAscii(':"')
+      const encoded = toBase64(plaintext)
+      if (encoded.length !== layout.encodedBytes) throw new Error("Unexpected V4 pack base64 length.")
+      writeAscii(encoded)
+      writeAscii('"')
+    }
+    writeBytes(suffix)
+    if (archiveOffset !== archive.byteLength) throw new Error("V4 pack archive length mismatch.")
+
+    const remotePath = await this.crypto(() => opaqueV4PackPath(this.options.keyring!.pathKey, packId))
+    const bytes = await this.crypto(() => encryptV4Payload(this.options.keyring!.contentKey, archive, { kind: "pack", aad: packId }))
+    return {
+      records: records.map(record => ({ ...record, storage: "pack", remotePath, encryptedPath: remotePath, packId, partPaths: undefined })),
+      file: { path: remotePath, bytes },
     }
   }
 

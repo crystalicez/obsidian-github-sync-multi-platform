@@ -84,3 +84,26 @@ test("v4 streamed encrypted parts preserve existing part paths AAD and read comp
   assert.equal(restored.byteLength, logicalBytes);
   assert.equal(await sha256Hex(restored), record.plaintextSha256);
 });
+
+test("v4 source-built pack preserves version-1 archive and existing read compatibility", async () => {
+  const { decryptV4Payload } = await import("../../src/lib/v4/crypto");
+  const { bytesToUtf8, fromBase64, sha256Hex } = await import("../../src/lib/bytes");
+  const { createV4WholeBufferContentSource } = await import("../../src/lib/v4/content-source");
+  const plaintext = bytes("source-pack-secret");
+  const keys = await deriveV4Keyring({ passphrase: "pass", repoId: "o/r#main", salt: bytes("salt"), iterations: 10 });
+  const codec = new V4StorageCodec({ mode: "encrypted", pathLayout: "opaque-stable-v1", keyring: keys });
+  const packed = await codec.preparePackFromSources("source-pack", [{
+    logicalPath: "Folder/source.md",
+    fileId: "source-pack-file",
+    source: createV4WholeBufferContentSource(plaintext),
+    expectedHash: await sha256Hex(plaintext),
+    version: "source-pack-v1",
+    mtime: 3,
+  }]);
+
+  const archiveBytes = await decryptV4Payload(keys.contentKey, packed.file.bytes, { kind: "pack", aad: "source-pack" });
+  const archive = JSON.parse(bytesToUtf8(archiveBytes));
+  assert.equal(archive.version, 1);
+  assert.deepEqual(fromBase64(archive.entries["source-pack-file"]), plaintext);
+  assert.deepEqual(await codec.read(packed.records[0], async () => packed.file.bytes), plaintext);
+});

@@ -34,6 +34,7 @@ import type { V4PullBinding, V4PushBinding, V4ResolvedBatch, V4StagedWriteBindin
 import { boundedMap } from "./bounded-map"
 import { V4ByteCache } from "./byte-cache"
 import {
+  estimateV4PackGroupResources,
   planV4PackGroups,
   type V4PackCandidateMeta,
 } from "./pack-planner"
@@ -598,6 +599,8 @@ export class V4SyncSession {
       : []
     const packGroups = planV4PackGroups(packCandidates, {
       maxPlaintextBytes: this.resources.limits.maxPackPlaintextBytes,
+      maxResidentBytes: this.resources.limits.maxResidentBytes,
+      maxTransportTransientBytes: this.resources.limits.maxTransportTransientBytes,
     })
     const packGroupByFileId = new Map<string, number>()
     packGroups.forEach((group, groupIndex) => group.forEach(candidate => packGroupByFileId.set(candidate.fileId, groupIndex)))
@@ -627,39 +630,48 @@ export class V4SyncSession {
         processedPackGroups.add(packGroupIndex)
         const groupMeta = packGroups[packGroupIndex]
         const groupContexts = groupMeta.map(candidate => contextByFileId.get(candidate.fileId)!)
-        const groupPlaintextBytes = groupMeta.reduce((sum, candidate) => sum + candidate.size, 0)
-        const packed = await this.resources.withResidentBytes(groupPlaintextBytes, async () => {
-          const entries: Array<{ record: V4IndexFileRecord; plaintext: Uint8Array }> = []
-          for (const groupContext of groupContexts) {
-            const groupAfter = groupContext.after!
-            const plaintext = await this.readPushBinding(groupContext.binding)
-            this.report({
-              phase: "encrypting",
-              currentPath: groupAfter.path,
-              currentDirection: "push",
-              push: directional(pushCompleted, pushTotal),
-            })
-            const plaintextSha256 = await this.resources.withCrypto(() => sha256Hex(plaintext))
-            const record = await this.codec.preparePackEntryRecord(
-              groupAfter.path,
-              plaintextSha256,
-              plaintext.byteLength,
-              journalId,
-              groupAfter.mtime,
-              groupAfter.fileId,
-            )
-            entries.push({ record: { path: groupAfter.path, ...record }, plaintext })
-          }
-          return this.codec.preparePack(`${journalId}-${packGroupIndex}`, entries)
-        })
-        files.push({
-          ...packed.file,
-          progressItems: groupContexts.map(groupContext => ({ fileId: groupContext.change.fileId, path: groupContext.after!.path })),
-        })
-        for (let index = 0; index < packed.records.length; index++) {
+        const groupBudget = estimateV4PackGroupResources(groupMeta)
+        const progressItems = groupContexts.map(groupContext => ({ fileId: groupContext.change.fileId, path: groupContext.after!.path }))
+        const uploadedPack = await this.resources.withResidentBytes(groupBudget.residentBytes, () =>
+          this.resources.withTransportBytes(groupBudget.transportBytes, async () => {
+            for (const item of progressItems) onUploadStarted(item)
+            for (const groupContext of groupContexts) {
+              this.report({
+                phase: "encrypting",
+                currentPath: groupContext.after!.path,
+                currentDirection: "push",
+                push: directional(pushCompleted, pushTotal),
+              })
+            }
+            const packed = await this.codec.preparePackFromSources(`${journalId}-${packGroupIndex}`, groupContexts.map(groupContext => {
+              const groupAfter = groupContext.after!
+              const sourceHandle = groupContext.binding.source
+              return {
+                logicalPath: groupAfter.path,
+                fileId: groupAfter.fileId,
+                source: this.packContentSource(groupContext.binding),
+                expectedHash: groupAfter.hash,
+                expectedSize: groupAfter.size,
+                version: journalId,
+                mtime: groupAfter.mtime,
+                checkSourceStable: sourceHandle?.kind === "vault"
+                  ? () => this.assertVaultSnapshot(sourceHandle)
+                  : undefined,
+              }
+            }))
+            const sha = await this.input.github.createGitBlob(packed.file.bytes)
+            return { packed, sha }
+          }),
+        )
+        streamedEntries.push({ path: uploadedPack.packed.file.path, mode: "100644", type: "blob", sha: uploadedPack.sha })
+        for (const item of progressItems) {
+          streamedUploadedPushIds.add(item.fileId)
+          completePush(item, item.path)
+        }
+        for (let index = 0; index < uploadedPack.packed.records.length; index++) {
           const groupContext = groupContexts[index]
           const groupAfter = groupContext.after!
-          const record: V4IndexFileRecord = { ...packed.records[index], path: groupAfter.path }
+          const record: V4IndexFileRecord = { ...uploadedPack.packed.records[index], path: groupAfter.path }
           recordsById.set(record.fileId, record)
           journalByFileId.get(record.fileId)!.after = descriptorFor(record)
           this.localReadCache.delete(groupAfter.path)
@@ -1045,6 +1057,30 @@ export class V4SyncSession {
     if (!this.localIo.staging) throw new Error(`Missing V4 staging store for ${stage.stageId}`)
     const source = await this.localIo.staging.open(stage)
     return collectV4ContentSource(source, this.resources.limits.maxResidentBytes)
+  }
+
+  private packContentSource(binding: V4PushBinding): V4ContentSource {
+    const after = binding.change.after
+    if (!after) throw new Error(`Missing V4 pack content metadata for ${binding.change.path}`)
+    const session = this
+    return {
+      size: after.size,
+      async *chunks(chunkBytes: number, signal?: AbortSignal) {
+        let bytes: Uint8Array
+        const source = binding.source
+        if (source?.kind === "stage") {
+          bytes = await session.readStage({ stageId: source.stageId, hash: source.expectedHash, size: source.expectedSize, mtime: after.mtime })
+        } else {
+          const path = source?.kind === "vault" ? source.path : after.path
+          bytes = await session.resources.withVaultRead(() => session.localIo.read(path))
+        }
+        if (bytes.byteLength !== after.size) throw new V4SourceChangedError(after.path, `read ${bytes.byteLength} bytes; expected ${after.size}`)
+        for (let offset = 0; offset < bytes.byteLength; offset += chunkBytes) {
+          if (signal?.aborted) throw signal.reason ?? new Error("V4 pack source read aborted.")
+          yield bytes.subarray(offset, Math.min(bytes.byteLength, offset + chunkBytes))
+        }
+      },
+    }
   }
 
   private async readPushBinding(binding: V4PushBinding): Promise<Uint8Array> {
