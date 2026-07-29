@@ -100,8 +100,11 @@ jobs:
         if: steps.check_version.outputs.should_release == 'true'
         run: |
 
-          pnpm install
+          pnpm install --frozen-lockfile
           pnpm run build
+          pnpm test
+          pnpm test:repeat
+          pnpm validate:package
           mkdir ${{ env.NAME }}
           cp main.js manifest.json styles.css ${{ env.NAME }}
           zip -r ${{ env.NAME }}-v${{ steps.check_version.outputs.release_tag }}.zip ${{ env.NAME }}

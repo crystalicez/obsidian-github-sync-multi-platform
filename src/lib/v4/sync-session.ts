@@ -6,31 +6,19 @@ import type { V4Keyring } from "./crypto"
 import { encryptV4Payload } from "./crypto"
 import { publishV4TreeChanges, type V4GitTreeFile, type V4GitTreeGithub, type V4GitTreeProgressItem } from "./git-tree-writer"
 import { buildV4JournalPages, type V4JournalChange } from "./history-journal"
-import { isV4LocalIndexCacheComplete, isV4LocalIndexShardConsistent, type V4IndexFileRecord, type V4LocalIndex } from "./local-index"
+import { isV4LocalIndexCacheComplete, type V4IndexFileRecord, type V4LocalIndex } from "./local-index"
+import { createV4LocalIo, type V4LocalIo, type V4SessionVault } from "./local-io"
 import { bucketForV4PathId } from "./paths"
 import { planV4Sync, type V4LogicalFile, type V4PlannedChange, type V4SyncOperation } from "./planner"
-import {
-  buildV4RemoteMetadata,
-  assertV4RemoteRecordSet,
-  assertV4RemoteShardRecords,
-  decodeV4RemoteConfig,
-  decodeV4RemoteHead,
-  decodeV4RemoteShard,
-  v4RemoteShardPath,
-} from "./remote-index"
-import { effectiveV4PathLayout, expectedV4PathLayout, V4_CONFIG_PATH, V4_HEAD_PATH, V4_ROOT, type V4RemoteConfig, type V4RemoteHead } from "./protocol-types"
+import { assertV4RemoteRecordSet, buildV4RemoteMetadata, v4RemoteShardPath } from "./remote-index"
+import { effectiveV4PathLayout, expectedV4PathLayout, V4_CONFIG_PATH, V4_ROOT, type V4RemoteConfig, type V4RemoteHead } from "./protocol-types"
+import { loadV4RemoteConfig, loadV4RemoteState, remoteV4StateFromLocalIndex, type V4RemoteState } from "./remote-loader"
 import { V4StorageCodec } from "./storage-codec"
 import type { V4QueuedChange } from "./sync-coordinator"
 import type { V4DirectionalProgress, V4SyncProgressPatch } from "./progress"
 
-export interface V4SessionVaultFile { path: string; size: number; mtime: number }
-export interface V4SessionVault {
-  listFiles(): Promise<V4SessionVaultFile[]>
-  stat?(path: string): Promise<V4SessionVaultFile | null>
-  read(path: string): Promise<Uint8Array>
-  write(path: string, bytes: Uint8Array, mtime?: number): Promise<void>
-  delete(path: string): Promise<void>
-}
+export type { V4SessionVault, V4SessionVaultFile } from "./local-io"
+export { assertV4PathLayoutCompatible } from "./remote-loader"
 
 export interface V4SessionGithub extends V4GitTreeGithub {
   getFileBytes(path: string, ref?: string): Promise<{ bytes: Uint8Array; sha: string } | null>
@@ -63,13 +51,6 @@ export interface V4SessionSyncResult {
   pushedFiles: number
   pulledFiles: number
   commitSha?: string
-}
-
-interface V4RemoteState {
-  config: V4RemoteConfig
-  head: V4RemoteHead
-  records: V4IndexFileRecord[]
-  commitSha: string
 }
 
 interface V4EffectivePull {
@@ -212,13 +193,6 @@ function causalIdentityState(records: V4IndexFileRecord[], changes: V4QueuedChan
   }
 }
 
-export function assertV4PathLayoutCompatible(remote: V4RemoteConfig, desired: V4RemoteConfig, operation: V4SyncOperation): void {
-  const actual = effectiveV4PathLayout(remote)
-  const expected = expectedV4PathLayout(desired.mode)
-  if (actual === expected) return
-  if (operation === "forcePush") return
-  throw new Error(`Remote encrypted path layout is ${actual}; confirmed Force Push is required to migrate to ${expected}.`)
-}
 
 const PACK_MIN_CHANGED_FILES = 64
 const PACK_MAX_FILES = 500
@@ -228,6 +202,7 @@ const PACK_MAX_ENTRY_BYTES = 1024 * 1024
 export class V4SyncSession {
   private readonly codec: V4StorageCodec
   private readonly now: () => number
+  private readonly localIo: V4LocalIo
   private readonly localReadCache = new Map<string, Uint8Array>()
 
   constructor(private readonly input: V4SyncSessionInput) {
@@ -237,6 +212,7 @@ export class V4SyncSession {
       keyring: input.keyring,
     })
     this.now = input.now ?? (() => Date.now())
+    this.localIo = createV4LocalIo(input.vault)
   }
 
   private report(patch: V4SyncProgressPatch): void {
@@ -256,11 +232,11 @@ export class V4SyncSession {
     const baseCommitSha = this.input.index.remoteCommitSha
     this.report({ phase: "checking-remote", currentPath: undefined, currentDirection: undefined })
     const ref = await this.input.github.getGitRefOrNull()
-    const remoteConfig = await this.loadRemoteConfig(ref?.sha, options.operation)
+    const remoteConfig = await loadV4RemoteConfig({ github: this.input.github, desiredConfig: this.input.config }, ref?.sha, options.operation)
     const localCacheComplete = isV4LocalIndexCacheComplete(this.input.index)
     const remote = ref && remoteConfig && remoteConfig.mode !== "encrypted" && localCacheComplete && ref.sha === this.input.index.remoteCommitSha && this.input.index.pathLayout === effectiveV4PathLayout(remoteConfig)
-      ? this.remoteFromLocalIndex(ref.sha, remoteConfig)
-      : await this.loadRemote(ref?.sha, remoteConfig, options.operation)
+      ? remoteV4StateFromLocalIndex(this.input.index, ref.sha, remoteConfig)
+      : await loadV4RemoteState({ github: this.input.github, index: this.input.index, keyring: this.input.keyring }, ref?.sha, remoteConfig)
     if (!remote && options.operation !== "forcePush") {
       throw new Error("Remote is not V4. Force Push is required before sync or Force Pull.")
     }
@@ -466,7 +442,7 @@ export class V4SyncSession {
         currentDirection: "push",
         ...counters(true),
       })
-      await this.input.vault.write(apply.path, apply.bytes, apply.mtime)
+      await this.localIo.write(apply.path, apply.bytes, apply.mtime)
       this.localReadCache.set(apply.path, apply.bytes)
     }
 
@@ -679,56 +655,6 @@ export class V4SyncSession {
     return { mode, operation: options.operation, changedFiles, pushedFiles: pushes.length, pulledFiles, commitSha: published.commitSha }
   }
 
-  private async loadRemoteConfig(commitSha: string | undefined, operation: V4SyncOperation): Promise<V4RemoteConfig | null> {
-    const configFile = await this.input.github.getFileBytes(V4_CONFIG_PATH, commitSha)
-    if (!configFile) return null
-    const config = decodeV4RemoteConfig(configFile.bytes)
-    if (config.repoId !== this.input.config.repoId) throw new Error("V4 remote repository identity mismatch.")
-    assertV4PathLayoutCompatible(config, this.input.config, operation)
-    return config
-  }
-
-  private async loadRemote(commitSha: string | undefined, config: V4RemoteConfig | null, operation: V4SyncOperation): Promise<V4RemoteState | null> {
-    if (!config) return null
-    const headFile = await this.input.github.getFileBytes(V4_HEAD_PATH, commitSha)
-    if (!headFile) throw new Error("V4 remote head is missing.")
-    const head = await decodeV4RemoteHead(headFile.bytes, config, this.input.keyring)
-    const records: V4IndexFileRecord[] = []
-    for (const bucket of Object.keys(head.shardHashes)) {
-      const cached = isV4LocalIndexShardConsistent(this.input.index, bucket, head.shardHashes[bucket])
-        ? this.input.index.shards[bucket]
-        : undefined
-      if (cached) {
-        assertV4RemoteShardRecords({ bucket, records: cached.records }, bucket, config)
-        records.push(...Object.values(cached.records))
-        continue
-      }
-      const file = await this.input.github.getFileBytes(v4RemoteShardPath(bucket, config.mode), commitSha)
-      if (!file) throw new Error(`V4 remote shard is missing: ${bucket}`)
-      records.push(...Object.values((await decodeV4RemoteShard(file.bytes, bucket, config, this.input.keyring)).records))
-    }
-    await assertV4RemoteRecordSet(records, config, this.input.keyring)
-    return { config, head, records, commitSha: commitSha ?? "" }
-  }
-
-  private remoteFromLocalIndex(commitSha: string, config: V4RemoteConfig): V4RemoteState {
-    return {
-      config,
-      head: {
-        formatVersion: 4,
-        mode: this.input.index.mode,
-        epoch: this.input.index.epoch,
-        generation: this.input.index.generation,
-        journalId: "",
-        shardHashes: { ...this.input.index.shardHashes },
-        updatedAt: 0,
-        deviceId: this.input.index.deviceId,
-      },
-      records: recordsFromIndex(this.input.index).map(record => ({ ...record, partPaths: record.partPaths ? [...record.partPaths] : undefined })),
-      commitSha,
-    }
-  }
-
   private async reconcileExternalCommit(remote: V4RemoteState, treeSha: string): Promise<void> {
     if (remote.config.mode === "encrypted") {
       throw new Error("External GitHub changes touched an encrypted V4 branch without updating its journal. Use Force Push or Force Pull after reviewing the commit.")
@@ -773,7 +699,7 @@ export class V4SyncSession {
     this.report({ phase: "scanning-local", currentPath: undefined, currentDirection: undefined })
     const pathChanges = changes.filter((change): change is Exclude<V4QueuedChange, { type: "rescan" }> => change.type !== "rescan")
     const hasFolderChange = pathChanges.some(change => change.type === "folderRename" || change.type === "folderDelete")
-    if (changes.length > 0 && pathChanges.length === changes.length && !hasFolderChange && baseRecords.length > 0 && this.input.vault.stat) {
+    if (changes.length > 0 && pathChanges.length === changes.length && !hasFolderChange && baseRecords.length > 0 && this.localIo.stat) {
       const byPath = new Map(logical(baseRecords).map(file => [file.path, file]))
       for (const change of pathChanges) {
         if (change.type === "delete") { byPath.delete(change.path); continue }
@@ -781,7 +707,7 @@ export class V4SyncSession {
         if (change.type === "replace") { byPath.delete(change.oldPath); byPath.delete(change.path) }
         if (change.type === "rename") byPath.delete(change.oldPath)
         this.report({ phase: "scanning-local", currentPath: change.path, currentDirection: undefined })
-        const stat = await this.input.vault.stat(change.path)
+        const stat = await this.localIo.stat(change.path)
         if (!stat) { byPath.delete(change.path); continue }
         this.report({ phase: "hashing", currentPath: change.path, currentDirection: undefined })
         const content = await this.readLocal(change.path)
@@ -796,7 +722,7 @@ export class V4SyncSession {
       for (const [path, fileId] of additionalFilesByPath ?? []) {
         if (byPath.has(path)) continue
         this.report({ phase: "scanning-local", currentPath: path, currentDirection: undefined })
-        const stat = await this.input.vault.stat(path)
+        const stat = await this.localIo.stat(path)
         if (!stat) continue
         this.report({ phase: "hashing", currentPath: path, currentDirection: undefined })
         const content = await this.readLocal(path)
@@ -831,7 +757,7 @@ export class V4SyncSession {
         identityByPath.set(`${change.path}${suffix}`, record)
       }
     }
-    const files = await this.input.vault.listFiles()
+    const files = await this.localIo.listFiles()
     return Promise.all(files.map(async file => {
       this.report({ phase: "scanning-local", currentPath: file.path, currentDirection: undefined })
       const existing = identityByPath.get(file.path)
@@ -857,7 +783,7 @@ export class V4SyncSession {
   ): Promise<void> {
     if (change.kind === "delete") {
       this.report({ phase: "applying", currentPath: change.path, currentDirection: "pull" })
-      await this.input.vault.delete(change.path)
+      await this.localIo.delete(change.path)
       onCompleted()
       return
     }
@@ -869,8 +795,8 @@ export class V4SyncSession {
       bytes = await this.readRecord(record!, remoteCommitSha)
     }
     this.report({ phase: "applying", currentPath: change.path, currentDirection: "pull" })
-    if (change.kind === "rename" && change.previousPath) await this.input.vault.delete(change.previousPath)
-    await this.input.vault.write(change.path, bytes, cachedMtime ?? record!.mtime)
+    if (change.kind === "rename" && change.previousPath) await this.localIo.delete(change.previousPath)
+    await this.localIo.write(change.path, bytes, cachedMtime ?? record!.mtime)
     this.localReadCache.set(change.path, bytes)
     onCompleted()
   }
@@ -878,7 +804,7 @@ export class V4SyncSession {
   private async readLocal(path: string): Promise<Uint8Array> {
     const cached = this.localReadCache.get(path)
     if (cached) return cached
-    const bytes = await this.input.vault.read(path)
+    const bytes = await this.localIo.read(path)
     this.localReadCache.set(path, bytes)
     return bytes
   }

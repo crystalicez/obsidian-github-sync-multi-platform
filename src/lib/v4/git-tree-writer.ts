@@ -30,6 +30,24 @@ export interface V4GitTreeGithub {
   updateGitRef(sha: string, expectedSha?: string): Promise<void>;
 }
 
+export interface V4PublicationBase {
+  ref: GitHubGitRef | null;
+  previousHeadSha?: string;
+  baseTreeSha?: string;
+}
+
+export interface V4UploadedTreeFiles {
+  entries: GitHubCreateTreeEntry[];
+  fileShas: Record<string, string>;
+}
+
+export interface V4CandidateCommit {
+  previousHeadSha?: string;
+  baseTreeSha?: string;
+  treeSha: string;
+  commitSha: string;
+}
+
 async function mapWithConcurrency<T, R>(items: T[], concurrency: number, mapper: (item: T) => Promise<R>): Promise<R[]> {
   const results = new Array<R>(items.length);
   let next = 0;
@@ -60,13 +78,23 @@ function invokeProgressCallback(callback: (() => void) | undefined): void {
   }
 }
 
-export async function publishV4TreeChanges(github: V4GitTreeGithub, input: V4GitTreeWriteInput): Promise<V4GitTreeWriteResult> {
+export async function resolveV4PublicationBase(
+  github: V4GitTreeGithub,
+  expectedHeadSha?: string | null,
+): Promise<V4PublicationBase> {
   let ref = await github.getGitRefOrNull();
-  if (input.expectedHeadSha !== undefined && (ref?.sha ?? null) !== input.expectedHeadSha) {
-    throw new Error("V4 branch head changed before atomic publish.")
+  if (expectedHeadSha !== undefined && (ref?.sha ?? null) !== expectedHeadSha) {
+    throw new Error("V4 branch head changed before atomic publish.");
   }
   if (!ref && github.ensureGitRepositoryInitialized) ref = await github.ensureGitRepositoryInitialized();
   const baseTreeSha = ref ? (await github.getGitCommit(ref.sha)).treeSha : undefined;
+  return { ref, previousHeadSha: ref?.sha, baseTreeSha };
+}
+
+export async function uploadV4TreeFiles(
+  github: V4GitTreeGithub,
+  input: Pick<V4GitTreeWriteInput, "files" | "onLogicalFileUploadStarted" | "onLogicalFileUploaded" | "onUploadsComplete">,
+): Promise<V4UploadedTreeFiles> {
   const progressItemsByFile = input.files.map(file => {
     const seen = new Set<string>();
     return (file.progressItems ?? []).filter(item => {
@@ -101,11 +129,46 @@ export async function publishV4TreeChanges(github: V4GitTreeGithub, input: V4Git
     fileShas[file.path] = sha;
     return { path: file.path, mode: "100644", type: "blob", sha };
   });
-  for (const path of input.deletions ?? []) entries.push({ path, mode: "100644", type: "blob", sha: null });
   invokeProgressCallback(input.onUploadsComplete);
-  const treeSha = await github.createGitTree(entries, baseTreeSha);
-  const commitSha = await github.createGitCommit(input.message, treeSha, ref ? [ref.sha] : []);
-  if (ref) await github.updateGitRef(commitSha, ref.sha);
-  else await github.createGitRef(commitSha);
-  return { previousHeadSha: ref?.sha, baseTreeSha, treeSha, commitSha, fileShas };
+  return { entries, fileShas };
+}
+
+export async function createV4CandidateCommit(
+  github: V4GitTreeGithub,
+  input: {
+    base: V4PublicationBase;
+    message: string;
+    entries: GitHubCreateTreeEntry[];
+    deletions?: string[];
+  },
+): Promise<V4CandidateCommit> {
+  const entries = [...input.entries];
+  for (const path of input.deletions ?? []) entries.push({ path, mode: "100644", type: "blob", sha: null });
+  const treeSha = await github.createGitTree(entries, input.base.baseTreeSha);
+  const parents = input.base.ref ? [input.base.ref.sha] : [];
+  const commitSha = await github.createGitCommit(input.message, treeSha, parents);
+  return {
+    previousHeadSha: input.base.previousHeadSha,
+    baseTreeSha: input.base.baseTreeSha,
+    treeSha,
+    commitSha,
+  };
+}
+
+export async function publishV4CandidateRef(github: V4GitTreeGithub, candidate: V4CandidateCommit): Promise<void> {
+  if (candidate.previousHeadSha !== undefined) await github.updateGitRef(candidate.commitSha, candidate.previousHeadSha);
+  else await github.createGitRef(candidate.commitSha);
+}
+
+export async function publishV4TreeChanges(github: V4GitTreeGithub, input: V4GitTreeWriteInput): Promise<V4GitTreeWriteResult> {
+  const base = await resolveV4PublicationBase(github, input.expectedHeadSha);
+  const uploaded = await uploadV4TreeFiles(github, input);
+  const candidate = await createV4CandidateCommit(github, {
+    base,
+    message: input.message,
+    entries: uploaded.entries,
+    deletions: input.deletions,
+  });
+  await publishV4CandidateRef(github, candidate);
+  return { ...candidate, fileShas: uploaded.fileShas };
 }

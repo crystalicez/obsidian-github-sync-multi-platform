@@ -17,6 +17,7 @@ import type { V4ConflictResolution } from "./conflicts"
 import { V4SyncCoordinator, type V4QueuedChange, type V4SyncRequest } from "./sync-coordinator"
 import { expectedV4PathLayout, V4_FORMAT_VERSION, V4_CONFIG_PATH, type V4RemoteConfig, type V4StorageMode } from "./protocol-types"
 import { V4HistoryService } from "./history-service"
+import type { V4SessionVault } from "./local-io"
 import { V4ProgressStore, type V4SyncProgressSnapshot } from "./progress"
 
 const V4_INDEX_ROOT = "github-sync-v4-index"
@@ -246,7 +247,7 @@ export class V4PluginRuntime {
     await saveV4LocalIndex(this.adapter, V4_INDEX_ROOT, index, previousShardHashes)
   }
 
-  private sessionVault(inScope = this.scopePredicate()) {
+  private sessionVault(inScope = this.scopePredicate()): V4SessionVault {
     return {
       listFiles: async () => this.plugin.app.vault.getFiles().filter(file => inScope(file.path)).map(file => ({ path: file.path, size: file.stat.size, mtime: file.stat.mtime })),
       stat: async (path: string) => {

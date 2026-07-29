@@ -1,7 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { publishV4TreeChanges } from "../../src/lib/v4/git-tree-writer";
+import {
+  createV4CandidateCommit,
+  publishV4CandidateRef,
+  publishV4TreeChanges,
+  resolveV4PublicationBase,
+  uploadV4TreeFiles,
+} from "../../src/lib/v4/git-tree-writer";
 import type { GitHubCreateTreeEntry } from "../../src/lib/github-git-types";
 
 class MemoryV4GitHub {
@@ -193,6 +199,58 @@ test("V4 tree writer settles already-started uploads before rejecting the first 
   assert.equal(events.slice(rejectionIndex + 1).some(event => event.startsWith("uploaded:")), false, events.join(", "));
   assert.equal(events.slice(0, rejectionIndex).filter(event => event.startsWith("uploaded:")).length, 3);
   assert.equal(events.includes("uploads-complete"), false);
+  assert.equal(github.trees.length, 0);
+  assert.equal(github.commits.length, 0);
+  assert.deepEqual(github.createdRefs, []);
+  assert.deepEqual(github.updatedRefs, []);
+});
+
+
+test("V4 tree writer creates an exact candidate before mutating the branch ref", async () => {
+  const github = new MemoryV4GitHub();
+  github.ref = { ref: "refs/heads/main", sha: "commit-old", type: "commit" };
+
+  const base = await resolveV4PublicationBase(github, "commit-old");
+  const uploaded = await uploadV4TreeFiles(github, { files: [{ path: "A.md", bytes: bytes("A") }] });
+  const candidate = await createV4CandidateCommit(github, {
+    base,
+    message: "obsidian-sync-v4:journal-candidate",
+    entries: uploaded.entries,
+    deletions: ["old.md"],
+  });
+
+  assert.equal(candidate.commitSha, "commit-1");
+  assert.equal(candidate.previousHeadSha, "commit-old");
+  assert.deepEqual(github.updatedRefs, []);
+  assert.deepEqual(github.createdRefs, []);
+
+  await publishV4CandidateRef(github, candidate);
+  assert.deepEqual(github.updatedRefs, [{ sha: "commit-1", expected: "commit-old" }]);
+});
+
+test("V4 publication base resolves bootstrap before creating a normal candidate", async () => {
+  const github = new MemoryV4GitHub();
+  github.initializedRef = { ref: "refs/heads/main", sha: "bootstrap", type: "commit" };
+
+  const base = await resolveV4PublicationBase(github, null);
+
+  assert.equal(base.ref?.sha, "bootstrap");
+  assert.equal(base.baseTreeSha, "base-tree");
+  assert.deepEqual(github.createdRefs, []);
+  assert.deepEqual(github.updatedRefs, []);
+});
+
+
+test("V4 publication base rejects a stale expected head before uploads or bootstrap", async () => {
+  const github = new MemoryV4GitHub();
+  github.ref = { ref: "refs/heads/main", sha: "commit-current", type: "commit" };
+
+  await assert.rejects(
+    () => resolveV4PublicationBase(github, "commit-stale"),
+    /branch head changed/iu,
+  );
+
+  assert.equal(github.blobs.length, 0);
   assert.equal(github.trees.length, 0);
   assert.equal(github.commits.length, 0);
   assert.deepEqual(github.createdRefs, []);

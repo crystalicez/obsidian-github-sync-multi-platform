@@ -14,6 +14,7 @@ import { buildV4RemoteMetadata } from "../../src/lib/v4/remote-index";
 import { publishV4TreeChanges } from "../../src/lib/v4/git-tree-writer";
 import { V4_LARGE_FILE_THRESHOLD_BYTES } from "../../src/lib/v4/large-files";
 import type { V4SyncProgressPatch } from "../../src/lib/v4/progress";
+import { waitForCondition } from "../helpers/wait-for";
 
 const enc = (value: string) => new TextEncoder().encode(value);
 const dec = (value: Uint8Array) => new TextDecoder().decode(value);
@@ -1090,7 +1091,7 @@ test("v4 resolves every conflict and exact total before an ordinary pull mutates
     },
   }).sync({ operation: "normal", allowThresholdOverride: false, changes: [{ type: "modify", path: "conflict.md", mtime: 3 }] });
 
-  for (let tick = 0; !promptPending && tick < 50; tick++) await new Promise<void>(resolve => setImmediate(resolve));
+  await waitForCondition(() => promptPending, "ordinary pull conflict prompt");
   assert.equal(promptPending, true);
   const operationsBeforeDecision = [...fixture.localVault.operations];
   const eventsBeforeDecision = events.map(event => structuredClone(event));
@@ -1224,7 +1225,7 @@ test("v4 defers a merged local write until every conflict decision and exact tot
     changes: ["A.md", "B.md"].map(path => ({ type: "modify" as const, path, mtime: 3 })),
   });
 
-  for (let tick = 0; !secondPromptPending && tick < 50; tick++) await new Promise<void>(resolve => setImmediate(resolve));
+  await waitForCondition(() => secondPromptPending, "second conflict prompt");
   assert.equal(secondPromptPending, true);
   const writesBeforeFinalDecision = timeline.filter(item => item.kind === "write").map(item => item.path);
   secondDecision.resolve({ action: "use-local" });

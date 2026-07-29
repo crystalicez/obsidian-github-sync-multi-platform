@@ -8,11 +8,18 @@
     "dev": "node esbuild.config.mjs",
     "devcss": "sass --watch src/styles.scss styles.css && tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
     "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
-    "test": "node scripts/run-tests.mjs",
+    "test": "node scripts/run-tests.mjs --tier=fast",
     "ver": "node ./scripts/update-version.js",
     "test:github-e2e": "node scripts/run-github-e2e.mjs",
     "test:github-e2e:quick": "node scripts/run-github-e2e.mjs",
-    "zip": "node scripts/zip-source.mjs"
+    "zip": "node scripts/zip-source.mjs",
+    "test:fast": "node scripts/run-tests.mjs --tier=fast",
+    "test:repeat": "node scripts/run-test-repeat.mjs",
+    "test:feasibility": "node scripts/run-tests.mjs --tier=feasibility",
+    "test:resource": "node scripts/run-tests.mjs --tier=resource",
+    "test:recovery": "node scripts/run-tests.mjs --tier=recovery",
+    "test:soak": "node scripts/run-soak.mjs",
+    "validate:package": "node scripts/validate-package.mjs"
   },
   "keywords": [],
   "repository": {

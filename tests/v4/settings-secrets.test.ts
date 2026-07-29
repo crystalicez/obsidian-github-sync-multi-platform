@@ -14,6 +14,7 @@ import { V4StorageCodec } from "../../src/lib/v4/storage-codec";
 import { V4_CONFIG_PATH, V4_FORMAT_VERSION, V4_HEAD_PATH, V4_ROOT, type V4PathLayout, type V4RemoteConfig, type V4RemoteHead } from "../../src/lib/v4/protocol-types";
 import { loadV4LocalIndex, type V4IndexFileRecord, type V4LocalIndex, type V4LocalIndexAdapter } from "../../src/lib/v4/local-index";
 import type { V4SyncProgressSnapshot } from "../../src/lib/v4/progress";
+import { waitForCondition } from "../helpers/wait-for";
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -219,9 +220,7 @@ test("v4 runtime terminal upload failure snapshot cannot mutate after delayed wo
   fixture.runtime.subscribeProgress(snapshot => seen.push(structuredClone(snapshot)));
 
   const run = fixture.runtime.forcePush();
-  for (let tick = 0; fixture.github.blobAttempts < 4 && tick < 500; tick++) {
-    await new Promise<void>(resolve => setImmediate(resolve));
-  }
+  await waitForCondition(() => fixture.github.blobAttempts >= 4, "four blob upload attempts");
   assert.equal(fixture.github.blobAttempts, 4, JSON.stringify(fixture.runtime.progressSnapshot));
   delayed.forEach((gate, index) => gate.resolve(`blob-${index + 2}`));
   await run;
@@ -240,9 +239,8 @@ test("v4 runtime publishes blocked with planned totals before the force override
   resetModalTestState();
 
   const run = fixture.runtime.forcePush();
-  for (let tick = 0; modalButtons.length === 0 && tick < 50; tick++) {
-    await new Promise<void>(resolve => setImmediate(resolve));
-  }
+  await waitForCondition(() => modalButtons.length > 0, "force override modal");
+  await waitForCondition(() => fixture.runtime.progressSnapshot.phase === "blocked", "blocked progress phase");
 
   assert.equal(fixture.runtime.progressSnapshot.phase, "blocked");
   assert.deepEqual(fixture.runtime.progressSnapshot.push, { completed: 0, total: 1 });
@@ -678,7 +676,7 @@ test("v4 guard confirmation counts each checking entry as a displayed attempt", 
   fixture.runtime.subscribeProgress(snapshot => seen.push(structuredClone(snapshot)));
 
   const run = fixture.runtime.forcePush();
-  for (let tick = 0; modalButtons.length === 0 && tick < 50; tick++) await new Promise<void>(resolve => setImmediate(resolve));
+  await waitForCondition(() => modalButtons.some(button => button.text === "Override and force push"), "force push override button");
   const confirm = modalButtons.find(button => button.text === "Override and force push");
   assert.ok(confirm);
   confirm.click();
@@ -703,7 +701,7 @@ test("v4 guard confirmation plus CAS retry keeps displayed attempts and occurren
   fixture.runtime.subscribeProgress(snapshot => seen.push(structuredClone(snapshot)));
 
   const run = fixture.runtime.forcePush();
-  for (let tick = 0; modalButtons.length === 0 && tick < 50; tick++) await new Promise<void>(resolve => setImmediate(resolve));
+  await waitForCondition(() => modalButtons.some(button => button.text === "Override and force push"), "force push override button");
   const confirm = modalButtons.find(button => button.text === "Override and force push");
   assert.ok(confirm);
   confirm.click();
