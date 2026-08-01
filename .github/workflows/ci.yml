@@ -26,6 +26,12 @@ jobs:
         run: pnpm test
       - name: Repeat fast tests
         run: pnpm test:repeat
+      - name: Recovery tests
+        run: pnpm test:recovery
+      - name: Resource tests
+        run: pnpm test:resource
+      - name: Feasibility tests
+        run: pnpm test:feasibility
       - name: Validate package
         run: pnpm validate:package
       - name: Upload tested plugin artifact

@@ -1,0 +1,61 @@
+{
+  "schemaVersion": 1,
+  "capturedDate": "2026-07-30",
+  "platform": "windows",
+  "sourceEvidence": {
+    "task14OfficialGate": "pass",
+    "build": "pass",
+    "fast": { "passed": 341, "total": 341 },
+    "repeat": { "runs": 10, "status": "pass" },
+    "recovery": { "passed": 23, "total": 23 },
+    "resource": { "passed": 7, "total": 7 },
+    "feasibility": { "passed": 6, "total": 6 },
+    "packageValidation": "pass",
+    "task15SourceCommit": "233c0681afe6869464252d56309b8dff00f538f4",
+    "task15FullSourceArchiveSha256": "59c6961f140f8ce1d479ca8d16b12d3538d4692ec8faf1578ec60fa2020e14c7"
+  },
+  "task15AutomatedGate": {
+    "status": "pass",
+    "build": "pass",
+    "fast": { "passed": 345, "total": 345 },
+    "repeat": { "runs": 10, "passedPerRun": 345, "totalPerRun": 345, "status": "pass" },
+    "recovery": { "passed": 30, "total": 30 },
+    "resource": { "passed": 11, "total": 11 },
+    "feasibility": { "passed": 6, "total": 6 },
+    "packageValidation": "pass",
+    "soak": {
+      "status": "pass",
+      "virtual2GiB": "pass",
+      "virtual5GiB": "pass",
+      "measurementClass": "automated-virtual-stream"
+    }
+  },
+  "physicalLargeFile": {
+    "status": "pending",
+    "classification": null,
+    "logicalBytes": 5368709120,
+    "encryptedForcePushSeconds": null,
+    "noopSyncSeconds": null,
+    "forcePullSeconds": null,
+    "sourceSha256": null,
+    "pulledSha256": null,
+    "peakMemoryBytes": null,
+    "memoryMetric": null,
+    "requests": null,
+    "mutations": null,
+    "retries": null,
+    "pacingMs": null,
+    "partBytes": null,
+    "partCount": null,
+    "controlledRecovery": "pending"
+  },
+  "performance": {
+    "unchanged10kMs": null,
+    "oneFileChangeMs": null,
+    "small1000BatchMs": null,
+    "packBatchMs": null,
+    "virtual512MiB": "automated-resource-test",
+    "virtual2GiB": "pass-official-windows-soak",
+    "virtual5GiB": "pass-official-windows-soak"
+  }
+}

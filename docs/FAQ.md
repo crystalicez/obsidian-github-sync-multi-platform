@@ -1,110 +1,91 @@
 # Frequently Asked Questions (FAQ) / 常见问题解答
 
-Here are the answers to the most frequently asked questions about the synchronization mechanism of **Obsidian-Github-Sync-Multi-Platform**.
+This FAQ describes the current V4 implementation. Qualification status for very large files is evidence-based and platform-specific.
 
-有关 **Obsidian-Github-Sync-Multi-Platform** 同步机制的常见问题解答。
+本文说明当前 V4 实现。超大文件能力必须按平台和实际验证证据区分。
 
 ---
 
 ## 简体中文
 
-### Q1. 双向同步：当远程仓库有更新时，插件是否支持从 GitHub 拉取更改？还是只能单向推送？
+### Q1. V4 是双向同步吗？
 
-**支持完整的双向同步。**
+是。普通同步使用三方状态（上次已验证基线、本地、远端）制定计划：先处理需要拉取的远端变化，再在一个 Git 提交中发布需要推送的远端变化。文件创建、修改、删除、文件重命名和文件夹重命名都会保留 V4 的逻辑文件身份；“删除后重建”会产生新的身份。
 
-插件的同步逻辑分为 **全量双向同步** 和 **本地实时单向推送** 两种机制：
+**Force Push** 让 V4 远端精确镜像当前同步范围内的本地状态；**Force Pull** 让本地同步范围镜像已验证的 V4 远端状态。加密旧布局迁移只通过明确确认的 Force Push 完成，普通同步不会隐式迁移。
 
-1. **全量双向同步**（拉取远端变动 + 推送本地变动）：
-   - **触发时机**：
-     - 在插件启动时（延迟 1.5 秒以等待 Obsidian 布局初始化完毕）。
-     - 用户点击侧边栏的同步图标。
-     - 手动执行“同步全部笔记”命令。
-   - **工作流**：
-     - **第一步（拉取远端变更）**：获取 GitHub 上的当前文件树，对比本地缓存的 SHA。如果远端有新文件，或远端的 SHA 与本地记录的 SHA 不一致，插件会通过 GitHub API 下载最新内容并覆盖/新建本地文件。
-     - **第二步（推送本地变更）**：扫描本地的所有文件，将远端不存在的新文件以及本地内容发生变化的文件推送至 GitHub。
-2. **本地实时单向推送**：
-   - **机制**：当用户在本地编辑、创建、重命名或删除笔记时，插件的 Watcher 会监听到这些事件（在执行上述全量同步时，Watcher 会临时关闭以防产生冲突），并通过防抖机制（默认 5 秒防抖，避免高频请求触发 GitHub API 速率限制）自动将变更推送至 GitHub。
+### Q2. V4 是否每次重新上传所有文件？
 
----
+不是。计划器按逻辑文件身份、路径和内容哈希判断变化；未变文件复用现有远端记录。内容保持不变的重命名可以复用已有加密对象/分片，不重新上传文件内容。
 
-### Q2. 增量推送：插件是否只同步有变更的文件（增量同步），还是每次都会推送全部内容？
+但这不等于“文件内部增量/差分上传”。当一个大文件的内容发生变化时，当前 V4 会生成新的完整 `remoteVersion`；超过 50 MiB 的远端内容使用有序分片。当前协议没有 changed-part/delta sync，因此修改一个 5 GiB 加密文件可能产生接近一整个新 5 GiB 修订的数据增长。
 
-**插件采用完全的增量同步策略。**
+### Q3. 多设备同时修改同一文件时怎么处理？
 
-无论是拉取还是推送，插件都会通过哈希（Hash）和 SHA 校验来过滤未变更的文件，绝不会每次推送或下载全部内容：
+V4 会检测真正的三方冲突，不再采用旧版 FAQ 中描述的“409 后直接覆盖”。可选策略为：
 
-*   **推送增量过滤**：插件会计算本地文件的最新内容哈希值（Markdown 笔记采用内容 Hash，图片等二进制文件采用 `大小 + 修改时间` 组合 Hash），并与本地同步缓存数据 `syncData.files[path].hash` 进行比对。如果哈希值未发生变化，则直接跳过该文件。
-*   **拉取增量过滤**：插件通过 GitHub Tree 接口一次性获取远端所有文件的 SHA 列表，仅对 SHA 发生改变或本地不存在的文件发起具体的内容下载请求（GET），不会重复下载未修改的文件。
+- **Copy policy**：保留远端主版本，同时把本地版本保存为冲突副本。
+- **Newer**：按元数据选择较新的版本；时间相同时退化为保留两份。
+- **Merge text**：只对支持的文本类型且三个已知版本都不超过 2 MiB 时尝试当前的保守三方合并；不能安全合并时保留两份。
+- **Always ask**：先让用户选择，再只读取所需的内容。
 
----
+网络过程中如果本地目标又被用户修改，最终写入前的 precondition 会阻止静默覆盖，并转入重新规划/恢复路径。
 
-### Q3. 冲突处理：如果多台设备同时编辑同一笔记，产生冲突时插件如何处理？
+### Q4. 大文件和 5 GiB 的支持状态是什么？
 
-由于本插件**没有采用类似 Git 的本地三方合并逻辑（Merge）**，也**不会生成 `.conflict` 等冲突副本文件**，因此在发生冲突时，插件会采用 **“覆盖（Overwrite）/ 最终写入者胜出”** 的简易策略：
+V4 远端格式在超过 50 MiB 时使用分片；当前兼容读取必须接受历史 48 MiB 分片。桌面端实现了有界读取、分阶段写入和最终校验提交，自动化测试还覆盖 512 MiB 虚拟路径以及独立的 2/5 GiB cryptographic soak harness。
 
-*   **场景 A：在未拉取最新远端更改的情况下，本地实时修改并触发推送**
-    *   当设备 B 在本地修改了笔记 `X.md` 并触发实时推送时，它会携带本地旧的 SHA 试图更新 GitHub。
-    *   因为设备 A 已经提前更新了 GitHub 上的该文件，GitHub 会返回 `409 Conflict`（冲突）或 `422` 错误。
-    *   插件捕捉到 409/422 状态码后，会**自动请求获取远端最新的 SHA，然后直接使用新 SHA 再次发起推送**。
-    *   **结果**：设备 B 的修改会强行覆盖 GitHub 上的内容（设备 A 提交的修改在 GitHub 上会被抹去）。
-*   **场景 B：在未推送本地修改的情况下，触发了全量同步（例如重新打开软件或手动同步）**
-    *   全量同步的第一步是**下拉远端变更**。插件检测到远端 SHA 发生改变，会直接下载远端内容并调用 Obsidian 的 `vault.modify` 覆写本地文件。
-    *   **结果**：设备 B 本地尚未推送到远端的修改会被远端内容覆盖而丢失。不过，Obsidian 自带的 **“文件恢复 (File Recovery)”** 插件通常会保留本地历史记录，用户可以通过它找回被覆盖的内容。
+但是“自动化虚拟流通过”不等于“真实设备 5 GiB 通过”。公开支持结论必须来自 `tests/baselines/v4/` 中记录的物理测试：
 
-#### 💡 推荐的工作流程建议
-为了防止多设备协作时内容被意外覆写，建议用户：
-1. **保持实时同步开启**：编辑完成后，稍微等待几秒钟，确保当前设备的修改已自动推送至 GitHub。
-2. **切换设备时先同步**：在另一设备上开始编辑前，先打开 Obsidian 让其自动完成全量同步（或手动点击同步按钮），确保本地笔记是最新的，再开始撰写。
+- **Windows 5 GiB**：在完整 Force Push → no-op → 清洁 vault Force Pull → SHA-256 相等测试被记录之前，状态是待物理验证。
+- **Android 5 GiB**：当前实现没有经过支持路径证明的有界本地读取和最终 stage-commit，因此大文件会能力门控；状态为 `platform-capability-fail`，不宣称 Android 5 GiB。
+
+### Q5. GitHub Free 适合反复同步 5 GiB 加密文件吗？
+
+一次操作“技术上可能完成”和“长期运行健康”是两回事。当前 48 MiB 模型对 5 GiB 文件约为 107 个数据分片、约 114 个内容/发布 mutation，并至少需要约 113 秒的 1 秒 mutation pacing（不含网络、加密、重试和磁盘 I/O）。更重要的是，两个完整加密 5 GiB 修订的模型增长已经略高于 GitHub 当前 10 GB 仓库大小建议。
+
+因此在真实一次性测量完成前，发布层面的 GitHub Free 5 GiB 状态仍是 `measurement-required`，尚不赋予发布分类；模型结论是 `technical-pass-operational-limited`，不能宣传为适合频繁修改的 5 GiB 工作负载。
 
 ---
 
 ## English
 
-### Q1. Two-way sync: When the remote repository has updates, does the plugin support pulling changes from GitHub? Or is it only one-way push?
+### Q1. Is V4 a two-way sync?
 
-**Yes, full two-way synchronization is supported.**
+Yes. Normal sync plans from three states: the last verified base, local state, and authenticated remote state. It applies required pulls first and publishes required remote changes in one Git commit. Create, modify, delete, file rename, and folder rename preserve logical V4 identity; delete-then-recreate creates a new identity.
 
-The sync logic is divided into **Full Two-Way Sync** and **Real-Time Local Push**:
+**Force Push** makes the V4 remote exactly mirror the local in-scope state. **Force Pull** makes the local in-scope state mirror the validated V4 remote. Legacy encrypted-layout migration is an explicitly confirmed Force Push operation, not an implicit normal-sync migration.
 
-1. **Full Two-Way Sync** (Pull Remote + Push Local):
-   - **Trigger**:
-     - At startup (delayed by 1.5 seconds to wait for Obsidian layout initialization).
-     - Clicking the ribbon icon in the sidebar.
-     - Executing the "Sync all files" command manually.
-   - **Workflow**:
-     - **Step 1 (Pull Remote)**: Gets the remote file tree from GitHub and compares remote SHAs with local cached SHAs. If a remote file is new or has a different SHA, it downloads the latest content and creates/modifies the local file.
-     - **Step 2 (Push Local)**: Scans all local files and pushes new or modified files to GitHub.
-2. **Real-Time Local Push**:
-   - **Mechanism**: When you edit, create, rename, or delete a note locally, a file watcher intercepts the event (temporarily disabled during full sync to avoid race conditions) and automatically pushes the changes to GitHub with a 5-second debounce.
+### Q2. Does V4 upload every file on every sync?
 
----
+No. The planner compares logical file identity, path, and content hash. Unchanged records are reused, and a content-preserving encrypted rename can reuse the existing object/parts without uploading the content again.
 
-### Q2. Incremental Sync: Does the plugin only sync changed files, or does it push everything every time?
+This is not block-level delta sync. When a large file's content changes, current V4 creates a new complete `remoteVersion`. Remote payloads over 50 MiB use ordered parts, but V4 does not currently upload only the changed internal parts of a modified file. A changed 5 GiB encrypted file can therefore add roughly one new full revision to history.
 
-**The plugin uses a fully incremental sync strategy.**
+### Q3. How are simultaneous edits handled?
 
-Neither push nor pull operations will download or upload unchanged files:
+V4 detects a three-way conflict instead of using the old “retry 409 then overwrite” behavior previously described by this FAQ. The available policies are:
 
-*   **Push Incremental Filtering**: The plugin calculates the hash of the local file content. If it matches the cached hash (`syncData.files[path].hash`), the upload is skipped.
-*   **Pull Incremental Filtering**: The plugin fetches the remote tree to check all file SHAs and only downloads files that have different SHAs or do not exist locally.
+- **Copy policy**: keep the remote primary version and materialize the local version as a conflict copy.
+- **Newer**: choose by metadata; a tie keeps both.
+- **Merge text**: attempt the existing conservative 3-way text merge only for supported text types when all three known versions are at most 2 MiB; otherwise keep both.
+- **Always ask**: ask first, then load only the body required by the selected action.
 
----
+If the user changes a local target while network work is in flight, the final precondition check refuses to silently overwrite that edit and moves the run into recovery/replanning.
 
-### Q3. Conflict Handling: If multiple devices edit the same note simultaneously, how does the plugin handle conflicts?
+### Q4. What is the large-file / 5 GiB support status?
 
-The plugin **does not perform Git-style 3-way merges** and **does not create `.conflict` files**. It uses a **"last write wins" (overwrite)** strategy:
+The V4 remote format uses parts above 50 MiB and readers remain compatible with historical 48 MiB parts. Desktop code has bounded reads, staged writes, and verified final commit/rollback. The official Windows Task 15 automated gate and the separate 2/5 GiB cryptographic soak are recorded as passed.
 
-*   **Scenario A: Editing and saving locally without pulling remote updates first**
-    *   If Device B edits `X.md` and triggers a real-time push, it sends the old local SHA to GitHub.
-    *   If Device A has already updated `X.md` on GitHub, GitHub returns an HTTP `409 Conflict` or `422` error.
-    *   The plugin catches this error, fetches the fresh remote SHA, and retries the push with the updated SHA.
-    *   **Result**: Device B's changes overwrite the remote version on GitHub (Device A's edits on GitHub are overwritten).
-*   **Scenario B: A full sync is triggered before local changes are pushed**
-    *   The full sync pulls remote changes first.
-    *   Since the remote SHA is newer, the plugin overwrites the local file with the remote version.
-    *   **Result**: Device B's unpushed local changes are overwritten. However, you can retrieve them via Obsidian's built-in **"File Recovery"** plugin.
+A virtual stream is not a physical-device 5 GiB pass. Public support claims come only from recorded evidence in `tests/baselines/v4/`:
 
-#### 💡 Recommended Workflow
-To avoid overwriting edits on multiple devices:
-1. **Enable Real-Time Sync**: Wait a few seconds after finishing edits to let the plugin auto-push changes.
-2. **Sync Before Editing**: When switching devices, open Obsidian and wait for the startup sync to complete (or click the sync button) to pull the latest edits before you start typing.
+- **Windows 5 GiB**: pending a recorded physical Force Push → no-op → clean-vault Force Pull → SHA-256 equality run.
+- **Android 5 GiB**: the current supported implementation lacks bounded local read and bounded final stage-commit capability, so large mobile paths are capability-gated and classified `platform-capability-fail`.
+
+### Q5. Is repeated 5 GiB encrypted sync operationally suitable on GitHub Free?
+
+Technical completion and operational suitability are separate. With the current 48 MiB model, one 5 GiB revision is 107 data parts and about 114 modeled content/publication mutations, with a minimum 113-second one-second mutation-pacing floor before network, crypto, retries, or disk I/O. Repository growth is the stronger limitation: two full encrypted 5 GiB revisions already model slightly above GitHub's current 10 GB repository-size recommendation.
+
+Until one disposable-repository measurement is recorded, the release status is `measurement-required` and no release classification is assigned yet. The current model classification is `technical-pass-operational-limited`, not “healthy for frequent 5 GiB edits.”
+
+See `docs/engineering/v4-github-free-operational-model.md` and `docs/testing/v4-windows-android-validation.md` for the evidence rules.

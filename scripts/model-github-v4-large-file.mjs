@@ -7,9 +7,14 @@ const spacingMs = Number(process.env.GITHUB_MUTATION_SPACING_MS ?? 1_000);
 const hourlyGuidance = Number(process.env.GITHUB_CONTENT_HOURLY_GUIDANCE ?? 500);
 const safetyFraction = Number(process.env.GITHUB_CONTENT_SAFETY_FRACTION ?? 0.70);
 const recommendedRepoBytes = Number(process.env.GITHUB_RECOMMENDED_REPO_BYTES ?? 10 * GiB);
+const measuredMutations = process.env.MEASURED_MUTATIONS ? Number(process.env.MEASURED_MUTATIONS) : undefined;
+const measuredSeconds = process.env.MEASURED_SECONDS ? Number(process.env.MEASURED_SECONDS) : undefined;
+const measuredRevisionBytes = process.env.MEASURED_REVISION_BYTES ? Number(process.env.MEASURED_REVISION_BYTES) : undefined;
+const measuredOrphanBytes = process.env.MEASURED_ORPHAN_BYTES ? Number(process.env.MEASURED_ORPHAN_BYTES) : undefined;
 
 const rows = [48, 32, 16].map(partMiB => {
   const model = modelV4LargeFileRevision(logicalBytes, partMiB * MiB, { mutationSpacingMs: spacingMs });
+  const oneRevisionBytes = measuredRevisionBytes ?? model.estimatedRepositoryBytesPerRevision;
   return {
     partMiB,
     partCount: model.partCount,
@@ -17,12 +22,41 @@ const rows = [48, 32, 16].map(partMiB => {
     hourlyGuidanceFraction: model.contentMutations / hourlyGuidance,
     withinSafetyBudget: model.contentMutations <= hourlyGuidance * safetyFraction,
     minimumPacedSeconds: model.minimumPacedMutationMs / 1000,
-    revisionGiB: model.estimatedRepositoryBytesPerRevision / GiB,
-    twoRevisionGiB: (model.estimatedRepositoryBytesPerRevision * 2) / GiB,
-    threeRevisionGiB: (model.estimatedRepositoryBytesPerRevision * 3) / GiB,
-    twoRevisionsWithinRecommendedRepo: model.estimatedRepositoryBytesPerRevision * 2 <= recommendedRepoBytes,
+    revisionGiB: oneRevisionBytes / GiB,
+    twoRevisionGiB: (oneRevisionBytes * 2) / GiB,
+    threeRevisionGiB: (oneRevisionBytes * 3) / GiB,
+    twoRevisionsWithinRecommendedRepo: oneRevisionBytes * 2 <= recommendedRepoBytes,
+    orphanGiB: (measuredOrphanBytes ?? logicalBytes) / GiB,
   };
 });
+
+const measured = {
+  mutations: measuredMutations,
+  seconds: measuredSeconds,
+  revisionBytes: measuredRevisionBytes,
+  orphanBytes: measuredOrphanBytes,
+  complete: [measuredMutations, measuredSeconds, measuredRevisionBytes].every(Number.isFinite),
+};
+const writer48 = rows[0];
+const modelClassification = writer48.withinSafetyBudget && writer48.twoRevisionsWithinRecommendedRepo
+  ? "operational-pass"
+  : "technical-pass-operational-limited";
+const measuredWithinSafetyBudget = Number.isFinite(measuredMutations)
+  ? measuredMutations <= hourlyGuidance * safetyFraction
+  : undefined;
+const measuredTwoRevisionsWithinRecommendedRepo = Number.isFinite(measuredRevisionBytes)
+  ? measuredRevisionBytes * 2 <= recommendedRepoBytes
+  : undefined;
+const measurementConsistent = !measured.complete || (
+  measuredMutations >= writer48.partCount
+  && measuredSeconds >= Math.max(0, measuredMutations - 1) * spacingMs / 1000
+);
+const releaseStatus = !measured.complete ? "measurement-required" : !measurementConsistent ? "measurement-invalid" : "classified";
+const releaseClassification = releaseStatus !== "classified"
+  ? null
+  : measuredWithinSafetyBudget && measuredTwoRevisionsWithinRecommendedRepo
+    ? "operational-pass"
+    : "technical-pass-operational-limited";
 
 console.table(rows.map(row => ({
   "part MiB": row.partMiB,
@@ -35,6 +69,22 @@ console.table(rows.map(row => ({
   "2 rev GiB": row.twoRevisionGiB.toFixed(3),
   "3 rev GiB": row.threeRevisionGiB.toFixed(3),
   "2 rev <=10GiB": row.twoRevisionsWithinRecommendedRepo,
+  "orphan GiB": row.orphanGiB.toFixed(3),
 })));
 
-console.log(JSON.stringify({ logicalBytes, spacingMs, hourlyGuidance, safetyFraction, recommendedRepoBytes, rows }, null, 2));
+console.log(JSON.stringify({
+  generatedAt: new Date().toISOString(),
+  logicalBytes,
+  spacingMs,
+  hourlyGuidance,
+  safetyFraction,
+  recommendedRepoBytes,
+  measured,
+  measuredWithinSafetyBudget,
+  measuredTwoRevisionsWithinRecommendedRepo,
+  measurementConsistent,
+  modelClassification,
+  releaseStatus,
+  releaseClassification,
+  rows,
+}, null, 2));

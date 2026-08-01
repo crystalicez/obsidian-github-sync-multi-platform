@@ -57,7 +57,7 @@ class V4IncrementalSha256 implements V4IncrementalHash {
       }
     }
     while (offset + 64 <= bytes.byteLength) {
-      this.compress(bytes.subarray(offset, offset + 64))
+      this.compress(bytes, offset)
       offset += 64
     }
     if (offset < bytes.byteLength) {
@@ -109,10 +109,10 @@ class V4IncrementalSha256 implements V4IncrementalHash {
     this.result = output
   }
 
-  private compress(bytes: Uint8Array): void {
+  private compress(bytes: Uint8Array, baseOffset = 0): void {
     const w = this.words
     for (let i = 0; i < 16; i++) {
-      const offset = i * 4
+      const offset = baseOffset + i * 4
       w[i] = ((bytes[offset] << 24) | (bytes[offset + 1] << 16) | (bytes[offset + 2] << 8) | bytes[offset + 3]) >>> 0
     }
     for (let i = 16; i < 64; i++) {

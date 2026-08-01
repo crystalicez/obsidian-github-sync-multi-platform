@@ -18,11 +18,11 @@ Unlike traditional Git-based plugins, this tool interacts directly with the GitH
 
 ### ✨ Key Features
 
--   **Native Mobile Support**: Full compatibility with iOS and Android without requiring Git binaries.
+-   **Mobile support without Git binaries**: Normal-size vault content works through the Obsidian API. Large mobile files are capability-gated when a bounded local read/commit path is unavailable; the plugin does not fall back to a multi-gigabyte whole-buffer read.
 -   **Real-time Auto-Sync**: Intelligent event listening triggers synchronization on file modification with a 5-second debounce to optimize API usage.
 -   **Serverless Architecture**: No middle-man server required. Your data goes directly to your private GitHub repository.
 -   **Atomic two-way sync**: Pulls first, plans with a three-way index, and publishes all required remote updates in one Git commit.
--   **All vault file types**: Syncs notes, media, archives, Canvas files, and other files. Files over 50 MiB are split into verified parts automatically.
+-   **All vault file types**: Syncs notes, media, archives, Canvas files, and other files. The V4 remote format splits payloads over 50 MiB into verified parts; desktop uses bounded local I/O, while large mobile upload remains capability-gated pending a proven bounded read path.
 -   **Optional encryption**: Hides every directory name, filename, extension, and file content behind stable opaque objects; plaintext mode stores normal paths and bytes.
 -   **Sync Center**: Browse 50 commits per page, inspect commit changes, and lazily preview commit or current-file versions.
 
@@ -73,6 +73,17 @@ The status bar shows the current sync phase with separate pull and push counts; 
 
 Phase changes appear immediately. Rapid path and counter changes are published at most once every 400 ms, while an active phase's elapsed time refreshes once per second. The latest completed run remains visible until the next run begins. Logical paths and timing details exist only in runtime memory and are never saved to plugin settings, the local index, or GitHub.
 
+## 🧪 Qualification status
+
+The V4 execution path is covered by deterministic model, recovery/crash, bounded-resource, and virtual-stream tests. These tests do **not** substitute for physical-device evidence.
+
+- Desktop bounded I/O, staged commit/rollback, source-snapshot guards, exact-candidate recovery, cancellation, and transport pacing are automated release gates. The official Windows Task 15 automated gate and separate 2 GiB + 5 GiB cryptographic virtual soak are recorded as passed.
+- A physical encrypted 5 GiB Windows Force Push → no-op → clean-vault Force Pull round trip is a separate qualification and is not claimed until recorded in `tests/baselines/v4/windows.json`.
+- Android currently has no supported bounded local read/final-stage-commit path in this implementation for multi-gigabyte files. Large mobile upload is therefore capability-gated; Android 5 GiB is **not** a supported claim.
+- The current 48 MiB-part model for one 5 GiB revision is 107 data parts and about 114 modeled content/publication mutations with a minimum policy pacing floor of 113 seconds. Repeated full encrypted 5 GiB revisions are operationally limited by repository growth; see [the GitHub Free operational model](docs/engineering/v4-github-free-operational-model.md).
+
+See [Windows/Android validation](docs/testing/v4-windows-android-validation.md) and [performance methodology](docs/engineering/v4-performance-methodology.md) for the evidence rules.
+
 ## ❓ FAQ
 
 For detailed information about synchronization mechanisms, incremental sync, and conflict resolution, please refer to our [FAQ Document](docs/FAQ.md).
@@ -89,11 +100,11 @@ For detailed information about synchronization mechanisms, incremental sync, and
 
 ### ✨ 核心特性
 
--   **原生移动端支持**：完美适配 iOS 和 Android，无需复杂的 Git 环境配置。
+-   **无需 Git 的移动端支持**：普通大小的文件通过 Obsidian API 同步；当平台缺少经过验证的有界读取/提交能力时，大文件会安全地提示能力不足，不会退化成数 GiB 的整文件内存读取。
 -   **实时自动同步**：智能监听文件修改事件，内置 5 秒防抖（Debounce）逻辑，平衡实时性与 API 调用额度。
 -   **无服务器架构**：数据直接点对点传输至您的私有 GitHub 仓库，隐私安全。
 -   **冲突检测**：基于内容哈希的智能检测，最大限度减少同步冲突。
--   **全部文件类型**：同步笔记、图片、压缩包、Canvas 与其他附件；超过 50 MiB 的文件会自动拆分并校验。
+-   **全部文件类型**：同步笔记、图片、压缩包、Canvas 与其他附件；V4 远端格式会将超过 50 MiB 的内容拆分并校验。桌面端使用有界本地 I/O；移动端大文件上传在有界读取能力得到验证前保持能力门控。
 -   **可选加密**：隐藏所有目录名、文件名、扩展名和文件内容，并在固定技术分桶中保存稳定的不透明对象；明文模式直接保存原路径与内容。
 -   **同步中心**：分页查看提交、变更列表，以及按需加载的提交/当前文件历史预览。
 -   **可视化看板**：配套数据看板，直观展示写作进度与同步状态。
@@ -122,6 +133,10 @@ For detailed information about synchronization mechanisms, incremental sync, and
     -   **Repo**: 您的私有笔记仓库名称。
     -   **Branch**: 默认为 `main`。
 3.  **Sync Options**: 开启“启用同步”即可享受实时同步体验。
+
+## 🧪 资格验证状态
+
+V4 已有确定性模型、崩溃恢复、资源上限和虚拟流测试；这些自动化证据**不能替代真实设备的 5 GiB 完整链路测试**。当前移动端大文件仍受有界读取/最终提交能力门控，因此不宣称 Android 5 GiB 支持。重复的 5 GiB 加密修订还会快速增长 Git 历史，GitHub Free 的运行适用性与“API 能否接受一次请求”是两个不同问题。详细证据规则见 [Windows/Android 验证](docs/testing/v4-windows-android-validation.md)。
 
 ## ❓ 常见问题 (FAQ)
 

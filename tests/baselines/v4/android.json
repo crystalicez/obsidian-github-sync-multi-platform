@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "capturedDate": "2026-07-30",
+  "platform": "android",
+  "physicalDevice": { "status": "not-run", "device": null, "obsidianVersion": null },
+  "boundedIo": {
+    "boundedRead": false,
+    "boundedAppend": "feature-detected",
+    "freeSpace": false,
+    "stageCommit": false,
+    "wholeBufferCompatibilityCeilingBytes": 33554432
+  },
+  "largeFile": {
+    "status": "platform-capability-fail",
+    "classification": "platform-capability-fail",
+    "reason": "Current supported mobile path has no bounded local read or bounded final stage-commit capability; large files must capability-fail rather than whole-buffer fallback.",
+    "physical5GiBRoundTrip": "not-run"
+  },
+  "performance": {
+    "peakMemoryBytes": null,
+    "virtualEvidenceOnly": true
+  }
+}
