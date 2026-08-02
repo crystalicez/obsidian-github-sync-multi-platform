@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { setRequestUrlHandler } from "obsidian";
 
+import { toBase64 } from "../../src/lib/bytes";
 import { GitHubClient } from "../../src/lib/github-api";
 import { V4RequestScheduler } from "../../src/lib/v4/request-scheduler";
 
@@ -106,7 +107,7 @@ test("GitHubClient pins file reads to an explicit commit SHA", async () => {
         status: 200,
         text: "",
         headers: {},
-        json: { content: "dHJhbnNmb3JtZWQ=", encoding: "base64", sha: "blob-sha" },
+        json: { content: "dHJhbnNmb3JtZWQ=", encoding: "base64", sha: "a5df5b6112f9310f9b7d922dc562cd9d413ecf02" },
         arrayBuffer: new ArrayBuffer(0),
       };
     }
@@ -124,12 +125,57 @@ test("GitHubClient pins file reads to an explicit commit SHA", async () => {
     assert.match(requestUrls[0], /ref=commit%2Fsha/u);
     assert.equal(accept, "application/vnd.github.object+json");
     assert.equal(new TextDecoder().decode(file!.bytes), "transformed");
-    assert.equal(file!.sha, "blob-sha");
+    assert.equal(file!.sha, "a5df5b6112f9310f9b7d922dc562cd9d413ecf02");
     assert.equal(requestUrls.length, 1);
   } finally {
     setRequestUrlHandler(null);
   }
 });
+
+function githubContentsUtf16beTransform(bytes: Uint8Array): Uint8Array {
+  let text = ""
+  for (let index = 0; index + 1 < bytes.byteLength; index += 2) {
+    text += String.fromCharCode((bytes[index] << 8) | bytes[index + 1])
+  }
+  if ((bytes.byteLength & 1) !== 0) text += "\uFFFD"
+  return new TextEncoder().encode(text)
+}
+
+test("GitHubClient falls back to the canonical Git Blob when Contents transforms binary bytes", async () => {
+  const raw = Uint8Array.from([
+    79, 71, 83, 52, 1, 253, 142, 97, 212, 167, 10, 51, 86, 115, 77, 87, 209, 244, 140,
+    48, 80, 42, 244, 84, 28, 131, 154, 197, 154, 111, 119, 70, 50, 225, 97, 66, 143,
+  ])
+  const blobSha = "5a469309d6d8c744bb48764f30ff665c3c2d65ca"
+  const requests: string[] = []
+  setRequestUrlHandler(async (options: unknown) => {
+    const request = options as { url: string }
+    requests.push(request.url)
+    if (request.url.includes("/contents/")) {
+      return {
+        status: 200,
+        text: "",
+        headers: {},
+        json: { content: toBase64(githubContentsUtf16beTransform(raw)), encoding: "base64", sha: blobSha },
+        arrayBuffer: new ArrayBuffer(0),
+      }
+    }
+    return { status: 200, text: "", headers: {}, json: undefined, arrayBuffer: raw.buffer }
+  })
+  try {
+    const client = new GitHubClient(
+      { token: "token", owner: "owner", repo: "repo", branch: "main" },
+      { transportPolicy: { mutationSpacingMs: 0 } },
+    )
+    const file = await client.getFileBytes("binary.enc", "commit-sha")
+    assert.deepEqual(file?.bytes, raw)
+    assert.equal(file?.sha, blobSha)
+    assert.equal(requests.length, 2)
+    assert.equal(requests.some(url => url.endsWith(`/git/blobs/${blobSha}`)), true)
+  } finally {
+    setRequestUrlHandler(null)
+  }
+})
 
 test("GitHubClient bootstraps a truly empty repository before Git ref writes", async () => {
   const requests: Array<Record<string, any>> = [];
