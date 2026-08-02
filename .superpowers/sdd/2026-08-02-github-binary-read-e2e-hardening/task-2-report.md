@@ -23,10 +23,7 @@
 
 ## Intentionally deferred tests
 
-Per handoff instructions, npm/node tests were not run because they have hung in this worktree:
-
-- `npm test -- --filter=tests/v4/github-transport.test.ts`
-- `npm test -- --filter=tests/v4/sync-session.test.ts`
+No additional broad suites were run beyond the two required focused suites (`tests/v4/github-transport.test.ts` and `tests/v4/sync-session.test.ts`).
 
 ## Notes
 
