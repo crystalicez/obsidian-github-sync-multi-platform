@@ -1,6 +1,8 @@
 # V4 GitHub REST end-to-end test
 
-The destructive test uses a dedicated non-default branch in a real GitHub repository. The quick smoke workload verifies small plaintext and encrypted V4 force push, encrypted rename, no-change detection, binary object validation, force pull, and final branch cleanup. It is a live network smoke measurement, not a 5 GiB qualification.
+The destructive test uses a dedicated non-default branch in a real GitHub repository. The current runner is a small real-REST smoke suite with safe metrics. Its quick smoke workload verifies small plaintext and encrypted V4 force push, encrypted rename, no-change detection, binary object validation, force pull, and final branch cleanup. It is a live network smoke measurement, not a 5 GiB qualification.
+
+Pack and large-file workloads are outside the current runner. They require a separate runner and separate evidence that records request, memory, and final-byte behavior; do not add pack/large-file environment variables to this configuration until that runner exists.
 
 Set these values in `.env.github-e2e` or the process environment:
 
