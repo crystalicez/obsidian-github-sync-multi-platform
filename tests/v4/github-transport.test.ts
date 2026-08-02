@@ -177,6 +177,42 @@ test("GitHubClient falls back to the canonical Git Blob when Contents transforms
   }
 })
 
+test("GitHubClient falls back to the canonical Git Blob when SHA verification fails", async () => {
+  const raw = Uint8Array.from([79, 71, 83, 52, 1, 253, 142, 97])
+  const blobSha = "0123456789abcdef0123456789abcdef01234567"
+  const requests: string[] = []
+  const originalDigest = crypto.subtle.digest
+  crypto.subtle.digest = (async () => { throw new Error("forced digest failure") }) as typeof crypto.subtle.digest
+  setRequestUrlHandler(async (options: unknown) => {
+    const request = options as { url: string }
+    requests.push(request.url)
+    if (request.url.includes("/contents/")) {
+      return {
+        status: 200,
+        text: "",
+        headers: {},
+        json: { content: toBase64(raw), encoding: "base64", sha: blobSha },
+        arrayBuffer: new ArrayBuffer(0),
+      }
+    }
+    return { status: 200, text: "", headers: {}, json: undefined, arrayBuffer: raw.buffer }
+  })
+  try {
+    const client = new GitHubClient(
+      { token: "token", owner: "owner", repo: "repo", branch: "main" },
+      { transportPolicy: { mutationSpacingMs: 0 } },
+    )
+    const file = await client.getFileBytes("binary.enc", "commit-sha")
+    assert.deepEqual(file?.bytes, raw)
+    assert.equal(file?.sha, blobSha)
+    assert.equal(requests.length, 2)
+    assert.equal(requests.filter(url => url.endsWith(`/git/blobs/${blobSha}`)).length, 1)
+  } finally {
+    crypto.subtle.digest = originalDigest
+    setRequestUrlHandler(null)
+  }
+})
+
 test("GitHubClient bootstraps a truly empty repository before Git ref writes", async () => {
   const requests: Array<Record<string, any>> = [];
   setRequestUrlHandler(async (options: unknown) => {
