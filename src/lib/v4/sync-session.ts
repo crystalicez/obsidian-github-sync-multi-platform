@@ -14,6 +14,7 @@ import {
   type V4GitTreeGithub,
   type V4GitTreeProgressItem,
 } from "./git-tree-writer"
+import { reconcileV4CandidatePublication } from "./publish-reconciler"
 import { buildV4JournalPages, type V4JournalChange } from "./history-journal"
 import { isV4LocalIndexCacheComplete, type V4IndexFileRecord, type V4LocalIndex } from "./local-index"
 import { assertV4LocalTargetPrecondition, createV4LocalIo, type V4LocalIo, type V4LocalTargetPrecondition, type V4SessionVault } from "./local-io"
@@ -914,8 +915,15 @@ export class V4SyncSession {
     preserveStagesForRecovery = !!recoverySnapshot && (recoveryPlan?.payload.mutations.length ?? 0) > 0
     await deferV4Cancellation(this.input.signal, () => publishV4CandidateRef(this.input.github, candidate, this.input.signal))
     if (this.input.recoveryStore && recoverySnapshot) {
-      const verifiedRef = await this.input.github.getGitRefOrNull()
-      if (verifiedRef?.sha !== candidate.commitSha) throw new Error("V4 candidate publication could not be verified.")
+      const publication = await reconcileV4CandidatePublication(this.input.github, {
+        candidateCommitSha: candidate.commitSha,
+        expectedHeadSha: candidate.previousHeadSha ?? null,
+        journalId,
+        signal: this.input.signal,
+      })
+      if (publication.status !== "published" || publication.publishedCommitSha !== candidate.commitSha) {
+        throw new V4RecoveryReplanRequiredError(publication.currentHeadSha ?? candidate.commitSha)
+      }
       recoverySnapshot = await this.input.recoveryStore.save({
         runId: batch.runId,
         journalId,

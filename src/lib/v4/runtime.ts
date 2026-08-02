@@ -1,6 +1,7 @@
 import { Modal, Notice, Platform, TFile } from "obsidian"
 import type FastSync from "../../main"
 import { fromBase64Url, randomBytes, sha256Hex, toBase64Url, utf8ToBytes } from "../bytes"
+import { syncConsoleLog } from "../debug"
 import { readVaultFileBytes, writeVaultFileBytes, trashVaultFileIfExists } from "../vault"
 import { deriveV4Keyring, type V4Keyring } from "./crypto"
 import {
@@ -406,6 +407,10 @@ export class V4PluginRuntime {
     }
     if (request.trigger === "startup") this.plugin.enableWatch()
     this.plugin.isSyncInProgress = true
+    syncConsoleLog(this.plugin.settings, "info", "V4 sync started", {
+      operation: request.operation,
+      trigger: request.trigger,
+    })
     try {
       if (!this.plugin.githubClient) throw new Error("GitHub connection is not configured.")
       ;(this.plugin.githubClient as unknown as { setV4AbortSignal?(signal?: AbortSignal): void }).setV4AbortSignal?.(signal)
@@ -505,6 +510,12 @@ export class V4PluginRuntime {
           if (recoveryRunId) await markV4RecoveryIndexCommitted(recoveryStore, recoveryRunId)
           if (result.changedFiles === 0 && request.trigger === "manual") new Notice("GitHub Sync: No changes")
           this.progressStore.finish(result.changedFiles === 0 ? "no-change" : "success", { lastSyncTime: Date.now() })
+          syncConsoleLog(this.plugin.settings, "info", "V4 sync completed", {
+            operation: request.operation,
+            trigger: request.trigger,
+            changedFiles: result.changedFiles,
+            attempt: progressAttempt,
+          })
           return { changedFiles: result.changedFiles }
         } catch (error) {
           lastError = error
@@ -532,6 +543,14 @@ export class V4PluginRuntime {
     } catch (error) {
       if (error instanceof V4CancelledError) return { changedFiles: 0 }
       const message = (error as Error).message
+      const snapshot = this.progressStore.snapshot
+      syncConsoleLog(this.plugin.settings, "warn", "V4 sync failed", {
+        operation: request.operation,
+        trigger: request.trigger,
+        phase: snapshot.phase,
+        currentPath: snapshot.currentPath,
+        error,
+      })
       this.progressStore.finish("failed", { errorMessage: message })
       new Notice(`GitHub Sync failed: ${message}`)
       return { changedFiles: 0 }

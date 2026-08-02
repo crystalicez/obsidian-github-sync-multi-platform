@@ -93,8 +93,19 @@ class RuntimeMemoryGitHub {
   createBlobOverride?: (bytes: Uint8Array, attempt: number) => Promise<string>;
   refReadBarrier?: Promise<void>;
   refReads = 0;
+  returnStaleRefAfterNextUpdate = false;
+  staleRefReads = 0;
+  staleRef: { ref: string; sha: string; type: string } | null = null;
   async getFileBytes(path: string, ref?: string) { this.readPaths.push(path); const commit = ref ? this.commits.get(ref) : undefined; const value = commit ? this.trees.get(commit.treeSha)?.get(path) : this.files.get(path); return value ? { bytes: new Uint8Array(value), sha: `sha-${path}` } : null; }
-  async getGitRefOrNull() { this.refReads++; await this.refReadBarrier; return this.ref; }
+  async getGitRefOrNull() {
+    this.refReads++;
+    await this.refReadBarrier;
+    if (this.staleRefReads > 0) {
+      this.staleRefReads--;
+      return this.staleRef;
+    }
+    return this.ref;
+  }
   async ensureGitRepositoryInitialized() { return null; }
   async getGitCommit(sha: string) { const value = this.commits.get(sha)!; return { sha, treeSha: value.treeSha, parentShas: value.parents, message: value.message }; }
   async getTreeAt(treeSha: string) { const tree = this.trees.get(treeSha) ?? new Map(); return { sha: treeSha, url: "", truncated: false, tree: [...tree.entries()].map(([path, bytes], index) => ({ path, mode: "100644", type: "blob" as const, sha: `tree-blob-${index}`, size: bytes.byteLength, url: "" })) }; }
@@ -102,7 +113,21 @@ class RuntimeMemoryGitHub {
   async createGitTree(entries: GitHubCreateTreeEntry[], baseTree?: string) { const tree = new Map(baseTree ? this.trees.get(baseTree) : undefined); for (const entry of entries) entry.sha === null ? tree.delete(entry.path) : tree.set(entry.path, new Uint8Array(this.blobs.get(entry.sha)!)); const sha = `tree-${this.trees.size + 1}`; this.trees.set(sha, tree); return sha; }
   async createGitCommit(message: string, treeSha: string, parents: string[]) { const sha = `commit-${this.commits.size + 1}`; this.commits.set(sha, { treeSha, parents, message }); return sha; }
   async createGitRef(sha: string) { this.ref = { ref: "refs/heads/main", sha, type: "commit" }; this.files = new Map(this.trees.get(this.commits.get(sha)!.treeSha)); }
-  async updateGitRef(sha: string, expected?: string) { if (this.updateFailuresRemaining-- > 0) { this.onUpdateFailure?.(); if (this.updateFailureDelayMs > 0) await new Promise(resolve => setTimeout(resolve, this.updateFailureDelayMs)); throw new Error("stale ref"); } if (expected && this.ref?.sha !== expected) throw new Error("stale ref"); await this.createGitRef(sha); }
+  async updateGitRef(sha: string, expected?: string) {
+    if (this.updateFailuresRemaining-- > 0) {
+      this.onUpdateFailure?.();
+      if (this.updateFailureDelayMs > 0) await new Promise(resolve => setTimeout(resolve, this.updateFailureDelayMs));
+      throw new Error("stale ref");
+    }
+    if (expected && this.ref?.sha !== expected) throw new Error("stale ref");
+    const previous = this.ref;
+    await this.createGitRef(sha);
+    if (this.returnStaleRefAfterNextUpdate) {
+      this.returnStaleRefAfterNextUpdate = false;
+      this.staleRef = previous;
+      this.staleRefReads = 1;
+    }
+  }
 }
 
 function plaintextRuntimeFixture(pathInput: string | string[] = "secret.md", github = new RuntimeMemoryGitHub(), deviceId = "device") {
@@ -212,6 +237,37 @@ test("v4 runtime keeps the exact upload failure phase and logical path", async (
   assert.equal(fixture.runtime.progressSnapshot.failurePhase, "uploading");
   assert.equal(fixture.runtime.progressSnapshot.failurePath, "secret.md");
   assert.match(fixture.runtime.progressSnapshot.errorMessage ?? "", /upload failure/iu);
+  fixture.runtime.dispose();
+});
+
+test("v4 runtime emits a warning when verbose logging is enabled and sync fails", async () => {
+  const fixture = plaintextRuntimeFixture();
+  fixture.plugin.settings.consoleLoggingEnabled = true;
+  fixture.github.blobFailuresRemaining = 1;
+  const messages: unknown[][] = [];
+  const originalWarn = console.warn;
+  console.warn = ((...args: unknown[]) => { messages.push(args); }) as typeof console.warn;
+  try {
+    await fixture.runtime.forcePush();
+  } finally {
+    console.warn = originalWarn;
+    fixture.runtime.dispose();
+  }
+
+  assert.equal(messages.some(args => args[0] === "[Encrypted GitHub Sync]" && args[1] === "V4 sync failed"), true);
+});
+
+test("v4 normal sync retries without failing when immediate publication verification reads a stale branch head", async () => {
+  const fixture = plaintextRuntimeFixture();
+  await fixture.runtime.forcePush();
+  fixture.contents.set("secret.md", new TextEncoder().encode("changed"));
+  fixture.vaultFile.stat = { size: 7, mtime: 2 };
+  fixture.github.returnStaleRefAfterNextUpdate = true;
+
+  await fixture.runtime.manualSync();
+
+  assert.equal(fixture.runtime.progressSnapshot.lifecycle, "no-change");
+  assert.equal(fixture.runtime.progressSnapshot.attempt, 2);
   fixture.runtime.dispose();
 });
 
