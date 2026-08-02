@@ -1,5 +1,5 @@
 import { requestUrl, type RequestUrlParam, type RequestUrlResponse } from "obsidian";
-import { fromBase64, toBase64, utf8ToBytes } from "./bytes";
+import { fromBase64, toBase64, toHex, utf8ToBytes } from "./bytes";
 import type { GitHubCreateTreeEntry, GitHubGitCommit, GitHubGitRef } from "./github-git-types";
 import {
   canRetryV4MutationAfterUnknownOutcome,
@@ -175,6 +175,14 @@ export class GitHubClient {
     };
   }
 
+  private async gitBlobSha1(bytes: Uint8Array): Promise<string> {
+    const header = utf8ToBytes(`blob ${bytes.byteLength}\0`);
+    const payload = new Uint8Array(header.byteLength + bytes.byteLength);
+    payload.set(header);
+    payload.set(bytes, header.byteLength);
+    return toHex(await crypto.subtle.digest("SHA-1", payload));
+  }
+
   async getFileBytes(path: string, ref = this.config.branch): Promise<{ bytes: Uint8Array; sha: string } | null> {
     const encodedPath = path.split('/').map(encodeURIComponent).join('/');
     const freshness = ref === this.config.branch ? `&_=${Date.now()}` : "";
@@ -191,7 +199,19 @@ export class GitHubClient {
         const json = response.json as { content?: string; encoding?: string; sha?: string };
         const sha = json.sha ?? "";
         if (json.encoding === "base64" && typeof json.content === "string") {
-          try { return { bytes: fromBase64(json.content), sha }; } catch { /* Blob fallback below. */ }
+          let decoded: Uint8Array | undefined;
+          try {
+            decoded = fromBase64(json.content);
+          } catch {
+            decoded = undefined;
+          }
+          if (decoded) {
+            let verified = true;
+            if (/^[0-9a-f]{40}$/u.test(sha)) {
+              try { verified = await this.gitBlobSha1(decoded) === sha; } catch { verified = false; }
+            }
+            if (verified) return { bytes: decoded, sha };
+          }
         }
         if (sha) return { bytes: await this.getBlob(sha), sha };
         throw new Error(`GitHub Contents response has no decodable payload for ${path}.`);
