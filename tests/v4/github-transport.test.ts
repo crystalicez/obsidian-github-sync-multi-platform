@@ -57,11 +57,16 @@ test("GitHubClient reads historical trees and can create a branch ref", async ()
 
 test("V4 request scheduler retries rate limits after the requested delay", async () => {
   const sleeps: number[] = [];
+  let now = 0;
   let attempts = 0;
   const scheduler = new V4RequestScheduler({
     readConcurrency: 2,
     writeConcurrency: 1,
-    sleep: async ms => { sleeps.push(ms); },
+    now: () => now,
+    sleep: async milliseconds => {
+      sleeps.push(milliseconds);
+      now += milliseconds;
+    },
   });
   const result = await scheduler.run("write", async () => {
     attempts += 1;
