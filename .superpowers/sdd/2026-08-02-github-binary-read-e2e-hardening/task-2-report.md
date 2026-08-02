@@ -1,4 +1,4 @@
-# Task 2 report
+# Task 2 checkpoint report
 
 ## Implementation
 
@@ -16,10 +16,10 @@
 ## Verification
 
 - `git diff --check`: passed (exit code 0).
-- `npm test -- --filter=tests/v4/github-transport.test.ts`: passed (20/20).
+- `npm test -- --filter=tests/v4/github-transport.test.ts`: passed (21/21), run 5 consecutive times.
 - `npm test -- --filter=tests/v4/sync-session.test.ts`: passed (86/86).
-- Commit: `2f9130f` (`Validate GitHub Contents blob identity`).
-- Final commit range: `2f9130f..HEAD` after adding the digest-failure coverage handoff commit.
+- Task 2 implementation commits: `2f9130f` and `1143568`.
+- Whole-branch verification is recorded separately in `task-6-report.md` (build, fast 349/349, recovery 30/30, resource 11/11, feasibility 6/6, soak, repeat, and real E2E).
 
 ## Intentionally deferred tests
 
