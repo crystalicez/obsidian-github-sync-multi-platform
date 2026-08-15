@@ -1,653 +1,697 @@
 # Conflict Resolution and Git History UI Design
 
 Date: 2026-08-16
-Status: Approved design, pending implementation plan
+Status: Design v2 — self-reviewed against current V4 codebase; implementation plan blocked pending user approval
 Target branch: `agent/conflict-history-ui`
 Reference UX: `silvanocerza/github-gitless-sync` (clean-room behavioral inspiration only)
 
 ## 1. Purpose
 
-Add a first-class conflict resolution workspace and upgrade the existing GitHub Sync Center into a diff-oriented Git history workspace.
+Add a first-class conflict-resolution workspace and upgrade the existing GitHub Sync Center into a diff-oriented Git history workspace.
 
-The feature must preserve the V4 sync safety properties already present in the repository: conflict detection, optimistic/CAS-style remote-head validation, recovery behavior, bounded resource use, encrypted storage handling, and the existing local-change pipeline.
+The feature must preserve the V4 safety properties already present in this repository: logical file identity, conflict detection, bounded I/O, source-stability checks, Git ref/CAS publication, crash recovery, encrypted storage handling, change guards, and normal local-change synchronization.
 
-The reference plugin is licensed AGPL-3.0 while this repository is Apache-2.0. No source code, CSS, component implementation, or other copyrightable implementation detail will be copied from the reference. The implementation will be clean-room and use this repository's existing Obsidian-native architecture.
+The reference plugin is AGPL-3.0 while this repository is Apache-2.0. No source, CSS, component implementation, or other copyrightable implementation detail will be copied. This is a clean-room implementation using this repository's Obsidian-native TypeScript architecture.
 
-## 2. Goals
+## 2. Approved product scope
 
 ### Conflict resolution
 
-- Replace the current per-file conflict modal with a dedicated `ItemView` conflict workspace.
-- When a sync run has multiple conflicts, collect them into one batch and pause the run until all are resolved.
-- Support real three-way, hunk-level text conflict resolution using BASE / LOCAL / REMOTE.
-- Provide hunk actions equivalent to:
-  - Accept local
-  - Accept remote
-  - Accept both
-  - Discard both / restore BASE for that hunk
-- Let the user manually edit the final merged result before continuing sync.
-- Support multiple conflict files in one workspace with tabs / file picker and unresolved counts.
-- Default to split view on desktop and unified view on mobile, with a user-selectable mode that is remembered.
-- Support binary conflicts at file level with preview where practical.
-- Keep the current sync run suspended and resume that logical run after resolution, rather than starting a new manual sync.
-- Revalidate both local and remote state before applying user resolutions so stale decisions are never silently published.
+- Dedicated Obsidian `ItemView`, not a sequence of modals.
+- One workspace for every unresolved conflict in one logical sync run.
+- Text conflicts support real three-way BASE / LOCAL / REMOTE resolution at hunk level.
+- Hunk actions: Accept local, Accept remote, Accept both, Discard both / BASE.
+- The final merged text is editable by hand before continuation.
+- Desktop defaults to Split; mobile defaults to Unified; the user can switch and remember the mode.
+- Binary/unsupported content uses file-level resolution and best-effort preview.
+- Closing the pane does not cancel the run; explicit Cancel does.
+- Resolve all conflicts first, then resume the same logical run.
 
 ### Git history
 
-- Upgrade the existing Sync Center rather than creating a second unrelated history view.
-- Preserve `Repository history` and `Current file` concepts, but make the workspace master/detail and diff-oriented.
-- Show text diffs and image/binary previews for historical versions.
-- Track per-file history by V4 logical `fileId`, so history survives renames.
-- Add `Restore this version` for a file.
-- Restore by writing the historical content into the local vault and letting the normal V4 change/sync pipeline publish it later.
+- Upgrade the existing Sync Center rather than create another unrelated history view.
+- Modes: Repository history and Current file.
+- Master/detail commit/version navigation with before/after diff or preview.
+- Current-file history follows the V4 logical `fileId` while that identity exists.
+- Add file-version Restore.
+- Restore is a local vault mutation; remote publication happens only through normal V4 sync.
+- Whole-commit revert is not part of this iteration.
 
-## 3. Non-goals for this iteration
+## 3. Explicit non-goals
 
 - Whole-commit revert.
-- Arbitrary compare between any two user-selected commits/versions.
-- Branch browser.
-- Git staging/index UI.
-- Cherry-pick.
-- Persisted plaintext or encrypted conflict drafts across application restart.
-- Semantic Markdown merge at heading/block level.
-- Binary content merging.
-- Collaborative/live conflict editing.
-- Copying implementation or styling from the reference AGPL plugin.
+- Arbitrary A-vs-B commit/version comparison.
+- Branch browser, staging/index UI, cherry-pick.
+- Cross-restart persisted conflict drafts.
+- Semantic Markdown AST/block merge.
+- Binary merging.
+- Collaborative/live merge editing.
+- Copying implementation or styling from the AGPL reference.
 
-The architecture should not prevent future arbitrary version comparison or whole-commit revert, but neither is part of this delivery.
+## 4. Current codebase constraints and integration points
 
-## 4. Existing integration points
+The implementation must extend existing V4 paths rather than bypass them.
 
-The implementation should build on current V4 structures rather than adding parallel infrastructure.
+- `src/views/sync-center.ts`: existing Obsidian DOM `ItemView`, async render-generation guards, progress card, repository history, current-file versions, text/image/binary preview.
+- `src/lib/v4/history-service.ts`: commit paging, journal/external change discovery, preview, and `getFileVersions(fileId)`.
+- `src/lib/github-api.ts`: scheduled/bounded GitHub reads/writes, commit/tree/blob APIs.
+- `src/lib/v4/conflicts.ts`: current policies/actions and 2 MiB text-merge ceiling.
+- `src/lib/v4/planner.ts`: conflict detection by `fileId`, including path/presence as well as content changes.
+- `src/lib/v4/sync-session.ts`: planning, resolved batch construction, staging, publication, recovery, CAS handling.
+- `src/lib/v4/runtime.ts`: outer CAS retry loop, current conflict modal, progress integration.
+- `src/lib/v4/sync-coordinator.ts`: one active run plus queued local changes.
+- `src/lib/v4/staging-store.ts` / recovery: existing transient plaintext staging after a mutation is confirmed.
+- `src/setting.tsx`: current conflict policy setting.
+- `src/styles.scss`: existing native Obsidian styling.
 
-- `src/views/sync-center.ts`
-  - existing GitHub Sync Center `ItemView`
-  - existing repository commit history and current-file history entry points
-- `src/lib/v4/history-service.ts`
-  - existing commit listing, commit change lookup, historical previews, and `getFileVersions(fileId)`
-- `src/lib/github-api.ts`
-  - existing bounded/scheduled GitHub API access, commit/tree/blob methods
-- `src/lib/v4/conflicts.ts`
-  - existing conflict policy/actions and automatic text merge constraints
-- `src/lib/v4/sync-session.ts`
-  - existing conflict decision callback and merge application path
-- `src/lib/v4/runtime.ts`
-  - current conflict `Modal` and runtime-to-session callback bridge
-- `src/setting.tsx`
-  - existing plugin settings, including conflict policy
-- `src/styles.scss`
-  - existing Sync Center styling and Obsidian theme-variable usage
-
-The current `askConflict` callback only exposes path/mtime-level information. Full conflict editing therefore requires extending the conflict/session boundary to expose bounded BASE / LOCAL / REMOTE content or lazy content handles.
+The project currently has no runtime dependencies. The first implementation should keep that property unless measurements demonstrate a compelling need.
 
 ## 5. Architecture
 
-Use the following separation of responsibility.
-
 ### `V4SyncSession`
 
-Owns sync planning, execution, remote-head validation, application, publishing, retry, and recovery semantics.
-
-It discovers conflicts and creates a conflict batch. It must not own UI state.
+Owns planning, conflict discovery, lazy materialization of conflict inputs, application, publication, retry/recovery semantics, and pre-publication validation. It must not own DOM state.
 
 ### `V4ConflictResolutionCoordinator`
 
-Owns the lifecycle of a pending conflict batch while the plugin process is alive.
+Runtime-scoped controller for one pending conflict batch.
 
 Responsibilities:
 
-- hold the currently pending batch
-- expose observable state to views/status UI
-- suspend/resume the awaiting sync session through one controlled promise/result boundary
-- retain in-memory decisions and manual merged drafts when the view is merely closed
-- invalidate stale file resolutions after local/remote revalidation
-- discard the batch on explicit cancel or plugin unload
+- bind a pending batch to `runId` and batch generation
+- expose immutable/renderable state to the view/status surfaces
+- hold user decisions and merged drafts in memory
+- resolve or reject the session's one batch-await boundary
+- preserve compatible decisions across a re-plan by fingerprint
+- invalidate stale generation loaders and stale file resolutions
+- settle promptly when the run's AbortSignal is aborted
+- discard state on explicit cancel or plugin unload
+
+Only one logical conflict workspace may exist for a pending batch. Reopen/reveal the existing leaf rather than create independent resolver instances.
 
 ### `V4ConflictResolutionView`
 
-A dedicated Obsidian `ItemView` responsible only for user interaction and rendering.
+Dedicated Obsidian `ItemView`. Rendering only; no Git mutation logic.
 
-It must be safe to close and reopen without cancelling the pending conflict batch.
+It uses its own render generation in addition to coordinator/batch generation so stale async preview/materialization callbacks cannot mutate a newer view.
 
 ### `V4ConflictMergeModel`
 
-Pure TypeScript, DOM-independent three-way merge/diff state.
+Pure TypeScript, DOM-independent model for bounded three-way text diff/merge, hunk state, mapped output ranges, manual edits, and final bytes.
 
-Responsibilities:
+### Shared read-only diff/preview layer
 
-- produce line-oriented three-way hunks
-- classify auto-resolvable vs user-conflict hunks
-- create and update the merged document
-- apply hunk actions deterministically
-- track hunk resolution state
-- preserve manual merged edits
-- generate final merged bytes
+Conflict and History may share two-way text diff presentation, image preview, binary metadata preview, and version labels. History never depends on the editable three-way merge state machine.
 
-### Shared read-only preview/diff layer
+## 6. Conflict policy behavior
 
-History and conflict UIs should share presentation components where sensible, such as:
+Preserve the existing default `copy` policy and make UI behavior explicit:
 
-- text two-way diff display
-- image preview
-- binary metadata preview
-- file/version labels
+- `copy`: keep current automatic keep-local/copy-remote behavior; do not open the workspace.
+- `newer`: keep current automatic mtime-based behavior; equal mtimes fall back to keep-local/copy-remote; do not open the workspace.
+- `ask`: every planner conflict is presented in the workspace. Non-conflicting regions inside a text file may still be auto-merged in the model, but the conflict batch requires user confirmation.
+- `merge`: attempt the new bounded three-way merge first. If all content and structural dimensions are safely resolvable, continue automatically. If any unresolved content/path/presence conflict remains, open the workspace instead of silently falling back to copy.
 
-History must not depend on the editable three-way merge state machine.
+The `merge` policy therefore intentionally improves on the current overlap fallback. Update the setting description to make this clear, e.g. `Merge text; ask when unresolved`.
 
-## 6. Sync state flow and conflict batching
+Force Push and Force Pull do not invoke the conflict workspace because the planner already gives those operations authoritative one-way semantics.
 
-A conflict-bearing run conceptually becomes:
+## 7. Conflict is structural as well as textual
 
-`planning -> waiting-for-conflicts -> revalidate -> applying -> publishing`
+A V4 conflict is not merely LOCAL text versus REMOTE text. `planV4Sync` compares logical identity, path, presence, and content.
 
-### Batch creation
+Every conflict side is modeled as:
 
-During planning, conflicts are accumulated into one `ConflictBatch` instead of opening one modal at a time.
+```text
+SideState = ABSENT | { normalizedPath, plaintextHash, size, mtime, contentHandle? }
+```
 
-The batch contains:
+The resolver separately reasons about:
 
-- a unique `runId`
-- the remote head SHA used for planning
-- all conflict files found for that plan
-- per-file path and V4 identity metadata
-- local/remote mtimes and sizes when available
-- BASE / LOCAL / REMOTE content fingerprints
-- bounded text snapshots or lazy content accessors
-- preview metadata for binary files
+1. presence/existence
+2. path/rename
+3. content
 
-A batch must be complete before the conflict workspace asks the user to resolve it. No mutation that depends on conflict choices should be remotely published while the batch is waiting.
+### Structural rules
 
-### Suspend behavior
+- BASE/LOCAL/REMOTE all exist at one effective logical target path and text is safe: hunk editor is available.
+- One side renamed while the other remains at BASE path: the changed path is structurally non-conflicting; content can still use three-way merge.
+- Both sides rename the same `fileId` to the same path: path is resolved; content is handled normally.
+- Both sides rename to different paths: explicit structural path conflict. The user must choose LOCAL path, REMOTE path, or whole-file Keep both where valid.
+- Edit vs delete: file-level structural conflict. Deletion is absence, never an empty text document.
+- Rename vs delete: file-level structural conflict.
+- Competing creates with no BASE: no `Discard both = empty file` interpretation. BASE absence means file absence. Use file-level resolution unless a future create/create merge policy is explicitly designed.
+- Hunk-level `Accept both` is only available after the structural model has one logical target file. It is not a substitute for choosing two paths.
 
-The sync session awaits one batch-resolution result.
+### File-level action semantics
 
-Closing the conflict view does not resolve or reject that wait. The coordinator remains alive and the Sync Center/status surface may reopen the conflict workspace.
+- `Use local`: LOCAL side is authoritative, including its path/presence/content.
+- `Use remote`: REMOTE side is authoritative.
+- `Keep both`: only valid when both sides contain materializable files. Preserve LOCAL as the primary logical file and materialize REMOTE through the repository's existing conflict-copy naming/identity mechanism.
+- If one side is absent, use concrete labels such as `Keep deletion` / `Restore remote`; do not expose a meaningless Keep both.
 
-### Continue behavior
+Any chosen target path must pass existing path-safety and case-insensitive collision rules before continuation.
 
-`Resolve all & continue` becomes enabled only when every file is resolved according to its conflict type.
+## 8. Conflict fingerprints and batch generation
 
-On continue, the coordinator returns final per-file resolutions to the waiting session. The session does not start a new top-level manual sync.
+Content hashes alone are insufficient because unchanged bytes can still participate in divergent rename or delete conflicts.
 
-### Revalidation
+A reusable file-resolution fingerprint is conceptually:
 
-Before applying resolved content, revalidate:
+```text
+repo/run context
++ fileId
++ BASE  { exists, normalizedPath-or-ABSENT, plaintextHash-or-ABSENT }
++ LOCAL { exists, normalizedPath-or-ABSENT, plaintextHash-or-ABSENT }
++ REMOTE{ exists, normalizedPath-or-ABSENT, plaintextHash-or-ABSENT }
+```
 
-- current remote branch head
-- current local file fingerprint/state for every affected conflict file
+Paths are normalized using the V4 vault-path rules and NFC for fingerprint stability; case-insensitive collision validation remains a separate safety check.
 
-If the remote head changed, re-plan inside the same logical run. A previously resolved file may be reused only if the re-planned BASE / LOCAL / REMOTE fingerprint tuple is unchanged.
+A changed path, presence bit, or content hash invalidates the previous resolution. Mtime is useful for diagnostics/preconditions but is not the identity of a resolution.
 
-If a local file changed while the user was resolving it, invalidate that file and require review again rather than overwriting the newer local content.
+Hunk IDs are deterministic only inside one file fingerprint and derive from normalized source ranges/content rather than DOM positions.
 
-Unrelated remote commits should not automatically discard all user work; unchanged conflict fingerprints may retain their decisions/manual merged content.
+The batch also captures repository/run context (repo identity, branch/config generation, and `runId`). A retry under a changed repository/config context must never reuse old decisions.
 
-## 7. Conflict fingerprints
+## 9. Lazy conflict materialization and resource bounds
 
-Every conflict file must have a stable fingerprint derived from immutable conflict inputs, conceptually:
+Do not eagerly load BASE + LOCAL + REMOTE for every conflict file.
 
-`fileId + hash(BASE) + hash(LOCAL) + hash(REMOTE)`
+Batch discovery first produces metadata/fingerprints. The session exposes a generation-scoped lazy materializer for a selected file. Materialization:
 
-Path/mtime alone is insufficient.
+- loads only the sides required by the active file/policy
+- uses existing V4 codec/decryption and resource controls
+- enforces text merge limits before whole-buffer reads where possible
+- may cache the active/adjacent file within a bounded budget
+- releases inactive preview buffers/object URLs
+- becomes invalid when batch generation changes
 
-The fingerprint is used to decide whether a resolution can survive a re-plan. A changed fingerprint means the old decision is stale and cannot be applied automatically.
+For `merge`, auto-resolution may materialize conflicts sequentially so one large batch never requires all three versions of every file in memory simultaneously.
 
-Hunk identifiers should be deterministic within one file fingerprint, based on normalized source ranges/content rather than transient DOM/editor positions.
+## 10. Bounded text-diff model
 
-## 8. Three-way text merge model
+The existing 2 MiB byte ceiling remains an upper bound, but bytes alone are not a sufficient CPU bound. A 2 MiB file can contain hundreds of thousands of tiny lines.
 
-Text conflicts use BASE / LOCAL / REMOTE.
+The clean-room diff implementation must therefore be deterministic and bounded by both content size and an explicit work/line budget. A bounded Myers/patience-style implementation or equivalent is acceptable; the implementation plan must pick constants and test them.
 
-The line-oriented merge model classifies changes at minimum as:
+If the work budget is exceeded, the UI must degrade safely to file-level resolution rather than freeze the Obsidian UI.
 
-- `local-only`: local differs from BASE, remote equals BASE; auto-accept local
-- `remote-only`: remote differs from BASE, local equals BASE; auto-accept remote
-- `same-change`: local and remote produce the same change; auto-resolved once
-- `conflict`: both sides modify overlapping BASE regions differently
+Text qualification requires:
 
-Additional rules:
+- supported text extension/type
+- all required sides within the text ceiling
+- fatal UTF-8 decoding succeeds
+- binary-looking content (notably NUL-heavy/control-heavy data) is rejected
 
-- different insertions at the same BASE position are a conflict
-- delete-vs-edit is a conflict
-- identical insertion/change is not duplicated
-- adjacent but non-overlapping edits should remain separate when deterministic
-- beginning/end-of-file and empty-file cases must be supported
-- newline handling must preserve a deliberate final newline decision and avoid accidental whole-file churn
+Line tokenization must preserve:
 
-The algorithm will be implemented clean-room in pure TypeScript. No runtime diff dependency is required by the design.
+- LF / CRLF / lone-CR behavior
+- mixed EOL sequences without accidental whole-file normalization
+- UTF-8 BOM where present
+- intentional final-newline presence/absence
+- huge single-line files
 
-## 9. Hunk action semantics
+Repeated-line ambiguity must still produce deterministic hunks.
 
-For a user-conflict hunk:
+## 11. Three-way merge classifications
 
-### Accept local
+For content where BASE/LOCAL/REMOTE all exist:
 
-The merged output for the hunk becomes the LOCAL replacement.
+- `local-only`: LOCAL differs from BASE; REMOTE equals BASE → auto LOCAL.
+- `remote-only`: REMOTE differs from BASE; LOCAL equals BASE → auto REMOTE.
+- `same-change`: both produce the same replacement → auto resolved once.
+- `conflict`: overlapping incompatible replacements, competing insertions at the same BASE location, delete-vs-edit, or other non-equivalent overlap.
 
-### Accept remote
+Adjacent but genuinely non-overlapping changes stay separate when the bounded algorithm can prove it deterministically.
 
-The merged output for the hunk becomes the REMOTE replacement.
+The initial merged document uses all safely auto-resolved changes. For unresolved content hunks it uses BASE as the neutral placeholder, not an implicit LOCAL or REMOTE bias.
 
-### Accept both
+## 12. Hunk action semantics
 
-The merged output becomes LOCAL followed by REMOTE, matching the visual order used in the unified conflict block.
+For an unresolved text hunk:
 
-This operation is literal and deterministic; it must not perform heuristic de-duplication.
+- Accept local → output exactly the LOCAL replacement.
+- Accept remote → output exactly the REMOTE replacement.
+- Accept both → LOCAL replacement followed by REMOTE replacement in the displayed order, with exact token/EOL preservation and no heuristic de-duplication.
+- Discard both / Base → restore exactly the BASE region.
 
-### Discard both
+For an insertion conflict whose BASE region is empty, Discard both produces no insertion.
 
-The merged output becomes the original BASE content for that hunk.
+No Git marker text (`<<<<<<<`, etc.) is inserted into the real merged document automatically; conflict boundaries are UI decorations.
 
-For a conflict consisting only of competing insertions at an empty BASE position, `Discard both` therefore produces no inserted content.
+## 13. Manual merged editing
 
-The unified UI may label this action `Base` when space is constrained, while its accessible/full label remains clear.
+The merged result is the final authority for the bytes to apply.
 
-## 10. Manual merged editing
+Hunk buttons patch only the mapped output range for their hunk. They never regenerate the whole file and thereby erase unrelated manual edits.
 
-The merged result is an editable document and is the final authority for the bytes that will be applied.
+Manual edit rules:
 
-Hunk buttons are editing aids, not a regeneration recipe that rebuilds the entire file after every click.
+- an edit intersecting one unresolved hunk marks that hunk `manually-resolved`
+- an edit spanning multiple unresolved hunk ranges marks every intersected hunk manually resolved
+- an edit outside unresolved hunk ranges does not resolve anything
+- editing an already resolved or auto-resolved region changes final text but does not create a new unresolved hunk
+- a later hunk action on a manually resolved hunk replaces only that mapped range and must be visually explicit
+- every edit/action updates downstream mapped offsets deterministically
+- paste, undo, redo, and IME/composition input must go through the same model update path
 
-Requirements:
+A native Obsidian DOM editor/`textarea` abstraction is preferred for the first implementation to preserve the no-runtime-dependency posture. Previous/current value common-prefix/suffix detection may be used to map generic DOM edits into model ranges. CodeMirror is not required by the design.
 
-- applying a hunk action patches only the range controlled by that hunk
-- manual edits elsewhere survive subsequent hunk actions
-- switching Split / Unified does not regenerate or lose the merged document
-- undo/redo is available in the merged editor
-- `Reset file` restores the current conflict file to its initial merge state, with confirmation when manual work exists
-- real Git conflict marker text (`<<<<<<<`, etc.) is not inserted automatically; conflict boundaries are UI decorations only
+`Reset file` returns the current file to its initial auto-merge state (unresolved conflict ranges showing BASE) and requires confirmation if manual work exists.
 
-### Manual-resolution state
+Switching Split / Unified is presentation-only and never reconstructs the merge model.
 
-The model tracks mapped merged-document ranges for unresolved conflict hunks.
+## 14. Resolution completeness
 
-A manual edit that intersects the output range of an unresolved conflict hunk marks that hunk `manually-resolved`. Manual edits outside unresolved conflict ranges do not resolve a hunk.
+A text file is resolved only when:
 
-If a later hunk action is applied to a manually resolved hunk, that action replaces only that hunk's mapped result range and the UI must make the replacement evident so manual work is not silently discarded.
+- all required structural decisions are resolved, and
+- each user content conflict is one of accepted-local / accepted-remote / accepted-both / discarded-both / manually-resolved.
 
-A text file is considered resolved when every user-conflict hunk is one of:
+A binary/unsupported file is resolved when its file-level structural action is chosen.
 
-- accepted-local
-- accepted-remote
-- accepted-both
-- discarded-both
-- manually-resolved
+`Resolve all & continue` is disabled until every current-generation file is complete and error-free.
 
-Auto-resolved hunks do not require a user decision.
+## 15. Sync flow and conflict batching
 
-## 11. Conflict workspace UI
+Conceptual flow:
 
-### Header and file navigation
+```text
+planning
+→ conflict metadata batch
+→ policy auto-resolution / waiting in resolver
+→ continue requested
+→ local + remote revalidation
+→ re-plan if stale
+→ prepare resolved batch
+→ final pre-publish conflict guard
+→ publish under existing Git ref CAS
+→ existing recovery/local commit path
+```
 
-The workspace contains all files in the current conflict batch.
+The current per-conflict `askConflict(path, mtime...)` callback should become one batch-resolution boundary. The session does not open UI one file at a time.
 
-Desktop should provide a horizontally scrollable file-tab bar plus an `All conflicts` selector for large batches.
+No conflict-dependent remote mutation is published while the resolver is waiting.
 
-Each file entry shows state:
+## 16. Revalidation and pre-publication guard
 
-- unresolved count
-- resolved/check state
-- stale/remote-changed warning
-- binary/file-level indicator
+This is a hard correctness invariant: user decisions based on stale conflict inputs must not be published.
 
-A global summary shows total files and resolved conflict counts.
+### On `Resolve all & continue`
 
-### Desktop default: Split
+Re-read/verify:
 
-Desktop defaults to Split when the setting is `auto`.
+- current remote branch HEAD against the plan's expected head
+- each affected conflict file's current LOCAL presence/path/content fingerprint
 
-Primary layout:
+If remote HEAD changed, re-plan in the same logical runtime run. Reuse only resolutions whose full structural/content fingerprint remains identical.
 
-1. file tabs / batch status
-2. LOCAL and REMOTE read-only diff panes
-3. central or aligned hunk action controls
-4. editable Merged Result pane
-5. previous/next conflict controls and final batch action
+If LOCAL changed, invalidate that file and require review again.
 
-LOCAL and REMOTE panes should use synchronized scrolling where practical. Line numbers and changed-range highlighting are expected.
+### Immediately before Git ref publication
 
-The merged editor should receive enough space to remain the primary editable result rather than a tiny preview.
+The existing recovery flow can discover local-target changes after a remote candidate was already published, so user-resolved conflict files need an additional pre-publish guard.
 
-### Mobile default: Unified
+Before `publishV4CandidateRef`:
 
-Mobile defaults to Unified when the setting is `auto`.
+- verify conflict-local targets still satisfy their resolved-input snapshot
+- use stat as a fast path, but hash when stat changed or when a full fingerprint check is required
+- large files must use existing bounded hashing/content-source machinery
+- if a conflict input changed, abort candidate publication and re-plan instead of relying only on post-publication local recovery preconditions
 
-Each conflict block shows context plus LOCAL and REMOTE alternatives in one vertical flow, followed by touch-sized actions.
+The existing Git ref CAS remains the authoritative remote race guard.
 
-Sticky navigation should expose previous/next conflict and progress.
+This extra guard is specific to user-resolved/staged conflict decisions; ordinary non-conflict push behavior remains under the current source-stability/CAS mechanisms.
 
-The user may still select Split explicitly, but the UI may warn that Unified is more suitable for narrow widths rather than forcibly changing the setting.
+## 17. CAS retry and coordinator interaction
 
-### View mode setting
+`V4PluginRuntime.execute` already retries stale-ref/recovery-replan conditions within one top-level coordinator run. Conflict UI must fit that model.
 
-Add a persisted setting conceptually:
+- One `runState.runId` owns the conflict coordinator state across retry attempts.
+- Every re-plan advances batch generation.
+- Identical fingerprints can reuse decisions/drafts.
+- Removed conflicts disappear from the workspace.
+- Newly discovered conflicts are added.
+- If the re-plan has no unresolved conflicts, the pending workspace is completed/closed automatically.
+- Old lazy materializers and async view callbacks fail closed when generation mismatches.
 
-`conflictViewMode: "auto" | "split" | "unified"`
+Local vault events occurring while the run is active remain queued by `V4SyncCoordinator`; conflict-local prepublication validation prevents those queued edits from being overwritten/published through a stale resolution.
 
-Default: `auto`
+## 18. Cancel, close, unload, and settings changes
 
-- desktop + auto -> split
-- mobile + auto -> unified
+### Close pane
 
-Changing mode must preserve all batch decisions and manual merged text.
+Closing the ItemView does not resolve or cancel the pending batch. The coordinator remains alive in memory. Reopening reveals the same batch.
 
-### Resolved-conflict visibility
+If Obsidian restores the view when no batch exists, render a harmless `No active conflicts` state.
 
-Provide a `Show resolved conflicts` control.
+### Explicit Cancel sync
 
-When hidden, previous/next navigation skips resolved hunks by default.
+Cancel is separate from pane close. It settles the resolver wait and terminates the active run without publishing unconfirmed conflict results.
 
-## 12. Binary and non-text conflicts
-
-If a conflict cannot safely participate in the text merge path, resolve it at file level.
-
-This includes:
-
-- unsupported extension/content type
-- malformed/non-decodable text
-- content over the configured text-merge size ceiling
-- arbitrary binary formats
-
-### Preview behavior
-
-Attempt preview only where practical and bounded:
-
-- images: LOCAL / REMOTE image previews plus dimensions/size when cheaply available
-- PDFs: render only if the existing Obsidian/browser environment supports it safely without a new heavyweight subsystem; otherwise metadata-only
-- unknown binary: filename, extension/MIME when known, sizes, timestamps, truncated hashes for diagnostics
-
-Preview failure must never block file-level resolution.
-
-### File-level actions
-
-- `Use local`
-- `Use remote`
-- `Keep both`
-
-`Keep both` must reuse the repository's existing safe conflict-copy semantics rather than invent a second naming policy. The original local content remains at the logical local path and the remote alternative is materialized through the existing conflict-copy behavior.
-
-For delete-vs-file cases, labels should describe the actual operation (`Keep deletion`, `Restore remote`, etc.) instead of presenting misleading generic text.
-
-Binary `Accept both` concatenation is not supported.
-
-## 13. Conflict workspace lifecycle
-
-### Close view
-
-Closing only the `ItemView` does not cancel sync.
-
-The coordinator keeps the conflict batch and in-memory drafts alive. Sync Center/status UI shows a `Waiting for conflict resolution` state and offers a route back to the workspace.
-
-### Cancel sync
-
-Provide an explicit `Cancel sync` action separate from the normal pane-close control.
-
-Cancel discards the pending batch and causes the waiting sync run to exit without applying the unconfirmed merged results.
+Add a truthful terminal progress lifecycle/status for user cancellation (preferred: `cancelled`) rather than leaving progress stuck in `active` or reporting a false success/no-change.
 
 ### Plugin/app unload
 
-Pending conflict drafts are process-memory only.
+Coordinator disposal aborts the waiting resolver promptly. No partial conflict publication occurs. Drafts are not restored on the next app start; a fresh sync re-plans.
 
-On plugin unload/application shutdown:
+### Relevant settings/repository change while waiting
 
-- abort the active waiting sync through existing cancellation lifecycle
-- do not publish partial conflict resolutions
-- do not persist plaintext BASE / LOCAL / REMOTE / merged drafts to plugin data or the vault
+A pending batch is bound to its repository/config/run context. If owner/repo/branch/storage mode/scope/credential generation changes while a conflict run is waiting or between CAS attempts, invalidate/cancel the pending batch and require a fresh sync rather than applying it to a newly configured target.
 
-On next startup, a fresh sync re-plans from real state.
+Changing only conflict view presentation mode is safe and does not invalidate the batch.
 
-This iteration deliberately does not add a cross-restart encrypted conflict-draft subsystem.
+## 19. Progress and status integration
 
-## 14. Conflict failure handling
+Keep conflict waiting as lifecycle `active` with phase `resolving-conflicts`; do not reuse the existing `waiting` lifecycle, which currently represents debouncing behavior.
 
-- Network loss while editing does not invalidate the in-memory editor; connectivity is needed again only for continue/revalidation/publish.
-- Remote-head change triggers re-plan and selective invalidation/reuse by fingerprint.
-- Local change while waiting invalidates the affected file before application.
-- GitHub API error after resolution remains governed by normal V4 retry/recovery behavior.
-- Decryption failure places the affected file in an error state and prevents final continuation until the content can be obtained safely.
-- Malformed or oversized text downgrades to file-level resolution.
-- No merged result is treated as a force-push instruction.
+The Sync Center/status surface should show a human label such as `Waiting for conflict resolution` and unresolved counts when available.
 
-## 15. Sync Center / History workspace
+Current status-bar click behavior must change:
 
-The existing Sync Center remains the single history workspace.
+- pending conflict batch → reveal/open Conflict Resolution view
+- no pending conflict and runtime idle → normal manual sync action
+- active non-conflict sync → no second sync
+
+## 20. Conflict workspace UI
+
+### Shared header
+
+- file tabs with unresolved/error/stale/binary badges
+- horizontally scrollable tabs plus `All conflicts` selector for large batches
+- global file/conflict progress
+- Split / Unified selector (`auto | split | unified` persisted in settings)
+- Previous / Next unresolved conflict
+- Show resolved conflicts
+- Resolve all & continue
+- explicit Cancel sync in a non-accidental location
+
+### Desktop auto mode
+
+Split view:
+
+```text
+LOCAL read-only diff | aligned hunk actions | REMOTE read-only diff
+---------------------------------------------------------------
+Editable Merged Result
+```
+
+Synchronize local/remote scrolling where practical; show line numbers and changed-range highlighting.
+
+### Mobile auto mode
+
+Unified vertical blocks with BASE context, LOCAL/REMOTE alternatives, touch-sized actions, sticky conflict navigation, and editable merged result.
+
+The user may force Split on narrow screens; warn if useful but do not silently change their setting.
+
+### Async rendering safety
+
+All preview/materialization results must check both view render generation and conflict batch generation before updating DOM.
+
+## 21. Binary and unsupported conflict preview
+
+Preview is best-effort and never a prerequisite for resolution.
+
+- images: local/remote preview plus dimensions/size where cheap
+- PDF: render only if safely supported by existing platform capabilities; otherwise metadata
+- unknown binary: path/type, size, mtime, truncated plaintext hash metadata
+- preview failure: show error/metadata and keep file-level actions enabled
+
+Before/after image views can require multiple simultaneous object URLs. Manage them as a bounded collection and revoke all on replacement/close, rather than the Sync Center's current single-URL assumption.
+
+## 22. Keep-both collision behavior
+
+Reuse current `runState.conflictCopies` / conflict-copy naming semantics so a CAS retry preserves the reserved identity/path when still valid.
+
+Before application, recheck that the reserved conflict-copy path remains unoccupied and does not introduce a case-insensitive collision. If the path became occupied while the user was waiting, invalidate/re-reserve safely; never overwrite the new occupant.
+
+## 23. History workspace
+
+Keep the existing Sync Center and preserve its native DOM/master-detail pattern and async render-generation guards.
 
 Primary modes:
 
-- `Repository history`
-- `Current file`
+- Repository history
+- Current file
 
-Desktop uses a master/detail layout. Mobile may collapse the same information into stacked navigation without changing the underlying history model.
+History reads are independent from sync mutations and should fail locally in the view without changing sync state.
 
-## 16. Repository history
+## 24. Repository history semantics
 
-The master list shows commit metadata:
+Commit list shows message, author, time, source (`Synced` vs `External`), and changed-file count when loaded.
 
-- commit message
-- author
-- authored time
-- plugin-synced vs external classification when available
-- changed-file count after details are loaded
+Selecting a file shows before/after:
 
-Selecting a commit opens its changed-file list. Selecting a changed file opens a before/after preview.
+- text: two-way read-only diff
+- image: before/after preview
+- binary: metadata/preview where supported
+- create: empty/absent before side
+- delete: absent after side
+- pure rename with identical content: rename metadata plus `content unchanged`
 
-Text changes use a read-only two-way diff. Image/binary changes use the same preview infrastructure used by conflict UI where possible.
+Merge commits use first-parent comparison to match the current history service behavior.
 
-Change kinds should be explicit: create / modify / delete / rename.
+### External commits
 
-Rename display should show old path -> new path.
+Current external history is path/tree based and does not carry V4 logical `fileId` semantics.
 
-History content is loaded lazily; the commit list does not fetch every blob up front.
+- plaintext repositories: show ordinary Git path changes. Exact rename inference is allowed only when old/new blob identity pairing is unambiguous; otherwise display delete + create rather than guess.
+- encrypted V4 repositories: an external commit that bypasses V4 journals is not safely interpretable as logical plaintext V4 history. Show a warning/raw Git metadata where available and disable logical diff/Restore when safe decoding cannot be proven.
 
-## 17. Current-file history
+## 25. Current-file history and pagination
 
-Current-file history follows the logical V4 `fileId`, not merely the current path.
+Current-file history follows plugin journal `fileId` across renames.
 
-The version timeline therefore survives renames.
+Do not silently stop after the current `getFileVersions(fileId, maxPages=20)` default. Replace the fixed hidden cap with incremental pagination/load-older semantics and an explicit `hasMore`/truncated state.
 
-Selecting a historical version shows:
+External path-only commits are not silently attached to a logical `fileId` timeline unless identity can be proven.
 
-- historical path
-- action/change kind
-- commit and timestamp
-- previous-version versus selected-version preview/diff
-- `Restore this version`
+Selecting a version compares it to its immediately preceding version in this iteration. Arbitrary A-vs-B comparison remains out of scope.
 
-For a delete event, the last existing content may still be previewed from its preceding version.
+## 26. History preview service changes
 
-Arbitrary user-selected A-vs-B version comparison is deferred.
+Extend `V4HistoryService` with explicit bounded before/after APIs instead of reusing `after ?? before` preview.
 
-## 18. History preview service changes
+The service remains responsible for journal parsing, encrypted historical decoding, external tree comparison, preview classification, and safety limits.
 
-The existing history service currently has a generic preview path. The history UI needs explicit before/after access for selected changes.
+Add bounded service-level caching for immutable commit metadata/tree maps so selecting multiple files from one commit does not recursively refetch the same tree for every side. Cache keys are commit/tree SHAs and are evicted with the history service/view generation.
 
-Extend the history service with bounded methods that return historical sides explicitly, conceptually:
+A truncated Git tree remains a fail-safe error; do not guess missing historical blobs.
 
-- before preview
-- after preview
-- content kind and byte-size metadata
+History service instances must be invalidated when repository/config/credential generation changes so a long-open Sync Center does not keep operating on a stale target configuration.
 
-The service remains responsible for:
+## 27. Restore semantics
 
-- plugin history journal interpretation
-- external-commit tree comparison
-- encrypted historical storage decoding
-- size ceilings
-- binary/image/text classification
-
-The UI must not issue raw GitHub requests around the service.
-
-## 19. Restore-version semantics
-
-Restore is a local file operation followed by normal V4 synchronization.
-
-It must not create or amend a Git commit directly from History.
+Restore is a local user edit, not a Git mutation.
 
 Flow:
 
-1. user previews a historical version
-2. user chooses `Restore this version`
-3. UI shows confirmation with current path, selected version/commit/time, and overwrite implications
-4. historical bytes are fetched/decrypted through the existing V4 history/storage path
-5. validate that the current local state still matches the fingerprint observed when the preview was opened
-6. write historical bytes to the local vault
-7. normal V4 local-change detection/enqueue path handles the edit
-8. later normal sync publishes it with regular conflict/CAS/recovery protection
+1. select a historical version by immutable commit SHA/descriptor
+2. capture the current local restore precondition/fingerprint
+3. user presses Restore and confirms target/version
+4. revalidate the local precondition
+5. materialize historical content through the V4 history/codec path
+6. validate path/collision rules
+7. write/commit into the local vault
+8. reflect the result as a normal local change according to current sync settings
 
-### Current renamed file
+The Restore button is disabled while a sync run is active, including while conflict resolution is pending. This prevents History from mutating a file inside the active run's snapshot.
 
-Restoring an old version of a file that has since been renamed restores the historical content into the file's current logical path by default. It does not rename the file back to the historical path.
+Double-click/repeated Restore is serialized and the action is disabled while the first restore is in flight.
 
-### Currently deleted file
+## 28. Restore and local sync settings
 
-When the logical file no longer exists locally, the action becomes `Restore file`.
+Restore must respect user sync settings.
 
-Use the latest safe historical path represented by that logical file history to recreate the local file, subject to the same path-safety checks used elsewhere in V4.
+- Always complete the confirmed local restore if the local/path preconditions remain valid.
+- If sync-on-local-change is enabled and watch is active, route the restored path into the normal local-change queue exactly once.
+- If automatic sync is disabled, do not force a sync. Show `Restored locally; sync manually when ready`.
+- Avoid duplicate vault event + explicit enqueue by performing restore through a runtime helper that suppresses its own vault event and then explicitly enqueues only when policy allows.
+- A restore path outside current sync scope may be restored locally after a clear warning, but it is not queued/published until scope allows it.
 
-If the desired restore path is occupied by an unrelated current file, do not overwrite it silently; require a safe alternative or abort with a clear conflict.
+## 29. Restore path and logical identity
 
-## 20. Restore precondition and failure behavior
+### Existing logical file, including historical rename
 
-When a historical preview opens, record a current-local fingerprint/precondition.
+Restore old content into the file's current logical path by default. Do not rename it back to the historical path.
 
-At restore time:
+### Currently deleted logical file
 
-- if local still matches, proceed
-- if local changed, block the default restore and offer `Refresh comparison` or explicit `Restore anyway`
+Repository history may restore historical content whose `fileId` is no longer present in the current local/remote index.
 
-`Restore anyway` is an explicit local overwrite only. Remote publication still follows normal V4 conflict/CAS logic.
+For this iteration, recreate it as a **new local logical file identity** at the latest safe historical path. This avoids an unreliable cross-restart one-shot resurrection seed and avoids silently reusing an identity that is absent from current state.
 
-Failure rules:
+The UI should make this clear (`Restore file as new local file`). Preserving/resurrecting the old `fileId` across deletion can be a separate future feature if durable identity-seeding semantics are designed.
 
-- historical fetch/decryption failure -> no local change
-- path validation failure -> no local change
-- local write failure -> report failure and do not enqueue/claim successful restore
-- write succeeds but later sync fails -> restored local content remains as a real local edit and is eligible for a later sync retry
+Before creating:
 
-The restore flow does not create a second automatic backup file in this iteration.
+- normalize with `normalizeV4VaultPath`
+- reject unsafe `.` / `..` / empty paths
+- reject file-vs-folder collisions
+- reject case-insensitive collisions with unrelated logical files
+- if occupied, do not overwrite silently; require another path or abort
 
-## 21. Resource and privacy constraints
+## 30. Large-file Restore is not limited by preview
 
-The repository currently has no runtime dependencies. Preserve that lightweight posture unless implementation evidence proves a small dependency is necessary.
+`V4_HISTORY_PREVIEW_MAX_BYTES` is a preview limit, not a restore limit.
 
-Requirements:
+Do not make a valid historical file un-restorable merely because it exceeds 5 MiB.
 
-- pure TypeScript merge/diff core where possible
-- do not load all historical blobs eagerly
-- lazily load active conflict/history previews
-- maintain existing text-preview/text-merge byte ceilings unless a measured change is approved separately
-- bound in-memory caches and release inactive previews
-- revoke generated object URLs when views/previews are replaced or closed
-- do not write decrypted historical/conflict content to disk as cache
-- route encrypted historical content through the existing codec/key infrastructure
+- small historical content may be read/decrypted whole
+- large/chunked historical content should use existing `V4StorageCodec.readToSink` + `V4StagingStore` and then existing bounded stage commit where possible
+- packed encrypted records follow current codec/resource limits; if safe bounded restoration cannot be provided, fail clearly rather than exceed memory limits
 
-If CodeMirror 6 modules are needed for the merged editor, use only the minimum official modules compatible with Obsidian and verify build/bundle/resource impact before accepting them. Merge semantics remain independent of CodeMirror.
+Restore can remain available even when visual preview is unavailable because of size/type, provided the historical descriptor can be materialized safely.
 
-## 22. Accessibility and theming
+## 31. Restore stale-local precondition
 
-- use Obsidian theme variables instead of hard-coded light/dark palettes
-- do not communicate conflict state by color alone
-- provide accessible labels for icon-only/hunk actions
-- maintain keyboard navigation for desktop
-- provide touch-sized controls for mobile
-- expose resolved/unresolved progress in text
-- ensure focus can move between file selection, conflict navigation, actions, and merged editor
+When preview/version selection opens, capture the current target state. At Restore time:
 
-The visual result should feel native to Obsidian while preserving the interaction ideas shown in the reference screenshots.
+- unchanged → proceed
+- changed → block default action and offer Refresh comparison or explicit Restore anyway
 
-## 23. Testing strategy
+Use content hash where practical; size/mtime alone is not a sufficient identity guarantee. Large-file verification uses bounded hashing.
 
-The feature must integrate with the repository's existing test runner rather than creating a separate framework.
+`Restore anyway` is an explicit local overwrite only. Remote sync still follows normal conflict/CAS behavior.
 
-### Merge-model unit coverage
+Historical fetch/decryption/path/write failure must leave local content unchanged whenever the failure occurs before commit. If local commit succeeds but later sync fails, the restored local edit remains for a later retry.
 
-- local-only change
-- remote-only change
-- identical change
-- overlapping edits
-- insertion/insertion at same position
-- delete/edit
-- adjacent hunks
-- start/end-of-file edits
-- empty files
-- CRLF/LF handling
-- final newline behavior
+## 32. Privacy, draft persistence, and existing staging
+
+Conflict BASE/LOCAL/REMOTE snapshots and manual drafts are process-memory only while the user edits. Do not create a new plaintext conflict-draft/cache file.
+
+This does **not** mean the final confirmed merged result can bypass existing V4 staging/recovery. After `Resolve all & continue`, confirmed final bytes may enter the repository's existing transient staging/recovery mechanism, which can place plaintext stage data under the plugin staging area as current V4 local-recovery behavior already does.
+
+The design promise is therefore:
+
+- no new persisted plaintext draft/cache while waiting for user decisions
+- confirmed mutations continue to use existing V4 recovery/staging guarantees
+- encrypted Git remote content remains encrypted through the normal codec path
+
+## 33. Failure behavior
+
+- network loss while editing: keep in-memory model; revalidate on Continue
+- remote branch deleted/rewritten: fail/re-plan safely; never force old decisions
+- local file renamed/deleted/edited while waiting: invalidate that file by structural fingerprint
+- config/credential target changed: cancel/invalidate batch
+- decrypt/auth failure: mark file error; no Continue
+- text diff budget exceeded: downgrade safely to file-level resolution
+- preview failure: never blocks file-level resolution
+- stale history commit no longer fetchable: show refresh/error; no restore
+- Git tree truncated: fail safe
+- plugin unload: abort pending resolver promptly and clean in-memory drafts
+
+## 34. Test strategy
+
+Use the existing Node test runner and extend existing Obsidian stubs where needed. Do not introduce a parallel test framework.
+
+### Pure merge/diff tests
+
+- local-only / remote-only / identical change
+- overlap / competing insertion / delete-vs-edit
+- adjacent hunks / repeated-line ambiguity
+- file start/end / empty file / huge single line
+- CRLF, LF, lone CR, mixed EOL
+- BOM and final-newline preservation
 - Unicode/emoji
-- Accept local
-- Accept remote
-- Accept both ordering
-- Discard both -> BASE
-- manual-edit preservation
-- mapped range behavior after edits
+- malformed UTF-8 / NUL-heavy pseudo-text downgrade
+- very high line count/work-budget downgrade
+- Accept local/remote/both/base exact output
+- manual edit one hunk / multiple hunks / outside hunk
+- undo/redo/paste/IME-equivalent edit mapping
+- mapped offset updates after actions/edits
+- Split/Unified switch does not alter model
 
-### Conflict batch/session coverage
+### Structural conflict tests
 
-- multiple conflict files in one run
-- run waits for complete batch resolution
-- close/reopen view does not cancel batch
-- explicit cancel does not publish
-- local mutation while waiting
-- remote-head mutation while waiting
-- unchanged fingerprints reuse prior decisions
-- changed fingerprints selectively invalidate
-- no partial publish before resolution phase completes
+- rename vs unchanged path + edit
+- same rename both sides
+- divergent rename
+- delete vs edit
+- delete vs rename
+- competing create with no BASE
+- path/presence change invalidates fingerprint even when content hash is identical
+- case-insensitive collision after path choice
+- conflict-copy path becomes occupied while waiting
 
-### Binary coverage
+### Policy tests
 
-- previewable image
-- preview failure does not block resolution
-- unknown binary
-- oversized text downgrade
-- use local / use remote / keep both
-- delete-vs-file labels/semantics
+- copy unchanged behavior
+- newer unchanged behavior including equal-mtime copy fallback
+- ask always yields workspace batch for planner conflicts
+- merge auto-resolves clean three-way conflict
+- merge opens workspace for unresolved overlap/structural conflict instead of old copy fallback
+- forcePush/forcePull never open conflict resolver
 
-### History coverage
+### Batch/session tests
 
-- repository commit -> changed file -> before/after preview
-- current-file versions by `fileId`
-- rename history
-- create/delete preview
-- encrypted historical content
-- external Git commit
-- lazy loading / preview limits
+- multiple conflicts → one batch wait
+- close/reopen view does not settle wait
+- explicit cancel terminal state and no publication
+- abort/unload settles wait promptly
+- local edit while waiting invalidates before publish
+- local edit after Continue but before ref update trips final conflict guard
+- remote HEAD change re-plans
+- unchanged fingerprints reuse decisions
+- changed path/presence/hash selectively invalidates
+- retry generation invalidates stale loader callbacks
+- repository/settings generation change invalidates run
+- no partial conflict publication
 
-### Restore coverage
+### Resource/recovery tests
 
-- restore an old version into current logical path
-- restore after historical rename
-- recreate currently deleted file
-- occupied restore path protection
-- unchanged local precondition
-- changed local blocks default restore
-- explicit restore-anyway
-- failed fetch does not mutate local
-- failed write does not enqueue sync
-- successful write becomes a normal local dirty change
+- many conflict files materialize lazily
+- text work budget prevents pathological CPU/memory growth
+- bounded large-file hashing
+- preview cache eviction/object URL cleanup
+- final confirmed merge still uses existing staging/recovery path
+- network/CAS/recovery failures around resolved conflicts
 
-### Resource/recovery coverage
+### History tests
 
-- bounded memory for many conflict files
-- preview cache eviction
-- repeated open/close views
-- object URL cleanup
-- network failure before and after conflict resolution
-- CAS/retry/recovery path after resolution
+- plugin commit before/after text diff
+- create/delete/rename display
+- first-parent merge-commit behavior
+- current-file timeline follows plugin `fileId` across rename
+- load-older pagination beyond 1000 commits without silent truncation
+- external plaintext commit path diff
+- unambiguous vs ambiguous rename inference
+- encrypted external commit disables unsafe logical diff/restore
+- tree/commit cache avoids duplicate immutable tree loads
+- truncated tree fails safe
+- simultaneous before/after image URL cleanup
 
-### UI/lifecycle coverage
+### Restore tests
 
-Where practical with the repository's test environment:
+- restore old content to current logical path
+- historical rename does not rename current file backwards
+- deleted historical file restores as new logical identity
+- unsafe/occupied/case-colliding path blocked
+- active sync disables restore
+- unchanged/changed local precondition
+- Restore anyway
+- auto-sync enabled queues exactly once
+- auto-sync disabled restores locally without forced sync
+- outside-scope restore warns and does not queue
+- >5 MiB historical file can restore without preview via bounded stage path
+- failed materialization/commit does not report success
 
-- desktop auto -> split
-- mobile auto -> unified
-- switching view mode preserves merged text and decisions
-- unresolved/resolved counters
-- navigation skips resolved hunks when configured
-- close/reopen preserves in-memory batch state
-- accessibility labels and mobile-width layout smoke checks
+### UI/lifecycle tests
 
-## 24. Verification gates before implementation is considered complete
+- desktop auto → split
+- mobile auto → unified
+- one existing conflict view is revealed, not duplicated
+- stale async render generations do not mutate new view
+- resolved/unresolved counters and navigation
+- no-active-batch placeholder
+- status-bar click opens pending resolver
+- `cancelled` status rendering
+- light/dark variables and touch-sized mobile controls smoke tests
 
-Run and pass at least:
+## 35. Verification gates
+
+Before implementation is considered complete, run at least:
 
 - `pnpm build`
 - `pnpm test:fast`
@@ -657,20 +701,23 @@ Run and pass at least:
 - `pnpm test:feasibility`
 - `pnpm validate:package`
 
-Add targeted feature tests to the existing runner so the standard CI path exercises the new merge/history behavior.
+Add targeted feature tests to the existing runner so standard CI covers the new semantics.
 
-## 25. Acceptance criteria
+## 36. Acceptance criteria
 
-The feature is complete when all of the following are true:
-
-1. A sync run with multiple text conflicts opens one conflict workspace and remains suspended until all required conflicts are resolved or explicitly cancelled.
-2. Text conflicts support deterministic hunk-level local/remote/both/base decisions and an editable final merged result.
-3. Desktop defaults to split and mobile defaults to unified under `auto`, and switching modes preserves state.
-4. Binary/unsupported conflicts remain resolvable at file level even if preview fails.
-5. Closing the view does not accidentally cancel the run; explicit cancel does.
-6. Local or remote changes during resolution cannot cause stale conflict decisions to be blindly applied.
-7. Sync Center presents repository and current-file history with lazy before/after diff/preview.
-8. Per-file history follows V4 logical identity through rename.
-9. Historical file content can be restored locally, with local-change precondition checking, and is then published only through normal V4 sync.
-10. No implementation or CSS is copied from the AGPL reference project.
-11. Existing safety/resource/recovery test suites remain green and new targeted tests cover the feature semantics above.
+1. Multi-file planner conflicts are represented in one generation-aware conflict workspace and suspend one logical run.
+2. `copy` and `newer` keep current automatic behavior; `ask` opens the workspace; `merge` auto-merges safe cases and asks for unresolved cases.
+3. Structural path/presence conflicts are resolved explicitly and deletion is never misinterpreted as empty content.
+4. Text merge is deterministic, resource-bounded, EOL/BOM preserving, and supports hunk actions plus manual editing.
+5. Closing the pane does not cancel; explicit Cancel terminates cleanly with truthful status.
+6. Local, remote, path, presence, or configuration changes cannot cause a stale user resolution to be published.
+7. A final conflict-local guard runs before Git ref publication in addition to existing CAS/recovery checks.
+8. Binary/unsupported conflicts remain resolvable when preview/diff is unavailable.
+9. Sync Center provides repository/current-file lazy before/after history without silent fixed-page truncation.
+10. External/encrypted history is displayed only to the degree that identity/plaintext interpretation is safe.
+11. Restore is local-first, disabled during active sync, respects auto-sync/scope settings, and does not force remote publication.
+12. Preview size limits do not unnecessarily prevent bounded large-file restore.
+13. Restore of a currently deleted historical file recreates a new logical local identity in this iteration.
+14. No new plaintext conflict draft/cache is persisted; confirmed results may use existing V4 staging/recovery.
+15. No reference-plugin AGPL source or CSS is copied.
+16. Existing build/recovery/resource suites and new targeted tests pass.
