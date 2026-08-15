@@ -1073,36 +1073,59 @@ export class V4SyncSession {
       }
       return [...byPath.values()]
     }
-    const identityByPath = new Map(baseRecords.map(record => [record.path, record]))
+    const identityByPath = new Map<string, V4IndexFileRecord | null>(baseRecords.map(record => [record.path, record]))
+    const atOrBelow = (path: string, root: string) => path === root || path.startsWith(`${root}/`)
     for (const change of changes) {
-      if (change.type === "replace") {
-        identityByPath.delete(change.oldPath)
+      if (change.type === "rescan") continue
+      if (change.type === "delete") {
         identityByPath.delete(change.path)
         continue
       }
+      if (change.type === "modify") {
+        if (!identityByPath.has(change.path) && !identitySeedByPath?.has(change.path)) identityByPath.set(change.path, null)
+        continue
+      }
+      if (change.type === "replace") {
+        identityByPath.delete(change.oldPath)
+        identityByPath.delete(change.path)
+        identityByPath.set(change.path, null)
+        continue
+      }
       if (change.type === "rename") {
+        const hadSource = identityByPath.has(change.oldPath)
         const record = identityByPath.get(change.oldPath)
-        if (record) { identityByPath.delete(change.oldPath); identityByPath.set(change.path, record) }
+        identityByPath.delete(change.oldPath)
+        identityByPath.delete(change.path)
+        if (hadSource) identityByPath.set(change.path, record ?? null)
+        continue
+      }
+      if (change.type === "folderDelete") {
+        for (const path of [...identityByPath.keys()]) if (atOrBelow(path, change.path)) identityByPath.delete(path)
         continue
       }
       if (change.type !== "folderRename") continue
-      const oldPrefix = `${change.oldPath}/`
+      const moved: Array<[string, V4IndexFileRecord | null]> = []
       for (const [path, record] of [...identityByPath]) {
-        if (path !== change.oldPath && !path.startsWith(oldPrefix)) continue
-        const suffix = path.slice(change.oldPath.length)
+        if (!atOrBelow(path, change.oldPath)) continue
         identityByPath.delete(path)
-        identityByPath.set(`${change.path}${suffix}`, record)
+        moved.push([`${change.path}${path.slice(change.oldPath.length)}`, record])
       }
+      for (const path of [...identityByPath.keys()]) if (atOrBelow(path, change.path)) identityByPath.delete(path)
+      for (const [path, record] of moved) identityByPath.set(path, record)
     }
     const files = await this.localIo.listFiles()
     return boundedMap(files, this.resources.limits.maxVaultReads, async file => {
       this.report({ phase: "scanning-local", currentPath: file.path, currentDirection: undefined })
-      const existing = identityByPath.get(file.path)
+      const identity = identityByPath.get(file.path)
+      const existing = identity ?? undefined
       const unchangedStat = existing && existing.size === file.size && existing.mtime === file.mtime
       if (!unchangedStat) this.report({ phase: "hashing", currentPath: file.path, currentDirection: undefined })
+      const fileId = identity === null
+        ? await this.newFileId(file.path)
+        : identitySeedByPath?.get(file.path) ?? existing?.fileId ?? await this.newFileId(file.path)
       return {
         path: file.path,
-        fileId: identitySeedByPath?.get(file.path) ?? existing?.fileId ?? await this.newFileId(file.path),
+        fileId,
         hash: unchangedStat ? existing.plaintextSha256 : await this.hashLocal(file.path, file.size, file.mtime),
         size: file.size,
         mtime: file.mtime,

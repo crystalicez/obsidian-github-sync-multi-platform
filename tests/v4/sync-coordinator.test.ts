@@ -202,7 +202,7 @@ test("v4 coordinator does not let a scheduled tick cut short a pending local deb
   assert.deepEqual(executions, ["localChange:1"]);
 });
 
-test("v4 coalescing preserves identity discontinuity for replacement and rename-delete sequences", async () => {
+test("v4 coalescing preserves replacement identity discontinuity and rescans ambiguous rename-delete sequences", async () => {
   const executions: V4QueuedChange[][] = [];
   const coordinator = new V4SyncCoordinator({ execute: async (_request, changes) => { executions.push(changes); return { changedFiles: changes.length }; } });
 
@@ -216,7 +216,11 @@ test("v4 coalescing preserves identity discontinuity for replacement and rename-
 
   assert.deepEqual(executions, [
     [{ type: "replace", oldPath: "replaced.md", path: "replaced.md", mtime: 2 }],
-    [{ type: "delete", path: "old.md", mtime: 4 }],
+    [
+      { type: "rename", oldPath: "old.md", path: "new.md", mtime: 3 },
+      { type: "delete", path: "new.md", mtime: 4 },
+      { type: "rescan", mtime: 4 },
+    ],
   ]);
 });
 
@@ -230,6 +234,19 @@ test("v4 coalescing preserves replacement identity break through a subsequent re
   ]);
 });
 
+test("v4 coalescing falls back to a causal rescan when a rename cycle can hide an overwritten destination", () => {
+  assert.deepEqual(coalesceV4Changes([
+    { type: "delete", path: "B.md", mtime: 1 },
+    { type: "rename", oldPath: "A.md", path: "B.md", mtime: 2 },
+    { type: "rename", oldPath: "B.md", path: "A.md", mtime: 3 },
+  ]), [
+    { type: "delete", path: "B.md", mtime: 1 },
+    { type: "rename", oldPath: "A.md", path: "B.md", mtime: 2 },
+    { type: "rename", oldPath: "B.md", path: "A.md", mtime: 3 },
+    { type: "rescan", mtime: 3 },
+  ]);
+});
+
 test("v4 coordinator collapses folder events to one full rescan", async () => {
   const executions: V4QueuedChange[][] = [];
   const coordinator = new V4SyncCoordinator({ execute: async (_request, changes) => { executions.push(changes); return { changedFiles: changes.length }; } });
@@ -237,6 +254,17 @@ test("v4 coordinator collapses folder events to one full rescan", async () => {
   coordinator.enqueue({ type: "modify", path: "Folder/note.md", mtime: 2 });
   await coordinator.run({ operation: "normal", trigger: "manual" });
   assert.deepEqual(executions, [[{ type: "rescan", mtime: 2 }]]);
+});
+
+test("v4 folder changes preserve causal event order across delete-recreate interactions", () => {
+  const changes: V4QueuedChange[] = [
+    { type: "folderDelete", path: "F", mtime: 1 },
+    { type: "folderRename", oldPath: "H", path: "F", mtime: 2 },
+    { type: "folderDelete", path: "F", mtime: 3 },
+    { type: "modify", path: "F/a.md", mtime: 4 },
+    { type: "rename", oldPath: "F/a.md", path: "H/a.md", mtime: 5 },
+  ];
+  assert.deepEqual(coalesceV4Changes(changes), changes);
 });
 
 test("v4 folder rename keeps descendant changes as one prefix mapping", () => {

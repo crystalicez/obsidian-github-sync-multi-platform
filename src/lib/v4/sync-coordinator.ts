@@ -35,11 +35,39 @@ export function coalesceV4Changes(changes: V4QueuedChange[]): V4QueuedChange[] {
     return [{ type: "rescan", mtime: Math.max(...changes.map(change => change.mtime)) }];
   }
   const byPath = new Map<string | symbol, V4QueuedChange>();
-  const pathChanges = changes.filter((change): change is V4PathChange => change.type !== "rescan");
-  for (const raw of pathChanges) {
-    const change: V4PathChange = raw.type === "rename" || raw.type === "replace" || raw.type === "folderRename"
+  const pathChanges = changes
+    .filter((change): change is V4PathChange => change.type !== "rescan")
+    .map((raw): V4PathChange => raw.type === "rename" || raw.type === "replace" || raw.type === "folderRename"
       ? { ...raw, oldPath: normalizeV4VaultPath(raw.oldPath), path: normalizeV4VaultPath(raw.path) }
-      : { ...raw, path: normalizeV4VaultPath(raw.path) };
+      : { ...raw, path: normalizeV4VaultPath(raw.path) });
+
+  if (pathChanges.some(change => change.type === "folderRename" || change.type === "folderDelete")) {
+    return pathChanges;
+  }
+
+  const isSimpleInverseRenameCycle = pathChanges.length === 2
+    && pathChanges[0].type === "rename"
+    && pathChanges[1].type === "rename"
+    && pathChanges[0].oldPath === pathChanges[1].path
+    && pathChanges[0].path === pathChanges[1].oldPath;
+  if (!isSimpleInverseRenameCycle) {
+    const priorRenameEndpoints = new Set<string>();
+    const priorRenameDestinations = new Set<string>();
+    for (const change of pathChanges) {
+      if (change.type === "delete" && priorRenameDestinations.has(change.path)) {
+        return [...pathChanges, { type: "rescan", mtime: Math.max(...pathChanges.map(item => item.mtime)) }];
+      }
+      if (change.type !== "rename") continue;
+      if (priorRenameEndpoints.has(change.oldPath) || priorRenameEndpoints.has(change.path)) {
+        return [...pathChanges, { type: "rescan", mtime: Math.max(...pathChanges.map(item => item.mtime)) }];
+      }
+      priorRenameEndpoints.add(change.oldPath);
+      priorRenameEndpoints.add(change.path);
+      priorRenameDestinations.add(change.path);
+    }
+  }
+
+  for (const change of pathChanges) {
     if (change.type === "folderRename") {
       byPath.set(Symbol("folderRename"), change);
       continue;
