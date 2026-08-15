@@ -45,19 +45,26 @@ export function coalesceV4Changes(changes: V4QueuedChange[]): V4QueuedChange[] {
     return pathChanges;
   }
 
-  const priorRenameEndpoints = new Set<string>();
-  const priorRenameDestinations = new Set<string>();
-  for (const change of pathChanges) {
-    if (change.type === "delete" && priorRenameDestinations.has(change.path)) {
-      return [...pathChanges, { type: "rescan", mtime: Math.max(...pathChanges.map(item => item.mtime)) }];
+  const isSimpleInverseRenameCycle = pathChanges.length === 2
+    && pathChanges[0].type === "rename"
+    && pathChanges[1].type === "rename"
+    && pathChanges[0].oldPath === pathChanges[1].path
+    && pathChanges[0].path === pathChanges[1].oldPath;
+  if (!isSimpleInverseRenameCycle) {
+    const priorRenameEndpoints = new Set<string>();
+    const priorRenameDestinations = new Set<string>();
+    for (const change of pathChanges) {
+      if (change.type === "delete" && priorRenameDestinations.has(change.path)) {
+        return [...pathChanges, { type: "rescan", mtime: Math.max(...pathChanges.map(item => item.mtime)) }];
+      }
+      if (change.type !== "rename") continue;
+      if (priorRenameEndpoints.has(change.oldPath) || priorRenameEndpoints.has(change.path)) {
+        return [...pathChanges, { type: "rescan", mtime: Math.max(...pathChanges.map(item => item.mtime)) }];
+      }
+      priorRenameEndpoints.add(change.oldPath);
+      priorRenameEndpoints.add(change.path);
+      priorRenameDestinations.add(change.path);
     }
-    if (change.type !== "rename") continue;
-    if (priorRenameEndpoints.has(change.oldPath) || priorRenameEndpoints.has(change.path)) {
-      return [...pathChanges, { type: "rescan", mtime: Math.max(...pathChanges.map(item => item.mtime)) }];
-    }
-    priorRenameEndpoints.add(change.oldPath);
-    priorRenameEndpoints.add(change.path);
-    priorRenameDestinations.add(change.path);
   }
 
   for (const change of pathChanges) {
