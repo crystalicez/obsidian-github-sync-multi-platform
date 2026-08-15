@@ -1,0 +1,41 @@
+name: Agent apply causality fix
+
+on:
+  push:
+    branches:
+      - agent/harden-v4-change-causality
+    paths:
+      - scripts/agent-apply-causality-fix.py
+      - .github/workflows/agent-apply-causality-fix.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+      - run: corepack enable
+      - name: Apply audited patch
+        run: python3 scripts/agent-apply-causality-fix.py
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Verify tests
+        run: pnpm test
+      - name: Verify build
+        run: pnpm build
+      - name: Verify diff
+        run: git diff --check
+      - name: Commit audited result
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "fix: harden V4 change causality"
+          git push origin HEAD:agent/harden-v4-change-causality
