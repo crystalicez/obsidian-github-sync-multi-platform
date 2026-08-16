@@ -32,7 +32,12 @@ export interface V4SyncCoordinatorOptions {
 
 export function coalesceV4Changes(changes: V4QueuedChange[]): V4QueuedChange[] {
   if (changes.some(change => change.type === "rescan")) {
-    return [{ type: "rescan", mtime: Math.max(...changes.map(change => change.mtime)) }];
+    const rescanMtime = Math.max(...changes.map(change => change.mtime));
+    const coalesced = coalesceV4Changes(changes.filter(change => change.type !== "rescan"));
+    const causalChanges = coalesced.filter(change => change.type !== "rescan");
+    return causalChanges.some(change => change.type !== "modify")
+      ? [...causalChanges, { type: "rescan", mtime: rescanMtime }]
+      : [{ type: "rescan", mtime: rescanMtime }];
   }
   const byPath = new Map<string | symbol, V4QueuedChange>();
   const pathChanges = changes
