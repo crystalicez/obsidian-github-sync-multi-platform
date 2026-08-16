@@ -492,6 +492,15 @@ export class V4SyncSession {
       if (copy && binding.change.after?.hash === copy.stage.hash) binding.source = this.stageHandle(copy.stage)
     }
     const prefetchedRemoteBodies = new Map<string, Uint8Array>()
+    const rememberPrefetchedRemoteBody = (fileId: string, bytes: Uint8Array): void => {
+      prefetchedRemoteBodies.delete(fileId)
+      prefetchedRemoteBodies.set(fileId, bytes)
+      while (prefetchedRemoteBodies.size > 3) {
+        const oldestFileId = prefetchedRemoteBodies.keys().next().value
+        if (oldestFileId === undefined) break
+        prefetchedRemoteBodies.delete(oldestFileId)
+      }
+    }
     const stagedCopyPulls: Array<{ pull: V4PullBinding; push?: V4PushBinding; reserved: { path: string; fileId: string; includeInSync: boolean } }> = []
     const conflictCopyClaims = new Map<string, string>([...this.input.runState?.conflictCopies.entries() ?? []]
       .map(([conflictFileId, copy]) => [copy.path.normalize("NFC").toLowerCase(), conflictFileId] as const))
@@ -576,7 +585,7 @@ export class V4SyncSession {
         const localBytes = await this.readLocal(meta.conflict.local.path)
         assertConflictGeneration()
         const remoteBytes = await this.readRecord(meta.remoteRecord, remoteCommitSha)
-        prefetchedRemoteBodies.set(meta.remoteRecord.fileId, remoteBytes)
+        rememberPrefetchedRemoteBody(meta.remoteRecord.fileId, remoteBytes)
         assertConflictGeneration()
         const baseBytes = meta.remoteRecord.remoteVersion === meta.baseRecord.remoteVersion
           ? new Uint8Array(remoteBytes)
