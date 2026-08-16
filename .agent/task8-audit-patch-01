@@ -1,0 +1,114 @@
+   throw error
++    }
+     if (this.input.recoveryStore && recoverySnapshot) {
+       const publication = await reconcileV4CandidatePublication(this.input.github, {
+         candidateCommitSha: candidate.commitSha,
+@@ -1787,6 +1833,57 @@ export class V4SyncSession {
+     throw new V4BoundedIoUnavailableError("bounded-read", handle.kind === "vault" ? handle.path : undefined)
+   }
+ 
++  private async assertConflictCopyTargetGuards(
++    guards: readonly V4ConflictCopyTargetGuard[],
++    expectAbsent: boolean,
++  ): Promise<void> {
++    if (guards.length === 0) return
++    const localFiles = await this.localIo.listFiles()
++    const byFoldedPath = new Map<string, typeof localFiles>()
++    for (const file of localFiles) {
++      const key = file.path.normalize("NFC").toLowerCase()
++      const entries = byFoldedPath.get(key) ?? []
++      entries.push(file)
++      byFoldedPath.set(key, entries)
++    }
++    for (const guard of guards) {
++      throwIfV4Aborted(this.input.signal)
++      const matches = byFoldedPath.get(guard.path.normalize("NFC").toLowerCase()) ?? []
++      if (expectAbsent) {
++        if (matches.length > 0) {
++          throw new V4ConflictReplanRequiredError(`V4 conflict copy target changed while resolving ${guard.path}.`)
++        }
++        continue
++      }
++      if (matches.length !== 1 || matches[0].path !== guard.path || matches[0].size !== guard.expectedSize) {
++        throw new V4ConflictReplanRequiredError(`V4 conflict copy target changed while resolving ${guard.path}.`)
++      }
++      try {
++        const hash = await this.hashLocal(guard.path, matches[0].size, matches[0].mtime)
++        if (hash !== guard.expectedHash) {
++          throw new V4ConflictReplanRequiredError(`V4 conflict copy content changed while resolving ${guard.path}.`)
++        }
++      } catch (error) {
++        if (error instanceof V4ConflictReplanRequiredError) throw error
++        if (error instanceof V4SourceChangedError) {
++          throw new V4ConflictReplanRequiredError(`V4 conflict copy target changed while resolving ${guard.path}.`)
++        }
++        throw error
++      }
++    }
++  }
++
++  private discardUnpublishedSyncedConflictCopies(remoteRecords: readonly V4IndexFileRecord[]): void {
++    const runState = this.input.runState
++    if (!runState) return
++    const remoteFileIds = new Set(remoteRecords.map(record => record.fileId))
++    for (const [conflictFileId, copy] of [...runState.conflictCopies]) {
++      if (!copy.includeInSync || remoteFileIds.has(copy.fileId)) continue
++      runState.conflictCopies.delete(conflictFileId)
++      runState.conflictCopyStages?.delete(copy.fileId)
++    }
++  }
++
+   private async assertConflictLocalGuards(guards: readonly V4ConflictLocalGuard[]): Promise<void> {
+     for (const guard of guards) {
+       throwIfV4Aborted(this.input.signal)
+diff --git a/tests/recovery/conflict-workspace-recovery.test.ts b/tests/recovery/conflict-workspace-recovery.test.ts
+index c6a00e3..e9ce44a 100644
+--- a/tests/recovery/conflict-workspace-recovery.test.ts
++++ b/tests/recovery/conflict-workspace-recovery.test.ts
+@@ -245,3 +245,172 @@ test("merged resolution changed locally before publication performs zero ref upd
+   assert.equal(pending.header.phase, "publish-intent");
+   assert.equal((pending.payload?.mutations.length ?? 0) > 0, true);
+ });
++
++test("stale uncommitted keep-both stage is not published after remote fingerprint changes and user changes decision", async () => {
++  const fixture = await divergedFixture();
++  const adapter = new MemoryAdapter();
++  const recoveryStore = createV4RecoveryStore({ adapter, root: "recovery-stale-copy", repoId: config.repoId });
++  const runState = { runId: "keep-both-replan", conflictCopies: new Map<string, { path: string; fileId: string; includeInSync: boolean }>(), conflictCopyStages: new Map() };
++
++  const r1 = fixture.github.ref!.sha;
++  const r1Tree = fixture.github.commits.get(r1)!.treeSha;
++  const externalBlob = await fixture.github.createGitBlob(enc("remote-v2\n"));
++  const externalTree = await fixture.github.createGitTree([{ path: "note.md", mode: "100644", type: "blob", sha: externalBlob }], r1Tree);
++  const externalCommit = await fixture.github.createGitCommit("external edit", externalTree, [r1]);
++
++  let switched = false;
++  fixture.github.onCreateCommit = () => {
++    if (switched) return;
++    switched = true;
++    fixture.github.ref = { ref: "refs/heads/main", sha: externalCommit, type: "commit" };
++    fixture.github.files = new Map(fixture.github.trees.get(externalTree));
++  };
++
++  await assert.rejects(new V4SyncSession({
++    github: fixture.github,
++    vault: fixture.localVault,
++    index: fixture.localIndex,
++    config,
++    conflictPolicy: "ask",
++    abortChangePercent: 0,
++    recoveryStore,
++    runState,
++    now: () => 100,
++    resolveConflictBatch: async request => keepBoth(request),
++  }).sync({ operation: "normal", allowThresholdOverride: false, changes: [{ type: "modify", path: "note.md", mtime: 3 }] }), /branch head changed|stale ref/iu);
++
++  assert.equal(runState.conflictCopyStages.size, 0, "deterministic stale publish must discard the uncommitted synced conflict-copy stage");
++  assert.equal(runState.conflictCopies.size, 0, "deterministic stale publish must discard the uncommitted synced conflict-copy reservation");
++  fixture.github.onCreateCommit = undefined;
++
++  await new V4SyncSession({
++    github: fixture.github,
++    vault: fixture.localVault,
++    index: fixture.localIndex,
++    con
