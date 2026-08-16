@@ -18,13 +18,51 @@ jobs:
         with:
           fetch-depth: 0
           ref: agent/task8-audit-transport
-      - name: Verify and apply exact audited patch
+      - name: Diagnose exact patch transport
+        shell: bash
+        run: |
+          set -euo pipefail
+          files=(.agent/task8-audit-patch-00 .agent/task8-audit-patch-01 .agent/task8-audit-patch-02 .agent/task8-audit-patch-03 .agent/task8-audit-patch-04)
+          expected_sizes=(5500 5500 5500 5500 1217)
+          expected_hashes=(
+            ca0688f19c39c42a9bfd1b769e85365fe0b33c324b3a3ff87e99a994fd5d568b
+            a857c63a376d69af9957e982dee00fd2713d8760cbc0b309e237d14f8d47cdaa
+            d9a066dff15ec5831b8819f233e2407ad36b06c6b31cecd72650967ae54019f5
+            a58ed85a0cb988c8d9e4efbf46db0bd0d8120e51a2bcbe9fc80fc1be4d1fa1d8
+            8294d8e99e610f2711930423aba601b7060365e882661c12d6d9cccdc618774f
+          )
+          ok=1
+          for i in "${!files[@]}"; do
+            actual_size=$(wc -c < "${files[$i]}" | tr -d ' ')
+            actual_hash=$(sha256sum "${files[$i]}" | cut -d' ' -f1)
+            echo "chunk $i size=$actual_size sha256=$actual_hash"
+            if [[ "$actual_size" != "${expected_sizes[$i]}" || "$actual_hash" != "${expected_hashes[$i]}" ]]; then
+              echo "::error title=Task8 patch chunk $i mismatch::expected size=${expected_sizes[$i]} sha256=${expected_hashes[$i]}; actual size=$actual_size sha256=$actual_hash"
+              ok=0
+            fi
+          done
+          cat "${files[@]}" > /tmp/task8-audit.patch
+          actual_full=$(sha256sum /tmp/task8-audit.patch | cut -d' ' -f1)
+          actual_full_size=$(wc -c < /tmp/task8-audit.patch | tr -d ' ')
+          echo "full size=$actual_full_size sha256=$actual_full"
+          if [[ "$actual_full" != "0577e3ae3f064704c21502cee23a1107e8fe38f62443ab4b83b74131107c92b0" ]]; then
+            echo "::error title=Task8 full patch checksum mismatch::expected 0577e3ae3f064704c21502cee23a1107e8fe38f62443ab4b83b74131107c92b0; actual $actual_full (size $actual_full_size)"
+            ok=0
+          fi
+          if [[ "$ok" != 1 ]]; then exit 1; fi
+      - name: Verify audited patch applies
         shell: bash
         run: |
           set -euo pipefail
           cat .agent/task8-audit-patch-00 .agent/task8-audit-patch-01 .agent/task8-audit-patch-02 .agent/task8-audit-patch-03 .agent/task8-audit-patch-04 > /tmp/task8-audit.patch
-          echo '0577e3ae3f064704c21502cee23a1107e8fe38f62443ab4b83b74131107c92b  /tmp/task8-audit.patch' | sha256sum -c -
-          git apply --check /tmp/task8-audit.patch
+          if ! git apply --check --verbose /tmp/task8-audit.patch; then
+            echo "::error title=Task8 git apply check failed::checksum matched but git apply --check rejected the audited patch"
+            exit 1
+          fi
+      - name: Apply audited patch and clean transport files
+        shell: bash
+        run: |
+          set -euo pipefail
           git apply /tmp/task8-audit.patch
           rm -rf .agent
           rm .github/workflows/agent-task8-audit-materialize.yml
