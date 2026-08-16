@@ -1,0 +1,35 @@
+name: Agent Materialize Task 8 Audit Fix
+
+on:
+  push:
+    branches:
+      - agent/task8-audit-transport
+    paths:
+      - .github/workflows/agent-task8-audit-materialize.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: agent/task8-audit-transport
+      - name: Verify and apply exact audited patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat .agent/task8-audit-patch-00 .agent/task8-audit-patch-01 .agent/task8-audit-patch-02 .agent/task8-audit-patch-03 .agent/task8-audit-patch-04 > /tmp/task8-audit.patch
+          echo '0577e3ae3f064704c21502cee23a1107e8fe38f62443ab4b83b74131107c92b  /tmp/task8-audit.patch' | sha256sum -c -
+          git apply --check /tmp/task8-audit.patch
+          git apply /tmp/task8-audit.patch
+          rm -rf .agent
+          rm .github/workflows/agent-task8-audit-materialize.yml
+          git config user.name 'OpenAI Agent'
+          git config user.email 'agent@openai.local'
+          git add -A
+          git commit -m 'temp: materialize audited conflict hardening'
+          git push origin HEAD:refs/heads/agent/task8-audit-transport
