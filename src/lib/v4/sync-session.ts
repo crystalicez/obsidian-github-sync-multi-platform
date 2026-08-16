@@ -832,6 +832,14 @@ export class V4SyncSession {
         if (!reservedCopy) throw new Error(`Failed to reserve V4 conflict copy path: ${conflict.fileId}`)
         const copyPath = reservedCopy.path
         const copyFileId = reservedCopy.fileId
+        if (this.input.recoveryStore) {
+          acceptedConflictLocalGuards.push({
+            fileId: copyFileId,
+            displayPath: copyPath,
+            local: { exists: false },
+            absentPaths: [copyPath],
+          })
+        }
         const carriedStage = syntheticConflictCopyIds.has(copyFileId)
           ? this.input.runState?.conflictCopyStages?.get(copyFileId)?.stage
           : undefined
