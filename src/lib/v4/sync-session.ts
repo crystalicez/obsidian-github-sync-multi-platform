@@ -558,7 +558,11 @@ export class V4SyncSession {
       if (!meta) return Promise.reject(new Error(`Unknown V4 conflict file: ${fileId}`))
       if (generation !== conflictGeneration) return Promise.reject(new Error("V4 conflict generation is stale."))
       const cached = materializedCache.get(fileId)
-      if (cached) return cached
+      if (cached) {
+        materializedCache.delete(fileId)
+        materializedCache.set(fileId, cached)
+        return cached
+      }
       const promise = (async (): Promise<V4ConflictMaterializedFile> => {
         assertConflictGeneration()
         if (!meta.summary.textCandidate || !meta.conflict.base || !meta.conflict.local || !meta.conflict.remote || !meta.baseRecord || !meta.remoteRecord) {
@@ -599,6 +603,16 @@ export class V4SyncSession {
         }
       })()
       materializedCache.set(fileId, promise)
+      while (materializedCache.size > 3) {
+        const oldestFileId = materializedCache.keys().next().value
+        if (oldestFileId === undefined) break
+        materializedCache.delete(oldestFileId)
+        prefetchedRemoteBodies.delete(oldestFileId)
+      }
+      void promise.catch(() => {
+        if (materializedCache.get(fileId) === promise) materializedCache.delete(fileId)
+        prefetchedRemoteBodies.delete(fileId)
+      })
       return promise
     }
 
