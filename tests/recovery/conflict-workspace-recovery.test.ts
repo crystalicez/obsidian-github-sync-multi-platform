@@ -245,3 +245,33 @@ test("merged resolution changed locally before publication performs zero ref upd
   assert.equal(pending.header.phase, "publish-intent");
   assert.equal((pending.payload?.mutations.length ?? 0) > 0, true);
 });
+
+test("keep-both copy path created after resolution but before publication performs zero ref updates", async () => {
+  const fixture = await divergedFixture();
+  const adapter = new MemoryAdapter();
+  const recoveryStore = createV4RecoveryStore({ adapter, root: "recovery", repoId: config.repoId });
+  const collisionPath = "note.conflict-remote-local-100.md";
+  let mutated = false;
+  fixture.github.onCreateCommit = () => {
+    if (mutated) return;
+    mutated = true;
+    fixture.localVault.files.set(collisionPath, { bytes: enc("USER LATE COLLISION\n"), mtime: 4 });
+  };
+
+  await assert.rejects(new V4SyncSession({
+    github: fixture.github,
+    vault: fixture.localVault,
+    index: fixture.localIndex,
+    config,
+    conflictPolicy: "ask",
+    abortChangePercent: 0,
+    now: () => 100,
+    recoveryStore,
+    runState: { runId: "copy-guard", conflictCopies: new Map(), conflictCopyStages: new Map() },
+    resolveConflictBatch: async request => keepBoth(request),
+  }).sync({ operation: "normal", allowThresholdOverride: false, changes: [{ type: "modify", path: "note.md", mtime: 3 }] }), /conflict.*replan|local.*changed|precondition/iu);
+
+  assert.equal(mutated, true);
+  assert.equal(fixture.github.refUpdates, 0, "late local copy-path collision must stop before branch publication");
+  assert.equal(dec(fixture.localVault.files.get(collisionPath)!.bytes), "USER LATE COLLISION\n");
+});
