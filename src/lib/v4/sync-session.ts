@@ -2,6 +2,18 @@ import { randomBytes, sha256Hex, toBase64Url, utf8ToBytes } from "../bytes"
 import type { GitHubTree } from "../github-api"
 import { evaluateV4ChangeGuard } from "./change-guard"
 import { canAttemptV4TextMerge, resolveV4Conflict, type V4ConflictPolicy, type V4ConflictResolution } from "./conflicts"
+import { createV4ConflictMergeModel } from "./conflict-merge-model"
+import {
+  buildV4ConflictContextKey,
+  fingerprintV4ConflictFile,
+  type V4ConflictBatchRequest,
+  type V4ConflictBatchResolution,
+  type V4ConflictFileResolution,
+  type V4ConflictFileSummary,
+  type V4ConflictMaterializedFile,
+  type V4ConflictSideSnapshot,
+} from "./conflict-types"
+import { V4DiffBudgetExceededError } from "./text-diff"
 import type { V4Keyring } from "./crypto"
 import { encryptV4Payload } from "./crypto"
 import {
@@ -20,7 +32,7 @@ import { isV4LocalIndexCacheComplete, type V4IndexFileRecord, type V4LocalIndex 
 import { assertV4LocalTargetPrecondition, createV4LocalIo, type V4LocalIo, type V4LocalTargetPrecondition, type V4SessionVault } from "./local-io"
 import { trashV4LocalUserFile } from "./local-delete-policy"
 import { bucketForV4PathId } from "./paths"
-import { planV4Sync, type V4LogicalFile, type V4PlannedChange, type V4SyncOperation } from "./planner"
+import { planV4Sync, type V4LogicalFile, type V4PlannedChange, type V4PlannedConflict, type V4SyncOperation } from "./planner"
 import { assertV4RemoteRecordSet, buildV4RemoteMetadata, v4RemoteShardPath } from "./remote-index"
 import { effectiveV4PathLayout, expectedV4PathLayout, V4_CONFIG_PATH, V4_ROOT, type V4RemoteConfig, type V4RemoteHead } from "./protocol-types"
 import { loadV4RemoteConfig, loadV4RemoteState, remoteV4StateFromLocalIndex, type V4RemoteState } from "./remote-loader"
@@ -71,6 +83,8 @@ export interface V4SyncSessionInput {
   abortChangePercent: number
   now?: () => number
   askConflict?: (input: { path: string; localMtime: number; remoteMtime: number }) => Promise<V4ConflictResolution>
+  resolveConflictBatch?: (request: V4ConflictBatchRequest, signal?: AbortSignal) => Promise<V4ConflictBatchResolution>
+  conflictContextKey?: string
   includePath?: (path: string) => boolean
   onProgress?: (patch: V4SyncProgressPatch) => void
   runState?: V4SyncRunState
@@ -83,6 +97,7 @@ export interface V4SyncRunState {
   runId?: string
   conflictCopies: Map<string, { path: string; fileId: string; includeInSync: boolean }>
   conflictCopyStages?: Map<string, { path: string; fileId: string; includeInSync: boolean; stage: V4StageRef }>
+  conflictGeneration?: number
 }
 
 export interface V4SessionSyncResult {
@@ -228,6 +243,61 @@ function causalIdentityState(records: V4IndexFileRecord[], changes: V4QueuedChan
       .filter(record => passedThroughRenameFileIds.has(record.fileId))
       .map(record => record.fileId)),
   }
+}
+
+
+interface V4SessionConflictMeta {
+  conflict: V4PlannedConflict
+  summary: V4ConflictFileSummary
+  targetPath?: string
+  structuralReason?: string
+  baseRecord?: V4IndexFileRecord
+  remoteRecord?: V4IndexFileRecord
+}
+
+function conflictSideSnapshot(file?: V4LogicalFile): V4ConflictSideSnapshot {
+  return file
+    ? { exists: true, path: file.path, hash: file.hash, size: file.size, mtime: file.mtime }
+    : { exists: false }
+}
+
+function conflictTargetPath(conflict: V4PlannedConflict): { path?: string; reason?: string } {
+  const { base, local, remote } = conflict
+  if (!base) return { reason: "No common BASE version is available for this conflict." }
+  if (!local || !remote) return { reason: "File presence differs between LOCAL and REMOTE." }
+  const localMoved = local.path !== base.path
+  const remoteMoved = remote.path !== base.path
+  if (localMoved && remoteMoved && local.path !== remote.path) {
+    return { reason: `LOCAL and REMOTE renamed the file to different paths (${local.path} vs ${remote.path}).` }
+  }
+  return { path: localMoved ? local.path : remoteMoved ? remote.path : base.path }
+}
+
+function isV4TextDowngradeError(error: unknown): boolean {
+  if (error instanceof V4DiffBudgetExceededError) return true
+  const message = (error as Error)?.message ?? ""
+  return /valid UTF-8|binary-looking|text diff work budget|merge limit|line limit|maximum is/iu.test(message)
+}
+
+function legacyConflictDecision(
+  conflict: V4PlannedConflict,
+  resolution: V4ConflictResolution,
+  fingerprint: string,
+  targetPath?: string,
+): V4ConflictFileResolution {
+  if (resolution.action === "use-local") return { fileId: conflict.fileId, fingerprint, kind: "use-local" }
+  if (resolution.action === "use-remote") return { fileId: conflict.fileId, fingerprint, kind: "use-remote" }
+  if (resolution.action === "merged" && resolution.mergedBytes) {
+    return {
+      fileId: conflict.fileId,
+      fingerprint,
+      kind: "merged",
+      path: targetPath ?? conflict.local?.path ?? conflict.remote?.path ?? conflict.path,
+      bytes: resolution.mergedBytes,
+    }
+  }
+  if (resolution.action === "keep-local-copy-remote") return { fileId: conflict.fileId, fingerprint, kind: "keep-both" }
+  throw new Error(`Conflict requires user decision: ${conflict.path}`)
 }
 
 
@@ -395,8 +465,10 @@ export class V4SyncSession {
     const recordsById = new Map((isLayoutMigration ? [] : allRemoteRecords).map(record => [record.fileId, record]))
     const baseRecordsById = new Map(baseRecords.map(record => [record.fileId, record]))
     const remoteCommitSha = remote?.commitSha
+    const runId = this.input.runState?.runId ?? toBase64Url(randomBytes(12))
+    if (this.input.runState && !this.input.runState.runId) this.input.runState.runId = runId
     const batch: V4ResolvedBatch = {
-      runId: this.input.runState?.runId ?? toBase64Url(randomBytes(12)),
+      runId,
       pulls: plan.pulls.map(change => this.bindPull(change, recordsById, remoteCommitSha)),
       pushes: plan.pushes.map(change => this.bindPush(change, recordsById)),
       stagedWrites: [],
@@ -407,126 +479,310 @@ export class V4SyncSession {
     }
     const prefetchedRemoteBodies = new Map<string, Uint8Array>()
     const stagedCopyPulls: Array<{ pull: V4PullBinding; push?: V4PushBinding; reserved: { path: string; fileId: string; includeInSync: boolean } }> = []
-    for (const [conflictIndex, conflict] of plan.conflicts.entries()) {
+    const conflictMetas = new Map<string, V4SessionConflictMeta>()
+    const conflictDecisions = new Map<string, V4ConflictFileResolution>()
+    const needsGeneration = plan.conflicts.length > 0 && (this.input.conflictPolicy === "ask" || this.input.conflictPolicy === "merge")
+    const conflictGeneration = needsGeneration
+      ? (this.input.runState?.conflictGeneration ?? 0) + 1
+      : (this.input.runState?.conflictGeneration ?? 0)
+    if (needsGeneration && this.input.runState) this.input.runState.conflictGeneration = conflictGeneration
+
+    for (const conflict of plan.conflicts) {
+      const remoteRecord = recordsById.get(conflict.fileId)
+      const baseRecord = baseRecordsById.get(conflict.fileId)
+      const structural = conflictTargetPath(conflict)
+      const baseReadable = !!baseRecord && !!remoteRecord
+        && (remoteRecord.remoteVersion === baseRecord.remoteVersion || !!baseCommitSha)
+      const textCandidate = !!structural.path
+        && !!conflict.base && !!conflict.local && !!conflict.remote
+        && baseReadable
+        && canAttemptV4TextMerge(structural.path, [conflict.base.size, conflict.local.size, conflict.remote.size])
+      const summary: V4ConflictFileSummary = {
+        fileId: conflict.fileId,
+        displayPath: structural.path ?? conflict.path,
+        fingerprint: await fingerprintV4ConflictFile({
+          fileId: conflict.fileId,
+          base: conflictSideSnapshot(conflict.base),
+          local: conflictSideSnapshot(conflict.local),
+           remote: conflictSideSnapshot(conflict.remote),
+        }),
+        base: conflictSideSnapshot(conflict.base),
+        local: conflictSideSnapshot(conflict.local),
+        remote: conflictSideSnapshot(conflict.remote),
+        textCandidate,
+        requiresReview: true,
+      }
+      conflictMetas.set(conflict.fileId, {
+        conflict,
+        summary,
+        targetPath: structural.path,
+        structuralReason: structural.reason ?? (!baseReadable ? "The BASE version cannot be materialized safely." : undefined),
+        baseRecord,
+        remoteRecord,
+      })
+    }
+
+    const materializedCache = new Map<string, Promise<V4ConflictMaterializedFile>>()
+    const assertConflictGeneration = () => {
+      if (this.input.runState && this.input.runState.conflictGeneration !== conflictGeneration) {
+        throw new Error("V4 conflict generation changed while content was in flight.")
+      }
+      throwIfV4Aborted(this.input.signal)
+    }
+    const materializeConflict = (fileId: string, generation: number): Promise<V4ConflictMaterializedFile> => {
+      const meta = conflictMetas.get(fileId)
+      if (!meta) return Promise.reject(new Error(`Unknown V4 conflict file: ${fileId}`))
+      if (generation !== conflictGeneration) return Promise.reject(new Error("V4 conflict generation is stale."))
+      const cached = materializedCache.get(fileId)
+      if (cached) return cached
+      const promise = (async (): Promise<V4ConflictMaterializedFile> => {
+        assertConflictGeneration()
+        if (!meta.summary.textCandidate || !meta.conflict.base || !meta.conflict.local || !meta.conflict.remote || !meta.baseRecord || !meta.remoteRecord) {
+          return {
+            generation,
+            summary: meta.summary,
+            mode: "file",
+            downgradeReason: meta.structuralReason ?? "This conflict requires file-level resolution.",
+          }
+        }
+        const localBytes = await this.readLocal(meta.conflict.local.path)
+        assertConflictGeneration()
+        const remoteBytes = await this.readRecord(meta.remoteRecord, remoteCommitSha)
+        prefetchedRemoteBodies.set(meta.remoteRecord.fileId, remoteBytes)
+        assertConflictGeneration()
+        const baseBytes = meta.remoteRecord.remoteVersion === meta.baseRecord.remoteVersion
+          ? new Uint8Array(remoteBytes)
+          : await this.readRecord(meta.baseRecord, baseCommitSha)
+        assertConflictGeneration()
+        try {
+          createV4ConflictMergeModel({ baseBytes, localBytes, remoteBytes })
+        } catch (error) {
+          if (!isV4TextDowngradeError(error)) throw error
+          return {
+            generation,
+            summary: meta.summary,
+            mode: "file",
+            downgradeReason: (error as Error).message,
+          }
+        }
+        return {
+          generation,
+          summary: meta.summary,
+          mode: "text",
+          baseBytes: new Uint8Array(baseBytes),
+          localBytes: new Uint8Array(localBytes),
+          remoteBytes: new Uint8Array(remoteBytes),
+        }
+      })()
+      materializedCache.set(fileId, promise)
+      return promise
+    }
+
+    const pendingBatchMetas: V4SessionConflictMeta[] = []
+    const decideWithLegacyPrompt = async (meta: V4SessionConflictMeta, initial: V4ConflictResolution): Promise<V4ConflictFileResolution> => {
+      let resolution = initial
+      if (resolution.action === "ask") {
+        if (!this.input.askConflict) {
+          if (this.input.conflictPolicy === "merge") resolution = { action: "keep-local-copy-remote" }
+          else throw new Error(`Conflict requires user decision: ${meta.conflict.path}`)
+        } else {
+          resolution = await this.input.askConflict({
+            path: meta.conflict.path,
+            localMtime: meta.conflict.local?.mtime ?? 0,
+            remoteMtime: meta.conflict.remote?.mtime ?? 0,
+          })
+          if (resolution.action === "ask") throw new Error(`Conflict cancelled: ${meta.conflict.path}`)
+        }
+      }
+      return legacyConflictDecision(meta.conflict, resolution, meta.summary.fingerprint, meta.targetPath)
+    }
+
+    for (const conflict of plan.conflicts) {
+      const meta = conflictMetas.get(conflict.fileId)!
       this.report({
         phase: "resolving-conflicts",
         currentPath: conflict.path,
         currentDirection: undefined,
         ...counters(false),
       })
-      const remoteRecord = recordsById.get(conflict.fileId)
-      const baseRecord = baseRecordsById.get(conflict.fileId)
-      let remoteBytes: Uint8Array | undefined
-      let resolution: V4ConflictResolution
-      const canMergeFromMetadata = this.input.conflictPolicy === "merge"
-        && !!conflict.local && !!conflict.remote && !!baseRecord && !!remoteRecord
-        && (remoteRecord.remoteVersion === baseRecord.remoteVersion || !!baseCommitSha)
-        && canAttemptV4TextMerge(conflict.path, [baseRecord.size, conflict.local.size, conflict.remote.size])
-      if (canMergeFromMetadata) {
-        const localBytes = await this.readLocal(conflict.local!.path)
-        remoteBytes = await this.readRecord(remoteRecord!, remoteCommitSha)
-        const baseBytes = remoteRecord!.remoteVersion === baseRecord!.remoteVersion
-          ? remoteBytes
-          : await this.readRecord(baseRecord!, baseCommitSha)
-        resolution = resolveV4Conflict({
-          policy: this.input.conflictPolicy,
-          path: conflict.path,
-          localMtime: conflict.local?.mtime ?? 0,
-          remoteMtime: conflict.remote?.mtime ?? 0,
-          baseBytes,
-          localBytes,
-          remoteBytes,
-        })
-      } else {
-        resolution = resolveV4Conflict({
-          policy: this.input.conflictPolicy,
-          path: conflict.path,
-          localMtime: conflict.local?.mtime ?? 0,
-          remoteMtime: conflict.remote?.mtime ?? 0,
-        })
-      }
-      if (resolution.action === "ask") {
-        if (!this.input.askConflict) throw new Error(`Conflict requires user decision: ${conflict.path}`)
-        resolution = await this.input.askConflict({ path: conflict.path, localMtime: conflict.local?.mtime ?? 0, remoteMtime: conflict.remote?.mtime ?? 0 })
-        if (resolution.action === "ask") throw new Error(`Conflict cancelled: ${conflict.path}`)
-      }
-      if (remoteBytes && remoteRecord) prefetchedRemoteBodies.set(remoteRecord.fileId, remoteBytes)
 
-      if (resolution.action === "use-remote") {
+      if (this.input.conflictPolicy === "copy" || this.input.conflictPolicy === "newer") {
+        conflictDecisions.set(conflict.fileId, legacyConflictDecision(conflict, resolveV4Conflict({
+          policy: this.input.conflictPolicy,
+          path: conflict.path,
+          localMtime: conflict.local?.mtime ?? 0,
+          remoteMtime: conflict.remote?.mtime ?? 0,
+        }), meta.summary.fingerprint, meta.targetPath))
+        continue
+      }
+
+      if (this.input.conflictPolicy === "merge" && meta.summary.textCandidate) {
+        const materialized = await materializeConflict(conflict.fileId, conflictGeneration)
+        if (materialized.mode === "text" && materialized.baseBytes && materialized.localBytes && materialized.remoteBytes && meta.targetPath) {
+          const model = createV4ConflictMergeModel({
+            baseBytes: materialized.baseBytes,
+            localBytes: materialized.localBytes,
+            remoteBytes: materialized.remoteBytes,
+          })
+          if (model.unresolvedCount === 0) {
+            conflictDecisions.set(conflict.fileId, {
+              fileId: conflict.fileId,
+              fingerprint: meta.summary.fingerprint,
+              kind: "merged",
+              path: meta.targetPath,
+              bytes: model.toBytes(),
+            })
+            continue
+          }
+        }
+      }
+
+      if (this.input.resolveConflictBatch) {
+        pendingBatchMetas.push(meta)
+        continue
+      }
+
+      conflictDecisions.set(conflict.fileId, await decideWithLegacyPrompt(meta, resolveV4Conflict({
+        policy: this.input.conflictPolicy,
+        path: meta.targetPath ?? conflict.path,
+        localMtime: conflict.local?.mtime ?? 0,
+        remoteMtime: conflict.remote?.mtime ?? 0,
+      })))
+    }
+
+    if (pendingBatchMetas.length > 0) {
+      const contextKey = this.input.conflictContextKey ?? await buildV4ConflictContextKey({
+        repoId: this.input.config.repoId,
+        mode: this.input.config.mode,
+        pathLayout: this.input.config.pathLayout ?? expectedV4PathLayout(this.input.config.mode),
+        settingsGeneration: 0,
+        scopeSignature: "session-default",
+      })
+      const request: V4ConflictBatchRequest = {
+        runId,
+        generation: conflictGeneration,
+        contextKey,
+        expectedRemoteHead: remoteCommitSha ?? null,
+        files: pendingBatchMetas.map(meta => meta.summary),
+        materialize: materializeConflict,
+      }
+      const resolved = await this.input.resolveConflictBatch!(request, this.input.signal)
+      if (resolved.runId !== runId || resolved.generation !== conflictGeneration) {
+        throw new Error("V4 conflict batch resolution identity mismatch.")
+      }
+      if (resolved.files.length !== pendingBatchMetas.length) throw new Error("V4 conflict batch resolution is incomplete.")
+      const expected = new Map(pendingBatchMetas.map(meta => [meta.conflict.fileId, meta]))
+      const seen = new Set<string>()
+      for (const resolution of resolved.files) {
+        if (seen.has(resolution.fileId)) throw new Error(`Duplicate V4 conflict resolution: ${resolution.fileId}`)
+        seen.add(resolution.fileId)
+        const meta = expected.get(resolution.fileId)
+        if (!meta) throw new Error(`Unexpected V4 conflict resolution: ${resolution.fileId}`)
+        if (resolution.fingerprint !== meta.summary.fingerprint) throw new Error(`V4 conflict fingerprint mismatch: ${resolution.fileId}`)
+        if (resolution.kind === "merged") {
+          if (!meta.summary.textCandidate || !meta.targetPath || resolution.path !== meta.targetPath) {
+            throw new Error(`Invalid merged V4 conflict target: ${resolution.fileId}`)
+          }
+        }
+        if (resolution.kind === "keep-both" && (!meta.conflict.local || !meta.conflict.remote)) {
+          throw new Error(`Keep both requires materialized LOCAL and REMOTE files: ${resolution.fileId}`)
+        }
+        conflictDecisions.set(resolution.fileId, resolution.kind === "merged"
+          ? { ...resolution, bytes: new Uint8Array(resolution.bytes) }
+          : { ...resolution })
+      }
+    }
+
+    for (const conflict of plan.conflicts) {
+      const decision = conflictDecisions.get(conflict.fileId)
+      if (!decision) throw new Error(`Missing V4 conflict decision: ${conflict.path}`)
+      const meta = conflictMetas.get(conflict.fileId)!
+
+      if (decision.kind === "use-remote") {
         const pull = this.changeBetween(conflict.local, conflict.remote)
         if (pull) {
           pullTotal++
           batch.pulls.push(this.bindPull(pull, recordsById, remoteCommitSha))
         }
-      } else if (resolution.action === "merged" && conflict.local && resolution.mergedBytes) {
+        continue
+      }
+
+      if (decision.kind === "merged") {
+        const template = conflict.local ?? conflict.remote ?? conflict.base
+        if (!template) throw new Error(`Merged V4 conflict has no logical file: ${conflict.fileId}`)
         const mergeMtime = this.now()
-        const stage = await this.stageBytes(resolution.mergedBytes, mergeMtime, conflict.local.size, ownedStages)
+        const existingTargetBytes = conflict.local?.path === decision.path ? conflict.local.size : 0
+        const stage = await this.stageBytes(decision.bytes, mergeMtime, existingTargetBytes, ownedStages)
         const mergedAfter: V4LogicalFile = {
-          ...conflict.local,
+          ...template,
+          fileId: conflict.fileId,
+          path: decision.path,
           hash: stage.hash,
           size: stage.size,
           mtime: stage.mtime,
         }
-        const mergedChange = this.changeBetween(conflict.remote, mergedAfter)
-        if (mergedChange) {
+        const pushChange = this.changeBetween(conflict.remote, mergedAfter)
+        if (pushChange) {
           pushTotal++
-          const binding: V4PushBinding = { change: mergedChange, source: this.stageHandle(stage) }
-          batch.pushes.push(binding)
-          batch.stagedWrites.push({ change: mergedChange, stage })
+          batch.pushes.push({ change: pushChange, source: this.stageHandle(stage) })
         }
-      } else {
-        if (resolution.action === "keep-local-copy-remote" && conflict.remote && remoteRecord) {
-          let reservedCopy = this.input.runState?.conflictCopies.get(conflict.fileId)
-          if (!reservedCopy) {
-            const path = this.conflictCopyPath(conflict.remote.path)
-            reservedCopy = { path, fileId: await this.newFileId(path), includeInSync: includePath(path) }
-            this.input.runState?.conflictCopies.set(conflict.fileId, reservedCopy)
-          }
-          const copyPath = reservedCopy.path
-          const copyFileId = reservedCopy.fileId
-          const carriedStage = syntheticConflictCopyIds.has(copyFileId)
-            ? this.input.runState?.conflictCopyStages?.get(copyFileId)?.stage
-            : undefined
-          const existingCopy = carriedStage ? undefined : localById.get(copyFileId)
-          const copyChange: V4PlannedChange = {
-            fileId: copyFileId,
-            kind: existingCopy ? "modify" : "create",
+        const localWrite = this.changeBetween(conflict.local, mergedAfter)
+        if (localWrite) batch.stagedWrites.push({ change: localWrite, stage })
+        continue
+      }
+
+      if (decision.kind === "keep-both" && conflict.remote && meta.remoteRecord) {
+        let reservedCopy = this.input.runState?.conflictCopies.get(conflict.fileId)
+        if (!reservedCopy) {
+          const path = this.conflictCopyPath(conflict.remote.path)
+          reservedCopy = { path, fileId: await this.newFileId(path), includeInSync: includePath(path) }
+          this.input.runState?.conflictCopies.set(conflict.fileId, reservedCopy)
+        }
+        const copyPath = reservedCopy.path
+        const copyFileId = reservedCopy.fileId
+        const carriedStage = syntheticConflictCopyIds.has(copyFileId)
+          ? this.input.runState?.conflictCopyStages?.get(copyFileId)?.stage
+          : undefined
+        const existingCopy = carriedStage ? undefined : localById.get(copyFileId)
+        const copyChange: V4PlannedChange = {
+          fileId: copyFileId,
+          kind: existingCopy ? "modify" : "create",
+          path: copyPath,
+          before: existingCopy,
+          after: {
             path: copyPath,
-            before: existingCopy,
-            after: {
-              path: copyPath,
-              fileId: copyFileId,
-              hash: conflict.remote.hash,
-              size: conflict.remote.size,
-              mtime: conflict.remote.mtime,
-            },
-          }
-          pullTotal++
-          const pullBinding: V4PullBinding = { change: copyChange, remoteRecord, remoteCommitSha, stage: carriedStage }
-          batch.pulls.push(pullBinding)
-          let pushBinding: V4PushBinding | undefined
-          if (reservedCopy.includeInSync && !batch.pushes.some(binding => binding.change.fileId === copyFileId)) {
-            pushTotal++
-            pushBinding = { change: copyChange }
-            batch.pushes.push(pushBinding)
-          }
-          if (!carriedStage) stagedCopyPulls.push({ pull: pullBinding, push: pushBinding, reserved: reservedCopy })
+            fileId: copyFileId,
+            hash: conflict.remote.hash,
+            size: conflict.remote.size,
+            mtime: conflict.remote.mtime,
+          },
         }
-        const localPush = this.changeBetween(conflict.remote, conflict.local)
-        if (localPush) {
+        pullTotal++
+        const pullBinding: V4PullBinding = { change: copyChange, remoteRecord: meta.remoteRecord, remoteCommitSha, stage: carriedStage }
+        batch.pulls.push(pullBinding)
+        let pushBinding: V4PushBinding | undefined
+        if (reservedCopy.includeInSync && !batch.pushes.some(binding => binding.change.fileId === copyFileId)) {
           pushTotal++
-          batch.pushes.push(this.bindPush(localPush, recordsById))
+          pushBinding = { change: copyChange }
+          batch.pushes.push(pushBinding)
         }
+        if (!carriedStage) stagedCopyPulls.push({ pull: pullBinding, push: pushBinding, reserved: reservedCopy })
       }
-      const isFinalConflict = conflictIndex === plan.conflicts.length - 1
-      if (isFinalConflict) {
-        this.report({
-          phase: "resolving-conflicts",
-          currentPath: conflict.path,
-          currentDirection: undefined,
-          ...counters(true),
-        })
+
+      const localPush = this.changeBetween(conflict.remote, conflict.local)
+      if (localPush) {
+        pushTotal++
+        batch.pushes.push(this.bindPush(localPush, recordsById))
       }
+    }
+
+    if (plan.conflicts.length > 0) {
+      this.report({
+        phase: "resolving-conflicts",
+        currentPath: plan.conflicts.at(-1)?.path,
+        currentDirection: undefined,
+        ...counters(true),
+      })
     }
 
     for (const stagedCopy of stagedCopyPulls) {

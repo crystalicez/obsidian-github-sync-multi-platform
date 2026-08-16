@@ -11,7 +11,7 @@ test("v4 copy and newer policies are deterministic", () => {
   assert.equal(resolveV4Conflict({ policy: "newer", path: "a.bin", localMtime: 3, remoteMtime: 3 }).action, "keep-local-copy-remote");
 });
 
-test("v4 merge combines non-overlapping text edits and falls back for overlap", () => {
+test("v4 merge combines non-overlapping text edits and asks for unresolved overlap", () => {
   const clean = resolveV4Conflict({
     policy: "merge",
     path: "note.md",
@@ -33,5 +33,5 @@ test("v4 merge combines non-overlapping text edits and falls back for overlap", 
     localBytes: enc("LOCAL\ntwo"),
     remoteBytes: enc("REMOTE\ntwo"),
   });
-  assert.equal(overlap.action, "keep-local-copy-remote");
+  assert.equal(overlap.action, "ask");
 });

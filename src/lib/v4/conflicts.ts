@@ -84,6 +84,7 @@ export function resolveV4Conflict(input: {
         if (merged !== null) return { action: "merged", mergedBytes: new TextEncoder().encode(merged) };
       }
     }
+    return { action: "ask" };
   }
   return { action: "keep-local-copy-remote" };
 }
