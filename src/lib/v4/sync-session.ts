@@ -124,6 +124,13 @@ export class V4RecoveryReplanRequiredError extends Error {
   }
 }
 
+export class V4ConflictReplanRequiredError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = "V4ConflictReplanRequiredError"
+  }
+}
+
 function recordsFromIndex(index: V4LocalIndex): V4IndexFileRecord[] {
   return Object.values(index.shards).flatMap(shard => Object.values(shard.records)).filter(record => !record.deleted)
 }
@@ -253,6 +260,13 @@ interface V4SessionConflictMeta {
   structuralReason?: string
   baseRecord?: V4IndexFileRecord
   remoteRecord?: V4IndexFileRecord
+}
+
+interface V4ConflictLocalGuard {
+  fileId: string
+  displayPath: string
+  local: V4ConflictSideSnapshot
+  absentPaths: string[]
 }
 
 function conflictSideSnapshot(file?: V4LogicalFile): V4ConflictSideSnapshot {
@@ -650,6 +664,7 @@ export class V4SyncSession {
       })))
     }
 
+    let acceptedConflictLocalGuards: V4ConflictLocalGuard[] = []
     if (pendingBatchMetas.length > 0) {
       const contextKey = this.input.conflictContextKey ?? await buildV4ConflictContextKey({
         repoId: this.input.config.repoId,
@@ -691,6 +706,23 @@ export class V4SyncSession {
           ? { ...resolution, bytes: new Uint8Array(resolution.bytes) }
           : { ...resolution })
       }
+
+      const currentRef = await this.input.github.getGitRefOrNull()
+      if ((currentRef?.sha ?? null) !== (remoteCommitSha ?? null)) {
+        throw new V4ConflictReplanRequiredError("V4 conflict remote HEAD changed while awaiting resolution.")
+      }
+      acceptedConflictLocalGuards = pendingBatchMetas.map(meta => ({
+        fileId: meta.conflict.fileId,
+        displayPath: meta.summary.displayPath,
+        local: meta.summary.local,
+        absentPaths: [...new Set([
+          meta.conflict.path,
+          meta.conflict.base?.path,
+          meta.conflict.remote?.path,
+          meta.targetPath,
+        ].filter((path): path is string => !!path))],
+      }))
+      await this.assertConflictLocalGuards(acceptedConflictLocalGuards)
     }
 
     for (const conflict of plan.conflicts) {
@@ -1169,6 +1201,7 @@ export class V4SyncSession {
       })
       : undefined
     preserveStagesForRecovery = !!recoverySnapshot && (recoveryPlan?.payload.mutations.length ?? 0) > 0
+    if (acceptedConflictLocalGuards.length > 0) await this.assertConflictLocalGuards(acceptedConflictLocalGuards)
     await deferV4Cancellation(this.input.signal, () => publishV4CandidateRef(this.input.github, candidate, this.input.signal))
     if (this.input.recoveryStore && recoverySnapshot) {
       const publication = await reconcileV4CandidatePublication(this.input.github, {
@@ -1715,6 +1748,47 @@ export class V4SyncSession {
       return this.localIo.staging.open({ stageId: handle.stageId, size: handle.expectedSize })
     }
     throw new V4BoundedIoUnavailableError("bounded-read", handle.kind === "vault" ? handle.path : undefined)
+  }
+
+  private async assertConflictLocalGuards(guards: readonly V4ConflictLocalGuard[]): Promise<void> {
+    for (const guard of guards) {
+      throwIfV4Aborted(this.input.signal)
+      if (!guard.local.exists) {
+        if (this.localIo.stat) {
+          for (const path of guard.absentPaths) {
+            if (await this.localIo.stat(path)) {
+              throw new V4ConflictReplanRequiredError(`V4 conflict local state changed while resolving ${guard.displayPath}.`)
+            }
+          }
+        } else {
+          const present = new Set((await this.localIo.listFiles()).map(file => file.path))
+          if (guard.absentPaths.some(path => present.has(path))) {
+            throw new V4ConflictReplanRequiredError(`V4 conflict local state changed while resolving ${guard.displayPath}.`)
+          }
+        }
+        continue
+      }
+
+      const path = guard.local.path
+      const stat = this.localIo.stat
+        ? await this.localIo.stat(path)
+        : (await this.localIo.listFiles()).find(file => file.path === path) ?? null
+      if (!stat || stat.size !== guard.local.size) {
+        throw new V4ConflictReplanRequiredError(`V4 conflict local state changed while resolving ${guard.displayPath}.`)
+      }
+      try {
+        const hash = await this.hashLocal(path, stat.size, stat.mtime)
+        if (hash !== guard.local.hash) {
+          throw new V4ConflictReplanRequiredError(`V4 conflict local content changed while resolving ${guard.displayPath}.`)
+        }
+      } catch (error) {
+        if (error instanceof V4ConflictReplanRequiredError) throw error
+        if (error instanceof V4SourceChangedError) {
+          throw new V4ConflictReplanRequiredError(`V4 conflict local state changed while resolving ${guard.displayPath}.`)
+        }
+        throw error
+      }
+    }
   }
 
   private async hashLocal(path: string, expectedBytes: number, expectedMtime: number): Promise<string> {

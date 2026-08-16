@@ -13,7 +13,7 @@ import {
 } from "./local-index"
 import { decodeV4RemoteConfig } from "./remote-index"
 import { createV4ScopePredicate, isPathInV4SyncScope } from "./scope"
-import { assertV4PathLayoutCompatible, V4ChangeGuardError, V4RecoveryReplanRequiredError, V4SyncSession, type V4SyncRunState } from "./sync-session"
+import { assertV4PathLayoutCompatible, V4ChangeGuardError, V4ConflictReplanRequiredError, V4RecoveryReplanRequiredError, V4SyncSession, type V4SyncRunState } from "./sync-session"
 import type { V4ConflictResolution } from "./conflicts"
 import { V4SyncCoordinator, type V4QueuedChange, type V4SyncRequest } from "./sync-coordinator"
 import { expectedV4PathLayout, V4_FORMAT_VERSION, V4_CONFIG_PATH, type V4RemoteConfig, type V4StorageMode } from "./protocol-types"
@@ -528,7 +528,8 @@ export class V4PluginRuntime {
             continue
           }
           const recoveryReplan = error instanceof V4RecoveryReplanRequiredError && request.operation === "normal"
-          if (casAttempt === 3 || (!recoveryReplan && !/branch head changed|stale ref/i.test((error as Error).message))) throw error
+          const conflictReplan = error instanceof V4ConflictReplanRequiredError && request.operation === "normal"
+          if (casAttempt === 3 || (!recoveryReplan && !conflictReplan && !/branch head changed|stale ref/i.test((error as Error).message))) throw error
           this.progressStore.update({
             phase: "retrying",
             attempt: progressAttempt + 1,
