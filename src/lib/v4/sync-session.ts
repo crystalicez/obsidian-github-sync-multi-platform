@@ -493,6 +493,16 @@ export class V4SyncSession {
     }
     const prefetchedRemoteBodies = new Map<string, Uint8Array>()
     const stagedCopyPulls: Array<{ pull: V4PullBinding; push?: V4PushBinding; reserved: { path: string; fileId: string; includeInSync: boolean } }> = []
+    const conflictCopyClaims = new Map<string, string>([...this.input.runState?.conflictCopies.entries() ?? []]
+      .map(([conflictFileId, copy]) => [copy.path.normalize("NFC").toLowerCase(), conflictFileId] as const))
+    let conflictCopyOccupiedPaths: Set<string> | undefined
+    const occupiedConflictCopyPaths = async (): Promise<Set<string>> => {
+      if (conflictCopyOccupiedPaths) return conflictCopyOccupiedPaths
+      conflictCopyOccupiedPaths = new Set<string>()
+      for (const file of await this.localIo.listFiles()) conflictCopyOccupiedPaths.add(file.path.normalize("NFC").toLowerCase())
+      for (const record of remoteRecords) conflictCopyOccupiedPaths.add(record.path.normalize("NFC").toLowerCase())
+      return conflictCopyOccupiedPaths
+    }
     const conflictMetas = new Map<string, V4SessionConflictMeta>()
     const conflictDecisions = new Map<string, V4ConflictFileResolution>()
     const needsGeneration = plan.conflicts.length > 0 && (this.input.conflictPolicy === "ask" || this.input.conflictPolicy === "merge")
@@ -765,11 +775,38 @@ export class V4SyncSession {
 
       if (decision.kind === "keep-both" && conflict.remote && meta.remoteRecord) {
         let reservedCopy = this.input.runState?.conflictCopies.get(conflict.fileId)
-        if (!reservedCopy) {
-          const path = this.conflictCopyPath(conflict.remote.path)
+        const occupiedPaths = await occupiedConflictCopyPaths()
+        const reservedKey = reservedCopy?.path.normalize("NFC").toLowerCase()
+        const reservedPathSafe = !!reservedCopy
+          && !occupiedPaths.has(reservedKey!)
+          && (conflictCopyClaims.get(reservedKey!) === undefined || conflictCopyClaims.get(reservedKey!) === conflict.fileId)
+        if (!reservedPathSafe) {
+          const previousCopy = reservedCopy
+          const previousStage = previousCopy ? this.input.runState?.conflictCopyStages?.get(previousCopy.fileId) : undefined
+          if (previousCopy) {
+            const previousKey = previousCopy.path.normalize("NFC").toLowerCase()
+            if (conflictCopyClaims.get(previousKey) === conflict.fileId) conflictCopyClaims.delete(previousKey)
+          }
+          let attempt = 1
+          let path = this.conflictCopyPath(conflict.remote.path, attempt)
+          let key = path.normalize("NFC").toLowerCase()
+          while (occupiedPaths.has(key) || conflictCopyClaims.has(key)) {
+            attempt++
+            path = this.conflictCopyPath(conflict.remote.path, attempt)
+            key = path.normalize("NFC").toLowerCase()
+          }
           reservedCopy = { path, fileId: await this.newFileId(path), includeInSync: includePath(path) }
+          conflictCopyClaims.set(key, conflict.fileId)
           this.input.runState?.conflictCopies.set(conflict.fileId, reservedCopy)
+          if (previousCopy && previousStage && this.input.runState?.conflictCopyStages) {
+            this.input.runState.conflictCopyStages.delete(previousCopy.fileId)
+            this.input.runState.conflictCopyStages.set(reservedCopy.fileId, { ...reservedCopy, stage: previousStage.stage })
+            syntheticConflictCopyIds.add(reservedCopy.fileId)
+          }
+        } else {
+          conflictCopyClaims.set(reservedKey!, conflict.fileId)
         }
+        if (!reservedCopy) throw new Error(`Failed to reserve V4 conflict copy path: ${conflict.fileId}`)
         const copyPath = reservedCopy.path
         const copyFileId = reservedCopy.fileId
         const carriedStage = syntheticConflictCopyIds.has(copyFileId)
@@ -1835,9 +1872,10 @@ export class V4SyncSession {
     return { fileId: after.fileId, kind: "modify", path: after.path, before, after }
   }
 
-  private conflictCopyPath(path: string): string {
+  private conflictCopyPath(path: string, attempt = 1): string {
     const dot = path.lastIndexOf(".")
-    const suffix = `.conflict-remote-${this.input.index.deviceId}-${this.now()}`
+    const retrySuffix = attempt > 1 ? `-${attempt}` : ""
+    const suffix = `.conflict-remote-${this.input.index.deviceId}-${this.now()}${retrySuffix}`
     return dot > path.lastIndexOf("/") ? `${path.slice(0, dot)}${suffix}${path.slice(dot)}` : `${path}${suffix}`
   }
 
