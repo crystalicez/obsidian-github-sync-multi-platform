@@ -1,0 +1,109 @@
+fig,
++    conflictPolicy: "ask",
++    abortChangePercent: 0,
++    recoveryStore,
++    runState,
++    now: () => 200,
++    resolveConflictBatch: async request => ({
++      runId: request.runId,
++      generation: request.generation,
++      files: request.files.map(file => ({ fileId: file.fileId, fingerprint: file.fingerprint, kind: "use-local" as const })),
++    }),
++  }).sync({ operation: "normal", allowThresholdOverride: false, changes: [{ type: "modify", path: "note.md", mtime: 3 }] });
++
++  const staleCopies = [...fixture.github.files.keys()].filter(path => path.includes(".conflict-remote-"));
++  assert.deepEqual(staleCopies, [], `stale keep-both output leaked across a changed conflict generation: ${staleCopies.join(", ")}`);
++});
++
++test("keep-both target appearing after reservation aborts before ref publication", async () => {
++  const fixture = await divergedFixture();
++  const adapter = new MemoryAdapter();
++  const recoveryStore = createV4RecoveryStore({ adapter, root: "recovery-copy-guard", repoId: config.repoId });
++  const runState = { runId: "copy-target-guard", conflictCopies: new Map<string, { path: string; fileId: string; includeInSync: boolean }>(), conflictCopyStages: new Map() };
++  const collisionPath = "note.conflict-remote-local-100.md";
++  let mutated = false;
++  fixture.github.onCreateCommit = () => {
++    if (mutated) return;
++    mutated = true;
++    fixture.localVault.files.set(collisionPath, { bytes: enc("USER LATE COLLISION\n"), mtime: 101 });
++  };
++
++  await assert.rejects(new V4SyncSession({
++    github: fixture.github,
++    vault: fixture.localVault,
++    index: fixture.localIndex,
++    config,
++    conflictPolicy: "ask",
++    abortChangePercent: 0,
++    recoveryStore,
++    runState,
++    now: () => 100,
++    resolveConflictBatch: async request => keepBoth(request),
++  }).sync({ operation: "normal", allowThresholdOverride: false, changes: [{ type: "modify", path: "note.md", mtime: 3 }] }), /replan|target changed|precondition|local/iu);
++
++  assert.equal(mutated, true);
++  assert.equal(fixture.github.refUpdates, 0, "late keep-both collision must be detected before publishing the candidate ref");
++  assert.equal(dec(fixture.localVault.files.get(collisionPath)!.bytes), "USER LATE COLLISION\n");
++});
++
++test("pre-publish local replan discards an uncommitted keep-both stage before the next conflict generation", async () => {
++  const fixture = await divergedFixture();
++  const adapter = new MemoryAdapter();
++  const recoveryStore = createV4RecoveryStore({ adapter, root: "recovery-local-replan-copy", repoId: config.repoId });
++  const runState = { runId: "keep-both-local-replan", conflictCopies: new Map<string, { path: string; fileId: string; includeInSync: boolean }>(), conflictCopyStages: new Map() };
++  let mutated = false;
++  fixture.github.onCreateCommit = () => {
++    if (mutated) return;
++    mutated = true;
++    fixture.localVault.files.set("note.md", { bytes: enc("local-v2\n"), mtime: 4 });
++  };
++
++  await assert.rejects(new V4SyncSession({
++    github: fixture.github,
++    vault: fixture.localVault,
++    index: fixture.localIndex,
++    config,
++    conflictPolicy: "ask",
++    abortChangePercent: 0,
++    recoveryStore,
++    runState,
++    now: () => 100,
++    resolveConflictBatch: async request => keepBoth(request),
++  }).sync({ operation: "normal", allowThresholdOverride: false, changes: [{ type: "modify", path: "note.md", mtime: 3 }] }), /conflict.*replan|local.*changed/iu);
++
++  assert.equal(mutated, true);
++  assert.equal(fixture.github.refUpdates, 0);
++  assert.equal(runState.conflictCopyStages.size, 0, "pre-publish conflict replan must discard the uncommitted synced conflict-copy stage");
++  assert.equal(runState.conflictCopies.size, 0, "pre-publish conflict replan must discard the uncommitted synced conflict-copy reservation");
++  fixture.github.onCreateCommit = undefined;
++
++  await new V4SyncSession({
++    github: fixture.github,
++    vault: fixture.localVault,
++    index: fixture.localIndex,
++    config,
++    conflictPolicy: "ask",
++    abortChangePercent: 0,
++    recoveryStore,
++    runState,
++    now: () => 200,
++    resolveConflictBatch: async request => ({
++      runId: request.runId,
++      generation: request.generation,
++      files: request.files.map(file => ({ fileId: file.fileId, fingerprint: file.fingerprint, kind: "use-local" as const })),
++    }),
++  }).sync({ operation: "normal", allowThresholdOverride: false, changes: [{ type: "modify", path: "note.md", mtime: 4 }] });
++
++  assert.equal(dec(fixture.localVault.files.get("note.md")!.bytes), "local-v2\n");
++  const staleCopies = [...fixture.github.files.keys()].filter(path => path.includes(".conflict-remote-"));
++  assert.deepEqual(staleCopies, [], `stale keep-both output leaked after a local conflict replan: ${staleCopies.join(", ")}`);
++});
++
++test("case-folded keep-both target appearing after reservation aborts before ref publication", async () => {
++  const fixture = await divergedFixture();
++  const adapter = new MemoryAdapter();
++  const recoveryStore = createV4RecoveryStore({ adapter, root: "recovery-copy-case-guard", repoId: config.repoId });
++  const runState = { runId: "copy-target-case-guard", conflictCopies: new Map<string, { path: string; fileId: string; includeInSync: boolean }>(), conflictCopyStages: new Map() };
++  const collisionPath = "NOTE.CONFLICT-REMOTE-LOCAL-100.MD";
++  fixture.github.onCreateCommit = () => {
++    fixture.localVault.files.set(collisionPath, { bytes: en
