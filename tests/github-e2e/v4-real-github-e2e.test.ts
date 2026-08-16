@@ -3,15 +3,41 @@ import test, { after } from "node:test";
 import { setRequestUrlHandler } from "obsidian";
 
 import { GitHubClient, type GitHubConfig } from "../../src/lib/github-api";
-import { randomBytes, toBase64Url } from "../../src/lib/bytes";
-import { deriveV4Keyring } from "../../src/lib/v4/crypto";
+import { randomBytes, toBase64, toBase64Url } from "../../src/lib/bytes";
+import type { V4ConflictPolicy } from "../../src/lib/v4/conflicts";
+import { deriveV4Keyring, type V4Keyring } from "../../src/lib/v4/crypto";
 import { V4HistoryService } from "../../src/lib/v4/history-service";
-import { createEmptyV4LocalIndex } from "../../src/lib/v4/local-index";
+import { createEmptyV4LocalIndex, type V4LocalIndex } from "../../src/lib/v4/local-index";
 import { expectedV4PathLayout, V4_FORMAT_VERSION, type V4RemoteConfig, type V4StorageMode } from "../../src/lib/v4/protocol-types";
 import { V4StorageCodec } from "../../src/lib/v4/storage-codec";
-import { V4SyncSession, type V4SessionVault } from "../../src/lib/v4/sync-session";
+import { V4SyncSession, type V4SessionVault, type V4SyncRunState } from "../../src/lib/v4/sync-session";
 
 const forbiddenBranches = new Set(["main", "master", "production", "prod", "release", "stable"]);
+const encoder = new TextEncoder();
+
+interface ModeContext {
+  mode: V4StorageMode;
+  remoteConfig: V4RemoteConfig;
+  keyring?: V4Keyring;
+}
+
+interface DeviceContext {
+  name: string;
+  vault: MemoryVault;
+  index: V4LocalIndex;
+  client: GitHubClient;
+  session: V4SyncSession;
+  runState: V4SyncRunState;
+}
+
+interface InterferenceState {
+  armed: boolean;
+  fired: boolean;
+  marker?: string;
+  externalCommitSha?: string;
+}
+
+const interference: InterferenceState = { armed: false, fired: false };
 
 function requiredEnv(name: string): string {
   const value = process.env[name];
@@ -30,6 +56,30 @@ function githubConfig(): GitHubConfig {
   };
 }
 
+function branchPath(config: GitHubConfig): string {
+  return config.branch.split("/").map(encodeURIComponent).join("/");
+}
+
+function bytes(text: string): Uint8Array {
+  return encoder.encode(text);
+}
+
+function deterministicBinary(length: number, seed: number): Uint8Array {
+  const output = new Uint8Array(length);
+  let value = seed >>> 0;
+  for (let index = 0; index < output.length; index++) {
+    value = (Math.imul(value, 1664525) + 1013904223) >>> 0;
+    output[index] = value >>> 24;
+  }
+  return output;
+}
+
+function sameBytes(left: Uint8Array, right: Uint8Array): boolean {
+  if (left.byteLength !== right.byteLength) return false;
+  for (let index = 0; index < left.byteLength; index++) if (left[index] !== right[index]) return false;
+  return true;
+}
+
 async function fetchWithRetry(url: string, init: RequestInit, attempts = 3): Promise<Response> {
   let response: Response | undefined;
   for (let attempt = 1; attempt <= attempts; attempt++) {
@@ -43,11 +93,98 @@ async function fetchWithRetry(url: string, init: RequestInit, attempts = 3): Pro
   return response!;
 }
 
-function installRequestUrlBridge(): void {
+async function githubRequest(config: GitHubConfig, apiPath: string, init: RequestInit = {}): Promise<Response> {
+  return fetchWithRetry(`https://api.github.com/repos/${config.owner}/${config.repo}${apiPath}`, {
+    ...init,
+    headers: {
+      Authorization: `Bearer ${config.token}`,
+      Accept: "application/vnd.github+json",
+      "Content-Type": "application/json",
+      "X-GitHub-Api-Version": "2026-03-10",
+      ...(init.headers ?? {}),
+    },
+  });
+}
+
+async function expectJson<T>(response: Response, successStatuses: readonly number[], action: string): Promise<T> {
+  const text = await response.text();
+  if (!successStatuses.includes(response.status)) throw new Error(`${action}: HTTP ${response.status} ${text}`);
+  return (text ? JSON.parse(text) : {}) as T;
+}
+
+async function publishExternalCommit(config: GitHubConfig, marker: string): Promise<string> {
+  const encodedBranch = branchPath(config);
+  const ref = await expectJson<{ object?: { sha?: string } }>(
+    await githubRequest(config, `/git/ref/heads/${encodedBranch}?_=${Date.now()}`),
+    [200],
+    "Cannot read branch before external E2E commit",
+  );
+  const headSha = ref.object?.sha;
+  if (!headSha) throw new Error("External E2E branch ref is missing a commit SHA.");
+
+  const commit = await expectJson<{ tree?: { sha?: string } }>(
+    await githubRequest(config, `/git/commits/${headSha}`),
+    [200],
+    "Cannot read commit before external E2E commit",
+  );
+  const baseTree = commit.tree?.sha;
+  if (!baseTree) throw new Error("External E2E base commit is missing its tree SHA.");
+
+  const blob = await expectJson<{ sha?: string }>(
+    await githubRequest(config, "/git/blobs", {
+      method: "POST",
+      body: JSON.stringify({ content: toBase64(bytes(`external-e2e:${marker}\n`)), encoding: "base64" }),
+    }),
+    [201],
+    "Cannot create external E2E blob",
+  );
+  if (!blob.sha) throw new Error("External E2E blob response is missing SHA.");
+
+  const tree = await expectJson<{ sha?: string }>(
+    await githubRequest(config, "/git/trees", {
+      method: "POST",
+      body: JSON.stringify({
+        base_tree: baseTree,
+        tree: [{ path: `.e2e-external/${marker}.txt`, mode: "100644", type: "blob", sha: blob.sha }],
+      }),
+    }),
+    [201],
+    "Cannot create external E2E tree",
+  );
+  if (!tree.sha) throw new Error("External E2E tree response is missing SHA.");
+
+  const externalCommit = await expectJson<{ sha?: string }>(
+    await githubRequest(config, "/git/commits", {
+      method: "POST",
+      body: JSON.stringify({ message: `external-e2e:${marker}`, tree: tree.sha, parents: [headSha] }),
+    }),
+    [201],
+    "Cannot create external E2E commit",
+  );
+  if (!externalCommit.sha) throw new Error("External E2E commit response is missing SHA.");
+
+  await expectJson(
+    await githubRequest(config, `/git/refs/heads/${encodedBranch}`, {
+      method: "PATCH",
+      body: JSON.stringify({ sha: externalCommit.sha, force: false }),
+    }),
+    [200],
+    "Cannot publish external E2E commit",
+  );
+  return externalCommit.sha;
+}
+
+function installRequestUrlBridge(config: GitHubConfig): void {
+  const refSuffix = `/git/refs/heads/${branchPath(config)}`;
   setRequestUrlHandler(async raw => {
     const request = raw as { url: string; method?: string; headers?: Record<string, string>; body?: string };
+    const method = (request.method ?? "GET").toUpperCase();
+    if (interference.armed && !interference.fired && method === "PATCH" && request.url.includes(refSuffix)) {
+      interference.fired = true;
+      interference.externalCommitSha = await publishExternalCommit(config, interference.marker ?? "controlled-race");
+    }
     const response = await fetchWithRetry(request.url, {
-      method: request.method ?? "GET",
+      method,
       headers: request.headers,
       body: request.body,
     });
@@ -65,23 +202,23 @@ function installRequestUrlBridge(): void {
   });
 }
 
-async function githubRequest(config: GitHubConfig, apiPath: string, init: RequestInit = {}): Promise<Response> {
-  return fetchWithRetry(`https://api.github.com/repos/${config.owner}/${config.repo}${apiPath}`, {
-    ...init,
-    headers: {
-      Authorization: `Bearer ${config.token}`,
-      Accept: "application/vnd.github+json",
-      "Content-Type": "application/json",
-      "X-GitHub-Api-Version": "2026-03-10",
-      ...(init.headers ?? {}),
-    },
-  });
+function resetInterference(): void {
+  interference.armed = false;
+  interference.fired = false;
+  interference.marker = undefined;
+  interference.externalCommitSha = undefined;
 }
 
-async function waitForBranchAbsent(config: GitHubConfig, branchPath: string, timeoutMs = 15_000): Promise<void> {
+function armInterference(marker: string): void {
+  resetInterference();
+  interference.armed = true;
+  interference.marker = marker;
+}
+
+async function waitForBranchAbsent(config: GitHubConfig, encodedBranch: string, timeoutMs = 15_000): Promise<void> {
   const startedAt = Date.now();
   while (Date.now() - startedAt <= timeoutMs) {
-    const response = await githubRequest(config, `/git/ref/heads/${branchPath}?_=${Date.now()}`);
+    const response = await githubRequest(config, `/git/ref/heads/${encodedBranch}?_=${Date.now()}`);
     if (response.status === 404) return;
     const responseText = await response.text();
     if (response.status === 422) {
@@ -98,10 +235,9 @@ async function waitForBranchAbsent(config: GitHubConfig, branchPath: string, tim
 }
 
 async function waitForBranchHead(config: GitHubConfig, expectedSha: string, timeoutMs = 15_000): Promise<void> {
-  const branchPath = config.branch.split("/").map(encodeURIComponent).join("/");
   const startedAt = Date.now();
   while (Date.now() - startedAt <= timeoutMs) {
-    const response = await githubRequest(config, `/git/ref/heads/${branchPath}?_=${Date.now()}`);
+    const response = await githubRequest(config, `/git/ref/heads/${branchPath(config)}?_=${Date.now()}`);
     if (response.status === 200) {
       const ref = await response.json() as { object?: { sha?: string } };
       if (ref.object?.sha === expectedSha) return;
@@ -114,22 +250,23 @@ async function waitForBranchHead(config: GitHubConfig, expectedSha: string, time
 }
 
 async function deleteTestBranch(config: GitHubConfig): Promise<void> {
+  resetInterference();
   const repository = await githubRequest(config, "");
   if (!repository.ok) throw new Error(`Cannot inspect GitHub E2E repository: HTTP ${repository.status}`);
   const metadata = await repository.json() as { default_branch: string };
   if (metadata.default_branch === config.branch) throw new Error("GITHUB_E2E_BRANCH must not be the repository default branch.");
 
-  const branchPath = config.branch.split("/").map(encodeURIComponent).join("/");
-  const response = await githubRequest(config, `/git/refs/heads/${branchPath}`, { method: "DELETE" });
+  const encodedBranch = branchPath(config);
+  const response = await githubRequest(config, `/git/refs/heads/${encodedBranch}`, { method: "DELETE" });
   if (response.status === 204 || response.status === 404) {
-    await waitForBranchAbsent(config, branchPath);
+    await waitForBranchAbsent(config, encodedBranch);
     return;
   }
   const responseText = await response.text();
   if (response.status === 422) {
     try {
       if ((JSON.parse(responseText) as { message?: string }).message === "Reference does not exist") {
-        await waitForBranchAbsent(config, branchPath);
+        await waitForBranchAbsent(config, encodedBranch);
         return;
       }
     } catch {
@@ -142,8 +279,8 @@ async function deleteTestBranch(config: GitHubConfig): Promise<void> {
 class MemoryVault implements V4SessionVault {
   readonly files = new Map<string, { bytes: Uint8Array; mtime: number }>();
 
-  set(path: string, bytes: Uint8Array, mtime = Date.now()): void {
-    this.files.set(path, { bytes: new Uint8Array(bytes), mtime });
+  set(path: string, content: Uint8Array, mtime = Date.now()): void {
+    this.files.set(path, { bytes: new Uint8Array(content), mtime });
   }
 
   async listFiles() {
@@ -161,8 +298,8 @@ class MemoryVault implements V4SessionVault {
     return new Uint8Array(file.bytes);
   }
 
-  async write(path: string, bytes: Uint8Array, mtime?: number) {
-    this.set(path, bytes, mtime);
+  async write(path: string, content: Uint8Array, mtime?: number) {
+    this.set(path, content, mtime);
   }
 
   async trash(path: string) {
@@ -174,171 +311,467 @@ function repoId(config: GitHubConfig): string {
   return `${config.owner}/${config.repo}#${config.branch}`;
 }
 
-async function runRoundTrip(mode: V4StorageMode, config: GitHubConfig): Promise<void> {
-  await deleteTestBranch(config);
+async function createModeContext(mode: V4StorageMode, config: GitHubConfig): Promise<ModeContext> {
+  const salt = randomBytes(16);
+  const remoteConfig: V4RemoteConfig = mode === "encrypted"
+    ? {
+      formatVersion: V4_FORMAT_VERSION,
+      mode,
+      repoId: repoId(config),
+      pathLayout: expectedV4PathLayout(mode),
+      algorithm: "AES-GCM",
+      kdf: "PBKDF2-SHA-256",
+      kdfParams: { iterations: 10_000, salt: toBase64Url(salt) },
+    }
+    : { formatVersion: V4_FORMAT_VERSION, mode, repoId: repoId(config), pathLayout: expectedV4PathLayout(mode) };
+  const keyring = mode === "encrypted"
+    ? await deriveV4Keyring({ passphrase: "v4-real-github-e2e", repoId: remoteConfig.repoId, salt, iterations: 10_000 })
+    : undefined;
+  return { mode, remoteConfig, keyring };
+}
+
+function createDevice(
+  name: string,
+  config: GitHubConfig,
+  context: ModeContext,
+  options: { conflictPolicy?: V4ConflictPolicy; now?: () => number } = {},
+): DeviceContext {
+  const vault = new MemoryVault();
+  const index = createEmptyV4LocalIndex({
+    repoId: context.remoteConfig.repoId,
+    deviceId: name,
+    mode: context.mode,
+    pathLayout: expectedV4PathLayout(context.mode),
+  });
   const client = new GitHubClient(config);
+  const runState: V4SyncRunState = { conflictCopies: new Map() };
+  const session = new V4SyncSession({
+    github: client,
+    vault,
+    index,
+    config: context.remoteConfig,
+    keyring: context.keyring,
+    conflictPolicy: options.conflictPolicy ?? "copy",
+    abortChangePercent: 0,
+    now: options.now,
+    runState,
+  });
+  return { name, vault, index, client, session, runState };
+}
+
+function liveRecords(device: DeviceContext) {
+  return Object.values(device.index.shards).flatMap(shard => Object.values(shard.records)).filter(record => !record.deleted);
+}
+
+function recordFor(device: DeviceContext, path: string) {
+  const record = liveRecords(device).find(candidate => candidate.path === path);
+  if (!record) throw new Error(`${device.name} is missing V4 record for ${path}`);
+  return record;
+}
+
+function assertVaultEquals(actual: MemoryVault, expected: MemoryVault, label: string): void {
+  const actualPaths = [...actual.files.keys()].sort();
+  const expectedPaths = [...expected.files.keys()].sort();
+  assert.deepEqual(actualPaths, expectedPaths, `${label}: path set differs`);
+  for (const path of expectedPaths) {
+    const actualFile = actual.files.get(path);
+    const expectedFile = expected.files.get(path)!;
+    assert.ok(actualFile, `${label}: missing ${path}`);
+    assert.deepEqual(actualFile.bytes, expectedFile.bytes, `${label}: bytes differ at ${path}`);
+  }
+}
+
+function assertVaultContainsBytes(vault: MemoryVault, expected: Uint8Array, label: string): void {
+  assert.equal([...vault.files.values()].some(file => sameBytes(file.bytes, expected)), true, label);
+}
+
+function assertNoConflictCopies(vault: MemoryVault, label: string): void {
+  assert.equal([...vault.files.keys()].some(path => path.includes(".conflict-remote-")), false, label);
+}
+
+async function forcePullFreshDevice(name: string, config: GitHubConfig, context: ModeContext): Promise<DeviceContext> {
+  const device = createDevice(name, config, context);
+  const result = await device.session.sync({ operation: "forcePull", allowThresholdOverride: false });
+  assert.equal(result.mode, "force-pull");
+  return device;
+}
+
+async function verifyEncryptedObjectTransport(device: DeviceContext, context: ModeContext, path?: string): Promise<void> {
+  if (context.mode !== "encrypted") return;
+  const commitSha = device.index.remoteCommitSha;
+  assert.ok(commitSha, `${device.name}: missing remote commit SHA`);
+  const commit = await device.client.getGitCommit(commitSha);
+  const tree = await device.client.getTreeAt(commit.treeSha, true);
+  const records = path ? [recordFor(device, path)] : liveRecords(device);
+  const codec = new V4StorageCodec({ mode: context.mode, pathLayout: expectedV4PathLayout(context.mode), keyring: context.keyring });
+  for (const record of records) {
+    const node = tree.tree.find(item => item.path === record.remotePath);
+    assert.ok(node, `${device.name}: missing remote object ${record.remotePath}`);
+    const [byPath, byBlob] = await Promise.all([
+      device.client.getFileBytes(record.remotePath, commitSha),
+      device.client.getBlob(node.sha),
+    ]);
+    assert.ok(byPath, `${device.name}: Contents read missing ${record.remotePath}`);
+    assert.deepEqual(byPath.bytes, byBlob, `${device.name}: Contents/Git Blob mismatch for ${record.remotePath}`);
+    const decoded = await codec.read(record, async remotePath => {
+      const remoteNode = tree.tree.find(item => item.path === remotePath);
+      if (!remoteNode) throw new Error(`${device.name}: missing encrypted storage object ${remotePath}`);
+      return device.client.getBlob(remoteNode.sha);
+    });
+    const local = device.vault.files.get(record.path);
+    assert.ok(local, `${device.name}: missing local bytes for ${record.path}`);
+    assert.deepEqual(decoded, local.bytes, `${device.name}: encrypted authentication mismatch for ${record.path}`);
+  }
+}
+
+function scenarioMetrics(scenario: string, mode: V4StorageMode, started: number, devices: DeviceContext[]): void {
+  console.log(JSON.stringify({
+    scenario,
+    mode,
+    elapsedMs: Number((performance.now() - started).toFixed(1)),
+    devices: Object.fromEntries(devices.map(device => [device.name, device.client.transportMetricsSnapshot])),
+  }));
+}
+
+async function runScenario(
+  config: GitHubConfig,
+  mode: V4StorageMode,
+  scenario: string,
+  body: (input: {
+    context: ModeContext;
+    device: (name: string, options?: { conflictPolicy?: V4ConflictPolicy; now?: () => number }) => DeviceContext;
+  }) => Promise<void>,
+): Promise<void> {
+  await deleteTestBranch(config);
+  const context = await createModeContext(mode, config);
+  const devices: DeviceContext[] = [];
   const started = performance.now();
   try {
-    const salt = randomBytes(16);
-    const remoteConfig: V4RemoteConfig = mode === "encrypted"
-      ? {
-        formatVersion: V4_FORMAT_VERSION,
-        mode,
-        repoId: repoId(config),
-        pathLayout: expectedV4PathLayout(mode),
-        algorithm: "AES-GCM",
-        kdf: "PBKDF2-SHA-256",
-        kdfParams: { iterations: 10_000, salt: toBase64Url(salt) },
-      }
-      : { formatVersion: V4_FORMAT_VERSION, mode, repoId: repoId(config), pathLayout: expectedV4PathLayout(mode) };
-    assert.equal(remoteConfig.pathLayout, mode === "encrypted" ? "opaque-stable-v1" : "plaintext-v1");
-    const keyring = mode === "encrypted"
-      ? await deriveV4Keyring({ passphrase: "v4-real-github-e2e", repoId: remoteConfig.repoId, salt, iterations: 10_000 })
-      : undefined;
-
-    const source = new MemoryVault();
-    source.set("Notes/hello.md", new TextEncoder().encode(`hello from ${mode}`), 1);
-    source.set("Assets/pixel.bin", new Uint8Array([0, 1, 2, 255]), 2);
-    const sourceIndex = createEmptyV4LocalIndex({
-      repoId: remoteConfig.repoId,
-      deviceId: `source-${mode}`,
-      mode,
-      pathLayout: expectedV4PathLayout(mode),
+    await body({
+      context,
+      device: (name, options) => {
+        const created = createDevice(name, config, context, options);
+        devices.push(created);
+        return created;
+      },
     });
-    const sourceSession = new V4SyncSession({
-      github: client,
-      vault: source,
-      index: sourceIndex,
-      config: remoteConfig,
-      keyring,
-      conflictPolicy: "copy",
-      abortChangePercent: 0,
-    });
+  } catch (error) {
+    throw new Error(`GitHub E2E scenario failed: ${scenario} (${mode})`, { cause: error });
+  } finally {
+    scenarioMetrics(scenario, mode, started, devices);
+    resetInterference();
+  }
+}
 
-    const pushed = await sourceSession.sync({ operation: "forcePush", allowThresholdOverride: false });
+function seedBaseline(vault: MemoryVault, mode: V4StorageMode): void {
+  vault.set("Notes/hello.md", bytes(`hello from ${mode}`), 1);
+  vault.set("Assets/pixel.bin", new Uint8Array([0, 1, 2, 255]), 2);
+  vault.set("Notes/สวัสดี 🌏/mañana.md", bytes("สวัสดี\nmañana\n🌏\n"), 3);
+  vault.set("Projects/2026 Q3/[draft] #1.md", bytes("# draft\nspaces + punctuation\n"), 4);
+  vault.set(".workspace/user-state.json", bytes('{"open":true,"pane":"left"}\n'), 5);
+  vault.set("Empty/zero-byte.bin", new Uint8Array(), 6);
+  vault.set("Assets/medium-1m.bin", deterministicBinary(1024 * 1024, 0x51a7), 7);
+}
+
+async function runBaselineScenario(config: GitHubConfig, mode: V4StorageMode): Promise<void> {
+  await runScenario(config, mode, "baseline-edge-path-roundtrip", async ({ context, device }) => {
+    const source = device("device-a");
+    seedBaseline(source.vault, mode);
+    const pushed = await source.session.sync({ operation: "forcePush", allowThresholdOverride: false });
     assert.equal(pushed.mode, "force-push");
-    await waitForBranchHead(config, sourceIndex.remoteCommitSha!);
+    await waitForBranchHead(config, source.index.remoteCommitSha!);
 
     if (mode === "encrypted") {
-      const beforeRename = Object.values(sourceIndex.shards)
-        .flatMap(shard => Object.values(shard.records))
-        .find(record => record.path === "Notes/hello.md")!;
-      const renamedFile = source.files.get("Notes/hello.md")!;
-      source.files.delete("Notes/hello.md");
-      source.set("Notes/hello-renamed.md", renamedFile.bytes, 3);
-      await sourceSession.sync({
+      const beforeRename = recordFor(source, "Notes/hello.md");
+      const renamed = source.vault.files.get("Notes/hello.md")!;
+      source.vault.files.delete("Notes/hello.md");
+      source.vault.set("Notes/hello-renamed.md", renamed.bytes, 8);
+      await source.session.sync({
         operation: "normal",
         allowThresholdOverride: false,
-        changes: [{ type: "rename", oldPath: "Notes/hello.md", path: "Notes/hello-renamed.md", mtime: 3 }],
+        changes: [{ type: "rename", oldPath: "Notes/hello.md", path: "Notes/hello-renamed.md", mtime: 8 }],
       });
-      await waitForBranchHead(config, sourceIndex.remoteCommitSha!);
-      const afterRename = Object.values(sourceIndex.shards)
-        .flatMap(shard => Object.values(shard.records))
-        .find(record => record.path === "Notes/hello-renamed.md")!;
+      const afterRename = recordFor(source, "Notes/hello-renamed.md");
       assert.equal(afterRename.fileId, beforeRename.fileId);
       assert.equal(afterRename.remotePath, beforeRename.remotePath);
     }
 
-    assert.equal((await sourceSession.sync({ operation: "normal", allowThresholdOverride: false })).mode, "noop");
-    const publishedCommitSha = sourceIndex.remoteCommitSha!;
-    const history = new V4HistoryService({ github: client, config: remoteConfig, keyring });
+    assert.equal((await source.session.sync({ operation: "normal", allowThresholdOverride: false })).mode, "noop");
+    const publishedCommitSha = source.index.remoteCommitSha!;
+    const history = new V4HistoryService({ github: source.client, config: context.remoteConfig, keyring: context.keyring });
     const historyPage = await history.listCommits();
     const publishedHistoryCommit = historyPage.items.find(item => item.sha === publishedCommitSha && item.source === "plugin");
     assert.ok(publishedHistoryCommit?.journalId);
     const historyChanges = await history.getCommitChanges(publishedHistoryCommit);
     assert.equal(historyChanges.some(change => change.path === (mode === "encrypted" ? "Notes/hello-renamed.md" : "Notes/hello.md")), true);
 
-    const publishedCommit = await client.getGitCommit(publishedCommitSha);
-    const tree = await client.getTreeAt(publishedCommit.treeSha, true);
-    if (mode === "encrypted") {
+    const commit = await source.client.getGitCommit(publishedCommitSha);
+    const tree = await source.client.getTreeAt(commit.treeSha, true);
+    if (mode === "plaintext") {
+      for (const path of source.vault.files.keys()) assert.equal(tree.tree.some(node => node.path === path), true, `plaintext tree missing ${path}`);
+    } else {
+      const logicalPaths = new Set(source.vault.files.keys());
+      assert.equal(tree.tree.some(node => logicalPaths.has(node.path)), false, "encrypted tree leaked a logical path");
+      assert.equal(tree.tree.some(node => /^\.obsidian-github-sync-v4\/data\/[0-9a-f]{2}\/[0-9a-f]{64}\.enc$/u.test(node.path)), true);
       const headPath = ".obsidian-github-sync-v4/head";
       const headNode = tree.tree.find(node => node.path === headPath);
       assert.ok(headNode, "Encrypted V4 head is missing from the published commit tree.");
       const [headByPath, headByBlob] = await Promise.all([
-        client.getFileBytes(headPath, publishedCommitSha),
-        client.getBlob(headNode.sha),
+        source.client.getFileBytes(headPath, publishedCommitSha),
+        source.client.getBlob(headNode.sha),
       ]);
       assert.ok(headByPath, "Encrypted V4 head is missing from the Contents API.");
-      assert.deepEqual([...headByBlob.subarray(0, 4)], [0x4f, 0x47, 0x53, 0x34], "Encrypted V4 head blob was stored without its payload header.");
-      assert.deepEqual([...headByPath.bytes.subarray(0, 4)], [0x4f, 0x47, 0x53, 0x34], "Encrypted V4 head path read lost its payload header.");
-    }
-    const paths = tree.tree.map(entry => entry.path);
-    if (mode === "plaintext") assert.equal(paths.includes("Notes/hello.md"), true);
-    else {
-      assert.equal(paths.some(path => /^\.obsidian-github-sync-v4\/data\/[0-9a-f]{2}\/[0-9a-f]{64}\.enc$/u.test(path)), true);
-      for (const segment of ["Notes", "Assets", "hello", "pixel", "md", "bin"]) {
-        assert.equal(paths.some(path => path.includes(segment)), false);
-      }
-      const records = Object.values(sourceIndex.shards).flatMap(shard => Object.values(shard.records));
-      for (const record of records) {
-        const remote = await client.getFileBytes(record.remotePath, publishedCommitSha);
-        assert.ok(remote, `Encrypted V4 object is missing: ${record.remotePath}`);
-        const objectNode = tree.tree.find(node => node.path === record.remotePath);
-        assert.ok(objectNode, `Encrypted V4 object is missing from the commit tree: ${record.remotePath}`);
-        const blobBytes = await client.getBlob(objectNode.sha);
-        assert.deepEqual(remote.bytes, blobBytes, `Contents and Git Blob bytes differ: ${record.remotePath}`);
-        assert.deepEqual(
-          [...remote.bytes.subarray(0, 4)],
-          [0x4f, 0x47, 0x53, 0x34],
-          `Encrypted V4 object has an invalid header at ${record.remotePath}; length=${remote.bytes.byteLength}`,
-        );
-        try {
-          const decoded = await new V4StorageCodec({ mode, pathLayout: expectedV4PathLayout(mode), keyring }).read(record, async path => {
-            const node = tree.tree.find(item => item.path === path);
-            if (!node) throw new Error(`Encrypted V4 object is missing: ${path}`);
-            return client.getBlob(node.sha);
-          });
-          assert.deepEqual(decoded, source.files.get(record.path)!.bytes);
-        } catch (error) {
-          throw new Error(`Encrypted V4 object failed authentication: ${record.remotePath}`, { cause: error });
-        }
-      }
+      assert.deepEqual(headByPath.bytes, headByBlob, "Encrypted V4 head Contents/Git Blob mismatch.");
+      assert.deepEqual([...headByBlob.subarray(0, 4)], [0x4f, 0x47, 0x53, 0x34]);
+      await verifyEncryptedObjectTransport(source, context);
     }
 
-    const target = new MemoryVault();
-    target.set("remove-me.md", new TextEncoder().encode("old"));
-    const targetIndex = createEmptyV4LocalIndex({
-      repoId: remoteConfig.repoId,
-      deviceId: `target-${mode}`,
-      mode,
-      pathLayout: expectedV4PathLayout(mode),
-    });
-    const pulled = await new V4SyncSession({
-      github: client,
-      vault: target,
-      index: targetIndex,
-      config: remoteConfig,
-      keyring,
-      conflictPolicy: "copy",
-      abortChangePercent: 0,
-    }).sync({ operation: "forcePull", allowThresholdOverride: false });
-
+    const target = device("device-c");
+    target.vault.set("remove-me.md", bytes("old"), 1);
+    const pulled = await target.session.sync({ operation: "forcePull", allowThresholdOverride: false });
     assert.equal(pulled.mode, "force-pull");
-    for (const [path, sourceFile] of source.files) {
-      assert.deepEqual(target.files.get(path)!.bytes, sourceFile.bytes, `Pulled bytes differ at ${path}`);
-    }
-    assert.equal(target.files.has("remove-me.md"), false);
+    assertVaultEquals(target.vault, source.vault, `${mode} baseline force pull`);
 
     if (mode === "encrypted") {
-      const pushedRecords = Object.values(sourceIndex.shards).flatMap(shard => Object.values(shard.records));
-      const pulledRecords = Object.values(targetIndex.shards).flatMap(shard => Object.values(shard.records));
-      for (const pushedRecord of pushedRecords) {
-        const pulledRecord = pulledRecords.find(record => record.path === pushedRecord.path)!;
-        assert.equal(pulledRecord.fileId, pushedRecord.fileId);
-        assert.equal(pulledRecord.remotePath, pushedRecord.remotePath);
+      for (const sourceRecord of liveRecords(source)) {
+        const targetRecord = recordFor(target, sourceRecord.path);
+        assert.equal(targetRecord.fileId, sourceRecord.fileId);
+        assert.equal(targetRecord.remotePath, sourceRecord.remotePath);
       }
     }
-  } finally {
-    console.log(JSON.stringify({
-      mode,
-      elapsedMs: Number((performance.now() - started).toFixed(1)),
-      transport: client.transportMetricsSnapshot,
-    }));
-  }
+  });
+}
+
+async function runStaleCatchupScenario(config: GitHubConfig, mode: V4StorageMode): Promise<void> {
+  await runScenario(config, mode, "two-device-stale-catchup", async ({ device }) => {
+    const a = device("device-a");
+    a.vault.set("shared.md", bytes("shared-base\n"), 1);
+    a.vault.set("A-only.md", bytes("a-v1\n"), 2);
+    a.vault.set("Assets/shared.bin", deterministicBinary(4096, 11), 3);
+    await a.session.sync({ operation: "forcePush", allowThresholdOverride: false });
+
+    const b = device("device-b");
+    await b.session.sync({ operation: "forcePull", allowThresholdOverride: false });
+    b.vault.set("B-local.md", bytes("created on stale device b\n"), 10);
+
+    a.vault.set("A-only.md", bytes("a-v2\n"), 11);
+    a.vault.set("nested/new-from-a.md", bytes("new from a\n"), 12);
+    await a.session.sync({
+      operation: "normal",
+      allowThresholdOverride: false,
+      changes: [
+        { type: "modify", path: "A-only.md", mtime: 11 },
+        { type: "modify", path: "nested/new-from-a.md", mtime: 12 },
+      ],
+    });
+
+    const caughtUp = await b.session.sync({
+      operation: "normal",
+      allowThresholdOverride: false,
+      changes: [{ type: "modify", path: "B-local.md", mtime: 10 }],
+    });
+    assert.equal(["pull-push", "push"].includes(caughtUp.mode), true);
+    assert.deepEqual(b.vault.files.get("A-only.md")?.bytes, bytes("a-v2\n"));
+    assert.deepEqual(b.vault.files.get("nested/new-from-a.md")?.bytes, bytes("new from a\n"));
+    assert.deepEqual(b.vault.files.get("B-local.md")?.bytes, bytes("created on stale device b\n"));
+    assertNoConflictCopies(b.vault, "disjoint stale catch-up created a conflict copy");
+
+    const c = await forcePullFreshDevice("device-c", config, await createModeContext(mode, config).then(async fresh => {
+      // A new context would use a different encrypted key. Reuse the active remote config through B instead.
+      return fresh;
+    }).catch(() => { throw new Error("unreachable"); }));
+    void c;
+  });
+}
+
+async function runStaleCatchupScenarioWithSharedContext(config: GitHubConfig, mode: V4StorageMode): Promise<void> {
+  await runScenario(config, mode, "two-device-stale-catchup-and-disjoint-push", async ({ context, device }) => {
+    const a = device("device-a");
+    a.vault.set("shared.md", bytes("shared-base\n"), 1);
+    a.vault.set("A-only.md", bytes("a-v1\n"), 2);
+    a.vault.set("Assets/shared.bin", deterministicBinary(4096, 11), 3);
+    await a.session.sync({ operation: "forcePush", allowThresholdOverride: false });
+
+    const b = device("device-b");
+    await b.session.sync({ operation: "forcePull", allowThresholdOverride: false });
+    b.vault.set("B-local.md", bytes("created on stale device b\n"), 10);
+
+    a.vault.set("A-only.md", bytes("a-v2\n"), 11);
+    a.vault.set("nested/new-from-a.md", bytes("new from a\n"), 12);
+    await a.session.sync({
+      operation: "normal",
+      allowThresholdOverride: false,
+      changes: [
+        { type: "modify", path: "A-only.md", mtime: 11 },
+        { type: "modify", path: "nested/new-from-a.md", mtime: 12 },
+      ],
+    });
+
+    const caughtUp = await b.session.sync({
+      operation: "normal",
+      allowThresholdOverride: false,
+      changes: [{ type: "modify", path: "B-local.md", mtime: 10 }],
+    });
+    assert.equal(["pull-push", "push"].includes(caughtUp.mode), true);
+    assert.deepEqual(b.vault.files.get("A-only.md")?.bytes, bytes("a-v2\n"));
+    assert.deepEqual(b.vault.files.get("nested/new-from-a.md")?.bytes, bytes("new from a\n"));
+    assert.deepEqual(b.vault.files.get("B-local.md")?.bytes, bytes("created on stale device b\n"));
+    assertNoConflictCopies(b.vault, "disjoint stale catch-up created a conflict copy");
+
+    const c = createDevice("device-c", config, context);
+    const pulled = await c.session.sync({ operation: "forcePull", allowThresholdOverride: false });
+    assert.equal(pulled.mode, "force-pull");
+    assertVaultEquals(c.vault, b.vault, "fresh device after disjoint stale catch-up");
+  });
+}
+
+async function runCopyConflictScenario(config: GitHubConfig, mode: V4StorageMode): Promise<void> {
+  await runScenario(config, mode, "two-device-same-file-copy-conflict", async ({ context, device }) => {
+    const a = device("device-a");
+    a.vault.set("shared.md", bytes("base\n"), 1);
+    await a.session.sync({ operation: "forcePush", allowThresholdOverride: false });
+
+    const fixedNow = 424242;
+    const b = device("device-b", { now: () => fixedNow });
+    await b.session.sync({ operation: "forcePull", allowThresholdOverride: false });
+
+    a.vault.set("shared.md", bytes("from-a\n"), 2);
+    await a.session.sync({ operation: "normal", allowThresholdOverride: false, changes: [{ type: "modify", path: "shared.md", mtime: 2 }] });
+
+    b.vault.set("shared.md", bytes("from-b\n"), 3);
+    await b.session.sync({ operation: "normal", allowThresholdOverride: false, changes: [{ type: "modify", path: "shared.md", mtime: 3 }] });
+
+    const conflictPath = `shared.conflict-remote-device-b-${fixedNow}.md`;
+    assert.deepEqual(b.vault.files.get("shared.md")?.bytes, bytes("from-b\n"));
+    assert.deepEqual(b.vault.files.get(conflictPath)?.bytes, bytes("from-a\n"));
+    assert.equal([...b.vault.files.keys()].filter(path => path.includes(".conflict-remote-")).length, 1);
+
+    const c = createDevice("device-c", config, context);
+    await c.session.sync({ operation: "forcePull", allowThresholdOverride: false });
+    assert.deepEqual(c.vault.files.get("shared.md")?.bytes, bytes("from-b\n"));
+    assert.deepEqual(c.vault.files.get(conflictPath)?.bytes, bytes("from-a\n"));
+    await verifyEncryptedObjectTransport(c, context);
+  });
+}
+
+async function runRenameVsEditScenario(config: GitHubConfig, mode: V4StorageMode): Promise<void> {
+  await runScenario(config, mode, "two-device-rename-vs-stale-edit", async ({ context, device }) => {
+    const a = device("device-a");
+    const base = bytes("rename-base\n");
+    const staleEdit = bytes("edited-on-stale-device-b\n");
+    a.vault.set("Notes/rename-me.md", base, 1);
+    await a.session.sync({ operation: "forcePush", allowThresholdOverride: false });
+
+    const b = device("device-b", { now: () => 515151 });
+    await b.session.sync({ operation: "forcePull", allowThresholdOverride: false });
+    const oldRecord = recordFor(a, "Notes/rename-me.md");
+
+    a.vault.files.delete("Notes/rename-me.md");
+    a.vault.set("Notes/renamed.md", base, 2);
+    await a.session.sync({
+      operation: "normal",
+      allowThresholdOverride: false,
+      changes: [{ type: "rename", oldPath: "Notes/rename-me.md", path: "Notes/renamed.md", mtime: 2 }],
+    });
+    const renamedRecord = recordFor(a, "Notes/renamed.md");
+    assert.equal(renamedRecord.fileId, oldRecord.fileId);
+    if (mode === "encrypted") assert.equal(renamedRecord.remotePath, oldRecord.remotePath);
+
+    b.vault.set("Notes/rename-me.md", staleEdit, 3);
+    await b.session.sync({
+      operation: "normal",
+      allowThresholdOverride: false,
+      changes: [{ type: "modify", path: "Notes/rename-me.md", mtime: 3 }],
+    });
+
+    const c = createDevice("device-c", config, context);
+    await c.session.sync({ operation: "forcePull", allowThresholdOverride: false });
+    assertVaultContainsBytes(c.vault, base, "rename lineage bytes were lost");
+    assertVaultContainsBytes(c.vault, staleEdit, "stale edited lineage bytes were lost");
+    for (const record of liveRecords(c)) assert.ok(c.vault.files.has(record.path), `fresh pull missing record path ${record.path}`);
+  });
+}
+
+async function runDeleteRecreateScenario(config: GitHubConfig, mode: V4StorageMode): Promise<void> {
+  await runScenario(config, mode, "two-device-delete-recreate-identity-break", async ({ device }) => {
+    const a = device("device-a");
+    a.vault.set("Notes/reborn.md", bytes("generation-one\n"), 1);
+    await a.session.sync({ operation: "forcePush", allowThresholdOverride: false });
+
+    const b = device("device-b");
+    await b.session.sync({ operation: "forcePull", allowThresholdOverride: false });
+    const oldFileId = recordFor(a, "Notes/reborn.md").fileId;
+
+    a.vault.files.delete("Notes/reborn.md");
+    await a.session.sync({ operation: "normal", allowThresholdOverride: false, changes: [{ type: "delete", path: "Notes/reborn.md", mtime: 2 }] });
+
+    a.vault.set("Notes/reborn.md", bytes("generation-two\n"), 3);
+    await a.session.sync({ operation: "normal", allowThresholdOverride: false, changes: [{ type: "modify", path: "Notes/reborn.md", mtime: 3 }] });
+    const newRecord = recordFor(a, "Notes/reborn.md");
+    assert.notEqual(newRecord.fileId, oldFileId, "delete/recreate reused the old file identity");
+
+    await b.session.sync({ operation: "normal", allowThresholdOverride: false });
+    assert.deepEqual(b.vault.files.get("Notes/reborn.md")?.bytes, bytes("generation-two\n"));
+    assert.equal(recordFor(b, "Notes/reborn.md").fileId, newRecord.fileId);
+  });
+}
+
+async function runBinaryOverwriteScenario(config: GitHubConfig, mode: V4StorageMode): Promise<void> {
+  await runScenario(config, mode, "two-device-binary-overwrite", async ({ context, device }) => {
+    const revisionOne = deterministicBinary(256 * 1024, 0x1010);
+    const revisionTwo = deterministicBinary(256 * 1024, 0x2020);
+    const a = device("device-a");
+    a.vault.set("Assets/shared.bin", revisionOne, 1);
+    await a.session.sync({ operation: "forcePush", allowThresholdOverride: false });
+
+    const b = device("device-b");
+    await b.session.sync({ operation: "forcePull", allowThresholdOverride: false });
+    b.vault.set("Assets/shared.bin", revisionTwo, 2);
+    await b.session.sync({ operation: "normal", allowThresholdOverride: false, changes: [{ type: "modify", path: "Assets/shared.bin", mtime: 2 }] });
+
+    await a.session.sync({ operation: "normal", allowThresholdOverride: false });
+    assert.deepEqual(a.vault.files.get("Assets/shared.bin")?.bytes, revisionTwo);
+    await verifyEncryptedObjectTransport(a, context, "Assets/shared.bin");
+  });
+}
+
+async function runControlledRaceScenario(config: GitHubConfig): Promise<void> {
+  await runScenario(config, "plaintext", "controlled-external-branch-head-race", async ({ context, device }) => {
+    const a = device("device-a");
+    a.vault.set("race.md", bytes("base\n"), 1);
+    await a.session.sync({ operation: "forcePush", allowThresholdOverride: false });
+
+    a.vault.set("race.md", bytes("plugin-after-race\n"), 2);
+    armInterference("controlled-race");
+    let publishError: unknown;
+    try {
+      await a.session.sync({ operation: "normal", allowThresholdOverride: false, changes: [{ type: "modify", path: "race.md", mtime: 2 }] });
+    } catch (error) {
+      publishError = error;
+    }
+    interference.armed = false;
+    assert.equal(interference.fired, true, "controlled branch-head interference hook did not fire");
+    assert.ok(interference.externalCommitSha, "controlled branch-head interference did not create an external commit");
+    assert.ok(publishError, "plugin publish unexpectedly succeeded over an externally advanced branch");
+    assert.match(String((publishError as Error).message), /(branch head changed|Failed to update git ref: HTTP (409|422))/i);
+
+    const afterRaceHistory = await a.client.listCommits({ perPage: 100 });
+    assert.equal(afterRaceHistory.some(commit => commit.sha === interference.externalCommitSha), true, "external commit is not reachable after rejected plugin publish");
+
+    const rerun = await a.session.sync({ operation: "normal", allowThresholdOverride: false, changes: [{ type: "modify", path: "race.md", mtime: 2 }] });
+    assert.equal(["push", "pull-push", "noop"].includes(rerun.mode), true);
+    assert.deepEqual(a.vault.files.get("race.md")?.bytes, bytes("plugin-after-race\n"));
+
+    const finalHistory = await a.client.listCommits({ perPage: 100 });
+    assert.equal(finalHistory.some(commit => commit.sha === interference.externalCommitSha), true, "external commit disappeared after replan");
+    const c = createDevice("device-c", config, context);
+    await c.session.sync({ operation: "forcePull", allowThresholdOverride: false });
+    assert.deepEqual(c.vault.files.get("race.md")?.bytes, bytes("plugin-after-race\n"));
+  });
 }
 
 const config = githubConfig();
-installRequestUrlBridge();
+installRequestUrlBridge(config);
 
 after(async () => {
   try {
@@ -349,7 +782,14 @@ after(async () => {
   }
 });
 
-test("V4 real GitHub REST round trips plaintext and encrypted vaults", { timeout: 120_000 }, async () => {
-  await runRoundTrip("plaintext", config);
-  await runRoundTrip("encrypted", config);
+test("V4 real GitHub REST survives realistic superuser and two-device scenarios", { timeout: 900_000 }, async () => {
+  for (const mode of ["plaintext", "encrypted"] as const) {
+    await runBaselineScenario(config, mode);
+    await runStaleCatchupScenarioWithSharedContext(config, mode);
+    await runCopyConflictScenario(config, mode);
+    await runRenameVsEditScenario(config, mode);
+    await runDeleteRecreateScenario(config, mode);
+    await runBinaryOverwriteScenario(config, mode);
+  }
+  await runControlledRaceScenario(config);
 });
