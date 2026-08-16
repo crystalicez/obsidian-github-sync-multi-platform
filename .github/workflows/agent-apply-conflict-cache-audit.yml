@@ -1,0 +1,45 @@
+name: Agent Apply Conflict Cache Audit
+
+on:
+  push:
+    branches:
+      - agent/conflict-audit-red
+    paths:
+      - .github/workflows/agent-apply-conflict-cache-audit.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: agent/conflict-audit-red
+      - name: Bound conflict materialization cache and make failures retryable
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('src/lib/v4/sync-session.ts')
+          s = p.read_text()
+          old = '''      const cached = materializedCache.get(fileId)\n      if (cached) return cached\n      const promise = (async (): Promise<V4ConflictMaterializedFile> => {'''
+          new = '''      const cached = materializedCache.get(fileId)\n      if (cached) {\n        materializedCache.delete(fileId)\n        materializedCache.set(fileId, cached)\n        return cached\n      }\n      const promise = (async (): Promise<V4ConflictMaterializedFile> => {'''
+          if s.count(old) != 1:
+              raise SystemExit(f'expected one cache lookup replacement, got {s.count(old)}')
+          s = s.replace(old, new, 1)
+          old2 = '''      materializedCache.set(fileId, promise)\n      return promise\n    }'''
+          new2 = '''      materializedCache.set(fileId, promise)\n      while (materializedCache.size > 3) {\n        const oldestFileId = materializedCache.keys().next().value\n        if (oldestFileId === undefined) break\n        materializedCache.delete(oldestFileId)\n        prefetchedRemoteBodies.delete(oldestFileId)\n      }\n      void promise.catch(() => {\n        if (materializedCache.get(fileId) === promise) materializedCache.delete(fileId)\n        prefetchedRemoteBodies.delete(fileId)\n      })\n      return promise\n    }'''
+          if s.count(old2) != 1:
+              raise SystemExit(f'expected one cache insertion replacement, got {s.count(old2)}')
+          s = s.replace(old2, new2, 1)
+          p.write_text(s)
+          PY
+          git config user.name 'OpenAI Agent'
+          git config user.email 'agent@openai.local'
+          git add src/lib/v4/sync-session.ts
+          git commit -m 'fix: bound conflict materialization cache'
+          git push origin HEAD:refs/heads/agent/conflict-audit-red
