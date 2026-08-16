@@ -234,6 +234,17 @@ test("v4 coalescing preserves replacement identity break through a subsequent re
   ]);
 });
 
+test("v4 coalescing preserves identity-breaking changes when a full rescan is also queued", () => {
+  assert.deepEqual(coalesceV4Changes([
+    { type: "delete", path: "A.md", mtime: 1 },
+    { type: "modify", path: "A.md", mtime: 2 },
+    { type: "rescan", mtime: 3 },
+  ]), [
+    { type: "replace", oldPath: "A.md", path: "A.md", mtime: 2 },
+    { type: "rescan", mtime: 3 },
+  ]);
+});
+
 test("v4 coalescing falls back to a causal rescan when a rename cycle can hide an overwritten destination", () => {
   assert.deepEqual(coalesceV4Changes([
     { type: "delete", path: "B.md", mtime: 1 },
