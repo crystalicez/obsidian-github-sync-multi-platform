@@ -32,6 +32,8 @@ jobs:
         run: pnpm test:resource
       - name: Feasibility tests
         run: pnpm test:feasibility
+      - name: Compile real GitHub E2E harness
+        run: GITHUB_E2E_COMPILE_ONLY=1 pnpm test:github-e2e:quick
       - name: Validate package
         run: pnpm validate:package
       - name: Upload tested plugin artifact
