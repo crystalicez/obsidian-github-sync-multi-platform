@@ -68,11 +68,6 @@ jobs:
                    echo "should_release=true" >> $GITHUB_OUTPUT
                    # 设置发布的 tag 名称为当前版本号
                    echo "release_tag=$CURRENT_VERSION" >> $GITHUB_OUTPUT
-
-                   # Create tag locally so we can push it later (or just use Release API to tag)
-                   # Since we use create-release action using 'tag_name', it often expects the tag to exist or it creates it.
-                   # Let's rely on create-release to create the tag if we pass a tag name that doesn't exist?
-                   # Actually actions/create-release usually creates a release object which creates the git tag.
                else
                    echo "Current version $CURRENT_VERSION is lower than $LAST_VERSION. Skipping."
                    echo "should_release=false" >> $GITHUB_OUTPUT
@@ -105,16 +100,19 @@ jobs:
               echo "$msg" >> $GITHUB_OUTPUT
           fi
           echo "EOF" >> $GITHUB_OUTPUT
-      - name: Build
+      - name: Build and verify release
         id: build
         # 只有在 check_version 步骤输出 should_release 为 true 时才执行
         if: steps.check_version.outputs.should_release == 'true'
         run: |
-
           pnpm install --frozen-lockfile
           pnpm run build
           pnpm test
           pnpm test:repeat
+          pnpm test:recovery
+          pnpm test:resource
+          pnpm test:feasibility
+          GITHUB_E2E_COMPILE_ONLY=1 pnpm test:github-e2e:quick
           pnpm validate:package
           mkdir ${{ env.NAME }}
           cp main.js manifest.json styles.css ${{ env.NAME }}
@@ -142,5 +140,4 @@ jobs:
             styles.css
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
 

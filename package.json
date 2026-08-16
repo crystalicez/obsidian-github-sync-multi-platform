@@ -1,6 +1,6 @@
 {
   "name": "encrypted-github-sync-multi-platform",
-  "version": "1.0.7",
+  "version": "1.0.8",
   "description": "Encrypted real-time note synchronization with GitHub API, supporting desktop and mobile devices.",
   "main": "main.js",
   "author": "Crystalicez",
