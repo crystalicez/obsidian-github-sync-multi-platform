@@ -216,6 +216,7 @@ export class V4SyncCenterView extends ItemView {
     if (snapshot.lifecycle === "failed") return "Failed"
     if (snapshot.lifecycle === "success") return "Success"
     if (snapshot.lifecycle === "no-change") return "No changes"
+    if (snapshot.lifecycle === "cancelled") return "Cancelled"
     if (snapshot.lifecycle === "idle") return "Idle"
     return snapshot.phase ? formatV4PhaseLabel(snapshot.phase) : "Syncing"
   }

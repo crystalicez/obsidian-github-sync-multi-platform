@@ -47,6 +47,7 @@ export function formatV4ActiveSyncStatus(snapshot: V4SyncProgressSnapshot): V4St
     ].filter((value): value is string => Boolean(value)).join("\n");
     return { text: "❌ GH Sync: Failed", title };
   }
+  if (snapshot.lifecycle === "cancelled") return { text: "GH Sync: Cancelled", title: "Cancelled" };
   if (snapshot.lifecycle === "success") return { text: "✅ GH Sync: Success", title: ["Success", ...detailLines].join("\n") };
   if (snapshot.lifecycle === "no-change") return { text: "GH Sync: No changes", title: ["No changes", ...detailLines].join("\n") };
   if (snapshot.lifecycle === "idle") return { text: "GH Sync: Idle", title: "Idle" };

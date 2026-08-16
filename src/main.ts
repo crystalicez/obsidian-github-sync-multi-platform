@@ -8,6 +8,7 @@ import { V4PluginRuntime } from "./lib/v4/runtime";
 import { createIdleV4Progress } from "./lib/v4/progress";
 import { formatV4ActiveSyncStatus } from "./lib/v4/status";
 import { V4SyncCenterView, V4_SYNC_CENTER_VIEW } from "./views/sync-center";
+import { V4ConflictResolutionView, V4_CONFLICT_RESOLUTION_VIEW } from "./views/conflict-resolution";
 
 
 export default class FastSync extends Plugin {
@@ -58,7 +59,9 @@ export default class FastSync extends Plugin {
     this.initGitHubClient()
     this.v4Runtime = this.createV4Runtime()
     this.register(this.v4Runtime.subscribeProgress(() => this.updateStatusBar()))
+    this.register(this.v4Runtime.subscribeConflicts(() => this.updateStatusBar()))
     this.registerView(V4_SYNC_CENTER_VIEW, leaf => new V4SyncCenterView(leaf, this))
+    this.registerView(V4_CONFLICT_RESOLUTION_VIEW, leaf => new V4ConflictResolutionView(leaf, this))
     this.registerScheduledSync()
 
     // Create Ribbon Icons
@@ -201,6 +204,14 @@ export default class FastSync extends Plugin {
     await this.app.workspace.revealLeaf(leaf)
   }
 
+  async openConflictResolution(): Promise<void> {
+    const existing = this.app.workspace.getLeavesOfType(V4_CONFLICT_RESOLUTION_VIEW)[0]
+    const leaf = existing ?? this.app.workspace.getRightLeaf(false)
+    if (!leaf) return
+    if (!existing) await leaf.setViewState({ type: V4_CONFLICT_RESOLUTION_VIEW, active: true })
+    await this.app.workspace.revealLeaf(leaf)
+  }
+
   private createSecretId(prefix: string): string {
     const bytes = new Uint8Array(16)
     crypto.getRandomValues(bytes)
@@ -221,8 +232,8 @@ export default class FastSync extends Plugin {
     this.secretsMigrated = result.migrated
   }
 
-  async saveSettings() {
-    this.v4Runtime?.credentialsChanged()
+  async saveSettings(options: { presentationOnly?: boolean } = {}) {
+    if (!options.presentationOnly) this.v4Runtime?.credentialsChanged()
     storeV4Secrets(this.settings, this.app.secretStorage)
     this.initGitHubClient()
     this.registerScheduledSync()
@@ -265,10 +276,12 @@ export default class FastSync extends Plugin {
     span.title = title;
     const runtime = this.v4Runtime;
     span.onclick = () => {
-      if (runtime && !runtime.isSyncing) {
-        if (this.unloaded) return
-        void runtime.manualSync()
+      if (!runtime || this.unloaded) return
+      if (runtime.hasPendingConflicts) {
+        void this.openConflictResolution()
+        return
       }
+      if (!runtime.isSyncing) void runtime.manualSync()
     };
     this.statusDisplaySignature = signature;
   }

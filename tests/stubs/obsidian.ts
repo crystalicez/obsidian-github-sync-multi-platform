@@ -37,8 +37,14 @@ export function resetModalTestState() {
 export class ElementStub {
   text = "";
   title = "";
+  value = "";
+  checked = false;
   disabled = false;
+  scrollTop = 0;
+  scrollLeft = 0;
   onclick?: () => void;
+  oninput?: (event?: unknown) => void;
+  onchange?: (event?: unknown) => void;
   onpointerdown?: (event: PointerEvent) => void;
   onpointermove?: (event: PointerEvent) => void;
   onpointerup?: (event: PointerEvent) => void;
@@ -51,6 +57,7 @@ export class ElementStub {
   private parent?: ElementStub;
   private readonly root: { mutations: number };
   private ownMutations = 0;
+  private readonly listeners = new Map<string, Set<(event?: unknown) => void>>();
 
   constructor(root?: { mutations: number }, parent?: ElementStub) {
     this.root = root ?? { mutations: 0 };
@@ -67,11 +74,12 @@ export class ElementStub {
     this.mutate();
   }
 
-  createEl(tag: string, options?: { text?: string; cls?: string; attr?: Record<string, string> }) {
+  createEl(tag: string, options?: { text?: string; cls?: string; attr?: Record<string, string>; value?: string }) {
     const child = new ElementStub(this.root, this);
     this.children.push(child);
     this.mutate();
     if (options?.text) child.setText(options.text);
+    if (options?.value !== undefined) child.value = options.value;
     if (options?.cls) child.addClass(options.cls);
     for (const [name, value] of Object.entries(options?.attr ?? {})) child.setAttribute(name, value);
     if (tag === "button") modalButtons.push({ text: options?.text ?? "", click: () => child.onclick?.() });
@@ -142,6 +150,28 @@ export class ElementStub {
     return undefined;
   }
 
+
+  addEventListener(type: string, listener: (event?: unknown) => void) {
+    const listeners = this.listeners.get(type) ?? new Set();
+    listeners.add(listener);
+    this.listeners.set(type, listeners);
+  }
+
+  removeEventListener(type: string, listener: (event?: unknown) => void) {
+    this.listeners.get(type)?.delete(listener);
+  }
+
+  dispatchEvent(event: { type: string } | string) {
+    const type = typeof event === "string" ? event : event.type;
+    const value = typeof event === "string" ? { type } : event;
+    if (type === "input") this.oninput?.(value);
+    if (type === "change") this.onchange?.(value);
+    for (const listener of [...(this.listeners.get(type) ?? [])]) listener(value);
+    return true;
+  }
+
+  focus() {}
+
   getBoundingClientRect() { return { left: 0, width: 300 }; }
   setPointerCapture(_pointerId: number) {}
   releasePointerCapture(_pointerId: number) {}
@@ -163,7 +193,10 @@ export class Modal {
 
 export class WorkspaceLeaf {
   app: unknown;
+  private viewState: { type?: string; active?: boolean; state?: unknown } = {};
   constructor(app: unknown = { workspace: { getActiveFile: () => null } }) { this.app = app; }
+  async setViewState(state: { type?: string; active?: boolean; state?: unknown }) { this.viewState = { ...state }; }
+  getViewState() { return { ...this.viewState }; }
 }
 
 export class ItemView {

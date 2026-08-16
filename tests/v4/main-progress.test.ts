@@ -44,6 +44,16 @@ function createMainProgressFixture() {
         unsubscribeCalls.value++;
       };
     },
+    subscribeConflicts(listener: () => void) {
+      listener();
+      let active = true;
+      return () => {
+        if (!active) return;
+        active = false;
+        unsubscribeCalls.value++;
+      };
+    },
+    get hasPendingConflicts() { return false; },
     manualSync() { manualSyncCalls++; return Promise.resolve({}); },
     dispose() { disposed = true; },
     enqueueModify() {}, enqueueDelete() {}, enqueueFolderDelete() {}, enqueueRename() {}, enqueueFolderRename() {},
@@ -102,7 +112,7 @@ test("status bar subscribes to detailed progress and cleans up once", async () =
   assert.equal(fixture.manualSyncCalls, 1);
 
   fixture.plugin.onunload();
-  assert.equal(fixture.unsubscribeCalls.value, 1);
+  assert.equal(fixture.unsubscribeCalls.value, 2);
   assert.equal(fixture.disposed, true);
   fixture.statusSpan.click();
   assert.equal(fixture.manualSyncCalls, 1);

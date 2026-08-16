@@ -14,7 +14,8 @@ import {
 import { decodeV4RemoteConfig } from "./remote-index"
 import { createV4ScopePredicate, isPathInV4SyncScope } from "./scope"
 import { assertV4PathLayoutCompatible, V4ChangeGuardError, V4ConflictReplanRequiredError, V4RecoveryReplanRequiredError, V4SyncSession, type V4SyncRunState } from "./sync-session"
-import type { V4ConflictResolution } from "./conflicts"
+import { V4ConflictResolutionCoordinator, type V4ConflictCoordinatorSnapshot } from "./conflict-coordinator"
+import { buildV4ConflictContextKey, type V4ConflictBatchRequest, type V4ConflictBatchResolution, type V4ConflictFileResolution } from "./conflict-types"
 import { V4SyncCoordinator, type V4QueuedChange, type V4SyncRequest } from "./sync-coordinator"
 import { expectedV4PathLayout, V4_FORMAT_VERSION, V4_CONFIG_PATH, type V4RemoteConfig, type V4StorageMode } from "./protocol-types"
 import { V4HistoryService } from "./history-service"
@@ -119,6 +120,7 @@ function createIndexAdapter(plugin: FastSync): V4LocalIndexAdapter {
 
 export class V4PluginRuntime {
   private readonly coordinator: V4SyncCoordinator
+  private readonly conflictCoordinator = new V4ConflictResolutionCoordinator()
   private readonly adapter: V4LocalIndexAdapter
   private readonly progressStore = new V4ProgressStore()
   private readonly platformIo: V4PlatformIo
@@ -144,6 +146,7 @@ export class V4PluginRuntime {
     if (this.disposed) return
     this.disposed = true
     this.debounceRunActive = false
+    this.conflictCoordinator.cancel(new V4CancelledError("V4 runtime disposed."))
     this.coordinator.dispose()
     this.progressStore.dispose()
     void this.coordinator.whenIdle().finally(() => this.keyringCache.dispose())
@@ -151,6 +154,7 @@ export class V4PluginRuntime {
 
   credentialsChanged(): void {
     if (this.disposed) return
+    this.conflictCoordinator.cancel(new V4CancelledError("V4 sync settings changed."))
     this.credentialGeneration++
     this.keyringCache.invalidate()
   }
@@ -187,6 +191,28 @@ export class V4PluginRuntime {
 
   subscribeProgress(listener: (snapshot: V4SyncProgressSnapshot) => void): () => void {
     return this.progressStore.subscribe(snapshot => listener(this.snapshotForConsumers(snapshot)))
+  }
+
+  get hasPendingConflicts(): boolean { return this.conflictCoordinator.snapshot.pending }
+  get conflictSnapshot(): V4ConflictCoordinatorSnapshot { return this.conflictCoordinator.snapshot }
+
+  subscribeConflicts(listener: (snapshot: V4ConflictCoordinatorSnapshot) => void): () => void {
+    return this.conflictCoordinator.subscribe(listener)
+  }
+
+  async resolveConflictBatch(request: V4ConflictBatchRequest, signal?: AbortSignal): Promise<V4ConflictBatchResolution> {
+    this.progressStore.update({ phase: "resolving-conflicts", currentPath: undefined, currentDirection: undefined })
+    const pending = this.conflictCoordinator.resolveBatch(request, signal)
+    void this.plugin.openConflictResolution()
+    return pending
+  }
+
+  materializeConflict(fileId: string) { return this.conflictCoordinator.materialize(fileId) }
+  setConflictResolution(resolution: V4ConflictFileResolution): void { this.conflictCoordinator.setResolution(resolution) }
+  markConflictReviewed(fileId: string, reviewed = true): void { this.conflictCoordinator.markReviewed(fileId, reviewed) }
+  continueConflictResolution(): void { this.conflictCoordinator.continueBatch() }
+  cancelConflictResolution(): void {
+    this.conflictCoordinator.cancel(new V4CancelledError("V4 conflict resolution cancelled by user."))
   }
 
   manualSync(): Promise<unknown> { return this.coordinator.run({ operation: "normal", trigger: "manual" }) }
@@ -411,13 +437,13 @@ export class V4PluginRuntime {
       operation: request.operation,
       trigger: request.trigger,
     })
+    const runState: V4SyncRunState = { runId: toBase64Url(randomBytes(12)), conflictCopies: new Map(), conflictCopyStages: new Map() }
     try {
       if (!this.plugin.githubClient) throw new Error("GitHub connection is not configured.")
       ;(this.plugin.githubClient as unknown as { setV4AbortSignal?(signal?: AbortSignal): void }).setV4AbortSignal?.(signal)
       throwIfV4Aborted(signal)
       let lastError: unknown
       let progressAttempt = 0
-      const runState: V4SyncRunState = { runId: toBase64Url(randomBytes(12)), conflictCopies: new Map(), conflictCopyStages: new Map() }
       for (let casAttempt = 1; casAttempt <= 3; casAttempt++) {
         try {
           throwIfV4Aborted(signal)
@@ -437,6 +463,21 @@ export class V4PluginRuntime {
             throw new Error("Remote storage mode differs. Force Push is required.")
           }
           const config = selectV4RuntimeConfig(discovered, desiredMode, this.repoId())
+          const scopeSignature = JSON.stringify({
+            configDir: this.plugin.app.vault.configDir || ".obsidian",
+            pluginId: this.plugin.manifest.id,
+            ignorePathRegex: this.plugin.settings.ignorePathRegex,
+            syncObsidianConfig: this.plugin.settings.syncObsidianConfig,
+            syncBookmarks: this.plugin.settings.syncBookmarks,
+            syncPlugins: this.plugin.settings.syncPlugins,
+          })
+          const conflictContextKey = await buildV4ConflictContextKey({
+            repoId: config.repoId,
+            mode: config.mode,
+            pathLayout: config.pathLayout ?? expectedV4PathLayout(config.mode),
+            settingsGeneration: this.credentialGeneration,
+            scopeSignature,
+          })
           this.progressStore.update({ phase: "loading-index", currentPath: undefined, currentDirection: undefined })
           const index = await this.loadIndex(config)
           const previousShardHashes = { ...index.shardHashes }
@@ -488,7 +529,8 @@ export class V4PluginRuntime {
             keyring,
             conflictPolicy: this.plugin.settings.conflictPolicy,
             abortChangePercent: this.plugin.settings.abortChangePercent,
-            askConflict: input => this.askConflict(input.path),
+            resolveConflictBatch: (batchRequest, batchSignal) => this.resolveConflictBatch(batchRequest, batchSignal),
+            conflictContextKey,
             includePath,
             runState,
             recoveryStore,
@@ -508,6 +550,7 @@ export class V4PluginRuntime {
             : undefined
           const recoveryRunId = result.recoveryRunId ?? recoveredRunId
           if (recoveryRunId) await markV4RecoveryIndexCommitted(recoveryStore, recoveryRunId)
+          this.conflictCoordinator.completeRun(runState.runId!)
           if (result.changedFiles === 0 && request.trigger === "manual") new Notice("GitHub Sync: No changes")
           this.progressStore.finish(result.changedFiles === 0 ? "no-change" : "success", { lastSyncTime: Date.now() })
           syncConsoleLog(this.plugin.settings, "info", "V4 sync completed", {
@@ -542,7 +585,11 @@ export class V4PluginRuntime {
       }
       throw lastError
     } catch (error) {
-      if (error instanceof V4CancelledError) return { changedFiles: 0 }
+      if (error instanceof V4CancelledError) {
+        this.progressStore.finish("cancelled")
+        return { changedFiles: 0 }
+      }
+      this.conflictCoordinator.completeRun(runState.runId!)
       const message = (error as Error).message
       const snapshot = this.progressStore.snapshot
       syncConsoleLog(this.plugin.settings, "warn", "V4 sync failed", {
@@ -563,28 +610,6 @@ export class V4PluginRuntime {
         if (this.coordinator.pendingCount > 0) this.beginWaitingRun()
       }
     }
-  }
-
-  private async askConflict(path: string): Promise<V4ConflictResolution> {
-    return new Promise(resolve => {
-      const modal = new Modal(this.plugin.app)
-      let settled = false
-      const finish = (resolution: V4ConflictResolution) => {
-        if (settled) return
-        settled = true
-        modal.close()
-        resolve(resolution)
-      }
-      modal.onClose = () => { if (!settled) { settled = true; resolve({ action: "ask" }) } }
-      modal.titleEl.setText("Resolve sync conflict")
-      modal.contentEl.createEl("p", { text: `Both local and remote changed: ${path}` })
-      const buttons = modal.contentEl.createDiv()
-      buttons.createEl("button", { text: "Keep both" }).onclick = () => finish({ action: "keep-local-copy-remote" })
-      buttons.createEl("button", { text: "Use local" }).onclick = () => finish({ action: "use-local" })
-      buttons.createEl("button", { text: "Use remote" }).onclick = () => finish({ action: "use-remote" })
-      buttons.createEl("button", { text: "Cancel" }).onclick = () => finish({ action: "ask" })
-      modal.open()
-    })
   }
 
   private async confirmThresholdOverride(error: V4ChangeGuardError, operation: "forcePush" | "forcePull"): Promise<boolean> {

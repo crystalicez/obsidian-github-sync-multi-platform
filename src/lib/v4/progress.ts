@@ -1,7 +1,7 @@
 import type { V4SyncOperation } from "./planner";
 import type { V4SyncTrigger } from "./sync-coordinator";
 
-export type V4SyncLifecycle = "idle" | "waiting" | "active" | "success" | "no-change" | "failed";
+export type V4SyncLifecycle = "idle" | "waiting" | "active" | "success" | "no-change" | "failed" | "cancelled";
 export type V4SyncPhase =
   | "debouncing"
   | "checking-remote"
@@ -74,7 +74,7 @@ const phaseLabels: Record<V4SyncPhase, string> = {
   "scanning-local": "Scanning local",
   "planning": "Planning",
   "blocked": "Blocked",
-  "resolving-conflicts": "Resolving conflicts",
+  "resolving-conflicts": "Waiting for conflict resolution",
   "downloading": "Downloading",
   "applying": "Applying",
   "hashing": "Hashing",
@@ -335,7 +335,7 @@ export class V4ProgressStore {
     if (metadataChanged) this.publishEligibleState();
   }
 
-  finish(lifecycle: Extract<V4SyncLifecycle, "success" | "no-change" | "failed">, patch: V4SyncProgressPatch = {}): void {
+  finish(lifecycle: Extract<V4SyncLifecycle, "success" | "no-change" | "failed" | "cancelled">, patch: V4SyncProgressPatch = {}): void {
     if (this.disposed) return;
     const now = this.observeMonotonicNow();
     if (this.throttlePending) this.flushPendingSensitive(now);

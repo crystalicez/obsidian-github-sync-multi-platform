@@ -805,7 +805,7 @@ test("v4 runtime progress stays out of plugin data, local index files, and the r
   assert.match(mainSource, /startupSyncTimeout:\s*number\s*\|\s*null/u);
   assert.match(mainSource, /if \(this\.startupSyncTimeout !== null\) window\.clearTimeout\(this\.startupSyncTimeout\)/u);
   assert.match(mainSource, /onunload\(\)[\s\S]*?clearTimeout\(this\.startupSyncTimeout\)/u);
-  assert.match(mainSource, /const runtime = this\.v4Runtime;?[\s\S]*?if \(runtime && !runtime\.isSyncing\)/u);
+  assert.match(mainSource, /const runtime = this\.v4Runtime;?[\s\S]*?if \(!runtime \|\| this\.unloaded\) return[\s\S]*?if \(runtime\.hasPendingConflicts\)[\s\S]*?if \(!runtime\.isSyncing\) void runtime\.manualSync\(\)/u);
   fixture.runtime.dispose();
 });
 
@@ -1122,7 +1122,7 @@ test("v4 runtime keyring cache reuses one derived keyring until credential gener
   fixture.runtime.dispose()
 })
 
-test("main settings save invalidates the runtime credential generation before future sync work", async () => {
+test("main settings save invalidates credential generation except for presentation-only changes", async () => {
   const source = await readFile("src/main.ts", "utf8")
-  assert.match(source, /async saveSettings\(\)[\s\S]*?v4Runtime\?\.credentialsChanged\(\)/u)
+  assert.match(source, /async saveSettings\(options: \{ presentationOnly\?: boolean \} = \{\}\)[\s\S]*?if \(!options\.presentationOnly\) this\.v4Runtime\?\.credentialsChanged\(\)/u)
 })

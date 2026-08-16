@@ -27,6 +27,7 @@ export interface PluginSettings {
   syncPlugins: boolean
   abortChangePercent: number
   conflictPolicy: "copy" | "newer" | "merge" | "ask"
+  conflictViewMode: "auto" | "split" | "unified"
   statusBarStatusEnabled: boolean
   consoleLoggingEnabled: boolean
 
@@ -62,6 +63,7 @@ export const DEFAULT_SETTINGS: PluginSettings = {
   syncPlugins: false,
   abortChangePercent: 0,
   conflictPolicy: "copy",
+  conflictViewMode: "auto",
   lastSyncTime: 0,
   vault: "defaultVault",
   statusBarStatusEnabled: true,
@@ -98,8 +100,13 @@ export class SettingTab extends PluginSettingTab {
       const saveBtn = btnContainer.createEl("button", { text: "Save changes", cls: "mod-cta" })
       saveBtn.onclick = async () => {
         if (this.tempSettings) {
+          const changedKeys = Object.keys(this.tempSettings).filter(key =>
+            JSON.stringify((this.tempSettings as unknown as Record<string, unknown>)[key])
+              !== JSON.stringify((this.plugin.settings as unknown as Record<string, unknown>)[key]),
+          )
+          const presentationOnly = changedKeys.length > 0 && changedKeys.every(key => key === "conflictViewMode")
           this.plugin.settings = JSON.parse(JSON.stringify(this.tempSettings))
-          await this.plugin.saveSettings()
+          await this.plugin.saveSettings({ presentationOnly })
           this.plugin.initGitHubClient()
           this.plugin.updateStatusBar()
           new Notice("GitHub Sync: Settings saved")
@@ -490,11 +497,26 @@ export class SettingTab extends PluginSettingTab {
         dropdown
           .addOption("copy", "Copy policy")
           .addOption("newer", "Newer")
-          .addOption("merge", "Merge text")
+          .addOption("merge", "Merge text; ask when unresolved")
           .addOption("ask", "Always ask")
           .setValue(this.tempSettings!.conflictPolicy)
           .onChange((value) => {
             this.tempSettings!.conflictPolicy = value as "copy" | "newer" | "merge" | "ask"
+            this.updateDirtyState()
+          })
+      )
+
+    new Setting(set)
+      .setName("Conflict editor layout")
+      .setDesc("Choose Auto for Split on desktop and Unified on mobile, or force a layout on all devices.")
+      .addDropdown((dropdown) =>
+        dropdown
+          .addOption("auto", "Auto")
+          .addOption("split", "Split")
+          .addOption("unified", "Unified")
+          .setValue(this.tempSettings!.conflictViewMode)
+          .onChange((value) => {
+            this.tempSettings!.conflictViewMode = value as "auto" | "split" | "unified"
             this.updateDirtyState()
           })
       )
