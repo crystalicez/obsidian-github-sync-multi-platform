@@ -1,0 +1,39 @@
+name: Agent Apply Copy Guard Fix
+
+on:
+  push:
+    branches:
+      - agent/conflict-copy-guard-red
+    paths:
+      - .github/workflows/agent-apply-copy-guard-fix.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: agent/conflict-copy-guard-red
+      - name: Guard reserved keep-both target before publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('src/lib/v4/sync-session.ts')
+          s = p.read_text()
+          old = '''        const copyPath = reservedCopy.path\n        const copyFileId = reservedCopy.fileId\n        const carriedStage = syntheticConflictCopyIds.has(copyFileId)\n'''
+          new = '''        const copyPath = reservedCopy.path\n        const copyFileId = reservedCopy.fileId\n        if (this.input.recoveryStore) {\n          acceptedConflictLocalGuards.push({\n            fileId: copyFileId,\n            displayPath: copyPath,\n            local: { exists: false },\n            absentPaths: [copyPath],\n          })\n        }\n        const carriedStage = syntheticConflictCopyIds.has(copyFileId)\n'''
+          if s.count(old) != 1:
+              raise SystemExit(f'expected one keep-both insertion point, got {s.count(old)}')
+          p.write_text(s.replace(old, new, 1))
+          PY
+          git config user.name 'OpenAI Agent'
+          git config user.email 'agent@openai.local'
+          git add src/lib/v4/sync-session.ts
+          git commit -m 'fix: guard keep-both target before publish'
+          git push origin HEAD:refs/heads/agent/conflict-copy-guard-red
