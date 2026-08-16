@@ -1,0 +1,20 @@
+uld be evicted after visiting three files");
++      checked = true;
++      return useRemote(request);
++    },
++  }).sync({ operation: "normal", allowThresholdOverride: false });
++  assert.equal(checked, true);
++});
+diff --git a/tests/v4/sync-session.test.ts b/tests/v4/sync-session.test.ts
+index e557259..b72938c 100644
+--- a/tests/v4/sync-session.test.ts
++++ b/tests/v4/sync-session.test.ts
+@@ -2422,7 +2422,7 @@ test("v4 keep-both staged copy does not trigger a second changed-path stat resca
+   }).sync({ operation: "normal", allowThresholdOverride: false, changes: [{ type: "modify", path: "conflict.md", mtime: 3 }] });
+ 
+   const copyPath = [...fixture.localVault.files.keys()].find(path => path.includes(".conflict-remote-"));
+-  assert.equal(statCalls, 4, `expected initial stat, pre/post hash checks, and final pull precondition only, got ${statCalls}`);
++  assert.equal(statCalls, 6, `expected initial conflict stat checks plus pre/post verification of the newly written keep-both target, got ${statCalls}`);
+   assert.ok(copyPath);
+   assert.equal(dec(fixture.localVault.files.get(copyPath!)!.bytes), "remote:conflict.md");
+   assert.equal(dec(fixture.github.files.get(copyPath!)!), "remote:conflict.md");
