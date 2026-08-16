@@ -1,0 +1,105 @@
+diff --git a/src/lib/v4/sync-session.ts b/src/lib/v4/sync-session.ts
+index 12c72ba..4221e24 100644
+--- a/src/lib/v4/sync-session.ts
++++ b/src/lib/v4/sync-session.ts
+@@ -269,6 +269,12 @@ interface V4ConflictLocalGuard {
+   absentPaths: string[]
+ }
+ 
++interface V4ConflictCopyTargetGuard {
++  path: string
++  expectedHash: string
++  expectedSize: number
++}
++
+ function conflictSideSnapshot(file?: V4LogicalFile): V4ConflictSideSnapshot {
+   return file
+     ? { exists: true, path: file.path, hash: file.hash, size: file.size, mtime: file.mtime }
+@@ -491,8 +497,19 @@ export class V4SyncSession {
+       const copy = this.input.runState?.conflictCopyStages?.get(binding.change.fileId)
+       if (copy && binding.change.after?.hash === copy.stage.hash) binding.source = this.stageHandle(copy.stage)
+     }
++    const conflictBufferCacheEntries = 2
+     const prefetchedRemoteBodies = new Map<string, Uint8Array>()
++    const rememberPrefetchedRemoteBody = (fileId: string, bytes: Uint8Array): void => {
++      prefetchedRemoteBodies.delete(fileId)
++      prefetchedRemoteBodies.set(fileId, bytes)
++      while (prefetchedRemoteBodies.size > conflictBufferCacheEntries) {
++        const oldest = prefetchedRemoteBodies.keys().next().value as string | undefined
++        if (oldest === undefined) break
++        prefetchedRemoteBodies.delete(oldest)
++      }
++    }
+     const stagedCopyPulls: Array<{ pull: V4PullBinding; push?: V4PushBinding; reserved: { path: string; fileId: string; includeInSync: boolean } }> = []
++    const conflictCopyTargetGuards = new Map<string, V4ConflictCopyTargetGuard>()
+     const conflictCopyClaims = new Map<string, string>([...this.input.runState?.conflictCopies.entries() ?? []]
+       .map(([conflictFileId, copy]) => [copy.path.normalize("NFC").toLowerCase(), conflictFileId] as const))
+     let conflictCopyOccupiedPaths: Set<string> | undefined
+@@ -558,7 +575,11 @@ export class V4SyncSession {
+       if (!meta) return Promise.reject(new Error(`Unknown V4 conflict file: ${fileId}`))
+       if (generation !== conflictGeneration) return Promise.reject(new Error("V4 conflict generation is stale."))
+       const cached = materializedCache.get(fileId)
+-      if (cached) return cached
++      if (cached) {
++        materializedCache.delete(fileId)
++        materializedCache.set(fileId, cached)
++        return cached
++      }
+       const promise = (async (): Promise<V4ConflictMaterializedFile> => {
+         assertConflictGeneration()
+         if (!meta.summary.textCandidate || !meta.conflict.base || !meta.conflict.local || !meta.conflict.remote || !meta.baseRecord || !meta.remoteRecord) {
+@@ -572,7 +593,7 @@ export class V4SyncSession {
+         const localBytes = await this.readLocal(meta.conflict.local.path)
+         assertConflictGeneration()
+         const remoteBytes = await this.readRecord(meta.remoteRecord, remoteCommitSha)
+-        prefetchedRemoteBodies.set(meta.remoteRecord.fileId, remoteBytes)
++        rememberPrefetchedRemoteBody(meta.remoteRecord.fileId, remoteBytes)
+         assertConflictGeneration()
+         const baseBytes = meta.remoteRecord.remoteVersion === meta.baseRecord.remoteVersion
+           ? new Uint8Array(remoteBytes)
+@@ -599,6 +620,11 @@ export class V4SyncSession {
+         }
+       })()
+       materializedCache.set(fileId, promise)
++      while (materializedCache.size > conflictBufferCacheEntries) {
++        const oldest = materializedCache.keys().next().value as string | undefined
++        if (oldest === undefined) break
++        materializedCache.delete(oldest)
++      }
+       return promise
+     }
+ 
+@@ -809,6 +835,7 @@ export class V4SyncSession {
+         if (!reservedCopy) throw new Error(`Failed to reserve V4 conflict copy path: ${conflict.fileId}`)
+         const copyPath = reservedCopy.path
+         const copyFileId = reservedCopy.fileId
++        conflictCopyTargetGuards.set(copyFileId, { path: copyPath, expectedHash: conflict.remote.hash, expectedSize: conflict.remote.size })
+         const carriedStage = syntheticConflictCopyIds.has(copyFileId)
+           ? this.input.runState?.conflictCopyStages?.get(copyFileId)?.stage
+           : undefined
+@@ -1238,8 +1265,27 @@ export class V4SyncSession {
+       })
+       : undefined
+     preserveStagesForRecovery = !!recoverySnapshot && (recoveryPlan?.payload.mutations.length ?? 0) > 0
+-    if (acceptedConflictLocalGuards.length > 0) await this.assertConflictLocalGuards(acceptedConflictLocalGuards)
+-    await deferV4Cancellation(this.input.signal, () => publishV4CandidateRef(this.input.github, candidate, this.input.signal))
++    try {
++      if (acceptedConflictLocalGuards.length > 0) await this.assertConflictLocalGuards(acceptedConflictLocalGuards)
++      if (conflictCopyTargetGuards.size > 0) {
++        await this.assertConflictCopyTargetGuards([...conflictCopyTargetGuards.values()], !!this.input.recoveryStore)
++      }
++    } catch (error) {
++      if (error instanceof V4ConflictReplanRequiredError) {
++        preserveStagesForRecovery = false
++        this.discardUnpublishedSyncedConflictCopies(allRemoteRecords)
++      }
++      throw error
++    }
++    try {
++      await deferV4Cancellation(this.input.signal, () => publishV4CandidateRef(this.input.github, candidate, this.input.signal))
++    } catch (error) {
++      if (/branch head changed|stale ref/iu.test((error as Error)?.message ?? "")) {
++        preserveStagesForRecovery = false
++        this.discardUnpublishedSyncedConflictCopies(allRemoteRecords)
++      }
++    
