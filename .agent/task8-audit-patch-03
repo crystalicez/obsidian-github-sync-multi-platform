@@ -1,0 +1,107 @@
+c("CASE COLLISION\n"), mtime: 101 });
++  };
++
++  await assert.rejects(new V4SyncSession({
++    github: fixture.github,
++    vault: fixture.localVault,
++    index: fixture.localIndex,
++    config,
++    conflictPolicy: "ask",
++    abortChangePercent: 0,
++    recoveryStore,
++    runState,
++    now: () => 100,
++    resolveConflictBatch: async request => keepBoth(request),
++  }).sync({ operation: "normal", allowThresholdOverride: false, changes: [{ type: "modify", path: "note.md", mtime: 3 }] }), /replan|target changed|precondition|local/iu);
++
++  assert.equal(fixture.github.refUpdates, 0, "case-folded late collision must be detected before publishing the candidate ref");
++  assert.equal(dec(fixture.localVault.files.get(collisionPath)!.bytes), "CASE COLLISION\n");
++});
+diff --git a/tests/resource/conflict-workspace-resource.test.ts b/tests/resource/conflict-workspace-resource.test.ts
+index 99b487b..d6dbe88 100644
+--- a/tests/resource/conflict-workspace-resource.test.ts
++++ b/tests/resource/conflict-workspace-resource.test.ts
+@@ -181,3 +181,53 @@ test("multi-gap repeated-line conflict exceeding total DP budget downgrades with
+   assert.equal(result.mode, "file");
+   assert.match(result.downgradeReason ?? "", /budget/iu);
+ });
++
++test("session materialization cache evicts inactive conflict buffers instead of retaining every visited file", async () => {
++  const baseFiles = { "a.md": "base a\n", "b.md": "base b\n", "c.md": "base c\n" };
++  const github = new MemoryGitHub();
++  const remoteVault = new MemoryVault();
++  for (const [path, content] of Object.entries(baseFiles)) remoteVault.files.set(path, { bytes: enc(content), mtime: 1 });
++  const remoteIndex = createEmptyV4LocalIndex({ repoId: config.repoId, deviceId: "remote", mode: "plaintext" });
++  await new V4SyncSession({ github, vault: remoteVault, index: remoteIndex, config, conflictPolicy: "copy", abortChangePercent: 0 })
++    .sync({ operation: "forcePush", allowThresholdOverride: false });
++
++  const localVault = new MemoryVault();
++  localVault.files = new Map([...remoteVault.files].map(([path, file]) => [path, { bytes: new Uint8Array(file.bytes), mtime: file.mtime }]));
++  const localIndex = structuredClone(remoteIndex) as V4LocalIndex;
++  localIndex.deviceId = "local";
++
++  const remoteChanges: Array<{ type: "modify"; path: string; mtime: number }> = [];
++  for (const path of Object.keys(baseFiles)) {
++    remoteVault.files.set(path, { bytes: enc(`remote ${path}\n`), mtime: 2 });
++    localVault.files.set(path, { bytes: enc(`local ${path}\n`), mtime: 3 });
++    remoteChanges.push({ type: "modify", path, mtime: 2 });
++  }
++  await new V4SyncSession({ github, vault: remoteVault, index: remoteIndex, config, conflictPolicy: "copy", abortChangePercent: 0 })
++    .sync({ operation: "normal", allowThresholdOverride: false, changes: remoteChanges });
++
++  let checked = false;
++  await new V4SyncSession({
++    github,
++    vault: localVault,
++    index: localIndex,
++    config,
++    conflictPolicy: "ask",
++    abortChangePercent: 0,
++    resolveConflictBatch: async request => {
++      assert.equal(request.files.length, 3);
++      const first = await request.materialize(request.files[0].fileId, request.generation);
++      await request.materialize(request.files[1].fileId, request.generation);
++      await request.materialize(request.files[2].fileId, request.generation);
++      const firstAgain = await request.materialize(request.files[0].fileId, request.generation);
++      assert.notStrictEqual(firstAgain, first, "the oldest materialized conflict should be evicted after visiting three files");
++      checked = true;
++      return {
++        runId: request.runId,
++        generation: request.generation,
++        files: request.files.map(file => ({ fileId: file.fileId, fingerprint: file.fingerprint, kind: "use-remote" as const })),
++      };
++    },
++  }).sync({ operation: "normal", allowThresholdOverride: false, changes: Object.keys(baseFiles).map(path => ({ type: "modify" as const, path, mtime: 3 })) });
++
++  assert.equal(checked, true);
++});
+diff --git a/tests/v4/conflict-session.test.ts b/tests/v4/conflict-session.test.ts
+index bfb6358..024265f 100644
+--- a/tests/v4/conflict-session.test.ts
++++ b/tests/v4/conflict-session.test.ts
+@@ -228,3 +228,31 @@ test("divergent rename materializes as a file-level structural conflict", async
+   assert.equal(textCandidate, false);
+   assert.equal(materializedMode, "file");
+ });
++
++test("materialization cache evicts the oldest visited conflict instead of retaining the whole batch", async () => {
++  const fixture = await divergeSamePaths(
++    { "a.md": "base a\n", "b.md": "base b\n", "c.md": "base c\n" },
++    path => `remote ${path}\n`,
++    path => `local ${path}\n`,
++  );
++  let checked = false;
++  await new V4SyncSession({
++    github: fixture.github,
++    vault: fixture.localVault,
++    index: fixture.localIndex,
++    config: config(),
++    conflictPolicy: "ask",
++    abortChangePercent: 0,
++    resolveConflictBatch: async request => {
++      assert.equal(request.files.length, 3);
++      const first = await request.materialize(request.files[0].fileId, request.generation);
++      await request.materialize(request.files[1].fileId, request.generation);
++      await request.materialize(request.files[2].fileId, request.generation);
++      const firstAgain = await request.materialize(request.files[0].fileId, request.generation);
++      assert.notStrictEqual(firstAgain, first, "the oldest conflict materialization sho
