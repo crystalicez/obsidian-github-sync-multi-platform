@@ -1,0 +1,45 @@
+name: Agent Apply Prefetch Bound
+
+on:
+  push:
+    branches:
+      - agent/conflict-prefetch-red
+    paths:
+      - .github/workflows/agent-apply-prefetch-bound.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: agent/conflict-prefetch-red
+      - name: Bound remote prefetch independently of materialization timing
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('src/lib/v4/sync-session.ts')
+          s = p.read_text()
+          old = '    const prefetchedRemoteBodies = new Map<string, Uint8Array>()\n'
+          new = '''    const prefetchedRemoteBodies = new Map<string, Uint8Array>()\n    const rememberPrefetchedRemoteBody = (fileId: string, bytes: Uint8Array): void => {\n      prefetchedRemoteBodies.delete(fileId)\n      prefetchedRemoteBodies.set(fileId, bytes)\n      while (prefetchedRemoteBodies.size > 3) {\n        const oldestFileId = prefetchedRemoteBodies.keys().next().value\n        if (oldestFileId === undefined) break\n        prefetchedRemoteBodies.delete(oldestFileId)\n      }\n    }\n'''
+          if s.count(old) != 1:
+              raise SystemExit(f'expected one prefetch map declaration, got {s.count(old)}')
+          s = s.replace(old, new, 1)
+          old2 = '        prefetchedRemoteBodies.set(meta.remoteRecord.fileId, remoteBytes)\n'
+          new2 = '        rememberPrefetchedRemoteBody(meta.remoteRecord.fileId, remoteBytes)\n'
+          if s.count(old2) != 1:
+              raise SystemExit(f'expected one prefetch write, got {s.count(old2)}')
+          s = s.replace(old2, new2, 1)
+          p.write_text(s)
+          PY
+          git config user.name 'OpenAI Agent'
+          git config user.email 'agent@openai.local'
+          git add src/lib/v4/sync-session.ts
+          git commit -m 'fix: bound concurrent conflict prefetches'
+          git push origin HEAD:refs/heads/agent/conflict-prefetch-red
