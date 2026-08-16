@@ -1,3 +1,5 @@
+import { V4_MAX_TEXT_DIFF_BYTES } from "./text-diff";
+
 export type V4ConflictPolicy = "copy" | "newer" | "merge" | "ask";
 export type V4ConflictAction = "keep-local-copy-remote" | "use-local" | "use-remote" | "merged" | "ask";
 
@@ -7,7 +9,7 @@ export interface V4ConflictResolution {
 }
 
 const TEXT_EXTENSIONS = new Set(["md", "txt", "json", "canvas", "yaml", "yml", "csv", "css", "scss", "js", "ts", "tsx", "jsx", "html", "xml"]);
-export const V4_MAX_MERGE_BYTES = 2 * 1024 * 1024;
+export const V4_MAX_MERGE_BYTES = V4_MAX_TEXT_DIFF_BYTES;
 
 export function canAttemptV4TextMerge(path: string, sizes: readonly number[]): boolean {
   const extension = path.split(".").at(-1)?.toLowerCase() ?? "";
