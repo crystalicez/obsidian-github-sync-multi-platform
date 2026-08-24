@@ -63,31 +63,38 @@ if (!compileOnly) {
 }
 
 const outDir = path.join(root, ".tmp", "github-e2e", `${process.pid}-${Date.now()}`);
-const entry = "tests/github-e2e/v4-real-github-e2e.test.ts";
-const outfile = path.join(outDir, "v4-real-github-e2e.test.mjs");
+const entries = [
+  "tests/github-e2e/v4-real-github-e2e.test.ts",
+  "tests/github-e2e/v4-encrypted-external-mutation.test.ts",
+];
 
 await rm(outDir, { recursive: true, force: true });
 await mkdir(outDir, { recursive: true });
 
-await build({
-  entryPoints: [path.join(root, entry)],
-  outfile,
-  bundle: true,
-  platform: "node",
-  format: "esm",
-  target: "node22",
-  alias: {
-    obsidian: path.join(root, "tests", "stubs", "obsidian.ts"),
-  },
-  logLevel: "silent",
-});
+const outfiles = [];
+for (const entry of entries) {
+  const outfile = path.join(outDir, path.basename(entry).replace(/\.ts$/u, ".mjs"));
+  await build({
+    entryPoints: [path.join(root, entry)],
+    outfile,
+    bundle: true,
+    platform: "node",
+    format: "esm",
+    target: "node22",
+    alias: {
+      obsidian: path.join(root, "tests", "stubs", "obsidian.ts"),
+    },
+    logLevel: "silent",
+  });
+  outfiles.push(outfile);
+}
 
 if (compileOnly) {
-  console.log(`GitHub E2E bundle compiled: ${outfile}`);
+  for (const outfile of outfiles) console.log(`GitHub E2E bundle compiled: ${outfile}`);
   process.exit(0);
 }
 
-const result = spawnSync(process.execPath, ["--test", outfile], {
+const result = spawnSync(process.execPath, ["--test", "--test-concurrency=1", ...outfiles], {
   cwd: root,
   stdio: "inherit",
   env: process.env,
