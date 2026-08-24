@@ -1,32 +1,97 @@
-﻿name: Build plugin
+name: Stable Release
 
-# 触发条件配置
 on:
-  push:
-    # 针对 master 分支的普通提交也触发
-    branches:
-      - "master"
-    tags:
-      - "*"
-    paths:
-      - "manifest.json"
-# 权限配置：允许脚本写入仓库内容（用于发布 Release）
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Stable version to release (x.y.z)
+        required: true
+        type: string
+
 permissions:
+  actions: read
   contents: write
+
+concurrency:
+  group: stable-release
+  cancel-in-progress: false
 
 env:
   NAME: ${{ github.event.repository.name }}
 
 jobs:
-  build:
+  release:
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ github.ref }} # 明确 checkout 触发 workflow 的分支
-          # 获取所有历史记录，为了确保能获取到 git tags
-          fetch-depth: 0 # Required to fetch tags
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Verify release target and metadata
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          test "$GITHUB_REF" = "refs/heads/master"
+          test "$(jq -r .version manifest.json)" = "$VERSION"
+          test "$(jq -r .version package.json)" = "$VERSION"
+          min_app=$(jq -r .minAppVersion manifest.json)
+          test "$(jq -r --arg version "$VERSION" '.[$version]' versions.json)" = "$min_app"
+          current_master=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/master" --jq .object.sha)
+          test "$current_master" = "$GITHUB_SHA"
+          if git show-ref --verify --quiet "refs/tags/$VERSION"; then
+            echo "Stable tag already exists: $VERSION" >&2
+            exit 1
+          fi
+          if gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release already exists: $VERSION" >&2
+            exit 1
+          fi
+          highest=$(git tag --list | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1 || true)
+          if [ -n "$highest" ]; then
+            CURRENT_VERSION="$highest" TARGET_VERSION="$VERSION" node - <<'NODE'
+          const current = process.env.CURRENT_VERSION.split(".").map(Number);
+          const target = process.env.TARGET_VERSION.split(".").map(Number);
+          let comparison = 0;
+          for (let index = 0; index < 3; index++) {
+            if (target[index] !== current[index]) {
+              comparison = target[index] - current[index];
+              break;
+            }
+          }
+          if (comparison <= 0) {
+            console.error(`Release version ${process.env.TARGET_VERSION} must be greater than ${process.env.CURRENT_VERSION}`);
+            process.exit(1);
+          }
+          NODE
+          fi
+
+      - name: Require exact-SHA live GitHub qualification
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          qualified=false
+          mapfile -t run_ids < <(gh api \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/github-e2e-live.yml/runs?head_sha=$GITHUB_SHA&event=workflow_dispatch&status=completed&per_page=100" \
+            --jq '.workflow_runs[] | select(.conclusion == "success" and .head_branch == "master" and .head_sha == env.GITHUB_SHA) | .id')
+          for run_id in "${run_ids[@]}"; do
+            jobs=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/jobs?per_page=100")
+            qualify_count=$(jq '[.jobs[] | select(.name == "qualify" and .conclusion == "success")] | length' <<<"$jobs")
+            cleanup_count=$(jq '[.jobs[] | select(.name == "cleanup" and .conclusion == "success")] | length' <<<"$jobs")
+            if [ "$qualify_count" -ge 1 ] && [ "$cleanup_count" -ge 1 ]; then
+              echo "Using live qualification run $run_id for $GITHUB_SHA"
+              qualified=true
+              break
+            fi
+          done
+          if [ "$qualified" != true ]; then
+            echo "No successful exact-SHA GitHub E2E qualification with qualify+cleanup success for $GITHUB_SHA" >&2
+            exit 1
+          fi
 
       - uses: pnpm/action-setup@v4
 
@@ -34,110 +99,64 @@ jobs:
         uses: actions/setup-node@v6
         with:
           node-version-file: ".node-version"
+          cache: pnpm
 
-      # 核心逻辑：检查版本号变更
-      - name: Check Version
-        id: check_version
-        run: |
-          # 如果是 master 分支触发
-          if [[ "${{ github.ref }}" == "refs/heads/master" ]]; then
-            echo "Triggered by master branch. Checking for version bump..."
+      - name: Install
+        run: pnpm install --frozen-lockfile
 
-            # 获取上一个 commit 的版本号
-            LAST_VERSION=$(git show HEAD~1:manifest.json | jq -r .version)
+      - name: Build
+        run: pnpm build
 
-            # 从 manifest.json 中读取当前版本号
-            CURRENT_VERSION=$(jq -r .version manifest.json)
+      - name: Fast tests
+        run: pnpm test
 
-            echo "Last Version: $LAST_VERSION"
-            echo "Current Version: $CURRENT_VERSION"
+      - name: Repeat fast tests
+        run: pnpm test:repeat
 
-            # 对比版本号
-            if [ "$LAST_VERSION" = "$CURRENT_VERSION" ]; then
-               echo "Version has not changed. Skipping."
-               # 输出变量 should_release = false，后续步骤会通过 if 判断跳过
-               echo "should_release=false" >> $GITHUB_OUTPUT
-            else
-               # check if current > last
-               # 使用 sort -V 进行版本号大小比较
-               # 取较大值
-               HIGHER_VERSION=$(echo -e "$LAST_VERSION\n$CURRENT_VERSION" | sort -V | tail -n 1)
-               if [ "$HIGHER_VERSION" = "$CURRENT_VERSION" ]; then
-                   echo "New version detected!"
-                   # 确认需要发布
-                   echo "should_release=true" >> $GITHUB_OUTPUT
-                   # 设置发布的 tag 名称为当前版本号
-                   echo "release_tag=$CURRENT_VERSION" >> $GITHUB_OUTPUT
-               else
-                   echo "Current version $CURRENT_VERSION is lower than $LAST_VERSION. Skipping."
-                   echo "should_release=false" >> $GITHUB_OUTPUT
-               fi
-            fi
-          else
-            # 如果是 tag 触发 (手动打 tag 推送)
-            echo "Triggered by tag ${{ github.ref }}. Proceeding with release."
-            echo "should_release=true" >> $GITHUB_OUTPUT
-            echo "release_tag=${{ github.ref_name }}" >> $GITHUB_OUTPUT
-          fi
-      - name: Prepare Commit Message
-        id: prepare
-        if: steps.check_version.outputs.should_release == 'true'
-        run: |
-          # 获取提交文本信息
-          msg=$(git log -1 --pretty=%B)
+      - name: Recovery tests
+        run: pnpm test:recovery
 
-          # 设置 Python 进行翻译
-          pip install deep-translator > /dev/null 2>&1 || true
+      - name: Resource tests
+        run: pnpm test:resource
 
-          # 运行翻译脚本
-          export COMMIT_MSG="$msg"
+      - name: Feasibility tests
+        run: pnpm test:feasibility
 
-          echo "commit_msg<<EOF" >> $GITHUB_OUTPUT
-          if [ -f "scripts/translate_commit.py" ]; then
-              python3 scripts/translate_commit.py >> $GITHUB_OUTPUT
-          else
-              echo "未找到翻译脚本，使用原始消息"
-              echo "$msg" >> $GITHUB_OUTPUT
-          fi
-          echo "EOF" >> $GITHUB_OUTPUT
-      - name: Build and verify release
-        id: build
-        # 只有在 check_version 步骤输出 should_release 为 true 时才执行
-        if: steps.check_version.outputs.should_release == 'true'
-        run: |
-          pnpm install --frozen-lockfile
-          pnpm run build
-          pnpm test
-          pnpm test:repeat
-          pnpm test:recovery
-          pnpm test:resource
-          pnpm test:feasibility
-          GITHUB_E2E_COMPILE_ONLY=1 pnpm test:github-e2e:quick
-          pnpm validate:package
-          mkdir ${{ env.NAME }}
-          cp main.js manifest.json styles.css ${{ env.NAME }}
-          zip -r ${{ env.NAME }}-v${{ steps.check_version.outputs.release_tag }}.zip ${{ env.NAME }}
-          ls
-          # 设置输出变量 tag_name
-          echo "tag_name=${{ steps.check_version.outputs.release_tag }}" >> $GITHUB_OUTPUT
+      - name: Compile real GitHub E2E harness
+        run: GITHUB_E2E_COMPILE_ONLY=1 pnpm test:github-e2e:quick
 
-      - name: Create Release
-        if: steps.check_version.outputs.should_release == 'true'
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.check_version.outputs.release_tag }}
-          name: ${{ steps.check_version.outputs.release_tag }}
-          draft: false
-          prerelease: false
-          generate_release_notes: true
-          body: ${{ steps.prepare.outputs.commit_msg }}
-          target_commitish: ${{ github.sha }} # 明确指定在当前分支的 commit 上创建 tag
-          overwrite_files: true
-          files: |
-            ${{ env.NAME }}-v${{ steps.check_version.outputs.release_tag }}.zip
-            main.js
-            manifest.json
-            styles.css
+      - name: Validate package
+        run: pnpm validate:package
+
+      - name: Recheck master immediately before publication
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          current_master=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/master" --jq .object.sha)
+          test "$current_master" = "$GITHUB_SHA"
 
+      - name: Package plugin
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          rm -rf "$NAME"
+          mkdir "$NAME"
+          cp main.js manifest.json styles.css "$NAME/"
+          ZIP_PATH="$NAME-v$VERSION.zip"
+          zip -r "$ZIP_PATH" "$NAME"
+          echo "ZIP_PATH=$ZIP_PATH" >> "$GITHUB_ENV"
+
+      - name: Create stable release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          gh release create "$VERSION" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "$VERSION" \
+            --generate-notes \
+            "$ZIP_PATH" main.js manifest.json styles.css
