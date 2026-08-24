@@ -54,12 +54,32 @@ function changeFrom(before: V4LogicalFile | undefined, after: V4LogicalFile | un
   return { fileId, kind: "modify", path: after!.path, before, after };
 }
 
+function v4NamespaceKey(path: string): string {
+  return path.normalize("NFC").toLowerCase();
+}
+
+function assertCombinedV4NamespaceSafe(local: V4LogicalFile[], remote: V4LogicalFile[]): void {
+  const seen = new Map<string, { fileId: string; path: string }>();
+  for (const file of [...remote, ...local]) {
+    const key = v4NamespaceKey(file.path);
+    const prior = seen.get(key);
+    if (!prior) {
+      seen.set(key, { fileId: file.fileId, path: file.path });
+      continue;
+    }
+    if (prior.fileId !== file.fileId) {
+      throw new Error(`V4 path collision across local/remote state: ${prior.path} vs ${file.path}`);
+    }
+  }
+}
+
 export function planV4Sync(input: {
   operation: V4SyncOperation;
   base: V4LogicalFile[];
   local: V4LogicalFile[];
   remote: V4LogicalFile[];
 }): V4SyncPlan {
+  assertCombinedV4NamespaceSafe(input.local, input.remote);
   const base = byFileId(input.base);
   const local = byFileId(input.local);
   const remote = byFileId(input.remote);
