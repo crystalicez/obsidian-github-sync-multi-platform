@@ -485,10 +485,10 @@ export class SettingTab extends PluginSettingTab {
 
     new Setting(set)
       .setName("File conflict policy")
-      .setDesc("Choose what to do when both local and remote changed since last sync.")
+      .setDesc("When both sides changed, keep this device's local file at its normal path and preserve the remote version as a conflict copy when Copy is selected.")
       .addDropdown((dropdown) =>
         dropdown
-          .addOption("copy", "Copy policy")
+          .addOption("copy", "Copy (keep local, preserve remote copy)")
           .addOption("newer", "Newer")
           .addOption("merge", "Merge text")
           .addOption("ask", "Always ask")
