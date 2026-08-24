@@ -4,8 +4,11 @@ import { resolveV4Conflict } from "../../src/lib/v4/conflicts";
 
 const enc = (value: string) => new TextEncoder().encode(value);
 
-test("v4 copy and newer policies are deterministic", () => {
+test("v4 copy policy keeps local primary and requests a remote conflict copy", () => {
   assert.equal(resolveV4Conflict({ policy: "copy", path: "a.bin", localMtime: 2, remoteMtime: 3 }).action, "keep-local-copy-remote");
+});
+
+test("v4 newer policy is deterministic including tie fallback", () => {
   assert.equal(resolveV4Conflict({ policy: "newer", path: "a.bin", localMtime: 4, remoteMtime: 3 }).action, "use-local");
   assert.equal(resolveV4Conflict({ policy: "newer", path: "a.bin", localMtime: 2, remoteMtime: 3 }).action, "use-remote");
   assert.equal(resolveV4Conflict({ policy: "newer", path: "a.bin", localMtime: 3, remoteMtime: 3 }).action, "keep-local-copy-remote");
