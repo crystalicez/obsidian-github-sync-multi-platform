@@ -80,3 +80,59 @@ test("v4 force operations can resolve cross-side namespace divergence", () => {
   assert.doesNotThrow(() => planV4Sync({ operation: "forcePush", base: [], local, remote }));
   assert.doesNotThrow(() => planV4Sync({ operation: "forcePull", base: [], local, remote }));
 });
+
+test("v4 normal sync allows a local delete-recreate when remote still matches the base", () => {
+  const plan = planV4Sync({
+    operation: "normal",
+    base: [file("same.md", "old-id", "base")],
+    local: [file("same.md", "new-id", "local-new")],
+    remote: [file("same.md", "old-id", "base")],
+  });
+
+  assert.deepEqual(plan.pushes.map(change => ({ fileId: change.fileId, kind: change.kind, path: change.path })), [
+    { fileId: "old-id", kind: "delete", path: "same.md" },
+    { fileId: "new-id", kind: "create", path: "same.md" },
+  ]);
+  assert.equal(plan.pulls.length, 0);
+  assert.equal(plan.conflicts.length, 0);
+});
+
+test("v4 normal sync allows a remote delete-recreate when local still matches the base", () => {
+  const plan = planV4Sync({
+    operation: "normal",
+    base: [file("same.md", "old-id", "base")],
+    local: [file("same.md", "old-id", "base")],
+    remote: [file("same.md", "new-id", "remote-new")],
+  });
+
+  assert.deepEqual(plan.pulls.map(change => ({ fileId: change.fileId, kind: change.kind, path: change.path })), [
+    { fileId: "old-id", kind: "delete", path: "same.md" },
+    { fileId: "new-id", kind: "create", path: "same.md" },
+  ]);
+  assert.equal(plan.pushes.length, 0);
+  assert.equal(plan.conflicts.length, 0);
+});
+
+test("v4 normal sync rejects replacement colliding with a concurrently changed base lineage", () => {
+  assert.throws(
+    () => planV4Sync({
+      operation: "normal",
+      base: [file("same.md", "old-id", "base")],
+      local: [file("same.md", "new-id", "local-new")],
+      remote: [file("same.md", "old-id", "remote-edited")],
+    }),
+    /V4 path collision across local\/remote state/u,
+  );
+});
+
+test("v4 normal sync rejects two independent replacements of the same base namespace", () => {
+  assert.throws(
+    () => planV4Sync({
+      operation: "normal",
+      base: [file("same.md", "old-id", "base")],
+      local: [file("same.md", "local-new-id", "local-new")],
+      remote: [file("same.md", "remote-new-id", "remote-new")],
+    }),
+    /V4 path collision across local\/remote state/u,
+  );
+});
