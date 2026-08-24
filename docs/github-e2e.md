@@ -45,11 +45,13 @@ Run:
 pnpm test:github-e2e:quick
 ```
 
-For a credential-free bundle check:
+For a credential-free bundle check on any supported shell, including PowerShell:
 
-```bash
-GITHUB_E2E_COMPILE_ONLY=1 pnpm test:github-e2e:quick
+```text
+pnpm test:github-e2e:compile
 ```
+
+The runner also accepts `node scripts/run-github-e2e.mjs --compile-only`. `GITHUB_E2E_COMPILE_ONLY=1` remains supported for CI/backward compatibility, but the package script is preferred for local use because it does not depend on shell-specific environment-variable syntax.
 
 Ordinary CI uses only this compile gate.
 
