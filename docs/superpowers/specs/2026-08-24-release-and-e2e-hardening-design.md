@@ -109,7 +109,7 @@ This avoids a breaking semantic flip during release hardening because the resolv
 Update:
 
 - English and Chinese FAQ copy-policy wording,
-- the Settings option/description to an explicit user-facing phrase such as `Copy (keep local, copy remote)`,
+- the Settings option label to exactly `Copy (keep local, preserve remote copy)` and its description to explain the same behavior,
 - E2E/test names/messages where necessary.
 
 No conflict-resolution policy is added.
@@ -263,7 +263,7 @@ The workflow must fail before destructive work if `${E2E_OWNER}/${E2E_REPO}` equ
 
 A rerun of the same workflow run reuses/reset-cleans the same derived branch; different runs use different branches and cannot delete each other's test state.
 
-Use a fine-grained token scoped only to the disposable E2E repository with the minimum repository Contents permission required for Git data/ref writes. Environment deployment-branch protection permits only `master`; no required-reviewer gate is needed for the cleanup job.
+Use a fine-grained token scoped only to the disposable E2E repository with repository Contents read/write permission and no broader mutable repository permission. Environment deployment-branch protection permits only `master`; no required-reviewer gate is needed for the cleanup job.
 
 ### 4.2 Trigger and qualified SHA
 
@@ -283,7 +283,7 @@ Use a required job with stable job id/name `qualify`. It:
 4. runs `pnpm test:github-e2e:quick` without `GITHUB_E2E_COMPILE_ONLY`,
 5. therefore executes the existing plaintext/encrypted A/B/C scenarios and controlled real ref race,
 6. adds an encrypted external-mutation safety scenario: an out-of-band commit on an encrypted V4 branch must be rejected safely, remain reachable, and never be silently overwritten,
-7. after E2E success, writes a non-secret audit manifest and uploads it.
+7. after E2E success, writes a non-secret audit manifest and attempts to upload it with the artifact-upload step marked non-blocking (`continue-on-error: true`).
 
 The current Node suite timeout is 15 minutes. Set `timeout-minutes: 25` on `qualify` to leave bounded workflow overhead without creating an unbounded run.
 
@@ -301,7 +301,7 @@ The authoritative qualification record is the exact-SHA workflow run **plus its 
 
 Requiring named successful jobs protects against an accidentally skipped qualification job producing a misleading workflow-level success.
 
-The workflow additionally uploads an audit artifact named:
+The workflow also creates a best-effort audit artifact named:
 
 ```text
 github-e2e-qualification-${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}
@@ -320,7 +320,7 @@ containing:
 }
 ```
 
-The artifact is informative; release authority does not depend on artifact retention/expiry.
+Artifact availability is not part of the qualification decision; release authority does not depend on artifact retention, artifact service availability, or expiry.
 
 ### 4.5 Cleanup resilience
 
@@ -347,7 +347,7 @@ The existing `.github/workflows/pre-release.yml` must no longer create public ta
 Convert it to **Branch Candidate Build** with exactly these triggers:
 
 - `push` to non-master branches when `manifest.json` changes, preserving the current version-candidate behavior,
-- `workflow_dispatch` for explicit candidate builds.
+- `workflow_dispatch` with a guard that rejects `master`, for explicit candidate builds.
 
 The workflow uses `contents: read` only and runs:
 
@@ -360,7 +360,7 @@ The workflow uses `contents: read` only and runs:
 - feasibility tests,
 - compile-only GitHub E2E harness,
 - package validation,
-- upload plugin artifact named with branch and SHA.
+- upload plugin artifact as `candidate-${github.sha}`.
 
 It never creates a Git tag or GitHub Release.
 
@@ -432,7 +432,7 @@ This is a policy guard, not a claim of atomic compare-and-swap with future maste
 
 ### 6.7 Release creation and partial-failure rule
 
-After every gate passes, package the plugin ZIP and use authenticated GitHub CLI/API on the hosted runner rather than a third-party release action to create the stable tag/release at exactly the qualified target SHA, generate release notes, and upload:
+After every gate passes, package the plugin ZIP and use authenticated `gh release create` on the GitHub-hosted runner to create the stable tag/release at exactly the qualified target SHA, generate release notes, and upload in the same command:
 
 - `main.js`,
 - `manifest.json`,
@@ -441,7 +441,7 @@ After every gate passes, package the plugin ZIP and use authenticated GitHub CLI
 
 No release mutation occurs before all qualification/deterministic gates pass.
 
-GitHub tag/release/asset APIs are not a single cross-resource transaction. If the publication command itself fails after mutation begins, the workflow must report a publication failure and must not pretend rollback succeeded. Maintainer docs include an inspection/cleanup command for a partial draft/tag before retry; a rerun remains fail-closed while a conflicting tag/release exists.
+GitHub tag/release/asset APIs are not a single cross-resource transaction. If `gh release create` fails after mutation begins, the workflow must report a publication failure and must not pretend rollback succeeded. Maintainer docs include exact inspection/cleanup commands for a partial release/tag before retry; a rerun remains fail-closed while a conflicting tag/release exists.
 
 ---
 
