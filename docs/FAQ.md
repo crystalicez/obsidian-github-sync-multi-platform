@@ -24,7 +24,7 @@ This FAQ describes the current V4 implementation. Qualification status for very 
 
 V4 会检测真正的三方冲突，不再采用旧版 FAQ 中描述的“409 后直接覆盖”。可选策略为：
 
-- **Copy policy**：保留远端主版本，同时把本地版本保存为冲突副本。
+- **Copy policy**：保留当前设备的本地版本在原路径，并把远端冲突版本保存为单独的冲突副本。这样不会静默覆盖用户正在当前设备上编辑的内容，同时仍保留另一条远端内容分支。
 - **Newer**：按元数据选择较新的版本；时间相同时退化为保留两份。
 - **Merge text**：只对支持的文本类型且三个已知版本都不超过 2 MiB 时尝试当前的保守三方合并；不能安全合并时保留两份。
 - **Always ask**：先让用户选择，再只读取所需的内容。
@@ -66,7 +66,7 @@ This is not block-level delta sync. When a large file's content changes, current
 
 V4 detects a three-way conflict instead of using the old “retry 409 then overwrite” behavior previously described by this FAQ. The available policies are:
 
-- **Copy policy**: keep the remote primary version and materialize the local version as a conflict copy.
+- **Copy policy**: keep this device's local version at the canonical path and preserve the competing remote version as a separate conflict copy. This avoids silently replacing the content the user is actively editing while still preserving the remote lineage.
 - **Newer**: choose by metadata; a tie keeps both.
 - **Merge text**: attempt the existing conservative 3-way text merge only for supported text types when all three known versions are at most 2 MiB; otherwise keep both.
 - **Always ask**: ask first, then load only the body required by the selected action.
