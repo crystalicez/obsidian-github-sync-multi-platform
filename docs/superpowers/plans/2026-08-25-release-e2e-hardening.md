@@ -2,46 +2,34 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Make package metadata single-source, lock the current conflict semantics with deterministic regressions, add missing namespace/race coverage, run the real GitHub E2E as an isolated credentialed qualification, and make stable release an explicit exact-SHA fail-closed operation.
+**Goal:** Make release metadata single-source, define and prove the current conflict contract, harden cross-device edge cases, execute real GitHub E2E qualification safely, and make stable release explicit and exact-SHA qualified.
 
-**Architecture:** Keep the existing V4 sync algorithm unchanged unless a new deterministic regression proves a concrete defect. Separate ordinary secret-free CI from credentialed live qualification; use exact GitHub Actions run/job metadata for release authority, and remove the existing prerelease release-bypass. Every behavior change starts from a red regression, then receives the smallest production fix.
+**Architecture:** Keep V4 production semantics unchanged unless a deterministic red regression demonstrates a concrete defect. Ordinary CI remains secret-free; live GitHub qualification runs only from `master` against a dedicated disposable repository; stable release accepts only successful live qualification for the exact current `master` SHA.
 
-**Tech Stack:** TypeScript, Node.js 22 test runner, esbuild, pnpm 9, GitHub Actions, GitHub CLI (`gh`), Obsidian plugin API.
+**Tech Stack:** TypeScript, Node.js 22 `node:test`, esbuild, pnpm 9, GitHub Actions, GitHub CLI (`gh`), Obsidian API.
 
 **Spec:** `docs/superpowers/specs/2026-08-24-release-and-e2e-hardening-design.md`
 
 ## Global Constraints
 
-- Preserve current executable Copy policy: local version remains canonical; remote version becomes a conflict copy.
-- Do not add a new runtime dependency.
-- Do not add random/sleep-based concurrency tests; races must be deterministic.
-- Do not claim strict server-side Git ref CAS; preserve pre-read + non-force update + bounded runtime replan.
-- No 5 GiB physical qualification, pack-scale benchmark, or new public alpha/beta release channel.
-- Real GitHub qualification must use a dedicated disposable repository and a unique `obsidian-sync-e2e/run-${GITHUB_RUN_ID}` branch.
-- Stable release must qualify exactly the current `master` SHA and fail closed for stale/missing/skipped qualification.
-- Production V4 changes are permitted only after a failing regression demonstrates the need.
+- Copy policy remains local-primary / remote-conflict-copy.
+- No new runtime dependency.
+- No random concurrency or correctness-by-sleep tests.
+- No claim of strict server-side Git ref CAS.
+- No 5 GiB physical qualification, pack-scale benchmark, or public alpha/beta channel.
+- Real GitHub qualification uses a dedicated disposable repository and branch `obsidian-sync-e2e/run-${GITHUB_RUN_ID}`.
+- Stable release qualifies exactly current `master`; stale/missing/skipped qualification fails closed.
+- Any V4 production change requires a failing regression first.
 
 ## File Map
 
-- `.gitignore` — canonical lockfile/secret ignores.
-- `package-lock.json` — remove non-canonical npm lockfile.
-- `scripts/update-version.js` — atomic-preflight-style version metadata bump helper.
-- `scripts/validate-package.mjs` — offline package/release metadata validator.
-- `tests/v4/release-metadata.test.mjs` — isolated temp-repo tests for the two scripts.
-- `src/setting.tsx` — make Copy policy direction explicit in Settings.
-- `docs/FAQ.md` — align English/Chinese Copy policy docs with executable behavior.
-- `tests/v4/conflicts.test.ts` — resolver contract remains local-primary.
-- `tests/v4/sync-session.test.ts` — exact conflict outcomes, namespace collision regressions, conflict-copy collision regressions.
-- `src/lib/v4/sync-session.ts` — only if namespace/copy-path regressions expose a concrete unsafe mutation path.
-- `tests/v4/sync-coordinator.test.ts` — expanded rescan causality matrix.
-- `tests/v4/runtime-retry.test.ts` — user-facing automatic publication-race retry proof.
-- `tests/github-e2e/v4-real-github-e2e.test.ts` — exact multi-device assertions and encrypted external-mutation refusal.
-- `.github/workflows/github-e2e-live.yml` — credentialed exact-SHA qualification + separate cleanup job.
-- `.github/workflows/pre-release.yml` — convert to read-only Branch Candidate Build.
-- `.github/workflows/release.yml` — explicit qualified stable release.
-- `docs/github-e2e.md` — environment/setup/run/cleanup instructions.
-- `docs/releasing.md` — maintainer candidate/qualification/release/partial-publication flow.
-- `README.md` — qualification-status wording.
+- `.gitignore`, `package-lock.json`, `scripts/update-version.js`, `scripts/validate-package.mjs`, `tests/v4/release-metadata.test.mjs` — package/version source of truth.
+- `src/setting.tsx`, `docs/FAQ.md`, `tests/v4/conflicts.test.ts`, `tests/v4/sync-session.test.ts` — conflict contract and namespace safety.
+- `tests/v4/sync-coordinator.test.ts`, `tests/v4/runtime-retry.test.ts` — causality and user-facing retry.
+- `tests/github-e2e/v4-real-github-e2e.test.ts`, `docs/github-e2e.md` — live scenario coverage.
+- `.github/workflows/github-e2e-live.yml` — credentialed qualification.
+- `.github/workflows/pre-release.yml` — artifact-only candidate build.
+- `.github/workflows/release.yml`, `docs/releasing.md`, `README.md` — stable release and maintainer flow.
 
 ---
 
@@ -56,133 +44,143 @@
 
 **Interfaces:**
 - Consumes: `package.json.version`, `manifest.json.version`, `manifest.minAppVersion`, `versions.json`, `package.json.packageManager`, Git tracked-file state.
-- Produces: `node scripts/update-version.js <patch|minor|major|x.y.z>` that computes one target version and updates package/manifest/versions metadata; `node scripts/validate-package.mjs` that fails offline on metadata/lockfile drift.
+- Produces: one-target version bump and offline release metadata validation.
 
-- [ ] **Step 1: Write failing metadata-script tests**
+- [ ] **Step 1: Write failing temp-repository tests**
 
-Create `tests/v4/release-metadata.test.mjs` using `node:test`, `node:assert/strict`, `mkdtemp`, `spawnSync`, and a helper that initializes a temporary Git repository with minimal `package.json`, `manifest.json`, `versions.json`, `pnpm-lock.yaml`, and release artifact files. Copy the repository scripts under test into the fixture before spawning them.
-
-The tests must assert these exact cases:
+Create `tests/v4/release-metadata.test.mjs` with helpers that copy the two scripts into a temporary Git repo and write canonical fixtures. Use these concrete assertions:
 
 ```js
-await t.test("version helper derives one target and updates all metadata", () => {
-  // start package/manifest at 1.2.3, minAppVersion 1.11.4
-  // run: node scripts/update-version.js patch
-  // expect package.version === "1.2.4"
-  // expect manifest.version === "1.2.4"
-  // expect versions["1.2.4"] === "1.11.4"
+import assert from "node:assert/strict";
+import { cp, mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
+import os from "node:os";
+import path from "node:path";
+import test from "node:test";
+
+const root = process.cwd();
+const run = (cwd, args, env = {}) => spawnSync(process.execPath, args, {
+  cwd,
+  encoding: "utf8",
+  env: { ...process.env, ...env },
+});
+const git = (cwd, args) => spawnSync("git", args, { cwd, encoding: "utf8" });
+const json = async (cwd, file) => JSON.parse(await readFile(path.join(cwd, file), "utf8"));
+
+async function fixture() {
+  const dir = await mkdtemp(path.join(os.tmpdir(), "ogs-release-meta-"));
+  await mkdir(path.join(dir, "scripts"));
+  await cp(path.join(root, "scripts/update-version.js"), path.join(dir, "scripts/update-version.js"));
+  await cp(path.join(root, "scripts/validate-package.mjs"), path.join(dir, "scripts/validate-package.mjs"));
+  await writeFile(path.join(dir, "package.json"), JSON.stringify({ version: "1.2.3", packageManager: "pnpm@9.12.3" }, null, 2) + "\n");
+  await writeFile(path.join(dir, "manifest.json"), JSON.stringify({ id: "fixture", version: "1.2.3", minAppVersion: "1.11.4" }, null, 2) + "\n");
+  await writeFile(path.join(dir, "versions.json"), JSON.stringify({ "1.2.3": "1.11.4" }, null, 2) + "\n");
+  await writeFile(path.join(dir, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n");
+  await writeFile(path.join(dir, "main.js"), "fixture\n");
+  await writeFile(path.join(dir, "styles.css"), "fixture\n");
+  assert.equal(git(dir, ["init"]).status, 0);
+  assert.equal(git(dir, ["add", "."]).status, 0);
+  return dir;
+}
+
+test("version helper derives one target and updates package manifest versions", async () => {
+  const dir = await fixture();
+  const result = run(dir, ["scripts/update-version.js", "patch"]);
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal((await json(dir, "package.json")).version, "1.2.4");
+  assert.equal((await json(dir, "manifest.json")).version, "1.2.4");
+  assert.equal((await json(dir, "versions.json"))["1.2.4"], "1.11.4");
 });
 
-await t.test("version helper refuses pre-existing package/manifest drift without mutation", () => {
-  // package 1.2.3, manifest 1.2.4
-  // snapshot all three JSON strings
-  // run patch => non-zero
-  // exact file contents remain equal to snapshots
+test("version helper rejects drift before mutation", async () => {
+  const dir = await fixture();
+  const manifestPath = path.join(dir, "manifest.json");
+  await writeFile(manifestPath, JSON.stringify({ id: "fixture", version: "1.2.4", minAppVersion: "1.11.4" }, null, 2) + "\n");
+  const before = await Promise.all(["package.json", "manifest.json", "versions.json"].map(file => readFile(path.join(dir, file), "utf8")));
+  const result = run(dir, ["scripts/update-version.js", "patch"]);
+  assert.notEqual(result.status, 0);
+  const after = await Promise.all(["package.json", "manifest.json", "versions.json"].map(file => readFile(path.join(dir, file), "utf8")));
+  assert.deepEqual(after, before);
 });
 
-await t.test("version helper rejects malformed, non-increasing, duplicate target", () => {
-  // reject 1.2, 1.2.3 when current is 1.2.3, and target already present in versions.json
+test("validator rejects wrong compatibility mapping", async () => {
+  const dir = await fixture();
+  await writeFile(path.join(dir, "versions.json"), JSON.stringify({ "1.2.3": "1.6.5" }, null, 2) + "\n");
+  const result = run(dir, ["scripts/validate-package.mjs"]);
+  assert.notEqual(result.status, 0);
 });
 
-await t.test("validator rejects compatibility and lockfile drift", () => {
-  // versions mapping mismatch => fail
-  // tracked package-lock.json => fail
-  // tracked yarn.lock => fail
+test("validator rejects tracked alternate lockfiles", async () => {
+  const dir = await fixture();
+  await writeFile(path.join(dir, "package-lock.json"), "{}\n");
+  assert.equal(git(dir, ["add", "package-lock.json"]).status, 0);
+  const result = run(dir, ["scripts/validate-package.mjs"]);
+  assert.notEqual(result.status, 0);
 });
 
-await t.test("validator accepts canonical pnpm metadata after build artifacts exist", () => {
-  // valid package/manifest/versions, tracked pnpm-lock, main.js/manifest/styles exist => exit 0
+test("validator accepts canonical pnpm metadata", async () => {
+  const dir = await fixture();
+  const result = run(dir, ["scripts/validate-package.mjs"]);
+  assert.equal(result.status, 0, result.stderr);
 });
 ```
 
-- [ ] **Step 2: Run the new tests and prove they fail on current scripts**
+Add separate assertions in the same file that `update-version.js 1.2`, `update-version.js 1.2.3`, duplicate `1.2.4`, and invocation with neither CLI argument nor `NEW_VERSION` exit non-zero.
 
-Run:
-
-```bash
-pnpm test:fast -- --filter=release-metadata
-```
-
-If the package script does not forward the extra filter syntax, run the underlying runner directly:
+- [ ] **Step 2: Run red tests**
 
 ```bash
 node scripts/run-tests.mjs --tier=fast --filter=release-metadata
 ```
 
-Expected: FAIL because `update-version.js` does not update `versions.json`, accepts `npm_package_version`, and the validator does not enforce canonical lock/version metadata.
+Expected: FAIL because current helper does not update `versions.json` and current validator does not reject metadata/alternate-lock drift.
 
-- [ ] **Step 3: Harden `update-version.js` with read/preflight/compute/write**
+- [ ] **Step 3: Implement one-target version preflight**
 
-Refactor the main flow so it:
+In `scripts/update-version.js`, read all metadata before any write, remove `npm_package_version` fallback, compute one target from package/manifest shared current version, and reject non-increasing/duplicate targets. Add:
 
 ```js
-const packageJson = readJson(packagePath);
-const manifest = readJson(manifestPath);
-const versions = readJson(versionsPath);
-
-if (!isValidSemver(packageJson.version) || packageJson.version !== manifest.version) {
-  throw new Error(`Current version metadata is inconsistent: package=${packageJson.version} manifest=${manifest.version}`);
+function compareSemver(left, right) {
+  const a = left.split(".").map(Number);
+  const b = right.split(".").map(Number);
+  for (let i = 0; i < 3; i++) {
+    if (a[i] !== b[i]) return a[i] - b[i];
+  }
+  return 0;
 }
-
-const requested = process.argv.slice(2)[0] ?? process.env.NEW_VERSION;
-if (!requested) throw new Error("Provide x.y.z or major/minor/patch explicitly.");
-
-const target = bumpOptions.has(resolve(requested))
-  ? bumpVersion(packageJson.version, resolve(requested))
-  : resolve(requested);
-
-if (!isValidSemver(target)) throw new Error(`Invalid target version: ${target}`);
-if (compareSemver(target, packageJson.version) <= 0) throw new Error(`Target version must be greater than ${packageJson.version}`);
-if (Object.hasOwn(versions, target)) throw new Error(`versions.json already contains ${target}`);
-
-const nextPackage = { ...packageJson, version: target };
-const nextManifest = { ...manifest, version: target };
-const nextVersions = { ...versions, [target]: manifest.minAppVersion };
-
-writeJsonWithBackup(packagePath, nextPackage);
-writeJsonWithBackup(manifestPath, nextManifest);
-writeJsonWithBackup(versionsPath, nextVersions);
 ```
 
-Implement a numeric three-component `compareSemver(a, b)`; do not shell out to `sort -V` and do not use a new dependency. Remove `npm_package_version` fallback entirely.
+Use this write sequence only after all preflight checks succeed:
 
-- [ ] **Step 4: Harden `validate-package.mjs`**
+```js
+writeJsonWithBackup(packagePath, { ...pkg, version: target });
+writeJsonWithBackup(manifestPath, { ...manifest, version: target });
+writeJsonWithBackup(versionsPath, { ...versions, [target]: manifest.minAppVersion });
+```
 
-Add helpers:
+- [ ] **Step 4: Implement offline validator checks**
+
+In `scripts/validate-package.mjs`, read `versions.json`, define:
 
 ```js
 const STABLE_SEMVER = /^\d+\.\d+\.\d+$/u;
-function tracked(path) {
-  return spawnSync("git", ["ls-files", "--error-unmatch", "--", path], { stdio: "ignore" }).status === 0;
+function tracked(file) {
+  return spawnSync("git", ["ls-files", "--error-unmatch", "--", file], { stdio: "ignore" }).status === 0;
 }
 ```
 
-Read `versions.json`, then enforce:
+Fail with explicit messages when package/manifest versions are invalid or unequal, `manifest.minAppVersion` is invalid, `versions[manifest.version] !== manifest.minAppVersion`, packageManager is not `pnpm@...`, `pnpm-lock.yaml` is not tracked, or `package-lock.json`/`yarn.lock` is tracked. Preserve current artifact and secret checks.
 
-```js
-if (!STABLE_SEMVER.test(packageJson.version) || !STABLE_SEMVER.test(manifest.version)) throw new Error("Release version must be x.y.z");
-if (packageJson.version !== manifest.version) throw new Error(...);
-if (!STABLE_SEMVER.test(manifest.minAppVersion ?? "")) throw new Error("manifest.minAppVersion must be x.y.z");
-if (versions[manifest.version] !== manifest.minAppVersion) throw new Error(...);
-if (typeof packageJson.packageManager !== "string" || !packageJson.packageManager.startsWith("pnpm@")) throw new Error("packageManager must declare pnpm");
-if (!tracked("pnpm-lock.yaml")) throw new Error("pnpm-lock.yaml must be tracked");
-for (const alternate of ["package-lock.json", "yarn.lock"]) if (tracked(alternate)) throw new Error(`Non-canonical lockfile is tracked: ${alternate}`);
-```
+- [ ] **Step 5: Remove alternate lock source**
 
-Preserve existing artifact and local-secret validation.
-
-- [ ] **Step 5: Remove alternate lockfile and clean ignores**
-
-Delete tracked `package-lock.json`. In `.gitignore`, keep one GitHub-E2E secret block and add root-only alternate locks:
+Delete tracked `package-lock.json`. In `.gitignore`, remove the duplicate E2E-secret block and add:
 
 ```gitignore
 /package-lock.json
 /yarn.lock
 ```
 
-- [ ] **Step 6: Run targeted tests**
-
-Run:
+- [ ] **Step 6: Run green test**
 
 ```bash
 node scripts/run-tests.mjs --tier=fast --filter=release-metadata
@@ -190,7 +188,7 @@ node scripts/run-tests.mjs --tier=fast --filter=release-metadata
 
 Expected: PASS.
 
-- [ ] **Step 7: Commit Task 1**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add .gitignore scripts/update-version.js scripts/validate-package.mjs tests/v4/release-metadata.test.mjs
@@ -200,7 +198,7 @@ git commit -m "build: harden release metadata tooling"
 
 ---
 
-### Task 2: Lock the Copy-Policy User Contract and Exact Conflict Outcomes
+### Task 2: Define Exact Copy-Policy Conflict Semantics
 
 **Files:**
 - Modify: `src/setting.tsx`
@@ -210,68 +208,56 @@ git commit -m "build: harden release metadata tooling"
 - Modify: `tests/github-e2e/v4-real-github-e2e.test.ts`
 
 **Interfaces:**
-- Consumes: `resolveV4Conflict({ policy: "copy" }) -> { action: "keep-local-copy-remote" }`, `V4SyncSession.conflictCopyPath()` naming contract.
-- Produces: documented/tested invariant: local bytes stay canonical, remote bytes are preserved as one conflict copy with a distinct identity.
+- Consumes: `resolveV4Conflict({ policy: "copy" })` returning `keep-local-copy-remote` and current conflict-copy naming.
+- Produces: exact local-primary contract across docs, settings, deterministic tests, and live E2E.
 
-- [ ] **Step 1: Strengthen unit expectations for resolver semantics**
+- [ ] **Step 1: Lock resolver naming**
 
-In `tests/v4/conflicts.test.ts`, keep the action assertion and add a test name/message that explicitly states local-primary semantics:
+Add/rename the unit test to:
 
 ```ts
-test("v4 copy policy keeps local primary and requests one remote copy", () => {
-  assert.equal(resolveV4Conflict({ policy: "copy", path: "a.md", localMtime: 2, remoteMtime: 3 }).action, "keep-local-copy-remote");
+test("v4 copy policy keeps local primary and requests a remote conflict copy", () => {
+  const resolution = resolveV4Conflict({ policy: "copy", path: "a.md", localMtime: 2, remoteMtime: 3 });
+  assert.equal(resolution.action, "keep-local-copy-remote");
 });
 ```
 
-- [ ] **Step 2: Add exact session regressions for same-file, rename/edit, and delete/edit asymmetry**
+- [ ] **Step 2: Add exact session regressions before production edits**
 
-Using the existing `MemoryGitHub`, `MemoryVault`, `createEmptyV4LocalIndex`, and session fixtures in `tests/v4/sync-session.test.ts`, add deterministic fixed-clock tests for:
+Using existing `MemoryGitHub`/`MemoryVault` fixtures in `tests/v4/sync-session.test.ts`, add fixed-clock tests for these final states:
 
 ```text
-same-file edit/edit:
-  canonical shared.md == local bytes
-  exactly one shared.conflict-remote-<device>-<fixed>.md == remote bytes
-  canonical fileId == original fileId
-  copy fileId != original
-
-remote rename old->new vs stale local edit old:
-  old == stale local bytes with original fileId
-  exactly one conflict copy derived from remote new path == remote bytes
-  no standalone new path remains
-  fresh third index path set is exact
-
-remote delete vs stale local edit:
-  local edited canonical survives with original identity
-  zero conflict copies
-
-local delete vs remote edit:
-  canonical path absent
-  exactly one remote conflict copy survives with new identity
+edit/edit: canonical shared.md = local; one conflict copy = remote; original fileId stays canonical; copy fileId differs.
+remote rename old->new vs stale local edit old: old stays canonical/local/original-fileId; one conflict copy derived from new contains remote bytes; standalone new absent.
+remote delete vs stale local edit: local canonical survives; original fileId survives; no conflict copy.
+local delete vs remote edit: canonical path absent; remote bytes survive as one conflict copy with a distinct fileId.
 ```
 
-The red phase is required before modifying production code. If these tests already pass, production sync behavior remains unchanged.
+Each test must assert exact path set, exact bytes, exact conflict-copy count, and fileId relation.
 
-- [ ] **Step 3: Tighten live rename-vs-edit assertions**
+- [ ] **Step 3: Run session tests red/green**
 
-Replace the current byte-anywhere assertions in `runRenameVsEditScenario` with exact path/identity assertions matching the session contract. Use fixed `now()` for Device B so the expected conflict-copy path is deterministic. For a fresh Device C, assert exact live path set and bytes instead of only `assertVaultContainsBytes`.
+```bash
+node scripts/run-tests.mjs --tier=fast --filter=sync-session
+```
 
-For encrypted mode, additionally assert original canonical fileId stability and distinct conflict-copy fileId; call the existing encrypted transport verification for both records.
+If a new exact assertion fails, keep that regression red and apply the smallest production fix required by the approved contract before proceeding. If all pass, do not modify production sync behavior.
 
-- [ ] **Step 4: Align Settings and FAQ wording**
+- [ ] **Step 4: Tighten live rename-vs-edit**
 
-Change Settings option:
+In `runRenameVsEditScenario`, use Device B fixed time `515151`, compute the exact expected conflict-copy path from `Notes/renamed.md`, and assert Device C sees only the canonical stale-local path plus exactly one conflict copy. Assert canonical original fileId stability and conflict-copy distinct fileId; encrypted mode must additionally pass existing opaque-object verification.
+
+- [ ] **Step 5: Align Settings and FAQ**
+
+Change the dropdown option to:
 
 ```ts
 .addOption("copy", "Copy (keep local, preserve remote copy)")
 ```
 
-and set the description to explicitly say that when both sides changed, the local file keeps its normal path and the remote version is preserved under a conflict-copy filename.
+Change its description to: `When both sides changed, keep this device's local file at its normal path and preserve the remote version as a conflict copy.` Update English and Chinese FAQ to state the same semantics.
 
-Update English and Chinese FAQ Copy policy text to the same contract. Do not change `resolveV4Conflict` behavior.
-
-- [ ] **Step 5: Run targeted conflict tests and E2E compile**
-
-Run:
+- [ ] **Step 6: Verify conflict layer and harness compilation**
 
 ```bash
 node scripts/run-tests.mjs --tier=fast --filter=conflicts
@@ -279,9 +265,9 @@ node scripts/run-tests.mjs --tier=fast --filter=sync-session
 GITHUB_E2E_COMPILE_ONLY=1 pnpm test:github-e2e:quick
 ```
 
-Expected: PASS after test/assertion/doc alignment. If a newly exact session regression fails, stop and use TDD to fix only the demonstrated behavior before continuing.
+Expected: PASS.
 
-- [ ] **Step 6: Commit Task 2**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add src/setting.tsx docs/FAQ.md tests/v4/conflicts.test.ts tests/v4/sync-session.test.ts tests/github-e2e/v4-real-github-e2e.test.ts
@@ -290,55 +276,48 @@ git commit -m "test: define exact V4 copy conflict contract"
 
 ---
 
-### Task 3: Cross-Side Namespace Safety and Conflict-Copy Collision
+### Task 3: Cross-Device Namespace and Conflict-Copy Safety
 
 **Files:**
 - Modify: `tests/v4/sync-session.test.ts`
-- Modify only if red regression requires it: `src/lib/v4/sync-session.ts`
+- Modify only after red regression: `src/lib/v4/sync-session.ts`
 
 **Interfaces:**
-- Consumes: local/remote `V4LogicalFile` records and existing case-insensitive collision convention.
-- Produces if needed: a pre-plan combined namespace assertion that rejects two different fileIds mapping to the same `NFC + lowercase` key before pull/push mutation.
+- Consumes: local/remote logical records.
+- Produces if needed: early combined-namespace validation keyed by `path.normalize("NFC").toLowerCase()` and fileId.
 
-- [ ] **Step 1: Write red combined-namespace regressions**
+- [ ] **Step 1: Write cross-side collision regressions**
 
-Add tests where local and remote are each individually valid but combined state contains different identities at:
+Add cases where local and remote individually pass but different fileIds collide at `note.md/note.md`, `Foo.md/foo.md`, and `é.md/e\u0301.md`. Record `MemoryVault.operations` and GitHub commit count before sync. Assert sync rejects and both mutation counters remain unchanged.
 
-```text
-same exact path:       note.md / note.md
-case collision:        Foo.md / foo.md
-normalization collision: é.md / e\u0301.md
-```
+Add a control where the same fileId renames `Foo.md -> foo.md`; assert that it remains a valid rename.
 
-Instrument `MemoryVault.operations` and `MemoryGitHub` mutation counters. Expected error must match a clear collision diagnostic, and assertions must prove no local write/trash and no new publication commit happened after the collision was known.
-
-Add a control case where the **same fileId** changes only case (`Foo.md -> foo.md`) and remains a legal rename.
-
-- [ ] **Step 2: Run the namespace tests and inspect the real failure point**
-
-Run:
+- [ ] **Step 2: Run regression**
 
 ```bash
 node scripts/run-tests.mjs --tier=fast --filter=sync-session
 ```
 
-Expected initial result: at least one cross-side collision regression should fail or fail too late if current separate local/remote validation is insufficient.
+Expected: at least one different-fileId cross-side collision is red or fails after mutation on current code. Preserve the red regression.
 
-- [ ] **Step 3: If red, implement the smallest combined namespace guard**
+- [ ] **Step 3: Implement minimal combined namespace guard if red**
 
-Add a focused helper near the existing collision assertion in `sync-session.ts`, conceptually:
+Add near existing collision validation:
 
 ```ts
-function normalizedNamespaceKey(path: string): string {
+function v4NamespaceKey(path: string): string {
   return path.normalize("NFC").toLowerCase();
 }
 
-function assertCombinedNamespaceSafe(local: V4LogicalFile[], remote: V4LogicalFile[]): void {
+function assertCombinedV4NamespaceSafe(local: V4LogicalFile[], remote: V4LogicalFile[]): void {
   const seen = new Map<string, { fileId: string; path: string }>();
   for (const file of [...remote, ...local]) {
-    const key = normalizedNamespaceKey(file.path);
+    const key = v4NamespaceKey(file.path);
     const prior = seen.get(key);
-    if (!prior) { seen.set(key, { fileId: file.fileId, path: file.path }); continue; }
+    if (!prior) {
+      seen.set(key, { fileId: file.fileId, path: file.path });
+      continue;
+    }
     if (prior.fileId !== file.fileId) {
       throw new Error(`V4 path collision across local/remote state: ${prior.path} vs ${file.path}`);
     }
@@ -346,139 +325,116 @@ function assertCombinedNamespaceSafe(local: V4LogicalFile[], remote: V4LogicalFi
 }
 ```
 
-Invoke it after local scan/remote load but **before** planning or any pull/push application. Reuse the existing normalization convention exactly; if the current helper already exists elsewhere, call/refactor it instead of duplicating logic.
+Call it after local scan and remote record filtering, before `planV4Sync` and before any pull/push mutation. Reuse existing path-normalization helper if one already implements the exact same convention.
 
-- [ ] **Step 4: Write conflict-copy occupied-path regression**
+- [ ] **Step 4: Add occupied conflict-copy regression**
 
-Create a conflict whose deterministic copy path is already occupied by an unrelated fileId. Assert the sync refuses before overwriting that user file. A clear error is sufficient; do not add numbered fallback naming in this hardening.
+Create a copy conflict at fixed time where the expected conflict-copy filename is already occupied by an unrelated fileId. Assert the unrelated file bytes/fileId are unchanged and sync refuses rather than overwriting. Do not implement numbered fallback names.
 
-- [ ] **Step 5: Run targeted tests**
+- [ ] **Step 5: Verify**
 
 ```bash
 node scripts/run-tests.mjs --tier=fast --filter=sync-session
 ```
 
-Expected: PASS, with no silent overwrite and same-identity case rename still allowed.
+Expected: PASS, including legal same-fileId case-only rename.
 
-- [ ] **Step 6: Commit Task 3**
-
-If production changed:
-
-```bash
-git add tests/v4/sync-session.test.ts src/lib/v4/sync-session.ts
-git commit -m "fix: reject ambiguous cross-device V4 paths"
-```
-
-If all regressions passed without production change:
+- [ ] **Step 6: Commit**
 
 ```bash
 git add tests/v4/sync-session.test.ts
-git commit -m "test: cover cross-device namespace collisions"
+if git diff --quiet -- src/lib/v4/sync-session.ts; then
+  git commit -m "test: cover cross-device namespace collisions"
+else
+  git add src/lib/v4/sync-session.ts
+  git commit -m "fix: reject ambiguous cross-device V4 paths"
+fi
 ```
 
 ---
 
-### Task 4: Rescan Causality Matrix and Runtime Automatic Replan
+### Task 4: Rescan Causality and Runtime Automatic Retry
 
 **Files:**
 - Modify: `tests/v4/sync-coordinator.test.ts`
 - Create: `tests/v4/runtime-retry.test.ts`
-- Modify only if regressions require it: `src/lib/v4/sync-coordinator.ts`, `src/lib/v4/runtime.ts`
+- Modify only after red regression: `src/lib/v4/sync-coordinator.ts`, `src/lib/v4/runtime.ts`
 
 **Interfaces:**
-- Consumes: `coalesceV4Changes(changes)`, `V4PluginRuntime.manualSync()`, runtime progress snapshot `attempt`.
-- Produces: deterministic proof that rescans preserve identity-breaking events and user-facing runtime retries recoverable publication races without a second manual action.
+- Consumes: `coalesceV4Changes`, `V4PluginRuntime.manualSync`, progress `attempt`.
+- Produces: deterministic proof of identity-preserving rescan coalescing and one-action recoverable publication retry.
 
-- [ ] **Step 1: Add a table-driven rescan causality matrix**
+- [ ] **Step 1: Add table-driven causality cases**
 
-In `tests/v4/sync-coordinator.test.ts`, add explicit cases for:
+Add explicit coordinator tests for `replace+rescan`, `rename+rescan`, `delete+rescan`, `folderRename+rescan`, `folderDelete+rescan`, and `delete+modify+rescan -> replace`, while retaining the existing proof that content-only modifies can collapse to one rescan.
 
-```ts
-const cases = [
-  { name: "replace + rescan", changes: [replace("a", "a"), rescan()], mustKeep: "replace" },
-  { name: "rename + rescan", changes: [rename("a", "b"), rescan()], mustKeep: "rename" },
-  { name: "delete + rescan", changes: [del("a"), rescan()], mustKeep: "delete" },
-  { name: "folder rename + rescan", changes: [folderRename("A", "B"), rescan()], mustKeep: "folderRename" },
-  { name: "folder delete + rescan", changes: [folderDelete("A"), rescan()], mustKeep: "folderDelete" },
-  { name: "delete recreate + rescan", changes: [del("a"), modify("a"), rescan()], mustKeep: "replace" },
-];
-```
-
-Keep existing optimization coverage proving content-only modifies may collapse to one rescan.
-
-- [ ] **Step 2: Run coordinator regression matrix before production edits**
+- [ ] **Step 2: Run coordinator matrix**
 
 ```bash
 node scripts/run-tests.mjs --tier=fast --filter=sync-coordinator
 ```
 
-Expected: existing fixed causality cases pass; any newly exposed ambiguous chain must be red before changing `sync-coordinator.ts`.
+Expected: PASS for already-correct cases; any newly exposed failure stays red until minimally fixed.
 
-- [ ] **Step 3: Create a runtime-level race test fixture**
+- [ ] **Step 3: Build a real-runtime fake-GitHub retry fixture**
 
-Create `tests/v4/runtime-retry.test.ts`. Stub a minimal `FastSync`-shaped plugin and GitHub client so the first publication attempt throws a recoverable stale-ref/branch-head-changed error after advancing the fake remote head; the second attempt succeeds from the advanced head.
+Create `tests/v4/runtime-retry.test.ts` around exported `V4PluginRuntime`. Use an in-memory plugin-shaped object with required settings/vault/index adapter/GitHub methods. Configure the fake publication path so attempt 1 advances the fake branch then throws the same recoverable stale-ref/branch-head-changed condition used by production; attempt 2 publishes successfully.
 
-The test must invoke only one user action:
+Observe progress through `runtime.subscribeProgress` and assert:
 
 ```ts
+const attempts: number[] = [];
+const unsubscribe = runtime.subscribeProgress(snapshot => attempts.push(snapshot.attempt));
 const result = await runtime.manualSync();
+unsubscribe();
 assert.ok(result);
 assert.equal(publishAttempts, 2);
+assert.equal(Math.max(...attempts), 2);
 assert.equal(runtime.progressSnapshot.lifecycle, "success");
-assert.equal(maxObservedAttempt, 2);
-assert.equal(userManualActions, 1);
-assert.equal(conflictCopiesCreated, 0);
 ```
 
-Use the real `V4PluginRuntime`; do not test a reimplemented retry loop.
+The test must invoke `manualSync()` once and must use `V4PluginRuntime`, not a copied retry loop.
 
-- [ ] **Step 4: Run runtime test and fix only if behavior is not already covered**
+- [ ] **Step 4: Run runtime retry regression**
 
 ```bash
 node scripts/run-tests.mjs --tier=fast --filter=runtime-retry
 ```
 
-Expected: PASS if existing bounded retry semantics are correctly reachable through the fixture. If red because runtime does not retry the production error class/message, keep the red regression and apply the smallest change to `runtime.ts`.
+Expected: PASS if existing retry semantics are wired correctly. If red, modify only the production retry predicate/control flow proven insufficient by the test.
 
-- [ ] **Step 5: Commit Task 4**
+- [ ] **Step 5: Commit**
 
 ```bash
 git add tests/v4/sync-coordinator.test.ts tests/v4/runtime-retry.test.ts
-git add src/lib/v4/sync-coordinator.ts src/lib/v4/runtime.ts 2>/dev/null || true
+for file in src/lib/v4/sync-coordinator.ts src/lib/v4/runtime.ts; do
+  git diff --quiet -- "$file" || git add "$file"
+done
 git commit -m "test: harden V4 causality and runtime replan coverage"
 ```
 
 ---
 
-### Task 5: Harden the Real GitHub E2E Harness
+### Task 5: Harden the Live GitHub E2E Suite
 
 **Files:**
 - Modify: `tests/github-e2e/v4-real-github-e2e.test.ts`
-- Modify if helper behavior is needed: `scripts/run-github-e2e.mjs`
+- Modify only if required: `scripts/run-github-e2e.mjs`
 - Modify: `docs/github-e2e.md`
 
 **Interfaces:**
-- Consumes: existing `GITHUB_E2E_OWNER`, `GITHUB_E2E_REPO`, `GITHUB_E2E_BRANCH`, `GITHUB_E2E_TOKEN`; disposable branch only.
-- Produces: deterministic live suite with exact conflict assertions and encrypted external-mutation refusal.
+- Consumes existing `GITHUB_E2E_*` process env and disposable branch safety rules.
+- Produces: exact multi-device assertions plus encrypted external-mutation refusal.
 
-- [ ] **Step 1: Add encrypted external-mutation safety scenario**
+- [ ] **Step 1: Add encrypted external-mutation scenario**
 
-Add a live scenario that:
+Use existing live client helpers to: force-push encrypted V4; create an out-of-band Git commit on the same branch without changing authenticated encrypted journal/head metadata; advance branch with non-force ref update; run normal sync; assert rejection text matches encrypted external-change safety error; assert the external commit remains reachable and plugin does not publish over it.
 
-1. initializes encrypted V4 and publishes normally,
-2. creates an out-of-band Git commit on the same branch without updating the encrypted V4 journal/head contract,
-3. advances the branch with `force: false`,
-4. attempts normal plugin sync,
-5. asserts a clear encrypted external-change refusal,
-6. asserts the injected commit remains reachable and branch head is not silently overwritten by the plugin.
+- [ ] **Step 2: Keep manual-run safety invariant**
 
-Use deterministic mutation timing and existing request bridge/client helpers; do not add sleeps.
+Do not relax current runner rejection of `main`, `master`, `production`, `prod`, `release`, or `stable` branches.
 
-- [ ] **Step 2: Preserve the source-repo and protected-branch safety checks**
-
-Keep runner-level forbidden branch names. The workflow will add a stronger repository-isolation guard, but local manual runs must still refuse `main`, `master`, `production`, `prod`, `release`, and `stable`.
-
-- [ ] **Step 3: Compile the harness**
+- [ ] **Step 3: Compile**
 
 ```bash
 GITHUB_E2E_COMPILE_ONLY=1 pnpm test:github-e2e:quick
@@ -486,35 +442,37 @@ GITHUB_E2E_COMPILE_ONLY=1 pnpm test:github-e2e:quick
 
 Expected: PASS.
 
-- [ ] **Step 4: Update E2E docs for the new scenario and dynamic workflow branch**
+- [ ] **Step 4: Update docs**
 
-Document that local/manual `.env.github-e2e` can still specify a disposable branch, while GitHub Actions derives one per run. State that the suite is not 5 GiB qualification.
+Document local `.env.github-e2e` usage, GitHub Actions dynamic branch behavior, encrypted external mutation coverage, and explicit exclusion of physical 5 GiB qualification.
 
-- [ ] **Step 5: Commit Task 5**
+- [ ] **Step 5: Commit**
 
 ```bash
-git add tests/github-e2e/v4-real-github-e2e.test.ts scripts/run-github-e2e.mjs docs/github-e2e.md
+git add tests/github-e2e/v4-real-github-e2e.test.ts docs/github-e2e.md
+if ! git diff --quiet -- scripts/run-github-e2e.mjs; then git add scripts/run-github-e2e.mjs; fi
 git commit -m "test: harden live GitHub E2E safety coverage"
 ```
 
 ---
 
-### Task 6: Add Credentialed Live Qualification Workflow
+### Task 6: Credentialed Exact-SHA Live Qualification Workflow
 
 **Files:**
 - Create: `.github/workflows/github-e2e-live.yml`
 - Modify: `docs/github-e2e.md`
 
 **Interfaces:**
-- Consumes GitHub Environment `github-e2e`: variables `E2E_OWNER`, `E2E_REPO`; secret `E2E_TOKEN`.
-- Produces workflow/job authority: exact `master` `github.sha`, job ids `qualify` and `cleanup`, both successful; best-effort audit artifact.
+- GitHub Environment `github-e2e`: vars `E2E_OWNER`, `E2E_REPO`; secret `E2E_TOKEN`.
+- Stable job names: `qualify`, `cleanup`.
 
-- [ ] **Step 1: Create workflow with exact trigger, permissions, and environment mapping**
+- [ ] **Step 1: Create workflow header and jobs**
 
-Use this structural contract:
+Use exactly:
 
 ```yaml
 name: GitHub E2E Live
+
 on:
   workflow_dispatch:
 
@@ -536,18 +494,39 @@ jobs:
       GITHUB_E2E_REPO: ${{ vars.E2E_REPO }}
       GITHUB_E2E_TOKEN: ${{ secrets.E2E_TOKEN }}
       GITHUB_E2E_BRANCH: obsidian-sync-e2e/run-${{ github.run_id }}
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          ref: ${{ github.sha }}
-      # setup pnpm/node
-      # guard master/current SHA/source repo isolation
-      # pnpm install --frozen-lockfile
-      # pnpm build
-      # pnpm test:github-e2e:quick
-      # write audit JSON
-      # upload-artifact continue-on-error: true
+```
 
+Add checkout `actions/checkout@v6`, `pnpm/action-setup@v4`, and `actions/setup-node@v6` using `.node-version`.
+
+- [ ] **Step 2: Add source/target/stale guards before installation**
+
+With repository `GITHUB_TOKEN` exposed as `GH_TOKEN`, run:
+
+```bash
+set -euo pipefail
+test "$GITHUB_REF" = "refs/heads/master"
+test -n "$GITHUB_E2E_OWNER"
+test -n "$GITHUB_E2E_REPO"
+test "$GITHUB_E2E_OWNER/$GITHUB_E2E_REPO" != "$GITHUB_REPOSITORY"
+current_master=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/master" --jq .object.sha)
+test "$current_master" = "$GITHUB_SHA"
+```
+
+- [ ] **Step 3: Run live qualification and write best-effort audit artifact**
+
+Run frozen install, build, then `pnpm test:github-e2e:quick` without compile-only. After success write:
+
+```bash
+node -e 'const fs=require("fs"); fs.writeFileSync("github-e2e-qualification.json", JSON.stringify({schemaVersion:1,commitSha:process.env.GITHUB_SHA,workflowRunId:process.env.GITHUB_RUN_ID,runAttempt:Number(process.env.GITHUB_RUN_ATTEMPT),qualifiedAt:new Date().toISOString(),suite:"github-e2e-quick"}, null, 2)+"\n")'
+```
+
+Upload with `actions/upload-artifact@v4`, name `github-e2e-qualification-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}`, and `continue-on-error: true`.
+
+- [ ] **Step 4: Add separate cleanup job**
+
+Use:
+
+```yaml
   cleanup:
     name: cleanup
     if: always()
@@ -560,55 +539,15 @@ jobs:
       E2E_REPO: ${{ vars.E2E_REPO }}
       E2E_TOKEN: ${{ secrets.E2E_TOKEN }}
       E2E_BRANCH: obsidian-sync-e2e/run-${{ github.run_id }}
-    steps:
-      - name: Delete disposable branch
-        env:
-          GH_TOKEN: ${{ env.E2E_TOKEN }}
-        run: |
-          for attempt in 1 2 3; do
-            code=$(curl -sS -o /tmp/delete.out -w "%{http_code}" \
-              -X DELETE \
-              -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/$E2E_OWNER/$E2E_REPO/git/refs/heads/${E2E_BRANCH//\//%2F}") || code=000
-            if [ "$code" = 204 ] || [ "$code" = 422 ] || [ "$code" = 404 ]; then exit 0; fi
-            sleep $((attempt * 2))
-          done
-          exit 1
 ```
 
-Do not use `GITHUB_*` names for GitHub configuration variables/secrets; they are process env only.
+Delete branch with a Node `fetch` script instead of fragile URL shell escaping. The script must DELETE `https://api.github.com/repos/${owner}/${repo}/git/refs/heads/${branch.split("/").map(encodeURIComponent).join("/")}`, treat 204/404/422 as success, retry other responses three times with delays 2s/4s/6s, and exit non-zero if still present.
 
-- [ ] **Step 2: Implement fail-closed guard before destructive work**
+- [ ] **Step 5: Document setup**
 
-The `qualify` guard must verify all of:
+In `docs/github-e2e.md`, state Environment name `github-e2e`, vars `E2E_OWNER`/`E2E_REPO`, secret `E2E_TOKEN`, required dedicated repository, dynamic branch, and cleanup command.
 
-```bash
-test "$GITHUB_REF" = "refs/heads/master"
-test "$GITHUB_E2E_OWNER/$GITHUB_E2E_REPO" != "$GITHUB_REPOSITORY"
-current_master=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/master" --jq .object.sha)
-test "$current_master" = "$GITHUB_SHA"
-```
-
-Use the repository `GITHUB_TOKEN` only to read the source repo; use `E2E_TOKEN` only for the disposable target repo.
-
-- [ ] **Step 3: Generate best-effort audit evidence after live success**
-
-Write JSON with `schemaVersion`, `commitSha`, `workflowRunId`, `runAttempt`, `qualifiedAt`, and suite. Upload with artifact name `github-e2e-qualification-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}` and `continue-on-error: true`.
-
-- [ ] **Step 4: Document exact Environment setup and maintainer cleanup command**
-
-In `docs/github-e2e.md`, include:
-
-```text
-Environment: github-e2e
-Variables: E2E_OWNER, E2E_REPO
-Secret: E2E_TOKEN
-```
-
-and a copy-paste branch cleanup command parameterized by run id.
-
-- [ ] **Step 5: Commit Task 6**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add .github/workflows/github-e2e-live.yml docs/github-e2e.md
@@ -617,48 +556,45 @@ git commit -m "ci: add exact-SHA live GitHub qualification"
 
 ---
 
-### Task 7: Remove the Prerelease Bypass
+### Task 7: Remove Public Prerelease Bypass
 
 **Files:**
 - Replace: `.github/workflows/pre-release.yml`
 
 **Interfaces:**
-- Consumes: non-master manifest-version candidate pushes or manual dispatch.
-- Produces: tested plugin artifact only; never writes tags/releases.
+- Consumes non-master `manifest.json` changes/manual dispatch.
+- Produces candidate artifact only.
 
-- [ ] **Step 1: Replace release-capable workflow with Branch Candidate Build**
+- [ ] **Step 1: Replace workflow**
 
-Keep the workflow filename for continuity, but set:
+Use header:
 
 ```yaml
 name: Branch Candidate Build
 on:
   push:
-    branches-ignore: [master]
-    paths: [manifest.json]
+    branches-ignore:
+      - master
+    paths:
+      - manifest.json
   workflow_dispatch:
-
 permissions:
   contents: read
 ```
 
-The single verify job must run checkout, pnpm/node setup, frozen install, build, `pnpm test`, repeat, recovery, resource, feasibility, E2E compile-only, package validation, then upload `main.js`, `manifest.json`, `styles.css` as an artifact named only with a safe SHA component, e.g. `candidate-${{ github.sha }}`.
+Single job: checkout, pnpm/node setup, frozen install, build, `pnpm test`, repeat, recovery, resource, feasibility, E2E compile-only, package validation, upload `main.js`, `manifest.json`, `styles.css` as `candidate-${{ github.sha }}`.
 
-Delete all version-comparison, translation, `softprops/action-gh-release`, tag, release, and `contents: write` logic.
+- [ ] **Step 2: Prove release capabilities are absent**
 
-- [ ] **Step 2: Review workflow for write-capable steps**
-
-Search the resulting file for these strings and require no matches:
-
-```text
-contents: write
-action-gh-release
-tag_name
-deep-translator
-GITHUB_TOKEN
+```bash
+for needle in 'contents: write' 'action-gh-release' 'tag_name' 'deep-translator'; do
+  if grep -F "$needle" .github/workflows/pre-release.yml; then exit 1; fi
+done
 ```
 
-- [ ] **Step 3: Commit Task 7**
+Expected: command exits 0 with no matches.
+
+- [ ] **Step 3: Commit**
 
 ```bash
 git add .github/workflows/pre-release.yml
@@ -667,7 +603,7 @@ git commit -m "ci: make prerelease workflow artifact-only"
 
 ---
 
-### Task 8: Replace Stable Release with Explicit Exact-SHA Qualified Release
+### Task 8: Explicit Exact-SHA Stable Release
 
 **Files:**
 - Replace: `.github/workflows/release.yml`
@@ -675,12 +611,11 @@ git commit -m "ci: make prerelease workflow artifact-only"
 - Modify: `README.md`
 
 **Interfaces:**
-- Consumes: workflow input `version`, current `master` SHA, existing stable tags/releases, exact-SHA successful `GitHub E2E Live` run with successful `qualify` and `cleanup` jobs.
-- Produces: stable tag and GitHub Release at the exact qualified SHA, only after deterministic gates pass.
+- Input: `version` in `x.y.z`.
+- Authority: successful `github-e2e-live.yml` workflow-dispatch run at exact current `master` SHA with jobs `qualify` and `cleanup` successful.
+- Output: stable tag/release/assets at exact qualified SHA.
 
-- [ ] **Step 1: Replace triggers and permissions**
-
-Use:
+- [ ] **Step 1: Replace workflow trigger/permissions**
 
 ```yaml
 name: Stable Release
@@ -691,62 +626,59 @@ on:
         description: Stable version to release (x.y.z)
         required: true
         type: string
-
 permissions:
   actions: read
   contents: write
-
 concurrency:
   group: stable-release
   cancel-in-progress: false
 ```
 
-The workflow must fail in a normal step if `github.ref != refs/heads/master`; do not hide this with a job-level `if` that could mark the job skipped/successful.
+Use checkout with `fetch-depth: 0`, pnpm/action-setup@v4, setup-node@v6, and `.node-version`.
 
-- [ ] **Step 2: Add metadata, monotonic-version, duplicate, and stale-master preflight**
+- [ ] **Step 2: Add fail-closed metadata/tag/master preflight**
 
-Before build/publication:
+Run with `GH_TOKEN: ${{ github.token }}`:
 
 ```bash
+set -euo pipefail
 VERSION='${{ inputs.version }}'
 [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+test "$GITHUB_REF" = "refs/heads/master"
 test "$(jq -r .version manifest.json)" = "$VERSION"
 test "$(jq -r .version package.json)" = "$VERSION"
-# versions mapping equals manifest.minAppVersion
-# current master SHA equals GITHUB_SHA
-# refs/tags/$VERSION must not exist
-# release by tag $VERSION must not exist
-# VERSION must be greater than highest existing stable x.y.z tag
+MIN_APP=$(jq -r .minAppVersion manifest.json)
+test "$(jq -r --arg v "$VERSION" '.[$v]' versions.json)" = "$MIN_APP"
+CURRENT_MASTER=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/master" --jq .object.sha)
+test "$CURRENT_MASTER" = "$GITHUB_SHA"
+if git show-ref --verify --quiet "refs/tags/$VERSION"; then exit 1; fi
+if gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then exit 1; fi
 ```
 
-Use a small Node snippet for semantic version comparison rather than lexical comparison.
+Determine the highest existing stable tag with `git tag --list | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1`; compare it to requested version using a Node numeric three-component comparator and fail if requested is not greater.
 
-- [ ] **Step 3: Add exact-SHA qualification lookup**
+- [ ] **Step 3: Query exact-SHA live qualification**
 
-Use `gh api` with repository `GITHUB_TOKEN` to list `github-e2e-live.yml` runs filtered by `head_sha=$GITHUB_SHA`, `event=workflow_dispatch`, status completed. For each success candidate, fetch jobs and accept only a run where both stable job names `qualify` and `cleanup` conclude `success`.
+Run this Node script through `gh api` outputs or equivalent shell loop; acceptance conditions are exact: run event `workflow_dispatch`, head branch `master`, head SHA `$GITHUB_SHA`, run conclusion `success`, and both job names `qualify` and `cleanup` conclude `success`.
 
-Pseudocode shell:
+Concrete shell:
 
 ```bash
-run_ids=$(gh api --paginate \
-  "repos/$GITHUB_REPOSITORY/actions/workflows/github-e2e-live.yml/runs?head_sha=$GITHUB_SHA&event=workflow_dispatch&status=completed&per_page=100" \
-  --jq '.workflow_runs[] | select(.conclusion == "success" and .head_branch == "master" and .head_sha == env.GITHUB_SHA) | .id')
-
+set -euo pipefail
 qualified=false
-for run_id in $run_ids; do
+mapfile -t run_ids < <(gh api --paginate \
+  "repos/$GITHUB_REPOSITORY/actions/workflows/github-e2e-live.yml/runs?head_sha=$GITHUB_SHA&event=workflow_dispatch&status=completed&per_page=100" \
+  --jq '.workflow_runs[] | select(.conclusion == "success" and .head_branch == "master") | .id')
+for run_id in "${run_ids[@]}"; do
   jobs=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/jobs?per_page=100")
-  q=$(jq -r '[.jobs[] | select(.name == "qualify" and .conclusion == "success")] | length' <<<"$jobs")
-  c=$(jq -r '[.jobs[] | select(.name == "cleanup" and .conclusion == "success")] | length' <<<"$jobs")
+  q=$(jq '[.jobs[] | select(.name == "qualify" and .conclusion == "success")] | length' <<<"$jobs")
+  c=$(jq '[.jobs[] | select(.name == "cleanup" and .conclusion == "success")] | length' <<<"$jobs")
   if [ "$q" -ge 1 ] && [ "$c" -ge 1 ]; then qualified=true; break; fi
 done
-$qualified
+if [ "$qualified" != true ]; then echo "No exact-SHA live qualification" >&2; exit 1; fi
 ```
 
-No parent/child SHA or latest-success fallback.
-
-- [ ] **Step 4: Run every deterministic gate before publication**
-
-In order:
+- [ ] **Step 4: Run deterministic gates**
 
 ```bash
 pnpm install --frozen-lockfile
@@ -760,11 +692,16 @@ GITHUB_E2E_COMPILE_ONLY=1 pnpm test:github-e2e:quick
 pnpm validate:package
 ```
 
-Then perform the **final** current-master SHA check again.
+- [ ] **Step 5: Recheck master immediately before publication**
 
-- [ ] **Step 5: Package and publish with GitHub CLI only after all gates**
+```bash
+CURRENT_MASTER=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/master" --jq .object.sha)
+test "$CURRENT_MASTER" = "$GITHUB_SHA"
+```
 
-Create the plugin ZIP, then:
+- [ ] **Step 6: Package and publish last**
+
+Create `${{ github.event.repository.name }}-v${{ inputs.version }}.zip` containing `main.js`, `manifest.json`, `styles.css`; then run:
 
 ```bash
 gh release create "$VERSION" \
@@ -775,25 +712,15 @@ gh release create "$VERSION" \
   "$ZIP_PATH" main.js manifest.json styles.css
 ```
 
-Do not run `deep-translator`, do not use `softprops/action-gh-release`, and do not mutate a tag before the gates. If publication partially fails, leave the workflow failed; do not auto-delete a possibly-valid tag/release.
+Do not use translation service or third-party release action. Do not auto-delete a partial publication on failure.
 
-- [ ] **Step 6: Write maintainer release documentation**
+- [ ] **Step 7: Add maintainer docs**
 
-Create `docs/releasing.md` covering:
+Create `docs/releasing.md` with: version bump command; deterministic CI; Environment setup reference; live workflow dispatch; requirement for `qualify` and `cleanup`; stable release dispatch; partial publication inspection commands `gh release view <version>` and `git ls-remote --tags origin refs/tags/<version>`; explicit instruction to inspect before manual deletion.
 
-1. version bump via `pnpm ver -- patch|minor|major|x.y.z`,
-2. merge and wait for deterministic CI,
-3. configure/dispatch `GitHub E2E Live` on `master`,
-4. require `qualify` + `cleanup` success for the exact SHA,
-5. dispatch `Stable Release` on `master` with version,
-6. inspect a failed partial publication with `gh release view <version>` and `git ls-remote --tags origin refs/tags/<version>`,
-7. manually delete only after inspection if the maintainer decides the partial publication is invalid.
+Update README qualification section to distinguish deterministic CI, live real-GitHub qualification, and physical large-file evidence.
 
-- [ ] **Step 7: Update README qualification wording**
-
-State three evidence layers separately: deterministic CI, live real-GitHub qualification, and physical-device/large-file evidence. Do not claim a live pass until an actual live workflow succeeds for a SHA.
-
-- [ ] **Step 8: Commit Task 8**
+- [ ] **Step 8: Commit**
 
 ```bash
 git add .github/workflows/release.yml docs/releasing.md README.md
@@ -805,15 +732,12 @@ git commit -m "ci: require exact-SHA qualification for stable release"
 ### Task 9: Full Verification, Review, and Delivery
 
 **Files:**
-- Review all files changed since `43ac573e1feabe39ab0a1a090d7553a2948007fc`.
+- Review all changes after approved design commit `43ac573e1feabe39ab0a1a090d7553a2948007fc`.
 
 **Interfaces:**
-- Consumes: all Task 1-8 outputs.
-- Produces: branch ready for PR/merge; live workflow remains an explicit maintainer-run qualification if credentials are unavailable.
+- Produces branch/PR ready for merge; live qualification remains maintainer-run if credentials are unavailable here.
 
-- [ ] **Step 1: Attempt full deterministic verification locally**
-
-Run exactly:
+- [ ] **Step 1: Attempt deterministic verification locally**
 
 ```bash
 corepack pnpm install --frozen-lockfile
@@ -827,22 +751,13 @@ GITHUB_E2E_COMPILE_ONLY=1 corepack pnpm test:github-e2e:quick
 corepack pnpm validate:package
 ```
 
-Record real outputs. If dependency/network access prevents execution, do not claim pass; retain the ready-to-run commands for the maintainer.
+Record actual outputs. Network/dependency failure is a limitation, not a pass.
 
 - [ ] **Step 2: Static workflow safety review**
 
-Verify:
+Verify: candidate workflow is read-only/no release; ordinary CI has no live secrets; live workflow is dispatch-only with source-repo guard, dynamic branch, `qualify`/`cleanup`; stable release is dispatch-only, exact-SHA qualified, deterministic gates precede publication, and translation/release third-party action is gone.
 
-```text
-pre-release.yml: contents read only, no tag/release action
-ci.yml: no E2E secrets, compile-only only
-live E2E: workflow_dispatch only; dedicated target-repo guard; dynamic branch; qualify+cleanup jobs
-release.yml: workflow_dispatch only; actions read + contents write; exact SHA qualification; no translation; publication last
-```
-
-- [ ] **Step 3: Review branch diff against approved spec**
-
-Run/inspect:
+- [ ] **Step 3: Diff hygiene**
 
 ```bash
 git diff --check master...HEAD
@@ -850,27 +765,27 @@ git diff --stat master...HEAD
 git log --oneline master..HEAD
 ```
 
-Confirm no production V4 modification lacks an associated red regression commit.
+Any V4 production change must have a preceding failing regression commit.
 
-- [ ] **Step 4: Request code review / inspect PR diff**
+- [ ] **Step 4: Open/review PR**
 
-Open a PR from `audit-hardening-2026-08-24` to `master`, review changed-file patches for correctness and spec coverage, and address any concrete findings before merge.
+Open PR `audit-hardening-2026-08-24 -> master`; inspect all changed-file patches; address concrete findings before merge.
 
-- [ ] **Step 5: Merge only deterministic-ready source**
+- [ ] **Step 5: Merge deterministic-ready source**
 
-Merge after deterministic checks available to the environment are green. Do **not** create a stable release automatically.
+Merge after all deterministic checks available to this environment are green. Do not create a stable release automatically.
 
-- [ ] **Step 6: Maintainer live handoff**
+- [ ] **Step 6: Handoff only the credentialed steps**
 
-Provide these remaining user-run actions if live credentials are unavailable here:
+Provide:
 
 ```text
-1. Create/use a dedicated disposable E2E repository.
-2. GitHub repo Settings → Environments → github-e2e.
-3. Add variables E2E_OWNER, E2E_REPO and secret E2E_TOKEN.
+1. Create/use dedicated disposable E2E repo.
+2. Settings → Environments → github-e2e.
+3. Variables: E2E_OWNER, E2E_REPO. Secret: E2E_TOKEN.
 4. Actions → GitHub E2E Live → Run workflow on master.
-5. Confirm qualify and cleanup both succeeded.
-6. Only if a stable release is desired: Actions → Stable Release → Run workflow on master with version 1.0.8 (or the current metadata version).
+5. Confirm qualify and cleanup succeed.
+6. If publication is desired: Actions → Stable Release → Run workflow on master with current x.y.z version.
 ```
 
-The source hardening can be delivered without step 6; the repository must not be described as live-qualified until step 4-5 actually pass for the target SHA.
+Do not describe the target SHA as live-qualified until step 4-5 succeeds.
