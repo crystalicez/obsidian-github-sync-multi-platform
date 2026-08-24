@@ -43,7 +43,7 @@ function loadEnvFile() {
 
 loadEnvFile();
 
-const compileOnly = process.env.GITHUB_E2E_COMPILE_ONLY === "1";
+const compileOnly = process.argv.includes("--compile-only") || process.env.GITHUB_E2E_COMPILE_ONLY === "1";
 const required = ["GITHUB_E2E_OWNER", "GITHUB_E2E_REPO", "GITHUB_E2E_BRANCH", "GITHUB_E2E_TOKEN"];
 if (!compileOnly) {
   const missing = required.filter(name => !process.env[name]);
