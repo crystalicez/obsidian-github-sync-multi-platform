@@ -65,6 +65,7 @@ if (!compileOnly) {
 const outDir = path.join(root, ".tmp", "github-e2e", `${process.pid}-${Date.now()}`);
 const entries = [
   "tests/github-e2e/v4-real-github-e2e.test.ts",
+  "tests/github-e2e/v4-copy-contract-github-e2e.test.ts",
   "tests/github-e2e/v4-encrypted-external-mutation.test.ts",
 ];
 
