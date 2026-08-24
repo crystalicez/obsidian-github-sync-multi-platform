@@ -123,7 +123,7 @@ jobs:
         run: pnpm test:feasibility
 
       - name: Compile real GitHub E2E harness
-        run: GITHUB_E2E_COMPILE_ONLY=1 pnpm test:github-e2e:quick
+        run: pnpm test:github-e2e:compile
 
       - name: Validate package
         run: pnpm validate:package
