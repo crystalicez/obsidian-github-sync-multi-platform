@@ -32,9 +32,9 @@ The current V4 causality/identity implementation remains unchanged unless a new 
 - Preserve user data rather than silently choosing last-writer-wins.
 - Fail early on ambiguous cross-platform namespaces.
 - Keep destructive network qualification isolated from normal PR/fork CI.
-- The successful live-workflow run metadata for an exact SHA is authoritative qualification evidence; uploaded artifacts are audit aids, not the source of truth.
+- Successful exact-SHA workflow/job metadata is authoritative qualification evidence; uploaded artifacts are audit aids, not the source of truth.
 - Qualify exactly the commit that will be released.
-- Fail closed when qualification is absent, stale, or for a different SHA.
+- Fail closed when qualification is absent, stale, skipped, or for a different SHA.
 - Do not claim strict server-side compare-and-swap semantics that GitHub's ref update API does not provide; retain pre-read + non-force update + runtime replan.
 - No 5 GiB physical qualification or pack-scale benchmark in the quick live E2E.
 - No new runtime dependency for the Obsidian plugin.
@@ -49,7 +49,7 @@ The repository becomes explicitly pnpm-only for dependency locking.
 
 - Remove tracked `package-lock.json`.
 - Keep `pnpm-lock.yaml` as the only dependency lockfile.
-- Ignore `package-lock.json` and `yarn.lock` at the repository root.
+- Ignore root `package-lock.json` and `yarn.lock`.
 - Remove the duplicated GitHub-E2E ignore entries while editing `.gitignore`.
 
 ### 1.2 Package validation
@@ -58,7 +58,7 @@ Extend `scripts/validate-package.mjs` so release metadata drift fails before pub
 
 - `package.json.version` and `manifest.json.version` are valid stable `x.y.z` versions.
 - `package.json.version === manifest.json.version`.
-- `manifest.minAppVersion` is a non-empty version string.
+- `manifest.minAppVersion` is a valid `x.y.z` version.
 - `versions.json` contains the current manifest version.
 - `versions.json[currentVersion] === manifest.minAppVersion`.
 - `package.json.packageManager` identifies pnpm.
@@ -85,7 +85,7 @@ A failed preflight must leave all files untouched. The helper is not described a
 
 ### 1.4 Script regression tests
 
-Add fast tests that spawn the version helper/validator against temporary fixture directories. Cover:
+Add fast tests that spawn the version helper/validator against temporary fixture directories initialized as small Git repositories so tracked-file checks are real. Cover:
 
 - patch/minor/major and explicit versions derive one target for all metadata,
 - existing package/manifest drift is rejected before mutation,
@@ -104,12 +104,12 @@ The current implementation is the contract for this hardening:
 
 > **Copy policy keeps the local version at the canonical path and preserves the remote version as a conflict copy.**
 
-This is preferable to changing runtime behavior during release hardening because the resolver action name, unit tests, and current real-GitHub E2E already agree on local-primary semantics. It also keeps the file the user is actively editing at its familiar local path while preserving the competing remote lineage.
+This avoids a breaking semantic flip during release hardening because the resolver action name, unit tests, and current real-GitHub E2E already agree on local-primary behavior. It also keeps the file the user is actively editing at its familiar local path while preserving the competing remote lineage.
 
 Update:
 
 - English and Chinese FAQ copy-policy wording,
-- the Settings description/option label so direction is explicit,
+- the Settings option/description to an explicit user-facing phrase such as `Copy (keep local, copy remote)`,
 - E2E/test names/messages where necessary.
 
 No conflict-resolution policy is added.
@@ -171,7 +171,7 @@ Add deterministic scenarios for:
 - folder delete on A versus stale descendant edit on B,
 - folder delete on A versus stale descendant recreate on B.
 
-Assertions cover exact final path set, byte lineage, conflict-copy count, and identity continuity/discontinuity. Expected outcomes must be derived from the same local-primary contract above, not invented separately for folders.
+Assertions cover exact final path set, byte lineage, conflict-copy count, and identity continuity/discontinuity. Expected outcomes are derived from the same local-primary contract above, not invented separately for folders.
 
 ---
 
@@ -185,7 +185,7 @@ Add regressions for two different file identities whose paths collide only after
 - case-only collision such as `Foo.md` vs `foo.md`,
 - Unicode NFC/NFD-equivalent names.
 
-The desired invariant is **fail early before local or remote mutation with a clear collision error** when different file identities occupy the same normalized namespace key (`NFC + case-fold/lowercase`).
+The required invariant is **fail early before local or remote mutation with a clear collision error** when different file identities occupy the same normalized namespace key (`NFC + lowercase`, matching the existing collision convention).
 
 A same-file-identity case-only rename is not treated as two colliding files and remains allowed as a rename. This distinction prevents the safety check from breaking legitimate rename semantics.
 
@@ -195,7 +195,7 @@ If current code fails only late at a local precondition, keep the failing regres
 
 Add a regression where the deterministic conflict-copy candidate path is already occupied by an unrelated user file. The minimum required behavior is fail-safe: the existing user file must never be overwritten silently.
 
-Generating numbered alternate conflict names is out of scope unless the regression proves the current fail-safe path produces an unacceptable correctness defect; a clear refusal is acceptable for this hardening.
+For this hardening, a clear refusal is accepted; automatically inventing numbered alternate conflict-copy names is out of scope.
 
 ### 3.3 Rescan causality matrix
 
@@ -211,7 +211,7 @@ A rescan may discard redundant content-only `modify` events, but it must never d
 
 ### 3.4 Runtime automatic replan user flow
 
-Add a deterministic runtime-level test proving the user-facing `V4PluginRuntime` path automatically retries a branch-head/stale-ref publication race within its bounded retry loop. The test should assert:
+Add a deterministic runtime-level test proving the user-facing `V4PluginRuntime` path automatically retries a branch-head/stale-ref publication race within its bounded retry loop. The test must assert:
 
 - first attempt observes an injected branch-head race,
 - retry/replan occurs without requiring a second manual user action,
@@ -219,7 +219,7 @@ Add a deterministic runtime-level test proving the user-facing `V4PluginRuntime`
 - progress exposes a retry attempt,
 - no duplicate conflict copies or lost updates are produced.
 
-The existing lower-level live race remains useful for real GitHub ref behavior; this deterministic test proves the UX layer that hides transient CAS races from users.
+The existing lower-level live race remains useful for real GitHub ref behavior; this deterministic test proves the UX layer that hides transient publication races from users.
 
 ### 3.5 Production-code rule
 
@@ -242,33 +242,40 @@ Add `.github/workflows/github-e2e-live.yml` as the real network qualification wo
 
 The live suite must use a **dedicated disposable E2E repository**, not the plugin source repository and not a real user vault.
 
-Configure a GitHub Environment named `github-e2e`:
+Configure a GitHub Environment named `github-e2e` with configuration names that comply with GitHub's reserved-prefix rules:
 
-- environment variable `GITHUB_E2E_OWNER`,
-- environment variable `GITHUB_E2E_REPO`,
-- secret `GITHUB_E2E_TOKEN`.
+- environment variable `E2E_OWNER`,
+- environment variable `E2E_REPO`,
+- environment secret `E2E_TOKEN`.
 
-Do not store a fixed branch name. The workflow derives:
+The workflow maps those values into the existing runner interface:
 
 ```text
+GITHUB_E2E_OWNER=${E2E_OWNER}
+GITHUB_E2E_REPO=${E2E_REPO}
+GITHUB_E2E_TOKEN=${E2E_TOKEN}
 GITHUB_E2E_BRANCH=obsidian-sync-e2e/run-${GITHUB_RUN_ID}
 ```
 
-A rerun of the same workflow run reuses/reset-cleans the same branch; different runs use different branches and cannot delete each other's test state.
+Do not configure `GITHUB_E2E_*` as GitHub configuration-variable or secret names because GitHub reserves the `GITHUB_` prefix. They exist only as process environment variables inside the job.
 
-Use a fine-grained token scoped only to the disposable E2E repository with the minimum repository Contents permission required for Git data/ref writes. Environment deployment-branch protection should allow only `master` for this environment.
+The workflow must fail before destructive work if `${E2E_OWNER}/${E2E_REPO}` equals the source repository `${github.repository}`.
+
+A rerun of the same workflow run reuses/reset-cleans the same derived branch; different runs use different branches and cannot delete each other's test state.
+
+Use a fine-grained token scoped only to the disposable E2E repository with the minimum repository Contents permission required for Git data/ref writes. Environment deployment-branch protection permits only `master`; no required-reviewer gate is needed for the cleanup job.
 
 ### 4.2 Trigger and qualified SHA
 
 - `workflow_dispatch` only.
-- The workflow must be dispatched on ref `master`; guard `github.ref == refs/heads/master`.
+- The workflow must be dispatched on ref `master`; a normal failing guard step verifies `github.ref == refs/heads/master` so the qualification job cannot become silently skipped.
 - The qualified SHA is exactly `github.sha`.
 - Before destructive work, verify that `github.sha` still equals the source repository's current `refs/heads/master`; a queued stale dispatch fails and must be rerun.
 - Ordinary PR/fork workflows never receive the live-test environment or token.
 
 ### 4.3 Qualification job
 
-The qualification job:
+Use a required job with stable job id/name `qualify`. It:
 
 1. checks out `github.sha`,
 2. installs pnpm dependencies with `--frozen-lockfile`,
@@ -276,23 +283,31 @@ The qualification job:
 4. runs `pnpm test:github-e2e:quick` without `GITHUB_E2E_COMPILE_ONLY`,
 5. therefore executes the existing plaintext/encrypted A/B/C scenarios and controlled real ref race,
 6. adds an encrypted external-mutation safety scenario: an out-of-band commit on an encrypted V4 branch must be rejected safely, remain reachable, and never be silently overwritten,
-7. writes an optional non-secret audit manifest after the E2E command succeeds.
+7. after E2E success, writes a non-secret audit manifest and uploads it.
 
-The current Node suite timeout is 15 minutes; give the job a finite workflow timeout with enough headroom (for example 25 minutes) rather than matching the inner timeout exactly.
+The current Node suite timeout is 15 minutes. Set `timeout-minutes: 25` on `qualify` to leave bounded workflow overhead without creating an unbounded run.
 
 ### 4.4 Qualification authority
 
-The **completed successful workflow run** is the authoritative qualification record. Stable release looks up `github-e2e-live.yml` runs and requires:
+The authoritative qualification record is the exact-SHA workflow run **plus its required job results**. Stable release selects a `github-e2e-live.yml` run only if:
 
 - `event == workflow_dispatch`,
 - `head_branch == master`,
 - `head_sha == release target SHA`,
 - `status == completed`,
-- `conclusion == success`.
+- `conclusion == success`,
+- job `qualify` has `conclusion == success`,
+- job `cleanup` has `conclusion == success`.
 
-This avoids making release safety depend on artifact retention/expiry or rerun artifact naming behavior.
+Requiring named successful jobs protects against an accidentally skipped qualification job producing a misleading workflow-level success.
 
-For human auditability, the workflow may additionally upload an immutable artifact named with SHA, run ID, and run attempt, containing:
+The workflow additionally uploads an audit artifact named:
+
+```text
+github-e2e-qualification-${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}
+```
+
+containing:
 
 ```json
 {
@@ -305,17 +320,23 @@ For human auditability, the workflow may additionally upload an immutable artifa
 }
 ```
 
-The artifact is informative; release does not fail merely because an old audit artifact expired if the successful exact-SHA workflow run metadata is still available.
+The artifact is informative; release authority does not depend on artifact retention/expiry.
 
 ### 4.5 Cleanup resilience
 
-Use a separate cleanup job with `needs: qualify` and `if: always()` rather than relying only on a final step inside the potentially timed-out test job. The cleanup job receives the same isolated environment and deletes only its derived `obsidian-sync-e2e/run-${GITHUB_RUN_ID}` branch.
+Use a required job with stable job id/name `cleanup`, `needs: qualify`, and `if: always()`. It receives the same isolated environment and deletes only its derived `obsidian-sync-e2e/run-${GITHUB_RUN_ID}` branch.
 
-Cleanup treats an already-absent branch as success. The workflow is considered qualified only when both the qualification and cleanup jobs succeed.
+Cleanup:
+
+- treats an already-absent branch as success,
+- retries transient GitHub API cleanup failure a bounded maximum of three attempts,
+- fails if the branch still exists after those attempts.
+
+A workflow is release-qualifying only when both `qualify` and `cleanup` succeed.
 
 Hard cancellation can still prevent any cleanup job from running; the unique per-run branch makes such residue isolated and harmless. A rerun resets the same branch, and maintainer docs include a copy-paste cleanup command.
 
-A global concurrency lock is not required for correctness because branches are unique. A small `cancel-in-progress: false` concurrency/rate-throttle may still be used if desired to avoid unnecessary GitHub API pressure, but it must not be the isolation mechanism.
+Use workflow concurrency group `github-e2e-live` with `cancel-in-progress: false` as an API-rate throttle. Correctness does not depend on this lock because branches are unique.
 
 ---
 
@@ -323,19 +344,27 @@ A global concurrency lock is not required for correctness because branches are u
 
 The existing `.github/workflows/pre-release.yml` must no longer create public tags/releases from arbitrary non-master branch version bumps.
 
-Convert it to a **Branch Candidate Build**:
+Convert it to **Branch Candidate Build** with exactly these triggers:
 
-- trigger on relevant non-master pushes/manual dispatch as appropriate,
-- `contents: read` only,
+- `push` to non-master branches when `manifest.json` changes, preserving the current version-candidate behavior,
+- `workflow_dispatch` for explicit candidate builds.
+
+The workflow uses `contents: read` only and runs:
+
 - frozen pnpm install,
 - build,
-- fast/repeat/recovery/resource/feasibility tests,
+- fast tests,
+- repeat tests,
+- recovery tests,
+- resource tests,
+- feasibility tests,
 - compile-only GitHub E2E harness,
 - package validation,
-- upload plugin artifact named with branch/SHA,
-- never create a Git tag or GitHub Release.
+- upload plugin artifact named with branch and SHA.
 
-If public alpha/beta publishing is desired later, it should be a separate explicit qualified release channel. It is intentionally not part of this hardening.
+It never creates a Git tag or GitHub Release.
+
+Public alpha/beta publication is intentionally removed from this hardening. A future prerelease channel must be separately explicit and qualified.
 
 ---
 
@@ -348,34 +377,36 @@ Replace automatic `manifest.json`-push/tag-trigger publication with a `workflow_
 - one required `version` input in stable `x.y.z` form,
 - dispatch on ref `master` only,
 - target SHA is exactly `github.sha`,
-- verify at start that target SHA is the current `refs/heads/master`,
+- a normal failing guard verifies target SHA is the current `refs/heads/master`,
 - `permissions: actions: read, contents: write`, with no broader repository permissions,
-- use a release concurrency group with `cancel-in-progress: false` so two release dispatches cannot race tag creation.
+- release concurrency group `stable-release` with `cancel-in-progress: false` so release dispatches cannot race tag creation.
 
 ### 6.2 Release preconditions
 
-Before any tag/release mutation:
+Before any tag/release mutation, the workflow must establish all of the following; checks that require built artifacts run after the build step but still before publication:
 
 1. requested version is valid stable `x.y.z`,
 2. requested version equals `manifest.json.version` and `package.json.version`,
 3. `versions.json[version] === manifest.minAppVersion`,
-4. package validation passes,
-5. requested version is greater than the highest existing stable `x.y.z` tag (ignore historical prerelease suffixes),
-6. target version tag/release does not already exist,
-7. a completed successful `github-e2e-live.yml` workflow-dispatch run exists for exact `head_sha == github.sha`,
+4. full package validation passes after build artifacts exist,
+5. requested version is greater than the highest existing stable `x.y.z` tag (historical prerelease suffixes are ignored),
+6. target stable version tag/release does not already exist,
+7. a completed successful `github-e2e-live.yml` workflow-dispatch run exists for exact `head_sha == github.sha`, with successful `qualify` and `cleanup` jobs,
 8. deterministic release gates pass.
 
 No "latest successful E2E" fallback is permitted. Parent/child SHA qualification is not accepted.
 
 ### 6.3 Qualification lookup
 
-Use the repository's GitHub Actions API/`gh api` with `GITHUB_TOKEN` to query the specific `github-e2e-live.yml` workflow filtered by exact `head_sha`. Validate the returned run fields listed in §4.4.
+Use the repository's GitHub Actions API via `gh api` and `GITHUB_TOKEN` to query the specific `github-e2e-live.yml` workflow filtered by exact `head_sha`, `event=workflow_dispatch`, and successful/completed state. For candidate runs, query run jobs and require the stable job ids/names `qualify` and `cleanup` to have successful conclusions.
 
-The lookup depends on Actions run metadata, not downloadable artifact retention.
+If no candidate satisfies every exact-SHA workflow/job condition, release fails closed.
+
+The lookup depends on Actions run/job metadata, not downloadable artifact retention.
 
 ### 6.4 Deterministic release gates
 
-Rerun before publication:
+Run before publication:
 
 - `pnpm install --frozen-lockfile`,
 - `pnpm build`,
@@ -387,27 +418,30 @@ Rerun before publication:
 - compile-only real GitHub E2E harness,
 - package validation.
 
-The live network suite is not rerun inside the release job because exact-SHA qualification already exists. This makes release retries deterministic with respect to the disposable E2E repository.
+The live network suite is not rerun inside stable release because exact-SHA qualification already exists. This keeps stable-release retries deterministic with respect to the disposable E2E repository.
 
 ### 6.5 Remove release-time translation network dependency
 
-Do not `pip install deep-translator` or call Google Translate as part of the release gate. Release notes should use GitHub-generated notes and/or repository-local text. Translation, if desired, belongs outside the correctness-critical release path.
+Do not `pip install deep-translator` or call Google Translate as part of the release path. Stable release notes use GitHub-generated release notes only. Translation remains outside the correctness-critical release workflow.
 
 ### 6.6 Final stale-master guard
 
-Immediately before publication, re-check that the target SHA is still current `master`. If master advanced, fail before creating a tag/release and require a new live qualification for the new tip.
+Immediately before publication, re-check that target SHA is still current `master`. If master advanced, fail before creating a tag/release and require a new live qualification for the new tip.
 
 This is a policy guard, not a claim of atomic compare-and-swap with future master pushes; exact target SHA remains the release-content identity.
 
-### 6.7 Release creation
+### 6.7 Release creation and partial-failure rule
 
-Use the authenticated GitHub CLI/API already present on GitHub-hosted runners rather than a third-party release action for the write-token step. After all gates:
+After every gate passes, package the plugin ZIP and use authenticated GitHub CLI/API on the hosted runner rather than a third-party release action to create the stable tag/release at exactly the qualified target SHA, generate release notes, and upload:
 
-- create/publish the stable release/tag at exactly the qualified target SHA,
-- generate release notes,
-- upload `main.js`, `manifest.json`, `styles.css`, and the packaged plugin ZIP.
+- `main.js`,
+- `manifest.json`,
+- `styles.css`,
+- packaged plugin ZIP.
 
-No tag/release is created on validation failure.
+No release mutation occurs before all qualification/deterministic gates pass.
+
+GitHub tag/release/asset APIs are not a single cross-resource transaction. If the publication command itself fails after mutation begins, the workflow must report a publication failure and must not pretend rollback succeeded. Maintainer docs include an inspection/cleanup command for a partial draft/tag before retry; a rerun remains fail-closed while a conflicting tag/release exists.
 
 ---
 
@@ -433,19 +467,19 @@ It never executes destructive GitHub REST tests. A GitHub API outage in the disp
 1. merge code/version metadata to `master`,
 2. ensure deterministic CI is green,
 3. dispatch **GitHub E2E Live** on ref `master`,
-4. require successful qualification + cleanup for that exact master SHA,
+4. require successful `qualify` + `cleanup` for that exact master SHA,
 5. dispatch **Stable Release** on ref `master` with the version input,
-6. release workflow revalidates metadata, monotonic version, deterministic gates, and exact-SHA E2E success,
+6. stable release revalidates metadata, monotonic version, deterministic gates, and exact-SHA workflow/job evidence,
 7. tag/release is created only after every gate passes.
 
-If master changes between live qualification and release, the stable release fails closed and the new tip must be qualified. This deliberately trades a small amount of maintainer ceremony for unambiguous release evidence.
+If master changes between live qualification and stable release, stable release fails closed and the new tip must be qualified. This deliberately trades a small amount of maintainer ceremony for unambiguous release evidence.
 
 ### 8.2 Documentation changes
 
 Update:
 
-- `docs/github-e2e.md`: dedicated disposable repo, environment vars/secret, dynamic branch behavior, manual workflow use, local command, residue cleanup command, qualification boundary,
-- add/refresh a release-maintainer document describing candidate build, live qualification, and stable release sequence,
+- `docs/github-e2e.md`: dedicated disposable repo, Environment names `E2E_OWNER`/`E2E_REPO`/`E2E_TOKEN`, runtime env mapping, dynamic branch behavior, manual workflow use, local command, residue cleanup command, qualification boundary,
+- add/refresh a release-maintainer document describing candidate build, live qualification, stable release, and partial-publication cleanup,
 - `docs/FAQ.md` English/Chinese copy-policy semantics,
 - Settings copy-policy description so local-primary behavior is visible before users select it,
 - README qualification section to distinguish deterministic CI, live real-GitHub qualification, and physical large-file evidence.
@@ -476,13 +510,14 @@ If the environment cannot fetch dependencies, record that limitation and use Git
 
 ### 9.2 Maintainer-run live step
 
-The expected maintainer-run step when credentials are unavailable to the implementation environment is:
+When live credentials are unavailable to the implementation environment, the maintainer-run steps are:
 
-- configure GitHub Environment `github-e2e`,
-- dispatch **GitHub E2E Live** on `master`,
-- after it succeeds, dispatch **Stable Release** if publication is desired.
+1. create/configure dedicated disposable E2E repository,
+2. configure GitHub Environment `github-e2e` with variables `E2E_OWNER`, `E2E_REPO` and secret `E2E_TOKEN`,
+3. dispatch **GitHub E2E Live** on `master`,
+4. after it succeeds, dispatch **Stable Release** if publication is desired.
 
-The implementation handoff must include copy-paste local E2E commands as an alternative and exact UI/configuration instructions. The code is not described as live-qualified until the real workflow succeeds for the target SHA.
+The implementation handoff includes copy-paste local E2E commands and exact GitHub UI/configuration steps. The code is not described as live-qualified until the real workflow succeeds for the target SHA.
 
 ---
 
@@ -515,11 +550,13 @@ This hardening does not include:
 - runtime automatic branch-race retry has deterministic user-flow coverage.
 - no V4 production change exists without a failing regression that requires it.
 - ordinary CI stays secret-free and compiles the live harness.
+- GitHub Environment names comply with reserved-prefix rules; process env still matches the existing runner.
 - live E2E uses a dedicated disposable repository and unique per-run branch.
 - encrypted external mutation refusal is covered live.
-- successful exact-SHA live workflow metadata is authoritative qualification evidence.
-- cleanup is isolated into a best-effort separate job and leftover branches are uniquely scoped.
+- successful exact-SHA workflow + `qualify`/`cleanup` job metadata is authoritative qualification evidence.
+- cleanup is isolated into a bounded-retry separate job and leftover branches are uniquely scoped.
 - branch candidate workflow cannot create tags/releases.
 - stable release is explicit, monotonic, exact-SHA qualified, and serialized.
-- stable release contains no translation/network dependency beyond GitHub itself and dependency installation.
-- stable release artifacts/tags are created only after all deterministic and exact-SHA qualification gates pass.
+- stable release contains no translation service dependency.
+- no stable-release mutation begins before all deterministic and exact-SHA qualification gates pass.
+- partial GitHub publication failure is surfaced honestly and has documented recovery rather than assumed rollback.
