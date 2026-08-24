@@ -12,6 +12,7 @@
     "ver": "node ./scripts/update-version.js",
     "test:github-e2e": "node scripts/run-github-e2e.mjs",
     "test:github-e2e:quick": "node scripts/run-github-e2e.mjs",
+    "test:github-e2e:compile": "node scripts/run-github-e2e.mjs --compile-only",
     "zip": "node scripts/zip-source.mjs",
     "test:fast": "node scripts/run-tests.mjs --tier=fast",
     "test:repeat": "node scripts/run-test-repeat.mjs",
