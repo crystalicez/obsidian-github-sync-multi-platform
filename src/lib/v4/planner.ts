@@ -58,18 +58,36 @@ function v4NamespaceKey(path: string): string {
   return path.normalize("NFC").toLowerCase();
 }
 
-function assertCombinedV4NamespaceSafe(local: V4LogicalFile[], remote: V4LogicalFile[]): void {
-  const seen = new Map<string, { fileId: string; path: string }>();
-  for (const file of [...remote, ...local]) {
+function byV4Namespace(files: V4LogicalFile[]): Map<string, V4LogicalFile> {
+  const result = new Map<string, V4LogicalFile>();
+  for (const file of files) {
     const key = v4NamespaceKey(file.path);
-    const prior = seen.get(key);
-    if (!prior) {
-      seen.set(key, { fileId: file.fileId, path: file.path });
-      continue;
-    }
-    if (prior.fileId !== file.fileId) {
+    const prior = result.get(key);
+    if (prior && prior.fileId !== file.fileId) {
       throw new Error(`V4 path collision across local/remote state: ${prior.path} vs ${file.path}`);
     }
+    if (!prior) result.set(key, file);
+  }
+  return result;
+}
+
+function isUnchangedBaseFile(file: V4LogicalFile, base: V4LogicalFile[]): boolean {
+  return base.some(candidate => candidate.fileId === file.fileId && sameFile(candidate, file));
+}
+
+function assertCombinedV4NamespaceSafe(base: V4LogicalFile[], local: V4LogicalFile[], remote: V4LogicalFile[]): void {
+  const localByNamespace = byV4Namespace(local);
+  const remoteByNamespace = byV4Namespace(remote);
+
+  for (const [key, localFile] of localByNamespace) {
+    const remoteFile = remoteByNamespace.get(key);
+    if (!remoteFile || remoteFile.fileId === localFile.fileId) continue;
+
+    const localIsUnchangedBase = isUnchangedBaseFile(localFile, base);
+    const remoteIsUnchangedBase = isUnchangedBaseFile(remoteFile, base);
+    if (localIsUnchangedBase !== remoteIsUnchangedBase) continue;
+
+    throw new Error(`V4 path collision across local/remote state: ${remoteFile.path} vs ${localFile.path}`);
   }
 }
 
@@ -79,7 +97,7 @@ export function planV4Sync(input: {
   local: V4LogicalFile[];
   remote: V4LogicalFile[];
 }): V4SyncPlan {
-  if (input.operation === "normal") assertCombinedV4NamespaceSafe(input.local, input.remote);
+  if (input.operation === "normal") assertCombinedV4NamespaceSafe(input.base, input.local, input.remote);
   const base = byFileId(input.base);
   const local = byFileId(input.local);
   const remote = byFileId(input.remote);
