@@ -41,3 +41,34 @@ test("v4 planner treats a rename as one logical push", () => {
   ]);
   assert.equal(plan.changedFiles, 1);
 });
+
+test("v4 planner rejects different identities that collide across local and remote namespaces", () => {
+  for (const [localPath, remotePath] of [
+    ["note.md", "note.md"],
+    ["Foo.md", "foo.md"],
+    ["é.md", "e\u0301.md"],
+  ] as const) {
+    assert.throws(
+      () => planV4Sync({
+        operation: "normal",
+        base: [],
+        local: [file(localPath, "local-id", "local")],
+        remote: [file(remotePath, "remote-id", "remote")],
+      }),
+      /V4 path collision across local\/remote state/u,
+    );
+  }
+});
+
+test("v4 planner allows a same-identity case-only rename", () => {
+  const plan = planV4Sync({
+    operation: "normal",
+    base: [file("Foo.md", "note", "same")],
+    local: [file("foo.md", "note", "same")],
+    remote: [file("Foo.md", "note", "same")],
+  });
+
+  assert.deepEqual(plan.pushes.map(change => ({ kind: change.kind, path: change.path, previousPath: change.previousPath })), [
+    { kind: "rename", path: "foo.md", previousPath: "Foo.md" },
+  ]);
+});
