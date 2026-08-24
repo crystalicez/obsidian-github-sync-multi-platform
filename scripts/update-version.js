@@ -1,116 +1,92 @@
 #!/usr/bin/env node
 /**
- * 用法（在项目根目录）：
- *  pnpm run ver -- 0.7.0      # 将 version 设置为 0.7.0
- *  pnpm run ver -- patch (或 c) # 将 patch 自增（如 0.6.24 -> 0.6.25）
- *  pnpm run ver -- minor (或 b) # 将 minor 自增（如 0.6.24 -> 0.6.25）
- *  pnpm run ver -- major (或 a) # 将 major 自增（如 0.6.24 -> 0.6.25）
- *  或者使用环境变量： NEW_VERSION=0.7.0 pnpm run ver
- *
- * 优先级（目标版本来源）：
- * 1. 命令行参数（pnpm run ver -- <version|major|minor|patch>）
- * 2. 环境变量 NEW_VERSION
- * 3. 环境变量 npm_package_version（不常用，通常为 package.json 中原始值）
+ * Usage (project root):
+ *   pnpm run ver -- 1.2.3
+ *   pnpm run ver -- patch|minor|major
+ *   NEW_VERSION=1.2.3 pnpm run ver
  */
 
 const fs = require('fs');
 const path = require('path');
 
 function readJson(filePath) {
-    const txt = fs.readFileSync(filePath, 'utf8');
-    return JSON.parse(txt);
+    return JSON.parse(fs.readFileSync(filePath, 'utf8'));
 }
-function writeJsonWithBackup(filePath, obj) {
-    const txt = JSON.stringify(obj, null, 2) + '\n';
-    const bak = filePath + '.bak';
-    //if (fs.existsSync(filePath)) fs.copyFileSync(filePath, bak);
-    fs.writeFileSync(filePath, txt, 'utf8');
+
+function writeJson(filePath, value) {
+    fs.writeFileSync(filePath, JSON.stringify(value, null, 2) + '\n', 'utf8');
 }
-function isValidSemver(v) {
-    return /^\d+\.\d+\.\d+$/.test(v);
+
+function isValidSemver(value) {
+    return /^\d+\.\d+\.\d+$/.test(value);
 }
+
+function compareSemver(left, right) {
+    const a = left.split('.').map(Number);
+    const b = right.split('.').map(Number);
+    for (let index = 0; index < 3; index++) {
+        if (a[index] !== b[index]) return a[index] - b[index];
+    }
+    return 0;
+}
+
 function bumpVersion(current, part) {
-    if (!isValidSemver(current)) throw new Error('当前版本不是 x.y.z 格式: ' + current);
-    const [maj, min, pat] = current.split('.').map(n => parseInt(n, 10));
-    if (part === 'major') return `${maj + 1}.0.0`;
-    if (part === 'minor') return `${maj}.${min + 1}.0`;
-    if (part === 'patch') return `${maj}.${min}.${pat + 1}`;
-    throw new Error('未知的增量类型: ' + part);
-}
-function updateFileVersion(filePath, targetVersion, bumpOption) {
-    if (!fs.existsSync(filePath)) {
-        console.warn('文件不存在，跳过:', filePath);
-        return null;
-    }
-    const data = readJson(filePath);
-    if (!data.version) {
-        console.warn('文件中没有 version 字段，跳过:', filePath);
-        return null;
-    }
-    const from = data.version;
-    let to = targetVersion;
-    if (!to && bumpOption) to = bumpVersion(from, bumpOption);
-    if (!to) throw new Error('没有提供目标版本或增量选项');
-    if (!isValidSemver(to)) throw new Error('目标版本格式不合法，应为 x.y.z: ' + to);
-    data.version = to;
-    writeJsonWithBackup(filePath, data);
-    return { filePath, from, to };
+    if (!isValidSemver(current)) throw new Error(`Current version is not x.y.z: ${current}`);
+    const [major, minor, patch] = current.split('.').map(Number);
+    if (part === 'major') return `${major + 1}.0.0`;
+    if (part === 'minor') return `${major}.${minor + 1}.0`;
+    if (part === 'patch') return `${major}.${minor}.${patch + 1}`;
+    throw new Error(`Unknown version bump: ${part}`);
 }
 
-// 主逻辑
 (function main() {
-    const rawArgs = process.argv.slice(2); // 通过 npm run bump -- <args> 传入
-
-    const aliasMap = { 'a': 'major', 'b': 'minor', 'c': 'patch' };
-    const resolve = (v) => aliasMap[v] || v;
-
-    const arg = resolve(rawArgs[0]);
-    const envVersion = resolve(process.env.NEW_VERSION || process.env.npm_package_version || null);
-    const bumpOptions = new Set(['major', 'minor', 'patch']);
-
-    let newVersion = null;
-    let bumpOption = null;
-
-    if (arg) {
-        if (bumpOptions.has(arg)) bumpOption = arg;
-        else if (isValidSemver(arg)) newVersion = arg;
-        else {
-            console.error('参数无效，应为 x.y.z 或 major/minor/patch');
-            process.exit(1);
-        }
-    } else if (envVersion) {
-        if (bumpOptions.has(envVersion)) bumpOption = envVersion;
-        else if (isValidSemver(envVersion)) newVersion = envVersion;
-        else {
-            console.error('环境变量 NEW_VERSION 格式无效，应为 x.y.z 或 major/minor/patch');
-            process.exit(1);
-        }
-    } else {
-        console.error('未提供版本参数：使用 npm run bump -- <version|major|minor|patch> 或 NEW_VERSION 环境变量');
+    const aliases = { a: 'major', b: 'minor', c: 'patch' };
+    const resolve = value => aliases[value] || value;
+    const requestedRaw = process.argv.slice(2)[0] ?? process.env.NEW_VERSION;
+    if (!requestedRaw) {
+        console.error('Provide x.y.z or major/minor/patch explicitly.');
         process.exit(1);
     }
 
+    const requested = resolve(requestedRaw);
+    const bumpOptions = new Set(['major', 'minor', 'patch']);
     const cwd = process.cwd();
-    const targets = [
-        path.join(cwd, 'package.json'),
-        path.join(cwd, 'manifest.json'),
-    ];
+    const packagePath = path.join(cwd, 'package.json');
+    const manifestPath = path.join(cwd, 'manifest.json');
+    const versionsPath = path.join(cwd, 'versions.json');
 
     try {
-        const results = [];
-        for (const t of targets) {
-            const res = updateFileVersion(t, newVersion, bumpOption);
-            if (res) results.push(res);
+        const packageJson = readJson(packagePath);
+        const manifest = readJson(manifestPath);
+        const versions = readJson(versionsPath);
+
+        if (!isValidSemver(packageJson.version) || !isValidSemver(manifest.version) || packageJson.version !== manifest.version) {
+            throw new Error(`Current version metadata is inconsistent: package=${packageJson.version} manifest=${manifest.version}`);
         }
-        if (results.length === 0) {
-            console.warn('没有更新任何文件。');
-            process.exit(0);
+        if (!isValidSemver(manifest.minAppVersion)) {
+            throw new Error(`manifest.minAppVersion is not x.y.z: ${manifest.minAppVersion}`);
         }
-        for (const r of results) {
-            console.log(`${path.basename(r.filePath)}: ${r.from} -> ${r.to}`);
+        if (versions[packageJson.version] !== manifest.minAppVersion) {
+            throw new Error(`versions.json is inconsistent for current version ${packageJson.version}`);
         }
-    } catch (err) {
-        console.error('错误：', err.message);
+
+        const target = bumpOptions.has(requested) ? bumpVersion(packageJson.version, requested) : requested;
+        if (!isValidSemver(target)) throw new Error(`Invalid target version: ${target}`);
+        if (compareSemver(target, packageJson.version) <= 0) {
+            throw new Error(`Target version must be greater than ${packageJson.version}`);
+        }
+        if (Object.hasOwn(versions, target)) throw new Error(`versions.json already contains ${target}`);
+
+        const nextPackage = { ...packageJson, version: target };
+        const nextManifest = { ...manifest, version: target };
+        const nextVersions = { ...versions, [target]: manifest.minAppVersion };
+
+        writeJson(packagePath, nextPackage);
+        writeJson(manifestPath, nextManifest);
+        writeJson(versionsPath, nextVersions);
+        console.log(`Version: ${packageJson.version} -> ${target}`);
+    } catch (error) {
+        console.error(`Error: ${error.message}`);
         process.exit(1);
     }
 })();
