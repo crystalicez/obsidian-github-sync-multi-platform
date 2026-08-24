@@ -75,14 +75,15 @@ Phase changes appear immediately. Rapid path and counter changes are published a
 
 ## 🧪 Qualification status
 
-The V4 execution path is covered by deterministic model, recovery/crash, bounded-resource, and virtual-stream tests. These tests do **not** substitute for physical-device evidence.
+V4 uses three separate evidence layers; one layer never substitutes for another:
 
-- Desktop bounded I/O, staged commit/rollback, source-snapshot guards, exact-candidate recovery, cancellation, and transport pacing are automated release gates. The official Windows Task 15 automated gate and separate 2 GiB + 5 GiB cryptographic virtual soak are recorded as passed.
-- A physical encrypted 5 GiB Windows Force Push → no-op → clean-vault Force Pull round trip is a separate qualification and is not claimed until recorded in `tests/baselines/v4/windows.json`.
-- Android currently has no supported bounded local read/final-stage-commit path in this implementation for multi-gigabyte files. Large mobile upload is therefore capability-gated; Android 5 GiB is **not** a supported claim.
-- The current 48 MiB-part model for one 5 GiB revision is 107 data parts and about 114 modeled content/publication mutations with a minimum policy pacing floor of 113 seconds. Repeated full encrypted 5 GiB revisions are operationally limited by repository growth; see [the GitHub Free operational model](docs/engineering/v4-github-free-operational-model.md).
+- **Deterministic CI/release gates** cover model behavior, recovery/crash handling, bounded resources, source snapshots, cancellation, transport pacing, and compile the destructive real-GitHub E2E harness. The official Windows Task 15 automated gate and separate 2 GiB + 5 GiB cryptographic virtual soak are recorded as passed.
+- **Live real-GitHub qualification** is a credentialed exact-SHA workflow against a dedicated disposable repository. It exercises plaintext/encrypted multi-device conflicts, branch-head races, exact Copy-policy lineage, and encrypted out-of-band mutation refusal. A commit is not described as live-qualified until that workflow's `qualify` and `cleanup` jobs actually succeed for the exact SHA.
+- **Physical-device/large-file evidence** remains separate. A physical encrypted 5 GiB Windows Force Push → no-op → clean-vault Force Pull round trip is not claimed until recorded in `tests/baselines/v4/windows.json`. Android currently lacks a supported bounded local read/final-stage-commit path for multi-gigabyte files, so Android 5 GiB is not a supported claim.
 
-See [Windows/Android validation](docs/testing/v4-windows-android-validation.md) and [performance methodology](docs/engineering/v4-performance-methodology.md) for the evidence rules.
+The current 48 MiB-part model for one 5 GiB revision is 107 data parts and about 114 modeled content/publication mutations with a minimum policy pacing floor of 113 seconds. Repeated full encrypted 5 GiB revisions are operationally limited by repository growth; see [the GitHub Free operational model](docs/engineering/v4-github-free-operational-model.md).
+
+See [real GitHub E2E qualification](docs/github-e2e.md), [release procedure](docs/releasing.md), [Windows/Android validation](docs/testing/v4-windows-android-validation.md), and [performance methodology](docs/engineering/v4-performance-methodology.md) for the evidence rules.
 
 ## ❓ FAQ
 
@@ -129,14 +130,16 @@ For detailed information about synchronization mechanisms, incremental sync, and
 
 1.  **GitHub 令牌**: 访问 [GitHub Settings](https://github.com/settings/tokens) 生成一个具有 `repo` 权限的个人访问令牌 (PAT)。
 2.  **仓库配置**:
-    -   **Owner**: 您的 GitHub 用户名。
-    -   **Repo**: 您的私有笔记仓库名称。
-    -   **Branch**: 默认为 `main`。
-3.  **Sync Options**: 开启“启用同步”即可享受实时同步体验。
+    -   **Owner**: 您的 GitHub 用户名.
+    -   **Repo**: 您的私有笔记仓库名称.
+    -   **Branch**: 默认为 `main`.
+3.  **Sync Options**: 开启“启用同步”即可享受实时同步体验.
 
 ## 🧪 资格验证状态
 
-V4 已有确定性模型、崩溃恢复、资源上限和虚拟流测试；这些自动化证据**不能替代真实设备的 5 GiB 完整链路测试**。当前移动端大文件仍受有界读取/最终提交能力门控，因此不宣称 Android 5 GiB 支持。重复的 5 GiB 加密修订还会快速增长 Git 历史，GitHub Free 的运行适用性与“API 能否接受一次请求”是两个不同问题。详细证据规则见 [Windows/Android 验证](docs/testing/v4-windows-android-validation.md)。
+V4 将证据分为三个互不替代的层级：**确定性 CI/发布门禁**负责模型、恢复、资源上限、取消与构建验证；**真实 GitHub 资格验证**使用独立一次性仓库，对精确 commit SHA 运行多设备冲突、分支竞争、Copy 策略身份链以及加密分支外部修改拒绝；只有对应 SHA 的 `qualify` 与 `cleanup` 都实际成功后，才称该提交通过真实 GitHub 验证。**物理设备/超大文件证据**仍单独记录，自动化或真实 GitHub 小中型测试都不能替代 5 GiB 真实设备完整链路。
+
+Windows 物理加密 5 GiB 仍需在 `tests/baselines/v4/windows.json` 记录完整 Force Push → no-op → clean-vault Force Pull → SHA-256 相等后才能宣称通过。Android 当前没有受支持的多 GiB 有界本地读取/最终 stage-commit 路径，因此不宣称 Android 5 GiB 支持。详细规则见 [真实 GitHub E2E](docs/github-e2e.md)、[发布流程](docs/releasing.md) 和 [Windows/Android 验证](docs/testing/v4-windows-android-validation.md)。
 
 ## ❓ 常见问题 (FAQ)
 
