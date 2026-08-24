@@ -79,7 +79,7 @@ export function planV4Sync(input: {
   local: V4LogicalFile[];
   remote: V4LogicalFile[];
 }): V4SyncPlan {
-  assertCombinedV4NamespaceSafe(input.local, input.remote);
+  if (input.operation === "normal") assertCombinedV4NamespaceSafe(input.local, input.remote);
   const base = byFileId(input.base);
   const local = byFileId(input.local);
   const remote = byFileId(input.remote);
