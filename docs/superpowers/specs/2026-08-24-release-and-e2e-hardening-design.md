@@ -134,9 +134,12 @@ If a new test exposes a real defect:
 
 Add `.github/workflows/github-e2e-live.yml` as the real network qualification workflow.
 
-### Trigger
+### Trigger and target SHA
 
 - `workflow_dispatch` is required.
+- The workflow must be dispatched with `master` as its ref; a guard fails immediately if `github.ref != refs/heads/master`.
+- The qualified SHA is exactly `github.sha` from that dispatch.
+- The workflow also verifies that `github.sha` still equals the repository's current `refs/heads/master` SHA before starting destructive work. If master advanced after dispatch, the run fails as stale and must be dispatched again.
 - Optional scheduled execution may be added only if it does not make releases dependent on a nightly schedule.
 - Ordinary PRs and forks must never receive the live-test secrets.
 
@@ -155,23 +158,25 @@ The configured repository/branch is disposable. The existing runner's protected/
 
 The workflow:
 
-1. checks out the requested commit SHA,
+1. checks out `github.sha`,
 2. installs pnpm dependencies with `--frozen-lockfile`,
 3. builds the plugin,
 4. runs `pnpm test:github-e2e:quick` without `GITHUB_E2E_COMPILE_ONLY`,
 5. records the exact tested commit SHA,
 6. uploads a small qualification artifact/manifest containing only non-secret evidence,
-7. always attempts branch cleanup through the test harness/final cleanup path.
+7. runs an `if: always()` cleanup step that independently attempts to delete the configured disposable branch, even if the Node test process failed before its `after()` hook.
+
+Cleanup treats an already-absent branch as success and never targets the source repository's default/protected branch names.
 
 ### Concurrency and timeout
 
-Use one concurrency group for the shared disposable E2E target so two runs cannot delete/reset the same branch concurrently. Do not cancel an already-running destructive test merely because a new dispatch starts.
+Use one concurrency group for the shared disposable E2E target so two runs cannot delete/reset the same branch concurrently. Set `cancel-in-progress: false`; a new dispatch waits rather than interrupting an active destructive run.
 
 Set a finite workflow/job timeout. Test correctness must not depend on arbitrary sleeps; existing bounded polling remains acceptable.
 
 ### Evidence artifact
 
-On success, generate a machine-readable file such as `github-e2e-qualification.json` containing at minimum:
+Only after the live E2E command succeeds, generate and upload an artifact named `github-e2e-qualification-${github.sha}` containing `github-e2e-qualification.json`:
 
 ```json
 {
@@ -189,26 +194,41 @@ No tokens, passphrases, file contents, or encrypted object bytes are stored in t
 
 Replace automatic "manifest version changed on master => publish release" behavior with an explicit dispatch flow.
 
-### Trigger and input
+### Trigger and target SHA
 
-`release.yml` becomes `workflow_dispatch`-driven and accepts a release version input. Tag pushes must not create a second release path that bypasses qualification.
+`release.yml` becomes `workflow_dispatch`-only and accepts one required `version` input.
+
+- The workflow must be dispatched with `master` as its ref.
+- The release target SHA is exactly `github.sha`.
+- The workflow verifies that `github.sha` still equals current `refs/heads/master`; stale dispatches fail.
+- Tag pushes do not create a second release path and cannot bypass qualification.
 
 ### Release preconditions
 
 Before building/releasing, the workflow verifies:
 
-1. checkout is the current intended `master` commit or an explicitly supplied master SHA,
+1. target SHA is current `master`,
 2. requested version equals `manifest.json.version`,
 3. `package.json`, `manifest.json`, and `versions.json` are consistent,
 4. the target version tag does not already exist,
 5. all deterministic local gates pass,
-6. successful live-GitHub-E2E evidence exists for the exact target SHA.
+6. successful live-GitHub-E2E evidence exists for exactly `github.sha`.
 
 ### Qualification lookup
 
-The release workflow retrieves the successful live E2E workflow run/artifact for the target SHA and validates `commitSha` inside the artifact. Evidence for a different SHA, even a parent or child commit, is rejected.
+Use the GitHub Actions API with the workflow `GITHUB_TOKEN` to list successful runs of `github-e2e-live.yml` filtered by `head_sha=${github.sha}`. Select only a completed successful run whose head SHA equals the release target.
 
-If GitHub Actions cannot reliably query a prior artifact by SHA using the chosen action/API permissions, the implementation must use an explicit `workflow_run`/artifact linkage or another fail-closed mechanism. It must never degrade to "latest successful live E2E" without SHA equality.
+For that run:
+
+1. list its artifacts,
+2. require artifact name `github-e2e-qualification-${github.sha}`,
+3. download the artifact,
+4. parse `github-e2e-qualification.json`,
+5. require `schemaVersion === 1`, `suite === "github-e2e-quick"`, and `commitSha === github.sha`.
+
+No matching successful run/artifact, expired artifact, malformed JSON, or SHA mismatch causes a hard failure. The workflow never falls back to "latest successful live E2E" without exact SHA equality.
+
+The release workflow therefore needs read permission for Actions metadata/artifacts plus write permission for repository contents/releases.
 
 ### Deterministic release gates
 
@@ -257,13 +277,13 @@ The intended release flow is:
 
 1. merge normal code to `master`,
 2. ensure deterministic CI is green,
-3. dispatch `GitHub E2E Live` for the exact master SHA,
-4. wait for a successful qualification artifact,
-5. dispatch `Release` with that version/SHA,
+3. dispatch `GitHub E2E Live` on ref `master`,
+4. wait for a successful qualification artifact for that exact SHA,
+5. dispatch `Release` on ref `master` with the version input,
 6. release workflow revalidates deterministic gates and exact-SHA qualification,
 7. tag/release is created only after all gates pass.
 
-If the live E2E fails, maintainers fix/retry it without creating a release. If the release build fails, maintainers rerun the release after fixing the source; a source change necessarily changes the SHA and therefore requires a fresh live qualification.
+If master changes between steps 3 and 5, the old qualification cannot release the new master; run live E2E again. If the live E2E fails, maintainers fix/retry it without creating a release. If the release build fails and source is changed, the new SHA requires a fresh live qualification.
 
 ## 7. Verification Strategy
 
