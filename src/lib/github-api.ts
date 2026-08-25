@@ -20,6 +20,7 @@ import { V4TransportMetrics, type V4TransportMetricsSnapshot } from "./v4/transp
 import { resolveV4TransportPolicy, type V4TransportPolicy } from "./v4/transport-policy";
 
 const V4_BOOTSTRAP_PATH = ".obsidian-github-sync-v4/bootstrap";
+const GIT_COMMIT_SHA = /^[0-9a-f]{40}$/iu;
 
 export interface GitHubConfig {
   owner: string;
@@ -183,6 +184,18 @@ export class GitHubClient {
     return toHex(await crypto.subtle.digest("SHA-1", payload));
   }
 
+  private async getImmutableFileFromTree(path: string, commitSha: string): Promise<{ bytes: Uint8Array; sha: string } | null> {
+    const commit = await this.getGitCommit(commitSha);
+    if (!commit.treeSha) throw new Error(`GitHub immutable commit has no tree SHA: ${commitSha}`);
+    const tree = await this.getTreeAt(commit.treeSha, true);
+    const node = tree.tree.find(candidate => candidate.type === "blob" && candidate.path === path);
+    if (node) return { bytes: await this.getBlob(node.sha), sha: node.sha };
+    if (tree.truncated) {
+      throw new Error(`GitHub immutable tree is truncated while confirming a Contents 404 for ${path}.`);
+    }
+    return null;
+  }
+
   async getFileBytes(path: string, ref = this.config.branch): Promise<{ bytes: Uint8Array; sha: string } | null> {
     const encodedPath = path.split('/').map(encodeURIComponent).join('/');
     const freshness = ref === this.config.branch ? `&_=${Date.now()}` : "";
@@ -216,11 +229,15 @@ export class GitHubClient {
         if (sha) return { bytes: await this.getBlob(sha), sha };
         throw new Error(`GitHub Contents response has no decodable payload for ${path}.`);
       }
-      if (response.status === 404) return null;
+      if (response.status === 404) {
+        return GIT_COMMIT_SHA.test(ref) ? this.getImmutableFileFromTree(path, ref) : null;
+      }
       throw new Error("Failed to get file bytes " + path + ": HTTP " + response.status + " - " + response.text);
     } catch (error) {
       const httpError = error as { status?: number };
-      if (httpError.status === 404) return null;
+      if (httpError.status === 404) {
+        return GIT_COMMIT_SHA.test(ref) ? this.getImmutableFileFromTree(path, ref) : null;
+      }
       throw error;
     }
   }
