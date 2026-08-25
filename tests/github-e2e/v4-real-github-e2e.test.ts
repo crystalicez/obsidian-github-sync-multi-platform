@@ -9,10 +9,12 @@ import { V4HistoryService } from "../../src/lib/v4/history-service";
 import { createEmptyV4LocalIndex, type V4LocalIndex } from "../../src/lib/v4/local-index";
 import { expectedV4PathLayout, V4_FORMAT_VERSION, type V4RemoteConfig, type V4StorageMode } from "../../src/lib/v4/protocol-types";
 import { V4StorageCodec } from "../../src/lib/v4/storage-codec";
-import { V4SyncSession, type V4SessionVault } from "../../src/lib/v4/sync-session";
+import { V4SyncSession, type V4SessionVault, type V4SyncRunState } from "../../src/lib/v4/sync-session";
 
 const forbiddenBranches = new Set(["main", "master", "production", "prod", "release", "stable"]);
 const encoder = new TextEncoder();
+
+type E2ESession = Pick<V4SyncSession, "sync">;
 
 interface ModeContext {
   mode: V4StorageMode;
@@ -25,7 +27,8 @@ interface DeviceContext {
   vault: MemoryVault;
   index: V4LocalIndex;
   client: GitHubClient;
-  session: V4SyncSession;
+  session: E2ESession;
+  rawSession: V4SyncSession;
 }
 
 interface InterferenceState {
@@ -341,17 +344,37 @@ function createDevice(name: string, config: GitHubConfig, context: ModeContext, 
     pathLayout: expectedV4PathLayout(context.mode),
   });
   const client = new GitHubClient(config);
-  const session = new V4SyncSession({
+  const sessionInput = {
     github: client,
     vault,
     index,
     config: context.remoteConfig,
     keyring: context.keyring,
-    conflictPolicy: "copy",
+    conflictPolicy: "copy" as const,
     abortChangePercent: 0,
     now,
-  });
-  return { name, vault, index, client, session };
+  };
+  const rawSession = new V4SyncSession(sessionInput);
+  const session: E2ESession = {
+    async sync(options) {
+      const runState: V4SyncRunState = { conflictCopies: new Map(), conflictCopyStages: new Map() };
+      let lastError: unknown;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          return await new V4SyncSession({ ...sessionInput, runState }).sync(options);
+        } catch (error) {
+          lastError = error;
+          const message = error instanceof Error ? error.message : String(error);
+          const retryable = options.operation === "normal" && /branch head changed|stale ref/i.test(message);
+          if (!retryable || attempt === 3) throw error;
+          runState.conflictCopyStages?.clear();
+          console.warn(`GitHub E2E retrying normal sync after recoverable CAS race (attempt ${attempt + 1}/3): ${message}`);
+        }
+      }
+      throw lastError;
+    },
+  };
+  return { name, vault, index, client, session, rawSession };
 }
 
 function liveRecords(device: DeviceContext) {
@@ -721,7 +744,7 @@ async function runControlledRaceScenario(config: GitHubConfig): Promise<void> {
     armInterference("controlled-race");
     let publishError: unknown;
     try {
-      await a.session.sync({
+      await a.rawSession.sync({
         operation: "normal",
         allowThresholdOverride: false,
         changes: [{ type: "modify", path: "race.md", mtime: 2 }],
