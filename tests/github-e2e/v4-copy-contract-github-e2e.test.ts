@@ -7,10 +7,11 @@ import { randomBytes, toBase64Url } from "../../src/lib/bytes";
 import { deriveV4Keyring, type V4Keyring } from "../../src/lib/v4/crypto";
 import { createEmptyV4LocalIndex, type V4LocalIndex } from "../../src/lib/v4/local-index";
 import { expectedV4PathLayout, V4_FORMAT_VERSION, type V4RemoteConfig, type V4StorageMode } from "../../src/lib/v4/protocol-types";
-import { V4SyncSession, type V4SessionVault } from "../../src/lib/v4/sync-session";
+import { V4SyncSession, type V4SessionVault, type V4SyncRunState } from "../../src/lib/v4/sync-session";
 
 const forbiddenBranches = new Set(["main", "master", "production", "prod", "release", "stable"]);
 const encoder = new TextEncoder();
+type E2ESession = Pick<V4SyncSession, "sync">;
 
 function requiredEnv(name: string): string {
   const value = process.env[name];
@@ -80,7 +81,7 @@ class MemoryVault implements V4SessionVault {
 }
 
 interface ModeContext { mode: V4StorageMode; config: V4RemoteConfig; keyring?: V4Keyring; }
-interface Device { vault: MemoryVault; index: V4LocalIndex; session: V4SyncSession; }
+interface Device { vault: MemoryVault; index: V4LocalIndex; session: E2ESession; }
 
 function repoId(config: GitHubConfig): string { return `${config.owner}/${config.repo}#${config.branch}`; }
 
@@ -111,16 +112,36 @@ function device(name: string, github: GitHubConfig, context: ModeContext, now?: 
     mode: context.mode,
     pathLayout: expectedV4PathLayout(context.mode),
   });
-  const session = new V4SyncSession({
-    github: new GitHubClient(github),
+  const client = new GitHubClient(github);
+  const sessionInput = {
+    github: client,
     vault,
     index,
     config: context.config,
     keyring: context.keyring,
-    conflictPolicy: "copy",
+    conflictPolicy: "copy" as const,
     abortChangePercent: 0,
     now,
-  });
+  };
+  const session: E2ESession = {
+    async sync(options) {
+      const runState: V4SyncRunState = { conflictCopies: new Map(), conflictCopyStages: new Map() };
+      let lastError: unknown;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          return await new V4SyncSession({ ...sessionInput, runState }).sync(options);
+        } catch (error) {
+          lastError = error;
+          const message = error instanceof Error ? error.message : String(error);
+          const retryable = options.operation === "normal" && /branch head changed|stale ref/i.test(message);
+          if (!retryable || attempt === 3) throw error;
+          runState.conflictCopyStages?.clear();
+          console.warn(`Copy-contract E2E retrying normal sync after recoverable CAS race (attempt ${attempt + 1}/3): ${message}`);
+        }
+      }
+      throw lastError;
+    },
+  };
   return { vault, index, session };
 }
 
