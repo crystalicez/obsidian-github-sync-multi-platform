@@ -14,6 +14,7 @@ async function makeWorkspace({ ignoredSecret = false, trackedSecret = false } = 
   await writeFile(join(dir, 'manifest.json'), JSON.stringify({ id: 'test-plugin', version: '1.0.7', minAppVersion: '1.0.0' }));
   await writeFile(join(dir, 'package.json'), JSON.stringify({ version: '1.0.7', packageManager: 'pnpm@10.17.1' }));
   await writeFile(join(dir, 'versions.json'), JSON.stringify({ '1.0.7': '1.0.0' }));
+  await writeFile(join(dir, '.node-version'), 'v22.11.0\n');
   await writeFile(join(dir, 'pnpm-lock.yaml'), "lockfileVersion: '9.0'\n");
 
   const git = spawnSync('git', ['init', '-q'], { cwd: dir, encoding: 'utf8' });
@@ -46,4 +47,13 @@ test('package validation rejects a tracked local secret file', async () => {
   const result = spawnSync(process.execPath, [validator], { cwd, encoding: 'utf8' });
   assert.notEqual(result.status, 0);
   assert.match(`${result.stderr}\n${result.stdout}`, /tracked local secret/i);
+});
+
+test('package validation still rejects a missing generated artifact', async () => {
+  const cwd = await makeWorkspace();
+  const { rm } = await import('node:fs/promises');
+  await rm(join(cwd, 'main.js'));
+  const result = spawnSync(process.execPath, [validator], { cwd, encoding: 'utf8' });
+  assert.notEqual(result.status, 0);
+  assert.match(`${result.stderr}\n${result.stdout}`, /main\.js|release artifact/i);
 });

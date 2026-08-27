@@ -21,21 +21,26 @@ function isValidSemver(value) {
     return /^\d+\.\d+\.\d+$/.test(value);
 }
 
+function parseSemver(value) {
+    if (!isValidSemver(value)) throw new Error(`Version is not x.y.z: ${value}`);
+    return value.split('.').map(part => BigInt(part));
+}
+
 function compareSemver(left, right) {
-    const a = left.split('.').map(Number);
-    const b = right.split('.').map(Number);
+    const a = parseSemver(left);
+    const b = parseSemver(right);
     for (let index = 0; index < 3; index++) {
-        if (a[index] !== b[index]) return a[index] - b[index];
+        if (a[index] < b[index]) return -1;
+        if (a[index] > b[index]) return 1;
     }
     return 0;
 }
 
 function bumpVersion(current, part) {
-    if (!isValidSemver(current)) throw new Error(`Current version is not x.y.z: ${current}`);
-    const [major, minor, patch] = current.split('.').map(Number);
-    if (part === 'major') return `${major + 1}.0.0`;
-    if (part === 'minor') return `${major}.${minor + 1}.0`;
-    if (part === 'patch') return `${major}.${minor}.${patch + 1}`;
+    const [major, minor, patch] = parseSemver(current);
+    if (part === 'major') return `${major + 1n}.0.0`;
+    if (part === 'minor') return `${major}.${minor + 1n}.0`;
+    if (part === 'patch') return `${major}.${minor}.${patch + 1n}`;
     throw new Error(`Unknown version bump: ${part}`);
 }
 
