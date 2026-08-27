@@ -1,63 +1,28 @@
 import { build } from "esbuild";
-import { existsSync, readFileSync } from "node:fs";
 import { mkdir, rm } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import path from "node:path";
+import { loadGitHubE2EEnv, requireGitHubE2EConfig } from "./github-e2e-env.mjs";
+import { readOriginFetchRepository } from "./github-repo.mjs";
+import { preflightE2ERemote } from "./github-e2e-remote.mjs";
 
 const root = process.cwd();
-const envFile = process.env.GITHUB_E2E_ENV_FILE ?? ".env.github-e2e";
-const envPath = path.isAbsolute(envFile) ? envFile : path.join(root, envFile);
-
-function parseEnvLine(line) {
-  const trimmed = line.trim();
-  if (!trimmed || trimmed.startsWith("#")) return null;
-  const normalized = trimmed.startsWith("export ") ? trimmed.slice("export ".length).trim() : trimmed;
-  const separatorIndex = normalized.indexOf("=");
-  if (separatorIndex <= 0) return null;
-  const key = normalized.slice(0, separatorIndex).trim();
-  let value = normalized.slice(separatorIndex + 1).trim();
-  if (!/^[A-Za-z_][A-Za-z0-9_]*$/u.test(key)) return null;
-  if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
-    value = value.slice(1, -1);
-  }
-  return [key, value];
-}
-
-function loadEnvFile() {
-  if (!existsSync(envPath)) {
-    if (process.env.GITHUB_E2E_ENV_FILE) {
-      console.error(`GitHub E2E env file not found: ${envPath}`);
-      process.exit(2);
-    }
-    return;
-  }
-
-  const content = readFileSync(envPath, "utf8");
-  for (const line of content.split(/\r?\n/u)) {
-    const entry = parseEnvLine(line);
-    if (!entry) continue;
-    const [key, value] = entry;
-    if (process.env[key] === undefined) process.env[key] = value;
-  }
-}
-
-loadEnvFile();
-
 const compileOnly = process.argv.includes("--compile-only") || process.env.GITHUB_E2E_COMPILE_ONLY === "1";
-const required = ["GITHUB_E2E_OWNER", "GITHUB_E2E_REPO", "GITHUB_E2E_BRANCH", "GITHUB_E2E_TOKEN"];
-if (!compileOnly) {
-  const missing = required.filter(name => !process.env[name]);
-  if (missing.length > 0) {
-    console.error(`Missing required GitHub E2E env vars: ${missing.join(", ")}`);
-    console.error(`Required: ${required.join(", ")}`);
-    console.error(`Set them in the shell or in ${envPath}`);
-    process.exit(2);
-  }
 
-  const branch = process.env.GITHUB_E2E_BRANCH ?? "";
-  const forbiddenBranches = new Set(["main", "master", "production", "prod", "release", "stable"]);
-  if (forbiddenBranches.has(branch.toLowerCase())) {
-    console.error(`Refusing to run destructive GitHub E2E tests against protected-looking branch: ${branch}`);
+function runCommand(command, args, options = {}) {
+  return spawnSync(command, args, { ...options, shell: false });
+}
+
+let liveEnv = process.env;
+if (!compileOnly) {
+  try {
+    const currentSourceRepo = readOriginFetchRepository({ runner: runCommand, cwd: root });
+    const loaded = await loadGitHubE2EEnv({ cwd: root, env: process.env });
+    const config = requireGitHubE2EConfig(loaded.env, { currentSourceRepo });
+    await preflightE2ERemote({ fetchImpl: fetch, config });
+    liveEnv = loaded.env;
+  } catch (error) {
+    console.error(`GitHub E2E preflight failed: ${error instanceof Error ? error.message : String(error)}`);
     process.exit(2);
   }
 }
@@ -98,6 +63,7 @@ if (compileOnly) {
 const result = spawnSync(process.execPath, ["--test", "--test-concurrency=1", ...outfiles], {
   cwd: root,
   stdio: "inherit",
-  env: process.env,
+  env: liveEnv,
+  shell: false,
 });
 process.exit(result.status ?? 1);
