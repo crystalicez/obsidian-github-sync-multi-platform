@@ -109,6 +109,12 @@ export function validateQualificationReceipt(receipt, expected) {
   return receipt;
 }
 
+export function withoutGitHubE2EToken(env = {}) {
+  const next = { ...env };
+  delete next.GITHUB_E2E_TOKEN;
+  return next;
+}
+
 export function runCommand(command, args = [], options = {}) {
   const { encoding = "utf8", shell: _ignoredShell, ...rest } = options;
   return spawnSync(command, args, { ...rest, shell: false, encoding });
