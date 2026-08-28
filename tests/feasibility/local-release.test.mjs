@@ -156,6 +156,45 @@ test("public release is unreachable before all exact verification phases", async
   assert.equal(result.qualificationTagObjectSha, QUAL_OBJECT);
 });
 
+test("release strips GitHub E2E token from publication children while preserving GitHub auth env", async () => {
+  const h = await harness();
+  const seen = [];
+  h.services.requireCleanMaster = ({ runner }) => {
+    runner("env-probe", [], {});
+    return SHA;
+  };
+  h.services.readPnpmVersion = ({ env }) => {
+    seen.push(env);
+    return "9.12.3";
+  };
+  h.services.requireGithubPublicationAuth = ({ env }) => {
+    seen.push(env);
+  };
+  h.services.runPnpmGate = (name, { env }) => {
+    seen.push(env);
+    return { status: 0, stdout: "", stderr: "" };
+  };
+  const probeEnvs = [];
+  const runner = (command, args, options = {}) => {
+    if (command !== "env-probe") throw new Error(`unexpected runner command ${command} ${args.join(" ")}`);
+    probeEnvs.push(options.env);
+    return { status: 0, stdout: "", stderr: "" };
+  };
+  await releaseLocal({
+    cwd: "/repo",
+    version: "1.0.8",
+    runner,
+    services: h.services,
+    runtimeNodeVersion: "v22.11.0",
+    env: { PATH: "/bin", GH_TOKEN: "publication-token", GITHUB_E2E_TOKEN: "e2e-secret" },
+  });
+  for (const childEnv of [...seen, ...probeEnvs]) {
+    assert.equal(childEnv.GITHUB_E2E_TOKEN, undefined);
+    assert.equal(childEnv.GH_TOKEN, "publication-token");
+    assert.equal(childEnv.PATH, "/bin");
+  }
+});
+
 test("preflight rejects invalid syntax, non-monotonic versions, and existing publication state", async () => {
   const h1 = await harness();
   await assert.rejects(() => releaseLocal({ cwd: "/repo", version: "v1.0.8", services: h1.services, runtimeNodeVersion: "v22.11.0" }), /x\.y\.z/i);
