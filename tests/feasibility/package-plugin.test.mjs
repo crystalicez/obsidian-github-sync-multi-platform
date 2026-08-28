@@ -5,7 +5,7 @@ import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
-import { unzipSync } from "fflate";
+import { crc32 } from "../../scripts/deterministic-zip.mjs";
 import { packagePlugin, RELEASE_ARCHIVE_ROOT } from "../../scripts/package-plugin.mjs";
 
 function git(cwd, args) {
@@ -46,6 +46,34 @@ function digest(bytes) {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
+function readStoredZipEntries(zip) {
+  const endOffset = zip.length - 22;
+  assert.equal(zip.readUInt32LE(endOffset), 0x06054b50);
+  const count = zip.readUInt16LE(endOffset + 10);
+  let cursor = zip.readUInt32LE(endOffset + 16);
+  const entries = Object.create(null);
+  for (let index = 0; index < count; index += 1) {
+    assert.equal(zip.readUInt32LE(cursor), 0x02014b50);
+    assert.equal(zip.readUInt16LE(cursor + 10), 0);
+    const expectedCrc = zip.readUInt32LE(cursor + 16);
+    const size = zip.readUInt32LE(cursor + 24);
+    const nameLength = zip.readUInt16LE(cursor + 28);
+    const extraLength = zip.readUInt16LE(cursor + 30);
+    const commentLength = zip.readUInt16LE(cursor + 32);
+    const localOffset = zip.readUInt32LE(cursor + 42);
+    const name = zip.subarray(cursor + 46, cursor + 46 + nameLength).toString("utf8");
+    assert.equal(zip.readUInt32LE(localOffset), 0x04034b50);
+    const localNameLength = zip.readUInt16LE(localOffset + 26);
+    const localExtraLength = zip.readUInt16LE(localOffset + 28);
+    const dataStart = localOffset + 30 + localNameLength + localExtraLength;
+    const data = Buffer.from(zip.subarray(dataStart, dataStart + size));
+    assert.equal(crc32(data), expectedCrc);
+    entries[name] = data;
+    cursor += 46 + nameLength + extraLength + commentLength;
+  }
+  return entries;
+}
+
 test("stages tracked static assets from exact HEAD blobs and main.js from current build output", async () => {
   const f = await fixture();
   const result = await packagePlugin({ cwd: f.cwd, version: "1.0.8" });
@@ -62,15 +90,15 @@ test("ZIP and upload asset contract is exact", async () => {
   const zipName = `${RELEASE_ARCHIVE_ROOT}-v1.0.8.zip`;
   assert.deepEqual(result.assets.map(item => item.name), ["main.js", "manifest.json", "styles.css", zipName]);
   assert.equal(resolve(result.stagingDir), resolve(f.cwd, ".tmp", "release", "1.0.8"));
-  const entries = unzipSync(await readFile(result.zipPath));
+  const entries = readStoredZipEntries(await readFile(result.zipPath));
   assert.deepEqual(Object.keys(entries), [
     `${RELEASE_ARCHIVE_ROOT}/main.js`,
     `${RELEASE_ARCHIVE_ROOT}/manifest.json`,
     `${RELEASE_ARCHIVE_ROOT}/styles.css`,
   ]);
-  assert.deepEqual(Buffer.from(entries[`${RELEASE_ARCHIVE_ROOT}/main.js`]), f.mainBytes);
-  assert.deepEqual(Buffer.from(entries[`${RELEASE_ARCHIVE_ROOT}/manifest.json`]), f.committedManifest);
-  assert.deepEqual(Buffer.from(entries[`${RELEASE_ARCHIVE_ROOT}/styles.css`]), f.committedStyles);
+  assert.deepEqual(entries[`${RELEASE_ARCHIVE_ROOT}/main.js`], f.mainBytes);
+  assert.deepEqual(entries[`${RELEASE_ARCHIVE_ROOT}/manifest.json`], f.committedManifest);
+  assert.deepEqual(entries[`${RELEASE_ARCHIVE_ROOT}/styles.css`], f.committedStyles);
   assert.equal(Object.hasOwn(entries, `${RELEASE_ARCHIVE_ROOT}/marker.txt`), false);
   for (const item of result.assets) {
     const bytes = await readFile(item.path);
