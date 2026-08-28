@@ -47,8 +47,12 @@ function repositoryUrl(owner, repo) {
   return `${API_BASE}/repos/${encoded(owner)}/${encoded(repo)}`;
 }
 
-function branchUrl(owner, repo, branch) {
+function branchReadUrl(owner, repo, branch) {
   return `${repositoryUrl(owner, repo)}/git/ref/heads/${encodedBranch(branch)}`;
+}
+
+function branchDeleteUrl(owner, repo, branch) {
+  return `${repositoryUrl(owner, repo)}/git/refs/heads/${encodedBranch(branch)}`;
 }
 
 export async function readE2ERepository({ fetchImpl = fetch, owner, repo, token }) {
@@ -62,7 +66,7 @@ export async function readE2ERepository({ fetchImpl = fetch, owner, repo, token 
 }
 
 export async function readE2EBranch({ fetchImpl = fetch, owner, repo, branch, token }) {
-  const response = await fetchResponse(fetchImpl, branchUrl(owner, repo, branch), { headers: headers(token) }, "GitHub E2E branch lookup");
+  const response = await fetchResponse(fetchImpl, branchReadUrl(owner, repo, branch), { headers: headers(token) }, "GitHub E2E branch lookup");
   if (response.status === 404) return { kind: "absent" };
   if (response.status !== 200) throw apiStatusError("GitHub E2E branch lookup", response.status);
   const body = await readJsonObject(response, "GitHub E2E branch lookup");
@@ -98,12 +102,12 @@ export async function cleanupE2EBranch({
   if (!Number.isInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > 10) {
     throw new Error("maxAttempts must be an integer between 1 and 10");
   }
-  const url = branchUrl(owner, repo, branch);
+  const deleteUrl = branchDeleteUrl(owner, repo, branch);
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     const before = await readE2EBranch({ fetchImpl, owner, repo, branch, token });
     if (before.kind === "absent") return;
 
-    const deleted = await fetchResponse(fetchImpl, url, { method: "DELETE", headers: headers(token) }, "GitHub E2E branch cleanup");
+    const deleted = await fetchResponse(fetchImpl, deleteUrl, { method: "DELETE", headers: headers(token) }, "GitHub E2E branch cleanup");
     if (deleted.status === 401 || deleted.status === 403) {
       throw apiStatusError("GitHub E2E branch cleanup", deleted.status);
     }
