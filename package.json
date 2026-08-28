@@ -22,7 +22,8 @@
     "test:soak": "node scripts/run-soak.mjs",
     "validate:metadata": "node scripts/validate-release-metadata.mjs",
     "validate:package": "node scripts/validate-package.mjs",
-    "qualify:local": "node scripts/local-qualify.mjs"
+    "qualify:local": "node scripts/local-qualify.mjs",
+    "release:local": "node scripts/local-release.mjs"
   },
   "keywords": [],
   "repository": {
@@ -37,6 +38,7 @@
     "builtin-modules": "^4.0.0",
     "esbuild": "^0.24.2",
     "eslint": "^9.39.3",
+    "fflate": "0.8.3",
     "obsidian": "^1.12.3",
     "tslib": "^2.8.1",
     "typescript": "^5.9.3"
