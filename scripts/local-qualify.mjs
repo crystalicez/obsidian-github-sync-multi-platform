@@ -12,6 +12,7 @@ import {
   runPnpmGate,
   serializeQualificationReceipt,
   validateQualificationReceipt,
+  withoutGitHubE2EToken,
 } from "./local-release-lib.mjs";
 import {
   createAnnotatedTagObject,
@@ -95,18 +96,21 @@ export async function qualifyLocal({
   const startedAt = now();
   if (!(startedAt instanceof Date) || !Number.isFinite(startedAt.getTime())) throw new Error("now() must return a valid Date");
 
-  const sha = requireCleanMaster({ runner, cwd });
-  requireCanonicalOriginEndpoints({ runner, cwd });
-  if (readRemoteMasterSha({ runner, cwd }) !== sha) throw new Error("Remote master does not equal local HEAD");
+  const nonLiveEnv = withoutGitHubE2EToken(env);
+  const nonLiveRunner = (command, args, options = {}) => runner(command, args, { ...options, env: nonLiveEnv });
+
+  const sha = requireCleanMaster({ runner: nonLiveRunner, cwd });
+  requireCanonicalOriginEndpoints({ runner: nonLiveRunner, cwd });
+  if (readRemoteMasterSha({ runner: nonLiveRunner, cwd }) !== sha) throw new Error("Remote master does not equal local HEAD");
 
   const metadata = validateReleaseMetadata(await readReleaseMetadata(cwd));
-  const pnpmVersion = readPnpmVersion({ runner, cwd, env, platform, comspec });
+  const pnpmVersion = readPnpmVersion({ runner: nonLiveRunner, cwd, env: nonLiveEnv, platform, comspec });
   assertExactRuntimeToolchain({ metadata, nodeVersion: runtimeNodeVersion, pnpmVersion });
-  requireSuccess(runner("git", ["var", "GIT_COMMITTER_IDENT"], { cwd, encoding: "utf8" }), "Git committer identity check");
+  requireSuccess(nonLiveRunner("git", ["var", "GIT_COMMITTER_IDENT"], { cwd, encoding: "utf8" }), "Git committer identity check");
 
   const version = metadata.version;
   const qualificationRef = qualificationRefName(version, sha);
-  const existing = fetchAndInspectObservedQualificationTag({ runner, cwd, ref: qualificationRef });
+  const existing = fetchAndInspectObservedQualificationTag({ runner: nonLiveRunner, cwd, ref: qualificationRef });
   if (existing.kind === "present") {
     const valid = validateObservedQualification(existing, {
       sha,
@@ -144,7 +148,7 @@ export async function qualifyLocal({
   for (const gate of FIXED_GATE_NAMES) {
     if (gate === "github-e2e-live") break;
     onProgress({ kind: "gate", name: gate });
-    const result = runPnpmGate(gate, { cwd, env: raw, platform, comspec, runner });
+    const result = runPnpmGate(gate, { cwd, env: nonLiveEnv, platform, comspec, runner: nonLiveRunner });
     requireSuccess(result, `Qualification gate ${gate}`);
   }
 
@@ -172,14 +176,14 @@ export async function qualifyLocal({
   }
   if (cleanupError) throw new Error(`GitHub E2E cleanup verification failed for ${officialBranch}: ${cleanupError.message}`);
 
-  const postSha = requireCleanMaster({ runner, cwd });
+  const postSha = requireCleanMaster({ runner: nonLiveRunner, cwd });
   if (postSha !== sha) throw new Error("HEAD changed during qualification");
-  requireCanonicalOriginEndpoints({ runner, cwd });
-  if (readRemoteMasterSha({ runner, cwd }) !== sha) throw new Error("Remote master changed during qualification");
+  requireCanonicalOriginEndpoints({ runner: nonLiveRunner, cwd });
+  if (readRemoteMasterSha({ runner: nonLiveRunner, cwd }) !== sha) throw new Error("Remote master changed during qualification");
   const postMetadata = validateReleaseMetadata(await readReleaseMetadata(cwd), { requestedVersion: version });
-  const postPnpmVersion = readPnpmVersion({ runner, cwd, env, platform, comspec });
+  const postPnpmVersion = readPnpmVersion({ runner: nonLiveRunner, cwd, env: nonLiveEnv, platform, comspec });
   assertExactRuntimeToolchain({ metadata: postMetadata, nodeVersion: runtimeNodeVersion, pnpmVersion: postPnpmVersion });
-  const postExisting = fetchAndInspectObservedQualificationTag({ runner, cwd, ref: qualificationRef });
+  const postExisting = fetchAndInspectObservedQualificationTag({ runner: nonLiveRunner, cwd, ref: qualificationRef });
   if (postExisting.kind !== "absent") throw new Error("Qualification ref appeared concurrently after gates");
 
   const finishedAt = now();
@@ -196,10 +200,10 @@ export async function qualifyLocal({
   });
   const tagName = qualificationTagName(version, sha);
   const message = serializeQualificationReceipt(receipt);
-  const tagObjectSha = createAnnotatedTagObject({ runner, cwd, targetSha: sha, tagName, message });
+  const tagObjectSha = createAnnotatedTagObject({ runner: nonLiveRunner, cwd, targetSha: sha, tagName, message });
 
-  const pushResult = runner("git", ["push", "--porcelain", "origin", `${tagObjectSha}:${qualificationRef}`], { cwd, encoding: "utf8" });
-  const remoteAfterPush = fetchAndInspectObservedQualificationTag({ runner, cwd, ref: qualificationRef });
+  const pushResult = nonLiveRunner("git", ["push", "--porcelain", "origin", `${tagObjectSha}:${qualificationRef}`], { cwd, encoding: "utf8" });
+  const remoteAfterPush = fetchAndInspectObservedQualificationTag({ runner: nonLiveRunner, cwd, ref: qualificationRef });
   if (pushResult?.status === 0) {
     const valid = validateObservedQualification(remoteAfterPush, {
       sha, version, nodeVersion: metadata.nodeVersion, pnpmVersion: metadata.pnpmVersion,
