@@ -74,7 +74,12 @@ function makeRunner({ bare, events = [], liveStatus = 0, ambiguousPush = false, 
         : args[1] === "test:github-e2e:compile" ? "github-e2e-compile"
         : args[1] === "test:github-e2e:quick" ? "github-e2e-live"
         : `unknown:${args.join(" ")}`;
-      events.push({ kind: "runner-gate", name: script, branch: options.env?.GITHUB_E2E_BRANCH });
+      events.push({
+        kind: "runner-gate",
+        name: script,
+        branch: options.env?.GITHUB_E2E_BRANCH,
+        hasToken: options.env?.GITHUB_E2E_TOKEN !== undefined,
+      });
       return { status: script === "github-e2e-live" ? liveStatus : 0, stdout: "", stderr: "" };
     }
     if (command !== "git") return { status: 1, stdout: "", stderr: `unexpected ${command}` };
@@ -147,15 +152,18 @@ async function createInvalidRemoteReceipt(f) {
   git(f.work, ["push", "-q", f.bare, `${object}:${ref}`]);
 }
 
-test("qualification executes exact v1 gate order and overrides manual branch", async () => {
+test("qualification executes exact v1 gate order, isolates token, and overrides manual branch", async () => {
   const f = await fixture();
   const { options, progress, runnerEvents } = baseOptions(f);
   const result = await qualifyLocal(options);
   assert.equal(result.alreadyQualified, false);
   assert.deepEqual(progress.filter(e => e.kind === "gate").map(e => e.name), QUALIFICATION_GATES);
-  const live = runnerEvents.find(e => e.name === "github-e2e-live");
+  const gateRuns = runnerEvents.filter(e => e.kind === "runner-gate");
+  const live = gateRuns.find(e => e.name === "github-e2e-live");
   assert.match(live.branch, /^obsidian-sync-e2e\/local-/u);
   assert.notEqual(live.branch, "main");
+  assert.equal(live.hasToken, true);
+  assert.equal(gateRuns.filter(e => e.name !== "github-e2e-live").some(e => e.hasToken), false);
   const remote = git(f.work, ["ls-remote", "--refs", f.bare, result.qualificationRef]).stdout.trim();
   assert.match(remote, new RegExp(`^${result.qualificationTagObjectSha}\\s`));
 });
