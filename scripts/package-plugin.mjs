@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { readFile, mkdir, rm, stat, writeFile } from "node:fs/promises";
 import { join, resolve, sep } from "node:path";
-import { zipSync } from "fflate";
+import { createStoredZip } from "./deterministic-zip.mjs";
 import { readCommittedBlob } from "./local-release-git.mjs";
 import { runCommand } from "./local-release-lib.mjs";
 import { parseStableTriple } from "./release-metadata.mjs";
@@ -50,17 +50,10 @@ export async function packagePlugin({ cwd = process.cwd(), version, runner = run
     await writeFile(join(stagingDir, name), stagedBytes.get(name));
   }
 
-  const fixed = Object.freeze({
-    level: 9,
-    mtime: new Date(1980, 0, 1, 0, 0, 0),
-    os: 0,
-    attrs: 0,
-  });
-  const archive = Object.create(null);
-  for (const name of RELEASE_FILES) {
-    archive[`${RELEASE_ARCHIVE_ROOT}/${name}`] = [stagedBytes.get(name), fixed];
-  }
-  const zipBytes = Buffer.from(zipSync(archive, fixed));
+  const zipBytes = createStoredZip(RELEASE_FILES.map(name => ({
+    name: `${RELEASE_ARCHIVE_ROOT}/${name}`,
+    bytes: stagedBytes.get(name),
+  })));
   if (zipBytes.length === 0) throw new Error("Plugin ZIP is empty");
 
   const zipName = `${RELEASE_ARCHIVE_ROOT}-v${version}.zip`;
