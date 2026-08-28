@@ -37,7 +37,12 @@ GITHUB_E2E_BRANCH=local-v4-e2e
 GITHUB_E2E_TOKEN=token-with-contents-write-access
 ```
 
-Never use `main`, `master`, `production`, `prod`, `release`, or `stable`; the runner rejects those exact branch names. The target repository/branch is destructive test state and must not be a real notes repository.
+The target repository must be dedicated disposable test state, never a real notes repository. Manual E2E may be launched from a fork checkout, but the runner refuses a destructive target equal to either:
+
+- the checkout's current GitHub `origin` repository, or
+- the canonical source repository `crystalicez/obsidian-github-sync-multi-platform`.
+
+The runner also rejects protected-looking branch names (`main`, `master`, `production`, `prod`, `release`, `stable`) and reads the target repository metadata before mutation so it can reject the repository's **actual default branch**, even when that branch has another name such as `trunk`.
 
 Run:
 
@@ -53,7 +58,38 @@ pnpm test:github-e2e:compile
 
 The runner also accepts `node scripts/run-github-e2e.mjs --compile-only`. `GITHUB_E2E_COMPILE_ONLY=1` remains supported for CI/backward compatibility, but the package script is preferred for local use because it does not depend on shell-specific environment-variable syntax.
 
-Ordinary CI uses only this compile gate.
+Compile-only mode does not require a Git checkout, credentials, or E2E configuration. Ordinary CI uses only this compile gate.
+
+## Official local release qualification
+
+`pnpm qualify:local` is stricter than an ordinary manual live-E2E invocation because it is release authority for one exact commit.
+
+The qualifier loads `GITHUB_E2E_OWNER`, `GITHUB_E2E_REPO`, and `GITHUB_E2E_TOKEN`, but it **does not use the configured manual `GITHUB_E2E_BRANCH`**. Instead it generates a unique branch:
+
+```text
+obsidian-sync-e2e/local-<sha12>-<run-id>
+```
+
+Only the child live-E2E process receives that branch override; `.env.github-e2e` is not rewritten.
+
+Before the live child starts, official qualification proves:
+
+- the E2E target is not the canonical source repository,
+- target repository metadata is readable,
+- the generated branch is not the target repository's actual default branch.
+
+After the live child returns, **whether the child succeeded or failed**, the qualifier performs bounded out-of-band cleanup:
+
+1. read the unique branch ref,
+2. delete it if present,
+3. read again and require absence,
+4. retry the bounded cleanup/verify sequence when appropriate.
+
+A qualification receipt cannot be created unless the live child succeeded **and** branch absence was verified.
+
+A hard process kill, machine loss, or power failure can prevent this outer cleanup from running. Because each official run uses a unique branch, any residue is isolated and the qualifier prints the safe branch identifier for manual inspection.
+
+An already-valid remote qualification receipt for the exact current SHA/version/toolchain/gate contract may short-circuit a later `qualify:local` invocation after source/master/toolchain verification; E2E credentials are needed when creating a new qualification, not to re-prove an existing valid receipt.
 
 ## GitHub Actions live qualification
 
@@ -79,33 +115,21 @@ Different runs therefore have independent branch state. The `qualify` job refuse
 
 The optional qualification JSON artifact is for human audit only. Stable release authority comes from exact-SHA workflow/job metadata, so artifact expiry or upload-service failure cannot turn an otherwise successful exact-SHA live run into false qualification evidence.
 
+The Actions qualification path and local qualification-tag path are independent authorities in v1: Actions Stable Release continues to require the Actions-native exact-SHA run, while `release:local` requires the exact remote annotated local qualification receipt.
+
 ## Cleanup residue
 
-Hard cancellation can prevent any cleanup job from running. Residue is isolated by run ID and is safe to inspect/delete manually. With a token scoped to the disposable repo:
+Hard cancellation can prevent any cleanup process/job from running. Residue is isolated by a unique run ID and is safe to inspect/delete manually.
 
-```bash
-export E2E_OWNER=owner
-export E2E_REPO=repository
-export E2E_TOKEN=token
-export RUN_ID=123456789
-node - <<'NODE'
-const owner = process.env.E2E_OWNER;
-const repo = process.env.E2E_REPO;
-const token = process.env.E2E_TOKEN;
-const branch = `obsidian-sync-e2e/run-${process.env.RUN_ID}`;
-const ref = branch.split("/").map(encodeURIComponent).join("/");
-const response = await fetch(`https://api.github.com/repos/${owner}/${repo}/git/refs/heads/${ref}`, {
-  method: "DELETE",
-  headers: {
-    Authorization: `Bearer ${token}`,
-    Accept: "application/vnd.github+json",
-    "X-GitHub-Api-Version": "2022-11-28",
-  },
-});
-if (![204, 404].includes(response.status)) throw new Error(`cleanup HTTP ${response.status}: ${await response.text()}`);
-console.log(`cleanup status ${response.status}`);
-NODE
+For an Actions run the branch is:
+
+```text
+obsidian-sync-e2e/run-<GITHUB_RUN_ID>
 ```
+
+For official local qualification, use the exact `obsidian-sync-e2e/local-...` branch printed by `qualify:local`.
+
+With a token scoped to the disposable repo, a branch can be removed through the GitHub Contents/ref API after a maintainer confirms it is disposable E2E residue. Do not reuse this cleanup guidance against the source repository or a real notes branch.
 
 ## Metrics
 
