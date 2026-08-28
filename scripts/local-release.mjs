@@ -9,6 +9,7 @@ import {
   runCommand,
   runPnpmGate,
   validateQualificationReceipt,
+  withoutGitHubE2EToken,
 } from "./local-release-lib.mjs";
 import {
   fetchAndInspectObservedQualificationTag,
@@ -145,69 +146,71 @@ export async function releaseLocal({
   if (!parseStableTriple(version)) throw new Error(`Release version must be x.y.z: ${version}`);
   const s = { ...DEFAULT_SERVICES, ...services };
   const phase = name => onProgress({ phase: name });
+  const releaseEnv = withoutGitHubE2EToken(env);
+  const releaseRunner = (command, args, options = {}) => runner(command, args, { ...options, env: releaseEnv });
 
   phase("preflight");
-  const sha = s.requireCleanMaster({ runner, cwd });
-  s.requireCanonicalOriginEndpoints({ runner, cwd });
-  if (s.readRemoteMasterSha({ runner, cwd }) !== sha) throw new Error("Remote master does not equal local HEAD");
+  const sha = s.requireCleanMaster({ runner: releaseRunner, cwd });
+  s.requireCanonicalOriginEndpoints({ runner: releaseRunner, cwd });
+  if (s.readRemoteMasterSha({ runner: releaseRunner, cwd }) !== sha) throw new Error("Remote master does not equal local HEAD");
   const metadata = s.validateReleaseMetadata(await s.readReleaseMetadata(cwd), { requestedVersion: version });
-  const runtimePnpmVersion = s.readPnpmVersion({ runner, cwd, env, platform, comspec });
+  const runtimePnpmVersion = s.readPnpmVersion({ runner: releaseRunner, cwd, env: releaseEnv, platform, comspec });
   requireExactToolchain(metadata, { runtimeNodeVersion, runtimePnpmVersion });
-  s.requireGithubPublicationAuth({ runner, repo: CANONICAL_REPOSITORY, env, cwd });
+  s.requireGithubPublicationAuth({ runner: releaseRunner, repo: CANONICAL_REPOSITORY, env: releaseEnv, cwd });
 
-  const remoteStableTags = s.listRemoteStableTags({ runner, cwd });
+  const remoteStableTags = s.listRemoteStableTags({ runner: releaseRunner, cwd });
   for (const tag of remoteStableTags) {
     if (compareStableTriples(version, tag.name) <= 0) {
       throw new Error(`Requested version ${version} must be greater than every remote stable tag`);
     }
   }
-  if (s.readStableRef({ runner, repo: CANONICAL_REPOSITORY, version, env, cwd }).kind !== "absent") {
+  if (s.readStableRef({ runner: releaseRunner, repo: CANONICAL_REPOSITORY, version, env: releaseEnv, cwd }).kind !== "absent") {
     throw new Error(`Stable ref ${version} already exists; inspect partial/concurrent publication state`);
   }
-  if (s.readReleaseState({ runner, repo: CANONICAL_REPOSITORY, version, env, cwd }).kind !== "absent") {
+  if (s.readReleaseState({ runner: releaseRunner, repo: CANONICAL_REPOSITORY, version, env: releaseEnv, cwd }).kind !== "absent") {
     throw new Error(`Release ${version} already exists; inspect partial/concurrent publication state`);
   }
 
   phase("qualification-snapshot");
   const qualificationRef = qualificationRefName(version, sha);
   const initialQualification = validateQualificationState(
-    s.fetchAndInspectObservedQualificationTag({ runner, cwd, ref: qualificationRef }),
+    s.fetchAndInspectObservedQualificationTag({ runner: releaseRunner, cwd, ref: qualificationRef }),
     { sha, version, nodeVersion: metadata.nodeVersion, pnpmVersion: metadata.pnpmVersion },
   );
   const qualificationTagObjectSha = initialQualification.objectSha;
 
   phase("publication-gates");
   for (const gate of PUBLICATION_GATES) {
-    const result = s.runPnpmGate(gate, { cwd, env, platform, comspec, runner });
+    const result = s.runPnpmGate(gate, { cwd, env: releaseEnv, platform, comspec, runner: releaseRunner });
     requireSuccess(result, `Publication gate ${gate}`);
   }
 
   phase("package");
-  const packaged = await s.packagePlugin({ cwd, version, runner });
+  const packaged = await s.packagePlugin({ cwd, version, runner: releaseRunner });
   if (!packaged || !Array.isArray(packaged.assets) || packaged.assets.length !== 4) {
     throw new Error("Release packaging did not produce the exact four-asset manifest");
   }
 
   const recheckSourceAndEvidence = async ({ requireStable, requireReleaseAbsent = false, requireDraft = false } = {}) => {
-    const currentSha = s.requireCleanMaster({ runner, cwd });
+    const currentSha = s.requireCleanMaster({ runner: releaseRunner, cwd });
     if (currentSha !== sha) throw new Error("Local HEAD changed during release");
-    s.requireCanonicalOriginEndpoints({ runner, cwd });
-    if (s.readRemoteMasterSha({ runner, cwd }) !== sha) throw new Error("Remote master changed during release");
+    s.requireCanonicalOriginEndpoints({ runner: releaseRunner, cwd });
+    if (s.readRemoteMasterSha({ runner: releaseRunner, cwd }) !== sha) throw new Error("Remote master changed during release");
     const currentMetadata = s.validateReleaseMetadata(await s.readReleaseMetadata(cwd), { requestedVersion: version });
-    const currentPnpm = s.readPnpmVersion({ runner, cwd, env, platform, comspec });
+    const currentPnpm = s.readPnpmVersion({ runner: releaseRunner, cwd, env: releaseEnv, platform, comspec });
     requireExactToolchain(currentMetadata, { runtimeNodeVersion, runtimePnpmVersion: currentPnpm });
     const qualification = validateQualificationState(
-      s.fetchAndInspectObservedQualificationTag({ runner, cwd, ref: qualificationRef }),
+      s.fetchAndInspectObservedQualificationTag({ runner: releaseRunner, cwd, ref: qualificationRef }),
       { sha, version, nodeVersion: currentMetadata.nodeVersion, pnpmVersion: currentMetadata.pnpmVersion },
     );
     if (qualification.objectSha !== qualificationTagObjectSha) throw new Error("Qualification evidence object changed during release");
-    const stable = s.readStableRef({ runner, repo: CANONICAL_REPOSITORY, version, env, cwd });
+    const stable = s.readStableRef({ runner: releaseRunner, repo: CANONICAL_REPOSITORY, version, env: releaseEnv, cwd });
     if (requireStable) {
       if (stable.kind !== "present" || stable.sha !== sha) throw new Error("Stable ref changed or does not target the qualified SHA");
     } else if (stable.kind !== "absent") {
       throw new Error("Stable ref appeared before the create-only claim");
     }
-    const releaseState = s.readReleaseState({ runner, repo: CANONICAL_REPOSITORY, version, env, cwd });
+    const releaseState = s.readReleaseState({ runner: releaseRunner, repo: CANONICAL_REPOSITORY, version, env: releaseEnv, cwd });
     if (requireReleaseAbsent && releaseState.kind !== "absent") throw new Error("Release appeared before draft creation");
     if (requireDraft) {
       if (releaseState.kind !== "present") throw new Error("Draft release disappeared before publication");
@@ -221,7 +224,7 @@ export async function releaseLocal({
   await recheckSourceAndEvidence({ requireStable: false, requireReleaseAbsent: true });
 
   phase("stable-ref-create");
-  s.createStableRef({ runner, repo: CANONICAL_REPOSITORY, version, sha, env, cwd });
+  s.createStableRef({ runner: releaseRunner, repo: CANONICAL_REPOSITORY, version, sha, env: releaseEnv, cwd });
 
   phase("post-ref-recheck");
   await recheckSourceAndEvidence({ requireStable: true, requireReleaseAbsent: true });
@@ -234,54 +237,54 @@ export async function releaseLocal({
     previousStableTag,
     stagedAssetPaths: packaged.assets.map(artifact => artifact.path),
   });
-  const draftResult = s.runGitHubCli({ runner, args: draftArgs, env, cwd });
+  const draftResult = s.runGitHubCli({ runner: releaseRunner, args: draftArgs, env: releaseEnv, cwd });
   if (!draftResult || draftResult.status !== 0) {
     let observed;
     try {
-      observed = s.readReleaseState({ runner, repo: CANONICAL_REPOSITORY, version, env, cwd });
+      observed = s.readReleaseState({ runner: releaseRunner, repo: CANONICAL_REPOSITORY, version, env: releaseEnv, cwd });
     } catch (error) {
       throw new Error(`Draft creation failed with unknown remote release state: ${error.message}`);
     }
     const description = observed.kind === "present" ? "a release/draft is now visible" : "no release is currently visible";
     throw new Error(`Draft creation failed; ${description}. Stop for inspection; do not retry or delete automatically.`);
   }
-  const draftState = s.readReleaseState({ runner, repo: CANONICAL_REPOSITORY, version, env, cwd });
+  const draftState = s.readReleaseState({ runner: releaseRunner, repo: CANONICAL_REPOSITORY, version, env: releaseEnv, cwd });
   if (draftState.kind !== "present") throw new Error("Draft creation returned success but no release is visible");
   requireReleaseShape(draftState.release, { version, draft: true });
 
   phase("draft-asset-verify");
   await s.verifyReleaseAssets({
-    runner, repo: CANONICAL_REPOSITORY, version, release: draftState.release,
-    localArtifacts: packaged.assets, tempRoot: join(packaged.stagingDir, "verify"), env, cwd,
+    runner: releaseRunner, repo: CANONICAL_REPOSITORY, version, release: draftState.release,
+    localArtifacts: packaged.assets, tempRoot: join(packaged.stagingDir, "verify"), env: releaseEnv, cwd,
   });
 
   phase("final-publish-check");
   const finalDraftState = await recheckSourceAndEvidence({ requireStable: true, requireDraft: true });
   await s.verifyReleaseAssets({
-    runner, repo: CANONICAL_REPOSITORY, version, release: finalDraftState.release,
-    localArtifacts: packaged.assets, tempRoot: join(packaged.stagingDir, "verify-final"), env, cwd,
+    runner: releaseRunner, repo: CANONICAL_REPOSITORY, version, release: finalDraftState.release,
+    localArtifacts: packaged.assets, tempRoot: join(packaged.stagingDir, "verify-final"), env: releaseEnv, cwd,
   });
 
   phase("publish");
-  const publishResult = s.runGitHubCli({ runner, args: s.publishDraftArgs({ repo: CANONICAL_REPOSITORY, version }), env, cwd });
+  const publishResult = s.runGitHubCli({ runner: releaseRunner, args: s.publishDraftArgs({ repo: CANONICAL_REPOSITORY, version }), env: releaseEnv, cwd });
 
   phase("post-verify");
   const finalQualification = validateQualificationState(
-    s.fetchAndInspectObservedQualificationTag({ runner, cwd, ref: qualificationRef }),
+    s.fetchAndInspectObservedQualificationTag({ runner: releaseRunner, cwd, ref: qualificationRef }),
     { sha, version, nodeVersion: metadata.nodeVersion, pnpmVersion: metadata.pnpmVersion },
   );
   if (finalQualification.objectSha !== qualificationTagObjectSha) throw new Error("Qualification evidence changed by post-publication verification");
-  const finalStable = s.readStableRef({ runner, repo: CANONICAL_REPOSITORY, version, env, cwd });
+  const finalStable = s.readStableRef({ runner: releaseRunner, repo: CANONICAL_REPOSITORY, version, env: releaseEnv, cwd });
   if (finalStable.kind !== "present" || finalStable.sha !== sha) throw new Error("Post-publication stable ref verification failed");
-  const finalReleaseState = s.readReleaseState({ runner, repo: CANONICAL_REPOSITORY, version, env, cwd });
+  const finalReleaseState = s.readReleaseState({ runner: releaseRunner, repo: CANONICAL_REPOSITORY, version, env: releaseEnv, cwd });
   if (finalReleaseState.kind !== "present") throw new Error("Post-publication release is absent");
   requireReleaseShape(finalReleaseState.release, { version, draft: false });
   await requireArtifactsUnchanged(packaged.assets);
   await s.verifyReleaseAssets({
-    runner, repo: CANONICAL_REPOSITORY, version, release: finalReleaseState.release,
-    localArtifacts: packaged.assets, tempRoot: join(packaged.stagingDir, "verify-post"), env, cwd,
+    runner: releaseRunner, repo: CANONICAL_REPOSITORY, version, release: finalReleaseState.release,
+    localArtifacts: packaged.assets, tempRoot: join(packaged.stagingDir, "verify-post"), env: releaseEnv, cwd,
   });
-  const postPublicationRemoteMaster = s.readRemoteMasterSha({ runner, cwd });
+  const postPublicationRemoteMaster = s.readRemoteMasterSha({ runner: releaseRunner, cwd });
   const releaseUrl = finalReleaseState.release.html_url;
   if (typeof releaseUrl !== "string" || releaseUrl === "") throw new Error("Published release is missing its GitHub URL");
 
