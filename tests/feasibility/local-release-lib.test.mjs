@@ -8,6 +8,7 @@ import {
   runPnpmGate,
   serializeQualificationReceipt,
   validateQualificationReceipt,
+  withoutGitHubE2EToken,
 } from "../../scripts/local-release-lib.mjs";
 
 const sha = "a".repeat(40);
@@ -83,6 +84,14 @@ test("receipt validates audit field syntax", () => {
     [{ ...receipt, platform: "" }, /platform/i],
     [{ ...receipt, platform: "linux x64" }, /platform/i],
   ]) assert.throws(() => validateQualificationReceipt(value, expected), pattern);
+});
+
+test("non-live qualification environment removes E2E token without mutating caller input", () => {
+  const source = { PATH: "/bin", GITHUB_E2E_TOKEN: "secret", OTHER: "keep" };
+  const result = withoutGitHubE2EToken(source);
+  assert.deepEqual(result, { PATH: "/bin", OTHER: "keep" });
+  assert.equal(source.GITHUB_E2E_TOKEN, "secret");
+  assert.notEqual(result, source);
 });
 
 test("Windows gate construction uses only a fixed allowlisted shell string", () => {
