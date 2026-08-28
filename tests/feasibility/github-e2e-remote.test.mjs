@@ -77,7 +77,7 @@ test("branch lookup distinguishes absent, present, and unknown", async () => {
   }), /network error/i);
 });
 
-test("cleanup deletes a present unique branch and verifies absence", async () => {
+test("cleanup deletes a present unique branch through documented read/delete endpoints and verifies absence", async () => {
   const calls = [];
   const fetchImpl = fakeFetch([
     response(200, { object: { sha: "a".repeat(40) } }),
@@ -87,8 +87,11 @@ test("cleanup deletes a present unique branch and verifies absence", async () =>
   await cleanupE2EBranch({
     fetchImpl, owner: "test", repo: "repo", branch: "obsidian-sync-e2e/local-abc-run", token: "secret", sleep: async () => {},
   });
+  assert.match(calls[0].url, /\/git\/ref\/heads\/obsidian-sync-e2e\/local-abc-run$/u);
+  assert.equal(calls[0].options.method, undefined);
+  assert.match(calls[1].url, /\/git\/refs\/heads\/obsidian-sync-e2e\/local-abc-run$/u);
   assert.equal(calls[1].options.method, "DELETE");
-  assert.match(calls[0].url, /heads\/obsidian-sync-e2e\/local-abc-run$/u);
+  assert.match(calls[2].url, /\/git\/ref\/heads\/obsidian-sync-e2e\/local-abc-run$/u);
 });
 
 test("cleanup succeeds when the branch is already absent", async () => {
