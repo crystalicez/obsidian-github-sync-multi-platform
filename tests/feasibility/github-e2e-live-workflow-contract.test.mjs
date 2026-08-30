@@ -34,3 +34,12 @@ test("cleanup re-proves target without qualify outputs", async () => {
   assert.doesNotMatch(text, /needs\.qualify\.outputs/u);
   assert.match(text, /cleanup-only rerun may remove residue but is not release qualification/u);
 });
+
+test("cleanup uses documented exact-ref reads and a bounded 15 second verification deadline", async () => {
+  const text = await readFile(workflow, "utf8");
+  const cleanup = text.slice(text.indexOf("Delete and verify pinned disposable branch"));
+  assert.match(cleanup, /const exactRead = \(\) => `\$\{base\}\/git\/ref\/heads\/\$\{encodeRef\(branch\)\}`/u);
+  assert.match(cleanup, /const exactDelete = \(\) => `\$\{base\}\/git\/refs\/heads\/\$\{encodeRef\(branch\)\}`/u);
+  assert.match(cleanup, /const cleanupDeadline = Date\.now\(\) \+ 15_000/u);
+  assert.doesNotMatch(cleanup, /for \(let attempt = 1; attempt <= 3; attempt\+\+\)/u);
+});
