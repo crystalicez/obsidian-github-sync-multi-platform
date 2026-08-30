@@ -324,6 +324,7 @@ jobs:
         with:
           name: github-e2e-target-${{ github.run_id }}-${{ github.run_attempt }}
           path: .tmp/github-e2e-receipt/github-e2e-target.json
+          include-hidden-files: true
           if-no-files-found: error
 
       - name: Run verified real GitHub E2E bundles
