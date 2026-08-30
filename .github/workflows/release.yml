@@ -10,7 +10,7 @@ on:
 
 permissions:
   actions: read
-  contents: write
+  contents: read
 
 concurrency:
   group: stable-release
@@ -23,6 +23,11 @@ jobs:
   release:
     runs-on: ubuntu-latest
     steps:
+      - name: Block stable release until Child A provenance gate lands
+        run: |
+          echo "Stable Release is temporarily disabled until the approved Release Provenance and Versioning (Child A) implementation replaces the legacy qualification/publication path." >&2
+          exit 1
+
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ github.sha }}
