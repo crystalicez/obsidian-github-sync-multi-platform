@@ -71,27 +71,23 @@ If cleanup fails, **Re-run failed jobs** may be used to remove residue safely. T
 
 If `master` changes after qualification, or ordinary CI is rerun for the same SHA and a newer producer attempt becomes authoritative, the previous live evidence is stale. Run **GitHub E2E Live** again.
 
-## 4. Create a stable release
+## 4. Stable Release is temporarily interlocked
 
-In **Actions -> Stable Release -> Run workflow**, select `master` and enter the exact stable `x.y.z` version already present in `package.json`/`manifest.json`.
+Do **not** dispatch **Stable Release** while only the Live-E2E Safety child is installed. The legacy release gate cannot prove the new same-attempt receipt is bound to the current authoritative CI producer, so the workflow is intentionally fail-closed until the approved **Release Provenance and Versioning (Child A)** implementation replaces it.
 
-Before publication the current Stable Release workflow verifies:
+The temporary interlock is enforced in `.github/workflows/release.yml` before checkout or repository code execution, and the default workflow token is read-only (`actions: read`, `contents: read`). The interlock must not be removed as a manual workaround.
 
-- requested version/compatibility metadata are consistent,
-- requested stable version is monotonic and its tag/release does not already exist,
-- target SHA is current `master`,
-- a successful **GitHub E2E Live** run exists for that exact SHA with successful `qualify` and `cleanup` jobs,
-- frozen pnpm install, build, fast/repeat/recovery/resource/feasibility tests, GitHub-E2E compile gate, and package validation all pass,
-- `master` still points to the same SHA immediately before publication.
+Child A will replace the legacy release path with the approved flow:
 
-Only then does the workflow call `gh release create` for the exact qualified SHA and upload:
+```text
+newest exact-SHA/current-attempt CI authority
+-> newest exact-SHA/current-attempt cohesive Live E2E authority
+-> same-attempt receipt binds the exact current CI producer/artifact
+-> promote exact CI-produced release bytes
+-> isolated tag/draft/assets/publish state machine
+```
 
-- `main.js`,
-- `manifest.json`,
-- `styles.css`,
-- packaged plugin ZIP.
-
-The Stable Release publication implementation itself is not redesigned by the live-E2E safety work described above; publication hardening belongs to the separate release child design.
+Until that implementation lands, version bumps, ordinary CI, Branch Candidate Builds, and GitHub E2E Live qualification remain available, but stable publication is deliberately unavailable.
 
 ## Branch candidate builds
 
@@ -101,7 +97,7 @@ There is no automatic public alpha/beta channel in the current release design.
 
 ## Partial publication failure
 
-Tag creation, release creation, and asset upload are not one cross-resource transaction. If the final publication command fails after mutation starts, inspect actual GitHub state before retrying or deleting anything.
+The legacy publication steps remain below the temporary interlock only as code to be replaced by Child A; they are unreachable while the interlock is active. If inspecting historical partial publication state from a run before the interlock, remember that tag creation, release creation, and asset upload were not one cross-resource transaction.
 
 ```bash
 VERSION=1.2.3
@@ -109,11 +105,11 @@ gh release view "$VERSION" --repo crystalicez/obsidian-github-sync-multi-platfor
 git ls-remote --tags origin "refs/tags/$VERSION"
 ```
 
-Do not automatically delete a tag/release just because the workflow failed. Inspect whether a valid release already exists, then remove only state the maintainer has determined is partial/invalid. The Stable Release workflow remains fail-closed while a conflicting tag or release exists.
+Do not automatically delete a tag/release just because an older workflow failed. Inspect whether a valid release already exists, then remove only state the maintainer has determined is partial/invalid.
 
 ## Local deterministic verification
 
-Before dispatching qualification/release, the equivalent local gate is:
+Before dispatching qualification, the equivalent local gate is:
 
 ```bash
 corepack pnpm install --frozen-lockfile
