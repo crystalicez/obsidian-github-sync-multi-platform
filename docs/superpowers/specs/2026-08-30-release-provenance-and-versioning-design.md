@@ -10,18 +10,9 @@ Revised after formal red-team review on 2026-08-30. This child owns stable relea
 
 Publish the exact stable-release bytes produced and package-validated by authoritative ordinary CI for the exact final `master` SHA, while keeping repository write authority out of repository checkout/install/build/test execution.
 
-The release system must prove:
+The release system must prove exact source commit, authoritative current CI producer/job execution, authoritative current live-E2E qualification for that same current CI producer, byte integrity through public assets, source-manifest identity, monotonic stable version history, exact tag binding, and current qualification immediately before mutation/publication.
 
-1. exact source commit,
-2. authoritative current CI producer and producer job execution,
-3. authoritative current live-E2E qualification for the same current CI producer,
-4. byte integrity from CI artifact through public release assets,
-5. source `manifest.json` identity for the public manifest,
-6. canonical monotonic stable-version history,
-7. exact tag binding to the source SHA,
-8. current-master/qualification validity immediately before mutation and publication.
-
-The design does not claim unit tests execute final bundled `main.js` byte-for-byte; it guarantees the promoted bytes are the exact outputs produced and package-validated in the same successful CI producer execution after deterministic source/build/test gates, with no release-time rebuild.
+The design does not claim unit tests execute final bundled `main.js` byte-for-byte; it guarantees promoted bytes are exact outputs produced and package-validated in the same successful CI producer execution after deterministic source/build/test gates, with no release-time rebuild.
 
 ## Non-goals
 
@@ -41,17 +32,17 @@ fast + repeat + recovery + resource + feasibility tests
 real-GitHub E2E compile gate
 package validation
 construct stable release ZIP
-validate ZIP semantic contents
+validate ZIP semantics
 write release-input manifest
 upload release-input artifact
 ```
 
-Stable Release never checks out the repository, installs dependencies, rebuilds, or reruns repository tests.
+Stable Release never checks out repository code, installs dependencies, rebuilds, or reruns repository tests.
 
 CI uploads:
 
 ```text
-release-input-${GITHUB_SHA}-${GITHUB_RUN_ID}-${VERIFY_JOB_EXECUTION_ATTEMPT}
+release-input-${GITHUB_SHA}-${GITHUB_RUN_ID}-${VERIFY_JOB_ATTEMPT}
 ```
 
 with exactly:
@@ -64,65 +55,56 @@ manifest.json
 styles.css
 ```
 
-The trusted `<repository-name>` authority is GitHub repository metadata/context, not a value supplied by the artifact manifest.
+Trusted `<repository-name>` authority is GitHub repository metadata/context, never artifact-supplied text.
 
-`release-input.json` records data only: schema version, repository ID, commit SHA, CI run ID, producer `verify` job execution attempt, version, plugin ID, exact public asset names, sizes, and SHA-256 values. It cannot define commands, extraction destinations, upload destinations, or arbitrary filenames.
+The manifest records schema version, repository ID, commit SHA, CI run ID, producer `verify` execution attempt, version, plugin ID, exact asset names, sizes, and SHA-256 values as data only.
 
 ---
 
 # 2. Stable Package Compatibility Contract
 
-The hardening change preserves current stable-release UX:
+Preserve current stable-release UX:
 
 ```text
 release title/name = VERSION
 generate release notes = true
 prerelease = false
-draft until verification is complete
+draft until verification completes
 ```
 
-The convenience ZIP name remains:
+ZIP remains:
 
 ```text
 <repository-name>-v<VERSION>.zip
 ```
 
-and its internal root directory remains:
+with internal root:
 
 ```text
 <repository-name>/
+  main.js
+  manifest.json
+  styles.css
 ```
 
-with exactly:
-
-```text
-main.js
-manifest.json
-styles.css
-```
-
-CI validates the ZIP as a real ZIP container and rejects absolute/traversal paths, duplicate names, symlinks, unexpected directories/files, or extras. The inner three files must be byte-identical to the standalone artifact files.
-
-The ZIP SHA-256 is recorded only after semantic validation succeeds.
+CI rejects invalid ZIP container, absolute/traversal paths, duplicate names, symlinks, unexpected entries, or extras. Inner files must be byte-identical to standalone assets. ZIP SHA-256 is recorded only after semantic validation.
 
 ---
 
 # 3. Exact Source Metadata Binding
 
-The artifact `manifest.json` must be byte-identical to `manifest.json` stored at exact source `GITHUB_SHA`.
+Artifact `manifest.json` must be byte-identical to exact source `manifest.json` at `GITHUB_SHA`.
 
-Stable Release reads fixed source paths directly through GitHub API at exact SHA:
+Stable Release reads only fixed source paths through GitHub API at exact SHA:
 
 ```text
 package.json
 manifest.json
 versions.json
-.node-version when required by cross-workflow provenance checks
+.node-version when needed by provenance checks
 ```
 
-These are parsed strictly as data. No source checkout or source script execution is allowed.
-
-The public `manifest.json` artifact is rejected if it differs from exact-SHA source bytes even when the artifact manifest is internally self-consistent.
+These are parsed strictly as data; no source checkout/script execution is allowed.
 
 ---
 
@@ -130,9 +112,9 @@ The public `manifest.json` artifact is rejected if it differs from exact-SHA sou
 
 ## 4.1 Newest exact-SHA run authority
 
-For each workflow, select the **newest** run matching the exact required identity rather than any historical success.
+For each workflow, select the **newest** run matching exact identity; do not choose any historical success.
 
-CI identity:
+CI:
 
 ```text
 workflow = ci.yml
@@ -141,7 +123,7 @@ head_branch = master
 head_sha = GITHUB_SHA
 ```
 
-Live identity:
+Live:
 
 ```text
 workflow = github-e2e-live.yml
@@ -150,17 +132,13 @@ head_branch = master
 head_sha = GITHUB_SHA
 ```
 
-If the newest matching run is queued/running/cancelled/failed, release blocks. It never falls back to an older successful run.
-
-Run ordering uses explicit GitHub run metadata (newest creation/run ordering with deterministic ID tie-break where necessary), not first-page accident.
+If newest matching run is queued/running/cancelled/failed, release blocks. Ordering uses explicit run metadata with deterministic tie-breaking, not first-page accident.
 
 ## 4.2 Latest execution of each required job
 
-GitHub partial reruns may execute only failed or selected jobs. Therefore authority is not "all jobs must be in one attempt".
+For the selected run, enumerate attempt-specific jobs and find the highest attempt in which each required job actually executed.
 
-For a selected run, enumerate attempt-specific jobs and find the highest attempt in which each required job actually executed.
-
-Require its latest execution to be:
+Require latest execution:
 
 ```text
 status = completed
@@ -174,11 +152,19 @@ CI:       verify
 Live E2E: qualify, cleanup
 ```
 
-This permits a successful `qualify` from attempt 1 plus a successful rerun of failed `cleanup` in attempt 2, while a newer failed/running execution of `qualify` supersedes its earlier success.
+This supports partial reruns: attempt-1 `qualify` success plus attempt-2 rerun of failed `cleanup` can qualify, while a newer failed/running execution of `qualify` supersedes its earlier success.
 
 ## 4.3 Current CI producer binds live qualification
 
-The newest authoritative live run must record the exact CI producer identity it consumed:
+Child B persists a strict non-secret target/provenance receipt **before live scenario mutation** for each `qualify` execution attempt:
+
+```text
+github-e2e-target-${LIVE_RUN_ID}-${QUALIFY_ATTEMPT}
+```
+
+For the latest successful `qualify` execution, Stable Release requires the corresponding receipt artifact and verifies its repository/SHA/run/attempt metadata/content.
+
+The receipt supplies the exact CI input identity used by that successful `qualify` execution:
 
 ```text
 ciProducerRunId
@@ -187,89 +173,66 @@ ciE2EArtifactId
 ciE2EArtifactDigest when exposed
 ```
 
-Stable Release requires those values to equal the current authoritative CI producer/E2E artifact.
+Receipt existence/content is **not** proof that E2E passed; successful `qualify`/`cleanup` authority comes only from Actions job state. The receipt is provenance data binding that successful job execution to its CI input.
 
-Therefore any later CI rerun/new producer for the same SHA invalidates old live qualification until live E2E is rerun against the new current CI artifact.
+Those CI values must equal the current authoritative CI producer/E2E artifact. Any later CI producer invalidates old live qualification until live E2E is rerun.
 
 ---
 
 # 5. Release Artifact Selection and Untrusted Boundary
 
-The selected `release-input` artifact must bind to the latest authoritative CI `verify` execution that produced it.
+Selected `release-input` artifact binds to latest authoritative CI `verify` execution.
 
-Before use require:
+Require exact artifact name, unexpired state, matching workflow run/repository/head metadata, server artifact digest when exposed, and embedded producer identity.
 
-- exact artifact name,
-- artifact not expired,
-- artifact workflow run ID/repository ID/head SHA match authoritative CI,
-- server artifact SHA-256 digest matches when exposed,
-- embedded manifest run/repository/SHA/job-attempt identity matches.
-
-The `verify` and `publish` jobs each independently download and validate the exact selected artifact. No mutable workspace handoff is trusted across jobs.
+`verify` and `publish` independently download/validate the same selected artifact; mutable workspace handoff is not trusted.
 
 Before extraction reject absolute/traversal paths, symlinks, duplicate names, unexpected directories, and anything outside the fixed five-entry allowlist derived from trusted repository name + requested canonical version.
 
-Extraction occurs only into a fresh empty directory. Every extracted asset must be a regular file with exact expected size/SHA-256. Artifact files are never sourced, imported, required, or executed.
+Extraction is into a fresh empty directory. Every asset must be a regular file with exact expected size/SHA-256. Artifact files are never sourced/imported/required/executed.
 
 ---
 
 # 6. Stable Release Privilege Architecture
 
-## 6.1 Default workflow token remains read-only
+## 6.1 Default workflow token is always read-only
 
-Stable Release never grants repository write permission to its default `GITHUB_TOKEN`.
+Stable Release never grants repository write permission to default `GITHUB_TOKEN`.
 
-Workflow/job permission contract is limited to read authority required for qualification/source/artifact inspection, such as:
+It has only read authority required for Actions/source/artifact inspection, such as:
 
 ```text
 actions: read
 contents: read
 ```
 
-Repository mutation does not use this token.
+Repository mutation never uses this token.
 
-## 6.2 `stable-release` environment and scoped publication credential
+## 6.2 `stable-release` environment + scoped publication credential
 
-Create a `stable-release` environment with **Selected branches and tags** allowing branch `master` and no tags.
+Create `stable-release` environment with **Selected branches and tags** allowing branch `master` and no tags. Do not use `Protected branches only` while repository has no protected branch rule.
 
-Do not use `Protected branches only` while the repository has no protected branch rule.
+The environment provides `RELEASE_TOKEN`, scoped so mutable repository authority is restricted to this source repository and only permissions required for tag/release publication. A fine-grained repository-scoped credential or repository-scoped GitHub App credential is acceptable; broad classic credentials are not release-qualifying configuration.
 
-The environment provides a release publication credential represented as `RELEASE_TOKEN`. Its mutable repository scope is restricted to this source repository and only the repository permissions required for tag/release publication.
+`publish` references `environment: stable-release`; removing the environment loses `RELEASE_TOKEN` and leaves only read-only default token.
 
-Acceptable implementations include a fine-grained repository-scoped credential or repository-scoped GitHub App installation credential. Broad classic credentials are not release-qualifying configuration.
+The release credential is exposed only to fixed workflow-owned publication-state inspection/mutation/upload/publication steps that execute no repository code. Most read-only qualification uses default token.
 
-The `publish` job references `environment: stable-release`; if a workflow variant removes that environment, it loses `RELEASE_TOKEN` and still has only the read-only default workflow token.
+Draft-release enumeration is performed with the publication credential because GitHub only exposes draft releases to callers with push access; publication conflict checks must include drafts rather than accidentally seeing published releases only.
 
-The release credential is exposed only to fixed mutation/upload/publication steps. Read-only revalidation uses the default read token.
+## 6.3 `verify`
 
-## 6.3 `verify` job
+No release credential; no repository mutation. It requires exact master, selects authoritative CI/live job executions, requires live receipt to bind current CI input, verifies exact release artifact, reads fixed exact-SHA source metadata, validates package/version/history, and exposes only non-secret identities.
 
-`verify` has no release publication credential and performs no repository mutation.
+## 6.4 `publish`
 
-It:
-
-1. requires dispatch from `master`,
-2. requires current `master == GITHUB_SHA`,
-3. selects authoritative CI and live runs/jobs,
-4. requires live consumed current CI E2E input,
-5. downloads/verifies the exact release-input artifact,
-6. reads fixed exact-SHA source metadata,
-7. validates version/history/source-manifest/package invariants,
-8. exposes only non-secret selected identities to `publish`.
-
-## 6.4 `publish` job
-
-`publish` depends on `verify`, runs with `environment: stable-release`, and has no checkout/install/build/test step.
-
-It independently re-downloads/revalidates the exact artifact and exact source metadata before any mutation.
+Depends on `verify`, references protected release environment, contains no checkout/install/build/test, independently re-downloads/revalidates artifact/source metadata, and performs final publication-state inspection before mutation.
 
 ---
 
 # 7. External Action Pinning
 
-All external `uses:` references remain pinned to verified full-length commit SHAs under the cross-cutting Actions policy established by Child B.
-
-A static feasibility test prevents regression to mutable action tags/branches.
+All external `uses:` references remain pinned to verified full-length commit SHAs under the cross-cutting Actions policy established by Child B. Static feasibility tests prevent regression to mutable action tags/branches.
 
 Privileged release jobs minimize external actions and execute no repository code.
 
@@ -283,39 +246,39 @@ Canonical stable versions match:
 ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$
 ```
 
-Comparison uses exact integer components (`BigInt` or equivalent), never JavaScript `Number` or `sort -V` as authority.
+Comparison uses exact integer components (`BigInt` or equivalent), never JavaScript `Number` or `sort -V` authority.
 
-Repository-side tooling shares one dependency-free version helper for parse/validate/compare/max behavior. `scripts/update-version.js`, `scripts/validate-package.mjs`, and source-side tests use it.
+Repository tooling shares one dependency-free helper for parse/validate/compare/max. `scripts/update-version.js`, `scripts/validate-package.mjs`, and tests use it.
 
-Privileged release jobs do not checkout/execute that helper; they use small fixed workflow-owned logic tested against the same canonical vectors.
+Privileged release jobs do not checkout/execute that helper; small fixed workflow-owned comparison logic is tested against the same vectors.
 
-`versions.json` validation requires every key canonical, compatibility values valid under current project syntax, package/manifest versions identical, current version present and maximum, and current mapping equal `manifest.minAppVersion`.
+`versions.json` requires every key canonical, compatibility values valid under current project syntax, package/manifest versions identical, current version present and maximum, and current mapping equal `manifest.minAppVersion`.
 
-The bump helper rejects an existing/non-increasing target before write.
+Bump helper rejects existing/non-increasing target before write.
 
 ---
 
 # 9. Publication History
 
-Immediately before tag creation, calculate stable history from the union of:
+Immediately before tag creation calculate stable history union:
 
 ```text
 canonical exact-SHA versions.json keys
 canonical remote tag names
-canonical authenticated-visible release tag_name values
+canonical authenticated-visible release tag_name values (including drafts)
 ```
 
-The requested version must equal the maximum declared exact-SHA `versions.json` key and be strictly greater than every other canonical observed stable version.
+Requested version must equal maximum declared exact-SHA `versions.json` key and be strictly greater than every other canonical observed stable version.
 
-Enumeration is pagination-safe.
+Tag/release enumeration is pagination-safe. Release enumeration requiring draft visibility uses the scoped publication credential in the no-code `publish` job.
 
-Deleted history absent from all three sources cannot be reconstructed by workflow logic; Immutable Releases/repository governance are the long-term defense against historical erasure.
+Deleted history absent from all three sources cannot be reconstructed; Immutable Releases/repository governance are long-term defenses.
 
 ---
 
 # 10. Publication-Time Revalidation
 
-Immediately before tag mutation, require:
+Immediately before tag mutation require:
 
 ```text
 current master == GITHUB_SHA
@@ -323,104 +286,81 @@ newest authoritative CI run unchanged
 latest CI verify execution still successful
 newest authoritative live run unchanged
 latest live qualify + cleanup executions still successful
-live run still references current CI E2E producer
+latest successful qualify receipt valid
+receipt still references current CI E2E producer
 release-input artifact still matches current CI producer
-artifact/source manifest binding still valid
-exact-SHA package/manifest/versions still match requested version
-complete tag/release history still permits version
+artifact/source manifest binding valid
+exact-SHA package/manifest/versions match requested version
+complete tag + draft/published release history permits version
 requested tag absent
 no authenticated-visible release/draft uses requested tag
 ```
 
-Immediately before draft -> public transition, re-require at least:
+Immediately before draft -> public transition re-require at least:
 
 ```text
 current master == GITHUB_SHA
-authoritative CI/live evidence unchanged and successful
-live still references current CI producer
+authoritative CI/live evidence unchanged/successful
+qualify receipt still binds current CI producer
 exact tag == GITHUB_SHA
 same expected draft release ID/assets
 ```
 
-The workflow does not claim atomicity against an external administrator modifying controls after final observation.
+No claim of atomicity against an external administrator modifying controls after final observation.
 
 ---
 
 # 11. Publication State Machine
 
 ```text
-revalidate all authority using read-only token
+revalidate ordinary authority with read-only token
+inspect complete release state (including drafts) with RELEASE_TOKEN
         ↓
 with RELEASE_TOKEN: create refs/tags/VERSION -> GITHUB_SHA via create-only Git refs API
         ↓
 read exact tag; require commit object at GITHUB_SHA
         ↓
 with RELEASE_TOKEN: create draft release for existing tag
-  name/title = VERSION
+  title/name = VERSION
   generate_release_notes = true
   prerelease = false
         ↓
-capture numeric release ID + upload URL from creation response
+capture numeric release ID + upload URL
         ↓
-with RELEASE_TOKEN: upload exact fixed allowlisted assets
+with RELEASE_TOKEN: upload exact allowlisted assets
         ↓
 GET same release ID; require draft/tag/exact asset set
         ↓
-boundedly wait for each release asset digest if necessary
-require `sha256:` digest + size equal release-input manifest
+boundedly wait for release asset digest readiness if needed
+require each `sha256:` digest + size equals release-input manifest
         ↓
-revalidate master + authoritative CI/live + current-CI binding + exact tag
+revalidate master + CI/live/current-CI binding + exact tag
         ↓
-with RELEASE_TOKEN: publish the same numeric release ID
+with RELEASE_TOKEN: publish same numeric release ID
         ↓
 GET same release ID
-require public non-prerelease release, exact tag/title, exact assets, exact sizes/digests
+require public non-prerelease state, exact tag/title, exact assets/sizes/digests
 ```
 
-`gh release create --target` is not tag authority. Returned numeric release ID is release authority after draft creation; do not rediscover the draft by mutable tag/name for subsequent mutation.
+`gh release create --target` is not tag authority. Numeric release ID returned by draft creation is release identity for subsequent mutation; do not rediscover by tag/name.
 
 ---
 
 # 12. Partial Publication and Immutability
 
-Tag creation, draft creation, asset upload, and public publication are not one transaction.
+Tag creation, draft creation, upload, and public publication are not one transaction.
 
-Never automatically remove repository publication state because a later step fails. Conflicting partial state remains inspectable and blocks another stable run until a maintainer resolves it.
+Never automatically remove publication state because a later step fails. Conflicting partial state remains inspectable and blocks another stable run until maintainer resolution.
 
-Runbook covers tag-only state, incomplete draft, complete draft whose qualification became stale, public release with failed final verification, and digest mismatch.
+Runbook covers tag-only state, incomplete draft, complete stale-qualified draft, public release with failed final verification, and digest mismatch.
 
-Enable GitHub Immutable Releases before calling published releases immutable. Workflow provenance/binding protects publication correctness; platform immutability protects the associated tag/assets after publication when enabled.
+Enable GitHub Immutable Releases before calling published releases immutable. Workflow provenance protects publication correctness; platform immutability protects associated tag/assets after publication when enabled.
 
 ---
 
 # 13. Tests
 
-Required tests include:
-
-- canonical patch/minor/major/explicit versions,
-- huge integer version components,
-- leading-zero/malformed/equal/lower/duplicate versions,
-- noncanonical history/current-not-maximum metadata,
-- exact ZIP root/name/content semantics,
-- traversal/symlink/duplicate/extra ZIP rejection,
-- ZIP inner files equal standalone assets,
-- artifact manifest/source manifest mismatch rejection,
-- newest exact-SHA CI/live run authority,
-- newer failed/running run blocks older success,
-- latest required-job execution across attempts,
-- partial cleanup rerun remains usable,
-- newer CI producer invalidates older live qualification,
-- malicious artifact shape rejected,
-- no release checkout/install/build/test,
-- no write-capable default `GITHUB_TOKEN`,
-- `stable-release` environment/published credential boundary present,
-- complete pagination-safe publication history,
-- create-only exact tag before draft,
-- release ID captured and reused,
-- title/generated-notes/non-prerelease/ZIP-layout compatibility,
-- revalidation before tag and before public publication,
-- final asset `sha256:` digests/sizes match,
-- no automatic destructive rollback.
+Required evidence includes canonical version positives/negatives + huge integers; noncanonical/current-not-maximum history; exact ZIP name/root/content semantics; ZIP traversal/symlink/duplicate/extra rejection; artifact/source manifest mismatch rejection; newest exact-SHA CI/live authority; latest required-job execution across attempts; partial cleanup rerun support; newer CI producer invalidating older live qualification; exact successful-qualify receipt binding; missing/mismatched receipt rejection; malicious release artifact rejection; no release checkout/install/build/test; no write-capable default `GITHUB_TOKEN`; protected release environment boundary; draft-visible conflict enumeration with publication credential; complete pagination-safe history; create-only exact tag; captured release ID; preserved title/generated-notes/non-prerelease/ZIP UX; revalidation before tag/publication; exact final asset digests; and no automatic destructive rollback.
 
 ---
 
@@ -430,26 +370,24 @@ One-time setup:
 
 1. configure `stable-release` environment,
 2. restrict it to selected branch `master`,
-3. configure repository-scoped release publication credential,
-4. enable Immutable Releases when available/desirable,
+3. configure repository-scoped publication credential,
+4. enable Immutable Releases when appropriate,
 5. keep external actions full-SHA pinned.
 
 Per release:
 
 ```text
 bump version
-merge to master
-ordinary CI succeeds and produces current release + E2E artifacts
-run GitHub E2E Live for exact current SHA/current CI E2E artifact
-run Stable Release with already-declared version
+-> merge master
+-> ordinary CI succeeds and produces current release + E2E artifacts
+-> GitHub E2E Live succeeds for exact SHA/current CI E2E artifact
+-> Stable Release promotes current CI release artifact
 ```
 
-Stable Release only verifies and promotes CI output, so it is faster and narrower than the current rebuild workflow.
-
-If authoritative CI changes, live qualification must be repeated. If `master` changes, all previous exact-SHA qualification is irrelevant to the new tip.
+If authoritative CI changes, live qualification must be repeated. If master changes, prior exact-SHA qualification is irrelevant to new tip.
 
 ---
 
 # 15. Acceptance Criteria
 
-Complete only when CI is the sole stable release-byte producer; Stable Release executes no repository code/dependencies; default workflow token remains read-only; publication authority exists only through the `stable-release` environment-scoped repository-limited credential; newest exact-SHA CI/live runs and latest executions of required jobs are authoritative; live qualification is bound to the current CI producer; source/public manifest and artifact digests are verified; version history is canonical/exact; tag creation is create-only at exact SHA; release draft/public lifecycle uses returned numeric release ID; existing release title/notes/ZIP UX is preserved; final public asset digests match; and partial failures never trigger automatic destructive rollback.
+Complete only when CI is sole stable release-byte producer; Stable Release executes no repository code/dependencies; default workflow token remains read-only; publication authority exists only through protected environment-scoped repository-limited credential; draft conflict inspection is complete; newest exact-SHA CI/live runs and latest required-job executions are authoritative; latest successful qualify receipt binds live success to current CI producer; source/public manifest + artifact digests are verified; version history is canonical/exact; exact tag is create-only; release lifecycle uses returned numeric release ID; current release title/notes/ZIP UX is preserved; final public asset digests match; and partial failures never trigger automatic destructive rollback.
