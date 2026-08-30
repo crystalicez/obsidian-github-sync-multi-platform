@@ -51,7 +51,13 @@ function loadEnvFile() {
 
 if (!compileOnly) loadEnvFile();
 
-const required = ["GITHUB_E2E_OWNER", "GITHUB_E2E_REPO", "GITHUB_E2E_BRANCH", "GITHUB_E2E_TOKEN"];
+const required = [
+  "GITHUB_E2E_OWNER",
+  "GITHUB_E2E_REPO",
+  "GITHUB_E2E_BRANCH",
+  "GITHUB_E2E_TOKEN",
+  "GITHUB_E2E_EXPECTED_REPO_ID",
+];
 if (!compileOnly) {
   const missing = required.filter(name => !process.env[name]);
   if (missing.length > 0) {
