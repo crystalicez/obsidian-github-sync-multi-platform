@@ -10,18 +10,19 @@ It refines, but does not rewrite, the historical hardening design in `docs/super
 
 ## Goal
 
-Close the remaining release-safety, live-E2E isolation, publication-race/recovery, and immutable-read gaps without broad V4 rewrites or speculative optimization.
+Close remaining release-safety, live-E2E isolation, publication-race/recovery, and immutable-read gaps without broad V4 rewrites or speculative optimization.
 
-The design follows these principles:
+Principles:
 
-1. **CI is the sole producer of release bytes and live-E2E executable bundles.**
+1. **CI is sole producer of release bytes and live-E2E executable bundles.**
 2. **Privileged workflows consume integrity-bound CI artifacts; they do not checkout/install/build repository code.**
-3. **Destructive credentials are narrowly scoped, environment-gated, and never replaced by a write-capable default `GITHUB_TOKEN`.**
+3. **Privileged credentials are narrowly scoped, environment-gated, and never replaced by a write-capable default `GITHUB_TOKEN`.**
 4. **Numeric GitHub repository IDs are safety identities; owner/repo names are routing only.**
-5. **Qualification uses newest exact-SHA evidence and the latest execution of each required job.**
-6. **Publication races are classified from observed Git state, never human-readable error wording.**
-7. **Missing correctness evidence is added before changing V4 causality.**
-8. **Known scaling hazards are fixed without speculative retained caches.**
+5. **Qualification uses the newest exact-SHA matching workflow run and the latest execution of each required job.**
+6. **Durable non-secret receipts bind a successful live job execution to its exact CI input/target identity; receipts never substitute for Actions job success.**
+7. **Publication races are classified from observed Git state, never human-readable error wording.**
+8. **Missing correctness evidence is added before changing V4 causality.**
+9. **Known scaling hazards are fixed without speculative retained caches.**
 
 ---
 
@@ -31,75 +32,29 @@ The design follows these principles:
 
 `docs/superpowers/specs/2026-08-30-release-provenance-and-versioning-design.md`
 
-Owns:
-
-- CI-produced stable release artifact,
-- exact release-byte provenance,
-- Stable Release read/write privilege separation,
-- `stable-release` environment and scoped `RELEASE_TOKEN`,
-- newest exact-SHA CI/live qualification,
-- latest-job-execution rerun semantics,
-- untrusted-artifact handling,
-- canonical stable-version parsing/comparison/history,
-- exact create-only tag,
-- draft release by numeric release ID,
-- release notes/title/package-layout compatibility,
-- final asset digest verification,
-- partial-publication handling,
-- Immutable Releases guidance.
+Owns CI stable-release artifact production; exact release-byte provenance; Stable Release privilege separation; `stable-release` environment/scoped publication credential; newest exact-SHA CI/live authority; latest-job-execution rerun semantics; live receipt-to-CI binding; artifact safety; canonical stable-version history; exact tag creation; draft/public release by numeric release ID; release title/notes/package compatibility; final asset digests; partial-publication handling; and Immutable Releases guidance.
 
 ## Child B — Live GitHub E2E Safety
 
 `docs/superpowers/specs/2026-08-30-live-github-e2e-safety-design.md`
 
-Owns:
-
-- CI-produced precompiled E2E artifact,
-- no checkout/install/build/compile in credentialed live-E2E execution,
-- `github-e2e` environment selected-branch restriction,
-- mandatory pinned numeric target repository ID,
-- narrowly scoped target credential,
-- canonical target routing + actual default-branch checks,
-- shared destructive-safety helper across all live suites,
-- cleanup bound to the qualified target identity,
-- Git-ref capability probes before interpreting absence,
-- safe local/manual cleanup behavior.
+Owns CI precompiled E2E artifact production; fresh-runner/no-checkout credentialed execution; `github-e2e` environment restriction; mandatory pinned numeric target ID; target-only credential; durable target/provenance receipt before target mutation; canonical target/default-branch/ref-capability checks; shared target-safety helper; rerun-safe cleanup; and local/manual safety.
 
 ## Child C — Publication Race and Conflict Recovery
 
 `docs/superpowers/specs/2026-08-30-publication-race-and-conflict-recovery-design.md`
 
-Owns:
-
-- `V4PublicationRaceError`,
-- publication reconciliation as race-classification authority,
-- explicit indeterminate reconciliation evidence,
-- concurrent empty-repository initialization,
-- remote-appears-between-config-discovery-and-session race,
-- preservation of existing runtime/E2E retry semantics,
-- terminal retry UX,
-- multi-descendant folder regressions using actual folder events,
-- Copy + publication-race + recovery-store integration,
-- no broad causality changes without a deterministic failing regression.
+Owns typed publication races; reconciliation as classification authority; explicit indeterminate evidence for traversal limits/read failures; concurrent empty initialization; remote-appears-after-speculative-config race; existing runtime/E2E retry compatibility; terminal retry UX; actual multi-descendant folder-event regressions; Copy + race + recovery-store evidence; and no broad causality changes without failing regression.
 
 ## Child D — Immutable Git Read Fallback
 
 `docs/superpowers/specs/2026-08-30-immutable-git-read-fallback-design.md`
 
-Owns:
-
-- path-directed non-recursive immutable tree traversal,
-- strict complete-evidence/truncation semantics,
-- malformed-tree evidence handling,
-- explicit managed-path symlink/gitlink policy,
-- no unbounded tree cache,
-- exact fallback regressions and scaling contract.
+Owns path-directed non-recursive immutable traversal; explicit complete-evidence/truncation rules; malformed-tree evidence; managed-path symlink/gitlink policy; no retained tree cache; and fallback scaling regressions.
 
 ---
 
 # 2. Dependency Order
-
-Implementation planning/execution proceeds:
 
 ```text
 Live E2E Safety
@@ -111,72 +66,58 @@ Publication Race and Conflict Recovery
 Immutable Git Read Fallback
 ```
 
-This remains acyclic because Child B owns production of the CI `github-e2e-input` artifact, while Child A independently adds the CI `release-input` artifact later.
+This is acyclic: Child B first adds the CI `github-e2e-input` producer/consumer contract; Child A later adds independent CI `release-input` production and Stable Release promotion.
 
-Stable Release depends on trustworthy live-E2E qualification. Sync/recovery changes are independent once qualification infrastructure is hardened. Immutable-read fallback remains independent and last.
+Stable Release depends on trustworthy current live qualification. Sync/recovery becomes independent after qualification infrastructure is hardened. Immutable-read fallback remains independent and last.
 
 ---
 
-# 3. CI as the Trusted Producer Boundary
+# 3. CI Producer Boundary
 
-Ordinary `ci.yml` on a push to `master` is the only workflow allowed to compile/build artifacts later consumed under privileged credentials.
+Ordinary `ci.yml` on push to `master` is the only workflow that compiles/builds artifacts later consumed under privileged credentials.
 
-CI remains repository read-only and may produce two independent artifacts:
+CI remains repository read-only and may produce:
 
 ```text
-release-input-<SHA>-<CI_RUN_ID>-<VERIFY_ATTEMPT>
 github-e2e-input-<SHA>-<CI_RUN_ID>-<VERIFY_ATTEMPT>
+release-input-<SHA>-<CI_RUN_ID>-<VERIFY_ATTEMPT>
 ```
 
-Both artifacts:
+Each binds repository ID, source SHA, producer run ID, producer job execution attempt, fixed entry allowlist, sizes, and SHA-256 values.
 
-- bind repository ID, source SHA, producer run ID, and producer job execution attempt,
-- contain strict manifests with fixed file allowlists + byte sizes + SHA-256 values,
-- are validated before upload,
-- are treated as untrusted data when downloaded later,
-- are never trusted solely because their artifact names match.
-
-No privileged workflow rebuilds either artifact.
+Artifacts are validated before upload and treated as untrusted data when consumed later. Privileged workflows never rebuild them.
 
 ---
 
 # 4. GitHub Actions Trust Boundary
 
-## 4.1 External actions are immutable inputs
+## External actions
 
-Every external `uses:` reference in repository workflows is pinned to a verified full-length commit SHA. Human-readable version comments may be retained beside the SHA.
+Every external `uses:` reference in repository workflows is pinned to a verified full-length commit SHA. A feasibility/static contract rejects mutable external action refs. Repository-wide full-SHA policy may be enabled after every workflow satisfies the rule.
 
-A feasibility/static contract rejects mutable external action refs such as `@v4`, `@v6`, or branch names.
+## Environments
 
-After all workflows satisfy the contract, repository policy may require full-length action SHA pinning as defense in depth.
+`github-e2e` and `stable-release` use **Selected branches and tags**, allowing branch `master` and no tags. Do not use `Protected branches only` while this repository has no protected branch rule.
 
-Local actions/reusable code under the repository are governed by the exact source SHA and ordinary CI review, not by external-action pinning.
+Workflow runtime checks still require `GITHUB_REF == refs/heads/master`; environment policy is independent defense.
 
-## 4.2 Environment branch policy
+## Credentials
 
-`github-e2e` and `stable-release` environments use **Selected branches and tags**, explicitly allowing branch `master` and no release tags.
+Stable Release default `GITHUB_TOKEN` remains read-only. Tag/release state requiring publication authority is handled only in the no-code `publish` job with the environment-scoped source-repository publication credential.
 
-Do not use **Protected branches only** as the policy while this repository has no protected branch rule; that setting would not provide the intended restriction.
+Live E2E target credential exists only in `github-e2e` and its mutable scope is limited to the pinned disposable target repository.
 
-Workflow runtime checks still require `GITHUB_REF == refs/heads/master`; environment policy is an independent defense.
-
-## 4.3 No write-capable default workflow token in release
-
-Stable Release's default `GITHUB_TOKEN` remains read-only. Repository mutation uses a separate environment secret `RELEASE_TOKEN` whose mutable scope is restricted to this source repository and only the repository permissions required for tag/release publication.
-
-If a workflow variant removes the `stable-release` environment, it loses `RELEASE_TOKEN`; it does not fall back to a write-capable `GITHUB_TOKEN`.
-
-The same principle applies to live E2E: the destructive target token exists only as an environment secret on `github-e2e`.
-
-These controls do not claim protection against an authorized maintainer/admin who intentionally changes trusted `master` and environment configuration.
+These controls do not claim protection against an authorized maintainer/admin intentionally changing trusted `master` and environment configuration.
 
 ---
 
-# 5. Qualification Authority
+# 5. Qualification Authority and Reruns
 
-For CI and live E2E, Stable Release uses the **newest qualifying exact-SHA workflow run**, not any historical successful run.
+For CI and live E2E, authority starts with the **newest matching exact-SHA run**, not the newest successful run and not any historical success.
 
-For each required job within that run, authority is the **latest execution of that job across workflow attempts**:
+If that newest matching run is queued, running, cancelled, or failed, qualification blocks rather than falling back.
+
+Within the selected run, each required job is judged by its **latest actual execution across attempts**:
 
 ```text
 latest execution exists
@@ -184,74 +125,61 @@ status == completed
 conclusion == success
 ```
 
-This preserves normal GitHub rerun behavior:
+This preserves partial reruns:
 
-- rerunning only failed `cleanup` may reuse an earlier successful `qualify`,
-- rerunning `qualify` creates newer authority for `qualify`,
-- a newer failing/in-progress execution blocks release,
-- a newer exact-SHA live workflow run blocks fallback to an older successful run.
+- rerunning only failed `cleanup` may reuse earlier successful `qualify`,
+- a newer execution of `qualify` supersedes the earlier one,
+- newer in-progress/failing execution blocks release.
 
-Artifact identity is bound to the execution attempt of the producer job that actually created it.
+Artifact identity binds to the producer job execution attempt that created it.
 
-If current CI producer evidence changes, any live-E2E qualification that consumed the previous CI E2E artifact becomes stale and must be rerun.
+Child B's durable receipt associated with the latest successful `qualify` execution binds that successful job to exact CI producer artifact + pinned target identity. Actions job state remains the success authority.
+
+If current CI producer changes, old live qualification becomes stale and must be repeated.
 
 ---
 
 # 6. Cross-Cutting Invariants
 
-- Exact `master` commit SHA is the release source identity.
+- Exact `master` commit SHA is release source identity.
 - Numeric repository IDs are workflow/test safety identities only; they do not replace V4 `owner/repo#branch` protocol identity.
 - V4 repository rename/case migration remains separate because it affects crypto/recovery namespaces.
-- GitHub ref mutation is not server-side compare-and-swap merely because local code accepts an expected SHA argument.
-- Copy conflict semantics remain local-primary with a remote competitor preserved exactly once when a remote body exists.
-- Ambiguous namespace, incomplete ancestry evidence, malformed tree evidence, or uncertain privilege provenance fails closed.
-- Recovery/stage lifecycle assertions remain in recovery tests.
-- No Git-tree cache is added without profiling and a bounded resource design.
-- No watcher-noise/out-of-order behavior is added without production-relevant evidence.
+- GitHub ref mutation is not server-side compare-and-swap merely because local code accepts expected SHA.
+- Copy remains local-primary with remote competitor preserved exactly once when a remote body exists.
+- Ambiguous namespace, incomplete ancestry evidence, malformed tree evidence, missing provenance receipt, or uncertain privilege evidence fails closed.
+- Recovery/stage lifecycle assertions remain recovery-tier tests.
+- No Git-tree cache without profiling + bounded resource design.
+- No watcher-noise behavior without production-relevant deterministic evidence.
 - `scripts/zip-source.mjs` remains separate maintenance work; stable release packaging is independently validated.
 
 ---
 
 # 7. Release-Readiness Gate
 
-A final release is eligible only after all implemented child plans are complete and final `master` SHA has:
+Final release eligibility requires final `master` SHA to have:
 
 ```text
-newest exact-SHA ordinary CI push run: authoritative required jobs successful
+newest exact-SHA ordinary CI push run: latest required execution successful
 current CI release artifact: valid
 current CI E2E bundle artifact: valid
-newest exact-SHA live E2E run: authoritative qualify + cleanup successful
-live qualification consumed current CI E2E artifact
+newest exact-SHA live run: latest qualify + cleanup executions successful
+latest successful qualify receipt: valid and bound to current CI E2E input
 Stable Release input version: canonical/current
-master still equals exact qualified SHA at mutation/publication boundaries
+master still exact qualified SHA at mutation/publication boundaries
 ```
 
-Any later `master` commit invalidates qualification. Any newer exact-SHA CI/live run or newer execution of a required job becomes the new authority.
+Any later `master` commit invalidates qualification. Any newer matching exact-SHA CI/live run or newer required-job execution becomes new authority.
 
 ---
 
 # 8. Deferred Work
 
-Separate future designs remain for:
-
-- V4 repository rename/case migration,
-- physical Windows/Android qualification expansion,
-- multi-gigabyte stress qualification,
-- bounded immutable-tree caching if profiling justifies it,
-- watcher-noise hardening backed by production evidence,
-- `scripts/zip-source.mjs` portability repair,
-- stronger repository governance/branch-protection policy if desired.
+Separate designs remain for V4 repository rename/case migration; physical Windows/Android qualification; multi-gigabyte stress qualification; bounded immutable-tree caching if profiling justifies it; watcher-noise hardening backed by evidence; `scripts/zip-source.mjs` portability repair; and stronger repository governance/branch protection if desired.
 
 ---
 
-# 9. Superpowers Workflow Gate
+# 9. Superpowers Gate
 
-Each child design must be:
-
-1. written and committed,
-2. self-reviewed for placeholders, contradictions, scope, and ambiguity,
-3. reviewed/approved by the user,
-4. converted to its own implementation plan with `writing-plans`,
-5. implemented/tested/reviewed independently.
+Each child design must be written/committed, self-reviewed, user-approved, converted to its own `writing-plans` implementation plan, then implemented/tested/reviewed independently.
 
 No implementation plan combines all children into one mega-plan.
