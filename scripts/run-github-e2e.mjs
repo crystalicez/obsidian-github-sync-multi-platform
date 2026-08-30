@@ -1,12 +1,20 @@
-import { build } from "esbuild";
 import { existsSync, readFileSync } from "node:fs";
-import { mkdir, rm } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import path from "node:path";
+import { compileGitHubE2EBundles, writeGitHubE2EInputManifest } from "./github-e2e-input.mjs";
 
 const root = process.cwd();
 const envFile = process.env.GITHUB_E2E_ENV_FILE ?? ".env.github-e2e";
 const envPath = path.isAbsolute(envFile) ? envFile : path.join(root, envFile);
+const compileOnly = process.argv.includes("--compile-only") || process.env.GITHUB_E2E_COMPILE_ONLY === "1";
+
+function optionValue(name) {
+  const prefix = `--${name}=`;
+  return process.argv.slice(2).find(value => value.startsWith(prefix))?.slice(prefix.length);
+}
+
+const requestedOutDir = optionValue("out-dir");
+const writeInputManifest = process.argv.includes("--write-input-manifest");
 
 function parseEnvLine(line) {
   const trimmed = line.trim();
@@ -41,9 +49,8 @@ function loadEnvFile() {
   }
 }
 
-loadEnvFile();
+if (!compileOnly) loadEnvFile();
 
-const compileOnly = process.argv.includes("--compile-only") || process.env.GITHUB_E2E_COMPILE_ONLY === "1";
 const required = ["GITHUB_E2E_OWNER", "GITHUB_E2E_REPO", "GITHUB_E2E_BRANCH", "GITHUB_E2E_TOKEN"];
 if (!compileOnly) {
   const missing = required.filter(name => !process.env[name]);
@@ -62,33 +69,11 @@ if (!compileOnly) {
   }
 }
 
-const outDir = path.join(root, ".tmp", "github-e2e", `${process.pid}-${Date.now()}`);
-const entries = [
-  "tests/github-e2e/v4-real-github-e2e.test.ts",
-  "tests/github-e2e/v4-copy-contract-github-e2e.test.ts",
-  "tests/github-e2e/v4-encrypted-external-mutation.test.ts",
-];
-
-await rm(outDir, { recursive: true, force: true });
-await mkdir(outDir, { recursive: true });
-
-const outfiles = [];
-for (const entry of entries) {
-  const outfile = path.join(outDir, path.basename(entry).replace(/\.ts$/u, ".mjs"));
-  await build({
-    entryPoints: [path.join(root, entry)],
-    outfile,
-    bundle: true,
-    platform: "node",
-    format: "esm",
-    target: "node22",
-    alias: {
-      obsidian: path.join(root, "tests", "stubs", "obsidian.ts"),
-    },
-    logLevel: "silent",
-  });
-  outfiles.push(outfile);
-}
+const outDir = requestedOutDir
+  ? (path.isAbsolute(requestedOutDir) ? requestedOutDir : path.join(root, requestedOutDir))
+  : path.join(root, ".tmp", "github-e2e", `${process.pid}-${Date.now()}`);
+const outfiles = await compileGitHubE2EBundles({ root, outDir });
+if (writeInputManifest) await writeGitHubE2EInputManifest({ outDir });
 
 if (compileOnly) {
   for (const outfile of outfiles) console.log(`GitHub E2E bundle compiled: ${outfile}`);
