@@ -2,54 +2,39 @@
 
 ## Status
 
-Child design of `2026-08-30-release-e2e-runtime-hardening-followup-design.md`.
+Child design of `2026-08-30-release-e2e-runtime-hardening-followup-design.md` for baseline `35e98cea924702293bde62d064a83d52eca6d898`.
 
-Repository baseline: `35e98cea924702293bde62d064a83d52eca6d898`.
-
-This child owns the immutable commit-SHA Contents-404 fallback in `GitHubClient` and its scaling/evidence semantics.
+Revised after formal red-team review on 2026-08-30. This child owns the immutable commit-SHA Contents-404 fallback in `GitHubClient`, including complete-evidence semantics and resource scaling.
 
 ## Goal
 
-Recover exact immutable file reads when GitHub Contents temporarily reports 404 without recursively materializing the entire repository tree, while never interpreting truncated or unsupported evidence as confirmed absence.
+Recover exact immutable managed-file reads when GitHub Contents temporarily returns 404 without recursively materializing the entire repository tree, while never converting truncated, malformed, or unsupported Git-object evidence into a false file-absence result.
 
 ## Non-goals
 
-This child does not:
-
-- add a retained Git-tree cache,
-- change mutable branch-ref Contents semantics,
-- redesign history service APIs,
-- migrate the repository from SHA-1 object identifiers to another hash algorithm,
-- optimize ordinary successful Contents reads,
-- treat unsupported Git object modes as normal managed V4 files.
+This child does not add a retained Git-tree cache, change mutable branch-ref Contents semantics, redesign history service APIs, broaden Git object-ID algorithms beyond the current project-wide 40-hex assumption, optimize ordinary successful Contents reads, or provide general symlink-following parity with GitHub Contents API.
 
 ---
 
 # 1. Existing Failure Mode
 
-Current immutable fallback behavior is:
+Current fallback is:
 
 ```text
 getFileBytes(path, 40-hex commit SHA)
-        ↓
-Contents API returns 404
-        ↓
-GET commit
-        ↓
-GET full recursive tree (?recursive=1)
-        ↓
-find exact blob path or return null
+-> Contents API 404
+-> GET commit
+-> GET full recursive tree (?recursive=1)
+-> find exact blob path or return null
 ```
 
-This is correct only when the recursive tree is complete and can materialize far more repository state than required to resolve one path.
-
-The existing code already refuses to treat a truncated recursive response as absence. That fail-closed property must be preserved.
+The current code correctly refuses to use a truncated recursive tree as proof of absence, but recursively materializing the entire repository is unnecessary and scales with total repository entries rather than requested path depth.
 
 ---
 
 # 2. Path-Directed Non-Recursive Traversal
 
-For a requested immutable path:
+For immutable path:
 
 ```text
 a/b/c.md
@@ -59,238 +44,207 @@ resolve:
 
 ```text
 GET commit SHA
-→ root tree SHA
-→ GET root tree non-recursive; locate entry "a"
-→ require "a" is tree
-→ GET tree(a) non-recursive; locate entry "b"
-→ require "b" is tree
-→ GET tree(b) non-recursive; locate entry "c.md"
-→ require final entry is a supported regular blob
-→ GET exact blob SHA
+-> require exact commit tree SHA
+-> GET root tree non-recursive; locate exact segment "a"
+-> require "a" is tree
+-> GET tree(a) non-recursive; locate exact segment "b"
+-> require "b" is tree
+-> GET tree(b) non-recursive; locate exact segment "c.md"
+-> require supported regular blob
+-> GET exact blob SHA
 ```
 
 No immutable-404 fallback request uses `recursive=1`.
 
-Network complexity becomes proportional to path depth rather than repository entry count.
+Network work is proportional to path depth rather than whole repository size.
 
 ---
 
 # 3. Exact Path Semantics
 
-## 3.1 Do not normalize into a different path
-
 The fallback resolves the exact slash-separated path supplied by the caller.
 
-It does not silently case-fold, Unicode-normalize, collapse `.`/`..`, or otherwise reinterpret path identity.
+It does not case-fold, Unicode-normalize, collapse `.`/`..`, convert a different path into the requested path, or silently reinterpret ambiguous segments.
 
-Invalid/ambiguous path segments that cannot represent an exact repository path under this API should fail clearly rather than be silently normalized.
+Invalid segments fail clearly.
 
-Ordinary V4 remote object paths are already produced by controlled project code; this rule protects the generic GitHub read boundary from accidental reinterpretation.
+At each tree level, the implementation requires exact segment equality and a unique matching entry. Duplicate exact entry names or malformed entry data are treated as malformed/unsupported evidence and throw rather than selecting one arbitrarily.
 
-## 3.2 Intermediate segments
+---
 
-At an intermediate level:
+# 4. Tree Response Evidence Contract
 
-- exact segment present with `type=tree` → descend,
-- exact segment absent and response complete → requested nested file is confirmed absent,
-- exact segment absent and response truncated → throw because absence is unknown,
-- exact segment present but not a tree → requested deeper path cannot exist below that object; return confirmed absence for the nested file request when the containing tree response is complete.
+A tree response is acceptable for absence reasoning only when its completeness state is explicit.
 
-## 3.3 Final segment
+For each level independently:
+
+```text
+requested segment found
+-> use the matching entry even when tree reports truncated=true,
+   because existence of that exact returned entry is positive evidence
+
+requested segment not found
+AND truncated === false
+-> absence is proven at this level
+
+requested segment not found
+AND truncated !== false
+-> evidence is incomplete/malformed; throw
+```
+
+The implementation must test `truncated === false` explicitly. Missing, `null`, non-boolean, or otherwise malformed `truncated` state is not treated as complete evidence.
+
+A complete parent does not make a truncated/malformed child complete, and vice versa.
+
+Tree payload validation also requires the node fields needed for traversal (`path`, `type`, `mode`, `sha`) to have valid expected shapes before they become authority.
+
+---
+
+# 5. Intermediate Segment Semantics
+
+For an intermediate segment:
+
+- exact entry with `type=tree` and valid non-empty SHA -> descend,
+- exact segment absent from an explicitly complete tree -> return `null`,
+- exact segment absent from truncated/malformed evidence -> throw,
+- exact entry exists but is regular blob/gitlink/other non-tree -> deeper regular file cannot exist below that entry; return `null` only when the containing response itself is valid evidence,
+- malformed/unsupported entry shape -> throw.
+
+No unrelated subtree is requested.
+
+---
+
+# 6. Final Segment and Managed-Path Object Policy
 
 At the containing directory:
 
-- exact final entry absent + complete response → return `null`,
-- exact final entry absent + truncated response → throw,
-- supported regular blob → fetch exact blob and return it,
-- final tree → requested regular file is not present; return `null`,
-- final gitlink/submodule (`type=commit` / mode `160000`) → requested regular file is not present; return `null`,
-- symlink blob mode `120000` → fail closed as unsupported for this managed-file fallback rather than returning symlink-target text as ordinary file bytes,
-- other unsupported mode/type combinations → fail closed with an explicit unsupported-object error.
+- exact final entry absent + `truncated === false` -> `null`,
+- absent + incomplete/malformed completeness evidence -> throw,
+- ordinary blob mode `100644` -> fetch exact blob,
+- ordinary executable blob mode `100755` -> fetch exact blob,
+- final tree -> requested regular file absent, return `null`,
+- final gitlink/submodule (`type=commit` / mode `160000`) -> requested regular file absent, return `null`,
+- symlink blob mode `120000` -> throw explicit unsupported managed-path object error,
+- unsupported/mismatched mode/type combinations -> throw.
 
-Supported regular blob modes are the ordinary file modes used by this project (`100644`, and safely `100755` if encountered as a regular blob).
+The symlink rule is intentional: this fallback is for project-managed immutable remote files. A symlink occupying a managed remote file path is treated as out-of-band/unsupported repository state rather than following the symlink or returning its target text as ordinary managed bytes.
 
----
-
-# 4. Truncation Is Unknown, Never Absence
-
-For every tree response independently:
-
-```text
-requested entry found
-→ entry evidence may be used
-
-requested entry not found + truncated=false
-→ absence confirmed at this level
-
-requested entry not found + truncated=true
-→ throw
-```
-
-A complete parent does not make a truncated child complete, and vice versa. The rule is applied at every traversal depth.
-
-The error message should identify that immutable-tree evidence was truncated while resolving the requested path, without pretending the file is missing.
+GitHub Contents API may have different general-purpose symlink behavior on a successful non-fallback read; general arbitrary-symlink parity is explicitly outside this child's scope. The fallback's fail-closed symlink behavior is a managed-path integrity boundary, not an accidental claim that all Contents and Git-tree object semantics are identical.
 
 ---
 
-# 5. Error Propagation
+# 7. Error Propagation
 
-Unexpected errors from:
+Unexpected failures from commit lookup, tree lookup, blob lookup, transport/rate limits, malformed Git object data, unsupported managed object modes, or incomplete tree evidence propagate.
 
-- commit lookup,
-- tree lookup,
-- blob lookup,
-- transport/rate limiting,
-- malformed Git object data,
+`null` is reserved for complete evidence that the requested regular managed file does not exist at that exact immutable tree path.
 
-propagate rather than becoming `null`.
-
-`null` is reserved for evidence that the requested regular file is genuinely absent/non-file in a complete immutable tree path.
-
-This preserves the distinction:
+This preserves:
 
 ```text
-not found with complete evidence
-vs
-cannot prove because API/evidence failed
+confirmed absent
+!=
+cannot prove
 ```
 
 ---
 
-# 6. No Cache in This Child
+# 8. No Retained Cache
 
-Do not add a `Map` or other retained Git-tree cache.
+Do not add a retained `Map` or other Git-tree cache in this child.
 
 Reasons:
 
-- immutable Contents 404 is a fallback/rare path,
-- the project explicitly budgets resident/mobile resources,
-- unbounded immutable-tree retention can grow with history browsing/sync activity,
-- path-directed traversal already removes the known whole-tree scaling hazard.
+- immutable Contents 404 is a fallback path,
+- the project budgets resident/mobile resources explicitly,
+- unbounded historical tree retention can grow with sync/history activity,
+- path-directed traversal already removes the known whole-tree scaling problem.
 
-If profiling later demonstrates repeated traversal cost is material, design a separate bounded/resource-accounted cache with explicit eviction and memory limits.
-
----
-
-# 7. Commit Identifier Scope
-
-Current fallback activation recognizes the project's existing 40-hex immutable commit-SHA form.
-
-This child does not broaden commit-object identifier handling or predict a future GitHub repository hash-algorithm migration.
-
-If GitHub/repository object-ID format changes become production-relevant, that requires a separate compatibility design covering all places that assume 40-hex Git object IDs, not a local regex tweak in this fallback alone.
+If profiling later proves repeated traversal cost material, design a separate bounded/resource-accounted cache with explicit eviction and memory limits.
 
 ---
 
-# 8. Implementation Boundary
+# 9. Commit Identifier Scope
 
-The preferred implementation keeps ordinary Contents behavior unchanged and replaces only the immutable-tree fallback helper.
+Fallback activation retains the current project contract for 40-hex immutable commit identifiers.
 
-Conceptually:
+This child does not locally broaden SHA/object-ID handling. A future GitHub object-hash migration requires a repository-wide compatibility design covering every 40-hex assumption, not a one-off fallback regex change.
 
-```ts
-private async getImmutableFileFromTree(
-  path: string,
-  commitSha: string,
-): Promise<{ bytes: Uint8Array; sha: string } | null>
-```
+---
 
-internally becomes path-directed and may use a smaller helper such as:
+# 10. Implementation Boundary
 
-```ts
-private async resolveImmutableBlobNode(
-  path: string,
-  commitSha: string,
-): Promise<GitHubTreeNode | null>
-```
+Ordinary successful Contents behavior remains unchanged.
 
-Exact names are implementation-plan details.
-
-Do not alter mutable-ref 404 behavior:
+Mutable configured branch 404 behavior remains unchanged:
 
 ```text
-mutable configured branch + Contents 404 → null
+mutable branch + Contents 404 -> null
 ```
 
-The fallback remains specific to immutable commit evidence.
+Only the immutable commit-SHA 404 fallback helper changes from recursive full-tree lookup to path-directed traversal.
+
+A small internal resolver may be introduced, but no public API redesign is required.
 
 ---
 
-# 9. Tests
+# 11. Tests
 
-Extend `tests/v4/github-immutable-read-fallback.test.ts` with focused request-level evidence.
-
-Required cases:
-
-## 9.1 Success
+## Success
 
 - root-level regular blob,
 - deep nested regular blob,
-- filenames with spaces/punctuation/Unicode that are exact tree entry names,
-- regular executable blob mode `100755` if supported by the implementation contract,
-- transient Contents 404 followed by exact path-directed recovery returns expected bytes/blob SHA.
+- exact names with spaces/punctuation/Unicode,
+- regular executable blob mode `100755`,
+- transient Contents 404 followed by exact path traversal returns expected bytes/blob SHA,
+- target segment found in a tree that also reports `truncated=true` may still proceed from that positive entry evidence.
 
-## 9.2 Confirmed absence
+## Confirmed absence
 
-- final entry absent in complete containing tree → `null`,
-- intermediate entry absent in complete tree → `null`,
-- intermediate entry is blob/gitlink instead of tree → `null`,
-- final entry is tree → `null`,
-- final entry is gitlink → `null`.
+- final entry absent in tree with `truncated === false` -> `null`,
+- intermediate entry absent in complete tree -> `null`,
+- intermediate entry is non-tree -> `null`,
+- final tree -> `null`,
+- final gitlink -> `null`.
 
-## 9.3 Fail closed
+## Fail closed
 
-- missing entry in truncated root tree → throw,
-- missing entry in truncated nested tree → throw,
-- final symlink mode `120000` → explicit unsupported/fail-closed result,
-- unexpected mode/type combination → throw,
-- commit response missing tree SHA → throw,
-- tree HTTP/API failure → propagate,
-- blob HTTP/API failure → propagate.
+- missing segment in truncated root -> throw,
+- missing segment in truncated nested tree -> throw,
+- missing segment when `truncated` missing/null/non-boolean -> throw,
+- duplicate exact segment names -> throw,
+- malformed node path/type/mode/SHA -> throw,
+- final symlink mode `120000` -> explicit unsupported managed-path error,
+- unsupported mode/type combination -> throw,
+- commit response missing valid tree SHA -> throw,
+- tree API failure -> propagate,
+- blob API failure -> propagate.
 
-## 9.4 Request-shape/scaling assertions
-
-Tests assert:
+## Request shape/resource
 
 - no requested URL contains `recursive=1`,
-- deep path performs only commit + per-level non-recursive tree lookups + exact blob read,
-- unrelated repository subtrees are never requested,
+- deep success uses one commit lookup + one non-recursive tree lookup per path level + one blob lookup,
+- unrelated subtrees are not requested,
 - no retained cache is required for correctness.
 
 ---
 
-# 10. Performance and Resource Model
+# 12. Performance Model
 
-For path depth `d`, fallback network requests are approximately:
+For path depth `d`, successful fallback is approximately:
 
 ```text
 1 commit lookup
-+ d tree lookups
-+ 1 blob lookup on success
++ d non-recursive tree lookups
++ 1 blob lookup
 ```
 
-The response memory footprint is bounded by one non-recursive tree response at a time plus the requested blob, rather than an entire recursive repository tree.
+Memory footprint is bounded by one tree response at a time plus the requested blob rather than an entire recursive repository tree.
 
-The implementation does not promise constant latency for extremely deep paths, but repository depth is a materially better bound than total repository entries for this use case.
-
-No new resident cache means no new long-lived mobile memory budget is required.
+The design does not promise constant latency for arbitrarily deep paths; path depth is the intended bound because it is materially smaller and more stable than total repository entry count for this use case.
 
 ---
 
-# 11. Acceptance Criteria
+# 13. Acceptance Criteria
 
-This child is complete when:
-
-- immutable Contents 404 recovery no longer requests recursive trees,
-- exact nested path traversal uses non-recursive trees segment by segment,
-- absent entries return `null` only from complete evidence,
-- truncation at any unresolved level throws rather than becoming absence,
-- intermediate non-tree entries are handled deterministically,
-- final tree/gitlink are not returned as regular file bytes,
-- symlink/unsupported modes fail closed,
-- unexpected commit/tree/blob failures propagate,
-- ordinary successful Contents behavior is unchanged,
-- mutable branch-ref 404 behavior is unchanged,
-- no unbounded tree cache is added,
-- request-level regressions prove traversal does not touch unrelated subtrees,
-- existing immutable recovery tests remain semantically satisfied with the non-recursive implementation.
+Complete only when immutable Contents-404 recovery never requests recursive trees; exact path traversal is segment-by-segment; absence requires explicit `truncated === false`; malformed/truncated evidence never becomes `null`; exact segment matching is unique; ordinary regular blobs work; final tree/gitlink are not returned as file bytes; symlink/unsupported managed objects fail closed by explicit policy; unexpected commit/tree/blob failures propagate; ordinary successful Contents and mutable-ref 404 behavior remain unchanged; no retained tree cache is added; and request-level tests prove unrelated subtrees are untouched.
