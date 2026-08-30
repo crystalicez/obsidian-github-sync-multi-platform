@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Make release-qualifying real-GitHub E2E execute exact CI-produced bundles on a fresh runner against one pinned disposable repository, with target credentials isolated from build tooling and cleanup bound to durable repository identity evidence.
+**Goal:** Make release-qualifying real-GitHub E2E execute exact CI-produced bundles on a fresh runner against one pinned disposable repository, with target credentials isolated from build tooling and one cohesive workflow attempt carrying qualification, provenance receipt, scenario execution, and cleanup.
 
-**Architecture:** Ordinary read-only `ci.yml` remains the only compiler of the three live-E2E bundles and uploads a strict provenance manifest with them. `github-e2e-live.yml` becomes a no-checkout/no-install/no-build consumer: it selects the newest exact-SHA CI producer, verifies and extracts that artifact, proves a pinned numeric target repository identity, persists a receipt before any target mutation, runs only the three fixed bundles serially, and cleans up using the highest valid persisted receipt rather than prior job outputs. All credentialed test suites share one target-safety helper; workflow cleanup uses equivalent fixed workflow-owned logic so privileged jobs never execute repository helper code outside the verified bundles.
+**Architecture:** Ordinary read-only `ci.yml` is the only compiler of the three live-E2E bundles and uploads a strict provenance manifest with them. `github-e2e-live.yml` becomes a no-checkout/no-install/no-build consumer: it selects the newest exact-SHA CI producer/current attempt, verifies and extracts that artifact, proves a pinned numeric target repository identity, persists a same-attempt receipt before any target mutation, runs only the three fixed bundles serially, and performs cleanup by independently re-resolving the currently configured route against the same pinned ID. Release qualification never mixes jobs or artifacts across workflow attempts; a cleanup-only rerun is maintenance evidence only until all jobs are rerun cohesively.
 
 **Tech Stack:** Node.js `v22.11.0`, TypeScript, ESM, esbuild, Node `node:test`, pnpm `9.12.3`, GitHub Actions, GitHub REST Git refs/Actions/artifact APIs, pinned external Actions.
 
@@ -13,45 +13,47 @@
 ## Global Constraints
 
 - Repository baseline for the approved design is `35e98cea924702293bde62d064a83d52eca6d898`; rebase/re-review if `master` materially changes before execution.
-- Release-qualifying live E2E must run only for exact current `master` and must consume the newest matching exact-SHA ordinary CI `push` run; an older successful CI run is never fallback authority.
-- CI is the sole compiler of release-qualifying live-E2E bundles. The credentialed live workflow must not checkout repository code, run pnpm/npm, install project dependencies, build, or compile.
-- The live target credential must be step-scoped, never job-level state, and its mutable scope must be limited to the dedicated disposable target repository.
-- `E2E_REPO_ID` is a mandatory maintainer-pinned numeric repository identity for Actions qualification. Owner/repository names are routing only.
-- Release-qualifying branch name is exactly `obsidian-sync-e2e/run-${GITHUB_RUN_ID}` and must not equal the target's actual default branch.
-- A readable initialized target default-branch Git ref is required before interpreting exact disposable-ref absence.
-- Receipt persistence is a blocking prerequisite before any scenario target mutation.
-- Cleanup must not depend on `needs.qualify.outputs` surviving a partial workflow rerun.
-- The default source `GITHUB_TOKEN` remains read-only.
+- Release-qualifying live E2E runs only for exact current `master` and consumes the newest matching exact-SHA ordinary CI `push` run/current attempt; older successful CI runs/attempts are never fallback authority.
+- CI is the sole compiler of release-qualifying live-E2E bundles. Credentialed live workflow must not checkout repository code, run pnpm/npm, install project dependencies, build, or compile.
+- Live target credential is step-scoped, never job-level state, and its mutable scope is limited to the dedicated disposable target repository.
+- `E2E_REPO_ID` is mandatory maintainer-pinned numeric target identity for Actions qualification. Owner/repository names are routing only.
+- Release-qualifying branch is exactly `obsidian-sync-e2e/run-${GITHUB_RUN_ID}` and must not equal target actual default branch.
+- Readable initialized target default-branch Git ref is required before interpreting exact disposable-ref absence.
+- Qualification receipt persists successfully before scenario target mutation.
+- Receipt is same-attempt provenance only; it never bridges old attempts for cleanup or qualification.
+- Release qualification requires current/latest live workflow attempt to contain successful `qualify` + successful `cleanup` + valid same-attempt receipt.
+- A cleanup-only partial rerun is not release qualification. To regain qualification, use Re-run all jobs.
+- Default source `GITHUB_TOKEN` remains read-only.
 - Every external `uses:` reference in repository workflows is pinned to a verified full-length commit SHA.
 - Do not change V4 publication-race retry classification in this child; Child C owns those changes.
 - Do not change stable-release publication semantics beyond mechanical full-SHA action pinning; Child A owns release redesign.
-- No new npm dependency is required for this child.
+- No new npm dependency is required.
 
 ## File Structure
 
 ### New files
 
-- `scripts/github-e2e-input.mjs` — one focused source-side library for deterministic bundle names/output and CI provenance-manifest hashing. It runs only in ordinary/local source contexts, never in the credentialed live workflow.
-- `tests/github-e2e/support/target-safety.ts` — the single target identity/ref-capability/reset authority bundled into all credentialed E2E suites.
+- `scripts/github-e2e-input.mjs` — deterministic E2E bundle names/output + CI provenance manifest hashing in ordinary/local source contexts.
+- `tests/github-e2e/support/target-safety.ts` — single target identity/ref-capability/reset authority bundled into all credentialed E2E suites.
 - `tests/feasibility/github-actions-pinning.test.mjs` — repository-wide external Action full-SHA contract.
 - `tests/feasibility/github-e2e-input.test.mjs` — compile-output/manifest/CI-artifact contract.
-- `tests/feasibility/github-e2e-target-safety.test.ts` — deterministic mocked GitHub REST tests for target safety.
-- `tests/feasibility/github-e2e-suite-safety-contract.test.mjs` — proves all three credentialed suites consume the shared helper and no longer own ad-hoc reset logic.
-- `tests/feasibility/github-e2e-live-workflow-contract.test.mjs` — static semantic/order contract for the no-checkout live workflow and durable receipt flow.
+- `tests/feasibility/github-e2e-target-safety.test.ts` — deterministic mocked GitHub REST target-safety matrix.
+- `tests/feasibility/github-e2e-suite-safety-contract.test.mjs` — proves all three credentialed suites consume shared helper and no longer own reset logic.
+- `tests/feasibility/github-e2e-live-workflow-contract.test.mjs` — static semantic/order contract for no-build live workflow, same-attempt receipt, independent cleanup, cohesive qualification.
 
 ### Modified files
 
-- `scripts/run-github-e2e.mjs` — use the shared bundle producer, support caller-owned compile output, skip `.env.github-e2e` entirely in compile-only mode, require expected target ID for credentialed local runs.
-- `tests/feasibility/github-e2e-compile-cli.test.mjs` — expand compile-only regression coverage.
-- `tests/github-e2e/v4-real-github-e2e.test.ts` — remove ad-hoc target/reset safety and use the shared helper.
-- `tests/github-e2e/v4-copy-contract-github-e2e.test.ts` — same safety migration; preserve its current Normal-only CAS retry policy for Child C.
-- `tests/github-e2e/v4-encrypted-external-mutation.test.ts` — same safety migration.
-- `.github/workflows/ci.yml` — compile once into a fixed directory, write provenance manifest, upload release-qualifying E2E input only for `push` to `master`.
-- `.github/workflows/github-e2e-live.yml` — replace source checkout/build execution with verified CI-artifact execution and receipt-bound cleanup.
+- `scripts/run-github-e2e.mjs` — shared bundle producer; caller-owned compile output; no `.env.github-e2e` load in compile-only mode; expected target ID required for credentialed local runs.
+- `tests/feasibility/github-e2e-compile-cli.test.mjs` — compile-only and local-ID regressions.
+- `tests/github-e2e/v4-real-github-e2e.test.ts` — shared target/reset helper.
+- `tests/github-e2e/v4-copy-contract-github-e2e.test.ts` — shared target/reset helper; preserve Child-C retry semantics.
+- `tests/github-e2e/v4-encrypted-external-mutation.test.ts` — shared target/reset helper.
+- `.github/workflows/ci.yml` — compile once to fixed directory, write provenance manifest, upload E2E input only for master push.
+- `.github/workflows/github-e2e-live.yml` — verified CI-artifact executor with same-attempt receipt and independently guarded cleanup.
 - `.github/workflows/pre-release.yml` — mechanical full-SHA Action pinning only.
-- `.github/workflows/release.yml` — mechanical full-SHA Action pinning only; no Child-A behavior changes here.
-- `docs/github-e2e.md` — pinned target ID, environment branch restriction, CI-artifact flow, safe local/manual cleanup.
-- `docs/releasing.md` — update only the live-E2E configuration/qualification portion so the release runbook no longer describes the old source-building live workflow.
+- `.github/workflows/release.yml` — mechanical full-SHA Action pinning only.
+- `docs/github-e2e.md` — pinned target ID, environment branch restriction, CI-artifact flow, cohesive rerun policy, safe cleanup.
+- `docs/releasing.md` — update only live-E2E configuration/qualification portion.
 
 ---
 
@@ -66,12 +68,11 @@
 
 **Interfaces:**
 - Consumes: all `.yml`/`.yaml` files in `.github/workflows/`.
-- Produces: repository invariant `external uses => @<40 lowercase hex commit SHA>`; local `uses: ./...` remains allowed.
+- Produces: invariant `external uses => @<40 lowercase hex commit SHA>`; local `uses: ./...` remains allowed.
 
-- [ ] **Step 1: Write the failing repository-wide pinning test**
+- [ ] **Step 1: Write failing repository-wide pinning test**
 
 ```js
-// tests/feasibility/github-actions-pinning.test.mjs
 import assert from "node:assert/strict";
 import test from "node:test";
 import { readdir, readFile } from "node:fs/promises";
@@ -81,8 +82,7 @@ const workflowDir = resolve(".github/workflows");
 
 function externalUse(line) {
   const match = line.match(/^\s*uses:\s*([^\s#]+)(?:\s+#.*)?$/u);
-  if (!match) return null;
-  if (match[1].startsWith("./")) return null;
+  if (!match || match[1].startsWith("./")) return null;
   return match[1];
 }
 
@@ -93,27 +93,22 @@ test("all external workflow actions are pinned to full commit SHAs", async () =>
     const text = await readFile(resolve(workflowDir, name), "utf8");
     for (const [index, line] of text.split(/\r?\n/u).entries()) {
       const value = externalUse(line);
-      if (!value) continue;
-      if (!/^[^@\s]+@[0-9a-f]{40}$/u.test(value)) failures.push(`${name}:${index + 1}: ${value}`);
+      if (value && !/^[^@\s]+@[0-9a-f]{40}$/u.test(value)) failures.push(`${name}:${index + 1}: ${value}`);
     }
   }
   assert.deepEqual(failures, []);
 });
 ```
 
-- [ ] **Step 2: Run the focused test and prove current mutable refs fail**
-
-Run:
+- [ ] **Step 2: Run focused test and prove current mutable refs fail**
 
 ```bash
 node scripts/run-tests.mjs --tier=feasibility --filter=github-actions-pinning
 ```
 
-Expected: FAIL and list current refs such as `actions/checkout@v6`, `actions/setup-node@v6`, `actions/upload-artifact@v4`, and `pnpm/action-setup@v4`.
+Expected: FAIL listing current `@v4`/`@v6` refs.
 
-- [ ] **Step 3: Replace the existing mutable refs with the already-verified commit SHAs**
-
-Use these exact pins, retaining human-readable comments:
+- [ ] **Step 3: Pin verified action commits**
 
 ```yaml
 uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -122,9 +117,9 @@ uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
 uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
 ```
 
-Do not otherwise redesign `.github/workflows/release.yml` or `.github/workflows/pre-release.yml` in this task.
+Do not redesign release/pre-release workflows here.
 
-- [ ] **Step 4: Run focused and full feasibility tests**
+- [ ] **Step 4: Verify**
 
 ```bash
 node scripts/run-tests.mjs --tier=feasibility --filter=github-actions-pinning
@@ -152,7 +147,6 @@ git commit -m "build: pin github actions by commit sha"
 - Modify: `.github/workflows/ci.yml`
 
 **Interfaces:**
-- Produces from `scripts/github-e2e-input.mjs`:
 
 ```js
 export const GITHUB_E2E_BUNDLES = Object.freeze([
@@ -160,115 +154,77 @@ export const GITHUB_E2E_BUNDLES = Object.freeze([
   "v4-copy-contract-github-e2e.test.mjs",
   "v4-encrypted-external-mutation.test.mjs",
 ]);
-
 export async function compileGitHubE2EBundles({ root, outDir })
-// => Promise<string[]> absolute output paths in the fixed order above
-
 export async function writeGitHubE2EInputManifest({ outDir, env, nodeVersion })
-// => Promise<object>; writes `${outDir}/github-e2e-input.json`
 ```
 
-- `run-github-e2e.mjs` CLI adds:
+CLI additions:
 
 ```text
---out-dir=<path>             valid with --compile-only
---write-input-manifest       valid with --compile-only; requires GitHub producer env
+--out-dir=<path>
+--write-input-manifest
 ```
 
-- CI artifact name:
+CI artifact:
 
 ```text
 github-e2e-input-${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}
 ```
 
-- Exact artifact logical entries:
-
-```text
-github-e2e-input.json
-v4-real-github-e2e.test.mjs
-v4-copy-contract-github-e2e.test.mjs
-v4-encrypted-external-mutation.test.mjs
-```
+Exact entries: manifest + three bundles.
 
 - [ ] **Step 1: Extend compile-only tests first**
 
-Add regressions to `tests/feasibility/github-e2e-compile-cli.test.mjs`:
+Add a test using explicit missing `GITHUB_E2E_ENV_FILE`; compile-only must still succeed, proving it never loads target env files. Use a temp output directory, pre-create a stale file, then assert exact output names and stale-file removal.
 
 ```js
-test("compile-only ignores credential env-file loading and writes exactly three fixed bundles", async () => {
-  const outDir = await mkdtemp(resolve(tmpdir(), "github-e2e-input-"));
-  const env = { ...process.env, GITHUB_E2E_ENV_FILE: resolve(outDir, "intentionally-missing.env") };
-  delete env.GITHUB_E2E_TOKEN;
-  const result = spawnSync(process.execPath, [
-    resolve("scripts/run-github-e2e.mjs"),
-    "--compile-only",
-    `--out-dir=${outDir}`,
-  ], { cwd: resolve("."), env, encoding: "utf8" });
-  assert.equal(result.status, 0, result.stderr || result.stdout);
-  assert.deepEqual((await readdir(outDir)).sort(), [
-    "v4-copy-contract-github-e2e.test.mjs",
-    "v4-encrypted-external-mutation.test.mjs",
-    "v4-real-github-e2e.test.mjs",
-  ]);
-});
+const result = spawnSync(process.execPath, [
+  resolve("scripts/run-github-e2e.mjs"),
+  "--compile-only",
+  `--out-dir=${outDir}`,
+], { cwd: resolve("."), env, encoding: "utf8" });
+assert.equal(result.status, 0, result.stderr || result.stdout);
+assert.deepEqual((await readdir(outDir)).sort(), [
+  "v4-copy-contract-github-e2e.test.mjs",
+  "v4-encrypted-external-mutation.test.mjs",
+  "v4-real-github-e2e.test.mjs",
+]);
 ```
-
-Also pre-create a stale file in `outDir` and assert it is removed so CI cannot accidentally upload residue.
 
 - [ ] **Step 2: Write failing manifest tests**
 
 ```js
-// tests/feasibility/github-e2e-input.test.mjs
-import assert from "node:assert/strict";
-import test from "node:test";
-import { mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { resolve } from "node:path";
 import { GITHUB_E2E_BUNDLES, writeGitHubE2EInputManifest } from "../../scripts/github-e2e-input.mjs";
 
-test("E2E input manifest binds exact fixed bundles to CI producer identity", async () => {
-  const outDir = await mkdtemp(resolve(tmpdir(), "e2e-manifest-"));
-  for (const name of GITHUB_E2E_BUNDLES) await writeFile(resolve(outDir, name), `bundle:${name}\n`);
-  await writeGitHubE2EInputManifest({
-    outDir,
-    env: {
-      GITHUB_REPOSITORY_ID: "1282135059",
-      GITHUB_SHA: "a".repeat(40),
-      GITHUB_RUN_ID: "1234",
-      GITHUB_RUN_ATTEMPT: "2",
-    },
-    nodeVersion: "v22.11.0",
-  });
-  assert.deepEqual((await readdir(outDir)).sort(), ["github-e2e-input.json", ...GITHUB_E2E_BUNDLES].sort());
-  const manifest = JSON.parse(await readFile(resolve(outDir, "github-e2e-input.json"), "utf8"));
-  assert.equal(manifest.schemaVersion, 1);
-  assert.equal(manifest.repositoryId, "1282135059");
-  assert.equal(manifest.commitSha, "a".repeat(40));
-  assert.equal(manifest.workflowRunId, "1234");
-  assert.equal(manifest.verifyExecutionAttempt, 2);
-  assert.equal(manifest.nodeVersion, "v22.11.0");
-  assert.deepEqual(manifest.bundles.map(item => item.name), GITHUB_E2E_BUNDLES);
-  assert.ok(manifest.bundles.every(item => /^[0-9a-f]{64}$/u.test(item.sha256) && item.size > 0));
+const manifest = await writeGitHubE2EInputManifest({
+  outDir,
+  env: {
+    GITHUB_REPOSITORY_ID: "1282135059",
+    GITHUB_SHA: "a".repeat(40),
+    GITHUB_RUN_ID: "1234",
+    GITHUB_RUN_ATTEMPT: "2",
+  },
+  nodeVersion: "v22.11.0",
 });
+assert.equal(manifest.repositoryId, "1282135059");
+assert.equal(manifest.commitSha, "a".repeat(40));
+assert.equal(manifest.workflowRunId, "1234");
+assert.equal(manifest.workflowRunAttempt, 2);
+assert.deepEqual(manifest.bundles.map(item => item.name), GITHUB_E2E_BUNDLES);
 ```
 
-Add negative cases for missing producer env, non-40-hex SHA, zero/invalid attempt, missing bundle, and unexpected extra file when manifest is finalized.
+Add negatives: missing producer env, non-40-hex SHA, invalid attempt, missing bundle, unexpected extra entry.
 
-- [ ] **Step 3: Run tests and prove they fail before the producer module/flags exist**
+- [ ] **Step 3: Prove tests fail**
 
 ```bash
 node scripts/run-tests.mjs --tier=feasibility --filter=github-e2e-compile-cli
 node scripts/run-tests.mjs --tier=feasibility --filter=github-e2e-input
 ```
 
-Expected: FAIL because the fixed output/manifest contract is not implemented.
-
-- [ ] **Step 4: Implement the focused producer module**
-
-Core structure:
+- [ ] **Step 4: Implement producer module**
 
 ```js
-// scripts/github-e2e-input.mjs
 import { createHash } from "node:crypto";
 import { readFile, readdir, rm, mkdir, stat, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
@@ -279,17 +235,17 @@ export const GITHUB_E2E_ENTRY_POINTS = Object.freeze([
   "tests/github-e2e/v4-copy-contract-github-e2e.test.ts",
   "tests/github-e2e/v4-encrypted-external-mutation.test.ts",
 ]);
-export const GITHUB_E2E_BUNDLES = Object.freeze(GITHUB_E2E_ENTRY_POINTS.map(path => path.split("/").at(-1).replace(/\.ts$/u, ".mjs")));
+export const GITHUB_E2E_BUNDLES = Object.freeze(GITHUB_E2E_ENTRY_POINTS.map(value => value.split("/").at(-1).replace(/\.ts$/u, ".mjs")));
 
 export async function compileGitHubE2EBundles({ root = process.cwd(), outDir }) {
   if (!outDir) throw new Error("GitHub E2E output directory is required.");
   await rm(outDir, { recursive: true, force: true });
   await mkdir(outDir, { recursive: true });
   const outputs = [];
-  for (let i = 0; i < GITHUB_E2E_ENTRY_POINTS.length; i++) {
-    const outfile = resolve(outDir, GITHUB_E2E_BUNDLES[i]);
+  for (let index = 0; index < GITHUB_E2E_ENTRY_POINTS.length; index++) {
+    const outfile = resolve(outDir, GITHUB_E2E_BUNDLES[index]);
     await build({
-      entryPoints: [resolve(root, GITHUB_E2E_ENTRY_POINTS[i])],
+      entryPoints: [resolve(root, GITHUB_E2E_ENTRY_POINTS[index])],
       outfile,
       bundle: true,
       platform: "node",
@@ -303,57 +259,27 @@ export async function compileGitHubE2EBundles({ root = process.cwd(), outDir }) 
   return outputs;
 }
 
-function required(env, name, pattern) {
-  const value = env[name] ?? "";
-  if (!pattern.test(value)) throw new Error(`Invalid GitHub E2E producer field: ${name}`);
-  return value;
-}
-
 export async function writeGitHubE2EInputManifest({ outDir, env = process.env, nodeVersion = process.version }) {
-  const repositoryId = required(env, "GITHUB_REPOSITORY_ID", /^[1-9][0-9]*$/u);
-  const commitSha = required(env, "GITHUB_SHA", /^[0-9a-f]{40}$/u);
-  const workflowRunId = required(env, "GITHUB_RUN_ID", /^[1-9][0-9]*$/u);
-  const attemptText = required(env, "GITHUB_RUN_ATTEMPT", /^[1-9][0-9]*$/u);
-  const entries = (await readdir(outDir)).sort();
-  if (entries.join("\n") !== [...GITHUB_E2E_BUNDLES].sort().join("\n")) throw new Error("GitHub E2E input directory contains unexpected entries before manifest creation.");
-  const bundles = [];
-  for (const name of GITHUB_E2E_BUNDLES) {
-    const file = resolve(outDir, name);
-    const info = await stat(file);
-    if (!info.isFile()) throw new Error(`GitHub E2E bundle is not a regular file: ${name}`);
-    const bytes = await readFile(file);
-    bundles.push({ name, size: bytes.byteLength, sha256: createHash("sha256").update(bytes).digest("hex") });
-  }
-  const manifest = {
-    schemaVersion: 1,
-    repositoryId,
-    commitSha,
-    workflowRunId,
-    verifyExecutionAttempt: Number(attemptText),
-    nodeVersion,
-    bundles,
-  };
-  await writeFile(resolve(outDir, "github-e2e-input.json"), `${JSON.stringify(manifest, null, 2)}\n`);
-  return manifest;
+  // Validate repository ID/run ID as canonical decimal strings, SHA as 40 lowercase hex,
+  // and run attempt as positive integer. Require directory contains only the 3 bundles.
+  // Hash each regular file with SHA-256; then write github-e2e-input.json with schemaVersion:1.
 }
 ```
 
-Use IDs as validated decimal strings in manifests rather than depending on JavaScript integer precision.
+The implementation of `writeGitHubE2EInputManifest` must contain the exact validation described by tests; do not leave permissive coercion.
 
-- [ ] **Step 5: Refactor `run-github-e2e.mjs` without changing local credentialed semantics**
+- [ ] **Step 5: Refactor runner**
 
-Determine compile mode **before** reading `.env.github-e2e`:
+Determine compile mode before env-file loading:
 
 ```js
 const compileOnly = process.argv.includes("--compile-only") || process.env.GITHUB_E2E_COMPILE_ONLY === "1";
 if (!compileOnly) loadEnvFile();
 ```
 
-Parse `--out-dir=` and `--write-input-manifest`. Use `compileGitHubE2EBundles()` for both compile-only and local credentialed execution. When `--write-input-manifest` is present, call `writeGitHubE2EInputManifest()` after compilation. Do not load target credentials or target env files in compile-only mode.
+Use `compileGitHubE2EBundles()` for compile-only/local execution. Parse `--out-dir=`. If `--write-input-manifest` is present, call manifest writer after compile.
 
-- [ ] **Step 6: Make CI compile once and upload the E2E input only for master pushes**
-
-Replace the existing compile command with:
+- [ ] **Step 6: Update CI**
 
 ```yaml
 - name: Compile real GitHub E2E harness
@@ -362,11 +288,7 @@ Replace the existing compile command with:
     --compile-only
     --out-dir=.tmp/github-e2e-input
     --write-input-manifest
-```
 
-After package validation, add:
-
-```yaml
 - name: Upload release-qualifying GitHub E2E input
   if: github.event_name == 'push' && github.ref == 'refs/heads/master'
   uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -376,29 +298,19 @@ After package validation, add:
     if-no-files-found: error
 ```
 
-Keep the current ordinary plugin artifact behavior unchanged in Child B.
+Keep current ordinary plugin artifact unchanged in Child B.
 
-- [ ] **Step 7: Add CI workflow assertions to `github-e2e-input.test.mjs`**
+- [ ] **Step 7: Add CI raw-text contract**
 
-Assert raw workflow semantics rather than whitespace snapshots:
+Assert fixed output directory, manifest flag, master-push condition, exact artifact naming.
 
-```js
-const ci = await readFile(resolve(".github/workflows/ci.yml"), "utf8");
-assert.match(ci, /--out-dir=\.tmp\/github-e2e-input/u);
-assert.match(ci, /--write-input-manifest/u);
-assert.match(ci, /github-e2e-input-\$\{\{ github\.sha \}\}-\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}/u);
-assert.match(ci, /github\.event_name == 'push' && github\.ref == 'refs\/heads\/master'/u);
-```
-
-- [ ] **Step 8: Run focused gates and compile the bundles**
+- [ ] **Step 8: Verify**
 
 ```bash
 node scripts/run-tests.mjs --tier=feasibility --filter=github-e2e-compile-cli
 node scripts/run-tests.mjs --tier=feasibility --filter=github-e2e-input
 corepack pnpm test:github-e2e:compile
 ```
-
-Expected: PASS without any GitHub E2E credential.
 
 - [ ] **Step 9: Commit**
 
@@ -409,7 +321,7 @@ git commit -m "test: produce provenance-bound github e2e bundles"
 
 ---
 
-### Task 3: Build the Shared Target-Safety Authority with Mocked REST Tests
+### Task 3: Build Shared Target-Safety Authority with Mocked REST Tests
 
 **Files:**
 - Create: `tests/github-e2e/support/target-safety.ts`
@@ -427,7 +339,6 @@ export interface GitHubE2ETargetEnvironment {
   sourceRepositoryId?: string
   requiredBranch?: string
 }
-
 export interface ResolvedGitHubE2ETarget {
   config: GitHubConfig
   repositoryId: string
@@ -435,58 +346,44 @@ export interface ResolvedGitHubE2ETarget {
   defaultBranch: string
   defaultBranchSha: string
 }
-
 export type GitHubE2EFetch = (url: string, init?: RequestInit) => Promise<Response>
-
 export function readGitHubE2ETargetEnvironment(env?: NodeJS.ProcessEnv): GitHubE2ETargetEnvironment
 export function encodeGitHubE2ERefPath(branch: string): string
 export async function resolveGitHubE2ETarget(input: GitHubE2ETargetEnvironment, request?: GitHubE2EFetch): Promise<ResolvedGitHubE2ETarget>
 export async function resetGitHubE2EDisposableBranch(input: GitHubE2ETargetEnvironment, request?: GitHubE2EFetch): Promise<ResolvedGitHubE2ETarget>
 ```
 
-`resolveGitHubE2ETarget()` is non-destructive and proves repository ID, source inequality when supplied, actual default branch, required branch when supplied, branch != default, and readable default-branch Git ref.
+- [ ] **Step 1: Write safety matrix first**
 
-`resetGitHubE2EDisposableBranch()` re-runs the full resolve/capability proof immediately before reset, treats absence as valid only after capability proof, handles a recognized concurrent already-absent result, and performs bounded post-delete capability + absence verification.
-
-- [ ] **Step 1: Write the safety matrix before the helper exists**
-
-Use a deterministic injected `fetch` fake. Required tests:
+Required tests:
 
 ```ts
-test("rejects case-different route that resolves to the source numeric repository ID", async () => {})
-test("rejects configured route when resolved target ID differs from pinned ID", async () => {})
-test("rejects the actual default branch even when its name is not main/master", async () => {})
-test("rejects a branch that differs from required Actions branch", async () => {})
-test("fails closed when repository metadata cannot be resolved", async () => {})
-test("fails closed when the actual default-branch ref is unreadable", async () => {})
-test("accepts exact disposable 404 only after default-ref capability succeeds", async () => {})
-test("rejects arbitrary 422 as absence", async () => {})
-test("accepts only exact recognized missing-reference validation after capability", async () => {})
-test("accepts concurrent already-absent DELETE only after final capability and absence verification", async () => {})
-test("fails when default-ref capability is lost after DELETE", async () => {})
-test("requires expected numeric repository ID in credentialed environment parsing", () => {})
+test("rejects case-different route resolving to source numeric ID", async () => {})
+test("rejects target ID mismatch with pinned ID", async () => {})
+test("rejects actual default branch regardless of its name", async () => {})
+test("rejects branch differing from required Actions branch", async () => {})
+test("metadata failure fails closed", async () => {})
+test("default-branch ref unreadable fails closed", async () => {})
+test("exact disposable 404 accepted only after capability success", async () => {})
+test("arbitrary 422 is rejected", async () => {})
+test("recognized missing-reference validation accepted only after capability", async () => {})
+test("concurrent already-absent DELETE still performs final capability+absence verification", async () => {})
+test("post-delete loss of default-ref capability fails", async () => {})
+test("credentialed env parsing requires numeric expected repo ID", () => {})
 ```
 
-The fake should record method + URL order so tests assert capability reads occur before absence interpretation and again after deletion.
+Fake fetch records method+URL order.
 
-- [ ] **Step 2: Run the focused test and prove the module is missing**
+- [ ] **Step 2: Prove module missing**
 
 ```bash
 node scripts/run-tests.mjs --tier=feasibility --filter=github-e2e-target-safety
 ```
 
-Expected: FAIL because the helper does not exist.
-
-- [ ] **Step 3: Implement strict environment parsing and ref encoding**
+- [ ] **Step 3: Implement strict env/ref helpers**
 
 ```ts
 const FORBIDDEN_LOCAL_BRANCHES = new Set(["main", "master", "production", "prod", "release", "stable"])
-
-function required(env: NodeJS.ProcessEnv, name: string): string {
-  const value = env[name]?.trim()
-  if (!value) throw new Error(`Missing required env var: ${name}`)
-  return value
-}
 
 export function readGitHubE2ETargetEnvironment(env = process.env): GitHubE2ETargetEnvironment {
   const branch = required(env, "GITHUB_E2E_BRANCH")
@@ -511,55 +408,17 @@ export function encodeGitHubE2ERefPath(branch: string): string {
 
 - [ ] **Step 4: Implement metadata/default-ref proof**
 
-Core rules:
+Require metadata `id/full_name/default_branch`, pinned ID equality, source inequality when supplied, required-branch equality when supplied, branch != actual default. Then read actual default-branch Git ref and require 200 + object SHA.
 
-```ts
-const metadata = await expectJson<{
-  id?: number
-  full_name?: string
-  default_branch?: string
-}>(await request(repoUrl, { headers }), [200], "Cannot inspect GitHub E2E repository")
+- [ ] **Step 5: Implement exact absence classification/reset**
 
-const repositoryId = String(metadata.id ?? "")
-if (repositoryId !== input.expectedRepositoryId) throw new Error("GitHub E2E target repository ID does not match the pinned repository ID.")
-if (input.sourceRepositoryId && repositoryId === input.sourceRepositoryId) throw new Error("GitHub E2E target repository must not be the source repository.")
-if (!metadata.full_name || !metadata.default_branch) throw new Error("GitHub E2E repository metadata is incomplete.")
-if (input.requiredBranch && input.branch !== input.requiredBranch) throw new Error("GitHub E2E branch does not match the required workflow branch.")
-if (input.branch === metadata.default_branch) throw new Error("GITHUB_E2E_BRANCH must not be the repository default branch.")
+Only after capability proof recognize exact-ref `404` or `422` whose parsed message is exactly `Reference does not exist`. For present ref, DELETE; accept `204` or recognized concurrent absence; then re-prove default-ref readability and boundedly verify disposable ref absence. Ambiguous responses fail closed. Never log token.
 
-const defaultRef = await expectJson<{ object?: { sha?: string } }>(
-  await request(`${canonicalBase}/git/ref/heads/${encodeGitHubE2ERefPath(metadata.default_branch)}`, { headers }),
-  [200],
-  "Cannot prove Git-ref read capability on the target default branch",
-)
-if (!defaultRef.object?.sha) throw new Error("Target default-branch ref is missing its commit SHA.")
-```
-
-Never include the credential value in errors/log output.
-
-- [ ] **Step 5: Implement exact absence classification and bounded reset**
-
-Recognize absence only as:
-
-```ts
-async function isRecognizedMissingRef(response: Response): Promise<boolean> {
-  if (response.status === 404) return true
-  if (response.status !== 422) return false
-  const text = await response.text()
-  try { return (JSON.parse(text) as { message?: string }).message === "Reference does not exist" }
-  catch { return false }
-}
-```
-
-This helper is called only after default-ref capability is established. After a present exact ref, send `DELETE`; accept `204` or a recognized concurrent already-absent response, then re-read the actual default ref and poll the exact disposable ref up to 3 times. Any ambiguous response fails closed.
-
-- [ ] **Step 6: Run focused tests**
+- [ ] **Step 6: Verify**
 
 ```bash
 node scripts/run-tests.mjs --tier=feasibility --filter=github-e2e-target-safety
 ```
-
-Expected: PASS with no real network calls.
 
 - [ ] **Step 7: Commit**
 
@@ -570,7 +429,7 @@ git commit -m "test: centralize github e2e target safety"
 
 ---
 
-### Task 4: Migrate All Credentialed Suites and Local Runner to the Pinned-ID Contract
+### Task 4: Migrate All Credentialed Suites and Local Runner to Pinned-ID Contract
 
 **Files:**
 - Create: `tests/feasibility/github-e2e-suite-safety-contract.test.mjs`
@@ -581,53 +440,40 @@ git commit -m "test: centralize github e2e target safety"
 - Modify: `tests/feasibility/github-e2e-compile-cli.test.mjs`
 
 **Interfaces:**
-- All three suites import `readGitHubE2ETargetEnvironment`, `resolveGitHubE2ETarget`, `resetGitHubE2EDisposableBranch`, and `encodeGitHubE2ERefPath` as needed.
+- All suites import shared target helper.
 - Credentialed local execution requires `GITHUB_E2E_EXPECTED_REPO_ID`.
-- Actions execution additionally supplies `GITHUB_E2E_SOURCE_REPO_ID` and `GITHUB_E2E_REQUIRED_BRANCH`.
-- Existing test scenario semantics and Child-C-owned retry logic remain unchanged.
+- Actions additionally supplies source repo ID + exact required branch.
+- Existing scenario semantics/Child-C retry code unchanged.
 
-- [ ] **Step 1: Write a static suite-consumer regression**
+- [ ] **Step 1: Write static suite-consumer regression**
 
 ```js
-// tests/feasibility/github-e2e-suite-safety-contract.test.mjs
-import assert from "node:assert/strict";
-import test from "node:test";
-import { readFile } from "node:fs/promises";
-import { resolve } from "node:path";
-
 const suites = [
   "tests/github-e2e/v4-real-github-e2e.test.ts",
   "tests/github-e2e/v4-copy-contract-github-e2e.test.ts",
   "tests/github-e2e/v4-encrypted-external-mutation.test.ts",
 ];
-
-test("every credentialed GitHub E2E suite delegates target reset safety", async () => {
-  for (const file of suites) {
-    const text = await readFile(resolve(file), "utf8");
-    assert.match(text, /\.\/support\/target-safety/u, file);
-    assert.match(text, /resetGitHubE2EDisposableBranch/u, file);
-    assert.doesNotMatch(text, /async function deleteTestBranch/u, file);
-    assert.doesNotMatch(text, /const forbiddenBranches/u, file);
-  }
-});
+for (const file of suites) {
+  const text = await readFile(resolve(file), "utf8");
+  assert.match(text, /\.\/support\/target-safety/u, file);
+  assert.match(text, /resetGitHubE2EDisposableBranch/u, file);
+  assert.doesNotMatch(text, /async function deleteTestBranch/u, file);
+  assert.doesNotMatch(text, /const forbiddenBranches/u, file);
+}
 ```
 
-- [ ] **Step 2: Add a local-runner required-ID regression**
+- [ ] **Step 2: Add local runner missing-ID regression**
 
-Extend `github-e2e-compile-cli.test.mjs` with a non-network validation case that provides owner/repo/branch/token but omits `GITHUB_E2E_EXPECTED_REPO_ID`. Assert exit status `2` and an error naming the missing expected ID before any bundle execution/network work.
+Provide owner/repo/branch/token but omit `GITHUB_E2E_EXPECTED_REPO_ID`; assert exit status 2 and missing-ID message before network/test execution.
 
-- [ ] **Step 3: Run tests and prove they fail**
+- [ ] **Step 3: Prove failures**
 
 ```bash
 node scripts/run-tests.mjs --tier=feasibility --filter=github-e2e-suite-safety-contract
 node scripts/run-tests.mjs --tier=feasibility --filter=github-e2e-compile-cli
 ```
 
-Expected: FAIL because suites still own reset logic and the runner does not require expected ID.
-
-- [ ] **Step 4: Update the local runner required environment**
-
-In non-compile mode:
+- [ ] **Step 4: Require expected ID in non-compile runner**
 
 ```js
 const required = [
@@ -639,11 +485,7 @@ const required = [
 ];
 ```
 
-Keep compile-only mode credential-free and keep the existing local convenience behavior of compiling then running serially.
-
-- [ ] **Step 5: Migrate each suite to the shared helper**
-
-Use this pattern at module setup:
+- [ ] **Step 5: Migrate suites**
 
 ```ts
 import {
@@ -658,22 +500,11 @@ const initialTarget = await resolveGitHubE2ETarget(targetEnvironment)
 const github = initialTarget.config
 ```
 
-Replace every scenario-start and `after()` branch reset with:
+Replace every scenario-start/after reset with `await resetGitHubE2EDisposableBranch(targetEnvironment)`. Use shared ref encoder for external-interference paths. Remove duplicate forbidden/env/delete logic.
 
-```ts
-await resetGitHubE2EDisposableBranch(targetEnvironment)
-```
+Do not alter main/copy wrapper retry classification or `conflictCopyStages.clear()`.
 
-Use `encodeGitHubE2ERefPath(github.branch)` anywhere external-interference code still needs the encoded ref path. Remove each suite's duplicate `forbiddenBranches`, env/config parser, ad-hoc `deleteTestBranch`, and duplicated absence loop.
-
-Do **not** alter these Child-C-owned blocks in this task:
-
-```text
-v4-real-github-e2e Normal-only wrapper retry
-v4-copy-contract-github-e2e Normal-only wrapper retry + conflictCopyStages.clear()
-```
-
-- [ ] **Step 6: Run deterministic compile and feasibility gates**
+- [ ] **Step 6: Verify**
 
 ```bash
 node scripts/run-tests.mjs --tier=feasibility --filter=github-e2e-suite-safety-contract
@@ -681,8 +512,6 @@ node scripts/run-tests.mjs --tier=feasibility --filter=github-e2e-compile-cli
 node scripts/run-tests.mjs --tier=feasibility --filter=github-e2e-target-safety
 corepack pnpm test:github-e2e:compile
 ```
-
-Expected: PASS. No real target credential is required for these checks.
 
 - [ ] **Step 7: Commit**
 
@@ -693,14 +522,15 @@ git commit -m "test: enforce pinned live e2e repository identity"
 
 ---
 
-### Task 5: Rewrite GitHub E2E Live as a Verified CI-Artifact Executor
+### Task 5: Rewrite GitHub E2E Live as Verified CI-Artifact Executor
 
 **Files:**
 - Create: `tests/feasibility/github-e2e-live-workflow-contract.test.mjs`
 - Modify: `.github/workflows/github-e2e-live.yml`
 
 **Interfaces:**
-- Workflow environment variables/secrets:
+
+Environment:
 
 ```text
 vars.E2E_OWNER
@@ -709,63 +539,41 @@ vars.E2E_REPO_ID
 secrets.E2E_TOKEN
 ```
 
-- `qualify` consumes newest exact-SHA CI artifact and persists receipt artifact:
+Receipt artifact for each qualify attempt:
 
 ```text
 github-e2e-target-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}
 ```
 
-whose sole file is `github-e2e-target.json`.
+with sole file `github-e2e-target.json`.
 
-- `cleanup` discovers the highest valid receipt for the current workflow run via Actions artifacts; it does not use `needs.qualify.outputs` as target identity authority.
+Release qualification later requires the authoritative live run **current attempt** to contain successful `qualify`, successful `cleanup`, and valid same-attempt receipt. Cleanup itself uses configured route + pinned ID and does not use receipt/old attempt outputs as safety authority.
 
-- [ ] **Step 1: Write the failing workflow contract before replacing the workflow**
+- [ ] **Step 1: Write failing workflow contract**
 
 ```js
-// tests/feasibility/github-e2e-live-workflow-contract.test.mjs
-import assert from "node:assert/strict";
-import test from "node:test";
-import { readFile } from "node:fs/promises";
-import { resolve } from "node:path";
-
-const file = resolve(".github/workflows/github-e2e-live.yml");
-
-test("live E2E workflow is a no-build verified-artifact executor", async () => {
-  const text = await readFile(file, "utf8");
-  assert.match(text, /actions:\s*read/u);
-  assert.match(text, /contents:\s*read/u);
-  assert.doesNotMatch(text, /actions\/checkout@/u);
-  assert.doesNotMatch(text, /pnpm\/action-setup@/u);
-  assert.doesNotMatch(text, /pnpm install|pnpm build|run-github-e2e\.mjs/u);
-  assert.match(text, /github-e2e-input-/u);
-  assert.match(text, /E2E_REPO_ID/u);
-  assert.match(text, /github-e2e-target-/u);
-  assert.match(text, /node --test --test-concurrency=1/u);
-  assert.doesNotMatch(text, /needs\.qualify\.outputs/u);
-  assert.doesNotMatch(text, /^ {4}env:/mu); // no job-level env blocks
-});
-
-test("receipt persistence precedes credentialed bundle execution", async () => {
-  const text = await readFile(file, "utf8");
-  const receipt = text.indexOf("Upload target/provenance receipt");
-  const execute = text.indexOf("Run verified real GitHub E2E bundles");
-  assert.ok(receipt >= 0 && execute > receipt);
-});
+const text = await readFile(resolve(".github/workflows/github-e2e-live.yml"), "utf8");
+assert.match(text, /actions:\s*read/u);
+assert.match(text, /contents:\s*read/u);
+assert.doesNotMatch(text, /actions\/checkout@/u);
+assert.doesNotMatch(text, /pnpm\/action-setup@/u);
+assert.doesNotMatch(text, /pnpm install|pnpm build|run-github-e2e\.mjs/u);
+assert.match(text, /github-e2e-input-/u);
+assert.match(text, /E2E_REPO_ID/u);
+assert.match(text, /github-e2e-target-/u);
+assert.match(text, /node --test --test-concurrency=1/u);
+assert.doesNotMatch(text, /^ {4}env:/mu); // no job-level env blocks
 ```
 
-Add assertions that both `qualify` and `cleanup` reference `environment: github-e2e`, `cleanup` uses `if: always()`, the branch literal contains `obsidian-sync-e2e/run-${{ github.run_id }}`, and the target secret is not mapped in any job-level `env:`.
+Add ordering assertion receipt upload before bundle execution; assert both jobs `environment: github-e2e`, cleanup `if: always()`, run-derived branch literal, and no cleanup logic reading an old receipt artifact or `needs.qualify.outputs` as identity authority.
 
-- [ ] **Step 2: Run the focused test and prove the old workflow fails**
+- [ ] **Step 2: Prove old workflow fails**
 
 ```bash
 node scripts/run-tests.mjs --tier=feasibility --filter=github-e2e-live-workflow-contract
 ```
 
-Expected: FAIL because current workflow checks out/builds and stores target credential at job scope.
-
-- [ ] **Step 3: Replace workflow-level permissions and job shell structure**
-
-Use:
+- [ ] **Step 3: Set workflow permissions/jobs**
 
 ```yaml
 permissions:
@@ -777,58 +585,46 @@ concurrency:
   cancel-in-progress: false
 ```
 
-`qualify` and `cleanup` both use `environment: github-e2e`; neither job has a job-level `env:` block.
+`qualify` and `cleanup` reference `environment: github-e2e`; neither has job-level `env:`.
 
-- [ ] **Step 4: Implement authoritative CI selection as fixed workflow-owned code**
+- [ ] **Step 4: Implement authoritative CI current-attempt selection**
 
-The first `qualify` step uses only `${{ github.token }}` and must:
+Fixed workflow-owned code must:
 
-1. require `GITHUB_REF == refs/heads/master`,
-2. GET source `git/ref/heads/master` and require its SHA equals `GITHUB_SHA`,
-3. paginate all `ci.yml` runs filtered by exact SHA + `push`, then filter exact `head_branch=master` and choose newest by `created_at`, tie-breaking by numeric run ID,
-4. require newest run `status=completed` and `conclusion=success`,
-5. use that run's current `run_attempt` and attempt-specific jobs endpoint; require `verify` completed/successful,
-6. locate exact unexpired artifact `github-e2e-input-${GITHUB_SHA}-${CI_RUN_ID}-${CI_ATTEMPT}` pagination-safely,
-7. output CI run ID, attempt, artifact ID, artifact digest if present, and exact `.node-version` fetched from fixed source path at `GITHUB_SHA`.
+1. require source ref `master`,
+2. require current source master SHA == `GITHUB_SHA`,
+3. paginate matching `ci.yml` `push` runs for exact SHA/master,
+4. choose newest by `created_at`, tie-break numeric run ID,
+5. require newest run completed/successful,
+6. read that run's **current `run_attempt`** and attempt-specific jobs; require `verify` executed/completed/successful in that same attempt,
+7. locate exact unexpired artifact `github-e2e-input-${GITHUB_SHA}-${CI_RUN_ID}-${CI_RUN_ATTEMPT}` pagination-safely,
+8. fetch exact source `.node-version`,
+9. expose only non-secret CI run/attempt/artifact/digest/node outputs.
 
-The workflow-owned Node logic should use explicit pagination, e.g.:
+Pagination helper shape:
 
 ```js
-async function listAll(path) {
+async function listAll(path, key) {
   const values = [];
   for (let page = 1; ; page++) {
     const separator = path.includes("?") ? "&" : "?";
     const response = await api(`${path}${separator}per_page=100&page=${page}`);
-    const pageValues = response.workflow_runs ?? response.jobs ?? response.artifacts ?? [];
+    const pageValues = response[key] ?? [];
     values.push(...pageValues);
     if (pageValues.length < 100) return values;
   }
 }
 ```
 
-Do not use “first successful run found” logic.
+Do not search for “any successful run”.
 
-- [ ] **Step 5: Download and validate the exact CI artifact before target credential exposure**
+- [ ] **Step 5: Download/verify exact CI artifact before target secret exposure**
 
-Use source read token to download the artifact by selected numeric artifact ID into a fresh directory. If the API exposes `digest: sha256:<hex>`, hash the downloaded archive and require equality.
+Download by numeric artifact ID through GitHub REST with source read token. When REST exposes `digest: sha256:<hex>`, verify downloaded archive digest. GitHub documents artifact digest as SHA-256 of uploaded artifact; keep inner manifest hashes as the independent file-level integrity authority.
 
-Before extraction use standard-library archive inspection (Python `zipfile` is acceptable on the hosted runner) to reject:
+Before extraction reject absolute paths, `..`, backslash ambiguity, duplicate names, directories, symlinks, extra/missing entries. Exact archive logical entries are manifest + 3 bundles. Parse manifest strictly and require source repo ID/SHA/run/current attempt/Node version/bundle names/sizes/hashes. Write only validated bytes into fresh `.tmp/github-e2e-verified`.
 
-```text
-absolute paths
-.. traversal
-backslash path ambiguity
-duplicate names
-directories
-symlink entries
-extra/missing entries
-```
-
-Exact entries are the four files from Task 2. Parse `github-e2e-input.json` strictly and require repository ID, SHA, run ID, verify attempt, Node version, exact bundle names, sizes, and SHA-256 hashes. Manually write only validated regular-file bytes into a fresh directory; do not `extractall()` unvalidated input.
-
-- [ ] **Step 6: Set up only the exact Node runtime needed to run already-verified bundles**
-
-Use the full-SHA-pinned setup action:
+- [ ] **Step 6: Set up exact Node runtime only**
 
 ```yaml
 - name: Setup exact Node.js runtime
@@ -837,11 +633,9 @@ Use the full-SHA-pinned setup action:
     node-version: ${{ steps.ci.outputs.node_version }}
 ```
 
-No pnpm cache, install, source checkout, build, or compile is allowed.
+No pnpm cache/install/build/compile.
 
-- [ ] **Step 7: Resolve and prove the pinned target identity with step-scoped credential**
-
-The guard step gets only:
+- [ ] **Step 7: Resolve pinned target with step-scoped credential**
 
 ```yaml
 env:
@@ -852,32 +646,21 @@ env:
   E2E_BRANCH: obsidian-sync-e2e/run-${{ github.run_id }}
 ```
 
-Fixed code must resolve target metadata and require:
+Fixed code resolves metadata and requires resolved ID == pinned ID, ID != source ID, non-empty canonical full name/default branch, branch != default, and GET actual default-branch Git ref == 200 with object SHA. Emit non-secret canonical owner/repo/ID/default/branch outputs only.
 
-```text
-resolved ID == E2E_REPO_ID
-resolved ID != GITHUB_REPOSITORY_ID
-full_name exists
-actual default_branch exists
-E2E_BRANCH != actual default_branch
-GET actual default-branch git ref == 200 with object SHA
-```
+- [ ] **Step 8: Persist same-attempt receipt before mutation**
 
-Emit only non-secret canonical full name, repository ID, default branch, and target branch as step outputs.
-
-- [ ] **Step 8: Persist the durable target/provenance receipt before scenario execution**
-
-Without target token in the step environment, write exactly `github-e2e-target.json`:
+Without target token in this step, write exactly:
 
 ```json
 {
   "schemaVersion": 1,
-  "sourceRepositoryId": "${GITHUB_REPOSITORY_ID}",
-  "sourceCommitSha": "${GITHUB_SHA}",
-  "workflowRunId": "${GITHUB_RUN_ID}",
-  "qualifyExecutionAttempt": 1,
+  "sourceRepositoryId": "...",
+  "sourceCommitSha": "...",
+  "workflowRunId": "...",
+  "workflowRunAttempt": 1,
   "ciProducerRunId": "...",
-  "ciVerifyExecutionAttempt": 1,
+  "ciProducerRunAttempt": 1,
   "ciE2EArtifactId": "...",
   "ciE2EArtifactDigest": "sha256:... or null",
   "targetRepositoryId": "...",
@@ -887,10 +670,10 @@ Without target token in the step environment, write exactly `github-e2e-target.j
 }
 ```
 
-Use actual runtime values, write atomically to a clean receipt directory, then upload as a **blocking** artifact:
+Upload blocking:
 
 ```yaml
-- name: Upload target/provenance receipt
+- name: Upload same-attempt qualification receipt
   uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
   with:
     name: github-e2e-target-${{ github.run_id }}-${{ github.run_attempt }}
@@ -898,9 +681,9 @@ Use actual runtime values, write atomically to a clean receipt directory, then u
     if-no-files-found: error
 ```
 
-There must be no `continue-on-error`.
+No `continue-on-error`.
 
-- [ ] **Step 9: Execute only the three verified bundles with step-scoped target credential**
+- [ ] **Step 9: Execute exact bundles serially with step-scoped target credential**
 
 ```yaml
 - name: Run verified real GitHub E2E bundles
@@ -920,23 +703,33 @@ There must be no `continue-on-error`.
       .tmp/github-e2e-verified/v4-encrypted-external-mutation.test.mjs
 ```
 
-The manifest cannot choose executable paths or arguments.
+- [ ] **Step 10: Make cleanup independent and fail closed**
 
-- [ ] **Step 10: Implement receipt-selected cleanup without `needs.qualify.outputs` authority**
+`cleanup` gets current `E2E_OWNER/E2E_REPO/E2E_REPO_ID/E2E_TOKEN` only in its cleanup step. It does **not** download old receipt artifacts and does not require `needs.qualify.outputs` for target identity.
 
-`cleanup` runs `if: always()` on its own runner. First, with source read token only:
+Before exact ref removal it independently:
 
-1. paginate artifacts for `GITHUB_RUN_ID`,
-2. select names matching `^github-e2e-target-${GITHUB_RUN_ID}-([1-9][0-9]*)$`, highest attempt first,
-3. download candidates until the highest valid receipt is found,
-4. validate artifact digest when exposed, exact one-file archive shape, receipt schema/source repo/SHA/workflow run/attempt,
-5. require receipt target ID equals current pinned `${{ vars.E2E_REPO_ID }}` and branch equals `obsidian-sync-e2e/run-${GITHUB_RUN_ID}`.
+```text
+requires configured route nonempty
+requires pinned ID canonical numeric
+resolves current route metadata
+requires resolved ID == pinned E2E_REPO_ID
+requires resolved ID != source repository ID
+requires branch == obsidian-sync-e2e/run-${GITHUB_RUN_ID}
+requires branch != current default branch
+requires current default-branch Git ref readable
+reads exact disposable ref
+```
 
-Then a separate cleanup step gets the target token and uses the receipt's **canonical `targetFullName`** for routing. It re-resolves metadata and requires the same repository ID, source inequality, branch != current default branch, and readable current default-branch ref before exact disposable-ref inspection/removal. A recognized already-absent result is accepted only inside that proven-capability window; final default-ref capability and exact branch absence are verified with bounded retries.
+If exact ref is recognized absent after capability proof, succeed. If present, delete exact ref; accept 204 or recognized concurrent absence; then re-prove default-ref capability and boundedly verify exact absence. Ambiguous route/ID/ref responses mutate nothing and fail.
 
-If no valid receipt exists, do not call the target mutation endpoint and fail the cleanup job.
+A cleanup-only rerun may therefore clean residue safely, but it does not create a same-attempt `qualify`/receipt and cannot become release qualification.
 
-- [ ] **Step 11: Run workflow/static feasibility tests**
+- [ ] **Step 11: Add static cohesive-attempt contract**
+
+The feasibility test must assert receipt name includes `${{ github.run_attempt }}` and docs/static markers make the intended rule explicit. It cannot prove GitHub job result semantics; final live run is authoritative execution evidence.
+
+- [ ] **Step 12: Verify**
 
 ```bash
 node scripts/run-tests.mjs --tier=feasibility --filter=github-e2e-live-workflow-contract
@@ -945,9 +738,7 @@ corepack pnpm test:feasibility
 corepack pnpm test:github-e2e:compile
 ```
 
-Expected: PASS.
-
-- [ ] **Step 12: Commit**
+- [ ] **Step 13: Commit**
 
 ```bash
 git add .github/workflows/github-e2e-live.yml tests/feasibility/github-e2e-live-workflow-contract.test.mjs
@@ -963,41 +754,28 @@ git commit -m "ci: run live github e2e from verified ci bundles"
 - Modify: `docs/releasing.md`
 
 **Interfaces:**
-- One-time `github-e2e` environment configuration now requires:
+
+One-time environment:
 
 ```text
 Variable: E2E_OWNER
 Variable: E2E_REPO
 Variable: E2E_REPO_ID
 Secret:   E2E_TOKEN
-Deployment branches/tags: Selected branches and tags -> branch master only; no tags
+Deployment branches/tags: Selected branches and tags -> master only; no tags
 ```
 
-- Local credentialed execution now requires:
+Local credentialed execution adds:
 
 ```text
 GITHUB_E2E_EXPECTED_REPO_ID=<numeric target id>
 ```
 
-- [ ] **Step 1: Rewrite the local/manual configuration section**
+- [ ] **Step 1: Rewrite local/manual configuration**
 
-Document:
+Document owner/repo/expected numeric ID/branch/token. State release-qualifying credential scope is target-repository-only, not merely preferred. Preserve `pnpm test:github-e2e:quick` convenience and explain local compile+run is intentionally different from fresh-runner Actions qualification.
 
-```text
-GITHUB_E2E_OWNER=owner
-GITHUB_E2E_REPO=dedicated-disposable-repository
-GITHUB_E2E_EXPECTED_REPO_ID=123456789
-GITHUB_E2E_BRANCH=local-v4-e2e
-GITHUB_E2E_TOKEN=<repository-scoped credential>
-```
-
-State that release-qualifying configuration requires target-repository-only mutable scope; “prefer” is no longer sufficient wording.
-
-Keep `pnpm test:github-e2e:quick` as the local convenience command and state explicitly that local convenience still compiles+runs in one process, while release-qualifying Actions deliberately consumes CI-precompiled bundles on a fresh runner.
-
-- [ ] **Step 2: Rewrite GitHub Actions environment setup**
-
-State exactly:
+- [ ] **Step 2: Rewrite Actions environment setup**
 
 ```text
 Settings -> Environments -> github-e2e
@@ -1006,54 +784,59 @@ Allowed branch -> master
 No tags
 ```
 
-Warn not to use `Protected branches only` while `master` has no protection rule.
+Warn against `Protected branches only` while master is unprotected. Explain numeric ID is authority and owner/repo is route.
 
-Explain that `E2E_REPO_ID` is the pinned authority and owner/repo values are routing only.
+- [ ] **Step 3: Replace blind manual cleanup snippet**
 
-- [ ] **Step 3: Replace the old blind cleanup snippet**
-
-The runbook must require this invariant order before any manual deletion:
+Require:
 
 ```text
 known expected numeric target ID
--> resolve repository metadata
+-> resolve current configured route
 -> require resolved ID == expected ID
--> require branch is obsidian-sync-e2e/run-<RUN_ID>
--> require branch != actual default branch
--> read actual default-branch Git ref successfully
+-> require branch obsidian-sync-e2e/run-<RUN_ID>
+-> require branch != actual default
+-> read actual default ref successfully
 -> inspect exact disposable ref
 -> delete only if present
--> read default-branch ref again
+-> read default ref again
 -> verify exact disposable ref absent
 ```
 
-Do not leave a sample that treats arbitrary 404 as success before capability proof. The manual script may inline fixed Node code, but it must require `E2E_REPO_ID` and print canonical repository name/ID/default branch/target branch before deletion.
+No arbitrary 404-success before capability proof.
 
-- [ ] **Step 4: Update only the Child-B portion of `docs/releasing.md`**
-
-Change environment setup to include `E2E_REPO_ID` + selected branch `master`, and qualification flow to:
+- [ ] **Step 4: Document cohesive rerun policy**
 
 ```text
-ordinary CI on exact master succeeds
--> CI produces current github-e2e-input artifact
--> GitHub E2E Live consumes that exact current artifact
--> target/provenance receipt persists before target mutation
--> qualify succeeds
--> cleanup succeeds
+cleanup fails -> Re-run failed jobs may be used to clean residue
+cleanup-only attempt is NOT release qualification
+for release qualification -> Re-run all jobs
+new attempt must produce its own receipt, rerun exact bundles, and cleanup successfully
 ```
 
-Do not rewrite Stable Release build/publication behavior here; Child A will replace that section later.
+- [ ] **Step 5: Update only Child-B portion of `docs/releasing.md`**
 
-- [ ] **Step 5: Run documentation-sensitive feasibility/static gates**
+Qualification becomes:
+
+```text
+ordinary CI exact master current attempt succeeds
+-> current github-e2e-input artifact exists
+-> GitHub E2E Live consumes it
+-> same-attempt receipt persists before target mutation
+-> qualify succeeds
+-> cleanup succeeds in same attempt
+```
+
+Do not redesign Stable Release section yet.
+
+- [ ] **Step 6: Verify docs-sensitive gates**
 
 ```bash
 corepack pnpm test:feasibility
 corepack pnpm test:github-e2e:compile
 ```
 
-Expected: PASS.
-
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add docs/github-e2e.md docs/releasing.md
@@ -1065,12 +848,12 @@ git commit -m "docs: harden live github e2e runbook"
 ### Task 7: Verify Child B End-to-End Before Handoff
 
 **Files:**
-- No planned source change. Fix only defects exposed by verification, each with its own failing regression and focused commit.
+- No planned source change. Any defect exposed here gets a failing regression + focused fix commit.
 
 **Interfaces:**
-- Produces: evidence that deterministic/local gates pass on the implementation branch and, after merge/configuration, one release-qualifying live run succeeds against exact current `master` and current CI E2E artifact.
+- Produces deterministic branch evidence and, after merge/configuration, one exact-final-master live workflow whose current attempt has successful `qualify`, valid same-attempt receipt, and successful `cleanup`.
 
-- [ ] **Step 1: Attempt the complete deterministic local gate**
+- [ ] **Step 1: Attempt complete deterministic local gate**
 
 ```bash
 corepack pnpm install --frozen-lockfile
@@ -1084,99 +867,85 @@ corepack pnpm test:github-e2e:compile
 corepack pnpm validate:package
 ```
 
-Expected: all PASS. If the local environment cannot install/run, record the exact failure honestly and continue with GitHub Actions after pushing; do not claim local success.
+If local environment cannot run, record exact failure and rely on pushed GitHub Actions evidence; never claim local pass.
 
-- [ ] **Step 2: Inspect the implementation diff for child-boundary violations**
+- [ ] **Step 2: Inspect child-boundary diff**
 
-Required checks:
+Require:
 
 ```text
 no Child-C typed-race implementation
-no Child-A release publication redesign beyond action pins
-no live workflow checkout/install/build/compile
+no Child-A release redesign beyond action pins
+no live checkout/install/build/compile
 no job-level target credential
 no write-capable source GITHUB_TOKEN
 all external Actions pinned
-all three suites use target-safety helper
+all three suites share target-safety helper
 ```
 
-- [ ] **Step 3: Push every implementation commit to GitHub and require ordinary branch/PR CI**
+- [ ] **Step 3: Push all implementation commits and require ordinary branch/PR CI**
 
-Do not squash away the TDD commit boundaries before review. Use GitHub as source of truth.
+Preserve TDD commit boundaries for review.
 
-- [ ] **Step 4: Before a real release-qualifying live run, verify the one-time environment configuration**
+- [ ] **Step 4: Verify one-time environment configuration before live qualification**
 
-Maintainer evidence must confirm:
+Maintainer evidence:
 
 ```text
 github-e2e environment exists
-Selected branches and tags allows master only
-E2E_OWNER/E2E_REPO route to disposable initialized repository
-E2E_REPO_ID equals that repository's numeric ID
-E2E_TOKEN mutable scope is limited to that repository
-actual default branch is readable and is not the disposable run branch
+Selected branches/tags allows master only
+E2E_OWNER/E2E_REPO route to initialized disposable repo
+E2E_REPO_ID equals resolved numeric ID
+E2E_TOKEN mutable scope limited to target repo
+actual default branch readable and differs from disposable branch
 ```
 
-If current tooling cannot inspect a setting, do not infer it; require explicit maintainer verification in the GitHub UI/runbook.
+If tooling cannot inspect a setting, require explicit GitHub UI verification; do not infer.
 
-- [ ] **Step 5: Merge only after review, then qualify the exact final master SHA**
+- [ ] **Step 5: Merge only after review, then qualify exact final master SHA**
 
-After merge:
+Require newest CI push run/current attempt for final master `M` completed/successful and artifact `github-e2e-input-M-<run>-<attempt>` exists/unexpired. Dispatch GitHub E2E Live selecting `master`.
 
-```text
-current master SHA = M
-newest CI push run for M = completed/success
-CI artifact github-e2e-input-M-<run>-<attempt> exists and is unexpired
-```
-
-Dispatch **GitHub E2E Live** selecting `master`. Require:
+Require current live workflow attempt:
 
 ```text
-qualify = success
-cleanup = success
-receipt artifact exists for successful qualify attempt
+qualify executed + success
+receipt github-e2e-target-<live-run>-<same-attempt> exists
 receipt source SHA = M
-receipt target repository ID = pinned E2E_REPO_ID
-receipt CI producer run/attempt/artifact = current authoritative CI producer
+receipt target ID = pinned E2E_REPO_ID
+receipt CI producer run/attempt/artifact = authoritative current CI input
+cleanup executed + success in same attempt
 ```
 
-Do not dispatch Stable Release as part of Child B verification.
+Do not dispatch Stable Release in Child B.
 
-- [ ] **Step 6: If cleanup alone fails, verify partial-rerun behavior**
+- [ ] **Step 6: Exercise cleanup-only rerun semantics only if naturally needed**
 
-Use GitHub's “Re-run failed jobs” only when appropriate. Expected contract:
+If cleanup fails, `Re-run failed jobs` may be used to safely remove residue. Confirm that attempt is **not** treated as release qualification because qualify/receipt were not recreated in that same attempt. Then use `Re-run all jobs` and require the new cohesive attempt to pass before qualification is restored.
 
-```text
-earlier successful qualify remains latest qualify execution
-rerun cleanup can locate the earlier persisted receipt
-cleanup succeeds without needs.qualify.outputs
-```
+- [ ] **Step 7: Record final handoff evidence**
 
-If `qualify` is rerun, its newer execution becomes authority and must persist its own receipt before scenario mutation.
-
-- [ ] **Step 7: Record final evidence in the implementation handoff**
-
-Report exact commit SHA, local commands actually run, GitHub CI run ID/result, live E2E run ID/attempt/job results, and any operational setting that was manually verified. Never describe the child as release-qualified without exact final-master evidence.
+Report exact implementation commit SHA, local commands actually run, GitHub CI run ID/attempt/result, live run ID/current attempt/job results, receipt identity, and manually verified environment settings. Never describe Child B as release-qualified without exact final-master cohesive-attempt evidence.
 
 ---
 
 ## Plan Self-Review Checklist
 
-Before execution begins, verify the plan against the approved spec:
-
-- Child B owns CI-produced E2E bundles but not Child A release-byte artifact redesign.
+- Child B owns CI-produced E2E bundles but not Child A release-byte redesign.
 - Fresh credentialed live runner executes no checkout/install/build/compile.
-- Compile-only mode does not even load `.env.github-e2e`.
-- CI artifact contains exactly manifest + three fixed bundles.
-- Newest matching exact-SHA CI run is authority; no historical-success fallback.
-- Pinned `E2E_REPO_ID` is mandatory and source repository ID is rejected.
+- Compile-only mode does not load `.env.github-e2e`.
+- CI artifact contains exactly manifest + three bundles.
+- Newest matching exact-SHA CI run/current attempt is authority; no historical-success fallback.
+- Pinned `E2E_REPO_ID` mandatory; source ID rejected.
 - Shared helper owns destructive-suite safety for all three scenario files.
 - Default-ref capability precedes absent-ref interpretation.
-- Receipt persists before any scenario mutation.
-- Cleanup routing survives partial rerun without `needs.qualify.outputs`.
-- Live receipt is provenance/routing evidence, not proof of test success.
+- Same-attempt receipt persists before scenario mutation.
+- Cleanup independently re-resolves configured route against pinned ID and does not depend on old-attempt artifacts.
+- Live release qualification never mixes job/artifact evidence across attempts.
+- Cleanup-only partial rerun is maintenance-only; Re-run all jobs restores qualification.
+- Receipt is provenance data, not test-success proof.
 - Source `GITHUB_TOKEN` remains read-only.
 - External Actions are full-SHA pinned repository-wide.
-- Local convenience remains usable with an explicit expected target ID.
-- Manual cleanup no longer has a blind delete path.
-- Final real-GitHub qualification happens only on exact merged `master`; Stable Release is out of scope.
+- Local convenience remains usable with explicit expected target ID.
+- Manual cleanup no longer has blind delete path.
+- Final real-GitHub qualification occurs only on exact merged `master`; Stable Release is out of scope.
