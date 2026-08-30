@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { GITHUB_E2E_BUNDLES, writeGitHubE2EInputManifest } from "../../scripts/github-e2e-input.mjs";
@@ -52,6 +52,25 @@ test("manifest rejects empty or extra entries", async () => {
   const extraDir = await makeBundles();
   await writeFile(resolve(extraDir, "unexpected.txt"), "x");
   await assert.rejects(writeGitHubE2EInputManifest({ outDir: extraDir, env: goodEnv, nodeVersion: "v22.11.0" }), /unexpected entries/u);
+});
+
+test("manifest rejects symlink bundle entries", async t => {
+  const outDir = await makeBundles();
+  const linkPath = resolve(outDir, GITHUB_E2E_BUNDLES[0]);
+  try {
+    await unlink(linkPath);
+    await symlink(resolve(outDir, GITHUB_E2E_BUNDLES[1]), linkPath, "file");
+  } catch (error) {
+    if (["EPERM", "EACCES", "ENOSYS"].includes(error?.code)) {
+      t.skip(`symlink creation is unavailable on this platform: ${error.code}`);
+      return;
+    }
+    throw error;
+  }
+  await assert.rejects(
+    writeGitHubE2EInputManifest({ outDir, env: goodEnv, nodeVersion: "v22.11.0" }),
+    /regular file|symbolic link|symlink/u,
+  );
 });
 
 test("manifest rejects invalid Node version", async () => {
