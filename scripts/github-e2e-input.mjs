@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
-import { mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
-import { resolve } from "node:path";
+import { lstat, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { isAbsolute, relative, resolve, sep } from "node:path";
 import { build } from "esbuild";
 
 export const GITHUB_E2E_ENTRY_POINTS = Object.freeze([
@@ -19,13 +19,77 @@ function required(env, name, pattern) {
   return value;
 }
 
-export async function compileGitHubE2EBundles({ root = process.cwd(), outDir }) {
+function isWithin(parent, child) {
+  const rel = relative(parent, child);
+  return rel !== "" && rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
+}
+
+async function lstatOrNull(path) {
+  try {
+    return await lstat(path);
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+async function assertOwnedTempAncestors(root, outDir) {
+  const tempRoot = resolve(root, ".tmp");
+  if (!isWithin(tempRoot, outDir)) return false;
+
+  await mkdir(tempRoot, { recursive: true });
+  const tempInfo = await lstat(tempRoot);
+  if (tempInfo.isSymbolicLink() || !tempInfo.isDirectory()) {
+    throw new Error("GitHub E2E repository temp root must be a real directory, not a symbolic link.");
+  }
+
+  const rel = relative(tempRoot, outDir);
+  const parents = rel.split(sep).slice(0, -1);
+  let cursor = tempRoot;
+  for (const part of parents) {
+    cursor = resolve(cursor, part);
+    const info = await lstatOrNull(cursor);
+    if (!info) break;
+    if (info.isSymbolicLink() || !info.isDirectory()) {
+      throw new Error(`GitHub E2E output parent is not a real directory: ${cursor}`);
+    }
+  }
+  return true;
+}
+
+export async function prepareGitHubE2EOutputDirectory({ root = process.cwd(), outDir }) {
   if (!outDir) throw new Error("GitHub E2E output directory is required.");
-  await rm(outDir, { recursive: true, force: true });
-  await mkdir(outDir, { recursive: true });
+  const resolvedRoot = resolve(root);
+  const resolvedOutDir = resolve(outDir);
+  if (resolvedOutDir === resolvedRoot) {
+    throw new Error("Refusing to use the repository root as the GitHub E2E output directory.");
+  }
+
+  if (await assertOwnedTempAncestors(resolvedRoot, resolvedOutDir)) {
+    await rm(resolvedOutDir, { recursive: true, force: true });
+    await mkdir(resolvedOutDir, { recursive: true });
+    return resolvedOutDir;
+  }
+
+  const info = await lstatOrNull(resolvedOutDir);
+  if (!info) {
+    await mkdir(resolvedOutDir, { recursive: true });
+    return resolvedOutDir;
+  }
+  if (info.isSymbolicLink() || !info.isDirectory()) {
+    throw new Error("Refusing to use a caller-owned GitHub E2E output path that is not a real directory.");
+  }
+  if ((await readdir(resolvedOutDir)).length > 0) {
+    throw new Error("GitHub E2E output directory is non-empty; refusing to clear a caller-owned output directory.");
+  }
+  return resolvedOutDir;
+}
+
+export async function compileGitHubE2EBundles({ root = process.cwd(), outDir }) {
+  const preparedOutDir = await prepareGitHubE2EOutputDirectory({ root, outDir });
   const outputs = [];
   for (let index = 0; index < GITHUB_E2E_ENTRY_POINTS.length; index++) {
-    const outfile = resolve(outDir, GITHUB_E2E_BUNDLES[index]);
+    const outfile = resolve(preparedOutDir, GITHUB_E2E_BUNDLES[index]);
     await build({
       entryPoints: [resolve(root, GITHUB_E2E_ENTRY_POINTS[index])],
       outfile,
@@ -57,7 +121,8 @@ export async function writeGitHubE2EInputManifest({ outDir, env = process.env, n
   const bundles = [];
   for (const name of GITHUB_E2E_BUNDLES) {
     const file = resolve(outDir, name);
-    const info = await stat(file);
+    const info = await lstat(file);
+    if (info.isSymbolicLink()) throw new Error(`GitHub E2E bundle must not be a symbolic link: ${name}`);
     if (!info.isFile()) throw new Error(`GitHub E2E bundle is not a regular file: ${name}`);
     const bytes = await readFile(file);
     if (bytes.byteLength === 0) throw new Error(`GitHub E2E bundle is empty: ${name}`);
