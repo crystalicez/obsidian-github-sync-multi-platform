@@ -2,121 +2,123 @@
 
 ## Status
 
-Child design of `2026-08-30-release-e2e-runtime-hardening-followup-design.md`.
+Child design of `2026-08-30-release-e2e-runtime-hardening-followup-design.md` for baseline `35e98cea924702293bde62d064a83d52eca6d898`.
 
-Repository baseline: `35e98cea924702293bde62d064a83d52eca6d898`.
-
-This child owns recoverable publication-race classification, retry semantics, empty-repository concurrent initialization, missing folder-causality evidence, and Copy-conflict recovery integration.
+Revised after formal red-team review on 2026-08-30. This child owns evidence-based publication-race classification, bounded/indeterminate reconciliation, empty-repository/config-discovery races, retry UX, missing folder-causality evidence, and Copy-conflict recovery integration.
 
 ## Goal
 
-Replace human-readable stale-ref heuristics with structured evidence-based publication-race handling while preserving existing user-visible retry behavior and proving folder/Copy recovery semantics before modifying V4 causality.
+Replace stale-ref message heuristics with structured Git-state evidence while preserving current user-visible retry behavior and proving folder/Copy recovery semantics before changing V4 causality.
 
 ## Non-goals
 
-This child does not redesign the V4 planner/coordinator/session wholesale, add server-side CAS semantics GitHub does not provide, change local-primary Copy policy, change Force operation UX beyond compatibility, move recovery assertions into fast tests, or add watcher-noise behavior without reproducible evidence.
+This child does not add server-side CAS GitHub does not provide, redesign the planner/coordinator wholesale, change local-primary Copy policy, change Force Push/Force Pull behavior beyond preserving current publication-race retry compatibility, add watcher-noise behavior without a deterministic production-relevant regression, or expand recovery assertions into the fast tier.
 
 ---
 
-# 1. Existing Behavioral Contract
+# 1. Existing Retry Compatibility
 
-## 1.1 Production runtime
+Production runtime currently has two distinct retry policies:
 
-Current runtime retries for:
+```text
+publication/stale-head wording
+-> retry regardless of operation
+-> maximum three outer attempts
 
-1. branch-head/stale-ref message wording,
-2. `V4RecoveryReplanRequiredError` during Normal sync.
+V4RecoveryReplanRequiredError
+-> retry only for Normal
+-> maximum three outer attempts
+```
 
-The branch-race wording path is not restricted by operation. Compatibility is therefore:
+The typed migration preserves that behavior:
 
 ```text
 V4PublicationRaceError
-→ retry regardless of request.operation
-→ maximum three outer attempts
+-> retry regardless of request.operation
 
 V4RecoveryReplanRequiredError
-→ retry only for request.operation == normal
-→ same bounded outer attempt loop
+-> retry only when request.operation == normal
 ```
 
-Narrowing Force Push/Force Pull retry later requires a separate UX design.
-
-## 1.2 Live-E2E wrappers
-
-Current wrappers in:
+The two live E2E wrappers currently retry stale-head wording only for Normal sync; they keep that harness policy after migrating to the typed predicate:
 
 ```text
 tests/github-e2e/v4-real-github-e2e.test.ts
 tests/github-e2e/v4-copy-contract-github-e2e.test.ts
 ```
 
-retry branch-race wording only for Normal sync. They keep Normal-only wrapper retry after moving to typed classification.
-
-Production and E2E share classification, not identical retry policy.
+Production and live harness therefore share race classification but intentionally not identical retry policy.
 
 ---
 
 # 2. Structured Publication-Race Error
 
-Introduce one shared type, for example:
+Introduce one shared error type/predicate, conceptually:
 
 ```ts
-export class V4PublicationRaceError extends Error {
-  readonly code = "V4_PUBLICATION_RACE"
-
-  constructor(
-    readonly phase: "bootstrap" | "pre-publish" | "reconcile",
-    readonly expectedHeadSha: string | null,
-    readonly observedHeadSha: string | null,
-    readonly cause?: unknown,
-    message = "Remote branch changed while publishing sync state.",
-  ) { ... }
+V4PublicationRaceError {
+  code: "V4_PUBLICATION_RACE"
+  phase: "bootstrap-config" | "bootstrap-publish" | "pre-publish" | "post-publish"
+  expectedHeadSha: string | null
+  observedHeadSha: string | null
+  publicationOutcome: "published" | "not-published" | "unknown"
+  cause?: unknown
 }
 ```
 
-Exact placement is a planning detail, but it must be importable by Git publication code, production runtime, and real-GitHub E2E bundles.
+Exact naming/file placement is a plan detail.
 
-Retry decisions use type/predicate, never message regex.
+Retry decisions use this type/predicate only, never message regex.
 
-The type carries structured expected/observed head evidence and original cause where available.
+Structured fields are for recovery/logging/diagnostics. The user-facing terminal message remains concise and does not expose raw SHA/CAS internals by default.
 
 ---
 
-# 3. Publication Reconciler Is the Classification Authority
+# 3. Reconciler Is the Post-Mutation Classification Authority
 
 ## 3.1 One state machine
 
-The codebase already has candidate-publication reconciliation. Extend that authority rather than adding a second stale-head classifier around ad-hoc ref reads.
+`reconcileV4CandidatePublication()` remains the central authority for post-mutation evidence. Do not add a second independent stale-head classifier around ad-hoc ref reads.
 
-Semantically the reconciler distinguishes:
-
-```text
-candidate is current/published
-candidate was published and branch later advanced
-candidate was not published and expected head still holds
-branch diverged away from candidate/expected base
-```
-
-Existing status names may remain implementation details; semantic mapping is authoritative.
-
-## 3.2 Result mapping after mutation failure/uncertainty
+The result model must distinguish:
 
 ```text
-candidate published/current
-→ success; no outer retry
-
-candidate published then branch advanced
-→ V4PublicationRaceError(expected, observed advanced head)
-
-expected head still current; candidate not published
-→ preserve original mutation failure classification
-→ existing unknown-outcome policy may perform its one evidence-based mutation retry
-
-branch diverged
-→ V4PublicationRaceError(expected, observed diverged head)
+published
+published-advanced
+not-published
+indeterminate
 ```
 
-This prevents a lost response after successful publication from becoming a false race/replay.
+A separately named `diverged` state may remain only if it represents evidence stronger than the indeterminate cases below; it must not be returned merely because an evidence traversal stopped early.
+
+## 3.2 Evidence mapping
+
+After any ref mutation failure where reconciliation can be attempted:
+
+```text
+candidate is current head
+-> treat mutation as successful
+-> no outer retry
+
+candidate/marker-equivalent is proven in current ancestry and branch advanced
+-> V4PublicationRaceError
+   publicationOutcome = published
+
+expected head is still current
+-> preserve original mutation failure
+-> for outcome-unknown transport failures, retain the existing single evidence-based low-level retry policy
+
+current head differs from expected and candidate publication cannot be proven
+-> outer operation must replan
+-> V4PublicationRaceError
+   publicationOutcome = unknown
+
+reconciliation cannot even establish trustworthy current-head state
+-> do not invent race/success
+-> preserve original mutation failure as primary failure
+```
+
+This handles both outcome-unknown and definitive API failures such as a competing ref update that returns a validation error.
 
 ## 3.3 Pre-publish mismatch
 
@@ -124,343 +126,288 @@ Immediately before candidate ref mutation:
 
 ```text
 observed current head != expected candidate base
-→ V4PublicationRaceError(
-     phase="pre-publish",
-     expectedHeadSha=<base>,
-     observedHeadSha=<current>
+-> V4PublicationRaceError(
+     phase = pre-publish,
+     publicationOutcome = not-published,
+     expected = candidate base,
+     observed = current head
    )
-→ no mutation attempted
+-> no mutation attempt
 ```
 
 ## 3.4 Cause preservation
 
-When a race is derived after a transport/API failure, preserve that original failure as `cause` for diagnostics.
-
-User-facing terminal messaging does not expose raw SHA/CAS internals by default.
-
-## 3.5 Reconciliation itself can fail
-
-A follow-up reconciliation read can itself fail because of transport, rate limit, permission, or API errors.
-
-If reconciliation cannot establish publication state:
-
-- do not invent a publication race,
-- do not claim candidate success,
-- preserve/propagate the original mutation failure as the primary failure when one exists,
-- retain reconciliation failure as diagnostic cause/context if the implementation can do so without obscuring the primary error.
-
-The retry classifier requires positive state evidence, not merely failure of the evidence-gathering step.
+When race evidence is derived after an API/transport failure, preserve the original failure as diagnostic cause.
 
 ---
 
-# 4. Empty-Repository Concurrent Initialization
+# 4. Bounded Traversal and Indeterminate Evidence
 
-## 4.1 Failure mode
+The current reconciler bounds ancestry traversal. A bound is necessary for resource control, but exhausting it is not proof that the candidate is unrelated.
 
-Two devices can observe a truly empty GitHub repository concurrently. One initializes repository/ref state while the other still plans under an empty-remote assumption.
-
-The losing writer may receive a definitive mutation error even though the correct higher-level action is a full replan.
-
-## 4.2 Required behavior
+Example:
 
 ```text
-session observed empty remote
-        ↓
-bootstrap/init mutation loses
-        ↓
-re-observe repository/configured ref state
-        ↓
-writer-created state now exists
-        ↓
-V4PublicationRaceError(
-  phase="bootstrap",
-  expectedHeadSha=null,
-  observedHeadSha=<new head>,
-  cause=<bootstrap failure>
-)
-        ↓
-outer runtime retry reloads config/index/recovery/remote and replans whole operation
+candidate published
+-> branch advances more than traversal bound
+-> later recovery cannot reach candidate within bound
 ```
 
-Do not silently adopt the new head inside the already-planned session.
+Returning a definitive unrelated/diverged result in that case would overstate evidence.
 
-## 4.3 Non-race bootstrap failures
+Required semantics:
 
-If re-observation does not prove newly created remote/ref state, propagate the original bootstrap failure.
+- if queue/traversal completes and all required reads succeeded, use the strongest proven result,
+- if traversal bound is exhausted while unexplored ancestry remains, return `indeterminate`,
+- if an ancestry commit needed for classification cannot be read, return `indeterminate` rather than silently skipping it into a definitive negative conclusion,
+- cancellation still propagates as cancellation,
+- `indeterminate` records known current head plus reason such as `traversal-limit` or `ancestry-read-failure`.
 
-Unknown mutation outcomes continue through existing mutation-outcome reconciliation before higher-level classification.
+For runtime publication handling, `indeterminate` plus a current head different from expected is enough to require an outer replan, but it is **not** evidence that the candidate was or was not previously published.
 
-If the bootstrap re-observation itself fails, absence of evidence is not race evidence; propagate the primary failure with diagnostics.
+For recovery, indeterminate publication history must never populate `verifiedRemoteHead` as though candidate publication were proven. Recovery moves to conservative replan-required state while retaining stable conflict-copy identity/stages only under their existing safe lifetime rules.
 
 ---
 
-# 5. Runtime Retry and User Flow
+# 5. Empty-Repository Races
 
-## 5.1 Same user action, bounded attempts
+## 5.1 Publish-time concurrent initialization
 
-A publication race is retried inside the same user-triggered sync action with the existing three-attempt bound.
+Two devices may observe an empty repository/branch and race to initialize it.
 
-On retry:
+When one create-ref/bootstrap writer loses and re-observation shows another writer's head now exists:
 
-- phase becomes `retrying`,
-- visible attempt advances,
-- remote config/index/recovery are loaded fresh,
-- planning recomputes,
-- logical `runState` remains available where Copy/recovery requires stable conflict-copy reservation.
+```text
+V4PublicationRaceError(
+  phase = bootstrap-publish,
+  expectedHeadSha = null,
+  observedHeadSha = new head,
+  publicationOutcome = unknown,
+  cause = original mutation failure
+)
+```
 
-## 5.2 Terminal UX
+The outer runtime retries and replans from fresh remote/config/index state. The losing session never silently adopts the new head inside a plan derived from empty-remote assumptions.
 
-Attempts before exhaustion stay transparent except for progress.
+If bootstrap fails and no new remote state can be proven, preserve the original failure.
 
-After the final typed race, present actionable wording such as:
+## 5.2 Remote appears after speculative config discovery
+
+There is an earlier race before publication:
+
+```text
+runtime observes no V4 remote
+-> runtime creates speculative new config (encrypted mode may create new random KDF salt)
+-> another device initializes V4
+-> session starts and sees winner's remote config
+```
+
+The session must not proceed to decode/decrypt remote state with the speculative loser's config/keyring.
+
+Required design:
+
+- runtime/session carry whether the selected config came from observed remote state or was speculative for an empty remote,
+- when a speculative-empty config reaches session startup, remote config existence is checked before using the speculative codec/keyring for remote state,
+- if another valid V4 remote now exists, throw `V4PublicationRaceError` with phase `bootstrap-config` and replan the whole outer operation,
+- next attempt loads the winner's actual config/KDF and derives the correct keyring fresh,
+- malformed/non-V4 remote state still follows existing explicit migration/Force Push errors rather than being mislabeled automatically as a race.
+
+This test is required for plaintext and especially encrypted mode so a recoverable concurrent initialization cannot surface as a misleading authentication/decryption failure.
+
+---
+
+# 6. Runtime Retry and User Flow
+
+One user-triggered sync action owns one logical `runState` and up to three outer attempts.
+
+On publication race:
+
+- progress becomes `retrying`,
+- attempt number advances,
+- remote config/index/recovery state are loaded fresh,
+- planning is recomputed,
+- stable logical Copy reservations in the same `runState` remain available where current recovery contract requires them.
+
+Attempts 1->2->3 are transparent except progress.
+
+If the final attempt still ends in publication race, user-facing error is actionable, for example:
 
 ```text
 Remote branch changed repeatedly while syncing. Please try again.
 ```
 
-Structured logs retain phase, expected/observed SHA, cause, attempt, and operation.
+Structured logs retain operation, attempt, phase, expected/observed head, publication outcome/evidence, and cause without secrets/plaintext payloads.
 
-## 5.3 Message wording is not authority
-
-```ts
-new Error("stale ref")
-```
-
-is not retryable by wording alone.
-
-A `V4PublicationRaceError` remains retryable even with unrelated human-readable text.
+A generic `new Error("stale ref")` is not retryable unless publication code converted it from actual Git-state evidence. A typed race remains retryable even when its human message contains no stale/race wording.
 
 ---
 
-# 6. Live-E2E Retry Consumers
+# 7. Live-E2E Retry Consumers
 
-Both wrappers move from regex to shared typed detection:
+Both precompiled live bundles migrate from regex classification to the shared race predicate:
 
 ```text
 v4-real-github-e2e.test.ts
 v4-copy-contract-github-e2e.test.ts
 ```
 
-Policy remains:
+Their harness behavior remains:
 
 ```text
 V4PublicationRaceError
 AND operation == normal
 AND attempt < 3
-→ retry
+-> retry
 ```
 
-Force operations do not gain harness-level retry.
+Force operations do not gain harness-level retry behavior.
 
-Harness-specific conflict-copy stage clearing may remain because these wrappers do not model full production recovery storage.
+Harness-specific conflict-stage clearing may remain because these wrappers do not model the complete production recovery-store lifecycle.
 
-The shared type must compile into precompiled live-E2E bundles.
+The CI E2E compile artifact from Child B must bundle the shared error predicate successfully.
 
 ---
 
-# 7. Folder Conflict Evidence
+# 8. Folder Conflict Evidence Before Core Changes
 
-## 7.1 Production-change rule
+For every folder regression:
 
 ```text
-write deterministic expected regression
+write deterministic regression
 run against current production
-PASS → no V4 causality change
-FAIL → keep regression + smallest production correction
+PASS -> do not change V4 causality
+FAIL -> keep failing regression and make smallest correction
 ```
 
-No refactor is justified by theoretical complexity alone.
+Tests exercise actual queued folder events, not synthetic independent file renames:
 
-## 7.2 Exercise actual folder events
-
-Tests must send production folder-event shapes rather than simulating folders with independent file events, e.g.:
-
-```ts
+```text
 { type: "folderRename", oldPath: "folder", path: "moved" }
 { type: "folderDelete", path: "folder" }
 ```
 
-A nested chain should be one logical batch when supported:
-
-```text
-folder -> middle
-middle -> final
-```
-
-with final filesystem state at `final/*`.
-
-## 7.3 Multi-descendant shape
-
-Primary scenarios start with:
+Each primary scenario starts with at least:
 
 ```text
 folder/edited.md
 folder/untouched.md
 ```
 
-Only `edited.md` gets the stale competing edit; `untouched.md` proves one-sided sibling propagation under the same folder event.
+Only `edited.md` receives stale competing modification. `untouched.md` proves one-sided folder propagation for a sibling under the same event.
 
-## 7.4 Remote folder rename vs stale edited descendant
+Required scenarios/expected contract:
 
-Remote renames `folder -> moved`.
+### Remote folder rename vs stale edited descendant
 
-Expected:
-
-- stale edited lineage canonical at `folder/edited.md`, original identity,
-- remote `moved/edited.md` competitor preserved exactly once as distinct conflict-copy identity,
-- untouched sibling moves to `moved/untouched.md`, identity preserved,
-- no intermediate/duplicate paths,
+- stale edited lineage remains canonical at original path/identity,
+- remote competitor from renamed path is preserved exactly once as conflict copy,
+- untouched sibling follows remote rename and keeps identity,
+- no duplicate/intermediate paths,
 - fresh-device convergence.
 
-## 7.5 Remote folder delete vs stale edited descendant
+### Remote folder delete vs stale edited descendant
 
-Expected:
-
-- stale edited `folder/edited.md` survives canonical with original identity,
-- no remote-body conflict copy invented for absent remote lineage,
-- untouched sibling deleted,
+- stale locally edited file remains canonical/original identity,
+- no absent-body conflict copy,
+- untouched sibling follows remote deletion,
 - fresh-device convergence.
 
-## 7.6 Remote folder delete vs stale delete/recreate
+### Remote folder delete vs stale delete/recreate descendant
 
-Expected:
-
-- recreated `folder/edited.md` survives canonical,
-- recreated file has new identity,
-- old identity stays deleted,
-- untouched sibling follows remote delete,
+- recreated canonical path survives with new identity,
+- old identity remains deleted,
+- untouched sibling follows remote deletion,
 - no absent-body conflict copy.
 
-## 7.7 Nested folder rename chain
+### Nested folder rename chain
 
-Expected:
+Exercise one logical batch where possible:
 
-- stale edited lineage remains at original path,
-- remote final edited lineage becomes one conflict copy derived from `final/edited.md`,
-- untouched sibling ends at `final/untouched.md` with identity preserved,
-- no `middle/*` paths.
+```text
+folder -> middle
+middle -> final
+```
 
-## 7.8 Case-only folder rename
+Final filesystem state is `final/*`; stale edited lineage/conflict semantics remain correct; untouched sibling reaches `final/untouched.md`; no `middle/*` survives.
 
-One-sided `Folder -> folder` with multiple descendants:
+### Case-only rename
 
-- identities stable,
-- one normalized path per descendant,
-- casing alone does not create conflict copy.
+Multiple descendants preserve identities and do not create conflict copies when no normalized-namespace collision exists.
 
-## 7.9 NFC/case namespace collision
+### NFC/case namespace collision
 
-Different identities colliding under `NFC + lowercase` must fail before mutation, report collision, and neither choose a winner nor evade the invariant through conflict-copy creation.
+Different identities that would occupy one `NFC + lowercase` namespace fail before mutation; no winner/conflict-copy workaround bypasses the namespace invariant.
 
-All folder regressions assert exact paths, bytes, identity continuity/discontinuity, copy count, unrelated-overwrite absence, and fresh-device convergence when valid.
+Assertions cover exact paths, bytes, identities, conflict-copy count, no unrelated overwrite, and fresh-device convergence where valid.
 
 ---
 
-# 8. Copy + Publication Race + Recovery Integration
+# 9. Copy + Publication Race + Recovery Integration
 
-## 8.1 Fast UX evidence
-
-Keep/add a fast runtime test proving:
+Keep/add a fast runtime user-flow regression:
 
 ```text
-one manual action
-→ publication attempt races
-→ automatic retry
-→ progress attempt 2
-→ success
+one manual sync
+-> first publication attempt races
+-> automatic retry
+-> visible attempt reaches 2
+-> final success
 ```
 
-It does not deeply inspect persisted recovery storage.
-
-## 8.2 Recovery-tier integration
-
-Add:
+Add a recovery-tier integration:
 
 ```text
 shared base
-→ local edit + remote edit
-→ Copy conflict resolution
-→ remote conflict-copy body staged
-→ candidate publication races
-→ reconciliation/replan/recovery
-→ exactly one final conflict copy
-→ index/recovery committed
+-> local edit + remote competitor
+-> Copy conflict reserves/stages remote copy
+-> candidate publication races
+-> reconcile/replan/recovery
+-> exactly one final conflict copy
+-> index/recovery reaches committed terminal boundary
 ```
 
-Assert:
+Required assertions:
 
 - local canonical bytes preserved,
-- remote competitor exactly once,
-- conflict-copy path and identity stable within logical run,
-- invalid stale stage references not reused,
-- no duplicate copy path/logical record,
-- final remote/index agree,
-- recovery reaches committed/cleared boundary,
+- remote competitor preserved exactly once,
+- logical conflict-copy path/file identity stable within run,
+- invalid stale stages not reused,
+- no duplicate conflict path/record,
+- final remote/index agreement,
+- recovery terminal boundary correct,
 - fresh device converges.
 
-Recovery/stage assertions remain under `tests/recovery/`.
+Deep stage/recovery lifetime assertions remain under `tests/recovery/`.
 
 ---
 
-# 9. Required Tests
+# 10. Focused Publication Tests
 
-Publication classification tests cover:
+Required regressions include:
 
-- pre-publish mismatch → typed race,
-- expected/observed structured evidence,
-- mutation failure but candidate current → success,
-- published-advanced → typed race,
-- diverged → typed race,
-- expected-head/not-published → original failure,
-- reconciliation failure does not invent race/success,
-- original cause preserved when race established,
-- generic `stale ref` message no retry,
-- typed race with unrelated message retries,
-- production retry bound three,
-- Force publication-race compatibility preserved,
-- recovery-replan Normal-only,
+- pre-publish mismatch -> typed race/no mutation,
+- candidate current after failed response -> success/no outer retry,
+- candidate ancestor/marker equivalent -> published-advanced typed race,
+- expected head current -> original failure preserved,
+- current head advanced but publication history unknown -> typed race with `publicationOutcome=unknown`,
+- traversal bound exhausted -> indeterminate, never false definitive divergence,
+- ancestry read failure -> indeterminate,
+- current-head/ref read failure -> original mutation failure, not invented race,
+- original failure retained as cause when race is derived,
+- generic stale-ref wording does not retry,
+- typed race with unrelated wording retries,
+- runtime bound remains three,
+- runtime Force Push/Force Pull publication-race retry compatibility preserved,
+- recovery-replan remains Normal-only,
 - both live wrappers typed + Normal-only,
-- concurrent empty-repo loser replans,
-- bootstrap failure without new state remains original,
-- E2E compile includes shared type.
-
----
-
-# 10. Observability
-
-Log only structured non-secret publication fields:
-
-```text
-operation
-attempt
-phase
-expected head
-observed head
-reconciliation status
-cause class/message
-```
-
-Do not log tokens, passphrases, plaintext encrypted payloads, or conflict body contents.
-
-Count outer logical publication retries separately from transport retries.
+- empty-ref competing initializer replans,
+- remote V4 appearing after speculative config discovery replans before decrypt,
+- encrypted version of that race derives winner keyring on retry,
+- non-race bootstrap failure remains original failure,
+- CI precompiled E2E bundle includes shared race type.
 
 ---
 
 # 11. Acceptance Criteria
 
-Complete only when:
-
-- production retry no longer depends on stale-ref wording,
-- candidate reconciler is central post-mutation classification authority,
-- reconciliation failure itself never becomes false race/success evidence,
-- candidate-head idempotent success is preserved,
-- advanced/diverged evidence produces typed race,
-- empty-repository concurrent initialization replans the full operation,
-- non-evidenced bootstrap failures remain original errors,
-- runtime preserves operation-agnostic publication-race retry + Normal-only recovery replan,
-- repeated-race terminal UX is actionable,
-- both live wrappers use typed race while remaining Normal-only,
-- folder tests exercise actual folder events with multiple descendants,
-- folder rename/delete/recreate/case/NFC outcomes assert path/byte/identity semantics,
-- Copy + publication-race recovery proves exactly-once stage/copy behavior,
-- production V4 causality changes only for a demonstrated failing regression.
+Complete only when message regex no longer controls production/live publication retry; reconciliation is the central post-mutation authority; bounded/incomplete ancestry evidence is explicitly indeterminate; candidate-head idempotent success is preserved; advanced head with uncertain publication outcome replans conservatively; reconciliation failure does not invent success/race without head evidence; both publish-time and pre-session empty-repository races replan the whole operation; encrypted speculative config cannot cause misleading decrypt failure after a concurrent initializer wins; runtime and E2E retry compatibility are preserved; actual multi-descendant folder events have deterministic evidence; Copy + publication-race recovery proves exactly-once conflict preservation; and production causality changes only for demonstrated failing regressions.
