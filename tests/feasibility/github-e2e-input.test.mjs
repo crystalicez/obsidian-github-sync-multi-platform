@@ -66,3 +66,11 @@ test("CI publishes live E2E input only for master pushes", async () => {
   assert.match(ci, /github-e2e-input-\$\{\{ github\.sha \}\}-\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}/u);
   assert.match(ci, /github\.event_name == 'push' && github\.ref == 'refs\/heads\/master'/u);
 });
+
+test("hidden CI input directory is explicitly included in artifact upload", async () => {
+  const ci = await readFile(resolve(".github/workflows/ci.yml"), "utf8");
+  const start = ci.indexOf("Upload release-qualifying GitHub E2E input");
+  const end = ci.indexOf("Upload tested plugin artifact", start);
+  assert.ok(start >= 0 && end > start);
+  assert.match(ci.slice(start, end), /include-hidden-files:\s*true/u);
+});
