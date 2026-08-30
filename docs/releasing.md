@@ -22,36 +22,60 @@ Commit/merge the version and source changes to `master`, then require ordinary d
 In repository **Settings -> Environments**, create `github-e2e` with:
 
 ```text
+Deployment branches and tags -> Selected branches and tags
+Allowed branch -> master
+Allowed tags -> none
+
 Variable: E2E_OWNER
 Variable: E2E_REPO
+Variable: E2E_REPO_ID
 Secret:   E2E_TOKEN
 ```
 
-The target must be a dedicated disposable repository, not this source repository and not a real notes repository. Prefer a fine-grained token scoped only to the disposable repository with repository Contents read/write permission.
+Do not use **Protected branches only** while `master` has no branch-protection rule. `E2E_REPO_ID` is the pinned numeric authority; owner/repository text is routing only. The target must be an initialized dedicated disposable repository, not this source repository and not a real notes repository. The release-qualifying target credential must have mutable scope only to that target repository.
 
-See `docs/github-e2e.md` for branch isolation and cleanup details.
+See `docs/github-e2e.md` for branch isolation, target-ID checks, cleanup evidence, and rerun semantics.
 
 ## 3. Qualify the exact master SHA
 
-In **Actions -> GitHub E2E Live -> Run workflow**, select `master` and start the workflow.
+Before dispatching the live workflow, require ordinary CI for the exact current `master` SHA to complete successfully. The current CI attempt must publish the exact release-qualifying artifact:
 
-A qualifying run requires:
+```text
+github-e2e-input-<master-sha>-<ci-run-id>-<ci-current-attempt>
+```
 
-- source ref is `master`,
-- dispatched `github.sha` is still the current `master` SHA,
-- target E2E repository is not the source repository,
-- job **qualify** succeeds,
-- job **cleanup** succeeds.
+Then in **Actions -> GitHub E2E Live -> Run workflow**, select `master` and start the workflow.
 
-The audit artifact is optional evidence. Stable release trusts exact-SHA workflow/job metadata, not artifact retention.
+The Child-B qualification flow is:
 
-If `master` changes after qualification, the old run cannot qualify the new tip. Run GitHub E2E Live again.
+```text
+ordinary CI exact master/current attempt succeeds
+-> current github-e2e-input artifact exists
+-> GitHub E2E Live current attempt consumes and verifies it
+-> same-attempt receipt persists before target mutation
+-> qualify succeeds
+-> cleanup succeeds in the same current attempt
+```
+
+A release-qualifying live run requires its **current/latest workflow attempt** to be cohesive:
+
+- source ref is `master` and dispatched `github.sha` is still current `master`,
+- newest exact-SHA ordinary CI `push` run is the authoritative producer and its current attempt/`verify` job succeeded,
+- the selected CI E2E artifact is unexpired and bound to that producer/source SHA,
+- pinned target repository ID differs from the source repository ID and its actual default Git ref is readable,
+- same-attempt qualification receipt exists before scenario mutation and binds source, CI producer/artifact, and target identity,
+- job **qualify** executes in that attempt and succeeds,
+- job **cleanup** executes in that same attempt and succeeds.
+
+If cleanup fails, **Re-run failed jobs** may be used to remove residue safely. That cleanup-only attempt is not release qualification. Use **Re-run all jobs** to create a new cohesive current attempt before release qualification is restored.
+
+If `master` changes after qualification, or ordinary CI is rerun for the same SHA and a newer producer attempt becomes authoritative, the previous live evidence is stale. Run **GitHub E2E Live** again.
 
 ## 4. Create a stable release
 
 In **Actions -> Stable Release -> Run workflow**, select `master` and enter the exact stable `x.y.z` version already present in `package.json`/`manifest.json`.
 
-Before publication the workflow verifies:
+Before publication the current Stable Release workflow verifies:
 
 - requested version/compatibility metadata are consistent,
 - requested stable version is monotonic and its tag/release does not already exist,
@@ -66,6 +90,8 @@ Only then does the workflow call `gh release create` for the exact qualified SHA
 - `manifest.json`,
 - `styles.css`,
 - packaged plugin ZIP.
+
+The Stable Release publication implementation itself is not redesigned by the live-E2E safety work described above; publication hardening belongs to the separate release child design.
 
 ## Branch candidate builds
 
@@ -97,7 +123,7 @@ corepack pnpm test:repeat
 corepack pnpm test:recovery
 corepack pnpm test:resource
 corepack pnpm test:feasibility
-GITHUB_E2E_COMPILE_ONLY=1 corepack pnpm test:github-e2e:quick
+corepack pnpm test:github-e2e:compile
 corepack pnpm validate:package
 ```
 
