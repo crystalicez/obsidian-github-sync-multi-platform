@@ -1,11 +1,9 @@
 # Superseded Plan
 
-This implementation plan was superseded during `writing-plans` self-review.
-
 Do not execute this file.
 
-Canonical plan:
+Canonical execution-ready plan:
 
-`docs/superpowers/plans/2026-08-30-live-github-e2e-safety-final.md`
+`docs/superpowers/plans/2026-08-30-live-github-e2e-safety-execution-ready.md`
 
-Reason: the earlier plan explored cross-attempt qualification/cleanup behavior before the design was simplified to one cohesive current workflow attempt.
+This pointer is retained only to preserve `writing-plans` review history.
