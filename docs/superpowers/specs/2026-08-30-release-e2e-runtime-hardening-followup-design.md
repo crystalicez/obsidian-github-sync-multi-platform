@@ -33,7 +33,7 @@ This follow-up does not:
 - claim workflow checks can make repository state immutable against an administrator who retains write authority,
 - migrate the V4 protocol `repoId` from `owner/repo#branch` to GitHub's numeric repository ID.
 
-The final point is important: numeric GitHub repository IDs are used in this design for **workflow safety boundaries only**. The current V4 protocol scopes encryption/key derivation and remote identity using its existing string `repoId`; changing that is a separate protocol/migration problem.
+Numeric GitHub repository IDs are used in this design for **workflow safety boundaries only**. The current V4 protocol scopes encryption/key derivation and remote identity using its existing string `repoId`; changing that is a separate protocol/migration problem.
 
 ---
 
@@ -55,7 +55,7 @@ It also checks tag absence early, performs lengthy work, and finally relies on `
 
 A second issue is credential blast radius. The release job grants `contents: write` for its full lifetime, and checkout currently persists the job token. Build/install/test code should not need repository write authority.
 
-A third issue is policy/enforcement drift: the runbook and acceptance criteria require ordinary exact-SHA CI to pass, but the Stable Release workflow currently enforces only exact-SHA live E2E plus its own rerun of deterministic gates.
+A third issue is policy/enforcement drift: the runbook and acceptance criteria require ordinary exact-SHA CI to pass, but Stable Release currently enforces only exact-SHA live E2E plus its own deterministic rerun.
 
 ## 1.2 Two-job authority model
 
@@ -81,16 +81,18 @@ Responsibilities:
 - install with frozen pnpm lockfile,
 - build,
 - run fast/repeat/recovery/resource/feasibility gates,
-- compile real-GitHub E2E harness,
+- compile the real-GitHub E2E harness,
 - validate package,
 - package the exact release ZIP,
-- create a release-input manifest,
-- upload one blocking release-input artifact for the same workflow run.
+- create a release-input integrity manifest,
+- upload one blocking release-input artifact for this same workflow run.
 
 The release-input manifest records at least:
 
 ```text
 schemaVersion
+workflowRunId
+repositoryId
 commitSha
 version
 asset file names
@@ -132,11 +134,23 @@ The publish job must be deliberately small:
 - no repository build/test code,
 - no third-party action required for publication.
 
-It obtains the release-input artifact created by `verify` from the **same workflow run**, using GitHub API/CLI, expands it, verifies its recorded `commitSha` and `version`, and verifies every recorded SHA-256/size before mutation.
+It locates the release-input artifact created by `verify` from the **same workflow run** through GitHub's Actions artifact API. Artifact metadata must prove at least:
 
-The write-capable job then performs only repository-state verification and publication commands.
+```text
+artifact is not expired
+artifact workflow_run.id == GITHUB_RUN_ID
+artifact workflow_run.head_sha == GITHUB_SHA
+artifact workflow_run.repository_id == GITHUB_REPOSITORY_ID
+artifact name is the exact expected release-input artifact name
+```
 
-This is the primary credential-compartmentalization boundary. A write-capable `GITHUB_TOKEN` is not present during dependency installation or repository code execution.
+When the API exposes an artifact SHA-256 digest, the downloaded artifact archive must match that digest before extraction.
+
+After extraction, the publish job verifies the embedded release-input manifest and recomputes every listed asset's size and SHA-256. The manifest's `workflowRunId`, `repositoryId`, `commitSha`, and `version` must match the current workflow context/input.
+
+Only then may the write-capable job mutate repository state.
+
+This is the primary credential-compartmentalization boundary: repository write authority is not present during dependency installation or repository code execution.
 
 ## 1.3 Exact-SHA CI qualification
 
@@ -154,7 +168,7 @@ job "verify" == success
 
 A PR-only, manually-dispatched, stale, skipped, or different-SHA run does not qualify.
 
-Stable Release still reruns its deterministic gates. CI qualification and release-time deterministic verification are intentionally redundant: the former proves the normal master pipeline passed; the latter proves release inputs were regenerated and tested in the release workflow itself.
+Stable Release still reruns deterministic gates. CI qualification and release-time verification are intentionally redundant: the former proves the normal master pipeline passed; the latter proves the release inputs were regenerated and tested in the release workflow itself.
 
 ## 1.4 Exact-SHA live qualification
 
@@ -181,13 +195,15 @@ Immediately before tag creation it re-reads **remote GitHub state** and requires
 current master == GITHUB_SHA
 requested version is still canonical
 no conflicting version tag exists
-no release, including draft state visible to the authenticated workflow, uses the requested tag
+no release, including authenticated-visible draft release state, uses the requested tag
 requested version is greater than every currently observed canonical stable tag
 ```
 
-Highest-version calculation must use remote tag state observed at publication time, not only local checkout tags from hours earlier.
+Remote tag and release enumeration must cover all pages needed to establish these facts; first-page-only checks are insufficient as a long-term contract.
 
-The workflow must not claim the monotonic check is globally atomic across different tag names. An external administrator can create another higher version between the maximum-tag read and this workflow's tag creation. The workflow's create-only ref operation gives strong atomicity only for the **requested tag name**. Platform-level repository rules/administrator policy remain outside this workflow boundary.
+Highest-version calculation must use remote tag state observed at publication time, not only local checkout tags captured earlier.
+
+The workflow must not claim the monotonic check is globally atomic across different tag names. An external administrator can create another higher version between the maximum-tag read and this workflow's tag creation. The workflow's create-only ref operation gives strong atomicity only for the **requested tag name**. Platform repository rules/administrator policy remain outside this workflow boundary.
 
 ## 1.6 Canonical publication state machine
 
@@ -198,11 +214,11 @@ re-read master and remote publication state
         ↓
 create refs/tags/VERSION -> GITHUB_SHA through create-only Git refs API
         ↓
-read exact tag ref; require lightweight ref object SHA == GITHUB_SHA
+read exact tag ref; require lightweight ref object type=commit and SHA == GITHUB_SHA
         ↓
 create draft release for the existing verified tag
         ↓
-attach the exact verified release-input assets
+attach the exact integrity-verified release-input assets
         ↓
 verify draft tag name + expected complete asset set
         ↓
@@ -210,12 +226,14 @@ re-read exact tag ref; require SHA == GITHUB_SHA
         ↓
 publish the draft
         ↓
-verify release is public, tag name exact, tag SHA exact, asset names/sizes expected
+verify release is public, tag name exact, tag SHA exact, asset names/sizes/digests exact
 ```
 
 `gh release create --target "$GITHUB_SHA"` is no longer the mechanism that establishes tag authority.
 
 A draft is preferred because asset preparation completes before the release becomes public.
+
+For every final release asset, if GitHub's release asset API exposes a `sha256:` digest, it must equal the SHA-256 recorded in the release-input manifest. This closes the byte-integrity chain from the read-only verify job through the published release asset.
 
 ## 1.7 Partial publication failure
 
@@ -249,7 +267,7 @@ Current live qualification:
 - compares `owner/repo` strings to reject the source repository,
 - places the destructive E2E token in job-level environment variables,
 - allows checkout/setup/install/build/upload steps to run in the same job environment where that secret is defined,
-- validates repository identity only in the workflow guard, while the test runner continues to address the repository by mutable owner/name strings,
+- validates repository identity only in the workflow guard, while the runner continues to address the repository by mutable owner/name strings,
 - lets cleanup treat branch 404 as success without first proving the intended repository identity is reachable.
 
 ## 2.2 Secret compartmentalization
@@ -264,14 +282,14 @@ GITHUB_E2E_REPO
 GITHUB_E2E_BRANCH
 ```
 
-The secret token is supplied only to steps that need destructive target-repository access:
+The secret token is supplied only to steps that need target-repository access:
 
 1. target-repository identity guard,
 2. real GitHub E2E execution.
 
 Checkout/setup/install/build/audit-upload steps do not receive the E2E token.
 
-Cleanup similarly passes `E2E_TOKEN` only to its single cleanup/verification step.
+Cleanup similarly passes `E2E_TOKEN` only to its cleanup/verification step.
 
 The workflow-level `GITHUB_TOKEN` remains read-only in live E2E qualification.
 
@@ -302,7 +320,7 @@ If that output was never produced, destructive work must not have started.
 
 ## 2.4 Revalidation inside the destructive runner
 
-Workflow validation alone is not enough because the runner ultimately sends requests using `owner/repo` strings.
+Workflow validation alone is not sufficient because the runner ultimately sends requests using `owner/repo` strings.
 
 The live workflow passes:
 
@@ -320,9 +338,9 @@ branch != resolved default_branch
 branch matches the disposable branch contract
 ```
 
-The runner should then use the resolved canonical `full_name` for child-process owner/repo environment values so capitalization/rename aliases do not become its primary identity.
+The runner then uses the resolved canonical `full_name` for child-process owner/repo environment values so capitalization/rename aliases do not become its primary identity.
 
-Inside the real E2E suite, each scenario reset/delete boundary must re-resolve repository metadata and, when `GITHUB_E2E_EXPECTED_REPO_ID` is present, require that the repository ID still matches before deleting/resetting the branch.
+Inside the real E2E suite, each scenario reset/delete boundary re-resolves repository metadata and, when `GITHUB_E2E_EXPECTED_REPO_ID` is present, requires that the ID still matches before deleting/resetting the branch.
 
 The design does not require an identity API call before every Git blob/tree request. Revalidation is required at destructive reset boundaries; fine-grained token scope plus branch isolation provide the remaining defense in depth.
 
@@ -372,7 +390,7 @@ Hard workflow cancellation can still prevent cleanup from running; unique run-de
 
 ## 2.7 Local manual E2E
 
-The local runner should always resolve target metadata before destructive execution and reject the target repository's actual default branch.
+The local runner always resolves target metadata before destructive execution and rejects the target repository's actual default branch.
 
 Name blacklists such as `main/master/production` may remain as defense in depth but are not the authority.
 
@@ -408,7 +426,7 @@ folder/edited.md
 folder/untouched.md
 ```
 
-The stale device changes only `edited.md`; `untouched.md` remains unchanged locally. This proves the engine handles mixed per-descendant outcomes from one folder operation.
+The stale device changes only `edited.md`; `untouched.md` remains unchanged locally. This proves mixed per-descendant outcomes from one folder operation.
 
 ### Remote folder rename vs stale edited descendant
 
@@ -507,24 +525,24 @@ Recovery-store/stage-lifetime assertions stay in `tests/recovery/` rather than b
 
 ## 4.1 Existing behavior to preserve
 
-The current runtime has two different retry reasons:
+The current runtime has two retry reasons:
 
 1. branch-head/stale-ref message matches,
 2. `V4RecoveryReplanRequiredError` for Normal sync.
 
-The first path is currently **not restricted to Normal sync**. Therefore this refactor must not silently change operation semantics.
+The first path is currently **not restricted by `request.operation`**. Therefore this refactor must not silently change operation semantics.
 
-The compatibility contract for this follow-up is:
+Compatibility contract:
 
 ```text
 V4PublicationRaceError
-→ bounded runtime retry for the operations that currently receive branch-race retry behavior, including Force Push where publication races can occur
+→ bounded runtime retry regardless of request.operation, preserving the current branch-race retry path; only operations that actually reach a publication race will observe it
 
 V4RecoveryReplanRequiredError
 → retry only for Normal sync, as today
 ```
 
-If a future design wants different force-operation semantics, that is a separate behavior change with explicit UX tests.
+A future decision to change force-operation behavior is a separate UX/behavior change.
 
 The retry bound remains three attempts.
 
@@ -536,7 +554,7 @@ Introduce a shared publication-boundary error, for example:
 export class V4PublicationRaceError extends Error {
   readonly code = "V4_PUBLICATION_RACE"
   constructor(
-    readonly phase: "pre-publish" | "post-mutation-failure" | "reconcile",
+    readonly phase: "bootstrap" | "pre-publish" | "post-mutation-failure" | "reconcile",
     readonly expectedHeadSha: string | null,
     readonly observedHeadSha: string | null,
     readonly cause?: unknown,
@@ -549,33 +567,58 @@ Retry decisions depend on the type, not message text.
 
 ## 4.3 Evidence rules
 
-Type a publication race only when Git state establishes that the candidate's expected publication base is stale or publication reconciliation establishes divergence/advance.
+Type a publication race only when Git state establishes that the operation's assumed publication base is stale or reconciliation establishes divergence/advance.
 
 Evidence includes:
 
 - pre-publish observed head != expected head,
-- ref mutation fails and immediate re-read shows observed head != expected head,
+- ref mutation fails and an immediate re-read shows observed head != expected head,
 - reconciliation returns `published-advanced`,
-- reconciliation returns `diverged`.
+- reconciliation returns `diverged`,
+- concurrent empty-repository bootstrap/init mutation fails, then re-observation proves another writer created repository/ref state that invalidates the session's empty-remote assumption.
 
 A generic `Error("stale ref")` is not retryable by wording alone.
 
-If mutation fails and the branch still equals the expected head, preserve the original failure classification rather than inventing a race.
+If a normal ref mutation fails and the branch still equals the expected head, preserve the original failure classification rather than inventing a race.
 
-Unknown mutation outcomes continue through the existing mutation-outcome reconciler first. Do not replace evidence-based reconciliation with a generic retry.
+Unknown mutation outcomes continue through the existing mutation-outcome reconciler first. Do not replace evidence-based reconciliation with generic retry.
 
-A typed race created after another mutation error should preserve the original error as `cause` for diagnostics.
+A typed race created after another mutation error preserves the original error as `cause` for diagnostics.
 
-## 4.4 Consumers
+## 4.4 Empty-repository bootstrap race
+
+Two devices can observe a truly empty repository concurrently. One can create bootstrap/default ref state while the other still believes the remote is empty.
+
+The losing device must **not** simply adopt the newly observed base inside the already-planned session, because Normal sync planning was computed under the empty-remote assumption.
+
+Required behavior:
+
+```text
+bootstrap/init mutation fails
+        ↓
+re-observe repository/configured ref state
+        ↓
+new writer-created state is now present
+        ↓
+throw V4PublicationRaceError(phase="bootstrap", expected=null, observed=<new head>)
+        ↓
+runtime re-runs the whole operation from a fresh remote plan
+```
+
+This preserves correctness for Normal sync and preserves explicit Force Push semantics through the same bounded outer retry.
+
+A bootstrap failure with no evidence of newly created remote/ref state remains the original error.
+
+## 4.5 Consumers
 
 Both of these use the same shared type:
 
 - `V4PluginRuntime`,
 - the retry wrapper in `tests/github-e2e/v4-copy-contract-github-e2e.test.ts`.
 
-The E2E harness may keep its harness-specific stage clearing between attempts because it does not model the full production recovery-store lifecycle.
+The E2E harness may keep harness-specific conflict-copy stage clearing between attempts because it does not model the full production recovery-store lifecycle.
 
-## 4.5 Required tests
+## 4.6 Required tests
 
 Cover at least:
 
@@ -583,11 +626,13 @@ Cover at least:
 - mutation failure + changed head produces typed race and preserves cause,
 - mutation failure + unchanged head propagates original failure,
 - `published-advanced` and `diverged` produce typed race,
-- typed race retries regardless of message wording,
+- typed race retries regardless of human-readable message,
 - generic message containing `stale ref` does not retry,
 - retry bound remains three,
 - Force Push publication-race retry behavior is preserved,
 - `V4RecoveryReplanRequiredError` remains Normal-only,
+- concurrent empty-repository bootstrap race replans rather than continuing an empty-remote plan or failing solely on a definitive bootstrap response,
+- bootstrap failure without changed remote/ref evidence remains non-race,
 - live E2E bundles compile with the shared type.
 
 ---
@@ -623,7 +668,7 @@ At each tree level:
 - final entry must be a blob; a tree/gitlink/other non-blob final entry means this requested file path is not a blob when the containing response is complete,
 - unexpected Git tree/blob errors propagate.
 
-Git tree typing should not assume every entry is only `blob | tree`; Gitlink/submodule-style `commit` entries must be handled safely if encountered.
+Git tree typing must not assume every entry is only `blob | tree`; Gitlink/submodule-style `commit` entries are handled safely if encountered.
 
 ## 5.4 No cache
 
@@ -723,7 +768,7 @@ Preflight validation errors occur before metadata writes.
 
 Add text-level semantic contract tests under `tests/feasibility/`.
 
-They are regression guards, not YAML interpreters, and should avoid whitespace-sensitive assertions.
+They are regression guards, not YAML interpreters, and avoid whitespace-sensitive assertions.
 
 Stable Release contract verifies ordering/markers for:
 
@@ -735,11 +780,13 @@ Stable Release contract verifies ordering/markers for:
 - exact-SHA CI qualification,
 - exact-SHA live-E2E qualification,
 - release-input artifact + integrity manifest,
-- final remote master/version/release revalidation before mutation,
+- artifact metadata is bound to same run/repository/SHA,
+- final remote master/version/tag/release revalidation before mutation,
+- remote tag/release checks are pagination-safe,
 - create-only tag creation,
 - exact tag verification,
 - draft before public publication,
-- final release/tag/asset verification.
+- final release/tag/asset digest verification where GitHub exposes digests.
 
 Live-E2E contract verifies:
 
@@ -784,9 +831,10 @@ Core causality changes are made only when a new correctness regression fails.
 - split Stable Release into read-only `verify` and minimal write-only `publish`,
 - enforce exact-SHA CI and live-E2E evidence,
 - create and integrity-check release-input artifact,
-- re-read remote master/tags/releases immediately before publication,
+- bind artifact metadata/digest to current run/repo/SHA,
+- re-read paginated remote master/tags/releases immediately before publication,
 - create requested tag explicitly at `GITHUB_SHA`,
-- draft/upload/reverify/publish/final-verify release,
+- draft/upload/reverify/publish/final-verify release including asset digests where exposed,
 - update runbook and immutable-release guidance.
 
 ## Batch B — Live-E2E identity and secret scope
@@ -810,10 +858,10 @@ Core causality changes are made only when a new correctness regression fails.
 ## Batch D — Typed publication races
 
 - add structured shared race type,
-- classify from Git/reconciliation evidence,
+- classify normal publication and bootstrap races from Git/reconciliation evidence,
 - preserve existing operation retry semantics,
 - remove message regex from runtime and real-E2E wrapper,
-- add positive/negative/force-operation tests.
+- add positive/negative/force/bootstrap tests.
 
 ## Batch E — Immutable read fallback
 
@@ -871,9 +919,11 @@ This principle does **not** retroactively change the V4 protocol's existing `rep
 ## 10.2 Prefer evidence over wording
 
 - retry from observed Git state, not English messages,
+- replan after concurrent empty-repository initialization rather than continuing an already-invalid plan,
 - treat truncated tree responses as unknown, not absent,
 - treat cleanup 404 as absence only after repository identity is proven,
-- publish only the exact artifact whose bytes were verified in the read-only job.
+- publish only the exact artifact whose bytes were verified in the read-only job,
+- verify server-reported release-asset SHA-256 digests against the release-input manifest when available.
 
 ## 10.3 Minimize credential blast radius
 
@@ -904,11 +954,12 @@ This follow-up is complete only when all of the following are true:
 - Repository code/dependencies never execute in the write-capable publish job.
 - Stable Release enforces exact-SHA ordinary CI and exact-SHA live E2E qualification.
 - The exact published assets are produced/tested in `verify`, integrity-manifested, and reverified in `publish`.
-- Publication re-reads remote `master`, tags, and conflicting release state immediately before mutation.
+- Publish verifies the release-input artifact belongs to the same workflow run/repository/SHA and verifies its digest when the API exposes one.
+- Publication re-reads complete paginated remote `master`, tag, and conflicting release state immediately before mutation.
 - Stable Release no longer relies on `gh release create --target` to create/bind a missing tag after lengthy gates.
 - Requested tag creation is create-only at `GITHUB_SHA` and is verified before and after draft preparation.
 - Public release publication occurs only after complete draft asset preparation.
-- Final release/tag/asset state is explicitly verified.
+- Final release/tag/asset state is explicitly verified, including SHA-256 asset digests where GitHub exposes them.
 - Runbook documents partial states and does not overstate atomicity or administrator resistance.
 - Live E2E secret is step-scoped rather than job-scoped.
 - Live qualification rejects the source repository by numeric repository ID.
@@ -918,7 +969,8 @@ This follow-up is complete only when all of the following are true:
 - Folder conflict regressions use multiple descendants and prove both conflicted and unaffected child behavior.
 - Recovery integration proves exactly-once conflict-copy/stage behavior through a publication race.
 - Publication-race retry no longer depends on `branch head changed|stale ref` regex in production or live E2E.
-- Typed publication-race refactor preserves existing force-operation branch-race retry behavior and keeps recovery-replan retry Normal-only.
+- Typed publication-race refactor preserves the current operation-agnostic branch-race retry path and keeps recovery-replan retry Normal-only.
+- Concurrent empty-repository initialization is re-observed and replanned instead of continuing an empty-remote plan or failing solely because another writer won bootstrap.
 - Immutable Contents-404 fallback performs no recursive whole-tree request, fails closed on truncated evidence, and handles non-blob tree entries safely.
 - No unbounded Git tree cache is added.
 - Stable version grammar/comparison is canonical and exact across helper, validator, workflow, and tests.
