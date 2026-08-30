@@ -26,86 +26,119 @@ The runner executes E2E test files serially so their destructive branch reset/cl
 
 This is a live network and multi-device correctness smoke suite. It is **not** physical-device qualification, 5 GiB qualification, pack-scale benchmarking, or a large-file performance claim. Physical Windows/Android evidence remains separate in `tests/baselines/v4/` and `docs/testing/v4-windows-android-validation.md`.
 
+Release-qualifying GitHub Actions deliberately do **not** compile the live suites on the credentialed runner. Ordinary read-only CI compiles the exact three E2E bundles and publishes a provenance-bound artifact; **GitHub E2E Live** consumes only those verified bundles on a fresh runner.
+
 ## Local/manual configuration
 
-Set these process variables in `.env.github-e2e` or the shell:
+Credentialed local execution requires all of these values in `.env.github-e2e` or the shell:
 
 ```text
 GITHUB_E2E_OWNER=owner
 GITHUB_E2E_REPO=dedicated-disposable-repository
+GITHUB_E2E_EXPECTED_REPO_ID=123456789
 GITHUB_E2E_BRANCH=local-v4-e2e
-GITHUB_E2E_TOKEN=token-with-contents-write-access
+GITHUB_E2E_TOKEN=<credential scoped only to that repository>
 ```
 
-Never use `main`, `master`, `production`, `prod`, `release`, or `stable`; the runner rejects those exact branch names. The target repository/branch is destructive test state and must not be a real notes repository.
+`GITHUB_E2E_EXPECTED_REPO_ID` is mandatory and must be the target repository's numeric GitHub ID. Owner/repository text is routing information only; the resolved numeric ID is checked before destructive work. Never use `main`, `master`, `production`, `prod`, `release`, or `stable`, and never point this configuration at a real notes repository.
 
-Run:
+For release-qualifying use, the credential's mutable repository scope must be limited to the dedicated disposable target repository. A token that can modify the plugin source repository or unrelated repositories is not acceptable qualification configuration.
+
+Run the local convenience flow with:
 
 ```bash
 pnpm test:github-e2e:quick
 ```
 
-For a credential-free bundle check on any supported shell, including PowerShell:
+Local quick mode compiles and runs in one process. For a credential-free compile check on any supported shell, including PowerShell:
 
 ```text
 pnpm test:github-e2e:compile
 ```
 
-The runner also accepts `node scripts/run-github-e2e.mjs --compile-only`. `GITHUB_E2E_COMPILE_ONLY=1` remains supported for CI/backward compatibility, but the package script is preferred for local use because it does not depend on shell-specific environment-variable syntax.
-
-Ordinary CI uses only this compile gate.
+The runner also accepts `node scripts/run-github-e2e.mjs --compile-only`. Compile-only mode does not load the target env file and requires no target credential or repository ID.
 
 ## GitHub Actions live qualification
 
-The source repository contains **GitHub E2E Live**, a `workflow_dispatch`-only workflow. Configure repository **Settings -> Environments -> `github-e2e`** with:
+In repository **Settings -> Environments**, create or update `github-e2e`:
 
 ```text
-Environment variable: E2E_OWNER
-Environment variable: E2E_REPO
-Environment secret:   E2E_TOKEN
+Settings -> Environments -> github-e2e
+Deployment branches and tags -> Selected branches and tags
+Allowed branch -> master
+Allowed tags -> none
+
+Variable: E2E_OWNER
+Variable: E2E_REPO
+Variable: E2E_REPO_ID
+Secret:   E2E_TOKEN
 ```
 
-Do not try to create GitHub configuration variables/secrets named `GITHUB_E2E_*`; GitHub reserves the `GITHUB_` prefix. The workflow maps `E2E_*` into the runner's `GITHUB_E2E_*` process environment.
+Do not choose **Protected branches only** while `master` has no branch-protection rule. The environment must explicitly allow `master` and no release tags.
 
-`E2E_OWNER/E2E_REPO` must identify a **dedicated disposable E2E repository**, never this plugin source repository and never a real user vault. Prefer a fine-grained token scoped only to that disposable repository with repository Contents read/write permission.
+Do not create variables/secrets named `GITHUB_E2E_*`; GitHub reserves the `GITHUB_` prefix. The workflow maps environment configuration into process variables only in the fixed steps that need them.
 
-For each workflow run the branch is derived automatically:
+`E2E_REPO_ID` is the authority. `E2E_OWNER/E2E_REPO` only route the API request. Before target work, the workflow resolves current repository metadata and requires:
+
+```text
+resolved target ID == E2E_REPO_ID
+resolved target ID != source GITHUB_REPOSITORY_ID
+run-derived branch != actual target default branch
+actual target default-branch Git ref is readable
+```
+
+For each workflow run the destructive branch is exactly:
 
 ```text
 obsidian-sync-e2e/run-${GITHUB_RUN_ID}
 ```
 
-Different runs therefore have independent branch state. The `qualify` job refuses stale/non-master source SHAs and refuses a target repository equal to the plugin source repository. The `cleanup` job independently deletes and verifies the run-specific branch, with bounded retries. A live run is release-qualifying only when **both `qualify` and `cleanup` succeed**.
+Different workflow run IDs therefore isolate branch state. Reruns of one workflow run intentionally reuse that run's branch.
 
-The optional qualification JSON artifact is for human audit only. Stable release authority comes from exact-SHA workflow/job metadata, so artifact expiry or upload-service failure cannot turn an otherwise successful exact-SHA live run into false qualification evidence.
+### Release-qualifying execution flow
+
+A qualifying current workflow attempt is:
+
+```text
+newest exact-SHA ordinary CI push run/current attempt succeeds
+-> exact github-e2e-input artifact is selected and verified
+-> fresh live runner validates archive digest/shape/manifest/bundle hashes
+-> pinned target identity + default-ref capability are proven
+-> same-attempt qualification receipt is uploaded successfully
+-> exact three verified bundles execute serially with target credential
+-> cleanup independently re-proves current pinned target identity/capability
+-> cleanup succeeds in that same workflow attempt
+```
+
+The receipt artifact is named:
+
+```text
+github-e2e-target-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}
+```
+
+It binds the live attempt to its exact source SHA, authoritative CI producer/artifact, and observed target identity. Receipt persistence is blocking and occurs before scenario target mutation. The receipt does not itself prove the tests passed; `qualify` job success does that.
+
+A release qualification must be cohesive in one **current/latest workflow attempt**: `qualify` success, a valid same-attempt receipt, and `cleanup` success. Older job executions are never mixed with a newer attempt.
+
+If cleanup fails, **Re-run failed jobs** may safely remove residue. That cleanup-only attempt is maintenance evidence only and is **not** release qualification. To restore release qualification, use **Re-run all jobs** so the new current attempt runs `qualify`, writes a new receipt, executes the bundles, and completes cleanup.
 
 ## Cleanup residue
 
-Hard cancellation can prevent any cleanup job from running. Residue is isolated by run ID and is safe to inspect/delete manually. With a token scoped to the disposable repo:
+Hard cancellation can prevent cleanup from running. Residue remains confined to the pinned disposable repository and a run-ID-derived branch.
 
-```bash
-export E2E_OWNER=owner
-export E2E_REPO=repository
-export E2E_TOKEN=token
-export RUN_ID=123456789
-node - <<'NODE'
-const owner = process.env.E2E_OWNER;
-const repo = process.env.E2E_REPO;
-const token = process.env.E2E_TOKEN;
-const branch = `obsidian-sync-e2e/run-${process.env.RUN_ID}`;
-const ref = branch.split("/").map(encodeURIComponent).join("/");
-const response = await fetch(`https://api.github.com/repos/${owner}/${repo}/git/refs/heads/${ref}`, {
-  method: "DELETE",
-  headers: {
-    Authorization: `Bearer ${token}`,
-    Accept: "application/vnd.github+json",
-    "X-GitHub-Api-Version": "2022-11-28",
-  },
-});
-if (![204, 404].includes(response.status)) throw new Error(`cleanup HTTP ${response.status}: ${await response.text()}`);
-console.log(`cleanup status ${response.status}`);
-NODE
-```
+Manual cleanup must follow the same fail-closed order as the workflow:
+
+1. Start with the maintainer-known numeric target repository ID.
+2. Resolve the configured owner/repository route and require its numeric ID to equal that known target ID and differ from the source repository ID.
+3. Derive exactly `obsidian-sync-e2e/run-<RUN_ID>`.
+4. Require that branch to differ from the target's actual `default_branch`.
+5. Read the actual default-branch Git ref successfully and require a commit SHA. Repository metadata visibility alone is not enough.
+6. Inspect the exact disposable branch ref.
+7. If the exact ref is present, remove only that exact ref. If it is absent, accept absence only after step 5 proved Git-ref read capability.
+8. Resolve the target again and successfully read the current default-branch Git ref again.
+9. Verify the exact disposable ref is absent. Treat an unrelated/ambiguous API error as failure, not absence.
+
+Do not use a cleanup recipe where an arbitrary `404` or `422` is considered success before default-ref capability has been proven.
 
 ## Metrics
 
