@@ -4,26 +4,26 @@
 
 Child design of `2026-08-30-release-e2e-runtime-hardening-followup-design.md` for baseline `35e98cea924702293bde62d064a83d52eca6d898`.
 
-Revised after formal red-team review on 2026-08-30. This child owns live-E2E executable provenance, target identity, credential isolation, reset/cleanup safety, and release-qualifying execution boundaries.
+Revised after implementation-plan self-review on 2026-08-30. This child owns live-E2E executable provenance, target identity, credential isolation, reset/cleanup safety, and release-qualifying execution boundaries.
 
 ## Goal
 
-Run real GitHub E2E tests against one pinned disposable repository while ensuring build/dependency processes never share a runner with the target credential, every target branch mutation proves pinned repository identity and disposable branch contract, cleanup remains safe across partial reruns, and live qualification executes exact precompiled bundles produced by authoritative ordinary CI for the same source SHA.
+Run real GitHub E2E tests against one pinned disposable repository while ensuring build/dependency processes never share a runner with the target credential, every target mutation proves pinned repository identity and a non-default disposable branch, cleanup fails closed on ambiguous identity/capability, and release qualification executes exact precompiled bundles produced by authoritative ordinary CI for the same source SHA.
 
 ## Non-goals
 
-This child does not redefine V4 protocol `repoId`, migrate encrypted data after repository rename, guarantee cleanup after hard cancellation, own stable release publication, or own publication-race retry semantics inside scenario code.
+This child does not redefine V4 protocol `repoId`, migrate encrypted data after repository rename, guarantee cleanup after hard cancellation, own stable release publication, own publication-race retry semantics inside scenario code, or depend on undocumented cross-attempt artifact/job-output behavior.
 
 ---
 
 # 1. CI Produces the Live-E2E Executable Artifact
 
-Ordinary read-only `ci.yml` is sole producer of executable bundles later used by live E2E.
+Ordinary read-only `ci.yml` is the sole producer of executable bundles later used by live E2E.
 
 After deterministic CI gates + compile gate succeed, CI creates:
 
 ```text
-github-e2e-input-${GITHUB_SHA}-${GITHUB_RUN_ID}-${VERIFY_JOB_ATTEMPT}
+github-e2e-input-${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}
 ```
 
 with exactly:
@@ -37,9 +37,9 @@ v4-encrypted-external-mutation.test.mjs
 
 No source checkout, package-manager state, helper scripts, arbitrary executable, symlink, or extra file is part of this artifact.
 
-`scripts/run-github-e2e.mjs` gains deterministic compile-only output to a caller-provided clean directory. Compile-only mode requires no target credential, performs no target API work, and emits exactly the three expected bundles.
+`scripts/run-github-e2e.mjs` gains deterministic compile-only output to a caller-provided clean directory. Compile-only mode does not load `.env.github-e2e`, requires no target credential, performs no target API work, and emits exactly the three expected bundles.
 
-Manifest data includes schema version, source repository ID/SHA, CI run ID, producer `verify` execution attempt, exact Node version, bundle names, sizes, and SHA-256 values. It cannot define commands, arbitrary paths, test arguments, or environment names.
+Manifest data includes schema version, source repository ID/SHA, CI run ID, producer run attempt, exact Node version, bundle names, sizes, and SHA-256 values. It cannot define commands, arbitrary paths, test arguments, or environment names.
 
 CI validates exact entries, regular-file shape, producer identity, and hashes before upload.
 
@@ -47,7 +47,7 @@ CI validates exact entries, regular-file shape, producer identity, and hashes be
 
 # 2. Authoritative CI Producer
 
-For live run exact `GITHUB_SHA`, select the **newest** ordinary CI run matching:
+For live run exact `GITHUB_SHA`, select the **newest matching** ordinary CI run satisfying:
 
 ```text
 workflow = ci.yml
@@ -58,9 +58,9 @@ head_sha = GITHUB_SHA
 
 Newest matching run is authoritative even when queued/running/cancelled/failed; older success is not fallback authority.
 
-Within that run, latest execution of `verify` across attempts must be completed successfully. Selected E2E artifact binds to the attempt in which that latest successful `verify` execution produced it.
+The current run attempt must be completed successfully and its `verify` job must be completed/successful in that same attempt. The selected E2E artifact must bind to that exact run attempt.
 
-If CI is rerun later for same SHA, previous E2E artifact and every live qualification based on it become stale. Live E2E must run again against newer authoritative producer before release.
+If CI is rerun later for the same SHA, the previous E2E artifact and live qualification based on it become stale. Live E2E must run again against the new authoritative producer before release.
 
 Completeness-sensitive run/job/artifact discovery is pagination-safe.
 
@@ -70,11 +70,11 @@ Completeness-sensitive run/job/artifact discovery is pagination-safe.
 
 Live qualification uses a fresh GitHub-hosted runner and does not checkout repository code, install project dependencies, build, or compile.
 
-Before executing bundles it derives authoritative CI identity, locates exact artifact, requires unexpired state, verifies artifact repository/run/head metadata + server digest when exposed, rejects traversal/absolute/symlink/duplicate/unexpected archive entries, extracts to fresh directory, parses manifest strictly, verifies exact bundle allowlist and each size/SHA-256, and establishes exact Node runtime from fixed exact-source metadata/workflow contract.
+Before executing bundles it derives authoritative CI identity, locates the exact artifact, requires unexpired state, verifies artifact repository/run/head metadata + server digest when exposed, rejects traversal/absolute/symlink/duplicate/unexpected archive entries, extracts into a fresh directory, parses the manifest strictly, verifies the exact bundle allowlist and each size/SHA-256, and establishes exact Node runtime from fixed exact-source metadata/workflow contract.
 
 Only the three fixed verified bundle paths may execute.
 
-The design does not claim CI toolchain has no influence on bundle bytes. Those bytes are treated as exact reviewed/tested output of authoritative read-only CI, combined with fresh-runner isolation and target-only credential scope.
+The design does not claim the CI toolchain has no influence on bundle bytes. Those bytes are treated as exact reviewed/tested output of authoritative read-only CI, combined with fresh-runner isolation and target-only credential scope.
 
 ---
 
@@ -85,7 +85,7 @@ The `github-e2e` environment stores routing information, maintainer-pinned numer
 Before target work:
 
 ```text
-resolved target.id == configured pinned target repository ID
+resolved target.id == configured E2E_REPO_ID
 resolved target.id != source GITHUB_REPOSITORY_ID
 ```
 
@@ -107,7 +107,7 @@ Source workflow token remains read-only with only source/API/artifact read permi
 
 All external `uses:` references in repository workflows are pinned to verified full-length commit SHAs before repository-wide full-SHA action policy is enabled.
 
-A feasibility/static test rejects mutable external action refs. This child may perform mechanical cross-workflow pinning to establish Actions trust boundary; later child changes preserve pins.
+A feasibility/static test rejects mutable external action refs. This child may perform mechanical cross-workflow pinning to establish the Actions trust boundary; later child changes preserve pins.
 
 Privileged live jobs minimize external actions and require no checkout action.
 
@@ -123,7 +123,7 @@ full_name
 default_branch
 ```
 
-Disposable target must already have initialized readable default branch.
+Disposable target must already have an initialized readable default branch.
 
 Release-qualifying branch is exactly:
 
@@ -131,9 +131,9 @@ Release-qualifying branch is exactly:
 obsidian-sync-e2e/run-${GITHUB_RUN_ID}
 ```
 
-Reruns of one workflow run intentionally reuse branch; different run IDs remain isolated.
+Reruns of one workflow run intentionally reuse that branch; different run IDs remain isolated.
 
-Before target mutation require pinned numeric ID equality, source-vs-target inequality, exact run-derived branch, and branch inequality with actual target default branch. Canonical `full_name` becomes route identity for run.
+Before target mutation require pinned numeric ID equality, source-vs-target inequality, exact run-derived branch, and branch inequality with actual target default branch. Canonical `full_name` becomes the route identity for that attempt.
 
 ---
 
@@ -176,9 +176,7 @@ Arbitrary `404`/`422` responses are not normalized blindly.
 
 ---
 
-# 9. Durable Target/Provenance Receipt
-
-Cleanup safety must not depend on undocumented cross-attempt preservation of `needs.<job>.outputs`.
+# 9. Qualification Receipt
 
 After target identity/default-ref guard succeeds, but **before any scenario target mutation**, `qualify` writes and successfully persists:
 
@@ -186,16 +184,16 @@ After target identity/default-ref guard succeeds, but **before any scenario targ
 github-e2e-target-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}
 ```
 
-with strict non-secret data:
+containing strict non-secret data:
 
 ```text
 schemaVersion
 sourceRepositoryId
 sourceCommitSha
 workflowRunId
-qualifyExecutionAttempt
+workflowRunAttempt
 ciProducerRunId
-ciVerifyExecutionAttempt
+ciProducerRunAttempt
 ciE2EArtifactId/digest
 targetRepositoryId
 targetFullName
@@ -203,17 +201,33 @@ targetDefaultBranch
 targetBranch
 ```
 
-Receipt persistence is a blocking prerequisite for destructive scenario execution. If a later `qualify` attempt fails before its receipt, that attempt has not yet run target mutation.
+Receipt persistence is a blocking prerequisite for destructive scenario execution. Receipt data binds the successful qualification attempt to its exact CI input and observed target identity; it is **not** proof that E2E passed. Job success comes only from Actions job state.
 
-The receipt is machine authority for target routing/provenance data, **not proof of E2E success**. Stable Release may use the receipt associated with the latest successful `qualify` execution to bind that job to its exact CI input; job success itself always comes from Actions job state.
-
-Cleanup selects highest-attempt valid receipt available for the workflow run, verifies its artifact/source/run metadata and pinned target ID, then uses canonical route/branch from that receipt.
-
-This supports `Re-run failed cleanup` without relying on prior job outputs and ensures a newer attempt cannot mutate target before its own identity/provenance has been durably recorded.
+The receipt is not used as a cross-attempt cleanup authority. This design deliberately avoids relying on old-attempt artifact visibility after reruns.
 
 ---
 
-# 10. Live Workflow Jobs
+# 10. Cohesive Workflow-Attempt Qualification
+
+A live workflow run is release-qualifying only when its **current/latest workflow attempt** is cohesive:
+
+```text
+current attempt exists
+qualify executed in that attempt and succeeded
+cleanup executed in that same attempt and succeeded
+receipt for that same attempt exists and is valid
+receipt binds to current authoritative CI producer/artifact
+```
+
+Older successful job executions are not mixed with newer attempts to synthesize qualification.
+
+If `cleanup` fails, a maintainer may use **Re-run failed jobs** only as an operational cleanup retry; that partial attempt is not release-qualifying because `qualify` did not execute in the same attempt. To restore release qualification, use **Re-run all jobs** so a new cohesive attempt creates a new receipt, reruns the exact bundles, and cleans up successfully.
+
+This intentionally trades a little rerun convenience for documented, auditable provenance and removes dependence on cross-attempt artifact/job-output behavior.
+
+---
+
+# 11. Live Workflow Jobs
 
 ## `qualify`
 
@@ -225,9 +239,8 @@ select authoritative CI producer                 [read-only source token]
 download/verify exact E2E artifact               [read-only source token]
 set up exact Node runtime if required             [no target credential]
 resolve pinned target + default-ref guard         [target credential]
-write + persist target/provenance receipt         [no target credential]
+write + persist same-attempt qualification receipt [no target credential]
 execute exact three verified bundles serially    [target credential]
-write/upload optional richer audit evidence       [no target credential]
 ```
 
 There is no checkout, pnpm install, repository build, or compile.
@@ -236,29 +249,28 @@ Execution is fixed conceptually to `node --test --test-concurrency=1` plus exact
 
 ## `cleanup`
 
-Runs separately with `if: always()` and references same protected environment.
+Runs separately with `if: always()` and references the same protected environment.
 
-Cleanup does not require `needs.qualify.outputs` as identity authority. It derives highest valid persisted target receipt for workflow run, then requires:
+Cleanup independently uses the currently configured route plus pinned `E2E_REPO_ID`; it does not trust old-attempt artifacts or need prior job outputs as repository identity authority.
+
+Before any target mutation it requires:
 
 ```text
-receipt source repository/SHA/run identity matches
-receipt target ID == pinned target ID
-receipt branch == expected run-derived branch
-receipt canonical route resolves now to same target ID
-resolved ID != source repository ID
+configured route resolves now
+resolved target ID == pinned E2E_REPO_ID
+resolved target ID != source repository ID
+branch == obsidian-sync-e2e/run-${GITHUB_RUN_ID}
 branch != current target default branch
 current default-branch ref readable
 ```
 
-Only then may cleanup act on exact disposable ref and verify absence.
+Only then may it inspect/remove the exact disposable ref and verify absence.
 
-If no valid receipt exists, cleanup performs no target mutation and fails closed. Because destructive execution is gated on receipt persistence, absence of receipt means no attempt was allowed to start destructive scenarios under this design.
-
-Hard cancellation can still prevent cleanup after a valid receipt/target action; unique per-run branches bound residue to pinned disposable target.
+If route/ID/capability is ambiguous, cleanup mutates nothing and fails closed. Hard cancellation can still prevent cleanup; unique per-run branches bound residue to the pinned disposable target.
 
 ---
 
-# 11. Local and Manual Safety
+# 12. Local and Manual Safety
 
 Compile-only local mode remains offline and requires no target identity/credential.
 
@@ -266,19 +278,19 @@ Credentialed local execution requires explicit expected numeric target repositor
 
 Local mode may use another explicit disposable branch but rejects actual default branch and conservative protected-looking names.
 
-Manual residue cleanup follows same pinned-ID/default-ref/absence evidence contract using maintainer-known target ID. Runbook does not offer blind removal that treats ambiguous API absence as success.
+Manual residue cleanup follows the same pinned-ID/default-ref/absence evidence contract. Runbook does not offer blind removal that treats ambiguous API absence as success.
 
 ---
 
-# 12. Tests
+# 13. Tests
 
-Required evidence includes deterministic credential-free CI bundle output; exact bundle artifact/hash manifest; newest exact-SHA CI authority; newer failed/running CI blocks older success; latest `verify` execution across attempts; CI rerun invalidates prior live input; artifact digest/provenance/shape validation; no checkout/install/build/compile in live qualification; wrong pinned/source/default target rejection; default-ref capability failure; exact absence only after capability proof; arbitrary validation response rejection; concurrent already-absent handling with final verification; receipt persisted before scenario mutation; cleanup attempt-2 can use valid attempt-1 receipt when only cleanup reruns; newer valid receipt supersedes older; invalid receipt never authorizes cleanup or release input binding; no receipt means no cleanup mutation; local expected numeric ID mandatory; no job-level target credential; and all external action refs full-SHA pinned.
+Required evidence includes deterministic credential-free CI bundle output; exact bundle artifact/hash manifest; newest exact-SHA CI authority; newer failed/running CI blocks older success; current CI attempt/verify success; CI rerun invalidates prior live input; artifact digest/provenance/shape validation; no checkout/install/build/compile in live qualification; wrong pinned/source/default target rejection; default-ref capability failure; exact absence only after capability proof; arbitrary validation response rejection; concurrent already-absent handling with final verification; receipt persisted before scenario mutation; same-attempt receipt/job qualification; partial cleanup-only rerun is not release-qualifying; local expected numeric ID mandatory; no job-level target credential; and all external action refs full-SHA pinned.
 
 Publication-race wrapper policy is owned by Child C.
 
 ---
 
-# 13. Maintainer Flow
+# 14. Maintainer Flow
 
 One-time:
 
@@ -295,15 +307,17 @@ merge master
 -> ordinary CI succeeds and produces current E2E bundle artifact
 -> dispatch GitHub E2E Live on exact current master
 -> live verifies CI artifact
--> target/provenance receipt persists
+-> same-attempt qualification receipt persists
 -> exact bundles execute on pinned target
--> cleanup succeeds
+-> cleanup succeeds in same workflow attempt
 ```
+
+If cleanup alone fails and is retried separately, treat that as cleanup-only evidence; rerun all jobs before release qualification.
 
 Normal Obsidian users see no behavior change.
 
 ---
 
-# 14. Acceptance Criteria
+# 15. Acceptance Criteria
 
-Complete only when CI is sole compiler of live-E2E bundles; credentialed live execution uses fresh runner with no repository checkout/install/build/compile; newest authoritative exact-SHA CI controls input; target numeric ID is pinned; target credential scope is target-only; `github-e2e` environment is selected-branch `master`; external actions are full-SHA pinned; target/provenance receipt persists before scenario mutation and can safely bind cleanup + latest successful qualify to exact CI input across partial reruns without relying on cross-attempt job outputs; all suites share one target-safety authority; cleanup proves absence against pinned target; local credentialed E2E requires expected target ID; and current CI producer/target identities remain auditable.
+Complete only when CI is sole compiler of live-E2E bundles; credentialed live execution uses fresh runner with no repository checkout/install/build/compile; newest authoritative exact-SHA CI controls input; target numeric ID is pinned; target credential scope is target-only; `github-e2e` environment is selected-branch `master`; external actions are full-SHA pinned; same-attempt receipt persists before scenario mutation and binds successful `qualify` to exact CI input; release qualification requires `qualify` + `cleanup` success in the same current workflow attempt; partial cleanup-only rerun never synthesizes release qualification; all suites share one target-safety authority; cleanup independently proves current pinned target identity/capability; local credentialed E2E requires expected target ID; and current CI producer/target identities remain auditable.
