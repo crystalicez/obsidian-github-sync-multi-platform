@@ -44,3 +44,21 @@ test("compile-only ignores target env files and emits only fixed bundles", async
     "v4-real-github-e2e.test.mjs",
   ]);
 });
+
+test("credentialed runner requires expected target repository ID before execution", () => {
+  const env = { ...process.env };
+  delete env.GITHUB_E2E_ENV_FILE;
+  env.GITHUB_E2E_OWNER = "owner";
+  env.GITHUB_E2E_REPO = "repo";
+  env.GITHUB_E2E_BRANCH = "local-e2e";
+  env.GITHUB_E2E_TOKEN = "test-token";
+  delete env.GITHUB_E2E_EXPECTED_REPO_ID;
+
+  const result = spawnSync(process.execPath, [resolve("scripts/run-github-e2e.mjs")], {
+    cwd: resolve("."),
+    env,
+    encoding: "utf8",
+  });
+  assert.equal(result.status, 2, result.stderr || result.stdout);
+  assert.match(result.stderr, /GITHUB_E2E_EXPECTED_REPO_ID/u);
+});
