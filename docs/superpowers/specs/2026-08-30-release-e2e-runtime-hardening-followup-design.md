@@ -91,7 +91,7 @@ re-read tag; require object SHA == GITHUB_SHA
         ↓
 publish the draft release
         ↓
-read published release and tag; verify final association
+read published release and tag; verify final association and asset set
 ```
 
 The mutation boundary moves as late as practical: all deterministic gates and asset construction occur before tag creation.
@@ -100,7 +100,7 @@ The mutation boundary moves as late as practical: all deterministic gates and as
 
 The workflow must create `refs/tags/$VERSION` explicitly through GitHub's Git refs API with `GITHUB_SHA` as the target. The operation is create-only; if the ref already exists, publication fails closed.
 
-After creation, the workflow must read the exact tag ref from GitHub and require the observed object SHA to equal `GITHUB_SHA`.
+After creation, the workflow must read the exact tag ref from GitHub and require both that it is the expected lightweight ref shape and that the observed object SHA equals `GITHUB_SHA`.
 
 The workflow must not treat `gh release create --target "$GITHUB_SHA"` as the mechanism that binds publication to the qualified commit.
 
@@ -108,9 +108,14 @@ The workflow must not treat `gh release create --target "$GITHUB_SHA"` as the me
 
 The release is created against the already-existing verified tag as a draft. Assets are attached while the release remains draft. Immediately before publication, the tag is read and verified again.
 
-The final publish operation then makes the prepared draft public. The workflow verifies the resulting release exists and that the associated tag still resolves to `GITHUB_SHA`.
+The final publish operation then makes the prepared draft public. The workflow must verify the resulting release state rather than assuming a successful command is sufficient. Final verification requires at least:
 
-This ordering reduces the interval in which a partially prepared public release can exist.
+- release tag name is exactly `VERSION`,
+- release is no longer a draft,
+- exact tag ref still resolves to `GITHUB_SHA`,
+- expected release assets are present: packaged plugin ZIP, `main.js`, `manifest.json`, and `styles.css`.
+
+This ordering reduces the interval in which a partially prepared public release can exist and makes the final state observable rather than inferred from a CLI exit code.
 
 ## 1.5 Partial failure behavior
 
@@ -151,7 +156,7 @@ Required contract markers:
 - release is prepared as a draft before publication,
 - tag verification occurs again before publish,
 - public publish occurs only after asset preparation,
-- final verification occurs after publication.
+- final release/tag/asset verification occurs after publication.
 
 The test is a regression guard, not a YAML interpreter.
 
@@ -173,7 +178,7 @@ The cleanup job also treats a branch GET returning 404 as success without first 
 
 ## 2.2 Repository identity contract
 
-Before destructive E2E work, the qualification job must resolve the target repository using `E2E_TOKEN` and record at least:
+Before destructive E2E work, a dedicated qualification guard step must resolve the target repository using `E2E_TOKEN` and record at least:
 
 - immutable numeric repository ID,
 - canonical full name,
@@ -192,6 +197,8 @@ AND generated E2E branch matches the disposable branch contract
 
 The canonical target repository ID becomes the authority; lowercased owner/name comparison is not a fallback.
 
+The guard step must write the verified target repository ID to a named step output, and the `qualify` job must map that value to a job output before the real E2E command can run. This ordering is an invariant: if the job output is unavailable, destructive E2E work must not have started.
+
 ## 2.3 Disposable branch contract
 
 The live workflow continues to derive the branch internally:
@@ -208,16 +215,19 @@ The branch must not equal the resolved target repository's default branch, even 
 
 ## 2.4 Binding qualify and cleanup to the same repository
 
-The qualification job exposes the resolved target repository ID as a job output.
+The qualification job exposes the verified target repository ID as a job output produced before destructive work.
 
 The cleanup job must independently resolve `E2E_OWNER/E2E_REPO` using the cleanup token/environment before issuing any branch deletion. Cleanup then requires:
 
 ```text
-resolved cleanup target ID == qualify target repository ID
+qualify target repository ID is non-empty
+AND resolved cleanup target ID == qualify target repository ID
 AND resolved cleanup target ID != source repository ID
 AND cleanup branch == obsidian-sync-e2e/run-${GITHUB_RUN_ID}
 AND cleanup branch != current target default branch
 ```
+
+If the qualify target ID is absent, cleanup must not delete anything and must fail closed. By construction, an absent ID means qualification was not permitted to begin destructive work.
 
 If environment variables or repository names change between jobs, cleanup fails closed rather than deleting from a repository different from the one qualification used.
 
@@ -259,7 +269,9 @@ Required semantic markers:
 - numeric repository ID is compared with the source repository ID,
 - target default branch is checked,
 - disposable branch pattern is checked,
+- verified target repository ID is exposed before destructive work,
 - qualify exposes target repository identity to cleanup,
+- cleanup rejects an absent qualify target ID,
 - cleanup re-resolves repository metadata,
 - cleanup verifies the resolved repository ID before DELETE,
 - branch 404 is interpreted only after repository resolution/identity verification.
@@ -287,27 +299,82 @@ This rule applies especially to `causalIdentityState`, planner namespace logic, 
 
 ## 3.2 Folder conflict matrix
 
-Add deterministic folder scenarios required by the existing hardening design but not yet proven at the desired integration depth:
+Add deterministic folder scenarios required by the existing hardening design but not yet proven at the desired integration depth. The expected outcomes are explicit so the implementation must not invent a second folder-specific policy.
 
-1. remote folder rename versus stale local descendant edit,
-2. remote folder delete versus stale local descendant edit,
-3. remote folder delete versus stale local descendant recreate,
-4. nested folder rename chain with a stale descendant change,
-5. case-only folder rename through the current namespace rules,
-6. NFC-equivalent destination collision where different identities would occupy one normalized namespace.
+### 3.2.1 Remote folder rename versus stale local descendant edit
 
-Assertions must cover:
+Starting from `folder/note.md`, device A renames `folder -> moved` and publishes. Stale device B edits `folder/note.md` and then performs Normal sync under Copy policy.
 
-- exact final live path set,
-- exact bytes at every live path,
-- canonical versus conflict-copy role,
-- conflict-copy count,
-- original file identity continuity where the logical lineage survives,
-- new identity where the contract requires a recreated/conflict-copy lineage,
-- no unrelated user path overwritten,
-- fresh-device convergence when the scenario produces a valid final remote state.
+Expected result on B and a fresh converged device:
 
-Expected results derive from the existing local-primary Copy contract and namespace rules. The tests must not invent a folder-specific conflict policy.
+- B's edited lineage remains canonical at `folder/note.md`,
+- canonical file keeps the original logical identity,
+- A's remotely renamed version is preserved exactly once as a conflict copy derived from the remote final path `moved/note.md`,
+- conflict copy receives a distinct logical identity,
+- there is no extra live canonical `moved/note.md` in addition to that preserved copy,
+- no unrelated path is overwritten.
+
+This is the folder analogue of the existing remote-rename versus stale-local-edit contract.
+
+### 3.2.2 Remote folder delete versus stale local descendant edit
+
+Starting from `folder/note.md`, device A deletes the folder and publishes. Stale B edits the existing `folder/note.md` lineage and syncs.
+
+Expected result:
+
+- edited local file remains canonical at `folder/note.md`,
+- original logical identity remains canonical,
+- remote deletion is overridden by local-primary Copy semantics for that edited lineage,
+- no meaningless conflict copy is created for the absent remote body,
+- fresh-device convergence sees the canonical edited file and no duplicate.
+
+### 3.2.3 Remote folder delete versus stale local descendant recreate
+
+Starting from `folder/note.md`, device A deletes the folder and publishes. On stale B, the original descendant is deleted and a new file is recreated at the same logical path before sync.
+
+Expected result:
+
+- recreated local file remains canonical at `folder/note.md`,
+- recreated file has a new logical identity rather than resurrecting the deleted original identity,
+- original identity remains deleted,
+- remote deletion has no body to preserve as a conflict copy,
+- exactly one live canonical file exists at that path after convergence.
+
+This scenario specifically guards identity discontinuity across delete/recreate.
+
+### 3.2.4 Nested remote folder rename chain versus stale descendant edit
+
+Starting from `folder/note.md`, device A publishes `folder -> middle -> final` while B remains stale and edits `folder/note.md`.
+
+Expected result follows the same local-primary rename conflict rule:
+
+- B's stale edited original lineage remains canonical at `folder/note.md` with its original identity,
+- the remote lineage at its final path `final/note.md` is preserved exactly once as a conflict copy derived from that final remote path,
+- the preserved copy has a distinct identity,
+- no intermediate `middle/note.md` survives,
+- no duplicate conflict copies are produced.
+
+### 3.2.5 Case-only folder rename without a competing identity
+
+For a one-sided folder rename such as `Folder -> folder` where no different identity occupies the normalized namespace:
+
+- the rename remains a single logical lineage,
+- descendant file identities are preserved,
+- exactly one normalized logical path exists after convergence,
+- no conflict copy is created solely because casing changed.
+
+If a different identity already occupies the normalized destination namespace, the operation is governed by the existing collision rule and must fail before mutation rather than merging identities.
+
+### 3.2.6 NFC-equivalent folder destination collision
+
+When different logical identities would occupy folder/file paths that normalize to the same NFC + lowercase namespace key:
+
+- Normal sync fails before local or remote mutation,
+- the error clearly identifies a namespace collision,
+- neither identity is silently selected as the winner,
+- no conflict copy is used to evade the namespace invariant.
+
+All folder assertions must cover exact live path set, bytes, canonical/conflict-copy role, conflict-copy count, identity continuity/discontinuity, no unrelated overwrite, and fresh-device convergence when the scenario yields a valid final state.
 
 ## 3.3 Fast runtime retry regression
 
@@ -359,15 +426,26 @@ This makes retry behavior depend on wording instead of the state transition that
 
 ## 4.2 Error type
 
-Introduce a V4-specific error representing an observed recoverable publication race, for example:
+Introduce a V4-specific error representing an observed recoverable publication race. The type should carry structured evidence useful for diagnostics, for example:
 
 ```ts
 export class V4PublicationRaceError extends Error {
   readonly code = "V4_PUBLICATION_RACE"
+  constructor(
+    readonly phase: "pre-publish" | "post-mutation-failure" | "reconcile",
+    readonly expectedHeadSha: string | null,
+    readonly observedHeadSha: string | null,
+    message = "V4 publication race requires replanning.",
+  ) {
+    super(message)
+    this.name = "V4PublicationRaceError"
+  }
 }
 ```
 
 The exact file location should follow the existing Git publication boundary so `git-tree-writer`, runtime, recovery tests, and live E2E can depend on one stable type without introducing a circular dependency.
+
+The structured fields are diagnostic evidence; retry decisions depend on the type, not the message text.
 
 ## 4.3 Evidence rules
 
@@ -413,7 +491,7 @@ Required deterministic tests:
 - typed race retries,
 - typed race remains retryable if its human-readable message changes,
 - generic `new Error("stale ref")` does not retry by itself,
-- observed expected-vs-current ref mismatch yields `V4PublicationRaceError`,
+- observed expected-vs-current ref mismatch yields `V4PublicationRaceError` with expected/observed SHA evidence,
 - non-race API failure with unchanged head propagates,
 - retry bound remains three attempts,
 - force-operation behavior is unchanged,
@@ -506,7 +584,7 @@ Examples rejected:
 
 This follow-up does not add prerelease SemVer support.
 
-## 6.2 Comparison
+## 6.2 Comparison and highest published version
 
 Numeric version components are compared without JavaScript `Number` precision loss. Use `BigInt` or an equivalent dependency-free exact integer comparison.
 
@@ -519,6 +597,8 @@ The same canonical grammar/comparison semantics must apply to:
 - release workflow contract tests where appropriate.
 
 The release workflow must not keep a permissive regex or `Number` comparison after the scripts are hardened.
+
+The workflow must also avoid making `sort -V` the authority for selecting the highest published stable tag. It should enumerate candidate tags, discard non-canonical stable versions, and compute the maximum with the same exact component comparator used for monotonic validation. This prevents the workflow from having a second subtly different version-ordering implementation.
 
 ## 6.3 Version helper user flow
 
@@ -550,7 +630,8 @@ Add negative tests for:
 - equal/lower target,
 - duplicate `versions.json` key,
 - large components beyond IEEE-754 exact integer range,
-- inconsistent package/manifest metadata.
+- inconsistent package/manifest metadata,
+- non-canonical historical tags being ignored by the stable-tag maximum calculation.
 
 A validation failure must occur before metadata writes.
 
@@ -627,7 +708,7 @@ The implementation plan should use six reviewable batches. Each batch must leave
 - verify tag SHA,
 - prepare release as draft with final assets,
 - re-verify tag before publish,
-- publish and verify final release state,
+- publish and verify final release/tag/asset state,
 - update release runbook,
 - document Immutable Releases as repository-level hardening rather than pretending workflow checks provide platform immutability.
 
@@ -635,22 +716,23 @@ The implementation plan should use six reviewable batches. Each batch must leave
 
 - resolve target repository metadata with `E2E_TOKEN`,
 - compare immutable target/source repository IDs,
+- expose verified target ID before destructive work,
 - enforce target default-branch exclusion and disposable branch pattern,
 - pass qualified target repository ID to cleanup,
-- cleanup re-resolves and verifies identity before DELETE,
+- cleanup rejects absent/mismatched target identity and re-resolves identity before DELETE,
 - tighten 404 semantics,
 - update E2E docs and workflow contracts.
 
 ## Batch C — Missing correctness evidence
 
-- add folder conflict matrix,
+- add explicit folder conflict matrix,
 - retain/strengthen fast runtime retry user-flow coverage,
 - add recovery-tier Copy + CAS + stage lifecycle integration,
 - change production causality only if a new regression fails.
 
 ## Batch D — Typed publication races
 
-- define shared publication-race error at Git publication boundary,
+- define shared publication-race error with structured expected/observed-head evidence at Git publication boundary,
 - classify from observed Git state/reconciliation outcomes,
 - remove message regex from production runtime,
 - remove message regex from real-GitHub copy-contract retry wrapper,
@@ -661,7 +743,8 @@ The implementation plan should use six reviewable batches. Each batch must leave
 - replace recursive immutable-tree fallback with path-directed non-recursive traversal,
 - fail closed on truncated evidence at every level,
 - add no cache,
-- make stable-version grammar and exact comparison consistent across helper, validator, workflow, and tests.
+- make stable-version grammar and exact comparison consistent across helper, validator, workflow, and tests,
+- compute highest canonical stable tag with the same exact comparator rather than `sort -V` authority.
 
 These two changes share no runtime behavior but are both bounded infrastructure hardening; the implementation plan may split them into separate commits/tasks inside Batch E for review clarity.
 
@@ -708,19 +791,23 @@ The source ZIP helper and speculative watcher-noise hardening are intentionally 
 This follow-up is complete only when all of the following are true:
 
 - Stable release no longer relies on `gh release create --target` to create/bind a missing tag after lengthy gates.
-- Stable release explicitly creates the version tag at `GITHUB_SHA`, verifies it, prepares assets before public publication, verifies again before publish, and verifies final state afterward.
+- Stable release explicitly creates the version tag at `GITHUB_SHA`, verifies it, prepares assets before public publication, verifies again before publish, and verifies final release/tag/asset state afterward.
 - The release runbook accurately describes partial states and repository-level immutable-release hardening without overstating workflow atomicity.
 - Live qualification rejects the source repository by numeric repository ID, not repository-name string comparison.
+- Live qualification resolves and exposes the verified target repository ID before any destructive E2E work.
 - Live qualification rejects the target repository's actual default branch and enforces the generated disposable branch contract.
 - Cleanup is bound to the same target repository ID used by qualification and verifies that identity before any deletion.
+- Cleanup refuses deletion when the qualified target repository ID is absent or mismatched.
 - Cleanup does not treat an unauthenticated/unresolved repository 404 as evidence that a branch is absent.
-- Folder conflict regressions cover the required stale descendant cases and either pass unchanged production code or precede the smallest demonstrated fix.
+- Folder conflict regressions cover the required stale descendant cases with the exact outcomes in this spec and either pass unchanged production code or precede the smallest demonstrated fix.
 - Runtime and recovery tests prove one-action retry and exactly-once conflict-copy/recovery semantics at their correct test tiers.
 - Retry classification no longer depends on `branch head changed|stale ref` message regex in either production runtime or the real-GitHub copy-contract harness.
 - Generic errors containing the words `stale ref` do not become retryable without state evidence.
+- Publication-race errors carry structured expected/observed ref evidence for diagnostics.
 - Immutable Contents-404 verification does not request a recursive whole-repository tree and never converts truncated evidence to absence.
 - No unbounded Git tree cache is introduced.
 - Stable version grammar/comparison is canonical and consistent across scripts and release workflow, including values beyond JavaScript Number's exact integer range.
+- Highest stable-tag selection uses the same canonical exact comparator and does not delegate version authority to `sort -V`.
 - Full deterministic gates pass on the final implementation.
 - Exact final master SHA has successful ordinary CI plus successful live `qualify` and `cleanup` jobs before Stable Release is considered eligible.
 
