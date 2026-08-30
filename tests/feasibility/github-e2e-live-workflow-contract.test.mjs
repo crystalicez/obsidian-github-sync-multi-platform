@@ -22,7 +22,9 @@ test("receipt is blocking and before scenario execution", async () => {
   const execute = text.indexOf("Run verified real GitHub E2E bundles");
   assert.ok(receipt >= 0 && execute > receipt);
   assert.match(text, /github-e2e-target-\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}/u);
-  assert.doesNotMatch(text.slice(receipt, execute), /continue-on-error:\s*true/u);
+  const receiptBlock = text.slice(receipt, execute);
+  assert.doesNotMatch(receiptBlock, /continue-on-error:\s*true/u);
+  assert.match(receiptBlock, /include-hidden-files:\s*true/u);
 });
 
 test("cleanup re-proves target without qualify outputs", async () => {
