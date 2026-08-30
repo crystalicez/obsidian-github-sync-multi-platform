@@ -10,95 +10,83 @@ This child owns destructive live-E2E repository identity, credential scope, rese
 
 ## Goal
 
-Make every destructive live-E2E branch mutation prove that it is operating on the intended disposable repository and non-default disposable branch, while keeping the destructive credential out of checkout/install/build/compile processes.
+Make every destructive live-E2E branch mutation prove that it targets the intended disposable repository and non-default disposable branch, while keeping the destructive credential out of checkout/install/build/compile processes.
 
 ## Non-goals
 
-This child does not:
-
-- redefine V4 protocol `repoId`,
-- migrate encrypted data when a GitHub repository is renamed,
-- make hard-cancel cleanup guaranteed,
-- grant broader token scope for convenience,
-- replace real GitHub qualification with mocks,
-- add random concurrency when deterministic one-shot interference is sufficient.
+This child does not redefine V4 protocol `repoId`, migrate encrypted data after repository rename, guarantee cleanup after hard cancellation, grant broad tokens for convenience, or own publication-race retry semantics.
 
 ---
 
 # 1. Credential Model
 
-## 1.1 Release-qualifying credential requirement
+## 1.1 Release-qualifying credential scope
 
-Release-qualifying GitHub E2E requires a credential whose mutable repository scope is restricted to the dedicated disposable target repository.
+Release-qualifying GitHub E2E requires a credential whose mutable scope is restricted to the dedicated disposable target repository.
 
-Acceptable examples include:
+Acceptable examples:
 
-- a fine-grained personal access token scoped only to the target repository,
-- a repository-scoped GitHub App installation token with only the permissions needed by the suite.
+- fine-grained PAT scoped only to that repository,
+- repository-scoped GitHub App installation token with only required repository permissions.
 
-Required mutable permission is limited to repository Contents/Git data needed to create/update/delete the disposable test branch and objects.
+Required mutable permission is limited to Contents/Git data needed by the isolated branch tests.
 
-A broad classic token that can mutate the plugin source repository or unrelated repositories is not a release-qualifying configuration.
+A classic/broad token able to mutate the source repository or unrelated repositories is not release-qualifying configuration.
 
-The workflow cannot always infer every external credential policy attribute, so this restriction is both:
+This restriction is a documented environment prerequisite and is reinforced by numeric repository-ID checks at runtime.
 
-- a configuration prerequisite documented in the runbook,
-- a defense complemented by numeric repository-ID checks at runtime.
+## 1.2 Initialized disposable repository prerequisite
 
-## 1.2 Secret lifetime
+The target test repository must already have an initialized readable default branch.
+
+The live suite mutates only its generated non-default branch. It never relies on creating or replacing the repository's default branch.
+
+This makes the actual default-branch ref a concrete non-destructive capability probe for Git-ref read access.
+
+## 1.3 Secret lifetime
 
 `E2E_TOKEN` / `GITHUB_E2E_TOKEN` is never job-level environment state.
 
-The qualification job has two stages:
-
-```text
-secret-free preparation
-        ↓
-secret-bearing destructive execution
-```
-
 Secret-free preparation includes:
 
-- checkout,
-- pnpm setup,
-- Node setup,
-- frozen dependency install,
-- plugin build,
-- compilation/bundling of the real-GitHub E2E test bundles.
-
-The destructive token is introduced only to:
-
-1. the target identity guard step,
-2. the precompiled real-GitHub E2E execution step.
-
-Audit artifact creation/upload does not receive the destructive token.
-
-Cleanup receives the token only in its cleanup/verification step.
-
-## 1.3 Precompiled test execution
-
-The live workflow must not call a command that recompiles the E2E suite while the destructive token is present.
-
-The runner is structured so the workflow can perform:
-
 ```text
-pnpm test:github-e2e:compile      # no destructive token
-node <precompiled serial test runner>   # destructive token present
+checkout
+pnpm/Node setup
+frozen install
+plugin build
+E2E compilation/bundling
 ```
 
-Local/manual `pnpm test:github-e2e:quick` may remain a convenience command that performs prepare + execute in one invocation because local credential exposure is controlled by the maintainer running it. The release-qualifying Actions workflow uses the split boundary.
+The destructive token appears only in:
+
+1. target identity/capability guard,
+2. execution of already-precompiled real-GitHub tests,
+3. cleanup/verification step in cleanup job.
+
+Audit generation/upload does not receive the destructive token.
+
+## 1.4 Precompile before secret
+
+The release-qualifying workflow must not call a command that can compile/bundle while the token is present.
+
+Actions flow:
+
+```text
+pnpm test:github-e2e:compile      # no E2E token
+node <precompiled serial runner>  # E2E token present
+```
+
+Local/manual convenience commands may still combine compile+run outside the release-qualifying Actions boundary.
 
 ---
 
 # 2. Target Repository Identity
 
-## 2.1 Immutable authority
+## 2.1 Numeric repository ID is safety authority
 
-For workflow/test safety, the target repository is identified by GitHub's numeric repository ID.
+Workflow/test safety identifies the target by GitHub numeric repository ID. Owner/name strings are routing interfaces only.
 
-Owner/name strings are discovery/routing interfaces only.
-
-The workflow resolves configured `E2E_OWNER/E2E_REPO` with the target token and records:
+The guard resolves configured target metadata with the target token:
 
 ```text
 id
@@ -106,10 +94,10 @@ full_name
 default_branch
 ```
 
-Before destructive work it requires:
+Before destructive work require:
 
 ```text
-target metadata request succeeds
+target metadata request = success
 target.id != GITHUB_REPOSITORY_ID
 source ref == refs/heads/master
 current source master == GITHUB_SHA
@@ -117,11 +105,11 @@ branch == obsidian-sync-e2e/run-${GITHUB_RUN_ID}
 branch != target.default_branch
 ```
 
-Repository-name case differences cannot bypass the numeric-ID comparison.
+Case-only owner/repository changes cannot bypass numeric identity.
 
-## 2.2 Qualification outputs
+## 2.2 Guard outputs
 
-The guard step writes non-secret job outputs before destructive execution:
+Before destructive execution the guard exports non-secret job outputs:
 
 ```text
 target_repo_id
@@ -130,21 +118,19 @@ target_default_branch
 target_branch
 ```
 
-If these outputs are not produced successfully, the destructive test step must not run.
+If these outputs do not exist, destructive execution must not start.
 
-The target token itself is never a job output.
+The token is never an output.
 
-## 2.3 Canonical target name
+## 2.3 Canonical routing name
 
-After resolving metadata, child processes use `target.full_name` as the canonical owner/repo route rather than the original configured casing/alias.
-
-This avoids relying on mutable capitalization while still binding safety to numeric repository ID.
+After metadata resolution, child test processes receive owner/repo values derived from canonical `full_name`, while expected identity remains numeric ID.
 
 ---
 
-# 3. Shared Destructive-Safety Library
+# 3. One Shared Destructive-Safety Authority
 
-The current live suites duplicate repository metadata, branch deletion, default-branch, and 404 handling. This child consolidates those safety primitives into one test-support module used by all credentialed E2E suites.
+Current credentialed E2E files duplicate repository/default-branch/delete/absence logic. Consolidate those semantics into one test-support module shared by every credentialed suite.
 
 Suggested location:
 
@@ -152,9 +138,7 @@ Suggested location:
 tests/github-e2e/support/target-safety.ts
 ```
 
-The exact filename may change during planning, but there must be one shared authority for destructive safety semantics.
-
-The helper owns:
+The helper owns primitives equivalent to:
 
 ```text
 resolveCanonicalTarget()
@@ -167,305 +151,269 @@ deleteDisposableBranch()
 waitForDisposableBranchAbsent()
 ```
 
-It does not own scenario-specific sync behavior.
+Scenario-specific sync logic remains in scenario files.
 
-## 3.1 Expected repository ID
+When `GITHUB_E2E_EXPECTED_REPO_ID` exists, every destructive reset/delete boundary requires the current resolved repository ID to equal it.
 
-When `GITHUB_E2E_EXPECTED_REPO_ID` is present, every destructive reset boundary requires:
+---
 
-```text
-resolved target.id == expected ID
-```
+# 4. Disposable Branch Contract
 
-A mismatch is a hard failure and performs no deletion/reset mutation.
-
-## 3.2 Disposable branch contract
-
-Release-qualifying Actions runs require the exact generated branch:
+Release-qualifying Actions runs use exactly:
 
 ```text
 obsidian-sync-e2e/run-${GITHUB_RUN_ID}
 ```
 
+Reruns of the same workflow run intentionally reuse the same branch so they can reset residue from a previous attempt. Different run IDs remain isolated.
+
 The helper rejects:
 
 - empty branch,
-- branch equal to actual target default branch,
-- branch not matching the exact generated contract when the workflow run ID is available.
+- branch equal to actual default branch,
+- branch not matching the exact run-derived contract in Actions mode.
 
-Local/manual E2E may use a different explicit disposable branch, but still rejects the actual default branch and retains conservative forbidden-name defense in depth.
+Local/manual mode may use another explicit disposable branch but still rejects the actual default branch and may retain conservative forbidden-name checks as defense in depth.
 
 ---
 
-# 4. Git-Ref Capability and 404 Semantics
+# 5. Git-Ref Capability and Absence Semantics
 
-Repository metadata visibility alone does not prove that the token can read Git refs. Therefore an exact branch 404 is not accepted as proof of absence until Git-ref read capability has been demonstrated.
+## 5.1 Concrete capability probe
 
-## 4.1 Capability probe
+Repository metadata visibility alone is not enough to trust a branch 404.
 
-Before destructive cleanup/reset interprets exact-ref absence, perform a non-destructive Git-ref read operation whose successful response proves ref-read capability for the target repository.
-
-The implementation may use a stable Git refs endpoint/collection appropriate to the GitHub API, but the contract is:
+After resolving target metadata, read the actual default-branch Git ref:
 
 ```text
-repository metadata = reachable and expected ID
-Git-ref capability probe = success
+GET /git/ref/heads/<encoded default_branch>
 ```
 
-Only then can exact-ref 404/recognized "reference does not exist" semantics be treated as absence.
+It must return a successful ref with a non-empty object SHA.
 
-## 4.2 Branch absence sequence
+Failure to read the initialized default-branch ref means Git-ref capability is not established; cleanup/reset fails closed and performs no delete based on an absence interpretation.
+
+## 5.2 Exact disposable-branch absence
+
+Only after metadata identity + default-branch-ref capability succeed:
+
+```text
+GET exact disposable ref
+```
+
+can a recognized absent-ref response be interpreted as absence.
 
 Required sequence:
 
 ```text
-resolve target metadata
+resolve metadata
 verify numeric ID
-verify branch contract/default branch
-verify Git-ref read capability
-GET exact disposable branch
+verify generated branch + not default
+GET actual default-branch ref = 200
+GET exact disposable ref
         ↓
-recognized absent response => success, no DELETE
-200 => DELETE exact disposable branch
+recognized absent => success/no DELETE
+200 => DELETE exact disposable ref
 other => failure
         ↓
-verify Git-ref read capability still succeeds
-GET exact disposable branch
+GET actual default-branch ref = 200 again
+GET exact disposable ref
         ↓
-recognized absent response => deletion confirmed
-200 => retry/fail boundedly
+recognized absent => deletion confirmed
+200 => bounded retry/failure
 other => failure
 ```
 
-The design does not blindly accept arbitrary `422` as absence. Only a documented/recognized reference-absent response may be normalized to absence.
-
-Retries remain bounded.
+Do not blindly accept all `422` responses. Only an explicitly recognized missing-reference response may be normalized to absence, and only after capability is proven.
 
 ---
 
-# 5. Runner Revalidation
+# 6. Runner Revalidation
 
-Workflow-level guards are insufficient because the precompiled suites still route requests by owner/repo strings.
-
-The destructive test step passes:
+The token-bearing execution step passes:
 
 ```text
 GITHUB_E2E_EXPECTED_REPO_ID
-GITHUB_E2E_OWNER / REPO from canonical full_name
+canonical GITHUB_E2E_OWNER
+canonical GITHUB_E2E_REPO
 GITHUB_E2E_BRANCH
 GITHUB_E2E_TOKEN
 ```
 
-Before spawning test scenarios, the runner independently resolves metadata and requires:
+Before spawning precompiled tests, the runner independently requires:
 
 ```text
 resolved ID == expected ID
-resolved full_name is canonicalized into child env
-branch != resolved default_branch
+resolved canonical full_name matches child routing env
+branch != actual default branch
 branch matches workflow disposable contract
-Git-ref read capability succeeds
+actual default-branch Git ref is readable
 ```
 
-The runner then executes precompiled test files serially.
+Precompiled test files execute serially.
 
-Each scenario-specific reset/delete uses the shared safety helper, which re-resolves identity at the destructive boundary.
+Every destructive scenario reset uses the shared safety helper and re-resolves identity at that destructive boundary.
 
-The design does not require an identity API call before every blob/tree read. Identity is revalidated before destructive reset/delete boundaries; unique branch isolation and narrow credential scope provide the remaining defense in depth.
+Identity checks are not required before every blob/tree read; narrow credential scope + isolated branch + destructive-boundary revalidation provide the intended defense in depth.
 
 ---
 
-# 6. Live Workflow Structure
+# 7. Live Workflow Structure
 
-## 6.1 Qualification job
-
-High-level order:
+## 7.1 Qualification job order
 
 ```text
-checkout exact SHA                    [no E2E token]
-setup/install/build                    [no E2E token]
-compile E2E bundles                    [no E2E token]
-resolve/guard target identity          [E2E token only here]
-run precompiled serial E2E             [E2E token only here]
-write audit manifest                   [no E2E token]
-upload audit artifact                  [no E2E token]
+checkout exact source SHA             [no E2E token]
+setup/install/build                   [no E2E token]
+compile E2E bundles                   [no E2E token]
+resolve target + ID/default-ref guard [E2E token only here]
+run precompiled E2E serially          [E2E token only here]
+write audit manifest                  [no E2E token]
+upload audit artifact                 [no E2E token]
 ```
 
 The source workflow token remains read-only.
 
-## 6.2 Audit manifest
+## 7.2 Audit manifest
 
-The non-secret audit manifest includes at least:
+Best-effort audit data includes:
 
-```json
-{
-  "schemaVersion": 1,
-  "commitSha": "...",
-  "workflowRunId": "...",
-  "workflowRunAttempt": 1,
-  "targetRepositoryId": "...",
-  "targetFullName": "...",
-  "targetBranch": "...",
-  "suite": "github-e2e-quick",
-  "qualifiedAt": "..."
-}
+```text
+schemaVersion
+commitSha
+workflowRunId
+workflowRunAttempt
+targetRepositoryId
+targetFullName
+targetBranch
+suite
+qualifiedAt
 ```
 
-Artifact upload remains best-effort human evidence; release authority is workflow/job metadata, not artifact retention.
+The artifact is human evidence, not release authority.
 
-## 6.3 Cleanup job
+## 7.3 Cleanup job
 
-`cleanup` runs with `if: always()` and `needs: qualify`.
-
-It receives the target token only in the cleanup step and receives the non-secret qualified target identity through `needs.qualify.outputs`.
+`cleanup` uses `if: always()` and `needs: qualify`.
 
 Before any DELETE it requires:
 
 ```text
-qualified target repo ID non-empty
-current configured target resolves
-resolved target ID == qualified target ID
-resolved target ID != source GITHUB_REPOSITORY_ID
+qualified target repo ID exists
+currently configured target resolves
+current target ID == qualified target ID
+current target ID != source repository ID
 branch == expected run-derived branch
-branch != actual target default branch
-Git-ref read capability succeeds
+branch != actual default branch
+actual default-branch ref readable
 ```
 
-If identity cannot be established, cleanup deletes nothing and fails.
+Identity/capability ambiguity deletes nothing and fails.
 
-A hard workflow cancellation can still prevent cleanup from executing. Unique per-run branch naming bounds residue to the disposable target repository.
+Hard cancellation can still prevent cleanup; unique run-derived branch bounds residue to the disposable target.
 
 ---
 
-# 7. Manual/Local E2E Safety
+# 8. Local and Emergency Cleanup
 
-## 7.1 Local runner
+## 8.1 Local runner
 
-Local/manual execution always resolves target metadata before destructive test execution and rejects the actual default branch.
+Local/manual execution always resolves target metadata and actual default branch before destructive work.
 
-If the user supplies an expected numeric repository ID, the runner enforces it exactly.
+If an expected numeric target ID is supplied, it is enforced exactly.
 
-When no source repository ID is available locally, the runner cannot prove source-vs-target inequality by numeric identity. The documentation therefore requires the configured repository to be a dedicated disposable test repository and recommends supplying an expected target ID for stronger local assurance.
+Without a known source numeric ID, local mode cannot prove source-vs-target inequality automatically; documentation therefore requires an explicitly dedicated disposable target and recommends recording/supplying its numeric ID.
 
-## 7.2 Emergency cleanup command
+## 8.2 Manual residue cleanup
 
-The documented manual cleanup procedure must use the same safety order as automated cleanup:
+The documented emergency cleanup command follows the same invariant order:
 
 ```text
-resolve repository metadata
-print canonical full_name + numeric ID + default branch
-require maintainer-provided/recorded expected target ID
+require maintainer-known expected target repository ID
+resolve metadata
+print canonical full_name + ID + default branch
+require resolved ID == expected ID
 require branch matches disposable residue contract
 require branch != default branch
-prove Git-ref read capability
-read exact branch
-only then delete if present
-verify absence
+read actual default-branch ref successfully
+read exact disposable ref
+only if present: delete exact disposable ref
+read default-branch ref again
+verify disposable ref absent
 ```
 
-The runbook no longer provides a blind `DELETE` command that treats unauthenticated/permission-masked 404 as success.
+The docs no longer offer a blind delete command that accepts permission-masked 404 as success.
 
-The qualification audit manifest supplies the expected target repository ID/full name/branch needed for residue inspection when available.
-
----
-
-# 8. Real-E2E Retry Consumers
-
-The two live suites that currently wrap `V4SyncSession` retry publication races are:
-
-```text
-tests/github-e2e/v4-real-github-e2e.test.ts
-tests/github-e2e/v4-copy-contract-github-e2e.test.ts
-```
-
-Both must move from message regex matching to the shared typed publication-race predicate specified by the Publication Race and Conflict Recovery child design.
-
-Harness retry policy remains **Normal-only**, preserving current E2E behavior:
-
-```text
-V4PublicationRaceError + operation=normal => retry, bounded to 3
-otherwise => propagate
-```
-
-This differs intentionally from production runtime's current operation-agnostic branch-race retry policy.
-
-Harness-specific conflict-copy stage clearing between attempts may remain until the E2E harness models the full production recovery store.
+If the audit artifact is missing after hard cancellation, the expected repository ID must come from maintainer-known target configuration/workflow evidence; it must not be inferred solely from whichever owner/repo strings happen to be configured at cleanup time.
 
 ---
 
 # 9. Tests
 
-## 9.1 Shared safety helper tests
+## 9.1 Shared helper
 
 Cover:
 
-- case-different owner/repo resolving to source numeric ID is rejected,
-- expected target ID mismatch rejects before mutation,
-- actual default branch rejected regardless of its name,
-- malformed workflow branch rejected,
-- metadata 404/403 fails closed,
-- Git-ref capability failure fails closed,
-- exact branch 404 accepted only after capability success,
-- arbitrary 422 not accepted as absence,
-- recognized missing-reference response accepted after capability success,
-- delete followed by successful absence verification,
-- post-delete ref-capability loss fails rather than being mistaken for absence.
+- case-different name resolving to source numeric ID rejected,
+- expected target-ID mismatch before mutation,
+- actual default branch rejected regardless of name,
+- malformed run-derived branch rejected,
+- metadata failure fails closed,
+- default-branch ref unreadable fails closed,
+- exact disposable 404 accepted only after capability success,
+- arbitrary 422 rejected,
+- recognized missing-reference response accepted only with capability,
+- deletion followed by absence verification,
+- post-delete loss of default-ref capability fails instead of masquerading as success.
 
-## 9.2 Runner tests
+## 9.2 Runner/workflow
 
 Cover:
 
-- precompiled execution path does not invoke compile when token-bearing mode is selected,
-- expected repository ID passed/revalidated,
-- canonical full name propagated to child test env,
-- test files execute serially,
-- destructive reset calls shared helper.
-
-## 9.3 Workflow feasibility contracts
-
-Verify semantic markers/order for:
-
+- token-bearing mode executes precompiled tests without compiling,
+- expected repository ID revalidated,
+- canonical full name propagated,
+- tests serial,
+- destructive reset uses shared helper,
 - no job-level E2E token,
-- compile occurs before token-bearing execution,
-- target guard outputs numeric ID before destructive step,
-- source/target numeric inequality,
+- compile precedes token-bearing execution,
+- guard outputs ID before destructive step,
 - cleanup consumes qualified target ID,
-- cleanup capability probe precedes absent-branch interpretation,
-- audit manifest contains target repository ID/run attempt,
-- workflow token is read-only.
+- audit includes target ID + run attempt,
+- source workflow token remains read-only.
+
+Publication-race retry classification inside E2E wrappers is owned and tested by the Publication Race and Conflict Recovery child design, not this child.
 
 ---
 
-# 10. User/Maintainer Flow
+# 10. Maintainer Flow
 
-Release-qualifying setup is explicit:
+1. maintain an initialized dedicated disposable repository,
+2. configure a narrowly scoped credential that can mutate only that target,
+3. configure `E2E_OWNER`, `E2E_REPO`, `E2E_TOKEN`,
+4. dispatch GitHub E2E Live from exact current `master`,
+5. require both `qualify` and `cleanup` success.
 
-1. create/select a dedicated disposable repository,
-2. configure a narrowly scoped mutable credential for only that repository,
-3. configure environment `E2E_OWNER`, `E2E_REPO`, `E2E_TOKEN`,
-4. dispatch GitHub E2E Live from `master`,
-5. inspect `qualify` and `cleanup` results.
+Normal Obsidian users see no behavior change.
 
-Normal users of the Obsidian plugin see no behavior change from this child design.
-
-Maintainers gain safer failure behavior: if identity or ref-read capability becomes ambiguous, the workflow fails without deleting anything.
+If repository identity, default branch, or ref-read capability is ambiguous, the system fails without deleting anything.
 
 ---
 
 # 11. Acceptance Criteria
 
-This child is complete when:
+Complete only when:
 
-- release-qualifying credential scope is documented as restricted to the disposable repository,
+- release-qualifying credentials are documented as target-repository scoped,
+- target repository is required to have a readable initialized default branch,
 - destructive token is absent from checkout/install/build/compile/audit steps,
-- live workflow compiles E2E before introducing the destructive token,
-- numeric target repository ID is established before destructive work,
-- source repository numeric ID cannot equal target numeric ID,
-- runner independently revalidates expected target ID/default branch/ref capability,
-- all credentialed suites share one destructive-safety helper,
-- no suite blindly accepts arbitrary 404/422 as branch absence,
-- cleanup proves Git-ref read capability before interpreting branch absence,
-- cleanup is bound to the exact qualified target ID,
-- hard cancellation residue remains isolated by run-derived branch,
-- manual cleanup follows the same identity/default-branch/capability invariants,
-- audit evidence records target ID/full name/branch/run attempt,
-- both regex-based live-E2E retry wrappers migrate to typed publication-race detection while preserving Normal-only harness retry behavior.
+- live Actions execution uses precompiled E2E bundles under the token,
+- numeric target ID is established before destructive work and cannot equal source ID,
+- runner independently revalidates target ID/default branch/default-ref capability,
+- all credentialed suites use one destructive-safety helper,
+- absence semantics never rely on metadata visibility alone,
+- arbitrary 404/422 is not blindly treated as absent branch,
+- cleanup is bound to the exact qualified target ID and run-derived branch,
+- hard-cancel residue remains isolated,
+- manual cleanup uses the same ID/default-branch/ref-capability contract,
+- audit evidence records target identity and workflow run attempt.
