@@ -10,8 +10,13 @@ import { createEmptyV4LocalIndex, type V4LocalIndex } from "../../src/lib/v4/loc
 import { expectedV4PathLayout, V4_FORMAT_VERSION, type V4RemoteConfig, type V4StorageMode } from "../../src/lib/v4/protocol-types";
 import { V4StorageCodec } from "../../src/lib/v4/storage-codec";
 import { V4SyncSession, type V4SessionVault, type V4SyncRunState } from "../../src/lib/v4/sync-session";
+import {
+  encodeGitHubE2ERefPath,
+  readGitHubE2ETargetEnvironment,
+  resetGitHubE2EDisposableBranch,
+  resolveGitHubE2ETarget,
+} from "./support/target-safety";
 
-const forbiddenBranches = new Set(["main", "master", "production", "prod", "release", "stable"]);
 const encoder = new TextEncoder();
 
 type E2ESession = Pick<V4SyncSession, "sync">;
@@ -40,25 +45,8 @@ interface InterferenceState {
 
 const interference: InterferenceState = { armed: false, fired: false };
 
-function requiredEnv(name: string): string {
-  const value = process.env[name];
-  if (!value) throw new Error(`Missing required env var: ${name}`);
-  return value;
-}
-
-function githubConfig(): GitHubConfig {
-  const branch = requiredEnv("GITHUB_E2E_BRANCH");
-  if (forbiddenBranches.has(branch.toLowerCase())) throw new Error(`Refusing destructive GitHub E2E branch: ${branch}`);
-  return {
-    owner: requiredEnv("GITHUB_E2E_OWNER"),
-    repo: requiredEnv("GITHUB_E2E_REPO"),
-    branch,
-    token: requiredEnv("GITHUB_E2E_TOKEN"),
-  };
-}
-
 function branchPath(config: GitHubConfig): string {
-  return config.branch.split("/").map(encodeURIComponent).join("/");
+  return encodeGitHubE2ERefPath(config.branch);
 }
 
 function bytes(text: string): Uint8Array {
@@ -219,25 +207,6 @@ function armInterference(marker: string): void {
   interference.marker = marker;
 }
 
-async function waitForBranchAbsent(config: GitHubConfig, encodedBranch: string, timeoutMs = 15_000): Promise<void> {
-  const startedAt = Date.now();
-  while (Date.now() - startedAt <= timeoutMs) {
-    const response = await githubRequest(config, `/git/ref/heads/${encodedBranch}?_=${Date.now()}`);
-    if (response.status === 404) return;
-    const responseText = await response.text();
-    if (response.status === 422) {
-      try {
-        if ((JSON.parse(responseText) as { message?: string }).message === "Reference does not exist") return;
-      } catch {
-        // Continue to the explicit unexpected-response error below.
-      }
-    }
-    if (response.status !== 200) throw new Error(`Cannot verify GitHub E2E branch deletion: HTTP ${response.status} ${responseText}`);
-    await new Promise(resolve => setTimeout(resolve, 250));
-  }
-  throw new Error(`Timed out waiting for GitHub E2E branch deletion after ${timeoutMs}ms.`);
-}
-
 async function waitForBranchHead(config: GitHubConfig, expectedSha: string, timeoutMs = 15_000): Promise<void> {
   const startedAt = Date.now();
   while (Date.now() - startedAt <= timeoutMs) {
@@ -251,34 +220,6 @@ async function waitForBranchHead(config: GitHubConfig, expectedSha: string, time
     await new Promise(resolve => setTimeout(resolve, 250));
   }
   throw new Error(`Timed out waiting for GitHub E2E branch head ${expectedSha} after ${timeoutMs}ms.`);
-}
-
-async function deleteTestBranch(config: GitHubConfig): Promise<void> {
-  resetInterference();
-  const repository = await githubRequest(config, "");
-  if (!repository.ok) throw new Error(`Cannot inspect GitHub E2E repository: HTTP ${repository.status}`);
-  const metadata = await repository.json() as { default_branch: string };
-  if (metadata.default_branch === config.branch) throw new Error("GITHUB_E2E_BRANCH must not be the repository default branch.");
-
-  const encodedBranch = branchPath(config);
-  const response = await githubRequest(config, `/git/refs/heads/${encodedBranch}`, { method: "DELETE" });
-  if (response.status === 204 || response.status === 404) {
-    await waitForBranchAbsent(config, encodedBranch);
-    return;
-  }
-
-  const responseText = await response.text();
-  if (response.status === 422) {
-    try {
-      if ((JSON.parse(responseText) as { message?: string }).message === "Reference does not exist") {
-        await waitForBranchAbsent(config, encodedBranch);
-        return;
-      }
-    } catch {
-      // Fall through so malformed validation responses remain visible.
-    }
-  }
-  throw new Error(`Cannot reset GitHub E2E branch: HTTP ${response.status} ${responseText}`);
 }
 
 class MemoryVault implements V4SessionVault {
@@ -455,7 +396,7 @@ async function runScenario(
     device: (name: string, now?: () => number) => DeviceContext;
   }) => Promise<void>,
 ): Promise<void> {
-  await deleteTestBranch(config);
+  await resetGitHubE2EDisposableBranch(targetEnvironment);
   const context = await createModeContext(mode, config);
   const devices: DeviceContext[] = [];
   const started = performance.now();
@@ -781,12 +722,14 @@ async function runControlledRaceScenario(config: GitHubConfig): Promise<void> {
   });
 }
 
-const config = githubConfig();
+const targetEnvironment = readGitHubE2ETargetEnvironment();
+const initialTarget = await resolveGitHubE2ETarget(targetEnvironment);
+const config = initialTarget.config;
 installRequestUrlBridge(config);
 
 after(async () => {
   try {
-    await deleteTestBranch(config);
+    await resetGitHubE2EDisposableBranch(targetEnvironment);
     console.log(`GitHub E2E branch cleanup verified: ${config.branch}`);
   } finally {
     setRequestUrlHandler(null);
