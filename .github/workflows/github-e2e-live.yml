@@ -417,27 +417,31 @@ jobs:
           }
 
           let base = await resolveTarget();
-          const exact = () => `${base}/git/refs/heads/${encodeRef(branch)}`;
-          const before = await fetch(exact(), { headers });
+          const exactRead = () => `${base}/git/ref/heads/${encodeRef(branch)}`;
+          const exactDelete = () => `${base}/git/refs/heads/${encodeRef(branch)}`;
+          const before = await fetch(exactRead(), { headers });
           const beforeBody = await text(before);
           if (!exactMissing(before.status, beforeBody)) {
             if (before.status !== 200) throw new Error(`Cannot inspect cleanup ref: HTTP ${before.status} ${beforeBody}`);
-            const deleted = await fetch(exact(), { method: "DELETE", headers });
+            const deleted = await fetch(exactDelete(), { method: "DELETE", headers });
             const deletedBody = await text(deleted);
             if (deleted.status !== 204 && !exactMissing(deleted.status, deletedBody)) {
               throw new Error(`Cannot remove cleanup ref: HTTP ${deleted.status} ${deletedBody}`);
             }
           }
 
-          for (let attempt = 1; attempt <= 3; attempt++) {
+          const cleanupDeadline = Date.now() + 15_000;
+          while (true) {
             base = await resolveTarget();
-            const verify = await fetch(exact(), { headers });
+            const verify = await fetch(exactRead(), { headers });
             const verifyBody = await text(verify);
             if (exactMissing(verify.status, verifyBody)) process.exit(0);
             if (verify.status !== 200) {
               throw new Error(`Cannot verify cleanup ref absence: HTTP ${verify.status} ${verifyBody}`);
             }
-            if (attempt < 3) await sleep(attempt * 2_000);
+            const remaining = cleanupDeadline - Date.now();
+            if (remaining <= 0) break;
+            await sleep(Math.min(500, remaining));
           }
-          throw new Error(`Disposable E2E branch still exists after cleanup attempts: ${branch}`);
+          throw new Error(`Timed out waiting for disposable E2E branch deletion: ${branch}`);
           NODE
