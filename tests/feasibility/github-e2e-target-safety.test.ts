@@ -15,9 +15,10 @@ function scriptedFetch(steps: Array<{ method?: string; path: string; status: num
     assert.ok(step, `unexpected request ${(init.method ?? "GET").toUpperCase()} ${url}`)
     assert.equal((init.method ?? "GET").toUpperCase(), step.method ?? "GET")
     assert.equal(new URL(url).pathname, step.path)
-    return new Response(step.body === undefined ? "" : JSON.stringify(step.body), {
+    const body = step.status === 204 ? null : (step.body === undefined ? "" : JSON.stringify(step.body))
+    return new Response(body, {
       status: step.status,
-      headers: { "content-type": "application/json" },
+      headers: step.status === 204 ? undefined : { "content-type": "application/json" },
     })
   }
 }
