@@ -191,6 +191,29 @@ test("runtime retries a structured publication race even when its message has no
   runtime.dispose()
 })
 
+test("force operations preserve typed publication-race outer retry compatibility", async () => {
+  for (const operation of ["forcePush", "forcePull"] as const) {
+    const { runtime, githubClient } = await initializeFixture()
+    githubClient.nextRefReadError = Object.assign(new Error(`typed ${operation} race`), {
+      code: "V4_PUBLICATION_RACE",
+      phase: "pre-publish",
+      expectedHeadSha: githubClient.ref!.sha,
+      observedHeadSha: `other-${operation}`,
+      publicationOutcome: "not-published",
+      evidence: "pre-publish-head-mismatch",
+    })
+    const attempts: number[] = []
+    const unsubscribe = runtime.subscribeProgress(snapshot => attempts.push(snapshot.attempt))
+
+    await runtime[operation]()
+    unsubscribe()
+
+    assert.equal(runtime.progressSnapshot.lifecycle, "success", operation)
+    assert.equal(Math.max(...attempts), 2, operation)
+    runtime.dispose()
+  }
+})
+
 test("terminal publication race log retains structured attempt and Git evidence", async () => {
   const { runtime, githubClient, vault, plugin } = await initializeFixture()
   vault.set("note.md", new TextEncoder().encode("changed\n"), 2)
