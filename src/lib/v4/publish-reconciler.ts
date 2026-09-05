@@ -79,13 +79,19 @@ export async function reconcileV4CandidatePublication(
 
   const queue = [currentHeadSha]
   const visited = new Set<string>()
-  const maxCommits = Math.max(1, Math.floor(input.maxCommits ?? 256))
+  const requestedMax = Math.floor(input.maxCommits ?? 256)
+  const maxCommits = Number.isFinite(requestedMax) ? Math.max(1, requestedMax) : 256
   let markerEquivalent: GitHubGitCommit | undefined
+  let traversalLimited = false
 
-  while (queue.length > 0 && visited.size < maxCommits) {
+  while (queue.length > 0) {
     throwIfV4Aborted(input.signal)
     const sha = queue.shift()!
     if (visited.has(sha)) continue
+    if (visited.size >= maxCommits) {
+      traversalLimited = true
+      break
+    }
     visited.add(sha)
     if (sha === input.candidateCommitSha) {
       return {
@@ -126,7 +132,7 @@ export async function reconcileV4CandidatePublication(
       verifiedHeadSha: currentHeadSha,
     }
   }
-  if (queue.length > 0) {
+  if (traversalLimited) {
     return {
       status: "indeterminate",
       evidence: "traversal-limit",
