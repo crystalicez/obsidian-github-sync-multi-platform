@@ -3,7 +3,7 @@ import type FastSync from "../../main"
 import { fromBase64Url, randomBytes, sha256Hex, toBase64Url, utf8ToBytes } from "../bytes"
 import { syncConsoleLog } from "../debug"
 import { readVaultFileBytes, writeVaultFileBytes, trashVaultFileIfExists } from "../vault"
-import { deriveV4Keyring, type V4Keyring } from "./crypto"
+import { deriveV4BootstrapRecoveryKey, deriveV4Keyring, type V4Keyring } from "./crypto"
 import {
   createEmptyV4LocalIndex,
   loadV4LocalIndex,
@@ -23,10 +23,10 @@ import { createV4ContentSource, createV4WholeBufferContentSource, DEFAULT_V4_WHO
 import { createV4PlatformIo, type V4BinaryAdapterLike, type V4PlatformIo } from "./platform-io"
 import { createV4StagingStore, type V4StagingStore } from "./staging-store"
 import { V4ProgressStore, type V4SyncProgressSnapshot } from "./progress"
-import { createV4RecoveryStore, discardV4RecoveryStages, markV4RecoveryIndexCommitted, recoverV4PendingState } from "./recovery-store"
+import { createV4RecoveryStore, discardV4RecoveryStages, markV4RecoveryIndexCommitted, recoverV4PendingState, V4RecoveryRequiredError } from "./recovery-store"
 import { V4KeyringCache } from "./keyring-cache"
 import { V4CancelledError, throwIfV4Aborted } from "./cancellation"
-import { isV4PublicationRaceError } from "./publication-race"
+import { V4PublicationRaceError, isV4PublicationRaceError } from "./publication-race"
 import { assertV4SpeculativeConfigStillAbsent, guardV4SpeculativeConfigGithub } from "./speculative-config-guard"
 
 const V4_INDEX_ROOT = "github-sync-v4-index"
@@ -414,6 +414,16 @@ export class V4PluginRuntime {
     }
     if (request.trigger === "startup") this.plugin.enableWatch()
     this.plugin.isSyncInProgress = true
+    let bootstrapRecoveryKeyCache: { repoId: string; credentialGeneration: number; key: Uint8Array } | undefined
+    const bootstrapRecoveryKeyFor = async (passphrase: string, repoId: string): Promise<Uint8Array> => {
+      if (bootstrapRecoveryKeyCache?.repoId === repoId && bootstrapRecoveryKeyCache.credentialGeneration === this.credentialGeneration) {
+        return bootstrapRecoveryKeyCache.key
+      }
+      bootstrapRecoveryKeyCache?.key.fill(0)
+      const key = await deriveV4BootstrapRecoveryKey({ passphrase, repoId })
+      bootstrapRecoveryKeyCache = { repoId, credentialGeneration: this.credentialGeneration, key }
+      return key
+    }
     syncConsoleLog(this.plugin.settings, "info", "V4 sync started", {
       operation: request.operation,
       trigger: request.trigger,
@@ -458,13 +468,43 @@ export class V4PluginRuntime {
             ? await this.keyringForConfig(authenticationConfig, passphrase, signal)
             : undefined
           const recoveryNamespace = (await sha256Hex(utf8ToBytes(config.repoId))).slice(0, 32)
-          const recoveryStore = createV4RecoveryStore({
+          const recoveryRoot = `${V4_RECOVERY_ROOT}/${recoveryNamespace}`
+          let recoveryPayloadKey: Uint8Array | undefined
+          if (config.mode === "encrypted") {
+            recoveryPayloadKey = configSelection.source === "speculative-empty"
+              ? await bootstrapRecoveryKeyFor(passphrase, config.repoId)
+              : keyring?.journalKey
+          }
+          let recoveryStore = createV4RecoveryStore({
             adapter: this.adapter,
-            root: `${V4_RECOVERY_ROOT}/${recoveryNamespace}`,
+            root: recoveryRoot,
             repoId: config.repoId,
-            payloadKey: config.mode === "encrypted" ? keyring?.journalKey : undefined,
+            payloadKey: recoveryPayloadKey,
           })
-          const pendingRecovery = await recoveryStore.load()
+          let pendingRecovery
+          try {
+            pendingRecovery = await recoveryStore.load()
+          } catch (error) {
+            if (
+              !(error instanceof V4RecoveryRequiredError)
+              || config.mode !== "encrypted"
+              || configSelection.source !== "observed-remote"
+              || !passphrase
+            ) throw error
+            const bootstrapKey = await bootstrapRecoveryKeyFor(passphrase, config.repoId)
+            const bootstrapStore = createV4RecoveryStore({
+              adapter: this.adapter,
+              root: recoveryRoot,
+              repoId: config.repoId,
+              payloadKey: bootstrapKey,
+            })
+            try {
+              pendingRecovery = await bootstrapStore.load()
+              recoveryStore = bootstrapStore
+            } catch {
+              throw error
+            }
+          }
           let reconciledRecovery = pendingRecovery
           if (pendingRecovery && pendingRecovery.header.phase !== "index-committed") {
             const recoveryHead = (await this.plugin.githubClient.getGitRefOrNull())?.sha ?? null
@@ -545,7 +585,14 @@ export class V4PluginRuntime {
           const recoveryReplan = error instanceof V4RecoveryReplanRequiredError && request.operation === "normal"
           if (casAttempt === 3 || (!publicationRace && !recoveryReplan)) {
             if (publicationRace && casAttempt === 3) {
-              error.message = "Remote branch changed repeatedly while syncing. Please try again."
+              throw new V4PublicationRaceError({
+                phase: error.phase,
+                expectedHeadSha: error.expectedHeadSha,
+                observedHeadSha: error.observedHeadSha,
+                publicationOutcome: error.publicationOutcome,
+                cause: error.cause,
+                message: "Remote branch changed repeatedly while syncing. Please try again.",
+              })
             }
             throw error
           }
@@ -575,6 +622,7 @@ export class V4PluginRuntime {
       new Notice(`GitHub Sync failed: ${message}`)
       return { changedFiles: 0 }
     } finally {
+      bootstrapRecoveryKeyCache?.key.fill(0)
       ;(this.plugin.githubClient as unknown as { setV4AbortSignal?(signal?: AbortSignal): void } | undefined)?.setV4AbortSignal?.(undefined)
       this.plugin.isSyncInProgress = false
       if (!this.disposed) {
