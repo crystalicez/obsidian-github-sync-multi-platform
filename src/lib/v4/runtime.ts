@@ -590,6 +590,7 @@ export class V4PluginRuntime {
                 expectedHeadSha: error.expectedHeadSha,
                 observedHeadSha: error.observedHeadSha,
                 publicationOutcome: error.publicationOutcome,
+                evidence: error.evidence,
                 cause: error.cause,
                 message: "Remote branch changed repeatedly while syncing. Please try again.",
               })
@@ -611,11 +612,19 @@ export class V4PluginRuntime {
       if (error instanceof V4CancelledError) return { changedFiles: 0 }
       const message = (error as Error).message
       const snapshot = this.progressStore.snapshot
+      const publicationRace = isV4PublicationRaceError(error) ? error : undefined
       syncConsoleLog(this.plugin.settings, "warn", "V4 sync failed", {
         operation: request.operation,
         trigger: request.trigger,
+        attempt: snapshot.attempt,
         phase: snapshot.phase,
         currentPath: snapshot.currentPath,
+        publicationPhase: publicationRace?.phase,
+        expectedHeadSha: publicationRace?.expectedHeadSha,
+        observedHeadSha: publicationRace?.observedHeadSha,
+        publicationOutcome: publicationRace?.publicationOutcome,
+        publicationEvidence: publicationRace?.evidence,
+        publicationCause: publicationRace?.cause,
         error,
       })
       this.progressStore.finish("failed", { errorMessage: message })
