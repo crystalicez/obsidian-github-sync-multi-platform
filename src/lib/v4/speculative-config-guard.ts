@@ -23,6 +23,7 @@ function bootstrapConfigRace(observedHeadSha: string | null): V4PublicationRaceE
     expectedHeadSha: null,
     observedHeadSha,
     publicationOutcome: "unknown",
+    evidence: "remote-config-appeared",
     message: "V4 remote configuration appeared while initializing an empty branch.",
   })
 }
