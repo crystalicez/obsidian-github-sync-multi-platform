@@ -6,6 +6,7 @@ import { GitHubClient, type GitHubConfig } from "../../src/lib/github-api";
 import { randomBytes, toBase64Url } from "../../src/lib/bytes";
 import { deriveV4Keyring, type V4Keyring } from "../../src/lib/v4/crypto";
 import { createEmptyV4LocalIndex, type V4LocalIndex } from "../../src/lib/v4/local-index";
+import { isV4PublicationRaceError } from "../../src/lib/v4/publication-race";
 import { expectedV4PathLayout, V4_FORMAT_VERSION, type V4RemoteConfig, type V4StorageMode } from "../../src/lib/v4/protocol-types";
 import { V4SyncSession, type V4SessionVault, type V4SyncRunState } from "../../src/lib/v4/sync-session";
 import {
@@ -110,7 +111,7 @@ function device(name: string, github: GitHubConfig, context: ModeContext, now?: 
         } catch (error) {
           lastError = error;
           const message = error instanceof Error ? error.message : String(error);
-          const retryable = options.operation === "normal" && /branch head changed|stale ref/i.test(message);
+          const retryable = options.operation === "normal" && isV4PublicationRaceError(error);
           if (!retryable || attempt === 3) throw error;
           runState.conflictCopyStages?.clear();
           console.warn(`Copy-contract E2E retrying normal sync after recoverable CAS race (attempt ${attempt + 1}/3): ${message}`);
