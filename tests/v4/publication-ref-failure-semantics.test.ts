@@ -141,6 +141,7 @@ test("advanced head with incomplete ancestry becomes typed unknown race and reta
   assert.equal(error.expectedHeadSha, "base")
   assert.equal(error.observedHeadSha, "later")
   assert.equal(error.publicationOutcome, "unknown")
+  assert.equal(error.evidence, "ancestry-read-failure")
   assert.equal(error.cause, original)
   assert.equal(github.updateCalls, 1)
 })
@@ -162,6 +163,7 @@ test("marker-equivalent publication in advanced ancestry becomes typed published
   assert.equal(error.phase, "post-publish")
   assert.equal(error.observedHeadSha, "later")
   assert.equal(error.publicationOutcome, "published")
+  assert.equal(error.evidence, "marker-equivalent")
   assert.equal(error.cause, original)
 })
 
