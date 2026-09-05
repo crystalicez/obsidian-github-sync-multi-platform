@@ -19,13 +19,17 @@ class WriterGithub implements V4GitTreeGithub {
   createCalls = 0
   refReads = 0
   failRefReadAt = new Set<number>()
+  afterRefReadFailure?: () => void
   mutationError: unknown
   afterMutationFailure?: () => void
   failCommitReads = new Set<string>()
 
   async getGitRefOrNull() {
     this.refReads++
-    if (this.failRefReadAt.has(this.refReads)) throw new Error(`ref-read-${this.refReads}-failed`)
+    if (this.failRefReadAt.has(this.refReads)) {
+      this.afterRefReadFailure?.()
+      throw new Error(`ref-read-${this.refReads}-failed`)
+    }
     return this.ref
   }
   async ensureGitRepositoryInitialized() { return this.ref }
@@ -78,6 +82,21 @@ async function capture(task: () => Promise<unknown>): Promise<unknown> {
   }
   throw new Error("expected rejection")
 }
+
+test("pre-publish ref read failure is not reclassified as an ambiguous post-publish race", async () => {
+  const github = new WriterGithub()
+  const candidate = await existingCandidate(github, "pre-read")
+  github.failRefReadAt.add(1)
+  github.afterRefReadFailure = () => {
+    github.ref = { ref: "refs/heads/main", sha: "later", type: "commit" }
+  }
+
+  const error = await capture(() => publishV4CandidateRef(github, candidate)) as Error & { code?: string }
+
+  assert.match(error.message, /ref-read-1-failed/iu)
+  assert.equal(error.code, undefined)
+  assert.equal(github.updateCalls, 0)
+})
 
 test("definitive ref failure with unchanged expected head preserves the original error without retry", async () => {
   const github = new WriterGithub()
