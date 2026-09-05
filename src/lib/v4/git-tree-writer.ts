@@ -233,7 +233,7 @@ export async function publishV4CandidateRef(github: V4GitTreeGithub, candidate: 
   throwIfV4Aborted(signal);
   const expectedHead = candidate.previousHeadSha ?? null;
   const journalId = candidate.message.startsWith("obsidian-sync-v4:") ? candidate.message.slice("obsidian-sync-v4:".length) : undefined;
-  const mutate = async (): Promise<void> => {
+  const assertExpectedHead = async (): Promise<void> => {
     throwIfV4Aborted(signal);
     const current = await github.getGitRefOrNull();
     if ((current?.sha ?? null) !== expectedHead) {
@@ -245,12 +245,15 @@ export async function publishV4CandidateRef(github: V4GitTreeGithub, candidate: 
         message: "V4 branch head changed before atomic publish.",
       });
     }
+  };
+  const mutate = async (): Promise<void> => {
     if (candidate.previousHeadSha !== undefined) await github.updateGitRef(candidate.commitSha, candidate.previousHeadSha);
     else await github.createGitRef(candidate.commitSha);
   };
 
   for (let attempt = 1; attempt <= 2; attempt++) {
     throwIfV4Aborted(signal);
+    await assertExpectedHead();
     try {
       await mutate();
       return;
