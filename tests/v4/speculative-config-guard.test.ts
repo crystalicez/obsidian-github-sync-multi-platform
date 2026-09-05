@@ -60,17 +60,38 @@ test("speculative empty config recheck reports a typed bootstrap-config race whe
   assert.equal(error.publicationOutcome, "unknown")
 })
 
-test("speculative guard catches V4 config that appears during the session read window", async () => {
+test("speculative guard catches V4 config that appears between the session ref read and config probe", async () => {
   const github = new MemoryGithub()
-  github.configBytes = bytes(plaintextConfig("o/r#main"))
   const guarded = guardV4SpeculativeConfigGithub(github, "o/r#main")
+
+  assert.equal(await guarded.getGitRefOrNull(), null)
+  github.ref = { ref: "refs/heads/main", sha: "winner", type: "commit" }
+  github.configBytes = bytes(plaintextConfig("o/r#main"))
 
   const error = await captureError(() => guarded.getFileBytes(V4_CONFIG_PATH))
 
   assert.equal(error.code, "V4_PUBLICATION_RACE")
   assert.equal(error.phase, "bootstrap-config")
-  assert.equal(error.observedHeadSha, null)
+  assert.equal(error.observedHeadSha, "winner")
   assert.equal(error.publicationOutcome, "unknown")
+})
+
+test("speculative guard deactivates after the first config probe so it does not flag the session's own publication", async () => {
+  const github = new MemoryGithub()
+  const guarded = guardV4SpeculativeConfigGithub(github, "o/r#main")
+
+  assert.equal(await guarded.getGitRefOrNull(), null)
+  assert.equal(await guarded.getFileBytes(V4_CONFIG_PATH), null)
+
+  github.ref = { ref: "refs/heads/main", sha: "own-publication", type: "commit" }
+  github.configBytes = bytes(plaintextConfig("o/r#main"))
+  const configReadsBeforePostPublishRef = github.configReads
+
+  assert.deepEqual(await guarded.getGitRefOrNull(), github.ref)
+  assert.equal(github.configReads, configReadsBeforePostPublishRef)
+  const file = await guarded.getFileBytes(V4_CONFIG_PATH, "own-publication")
+  assert.ok(file)
+  assert.deepEqual(file.bytes, github.configBytes)
 })
 
 test("speculative guard leaves malformed non-V4 config for the ordinary migration/error path", async () => {
