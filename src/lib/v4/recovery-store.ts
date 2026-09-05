@@ -408,7 +408,7 @@ export async function reconcileV4RecoveryPublishIntent(input: {
     phase: "replan-required",
     expectedRemoteHead: snapshot.header.expectedRemoteHead,
     candidateCommitSha: candidate,
-    verifiedRemoteHead: result.status === "published-advanced" ? result.publishedCommitSha : snapshot.header.verifiedRemoteHead,
+    verifiedRemoteHead: undefined,
     payload: snapshot.payload,
   })
 }
