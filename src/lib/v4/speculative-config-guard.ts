@@ -44,22 +44,21 @@ export function guardV4SpeculativeConfigGithub<T extends V4SpeculativeConfigGith
 ): T {
   const getGitRefOrNull = github.getGitRefOrNull.bind(github)
   const getFileBytes = github.getFileBytes.bind(github)
+  let configProbePending = true
 
   return new Proxy(github, {
     get(target, property, receiver) {
-      if (property === "getGitRefOrNull") {
-        return async (): Promise<GitHubGitRef | null> => {
-          const ref = await getGitRefOrNull()
-          if (!ref) return null
-          const file = await getFileBytes(V4_CONFIG_PATH, ref.sha)
-          if (file && validConfigForRepo(file.bytes, repoId)) throw bootstrapConfigRace(ref.sha)
-          return ref
-        }
-      }
+      if (property === "getGitRefOrNull") return getGitRefOrNull
       if (property === "getFileBytes") {
         return async (path: string, ref?: string): Promise<{ bytes: Uint8Array; sha: string } | null> => {
           const file = await getFileBytes(path, ref)
-          if (path !== V4_CONFIG_PATH || !file || !validConfigForRepo(file.bytes, repoId)) return file
+          if (!configProbePending || path !== V4_CONFIG_PATH) return file
+
+          // V4SyncSession always performs exactly one startup config probe after its
+          // initial ref read. Guard that race window, then stop intercepting so the
+          // session cannot mistake its own later publication for a bootstrap winner.
+          configProbePending = false
+          if (!file || !validConfigForRepo(file.bytes, repoId)) return file
           const observedHeadSha = ref ?? (await getGitRefOrNull())?.sha ?? null
           throw bootstrapConfigRace(observedHeadSha)
         }
