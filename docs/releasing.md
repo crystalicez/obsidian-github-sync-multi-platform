@@ -22,50 +22,72 @@ Commit/merge the version and source changes to `master`, then require ordinary d
 In repository **Settings -> Environments**, create `github-e2e` with:
 
 ```text
+Deployment branches and tags -> Selected branches and tags
+Allowed branch -> master
+Allowed tags -> none
+
 Variable: E2E_OWNER
 Variable: E2E_REPO
+Variable: E2E_REPO_ID
 Secret:   E2E_TOKEN
 ```
 
-The target must be a dedicated disposable repository, not this source repository and not a real notes repository. Prefer a fine-grained token scoped only to the disposable repository with repository Contents read/write permission.
+Do not use **Protected branches only** while `master` has no branch-protection rule. `E2E_REPO_ID` is the pinned numeric authority; owner/repository text is routing only. The target must be an initialized dedicated disposable repository, not this source repository and not a real notes repository. The release-qualifying target credential must have mutable scope only to that target repository.
 
-See `docs/github-e2e.md` for branch isolation and cleanup details.
+See `docs/github-e2e.md` for branch isolation, target-ID checks, cleanup evidence, and rerun semantics.
 
 ## 3. Qualify the exact master SHA
 
-In **Actions -> GitHub E2E Live -> Run workflow**, select `master` and start the workflow.
+Before dispatching the live workflow, require ordinary CI for the exact current `master` SHA to complete successfully. The current CI attempt must publish the exact release-qualifying artifact:
 
-A qualifying run requires:
+```text
+github-e2e-input-<master-sha>-<ci-run-id>-<ci-current-attempt>
+```
 
-- source ref is `master`,
-- dispatched `github.sha` is still the current `master` SHA,
-- target E2E repository is not the source repository,
-- job **qualify** succeeds,
-- job **cleanup** succeeds.
+Then in **Actions -> GitHub E2E Live -> Run workflow**, select `master` and start the workflow.
 
-The audit artifact is optional evidence. Stable release trusts exact-SHA workflow/job metadata, not artifact retention.
+The Child-B qualification flow is:
 
-If `master` changes after qualification, the old run cannot qualify the new tip. Run GitHub E2E Live again.
+```text
+ordinary CI exact master/current attempt succeeds
+-> current github-e2e-input artifact exists
+-> GitHub E2E Live current attempt consumes and verifies it
+-> same-attempt receipt persists before target mutation
+-> qualify succeeds
+-> cleanup succeeds in the same current attempt
+```
 
-## 4. Create a stable release
+A release-qualifying live run requires its **current/latest workflow attempt** to be cohesive:
 
-In **Actions -> Stable Release -> Run workflow**, select `master` and enter the exact stable `x.y.z` version already present in `package.json`/`manifest.json`.
+- source ref is `master` and dispatched `github.sha` is still current `master`,
+- newest exact-SHA ordinary CI `push` run is the authoritative producer and its current attempt/`verify` job succeeded,
+- the selected CI E2E artifact is unexpired and bound to that producer/source SHA,
+- pinned target repository ID differs from the source repository ID and its actual default Git ref is readable,
+- same-attempt qualification receipt exists before scenario mutation and binds source, CI producer/artifact, and target identity,
+- job **qualify** executes in that attempt and succeeds,
+- job **cleanup** executes in that same attempt and succeeds.
 
-Before publication the workflow verifies:
+If cleanup fails, **Re-run failed jobs** may be used to remove residue safely. That cleanup-only attempt is not release qualification. Use **Re-run all jobs** to create a new cohesive current attempt before release qualification is restored.
 
-- requested version/compatibility metadata are consistent,
-- requested stable version is monotonic and its tag/release does not already exist,
-- target SHA is current `master`,
-- a successful **GitHub E2E Live** run exists for that exact SHA with successful `qualify` and `cleanup` jobs,
-- frozen pnpm install, build, fast/repeat/recovery/resource/feasibility tests, GitHub-E2E compile gate, and package validation all pass,
-- `master` still points to the same SHA immediately before publication.
+If `master` changes after qualification, or ordinary CI is rerun for the same SHA and a newer producer attempt becomes authoritative, the previous live evidence is stale. Run **GitHub E2E Live** again.
 
-Only then does the workflow call `gh release create` for the exact qualified SHA and upload:
+## 4. Stable Release is temporarily interlocked
 
-- `main.js`,
-- `manifest.json`,
-- `styles.css`,
-- packaged plugin ZIP.
+Do **not** dispatch **Stable Release** while only the Live-E2E Safety child is installed. The legacy release gate cannot prove the new same-attempt receipt is bound to the current authoritative CI producer, so the workflow is intentionally fail-closed until the approved **Release Provenance and Versioning (Child A)** implementation replaces it.
+
+The temporary interlock is enforced in `.github/workflows/release.yml` before checkout or repository code execution, and the default workflow token is read-only (`actions: read`, `contents: read`). The interlock must not be removed as a manual workaround.
+
+Child A will replace the legacy release path with the approved flow:
+
+```text
+newest exact-SHA/current-attempt CI authority
+-> newest exact-SHA/current-attempt cohesive Live E2E authority
+-> same-attempt receipt binds the exact current CI producer/artifact
+-> promote exact CI-produced release bytes
+-> isolated tag/draft/assets/publish state machine
+```
+
+Until that implementation lands, version bumps, ordinary CI, Branch Candidate Builds, and GitHub E2E Live qualification remain available, but stable publication is deliberately unavailable.
 
 ## Branch candidate builds
 
@@ -75,7 +97,7 @@ There is no automatic public alpha/beta channel in the current release design.
 
 ## Partial publication failure
 
-Tag creation, release creation, and asset upload are not one cross-resource transaction. If the final publication command fails after mutation starts, inspect actual GitHub state before retrying or deleting anything.
+The legacy publication steps remain below the temporary interlock only as code to be replaced by Child A; they are unreachable while the interlock is active. If inspecting historical partial publication state from a run before the interlock, remember that tag creation, release creation, and asset upload were not one cross-resource transaction.
 
 ```bash
 VERSION=1.2.3
@@ -83,11 +105,11 @@ gh release view "$VERSION" --repo crystalicez/obsidian-github-sync-multi-platfor
 git ls-remote --tags origin "refs/tags/$VERSION"
 ```
 
-Do not automatically delete a tag/release just because the workflow failed. Inspect whether a valid release already exists, then remove only state the maintainer has determined is partial/invalid. The Stable Release workflow remains fail-closed while a conflicting tag or release exists.
+Do not automatically delete a tag/release just because an older workflow failed. Inspect whether a valid release already exists, then remove only state the maintainer has determined is partial/invalid.
 
 ## Local deterministic verification
 
-Before dispatching qualification/release, the equivalent local gate is:
+Before dispatching qualification, the equivalent local gate is:
 
 ```bash
 corepack pnpm install --frozen-lockfile
@@ -97,7 +119,7 @@ corepack pnpm test:repeat
 corepack pnpm test:recovery
 corepack pnpm test:resource
 corepack pnpm test:feasibility
-GITHUB_E2E_COMPILE_ONLY=1 corepack pnpm test:github-e2e:quick
+corepack pnpm test:github-e2e:compile
 corepack pnpm validate:package
 ```
 

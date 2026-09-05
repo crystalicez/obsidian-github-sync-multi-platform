@@ -12,10 +12,10 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: pnpm/action-setup@v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
       - name: Setup Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version-file: ".node-version"
           cache: pnpm
@@ -34,11 +34,23 @@ jobs:
       - name: Feasibility tests
         run: pnpm test:feasibility
       - name: Compile real GitHub E2E harness
-        run: GITHUB_E2E_COMPILE_ONLY=1 pnpm test:github-e2e:quick
+        run: >-
+          node scripts/run-github-e2e.mjs
+          --compile-only
+          --out-dir=.tmp/github-e2e-input
+          --write-input-manifest
       - name: Validate package
         run: pnpm validate:package
+      - name: Upload release-qualifying GitHub E2E input
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: github-e2e-input-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .tmp/github-e2e-input
+          include-hidden-files: true
+          if-no-files-found: error
       - name: Upload tested plugin artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: plugin-${{ github.sha }}
           path: |
