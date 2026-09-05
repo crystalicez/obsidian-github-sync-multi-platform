@@ -11,6 +11,7 @@ export interface V4PublicationRaceErrorInput {
   expectedHeadSha: string | null
   observedHeadSha: string | null
   publicationOutcome: V4PublicationOutcome
+  evidence?: string
   cause?: unknown
   message?: string
 }
@@ -21,6 +22,7 @@ export class V4PublicationRaceError extends Error {
   readonly expectedHeadSha: string | null
   readonly observedHeadSha: string | null
   readonly publicationOutcome: V4PublicationOutcome
+  readonly evidence: string | undefined
   readonly cause: unknown
 
   constructor(input: V4PublicationRaceErrorInput) {
@@ -30,6 +32,7 @@ export class V4PublicationRaceError extends Error {
     this.expectedHeadSha = input.expectedHeadSha
     this.observedHeadSha = input.observedHeadSha
     this.publicationOutcome = input.publicationOutcome
+    this.evidence = input.evidence
     this.cause = input.cause
   }
 }
