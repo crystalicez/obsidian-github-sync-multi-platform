@@ -96,6 +96,7 @@ export async function resolveV4PublicationBase(
       expectedHeadSha,
       observedHeadSha: ref?.sha ?? null,
       publicationOutcome: "not-published",
+      evidence: "pre-publish-head-mismatch",
       message: "V4 branch head changed before atomic publish.",
     });
   }
@@ -115,6 +116,7 @@ export async function resolveV4PublicationBase(
         expectedHeadSha: null,
         observedHeadSha: observed.sha,
         publicationOutcome: "unknown",
+        evidence: "bootstrap-head-appeared",
         cause: error,
         message: "V4 branch head changed during repository bootstrap.",
       });
@@ -242,6 +244,7 @@ export async function publishV4CandidateRef(github: V4GitTreeGithub, candidate: 
         expectedHeadSha: expectedHead,
         observedHeadSha: current?.sha ?? null,
         publicationOutcome: "not-published",
+        evidence: "pre-publish-head-mismatch",
         message: "V4 branch head changed before atomic publish.",
       });
     }
@@ -281,6 +284,7 @@ export async function publishV4CandidateRef(github: V4GitTreeGithub, candidate: 
           expectedHeadSha: expectedHead,
           observedHeadSha: reconciled.currentHeadSha,
           publicationOutcome: "published",
+          evidence: reconciled.evidence,
           cause: error,
           message: "V4 branch head changed after candidate publication.",
         });
@@ -295,6 +299,7 @@ export async function publishV4CandidateRef(github: V4GitTreeGithub, candidate: 
           expectedHeadSha: expectedHead,
           observedHeadSha: reconciled.currentHeadSha,
           publicationOutcome: "unknown",
+          evidence: reconciled.evidence,
           cause: error,
           message: "V4 branch head changed during candidate publication.",
         });
