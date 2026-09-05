@@ -152,6 +152,8 @@ async function initializeFixture() {
   const runtime = new V4PluginRuntime(fixture.plugin as never)
   await runtime.forcePush()
   assert.ok(fixture.githubClient.ref?.sha)
+  assert.equal(runtime.progressSnapshot.lifecycle, "success")
+  assert.equal(runtime.progressSnapshot.attempt, 1, "own bootstrap publication must not trigger a speculative-config retry")
   return { ...fixture, runtime }
 }
 
