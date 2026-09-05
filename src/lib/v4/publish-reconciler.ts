@@ -6,13 +6,16 @@ export interface V4PublishReconcilerGithub {
   getGitCommit(sha: string): Promise<GitHubGitCommit>
 }
 
-export type V4PublishReconcileStatus = "published" | "published-advanced" | "not-published" | "diverged"
+export type V4PublishReconcileStatus = "published" | "published-advanced" | "not-published" | "diverged" | "indeterminate"
 export type V4PublishReconcileEvidence =
   | "candidate-head"
   | "candidate-ancestor"
   | "marker-equivalent"
   | "expected-head"
   | "unrelated-head"
+  | "traversal-limit"
+  | "ancestry-read-failure"
+export type V4PublishReconcileIndeterminateReason = "traversal-limit" | "ancestry-read-failure"
 
 export interface V4PublishReconcileResult {
   status: V4PublishReconcileStatus
@@ -20,6 +23,7 @@ export interface V4PublishReconcileResult {
   currentHeadSha: string | null
   publishedCommitSha?: string
   verifiedHeadSha?: string
+  indeterminateReason?: V4PublishReconcileIndeterminateReason
 }
 
 export interface V4PublishReconcileInput {
@@ -60,18 +64,34 @@ export async function reconcileV4CandidatePublication(
   }
   if (!currentHeadSha) return { status: "diverged", evidence: "unrelated-head", currentHeadSha }
 
-  let candidate: GitHubGitCommit | undefined
-  try { candidate = await github.getGitCommit(input.candidateCommitSha) } catch {}
   const marker = markerFor(input.journalId)
+  let candidate: GitHubGitCommit | undefined
+  let incompleteAncestry = false
+  if (marker) {
+    try {
+      candidate = await github.getGitCommit(input.candidateCommitSha)
+      throwIfV4Aborted(input.signal)
+    } catch (error) {
+      if (input.signal?.aborted) throw error
+      incompleteAncestry = true
+    }
+  }
+
   const queue = [currentHeadSha]
   const visited = new Set<string>()
-  const maxCommits = Math.max(1, Math.floor(input.maxCommits ?? 256))
+  const requestedMax = Math.floor(input.maxCommits ?? 256)
+  const maxCommits = Number.isFinite(requestedMax) ? Math.max(1, requestedMax) : 256
   let markerEquivalent: GitHubGitCommit | undefined
+  let traversalLimited = false
 
-  while (queue.length > 0 && visited.size < maxCommits) {
+  while (queue.length > 0) {
     throwIfV4Aborted(input.signal)
     const sha = queue.shift()!
     if (visited.has(sha)) continue
+    if (visited.size >= maxCommits) {
+      traversalLimited = true
+      break
+    }
     visited.add(sha)
     if (sha === input.candidateCommitSha) {
       return {
@@ -84,7 +104,14 @@ export async function reconcileV4CandidatePublication(
     }
     if (sha === input.expectedHeadSha) continue
     let current: GitHubGitCommit
-    try { current = await github.getGitCommit(sha); throwIfV4Aborted(input.signal) } catch (error) { if (input.signal?.aborted) throw error; continue }
+    try {
+      current = await github.getGitCommit(sha)
+      throwIfV4Aborted(input.signal)
+    } catch (error) {
+      if (input.signal?.aborted) throw error
+      incompleteAncestry = true
+      continue
+    }
     if (
       !markerEquivalent
       && marker
@@ -103,6 +130,22 @@ export async function reconcileV4CandidatePublication(
       currentHeadSha,
       publishedCommitSha: markerEquivalent.sha,
       verifiedHeadSha: currentHeadSha,
+    }
+  }
+  if (traversalLimited) {
+    return {
+      status: "indeterminate",
+      evidence: "traversal-limit",
+      currentHeadSha,
+      indeterminateReason: "traversal-limit",
+    }
+  }
+  if (incompleteAncestry) {
+    return {
+      status: "indeterminate",
+      evidence: "ancestry-read-failure",
+      currentHeadSha,
+      indeterminateReason: "ancestry-read-failure",
     }
   }
   return { status: "diverged", evidence: "unrelated-head", currentHeadSha }

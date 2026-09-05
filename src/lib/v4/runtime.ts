@@ -3,7 +3,7 @@ import type FastSync from "../../main"
 import { fromBase64Url, randomBytes, sha256Hex, toBase64Url, utf8ToBytes } from "../bytes"
 import { syncConsoleLog } from "../debug"
 import { readVaultFileBytes, writeVaultFileBytes, trashVaultFileIfExists } from "../vault"
-import { deriveV4Keyring, type V4Keyring } from "./crypto"
+import { deriveV4BootstrapRecoveryKey, deriveV4Keyring, type V4Keyring } from "./crypto"
 import {
   createEmptyV4LocalIndex,
   loadV4LocalIndex,
@@ -23,14 +23,22 @@ import { createV4ContentSource, createV4WholeBufferContentSource, DEFAULT_V4_WHO
 import { createV4PlatformIo, type V4BinaryAdapterLike, type V4PlatformIo } from "./platform-io"
 import { createV4StagingStore, type V4StagingStore } from "./staging-store"
 import { V4ProgressStore, type V4SyncProgressSnapshot } from "./progress"
-import { createV4RecoveryStore, discardV4RecoveryStages, markV4RecoveryIndexCommitted, recoverV4PendingState } from "./recovery-store"
+import { createV4RecoveryStore, discardV4RecoveryStages, markV4RecoveryIndexCommitted, recoverV4PendingState, V4RecoveryRequiredError } from "./recovery-store"
 import { V4KeyringCache } from "./keyring-cache"
 import { V4CancelledError, throwIfV4Aborted } from "./cancellation"
+import { V4PublicationRaceError, isV4PublicationRaceError } from "./publication-race"
+import { assertV4SpeculativeConfigStillAbsent, guardV4SpeculativeConfigGithub } from "./speculative-config-guard"
 
 const V4_INDEX_ROOT = "github-sync-v4-index"
 const V4_STAGE_ROOT = "github-sync-v4-stage"
 const V4_RECOVERY_ROOT = "github-sync-v4-recovery"
 const fallbackStores = new WeakMap<object, Map<string, string>>()
+
+type V4RuntimeConfigSource = "observed-remote" | "speculative-empty"
+interface V4RuntimeConfigSelection {
+  config: V4RemoteConfig
+  source: V4RuntimeConfigSource
+}
 
 export function selectV4RuntimeConfig(discovered: V4RemoteConfig | null, mode: V4StorageMode, repoId: string): V4RemoteConfig {
   if (discovered?.mode === mode) return { ...discovered, repoId, pathLayout: expectedV4PathLayout(mode) }
@@ -56,7 +64,6 @@ function createMemoryAdapter(owner: object): V4LocalIndexAdapter {
     async mkdir() {},
   }
 }
-
 
 function createRuntimePlatformIo(plugin: FastSync): { io: V4PlatformIo; stageRoot: string } {
   const vault = plugin.app.vault as FastSync["app"]["vault"] & {
@@ -316,11 +323,11 @@ export class V4PluginRuntime {
     return { remoteConfig, config }
   }
 
-  private async remoteOrNewConfig(): Promise<V4RemoteConfig> {
+  private async remoteOrNewConfig(): Promise<V4RuntimeConfigSelection> {
     const loaded = await this.loadConfiguredRemoteConfig()
-    if (loaded) return loaded.config
+    if (loaded) return { config: loaded.config, source: "observed-remote" }
     const mode = this.plugin.settings.encryptionMode
-    return selectV4RuntimeConfig(null, mode, this.repoId())
+    return { config: selectV4RuntimeConfig(null, mode, this.repoId()), source: "speculative-empty" }
   }
 
   private async loadIndex(config: V4RemoteConfig): Promise<V4LocalIndex> {
@@ -407,6 +414,16 @@ export class V4PluginRuntime {
     }
     if (request.trigger === "startup") this.plugin.enableWatch()
     this.plugin.isSyncInProgress = true
+    let bootstrapRecoveryKeyCache: { repoId: string; credentialGeneration: number; key: Uint8Array } | undefined
+    const bootstrapRecoveryKeyFor = async (passphrase: string, repoId: string): Promise<Uint8Array> => {
+      if (bootstrapRecoveryKeyCache?.repoId === repoId && bootstrapRecoveryKeyCache.credentialGeneration === this.credentialGeneration) {
+        return bootstrapRecoveryKeyCache.key
+      }
+      bootstrapRecoveryKeyCache?.key.fill(0)
+      const key = await deriveV4BootstrapRecoveryKey({ passphrase, repoId })
+      bootstrapRecoveryKeyCache = { repoId, credentialGeneration: this.credentialGeneration, key }
+      return key
+    }
     syncConsoleLog(this.plugin.settings, "info", "V4 sync started", {
       operation: request.operation,
       trigger: request.trigger,
@@ -428,7 +445,8 @@ export class V4PluginRuntime {
             currentPath: undefined,
             currentDirection: undefined,
           })
-          const discovered = await this.remoteOrNewConfig()
+          const configSelection = await this.remoteOrNewConfig()
+          const discovered = configSelection.config
           const desiredMode = this.plugin.settings.encryptionMode
           if (discovered.mode !== desiredMode && desiredMode === "encrypted") {
             throw new Error("Encrypted V4 requires a new empty repository or branch; plaintext history cannot be retained.")
@@ -440,6 +458,9 @@ export class V4PluginRuntime {
           this.progressStore.update({ phase: "loading-index", currentPath: undefined, currentDirection: undefined })
           const index = await this.loadIndex(config)
           const previousShardHashes = { ...index.shardHashes }
+          if (configSelection.source === "speculative-empty") {
+            await assertV4SpeculativeConfigStillAbsent(this.plugin.githubClient, config.repoId)
+          }
           const passphrase = this.plugin.settings.encryptionPassphrase
           const authenticationConfig = discovered.mode === "encrypted" ? discovered : config.mode === "encrypted" ? config : null
           if (authenticationConfig && !passphrase) throw new Error("Encryption passphrase is required.")
@@ -447,13 +468,43 @@ export class V4PluginRuntime {
             ? await this.keyringForConfig(authenticationConfig, passphrase, signal)
             : undefined
           const recoveryNamespace = (await sha256Hex(utf8ToBytes(config.repoId))).slice(0, 32)
-          const recoveryStore = createV4RecoveryStore({
+          const recoveryRoot = `${V4_RECOVERY_ROOT}/${recoveryNamespace}`
+          let recoveryPayloadKey: Uint8Array | undefined
+          if (config.mode === "encrypted") {
+            recoveryPayloadKey = configSelection.source === "speculative-empty"
+              ? await bootstrapRecoveryKeyFor(passphrase, config.repoId)
+              : keyring?.journalKey
+          }
+          let recoveryStore = createV4RecoveryStore({
             adapter: this.adapter,
-            root: `${V4_RECOVERY_ROOT}/${recoveryNamespace}`,
+            root: recoveryRoot,
             repoId: config.repoId,
-            payloadKey: config.mode === "encrypted" ? keyring?.journalKey : undefined,
+            payloadKey: recoveryPayloadKey,
           })
-          const pendingRecovery = await recoveryStore.load()
+          let pendingRecovery
+          try {
+            pendingRecovery = await recoveryStore.load()
+          } catch (error) {
+            if (
+              !(error instanceof V4RecoveryRequiredError)
+              || config.mode !== "encrypted"
+              || configSelection.source !== "observed-remote"
+              || !passphrase
+            ) throw error
+            const bootstrapKey = await bootstrapRecoveryKeyFor(passphrase, config.repoId)
+            const bootstrapStore = createV4RecoveryStore({
+              adapter: this.adapter,
+              root: recoveryRoot,
+              repoId: config.repoId,
+              payloadKey: bootstrapKey,
+            })
+            try {
+              pendingRecovery = await bootstrapStore.load()
+              recoveryStore = bootstrapStore
+            } catch {
+              throw error
+            }
+          }
           let reconciledRecovery = pendingRecovery
           if (pendingRecovery && pendingRecovery.header.phase !== "index-committed") {
             const recoveryHead = (await this.plugin.githubClient.getGitRefOrNull())?.sha ?? null
@@ -480,8 +531,11 @@ export class V4PluginRuntime {
             }
             return inScope(path)
           }
+          const sessionGithub = configSelection.source === "speculative-empty"
+            ? guardV4SpeculativeConfigGithub(this.plugin.githubClient, config.repoId)
+            : this.plugin.githubClient
           const result = await new V4SyncSession({
-            github: this.plugin.githubClient,
+            github: sessionGithub,
             vault: this.sessionVault(includePath),
             index,
             config,
@@ -527,8 +581,22 @@ export class V4PluginRuntime {
             casAttempt--
             continue
           }
+          const publicationRace = isV4PublicationRaceError(error)
           const recoveryReplan = error instanceof V4RecoveryReplanRequiredError && request.operation === "normal"
-          if (casAttempt === 3 || (!recoveryReplan && !/branch head changed|stale ref/i.test((error as Error).message))) throw error
+          if (casAttempt === 3 || (!publicationRace && !recoveryReplan)) {
+            if (publicationRace && casAttempt === 3) {
+              throw new V4PublicationRaceError({
+                phase: error.phase,
+                expectedHeadSha: error.expectedHeadSha,
+                observedHeadSha: error.observedHeadSha,
+                publicationOutcome: error.publicationOutcome,
+                evidence: error.evidence,
+                cause: error.cause,
+                message: "Remote branch changed repeatedly while syncing. Please try again.",
+              })
+            }
+            throw error
+          }
           this.progressStore.update({
             phase: "retrying",
             attempt: progressAttempt + 1,
@@ -544,17 +612,26 @@ export class V4PluginRuntime {
       if (error instanceof V4CancelledError) return { changedFiles: 0 }
       const message = (error as Error).message
       const snapshot = this.progressStore.snapshot
+      const publicationRace = isV4PublicationRaceError(error) ? error : undefined
       syncConsoleLog(this.plugin.settings, "warn", "V4 sync failed", {
         operation: request.operation,
         trigger: request.trigger,
+        attempt: snapshot.attempt,
         phase: snapshot.phase,
         currentPath: snapshot.currentPath,
+        publicationPhase: publicationRace?.phase,
+        expectedHeadSha: publicationRace?.expectedHeadSha,
+        observedHeadSha: publicationRace?.observedHeadSha,
+        publicationOutcome: publicationRace?.publicationOutcome,
+        publicationEvidence: publicationRace?.evidence,
+        publicationCause: publicationRace?.cause,
         error,
       })
       this.progressStore.finish("failed", { errorMessage: message })
       new Notice(`GitHub Sync failed: ${message}`)
       return { changedFiles: 0 }
     } finally {
+      bootstrapRecoveryKeyCache?.key.fill(0)
       ;(this.plugin.githubClient as unknown as { setV4AbortSignal?(signal?: AbortSignal): void } | undefined)?.setV4AbortSignal?.(undefined)
       this.plugin.isSyncInProgress = false
       if (!this.disposed) {

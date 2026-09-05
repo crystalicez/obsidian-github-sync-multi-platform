@@ -2,6 +2,7 @@ import type { GitHubCreateTreeEntry, GitHubGitCommit, GitHubGitRef } from "../gi
 import type { V4StreamObject } from "./object-stream";
 import { isV4GitMutationOutcomeUnknownError } from "./git-mutation-policy";
 import { reconcileV4CandidatePublication } from "./publish-reconciler";
+import { V4PublicationRaceError, isV4PublicationRaceError } from "./publication-race";
 import { throwIfV4Aborted } from "./cancellation";
 
 export interface V4GitTreeProgressItem { fileId: string; path: string; }
@@ -90,9 +91,37 @@ export async function resolveV4PublicationBase(
 ): Promise<V4PublicationBase> {
   let ref = await github.getGitRefOrNull();
   if (expectedHeadSha !== undefined && (ref?.sha ?? null) !== expectedHeadSha) {
-    throw new Error("V4 branch head changed before atomic publish.");
+    throw new V4PublicationRaceError({
+      phase: "pre-publish",
+      expectedHeadSha,
+      observedHeadSha: ref?.sha ?? null,
+      publicationOutcome: "not-published",
+      evidence: "pre-publish-head-mismatch",
+      message: "V4 branch head changed before atomic publish.",
+    });
   }
-  if (!ref && github.ensureGitRepositoryInitialized) ref = await github.ensureGitRepositoryInitialized();
+  if (!ref && github.ensureGitRepositoryInitialized) {
+    try {
+      ref = await github.ensureGitRepositoryInitialized();
+    } catch (error) {
+      let observed: GitHubGitRef | null;
+      try {
+        observed = await github.getGitRefOrNull();
+      } catch {
+        throw error;
+      }
+      if (!observed) throw error;
+      throw new V4PublicationRaceError({
+        phase: "bootstrap-publish",
+        expectedHeadSha: null,
+        observedHeadSha: observed.sha,
+        publicationOutcome: "unknown",
+        evidence: "bootstrap-head-appeared",
+        cause: error,
+        message: "V4 branch head changed during repository bootstrap.",
+      });
+    }
+  }
   const baseTreeSha = ref ? (await github.getGitCommit(ref.sha)).treeSha : undefined;
   return { ref, previousHeadSha: ref?.sha, baseTreeSha };
 }
@@ -141,7 +170,6 @@ export async function uploadV4TreeFiles(
   invokeProgressCallback(input.onUploadsComplete);
   return { entries, fileShas };
 }
-
 
 export async function uploadV4ObjectStream(
   github: V4GitTreeGithub,
@@ -199,39 +227,84 @@ export async function createV4CandidateCommit(
   };
 }
 
+function postMutationRacePhase(expectedHeadSha: string | null): "bootstrap-publish" | "post-publish" {
+  return expectedHeadSha === null ? "bootstrap-publish" : "post-publish";
+}
+
 export async function publishV4CandidateRef(github: V4GitTreeGithub, candidate: V4CandidateCommit, signal?: AbortSignal): Promise<void> {
   throwIfV4Aborted(signal);
   const expectedHead = candidate.previousHeadSha ?? null;
   const journalId = candidate.message.startsWith("obsidian-sync-v4:") ? candidate.message.slice("obsidian-sync-v4:".length) : undefined;
-  const mutate = async (): Promise<void> => {
+  const assertExpectedHead = async (): Promise<void> => {
     throwIfV4Aborted(signal);
     const current = await github.getGitRefOrNull();
-    if ((current?.sha ?? null) !== expectedHead) throw new Error("V4 branch head changed before atomic publish.");
+    if ((current?.sha ?? null) !== expectedHead) {
+      throw new V4PublicationRaceError({
+        phase: "pre-publish",
+        expectedHeadSha: expectedHead,
+        observedHeadSha: current?.sha ?? null,
+        publicationOutcome: "not-published",
+        evidence: "pre-publish-head-mismatch",
+        message: "V4 branch head changed before atomic publish.",
+      });
+    }
+  };
+  const mutate = async (): Promise<void> => {
     if (candidate.previousHeadSha !== undefined) await github.updateGitRef(candidate.commitSha, candidate.previousHeadSha);
     else await github.createGitRef(candidate.commitSha);
   };
-  const reconcileUnknown = async () => reconcileV4CandidatePublication(github, {
-    candidateCommitSha: candidate.commitSha,
-    expectedHeadSha: expectedHead,
-    journalId,
-    signal,
-  });
 
   for (let attempt = 1; attempt <= 2; attempt++) {
     throwIfV4Aborted(signal);
+    await assertExpectedHead();
     try {
       await mutate();
       return;
     } catch (error) {
-      if (!isV4GitMutationOutcomeUnknownError(error)) throw error;
-      const reconciled = await reconcileUnknown();
+      if (isV4PublicationRaceError(error)) throw error;
+
+      let reconciled;
+      try {
+        reconciled = await reconcileV4CandidatePublication(github, {
+          candidateCommitSha: candidate.commitSha,
+          expectedHeadSha: expectedHead,
+          journalId,
+          signal,
+        });
+      } catch {
+        // If even the current branch head cannot be established, the mutation failure
+        // remains the most trustworthy evidence. Do not manufacture a race result.
+        throw error;
+      }
+
       if (reconciled.status === "published" && reconciled.publishedCommitSha === candidate.commitSha) return;
       if (reconciled.status === "published-advanced") {
-        throw new Error("V4 branch head changed after candidate publication; replan against the advanced head.");
+        throw new V4PublicationRaceError({
+          phase: postMutationRacePhase(expectedHead),
+          expectedHeadSha: expectedHead,
+          observedHeadSha: reconciled.currentHeadSha,
+          publicationOutcome: "published",
+          evidence: reconciled.evidence,
+          cause: error,
+          message: "V4 branch head changed after candidate publication.",
+        });
       }
-      if (reconciled.status === "diverged") throw new Error("V4 branch head changed during ambiguous candidate publication.");
-      if (attempt === 2) throw error;
-      // The expected head was re-observed after the unknown outcome. One retry is now evidence-based, not blind.
+      if (reconciled.status === "not-published" && reconciled.currentHeadSha === expectedHead) {
+        if (attempt === 1 && isV4GitMutationOutcomeUnknownError(error)) continue;
+        throw error;
+      }
+      if (reconciled.currentHeadSha !== expectedHead) {
+        throw new V4PublicationRaceError({
+          phase: postMutationRacePhase(expectedHead),
+          expectedHeadSha: expectedHead,
+          observedHeadSha: reconciled.currentHeadSha,
+          publicationOutcome: "unknown",
+          evidence: reconciled.evidence,
+          cause: error,
+          message: "V4 branch head changed during candidate publication.",
+        });
+      }
+      throw error;
     }
   }
 }
