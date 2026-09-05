@@ -39,8 +39,10 @@ async function rejectsMalformedUnrelated(entry: Record<string, unknown>): Promis
   }
 }
 
-test("complete absence is not inferred from a tree containing malformed unrelated entries", async () => {
+test("complete absence is not inferred from a tree containing malformed or unsupported unrelated entries", async () => {
   await rejectsMalformedUnrelated({ path: "other.md", type: "tag", mode: "100644", sha: OTHER_SHA, url: "" });
   await rejectsMalformedUnrelated({ path: "other.md", type: "blob", mode: 100644, sha: OTHER_SHA, url: "" });
   await rejectsMalformedUnrelated({ path: "other.md", type: "blob", mode: "100644", sha: "short", url: "" });
+  await rejectsMalformedUnrelated({ path: "other.md", type: "blob", mode: "040000", sha: OTHER_SHA, url: "" });
+  await rejectsMalformedUnrelated({ path: "other.md", type: "blob", mode: "100600", sha: OTHER_SHA, url: "" });
 });
