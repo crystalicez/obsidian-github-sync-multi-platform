@@ -190,3 +190,46 @@ test("runtime retries a structured publication race even when its message has no
   assert.equal(Math.max(...attempts), 2)
   runtime.dispose()
 })
+
+test("terminal publication race log retains structured attempt and Git evidence", async () => {
+  const { runtime, githubClient, vault, plugin } = await initializeFixture()
+  vault.set("note.md", new TextEncoder().encode("changed\n"), 2)
+  plugin.settings.consoleLoggingEnabled = true
+  const expectedHeadSha = githubClient.ref!.sha
+  const originalGetRef = githubClient.getGitRefOrNull.bind(githubClient)
+  let racesRemaining = 3
+  githubClient.getGitRefOrNull = async () => {
+    if (racesRemaining-- > 0) {
+      throw Object.assign(new Error("typed race without stale wording"), {
+        code: "V4_PUBLICATION_RACE",
+        phase: "pre-publish",
+        expectedHeadSha,
+        observedHeadSha: `other-${3 - racesRemaining}`,
+        publicationOutcome: "not-published",
+        evidence: "pre-publish-head-mismatch",
+      })
+    }
+    return originalGetRef()
+  }
+  const warnings: unknown[][] = []
+  const originalWarn = console.warn
+  console.warn = (...args: unknown[]) => { warnings.push(args) }
+  try {
+    await runtime.manualSync()
+  } finally {
+    console.warn = originalWarn
+  }
+
+  const failure = warnings.find(args => args[1] === "V4 sync failed")
+  assert.ok(failure)
+  const details = failure[2] as Record<string, unknown>
+  assert.equal(details.attempt, 3)
+  assert.equal(details.publicationPhase, "pre-publish")
+  assert.equal(details.expectedHeadSha, expectedHeadSha)
+  assert.equal(details.observedHeadSha, "other-3")
+  assert.equal(details.publicationOutcome, "not-published")
+  assert.equal(details.publicationEvidence, "pre-publish-head-mismatch")
+  assert.deepEqual(details.publicationCause, undefined)
+  assert.equal(runtime.progressSnapshot.lifecycle, "failed")
+  runtime.dispose()
+})
