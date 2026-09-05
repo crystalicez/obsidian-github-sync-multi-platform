@@ -22,12 +22,11 @@ async function hmacSha256(keyBytes: Uint8Array, value: string): Promise<Uint8Arr
   return new Uint8Array(await crypto.subtle.sign("HMAC", key, utf8ToBytes(value) as any));
 }
 
-export async function deriveV4Keyring(input: {
+async function deriveV4PassphraseMasterKey(input: {
   passphrase: string;
-  repoId: string;
   salt: Uint8Array;
   iterations?: number;
-}): Promise<V4Keyring> {
+}): Promise<Uint8Array> {
   const passphraseBytes = utf8ToBytes(input.passphrase);
   let material: CryptoKey;
   try {
@@ -36,12 +35,21 @@ export async function deriveV4Keyring(input: {
     // Best-effort only; the JS engine/WebCrypto implementation may retain internal copies.
     passphraseBytes.fill(0);
   }
-  const masterKey = new Uint8Array(await crypto.subtle.deriveBits({
+  return new Uint8Array(await crypto.subtle.deriveBits({
     name: "PBKDF2",
     hash: "SHA-256",
     salt: input.salt as any,
     iterations: input.iterations ?? 600_000,
   }, material, 256));
+}
+
+export async function deriveV4Keyring(input: {
+  passphrase: string;
+  repoId: string;
+  salt: Uint8Array;
+  iterations?: number;
+}): Promise<V4Keyring> {
+  const masterKey = await deriveV4PassphraseMasterKey(input);
   const scope = `obsidian-github-sync-v4:${input.repoId}`;
   return {
     masterKey,
@@ -50,6 +58,31 @@ export async function deriveV4Keyring(input: {
     indexKey: await hmacSha256(masterKey, `${scope}:index`),
     journalKey: await hmacSha256(masterKey, `${scope}:journal`),
   };
+}
+
+export async function deriveV4BootstrapRecoveryKey(input: {
+  passphrase: string;
+  repoId: string;
+  iterations?: number;
+}): Promise<Uint8Array> {
+  const saltSource = utf8ToBytes(`obsidian-github-sync-v4:${input.repoId}:bootstrap-recovery-salt`);
+  let salt: Uint8Array;
+  try {
+    salt = new Uint8Array(await crypto.subtle.digest("SHA-256", saltSource as any));
+  } finally {
+    saltSource.fill(0);
+  }
+  const masterKey = await deriveV4PassphraseMasterKey({
+    passphrase: input.passphrase,
+    salt,
+    iterations: input.iterations,
+  });
+  try {
+    return await hmacSha256(masterKey, `obsidian-github-sync-v4:${input.repoId}:bootstrap-recovery`);
+  } finally {
+    masterKey.fill(0);
+    salt.fill(0);
+  }
 }
 
 function payloadAad(context: V4PayloadContext): Uint8Array {
