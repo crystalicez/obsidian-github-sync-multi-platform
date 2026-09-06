@@ -202,7 +202,6 @@ test("publication retry preserves conflict-copy reservation but invalidates its 
     await runtime.manualSync()
   } finally {
     V4SyncSession.prototype.sync = originalSync
-    runtime.dispose()
   }
 
   assert.equal(syncCalls, 2)
@@ -214,4 +213,5 @@ test("publication retry preserves conflict-copy reservation but invalidates its 
     fileId: "copy-file-id",
     includeInSync: true,
   })
+  runtime.dispose()
 })
