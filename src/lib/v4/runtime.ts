@@ -555,9 +555,15 @@ export class V4PluginRuntime {
           this.progressStore.update({ phase: "saving-index", currentPath: undefined, currentDirection: undefined })
           await this.saveIndex(index, previousShardHashes)
           const recoveredRunId = !result.recoveryRunId
-            && reconciledRecovery?.header.phase !== "index-committed"
-            && !!reconciledRecovery?.header.verifiedRemoteHead
-            && index.remoteCommitSha === reconciledRecovery.header.verifiedRemoteHead
+            && reconciledRecovery
+            && reconciledRecovery.header.phase !== "index-committed"
+            && (
+              reconciledRecovery.header.phase === "replan-required"
+              || (
+                !!reconciledRecovery.header.verifiedRemoteHead
+                && index.remoteCommitSha === reconciledRecovery.header.verifiedRemoteHead
+              )
+            )
             ? reconciledRecovery.header.runId
             : undefined
           const recoveryRunId = result.recoveryRunId ?? recoveredRunId
