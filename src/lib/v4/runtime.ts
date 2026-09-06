@@ -597,6 +597,7 @@ export class V4PluginRuntime {
             }
             throw error
           }
+          if (publicationRace) runState.conflictCopyStages?.clear()
           this.progressStore.update({
             phase: "retrying",
             attempt: progressAttempt + 1,
