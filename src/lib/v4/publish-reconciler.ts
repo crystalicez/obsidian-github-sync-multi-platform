@@ -47,7 +47,13 @@ export async function reconcileV4CandidatePublication(
   input: V4PublishReconcileInput,
 ): Promise<V4PublishReconcileResult> {
   throwIfV4Aborted(input.signal)
-  const ref = await github.getGitRefOrNull()
+  let ref: GitHubGitRef | null
+  try {
+    ref = await github.getGitRefOrNull()
+  } catch (error) {
+    throwIfV4Aborted(input.signal)
+    throw error
+  }
   throwIfV4Aborted(input.signal)
   const currentHeadSha = ref?.sha ?? null
   if (currentHeadSha === input.candidateCommitSha) {
@@ -72,7 +78,7 @@ export async function reconcileV4CandidatePublication(
       candidate = await github.getGitCommit(input.candidateCommitSha)
       throwIfV4Aborted(input.signal)
     } catch (error) {
-      if (input.signal?.aborted) throw error
+      if (input.signal?.aborted) throwIfV4Aborted(input.signal)
       incompleteAncestry = true
     }
   }
@@ -108,7 +114,7 @@ export async function reconcileV4CandidatePublication(
       current = await github.getGitCommit(sha)
       throwIfV4Aborted(input.signal)
     } catch (error) {
-      if (input.signal?.aborted) throw error
+      if (input.signal?.aborted) throwIfV4Aborted(input.signal)
       incompleteAncestry = true
       continue
     }
