@@ -237,7 +237,14 @@ export async function publishV4CandidateRef(github: V4GitTreeGithub, candidate: 
   const journalId = candidate.message.startsWith("obsidian-sync-v4:") ? candidate.message.slice("obsidian-sync-v4:".length) : undefined;
   const assertExpectedHead = async (): Promise<void> => {
     throwIfV4Aborted(signal);
-    const current = await github.getGitRefOrNull();
+    let current: GitHubGitRef | null;
+    try {
+      current = await github.getGitRefOrNull();
+    } catch (error) {
+      throwIfV4Aborted(signal);
+      throw error;
+    }
+    throwIfV4Aborted(signal);
     if ((current?.sha ?? null) !== expectedHead) {
       throw new V4PublicationRaceError({
         phase: "pre-publish",
@@ -261,6 +268,7 @@ export async function publishV4CandidateRef(github: V4GitTreeGithub, candidate: 
       await mutate();
       return;
     } catch (error) {
+      throwIfV4Aborted(signal);
       if (isV4PublicationRaceError(error)) throw error;
 
       let reconciled;
@@ -272,6 +280,7 @@ export async function publishV4CandidateRef(github: V4GitTreeGithub, candidate: 
           signal,
         });
       } catch {
+        throwIfV4Aborted(signal);
         // If even the current branch head cannot be established, the mutation failure
         // remains the most trustworthy evidence. Do not manufacture a race result.
         throw error;
