@@ -1,5 +1,6 @@
 import type { GitHubCreateTreeEntry, GitHubGitCommit, GitHubGitRef } from "../github-git-types";
 import type { V4StreamObject } from "./object-stream";
+import { isV4RepositoryBootstrapRaceError } from "./bootstrap-race";
 import { isV4GitMutationOutcomeUnknownError } from "./git-mutation-policy";
 import { reconcileV4CandidatePublication } from "./publish-reconciler";
 import { V4PublicationRaceError, isV4PublicationRaceError } from "./publication-race";
@@ -104,6 +105,17 @@ export async function resolveV4PublicationBase(
     try {
       ref = await github.ensureGitRepositoryInitialized();
     } catch (error) {
+      if (isV4RepositoryBootstrapRaceError(error)) {
+        throw new V4PublicationRaceError({
+          phase: "bootstrap-publish",
+          expectedHeadSha: null,
+          observedHeadSha: error.observedRefSha,
+          publicationOutcome: "unknown",
+          evidence: "bootstrap-repository-state-changed",
+          cause: error.cause,
+          message: "V4 repository bootstrap changed concurrently.",
+        });
+      }
       let observed: GitHubGitRef | null;
       try {
         observed = await github.getGitRefOrNull();
