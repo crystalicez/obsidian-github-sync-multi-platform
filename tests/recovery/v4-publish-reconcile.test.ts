@@ -143,6 +143,7 @@ test("recovery marks advanced or divergent publication evidence for replan inste
   })
   assert.equal(reconciled.header.phase, "replan-required")
   assert.equal(reconciled.header.candidateCommitSha, "candidate")
+  assert.equal(reconciled.header.verifiedRemoteHead, undefined)
 })
 
 test("startup recovery reconciles an advanced head through exact candidate ancestry before replanning", async () => {
@@ -175,6 +176,6 @@ test("startup recovery reconciles an advanced head through exact candidate ances
   })
   assert.equal(recovered.replanRequired, true)
   assert.equal(recovered.snapshot.header.phase, "replan-required")
-  assert.equal(recovered.snapshot.header.verifiedRemoteHead, "candidate")
+  assert.equal(recovered.snapshot.header.verifiedRemoteHead, undefined)
   assert.equal(github.reads.includes("later"), true)
 })
