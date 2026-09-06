@@ -2,7 +2,10 @@ import assert from "node:assert/strict"
 import test from "node:test"
 import { TFile } from "obsidian"
 
+import { sha256Hex, utf8ToBytes } from "../../src/lib/bytes"
 import type { GitHubCreateTreeEntry } from "../../src/lib/github-git-types"
+import type { V4LocalIndexAdapter } from "../../src/lib/v4/local-index"
+import { createV4RecoveryStore } from "../../src/lib/v4/recovery-store"
 import { V4PluginRuntime } from "../../src/lib/v4/runtime"
 import { V4SyncSession, type V4SyncRunState } from "../../src/lib/v4/sync-session"
 
@@ -213,5 +216,34 @@ test("publication retry preserves conflict-copy reservation but invalidates its 
     fileId: "copy-file-id",
     includeInSync: true,
   })
+  runtime.dispose()
+})
+
+test("successful fresh no-op terminalizes superseded replan-required recovery", async () => {
+  const { runtime } = await initializeFixture()
+  const repoId = "o/r#main"
+  const recoveryNamespace = (await sha256Hex(utf8ToBytes(repoId))).slice(0, 32)
+  const adapter = (runtime as unknown as { adapter: V4LocalIndexAdapter }).adapter
+  const store = createV4RecoveryStore({
+    adapter,
+    root: `github-sync-v4-recovery/${recoveryNamespace}`,
+    repoId,
+  })
+  await store.save({
+    runId: "stale-replan-run",
+    phase: "replan-required",
+    expectedRemoteHead: null,
+    payload: { mutations: [], completedMutationIds: [] },
+  })
+
+  const pending = await store.load()
+  assert.equal(pending?.header.phase, "replan-required")
+  assert.equal(pending?.header.verifiedRemoteHead, undefined)
+
+  await runtime.manualSync()
+
+  const terminal = await store.load()
+  assert.equal(terminal?.header.runId, "stale-replan-run")
+  assert.equal(terminal?.header.phase, "index-committed", "a successful fresh plan + saved index supersedes stale replan-required state")
   runtime.dispose()
 })
