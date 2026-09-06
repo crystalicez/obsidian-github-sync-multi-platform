@@ -189,7 +189,7 @@ async function freshPull(github: RacingMemoryGitHub) {
   return { vault, index }
 }
 
-test("Copy conflict survives a publication race/replan exactly once with stable identity and committed recovery", async () => {
+test("Copy conflict refreshes a raced R1 stage to R2 while preserving exactly one stable reservation", async () => {
   const github = new RacingMemoryGitHub()
   const remoteVault = new MemoryVault()
   remoteVault.files.set("shared.md", { bytes: enc("base\n"), mtime: 1 })
@@ -201,7 +201,7 @@ test("Copy conflict survives a publication race/replan exactly once with stable 
   localIndex.deviceId = "local"
   const originalFileId = recordAt(localIndex, "shared.md").fileId
 
-  remoteVault.files.set("shared.md", { bytes: enc("remote-competitor\n"), mtime: 2 })
+  remoteVault.files.set("shared.md", { bytes: enc("remote-r1\n"), mtime: 2 })
   await session({ github, vault: remoteVault, index: remoteIndex }).sync({
     operation: "normal",
     allowThresholdOverride: false,
@@ -215,18 +215,18 @@ test("Copy conflict survives a publication race/replan exactly once with stable 
   const now = () => 515151
 
   github.beforeNextUpdate = async () => {
-    remoteVault.files.set("winner.md", { bytes: enc("winner\n"), mtime: 4 })
+    remoteVault.files.set("shared.md", { bytes: enc("remote-r2\n"), mtime: 4 })
     await session({ github, vault: remoteVault, index: remoteIndex }).sync({
       operation: "normal",
       allowThresholdOverride: false,
-      changes: [{ type: "modify", path: "winner.md", mtime: 4 }],
+      changes: [{ type: "modify", path: "shared.md", mtime: 4 }],
     })
   }
 
   let attempts = 0
   let reservedPathAfterRace: string | undefined
   let reservedFileIdAfterRace: string | undefined
-  let reservedStageIdAfterRace: string | undefined
+  let staleStageIdAfterRace: string | undefined
   for (let attempt = 1; attempt <= 2; attempt++) {
     attempts = attempt
     try {
@@ -245,7 +245,11 @@ test("Copy conflict survives a publication race/replan exactly once with stable 
       assert.ok(stage)
       reservedPathAfterRace = reservation.path
       reservedFileIdAfterRace = reservation.fileId
-      reservedStageIdAfterRace = stage.stage.stageId
+      staleStageIdAfterRace = stage.stage.stageId
+
+      // Model the production outer-retry boundary: the reservation is run-scoped,
+      // while staged bytes are scoped to the raced remote plan and must not be kept.
+      runState.conflictCopyStages?.clear()
 
       const pending = await recoveryStore.load()
       assert.equal(pending?.header.phase, "publish-intent")
@@ -262,6 +266,7 @@ test("Copy conflict survives a publication race/replan exactly once with stable 
       assert.equal(recovered.snapshot.header.phase, "replan-required")
       assert.equal(recovered.snapshot.header.verifiedRemoteHead, undefined)
       const keepStageIds = new Set([...runState.conflictCopyStages?.values() ?? []].map(copy => copy.stage.stageId))
+      assert.equal(keepStageIds.size, 0)
       await discardV4RecoveryStages(recovered.snapshot, localVault, keepStageIds)
     }
   }
@@ -271,14 +276,15 @@ test("Copy conflict survives a publication race/replan exactly once with stable 
   assert.ok(reservation)
   assert.equal(reservation.path, reservedPathAfterRace)
   assert.equal(reservation.fileId, reservedFileIdAfterRace)
-  assert.equal(runState.conflictCopyStages?.get(reservation.fileId)?.stage.stageId, reservedStageIdAfterRace)
+  const refreshedStageId = runState.conflictCopyStages?.get(reservation.fileId)?.stage.stageId
+  assert.ok(refreshedStageId)
+  assert.notEqual(refreshedStageId, staleStageIdAfterRace)
 
   const copyPath = "shared.conflict-remote-local-515151.md"
   assert.equal(reservation.path, copyPath)
-  assert.deepEqual([...localVault.files.keys()].sort(), [copyPath, "shared.md", "winner.md"])
+  assert.deepEqual([...localVault.files.keys()].sort(), [copyPath, "shared.md"])
   assert.deepEqual(localVault.files.get("shared.md")?.bytes, enc("local-canonical\n"))
-  assert.deepEqual(localVault.files.get(copyPath)?.bytes, enc("remote-competitor\n"))
-  assert.deepEqual(localVault.files.get("winner.md")?.bytes, enc("winner\n"))
+  assert.deepEqual(localVault.files.get(copyPath)?.bytes, enc("remote-r2\n"))
   assert.equal(recordAt(localIndex, "shared.md").fileId, originalFileId)
   assert.equal(recordAt(localIndex, copyPath).fileId, reservation.fileId)
   assert.equal(liveRecords(localIndex).filter(record => record.path === copyPath).length, 1)
@@ -292,7 +298,7 @@ test("Copy conflict survives a publication race/replan exactly once with stable 
   const fresh = await freshPull(github)
   assert.deepEqual([...fresh.vault.files.keys()].sort(), [...localVault.files.keys()].sort())
   assert.deepEqual(fresh.vault.files.get("shared.md")?.bytes, enc("local-canonical\n"))
-  assert.deepEqual(fresh.vault.files.get(copyPath)?.bytes, enc("remote-competitor\n"))
+  assert.deepEqual(fresh.vault.files.get(copyPath)?.bytes, enc("remote-r2\n"))
   assert.equal(recordAt(fresh.index, "shared.md").fileId, originalFileId)
   assert.equal(recordAt(fresh.index, copyPath).fileId, reservation.fileId)
 })

@@ -47,3 +47,47 @@ test("speculative encrypted recovery key is stable across competing remote KDF s
   assert.equal(recovered?.header.runId, "run-bootstrap")
   assert.deepEqual(recovered?.payload, { mutations: [], completedMutationIds: [] })
 })
+
+test("a newer bootstrap-encrypted recovery generation cannot be hidden behind an older payloadless terminal", async () => {
+  const repoId = "owner/repo#main"
+  const passphrase = "generation-authority-passphrase"
+  const [winner, bootstrap] = await Promise.all([
+    deriveV4Keyring({ passphrase, repoId, salt: salt(201), iterations: 1_000 }),
+    deriveV4BootstrapRecoveryKey({ passphrase, repoId, iterations: 1_000 }),
+  ])
+  const adapter = new MemoryAdapter()
+  const bootstrapStore = createV4RecoveryStore({ adapter, root: "generation-recovery", repoId, payloadKey: bootstrap })
+
+  for (let generation = 1; generation <= 10; generation++) {
+    const saved = await bootstrapStore.save({
+      runId: `terminal-${generation}`,
+      journalId: `journal-${generation}`,
+      phase: "index-committed",
+      expectedRemoteHead: `head-${generation}`,
+    })
+    assert.equal(saved.header.generation, generation)
+  }
+
+  const pending = await bootstrapStore.save({
+    runId: "pending-11",
+    journalId: "journal-11",
+    phase: "publish-intent",
+    expectedRemoteHead: "head-10",
+    candidateCommitSha: "candidate-11",
+    payload: { mutations: [], completedMutationIds: [] },
+  })
+  assert.equal(pending.header.generation, 11)
+
+  const winnerKeyStore = createV4RecoveryStore({ adapter, root: "generation-recovery", repoId, payloadKey: winner.journalKey })
+  let recovered
+  try {
+    recovered = await winnerKeyStore.load()
+  } catch (error) {
+    assert.equal(error instanceof V4RecoveryRequiredError, true)
+    recovered = await bootstrapStore.load()
+  }
+
+  assert.equal(recovered?.header.generation, 11)
+  assert.equal(recovered?.header.runId, "pending-11")
+  assert.deepEqual(recovered?.payload, { mutations: [], completedMutationIds: [] })
+})

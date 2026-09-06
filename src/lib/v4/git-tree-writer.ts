@@ -1,5 +1,6 @@
 import type { GitHubCreateTreeEntry, GitHubGitCommit, GitHubGitRef } from "../github-git-types";
 import type { V4StreamObject } from "./object-stream";
+import { isV4RepositoryBootstrapRaceError } from "./bootstrap-race";
 import { isV4GitMutationOutcomeUnknownError } from "./git-mutation-policy";
 import { reconcileV4CandidatePublication } from "./publish-reconciler";
 import { V4PublicationRaceError, isV4PublicationRaceError } from "./publication-race";
@@ -104,6 +105,17 @@ export async function resolveV4PublicationBase(
     try {
       ref = await github.ensureGitRepositoryInitialized();
     } catch (error) {
+      if (isV4RepositoryBootstrapRaceError(error)) {
+        throw new V4PublicationRaceError({
+          phase: "bootstrap-publish",
+          expectedHeadSha: null,
+          observedHeadSha: error.observedRefSha,
+          publicationOutcome: "unknown",
+          evidence: "bootstrap-repository-state-changed",
+          cause: error.cause,
+          message: "V4 repository bootstrap changed concurrently.",
+        });
+      }
       let observed: GitHubGitRef | null;
       try {
         observed = await github.getGitRefOrNull();
@@ -237,7 +249,14 @@ export async function publishV4CandidateRef(github: V4GitTreeGithub, candidate: 
   const journalId = candidate.message.startsWith("obsidian-sync-v4:") ? candidate.message.slice("obsidian-sync-v4:".length) : undefined;
   const assertExpectedHead = async (): Promise<void> => {
     throwIfV4Aborted(signal);
-    const current = await github.getGitRefOrNull();
+    let current: GitHubGitRef | null;
+    try {
+      current = await github.getGitRefOrNull();
+    } catch (error) {
+      throwIfV4Aborted(signal);
+      throw error;
+    }
+    throwIfV4Aborted(signal);
     if ((current?.sha ?? null) !== expectedHead) {
       throw new V4PublicationRaceError({
         phase: "pre-publish",
@@ -261,6 +280,7 @@ export async function publishV4CandidateRef(github: V4GitTreeGithub, candidate: 
       await mutate();
       return;
     } catch (error) {
+      throwIfV4Aborted(signal);
       if (isV4PublicationRaceError(error)) throw error;
 
       let reconciled;
@@ -272,6 +292,7 @@ export async function publishV4CandidateRef(github: V4GitTreeGithub, candidate: 
           signal,
         });
       } catch {
+        throwIfV4Aborted(signal);
         // If even the current branch head cannot be established, the mutation failure
         // remains the most trustworthy evidence. Do not manufacture a race result.
         throw error;
