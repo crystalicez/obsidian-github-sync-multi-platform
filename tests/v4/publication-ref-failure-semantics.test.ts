@@ -2,6 +2,7 @@ import assert from "node:assert/strict"
 import test from "node:test"
 
 import type { GitHubCreateTreeEntry, GitHubGitCommit, GitHubGitRef } from "../../src/lib/github-git-types"
+import { V4CancelledError } from "../../src/lib/v4/cancellation"
 import {
   createV4CandidateCommit,
   publishV4CandidateRef,
@@ -120,6 +121,22 @@ test("reconciliation current-head read failure preserves the original mutation f
   const error = await capture(() => publishV4CandidateRef(github, candidate))
 
   assert.equal(error, original)
+  assert.equal(github.updateCalls, 1)
+})
+
+test("cancellation during reconciliation wins over the original mutation failure", async () => {
+  const github = new WriterGithub()
+  const candidate = await existingCandidate(github, "cancel-reconcile")
+  const original = Object.assign(new Error("mutation failed"), { status: 422 })
+  const controller = new AbortController()
+  github.mutationError = original
+  github.failRefReadAt.add(2)
+  github.afterRefReadFailure = () => controller.abort("user-cancelled")
+
+  const error = await capture(() => publishV4CandidateRef(github, candidate, controller.signal))
+
+  assert.ok(error instanceof V4CancelledError)
+  assert.equal(error.reason, "user-cancelled")
   assert.equal(github.updateCalls, 1)
 })
 
