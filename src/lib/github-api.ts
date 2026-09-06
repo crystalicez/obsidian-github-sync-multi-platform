@@ -1,6 +1,7 @@
 import { requestUrl, type RequestUrlParam, type RequestUrlResponse } from "obsidian";
 import { fromBase64, toBase64, toHex, utf8ToBytes } from "./bytes";
 import type { GitHubCreateTreeEntry, GitHubGitCommit, GitHubGitRef } from "./github-git-types";
+import { V4RepositoryBootstrapRaceError } from "./v4/bootstrap-race";
 import {
   canRetryV4MutationAfterUnknownOutcome,
   classifyV4MutationFailure,
@@ -41,7 +42,7 @@ export interface GitHubClientOptions {
 export interface GitHubTreeNode {
   path: string;
   mode: string;
-  type: "blob" | "tree";
+  type: "blob" | "tree" | "commit";
   sha: string;
   size?: number;
   url: string;
@@ -374,7 +375,16 @@ export class GitHubClient {
         commitSha = (response.json as { commit?: { sha?: string } }).commit?.sha;
         if (!commitSha) throw new Error("GitHub bootstrap response is missing its commit SHA.");
       } catch (error) {
-        if (!(error instanceof V4GitMutationOutcomeUnknownError)) throw error;
+        if (!(error instanceof V4GitMutationOutcomeUnknownError)) {
+          const status = (error as { status?: number }).status;
+          if (status === 409 || status === 422) {
+            let observed: GitHubGitRef | null;
+            try { observed = await this.inspectAnyGitRef(); }
+            catch { throw error; }
+            if (observed?.sha) throw new V4RepositoryBootstrapRaceError(observed.sha, error);
+          }
+          throw error;
+        }
         const observed = await this.inspectAnyGitRef();
         if (observed?.sha) commitSha = observed.sha;
         else if (attempt === 2) throw error;
