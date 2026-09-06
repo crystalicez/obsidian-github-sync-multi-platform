@@ -128,7 +128,7 @@ export function createV4RecoveryStore(options: {
     return parsed
   }
 
-  const readSlot = async (slot: number): Promise<{ present: boolean; snapshot?: V4RecoverySnapshot }> => {
+  const readSlot = async (slot: number): Promise<{ present: boolean; header?: V4RecoveryHeader }> => {
     const path = slotPath(root, slot)
     if (!(await options.adapter.exists(path))) return { present: false }
     let parsed: unknown
@@ -137,20 +137,24 @@ export function createV4RecoveryStore(options: {
     const header = parsed
     const { integrity, ...withoutIntegrity } = header
     if (await integrityFor(withoutIntegrity) !== integrity) return { present: true }
-    try {
-      const payload = await decodePayload(header)
-      return { present: true, snapshot: { header, payload } }
-    } catch {
-      return { present: true }
-    }
+    return { present: true, header }
   }
 
   const load = async (): Promise<V4RecoverySnapshot | null> => {
     const slots = await Promise.all([readSlot(0), readSlot(1)])
-    const valid = slots.flatMap(slot => slot.snapshot ? [slot.snapshot] : [])
-    if (valid.length > 0) return valid.reduce((latest, candidate) => candidate.header.generation > latest.header.generation ? candidate : latest)
-    if (slots.some(slot => slot.present)) throw new V4RecoveryRequiredError()
-    return null
+    const validHeaders = slots.flatMap(slot => slot.header ? [slot.header] : [])
+    if (validHeaders.length === 0) {
+      if (slots.some(slot => slot.present)) throw new V4RecoveryRequiredError()
+      return null
+    }
+    const header = validHeaders.reduce((latest, candidate) => candidate.generation > latest.generation ? candidate : latest)
+    try {
+      const payload = await decodePayload(header)
+      return { header, payload }
+    } catch (error) {
+      if (error instanceof V4RecoveryRequiredError) throw error
+      throw new V4RecoveryRequiredError("V4 recovery payload cannot be decrypted.")
+    }
   }
 
   return {
