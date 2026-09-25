@@ -14,8 +14,8 @@
 - Child C PR: #6, stacked on `master`
 - Child C baseline: `f0cf947b66471ac15e1f2f3060473e3bb0206e91`
 - Latest code/test heads before the current handoff-document update:
-  - Child C: `3c5008948f45d00fed72927183e1647c6572e7c3`
-  - Child D merge head: `4595ec537546bd9178cdb682d63b99abc49f0c2f`
+  - Child C: `73a35a67aaff69f9765c3a2005d035a0e7e12d04`
+  - Child D merge head: `af29c7c5339cfd552af577856c98cd2f0d446e00`
 - Do **not** assume the current branch HEAD equals the hashes above; this handoff file itself may advance the branch. Run `git rev-parse HEAD` after checkout.
 
 ## User instruction
@@ -91,7 +91,7 @@ Implementation:
   - thrown Contents 404 immutable fallback.
 
 Stack integration:
-- Merge base of Child D against Child C is Child C head `3c5008948f45d00fed72927183e1647c6572e7c3`.
+- Merge base of Child D against Child C is Child C head `73a35a67aaff69f9765c3a2005d035a0e7e12d04`.
 - After carrying the acceptance-test corrections into D, compare was `ahead`, `behind=0`.
 - Before adding this durable handoff document, D-vs-C diff contained only the seven D implementation/test files below. The current diff is those files **plus** root-level `HANDOFF-NEXT-SESSION.md`:
   - `docs/superpowers/plans/2026-09-06-immutable-git-read-fallback.md`
@@ -162,7 +162,21 @@ Root-cause review confirmed both remaining expectations were stale transaction s
 
 Those final test-only corrections were committed to Child C as `3c5008948f45d00fed72927183e1647c6572e7c3` and merged into Child D as `4595ec537546bd9178cdb682d63b99abc49f0c2f`.
 
-No production source changed in either acceptance-remediation round. The corrected tree still needs a final fast/repeat rerun before it can be called green.
+The user reran on Child D head `10a52a586d4add81c3d0562dc893b04b4d33a60b`:
+- settings-secrets targeted suite remained 33/35 PASS;
+- full fast suite remained 417/419 PASS;
+- repeat runner reproduced the same two failures;
+- the copy-count assertions were fixed, and the only remaining mismatch became canonical remote content: actual `remote change`, expected `local change`.
+
+Root cause: the generic race harness created a synthetic **external** competing commit before invoking the settings-change callback. On the fresh plaintext retry, external reconciliation re-stamped remote metadata with `mtime = now()`; therefore policy `newer` correctly chose the remote content. The test name/intent said the retry should choose local, so the harness—not production—was modeling the wrong kind of competitor.
+
+The harness now supports an async failure hook. For these two regressions, the remote runtime performs a real `forcePush()` during the local CAS attempt and the test asserts the competing V4 head actually advances. Only when a hook does not advance the ref does the generic harness fall back to a synthetic external competitor. This preserves the original intent: a plugin-valid competing publication advances the head without changing the logical `conflict.md` record, then the changed `newer` policy selects the local mtime-3 edit.
+
+This third acceptance-remediation commit is test-only:
+- Child C: `73a35a67aaff69f9765c3a2005d035a0e7e12d04`
+- merged into Child D: `af29c7c5339cfd552af577856c98cd2f0d446e00`
+
+No production source changed in the acceptance-remediation rounds. The latest tree still needs the same final `settings-secrets`, fast, and repeat rerun before it can be called green.
 
 At the time of this handoff:
 - GitHub combined status checks for Child C and Child D were empty (`statuses: []`).
@@ -246,4 +260,4 @@ The connector available to the AI session did not expose a delete-ref action, so
 ## Last updated
 
 - 2026-09-25 (Asia/Bangkok)
-- Reason: record the second acceptance run, reduce the fast failures from eight to two, document the final transaction-semantics root cause, and record the final test-only corrections.
+- Reason: record the third acceptance run, identify the synthetic-external-competitor mtime artifact, and record the async plugin-valid competitor harness correction.
