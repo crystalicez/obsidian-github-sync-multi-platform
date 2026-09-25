@@ -111,6 +111,15 @@ test("branch lookup distinguishes absent, present, and unknown", async () => {
   }), /network error/i);
 });
 
+test("cleanup rejects non-local branch namespaces before any remote request", async () => {
+  const fetchImpl = fakeFetch([]);
+  await assert.rejects(() => cleanupE2EBranch({
+    fetchImpl, owner: "test", repo: "repo", branch: "feature/do-not-delete",
+    token: "secret", expectedRepoId: "123", currentSourceRepoId: "777", sleep: async () => {},
+  }), /restricted.*local/i);
+  assert.equal(fetchImpl.remaining(), 0);
+});
+
 test("cleanup deletes a present unique branch, verifies absence, and re-proves pinned target capability", async () => {
   const calls = [];
   const fetchImpl = fakeFetch([
@@ -133,7 +142,7 @@ test("cleanup deletes a present unique branch, verifies absence, and re-proves p
 test("cleanup succeeds for an absent branch only after pinned target capability is proved twice", async () => {
   const fetchImpl = fakeFetch([repo(), ref(), response(404), repo(), ref()]);
   await cleanupE2EBranch({
-    fetchImpl, owner: "test", repo: "repo", branch: "gone", token: "secret", expectedRepoId: "123", currentSourceRepoId: "777", sleep: async () => {},
+    fetchImpl, owner: "test", repo: "repo", branch: "obsidian-sync-e2e/local-gone", token: "secret", expectedRepoId: "123", currentSourceRepoId: "777", sleep: async () => {},
   });
   assert.equal(fetchImpl.remaining(), 0);
 });
@@ -143,11 +152,12 @@ test("cleanup retries a failed server-side delete after verifying the branch rem
   const fetchImpl = fakeFetch([
     repo(), ref(),
     response(200, { object: { sha: PRESENT_SHA } }), response(500), response(200, { object: { sha: PRESENT_SHA } }),
+    repo(), ref(),
     response(200, { object: { sha: PRESENT_SHA } }), response(204), response(404),
     repo(), ref(),
   ]);
   await cleanupE2EBranch({
-    fetchImpl, owner: "test", repo: "repo", branch: "e2e/retry", token: "secret", expectedRepoId: "123", currentSourceRepoId: "777",
+    fetchImpl, owner: "test", repo: "repo", branch: "obsidian-sync-e2e/local-retry", token: "secret", expectedRepoId: "123", currentSourceRepoId: "777",
     sleep: async ms => sleeps.push(ms),
   });
   assert.deepEqual(sleeps, [2000]);
@@ -158,10 +168,11 @@ test("cleanup fails if the branch persists after bounded attempts", async () => 
   const fetchImpl = fakeFetch([
     repo(), ref(),
     present(), response(204), present(),
+    repo(), ref(),
     present(), response(204), present(),
   ]);
   await assert.rejects(() => cleanupE2EBranch({
-    fetchImpl, owner: "test", repo: "repo", branch: "e2e/stuck", token: "secret", expectedRepoId: "123", currentSourceRepoId: "777",
+    fetchImpl, owner: "test", repo: "repo", branch: "obsidian-sync-e2e/local-stuck", token: "secret", expectedRepoId: "123", currentSourceRepoId: "777",
     sleep: async () => {}, maxAttempts: 2,
   }), /still exists/i);
 });
@@ -173,18 +184,18 @@ test("cleanup fails closed if target identity changes during post-delete verific
     repo(999),
   ]);
   await assert.rejects(() => cleanupE2EBranch({
-    fetchImpl, owner: "test", repo: "repo", branch: "e2e/x", token: "secret", expectedRepoId: "123", currentSourceRepoId: "777", sleep: async () => {},
+    fetchImpl, owner: "test", repo: "repo", branch: "obsidian-sync-e2e/local-x", token: "secret", expectedRepoId: "123", currentSourceRepoId: "777", sleep: async () => {},
   }), /repository ID/i);
 });
 
 test("cleanup treats auth and network failures as unknown, not success", async () => {
   await assert.rejects(() => cleanupE2EBranch({
     fetchImpl: fakeFetch([repo(), ref(), response(200, { object: { sha: PRESENT_SHA } }), response(403)]),
-    owner: "test", repo: "repo", branch: "e2e/x", token: "secret", expectedRepoId: "123", currentSourceRepoId: "777", sleep: async () => {},
+    owner: "test", repo: "repo", branch: "obsidian-sync-e2e/local-x", token: "secret", expectedRepoId: "123", currentSourceRepoId: "777", sleep: async () => {},
   }), /HTTP 403/i);
   await assert.rejects(() => cleanupE2EBranch({
     fetchImpl: fakeFetch([new Error("offline")]),
-    owner: "test", repo: "repo", branch: "e2e/x", token: "secret", expectedRepoId: "123", currentSourceRepoId: "777", sleep: async () => {},
+    owner: "test", repo: "repo", branch: "obsidian-sync-e2e/local-x", token: "secret", expectedRepoId: "123", currentSourceRepoId: "777", sleep: async () => {},
   }), /network error/i);
 });
 
