@@ -166,6 +166,17 @@ test("bounded absence polling can outlive three still-present observations", asy
   })
 })
 
+test("credentialed environment rejects a malformed optional source repository ID", () => {
+  assert.throws(() => readGitHubE2ETargetEnvironment({
+    GITHUB_E2E_OWNER: "owner",
+    GITHUB_E2E_REPO: "repo",
+    GITHUB_E2E_BRANCH: "local-e2e",
+    GITHUB_E2E_TOKEN: "secret",
+    GITHUB_E2E_EXPECTED_REPO_ID: "222",
+    GITHUB_E2E_SOURCE_REPO_ID: "source-name",
+  }), /SOURCE_REPO_ID.*numeric|numeric.*source/i)
+})
+
 test("credentialed environment requires numeric expected repository ID", () => {
   assert.throws(() => readGitHubE2ETargetEnvironment({
     GITHUB_E2E_OWNER: "owner",
