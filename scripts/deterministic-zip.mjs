@@ -26,7 +26,15 @@ export function crc32(input) {
 }
 
 function checkedName(name) {
-  if (typeof name !== "string" || name === "" || name.includes("\\") || name.startsWith("/") || name.includes("\0")) {
+  const parts = typeof name === "string" ? name.split("/") : [];
+  if (
+    typeof name !== "string"
+    || name === ""
+    || name.includes("\\")
+    || name.startsWith("/")
+    || name.includes("\0")
+    || parts.some(part => part === "" || part === "." || part === "..")
+  ) {
     throw new Error(`Invalid ZIP entry name: ${name}`);
   }
   const encoded = Buffer.from(name, "utf8");
