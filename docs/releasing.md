@@ -33,7 +33,7 @@ Before the official local flow, require:
 
 - clean checkout on branch `master`,
 - exactly one effective `origin` fetch URL and one effective `origin` push URL, both resolving to `crystalicez/obsidian-github-sync-multi-platform`,
-- Node exactly matching `.node-version` (`v22.11.0` at this writing),
+- Node exactly matching `.node-version` (`v24.11.0` at this writing),
 - Corepack pnpm exactly matching `package.json#packageManager` (`9.12.3` at this writing),
 - configured Git committer/tagger identity,
 - Git authentication able to push qualification tags to the canonical source repository,
