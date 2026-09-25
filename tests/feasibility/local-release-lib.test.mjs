@@ -8,6 +8,8 @@ import {
   runPnpmGate,
   serializeQualificationReceipt,
   validateQualificationReceipt,
+  withoutAnyGitHubTokens,
+  withoutGitHubAuthTokens,
   withoutGitHubE2EToken,
 } from "../../scripts/local-release-lib.mjs";
 
@@ -116,4 +118,30 @@ test("POSIX gate construction uses shell-free corepack argv", () => {
   assert.equal(calls[0].command, "corepack");
   assert.deepEqual(calls[0].args, ["pnpm", "install", "--frozen-lockfile"]);
   assert.throws(() => runPnpmGate("not-a-gate", { runner }), /unknown pnpm gate/i);
+});
+
+
+test("GitHub token sanitizers separate E2E and publication credentials", () => {
+  const env = {
+    PATH: "/bin",
+    GITHUB_E2E_TOKEN: "e2e",
+    GH_TOKEN: "gh",
+    GITHUB_TOKEN: "github",
+    GH_ENTERPRISE_TOKEN: "ghe",
+    GITHUB_ENTERPRISE_TOKEN: "github-enterprise",
+  };
+  assert.deepEqual(withoutGitHubE2EToken(env), {
+    PATH: "/bin",
+    GH_TOKEN: "gh",
+    GITHUB_TOKEN: "github",
+    GH_ENTERPRISE_TOKEN: "ghe",
+    GITHUB_ENTERPRISE_TOKEN: "github-enterprise",
+  });
+  assert.deepEqual(withoutGitHubAuthTokens(env), {
+    PATH: "/bin",
+    GITHUB_E2E_TOKEN: "e2e",
+  });
+  assert.deepEqual(withoutAnyGitHubTokens(env), { PATH: "/bin" });
+  assert.equal(env.GITHUB_E2E_TOKEN, "e2e");
+  assert.equal(env.GH_TOKEN, "gh");
 });
