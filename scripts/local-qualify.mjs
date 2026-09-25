@@ -12,6 +12,7 @@ import {
   runPnpmGate,
   serializeQualificationReceipt,
   validateQualificationReceipt,
+  withoutAnyGitHubTokens,
   withoutGitHubE2EToken,
 } from "./local-release-lib.mjs";
 import {
@@ -97,6 +98,7 @@ export async function qualifyLocal({
   if (!(startedAt instanceof Date) || !Number.isFinite(startedAt.getTime())) throw new Error("now() must return a valid Date");
 
   const nonLiveEnv = withoutGitHubE2EToken(env);
+  const gateEnv = withoutAnyGitHubTokens(env);
   const nonLiveRunner = (command, args, options = {}) => runner(command, args, { ...options, env: nonLiveEnv });
 
   const sha = requireCleanMaster({ runner: nonLiveRunner, cwd });
@@ -104,7 +106,7 @@ export async function qualifyLocal({
   if (readRemoteMasterSha({ runner: nonLiveRunner, cwd }) !== sha) throw new Error("Remote master does not equal local HEAD");
 
   const metadata = validateReleaseMetadata(await readReleaseMetadata(cwd));
-  const pnpmVersion = readPnpmVersion({ runner: nonLiveRunner, cwd, env: nonLiveEnv, platform, comspec });
+  const pnpmVersion = readPnpmVersion({ runner: nonLiveRunner, cwd, env: gateEnv, platform, comspec });
   assertExactRuntimeToolchain({ metadata, nodeVersion: runtimeNodeVersion, pnpmVersion });
   requireSuccess(nonLiveRunner("git", ["var", "GIT_COMMITTER_IDENT"], { cwd, encoding: "utf8" }), "Git committer identity check");
 
@@ -149,7 +151,7 @@ export async function qualifyLocal({
   for (const gate of FIXED_GATE_NAMES) {
     if (gate === "github-e2e-live") break;
     onProgress({ kind: "gate", name: gate });
-    const result = runPnpmGate(gate, { cwd, env: nonLiveEnv, platform, comspec, runner: nonLiveRunner });
+    const result = runPnpmGate(gate, { cwd, env: gateEnv, platform, comspec, runner: nonLiveRunner });
     requireSuccess(result, `Qualification gate ${gate}`);
   }
 
@@ -184,7 +186,7 @@ export async function qualifyLocal({
   requireCanonicalOriginEndpoints({ runner: nonLiveRunner, cwd });
   if (readRemoteMasterSha({ runner: nonLiveRunner, cwd }) !== sha) throw new Error("Remote master changed during qualification");
   const postMetadata = validateReleaseMetadata(await readReleaseMetadata(cwd), { requestedVersion: version });
-  const postPnpmVersion = readPnpmVersion({ runner: nonLiveRunner, cwd, env: nonLiveEnv, platform, comspec });
+  const postPnpmVersion = readPnpmVersion({ runner: nonLiveRunner, cwd, env: gateEnv, platform, comspec });
   assertExactRuntimeToolchain({ metadata: postMetadata, nodeVersion: runtimeNodeVersion, pnpmVersion: postPnpmVersion });
   const postExisting = fetchAndInspectObservedQualificationTag({ runner: nonLiveRunner, cwd, ref: qualificationRef });
   if (postExisting.kind !== "absent") throw new Error("Qualification ref appeared concurrently after gates");
