@@ -392,7 +392,7 @@ test("v4 runtime CAS retry reuses one keep-local-copy-remote conflict copy", asy
   assert.equal(local.runtime.progressSnapshot.timings.find(item => item.phase === "checking-remote")?.occurrences, 2);
 });
 
-test("v4 incremental CAS retry publishes an applied conflict copy when retry chooses use-local", async t => {
+test("v4 incremental CAS retry abandons an uncommitted conflict copy when retry chooses use-local", async t => {
   const github = new RuntimeMemoryGitHub();
   const local = plaintextRuntimeFixture("conflict.md", github, "local");
   const remote = plaintextRuntimeFixture([], github, "remote");
@@ -430,13 +430,13 @@ test("v4 incremental CAS retry publishes an applied conflict copy when retry cho
     .filter(record => !record.deleted && record.path.includes(".conflict-remote-"));
 
   assert.equal(local.runtime.progressSnapshot.lifecycle, "success");
-  assert.equal(localCopyPaths.length, 1, `local copies: ${localCopyPaths.join(", ")}`);
-  assert.deepEqual(remoteCopyPaths, localCopyPaths, `remote copies: ${remoteCopyPaths.join(", ")}`);
-  assert.deepEqual(indexCopyRecords.map(record => record.path), localCopyPaths);
-  assert.deepEqual(remoteCopyRecords.map(record => record.path), localCopyPaths);
-  assert.deepEqual(remoteCopyRecords.map(record => record.fileId), indexCopyRecords.map(record => record.fileId));
+  assert.deepEqual(localCopyPaths, [], "the losing attempt must not materialize its uncommitted conflict copy");
+  assert.deepEqual(remoteCopyPaths, []);
+  assert.deepEqual(indexCopyRecords, []);
+  assert.deepEqual(remoteCopyRecords, []);
+  assert.equal(new TextDecoder().decode(github.files.get("conflict.md")), "local change");
   assert.deepEqual(local.runtime.progressSnapshot.pull, { completed: 0, total: 0 });
-  assert.deepEqual(local.runtime.progressSnapshot.push, { completed: 2, total: 2 });
+  assert.deepEqual(local.runtime.progressSnapshot.push, { completed: 1, total: 1 });
   assert.equal(local.runtime.progressSnapshot.timings.find(item => item.phase === "checking-remote")?.occurrences, 2);
 });
 
@@ -481,7 +481,7 @@ test("v4 direct keep-local-copy keeps an out-of-scope generated copy local only"
   assert.deepEqual(local.runtime.progressSnapshot.push, { completed: 1, total: 1 });
 });
 
-test("v4 incremental CAS retry keeps an out-of-scope copy local when policy and settings change", async t => {
+test("v4 incremental CAS retry drops an uncommitted out-of-scope copy when policy changes", async t => {
   const github = new RuntimeMemoryGitHub();
   const local = plaintextRuntimeFixture("conflict.md", github, "local");
   const remote = plaintextRuntimeFixture([], github, "remote");
@@ -520,10 +520,11 @@ test("v4 incremental CAS retry keeps an out-of-scope copy local when policy and 
     .filter(record => !record.deleted && record.path.includes(".conflict-remote-"));
 
   assert.equal(local.runtime.progressSnapshot.lifecycle, "success");
-  assert.equal(localCopyPaths.length, 1, `local copies: ${localCopyPaths.join(", ")}`);
+  assert.deepEqual(localCopyPaths, [], "the losing attempt must not leave an out-of-scope copy behind");
   assert.deepEqual(remoteCopyPaths, []);
   assert.deepEqual(remoteCopyRecords, []);
   assert.deepEqual(indexCopyRecords, []);
+  assert.equal(new TextDecoder().decode(github.files.get("conflict.md")), "local change");
   assert.deepEqual(local.runtime.progressSnapshot.pull, { completed: 0, total: 0 });
   assert.deepEqual(local.runtime.progressSnapshot.push, { completed: 1, total: 1 });
   assert.equal(local.runtime.progressSnapshot.timings.find(item => item.phase === "checking-remote")?.occurrences, 2);
