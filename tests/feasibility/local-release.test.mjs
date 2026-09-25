@@ -156,28 +156,29 @@ test("public release is unreachable before all exact verification phases", async
   assert.equal(result.qualificationTagObjectSha, QUAL_OBJECT);
 });
 
-test("release strips GitHub E2E token from publication children while preserving GitHub auth env", async () => {
+test("release isolates verification gates while preserving publication auth for Git and gh operations", async () => {
   const h = await harness();
-  const seen = [];
+  const gateEnvs = [];
+  const publicationEnvs = [];
   h.services.requireCleanMaster = ({ runner }) => {
     runner("env-probe", [], {});
     return SHA;
   };
   h.services.readPnpmVersion = ({ env }) => {
-    seen.push(env);
+    gateEnvs.push(env);
     return "9.12.3";
   };
   h.services.requireGithubPublicationAuth = ({ env }) => {
-    seen.push(env);
+    publicationEnvs.push(env);
   };
   h.services.runPnpmGate = (name, { env }) => {
-    seen.push(env);
+    gateEnvs.push(env);
     return { status: 0, stdout: "", stderr: "" };
   };
-  const probeEnvs = [];
+  const gitEnvs = [];
   const runner = (command, args, options = {}) => {
     if (command !== "env-probe") throw new Error(`unexpected runner command ${command} ${args.join(" ")}`);
-    probeEnvs.push(options.env);
+    gitEnvs.push(options.env);
     return { status: 0, stdout: "", stderr: "" };
   };
   await releaseLocal({
@@ -186,11 +187,23 @@ test("release strips GitHub E2E token from publication children while preserving
     runner,
     services: h.services,
     runtimeNodeVersion: "v22.11.0",
-    env: { PATH: "/bin", GH_TOKEN: "publication-token", GITHUB_E2E_TOKEN: "e2e-secret" },
+    env: {
+      PATH: "/bin",
+      GH_TOKEN: "publication-token",
+      GITHUB_TOKEN: "actions-token",
+      GITHUB_E2E_TOKEN: "e2e-secret",
+    },
   });
-  for (const childEnv of [...seen, ...probeEnvs]) {
+  for (const childEnv of gateEnvs) {
+    assert.equal(childEnv.GITHUB_E2E_TOKEN, undefined);
+    assert.equal(childEnv.GH_TOKEN, undefined);
+    assert.equal(childEnv.GITHUB_TOKEN, undefined);
+    assert.equal(childEnv.PATH, "/bin");
+  }
+  for (const childEnv of [...publicationEnvs, ...gitEnvs]) {
     assert.equal(childEnv.GITHUB_E2E_TOKEN, undefined);
     assert.equal(childEnv.GH_TOKEN, "publication-token");
+    assert.equal(childEnv.GITHUB_TOKEN, "actions-token");
     assert.equal(childEnv.PATH, "/bin");
   }
 });
