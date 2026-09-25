@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   CANONICAL_REPOSITORY,
+  CANONICAL_REPOSITORY_ID,
   parseGitHubRemote,
   readOriginFetchRepository,
   requireCanonicalOriginEndpoints,
@@ -24,6 +25,11 @@ function fakeGit({ fetchUrls = [], pushUrls = [], status = 0 } = {}) {
     throw new Error(`Unexpected command: ${args.join(" ")}`);
   };
 }
+
+test("canonical source identity pins both name and stable numeric ID", () => {
+  assert.equal(CANONICAL_REPOSITORY, "crystalicez/obsidian-github-sync-multi-platform");
+  assert.equal(CANONICAL_REPOSITORY_ID, "1282135059");
+});
 
 test("supported GitHub remotes normalize to owner/repo", () => {
   assert.equal(parseGitHubRemote("https://github.com/crystalicez/obsidian-github-sync-multi-platform.git"), CANONICAL_REPOSITORY);
