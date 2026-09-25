@@ -49,7 +49,8 @@ function makeFetch({ cleanupStatus = 404 } = {}) {
   const calls = [];
   const impl = async (url, options = {}) => {
     calls.push({ url, options });
-    if (!url.includes("/git/ref/heads/")) return response(200, { default_branch: "main" });
+    if (!url.includes("/git/ref") && !url.includes("/git/refs")) return response(200, { id: 123, default_branch: "main" });
+    if (url.includes("/git/ref/heads/main")) return response(200, { object: { sha: "d".repeat(40) } });
     if (cleanupStatus === "network") throw new Error("network");
     if (cleanupStatus === 403) return response(403, {});
     return response(cleanupStatus, {});
@@ -134,6 +135,7 @@ function baseOptions(f, extras = {}) {
         GITHUB_E2E_REPO: "disposable-repo",
         GITHUB_E2E_BRANCH: "main",
         GITHUB_E2E_TOKEN: "secret-token",
+        GITHUB_E2E_EXPECTED_REPO_ID: "123",
       },
       runtimeNodeVersion: "v22.11.0",
       platform: "linux",
