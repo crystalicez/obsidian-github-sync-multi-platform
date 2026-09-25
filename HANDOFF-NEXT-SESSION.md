@@ -325,6 +325,35 @@ The user's current Windows installation already resolves `node.exe` from `C:\\Pr
 
 Fresh acceptance must now run on exact Node `v24.11.0` and pnpm `9.12.3` against the current PR #4 head. The earlier Node-24/libuv failure is **not** accepted as proof: it occurred before the preflight-ordering fix `572a69f40a84e125375cbd9f23de9b11649a1896`; the focused `github-e2e-compile-cli` regression must pass on the migrated toolchain before merge.
 
+### 2026-09-26 Node 24 acceptance progress
+
+The user ran a fresh non-destructive acceptance subset on exact code/test head `1d924d68d0e1ba8efc28ee54189e7e4fe8f66bd7` with:
+- Node `v24.11.0`;
+- pnpm `9.12.3`.
+
+Observed GREEN evidence:
+- focused `github-e2e-compile-cli`: 4/4 PASS, including the regression `credentialed runner requires expected target repository ID before execution`;
+- focused `release-metadata`: 9/9 PASS;
+- focused `local-qualify`: 9/9 PASS;
+- focused `local-release`: 37/37 PASS;
+- production build: PASS;
+- full feasibility suite: 138/138 PASS, 0 fail/cancel/skip/todo.
+
+This directly verifies the preflight-ordering fix on Node 24 and validates the Node-24 exact-toolchain migration across the release/E2E feasibility surface.
+
+Remaining fresh gates before PR #4 merge:
+- full fast suite;
+- repeat fast suite (10x);
+- recovery suite;
+- resource suite;
+- release metadata validation command;
+- GitHub-E2E compile-only command;
+- CI producer input-manifest path on Node 24;
+- package validation;
+- final clean-tree/head integrity check.
+
+The handoff update recording this result is documentation-only. If it advances the branch head, the code/test tree proven above is still `1d924d68...`; do not invalidate that evidence merely because the handoff markdown changed.
+
 ## Known housekeeping
 
 The previously noted temporary branch `tmp-ignore` is no longer present in the current remote branch listing, so no action is required for it.
