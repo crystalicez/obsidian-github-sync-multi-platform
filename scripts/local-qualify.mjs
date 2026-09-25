@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { pathToFileURL } from "node:url";
-import { loadGitHubE2EEnv, qualificationE2EBranch, validateGitHubE2EConfig } from "./github-e2e-env.mjs";
+import { loadGitHubE2EEnv, qualificationE2EBranch, sanitizeGitHubE2ELiveEnv, validateGitHubE2EConfig } from "./github-e2e-env.mjs";
 import { cleanupE2EBranch, preflightE2ERemote } from "./github-e2e-remote.mjs";
 import { CANONICAL_REPOSITORY, CANONICAL_REPOSITORY_ID, requireCanonicalOriginEndpoints } from "./github-repo.mjs";
 import {
@@ -154,7 +154,7 @@ export async function qualifyLocal({
   }
 
   onProgress({ kind: "gate", name: "github-e2e-live" });
-  const liveEnv = { ...raw, GITHUB_E2E_BRANCH: officialBranch };
+  const liveEnv = sanitizeGitHubE2ELiveEnv({ ...raw, GITHUB_E2E_BRANCH: officialBranch });
   const liveResult = runPnpmGate("github-e2e-live", { cwd, env: liveEnv, platform, comspec, runner });
   let cleanupError = null;
   try {
