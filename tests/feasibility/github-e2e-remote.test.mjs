@@ -53,6 +53,17 @@ test("remote preflight rejects a repository route whose numeric ID changed", asy
   }), /repository ID/i);
 });
 
+test("remote preflight rejects canonical and current source repository IDs", async () => {
+  await assert.rejects(() => preflightE2ERemote({
+    fetchImpl: fakeFetch([repo(1282135059)]),
+    config: config("e2e/run-1", "1282135059"),
+  }), /source repository ID/i);
+  await assert.rejects(() => preflightE2ERemote({
+    fetchImpl: fakeFetch([repo(777)]),
+    config: { ...config("e2e/run-1", "777"), currentSourceRepoId: "777" },
+  }), /source repository ID/i);
+});
+
 test("remote preflight requires readable default-ref capability", async () => {
   await assert.rejects(() => preflightE2ERemote({
     fetchImpl: fakeFetch([repo(), response(404)]),
@@ -111,7 +122,7 @@ test("cleanup deletes a present unique branch, verifies absence, and re-proves p
   ], calls);
   await cleanupE2EBranch({
     fetchImpl, owner: "test", repo: "repo", branch: "obsidian-sync-e2e/local-abc-run",
-    token: "secret", expectedRepoId: "123", sleep: async () => {},
+    token: "secret", expectedRepoId: "123", currentSourceRepoId: "777", sleep: async () => {},
   });
   assert.match(calls[2].url, /\/git\/ref\/heads\/obsidian-sync-e2e\/local-abc-run$/u);
   assert.equal(calls[3].options.method, "DELETE");
@@ -122,7 +133,7 @@ test("cleanup deletes a present unique branch, verifies absence, and re-proves p
 test("cleanup succeeds for an absent branch only after pinned target capability is proved twice", async () => {
   const fetchImpl = fakeFetch([repo(), ref(), response(404), repo(), ref()]);
   await cleanupE2EBranch({
-    fetchImpl, owner: "test", repo: "repo", branch: "gone", token: "secret", expectedRepoId: "123", sleep: async () => {},
+    fetchImpl, owner: "test", repo: "repo", branch: "gone", token: "secret", expectedRepoId: "123", currentSourceRepoId: "777", sleep: async () => {},
   });
   assert.equal(fetchImpl.remaining(), 0);
 });
@@ -136,7 +147,7 @@ test("cleanup retries a failed server-side delete after verifying the branch rem
     repo(), ref(),
   ]);
   await cleanupE2EBranch({
-    fetchImpl, owner: "test", repo: "repo", branch: "e2e/retry", token: "secret", expectedRepoId: "123",
+    fetchImpl, owner: "test", repo: "repo", branch: "e2e/retry", token: "secret", expectedRepoId: "123", currentSourceRepoId: "777",
     sleep: async ms => sleeps.push(ms),
   });
   assert.deepEqual(sleeps, [2000]);
@@ -150,7 +161,7 @@ test("cleanup fails if the branch persists after bounded attempts", async () => 
     present(), response(204), present(),
   ]);
   await assert.rejects(() => cleanupE2EBranch({
-    fetchImpl, owner: "test", repo: "repo", branch: "e2e/stuck", token: "secret", expectedRepoId: "123",
+    fetchImpl, owner: "test", repo: "repo", branch: "e2e/stuck", token: "secret", expectedRepoId: "123", currentSourceRepoId: "777",
     sleep: async () => {}, maxAttempts: 2,
   }), /still exists/i);
 });
@@ -162,18 +173,18 @@ test("cleanup fails closed if target identity changes during post-delete verific
     repo(999),
   ]);
   await assert.rejects(() => cleanupE2EBranch({
-    fetchImpl, owner: "test", repo: "repo", branch: "e2e/x", token: "secret", expectedRepoId: "123", sleep: async () => {},
+    fetchImpl, owner: "test", repo: "repo", branch: "e2e/x", token: "secret", expectedRepoId: "123", currentSourceRepoId: "777", sleep: async () => {},
   }), /repository ID/i);
 });
 
 test("cleanup treats auth and network failures as unknown, not success", async () => {
   await assert.rejects(() => cleanupE2EBranch({
     fetchImpl: fakeFetch([repo(), ref(), response(200, { object: { sha: PRESENT_SHA } }), response(403)]),
-    owner: "test", repo: "repo", branch: "e2e/x", token: "secret", expectedRepoId: "123", sleep: async () => {},
+    owner: "test", repo: "repo", branch: "e2e/x", token: "secret", expectedRepoId: "123", currentSourceRepoId: "777", sleep: async () => {},
   }), /HTTP 403/i);
   await assert.rejects(() => cleanupE2EBranch({
     fetchImpl: fakeFetch([new Error("offline")]),
-    owner: "test", repo: "repo", branch: "e2e/x", token: "secret", expectedRepoId: "123", sleep: async () => {},
+    owner: "test", repo: "repo", branch: "e2e/x", token: "secret", expectedRepoId: "123", currentSourceRepoId: "777", sleep: async () => {},
   }), /network error/i);
 });
 
