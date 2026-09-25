@@ -20,10 +20,10 @@ const validReceiptInput = {
   qualifiedAt: "2026-08-27T00:00:00.000Z",
   durationMs: 1234,
   platform: "linux-x64",
-  nodeVersion: "v22.11.0",
+  nodeVersion: "v24.11.0",
   pnpmVersion: "9.12.3",
 };
-const expected = { sha, version: "1.0.8", nodeVersion: "v22.11.0", pnpmVersion: "9.12.3" };
+const expected = { sha, version: "1.0.8", nodeVersion: "v24.11.0", pnpmVersion: "9.12.3" };
 
 test("qualification naming binds version and full SHA", () => {
   assert.equal(qualificationTagName("1.0.8", sha), `qualification/local/v1/1.0.8/${sha}`);
