@@ -251,7 +251,20 @@ Current GitHub backlog survey:
 Integration progress:
 1. PR #6: **DONE**, merged to `master`.
 2. PR #7: **DONE**, retargeted, D-only diff verified, merged to `master`.
-3. PR #4: **NEXT**, resolve `feature/local-release-qualification` against the now-final master, re-run release/qualification verification, and merge if still valid.
+3. PR #4: **IN PROGRESS**. Branch merged with final master and is `behind=0`. Integration hardening added pinned numeric E2E repository identity, readable-default-ref proof, post-cleanup re-proof, current master compile/provenance pipeline retention, and docs that preserve the Actions Stable Release interlock. PR is Ready for Review; CI on the final head is the merge gate.
+
+## PR #4 integration details
+
+Current PR #4 integration decisions:
+- Mechanical merge commit `4c74b8d05d03eae03dbc98fc684418bf7c98a5a3` restacked `feature/local-release-qualification` on master `25ea5f5116b98f2b2941da23b23cf022dbca5fcd`.
+- Master and PR #4 overlapped in only three files: `docs/github-e2e.md`, `docs/releasing.md`, and `scripts/run-github-e2e.mjs`.
+- `scripts/run-github-e2e.mjs` retains master's `compileGitHubE2EBundles` / CI input-manifest flow and adds PR #4's local-origin/remote preflight.
+- Local/manual E2E now requires `GITHUB_E2E_EXPECTED_REPO_ID`; target repository metadata ID must match before destructive work.
+- Preflight requires the target's actual default Git ref to be readable, not merely repository metadata.
+- Local qualification cleanup re-proves pinned repository identity/default-ref capability after branch absence before qualification can succeed.
+- `.env.github-e2e.example` now includes the numeric repository ID field that master docs/runner already required.
+- The local release authority path is documented as supported, while GitHub Actions Stable Release remains intentionally interlocked by the current workflow. PR #4 does not bypass/remove that interlock.
+- PR #4 is now Ready for Review and mergeable; execution verification on its final head remains required before merge.
 
 ## Known housekeeping
 
@@ -278,4 +291,4 @@ The previously noted temporary branch `tmp-ignore` is no longer present in the c
 ## Last updated
 
 - 2026-09-25 (Asia/Bangkok)
-- Reason: record PR #6 and PR #7 fully landed; PR #4 is the remaining integration target.
+- Reason: record PR #4 restack/safety integration and CI-gated final verification state after PR #6/#7 landed.
