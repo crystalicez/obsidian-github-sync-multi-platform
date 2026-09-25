@@ -69,4 +69,8 @@ test("stored ZIP rejects duplicate and unsafe entry names", () => {
   ]), /duplicate/i);
   assert.throws(() => createStoredZip([{ name: "bad\\name", bytes: Buffer.from("a") }]), /invalid/i);
   assert.throws(() => createStoredZip([{ name: "/absolute", bytes: Buffer.from("a") }]), /invalid/i);
+  assert.throws(() => createStoredZip([{ name: "../escape", bytes: Buffer.from("a") }]), /invalid/i);
+  assert.throws(() => createStoredZip([{ name: "root/../escape", bytes: Buffer.from("a") }]), /invalid/i);
+  assert.throws(() => createStoredZip([{ name: "root/./file", bytes: Buffer.from("a") }]), /invalid/i);
+  assert.throws(() => createStoredZip([{ name: "root//file", bytes: Buffer.from("a") }]), /invalid/i);
 });
