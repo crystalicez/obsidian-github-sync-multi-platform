@@ -7,6 +7,7 @@ import { randomBytes, toBase64, toBase64Url } from "../../src/lib/bytes";
 import { deriveV4Keyring, type V4Keyring } from "../../src/lib/v4/crypto";
 import { V4HistoryService } from "../../src/lib/v4/history-service";
 import { createEmptyV4LocalIndex, type V4LocalIndex } from "../../src/lib/v4/local-index";
+import { isV4PublicationRaceError } from "../../src/lib/v4/publication-race";
 import { expectedV4PathLayout, V4_FORMAT_VERSION, type V4RemoteConfig, type V4StorageMode } from "../../src/lib/v4/protocol-types";
 import { V4StorageCodec } from "../../src/lib/v4/storage-codec";
 import { V4SyncSession, type V4SessionVault, type V4SyncRunState } from "../../src/lib/v4/sync-session";
@@ -306,7 +307,7 @@ function createDevice(name: string, config: GitHubConfig, context: ModeContext, 
         } catch (error) {
           lastError = error;
           const message = error instanceof Error ? error.message : String(error);
-          const retryable = options.operation === "normal" && /branch head changed|stale ref/i.test(message);
+          const retryable = options.operation === "normal" && isV4PublicationRaceError(error);
           if (!retryable || attempt === 3) throw error;
           runState.conflictCopyStages?.clear();
           console.warn(`GitHub E2E retrying normal sync after recoverable CAS race (attempt ${attempt + 1}/3): ${message}`);
@@ -699,8 +700,7 @@ async function runControlledRaceScenario(config: GitHubConfig): Promise<void> {
     const externalCommitSha = interference.externalCommitSha;
     assert.ok(externalCommitSha, "controlled branch-head interference did not create an external commit");
     assert.ok(publishError, "plugin publish unexpectedly succeeded over an externally advanced branch");
-    const publishMessage = publishError instanceof Error ? publishError.message : String(publishError);
-    assert.match(publishMessage, /(branch head changed|Failed to update git ref: HTTP (409|422))/i);
+    assert.equal(isV4PublicationRaceError(publishError), true, "controlled publication race was not classified as V4PublicationRaceError");
 
     const afterRaceHistory = await a.client.listCommits({ perPage: 100 });
     assert.equal(afterRaceHistory.some(commit => commit.sha === externalCommitSha), true, "external commit is not reachable after rejected plugin publish");
