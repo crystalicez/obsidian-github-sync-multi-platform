@@ -87,7 +87,7 @@ class RuntimeMemoryGitHub {
   readPaths: string[] = [];
   updateFailuresRemaining = 0;
   updateFailureDelayMs = 0;
-  onUpdateFailure?: () => void;
+  onUpdateFailure?: () => void | Promise<void>;
   blobFailuresRemaining = 0;
   blobAttempts = 0;
   createBlobOverride?: (bytes: Uint8Array, attempt: number) => Promise<string>;
@@ -114,20 +114,24 @@ class RuntimeMemoryGitHub {
   async createGitCommit(message: string, treeSha: string, parents: string[]) { const sha = `commit-${this.commits.size + 1}`; this.commits.set(sha, { treeSha, parents, message }); return sha; }
   async createGitRef(sha: string) { this.ref = { ref: "refs/heads/main", sha, type: "commit" }; this.files = new Map(this.trees.get(this.commits.get(sha)!.treeSha)); }
   async updateGitRef(sha: string, expected?: string) {
-    if (this.updateFailuresRemaining-- > 0) {
-      const current = this.ref;
-      if (!current) throw new Error("Cannot simulate a publication race without a current ref.");
-      const currentCommit = this.commits.get(current.sha);
-      if (!currentCommit) throw new Error(`Missing commit ${current.sha}`);
-      const winnerSha = `winner-${this.commits.size + 1}`;
-      this.commits.set(winnerSha, {
-        treeSha: currentCommit.treeSha,
-        parents: [current.sha],
-        message: "external winner",
-      });
-      this.ref = { ...current, sha: winnerSha };
-      this.files = new Map(this.trees.get(currentCommit.treeSha));
-      this.onUpdateFailure?.();
+    if (this.updateFailuresRemaining > 0) {
+      this.updateFailuresRemaining--;
+      const beforeFailureHead = this.ref?.sha;
+      await this.onUpdateFailure?.();
+      if (this.ref?.sha === beforeFailureHead) {
+        const current = this.ref;
+        if (!current) throw new Error("Cannot simulate a publication race without a current ref.");
+        const currentCommit = this.commits.get(current.sha);
+        if (!currentCommit) throw new Error(`Missing commit ${current.sha}`);
+        const winnerSha = `winner-${this.commits.size + 1}`;
+        this.commits.set(winnerSha, {
+          treeSha: currentCommit.treeSha,
+          parents: [current.sha],
+          message: "external winner",
+        });
+        this.ref = { ...current, sha: winnerSha };
+        this.files = new Map(this.trees.get(currentCommit.treeSha));
+      }
       if (this.updateFailureDelayMs > 0) await new Promise(resolve => setTimeout(resolve, this.updateFailureDelayMs));
       throw Object.assign(new Error("CAS rejected"), { status: 422 });
     }
@@ -412,7 +416,10 @@ test("v4 incremental CAS retry abandons an uncommitted conflict copy when retry 
   local.contents.set("conflict.md", new TextEncoder().encode("local change"));
   local.vaultFile.stat = { size: 12, mtime: 3 };
   github.updateFailuresRemaining = 1;
-  github.onUpdateFailure = () => {
+  github.onUpdateFailure = async () => {
+    const beforeWinner = github.ref?.sha;
+    await remote.runtime.forcePush();
+    assert.notEqual(github.ref?.sha, beforeWinner, "remote runtime must publish the competing V4 head");
     local.plugin.settings.conflictPolicy = "newer";
     local.plugin.settings.ignorePathRegex = "\\.conflict-remote-";
   };
@@ -502,7 +509,10 @@ test("v4 incremental CAS retry drops an uncommitted out-of-scope copy when polic
   local.vaultFile.stat = { size: 12, mtime: 3 };
   local.plugin.settings.ignorePathRegex = "\\.conflict-remote-";
   github.updateFailuresRemaining = 1;
-  github.onUpdateFailure = () => {
+  github.onUpdateFailure = async () => {
+    const beforeWinner = github.ref?.sha;
+    await remote.runtime.forcePush();
+    assert.notEqual(github.ref?.sha, beforeWinner, "remote runtime must publish the competing V4 head");
     local.plugin.settings.conflictPolicy = "newer";
     local.plugin.settings.ignorePathRegex = "";
   };
