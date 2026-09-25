@@ -93,7 +93,7 @@ Implementation:
 Stack integration:
 - Merge base of Child D against Child C was confirmed as Child C head `30676ecdd830734424996101fcba8ee290f95c2f`.
 - Compare was `ahead`, `behind=0`.
-- D-vs-C diff contained only D files:
+- Before adding this durable handoff document, D-vs-C diff contained only the seven D implementation/test files below. The current diff is those files **plus** root-level `HANDOFF-NEXT-SESSION.md`:
   - `docs/superpowers/plans/2026-09-06-immutable-git-read-fallback.md`
   - `src/lib/github-api.ts`
   - `src/lib/v4/immutable-git-read.ts`
@@ -101,6 +101,7 @@ Stack integration:
   - `tests/v4/github-immutable-read-fallback-commit-failure.test.ts`
   - `tests/v4/github-immutable-read-fallback-malformed-evidence.test.ts`
   - `tests/v4/github-immutable-read-fallback.test.ts`
+  - `HANDOFF-NEXT-SESSION.md`
 
 ## Important design decisions / invariants
 
