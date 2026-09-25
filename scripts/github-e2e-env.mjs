@@ -7,6 +7,7 @@ const REQUIRED_E2E_KEYS = Object.freeze([
   "GITHUB_E2E_REPO",
   "GITHUB_E2E_BRANCH",
   "GITHUB_E2E_TOKEN",
+  "GITHUB_E2E_EXPECTED_REPO_ID",
 ]);
 const FORBIDDEN_BRANCHES = new Set(["main", "master", "production", "prod", "release", "stable"]);
 
@@ -49,6 +50,12 @@ export async function loadGitHubE2EEnv({ cwd = process.cwd(), env = process.env,
   return { env: merged, envPath: path };
 }
 
+function requireRepositoryId(value, name = "GITHUB_E2E_EXPECTED_REPO_ID") {
+  const text = String(value ?? "").trim();
+  if (!/^[1-9][0-9]*$/u.test(text)) throw new Error(`Invalid ${name}`);
+  return text;
+}
+
 function requireSafeSegment(value, name) {
   if (typeof value !== "string" || value.trim() === "" || value.includes("/") || /\s/u.test(value)) {
     throw new Error(`Invalid ${name}`);
@@ -56,7 +63,7 @@ function requireSafeSegment(value, name) {
   return value.trim();
 }
 
-export function validateGitHubE2EConfig({ owner, repo, branch, token, currentSourceRepo }) {
+export function validateGitHubE2EConfig({ owner, repo, branch, token, expectedRepoId, currentSourceRepo }) {
   const safeOwner = requireSafeSegment(owner, "GITHUB_E2E_OWNER");
   const safeRepo = requireSafeSegment(repo, "GITHUB_E2E_REPO");
   if (typeof branch !== "string" || branch.trim() === "") throw new Error("Missing GITHUB_E2E_BRANCH");
@@ -65,6 +72,7 @@ export function validateGitHubE2EConfig({ owner, repo, branch, token, currentSou
     throw new Error(`Refusing destructive GitHub E2E against protected-looking branch: ${safeBranch}`);
   }
   if (typeof token !== "string" || token === "") throw new Error("Missing GITHUB_E2E_TOKEN");
+  const safeExpectedRepoId = requireRepositoryId(expectedRepoId);
 
   const targetRepository = `${safeOwner}/${safeRepo}`;
   if (currentSourceRepo && repositoriesEqual(targetRepository, currentSourceRepo)) {
@@ -74,7 +82,14 @@ export function validateGitHubE2EConfig({ owner, repo, branch, token, currentSou
     throw new Error("Refusing destructive GitHub E2E against the canonical source repository");
   }
 
-  return { owner: safeOwner, repo: safeRepo, branch: safeBranch, token, targetRepository };
+  return {
+    owner: safeOwner,
+    repo: safeRepo,
+    branch: safeBranch,
+    token,
+    expectedRepoId: safeExpectedRepoId,
+    targetRepository,
+  };
 }
 
 export function requireGitHubE2EConfig(env, { currentSourceRepo } = {}) {
@@ -85,6 +100,7 @@ export function requireGitHubE2EConfig(env, { currentSourceRepo } = {}) {
     repo: env.GITHUB_E2E_REPO,
     branch: env.GITHUB_E2E_BRANCH,
     token: env.GITHUB_E2E_TOKEN,
+    expectedRepoId: env.GITHUB_E2E_EXPECTED_REPO_ID,
     currentSourceRepo,
   });
 }

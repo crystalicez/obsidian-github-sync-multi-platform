@@ -56,17 +56,29 @@ function branchDeleteUrl(owner, repo, branch) {
 }
 
 export async function readE2ERepository({ fetchImpl = fetch, owner, repo, token }) {
-  const response = await fetchResponse(fetchImpl, repositoryUrl(owner, repo), { headers: headers(token) }, "GitHub E2E repository lookup");
+  const response = await fetchResponse(
+    fetchImpl,
+    repositoryUrl(owner, repo),
+    { headers: headers(token) },
+    "GitHub E2E repository lookup",
+  );
   if (response.status !== 200) throw apiStatusError("GitHub E2E repository lookup", response.status);
   const body = await readJsonObject(response, "GitHub E2E repository lookup");
+  const id = String(body.id ?? "").trim();
+  if (!/^[1-9][0-9]*$/u.test(id)) throw new Error("GitHub E2E repository lookup returned no valid repository ID");
   if (typeof body.default_branch !== "string" || body.default_branch.trim() === "") {
     throw new Error("GitHub E2E repository lookup returned no valid default branch");
   }
-  return { defaultBranch: body.default_branch };
+  return { id, defaultBranch: body.default_branch };
 }
 
 export async function readE2EBranch({ fetchImpl = fetch, owner, repo, branch, token }) {
-  const response = await fetchResponse(fetchImpl, branchReadUrl(owner, repo, branch), { headers: headers(token) }, "GitHub E2E branch lookup");
+  const response = await fetchResponse(
+    fetchImpl,
+    branchReadUrl(owner, repo, branch),
+    { headers: headers(token) },
+    "GitHub E2E branch lookup",
+  );
   if (response.status === 404) return { kind: "absent" };
   if (response.status !== 200) throw apiStatusError("GitHub E2E branch lookup", response.status);
   const body = await readJsonObject(response, "GitHub E2E branch lookup");
@@ -84,10 +96,21 @@ export async function preflightE2ERemote({ fetchImpl = fetch, config }) {
     repo: config.repo,
     token: config.token,
   });
+  if (repository.id !== String(config.expectedRepoId ?? "")) {
+    throw new Error("GitHub E2E target repository ID does not match GITHUB_E2E_EXPECTED_REPO_ID");
+  }
   if (config.branch === repository.defaultBranch) {
     throw new Error(`Refusing destructive GitHub E2E against repository default branch: ${repository.defaultBranch}`);
   }
-  return repository;
+  const defaultRef = await readE2EBranch({
+    fetchImpl,
+    owner: config.owner,
+    repo: config.repo,
+    branch: repository.defaultBranch,
+    token: config.token,
+  });
+  if (defaultRef.kind !== "present") throw new Error("GitHub E2E target default Git ref is not readable");
+  return { ...repository, defaultBranchSha: defaultRef.sha };
 }
 
 export async function cleanupE2EBranch({
@@ -96,18 +119,30 @@ export async function cleanupE2EBranch({
   repo,
   branch,
   token,
+  expectedRepoId,
   sleep = ms => new Promise(resolve => setTimeout(resolve, ms)),
   maxAttempts = 3,
 }) {
   if (!Number.isInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > 10) {
     throw new Error("maxAttempts must be an integer between 1 and 10");
   }
+  const config = { owner, repo, branch, token, expectedRepoId };
+  await preflightE2ERemote({ fetchImpl, config });
+
   const deleteUrl = branchDeleteUrl(owner, repo, branch);
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     const before = await readE2EBranch({ fetchImpl, owner, repo, branch, token });
-    if (before.kind === "absent") return;
+    if (before.kind === "absent") {
+      await preflightE2ERemote({ fetchImpl, config });
+      return;
+    }
 
-    const deleted = await fetchResponse(fetchImpl, deleteUrl, { method: "DELETE", headers: headers(token) }, "GitHub E2E branch cleanup");
+    const deleted = await fetchResponse(
+      fetchImpl,
+      deleteUrl,
+      { method: "DELETE", headers: headers(token) },
+      "GitHub E2E branch cleanup",
+    );
     if (deleted.status === 401 || deleted.status === 403) {
       throw apiStatusError("GitHub E2E branch cleanup", deleted.status);
     }
@@ -116,7 +151,10 @@ export async function cleanupE2EBranch({
     }
 
     const verify = await readE2EBranch({ fetchImpl, owner, repo, branch, token });
-    if (verify.kind === "absent") return;
+    if (verify.kind === "absent") {
+      await preflightE2ERemote({ fetchImpl, config });
+      return;
+    }
     if (attempt < maxAttempts) await sleep(attempt * 2_000);
   }
   throw new Error(`Disposable GitHub E2E branch still exists after ${maxAttempts} cleanup attempts: ${branch}`);
