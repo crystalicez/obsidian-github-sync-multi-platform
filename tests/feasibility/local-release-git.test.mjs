@@ -87,6 +87,22 @@ test("remote qualification inspection ignores a malicious same-named local tag",
   assert.equal(git(work, ["for-each-ref", "--format=%(refname)", "refs/local-qualification-inspect"]), "");
 });
 
+test("qualification inspection preserves a pre-existing temp-namespace ref on suffix collision", async () => {
+  const { work, sha } = await makeRepo();
+  const name = `qualification/local/v1/1.0.8/${sha}`;
+  const remoteObject = createAnnotatedTagObject({ cwd: work, targetSha: sha, tagName: name, message: tagMessage("remote") });
+  git(work, ["push", "-q", "origin", `${remoteObject}:refs/tags/${name}`]);
+  const tempRef = "refs/local-qualification-inspect/inspect999";
+  git(work, ["update-ref", tempRef, sha]);
+
+  assert.throws(() => fetchAndInspectObservedQualificationTag({
+    cwd: work,
+    ref: `refs/tags/${name}`,
+    randomId: () => "inspect999",
+  }), /temporary inspection ref.*exists|already exists/i);
+  assert.equal(git(work, ["rev-parse", tempRef]), sha);
+});
+
 test("inspection rejects a remote object change between observation and fetch and cleans temp ref", async () => {
   const { work, remote, sha } = await makeRepo();
   const name = `qualification/local/v1/1.0.8/${sha}`;
