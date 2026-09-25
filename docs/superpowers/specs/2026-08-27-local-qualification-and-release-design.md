@@ -233,7 +233,7 @@ This prevents a fresh checkout from failing on missing `main.js` and prevents a 
 
 **Decision:** Yes for Node/pnpm versions.
 
-- running Node must equal committed `.node-version`, currently `v22.11.0`,
+- running Node must equal committed `.node-version`, currently `v24.11.0`,
 - Corepack pnpm must equal the version in `package.json#packageManager`, currently `9.12.3`.
 
 The receipt records both and release verification requires them to match the declarations of the qualified commit.
@@ -405,7 +405,7 @@ The message is deterministic UTF-8 JSON serialization (two-space indentation plu
   "qualifiedAt": "2026-08-27T00:00:00.000Z",
   "durationMs": 123456,
   "platform": "win32-x64",
-  "nodeVersion": "v22.11.0",
+  "nodeVersion": "v24.11.0",
   "pnpmVersion": "9.12.3",
   "e2eSuite": "github-e2e-quick",
   "gates": [
