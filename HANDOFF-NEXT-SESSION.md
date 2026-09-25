@@ -14,8 +14,8 @@
 - Child C PR: #6, stacked on `master`
 - Child C baseline: `f0cf947b66471ac15e1f2f3060473e3bb0206e91`
 - Latest code/test heads before the current handoff-document update:
-  - Child C: `2591ebff4dcd0b02acfcc70dbc7c1c3183e8d9ed`
-  - Child D merge head: `196f0bd149cbb7db6b115d799490b33616f7b3d3`
+  - Child C: `3c5008948f45d00fed72927183e1647c6572e7c3`
+  - Child D merge head: `4595ec537546bd9178cdb682d63b99abc49f0c2f`
 - Do **not** assume the current branch HEAD equals the hashes above; this handoff file itself may advance the branch. Run `git rev-parse HEAD` after checkout.
 
 ## User instruction
@@ -91,7 +91,7 @@ Implementation:
   - thrown Contents 404 immutable fallback.
 
 Stack integration:
-- Merge base of Child D against Child C is Child C head `2591ebff4dcd0b02acfcc70dbc7c1c3183e8d9ed`.
+- Merge base of Child D against Child C is Child C head `3c5008948f45d00fed72927183e1647c6572e7c3`.
 - After carrying the acceptance-test corrections into D, compare was `ahead`, `behind=0`.
 - Before adding this durable handoff document, D-vs-C diff contained only the seven D implementation/test files below. The current diff is those files **plus** root-level `HANDOFF-NEXT-SESSION.md`:
   - `docs/superpowers/plans/2026-09-06-immutable-git-read-fallback.md`
@@ -142,7 +142,27 @@ Root-cause review of the 8 fast failures:
 
 Corrections were committed to Child C as `2591ebff4dcd0b02acfcc70dbc7c1c3183e8d9ed` and merged into Child D as `196f0bd149cbb7db6b115d799490b33616f7b3d3`.
 
-These corrections are test/harness-only; production source was not changed by this acceptance-failure remediation. The corrected tree still needs a rerun before it can be called green.
+The user reran on Child D head `cf109389befe2a4d7fd9ca035aa2c97127eaaaeb`:
+- folder-conflict-causality targeted suite: 6/6 PASS;
+- runtime-publication-race-contract targeted suite: 4/4 PASS;
+- runtime-publication-race-stage-lifetime targeted suite: 2/2 PASS;
+- settings-secrets targeted suite: 33/35 PASS, leaving exactly two failures;
+- full fast suite: 417/419 PASS;
+- repeat runner reproduced the same two failures;
+- local GitHub E2E compile-only without manifest generation: PASS, all three bundles compiled.
+
+The final two failures were:
+- `v4 incremental CAS retry publishes an applied conflict copy when retry chooses use-local`;
+- `v4 incremental CAS retry keeps an out-of-scope copy local when policy and settings change`.
+
+Root-cause review confirmed both remaining expectations were stale transaction semantics. A losing publication attempt writes `publish-intent` but does not apply recovery local mutations until candidate publication is proven. Therefore an uncommitted conflict copy from the losing attempt must not become user-visible merely because its reservation survives. If settings/policy change before the fresh retry and the retry chooses `use-local`, no conflict copy should be materialized. The tests now assert:
+- no phantom local/remote/index conflict copy;
+- canonical remote bytes are the local winner;
+- retry progress is one canonical push and zero pulls.
+
+Those final test-only corrections were committed to Child C as `3c5008948f45d00fed72927183e1647c6572e7c3` and merged into Child D as `4595ec537546bd9178cdb682d63b99abc49f0c2f`.
+
+No production source changed in either acceptance-remediation round. The corrected tree still needs a final fast/repeat rerun before it can be called green.
 
 At the time of this handoff:
 - GitHub combined status checks for Child C and Child D were empty (`statuses: []`).
@@ -205,12 +225,11 @@ The connector available to the AI session did not expose a delete-ref action, so
 1. Read this file first.
 2. Fetch PR #6 and PR #7 metadata and current heads from GitHub; do not trust old hashes blindly.
 3. Confirm Child D is still ahead-only / behind=0 relative to Child C.
-4. Current immediate next step: rerun the corrected fast acceptance gates on the latest Child D head:
-   - `node scripts/run-tests.mjs --tier=fast --filter=folder-conflict-causality`
-   - `node scripts/run-tests.mjs --tier=fast --filter=runtime-publication-race-contract`
-   - `node scripts/run-tests.mjs --tier=fast --filter=runtime-publication-race-stage-lifetime`
+4. Current immediate next step: rerun only the final corrected surface on the latest Child D head:
    - `node scripts/run-tests.mjs --tier=fast --filter=settings-secrets`
-   - then `pnpm test` and `pnpm test:repeat`.
+   - `pnpm test`
+   - `pnpm test:repeat`.
+   The prior rerun already proved the other corrected targeted suites and local E2E compile-only path green.
 5. For local E2E compile verification, use compile-only **without** `--write-input-manifest`; manifest creation is CI-producer validation and requires GitHub Actions environment fields.
 6. If the user supplies new acceptance output:
    - on failure: use systematic debugging, fix the smallest demonstrated root cause, push to GitHub, update this file;
@@ -227,4 +246,4 @@ The connector available to the AI session did not expose a delete-ref action, so
 ## Last updated
 
 - 2026-09-25 (Asia/Bangkok)
-- Reason: record the user's first acceptance run, root-cause the 8 fast-suite failures, record the test-harness corrections, and fix the local E2E compile-only command.
+- Reason: record the second acceptance run, reduce the fast failures from eight to two, document the final transaction-semantics root cause, and record the final test-only corrections.
