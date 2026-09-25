@@ -8,15 +8,13 @@
 
 - Repository: `crystalicez/obsidian-github-sync-multi-platform`
 - Source of truth: GitHub
-- Active final integration branch: `child-d-immutable-git-read-fallback`
-- Child D PR: #7, stacked on Child C
-- Child C branch: `child-c-publication-race-conflict-recovery`
-- Child C PR: #6, stacked on `master`
-- Child C baseline: `f0cf947b66471ac15e1f2f3060473e3bb0206e91`
-- Latest code/test heads before the current handoff-document update:
-  - Child C: `73a35a67aaff69f9765c3a2005d035a0e7e12d04`
-  - Child D merge head: `af29c7c5339cfd552af577856c98cd2f0d446e00`
-- Do **not** assume the current branch HEAD equals the hashes above; this handoff file itself may advance the branch. Run `git rev-parse HEAD` after checkout.
+- Active final integration branch: `feature/local-release-qualification`
+- Active PR: #4, base `master`
+- PR #6 (`child-c-publication-race-conflict-recovery`) is merged to `master`.
+- PR #7 (`child-d-immutable-git-read-fallback`) is merged to `master`.
+- PR #4 mechanical restack merge commit: `4c74b8d05d03eae03dbc98fc684418bf7c98a5a3`.
+- Current PR #4 branch is ahead-only / `behind=0` relative to `master` and Ready for Review.
+- Do **not** assume the current branch HEAD equals a hash written here; this handoff file itself may advance the branch. Run `git rev-parse HEAD` after checkout.
 
 ## User instruction
 
@@ -71,7 +69,7 @@ The red-team findings discovered before final acceptance were addressed in sourc
 
 ### Child D — immutable Git read fallback
 
-Child D contains latest Child C as merge ancestry and remains an ahead-only stack relative to Child C.
+Child D was landed to `master` via PR #7. The implementation state below remains historical/reference context.
 
 Implementation:
 - Immutable 40-hex commit-SHA Contents 404 fallback is path-directed.
@@ -251,20 +249,33 @@ Current GitHub backlog survey:
 Integration progress:
 1. PR #6: **DONE**, merged to `master`.
 2. PR #7: **DONE**, retargeted, D-only diff verified, merged to `master`.
-3. PR #4: **IN PROGRESS**. Branch merged with final master and is `behind=0`. Integration hardening added pinned numeric E2E repository identity, readable-default-ref proof, post-cleanup re-proof, current master compile/provenance pipeline retention, and docs that preserve the Actions Stable Release interlock. PR is Ready for Review; CI on the final head is the merge gate.
+3. PR #4: **IN PROGRESS / FINAL GATE**. Branch is merged with current `master`, `behind=0`, mergeable, and Ready for Review. Static integration/security hardening is complete enough to freeze code pending fresh execution verification. GitHub Actions has produced **no workflow run for connector-created PR #4 heads**, so do not claim final green until the acceptance commands are run on the current branch head.
 
 ## PR #4 integration details
 
-Current PR #4 integration decisions:
+Current PR #4 integration decisions and hardening:
 - Mechanical merge commit `4c74b8d05d03eae03dbc98fc684418bf7c98a5a3` restacked `feature/local-release-qualification` on master `25ea5f5116b98f2b2941da23b23cf022dbca5fcd`.
-- Master and PR #4 overlapped in only three files: `docs/github-e2e.md`, `docs/releasing.md`, and `scripts/run-github-e2e.mjs`.
-- `scripts/run-github-e2e.mjs` retains master's `compileGitHubE2EBundles` / CI input-manifest flow and adds PR #4's local-origin/remote preflight.
-- Local/manual E2E now requires `GITHUB_E2E_EXPECTED_REPO_ID`; target repository metadata ID must match before destructive work.
-- Preflight requires the target's actual default Git ref to be readable, not merely repository metadata.
-- Local qualification cleanup re-proves pinned repository identity/default-ref capability after branch absence before qualification can succeed.
-- `.env.github-e2e.example` now includes the numeric repository ID field that master docs/runner already required.
-- The local release authority path is documented as supported, while GitHub Actions Stable Release remains intentionally interlocked by the current workflow. PR #4 does not bypass/remove that interlock.
-- PR #4 is now Ready for Review and mergeable; execution verification on its final head remains required before merge.
+- The original master/PR #4 overlap was only `docs/github-e2e.md`, `docs/releasing.md`, and `scripts/run-github-e2e.mjs`; the integration retained master's compiler/input-manifest pipeline and added the local qualification flow around it.
+- `GITHUB_E2E_EXPECTED_REPO_ID` is mandatory for local/manual destructive E2E.
+- Target safety is bound to numeric identity: target ID must match the configured expected ID and must differ from both the stable canonical source repository ID (`1282135059`) and the current checkout source repository ID.
+- Manual live E2E resolves the current checkout origin's numeric repository identity before target mutation; inability to prove source identity fails closed.
+- Target preflight also rejects the actual target default branch and requires that default Git ref to be readable.
+- Live-E2E/source credentials are separated: install/build/test/compile children get neither target E2E nor standard source/publication GitHub tokens; the live E2E child gets the dedicated E2E token with standard `GH_TOKEN`/`GITHUB_TOKEN`-family variables stripped.
+- Local qualification cleanup is restricted to the `obsidian-sync-e2e/local-` namespace, re-proves target identity/default-ref capability before every delete attempt, and accepts success only when a fresh exact branch read is absent **after** the final target proof. A regression test covers stale absence followed by branch recreation.
+- Qualification tag inspection now detects a pre-existing temp-ref collision and never unconditionally deletes a pre-existing local ref. Cleanup uses compare-and-delete against the SHA created by the invocation.
+- Release staging rejects symlinked/non-directory `.tmp` / `.tmp/release` ancestors and symlinked staging targets.
+- Release metadata, generated `main.js`, the canonical lockfile, and staged upload assets must be real non-empty regular files, not symlinks.
+- Deterministic ZIP entry names reject absolute paths, backslashes, empty segments, `.`, and `..` traversal shapes.
+- `.env.github-e2e.example` includes the mandatory numeric target repository ID.
+- Local stable publication is documented as the supported authority path; GitHub Actions Stable Release remains intentionally interlocked by the current workflow. PR #4 does not bypass or remove that interlock.
+- PR #4 is Ready for Review, mergeable, and `behind=0`; no workflow run exists for its connector-created current heads, so fresh local execution evidence is still required before merge.
+
+### PR #4 verification constraint
+
+The AI sandbox still cannot clone/download the repository from GitHub because direct GitHub network/DNS access is blocked, and the GitHub connector does not provide a workflow-dispatch action. The repository CI workflow supports `push` / `pull_request` / `workflow_dispatch`, but connector-created commits currently produce no Actions run for this branch. Therefore:
+- static/code-path review and GitHub diff/ancestry checks can be done here;
+- final build/test/package proof must come from a fresh user-local run on the **current PR #4 head**;
+- do not merge PR #4 or claim it green until that evidence is reported.
 
 ## Known housekeeping
 
@@ -272,14 +283,14 @@ The previously noted temporary branch `tmp-ignore` is no longer present in the c
 
 ## Next action for a resumed session
 
-1. Read this file first.
-2. Fetch PR #6 and PR #7 metadata and current heads from GitHub; do not trust old hashes blindly.
-3. Confirm Child D is still ahead-only / behind=0 relative to Child C.
-4. Acceptance is green. Do **not** make further correctness changes unless a new failure, review finding, or user request appears.
-5. Preserve the stack: PR #7 remains on top of PR #6 until the user chooses the merge/integration sequence.
-6. If local E2E compile verification is repeated outside CI, use compile-only **without** `--write-input-manifest`; manifest creation requires GitHub Actions producer environment fields.
-7. Known housekeeping remains: delete remote branch `tmp-ignore` when convenient.
-8. If any source/test/design/branch/verification state changes, update this file before ending the session.
+1. Read this file first and fetch PR #4 metadata/current head from GitHub.
+2. Confirm `feature/local-release-qualification` is still `behind=0` and mergeable against `master`.
+3. Do not make new correctness changes unless final static audit or execution output exposes a concrete failure.
+4. Run/obtain the final PR #4 acceptance gate on the current head: focused local-release/E2E feasibility tests, build, full fast/repeat/recovery/resource/feasibility suites, GitHub-E2E compile + producer-manifest path, and package validation.
+5. If any gate fails, debug the specific failure before merging.
+6. If all final gates are freshly green, update this handoff with exact observed counts/head SHA, merge PR #4 to `master`, verify the merged result, then audit historical remote branches for unique work before deleting only branches proven obsolete.
+7. Do not run destructive live GitHub E2E or `release:local` merely as an acceptance test.
+8. Any material code/test/design/branch/verification change must update this file before handoff.
 
 ## Relevant design / plan docs
 
@@ -290,5 +301,5 @@ The previously noted temporary branch `tmp-ignore` is no longer present in the c
 
 ## Last updated
 
-- 2026-09-25 (Asia/Bangkok)
-- Reason: record PR #4 restack/safety integration and CI-gated final verification state after PR #6/#7 landed.
+- 2026-09-26 (Asia/Bangkok)
+- Reason: record final PR #4 integration/security hardening, code-freeze state, and the remaining fresh execution gate before merge.
