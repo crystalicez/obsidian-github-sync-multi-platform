@@ -142,19 +142,32 @@ export async function resetGitHubE2EDisposableBranch(
 ): Promise<ResolvedGitHubE2ETarget> {
   const verificationTimeoutMs = positiveDuration(options.verificationTimeoutMs, 15_000, "verificationTimeoutMs")
   const verificationPollMs = positiveDuration(options.verificationPollMs, 500, "verificationPollMs")
-  const target = await resolveGitHubE2ETarget(input, request)
-  const base = `${API}/repos/${encodeURIComponent(target.config.owner)}/${encodeURIComponent(target.config.repo)}`
+  let target = await resolveGitHubE2ETarget(input, request)
   const refPath = encodeGitHubE2ERefPath(target.config.branch)
-  const exactRead = `${base}/git/ref/heads/${refPath}`
-  const exactDelete = `${base}/git/refs/heads/${refPath}`
   const auth = headers(input.token)
+  const endpoints = (resolved: ResolvedGitHubE2ETarget) => {
+    const base = `${API}/repos/${encodeURIComponent(resolved.config.owner)}/${encodeURIComponent(resolved.config.repo)}`
+    return {
+      read: `${base}/git/ref/heads/${refPath}`,
+      delete: `${base}/git/refs/heads/${refPath}`,
+    }
+  }
 
-  const before = await request(exactRead, { headers: auth })
-  if (await recognizedMissingRef(before)) return target
-  if (before.status !== 200) throw new Error(`Cannot inspect GitHub E2E disposable ref: HTTP ${before.status}`)
-  await before.arrayBuffer().catch(() => undefined)
+  let current = endpoints(target)
+  const before = await request(current.read, { headers: auth })
+  if (await recognizedMissingRef(before)) {
+    target = await resolveGitHubE2ETarget(input, request)
+    current = endpoints(target)
+    const confirmed = await request(current.read, { headers: auth })
+    if (await recognizedMissingRef(confirmed)) return target
+    if (confirmed.status !== 200) throw new Error(`Cannot inspect GitHub E2E disposable ref: HTTP ${confirmed.status}`)
+    await confirmed.arrayBuffer().catch(() => undefined)
+  } else {
+    if (before.status !== 200) throw new Error(`Cannot inspect GitHub E2E disposable ref: HTTP ${before.status}`)
+    await before.arrayBuffer().catch(() => undefined)
+  }
 
-  const deleted = await request(exactDelete, { method: "DELETE", headers: auth })
+  const deleted = await request(current.delete, { method: "DELETE", headers: auth })
   if (deleted.status === 204) await deleted.arrayBuffer().catch(() => undefined)
   else if (!(await recognizedMissingRef(deleted))) {
     throw new Error(`Cannot remove GitHub E2E disposable ref: HTTP ${deleted.status}`)
@@ -162,8 +175,9 @@ export async function resetGitHubE2EDisposableBranch(
 
   const deadline = Date.now() + verificationTimeoutMs
   while (true) {
-    await resolveGitHubE2ETarget(input, request)
-    const verify = await request(exactRead, { headers: auth })
+    target = await resolveGitHubE2ETarget(input, request)
+    current = endpoints(target)
+    const verify = await request(current.read, { headers: auth })
     if (await recognizedMissingRef(verify)) return target
     if (verify.status !== 200) throw new Error(`Cannot verify GitHub E2E disposable ref absence: HTTP ${verify.status}`)
     await verify.arrayBuffer().catch(() => undefined)
