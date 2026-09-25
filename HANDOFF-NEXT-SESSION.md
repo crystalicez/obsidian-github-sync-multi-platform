@@ -1,3 +1,30 @@
+## Current final state
+
+As of 2026-09-26 (Asia/Bangkok), the integrated implementation work covered by PRs #1, #3, #4, #5, #6, and #7 is landed on `master`.
+
+- `master` merge commit for PR #4: `43f96478007aded2ebde7cef5da81dfc3685c7c1`.
+- PR #4 final accepted code/test branch head: `c6e38c5b5057adedb445a82fb5768435d22cdb73`.
+- Exact release toolchain: Node `v24.11.0`, pnpm `9.12.3`.
+- Final acceptance evidence:
+  - focused `github-e2e-compile-cli`: 4/4 PASS;
+  - focused `release-metadata`: 9/9 PASS;
+  - focused `local-qualify`: 9/9 PASS;
+  - focused `local-release`: 37/37 PASS;
+  - production build: PASS;
+  - feasibility: 138/138 PASS;
+  - fast: 419/419 PASS;
+  - repeat fast: 10/10 runs, each 419/419 PASS;
+  - recovery: 43/43 PASS;
+  - resource: 11/11 PASS;
+  - release metadata validation: PASS;
+  - GitHub E2E compile-only: PASS for all 3 bundles;
+  - CI producer input-manifest path: PASS;
+  - package validation: PASS;
+  - final clean-tree/head integrity: PASS.
+- Open pull requests: 0.
+- Open issues: 0.
+- GitHub Actions Stable Release remains intentionally interlocked; the supported stable publication authority is the accepted local exact-SHA qualification/release path.
+
 # HANDOFF — NEXT SESSION
 
 > Persistent handoff for the `obsidian-sync` project.
@@ -365,20 +392,58 @@ Combined with the prior Node-24 acceptance subset:
 
 Therefore PR #4 has complete non-destructive release-grade acceptance evidence for the integrated Node-24 toolchain. Do not rerun solely because this handoff markdown commit advances the branch head; this update is documentation-only and records the tested SHA above.
 
+## Remote branch audit
+
+Audited against `master` after PR #4 merge.
+
+### Safe cleanup candidates
+
+These branches have no unmerged active work based on ancestry or a merged PR whose recorded head SHA exactly matches the current branch tip:
+
+- `audit-hardening-2026-08-24` — ahead 0.
+- `child-c-publication-race-conflict-recovery` — ahead 0; PR #6 landed.
+- `child-d-immutable-git-read-fallback` — ahead 0; PR #7 landed.
+- `encrypted-sync` — ahead 0.
+- `feature/local-release-qualification` — ahead 0 after PR #4 merge.
+- `fix/live-github-immutable-read-fallback` — ahead 0.
+- `fix/v4-rescan-causality` — ahead 0.
+- `agent/harden-v4-change-causality` — PR #1 merged; current branch tip exactly equals PR #1 recorded head SHA `a46321b14492eea2191ff0aed5f8dea6e51fcf3c`.
+- `test/real-github-e2e-superuser` — PR #3 merged; current branch tip exactly equals PR #3 recorded head SHA `981afb12a2eb4f913b5696796f7f118062780439`.
+- `impl/2026-08-30-live-github-e2e-safety` — PR #5 merged; current branch tip exactly equals PR #5 recorded head SHA `9a8d3dbd2a16b02074b653860168c5919415fd57`.
+
+The available GitHub connector has no delete-ref/delete-branch action, and direct GitHub Git transport from the AI sandbox is DNS-blocked. Therefore these branches were **not** deleted by the AI. Deleting them is optional repository housekeeping, not unfinished implementation work.
+
+### Retained historical unique branches
+
+Do **not** auto-delete these. They still contain unique commits/files and have no merged PR proving the current tip was integrated:
+
+- `agent/conflict-audit-red`
+- `agent/conflict-copy-guard-red`
+- `agent/conflict-history-ui`
+- `agent/conflict-prefetch-red`
+- `agent/task8-audit-transport`
+- `design/2026-08-30-hardening-followup`
+
+These are old August 2026 prototype/design/agent branches. They are not represented by any open PR or issue and are not part of the current active implementation backlog. Preserve them as historical references unless a future maintainer explicitly decides to revive or discard that work.
+
 ## Known housekeeping
 
-The previously noted temporary branch `tmp-ignore` is no longer present in the current remote branch listing, so no action is required for it.
+- The previously noted temporary branch `tmp-ignore` is no longer present in the current remote branch listing.
+- No open pull requests remain.
+- No open issues remain.
+- Safe branch deletion is optional housekeeping only; no landed implementation depends on it.
 
 ## Next action for a resumed session
 
-1. Read this file first and fetch PR #4 metadata/current head from GitHub.
-2. Confirm `feature/local-release-qualification` is still `behind=0` and mergeable against `master`.
-3. Do not make new correctness changes unless final static audit or execution output exposes a concrete failure.
-4. Run/obtain the final PR #4 acceptance gate on the current head using exact Node `v24.11.0` + pnpm `9.12.3`: focused local-release/E2E feasibility tests, build, full fast/repeat/recovery/resource/feasibility suites, GitHub-E2E compile + producer-manifest path, and package validation.
-5. If any gate fails, debug the specific failure before merging.
-6. If all final gates are freshly green, update this handoff with exact observed counts/head SHA, merge PR #4 to `master`, verify the merged result, then audit historical remote branches for unique work before deleting only branches proven obsolete.
-7. Do not run destructive live GitHub E2E or `release:local` merely as an acceptance test.
-8. Any material code/test/design/branch/verification change must update this file before handoff.
+There is no active implementation PR or acceptance gate remaining for the landed scope.
+
+If resuming for maintenance:
+1. Read this file and verify `master` still descends from `43f96478007aded2ebde7cef5da81dfc3685c7c1`.
+2. Treat the final acceptance counts in **Current final state** as the completed evidence for the landed PR #4 scope.
+3. Do not rerun destructive live GitHub E2E or `release:local` merely to reconfirm historical acceptance.
+4. Historical remote branch cleanup is housekeeping only; see **Remote branch audit** below.
+5. Any new product/feature work should start from current `master` in a new branch and receive its own acceptance evidence.
+6. Any material code/test/design/branch/verification change must update this file before handoff.
 
 ## Relevant design / plan docs
 
@@ -390,4 +455,4 @@ The previously noted temporary branch `tmp-ignore` is no longer present in the c
 ## Last updated
 
 - 2026-09-26 (Asia/Bangkok)
-- Reason: record the Node v24.11.0 exact-toolchain migration and the remaining fresh execution gate before PR #4 merge.
+- Reason: record final PR #4 acceptance/merge, verify master, and classify all remaining remote branches after repository closeout.
