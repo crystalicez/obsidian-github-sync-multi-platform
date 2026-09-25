@@ -80,6 +80,8 @@ function makeRunner({ bare, events = [], liveStatus = 0, ambiguousPush = false, 
         name: script,
         branch: options.env?.GITHUB_E2E_BRANCH,
         hasToken: options.env?.GITHUB_E2E_TOKEN !== undefined,
+        hasGhToken: options.env?.GH_TOKEN !== undefined,
+        hasGithubToken: options.env?.GITHUB_TOKEN !== undefined,
       });
       return { status: script === "github-e2e-live" ? liveStatus : 0, stdout: "", stderr: "" };
     }
@@ -136,6 +138,8 @@ function baseOptions(f, extras = {}) {
         GITHUB_E2E_BRANCH: "main",
         GITHUB_E2E_TOKEN: "secret-token",
         GITHUB_E2E_EXPECTED_REPO_ID: "123",
+        GH_TOKEN: "source-gh-token",
+        GITHUB_TOKEN: "source-actions-token",
       },
       runtimeNodeVersion: "v22.11.0",
       platform: "linux",
@@ -165,7 +169,10 @@ test("qualification executes exact v1 gate order, isolates token, and overrides 
   assert.match(live.branch, /^obsidian-sync-e2e\/local-/u);
   assert.notEqual(live.branch, "main");
   assert.equal(live.hasToken, true);
+  assert.equal(live.hasGhToken, false);
+  assert.equal(live.hasGithubToken, false);
   assert.equal(gateRuns.filter(e => e.name !== "github-e2e-live").some(e => e.hasToken), false);
+  assert.equal(gateRuns.some(e => e.hasGhToken || e.hasGithubToken), false);
   const remote = git(f.work, ["ls-remote", "--refs", f.bare, result.qualificationRef]).stdout.trim();
   assert.match(remote, new RegExp(`^${result.qualificationTagObjectSha}\\s`));
 });
