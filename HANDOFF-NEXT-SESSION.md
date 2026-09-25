@@ -238,15 +238,24 @@ pnpm validate:package
 
 Do not run live GitHub E2E unless credentials/safety scope are explicitly intended. Compile-only is the default acceptance check.
 
+## Remaining repository work after green acceptance
+
+Current GitHub backlog survey:
+- PR #6 (`child-c-publication-race-conflict-recovery`) is open, draft, mergeable, and GREEN through the stacked acceptance run. It is 55 commits ahead / 0 behind `master`.
+- PR #7 (`child-d-immutable-git-read-fallback`) is open, draft, mergeable, and GREEN. It is stacked cleanly on the latest Child C with `behind=0`.
+- PR #4 (`feature/local-release-qualification`) is still open and draft but currently `mergeable=false`. Compared with current `master`, it is 40 commits ahead / 1 behind and needs a dedicated rebase/merge conflict review plus fresh verification before integration.
+- There are currently no open GitHub issues.
+- The repository still has multiple historical/agent/fix/design remote branches with no open PR. Treat branch cleanup as optional housekeeping only after checking whether each branch contains unique work.
+- Current commit-status API results for PR #4/#6/#7 are empty, so do not assume GitHub-hosted CI evidence exists; rely on recorded local acceptance until new CI is configured/run.
+
+Recommended integration order when the user asks to merge:
+1. merge/land PR #6 to `master`;
+2. restack/retarget PR #7 onto the new `master` if GitHub does not do so automatically, verify its diff remains D-only, then merge PR #7;
+3. only then revisit PR #4 against the new `master`, resolve its divergence/conflicts, re-run its release/qualification verification, and merge separately if still desired.
+
 ## Known housekeeping
 
-A temporary remote branch named `tmp-ignore` was accidentally created during connector inspection. It contains no unique work and should be deleted when convenient:
-
-```powershell
-git push origin --delete tmp-ignore
-```
-
-The connector available to the AI session did not expose a delete-ref action, so it could not be removed there.
+The previously noted temporary branch `tmp-ignore` is no longer present in the current remote branch listing, so no action is required for it.
 
 ## Next action for a resumed session
 
@@ -269,4 +278,4 @@ The connector available to the AI session did not expose a delete-ref action, so
 ## Last updated
 
 - 2026-09-25 (Asia/Bangkok)
-- Reason: record final green acceptance: settings-secrets 35/35, fast 419/419, and repeat 10/10 with 419/419 on every repeat.
+- Reason: record final green acceptance and the post-acceptance repository backlog survey (PR #6/#7 integration, PR #4 divergence, and optional stale-branch cleanup).
