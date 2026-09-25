@@ -2,7 +2,7 @@ import { spawnSync } from "node:child_process";
 import path from "node:path";
 import { compileGitHubE2EBundles, writeGitHubE2EInputManifest } from "./github-e2e-input.mjs";
 import { loadGitHubE2EEnv, requireGitHubE2EConfig } from "./github-e2e-env.mjs";
-import { preflightE2ERemote } from "./github-e2e-remote.mjs";
+import { preflightE2ERemote, readE2ERepository } from "./github-e2e-remote.mjs";
 import { readOriginFetchRepository } from "./github-repo.mjs";
 
 const root = process.cwd();
@@ -24,9 +24,12 @@ let liveEnv = process.env;
 if (!compileOnly) {
   try {
     const currentSourceRepo = readOriginFetchRepository({ runner: runCommand, cwd: root });
+    const [sourceOwner, sourceRepo, ...extra] = currentSourceRepo.split("/");
+    if (!sourceOwner || !sourceRepo || extra.length) throw new Error("Current source repository is malformed");
+    const sourceIdentity = await readE2ERepository({ fetchImpl: fetch, owner: sourceOwner, repo: sourceRepo });
     const loaded = await loadGitHubE2EEnv({ cwd: root, env: process.env });
     const config = requireGitHubE2EConfig(loaded.env, { currentSourceRepo });
-    await preflightE2ERemote({ fetchImpl: fetch, config });
+    await preflightE2ERemote({ fetchImpl: fetch, config: { ...config, currentSourceRepoId: sourceIdentity.id } });
     liveEnv = loaded.env;
   } catch (error) {
     console.error(`GitHub E2E preflight failed: ${error instanceof Error ? error.message : String(error)}`);
