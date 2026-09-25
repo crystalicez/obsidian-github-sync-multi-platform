@@ -1,4 +1,4 @@
-import { readFile } from "node:fs/promises";
+import { lstat, readFile } from "node:fs/promises";
 import { join } from "node:path";
 
 const STABLE_TRIPLE_RE = /^\d+\.\d+\.\d+$/u;
@@ -32,12 +32,21 @@ export function declaredPnpmVersion(packageManager) {
   return match[1];
 }
 
+async function readAuthorityText(cwd, name) {
+  const path = join(cwd, name);
+  const info = await lstat(path);
+  if (!info.isFile() || info.isSymbolicLink() || info.size === 0) {
+    throw new Error(`${name} must be a non-empty regular file`);
+  }
+  return readFile(path, "utf8");
+}
+
 export async function readReleaseMetadata(cwd = process.cwd()) {
   const [packageJsonText, manifestText, versionsText, nodeVersionText] = await Promise.all([
-    readFile(join(cwd, "package.json"), "utf8"),
-    readFile(join(cwd, "manifest.json"), "utf8"),
-    readFile(join(cwd, "versions.json"), "utf8"),
-    readFile(join(cwd, ".node-version"), "utf8"),
+    readAuthorityText(cwd, "package.json"),
+    readAuthorityText(cwd, "manifest.json"),
+    readAuthorityText(cwd, "versions.json"),
+    readAuthorityText(cwd, ".node-version"),
   ]);
 
   const packageJson = JSON.parse(packageJsonText);
