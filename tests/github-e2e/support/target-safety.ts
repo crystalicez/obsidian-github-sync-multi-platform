@@ -40,6 +40,10 @@ export function readGitHubE2ETargetEnvironment(env = process.env): GitHubE2ETarg
   if (!/^[1-9][0-9]*$/u.test(expectedRepositoryId)) {
     throw new Error("GITHUB_E2E_EXPECTED_REPO_ID must be a numeric GitHub repository ID.")
   }
+  const sourceRepositoryId = env.GITHUB_E2E_SOURCE_REPO_ID?.trim() || undefined
+  if (sourceRepositoryId && !/^[1-9][0-9]*$/u.test(sourceRepositoryId)) {
+    throw new Error("GITHUB_E2E_SOURCE_REPO_ID must be a numeric GitHub repository ID when provided.")
+  }
   if (FORBIDDEN_LOCAL_BRANCHES.has(branch.toLowerCase())) {
     throw new Error(`Refusing destructive GitHub E2E branch: ${branch}`)
   }
@@ -49,7 +53,7 @@ export function readGitHubE2ETargetEnvironment(env = process.env): GitHubE2ETarg
     branch,
     token: required(env, "GITHUB_E2E_TOKEN"),
     expectedRepositoryId,
-    sourceRepositoryId: env.GITHUB_E2E_SOURCE_REPO_ID?.trim() || undefined,
+    sourceRepositoryId,
     requiredBranch: env.GITHUB_E2E_REQUIRED_BRANCH?.trim() || undefined,
   }
 }
