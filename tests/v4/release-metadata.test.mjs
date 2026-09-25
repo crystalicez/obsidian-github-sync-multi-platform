@@ -32,7 +32,7 @@ async function fixture() {
   await writeFile(path.join(directory, "package.json"), JSON.stringify({ version: "1.2.3", packageManager: "pnpm@9.12.3" }, null, 2) + "\n");
   await writeFile(path.join(directory, "manifest.json"), JSON.stringify({ id: "fixture", version: "1.2.3", minAppVersion: "1.11.4" }, null, 2) + "\n");
   await writeFile(path.join(directory, "versions.json"), JSON.stringify({ "1.2.3": "1.11.4" }, null, 2) + "\n");
-  await writeFile(path.join(directory, ".node-version"), "v22.11.0\n");
+  await writeFile(path.join(directory, ".node-version"), "v24.11.0\n");
   await writeFile(path.join(directory, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n");
   await writeFile(path.join(directory, "main.js"), "fixture\n");
   await writeFile(path.join(directory, "styles.css"), "fixture\n");
