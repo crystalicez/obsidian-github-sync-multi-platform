@@ -105,6 +105,12 @@ export function requireGitHubE2EConfig(env, { currentSourceRepo } = {}) {
   });
 }
 
+export function sanitizeGitHubE2ELiveEnv(env = {}) {
+  const next = { ...env };
+  for (const key of ["GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"]) delete next[key];
+  return next;
+}
+
 export function qualificationE2EBranch(sha, runId) {
   if (!/^[0-9a-f]{40}$/u.test(sha ?? "")) throw new Error("Expected full lowercase commit SHA");
   if (!/^[A-Za-z0-9_-]{6,64}$/u.test(runId ?? "")) throw new Error("Unsafe qualification run id");
