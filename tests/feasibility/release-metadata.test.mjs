@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -99,4 +99,46 @@ test("update-version preserves accepted syntax and rejects non-stable forms", as
     assert.notEqual(result.status, 0);
     assert.match(`${result.stderr}\n${result.stdout}`, /invalid target version/i);
   }
+});
+
+
+test("release metadata reader rejects symlinked authority files when symlinks are available", async t => {
+  const cwd = await mkdtemp(join(tmpdir(), "release-metadata-symlink-"));
+  const realPackage = join(cwd, "real-package.json");
+  await Promise.all([
+    writeFile(realPackage, JSON.stringify({ version: "1.0.8", packageManager: "pnpm@9.12.3" })),
+    writeFile(join(cwd, "manifest.json"), JSON.stringify({ id: "plugin", version: "1.0.8", minAppVersion: "1.11.4" })),
+    writeFile(join(cwd, "versions.json"), JSON.stringify({ "1.0.8": "1.11.4" })),
+    writeFile(join(cwd, ".node-version"), "v22.11.0\n"),
+  ]);
+  try {
+    await symlink(realPackage, join(cwd, "package.json"), "file");
+  } catch (error) {
+    if (["EPERM", "EACCES", "ENOSYS"].includes(error?.code)) {
+      t.skip(`symlink creation unavailable: ${error.code}`);
+      return;
+    }
+    throw error;
+  }
+  await assert.rejects(() => readReleaseMetadata(cwd), /package\.json.*regular file/i);
+});
+
+test("update-version rejects symlinked metadata instead of following it", async t => {
+  const cwd = await makeVersionWorkspace();
+  const realPackage = join(cwd, "real-package.json");
+  await writeFile(realPackage, await readFile(join(cwd, "package.json"), "utf8"));
+  await rm(join(cwd, "package.json"));
+  try {
+    await symlink(realPackage, join(cwd, "package.json"), "file");
+  } catch (error) {
+    if (["EPERM", "EACCES", "ENOSYS"].includes(error?.code)) {
+      t.skip(`symlink creation unavailable: ${error.code}`);
+      return;
+    }
+    throw error;
+  }
+  const result = spawnSync(process.execPath, [updateVersionScript, "1.0.9"], { cwd, encoding: "utf8" });
+  assert.notEqual(result.status, 0);
+  assert.match(`${result.stderr}\n${result.stdout}`, /package\.json.*regular file/i);
+  assert.equal(JSON.parse(await readFile(realPackage, "utf8")).version, "1.0.8");
 });
