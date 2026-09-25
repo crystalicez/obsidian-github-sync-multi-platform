@@ -210,7 +210,7 @@ test("force operations preserve typed publication-race outer retry compatibility
     await runtime[operation]()
     unsubscribe()
 
-    assert.equal(runtime.progressSnapshot.lifecycle, "success", operation)
+    assert.equal(runtime.progressSnapshot.lifecycle, "no-change", operation)
     assert.equal(Math.max(...attempts), 2, operation)
     runtime.dispose()
   }

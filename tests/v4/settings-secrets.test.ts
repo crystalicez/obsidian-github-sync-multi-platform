@@ -115,11 +115,23 @@ class RuntimeMemoryGitHub {
   async createGitRef(sha: string) { this.ref = { ref: "refs/heads/main", sha, type: "commit" }; this.files = new Map(this.trees.get(this.commits.get(sha)!.treeSha)); }
   async updateGitRef(sha: string, expected?: string) {
     if (this.updateFailuresRemaining-- > 0) {
+      const current = this.ref;
+      if (!current) throw new Error("Cannot simulate a publication race without a current ref.");
+      const currentCommit = this.commits.get(current.sha);
+      if (!currentCommit) throw new Error(`Missing commit ${current.sha}`);
+      const winnerSha = `winner-${this.commits.size + 1}`;
+      this.commits.set(winnerSha, {
+        treeSha: currentCommit.treeSha,
+        parents: [current.sha],
+        message: "external winner",
+      });
+      this.ref = { ...current, sha: winnerSha };
+      this.files = new Map(this.trees.get(currentCommit.treeSha));
       this.onUpdateFailure?.();
       if (this.updateFailureDelayMs > 0) await new Promise(resolve => setTimeout(resolve, this.updateFailureDelayMs));
-      throw new Error("stale ref");
+      throw Object.assign(new Error("CAS rejected"), { status: 422 });
     }
-    if (expected && this.ref?.sha !== expected) throw new Error("stale ref");
+    if (expected && this.ref?.sha !== expected) throw Object.assign(new Error("CAS rejected"), { status: 422 });
     const previous = this.ref;
     await this.createGitRef(sha);
     if (this.returnStaleRefAfterNextUpdate) {
