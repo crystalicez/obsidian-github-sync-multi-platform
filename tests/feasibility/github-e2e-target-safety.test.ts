@@ -84,8 +84,10 @@ test("unreadable default ref fails closed", async () => {
   ])), /Git-ref read capability/u)
 })
 
-test("exact disposable 404 is accepted only after default-ref capability", async () => {
+test("exact disposable 404 is accepted only after a second target proof and absence read", async () => {
   const resolved = await resetGitHubE2EDisposableBranch(base, scriptedFetch([
+    ...resolvedSteps(),
+    { path: exactReadPath, status: 404, body: { message: "Not Found" } },
     ...resolvedSteps(),
     { path: exactReadPath, status: 404, body: { message: "Not Found" } },
   ]))
@@ -119,8 +121,10 @@ test("arbitrary 422 is not absence", async () => {
   ])), /Cannot inspect GitHub E2E disposable ref/u)
 })
 
-test("recognized 422 missing reference is absence after capability", async () => {
+test("recognized 422 missing reference still requires a second target proof and absence read", async () => {
   await resetGitHubE2EDisposableBranch(base, scriptedFetch([
+    ...resolvedSteps(),
+    { path: exactReadPath, status: 422, body: { message: "Reference does not exist" } },
     ...resolvedSteps(),
     { path: exactReadPath, status: 422, body: { message: "Reference does not exist" } },
   ]))
