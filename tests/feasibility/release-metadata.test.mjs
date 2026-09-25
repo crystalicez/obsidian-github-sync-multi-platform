@@ -32,12 +32,12 @@ test("metadata exposes exact committed toolchain versions", () => {
     packageJson: { version: "1.0.8", packageManager: "pnpm@9.12.3+sha512.deadbeef" },
     manifest: { id: "encrypted-github-sync-multi-platform", version: "1.0.8", minAppVersion: "1.11.4" },
     versions: { "1.0.8": "1.11.4" },
-    nodeVersion: "v22.11.0",
+    nodeVersion: "v24.11.0",
     pnpmVersion: "9.12.3",
   });
   assert.equal(result.version, "1.0.8");
   assert.equal(result.pnpmVersion, "9.12.3");
-  assert.equal(result.nodeVersion, "v22.11.0");
+  assert.equal(result.nodeVersion, "v24.11.0");
 });
 
 test("metadata rejects mismatches and malformed authority fields", () => {
@@ -45,7 +45,7 @@ test("metadata rejects mismatches and malformed authority fields", () => {
     packageJson: { version: "1.0.8", packageManager: "pnpm@9.12.3" },
     manifest: { id: "plugin", version: "1.0.8", minAppVersion: "1.11.4" },
     versions: { "1.0.8": "1.11.4" },
-    nodeVersion: "v22.11.0",
+    nodeVersion: "v24.11.0",
     pnpmVersion: "9.12.3",
   };
   assert.throws(() => validateReleaseMetadata({ ...base, manifest: { ...base.manifest, version: "1.0.9" } }), /version mismatch/i);
@@ -53,7 +53,7 @@ test("metadata rejects mismatches and malformed authority fields", () => {
   assert.throws(() => validateReleaseMetadata({ ...base, manifest: { ...base.manifest, minAppVersion: "v1.11.4" } }), /minAppVersion/i);
   assert.throws(() => validateReleaseMetadata({ ...base, packageJson: { ...base.packageJson, packageManager: "npm@10.0.0" } }), /packageManager/i);
   assert.throws(() => validateReleaseMetadata({ ...base, manifest: { ...base.manifest, id: "" } }), /plugin id/i);
-  assert.throws(() => validateReleaseMetadata({ ...base, nodeVersion: "22.11.0" }), /\.node-version/i);
+  assert.throws(() => validateReleaseMetadata({ ...base, nodeVersion: "24.11.0" }), /\.node-version/i);
   assert.throws(() => validateReleaseMetadata(base, { requestedVersion: "1.0.9" }), /requested version mismatch/i);
 });
 
@@ -63,10 +63,10 @@ test("readReleaseMetadata trims node version and extracts pnpm version", async (
     writeFile(join(cwd, "package.json"), JSON.stringify({ version: "1.0.8", packageManager: "pnpm@9.12.3+sha512.deadbeef" })),
     writeFile(join(cwd, "manifest.json"), JSON.stringify({ id: "plugin", version: "1.0.8", minAppVersion: "1.11.4" })),
     writeFile(join(cwd, "versions.json"), JSON.stringify({ "1.0.8": "1.11.4" })),
-    writeFile(join(cwd, ".node-version"), "v22.11.0\n"),
+    writeFile(join(cwd, ".node-version"), "v24.11.0\n"),
   ]);
   const result = await readReleaseMetadata(cwd);
-  assert.equal(result.nodeVersion, "v22.11.0");
+  assert.equal(result.nodeVersion, "v24.11.0");
   assert.equal(result.pnpmVersion, "9.12.3");
 });
 
@@ -109,7 +109,7 @@ test("release metadata reader rejects symlinked authority files when symlinks ar
     writeFile(realPackage, JSON.stringify({ version: "1.0.8", packageManager: "pnpm@9.12.3" })),
     writeFile(join(cwd, "manifest.json"), JSON.stringify({ id: "plugin", version: "1.0.8", minAppVersion: "1.11.4" })),
     writeFile(join(cwd, "versions.json"), JSON.stringify({ "1.0.8": "1.11.4" })),
-    writeFile(join(cwd, ".node-version"), "v22.11.0\n"),
+    writeFile(join(cwd, ".node-version"), "v24.11.0\n"),
   ]);
   try {
     await symlink(realPackage, join(cwd, "package.json"), "file");
