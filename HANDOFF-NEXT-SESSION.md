@@ -241,17 +241,17 @@ Do not run live GitHub E2E unless credentials/safety scope are explicitly intend
 ## Remaining repository work after green acceptance
 
 Current GitHub backlog survey:
-- PR #6 (`child-c-publication-race-conflict-recovery`) is open, draft, mergeable, and GREEN through the stacked acceptance run. It is 55 commits ahead / 0 behind `master`.
-- PR #7 (`child-d-immutable-git-read-fallback`) is open, draft, mergeable, and GREEN. It is stacked cleanly on the latest Child C with `behind=0`.
+- PR #6 (`child-c-publication-race-conflict-recovery`) was merged to `master` on 2026-09-25 with merge commit `23c9c29dfbdd276733a082fdb8afb2feda86b2b3`.
+- PR #7 (`child-d-immutable-git-read-fallback`) remains GREEN. Its branch now contains the merged-master commit as ancestry via `4c200f1eea2a25f6496ea75820a0223d5a446399` and is being retargeted to `master` for final D-only review/merge.
 - PR #4 (`feature/local-release-qualification`) is still open and draft but currently `mergeable=false`. Compared with current `master`, it is 40 commits ahead / 1 behind and needs a dedicated rebase/merge conflict review plus fresh verification before integration.
 - There are currently no open GitHub issues.
 - The repository still has multiple historical/agent/fix/design remote branches with no open PR. Treat branch cleanup as optional housekeeping only after checking whether each branch contains unique work.
 - Current commit-status API results for PR #4/#6/#7 are empty, so do not assume GitHub-hosted CI evidence exists; rely on recorded local acceptance until new CI is configured/run.
 
-Recommended integration order when the user asks to merge:
-1. merge/land PR #6 to `master`;
-2. restack/retarget PR #7 onto the new `master` if GitHub does not do so automatically, verify its diff remains D-only, then merge PR #7;
-3. only then revisit PR #4 against the new `master`, resolve its divergence/conflicts, re-run its release/qualification verification, and merge separately if still desired.
+Integration progress:
+1. PR #6: **DONE**, merged to `master`.
+2. PR #7: **IN PROGRESS**, branch restacked on the new master; retarget/diff verification/merge next.
+3. PR #4: revisit only after #7 lands; resolve against the final master, re-run release/qualification verification, and merge separately if still valid.
 
 ## Known housekeeping
 
@@ -278,4 +278,4 @@ The previously noted temporary branch `tmp-ignore` is no longer present in the c
 ## Last updated
 
 - 2026-09-25 (Asia/Bangkok)
-- Reason: record final green acceptance and the post-acceptance repository backlog survey (PR #6/#7 integration, PR #4 divergence, and optional stale-branch cleanup).
+- Reason: record PR #6 merged to master and Child D restacked on the new master before PR #7 retarget/merge.
