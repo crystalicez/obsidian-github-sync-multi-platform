@@ -149,7 +149,7 @@ export async function releaseLocal({
   const phase = name => onProgress({ phase: name });
   const releaseEnv = withoutGitHubE2EToken(env);
   const gateEnv = withoutAnyGitHubTokens(env);
-  const releaseRunner = (command, args, options = {}) => runner(command, args, { ...options, env: releaseEnv });
+  const releaseRunner = (command, args, options = {}) => runner(command, args, { ...options, env: options.env ?? releaseEnv });
 
   phase("preflight");
   const sha = s.requireCleanMaster({ runner: releaseRunner, cwd });
