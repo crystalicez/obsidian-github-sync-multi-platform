@@ -58,7 +58,7 @@ pnpm test:github-e2e:compile
 
 The runner also accepts `node scripts/run-github-e2e.mjs --compile-only`. Compile-only mode does not load the target env file and requires no target credential or repository ID.
 
-Manual execution also resolves the checkout's GitHub `origin` and refuses a destructive target equal to that current source repository or the canonical source repository. Before mutation, the configured owner/repository route must resolve to `GITHUB_E2E_EXPECTED_REPO_ID`, the selected branch must differ from the actual target default branch, and the target default Git ref must be readable.
+Manual execution also resolves the checkout's GitHub `origin` **and its numeric repository ID**. It refuses a destructive target equal to either the current source repository or the canonical source repository by route/name or by numeric repository identity. Before mutation, the configured owner/repository route must resolve to `GITHUB_E2E_EXPECTED_REPO_ID`, the selected branch must differ from the actual target default branch, and the target default Git ref must be readable. If source identity cannot be proven, the manual run fails closed.
 
 ## Official local release qualification
 
@@ -74,19 +74,23 @@ Only the child live-E2E process receives that branch override; `.env.github-e2e`
 
 Before the live child starts, official qualification proves:
 
-- the E2E target is not the canonical/current source repository,
+- the E2E target is not the canonical/current source repository by repository route **or numeric repository ID**,
 - the configured route resolves to the pinned numeric `GITHUB_E2E_EXPECTED_REPO_ID`,
 - target repository metadata and its actual default Git ref are readable,
 - the generated branch is not the target repository's actual default branch.
 
-After the live child returns, **whether the child succeeded or failed**, the qualifier performs bounded out-of-band cleanup:
+Credential scopes are separated deliberately. Install/build/test/compile children do not receive `GITHUB_E2E_TOKEN` or standard GitHub source/publication tokens such as `GH_TOKEN` / `GITHUB_TOKEN`. The destructive live-E2E child receives the dedicated `GITHUB_E2E_TOKEN` but has the standard source/publication GitHub token variables stripped.
 
-1. read the unique branch ref,
-2. delete it if present,
-3. read again and require absence,
-4. retry the bounded cleanup/verify sequence when appropriate.
+After the live child returns, **whether the child succeeded or failed**, the qualifier performs bounded out-of-band cleanup restricted to the `obsidian-sync-e2e/local-` namespace:
 
-A qualification receipt cannot be created unless the live child succeeded **and** branch absence was verified.
+1. re-prove the pinned target repository identity and readable actual default ref before each delete attempt,
+2. read the exact unique qualification branch,
+3. delete it if present,
+4. re-prove the pinned target identity/default-ref capability again,
+5. read the exact qualification branch **after that final proof** and require absence,
+6. retry the bounded cleanup/verify sequence when appropriate.
+
+A stale earlier 404 is never accepted as cleanup proof. A qualification receipt cannot be created unless the live child succeeded **and** the final post-proof branch read is absent.
 
 A hard process kill, machine loss, or power failure can prevent this outer cleanup from running. Because each official run uses a unique branch, any residue is isolated and the qualifier prints the safe branch identifier for manual inspection.
 
@@ -168,7 +172,7 @@ obsidian-sync-e2e/run-<GITHUB_RUN_ID>
 
 For official local qualification, use the exact `obsidian-sync-e2e/local-...` branch printed by `qualify:local`.
 
-Cleanup is fail-closed. Before deleting an official local qualification branch, the tool re-resolves the configured target and requires its numeric repository ID to equal `GITHUB_E2E_EXPECTED_REPO_ID`, rejects the actual default branch, and proves the default Git ref is readable. After branch absence is observed, it re-proves the same pinned target identity/capability before qualification can succeed.
+Cleanup is fail-closed. Before each delete attempt for an official local qualification branch, the tool re-resolves the configured target, requires its numeric repository ID to equal `GITHUB_E2E_EXPECTED_REPO_ID`, rejects canonical/current source repository IDs, rejects the actual default branch, and proves the default Git ref is readable. Success requires another target proof followed by a fresh exact-branch read that is absent; an absence observed before that proof is not sufficient.
 
 For Actions residue, follow the pinned-ID/default-ref procedure documented by the workflow. Never treat an arbitrary 404/422 as sufficient cleanup proof, and never reuse cleanup guidance against the source repository or a real notes branch.
 
