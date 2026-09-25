@@ -14,7 +14,7 @@ async function makeWorkspace({ ignoredSecret = false, trackedSecret = false } = 
   await writeFile(join(dir, 'manifest.json'), JSON.stringify({ id: 'test-plugin', version: '1.0.7', minAppVersion: '1.0.0' }));
   await writeFile(join(dir, 'package.json'), JSON.stringify({ version: '1.0.7', packageManager: 'pnpm@10.17.1' }));
   await writeFile(join(dir, 'versions.json'), JSON.stringify({ '1.0.7': '1.0.0' }));
-  await writeFile(join(dir, '.node-version'), 'v22.11.0\n');
+  await writeFile(join(dir, '.node-version'), 'v24.11.0\n');
   await writeFile(join(dir, 'pnpm-lock.yaml'), "lockfileVersion: '9.0'\n");
 
   const git = spawnSync('git', ['init', '-q'], { cwd: dir, encoding: 'utf8' });
