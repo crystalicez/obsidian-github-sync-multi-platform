@@ -32,7 +32,7 @@ async function fixture() {
   await writeFile(join(work, "package.json"), JSON.stringify({ version: "1.0.8", packageManager: "pnpm@9.12.3+sha512.deadbeef" }, null, 2) + "\n");
   await writeFile(join(work, "manifest.json"), JSON.stringify({ id: "encrypted-github-sync-multi-platform", version: "1.0.8", minAppVersion: "1.11.4" }, null, 2) + "\n");
   await writeFile(join(work, "versions.json"), JSON.stringify({ "1.0.8": "1.11.4" }, null, 2) + "\n");
-  await writeFile(join(work, ".node-version"), "v22.11.0\n");
+  await writeFile(join(work, ".node-version"), "v24.11.0\n");
   git(work, ["add", "."]);
   git(work, ["commit", "-qm", "fixture"]);
   const sha = git(work, ["rev-parse", "HEAD"]).stdout.trim();
@@ -141,7 +141,7 @@ function baseOptions(f, extras = {}) {
         GH_TOKEN: "source-gh-token",
         GITHUB_TOKEN: "source-actions-token",
       },
-      runtimeNodeVersion: "v22.11.0",
+      runtimeNodeVersion: "v24.11.0",
       platform: "linux",
       arch: "x64",
       onProgress: event => progress.push(event),
