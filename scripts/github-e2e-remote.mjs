@@ -136,15 +136,17 @@ export async function cleanupE2EBranch({
     throw new Error("Local qualification cleanup is restricted to obsidian-sync-e2e/local-* branches");
   }
   const config = { owner, repo, branch, token, expectedRepoId, currentSourceRepoId };
+  const proveAbsentAfterTargetProof = async () => {
+    await preflightE2ERemote({ fetchImpl, config });
+    const observed = await readE2EBranch({ fetchImpl, owner, repo, branch, token });
+    return observed.kind === "absent";
+  };
 
   const deleteUrl = branchDeleteUrl(owner, repo, branch);
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     await preflightE2ERemote({ fetchImpl, config });
     const before = await readE2EBranch({ fetchImpl, owner, repo, branch, token });
-    if (before.kind === "absent") {
-      await preflightE2ERemote({ fetchImpl, config });
-      return;
-    }
+    if (before.kind === "absent" && await proveAbsentAfterTargetProof()) return;
 
     const deleted = await fetchResponse(
       fetchImpl,
@@ -159,11 +161,7 @@ export async function cleanupE2EBranch({
       throw apiStatusError("GitHub E2E branch cleanup", deleted.status);
     }
 
-    const verify = await readE2EBranch({ fetchImpl, owner, repo, branch, token });
-    if (verify.kind === "absent") {
-      await preflightE2ERemote({ fetchImpl, config });
-      return;
-    }
+    if (await proveAbsentAfterTargetProof()) return;
     if (attempt < maxAttempts) await sleep(attempt * 2_000);
   }
   throw new Error(`Disposable GitHub E2E branch still exists after ${maxAttempts} cleanup attempts: ${branch}`);
