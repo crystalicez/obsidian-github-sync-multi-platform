@@ -139,11 +139,27 @@ test("cleanup deletes a present unique branch, verifies absence, and re-proves p
   assert.equal(fetchImpl.remaining(), 0);
 });
 
-test("cleanup succeeds for an absent branch only after pinned target capability is proved twice", async () => {
-  const fetchImpl = fakeFetch([repo(), ref(), response(404), repo(), ref()]);
+test("cleanup succeeds for an absent branch only when absence is re-read after the final target proof", async () => {
+  const fetchImpl = fakeFetch([repo(), ref(), response(404), repo(), ref(), response(404)]);
   await cleanupE2EBranch({
     fetchImpl, owner: "test", repo: "repo", branch: "obsidian-sync-e2e/local-gone", token: "secret", expectedRepoId: "123", currentSourceRepoId: "777", sleep: async () => {},
   });
+  assert.equal(fetchImpl.remaining(), 0);
+});
+
+test("cleanup does not accept stale absence if the disposable branch reappears during final proof", async () => {
+  const calls = [];
+  const fetchImpl = fakeFetch([
+    repo(), ref(), response(404),
+    repo(), ref(), response(200, { object: { sha: PRESENT_SHA } }),
+    response(204),
+    repo(), ref(), response(404),
+  ], calls);
+  await cleanupE2EBranch({
+    fetchImpl, owner: "test", repo: "repo", branch: "obsidian-sync-e2e/local-recreated",
+    token: "secret", expectedRepoId: "123", currentSourceRepoId: "777", sleep: async () => {},
+  });
+  assert.equal(calls.some(call => call.options?.method === "DELETE"), true);
   assert.equal(fetchImpl.remaining(), 0);
 });
 
