@@ -1,10 +1,11 @@
+import { CANONICAL_REPOSITORY_ID } from "./github-repo.mjs";
 const API_BASE = "https://api.github.com";
 const API_VERSION = "2022-11-28";
 const SHA_RE = /^[0-9a-f]{40}$/u;
 
 function headers(token) {
   return {
-    Authorization: `Bearer ${token}`,
+    ...(typeof token === "string" && token !== "" ? { Authorization: `Bearer ${token}` } : {}),
     Accept: "application/vnd.github+json",
     "X-GitHub-Api-Version": API_VERSION,
   };
@@ -98,6 +99,10 @@ export async function preflightE2ERemote({ fetchImpl = fetch, config }) {
   });
   if (repository.id !== String(config.expectedRepoId ?? "")) {
     throw new Error("GitHub E2E target repository ID does not match GITHUB_E2E_EXPECTED_REPO_ID");
+  }
+  const sourceIds = new Set([CANONICAL_REPOSITORY_ID, String(config.currentSourceRepoId ?? "")].filter(Boolean));
+  if (sourceIds.has(repository.id)) {
+    throw new Error("Refusing destructive GitHub E2E against a source repository ID");
   }
   if (config.branch === repository.defaultBranch) {
     throw new Error(`Refusing destructive GitHub E2E against repository default branch: ${repository.defaultBranch}`);
