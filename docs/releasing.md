@@ -39,7 +39,7 @@ Before the official local flow, require:
 - Git authentication able to push qualification tags to the canonical source repository,
 - GitHub CLI authenticated on **github.com** with push/Contents-write access to the canonical source repository,
 - a dedicated disposable real-GitHub E2E repository, its pinned numeric repository ID, and a token with Contents read/write permission,
-- that E2E repository must not be this source repository and must not contain real user notes.
+- that E2E repository must not be this source repository by route/name **or numeric repository ID** and must not contain real user notes.
 
 Create `.env.github-e2e` from `.env.github-e2e.example` or provide the equivalent process environment, including `GITHUB_E2E_EXPECTED_REPO_ID`. The configured manual branch is ignored by official qualification; `qualify:local` generates a unique branch for its own destructive run.
 
@@ -81,9 +81,10 @@ github-e2e-cleanup-verified
 Important qualification behavior:
 
 - build runs before full package validation because `validate:package` requires generated `main.js`,
-- the destructive E2E target is checked against the current/canonical source repository, pinned numeric target repository ID, readable actual default Git ref, and the target repository's actual default branch,
+- the destructive E2E target is checked against the current/canonical source repository by route/name and numeric ID, the pinned numeric target repository ID, readable actual default Git ref, and the target repository's actual default branch,
+- non-live qualification gates receive neither the E2E target token nor standard GitHub source/publication tokens; the live child receives the dedicated E2E token but not the standard source/publication token variables,
 - official qualification overrides the configured branch with `obsidian-sync-e2e/local-<sha12>-<run-id>`,
-- after the live child returns, bounded out-of-band cleanup proves that unique branch is absent before qualification can succeed,
+- cleanup is restricted to the local-qualification namespace, re-proves target identity/default-ref capability before delete attempts, and only accepts branch absence when a fresh exact-branch read occurs **after** the final target proof,
 - source `HEAD`, canonical fetch/push origins, metadata/toolchain, remote `master`, and qualification-ref absence are rechecked after the long gates,
 - only then is one annotated qualification tag object pushed to:
 
@@ -136,8 +137,8 @@ The release command:
 1. proves clean canonical `master == remote master`, exact metadata/toolchain, GitHub auth, monotonic version, requested stable-ref absence, requested draft/published release absence, and exact remote qualification evidence,
 2. snapshots the remote qualification **tag-object SHA**,
 3. reruns publication-machine gates: frozen install, build, package validation, fast tests, and GitHub-E2E compile,
-4. stages release bytes under ignored `.tmp/release/<version>/`,
-5. reads `manifest.json` and `styles.css` from exact `HEAD` Git blobs and `main.js` from the just-built output,
+4. stages release bytes under ignored `.tmp/release/<version>/` only after proving the staging ancestors are real directories rather than symlinks,
+5. requires release-authority metadata, the generated `main.js`, the canonical lockfile, and staged upload assets to be real regular files; reads `manifest.json` and `styles.css` from exact `HEAD` Git blobs and `main.js` from the just-built output,
 6. creates the deterministic repository-rooted ZIP and computes size/SHA-256 for all four assets,
 7. rechecks source/master/origin/evidence/publication absence immediately before mutation,
 8. atomically claims the lightweight stable `x.y.z` ref with GitHub's create-reference API,
@@ -162,7 +163,7 @@ obsidian-github-sync-multi-platform/manifest.json
 obsidian-github-sync-multi-platform/styles.css
 ```
 
-The current packager emits a minimal deterministic ZIP32 **stored** archive (no compression) for this fixed three-file contract; see `docs/superpowers/specs/2026-08-28-local-release-packaging-amendment.md`.
+The current packager emits a minimal deterministic ZIP32 **stored** archive (no compression) for this fixed three-file contract. ZIP entry names reject absolute, empty-segment, `.`, `..`, and backslash traversal shapes; see `docs/superpowers/specs/2026-08-28-local-release-packaging-amendment.md`.
 
 ## 6. Partial/ambiguous publication state
 
