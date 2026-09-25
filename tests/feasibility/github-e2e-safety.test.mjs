@@ -14,6 +14,7 @@ import {
   loadGitHubE2EEnv,
   parseEnvLine,
   qualificationE2EBranch,
+  sanitizeGitHubE2ELiveEnv,
   validateGitHubE2EConfig,
 } from "../../scripts/github-e2e-env.mjs";
 
@@ -107,6 +108,25 @@ test("E2E config rejects missing credentials, invalid target IDs, and protected 
   assert.throws(() => validateGitHubE2EConfig({ owner: "owner", repo: "repo", branch: "e2e", token: "secret", expectedRepoId: "" }), /EXPECTED_REPO_ID/i);
   assert.throws(() => validateGitHubE2EConfig({ owner: "owner", repo: "repo", branch: "e2e", token: "secret", expectedRepoId: "01" }), /EXPECTED_REPO_ID/i);
   assert.equal(validateGitHubE2EConfig({ owner: "owner", repo: "repo", branch: "e2e", token: "secret", expectedRepoId: "123" }).expectedRepoId, "123");
+});
+
+test("manual live E2E env keeps only the dedicated target token among standard GitHub tokens", () => {
+  const source = {
+    PATH: "/bin",
+    GITHUB_E2E_TOKEN: "e2e-target",
+    GH_TOKEN: "source-gh",
+    GITHUB_TOKEN: "source-actions",
+    GH_ENTERPRISE_TOKEN: "source-enterprise",
+    GITHUB_ENTERPRISE_TOKEN: "source-enterprise-actions",
+  };
+  const sanitized = sanitizeGitHubE2ELiveEnv(source);
+  assert.equal(sanitized.GITHUB_E2E_TOKEN, "e2e-target");
+  assert.equal(sanitized.GH_TOKEN, undefined);
+  assert.equal(sanitized.GITHUB_TOKEN, undefined);
+  assert.equal(sanitized.GH_ENTERPRISE_TOKEN, undefined);
+  assert.equal(sanitized.GITHUB_ENTERPRISE_TOKEN, undefined);
+  assert.equal(sanitized.PATH, "/bin");
+  assert.equal(source.GH_TOKEN, "source-gh", "sanitizer must not mutate caller env");
 });
 
 test("env parser preserves shell-env-wins behavior", async () => {
