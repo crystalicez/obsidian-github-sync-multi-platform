@@ -1,7 +1,7 @@
 import { spawnSync } from "node:child_process";
 import path from "node:path";
 import { compileGitHubE2EBundles, writeGitHubE2EInputManifest } from "./github-e2e-input.mjs";
-import { loadGitHubE2EEnv, requireGitHubE2EConfig } from "./github-e2e-env.mjs";
+import { loadGitHubE2EEnv, requireGitHubE2EConfig, sanitizeGitHubE2ELiveEnv } from "./github-e2e-env.mjs";
 import { preflightE2ERemote, readE2ERepository } from "./github-e2e-remote.mjs";
 import { readOriginFetchRepository } from "./github-repo.mjs";
 
@@ -30,7 +30,7 @@ if (!compileOnly) {
     const loaded = await loadGitHubE2EEnv({ cwd: root, env: process.env });
     const config = requireGitHubE2EConfig(loaded.env, { currentSourceRepo });
     await preflightE2ERemote({ fetchImpl: fetch, config: { ...config, currentSourceRepoId: sourceIdentity.id } });
-    liveEnv = loaded.env;
+    liveEnv = sanitizeGitHubE2ELiveEnv(loaded.env);
   } catch (error) {
     console.error(`GitHub E2E preflight failed: ${error instanceof Error ? error.message : String(error)}`);
     process.exit(2);
