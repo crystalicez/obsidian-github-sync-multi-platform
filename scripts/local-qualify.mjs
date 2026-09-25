@@ -131,7 +131,7 @@ export async function qualifyLocal({
   const officialBranch = qualificationE2EBranch(sha, runIdValue);
   const loaded = await loadGitHubE2EEnv({ cwd, env });
   const raw = loaded.env;
-  for (const key of ["GITHUB_E2E_OWNER", "GITHUB_E2E_REPO", "GITHUB_E2E_TOKEN"]) {
+  for (const key of ["GITHUB_E2E_OWNER", "GITHUB_E2E_REPO", "GITHUB_E2E_TOKEN", "GITHUB_E2E_EXPECTED_REPO_ID"]) {
     if (!raw[key]) throw new Error(`Missing required GitHub E2E env var: ${key}`);
   }
   const e2eConfig = validateGitHubE2EConfig({
@@ -139,6 +139,7 @@ export async function qualifyLocal({
     repo: raw.GITHUB_E2E_REPO,
     branch: officialBranch,
     token: raw.GITHUB_E2E_TOKEN,
+    expectedRepoId: raw.GITHUB_E2E_EXPECTED_REPO_ID,
     currentSourceRepo: CANONICAL_REPOSITORY,
   });
   await preflightE2ERemote({ fetchImpl, config: e2eConfig });
@@ -163,6 +164,7 @@ export async function qualifyLocal({
       repo: e2eConfig.repo,
       branch: officialBranch,
       token: e2eConfig.token,
+      expectedRepoId: e2eConfig.expectedRepoId,
       sleep,
     });
     onProgress({ kind: "gate", name: "github-e2e-cleanup-verified" });
