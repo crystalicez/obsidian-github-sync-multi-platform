@@ -132,11 +132,14 @@ export async function cleanupE2EBranch({
   if (!Number.isInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > 10) {
     throw new Error("maxAttempts must be an integer between 1 and 10");
   }
+  if (typeof branch !== "string" || !branch.startsWith("obsidian-sync-e2e/local-")) {
+    throw new Error("Local qualification cleanup is restricted to obsidian-sync-e2e/local-* branches");
+  }
   const config = { owner, repo, branch, token, expectedRepoId, currentSourceRepoId };
-  await preflightE2ERemote({ fetchImpl, config });
 
   const deleteUrl = branchDeleteUrl(owner, repo, branch);
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    await preflightE2ERemote({ fetchImpl, config });
     const before = await readE2EBranch({ fetchImpl, owner, repo, branch, token });
     if (before.kind === "absent") {
       await preflightE2ERemote({ fetchImpl, config });
