@@ -309,15 +309,21 @@ A subsequent stop-on-first-failure acceptance attempt on current head `68846941c
 - toolchain guard stopped immediately because actual Node was still `v24.11.0` while `.node-version` requires `v22.11.0`;
 - no build/test gate ran after that mismatch, so this attempt adds no new code/test failure evidence.
 
-Next action remains unchanged: switch the maintainer shell to exact Node `v22.11.0`, confirm `node --version`, then rerun the full stop-on-first-failure acceptance block from the current PR #4 head.
+Historical note: the acceptance attempts above happened while the committed release contract still required Node `v22.11.0`. The user chose to move the repository's official exact runtime forward instead of installing a second Node version locally.
 
-A follow-up Windows shell attempt confirmed:
-- `node.exe` currently resolves from `C:\\Program Files\\nodejs\\node.exe`;
-- actual Node remains `v24.11.0`;
-- the interactive `if / elseif / else` helper was pasted as separate PowerShell statements, so later `elseif` / `else` tokens were parsed as standalone commands and failed before any version-manager activation;
-- no repository build/test gate ran, so this adds no new repository failure evidence.
+### Node 24.11.0 exact-toolchain migration
 
-Use independent version-manager commands (or one complete scriptblock) for the next activation attempt; do not paste separated `elseif` / `else` fragments interactively.
+Current release/toolchain authority is now **Node `v24.11.0`**:
+- `.node-version` was changed from `v22.11.0` to `v24.11.0`;
+- release qualification/release logic remains exact-version fail-closed and reads the committed `.node-version`; no production algorithm needed a Node-specific fork;
+- feasibility/V4 release metadata tests that intentionally pin the exact runtime were updated to `v24.11.0`;
+- release design/plan/runbook examples were updated to the new exact runtime;
+- GitHub workflows already consume `.node-version` (or the exact CI-produced node-version value), so no workflow-specific hardcoded Node major change was required;
+- `@types/node` was intentionally not upgraded as part of this runtime migration: it is a compile-time dependency and changing it would add unrelated lockfile/type-surface churn. Final build/tests on Node 24 are the evidence that the current type/runtime combination remains valid.
+
+The user's current Windows installation already resolves `node.exe` from `C:\\Program Files\\nodejs\\node.exe` as `v24.11.0`, so no version-manager installation is required for the new contract.
+
+Fresh acceptance must now run on exact Node `v24.11.0` and pnpm `9.12.3` against the current PR #4 head. The earlier Node-24/libuv failure is **not** accepted as proof: it occurred before the preflight-ordering fix `572a69f40a84e125375cbd9f23de9b11649a1896`; the focused `github-e2e-compile-cli` regression must pass on the migrated toolchain before merge.
 
 ## Known housekeeping
 
@@ -328,7 +334,7 @@ The previously noted temporary branch `tmp-ignore` is no longer present in the c
 1. Read this file first and fetch PR #4 metadata/current head from GitHub.
 2. Confirm `feature/local-release-qualification` is still `behind=0` and mergeable against `master`.
 3. Do not make new correctness changes unless final static audit or execution output exposes a concrete failure.
-4. Run/obtain the final PR #4 acceptance gate on the current head: focused local-release/E2E feasibility tests, build, full fast/repeat/recovery/resource/feasibility suites, GitHub-E2E compile + producer-manifest path, and package validation.
+4. Run/obtain the final PR #4 acceptance gate on the current head using exact Node `v24.11.0` + pnpm `9.12.3`: focused local-release/E2E feasibility tests, build, full fast/repeat/recovery/resource/feasibility suites, GitHub-E2E compile + producer-manifest path, and package validation.
 5. If any gate fails, debug the specific failure before merging.
 6. If all final gates are freshly green, update this handoff with exact observed counts/head SHA, merge PR #4 to `master`, verify the merged result, then audit historical remote branches for unique work before deleting only branches proven obsolete.
 7. Do not run destructive live GitHub E2E or `release:local` merely as an acceptance test.
@@ -344,4 +350,4 @@ The previously noted temporary branch `tmp-ignore` is no longer present in the c
 ## Last updated
 
 - 2026-09-26 (Asia/Bangkok)
-- Reason: record final PR #4 integration/security hardening, code-freeze state, and the remaining fresh execution gate before merge.
+- Reason: record the Node v24.11.0 exact-toolchain migration and the remaining fresh execution gate before PR #4 merge.
