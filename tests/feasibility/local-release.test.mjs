@@ -28,7 +28,7 @@ function qualificationState(objectSha = QUAL_OBJECT) {
         qualifiedAt: "2026-08-28T00:00:00.000Z",
         durationMs: 1234,
         platform: "linux-x64",
-        nodeVersion: "v22.11.0",
+        nodeVersion: "v24.11.0",
         pnpmVersion: "9.12.3",
         e2eSuite: "github-e2e-quick",
         gates: [
@@ -79,7 +79,7 @@ async function harness(overrides = {}) {
     packageJson: { version: "1.0.8", packageManager: "pnpm@9.12.3" },
     manifest: { id: "plugin", version: "1.0.8", minAppVersion: "1.11.4" },
     versions: { "1.0.8": "1.11.4" },
-    nodeVersion: "v22.11.0",
+    nodeVersion: "v24.11.0",
     pnpmVersion: "9.12.3",
   };
   const services = {
@@ -89,7 +89,7 @@ async function harness(overrides = {}) {
     async readReleaseMetadata() { return metadata; },
     validateReleaseMetadata(value, { requestedVersion } = {}) {
       if (requestedVersion && requestedVersion !== "1.0.8") throw new Error("requested version mismatch");
-      return { version: "1.0.8", minAppVersion: "1.11.4", pluginId: "plugin", nodeVersion: "v22.11.0", pnpmVersion: "9.12.3" };
+      return { version: "1.0.8", minAppVersion: "1.11.4", pluginId: "plugin", nodeVersion: "v24.11.0", pnpmVersion: "9.12.3" };
     },
     readPnpmVersion() { return "9.12.3"; },
     requireGithubPublicationAuth() { calls.push("auth"); },
@@ -144,7 +144,7 @@ test("public release is unreachable before all exact verification phases", async
   const h = await harness();
   const result = await releaseLocal({
     cwd: "/repo", version: "1.0.8", services: h.services,
-    runtimeNodeVersion: "v22.11.0", onProgress: event => h.events.push(event),
+    runtimeNodeVersion: "v24.11.0", onProgress: event => h.events.push(event),
   });
   assert.deepEqual(h.events.filter(e => e.phase).map(e => e.phase), PHASES);
   assert.deepEqual(h.calls.filter(value => value.startsWith("gate:")), [
@@ -186,7 +186,7 @@ test("release isolates verification gates while preserving publication auth for 
     version: "1.0.8",
     runner,
     services: h.services,
-    runtimeNodeVersion: "v22.11.0",
+    runtimeNodeVersion: "v24.11.0",
     env: {
       PATH: "/bin",
       GH_TOKEN: "publication-token",
@@ -210,41 +210,41 @@ test("release isolates verification gates while preserving publication auth for 
 
 test("preflight rejects invalid syntax, non-monotonic versions, and existing publication state", async () => {
   const h1 = await harness();
-  await assert.rejects(() => releaseLocal({ cwd: "/repo", version: "v1.0.8", services: h1.services, runtimeNodeVersion: "v22.11.0" }), /x\.y\.z/i);
+  await assert.rejects(() => releaseLocal({ cwd: "/repo", version: "v1.0.8", services: h1.services, runtimeNodeVersion: "v24.11.0" }), /x\.y\.z/i);
   const h2 = await harness({ stableTags: [{ name: "1.0.8", objectSha: "c".repeat(40) }] });
-  await assert.rejects(() => releaseLocal({ cwd: "/repo", version: "1.0.8", services: h2.services, runtimeNodeVersion: "v22.11.0" }), /greater than every remote stable/i);
+  await assert.rejects(() => releaseLocal({ cwd: "/repo", version: "1.0.8", services: h2.services, runtimeNodeVersion: "v24.11.0" }), /greater than every remote stable/i);
   const h3 = await harness({ services: { readReleaseState() { return { kind: "present", release: { tag_name: "1.0.8", draft: true, prerelease: false, assets: [] } }; } } });
-  await assert.rejects(() => releaseLocal({ cwd: "/repo", version: "1.0.8", services: h3.services, runtimeNodeVersion: "v22.11.0" }), /already exists/i);
+  await assert.rejects(() => releaseLocal({ cwd: "/repo", version: "1.0.8", services: h3.services, runtimeNodeVersion: "v24.11.0" }), /already exists/i);
 });
 
 test("master movement before stable ref creation blocks every stable mutation", async () => {
   const h = await harness({ masterSequence: [SHA, "d".repeat(40)] });
-  await assert.rejects(() => releaseLocal({ cwd: "/repo", version: "1.0.8", services: h.services, runtimeNodeVersion: "v22.11.0" }), /remote master changed/i);
+  await assert.rejects(() => releaseLocal({ cwd: "/repo", version: "1.0.8", services: h.services, runtimeNodeVersion: "v24.11.0" }), /remote master changed/i);
   assert.equal(h.calls.includes("stable-create"), false);
 });
 
 test("qualification object replacement after stable ref claim blocks draft creation", async () => {
   const h = await harness({ qualificationSequence: [qualificationState(), qualificationState(), qualificationState("e".repeat(40))] });
-  await assert.rejects(() => releaseLocal({ cwd: "/repo", version: "1.0.8", services: h.services, runtimeNodeVersion: "v22.11.0" }), /qualification.*changed/i);
+  await assert.rejects(() => releaseLocal({ cwd: "/repo", version: "1.0.8", services: h.services, runtimeNodeVersion: "v24.11.0" }), /qualification.*changed/i);
   assert.equal(h.calls.some(value => value.startsWith("gh:release:create")), false);
 });
 
 test("nonzero draft creation stops for inspection and never publishes", async () => {
   const h = await harness({ draftResult: { status: 1, stderr: "transport lost" } });
-  await assert.rejects(() => releaseLocal({ cwd: "/repo", version: "1.0.8", services: h.services, runtimeNodeVersion: "v22.11.0" }), /draft creation failed/i);
+  await assert.rejects(() => releaseLocal({ cwd: "/repo", version: "1.0.8", services: h.services, runtimeNodeVersion: "v24.11.0" }), /draft creation failed/i);
   assert.equal(h.calls.some(value => value.startsWith("gh:release:edit")), false);
 });
 
 test("nonzero publish reconciles success only from exact final published state", async () => {
   const h = await harness({ publishResult: { status: 1, stderr: "connection reset" } });
-  const result = await releaseLocal({ cwd: "/repo", version: "1.0.8", services: h.services, runtimeNodeVersion: "v22.11.0" });
+  const result = await releaseLocal({ cwd: "/repo", version: "1.0.8", services: h.services, runtimeNodeVersion: "v24.11.0" });
   assert.equal(result.reconciledPublish, true);
   assert.equal(h.getRelease().draft, false);
 });
 
 test("nonzero publish with remaining draft fails closed", async () => {
   const h = await harness({ publishResult: { status: 1 }, keepDraftAfterPublish: true });
-  await assert.rejects(() => releaseLocal({ cwd: "/repo", version: "1.0.8", services: h.services, runtimeNodeVersion: "v22.11.0" }), /post-publication|published/i);
+  await assert.rejects(() => releaseLocal({ cwd: "/repo", version: "1.0.8", services: h.services, runtimeNodeVersion: "v24.11.0" }), /post-publication|published/i);
 });
 
 test("local staged artifact mutation is detected before first remote stable mutation", async () => {
@@ -255,6 +255,6 @@ test("local staged artifact mutation is detected before first remote stable muta
     if (masterRead === 2) writeFile(h.packaged.assets[0].path, "tampered");
     return SHA;
   };
-  await assert.rejects(() => releaseLocal({ cwd: "/repo", version: "1.0.8", services: h.services, runtimeNodeVersion: "v22.11.0" }), /staged release asset changed/i);
+  await assert.rejects(() => releaseLocal({ cwd: "/repo", version: "1.0.8", services: h.services, runtimeNodeVersion: "v24.11.0" }), /staged release asset changed/i);
   assert.equal(h.calls.includes("stable-create"), false);
 });
