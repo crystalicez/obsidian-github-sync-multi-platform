@@ -1,4 +1,5 @@
 export const CANONICAL_REPOSITORY = "crystalicez/obsidian-github-sync-multi-platform";
+export const CANONICAL_REPOSITORY_ID = "1282135059";
 
 function failRemote(message = "Unsupported GitHub remote URL") {
   throw new Error(message);
