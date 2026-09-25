@@ -125,13 +125,14 @@ export async function cleanupE2EBranch({
   branch,
   token,
   expectedRepoId,
+  currentSourceRepoId,
   sleep = ms => new Promise(resolve => setTimeout(resolve, ms)),
   maxAttempts = 3,
 }) {
   if (!Number.isInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > 10) {
     throw new Error("maxAttempts must be an integer between 1 and 10");
   }
-  const config = { owner, repo, branch, token, expectedRepoId };
+  const config = { owner, repo, branch, token, expectedRepoId, currentSourceRepoId };
   await preflightE2ERemote({ fetchImpl, config });
 
   const deleteUrl = branchDeleteUrl(owner, repo, branch);
