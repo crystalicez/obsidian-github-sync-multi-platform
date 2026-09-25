@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, writeFile } from 'node:fs/promises';
+import { mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -14,6 +14,7 @@ async function makeWorkspace({ ignoredSecret = false, trackedSecret = false } = 
   await writeFile(join(dir, 'manifest.json'), JSON.stringify({ id: 'test-plugin', version: '1.0.7', minAppVersion: '1.0.0' }));
   await writeFile(join(dir, 'package.json'), JSON.stringify({ version: '1.0.7', packageManager: 'pnpm@10.17.1' }));
   await writeFile(join(dir, 'versions.json'), JSON.stringify({ '1.0.7': '1.0.0' }));
+  await writeFile(join(dir, '.node-version'), 'v24.11.0\n');
   await writeFile(join(dir, 'pnpm-lock.yaml'), "lockfileVersion: '9.0'\n");
 
   const git = spawnSync('git', ['init', '-q'], { cwd: dir, encoding: 'utf8' });
@@ -46,4 +47,54 @@ test('package validation rejects a tracked local secret file', async () => {
   const result = spawnSync(process.execPath, [validator], { cwd, encoding: 'utf8' });
   assert.notEqual(result.status, 0);
   assert.match(`${result.stderr}\n${result.stdout}`, /tracked local secret/i);
+});
+
+test('package validation still rejects a missing generated artifact', async () => {
+  const cwd = await makeWorkspace();
+  const { rm } = await import('node:fs/promises');
+  await rm(join(cwd, 'main.js'));
+  const result = spawnSync(process.execPath, [validator], { cwd, encoding: 'utf8' });
+  assert.notEqual(result.status, 0);
+  assert.match(`${result.stderr}\n${result.stdout}`, /main\.js|release artifact/i);
+});
+
+
+test('package validation rejects symlinked generated artifacts when symlinks are available', async t => {
+  const cwd = await makeWorkspace();
+  const target = join(cwd, 'real-main.js');
+  await writeFile(target, 'console.log("outside")\n');
+  await rm(join(cwd, 'main.js'));
+  try {
+    await symlink(target, join(cwd, 'main.js'), 'file');
+  } catch (error) {
+    if (['EPERM', 'EACCES', 'ENOSYS'].includes(error?.code)) {
+      t.skip(`symlink creation unavailable: ${error.code}`);
+      return;
+    }
+    throw error;
+  }
+  const result = spawnSync(process.execPath, [validator], { cwd, encoding: 'utf8' });
+  assert.notEqual(result.status, 0);
+  assert.match(`${result.stderr}\n${result.stdout}`, /non-regular release artifact|main\.js/i);
+});
+
+test('package validation rejects a symlinked canonical lockfile when symlinks are available', async t => {
+  const cwd = await makeWorkspace();
+  const target = join(cwd, 'real-lock.yaml');
+  await writeFile(target, "lockfileVersion: '9.0'\n");
+  await rm(join(cwd, 'pnpm-lock.yaml'));
+  try {
+    await symlink(target, join(cwd, 'pnpm-lock.yaml'), 'file');
+  } catch (error) {
+    if (['EPERM', 'EACCES', 'ENOSYS'].includes(error?.code)) {
+      t.skip(`symlink creation unavailable: ${error.code}`);
+      return;
+    }
+    throw error;
+  }
+  const add = spawnSync('git', ['add', '--', 'pnpm-lock.yaml'], { cwd, encoding: 'utf8' });
+  assert.equal(add.status, 0, add.stderr || add.stdout);
+  const result = spawnSync(process.execPath, [validator], { cwd, encoding: 'utf8' });
+  assert.notEqual(result.status, 0);
+  assert.match(`${result.stderr}\n${result.stdout}`, /pnpm-lock\.yaml.*regular file/i);
 });

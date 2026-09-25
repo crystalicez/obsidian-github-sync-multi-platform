@@ -84,12 +84,34 @@ test("unreadable default ref fails closed", async () => {
   ])), /Git-ref read capability/u)
 })
 
-test("exact disposable 404 is accepted only after default-ref capability", async () => {
+test("exact disposable 404 is accepted only after a second target proof and absence read", async () => {
   const resolved = await resetGitHubE2EDisposableBranch(base, scriptedFetch([
+    ...resolvedSteps(),
+    { path: exactReadPath, status: 404, body: { message: "Not Found" } },
     ...resolvedSteps(),
     { path: exactReadPath, status: 404, body: { message: "Not Found" } },
   ]))
   assert.equal(resolved.repositoryId, "222")
+})
+
+test("early absence is re-proved and a recreated disposable branch is still deleted", async () => {
+  let deleteSeen = false
+  const scripted = scriptedFetch([
+    ...resolvedSteps(),
+    { path: exactReadPath, status: 404, body: { message: "Not Found" } },
+    ...resolvedSteps(),
+    { path: exactReadPath, status: 200, body: { object: { sha: "a".repeat(40) } } },
+    { method: "DELETE", path: exactDeletePath, status: 204 },
+    ...resolvedSteps(),
+    { path: exactReadPath, status: 404, body: { message: "Not Found" } },
+  ])
+  const request: GitHubE2EFetch = async (url, init = {}) => {
+    if ((init.method ?? "GET").toUpperCase() === "DELETE") deleteSeen = true
+    return scripted(url, init)
+  }
+
+  await resetGitHubE2EDisposableBranch(base, request)
+  assert.equal(deleteSeen, true)
 })
 
 test("arbitrary 422 is not absence", async () => {
@@ -99,8 +121,10 @@ test("arbitrary 422 is not absence", async () => {
   ])), /Cannot inspect GitHub E2E disposable ref/u)
 })
 
-test("recognized 422 missing reference is absence after capability", async () => {
+test("recognized 422 missing reference still requires a second target proof and absence read", async () => {
   await resetGitHubE2EDisposableBranch(base, scriptedFetch([
+    ...resolvedSteps(),
+    { path: exactReadPath, status: 422, body: { message: "Reference does not exist" } },
     ...resolvedSteps(),
     { path: exactReadPath, status: 422, body: { message: "Reference does not exist" } },
   ]))
@@ -140,6 +164,17 @@ test("bounded absence polling can outlive three still-present observations", asy
     verificationTimeoutMs: 1_000,
     verificationPollMs: 1,
   })
+})
+
+test("credentialed environment rejects a malformed optional source repository ID", () => {
+  assert.throws(() => readGitHubE2ETargetEnvironment({
+    GITHUB_E2E_OWNER: "owner",
+    GITHUB_E2E_REPO: "repo",
+    GITHUB_E2E_BRANCH: "local-e2e",
+    GITHUB_E2E_TOKEN: "secret",
+    GITHUB_E2E_EXPECTED_REPO_ID: "222",
+    GITHUB_E2E_SOURCE_REPO_ID: "source-name",
+  }), /SOURCE_REPO_ID.*numeric|numeric.*source/i)
 })
 
 test("credentialed environment requires numeric expected repository ID", () => {

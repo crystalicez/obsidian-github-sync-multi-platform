@@ -8,15 +8,13 @@
 
 - Repository: `crystalicez/obsidian-github-sync-multi-platform`
 - Source of truth: GitHub
-- Active final integration branch: `child-d-immutable-git-read-fallback`
-- Child D PR: #7, stacked on Child C
-- Child C branch: `child-c-publication-race-conflict-recovery`
-- Child C PR: #6, stacked on `master`
-- Child C baseline: `f0cf947b66471ac15e1f2f3060473e3bb0206e91`
-- Latest code/test heads before the current handoff-document update:
-  - Child C: `73a35a67aaff69f9765c3a2005d035a0e7e12d04`
-  - Child D merge head: `af29c7c5339cfd552af577856c98cd2f0d446e00`
-- Do **not** assume the current branch HEAD equals the hashes above; this handoff file itself may advance the branch. Run `git rev-parse HEAD` after checkout.
+- Active final integration branch: `feature/local-release-qualification`
+- Active PR: #4, base `master`
+- PR #6 (`child-c-publication-race-conflict-recovery`) is merged to `master`.
+- PR #7 (`child-d-immutable-git-read-fallback`) is merged to `master`.
+- PR #4 mechanical restack merge commit: `4c74b8d05d03eae03dbc98fc684418bf7c98a5a3`.
+- Current PR #4 branch is ahead-only / `behind=0` relative to `master` and Ready for Review.
+- Do **not** assume the current branch HEAD equals a hash written here; this handoff file itself may advance the branch. Run `git rev-parse HEAD` after checkout.
 
 ## User instruction
 
@@ -71,7 +69,7 @@ The red-team findings discovered before final acceptance were addressed in sourc
 
 ### Child D — immutable Git read fallback
 
-Child D contains latest Child C as merge ancestry and remains an ahead-only stack relative to Child C.
+Child D was landed to `master` via PR #7. The implementation state below remains historical/reference context.
 
 Implementation:
 - Immutable 40-hex commit-SHA Contents 404 fallback is path-directed.
@@ -251,7 +249,121 @@ Current GitHub backlog survey:
 Integration progress:
 1. PR #6: **DONE**, merged to `master`.
 2. PR #7: **DONE**, retargeted, D-only diff verified, merged to `master`.
-3. PR #4: **NEXT**, resolve `feature/local-release-qualification` against the now-final master, re-run release/qualification verification, and merge if still valid.
+3. PR #4: **FINAL ACCEPTANCE GREEN / READY TO MERGE**. Branch is merged with current `master`, `behind=0`, mergeable, and Ready for Review. Fresh local acceptance is complete on tested head `c6e38c5b5057adedb445a82fb5768435d22cdb73` using exact Node `v24.11.0` + pnpm `9.12.3`.
+
+## PR #4 integration details
+
+Current PR #4 integration decisions and hardening:
+- Mechanical merge commit `4c74b8d05d03eae03dbc98fc684418bf7c98a5a3` restacked `feature/local-release-qualification` on master `25ea5f5116b98f2b2941da23b23cf022dbca5fcd`.
+- The original master/PR #4 overlap was only `docs/github-e2e.md`, `docs/releasing.md`, and `scripts/run-github-e2e.mjs`; the integration retained master's compiler/input-manifest pipeline and added the local qualification flow around it.
+- `GITHUB_E2E_EXPECTED_REPO_ID` is mandatory for local/manual destructive E2E.
+- Target safety is bound to numeric identity: target ID must match the configured expected ID and must differ from both the stable canonical source repository ID (`1282135059`) and the current checkout source repository ID.
+- Manual live E2E resolves the current checkout origin's numeric repository identity before target mutation; inability to prove source identity fails closed.
+- Target preflight also rejects the actual target default branch and requires that default Git ref to be readable.
+- Live-E2E/source credentials are separated: install/build/test/compile children get neither target E2E nor standard source/publication GitHub tokens; the live E2E child gets the dedicated E2E token with standard `GH_TOKEN`/`GITHUB_TOKEN`-family variables stripped.
+- Local qualification cleanup is restricted to the `obsidian-sync-e2e/local-` namespace, re-proves target identity/default-ref capability before every delete attempt, and accepts success only when a fresh exact branch read is absent **after** the final target proof. A regression test covers stale absence followed by branch recreation.
+- The shared live-E2E target-reset helper now applies the same principle to its early-absence path: an initial 404/recognized-missing response is re-proved against current target identity and re-read before reset success; if the branch reappears it is deleted and verified through the normal bounded path.
+- `GITHUB_E2E_SOURCE_REPO_ID`, when supplied to the live harness, must be a positive numeric GitHub repository ID; malformed optional source identity fails closed.
+- Qualification tag inspection now detects a pre-existing temp-ref collision and never unconditionally deletes a pre-existing local ref. Cleanup uses compare-and-delete against the SHA created by the invocation.
+- Release staging rejects symlinked/non-directory `.tmp` / `.tmp/release` ancestors and symlinked staging targets.
+- Release metadata, generated `main.js`, the canonical lockfile, and staged upload assets must be real non-empty regular files, not symlinks.
+- Deterministic ZIP entry names reject absolute paths, backslashes, empty segments, `.`, and `..` traversal shapes.
+- `.env.github-e2e.example` includes the mandatory numeric target repository ID.
+- Local stable publication is documented as the supported authority path; GitHub Actions Stable Release remains intentionally interlocked by the current workflow. PR #4 does not bypass or remove that interlock.
+- PR #4 is Ready for Review and remains the final integration target; the latest production-fix head before this handoff update is `572a69f40a84e125375cbd9f23de9b11649a1896`. Fresh exact-toolchain local execution evidence is still required before merge.
+
+### PR #4 verification constraint
+
+The AI sandbox still cannot clone/download the repository from GitHub because direct GitHub DNS access fails (`Could not resolve host: github.com`), the public web download bridge does not expose this fork/branch, and the GitHub connector does not provide a workflow-dispatch action. The repository CI workflow supports `push` / `pull_request` / `workflow_dispatch`, but connector-created commits currently produce no Actions run for this branch. Therefore:
+- static/code-path review and GitHub diff/ancestry checks can be done here;
+- final build/test/package proof must come from a fresh user-local run on the **current PR #4 head**;
+- do not merge PR #4 or claim it green until that evidence is reported.
+
+### 2026-09-26 PR #4 acceptance follow-up
+
+User acceptance on head `9f7efca7838cba3a901e4242f2250e90a8e6e028` exposed one focused/full feasibility failure:
+- `credentialed runner requires expected target repository ID before execution`
+- Windows/Node `v24.11.0` returned `3221226505` after the child printed the expected missing-ID preflight error plus a libuv `UV_HANDLE_CLOSING` assertion.
+
+Root cause review found a real ordering defect rather than treating the crash as environment-only: `scripts/run-github-e2e.mjs` resolved the current source repository through network `fetch()` before validating that all required local E2E configuration was present. Missing `GITHUB_E2E_EXPECTED_REPO_ID` therefore still opened network handles before the process exited.
+
+Fix:
+- commit `572a69f40a84e125375cbd9f23de9b11649a1896`
+- local origin route is still read first;
+- env file/config is loaded and `requireGitHubE2EConfig()` runs **before** any source-repository network lookup;
+- only a valid local config proceeds to source numeric-ID lookup and target remote preflight.
+
+The same acceptance log showed:
+- fast suite `419/419` PASS;
+- repeat fast suite completed 10/10 with `419/419` each;
+- recovery `43/43` PASS;
+- resource `11/11` PASS;
+- GitHub-E2E compile-only PASS;
+- producer input-manifest generation PASS;
+- package validation PASS.
+However that run used Node `v24.11.0`, while the release contract requires exact Node `v22.11.0`; the interactive pasted PowerShell also continued after thrown gate failures. Therefore the run is useful debugging evidence but **not final release acceptance**. A fresh stop-on-first-failure run on exact Node `v22.11.0` is still required after `572a69f...`.
+
+A subsequent stop-on-first-failure acceptance attempt on current head `68846941c8c00ce08382ee457c5c096527ad8fa0` verified:
+- branch/head sync succeeded;
+- working tree reached the expected PR #4 head;
+- toolchain guard stopped immediately because actual Node was still `v24.11.0` while `.node-version` requires `v22.11.0`;
+- no build/test gate ran after that mismatch, so this attempt adds no new code/test failure evidence.
+
+Historical note: the acceptance attempts above happened while the committed release contract still required Node `v22.11.0`. The user chose to move the repository's official exact runtime forward instead of installing a second Node version locally.
+
+### Node 24.11.0 exact-toolchain migration
+
+Current release/toolchain authority is now **Node `v24.11.0`**:
+- `.node-version` was changed from `v22.11.0` to `v24.11.0`;
+- release qualification/release logic remains exact-version fail-closed and reads the committed `.node-version`; no production algorithm needed a Node-specific fork;
+- feasibility/V4 release metadata tests that intentionally pin the exact runtime were updated to `v24.11.0`;
+- release design/plan/runbook examples were updated to the new exact runtime;
+- GitHub workflows already consume `.node-version` (or the exact CI-produced node-version value), so no workflow-specific hardcoded Node major change was required;
+- `@types/node` was intentionally not upgraded as part of this runtime migration: it is a compile-time dependency and changing it would add unrelated lockfile/type-surface churn. Final build/tests on Node 24 are the evidence that the current type/runtime combination remains valid.
+
+The user's current Windows installation already resolves `node.exe` from `C:\\Program Files\\nodejs\\node.exe` as `v24.11.0`, so no version-manager installation is required for the new contract.
+
+Fresh acceptance must now run on exact Node `v24.11.0` and pnpm `9.12.3` against the current PR #4 head. The earlier Node-24/libuv failure is **not** accepted as proof: it occurred before the preflight-ordering fix `572a69f40a84e125375cbd9f23de9b11649a1896`; the focused `github-e2e-compile-cli` regression must pass on the migrated toolchain before merge.
+
+### 2026-09-26 Node 24 acceptance progress
+
+The user ran a fresh non-destructive acceptance subset on exact code/test head `1d924d68d0e1ba8efc28ee54189e7e4fe8f66bd7` with:
+- Node `v24.11.0`;
+- pnpm `9.12.3`.
+
+Observed GREEN evidence:
+- focused `github-e2e-compile-cli`: 4/4 PASS, including the regression `credentialed runner requires expected target repository ID before execution`;
+- focused `release-metadata`: 9/9 PASS;
+- focused `local-qualify`: 9/9 PASS;
+- focused `local-release`: 37/37 PASS;
+- production build: PASS;
+- full feasibility suite: 138/138 PASS, 0 fail/cancel/skip/todo.
+
+This directly verifies the preflight-ordering fix on Node 24 and validates the Node-24 exact-toolchain migration across the release/E2E feasibility surface.
+
+Final acceptance is now GREEN.
+
+Fresh user-local evidence on exact branch head `c6e38c5b5057adedb445a82fb5768435d22cdb73` with Node `v24.11.0` and pnpm `9.12.3`:
+- full fast suite: 419/419 PASS;
+- repeat fast suite: 10/10 complete, each run 419/419 PASS;
+- recovery suite: 43/43 PASS;
+- resource suite: 11/11 PASS;
+- release metadata validation: PASS;
+- GitHub-E2E compile-only: PASS for all 3 bundles;
+- CI producer input-manifest path: PASS;
+- package validation: PASS;
+- final clean-tree/head integrity check: PASS;
+- terminal acceptance banner reached without an intervening gate failure.
+
+Combined with the prior Node-24 acceptance subset:
+- focused `github-e2e-compile-cli`: 4/4 PASS;
+- focused `release-metadata`: 9/9 PASS;
+- focused `local-qualify`: 9/9 PASS;
+- focused `local-release`: 37/37 PASS;
+- production build: PASS;
+- full feasibility suite: 138/138 PASS.
+
+Therefore PR #4 has complete non-destructive release-grade acceptance evidence for the integrated Node-24 toolchain. Do not rerun solely because this handoff markdown commit advances the branch head; this update is documentation-only and records the tested SHA above.
 
 ## Known housekeeping
 
@@ -259,14 +371,14 @@ The previously noted temporary branch `tmp-ignore` is no longer present in the c
 
 ## Next action for a resumed session
 
-1. Read this file first.
-2. Fetch PR #6 and PR #7 metadata and current heads from GitHub; do not trust old hashes blindly.
-3. Confirm Child D is still ahead-only / behind=0 relative to Child C.
-4. Acceptance is green. Do **not** make further correctness changes unless a new failure, review finding, or user request appears.
-5. Preserve the stack: PR #7 remains on top of PR #6 until the user chooses the merge/integration sequence.
-6. If local E2E compile verification is repeated outside CI, use compile-only **without** `--write-input-manifest`; manifest creation requires GitHub Actions producer environment fields.
-7. Known housekeeping remains: delete remote branch `tmp-ignore` when convenient.
-8. If any source/test/design/branch/verification state changes, update this file before ending the session.
+1. Read this file first and fetch PR #4 metadata/current head from GitHub.
+2. Confirm `feature/local-release-qualification` is still `behind=0` and mergeable against `master`.
+3. Do not make new correctness changes unless final static audit or execution output exposes a concrete failure.
+4. Run/obtain the final PR #4 acceptance gate on the current head using exact Node `v24.11.0` + pnpm `9.12.3`: focused local-release/E2E feasibility tests, build, full fast/repeat/recovery/resource/feasibility suites, GitHub-E2E compile + producer-manifest path, and package validation.
+5. If any gate fails, debug the specific failure before merging.
+6. If all final gates are freshly green, update this handoff with exact observed counts/head SHA, merge PR #4 to `master`, verify the merged result, then audit historical remote branches for unique work before deleting only branches proven obsolete.
+7. Do not run destructive live GitHub E2E or `release:local` merely as an acceptance test.
+8. Any material code/test/design/branch/verification change must update this file before handoff.
 
 ## Relevant design / plan docs
 
@@ -277,5 +389,5 @@ The previously noted temporary branch `tmp-ignore` is no longer present in the c
 
 ## Last updated
 
-- 2026-09-25 (Asia/Bangkok)
-- Reason: record PR #6 and PR #7 fully landed; PR #4 is the remaining integration target.
+- 2026-09-26 (Asia/Bangkok)
+- Reason: record the Node v24.11.0 exact-toolchain migration and the remaining fresh execution gate before PR #4 merge.
