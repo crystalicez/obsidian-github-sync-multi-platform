@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -128,4 +128,47 @@ test("repeated packaging is byte-identical across time zones", async () => {
 test("rejects invalid versions before deriving a staging target", async () => {
   const f = await fixture();
   await assert.rejects(() => packagePlugin({ cwd: f.cwd, version: "../escape" }), /version/i);
+});
+
+
+test("release staging refuses a non-directory repository temp root", async () => {
+  const f = await fixture();
+  await writeFile(join(f.cwd, ".tmp"), "not a directory\n");
+  await assert.rejects(() => packagePlugin({ cwd: f.cwd, version: "1.0.8" }), /temp root.*real directory|temp root/i);
+});
+
+test("release staging refuses symlinked temp ancestors when the platform permits symlinks", async t => {
+  const f = await fixture();
+  const outside = await mkdtemp(join(tmpdir(), "package-plugin-outside-"));
+  try {
+    try {
+      await symlink(outside, join(f.cwd, ".tmp"), process.platform === "win32" ? "junction" : "dir");
+    } catch (error) {
+      if (["EPERM", "EACCES", "ENOSYS"].includes(error?.code)) {
+        t.skip(`symlink creation unavailable: ${error.code}`);
+        return;
+      }
+      throw error;
+    }
+    await assert.rejects(() => packagePlugin({ cwd: f.cwd, version: "1.0.8" }), /temp root.*real directory|symbolic link/i);
+  } finally {
+    await rm(outside, { recursive: true, force: true });
+  }
+});
+
+test("packaging refuses a symlinked generated main.js when the platform permits symlinks", async t => {
+  const f = await fixture();
+  const secret = join(f.cwd, "secret-build-source.txt");
+  await writeFile(secret, "must not be packaged\n");
+  await rm(join(f.cwd, "main.js"));
+  try {
+    await symlink(secret, join(f.cwd, "main.js"), "file");
+  } catch (error) {
+    if (["EPERM", "EACCES", "ENOSYS"].includes(error?.code)) {
+      t.skip(`symlink creation unavailable: ${error.code}`);
+      return;
+    }
+    throw error;
+  }
+  await assert.rejects(() => packagePlugin({ cwd: f.cwd, version: "1.0.8" }), /main\.js.*regular file/i);
 });
