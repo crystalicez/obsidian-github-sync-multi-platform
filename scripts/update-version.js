@@ -10,6 +10,10 @@ const fs = require('fs');
 const path = require('path');
 
 function readJson(filePath) {
+    const info = fs.lstatSync(filePath);
+    if (!info.isFile() || info.isSymbolicLink() || info.size === 0) {
+        throw new Error(`${path.basename(filePath)} must be a non-empty regular file`);
+    }
     return JSON.parse(fs.readFileSync(filePath, 'utf8'));
 }
 
