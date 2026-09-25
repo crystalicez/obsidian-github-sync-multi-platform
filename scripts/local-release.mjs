@@ -9,6 +9,7 @@ import {
   runCommand,
   runPnpmGate,
   validateQualificationReceipt,
+  withoutAnyGitHubTokens,
   withoutGitHubE2EToken,
 } from "./local-release-lib.mjs";
 import {
@@ -147,6 +148,7 @@ export async function releaseLocal({
   const s = { ...DEFAULT_SERVICES, ...services };
   const phase = name => onProgress({ phase: name });
   const releaseEnv = withoutGitHubE2EToken(env);
+  const gateEnv = withoutAnyGitHubTokens(env);
   const releaseRunner = (command, args, options = {}) => runner(command, args, { ...options, env: releaseEnv });
 
   phase("preflight");
@@ -154,7 +156,7 @@ export async function releaseLocal({
   s.requireCanonicalOriginEndpoints({ runner: releaseRunner, cwd });
   if (s.readRemoteMasterSha({ runner: releaseRunner, cwd }) !== sha) throw new Error("Remote master does not equal local HEAD");
   const metadata = s.validateReleaseMetadata(await s.readReleaseMetadata(cwd), { requestedVersion: version });
-  const runtimePnpmVersion = s.readPnpmVersion({ runner: releaseRunner, cwd, env: releaseEnv, platform, comspec });
+  const runtimePnpmVersion = s.readPnpmVersion({ runner: releaseRunner, cwd, env: gateEnv, platform, comspec });
   requireExactToolchain(metadata, { runtimeNodeVersion, runtimePnpmVersion });
   s.requireGithubPublicationAuth({ runner: releaseRunner, repo: CANONICAL_REPOSITORY, env: releaseEnv, cwd });
 
@@ -181,7 +183,7 @@ export async function releaseLocal({
 
   phase("publication-gates");
   for (const gate of PUBLICATION_GATES) {
-    const result = s.runPnpmGate(gate, { cwd, env: releaseEnv, platform, comspec, runner: releaseRunner });
+    const result = s.runPnpmGate(gate, { cwd, env: gateEnv, platform, comspec, runner: releaseRunner });
     requireSuccess(result, `Publication gate ${gate}`);
   }
 
@@ -197,7 +199,7 @@ export async function releaseLocal({
     s.requireCanonicalOriginEndpoints({ runner: releaseRunner, cwd });
     if (s.readRemoteMasterSha({ runner: releaseRunner, cwd }) !== sha) throw new Error("Remote master changed during release");
     const currentMetadata = s.validateReleaseMetadata(await s.readReleaseMetadata(cwd), { requestedVersion: version });
-    const currentPnpm = s.readPnpmVersion({ runner: releaseRunner, cwd, env: releaseEnv, platform, comspec });
+    const currentPnpm = s.readPnpmVersion({ runner: releaseRunner, cwd, env: gateEnv, platform, comspec });
     requireExactToolchain(currentMetadata, { runtimeNodeVersion, runtimePnpmVersion: currentPnpm });
     const qualification = validateQualificationState(
       s.fetchAndInspectObservedQualificationTag({ runner: releaseRunner, cwd, ref: qualificationRef }),
