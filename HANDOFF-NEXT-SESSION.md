@@ -249,7 +249,7 @@ Current GitHub backlog survey:
 Integration progress:
 1. PR #6: **DONE**, merged to `master`.
 2. PR #7: **DONE**, retargeted, D-only diff verified, merged to `master`.
-3. PR #4: **IN PROGRESS / FINAL GATE**. Branch is merged with current `master`, `behind=0`, mergeable, and Ready for Review. Static integration/security hardening is complete enough to freeze code pending fresh execution verification. GitHub Actions has produced **no workflow run for connector-created PR #4 heads**, so do not claim final green until the acceptance commands are run on the current branch head.
+3. PR #4: **FINAL ACCEPTANCE GREEN / READY TO MERGE**. Branch is merged with current `master`, `behind=0`, mergeable, and Ready for Review. Fresh local acceptance is complete on tested head `c6e38c5b5057adedb445a82fb5768435d22cdb73` using exact Node `v24.11.0` + pnpm `9.12.3`.
 
 ## PR #4 integration details
 
@@ -341,18 +341,29 @@ Observed GREEN evidence:
 
 This directly verifies the preflight-ordering fix on Node 24 and validates the Node-24 exact-toolchain migration across the release/E2E feasibility surface.
 
-Remaining fresh gates before PR #4 merge:
-- full fast suite;
-- repeat fast suite (10x);
-- recovery suite;
-- resource suite;
-- release metadata validation command;
-- GitHub-E2E compile-only command;
-- CI producer input-manifest path on Node 24;
-- package validation;
-- final clean-tree/head integrity check.
+Final acceptance is now GREEN.
 
-The handoff update recording this result is documentation-only. If it advances the branch head, the code/test tree proven above is still `1d924d68...`; do not invalidate that evidence merely because the handoff markdown changed.
+Fresh user-local evidence on exact branch head `c6e38c5b5057adedb445a82fb5768435d22cdb73` with Node `v24.11.0` and pnpm `9.12.3`:
+- full fast suite: 419/419 PASS;
+- repeat fast suite: 10/10 complete, each run 419/419 PASS;
+- recovery suite: 43/43 PASS;
+- resource suite: 11/11 PASS;
+- release metadata validation: PASS;
+- GitHub-E2E compile-only: PASS for all 3 bundles;
+- CI producer input-manifest path: PASS;
+- package validation: PASS;
+- final clean-tree/head integrity check: PASS;
+- terminal acceptance banner reached without an intervening gate failure.
+
+Combined with the prior Node-24 acceptance subset:
+- focused `github-e2e-compile-cli`: 4/4 PASS;
+- focused `release-metadata`: 9/9 PASS;
+- focused `local-qualify`: 9/9 PASS;
+- focused `local-release`: 37/37 PASS;
+- production build: PASS;
+- full feasibility suite: 138/138 PASS.
+
+Therefore PR #4 has complete non-destructive release-grade acceptance evidence for the integrated Node-24 toolchain. Do not rerun solely because this handoff markdown commit advances the branch head; this update is documentation-only and records the tested SHA above.
 
 ## Known housekeeping
 
