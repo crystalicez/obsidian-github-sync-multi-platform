@@ -118,7 +118,7 @@ Stack integration:
 
 ## Verification status
 
-**Do not claim the implementation is fully verified yet.**
+**GREEN — acceptance completed on 2026-09-25.**
 
 ### User acceptance run on 2026-09-25
 
@@ -176,14 +176,28 @@ This third acceptance-remediation commit is test-only:
 - Child C: `73a35a67aaff69f9765c3a2005d035a0e7e12d04`
 - merged into Child D: `af29c7c5339cfd552af577856c98cd2f0d446e00`
 
-No production source changed in the acceptance-remediation rounds. The latest tree still needs the same final `settings-secrets`, fast, and repeat rerun before it can be called green.
+No production source changed in the acceptance-remediation rounds.
 
-At the time of this handoff:
-- GitHub combined status checks for Child C and Child D were empty (`statuses: []`).
-- The AI sandbox could not resolve `github.com` for a checkout.
-- The sandbox did not have `pnpm` installed.
-- Therefore the full repository verification suite has not been run by the AI on the final stacked tree.
-- The user was asked to run the acceptance suite locally and return any failure output.
+### Final green acceptance
+
+The user reran the final corrected Child D head `29406e9235c1484b919d835ecfb2ed00a6b92d9d` and reported:
+- `settings-secrets` targeted fast suite: **35/35 PASS**;
+- full fast suite: **419/419 PASS**;
+- repeat runner: **10/10 complete repeats**, each **419/419 PASS**;
+- zero failures, cancellations, skips, or todos in the final repeat summaries.
+
+Earlier acceptance gates on the same production implementation had already passed:
+- production build: PASS;
+- recovery: 43/43 PASS;
+- resource: 11/11 PASS;
+- feasibility: 37/37 PASS;
+- package validation: PASS;
+- targeted publication/recovery/cancellation/bootstrap/encrypted-winner/mutation-race/logging/immutable-read regressions: PASS after expectation/harness corrections;
+- local GitHub E2E compile-only without manifest generation: PASS for all three bundles.
+
+Only test/harness and handoff-document commits changed after those earlier production gates; production source did not change. Therefore the final stacked implementation is accepted green.
+
+The AI sandbox itself still cannot independently checkout/run the repository because direct GitHub DNS/pnpm availability is constrained, so the authoritative green evidence is the user's local acceptance run recorded above.
 
 ### Acceptance gate
 
@@ -239,16 +253,11 @@ The connector available to the AI session did not expose a delete-ref action, so
 1. Read this file first.
 2. Fetch PR #6 and PR #7 metadata and current heads from GitHub; do not trust old hashes blindly.
 3. Confirm Child D is still ahead-only / behind=0 relative to Child C.
-4. Current immediate next step: rerun only the final corrected surface on the latest Child D head:
-   - `node scripts/run-tests.mjs --tier=fast --filter=settings-secrets`
-   - `pnpm test`
-   - `pnpm test:repeat`.
-   The prior rerun already proved the other corrected targeted suites and local E2E compile-only path green.
-5. For local E2E compile verification, use compile-only **without** `--write-input-manifest`; manifest creation is CI-producer validation and requires GitHub Actions environment fields.
-6. If the user supplies new acceptance output:
-   - on failure: use systematic debugging, fix the smallest demonstrated root cause, push to GitHub, update this file;
-   - on success: record exact commands/results in this file, then proceed with integration decision only when the user requests it.
-7. If any source/test/design/branch state changes, update this file before ending the session.
+4. Acceptance is green. Do **not** make further correctness changes unless a new failure, review finding, or user request appears.
+5. Preserve the stack: PR #7 remains on top of PR #6 until the user chooses the merge/integration sequence.
+6. If local E2E compile verification is repeated outside CI, use compile-only **without** `--write-input-manifest`; manifest creation requires GitHub Actions producer environment fields.
+7. Known housekeeping remains: delete remote branch `tmp-ignore` when convenient.
+8. If any source/test/design/branch/verification state changes, update this file before ending the session.
 
 ## Relevant design / plan docs
 
@@ -260,4 +269,4 @@ The connector available to the AI session did not expose a delete-ref action, so
 ## Last updated
 
 - 2026-09-25 (Asia/Bangkok)
-- Reason: record the third acceptance run, identify the synthetic-external-competitor mtime artifact, and record the async plugin-valid competitor harness correction.
+- Reason: record final green acceptance: settings-secrets 35/35, fast 419/419, and repeat 10/10 with 419/419 on every repeat.
