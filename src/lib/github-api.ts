@@ -1,6 +1,7 @@
 import { requestUrl, type RequestUrlParam, type RequestUrlResponse } from "obsidian";
 import { fromBase64, toBase64, toHex, utf8ToBytes } from "./bytes";
 import type { GitHubCreateTreeEntry, GitHubGitCommit, GitHubGitRef } from "./github-git-types";
+import { V4RepositoryBootstrapRaceError } from "./v4/bootstrap-race";
 import {
   canRetryV4MutationAfterUnknownOutcome,
   classifyV4MutationFailure,
@@ -18,6 +19,7 @@ import {
 import { V4RequestScheduler } from "./v4/request-scheduler";
 import { V4TransportMetrics, type V4TransportMetricsSnapshot } from "./v4/transport-metrics";
 import { resolveV4TransportPolicy, type V4TransportPolicy } from "./v4/transport-policy";
+import { readImmutableGitFile } from "./v4/immutable-git-read";
 
 const V4_BOOTSTRAP_PATH = ".obsidian-github-sync-v4/bootstrap";
 const GIT_COMMIT_SHA = /^[0-9a-f]{40}$/iu;
@@ -40,7 +42,7 @@ export interface GitHubClientOptions {
 export interface GitHubTreeNode {
   path: string;
   mode: string;
-  type: "blob" | "tree";
+  type: "blob" | "tree" | "commit";
   sha: string;
   size?: number;
   url: string;
@@ -185,15 +187,11 @@ export class GitHubClient {
   }
 
   private async getImmutableFileFromTree(path: string, commitSha: string): Promise<{ bytes: Uint8Array; sha: string } | null> {
-    const commit = await this.getGitCommit(commitSha);
-    if (!commit.treeSha) throw new Error(`GitHub immutable commit has no tree SHA: ${commitSha}`);
-    const tree = await this.getTreeAt(commit.treeSha, true);
-    const node = tree.tree.find(candidate => candidate.type === "blob" && candidate.path === path);
-    if (node) return { bytes: await this.getBlob(node.sha), sha: node.sha };
-    if (tree.truncated) {
-      throw new Error(`GitHub immutable tree is truncated while confirming a Contents 404 for ${path}.`);
-    }
-    return null;
+    return readImmutableGitFile(path, commitSha, {
+      getCommit: sha => this.getGitCommit(sha),
+      getTree: treeSha => this.getTreeAt(treeSha, false),
+      getBlob: blobSha => this.getBlob(blobSha),
+    });
   }
 
   async getFileBytes(path: string, ref = this.config.branch): Promise<{ bytes: Uint8Array; sha: string } | null> {
@@ -377,7 +375,16 @@ export class GitHubClient {
         commitSha = (response.json as { commit?: { sha?: string } }).commit?.sha;
         if (!commitSha) throw new Error("GitHub bootstrap response is missing its commit SHA.");
       } catch (error) {
-        if (!(error instanceof V4GitMutationOutcomeUnknownError)) throw error;
+        if (!(error instanceof V4GitMutationOutcomeUnknownError)) {
+          const status = (error as { status?: number }).status;
+          if (status === 409 || status === 422) {
+            let observed: GitHubGitRef | null;
+            try { observed = await this.inspectAnyGitRef(); }
+            catch { throw error; }
+            if (observed?.sha) throw new V4RepositoryBootstrapRaceError(observed.sha, error);
+          }
+          throw error;
+        }
         const observed = await this.inspectAnyGitRef();
         if (observed?.sha) commitSha = observed.sha;
         else if (attempt === 2) throw error;

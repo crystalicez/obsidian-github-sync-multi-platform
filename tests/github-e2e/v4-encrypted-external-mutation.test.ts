@@ -8,29 +8,17 @@ import { deriveV4Keyring } from "../../src/lib/v4/crypto";
 import { createEmptyV4LocalIndex } from "../../src/lib/v4/local-index";
 import { expectedV4PathLayout, V4_FORMAT_VERSION, type V4RemoteConfig } from "../../src/lib/v4/protocol-types";
 import { V4SyncSession, type V4SessionVault } from "../../src/lib/v4/sync-session";
+import {
+  encodeGitHubE2ERefPath,
+  readGitHubE2ETargetEnvironment,
+  resetGitHubE2EDisposableBranch,
+  resolveGitHubE2ETarget,
+} from "./support/target-safety";
 
-const forbiddenBranches = new Set(["main", "master", "production", "prod", "release", "stable"]);
 const encoder = new TextEncoder();
 
-function requiredEnv(name: string): string {
-  const value = process.env[name];
-  if (!value) throw new Error(`Missing required env var: ${name}`);
-  return value;
-}
-
-function configFromEnv(): GitHubConfig {
-  const branch = requiredEnv("GITHUB_E2E_BRANCH");
-  if (forbiddenBranches.has(branch.toLowerCase())) throw new Error(`Refusing destructive GitHub E2E branch: ${branch}`);
-  return {
-    owner: requiredEnv("GITHUB_E2E_OWNER"),
-    repo: requiredEnv("GITHUB_E2E_REPO"),
-    branch,
-    token: requiredEnv("GITHUB_E2E_TOKEN"),
-  };
-}
-
 function branchPath(config: GitHubConfig): string {
-  return config.branch.split("/").map(encodeURIComponent).join("/");
+  return encodeGitHubE2ERefPath(config.branch);
 }
 
 async function githubRequest(config: GitHubConfig, apiPath: string, init: RequestInit = {}): Promise<Response> {
@@ -40,7 +28,7 @@ async function githubRequest(config: GitHubConfig, apiPath: string, init: Reques
       Authorization: `Bearer ${config.token}`,
       Accept: "application/vnd.github+json",
       "Content-Type": "application/json",
-      "X-GitHub-Api-Version": "2022-11-28",
+      "X-GitHub-Api-Version": "2026-03-10",
       ...(init.headers ?? {}),
     },
   });
@@ -79,23 +67,6 @@ async function readBranchHead(config: GitHubConfig): Promise<string | null> {
   if (response.status === 404) return null;
   const ref = await expectJson<{ object?: { sha?: string } }>(response, [200], "Cannot read E2E branch head");
   return ref.object?.sha ?? null;
-}
-
-async function deleteTestBranch(config: GitHubConfig): Promise<void> {
-  const repository = await expectJson<{ default_branch: string }>(await githubRequest(config, ""), [200], "Cannot inspect E2E repository");
-  if (repository.default_branch === config.branch) throw new Error("GITHUB_E2E_BRANCH must not be the repository default branch.");
-
-  const response = await githubRequest(config, `/git/refs/heads/${branchPath(config)}`, { method: "DELETE" });
-  if (![204, 404, 422].includes(response.status)) {
-    throw new Error(`Cannot delete E2E branch: HTTP ${response.status} ${await response.text()}`);
-  }
-  await response.arrayBuffer().catch(() => undefined);
-
-  for (let attempt = 0; attempt < 40; attempt++) {
-    if ((await readBranchHead(config)) === null) return;
-    await new Promise(resolve => setTimeout(resolve, 250));
-  }
-  throw new Error(`Timed out deleting E2E branch ${config.branch}`);
 }
 
 async function publishExternalCommit(config: GitHubConfig, marker: string): Promise<string> {
@@ -184,19 +155,21 @@ class MemoryVault implements V4SessionVault {
   }
 }
 
-const config = configFromEnv();
+const targetEnvironment = readGitHubE2ETargetEnvironment();
+const initialTarget = await resolveGitHubE2ETarget(targetEnvironment);
+const config = initialTarget.config;
 installRequestUrlBridge();
 
 after(async () => {
   try {
-    await deleteTestBranch(config);
+    await resetGitHubE2EDisposableBranch(targetEnvironment);
   } finally {
     setRequestUrlHandler(null);
   }
 });
 
 test("encrypted V4 refuses an out-of-band GitHub commit without silently overwriting it", { timeout: 180_000 }, async () => {
-  await deleteTestBranch(config);
+  await resetGitHubE2EDisposableBranch(targetEnvironment);
   const repoId = `${config.owner}/${config.repo}#${config.branch}`;
   const salt = randomBytes(16);
   const remoteConfig: V4RemoteConfig = {

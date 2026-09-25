@@ -6,32 +6,21 @@ import { GitHubClient, type GitHubConfig } from "../../src/lib/github-api";
 import { randomBytes, toBase64Url } from "../../src/lib/bytes";
 import { deriveV4Keyring, type V4Keyring } from "../../src/lib/v4/crypto";
 import { createEmptyV4LocalIndex, type V4LocalIndex } from "../../src/lib/v4/local-index";
+import { isV4PublicationRaceError } from "../../src/lib/v4/publication-race";
 import { expectedV4PathLayout, V4_FORMAT_VERSION, type V4RemoteConfig, type V4StorageMode } from "../../src/lib/v4/protocol-types";
 import { V4SyncSession, type V4SessionVault, type V4SyncRunState } from "../../src/lib/v4/sync-session";
+import {
+  encodeGitHubE2ERefPath,
+  readGitHubE2ETargetEnvironment,
+  resetGitHubE2EDisposableBranch,
+  resolveGitHubE2ETarget,
+} from "./support/target-safety";
 
-const forbiddenBranches = new Set(["main", "master", "production", "prod", "release", "stable"]);
 const encoder = new TextEncoder();
 type E2ESession = Pick<V4SyncSession, "sync">;
 
-function requiredEnv(name: string): string {
-  const value = process.env[name];
-  if (!value) throw new Error(`Missing required env var: ${name}`);
-  return value;
-}
-
-function configFromEnv(): GitHubConfig {
-  const branch = requiredEnv("GITHUB_E2E_BRANCH");
-  if (forbiddenBranches.has(branch.toLowerCase())) throw new Error(`Refusing destructive GitHub E2E branch: ${branch}`);
-  return {
-    owner: requiredEnv("GITHUB_E2E_OWNER"),
-    repo: requiredEnv("GITHUB_E2E_REPO"),
-    branch,
-    token: requiredEnv("GITHUB_E2E_TOKEN"),
-  };
-}
-
 function branchPath(config: GitHubConfig): string {
-  return config.branch.split("/").map(encodeURIComponent).join("/");
+  return encodeGitHubE2ERefPath(config.branch);
 }
 
 async function githubRequest(config: GitHubConfig, apiPath: string, init: RequestInit = {}): Promise<Response> {
@@ -57,17 +46,6 @@ function installRequestUrlBridge(): void {
     try { json = text ? JSON.parse(text) : undefined; } catch { json = undefined; }
     return { status: response.status, headers: Object.fromEntries(response.headers.entries()), text, json, arrayBuffer };
   });
-}
-
-async function deleteTestBranch(config: GitHubConfig): Promise<void> {
-  const repoResponse = await githubRequest(config, "");
-  if (!repoResponse.ok) throw new Error(`Cannot inspect E2E repo: HTTP ${repoResponse.status}`);
-  const repository = await repoResponse.json() as { default_branch: string };
-  if (repository.default_branch === config.branch) throw new Error("GITHUB_E2E_BRANCH must not be the repository default branch.");
-
-  const response = await githubRequest(config, `/git/refs/heads/${branchPath(config)}`, { method: "DELETE" });
-  if (![204, 404, 422].includes(response.status)) throw new Error(`Cannot delete E2E branch: HTTP ${response.status} ${await response.text()}`);
-  await response.arrayBuffer().catch(() => undefined);
 }
 
 class MemoryVault implements V4SessionVault {
@@ -133,7 +111,7 @@ function device(name: string, github: GitHubConfig, context: ModeContext, now?: 
         } catch (error) {
           lastError = error;
           const message = error instanceof Error ? error.message : String(error);
-          const retryable = options.operation === "normal" && /branch head changed|stale ref/i.test(message);
+          const retryable = options.operation === "normal" && isV4PublicationRaceError(error);
           if (!retryable || attempt === 3) throw error;
           runState.conflictCopyStages?.clear();
           console.warn(`Copy-contract E2E retrying normal sync after recoverable CAS race (attempt ${attempt + 1}/3): ${message}`);
@@ -155,17 +133,19 @@ function recordAt(index: V4LocalIndex, path: string) {
   return record;
 }
 
-const github = configFromEnv();
+const targetEnvironment = readGitHubE2ETargetEnvironment();
+const initialTarget = await resolveGitHubE2ETarget(targetEnvironment);
+const github = initialTarget.config;
 installRequestUrlBridge();
 
 after(async () => {
-  try { await deleteTestBranch(github); }
+  try { await resetGitHubE2EDisposableBranch(targetEnvironment); }
   finally { setRequestUrlHandler(null); }
 });
 
 test("real GitHub rename versus stale edit follows exact local-primary Copy contract", { timeout: 300_000 }, async () => {
   for (const mode of ["plaintext", "encrypted"] as const) {
-    await deleteTestBranch(github);
+    await resetGitHubE2EDisposableBranch(targetEnvironment);
     const context = await modeContext(mode, github);
     const a = device("device-a", github, context);
     const b = device("device-b", github, context, () => 515151);
