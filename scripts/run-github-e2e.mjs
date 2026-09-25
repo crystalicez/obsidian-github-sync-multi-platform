@@ -24,11 +24,11 @@ let liveEnv = process.env;
 if (!compileOnly) {
   try {
     const currentSourceRepo = readOriginFetchRepository({ runner: runCommand, cwd: root });
+    const loaded = await loadGitHubE2EEnv({ cwd: root, env: process.env });
+    const config = requireGitHubE2EConfig(loaded.env, { currentSourceRepo });
     const [sourceOwner, sourceRepo, ...extra] = currentSourceRepo.split("/");
     if (!sourceOwner || !sourceRepo || extra.length) throw new Error("Current source repository is malformed");
     const sourceIdentity = await readE2ERepository({ fetchImpl: fetch, owner: sourceOwner, repo: sourceRepo });
-    const loaded = await loadGitHubE2EEnv({ cwd: root, env: process.env });
-    const config = requireGitHubE2EConfig(loaded.env, { currentSourceRepo });
     await preflightE2ERemote({ fetchImpl: fetch, config: { ...config, currentSourceRepoId: sourceIdentity.id } });
     liveEnv = sanitizeGitHubE2ELiveEnv(loaded.env);
   } catch (error) {
