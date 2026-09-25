@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, writeFile } from 'node:fs/promises';
+import { mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -56,4 +56,45 @@ test('package validation still rejects a missing generated artifact', async () =
   const result = spawnSync(process.execPath, [validator], { cwd, encoding: 'utf8' });
   assert.notEqual(result.status, 0);
   assert.match(`${result.stderr}\n${result.stdout}`, /main\.js|release artifact/i);
+});
+
+
+test('package validation rejects symlinked generated artifacts when symlinks are available', async t => {
+  const cwd = await makeWorkspace();
+  const target = join(cwd, 'real-main.js');
+  await writeFile(target, 'console.log("outside")\n');
+  await rm(join(cwd, 'main.js'));
+  try {
+    await symlink(target, join(cwd, 'main.js'), 'file');
+  } catch (error) {
+    if (['EPERM', 'EACCES', 'ENOSYS'].includes(error?.code)) {
+      t.skip(`symlink creation unavailable: ${error.code}`);
+      return;
+    }
+    throw error;
+  }
+  const result = spawnSync(process.execPath, [validator], { cwd, encoding: 'utf8' });
+  assert.notEqual(result.status, 0);
+  assert.match(`${result.stderr}\n${result.stdout}`, /non-regular release artifact|main\.js/i);
+});
+
+test('package validation rejects a symlinked canonical lockfile when symlinks are available', async t => {
+  const cwd = await makeWorkspace();
+  const target = join(cwd, 'real-lock.yaml');
+  await writeFile(target, "lockfileVersion: '9.0'\n");
+  await rm(join(cwd, 'pnpm-lock.yaml'));
+  try {
+    await symlink(target, join(cwd, 'pnpm-lock.yaml'), 'file');
+  } catch (error) {
+    if (['EPERM', 'EACCES', 'ENOSYS'].includes(error?.code)) {
+      t.skip(`symlink creation unavailable: ${error.code}`);
+      return;
+    }
+    throw error;
+  }
+  const add = spawnSync('git', ['add', '--', 'pnpm-lock.yaml'], { cwd, encoding: 'utf8' });
+  assert.equal(add.status, 0, add.stderr || add.stdout);
+  const result = spawnSync(process.execPath, [validator], { cwd, encoding: 'utf8' });
+  assert.notEqual(result.status, 0);
+  assert.match(`${result.stderr}\n${result.stdout}`, /pnpm-lock\.yaml.*regular file/i);
 });
