@@ -1,12 +1,12 @@
-import { access, stat } from "node:fs/promises";
+import { access, lstat } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import { readReleaseMetadata, validateReleaseMetadata } from "./release-metadata.mjs";
 
 const required = ["main.js", "manifest.json", "styles.css"];
 for (const file of required) {
   await access(file);
-  const info = await stat(file);
-  if (!info.isFile() || info.size === 0) throw new Error(`Missing or empty release artifact: ${file}`);
+  const info = await lstat(file);
+  if (!info.isFile() || info.isSymbolicLink() || info.size === 0) throw new Error(`Missing, empty, or non-regular release artifact: ${file}`);
 }
 
 const metadata = await readReleaseMetadata(process.cwd());
@@ -21,6 +21,8 @@ function tracked(file) {
 }
 
 if (!tracked("pnpm-lock.yaml")) throw new Error("pnpm-lock.yaml must be tracked");
+const lockInfo = await lstat("pnpm-lock.yaml");
+if (!lockInfo.isFile() || lockInfo.isSymbolicLink() || lockInfo.size === 0) throw new Error("pnpm-lock.yaml must be a non-empty regular file");
 for (const alternate of ["package-lock.json", "yarn.lock"]) {
   if (tracked(alternate)) throw new Error(`Non-canonical lockfile is tracked: ${alternate}`);
 }
