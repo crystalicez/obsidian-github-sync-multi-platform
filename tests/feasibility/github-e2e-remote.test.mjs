@@ -126,8 +126,7 @@ test("cleanup deletes a present unique branch, verifies absence, and re-proves p
     repo(), ref(),
     response(200, { object: { sha: PRESENT_SHA } }),
     response(204),
-    response(404),
-    repo(), ref(),
+    repo(), ref(), response(404),
   ], calls);
   await cleanupE2EBranch({
     fetchImpl, owner: "test", repo: "repo", branch: "obsidian-sync-e2e/local-abc-run",
@@ -135,7 +134,7 @@ test("cleanup deletes a present unique branch, verifies absence, and re-proves p
   });
   assert.match(calls[2].url, /\/git\/ref\/heads\/obsidian-sync-e2e\/local-abc-run$/u);
   assert.equal(calls[3].options.method, "DELETE");
-  assert.match(calls[4].url, /\/git\/ref\/heads\/obsidian-sync-e2e\/local-abc-run$/u);
+  assert.match(calls[6].url, /\/git\/ref\/heads\/obsidian-sync-e2e\/local-abc-run$/u);
   assert.equal(fetchImpl.remaining(), 0);
 });
 
@@ -167,10 +166,10 @@ test("cleanup retries a failed server-side delete after verifying the branch rem
   const sleeps = [];
   const fetchImpl = fakeFetch([
     repo(), ref(),
-    response(200, { object: { sha: PRESENT_SHA } }), response(500), response(200, { object: { sha: PRESENT_SHA } }),
-    repo(), ref(),
-    response(200, { object: { sha: PRESENT_SHA } }), response(204), response(404),
-    repo(), ref(),
+    response(200, { object: { sha: PRESENT_SHA } }), response(500),
+    repo(), ref(), response(200, { object: { sha: PRESENT_SHA } }),
+    repo(), ref(), response(200, { object: { sha: PRESENT_SHA } }), response(204),
+    repo(), ref(), response(404),
   ]);
   await cleanupE2EBranch({
     fetchImpl, owner: "test", repo: "repo", branch: "obsidian-sync-e2e/local-retry", token: "secret", expectedRepoId: "123", currentSourceRepoId: "777",
@@ -182,10 +181,10 @@ test("cleanup retries a failed server-side delete after verifying the branch rem
 test("cleanup fails if the branch persists after bounded attempts", async () => {
   const present = () => response(200, { object: { sha: PRESENT_SHA } });
   const fetchImpl = fakeFetch([
-    repo(), ref(),
-    present(), response(204), present(),
-    repo(), ref(),
-    present(), response(204), present(),
+    repo(), ref(), present(), response(204),
+    repo(), ref(), present(),
+    repo(), ref(), present(), response(204),
+    repo(), ref(), present(),
   ]);
   await assert.rejects(() => cleanupE2EBranch({
     fetchImpl, owner: "test", repo: "repo", branch: "obsidian-sync-e2e/local-stuck", token: "secret", expectedRepoId: "123", currentSourceRepoId: "777",
@@ -196,7 +195,7 @@ test("cleanup fails if the branch persists after bounded attempts", async () => 
 test("cleanup fails closed if target identity changes during post-delete verification", async () => {
   const fetchImpl = fakeFetch([
     repo(), ref(),
-    response(200, { object: { sha: PRESENT_SHA } }), response(204), response(404),
+    response(200, { object: { sha: PRESENT_SHA } }), response(204),
     repo(999),
   ]);
   await assert.rejects(() => cleanupE2EBranch({
