@@ -270,7 +270,7 @@ Current PR #4 integration decisions and hardening:
 - Deterministic ZIP entry names reject absolute paths, backslashes, empty segments, `.`, and `..` traversal shapes.
 - `.env.github-e2e.example` includes the mandatory numeric target repository ID.
 - Local stable publication is documented as the supported authority path; GitHub Actions Stable Release remains intentionally interlocked by the current workflow. PR #4 does not bypass or remove that interlock.
-- PR #4 is Ready for Review, mergeable, and `behind=0`; the last code/test head before this handoff update is `a2153104152efb972581ed87798f55e7d1eb754c`. No workflow run exists for connector-created PR #4 heads, so fresh local execution evidence is still required before merge.
+- PR #4 is Ready for Review and remains the final integration target; the latest production-fix head before this handoff update is `572a69f40a84e125375cbd9f23de9b11649a1896`. Fresh exact-toolchain local execution evidence is still required before merge.
 
 ### PR #4 verification constraint
 
@@ -278,6 +278,30 @@ The AI sandbox still cannot clone/download the repository from GitHub because di
 - static/code-path review and GitHub diff/ancestry checks can be done here;
 - final build/test/package proof must come from a fresh user-local run on the **current PR #4 head**;
 - do not merge PR #4 or claim it green until that evidence is reported.
+
+### 2026-09-26 PR #4 acceptance follow-up
+
+User acceptance on head `9f7efca7838cba3a901e4242f2250e90a8e6e028` exposed one focused/full feasibility failure:
+- `credentialed runner requires expected target repository ID before execution`
+- Windows/Node `v24.11.0` returned `3221226505` after the child printed the expected missing-ID preflight error plus a libuv `UV_HANDLE_CLOSING` assertion.
+
+Root cause review found a real ordering defect rather than treating the crash as environment-only: `scripts/run-github-e2e.mjs` resolved the current source repository through network `fetch()` before validating that all required local E2E configuration was present. Missing `GITHUB_E2E_EXPECTED_REPO_ID` therefore still opened network handles before the process exited.
+
+Fix:
+- commit `572a69f40a84e125375cbd9f23de9b11649a1896`
+- local origin route is still read first;
+- env file/config is loaded and `requireGitHubE2EConfig()` runs **before** any source-repository network lookup;
+- only a valid local config proceeds to source numeric-ID lookup and target remote preflight.
+
+The same acceptance log showed:
+- fast suite `419/419` PASS;
+- repeat fast suite completed 10/10 with `419/419` each;
+- recovery `43/43` PASS;
+- resource `11/11` PASS;
+- GitHub-E2E compile-only PASS;
+- producer input-manifest generation PASS;
+- package validation PASS.
+However that run used Node `v24.11.0`, while the release contract requires exact Node `v22.11.0`; the interactive pasted PowerShell also continued after thrown gate failures. Therefore the run is useful debugging evidence but **not final release acceptance**. A fresh stop-on-first-failure run on exact Node `v22.11.0` is still required after `572a69f...`.
 
 ## Known housekeeping
 
