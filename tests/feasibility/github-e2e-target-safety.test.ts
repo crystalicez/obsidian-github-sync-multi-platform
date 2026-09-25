@@ -92,6 +92,26 @@ test("exact disposable 404 is accepted only after default-ref capability", async
   assert.equal(resolved.repositoryId, "222")
 })
 
+test("early absence is re-proved and a recreated disposable branch is still deleted", async () => {
+  let deleteSeen = false
+  const scripted = scriptedFetch([
+    ...resolvedSteps(),
+    { path: exactReadPath, status: 404, body: { message: "Not Found" } },
+    ...resolvedSteps(),
+    { path: exactReadPath, status: 200, body: { object: { sha: "a".repeat(40) } } },
+    { method: "DELETE", path: exactDeletePath, status: 204 },
+    ...resolvedSteps(),
+    { path: exactReadPath, status: 404, body: { message: "Not Found" } },
+  ])
+  const request: GitHubE2EFetch = async (url, init = {}) => {
+    if ((init.method ?? "GET").toUpperCase() === "DELETE") deleteSeen = true
+    return scripted(url, init)
+  }
+
+  await resetGitHubE2EDisposableBranch(base, request)
+  assert.equal(deleteSeen, true)
+})
+
 test("arbitrary 422 is not absence", async () => {
   await assert.rejects(resetGitHubE2EDisposableBranch(base, scriptedFetch([
     ...resolvedSteps(),
