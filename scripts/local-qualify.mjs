@@ -99,7 +99,7 @@ export async function qualifyLocal({
 
   const nonLiveEnv = withoutGitHubE2EToken(env);
   const gateEnv = withoutAnyGitHubTokens(env);
-  const nonLiveRunner = (command, args, options = {}) => runner(command, args, { ...options, env: nonLiveEnv });
+  const nonLiveRunner = (command, args, options = {}) => runner(command, args, { ...options, env: options.env ?? nonLiveEnv });
 
   const sha = requireCleanMaster({ runner: nonLiveRunner, cwd });
   requireCanonicalOriginEndpoints({ runner: nonLiveRunner, cwd });
