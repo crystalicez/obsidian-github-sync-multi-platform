@@ -311,6 +311,14 @@ A subsequent stop-on-first-failure acceptance attempt on current head `68846941c
 
 Next action remains unchanged: switch the maintainer shell to exact Node `v22.11.0`, confirm `node --version`, then rerun the full stop-on-first-failure acceptance block from the current PR #4 head.
 
+A follow-up Windows shell attempt confirmed:
+- `node.exe` currently resolves from `C:\\Program Files\\nodejs\\node.exe`;
+- actual Node remains `v24.11.0`;
+- the interactive `if / elseif / else` helper was pasted as separate PowerShell statements, so later `elseif` / `else` tokens were parsed as standalone commands and failed before any version-manager activation;
+- no repository build/test gate ran, so this adds no new repository failure evidence.
+
+Use independent version-manager commands (or one complete scriptblock) for the next activation attempt; do not paste separated `elseif` / `else` fragments interactively.
+
 ## Known housekeeping
 
 The previously noted temporary branch `tmp-ignore` is no longer present in the current remote branch listing, so no action is required for it.
