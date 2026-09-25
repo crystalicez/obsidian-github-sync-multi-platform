@@ -83,21 +83,24 @@ test("manual source detection permits non-canonical fork origin", () => {
 
 test("manual E2E may run from a fork but cannot target the fork itself", () => {
   assert.throws(() => validateGitHubE2EConfig({
-    owner: "fork-owner", repo: "obsidian-github-sync-multi-platform", branch: "e2e-destructive", token: "secret",
+    owner: "fork-owner", repo: "obsidian-github-sync-multi-platform", branch: "e2e-destructive", token: "secret", expectedRepoId: "123",
     currentSourceRepo: "fork-owner/obsidian-github-sync-multi-platform",
   }), /source repository/i);
 });
 
 test("manual E2E from a fork also rejects canonical source target case-insensitively", () => {
   assert.throws(() => validateGitHubE2EConfig({
-    owner: "CrystalIceZ", repo: "Obsidian-GitHub-Sync-Multi-Platform", branch: "e2e-destructive", token: "secret",
+    owner: "CrystalIceZ", repo: "Obsidian-GitHub-Sync-Multi-Platform", branch: "e2e-destructive", token: "secret", expectedRepoId: "123",
     currentSourceRepo: "fork-owner/obsidian-github-sync-multi-platform",
   }), /source repository/i);
 });
 
-test("E2E config rejects missing credentials and protected branches", () => {
-  assert.throws(() => validateGitHubE2EConfig({ owner: "owner", repo: "repo", branch: "main", token: "secret" }), /protected-looking/i);
-  assert.throws(() => validateGitHubE2EConfig({ owner: "owner", repo: "repo", branch: "e2e", token: "" }), /token/i);
+test("E2E config rejects missing credentials, invalid target IDs, and protected branches", () => {
+  assert.throws(() => validateGitHubE2EConfig({ owner: "owner", repo: "repo", branch: "main", token: "secret", expectedRepoId: "123" }), /protected-looking/i);
+  assert.throws(() => validateGitHubE2EConfig({ owner: "owner", repo: "repo", branch: "e2e", token: "", expectedRepoId: "123" }), /token/i);
+  assert.throws(() => validateGitHubE2EConfig({ owner: "owner", repo: "repo", branch: "e2e", token: "secret", expectedRepoId: "" }), /EXPECTED_REPO_ID/i);
+  assert.throws(() => validateGitHubE2EConfig({ owner: "owner", repo: "repo", branch: "e2e", token: "secret", expectedRepoId: "01" }), /EXPECTED_REPO_ID/i);
+  assert.equal(validateGitHubE2EConfig({ owner: "owner", repo: "repo", branch: "e2e", token: "secret", expectedRepoId: "123" }).expectedRepoId, "123");
 });
 
 test("env parser preserves shell-env-wins behavior", async () => {
