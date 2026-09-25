@@ -262,17 +262,19 @@ Current PR #4 integration decisions and hardening:
 - Target preflight also rejects the actual target default branch and requires that default Git ref to be readable.
 - Live-E2E/source credentials are separated: install/build/test/compile children get neither target E2E nor standard source/publication GitHub tokens; the live E2E child gets the dedicated E2E token with standard `GH_TOKEN`/`GITHUB_TOKEN`-family variables stripped.
 - Local qualification cleanup is restricted to the `obsidian-sync-e2e/local-` namespace, re-proves target identity/default-ref capability before every delete attempt, and accepts success only when a fresh exact branch read is absent **after** the final target proof. A regression test covers stale absence followed by branch recreation.
+- The shared live-E2E target-reset helper now applies the same principle to its early-absence path: an initial 404/recognized-missing response is re-proved against current target identity and re-read before reset success; if the branch reappears it is deleted and verified through the normal bounded path.
+- `GITHUB_E2E_SOURCE_REPO_ID`, when supplied to the live harness, must be a positive numeric GitHub repository ID; malformed optional source identity fails closed.
 - Qualification tag inspection now detects a pre-existing temp-ref collision and never unconditionally deletes a pre-existing local ref. Cleanup uses compare-and-delete against the SHA created by the invocation.
 - Release staging rejects symlinked/non-directory `.tmp` / `.tmp/release` ancestors and symlinked staging targets.
 - Release metadata, generated `main.js`, the canonical lockfile, and staged upload assets must be real non-empty regular files, not symlinks.
 - Deterministic ZIP entry names reject absolute paths, backslashes, empty segments, `.`, and `..` traversal shapes.
 - `.env.github-e2e.example` includes the mandatory numeric target repository ID.
 - Local stable publication is documented as the supported authority path; GitHub Actions Stable Release remains intentionally interlocked by the current workflow. PR #4 does not bypass or remove that interlock.
-- PR #4 is Ready for Review, mergeable, and `behind=0`; no workflow run exists for its connector-created current heads, so fresh local execution evidence is still required before merge.
+- PR #4 is Ready for Review, mergeable, and `behind=0`; the last code/test head before this handoff update is `a2153104152efb972581ed87798f55e7d1eb754c`. No workflow run exists for connector-created PR #4 heads, so fresh local execution evidence is still required before merge.
 
 ### PR #4 verification constraint
 
-The AI sandbox still cannot clone/download the repository from GitHub because direct GitHub network/DNS access is blocked, and the GitHub connector does not provide a workflow-dispatch action. The repository CI workflow supports `push` / `pull_request` / `workflow_dispatch`, but connector-created commits currently produce no Actions run for this branch. Therefore:
+The AI sandbox still cannot clone/download the repository from GitHub because direct GitHub DNS access fails (`Could not resolve host: github.com`), the public web download bridge does not expose this fork/branch, and the GitHub connector does not provide a workflow-dispatch action. The repository CI workflow supports `push` / `pull_request` / `workflow_dispatch`, but connector-created commits currently produce no Actions run for this branch. Therefore:
 - static/code-path review and GitHub diff/ancestry checks can be done here;
 - final build/test/package proof must come from a fresh user-local run on the **current PR #4 head**;
 - do not merge PR #4 or claim it green until that evidence is reported.
