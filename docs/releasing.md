@@ -2,12 +2,15 @@
 
 Stable publication is explicit and exact-SHA qualified. A version bump or branch push never creates a public release by itself.
 
-There are two independent supported authority paths:
+The **official local maintainer path** is currently the supported stable publication authority:
 
-1. **Official local maintainer path:** `pnpm qualify:local` -> durable exact-SHA qualification tag -> `pnpm release:local -- <version>`.
-2. **GitHub Actions path:** GitHub E2E Live -> Stable Release workflow.
+```text
+pnpm qualify:local
+-> durable exact-SHA qualification tag
+-> pnpm release:local -- <version>
+```
 
-The local path does not require, wait for, or trust an Actions qualification run. The Actions release path continues to require its own Actions-native qualification evidence.
+GitHub Actions live qualification remains available, but **Actions -> Stable Release is still temporarily interlocked** by `.github/workflows/release.yml` until the approved Release Provenance and Versioning implementation replaces the legacy Actions publication path. Do not remove that interlock as part of local-release operation.
 
 ## 1. Bump release metadata
 
@@ -35,10 +38,10 @@ Before the official local flow, require:
 - configured Git committer/tagger identity,
 - Git authentication able to push qualification tags to the canonical source repository,
 - GitHub CLI authenticated on **github.com** with push/Contents-write access to the canonical source repository,
-- a dedicated disposable real-GitHub E2E repository and token with Contents read/write permission,
+- a dedicated disposable real-GitHub E2E repository, its pinned numeric repository ID, and a token with Contents read/write permission,
 - that E2E repository must not be this source repository and must not contain real user notes.
 
-Create `.env.github-e2e` from `.env.github-e2e.example` or provide the equivalent process environment. The configured manual branch is ignored by official qualification; `qualify:local` generates a unique branch for its own destructive run.
+Create `.env.github-e2e` from `.env.github-e2e.example` or provide the equivalent process environment, including `GITHUB_E2E_EXPECTED_REPO_ID`. The configured manual branch is ignored by official qualification; `qualify:local` generates a unique branch for its own destructive run.
 
 The local release path pins GitHub CLI operations to `github.com`; an inherited `GH_HOST`/enterprise host or `GH_REPO` does not redirect publication.
 
@@ -78,7 +81,7 @@ github-e2e-cleanup-verified
 Important qualification behavior:
 
 - build runs before full package validation because `validate:package` requires generated `main.js`,
-- the destructive E2E target is checked against both the current/canonical source repository and the target repository's actual default branch,
+- the destructive E2E target is checked against the current/canonical source repository, pinned numeric target repository ID, readable actual default Git ref, and the target repository's actual default branch,
 - official qualification overrides the configured branch with `obsidian-sync-e2e/local-<sha12>-<run-id>`,
 - after the live child returns, bounded out-of-band cleanup proves that unique branch is absent before qualification can succeed,
 - source `HEAD`, canonical fetch/push origins, metadata/toolchain, remote `master`, and qualification-ref absence are rechecked after the long gates,
@@ -203,39 +206,97 @@ Version 1 intentionally treats a stable ref/draft left by a previous invocation 
 
 A failed publish command may still reconcile as success only when a fresh read proves the exact final non-draft/non-prerelease release, exact stable SHA, unchanged qualification tag object, and byte-matching four-asset set.
 
-## 7. GitHub Actions release path
+## 7. Configure the disposable live-E2E environment
 
-The existing Actions path remains supported and independent.
-
-Configure repository **Settings -> Environments -> `github-e2e`** with:
+In repository **Settings -> Environments**, create `github-e2e` with:
 
 ```text
+Deployment branches and tags -> Selected branches and tags
+Allowed branch -> master
+Allowed tags -> none
+
 Variable: E2E_OWNER
 Variable: E2E_REPO
+Variable: E2E_REPO_ID
 Secret:   E2E_TOKEN
 ```
 
-Then:
+Do not use **Protected branches only** while `master` has no branch-protection rule. `E2E_REPO_ID` is the pinned numeric authority; owner/repository text is routing only. The target must be an initialized dedicated disposable repository, not this source repository and not a real notes repository. The release-qualifying target credential must have mutable scope only to that target repository.
 
-1. run **Actions -> GitHub E2E Live** on `master`,
-2. require both `qualify` and `cleanup` jobs to succeed for the exact current `master` SHA,
-3. run **Actions -> Stable Release** for the exact stable version.
+See `docs/github-e2e.md` for branch isolation, target-ID checks, cleanup evidence, and rerun semantics.
 
-The Actions Stable Release workflow continues to require Actions-native exact-SHA qualification; it does not trust local qualification tags in v1.
+## 8. Qualify the exact master SHA
 
-## 8. Incidental CI triggered by tags
+Before dispatching the live workflow, require ordinary CI for the exact current `master` SHA to complete successfully. The current CI attempt must publish the exact release-qualifying artifact:
 
-The local authority path does not depend on GitHub Actions, but the repository's ordinary CI currently listens to unfiltered `push`. Qualification/stable tag creation can therefore trigger incidental CI runs.
+```text
+github-e2e-input-<master-sha>-<ci-run-id>-<ci-current-attempt>
+```
 
-Those runs are non-authoritative for the local path and are neither awaited nor used as local qualification evidence. This is not a promise of zero Actions executions.
+Then in **Actions -> GitHub E2E Live -> Run workflow**, select `master` and start the workflow.
 
-## 9. Branch candidate builds
+The Child-B qualification flow is:
 
-`.github/workflows/pre-release.yml` remains an artifact-only **Branch Candidate Build**. It can build/test non-master manifest-version candidates, but it has read-only repository permission and never creates tags or GitHub Releases.
+```text
+ordinary CI exact master/current attempt succeeds
+-> current github-e2e-input artifact exists
+-> GitHub E2E Live current attempt consumes and verifies it
+-> same-attempt receipt persists before target mutation
+-> qualify succeeds
+-> cleanup succeeds in the same current attempt
+```
+
+A release-qualifying live run requires its **current/latest workflow attempt** to be cohesive:
+
+- source ref is `master` and dispatched `github.sha` is still current `master`,
+- newest exact-SHA ordinary CI `push` run is the authoritative producer and its current attempt/`verify` job succeeded,
+- the selected CI E2E artifact is unexpired and bound to that producer/source SHA,
+- pinned target repository ID differs from the source repository ID and its actual default Git ref is readable,
+- same-attempt qualification receipt exists before scenario mutation and binds source, CI producer/artifact, and target identity,
+- job **qualify** executes in that attempt and succeeds,
+- job **cleanup** executes in that same attempt and succeeds.
+
+If cleanup fails, **Re-run failed jobs** may be used to remove residue safely. That cleanup-only attempt is not release qualification. Use **Re-run all jobs** to create a new cohesive current attempt before release qualification is restored.
+
+If `master` changes after qualification, or ordinary CI is rerun for the same SHA and a newer producer attempt becomes authoritative, the previous live evidence is stale. Run **GitHub E2E Live** again.
+
+## 9. Actions Stable Release is temporarily interlocked
+
+Do **not** dispatch **Stable Release** while only the Live-E2E Safety child is installed. The legacy release gate cannot prove the new same-attempt receipt is bound to the current authoritative CI producer, so the workflow is intentionally fail-closed until the approved **Release Provenance and Versioning (Child A)** implementation replaces it.
+
+The temporary interlock is enforced in `.github/workflows/release.yml` before checkout or repository code execution, and the default workflow token is read-only (`actions: read`, `contents: read`). The interlock must not be removed as a manual workaround.
+
+Child A will replace the legacy release path with the approved flow:
+
+```text
+newest exact-SHA/current-attempt CI authority
+-> newest exact-SHA/current-attempt cohesive Live E2E authority
+-> same-attempt receipt binds the exact current CI producer/artifact
+-> promote exact CI-produced release bytes
+-> isolated tag/draft/assets/publish state machine
+```
+
+Until that implementation lands, version bumps, ordinary CI, Branch Candidate Builds, and GitHub E2E Live qualification remain available, but stable publication is deliberately unavailable.
+
+## 10. Branch candidate builds
+
+`.github/workflows/pre-release.yml` is intentionally an artifact-only **Branch Candidate Build**. It can build/test non-master manifest-version candidates, but it has read-only repository permission and never creates tags or GitHub Releases.
 
 There is no automatic public alpha/beta channel in the current release design.
 
-## 10. Deterministic verification before merge/release
+## 11. Historical Actions partial publication state
+
+The legacy publication steps remain below the temporary interlock only as code to be replaced by Child A; they are unreachable while the interlock is active. If inspecting historical partial publication state from a run before the interlock, remember that tag creation, release creation, and asset upload were not one cross-resource transaction.
+
+```bash
+VERSION=1.2.3
+gh release view "$VERSION" --repo crystalicez/obsidian-github-sync-multi-platform || true
+git ls-remote --tags origin "refs/tags/$VERSION"
+```
+
+Do not automatically delete a tag/release just because an older workflow failed. Inspect whether a valid release already exists, then remove only state the maintainer has determined is partial/invalid.
+
+## 12. Deterministic verification before merge/release
 
 Before merging release-tooling changes, run:
 
