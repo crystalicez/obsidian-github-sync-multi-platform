@@ -115,6 +115,16 @@ export function withoutGitHubE2EToken(env = {}) {
   return next;
 }
 
+export function withoutGitHubAuthTokens(env = {}) {
+  const next = { ...env };
+  for (const key of ["GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"]) delete next[key];
+  return next;
+}
+
+export function withoutAnyGitHubTokens(env = {}) {
+  return withoutGitHubAuthTokens(withoutGitHubE2EToken(env));
+}
+
 export function runCommand(command, args = [], options = {}) {
   const { encoding = "utf8", shell: _ignoredShell, ...rest } = options;
   return spawnSync(command, args, { ...rest, shell: false, encoding });
