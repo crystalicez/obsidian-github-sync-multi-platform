@@ -338,7 +338,7 @@ test("folder rename into an NFC/case-equivalent namespace fails before remote mu
       allowThresholdOverride: false,
       changes: [{ type: "folderRename", oldPath: "spare", path: "FOLDER", mtime: 2 }],
     }),
-    /V4 path collision/iu,
+    /path collision/iu,
   )
 
   assert.equal(github.ref?.sha, headBefore)

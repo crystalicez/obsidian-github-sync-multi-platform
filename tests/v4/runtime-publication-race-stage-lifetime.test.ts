@@ -209,7 +209,7 @@ test("publication retry preserves conflict-copy reservation but invalidates its 
 
   assert.equal(syncCalls, 2)
   assert.equal(runtime.progressSnapshot.attempt, 2)
-  assert.equal(runtime.progressSnapshot.lifecycle, "success")
+  assert.equal(runtime.progressSnapshot.lifecycle, "no-change")
   assert.equal(secondAttemptStageCount, 0, "a fresh remote plan must not reuse conflict-copy material staged from the raced snapshot")
   assert.deepEqual(secondAttemptReservation, {
     path: "note.conflict-remote-device.md",
