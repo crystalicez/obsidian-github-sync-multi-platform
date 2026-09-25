@@ -111,14 +111,21 @@ export function fetchAndInspectObservedQualificationTag({
   const suffix = randomId();
   if (!/^[A-Za-z0-9_-]{6,64}$/u.test(suffix ?? "")) throw new Error("Unsafe temporary inspection ref id");
   const tempRef = `refs/local-qualification-inspect/${suffix}`;
+  const collision = runner("git", ["show-ref", "--verify", "--quiet", tempRef], { cwd, encoding: "utf8" });
+  if (!collision || ![0, 1].includes(collision.status)) {
+    throw new Error("Temporary inspection ref collision check failed");
+  }
+  if (collision.status === 0) throw new Error("Temporary inspection ref already exists");
+
+  let fetchedSha;
   try {
     requireSuccess(runner("git", ["fetch", "--no-tags", remote, `${ref}:${tempRef}`], { cwd, encoding: "utf8" }), "Qualification ref fetch");
     const resolved = requireSuccess(runner("git", ["rev-parse", tempRef], { cwd, encoding: "utf8" }), "Qualification temp-ref resolution");
-    const fetchedSha = requireSha(text(resolved), "Qualification temp-ref resolution");
+    fetchedSha = requireSha(text(resolved), "Qualification temp-ref resolution");
     if (fetchedSha !== observed.objectSha) throw new Error("Remote qualification ref changed during inspection");
     return { kind: "present", objectSha: observed.objectSha, tag: inspectTagObject({ runner, cwd, objectSha: observed.objectSha }) };
   } finally {
-    runner("git", ["update-ref", "-d", tempRef], { cwd, encoding: "utf8" });
+    if (fetchedSha) runner("git", ["update-ref", "-d", tempRef, fetchedSha], { cwd, encoding: "utf8" });
   }
 }
 
