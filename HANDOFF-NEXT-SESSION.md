@@ -303,6 +303,14 @@ The same acceptance log showed:
 - package validation PASS.
 However that run used Node `v24.11.0`, while the release contract requires exact Node `v22.11.0`; the interactive pasted PowerShell also continued after thrown gate failures. Therefore the run is useful debugging evidence but **not final release acceptance**. A fresh stop-on-first-failure run on exact Node `v22.11.0` is still required after `572a69f...`.
 
+A subsequent stop-on-first-failure acceptance attempt on current head `68846941c8c00ce08382ee457c5c096527ad8fa0` verified:
+- branch/head sync succeeded;
+- working tree reached the expected PR #4 head;
+- toolchain guard stopped immediately because actual Node was still `v24.11.0` while `.node-version` requires `v22.11.0`;
+- no build/test gate ran after that mismatch, so this attempt adds no new code/test failure evidence.
+
+Next action remains unchanged: switch the maintainer shell to exact Node `v22.11.0`, confirm `node --version`, then rerun the full stop-on-first-failure acceptance block from the current PR #4 head.
+
 ## Known housekeeping
 
 The previously noted temporary branch `tmp-ignore` is no longer present in the current remote branch listing, so no action is required for it.
