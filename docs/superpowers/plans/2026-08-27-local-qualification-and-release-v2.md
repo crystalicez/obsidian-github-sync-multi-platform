@@ -6,7 +6,7 @@
 
 **Architecture:** Keep orchestration thin. Separate repository identity, E2E configuration, E2E remote cleanup, Git-object authority, packaging, and GitHub publication helpers so each safety boundary has focused tests. `qualify:local` creates one remote annotated receipt only after deterministic/live gates and out-of-band E2E cleanup; `release:local` snapshots that exact tag object, stages exact bytes, atomically creates the lightweight stable ref with GitHub's create-reference endpoint, stages an explicit draft, verifies remote bytes, publishes, and post-verifies.
 
-**Tech Stack:** Node.js v22.11.0, ESM `.mjs`, existing CommonJS `scripts/update-version.js`, pnpm 9.12.3 through Corepack, Node `node:test`, Git CLI, GitHub CLI pinned to `github.com`, Node 22 global `fetch`, `fflate@0.8.3`, existing `tests/feasibility/` tier.
+**Tech Stack:** Node.js v24.11.0, ESM `.mjs`, existing CommonJS `scripts/update-version.js`, pnpm 9.12.3 through Corepack, Node `node:test`, Git CLI, GitHub CLI pinned to `github.com`, Node 22 global `fetch`, `fflate@0.8.3`, existing `tests/feasibility/` tier.
 
 **Spec:** `docs/superpowers/specs/2026-08-27-local-qualification-and-release-design.md`
 
@@ -114,10 +114,10 @@ test("metadata exposes exact committed toolchain versions", () => {
     packageJson: { version: "1.0.8", packageManager: "pnpm@9.12.3+sha512.deadbeef" },
     manifest: { id: "encrypted-github-sync-multi-platform", version: "1.0.8", minAppVersion: "1.11.4" },
     versions: { "1.0.8": "1.11.4" },
-    nodeVersion: "v22.11.0",
+    nodeVersion: "v24.11.0",
   });
   assert.equal(result.pnpmVersion, "9.12.3");
-  assert.equal(result.nodeVersion, "v22.11.0");
+  assert.equal(result.nodeVersion, "v24.11.0");
 });
 ```
 
@@ -1088,7 +1088,7 @@ Prerequisites:
 
 - clean canonical `master`,
 - canonical fetch **and push** origin endpoints,
-- Node v22.11.0,
+- Node v24.11.0,
 - Corepack pnpm 9.12.3,
 - Git committer/tagger identity and tag-push auth for qualification receipt,
 - GitHub CLI auth on `github.com` with canonical Contents write permission,
@@ -1168,7 +1168,7 @@ Confirm `.github/workflows/github-e2e-live.yml` and `.github/workflows/release.y
 
 - [ ] **Step 8: Record native-Windows verification requirement**
 
-Before first production Windows release, run the focused test command from Step 6 natively on Windows using Node v22.11.0/pnpm 9.12.3. Record command + exit status in the release checklist. Injected win32 construction tests alone are not the evidence for the first real Windows publication.
+Before first production Windows release, run the focused test command from Step 6 natively on Windows using Node v24.11.0/pnpm 9.12.3. Record command + exit status in the release checklist. Injected win32 construction tests alone are not the evidence for the first real Windows publication.
 
 - [ ] **Step 9: Commit docs**
 
