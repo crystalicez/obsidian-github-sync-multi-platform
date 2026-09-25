@@ -7,6 +7,9 @@ import {
   readE2ERepository,
 } from "../../scripts/github-e2e-remote.mjs";
 
+const DEFAULT_SHA = "d".repeat(40);
+const PRESENT_SHA = "a".repeat(40);
+
 function response(status, body) {
   return {
     status,
@@ -30,21 +33,39 @@ function fakeFetch(sequence, calls = []) {
   return fn;
 }
 
+const repo = (id = 123, defaultBranch = "trunk") => response(200, { id, default_branch: defaultBranch });
+const ref = (sha = DEFAULT_SHA) => response(200, { object: { sha } });
+const config = (branch = "e2e/run-1", expectedRepoId = "123") => ({
+  owner: "test", repo: "repo", branch, token: "secret", expectedRepoId,
+});
+
 test("remote preflight rejects actual default branch before mutation", async () => {
-  const fetchImpl = fakeFetch([response(200, { default_branch: "trunk" })]);
   await assert.rejects(() => preflightE2ERemote({
-    fetchImpl,
-    config: { owner: "test", repo: "repo", branch: "trunk", token: "secret" },
+    fetchImpl: fakeFetch([repo()]),
+    config: config("trunk"),
   }), /default branch/i);
 });
 
-test("remote preflight accepts a safe non-default branch", async () => {
-  const fetchImpl = fakeFetch([response(200, { default_branch: "trunk" })]);
+test("remote preflight rejects a repository route whose numeric ID changed", async () => {
+  await assert.rejects(() => preflightE2ERemote({
+    fetchImpl: fakeFetch([repo(999)]),
+    config: config(),
+  }), /repository ID/i);
+});
+
+test("remote preflight requires readable default-ref capability", async () => {
+  await assert.rejects(() => preflightE2ERemote({
+    fetchImpl: fakeFetch([repo(), response(404)]),
+    config: config(),
+  }), /default Git ref/i);
+});
+
+test("remote preflight accepts only a pinned safe non-default branch", async () => {
   const result = await preflightE2ERemote({
-    fetchImpl,
-    config: { owner: "test", repo: "repo", branch: "e2e/run-1", token: "secret" },
+    fetchImpl: fakeFetch([repo(), ref()]),
+    config: config(),
   });
-  assert.equal(result.defaultBranch, "trunk");
+  assert.deepEqual(result, { id: "123", defaultBranch: "trunk", defaultBranchSha: DEFAULT_SHA });
 });
 
 test("repository lookup fails closed for HTTP errors and malformed responses", async () => {
@@ -57,18 +78,20 @@ test("repository lookup fails closed for HTTP errors and malformed responses", a
     fetchImpl: fakeFetch([response(200, new Error("bad json"))]), owner: "test", repo: "repo", token: "secret",
   }), /malformed JSON/i);
   await assert.rejects(() => readE2ERepository({
-    fetchImpl: fakeFetch([response(200, { default_branch: "" })]), owner: "test", repo: "repo", token: "secret",
+    fetchImpl: fakeFetch([response(200, { id: 123, default_branch: "" })]), owner: "test", repo: "repo", token: "secret",
   }), /default branch/i);
+  await assert.rejects(() => readE2ERepository({
+    fetchImpl: fakeFetch([response(200, { id: 0, default_branch: "trunk" })]), owner: "test", repo: "repo", token: "secret",
+  }), /repository ID/i);
 });
 
 test("branch lookup distinguishes absent, present, and unknown", async () => {
   assert.deepEqual(await readE2EBranch({
     fetchImpl: fakeFetch([response(404)]), owner: "test", repo: "repo", branch: "x/y", token: "secret",
   }), { kind: "absent" });
-  const sha = "a".repeat(40);
   assert.deepEqual(await readE2EBranch({
-    fetchImpl: fakeFetch([response(200, { object: { sha } })]), owner: "test", repo: "repo", branch: "x/y", token: "secret",
-  }), { kind: "present", sha });
+    fetchImpl: fakeFetch([response(200, { object: { sha: PRESENT_SHA } })]), owner: "test", repo: "repo", branch: "x/y", token: "secret",
+  }), { kind: "present", sha: PRESENT_SHA });
   await assert.rejects(() => readE2EBranch({
     fetchImpl: fakeFetch([response(500, {})]), owner: "test", repo: "repo", branch: "x/y", token: "secret",
   }), /HTTP 500/i);
@@ -77,59 +100,80 @@ test("branch lookup distinguishes absent, present, and unknown", async () => {
   }), /network error/i);
 });
 
-test("cleanup deletes a present unique branch through documented read/delete endpoints and verifies absence", async () => {
+test("cleanup deletes a present unique branch, verifies absence, and re-proves pinned target capability", async () => {
   const calls = [];
   const fetchImpl = fakeFetch([
-    response(200, { object: { sha: "a".repeat(40) } }),
+    repo(), ref(),
+    response(200, { object: { sha: PRESENT_SHA } }),
     response(204),
     response(404),
+    repo(), ref(),
   ], calls);
   await cleanupE2EBranch({
-    fetchImpl, owner: "test", repo: "repo", branch: "obsidian-sync-e2e/local-abc-run", token: "secret", sleep: async () => {},
+    fetchImpl, owner: "test", repo: "repo", branch: "obsidian-sync-e2e/local-abc-run",
+    token: "secret", expectedRepoId: "123", sleep: async () => {},
   });
-  assert.match(calls[0].url, /\/git\/ref\/heads\/obsidian-sync-e2e\/local-abc-run$/u);
-  assert.equal(calls[0].options.method, undefined);
-  assert.match(calls[1].url, /\/git\/refs\/heads\/obsidian-sync-e2e\/local-abc-run$/u);
-  assert.equal(calls[1].options.method, "DELETE");
   assert.match(calls[2].url, /\/git\/ref\/heads\/obsidian-sync-e2e\/local-abc-run$/u);
+  assert.equal(calls[3].options.method, "DELETE");
+  assert.match(calls[4].url, /\/git\/ref\/heads\/obsidian-sync-e2e\/local-abc-run$/u);
+  assert.equal(fetchImpl.remaining(), 0);
 });
 
-test("cleanup succeeds when the branch is already absent", async () => {
-  const fetchImpl = fakeFetch([response(404)]);
-  await cleanupE2EBranch({ fetchImpl, owner: "test", repo: "repo", branch: "gone", token: "secret", sleep: async () => {} });
+test("cleanup succeeds for an absent branch only after pinned target capability is proved twice", async () => {
+  const fetchImpl = fakeFetch([repo(), ref(), response(404), repo(), ref()]);
+  await cleanupE2EBranch({
+    fetchImpl, owner: "test", repo: "repo", branch: "gone", token: "secret", expectedRepoId: "123", sleep: async () => {},
+  });
   assert.equal(fetchImpl.remaining(), 0);
 });
 
 test("cleanup retries a failed server-side delete after verifying the branch remains", async () => {
   const sleeps = [];
   const fetchImpl = fakeFetch([
-    response(200, { object: { sha: "a".repeat(40) } }), response(500), response(200, { object: { sha: "a".repeat(40) } }),
-    response(200, { object: { sha: "a".repeat(40) } }), response(204), response(404),
+    repo(), ref(),
+    response(200, { object: { sha: PRESENT_SHA } }), response(500), response(200, { object: { sha: PRESENT_SHA } }),
+    response(200, { object: { sha: PRESENT_SHA } }), response(204), response(404),
+    repo(), ref(),
   ]);
   await cleanupE2EBranch({
-    fetchImpl, owner: "test", repo: "repo", branch: "e2e/retry", token: "secret", sleep: async ms => sleeps.push(ms),
+    fetchImpl, owner: "test", repo: "repo", branch: "e2e/retry", token: "secret", expectedRepoId: "123",
+    sleep: async ms => sleeps.push(ms),
   });
   assert.deepEqual(sleeps, [2000]);
 });
 
 test("cleanup fails if the branch persists after bounded attempts", async () => {
-  const present = () => response(200, { object: { sha: "a".repeat(40) } });
+  const present = () => response(200, { object: { sha: PRESENT_SHA } });
   const fetchImpl = fakeFetch([
+    repo(), ref(),
     present(), response(204), present(),
     present(), response(204), present(),
   ]);
   await assert.rejects(() => cleanupE2EBranch({
-    fetchImpl, owner: "test", repo: "repo", branch: "e2e/stuck", token: "secret", sleep: async () => {}, maxAttempts: 2,
+    fetchImpl, owner: "test", repo: "repo", branch: "e2e/stuck", token: "secret", expectedRepoId: "123",
+    sleep: async () => {}, maxAttempts: 2,
   }), /still exists/i);
 });
 
-test("cleanup treats auth and network failures as unknown, not success", async () => {
-  const present = response(200, { object: { sha: "a".repeat(40) } });
+test("cleanup fails closed if target identity changes during post-delete verification", async () => {
+  const fetchImpl = fakeFetch([
+    repo(), ref(),
+    response(200, { object: { sha: PRESENT_SHA } }), response(204), response(404),
+    repo(999),
+  ]);
   await assert.rejects(() => cleanupE2EBranch({
-    fetchImpl: fakeFetch([present, response(403)]), owner: "test", repo: "repo", branch: "e2e/x", token: "secret", sleep: async () => {},
+    fetchImpl, owner: "test", repo: "repo", branch: "e2e/x", token: "secret", expectedRepoId: "123", sleep: async () => {},
+  }), /repository ID/i);
+});
+
+test("cleanup treats auth and network failures as unknown, not success", async () => {
+  await assert.rejects(() => cleanupE2EBranch({
+    fetchImpl: fakeFetch([repo(), ref(), response(200, { object: { sha: PRESENT_SHA } }), response(403)]),
+    owner: "test", repo: "repo", branch: "e2e/x", token: "secret", expectedRepoId: "123", sleep: async () => {},
   }), /HTTP 403/i);
   await assert.rejects(() => cleanupE2EBranch({
-    fetchImpl: fakeFetch([new Error("offline")]), owner: "test", repo: "repo", branch: "e2e/x", token: "secret", sleep: async () => {},
+    fetchImpl: fakeFetch([new Error("offline")]),
+    owner: "test", repo: "repo", branch: "e2e/x", token: "secret", expectedRepoId: "123", sleep: async () => {},
   }), /network error/i);
 });
 
