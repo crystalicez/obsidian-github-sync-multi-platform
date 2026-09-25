@@ -2,7 +2,7 @@ import { randomBytes } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import { loadGitHubE2EEnv, qualificationE2EBranch, validateGitHubE2EConfig } from "./github-e2e-env.mjs";
 import { cleanupE2EBranch, preflightE2ERemote } from "./github-e2e-remote.mjs";
-import { CANONICAL_REPOSITORY, requireCanonicalOriginEndpoints } from "./github-repo.mjs";
+import { CANONICAL_REPOSITORY, CANONICAL_REPOSITORY_ID, requireCanonicalOriginEndpoints } from "./github-repo.mjs";
 import {
   createQualificationReceipt,
   QUALIFICATION_GATES,
@@ -142,7 +142,7 @@ export async function qualifyLocal({
     expectedRepoId: raw.GITHUB_E2E_EXPECTED_REPO_ID,
     currentSourceRepo: CANONICAL_REPOSITORY,
   });
-  await preflightE2ERemote({ fetchImpl, config: e2eConfig });
+  await preflightE2ERemote({ fetchImpl, config: { ...e2eConfig, currentSourceRepoId: CANONICAL_REPOSITORY_ID } });
   onProgress({ kind: "e2e-branch", branch: officialBranch });
 
   onProgress({ kind: "gate", name: "metadata-validation" });
@@ -165,6 +165,7 @@ export async function qualifyLocal({
       branch: officialBranch,
       token: e2eConfig.token,
       expectedRepoId: e2eConfig.expectedRepoId,
+      currentSourceRepoId: CANONICAL_REPOSITORY_ID,
       sleep,
     });
     onProgress({ kind: "gate", name: "github-e2e-cleanup-verified" });
