@@ -160,6 +160,19 @@ export class V4PluginRuntime {
     this.assertNotDisposed()
     this.coordinator.cancelActive(new V4CancelledError("V4 settings changed."))
     await this.coordinator.whenIdle()
+    if (this.progressStore.snapshot.lifecycle === "active") {
+      this.progressStore.update({
+        lifecycle: "idle",
+        phase: undefined,
+        currentPath: undefined,
+        currentDirection: undefined,
+        pull: { completed: 0, total: undefined },
+        push: { completed: 0, total: undefined },
+        errorMessage: undefined,
+        failurePhase: undefined,
+        failurePath: undefined,
+      })
+    }
   }
 
   credentialsChanged(): void {
