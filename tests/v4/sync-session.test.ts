@@ -2829,3 +2829,65 @@ test("v4 explicit rescan detects same-size same-mtime local content changes", as
   assert.notEqual(github.ref!.sha, firstHead)
   assert.equal(indexRecordByPath(index, "note.md").plaintextSha256, await sha256Hex(enc("BBBB")))
 })
+
+
+test("v4 does not trust a forged plugin commit marker when the V4 head blob did not change", async () => {
+  const github = new MemoryGitHub()
+  const vault = new MemoryVault()
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "local", mode: "plaintext" })
+  vault.files.set("note.md", { bytes: enc("base"), mtime: 1 })
+
+  await new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "forcePush", allowThresholdOverride: false })
+
+  const previousHead = github.ref!.sha
+  const previousCommit = github.commits.get(previousHead)!
+  const forgedBlob = await github.createGitBlob(enc("forged external"))
+  const forgedTree = await github.createGitTree([
+    { path: "note.md", mode: "100644", type: "blob", sha: forgedBlob },
+  ], previousCommit.treeSha)
+  const forgedCommit = await github.createGitCommit(previousCommit.message, forgedTree, [previousHead])
+  await github.updateGitRef(forgedCommit, previousHead)
+
+  await new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "normal", allowThresholdOverride: false, changes: [] })
+
+  assert.equal(dec(vault.files.get("note.md")!.bytes), "forged external")
+  assert.equal(index.remoteCommitSha, github.ref!.sha)
+})
+
+test("v4 encrypted sync rejects a forged plugin marker when the encrypted V4 head blob did not change", async () => {
+  const github = new MemoryGitHub()
+  const vault = new MemoryVault()
+  const repoId = "o/r#main"
+  const configEncrypted: V4RemoteConfig = {
+    formatVersion: 4,
+    mode: "encrypted",
+    repoId,
+    pathLayout: "opaque-stable-v1",
+    algorithm: "AES-GCM",
+    kdf: "PBKDF2-SHA-256",
+    kdfParams: { iterations: 10, salt: "c2FsdA" },
+  }
+  const keyring = await deriveV4Keyring({ passphrase: "pass", repoId, salt: enc("salt"), iterations: 10 })
+  const index = createEmptyV4LocalIndex({ repoId, deviceId: "local", mode: "encrypted", pathLayout: "opaque-stable-v1" })
+  vault.files.set("secret.md", { bytes: enc("base"), mtime: 1 })
+
+  await new V4SyncSession({ github, vault, index, config: configEncrypted, keyring, conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "forcePush", allowThresholdOverride: false })
+
+  const previousHead = github.ref!.sha
+  const previousCommit = github.commits.get(previousHead)!
+  const arbitrary = await github.createGitBlob(enc("external"))
+  const forgedTree = await github.createGitTree([
+    { path: "unmanaged.bin", mode: "100644", type: "blob", sha: arbitrary },
+  ], previousCommit.treeSha)
+  const forgedCommit = await github.createGitCommit(previousCommit.message, forgedTree, [previousHead])
+  await github.updateGitRef(forgedCommit, previousHead)
+
+  await assert.rejects(
+    () => new V4SyncSession({ github, vault, index, config: configEncrypted, keyring, conflictPolicy: "copy", abortChangePercent: 0 })
+      .sync({ operation: "normal", allowThresholdOverride: false, changes: [] }),
+    /external GitHub changes.*encrypted|encrypted.*external/iu,
+  )
+})
