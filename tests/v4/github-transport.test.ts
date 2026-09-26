@@ -753,3 +753,26 @@ test("GitHub client rejects non-object SHA strings in successful ref and immutab
     setRequestUrlHandler(null);
   }
 });
+
+
+test("bootstrap rejects a malformed successful commit SHA before creating the configured ref", async () => {
+  const requests: Array<{ url: string; method?: string }> = []
+  setRequestUrlHandler(async request => {
+    requests.push({ url: request.url, method: request.method })
+    if (request.url.includes("/git/refs?")) {
+      return { status: 200, text: "", headers: {}, json: [] }
+    }
+    if (request.url.includes("/contents/") && request.method === "PUT") {
+      return { status: 201, text: "", headers: {}, json: { commit: { sha: "not-a-git-object" } } }
+    }
+    throw new Error(`unexpected request: ${request.method} ${request.url}`)
+  })
+
+  const client = new GitHubClient({ owner: "o", repo: "r", branch: "main", token: "t" })
+
+  await assert.rejects(
+    () => client.ensureGitRepositoryInitialized(),
+    /bootstrap.*sha|object.*sha|malformed|invalid/iu,
+  )
+  assert.equal(requests.some(request => request.url.endsWith("/git/refs") && request.method === "POST"), false)
+})
