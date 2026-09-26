@@ -318,3 +318,34 @@ test("v4 coordinator aborts the active execution on dispose and starts no follow
   assert.equal((await coordinator.run({ operation: "normal", trigger: "manual" })).status, "skipped")
   assert.equal(executions, 1)
 })
+
+
+test("v4 coordinator can cancel an active run for settings rotation without disposing future syncs", async () => {
+  let executions = 0;
+  let observedSignal: AbortSignal | undefined;
+  const coordinator = new V4SyncCoordinator({
+    execute: async (_request, _changes, signal) => {
+      executions++;
+      observedSignal = signal;
+      if (executions > 1) return { changedFiles: 0 };
+      await new Promise<void>((resolve, reject) => {
+        if (signal.aborted) return reject(signal.reason);
+        signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+      });
+      return { changedFiles: 0 };
+    },
+  });
+
+  const active = coordinator.run({ operation: "normal", trigger: "manual" });
+  const cancellable = coordinator as unknown as { cancelActive(reason?: unknown): void };
+  cancellable.cancelActive(new Error("settings changed"));
+
+  await assert.rejects(active, /settings changed/iu);
+  assert.equal(observedSignal?.aborted, true);
+  await coordinator.whenIdle();
+  assert.equal(coordinator.isSyncing, false);
+
+  const followup = await coordinator.run({ operation: "normal", trigger: "manual" });
+  assert.equal(followup.status, "completed");
+  assert.equal(executions, 2);
+});
