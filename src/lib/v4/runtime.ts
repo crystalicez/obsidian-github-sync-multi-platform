@@ -2,6 +2,7 @@ import { Modal, Notice, Platform, TFile } from "obsidian"
 import type FastSync from "../../main"
 import { fromBase64Url, randomBytes, sha256Hex, toBase64Url, utf8ToBytes } from "../bytes"
 import { syncConsoleLog } from "../debug"
+import { assertPluginSettingsRuntimeSafe } from "../plugin-settings-validation"
 import { readVaultFileBytes, writeVaultFileBytes, trashVaultFileIfExists } from "../vault"
 import { deriveV4BootstrapRecoveryKey, deriveV4Keyring, type V4Keyring } from "./crypto"
 import {
