@@ -190,3 +190,17 @@ test("desktop stage rollback refuses to overwrite an unrelated target edit and p
   assert.deepEqual(new Uint8Array(await readFile(targetPath)), new Uint8Array([4, 4, 4, 4, 4]));
   assert.deepEqual(new Uint8Array(await readFile(backupPath)), new Uint8Array([1, 2, 3]));
 });
+
+
+test("mobile staged rollback is a no-op because mobile never creates desktop target backups", async () => {
+  const io = createV4PlatformIo({
+    platform: "mobile",
+    adapter: { async writeBinary() {}, async appendBinary() {} },
+  });
+
+  await assert.doesNotReject(() => io.rollbackStage("stage.bin", "target.bin", {
+    expectedTarget: { exists: true, size: 3 },
+    expectedStageSize: 4,
+    expectedStageSha256: "f".repeat(64),
+  }));
+});
