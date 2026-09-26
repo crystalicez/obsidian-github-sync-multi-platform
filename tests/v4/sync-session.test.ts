@@ -2916,3 +2916,45 @@ test("v4 encrypted sync rejects a forged plugin marker when the encrypted V4 hea
     /external GitHub changes.*encrypted|encrypted.*external/iu,
   )
 })
+
+
+test("v4 external reconciliation fails closed when the immutable tree lists a blob but its file read is missing", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault();
+  vault.files.set("external.md", { bytes: enc("base"), mtime: 1 });
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "local", mode: "plaintext" });
+
+  await new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "forcePush", allowThresholdOverride: false });
+
+  const previousHead = github.ref!.sha;
+  const previousTree = github.commits.get(previousHead)!.treeSha;
+  const externalTree = new Map(github.trees.get(previousTree));
+  externalTree.set("external.md", enc("edited on GitHub"));
+  github.trees.set("tree-missing-read", externalTree);
+  github.commits.set("commit-missing-read", {
+    treeSha: "tree-missing-read",
+    parents: [previousHead],
+    message: "external edit",
+  });
+  github.ref = { ref: "refs/heads/main", sha: "commit-missing-read", type: "commit" };
+  github.files = new Map(externalTree);
+
+  const originalGetFileBytes = github.getFileBytes.bind(github);
+  github.getFileBytes = async (path: string, ref?: string) => {
+    if (ref === "commit-missing-read" && path === "external.md") return null;
+    return originalGetFileBytes(path, ref);
+  };
+  const indexBefore = structuredClone(index);
+  const bytesBefore = new Uint8Array(vault.files.get("external.md")!.bytes);
+
+  await assert.rejects(
+    () => new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+      .sync({ operation: "normal", allowThresholdOverride: false, changes: [] }),
+    /external.*blob.*missing|blob.*external.md.*missing|unsafe.*external/iu,
+  );
+
+  assert.deepEqual(vault.files.get("external.md")!.bytes, bytesBefore);
+  assert.deepEqual(index, indexBefore);
+  assert.equal(vault.operations.some(operation => operation.startsWith("trash:") || operation.startsWith("delete:")), false);
+});
