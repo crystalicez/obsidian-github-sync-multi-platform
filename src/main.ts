@@ -220,6 +220,7 @@ export default class FastSync extends Plugin {
       this.app.secretStorage,
       prefix => this.createSecretId(prefix),
     )
+    assertPluginSettingsRuntimeSafe(result.settings)
     this.settings = result.settings as PluginSettings
     this.secretsMigrated = result.migrated
   }
