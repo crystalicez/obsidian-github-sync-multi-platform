@@ -135,6 +135,18 @@ Audit method:
    - RED: `50de3d3925e371001142b0b61f0b65ae9b32a0f6`.
    - Fixes: `d21c1c5d4a92d7875c4da6d185e78d39f4a774fa`, `111e9fdd0549f4f9de93753909eae1c6a3a085ba` centralize scoped-path counting on the same predicate used by runtime and use it in the force confirmation.
 
+18. **MEDIUM settings safety — invalid ignore-regex edits could disrupt the current generation before being rejected.**
+   - Scope compilation can throw for an invalid regex. If validation occurs only after runtime quiescence/settings publication begins, an invalid edit can cancel legitimate in-flight work or partially rotate runtime state even though settings are not accepted.
+   - RED: `0fa5a74fe39259d117ecffc140b2ffadd76d3796`.
+   - Fixes: `38928aa3aed4e51b82b4f23b65a3450544d7d946`, `3b6d46cb7c0d2d272021cacb59c851452a51625e`.
+   - `saveSettings(nextSettings)` now compiles/validates the ignore regex before quiescing the old runtime generation, and the settings UI reports failure without publishing the invalid generation.
+
+19. **MEDIUM remote resource amplification — chunk descriptors were broadly capped but not constrained to counts the writer can actually produce for the declared size.**
+   - The first remote descriptor hardening allowed any positive part count up to 400.
+   - A forged small or ~50 MiB record could therefore claim hundreds of canonical-looking part paths and trigger unnecessary immutable reads despite the writer using at least 1 MiB parts, at most 48 MiB parts, and not chunking below the threshold.
+   - RED: `429b10ce5bc68bad0be548caf20b8826397759e3`.
+   - Fix: `690f64ed557836caa3fb4923a833d7cb0e2d61e1` requires chunked records to cross the writer threshold and constrains part count to the writer-compatible range `ceil(size / 48 MiB) .. ceil(size / 1 MiB)`, while retaining the 400-mutation budget ceiling.
+
 ### Audited surfaces with no new confirmed defect so far
 
 - secret migration/persistence: raw token/passphrase are removed before plugin data persistence and use Obsidian SecretStorage;
