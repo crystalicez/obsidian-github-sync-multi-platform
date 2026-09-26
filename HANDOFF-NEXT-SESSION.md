@@ -4,6 +4,43 @@
 >
 > **Mandatory workflow rule:** Every AI session that makes a material change to code, tests, design decisions, branch/PR state, verification status, or next steps MUST update this file before ending or handing work off. GitHub is the source of truth.
 
+## Active production audit — 2026-09-26
+
+Branch: `audit/2026-09-26-production-hardening`
+Baseline master: `ef4f8e675a0be7d598c22b2ce88c843c1306c926`
+
+The user requested the most detailed practical production audit possible. This audit is active and must be resumed before declaring the repository closed again.
+
+Audit method:
+- prioritize data-loss, corruption, fail-open, remote-input/resource amplification, crash consistency, credential/symlink/path safety, GitHub mutation ambiguity, cancellation, and concurrency;
+- distinguish acceptance coverage from adversarial audit coverage;
+- confirm each candidate defect with a RED regression before production changes;
+- use TDD for fixes;
+- do not run destructive live GitHub E2E or `release:local` merely as audit verification.
+
+Current candidate findings requiring RED proof:
+1. **Plaintext unchanged-head local-index authority** — `V4SyncSession` may reconstruct remote state from a structurally complete local index when the branch SHA matches. Local-index validation does not recompute remote shard content hashes. A locally corrupted shard can therefore remain “complete” while omitting a record. In `forcePull`, this may treat the missing cached record as authoritative remote deletion and trash a local file even though the immutable remote shard still contains it.
+2. **Remote-controlled PBKDF2 work factor** — `decodeV4RemoteConfig` does not validate KDF algorithm/parameters, salt shape/size, or bound `iterations`; runtime passes remote iterations directly to WebCrypto PBKDF2. A forged/corrupt encrypted config may cause CPU/resource exhaustion before sync can fail safely.
+3. **Unbounded history journal fanout** — `V4HistoryService.readJournal` trusts page 0 `pageCount` and performs one remote read per page without a protocol bound or cross-page consistency check. A forged/corrupt plugin-looking journal can amplify history work into very large request counts.
+4. **Remote descriptor/count validation** — chunk/pack/history descriptors are still being audited for count/size consistency and resource amplification; no confirmed finding yet.
+
+Audit areas already inspected:
+- V4 runtime/session/planner/coordinator;
+- local index and remote loader/index;
+- publication race/reconciler and Git mutation retry policy;
+- GitHub API immutable reads and mutation wrappers;
+- content source/object streaming/resource controller;
+- crypto/keyring/secrets;
+- recovery-store semantics (partial; deeper payload-bound audit pending);
+- history service/journals.
+
+Next audit actions:
+1. inspect recovery payload validation/bounds, release tooling/workflows, settings/runtime lifecycle, and remaining GitHub bootstrap/mutation paths;
+2. write RED regressions for confirmed candidates;
+3. fix only reproduced defects;
+4. run focused + full acceptance appropriate to changed surfaces;
+5. update this handoff after every material finding/fix/verification change.
+
 ## Final repository state
 
 As of 2026-09-26 (Asia/Bangkok), the implementation/integration scope covered by PRs #1, #3, #4, #5, #6, and #7 is complete and landed on `master`.
