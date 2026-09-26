@@ -1336,3 +1336,33 @@ test("desktop runtime proves the vault root and guards small-file reads and muta
     /readVaultWhole:\s*async\s+path\s*=>\s*\{[\s\S]*?assertVaultPathSafe\(path,\s*\{\s*mustExist:\s*true\s*\}\)[\s\S]*?readVaultFileBytes/u,
   );
 });
+
+
+test("settings persistence holds a runtime transition gate until the new generation is committed or aborted", async () => {
+  const mainSource = await readFile("src/main.ts", "utf8");
+  const runtimeSource = await readFile("src/lib/v4/runtime.ts", "utf8");
+
+  assert.match(
+    mainSource,
+    /await this\.v4Runtime\?\.quiesceForSettingsChange\(\)[\s\S]*?try\s*\{[\s\S]*?await this\.persistSettingsData\(preparedSettings\)[\s\S]*?this\.settings\s*=\s*preparedSettings[\s\S]*?credentialsChanged\(\)[\s\S]*?\}\s*finally\s*\{[\s\S]*?finishSettingsChange/u,
+  );
+  assert.match(runtimeSource, /private settingsTransitionActive\s*=\s*false/u);
+  assert.match(runtimeSource, /quiesceForSettingsChange\(\)[\s\S]*?settingsTransitionActive\s*=\s*true[\s\S]*?cancelPending\(\)[\s\S]*?cancelActive/u);
+  assert.match(runtimeSource, /finishSettingsChange\(\)[\s\S]*?settingsTransitionActive\s*=\s*false/u);
+  assert.match(runtimeSource, /manualSync\(\)[\s\S]*?runWhileSettingsStable/u);
+  assert.match(runtimeSource, /createHistoryService\(\)[\s\S]*?assertSettingsTransitionInactive/u);
+  assert.match(runtimeSource, /private enqueue\([^)]*\)[\s\S]*?settingsTransitionActive[\s\S]*?settingsTransitionSawLocalChange/u);
+});
+
+test("startup and scheduled callbacks are bound to the settings generation that scheduled them", async () => {
+  const mainSource = await readFile("src/main.ts", "utf8");
+
+  assert.match(
+    mainSource,
+    /registerScheduledSync\(\)[\s\S]*?const generation\s*=\s*this\.v4Runtime\.settingsGeneration[\s\S]*?setInterval\([\s\S]*?settingsGeneration\s*!==\s*generation[\s\S]*?return[\s\S]*?scheduledSync/u,
+  );
+  assert.match(
+    mainSource,
+    /onLayoutReady[\s\S]*?const generation\s*=\s*this\.v4Runtime\.settingsGeneration[\s\S]*?setTimeout\([\s\S]*?settingsGeneration\s*!==\s*generation[\s\S]*?return[\s\S]*?startupSync/u,
+  );
+});
