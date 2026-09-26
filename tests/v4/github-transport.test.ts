@@ -375,13 +375,11 @@ test("GitHubClient never blindly retries a normal ref mutation after a lost resp
   }
 })
 
-test("empty-repository bootstrap observes initialization before retrying a lost Contents PUT", async () => {
-  const requests: Array<Record<string, any>> = []
+test("empty-repository bootstrap replans after a lost Contents PUT once repository state appears", async () => {
   let initialized = false
   let puts = 0
   setRequestUrlHandler(async (options: unknown) => {
     const request = options as Record<string, any>
-    requests.push(request)
     if (request.url.includes("/git/refs?")) {
       return initialized
         ? { status: 200, text: "", headers: {}, json: [{ ref: "refs/heads/main", object: { sha: "bootstrap-commit", type: "commit" } }] }
@@ -392,9 +390,6 @@ test("empty-repository bootstrap observes initialization before retrying a lost 
       initialized = true
       throw new Error("bootstrap response lost")
     }
-    if (request.method === "GET" && request.url.includes("/git/ref/heads/main")) {
-      return { status: 200, text: "", headers: {}, json: { ref: "refs/heads/main", object: { sha: "bootstrap-commit", type: "commit" } } }
-    }
     throw new Error(`Unexpected request: ${request.method} ${request.url}`)
   })
   try {
@@ -402,8 +397,16 @@ test("empty-repository bootstrap observes initialization before retrying a lost 
       { token: "token", owner: "owner", repo: "repo", branch: "main" },
       { transportPolicy: { mutationSpacingMs: 0 } },
     )
-    const ref = await client.ensureGitRepositoryInitialized()
-    assert.equal(ref?.sha, "bootstrap-commit")
+    await assert.rejects(
+      () => client.ensureGitRepositoryInitialized(),
+      error => {
+        const candidate = error as Error & { code?: string; observedRefSha?: string }
+        assert.equal(candidate.name, "V4RepositoryBootstrapRaceError")
+        assert.equal(candidate.code, "V4_REPOSITORY_BOOTSTRAP_RACE")
+        assert.equal(candidate.observedRefSha, "bootstrap-commit")
+        return true
+      },
+    )
     assert.equal(puts, 1)
   } finally {
     setRequestUrlHandler(null)
