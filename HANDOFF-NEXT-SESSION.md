@@ -164,6 +164,32 @@ Audit method:
    - RED: `722524c9abad4099f979fe59cd19d46b4da6fa3a`.
    - Fix: `2f2f1ac0875623279ff35362e82c097027504869` applies the same payload validator before persistence/return, so malformed recovery state cannot become replayable in-process or after restart.
 
+23. **HIGH local-mutation safety — external Git paths were not normalized before entering reconciliation/planning.**
+   - Manual/plaintext Git commits can introduce tree paths not emitted by the plugin writer, including backslash/noncanonical path forms.
+   - Without an explicit trust-boundary check those paths could flow toward local pull planning with platform-dependent normalization semantics.
+   - RED: `5a0409c06a3507f27fd1d15a2d220a33130e675d`.
+   - Fix: `a42e50294fc3db66a30a4eaed69af56d84a9f291` requires every external non-internal blob path to pass `normalizeV4VaultPath` and already be canonical before any file read/planning/local mutation.
+
+24. **HIGH conflict safety — external reconciliation synthesized remote mtimes and the `newer` policy treated them as authoritative.**
+   - Git trees do not carry file mtimes, so reconciliation uses a local synthetic timestamp.
+   - Under `newer`, a concurrent local edit could be overwritten merely because the synthetic remote timestamp happened to be later.
+   - RED: `037845866387da48402e00ee5fe4528bee33c7be`.
+   - Fix: `3433f06d1d31535a0adf57079e9193405a94382a` downgrades `newer` to keep-both/copy conflict resolution for externally reconciled state, preserving both sides instead of comparing synthetic time.
+   - Follow-up `ae590080696312eeba0c5cf122cf32eb74bdc150` keeps synthesized external `remoteVersion` inside the protocol-safe token alphabet.
+
+25. **MEDIUM fail-closed Git boundary — successful empty-repository bootstrap accepted a malformed commit object ID.**
+   - Contents bootstrap `200/201` extracted `commit.sha` as any non-empty string, unlike the hardened immutable Git object APIs.
+   - A malformed 2xx response could therefore trigger a dependent create-ref mutation using an invalid/unproven object ID.
+   - RED: `fb8c8196c26a2be984defdb23d62c8acf9f11ca7`.
+   - Fix: `95b56311885d9fbce55996e24afc3a593b355bd0` requires the bootstrap commit SHA to be a valid 40-hex Git object ID before any dependent branch creation.
+
+26. **HIGH sync correctness — authoritative full scans trusted size+mtime and could silently miss content changes.**
+   - The targeted watcher-change path already rehashes changed files.
+   - Startup/scheduled/manual runs with no queued changes and explicit `rescan` used the full-scan path, where matching cached size+mtime reused the prior content hash.
+   - Tools/restores that preserve both size and mtime could therefore change bytes while a normal authoritative sync continued to report no change and retained the stale index hash.
+   - RED: `980f9211f2addc2d70cc83e071b82f419799f7c5` covers both no-change-list full scan and explicit rescan.
+   - Fix: `f41c250c6f32a69244455b508423519079bb941f` disables stat-only hash reuse for authoritative full scans/rescans; targeted event-driven scans retain the optimization.
+
 ### Audited surfaces with no new confirmed defect so far
 
 - secret migration/persistence: raw token/passphrase are removed before plugin data persistence and use Obsidian SecretStorage;
@@ -173,7 +199,7 @@ Audit method:
 - request scheduler/transport policy: read/write concurrency and rate-limit waits are bounded/abortable;
 - local release publication tooling: canonical repo checks, create-only stable refs, ambiguous-state reconciliation, exact asset set/size/hash verification, and temp-ref compare-delete are present;
 - workflows: Actions are SHA-pinned, CI uses read-only contents permission, and the legacy Actions stable-release path remains intentionally interlocked;
-- local target size+mtime preconditions retain a theoretical same-size/same-mtime TOCTOU risk, but no realistic bypass path has been demonstrated in this audit; treat as residual risk unless a reproduction appears;
+- local target preconditions still use size+mtime at final mutation boundaries, but authoritative local discovery no longer treats matching size+mtime as content identity; the remaining narrow TOCTOU window is guarded by source hashing/stability where content is read and remains a residual OS/filesystem race rather than the previously confirmed full-scan blind spot;
 - recovery payload path/ID/stage/precondition validation is now enforced on both save and load; remaining header-field tightening is low-priority local-state hardening rather than a confirmed destructive path;
 - retired encrypted key material is best-effort zeroized on runtime disposal, but resolved keyrings invalidated by settings changes may remain in the cache's retired set until disposal. Immediate zeroization is intentionally not changed yet because history work exists outside the sync coordinator and can hold a live keyring reference; settings-generation guards now stop stale history results, but tighter reference-counted key lifetime remains a residual hardening opportunity. (full path/duplicate-ID/numeric validation), but header integrity and normal writer ownership mean no equivalent concrete production corruption path is confirmed yet.
 
