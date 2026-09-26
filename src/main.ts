@@ -6,6 +6,7 @@ import { normalizeScheduledSyncIntervalSeconds, shouldRunScheduledSync, shouldRu
 import { migrateV4Secrets, sanitizeV4SettingsForPersistence, storeV4Secrets } from "./lib/v4/secrets";
 import { V4PluginRuntime } from "./lib/v4/runtime";
 import { countV4ScopedPaths } from "./lib/v4/scope";
+import { compileV4IgnorePathRegex } from "./lib/v4/ignore";
 import { createIdleV4Progress } from "./lib/v4/progress";
 import { formatV4ActiveSyncStatus } from "./lib/v4/status";
 import { V4SyncCenterView, V4_SYNC_CENTER_VIEW } from "./views/sync-center";
@@ -223,6 +224,7 @@ export default class FastSync extends Plugin {
   }
 
   async saveSettings(nextSettings: PluginSettings = this.settings) {
+    compileV4IgnorePathRegex(nextSettings.ignorePathRegex)
     await this.v4Runtime?.quiesceForSettingsChange()
     this.settings = nextSettings
     this.v4Runtime?.credentialsChanged()
