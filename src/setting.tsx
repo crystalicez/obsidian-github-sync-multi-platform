@@ -99,10 +99,15 @@ export class SettingTab extends PluginSettingTab {
       saveBtn.onclick = async () => {
         if (this.tempSettings) {
           const nextSettings = JSON.parse(JSON.stringify(this.tempSettings)) as PluginSettings
-          await this.plugin.saveSettings(nextSettings)
-          this.plugin.updateStatusBar()
-          new Notice("GitHub Sync: Settings saved")
-          this.display()
+          try {
+            await this.plugin.saveSettings(nextSettings)
+            this.plugin.updateStatusBar()
+            new Notice("GitHub Sync: Settings saved")
+            this.display()
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error)
+            new Notice(`GitHub Sync: Settings not saved: ${message}`)
+          }
         }
       }
 
