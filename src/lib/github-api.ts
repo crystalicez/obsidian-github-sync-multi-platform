@@ -386,8 +386,8 @@ export class GitHubClient {
           throw error;
         }
         const observed = await this.inspectAnyGitRef();
-        if (observed?.sha) commitSha = observed.sha;
-        else if (attempt === 2) throw error;
+        if (observed?.sha) throw new V4RepositoryBootstrapRaceError(observed.sha, error);
+        if (attempt === 2) throw error;
       }
     }
     if (!commitSha) throw new Error("GitHub bootstrap response is missing its commit SHA.");
