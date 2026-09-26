@@ -1295,3 +1295,18 @@ test("runtime decision modals settle immediately when the active sync is aborted
     /confirmThresholdOverride\(error,\s*request\.operation,\s*signal\)/u,
   );
 });
+
+
+test("aborted runtime decision modals preserve canonical cancellation after awaiting user input", async () => {
+  const runtimeSource = await readFile("src/lib/v4/runtime.ts", "utf8");
+  const sessionSource = await readFile("src/lib/v4/sync-session.ts", "utf8");
+
+  assert.match(
+    runtimeSource,
+    /await this\.confirmThresholdOverride\(error,\s*request\.operation,\s*signal\)[\s\S]*?throwIfV4Aborted\(signal\)[\s\S]*?if \(!confirmed\)/u,
+  );
+  assert.match(
+    sessionSource,
+    /await this\.input\.askConflict\([^)]*\)[\s\S]*?throwIfV4Aborted\(this\.input\.signal\)[\s\S]*?if \(resolution\.action === "ask"\)/u,
+  );
+});
