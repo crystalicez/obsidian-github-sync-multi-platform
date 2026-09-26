@@ -92,3 +92,39 @@ test("desktop stage commit swaps through backup and verifies the final target", 
   assert.deepEqual(new Uint8Array(await readFile(targetPath)), new Uint8Array([9, 8, 7, 6]));
   await assert.rejects(readFile(stagePath));
 });
+
+
+test("desktop stage commit resumes after a crash between target backup and staged rename", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "v4-stage-resume-"));
+  const stagePath = path.join(root, "stage.bin");
+  const targetPath = path.join(root, "target.bin");
+  const backupPath = `${stagePath}.target-backup`;
+  await writeFile(stagePath, new Uint8Array([9, 8, 7, 6]));
+  await writeFile(backupPath, new Uint8Array([1, 2, 3]));
+
+  const io = createV4PlatformIo({ platform: "desktop", resolveDesktopPath: value => value });
+  await io.commitStage(stagePath, targetPath, {
+    expectedTarget: { exists: true, size: 3 },
+    expectedStageSize: 4,
+    expectedStageSha256: "63d987d1c6d69751c17297f410f5b3547a65d096a8993b35bcb4f9cad054f176",
+  });
+
+  assert.deepEqual(new Uint8Array(await readFile(targetPath)), new Uint8Array([9, 8, 7, 6]));
+  await assert.rejects(readFile(stagePath));
+  await assert.rejects(readFile(backupPath));
+});
+
+test("desktop stage cleanup removes an orphaned target backup after the staged file already became the target", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "v4-stage-cleanup-"));
+  const stagePath = path.join(root, "stage.bin");
+  const targetPath = path.join(root, "target.bin");
+  const backupPath = `${stagePath}.target-backup`;
+  await writeFile(targetPath, new Uint8Array([9, 8, 7, 6]));
+  await writeFile(backupPath, new Uint8Array([1, 2, 3]));
+
+  const io = createV4PlatformIo({ platform: "desktop", resolveDesktopPath: value => value });
+  await io.removeStage(stagePath);
+
+  assert.deepEqual(new Uint8Array(await readFile(targetPath)), new Uint8Array([9, 8, 7, 6]));
+  await assert.rejects(readFile(backupPath));
+});
