@@ -156,6 +156,12 @@ export class V4PluginRuntime {
     void this.coordinator.whenIdle().finally(() => this.keyringCache.dispose())
   }
 
+  async quiesceForSettingsChange(): Promise<void> {
+    this.assertNotDisposed()
+    this.coordinator.cancelActive(new V4CancelledError("V4 settings changed."))
+    await this.coordinator.whenIdle()
+  }
+
   credentialsChanged(): void {
     if (this.disposed) return
     this.credentialGeneration++
