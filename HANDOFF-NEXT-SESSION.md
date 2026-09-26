@@ -12,34 +12,83 @@ Baseline master: `ef4f8e675a0be7d598c22b2ce88c843c1306c926`
 The user requested the most detailed practical production audit possible. This audit is active and must be resumed before declaring the repository closed again.
 
 Audit method:
-- prioritize data-loss, corruption, fail-open, remote-input/resource amplification, crash consistency, credential/symlink/path safety, GitHub mutation ambiguity, cancellation, and concurrency;
-- distinguish acceptance coverage from adversarial audit coverage;
-- confirm each candidate defect with a RED regression before production changes;
+- prioritize data loss/corruption, cross-target mutation, fail-open protocol behavior, remote-input/resource amplification, crash consistency, credential/symlink/path safety, GitHub mutation ambiguity, cancellation, and concurrency;
+- distinguish prior acceptance coverage from adversarial audit coverage;
+- confirm each production candidate with a RED regression before changing behavior;
 - use TDD for fixes;
 - do not run destructive live GitHub E2E or `release:local` merely as audit verification.
 
-Current candidate findings requiring RED proof:
-1. **Plaintext unchanged-head local-index authority** — `V4SyncSession` may reconstruct remote state from a structurally complete local index when the branch SHA matches. Local-index validation does not recompute remote shard content hashes. A locally corrupted shard can therefore remain “complete” while omitting a record. In `forcePull`, this may treat the missing cached record as authoritative remote deletion and trash a local file even though the immutable remote shard still contains it.
-2. **Remote-controlled PBKDF2 work factor** — `decodeV4RemoteConfig` does not validate KDF algorithm/parameters, salt shape/size, or bound `iterations`; runtime passes remote iterations directly to WebCrypto PBKDF2. A forged/corrupt encrypted config may cause CPU/resource exhaustion before sync can fail safely.
-3. **Unbounded history journal fanout** — `V4HistoryService.readJournal` trusts page 0 `pageCount` and performs one remote read per page without a protocol bound or cross-page consistency check. A forged/corrupt plugin-looking journal can amplify history work into very large request counts.
-4. **Remote descriptor/count validation** — chunk/pack/history descriptors are still being audited for count/size consistency and resource amplification; no confirmed finding yet.
+### Confirmed production findings awaiting RED tests/fixes
 
-Audit areas already inspected:
-- V4 runtime/session/planner/coordinator;
-- local index and remote loader/index;
-- publication race/reconciler and Git mutation retry policy;
-- GitHub API immutable reads and mutation wrappers;
-- content source/object streaming/resource controller;
-- crypto/keyring/secrets;
-- recovery-store semantics (partial; deeper payload-bound audit pending);
-- history service/journals.
+1. **HIGH — local-index cache integrity is not content-authenticated before becoming remote authority.**
+   - `loadV4LocalIndex()` checks that the persisted shard's `hash` string equals the header's advertised hash but never recomputes that hash from the loaded records.
+   - A cached shard whose records are omitted/modified while its old `hash` field remains unchanged is still considered complete.
+   - The plaintext unchanged-head fast path can reconstruct `V4RemoteState` from that cache without loading the immutable remote shard.
+   - Consequence: Force Pull can treat a still-remote file as deleted locally; normal sync can also plan/publish from an incomplete remote record set and remove metadata/object reachability for an unrelated remote file.
+   - Intended fix: recompute the canonical remote shard content hash from loaded cached records (excluding local-only cache fields such as `dirty`) and invalidate the cache on mismatch; retain the valid unchanged-head optimization.
 
-Next audit actions:
-1. inspect recovery payload validation/bounds, release tooling/workflows, settings/runtime lifecycle, and remaining GitHub bootstrap/mutation paths;
-2. write RED regressions for confirmed candidates;
-3. fix only reproduced defects;
-4. run focused + full acceptance appropriate to changed surfaces;
-5. update this handoff after every material finding/fix/verification change.
+2. **HIGH — settings/credentials can change while a sync is active, allowing cross-target state mixing.**
+   - Setting UI currently assigns `plugin.settings = tempSettings` before `saveSettings()`.
+   - `saveSettings()` invalidates keyring generation and replaces `githubClient`, but does not cancel/await the active coordinator run.
+   - Runtime reads `this.plugin.settings` and `this.plugin.githubClient` repeatedly across awaits, so one run can observe repo/client/settings from different generations.
+   - Consequence: state/config loaded from target A can be combined with repo identity/client/passphrase/policy from target B.
+   - Intended fix: add a non-disposing coordinator/runtime quiesce operation; abort + await the active run while old settings/client remain installed, then atomically publish/store the new settings/client.
+
+3. **HIGH — empty-repository bootstrap unknown outcome can silently adopt an unproven competitor commit.**
+   - After a lost/unknown Contents bootstrap mutation response, `ensureGitRepositoryInitialized()` accepts any newly observed ref SHA as the bootstrap commit.
+   - There is no proof that observed SHA was created by this invocation; a concurrent initializer can win in the unknown window.
+   - Definitive 409/422 bootstrap races already replan correctly, but unknown-outcome bootstrap currently has weaker semantics.
+   - Intended fix: if an unknown Contents PUT is followed by newly non-empty repository state, throw typed `V4RepositoryBootstrapRaceError` and replan rather than adopting the observed commit.
+
+4. **MEDIUM/HIGH resource safety — encrypted remote config accepts unsupported/unbounded KDF semantics.**
+   - `decodeV4RemoteConfig()` currently validates version/mode/path layout only.
+   - Encrypted `algorithm`, `kdf`, `kdfParams.iterations`, and salt representation/size are not strictly validated.
+   - Runtime passes remote iterations directly into WebCrypto PBKDF2.
+   - Consequences: unsupported protocol fields are silently interpreted as current AES-GCM/PBKDF2 behavior; forged/corrupt configs can request extreme PBKDF2 work and cause CPU/resource exhaustion.
+   - Compatibility note: tests/legacy fixtures intentionally use low positive iteration counts, so the fix should enforce recognized algorithms, positive-safe integer iterations plus an upper resource ceiling, and strict bounded base64url salt without imposing a new high minimum that breaks legacy repos.
+
+5. **MEDIUM resource/protocol safety — history journal identity/page fanout is insufficiently bounded.**
+   - Commit classification accepts any non-whitespace suffix after `obsidian-sync-v4:` as a journal ID, while the writer emits a restricted `${timestamp}-${base64url}` token.
+   - Page 0 `pageCount` controls one remote read per page without a protocol ceiling.
+   - Subsequent pages are not required to agree on `pageCount`; page change arrays are not bounded to the writer's 500-change default.
+   - Consequences: forged/corrupt plugin-looking history commits can cause large request amplification and path-like journal identifiers.
+   - Intended fix: validate journal ID token shape/length, bound page count, enforce positive integer page metadata/cross-page consistency, and cap changes per page to the writer contract.
+
+6. **MEDIUM resource/protocol safety — remote record descriptors permit workloads the writer cannot produce.**
+   - Remote record validation does not require non-negative safe `size`, bounded chunk part counts, or writer-compatible pack-entry sizes.
+   - Chunked `V4StorageCodec.read()` currently fans all `partPaths` through `Promise.all()`.
+   - Writer already enforces a 400 content-mutation/revision budget and pack limits (500 files, <=1 MiB entry, <=32 MiB plaintext group), but reader validation does not enforce corresponding impossible-state rejection.
+   - Conflict/merge/copy/history paths use the whole-buffer reader, so forged metadata can amplify concurrent remote reads.
+   - Intended fix: enforce remote record numeric/descriptor bounds using the writer constants and replace unbounded chunk `Promise.all()` with bounded/sequential reading as defense in depth.
+
+### Audited surfaces with no new confirmed defect so far
+
+- secret migration/persistence: raw token/passphrase are removed before plugin data persistence and use Obsidian SecretStorage;
+- debug payload/logging: sensitive key redaction, recursive error sanitization, cycle/depth bounds are present;
+- GitHub mutation retry policy: reachable-ref mutations are not blindly retried after unknown outcomes;
+- publication reconciliation: ancestry work is bounded and fails indeterminate rather than claiming success;
+- request scheduler/transport policy: read/write concurrency and rate-limit waits are bounded/abortable;
+- local release publication tooling: canonical repo checks, create-only stable refs, ambiguous-state reconciliation, exact asset set/size/hash verification, and temp-ref compare-delete are present;
+- workflows: Actions are SHA-pinned, CI uses read-only contents permission, and the legacy Actions stable-release path remains intentionally interlocked;
+- local target size+mtime preconditions retain a theoretical same-size/same-mtime TOCTOU risk, but no realistic bypass path has been demonstrated in this audit; treat as residual risk unless a reproduction appears;
+- recovery payload validation has hardening gaps (full path/duplicate-ID/numeric validation), but header integrity and normal writer ownership mean no equivalent concrete production corruption path is confirmed yet.
+
+### TDD plan
+
+Write RED regressions before fixes:
+- `tests/v4/local-index.test.ts`: records tampered/omitted while advertised hash remains unchanged must invalidate cache.
+- `tests/v4/sync-coordinator.test.ts` + settings/runtime contract test: cancel active run without disposing and remain reusable; settings save must quiesce before publishing new settings.
+- `tests/v4/github-transport.test.ts`: unknown bootstrap response followed by competitor ref must surface a typed bootstrap race.
+- `tests/v4/protocol-core.test.ts`: unsupported/unbounded encrypted remote config must fail before key derivation.
+- `tests/v4/history-service.test.ts`: unsafe journal marker, excessive pageCount, and pageCount inconsistency must fail closed with bounded reads.
+- new remote-metadata bounds regression: invalid size / excessive chunk descriptors reject before body fanout; chunk reader must not create unbounded concurrent reads.
+
+After RED proof:
+1. implement minimal root-cause fixes;
+2. update this handoff with exact commits and any refined severity;
+3. attempt focused verification in the AI environment;
+4. if repository execution remains unavailable, provide one user-local focused gate before full acceptance;
+5. open a draft audit PR only after the branch diff is coherent; do not merge without explicit user request.
 
 ## Final repository state
 
