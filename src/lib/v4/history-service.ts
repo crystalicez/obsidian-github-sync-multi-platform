@@ -66,6 +66,7 @@ export class V4HistoryService {
   async previewChange(commit: V4HistoryCommit, change: V4HistoryChange): Promise<V4VersionPreview> {
     const descriptor = change.after ?? change.before
     if (!descriptor) return { kind: "binary", bytes: new Uint8Array() }
+    const record = this.recordFromDescriptor(change, descriptor)
     if (descriptor.size > V4_HISTORY_PREVIEW_MAX_BYTES) {
       throw new Error(`V4 history preview exceeds the ${V4_HISTORY_PREVIEW_MAX_BYTES}-byte preview limit.`)
     }
@@ -76,7 +77,6 @@ export class V4HistoryService {
     const tree = await this.input.github.getTreeAt(versionCommit.treeSha, true)
     if (tree.truncated) throw new Error("Historical Git tree is truncated; preview is unsafe.")
     const shas = new Map(tree.tree.filter(node => node.type === "blob").map(node => [node.path, node.sha]))
-    const record = this.recordFromDescriptor(change, descriptor)
     const bytes = await this.codec.read(record, async path => {
       const sha = shas.get(path)
       if (!sha) throw new Error(`Version blob is missing: ${path}`)
