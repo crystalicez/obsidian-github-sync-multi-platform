@@ -2747,3 +2747,44 @@ test("v4 rejects a non-canonical external Git path before any local pull mutatio
   assert.equal(vault.files.has("Folder\\evil.md"), false);
   assert.equal(vault.files.has("Folder/evil.md"), false);
 });
+
+
+test("v4 newer policy does not treat synthesized external reconciliation mtime as authoritative", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault();
+  vault.files.set("note.md", { bytes: enc("base"), mtime: 1 });
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "local", mode: "plaintext" });
+
+  await new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "newer", abortChangePercent: 0, now: () => 10 })
+    .sync({ operation: "forcePush", allowThresholdOverride: false });
+
+  const previousHead = github.ref!.sha;
+  const previousTree = github.commits.get(previousHead)!.treeSha;
+  const remoteBlob = await github.createGitBlob(enc("external remote"));
+  const externalTree = await github.createGitTree([
+    { path: "note.md", mode: "100644", type: "blob", sha: remoteBlob },
+  ], previousTree);
+  const externalCommit = await github.createGitCommit("manual GitHub edit", externalTree, [previousHead]);
+  await github.updateGitRef(externalCommit, previousHead);
+
+  vault.files.set("note.md", { bytes: enc("local edit"), mtime: 20 });
+
+  await new V4SyncSession({
+    github,
+    vault,
+    index,
+    config: config(),
+    conflictPolicy: "newer",
+    abortChangePercent: 0,
+    now: () => 100,
+  }).sync({
+    operation: "normal",
+    allowThresholdOverride: false,
+    changes: [{ type: "modify", path: "note.md", mtime: 20 }],
+  });
+
+  assert.equal(dec(vault.files.get("note.md")!.bytes), "local edit");
+  const copyPath = [...vault.files.keys()].find(path => path.includes(".conflict-remote-"));
+  assert.ok(copyPath, "external conflict must be preserved as a copy when remote mtime is synthetic");
+  assert.equal(dec(vault.files.get(copyPath!)!.bytes), "external remote");
+});
