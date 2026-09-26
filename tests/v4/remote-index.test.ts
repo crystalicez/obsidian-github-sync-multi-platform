@@ -229,3 +229,32 @@ test("v4 remote shard rejects chunk counts outside the writer-compatible size ra
     );
   }
 });
+
+
+test("v4 remote records reject local-only cache flags", async () => {
+  const config: V4RemoteConfig = { formatVersion: 4, mode: "plaintext", repoId: "o/r#main", pathLayout: "plaintext-v1" };
+  const path = "Notes/a.md";
+  const pathId = await sha256Hex(enc(`path:${path}`));
+  const base = {
+    path,
+    pathId,
+    fileId: "file-a",
+    plaintextSha256: "a".repeat(64),
+    size: 1,
+    mtime: 1,
+    remoteVersion: "v1",
+    remotePath: path,
+    storage: "single" as const,
+  };
+
+  for (const [label, record] of [
+    ["dirty", { ...base, dirty: true }],
+    ["deleted", { ...base, deleted: true }],
+  ] as const) {
+    await assert.rejects(
+      () => decodeV4RemoteShard(enc(JSON.stringify({ bucket: pathId.slice(0, 2), records: { [pathId]: record } })), pathId.slice(0, 2), config),
+      /local-only|dirty|deleted|remote record/iu,
+      label,
+    );
+  }
+});
