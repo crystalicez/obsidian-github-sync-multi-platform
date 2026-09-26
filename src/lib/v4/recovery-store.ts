@@ -375,9 +375,18 @@ export async function markV4RecoveryIndexCommitted(store: V4RecoveryStore, runId
 }
 
 export async function discardV4RecoveryStages(snapshot: V4RecoverySnapshot, io: V4LocalIo, keepStageIds: ReadonlySet<string> = new Set()): Promise<void> {
-  const stageIds = new Set(snapshot.payload?.mutations.flatMap(mutation => mutation.kind === "stage-write" ? [mutation.stage.stageId] : []) ?? [])
-  for (const stageId of stageIds) {
-    if (keepStageIds.has(stageId)) continue
+  const payload = snapshot.payload
+  if (!payload) return
+  const completed = new Set(payload.completedMutationIds)
+  const processed = new Set<string>()
+  for (const mutation of payload.mutations) {
+    if (mutation.kind !== "stage-write") continue
+    const stageId = mutation.stage.stageId
+    if (processed.has(stageId) || keepStageIds.has(stageId)) continue
+    processed.add(stageId)
+    if (!completed.has(mutation.id) && io.rollbackStage) {
+      await io.rollbackStage({ stage: mutation.stage, path: mutation.path, precondition: mutation.precondition })
+    }
     try { await io.staging?.remove({ stageId }) } catch {}
   }
 }
