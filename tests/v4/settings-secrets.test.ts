@@ -1259,3 +1259,17 @@ test("settings save does not publish the new runtime generation before durable p
     /encryptionPassphrase !== previousSettings\.encryptionPassphrase[\s\S]*?createSecretId\("encryption-passphrase"\)/u,
   );
 });
+
+
+test("force confirmation is bound to the settings generation that the user reviewed", async () => {
+  const mainSource = await readFile("src/main.ts", "utf8");
+
+  assert.match(
+    mainSource,
+    /async showForceConfirm\([^)]*\)[\s\S]*?const approvedGeneration\s*=\s*this\.v4Runtime\.settingsGeneration[\s\S]*?Repository:\s*\$\{repo\}[\s\S]*?Branch:\s*\$\{branch\}/u,
+  );
+  assert.match(
+    mainSource,
+    /const runConfirmedOperation[\s\S]*?this\.v4Runtime\.settingsGeneration\s*!==\s*approvedGeneration[\s\S]*?Settings changed[\s\S]*?return[\s\S]*?v4Runtime\.forcePush\(\)[\s\S]*?v4Runtime\.forcePull\(\)/iu,
+  );
+});
