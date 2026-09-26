@@ -190,10 +190,14 @@ export default class FastSync extends Plugin {
   }
 
   /** Persist only current V4 settings; the V4 local index uses its own sharded adapter storage. */
-  async persistData() {
+  private async persistSettingsData(settings: PluginSettings) {
     await this.saveData({
-      settings: sanitizeV4SettingsForPersistence(this.settings),
+      settings: sanitizeV4SettingsForPersistence(settings),
     });
+  }
+
+  async persistData() {
+    await this.persistSettingsData(this.settings)
   }
 
   async openSyncCenter(): Promise<void> {
@@ -230,14 +234,28 @@ export default class FastSync extends Plugin {
   async saveSettings(nextSettings: PluginSettings = this.settings) {
     assertPluginSettingsRuntimeSafe(nextSettings)
     compileV4IgnorePathRegex(nextSettings.ignorePathRegex)
+    const previousSettings = this.settings
+    const preparedSettings = { ...nextSettings }
+
+    if (!preparedSettings.githubTokenSecretId || preparedSettings.githubToken !== previousSettings.githubToken) {
+      preparedSettings.githubTokenSecretId = this.createSecretId("github-token")
+    }
+    if (
+      !preparedSettings.encryptionPassphraseSecretId
+      || preparedSettings.encryptionPassphrase !== previousSettings.encryptionPassphrase
+    ) {
+      preparedSettings.encryptionPassphraseSecretId = this.createSecretId("encryption-passphrase")
+    }
+
     await this.v4Runtime?.quiesceForSettingsChange()
-    this.settings = nextSettings
+    storeV4Secrets(preparedSettings, this.app.secretStorage)
+    await this.persistSettingsData(preparedSettings)
+
+    this.settings = preparedSettings
     this.v4Runtime?.credentialsChanged()
-    storeV4Secrets(this.settings, this.app.secretStorage)
     this.initGitHubClient()
     this.registerScheduledSync()
     this.updateRibbonIcon(!!(this.settings.githubToken && this.settings.githubOwner && this.settings.githubRepo))
-    await this.persistData()
   }
 
   showSavedFeedback() {
