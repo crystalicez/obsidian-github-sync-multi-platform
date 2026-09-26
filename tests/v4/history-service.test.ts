@@ -369,3 +369,50 @@ test("v4 history service rejects completion from an obsolete settings generation
 
   await assert.rejects(pending, /settings generation changed/iu);
 });
+
+
+test("v4 history previews external Git changes as raw blobs instead of requiring V4 descriptors", async () => {
+  let blobReads = 0;
+  const github = {
+    async listCommits() { return []; },
+    async getFileBytes() { return null; },
+    async getGitCommit(sha: string) { return { sha, treeSha: "tree-current", parentShas: [] }; },
+    async getTreeAt() {
+      return {
+        sha: "tree-current",
+        url: "",
+        truncated: false,
+        tree: [{ path: "external.md", mode: "100644", type: "blob" as const, sha: "blob-external", size: 8, url: "" }],
+      };
+    },
+    async getBlob(sha: string) {
+      blobReads++;
+      assert.equal(sha, "blob-external");
+      return enc("external");
+    },
+  };
+  const service = new V4HistoryService({
+    github,
+    config: { formatVersion: 4, mode: "encrypted", repoId: "o/r#main", pathLayout: "opaque-stable-v1", algorithm: "AES-GCM", kdf: "PBKDF2-SHA-256", kdfParams: { iterations: 10, salt: "c2FsdA" } },
+    keyring: await deriveV4Keyring({ passphrase: "pass", repoId: "o/r#main", salt: enc("salt"), iterations: 10 }),
+  });
+  const commit = {
+    sha: "external-commit",
+    message: "external edit",
+    authorName: "A",
+    authoredAt: "",
+    parentShas: [],
+    source: "external" as const,
+  };
+  const preview = await service.previewChange(commit, {
+    source: "external",
+    fileId: "external.md",
+    kind: "create",
+    path: "external.md",
+    after: { remotePath: "external.md", sha: "blob-external", size: 8 },
+  });
+
+  assert.equal(preview.kind, "text");
+  assert.equal(preview.text, "external");
+  assert.equal(blobReads, 1);
+});
