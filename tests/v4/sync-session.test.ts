@@ -12,7 +12,7 @@ import { decryptV4Payload, deriveV4Keyring, encryptV4Payload } from "../../src/l
 import { sha256Hex } from "../../src/lib/bytes";
 import { buildV4RemoteMetadata } from "../../src/lib/v4/remote-index";
 import { publishV4TreeChanges } from "../../src/lib/v4/git-tree-writer";
-import { V4_LARGE_FILE_THRESHOLD_BYTES } from "../../src/lib/v4/large-files";
+import { buildV4PartPaths, V4_LARGE_FILE_THRESHOLD_BYTES } from "../../src/lib/v4/large-files";
 import type { V4SyncProgressPatch } from "../../src/lib/v4/progress";
 import { DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES, type V4ContentHandle, type V4ContentSource } from "../../src/lib/v4/content-source";
 import { planV4PackGroups } from "../../src/lib/v4/pack-planner";
@@ -2623,4 +2623,95 @@ test("v4 pull rename preserves an old-path user edit that appears while remote b
     /local target changed/iu,
   );
   assert.equal(dec(localVault.files.get("old.md")!.bytes), "user-edit");
+});
+
+
+test("v4 keep-both chunked conflict streams the remote copy instead of whole-buffer reassembly", async () => {
+  const github = new MemoryGitHub();
+  const path = "conflict.bin";
+  const pathId = await sha256Hex(enc(`path:${path}`));
+  const bucket = pathId.slice(0, 2);
+  const fileId = "chunk-conflict-file";
+  const makeRecord = async (version: string, bytes: Uint8Array) => {
+    const partPaths = buildV4PartPaths({ mode: "plaintext", logicalPath: path, version, partCount: bytes.byteLength });
+    return {
+      path,
+      pathId,
+      fileId,
+      plaintextSha256: await sha256Hex(bytes),
+      size: bytes.byteLength,
+      mtime: version === "v1" ? 1 : 2,
+      remoteVersion: version,
+      remotePath: partPaths[0],
+      storage: "chunked" as const,
+      partPaths,
+    };
+  };
+  const publish = async (record: V4IndexFileRecord, bytes: Uint8Array, generation: number, expectedHeadSha?: string) => {
+    const shardHash = await sha256Hex(enc(JSON.stringify([record])));
+    const head: V4RemoteHead = {
+      formatVersion: 4,
+      mode: "plaintext",
+      epoch: 1,
+      generation,
+      journalId: record.remoteVersion,
+      shardHashes: { [bucket]: shardHash },
+      updatedAt: generation,
+      deviceId: "remote",
+    };
+    const objectFiles = record.partPaths!.map((partPath, index) => ({ path: partPath, bytes: bytes.subarray(index, index + 1) }));
+    return publishV4TreeChanges(github, {
+      message: `obsidian-sync-v4:${record.remoteVersion}`,
+      files: [...objectFiles, ...await buildV4RemoteMetadata({ config: config(), head, records: [record] })],
+      expectedHeadSha,
+    });
+  };
+
+  const baseBytes = new Uint8Array([1, 1]);
+  const remoteBytes = new Uint8Array([2, 2]);
+  const localBytes = new Uint8Array([3, 3]);
+  const baseRecord = await makeRecord("v1", baseBytes);
+  const base = await publish(baseRecord, baseBytes, 1);
+  const remoteRecord = await makeRecord("v2", remoteBytes);
+  await publish(remoteRecord, remoteBytes, 2, base.commitSha);
+
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "local", mode: "plaintext" });
+  const baseHash = await sha256Hex(enc(JSON.stringify([baseRecord])));
+  index.remoteCommitSha = base.commitSha;
+  index.epoch = 1;
+  index.generation = 1;
+  index.shardHashes = { [bucket]: baseHash };
+  index.shards = {
+    [bucket]: {
+      bucket,
+      hash: baseHash,
+      records: { [pathId]: { ...baseRecord, dirty: false } },
+    },
+  };
+  const vault = new MemoryVault();
+  vault.files.set(path, { bytes: localBytes, mtime: 3 });
+
+  const session = new V4SyncSession({
+    github,
+    vault,
+    index,
+    config: config(),
+    conflictPolicy: "copy",
+    abortChangePercent: 0,
+    now: () => 100,
+  });
+  const privateSession = session as unknown as {
+    readRecord(record: V4IndexFileRecord, remoteCommitSha?: string): Promise<Uint8Array>;
+  };
+  privateSession.readRecord = async record => {
+    if (record.storage === "chunked") throw new Error("whole-buffer chunk conflict copy forbidden");
+    throw new Error("unexpected whole-buffer remote read");
+  };
+
+  await session.sync({ operation: "normal", allowThresholdOverride: false, changes: [{ type: "modify", path, mtime: 3 }] });
+
+  const copyPath = [...vault.files.keys()].find(candidate => candidate.includes(".conflict-remote-"));
+  assert.ok(copyPath);
+  assert.deepEqual(vault.files.get(copyPath!)?.bytes, remoteBytes);
+  assert.deepEqual(vault.files.get(path)?.bytes, localBytes);
 });
