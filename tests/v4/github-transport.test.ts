@@ -279,7 +279,7 @@ test("GitHubClient falls back to Git Blob bytes when Contents omits a large payl
     const url = (options as { url: string }).url;
     requests.push(url);
     if (url.includes("/contents/")) {
-      return { status: 200, text: "", headers: {}, json: { content: "", encoding: "none", sha: "large-blob" }, arrayBuffer: new ArrayBuffer(0) };
+      return { status: 200, text: "", headers: {}, json: { content: "", encoding: "none", sha: "1111111111111111111111111111111111111111" }, arrayBuffer: new ArrayBuffer(0) };
     }
     return { status: 200, text: "payload", headers: {}, json: undefined, arrayBuffer: new TextEncoder().encode("large payload").buffer };
   });
@@ -287,8 +287,8 @@ test("GitHubClient falls back to Git Blob bytes when Contents omits a large payl
     const client = new GitHubClient({ token: "token", owner: "owner", repo: "repo", branch: "main" }, { transportPolicy: { mutationSpacingMs: 0 } });
     const file = await client.getFileBytes("large.bin", "commit-sha");
     assert.equal(new TextDecoder().decode(file!.bytes), "large payload");
-    assert.equal(file!.sha, "large-blob");
-    assert.equal(requests.some(url => url.endsWith("/git/blobs/large-blob")), true);
+    assert.equal(file!.sha, "1111111111111111111111111111111111111111");
+    assert.equal(requests.some(url => url.endsWith("/git/blobs/1111111111111111111111111111111111111111")), true);
   } finally {
     setRequestUrlHandler(null);
   }
@@ -487,7 +487,7 @@ test("immutable commit and content reads omit timestamp cache-busting while ref 
   setRequestUrlHandler(async (options: unknown) => {
     const request = options as Record<string, any>
     urls.push(request.url)
-    if (request.url.includes("/contents/")) return { status: 200, text: "", headers: {}, json: { content: "YQ==", encoding: "base64", sha: "blob" }, arrayBuffer: new ArrayBuffer(0) }
+    if (request.url.includes("/contents/")) return { status: 200, text: "", headers: {}, json: { content: "YQ==", encoding: "base64", sha: "2e65efe2a145dda7ee51d1741299f848e5bf752e" }, arrayBuffer: new ArrayBuffer(0) }
     if (request.url.includes("/git/commits/")) return { status: 200, text: "", headers: {}, json: { sha: "commit-sha", tree: { sha: "tree" }, parents: [] } }
     if (request.url.includes("/git/ref/heads/")) return { status: 200, text: "", headers: {}, json: { ref: "refs/heads/main", object: { sha: "commit-sha", type: "commit" } } }
     throw new Error(`unexpected:${request.url}`)
