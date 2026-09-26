@@ -2715,3 +2715,35 @@ test("v4 keep-both chunked conflict streams the remote copy instead of whole-buf
   assert.deepEqual(vault.files.get(copyPath!)?.bytes, remoteBytes);
   assert.deepEqual(vault.files.get(path)?.bytes, localBytes);
 });
+
+
+test("v4 rejects a non-canonical external Git path before any local pull mutation", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault();
+  vault.files.set("base.md", { bytes: enc("base"), mtime: 1 });
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "d", mode: "plaintext" });
+
+  await new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "forcePush", allowThresholdOverride: false });
+
+  const previousHead = github.ref!.sha;
+  const previousTree = github.commits.get(previousHead)!.treeSha;
+  const blobSha = await github.createGitBlob(enc("external"));
+  const externalTree = await github.createGitTree([
+    { path: "Folder\\evil.md", mode: "100644", type: "blob", sha: blobSha },
+  ], previousTree);
+  const externalCommit = await github.createGitCommit("external edit", externalTree, [previousHead]);
+  await github.updateGitRef(externalCommit, previousHead);
+
+  vault.operations.length = 0;
+
+  await assert.rejects(
+    () => new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+      .sync({ operation: "normal", allowThresholdOverride: false }),
+    /external.*path|not normalized|unsafe.*path/iu,
+  );
+
+  assert.deepEqual(vault.operations.filter(operation => /^(?:write|trash|delete):/u.test(operation)), []);
+  assert.equal(vault.files.has("Folder\\evil.md"), false);
+  assert.equal(vault.files.has("Folder/evil.md"), false);
+});
