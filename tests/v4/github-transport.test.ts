@@ -639,3 +639,31 @@ test("GitHub client rejects malformed successful immutable-object mutation respo
     setRequestUrlHandler(null);
   }
 });
+
+
+test("GitHubClient rejects a Contents payload with a malformed Git object SHA instead of trusting unverified bytes", async () => {
+  let requests = 0;
+  setRequestUrlHandler(async () => {
+    requests++;
+    return {
+      status: 200,
+      text: "",
+      headers: {},
+      json: { content: toBase64(new TextEncoder().encode("tampered")), encoding: "base64", sha: "not-a-git-sha" },
+      arrayBuffer: new ArrayBuffer(0),
+    };
+  });
+  try {
+    const client = new GitHubClient(
+      { token: "token", owner: "owner", repo: "repo", branch: "main" },
+      { transportPolicy: { mutationSpacingMs: 0 } },
+    );
+    await assert.rejects(
+      () => client.getFileBytes("binary.enc", "0123456789abcdef0123456789abcdef01234567"),
+      /contents.*sha|git object.*sha|malformed/iu,
+    );
+    assert.equal(requests, 1);
+  } finally {
+    setRequestUrlHandler(null);
+  }
+});
