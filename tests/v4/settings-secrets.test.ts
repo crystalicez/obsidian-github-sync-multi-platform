@@ -1168,7 +1168,7 @@ test("settings UI quiesces an active runtime before publishing a new settings ge
   const mainSource = await readFile("src/main.ts", "utf8");
   const settingsSource = await readFile("src/setting.tsx", "utf8");
 
-  assert.match(mainSource, /async saveSettings\([^)]*nextSettings[\s\S]*?await this\.v4Runtime\?\.quiesceForSettingsChange\(\)[\s\S]*?this\.settings\s*=\s*nextSettings[\s\S]*?credentialsChanged\(\)[\s\S]*?initGitHubClient\(\)/u);
+  assert.match(mainSource, /async saveSettings\([^)]*nextSettings[\s\S]*?await this\.v4Runtime\?\.quiesceForSettingsChange\(\)[\s\S]*?await this\.persistSettingsData\(preparedSettings\)[\s\S]*?this\.settings\s*=\s*preparedSettings[\s\S]*?credentialsChanged\(\)[\s\S]*?initGitHubClient\(\)/u);
   assert.match(settingsSource, /const nextSettings\s*=\s*JSON\.parse\(JSON\.stringify\(this\.tempSettings\)\)[\s\S]*?await this\.plugin\.saveSettings\(nextSettings\)/u);
   assert.doesNotMatch(settingsSource, /this\.plugin\.settings\s*=\s*JSON\.parse\(JSON\.stringify\(this\.tempSettings\)\)[\s\S]*?await this\.plugin\.saveSettings\(\)/u);
 });
@@ -1180,7 +1180,7 @@ test("settings save validates ignore regex before quiescing or publishing a new 
 
   assert.match(
     mainSource,
-    /async saveSettings\([^)]*nextSettings[\s\S]*?compileV4IgnorePathRegex\(nextSettings\.ignorePathRegex\)[\s\S]*?await this\.v4Runtime\?\.quiesceForSettingsChange\(\)[\s\S]*?this\.settings\s*=\s*nextSettings/u,
+    /async saveSettings\([^)]*nextSettings[\s\S]*?compileV4IgnorePathRegex\(nextSettings\.ignorePathRegex\)[\s\S]*?await this\.v4Runtime\?\.quiesceForSettingsChange\(\)[\s\S]*?await this\.persistSettingsData\(preparedSettings\)[\s\S]*?this\.settings\s*=\s*preparedSettings/u,
   );
   assert.match(
     settingsSource,
@@ -1225,7 +1225,7 @@ test("persisted settings are validated after migration before installation or sc
   const mainSource = await readFile("src/main.ts", "utf8")
   assert.match(
     mainSource,
-    /async loadSettings()[sS]*?migrateV4Secrets([sS]*?assertPluginSettingsRuntimeSafe(result.settings)[sS]*?this.settingss*=s*result.settings/u,
+    /async loadSettings\(\)[\s\S]*?migrateV4Secrets\([\s\S]*?assertPluginSettingsRuntimeSafe\(result\.settings\)[\s\S]*?this\.settings\s*=\s*result\.settings/u,
   )
 })
 
@@ -1234,7 +1234,7 @@ test("layout-ready startup callback is inert after plugin unload", async () => {
   const mainSource = await readFile("src/main.ts", "utf8")
   assert.match(
     mainSource,
-    /this.app.workspace.onLayoutReady(()s*=>s*{s*ifs*(this.unloaded)s*return[sS]*?setTimeout(()s*=>s*{s*ifs*(this.unloaded)s*return/u,
+    /this\.app\.workspace\.onLayoutReady\(\(\)\s*=>\s*\{\s*if\s*\(this\.unloaded\)\s*return[\s\S]*?setTimeout\(\(\)\s*=>\s*\{\s*if\s*\(this\.unloaded\)\s*return/u,
   )
 })
 
