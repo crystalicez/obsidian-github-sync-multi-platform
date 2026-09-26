@@ -1219,3 +1219,12 @@ test("runtime and settings-save boundaries validate settings before any sync-gen
     /private async execute\([^)]*\)[\s\S]*?assertPluginSettingsRuntimeSafe\(this\.plugin\.settings\)[\s\S]*?githubClient/u,
   );
 });
+
+
+test("persisted settings are validated after migration before installation or scheduling", async () => {
+  const mainSource = await readFile("src/main.ts", "utf8")
+  assert.match(
+    mainSource,
+    /async loadSettings()[sS]*?migrateV4Secrets([sS]*?assertPluginSettingsRuntimeSafe(result.settings)[sS]*?this.settingss*=s*result.settings/u,
+  )
+})
