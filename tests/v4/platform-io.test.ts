@@ -10,13 +10,21 @@ import {
   V4BoundedIoUnavailableError,
 } from "../../src/lib/v4/platform-io";
 
+function desktopIo(root: string) {
+  return createV4PlatformIo({
+    platform: "desktop",
+    resolveDesktopPath: value => value,
+    desktopRootPath: root,
+  });
+}
+
 test("desktop platform IO reads a generated file in bounded chunks", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "v4-platform-"));
   const filePath = path.join(root, "large.bin");
   const data = Uint8Array.from({ length: 1024 * 1024 + 19 }, (_, index) => index & 0xff);
   await writeFile(filePath, data);
 
-  const io = createV4PlatformIo({ platform: "desktop", resolveDesktopPath: value => value });
+  const io = desktopIo(root);
   assert.equal(io.capabilities.boundedRead, true);
   const source = await io.openBoundedSource(filePath, data.byteLength);
   let largest = 0;
@@ -83,7 +91,7 @@ test("desktop stage commit swaps through backup and verifies the final target", 
   const targetPath = path.join(root, "target.bin");
   await writeFile(stagePath, new Uint8Array([9, 8, 7, 6]));
   await writeFile(targetPath, new Uint8Array([1, 2, 3]));
-  const io = createV4PlatformIo({ platform: "desktop", resolveDesktopPath: value => value });
+  const io = desktopIo(root);
   await io.commitStage(stagePath, targetPath, {
     expectedTarget: { exists: true, size: 3 },
     expectedStageSize: 4,
@@ -102,7 +110,7 @@ test("desktop stage commit resumes after a crash between target backup and stage
   await writeFile(stagePath, new Uint8Array([9, 8, 7, 6]));
   await writeFile(backupPath, new Uint8Array([1, 2, 3]));
 
-  const io = createV4PlatformIo({ platform: "desktop", resolveDesktopPath: value => value });
+  const io = desktopIo(root);
   await io.commitStage(stagePath, targetPath, {
     expectedTarget: { exists: true, size: 3 },
     expectedStageSize: 4,
@@ -122,7 +130,7 @@ test("desktop stage cleanup removes an orphaned target backup after the staged f
   await writeFile(targetPath, new Uint8Array([9, 8, 7, 6]));
   await writeFile(backupPath, new Uint8Array([1, 2, 3]));
 
-  const io = createV4PlatformIo({ platform: "desktop", resolveDesktopPath: value => value });
+  const io = desktopIo(root);
   await io.removeStage(stagePath);
 
   assert.deepEqual(new Uint8Array(await readFile(targetPath)), new Uint8Array([9, 8, 7, 6]));
@@ -138,7 +146,7 @@ test("desktop stage rollback restores the original target from a backup-only cra
   await writeFile(stagePath, new Uint8Array([9, 8, 7, 6]));
   await writeFile(backupPath, new Uint8Array([1, 2, 3]));
 
-  const io = createV4PlatformIo({ platform: "desktop", resolveDesktopPath: value => value });
+  const io = desktopIo(root);
   await io.rollbackStage(stagePath, targetPath, {
     expectedTarget: { exists: true, size: 3 },
     expectedStageSize: 4,
@@ -158,7 +166,7 @@ test("desktop stage rollback restores the original target when staged bytes reac
   await writeFile(targetPath, new Uint8Array([9, 8, 7, 6]));
   await writeFile(backupPath, new Uint8Array([1, 2, 3]));
 
-  const io = createV4PlatformIo({ platform: "desktop", resolveDesktopPath: value => value });
+  const io = desktopIo(root);
   await io.rollbackStage(stagePath, targetPath, {
     expectedTarget: { exists: true, size: 3 },
     expectedStageSize: 4,
@@ -177,7 +185,7 @@ test("desktop stage rollback refuses to overwrite an unrelated target edit and p
   await writeFile(targetPath, new Uint8Array([4, 4, 4, 4, 4]));
   await writeFile(backupPath, new Uint8Array([1, 2, 3]));
 
-  const io = createV4PlatformIo({ platform: "desktop", resolveDesktopPath: value => value });
+  const io = desktopIo(root);
   await assert.rejects(
     io.rollbackStage(stagePath, targetPath, {
       expectedTarget: { exists: true, size: 3 },
@@ -232,7 +240,7 @@ test("desktop bounded reads reject a vault directory link that escapes the vault
       platform: "desktop",
       resolveDesktopPath: value => path.join(root, value),
       desktopRootPath: root,
-    } as never);
+    });
 
     const source = await io.openBoundedSource("linked-outside/secret.bin", 3);
     await assert.rejects(
@@ -260,7 +268,7 @@ test("desktop staged commit refuses a target beneath a vault directory link", as
       platform: "desktop",
       resolveDesktopPath: value => path.join(root, value),
       desktopRootPath: root,
-    } as never);
+    });
 
     await assert.rejects(
       () => io.commitStage(".obsidian/stage.bin", "linked-outside/target.bin", {
@@ -275,4 +283,17 @@ test("desktop staged commit refuses a target beneath a vault directory link", as
     await rm(root, { recursive: true, force: true });
     await rm(outside, { recursive: true, force: true });
   }
+});
+
+
+test("desktop Node IO capability-fails when the vault root cannot be proven", async () => {
+  const io = createV4PlatformIo({
+    platform: "desktop",
+    resolveDesktopPath: value => value,
+  });
+  assert.equal(io.capabilities.boundedRead, false);
+  await assert.rejects(
+    () => io.assertVaultPathSafe("note.md"),
+    error => error instanceof V4BoundedIoUnavailableError,
+  );
 });
