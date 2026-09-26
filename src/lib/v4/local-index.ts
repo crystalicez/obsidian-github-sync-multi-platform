@@ -132,6 +132,9 @@ export function createEmptyV4LocalIndex(input: { repoId: string; deviceId: strin
 async function saveV4LocalIndexShard(adapter: V4LocalIndexAdapter, root: string, index: V4LocalIndex, bucket: string): Promise<void> {
   const shard = index.shards[bucket];
   if (!shard || !isShardConsistent(shard, bucket, shard.hash)) throw new Error(`Invalid V4 local index shard: ${bucket}`);
+  if (await hashV4ShardRecords(Object.values(shard.records)) !== shard.hash) {
+    throw new Error(`V4 local index shard hash mismatch: ${bucket}`);
+  }
   index.shardHashes[bucket] = shard.hash;
   await adapter.mkdir(root);
   await adapter.mkdir(join(root, "shards"));
