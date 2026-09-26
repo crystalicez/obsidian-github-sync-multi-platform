@@ -302,6 +302,7 @@ export default class FastSync extends Plugin {
   }
 
   async showForceConfirm(operation: "forcePush" | "forcePull"): Promise<void> {
+    const approvedGeneration = this.v4Runtime.settingsGeneration
     await new Promise<void>((resolve) => {
       const modal = new Modal(this.app)
       let settled = false
@@ -373,6 +374,12 @@ export default class FastSync extends Plugin {
       const runConfirmedOperation = () => {
         if (resolved || !unlocked) return
         resolved = true
+        if (this.v4Runtime.settingsGeneration !== approvedGeneration) {
+          modal.close()
+          new Notice("GitHub Sync: Settings changed after this confirmation was opened. Reopen the force confirmation and review the target again.")
+          finish()
+          return
+        }
         modal.close()
         if (operation === "forcePush") void this.v4Runtime.forcePush()
         else void this.v4Runtime.forcePull()
