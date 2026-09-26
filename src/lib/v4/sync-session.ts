@@ -21,8 +21,8 @@ import { assertV4LocalTargetPrecondition, createV4LocalIo, type V4LocalIo, type 
 import { trashV4LocalUserFile } from "./local-delete-policy"
 import { bucketForV4PathId, normalizeV4VaultPath } from "./paths"
 import { planV4Sync, type V4LogicalFile, type V4PlannedChange, type V4SyncOperation } from "./planner"
-import { assertV4RemoteRecordSet, buildV4RemoteMetadata, v4RemoteShardPath } from "./remote-index"
-import { effectiveV4PathLayout, expectedV4PathLayout, V4_CONFIG_PATH, V4_ROOT, type V4RemoteConfig, type V4RemoteHead } from "./protocol-types"
+import { assertV4RemoteRecordSet, buildV4RemoteMetadata, decodeV4RemoteHead, v4RemoteShardPath } from "./remote-index"
+import { effectiveV4PathLayout, expectedV4PathLayout, V4_CONFIG_PATH, V4_HEAD_PATH, V4_ROOT, type V4RemoteConfig, type V4RemoteHead } from "./protocol-types"
 import { loadV4RemoteConfig, loadV4RemoteState, remoteV4StateFromLocalIndex, type V4RemoteState } from "./remote-loader"
 import { V4StorageCodec } from "./storage-codec"
 import { collectV4ContentSource, createV4WholeBufferContentSource, DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES, type V4ContentHandle, type V4ContentSource } from "./content-source"
@@ -298,8 +298,7 @@ export class V4SyncSession {
     let externalReconciled = false
     if (remote && this.input.index.remoteCommitSha && remote.commitSha !== this.input.index.remoteCommitSha) {
       const tip = await this.input.github.getGitCommit(remote.commitSha)
-      const pluginMessage = `obsidian-sync-v4:${remote.head.journalId}`
-      if (tip.message?.split("\n", 1)[0] !== pluginMessage) {
+      if (!(await this.isVerifiedPluginPublication(remote, tip))) {
         await this.reconcileExternalCommit(remote, tip.treeSha)
         externalReconciled = true
       }
@@ -984,6 +983,27 @@ export class V4SyncSession {
       if (!preserveStagesForRecovery) await this.cleanupStages(ownedStages)
       this.localReadCache.clear()
     }
+  }
+
+  private async isVerifiedPluginPublication(
+    remote: V4RemoteState,
+    tip: { message?: string; parentShas: string[] },
+  ): Promise<boolean> {
+    const pluginMessage = `obsidian-sync-v4:${remote.head.journalId}`
+    if (tip.message?.split("\n", 1)[0] !== pluginMessage) return false
+    const parentSha = tip.parentShas[0]
+    if (!parentSha) return false
+    const parentHeadFile = await this.input.github.getFileBytes(V4_HEAD_PATH, parentSha)
+    if (!parentHeadFile) return false
+    let parentHead: V4RemoteHead
+    try {
+      parentHead = await decodeV4RemoteHead(parentHeadFile.bytes, remote.config, this.input.keyring)
+    } catch {
+      return false
+    }
+    return parentHead.mode === remote.head.mode
+      && remote.head.generation === parentHead.generation + 1
+      && remote.head.journalId !== parentHead.journalId
   }
 
   private async reconcileExternalCommit(remote: V4RemoteState, treeSha: string): Promise<void> {
