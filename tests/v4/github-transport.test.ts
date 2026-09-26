@@ -695,3 +695,32 @@ test("GitHubClient rejects a raw Git Blob 200 whose bytes do not match the reque
     setRequestUrlHandler(null);
   }
 });
+
+
+test("GitHubClient rejects malformed successful commit-list and tree responses", async () => {
+  setRequestUrlHandler(async (options: unknown) => {
+    const request = options as Record<string, any>;
+    if (request.url.includes("/commits?")) {
+      return { status: 200, text: "", headers: {}, json: { not: "an array" } };
+    }
+    throw new Error(`Unexpected request: ${request.method} ${request.url}`);
+  });
+  try {
+    const client = new GitHubClient(
+      { token: "token", owner: "owner", repo: "repo", branch: "main" },
+      { transportPolicy: { mutationSpacingMs: 0 } },
+    );
+    await assert.rejects(() => client.listCommits(), /commit.*list|malformed|array/iu);
+
+    setRequestUrlHandler(async (options: unknown) => {
+      const request = options as Record<string, any>;
+      if (request.url.includes("/git/trees/")) {
+        return { status: 200, text: "", headers: {}, json: { sha: "tree", tree: [] } };
+      }
+      throw new Error(`Unexpected request: ${request.method} ${request.url}`);
+    });
+    await assert.rejects(() => client.getTreeAt("tree", true), /tree.*truncated|malformed|boolean/iu);
+  } finally {
+    setRequestUrlHandler(null);
+  }
+});
