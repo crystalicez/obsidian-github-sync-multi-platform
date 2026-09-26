@@ -1,5 +1,13 @@
 import type { V4ChangeKind } from "./planner";
 
+export const V4_JOURNAL_PAGE_SIZE = 500
+export const V4_MAX_JOURNAL_PAGES = 256
+const V4_JOURNAL_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/u
+
+export function isV4JournalId(value: unknown): value is string {
+  return typeof value === "string" && V4_JOURNAL_ID_PATTERN.test(value)
+}
+
 export interface V4VersionDescriptor {
   remotePath: string;
   sha: string;
@@ -44,9 +52,13 @@ export interface V4FileVersion {
   descriptor?: V4VersionDescriptor;
 }
 
-export function buildV4JournalPages(journalId: string, changes: V4JournalChange[], pageSize = 500): V4JournalPage[] {
-  if (!Number.isInteger(pageSize) || pageSize <= 0) throw new Error("V4 journal page size must be positive.");
+export function buildV4JournalPages(journalId: string, changes: V4JournalChange[], pageSize = V4_JOURNAL_PAGE_SIZE): V4JournalPage[] {
+  if (!isV4JournalId(journalId)) throw new Error("V4 journal id is invalid.");
+  if (!Number.isInteger(pageSize) || pageSize <= 0 || pageSize > V4_JOURNAL_PAGE_SIZE) {
+    throw new Error(`V4 journal page size must be between 1 and ${V4_JOURNAL_PAGE_SIZE}.`)
+  }
   const pageCount = Math.max(1, Math.ceil(changes.length / pageSize));
+  if (pageCount > V4_MAX_JOURNAL_PAGES) throw new Error("V4 journal page count exceeds the protocol limit.")
   return Array.from({ length: pageCount }, (_, page) => ({
     journalId,
     page,
