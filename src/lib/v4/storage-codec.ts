@@ -1,4 +1,5 @@
 import { bytesToUtf8, fromBase64, sha256Hex, toBase64, utf8ToBytes } from "../bytes"
+import { boundedMap } from "./bounded-map"
 import { collectV4ContentSource, type V4ContentSource } from "./content-source"
 import { decryptV4Payload, encryptV4Payload, type V4Keyring } from "./crypto"
 import { throwIfV4Aborted } from "./cancellation"
@@ -15,6 +16,8 @@ import { normalizeV4VaultPath, objectIdForV4File, opaqueV4ObjectPath, opaqueV4Pa
 import { type V4FileRecord, type V4PathLayout, type V4StorageMode } from "./protocol-types"
 import type { V4ResourceController } from "./resource-controller"
 import type { V4StagedSink } from "./staging-store"
+
+const V4_CHUNK_READ_CONCURRENCY = 4
 
 export interface V4PreparedFile {
   path: string
@@ -486,7 +489,7 @@ export class V4StorageCodec {
     }
     const partPaths = record.partPaths ?? []
     if (partPaths.length === 0) throw new Error("V4 chunked record has no parts.")
-    const parts = await Promise.all(partPaths.map(async (path, index) => {
+    const parts = await boundedMap(partPaths, V4_CHUNK_READ_CONCURRENCY, async (path, index) => {
       throwIfV4Aborted(signal)
       const bytes = await reader(path)
       throwIfV4Aborted(signal)
@@ -496,7 +499,7 @@ export class V4StorageCodec {
           kind: "part",
           aad: `${this.contentAad(record)}:${index}`,
         }))
-    }))
+    })
     return joinAndVerifyV4Parts(parts, record.plaintextSha256)
   }
 }
