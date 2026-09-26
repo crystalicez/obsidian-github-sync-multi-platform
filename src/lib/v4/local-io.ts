@@ -16,6 +16,7 @@ export interface V4SessionVault {
   openContentSource?(handle: V4ContentHandle, signal?: AbortSignal): Promise<V4ContentSource>
   staging?: V4StagingStore
   commitStage?(input: { stage: V4StageRef; path: string; precondition: V4LocalTargetPrecondition }): Promise<void>
+  rollbackStage?(input: { stage: V4StageRef; path: string; precondition: V4LocalTargetPrecondition }): Promise<void>
 }
 
 export type V4LocalIo = V4SessionVault
@@ -31,6 +32,7 @@ export function createV4LocalIo(vault: V4SessionVault): V4LocalIo {
   if (vault.openContentSource) localIo.openContentSource = (handle, signal) => vault.openContentSource!(handle, signal)
   if (vault.staging) localIo.staging = vault.staging
   if (vault.commitStage) localIo.commitStage = input => vault.commitStage!(input)
+  if (vault.rollbackStage) localIo.rollbackStage = input => vault.rollbackStage!(input)
   return localIo
 }
 
