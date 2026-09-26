@@ -2,6 +2,7 @@ import assert from "node:assert/strict"
 import { readFile } from "node:fs/promises"
 import test from "node:test"
 
+import { sha256Hex, toBase64, utf8ToBytes } from "../../src/lib/bytes"
 import { createV4RecoveryStore, V4RecoveryRequiredError } from "../../src/lib/v4/recovery-store"
 import type { V4LocalIndexAdapter } from "../../src/lib/v4/local-index"
 
@@ -330,3 +331,82 @@ test("discarding replanned recovery does not roll back a staged mutation with a 
 
   assert.deepEqual(events, ["remove:stage-done"])
 });
+
+
+test("recovery store rejects integrity-valid payloads outside the writer safety contract", async () => {
+  const cases = [
+    {
+      label: "unsafe vault path",
+      payload: {
+        mutations: [{ id: "trash:unsafe", kind: "trash", path: "../outside.md", precondition: { path: "../outside.md", exists: true, size: 1, mtime: 1 } }],
+        completedMutationIds: [],
+      },
+    },
+    {
+      label: "duplicate mutation id",
+      payload: {
+        mutations: [
+          { id: "same", kind: "trash", path: "one.md", precondition: { path: "one.md", exists: false } },
+          { id: "same", kind: "trash", path: "two.md", precondition: { path: "two.md", exists: false } },
+        ],
+        completedMutationIds: [],
+      },
+    },
+    {
+      label: "unknown durable receipt",
+      payload: {
+        mutations: [{ id: "trash:one", kind: "trash", path: "one.md", precondition: { path: "one.md", exists: false } }],
+        completedMutationIds: ["trash:other"],
+      },
+    },
+    {
+      label: "invalid stage metadata",
+      payload: {
+        mutations: [{
+          id: "stage:one",
+          kind: "stage-write",
+          path: "one.md",
+          precondition: { path: "one.md", exists: false },
+          stage: { stageId: "../stage", hash: "not-a-hash", size: -1, mtime: Number.NaN },
+        }],
+        completedMutationIds: [],
+      },
+    },
+    {
+      label: "invalid existing precondition",
+      payload: {
+        mutations: [{
+          id: "trash:one",
+          kind: "trash",
+          path: "one.md",
+          precondition: { path: "one.md", exists: true, size: -1, mtime: Number.NaN },
+        }],
+        completedMutationIds: [],
+      },
+    },
+  ] as const
+
+  for (const entry of cases) {
+    const adapter = new MemoryAdapter()
+    const payloadBytes = utf8ToBytes(JSON.stringify(entry.payload))
+    const withoutIntegrity = {
+      schemaVersion: 1,
+      generation: 1,
+      runId: "run-safe-boundary",
+      phase: "remote-verified",
+      expectedRemoteHead: "a".repeat(40),
+      candidateCommitSha: "b".repeat(40),
+      verifiedRemoteHead: "b".repeat(40),
+      payloadCiphertext: toBase64(payloadBytes),
+    }
+    const integrity = await sha256Hex(utf8ToBytes(JSON.stringify(withoutIntegrity)))
+    adapter.values.set("recovery/slot-1.json", JSON.stringify({ ...withoutIntegrity, integrity }))
+    const store = createV4RecoveryStore({ adapter, root: "recovery", repoId: "owner/repo#main" })
+
+    await assert.rejects(
+      () => store.load(),
+      (error: unknown) => error instanceof V4RecoveryRequiredError,
+      entry.label,
+    )
+  }
+})
