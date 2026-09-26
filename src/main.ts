@@ -7,6 +7,7 @@ import { migrateV4Secrets, sanitizeV4SettingsForPersistence, storeV4Secrets } fr
 import { V4PluginRuntime } from "./lib/v4/runtime";
 import { countV4ScopedPaths } from "./lib/v4/scope";
 import { compileV4IgnorePathRegex } from "./lib/v4/ignore";
+import { assertPluginSettingsRuntimeSafe } from "./lib/plugin-settings-validation";
 import { createIdleV4Progress } from "./lib/v4/progress";
 import { formatV4ActiveSyncStatus } from "./lib/v4/status";
 import { V4SyncCenterView, V4_SYNC_CENTER_VIEW } from "./views/sync-center";
@@ -224,6 +225,7 @@ export default class FastSync extends Plugin {
   }
 
   async saveSettings(nextSettings: PluginSettings = this.settings) {
+    assertPluginSettingsRuntimeSafe(nextSettings)
     compileV4IgnorePathRegex(nextSettings.ignorePathRegex)
     await this.v4Runtime?.quiesceForSettingsChange()
     this.settings = nextSettings
