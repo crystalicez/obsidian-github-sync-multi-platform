@@ -5,6 +5,7 @@ import { GitHubClient } from "./lib/github-api";
 import { normalizeScheduledSyncIntervalSeconds, shouldRunScheduledSync, shouldRunStartupSync } from "./lib/sync-policy";
 import { migrateV4Secrets, sanitizeV4SettingsForPersistence, storeV4Secrets } from "./lib/v4/secrets";
 import { V4PluginRuntime } from "./lib/v4/runtime";
+import { countV4ScopedPaths } from "./lib/v4/scope";
 import { createIdleV4Progress } from "./lib/v4/progress";
 import { formatV4ActiveSyncStatus } from "./lib/v4/status";
 import { V4SyncCenterView, V4_SYNC_CENTER_VIEW } from "./views/sync-center";
@@ -287,7 +288,17 @@ export default class FastSync extends Plugin {
       modal.onClose = finish
       const repo = `${this.settings.githubOwner}/${this.settings.githubRepo}`
       const branch = this.settings.githubBranch || "main"
-      const localFileCount = this.app.vault.getFiles().filter(file => !file.path.startsWith(`${this.app.vault.configDir}/`)).length
+      const localFileCount = countV4ScopedPaths(
+        this.app.vault.getFiles().map(file => file.path),
+        {
+          configDir: this.app.vault.configDir,
+          pluginId: this.manifest.id,
+          ignorePathRegex: this.settings.ignorePathRegex,
+          syncObsidianConfig: this.settings.syncObsidianConfig,
+          syncBookmarks: this.settings.syncBookmarks,
+          syncPlugins: this.settings.syncPlugins,
+        },
+      )
 
       const title = operation === "forcePush" ? "Force push local vault to remote?" : "Force pull remote vault to local?";
       const message = operation === "forcePush"
