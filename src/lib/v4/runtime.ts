@@ -138,6 +138,8 @@ export class V4PluginRuntime {
   private readonly keyringCache = new V4KeyringCache()
   private credentialGeneration = 0
   private debounceRunActive = false
+  private settingsTransitionActive = false
+  private settingsTransitionSawLocalChange = false
   private disposed = false
 
   constructor(private readonly plugin: FastSync) {
@@ -163,24 +165,40 @@ export class V4PluginRuntime {
 
   async quiesceForSettingsChange(): Promise<void> {
     this.assertNotDisposed()
-    this.coordinator.cancelPending()
-    this.coordinator.cancelActive(new V4CancelledError("V4 settings changed."))
-    await this.coordinator.whenIdle()
-    this.coordinator.cancelPending()
-    this.debounceRunActive = false
-    if (this.progressStore.snapshot.lifecycle === "active" || this.progressStore.snapshot.lifecycle === "waiting") {
-      this.progressStore.update({
-        lifecycle: "idle",
-        phase: undefined,
-        currentPath: undefined,
-        currentDirection: undefined,
-        pull: { completed: 0, total: undefined },
-        push: { completed: 0, total: undefined },
-        errorMessage: undefined,
-        failurePhase: undefined,
-        failurePath: undefined,
-      })
+    if (this.settingsTransitionActive) throw new Error("V4 settings change is already in progress.")
+    this.settingsTransitionActive = true
+    this.settingsTransitionSawLocalChange = false
+    try {
+      this.coordinator.cancelPending()
+      this.coordinator.cancelActive(new V4CancelledError("V4 settings changed."))
+      await this.coordinator.whenIdle()
+      this.coordinator.cancelPending()
+      this.debounceRunActive = false
+      if (this.progressStore.snapshot.lifecycle === "active" || this.progressStore.snapshot.lifecycle === "waiting") {
+        this.progressStore.update({
+          lifecycle: "idle",
+          phase: undefined,
+          currentPath: undefined,
+          currentDirection: undefined,
+          pull: { completed: 0, total: undefined },
+          push: { completed: 0, total: undefined },
+          errorMessage: undefined,
+          failurePhase: undefined,
+          failurePath: undefined,
+        })
+      }
+    } catch (error) {
+      this.finishSettingsChange()
+      throw error
     }
+  }
+
+  finishSettingsChange(): void {
+    if (!this.settingsTransitionActive) return
+    const rescan = this.settingsTransitionSawLocalChange
+    this.settingsTransitionSawLocalChange = false
+    this.settingsTransitionActive = false
+    if (rescan && !this.disposed) this.enqueue({ type: "rescan", mtime: Date.now() })
   }
 
   credentialsChanged(): void {
@@ -224,14 +242,24 @@ export class V4PluginRuntime {
     return this.progressStore.subscribe(snapshot => listener(this.snapshotForConsumers(snapshot)))
   }
 
-  manualSync(): Promise<unknown> { return this.coordinator.run({ operation: "normal", trigger: "manual" }) }
-  startupSync(): Promise<unknown> { return this.coordinator.run({ operation: "normal", trigger: "startup" }) }
-  scheduledSync(): Promise<unknown> { return this.coordinator.run({ operation: "normal", trigger: "scheduled" }) }
-  forcePush(allowThresholdOverride = false): Promise<unknown> { return this.coordinator.run({ operation: "forcePush", trigger: "forcePush", allowThresholdOverride }) }
-  forcePull(allowThresholdOverride = false): Promise<unknown> { return this.coordinator.run({ operation: "forcePull", trigger: "forcePull", allowThresholdOverride }) }
+  private runWhileSettingsStable(request: V4SyncRequest): Promise<unknown> {
+    if (this.disposed || this.settingsTransitionActive) return Promise.resolve({ status: "skipped", changedFiles: 0 })
+    return this.coordinator.run(request)
+  }
+
+  private assertSettingsTransitionInactive(): void {
+    this.assertNotDisposed()
+    if (this.settingsTransitionActive) throw new V4CancelledError("V4 settings change is in progress.")
+  }
+
+  manualSync(): Promise<unknown> { return this.runWhileSettingsStable({ operation: "normal", trigger: "manual" }) }
+  startupSync(): Promise<unknown> { return this.runWhileSettingsStable({ operation: "normal", trigger: "startup" }) }
+  scheduledSync(): Promise<unknown> { return this.runWhileSettingsStable({ operation: "normal", trigger: "scheduled" }) }
+  forcePush(allowThresholdOverride = false): Promise<unknown> { return this.runWhileSettingsStable({ operation: "forcePush", trigger: "forcePush", allowThresholdOverride }) }
+  forcePull(allowThresholdOverride = false): Promise<unknown> { return this.runWhileSettingsStable({ operation: "forcePull", trigger: "forcePull", allowThresholdOverride }) }
 
   async createHistoryService(): Promise<V4HistoryService> {
-    this.assertNotDisposed()
+    this.assertSettingsTransitionInactive()
     const generation = this.credentialGeneration
     const github = this.plugin.githubClient
     const repoId = this.repoId()
@@ -254,7 +282,7 @@ export class V4PluginRuntime {
   }
 
   async fileIdForPath(path: string): Promise<string | null> {
-    this.assertNotDisposed()
+    this.assertSettingsTransitionInactive()
     const generation = this.credentialGeneration
     const github = this.plugin.githubClient
     const repoId = this.repoId()
@@ -282,6 +310,10 @@ export class V4PluginRuntime {
     if (this.disposed) return
     if (!this.plugin.settings.syncEnabled || !this.plugin.settings.syncOnLocalChange || !this.plugin.isWatchEnabled) return
     if (change.type === "rescan") {
+      if (this.settingsTransitionActive) {
+        this.settingsTransitionSawLocalChange = true
+        return
+      }
       this.coordinator.enqueue(change)
       this.markWaiting()
       return
@@ -292,6 +324,10 @@ export class V4PluginRuntime {
       if (!this.inScope(change.path) && (!oldPath || !this.inScope(oldPath))) return
     } catch (error) {
       new Notice(`GitHub Sync: Invalid ignore regex: ${(error as Error).message}`)
+      return
+    }
+    if (this.settingsTransitionActive) {
+      this.settingsTransitionSawLocalChange = true
       return
     }
     this.coordinator.enqueue(change)
