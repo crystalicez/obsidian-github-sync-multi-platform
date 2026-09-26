@@ -349,3 +349,30 @@ test("v4 coordinator can cancel an active run for settings rotation without disp
   assert.equal(followup.status, "completed");
   assert.equal(executions, 2);
 });
+
+
+test("v4 coordinator drops pending debounce work for a settings generation switch and remains reusable", async () => {
+  const timers = new FakeTimers();
+  const executions: V4QueuedChange[][] = [];
+  const coordinator = new V4SyncCoordinator({
+    execute: async (_request, changes) => { executions.push(changes); return { changedFiles: changes.length }; },
+    schedule: timers.schedule,
+    cancel: timers.cancel,
+  });
+
+  coordinator.enqueue({ type: "modify", path: "old-target.md", mtime: 1 });
+  assert.equal(coordinator.pendingCount, 1);
+  assert.equal(timers.timers.size, 1);
+
+  coordinator.cancelPending();
+
+  assert.equal(coordinator.pendingCount, 0);
+  assert.equal(timers.timers.size, 0);
+  await coordinator.run({ operation: "normal", trigger: "manual" });
+  assert.deepEqual(executions, [[]]);
+
+  coordinator.enqueue({ type: "modify", path: "new-target.md", mtime: 2 });
+  timers.fireLatest();
+  await coordinator.whenIdle();
+  assert.deepEqual(executions, [[], [{ type: "modify", path: "new-target.md", mtime: 2 }]]);
+});
