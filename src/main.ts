@@ -129,10 +129,12 @@ export default class FastSync extends Plugin {
 
     // After the workspace layout is ready, run the startup sync once, then enable real-time watch
     this.app.workspace.onLayoutReady(() => {
+      if (this.unloaded) return
       if (shouldRunStartupSync(this.settings)) {
         // Delay 1.5 s to let Obsidian finish initialising
         this.startupSyncTimeout = window.setTimeout(() => {
           this.startupSyncTimeout = null;
+          if (this.unloaded) return
           const runtime = this.v4Runtime;
           if (runtime) void runtime.startupSync();
         }, 1500);
