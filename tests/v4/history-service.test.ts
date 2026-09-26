@@ -303,3 +303,33 @@ test("v4 history rejects inconsistent journal page counts across one commit", as
   await assert.rejects(() => service.getCommitChanges(commit), /page count|journal.*consistent|journal.*mismatch/iu);
   assert.equal(fixture.reads, 2);
 });
+
+
+test("v4 history rejects a journal page that exceeds the writer change-count contract", async () => {
+  const fixture = historyJournalFixture(page => ({
+    journalId: "123-safe",
+    page,
+    pageCount: 1,
+    changes: Array.from({ length: 501 }, (_, index) => ({
+      fileId: `f-${index}`,
+      kind: "modify",
+      path: `n-${index}.md`,
+    })),
+  }));
+  const service = new V4HistoryService({
+    github: fixture.github,
+    config: { formatVersion: 4, mode: "plaintext", repoId: "o/r#main", pathLayout: "plaintext-v1" },
+  });
+  const commit = {
+    sha: "c1",
+    message: "obsidian-sync-v4:123-safe",
+    authorName: "A",
+    authoredAt: new Date(0).toISOString(),
+    parentShas: [],
+    source: "plugin" as const,
+    journalId: "123-safe",
+  };
+
+  await assert.rejects(() => service.getCommitChanges(commit), /journal.*change.*limit|too many.*changes/iu);
+  assert.equal(fixture.reads, 1);
+});
