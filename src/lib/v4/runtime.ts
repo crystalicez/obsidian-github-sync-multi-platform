@@ -158,9 +158,12 @@ export class V4PluginRuntime {
 
   async quiesceForSettingsChange(): Promise<void> {
     this.assertNotDisposed()
+    this.coordinator.cancelPending()
     this.coordinator.cancelActive(new V4CancelledError("V4 settings changed."))
     await this.coordinator.whenIdle()
-    if (this.progressStore.snapshot.lifecycle === "active") {
+    this.coordinator.cancelPending()
+    this.debounceRunActive = false
+    if (this.progressStore.snapshot.lifecycle === "active" || this.progressStore.snapshot.lifecycle === "waiting") {
       this.progressStore.update({
         lifecycle: "idle",
         phase: undefined,
@@ -207,6 +210,7 @@ export class V4PluginRuntime {
 
   get isSyncing(): boolean { return this.coordinator.isSyncing }
   get pendingCount(): number { return this.coordinator.pendingCount }
+  get settingsGeneration(): number { return this.credentialGeneration }
   get progressSnapshot(): V4SyncProgressSnapshot {
     return this.snapshotForConsumers(this.progressStore.snapshot)
   }
