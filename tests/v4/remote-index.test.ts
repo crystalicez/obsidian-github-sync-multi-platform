@@ -116,6 +116,7 @@ test("v4 encrypted remote config rejects unsupported crypto semantics and unsafe
     ["kdf", { ...base, kdf: "scrypt" }],
     ["zero iterations", { ...base, kdfParams: { ...base.kdfParams, iterations: 0 } }],
     ["fractional iterations", { ...base, kdfParams: { ...base.kdfParams, iterations: 1.5 } }],
+    ["above writer iterations", { ...base, kdfParams: { ...base.kdfParams, iterations: 600_001 } }],
     ["unbounded iterations", { ...base, kdfParams: { ...base.kdfParams, iterations: Number.MAX_SAFE_INTEGER } }],
     ["malformed salt", { ...base, kdfParams: { ...base.kdfParams, salt: "***" } }],
     ["oversized salt", { ...base, kdfParams: { ...base.kdfParams, salt: "A".repeat(1024) } }],
