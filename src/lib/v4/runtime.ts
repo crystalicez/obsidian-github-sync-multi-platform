@@ -407,6 +407,18 @@ export class V4PluginRuntime {
           this.plugin.removeIgnoredFile(path)
         }
       },
+      rollbackStage: async ({ stage, path, precondition }) => {
+        this.plugin.addIgnoredFile(path)
+        try {
+          await this.platformIo.rollbackStage(this.stagingStore.pathFor(stage.stageId), path, {
+            expectedTarget: precondition,
+            expectedStageSize: stage.size,
+            expectedStageSha256: stage.hash,
+          })
+        } finally {
+          this.plugin.removeIgnoredFile(path)
+        }
+      },
     }
   }
 
