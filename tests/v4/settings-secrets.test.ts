@@ -1310,3 +1310,29 @@ test("aborted runtime decision modals preserve canonical cancellation after awai
     /await this\.input\.askConflict\([^)]*\)[\s\S]*?throwIfV4Aborted\(this\.input\.signal\)[\s\S]*?if \(resolution\.action === "ask"\)/u,
   );
 });
+
+
+test("desktop runtime proves the vault root and guards small-file reads and mutations", async () => {
+  const runtimeSource = await readFile("src/lib/v4/runtime.ts", "utf8");
+
+  assert.match(
+    runtimeSource,
+    /getBasePath\?\(\):\s*string[\s\S]*?desktopRootPath[\s\S]*?getBasePath\(\)[\s\S]*?createV4PlatformIo\([\s\S]*?desktopRootPath/u,
+  );
+  assert.match(
+    runtimeSource,
+    /read:\s*async\s*\(path:[^)]*\)\s*=>\s*\{[\s\S]*?assertVaultPathSafe\(path,\s*\{\s*mustExist:\s*true\s*\}\)[\s\S]*?readVaultFileBytes/u,
+  );
+  assert.match(
+    runtimeSource,
+    /write:\s*async\s*\(path:[^)]*\)\s*=>\s*\{[\s\S]*?assertVaultPathSafe\(path\)[\s\S]*?writeVaultFileBytes/u,
+  );
+  assert.match(
+    runtimeSource,
+    /trash:\s*async\s*\(path:[^)]*\)\s*=>\s*\{[\s\S]*?assertVaultPathSafe\(path\)[\s\S]*?trashVaultFileIfExists/u,
+  );
+  assert.match(
+    runtimeSource,
+    /readVaultWhole:\s*async\s+path\s*=>\s*\{[\s\S]*?assertVaultPathSafe\(path,\s*\{\s*mustExist:\s*true\s*\}\)[\s\S]*?readVaultFileBytes/u,
+  );
+});
