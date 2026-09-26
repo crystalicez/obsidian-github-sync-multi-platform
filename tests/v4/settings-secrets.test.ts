@@ -1273,3 +1273,25 @@ test("force confirmation is bound to the settings generation that the user revie
     /const runConfirmedOperation[\s\S]*?this\.v4Runtime\.settingsGeneration\s*!==\s*approvedGeneration[\s\S]*?Settings changed[\s\S]*?return[\s\S]*?v4Runtime\.forcePush\(\)[\s\S]*?v4Runtime\.forcePull\(\)/iu,
   );
 });
+
+
+test("runtime decision modals settle immediately when the active sync is aborted", async () => {
+  const runtimeSource = await readFile("src/lib/v4/runtime.ts", "utf8");
+
+  assert.match(
+    runtimeSource,
+    /askConflict\([^)]*signal:\s*AbortSignal[\s\S]*?signal\.addEventListener\("abort"[\s\S]*?finish\(\{\s*action:\s*"ask"\s*\}\)/u,
+  );
+  assert.match(
+    runtimeSource,
+    /confirmThresholdOverride\([^)]*signal:\s*AbortSignal[\s\S]*?signal\.addEventListener\("abort"[\s\S]*?finish\(false\)/u,
+  );
+  assert.match(
+    runtimeSource,
+    /askConflict\(input\.path,\s*signal\)/u,
+  );
+  assert.match(
+    runtimeSource,
+    /confirmThresholdOverride\(error,\s*request\.operation,\s*signal\)/u,
+  );
+});
