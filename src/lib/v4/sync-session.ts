@@ -419,7 +419,10 @@ export class V4SyncSession {
       const baseRecord = baseRecordsById.get(conflict.fileId)
       let remoteBytes: Uint8Array | undefined
       let resolution: V4ConflictResolution
-      const canMergeFromMetadata = this.input.conflictPolicy === "merge"
+      const conflictPolicy: V4ConflictPolicy = externalReconciled && this.input.conflictPolicy === "newer"
+        ? "copy"
+        : this.input.conflictPolicy
+      const canMergeFromMetadata = conflictPolicy === "merge"
         && !!conflict.local && !!conflict.remote && !!baseRecord && !!remoteRecord
         && (remoteRecord.remoteVersion === baseRecord.remoteVersion || !!baseCommitSha)
         && canAttemptV4TextMerge(conflict.path, [baseRecord.size, conflict.local.size, conflict.remote.size])
@@ -430,7 +433,7 @@ export class V4SyncSession {
           ? remoteBytes
           : await this.readRecord(baseRecord!, baseCommitSha)
         resolution = resolveV4Conflict({
-          policy: this.input.conflictPolicy,
+          policy: conflictPolicy,
           path: conflict.path,
           localMtime: conflict.local?.mtime ?? 0,
           remoteMtime: conflict.remote?.mtime ?? 0,
@@ -440,7 +443,7 @@ export class V4SyncSession {
         })
       } else {
         resolution = resolveV4Conflict({
-          policy: this.input.conflictPolicy,
+          policy: conflictPolicy,
           path: conflict.path,
           localMtime: conflict.local?.mtime ?? 0,
           remoteMtime: conflict.remote?.mtime ?? 0,
