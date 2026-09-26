@@ -15,9 +15,9 @@ test("GitHubClient pins the API version and paginates commit history", async () 
       text: "",
       headers: {},
       json: [{
-        sha: "commit-1",
+        sha: "1111111111111111111111111111111111111111",
         commit: { message: "obsidian-sync-v4:journal-1", author: { date: "2026-07-13T00:00:00Z", name: "Sync" } },
-        parents: [{ sha: "parent-1" }],
+        parents: [{ sha: "2222222222222222222222222222222222222222" }],
       }],
     };
   });
@@ -25,8 +25,8 @@ test("GitHubClient pins the API version and paginates commit history", async () 
     const client = new GitHubClient({ token: "token", owner: "owner", repo: "repo", branch: "main" }, { transportPolicy: { mutationSpacingMs: 0 } });
     const commits = await client.listCommits({ page: 2, perPage: 50 });
 
-    assert.equal(commits[0].sha, "commit-1");
-    assert.deepEqual(commits[0].parentShas, ["parent-1"]);
+    assert.equal(commits[0].sha, "1111111111111111111111111111111111111111");
+    assert.deepEqual(commits[0].parentShas, ["2222222222222222222222222222222222222222"]);
     assert.match(requests[0].url, /commits\?sha=main&per_page=50&page=2/u);
     assert.equal(requests[0].headers["X-GitHub-Api-Version"], "2026-03-10");
   } finally {
@@ -39,17 +39,17 @@ test("GitHubClient reads historical trees and can create a branch ref", async ()
   setRequestUrlHandler(async (options: unknown) => {
     const request = options as Record<string, any>;
     requests.push(request);
-    if (request.method === "POST") return { status: 201, text: "", headers: {}, json: { ref: "refs/heads/v4", object: { sha: "root" } } };
-    return { status: 200, text: "", headers: {}, json: { sha: "tree-old", url: "", tree: [], truncated: false } };
+    if (request.method === "POST") return { status: 201, text: "", headers: {}, json: { ref: "refs/heads/v4", object: { sha: "3333333333333333333333333333333333333333" } } };
+    return { status: 200, text: "", headers: {}, json: { sha: "4444444444444444444444444444444444444444", url: "", tree: [], truncated: false } };
   });
   try {
     const client = new GitHubClient({ token: "token", owner: "owner", repo: "repo", branch: "v4" }, { transportPolicy: { mutationSpacingMs: 0 } });
-    const tree = await client.getTreeAt("tree-old", false);
-    await client.createGitRef("root");
+    const tree = await client.getTreeAt("4444444444444444444444444444444444444444", false);
+    await client.createGitRef("3333333333333333333333333333333333333333");
 
-    assert.equal(tree.sha, "tree-old");
+    assert.equal(tree.sha, "4444444444444444444444444444444444444444");
     assert.equal(requests[0].url.endsWith("/git/trees/tree-old"), true);
-    assert.deepEqual(JSON.parse(requests[1].body), { ref: "refs/heads/v4", sha: "root" });
+    assert.deepEqual(JSON.parse(requests[1].body), { ref: "refs/heads/v4", sha: "3333333333333333333333333333333333333333" });
   } finally {
     setRequestUrlHandler(null);
   }
@@ -172,7 +172,7 @@ test("GitHubClient falls back to the canonical Git Blob when Contents transforms
       { token: "token", owner: "owner", repo: "repo", branch: "main" },
       { transportPolicy: { mutationSpacingMs: 0 } },
     )
-    const file = await client.getFileBytes("binary.enc", "commit-sha")
+    const file = await client.getFileBytes("binary.enc", "9999999999999999999999999999999999999999")
     assert.deepEqual(file?.bytes, raw)
     assert.equal(file?.sha, blobSha)
     assert.equal(requests.length, 2)
@@ -208,7 +208,7 @@ test("GitHubClient fails closed when Git object authentication itself is unavail
       { transportPolicy: { mutationSpacingMs: 0 } },
     )
     await assert.rejects(
-      () => client.getFileBytes("binary.enc", "commit-sha"),
+      () => client.getFileBytes("binary.enc", "9999999999999999999999999999999999999999"),
       /verify.*blob|blob.*verification|digest/iu,
     )
     assert.equal(requests.length, 2)
@@ -225,9 +225,9 @@ test("GitHubClient bootstraps a truly empty repository before Git ref writes", a
     const request = options as Record<string, any>;
     requests.push(request);
     if (request.url.includes("/git/refs?")) return { status: 409, text: "Git Repository is empty.", headers: {}, json: {} };
-    if (request.method === "PUT") return { status: 201, text: "", headers: {}, json: { commit: { sha: "bootstrap-commit" } } };
+    if (request.method === "PUT") return { status: 201, text: "", headers: {}, json: { commit: { sha: "cccccccccccccccccccccccccccccccccccccccc" } } };
     if (request.method === "GET" && request.url.includes("/git/ref/heads/")) {
-      return { status: 200, text: "", headers: {}, json: { ref: "refs/heads/main", object: { sha: "bootstrap-commit", type: "commit" } } };
+      return { status: 200, text: "", headers: {}, json: { ref: "refs/heads/main", object: { sha: "cccccccccccccccccccccccccccccccccccccccc", type: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" } } };
     }
     throw new Error(`Unexpected request: ${request.method} ${request.url}`);
   });
@@ -235,7 +235,7 @@ test("GitHubClient bootstraps a truly empty repository before Git ref writes", a
     const client = new GitHubClient({ token: "token", owner: "owner", repo: "repo", branch: "main" }, { transportPolicy: { mutationSpacingMs: 0 } });
     const ref = await client.ensureGitRepositoryInitialized();
 
-    assert.equal(ref?.sha, "bootstrap-commit");
+    assert.equal(ref?.sha, "cccccccccccccccccccccccccccccccccccccccc");
     const put = requests.find(request => request.method === "PUT")!;
     assert.match(put.url, /\/contents\/\.obsidian-github-sync-v4\/bootstrap$/u);
     const body = JSON.parse(put.body);
@@ -253,12 +253,12 @@ test("GitHubClient creates a configured custom branch after empty-repository boo
     const request = options as Record<string, any>;
     requests.push(request);
     if (request.url.includes("/git/refs?")) return { status: 409, text: "empty", headers: {}, json: {} };
-    if (request.method === "PUT") return { status: 201, text: "", headers: {}, json: { commit: { sha: "bootstrap-commit" } } };
+    if (request.method === "PUT") return { status: 201, text: "", headers: {}, json: { commit: { sha: "cccccccccccccccccccccccccccccccccccccccc" } } };
     if (request.method === "GET" && request.url.includes("/git/ref/heads/v4-sync")) {
       customRefReads++;
       return customRefReads === 1
         ? { status: 404, text: "missing", headers: {}, json: {} }
-        : { status: 200, text: "", headers: {}, json: { ref: "refs/heads/v4-sync", object: { sha: "bootstrap-commit", type: "commit" } } };
+        : { status: 200, text: "", headers: {}, json: { ref: "refs/heads/v4-sync", object: { sha: "cccccccccccccccccccccccccccccccccccccccc", type: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" } } };
     }
     if (request.method === "POST" && request.url.endsWith("/git/refs")) return { status: 201, text: "", headers: {}, json: {} };
     throw new Error(`Unexpected request: ${request.method} ${request.url}`);
@@ -268,7 +268,7 @@ test("GitHubClient creates a configured custom branch after empty-repository boo
     const ref = await client.ensureGitRepositoryInitialized();
     assert.equal(ref?.ref, "refs/heads/v4-sync");
     const createRef = requests.find(request => request.method === "POST")!;
-    assert.deepEqual(JSON.parse(createRef.body), { ref: "refs/heads/v4-sync", sha: "bootstrap-commit" });
+    assert.deepEqual(JSON.parse(createRef.body), { ref: "refs/heads/v4-sync", sha: "cccccccccccccccccccccccccccccccccccccccc" });
   } finally {
     setRequestUrlHandler(null);
   }
@@ -286,7 +286,7 @@ test("GitHubClient falls back to Git Blob bytes when Contents omits a large payl
   });
   try {
     const client = new GitHubClient({ token: "token", owner: "owner", repo: "repo", branch: "main" }, { transportPolicy: { mutationSpacingMs: 0 } });
-    const file = await client.getFileBytes("large.bin", "commit-sha");
+    const file = await client.getFileBytes("large.bin", "9999999999999999999999999999999999999999");
     assert.equal(new TextDecoder().decode(file!.bytes), "large payload");
     assert.equal(file!.sha, "413c6a76c6527732a74dbfab3c20d471cb38a573");
     assert.equal(requests.some(url => url.endsWith("/git/blobs/413c6a76c6527732a74dbfab3c20d471cb38a573")), true);
@@ -300,14 +300,14 @@ test("GitHubClient retries a lost blob response because the immutable mutation i
   setRequestUrlHandler(async () => {
     attempts++
     if (attempts === 1) throw new Error("blob response lost")
-    return { status: 201, text: "", headers: {}, json: { sha: "blob-stable" } }
+    return { status: 201, text: "", headers: {}, json: { sha: "5555555555555555555555555555555555555555" } }
   })
   try {
     const client = new GitHubClient(
       { token: "token", owner: "owner", repo: "repo", branch: "main" },
       { transportPolicy: { mutationSpacingMs: 0 } },
     )
-    assert.equal(await client.createGitBlob(new TextEncoder().encode("body")), "blob-stable")
+    assert.equal(await client.createGitBlob(new TextEncoder().encode("body")), "5555555555555555555555555555555555555555")
     assert.equal(attempts, 2)
   } finally {
     setRequestUrlHandler(null)
@@ -319,14 +319,14 @@ test("GitHubClient retries a lost tree response because the immutable mutation i
   setRequestUrlHandler(async () => {
     attempts++
     if (attempts === 1) throw new Error("tree response lost")
-    return { status: 201, text: "", headers: {}, json: { sha: "tree-stable" } }
+    return { status: 201, text: "", headers: {}, json: { sha: "6666666666666666666666666666666666666666" } }
   })
   try {
     const client = new GitHubClient(
       { token: "token", owner: "owner", repo: "repo", branch: "main" },
       { transportPolicy: { mutationSpacingMs: 0 } },
     )
-    assert.equal(await client.createGitTree([{ path: "A", mode: "100644", type: "blob", sha: "blob-stable" }]), "tree-stable")
+    assert.equal(await client.createGitTree([{ path: "A", mode: "100644", type: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", sha: "5555555555555555555555555555555555555555" }]), "6666666666666666666666666666666666666666")
     assert.equal(attempts, 2)
   } finally {
     setRequestUrlHandler(null)
@@ -338,7 +338,7 @@ test("GitHubClient retries a lost commit response only with explicit orphan-safe
   setRequestUrlHandler(async () => {
     attempts++
     if (attempts === 1) throw new Error("commit response lost")
-    return { status: 201, text: "", headers: {}, json: { sha: "commit-second" } }
+    return { status: 201, text: "", headers: {}, json: { sha: "7777777777777777777777777777777777777777" } }
   })
   try {
     const client = new GitHubClient(
@@ -346,8 +346,8 @@ test("GitHubClient retries a lost commit response only with explicit orphan-safe
       { transportPolicy: { mutationSpacingMs: 0 } },
     )
     assert.equal(
-      await client.createGitCommit("obsidian-sync-v4:j", "tree", ["base"], { originalCannotBeReachable: true }),
-      "commit-second",
+      await client.createGitCommit("obsidian-sync-v4:j", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", ["base"], { originalCannotBeReachable: true }),
+      "7777777777777777777777777777777777777777",
     )
     assert.equal(attempts, 2)
   } finally {
@@ -367,7 +367,7 @@ test("GitHubClient never blindly retries a normal ref mutation after a lost resp
       { transportPolicy: { mutationSpacingMs: 0 } },
     )
     await assert.rejects(
-      () => client.updateGitRef("candidate", "base"),
+      () => client.updateGitRef("8888888888888888888888888888888888888888", "base"),
       error => (error as Error).name === "V4GitMutationOutcomeUnknownError",
     )
     assert.equal(attempts, 1)
@@ -383,7 +383,7 @@ test("empty-repository bootstrap replans after a lost Contents PUT once reposito
     const request = options as Record<string, any>
     if (request.url.includes("/git/refs?")) {
       return initialized
-        ? { status: 200, text: "", headers: {}, json: [{ ref: "refs/heads/main", object: { sha: "bootstrap-commit", type: "commit" } }] }
+        ? { status: 200, text: "", headers: {}, json: [{ ref: "refs/heads/main", object: { sha: "cccccccccccccccccccccccccccccccccccccccc", type: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" } }] }
         : { status: 409, text: "empty", headers: {}, json: {} }
     }
     if (request.method === "PUT") {
@@ -404,7 +404,7 @@ test("empty-repository bootstrap replans after a lost Contents PUT once reposito
         const candidate = error as Error & { code?: string; observedRefSha?: string }
         assert.equal(candidate.name, "V4RepositoryBootstrapRaceError")
         assert.equal(candidate.code, "V4_REPOSITORY_BOOTSTRAP_RACE")
-        assert.equal(candidate.observedRefSha, "bootstrap-commit")
+        assert.equal(candidate.observedRefSha, "cccccccccccccccccccccccccccccccccccccccc")
         return true
       },
     )
@@ -420,10 +420,10 @@ test("bootstrap branch creation observes the configured ref before retrying a lo
   setRequestUrlHandler(async (options: unknown) => {
     const request = options as Record<string, any>
     if (request.url.includes("/git/refs?")) return { status: 409, text: "empty", headers: {}, json: {} }
-    if (request.method === "PUT") return { status: 201, text: "", headers: {}, json: { commit: { sha: "bootstrap-commit" } } }
+    if (request.method === "PUT") return { status: 201, text: "", headers: {}, json: { commit: { sha: "cccccccccccccccccccccccccccccccccccccccc" } } }
     if (request.method === "GET" && request.url.includes("/git/ref/heads/v4-sync")) {
       return customExists
-        ? { status: 200, text: "", headers: {}, json: { ref: "refs/heads/v4-sync", object: { sha: "bootstrap-commit", type: "commit" } } }
+        ? { status: 200, text: "", headers: {}, json: { ref: "refs/heads/v4-sync", object: { sha: "cccccccccccccccccccccccccccccccccccccccc", type: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" } } }
         : { status: 404, text: "missing", headers: {}, json: {} }
     }
     if (request.method === "POST" && request.url.endsWith("/git/refs")) {
@@ -439,7 +439,7 @@ test("bootstrap branch creation observes the configured ref before retrying a lo
       { transportPolicy: { mutationSpacingMs: 0 } },
     )
     const ref = await client.ensureGitRepositoryInitialized()
-    assert.equal(ref?.sha, "bootstrap-commit")
+    assert.equal(ref?.sha, "cccccccccccccccccccccccccccccccccccccccc")
     assert.equal(posts, 1)
   } finally {
     setRequestUrlHandler(null)
@@ -447,7 +447,7 @@ test("bootstrap branch creation observes the configured ref before retrying a lo
 })
 
 test("transport metrics are in-memory and contain no request path or response body", async () => {
-  setRequestUrlHandler(async () => ({ status: 201, text: "SECRET RESPONSE", headers: {}, json: { sha: "blob" } }))
+  setRequestUrlHandler(async () => ({ status: 201, text: "SECRET RESPONSE", headers: {}, json: { sha: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" } }))
   try {
     const client = new GitHubClient(
       { token: "token", owner: "owner", repo: "repo", branch: "main" },
@@ -477,7 +477,7 @@ test("GitHubClient never blindly retries a normal create-ref mutation after a lo
       { transportPolicy: { mutationSpacingMs: 0 } },
     )
     await assert.rejects(
-      () => client.createGitRef("candidate"),
+      () => client.createGitRef("8888888888888888888888888888888888888888"),
       error => (error as Error).name === "V4GitMutationOutcomeUnknownError",
     )
     assert.equal(attempts, 1)
@@ -492,8 +492,8 @@ test("immutable commit and content reads omit timestamp cache-busting while ref 
     const request = options as Record<string, any>
     urls.push(request.url)
     if (request.url.includes("/contents/")) return { status: 200, text: "", headers: {}, json: { content: "YQ==", encoding: "base64", sha: "2e65efe2a145dda7ee51d1741299f848e5bf752e" }, arrayBuffer: new ArrayBuffer(0) }
-    if (request.url.includes("/git/commits/")) return { status: 200, text: "", headers: {}, json: { sha: "commit-sha", tree: { sha: "tree" }, parents: [] } }
-    if (request.url.includes("/git/ref/heads/")) return { status: 200, text: "", headers: {}, json: { ref: "refs/heads/main", object: { sha: "commit-sha", type: "commit" } } }
+    if (request.url.includes("/git/commits/")) return { status: 200, text: "", headers: {}, json: { sha: "9999999999999999999999999999999999999999", tree: { sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }, parents: [] } }
+    if (request.url.includes("/git/ref/heads/")) return { status: 200, text: "", headers: {}, json: { ref: "refs/heads/main", object: { sha: "9999999999999999999999999999999999999999", type: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" } } }
     throw new Error(`unexpected:${request.url}`)
   })
   try {
@@ -501,8 +501,8 @@ test("immutable commit and content reads omit timestamp cache-busting while ref 
       { token: "token", owner: "owner", repo: "repo", branch: "main" },
       { transportPolicy: { mutationSpacingMs: 0 } },
     )
-    await client.getFileBytes("A.md", "commit-sha")
-    await client.getGitCommit("commit-sha")
+    await client.getFileBytes("A.md", "9999999999999999999999999999999999999999")
+    await client.getGitCommit("9999999999999999999999999999999999999999")
     await client.getGitRef()
     assert.equal(urls[0].includes("&_="), false)
     assert.equal(urls[1].includes("?_="), false)
@@ -517,7 +517,7 @@ test("GitHubClient holds the transport reservation across mutation serialization
   let reserved = 0
   setRequestUrlHandler(async () => {
     assert.equal(active, true)
-    return { status: 201, text: "", headers: {}, json: { sha: "blob" } }
+    return { status: 201, text: "", headers: {}, json: { sha: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" } }
   })
   try {
     const client = new GitHubClient(
@@ -542,7 +542,7 @@ test("GitHubClient holds the transport reservation across mutation serialization
 })
 
 test("transport metrics count response text as UTF-8 bytes", async () => {
-  setRequestUrlHandler(async () => ({ status: 201, text: "é", headers: {}, json: { sha: "blob" } }))
+  setRequestUrlHandler(async () => ({ status: 201, text: "é", headers: {}, json: { sha: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" } }))
   try {
     const client = new GitHubClient(
       { token: "token", owner: "owner", repo: "repo", branch: "main" },
@@ -563,7 +563,7 @@ test("empty-repository bootstrap treats an unknown Contents outcome plus a newly
     const request = options as Record<string, any>;
     if (request.url.includes("/git/refs?")) {
       return initialized
-        ? { status: 200, text: "", headers: {}, json: [{ ref: "refs/heads/main", object: { sha: "competitor-commit", type: "commit" } }] }
+        ? { status: 200, text: "", headers: {}, json: [{ ref: "refs/heads/main", object: { sha: "dddddddddddddddddddddddddddddddddddddddd", type: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" } }] }
         : { status: 409, text: "empty", headers: {}, json: {} };
     }
     if (request.method === "PUT") {
@@ -572,7 +572,7 @@ test("empty-repository bootstrap treats an unknown Contents outcome plus a newly
       throw new Error("bootstrap response lost while another initializer won");
     }
     if (request.method === "GET" && request.url.includes("/git/ref/heads/main")) {
-      return { status: 200, text: "", headers: {}, json: { ref: "refs/heads/main", object: { sha: "competitor-commit", type: "commit" } } };
+      return { status: 200, text: "", headers: {}, json: { ref: "refs/heads/main", object: { sha: "dddddddddddddddddddddddddddddddddddddddd", type: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" } } };
     }
     throw new Error(`Unexpected request: ${request.method} ${request.url}`);
   });
@@ -589,7 +589,7 @@ test("empty-repository bootstrap treats an unknown Contents outcome plus a newly
         const candidate = error as Error & { code?: string; observedRefSha?: string };
         assert.equal(candidate.name, "V4RepositoryBootstrapRaceError");
         assert.equal(candidate.code, "V4_REPOSITORY_BOOTSTRAP_RACE");
-        assert.equal(candidate.observedRefSha, "competitor-commit");
+        assert.equal(candidate.observedRefSha, "dddddddddddddddddddddddddddddddddddddddd");
         return true;
       },
     );
@@ -604,10 +604,10 @@ test("GitHub client rejects malformed successful ref and commit responses at the
   setRequestUrlHandler(async (options: unknown) => {
     const request = options as Record<string, any>;
     if (request.url.includes("/git/ref/heads/main")) {
-      return { status: 200, text: "", headers: {}, json: { ref: "refs/heads/main", object: { type: "commit" } } };
+      return { status: 200, text: "", headers: {}, json: { ref: "refs/heads/main", object: { type: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" } } };
     }
     if (request.url.includes("/git/commits/")) {
-      return { status: 200, text: "", headers: {}, json: { sha: "commit", parents: [] } };
+      return { status: 200, text: "", headers: {}, json: { sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", parents: [] } };
     }
     throw new Error(`Unexpected request: ${request.method} ${request.url}`);
   });
@@ -618,11 +618,11 @@ test("GitHub client rejects malformed successful ref and commit responses at the
     setRequestUrlHandler(async (options: unknown) => {
       const request = options as Record<string, any>;
       if (request.url.includes("/git/commits/")) {
-        return { status: 200, text: "", headers: {}, json: { sha: "commit", parents: [] } };
+        return { status: 200, text: "", headers: {}, json: { sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", parents: [] } };
       }
       throw new Error(`Unexpected request: ${request.method} ${request.url}`);
     });
-    await assert.rejects(() => client.getGitCommit("commit"), /tree.*sha|malformed|invalid/iu);
+    await assert.rejects(() => client.getGitCommit("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"), /tree.*sha|malformed|invalid/iu);
   } finally {
     setRequestUrlHandler(null);
   }
@@ -715,11 +715,11 @@ test("GitHubClient rejects malformed successful commit-list and tree responses",
     setRequestUrlHandler(async (options: unknown) => {
       const request = options as Record<string, any>;
       if (request.url.includes("/git/trees/")) {
-        return { status: 200, text: "", headers: {}, json: { sha: "tree", tree: [] } };
+        return { status: 200, text: "", headers: {}, json: { sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", tree: [] } };
       }
       throw new Error(`Unexpected request: ${request.method} ${request.url}`);
     });
-    await assert.rejects(() => client.getTreeAt("tree", true), /tree.*truncated|malformed|boolean/iu);
+    await assert.rejects(() => client.getTreeAt("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", true), /tree.*truncated|malformed|boolean/iu);
   } finally {
     setRequestUrlHandler(null);
   }
@@ -730,7 +730,7 @@ test("GitHub client rejects non-object SHA strings in successful ref and immutab
   setRequestUrlHandler(async (options: unknown) => {
     const request = options as Record<string, any>;
     if (request.url.includes("/git/ref/heads/main")) {
-      return { status: 200, text: "", headers: {}, json: { ref: "refs/heads/main", object: { sha: "not-a-sha", type: "commit" } } };
+      return { status: 200, text: "", headers: {}, json: { ref: "refs/heads/main", object: { sha: "not-a-sha", type: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" } } };
     }
     throw new Error(`Unexpected request: ${request.method} ${request.url}`);
   });
