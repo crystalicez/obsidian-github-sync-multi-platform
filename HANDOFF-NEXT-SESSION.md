@@ -190,6 +190,18 @@ Audit method:
    - RED: `980f9211f2addc2d70cc83e071b82f419799f7c5` covers both no-change-list full scan and explicit rescan.
    - Fix: `f41c250c6f32a69244455b508423519079bb941f` disables stat-only hash reuse for authoritative full scans/rescans; targeted event-driven scans retain the optimization.
 
+27. **MEDIUM settings lifecycle safety — malformed persisted settings could affect startup/client/timer policy before runtime validation.**
+   - Runtime execution and settings-save boundaries were already validating settings, but `loadSettings()` installed migrated persisted settings before any validator ran.
+   - `onload()` then used those values for GitHub client creation, startup-sync policy, scheduled-sync policy, and runtime construction before `V4PluginRuntime.execute()` could reject them.
+   - RED: `d8a6c5eed4efe5eb50f46732f59106f5ae6d484e`.
+   - Fix: `4319fb067755953613f95e218b206410b73627c2` validates the default-merged + secret-migrated settings object before assigning `this.settings`, preserving valid legacy secret migration while preventing malformed persisted safety controls from reaching startup policy.
+
+28. **LOW/MEDIUM lifecycle safety — a late workspace layout-ready callback could recreate startup work after plugin unload.**
+   - `onunload()` clears an already-created startup timer, but the registered `onLayoutReady` callback could itself run after unload and create a new timer that no later unload pass would clear.
+   - The disposed runtime would reject/skip eventual work, so this was not a remote-corruption path, but it could retain a stale callback/timer after plugin disable/reload.
+   - RED: `a01a7d2aa57908032bc0cccb72c8e76cbd3c660c`.
+   - Fix: `90350f2f9afc18b5079b0b3dda3a6ad09f9def99` guards both the layout-ready callback and delayed startup callback with the plugin unload flag.
+
 ### Audited surfaces with no new confirmed defect so far
 
 - secret migration/persistence: raw token/passphrase are removed before plugin data persistence and use Obsidian SecretStorage;
@@ -202,6 +214,7 @@ Audit method:
 - local target preconditions still use size+mtime at final mutation boundaries, but authoritative local discovery no longer treats matching size+mtime as content identity; the remaining narrow TOCTOU window is guarded by source hashing/stability where content is read and remains a residual OS/filesystem race rather than the previously confirmed full-scan blind spot;
 - recovery payload path/ID/stage/precondition validation is now enforced on both save and load; remaining header-field tightening is low-priority local-state hardening rather than a confirmed destructive path;
 - retired encrypted key material is best-effort zeroized on runtime disposal, but resolved keyrings invalidated by settings changes may remain in the cache's retired set until disposal. Immediate zeroization is intentionally not changed yet because history work exists outside the sync coordinator and can hold a live keyring reference; settings-generation guards now stop stale history results, but tighter reference-counted key lifetime remains a residual hardening opportunity. (full path/duplicate-ID/numeric validation), but header integrity and normal writer ownership mean no equivalent concrete production corruption path is confirmed yet.
+- Obsidian `requestUrl` buffers HTTP response bodies before the V4 reader can inspect expected descriptor/tree sizes. Git/V4 integrity checks and read concurrency still fail closed after receipt, but a forged unexpectedly large remote blob can create transient peak memory above the writer contract before rejection. A meaningful fix requires a streaming/bounded transport API; a post-allocation size check would not solve the peak-memory risk and is intentionally not presented as mitigation.
 
 ### RED regression status
 
