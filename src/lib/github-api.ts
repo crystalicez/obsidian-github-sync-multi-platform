@@ -337,7 +337,6 @@ export class GitHubClient {
       if (!first) return null;
       const sha = requiredGitHubString(first.object?.sha, "git ref SHA");
       const type = requiredGitHubString(first.object?.type, "git ref object type");
-      if (type !== "commit") throw new Error(`Malformed GitHub response: repository ref points to unsupported object type ${type}.`);
       return { ref: requiredGitHubString(first.ref, "git ref name"), sha, type };
     }
     if (response.status === 404 || response.status === 409) return null;
