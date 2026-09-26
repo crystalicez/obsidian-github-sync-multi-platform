@@ -250,10 +250,10 @@ test("mutable 404 and successful Contents behavior remain unchanged", async () =
 
   const payload = new TextEncoder().encode("contents-success\n");
   const content = Buffer.from(payload).toString("base64");
-  await runScenario("direct.md", COMMIT_SHA, { contents: { status: 200, json: { content, encoding: "base64", sha: "contents-sha" } } }, async (client, urls) => {
+  await runScenario("direct.md", COMMIT_SHA, { contents: { status: 200, json: { content, encoding: "base64", sha: "db3623d4e947fa18f6a4935c71ca63cfb0aed07c" } } }, async (client, urls) => {
     const file = await client.getFileBytes("direct.md", COMMIT_SHA);
     assert.deepEqual(file?.bytes, payload);
-    assert.equal(file?.sha, "contents-sha");
+    assert.equal(file?.sha, "db3623d4e947fa18f6a4935c71ca63cfb0aed07c");
     assert.equal(urls.length, 1);
   });
 });
