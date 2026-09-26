@@ -132,11 +132,13 @@ export default class FastSync extends Plugin {
       if (this.unloaded) return
       if (shouldRunStartupSync(this.settings)) {
         // Delay 1.5 s to let Obsidian finish initialising
+        const generation = this.v4Runtime.settingsGeneration
         this.startupSyncTimeout = window.setTimeout(() => {
           this.startupSyncTimeout = null;
           if (this.unloaded) return
           const runtime = this.v4Runtime;
-          if (runtime) void runtime.startupSync();
+          if (!runtime || runtime.settingsGeneration !== generation) return
+          void runtime.startupSync();
         }, 1500);
       } else {
         // Not configured – enable watch immediately
@@ -174,7 +176,9 @@ export default class FastSync extends Plugin {
     this.scheduledSyncTimer = null;
     if (!shouldRunScheduledSync(this.settings)) return;
     const seconds = normalizeScheduledSyncIntervalSeconds(this.settings.scheduledSyncIntervalSeconds);
+    const generation = this.v4Runtime.settingsGeneration
     this.scheduledSyncTimer = window.setInterval(() => {
+      if (this.v4Runtime.settingsGeneration !== generation) return
       void this.v4Runtime.scheduledSync()
     }, seconds * 1000);
   }
@@ -248,14 +252,18 @@ export default class FastSync extends Plugin {
     }
 
     await this.v4Runtime?.quiesceForSettingsChange()
-    storeV4Secrets(preparedSettings, this.app.secretStorage)
-    await this.persistSettingsData(preparedSettings)
+    try {
+      storeV4Secrets(preparedSettings, this.app.secretStorage)
+      await this.persistSettingsData(preparedSettings)
 
-    this.settings = preparedSettings
-    this.v4Runtime?.credentialsChanged()
-    this.initGitHubClient()
-    this.registerScheduledSync()
-    this.updateRibbonIcon(!!(this.settings.githubToken && this.settings.githubOwner && this.settings.githubRepo))
+      this.settings = preparedSettings
+      this.v4Runtime?.credentialsChanged()
+      this.initGitHubClient()
+      this.registerScheduledSync()
+      this.updateRibbonIcon(!!(this.settings.githubToken && this.settings.githubOwner && this.settings.githubRepo))
+    } finally {
+      this.v4Runtime?.finishSettingsChange()
+    }
   }
 
   showSavedFeedback() {
