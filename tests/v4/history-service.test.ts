@@ -333,3 +333,39 @@ test("v4 history rejects a journal page that exceeds the writer change-count con
   await assert.rejects(() => service.getCommitChanges(commit), /journal.*change.*limit|too many.*changes/iu);
   assert.equal(fixture.reads, 1);
 });
+
+
+test("v4 history service rejects completion from an obsolete settings generation", async () => {
+  let current = true;
+  let release!: () => void;
+  const blocker = new Promise<void>(resolve => { release = resolve; });
+  const github = {
+    async listCommits() {
+      await blocker;
+      return [{
+        sha: "old",
+        message: "external",
+        authorName: "A",
+        authoredAt: new Date(0).toISOString(),
+        parentShas: [],
+      }];
+    },
+    async getFileBytes() { return null; },
+    async getGitCommit(sha: string) { return { sha, treeSha: "tree", parentShas: [] }; },
+    async getTreeAt() { return { sha: "tree", url: "", truncated: false, tree: [] }; },
+    async getBlob() { return new Uint8Array(); },
+  };
+  const service = new V4HistoryService({
+    github,
+    config: { formatVersion: 4, mode: "plaintext", repoId: "old/repo#main", pathLayout: "plaintext-v1" },
+    assertCurrent: () => {
+      if (!current) throw new Error("V4 history settings generation changed.");
+    },
+  });
+
+  const pending = service.listCommits(1);
+  current = false;
+  release();
+
+  await assert.rejects(pending, /settings generation changed/iu);
+});
