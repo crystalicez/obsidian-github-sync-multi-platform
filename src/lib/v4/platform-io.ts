@@ -185,7 +185,7 @@ export function createV4PlatformIo(options: V4PlatformIoOptions): V4PlatformIo {
       return Number(stats.bavail) * Number(stats.bsize)
     },
     async rollbackStage(stagePath, targetPath, commitOptions) {
-      if (!desktopReady) throw new V4BoundedIoUnavailableError("stage-commit", targetPath)
+      if (!desktopReady) return
       const fs = await desktopFs()
       const stage = full(stagePath)
       const target = full(targetPath)
