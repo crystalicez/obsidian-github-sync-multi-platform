@@ -61,6 +61,19 @@ Audit method:
    - Conflict/merge/copy/history paths use the whole-buffer reader, so forged metadata can amplify concurrent remote reads.
    - Intended fix: enforce remote record numeric/descriptor bounds using the writer constants and replace unbounded chunk `Promise.all()` with bounded/sequential reading as defense in depth.
 
+7. **HIGH crash consistency — interrupted desktop stage replacement was not resumable from the backup-only state.**
+   - Desktop atomic commit swaps `target -> <stage>.target-backup` then `stage -> target`.
+   - A process crash between those renames leaves the target absent and the durable backup present.
+   - Recovery previously evaluated the logical target precondition before delegating the large staged write to `commitStage()`, so this valid interrupted state could be classified as changed/replan-required instead of resumed.
+   - RED coverage: `5a86244f21dac3d32e42e2cb330aee3356b52cc2`, `2c4de65ae99d2c558c9ac8845a7e08249deb6a8a`.
+   - Fixes: `99f8e793c3270adbc0c9d48bfe7ec904f6f8c930`, `e2d9dae3bda454d0004b472aa6d54e687cc04a34` make desktop commit recover the backup-only intermediate state and let large recovery delegate the atomic precondition/recovery decision to the platform commit path.
+
+8. **MEDIUM/HIGH memory safety — large chunked conflict-copy path could materialize the whole remote file before staging.**
+   - Conflict-copy construction had a fallback `readRecord(...) -> stageBytes(...)` path.
+   - For chunked content this defeated the streaming/staging design and could allocate the entire remote file in memory during a keep-both conflict.
+   - RED coverage: `744c42ae289deb28ead5115f269317a3dff602c7`.
+   - Fix: `d49bb3c8c38700aa7eec6a149b0b08d90e83a74a` routes chunked conflict copies through `stageRemotePull()`, retaining bounded streaming into staging.
+
 ### Audited surfaces with no new confirmed defect so far
 
 - secret migration/persistence: raw token/passphrase are removed before plugin data persistence and use Obsidian SecretStorage;
@@ -106,6 +119,10 @@ Root-cause fixes are now on the audit branch:
 - `ff2780ff1543fde9b3914db174b733a998011f9f` — bound whole-buffer chunk remote reads to four concurrent part fetches.
 - `6151868d066c050deef9159d3beda389e2ae0ce7`, `d9cde1a72496a8c86df5c85b975d39b92998f873`, `0c301523e774d54bc03191aa7a897da98691ac81`, `06335328777bd5010e928c1951f1cdb581aac2f0` — bounded journal writer/reader contract, safe journal markers, cross-page consistency, descriptor validation before blob reads, and preview-limit precedence.
 - fixture-only followups `4ce0affffce484398db30b0de339af8a2dd1e5cf`, `e5ae96eda6003faa4233346bd5104561e2258923`, `40fc418844c40a52ef4baa39c7318f21a5547782`, `b876e4076084e544ec13ec0ef60c9ef7e0cbcc8a` keep tests protocol-shaped rather than weakening production validation.
+
+Recent crash/memory hardening:
+- `99f8e793...` / `e2d9dae3...` — interrupted desktop staged swaps become resumable.
+- `d49bb3c8...` — large chunked conflict copies stream directly into staging.
 
 Verification status:
 - AI sandbox execution is still blocked from obtaining the repository: direct `git clone` failed because `github.com` cannot resolve; local tools visible are Node 22.16.0, npm 10.9.2, TypeScript 5.8.3, and no pnpm.
