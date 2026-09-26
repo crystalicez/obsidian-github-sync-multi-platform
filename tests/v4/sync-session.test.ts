@@ -19,9 +19,23 @@ import { planV4PackGroups } from "../../src/lib/v4/pack-planner";
 import { waitForCondition } from "../helpers/wait-for";
 import { V4SourceChangedError } from "../../src/lib/v4/object-stream";
 import { createV4StagingStore, type V4StageRef } from "../../src/lib/v4/staging-store";
+import { hashV4ShardRecords } from "../../src/lib/v4/shard-hash";
 
 const enc = (value: string) => new TextEncoder().encode(value);
 const dec = (value: Uint8Array) => new TextDecoder().decode(value);
+
+async function shardHashesForRecords(records: V4IndexFileRecord[]): Promise<Record<string, string>> {
+  const byBucket = new Map<string, V4IndexFileRecord[]>();
+  for (const record of records) {
+    const bucket = record.pathId.slice(0, 2);
+    const bucketRecords = byBucket.get(bucket) ?? [];
+    bucketRecords.push(record);
+    byBucket.set(bucket, bucketRecords);
+  }
+  return Object.fromEntries(await Promise.all(
+    [...byBucket].map(async ([bucket, bucketRecords]) => [bucket, await hashV4ShardRecords(bucketRecords)] as const),
+  ));
+}
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -1930,7 +1944,7 @@ test("v4 confirmed Force Push migrates legacy encrypted paths in one commit", as
     epoch: 1,
     generation: 1,
     journalId: "legacy-v",
-    shardHashes: { [legacyPathId.slice(0, 2)]: "legacy-shard", [orphanPathId.slice(0, 2)]: "orphan-shard" },
+    shardHashes: await shardHashesForRecords([legacyRecord, orphanRecord]),
     updatedAt: 1,
     deviceId: "old",
   };
@@ -2023,7 +2037,7 @@ async function legacyMigrationEventFixture(input: { remotePath: string; localPat
     path: input.remotePath, pathId, fileId: input.fileId, plaintextSha256: await sha256Hex(remoteBytes), size: remoteBytes.byteLength, mtime: 1,
     remoteVersion: "legacy-v", remotePath: legacyObjectPath, storage: "single",
   };
-  const head: V4RemoteHead = { formatVersion: 4, mode: "encrypted", epoch: 1, generation: 1, journalId: "legacy-v", shardHashes: { [pathId.slice(0, 2)]: "legacy-shard" }, updatedAt: 1, deviceId: "old" };
+  const head: V4RemoteHead = { formatVersion: 4, mode: "encrypted", epoch: 1, generation: 1, journalId: "legacy-v", shardHashes: await shardHashesForRecords([legacyRecord]), updatedAt: 1, deviceId: "old" };
   const files = await buildV4RemoteMetadata({ config: legacyConfig, head, records: [legacyRecord], keyring: keys });
   files.push({ path: legacyObjectPath, bytes: await encryptV4Payload(keys.contentKey, remoteBytes, { kind: "content", aad: `${pathId}:legacy-v` }) });
   await publishV4TreeChanges(github, { message: "obsidian-sync-v4:legacy-v", files });
@@ -2107,7 +2121,7 @@ test("v4 confirmed migration accepts legacy packed records with retained loose e
   const retainedLegacyLoosePath = ".obsidian-github-sync-v4/data/Legacy/retained.enc";
   const legacyRecord: V4IndexFileRecord = { path: "Legacy/note.md", ...packed.records[0], encryptedPath: retainedLegacyLoosePath };
   const bucket = legacyRecord.pathId.slice(0, 2);
-  const head: V4RemoteHead = { formatVersion: 4, mode: "encrypted", epoch: 1, generation: 1, journalId: "legacy-packed-v", shardHashes: { [bucket]: "legacy-pack-shard" }, updatedAt: 1, deviceId: "old" };
+  const head: V4RemoteHead = { formatVersion: 4, mode: "encrypted", epoch: 1, generation: 1, journalId: "legacy-packed-v", shardHashes: await shardHashesForRecords([legacyRecord]), updatedAt: 1, deviceId: "old" };
   await publishV4TreeChanges(github, { message: "obsidian-sync-v4:legacy-packed-v", files: [{ path: retainedLegacyLoosePath, bytes: loose.files[0].bytes }, packed.file, ...await buildV4RemoteMetadata({ config: legacyConfig, head, records: [legacyRecord], keyring: keys })] });
   assert.deepEqual(await codec.read(legacyRecord, async path => (await github.getFileBytes(path, github.ref!.sha))!.bytes), plaintext);
   const oldPackPath = legacyRecord.remotePath;
@@ -2135,7 +2149,7 @@ test("v4 legacy migration refuses to delete encrypted records excluded by sync s
   const keys = await deriveV4Keyring({ passphrase: "pass", repoId: "o/r#main", salt: enc("salt"), iterations: 10 });
   const pathId = await (await import("../../src/lib/v4/paths")).pathIdForV4Path(keys.pathKey, "Excluded/note.md");
   const record: V4IndexFileRecord = { path: "Excluded/note.md", pathId, fileId: "excluded-file", plaintextSha256: await sha256Hex(plaintext), size: plaintext.byteLength, mtime: 1, remoteVersion: "legacy-v", remotePath: ".obsidian-github-sync-v4/data/Excluded/note.enc", storage: "single" };
-  const head: V4RemoteHead = { formatVersion: 4, mode: "encrypted", epoch: 1, generation: 1, journalId: "legacy-v", shardHashes: { [pathId.slice(0, 2)]: "legacy-shard" }, updatedAt: 1, deviceId: "old" };
+  const head: V4RemoteHead = { formatVersion: 4, mode: "encrypted", epoch: 1, generation: 1, journalId: "legacy-v", shardHashes: await shardHashesForRecords([record]), updatedAt: 1, deviceId: "old" };
   const files = await buildV4RemoteMetadata({ config: legacyConfig, head, records: [record], keyring: keys });
   files.push({ path: record.remotePath, bytes: await encryptV4Payload(keys.contentKey, plaintext, { kind: "content", aad: `${record.pathId}:legacy-v` }) });
   await publishV4TreeChanges(github, { message: "obsidian-sync-v4:legacy-v", files });
@@ -2243,8 +2257,8 @@ test("v4 no-op reuses all 256 unchanged local index shards", async () => {
     const pathId = await sha256Hex(enc(`path:${path}`));
     const bucket = pathId.slice(0, 2);
     if (shardHashes[bucket]) continue;
-    const record = { path, pathId, fileId: `file-${bucket}`, plaintextSha256: `hash-${bucket}`, size: 1, mtime: 1, remoteVersion: "j1", remotePath: path, storage: "single" as const };
-    const hash = `shard-${bucket}`;
+    const record = { path, pathId, fileId: `file-${bucket}`, plaintextSha256: await sha256Hex(enc("x")), size: 1, mtime: 1, remoteVersion: "j1", remotePath: path, storage: "single" as const };
+    const hash = await hashV4ShardRecords([record]);
     shardHashes[bucket] = hash;
     index.shardHashes[bucket] = hash;
     index.shards[bucket] = { bucket, hash, records: { [pathId]: record } };
@@ -2281,7 +2295,7 @@ test("v4 authenticated remote duplicate fileIds are rejected before normal or Fo
     { path: "one.md", pathId: firstPathId, fileId: "duplicate-id", plaintextSha256: "a".repeat(64), size: 1, mtime: 1, remoteVersion: "v", remotePath, storage: "single" },
     { path: "two.md", pathId: secondPathId, fileId: "duplicate-id", plaintextSha256: "b".repeat(64), size: 1, mtime: 1, remoteVersion: "v", remotePath, storage: "single" },
   ];
-  const shardHashes = Object.fromEntries([...new Set(records.map(record => record.pathId.slice(0, 2)))].map(bucket => [bucket, `hash-${bucket}`]));
+  const shardHashes = await shardHashesForRecords(records);
   const head: V4RemoteHead = { formatVersion: 4, mode: "encrypted", epoch: 1, generation: 1, journalId: "malicious", shardHashes, updatedAt: 1, deviceId: "attacker" };
   await publishV4TreeChanges(github, { message: "obsidian-sync-v4:malicious", files: await buildV4RemoteMetadata({ config: encryptedConfig, head, records, keyring: keys }) });
   const before = { ref: github.ref!.sha, blobs: github.blobs.size, trees: github.trees.size, commits: github.commits.size };
@@ -2316,7 +2330,7 @@ test("v4 authenticated remote duplicate paths and fabricated pathIds reject befo
 
   for (const scenario of cases) {
     const github = new MemoryGitHub();
-    const shardHashes = Object.fromEntries([...new Set(scenario.records.map(item => item.pathId.slice(0, 2)))].map(bucket => [bucket, `hash-${bucket}`]));
+    const shardHashes = await shardHashesForRecords(scenario.records);
     const head: V4RemoteHead = { formatVersion: 4, mode: "encrypted", epoch: 1, generation: 1, journalId: "malicious", shardHashes, updatedAt: 1, deviceId: "attacker" };
     await publishV4TreeChanges(github, { message: "obsidian-sync-v4:malicious", files: await buildV4RemoteMetadata({ config: encryptedConfig, head, records: scenario.records, keyring: keys }) });
     const before = { ref: github.ref!.sha, blobs: github.blobs.size, trees: github.trees.size, commits: github.commits.size };
