@@ -34,16 +34,6 @@ test("remote loader reads config head and shard at the requested immutable commi
     repoId: "o/r#main",
     pathLayout: expectedV4PathLayout("plaintext"),
   };
-  const head: V4RemoteHead = {
-    formatVersion: V4_FORMAT_VERSION,
-    mode: "plaintext",
-    epoch: 1,
-    generation: 2,
-    journalId: "journal-2",
-    shardHashes: { [bucket]: "remote-shard-hash" },
-    updatedAt: 3,
-    deviceId: "device-a",
-  };
   const record = {
     path,
     pathId,
@@ -54,6 +44,17 @@ test("remote loader reads config head and shard at the requested immutable commi
     remoteVersion: "journal-2",
     remotePath: path,
     storage: "single" as const,
+  };
+  const shardHash = await sha256Hex(enc(JSON.stringify([record])));
+  const head: V4RemoteHead = {
+    formatVersion: V4_FORMAT_VERSION,
+    mode: "plaintext",
+    epoch: 1,
+    generation: 2,
+    journalId: "journal-2",
+    shardHashes: { [bucket]: shardHash },
+    updatedAt: 3,
+    deviceId: "device-a",
   };
   const metadata = await buildV4RemoteMetadata({ config, head, records: [record] });
   const github = new MemoryRemoteGithub(new Map(metadata.map(file => [file.path, file.bytes])));
@@ -89,4 +90,46 @@ test("remote loader can reconstruct a plaintext unchanged-head state from the lo
   assert.equal(state.head.epoch, 4);
   assert.equal(state.head.generation, 5);
   assert.deepEqual(state.records, []);
+});
+
+
+test("remote loader rejects a shard whose records do not match the head shard hash", async () => {
+  const path = "Notes/a.md";
+  const pathId = await sha256Hex(enc(`path:${path}`));
+  const bucket = pathId.slice(0, 2);
+  const config: V4RemoteConfig = {
+    formatVersion: 4,
+    mode: "plaintext",
+    repoId: "o/r#main",
+    pathLayout: "plaintext-v1",
+  };
+  const record = {
+    path,
+    pathId,
+    fileId: "file-a",
+    plaintextSha256: "a".repeat(64),
+    size: 1,
+    mtime: 2,
+    remoteVersion: "journal-2",
+    remotePath: path,
+    storage: "single" as const,
+  };
+  const head: V4RemoteHead = {
+    formatVersion: 4,
+    mode: "plaintext",
+    epoch: 1,
+    generation: 2,
+    journalId: "journal-2",
+    shardHashes: { [bucket]: "f".repeat(64) },
+    updatedAt: 3,
+    deviceId: "device-a",
+  };
+  const metadata = await buildV4RemoteMetadata({ config, head, records: [record] });
+  const github = new MemoryRemoteGithub(new Map(metadata.map(file => [file.path, file.bytes])));
+  const index = createEmptyV4LocalIndex({ repoId: config.repoId, deviceId: "local", mode: config.mode, pathLayout: config.pathLayout });
+
+  await assert.rejects(
+    () => loadV4RemoteState({ github, index }, "commit-2", config),
+    /shard.*hash|hash.*mismatch/iu,
+  );
 });
