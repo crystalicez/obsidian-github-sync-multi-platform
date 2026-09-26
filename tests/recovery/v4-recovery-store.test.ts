@@ -410,3 +410,30 @@ test("recovery store rejects integrity-valid payloads outside the writer safety 
     )
   }
 })
+
+
+test("recovery store refuses to persist an unsafe payload that could be replayed without reload", async () => {
+  const adapter = new MemoryAdapter()
+  const store = createV4RecoveryStore({ adapter, root: "recovery", repoId: "owner/repo#main" })
+
+  await assert.rejects(
+    () => store.save({
+      runId: "run-unsafe-save",
+      phase: "remote-verified",
+      expectedRemoteHead: "a".repeat(40),
+      candidateCommitSha: "b".repeat(40),
+      verifiedRemoteHead: "b".repeat(40),
+      payload: {
+        mutations: [{
+          id: "trash:unsafe",
+          kind: "trash",
+          path: "../outside.md",
+          precondition: { path: "../outside.md", exists: false },
+        }],
+        completedMutationIds: [],
+      },
+    }),
+    V4RecoveryRequiredError,
+  )
+  assert.equal(adapter.values.size, 0)
+})
