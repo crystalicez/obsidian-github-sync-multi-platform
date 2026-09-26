@@ -550,3 +550,47 @@ test("transport metrics count response text as UTF-8 bytes", async () => {
     setRequestUrlHandler(null)
   }
 })
+
+
+test("empty-repository bootstrap treats an unknown Contents outcome plus a newly observed competitor ref as a bootstrap race", async () => {
+  let initialized = false;
+  let puts = 0;
+  setRequestUrlHandler(async (options: unknown) => {
+    const request = options as Record<string, any>;
+    if (request.url.includes("/git/refs?")) {
+      return initialized
+        ? { status: 200, text: "", headers: {}, json: [{ ref: "refs/heads/main", object: { sha: "competitor-commit", type: "commit" } }] }
+        : { status: 409, text: "empty", headers: {}, json: {} };
+    }
+    if (request.method === "PUT") {
+      puts++;
+      initialized = true;
+      throw new Error("bootstrap response lost while another initializer won");
+    }
+    if (request.method === "GET" && request.url.includes("/git/ref/heads/main")) {
+      return { status: 200, text: "", headers: {}, json: { ref: "refs/heads/main", object: { sha: "competitor-commit", type: "commit" } } };
+    }
+    throw new Error(`Unexpected request: ${request.method} ${request.url}`);
+  });
+
+  try {
+    const client = new GitHubClient(
+      { token: "token", owner: "owner", repo: "repo", branch: "main" },
+      { transportPolicy: { mutationSpacingMs: 0 } },
+    );
+
+    await assert.rejects(
+      () => client.ensureGitRepositoryInitialized(),
+      error => {
+        const candidate = error as Error & { code?: string; observedRefSha?: string };
+        assert.equal(candidate.name, "V4RepositoryBootstrapRaceError");
+        assert.equal(candidate.code, "V4_REPOSITORY_BOOTSTRAP_RACE");
+        assert.equal(candidate.observedRefSha, "competitor-commit");
+        return true;
+      },
+    );
+    assert.equal(puts, 1);
+  } finally {
+    setRequestUrlHandler(null);
+  }
+});
