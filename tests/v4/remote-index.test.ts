@@ -158,3 +158,31 @@ test("v4 remote shard rejects impossible numeric and chunk descriptor workloads 
     );
   }
 });
+
+
+test("v4 remote records reject missing integrity/version identifiers that the writer never emits", async () => {
+  const config: V4RemoteConfig = { formatVersion: 4, mode: "plaintext", repoId: "o/r#main", pathLayout: "plaintext-v1" };
+  const pathId = "aa".padEnd(64, "0");
+  const base = {
+    path: "note.md",
+    pathId,
+    fileId: "file-a",
+    plaintextSha256: "a".repeat(64),
+    size: 1,
+    mtime: 1,
+    remoteVersion: "v1",
+    remotePath: "note.md",
+    storage: "single" as const,
+  };
+  for (const [label, record] of [
+    ["empty plaintext hash", { ...base, plaintextSha256: "" }],
+    ["malformed plaintext hash", { ...base, plaintextSha256: "not-a-sha" }],
+    ["empty remote version", { ...base, remoteVersion: "" }],
+  ] as const) {
+    await assert.rejects(
+      () => decodeV4RemoteShard(enc(JSON.stringify({ bucket: "aa", records: { [pathId]: record } })), "aa", config),
+      /hash|version|record/iu,
+      label,
+    );
+  }
+});
