@@ -122,6 +122,19 @@ Audit method:
    - RED refinement: `f07c06ee88bb5d5dc5f238292297dcfe2dacd4fb`.
    - Fixes: `c14ffb89b79aae4287f762fbd8d82a86e61facd5`, `b093ad1cebbb10b11d4202471c52a73e252bc5fc`, `4a03d7954859d63064bfc2ece5c88518fafe3232` define one shared exact 600,000-iteration writer/reader contract.
 
+16. **MEDIUM fail-closed boundary — successful GitHub list/tree/object responses still accepted malformed object IDs/shapes.**
+   - After initial response-shape hardening, refs/commits/mutation object IDs could still be arbitrary non-empty strings, and history list/tree responses could omit required structure such as the tree `truncated` boolean.
+   - Malformed 2xx data could therefore move failure into later dependent operations or make history treat incomplete evidence as complete.
+   - RED: `e05415043c61425897ba2c602d29e694a5c8159e`, `99bbd729d40cc9b08c1c79beb142b9ca0083d00b`.
+   - Fixes: `751aeace07b7edf4bd226ed800ae11cc2ed5a4a8`, `8277a94652319e134bf0a304050ef76889d0895a` validate commit-list/tree shapes and require 40-hex Git object IDs at ref/commit/tree/blob mutation boundaries.
+   - Fixture normalization: `28cc0e313c54757c930b96136a588af39c56c023`, corrected by `18c0509b9a8023de72e6f1794b30aae511091729`, keeps transport fixtures object-ID shaped without changing semantic `type: "blob" | "commit"` literals.
+
+17. **MEDIUM destructive-action safety UI — Force Push/Pull confirmation understated the actual synced local scope.**
+   - Confirmation counted vault files by excluding all `.obsidian/*`, while production scope can intentionally include config, bookmarks, community plugin metadata, and other plugins.
+   - With those settings enabled, the destructive confirmation displayed fewer affected local files than runtime would actually consider.
+   - RED: `50de3d3925e371001142b0b61f0b65ae9b32a0f6`.
+   - Fixes: `d21c1c5d4a92d7875c4da6d185e78d39f4a774fa`, `111e9fdd0549f4f9de93753909eae1c6a3a085ba` centralize scoped-path counting on the same predicate used by runtime and use it in the force confirmation.
+
 ### Audited surfaces with no new confirmed defect so far
 
 - secret migration/persistence: raw token/passphrase are removed before plugin data persistence and use Obsidian SecretStorage;
