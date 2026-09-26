@@ -287,11 +287,11 @@ export async function applyV4RecoveryLocalMutations(input: {
         input.onApplied?.(mutation)
         continue
       }
-      await assertV4LocalTargetPrecondition(input.io, mutation.precondition)
       if (mutation.stage.size > DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES) {
         if (!input.io.commitStage) throw new V4RecoveryRequiredError(`V4 recovery cannot commit staged content: ${mutation.id}`)
         await input.io.commitStage({ stage: mutation.stage, path: mutation.path, precondition: mutation.precondition })
       } else {
+        await assertV4LocalTargetPrecondition(input.io, mutation.precondition)
         if (!input.io.staging) throw new V4RecoveryRequiredError(`V4 recovery stage is unavailable: ${mutation.id}`)
         const source = await input.io.staging.open(mutation.stage)
         const bytes = await collectV4ContentSource(source, DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES, input.signal)
