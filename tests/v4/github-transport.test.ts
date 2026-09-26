@@ -724,3 +724,32 @@ test("GitHubClient rejects malformed successful commit-list and tree responses",
     setRequestUrlHandler(null);
   }
 });
+
+
+test("GitHub client rejects non-object SHA strings in successful ref and immutable mutation responses", async () => {
+  setRequestUrlHandler(async (options: unknown) => {
+    const request = options as Record<string, any>;
+    if (request.url.includes("/git/ref/heads/main")) {
+      return { status: 200, text: "", headers: {}, json: { ref: "refs/heads/main", object: { sha: "not-a-sha", type: "commit" } } };
+    }
+    throw new Error(`Unexpected request: ${request.method} ${request.url}`);
+  });
+  try {
+    const client = new GitHubClient(
+      { token: "token", owner: "owner", repo: "repo", branch: "main" },
+      { transportPolicy: { mutationSpacingMs: 0 } },
+    );
+    await assert.rejects(() => client.getGitRef(), /invalid.*sha|malformed/iu);
+
+    setRequestUrlHandler(async (options: unknown) => {
+      const request = options as Record<string, any>;
+      if (request.method === "POST" && request.url.endsWith("/git/blobs")) {
+        return { status: 201, text: "", headers: {}, json: { sha: "not-a-sha" } };
+      }
+      throw new Error(`Unexpected request: ${request.method} ${request.url}`);
+    });
+    await assert.rejects(() => client.createGitBlob(new Uint8Array([1])), /invalid.*sha|malformed/iu);
+  } finally {
+    setRequestUrlHandler(null);
+  }
+});
