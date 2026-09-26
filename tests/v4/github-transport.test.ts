@@ -594,3 +594,48 @@ test("empty-repository bootstrap treats an unknown Contents outcome plus a newly
     setRequestUrlHandler(null);
   }
 });
+
+
+test("GitHub client rejects malformed successful ref and commit responses at the read boundary", async () => {
+  setRequestUrlHandler(async (options: unknown) => {
+    const request = options as Record<string, any>;
+    if (request.url.includes("/git/ref/heads/main")) {
+      return { status: 200, text: "", headers: {}, json: { ref: "refs/heads/main", object: { type: "commit" } } };
+    }
+    if (request.url.includes("/git/commits/")) {
+      return { status: 200, text: "", headers: {}, json: { sha: "commit", parents: [] } };
+    }
+    throw new Error(`Unexpected request: ${request.method} ${request.url}`);
+  });
+  try {
+    const client = new GitHubClient({ token: "token", owner: "owner", repo: "repo", branch: "main" }, { transportPolicy: { mutationSpacingMs: 0 } });
+    await assert.rejects(() => client.getGitRef(), /ref.*sha|malformed|invalid/iu);
+
+    setRequestUrlHandler(async (options: unknown) => {
+      const request = options as Record<string, any>;
+      if (request.url.includes("/git/commits/")) {
+        return { status: 200, text: "", headers: {}, json: { sha: "commit", parents: [] } };
+      }
+      throw new Error(`Unexpected request: ${request.method} ${request.url}`);
+    });
+    await assert.rejects(() => client.getGitCommit("commit"), /tree.*sha|malformed|invalid/iu);
+  } finally {
+    setRequestUrlHandler(null);
+  }
+});
+
+test("GitHub client rejects malformed successful immutable-object mutation responses before dependent writes", async () => {
+  setRequestUrlHandler(async (options: unknown) => {
+    const request = options as Record<string, any>;
+    if (request.method === "POST" && request.url.endsWith("/git/blobs")) {
+      return { status: 201, text: "", headers: {}, json: {} };
+    }
+    throw new Error(`Unexpected request: ${request.method} ${request.url}`);
+  });
+  try {
+    const client = new GitHubClient({ token: "token", owner: "owner", repo: "repo", branch: "main" }, { transportPolicy: { mutationSpacingMs: 0 } });
+    await assert.rejects(() => client.createGitBlob(new Uint8Array([1])), /blob.*sha|malformed|invalid/iu);
+  } finally {
+    setRequestUrlHandler(null);
+  }
+});
