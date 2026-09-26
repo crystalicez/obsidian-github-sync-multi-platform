@@ -427,8 +427,10 @@ export class GitHubClient {
           successStatuses: [200, 201],
           action: "Failed to bootstrap empty repository",
         });
-        commitSha = (response.json as { commit?: { sha?: string } }).commit?.sha;
-        if (!commitSha) throw new Error("GitHub bootstrap response is missing its commit SHA.");
+        commitSha = requiredGitObjectSha(
+          (response.json as { commit?: { sha?: string } }).commit?.sha,
+          "bootstrap commit SHA",
+        );
       } catch (error) {
         if (!(error instanceof V4GitMutationOutcomeUnknownError)) {
           const status = (error as { status?: number }).status;
