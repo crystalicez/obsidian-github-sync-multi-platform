@@ -127,3 +127,37 @@ test("v4 streamed sink size mismatch identifies the remote object without requir
     /V4 content size mismatch: \.obsidian-github-sync-v4\/objects\/opaque\.bin/u,
   );
 });
+
+
+test("v4 whole-buffer chunk reader bounds concurrent remote part reads", async () => {
+  const codec = new V4StorageCodec({ mode: "plaintext", pathLayout: "plaintext-v1" });
+  const parts = Array.from({ length: 12 }, (_, index) => new Uint8Array([index + 1]));
+  const joined = new Uint8Array(parts.length);
+  parts.forEach((part, index) => joined.set(part, index));
+  const paths = parts.map((_, index) => `.obsidian-github-sync-v4/large/x/v1/${String(index + 1).padStart(6, "0")}.part`);
+  let active = 0;
+  let peak = 0;
+  const record = {
+    pathId: "aa".padEnd(64, "0"),
+    fileId: "f",
+    plaintextSha256: await sha256Hex(joined),
+    size: joined.byteLength,
+    mtime: 1,
+    remoteVersion: "v1",
+    remotePath: paths[0],
+    storage: "chunked" as const,
+    partPaths: paths,
+  };
+
+  const restored = await codec.read(record, async path => {
+    const index = paths.indexOf(path);
+    active++;
+    peak = Math.max(peak, active);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    active--;
+    return parts[index];
+  });
+
+  assert.deepEqual(restored, joined);
+  assert.equal(peak <= 4, true, `peak chunk reads must stay bounded, got ${peak}`);
+});
