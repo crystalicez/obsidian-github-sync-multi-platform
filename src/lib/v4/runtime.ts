@@ -642,6 +642,7 @@ export class V4PluginRuntime {
           if (error instanceof V4ChangeGuardError && !request.allowThresholdOverride && request.operation !== "normal") {
             this.progressStore.update({ phase: "blocked", currentPath: undefined, currentDirection: undefined })
             const confirmed = await this.confirmThresholdOverride(error, request.operation, signal)
+            throwIfV4Aborted(signal)
             if (!confirmed) throw new Error("Sync cancelled because the modification threshold was exceeded.")
             request.allowThresholdOverride = true
             casAttempt--
