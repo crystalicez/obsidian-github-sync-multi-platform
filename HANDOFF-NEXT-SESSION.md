@@ -95,6 +95,14 @@ Audit method:
    - Fixes: `634391f1e3ba167fe2559da0b2be9ece1a799e26`, `85ae7b944a401d278805bb03eb61238f76ed5f7a`, `4cb2eed2942b853e77ea7a237c00f5bd01c69e4b`.
    - Runtime exposes a monotonic settings generation, captures one client/repo/passphrase generation for history creation/file lookup, old history services assert their generation at async boundaries, and Sync Center recreates its cached service when the generation changes.
 
+12. **MEDIUM/HIGH integrity — GitHub Contents 200 could bypass binary authentication when the response SHA was malformed.**
+   - `getFileBytes()` only verified decoded Contents bytes against Git blob SHA-1 when the returned `sha` already matched the 40-hex pattern.
+   - A non-empty malformed SHA therefore skipped verification and the decoded Contents payload was accepted directly.
+   - This undermined the binary-transformation defense used for encrypted/opaque metadata and could propagate unverified bytes into protocol decoders.
+   - RED: `7af7f593b634a445f88a469645874ed668138989`.
+   - Fix: `934b7a979e0958ea8deb5907cf3594311dac0a2b` requires a valid Git object SHA before any 200 Contents payload can be trusted, verifies decoded bytes against that SHA, and otherwise falls back to the raw Git Blob endpoint using the validated SHA.
+   - Fixture cleanup: current GitHub transport fixtures now use protocol-shaped 40-hex object IDs rather than symbolic placeholder SHAs where the Contents boundary is exercised.
+
 ### Audited surfaces with no new confirmed defect so far
 
 - secret migration/persistence: raw token/passphrase are removed before plugin data persistence and use Obsidian SecretStorage;
