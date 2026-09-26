@@ -278,13 +278,15 @@ Audit method:
    - RED: `bcab23adc56f7edc8d5088159f519e4bff7ecf9c`.
    - Fix: `4b6282a559841d800a057caecf6ef096e95feca5` makes `normalizeV4VaultPath` enforce a portable logical-path subset: reject Windows device names, control/forbidden characters, trailing dot/space, and >255 UTF-8 byte path components.
 
-40. **HIGH privacy/local-mutation safety — desktop filesystem IO can traverse vault symlink/junction ancestors outside the vault.**
-   - Obsidian desktop supports symlinks/junctions that may target locations outside the vault. Current bounded/staging IO resolves a lexical vault path with `getFullPath()` then uses Node `fs.stat/read/open/mkdir/rename/rm`, which follows parent links.
-   - A vault link to an external directory can therefore make large bounded local-source reads upload bytes outside the vault, or make staged pull/rollback/commit paths mutate files outside the vault.
+40. **HIGH privacy/local-mutation safety — desktop filesystem IO could traverse vault symlink/junction ancestors outside the vault.**
+   - Obsidian desktop supports symlinks/junctions that may target locations outside the vault. The previous bounded/staging IO resolved a lexical vault path with `getFullPath()` then used Node `fs.stat/read/open/mkdir/rename/rm`, which follows parent links.
+   - A vault link to an external directory could therefore make local-source reads upload bytes outside the vault, or make staged pull/rollback/commit paths mutate files outside the vault.
    - External reference confirmation: Obsidian documentation explicitly warns that symlinks/junctions may point outside the vault and can cause sync/data-loss issues; FileSystemAdapter exposes `getBasePath()` and `getFullPath()` on desktop.
    - RED: `1f1052c4110f459f79dcae51e18183ea8418b90c` covers an external directory link used by bounded source read and a staged commit target beneath that link.
-   - Required fix: make desktop platform IO root-aware, prove lexical + real-path containment, reject symlink/junction ancestors before reads/mutations, and expose the same guard to small-file vault reads so protection is not limited to the large-file path.
-   - Residual TOCTOU note: user/OS replacement of a verified directory entry between guard and subsequent Node operation cannot be fully eliminated without handle-relative/openat-style APIs; the fix must document that narrow local-adversary race rather than claiming stronger guarantees.
+   - Fixes: `d6ddd9836e60b7ee7437656374decc30cbd93f3d`, `d25b9c0a9ccc92b051776da5ab4e41113f3939eb`, `d0e46ea1d8e4cd9bb75cd760a47fc8e1aea13ca1`, `10ad6688ca89061024095969247caed38ef98aef`, `4cb9a969ab8be2ebcbdc6beb85b88c020e444b58`, `7697ad51d8a32d1d4599c1bcfd4d6a7c2786a7ba`, `3ef3575af8ecc5eeb98f387efd76e003fc2dfe87`, `fb950b961bfa1fb43980dca5bc633374797151f7`.
+   - Desktop IO now requires both FileSystemAdapter full-path and base-root proof, checks lexical containment, resolves the real vault root, rejects symlink/junction or outside-root existing descendants, and applies the guard to small vault reads/writes/trash plus bounded/staging/recovery IO. Desktop stage/recovery operations capability-fail rather than falling back to unproven adapter IO when root proof is unavailable.
+   - The vault root itself may resolve through a symlink; links **inside** the vault tree are rejected for synced IO.
+   - Residual TOCTOU: a local adversary/OS process can theoretically replace an already-verified directory entry between the guard and the following Node filesystem call. Fully eliminating that narrow race would require handle-relative/openat-style APIs not exposed by the current Obsidian/Node integration; do not claim stronger guarantees.
 
 ### Audited surfaces with no new confirmed defect so far
 
