@@ -221,7 +221,9 @@ export default class FastSync extends Plugin {
     this.secretsMigrated = result.migrated
   }
 
-  async saveSettings() {
+  async saveSettings(nextSettings: PluginSettings = this.settings) {
+    await this.v4Runtime?.quiesceForSettingsChange()
+    this.settings = nextSettings
     this.v4Runtime?.credentialsChanged()
     storeV4Secrets(this.settings, this.app.secretStorage)
     this.initGitHubClient()
