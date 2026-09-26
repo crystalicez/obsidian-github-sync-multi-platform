@@ -776,3 +776,27 @@ test("bootstrap rejects a malformed successful commit SHA before creating the co
   )
   assert.equal(requests.some(request => request.url.endsWith("/git/refs") && request.method === "POST"), false)
 })
+
+
+test("GitHub tree rejects blob entries that omit byte size", async () => {
+  const client = new GitHubClient({ token: "t", owner: "o", repo: "r", branch: "main" }, async () => ({
+    status: 200,
+    text: "",
+    json: {
+      sha: "a".repeat(40),
+      truncated: false,
+      tree: [{
+        path: "large.bin",
+        mode: "100644",
+        type: "blob",
+        sha: "b".repeat(40),
+        url: "",
+      }],
+    },
+  }) as any);
+
+  await assert.rejects(
+    () => client.getTreeAt("a".repeat(40), true),
+    /tree entry.*size|blob.*size/iu,
+  );
+});
