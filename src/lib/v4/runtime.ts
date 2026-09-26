@@ -227,23 +227,39 @@ export class V4PluginRuntime {
 
   async createHistoryService(): Promise<V4HistoryService> {
     this.assertNotDisposed()
-    const loaded = await this.loadConfiguredRemoteConfig()
+    const generation = this.credentialGeneration
+    const github = this.plugin.githubClient
+    const repoId = this.repoId()
+    const passphrase = this.plugin.settings.encryptionPassphrase
+    const loaded = await this.loadConfiguredRemoteConfig({ github, repoId })
+    this.assertSettingsGeneration(generation)
     if (!loaded) throw new Error("V4 history is not initialized. Force Push first.")
     const { remoteConfig, config } = loaded
     assertV4PathLayoutCompatible(remoteConfig, config, "normal")
     const keyring = config.mode === "encrypted"
-      ? await this.keyringForConfig(config, this.plugin.settings.encryptionPassphrase)
+      ? await this.keyringForConfig(config, passphrase)
       : undefined
-    return new V4HistoryService({ github: this.plugin.githubClient, config, keyring })
+    this.assertSettingsGeneration(generation)
+    return new V4HistoryService({
+      github,
+      config,
+      keyring,
+      assertCurrent: () => this.assertSettingsGeneration(generation),
+    })
   }
 
   async fileIdForPath(path: string): Promise<string | null> {
     this.assertNotDisposed()
-    const loaded = await this.loadConfiguredRemoteConfig()
+    const generation = this.credentialGeneration
+    const github = this.plugin.githubClient
+    const repoId = this.repoId()
+    const loaded = await this.loadConfiguredRemoteConfig({ github, repoId })
+    this.assertSettingsGeneration(generation)
     if (!loaded) throw new Error("V4 history is not initialized. Force Push first.")
     assertV4PathLayoutCompatible(loaded.remoteConfig, loaded.config, "normal")
     const config = loaded.config
     const index = await this.loadIndex(config)
+    this.assertSettingsGeneration(generation)
     for (const shard of Object.values(index.shards)) {
       for (const record of Object.values(shard.records)) if (!record.deleted && record.path === path) return record.fileId
     }
@@ -284,6 +300,11 @@ export class V4PluginRuntime {
 
   private assertNotDisposed(): void {
     if (this.disposed) throw new Error("V4 runtime is disposed.")
+  }
+
+  private assertSettingsGeneration(generation: number): void {
+    this.assertNotDisposed()
+    if (generation !== this.credentialGeneration) throw new V4CancelledError("V4 settings generation changed.")
   }
 
   private beginWaitingRun(): void {
@@ -335,13 +356,15 @@ export class V4PluginRuntime {
     return `${this.plugin.settings.githubOwner}/${this.plugin.settings.githubRepo}#${this.plugin.settings.githubBranch || "main"}`
   }
 
-  private async loadConfiguredRemoteConfig(): Promise<{ remoteConfig: V4RemoteConfig; config: V4RemoteConfig } | null> {
-    if (!this.plugin.githubClient) throw new Error("GitHub connection is not configured.")
-    const ref = await this.plugin.githubClient.getGitRefOrNull()
-    const remote = ref ? await this.plugin.githubClient.getFileBytes(V4_CONFIG_PATH, ref.sha) : null
+  private async loadConfiguredRemoteConfig(
+    target: { github: FastSync["githubClient"]; repoId: string } = { github: this.plugin.githubClient, repoId: this.repoId() },
+  ): Promise<{ remoteConfig: V4RemoteConfig; config: V4RemoteConfig } | null> {
+    if (!target.github) throw new Error("GitHub connection is not configured.")
+    const ref = await target.github.getGitRefOrNull()
+    const remote = ref ? await target.github.getFileBytes(V4_CONFIG_PATH, ref.sha) : null
     if (!remote) return null
     const remoteConfig = decodeV4RemoteConfig(remote.bytes)
-    const config = selectV4RuntimeConfig(remoteConfig, remoteConfig.mode, this.repoId())
+    const config = selectV4RuntimeConfig(remoteConfig, remoteConfig.mode, target.repoId)
     if (remoteConfig.repoId !== config.repoId) throw new Error("V4 remote repository identity mismatch.")
     return { remoteConfig, config }
   }
