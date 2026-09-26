@@ -1228,3 +1228,12 @@ test("persisted settings are validated after migration before installation or sc
     /async loadSettings()[sS]*?migrateV4Secrets([sS]*?assertPluginSettingsRuntimeSafe(result.settings)[sS]*?this.settingss*=s*result.settings/u,
   )
 })
+
+
+test("layout-ready startup callback is inert after plugin unload", async () => {
+  const mainSource = await readFile("src/main.ts", "utf8")
+  assert.match(
+    mainSource,
+    /this.app.workspace.onLayoutReady(()s*=>s*{s*ifs*(this.unloaded)s*return[sS]*?setTimeout(()s*=>s*{s*ifs*(this.unloaded)s*return/u,
+  )
+})
