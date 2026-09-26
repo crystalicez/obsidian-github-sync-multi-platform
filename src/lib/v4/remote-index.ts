@@ -70,8 +70,18 @@ export function assertV4RemoteRecordDescriptor(record: V4IndexFileRecord, config
     if (!Array.isArray(record.partPaths) || record.partPaths.length === 0 || record.remotePath !== record.partPaths[0] || record.packId !== undefined) {
       throw new Error("V4 chunked storage has inconsistent part descriptors.")
     }
-    if (record.partPaths.length > V4_GITHUB_SAFE_CONTENT_MUTATIONS_PER_REVISION) {
-      throw new Error("V4 chunked storage exceeds the part-count budget.")
+    const predictedRemoteBytes = record.size + (config.mode === "encrypted" ? 33 : 0)
+    if (!shouldUseV4Parts(record.size, predictedRemoteBytes)) {
+      throw new Error("V4 chunked storage is below the writer chunking threshold.")
+    }
+    const minWriterParts = Math.ceil(record.size / V4_PART_BYTES)
+    const maxWriterParts = Math.ceil(record.size / (1024 * 1024))
+    if (
+      record.partPaths.length < minWriterParts
+      || record.partPaths.length > maxWriterParts
+      || record.partPaths.length > V4_GITHUB_SAFE_CONTENT_MUTATIONS_PER_REVISION
+    ) {
+      throw new Error("V4 chunked storage has a writer-incompatible part count.")
     }
     if (record.size > V4_GITHUB_SAFE_CONTENT_MUTATIONS_PER_REVISION * V4_PART_BYTES) {
       throw new Error("V4 chunked storage exceeds the writer size budget.")
