@@ -2788,3 +2788,44 @@ test("v4 newer policy does not treat synthesized external reconciliation mtime a
   assert.ok(copyPath, "external conflict must be preserved as a copy when remote mtime is synthetic");
   assert.equal(dec(vault.files.get(copyPath!)!.bytes), "external remote");
 });
+
+
+test("v4 authoritative full scan detects same-size same-mtime local content changes", async () => {
+  const github = new MemoryGitHub()
+  const vault = new MemoryVault()
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "local", mode: "plaintext" })
+  vault.files.set("note.md", { bytes: enc("AAAA"), mtime: 1 })
+
+  await new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "forcePush", allowThresholdOverride: false })
+
+  const firstHead = github.ref!.sha
+  const firstHash = indexRecordByPath(index, "note.md").plaintextSha256
+  vault.files.set("note.md", { bytes: enc("BBBB"), mtime: 1 })
+
+  await new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "normal", allowThresholdOverride: false, changes: [] })
+
+  assert.notEqual(github.ref!.sha, firstHead)
+  assert.notEqual(indexRecordByPath(index, "note.md").plaintextSha256, firstHash)
+  assert.equal(indexRecordByPath(index, "note.md").plaintextSha256, await sha256Hex(enc("BBBB")))
+})
+
+test("v4 explicit rescan detects same-size same-mtime local content changes", async () => {
+  const github = new MemoryGitHub()
+  const vault = new MemoryVault()
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "local", mode: "plaintext" })
+  vault.files.set("note.md", { bytes: enc("AAAA"), mtime: 1 })
+
+  await new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "forcePush", allowThresholdOverride: false })
+
+  const firstHead = github.ref!.sha
+  vault.files.set("note.md", { bytes: enc("BBBB"), mtime: 1 })
+
+  await new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "normal", allowThresholdOverride: false, changes: [{ type: "rescan", mtime: 2 }] })
+
+  assert.notEqual(github.ref!.sha, firstHead)
+  assert.equal(indexRecordByPath(index, "note.md").plaintextSha256, await sha256Hex(enc("BBBB")))
+})
