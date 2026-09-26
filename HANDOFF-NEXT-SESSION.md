@@ -202,6 +202,14 @@ Audit method:
    - RED: `a01a7d2aa57908032bc0cccb72c8e76cbd3c660c`.
    - Fix: `90350f2f9afc18b5079b0b3dda3a6ad09f9def99` guards both the layout-ready callback and delayed startup callback with the plugin unload flag.
 
+29. **HIGH remote-change detection — commit-message-only plugin classification could hide forged external content changes.**
+   - When the branch SHA changed, sync previously treated the tip as a plugin publication solely when its first commit-message line equaled `obsidian-sync-v4:<current journalId>`.
+   - An external commit could change plaintext user bytes, leave V4 head/shards unchanged, reuse the previous plugin message, and cause planning to see unchanged metadata and return no-op; the local index could then advance to the forged SHA without reconciling those changed bytes.
+   - In encrypted mode, the same marker-only classification could hide an external object/tree mutation that should instead trigger the encrypted external-change fail-closed path.
+   - RED: `556cb4c6f70bb2c70935857ce09c85a7e7ee95f0` covers plaintext reconciliation and encrypted rejection.
+   - Fix: `4d1815e47d8a168753232d0d89cbe891126517f7` treats the message only as one signal. It also loads/decodes the immediate parent's V4 head and requires a valid publication transition: same mode, generation exactly parent+1, and a new journal ID. Otherwise the tip is reconciled/rejected as external.
+   - Plaintext repositories intentionally cannot cryptographically authenticate a publisher: a repository writer can construct a fully protocol-valid plaintext publication. This fix prevents accidental/message-only masquerade; it does not claim publisher authentication where the protocol has no secret.
+
 ### Audited surfaces with no new confirmed defect so far
 
 - secret migration/persistence: raw token/passphrase are removed before plugin data persistence and use Obsidian SecretStorage;
