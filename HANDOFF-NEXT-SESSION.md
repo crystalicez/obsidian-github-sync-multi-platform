@@ -222,6 +222,19 @@ Audit method:
    - RED: `afe682d6282009ac50a9cbbc5191f08d6dca7132`.
    - Fix: `b4a3a1e2b883f4f45b3f162a9f4d992ac39371ee` validates encoded length from `record.size` before decode and decoded length afterward.
 
+32. **MEDIUM availability safety — explicit GitHub rate-limit headers could bypass the configured maximum cooldown.**
+   - `maxSecondaryCooldownMs` capped only the exponential fallback path.
+   - A large `Retry-After` or far-future `X-RateLimit-Reset` could therefore suspend all shared request scheduling far longer than the declared policy maximum.
+   - RED: `7eeef1371644cb592d0416137d1d17b3f8f4dde3`.
+   - Fix: `bec76c2aa77ee3f42cc56dd6e6aa06300e647108` caps both explicit header-derived delays at `maxSecondaryCooldownMs`.
+
+33. **HIGH settings consistency — failed settings persistence could publish a new runtime target/credential generation anyway.**
+   - The first atomic-generation fix quiesced old work correctly, but then assigned `this.settings = nextSettings` before SecretStorage and `saveData()` completed.
+   - A SecretStorage/persistence failure could therefore leave UI reporting “not saved” while the in-memory runtime/client had already switched; reusing the same secret IDs also meant a failed metadata save could overwrite credentials referenced by the old persisted settings.
+   - RED: `b1ecad5cea161c01e9776b4a38c0a6d8cab8a951`.
+   - Fix: `b9ebf4f33956d6535d625cffeb1b19eaac915689` allocates new secret IDs on credential rotation, stores/persists the prepared generation first, and only then publishes `this.settings`, invalidates the runtime credential generation, and rebuilds the GitHub client. A failed durable save may leave only unreferenced orphan secrets, not a hidden runtime/persisted target switch.
+   - Test-contract cleanup: `362211c4c15f8729895a12068b1a8019357c6d56` updates source-order assertions to the transactional generation and repairs two malformed regex literals that would otherwise create false test failures.
+
 ### Audited surfaces with no new confirmed defect so far
 
 - secret migration/persistence: raw token/passphrase are removed before plugin data persistence and use Obsidian SecretStorage;
