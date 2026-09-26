@@ -97,28 +97,3 @@ export async function loadV4RemoteState(
   await assertV4RemoteRecordSet(records, config, input.keyring)
   return { config, head, records, commitSha: commitSha ?? "" }
 }
-
-export function remoteV4StateFromLocalIndex(
-  index: V4LocalIndex,
-  commitSha: string,
-  config: V4RemoteConfig,
-): V4RemoteState {
-  return {
-    config,
-    head: {
-      formatVersion: 4,
-      mode: index.mode,
-      epoch: index.epoch,
-      generation: index.generation,
-      journalId: "",
-      shardHashes: { ...index.shardHashes },
-      updatedAt: 0,
-      deviceId: index.deviceId,
-    },
-    records: recordsFromIndex(index).map(record => ({
-      ...record,
-      partPaths: record.partPaths ? [...record.partPaths] : undefined,
-    })),
-    commitSha,
-  }
-}
