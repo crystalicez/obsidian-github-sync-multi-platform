@@ -193,7 +193,6 @@ export function createV4PlatformIo(options: V4PlatformIoOptions): V4PlatformIo {
     },
     async openBoundedSource(path, expectedSize) {
       if (!desktopReady) throw new V4BoundedIoUnavailableError("bounded-read", path)
-      await assertDesktopPathSafe(path, true)
       return desktopBoundedSource(full(path), expectedSize, () => assertDesktopPathSafe(path, true))
     },
     async writeStage(path, bytes) {
