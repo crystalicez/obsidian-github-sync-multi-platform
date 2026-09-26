@@ -94,6 +94,24 @@ Refined root-cause design:
 
 Execution constraint recorded during this audit: a direct sandbox clone of the audit branch was attempted and failed with DNS resolution error `Could not resolve host: github.com`. Do not claim local suite execution from the AI environment unless a later attempt succeeds.
 
+### Production fix status
+
+Root-cause fixes are now on the audit branch:
+- `da56f07630a1f388249fc588b246f1a46a7d29bb` — add canonical V4 shard-record hashing helper.
+- `378059b94b33dc8b495f0b4810c2b9b4b9219dd2`, `3dba921c263e5098214cb9bad800836c8b817ed9` — validate local cached shard hashes on load and refuse mismatched shard persistence.
+- `dcff671b8b09baab72a3ecd580819f1de28d7c76`, `359b873277cfb25456faf1617e76b54c04073472` — writer derives head hashes from canonical records; remote loader verifies both cached and freshly fetched shards against the head.
+- `e300fe07983a757d0020cb8fe8c79a18993e1e4e` — unknown empty-repository Contents bootstrap outcomes with newly observed repository state now surface a typed bootstrap race instead of adopting an unproven SHA.
+- `88990134ae8e8764e8b8c0696e16c934020727ae`, `aab2e432c74dc7b550455d5300a1a604eaac087f`, `e382e63e085fc196e8015c4dc046a7c1c99e8473`, `a04ba7b4f9b233871328368fbdb58da1591965fa`, `d2a02390b7c725a40f96ebc392153b8a13611fd8` — reusable active cancellation, runtime quiescence, settings publication ordering, and progress cleanup for atomic settings/client generation rotation.
+- `f2ad17aef7d833178f7e9ba105489ce6fb6ad999`, `8c6bd38cdb0b9bc3a953a4bc9dcda0734b6bf60b` — encrypted config/KDF bounds plus remote head/record/shard shape/resource validation.
+- `ff2780ff1543fde9b3914db174b733a998011f9f` — bound whole-buffer chunk remote reads to four concurrent part fetches.
+- `6151868d066c050deef9159d3beda389e2ae0ce7`, `d9cde1a72496a8c86df5c85b975d39b92998f873`, `0c301523e774d54bc03191aa7a897da98691ac81`, `06335328777bd5010e928c1951f1cdb581aac2f0` — bounded journal writer/reader contract, safe journal markers, cross-page consistency, descriptor validation before blob reads, and preview-limit precedence.
+- fixture-only followups `4ce0affffce484398db30b0de339af8a2dd1e5cf`, `e5ae96eda6003faa4233346bd5104561e2258923`, `40fc418844c40a52ef4baa39c7318f21a5547782`, `b876e4076084e544ec13ec0ef60c9ef7e0cbcc8a` keep tests protocol-shaped rather than weakening production validation.
+
+Verification status:
+- AI sandbox execution is still blocked from obtaining the repository: direct `git clone` failed because `github.com` cannot resolve; local tools visible are Node 22.16.0, npm 10.9.2, TypeScript 5.8.3, and no pnpm.
+- GitHub Actions runs were queried for the audit branch and none were available; connector-created commits did not produce a usable CI run.
+- Therefore no full suite may be claimed yet. Continue static/targeted audit, then request the established user-local gates only after the audit branch is coherent.
+
 ### TDD plan
 
 Write RED regressions before fixes:
