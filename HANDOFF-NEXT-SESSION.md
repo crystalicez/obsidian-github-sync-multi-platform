@@ -257,6 +257,21 @@ Audit method:
    - RED: `0ec71b2f5a6d1420728f60094bedf35b1380cb41`.
    - Fix: `52070098483524b029cca836d9e709060b88c38b` fails closed whenever immutable tree evidence says a scoped blob exists but its exact-commit file read is missing; the regression also asserts no local trash/delete and no index mutation occur.
 
+37. **HIGH destructive-action safety — Force Push/Pull confirmation was not bound to the settings generation the user reviewed.**
+   - The modal rendered repository, branch, and scoped local-file count from the settings/client generation current when it opened.
+   - Confirmation later called `v4Runtime.forcePush()/forcePull()` without proving that settings were unchanged while the modal remained open.
+   - A concurrent settings save could therefore make the user approve target A while the destructive operation executed against target B.
+   - RED: `aef9f1149b60bfd16eaffbbbf7afa23f741e6aed`.
+   - Fix: `dc4161bad4668d0686d019db11d07b87f273017f` captures `settingsGeneration` when the modal opens and refuses the destructive action if the generation changes, requiring the user to reopen/review the confirmation.
+
+38. **MEDIUM lifecycle/cancellation safety — runtime decision modals were not abort-aware.**
+   - Conflict and modification-threshold modals returned promises that stayed pending until user interaction.
+   - Settings rotation calls `quiesceForSettingsChange()`, which aborts the active sync and waits for the coordinator to become idle. If an active run was awaiting either modal, the settings save could remain blocked until the stale modal was manually closed.
+   - The first abort-aware modal fix also needed post-await canonical cancellation checks; otherwise an abort resolved to `ask`/false and could be reported as a generic sync failure.
+   - RED: `25e473ae7d40f8ba740abc35ce5468215b83bbb8`, `95a0635e9a07702fcceb5d1da246935808b73b51`.
+   - Fixes: `aa0f556aa1b9dfecfc82e2d0426a3939397892c5`, `cf88125803e3ce1c13199c82075235ef35c6036b`, `a8f4d79da344ba610ac83b4df2c20be4bfa571b0`.
+   - Both decision modals now settle immediately on AbortSignal, remove listeners on every settle path, and callers re-check cancellation immediately after awaiting so settings change/unload remains canonical `V4CancelledError`.
+
 ### Audited surfaces with no new confirmed defect so far
 
 - secret migration/persistence: raw token/passphrase are removed before plugin data persistence and use Obsidian SecretStorage;
