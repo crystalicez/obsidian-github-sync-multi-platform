@@ -74,6 +74,27 @@ Audit method:
    - RED coverage: `744c42ae289deb28ead5115f269317a3dff602c7`.
    - Fix: `d49bb3c8c38700aa7eec6a149b0b08d90e83a74a` routes chunked conflict copies through `stageRemotePull()`, retaining bounded streaming into staging.
 
+9. **HIGH data loss — recovery replan cleanup could delete the only pre-sync backup after an interrupted desktop stage swap.**
+   - If the process crashed after `target -> <stage>.target-backup` but before the durable recovery receipt, a later remote-head change could mark recovery `replan-required`.
+   - Runtime then called `discardV4RecoveryStages()`; desktop `removeStage()` removed both stage residue and `.target-backup`.
+   - In the backup-only crash state this could delete the only remaining copy of the local pre-sync target.
+   - RED: `130fa31665b08728d7402f9967535cf2daa43508`, `77f283dbcf8c582c21c7bce569c12152b0cd5be9`, mobile contract `df79be819e5c5e2c6405b4931f01206c7ae52316`.
+   - Fixes: `2e1251d06985a827086f970f1d48d5ab93eb673e`, `8d90ce599c152dfb076872a17968d781eca61dca`, `82987f41177ca4f927a30a9d6eb82d3e81419e23`, `d8fced6f4d79dafec9e59de29a58959c13fdc354`, `af293a38cc311b50bba9a731e8f60798353b0e17`.
+   - Desktop rollback restores a verified backup when target is missing or still contains the staged bytes, refuses to overwrite unrelated user edits, and only then allows stage cleanup. Non-desktop rollback is a no-op because mobile never creates desktop target backups.
+
+10. **HIGH — debounced local-change work could cross a settings/target generation even after active-run cancellation.**
+   - The first settings fix cancelled/awaited the active coordinator run, but an old generation's debounce timer/pending queue could still fire after the new repo/client/settings were installed.
+   - RED: `b0ac790970c6ac885dee48f8b235835c50584de7`.
+   - Fixes: `a57fe29f03d3352640ad797b8d09a8598b764ed9`, `4b1897494ec2b24beabc8211f6b6ea719c5d2433`.
+   - Coordinator now has reusable `cancelPending()`; settings quiescence clears old pending/timer state before cancelling the active run and again after idle, while leaving the coordinator reusable.
+
+11. **MEDIUM privacy/correctness — Sync Center cached history service across settings generations.**
+   - `V4SyncCenterView` retained one `V4HistoryService`, while that service captures GitHub client/config/keyring at creation.
+   - After repo/token/passphrase rotation, subsequent history actions could continue reading the previous repository; an in-flight old history request could also complete after settings changed.
+   - RED: `f49f2ee92ae6504db7f3d4b8a52a10b5da240df3`, `62d775dfd3675ef2c5ec73c8e466853eeac45360`.
+   - Fixes: `634391f1e3ba167fe2559da0b2be9ece1a799e26`, `85ae7b944a401d278805bb03eb61238f76ed5f7a`, `4cb2eed2942b853e77ea7a237c00f5bd01c69e4b`.
+   - Runtime exposes a monotonic settings generation, captures one client/repo/passphrase generation for history creation/file lookup, old history services assert their generation at async boundaries, and Sync Center recreates its cached service when the generation changes.
+
 ### Audited surfaces with no new confirmed defect so far
 
 - secret migration/persistence: raw token/passphrase are removed before plugin data persistence and use Obsidian SecretStorage;
@@ -84,7 +105,8 @@ Audit method:
 - local release publication tooling: canonical repo checks, create-only stable refs, ambiguous-state reconciliation, exact asset set/size/hash verification, and temp-ref compare-delete are present;
 - workflows: Actions are SHA-pinned, CI uses read-only contents permission, and the legacy Actions stable-release path remains intentionally interlocked;
 - local target size+mtime preconditions retain a theoretical same-size/same-mtime TOCTOU risk, but no realistic bypass path has been demonstrated in this audit; treat as residual risk unless a reproduction appears;
-- recovery payload validation has hardening gaps (full path/duplicate-ID/numeric validation), but header integrity and normal writer ownership mean no equivalent concrete production corruption path is confirmed yet.
+- recovery payload validation has hardening gaps (full path/duplicate-ID/numeric validation), but local recovery state is writer-owned and integrity-checked against accidental corruption; no external production corruption path has been demonstrated yet;
+- retired encrypted key material is best-effort zeroized on runtime disposal, but resolved keyrings invalidated by settings changes may remain in the cache's retired set until disposal. Immediate zeroization is intentionally not changed yet because history work exists outside the sync coordinator and can hold a live keyring reference; settings-generation guards now stop stale history results, but tighter reference-counted key lifetime remains a residual hardening opportunity. (full path/duplicate-ID/numeric validation), but header integrity and normal writer ownership mean no equivalent concrete production corruption path is confirmed yet.
 
 ### RED regression status
 
