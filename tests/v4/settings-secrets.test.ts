@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test from "node:test";
 import { readFile } from "node:fs/promises";
 import { modalButtons, Notice, resetModalTestState, TFile } from "obsidian";
@@ -15,6 +16,10 @@ import { V4_CONFIG_PATH, V4_FORMAT_VERSION, V4_HEAD_PATH, V4_ROOT, type V4PathLa
 import { loadV4LocalIndex, type V4IndexFileRecord, type V4LocalIndex, type V4LocalIndexAdapter } from "../../src/lib/v4/local-index";
 import type { V4SyncProgressSnapshot } from "../../src/lib/v4/progress";
 import { waitForCondition } from "../helpers/wait-for";
+
+function testShardHash(records: unknown[]): string {
+  return createHash("sha256").update(JSON.stringify(records)).digest("hex");
+}
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -840,7 +845,7 @@ async function encryptedToPlaintextRuntimeFixture(savedPassphrase: string) {
   const prepared = await new V4StorageCodec({ mode: "encrypted", pathLayout: "opaque-stable-v1", keyring: keys }).prepare("note.md", new TextEncoder().encode("plaintext body"), "old-v", 1, "stable-file");
   const record = { path: "note.md", ...prepared.record };
   const bucket = record.pathId.slice(0, 2);
-  const head: V4RemoteHead = { formatVersion: 4, mode: "encrypted", epoch: 1, generation: 1, journalId: "old-v", shardHashes: { [bucket]: "old-hash" }, updatedAt: 1, deviceId: "old" };
+  const head: V4RemoteHead = { formatVersion: 4, mode: "encrypted", epoch: 1, generation: 1, journalId: "old-v", shardHashes: { [bucket]: testShardHash([record]) }, updatedAt: 1, deviceId: "old" };
   await publishV4TreeChanges(github, { message: "obsidian-sync-v4:old-v", files: [...prepared.files, ...await buildV4RemoteMetadata({ config: remoteConfig, head, records: [record], keyring: keys })] });
   const oldObjectPath = record.remotePath;
   const vaultFile = new TFile("note.md", new TextEncoder().encode("plaintext body"));
@@ -983,7 +988,13 @@ test("v4 runtime recovers after a published commit whose second local shard save
 function runtimeFixture(input: { remoteConfig: V4RemoteConfig; localIndexRepoId: string; localIndexPathLayout?: V4PathLayout; cachedShard?: boolean }) {
   const files = new Map<string, string>();
   const indexPath = ".obsidian/plugins/test/github-sync-v4-index/index.json";
-  const shardHashes = input.cachedShard ? { aa: "legacy-hash" } : {};
+  const legacyPathId = "aa".padEnd(64, "0");
+  const legacyRecord = {
+    path: "Legacy/note.md", pathId: legacyPathId, fileId: "legacy-file", plaintextSha256: "legacy-sha", size: 1, mtime: 1,
+    remoteVersion: "legacy-v", remotePath: ".obsidian-github-sync-v4/data/Legacy/token.enc", storage: "single" as const,
+  };
+  const legacyHash = testShardHash([legacyRecord]);
+  const shardHashes = input.cachedShard ? { aa: legacyHash } : {};
   files.set(indexPath, JSON.stringify({
     formatVersion: V4_FORMAT_VERSION,
     repoId: input.localIndexRepoId,
@@ -995,10 +1006,11 @@ function runtimeFixture(input: { remoteConfig: V4RemoteConfig; localIndexRepoId:
     generation: 1,
     shardHashes,
   }));
-  const legacyPathId = "aa".padEnd(64, "0");
-  if (input.cachedShard) files.set(".obsidian/plugins/test/github-sync-v4-index/shards/aa.json", JSON.stringify({ bucket: "aa", hash: "legacy-hash", records: {
-    [legacyPathId]: { path: "Legacy/note.md", pathId: legacyPathId, fileId: "legacy-file", plaintextSha256: "legacy-sha", size: 1, mtime: 1, remoteVersion: "legacy-v", remotePath: ".obsidian-github-sync-v4/data/Legacy/token.enc", storage: "single" },
-  } }));
+  if (input.cachedShard) files.set(".obsidian/plugins/test/github-sync-v4-index/shards/aa.json", JSON.stringify({
+    bucket: "aa",
+    hash: legacyHash,
+    records: { [legacyPathId]: legacyRecord },
+  }));
   let vaultLists = 0;
   const plugin = {
     app: {
