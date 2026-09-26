@@ -69,7 +69,7 @@ function createMemoryAdapter(owner: object): V4LocalIndexAdapter {
 function createRuntimePlatformIo(plugin: FastSync): { io: V4PlatformIo; stageRoot: string } {
   const vault = plugin.app.vault as FastSync["app"]["vault"] & {
     configDir?: string
-    adapter?: V4BinaryAdapterLike & { getFullPath?(path: string): string }
+    adapter?: V4BinaryAdapterLike & { getFullPath?(path: string): string; getBasePath?(): string }
   }
   const adapter = vault.adapter
   const configDir = vault.configDir || ".obsidian"
@@ -78,11 +78,15 @@ function createRuntimePlatformIo(plugin: FastSync): { io: V4PlatformIo; stageRoo
   const resolveDesktopPath = desktop && typeof adapter?.getFullPath === "function"
     ? (path: string) => adapter.getFullPath!(path)
     : undefined
+  const desktopRootPath = desktop && typeof adapter?.getBasePath === "function"
+    ? adapter.getBasePath()
+    : undefined
   return {
     io: createV4PlatformIo({
       platform: desktop ? "desktop" : "mobile",
       adapter,
       resolveDesktopPath,
+      desktopRootPath,
     }),
     stageRoot,
   }
@@ -396,16 +400,19 @@ export class V4PluginRuntime {
         return file instanceof TFile && inScope(path) ? { path, size: file.stat.size, mtime: file.stat.mtime } : null
       },
       read: async (path: string) => {
+        await this.platformIo.assertVaultPathSafe(path, { mustExist: true })
         const file = this.plugin.app.vault.getAbstractFileByPath(path)
         if (!(file instanceof TFile)) throw new Error(`Missing local file: ${path}`)
         return readVaultFileBytes(this.plugin.app.vault, file)
       },
       write: async (path: string, bytes: Uint8Array) => {
+        await this.platformIo.assertVaultPathSafe(path)
         this.plugin.addIgnoredFile(path)
         try { await writeVaultFileBytes(this.plugin.app.vault, path, bytes) }
         finally { this.plugin.removeIgnoredFile(path) }
       },
       trash: async (path: string) => {
+        await this.platformIo.assertVaultPathSafe(path)
         this.plugin.addIgnoredFile(path)
         try { await trashVaultFileIfExists(this.plugin.app.vault, this.plugin.app.fileManager, path) }
         finally { this.plugin.removeIgnoredFile(path) }
@@ -413,6 +420,7 @@ export class V4PluginRuntime {
       openContentSource: (handle, signal) => createV4ContentSource(handle, {
         wholeBufferCeilingBytes: DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES,
         readVaultWhole: async path => {
+          await this.platformIo.assertVaultPathSafe(path, { mustExist: true })
           const file = this.plugin.app.vault.getAbstractFileByPath(path)
           if (!(file instanceof TFile)) throw new Error(`Missing local file: ${path}`)
           return readVaultFileBytes(this.plugin.app.vault, file)
