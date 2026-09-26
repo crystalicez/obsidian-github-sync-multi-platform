@@ -103,6 +103,13 @@ Audit method:
    - Fix: `934b7a979e0958ea8deb5907cf3594311dac0a2b` requires a valid Git object SHA before any 200 Contents payload can be trusted, verifies decoded bytes against that SHA, and otherwise falls back to the raw Git Blob endpoint using the validated SHA.
    - Fixture cleanup: current GitHub transport fixtures now use protocol-shaped 40-hex object IDs rather than symbolic placeholder SHAs where the Contents boundary is exercised.
 
+13. **MEDIUM history correctness — strict V4 descriptor validation exposed that external Git history preview was using the V4 codec path.**
+   - External commits produce raw Git tree/blob descriptors, not V4 storage descriptors with `pathId/plaintextSha256/remoteVersion`.
+   - Reusing the V4 descriptor validator/codec for external history would reject those changes; on encrypted repos, attempting V4 decrypt semantics on an external raw blob is also conceptually wrong.
+   - RED: `24e0d41a4aaf246992b045aca49fb226a79a4978`.
+   - Fix: `91a81da29e06da35ea09886645bb07543717674e` routes external history previews directly through the immutable commit tree/raw Git blob while plugin-authored history continues through the V4 storage codec and descriptor validation.
+   - Fixture cleanup: `7a2818d0c2bfdcae6eb70d39bf8b108c1aa71a98` keeps legacy remote-index fixtures protocol-shaped under the stricter validator.
+
 ### Audited surfaces with no new confirmed defect so far
 
 - secret migration/persistence: raw token/passphrase are removed before plugin data persistence and use Obsidian SecretStorage;
