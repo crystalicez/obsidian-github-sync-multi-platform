@@ -469,7 +469,10 @@ export class V4StorageCodec {
       const parsed = JSON.parse(bytesToUtf8(archive)) as { version?: number; entries?: Record<string, string> }
       const encoded = parsed.version === 1 ? parsed.entries?.[record.fileId] : undefined
       if (!encoded) throw new Error(`V4 pack entry is missing: ${record.fileId}`)
+      const expectedEncodedLength = 4 * Math.ceil(record.size / 3)
+      if (encoded.length !== expectedEncodedLength) throw new Error("V4 packed entry size is inconsistent with its record.")
       const plaintext = fromBase64(encoded)
+      if (plaintext.byteLength !== record.size) throw new Error("V4 packed entry size is inconsistent with its record.")
       if (record.plaintextSha256 && await this.crypto(() => sha256Hex(plaintext)) !== record.plaintextSha256) throw new Error("V4 packed content hash mismatch.")
       return plaintext
     }
