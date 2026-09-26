@@ -189,6 +189,9 @@ export function createV4RecoveryStore(options: {
   return {
     load,
     async save(input) {
+      if (input.payload && !isPayload(input.payload)) {
+        throw new V4RecoveryRequiredError("V4 recovery payload shape is invalid.")
+      }
       let previous: V4RecoverySnapshot | null = null
       try { previous = await load() } catch (error) { if (error instanceof V4RecoveryRequiredError) throw error; throw error }
       const generation = (previous?.header.generation ?? 0) + 1
