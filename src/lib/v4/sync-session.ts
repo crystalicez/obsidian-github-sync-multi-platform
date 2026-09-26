@@ -30,6 +30,7 @@ import type { V4StageRef } from "./staging-store"
 import { V4BoundedIoUnavailableError } from "./platform-io"
 import { shouldUseV4Parts, V4_PART_BYTES } from "./large-files"
 import { hashV4StableContentSource, V4SourceChangedError } from "./object-stream"
+import { hashV4ShardRecords } from "./shard-hash"
 import { selectV4WriterPartBytes } from "./part-write-policy"
 import type { V4PullBinding, V4PushBinding, V4ResolvedBatch, V4StagedWriteBinding } from "./resolved-batch"
 import { boundedMap } from "./bounded-map"
@@ -835,7 +836,7 @@ export class V4SyncSession {
     const shardHashes = { ...(remote?.head.shardHashes ?? {}) }
     for (const bucket of oldBuckets) if (!buckets.has(bucket)) delete shardHashes[bucket]
     for (const bucket of changedBuckets) {
-      if (buckets.has(bucket)) shardHashes[bucket] = await sha256Hex(utf8ToBytes(bucketSignature(finalByBucket.get(bucket))))
+      if (buckets.has(bucket)) shardHashes[bucket] = await hashV4ShardRecords(finalByBucket.get(bucket) ?? [])
     }
     const head: V4RemoteHead = {
       formatVersion: 4,
