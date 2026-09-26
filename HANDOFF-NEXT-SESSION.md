@@ -147,6 +147,23 @@ Audit method:
    - RED: `429b10ce5bc68bad0be548caf20b8826397759e3`.
    - Fix: `690f64ed557836caa3fb4923a833d7cb0e2d61e1` requires chunked records to cross the writer threshold and constrains part count to the writer-compatible range `ceil(size / 48 MiB) .. ceil(size / 1 MiB)`, while retaining the 400-mutation budget ceiling.
 
+20. **MEDIUM/HIGH settings fail-closed regression — runtime validator existed but was not actually invoked before sync.**
+   - `assertPluginSettingsRuntimeSafe` was added and settings-save validation called it, but `V4PluginRuntime.execute()` only imported the validator without calling it.
+   - The existing RED contract in `tests/v4/settings-secrets.test.ts` explicitly required runtime validation before GitHub access; without execution, malformed persisted settings could still reach runtime work.
+   - Fix: `d8fa4a6d9b7280fe4ca0a6076f579a281fbfc82d` invokes `assertPluginSettingsRuntimeSafe(this.plugin.settings)` immediately after cancellation check and before progress/network/session work.
+
+21. **MEDIUM local destructive-replay safety — integrity-valid recovery payloads were not constrained to the writer contract.**
+   - Recovery payload validation accepted arbitrary strings for mutation paths/IDs, duplicate IDs, completed receipts unrelated to any mutation, weak stage IDs/hashes/sizes, and incomplete/invalid target preconditions.
+   - Plaintext recovery integrity is an accidental-corruption integrity check, not a keyed authentication boundary; coherent local state edits or programming bugs could therefore feed writer-impossible data to trash/write recovery replay.
+   - RED: `96d07441114cdbeaf7a3737b7dff2a3daf91a0b2`.
+   - Fix: `d9467e54517e1c357063acdfa4f256e1c92f3359` validates normalized vault paths, unique bounded mutation IDs, receipt subset/uniqueness, stage ID/hash/size/mtime, and exact target-precondition shape before loaded recovery state becomes replayable.
+
+22. **MEDIUM invariant safety — unsafe recovery payloads could be replayed immediately after save without passing the load validator.**
+   - `V4RecoveryStore.save()` returned the caller's payload in the snapshot and the sync path can apply that snapshot immediately.
+   - Loader-only validation therefore did not protect the current process from an internal/upstream writer-contract violation.
+   - RED: `722524c9abad4099f979fe59cd19d46b4da6fa3a`.
+   - Fix: `2f2f1ac0875623279ff35362e82c097027504869` applies the same payload validator before persistence/return, so malformed recovery state cannot become replayable in-process or after restart.
+
 ### Audited surfaces with no new confirmed defect so far
 
 - secret migration/persistence: raw token/passphrase are removed before plugin data persistence and use Obsidian SecretStorage;
@@ -157,7 +174,7 @@ Audit method:
 - local release publication tooling: canonical repo checks, create-only stable refs, ambiguous-state reconciliation, exact asset set/size/hash verification, and temp-ref compare-delete are present;
 - workflows: Actions are SHA-pinned, CI uses read-only contents permission, and the legacy Actions stable-release path remains intentionally interlocked;
 - local target size+mtime preconditions retain a theoretical same-size/same-mtime TOCTOU risk, but no realistic bypass path has been demonstrated in this audit; treat as residual risk unless a reproduction appears;
-- recovery payload validation has hardening gaps (full path/duplicate-ID/numeric validation), but local recovery state is writer-owned and integrity-checked against accidental corruption; no external production corruption path has been demonstrated yet;
+- recovery payload path/ID/stage/precondition validation is now enforced on both save and load; remaining header-field tightening is low-priority local-state hardening rather than a confirmed destructive path;
 - retired encrypted key material is best-effort zeroized on runtime disposal, but resolved keyrings invalidated by settings changes may remain in the cache's retired set until disposal. Immediate zeroization is intentionally not changed yet because history work exists outside the sync coordinator and can hold a live keyring reference; settings-generation guards now stop stale history results, but tighter reference-counted key lifetime remains a residual hardening opportunity. (full path/duplicate-ID/numeric validation), but header integrity and normal writer ownership mean no equivalent concrete production corruption path is confirmed yet.
 
 ### RED regression status
