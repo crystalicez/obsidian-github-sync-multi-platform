@@ -24,6 +24,11 @@ import { readImmutableGitFile } from "./v4/immutable-git-read";
 const V4_BOOTSTRAP_PATH = ".obsidian-github-sync-v4/bootstrap";
 const GIT_COMMIT_SHA = /^[0-9a-f]{40}$/iu;
 
+function requiredGitHubString(value: unknown, label: string): string {
+  if (typeof value !== "string" || value.length === 0) throw new Error(`Malformed GitHub response: missing ${label}.`);
+  return value;
+}
+
 export interface GitHubConfig {
   owner: string;
   repo: string;
@@ -306,7 +311,10 @@ export class GitHubClient {
     });
     if (response.status !== 200) throw this.gitHttpError("Failed to get git ref", response.status, response.text);
     const json = response.json as { ref?: string; object?: { sha?: string; type?: string } };
-    return { ref: json.ref ?? `refs/heads/${this.config.branch}`, sha: json.object?.sha ?? "", type: json.object?.type ?? "commit" };
+    const sha = requiredGitHubString(json.object?.sha, "git ref SHA");
+    const type = requiredGitHubString(json.object?.type, "git ref object type");
+    if (type !== "commit") throw new Error(`Malformed GitHub response: branch ref points to unsupported object type ${type}.`);
+    return { ref: requiredGitHubString(json.ref, "git ref name"), sha, type };
   }
 
   async getGitRefOrNull(): Promise<GitHubGitRef | null> {
@@ -327,7 +335,10 @@ export class GitHubClient {
     if (response.status === 200 && Array.isArray(response.json)) {
       const first = (response.json as Array<{ ref?: string; object?: { sha?: string; type?: string } }>)[0];
       if (!first) return null;
-      return { ref: first.ref ?? "", sha: first.object?.sha ?? "", type: first.object?.type ?? "commit" };
+      const sha = requiredGitHubString(first.object?.sha, "git ref SHA");
+      const type = requiredGitHubString(first.object?.type, "git ref object type");
+      if (type !== "commit") throw new Error(`Malformed GitHub response: repository ref points to unsupported object type ${type}.`);
+      return { ref: requiredGitHubString(first.ref, "git ref name"), sha, type };
     }
     if (response.status === 404 || response.status === 409) return null;
     throw this.gitHttpError("Failed to inspect git refs", response.status, response.text);
@@ -403,7 +414,14 @@ export class GitHubClient {
     });
     if (response.status !== 200) throw this.gitHttpError("Failed to get git commit", response.status, response.text);
     const json = response.json as { sha?: string; message?: string; tree?: { sha?: string }; parents?: Array<{ sha?: string }> };
-    return { sha: json.sha ?? sha, treeSha: json.tree?.sha ?? "", parentShas: (json.parents ?? []).map(parent => parent.sha ?? "").filter(Boolean), message: json.message };
+    if (json.parents !== undefined && !Array.isArray(json.parents)) throw new Error("Malformed GitHub response: commit parents are invalid.");
+    const parentShas = (json.parents ?? []).map(parent => requiredGitHubString(parent?.sha, "commit parent SHA"));
+    return {
+      sha: requiredGitHubString(json.sha, "commit SHA"),
+      treeSha: requiredGitHubString(json.tree?.sha, "commit tree SHA"),
+      parentShas,
+      message: json.message,
+    };
   }
 
   async createGitBlob(content: Uint8Array | ArrayBuffer): Promise<string> {
@@ -420,7 +438,7 @@ export class GitHubClient {
         reservationAlreadyHeld: true,
         action: "Failed to create git blob",
       });
-      return (response.json as { sha?: string }).sha ?? "";
+      return requiredGitHubString((response.json as { sha?: string }).sha, "created blob SHA");
     });
   }
 
@@ -434,7 +452,7 @@ export class GitHubClient {
       successStatuses: [201],
       action: "Failed to create git tree",
     });
-    return (response.json as { sha?: string }).sha ?? "";
+    return requiredGitHubString((response.json as { sha?: string }).sha, "created tree SHA");
   }
 
   async createGitCommit(
@@ -452,7 +470,7 @@ export class GitHubClient {
       successStatuses: [201],
       action: "Failed to create git commit",
     });
-    return (response.json as { sha?: string }).sha ?? "";
+    return requiredGitHubString((response.json as { sha?: string }).sha, "created commit SHA");
   }
 
   async updateGitRef(sha: string, _expectedSha?: string): Promise<void> {
