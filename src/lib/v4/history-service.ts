@@ -1,9 +1,10 @@
 import type { GitHubCommitSummary, GitHubTree } from "../github-api"
 import { bytesToUtf8 } from "../bytes"
 import { decryptV4Payload, type V4Keyring } from "./crypto"
-import type { V4JournalChange, V4JournalPage, V4VersionDescriptor } from "./history-journal"
+import { isV4JournalId, V4_JOURNAL_PAGE_SIZE, V4_MAX_JOURNAL_PAGES, type V4JournalChange, type V4JournalPage, type V4VersionDescriptor } from "./history-journal"
 import type { V4IndexFileRecord } from "./local-index"
 import { expectedV4PathLayout, V4_ROOT, type V4RemoteConfig } from "./protocol-types"
+import { assertV4RemoteRecordDescriptor } from "./remote-index"
 import { V4StorageCodec } from "./storage-codec"
 import { assertV4PathLayoutCompatible } from "./sync-session"
 
@@ -50,7 +51,9 @@ export class V4HistoryService {
   async listCommits(page = 1): Promise<V4CommitPage> {
     const items = (await this.input.github.listCommits({ page, perPage: 50 })).map(commit => {
       const match = /^obsidian-sync-v4:([^\s]+)$/u.exec(commit.message.split("\n", 1)[0])
-      return { ...commit, source: match ? "plugin" as const : "external" as const, journalId: match?.[1] }
+      const journalId = match?.[1]
+      const plugin = isV4JournalId(journalId)
+      return { ...commit, source: plugin ? "plugin" as const : "external" as const, journalId: plugin ? journalId : undefined }
     })
     return { items, page, hasMore: items.length === 50 }
   }
@@ -98,13 +101,16 @@ export class V4HistoryService {
   }
 
   private async readJournal(journalId: string, commitSha: string): Promise<V4HistoryChange[]> {
+    if (!isV4JournalId(journalId)) throw new Error("V4 history journal id is invalid.")
     const first = await this.readJournalPage(journalId, 0, commitSha)
     const pages = [first]
-    for (let page = 1; page < first.pageCount; page++) pages.push(await this.readJournalPage(journalId, page, commitSha))
+    for (let page = 1; page < first.pageCount; page++) {
+      pages.push(await this.readJournalPage(journalId, page, commitSha, first.pageCount))
+    }
     return pages.flatMap(page => page.changes.map(change => ({ ...change, source: "plugin" as const })))
   }
 
-  private async readJournalPage(journalId: string, page: number, commitSha: string): Promise<V4JournalPage> {
+  private async readJournalPage(journalId: string, page: number, commitSha: string, expectedPageCount?: number): Promise<V4JournalPage> {
     const encrypted = this.input.config.mode === "encrypted"
     const path = `${V4_ROOT}/journals/${journalId}/${String(page).padStart(6, "0")}.${encrypted ? "enc" : "json"}`
     const file = await this.input.github.getFileBytes(path, commitSha)
@@ -113,7 +119,17 @@ export class V4HistoryService {
       ? await decryptV4Payload(this.input.keyring!.journalKey, file.bytes, { kind: "journal", aad: `${this.input.config.repoId}:${journalId}:${page}` })
       : file.bytes
     const journal = JSON.parse(bytesToUtf8(bytes)) as V4JournalPage
+    if (!journal || typeof journal !== "object" || Array.isArray(journal)) throw new Error("V4 history journal is malformed.")
     if (journal.journalId !== journalId || journal.page !== page) throw new Error("V4 history journal identity mismatch.")
+    if (!Number.isSafeInteger(journal.pageCount) || journal.pageCount < 1 || journal.pageCount > V4_MAX_JOURNAL_PAGES) {
+      throw new Error("V4 history journal page count exceeds the protocol limit.")
+    }
+    if (expectedPageCount !== undefined && journal.pageCount !== expectedPageCount) {
+      throw new Error("V4 history journal page count is inconsistent.")
+    }
+    if (!Array.isArray(journal.changes) || journal.changes.length > V4_JOURNAL_PAGE_SIZE) {
+      throw new Error("V4 history journal change count exceeds the per-page limit.")
+    }
     return journal
   }
 
@@ -147,7 +163,7 @@ export class V4HistoryService {
   }
 
   private recordFromDescriptor(change: V4HistoryChange, descriptor: V4VersionDescriptor): V4IndexFileRecord {
-    return {
+    const record: V4IndexFileRecord = {
       path: change.path,
       pathId: descriptor.pathId ?? change.fileId,
       fileId: change.fileId,
@@ -160,5 +176,7 @@ export class V4HistoryService {
       partPaths: descriptor.partPaths,
       packId: descriptor.packId,
     }
+    assertV4RemoteRecordDescriptor(record, this.input.config)
+    return record
   }
 }
