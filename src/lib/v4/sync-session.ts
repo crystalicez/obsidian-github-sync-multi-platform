@@ -1020,7 +1020,7 @@ export class V4SyncSession {
         plaintextSha256: await sha256Hex(file.bytes),
         size: file.bytes.byteLength,
         mtime: this.now(),
-        remoteVersion: `external:${remote.commitSha}`,
+        remoteVersion: `external-${remote.commitSha}`,
         remotePath: node.path,
         storage: "single",
       })
