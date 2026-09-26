@@ -282,18 +282,26 @@ export class GitHubClient {
       throw: false,
     });
     if (response.status !== 200) throw this.gitHttpError("Failed to list commits", response.status, response.text);
-    const commits = response.json as Array<{
-      sha?: string;
-      commit?: { message?: string; author?: { name?: string; date?: string } };
-      parents?: Array<{ sha?: string }>;
-    }>;
-    return commits.map(commit => ({
-      sha: commit.sha ?? "",
-      message: commit.commit?.message ?? "",
-      authorName: commit.commit?.author?.name ?? "",
-      authoredAt: commit.commit?.author?.date ?? "",
-      parentShas: (commit.parents ?? []).map(parent => parent.sha ?? "").filter(Boolean),
-    }));
+    if (!Array.isArray(response.json)) throw new Error("Malformed GitHub response: commit list is not an array.");
+    return response.json.map((raw: unknown) => {
+      if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("Malformed GitHub response: commit list entry is invalid.");
+      const commit = raw as {
+        sha?: string;
+        commit?: { message?: string; author?: { name?: string; date?: string } | null };
+        parents?: Array<{ sha?: string }>;
+      };
+      if (!commit.commit || typeof commit.commit !== "object" || typeof commit.commit.message !== "string") {
+        throw new Error("Malformed GitHub response: commit metadata is invalid.");
+      }
+      if (commit.parents !== undefined && !Array.isArray(commit.parents)) throw new Error("Malformed GitHub response: commit parent list is invalid.");
+      return {
+        sha: requiredGitHubString(commit.sha, "commit-list SHA"),
+        message: commit.commit.message,
+        authorName: commit.commit.author?.name ?? "",
+        authoredAt: commit.commit.author?.date ?? "",
+        parentShas: (commit.parents ?? []).map(parent => requiredGitHubString(parent?.sha, "commit-list parent SHA")),
+      };
+    });
   }
 
   async getTreeAt(treeSha: string, recursive = true): Promise<GitHubTree> {
@@ -304,7 +312,29 @@ export class GitHubClient {
       throw: false,
     });
     if (response.status !== 200) throw this.gitHttpError("Failed to get historical tree", response.status, response.text);
-    return response.json as GitHubTree;
+    const raw = response.json as Partial<GitHubTree> | undefined;
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("Malformed GitHub response: tree response is invalid.");
+    if (!Array.isArray(raw.tree)) throw new Error("Malformed GitHub response: tree entries are not an array.");
+    if (typeof raw.truncated !== "boolean") throw new Error("Malformed GitHub response: tree truncated flag is not boolean.");
+    const tree = raw.tree.map((entry, index) => {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) throw new Error(`Malformed GitHub response: tree entry ${index} is invalid.`);
+      if (typeof entry.path !== "string" || typeof entry.mode !== "string" || typeof entry.sha !== "string" || !entry.sha) {
+        throw new Error(`Malformed GitHub response: tree entry ${index} fields are invalid.`);
+      }
+      if (entry.type !== "blob" && entry.type !== "tree" && entry.type !== "commit") {
+        throw new Error(`Malformed GitHub response: tree entry ${index} type is invalid.`);
+      }
+      if (entry.size !== undefined && (!Number.isSafeInteger(entry.size) || entry.size < 0)) {
+        throw new Error(`Malformed GitHub response: tree entry ${index} size is invalid.`);
+      }
+      return { ...entry, url: typeof entry.url === "string" ? entry.url : "" } as GitHubTreeNode;
+    });
+    return {
+      sha: requiredGitHubString(raw.sha, "tree SHA"),
+      url: typeof raw.url === "string" ? raw.url : "",
+      tree,
+      truncated: raw.truncated,
+    };
   }
 
   private branchRefPath(): string {
