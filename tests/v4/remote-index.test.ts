@@ -9,12 +9,27 @@ import { expectedV4PathLayout, V4_FORMAT_VERSION, type V4RemoteConfig, type V4Re
 const enc = (value: string) => new TextEncoder().encode(value);
 
 test("v4 remote config decoder accepts a valid explicit path layout", () => {
-  const config: V4RemoteConfig = { formatVersion: V4_FORMAT_VERSION, mode: "encrypted", repoId: "o/r#main", pathLayout: "opaque-stable-v1" };
+  const config: V4RemoteConfig = {
+    formatVersion: V4_FORMAT_VERSION,
+    mode: "encrypted",
+    repoId: "o/r#main",
+    pathLayout: "opaque-stable-v1",
+    algorithm: "AES-GCM",
+    kdf: "PBKDF2-SHA-256",
+    kdfParams: { iterations: 10, salt: "c2FsdA" },
+  };
   assert.deepEqual(decodeV4RemoteConfig(encodeV4RemoteConfig(config)), config);
 });
 
 test("v4 remote config decoder accepts an omitted path layout for legacy detection", () => {
-  const config = decodeV4RemoteConfig(enc(JSON.stringify({ formatVersion: V4_FORMAT_VERSION, mode: "encrypted", repoId: "o/r#main" })));
+  const config = decodeV4RemoteConfig(enc(JSON.stringify({
+    formatVersion: V4_FORMAT_VERSION,
+    mode: "encrypted",
+    repoId: "o/r#main",
+    algorithm: "AES-GCM",
+    kdf: "PBKDF2-SHA-256",
+    kdfParams: { iterations: 10, salt: "c2FsdA" },
+  })));
   assert.equal(config.pathLayout, undefined);
 });
 
@@ -82,4 +97,64 @@ test("v4 complete remote record validation rejects pathId not derived from logic
   const config: V4RemoteConfig = { formatVersion: 4, mode: "plaintext", repoId: "o/r#main", pathLayout: "plaintext-v1" };
   const record = { path: "note.md", pathId: "ff".repeat(32), fileId: "file", plaintextSha256: "a".repeat(64), size: 1, mtime: 1, remoteVersion: "v", remotePath: "note.md", storage: "single" as const };
   await assert.rejects(() => assertV4RemoteRecordSet([record], config), /path.*id|logical path/iu);
+});
+
+
+test("v4 encrypted remote config rejects unsupported crypto semantics and unsafe KDF parameters", () => {
+  const base = {
+    formatVersion: V4_FORMAT_VERSION,
+    mode: "encrypted",
+    repoId: "o/r#main",
+    pathLayout: "opaque-stable-v1",
+    algorithm: "AES-GCM",
+    kdf: "PBKDF2-SHA-256",
+    kdfParams: { iterations: 600_000, salt: "c2FsdA" },
+  };
+
+  for (const [label, value] of [
+    ["algorithm", { ...base, algorithm: "AES-CBC" }],
+    ["kdf", { ...base, kdf: "scrypt" }],
+    ["zero iterations", { ...base, kdfParams: { ...base.kdfParams, iterations: 0 } }],
+    ["fractional iterations", { ...base, kdfParams: { ...base.kdfParams, iterations: 1.5 } }],
+    ["unbounded iterations", { ...base, kdfParams: { ...base.kdfParams, iterations: Number.MAX_SAFE_INTEGER } }],
+    ["malformed salt", { ...base, kdfParams: { ...base.kdfParams, salt: "***" } }],
+    ["oversized salt", { ...base, kdfParams: { ...base.kdfParams, salt: "A".repeat(1024) } }],
+  ] as const) {
+    assert.throws(
+      () => decodeV4RemoteConfig(enc(JSON.stringify(value))),
+      /encrypted|algorithm|kdf|iteration|salt|config/iu,
+      label,
+    );
+  }
+});
+
+test("v4 remote shard rejects impossible numeric and chunk descriptor workloads before content reads", async () => {
+  const config: V4RemoteConfig = { formatVersion: 4, mode: "plaintext", repoId: "o/r#main", pathLayout: "plaintext-v1" };
+  const pathId = "aa".padEnd(64, "0");
+  const base = {
+    path: "large.bin",
+    pathId,
+    fileId: "f",
+    plaintextSha256: "a".repeat(64),
+    size: 1,
+    mtime: 3,
+    remoteVersion: "v1",
+    remotePath: ".obsidian-github-sync-v4/large/large.bin/v1/000001.part",
+    storage: "chunked" as const,
+  };
+  const excessiveParts = Array.from({ length: 401 }, (_, index) =>
+    `.obsidian-github-sync-v4/large/large.bin/v1/${String(index + 1).padStart(6, "0")}.part`
+  );
+
+  for (const [label, record] of [
+    ["negative size", { ...base, size: -1, partPaths: [base.remotePath] }],
+    ["unsafe size", { ...base, size: Number.MAX_SAFE_INTEGER + 1, partPaths: [base.remotePath] }],
+    ["excessive chunk parts", { ...base, size: excessiveParts.length, partPaths: excessiveParts }],
+  ] as const) {
+    await assert.rejects(
+      () => decodeV4RemoteShard(enc(JSON.stringify({ bucket: "aa", records: { [pathId]: record } })), "aa", config),
+      /size|chunk|part|descriptor|limit|budget/iu,
+      label,
+    );
+  }
 });
