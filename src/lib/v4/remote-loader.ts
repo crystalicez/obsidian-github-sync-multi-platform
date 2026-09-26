@@ -5,7 +5,7 @@ import {
   type V4LocalIndex,
 } from "./local-index"
 import type { V4SyncOperation } from "./planner"
-import { hashV4ShardRecords } from "./shard-hash"
+import { hashV4ShardRecords, toV4RemoteRecord } from "./shard-hash"
 import {
   assertV4RemoteRecordSet,
   assertV4RemoteShardRecords,
@@ -82,8 +82,11 @@ export async function loadV4RemoteState(
       : undefined
     if (cached && await hashV4ShardRecords(Object.values(cached.records)) !== expectedHash) cached = undefined
     if (cached) {
-      assertV4RemoteShardRecords({ bucket, records: cached.records }, bucket, config)
-      records.push(...Object.values(cached.records))
+      const remoteRecords = Object.fromEntries(
+        Object.entries(cached.records).map(([pathId, record]) => [pathId, toV4RemoteRecord(record)]),
+      )
+      assertV4RemoteShardRecords({ bucket, records: remoteRecords }, bucket, config)
+      records.push(...Object.values(remoteRecords))
       continue
     }
     const file = await input.github.getFileBytes(v4RemoteShardPath(bucket, config.mode), commitSha)
