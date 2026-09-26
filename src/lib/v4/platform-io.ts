@@ -164,7 +164,9 @@ export function createV4PlatformIo(options: V4PlatformIoOptions): V4PlatformIo {
     async removeStage(path) {
       if (desktopReady) {
         const fs = await desktopFs()
-        await fs.rm(full(path), { force: true })
+        const stage = full(path)
+        await fs.rm(stage, { force: true })
+        await fs.rm(`${stage}.target-backup`, { force: true })
         return
       }
       if (options.adapter?.remove) await options.adapter.remove(path)
@@ -185,11 +187,21 @@ export function createV4PlatformIo(options: V4PlatformIoOptions): V4PlatformIo {
       const backup = `${stage}.target-backup`
       await ensureDesktopParent(target)
       const statOrNull = async (path: string) => { try { return await fs.stat(path) } catch (error) { if ((error as { code?: string }).code === "ENOENT") return null; throw error } }
-      const targetBefore = await statOrNull(target)
       const expected = commitOptions.expectedTarget
-      if (expected.exists !== !!targetBefore
-        || (expected.exists && expected.size !== undefined && targetBefore!.size !== expected.size)
-        || (expected.exists && expected.mtime !== undefined && Math.trunc(targetBefore!.mtimeMs) !== Math.trunc(expected.mtime))) {
+      const matchesExpected = (candidate: Awaited<ReturnType<typeof fs.stat>> | null): boolean =>
+        expected.exists === !!candidate
+        && (!expected.exists || expected.size === undefined || candidate!.size === expected.size)
+        && (!expected.exists || expected.mtime === undefined || Math.trunc(candidate!.mtimeMs) === Math.trunc(expected.mtime))
+      let targetBefore = await statOrNull(target)
+      const interruptedBackup = await statOrNull(backup)
+      if (!targetBefore && interruptedBackup) {
+        if (!matchesExpected(interruptedBackup)) {
+          throw new Error(`V4 interrupted target backup does not match the expected target: ${targetPath}`)
+        }
+        await fs.rename(backup, target)
+        targetBefore = await statOrNull(target)
+      }
+      if (!matchesExpected(targetBefore)) {
         throw new Error(`V4 local target changed before staged commit: ${targetPath}`)
       }
       const stageStat = await fs.stat(stage)
