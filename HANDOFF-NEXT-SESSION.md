@@ -235,6 +235,21 @@ Audit method:
    - Fix: `b9ebf4f33956d6535d625cffeb1b19eaac915689` allocates new secret IDs on credential rotation, stores/persists the prepared generation first, and only then publishes `this.settings`, invalidates the runtime credential generation, and rebuilds the GitHub client. A failed durable save may leave only unreferenced orphan secrets, not a hidden runtime/persisted target switch.
    - Test-contract cleanup: `362211c4c15f8729895a12068b1a8019357c6d56` updates source-order assertions to the transactional generation and repairs two malformed regex literals that would otherwise create false test failures.
 
+34. **MEDIUM hardening-regression — strict remote-record validation initially rejected valid local cache records.**
+   - Local index entries intentionally carry local-only fields such as `dirty:false`.
+   - After remote wire hardening began rejecting `dirty/deleted`, unchanged-shard cache reuse still passed local cached records through the wire validator unchanged.
+   - That would turn a valid post-sync cache hit into a failure even though the shard content hash was correct.
+   - Closure discovery also found a stale `remoteV4StateFromLocalIndex` import left after the unauthenticated bypass helper was removed.
+   - Fixes: `20b8a08f8e425581a0250b3c981325a56627728e`, `35bcb0b1a51a31d1275bf897502974f32fdb3429`, `5ee7e5aa19404e19feecac936f37187f9b8d3014`.
+   - Local cached records are now projected into canonical remote shape (strip `dirty/deleted`) before remote validation/reconstruction, while GitHub-loaded records still reject those fields.
+
+35. **MEDIUM resource/fail-closed boundary — Git tree blob entries without byte size could bypass History preview size checks.**
+   - `getTreeAt()` allowed blob entries with `size === undefined`.
+   - External history converted missing size to `0`, so the 5 MiB preview guard could pass before fetching an unexpectedly large blob into memory.
+   - Current GitHub REST tree responses include byte size for blob entries; missing size is therefore malformed evidence at this boundary.
+   - RED: `98fe2b8f636ceb5314ff3dab60d64cd90d85f71f`.
+   - Fix: `5d9ad89d4717f3f3b81ed44d1d582edb8a76163c` requires a non-negative safe integer size on every `type:"blob"` tree entry before history/immutable-read consumers receive it.
+
 ### Audited surfaces with no new confirmed defect so far
 
 - secret migration/persistence: raw token/passphrase are removed before plugin data persistence and use Obsidian SecretStorage;
@@ -268,7 +283,7 @@ Refined root-cause design:
 - add coordinator `cancelActive` plus runtime quiesce and make settings publication occur only after the old run is idle;
 - unknown empty-repository Contents bootstrap outcomes must replan on newly observed repository state rather than adopt an unproven SHA.
 
-Execution constraint recorded during this audit: a direct sandbox clone of the audit branch was attempted and failed with DNS resolution error `Could not resolve host: github.com`. Do not claim local suite execution from the AI environment unless a later attempt succeeds.
+Execution constraint recorded during this audit: direct sandbox GitHub access was retried during closure and still failed with DNS resolution error `Could not resolve host: github.com`. No GitHub Actions run is available for the connector-created audit head. Do not claim local suite execution from the AI environment unless a later attempt succeeds.
 
 ### Production fix status
 
