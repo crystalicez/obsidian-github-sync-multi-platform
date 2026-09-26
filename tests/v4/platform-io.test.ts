@@ -296,4 +296,16 @@ test("desktop Node IO capability-fails when the vault root cannot be proven", as
     () => io.assertVaultPathSafe("note.md"),
     error => error instanceof V4BoundedIoUnavailableError,
   );
+  await assert.rejects(
+    () => io.writeStage(".obsidian/stage.bin", new Uint8Array([1])),
+    error => error instanceof V4BoundedIoUnavailableError,
+  );
+  await assert.rejects(
+    () => io.rollbackStage(".obsidian/stage.bin", "note.md", {
+      expectedTarget: { exists: false },
+      expectedStageSize: 1,
+      expectedStageSha256: "0".repeat(64),
+    }),
+    error => error instanceof V4BoundedIoUnavailableError,
+  );
 });
