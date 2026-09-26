@@ -161,3 +161,17 @@ test("v4 whole-buffer chunk reader bounds concurrent remote part reads", async (
   assert.deepEqual(restored, joined);
   assert.equal(peak <= 4, true, `peak chunk reads must stay bounded, got ${peak}`);
 });
+
+
+test("v4 pack reader rejects writer-incompatible entry size before base64 allocation", async () => {
+  const keys = await deriveV4Keyring({ passphrase: "pass", repoId: "o/r#main", salt: bytes("salt"), iterations: 10 });
+  const codec = new V4StorageCodec({ mode: "encrypted", pathLayout: "opaque-stable-v1", keyring: keys });
+  const prepared = await codec.prepare("small.md", bytes("x"), "v-pack", 1, "small-file");
+  const packed = await codec.preparePack("pack-size", [{ record: prepared.record, plaintext: bytes("0123456789") }]);
+  const record = { ...packed.records[0], size: 1, plaintextSha256: await sha256Hex(bytes("0")) };
+
+  await assert.rejects(
+    () => codec.read(record, async () => packed.file.bytes),
+    /pack.*size|entry.*size|encoded.*size/iu,
+  );
+});
