@@ -452,6 +452,7 @@ export class V4PluginRuntime {
 
   private async execute(request: V4SyncRequest, changes: V4QueuedChange[], signal: AbortSignal): Promise<{ changedFiles: number }> {
     throwIfV4Aborted(signal)
+    assertPluginSettingsRuntimeSafe(this.plugin.settings)
     const continuingDebounceRun = this.debounceRunActive
     this.debounceRunActive = false
     const runPatch = {
