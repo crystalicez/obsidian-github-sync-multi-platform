@@ -210,6 +210,18 @@ Audit method:
    - Fix: `4d1815e47d8a168753232d0d89cbe891126517f7` treats the message only as one signal. It also loads/decodes the immediate parent's V4 head and requires a valid publication transition: same mode, generation exactly parent+1, and a new journal ID. Otherwise the tip is reconciled/rejected as external.
    - Plaintext repositories intentionally cannot cryptographically authenticate a publisher: a repository writer can construct a fully protocol-valid plaintext publication. This fix prevents accidental/message-only masquerade; it does not claim publisher authentication where the protocol has no secret.
 
+30. **HIGH protocol integrity — remote records could carry local-only cache flags.**
+   - `V4IndexFileRecord.dirty` and `deleted` are local-cache semantics; the writer does not publish them.
+   - Remote decode previously accepted them. In particular, `deleted:true` is filtered by `logical()`, so a forged remote record could be interpreted as an authoritative deletion even though the record still exists in the shard.
+   - RED: `2ec65f85757b4ffca38983c216a36b986d652ef6`.
+   - Fixes: `41a1e01d1fc91566673a5d96b229cc7e055189ae`, `be0af3b9e6f7df0dc2a4842acb2bb30983a1d8f0` exclude both local-only fields from canonical cache hashing and reject them at the remote record boundary.
+
+31. **MEDIUM resource safety — packed-entry decoding allocated base64 payloads before binding them to the record size.**
+   - Pack records carry an exact plaintext `size`, and the writer emits deterministic base64 length for each entry.
+   - Reader previously called `fromBase64(encoded)` before checking encoded/decoded size, so a validly encrypted/corrupt archive could force entry allocation beyond the record contract before the hash mismatch was detected.
+   - RED: `afe682d6282009ac50a9cbbc5191f08d6dca7132`.
+   - Fix: `b4a3a1e2b883f4f45b3f162a9f4d992ac39371ee` validates encoded length from `record.size` before decode and decoded length afterward.
+
 ### Audited surfaces with no new confirmed defect so far
 
 - secret migration/persistence: raw token/passphrase are removed before plugin data persistence and use Obsidian SecretStorage;
