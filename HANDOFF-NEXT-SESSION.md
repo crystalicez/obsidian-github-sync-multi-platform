@@ -272,6 +272,20 @@ Audit method:
    - Fixes: `aa0f556aa1b9dfecfc82e2d0426a3939397892c5`, `cf88125803e3ce1c13199c82075235ef35c6036b`, `a8f4d79da344ba610ac83b4df2c20be4bfa571b0`.
    - Both decision modals now settle immediately on AbortSignal, remove listeners on every settle path, and callers re-check cancellation immediately after awaiting so settings change/unload remains canonical `V4CancelledError`.
 
+39. **HIGH multi-platform path safety — logical paths were not restricted to a portable filesystem subset.**
+   - Git and Unix-like vaults can contain names that Win32 cannot safely represent or aliases specially, including device names such as `CON.md`, trailing dot/space, control characters, and `<>:"|?*`.
+   - Existing path normalization handled slash/dot-segments and sync separately detected NFC/case collisions, but did not reject these cross-platform-invalid path segments before remote/local mutation planning.
+   - RED: `bcab23adc56f7edc8d5088159f519e4bff7ecf9c`.
+   - Fix: `4b6282a559841d800a057caecf6ef096e95feca5` makes `normalizeV4VaultPath` enforce a portable logical-path subset: reject Windows device names, control/forbidden characters, trailing dot/space, and >255 UTF-8 byte path components.
+
+40. **HIGH privacy/local-mutation safety — desktop filesystem IO can traverse vault symlink/junction ancestors outside the vault.**
+   - Obsidian desktop supports symlinks/junctions that may target locations outside the vault. Current bounded/staging IO resolves a lexical vault path with `getFullPath()` then uses Node `fs.stat/read/open/mkdir/rename/rm`, which follows parent links.
+   - A vault link to an external directory can therefore make large bounded local-source reads upload bytes outside the vault, or make staged pull/rollback/commit paths mutate files outside the vault.
+   - External reference confirmation: Obsidian documentation explicitly warns that symlinks/junctions may point outside the vault and can cause sync/data-loss issues; FileSystemAdapter exposes `getBasePath()` and `getFullPath()` on desktop.
+   - RED: `1f1052c4110f459f79dcae51e18183ea8418b90c` covers an external directory link used by bounded source read and a staged commit target beneath that link.
+   - Required fix: make desktop platform IO root-aware, prove lexical + real-path containment, reject symlink/junction ancestors before reads/mutations, and expose the same guard to small-file vault reads so protection is not limited to the large-file path.
+   - Residual TOCTOU note: user/OS replacement of a verified directory entry between guard and subsequent Node operation cannot be fully eliminated without handle-relative/openat-style APIs; the fix must document that narrow local-adversary race rather than claiming stronger guarantees.
+
 ### Audited surfaces with no new confirmed defect so far
 
 - secret migration/persistence: raw token/passphrase are removed before plugin data persistence and use Obsidian SecretStorage;
