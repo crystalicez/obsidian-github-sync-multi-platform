@@ -50,12 +50,14 @@ export interface V4PlatformIo {
     expectedStageSize: number
     expectedStageSha256: string
   }): Promise<void>
+  assertVaultPathSafe(path: string, options?: { mustExist?: boolean }): Promise<void>
 }
 
 export interface V4PlatformIoOptions {
   platform: V4PlatformKind
   adapter?: V4BinaryAdapterLike
   resolveDesktopPath?: (path: string) => string
+  desktopRootPath?: string
 }
 
 function asArrayBuffer(bytes: Uint8Array): ArrayBuffer {
@@ -81,12 +83,22 @@ async function ensureDesktopParent(fullPath: string): Promise<void> {
   await fs.mkdir(path.dirname(fullPath), { recursive: true })
 }
 
-function desktopBoundedSource(fullPath: string, expectedSize: number): V4ContentSource {
+function pathInside(root: string, candidate: string, pathModule: typeof import("node:path")): boolean {
+  const relative = pathModule.relative(root, candidate)
+  return relative === "" || (!pathModule.isAbsolute(relative) && relative !== ".." && !relative.startsWith(`..${pathModule.sep}`))
+}
+
+function desktopBoundedSource(
+  fullPath: string,
+  expectedSize: number,
+  assertSafe: () => Promise<void>,
+): V4ContentSource {
   return {
     size: expectedSize,
     async *chunks(chunkBytes: number, signal?: AbortSignal) {
       if (!Number.isSafeInteger(chunkBytes) || chunkBytes < 1) throw new TypeError("chunkBytes must be a positive safe integer.")
       const fs = await desktopFs()
+      await assertSafe()
       const before = await fs.stat(fullPath)
       if (before.size !== expectedSize) throw new Error(`V4 desktop source size changed: expected ${expectedSize}, got ${before.size}.`)
       const handle = await fs.open(fullPath, "r")
@@ -113,7 +125,10 @@ function desktopBoundedSource(fullPath: string, expectedSize: number): V4Content
 }
 
 export function createV4PlatformIo(options: V4PlatformIoOptions): V4PlatformIo {
-  const desktopReady = options.platform === "desktop" && typeof options.resolveDesktopPath === "function"
+  const desktopReady = options.platform === "desktop"
+    && typeof options.resolveDesktopPath === "function"
+    && typeof options.desktopRootPath === "string"
+    && options.desktopRootPath.length > 0
   const mobileAppend = options.platform === "mobile" && typeof options.adapter?.appendBinary === "function" && typeof options.adapter?.writeBinary === "function"
   const capabilities: V4PlatformIoCapabilities = {
     platform: options.platform,
@@ -126,24 +141,67 @@ export function createV4PlatformIo(options: V4PlatformIoOptions): V4PlatformIo {
     if (!desktopReady) throw new V4BoundedIoUnavailableError("bounded-read", path)
     return options.resolveDesktopPath!(path)
   }
+  const assertDesktopPathSafe = async (path: string, mustExist = false): Promise<void> => {
+    if (options.platform !== "desktop") return
+    if (!desktopReady) throw new V4BoundedIoUnavailableError("bounded-read", path)
+    const [fs, pathModule] = await Promise.all([desktopFs(), desktopPath()])
+    const lexicalRoot = pathModule.resolve(options.desktopRootPath!)
+    const requested = pathModule.resolve(full(path))
+    if (!pathInside(lexicalRoot, requested, pathModule)) {
+      throw new Error(`V4 desktop path escapes the vault root: ${path}`)
+    }
+    const realRoot = await fs.realpath(lexicalRoot)
+    const relative = pathModule.relative(lexicalRoot, requested)
+    const segments = relative === "" ? [] : relative.split(pathModule.sep).filter(Boolean)
+    let current = lexicalRoot
+    let missing = false
+    for (const [index, segment] of segments.entries()) {
+      current = pathModule.join(current, segment)
+      let stat: Awaited<ReturnType<typeof fs.lstat>>
+      try {
+        stat = await fs.lstat(current)
+      } catch (error) {
+        if ((error as { code?: string }).code !== "ENOENT") throw error
+        missing = true
+        if (mustExist) throw new Error(`V4 desktop path is missing: ${path}`)
+        break
+      }
+      if (stat.isSymbolicLink()) throw new Error(`V4 desktop path contains a symlink or junction: ${path}`)
+      const realCurrent = await fs.realpath(current)
+      if (!pathInside(realRoot, realCurrent, pathModule)) {
+        throw new Error(`V4 desktop path resolves outside the vault root: ${path}`)
+      }
+      if (!stat.isDirectory() && index < segments.length - 1) {
+        throw new Error(`V4 desktop path has a non-directory ancestor: ${path}`)
+      }
+    }
+    if (mustExist && missing) throw new Error(`V4 desktop path is missing: ${path}`)
+  }
   return {
     capabilities,
+    async assertVaultPathSafe(path, check = {}) {
+      await assertDesktopPathSafe(path, check.mustExist ?? false)
+    },
     async readWhole(path) {
-      if (options.adapter?.readBinary) return new Uint8Array(await options.adapter.readBinary(path))
-      if (desktopReady) {
+      if (options.platform === "desktop") {
+        await assertDesktopPathSafe(path, true)
         const fs = await desktopFs()
         return new Uint8Array(await fs.readFile(full(path)))
       }
+      if (options.adapter?.readBinary) return new Uint8Array(await options.adapter.readBinary(path))
       throw new V4BoundedIoUnavailableError("bounded-read", path)
     },
     async openBoundedSource(path, expectedSize) {
       if (!desktopReady) throw new V4BoundedIoUnavailableError("bounded-read", path)
-      return desktopBoundedSource(full(path), expectedSize)
+      await assertDesktopPathSafe(path, true)
+      return desktopBoundedSource(full(path), expectedSize, () => assertDesktopPathSafe(path, true))
     },
     async writeStage(path, bytes) {
       if (desktopReady) {
+        await assertDesktopPathSafe(path, false)
         const target = full(path)
         await ensureDesktopParent(target)
+        await assertDesktopPathSafe(path, false)
         const fs = await desktopFs()
         await fs.writeFile(target, bytes)
         return
@@ -157,8 +215,10 @@ export function createV4PlatformIo(options: V4PlatformIoOptions): V4PlatformIo {
     },
     async appendStage(path, bytes) {
       if (desktopReady) {
+        await assertDesktopPathSafe(path, false)
         const target = full(path)
         await ensureDesktopParent(target)
+        await assertDesktopPathSafe(path, false)
         const fs = await desktopFs()
         await fs.appendFile(target, bytes)
         return
@@ -168,6 +228,8 @@ export function createV4PlatformIo(options: V4PlatformIoOptions): V4PlatformIo {
     },
     async removeStage(path) {
       if (desktopReady) {
+        await assertDesktopPathSafe(path, false)
+        await assertDesktopPathSafe(`${path}.target-backup`, false)
         const fs = await desktopFs()
         const stage = full(path)
         await fs.rm(stage, { force: true })
@@ -178,19 +240,25 @@ export function createV4PlatformIo(options: V4PlatformIoOptions): V4PlatformIo {
     },
     async freeBytes(path) {
       if (!desktopReady) return undefined
+      await assertDesktopPathSafe(path, false)
       const target = full(path)
       await ensureDesktopParent(target)
+      await assertDesktopPathSafe(path, false)
       const [fs, pathModule] = await Promise.all([desktopFs(), desktopPath()])
       const stats = await fs.statfs(pathModule.dirname(target))
       return Number(stats.bavail) * Number(stats.bsize)
     },
     async rollbackStage(stagePath, targetPath, commitOptions) {
       if (!desktopReady) return
+      await assertDesktopPathSafe(stagePath, false)
+      await assertDesktopPathSafe(targetPath, false)
+      await assertDesktopPathSafe(`${stagePath}.target-backup`, false)
       const fs = await desktopFs()
       const stage = full(stagePath)
       const target = full(targetPath)
       const backup = `${stage}.target-backup`
       await ensureDesktopParent(target)
+      await assertDesktopPathSafe(targetPath, false)
       const statOrNull = async (path: string) => { try { return await fs.stat(path) } catch (error) { if ((error as { code?: string }).code === "ENOENT") return null; throw error } }
       const expected = commitOptions.expectedTarget
       const matchesExpected = (candidate: Awaited<ReturnType<typeof fs.stat>> | null): boolean =>
@@ -222,11 +290,15 @@ export function createV4PlatformIo(options: V4PlatformIoOptions): V4PlatformIo {
     },
     async commitStage(stagePath, targetPath, commitOptions) {
       if (!desktopReady) throw new V4BoundedIoUnavailableError("stage-commit", targetPath)
+      await assertDesktopPathSafe(stagePath, true)
+      await assertDesktopPathSafe(targetPath, false)
+      await assertDesktopPathSafe(`${stagePath}.target-backup`, false)
       const fs = await desktopFs()
       const stage = full(stagePath)
       const target = full(targetPath)
       const backup = `${stage}.target-backup`
       await ensureDesktopParent(target)
+      await assertDesktopPathSafe(targetPath, false)
       const statOrNull = async (path: string) => { try { return await fs.stat(path) } catch (error) { if ((error as { code?: string }).code === "ENOENT") return null; throw error } }
       const expected = commitOptions.expectedTarget
       const matchesExpected = (candidate: Awaited<ReturnType<typeof fs.stat>> | null): boolean =>
