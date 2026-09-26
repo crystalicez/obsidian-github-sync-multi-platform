@@ -1171,3 +1171,18 @@ test("settings UI quiesces an active runtime before publishing a new settings ge
   assert.match(settingsSource, /const nextSettings\s*=\s*JSON\.parse\(JSON\.stringify\(this\.tempSettings\)\)[\s\S]*?await this\.plugin\.saveSettings\(nextSettings\)/u);
   assert.doesNotMatch(settingsSource, /this\.plugin\.settings\s*=\s*JSON\.parse\(JSON\.stringify\(this\.tempSettings\)\)[\s\S]*?await this\.plugin\.saveSettings\(\)/u);
 });
+
+
+test("settings save validates ignore regex before quiescing or publishing a new generation", async () => {
+  const mainSource = await readFile("src/main.ts", "utf8");
+  const settingsSource = await readFile("src/setting.tsx", "utf8");
+
+  assert.match(
+    mainSource,
+    /async saveSettings\([^)]*nextSettings[\s\S]*?compileV4IgnorePathRegex\(nextSettings\.ignorePathRegex\)[\s\S]*?await this\.v4Runtime\?\.quiesceForSettingsChange\(\)[\s\S]*?this\.settings\s*=\s*nextSettings/u,
+  );
+  assert.match(
+    settingsSource,
+    /try\s*\{[\s\S]*?await this\.plugin\.saveSettings\(nextSettings\)[\s\S]*?Settings saved[\s\S]*?\}\s*catch\s*\(error\)[\s\S]*?Settings not saved/iu,
+  );
+});
