@@ -324,7 +324,10 @@ export class GitHubClient {
       if (entry.type !== "blob" && entry.type !== "tree" && entry.type !== "commit") {
         throw new Error(`Malformed GitHub response: tree entry ${index} type is invalid.`);
       }
-      if (entry.size !== undefined && (!Number.isSafeInteger(entry.size) || entry.size < 0)) {
+      if (entry.type === "blob" && (!Number.isSafeInteger(entry.size) || (entry.size ?? -1) < 0)) {
+        throw new Error(`Malformed GitHub response: tree entry ${index} blob size is invalid.`);
+      }
+      if (entry.type !== "blob" && entry.size !== undefined && (!Number.isSafeInteger(entry.size) || entry.size < 0)) {
         throw new Error(`Malformed GitHub response: tree entry ${index} size is invalid.`);
       }
       return { ...entry, url: typeof entry.url === "string" ? entry.url : "" } as GitHubTreeNode;
