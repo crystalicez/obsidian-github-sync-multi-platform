@@ -532,8 +532,17 @@ export class V4SyncSession {
 
     for (const stagedCopy of stagedCopyPulls) {
       const remoteRecord = stagedCopy.pull.remoteRecord!
-      const bytes = prefetchedRemoteBodies.get(remoteRecord.fileId) ?? await this.readRecord(remoteRecord, stagedCopy.pull.remoteCommitSha)
-      const stage = await this.stageBytes(bytes, remoteRecord.mtime, stagedCopy.pull.change.before?.size ?? 0, ownedStages)
+      const prefetched = prefetchedRemoteBodies.get(remoteRecord.fileId)
+      const stage = prefetched
+        ? await this.stageBytes(prefetched, remoteRecord.mtime, stagedCopy.pull.change.before?.size ?? 0, ownedStages)
+        : remoteRecord.storage === "chunked" || remoteRecord.size > DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES
+          ? await this.stageRemotePull(stagedCopy.pull, ownedStages)
+          : await this.stageBytes(
+              await this.readRecord(remoteRecord, stagedCopy.pull.remoteCommitSha),
+              remoteRecord.mtime,
+              stagedCopy.pull.change.before?.size ?? 0,
+              ownedStages,
+            )
       stagedCopy.pull.stage = stage
       if (stagedCopy.push) stagedCopy.push.source = this.stageHandle(stage)
       if (this.input.runState) {
