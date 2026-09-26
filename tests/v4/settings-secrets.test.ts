@@ -1149,3 +1149,13 @@ test("main settings save invalidates the runtime credential generation before fu
   const source = await readFile("src/main.ts", "utf8")
   assert.match(source, /async saveSettings\(\)[\s\S]*?v4Runtime\?\.credentialsChanged\(\)/u)
 })
+
+
+test("settings UI quiesces an active runtime before publishing a new settings generation", async () => {
+  const mainSource = await readFile("src/main.ts", "utf8");
+  const settingsSource = await readFile("src/setting.tsx", "utf8");
+
+  assert.match(mainSource, /async saveSettings\([^)]*nextSettings[\s\S]*?await this\.v4Runtime\?\.quiesceForSettingsChange\(\)[\s\S]*?this\.settings\s*=\s*nextSettings[\s\S]*?credentialsChanged\(\)[\s\S]*?initGitHubClient\(\)/u);
+  assert.match(settingsSource, /const nextSettings\s*=\s*JSON\.parse\(JSON\.stringify\(this\.tempSettings\)\)[\s\S]*?await this\.plugin\.saveSettings\(nextSettings\)/u);
+  assert.doesNotMatch(settingsSource, /this\.plugin\.settings\s*=\s*JSON\.parse\(JSON\.stringify\(this\.tempSettings\)\)[\s\S]*?await this\.plugin\.saveSettings\(\)/u);
+});
