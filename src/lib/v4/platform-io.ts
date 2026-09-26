@@ -45,6 +45,11 @@ export interface V4PlatformIo {
     expectedStageSize: number
     expectedStageSha256: string
   }): Promise<void>
+  rollbackStage(stagePath: string, targetPath: string, options: {
+    expectedTarget: { exists: boolean; size?: number; mtime?: number }
+    expectedStageSize: number
+    expectedStageSha256: string
+  }): Promise<void>
 }
 
 export interface V4PlatformIoOptions {
@@ -178,6 +183,42 @@ export function createV4PlatformIo(options: V4PlatformIoOptions): V4PlatformIo {
       const [fs, pathModule] = await Promise.all([desktopFs(), desktopPath()])
       const stats = await fs.statfs(pathModule.dirname(target))
       return Number(stats.bavail) * Number(stats.bsize)
+    },
+    async rollbackStage(stagePath, targetPath, commitOptions) {
+      if (!desktopReady) throw new V4BoundedIoUnavailableError("stage-commit", targetPath)
+      const fs = await desktopFs()
+      const stage = full(stagePath)
+      const target = full(targetPath)
+      const backup = `${stage}.target-backup`
+      await ensureDesktopParent(target)
+      const statOrNull = async (path: string) => { try { return await fs.stat(path) } catch (error) { if ((error as { code?: string }).code === "ENOENT") return null; throw error } }
+      const expected = commitOptions.expectedTarget
+      const matchesExpected = (candidate: Awaited<ReturnType<typeof fs.stat>> | null): boolean =>
+        expected.exists === !!candidate
+        && (!expected.exists || expected.size === undefined || candidate!.size === expected.size)
+        && (!expected.exists || expected.mtime === undefined || Math.trunc(candidate!.mtimeMs) === Math.trunc(expected.mtime))
+      const backupStat = await statOrNull(backup)
+      if (!backupStat) return
+      if (!matchesExpected(backupStat)) throw new Error(`V4 interrupted target backup does not match the expected target: ${targetPath}`)
+      const targetStat = await statOrNull(target)
+      if (!targetStat) {
+        await fs.rename(backup, target)
+        return
+      }
+      if (matchesExpected(targetStat)) {
+        await fs.rm(backup, { force: true })
+        return
+      }
+      if (targetStat.size === commitOptions.expectedStageSize) {
+        const hash = createV4IncrementalSha256()
+        for await (const chunk of desktopBoundedSource(target, commitOptions.expectedStageSize).chunks(4 * 1024 * 1024)) hash.update(chunk)
+        if (hash.digestHex() === commitOptions.expectedStageSha256) {
+          await fs.rm(target, { force: true })
+          await fs.rename(backup, target)
+          return
+        }
+      }
+      throw new Error(`V4 local target changed; staged rollback is unsafe: ${targetPath}`)
     },
     async commitStage(stagePath, targetPath, commitOptions) {
       if (!desktopReady) throw new V4BoundedIoUnavailableError("stage-commit", targetPath)
