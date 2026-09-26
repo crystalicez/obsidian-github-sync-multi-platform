@@ -196,6 +196,7 @@ export function createV4PlatformIo(options: V4PlatformIoOptions): V4PlatformIo {
       return desktopBoundedSource(full(path), expectedSize, () => assertDesktopPathSafe(path, true))
     },
     async writeStage(path, bytes) {
+      if (options.platform === "desktop" && !desktopReady) throw new V4BoundedIoUnavailableError("bounded-append", path)
       if (desktopReady) {
         await assertDesktopPathSafe(path, false)
         const target = full(path)
@@ -213,6 +214,7 @@ export function createV4PlatformIo(options: V4PlatformIoOptions): V4PlatformIo {
       await options.adapter.writeBinary(path, asArrayBuffer(bytes))
     },
     async appendStage(path, bytes) {
+      if (options.platform === "desktop" && !desktopReady) throw new V4BoundedIoUnavailableError("bounded-append", path)
       if (desktopReady) {
         await assertDesktopPathSafe(path, false)
         const target = full(path)
@@ -226,6 +228,7 @@ export function createV4PlatformIo(options: V4PlatformIoOptions): V4PlatformIo {
       await options.adapter!.appendBinary!(path, asArrayBuffer(bytes))
     },
     async removeStage(path) {
+      if (options.platform === "desktop" && !desktopReady) throw new V4BoundedIoUnavailableError("bounded-append", path)
       if (desktopReady) {
         await assertDesktopPathSafe(path, false)
         await assertDesktopPathSafe(`${path}.target-backup`, false)
@@ -248,6 +251,7 @@ export function createV4PlatformIo(options: V4PlatformIoOptions): V4PlatformIo {
       return Number(stats.bavail) * Number(stats.bsize)
     },
     async rollbackStage(stagePath, targetPath, commitOptions) {
+      if (options.platform === "desktop" && !desktopReady) throw new V4BoundedIoUnavailableError("stage-commit", targetPath)
       if (!desktopReady) return
       await assertDesktopPathSafe(stagePath, false)
       await assertDesktopPathSafe(targetPath, false)
