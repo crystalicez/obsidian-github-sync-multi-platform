@@ -288,6 +288,15 @@ Audit method:
    - The vault root itself may resolve through a symlink; links **inside** the vault tree are rejected for synced IO.
    - Residual TOCTOU: a local adversary/OS process can theoretically replace an already-verified directory entry between the guard and the following Node filesystem call. Fully eliminating that narrow race would require handle-relative/openat-style APIs not exposed by the current Obsidian/Node integration; do not claim stronger guarantees.
 
+41. **HIGH settings-generation safety — new sync/history work could start during asynchronous settings persistence after the old generation had been quiesced.**
+   - `saveSettings()` previously called `quiesceForSettingsChange()` and then awaited SecretStorage/plugin-data persistence before publishing the new settings/client generation.
+   - During that persistence window the runtime was idle but not gated: watcher, manual, scheduled/startup, force, or history work could start again on the old generation. The save could then publish a new settings/client generation while that newly-started work was active, recreating the cross-target race fixed earlier.
+   - Pending startup timeout callbacks were also not bound to the settings generation that scheduled them; an old startup timer could fire after a settings switch.
+   - RED: `6a75dc8f4e8ca039709b08b75a1f9984c26efe7c`.
+   - Fixes: `4b43edbe23a018c63dede004028d2a333d6d0275`, `2a31aff2789edfa55890f4483cce51cc26c201cb`.
+   - Runtime now enters a settings-transition gate before cancelling/awaiting active work, blocks new manual/startup/scheduled/force/history work while the transition is active, cancels pending coordinator work, records in-scope local events for a post-transition rescan, and releases the gate in `finally` whether durable persistence succeeds or fails.
+   - Startup and scheduled callbacks capture the settings generation that created the timer and no-op if that generation is stale.
+
 ### Audited surfaces with no new confirmed defect so far
 
 - secret migration/persistence: raw token/passphrase are removed before plugin data persistence and use Obsidian SecretStorage;
