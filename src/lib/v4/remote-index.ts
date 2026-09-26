@@ -235,8 +235,11 @@ export async function decodeV4RemoteShard(
   config: V4RemoteConfig,
   keyring?: V4Keyring,
 ): Promise<V4RemoteShard> {
-  const shard = await decodeMetadata<V4RemoteShard>(bytes, config, keyring, "index", `${config.repoId}:${bucket}`)
-  if (shard.bucket !== bucket) throw new Error(`V4 shard bucket mismatch: ${bucket}`)
+  const parsed = await decodeMetadata<unknown>(bytes, config, keyring, "index", `${config.repoId}:${bucket}`)
+  if (!isRecord(parsed) || parsed.bucket !== bucket || !isRecord(parsed.records)) {
+    throw new Error(`V4 shard bucket or record shape mismatch: ${bucket}`)
+  }
+  const shard = parsed as unknown as V4RemoteShard
   assertV4RemoteShardRecords(shard, bucket, config)
   return shard
 }
