@@ -201,3 +201,51 @@ test("v4 recovery cancellation during a large staged final commit waits for the 
   assert.deepEqual(snapshot.payload?.completedMutationIds, ["stage:large"])
   assert.equal(snapshot.header.phase, "local-committing")
 })
+
+
+test("v4 recovery delegates a large interrupted stage swap to the atomic platform commit before replanning", async () => {
+  const { applyV4RecoveryLocalMutations, createV4RecoveryStore } = await import("../../src/lib/v4/recovery-store")
+  const { DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES } = await import("../../src/lib/v4/content-source")
+  const adapter = new MemoryAdapter()
+  const store = createV4RecoveryStore({ adapter, root: "recovery", repoId: "repo" })
+  const stage = {
+    stageId: "stage-interrupted",
+    hash: "a".repeat(64),
+    size: DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES + 1,
+    mtime: 22,
+  }
+  let snapshot = await store.save({
+    runId: "run-interrupted",
+    phase: "remote-verified",
+    expectedRemoteHead: "old",
+    candidateCommitSha: "candidate",
+    verifiedRemoteHead: "candidate",
+    payload: {
+      mutations: [{
+        id: "stage:interrupted",
+        kind: "stage-write",
+        path: "large.bin",
+        stage,
+        precondition: { path: "large.bin", exists: true, size: 3, mtime: 1 },
+      }],
+      completedMutationIds: [],
+    },
+  })
+  let commits = 0
+  const result = await applyV4RecoveryLocalMutations({
+    store,
+    snapshot,
+    io: {
+      async read() { return new Uint8Array() },
+      async write() {},
+      async trash() {},
+      async stat() { return null },
+      async commitStage() { commits++ },
+    },
+  })
+
+  assert.equal(commits, 1)
+  assert.equal(result.replanRequired, false)
+  snapshot = (await store.load())!
+  assert.deepEqual(snapshot.payload?.completedMutationIds, ["stage:interrupted"])
+});
