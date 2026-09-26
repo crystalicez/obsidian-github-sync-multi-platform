@@ -227,7 +227,7 @@ test("GitHubClient bootstraps a truly empty repository before Git ref writes", a
     if (request.url.includes("/git/refs?")) return { status: 409, text: "Git Repository is empty.", headers: {}, json: {} };
     if (request.method === "PUT") return { status: 201, text: "", headers: {}, json: { commit: { sha: "cccccccccccccccccccccccccccccccccccccccc" } } };
     if (request.method === "GET" && request.url.includes("/git/ref/heads/")) {
-      return { status: 200, text: "", headers: {}, json: { ref: "refs/heads/main", object: { sha: "cccccccccccccccccccccccccccccccccccccccc", type: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" } } };
+      return { status: 200, text: "", headers: {}, json: { ref: "refs/heads/main", object: { sha: "cccccccccccccccccccccccccccccccccccccccc", type: "commit" } } };
     }
     throw new Error(`Unexpected request: ${request.method} ${request.url}`);
   });
@@ -258,7 +258,7 @@ test("GitHubClient creates a configured custom branch after empty-repository boo
       customRefReads++;
       return customRefReads === 1
         ? { status: 404, text: "missing", headers: {}, json: {} }
-        : { status: 200, text: "", headers: {}, json: { ref: "refs/heads/v4-sync", object: { sha: "cccccccccccccccccccccccccccccccccccccccc", type: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" } } };
+        : { status: 200, text: "", headers: {}, json: { ref: "refs/heads/v4-sync", object: { sha: "cccccccccccccccccccccccccccccccccccccccc", type: "commit" } } };
     }
     if (request.method === "POST" && request.url.endsWith("/git/refs")) return { status: 201, text: "", headers: {}, json: {} };
     throw new Error(`Unexpected request: ${request.method} ${request.url}`);
@@ -326,7 +326,7 @@ test("GitHubClient retries a lost tree response because the immutable mutation i
       { token: "token", owner: "owner", repo: "repo", branch: "main" },
       { transportPolicy: { mutationSpacingMs: 0 } },
     )
-    assert.equal(await client.createGitTree([{ path: "A", mode: "100644", type: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", sha: "5555555555555555555555555555555555555555" }]), "6666666666666666666666666666666666666666")
+    assert.equal(await client.createGitTree([{ path: "A", mode: "100644", type: "blob", sha: "5555555555555555555555555555555555555555" }]), "6666666666666666666666666666666666666666")
     assert.equal(attempts, 2)
   } finally {
     setRequestUrlHandler(null)
@@ -383,7 +383,7 @@ test("empty-repository bootstrap replans after a lost Contents PUT once reposito
     const request = options as Record<string, any>
     if (request.url.includes("/git/refs?")) {
       return initialized
-        ? { status: 200, text: "", headers: {}, json: [{ ref: "refs/heads/main", object: { sha: "cccccccccccccccccccccccccccccccccccccccc", type: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" } }] }
+        ? { status: 200, text: "", headers: {}, json: [{ ref: "refs/heads/main", object: { sha: "cccccccccccccccccccccccccccccccccccccccc", type: "commit" } }] }
         : { status: 409, text: "empty", headers: {}, json: {} }
     }
     if (request.method === "PUT") {
@@ -423,7 +423,7 @@ test("bootstrap branch creation observes the configured ref before retrying a lo
     if (request.method === "PUT") return { status: 201, text: "", headers: {}, json: { commit: { sha: "cccccccccccccccccccccccccccccccccccccccc" } } }
     if (request.method === "GET" && request.url.includes("/git/ref/heads/v4-sync")) {
       return customExists
-        ? { status: 200, text: "", headers: {}, json: { ref: "refs/heads/v4-sync", object: { sha: "cccccccccccccccccccccccccccccccccccccccc", type: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" } } }
+        ? { status: 200, text: "", headers: {}, json: { ref: "refs/heads/v4-sync", object: { sha: "cccccccccccccccccccccccccccccccccccccccc", type: "commit" } } }
         : { status: 404, text: "missing", headers: {}, json: {} }
     }
     if (request.method === "POST" && request.url.endsWith("/git/refs")) {
@@ -493,7 +493,7 @@ test("immutable commit and content reads omit timestamp cache-busting while ref 
     urls.push(request.url)
     if (request.url.includes("/contents/")) return { status: 200, text: "", headers: {}, json: { content: "YQ==", encoding: "base64", sha: "2e65efe2a145dda7ee51d1741299f848e5bf752e" }, arrayBuffer: new ArrayBuffer(0) }
     if (request.url.includes("/git/commits/")) return { status: 200, text: "", headers: {}, json: { sha: "9999999999999999999999999999999999999999", tree: { sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }, parents: [] } }
-    if (request.url.includes("/git/ref/heads/")) return { status: 200, text: "", headers: {}, json: { ref: "refs/heads/main", object: { sha: "9999999999999999999999999999999999999999", type: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" } } }
+    if (request.url.includes("/git/ref/heads/")) return { status: 200, text: "", headers: {}, json: { ref: "refs/heads/main", object: { sha: "9999999999999999999999999999999999999999", type: "commit" } } }
     throw new Error(`unexpected:${request.url}`)
   })
   try {
@@ -563,7 +563,7 @@ test("empty-repository bootstrap treats an unknown Contents outcome plus a newly
     const request = options as Record<string, any>;
     if (request.url.includes("/git/refs?")) {
       return initialized
-        ? { status: 200, text: "", headers: {}, json: [{ ref: "refs/heads/main", object: { sha: "dddddddddddddddddddddddddddddddddddddddd", type: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" } }] }
+        ? { status: 200, text: "", headers: {}, json: [{ ref: "refs/heads/main", object: { sha: "dddddddddddddddddddddddddddddddddddddddd", type: "commit" } }] }
         : { status: 409, text: "empty", headers: {}, json: {} };
     }
     if (request.method === "PUT") {
@@ -572,7 +572,7 @@ test("empty-repository bootstrap treats an unknown Contents outcome plus a newly
       throw new Error("bootstrap response lost while another initializer won");
     }
     if (request.method === "GET" && request.url.includes("/git/ref/heads/main")) {
-      return { status: 200, text: "", headers: {}, json: { ref: "refs/heads/main", object: { sha: "dddddddddddddddddddddddddddddddddddddddd", type: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" } } };
+      return { status: 200, text: "", headers: {}, json: { ref: "refs/heads/main", object: { sha: "dddddddddddddddddddddddddddddddddddddddd", type: "commit" } } };
     }
     throw new Error(`Unexpected request: ${request.method} ${request.url}`);
   });
@@ -604,7 +604,7 @@ test("GitHub client rejects malformed successful ref and commit responses at the
   setRequestUrlHandler(async (options: unknown) => {
     const request = options as Record<string, any>;
     if (request.url.includes("/git/ref/heads/main")) {
-      return { status: 200, text: "", headers: {}, json: { ref: "refs/heads/main", object: { type: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" } } };
+      return { status: 200, text: "", headers: {}, json: { ref: "refs/heads/main", object: { type: "commit" } } };
     }
     if (request.url.includes("/git/commits/")) {
       return { status: 200, text: "", headers: {}, json: { sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", parents: [] } };
@@ -730,7 +730,7 @@ test("GitHub client rejects non-object SHA strings in successful ref and immutab
   setRequestUrlHandler(async (options: unknown) => {
     const request = options as Record<string, any>;
     if (request.url.includes("/git/ref/heads/main")) {
-      return { status: 200, text: "", headers: {}, json: { ref: "refs/heads/main", object: { sha: "not-a-sha", type: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" } } };
+      return { status: 200, text: "", headers: {}, json: { ref: "refs/heads/main", object: { sha: "not-a-sha", type: "commit" } } };
     }
     throw new Error(`Unexpected request: ${request.method} ${request.url}`);
   });
