@@ -1032,7 +1032,7 @@ export class V4SyncSession {
       if (normalizedPath !== node.path) throw new Error(`External Git path is not normalized: ${node.path}`)
       if (!includePath(node.path)) continue
       const file = await this.input.github.getFileBytes(node.path, remote.commitSha)
-      if (!file) continue
+      if (!file) throw new Error(`External Git blob is missing from immutable commit evidence: ${node.path}`)
       const previous = existingByPath.get(node.path)
       const pathId = previous?.pathId ?? await sha256Hex(utf8ToBytes(`path:${node.path}`))
       reconciled.push({
