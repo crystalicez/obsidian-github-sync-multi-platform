@@ -145,14 +145,18 @@ export class V4SyncCoordinator {
     this.activeController?.abort(reason)
   }
 
+  cancelPending(): void {
+    if (this.timer !== undefined) this.cancel(this.timer)
+    this.timer = undefined
+    this.pending.length = 0
+    this.flushAfterActive = false
+  }
+
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
     this.cancelActive(new V4CancelledError("V4 coordinator disposed."))
-    if (this.timer !== undefined) this.cancel(this.timer)
-    this.timer = undefined
-    this.flushAfterActive = false
-    this.pending.length = 0
+    this.cancelPending()
   }
 
   enqueue(change: V4QueuedChange): void {
