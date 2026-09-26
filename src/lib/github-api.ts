@@ -295,11 +295,11 @@ export class GitHubClient {
       }
       if (commit.parents !== undefined && !Array.isArray(commit.parents)) throw new Error("Malformed GitHub response: commit parent list is invalid.");
       return {
-        sha: requiredGitHubString(commit.sha, "commit-list SHA"),
+        sha: requiredGitObjectSha(commit.sha, "commit-list SHA"),
         message: commit.commit.message,
         authorName: commit.commit.author?.name ?? "",
         authoredAt: commit.commit.author?.date ?? "",
-        parentShas: (commit.parents ?? []).map(parent => requiredGitHubString(parent?.sha, "commit-list parent SHA")),
+        parentShas: (commit.parents ?? []).map(parent => requiredGitObjectSha(parent?.sha, "commit-list parent SHA")),
       };
     });
   }
@@ -318,7 +318,7 @@ export class GitHubClient {
     if (typeof raw.truncated !== "boolean") throw new Error("Malformed GitHub response: tree truncated flag is not boolean.");
     const tree = raw.tree.map((entry, index) => {
       if (!entry || typeof entry !== "object" || Array.isArray(entry)) throw new Error(`Malformed GitHub response: tree entry ${index} is invalid.`);
-      if (typeof entry.path !== "string" || typeof entry.mode !== "string" || typeof entry.sha !== "string" || !entry.sha) {
+      if (typeof entry.path !== "string" || typeof entry.mode !== "string" || typeof entry.sha !== "string" || !GIT_COMMIT_SHA.test(entry.sha)) {
         throw new Error(`Malformed GitHub response: tree entry ${index} fields are invalid.`);
       }
       if (entry.type !== "blob" && entry.type !== "tree" && entry.type !== "commit") {
@@ -330,7 +330,7 @@ export class GitHubClient {
       return { ...entry, url: typeof entry.url === "string" ? entry.url : "" } as GitHubTreeNode;
     });
     return {
-      sha: requiredGitHubString(raw.sha, "tree SHA"),
+      sha: requiredGitObjectSha(raw.sha, "tree SHA"),
       url: typeof raw.url === "string" ? raw.url : "",
       tree,
       truncated: raw.truncated,
@@ -356,7 +356,7 @@ export class GitHubClient {
     });
     if (response.status !== 200) throw this.gitHttpError("Failed to get git ref", response.status, response.text);
     const json = response.json as { ref?: string; object?: { sha?: string; type?: string } };
-    const sha = requiredGitHubString(json.object?.sha, "git ref SHA");
+    const sha = requiredGitObjectSha(json.object?.sha, "git ref SHA");
     const type = requiredGitHubString(json.object?.type, "git ref object type");
     if (type !== "commit") throw new Error(`Malformed GitHub response: branch ref points to unsupported object type ${type}.`);
     return { ref: requiredGitHubString(json.ref, "git ref name"), sha, type };
@@ -380,7 +380,7 @@ export class GitHubClient {
     if (response.status === 200 && Array.isArray(response.json)) {
       const first = (response.json as Array<{ ref?: string; object?: { sha?: string; type?: string } }>)[0];
       if (!first) return null;
-      const sha = requiredGitHubString(first.object?.sha, "git ref SHA");
+      const sha = requiredGitObjectSha(first.object?.sha, "git ref SHA");
       const type = requiredGitHubString(first.object?.type, "git ref object type");
       return { ref: requiredGitHubString(first.ref, "git ref name"), sha, type };
     }
@@ -459,10 +459,10 @@ export class GitHubClient {
     if (response.status !== 200) throw this.gitHttpError("Failed to get git commit", response.status, response.text);
     const json = response.json as { sha?: string; message?: string; tree?: { sha?: string }; parents?: Array<{ sha?: string }> };
     if (json.parents !== undefined && !Array.isArray(json.parents)) throw new Error("Malformed GitHub response: commit parents are invalid.");
-    const parentShas = (json.parents ?? []).map(parent => requiredGitHubString(parent?.sha, "commit parent SHA"));
+    const parentShas = (json.parents ?? []).map(parent => requiredGitObjectSha(parent?.sha, "commit parent SHA"));
     return {
-      sha: requiredGitHubString(json.sha, "commit SHA"),
-      treeSha: requiredGitHubString(json.tree?.sha, "commit tree SHA"),
+      sha: requiredGitObjectSha(json.sha, "commit SHA"),
+      treeSha: requiredGitObjectSha(json.tree?.sha, "commit tree SHA"),
       parentShas,
       message: json.message,
     };
@@ -482,7 +482,7 @@ export class GitHubClient {
         reservationAlreadyHeld: true,
         action: "Failed to create git blob",
       });
-      return requiredGitHubString((response.json as { sha?: string }).sha, "created blob SHA");
+      return requiredGitObjectSha((response.json as { sha?: string }).sha, "created blob SHA");
     });
   }
 
@@ -496,7 +496,7 @@ export class GitHubClient {
       successStatuses: [201],
       action: "Failed to create git tree",
     });
-    return requiredGitHubString((response.json as { sha?: string }).sha, "created tree SHA");
+    return requiredGitObjectSha((response.json as { sha?: string }).sha, "created tree SHA");
   }
 
   async createGitCommit(
@@ -514,7 +514,7 @@ export class GitHubClient {
       successStatuses: [201],
       action: "Failed to create git commit",
     });
-    return requiredGitHubString((response.json as { sha?: string }).sha, "created commit SHA");
+    return requiredGitObjectSha((response.json as { sha?: string }).sha, "created commit SHA");
   }
 
   async updateGitRef(sha: string, _expectedSha?: string): Promise<void> {
