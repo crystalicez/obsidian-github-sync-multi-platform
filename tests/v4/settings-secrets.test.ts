@@ -1147,7 +1147,7 @@ test("v4 runtime keyring cache reuses one derived keyring until credential gener
 
 test("main settings save invalidates the runtime credential generation before future sync work", async () => {
   const source = await readFile("src/main.ts", "utf8")
-  assert.match(source, /async saveSettings\(\)[\s\S]*?v4Runtime\?\.credentialsChanged\(\)/u)
+  assert.match(source, /async saveSettings\([^)]*\)[\s\S]*?v4Runtime\?\.credentialsChanged\(\)/u)
 })
 
 
