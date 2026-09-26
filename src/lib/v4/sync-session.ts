@@ -1134,11 +1134,12 @@ export class V4SyncSession {
       for (const [path, record] of moved) identityByPath.set(path, record)
     }
     const files = await this.localIo.listFiles()
+    const allowStatHashReuse = changes.length > 0 && !changes.some(change => change.type === "rescan")
     return boundedMap(files, this.resources.limits.maxVaultReads, async file => {
       this.report({ phase: "scanning-local", currentPath: file.path, currentDirection: undefined })
       const identity = identityByPath.get(file.path)
       const existing = identity ?? undefined
-      const unchangedStat = existing && existing.size === file.size && existing.mtime === file.mtime
+      const unchangedStat = allowStatHashReuse && existing && existing.size === file.size && existing.mtime === file.mtime
       if (!unchangedStat) this.report({ phase: "hashing", currentPath: file.path, currentDirection: undefined })
       const fileId = identity === null
         ? await this.newFileId(file.path)
