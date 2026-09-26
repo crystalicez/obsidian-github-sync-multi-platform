@@ -210,3 +210,96 @@ test("v4 history refuses an oversized preview before loading blob bytes", async 
   }), /preview.*limit|too large/iu);
   assert.equal(blobReads, 0);
 });
+
+
+function historyJournalFixture(pageBody: (page: number) => unknown) {
+  let reads = 0;
+  const github = {
+    async listCommits() { return []; },
+    async getFileBytes(_path: string, _ref?: string) {
+      const page = reads++;
+      return { bytes: enc(JSON.stringify(pageBody(page))), sha: `journal-${page}` };
+    },
+    async getGitCommit(sha: string) { return { sha, treeSha: "tree", parentShas: [] }; },
+    async getTreeAt() { return { sha: "tree", url: "", truncated: false, tree: [] }; },
+    async getBlob() { return new Uint8Array(); },
+  };
+  return { github, get reads() { return reads; } };
+}
+
+test("v4 history does not classify path-like forged commit markers as plugin journals", async () => {
+  const github = {
+    async listCommits() {
+      return [{
+        sha: "external",
+        message: "obsidian-sync-v4:../../outside",
+        authorName: "A",
+        authoredAt: new Date(0).toISOString(),
+        parentShas: [],
+      }];
+    },
+    async getFileBytes() { throw new Error("journal read must not happen"); },
+    async getGitCommit(sha: string) { return { sha, treeSha: "tree", parentShas: [] }; },
+    async getTreeAt() { return { sha: "tree", url: "", truncated: false, tree: [] }; },
+    async getBlob() { return new Uint8Array(); },
+  };
+  const service = new V4HistoryService({
+    github,
+    config: { formatVersion: 4, mode: "plaintext", repoId: "o/r#main", pathLayout: "plaintext-v1" },
+  });
+
+  const page = await service.listCommits(1);
+
+  assert.equal(page.items[0].source, "external");
+  assert.equal(page.items[0].journalId, undefined);
+});
+
+test("v4 history rejects an excessive journal page count before issuing fanout reads", async () => {
+  const fixture = historyJournalFixture(page => ({
+    journalId: "123-safe",
+    page,
+    pageCount: page === 0 ? 1_000_000 : 1_000_000,
+    changes: [],
+  }));
+  const service = new V4HistoryService({
+    github: fixture.github,
+    config: { formatVersion: 4, mode: "plaintext", repoId: "o/r#main", pathLayout: "plaintext-v1" },
+  });
+  const commit = {
+    sha: "c1",
+    message: "obsidian-sync-v4:123-safe",
+    authorName: "A",
+    authoredAt: new Date(0).toISOString(),
+    parentShas: [],
+    source: "plugin" as const,
+    journalId: "123-safe",
+  };
+
+  await assert.rejects(() => service.getCommitChanges(commit), /journal.*page.*limit|page count/iu);
+  assert.equal(fixture.reads, 1);
+});
+
+test("v4 history rejects inconsistent journal page counts across one commit", async () => {
+  const fixture = historyJournalFixture(page => ({
+    journalId: "123-safe",
+    page,
+    pageCount: page === 0 ? 2 : 3,
+    changes: [],
+  }));
+  const service = new V4HistoryService({
+    github: fixture.github,
+    config: { formatVersion: 4, mode: "plaintext", repoId: "o/r#main", pathLayout: "plaintext-v1" },
+  });
+  const commit = {
+    sha: "c1",
+    message: "obsidian-sync-v4:123-safe",
+    authorName: "A",
+    authoredAt: new Date(0).toISOString(),
+    parentShas: [],
+    source: "plugin" as const,
+    journalId: "123-safe",
+  };
+
+  await assert.rejects(() => service.getCommitChanges(commit), /page count|journal.*consistent|journal.*mismatch/iu);
+  assert.equal(fixture.reads, 2);
+});
