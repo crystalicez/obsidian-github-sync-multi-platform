@@ -16,7 +16,7 @@ import { createV4ScopePredicate, isPathInV4SyncScope } from "./scope"
 import { assertV4PathLayoutCompatible, V4ChangeGuardError, V4RecoveryReplanRequiredError, V4SyncSession, type V4SyncRunState } from "./sync-session"
 import type { V4ConflictResolution } from "./conflicts"
 import { V4SyncCoordinator, type V4QueuedChange, type V4SyncRequest } from "./sync-coordinator"
-import { expectedV4PathLayout, V4_FORMAT_VERSION, V4_CONFIG_PATH, type V4RemoteConfig, type V4StorageMode } from "./protocol-types"
+import { expectedV4PathLayout, V4_FORMAT_VERSION, V4_CONFIG_PATH, V4_PBKDF2_ITERATIONS, type V4RemoteConfig, type V4StorageMode } from "./protocol-types"
 import { V4HistoryService } from "./history-service"
 import type { V4SessionVault } from "./local-io"
 import { createV4ContentSource, createV4WholeBufferContentSource, DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES, type V4ContentSource } from "./content-source"
@@ -50,7 +50,7 @@ export function selectV4RuntimeConfig(discovered: V4RemoteConfig | null, mode: V
     pathLayout: expectedV4PathLayout(mode),
     algorithm: "AES-GCM",
     kdf: "PBKDF2-SHA-256",
-    kdfParams: { iterations: 600_000, salt: toBase64Url(randomBytes(16)) },
+    kdfParams: { iterations: V4_PBKDF2_ITERATIONS, salt: toBase64Url(randomBytes(16)) },
   }
 }
 
