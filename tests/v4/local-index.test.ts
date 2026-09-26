@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { sha256Hex, utf8ToBytes } from "../../src/lib/bytes";
 import { createEmptyV4LocalIndex, loadV4LocalIndex, saveV4LocalIndex } from "../../src/lib/v4/local-index";
 
 function addShard(index: ReturnType<typeof createEmptyV4LocalIndex>, bucket: string, version: string) {
@@ -300,4 +301,65 @@ test("v4 local index persists the selected path layout", async () => {
   await saveV4LocalIndex(adapter, "index", index);
 
   assert.equal((await loadV4LocalIndex(adapter, "index")).pathLayout, "opaque-stable-v1");
+});
+
+
+test("v4 local index invalidates cached records whose advertised remote shard hash no longer matches content", async () => {
+  const bucket = "ab";
+  const pathIdA = `${bucket}${"0".repeat(62)}`;
+  const pathIdB = `${bucket}${"1".repeat(62)}`;
+  const recordA = {
+    path: "A.md",
+    pathId: pathIdA,
+    fileId: "file-a",
+    plaintextSha256: "a".repeat(64),
+    size: 1,
+    mtime: 1,
+    remoteVersion: "v1",
+    remotePath: "A.md",
+    storage: "single" as const,
+  };
+  const recordB = {
+    path: "B.md",
+    pathId: pathIdB,
+    fileId: "file-b",
+    plaintextSha256: "b".repeat(64),
+    size: 1,
+    mtime: 1,
+    remoteVersion: "v1",
+    remotePath: "B.md",
+    storage: "single" as const,
+  };
+  const advertisedHash = await sha256Hex(utf8ToBytes(JSON.stringify([recordA, recordB])));
+  const stored = new Map<string, string>([
+    ["index/index.json", JSON.stringify({
+      formatVersion: 4,
+      repoId: "o/r#main",
+      deviceId: "d",
+      mode: "plaintext",
+      pathLayout: "plaintext-v1",
+      remoteCommitSha: "remote-head",
+      epoch: 1,
+      generation: 1,
+      shardHashes: { [bucket]: advertisedHash },
+    })],
+    // Simulate a cache file whose records were lost/tampered while its old advertised hash field survived.
+    ["index/shards/ab.json", JSON.stringify({
+      bucket,
+      hash: advertisedHash,
+      records: { [pathIdA]: { ...recordA, dirty: false } },
+    })],
+  ]);
+  const adapter = {
+    async read(path: string) { return stored.get(path)!; },
+    async write(path: string, value: string) { stored.set(path, value); },
+    async exists(path: string) { return stored.has(path); },
+    async mkdir(_path: string) {},
+  };
+
+  const loaded = await loadV4LocalIndex(adapter, "index");
+
+  assert.equal(loaded.remoteCommitSha, undefined);
+  assert.deepEqual(loaded.shardHashes, {});
+  assert.deepEqual(loaded.shards, {});
 });
