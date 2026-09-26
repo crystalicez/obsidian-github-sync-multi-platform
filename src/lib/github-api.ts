@@ -249,15 +249,27 @@ export class GitHubClient {
   }
 
   async getBlob(sha: string): Promise<Uint8Array> {
-    const url = `${this.baseUrl}/git/blobs/${sha}`;
+    const expectedSha = requiredGitObjectSha(sha, "Git blob SHA");
+    const url = `${this.baseUrl}/git/blobs/${expectedSha}`;
     const response = await this.request({
       url,
       method: "GET",
       headers: { ...this.headers, Accept: "application/vnd.github.raw+json" },
       throw: false,
     });
-    if (response.status === 200) return new Uint8Array(response.arrayBuffer);
-    throw new Error("Failed to get blob " + sha + ": HTTP " + response.status + " - " + response.text);
+    if (response.status !== 200) {
+      throw new Error("Failed to get blob " + expectedSha + ": HTTP " + response.status + " - " + response.text);
+    }
+    if (!(response.arrayBuffer instanceof ArrayBuffer)) throw new Error("Malformed GitHub response: missing raw Git blob bytes.");
+    const bytes = new Uint8Array(response.arrayBuffer);
+    let actualSha: string;
+    try {
+      actualSha = await this.gitBlobSha1(bytes);
+    } catch (error) {
+      throw new Error("Unable to verify raw Git blob response.", { cause: error });
+    }
+    if (actualSha !== expectedSha) throw new Error("Git blob SHA verification failed.");
+    return bytes;
   }
 
   async listCommits(options: { page?: number; perPage?: number } = {}): Promise<GitHubCommitSummary[]> {
