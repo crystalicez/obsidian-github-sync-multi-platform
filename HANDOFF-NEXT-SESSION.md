@@ -73,6 +73,27 @@ Audit method:
 - local target size+mtime preconditions retain a theoretical same-size/same-mtime TOCTOU risk, but no realistic bypass path has been demonstrated in this audit; treat as residual risk unless a reproduction appears;
 - recovery payload validation has hardening gaps (full path/duplicate-ID/numeric validation), but header integrity and normal writer ownership mean no equivalent concrete production corruption path is confirmed yet.
 
+### RED regression status
+
+RED tests have now been pushed on the audit branch:
+- `494c7c57d86eb3125ccd7b664512a4c57b7e07c8` — local-index cached records can be tampered/omitted while the advertised hash string remains unchanged.
+- `88d0dad51c6f7f4a3b6a96a923b5040cc9973e0d` — encrypted remote config KDF/algorithm bounds and remote record numeric/chunk descriptor bounds.
+- `ced09a381e8c2f4bd4e2bd772d631117f3807733` — history journal marker/page-count safety.
+- `e8268b238fef068a97be4469e5d6777dc3d954d0` — unknown bootstrap outcome plus competitor ref must be a typed bootstrap race.
+- `01c6190b6d457e37a1ebed473b7285668f61f650` — reusable active-run cancellation required for settings rotation.
+- `89cc24a6664cd4839e8f5e991567cbc653adaf71` — whole-buffer chunk reads must have bounded concurrency.
+- `088e3d18cc4e646f095859259a18d09ab03a6d29` — settings UI/main must quiesce the old generation before publishing new settings/client state.
+- `83a9044b8047c9a57c8bae6e33878fd3db735037` — freshly fetched remote shard records must match the head's advertised shard hash.
+
+Refined root-cause design:
+- create one canonical shard-record hash function and use it for writer hash creation, remote shard verification, and local persisted-cache verification;
+- validate remote config/head/record/history metadata at decode boundaries using writer-compatible limits;
+- bound whole-buffer chunk read concurrency even after descriptor validation;
+- add coordinator `cancelActive` plus runtime quiesce and make settings publication occur only after the old run is idle;
+- unknown empty-repository Contents bootstrap outcomes must replan on newly observed repository state rather than adopt an unproven SHA.
+
+Execution constraint recorded during this audit: a direct sandbox clone of the audit branch was attempted and failed with DNS resolution error `Could not resolve host: github.com`. Do not claim local suite execution from the AI environment unless a later attempt succeeds.
+
 ### TDD plan
 
 Write RED regressions before fixes:
