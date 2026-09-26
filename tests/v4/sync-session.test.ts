@@ -947,7 +947,7 @@ test("v4 normal pull routes rename cleanup through local trash semantics", async
   assert.deepEqual(target.operations.filter(operation => /^(?:trash|delete):old-name\.md$/u.test(operation)), ["trash:old-name.md"]);
 });
 
-test("v4 session validates only the config when the remote commit is unchanged", async () => {
+test("v4 session validates the remote head while reusing unchanged cached shards", async () => {
   const github = new MemoryGitHub();
   const vault = new MemoryVault();
   vault.files.set("a.md", { bytes: enc("one"), mtime: 1 });
@@ -960,8 +960,33 @@ test("v4 session validates only the config when the remote commit is unchanged",
   await session.sync({ operation: "normal", allowThresholdOverride: false });
 
   assert.deepEqual(github.readRefs, [github.ref!.sha]);
-  assert.deepEqual(github.readPaths, [V4_CONFIG_PATH]);
+  assert.deepEqual(github.readPaths, [V4_CONFIG_PATH, V4_HEAD_PATH]);
   assert.deepEqual(github.treeReads, []);
+});
+
+test("v4 plaintext matching-SHA sync rejects a self-consistent local cache that disagrees with the remote head", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault();
+  vault.files.set("a.md", { bytes: enc("one"), mtime: 1 });
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "d1", mode: "plaintext" });
+  const session = new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 });
+  await session.sync({ operation: "forcePush", allowThresholdOverride: false });
+
+  const bucket = Object.keys(index.shards)[0];
+  const cachedRecord = Object.values(index.shards[bucket].records)[0];
+  const originalFileId = cachedRecord.fileId;
+  cachedRecord.fileId = "tampered-local-identity";
+  const { hashV4ShardRecords } = await import("../../src/lib/v4/shard-hash");
+  const tamperedHash = await hashV4ShardRecords(Object.values(index.shards[bucket].records));
+  index.shards[bucket].hash = tamperedHash;
+  index.shardHashes[bucket] = tamperedHash;
+
+  github.readPaths.length = 0;
+  const result = await session.sync({ operation: "normal", allowThresholdOverride: false });
+
+  assert.equal(result.mode, "noop");
+  assert.deepEqual(github.readPaths, [V4_CONFIG_PATH, V4_HEAD_PATH, `.obsidian-github-sync-v4/index/${bucket}.json`]);
+  assert.equal(indexRecordByPath(index, "a.md").fileId, originalFileId);
 });
 
 test("v4 encrypted matching-SHA sync authenticates the remote head before publishing with a derived key", async () => {
