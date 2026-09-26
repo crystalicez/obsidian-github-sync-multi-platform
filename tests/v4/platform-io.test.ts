@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -203,4 +203,76 @@ test("mobile staged rollback is a no-op because mobile never creates desktop tar
     expectedStageSize: 4,
     expectedStageSha256: "f".repeat(64),
   }));
+});
+
+
+async function createExternalDirectoryLink(t: { skip(message?: string): void }, root: string, outside: string): Promise<string | null> {
+  const link = path.join(root, "linked-outside");
+  try {
+    await symlink(outside, link, process.platform === "win32" ? "junction" : "dir");
+  } catch (error) {
+    if (["EPERM", "EACCES", "ENOSYS"].includes((error as { code?: string }).code ?? "")) {
+      t.skip(`directory link creation unavailable: ${(error as { code?: string }).code}`);
+      return null;
+    }
+    throw error;
+  }
+  return link;
+}
+
+test("desktop bounded reads reject a vault directory link that escapes the vault root", async t => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "v4-vault-root-"));
+  const outside = await mkdtemp(path.join(os.tmpdir(), "v4-vault-outside-"));
+  try {
+    await writeFile(path.join(outside, "secret.bin"), new Uint8Array([7, 7, 7]));
+    const link = await createExternalDirectoryLink(t, root, outside);
+    if (!link) return;
+
+    const io = createV4PlatformIo({
+      platform: "desktop",
+      resolveDesktopPath: value => path.join(root, value),
+      desktopRootPath: root,
+    } as never);
+
+    const source = await io.openBoundedSource("linked-outside/secret.bin", 3);
+    await assert.rejects(
+      () => collectV4ContentSource(source, 3),
+      /symlink|junction|vault root|outside|unsafe/iu,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+    await rm(outside, { recursive: true, force: true });
+  }
+});
+
+test("desktop staged commit refuses a target beneath a vault directory link", async t => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "v4-stage-vault-root-"));
+  const outside = await mkdtemp(path.join(os.tmpdir(), "v4-stage-vault-outside-"));
+  try {
+    await mkdir(path.join(root, ".obsidian"), { recursive: true });
+    const stagePath = path.join(root, ".obsidian", "stage.bin");
+    await writeFile(stagePath, new Uint8Array([9, 8, 7, 6]));
+    await writeFile(path.join(outside, "target.bin"), new Uint8Array([1, 2, 3]));
+    const link = await createExternalDirectoryLink(t, root, outside);
+    if (!link) return;
+
+    const io = createV4PlatformIo({
+      platform: "desktop",
+      resolveDesktopPath: value => path.join(root, value),
+      desktopRootPath: root,
+    } as never);
+
+    await assert.rejects(
+      () => io.commitStage(".obsidian/stage.bin", "linked-outside/target.bin", {
+        expectedTarget: { exists: true, size: 3 },
+        expectedStageSize: 4,
+        expectedStageSha256: "63d987d1c6d69751c17297f410f5b3547a65d096a8993b35bcb4f9cad054f176",
+      }),
+      /symlink|junction|vault root|outside|unsafe/iu,
+    );
+    assert.deepEqual(new Uint8Array(await readFile(path.join(outside, "target.bin"))), new Uint8Array([1, 2, 3]));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+    await rm(outside, { recursive: true, force: true });
+  }
 });
