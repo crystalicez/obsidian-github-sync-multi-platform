@@ -453,6 +453,7 @@ export class V4SyncSession {
       if (resolution.action === "ask") {
         if (!this.input.askConflict) throw new Error(`Conflict requires user decision: ${conflict.path}`)
         resolution = await this.input.askConflict({ path: conflict.path, localMtime: conflict.local?.mtime ?? 0, remoteMtime: conflict.remote?.mtime ?? 0 })
+        throwIfV4Aborted(this.input.signal)
         if (resolution.action === "ask") throw new Error(`Conflict cancelled: ${conflict.path}`)
       }
       if (remoteBytes && remoteRecord) prefetchedRemoteBodies.set(remoteRecord.fileId, remoteBytes)
