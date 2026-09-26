@@ -38,7 +38,8 @@ function extension(path: string): string { return path.split(".").at(-1)?.toLowe
 export class V4HistoryService {
   private readonly codec: V4StorageCodec
 
-  constructor(private readonly input: { github: V4HistoryGithub; config: V4RemoteConfig; keyring?: V4Keyring }) {
+  constructor(private readonly input: { github: V4HistoryGithub; config: V4RemoteConfig; keyring?: V4Keyring; assertCurrent?: () => void }) {
+    this.assertCurrent()
     assertV4PathLayoutCompatible(input.config, { ...input.config, pathLayout: expectedV4PathLayout(input.config.mode) }, "normal")
     const pathLayout = input.config.pathLayout ?? expectedV4PathLayout(input.config.mode)
     this.codec = new V4StorageCodec({
@@ -49,7 +50,10 @@ export class V4HistoryService {
   }
 
   async listCommits(page = 1): Promise<V4CommitPage> {
-    const items = (await this.input.github.listCommits({ page, perPage: 50 })).map(commit => {
+    this.assertCurrent()
+    const listed = await this.input.github.listCommits({ page, perPage: 50 })
+    this.assertCurrent()
+    const items = listed.map(commit => {
       const match = /^obsidian-sync-v4:([^\s]+)$/u.exec(commit.message.split("\n", 1)[0])
       const journalId = match?.[1]
       const plugin = isV4JournalId(journalId)
@@ -59,11 +63,16 @@ export class V4HistoryService {
   }
 
   async getCommitChanges(commit: V4HistoryCommit): Promise<V4HistoryChange[]> {
-    if (commit.source === "plugin" && commit.journalId) return this.readJournal(commit.journalId, commit.sha)
-    return this.diffExternalCommit(commit)
+    this.assertCurrent()
+    const changes = commit.source === "plugin" && commit.journalId
+      ? await this.readJournal(commit.journalId, commit.sha)
+      : await this.diffExternalCommit(commit)
+    this.assertCurrent()
+    return changes
   }
 
   async previewChange(commit: V4HistoryCommit, change: V4HistoryChange): Promise<V4VersionPreview> {
+    this.assertCurrent()
     const descriptor = change.after ?? change.before
     if (!descriptor) return { kind: "binary", bytes: new Uint8Array() }
     if (descriptor.size > V4_HISTORY_PREVIEW_MAX_BYTES) {
@@ -78,10 +87,14 @@ export class V4HistoryService {
     if (tree.truncated) throw new Error("Historical Git tree is truncated; preview is unsafe.")
     const shas = new Map(tree.tree.filter(node => node.type === "blob").map(node => [node.path, node.sha]))
     const bytes = await this.codec.read(record, async path => {
+      this.assertCurrent()
       const sha = shas.get(path)
       if (!sha) throw new Error(`Version blob is missing: ${path}`)
-      return this.input.github.getBlob(sha)
+      const blob = await this.input.github.getBlob(sha)
+      this.assertCurrent()
+      return blob
     })
+    this.assertCurrent()
     const ext = extension(change.path)
     if (TEXT_EXTENSIONS.has(ext) && bytes.byteLength <= 5 * 1024 * 1024) return { kind: "text", text: bytesToUtf8(bytes), bytes }
     if (IMAGE_MIME[ext]) return { kind: "image", mime: IMAGE_MIME[ext], bytes }
@@ -89,6 +102,7 @@ export class V4HistoryService {
   }
 
   async getFileVersions(fileId: string, maxPages = 20): Promise<Array<{ commit: V4HistoryCommit; change: V4HistoryChange }>> {
+    this.assertCurrent()
     const versions: Array<{ commit: V4HistoryCommit; change: V4HistoryChange }> = []
     for (let page = 1; page <= maxPages; page++) {
       const commits = await this.listCommits(page)
@@ -97,7 +111,12 @@ export class V4HistoryService {
       }
       if (!commits.hasMore) break
     }
+    this.assertCurrent()
     return versions.reverse()
+  }
+
+  private assertCurrent(): void {
+    this.input.assertCurrent?.()
   }
 
   private async readJournal(journalId: string, commitSha: string): Promise<V4HistoryChange[]> {
@@ -113,7 +132,9 @@ export class V4HistoryService {
   private async readJournalPage(journalId: string, page: number, commitSha: string, expectedPageCount?: number): Promise<V4JournalPage> {
     const encrypted = this.input.config.mode === "encrypted"
     const path = `${V4_ROOT}/journals/${journalId}/${String(page).padStart(6, "0")}.${encrypted ? "enc" : "json"}`
+    this.assertCurrent()
     const file = await this.input.github.getFileBytes(path, commitSha)
+    this.assertCurrent()
     if (!file) throw new Error(`V4 history journal is missing: ${journalId}/${page}`)
     const bytes = encrypted
       ? await decryptV4Payload(this.input.keyring!.journalKey, file.bytes, { kind: "journal", aad: `${this.input.config.repoId}:${journalId}:${page}` })
@@ -134,12 +155,21 @@ export class V4HistoryService {
   }
 
   private async diffExternalCommit(commit: V4HistoryCommit): Promise<V4HistoryChange[]> {
+    this.assertCurrent()
     const currentCommit = await this.input.github.getGitCommit(commit.sha)
+    this.assertCurrent()
     const current = await this.input.github.getTreeAt(currentCommit.treeSha, true)
+    this.assertCurrent()
     const parentSha = commit.parentShas[0] ?? currentCommit.parentShas[0]
-    const parent = parentSha
-      ? await this.input.github.getTreeAt((await this.input.github.getGitCommit(parentSha)).treeSha, true)
-      : { tree: [] } as unknown as GitHubTree
+    let parent: GitHubTree
+    if (parentSha) {
+      const parentCommit = await this.input.github.getGitCommit(parentSha)
+      this.assertCurrent()
+      parent = await this.input.github.getTreeAt(parentCommit.treeSha, true)
+      this.assertCurrent()
+    } else {
+      parent = { tree: [] } as unknown as GitHubTree
+    }
     if (current.truncated || parent.truncated) throw new Error("Historical Git tree is truncated; change list is unsafe.")
     const before = new Map(parent.tree.filter(node => node.type === "blob").map(node => [node.path, node]))
     const after = new Map(current.tree.filter(node => node.type === "blob").map(node => [node.path, node]))
