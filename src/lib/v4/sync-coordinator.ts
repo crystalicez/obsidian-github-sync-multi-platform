@@ -141,10 +141,14 @@ export class V4SyncCoordinator {
   get isSyncing(): boolean { return this.active !== undefined; }
   get pendingCount(): number { return this.disposed ? 0 : coalesceV4Changes(this.pending).length; }
 
+  cancelActive(reason: unknown = new V4CancelledError("V4 active sync cancelled.")): void {
+    this.activeController?.abort(reason)
+  }
+
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
-    this.activeController?.abort(new V4CancelledError("V4 coordinator disposed."))
+    this.cancelActive(new V4CancelledError("V4 coordinator disposed."))
     if (this.timer !== undefined) this.cancel(this.timer)
     this.timer = undefined
     this.flushAfterActive = false
