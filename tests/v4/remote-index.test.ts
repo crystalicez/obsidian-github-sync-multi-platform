@@ -187,3 +187,45 @@ test("v4 remote records reject missing integrity/version identifiers that the wr
     );
   }
 });
+
+
+test("v4 remote shard rejects chunk counts outside the writer-compatible size range", async () => {
+  const config: V4RemoteConfig = { formatVersion: 4, mode: "plaintext", repoId: "o/r#main", pathLayout: "plaintext-v1" };
+  const path = "large.bin";
+  const pathId = await sha256Hex(enc(`path:${path}`));
+  const version = "v1";
+  const partPath = (index: number) => `.obsidian-github-sync-v4/large/large.bin/${version}/${String(index + 1).padStart(6, "0")}.part`;
+  const base = {
+    path,
+    pathId,
+    fileId: "f",
+    plaintextSha256: "a".repeat(64),
+    mtime: 3,
+    remoteVersion: version,
+    remotePath: partPath(0),
+    storage: "chunked" as const,
+  };
+
+  const cases = [
+    {
+      label: "small file cannot claim chunked storage",
+      record: { ...base, size: 1, partPaths: Array.from({ length: 400 }, (_, index) => partPath(index)) },
+    },
+    {
+      label: "part count cannot exceed one part per MiB writer minimum",
+      record: { ...base, size: 51 * 1024 * 1024, partPaths: Array.from({ length: 100 }, (_, index) => partPath(index)) },
+    },
+    {
+      label: "part count cannot be below 48 MiB writer maximum",
+      record: { ...base, size: 97 * 1024 * 1024, partPaths: [partPath(0), partPath(1)] },
+    },
+  ];
+
+  for (const { label, record } of cases) {
+    await assert.rejects(
+      () => decodeV4RemoteShard(enc(JSON.stringify({ bucket: pathId.slice(0, 2), records: { [pathId]: record } })), pathId.slice(0, 2), config),
+      /chunk|part|writer|size|count/iu,
+      label,
+    );
+  }
+});
