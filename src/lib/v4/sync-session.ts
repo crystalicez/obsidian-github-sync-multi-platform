@@ -19,7 +19,7 @@ import { buildV4JournalPages, type V4JournalChange } from "./history-journal"
 import { isV4LocalIndexCacheComplete, type V4IndexFileRecord, type V4LocalIndex } from "./local-index"
 import { assertV4LocalTargetPrecondition, createV4LocalIo, type V4LocalIo, type V4LocalTargetPrecondition, type V4SessionVault } from "./local-io"
 import { trashV4LocalUserFile } from "./local-delete-policy"
-import { bucketForV4PathId } from "./paths"
+import { bucketForV4PathId, normalizeV4VaultPath } from "./paths"
 import { planV4Sync, type V4LogicalFile, type V4PlannedChange, type V4SyncOperation } from "./planner"
 import { assertV4RemoteRecordSet, buildV4RemoteMetadata, v4RemoteShardPath } from "./remote-index"
 import { effectiveV4PathLayout, expectedV4PathLayout, V4_CONFIG_PATH, V4_ROOT, type V4RemoteConfig, type V4RemoteHead } from "./protocol-types"
@@ -998,6 +998,13 @@ export class V4SyncSession {
     const reconciled: V4IndexFileRecord[] = remote.records.filter(record => !includePath(record.path))
     for (const node of tree.tree) {
       if (node.type !== "blob" || node.path === V4_CONFIG_PATH || node.path.startsWith(`${V4_ROOT}/`)) continue
+      let normalizedPath: string
+      try {
+        normalizedPath = normalizeV4VaultPath(node.path)
+      } catch (error) {
+        throw new Error(`Unsafe external Git path: ${node.path}`, { cause: error })
+      }
+      if (normalizedPath !== node.path) throw new Error(`External Git path is not normalized: ${node.path}`)
       if (!includePath(node.path)) continue
       const file = await this.input.github.getFileBytes(node.path, remote.commitSha)
       if (!file) continue
