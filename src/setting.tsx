@@ -98,9 +98,8 @@ export class SettingTab extends PluginSettingTab {
       const saveBtn = btnContainer.createEl("button", { text: "Save changes", cls: "mod-cta" })
       saveBtn.onclick = async () => {
         if (this.tempSettings) {
-          this.plugin.settings = JSON.parse(JSON.stringify(this.tempSettings))
-          await this.plugin.saveSettings()
-          this.plugin.initGitHubClient()
+          const nextSettings = JSON.parse(JSON.stringify(this.tempSettings)) as PluginSettings
+          await this.plugin.saveSettings(nextSettings)
           this.plugin.updateStatusBar()
           new Notice("GitHub Sync: Settings saved")
           this.display()
