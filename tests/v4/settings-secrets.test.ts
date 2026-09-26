@@ -1237,3 +1237,25 @@ test("layout-ready startup callback is inert after plugin unload", async () => {
     /this.app.workspace.onLayoutReady(()s*=>s*{s*ifs*(this.unloaded)s*return[sS]*?setTimeout(()s*=>s*{s*ifs*(this.unloaded)s*return/u,
   )
 })
+
+
+test("settings save does not publish the new runtime generation before durable persistence succeeds", async () => {
+  const mainSource = await readFile("src/main.ts", "utf8");
+
+  assert.match(
+    mainSource,
+    /async saveSettings\([^)]*nextSettings[\s\S]*?const previousSettings\s*=\s*this\.settings[\s\S]*?await this\.v4Runtime\?\.quiesceForSettingsChange\(\)[\s\S]*?await this\.persistSettingsData\(preparedSettings\)[\s\S]*?this\.settings\s*=\s*preparedSettings[\s\S]*?credentialsChanged\(\)[\s\S]*?initGitHubClient\(\)/u,
+  );
+  assert.doesNotMatch(
+    mainSource,
+    /await this\.v4Runtime\?\.quiesceForSettingsChange\(\)[\s\S]*?this\.settings\s*=\s*nextSettings[\s\S]*?await this\.persistData\(\)/u,
+  );
+  assert.match(
+    mainSource,
+    /githubToken !== previousSettings\.githubToken[\s\S]*?createSecretId\("github-token"\)/u,
+  );
+  assert.match(
+    mainSource,
+    /encryptionPassphrase !== previousSettings\.encryptionPassphrase[\s\S]*?createSecretId\("encryption-passphrase"\)/u,
+  );
+});
