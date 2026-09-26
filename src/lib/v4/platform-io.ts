@@ -279,7 +279,7 @@ export function createV4PlatformIo(options: V4PlatformIoOptions): V4PlatformIo {
       }
       if (targetStat.size === commitOptions.expectedStageSize) {
         const hash = createV4IncrementalSha256()
-        for await (const chunk of desktopBoundedSource(target, commitOptions.expectedStageSize).chunks(4 * 1024 * 1024)) hash.update(chunk)
+        for await (const chunk of desktopBoundedSource(target, commitOptions.expectedStageSize, () => assertDesktopPathSafe(targetPath, true)).chunks(4 * 1024 * 1024)) hash.update(chunk)
         if (hash.digestHex() === commitOptions.expectedStageSha256) {
           await fs.rm(target, { force: true })
           await fs.rename(backup, target)
