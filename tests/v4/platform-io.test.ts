@@ -128,3 +128,65 @@ test("desktop stage cleanup removes an orphaned target backup after the staged f
   assert.deepEqual(new Uint8Array(await readFile(targetPath)), new Uint8Array([9, 8, 7, 6]));
   await assert.rejects(readFile(backupPath));
 });
+
+
+test("desktop stage rollback restores the original target from a backup-only crash state", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "v4-stage-rollback-missing-"));
+  const stagePath = path.join(root, "stage.bin");
+  const targetPath = path.join(root, "target.bin");
+  const backupPath = `${stagePath}.target-backup`;
+  await writeFile(stagePath, new Uint8Array([9, 8, 7, 6]));
+  await writeFile(backupPath, new Uint8Array([1, 2, 3]));
+
+  const io = createV4PlatformIo({ platform: "desktop", resolveDesktopPath: value => value });
+  await io.rollbackStage(stagePath, targetPath, {
+    expectedTarget: { exists: true, size: 3 },
+    expectedStageSize: 4,
+    expectedStageSha256: "63d987d1c6d69751c17297f410f5b3547a65d096a8993b35bcb4f9cad054f176",
+  });
+
+  assert.deepEqual(new Uint8Array(await readFile(targetPath)), new Uint8Array([1, 2, 3]));
+  await assert.rejects(readFile(backupPath));
+  assert.deepEqual(new Uint8Array(await readFile(stagePath)), new Uint8Array([9, 8, 7, 6]));
+});
+
+test("desktop stage rollback restores the original target when staged bytes reached target but receipt did not", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "v4-stage-rollback-moved-"));
+  const stagePath = path.join(root, "stage.bin");
+  const targetPath = path.join(root, "target.bin");
+  const backupPath = `${stagePath}.target-backup`;
+  await writeFile(targetPath, new Uint8Array([9, 8, 7, 6]));
+  await writeFile(backupPath, new Uint8Array([1, 2, 3]));
+
+  const io = createV4PlatformIo({ platform: "desktop", resolveDesktopPath: value => value });
+  await io.rollbackStage(stagePath, targetPath, {
+    expectedTarget: { exists: true, size: 3 },
+    expectedStageSize: 4,
+    expectedStageSha256: "63d987d1c6d69751c17297f410f5b3547a65d096a8993b35bcb4f9cad054f176",
+  });
+
+  assert.deepEqual(new Uint8Array(await readFile(targetPath)), new Uint8Array([1, 2, 3]));
+  await assert.rejects(readFile(backupPath));
+});
+
+test("desktop stage rollback refuses to overwrite an unrelated target edit and preserves the backup", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "v4-stage-rollback-changed-"));
+  const stagePath = path.join(root, "stage.bin");
+  const targetPath = path.join(root, "target.bin");
+  const backupPath = `${stagePath}.target-backup`;
+  await writeFile(targetPath, new Uint8Array([4, 4, 4, 4, 4]));
+  await writeFile(backupPath, new Uint8Array([1, 2, 3]));
+
+  const io = createV4PlatformIo({ platform: "desktop", resolveDesktopPath: value => value });
+  await assert.rejects(
+    io.rollbackStage(stagePath, targetPath, {
+      expectedTarget: { exists: true, size: 3 },
+      expectedStageSize: 4,
+      expectedStageSha256: "63d987d1c6d69751c17297f410f5b3547a65d096a8993b35bcb4f9cad054f176",
+    }),
+    /target changed|rollback.*unsafe/iu,
+  );
+
+  assert.deepEqual(new Uint8Array(await readFile(targetPath)), new Uint8Array([4, 4, 4, 4, 4]));
+  assert.deepEqual(new Uint8Array(await readFile(backupPath)), new Uint8Array([1, 2, 3]));
+});
