@@ -249,3 +249,84 @@ test("v4 recovery delegates a large interrupted stage swap to the atomic platfor
   snapshot = (await store.load())!
   assert.deepEqual(snapshot.payload?.completedMutationIds, ["stage:interrupted"])
 });
+
+
+test("discarding replanned recovery rolls back unreceipted staged swaps before deleting stage residue", async () => {
+  const { discardV4RecoveryStages } = await import("../../src/lib/v4/recovery-store")
+  const stage = { stageId: "stage-replan", hash: "a".repeat(64), size: 10, mtime: 22 }
+  const mutation = {
+    id: "stage:replan",
+    kind: "stage-write" as const,
+    path: "note.md",
+    stage,
+    precondition: { path: "note.md", exists: true, size: 3, mtime: 1 },
+  }
+  const events: string[] = []
+  await discardV4RecoveryStages({
+    header: {
+      schemaVersion: 1,
+      generation: 1,
+      runId: "run",
+      phase: "replan-required",
+      expectedRemoteHead: "old",
+      integrity: "f".repeat(64),
+    },
+    payload: { mutations: [mutation], completedMutationIds: [] },
+  }, {
+    async listFiles() { return [] },
+    async read() { return new Uint8Array() },
+    async write() {},
+    async trash() {},
+    staging: {
+      beginStage: async () => { throw new Error("unused") },
+      stageSource: async () => { throw new Error("unused") },
+      open: async () => { throw new Error("unused") },
+      pathFor: () => "",
+      async remove(ref) { events.push(`remove:${ref.stageId}`) },
+    },
+    async rollbackStage(input) { events.push(`rollback:${input.stage.stageId}:${input.path}`) },
+  })
+
+  assert.deepEqual(events, ["rollback:stage-replan:note.md", "remove:stage-replan"])
+});
+
+test("discarding replanned recovery does not roll back a staged mutation with a durable receipt", async () => {
+  const { discardV4RecoveryStages } = await import("../../src/lib/v4/recovery-store")
+  const stage = { stageId: "stage-done", hash: "a".repeat(64), size: 10, mtime: 22 }
+  const events: string[] = []
+  await discardV4RecoveryStages({
+    header: {
+      schemaVersion: 1,
+      generation: 1,
+      runId: "run",
+      phase: "replan-required",
+      expectedRemoteHead: "old",
+      integrity: "f".repeat(64),
+    },
+    payload: {
+      mutations: [{
+        id: "stage:done",
+        kind: "stage-write",
+        path: "note.md",
+        stage,
+        precondition: { path: "note.md", exists: true, size: 3, mtime: 1 },
+      }],
+      completedMutationIds: ["stage:done"],
+    },
+  }, {
+    async listFiles() { return [] },
+    async read() { return new Uint8Array() },
+    async write() {},
+    async trash() {},
+    staging: {
+      beginStage: async () => { throw new Error("unused") },
+      stageSource: async () => { throw new Error("unused") },
+      open: async () => { throw new Error("unused") },
+      pathFor: () => "",
+      async remove(ref) { events.push(`remove:${ref.stageId}`) },
+    },
+    async rollbackStage() { events.push("rollback") },
+  })
+
+  assert.deepEqual(events, ["remove:stage-done"])
+});
