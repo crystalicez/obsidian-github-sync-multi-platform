@@ -5,7 +5,7 @@ import type { V4IndexFileRecord } from "./local-index"
 import { bucketForV4PathId, normalizeV4VaultPath, objectIdForV4File, opaqueV4ObjectPath, opaqueV4PackPath, pathIdForV4Path } from "./paths"
 import { PACK_MAX_ENTRY_BYTES } from "./pack-planner"
 import { V4_GITHUB_SAFE_CONTENT_MUTATIONS_PER_REVISION } from "./part-write-policy"
-import { effectiveV4PathLayout, V4_CONFIG_PATH, V4_HEAD_PATH, V4_ROOT, type V4RemoteConfig, type V4RemoteHead } from "./protocol-types"
+import { effectiveV4PathLayout, V4_CONFIG_PATH, V4_HEAD_PATH, V4_PBKDF2_ITERATIONS, V4_ROOT, type V4RemoteConfig, type V4RemoteHead } from "./protocol-types"
 import type { V4PreparedFile } from "./storage-codec"
 
 export interface V4RemoteShard {
@@ -13,7 +13,7 @@ export interface V4RemoteShard {
   records: Record<string, V4IndexFileRecord>
 }
 
-export const V4_MAX_KDF_ITERATIONS = 5_000_000
+export const V4_MAX_KDF_ITERATIONS = V4_PBKDF2_ITERATIONS
 export const V4_MAX_KDF_SALT_BYTES = 64
 const V4_PROTOCOL_TOKEN = /^[A-Za-z0-9_-]{1,128}$/u
 
