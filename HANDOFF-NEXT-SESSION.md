@@ -250,6 +250,13 @@ Audit method:
    - RED: `98fe2b8f636ceb5314ff3dab60d64cd90d85f71f`.
    - Fix: `5d9ad89d4717f3f3b81ed44d1d582edb8a76163c` requires a non-negative safe integer size on every `type:"blob"` tree entry before history/immutable-read consumers receive it.
 
+36. **HIGH fail-closed reconciliation — immutable external tree evidence could be silently weakened when a listed blob read returned missing.**
+   - External plaintext reconciliation first obtains a complete immutable Git tree and then reads each included blob at that exact commit.
+   - The old path used `if (!file) continue`, so a tree-listed blob whose immutable read unexpectedly returned `null` was omitted from reconstructed remote state instead of treated as contradictory/incomplete evidence.
+   - That could feed planning an artificial deletion/absence and allow later index/local mutation work to proceed from an incomplete external snapshot.
+   - RED: `0ec71b2f5a6d1420728f60094bedf35b1380cb41`.
+   - Fix: `52070098483524b029cca836d9e709060b88c38b` fails closed whenever immutable tree evidence says a scoped blob exists but its exact-commit file read is missing; the regression also asserts no local trash/delete and no index mutation occur.
+
 ### Audited surfaces with no new confirmed defect so far
 
 - secret migration/persistence: raw token/passphrase are removed before plugin data persistence and use Obsidian SecretStorage;
