@@ -5,6 +5,7 @@ import { readFile } from "node:fs/promises";
 import { modalButtons, Notice, resetModalTestState, TFile } from "obsidian";
 
 import { DEFAULT_SETTINGS } from "../../src/setting";
+import { assertPluginSettingsRuntimeSafe } from "../../src/lib/plugin-settings-validation";
 import type { GitHubCreateTreeEntry } from "../../src/lib/github-git-types";
 import { deriveV4Keyring } from "../../src/lib/v4/crypto";
 import { publishV4TreeChanges } from "../../src/lib/v4/git-tree-writer";
@@ -1184,5 +1185,37 @@ test("settings save validates ignore regex before quiescing or publishing a new 
   assert.match(
     settingsSource,
     /try\s*\{[\s\S]*?await this\.plugin\.saveSettings\(nextSettings\)[\s\S]*?Settings saved[\s\S]*?\}\s*catch\s*\(error\)[\s\S]*?Settings not saved/iu,
+  );
+});
+
+
+test("runtime settings validation fails closed on malformed persisted safety controls", () => {
+  const unsafeCases = [
+    { ...DEFAULT_SETTINGS, abortChangePercent: "abc" as unknown as number },
+    { ...DEFAULT_SETTINGS, syncPlugins: "false" as unknown as boolean },
+    { ...DEFAULT_SETTINGS, encryptionMode: "mystery" as unknown as "plaintext" },
+    { ...DEFAULT_SETTINGS, conflictPolicy: "overwrite" as unknown as "copy" },
+    { ...DEFAULT_SETTINGS, ignorePathRegex: 42 as unknown as string },
+    { ...DEFAULT_SETTINGS, githubBranch: 7 as unknown as string },
+  ];
+
+  for (const settings of unsafeCases) {
+    assert.throws(() => assertPluginSettingsRuntimeSafe(settings), /settings|invalid|malformed|unsafe/iu);
+  }
+
+  assert.doesNotThrow(() => assertPluginSettingsRuntimeSafe(DEFAULT_SETTINGS));
+});
+
+test("runtime and settings-save boundaries validate settings before any sync-generation mutation", async () => {
+  const mainSource = await readFile("src/main.ts", "utf8");
+  const runtimeSource = await readFile("src/lib/v4/runtime.ts", "utf8");
+
+  assert.match(
+    mainSource,
+    /async saveSettings\([^)]*nextSettings[\s\S]*?assertPluginSettingsRuntimeSafe\(nextSettings\)[\s\S]*?quiesceForSettingsChange/u,
+  );
+  assert.match(
+    runtimeSource,
+    /private async execute\([^)]*\)[\s\S]*?assertPluginSettingsRuntimeSafe\(this\.plugin\.settings\)[\s\S]*?githubClient/u,
   );
 });
