@@ -602,7 +602,7 @@ export class V4PluginRuntime {
             keyring,
             conflictPolicy: this.plugin.settings.conflictPolicy,
             abortChangePercent: this.plugin.settings.abortChangePercent,
-            askConflict: input => this.askConflict(input.path),
+            askConflict: input => this.askConflict(input.path, signal),
             includePath,
             runState,
             recoveryStore,
@@ -641,7 +641,7 @@ export class V4PluginRuntime {
           lastError = error
           if (error instanceof V4ChangeGuardError && !request.allowThresholdOverride && request.operation !== "normal") {
             this.progressStore.update({ phase: "blocked", currentPath: undefined, currentDirection: undefined })
-            const confirmed = await this.confirmThresholdOverride(error, request.operation)
+            const confirmed = await this.confirmThresholdOverride(error, request.operation, signal)
             if (!confirmed) throw new Error("Sync cancelled because the modification threshold was exceeded.")
             request.allowThresholdOverride = true
             casAttempt--
@@ -708,17 +708,21 @@ export class V4PluginRuntime {
     }
   }
 
-  private async askConflict(path: string): Promise<V4ConflictResolution> {
+  private async askConflict(path: string, signal: AbortSignal): Promise<V4ConflictResolution> {
     return new Promise(resolve => {
       const modal = new Modal(this.plugin.app)
       let settled = false
-      const finish = (resolution: V4ConflictResolution) => {
+      let onAbort: (() => void) | undefined
+      const settle = (resolution: V4ConflictResolution, close: boolean) => {
         if (settled) return
         settled = true
-        modal.close()
+        if (onAbort) signal.removeEventListener("abort", onAbort)
+        if (close) modal.close()
         resolve(resolution)
       }
-      modal.onClose = () => { if (!settled) { settled = true; resolve({ action: "ask" }) } }
+      const finish = (resolution: V4ConflictResolution) => settle(resolution, true)
+      onAbort = () => finish({ action: "ask" })
+      modal.onClose = () => settle({ action: "ask" }, false)
       modal.titleEl.setText("Resolve sync conflict")
       modal.contentEl.createEl("p", { text: `Both local and remote changed: ${path}` })
       const buttons = modal.contentEl.createDiv()
@@ -726,21 +730,34 @@ export class V4PluginRuntime {
       buttons.createEl("button", { text: "Use local" }).onclick = () => finish({ action: "use-local" })
       buttons.createEl("button", { text: "Use remote" }).onclick = () => finish({ action: "use-remote" })
       buttons.createEl("button", { text: "Cancel" }).onclick = () => finish({ action: "ask" })
+      if (signal.aborted) {
+        finish({ action: "ask" })
+        return
+      }
+      signal.addEventListener("abort", onAbort, { once: true })
       modal.open()
     })
   }
 
-  private async confirmThresholdOverride(error: V4ChangeGuardError, operation: "forcePush" | "forcePull"): Promise<boolean> {
+  private async confirmThresholdOverride(
+    error: V4ChangeGuardError,
+    operation: "forcePush" | "forcePull",
+    signal: AbortSignal,
+  ): Promise<boolean> {
     return new Promise(resolve => {
       const modal = new Modal(this.plugin.app)
       let settled = false
-      const finish = (value: boolean) => {
+      let onAbort: (() => void) | undefined
+      const settle = (value: boolean, close: boolean) => {
         if (settled) return
         settled = true
-        modal.close()
+        if (onAbort) signal.removeEventListener("abort", onAbort)
+        if (close) modal.close()
         resolve(value)
       }
-      modal.onClose = () => { if (!settled) { settled = true; resolve(false) } }
+      const finish = (value: boolean) => settle(value, true)
+      onAbort = () => finish(false)
+      modal.onClose = () => settle(false, false)
       modal.titleEl.setText("Modification threshold exceeded")
       modal.contentEl.createEl("p", { text: `${error.changePercent}% of logical files would change; the limit is ${error.thresholdPercent}%.` })
       modal.contentEl.createEl("p", { text: "Override the guard for this force operation only?" })
@@ -749,6 +766,11 @@ export class V4PluginRuntime {
       const confirm = buttons.createEl("button", { text: operation === "forcePush" ? "Override and force push" : "Override and force pull" })
       confirm.addClass("mod-warning")
       confirm.onclick = () => finish(true)
+      if (signal.aborted) {
+        finish(false)
+        return
+      }
+      signal.addEventListener("abort", onAbort, { once: true })
       modal.open()
     })
   }
