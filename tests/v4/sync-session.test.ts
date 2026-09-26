@@ -990,7 +990,6 @@ test("v4 plaintext matching-SHA sync rejects a self-consistent local cache that 
   const cachedRecord = Object.values(index.shards[bucket].records)[0];
   const originalFileId = cachedRecord.fileId;
   cachedRecord.fileId = "tampered-local-identity";
-  const { hashV4ShardRecords } = await import("../../src/lib/v4/shard-hash");
   const tamperedHash = await hashV4ShardRecords(Object.values(index.shards[bucket].records));
   index.shards[bucket].hash = tamperedHash;
   index.shardHashes[bucket] = tamperedHash;
@@ -2264,7 +2263,7 @@ test("v4 no-op reuses all 256 unchanged local index shards", async () => {
     index.shards[bucket] = { bucket, hash, records: { [pathId]: record } };
     vault.files.set(path, { bytes: enc("x"), mtime: 1 });
   }
-  index.remoteCommitSha = "commit-previous";
+  index.remoteCommitSha = "commit-noop";
   index.epoch = 1;
   index.generation = 1;
   const head: V4RemoteHead = { formatVersion: 4, mode: "plaintext", epoch: 1, generation: 1, journalId: "j1", shardHashes, updatedAt: 1, deviceId: "other" };
