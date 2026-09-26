@@ -110,6 +110,18 @@ Audit method:
    - Fix: `91a81da29e06da35ea09886645bb07543717674e` routes external history previews directly through the immutable commit tree/raw Git blob while plugin-authored history continues through the V4 storage codec and descriptor validation.
    - Fixture cleanup: `7a2818d0c2bfdcae6eb70d39bf8b108c1aa71a98` keeps legacy remote-index fixtures protocol-shaped under the stricter validator.
 
+14. **MEDIUM/HIGH integrity — raw Git Blob 200 responses were trusted without authenticating bytes against the requested object ID.**
+   - Contents fallback intentionally treats the Git Blob endpoint as canonical, but `getBlob()` previously returned any 200 `arrayBuffer` directly.
+   - A malformed/proxy-transformed 200 could therefore defeat the canonical fallback assumption.
+   - RED: `6d324737c23a1e4fbde51f8bbd089c7a6ef48d16`.
+   - Fix: `4f9b970f5db15fea65d91bcfc8e7140128e034cd` validates the requested Git object SHA, requires raw bytes, computes the Git blob SHA-1 over `blob <len>\0<bytes>`, and rejects mismatches or unavailable verification.
+
+15. **MEDIUM resource hardening refinement — initial PBKDF2 ceiling exceeded the writer contract.**
+   - The first KDF fix bounded remote iterations at 5,000,000, but the production writer emits exactly 600,000.
+   - Accepting >600,000 preserved an avoidable remote CPU-amplification range the writer never creates.
+   - RED refinement: `f07c06ee88bb5d5dc5f238292297dcfe2dacd4fb`.
+   - Fixes: `c14ffb89b79aae4287f762fbd8d82a86e61facd5`, `b093ad1cebbb10b11d4202471c52a73e252bc5fc`, `4a03d7954859d63064bfc2ece5c88518fafe3232` define one shared exact 600,000-iteration writer/reader contract.
+
 ### Audited surfaces with no new confirmed defect so far
 
 - secret migration/persistence: raw token/passphrase are removed before plugin data persistence and use Obsidian SecretStorage;
