@@ -78,23 +78,34 @@ export class V4HistoryService {
     if (descriptor.size > V4_HISTORY_PREVIEW_MAX_BYTES) {
       throw new Error(`V4 history preview exceeds the ${V4_HISTORY_PREVIEW_MAX_BYTES}-byte preview limit.`)
     }
-    const record = this.recordFromDescriptor(change, descriptor)
     const gitCommit = await this.input.github.getGitCommit(commit.sha)
+    this.assertCurrent()
     const parentSha = gitCommit.parentShas[0] ?? commit.parentShas[0]
     if (!change.after && !parentSha) throw new Error("Deleted version has no parent commit.")
     const versionCommit = change.after ? gitCommit : await this.input.github.getGitCommit(parentSha!)
+    this.assertCurrent()
     const tree = await this.input.github.getTreeAt(versionCommit.treeSha, true)
+    this.assertCurrent()
     if (tree.truncated) throw new Error("Historical Git tree is truncated; preview is unsafe.")
     const shas = new Map(tree.tree.filter(node => node.type === "blob").map(node => [node.path, node.sha]))
-    const bytes = await this.codec.read(record, async path => {
+    let bytes: Uint8Array
+    if (change.source === "external") {
+      const sha = shas.get(descriptor.remotePath)
+      if (!sha) throw new Error(`Version blob is missing: ${descriptor.remotePath}`)
+      bytes = await this.input.github.getBlob(sha)
       this.assertCurrent()
-      const sha = shas.get(path)
-      if (!sha) throw new Error(`Version blob is missing: ${path}`)
-      const blob = await this.input.github.getBlob(sha)
+    } else {
+      const record = this.recordFromDescriptor(change, descriptor)
+      bytes = await this.codec.read(record, async path => {
+        this.assertCurrent()
+        const sha = shas.get(path)
+        if (!sha) throw new Error(`Version blob is missing: ${path}`)
+        const blob = await this.input.github.getBlob(sha)
+        this.assertCurrent()
+        return blob
+      })
       this.assertCurrent()
-      return blob
-    })
-    this.assertCurrent()
+    }
     const ext = extension(change.path)
     if (TEXT_EXTENSIONS.has(ext) && bytes.byteLength <= 5 * 1024 * 1024) return { kind: "text", text: bytesToUtf8(bytes), bytes }
     if (IMAGE_MIME[ext]) return { kind: "image", mime: IMAGE_MIME[ext], bytes }
