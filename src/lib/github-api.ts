@@ -29,6 +29,12 @@ function requiredGitHubString(value: unknown, label: string): string {
   return value;
 }
 
+function requiredGitObjectSha(value: unknown, label: string): string {
+  const sha = requiredGitHubString(value, label);
+  if (!GIT_COMMIT_SHA.test(sha)) throw new Error(`Malformed GitHub response: invalid ${label}.`);
+  return sha;
+}
+
 export interface GitHubConfig {
   owner: string;
   repo: string;
@@ -213,7 +219,7 @@ export class GitHubClient {
 
       if (response.status === 200) {
         const json = response.json as { content?: string; encoding?: string; sha?: string };
-        const sha = json.sha ?? "";
+        const sha = requiredGitObjectSha(json.sha, "Contents blob SHA");
         if (json.encoding === "base64" && typeof json.content === "string") {
           let decoded: Uint8Array | undefined;
           try {
@@ -222,15 +228,12 @@ export class GitHubClient {
             decoded = undefined;
           }
           if (decoded) {
-            let verified = true;
-            if (/^[0-9a-f]{40}$/u.test(sha)) {
-              try { verified = await this.gitBlobSha1(decoded) === sha; } catch { verified = false; }
-            }
+            let verified = false;
+            try { verified = await this.gitBlobSha1(decoded) === sha; } catch { verified = false; }
             if (verified) return { bytes: decoded, sha };
           }
         }
-        if (sha) return { bytes: await this.getBlob(sha), sha };
-        throw new Error(`GitHub Contents response has no decodable payload for ${path}.`);
+        return { bytes: await this.getBlob(sha), sha };
       }
       if (response.status === 404) {
         return GIT_COMMIT_SHA.test(ref) ? this.getImmutableFileFromTree(path, ref) : null;
