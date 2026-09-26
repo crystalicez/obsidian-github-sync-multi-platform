@@ -41,6 +41,8 @@ export function assertV4RemoteRecordDescriptor(record: V4IndexFileRecord, config
   }
   if (normalized !== record.path) throw new Error(`V4 remote record path is not normalized: ${record.path}`)
   if (!record.fileId) throw new Error("V4 remote record has an empty fileId.")
+  if (!/^[0-9a-f]{64}$/u.test(record.plaintextSha256)) throw new Error("V4 remote record plaintext hash is invalid.")
+  if (!V4_PROTOCOL_TOKEN.test(record.remoteVersion)) throw new Error("V4 remote record version is invalid.")
   if (!Number.isSafeInteger(record.size) || record.size < 0) throw new Error("V4 remote record size is invalid.")
   if (!Number.isFinite(record.mtime)) throw new Error("V4 remote record mtime is invalid.")
   if (typeof record.remotePath !== "string" || !record.remotePath) throw new Error("V4 remote record path descriptor is invalid.")
@@ -74,7 +76,6 @@ export function assertV4RemoteRecordDescriptor(record: V4IndexFileRecord, config
     if (record.size > V4_GITHUB_SAFE_CONTENT_MUTATIONS_PER_REVISION * V4_PART_BYTES) {
       throw new Error("V4 chunked storage exceeds the writer size budget.")
     }
-    if (!V4_PROTOCOL_TOKEN.test(record.remoteVersion)) throw new Error("V4 chunked storage has an unsafe remote version.")
     if (record.partPaths.some(path => typeof path !== "string" || !path)) throw new Error("V4 chunked storage has invalid part paths.")
     if (config.mode === "plaintext") {
       const expected = buildV4PartPaths({
