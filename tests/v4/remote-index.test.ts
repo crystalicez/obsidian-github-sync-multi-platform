@@ -258,3 +258,33 @@ test("v4 remote records reject local-only cache flags", async () => {
     );
   }
 });
+
+
+test("v4 remote shard rejects local-only dirty/deleted flags even when canonical record hash would ignore them", async () => {
+  const config: V4RemoteConfig = { formatVersion: 4, mode: "plaintext", repoId: "o/r#main", pathLayout: "plaintext-v1" };
+  const path = "note.md";
+  const pathId = await sha256Hex(utf8ToBytes(`path:${path}`));
+  const base = {
+    path,
+    pathId,
+    fileId: "file-a",
+    plaintextSha256: "a".repeat(64),
+    size: 1,
+    mtime: 1,
+    remoteVersion: "v1",
+    remotePath: path,
+    storage: "single" as const,
+  };
+
+  for (const [label, record] of [
+    ["dirty", { ...base, dirty: false }],
+    ["deleted", { ...base, deleted: true }],
+  ] as const) {
+    const bytes = utf8ToBytes(JSON.stringify({ bucket: pathId.slice(0, 2), records: { [pathId]: record } }));
+    await assert.rejects(
+      () => decodeV4RemoteShard(bytes, pathId.slice(0, 2), config),
+      /local-only|dirty|deleted|remote record/iu,
+      label,
+    );
+  }
+});
