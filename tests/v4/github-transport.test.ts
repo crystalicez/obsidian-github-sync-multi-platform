@@ -858,3 +858,38 @@ test("GitHub ref boundaries reject valid-looking 2xx responses for the wrong bra
 
   setRequestUrlHandler(null);
 });
+
+
+test("GitHub tree boundary rejects duplicate logical paths", async () => {
+  setRequestUrlHandler(async (options: unknown) => {
+    const request = options as Record<string, any>;
+    if (request.url.includes("/git/trees/")) {
+      return {
+        status: 200,
+        text: "",
+        headers: {},
+        json: {
+          sha: "a".repeat(40),
+          truncated: false,
+          tree: [
+            { path: "dup.md", mode: "100644", type: "blob", sha: "b".repeat(40), size: 1, url: "" },
+            { path: "dup.md", mode: "100644", type: "blob", sha: "c".repeat(40), size: 2, url: "" },
+          ],
+        },
+      };
+    }
+    throw new Error(`Unexpected request: ${request.method} ${request.url}`);
+  });
+  try {
+    const client = new GitHubClient(
+      { token: "token", owner: "owner", repo: "repo", branch: "main" },
+      { transportPolicy: { mutationSpacingMs: 0 } },
+    );
+    await assert.rejects(
+      () => client.getTreeAt("a".repeat(40), true),
+      /duplicate.*tree.*path|tree.*duplicate.*path|malformed/iu,
+    );
+  } finally {
+    setRequestUrlHandler(null);
+  }
+});
