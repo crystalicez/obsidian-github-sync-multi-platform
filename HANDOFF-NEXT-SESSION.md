@@ -328,6 +328,14 @@ Audit method:
    - Shared branch validation now rejects Git-invalid/dangerous ref syntax while preserving ordinary slash-separated branches such as `feature/local-release-qualification`; both settings validation and direct `GitHubClient` construction enforce it.
    - Compatibility correction: persisted/settings-layer `githubBranch: ""` historically means “use main” via the existing `githubBranch || "main"` fallback. RED `48e682490739b415cb75fc82a5ba76d576519383`; fixes `4a340753dfa0fb5e1780c3a4ab49ade6f458f536`, `7456e4e1321df1c87c5b0d98829e028066ccf902` allow empty only at the settings-validation layer while direct `GitHubClient` construction still requires a non-empty safe branch.
 
+46. **MEDIUM/HIGH integrity/resource safety — whole-buffer V4 reads did not enforce the record's declared plaintext size.**
+   - `V4StorageCodec.read()` verified plaintext hashes for single/chunked content but did not compare the returned plaintext byte length to `record.size`.
+   - Conflict/history paths choose whole-buffer behavior partly from metadata size; a forged but internally hash-consistent record could under-report size and feed more bytes into a path the writer never produces.
+   - Streaming `readToSink()` already enforced size, so behavior was inconsistent across readers.
+   - RED: `90c19b14b2ff8385b392cc89c79023410ae6b49a`.
+   - Fix: `b5d4af4091e23cfd2bdf5bbbce30375423db9608` requires actual plaintext length to equal `record.size` for single/chunked whole-buffer reads before returning bytes.
+   - Residual transport limitation remains unchanged: Obsidian `requestUrl` can buffer an unexpectedly large HTTP body before this post-receipt validation runs.
+
 ### Audited surfaces with no new confirmed defect so far
 
 - secret migration/persistence: raw token/passphrase are removed before plugin data persistence and use Obsidian SecretStorage;
