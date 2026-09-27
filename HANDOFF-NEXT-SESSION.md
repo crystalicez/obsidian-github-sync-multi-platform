@@ -297,6 +297,14 @@ Audit method:
    - Runtime now enters a settings-transition gate before cancelling/awaiting active work, blocks new manual/startup/scheduled/force/history work while the transition is active, cancels pending coordinator work, records in-scope local events for a post-transition rescan, and releases the gate in `finally` whether durable persistence succeeds or fails.
    - Startup and scheduled callbacks capture the settings generation that created the timer and no-op if that generation is stale.
 
+42. **MEDIUM/HIGH credential/request-boundary safety — GitHub owner/repository settings could alter REST paths before repository identity checks.**
+   - `GitHubClient.baseUrl` interpolates owner/repository into `https://api.github.com/repos/<owner>/<repo>`.
+   - Branch/path/query components are encoded elsewhere, but owner/repository were free-form settings strings.
+   - Malformed persisted or clipboard-derived values containing slash/query/percent/dot-segment syntax could therefore change the PAT-bearing REST path inside GitHub's API before normal V4 repository-identity validation ran.
+   - RED: `c95c5ee000ed22d3097790785e35f6cd6e82545f`, `30d96a8c2098be66d85a931d1419fe0dfd1026ac`.
+   - Fixes: `e06085a02108b534b3d1a88bac84e68828086b77`, `70d9359b97c051d539bdb81f05fdfdf252a75de1`, `0a897eed3b17f71bdb47bf5907adb6c9f2d21e80`.
+   - A pure shared validator now restricts configured GitHub.com owner/repository coordinates to safe path-segment syntax; settings may still keep both fields empty while unconfigured, while direct `GitHubClient` construction requires valid non-empty coordinates.
+
 ### Audited surfaces with no new confirmed defect so far
 
 - secret migration/persistence: raw token/passphrase are removed before plugin data persistence and use Obsidian SecretStorage;
