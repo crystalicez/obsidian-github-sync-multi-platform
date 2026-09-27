@@ -342,8 +342,30 @@ export class GitHubClient {
     };
   }
 
+  private configuredRefName(): string {
+    return `refs/heads/${this.config.branch}`;
+  }
+
   private branchRefPath(): string {
     return this.config.branch.split("/").map(encodeURIComponent).join("/");
+  }
+
+  private parseConfiguredGitRef(value: unknown, expectedSha?: string): GitHubGitRef {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      throw new Error("Malformed GitHub response: branch ref is invalid.");
+    }
+    const json = value as { ref?: unknown; object?: { sha?: unknown; type?: unknown } };
+    const ref = requiredGitHubString(json.ref, "git ref name");
+    if (ref !== this.configuredRefName()) {
+      throw new Error(`Malformed GitHub response: unexpected branch ref name ${ref}.`);
+    }
+    const sha = requiredGitObjectSha(json.object?.sha, "git ref SHA");
+    if (expectedSha !== undefined && sha !== requiredGitObjectSha(expectedSha, "expected git ref SHA")) {
+      throw new Error("Malformed GitHub response: git ref mutation SHA does not match the requested commit.")
+    }
+    const type = requiredGitHubString(json.object?.type, "git ref object type");
+    if (type !== "commit") throw new Error(`Malformed GitHub response: branch ref points to unsupported object type ${type}.`);
+    return { ref, sha, type };
   }
 
   private gitHttpError(action: string, status: number, text: string): Error & { status?: number } {
@@ -360,11 +382,7 @@ export class GitHubClient {
       throw: false,
     });
     if (response.status !== 200) throw this.gitHttpError("Failed to get git ref", response.status, response.text);
-    const json = response.json as { ref?: string; object?: { sha?: string; type?: string } };
-    const sha = requiredGitObjectSha(json.object?.sha, "git ref SHA");
-    const type = requiredGitHubString(json.object?.type, "git ref object type");
-    if (type !== "commit") throw new Error(`Malformed GitHub response: branch ref points to unsupported object type ${type}.`);
-    return { ref: requiredGitHubString(json.ref, "git ref name"), sha, type };
+    return this.parseConfiguredGitRef(response.json);
   }
 
   async getGitRefOrNull(): Promise<GitHubGitRef | null> {
@@ -525,22 +543,26 @@ export class GitHubClient {
   }
 
   async updateGitRef(sha: string, _expectedSha?: string): Promise<void> {
-    await this.mutationRequest({
+    const expectedSha = requiredGitObjectSha(sha, "updated git ref SHA");
+    const response = await this.mutationRequest({
       options: { url: `${this.baseUrl}/git/refs/heads/${this.branchRefPath()}`, method: "PATCH", headers: this.headers, throw: false },
-      bodyValue: { sha, force: false },
+      bodyValue: { sha: expectedSha, force: false },
       retryClass: "reachable-ref",
       successStatuses: [200],
       action: "Failed to update git ref",
     });
+    this.parseConfiguredGitRef(response.json, expectedSha);
   }
 
   async createGitRef(sha: string): Promise<void> {
-    await this.mutationRequest({
+    const expectedSha = requiredGitObjectSha(sha, "created git ref SHA");
+    const response = await this.mutationRequest({
       options: { url: `${this.baseUrl}/git/refs`, method: "POST", headers: this.headers, throw: false },
-      bodyValue: { ref: `refs/heads/${this.config.branch}`, sha },
+      bodyValue: { ref: this.configuredRefName(), sha: expectedSha },
       retryClass: "reachable-ref",
       successStatuses: [201],
       action: "Failed to create git ref",
     });
+    this.parseConfiguredGitRef(response.json, expectedSha);
   }
 }
