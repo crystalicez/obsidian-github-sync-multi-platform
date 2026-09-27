@@ -39,7 +39,7 @@ test("GitHubClient reads historical trees and can create a branch ref", async ()
   setRequestUrlHandler(async (options: unknown) => {
     const request = options as Record<string, any>;
     requests.push(request);
-    if (request.method === "POST") return { status: 201, text: "", headers: {}, json: { ref: "refs/heads/v4", object: { sha: "3333333333333333333333333333333333333333" } } };
+    if (request.method === "POST") return { status: 201, text: "", headers: {}, json: { ref: "refs/heads/v4", object: { sha: "3333333333333333333333333333333333333333", type: "commit" } } };
     return { status: 200, text: "", headers: {}, json: { sha: "4444444444444444444444444444444444444444", url: "", tree: [], truncated: false } };
   });
   try {
@@ -260,7 +260,12 @@ test("GitHubClient creates a configured custom branch after empty-repository boo
         ? { status: 404, text: "missing", headers: {}, json: {} }
         : { status: 200, text: "", headers: {}, json: { ref: "refs/heads/v4-sync", object: { sha: "cccccccccccccccccccccccccccccccccccccccc", type: "commit" } } };
     }
-    if (request.method === "POST" && request.url.endsWith("/git/refs")) return { status: 201, text: "", headers: {}, json: {} };
+    if (request.method === "POST" && request.url.endsWith("/git/refs")) return {
+      status: 201,
+      text: "",
+      headers: {},
+      json: { ref: "refs/heads/v4-sync", object: { sha: "cccccccccccccccccccccccccccccccccccccccc", type: "commit" } },
+    };
     throw new Error(`Unexpected request: ${request.method} ${request.url}`);
   });
   try {
