@@ -1368,6 +1368,15 @@ test("startup and scheduled callbacks are bound to the settings generation that 
 });
 
 
+test("runtime settings preserve the legacy empty-branch fallback to main", () => {
+  assert.doesNotThrow(() => assertPluginSettingsRuntimeSafe({
+    ...DEFAULT_SETTINGS,
+    githubOwner: "owner",
+    githubRepo: "repo",
+    githubBranch: "",
+  }));
+});
+
 test("runtime settings reject unsafe Git branch/ref syntax before requests", () => {
   for (const githubBranch of [
     "../main",
