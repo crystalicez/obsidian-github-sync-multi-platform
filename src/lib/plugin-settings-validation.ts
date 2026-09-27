@@ -1,4 +1,4 @@
-import { assertSafeGitHubRepositoryCoordinates } from "./github-config"
+import { assertSafeGitHubBranch, assertSafeGitHubRepositoryCoordinates } from "./github-config"
 import { compileV4IgnorePathRegex } from "./v4/ignore"
 
 type RuntimeSettings = Record<string, unknown>
@@ -33,8 +33,9 @@ export function assertPluginSettingsRuntimeSafe(value: unknown): void {
 
   const githubOwner = requireString(settings, "githubOwner")
   const githubRepo = requireString(settings, "githubRepo")
-  requireString(settings, "githubBranch")
+  const githubBranch = requireString(settings, "githubBranch")
   assertSafeGitHubRepositoryCoordinates(githubOwner, githubRepo, { allowEmpty: true })
+  assertSafeGitHubBranch(githubBranch)
   requireString(settings, "vault")
   const ignorePathRegex = requireString(settings, "ignorePathRegex")
   compileV4IgnorePathRegex(ignorePathRegex)
