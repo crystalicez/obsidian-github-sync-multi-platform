@@ -318,11 +318,14 @@ export class GitHubClient {
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("Malformed GitHub response: tree response is invalid.");
     if (!Array.isArray(raw.tree)) throw new Error("Malformed GitHub response: tree entries are not an array.");
     if (typeof raw.truncated !== "boolean") throw new Error("Malformed GitHub response: tree truncated flag is not boolean.");
+    const seenPaths = new Set<string>();
     const tree = raw.tree.map((entry, index) => {
       if (!entry || typeof entry !== "object" || Array.isArray(entry)) throw new Error(`Malformed GitHub response: tree entry ${index} is invalid.`);
-      if (typeof entry.path !== "string" || typeof entry.mode !== "string" || typeof entry.sha !== "string" || !GIT_COMMIT_SHA.test(entry.sha)) {
+      if (typeof entry.path !== "string" || entry.path.length === 0 || typeof entry.mode !== "string" || typeof entry.sha !== "string" || !GIT_COMMIT_SHA.test(entry.sha)) {
         throw new Error(`Malformed GitHub response: tree entry ${index} fields are invalid.`);
       }
+      if (seenPaths.has(entry.path)) throw new Error(`Malformed GitHub response: duplicate tree path ${entry.path}.`);
+      seenPaths.add(entry.path);
       if (entry.type !== "blob" && entry.type !== "tree" && entry.type !== "commit") {
         throw new Error(`Malformed GitHub response: tree entry ${index} type is invalid.`);
       }
