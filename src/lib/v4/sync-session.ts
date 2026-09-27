@@ -535,10 +535,12 @@ export class V4SyncSession {
       }
     }
 
+    await this.stagePackedPullGroups(batch.pulls, ownedStages, prefetchedRemoteBodies)
+
     for (const stagedCopy of stagedCopyPulls) {
       const remoteRecord = stagedCopy.pull.remoteRecord!
       const prefetched = prefetchedRemoteBodies.get(remoteRecord.fileId)
-      const stage = prefetched
+      const stage = stagedCopy.pull.stage ?? (prefetched
         ? await this.stageBytes(prefetched, remoteRecord.mtime, stagedCopy.pull.change.before?.size ?? 0, ownedStages)
         : remoteRecord.storage === "chunked" || remoteRecord.size > DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES
           ? await this.stageRemotePull(stagedCopy.pull, ownedStages)
@@ -547,7 +549,7 @@ export class V4SyncSession {
               remoteRecord.mtime,
               stagedCopy.pull.change.before?.size ?? 0,
               ownedStages,
-            )
+            ))
       stagedCopy.pull.stage = stage
       if (stagedCopy.push) stagedCopy.push.source = this.stageHandle(stage)
       if (this.input.runState) {
@@ -1297,6 +1299,55 @@ export class V4SyncSession {
     if (source.kind === "vault") return this.readLocal(source.path)
     const stage: V4StageRef = { stageId: source.stageId, hash: source.expectedHash, size: source.expectedSize, mtime: after.mtime }
     return this.readStage(stage)
+  }
+
+  private async stagePackedPullGroups(
+    bindings: readonly V4PullBinding[],
+    ownedStages: V4StageRef[],
+    prefetchedRemoteBodies: ReadonlyMap<string, Uint8Array>,
+  ): Promise<void> {
+    const groups = new Map<string, V4PullBinding[]>()
+    for (const binding of bindings) {
+      if (binding.stage || binding.change.kind === "delete") continue
+      const record = binding.remoteRecord
+      if (!record || record.storage !== "pack" || !record.packId) continue
+      const prefetched = prefetchedRemoteBodies.get(record.fileId)
+      if (prefetched) {
+        this.report({ phase: "downloading", currentPath: binding.change.path, currentDirection: "pull" })
+        binding.stage = await this.stageBytes(prefetched, record.mtime, binding.change.before?.size ?? 0, ownedStages)
+        continue
+      }
+      const key = `${binding.remoteCommitSha ?? ""}\0${record.packId}\0${record.remotePath}`
+      const group = groups.get(key) ?? []
+      group.push(binding)
+      groups.set(key, group)
+    }
+
+    for (const group of groups.values()) {
+      const first = group[0]
+      const firstRecord = first.remoteRecord!
+      const records = group.map(binding => binding.remoteRecord!)
+      const budget = estimateV4PackGroupResources(records.map(record => ({
+        fileId: record.fileId,
+        path: record.path,
+        size: record.size,
+      })))
+      await this.resources.withResidentBytes(budget.residentBytes, async () => {
+        this.report({ phase: "downloading", currentPath: first.change.path, currentDirection: "pull" })
+        const entries = await this.codec.readPackRecords(records, async path => {
+          const file = await this.input.github.getFileBytes(path, first.remoteCommitSha)
+          if (!file) throw new Error(`Missing V4 remote object: ${path}`)
+          return file.bytes
+        }, this.input.signal)
+        for (const binding of group) {
+          const record = binding.remoteRecord!
+          const bytes = entries.get(record.fileId)
+          if (!bytes) throw new Error(`V4 packed entry is missing after verified decode: ${record.fileId}`)
+          this.report({ phase: "downloading", currentPath: binding.change.path, currentDirection: "pull" })
+          binding.stage = await this.stageBytes(bytes, record.mtime, binding.change.before?.size ?? 0, ownedStages)
+        }
+      }, this.input.signal)
+    }
   }
 
   private async stageRemotePull(binding: V4PullBinding, ownedStages: V4StageRef[]): Promise<V4StageRef> {
