@@ -320,6 +320,13 @@ Audit method:
    - RED: `d6f4348979a876ae6c4aa83700b96028a719e124`.
    - Fix: `9c11d0a2b26566110d205c22d38b36e46a0359d8` rejects empty and duplicate tree paths before any sync/history consumer receives the response.
 
+45. **MEDIUM/HIGH request-boundary safety — GitHub branch settings were not validated as safe Git refs before REST-path construction.**
+   - Owner/repository coordinates already used a shared path-segment validator, but `githubBranch` was accepted as any string.
+   - Branch is used both as a Git ref body value and in `/git/ref/heads/<branch>`; dot-segments, empty segments, `.lock`, `@{`, backslash/control/Git-special syntax could reach PAT-bearing REST requests before repository identity checks.
+   - RED: `1b03b393a65ab4aa3c2d93763b3bf22de9716b9c`, `f49f664dd6bed74135a6aa3f01e28b4138be5b27`.
+   - Fixes: `13eb57c1920abb1d04d0bc937a8f8bdfbb456efe`, `183b9d89ef52c14da102fc2a0b87b2b08d00b0c0`, `772f3d024c63b2f5c68d8f08efff06373cd864f1`.
+   - Shared branch validation now rejects Git-invalid/dangerous ref syntax while preserving ordinary slash-separated branches such as `feature/local-release-qualification`; both settings validation and direct `GitHubClient` construction enforce it.
+
 ### Audited surfaces with no new confirmed defect so far
 
 - secret migration/persistence: raw token/passphrase are removed before plugin data persistence and use Obsidian SecretStorage;
