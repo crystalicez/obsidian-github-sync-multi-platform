@@ -305,6 +305,14 @@ Audit method:
    - Fixes: `e06085a02108b534b3d1a88bac84e68828086b77`, `70d9359b97c051d539bdb81f05fdfdf252a75de1`, `0a897eed3b17f71bdb47bf5907adb6c9f2d21e80`.
    - A pure shared validator now restricts configured GitHub.com owner/repository coordinates to safe path-segment syntax; settings may still keep both fields empty while unconfigured, while direct `GitHubClient` construction requires valid non-empty coordinates.
 
+43. **HIGH publication integrity — successful Git ref responses were not bound to the configured branch/target SHA.**
+   - `getGitRef()` validated object SHA/type but accepted any non-empty `ref` string.
+   - `updateGitRef()` and `createGitRef()` treated HTTP 200/201 as success without validating the returned ref name/object type/object SHA.
+   - `publishV4CandidateRef()` returns immediately on a successful mutation call; reconciliation runs only when the mutation throws. Therefore a malformed/wrong 2xx response could make publication appear successful without proving the configured branch points to the requested candidate.
+   - RED: `9422102bdc64c019890529852400b148f569f24c`.
+   - Fix: `ef657ebc2ddeeec003e403279881127abefa71d8` centralizes configured-ref parsing and requires exact `refs/heads/<configured branch>`, `type:"commit"`, and exact requested mutation SHA for successful ref creation/update/read.
+   - Fixture normalization: `8a9d29ab44713f5ee72733317a8f7c7b34ede63e` makes success fixtures reflect the actual GitHub ref response shape.
+
 ### Audited surfaces with no new confirmed defect so far
 
 - secret migration/persistence: raw token/passphrase are removed before plugin data persistence and use Obsidian SecretStorage;
