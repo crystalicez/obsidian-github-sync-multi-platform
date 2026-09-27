@@ -313,6 +313,13 @@ Audit method:
    - Fix: `ef657ebc2ddeeec003e403279881127abefa71d8` centralizes configured-ref parsing and requires exact `refs/heads/<configured branch>`, `type:"commit"`, and exact requested mutation SHA for successful ref creation/update/read.
    - Fixture normalization: `8a9d29ab44713f5ee72733317a8f7c7b34ede63e` makes success fixtures reflect the actual GitHub ref response shape.
 
+44. **MEDIUM/HIGH fail-closed Git evidence — recursive tree responses could contain duplicate logical paths and callers would silently choose/duplicate authority.**
+   - `getTreeAt()` validated individual entries but did not reject duplicate `path` values in one tree response.
+   - External reconciliation iterates every blob and could synthesize multiple records for one logical path; history converts tree entries to `Map(path -> node)` and would silently let a later duplicate replace the earlier one.
+   - Immutable path-directed fallback already rejects duplicate exact entries, so accepting duplicates in the recursive boundary was inconsistent fail-closed behavior.
+   - RED: `d6f4348979a876ae6c4aa83700b96028a719e124`.
+   - Fix: `9c11d0a2b26566110d205c22d38b36e46a0359d8` rejects empty and duplicate tree paths before any sync/history consumer receives the response.
+
 ### Audited surfaces with no new confirmed defect so far
 
 - secret migration/persistence: raw token/passphrase are removed before plugin data persistence and use Obsidian SecretStorage;
