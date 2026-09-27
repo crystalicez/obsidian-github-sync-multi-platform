@@ -175,3 +175,43 @@ test("v4 pack reader rejects writer-incompatible entry size before base64 alloca
     /pack.*size|entry.*size|encoded.*size/iu,
   );
 });
+
+
+test("v4 whole-buffer reads reject plaintext length that disagrees with remote metadata", async () => {
+  const codec = new V4StorageCodec({ mode: "plaintext", pathLayout: "plaintext-v1" });
+  const singleBytes = enc("oversized-single");
+  const singleRecord = {
+    pathId: "aa".padEnd(64, "0"),
+    fileId: "single-file",
+    plaintextSha256: await sha256Hex(singleBytes),
+    size: 1,
+    mtime: 1,
+    remoteVersion: "v1",
+    remotePath: "single.md",
+    storage: "single" as const,
+  };
+  await assert.rejects(
+    () => codec.read(singleRecord, async () => singleBytes),
+    /size mismatch/iu,
+  );
+
+  const chunkA = enc("abc");
+  const chunkB = enc("def");
+  const chunked = new Uint8Array([...chunkA, ...chunkB]);
+  const partPaths = [".obsidian-github-sync-v4/large/x/v1/000001.part", ".obsidian-github-sync-v4/large/x/v1/000002.part"];
+  const chunkRecord = {
+    pathId: "bb".padEnd(64, "0"),
+    fileId: "chunk-file",
+    plaintextSha256: await sha256Hex(chunked),
+    size: 2,
+    mtime: 1,
+    remoteVersion: "v1",
+    remotePath: partPaths[0],
+    storage: "chunked" as const,
+    partPaths,
+  };
+  await assert.rejects(
+    () => codec.read(chunkRecord, async path => path === partPaths[0] ? chunkA : chunkB),
+    /size mismatch/iu,
+  );
+});
