@@ -344,6 +344,12 @@ Audit method:
    - Fix: `54b5d26c71286362add3aad8ab948ec152bfdf81` rejects any wire record carrying local-only `dirty` or `deleted` properties before remote shard records become authority.
    - Local persisted shards may still contain those fields; they are separately content-verified and protocol-validated before cache reuse.
 
+48. **MEDIUM remote resource safety — aggregate pack groups were not constrained to writer limits.**
+   - Per-record pack validation enforced <=1 MiB entries, but `assertV4RemoteRecordSet()` did not limit how many records could share one `packId` or their aggregate plaintext size.
+   - The production writer caps a pack at 500 files and 32 MiB plaintext; accepting larger groups admitted remote states the writer cannot create and amplified repeated pack reads.
+   - RED: `2f1a268e26f2a08e4c8b388cc203b67925fd2e45`.
+   - Fix: `73dc49446e026de826000299201eddb9a6ff9a80` enforces `PACK_MAX_FILES` and `PACK_MAX_PLAINTEXT_BYTES` per remote pack group using the same writer constants.
+
 ### Audited surfaces with no new confirmed defect so far
 
 - secret migration/persistence: raw token/passphrase are removed before plugin data persistence and use Obsidian SecretStorage;
