@@ -459,22 +459,61 @@ export class V4StorageCodec {
     return { plaintextSha256, size: total }
   }
 
+  async readPackRecords(
+    records: readonly V4FileRecord[],
+    reader: V4RemoteBytesReader,
+    signal: AbortSignal | undefined = this.options.signal,
+  ): Promise<Map<string, Uint8Array>> {
+    throwIfV4Aborted(signal)
+    if (this.options.mode !== "encrypted" || !this.options.keyring || records.length === 0) {
+      throw new Error("Invalid V4 pack record group.")
+    }
+    const first = records[0]
+    if (first.storage !== "pack" || !first.packId || !first.remotePath) throw new Error("Invalid V4 pack record.")
+    const packId = first.packId
+    const remotePath = first.remotePath
+    const fileIds = new Set<string>()
+    for (const record of records) {
+      if (record.storage !== "pack" || record.packId !== packId || record.remotePath !== remotePath) {
+        throw new Error("V4 pack record group is inconsistent.")
+      }
+      if (fileIds.has(record.fileId)) throw new Error(`Duplicate V4 packed fileId: ${record.fileId}`)
+      fileIds.add(record.fileId)
+    }
+
+    const payload = await reader(remotePath)
+    throwIfV4Aborted(signal)
+    const archive = await this.crypto(() => decryptV4Payload(this.options.keyring!.contentKey, payload, { kind: "pack", aad: packId }))
+    let parsed: unknown
+    try { parsed = JSON.parse(bytesToUtf8(archive)) } catch { throw new Error("V4 pack archive JSON is invalid.") }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("V4 pack archive is invalid.")
+    const candidate = parsed as { version?: unknown; entries?: unknown }
+    if (candidate.version !== 1 || !candidate.entries || typeof candidate.entries !== "object" || Array.isArray(candidate.entries)) {
+      throw new Error("V4 pack archive is invalid.")
+    }
+    const entries = candidate.entries as Record<string, unknown>
+    const output = new Map<string, Uint8Array>()
+    for (const record of records) {
+      const encoded = entries[record.fileId]
+      if (typeof encoded !== "string") throw new Error(`V4 pack entry is missing: ${record.fileId}`)
+      const expectedEncodedLength = 4 * Math.ceil(record.size / 3)
+      if (encoded.length !== expectedEncodedLength) throw new Error("V4 packed entry size is inconsistent with its record.")
+      let plaintext: Uint8Array
+      try { plaintext = fromBase64(encoded) } catch { throw new Error("V4 packed entry base64 is invalid.") }
+      if (plaintext.byteLength !== record.size) throw new Error("V4 packed entry size is inconsistent with its record.")
+      if (record.plaintextSha256 && await this.crypto(() => sha256Hex(plaintext)) !== record.plaintextSha256) {
+        throw new Error("V4 packed content hash mismatch.")
+      }
+      output.set(record.fileId, plaintext)
+    }
+    return output
+  }
+
   async read(record: V4FileRecord, reader: V4RemoteBytesReader, signal: AbortSignal | undefined = this.options.signal): Promise<Uint8Array> {
     throwIfV4Aborted(signal)
     if (record.storage === "pack") {
-      if (this.options.mode !== "encrypted" || !record.packId) throw new Error("Invalid V4 pack record.")
-      const payload = await reader(record.remotePath)
-      throwIfV4Aborted(signal)
-      const archive = await this.crypto(() => decryptV4Payload(this.options.keyring!.contentKey, payload, { kind: "pack", aad: record.packId! }))
-      const parsed = JSON.parse(bytesToUtf8(archive)) as { version?: number; entries?: Record<string, string> }
-      const encoded = parsed.version === 1 ? parsed.entries?.[record.fileId] : undefined
-      if (!encoded) throw new Error(`V4 pack entry is missing: ${record.fileId}`)
-      const expectedEncodedLength = 4 * Math.ceil(record.size / 3)
-      if (encoded.length !== expectedEncodedLength) throw new Error("V4 packed entry size is inconsistent with its record.")
-      const plaintext = fromBase64(encoded)
-      if (plaintext.byteLength !== record.size) throw new Error("V4 packed entry size is inconsistent with its record.")
-      if (record.plaintextSha256 && await this.crypto(() => sha256Hex(plaintext)) !== record.plaintextSha256) throw new Error("V4 packed content hash mismatch.")
-      return plaintext
+      const entries = await this.readPackRecords([record], reader, signal)
+      return entries.get(record.fileId)!
     }
     if (record.storage === "single") {
       const bytes = await reader(record.remotePath)
