@@ -1,6 +1,7 @@
 import { requestUrl, type RequestUrlParam, type RequestUrlResponse } from "obsidian";
 import { fromBase64, toBase64, toHex, utf8ToBytes } from "./bytes";
 import type { GitHubCreateTreeEntry, GitHubGitCommit, GitHubGitRef } from "./github-git-types";
+import { assertSafeGitHubRepositoryCoordinates } from "./github-config";
 import { V4RepositoryBootstrapRaceError } from "./v4/bootstrap-race";
 import {
   canRetryV4MutationAfterUnknownOutcome,
@@ -94,6 +95,7 @@ export class GitHubClient {
   private operationSignal?: AbortSignal;
 
   constructor(config: GitHubConfig, options: GitHubClientOptions = {}) {
+    assertSafeGitHubRepositoryCoordinates(config.owner, config.repo);
     this.config = config;
     this.transportPolicy = resolveV4TransportPolicy(options.transportPolicy);
     this.transportMetrics = options.transportMetrics ?? new V4TransportMetrics();
