@@ -800,3 +800,18 @@ test("GitHub tree rejects blob entries that omit byte size", async () => {
     /tree entry.*size|blob.*size/iu,
   );
 });
+
+
+test("GitHub client rejects unsafe owner and repository URL path segments before requests", () => {
+  for (const config of [
+    { token: "t", owner: "../user", repo: "repo", branch: "main" },
+    { token: "t", owner: "owner/name", repo: "repo", branch: "main" },
+    { token: "t", owner: "owner", repo: "../repo", branch: "main" },
+    { token: "t", owner: "owner", repo: "repo/contents", branch: "main" },
+    { token: "t", owner: "owner", repo: "repo?x=1", branch: "main" },
+    { token: "t", owner: "owner", repo: "%2f", branch: "main" },
+  ]) {
+    assert.throws(() => new GitHubClient(config), /owner|repository|unsafe|invalid/iu);
+  }
+  assert.doesNotThrow(() => new GitHubClient({ token: "t", owner: "crystalicez", repo: "obsidian-github_sync.multi-platform", branch: "main" }));
+});
