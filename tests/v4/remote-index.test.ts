@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { sha256Hex } from "../../src/lib/bytes";
+import { opaqueV4PackPath, pathIdForV4Path } from "../../src/lib/v4/paths";
+import { PACK_MAX_ENTRY_BYTES, PACK_MAX_FILES, PACK_MAX_PLAINTEXT_BYTES } from "../../src/lib/v4/pack-planner";
 import { deriveV4Keyring } from "../../src/lib/v4/crypto";
 import { assertV4RemoteRecordSet, buildV4RemoteMetadata, decodeV4RemoteConfig, decodeV4RemoteHead, decodeV4RemoteShard, encodeV4RemoteConfig } from "../../src/lib/v4/remote-index";
 import { expectedV4PathLayout, V4_FORMAT_VERSION, type V4RemoteConfig, type V4RemoteHead } from "../../src/lib/v4/protocol-types";
@@ -287,4 +289,51 @@ test("v4 remote shard rejects local-only dirty/deleted flags even when canonical
       label,
     );
   }
+});
+
+
+test("v4 remote record set rejects pack groups larger than the writer can produce", async () => {
+  const repoId = "o/r#main";
+  const keyring = await deriveV4Keyring({ passphrase: "pass", repoId, salt: enc("salt"), iterations: 10 });
+  const config: V4RemoteConfig = {
+    formatVersion: 4,
+    mode: "encrypted",
+    repoId,
+    pathLayout: "opaque-stable-v1",
+    algorithm: "AES-GCM",
+    kdf: "PBKDF2-SHA-256",
+    kdfParams: { iterations: 10, salt: "c2FsdA" },
+  };
+  const makePackRecords = async (count: number, size: number, packId: string) => {
+    const remotePath = await opaqueV4PackPath(keyring.pathKey, packId);
+    return Promise.all(Array.from({ length: count }, async (_, index) => {
+      const path = `pack/${packId}/${index}.bin`;
+      return {
+        path,
+        pathId: await pathIdForV4Path(keyring.pathKey, path),
+        fileId: `${packId}-file-${index}`,
+        plaintextSha256: "a".repeat(64),
+        size,
+        mtime: 1,
+        remoteVersion: "v1",
+        remotePath,
+        encryptedPath: remotePath,
+        storage: "pack" as const,
+        packId,
+      };
+    }));
+  };
+
+  const tooMany = await makePackRecords(PACK_MAX_FILES + 1, 1, "pack-many");
+  await assert.rejects(
+    () => assertV4RemoteRecordSet(tooMany, config, keyring),
+    /pack.*files|pack.*count|pack.*limit/iu,
+  );
+
+  const entriesForTooManyBytes = Math.floor(PACK_MAX_PLAINTEXT_BYTES / PACK_MAX_ENTRY_BYTES) + 1;
+  const tooLarge = await makePackRecords(entriesForTooManyBytes, PACK_MAX_ENTRY_BYTES, "pack-bytes");
+  await assert.rejects(
+    () => assertV4RemoteRecordSet(tooLarge, config, keyring),
+    /pack.*plaintext|pack.*bytes|pack.*limit/iu,
+  );
 });
