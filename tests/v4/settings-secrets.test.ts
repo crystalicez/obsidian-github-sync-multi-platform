@@ -1368,6 +1368,39 @@ test("startup and scheduled callbacks are bound to the settings generation that 
 });
 
 
+test("runtime settings reject unsafe Git branch/ref syntax before requests", () => {
+  for (const githubBranch of [
+    "../main",
+    "main/../other",
+    "/main",
+    "main/",
+    "main//other",
+    ".hidden",
+    "topic/.hidden",
+    "main..other",
+    "topic.lock",
+    "topic/child.lock",
+    "topic@{1}",
+    "topic?x",
+    "topic*x",
+    "topic[x",
+    "topic\\x",
+    "@",
+  ]) {
+    assert.throws(
+      () => assertPluginSettingsRuntimeSafe({ ...DEFAULT_SETTINGS, githubOwner: "owner", githubRepo: "repo", githubBranch }),
+      /branch|ref|unsafe|invalid/iu,
+      githubBranch,
+    );
+  }
+  assert.doesNotThrow(() => assertPluginSettingsRuntimeSafe({
+    ...DEFAULT_SETTINGS,
+    githubOwner: "owner",
+    githubRepo: "repo",
+    githubBranch: "feature/local-release-qualification",
+  }));
+});
+
 test("runtime settings reject GitHub owner/repository values that can alter REST paths", () => {
   for (const settings of [
     { ...DEFAULT_SETTINGS, githubOwner: "../user", githubRepo: "repo" },
