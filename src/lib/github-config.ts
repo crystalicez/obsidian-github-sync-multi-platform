@@ -21,3 +21,27 @@ export function assertSafeGitHubRepositoryCoordinates(
   assertSafeGitHubOwner(owner, options.allowEmpty)
   assertSafeGitHubRepository(repo, options.allowEmpty)
 }
+
+
+const GIT_REF_FORBIDDEN = /[\u0000-\u0020\u007f~^:?*\[\\]/u
+
+export function assertSafeGitHubBranch(value: string): void {
+  if (typeof value !== "string" || value.length === 0) throw new Error("Invalid GitHub branch.")
+  if (
+    value === "@"
+    || value.startsWith("/")
+    || value.endsWith("/")
+    || value.endsWith(".")
+    || value.includes("//")
+    || value.includes("..")
+    || value.includes("@{")
+    || GIT_REF_FORBIDDEN.test(value)
+  ) {
+    throw new Error("Invalid GitHub branch.")
+  }
+  for (const segment of value.split("/")) {
+    if (!segment || segment.startsWith(".") || segment.endsWith(".lock")) {
+      throw new Error("Invalid GitHub branch.")
+    }
+  }
+}
