@@ -3,7 +3,7 @@ import { decryptV4Payload, encryptV4Payload, type V4Keyring } from "./crypto"
 import { buildV4PartPaths, shouldUseV4Parts, V4_PART_BYTES } from "./large-files"
 import type { V4IndexFileRecord } from "./local-index"
 import { bucketForV4PathId, normalizeV4VaultPath, objectIdForV4File, opaqueV4ObjectPath, opaqueV4PackPath, pathIdForV4Path } from "./paths"
-import { PACK_MAX_ENTRY_BYTES } from "./pack-planner"
+import { PACK_MAX_ENTRY_BYTES, PACK_MAX_FILES, PACK_MAX_PLAINTEXT_BYTES } from "./pack-planner"
 import { V4_GITHUB_SAFE_CONTENT_MUTATIONS_PER_REVISION } from "./part-write-policy"
 import { effectiveV4PathLayout, V4_CONFIG_PATH, V4_HEAD_PATH, V4_PBKDF2_ITERATIONS, V4_ROOT, type V4RemoteConfig, type V4RemoteHead } from "./protocol-types"
 import type { V4PreparedFile } from "./storage-codec"
@@ -124,12 +124,22 @@ export function assertV4RemoteShardRecords(shard: V4RemoteShard, bucket: string,
 export async function assertV4RemoteRecordSet(records: V4IndexFileRecord[], config: V4RemoteConfig, keyring?: V4Keyring): Promise<void> {
   const fileIds = new Set<string>()
   const logicalPaths = new Set<string>()
+  const packGroups = new Map<string, { files: number; plaintextBytes: number }>()
   for (const record of records) {
     assertV4RemoteRecordDescriptor(record, config)
     if (fileIds.has(record.fileId)) throw new Error(`Duplicate V4 remote fileId: ${record.fileId}`)
     fileIds.add(record.fileId)
     if (logicalPaths.has(record.path)) throw new Error(`Duplicate V4 remote logical path: ${record.path}`)
     logicalPaths.add(record.path)
+    if (record.storage === "pack") {
+      const packId = record.packId!
+      const current = packGroups.get(packId) ?? { files: 0, plaintextBytes: 0 }
+      current.files++
+      current.plaintextBytes += record.size
+      if (current.files > PACK_MAX_FILES) throw new Error(`V4 remote pack exceeds file-count limit: ${packId}`)
+      if (current.plaintextBytes > PACK_MAX_PLAINTEXT_BYTES) throw new Error(`V4 remote pack exceeds plaintext byte limit: ${packId}`)
+      packGroups.set(packId, current)
+    }
     if (config.mode === "encrypted" && !keyring) throw new Error("Encryption passphrase is required to validate encrypted V4 records.")
     const expectedPathId = config.mode === "encrypted"
       ? await pathIdForV4Path(keyring!.pathKey, record.path)
