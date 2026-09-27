@@ -326,6 +326,7 @@ Audit method:
    - RED: `1b03b393a65ab4aa3c2d93763b3bf22de9716b9c`, `f49f664dd6bed74135a6aa3f01e28b4138be5b27`.
    - Fixes: `13eb57c1920abb1d04d0bc937a8f8bdfbb456efe`, `183b9d89ef52c14da102fc2a0b87b2b08d00b0c0`, `772f3d024c63b2f5c68d8f08efff06373cd864f1`.
    - Shared branch validation now rejects Git-invalid/dangerous ref syntax while preserving ordinary slash-separated branches such as `feature/local-release-qualification`; both settings validation and direct `GitHubClient` construction enforce it.
+   - Compatibility correction: persisted/settings-layer `githubBranch: ""` historically means “use main” via the existing `githubBranch || "main"` fallback. RED `48e682490739b415cb75fc82a5ba76d576519383`; fixes `4a340753dfa0fb5e1780c3a4ab49ade6f458f536`, `7456e4e1321df1c87c5b0d98829e028066ccf902` allow empty only at the settings-validation layer while direct `GitHubClient` construction still requires a non-empty safe branch.
 
 ### Audited surfaces with no new confirmed defect so far
 
