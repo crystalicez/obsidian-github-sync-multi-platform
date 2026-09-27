@@ -35,7 +35,7 @@ export function assertPluginSettingsRuntimeSafe(value: unknown): void {
   const githubRepo = requireString(settings, "githubRepo")
   const githubBranch = requireString(settings, "githubBranch")
   assertSafeGitHubRepositoryCoordinates(githubOwner, githubRepo, { allowEmpty: true })
-  assertSafeGitHubBranch(githubBranch)
+  assertSafeGitHubBranch(githubBranch, true)
   requireString(settings, "vault")
   const ignorePathRegex = requireString(settings, "ignorePathRegex")
   compileV4IgnorePathRegex(ignorePathRegex)
