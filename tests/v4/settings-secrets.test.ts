@@ -1366,3 +1366,20 @@ test("startup and scheduled callbacks are bound to the settings generation that 
     /onLayoutReady[\s\S]*?const generation\s*=\s*this\.v4Runtime\.settingsGeneration[\s\S]*?setTimeout\([\s\S]*?settingsGeneration\s*!==\s*generation[\s\S]*?return[\s\S]*?startupSync/u,
   );
 });
+
+
+test("runtime settings reject GitHub owner/repository values that can alter REST paths", () => {
+  for (const settings of [
+    { ...DEFAULT_SETTINGS, githubOwner: "../user", githubRepo: "repo" },
+    { ...DEFAULT_SETTINGS, githubOwner: "owner/name", githubRepo: "repo" },
+    { ...DEFAULT_SETTINGS, githubOwner: "owner", githubRepo: "../repo" },
+    { ...DEFAULT_SETTINGS, githubOwner: "owner", githubRepo: "repo/contents" },
+    { ...DEFAULT_SETTINGS, githubOwner: "owner", githubRepo: "repo?ref=other" },
+    { ...DEFAULT_SETTINGS, githubOwner: "owner", githubRepo: "%2e%2e" },
+  ]) {
+    assert.throws(() => assertPluginSettingsRuntimeSafe(settings), /githubOwner|githubRepo|repository|owner|unsafe|invalid/iu);
+  }
+
+  assert.doesNotThrow(() => assertPluginSettingsRuntimeSafe({ ...DEFAULT_SETTINGS, githubOwner: "", githubRepo: "" }));
+  assert.doesNotThrow(() => assertPluginSettingsRuntimeSafe({ ...DEFAULT_SETTINGS, githubOwner: "crystalicez", githubRepo: "obsidian-github_sync.multi-platform" }));
+});
