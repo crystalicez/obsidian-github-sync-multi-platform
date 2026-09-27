@@ -815,3 +815,41 @@ test("GitHub client rejects unsafe owner and repository URL path segments before
   }
   assert.doesNotThrow(() => new GitHubClient({ token: "t", owner: "crystalicez", repo: "obsidian-github_sync.multi-platform", branch: "main" }));
 });
+
+
+test("GitHub ref boundaries reject valid-looking 2xx responses for the wrong branch or object", async () => {
+  const client = new GitHubClient(
+    { token: "token", owner: "owner", repo: "repo", branch: "main" },
+    { transportPolicy: { mutationSpacingMs: 0 } },
+  );
+  const targetSha = "8".repeat(40);
+
+  setRequestUrlHandler(async (options: unknown) => {
+    const request = options as Record<string, any>;
+    if (request.method === "GET" && request.url.includes("/git/ref/heads/main")) {
+      return { status: 200, text: "", headers: {}, json: { ref: "refs/heads/other", object: { sha: targetSha, type: "commit" } } };
+    }
+    throw new Error(`Unexpected request: ${request.method} ${request.url}`);
+  });
+  await assert.rejects(() => client.getGitRef(), /ref.*name|branch.*ref|malformed/iu);
+
+  setRequestUrlHandler(async (options: unknown) => {
+    const request = options as Record<string, any>;
+    if (request.method === "PATCH" && request.url.includes("/git/refs/heads/main")) {
+      return { status: 200, text: "", headers: {}, json: { ref: "refs/heads/main", object: { sha: "9".repeat(40), type: "commit" } } };
+    }
+    throw new Error(`Unexpected request: ${request.method} ${request.url}`);
+  });
+  await assert.rejects(() => client.updateGitRef(targetSha), /ref.*sha|mutation.*sha|object.*sha|malformed/iu);
+
+  setRequestUrlHandler(async (options: unknown) => {
+    const request = options as Record<string, any>;
+    if (request.method === "POST" && request.url.endsWith("/git/refs")) {
+      return { status: 201, text: "", headers: {}, json: { ref: "refs/heads/other", object: { sha: targetSha, type: "commit" } } };
+    }
+    throw new Error(`Unexpected request: ${request.method} ${request.url}`);
+  });
+  await assert.rejects(() => client.createGitRef(targetSha), /ref.*name|branch.*ref|malformed/iu);
+
+  setRequestUrlHandler(null);
+});
