@@ -251,6 +251,11 @@ export async function decodeV4RemoteShard(
     throw new Error(`V4 shard bucket or record shape mismatch: ${bucket}`)
   }
   const shard = parsed as unknown as V4RemoteShard
+  for (const record of Object.values(shard.records)) {
+    if (Object.prototype.hasOwnProperty.call(record, "dirty") || Object.prototype.hasOwnProperty.call(record, "deleted")) {
+      throw new Error("V4 remote record contains local-only dirty/deleted state.")
+    }
+  }
   assertV4RemoteShardRecords(shard, bucket, config)
   return shard
 }
