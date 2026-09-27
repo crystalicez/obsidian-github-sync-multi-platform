@@ -25,7 +25,8 @@ export function assertSafeGitHubRepositoryCoordinates(
 
 const GIT_REF_FORBIDDEN = /[\u0000-\u0020\u007f~^:?*\[\\]/u
 
-export function assertSafeGitHubBranch(value: string): void {
+export function assertSafeGitHubBranch(value: string, allowEmpty = false): void {
+  if (allowEmpty && value === "") return
   if (typeof value !== "string" || value.length === 0) throw new Error("Invalid GitHub branch.")
   if (
     value === "@"
