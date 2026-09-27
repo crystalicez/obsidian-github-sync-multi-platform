@@ -336,6 +336,14 @@ Audit method:
    - Fix: `b5d4af4091e23cfd2bdf5bbbce30375423db9608` requires actual plaintext length to equal `record.size` for single/chunked whole-buffer reads before returning bytes.
    - Residual transport limitation remains unchanged: Obsidian `requestUrl` can buffer an unexpectedly large HTTP body before this post-receipt validation runs.
 
+47. **HIGH remote integrity — local-only cache flags were accepted on remote wire records and excluded from canonical shard hashing.**
+   - Canonical shard hashing intentionally strips `dirty` / `deleted` because those fields are local-index cache state.
+   - Fresh remote shard decoding nevertheless accepted those fields.
+   - An external/corrupt commit could therefore add `deleted:true` to a remote record without changing the canonical record hash advertised by head metadata; planner logic filters deleted records and could treat a still-present remote object as logically deleted.
+   - RED: `c0cb45d6c73bebe22a75ecd501a1d218a7dcf37e`.
+   - Fix: `54b5d26c71286362add3aad8ab948ec152bfdf81` rejects any wire record carrying local-only `dirty` or `deleted` properties before remote shard records become authority.
+   - Local persisted shards may still contain those fields; they are separately content-verified and protocol-validated before cache reuse.
+
 ### Audited surfaces with no new confirmed defect so far
 
 - secret migration/persistence: raw token/passphrase are removed before plugin data persistence and use Obsidian SecretStorage;
