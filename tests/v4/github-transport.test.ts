@@ -893,3 +893,37 @@ test("GitHub tree boundary rejects duplicate logical paths", async () => {
     setRequestUrlHandler(null);
   }
 });
+
+
+test("GitHub client rejects unsafe Git branch names before requests", () => {
+  for (const branchName of [
+    "../main",
+    "main/../other",
+    "/main",
+    "main/",
+    "main//other",
+    ".hidden",
+    "topic/.hidden",
+    "main..other",
+    "topic.lock",
+    "topic/child.lock",
+    "topic@{1}",
+    "topic?x",
+    "topic*x",
+    "topic[x",
+    "topic\\x",
+    "@",
+  ]) {
+    assert.throws(
+      () => new GitHubClient({ token: "t", owner: "owner", repo: "repo", branch: branchName }),
+      /branch|ref|unsafe|invalid/iu,
+      branchName,
+    );
+  }
+  assert.doesNotThrow(() => new GitHubClient({
+    token: "t",
+    owner: "owner",
+    repo: "repo",
+    branch: "feature/local-release-qualification",
+  }));
+});
