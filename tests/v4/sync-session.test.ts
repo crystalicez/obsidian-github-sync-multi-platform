@@ -1548,8 +1548,15 @@ test("v4 encrypted pack round trips through force pull and version-history previ
 
   const target = new MemoryVault();
   const targetIndex = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "b", mode: "encrypted" });
+  const originalGetFileBytes = github.getFileBytes.bind(github);
+  let pullPackReads = 0;
+  github.getFileBytes = async (path: string, ref?: string) => {
+    if (packPaths.includes(path)) pullPackReads++;
+    return originalGetFileBytes(path, ref);
+  };
   await new V4SyncSession({ github, vault: target, index: targetIndex, config: encryptedConfig, keyring: keys, conflictPolicy: "copy", abortChangePercent: 0 }).sync({ operation: "forcePull", allowThresholdOverride: false });
   assert.equal(dec(target.files.get("Folder/private-42.md")!.bytes), "secret-42");
+  assert.equal(pullPackReads, 1, "one packed immutable object should be fetched/decrypted once per pull generation");
 });
 
 test("v4 encrypted chunked rename reuses identity and parts without uploading content", async () => {
