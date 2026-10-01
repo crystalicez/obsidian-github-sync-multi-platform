@@ -696,6 +696,44 @@ test("GitHubClient rejects a successful blob mutation whose SHA does not match t
   }
 });
 
+test("GitHubClient rejects a successful commit mutation whose immutable commit does not match the requested semantics", async () => {
+  const createdSha = "c".repeat(40);
+  const treeSha = "a".repeat(40);
+  const parentSha = "b".repeat(40);
+  setRequestUrlHandler(async (options: unknown) => {
+    const request = options as Record<string, any>;
+    if (request.method === "POST" && request.url.endsWith("/git/commits")) {
+      return { status: 201, text: "", headers: {}, json: { sha: createdSha } };
+    }
+    if (request.method === "GET" && request.url.endsWith(`/git/commits/${createdSha}`)) {
+      return {
+        status: 200,
+        text: "",
+        headers: {},
+        json: {
+          sha: createdSha,
+          message: "different-message",
+          tree: { sha: treeSha },
+          parents: [{ sha: parentSha }],
+        },
+      };
+    }
+    throw new Error(`Unexpected request: ${request.method} ${request.url}`);
+  });
+  try {
+    const client = new GitHubClient(
+      { token: "token", owner: "owner", repo: "repo", branch: "main" },
+      { transportPolicy: { mutationSpacingMs: 0 } },
+    );
+    await assert.rejects(
+      () => client.createGitCommit("obsidian-sync-v4:expected", treeSha, [parentSha], { originalCannotBeReachable: true }),
+      /created commit.*mismatch|commit.*semantic|message|tree|parent/iu,
+    );
+  } finally {
+    setRequestUrlHandler(null);
+  }
+});
+
 test("GitHubClient rejects a Contents payload with a malformed Git object SHA instead of trusting unverified bytes", async () => {
   let requests = 0;
   setRequestUrlHandler(async () => {
