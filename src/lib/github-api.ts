@@ -420,20 +420,27 @@ export class GitHubClient {
     throw this.gitHttpError("Failed to inspect git refs", response.status, response.text);
   }
 
+  private assertConfiguredBootstrapRef(ref: GitHubGitRef, commitSha: string): GitHubGitRef {
+    if (ref.sha !== commitSha) {
+      throw new V4RepositoryBootstrapRaceError(
+        ref.sha,
+        new Error("V4 configured bootstrap branch does not point to the verified bootstrap commit."),
+      );
+    }
+    return ref;
+  }
+
   private async ensureConfiguredBootstrapRef(commitSha: string): Promise<GitHubGitRef> {
     const configured = await this.getGitRefOrNull();
-    if (configured) return configured;
+    if (configured) return this.assertConfiguredBootstrapRef(configured, commitSha);
     for (let attempt = 1; attempt <= 2; attempt++) {
       try {
         await this.createGitRef(commitSha);
-        return await this.getGitRef();
+        return this.assertConfiguredBootstrapRef(await this.getGitRef(), commitSha);
       } catch (error) {
         if (!(error instanceof V4GitMutationOutcomeUnknownError)) throw error;
         const observed = await this.getGitRefOrNull();
-        if (observed) {
-          if (observed.sha !== commitSha) throw new Error("V4 bootstrap branch changed during ambiguous creation.");
-          return observed;
-        }
+        if (observed) return this.assertConfiguredBootstrapRef(observed, commitSha);
         if (attempt === 2) throw error;
       }
     }
