@@ -350,6 +350,21 @@ Audit method:
    - RED: `2f1a268e26f2a08e4c8b388cc203b67925fd2e45`.
    - Fix: `73dc49446e026de826000299201eddb9a6ff9a80` enforces `PACK_MAX_FILES` and `PACK_MAX_PLAINTEXT_BYTES` per remote pack group using the same writer constants.
 
+49. **MEDIUM/HIGH remote resource safety — Force Pull decoded the same immutable pack once per member instead of once per pack generation.**
+   - Packed records share one immutable encrypted pack object, but pull staging could call the single-record pack reader for every member.
+   - A 500-file writer-valid pack therefore caused repeated download/decrypt/JSON/base64/hash work for identical bytes during one pull generation.
+   - RED: `91d580b57093154a1a24eb9a63f78b00c92ba282`.
+   - Fixes: `ec863a0d33ac4d8930a189b872442ed98a64a870`, `33349f1cad95c1f04e745b97fc4ce59dd8ef10f2`.
+   - The codec now verifies/decrypts one declared pack group in a batch, and pull staging groups records by immutable commit + pack ID + remote path so a shared pack is fetched/decrypted once per pull generation.
+
+50. **MEDIUM integrity/resource safety — pack payload bytes were not exactly bound to the declared record set before decrypt/JSON parse.**
+   - Aggregate remote pack metadata was bounded, but the encrypted object itself could still contain extra/oversized archive entries not declared by the records being read.
+   - The previous reader decrypted and parsed the whole archive before discovering missing/mismatched requested entries, allowing avoidable post-transport CPU/memory amplification and hidden undeclared archive content.
+   - RED: `cfe0e5fabcb0545220da81ce6d18002a78a4a486` with compile-shaped fixture correction `386ad5286f21b9475b15371ee9e2940fcd07482a`.
+   - Fixes: `9d78ea957fc66c9ed44846e1d7960577d7234f86`, `007bbb48612cb69f13d2bfed04eeebf5e330270f`.
+   - Reader now derives the exact deterministic archive size from declared `fileId` + plaintext sizes, checks encrypted payload length before decrypt, re-checks plaintext archive length after decrypt, and requires the archive key set to equal the declared record IDs exactly.
+   - This does **not** remove the previously documented transport peak-memory residual: Obsidian `requestUrl` can still buffer an unexpectedly large HTTP body before post-receipt validation runs.
+
 ### Audited surfaces with no new confirmed defect so far
 
 - secret migration/persistence: raw token/passphrase are removed before plugin data persistence and use Obsidian SecretStorage;
