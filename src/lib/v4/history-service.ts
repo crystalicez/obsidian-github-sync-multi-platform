@@ -2,11 +2,11 @@ import type { GitHubCommitSummary, GitHubTree } from "../github-api"
 import { bytesToUtf8 } from "../bytes"
 import { decryptV4Payload, type V4Keyring } from "./crypto"
 import { isV4JournalId, V4_JOURNAL_PAGE_SIZE, V4_MAX_JOURNAL_PAGES, type V4JournalChange, type V4JournalPage, type V4VersionDescriptor } from "./history-journal"
-import type { V4IndexFileRecord } from "./local-index"
+import { createEmptyV4LocalIndex, type V4IndexFileRecord } from "./local-index"
 import { expectedV4PathLayout, V4_ROOT, type V4RemoteConfig } from "./protocol-types"
 import { assertV4RemoteRecordDescriptor } from "./remote-index"
 import { V4StorageCodec } from "./storage-codec"
-import { assertV4PathLayoutCompatible } from "./sync-session"
+import { assertV4PathLayoutCompatible, loadV4RemoteConfig, loadV4RemoteState } from "./remote-loader"
 
 export interface V4HistoryGithub {
   listCommits(options?: { page?: number; perPage?: number }): Promise<GitHubCommitSummary[]>
@@ -96,14 +96,38 @@ export class V4HistoryService {
       this.assertCurrent()
     } else {
       const record = this.recordFromDescriptor(change, descriptor)
-      bytes = await this.codec.read(record, async path => {
+      const readBlob = async (path: string) => {
         this.assertCurrent()
         const sha = shas.get(path)
         if (!sha) throw new Error(`Version blob is missing: ${path}`)
         const blob = await this.input.github.getBlob(sha)
         this.assertCurrent()
         return blob
-      })
+      }
+      if (record.storage === "pack") {
+        const remoteConfig = await loadV4RemoteConfig({ github: this.input.github, desiredConfig: this.input.config }, versionCommit.sha, "normal")
+        if (!remoteConfig) throw new Error("Historical V4 config is missing.")
+        const historicalIndex = createEmptyV4LocalIndex({
+          repoId: remoteConfig.repoId,
+          deviceId: "history-preview",
+          mode: remoteConfig.mode,
+          pathLayout: expectedV4PathLayout(remoteConfig.mode),
+        })
+        const remoteState = await loadV4RemoteState({ github: this.input.github, index: historicalIndex, keyring: this.input.keyring }, versionCommit.sha, remoteConfig)
+        if (!remoteState) throw new Error("Historical V4 state is missing.")
+        const packRecords = remoteState.records.filter(candidate => candidate.storage === "pack"
+          && candidate.packId === record.packId
+          && candidate.remotePath === record.remotePath)
+        if (!packRecords.some(candidate => candidate.fileId === record.fileId)) {
+          throw new Error(`Historical V4 packed record is missing: ${record.fileId}`)
+        }
+        const entries = await this.codec.readPackRecords(packRecords, readBlob)
+        const packed = entries.get(record.fileId)
+        if (!packed) throw new Error(`Historical V4 packed entry is missing after verified decode: ${record.fileId}`)
+        bytes = packed
+      } else {
+        bytes = await this.codec.read(record, readBlob)
+      }
       this.assertCurrent()
     }
     const ext = extension(change.path)

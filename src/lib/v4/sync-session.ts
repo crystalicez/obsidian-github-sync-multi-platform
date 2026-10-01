@@ -123,6 +123,17 @@ function localIndexMatchesRemoteHead(index: V4LocalIndex, head: V4RemoteHead): b
       && index.shardHashes[bucket] === head.shardHashes[bucket])
 }
 
+function completePackRecords(record: V4IndexFileRecord, records: readonly V4IndexFileRecord[]): V4IndexFileRecord[] | undefined {
+  if (record.storage !== "pack" || !record.packId) return undefined
+  const group = records.filter(candidate => candidate.storage === "pack"
+    && candidate.packId === record.packId
+    && candidate.remotePath === record.remotePath)
+  if (!group.some(candidate => candidate.fileId === record.fileId)) {
+    throw new Error(`V4 packed record is missing from its metadata group: ${record.fileId}`)
+  }
+  return group
+}
+
 function logical(records: V4IndexFileRecord[]): V4LogicalFile[] {
   return records.filter(record => !record.deleted).map(record => ({
     path: record.path,
@@ -411,7 +422,7 @@ export class V4SyncSession {
     const remoteCommitSha = remote?.commitSha
     const batch: V4ResolvedBatch = {
       runId: this.input.runState?.runId ?? toBase64Url(randomBytes(12)),
-      pulls: plan.pulls.map(change => this.bindPull(change, recordsById, remoteCommitSha)),
+      pulls: plan.pulls.map(change => this.bindPull(change, recordsById, allRemoteRecords, remoteCommitSha)),
       pushes: plan.pushes.map(change => this.bindPush(change, recordsById)),
       stagedWrites: [],
     }
@@ -435,16 +446,21 @@ export class V4SyncSession {
       const conflictPolicy: V4ConflictPolicy = externalReconciled && this.input.conflictPolicy === "newer"
         ? "copy"
         : this.input.conflictPolicy
+      const basePackMetadataComplete = !baseRecord
+        || baseRecord.storage !== "pack"
+        || hasKnownBase
+        || remoteRecord?.remoteVersion === baseRecord.remoteVersion
       const canMergeFromMetadata = conflictPolicy === "merge"
         && !!conflict.local && !!conflict.remote && !!baseRecord && !!remoteRecord
+        && basePackMetadataComplete
         && (remoteRecord.remoteVersion === baseRecord.remoteVersion || !!baseCommitSha)
         && canAttemptV4TextMerge(conflict.path, [baseRecord.size, conflict.local.size, conflict.remote.size])
       if (canMergeFromMetadata) {
         const localBytes = await this.readLocal(conflict.local!.path)
-        remoteBytes = await this.readRecord(remoteRecord!, remoteCommitSha)
+        remoteBytes = await this.readRecord(remoteRecord!, remoteCommitSha, completePackRecords(remoteRecord!, allRemoteRecords))
         const baseBytes = remoteRecord!.remoteVersion === baseRecord!.remoteVersion
           ? remoteBytes
-          : await this.readRecord(baseRecord!, baseCommitSha)
+          : await this.readRecord(baseRecord!, baseCommitSha, completePackRecords(baseRecord!, baseRecords))
         resolution = resolveV4Conflict({
           policy: conflictPolicy,
           path: conflict.path,
@@ -474,7 +490,7 @@ export class V4SyncSession {
         const pull = this.changeBetween(conflict.local, conflict.remote)
         if (pull) {
           pullTotal++
-          batch.pulls.push(this.bindPull(pull, recordsById, remoteCommitSha))
+          batch.pulls.push(this.bindPull(pull, recordsById, allRemoteRecords, remoteCommitSha))
         }
       } else if (resolution.action === "merged" && conflict.local && resolution.mergedBytes) {
         const mergeMtime = this.now()
@@ -520,7 +536,13 @@ export class V4SyncSession {
             },
           }
           pullTotal++
-          const pullBinding: V4PullBinding = { change: copyChange, remoteRecord, remoteCommitSha, stage: carriedStage }
+          const pullBinding: V4PullBinding = {
+            change: copyChange,
+            remoteRecord,
+            remoteCommitSha,
+            packRecords: completePackRecords(remoteRecord, allRemoteRecords),
+            stage: carriedStage,
+          }
           batch.pulls.push(pullBinding)
           let pushBinding: V4PushBinding | undefined
           if (reservedCopy.includeInSync && !batch.pushes.some(binding => binding.change.fileId === copyFileId)) {
@@ -557,7 +579,7 @@ export class V4SyncSession {
         : remoteRecord.storage === "chunked" || remoteRecord.size > DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES
           ? await this.stageRemotePull(stagedCopy.pull, ownedStages)
           : await this.stageBytes(
-              await this.readRecord(remoteRecord, stagedCopy.pull.remoteCommitSha),
+              await this.readRecord(remoteRecord, stagedCopy.pull.remoteCommitSha, stagedCopy.pull.packRecords),
               remoteRecord.mtime,
               stagedCopy.pull.change.before?.size ?? 0,
               ownedStages,
@@ -1209,9 +1231,16 @@ export class V4SyncSession {
   private bindPull(
     change: V4PlannedChange,
     records: ReadonlyMap<string, V4IndexFileRecord>,
+    allRecords: readonly V4IndexFileRecord[],
     remoteCommitSha?: string,
   ): V4PullBinding {
-    return { change, remoteRecord: change.kind === "delete" ? undefined : records.get(change.fileId), remoteCommitSha }
+    const remoteRecord = change.kind === "delete" ? undefined : records.get(change.fileId)
+    return {
+      change,
+      remoteRecord,
+      remoteCommitSha,
+      packRecords: remoteRecord ? completePackRecords(remoteRecord, allRecords) : undefined,
+    }
   }
 
   private bindPush(
@@ -1353,7 +1382,8 @@ export class V4SyncSession {
     for (const group of groups.values()) {
       const first = group[0]
       const firstRecord = first.remoteRecord!
-      const records = group.map(binding => binding.remoteRecord!)
+      const records = first.packRecords ?? group.map(binding => binding.remoteRecord!)
+      if (!records.some(record => record.fileId === firstRecord.fileId)) throw new Error("V4 packed pull metadata is incomplete.")
       const budget = estimateV4PackGroupResources(records.map(record => ({
         fileId: record.fileId,
         path: record.path,
@@ -1527,7 +1557,7 @@ export class V4SyncSession {
     } else {
       if (!record) throw new Error(`Missing V4 remote record for ${change.path}`)
       this.report({ phase: "downloading", currentPath: change.path, currentDirection: "pull" })
-      bytes = await this.readRecord(record, binding.remoteCommitSha)
+      bytes = await this.readRecord(record, binding.remoteCommitSha, binding.packRecords)
       mtime = record.mtime
     }
     await assertV4LocalTargetPrecondition(this.localIo, targetPrecondition)
@@ -1611,12 +1641,24 @@ export class V4SyncSession {
     }, this.input.signal)
   }
 
-  private async readRecord(record: V4IndexFileRecord, remoteCommitSha?: string): Promise<Uint8Array> {
-    return this.codec.read(record, async path => {
+  private async readRecord(
+    record: V4IndexFileRecord,
+    remoteCommitSha?: string,
+    packRecords?: readonly V4IndexFileRecord[],
+  ): Promise<Uint8Array> {
+    const reader = async (path: string) => {
       const file = await this.input.github.getFileBytes(path, remoteCommitSha)
       if (!file) throw new Error(`Missing V4 remote object: ${path}`)
       return file.bytes
-    }, this.input.signal)
+    }
+    if (record.storage === "pack") {
+      if (!packRecords) throw new Error(`V4 packed read requires complete metadata: ${record.fileId}`)
+      const entries = await this.codec.readPackRecords(packRecords, reader, this.input.signal)
+      const bytes = entries.get(record.fileId)
+      if (!bytes) throw new Error(`V4 packed entry is missing after verified decode: ${record.fileId}`)
+      return bytes
+    }
+    return this.codec.read(record, reader, this.input.signal)
   }
 
   private changeBetween(before?: V4LogicalFile, after?: V4LogicalFile): V4PlannedChange | null {

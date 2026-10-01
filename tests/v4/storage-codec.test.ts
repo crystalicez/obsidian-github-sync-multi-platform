@@ -218,7 +218,7 @@ test("v4 whole-buffer reads reject plaintext length that disagrees with remote m
 
 
 test("v4 pack reader rejects payloads larger than the exact declared pack archive before decrypt/parse", async () => {
-  const keyring = await deriveV4Keyring({ passphrase: "pass", repoId: "o/r#main", salt: enc("salt"), iterations: 10 });
+  const keyring = await deriveV4Keyring({ passphrase: "pass", repoId: "o/r#main", salt: bytes("salt"), iterations: 10 });
   const codec = new V4StorageCodec({ mode: "encrypted", pathLayout: "opaque-stable-v1", keyring });
   const plaintext = bytes("a");
   const record = {
@@ -248,7 +248,7 @@ test("v4 pack reader rejects payloads larger than the exact declared pack archiv
 });
 
 test("v4 pack reader requires the archive entry set to match the declared pack records exactly", async () => {
-  const keyring = await deriveV4Keyring({ passphrase: "pass", repoId: "o/r#main", salt: enc("salt"), iterations: 10 });
+  const keyring = await deriveV4Keyring({ passphrase: "pass", repoId: "o/r#main", salt: bytes("salt"), iterations: 10 });
   const codec = new V4StorageCodec({ mode: "encrypted", pathLayout: "opaque-stable-v1", keyring });
   const plaintext = bytes("a");
   const record = {

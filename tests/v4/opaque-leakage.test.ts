@@ -236,7 +236,11 @@ test("encrypted V4 remote paths and payloads contain no logical path or content 
   assert.equal(packedRecord.storage, "pack");
   assert.deepEqual(await codec.read(singleRecord, readFromReachableTip), encode(singleMarker));
   assert.equal(Buffer.from(await codec.read(chunkedRecord, readFromReachableTip)).equals(Buffer.from(chunkBytes)), true);
-  assert.deepEqual(await codec.read(packedRecord, readFromReachableTip), encode(`${packMarker}-42`));
+  const packedGroup = liveRecords.filter(record => record.storage === "pack"
+    && record.packId === packedRecord.packId
+    && record.remotePath === packedRecord.remotePath);
+  const packedEntries = await codec.readPackRecords(packedGroup, readFromReachableTip);
+  assert.deepEqual(packedEntries.get(packedRecord.fileId), encode(`${packMarker}-42`));
 
   const history = new V4HistoryService({ github, config, keyring });
   const deletedVersions = await history.getFileVersions(deletedRecord.fileId);
