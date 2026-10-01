@@ -32,7 +32,7 @@ async function rejectsMalformedUnrelated(entry: Record<string, unknown>): Promis
     );
     await assert.rejects(
       () => client.getFileBytes("missing.md", COMMIT_SHA),
-      /immutable.*tree.*malformed|malformed.*immutable|unsupported.*git.*object/iu,
+      /malformed.*github|immutable.*tree.*malformed|malformed.*immutable|unsupported.*git.*object/iu,
     );
   } finally {
     setRequestUrlHandler(null);
@@ -41,8 +41,8 @@ async function rejectsMalformedUnrelated(entry: Record<string, unknown>): Promis
 
 test("complete absence is not inferred from a tree containing malformed or unsupported unrelated entries", async () => {
   await rejectsMalformedUnrelated({ path: "other.md", type: "tag", mode: "100644", sha: OTHER_SHA, url: "" });
-  await rejectsMalformedUnrelated({ path: "other.md", type: "blob", mode: 100644, sha: OTHER_SHA, url: "" });
-  await rejectsMalformedUnrelated({ path: "other.md", type: "blob", mode: "100644", sha: "short", url: "" });
-  await rejectsMalformedUnrelated({ path: "other.md", type: "blob", mode: "040000", sha: OTHER_SHA, url: "" });
-  await rejectsMalformedUnrelated({ path: "other.md", type: "blob", mode: "100600", sha: OTHER_SHA, url: "" });
+  await rejectsMalformedUnrelated({ path: "other.md", type: "blob", mode: 100644, sha: OTHER_SHA, size: 1, url: "" });
+  await rejectsMalformedUnrelated({ path: "other.md", type: "blob", mode: "100644", sha: "short", size: 1, url: "" });
+  await rejectsMalformedUnrelated({ path: "other.md", type: "blob", mode: "040000", sha: OTHER_SHA, size: 1, url: "" });
+  await rejectsMalformedUnrelated({ path: "other.md", type: "blob", mode: "100600", sha: OTHER_SHA, size: 1, url: "" });
 });

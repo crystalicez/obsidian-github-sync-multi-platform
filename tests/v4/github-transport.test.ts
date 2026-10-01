@@ -48,7 +48,7 @@ test("GitHubClient reads historical trees and can create a branch ref", async ()
     await client.createGitRef("3333333333333333333333333333333333333333");
 
     assert.equal(tree.sha, "4444444444444444444444444444444444444444");
-    assert.equal(requests[0].url.endsWith("/git/trees/tree-old"), true);
+    assert.equal(requests[0].url.includes(`/git/trees/${"4".repeat(40)}`), true);
     assert.deepEqual(JSON.parse(requests[1].body), { ref: "refs/heads/v4", sha: "3333333333333333333333333333333333333333" });
   } finally {
     setRequestUrlHandler(null);
@@ -784,9 +784,10 @@ test("bootstrap rejects a malformed successful commit SHA before creating the co
 
 
 test("GitHub tree rejects blob entries that omit byte size", async () => {
-  const client = new GitHubClient({ token: "t", owner: "o", repo: "r", branch: "main" }, async () => ({
+  setRequestUrlHandler(async () => ({
     status: 200,
     text: "",
+    headers: {},
     json: {
       sha: "a".repeat(40),
       truncated: false,
@@ -798,14 +799,18 @@ test("GitHub tree rejects blob entries that omit byte size", async () => {
         url: "",
       }],
     },
-  }) as any);
-
-  await assert.rejects(
-    () => client.getTreeAt("a".repeat(40), true),
-    /tree entry.*size|blob.*size/iu,
-  );
+    arrayBuffer: new ArrayBuffer(0),
+  }));
+  try {
+    const client = new GitHubClient({ token: "t", owner: "o", repo: "r", branch: "main" });
+    await assert.rejects(
+      () => client.getTreeAt("a".repeat(40), true),
+      /tree entry.*size|blob.*size/iu,
+    );
+  } finally {
+    setRequestUrlHandler(null);
+  }
 });
-
 
 test("GitHub client rejects unsafe owner and repository URL path segments before requests", () => {
   for (const config of [

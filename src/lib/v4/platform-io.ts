@@ -267,7 +267,7 @@ export function createV4PlatformIo(options: V4PlatformIoOptions): V4PlatformIo {
       const matchesExpected = (candidate: Awaited<ReturnType<typeof fs.stat>> | null): boolean =>
         expected.exists === !!candidate
         && (!expected.exists || expected.size === undefined || candidate!.size === expected.size)
-        && (!expected.exists || expected.mtime === undefined || Math.trunc(candidate!.mtimeMs) === Math.trunc(expected.mtime))
+        && (!expected.exists || expected.mtime === undefined || Math.trunc(Number(candidate!.mtimeMs)) === Math.trunc(expected.mtime))
       const backupStat = await statOrNull(backup)
       if (!backupStat) return
       if (!matchesExpected(backupStat)) throw new Error(`V4 interrupted target backup does not match the expected target: ${targetPath}`)
@@ -307,7 +307,7 @@ export function createV4PlatformIo(options: V4PlatformIoOptions): V4PlatformIo {
       const matchesExpected = (candidate: Awaited<ReturnType<typeof fs.stat>> | null): boolean =>
         expected.exists === !!candidate
         && (!expected.exists || expected.size === undefined || candidate!.size === expected.size)
-        && (!expected.exists || expected.mtime === undefined || Math.trunc(candidate!.mtimeMs) === Math.trunc(expected.mtime))
+        && (!expected.exists || expected.mtime === undefined || Math.trunc(Number(candidate!.mtimeMs)) === Math.trunc(expected.mtime))
       let targetBefore = await statOrNull(target)
       const interruptedBackup = await statOrNull(backup)
       if (!targetBefore && interruptedBackup) {
@@ -331,7 +331,7 @@ export function createV4PlatformIo(options: V4PlatformIoOptions): V4PlatformIo {
         const after = await fs.stat(target)
         if (after.size !== commitOptions.expectedStageSize) throw new Error(`V4 committed target size mismatch: ${targetPath}`)
         const hash = createV4IncrementalSha256()
-        for await (const chunk of desktopBoundedSource(target, commitOptions.expectedStageSize).chunks(4 * 1024 * 1024)) hash.update(chunk)
+        for await (const chunk of desktopBoundedSource(target, commitOptions.expectedStageSize, () => assertDesktopPathSafe(targetPath, true)).chunks(4 * 1024 * 1024)) hash.update(chunk)
         if (hash.digestHex() !== commitOptions.expectedStageSha256) throw new Error(`V4 committed target hash mismatch: ${targetPath}`)
         if (backedUp) await fs.rm(backup, { force: true })
       } catch (error) {

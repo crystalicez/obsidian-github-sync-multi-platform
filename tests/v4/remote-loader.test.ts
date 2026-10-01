@@ -3,12 +3,11 @@ import test from "node:test";
 
 import { sha256Hex } from "../../src/lib/bytes";
 import { createEmptyV4LocalIndex } from "../../src/lib/v4/local-index";
-import { buildV4RemoteMetadata } from "../../src/lib/v4/remote-index";
+import { buildV4RemoteMetadata, v4RemoteShardPath } from "../../src/lib/v4/remote-index";
 import {
   assertV4PathLayoutCompatible,
   loadV4RemoteConfig,
   loadV4RemoteState,
-  remoteV4StateFromLocalIndex,
 } from "../../src/lib/v4/remote-loader";
 import { expectedV4PathLayout, V4_FORMAT_VERSION, type V4RemoteConfig, type V4RemoteHead } from "../../src/lib/v4/protocol-types";
 
@@ -78,20 +77,52 @@ test("remote loader keeps layout migration restricted to Force Push", () => {
   assert.doesNotThrow(() => assertV4PathLayoutCompatible(legacy, desired, "forcePush"));
 });
 
-test("remote loader can reconstruct a plaintext unchanged-head state from the local index", () => {
+test("remote loader reuses a verified unchanged-head shard cache without reading the shard body", async () => {
+  const path = "Notes/cached.md";
+  const pathId = await sha256Hex(enc(`path:${path}`));
+  const bucket = pathId.slice(0, 2);
   const config: V4RemoteConfig = { formatVersion: 4, mode: "plaintext", repoId: "o/r#main", pathLayout: "plaintext-v1" };
+  const record = {
+    path,
+    pathId,
+    fileId: "file-cached",
+    plaintextSha256: "c".repeat(64),
+    size: 1,
+    mtime: 2,
+    remoteVersion: "journal-5",
+    remotePath: path,
+    storage: "single" as const,
+  };
+  const shardHash = await sha256Hex(enc(JSON.stringify([record])));
+  const head: V4RemoteHead = {
+    formatVersion: 4,
+    mode: "plaintext",
+    epoch: 4,
+    generation: 5,
+    journalId: "journal-5",
+    shardHashes: { [bucket]: shardHash },
+    updatedAt: 5,
+    deviceId: "device-a",
+  };
+  const metadata = await buildV4RemoteMetadata({ config, head, records: [record] });
+  const github = new MemoryRemoteGithub(new Map(metadata.map(file => [file.path, file.bytes])));
   const index = createEmptyV4LocalIndex({ repoId: config.repoId, deviceId: "local", mode: config.mode, pathLayout: config.pathLayout });
-  index.epoch = 4;
-  index.generation = 5;
+  index.epoch = head.epoch;
+  index.generation = head.generation;
   index.remoteCommitSha = "commit-5";
-  const state = remoteV4StateFromLocalIndex(index, "commit-5", config);
+  index.shardHashes[bucket] = shardHash;
+  index.shards[bucket] = {
+    bucket,
+    hash: shardHash,
+    records: { [pathId]: { ...record, dirty: false } },
+  };
 
-  assert.equal(state.commitSha, "commit-5");
-  assert.equal(state.head.epoch, 4);
-  assert.equal(state.head.generation, 5);
-  assert.deepEqual(state.records, []);
+  const state = await loadV4RemoteState({ github, index }, "commit-5", config);
+
+  assert.equal(state?.commitSha, "commit-5");
+  assert.deepEqual(state?.records, [record]);
+  assert.equal(github.reads.some(read => read.path === v4RemoteShardPath(bucket, config.mode)), false);
 });
-
 
 test("remote loader rejects a shard whose records do not match the head shard hash", async () => {
   const path = "Notes/a.md";

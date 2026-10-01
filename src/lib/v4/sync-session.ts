@@ -114,6 +114,15 @@ function recordsFromIndex(index: V4LocalIndex): V4IndexFileRecord[] {
   return Object.values(index.shards).flatMap(shard => Object.values(shard.records)).filter(record => !record.deleted)
 }
 
+function localIndexMatchesRemoteHead(index: V4LocalIndex, head: V4RemoteHead): boolean {
+  if (index.mode !== head.mode || index.epoch !== head.epoch || index.generation !== head.generation) return false
+  const localBuckets = Object.keys(index.shardHashes).sort()
+  const remoteBuckets = Object.keys(head.shardHashes).sort()
+  return localBuckets.length === remoteBuckets.length
+    && localBuckets.every((bucket, position) => bucket === remoteBuckets[position]
+      && index.shardHashes[bucket] === head.shardHashes[bucket])
+}
+
 function logical(records: V4IndexFileRecord[]): V4LogicalFile[] {
   return records.filter(record => !record.deleted).map(record => ({
     path: record.path,
@@ -314,7 +323,10 @@ export class V4SyncSession {
       throw new Error("Legacy V4 migration cannot continue while encrypted records are excluded by sync scope. Include all legacy paths and retry Force Push.")
     }
     const remoteRecords = allRemoteRecords.filter(record => includePath(record.path))
-    const hasKnownBase = localCacheComplete && !!this.input.index.remoteCommitSha
+    const localBaseMatchesCurrentCommit = !remote
+      || remote.commitSha !== this.input.index.remoteCommitSha
+      || localIndexMatchesRemoteHead(this.input.index, remote.head)
+    const hasKnownBase = localCacheComplete && !!this.input.index.remoteCommitSha && localBaseMatchesCurrentCommit
     const causalState = isLayoutMigration || !hasKnownBase
       ? causalIdentityState(remoteRecords, options.changes ?? [])
       : undefined
@@ -565,12 +577,27 @@ export class V4SyncSession {
       recoveryPlan = await this.prepareRecoveryLocalPayload(batch, ownedStages, localById)
       pulledFiles = batch.pulls.length
     } else {
+      const consumedPullStageIds = new Set<string>()
       for (const binding of batch.pulls) {
+        const appliedStage = binding.stage
         await this.applyPullBinding(binding, ownedStages, () => {
           pullCompleted++
           this.report({ currentPath: binding.change.path, currentDirection: "pull", pull: directional(pullCompleted, pullTotal) })
         })
+        if (appliedStage && appliedStage.size > DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES) {
+          consumedPullStageIds.add(appliedStage.stageId)
+        }
         pulledFiles++
+      }
+      for (const binding of batch.pushes) {
+        if (binding.source?.kind !== "stage" || !consumedPullStageIds.has(binding.source.stageId) || !binding.change.after) continue
+        binding.source = {
+          kind: "vault",
+          path: binding.change.after.path,
+          expectedHash: binding.change.after.hash,
+          expectedSize: binding.change.after.size,
+          expectedMtime: binding.change.after.mtime,
+        }
       }
       for (const binding of batch.stagedWrites) {
         await this.applyStagedWrite(binding)

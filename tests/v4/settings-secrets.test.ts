@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import test from "node:test";
 import { readFile } from "node:fs/promises";
-import { modalButtons, Notice, resetModalTestState, TFile } from "obsidian";
+import { modalButtons, Notice, Platform, resetModalTestState, TFile } from "obsidian";
 
 import { DEFAULT_SETTINGS } from "../../src/setting";
 import { assertPluginSettingsRuntimeSafe } from "../../src/lib/plugin-settings-validation";
@@ -153,6 +153,7 @@ class RuntimeMemoryGitHub {
 }
 
 function plaintextRuntimeFixture(pathInput: string | string[] = "secret.md", github = new RuntimeMemoryGitHub(), deviceId = "device") {
+  Platform.isDesktopApp = false;
   const paths = Array.isArray(pathInput) ? pathInput : [pathInput];
   const contents = new Map(paths.map(path => [path, new TextEncoder().encode("body")]));
   const vaultFiles = paths.map(path => {
@@ -830,7 +831,8 @@ test("v4 runtime progress stays out of plugin data, local index files, and the r
   const mainSource = await readFile("src/main.ts", "utf8");
   assert.doesNotMatch(mainSource, /\bsyncProgress\b/u);
   assert.match(mainSource, /v4Runtime\?\.progressSnapshot\s*\?\?\s*createIdleV4Progress/u);
-  assert.match(mainSource, /async persistData\(\)[\s\S]*?saveData\(\{[\s\S]*?settings:\s*sanitizeV4SettingsForPersistence\(this\.settings\)/u);
+  assert.match(mainSource, /private async persistSettingsData\([^)]*settings:\s*PluginSettings[\s\S]*?saveData\(\{[\s\S]*?settings:\s*sanitizeV4SettingsForPersistence\(settings\)/u);
+  assert.match(mainSource, /async persistData\(\)[\s\S]*?persistSettingsData\(this\.settings\)/u);
   assert.match(mainSource, /startupSyncTimeout:\s*number\s*\|\s*null/u);
   assert.match(mainSource, /if \(this\.startupSyncTimeout !== null\) window\.clearTimeout\(this\.startupSyncTimeout\)/u);
   assert.match(mainSource, /onunload\(\)[\s\S]*?clearTimeout\(this\.startupSyncTimeout\)/u);
@@ -1234,7 +1236,7 @@ test("layout-ready startup callback is inert after plugin unload", async () => {
   const mainSource = await readFile("src/main.ts", "utf8")
   assert.match(
     mainSource,
-    /this\.app\.workspace\.onLayoutReady\(\(\)\s*=>\s*\{\s*if\s*\(this\.unloaded\)\s*return[\s\S]*?setTimeout\(\(\)\s*=>\s*\{\s*if\s*\(this\.unloaded\)\s*return/u,
+    /this\.app\.workspace\.onLayoutReady\(\(\)\s*=>\s*\{\s*if\s*\(this\.unloaded\)\s*return[\s\S]*?setTimeout\(\(\)\s*=>\s*\{[\s\S]*?if\s*\(this\.unloaded\)\s*return/u,
   )
 })
 
@@ -1280,11 +1282,11 @@ test("runtime decision modals settle immediately when the active sync is aborted
 
   assert.match(
     runtimeSource,
-    /askConflict\([^)]*signal:\s*AbortSignal[\s\S]*?signal\.addEventListener\("abort"[\s\S]*?finish\(\{\s*action:\s*"ask"\s*\}\)/u,
+    /askConflict\([^)]*signal:\s*AbortSignal[\s\S]*?onAbort\s*=\s*\(\)\s*=>\s*finish\(\{\s*action:\s*"ask"\s*\}\)[\s\S]*?signal\.addEventListener\("abort",\s*onAbort/u,
   );
   assert.match(
     runtimeSource,
-    /confirmThresholdOverride\([^)]*signal:\s*AbortSignal[\s\S]*?signal\.addEventListener\("abort"[\s\S]*?finish\(false\)/u,
+    /confirmThresholdOverride\([\s\S]*?signal:\s*AbortSignal[\s\S]*?onAbort\s*=\s*\(\)\s*=>\s*finish\(false\)[\s\S]*?signal\.addEventListener\("abort",\s*onAbort/u,
   );
   assert.match(
     runtimeSource,

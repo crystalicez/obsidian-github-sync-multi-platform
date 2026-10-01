@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { TFile } from "obsidian";
+import { Platform, TFile } from "obsidian";
 
 import type { GitHubCreateTreeEntry } from "../../src/lib/github-git-types";
 import { V4PluginRuntime } from "../../src/lib/v4/runtime";
@@ -106,6 +106,7 @@ class MemoryObsidianVault {
 }
 
 function pluginFixture() {
+  Platform.isDesktopApp = false;
   const githubClient = new MemoryGitHub();
   const vault = new MemoryObsidianVault();
   const ignoredFiles = new Set<string>();

@@ -12,7 +12,7 @@ import { decryptV4Payload, deriveV4Keyring, encryptV4Payload } from "../../src/l
 import { sha256Hex } from "../../src/lib/bytes";
 import { buildV4RemoteMetadata } from "../../src/lib/v4/remote-index";
 import { publishV4TreeChanges } from "../../src/lib/v4/git-tree-writer";
-import { buildV4PartPaths, V4_LARGE_FILE_THRESHOLD_BYTES } from "../../src/lib/v4/large-files";
+import { buildV4PartPaths, V4_LARGE_FILE_THRESHOLD_BYTES, V4_PART_BYTES } from "../../src/lib/v4/large-files";
 import type { V4SyncProgressPatch } from "../../src/lib/v4/progress";
 import { DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES, type V4ContentHandle, type V4ContentSource } from "../../src/lib/v4/content-source";
 import { planV4PackGroups } from "../../src/lib/v4/pack-planner";
@@ -89,7 +89,7 @@ class MemoryVault implements V4SessionVault {
   async stat(path: string) { const file = this.files.get(path); return file ? { path, size: file.bytes.byteLength, mtime: file.mtime } : null; }
   async read(path: string) { this.operations.push(`read:${path}`); return new Uint8Array(this.files.get(path)!.bytes); }
   async openContentSource(handle: V4ContentHandle): Promise<V4ContentSource> {
-    if (handle.kind !== "vault") throw new Error("MemoryVault only opens vault handles.");
+    if (handle.kind === "stage") return this.staging.open({ stageId: handle.stageId, size: handle.expectedSize });
     const file = this.files.get(handle.path);
     if (!file) throw new Error(`Missing local file: ${handle.path}`);
     return {
@@ -973,7 +973,7 @@ test("v4 session validates the remote head while reusing unchanged cached shards
   github.readPaths.length = 0;
   await session.sync({ operation: "normal", allowThresholdOverride: false });
 
-  assert.deepEqual(github.readRefs, [github.ref!.sha]);
+  assert.deepEqual(github.readRefs, [github.ref!.sha, github.ref!.sha]);
   assert.deepEqual(github.readPaths, [V4_CONFIG_PATH, V4_HEAD_PATH]);
   assert.deepEqual(github.treeReads, []);
 });
@@ -1065,7 +1065,7 @@ test("v4 encrypted correct-key matching-SHA no-op reads only config and authenti
   assert.equal(result.mode, "noop");
   assert.deepEqual(github.readPaths, [V4_CONFIG_PATH, V4_HEAD_PATH]);
   assert.deepEqual(github.treeReads, []);
-  assert.deepEqual(vault.operations, []);
+  assert.deepEqual(vault.operations, ["read:secret.md"], "authoritative no-change scans still rehash local bytes");
 
   const bucket = Object.keys(index.shards)[0];
   const cachedRecord = Object.values(index.shards[bucket].records)[0];
@@ -2253,7 +2253,7 @@ test("v4 stale device reconciles a direct GitHub edit after a newer plugin commi
   assert.ok(github.treeReads.includes("tree-external"));
 });
 
-test("v4 no-op reuses all 256 unchanged local index shards", async () => {
+test("v4 no-op reuses all 256 unchanged remote shards while rehashing authoritative local state", async () => {
   const github = new MemoryGitHub();
   const vault = new MemoryVault();
   const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "d", mode: "plaintext" });
@@ -2287,7 +2287,7 @@ test("v4 no-op reuses all 256 unchanged local index shards", async () => {
 
   assert.equal(result.mode, "noop");
   assert.deepEqual(github.readPaths, [V4_CONFIG_PATH, V4_HEAD_PATH]);
-  assert.equal(vault.operations.length, 0);
+  assert.equal(vault.operations.filter(operation => operation.startsWith("read:")).length, 256);
 });
 
 test("v4 authenticated remote duplicate fileIds are rejected before normal or Force Pull mutation", async () => {
@@ -2678,7 +2678,8 @@ test("v4 keep-both chunked conflict streams the remote copy instead of whole-buf
   const bucket = pathId.slice(0, 2);
   const fileId = "chunk-conflict-file";
   const makeRecord = async (version: string, bytes: Uint8Array) => {
-    const partPaths = buildV4PartPaths({ mode: "plaintext", logicalPath: path, version, partCount: bytes.byteLength });
+    const partCount = Math.ceil(bytes.byteLength / V4_PART_BYTES);
+    const partPaths = buildV4PartPaths({ mode: "plaintext", logicalPath: path, version, partCount });
     return {
       path,
       pathId,
@@ -2693,7 +2694,7 @@ test("v4 keep-both chunked conflict streams the remote copy instead of whole-buf
     };
   };
   const publish = async (record: V4IndexFileRecord, bytes: Uint8Array, generation: number, expectedHeadSha?: string) => {
-    const shardHash = await sha256Hex(enc(JSON.stringify([record])));
+    const shardHash = await hashV4ShardRecords([record]);
     const head: V4RemoteHead = {
       formatVersion: 4,
       mode: "plaintext",
@@ -2704,7 +2705,10 @@ test("v4 keep-both chunked conflict streams the remote copy instead of whole-buf
       updatedAt: generation,
       deviceId: "remote",
     };
-    const objectFiles = record.partPaths!.map((partPath, index) => ({ path: partPath, bytes: bytes.subarray(index, index + 1) }));
+    const objectFiles = record.partPaths!.map((partPath, index) => {
+      const start = index * V4_PART_BYTES;
+      return { path: partPath, bytes: bytes.subarray(start, Math.min(bytes.byteLength, start + V4_PART_BYTES)) };
+    });
     return publishV4TreeChanges(github, {
       message: `obsidian-sync-v4:${record.remoteVersion}`,
       files: [...objectFiles, ...await buildV4RemoteMetadata({ config: config(), head, records: [record] })],
@@ -2712,16 +2716,19 @@ test("v4 keep-both chunked conflict streams the remote copy instead of whole-buf
     });
   };
 
-  const baseBytes = new Uint8Array([1, 1]);
-  const remoteBytes = new Uint8Array([2, 2]);
+  const remoteBytes = new Uint8Array(V4_LARGE_FILE_THRESHOLD_BYTES + 1);
+  remoteBytes[0] = 1;
+  remoteBytes[remoteBytes.byteLength - 1] = 1;
   const localBytes = new Uint8Array([3, 3]);
-  const baseRecord = await makeRecord("v1", baseBytes);
-  const base = await publish(baseRecord, baseBytes, 1);
+  const baseRecord = await makeRecord("v1", remoteBytes);
+  const base = await publish(baseRecord, remoteBytes, 1);
+  remoteBytes[0] = 2;
+  remoteBytes[remoteBytes.byteLength - 1] = 2;
   const remoteRecord = await makeRecord("v2", remoteBytes);
   await publish(remoteRecord, remoteBytes, 2, base.commitSha);
 
   const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "local", mode: "plaintext" });
-  const baseHash = await sha256Hex(enc(JSON.stringify([baseRecord])));
+  const baseHash = await hashV4ShardRecords([baseRecord]);
   index.remoteCommitSha = base.commitSha;
   index.epoch = 1;
   index.generation = 1;
@@ -2757,7 +2764,11 @@ test("v4 keep-both chunked conflict streams the remote copy instead of whole-buf
 
   const copyPath = [...vault.files.keys()].find(candidate => candidate.includes(".conflict-remote-"));
   assert.ok(copyPath);
-  assert.deepEqual(vault.files.get(copyPath!)?.bytes, remoteBytes);
+  const copied = vault.files.get(copyPath!)?.bytes;
+  assert.ok(copied);
+  assert.equal(copied.byteLength, remoteBytes.byteLength);
+  assert.equal(copied[0], 2);
+  assert.equal(copied[copied.byteLength - 1], 2);
   assert.deepEqual(vault.files.get(path)?.bytes, localBytes);
 });
 

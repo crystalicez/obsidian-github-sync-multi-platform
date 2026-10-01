@@ -468,7 +468,7 @@ export class V4StorageCodec {
     }
 
     const plaintextSha256 = hash.digestHex()
-    if (total !== record.size) throw new Error(`V4 content size mismatch: expected ${record.size}, got ${total}.`)
+    if (total !== record.size) throw new Error(`V4 content size mismatch: ${record.remotePath}; expected ${record.size}, got ${total}.`)
     if (record.plaintextSha256 && plaintextSha256 !== record.plaintextSha256) throw new Error(`V4 content hash mismatch: ${record.remotePath}`)
     return { plaintextSha256, size: total }
   }
@@ -548,7 +548,7 @@ export class V4StorageCodec {
           aad: this.contentAad(record),
         }))
       if (plaintext.byteLength !== record.size) {
-        throw new Error(`V4 content size mismatch: expected ${record.size}, got ${plaintext.byteLength}.`)
+        throw new Error(`V4 content size mismatch: ${record.remotePath}; expected ${record.size}, got ${plaintext.byteLength}.`)
       }
       if (record.plaintextSha256 && await this.crypto(() => sha256Hex(plaintext)) !== record.plaintextSha256) {
         throw new Error(`V4 content hash mismatch: ${record.remotePath}`)
@@ -570,7 +570,7 @@ export class V4StorageCodec {
     })
     const plaintext = await joinAndVerifyV4Parts(parts, record.plaintextSha256)
     if (plaintext.byteLength !== record.size) {
-      throw new Error(`V4 content size mismatch: expected ${record.size}, got ${plaintext.byteLength}.`)
+      throw new Error(`V4 content size mismatch: ${record.remotePath}; expected ${record.size}, got ${plaintext.byteLength}.`)
     }
     return plaintext
   }

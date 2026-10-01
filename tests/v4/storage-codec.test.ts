@@ -179,7 +179,7 @@ test("v4 pack reader rejects writer-incompatible entry size before base64 alloca
 
 test("v4 whole-buffer reads reject plaintext length that disagrees with remote metadata", async () => {
   const codec = new V4StorageCodec({ mode: "plaintext", pathLayout: "plaintext-v1" });
-  const singleBytes = enc("oversized-single");
+  const singleBytes = bytes("oversized-single");
   const singleRecord = {
     pathId: "aa".padEnd(64, "0"),
     fileId: "single-file",
@@ -195,8 +195,8 @@ test("v4 whole-buffer reads reject plaintext length that disagrees with remote m
     /size mismatch/iu,
   );
 
-  const chunkA = enc("abc");
-  const chunkB = enc("def");
+  const chunkA = bytes("abc");
+  const chunkB = bytes("def");
   const chunked = new Uint8Array([...chunkA, ...chunkB]);
   const partPaths = [".obsidian-github-sync-v4/large/x/v1/000001.part", ".obsidian-github-sync-v4/large/x/v1/000002.part"];
   const chunkRecord = {
