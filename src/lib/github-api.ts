@@ -549,7 +549,9 @@ export class GitHubClient {
     parents: string[],
     options: { originalCannotBeReachable?: boolean } = {},
   ): Promise<string> {
-    const bodyValue = { message, tree, parents };
+    const expectedTreeSha = requiredGitObjectSha(tree, "created commit tree SHA");
+    const expectedParentShas = parents.map(parent => requiredGitObjectSha(parent, "created commit parent SHA"));
+    const bodyValue = { message, tree: expectedTreeSha, parents: expectedParentShas };
     const response = await this.mutationRequest({
       options: { url: `${this.baseUrl}/git/commits`, method: "POST", headers: this.headers, throw: false },
       bodyValue,
@@ -558,7 +560,14 @@ export class GitHubClient {
       successStatuses: [201],
       action: "Failed to create git commit",
     });
-    return requiredGitObjectSha((response.json as { sha?: string }).sha, "created commit SHA");
+    const responseSha = requiredGitObjectSha((response.json as { sha?: string }).sha, "created commit SHA");
+    const observed = await this.getGitCommit(responseSha);
+    const parentsMatch = observed.parentShas.length === expectedParentShas.length
+      && observed.parentShas.every((parent, index) => parent === expectedParentShas[index]);
+    if (observed.treeSha !== expectedTreeSha || observed.message !== message || !parentsMatch) {
+      throw new Error("GitHub created commit does not match the requested message, tree, and parents.");
+    }
+    return responseSha;
   }
 
   async updateGitRef(sha: string, _expectedSha?: string): Promise<void> {

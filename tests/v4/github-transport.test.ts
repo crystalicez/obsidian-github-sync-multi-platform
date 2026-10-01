@@ -340,10 +340,25 @@ test("GitHubClient retries a lost tree response because the immutable mutation i
 
 test("GitHubClient retries a lost commit response only with explicit orphan-safe evidence", async () => {
   let attempts = 0
-  setRequestUrlHandler(async () => {
-    attempts++
-    if (attempts === 1) throw new Error("commit response lost")
-    return { status: 201, text: "", headers: {}, json: { sha: "7777777777777777777777777777777777777777" } }
+  const commitSha = "7777777777777777777777777777777777777777"
+  const treeSha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  const parentSha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  setRequestUrlHandler(async (options: unknown) => {
+    const request = options as Record<string, any>
+    if (request.method === "POST" && request.url.endsWith("/git/commits")) {
+      attempts++
+      if (attempts === 1) throw new Error("commit response lost")
+      return { status: 201, text: "", headers: {}, json: { sha: commitSha } }
+    }
+    if (request.method === "GET" && request.url.endsWith(`/git/commits/${commitSha}`)) {
+      return {
+        status: 200,
+        text: "",
+        headers: {},
+        json: { sha: commitSha, message: "obsidian-sync-v4:j", tree: { sha: treeSha }, parents: [{ sha: parentSha }] },
+      }
+    }
+    throw new Error(`Unexpected request: ${request.method} ${request.url}`)
   })
   try {
     const client = new GitHubClient(
@@ -351,8 +366,8 @@ test("GitHubClient retries a lost commit response only with explicit orphan-safe
       { transportPolicy: { mutationSpacingMs: 0 } },
     )
     assert.equal(
-      await client.createGitCommit("obsidian-sync-v4:j", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", ["base"], { originalCannotBeReachable: true }),
-      "7777777777777777777777777777777777777777",
+      await client.createGitCommit("obsidian-sync-v4:j", treeSha, [parentSha], { originalCannotBeReachable: true }),
+      commitSha,
     )
     assert.equal(attempts, 2)
   } finally {
