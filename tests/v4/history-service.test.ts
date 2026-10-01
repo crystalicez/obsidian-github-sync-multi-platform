@@ -366,6 +366,38 @@ test("v4 history rejects a journal page that exceeds the writer change-count con
   assert.equal(fixture.reads, 1);
 });
 
+test("v4 history rejects malformed journal change shapes before exposing them to consumers", async () => {
+  const invalidChanges = [
+    { fileId: "f1", kind: "overwrite", path: "note.md" },
+    { fileId: "f1", kind: "modify", path: "../outside.md" },
+    { fileId: "f1", kind: "create", path: "note.md" },
+  ];
+  for (const invalidChange of invalidChanges) {
+    const fixture = historyJournalFixture(page => ({
+      journalId: "123-safe",
+      page,
+      pageCount: 1,
+      changes: [invalidChange],
+    }));
+    const service = new V4HistoryService({
+      github: fixture.github,
+      config: { formatVersion: 4, mode: "plaintext", repoId: "o/r#main", pathLayout: "plaintext-v1" },
+    });
+    const commit = {
+      sha: "c1",
+      message: "obsidian-sync-v4:123-safe",
+      authorName: "A",
+      authoredAt: new Date(0).toISOString(),
+      parentShas: [],
+      source: "plugin" as const,
+      journalId: "123-safe",
+    };
+
+    await assert.rejects(() => service.getCommitChanges(commit), /journal.*change|history.*change|path|descriptor|shape/iu);
+    assert.equal(fixture.reads, 1);
+  }
+});
+
 
 test("v4 history service rejects completion from an obsolete settings generation", async () => {
   let current = true;

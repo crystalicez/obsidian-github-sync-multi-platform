@@ -267,6 +267,18 @@ test("v4 coordinator collapses folder events to one full rescan", async () => {
   assert.deepEqual(executions, [[{ type: "rescan", mtime: 2 }]]);
 });
 
+test("v4 coalescing handles a large local-event burst without spreading every mtime into Math.max", () => {
+  const count = 150_000;
+  const changes: V4QueuedChange[] = Array.from({ length: count }, (_, index) => ({
+    type: "modify",
+    path: `Burst/${index}.md`,
+    mtime: index + 1,
+  }));
+  changes.push({ type: "rescan", mtime: count + 1 });
+
+  assert.deepEqual(coalesceV4Changes(changes), [{ type: "rescan", mtime: count + 1 }]);
+});
+
 test("v4 folder changes preserve causal event order across delete-recreate interactions", () => {
   const changes: V4QueuedChange[] = [
     { type: "folderDelete", path: "F", mtime: 1 },
