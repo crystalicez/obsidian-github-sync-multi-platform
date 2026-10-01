@@ -246,6 +246,43 @@ test("GitHubClient bootstraps a truly empty repository before Git ref writes", a
   }
 });
 
+test("GitHubClient rejects a successful bootstrap commit that is already based on a competitor commit", async () => {
+  const bootstrapSha = "c".repeat(40);
+  const competitorSha = "d".repeat(40);
+  const treeSha = "e".repeat(40);
+  setRequestUrlHandler(async (options: unknown) => {
+    const request = options as Record<string, any>;
+    if (request.url.includes("/git/refs?")) return { status: 409, text: "Git Repository is empty.", headers: {}, json: {} };
+    if (request.method === "PUT") return { status: 201, text: "", headers: {}, json: { commit: { sha: bootstrapSha } } };
+    if (request.method === "GET" && request.url.endsWith(`/git/commits/${bootstrapSha}`)) {
+      return {
+        status: 200,
+        text: "",
+        headers: {},
+        json: {
+          sha: bootstrapSha,
+          message: "obsidian-sync-v4:bootstrap",
+          tree: { sha: treeSha },
+          parents: [{ sha: competitorSha }],
+        },
+      };
+    }
+    if (request.method === "GET" && request.url.includes("/git/ref/heads/main")) {
+      return { status: 200, text: "", headers: {}, json: { ref: "refs/heads/main", object: { sha: bootstrapSha, type: "commit" } } };
+    }
+    throw new Error(`Unexpected request: ${request.method} ${request.url}`);
+  });
+  try {
+    const client = new GitHubClient({ token: "token", owner: "owner", repo: "repo", branch: "main" }, { transportPolicy: { mutationSpacingMs: 0 } });
+    await assert.rejects(
+      () => client.ensureGitRepositoryInitialized(),
+      /bootstrap.*root|bootstrap.*parent|bootstrap.*race|competitor|repository.*changed/iu,
+    );
+  } finally {
+    setRequestUrlHandler(null);
+  }
+});
+
 test("GitHubClient creates a configured custom branch after empty-repository bootstrap", async () => {
   const requests: Array<Record<string, any>> = [];
   let customRefReads = 0;
