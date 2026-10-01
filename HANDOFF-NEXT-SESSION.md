@@ -425,6 +425,23 @@ Audit method:
    - RED: `1c5ca913938a2df2b8c9a034e21669197531d62f`.
    - Fix: `8d56b55c130062934ed3850b43dfcb62b462bb69` validates requested commit/tree IDs before issuing the request and rejects any successful response whose object SHA does not exactly match the requested immutable ID.
 
+60. **HIGH immutable Git mutation integrity — successful blob creation was not bound to the uploaded bytes.**
+   - `createGitBlob()` accepted any syntactically valid SHA returned by a 201 response and handed that SHA to tree construction.
+   - A mismatched success response could therefore make a candidate tree reference different blob bytes from the content that the client actually uploaded.
+   - RED: `e4c68da4e8f37af14ac1add9a715db201b5f30e0`.
+   - Fix: `7cc635aa3ee71bdbe36ddce8a6d7b5017c895f27` computes the deterministic Git blob SHA from the uploaded bytes before the base64/HTTP transient reservation and rejects any successful mutation response whose SHA differs. Existing transport fixtures were updated to use the real Git object IDs of their uploaded bodies.
+
+61. **HIGH publication integrity — successful commit creation was not semantically bound to the requested message/tree/parents.**
+   - `createGitCommit()` previously accepted any valid-looking SHA from a 201 response; candidate publication could then update the branch ref to that unrelated commit.
+   - RED: `1192a6c12c3900f87290f38a3702e8c4876d2b64` returns a valid created SHA whose immutable commit has a different message and proves the mismatch was accepted.
+   - Fix: `ddec918b51d3dc4e0129449b0682487cce1fb126` validates requested tree/parent object IDs, reads the returned immutable commit back by SHA, and requires exact message, tree, and ordered parent-list equality before the SHA can become a publication candidate.
+
+62. **HIGH bootstrap integrity/race safety — a successful empty-repository Contents bootstrap could silently adopt a competitor base.**
+   - The empty-repository preflight and Contents PUT are separate operations. If another initializer created the default branch after the preflight but before our PUT, GitHub could accept our PUT as a child commit on that newly created branch.
+   - The previous success path trusted the returned commit SHA and could then accept/create the configured ref at that child commit, thereby inheriting competitor state despite the operation having been planned as an empty-repository bootstrap.
+   - RED: `e042790b06fbce6621054a4ab67b3edbdcb6a855` models a successful bootstrap response whose immutable commit already has a competitor parent.
+   - Fix: `a4f9d5ba5ecd26140cb3a237251aa96939783276` reads the successful bootstrap commit immutably before any configured-ref adoption, requires it to be a root commit with the exact bootstrap message, and surfaces a typed `V4RepositoryBootstrapRaceError` carrying the observed parent SHA when a competitor base is present.
+
 ### Audited surfaces with no new confirmed defect so far
 
 - secret migration/persistence: raw token/passphrase are removed before plugin data persistence and use Obsidian SecretStorage;
@@ -439,6 +456,7 @@ Audit method:
 - retired encrypted key material is best-effort zeroized on runtime disposal, but resolved keyrings invalidated by settings changes may remain in the cache's retired set until disposal. Immediate zeroization is intentionally not changed yet because history work exists outside the sync coordinator and can hold a live keyring reference; settings-generation guards now stop stale history results, but tighter reference-counted key lifetime remains a residual hardening opportunity. (full path/duplicate-ID/numeric validation), but header integrity and normal writer ownership mean no equivalent concrete production corruption path is confirmed yet.
 - Obsidian `requestUrl` buffers HTTP response bodies before the V4 reader can inspect expected descriptor/tree sizes. Git/V4 integrity checks and read concurrency still fail closed after receipt, but a forged unexpectedly large remote blob can create transient peak memory above the writer contract before rejection. A meaningful fix requires a streaming/bounded transport API; a post-allocation size check would not solve the peak-memory risk and is intentionally not presented as mitigation.
 - Remote metadata/history fields still rely partly on transport size plus post-parse writer-shape validation rather than one universal pre-parse byte/string ceiling. This pass specifically reviewed journal bytes and `fileId` length; no new cap was added because the current writer contract does not define a portable total-path/metadata-byte maximum and tightening arbitrary string lengths could reject existing V4 data. Treat this as protocol/resource-hardening design work, not a confirmed destructive bug in this pass.
+- `createGitTree()` still validates successful tree mutation responses primarily as Git object IDs rather than proving full semantic equivalence to `base_tree + requested edits`. Blob creation and commit creation are now bound to their intended bytes/semantics, so this remaining gap is narrower, but an exact tree proof needs authenticated reconstruction/readback of the base and result tree. A naive recursive-tree comparison would add large-repository cost and can itself encounter truncated tree responses, so do not add a broad recursive scan merely to close this residual; design a bounded exact-tree proof first.
 
 - Supply-chain review: the repository has no runtime npm dependencies; build/test dependencies are lockfile-managed. `esbuild ^0.24.2` is in a known affected range for dev-server advisories (including the historical cross-origin dev-server issue and a Windows servedir file-read issue), but this repository's `esbuild.config.mjs` uses only `context().watch()/rebuild()` and never starts `serve()`. Treat esbuild `0.24.2` as a dev-tooling hygiene residual, not a production/runtime blocker. Do not hand-edit the pnpm lockfile; upgrade only with a real pnpm install + build/package verification.
 - Repository-host security alert APIs (Dependabot/secret-scanning/code-scanning) were probed through the available GitHub connector but were not readable with the current connector permissions, so this audit does not claim server-side alert dashboards are empty.
@@ -456,6 +474,9 @@ RED tests have now been pushed on the audit branch:
 - `ee6640d6fe02f9e493158f3c60e30e026fbd6948` — file-history traversal must have one aggregate journal-read budget, and scheduled intervals must stay within the signed 32-bit timer delay range.
 - `8aac1d5bc0b7598dafd25e4302be4035e960ff08` — large coordinator event bursts must not depend on argument-spread limits, and remote history journal changes must be writer-shaped before exposure.
 - `1c5ca913938a2df2b8c9a034e21669197531d62f` — successful immutable Git commit/tree reads must be bound to the exact requested object IDs, not merely valid-looking SHA strings.
+- `e4c68da4e8f37af14ac1add9a715db201b5f30e0` — successful Git blob creation must return the deterministic object ID of the uploaded bytes.
+- `1192a6c12c3900f87290f38a3702e8c4876d2b64` — successful Git commit creation must read back to the requested message/tree/parents before publication.
+- `e042790b06fbce6621054a4ab67b3edbdcb6a855` — a successful empty-repository bootstrap commit must still be a root commit rather than silently inheriting a competitor base.
 
 Refined root-cause design:
 - create one canonical shard-record hash function and use it for writer hash creation, remote shard verification, and local persisted-cache verification;
@@ -478,6 +499,9 @@ Root-cause fixes are now on the audit branch:
 - `ff2780ff1543fde9b3914db174b733a998011f9f` — bound whole-buffer chunk remote reads to four concurrent part fetches.
 - `e1173260c083c2be55c4317ed1fec119b90a488f` — remove coordinator argument-spread amplification and validate remote journal change semantics/paths/descriptors before history consumers observe them.
 - `8d56b55c130062934ed3850b43dfcb62b462bb69` — bind successful immutable Git commit/tree reads to the exact requested SHA before their evidence is trusted.
+- `7cc635aa3ee71bdbe36ddce8a6d7b5017c895f27` — bind successful Git blob creation to the deterministic SHA-1 of the uploaded bytes.
+- `ddec918b51d3dc4e0129449b0682487cce1fb126` — validate commit mutation inputs and read the created commit back to bind message/tree/parents before publication.
+- `a4f9d5ba5ecd26140cb3a237251aa96939783276` — authenticate successful empty-repository bootstrap as a root commit with the exact bootstrap message before accepting/creating the configured ref.
 - `6151868d066c050deef9159d3beda389e2ae0ce7`, `d9cde1a72496a8c86df5c85b975d39b92998f873`, `0c301523e774d54bc03191aa7a897da98691ac81`, `06335328777bd5010e928c1951f1cdb581aac2f0` — bounded journal writer/reader contract, safe journal markers, cross-page consistency, descriptor validation before blob reads, and preview-limit precedence.
 - fixture-only followups `4ce0affffce484398db30b0de339af8a2dd1e5cf`, `e5ae96eda6003faa4233346bd5104561e2258923`, `40fc418844c40a52ef4baa39c7318f21a5547782`, `b876e4076084e544ec13ec0ef60c9ef7e0cbcc8a` keep tests protocol-shaped rather than weakening production validation.
 
@@ -488,9 +512,9 @@ Recent crash/memory hardening:
 
 Verification status:
 - The repository was executed through the connected local engineering workspace with Node `v24.11.0` and pnpm `9.12.3`.
-- Final post-fix gates on the current source tree: `pnpm run test:fast` **497/497**, `pnpm run test:recovery` **48/48**, `pnpm run test:resource` **11/11**, and `pnpm run build` PASS.
+- Final post-fix gates on the current source tree: `pnpm run test:fast` **500/500**, `pnpm run test:recovery` **48/48**, `pnpm run test:resource` **11/11**, and `pnpm run build` PASS.
 - Final release checks also pass on regenerated artifacts: `pnpm run validate:metadata` and `pnpm run validate:package`.
-- Focused regressions in the latest audit pass: github-transport **35/35**, history-service **13/13**, and sync-coordinator **25/25**; prior sync-policy **2/2**, storage-codec **12/12**, opaque-leakage **2/2**, and sync-session **95/95** remain covered by the full fast gate.
+- Focused regressions in the latest audit pass: github-transport **38/38**; prior history-service **13/13**, sync-coordinator **25/25**, sync-policy **2/2**, storage-codec **12/12**, opaque-leakage **2/2**, and sync-session **95/95** remain covered by the full fast gate.
 - Real GitHub E2E remains excluded from the default fast tier and was not run in this closure; inspect hosted checks for the exact pushed SHA separately before treating the branch as release-qualified.
 
 ### TDD plan
