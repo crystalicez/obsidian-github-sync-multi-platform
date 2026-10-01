@@ -451,6 +451,66 @@ test("GitHubClient rejects a configured branch that appears at a competitor SHA 
   }
 });
 
+test("GitHubClient rejects a configured branch that moves away immediately after successful bootstrap ref creation", async () => {
+  const bootstrapSha = "c".repeat(40);
+  const competitorSha = "d".repeat(40);
+  const treeSha = "e".repeat(40);
+  let configuredReads = 0;
+  setRequestUrlHandler(async (options: unknown) => {
+    const request = options as Record<string, any>;
+    if (request.url.includes("/git/refs?")) return { status: 409, text: "empty", headers: {}, json: {} };
+    if (request.method === "PUT") return { status: 201, text: "", headers: {}, json: { commit: { sha: bootstrapSha } } };
+    if (request.method === "GET" && request.url.endsWith(`/git/commits/${bootstrapSha}`)) {
+      return {
+        status: 200,
+        text: "",
+        headers: {},
+        json: { sha: bootstrapSha, message: "obsidian-sync-v4:bootstrap", tree: { sha: treeSha }, parents: [] },
+      };
+    }
+    if (request.method === "GET" && request.url.includes("/contents/.obsidian-github-sync-v4/bootstrap")) {
+      const bytes = new TextEncoder().encode("obsidian-github-sync-v4\n");
+      return {
+        status: 200,
+        text: "",
+        headers: {},
+        json: { content: toBase64(bytes), encoding: "base64", sha: "030651af7d33cfcb8f2275a9a94221968794650e" },
+        arrayBuffer: new ArrayBuffer(0),
+      };
+    }
+    if (request.method === "GET" && request.url.includes("/git/ref/heads/v4-sync")) {
+      configuredReads++;
+      return configuredReads === 1
+        ? { status: 404, text: "missing", headers: {}, json: {} }
+        : { status: 200, text: "", headers: {}, json: { ref: "refs/heads/v4-sync", object: { sha: competitorSha, type: "commit" } } };
+    }
+    if (request.method === "POST" && request.url.endsWith("/git/refs")) {
+      return {
+        status: 201,
+        text: "",
+        headers: {},
+        json: { ref: "refs/heads/v4-sync", object: { sha: bootstrapSha, type: "commit" } },
+      };
+    }
+    throw new Error(`Unexpected request: ${request.method} ${request.url}`);
+  });
+  try {
+    const client = new GitHubClient({ token: "token", owner: "owner", repo: "repo", branch: "v4-sync" }, { transportPolicy: { mutationSpacingMs: 0 } });
+    await assert.rejects(
+      () => client.ensureGitRepositoryInitialized(),
+      error => {
+        const candidate = error as Error & { code?: string; observedRefSha?: string };
+        assert.equal(candidate.name, "V4RepositoryBootstrapRaceError");
+        assert.equal(candidate.code, "V4_REPOSITORY_BOOTSTRAP_RACE");
+        assert.equal(candidate.observedRefSha, competitorSha);
+        return true;
+      },
+    );
+  } finally {
+    setRequestUrlHandler(null);
+  }
+});
+
 test("GitHubClient falls back to Git Blob bytes when Contents omits a large payload", async () => {
   const requests: string[] = [];
   setRequestUrlHandler(async (options: unknown) => {
