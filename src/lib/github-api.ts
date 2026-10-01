@@ -308,8 +308,9 @@ export class GitHubClient {
   }
 
   async getTreeAt(treeSha: string, recursive = true): Promise<GitHubTree> {
+    const expectedTreeSha = requiredGitObjectSha(treeSha, "requested tree SHA");
     const response = await this.request({
-      url: `${this.baseUrl}/git/trees/${encodeURIComponent(treeSha)}${recursive ? "?recursive=1" : ""}`,
+      url: `${this.baseUrl}/git/trees/${encodeURIComponent(expectedTreeSha)}${recursive ? "?recursive=1" : ""}`,
       method: "GET",
       headers: this.headers,
       throw: false,
@@ -338,8 +339,12 @@ export class GitHubClient {
       }
       return { ...entry, url: typeof entry.url === "string" ? entry.url : "" } as GitHubTreeNode;
     });
+    const responseTreeSha = requiredGitObjectSha(raw.sha, "tree SHA");
+    if (responseTreeSha !== expectedTreeSha) {
+      throw new Error("Malformed GitHub response: tree SHA does not match the requested tree.");
+    }
     return {
-      sha: requiredGitObjectSha(raw.sha, "tree SHA"),
+      sha: responseTreeSha,
       url: typeof raw.url === "string" ? raw.url : "",
       tree,
       truncated: raw.truncated,
@@ -479,8 +484,9 @@ export class GitHubClient {
   }
 
   async getGitCommit(sha: string): Promise<GitHubGitCommit> {
+    const expectedCommitSha = requiredGitObjectSha(sha, "requested commit SHA");
     const response = await this.request({
-      url: `${this.baseUrl}/git/commits/${encodeURIComponent(sha)}`,
+      url: `${this.baseUrl}/git/commits/${encodeURIComponent(expectedCommitSha)}`,
       method: "GET",
       headers: this.headers,
       throw: false,
@@ -489,8 +495,12 @@ export class GitHubClient {
     const json = response.json as { sha?: string; message?: string; tree?: { sha?: string }; parents?: Array<{ sha?: string }> };
     if (json.parents !== undefined && !Array.isArray(json.parents)) throw new Error("Malformed GitHub response: commit parents are invalid.");
     const parentShas = (json.parents ?? []).map(parent => requiredGitObjectSha(parent?.sha, "commit parent SHA"));
+    const responseCommitSha = requiredGitObjectSha(json.sha, "commit SHA");
+    if (responseCommitSha !== expectedCommitSha) {
+      throw new Error("Malformed GitHub response: commit SHA does not match the requested commit.");
+    }
     return {
-      sha: requiredGitObjectSha(json.sha, "commit SHA"),
+      sha: responseCommitSha,
       treeSha: requiredGitObjectSha(json.tree?.sha, "commit tree SHA"),
       parentShas,
       message: json.message,
