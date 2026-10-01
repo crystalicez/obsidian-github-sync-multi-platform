@@ -351,6 +351,32 @@ export class GitHubClient {
     };
   }
 
+  private async assertBootstrapTreeShape(rootTreeSha: string, markerSha: string, markerSize: number): Promise<void> {
+    const [directoryName, markerName] = V4_BOOTSTRAP_PATH.split("/");
+    const root = await this.getTreeAt(rootTreeSha, false);
+    if (root.truncated || root.tree.length !== 1) {
+      throw new Error("GitHub bootstrap tree shape contains unexpected root entries.");
+    }
+    const directory = root.tree[0];
+    if (directory.path !== directoryName || directory.type !== "tree" || directory.mode !== "040000") {
+      throw new Error("GitHub bootstrap tree shape does not contain the expected bootstrap directory.");
+    }
+    const nested = await this.getTreeAt(directory.sha, false);
+    if (nested.truncated || nested.tree.length !== 1) {
+      throw new Error("GitHub bootstrap tree shape contains unexpected bootstrap-directory entries.");
+    }
+    const marker = nested.tree[0];
+    if (
+      marker.path !== markerName
+      || marker.type !== "blob"
+      || marker.mode !== "100644"
+      || marker.sha !== markerSha
+      || marker.size !== markerSize
+    ) {
+      throw new Error("GitHub bootstrap tree shape does not match the requested bootstrap marker.");
+    }
+  }
+
   private configuredRefName(): string {
     return `refs/heads/${this.config.branch}`;
   }
@@ -505,6 +531,7 @@ export class GitHubClient {
     if (!bootstrapContentMatches) {
       throw new Error("GitHub bootstrap marker content does not match the requested bootstrap mutation.");
     }
+    await this.assertBootstrapTreeShape(bootstrapCommit.treeSha, bootstrapFile.sha, bootstrapBytes.byteLength);
     return this.ensureConfiguredBootstrapRef(commitSha);
   }
 

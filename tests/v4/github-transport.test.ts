@@ -6,6 +6,37 @@ import { toBase64 } from "../../src/lib/bytes";
 import { GitHubClient } from "../../src/lib/github-api";
 import { V4RequestScheduler } from "../../src/lib/v4/request-scheduler";
 
+function cleanBootstrapTreeResponse(request: Record<string, any>, rootTreeSha: string) {
+  const directorySha = "a".repeat(40);
+  const markerSha = "030651af7d33cfcb8f2275a9a94221968794650e";
+  const markerSize = new TextEncoder().encode("obsidian-github-sync-v4\n").byteLength;
+  if (request.method === "GET" && request.url.includes(`/git/trees/${rootTreeSha}`)) {
+    return {
+      status: 200,
+      text: "",
+      headers: {},
+      json: {
+        sha: rootTreeSha,
+        truncated: false,
+        tree: [{ path: ".obsidian-github-sync-v4", mode: "040000", type: "tree", sha: directorySha }],
+      },
+    };
+  }
+  if (request.method === "GET" && request.url.includes(`/git/trees/${directorySha}`)) {
+    return {
+      status: 200,
+      text: "",
+      headers: {},
+      json: {
+        sha: directorySha,
+        truncated: false,
+        tree: [{ path: "bootstrap", mode: "100644", type: "blob", sha: markerSha, size: markerSize }],
+      },
+    };
+  }
+  return undefined;
+}
+
 test("GitHubClient pins the API version and paginates commit history", async () => {
   const requests: Array<Record<string, any>> = [];
   setRequestUrlHandler(async (options: unknown) => {
@@ -249,6 +280,8 @@ test("GitHubClient bootstraps a truly empty repository before Git ref writes", a
         arrayBuffer: new ArrayBuffer(0),
       };
     }
+    const treeResponse = cleanBootstrapTreeResponse(request, "e".repeat(40));
+    if (treeResponse) return treeResponse;
     if (request.method === "GET" && request.url.includes("/git/ref/heads/")) {
       return { status: 200, text: "", headers: {}, json: { ref: "refs/heads/main", object: { sha: "cccccccccccccccccccccccccccccccccccccccc", type: "commit" } } };
     }
@@ -449,6 +482,8 @@ test("GitHubClient creates a configured custom branch after empty-repository boo
         arrayBuffer: new ArrayBuffer(0),
       };
     }
+    const treeResponse = cleanBootstrapTreeResponse(request, "e".repeat(40));
+    if (treeResponse) return treeResponse;
     if (request.method === "GET" && request.url.includes("/git/ref/heads/v4-sync")) {
       customRefReads++;
       return customRefReads === 1
@@ -500,6 +535,8 @@ test("GitHubClient rejects a configured branch that appears at a competitor SHA 
         arrayBuffer: new ArrayBuffer(0),
       };
     }
+    const treeResponse = cleanBootstrapTreeResponse(request, treeSha);
+    if (treeResponse) return treeResponse;
     if (request.method === "GET" && request.url.includes("/git/ref/heads/v4-sync")) {
       return { status: 200, text: "", headers: {}, json: { ref: "refs/heads/v4-sync", object: { sha: competitorSha, type: "commit" } } };
     }
@@ -549,6 +586,8 @@ test("GitHubClient rejects a configured branch that moves away immediately after
         arrayBuffer: new ArrayBuffer(0),
       };
     }
+    const treeResponse = cleanBootstrapTreeResponse(request, treeSha);
+    if (treeResponse) return treeResponse;
     if (request.method === "GET" && request.url.includes("/git/ref/heads/v4-sync")) {
       configuredReads++;
       return configuredReads === 1
@@ -767,6 +806,8 @@ test("bootstrap branch creation observes the configured ref before retrying a lo
         arrayBuffer: new ArrayBuffer(0),
       };
     }
+    const treeResponse = cleanBootstrapTreeResponse(request, "e".repeat(40));
+    if (treeResponse) return treeResponse;
     if (request.method === "GET" && request.url.includes("/git/ref/heads/v4-sync")) {
       return customExists
         ? { status: 200, text: "", headers: {}, json: { ref: "refs/heads/v4-sync", object: { sha: "cccccccccccccccccccccccccccccccccccccccc", type: "commit" } } }
