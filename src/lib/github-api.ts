@@ -425,7 +425,8 @@ export class GitHubClient {
   async getGitRefOrNull(): Promise<GitHubGitRef | null> {
     try { return await this.getGitRef(); }
     catch (error) {
-      if ((error as { status?: number }).status === 404) return null;
+      const status = (error as { status?: number }).status;
+      if (status === 404 || status === 409) return null;
       throw error;
     }
   }
