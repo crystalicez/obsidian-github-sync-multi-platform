@@ -426,7 +426,8 @@ export class GitHubClient {
     try { return await this.getGitRef(); }
     catch (error) {
       const status = (error as { status?: number }).status;
-      if (status === 404 || status === 409) return null;
+      if (status === 404) return null;
+      if (status === 409 && /git repository is empty/iu.test((error as Error).message)) return null;
       throw error;
     }
   }
