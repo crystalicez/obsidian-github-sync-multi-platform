@@ -392,6 +392,18 @@ Audit method:
    - The strict payload-size and exact archive-entry-set checks remain intact; this repair does not weaken finding 50.
    - This regression was caught on the audit branch before merge/release.
 
+55. **MEDIUM remote resource safety — file-history traversal had no aggregate journal page-read budget.**
+   - Per-commit journal validation capped one journal at 256 pages, but `getFileVersions()` can scan up to 20 commit-list pages × 50 commits.
+   - A history made entirely of valid plugin markers with writer-limit journals could therefore drive roughly 256,000 journal-object reads for one file-history request even though every individual commit was protocol-shaped.
+   - RED: `ee6640d6fe02f9e493158f3c60e30e026fbd6948` proves aggregate fanout was unbounded across otherwise valid commits.
+   - Fix: `45123da` gives one `getFileVersions()` traversal a shared 1,024-page journal-read budget and decrements it before each remote page fetch. Single-commit history inspection retains the existing per-journal 256-page contract.
+
+56. **LOW/MEDIUM reliability — scheduled sync intervals could exceed the signed 32-bit timer delay range.**
+   - Runtime settings accepted any positive finite `scheduledSyncIntervalSeconds`; normalization enforced the 30-second minimum but no upper timer bound.
+   - Extremely large but otherwise valid values were multiplied by 1,000 and passed to `setInterval`, where timer implementations can overflow/clamp an out-of-range delay into unexpectedly frequent execution.
+   - RED: `ee6640d6fe02f9e493158f3c60e30e026fbd6948` shows `Number.MAX_VALUE` survived normalization unchanged.
+   - Fix: `45123da` clamps normalized intervals to `Math.floor(0x7fffffff / 1000)` = 2,147,483 seconds while preserving the existing default and 30-second minimum.
+
 ### Audited surfaces with no new confirmed defect so far
 
 - secret migration/persistence: raw token/passphrase are removed before plugin data persistence and use Obsidian SecretStorage;
@@ -405,6 +417,7 @@ Audit method:
 - recovery payload path/ID/stage/precondition validation is now enforced on both save and load; remaining header-field tightening is low-priority local-state hardening rather than a confirmed destructive path;
 - retired encrypted key material is best-effort zeroized on runtime disposal, but resolved keyrings invalidated by settings changes may remain in the cache's retired set until disposal. Immediate zeroization is intentionally not changed yet because history work exists outside the sync coordinator and can hold a live keyring reference; settings-generation guards now stop stale history results, but tighter reference-counted key lifetime remains a residual hardening opportunity. (full path/duplicate-ID/numeric validation), but header integrity and normal writer ownership mean no equivalent concrete production corruption path is confirmed yet.
 - Obsidian `requestUrl` buffers HTTP response bodies before the V4 reader can inspect expected descriptor/tree sizes. Git/V4 integrity checks and read concurrency still fail closed after receipt, but a forged unexpectedly large remote blob can create transient peak memory above the writer contract before rejection. A meaningful fix requires a streaming/bounded transport API; a post-allocation size check would not solve the peak-memory risk and is intentionally not presented as mitigation.
+- Remote metadata/history fields still rely partly on transport size plus post-parse writer-shape validation rather than one universal pre-parse byte/string ceiling. This pass specifically reviewed journal bytes and `fileId` length; no new cap was added because the current writer contract does not define a portable total-path/metadata-byte maximum and tightening arbitrary string lengths could reject existing V4 data. Treat this as protocol/resource-hardening design work, not a confirmed destructive bug in this pass.
 
 - Supply-chain review: the repository has no runtime npm dependencies; build/test dependencies are lockfile-managed. `esbuild ^0.24.2` is in a known affected range for dev-server advisories (including the historical cross-origin dev-server issue and a Windows servedir file-read issue), but this repository's `esbuild.config.mjs` uses only `context().watch()/rebuild()` and never starts `serve()`. Treat esbuild `0.24.2` as a dev-tooling hygiene residual, not a production/runtime blocker. Do not hand-edit the pnpm lockfile; upgrade only with a real pnpm install + build/package verification.
 - Repository-host security alert APIs (Dependabot/secret-scanning/code-scanning) were probed through the available GitHub connector but were not readable with the current connector permissions, so this audit does not claim server-side alert dashboards are empty.
@@ -419,6 +432,7 @@ RED tests have now been pushed on the audit branch:
 - `89cc24a6664cd4839e8f5e991567cbc653adaf71` — whole-buffer chunk reads must have bounded concurrency.
 - `088e3d18cc4e646f095859259a18d09ab03a6d29` — settings UI/main must quiesce the old generation before publishing new settings/client state.
 - `83a9044b8047c9a57c8bae6e33878fd3db735037` — freshly fetched remote shard records must match the head's advertised shard hash.
+- `ee6640d6fe02f9e493158f3c60e30e026fbd6948` — file-history traversal must have one aggregate journal-read budget, and scheduled intervals must stay within the signed 32-bit timer delay range.
 
 Refined root-cause design:
 - create one canonical shard-record hash function and use it for writer hash creation, remote shard verification, and local persisted-cache verification;
@@ -449,9 +463,9 @@ Recent crash/memory hardening:
 
 Verification status:
 - The repository was executed through the connected local engineering workspace with Node `v24.11.0` and pnpm `9.12.3`.
-- Final post-rebase/post-fix gates on the current source tree: `pnpm run test:fast` **492/492**, `pnpm run test:recovery` **48/48**, `pnpm run test:resource` **11/11**, and `pnpm run build` PASS.
+- Final post-fix gates on the current source tree: `pnpm run test:fast` **494/494**, `pnpm run test:recovery` **48/48**, `pnpm run test:resource` **11/11**, and `pnpm run build` PASS.
 - Final release checks also pass on regenerated artifacts: `pnpm run validate:metadata` and `pnpm run validate:package`.
-- Focused regressions also passed during closure: storage-codec **12/12**, opaque-leakage **2/2**, and sync-session **95/95**.
+- Focused regressions in the latest audit pass: history-service **12/12** and sync-policy **2/2**; prior focused storage-codec **12/12**, opaque-leakage **2/2**, and sync-session **95/95** also remain covered by the full fast gate.
 - Real GitHub E2E remains excluded from the default fast tier and was not run in this closure; inspect hosted checks for the exact pushed SHA separately before treating the branch as release-qualified.
 
 ### TDD plan
