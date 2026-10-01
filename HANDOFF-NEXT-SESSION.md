@@ -442,6 +442,12 @@ Audit method:
    - RED: `e042790b06fbce6621054a4ab67b3edbdcb6a855` models a successful bootstrap response whose immutable commit already has a competitor parent.
    - Fix: `a4f9d5ba5ecd26140cb3a237251aa96939783276` reads the successful bootstrap commit immutably before any configured-ref adoption, requires it to be a root commit with the exact bootstrap message, and surfaces a typed `V4RepositoryBootstrapRaceError` carrying the observed parent SHA when a competitor base is present.
 
+63. **HIGH bootstrap mutation integrity — root/message checks still did not bind the successful bootstrap commit to the exact marker bytes requested.**
+   - After finding 62, a returned bootstrap commit had to be a root commit with the exact bootstrap message, but a different root commit carrying that same message could still be accepted if its `.obsidian-github-sync-v4/bootstrap` bytes differed from the Contents PUT body.
+   - That left one final substitution gap in the successful empty-repository bootstrap path before configured-ref adoption.
+   - RED: `26af58a088acca4f39568a645c1e0e00225a7a26` returns a root commit with the exact bootstrap message but different marker bytes and proves the success path previously accepted it.
+   - Fix: `ff4386adeb24f983316872ae99394464b17efad3` reuses the exact bootstrap bytes sent to Contents PUT, reads the marker back immutably at the returned commit SHA, and requires byte-for-byte equality before accepting or creating the configured ref.
+
 ### Audited surfaces with no new confirmed defect so far
 
 - secret migration/persistence: raw token/passphrase are removed before plugin data persistence and use Obsidian SecretStorage;
@@ -477,6 +483,7 @@ RED tests have now been pushed on the audit branch:
 - `e4c68da4e8f37af14ac1add9a715db201b5f30e0` — successful Git blob creation must return the deterministic object ID of the uploaded bytes.
 - `1192a6c12c3900f87290f38a3702e8c4876d2b64` — successful Git commit creation must read back to the requested message/tree/parents before publication.
 - `e042790b06fbce6621054a4ab67b3edbdcb6a855` — a successful empty-repository bootstrap commit must still be a root commit rather than silently inheriting a competitor base.
+- `26af58a088acca4f39568a645c1e0e00225a7a26` — a successful root bootstrap commit must contain the exact bootstrap marker bytes sent by the client before any configured ref is trusted.
 
 Refined root-cause design:
 - create one canonical shard-record hash function and use it for writer hash creation, remote shard verification, and local persisted-cache verification;
@@ -502,6 +509,7 @@ Root-cause fixes are now on the audit branch:
 - `7cc635aa3ee71bdbe36ddce8a6d7b5017c895f27` — bind successful Git blob creation to the deterministic SHA-1 of the uploaded bytes.
 - `ddec918b51d3dc4e0129449b0682487cce1fb126` — validate commit mutation inputs and read the created commit back to bind message/tree/parents before publication.
 - `a4f9d5ba5ecd26140cb3a237251aa96939783276` — authenticate successful empty-repository bootstrap as a root commit with the exact bootstrap message before accepting/creating the configured ref.
+- `ff4386adeb24f983316872ae99394464b17efad3` — bind successful bootstrap completion to the exact immutable marker bytes that were sent in the Contents PUT before configured-ref adoption.
 - `6151868d066c050deef9159d3beda389e2ae0ce7`, `d9cde1a72496a8c86df5c85b975d39b92998f873`, `0c301523e774d54bc03191aa7a897da98691ac81`, `06335328777bd5010e928c1951f1cdb581aac2f0` — bounded journal writer/reader contract, safe journal markers, cross-page consistency, descriptor validation before blob reads, and preview-limit precedence.
 - fixture-only followups `4ce0affffce484398db30b0de339af8a2dd1e5cf`, `e5ae96eda6003faa4233346bd5104561e2258923`, `40fc418844c40a52ef4baa39c7318f21a5547782`, `b876e4076084e544ec13ec0ef60c9ef7e0cbcc8a` keep tests protocol-shaped rather than weakening production validation.
 
@@ -512,9 +520,9 @@ Recent crash/memory hardening:
 
 Verification status:
 - The repository was executed through the connected local engineering workspace with Node `v24.11.0` and pnpm `9.12.3`.
-- Final post-fix gates on the current source tree: `pnpm run test:fast` **500/500**, `pnpm run test:recovery` **48/48**, `pnpm run test:resource` **11/11**, and `pnpm run build` PASS.
+- Final post-fix gates on the current source tree: `pnpm run test:fast` **501/501**, `pnpm run test:recovery` **48/48**, `pnpm run test:resource` **11/11**, and `pnpm run build` PASS.
 - Final release checks also pass on regenerated artifacts: `pnpm run validate:metadata` and `pnpm run validate:package`.
-- Focused regressions in the latest audit pass: github-transport **38/38**; prior history-service **13/13**, sync-coordinator **25/25**, sync-policy **2/2**, storage-codec **12/12**, opaque-leakage **2/2**, and sync-session **95/95** remain covered by the full fast gate.
+- Focused regressions in the latest audit pass: github-transport **39/39**; prior history-service **13/13**, sync-coordinator **25/25**, sync-policy **2/2**, storage-codec **12/12**, opaque-leakage **2/2**, and sync-session **95/95** remain covered by the full fast gate.
 - Real GitHub E2E remains excluded from the default fast tier and was not run in this closure; inspect hosted checks for the exact pushed SHA separately before treating the branch as release-qualified.
 
 ### TDD plan
