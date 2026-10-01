@@ -674,6 +674,28 @@ test("GitHub client rejects malformed successful immutable-object mutation respo
 });
 
 
+test("GitHubClient rejects a successful blob mutation whose SHA does not match the uploaded bytes", async () => {
+  setRequestUrlHandler(async (options: unknown) => {
+    const request = options as Record<string, any>;
+    if (request.method === "POST" && request.url.endsWith("/git/blobs")) {
+      return { status: 201, text: "", headers: {}, json: { sha: "f".repeat(40) } };
+    }
+    throw new Error(`Unexpected request: ${request.method} ${request.url}`);
+  });
+  try {
+    const client = new GitHubClient(
+      { token: "token", owner: "owner", repo: "repo", branch: "main" },
+      { transportPolicy: { mutationSpacingMs: 0 } },
+    );
+    await assert.rejects(
+      () => client.createGitBlob(new Uint8Array([1, 2, 3])),
+      /created blob.*sha|blob.*mismatch|blob.*verification|uploaded.*bytes/iu,
+    );
+  } finally {
+    setRequestUrlHandler(null);
+  }
+});
+
 test("GitHubClient rejects a Contents payload with a malformed Git object SHA instead of trusting unverified bytes", async () => {
   let requests = 0;
   setRequestUrlHandler(async () => {
