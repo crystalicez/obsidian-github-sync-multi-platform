@@ -279,6 +279,38 @@ test("v4 history rejects an excessive journal page count before issuing fanout r
   assert.equal(fixture.reads, 1);
 });
 
+test("v4 file history bounds aggregate journal page fanout across commits", async () => {
+  let reads = 0;
+  const commits = Array.from({ length: 5 }, (_, index) => ({
+    sha: `c-${index}`,
+    message: `obsidian-sync-v4:j-${index}`,
+    authorName: "A",
+    authoredAt: new Date(index).toISOString(),
+    parentShas: [],
+  }));
+  const github = {
+    async listCommits() { return commits; },
+    async getFileBytes(path: string) {
+      reads++;
+      const match = /\/journals\/([^/]+)\/(\d+)\.json$/u.exec(path);
+      assert.ok(match, `unexpected journal path: ${path}`);
+      const journalId = match[1];
+      const page = Number(match[2]);
+      return { bytes: enc(JSON.stringify({ journalId, page, pageCount: 256, changes: [] })), sha: `journal-${reads}` };
+    },
+    async getGitCommit(sha: string) { return { sha, treeSha: "tree", parentShas: [] }; },
+    async getTreeAt() { return { sha: "tree", url: "", truncated: false, tree: [] }; },
+    async getBlob() { return new Uint8Array(); },
+  };
+  const service = new V4HistoryService({
+    github,
+    config: { formatVersion: 4, mode: "plaintext", repoId: "o/r#main", pathLayout: "plaintext-v1" },
+  });
+
+  await assert.rejects(() => service.getFileVersions("target"), /history.*budget|journal.*budget|fanout/iu);
+  assert.ok(reads <= 1025, `aggregate journal reads were not bounded: ${reads}`);
+});
+
 test("v4 history rejects inconsistent journal page counts across one commit", async () => {
   const fixture = historyJournalFixture(page => ({
     journalId: "123-safe",
