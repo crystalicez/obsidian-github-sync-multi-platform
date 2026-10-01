@@ -226,6 +226,19 @@ test("GitHubClient bootstraps a truly empty repository before Git ref writes", a
     requests.push(request);
     if (request.url.includes("/git/refs?")) return { status: 409, text: "Git Repository is empty.", headers: {}, json: {} };
     if (request.method === "PUT") return { status: 201, text: "", headers: {}, json: { commit: { sha: "cccccccccccccccccccccccccccccccccccccccc" } } };
+    if (request.method === "GET" && request.url.endsWith("/git/commits/cccccccccccccccccccccccccccccccccccccccc")) {
+      return {
+        status: 200,
+        text: "",
+        headers: {},
+        json: {
+          sha: "cccccccccccccccccccccccccccccccccccccccc",
+          message: "obsidian-sync-v4:bootstrap",
+          tree: { sha: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" },
+          parents: [],
+        },
+      };
+    }
     if (request.method === "GET" && request.url.includes("/git/ref/heads/")) {
       return { status: 200, text: "", headers: {}, json: { ref: "refs/heads/main", object: { sha: "cccccccccccccccccccccccccccccccccccccccc", type: "commit" } } };
     }
@@ -291,6 +304,19 @@ test("GitHubClient creates a configured custom branch after empty-repository boo
     requests.push(request);
     if (request.url.includes("/git/refs?")) return { status: 409, text: "empty", headers: {}, json: {} };
     if (request.method === "PUT") return { status: 201, text: "", headers: {}, json: { commit: { sha: "cccccccccccccccccccccccccccccccccccccccc" } } };
+    if (request.method === "GET" && request.url.endsWith("/git/commits/cccccccccccccccccccccccccccccccccccccccc")) {
+      return {
+        status: 200,
+        text: "",
+        headers: {},
+        json: {
+          sha: "cccccccccccccccccccccccccccccccccccccccc",
+          message: "obsidian-sync-v4:bootstrap",
+          tree: { sha: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" },
+          parents: [],
+        },
+      };
+    }
     if (request.method === "GET" && request.url.includes("/git/ref/heads/v4-sync")) {
       customRefReads++;
       return customRefReads === 1
@@ -478,6 +504,19 @@ test("bootstrap branch creation observes the configured ref before retrying a lo
     const request = options as Record<string, any>
     if (request.url.includes("/git/refs?")) return { status: 409, text: "empty", headers: {}, json: {} }
     if (request.method === "PUT") return { status: 201, text: "", headers: {}, json: { commit: { sha: "cccccccccccccccccccccccccccccccccccccccc" } } }
+    if (request.method === "GET" && request.url.endsWith("/git/commits/cccccccccccccccccccccccccccccccccccccccc")) {
+      return {
+        status: 200,
+        text: "",
+        headers: {},
+        json: {
+          sha: "cccccccccccccccccccccccccccccccccccccccc",
+          message: "obsidian-sync-v4:bootstrap",
+          tree: { sha: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" },
+          parents: [],
+        },
+      };
+    }
     if (request.method === "GET" && request.url.includes("/git/ref/heads/v4-sync")) {
       return customExists
         ? { status: 200, text: "", headers: {}, json: { ref: "refs/heads/v4-sync", object: { sha: "cccccccccccccccccccccccccccccccccccccccc", type: "commit" } } }

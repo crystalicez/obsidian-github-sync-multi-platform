@@ -480,6 +480,16 @@ export class GitHubClient {
       }
     }
     if (!commitSha) throw new Error("GitHub bootstrap response is missing its commit SHA.");
+    const bootstrapCommit = await this.getGitCommit(commitSha);
+    if (bootstrapCommit.parentShas.length > 0) {
+      throw new V4RepositoryBootstrapRaceError(
+        bootstrapCommit.parentShas[0],
+        new Error("Successful GitHub bootstrap commit is not a root commit."),
+      );
+    }
+    if (bootstrapCommit.message !== bodyValue.message) {
+      throw new Error("GitHub bootstrap commit message does not match the requested bootstrap mutation.");
+    }
     return this.ensureConfiguredBootstrapRef(commitSha);
   }
 
