@@ -306,6 +306,77 @@ test("GitHubClient rejects a successful bootstrap commit that is already based o
   }
 });
 
+test("GitHubClient rejects a successful root bootstrap commit whose exact marker is accompanied by extra tree content", async () => {
+  const bootstrapSha = "c".repeat(40);
+  const rootTreeSha = "e".repeat(40);
+  const bootstrapDirSha = "a".repeat(40);
+  const extraBlobSha = "b".repeat(40);
+  const markerSha = "030651af7d33cfcb8f2275a9a94221968794650e";
+  const markerBytes = new TextEncoder().encode("obsidian-github-sync-v4\n");
+  setRequestUrlHandler(async (options: unknown) => {
+    const request = options as Record<string, any>;
+    if (request.url.includes("/git/refs?")) return { status: 409, text: "Git Repository is empty.", headers: {}, json: {} };
+    if (request.method === "PUT") return { status: 201, text: "", headers: {}, json: { commit: { sha: bootstrapSha } } };
+    if (request.method === "GET" && request.url.endsWith(`/git/commits/${bootstrapSha}`)) {
+      return {
+        status: 200,
+        text: "",
+        headers: {},
+        json: { sha: bootstrapSha, message: "obsidian-sync-v4:bootstrap", tree: { sha: rootTreeSha }, parents: [] },
+      };
+    }
+    if (request.method === "GET" && request.url.includes("/contents/.obsidian-github-sync-v4/bootstrap")) {
+      return {
+        status: 200,
+        text: "",
+        headers: {},
+        json: { content: toBase64(markerBytes), encoding: "base64", sha: markerSha },
+        arrayBuffer: new ArrayBuffer(0),
+      };
+    }
+    if (request.method === "GET" && request.url.includes(`/git/trees/${rootTreeSha}`)) {
+      return {
+        status: 200,
+        text: "",
+        headers: {},
+        json: {
+          sha: rootTreeSha,
+          truncated: false,
+          tree: [
+            { path: ".obsidian-github-sync-v4", mode: "040000", type: "tree", sha: bootstrapDirSha },
+            { path: "extra.txt", mode: "100644", type: "blob", sha: extraBlobSha, size: 1 },
+          ],
+        },
+      };
+    }
+    if (request.method === "GET" && request.url.includes(`/git/trees/${bootstrapDirSha}`)) {
+      return {
+        status: 200,
+        text: "",
+        headers: {},
+        json: {
+          sha: bootstrapDirSha,
+          truncated: false,
+          tree: [{ path: "bootstrap", mode: "100644", type: "blob", sha: markerSha, size: markerBytes.byteLength }],
+        },
+      };
+    }
+    if (request.method === "GET" && request.url.includes("/git/ref/heads/main")) {
+      return { status: 200, text: "", headers: {}, json: { ref: "refs/heads/main", object: { sha: bootstrapSha, type: "commit" } } };
+    }
+    throw new Error(`Unexpected request: ${request.method} ${request.url}`);
+  });
+  try {
+    const client = new GitHubClient({ token: "token", owner: "owner", repo: "repo", branch: "main" }, { transportPolicy: { mutationSpacingMs: 0 } });
+    await assert.rejects(
+      () => client.ensureGitRepositoryInitialized(),
+      /bootstrap.*tree|bootstrap.*extra|bootstrap.*shape|unexpected.*bootstrap/iu,
+    );
+  } finally {
+    setRequestUrlHandler(null);
+  }
+});
+
 test("GitHubClient rejects a successful root bootstrap commit whose marker bytes do not match the requested content", async () => {
   const bootstrapSha = "c".repeat(40);
   const treeSha = "e".repeat(40);
