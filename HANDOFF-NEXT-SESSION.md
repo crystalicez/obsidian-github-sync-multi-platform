@@ -365,6 +365,13 @@ Audit method:
    - Reader now derives the exact deterministic archive size from declared `fileId` + plaintext sizes, checks encrypted payload length before decrypt, re-checks plaintext archive length after decrypt, and requires the archive key set to equal the declared record IDs exactly.
    - This does **not** remove the previously documented transport peak-memory residual: Obsidian `requestUrl` can still buffer an unexpectedly large HTTP body before post-receipt validation runs.
 
+51. **LOW/MEDIUM reliability — scheduled sync timer could be enabled before GitHub configuration was complete.**
+   - `shouldRunScheduledSync()` checked only `syncEnabled + scheduledSyncEnabled`, unlike startup sync which also required token/owner/repo.
+   - Main then installed a repeating timer whose callback invoked `runtime.scheduledSync()` without a local catch; runtime throws when `githubClient` is absent.
+   - A partially configured installation could therefore produce repeated rejected scheduled sync attempts every interval.
+   - RED: `d36678c39c1570821a073c086c56d4c147bc29eb`.
+   - Fix: `8b5d2ff83e7d4528b7f606ce6a9b1b97de9c2647` makes scheduled sync require the same complete GitHub configuration predicate before a timer is created.
+
 ### Audited surfaces with no new confirmed defect so far
 
 - secret migration/persistence: raw token/passphrase are removed before plugin data persistence and use Obsidian SecretStorage;
