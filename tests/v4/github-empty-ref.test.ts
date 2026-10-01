@@ -26,3 +26,25 @@ test("GitHubClient treats HTTP 409 from an empty Git database as an absent confi
     setRequestUrlHandler(null);
   }
 });
+
+test("GitHubClient keeps a non-empty 409 ref conflict fail-closed instead of entering bootstrap", async () => {
+  setRequestUrlHandler(async () => ({
+    status: 409,
+    text: "Git Repository is temporarily unavailable.",
+    headers: {},
+    json: {},
+  }));
+  try {
+    const client = new GitHubClient(
+      { token: "token", owner: "owner", repo: "repo", branch: "main" },
+      { transportPolicy: { mutationSpacingMs: 0 } },
+    );
+
+    await assert.rejects(
+      () => client.getGitRefOrNull(),
+      /409|unavailable|conflict/iu,
+    );
+  } finally {
+    setRequestUrlHandler(null);
+  }
+});
