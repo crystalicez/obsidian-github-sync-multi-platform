@@ -478,6 +478,12 @@ Audit method:
    - Fix: `d957ad1` requires a successful Contents object to be `type: "file"` and to report the exact requested path before decoding/trusting its payload. SHA validation remains first so malformed-object-ID failures retain their established precedence.
    - Fixture follow-up: `a121304` makes the immutable-fallback success fixture protocol-shaped rather than weakening the new production boundary.
 
+69. **HIGH bootstrap availability/compatibility — configured-ref lookup rejected GitHub's documented empty-repository HTTP 409.**
+   - GitHub's Git database REST documentation lists `409 Conflict` for Git reference reads and states that Git database APIs return 409 when a repository is empty or temporarily unavailable; empty repositories must be initialized through the Contents API.
+   - `getGitRefOrNull()` converted only 404 into an absent ref. A real empty repository could therefore fail before reaching the already-hardened Contents bootstrap path.
+   - RED: `d578693148d77549a7a3aab779a580daf073345b` reproduces a `Git Repository is empty.` 409 from the configured-ref endpoint and proves the helper threw instead of returning `null`.
+   - Fix: `6d3ba0a899214c9b8d0f842ce3a28be14c3a5796` treats 404 and 409 as an absent configured ref. If a 409 represents transient repository unavailability rather than an empty repository, the later bootstrap Contents mutation still fails closed; no ref is published without the existing bootstrap verification chain.
+
 ### Audited surfaces with no new confirmed defect so far
 
 - secret migration/persistence: raw token/passphrase are removed before plugin data persistence and use Obsidian SecretStorage;
@@ -518,6 +524,7 @@ RED tests have now been pushed on the audit branch:
 - `d5cdcd2ecd0424bfc6bff2be0f665a0d8ee79e19` — the configured branch must still point at the bootstrap SHA on the post-create read, not merely on the successful create-ref response.
 - `2d3812e6b5010c8296242ac3b5df8c9b2f86394b` — exact bootstrap marker bytes are insufficient if the root/bootstrap-directory tree contains additional entries.
 - `79a109603463a56559982d0c071df662db95e2be` — authenticated Contents bytes must still be bound to the exact requested repository path and file type.
+- `d578693148d77549a7a3aab779a580daf073345b` — an empty Git repository's documented HTTP 409 configured-ref response must be treated as an absent ref so Contents bootstrap can run.
 
 Refined root-cause design:
 - create one canonical shard-record hash function and use it for writer hash creation, remote shard verification, and local persisted-cache verification;
@@ -549,6 +556,7 @@ Root-cause fixes are now on the audit branch:
 - `0762038ae20673674fceb71376906dd21d1443c4` — stabilize the fast planner qualification by measuring process CPU time instead of wall-clock delay caused by concurrent test files.
 - `d957ad1` — bind successful GitHub Contents file responses to `type: "file"` and the exact requested repository path before trusting authenticated payload bytes.
 - fixture-only follow-up `a121304` keeps the immutable Contents-success regression protocol-shaped under the stricter response contract.
+- `6d3ba0a899214c9b8d0f842ce3a28be14c3a5796` — treat configured-ref HTTP 409 as an absent ref so documented empty-repository Git API behavior reaches the verified Contents bootstrap path.
 - `6151868d066c050deef9159d3beda389e2ae0ce7`, `d9cde1a72496a8c86df5c85b975d39b92998f873`, `0c301523e774d54bc03191aa7a897da98691ac81`, `06335328777bd5010e928c1951f1cdb581aac2f0` — bounded journal writer/reader contract, safe journal markers, cross-page consistency, descriptor validation before blob reads, and preview-limit precedence.
 - fixture-only followups `4ce0affffce484398db30b0de339af8a2dd1e5cf`, `e5ae96eda6003faa4233346bd5104561e2258923`, `40fc418844c40a52ef4baa39c7318f21a5547782`, `b876e4076084e544ec13ec0ef60c9ef7e0cbcc8a` keep tests protocol-shaped rather than weakening production validation.
 
@@ -559,9 +567,9 @@ Recent crash/memory hardening:
 
 Verification status:
 - The repository was executed through the connected local engineering workspace with Node `v24.11.0` and pnpm `9.12.3`.
-- Final post-fix gates on the current source tree: `pnpm run test:fast` **505/505**, `pnpm run test:recovery` **48/48**, `pnpm run test:resource` **11/11**, and `pnpm run build` PASS.
+- Final post-fix gates on the current source tree: `pnpm run test:fast` **506/506**, `pnpm run test:recovery` **48/48**, `pnpm run test:resource` **11/11**, and `pnpm run build` PASS.
 - Final release checks also pass on regenerated artifacts: `pnpm run validate:metadata` and `pnpm run validate:package`.
-- Focused regressions in the latest audit pass: github-transport **43/43**, github-immutable-read-fallback **13/13**, and benchmark **3/3**; the benchmark qualification also reproduced the prior wall-clock flake under full-suite contention before `0762038...`, then later full fast runs passed **503/503**, **504/504**, and now **505/505** after the Contents-identity regression was added. Prior history-service **13/13**, sync-coordinator **25/25**, sync-policy **2/2**, storage-codec **12/12**, opaque-leakage **2/2**, and sync-session **95/95** remain covered by the full fast gate.
+- Focused regressions in the latest audit pass: github-empty-ref **1/1**, github-transport **43/43**, github-immutable-read-fallback **13/13**, and benchmark **3/3**; the benchmark qualification also reproduced the prior wall-clock flake under full-suite contention before `0762038...`, then later full fast runs passed **503/503**, **504/504**, and now **505/505** after the Contents-identity regression was added. Prior history-service **13/13**, sync-coordinator **25/25**, sync-policy **2/2**, storage-codec **12/12**, opaque-leakage **2/2**, and sync-session **95/95** remain covered by the full fast gate.
 - Real GitHub E2E remains excluded from the default fast tier and was not run in this closure; inspect hosted checks for the exact pushed SHA separately before treating the branch as release-qualified.
 
 ### TDD plan
