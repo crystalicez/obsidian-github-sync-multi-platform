@@ -239,6 +239,16 @@ test("GitHubClient bootstraps a truly empty repository before Git ref writes", a
         },
       };
     }
+    if (request.method === "GET" && request.url.includes("/contents/.obsidian-github-sync-v4/bootstrap")) {
+      const bytes = new TextEncoder().encode("obsidian-github-sync-v4\n");
+      return {
+        status: 200,
+        text: "",
+        headers: {},
+        json: { content: toBase64(bytes), encoding: "base64", sha: "030651af7d33cfcb8f2275a9a94221968794650e" },
+        arrayBuffer: new ArrayBuffer(0),
+      };
+    }
     if (request.method === "GET" && request.url.includes("/git/ref/heads/")) {
       return { status: 200, text: "", headers: {}, json: { ref: "refs/heads/main", object: { sha: "cccccccccccccccccccccccccccccccccccccccc", type: "commit" } } };
     }
@@ -356,6 +366,16 @@ test("GitHubClient creates a configured custom branch after empty-repository boo
           tree: { sha: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" },
           parents: [],
         },
+      };
+    }
+    if (request.method === "GET" && request.url.includes("/contents/.obsidian-github-sync-v4/bootstrap")) {
+      const bytes = new TextEncoder().encode("obsidian-github-sync-v4\n");
+      return {
+        status: 200,
+        text: "",
+        headers: {},
+        json: { content: toBase64(bytes), encoding: "base64", sha: "030651af7d33cfcb8f2275a9a94221968794650e" },
+        arrayBuffer: new ArrayBuffer(0),
       };
     }
     if (request.method === "GET" && request.url.includes("/git/ref/heads/v4-sync")) {
@@ -556,6 +576,16 @@ test("bootstrap branch creation observes the configured ref before retrying a lo
           tree: { sha: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" },
           parents: [],
         },
+      };
+    }
+    if (request.method === "GET" && request.url.includes("/contents/.obsidian-github-sync-v4/bootstrap")) {
+      const bytes = new TextEncoder().encode("obsidian-github-sync-v4\n");
+      return {
+        status: 200,
+        text: "",
+        headers: {},
+        json: { content: toBase64(bytes), encoding: "base64", sha: "030651af7d33cfcb8f2275a9a94221968794650e" },
+        arrayBuffer: new ArrayBuffer(0),
       };
     }
     if (request.method === "GET" && request.url.includes("/git/ref/heads/v4-sync")) {

@@ -445,9 +445,10 @@ export class GitHubClient {
     if (initialRef) return null;
 
     const encodedPath = V4_BOOTSTRAP_PATH.split("/").map(encodeURIComponent).join("/");
+    const bootstrapBytes = utf8ToBytes("obsidian-github-sync-v4\n");
     const bodyValue = {
       message: "obsidian-sync-v4:bootstrap",
-      content: toBase64(utf8ToBytes("obsidian-github-sync-v4\n")),
+      content: toBase64(bootstrapBytes),
     };
     let commitSha: string | undefined;
     for (let attempt = 1; attempt <= 2 && !commitSha; attempt++) {
@@ -489,6 +490,13 @@ export class GitHubClient {
     }
     if (bootstrapCommit.message !== bodyValue.message) {
       throw new Error("GitHub bootstrap commit message does not match the requested bootstrap mutation.");
+    }
+    const bootstrapFile = await this.getFileBytes(V4_BOOTSTRAP_PATH, commitSha);
+    const bootstrapContentMatches = !!bootstrapFile
+      && bootstrapFile.bytes.byteLength === bootstrapBytes.byteLength
+      && bootstrapFile.bytes.every((byte, index) => byte === bootstrapBytes[index]);
+    if (!bootstrapContentMatches) {
+      throw new Error("GitHub bootstrap marker content does not match the requested bootstrap mutation.");
     }
     return this.ensureConfiguredBootstrapRef(commitSha);
   }
