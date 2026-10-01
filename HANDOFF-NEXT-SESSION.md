@@ -404,6 +404,20 @@ Audit method:
    - RED: `ee6640d6fe02f9e493158f3c60e30e026fbd6948` shows `Number.MAX_VALUE` survived normalization unchanged.
    - Fix: `45123da` clamps normalized intervals to `Math.floor(0x7fffffff / 1000)` = 2,147,483 seconds while preserving the existing default and 30-second minimum.
 
+57. **MEDIUM reliability/resource safety — large local-event bursts could overflow JavaScript argument limits during debounce coalescing.**
+   - `coalesceV4Changes()` used `Math.max(...changes.map(...))` for rescan mtimes and ambiguous rename fallbacks.
+   - A 150,000-event burst reproduced `RangeError: Maximum call stack size exceeded` on the repository's Node 24 toolchain before sync execution began.
+   - Vault watchers can accumulate very large event bursts during mass operations, so sync reliability must not depend on the engine's function-argument count limit.
+   - RED: `8aac1d5bc0b7598dafd25e4302be4035e960ff08`.
+   - Fix: `e1173260c083c2be55c4317ed1fec119b90a488f` replaces spread-based maxima with one O(n), O(1)-extra-space scan in every coordinator rescan-mtime path.
+
+58. **MEDIUM remote protocol/history safety — journal change objects were exposed before writer-shape/path/descriptor validation.**
+   - The history reader bounded page count and changes-per-page but accepted arbitrary individual change objects from remote journal JSON.
+   - Invalid change kinds, unsafe/non-canonical paths, and impossible create/delete/modify/rename shapes could escape `getCommitChanges()` into Sync Center/history consumers before preview-time descriptor validation.
+   - RED: `8aac1d5bc0b7598dafd25e4302be4035e960ff08`.
+   - Fix: `e1173260c083c2be55c4317ed1fec119b90a488f` validates every decoded journal change at the read boundary: kind, portable paths, writer-shape semantics, and before/after descriptors through the existing V4 remote-record contract. Rename-before descriptors are validated against `previousPath` rather than the new path.
+   - One older test fixture represented `modify` with only `after`; the initial V4 writer history was checked and the fixture was corrected to the writer-valid before+after shape instead of weakening production validation.
+
 ### Audited surfaces with no new confirmed defect so far
 
 - secret migration/persistence: raw token/passphrase are removed before plugin data persistence and use Obsidian SecretStorage;
@@ -433,6 +447,7 @@ RED tests have now been pushed on the audit branch:
 - `088e3d18cc4e646f095859259a18d09ab03a6d29` — settings UI/main must quiesce the old generation before publishing new settings/client state.
 - `83a9044b8047c9a57c8bae6e33878fd3db735037` — freshly fetched remote shard records must match the head's advertised shard hash.
 - `ee6640d6fe02f9e493158f3c60e30e026fbd6948` — file-history traversal must have one aggregate journal-read budget, and scheduled intervals must stay within the signed 32-bit timer delay range.
+- `8aac1d5bc0b7598dafd25e4302be4035e960ff08` — large coordinator event bursts must not depend on argument-spread limits, and remote history journal changes must be writer-shaped before exposure.
 
 Refined root-cause design:
 - create one canonical shard-record hash function and use it for writer hash creation, remote shard verification, and local persisted-cache verification;
@@ -441,7 +456,7 @@ Refined root-cause design:
 - add coordinator `cancelActive` plus runtime quiesce and make settings publication occur only after the old run is idle;
 - unknown empty-repository Contents bootstrap outcomes must replan on newly observed repository state rather than adopt an unproven SHA.
 
-Execution constraint recorded during this audit: direct sandbox GitHub access was retried during closure and still failed with DNS resolution error `Could not resolve host: github.com`. No GitHub Actions run is available for the connector-created audit head. Do not claim local suite execution from the AI environment unless a later attempt succeeds.
+Current execution state supersedes the earlier sandbox/DNS limitation: the connected lnwjud workspace can execute the repository with the exact Node/pnpm toolchain and can fetch/push the audit branch successfully. Hosted GitHub status/check-runs/workflow runs remain separate evidence and must still be checked for the exact pushed SHA before release qualification.
 
 ### Production fix status
 
@@ -453,6 +468,7 @@ Root-cause fixes are now on the audit branch:
 - `88990134ae8e8764e8b8c0696e16c934020727ae`, `aab2e432c74dc7b550455d5300a1a604eaac087f`, `e382e63e085fc196e8015c4dc046a7c1c99e8473`, `a04ba7b4f9b233871328368fbdb58da1591965fa`, `d2a02390b7c725a40f96ebc392153b8a13611fd8` — reusable active cancellation, runtime quiescence, settings publication ordering, and progress cleanup for atomic settings/client generation rotation.
 - `f2ad17aef7d833178f7e9ba105489ce6fb6ad999`, `8c6bd38cdb0b9bc3a953a4bc9dcda0734b6bf60b` — encrypted config/KDF bounds plus remote head/record/shard shape/resource validation.
 - `ff2780ff1543fde9b3914db174b733a998011f9f` — bound whole-buffer chunk remote reads to four concurrent part fetches.
+- `e1173260c083c2be55c4317ed1fec119b90a488f` — remove coordinator argument-spread amplification and validate remote journal change semantics/paths/descriptors before history consumers observe them.
 - `6151868d066c050deef9159d3beda389e2ae0ce7`, `d9cde1a72496a8c86df5c85b975d39b92998f873`, `0c301523e774d54bc03191aa7a897da98691ac81`, `06335328777bd5010e928c1951f1cdb581aac2f0` — bounded journal writer/reader contract, safe journal markers, cross-page consistency, descriptor validation before blob reads, and preview-limit precedence.
 - fixture-only followups `4ce0affffce484398db30b0de339af8a2dd1e5cf`, `e5ae96eda6003faa4233346bd5104561e2258923`, `40fc418844c40a52ef4baa39c7318f21a5547782`, `b876e4076084e544ec13ec0ef60c9ef7e0cbcc8a` keep tests protocol-shaped rather than weakening production validation.
 
@@ -463,9 +479,9 @@ Recent crash/memory hardening:
 
 Verification status:
 - The repository was executed through the connected local engineering workspace with Node `v24.11.0` and pnpm `9.12.3`.
-- Final post-fix gates on the current source tree: `pnpm run test:fast` **494/494**, `pnpm run test:recovery` **48/48**, `pnpm run test:resource` **11/11**, and `pnpm run build` PASS.
+- Final post-fix gates on the current source tree: `pnpm run test:fast` **496/496**, `pnpm run test:recovery` **48/48**, `pnpm run test:resource` **11/11**, and `pnpm run build` PASS.
 - Final release checks also pass on regenerated artifacts: `pnpm run validate:metadata` and `pnpm run validate:package`.
-- Focused regressions in the latest audit pass: history-service **12/12** and sync-policy **2/2**; prior focused storage-codec **12/12**, opaque-leakage **2/2**, and sync-session **95/95** also remain covered by the full fast gate.
+- Focused regressions in the latest audit pass: history-service **13/13** and sync-coordinator **25/25**; prior sync-policy **2/2**, storage-codec **12/12**, opaque-leakage **2/2**, and sync-session **95/95** remain covered by the full fast gate.
 - Real GitHub E2E remains excluded from the default fast tier and was not run in this closure; inspect hosted checks for the exact pushed SHA separately before treating the branch as release-qualified.
 
 ### TDD plan
