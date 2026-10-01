@@ -221,8 +221,10 @@ export class GitHubClient {
       });
 
       if (response.status === 200) {
-        const json = response.json as { content?: string; encoding?: string; sha?: string };
+        const json = response.json as { content?: string; encoding?: string; sha?: string; path?: unknown; type?: unknown };
         const sha = requiredGitObjectSha(json.sha, "Contents blob SHA");
+        if (json.type !== "file") throw new Error("Malformed GitHub response: Contents object is not a file.");
+        if (json.path !== path) throw new Error("Malformed GitHub response: Contents path does not match the requested path.");
         if (json.encoding === "base64" && typeof json.content === "string") {
           let decoded: Uint8Array | undefined;
           try {

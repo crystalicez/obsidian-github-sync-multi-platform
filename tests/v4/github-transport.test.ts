@@ -143,7 +143,7 @@ test("GitHubClient pins file reads to an explicit commit SHA", async () => {
         status: 200,
         text: "",
         headers: {},
-        json: { content: "dHJhbnNmb3JtZWQ=", encoding: "base64", sha: "a5df5b6112f9310f9b7d922dc562cd9d413ecf02" },
+        json: { type: "file", path: ".obsidian-github-sync-v4/head", content: "dHJhbnNmb3JtZWQ=", encoding: "base64", sha: "a5df5b6112f9310f9b7d922dc562cd9d413ecf02" },
         arrayBuffer: new ArrayBuffer(0),
       };
     }
@@ -192,7 +192,7 @@ test("GitHubClient falls back to the canonical Git Blob when Contents transforms
         status: 200,
         text: "",
         headers: {},
-        json: { content: toBase64(githubContentsUtf16beTransform(raw)), encoding: "base64", sha: blobSha },
+        json: { type: "file", path: "binary.enc", content: toBase64(githubContentsUtf16beTransform(raw)), encoding: "base64", sha: blobSha },
         arrayBuffer: new ArrayBuffer(0),
       }
     }
@@ -227,7 +227,7 @@ test("GitHubClient fails closed when Git object authentication itself is unavail
         status: 200,
         text: "",
         headers: {},
-        json: { content: toBase64(raw), encoding: "base64", sha: blobSha },
+        json: { type: "file", path: "binary.enc", content: toBase64(raw), encoding: "base64", sha: blobSha },
         arrayBuffer: new ArrayBuffer(0),
       }
     }
@@ -276,7 +276,7 @@ test("GitHubClient bootstraps a truly empty repository before Git ref writes", a
         status: 200,
         text: "",
         headers: {},
-        json: { content: toBase64(bytes), encoding: "base64", sha: "030651af7d33cfcb8f2275a9a94221968794650e" },
+        json: { type: "file", path: ".obsidian-github-sync-v4/bootstrap", content: toBase64(bytes), encoding: "base64", sha: "030651af7d33cfcb8f2275a9a94221968794650e" },
         arrayBuffer: new ArrayBuffer(0),
       };
     }
@@ -363,7 +363,7 @@ test("GitHubClient rejects a successful root bootstrap commit whose exact marker
         status: 200,
         text: "",
         headers: {},
-        json: { content: toBase64(markerBytes), encoding: "base64", sha: markerSha },
+        json: { type: "file", path: ".obsidian-github-sync-v4/bootstrap", content: toBase64(markerBytes), encoding: "base64", sha: markerSha },
         arrayBuffer: new ArrayBuffer(0),
       };
     }
@@ -431,7 +431,7 @@ test("GitHubClient rejects a successful root bootstrap commit whose marker bytes
         status: 200,
         text: "",
         headers: {},
-        json: { content: toBase64(wrongBytes), encoding: "base64", sha: "d128890312024eca85a550cd27b4cc3faf9a1136" },
+        json: { type: "file", path: ".obsidian-github-sync-v4/bootstrap", content: toBase64(wrongBytes), encoding: "base64", sha: "d128890312024eca85a550cd27b4cc3faf9a1136" },
         arrayBuffer: new ArrayBuffer(0),
       };
     }
@@ -478,7 +478,7 @@ test("GitHubClient creates a configured custom branch after empty-repository boo
         status: 200,
         text: "",
         headers: {},
-        json: { content: toBase64(bytes), encoding: "base64", sha: "030651af7d33cfcb8f2275a9a94221968794650e" },
+        json: { type: "file", path: ".obsidian-github-sync-v4/bootstrap", content: toBase64(bytes), encoding: "base64", sha: "030651af7d33cfcb8f2275a9a94221968794650e" },
         arrayBuffer: new ArrayBuffer(0),
       };
     }
@@ -531,7 +531,7 @@ test("GitHubClient rejects a configured branch that appears at a competitor SHA 
         status: 200,
         text: "",
         headers: {},
-        json: { content: toBase64(bytes), encoding: "base64", sha: "030651af7d33cfcb8f2275a9a94221968794650e" },
+        json: { type: "file", path: ".obsidian-github-sync-v4/bootstrap", content: toBase64(bytes), encoding: "base64", sha: "030651af7d33cfcb8f2275a9a94221968794650e" },
         arrayBuffer: new ArrayBuffer(0),
       };
     }
@@ -582,7 +582,7 @@ test("GitHubClient rejects a configured branch that moves away immediately after
         status: 200,
         text: "",
         headers: {},
-        json: { content: toBase64(bytes), encoding: "base64", sha: "030651af7d33cfcb8f2275a9a94221968794650e" },
+        json: { type: "file", path: ".obsidian-github-sync-v4/bootstrap", content: toBase64(bytes), encoding: "base64", sha: "030651af7d33cfcb8f2275a9a94221968794650e" },
         arrayBuffer: new ArrayBuffer(0),
       };
     }
@@ -627,7 +627,7 @@ test("GitHubClient falls back to Git Blob bytes when Contents omits a large payl
     const url = (options as { url: string }).url;
     requests.push(url);
     if (url.includes("/contents/")) {
-      return { status: 200, text: "", headers: {}, json: { content: "", encoding: "none", sha: "413c6a76c6527732a74dbfab3c20d471cb38a573" }, arrayBuffer: new ArrayBuffer(0) };
+      return { status: 200, text: "", headers: {}, json: { type: "file", path: "large.bin", content: "", encoding: "none", sha: "413c6a76c6527732a74dbfab3c20d471cb38a573" }, arrayBuffer: new ArrayBuffer(0) };
     }
     return { status: 200, text: "payload", headers: {}, json: undefined, arrayBuffer: new TextEncoder().encode("large payload").buffer };
   });
@@ -802,7 +802,7 @@ test("bootstrap branch creation observes the configured ref before retrying a lo
         status: 200,
         text: "",
         headers: {},
-        json: { content: toBase64(bytes), encoding: "base64", sha: "030651af7d33cfcb8f2275a9a94221968794650e" },
+        json: { type: "file", path: ".obsidian-github-sync-v4/bootstrap", content: toBase64(bytes), encoding: "base64", sha: "030651af7d33cfcb8f2275a9a94221968794650e" },
         arrayBuffer: new ArrayBuffer(0),
       };
     }
@@ -878,7 +878,7 @@ test("immutable commit and content reads omit timestamp cache-busting while ref 
   setRequestUrlHandler(async (options: unknown) => {
     const request = options as Record<string, any>
     urls.push(request.url)
-    if (request.url.includes("/contents/")) return { status: 200, text: "", headers: {}, json: { content: "YQ==", encoding: "base64", sha: "2e65efe2a145dda7ee51d1741299f848e5bf752e" }, arrayBuffer: new ArrayBuffer(0) }
+    if (request.url.includes("/contents/")) return { status: 200, text: "", headers: {}, json: { type: "file", path: "A.md", content: "YQ==", encoding: "base64", sha: "2e65efe2a145dda7ee51d1741299f848e5bf752e" }, arrayBuffer: new ArrayBuffer(0) }
     if (request.url.includes("/git/commits/")) return { status: 200, text: "", headers: {}, json: { sha: "9999999999999999999999999999999999999999", tree: { sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }, parents: [] } }
     if (request.url.includes("/git/ref/heads/")) return { status: 200, text: "", headers: {}, json: { ref: "refs/heads/main", object: { sha: "9999999999999999999999999999999999999999", type: "commit" } } }
     throw new Error(`unexpected:${request.url}`)
