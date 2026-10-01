@@ -30,6 +30,7 @@ export type V4VersionPreview =
 
 const TEXT_EXTENSIONS = new Set(["md", "txt", "json", "canvas", "yaml", "yml", "csv", "css", "scss", "js", "ts", "tsx", "jsx", "html", "xml"])
 export const V4_HISTORY_PREVIEW_MAX_BYTES = 5 * 1024 * 1024
+export const V4_HISTORY_MAX_JOURNAL_PAGE_READS = 1024
 
 const IMAGE_MIME: Record<string, string> = { png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp", svg: "image/svg+xml", bmp: "image/bmp" }
 
@@ -139,10 +140,13 @@ export class V4HistoryService {
   async getFileVersions(fileId: string, maxPages = 20): Promise<Array<{ commit: V4HistoryCommit; change: V4HistoryChange }>> {
     this.assertCurrent()
     const versions: Array<{ commit: V4HistoryCommit; change: V4HistoryChange }> = []
+    const journalBudget = { remaining: V4_HISTORY_MAX_JOURNAL_PAGE_READS }
     for (let page = 1; page <= maxPages; page++) {
       const commits = await this.listCommits(page)
       for (const commit of commits.items.filter(item => item.source === "plugin")) {
-        for (const change of await this.getCommitChanges(commit)) if (change.fileId === fileId) versions.push({ commit, change })
+        for (const change of await this.readJournal(commit.journalId!, commit.sha, journalBudget)) {
+          if (change.fileId === fileId) versions.push({ commit, change })
+        }
       }
       if (!commits.hasMore) break
     }
@@ -154,20 +158,34 @@ export class V4HistoryService {
     this.input.assertCurrent?.()
   }
 
-  private async readJournal(journalId: string, commitSha: string): Promise<V4HistoryChange[]> {
+  private async readJournal(
+    journalId: string,
+    commitSha: string,
+    budget?: { remaining: number },
+  ): Promise<V4HistoryChange[]> {
     if (!isV4JournalId(journalId)) throw new Error("V4 history journal id is invalid.")
-    const first = await this.readJournalPage(journalId, 0, commitSha)
+    const first = await this.readJournalPage(journalId, 0, commitSha, undefined, budget)
     const pages = [first]
     for (let page = 1; page < first.pageCount; page++) {
-      pages.push(await this.readJournalPage(journalId, page, commitSha, first.pageCount))
+      pages.push(await this.readJournalPage(journalId, page, commitSha, first.pageCount, budget))
     }
     return pages.flatMap(page => page.changes.map(change => ({ ...change, source: "plugin" as const })))
   }
 
-  private async readJournalPage(journalId: string, page: number, commitSha: string, expectedPageCount?: number): Promise<V4JournalPage> {
+  private async readJournalPage(
+    journalId: string,
+    page: number,
+    commitSha: string,
+    expectedPageCount?: number,
+    budget?: { remaining: number },
+  ): Promise<V4JournalPage> {
     const encrypted = this.input.config.mode === "encrypted"
     const path = `${V4_ROOT}/journals/${journalId}/${String(page).padStart(6, "0")}.${encrypted ? "enc" : "json"}`
     this.assertCurrent()
+    if (budget) {
+      if (budget.remaining <= 0) throw new Error("V4 history journal read budget exceeded.")
+      budget.remaining--
+    }
     const file = await this.input.github.getFileBytes(path, commitSha)
     this.assertCurrent()
     if (!file) throw new Error(`V4 history journal is missing: ${journalId}/${page}`)
