@@ -1116,6 +1116,36 @@ test("GitHubClient rejects a successful commit mutation whose immutable commit d
   }
 });
 
+test("GitHubClient rejects an authenticated Contents file response for a different requested path", async () => {
+  const bytes = new TextEncoder().encode("a");
+  const blobSha = "2e65efe2a145dda7ee51d1741299f848e5bf752e";
+  setRequestUrlHandler(async (options: unknown) => {
+    const request = options as Record<string, any>;
+    if (request.url.includes("/contents/expected.md")) {
+      return {
+        status: 200,
+        text: "",
+        headers: {},
+        json: { type: "file", path: "different.md", content: toBase64(bytes), encoding: "base64", sha: blobSha },
+        arrayBuffer: new ArrayBuffer(0),
+      };
+    }
+    throw new Error(`Unexpected request: ${request.method} ${request.url}`);
+  });
+  try {
+    const client = new GitHubClient(
+      { token: "token", owner: "owner", repo: "repo", branch: "main" },
+      { transportPolicy: { mutationSpacingMs: 0 } },
+    );
+    await assert.rejects(
+      () => client.getFileBytes("expected.md", "9".repeat(40)),
+      /contents.*path|unexpected.*path|path.*mismatch|requested.*path/iu,
+    );
+  } finally {
+    setRequestUrlHandler(null);
+  }
+});
+
 test("GitHubClient rejects a Contents payload with a malformed Git object SHA instead of trusting unverified bytes", async () => {
   let requests = 0;
   setRequestUrlHandler(async () => {
