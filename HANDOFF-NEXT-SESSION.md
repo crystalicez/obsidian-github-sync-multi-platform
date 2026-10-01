@@ -372,6 +372,26 @@ Audit method:
    - RED: `d36678c39c1570821a073c086c56d4c147bc29eb`.
    - Fix: `8b5d2ff83e7d4528b7f606ce6a9b1b97de9c2647` makes scheduled sync require the same complete GitHub configuration predicate before a timer is created.
 
+52. **HIGH integrity — a matching remote commit SHA did not prove the local cached shard manifest matched the authenticated current head.**
+   - A local index could remain internally self-consistent and retain the same `remoteCommitSha` while its epoch/generation/shard-hash manifest disagreed with the current remote head.
+   - The remote loader correctly fetched authoritative remote records, but planner base selection previously treated cache completeness + a remembered commit SHA as sufficient known-base authority.
+   - That could let stale/tampered cached records influence causal planning even though the current remote head had already disproved the cache manifest.
+   - Fix: `82efe37c23094d20aeb348a2f93be7b1ede50a38` requires mode/epoch/generation and the complete shard-hash manifest to match the authenticated current head before cached records can be used as the known base.
+   - Regression coverage: `v4 plaintext matching-SHA sync rejects a self-consistent local cache that disagrees with the remote head`.
+
+53. **HIGH correctness/reliability — a large keep-both conflict copy could consume its stage before the corresponding push read it.**
+   - In the no-recovery execution path, committing a large staged pull moves/removes the stage file as it becomes the final vault target.
+   - The paired push for an in-scope conflict copy could still retain a stage-backed source handle, so later upload preparation attempted to read a stage that had already been consumed.
+   - Fix: `82efe37c23094d20aeb348a2f93be7b1ede50a38` tracks consumed pull stages and rewrites any paired push source to the committed vault file with the same hash/size/mtime snapshot.
+   - The large keep-both regression now uses a writer-shaped chunked remote object and verifies the committed copy without whole-buffer reassembly.
+
+54. **MEDIUM/HIGH audit-branch correctness regression — exact pack validation initially rejected writer-valid multi-entry packs in single-member consumers.**
+   - The new exact pack payload/entry binding in `007bbb48612cb69f13d2bfed04eeebf5e330270f` is correct only when the reader receives the complete metadata group for that immutable pack.
+   - Sync conflict/pull paths and history preview still had call sites that supplied only one packed record; after rebasing the audit branch, writer-valid multi-member packs therefore failed with `V4 pack payload size does not match its declared records.`.
+   - Fix: `932515b` threads complete pack metadata through pull/conflict bindings, makes historical pack preview load and validate the historical V4 state before decoding, and falls back from unknown-base three-way merge when an older packed base cannot be proven complete.
+   - The strict payload-size and exact archive-entry-set checks remain intact; this repair does not weaken finding 50.
+   - This regression was caught on the audit branch before merge/release.
+
 ### Audited surfaces with no new confirmed defect so far
 
 - secret migration/persistence: raw token/passphrase are removed before plugin data persistence and use Obsidian SecretStorage;
@@ -425,11 +445,14 @@ Root-cause fixes are now on the audit branch:
 Recent crash/memory hardening:
 - `99f8e793...` / `e2d9dae3...` — interrupted desktop staged swaps become resumable.
 - `d49bb3c8...` — large chunked conflict copies stream directly into staging.
+- `82efe37c23094d20aeb348a2f93be7b1ede50a38` — final desktop staged-target hash verification re-runs vault path safety before bounded reads, in addition to the cache/staged-copy fixes above.
 
 Verification status:
-- AI sandbox execution is still blocked from obtaining the repository: direct `git clone` failed because `github.com` cannot resolve; local tools visible are Node 22.16.0, npm 10.9.2, TypeScript 5.8.3, and no pnpm.
-- GitHub Actions runs were queried for the audit branch and none were available; connector-created commits did not produce a usable CI run.
-- Therefore no full suite may be claimed yet. Continue static/targeted audit, then request the established user-local gates only after the audit branch is coherent.
+- The repository was executed through the connected local engineering workspace with Node `v24.11.0` and pnpm `9.12.3`.
+- Final post-rebase/post-fix gates on the current source tree: `pnpm run test:fast` **492/492**, `pnpm run test:recovery` **48/48**, `pnpm run test:resource` **11/11**, and `pnpm run build` PASS.
+- Final release checks also pass on regenerated artifacts: `pnpm run validate:metadata` and `pnpm run validate:package`.
+- Focused regressions also passed during closure: storage-codec **12/12**, opaque-leakage **2/2**, and sync-session **95/95**.
+- Real GitHub E2E remains excluded from the default fast tier and was not run in this closure; inspect hosted checks for the exact pushed SHA separately before treating the branch as release-qualified.
 
 ### TDD plan
 
