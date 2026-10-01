@@ -633,6 +633,30 @@ test("GitHub client rejects malformed successful ref and commit responses at the
   }
 });
 
+test("GitHub immutable commit and tree reads bind successful responses to the requested object IDs", async () => {
+  const requestedCommit = "a".repeat(40);
+  const returnedCommit = "b".repeat(40);
+  const requestedTree = "c".repeat(40);
+  const returnedTree = "d".repeat(40);
+  setRequestUrlHandler(async (options: unknown) => {
+    const request = options as Record<string, any>;
+    if (request.url.includes("/git/commits/")) {
+      return { status: 200, text: "", headers: {}, json: { sha: returnedCommit, tree: { sha: requestedTree }, parents: [] } };
+    }
+    if (request.url.includes("/git/trees/")) {
+      return { status: 200, text: "", headers: {}, json: { sha: returnedTree, tree: [], truncated: false } };
+    }
+    throw new Error(`Unexpected request: ${request.method} ${request.url}`);
+  });
+  try {
+    const client = new GitHubClient({ token: "token", owner: "owner", repo: "repo", branch: "main" }, { transportPolicy: { mutationSpacingMs: 0 } });
+    await assert.rejects(() => client.getGitCommit(requestedCommit), /commit.*sha|requested.*commit|mismatch|unexpected/iu);
+    await assert.rejects(() => client.getTreeAt(requestedTree), /tree.*sha|requested.*tree|mismatch|unexpected/iu);
+  } finally {
+    setRequestUrlHandler(null);
+  }
+});
+
 test("GitHub client rejects malformed successful immutable-object mutation responses before dependent writes", async () => {
   setRequestUrlHandler(async (options: unknown) => {
     const request = options as Record<string, any>;
