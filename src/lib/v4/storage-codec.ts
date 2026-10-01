@@ -1,7 +1,7 @@
 import { bytesToUtf8, fromBase64, sha256Hex, toBase64, utf8ToBytes } from "../bytes"
 import { boundedMap } from "./bounded-map"
 import { collectV4ContentSource, type V4ContentSource } from "./content-source"
-import { decryptV4Payload, encryptV4Payload, type V4Keyring } from "./crypto"
+import { decryptV4Payload, encryptV4Payload, V4_ENCRYPTED_PAYLOAD_OVERHEAD_BYTES, type V4Keyring } from "./crypto"
 import { throwIfV4Aborted } from "./cancellation"
 import {
   buildV4PartPaths,
@@ -18,6 +18,20 @@ import type { V4ResourceController } from "./resource-controller"
 import type { V4StagedSink } from "./staging-store"
 
 const V4_CHUNK_READ_CONCURRENCY = 4
+const V4_PACK_PREFIX_BYTES = utf8ToBytes('{"version":1,"entries":{').byteLength
+const V4_PACK_SUFFIX_BYTES = utf8ToBytes('}}').byteLength
+
+function expectedV4PackArchiveBytes(records: readonly V4FileRecord[]): number {
+  let total = V4_PACK_PREFIX_BYTES + V4_PACK_SUFFIX_BYTES
+  for (let index = 0; index < records.length; index++) {
+    const record = records[index]
+    const keyBytes = utf8ToBytes(JSON.stringify(record.fileId)).byteLength
+    const encodedBytes = 4 * Math.ceil(record.size / 3)
+    total += (index > 0 ? 1 : 0) + keyBytes + 2 + encodedBytes + 1
+    if (!Number.isSafeInteger(total)) throw new RangeError("V4 pack archive is too large.")
+  }
+  return total
+}
 
 export interface V4PreparedFile {
   path: string
@@ -483,7 +497,12 @@ export class V4StorageCodec {
 
     const payload = await reader(remotePath)
     throwIfV4Aborted(signal)
+    const expectedArchiveBytes = expectedV4PackArchiveBytes(records)
+    if (payload.byteLength !== expectedArchiveBytes + V4_ENCRYPTED_PAYLOAD_OVERHEAD_BYTES) {
+      throw new Error("V4 pack payload size does not match its declared records.")
+    }
     const archive = await this.crypto(() => decryptV4Payload(this.options.keyring!.contentKey, payload, { kind: "pack", aad: packId }))
+    if (archive.byteLength !== expectedArchiveBytes) throw new Error("V4 pack archive size does not match its declared records.")
     let parsed: unknown
     try { parsed = JSON.parse(bytesToUtf8(archive)) } catch { throw new Error("V4 pack archive JSON is invalid.") }
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("V4 pack archive is invalid.")
@@ -492,6 +511,10 @@ export class V4StorageCodec {
       throw new Error("V4 pack archive is invalid.")
     }
     const entries = candidate.entries as Record<string, unknown>
+    const entryKeys = Object.keys(entries)
+    if (entryKeys.length !== fileIds.size || entryKeys.some(fileId => !fileIds.has(fileId))) {
+      throw new Error("V4 pack archive entry set does not match its declared records.")
+    }
     const output = new Map<string, Uint8Array>()
     for (const record of records) {
       const encoded = entries[record.fileId]
