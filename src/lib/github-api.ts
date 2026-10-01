@@ -509,6 +509,9 @@ export class GitHubClient {
 
   async createGitBlob(content: Uint8Array | ArrayBuffer): Promise<string> {
     const bytes = content instanceof Uint8Array ? content : new Uint8Array(content);
+    // Authenticate the deterministic Git object id before entering the base64/HTTP phase so the
+    // temporary SHA-1 payload copy does not overlap the transport transient reservation.
+    const expectedSha = await this.gitBlobSha1(bytes);
     const transientBytes = estimateV4GitBlobTransportBytes(bytes.byteLength);
     return this.transportResources.withTransportBytes(transientBytes, async () => {
       const bodyValue = { content: toBase64(bytes), encoding: "base64" };
@@ -521,7 +524,9 @@ export class GitHubClient {
         reservationAlreadyHeld: true,
         action: "Failed to create git blob",
       });
-      return requiredGitObjectSha((response.json as { sha?: string }).sha, "created blob SHA");
+      const responseSha = requiredGitObjectSha((response.json as { sha?: string }).sha, "created blob SHA");
+      if (responseSha !== expectedSha) throw new Error("GitHub created blob SHA does not match the uploaded bytes.");
+      return responseSha;
     });
   }
 

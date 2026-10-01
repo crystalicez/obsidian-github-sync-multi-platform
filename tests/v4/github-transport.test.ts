@@ -305,14 +305,14 @@ test("GitHubClient retries a lost blob response because the immutable mutation i
   setRequestUrlHandler(async () => {
     attempts++
     if (attempts === 1) throw new Error("blob response lost")
-    return { status: 201, text: "", headers: {}, json: { sha: "5555555555555555555555555555555555555555" } }
+    return { status: 201, text: "", headers: {}, json: { sha: "fb4c35e739d53994aba7d3e0416a1082f11bfbba" } }
   })
   try {
     const client = new GitHubClient(
       { token: "token", owner: "owner", repo: "repo", branch: "main" },
       { transportPolicy: { mutationSpacingMs: 0 } },
     )
-    assert.equal(await client.createGitBlob(new TextEncoder().encode("body")), "5555555555555555555555555555555555555555")
+    assert.equal(await client.createGitBlob(new TextEncoder().encode("body")), "fb4c35e739d53994aba7d3e0416a1082f11bfbba")
     assert.equal(attempts, 2)
   } finally {
     setRequestUrlHandler(null)
@@ -452,7 +452,7 @@ test("bootstrap branch creation observes the configured ref before retrying a lo
 })
 
 test("transport metrics are in-memory and contain no request path or response body", async () => {
-  setRequestUrlHandler(async () => ({ status: 201, text: "SECRET RESPONSE", headers: {}, json: { sha: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" } }))
+  setRequestUrlHandler(async () => ({ status: 201, text: "SECRET RESPONSE", headers: {}, json: { sha: "2efcce908a8575df2a32851e0bca053d3cae23a8" } }))
   try {
     const client = new GitHubClient(
       { token: "token", owner: "owner", repo: "repo", branch: "main" },
@@ -522,7 +522,7 @@ test("GitHubClient holds the transport reservation across mutation serialization
   let reserved = 0
   setRequestUrlHandler(async () => {
     assert.equal(active, true)
-    return { status: 201, text: "", headers: {}, json: { sha: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" } }
+    return { status: 201, text: "", headers: {}, json: { sha: "f8c8f19da9424589d85086480fd89bd963959451" } }
   })
   try {
     const client = new GitHubClient(
@@ -547,7 +547,7 @@ test("GitHubClient holds the transport reservation across mutation serialization
 })
 
 test("transport metrics count response text as UTF-8 bytes", async () => {
-  setRequestUrlHandler(async () => ({ status: 201, text: "é", headers: {}, json: { sha: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" } }))
+  setRequestUrlHandler(async () => ({ status: 201, text: "é", headers: {}, json: { sha: "6b2aaa7640726588bcd3d57e1de4b1315b7f315e" } }))
   try {
     const client = new GitHubClient(
       { token: "token", owner: "owner", repo: "repo", branch: "main" },
