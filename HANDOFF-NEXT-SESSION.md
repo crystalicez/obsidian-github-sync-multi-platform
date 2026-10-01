@@ -470,6 +470,14 @@ Audit method:
    - RED: `2d3812e6b5010c8296242ac3b5df8c9b2f86394b` supplies the exact marker plus an extra root `extra.txt` and proves the success path previously accepted it.
    - Fix: `593657cb7a73b06630a0610f38ba281ea2eaa883` authenticates the bootstrap commit's non-recursive Merkle shape: the root must contain exactly the `.obsidian-github-sync-v4` tree, that tree must contain exactly the `bootstrap` regular blob, and the leaf SHA/size must match the already authenticated marker. This is a bounded two-level proof and does not add a recursive repository scan.
 
+68. **HIGH immutable Contents identity integrity — authenticated blob bytes were not bound to the requested repository path/type.**
+   - `getFileBytes(path, ref)` authenticated a successful Contents payload against the response blob SHA, but accepted that authenticated blob even when the successful response described a different repository path.
+   - A malformed/substituted Contents 200 could therefore return valid bytes for another file and pass the blob-integrity check; the immutable fallback's path-directed Merkle proof only ran on 404 and did not protect this 200 path.
+   - GitHub's Contents file schema includes both `type: "file"` and the requested repository `path`, so this identity can be checked without inventing a new protocol rule.
+   - RED: `79a109603463a56559982d0c071df662db95e2be` returns a byte/SHA-authenticated blob for `different.md` while requesting `expected.md` and proves the response was previously accepted.
+   - Fix: `d957ad1` requires a successful Contents object to be `type: "file"` and to report the exact requested path before decoding/trusting its payload. SHA validation remains first so malformed-object-ID failures retain their established precedence.
+   - Fixture follow-up: `a121304` makes the immutable-fallback success fixture protocol-shaped rather than weakening the new production boundary.
+
 ### Audited surfaces with no new confirmed defect so far
 
 - secret migration/persistence: raw token/passphrase are removed before plugin data persistence and use Obsidian SecretStorage;
@@ -509,6 +517,7 @@ RED tests have now been pushed on the audit branch:
 - `103bae04cdebc751d8dd5b367b6e774141291ad8` — an already-existing configured bootstrap branch must point exactly at the verified bootstrap commit.
 - `d5cdcd2ecd0424bfc6bff2be0f665a0d8ee79e19` — the configured branch must still point at the bootstrap SHA on the post-create read, not merely on the successful create-ref response.
 - `2d3812e6b5010c8296242ac3b5df8c9b2f86394b` — exact bootstrap marker bytes are insufficient if the root/bootstrap-directory tree contains additional entries.
+- `79a109603463a56559982d0c071df662db95e2be` — authenticated Contents bytes must still be bound to the exact requested repository path and file type.
 
 Refined root-cause design:
 - create one canonical shard-record hash function and use it for writer hash creation, remote shard verification, and local persisted-cache verification;
@@ -538,6 +547,8 @@ Root-cause fixes are now on the audit branch:
 - `68803e2f8ef1754c5c16dd93cce524f0dae84551` — bind every configured-bootstrap-ref observation to the verified bootstrap SHA, including pre-existing refs, post-create reads, and ambiguous create reconciliation.
 - `593657cb7a73b06630a0610f38ba281ea2eaa883` — authenticate the successful root bootstrap commit's exact bounded two-level tree shape and marker leaf identity before configured-ref adoption.
 - `0762038ae20673674fceb71376906dd21d1443c4` — stabilize the fast planner qualification by measuring process CPU time instead of wall-clock delay caused by concurrent test files.
+- `d957ad1` — bind successful GitHub Contents file responses to `type: "file"` and the exact requested repository path before trusting authenticated payload bytes.
+- fixture-only follow-up `a121304` keeps the immutable Contents-success regression protocol-shaped under the stricter response contract.
 - `6151868d066c050deef9159d3beda389e2ae0ce7`, `d9cde1a72496a8c86df5c85b975d39b92998f873`, `0c301523e774d54bc03191aa7a897da98691ac81`, `06335328777bd5010e928c1951f1cdb581aac2f0` — bounded journal writer/reader contract, safe journal markers, cross-page consistency, descriptor validation before blob reads, and preview-limit precedence.
 - fixture-only followups `4ce0affffce484398db30b0de339af8a2dd1e5cf`, `e5ae96eda6003faa4233346bd5104561e2258923`, `40fc418844c40a52ef4baa39c7318f21a5547782`, `b876e4076084e544ec13ec0ef60c9ef7e0cbcc8a` keep tests protocol-shaped rather than weakening production validation.
 
@@ -548,9 +559,9 @@ Recent crash/memory hardening:
 
 Verification status:
 - The repository was executed through the connected local engineering workspace with Node `v24.11.0` and pnpm `9.12.3`.
-- Final post-fix gates on the current source tree: `pnpm run test:fast` **504/504**, `pnpm run test:recovery` **48/48**, `pnpm run test:resource` **11/11**, and `pnpm run build` PASS.
+- Final post-fix gates on the current source tree: `pnpm run test:fast` **505/505**, `pnpm run test:recovery` **48/48**, `pnpm run test:resource` **11/11**, and `pnpm run build` PASS.
 - Final release checks also pass on regenerated artifacts: `pnpm run validate:metadata` and `pnpm run validate:package`.
-- Focused regressions in the latest audit pass: github-transport **42/42** and benchmark **3/3**; the benchmark qualification also reproduced the prior wall-clock flake under full-suite contention before `0762038...`, then the next full fast runs passed **503/503** and finally **504/504** after the bootstrap-tree regression was added. Prior history-service **13/13**, sync-coordinator **25/25**, sync-policy **2/2**, storage-codec **12/12**, opaque-leakage **2/2**, and sync-session **95/95** remain covered by the full fast gate.
+- Focused regressions in the latest audit pass: github-transport **43/43**, github-immutable-read-fallback **13/13**, and benchmark **3/3**; the benchmark qualification also reproduced the prior wall-clock flake under full-suite contention before `0762038...`, then later full fast runs passed **503/503**, **504/504**, and now **505/505** after the Contents-identity regression was added. Prior history-service **13/13**, sync-coordinator **25/25**, sync-policy **2/2**, storage-codec **12/12**, opaque-leakage **2/2**, and sync-session **95/95** remain covered by the full fast gate.
 - Real GitHub E2E remains excluded from the default fast tier and was not run in this closure; inspect hosted checks for the exact pushed SHA separately before treating the branch as release-qualified.
 
 ### TDD plan
