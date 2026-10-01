@@ -19,7 +19,7 @@ export function shouldRunStartupSync(settings: SyncPolicySettings): boolean {
 }
 
 export function shouldRunScheduledSync(settings: SyncPolicySettings): boolean {
-  return Boolean(settings.syncEnabled && settings.scheduledSyncEnabled);
+  return Boolean(settings.syncEnabled && settings.scheduledSyncEnabled && hasGitHubSyncConfig(settings));
 }
 
 export function normalizeScheduledSyncIntervalSeconds(value: unknown): number {
