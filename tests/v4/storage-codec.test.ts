@@ -215,3 +215,62 @@ test("v4 whole-buffer reads reject plaintext length that disagrees with remote m
     /size mismatch/iu,
   );
 });
+
+
+test("v4 pack reader rejects payloads larger than the exact declared pack archive before decrypt/parse", async () => {
+  const keyring = await deriveV4Keyring({ passphrase: "pass", repoId: "o/r#main", salt: enc("salt"), iterations: 10 });
+  const codec = new V4StorageCodec({ mode: "encrypted", pathLayout: "opaque-stable-v1", keyring });
+  const plaintext = enc("a");
+  const record = {
+    pathId: "aa".padEnd(64, "0"),
+    fileId: "f".repeat(64),
+    plaintextSha256: await sha256Hex(plaintext),
+    size: plaintext.byteLength,
+    mtime: 1,
+    remoteVersion: "v1",
+    remotePath: "opaque-pack",
+    storage: "pack" as const,
+    packId: "pack-1",
+  };
+  const archive = enc(JSON.stringify({
+    version: 1,
+    entries: {
+      [record.fileId]: toBase64(plaintext),
+      ["e".repeat(64)]: toBase64(new Uint8Array(1024 * 1024)),
+    },
+  }));
+  const payload = await encryptV4Payload(keyring.contentKey, archive, { kind: "pack", aad: record.packId });
+
+  await assert.rejects(
+    () => codec.readPackRecords([record], async () => payload),
+    /pack.*size|payload.*size|archive.*size|unexpected.*pack/iu,
+  );
+});
+
+test("v4 pack reader requires the archive entry set to match the declared pack records exactly", async () => {
+  const keyring = await deriveV4Keyring({ passphrase: "pass", repoId: "o/r#main", salt: enc("salt"), iterations: 10 });
+  const codec = new V4StorageCodec({ mode: "encrypted", pathLayout: "opaque-stable-v1", keyring });
+  const plaintext = enc("a");
+  const record = {
+    pathId: "aa".padEnd(64, "0"),
+    fileId: "f".repeat(64),
+    plaintextSha256: await sha256Hex(plaintext),
+    size: plaintext.byteLength,
+    mtime: 1,
+    remoteVersion: "v1",
+    remotePath: "opaque-pack",
+    storage: "pack" as const,
+    packId: "pack-1",
+  };
+  // Keep total archive size equal to the writer-shaped single-entry archive by replacing the expected key.
+  const archive = enc(JSON.stringify({
+    version: 1,
+    entries: { ["e".repeat(64)]: toBase64(plaintext) },
+  }));
+  const payload = await encryptV4Payload(keyring.contentKey, archive, { kind: "pack", aad: record.packId });
+
+  await assert.rejects(
+    () => codec.readPackRecords([record], async () => payload),
+    /entry set|missing|pack entry/iu,
+  );
+});
