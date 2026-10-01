@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { deriveV4Keyring } from "../../src/lib/v4/crypto";
+import { deriveV4Keyring, encryptV4Payload } from "../../src/lib/v4/crypto";
 import { V4StorageCodec } from "../../src/lib/v4/storage-codec";
 import { V4_LARGE_FILE_THRESHOLD_BYTES } from "../../src/lib/v4/large-files";
-import { sha256Hex } from "../../src/lib/bytes";
+import { sha256Hex, toBase64 } from "../../src/lib/bytes";
 
 const bytes = (value: string) => new TextEncoder().encode(value);
 
@@ -220,7 +220,7 @@ test("v4 whole-buffer reads reject plaintext length that disagrees with remote m
 test("v4 pack reader rejects payloads larger than the exact declared pack archive before decrypt/parse", async () => {
   const keyring = await deriveV4Keyring({ passphrase: "pass", repoId: "o/r#main", salt: enc("salt"), iterations: 10 });
   const codec = new V4StorageCodec({ mode: "encrypted", pathLayout: "opaque-stable-v1", keyring });
-  const plaintext = enc("a");
+  const plaintext = bytes("a");
   const record = {
     pathId: "aa".padEnd(64, "0"),
     fileId: "f".repeat(64),
@@ -232,7 +232,7 @@ test("v4 pack reader rejects payloads larger than the exact declared pack archiv
     storage: "pack" as const,
     packId: "pack-1",
   };
-  const archive = enc(JSON.stringify({
+  const archive = bytes(JSON.stringify({
     version: 1,
     entries: {
       [record.fileId]: toBase64(plaintext),
@@ -250,7 +250,7 @@ test("v4 pack reader rejects payloads larger than the exact declared pack archiv
 test("v4 pack reader requires the archive entry set to match the declared pack records exactly", async () => {
   const keyring = await deriveV4Keyring({ passphrase: "pass", repoId: "o/r#main", salt: enc("salt"), iterations: 10 });
   const codec = new V4StorageCodec({ mode: "encrypted", pathLayout: "opaque-stable-v1", keyring });
-  const plaintext = enc("a");
+  const plaintext = bytes("a");
   const record = {
     pathId: "aa".padEnd(64, "0"),
     fileId: "f".repeat(64),
@@ -263,7 +263,7 @@ test("v4 pack reader requires the archive entry set to match the declared pack r
     packId: "pack-1",
   };
   // Keep total archive size equal to the writer-shaped single-entry archive by replacing the expected key.
-  const archive = enc(JSON.stringify({
+  const archive = bytes(JSON.stringify({
     version: 1,
     entries: { ["e".repeat(64)]: toBase64(plaintext) },
   }));
