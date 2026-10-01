@@ -444,9 +444,31 @@ Audit method:
 
 63. **HIGH bootstrap mutation integrity — root/message checks still did not bind the successful bootstrap commit to the exact marker bytes requested.**
    - After finding 62, a returned bootstrap commit had to be a root commit with the exact bootstrap message, but a different root commit carrying that same message could still be accepted if its `.obsidian-github-sync-v4/bootstrap` bytes differed from the Contents PUT body.
-   - That left one final substitution gap in the successful empty-repository bootstrap path before configured-ref adoption.
+   - That left another substitution gap in the successful empty-repository bootstrap path before configured-ref adoption.
    - RED: `26af58a088acca4f39568a645c1e0e00225a7a26` returns a root commit with the exact bootstrap message but different marker bytes and proves the success path previously accepted it.
    - Fix: `ff4386adeb24f983316872ae99394464b17efad3` reuses the exact bootstrap bytes sent to Contents PUT, reads the marker back immutably at the returned commit SHA, and requires byte-for-byte equality before accepting or creating the configured ref.
+
+64. **HIGH bootstrap ref-adoption integrity — a configured branch appearing after verified bootstrap could be accepted at a competitor SHA.**
+   - After the root bootstrap commit and marker were verified, `ensureConfiguredBootstrapRef()` returned any already-existing configured branch without requiring it to point at the verified bootstrap commit.
+   - A competing actor could therefore create the configured branch between bootstrap verification and configured-ref adoption and cause the caller to continue from unrelated state.
+   - RED: `103bae04cdebc751d8dd5b367b6e774141291ad8`.
+   - Fix: `68803e2f8ef1754c5c16dd93cce524f0dae84551` centralizes configured-bootstrap-ref validation and raises a typed `V4RepositoryBootstrapRaceError` unless the observed branch points exactly at the verified bootstrap SHA.
+
+65. **HIGH bootstrap ref-race safety — a configured branch could move away immediately after successful ref creation.**
+   - The successful `createGitRef()` path re-read the configured branch and returned it without binding that re-read to the bootstrap SHA.
+   - A competitor advance between ref creation and the follow-up read could therefore make bootstrap appear successful at a different commit even though the create response itself was correct.
+   - RED: `d5cdcd2ecd0424bfc6bff2be0f665a0d8ee79e19`.
+   - Fix: `68803e2f8ef1754c5c16dd93cce524f0dae84551` applies the same exact-SHA bootstrap-ref assertion to the pre-existing, post-create, and ambiguous-create reconciliation paths.
+
+66. **LOW/MEDIUM qualification reliability — the fast-tier planner benchmark used wall-clock time under concurrent test load.**
+   - The 100,000-file planner regression asserted `Date.now() - started < 5_000` while Node's test runner executes fast-tier files concurrently.
+   - On the current branch this reproduced a false full-suite failure: functional assertions passed, but the planner test observed ~8.4 s under CPU contention; an immediate isolated rerun passed all 3 benchmark tests with the planner at ~1.13 s.
+   - Fix: `0762038ae20673674fceb71376906dd21d1443c4` keeps the same 5-second compute budget but measures the benchmark process's own CPU time via `process.cpuUsage()`, excluding scheduler wait caused by unrelated concurrent test files. A subsequent full fast run passed 503/503 before the next regression was added.
+
+67. **HIGH bootstrap tree integrity — exact bootstrap marker bytes did not prove the root commit contained only the requested bootstrap tree.**
+   - After finding 63, a substituted root commit with the exact message and exact marker bytes could still contain additional root or bootstrap-directory entries and be accepted before configured-ref adoption.
+   - RED: `2d3812e6b5010c8296242ac3b5df8c9b2f86394b` supplies the exact marker plus an extra root `extra.txt` and proves the success path previously accepted it.
+   - Fix: `593657cb7a73b06630a0610f38ba281ea2eaa883` authenticates the bootstrap commit's non-recursive Merkle shape: the root must contain exactly the `.obsidian-github-sync-v4` tree, that tree must contain exactly the `bootstrap` regular blob, and the leaf SHA/size must match the already authenticated marker. This is a bounded two-level proof and does not add a recursive repository scan.
 
 ### Audited surfaces with no new confirmed defect so far
 
@@ -462,7 +484,7 @@ Audit method:
 - retired encrypted key material is best-effort zeroized on runtime disposal, but resolved keyrings invalidated by settings changes may remain in the cache's retired set until disposal. Immediate zeroization is intentionally not changed yet because history work exists outside the sync coordinator and can hold a live keyring reference; settings-generation guards now stop stale history results, but tighter reference-counted key lifetime remains a residual hardening opportunity. (full path/duplicate-ID/numeric validation), but header integrity and normal writer ownership mean no equivalent concrete production corruption path is confirmed yet.
 - Obsidian `requestUrl` buffers HTTP response bodies before the V4 reader can inspect expected descriptor/tree sizes. Git/V4 integrity checks and read concurrency still fail closed after receipt, but a forged unexpectedly large remote blob can create transient peak memory above the writer contract before rejection. A meaningful fix requires a streaming/bounded transport API; a post-allocation size check would not solve the peak-memory risk and is intentionally not presented as mitigation.
 - Remote metadata/history fields still rely partly on transport size plus post-parse writer-shape validation rather than one universal pre-parse byte/string ceiling. This pass specifically reviewed journal bytes and `fileId` length; no new cap was added because the current writer contract does not define a portable total-path/metadata-byte maximum and tightening arbitrary string lengths could reject existing V4 data. Treat this as protocol/resource-hardening design work, not a confirmed destructive bug in this pass.
-- `createGitTree()` still validates successful tree mutation responses primarily as Git object IDs rather than proving full semantic equivalence to `base_tree + requested edits`. Blob creation and commit creation are now bound to their intended bytes/semantics, so this remaining gap is narrower, but an exact tree proof needs authenticated reconstruction/readback of the base and result tree. A naive recursive-tree comparison would add large-repository cost and can itself encounter truncated tree responses, so do not add a broad recursive scan merely to close this residual; design a bounded exact-tree proof first.
+- `createGitTree()` still validates general successful tree mutation responses primarily as Git object IDs rather than proving full semantic equivalence to `base_tree + requested edits`. Blob creation and commit creation are bound to their intended bytes/semantics, and the special empty-repository bootstrap tree now has its own exact bounded two-level proof, but general candidate-tree equivalence still needs authenticated Merkle/path reconstruction of the base and result. A naive recursive-tree comparison would add large-repository cost and can itself encounter truncated tree responses, so do not add a broad recursive scan merely to close this residual; design a bounded exact-tree proof first.
 
 - Supply-chain review: the repository has no runtime npm dependencies; build/test dependencies are lockfile-managed. `esbuild ^0.24.2` is in a known affected range for dev-server advisories (including the historical cross-origin dev-server issue and a Windows servedir file-read issue), but this repository's `esbuild.config.mjs` uses only `context().watch()/rebuild()` and never starts `serve()`. Treat esbuild `0.24.2` as a dev-tooling hygiene residual, not a production/runtime blocker. Do not hand-edit the pnpm lockfile; upgrade only with a real pnpm install + build/package verification.
 - Repository-host security alert APIs (Dependabot/secret-scanning/code-scanning) were probed through the available GitHub connector but were not readable with the current connector permissions, so this audit does not claim server-side alert dashboards are empty.
@@ -484,6 +506,9 @@ RED tests have now been pushed on the audit branch:
 - `1192a6c12c3900f87290f38a3702e8c4876d2b64` — successful Git commit creation must read back to the requested message/tree/parents before publication.
 - `e042790b06fbce6621054a4ab67b3edbdcb6a855` — a successful empty-repository bootstrap commit must still be a root commit rather than silently inheriting a competitor base.
 - `26af58a088acca4f39568a645c1e0e00225a7a26` — a successful root bootstrap commit must contain the exact bootstrap marker bytes sent by the client before any configured ref is trusted.
+- `103bae04cdebc751d8dd5b367b6e774141291ad8` — an already-existing configured bootstrap branch must point exactly at the verified bootstrap commit.
+- `d5cdcd2ecd0424bfc6bff2be0f665a0d8ee79e19` — the configured branch must still point at the bootstrap SHA on the post-create read, not merely on the successful create-ref response.
+- `2d3812e6b5010c8296242ac3b5df8c9b2f86394b` — exact bootstrap marker bytes are insufficient if the root/bootstrap-directory tree contains additional entries.
 
 Refined root-cause design:
 - create one canonical shard-record hash function and use it for writer hash creation, remote shard verification, and local persisted-cache verification;
@@ -510,6 +535,9 @@ Root-cause fixes are now on the audit branch:
 - `ddec918b51d3dc4e0129449b0682487cce1fb126` — validate commit mutation inputs and read the created commit back to bind message/tree/parents before publication.
 - `a4f9d5ba5ecd26140cb3a237251aa96939783276` — authenticate successful empty-repository bootstrap as a root commit with the exact bootstrap message before accepting/creating the configured ref.
 - `ff4386adeb24f983316872ae99394464b17efad3` — bind successful bootstrap completion to the exact immutable marker bytes that were sent in the Contents PUT before configured-ref adoption.
+- `68803e2f8ef1754c5c16dd93cce524f0dae84551` — bind every configured-bootstrap-ref observation to the verified bootstrap SHA, including pre-existing refs, post-create reads, and ambiguous create reconciliation.
+- `593657cb7a73b06630a0610f38ba281ea2eaa883` — authenticate the successful root bootstrap commit's exact bounded two-level tree shape and marker leaf identity before configured-ref adoption.
+- `0762038ae20673674fceb71376906dd21d1443c4` — stabilize the fast planner qualification by measuring process CPU time instead of wall-clock delay caused by concurrent test files.
 - `6151868d066c050deef9159d3beda389e2ae0ce7`, `d9cde1a72496a8c86df5c85b975d39b92998f873`, `0c301523e774d54bc03191aa7a897da98691ac81`, `06335328777bd5010e928c1951f1cdb581aac2f0` — bounded journal writer/reader contract, safe journal markers, cross-page consistency, descriptor validation before blob reads, and preview-limit precedence.
 - fixture-only followups `4ce0affffce484398db30b0de339af8a2dd1e5cf`, `e5ae96eda6003faa4233346bd5104561e2258923`, `40fc418844c40a52ef4baa39c7318f21a5547782`, `b876e4076084e544ec13ec0ef60c9ef7e0cbcc8a` keep tests protocol-shaped rather than weakening production validation.
 
@@ -520,9 +548,9 @@ Recent crash/memory hardening:
 
 Verification status:
 - The repository was executed through the connected local engineering workspace with Node `v24.11.0` and pnpm `9.12.3`.
-- Final post-fix gates on the current source tree: `pnpm run test:fast` **501/501**, `pnpm run test:recovery` **48/48**, `pnpm run test:resource` **11/11**, and `pnpm run build` PASS.
+- Final post-fix gates on the current source tree: `pnpm run test:fast` **504/504**, `pnpm run test:recovery` **48/48**, `pnpm run test:resource` **11/11**, and `pnpm run build` PASS.
 - Final release checks also pass on regenerated artifacts: `pnpm run validate:metadata` and `pnpm run validate:package`.
-- Focused regressions in the latest audit pass: github-transport **39/39**; prior history-service **13/13**, sync-coordinator **25/25**, sync-policy **2/2**, storage-codec **12/12**, opaque-leakage **2/2**, and sync-session **95/95** remain covered by the full fast gate.
+- Focused regressions in the latest audit pass: github-transport **42/42** and benchmark **3/3**; the benchmark qualification also reproduced the prior wall-clock flake under full-suite contention before `0762038...`, then the next full fast runs passed **503/503** and finally **504/504** after the bootstrap-tree regression was added. Prior history-service **13/13**, sync-coordinator **25/25**, sync-policy **2/2**, storage-codec **12/12**, opaque-leakage **2/2**, and sync-session **95/95** remain covered by the full fast gate.
 - Real GitHub E2E remains excluded from the default fast tier and was not run in this closure; inspect hosted checks for the exact pushed SHA separately before treating the branch as release-qualified.
 
 ### TDD plan
