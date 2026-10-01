@@ -418,6 +418,13 @@ Audit method:
    - Fix: `e1173260c083c2be55c4317ed1fec119b90a488f` validates every decoded journal change at the read boundary: kind, portable paths, writer-shape semantics, and before/after descriptors through the existing V4 remote-record contract. Rename-before descriptors are validated against `previousPath` rather than the new path.
    - One older test fixture represented `modify` with only `after`; the initial V4 writer history was checked and the fixture was corrected to the writer-valid before+after shape instead of weakening production validation.
 
+59. **HIGH immutable Git integrity — successful commit/tree reads were not bound to the requested object IDs.**
+   - `GitHubClient.getGitCommit(requestedSha)` and `getTreeAt(requestedTreeSha)` validated that returned SHAs were syntactically valid Git object IDs, but did not require them to equal the immutable IDs named in the request URL.
+   - A mismatched 200 response could therefore substitute a different valid commit or tree into publication reconciliation, external-commit reconciliation, Force Push tree evidence, immutable fallback, or history preview logic.
+   - This was inconsistent with raw Git Blob reads, which already authenticate returned bytes against the requested object SHA.
+   - RED: `1c5ca913938a2df2b8c9a034e21669197531d62f`.
+   - Fix: `8d56b55c130062934ed3850b43dfcb62b462bb69` validates requested commit/tree IDs before issuing the request and rejects any successful response whose object SHA does not exactly match the requested immutable ID.
+
 ### Audited surfaces with no new confirmed defect so far
 
 - secret migration/persistence: raw token/passphrase are removed before plugin data persistence and use Obsidian SecretStorage;
@@ -448,6 +455,7 @@ RED tests have now been pushed on the audit branch:
 - `83a9044b8047c9a57c8bae6e33878fd3db735037` — freshly fetched remote shard records must match the head's advertised shard hash.
 - `ee6640d6fe02f9e493158f3c60e30e026fbd6948` — file-history traversal must have one aggregate journal-read budget, and scheduled intervals must stay within the signed 32-bit timer delay range.
 - `8aac1d5bc0b7598dafd25e4302be4035e960ff08` — large coordinator event bursts must not depend on argument-spread limits, and remote history journal changes must be writer-shaped before exposure.
+- `1c5ca913938a2df2b8c9a034e21669197531d62f` — successful immutable Git commit/tree reads must be bound to the exact requested object IDs, not merely valid-looking SHA strings.
 
 Refined root-cause design:
 - create one canonical shard-record hash function and use it for writer hash creation, remote shard verification, and local persisted-cache verification;
@@ -469,6 +477,7 @@ Root-cause fixes are now on the audit branch:
 - `f2ad17aef7d833178f7e9ba105489ce6fb6ad999`, `8c6bd38cdb0b9bc3a953a4bc9dcda0734b6bf60b` — encrypted config/KDF bounds plus remote head/record/shard shape/resource validation.
 - `ff2780ff1543fde9b3914db174b733a998011f9f` — bound whole-buffer chunk remote reads to four concurrent part fetches.
 - `e1173260c083c2be55c4317ed1fec119b90a488f` — remove coordinator argument-spread amplification and validate remote journal change semantics/paths/descriptors before history consumers observe them.
+- `8d56b55c130062934ed3850b43dfcb62b462bb69` — bind successful immutable Git commit/tree reads to the exact requested SHA before their evidence is trusted.
 - `6151868d066c050deef9159d3beda389e2ae0ce7`, `d9cde1a72496a8c86df5c85b975d39b92998f873`, `0c301523e774d54bc03191aa7a897da98691ac81`, `06335328777bd5010e928c1951f1cdb581aac2f0` — bounded journal writer/reader contract, safe journal markers, cross-page consistency, descriptor validation before blob reads, and preview-limit precedence.
 - fixture-only followups `4ce0affffce484398db30b0de339af8a2dd1e5cf`, `e5ae96eda6003faa4233346bd5104561e2258923`, `40fc418844c40a52ef4baa39c7318f21a5547782`, `b876e4076084e544ec13ec0ef60c9ef7e0cbcc8a` keep tests protocol-shaped rather than weakening production validation.
 
@@ -479,9 +488,9 @@ Recent crash/memory hardening:
 
 Verification status:
 - The repository was executed through the connected local engineering workspace with Node `v24.11.0` and pnpm `9.12.3`.
-- Final post-fix gates on the current source tree: `pnpm run test:fast` **496/496**, `pnpm run test:recovery` **48/48**, `pnpm run test:resource` **11/11**, and `pnpm run build` PASS.
+- Final post-fix gates on the current source tree: `pnpm run test:fast` **497/497**, `pnpm run test:recovery` **48/48**, `pnpm run test:resource` **11/11**, and `pnpm run build` PASS.
 - Final release checks also pass on regenerated artifacts: `pnpm run validate:metadata` and `pnpm run validate:package`.
-- Focused regressions in the latest audit pass: history-service **13/13** and sync-coordinator **25/25**; prior sync-policy **2/2**, storage-codec **12/12**, opaque-leakage **2/2**, and sync-session **95/95** remain covered by the full fast gate.
+- Focused regressions in the latest audit pass: github-transport **35/35**, history-service **13/13**, and sync-coordinator **25/25**; prior sync-policy **2/2**, storage-codec **12/12**, opaque-leakage **2/2**, and sync-session **95/95** remain covered by the full fast gate.
 - Real GitHub E2E remains excluded from the default fast tier and was not run in this closure; inspect hosted checks for the exact pushed SHA separately before treating the branch as release-qualified.
 
 ### TDD plan
