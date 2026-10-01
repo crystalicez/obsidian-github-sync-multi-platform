@@ -52,13 +52,19 @@ export interface V4FileVersion {
   descriptor?: V4VersionDescriptor;
 }
 
-export function buildV4JournalPages(journalId: string, changes: V4JournalChange[], pageSize = V4_JOURNAL_PAGE_SIZE): V4JournalPage[] {
-  if (!isV4JournalId(journalId)) throw new Error("V4 journal id is invalid.");
+export function assertV4JournalChangeCapacity(changeCount: number, pageSize = V4_JOURNAL_PAGE_SIZE): void {
+  if (!Number.isSafeInteger(changeCount) || changeCount < 0) throw new Error("V4 journal change count is invalid.")
   if (!Number.isInteger(pageSize) || pageSize <= 0 || pageSize > V4_JOURNAL_PAGE_SIZE) {
     throw new Error(`V4 journal page size must be between 1 and ${V4_JOURNAL_PAGE_SIZE}.`)
   }
+  const pageCount = Math.max(1, Math.ceil(changeCount / pageSize))
+  if (pageCount > V4_MAX_JOURNAL_PAGES) throw new Error("V4 journal change capacity exceeds the protocol page limit.")
+}
+
+export function buildV4JournalPages(journalId: string, changes: V4JournalChange[], pageSize = V4_JOURNAL_PAGE_SIZE): V4JournalPage[] {
+  if (!isV4JournalId(journalId)) throw new Error("V4 journal id is invalid.");
+  assertV4JournalChangeCapacity(changes.length, pageSize)
   const pageCount = Math.max(1, Math.ceil(changes.length / pageSize));
-  if (pageCount > V4_MAX_JOURNAL_PAGES) throw new Error("V4 journal page count exceeds the protocol limit.")
   return Array.from({ length: pageCount }, (_, page) => ({
     journalId,
     page,

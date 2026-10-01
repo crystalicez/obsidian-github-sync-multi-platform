@@ -15,7 +15,7 @@ import {
   type V4GitTreeProgressItem,
 } from "./git-tree-writer"
 import { reconcileV4CandidatePublication } from "./publish-reconciler"
-import { buildV4JournalPages, type V4JournalChange } from "./history-journal"
+import { assertV4JournalChangeCapacity, buildV4JournalPages, type V4JournalChange } from "./history-journal"
 import { isV4LocalIndexCacheComplete, type V4IndexFileRecord, type V4LocalIndex } from "./local-index"
 import { assertV4LocalTargetPrecondition, createV4LocalIo, type V4LocalIo, type V4LocalTargetPrecondition, type V4SessionVault } from "./local-io"
 import { trashV4LocalUserFile } from "./local-delete-policy"
@@ -568,6 +568,9 @@ export class V4SyncSession {
         })
       }
     }
+
+    const journalChangeCount = (externalReconciled ? plan.pulls.length : 0) + batch.pushes.length
+    assertV4JournalChangeCapacity(journalChangeCount)
 
     await this.stagePackedPullGroups(batch.pulls, ownedStages, prefetchedRemoteBodies)
 
