@@ -3,6 +3,7 @@ import { bytesToUtf8 } from "../bytes"
 import { decryptV4Payload, type V4Keyring } from "./crypto"
 import { isV4JournalId, V4_JOURNAL_PAGE_SIZE, V4_MAX_JOURNAL_PAGES, type V4JournalChange, type V4JournalPage, type V4VersionDescriptor } from "./history-journal"
 import { createEmptyV4LocalIndex, type V4IndexFileRecord } from "./local-index"
+import { normalizeV4VaultPath } from "./paths"
 import { expectedV4PathLayout, V4_ROOT, type V4RemoteConfig } from "./protocol-types"
 import { assertV4RemoteRecordDescriptor } from "./remote-index"
 import { V4StorageCodec } from "./storage-codec"
@@ -204,6 +205,7 @@ export class V4HistoryService {
     if (!Array.isArray(journal.changes) || journal.changes.length > V4_JOURNAL_PAGE_SIZE) {
       throw new Error("V4 history journal change count exceeds the per-page limit.")
     }
+    for (const change of journal.changes) this.assertJournalChange(change)
     return journal
   }
 
@@ -245,9 +247,54 @@ export class V4HistoryService {
     return changes.sort((a, b) => a.path.localeCompare(b.path))
   }
 
-  private recordFromDescriptor(change: V4HistoryChange, descriptor: V4VersionDescriptor): V4IndexFileRecord {
+  private assertJournalChange(value: unknown): asserts value is V4JournalChange {
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("V4 history journal change shape is invalid.")
+    const change = value as Partial<V4JournalChange>
+    if (typeof change.fileId !== "string" || !change.fileId) throw new Error("V4 history journal change fileId is invalid.")
+    if (change.kind !== "create" && change.kind !== "modify" && change.kind !== "delete" && change.kind !== "rename") {
+      throw new Error("V4 history journal change kind is invalid.")
+    }
+    if (!this.isNormalizedJournalPath(change.path)) throw new Error("V4 history journal change path is invalid.")
+    if (change.previousPath !== undefined && !this.isNormalizedJournalPath(change.previousPath)) {
+      throw new Error("V4 history journal previous path is invalid.")
+    }
+    const hasBefore = change.before !== undefined
+    const hasAfter = change.after !== undefined
+    const hasPreviousPath = change.previousPath !== undefined
+    if (
+      (change.kind === "create" && (hasBefore || !hasAfter || hasPreviousPath))
+      || (change.kind === "delete" && (!hasBefore || hasAfter || hasPreviousPath))
+      || (change.kind === "modify" && (!hasBefore || !hasAfter || hasPreviousPath))
+      || (change.kind === "rename" && (!hasBefore || !hasAfter || !hasPreviousPath || change.previousPath === change.path))
+    ) {
+      throw new Error("V4 history journal change shape is inconsistent with its kind.")
+    }
+    const typed = change as V4JournalChange
+    if (typed.before !== undefined) {
+      this.assertJournalDescriptor(typed, typed.before, typed.kind === "rename" ? typed.previousPath! : typed.path)
+    }
+    if (typed.after !== undefined) this.assertJournalDescriptor(typed, typed.after, typed.path)
+  }
+
+  private isNormalizedJournalPath(value: unknown): value is string {
+    if (typeof value !== "string") return false
+    try { return normalizeV4VaultPath(value) === value } catch { return false }
+  }
+
+  private assertJournalDescriptor(change: V4JournalChange, value: unknown, logicalPath: string): asserts value is V4VersionDescriptor {
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("V4 history journal descriptor shape is invalid.")
+    const descriptor = value as Partial<V4VersionDescriptor>
+    if (typeof descriptor.sha !== "string") throw new Error("V4 history journal descriptor SHA is invalid.")
+    this.recordFromDescriptor(change, descriptor as V4VersionDescriptor, logicalPath)
+  }
+
+  private recordFromDescriptor(
+    change: Pick<V4JournalChange, "path" | "fileId">,
+    descriptor: V4VersionDescriptor,
+    logicalPath = change.path,
+  ): V4IndexFileRecord {
     const record: V4IndexFileRecord = {
-      path: change.path,
+      path: logicalPath,
       pathId: descriptor.pathId ?? change.fileId,
       fileId: change.fileId,
       plaintextSha256: descriptor.plaintextSha256 ?? "",
