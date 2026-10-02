@@ -476,10 +476,18 @@ export class GitHubClient {
         await this.createGitRef(commitSha);
         return this.assertConfiguredBootstrapRef(await this.getGitRef(), commitSha);
       } catch (error) {
-        if (!(error instanceof V4GitMutationOutcomeUnknownError)) throw error;
-        const observed = await this.getGitRefOrNull();
-        if (observed) return this.assertConfiguredBootstrapRef(observed, commitSha);
-        if (attempt === 2) throw error;
+        if (error instanceof V4GitMutationOutcomeUnknownError) {
+          const observed = await this.getGitRefOrNull();
+          if (observed) return this.assertConfiguredBootstrapRef(observed, commitSha);
+          if (attempt === 2) throw error;
+          continue;
+        }
+        const status = (error as { status?: number }).status;
+        if (status === 409 || status === 422) {
+          const observed = await this.getGitRefOrNull();
+          if (observed) return this.assertConfiguredBootstrapRef(observed, commitSha);
+        }
+        throw error;
       }
     }
     throw new Error("V4 bootstrap branch could not be initialized.");
