@@ -61,6 +61,21 @@ class MemoryVault implements V4SessionVault {
   async trash(path: string) { this.events.push(`vault-trash:${path}`); this.files.delete(path) }
 }
 
+class StrictTopologyVault extends MemoryVault {
+  private assertWritablePath(path: string) {
+    for (const existing of this.files.keys()) {
+      if (existing === path) continue
+      if (existing.startsWith(`${path}/`) || path.startsWith(`${existing}/`)) {
+        throw new Error(`filesystem topology blocks write: ${path} vs ${existing}`)
+      }
+    }
+  }
+  override async write(path: string, bytes: Uint8Array, mtime = 0) {
+    this.assertWritablePath(path)
+    await super.write(path, bytes, mtime)
+  }
+}
+
 class MemoryGitHub {
   ref: { ref: string; sha: string; type: string } | null = null
   files = new Map<string, Uint8Array>()
@@ -142,4 +157,56 @@ test("pure pull persists remote-verified without journalId before the first fina
   assert.equal(latest?.header.journalId, undefined)
   assert.equal(latest?.header.verifiedRemoteHead, github.ref?.sha)
   assert.equal(decode(vault.files.get("remote.md")!.bytes), "remote-body")
+})
+
+test("recovery pull removes blocking descendants before writing a parent file", async () => {
+  const github = new MemoryGitHub()
+  const sourceVault = new MemoryVault()
+  sourceVault.files.set("dir/file.md", { bytes: encode("old-child"), mtime: 1 })
+  const sourceIndex = createEmptyV4LocalIndex({ repoId: config.repoId, deviceId: "source-device", mode: "plaintext" })
+
+  await new V4SyncSession({
+    github,
+    vault: sourceVault,
+    index: sourceIndex,
+    config,
+    conflictPolicy: "copy",
+    abortChangePercent: 0,
+  }).sync({ operation: "forcePush" })
+
+  const targetIndex = structuredClone(sourceIndex)
+  const events: string[] = []
+  const targetVault = new StrictTopologyVault(events)
+  targetVault.files.set("dir/file.md", { bytes: encode("old-child"), mtime: 1 })
+
+  sourceVault.files.delete("dir/file.md")
+  sourceVault.files.set("dir", { bytes: encode("new-parent-file"), mtime: 2 })
+  await new V4SyncSession({
+    github,
+    vault: sourceVault,
+    index: sourceIndex,
+    config,
+    conflictPolicy: "copy",
+    abortChangePercent: 0,
+  }).sync({ operation: "forcePush" })
+
+  const adapter = new RecoveryAdapter(events)
+  const recoveryStore = createV4RecoveryStore({ adapter, root: "recovery-topology", repoId: config.repoId })
+  const runState = { runId: "topology-pull", conflictCopies: new Map() }
+  await new V4SyncSession({
+    github,
+    vault: targetVault,
+    index: targetIndex,
+    config,
+    conflictPolicy: "copy",
+    abortChangePercent: 0,
+    recoveryStore,
+    runState,
+  } as never).sync({ operation: "forcePull" })
+
+  const trash = events.findIndex(event => event === "vault-trash:dir/file.md")
+  const write = events.findIndex(event => event === "vault-write:dir")
+  assert.ok(trash >= 0 && write > trash, events.join("\n"))
+  assert.equal(targetVault.files.has("dir/file.md"), false)
+  assert.equal(decode(targetVault.files.get("dir")!.bytes), "new-parent-file")
 })
