@@ -176,6 +176,17 @@ export async function assertV4RemoteRecordSet(records: V4IndexFileRecord[], conf
       slash = path.indexOf("/", slash + 1)
     }
   }
+  for (const [canonicalPath, originalPath] of canonicalLogicalPaths) {
+    let slash = canonicalPath.indexOf("/")
+    while (slash > 0) {
+      const canonicalAncestor = canonicalPath.slice(0, slash)
+      const originalAncestor = canonicalLogicalPaths.get(canonicalAncestor)
+      if (originalAncestor) {
+        throw new Error(`V4 remote logical path canonical topology collision: ${originalAncestor} is a file ancestor of ${originalPath}`)
+      }
+      slash = canonicalPath.indexOf("/", slash + 1)
+    }
+  }
 }
 
 export function v4RemoteShardPath(bucket: string, mode: V4RemoteConfig["mode"]): string {
