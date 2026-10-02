@@ -137,9 +137,44 @@ class MemoryGitHub {
   async getGitRefOrNull() { return this.ref; }
   async ensureGitRepositoryInitialized() { return null; }
   async getGitCommit(sha: string) { const value = this.commits.get(sha)!; return { sha, treeSha: value.treeSha, parentShas: value.parents, message: value.message }; }
-  async getTreeAt(treeSha: string) {
+  async getTreeAt(treeSha: string, recursive = true) {
     this.treeReads.push(treeSha);
     const tree = this.trees.get(treeSha) ?? new Map();
+    if (!recursive) {
+      const rootBlobs: Array<{ path: string; bytes: Uint8Array }> = [];
+      const rootDirectories = new Map<string, Array<{ path: string; bytes: Uint8Array }>>();
+      for (const [path, bytes] of tree) {
+        const slash = path.indexOf("/");
+        if (slash < 0) {
+          rootBlobs.push({ path, bytes });
+          continue;
+        }
+        const directory = path.slice(0, slash);
+        const descendants = rootDirectories.get(directory) ?? [];
+        descendants.push({ path: path.slice(slash + 1), bytes });
+        rootDirectories.set(directory, descendants);
+      }
+      const blobEntries = await Promise.all(rootBlobs.map(async ({ path, bytes }) => ({
+        path,
+        mode: "100644",
+        type: "blob" as const,
+        sha: await sha256Hex(bytes),
+        size: bytes.byteLength,
+        url: "",
+      })));
+      const directoryEntries = await Promise.all([...rootDirectories].map(async ([path, descendants]) => {
+        const signatures = await Promise.all(descendants.map(async descendant =>
+          `${descendant.path}:${await sha256Hex(descendant.bytes)}`));
+        return {
+          path,
+          mode: "040000",
+          type: "tree" as const,
+          sha: await sha256Hex(enc(signatures.sort().join("\n"))),
+          url: "",
+        };
+      }));
+      return { sha: treeSha, url: "", truncated: false, tree: [...blobEntries, ...directoryEntries] };
+    }
     return {
       sha: treeSha,
       url: "",
@@ -1068,8 +1103,8 @@ test("v4 Force Push fails closed on an in-scope remote gitlink instead of claimi
     .sync({ operation: "forcePush", allowThresholdOverride: false });
 
   const originalGetTreeAt = github.getTreeAt.bind(github);
-  github.getTreeAt = async (treeSha: string) => {
-    const tree = await originalGetTreeAt(treeSha);
+  github.getTreeAt = async (treeSha: string, recursive = true) => {
+    const tree = await originalGetTreeAt(treeSha, recursive);
     return {
       ...tree,
       tree: [...tree.tree, {
@@ -1101,8 +1136,8 @@ test("v4 Force Push fails closed on an in-scope explicit empty Git tree", async 
     .sync({ operation: "forcePush", allowThresholdOverride: false });
 
   const originalGetTreeAt = github.getTreeAt.bind(github);
-  github.getTreeAt = async (treeSha: string) => {
-    const tree = await originalGetTreeAt(treeSha);
+  github.getTreeAt = async (treeSha: string, recursive = true) => {
+    const tree = await originalGetTreeAt(treeSha, recursive);
     return {
       ...tree,
       tree: [...tree.tree, {
@@ -1135,8 +1170,8 @@ test("v4 Force Push preserves an out-of-scope remote gitlink", async () => {
     .sync({ operation: "forcePush", allowThresholdOverride: false });
 
   const originalGetTreeAt = github.getTreeAt.bind(github);
-  github.getTreeAt = async (treeSha: string) => {
-    const tree = await originalGetTreeAt(treeSha);
+  github.getTreeAt = async (treeSha: string, recursive = true) => {
+    const tree = await originalGetTreeAt(treeSha, recursive);
     return {
       ...tree,
       tree: [...tree.tree, {
@@ -2929,7 +2964,9 @@ test("v4 external reconciliation reuses unchanged blobs instead of re-reading ev
   const externalCommit = await github.createGitCommit("external edit", externalTree, [previousHead]);
   await github.updateGitRef(externalCommit, previousHead);
 
-  github.getTreeAt = async function(treeSha: string) {
+  const originalGetTreeAt = github.getTreeAt.bind(github);
+  github.getTreeAt = async function(treeSha: string, recursive = true) {
+    if (!recursive) return originalGetTreeAt(treeSha, false);
     this.treeReads.push(treeSha);
     const tree = this.trees.get(treeSha) ?? new Map();
     return {
@@ -3044,8 +3081,8 @@ test("v4 external reconciliation rejects an in-scope explicit empty Git tree bef
   await github.updateGitRef(externalCommit, previousHead);
 
   const originalGetTreeAt = github.getTreeAt.bind(github);
-  github.getTreeAt = async (treeSha: string) => {
-    const tree = await originalGetTreeAt(treeSha);
+  github.getTreeAt = async (treeSha: string, recursive = true) => {
+    const tree = await originalGetTreeAt(treeSha, recursive);
     if (treeSha !== externalTree) return tree;
     return {
       ...tree,
@@ -3092,8 +3129,8 @@ test("v4 external reconciliation fails closed on an in-scope gitlink before loca
   await github.updateGitRef(externalCommit, previousHead);
 
   const originalGetTreeAt = github.getTreeAt.bind(github);
-  github.getTreeAt = async (treeSha: string) => {
-    const tree = await originalGetTreeAt(treeSha);
+  github.getTreeAt = async (treeSha: string, recursive = true) => {
+    const tree = await originalGetTreeAt(treeSha, recursive);
     if (treeSha !== externalTree) return tree;
     return {
       ...tree,
@@ -3140,8 +3177,8 @@ test("v4 external reconciliation rejects a tracked file replaced by a Git direct
   await github.updateGitRef(externalCommit, previousHead);
 
   const originalGetTreeAt = github.getTreeAt.bind(github);
-  github.getTreeAt = async (treeSha: string) => {
-    const tree = await originalGetTreeAt(treeSha);
+  github.getTreeAt = async (treeSha: string, recursive = true) => {
+    const tree = await originalGetTreeAt(treeSha, recursive);
     if (treeSha !== externalTree) return tree;
     return {
       ...tree,
@@ -3220,8 +3257,8 @@ test("v4 external reconciliation rejects an in-scope symlink before replacing lo
   await github.updateGitRef(externalCommit, previousHead);
 
   const originalGetTreeAt = github.getTreeAt.bind(github);
-  github.getTreeAt = async (treeSha: string) => {
-    const tree = await originalGetTreeAt(treeSha);
+  github.getTreeAt = async (treeSha: string, recursive = true) => {
+    const tree = await originalGetTreeAt(treeSha, recursive);
     if (treeSha !== externalTree) return tree;
     return {
       ...tree,
@@ -3382,6 +3419,55 @@ test("v4 does not trust a forged plugin commit marker when the V4 head blob did 
   assert.equal(dec(vault.files.get("note.md")!.bytes), "forged external")
   assert.equal(index.remoteCommitSha, github.ref!.sha)
 })
+
+test("v4 generation-1 publication marker is not trusted across a parent that lost the V4 head", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault();
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "local", mode: "plaintext" });
+  vault.files.set("note.md", { bytes: enc("base"), mtime: 1 });
+
+  await new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "forcePush", allowThresholdOverride: false });
+
+  const trustedHead = github.ref!.sha;
+  const trustedCommit = github.commits.get(trustedHead)!;
+  const trustedTree = new Map(github.trees.get(trustedCommit.treeSha)!);
+  const bucket = Object.keys(index.shardHashes)[0];
+  assert.ok(bucket);
+  const shardPath = `${V4_ROOT}/index/${bucket}.json`;
+
+  const parentTree = new Map(trustedTree);
+  for (const path of [...parentTree.keys()]) if (path === V4_ROOT || path.startsWith(`${V4_ROOT}/`)) parentTree.delete(path);
+  github.trees.set("tree-parent-without-v4", parentTree);
+  github.commits.set("parent-without-v4", {
+    treeSha: "tree-parent-without-v4",
+    parents: [trustedHead],
+    message: "external temporary V4 removal",
+  });
+
+  const forgedTreeFiles = new Map(trustedTree);
+  forgedTreeFiles.set(shardPath, enc(JSON.stringify({ bucket, records: {} })));
+  github.trees.set("tree-forged-generation-1", forgedTreeFiles);
+  github.commits.set("forged-generation-1", {
+    treeSha: "tree-forged-generation-1",
+    parents: ["parent-without-v4"],
+    message: trustedCommit.message,
+  });
+  github.ref = { ref: "refs/heads/main", sha: "forged-generation-1", type: "commit" };
+  github.files = new Map(forgedTreeFiles);
+
+  vault.operations.length = 0;
+  await assert.rejects(
+    () => new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+      .sync({ operation: "normal", allowThresholdOverride: false, changes: [] }),
+    /internal.*V4|V4.*internal|subtree.*changed|publication.*verified|ancestry/iu,
+  );
+
+  assert.equal(index.remoteCommitSha, trustedHead);
+  assert.equal(dec(vault.files.get("note.md")!.bytes), "base");
+  assert.deepEqual(vault.operations.filter(operation => /^(?:write|trash|delete|commit-stage):/u.test(operation)), []);
+});
+
 
 test("v4 encrypted sync rejects a forged plugin marker when the encrypted V4 head blob did not change", async () => {
   const github = new MemoryGitHub()
