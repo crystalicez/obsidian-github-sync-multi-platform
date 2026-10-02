@@ -340,6 +340,14 @@ export class GitHubClient {
       if (entry.type !== "blob" && entry.type !== "tree" && entry.type !== "commit") {
         throw new Error(`Malformed GitHub response: tree entry ${index} type is invalid.`);
       }
+      const modeMatchesType = entry.type === "blob"
+        ? entry.mode === "100644" || entry.mode === "100755" || entry.mode === "120000"
+        : entry.type === "tree"
+          ? entry.mode === "040000"
+          : entry.mode === "160000";
+      if (!modeMatchesType) {
+        throw new Error(`Malformed GitHub response: tree entry ${index} mode does not match its type.`);
+      }
       if (entry.type === "blob" && (!Number.isSafeInteger(entry.size) || (entry.size ?? -1) < 0)) {
         throw new Error(`Malformed GitHub response: tree entry ${index} blob size is invalid.`);
       }
