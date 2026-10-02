@@ -1055,6 +1055,32 @@ test("v4 plaintext matching-SHA sync rejects a self-consistent local cache that 
   assert.equal(indexRecordByPath(index, "a.md").fileId, originalFileId);
 });
 
+test("v4 encrypted stale device accepts the next authenticated plugin publication", async () => {
+  const github = new MemoryGitHub();
+  const keys = await deriveV4Keyring({ passphrase: "pass", repoId: "o/r#main", salt: enc("salt"), iterations: 10 });
+  const encryptedConfig: V4RemoteConfig = { formatVersion: V4_FORMAT_VERSION, mode: "encrypted", repoId: "o/r#main", pathLayout: "opaque-stable-v1", algorithm: "AES-GCM", kdf: "PBKDF2-SHA-256", kdfParams: { iterations: 10, salt: "c2FsdA" } };
+  const sourceVault = new MemoryVault();
+  sourceVault.files.set("secret.md", { bytes: enc("base"), mtime: 1 });
+  const sourceIndex = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "source", mode: "encrypted", pathLayout: "opaque-stable-v1" });
+
+  await new V4SyncSession({ github, vault: sourceVault, index: sourceIndex, config: encryptedConfig, keyring: keys, conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "forcePush", allowThresholdOverride: false });
+
+  const staleIndex = structuredClone(sourceIndex);
+  const staleVault = new MemoryVault();
+  staleVault.files.set("secret.md", { bytes: enc("base"), mtime: 1 });
+
+  sourceVault.files.set("secret.md", { bytes: enc("updated"), mtime: 2 });
+  await new V4SyncSession({ github, vault: sourceVault, index: sourceIndex, config: encryptedConfig, keyring: keys, conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "normal", allowThresholdOverride: false, changes: [{ type: "modify", path: "secret.md", mtime: 2 }] });
+
+  await new V4SyncSession({ github, vault: staleVault, index: staleIndex, config: encryptedConfig, keyring: keys, conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "normal", allowThresholdOverride: false, changes: [] });
+
+  assert.equal(dec(staleVault.files.get("secret.md")!.bytes), "updated");
+});
+
+
 test("v4 encrypted matching-SHA sync authenticates the remote head before publishing with a derived key", async () => {
   const github = new MemoryGitHub();
   const vault = new MemoryVault();
