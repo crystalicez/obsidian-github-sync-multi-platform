@@ -1,5 +1,6 @@
 import { randomBytes, sha256Hex, toBase64Url, utf8ToBytes } from "../bytes"
 import type { GitHubTree } from "../github-api"
+import type { GitHubGitCommit } from "../github-git-types"
 import { evaluateV4ChangeGuard } from "./change-guard"
 import { canAttemptV4TextMerge, resolveV4Conflict, type V4ConflictPolicy, type V4ConflictResolution } from "./conflicts"
 import type { V4Keyring } from "./crypto"
@@ -96,6 +97,8 @@ export interface V4SessionSyncResult {
   recoveryRunId?: string
 }
 
+const V4_EXTERNAL_PUBLICATION_ANCESTRY_LIMIT = 256
+
 export class V4ChangeGuardError extends Error {
   constructor(public readonly changePercent: number, public readonly thresholdPercent: number) {
     super(`V4 change guard blocked sync: ${changePercent}% exceeds ${thresholdPercent}%.`)
@@ -121,6 +124,23 @@ function localIndexMatchesRemoteHead(index: V4LocalIndex, head: V4RemoteHead): b
   return localBuckets.length === remoteBuckets.length
     && localBuckets.every((bucket, position) => bucket === remoteBuckets[position]
       && index.shardHashes[bucket] === head.shardHashes[bucket])
+}
+
+function sameV4RemoteHead(left: V4RemoteHead, right: V4RemoteHead): boolean {
+  if (
+    left.formatVersion !== right.formatVersion
+    || left.mode !== right.mode
+    || left.epoch !== right.epoch
+    || left.generation !== right.generation
+    || left.journalId !== right.journalId
+    || left.updatedAt !== right.updatedAt
+    || left.deviceId !== right.deviceId
+  ) return false
+  const leftBuckets = Object.keys(left.shardHashes).sort()
+  const rightBuckets = Object.keys(right.shardHashes).sort()
+  return leftBuckets.length === rightBuckets.length
+    && leftBuckets.every((bucket, index) => bucket === rightBuckets[index]
+      && left.shardHashes[bucket] === right.shardHashes[bucket])
 }
 
 function completePackRecords(record: V4IndexFileRecord, records: readonly V4IndexFileRecord[]): V4IndexFileRecord[] | undefined {
@@ -362,7 +382,7 @@ export class V4SyncSession {
     if (remote && this.input.index.remoteCommitSha && remote.commitSha !== this.input.index.remoteCommitSha) {
       const tip = await this.input.github.getGitCommit(remote.commitSha)
       if (!(await this.isVerifiedPluginPublication(remote, tip))) {
-        await this.reconcileExternalCommit(remote, tip.treeSha)
+        await this.reconcileExternalCommit(remote, tip)
         externalReconciled = true
       }
     }
@@ -1109,34 +1129,89 @@ export class V4SyncSession {
 
   private async isVerifiedPluginPublication(
     remote: V4RemoteState,
-    tip: { message?: string; parentShas: string[] },
+    tip: GitHubGitCommit,
   ): Promise<boolean> {
     const pluginMessage = `obsidian-sync-v4:${remote.head.journalId}`
     if (tip.message?.split("\n", 1)[0] !== pluginMessage) return false
+    const tipHeadFile = await this.input.github.getFileBytes(V4_HEAD_PATH, tip.sha)
+    if (!tipHeadFile) return false
+    let tipHead: V4RemoteHead
+    try {
+      tipHead = await decodeV4RemoteHead(tipHeadFile.bytes, remote.config, this.input.keyring)
+    } catch {
+      return false
+    }
+    if (!sameV4RemoteHead(tipHead, remote.head)) return false
+    const trustedGenerationOne = tipHead.epoch === 1
+      && tipHead.generation === 1
+      && tip.sha === this.input.index.remoteCommitSha
     const parentSha = tip.parentShas[0]
-    if (!parentSha) return false
+    if (!parentSha) return trustedGenerationOne
     const parentHeadFile = await this.input.github.getFileBytes(V4_HEAD_PATH, parentSha)
-    if (!parentHeadFile) return false
+    if (!parentHeadFile) return trustedGenerationOne
     let parentHead: V4RemoteHead
     try {
       parentHead = await decodeV4RemoteHead(parentHeadFile.bytes, remote.config, this.input.keyring)
     } catch {
       return false
     }
-    return parentHead.mode === remote.head.mode
-      && remote.head.generation === parentHead.generation + 1
-      && remote.head.journalId !== parentHead.journalId
+    return parentHead.mode === tipHead.mode
+      && parentHead.epoch === tipHead.epoch
+      && tipHead.generation === parentHead.generation + 1
+      && tipHead.journalId !== parentHead.journalId
   }
 
-  private async reconcileExternalCommit(remote: V4RemoteState, treeSha: string): Promise<void> {
+  private async v4RootTreeSha(commit: GitHubGitCommit): Promise<string> {
+    if (!this.input.github.getTreeAt) throw new Error("External GitHub changes require tree support.")
+    const root = await this.input.github.getTreeAt(commit.treeSha, false)
+    throwIfV4Aborted(this.input.signal)
+    if (root.truncated) throw new Error("External GitHub root tree is truncated; sync is unsafe.")
+    const entry = root.tree.find(node => node.path === V4_ROOT)
+    if (!entry || entry.type !== "tree" || entry.mode !== "040000") {
+      throw new Error("External GitHub V4 internal subtree is missing or malformed.")
+    }
+    return entry.sha
+  }
+
+  private async findVerifiedPluginPublication(remote: V4RemoteState, tip: GitHubGitCommit): Promise<GitHubGitCommit> {
+    const queue = [...tip.parentShas]
+    const visited = new Set<string>()
+    while (queue.length > 0) {
+      throwIfV4Aborted(this.input.signal)
+      const sha = queue.shift()!
+      if (visited.has(sha)) continue
+      if (visited.size >= V4_EXTERNAL_PUBLICATION_ANCESTRY_LIMIT) {
+        throw new Error("External GitHub ancestry exceeds the V4 verification limit.")
+      }
+      visited.add(sha)
+      const commit = await this.input.github.getGitCommit(sha)
+      throwIfV4Aborted(this.input.signal)
+      if (await this.isVerifiedPluginPublication(remote, commit)) return commit
+      throwIfV4Aborted(this.input.signal)
+      for (const parent of commit.parentShas) if (!visited.has(parent)) queue.push(parent)
+    }
+    throw new Error("External GitHub ancestry does not contain a verified V4 publication for the current head.")
+  }
+
+  private async assertExternalV4SubtreeUnchanged(remote: V4RemoteState, tip: GitHubGitCommit): Promise<void> {
+    const baseline = await this.findVerifiedPluginPublication(remote, tip)
+    const baselineV4Root = await this.v4RootTreeSha(baseline)
+    const currentV4Root = await this.v4RootTreeSha(tip)
+    if (baselineV4Root !== currentV4Root) {
+      throw new Error("External GitHub changes modified the internal V4 subtree; sync is unsafe.")
+    }
+  }
+
+  private async reconcileExternalCommit(remote: V4RemoteState, tip: GitHubGitCommit): Promise<void> {
     if (remote.config.mode === "encrypted") {
       throw new Error("External GitHub changes touched an encrypted V4 branch without updating its journal. Use Force Push or Force Pull after reviewing the commit.")
     }
+    await this.assertExternalV4SubtreeUnchanged(remote, tip)
     if (!this.input.github.getTreeAt) throw new Error("External GitHub changes require recursive tree support.")
     if (remote.records.some(record => record.storage !== "single")) {
       throw new Error("External GitHub changes cannot be safely reconciled while large or packed V4 objects exist.")
     }
-    const tree = await this.input.github.getTreeAt(treeSha, true)
+    const tree = await this.input.github.getTreeAt(tip.treeSha, true)
     if (tree.truncated) throw new Error("External GitHub tree is truncated; sync is unsafe.")
     const existingByPath = new Map(remote.records.map(record => [record.path, record]))
     const baselineBlobShaByPath = new Map<string, string>()
