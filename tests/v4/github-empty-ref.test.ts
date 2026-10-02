@@ -48,3 +48,34 @@ test("GitHubClient keeps a non-empty 409 ref conflict fail-closed instead of ent
     setRequestUrlHandler(null);
   }
 });
+
+test("GitHubClient does not bootstrap when any-ref preflight returns a non-empty 409", async () => {
+  let puts = 0;
+  setRequestUrlHandler(async (options: unknown) => {
+    const request = options as { url: string; method?: string };
+    if ((request.method ?? "GET") === "GET" && request.url.includes("/git/refs?")) {
+      return {
+        status: 409,
+        text: "Git Repository is temporarily unavailable.",
+        headers: {},
+        json: {},
+      };
+    }
+    if (request.method === "PUT") {
+      puts++;
+      return { status: 500, text: "bootstrap must not run", headers: {}, json: {} };
+    }
+    throw new Error(`Unexpected request: ${request.method} ${request.url}`);
+  });
+  try {
+    const client = new GitHubClient(
+      { token: "token", owner: "owner", repo: "repo", branch: "main" },
+      { transportPolicy: { mutationSpacingMs: 0 } },
+    );
+
+    await assert.rejects(() => client.ensureGitRepositoryInitialized());
+    assert.equal(puts, 0, "generic ref conflicts must fail before Contents bootstrap mutation");
+  } finally {
+    setRequestUrlHandler(null);
+  }
+});
