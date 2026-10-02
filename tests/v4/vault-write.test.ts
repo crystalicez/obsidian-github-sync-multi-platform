@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { TFolder, type Vault } from "obsidian"
+import { TFile, TFolder, type Vault } from "obsidian"
 
 import { writeVaultFileBytes } from "../../src/lib/vault"
 
@@ -13,7 +13,11 @@ function folder(path: string, children: TFolder[] = []): TFolder {
   return value
 }
 
-function fakeVault(initial: TFolder) {
+function file(path: string): TFile {
+  return new TFile(path, new Uint8Array())
+}
+
+function fakeVault(initial: TFolder | TFile) {
   const files = new Map<string, unknown>([[initial.path, initial]])
   const deleted: string[] = []
   const created: string[] = []
@@ -41,7 +45,18 @@ test("vault writer refuses to replace a non-empty folder target", async () => {
 
   await assert.rejects(
     () => writeVaultFileBytes(fixture.vault, "dir", bytes),
-    /non-empty folder/iu,
+    /local target changed.*non-empty folder/iu,
+  )
+  assert.deepEqual(fixture.deleted, [])
+  assert.deepEqual(fixture.created, [])
+})
+
+test("vault writer classifies a file ancestor as a local target change", async () => {
+  const fixture = fakeVault(file("dir"))
+
+  await assert.rejects(
+    () => writeVaultFileBytes(fixture.vault, "dir/child.md", bytes),
+    /local target changed.*file exists at that path/iu,
   )
   assert.deepEqual(fixture.deleted, [])
   assert.deepEqual(fixture.created, [])
