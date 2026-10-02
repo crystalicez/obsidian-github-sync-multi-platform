@@ -576,6 +576,13 @@ Audit method:
    - Fix: `2279fa9` validates the merged persisted settings before calling `migrateV4Secrets()`, while retaining the existing post-migration validation of resolved runtime settings.
    - Focused settings/runtime coverage is green at **55/55** after the fix.
 
+83. **MEDIUM/HIGH Force Push mirror safety — a managed explicit empty Git tree could survive an exact-mirror Force Push.**
+   - Force Push cleanup rejected managed gitlinks and deleted managed blobs, but skipped every `type: "tree"` entry in the recursive Git tree.
+   - Git can contain an explicit empty tree object with no descendant entries. Because Obsidian vault sync has no content object corresponding to that empty directory, such a managed tree could survive Force Push while the operation reported an exact managed mirror.
+   - RED: `9bc0fa2` injects an in-scope `type: "tree"`, mode `040000` entry with no descendants and proves Force Push completed instead of rejecting the unmirrorable remote state.
+   - Fix: `37f5f55` precomputes directory paths that are proven non-empty from recursive-tree descendants and fails closed only for managed tree entries with no descendants. Ordinary non-empty directories and out-of-scope tree entries keep their prior behavior.
+   - Focused `sync-session` coverage is green at **102/102** after the fix.
+
 ### Audited surfaces with no new confirmed defect so far
 
 - secret migration/persistence: raw token/passphrase are removed before plugin data persistence and use Obsidian SecretStorage;
@@ -630,6 +637,7 @@ RED tests have now been pushed on the audit branch:
 - `dd7e97d` — plugin startup must remain inert if unload occurs while settings load or migrated-settings persistence is still awaiting completion.
 - `ff149f941c7dbb1b0111baaa7d126af0bfad3226` — unload during startup settings load must not skip durable cleanup of migrated legacy secrets before startup returns.
 - `0d7bf41` — malformed persisted settings must be rejected before secret migration can mutate SecretStorage.
+- `9bc0fa2` — Force Push must not silently preserve a managed explicit empty Git tree while claiming an exact mirror.
 
 Refined root-cause design:
 - create one canonical shard-record hash function and use it for writer hash creation, remote shard verification, and local persisted-cache verification;
@@ -675,6 +683,7 @@ Root-cause fixes are now on the audit branch:
 - `df2bc0a` — make async plugin startup stop after unload at both settings-load and migrated-settings-persistence boundaries before recreating runtime work.
 - `78ba901` — persist migrated legacy-secret cleanup before the startup unload guard while keeping all runtime/UI/timer creation behind that guard.
 - `2279fa9` — validate merged persisted settings before `migrateV4Secrets()` can write SecretStorage, while retaining post-migration runtime validation.
+- `37f5f55` — fail closed on managed explicit empty Git tree entries during Force Push while preserving non-empty and out-of-scope directories.
 - `6151868d066c050deef9159d3beda389e2ae0ce7`, `d9cde1a72496a8c86df5c85b975d39b92998f873`, `0c301523e774d54bc03191aa7a897da98691ac81`, `06335328777bd5010e928c1951f1cdb581aac2f0` — bounded journal writer/reader contract, safe journal markers, cross-page consistency, descriptor validation before blob reads, and preview-limit precedence.
 - fixture-only followups `4ce0affffce484398db30b0de339af8a2dd1e5cf`, `e5ae96eda6003faa4233346bd5104561e2258923`, `40fc418844c40a52ef4baa39c7318f21a5547782`, `b876e4076084e544ec13ec0ef60c9ef7e0cbcc8a` keep tests protocol-shaped rather than weakening production validation.
 
@@ -685,10 +694,10 @@ Recent crash/memory hardening:
 
 Verification status:
 - The repository was executed through the connected local engineering workspace with Node `v24.11.0` and pnpm `9.12.3`.
-- Final post-fix gates on the current production source: `pnpm run test:fast` **521/521**, `pnpm run test:recovery` **49/49**, `pnpm run test:resource` **11/11**, and `pnpm run build` PASS.
+- Final post-fix gates on the current production source: `pnpm run test:fast` **522/522**, `pnpm run test:recovery` **49/49**, `pnpm run test:resource` **11/11**, and `pnpm run build` PASS.
 - Final release checks also pass on regenerated artifacts: `pnpm run validate:metadata` and `pnpm run validate:package`.
-- The 521/521 fast run was executed with one unrelated uncommitted test-only helper in `tests/v4/github-transport.test.ts`; it does not modify production source or add/change a test case. Do not describe that run as a pristine exact-Git-tree qualification until that concurrent WIP is committed or removed.
-- Focused regressions in the latest audit pass: settings-secrets **55/55**, sync-session **101/101**, recovery **49/49**, github-bootstrap-ref-conflict **2/2**, github-empty-ref **3/3**, github-transport **43/43**, storage-history **4/4**, github-immutable-read-fallback **13/13**, and benchmark **3/3**; the benchmark qualification also reproduced the prior wall-clock flake under full-suite contention before `0762038...`, with later full fast runs remaining green through the current **521/521** audit head. Prior history-service **13/13**, sync-coordinator **25/25**, sync-policy **2/2**, storage-codec **12/12**, and opaque-leakage **2/2** remain covered by the full fast gate.
+- The 522/522 fast run was executed with one unrelated uncommitted test-only helper in `tests/v4/github-transport.test.ts`; it does not modify production source or add/change a test case. Do not describe that run as a pristine exact-Git-tree qualification until that concurrent WIP is committed or removed.
+- Focused regressions in the latest audit pass: settings-secrets **55/55**, sync-session **102/102**, recovery **49/49**, github-bootstrap-ref-conflict **2/2**, github-empty-ref **3/3**, github-transport **43/43**, storage-history **4/4**, github-immutable-read-fallback **13/13**, and benchmark **3/3**; the benchmark qualification also reproduced the prior wall-clock flake under full-suite contention before `0762038...`, with later full fast runs remaining green through the current **522/522** audit head. Prior history-service **13/13**, sync-coordinator **25/25**, sync-policy **2/2**, storage-codec **12/12**, and opaque-leakage **2/2** remain covered by the full fast gate.
 - Real GitHub E2E remains excluded from the default fast tier and was not run in this closure; inspect hosted checks for the exact pushed SHA separately before treating the branch as release-qualified.
 
 ### TDD plan
