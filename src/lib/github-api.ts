@@ -25,6 +25,13 @@ import { readImmutableGitFile } from "./v4/immutable-git-read";
 const V4_BOOTSTRAP_PATH = ".obsidian-github-sync-v4/bootstrap";
 const GIT_COMMIT_SHA = /^[0-9a-f]{40}$/iu;
 
+function isEmptyGitRepositoryConflictText(value: string): boolean {
+  const normalized = value.trim().toLowerCase().replace(/[.!]+$/u, "");
+  return normalized === "empty"
+    || normalized.endsWith(" - empty")
+    || normalized.includes("git repository is empty");
+}
+
 function requiredGitHubString(value: unknown, label: string): string {
   if (typeof value !== "string" || value.length === 0) throw new Error(`Malformed GitHub response: missing ${label}.`);
   return value;
@@ -427,7 +434,7 @@ export class GitHubClient {
     catch (error) {
       const status = (error as { status?: number }).status;
       if (status === 404) return null;
-      if (status === 409 && /git repository is empty/iu.test((error as Error).message)) return null;
+      if (status === 409 && isEmptyGitRepositoryConflictText((error as Error).message)) return null;
       throw error;
     }
   }
@@ -446,7 +453,8 @@ export class GitHubClient {
       const type = requiredGitHubString(first.object?.type, "git ref object type");
       return { ref: requiredGitHubString(first.ref, "git ref name"), sha, type };
     }
-    if (response.status === 404 || response.status === 409) return null;
+    if (response.status === 404) return null;
+    if (response.status === 409 && isEmptyGitRepositoryConflictText(response.text)) return null;
     throw this.gitHttpError("Failed to inspect git refs", response.status, response.text);
   }
 
