@@ -227,6 +227,7 @@ export default class FastSync extends Plugin {
     // Backward compatibility: older versions stored settings fields directly at the top level
     const savedSettings = data.settings ?? data;
     const merged = Object.assign({}, DEFAULT_SETTINGS, savedSettings);
+    assertPluginSettingsRuntimeSafe(merged)
     const result = migrateV4Secrets(
       merged,
       this.app.secretStorage,
