@@ -2993,6 +2993,41 @@ test("v4 external reconciliation rejects canonical file topology before blob rea
 });
 
 
+test("v4 external reconciliation rejects internal V4 subtree tampering before metadata publication", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault();
+  vault.files.set("note.md", { bytes: enc("local"), mtime: 1 });
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "local", mode: "plaintext" });
+
+  await new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "forcePush", allowThresholdOverride: false });
+
+  const previousHead = github.ref!.sha;
+  const previousTree = github.commits.get(previousHead)!.treeSha;
+  const bucket = Object.keys(index.shardHashes)[0];
+  assert.ok(bucket, "force push must create at least one V4 shard");
+  const shardPath = `${V4_ROOT}/index/${bucket}.json`;
+  const tamperedShard = await github.createGitBlob(enc(JSON.stringify({ bucket, records: {} })));
+  const externalTree = await github.createGitTree([
+    { path: shardPath, mode: "100644", type: "blob", sha: tamperedShard },
+  ], previousTree);
+  const externalCommit = await github.createGitCommit("external V4 shard tamper", externalTree, [previousHead]);
+  await github.updateGitRef(externalCommit, previousHead);
+
+  vault.operations.length = 0;
+  const beforeRef = github.ref!.sha;
+  await assert.rejects(
+    () => new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+      .sync({ operation: "normal", allowThresholdOverride: false, changes: [] }),
+    /internal.*V4|V4.*internal|metadata.*tamper|subtree.*changed/iu,
+  );
+
+  assert.equal(github.ref!.sha, beforeRef, "tampered internal V4 subtree must not be laundered into a plugin publication");
+  assert.equal(dec(vault.files.get("note.md")!.bytes), "local");
+  assert.deepEqual(vault.operations.filter(operation => /^(?:write|trash|delete|commit-stage):/u.test(operation)), []);
+});
+
+
 test("v4 external reconciliation rejects an in-scope explicit empty Git tree before metadata publication", async () => {
   const github = new MemoryGitHub();
   const vault = new MemoryVault();
