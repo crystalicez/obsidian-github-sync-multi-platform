@@ -1148,6 +1148,14 @@ export class V4SyncSession {
       for (const node of baselineTree.tree) if (node.type === "blob") baselineBlobShaByPath.set(node.path, node.sha)
     }
     const includePath = this.input.includePath ?? (() => true)
+    const nonEmptyTreePaths = new Set<string>()
+    for (const node of tree.tree) {
+      let slash = node.path.lastIndexOf("/")
+      while (slash > 0) {
+        nonEmptyTreePaths.add(node.path.slice(0, slash))
+        slash = node.path.lastIndexOf("/", slash - 1)
+      }
+    }
     const managedExternalFilePaths: string[] = []
     for (const node of tree.tree) {
       const internal = node.path === V4_CONFIG_PATH || node.path.startsWith(`${V4_ROOT}/`)
@@ -1168,8 +1176,13 @@ export class V4SyncSession {
     for (const node of tree.tree) {
       const internal = node.path === V4_CONFIG_PATH || node.path.startsWith(`${V4_ROOT}/`)
       if (node.type === "tree") {
-        if (!internal && includePath(node.path) && existingByPath.has(node.path)) {
-          throw new Error(`External Git directory replaced tracked file path: ${node.path}`)
+        if (!internal && includePath(node.path)) {
+          if (existingByPath.has(node.path)) {
+            throw new Error(`External Git directory replaced tracked file path: ${node.path}`)
+          }
+          if (!nonEmptyTreePaths.has(node.path)) {
+            throw new Error(`External Git explicit empty tree is unsupported in managed sync scope: ${node.path}`)
+          }
         }
         continue
       }
