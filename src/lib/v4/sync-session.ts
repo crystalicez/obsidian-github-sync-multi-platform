@@ -154,15 +154,38 @@ function assertNoCaseInsensitiveCollisions(files: V4LogicalFile[]): void {
   }
 }
 
-function pathsBlockFileTarget(left: string, right: string): boolean {
-  return left === right || left.startsWith(`${right}/`) || right.startsWith(`${left}/`)
+function lowerBound(sorted: string[], target: string): number {
+  let low = 0
+  let high = sorted.length
+  while (low < high) {
+    const mid = low + ((high - low) >> 1)
+    if (sorted[mid] < target) low = mid + 1
+    else high = mid
+  }
+  return low
+}
+
+function trashBlocksAnyWrite(path: string, writePathSet: Set<string>, sortedWritePaths: string[]): boolean {
+  if (writePathSet.has(path)) return true
+
+  let slash = path.lastIndexOf("/")
+  while (slash > 0) {
+    if (writePathSet.has(path.slice(0, slash))) return true
+    slash = path.lastIndexOf("/", slash - 1)
+  }
+
+  const descendantPrefix = `${path}/`
+  const descendantIndex = lowerBound(sortedWritePaths, descendantPrefix)
+  return descendantIndex < sortedWritePaths.length
+    && sortedWritePaths[descendantIndex].startsWith(descendantPrefix)
 }
 
 export function orderRecoveryMutationsForFileTopology(mutations: V4RecoveryLocalMutation[]): V4RecoveryLocalMutation[] {
-  const writePaths = mutations.flatMap(mutation => mutation.kind === "stage-write" ? [mutation.path] : [])
-  if (writePaths.length === 0) return mutations
+  const writePathSet = new Set(mutations.flatMap(mutation => mutation.kind === "stage-write" ? [mutation.path] : []))
+  if (writePathSet.size === 0) return mutations
+  const sortedWritePaths = [...writePathSet].sort()
   const blockingTrashIds = new Set(mutations.flatMap(mutation => mutation.kind === "trash"
-    && writePaths.some(path => pathsBlockFileTarget(mutation.path, path))
+    && trashBlocksAnyWrite(mutation.path, writePathSet, sortedWritePaths)
       ? [mutation.id]
       : []))
   if (blockingTrashIds.size === 0) return mutations
