@@ -645,6 +645,13 @@ Audit method:
    - Fix: `27eb8eb` accepts only canonical Git mode/type pairs: blob `100644|100755|120000`, tree `040000`, and gitlink/commit `160000`; legitimate symlink/gitlink objects remain available for the later scope-specific policy checks.
    - Focused Git tree mode validation is green at **1/1** and github-transport remains **43/43** after the fix.
 
+93. **MEDIUM/HIGH external reconciliation integrity — managed explicit empty Git trees could be silently carried into a plugin publication.**
+   - Force Push already rejects an in-scope explicit empty Git tree because Obsidian vault state has no file object that can represent it, but plaintext external reconciliation only validated file blobs, gitlinks, symlinks, and tracked-file→directory replacements.
+   - An external commit containing an in-scope empty tree could therefore be accepted, followed by a replacement V4 metadata publication that preserved the empty tree in the repository while making the commit look like a normal plugin publication.
+   - RED: `e4f66ff` injects an in-scope recursive-tree entry with no descendants and proves normal external reconciliation published instead of failing closed.
+   - Fix: `77ed62b` computes the bounded set of tree paths proven non-empty from recursive-tree descendants and rejects managed tree entries with no descendants before blob reads, local mutation, or metadata publication. Internal V4 trees, out-of-scope trees, and ordinary non-empty directories keep their prior behavior.
+   - Focused sync-session coverage is green at **106/106** after the fix.
+
 ### Audited surfaces with no new confirmed defect so far
 
 - secret migration/persistence: raw token/passphrase are removed before plugin data persistence and use Obsidian SecretStorage;
@@ -709,6 +716,7 @@ RED tests have now been pushed on the audit branch:
 - `e64a7e7` — complete remote V4 record sets must reject file-ancestor topology collisions that appear only after NFC + case-insensitive canonicalization.
 - `045a0aa` — plaintext external Git reconciliation must reject portable/canonical file topology collisions before blob reads, local mutation, or replacement V4 metadata publication.
 - `5ec2801` — successful Git tree responses must reject incompatible object type / Git mode combinations at the decode boundary.
+- `e4f66ff` — plaintext external reconciliation must reject managed explicit empty Git trees before publishing replacement V4 metadata.
 
 Refined root-cause design:
 - create one canonical shard-record hash function and use it for writer hash creation, remote shard verification, and local persisted-cache verification;
@@ -764,6 +772,7 @@ Root-cause fixes are now on the audit branch:
 - `9bf77af` — reject authenticated remote file-prefix topology collisions across NFC/case variants by walking the canonical path set.
 - `b2f75c7` — reuse the complete path-set validator for external Git preflight, then validate the fully reconciled plaintext record set before installing it into remote state.
 - `27eb8eb` — bind Git tree entry modes to their canonical object types before any downstream consumer trusts the tree evidence.
+- `77ed62b` — reject managed explicit empty Git trees during plaintext external reconciliation using the same bounded descendant proof as Force Push.
 - `6151868d066c050deef9159d3beda389e2ae0ce7`, `d9cde1a72496a8c86df5c85b975d39b92998f873`, `0c301523e774d54bc03191aa7a897da98691ac81`, `06335328777bd5010e928c1951f1cdb581aac2f0` — bounded journal writer/reader contract, safe journal markers, cross-page consistency, descriptor validation before blob reads, and preview-limit precedence.
 - fixture-only followups `4ce0affffce484398db30b0de339af8a2dd1e5cf`, `e5ae96eda6003faa4233346bd5104561e2258923`, `40fc418844c40a52ef4baa39c7318f21a5547782`, `b876e4076084e544ec13ec0ef60c9ef7e0cbcc8a` keep tests protocol-shaped rather than weakening production validation.
 
@@ -774,10 +783,10 @@ Recent crash/memory hardening:
 
 Verification status:
 - The repository was executed through the connected local engineering workspace with Node `v24.11.0` and pnpm `9.12.3`.
-- Final post-fix gates on the current production source: `pnpm run test:fast` **532/532**, `pnpm run test:recovery` **50/50**, `pnpm run test:resource` **12/12**, and `pnpm run build` PASS.
+- Final post-fix gates on the current production source: `pnpm run test:fast` **533/533**, `pnpm run test:recovery` **50/50**, `pnpm run test:resource` **12/12**, and `pnpm run build` PASS.
 - Final release checks also pass on regenerated artifacts: `pnpm run validate:metadata` and `pnpm run validate:package`.
-- The 532/532 fast run was executed with one unrelated uncommitted test-only helper in `tests/v4/github-transport.test.ts`; it does not modify production source or add/change a test case. Do not describe that run as a pristine exact-Git-tree qualification until that concurrent WIP is committed or removed.
-- Focused regressions in the latest audit pass: settings-secrets **55/55**, sync-session **105/105**, remote-index **20/20**, recovery **50/50**, recovery-boundary **3/3**, recovery-topology-ordering **1/1**, vault-write **3/3**, github-bootstrap-ref-conflict **2/2**, github-empty-ref **3/3**, github-transport **43/43**, github-tree-mode-validation **1/1**, storage-history **4/4**, github-immutable-read-fallback **13/13**, and benchmark **3/3**; the benchmark qualification also reproduced the prior wall-clock flake under full-suite contention before `0762038...`, with later full fast runs remaining green through the current **532/532** audit head. Prior history-service **13/13**, sync-coordinator **25/25**, sync-policy **2/2**, storage-codec **12/12**, and opaque-leakage **2/2** remain covered by the full fast gate.
+- The 533/533 fast run was executed with one unrelated uncommitted test-only helper in `tests/v4/github-transport.test.ts`; it does not modify production source or add/change a test case. Do not describe that run as a pristine exact-Git-tree qualification until that concurrent WIP is committed or removed.
+- Focused regressions in the latest audit pass: settings-secrets **55/55**, sync-session **106/106**, remote-index **20/20**, recovery **50/50**, recovery-boundary **3/3**, recovery-topology-ordering **1/1**, vault-write **3/3**, github-bootstrap-ref-conflict **2/2**, github-empty-ref **3/3**, github-transport **43/43**, github-tree-mode-validation **1/1**, storage-history **4/4**, github-immutable-read-fallback **13/13**, and benchmark **3/3**; the benchmark qualification also reproduced the prior wall-clock flake under full-suite contention before `0762038...`, with later full fast runs remaining green through the current **533/533** audit head. Prior history-service **13/13**, sync-coordinator **25/25**, sync-policy **2/2**, storage-codec **12/12**, and opaque-leakage **2/2** remain covered by the full fast gate.
 - Real GitHub E2E remains excluded from the default fast tier and was not run in this closure; inspect hosted checks for the exact pushed SHA separately before treating the branch as release-qualified.
 
 ### TDD plan
