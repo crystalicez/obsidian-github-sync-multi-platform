@@ -482,7 +482,9 @@ Audit method:
    - GitHub's Git database REST documentation lists `409 Conflict` for Git reference reads and states that Git database APIs return 409 when a repository is empty or temporarily unavailable; empty repositories must be initialized through the Contents API.
    - `getGitRefOrNull()` converted only 404 into an absent ref. A real empty repository could therefore fail before reaching the already-hardened Contents bootstrap path.
    - RED: `d578693148d77549a7a3aab779a580daf073345b` reproduces a `Git Repository is empty.` 409 from the configured-ref endpoint and proves the helper threw instead of returning `null`.
-   - Fix: `6d3ba0a899214c9b8d0f842ce3a28be14c3a5796` treats 404 and 409 as an absent configured ref. If a 409 represents transient repository unavailability rather than an empty repository, the later bootstrap Contents mutation still fails closed; no ref is published without the existing bootstrap verification chain.
+   - Initial fix: `6d3ba0a899214c9b8d0f842ce3a28be14c3a5796` allowed the documented empty-repository 409 to reach Contents bootstrap.
+   - Follow-up RED: `a1362712f9e3c4a0d34d0c44847f62f1733f0394` proves a generic/unavailable 409 must not be interpreted as an empty repository.
+   - Final fix: `4959c07acd5ae6007ec66a925050edcd40bfb76f` returns `null` only for 404 or a 409 whose GitHub error explicitly reports that the Git repository is empty; other 409 conflicts propagate fail-closed.
 
 70. **MEDIUM remote resource/fail-late safety — resolved operations could exceed journal capacity only after staging or streamed object uploads had already started.**
    - The journal writer contract is 500 changes/page × 256 pages = 128,000 changes per publication, but `buildV4JournalPages()` was the first place enforcing that limit.
@@ -490,6 +492,14 @@ Audit method:
    - RED: `5655f2b3f565bf3b1b8912524b798f76336c2659` requires the journal capacity to be preflightable from a change count without materializing an oversized change array.
    - Fix: `647fbeeaade34008162d4382955afc37a787bf09` centralizes the writer-compatible capacity assertion and checks the exact resolved journal entry count — external-reconciliation pulls plus final resolved pushes — immediately after conflict resolution and before packed-pull staging, final local mutation, or streamed Git blob upload.
    - This remains a per-publication journal bound, not a global vault file-count limit; large vaults remain supported as long as one atomic publication stays inside the existing protocol journal contract.
+
+71. **MEDIUM/HIGH remote resource safety — direct plaintext external reconciliation re-downloaded every unchanged vault blob.**
+   - When a plaintext branch contained a direct external Git edit after the locally known V4 publication, `reconcileExternalCommit()` traversed the full current tree and called `getFileBytes()` for every in-scope blob, even when an immutable baseline tree proved that most blob object IDs were unchanged.
+   - A one-file manual GitHub edit in a large vault could therefore expand into thousands of Contents/blob reads, consuming rate-limit budget and making sync latency proportional to total vault size instead of the external delta.
+   - RED: `909c7442c6b6da3aea6f1d8eda9db87a3d657d29` proves an unchanged plaintext file was fetched during a one-file external edit.
+   - Fix: `48d103dc95b2c75feba43deabf40f56c2305804c` compares the current immutable tree with the locally known immutable baseline tree and reuses the authenticated V4 record when the path/blob object ID is unchanged.
+   - Reuse is deliberately gated by `localIndexMatchesRemoteHead()`; if the local metadata manifest is stale relative to the authenticated remote head, reconciliation keeps the prior full-read behavior rather than reusing records from the wrong generation. Closing that stale-device amplification path safely requires a bounded proof of which ancestor owns the inherited V4 metadata.
+   - The sync-session fixture now models tree child IDs as content-sensitive values so tests preserve the content-addressed Git invariant required by this optimization.
 
 ### Audited surfaces with no new confirmed defect so far
 
@@ -533,6 +543,7 @@ RED tests have now been pushed on the audit branch:
 - `79a109603463a56559982d0c071df662db95e2be` — authenticated Contents bytes must still be bound to the exact requested repository path and file type.
 - `d578693148d77549a7a3aab779a580daf073345b` — an empty Git repository's documented HTTP 409 configured-ref response must be treated as an absent ref so Contents bootstrap can run.
 - `5655f2b3f565bf3b1b8912524b798f76336c2659` — journal capacity must be checkable from the resolved change count before staging or immutable-object upload begins.
+- `909c7442c6b6da3aea6f1d8eda9db87a3d657d29` — direct plaintext external reconciliation must not re-download an unchanged blob when authenticated metadata and immutable baseline/current trees prove the blob object ID is unchanged.
 
 Refined root-cause design:
 - create one canonical shard-record hash function and use it for writer hash creation, remote shard verification, and local persisted-cache verification;
@@ -564,8 +575,9 @@ Root-cause fixes are now on the audit branch:
 - `0762038ae20673674fceb71376906dd21d1443c4` — stabilize the fast planner qualification by measuring process CPU time instead of wall-clock delay caused by concurrent test files.
 - `d957ad1` — bind successful GitHub Contents file responses to `type: "file"` and the exact requested repository path before trusting authenticated payload bytes.
 - fixture-only follow-up `a121304` keeps the immutable Contents-success regression protocol-shaped under the stricter response contract.
-- `6d3ba0a899214c9b8d0f842ce3a28be14c3a5796` — treat configured-ref HTTP 409 as an absent ref so documented empty-repository Git API behavior reaches the verified Contents bootstrap path.
+- `6d3ba0a899214c9b8d0f842ce3a28be14c3a5796`, `4959c07acd5ae6007ec66a925050edcd40bfb76f` — allow only documented empty-repository configured-ref conflicts to reach verified Contents bootstrap while propagating unrelated 409 conflicts fail-closed.
 - `647fbeeaade34008162d4382955afc37a787bf09` — preflight the exact resolved journal change count against the shared writer contract before staging or streamed remote uploads can create side effects.
+- `48d103dc95b2c75feba43deabf40f56c2305804c` — reuse authenticated plaintext records for unchanged external-tree blobs when the local metadata manifest exactly matches the authenticated remote head, avoiding full-vault blob re-downloads for direct external edits.
 - `6151868d066c050deef9159d3beda389e2ae0ce7`, `d9cde1a72496a8c86df5c85b975d39b92998f873`, `0c301523e774d54bc03191aa7a897da98691ac81`, `06335328777bd5010e928c1951f1cdb581aac2f0` — bounded journal writer/reader contract, safe journal markers, cross-page consistency, descriptor validation before blob reads, and preview-limit precedence.
 - fixture-only followups `4ce0affffce484398db30b0de339af8a2dd1e5cf`, `e5ae96eda6003faa4233346bd5104561e2258923`, `40fc418844c40a52ef4baa39c7318f21a5547782`, `b876e4076084e544ec13ec0ef60c9ef7e0cbcc8a` keep tests protocol-shaped rather than weakening production validation.
 
@@ -576,9 +588,9 @@ Recent crash/memory hardening:
 
 Verification status:
 - The repository was executed through the connected local engineering workspace with Node `v24.11.0` and pnpm `9.12.3`.
-- Final post-fix gates on the current source tree: `pnpm run test:fast` **507/507**, `pnpm run test:recovery` **48/48**, `pnpm run test:resource` **11/11**, and `pnpm run build` PASS.
+- Final post-fix gates on the current source tree: `pnpm run test:fast` **509/509**, `pnpm run test:recovery` **48/48**, `pnpm run test:resource` **11/11**, and `pnpm run build` PASS.
 - Final release checks also pass on regenerated artifacts: `pnpm run validate:metadata` and `pnpm run validate:package`.
-- Focused regressions in the latest audit pass: storage-history **4/4**, sync-session **95/95**, github-empty-ref **1/1**, github-transport **43/43**, github-immutable-read-fallback **13/13**, and benchmark **3/3**; the benchmark qualification also reproduced the prior wall-clock flake under full-suite contention before `0762038...`, then later full fast runs passed **503/503**, **504/504**, and now **505/505** after the Contents-identity regression was added. Prior history-service **13/13**, sync-coordinator **25/25**, sync-policy **2/2**, storage-codec **12/12**, opaque-leakage **2/2**, and sync-session **95/95** remain covered by the full fast gate.
+- Focused regressions in the latest audit pass: sync-session **96/96**, storage-history **4/4**, github-empty-ref **1/1**, github-transport **43/43**, github-immutable-read-fallback **13/13**, and benchmark **3/3**; the benchmark qualification also reproduced the prior wall-clock flake under full-suite contention before `0762038...`, then later full fast runs passed **503/503**, **504/504**, and now **505/505** after the Contents-identity regression was added. Prior history-service **13/13**, sync-coordinator **25/25**, sync-policy **2/2**, storage-codec **12/12**, opaque-leakage **2/2**, and sync-session **95/95** remain covered by the full fast gate.
 - Real GitHub E2E remains excluded from the default fast tier and was not run in this closure; inspect hosted checks for the exact pushed SHA separately before treating the branch as release-qualified.
 
 ### TDD plan
