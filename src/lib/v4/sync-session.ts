@@ -670,6 +670,11 @@ export class V4SyncSession {
       }
     }
 
+    const currentGeneration = remote?.head.generation ?? 0
+    if (currentGeneration >= Number.MAX_SAFE_INTEGER) {
+      throw new Error("V4 remote generation cannot be incremented safely.")
+    }
+
     const pushContentPaths = new Set(batch.pushes.flatMap(binding => binding.source?.kind === "vault" ? [binding.source.path] : []))
     this.localReadCache.retain(pushContentPaths)
     const files: V4GitTreeFile[] = []
@@ -896,7 +901,7 @@ export class V4SyncSession {
     const buckets = new Set(finalByBucket.keys())
     const oldBuckets = new Set(remote ? Object.keys(remote.head.shardHashes) : [])
     for (const bucket of oldBuckets) if (!buckets.has(bucket)) deletions.add(v4RemoteShardPath(bucket, remote!.config.mode))
-    const generation = (remote?.head.generation ?? 0) + 1
+    const generation = currentGeneration + 1
     const changedBuckets = new Set<string>()
     for (const bucket of new Set([...oldByBucket.keys(), ...finalByBucket.keys()])) {
       if (bucketSignature(oldByBucket.get(bucket)) !== bucketSignature(finalByBucket.get(bucket))) changedBuckets.add(bucket)
