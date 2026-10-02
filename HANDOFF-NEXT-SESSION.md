@@ -562,6 +562,13 @@ Audit method:
    - Fix: `df2bc0a` checks the unload sentinel immediately after `loadSettings()` and again after optional migrated-settings persistence, before any runtime/client/view/timer/event registration occurs.
    - Focused settings/runtime coverage is green at **53/53** after the fix.
 
+81. **MEDIUM/HIGH secret-migration durability — unload during settings load could skip durable cleanup of migrated legacy secrets.**
+   - Legacy settings migration moves raw token/passphrase values into Obsidian SecretStorage and marks the in-memory settings as migrated so the old cleartext fields can be removed from plugin data.
+   - Finding 80 added an unload guard immediately after `loadSettings()`. If unload happened while `loadSettings()` was awaiting and migration completed before that await returned, the guard could return before `persistData()`, leaving the legacy raw secret fields durably present in plugin data even though the plugin instance had already migrated them into SecretStorage.
+   - RED: `ff149f941c7dbb1b0111baaa7d126af0bfad3226` requires migrated-secret cleanup persistence to occur before unload can short-circuit startup runtime creation.
+   - Fix: `78ba901` preserves the lifecycle safety from finding 80 but orders startup as load → optional migrated-settings persistence → unload guard → runtime/UI creation. Unload during settings loading therefore cannot recreate runtime work, while migrated raw secrets are still durably scrubbed before startup returns.
+   - Focused settings/runtime coverage is green at **54/54** after the fix.
+
 ### Audited surfaces with no new confirmed defect so far
 
 - secret migration/persistence: raw token/passphrase are removed before plugin data persistence and use Obsidian SecretStorage;
@@ -614,6 +621,7 @@ RED tests have now been pushed on the audit branch:
 - `b7518a4` — plaintext external reconciliation must reject an in-scope Git symlink before its blob payload can be treated as ordinary file content.
 - `38f6266` — recovery persistence must reject a valid maximum safe generation before computing or writing an unsafe successor.
 - `dd7e97d` — plugin startup must remain inert if unload occurs while settings load or migrated-settings persistence is still awaiting completion.
+- `ff149f941c7dbb1b0111baaa7d126af0bfad3226` — unload during startup settings load must not skip durable cleanup of migrated legacy secrets before startup returns.
 
 Refined root-cause design:
 - create one canonical shard-record hash function and use it for writer hash creation, remote shard verification, and local persisted-cache verification;
@@ -657,6 +665,7 @@ Root-cause fixes are now on the audit branch:
 - `ed76ca7` — reject managed external plaintext symlinks and unsupported blob modes before body reads or local planning; preserve out-of-scope objects by scope.
 - `2d00466` — fail closed before recovery encryption/write when the current valid recovery generation has no safe successor.
 - `df2bc0a` — make async plugin startup stop after unload at both settings-load and migrated-settings-persistence boundaries before recreating runtime work.
+- `78ba901` — persist migrated legacy-secret cleanup before the startup unload guard while keeping all runtime/UI/timer creation behind that guard.
 - `6151868d066c050deef9159d3beda389e2ae0ce7`, `d9cde1a72496a8c86df5c85b975d39b92998f873`, `0c301523e774d54bc03191aa7a897da98691ac81`, `06335328777bd5010e928c1951f1cdb581aac2f0` — bounded journal writer/reader contract, safe journal markers, cross-page consistency, descriptor validation before blob reads, and preview-limit precedence.
 - fixture-only followups `4ce0affffce484398db30b0de339af8a2dd1e5cf`, `e5ae96eda6003faa4233346bd5104561e2258923`, `40fc418844c40a52ef4baa39c7318f21a5547782`, `b876e4076084e544ec13ec0ef60c9ef7e0cbcc8a` keep tests protocol-shaped rather than weakening production validation.
 
@@ -667,10 +676,10 @@ Recent crash/memory hardening:
 
 Verification status:
 - The repository was executed through the connected local engineering workspace with Node `v24.11.0` and pnpm `9.12.3`.
-- Final post-fix gates on the current production source: `pnpm run test:fast` **519/519**, `pnpm run test:recovery` **49/49**, `pnpm run test:resource` **11/11**, and `pnpm run build` PASS.
+- Final post-fix gates on the current production source: `pnpm run test:fast` **520/520**, `pnpm run test:recovery` **49/49**, `pnpm run test:resource` **11/11**, and `pnpm run build` PASS.
 - Final release checks also pass on regenerated artifacts: `pnpm run validate:metadata` and `pnpm run validate:package`.
-- The 519/519 fast run was executed with one unrelated uncommitted test-only helper in `tests/v4/github-transport.test.ts`; it does not modify production source or add/change a test case. Do not describe that run as a pristine exact-Git-tree qualification until that concurrent WIP is committed or removed.
-- Focused regressions in the latest audit pass: settings-secrets **53/53**, sync-session **101/101**, recovery **49/49**, github-bootstrap-ref-conflict **2/2**, github-empty-ref **3/3**, github-transport **43/43**, storage-history **4/4**, github-immutable-read-fallback **13/13**, and benchmark **3/3**; the benchmark qualification also reproduced the prior wall-clock flake under full-suite contention before `0762038...`, with later full fast runs remaining green through the current **519/519** audit head. Prior history-service **13/13**, sync-coordinator **25/25**, sync-policy **2/2**, storage-codec **12/12**, and opaque-leakage **2/2** remain covered by the full fast gate.
+- The 520/520 fast run was executed with one unrelated uncommitted test-only helper in `tests/v4/github-transport.test.ts`; it does not modify production source or add/change a test case. Do not describe that run as a pristine exact-Git-tree qualification until that concurrent WIP is committed or removed.
+- Focused regressions in the latest audit pass: settings-secrets **54/54**, sync-session **101/101**, recovery **49/49**, github-bootstrap-ref-conflict **2/2**, github-empty-ref **3/3**, github-transport **43/43**, storage-history **4/4**, github-immutable-read-fallback **13/13**, and benchmark **3/3**; the benchmark qualification also reproduced the prior wall-clock flake under full-suite contention before `0762038...`, with later full fast runs remaining green through the current **519/519** audit head. Prior history-service **13/13**, sync-coordinator **25/25**, sync-policy **2/2**, storage-codec **12/12**, and opaque-leakage **2/2** remain covered by the full fast gate.
 - Real GitHub E2E remains excluded from the default fast tier and was not run in this closure; inspect hosted checks for the exact pushed SHA separately before treating the branch as release-qualified.
 
 ### TDD plan
