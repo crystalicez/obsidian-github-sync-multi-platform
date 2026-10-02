@@ -943,7 +943,12 @@ export class V4SyncSession {
       ])
       for (const node of tree.tree) {
         const internal = node.path.startsWith(`${V4_ROOT}/`)
-        if (node.type !== "blob" || (!internal && !includePath(node.path)) || written.has(node.path) || node.path.startsWith(`${V4_ROOT}/journals/`)) continue
+        const managed = internal || includePath(node.path)
+        if (!managed || written.has(node.path)) continue
+        if (node.type === "commit") {
+          throw new Error(`Force Push cannot safely mirror remote gitlink/submodule: ${node.path}`)
+        }
+        if (node.type !== "blob" || node.path.startsWith(`${V4_ROOT}/journals/`)) continue
         deletions.add(node.path)
       }
     }
