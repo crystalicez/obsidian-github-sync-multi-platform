@@ -1241,6 +1241,20 @@ test("layout-ready startup callback is inert after plugin unload", async () => {
 })
 
 
+test("late settings persistence cannot recreate runtime work after plugin unload", async () => {
+  const mainSource = await readFile("src/main.ts", "utf8");
+
+  assert.match(
+    mainSource,
+    /async saveSettings\([^)]*nextSettings[\s\S]*?await this\.persistSettingsData\(preparedSettings\)[\s\S]*?if\s*\(this\.unloaded\)\s*return[\s\S]*?this\.settings\s*=\s*preparedSettings[\s\S]*?initGitHubClient\(\)[\s\S]*?registerScheduledSync\(\)/u,
+  );
+  assert.match(
+    mainSource,
+    /registerScheduledSync\(\)\s*\{\s*if\s*\(this\.unloaded\)\s*return/u,
+  );
+});
+
+
 test("settings save does not publish the new runtime generation before durable persistence succeeds", async () => {
   const mainSource = await readFile("src/main.ts", "utf8");
 
