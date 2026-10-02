@@ -2972,6 +2972,49 @@ test("v4 external reconciliation fails closed on an in-scope gitlink before loca
   assert.deepEqual(vault.operations.filter(operation => /^(?:write|trash|delete|commit-stage):/u.test(operation)), []);
 });
 
+test("v4 external reconciliation rejects an in-scope symlink before replacing local file content", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault();
+  vault.files.set("note.md", { bytes: enc("local"), mtime: 1 });
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "local", mode: "plaintext" });
+
+  await new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "forcePush", allowThresholdOverride: false });
+
+  const previousHead = github.ref!.sha;
+  const previousTree = github.commits.get(previousHead)!.treeSha;
+  const externalTree = `tree-symlink-${github.trees.size + 1}`;
+  const externalFiles = new Map(github.trees.get(previousTree));
+  externalFiles.set("note.md", enc("target.md"));
+  github.trees.set(externalTree, externalFiles);
+  const externalCommit = await github.createGitCommit("external symlink", externalTree, [previousHead]);
+  await github.updateGitRef(externalCommit, previousHead);
+
+  const originalGetTreeAt = github.getTreeAt.bind(github);
+  github.getTreeAt = async (treeSha: string) => {
+    const tree = await originalGetTreeAt(treeSha);
+    if (treeSha !== externalTree) return tree;
+    return {
+      ...tree,
+      tree: tree.tree.map(node => node.path === "note.md"
+        ? { ...node, mode: "120000", type: "blob" as const }
+        : node),
+    };
+  };
+
+  vault.operations.length = 0;
+  const beforeRef = github.ref!.sha;
+  await assert.rejects(
+    () => new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+      .sync({ operation: "normal", allowThresholdOverride: false, changes: [] }),
+    /external.*symlink|symlink.*unsupported|unsupported.*symlink/iu,
+  );
+
+  assert.equal(github.ref!.sha, beforeRef, "unsupported external symlink must not publish replacement metadata");
+  assert.equal(dec(vault.files.get("note.md")!.bytes), "local");
+  assert.deepEqual(vault.operations.filter(operation => /^(?:write|trash|delete|commit-stage):/u.test(operation)), []);
+});
+
 test("v4 rejects a non-canonical external Git path before any local pull mutation", async () => {
   const github = new MemoryGitHub();
   const vault = new MemoryVault();
