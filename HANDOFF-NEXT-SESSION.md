@@ -534,6 +534,13 @@ Audit method:
    - Fix: `d8c3c6b` returns immediately after successful durable persistence when `this.unloaded` is true, and `registerScheduledSync()` now fails closed after unload. The `finally` path still releases the settings-transition gate.
    - Focused settings/runtime coverage is green at **52/52**.
 
+77. **HIGH external plaintext reconciliation safety — an in-scope gitlink/submodule could be interpreted as a remote deletion and trash the local file.**
+   - Direct external plaintext reconciliation rebuilt logical remote state from recursive-tree blob entries and silently skipped every non-blob. If an external commit replaced a managed file path with a Git gitlink/submodule (`type: "commit"`, mode `160000`), that path disappeared from reconciled metadata even though the remote tree still contained an object at the path.
+   - The planner could then treat an unchanged local file as remotely deleted, apply the pull through trash/delete semantics, and later publish V4 metadata that still did not represent the surviving gitlink.
+   - RED: `4dce43d` replaces `note.md` with an in-scope gitlink in an external commit and proves normal sync proceeded instead of rejecting before local mutation.
+   - Fix: `fe8b8e7` validates gitlink paths during external reconciliation and fails closed for internal or in-scope gitlinks/submodules before planning/local mutation; explicitly out-of-scope gitlinks remain untouched.
+   - Focused `sync-session` coverage is green at **100/100** after the fix.
+
 ### Audited surfaces with no new confirmed defect so far
 
 - secret migration/persistence: raw token/passphrase are removed before plugin data persistence and use Obsidian SecretStorage;
@@ -582,6 +589,7 @@ RED tests have now been pushed on the audit branch:
 - `015df6301bbf264930166ef861075895630099d0` — a valid maximum safe remote generation must reject before any publication side effects because no safe successor generation exists.
 - `34bf179` — Force Push must not silently preserve an in-scope remote gitlink while claiming an exact mirror; out-of-scope gitlinks remain preserved by scope.
 - `014e073` — a settings save that resumes after plugin unload must not recreate client/runtime timers or publish a new live settings generation.
+- `4dce43d` — plaintext external reconciliation must not interpret an in-scope gitlink/submodule as file absence and locally delete the managed path.
 
 Refined root-cause design:
 - create one canonical shard-record hash function and use it for writer hash creation, remote shard verification, and local persisted-cache verification;
@@ -621,6 +629,7 @@ Root-cause fixes are now on the audit branch:
 - `b10522ea4e2fd2f942afd3cbca1ea0ed971b4da3` — guard max-generation remotes at the publication boundary so no unsafe successor head or remote publication side effects can be created.
 - `620c3bb` — fail closed when an in-scope remote gitlink/submodule prevents Force Push from proving an exact managed mirror; preserve out-of-scope gitlinks.
 - `d8c3c6b` — keep late settings-save completion inert after plugin unload and prevent scheduled sync registration from recreating timers on a disposed plugin.
+- `fe8b8e7` — reject managed external plaintext gitlinks/submodules before they can be misclassified as remote deletions; preserve out-of-scope gitlinks by scope.
 - `6151868d066c050deef9159d3beda389e2ae0ce7`, `d9cde1a72496a8c86df5c85b975d39b92998f873`, `0c301523e774d54bc03191aa7a897da98691ac81`, `06335328777bd5010e928c1951f1cdb581aac2f0` — bounded journal writer/reader contract, safe journal markers, cross-page consistency, descriptor validation before blob reads, and preview-limit precedence.
 - fixture-only followups `4ce0affffce484398db30b0de339af8a2dd1e5cf`, `e5ae96eda6003faa4233346bd5104561e2258923`, `40fc418844c40a52ef4baa39c7318f21a5547782`, `b876e4076084e544ec13ec0ef60c9ef7e0cbcc8a` keep tests protocol-shaped rather than weakening production validation.
 
@@ -631,10 +640,10 @@ Recent crash/memory hardening:
 
 Verification status:
 - The repository was executed through the connected local engineering workspace with Node `v24.11.0` and pnpm `9.12.3`.
-- Final post-fix gates on the current production source: `pnpm run test:fast` **516/516**, `pnpm run test:recovery` **48/48**, `pnpm run test:resource` **11/11**, and `pnpm run build` PASS.
+- Final post-fix gates on the current production source: `pnpm run test:fast` **517/517**, `pnpm run test:recovery` **48/48**, `pnpm run test:resource` **11/11**, and `pnpm run build` PASS.
 - Final release checks also pass on regenerated artifacts: `pnpm run validate:metadata` and `pnpm run validate:package`.
-- The 516/516 fast run was executed with one unrelated uncommitted test-only helper in `tests/v4/github-transport.test.ts`; it does not modify production source or add/change a test case. Do not describe that run as a pristine exact-Git-tree qualification until that concurrent WIP is committed or removed.
-- Focused regressions in the latest audit pass: settings-secrets **52/52**, sync-session **97/97**, github-bootstrap-ref-conflict **2/2**, github-empty-ref **3/3**, github-transport **43/43**, storage-history **4/4**, github-immutable-read-fallback **13/13**, and benchmark **3/3**; the benchmark qualification also reproduced the prior wall-clock flake under full-suite contention before `0762038...`, then later full fast runs passed **503/503**, **504/504**, and now **505/505** after the Contents-identity regression was added. Prior history-service **13/13**, sync-coordinator **25/25**, sync-policy **2/2**, storage-codec **12/12**, opaque-leakage **2/2**, and sync-session **95/95** remain covered by the full fast gate.
+- The 517/517 fast run was executed with one unrelated uncommitted test-only helper in `tests/v4/github-transport.test.ts`; it does not modify production source or add/change a test case. Do not describe that run as a pristine exact-Git-tree qualification until that concurrent WIP is committed or removed.
+- Focused regressions in the latest audit pass: settings-secrets **52/52**, sync-session **100/100**, github-bootstrap-ref-conflict **2/2**, github-empty-ref **3/3**, github-transport **43/43**, storage-history **4/4**, github-immutable-read-fallback **13/13**, and benchmark **3/3**; the benchmark qualification also reproduced the prior wall-clock flake under full-suite contention before `0762038...`, then later full fast runs passed **503/503**, **504/504**, and now **505/505** after the Contents-identity regression was added. Prior history-service **13/13**, sync-coordinator **25/25**, sync-policy **2/2**, storage-codec **12/12**, opaque-leakage **2/2**, and sync-session **95/95** remain covered by the full fast gate.
 - Real GitHub E2E remains excluded from the default fast tier and was not run in this closure; inspect hosted checks for the exact pushed SHA separately before treating the branch as release-qualified.
 
 ### TDD plan
