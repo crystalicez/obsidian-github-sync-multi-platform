@@ -1241,6 +1241,20 @@ test("layout-ready startup callback is inert after plugin unload", async () => {
 })
 
 
+test("startup secret migration persistence completes before unload can short-circuit runtime creation", async () => {
+  const mainSource = await readFile("src/main.ts", "utf8");
+  const onloadStart = mainSource.indexOf("async onload()");
+  const loadSettings = mainSource.indexOf("await this.loadSettings()", onloadStart);
+  const persistMigrated = mainSource.indexOf("if (this.secretsMigrated) await this.persistData()", loadSettings);
+  const unloadGuard = mainSource.indexOf("if (this.unloaded) return", loadSettings);
+  const createRuntime = mainSource.indexOf("this.v4Runtime = this.createV4Runtime()", loadSettings);
+
+  assert.ok(onloadStart >= 0 && loadSettings > onloadStart && persistMigrated > loadSettings);
+  assert.ok(unloadGuard > persistMigrated, "legacy secret cleanup must persist before startup can return after unload");
+  assert.ok(createRuntime > unloadGuard, "runtime creation must remain blocked after the unload guard");
+});
+
+
 test("plugin startup cannot recreate runtime work after unload during async settings initialization", async () => {
   const mainSource = await readFile("src/main.ts", "utf8");
 
