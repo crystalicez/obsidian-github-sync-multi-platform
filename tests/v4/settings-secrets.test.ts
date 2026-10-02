@@ -1241,6 +1241,16 @@ test("layout-ready startup callback is inert after plugin unload", async () => {
 })
 
 
+test("plugin startup cannot recreate runtime work after unload during async settings initialization", async () => {
+  const mainSource = await readFile("src/main.ts", "utf8");
+
+  assert.match(
+    mainSource,
+    /async onload\(\)[\s\S]*?await this\.loadSettings\(\)[\s\S]*?if\s*\(this\.unloaded\)\s*return[\s\S]*?if\s*\(this\.secretsMigrated\)[\s\S]*?await this\.persistData\(\)[\s\S]*?if\s*\(this\.unloaded\)\s*return[\s\S]*?this\.v4Runtime\s*=\s*this\.createV4Runtime\(\)/u,
+  );
+});
+
+
 test("late settings persistence cannot recreate runtime work after plugin unload", async () => {
   const mainSource = await readFile("src/main.ts", "utf8");
 
