@@ -124,6 +124,7 @@ export function assertV4RemoteShardRecords(shard: V4RemoteShard, bucket: string,
 export async function assertV4RemoteRecordSet(records: V4IndexFileRecord[], config: V4RemoteConfig, keyring?: V4Keyring): Promise<void> {
   const fileIds = new Set<string>()
   const logicalPaths = new Set<string>()
+  const canonicalLogicalPaths = new Map<string, string>()
   const packGroups = new Map<string, { files: number; plaintextBytes: number }>()
   for (const record of records) {
     assertV4RemoteRecordDescriptor(record, config)
@@ -131,6 +132,12 @@ export async function assertV4RemoteRecordSet(records: V4IndexFileRecord[], conf
     fileIds.add(record.fileId)
     if (logicalPaths.has(record.path)) throw new Error(`Duplicate V4 remote logical path: ${record.path}`)
     logicalPaths.add(record.path)
+    const canonicalPath = record.path.normalize("NFC").toLowerCase()
+    const canonicalPrevious = canonicalLogicalPaths.get(canonicalPath)
+    if (canonicalPrevious && canonicalPrevious !== record.path) {
+      throw new Error(`V4 remote logical path canonical collision: ${canonicalPrevious} <-> ${record.path}`)
+    }
+    canonicalLogicalPaths.set(canonicalPath, record.path)
     if (record.storage === "pack") {
       const packId = record.packId!
       const current = packGroups.get(packId) ?? { files: 0, plaintextBytes: 0 }
