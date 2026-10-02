@@ -158,7 +158,7 @@ function pathsBlockFileTarget(left: string, right: string): boolean {
   return left === right || left.startsWith(`${right}/`) || right.startsWith(`${left}/`)
 }
 
-function orderRecoveryMutationsForFileTopology(mutations: V4RecoveryLocalMutation[]): V4RecoveryLocalMutation[] {
+export function orderRecoveryMutationsForFileTopology(mutations: V4RecoveryLocalMutation[]): V4RecoveryLocalMutation[] {
   const writePaths = mutations.flatMap(mutation => mutation.kind === "stage-write" ? [mutation.path] : [])
   if (writePaths.length === 0) return mutations
   const blockingTrashIds = new Set(mutations.flatMap(mutation => mutation.kind === "trash"
