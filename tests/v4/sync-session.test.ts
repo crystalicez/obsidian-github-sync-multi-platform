@@ -1059,6 +1059,68 @@ test("v4 Force Push cannot overwrite an encrypted remote without authenticating 
   assert.equal(plaintextVault.operations.some(operation => operation.startsWith("write:") || operation.startsWith("delete:") || operation.startsWith("trash:")), false);
 });
 
+test("v4 Force Push fails closed on an in-scope remote gitlink instead of claiming an exact mirror", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault();
+  vault.files.set("note.md", { bytes: enc("local"), mtime: 1 });
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "local", mode: "plaintext" });
+  await new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "forcePush", allowThresholdOverride: false });
+
+  const originalGetTreeAt = github.getTreeAt.bind(github);
+  github.getTreeAt = async (treeSha: string) => {
+    const tree = await originalGetTreeAt(treeSha);
+    return {
+      ...tree,
+      tree: [...tree.tree, {
+        path: "vendor/module",
+        mode: "160000",
+        type: "commit" as const,
+        sha: "f".repeat(40),
+        url: "",
+      }],
+    };
+  };
+  const before = { ref: github.ref!.sha, blobs: github.blobs.size, trees: github.trees.size, commits: github.commits.size };
+
+  await assert.rejects(
+    () => new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+      .sync({ operation: "forcePush", allowThresholdOverride: false }),
+    /Force Push.*gitlink|Force Push.*submodule|gitlink.*mirror|submodule.*mirror/iu,
+  );
+
+  assert.deepEqual({ ref: github.ref!.sha, blobs: github.blobs.size, trees: github.trees.size, commits: github.commits.size }, before);
+});
+
+test("v4 Force Push preserves an out-of-scope remote gitlink", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault();
+  vault.files.set("note.md", { bytes: enc("local"), mtime: 1 });
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "local", mode: "plaintext" });
+  const includePath = (path: string) => path !== "vendor/module";
+  await new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0, includePath })
+    .sync({ operation: "forcePush", allowThresholdOverride: false });
+
+  const originalGetTreeAt = github.getTreeAt.bind(github);
+  github.getTreeAt = async (treeSha: string) => {
+    const tree = await originalGetTreeAt(treeSha);
+    return {
+      ...tree,
+      tree: [...tree.tree, {
+        path: "vendor/module",
+        mode: "160000",
+        type: "commit" as const,
+        sha: "e".repeat(40),
+        url: "",
+      }],
+    };
+  };
+
+  const result = await new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0, includePath })
+    .sync({ operation: "forcePush", allowThresholdOverride: false });
+  assert.equal(result.mode, "force-push");
+});
+
 test("v4 encrypted correct-key matching-SHA no-op reads only config and authenticated head", async () => {
   const github = new MemoryGitHub();
   const vault = new MemoryVault();
