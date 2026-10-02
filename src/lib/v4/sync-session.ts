@@ -1109,6 +1109,20 @@ export class V4SyncSession {
         }
         continue
       }
+      if (node.type === "blob" && node.mode !== "100644" && node.mode !== "100755") {
+        let normalizedPath: string
+        try {
+          normalizedPath = normalizeV4VaultPath(node.path)
+        } catch (error) {
+          throw new Error(`Unsafe external Git path: ${node.path}`, { cause: error })
+        }
+        if (normalizedPath !== node.path) throw new Error(`External Git path is not normalized: ${node.path}`)
+        if (internal || includePath(node.path)) {
+          const kind = node.mode === "120000" ? "symlink" : `blob mode ${node.mode}`
+          throw new Error(`External Git ${kind} is unsupported in managed sync scope: ${node.path}`)
+        }
+        continue
+      }
       if (node.type !== "blob" || internal) continue
       let normalizedPath: string
       try {
