@@ -2302,6 +2302,36 @@ test("v4 no-op reuses all 256 unchanged remote shards while rehashing authoritat
   assert.equal(vault.operations.filter(operation => operation.startsWith("read:")).length, 256);
 });
 
+test("v4 refuses to publish when the remote generation cannot be incremented safely", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault();
+  vault.files.set("note.md", { bytes: enc("base"), mtime: 1 });
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "local", mode: "plaintext" });
+
+  await new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "forcePush", allowThresholdOverride: false });
+
+  const currentHead = github.ref!.sha;
+  const currentTreeSha = github.commits.get(currentHead)!.treeSha;
+  const currentTree = github.trees.get(currentTreeSha)!;
+  const head = JSON.parse(dec(currentTree.get(V4_HEAD_PATH)!)) as V4RemoteHead;
+  head.generation = Number.MAX_SAFE_INTEGER;
+  currentTree.set(V4_HEAD_PATH, enc(JSON.stringify(head)));
+  github.files.set(V4_HEAD_PATH, enc(JSON.stringify(head)));
+  index.generation = Number.MAX_SAFE_INTEGER;
+
+  vault.files.set("note.md", { bytes: enc("local edit"), mtime: 2 });
+  const before = { ref: github.ref!.sha, blobs: github.blobs.size, trees: github.trees.size, commits: github.commits.size };
+
+  await assert.rejects(
+    () => new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+      .sync({ operation: "normal", allowThresholdOverride: false, changes: [{ type: "modify", path: "note.md", mtime: 2 }] }),
+    /generation.*overflow|generation.*safe|generation.*increment|maximum.*generation/iu,
+  );
+
+  assert.deepEqual({ ref: github.ref!.sha, blobs: github.blobs.size, trees: github.trees.size, commits: github.commits.size }, before);
+});
+
 test("v4 authenticated remote duplicate fileIds are rejected before normal or Force Pull mutation", async () => {
   const github = new MemoryGitHub();
   const encryptedConfig: V4RemoteConfig = { formatVersion: V4_FORMAT_VERSION, mode: "encrypted", repoId: "o/r#main", pathLayout: "opaque-stable-v1", algorithm: "AES-GCM", kdf: "PBKDF2-SHA-256", kdfParams: { iterations: 10, salt: "c2FsdA" } };
