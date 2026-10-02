@@ -941,12 +941,26 @@ export class V4SyncSession {
         ...finalObjectPaths,
         ...[...buckets].map(bucket => v4RemoteShardPath(bucket, this.input.config.mode)),
       ])
+      const nonEmptyTreePaths = new Set<string>()
+      for (const node of tree.tree) {
+        let slash = node.path.lastIndexOf("/")
+        while (slash > 0) {
+          nonEmptyTreePaths.add(node.path.slice(0, slash))
+          slash = node.path.lastIndexOf("/", slash - 1)
+        }
+      }
       for (const node of tree.tree) {
         const internal = node.path.startsWith(`${V4_ROOT}/`)
         const managed = internal || includePath(node.path)
         if (!managed || written.has(node.path)) continue
         if (node.type === "commit") {
           throw new Error(`Force Push cannot safely mirror remote gitlink/submodule: ${node.path}`)
+        }
+        if (node.type === "tree") {
+          if (!nonEmptyTreePaths.has(node.path)) {
+            throw new Error(`Force Push cannot safely mirror explicit empty remote tree: ${node.path}`)
+          }
+          continue
         }
         if (node.type !== "blob" || node.path.startsWith(`${V4_ROOT}/journals/`)) continue
         deletions.add(node.path)
