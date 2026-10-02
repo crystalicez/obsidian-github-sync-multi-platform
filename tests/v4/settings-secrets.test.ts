@@ -1260,7 +1260,7 @@ test("plugin startup cannot recreate runtime work after unload during async sett
 
   assert.match(
     mainSource,
-    /async onload\(\)[\s\S]*?await this\.loadSettings\(\)[\s\S]*?if\s*\(this\.unloaded\)\s*return[\s\S]*?if\s*\(this\.secretsMigrated\)[\s\S]*?await this\.persistData\(\)[\s\S]*?if\s*\(this\.unloaded\)\s*return[\s\S]*?this\.v4Runtime\s*=\s*this\.createV4Runtime\(\)/u,
+    /async onload\(\)[\s\S]*?await this\.loadSettings\(\)[\s\S]*?if\s*\(this\.secretsMigrated\)[\s\S]*?await this\.persistData\(\)[\s\S]*?if\s*\(this\.unloaded\)\s*return[\s\S]*?this\.v4Runtime\s*=\s*this\.createV4Runtime\(\)/u,
   );
 });
 
