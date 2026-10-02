@@ -194,7 +194,11 @@ export function createV4RecoveryStore(options: {
       }
       let previous: V4RecoverySnapshot | null = null
       try { previous = await load() } catch (error) { if (error instanceof V4RecoveryRequiredError) throw error; throw error }
-      const generation = (previous?.header.generation ?? 0) + 1
+      const previousGeneration = previous?.header.generation ?? 0
+      if (!Number.isSafeInteger(previousGeneration) || previousGeneration < 0 || previousGeneration >= Number.MAX_SAFE_INTEGER) {
+        throw new V4RecoveryRequiredError("V4 recovery generation cannot be incremented safely.")
+      }
+      const generation = previousGeneration + 1
       let payloadCiphertext: string | undefined
       if (input.payload) {
         let bytes = utf8ToBytes(JSON.stringify(input.payload))
