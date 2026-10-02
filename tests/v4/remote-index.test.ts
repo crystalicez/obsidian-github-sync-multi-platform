@@ -133,6 +133,28 @@ test("v4 complete remote record validation rejects case-insensitive and NFC-equi
 });
 
 
+test("v4 complete remote record validation rejects canonical file-prefix topology collisions", async () => {
+  const config: V4RemoteConfig = { formatVersion: 4, mode: "plaintext", repoId: "o/r#main", pathLayout: "plaintext-v1" };
+  const common = { plaintextSha256: "a".repeat(64), size: 1, mtime: 1, remoteVersion: "v", storage: "single" as const };
+
+  for (const [label, parentPath, childPath] of [
+    ["case-insensitive ancestor", "Dir", "dir/file.md"],
+    ["NFC-equivalent ancestor", "Café", "Cafe\u0301/file.md"],
+  ] as const) {
+    const parentPathId = await sha256Hex(enc(`path:${parentPath}`));
+    const childPathId = await sha256Hex(enc(`path:${childPath}`));
+    await assert.rejects(
+      () => assertV4RemoteRecordSet([
+        { ...common, path: parentPath, pathId: parentPathId, fileId: `${label}-parent`, remotePath: parentPath },
+        { ...common, path: childPath, pathId: childPathId, fileId: `${label}-child`, remotePath: childPath },
+      ], config),
+      /canonical|case-insensitive|normalization|ancestor|prefix|topology|collision/iu,
+      label,
+    );
+  }
+});
+
+
 test("v4 complete remote record validation rejects pathId not derived from logical path", async () => {
   const config: V4RemoteConfig = { formatVersion: 4, mode: "plaintext", repoId: "o/r#main", pathLayout: "plaintext-v1" };
   const record = { path: "note.md", pathId: "ff".repeat(32), fileId: "file", plaintextSha256: "a".repeat(64), size: 1, mtime: 1, remoteVersion: "v", remotePath: "note.md", storage: "single" as const };
