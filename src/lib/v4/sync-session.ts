@@ -1074,6 +1074,14 @@ export class V4SyncSession {
     const tree = await this.input.github.getTreeAt(treeSha, true)
     if (tree.truncated) throw new Error("External GitHub tree is truncated; sync is unsafe.")
     const existingByPath = new Map(remote.records.map(record => [record.path, record]))
+    const baselineBlobShaByPath = new Map<string, string>()
+    const baselineCommitSha = this.input.index.remoteCommitSha
+    if (baselineCommitSha && localIndexMatchesRemoteHead(this.input.index, remote.head)) {
+      const baselineCommit = await this.input.github.getGitCommit(baselineCommitSha)
+      const baselineTree = await this.input.github.getTreeAt(baselineCommit.treeSha, true)
+      if (baselineTree.truncated) throw new Error("External GitHub baseline tree is truncated; sync is unsafe.")
+      for (const node of baselineTree.tree) if (node.type === "blob") baselineBlobShaByPath.set(node.path, node.sha)
+    }
     const includePath = this.input.includePath ?? (() => true)
     const reconciled: V4IndexFileRecord[] = remote.records.filter(record => !includePath(record.path))
     for (const node of tree.tree) {
@@ -1086,9 +1094,17 @@ export class V4SyncSession {
       }
       if (normalizedPath !== node.path) throw new Error(`External Git path is not normalized: ${node.path}`)
       if (!includePath(node.path)) continue
+      const previous = existingByPath.get(node.path)
+      if (
+        previous
+        && previous.remotePath === node.path
+        && baselineBlobShaByPath.get(node.path) === node.sha
+      ) {
+        reconciled.push(previous)
+        continue
+      }
       const file = await this.input.github.getFileBytes(node.path, remote.commitSha)
       if (!file) throw new Error(`External Git blob is missing from immutable commit evidence: ${node.path}`)
-      const previous = existingByPath.get(node.path)
       const pathId = previous?.pathId ?? await sha256Hex(utf8ToBytes(`path:${node.path}`))
       reconciled.push({
         path: node.path,

@@ -140,7 +140,19 @@ class MemoryGitHub {
   async getTreeAt(treeSha: string) {
     this.treeReads.push(treeSha);
     const tree = this.trees.get(treeSha) ?? new Map();
-    return { sha: treeSha, url: "", truncated: false, tree: [...tree.entries()].map(([path, bytes], index) => ({ path, mode: "100644", type: "blob" as const, sha: `tree-blob-${index}`, size: bytes.byteLength, url: "" })) };
+    return {
+      sha: treeSha,
+      url: "",
+      truncated: false,
+      tree: await Promise.all([...tree.entries()].map(async ([path, bytes]) => ({
+        path,
+        mode: "100644",
+        type: "blob" as const,
+        sha: await sha256Hex(bytes),
+        size: bytes.byteLength,
+        url: "",
+      }))),
+    };
   }
   async createGitBlob(bytes: Uint8Array) { const sha = `blob-${this.blobs.size + 1}`; this.blobs.set(sha, new Uint8Array(bytes)); return sha; }
   async createGitTree(entries: GitHubCreateTreeEntry[], baseTree?: string) {
