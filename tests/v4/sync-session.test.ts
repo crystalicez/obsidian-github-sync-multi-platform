@@ -3420,6 +3420,50 @@ test("v4 does not trust a forged plugin commit marker when the V4 head blob did 
   assert.equal(index.remoteCommitSha, github.ref!.sha)
 })
 
+test("v4 does not trust forged generation progression that hides managed blob edits", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault();
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "local", mode: "plaintext" });
+  vault.files.set("note.md", { bytes: enc("base"), mtime: 1 });
+
+  await new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "forcePush", allowThresholdOverride: false });
+
+  const previousHead = github.ref!.sha;
+  const previousCommit = github.commits.get(previousHead)!;
+  const previousHeadBytes = github.trees.get(previousCommit.treeSha)!.get(V4_HEAD_PATH)!;
+  const previousRemoteHead = JSON.parse(dec(previousHeadBytes)) as V4RemoteHead;
+  const forgedJournalId = "forged-journal";
+  const forgedHead: V4RemoteHead = {
+    ...previousRemoteHead,
+    generation: previousRemoteHead.generation + 1,
+    journalId: forgedJournalId,
+    updatedAt: previousRemoteHead.updatedAt + 1,
+    deviceId: "forger",
+  };
+
+  const forgedBlob = await github.createGitBlob(enc("forged external"));
+  const forgedHeadBlob = await github.createGitBlob(enc(JSON.stringify(forgedHead)));
+  const forgedTree = await github.createGitTree([
+    { path: "note.md", mode: "100644", type: "blob", sha: forgedBlob },
+    { path: V4_HEAD_PATH, mode: "100644", type: "blob", sha: forgedHeadBlob },
+  ], previousCommit.treeSha);
+  const forgedCommit = await github.createGitCommit(`obsidian-sync-v4:${forgedJournalId}`, forgedTree, [previousHead]);
+  await github.updateGitRef(forgedCommit, previousHead);
+
+  vault.operations.length = 0;
+  await assert.rejects(
+    () => new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+      .sync({ operation: "normal", allowThresholdOverride: false, changes: [] }),
+    /publication|internal.*V4|V4.*internal|subtree|journal|verified/iu,
+  );
+
+  assert.equal(index.remoteCommitSha, previousHead, "forged publication must not advance the trusted local baseline");
+  assert.equal(dec(vault.files.get("note.md")!.bytes), "base");
+  assert.deepEqual(vault.operations.filter(operation => /^(?:write|trash|delete|commit-stage):/u.test(operation)), []);
+});
+
+
 test("v4 generation-1 publication marker is not trusted across a parent that lost the V4 head", async () => {
   const github = new MemoryGitHub();
   const vault = new MemoryVault();
