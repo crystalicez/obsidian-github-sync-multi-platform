@@ -1092,6 +1092,39 @@ test("v4 Force Push fails closed on an in-scope remote gitlink instead of claimi
   assert.deepEqual({ ref: github.ref!.sha, blobs: github.blobs.size, trees: github.trees.size, commits: github.commits.size }, before);
 });
 
+test("v4 Force Push fails closed on an in-scope explicit empty Git tree", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault();
+  vault.files.set("note.md", { bytes: enc("local"), mtime: 1 });
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "local", mode: "plaintext" });
+  await new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "forcePush", allowThresholdOverride: false });
+
+  const originalGetTreeAt = github.getTreeAt.bind(github);
+  github.getTreeAt = async (treeSha: string) => {
+    const tree = await originalGetTreeAt(treeSha);
+    return {
+      ...tree,
+      tree: [...tree.tree, {
+        path: "empty-dir",
+        mode: "040000",
+        type: "tree" as const,
+        sha: "d".repeat(40),
+        url: "",
+      }],
+    };
+  };
+  const before = { ref: github.ref!.sha, blobs: github.blobs.size, trees: github.trees.size, commits: github.commits.size };
+
+  await assert.rejects(
+    () => new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+      .sync({ operation: "forcePush", allowThresholdOverride: false }),
+    /Force Push.*empty.*tree|empty.*tree.*mirror|tree.*mirror/iu,
+  );
+
+  assert.deepEqual({ ref: github.ref!.sha, blobs: github.blobs.size, trees: github.trees.size, commits: github.commits.size }, before);
+});
+
 test("v4 Force Push preserves an out-of-scope remote gitlink", async () => {
   const github = new MemoryGitHub();
   const vault = new MemoryVault();
