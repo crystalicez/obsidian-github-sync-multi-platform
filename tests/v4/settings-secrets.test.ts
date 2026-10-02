@@ -114,7 +114,34 @@ class RuntimeMemoryGitHub {
   }
   async ensureGitRepositoryInitialized() { return null; }
   async getGitCommit(sha: string) { const value = this.commits.get(sha)!; return { sha, treeSha: value.treeSha, parentShas: value.parents, message: value.message }; }
-  async getTreeAt(treeSha: string) { const tree = this.trees.get(treeSha) ?? new Map(); return { sha: treeSha, url: "", truncated: false, tree: [...tree.entries()].map(([path, bytes], index) => ({ path, mode: "100644", type: "blob" as const, sha: `tree-blob-${index}`, size: bytes.byteLength, url: "" })) }; }
+  async getTreeAt(treeSha: string, recursive = true) {
+    const tree = this.trees.get(treeSha) ?? new Map<string, Uint8Array>();
+    if (!recursive) {
+      const rootBlobs: Array<[string, Uint8Array]> = [];
+      const directories = new Map<string, string[]>();
+      for (const [path, bytes] of tree) {
+        const slash = path.indexOf("/");
+        if (slash < 0) {
+          rootBlobs.push([path, bytes]);
+          continue;
+        }
+        const directory = path.slice(0, slash);
+        const signatures = directories.get(directory) ?? [];
+        signatures.push(`${path.slice(slash + 1)}:${bytes.byteLength}:${Array.from(bytes).join(",")}`);
+        directories.set(directory, signatures);
+      }
+      return {
+        sha: treeSha,
+        url: "",
+        truncated: false,
+        tree: [
+          ...rootBlobs.map(([path, bytes], index) => ({ path, mode: "100644", type: "blob" as const, sha: `tree-blob-${index}`, size: bytes.byteLength, url: "" })),
+          ...[...directories].map(([path, signatures]) => ({ path, mode: "040000", type: "tree" as const, sha: `tree-dir:${path}:${signatures.sort().join("|")}`, url: "" })),
+        ],
+      };
+    }
+    return { sha: treeSha, url: "", truncated: false, tree: [...tree.entries()].map(([path, bytes], index) => ({ path, mode: "100644", type: "blob" as const, sha: `tree-blob-${index}`, size: bytes.byteLength, url: "" })) };
+  }
   async createGitBlob(bytes: Uint8Array) { const attempt = ++this.blobAttempts; if (this.createBlobOverride) return this.createBlobOverride(bytes, attempt); if (this.blobFailuresRemaining-- > 0) throw new Error("simulated upload failure"); const sha = `blob-${this.blobs.size + 1}`; this.blobs.set(sha, new Uint8Array(bytes)); return sha; }
   async createGitTree(entries: GitHubCreateTreeEntry[], baseTree?: string) { const tree = new Map(baseTree ? this.trees.get(baseTree) : undefined); for (const entry of entries) entry.sha === null ? tree.delete(entry.path) : tree.set(entry.path, new Uint8Array(this.blobs.get(entry.sha)!)); const sha = `tree-${this.trees.size + 1}`; this.trees.set(sha, tree); return sha; }
   async createGitCommit(message: string, treeSha: string, parents: string[]) { const sha = `commit-${this.commits.size + 1}`; this.commits.set(sha, { treeSha, parents, message }); return sha; }
