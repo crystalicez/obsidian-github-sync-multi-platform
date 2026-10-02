@@ -2958,6 +2958,41 @@ test("v4 external reconciliation reuses unchanged blobs instead of re-reading ev
   assert.equal(dec(vault.files.get("changed.md")!.bytes), "after");
 });
 
+test("v4 external reconciliation rejects canonical file topology before blob reads", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault();
+  vault.files.set("base.md", { bytes: enc("base"), mtime: 1 });
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "local", mode: "plaintext" });
+
+  await new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "forcePush", allowThresholdOverride: false });
+
+  const previousHead = github.ref!.sha;
+  const previousTree = github.commits.get(previousHead)!.treeSha;
+  const parentBlob = await github.createGitBlob(enc("parent"));
+  const childBlob = await github.createGitBlob(enc("child"));
+  const externalTree = await github.createGitTree([
+    { path: "Dir", mode: "100644", type: "blob", sha: parentBlob },
+    { path: "dir/child.md", mode: "100644", type: "blob", sha: childBlob },
+  ], previousTree);
+  const externalCommit = await github.createGitCommit("external canonical topology collision", externalTree, [previousHead]);
+  await github.updateGitRef(externalCommit, previousHead);
+
+  github.readPaths.length = 0;
+  vault.operations.length = 0;
+
+  await assert.rejects(
+    () => new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+      .sync({ operation: "normal", allowThresholdOverride: false, changes: [] }),
+    /canonical|case-insensitive|ancestor|prefix|topology|collision/iu,
+  );
+
+  const collisionReads = github.readPaths.filter(path => path === "Dir" || path === "dir/child.md");
+  assert.deepEqual(collisionReads, [], "impossible external path topology must reject before blob body reads");
+  assert.deepEqual(vault.operations.filter(operation => /^(?:write|trash|delete|commit-stage):/u.test(operation)), []);
+});
+
+
 test("v4 external reconciliation fails closed on an in-scope gitlink before local deletion", async () => {
   const github = new MemoryGitHub();
   const vault = new MemoryVault();
@@ -3052,6 +3087,39 @@ test("v4 external reconciliation rejects a tracked file replaced by a Git direct
   assert.equal(dec(vault.files.get("note.md")!.bytes), "local");
   assert.deepEqual(vault.operations.filter(operation => /^(?:write|trash|delete|commit-stage):/u.test(operation)), []);
 });
+
+test("v4 external reconciliation rejects canonical file-prefix topology before local mutation or metadata publication", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault();
+  vault.files.set("Dir", { bytes: enc("tracked"), mtime: 1 });
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "local", mode: "plaintext" });
+
+  await new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "forcePush", allowThresholdOverride: false });
+
+  const previousHead = github.ref!.sha;
+  const previousTree = github.commits.get(previousHead)!.treeSha;
+  const externalTree = `tree-canonical-prefix-${github.trees.size + 1}`;
+  const externalFiles = new Map(github.trees.get(previousTree));
+  externalFiles.set("dir/child.md", enc("child"));
+  github.trees.set(externalTree, externalFiles);
+  const externalCommit = await github.createGitCommit("external canonical path topology", externalTree, [previousHead]);
+  await github.updateGitRef(externalCommit, previousHead);
+
+  vault.operations.length = 0;
+  const beforeRef = github.ref!.sha;
+  await assert.rejects(
+    () => new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+      .sync({ operation: "normal", allowThresholdOverride: false, changes: [] }),
+    /canonical|path.*topology|ancestor|prefix|collision/iu,
+  );
+
+  assert.equal(github.ref!.sha, beforeRef, "unsafe external topology must not publish replacement V4 metadata");
+  assert.equal(dec(vault.files.get("Dir")!.bytes), "tracked");
+  assert.equal(vault.files.has("dir/child.md"), false);
+  assert.deepEqual(vault.operations.filter(operation => /^(?:write|trash|delete|commit-stage):/u.test(operation)), []);
+});
+
 
 test("v4 external reconciliation rejects an in-scope symlink before replacing local file content", async () => {
   const github = new MemoryGitHub();
