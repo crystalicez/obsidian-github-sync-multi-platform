@@ -36,7 +36,7 @@ async function ensureVaultFolder(vault: Vault, folderPath: string): Promise<void
   for (const part of folderPath.split("/")) {
     current = current ? `${current}/${part}` : part;
     const existing = vault.getAbstractFileByPath(current);
-    if (existing instanceof TFile) throw new Error(`Cannot create folder ${current}; a file exists at that path.`);
+    if (existing instanceof TFile) throw new Error(`V4 local target changed: cannot create folder ${current}; a file exists at that path.`);
     if (!existing) await vault.createFolder(current);
   }
 }
@@ -44,7 +44,7 @@ async function ensureVaultFolder(vault: Vault, folderPath: string): Promise<void
 export async function removeEmptyVaultFolderIfExists(vault: Vault, path: string): Promise<void> {
   const existing = vault.getAbstractFileByPath(path);
   if (!(existing instanceof TFolder)) return;
-  if (existing.children.length > 0) throw new Error(`Cannot replace non-empty folder ${path} with a file.`);
+  if (existing.children.length > 0) throw new Error(`V4 local target changed: cannot replace non-empty folder ${path} with a file.`);
   await vault.delete(existing, true);
 }
 
