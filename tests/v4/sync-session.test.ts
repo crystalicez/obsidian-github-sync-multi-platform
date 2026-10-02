@@ -3496,6 +3496,56 @@ test("v4 does not trust forged generation progression that hides managed blob ed
 });
 
 
+test("v4 does not trust forged plugin publication that tampers a cached internal shard", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault();
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "local", mode: "plaintext" });
+  vault.files.set("note.md", { bytes: enc("base"), mtime: 1 });
+
+  await new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "forcePush", allowThresholdOverride: false });
+
+  const previousHead = github.ref!.sha;
+  const previousCommit = github.commits.get(previousHead)!;
+  const previousTree = github.trees.get(previousCommit.treeSha)!;
+  const previousHeadBytes = previousTree.get(V4_HEAD_PATH)!;
+  const previousRemoteHead = JSON.parse(dec(previousHeadBytes)) as V4RemoteHead;
+  const bucket = Object.keys(previousRemoteHead.shardHashes)[0];
+  assert.ok(bucket);
+  const shardPath = `${V4_ROOT}/index/${bucket}.json`;
+  assert.ok(previousTree.has(shardPath));
+
+  const forgedJournalId = "forged-cached-shard";
+  const forgedHead: V4RemoteHead = {
+    ...previousRemoteHead,
+    generation: previousRemoteHead.generation + 1,
+    journalId: forgedJournalId,
+    updatedAt: previousRemoteHead.updatedAt + 1,
+    deviceId: "forger",
+  };
+
+  const forgedHeadBlob = await github.createGitBlob(enc(JSON.stringify(forgedHead)));
+  const forgedShardBlob = await github.createGitBlob(enc('{"tampered":true}'));
+  const forgedTree = await github.createGitTree([
+    { path: V4_HEAD_PATH, mode: "100644", type: "blob", sha: forgedHeadBlob },
+    { path: shardPath, mode: "100644", type: "blob", sha: forgedShardBlob },
+  ], previousCommit.treeSha);
+  const forgedCommit = await github.createGitCommit(`obsidian-sync-v4:${forgedJournalId}`, forgedTree, [previousHead]);
+  await github.updateGitRef(forgedCommit, previousHead);
+
+  vault.operations.length = 0;
+  await assert.rejects(
+    () => new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+      .sync({ operation: "normal", allowThresholdOverride: false, changes: [] }),
+    /publication|shard|internal.*V4|V4.*internal|hash|verified/iu,
+  );
+
+  assert.equal(index.remoteCommitSha, previousHead, "forged internal shard must not advance the trusted local baseline");
+  assert.equal(dec(vault.files.get("note.md")!.bytes), "base");
+  assert.deepEqual(vault.operations.filter(operation => /^(?:write|trash|delete|commit-stage):/u.test(operation)), []);
+});
+
+
 test("v4 does not trust forged publication metadata whose changed blob bytes disagree with the current record", async () => {
   const github = new MemoryGitHub();
   const vault = new MemoryVault();
