@@ -2993,6 +2993,51 @@ test("v4 external reconciliation rejects canonical file topology before blob rea
 });
 
 
+test("v4 external reconciliation rejects an in-scope explicit empty Git tree before metadata publication", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault();
+  vault.files.set("note.md", { bytes: enc("local"), mtime: 1 });
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "local", mode: "plaintext" });
+
+  await new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "forcePush", allowThresholdOverride: false });
+
+  const previousHead = github.ref!.sha;
+  const previousTree = github.commits.get(previousHead)!.treeSha;
+  const externalTree = await github.createGitTree([], previousTree);
+  const externalCommit = await github.createGitCommit("external explicit empty tree", externalTree, [previousHead]);
+  await github.updateGitRef(externalCommit, previousHead);
+
+  const originalGetTreeAt = github.getTreeAt.bind(github);
+  github.getTreeAt = async (treeSha: string) => {
+    const tree = await originalGetTreeAt(treeSha);
+    if (treeSha !== externalTree) return tree;
+    return {
+      ...tree,
+      tree: [...tree.tree, {
+        path: "EmptyFolder",
+        mode: "040000",
+        type: "tree" as const,
+        sha: "e".repeat(40),
+        url: "",
+      }],
+    };
+  };
+
+  vault.operations.length = 0;
+  const beforeRef = github.ref!.sha;
+  await assert.rejects(
+    () => new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+      .sync({ operation: "normal", allowThresholdOverride: false, changes: [] }),
+    /external.*empty.*tree|empty.*tree.*external|explicit.*empty.*tree/iu,
+  );
+
+  assert.equal(github.ref!.sha, beforeRef, "unsupported external empty tree must not publish replacement V4 metadata");
+  assert.equal(dec(vault.files.get("note.md")!.bytes), "local");
+  assert.deepEqual(vault.operations.filter(operation => /^(?:write|trash|delete|commit-stage):/u.test(operation)), []);
+});
+
+
 test("v4 external reconciliation fails closed on an in-scope gitlink before local deletion", async () => {
   const github = new MemoryGitHub();
   const vault = new MemoryVault();
