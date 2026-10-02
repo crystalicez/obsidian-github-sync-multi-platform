@@ -2773,6 +2773,54 @@ test("v4 keep-both chunked conflict streams the remote copy instead of whole-buf
 });
 
 
+test("v4 external reconciliation reuses unchanged blobs instead of re-reading every file", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault();
+  vault.files.set("unchanged.md", { bytes: enc("same"), mtime: 1 });
+  vault.files.set("changed.md", { bytes: enc("before"), mtime: 1 });
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "local", mode: "plaintext" });
+
+  await new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "forcePush", allowThresholdOverride: false });
+
+  const previousHead = github.ref!.sha;
+  const previousTree = github.commits.get(previousHead)!.treeSha;
+  const changedBlob = await github.createGitBlob(enc("after"));
+  const externalTree = await github.createGitTree([
+    { path: "changed.md", mode: "100644", type: "blob", sha: changedBlob },
+  ], previousTree);
+  const externalCommit = await github.createGitCommit("external edit", externalTree, [previousHead]);
+  await github.updateGitRef(externalCommit, previousHead);
+
+  github.getTreeAt = async function(treeSha: string) {
+    this.treeReads.push(treeSha);
+    const tree = this.trees.get(treeSha) ?? new Map();
+    return {
+      sha: treeSha,
+      url: "",
+      truncated: false,
+      tree: await Promise.all([...tree.entries()].map(async ([path, bytes]) => ({
+        path,
+        mode: "100644",
+        type: "blob" as const,
+        sha: await sha256Hex(bytes),
+        size: bytes.byteLength,
+        url: "",
+      }))),
+    };
+  };
+  github.readPaths.length = 0;
+  github.readRefs.length = 0;
+
+  await new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "normal", allowThresholdOverride: false, changes: [] });
+
+  assert.equal(github.readPaths.filter(path => path === "unchanged.md").length, 0, "unchanged external blobs must be reused from authenticated V4 metadata");
+  assert.ok(github.readPaths.includes("changed.md"), "changed external blob must still be read");
+  assert.equal(dec(vault.files.get("unchanged.md")!.bytes), "same");
+  assert.equal(dec(vault.files.get("changed.md")!.bytes), "after");
+});
+
 test("v4 rejects a non-canonical external Git path before any local pull mutation", async () => {
   const github = new MemoryGitHub();
   const vault = new MemoryVault();
