@@ -154,6 +154,24 @@ function assertNoCaseInsensitiveCollisions(files: V4LogicalFile[]): void {
   }
 }
 
+function pathsBlockFileTarget(left: string, right: string): boolean {
+  return left === right || left.startsWith(`${right}/`) || right.startsWith(`${left}/`)
+}
+
+function orderRecoveryMutationsForFileTopology(mutations: V4RecoveryLocalMutation[]): V4RecoveryLocalMutation[] {
+  const writePaths = mutations.flatMap(mutation => mutation.kind === "stage-write" ? [mutation.path] : [])
+  if (writePaths.length === 0) return mutations
+  const blockingTrashIds = new Set(mutations.flatMap(mutation => mutation.kind === "trash"
+    && writePaths.some(path => pathsBlockFileTarget(mutation.path, path))
+      ? [mutation.id]
+      : []))
+  if (blockingTrashIds.size === 0) return mutations
+  return [
+    ...mutations.filter(mutation => mutation.kind === "trash" && blockingTrashIds.has(mutation.id)),
+    ...mutations.filter(mutation => mutation.kind !== "trash" || !blockingTrashIds.has(mutation.id)),
+  ]
+}
+
 function recordPaths(record: V4IndexFileRecord): string[] {
   return record.storage === "chunked" ? record.partPaths ?? [] : [record.remotePath]
 }
@@ -1523,12 +1541,13 @@ export class V4SyncSession {
   ): Promise<{ payload: V4RecoveryPayload; pullCompletionIds: Set<string> }> {
     const mutations: V4RecoveryLocalMutation[] = []
     const pullCompletionIds = new Set<string>()
+    const pullMutationGroups: string[][] = []
     const addPull = async (binding: V4PullBinding) => {
       const change = binding.change
       if (change.kind === "delete") {
         const id = `pull:${change.fileId}:delete`
         mutations.push({ id, kind: "trash", path: change.path, precondition: this.pullPrecondition(change) })
-        pullCompletionIds.add(id)
+        pullMutationGroups.push([id])
         return
       }
       if (!binding.stage) {
@@ -1537,14 +1556,14 @@ export class V4SyncSession {
       }
       if (this.ephemeralStages.has(binding.stage.stageId)) throw new V4BoundedIoUnavailableError("bounded-append", change.path)
       const writeId = `pull:${change.fileId}:write`
+      const mutationIds = [writeId]
       mutations.push({ id: writeId, kind: "stage-write", path: change.path, stage: binding.stage, precondition: this.pullPrecondition(change) })
       if (change.kind === "rename" && change.previousPath) {
         const trashId = `pull:${change.fileId}:rename-trash`
         mutations.push({ id: trashId, kind: "trash", path: change.previousPath, precondition: this.pullPrecondition(change, change.previousPath) })
-        pullCompletionIds.add(trashId)
-      } else {
-        pullCompletionIds.add(writeId)
+        mutationIds.push(trashId)
       }
+      pullMutationGroups.push(mutationIds)
     }
     for (const binding of batch.pulls) await addPull(binding)
 
@@ -1583,7 +1602,16 @@ export class V4SyncSession {
         precondition,
       })
     }
-    return { payload: { mutations, completedMutationIds: [] }, pullCompletionIds }
+    const orderedMutations = orderRecoveryMutationsForFileTopology(mutations)
+    const orderById = new Map(orderedMutations.map((mutation, index) => [mutation.id, index]))
+    for (const ids of pullMutationGroups) {
+      let terminalId = ids[0]
+      for (const id of ids.slice(1)) {
+        if ((orderById.get(id) ?? -1) > (orderById.get(terminalId) ?? -1)) terminalId = id
+      }
+      pullCompletionIds.add(terminalId)
+    }
+    return { payload: { mutations: orderedMutations, completedMutationIds: [] }, pullCompletionIds }
   }
 
   private pullPrecondition(change: V4PlannedChange, path = change.path): V4LocalTargetPrecondition {

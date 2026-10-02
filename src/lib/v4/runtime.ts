@@ -3,7 +3,7 @@ import type FastSync from "../../main"
 import { fromBase64Url, randomBytes, sha256Hex, toBase64Url, utf8ToBytes } from "../bytes"
 import { syncConsoleLog } from "../debug"
 import { assertPluginSettingsRuntimeSafe } from "../plugin-settings-validation"
-import { readVaultFileBytes, writeVaultFileBytes, trashVaultFileIfExists } from "../vault"
+import { readVaultFileBytes, removeEmptyVaultFolderIfExists, writeVaultFileBytes, trashVaultFileIfExists } from "../vault"
 import { deriveV4BootstrapRecoveryKey, deriveV4Keyring, type V4Keyring } from "./crypto"
 import {
   createEmptyV4LocalIndex,
@@ -470,6 +470,7 @@ export class V4PluginRuntime {
       commitStage: async ({ stage, path, precondition }) => {
         this.plugin.addIgnoredFile(path)
         try {
+          if (!precondition.exists) await removeEmptyVaultFolderIfExists(this.plugin.app.vault, path)
           await this.platformIo.commitStage(this.stagingStore.pathFor(stage.stageId), path, {
             expectedTarget: precondition,
             expectedStageSize: stage.size,
