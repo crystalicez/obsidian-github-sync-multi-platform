@@ -515,6 +515,13 @@ Audit method:
    - Fix: `5ed8abe` reconciles definitive 409/422 ref-create conflicts by reading the configured ref back and accepting it only through the existing exact-SHA `assertConfiguredBootstrapRef()` proof.
    - A second regression proves a competitor SHA remains a typed `V4RepositoryBootstrapRaceError`; the conflict path therefore becomes idempotent only when the observed ref is exactly the verified bootstrap commit and remains fail-closed otherwise.
 
+74. **HIGH remote-state integrity — a maximum safe remote generation could overflow on the next publication and create an unreadable head.**
+   - `decodeV4RemoteHead()` correctly accepts every non-negative safe-integer generation, including `Number.MAX_SAFE_INTEGER`.
+   - The publication path then used `remote.head.generation + 1` without checking that the successor remained a safe integer. A valid max-generation remote plus any push/Force Push could therefore encode an unsafe generation into the new V4 head after remote object work had begun; the next reader would reject that head as invalid.
+   - RED: `015df6301bbf264930166ef861075895630099d0` proves a max-generation remote could proceed instead of rejecting before blob/tree/commit/ref side effects.
+   - Fix: `b10522ea4e2fd2f942afd3cbca1ea0ed971b4da3` fail-fast guards the publication branch before publication-base resolution or remote uploads and reuses the checked generation for the increment.
+   - Pure pull/no-publication flows still return before this guard, so a vault can still recover/read a max-generation remote; only a new publication is blocked until the protocol generation is reset through an explicit migration/reinitialization path.
+
 ### Audited surfaces with no new confirmed defect so far
 
 - secret migration/persistence: raw token/passphrase are removed before plugin data persistence and use Obsidian SecretStorage;
@@ -560,6 +567,7 @@ RED tests have now been pushed on the audit branch:
 - `909c7442c6b6da3aea6f1d8eda9db87a3d657d29` — direct plaintext external reconciliation must not re-download an unchanged blob when authenticated metadata and immutable baseline/current trees prove the blob object ID is unchanged.
 - `0b097d3a4334096d90bea438d09d111bb28109f4` — a generic/unavailable any-ref HTTP 409 must fail before empty-repository Contents bootstrap can issue any remote mutation.
 - `72529e40a16c1bbe32a02fdeafc936cd4f5050da` — definitive configured-ref create conflicts must reconcile by exact observed SHA instead of failing a benign same-bootstrap race.
+- `015df6301bbf264930166ef861075895630099d0` — a valid maximum safe remote generation must reject before any publication side effects because no safe successor generation exists.
 
 Refined root-cause design:
 - create one canonical shard-record hash function and use it for writer hash creation, remote shard verification, and local persisted-cache verification;
@@ -596,6 +604,7 @@ Root-cause fixes are now on the audit branch:
 - `48d103dc95b2c75feba43deabf40f56c2305804c` — reuse authenticated plaintext records for unchanged external-tree blobs when the local metadata manifest exactly matches the authenticated remote head, avoiding full-vault blob re-downloads for direct external edits.
 - `5d7f4d211d22b73a4383972430ccd6ab4a039c5e` — distinguish explicit empty-repository conflicts from generic/unavailable 409 responses in the any-ref bootstrap preflight so non-empty conflicts fail before Contents mutation.
 - `5ed8abe` — reconcile definitive 409/422 configured-ref create conflicts only when read-back proves the ref points exactly at the verified bootstrap commit; competitor SHA remains a typed bootstrap race.
+- `b10522ea4e2fd2f942afd3cbca1ea0ed971b4da3` — guard max-generation remotes at the publication boundary so no unsafe successor head or remote publication side effects can be created.
 - `6151868d066c050deef9159d3beda389e2ae0ce7`, `d9cde1a72496a8c86df5c85b975d39b92998f873`, `0c301523e774d54bc03191aa7a897da98691ac81`, `06335328777bd5010e928c1951f1cdb581aac2f0` — bounded journal writer/reader contract, safe journal markers, cross-page consistency, descriptor validation before blob reads, and preview-limit precedence.
 - fixture-only followups `4ce0affffce484398db30b0de339af8a2dd1e5cf`, `e5ae96eda6003faa4233346bd5104561e2258923`, `40fc418844c40a52ef4baa39c7318f21a5547782`, `b876e4076084e544ec13ec0ef60c9ef7e0cbcc8a` keep tests protocol-shaped rather than weakening production validation.
 
@@ -606,9 +615,9 @@ Recent crash/memory hardening:
 
 Verification status:
 - The repository was executed through the connected local engineering workspace with Node `v24.11.0` and pnpm `9.12.3`.
-- Final post-fix gates on the current source tree: `pnpm run test:fast` **512/512**, `pnpm run test:recovery` **48/48**, `pnpm run test:resource` **11/11**, and `pnpm run build` PASS.
+- Final post-fix gates on the current source tree: `pnpm run test:fast` **513/513**, `pnpm run test:recovery` **48/48**, `pnpm run test:resource` **11/11**, and `pnpm run build` PASS.
 - Final release checks also pass on regenerated artifacts: `pnpm run validate:metadata` and `pnpm run validate:package`.
-- Focused regressions in the latest audit pass: github-bootstrap-ref-conflict **2/2**, github-empty-ref **3/3**, github-transport **43/43**, sync-session **96/96**, storage-history **4/4**, github-immutable-read-fallback **13/13**, and benchmark **3/3**; the benchmark qualification also reproduced the prior wall-clock flake under full-suite contention before `0762038...`, then later full fast runs passed **503/503**, **504/504**, and now **505/505** after the Contents-identity regression was added. Prior history-service **13/13**, sync-coordinator **25/25**, sync-policy **2/2**, storage-codec **12/12**, opaque-leakage **2/2**, and sync-session **95/95** remain covered by the full fast gate.
+- Focused regressions in the latest audit pass: sync-session **97/97**, github-bootstrap-ref-conflict **2/2**, github-empty-ref **3/3**, github-transport **43/43**, storage-history **4/4**, github-immutable-read-fallback **13/13**, and benchmark **3/3**; the benchmark qualification also reproduced the prior wall-clock flake under full-suite contention before `0762038...`, then later full fast runs passed **503/503**, **504/504**, and now **505/505** after the Contents-identity regression was added. Prior history-service **13/13**, sync-coordinator **25/25**, sync-policy **2/2**, storage-codec **12/12**, opaque-leakage **2/2**, and sync-session **95/95** remain covered by the full fast gate.
 - Real GitHub E2E remains excluded from the default fast tier and was not run in this closure; inspect hosted checks for the exact pushed SHA separately before treating the branch as release-qualified.
 
 ### TDD plan
