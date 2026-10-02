@@ -652,6 +652,14 @@ Audit method:
    - Fix: `77ed62b` computes the bounded set of tree paths proven non-empty from recursive-tree descendants and rejects managed tree entries with no descendants before blob reads, local mutation, or metadata publication. Internal V4 trees, out-of-scope trees, and ordinary non-empty directories keep their prior behavior.
    - Focused sync-session coverage is green at **106/106** after the fix.
 
+94. **HIGH external publication evidence integrity — external Git commits could tamper the internal V4 subtree while preserving the advertised head and then be laundered into a plugin publication.**
+   - Plaintext external reconciliation authenticated the current V4 head, but cached shard reuse could avoid re-reading unchanged advertised shard hashes and the reconciliation path did not prove that the commit's `.obsidian-github-sync-v4` subtree matched the last verified plugin publication.
+   - A direct Git commit could therefore alter an internal shard while leaving `head` unchanged, then reach external reconciliation and replacement metadata publication even though the internal V4 tree itself was no longer the authenticated plugin state.
+   - RED: `d7ee3db` tampers an internal V4 shard while preserving the head and proves the commit reached reconciliation instead of failing closed. Review also exposed a generation-1 marker bypass; `6d85a80` proves a forged generation-1 plugin marker whose parent temporarily lost the V4 head must not be trusted merely because the head is generation 1.
+   - Fix: `c32c886` binds plugin-publication classification to the exact immutable head at each candidate commit, walks at most 256 ancestors to a verified publication, trusts the generation-1 missing-parent-head case only when its SHA is the locally verified `index.remoteCommitSha`, and compares the non-recursive V4 root tree object SHA between that verified baseline and the external tip before any reconciliation.
+   - Test-fixture follow-up `01f04fb` makes retry/runtime Git doubles model non-recursive root-tree reads without weakening production validation.
+   - Focused sync-session coverage is green at **108/108**; publication-race **1/1**, runtime-retry **1/1**, and settings-secrets **55/55** also pass with the stricter evidence path.
+
 ### Audited surfaces with no new confirmed defect so far
 
 - secret migration/persistence: raw token/passphrase are removed before plugin data persistence and use Obsidian SecretStorage;
@@ -717,6 +725,8 @@ RED tests have now been pushed on the audit branch:
 - `045a0aa` — plaintext external Git reconciliation must reject portable/canonical file topology collisions before blob reads, local mutation, or replacement V4 metadata publication.
 - `5ec2801` — successful Git tree responses must reject incompatible object type / Git mode combinations at the decode boundary.
 - `e4f66ff` — plaintext external reconciliation must reject managed explicit empty Git trees before publishing replacement V4 metadata.
+- `d7ee3db` — external reconciliation must reject internal V4 subtree tampering even when the advertised head remains unchanged and cached shards could otherwise be reused.
+- `6d85a80` — generation-1 publication evidence must not trust a forged plugin marker across a parent that lost the V4 head unless the candidate SHA is the locally verified baseline.
 
 Refined root-cause design:
 - create one canonical shard-record hash function and use it for writer hash creation, remote shard verification, and local persisted-cache verification;
@@ -773,6 +783,7 @@ Root-cause fixes are now on the audit branch:
 - `b2f75c7` — reuse the complete path-set validator for external Git preflight, then validate the fully reconciled plaintext record set before installing it into remote state.
 - `27eb8eb` — bind Git tree entry modes to their canonical object types before any downstream consumer trusts the tree evidence.
 - `77ed62b` — reject managed explicit empty Git trees during plaintext external reconciliation using the same bounded descendant proof as Force Push.
+- `c32c886` — verify external publication ancestry against exact immutable V4 head evidence and require the external tip to preserve the verified V4 root tree before reconciliation.
 - `6151868d066c050deef9159d3beda389e2ae0ce7`, `d9cde1a72496a8c86df5c85b975d39b92998f873`, `0c301523e774d54bc03191aa7a897da98691ac81`, `06335328777bd5010e928c1951f1cdb581aac2f0` — bounded journal writer/reader contract, safe journal markers, cross-page consistency, descriptor validation before blob reads, and preview-limit precedence.
 - fixture-only followups `4ce0affffce484398db30b0de339af8a2dd1e5cf`, `e5ae96eda6003faa4233346bd5104561e2258923`, `40fc418844c40a52ef4baa39c7318f21a5547782`, `b876e4076084e544ec13ec0ef60c9ef7e0cbcc8a` keep tests protocol-shaped rather than weakening production validation.
 
@@ -783,10 +794,10 @@ Recent crash/memory hardening:
 
 Verification status:
 - The repository was executed through the connected local engineering workspace with Node `v24.11.0` and pnpm `9.12.3`.
-- Final post-fix gates on the current production source: `pnpm run test:fast` **533/533**, `pnpm run test:recovery` **50/50**, `pnpm run test:resource` **12/12**, and `pnpm run build` PASS.
+- Final post-fix gates on the current production source: `pnpm run test:fast` **535/535**, `pnpm run test:recovery` **50/50**, `pnpm run test:resource` **12/12**, and `pnpm run build` PASS.
 - Final release checks also pass on regenerated artifacts: `pnpm run validate:metadata` and `pnpm run validate:package`.
-- The 533/533 fast run was executed with one unrelated uncommitted test-only helper in `tests/v4/github-transport.test.ts`; it does not modify production source or add/change a test case. Do not describe that run as a pristine exact-Git-tree qualification until that concurrent WIP is committed or removed.
-- Focused regressions in the latest audit pass: settings-secrets **55/55**, sync-session **106/106**, remote-index **20/20**, recovery **50/50**, recovery-boundary **3/3**, recovery-topology-ordering **1/1**, vault-write **3/3**, github-bootstrap-ref-conflict **2/2**, github-empty-ref **3/3**, github-transport **43/43**, github-tree-mode-validation **1/1**, storage-history **4/4**, github-immutable-read-fallback **13/13**, and benchmark **3/3**; the benchmark qualification also reproduced the prior wall-clock flake under full-suite contention before `0762038...`, with later full fast runs remaining green through the current **533/533** audit head. Prior history-service **13/13**, sync-coordinator **25/25**, sync-policy **2/2**, storage-codec **12/12**, and opaque-leakage **2/2** remain covered by the full fast gate.
+- The 535/535 fast run was executed with one unrelated uncommitted test-only helper in `tests/v4/github-transport.test.ts`; it does not modify production source or add/change a test case. Do not describe that run as a pristine exact-Git-tree qualification until that concurrent WIP is committed or removed.
+- Focused regressions in the latest audit pass: settings-secrets **55/55**, sync-session **108/108**, remote-index **20/20**, recovery **50/50**, recovery-boundary **3/3**, recovery-topology-ordering **1/1**, vault-write **3/3**, github-bootstrap-ref-conflict **2/2**, github-empty-ref **3/3**, github-transport **43/43**, github-tree-mode-validation **1/1**, storage-history **4/4**, github-immutable-read-fallback **13/13**, and benchmark **3/3**; publication-race **1/1** and runtime-retry **1/1** also pass with the stricter non-recursive tree evidence model. The benchmark qualification also reproduced the prior wall-clock flake under full-suite contention before `0762038...`, with later full fast runs remaining green through the current **535/535** audit head. Prior history-service **13/13**, sync-coordinator **25/25**, sync-policy **2/2**, storage-codec **12/12**, and opaque-leakage **2/2** remain covered by the full fast gate.
 - Real GitHub E2E remains excluded from the default fast tier and was not run in this closure; inspect hosted checks for the exact pushed SHA separately before treating the branch as release-qualified.
 
 ### TDD plan
