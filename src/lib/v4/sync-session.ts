@@ -1095,7 +1095,21 @@ export class V4SyncSession {
     const includePath = this.input.includePath ?? (() => true)
     const reconciled: V4IndexFileRecord[] = remote.records.filter(record => !includePath(record.path))
     for (const node of tree.tree) {
-      if (node.type !== "blob" || node.path === V4_CONFIG_PATH || node.path.startsWith(`${V4_ROOT}/`)) continue
+      const internal = node.path === V4_CONFIG_PATH || node.path.startsWith(`${V4_ROOT}/`)
+      if (node.type === "commit") {
+        let normalizedPath: string
+        try {
+          normalizedPath = normalizeV4VaultPath(node.path)
+        } catch (error) {
+          throw new Error(`Unsafe external Git path: ${node.path}`, { cause: error })
+        }
+        if (normalizedPath !== node.path) throw new Error(`External Git path is not normalized: ${node.path}`)
+        if (internal || includePath(node.path)) {
+          throw new Error(`External Git gitlink/submodule is unsupported in managed sync scope: ${node.path}`)
+        }
+        continue
+      }
+      if (node.type !== "blob" || internal) continue
       let normalizedPath: string
       try {
         normalizedPath = normalizeV4VaultPath(node.path)
