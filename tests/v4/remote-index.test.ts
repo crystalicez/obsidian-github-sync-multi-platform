@@ -95,6 +95,22 @@ test("v4 complete remote record validation rejects duplicate logical paths", asy
   await assert.rejects(() => assertV4RemoteRecordSet([{ ...base, fileId: "first" }, { ...base, fileId: "second" }], config), /duplicate.*path/iu);
 });
 
+test("v4 complete remote record validation rejects file-prefix topology collisions", async () => {
+  const config: V4RemoteConfig = { formatVersion: 4, mode: "plaintext", repoId: "o/r#main", pathLayout: "plaintext-v1" };
+  const parentPath = "dir";
+  const childPath = "dir/file.md";
+  const parentPathId = await sha256Hex(enc(`path:${parentPath}`));
+  const childPathId = await sha256Hex(enc(`path:${childPath}`));
+  const common = { plaintextSha256: "a".repeat(64), size: 1, mtime: 1, remoteVersion: "v", storage: "single" as const };
+  await assert.rejects(
+    () => assertV4RemoteRecordSet([
+      { ...common, path: parentPath, pathId: parentPathId, fileId: "parent", remotePath: parentPath },
+      { ...common, path: childPath, pathId: childPathId, fileId: "child", remotePath: childPath },
+    ], config),
+    /path.*collision|prefix|ancestor|filesystem|topology/iu,
+  );
+});
+
 test("v4 complete remote record validation rejects pathId not derived from logical path", async () => {
   const config: V4RemoteConfig = { formatVersion: 4, mode: "plaintext", repoId: "o/r#main", pathLayout: "plaintext-v1" };
   const record = { path: "note.md", pathId: "ff".repeat(32), fileId: "file", plaintextSha256: "a".repeat(64), size: 1, mtime: 1, remoteVersion: "v", remotePath: "note.md", storage: "single" as const };
