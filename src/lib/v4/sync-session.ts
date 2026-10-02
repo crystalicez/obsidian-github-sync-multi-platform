@@ -98,6 +98,8 @@ export interface V4SessionSyncResult {
 }
 
 const V4_EXTERNAL_PUBLICATION_ANCESTRY_LIMIT = 256
+const V4_PUBLICATION_TREE_READ_LIMIT = 4_096
+const V4_PUBLICATION_TREE_NODE_LIMIT = 250_000
 
 export class V4ChangeGuardError extends Error {
   constructor(public readonly changePercent: number, public readonly thresholdPercent: number) {
@@ -1145,9 +1147,15 @@ export class V4SyncSession {
     beforeTreeSha: string | undefined,
     afterTreeSha: string | undefined,
     prefix = "",
+    budget = { reads: 0, nodes: 0 },
   ): Promise<Array<{ path: string; before?: GitHubTreeNode; after?: GitHubTreeNode }>> {
     if (beforeTreeSha && afterTreeSha && beforeTreeSha === afterTreeSha) return []
     if (!this.input.github.getTreeAt) throw new Error("Plugin publication verification requires tree support.")
+    const requestedReads = (beforeTreeSha ? 1 : 0) + (afterTreeSha ? 1 : 0)
+    if (budget.reads + requestedReads > V4_PUBLICATION_TREE_READ_LIMIT) {
+      throw new Error("Plugin publication tree verification read limit exceeded.")
+    }
+    budget.reads += requestedReads
     const emptyTree: GitHubTree = { sha: "", url: "", tree: [], truncated: false }
     const [beforeTree, afterTree] = await Promise.all([
       beforeTreeSha ? this.input.github.getTreeAt(beforeTreeSha, false) : Promise.resolve(emptyTree),
@@ -1156,6 +1164,10 @@ export class V4SyncSession {
     throwIfV4Aborted(this.input.signal)
     if (beforeTree.truncated || afterTree.truncated) {
       throw new Error("Plugin publication tree evidence is truncated; sync is unsafe.")
+    }
+    budget.nodes += beforeTree.tree.length + afterTree.tree.length
+    if (budget.nodes > V4_PUBLICATION_TREE_NODE_LIMIT) {
+      throw new Error("Plugin publication tree verification node limit exceeded.")
     }
 
     const beforeByPath = new Map(beforeTree.tree.map(node => [node.path, node]))
@@ -1189,6 +1201,7 @@ export class V4SyncSession {
         beforeIsTree ? before!.sha : undefined,
         afterIsTree ? after!.sha : undefined,
         path,
+        budget,
       )
       if (nested.length > 0) {
         changes.push(...nested)
