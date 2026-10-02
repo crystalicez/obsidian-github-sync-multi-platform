@@ -1,5 +1,5 @@
-import { randomBytes, sha256Hex, toBase64Url, utf8ToBytes } from "../bytes"
-import type { GitHubTree } from "../github-api"
+import { randomBytes, sha256Hex, toBase64Url, toHex, utf8ToBytes } from "../bytes"
+import type { GitHubTree, GitHubTreeNode } from "../github-api"
 import type { GitHubGitCommit } from "../github-git-types"
 import { evaluateV4ChangeGuard } from "./change-guard"
 import { canAttemptV4TextMerge, resolveV4Conflict, type V4ConflictPolicy, type V4ConflictResolution } from "./conflicts"
@@ -22,7 +22,7 @@ import { assertV4LocalTargetPrecondition, createV4LocalIo, type V4LocalIo, type 
 import { trashV4LocalUserFile } from "./local-delete-policy"
 import { bucketForV4PathId, normalizeV4VaultPath } from "./paths"
 import { planV4Sync, type V4LogicalFile, type V4PlannedChange, type V4SyncOperation } from "./planner"
-import { assertV4LogicalPathSetSafe, assertV4RemoteRecordSet, buildV4RemoteMetadata, decodeV4RemoteHead, v4RemoteShardPath } from "./remote-index"
+import { assertV4LogicalPathSetSafe, assertV4RemoteRecordSet, buildV4RemoteMetadata, decodeV4RemoteHead, decodeV4RemoteShard, v4RemoteShardPath } from "./remote-index"
 import { effectiveV4PathLayout, expectedV4PathLayout, V4_CONFIG_PATH, V4_HEAD_PATH, V4_ROOT, type V4RemoteConfig, type V4RemoteHead } from "./protocol-types"
 import { loadV4RemoteConfig, loadV4RemoteState, type V4RemoteState } from "./remote-loader"
 import { V4StorageCodec } from "./storage-codec"
@@ -219,6 +219,14 @@ function recordPaths(record: V4IndexFileRecord): string[] {
   return record.storage === "chunked" ? record.partPaths ?? [] : [record.remotePath]
 }
 
+async function gitBlobSha1(bytes: Uint8Array): Promise<string> {
+  const header = utf8ToBytes(`blob ${bytes.byteLength}\0`)
+  const payload = new Uint8Array(header.byteLength + bytes.byteLength)
+  payload.set(header)
+  payload.set(bytes, header.byteLength)
+  return toHex(await crypto.subtle.digest("SHA-1", payload))
+}
+
 function descriptorFor(record: V4IndexFileRecord) {
   return {
     remotePath: record.remotePath,
@@ -319,6 +327,7 @@ export class V4SyncSession {
   private readonly localIo: V4LocalIo
   private readonly resources: V4ResourceController
   private readonly localReadCache: V4ByteCache
+  private readonly verifiedPublicationChanges = new Map<string, Array<{ path: string; before?: GitHubTreeNode; after?: GitHubTreeNode }>>()
   private readonly ephemeralStages = new Map<string, Uint8Array>()
   private ephemeralStageSequence = 0
 
@@ -352,6 +361,7 @@ export class V4SyncSession {
   }): Promise<V4SessionSyncResult> {
     throwIfV4Aborted(this.input.signal)
     this.localReadCache.clear()
+    this.verifiedPublicationChanges.clear()
     const ownedStages: V4StageRef[] = []
     let preserveStagesForRecovery = false
     try {
@@ -379,9 +389,12 @@ export class V4SyncSession {
     }
     const metadataRemoteRecords = (remote?.records ?? []).map(record => ({ ...record, partPaths: record.partPaths ? [...record.partPaths] : undefined }))
     let externalReconciled = false
+    let verifiedPluginTip: GitHubGitCommit | undefined
     if (remote && this.input.index.remoteCommitSha && remote.commitSha !== this.input.index.remoteCommitSha) {
       const tip = await this.input.github.getGitCommit(remote.commitSha)
-      if (!(await this.isVerifiedPluginPublication(remote, tip))) {
+      if (await this.isVerifiedPluginPublication(remote, tip)) {
+        verifiedPluginTip = tip
+      } else {
         await this.reconcileExternalCommit(remote, tip)
         externalReconciled = true
       }
@@ -414,6 +427,7 @@ export class V4SyncSession {
       .map(copy => [copy.path, copy.fileId] as const))
     const identitySeedByPath = new Map([...causalState?.identityByPath ?? [], ...runCopyIdentityByPath])
     const localFiles = (await this.scanLocalStable(identityBaseRecords, options.changes ?? [], identitySeedByPath, runCopyIdentityByPath)).filter(file => includePath(file.path))
+    if (remote && verifiedPluginTip) await this.assertLocallyMatchedPublicationBodies(remote, verifiedPluginTip, localFiles)
     const syntheticConflictCopyIds = new Set<string>()
     for (const copy of this.input.runState?.conflictCopyStages?.values() ?? []) {
       if (!copy.includeInSync || localFiles.some(file => file.fileId === copy.fileId || file.path === copy.path)) continue
@@ -1127,6 +1141,162 @@ export class V4SyncSession {
     }
   }
 
+  private async changedGitTreeLeaves(
+    beforeTreeSha: string | undefined,
+    afterTreeSha: string | undefined,
+    prefix = "",
+  ): Promise<Array<{ path: string; before?: GitHubTreeNode; after?: GitHubTreeNode }>> {
+    if (beforeTreeSha && afterTreeSha && beforeTreeSha === afterTreeSha) return []
+    if (!this.input.github.getTreeAt) throw new Error("Plugin publication verification requires tree support.")
+    const emptyTree: GitHubTree = { sha: "", url: "", tree: [], truncated: false }
+    const [beforeTree, afterTree] = await Promise.all([
+      beforeTreeSha ? this.input.github.getTreeAt(beforeTreeSha, false) : Promise.resolve(emptyTree),
+      afterTreeSha ? this.input.github.getTreeAt(afterTreeSha, false) : Promise.resolve(emptyTree),
+    ])
+    throwIfV4Aborted(this.input.signal)
+    if (beforeTree.truncated || afterTree.truncated) {
+      throw new Error("Plugin publication tree evidence is truncated; sync is unsafe.")
+    }
+
+    const beforeByPath = new Map(beforeTree.tree.map(node => [node.path, node]))
+    const afterByPath = new Map(afterTree.tree.map(node => [node.path, node]))
+    const names = new Set([...beforeByPath.keys(), ...afterByPath.keys()])
+    const changes: Array<{ path: string; before?: GitHubTreeNode; after?: GitHubTreeNode }> = []
+
+    for (const name of names) {
+      const before = beforeByPath.get(name)
+      const after = afterByPath.get(name)
+      const path = prefix ? `${prefix}/${name}` : name
+      if (!prefix && path === V4_ROOT) continue
+      if (
+        before
+        && after
+        && before.sha === after.sha
+        && before.type === after.type
+        && before.mode === after.mode
+      ) continue
+
+      const beforeIsTree = before?.type === "tree"
+      const afterIsTree = after?.type === "tree"
+      if (!beforeIsTree && !afterIsTree) {
+        changes.push({ path, before, after })
+        continue
+      }
+
+      if (before && !beforeIsTree) changes.push({ path, before })
+      if (after && !afterIsTree) changes.push({ path, after })
+      const nested = await this.changedGitTreeLeaves(
+        beforeIsTree ? before!.sha : undefined,
+        afterIsTree ? after!.sha : undefined,
+        path,
+      )
+      if (nested.length > 0) {
+        changes.push(...nested)
+      } else if (beforeIsTree || afterIsTree) {
+        changes.push({
+          path,
+          before: beforeIsTree ? before : undefined,
+          after: afterIsTree ? after : undefined,
+        })
+      }
+    }
+    return changes
+  }
+
+  private async plaintextRecordAtCommit(
+    path: string,
+    commitSha: string,
+    config: V4RemoteConfig,
+    shardCache?: Map<string, Promise<Record<string, V4IndexFileRecord>>>,
+  ): Promise<V4IndexFileRecord | null> {
+    const pathId = await sha256Hex(utf8ToBytes(`path:${path}`))
+    const bucket = bucketForV4PathId(pathId)
+    let recordsPromise = shardCache?.get(bucket)
+    if (!recordsPromise) {
+      recordsPromise = (async () => {
+        const shardFile = await this.input.github.getFileBytes(v4RemoteShardPath(bucket, config.mode), commitSha)
+        if (!shardFile) return {}
+        const shard = await decodeV4RemoteShard(shardFile.bytes, bucket, config, this.input.keyring)
+        return shard.records
+      })()
+      shardCache?.set(bucket, recordsPromise)
+    }
+    const records = await recordsPromise
+    const record = records[pathId]
+    return record?.path === path ? record : null
+  }
+
+  private async isPluginPublicationTreeConsistent(
+    remote: V4RemoteState,
+    tip: GitHubGitCommit,
+    parentSha: string,
+  ): Promise<boolean> {
+    const parent = await this.input.github.getGitCommit(parentSha)
+    throwIfV4Aborted(this.input.signal)
+    const changes = await this.changedGitTreeLeaves(parent.treeSha, tip.treeSha)
+    if (changes.length === 0) {
+      this.verifiedPublicationChanges.set(tip.sha, changes)
+      return true
+    }
+    if (remote.config.mode === "encrypted") return false
+
+    const previousShardCache = new Map<string, Promise<Record<string, V4IndexFileRecord>>>()
+    const currentByRemotePath = new Map(remote.records.map(record => [record.remotePath, record]))
+    for (const change of changes) {
+      throwIfV4Aborted(this.input.signal)
+      if (change.after) {
+        if (change.after.type !== "blob" || change.after.mode !== "100644") return false
+        const record = currentByRemotePath.get(change.path)
+        if (!record || record.storage !== "single" || record.path !== change.path) return false
+        if (change.after.size !== undefined && change.after.size !== record.size) return false
+        const previous = await this.plaintextRecordAtCommit(change.path, parentSha, remote.config, previousShardCache)
+        if (
+          previous
+          && previous.storage === "single"
+          && previous.remotePath === change.path
+          && previous.plaintextSha256 === record.plaintextSha256
+          && previous.size === record.size
+        ) return false
+        continue
+      }
+
+      if (currentByRemotePath.has(change.path)) return false
+      const previous = await this.plaintextRecordAtCommit(change.path, parentSha, remote.config, previousShardCache)
+      if (!previous || previous.storage !== "single" || previous.remotePath !== change.path) return false
+    }
+    this.verifiedPublicationChanges.set(tip.sha, changes)
+    return true
+  }
+
+  private async assertLocallyMatchedPublicationBodies(
+    remote: V4RemoteState,
+    tip: GitHubGitCommit,
+    localFiles: readonly V4LogicalFile[],
+  ): Promise<void> {
+    if (remote.config.mode !== "plaintext") return
+    const parentSha = tip.parentShas[0]
+    if (!parentSha) return
+    const parent = await this.input.github.getGitCommit(parentSha)
+    throwIfV4Aborted(this.input.signal)
+    const changes = this.verifiedPublicationChanges.get(tip.sha)
+      ?? await this.changedGitTreeLeaves(parent.treeSha, tip.treeSha)
+    const currentByRemotePath = new Map(remote.records.map(record => [record.remotePath, record]))
+    const localByPath = new Map(localFiles.map(file => [file.path, file]))
+    for (const change of changes) {
+      throwIfV4Aborted(this.input.signal)
+      if (!change.after || change.after.type !== "blob" || change.after.mode !== "100644") continue
+      const record = currentByRemotePath.get(change.path)
+      if (!record || record.storage !== "single" || record.path !== change.path) continue
+      const local = localByPath.get(record.path)
+      if (!local || local.hash !== record.plaintextSha256 || local.size !== record.size) continue
+      const bytes = this.localReadCache.get(record.path)
+      if (!bytes || bytes.byteLength !== record.size) continue
+      if (await gitBlobSha1(bytes) !== change.after.sha) {
+        throw new Error(`Plugin publication blob does not match the locally verified record: ${record.path}`)
+      }
+    }
+  }
+
   private async isVerifiedPluginPublication(
     remote: V4RemoteState,
     tip: GitHubGitCommit,
@@ -1155,10 +1325,12 @@ export class V4SyncSession {
     } catch {
       return false
     }
-    return parentHead.mode === tipHead.mode
+    const validProgression = parentHead.mode === tipHead.mode
       && parentHead.epoch === tipHead.epoch
       && tipHead.generation === parentHead.generation + 1
       && tipHead.journalId !== parentHead.journalId
+    if (!validProgression) return false
+    return this.isPluginPublicationTreeConsistent(remote, tip, parentSha)
   }
 
   private async v4RootTreeSha(commit: GitHubGitCommit): Promise<string> {

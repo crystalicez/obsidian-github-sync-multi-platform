@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test from "node:test";
 
 import type { GitHubCreateTreeEntry } from "../../src/lib/github-git-types";
@@ -23,6 +24,11 @@ import { hashV4ShardRecords, toV4RemoteRecord } from "../../src/lib/v4/shard-has
 
 const enc = (value: string) => new TextEncoder().encode(value);
 const dec = (value: Uint8Array) => new TextDecoder().decode(value);
+
+function gitBlobSha1(bytes: Uint8Array): string {
+  const header = Buffer.from(`blob ${bytes.byteLength}\0`, "utf8");
+  return createHash("sha1").update(header).update(bytes).digest("hex");
+}
 
 async function shardHashesForRecords(records: V4IndexFileRecord[]): Promise<Record<string, string>> {
   const byBucket = new Map<string, V4IndexFileRecord[]>();
@@ -132,7 +138,7 @@ class MemoryGitHub {
     this.readPaths.push(path);
     const commit = ref ? this.commits.get(ref) : undefined;
     const value = commit ? this.trees.get(commit.treeSha)?.get(path) : this.files.get(path);
-    return value ? { bytes: new Uint8Array(value), sha: `sha-${path}` } : null;
+    return value ? { bytes: new Uint8Array(value), sha: gitBlobSha1(value) } : null;
   }
   async getGitRefOrNull() { return this.ref; }
   async ensureGitRepositoryInitialized() { return null; }
@@ -158,7 +164,7 @@ class MemoryGitHub {
         path,
         mode: "100644",
         type: "blob" as const,
-        sha: await sha256Hex(bytes),
+        sha: gitBlobSha1(bytes),
         size: bytes.byteLength,
         url: "",
       })));
@@ -183,7 +189,7 @@ class MemoryGitHub {
         path,
         mode: "100644",
         type: "blob" as const,
-        sha: await sha256Hex(bytes),
+        sha: gitBlobSha1(bytes),
         size: bytes.byteLength,
         url: "",
       }))),
@@ -2977,7 +2983,7 @@ test("v4 external reconciliation reuses unchanged blobs instead of re-reading ev
         path,
         mode: "100644",
         type: "blob" as const,
-        sha: await sha256Hex(bytes),
+        sha: gitBlobSha1(bytes),
         size: bytes.byteLength,
         url: "",
       }))),
