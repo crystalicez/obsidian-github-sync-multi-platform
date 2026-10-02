@@ -1110,6 +1110,12 @@ export class V4SyncSession {
     const reconciled: V4IndexFileRecord[] = remote.records.filter(record => !includePath(record.path))
     for (const node of tree.tree) {
       const internal = node.path === V4_CONFIG_PATH || node.path.startsWith(`${V4_ROOT}/`)
+      if (node.type === "tree") {
+        if (!internal && includePath(node.path) && existingByPath.has(node.path)) {
+          throw new Error(`External Git directory replaced tracked file path: ${node.path}`)
+        }
+        continue
+      }
       if (node.type === "commit") {
         let normalizedPath: string
         try {
