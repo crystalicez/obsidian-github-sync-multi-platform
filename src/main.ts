@@ -172,6 +172,7 @@ export default class FastSync extends Plugin {
   }
 
   registerScheduledSync() {
+    if (this.unloaded) return
     if (this.scheduledSyncTimer) window.clearInterval(this.scheduledSyncTimer);
     this.scheduledSyncTimer = null;
     if (!shouldRunScheduledSync(this.settings)) return;
@@ -255,6 +256,7 @@ export default class FastSync extends Plugin {
     try {
       storeV4Secrets(preparedSettings, this.app.secretStorage)
       await this.persistSettingsData(preparedSettings)
+      if (this.unloaded) return
 
       this.settings = preparedSettings
       this.v4Runtime?.credentialsChanged()
