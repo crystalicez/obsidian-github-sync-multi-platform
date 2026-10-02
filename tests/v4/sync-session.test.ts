@@ -19,7 +19,7 @@ import { planV4PackGroups } from "../../src/lib/v4/pack-planner";
 import { waitForCondition } from "../helpers/wait-for";
 import { V4SourceChangedError } from "../../src/lib/v4/object-stream";
 import { createV4StagingStore, type V4StageRef } from "../../src/lib/v4/staging-store";
-import { hashV4ShardRecords } from "../../src/lib/v4/shard-hash";
+import { hashV4ShardRecords, toV4RemoteRecord } from "../../src/lib/v4/shard-hash";
 
 const enc = (value: string) => new TextEncoder().encode(value);
 const dec = (value: Uint8Array) => new TextDecoder().decode(value);
@@ -3460,6 +3460,67 @@ test("v4 does not trust forged generation progression that hides managed blob ed
 
   assert.equal(index.remoteCommitSha, previousHead, "forged publication must not advance the trusted local baseline");
   assert.equal(dec(vault.files.get("note.md")!.bytes), "base");
+  assert.deepEqual(vault.operations.filter(operation => /^(?:write|trash|delete|commit-stage):/u.test(operation)), []);
+});
+
+
+test("v4 does not trust forged publication metadata whose changed blob bytes disagree with the current record", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault();
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "local", mode: "plaintext" });
+  vault.files.set("note.md", { bytes: enc("base"), mtime: 1 });
+
+  await new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "forcePush", allowThresholdOverride: false });
+
+  const previousHead = github.ref!.sha;
+  const previousCommit = github.commits.get(previousHead)!;
+  const previousHeadBytes = github.trees.get(previousCommit.treeSha)!.get(V4_HEAD_PATH)!;
+  const previousRemoteHead = JSON.parse(dec(previousHeadBytes)) as V4RemoteHead;
+  const previousRecord = Object.values(index.shards).flatMap(shard => Object.values(shard.records))[0]!;
+  const forgedJournalId = "forged-body-mismatch";
+  const claimedBytes = enc("claimed metadata");
+  const forgedRecord: V4IndexFileRecord = {
+    ...toV4RemoteRecord(previousRecord),
+    plaintextSha256: await sha256Hex(claimedBytes),
+    size: claimedBytes.byteLength,
+    mtime: previousRecord.mtime + 1,
+    remoteVersion: forgedJournalId,
+  };
+  const forgedHead: V4RemoteHead = {
+    ...previousRemoteHead,
+    generation: previousRemoteHead.generation + 1,
+    journalId: forgedJournalId,
+    shardHashes: await shardHashesForRecords([forgedRecord]),
+    updatedAt: previousRemoteHead.updatedAt + 1,
+    deviceId: "forger",
+  };
+
+  const forgedBlob = await github.createGitBlob(enc("forged external"));
+  const metadataFiles = await buildV4RemoteMetadata({ config: config(), head: forgedHead, records: [forgedRecord] });
+  const metadataEntries = await Promise.all(metadataFiles.map(async file => ({
+    path: file.path,
+    mode: "100644" as const,
+    type: "blob" as const,
+    sha: await github.createGitBlob(file.bytes),
+  })));
+  const forgedTree = await github.createGitTree([
+    { path: "note.md", mode: "100644", type: "blob", sha: forgedBlob },
+    ...metadataEntries,
+  ], previousCommit.treeSha);
+  const forgedCommit = await github.createGitCommit(`obsidian-sync-v4:${forgedJournalId}`, forgedTree, [previousHead]);
+  await github.updateGitRef(forgedCommit, previousHead);
+
+  vault.files.set("note.md", { bytes: claimedBytes, mtime: 2 });
+  vault.operations.length = 0;
+  await assert.rejects(
+    () => new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+      .sync({ operation: "normal", allowThresholdOverride: false, changes: [] }),
+    /publication|blob|hash|record|verified/iu,
+  );
+
+  assert.equal(index.remoteCommitSha, previousHead, "forged publication must not advance the trusted local baseline");
+  assert.equal(dec(vault.files.get("note.md")!.bytes), "claimed metadata");
   assert.deepEqual(vault.operations.filter(operation => /^(?:write|trash|delete|commit-stage):/u.test(operation)), []);
 });
 
