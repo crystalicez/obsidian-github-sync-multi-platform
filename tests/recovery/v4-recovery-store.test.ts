@@ -65,6 +65,41 @@ test("recovery store chooses the highest valid generation even when slot content
   assert.equal(recovered?.header.phase, "remote-verified")
 })
 
+test("recovery store rejects before writing when the current generation has no safe successor", async () => {
+  const adapter = new MemoryAdapter()
+  const store = createV4RecoveryStore({ adapter, root: "recovery", repoId: "owner/repo#main" })
+  const withoutIntegrity = {
+    schemaVersion: 1 as const,
+    generation: Number.MAX_SAFE_INTEGER,
+    runId: "run-max",
+    journalId: undefined,
+    phase: "index-committed" as const,
+    expectedRemoteHead: "head-old" as string | null,
+    candidateCommitSha: undefined,
+    verifiedRemoteHead: "head-new",
+    payloadCiphertext: undefined,
+  }
+  const integrity = await sha256Hex(utf8ToBytes(JSON.stringify({
+    schemaVersion: withoutIntegrity.schemaVersion,
+    generation: withoutIntegrity.generation,
+    runId: withoutIntegrity.runId,
+    journalId: withoutIntegrity.journalId,
+    phase: withoutIntegrity.phase,
+    expectedRemoteHead: withoutIntegrity.expectedRemoteHead,
+    candidateCommitSha: withoutIntegrity.candidateCommitSha,
+    verifiedRemoteHead: withoutIntegrity.verifiedRemoteHead,
+    payloadCiphertext: withoutIntegrity.payloadCiphertext,
+  })))
+  adapter.values.set("recovery/slot-1.json", JSON.stringify({ ...withoutIntegrity, integrity }))
+  const before = new Map(adapter.values)
+
+  await assert.rejects(
+    () => store.save(input("run-next")),
+    /recovery.*generation.*safe|generation.*increment/iu,
+  )
+  assert.deepEqual(adapter.values, before)
+})
+
 test("recovery store raises a typed recovery-required error when all present generations are invalid", async () => {
   const adapter = new MemoryAdapter()
   adapter.values.set("recovery/slot-0.json", "{broken")
