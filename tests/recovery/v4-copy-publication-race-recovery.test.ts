@@ -1,4 +1,5 @@
 import assert from "node:assert/strict"
+import { createHash } from "node:crypto"
 import test from "node:test"
 
 import type { GitHubCreateTreeEntry } from "../../src/lib/github-git-types"
@@ -16,6 +17,11 @@ import { createV4StagingStore, type V4StagingStore } from "../../src/lib/v4/stag
 import { V4SyncSession, type V4SessionVault, type V4SyncRunState } from "../../src/lib/v4/sync-session"
 
 const enc = (value: string) => new TextEncoder().encode(value)
+
+function gitBlobSha1(bytes: Uint8Array) {
+  const header = Buffer.from(`blob ${bytes.byteLength}\0`, "utf8")
+  return createHash("sha1").update(header).update(bytes).digest("hex")
+}
 
 class MemoryRecoveryAdapter implements V4LocalIndexAdapter {
   readonly values = new Map<string, string>()
@@ -72,6 +78,7 @@ class RacingMemoryGitHub {
   files = new Map<string, Uint8Array>()
   blobs = new Map<string, Uint8Array>()
   trees = new Map<string, Map<string, Uint8Array>>()
+  treeViews = new Map<string, Map<string, Uint8Array>>()
   commits = new Map<string, { treeSha: string; parents: string[]; message: string }>()
   beforeNextUpdate?: () => Promise<void>
 
@@ -87,17 +94,46 @@ class RacingMemoryGitHub {
     if (!value) throw new Error(`Missing commit ${sha}`)
     return { sha, treeSha: value.treeSha, parentShas: value.parents, message: value.message }
   }
-  async getTreeAt(treeSha: string) {
-    const tree = this.trees.get(treeSha) ?? new Map<string, Uint8Array>()
+  async getTreeAt(treeSha: string, recursive = true) {
+    const tree = this.trees.get(treeSha) ?? this.treeViews.get(treeSha) ?? new Map<string, Uint8Array>()
+    if (!recursive) {
+      const rootBlobs: Array<{ path: string; bytes: Uint8Array }> = []
+      const rootDirectories = new Map<string, Array<{ path: string; bytes: Uint8Array }>>()
+      for (const [path, bytes] of tree) {
+        const slash = path.indexOf("/")
+        if (slash < 0) {
+          rootBlobs.push({ path, bytes })
+          continue
+        }
+        const directory = path.slice(0, slash)
+        const descendants = rootDirectories.get(directory) ?? []
+        descendants.push({ path: path.slice(slash + 1), bytes })
+        rootDirectories.set(directory, descendants)
+      }
+      const blobEntries = rootBlobs.map(({ path, bytes }) => ({
+        path,
+        mode: "100644",
+        type: "blob" as const,
+        sha: gitBlobSha1(bytes),
+        size: bytes.byteLength,
+        url: "",
+      }))
+      const directoryEntries = [...rootDirectories].map(([path, descendants]) => {
+        const sha = createHash("sha1").update(descendants.map(item => `${item.path}:${gitBlobSha1(item.bytes)}`).sort().join("\n")).digest("hex")
+        this.treeViews.set(sha, new Map(descendants.map(item => [item.path, item.bytes])))
+        return { path, mode: "040000", type: "tree" as const, sha, url: "" }
+      })
+      return { sha: treeSha, url: "", truncated: false, tree: [...blobEntries, ...directoryEntries] }
+    }
     return {
       sha: treeSha,
       url: "",
       truncated: false,
-      tree: [...tree.entries()].map(([path, bytes], index) => ({
+      tree: [...tree.entries()].map(([path, bytes]) => ({
         path,
         mode: "100644",
         type: "blob" as const,
-        sha: `tree-blob-${index}`,
+        sha: gitBlobSha1(bytes),
         size: bytes.byteLength,
         url: "",
       })),
