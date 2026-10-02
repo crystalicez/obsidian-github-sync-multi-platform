@@ -21,7 +21,7 @@ import { assertV4LocalTargetPrecondition, createV4LocalIo, type V4LocalIo, type 
 import { trashV4LocalUserFile } from "./local-delete-policy"
 import { bucketForV4PathId, normalizeV4VaultPath } from "./paths"
 import { planV4Sync, type V4LogicalFile, type V4PlannedChange, type V4SyncOperation } from "./planner"
-import { assertV4RemoteRecordSet, buildV4RemoteMetadata, decodeV4RemoteHead, v4RemoteShardPath } from "./remote-index"
+import { assertV4LogicalPathSetSafe, assertV4RemoteRecordSet, buildV4RemoteMetadata, decodeV4RemoteHead, v4RemoteShardPath } from "./remote-index"
 import { effectiveV4PathLayout, expectedV4PathLayout, V4_CONFIG_PATH, V4_HEAD_PATH, V4_ROOT, type V4RemoteConfig, type V4RemoteHead } from "./protocol-types"
 import { loadV4RemoteConfig, loadV4RemoteState, type V4RemoteState } from "./remote-loader"
 import { V4StorageCodec } from "./storage-codec"
@@ -1148,6 +1148,22 @@ export class V4SyncSession {
       for (const node of baselineTree.tree) if (node.type === "blob") baselineBlobShaByPath.set(node.path, node.sha)
     }
     const includePath = this.input.includePath ?? (() => true)
+    const managedExternalFilePaths: string[] = []
+    for (const node of tree.tree) {
+      const internal = node.path === V4_CONFIG_PATH || node.path.startsWith(`${V4_ROOT}/`)
+      if (node.type !== "blob" || internal || !includePath(node.path)) continue
+      if (node.mode !== "100644" && node.mode !== "100755") continue
+      let normalizedPath: string
+      try {
+        normalizedPath = normalizeV4VaultPath(node.path)
+      } catch (error) {
+        throw new Error(`Unsafe external Git path: ${node.path}`, { cause: error })
+      }
+      if (normalizedPath !== node.path) throw new Error(`External Git path is not normalized: ${node.path}`)
+      managedExternalFilePaths.push(node.path)
+    }
+    assertV4LogicalPathSetSafe(managedExternalFilePaths)
+
     const reconciled: V4IndexFileRecord[] = remote.records.filter(record => !includePath(record.path))
     for (const node of tree.tree) {
       const internal = node.path === V4_CONFIG_PATH || node.path.startsWith(`${V4_ROOT}/`)
@@ -1217,6 +1233,7 @@ export class V4SyncSession {
         storage: "single",
       })
     }
+    await assertV4RemoteRecordSet(reconciled, remote.config)
     remote.records = reconciled
   }
 

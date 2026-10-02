@@ -121,23 +121,50 @@ export function assertV4RemoteShardRecords(shard: V4RemoteShard, bucket: string,
   }
 }
 
-export async function assertV4RemoteRecordSet(records: V4IndexFileRecord[], config: V4RemoteConfig, keyring?: V4Keyring): Promise<void> {
-  const fileIds = new Set<string>()
+export function assertV4LogicalPathSetSafe(paths: Iterable<string>): void {
   const logicalPaths = new Set<string>()
   const canonicalLogicalPaths = new Map<string, string>()
+  for (const path of paths) {
+    if (logicalPaths.has(path)) throw new Error(`Duplicate V4 remote logical path: ${path}`)
+    logicalPaths.add(path)
+    const canonicalPath = path.normalize("NFC").toLowerCase()
+    const canonicalPrevious = canonicalLogicalPaths.get(canonicalPath)
+    if (canonicalPrevious && canonicalPrevious !== path) {
+      throw new Error(`V4 remote logical path canonical collision: ${canonicalPrevious} <-> ${path}`)
+    }
+    canonicalLogicalPaths.set(canonicalPath, path)
+  }
+  for (const path of logicalPaths) {
+    let slash = path.indexOf("/")
+    while (slash > 0) {
+      const ancestor = path.slice(0, slash)
+      if (logicalPaths.has(ancestor)) {
+        throw new Error(`V4 remote logical path topology collision: ${ancestor} is a file ancestor of ${path}`)
+      }
+      slash = path.indexOf("/", slash + 1)
+    }
+  }
+  for (const [canonicalPath, originalPath] of canonicalLogicalPaths) {
+    let slash = canonicalPath.indexOf("/")
+    while (slash > 0) {
+      const canonicalAncestor = canonicalPath.slice(0, slash)
+      const originalAncestor = canonicalLogicalPaths.get(canonicalAncestor)
+      if (originalAncestor) {
+        throw new Error(`V4 remote logical path canonical topology collision: ${originalAncestor} is a file ancestor of ${originalPath}`)
+      }
+      slash = canonicalPath.indexOf("/", slash + 1)
+    }
+  }
+}
+
+export async function assertV4RemoteRecordSet(records: V4IndexFileRecord[], config: V4RemoteConfig, keyring?: V4Keyring): Promise<void> {
+  const fileIds = new Set<string>()
   const packGroups = new Map<string, { files: number; plaintextBytes: number }>()
+  for (const record of records) assertV4RemoteRecordDescriptor(record, config)
+  assertV4LogicalPathSetSafe(records.map(record => record.path))
   for (const record of records) {
-    assertV4RemoteRecordDescriptor(record, config)
     if (fileIds.has(record.fileId)) throw new Error(`Duplicate V4 remote fileId: ${record.fileId}`)
     fileIds.add(record.fileId)
-    if (logicalPaths.has(record.path)) throw new Error(`Duplicate V4 remote logical path: ${record.path}`)
-    logicalPaths.add(record.path)
-    const canonicalPath = record.path.normalize("NFC").toLowerCase()
-    const canonicalPrevious = canonicalLogicalPaths.get(canonicalPath)
-    if (canonicalPrevious && canonicalPrevious !== record.path) {
-      throw new Error(`V4 remote logical path canonical collision: ${canonicalPrevious} <-> ${record.path}`)
-    }
-    canonicalLogicalPaths.set(canonicalPath, record.path)
     if (record.storage === "pack") {
       const packId = record.packId!
       const current = packGroups.get(packId) ?? { files: 0, plaintextBytes: 0 }
@@ -165,27 +192,6 @@ export async function assertV4RemoteRecordSet(records: V4IndexFileRecord[], conf
       continue
     }
     if (record.remotePath !== await opaqueV4PackPath(opaqueKeyring.pathKey, record.packId!)) throw new Error("V4 encrypted pack storage path is inconsistent with packId.")
-  }
-  for (const path of logicalPaths) {
-    let slash = path.indexOf("/")
-    while (slash > 0) {
-      const ancestor = path.slice(0, slash)
-      if (logicalPaths.has(ancestor)) {
-        throw new Error(`V4 remote logical path topology collision: ${ancestor} is a file ancestor of ${path}`)
-      }
-      slash = path.indexOf("/", slash + 1)
-    }
-  }
-  for (const [canonicalPath, originalPath] of canonicalLogicalPaths) {
-    let slash = canonicalPath.indexOf("/")
-    while (slash > 0) {
-      const canonicalAncestor = canonicalPath.slice(0, slash)
-      const originalAncestor = canonicalLogicalPaths.get(canonicalAncestor)
-      if (originalAncestor) {
-        throw new Error(`V4 remote logical path canonical topology collision: ${originalAncestor} is a file ancestor of ${originalPath}`)
-      }
-      slash = canonicalPath.indexOf("/", slash + 1)
-    }
   }
 }
 
