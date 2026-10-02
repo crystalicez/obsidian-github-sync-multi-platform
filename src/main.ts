@@ -53,7 +53,9 @@ export default class FastSync extends Plugin {
   async onload() {
     this.unloaded = false
     await this.loadSettings()
+    if (this.unloaded) return
     if (this.secretsMigrated) await this.persistData()
+    if (this.unloaded) return
 
     this.settingTab = new SettingTab(this.app, this)
     this.addSettingTab(this.settingTab)
