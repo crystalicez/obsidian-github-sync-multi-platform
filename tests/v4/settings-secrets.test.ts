@@ -1223,6 +1223,19 @@ test("runtime and settings-save boundaries validate settings before any sync-gen
 });
 
 
+test("persisted settings are validated before secret migration can mutate SecretStorage", async () => {
+  const mainSource = await readFile("src/main.ts", "utf8");
+  const loadSettingsStart = mainSource.indexOf("async loadSettings()");
+  const mergedSettings = mainSource.indexOf("const merged = Object.assign", loadSettingsStart);
+  const preValidation = mainSource.indexOf("assertPluginSettingsRuntimeSafe(merged)", mergedSettings);
+  const migrateSecrets = mainSource.indexOf("migrateV4Secrets(", mergedSettings);
+
+  assert.ok(loadSettingsStart >= 0 && mergedSettings > loadSettingsStart);
+  assert.ok(preValidation > mergedSettings, "persisted settings must be validated before secret migration side effects");
+  assert.ok(migrateSecrets > preValidation, "secret migration must start only after persisted settings validation succeeds");
+});
+
+
 test("persisted settings are validated after migration before installation or scheduling", async () => {
   const mainSource = await readFile("src/main.ts", "utf8")
   assert.match(
