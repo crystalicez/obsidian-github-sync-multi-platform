@@ -583,6 +583,19 @@ Audit method:
    - Fix: `37f5f55` precomputes directory paths that are proven non-empty from recursive-tree descendants and fails closed only for managed tree entries with no descendants. Ordinary non-empty directories and out-of-scope tree entries keep their prior behavior.
    - Focused `sync-session` coverage is green at **102/102** after the fix.
 
+84. **HIGH external reconciliation safety — a tracked file replaced by a Git directory could be misclassified as a remote deletion.**
+   - Plaintext external reconciliation previously skipped recursive-tree directory entries and later inferred absence for the tracked file path from the lack of a blob entry.
+   - If an external Git commit replaced a tracked file such as `note.md` with a directory at the same path, normal sync could therefore plan local deletion instead of recognizing an unsupported file→directory topology change.
+   - RED: `2d8d32a` replaces a tracked file with a Git tree and proves the sync path could otherwise reach local deletion semantics.
+   - Fix: `1613d05` fails closed when an in-scope recursive-tree directory occupies a path that is already represented by an authenticated tracked file record, before any local mutation or metadata publication.
+
+85. **HIGH recovery/local topology safety — a directory→file pull could write before removing blocking descendants or fail on a surviving empty folder.**
+   - Recovery payloads were emitted in planner order. When remote state replaced a local directory subtree such as `dir/file.md` with a file at `dir`, the stage-write for `dir` could precede the descendant trash and fail because the filesystem topology still blocked the target.
+   - On the real Obsidian vault adapter, deleting the last descendant can still leave an empty `TFolder` object at the target path; desktop staged commit and direct vault writes then observe a directory where the file precondition expects no file.
+   - RED: `3526f19` proves recovery must remove blocking descendants before writing the parent file.
+   - Fix: `ffb71e0` topologically orders blocking trash mutations before stage-writes, derives pull completion from each pull group's actual terminal mutation, removes only empty target folders before file creation/commit, and refuses to replace non-empty folders.
+   - Focused recovery boundary coverage is green at **3/3** and vault-write adapter coverage at **2/2** after the fix.
+
 ### Audited surfaces with no new confirmed defect so far
 
 - secret migration/persistence: raw token/passphrase are removed before plugin data persistence and use Obsidian SecretStorage;
@@ -638,6 +651,8 @@ RED tests have now been pushed on the audit branch:
 - `ff149f941c7dbb1b0111baaa7d126af0bfad3226` — unload during startup settings load must not skip durable cleanup of migrated legacy secrets before startup returns.
 - `0d7bf41` — malformed persisted settings must be rejected before secret migration can mutate SecretStorage.
 - `9bc0fa2` — Force Push must not silently preserve a managed explicit empty Git tree while claiming an exact mirror.
+- `2d8d32a` — external reconciliation must not treat a tracked file replaced by a Git directory as ordinary remote absence/local deletion.
+- `3526f19` — recovery pulls must remove path-topology blockers before writing a file that replaces a directory subtree.
 
 Refined root-cause design:
 - create one canonical shard-record hash function and use it for writer hash creation, remote shard verification, and local persisted-cache verification;
@@ -684,6 +699,8 @@ Root-cause fixes are now on the audit branch:
 - `78ba901` — persist migrated legacy-secret cleanup before the startup unload guard while keeping all runtime/UI/timer creation behind that guard.
 - `2279fa9` — validate merged persisted settings before `migrateV4Secrets()` can write SecretStorage, while retaining post-migration runtime validation.
 - `37f5f55` — fail closed on managed explicit empty Git tree entries during Force Push while preserving non-empty and out-of-scope directories.
+- `1613d05` — fail closed when external plaintext reconciliation replaces an authenticated tracked file path with a Git directory before local deletion can be planned.
+- `ffb71e0` — topologically order recovery trash/write mutations and make the Obsidian vault adapter replace only empty target folders when a file must occupy that path.
 - `6151868d066c050deef9159d3beda389e2ae0ce7`, `d9cde1a72496a8c86df5c85b975d39b92998f873`, `0c301523e774d54bc03191aa7a897da98691ac81`, `06335328777bd5010e928c1951f1cdb581aac2f0` — bounded journal writer/reader contract, safe journal markers, cross-page consistency, descriptor validation before blob reads, and preview-limit precedence.
 - fixture-only followups `4ce0affffce484398db30b0de339af8a2dd1e5cf`, `e5ae96eda6003faa4233346bd5104561e2258923`, `40fc418844c40a52ef4baa39c7318f21a5547782`, `b876e4076084e544ec13ec0ef60c9ef7e0cbcc8a` keep tests protocol-shaped rather than weakening production validation.
 
@@ -694,10 +711,10 @@ Recent crash/memory hardening:
 
 Verification status:
 - The repository was executed through the connected local engineering workspace with Node `v24.11.0` and pnpm `9.12.3`.
-- Final post-fix gates on the current production source: `pnpm run test:fast` **522/522**, `pnpm run test:recovery` **49/49**, `pnpm run test:resource` **11/11**, and `pnpm run build` PASS.
+- Final post-fix gates on the current production source: `pnpm run test:fast` **525/525**, `pnpm run test:recovery` **50/50**, `pnpm run test:resource` **11/11**, and `pnpm run build` PASS.
 - Final release checks also pass on regenerated artifacts: `pnpm run validate:metadata` and `pnpm run validate:package`.
-- The 522/522 fast run was executed with one unrelated uncommitted test-only helper in `tests/v4/github-transport.test.ts`; it does not modify production source or add/change a test case. Do not describe that run as a pristine exact-Git-tree qualification until that concurrent WIP is committed or removed.
-- Focused regressions in the latest audit pass: settings-secrets **55/55**, sync-session **102/102**, recovery **49/49**, github-bootstrap-ref-conflict **2/2**, github-empty-ref **3/3**, github-transport **43/43**, storage-history **4/4**, github-immutable-read-fallback **13/13**, and benchmark **3/3**; the benchmark qualification also reproduced the prior wall-clock flake under full-suite contention before `0762038...`, with later full fast runs remaining green through the current **522/522** audit head. Prior history-service **13/13**, sync-coordinator **25/25**, sync-policy **2/2**, storage-codec **12/12**, and opaque-leakage **2/2** remain covered by the full fast gate.
+- The 525/525 fast run was executed with one unrelated uncommitted test-only helper in `tests/v4/github-transport.test.ts`; it does not modify production source or add/change a test case. Do not describe that run as a pristine exact-Git-tree qualification until that concurrent WIP is committed or removed.
+- Focused regressions in the latest audit pass: settings-secrets **55/55**, sync-session **102/102**, recovery **50/50**, recovery-boundary **3/3**, vault-write **2/2**, github-bootstrap-ref-conflict **2/2**, github-empty-ref **3/3**, github-transport **43/43**, storage-history **4/4**, github-immutable-read-fallback **13/13**, and benchmark **3/3**; the benchmark qualification also reproduced the prior wall-clock flake under full-suite contention before `0762038...`, with later full fast runs remaining green through the current **525/525** audit head. Prior history-service **13/13**, sync-coordinator **25/25**, sync-policy **2/2**, storage-codec **12/12**, and opaque-leakage **2/2** remain covered by the full fast gate.
 - Real GitHub E2E remains excluded from the default fast tier and was not run in this closure; inspect hosted checks for the exact pushed SHA separately before treating the branch as release-qualified.
 
 ### TDD plan
