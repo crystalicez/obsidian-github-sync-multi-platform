@@ -159,6 +159,16 @@ export async function assertV4RemoteRecordSet(records: V4IndexFileRecord[], conf
     }
     if (record.remotePath !== await opaqueV4PackPath(opaqueKeyring.pathKey, record.packId!)) throw new Error("V4 encrypted pack storage path is inconsistent with packId.")
   }
+  for (const path of logicalPaths) {
+    let slash = path.indexOf("/")
+    while (slash > 0) {
+      const ancestor = path.slice(0, slash)
+      if (logicalPaths.has(ancestor)) {
+        throw new Error(`V4 remote logical path topology collision: ${ancestor} is a file ancestor of ${path}`)
+      }
+      slash = path.indexOf("/", slash + 1)
+    }
+  }
 }
 
 export function v4RemoteShardPath(bucket: string, mode: V4RemoteConfig["mode"]): string {
