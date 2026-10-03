@@ -660,6 +660,30 @@ Audit method:
    - Test-fixture follow-up `01f04fb` makes retry/runtime Git doubles model non-recursive root-tree reads without weakening production validation.
    - Focused sync-session coverage is green at **108/108**; publication-race **1/1**, runtime-retry **1/1**, and settings-secrets **55/55** also pass with the stricter evidence path.
 
+95. **HIGH plugin-publication classification integrity — valid marker/head progression could still hide managed user-tree edits.**
+   - After finding 94, plugin markers and head progression were authenticated, but a forged commit could increment generation/journal correctly while changing managed plaintext blobs outside the internal V4 subtree.
+   - RED: `f894dcf` proves a commit with a valid-looking plugin message and head progression could hide a managed blob edit and be treated as a plugin publication instead of external Git state.
+   - Fix: `8e91084` compares parent/tip Git trees through bounded non-recursive tree evidence, rejects encrypted publications with user-tree changes, and for plaintext accepts only changes that correspond exactly to authenticated current/previous records.
+   - Regression follow-up `d9b0fd8` preserves legitimate encrypted publication classification under the stricter tree-change rules.
+
+96. **HIGH publication body integrity — forged metadata could claim one plaintext body while the publication tree pointed at different blob bytes.**
+   - A malicious publication could update authenticated record metadata to a hash/size that matched the current local file while its Git tree referenced a different blob. Local-match shortcuts could otherwise avoid fetching the remote body and let the forged publication advance trust.
+   - RED: `3fc0246` proves the changed Git blob could disagree with the authenticated current record while local bytes matched the forged metadata.
+   - Fix: `8e91084` reuses the verified changed-leaf evidence and, whenever local bytes already match the authenticated record, computes the Git blob object ID of those bytes and requires it to equal the changed tree leaf SHA before the publication can be trusted.
+
+97. **MEDIUM/HIGH publication evidence resource safety — exact tree-change verification could amplify into unbounded non-recursive tree reads.**
+   - The semantic tree verifier initially recursed through every changed directory without an aggregate transport/node budget. A hostile or unusually wide/deep tree could therefore force thousands of Git tree reads before classification failed.
+   - RED: `72b2a79` models 3,000 changed root directories and proves publication verification needs a hard aggregate read bound.
+   - Fix: `1c9b6f5` caps publication-tree verification at **4,096 tree reads** and **250,000 decoded tree nodes**, failing closed on budget exhaustion or truncated evidence.
+   - Fixture follow-ups `e12bc41` and `b7635b7` make conflict/recovery Git doubles model non-recursive tree reads without weakening production validation.
+   - Focused publication-tree resource coverage is green at **1/1**.
+
+98. **HIGH cached-shard publication integrity — a forged plugin publication could tamper a shard that the loader reused from the local cache.**
+   - Remote loading can legitimately reuse a locally cached shard when its cached canonical hash matches the advertised head hash. A forged commit could keep that advertised hash unchanged, alter the actual shard blob in the publication tree, and increment the plugin head; the cached path would then avoid reading the tampered shard body.
+   - RED: `10b4aae` tampers an internal index shard while keeping the new head's shard hash unchanged and proves the forged publication could otherwise advance the trusted baseline.
+   - Fix: `5104c91` identifies buckets satisfied from the local cache and proves their immutable shard blob SHAs are unchanged between the trusted baseline commit and the candidate publication using the same bounded non-recursive tree evidence budget.
+   - Focused sync-session coverage is green at **112/112** after the fix; publication-tree resource coverage remains **1/1**.
+
 ### Audited surfaces with no new confirmed defect so far
 
 - secret migration/persistence: raw token/passphrase are removed before plugin data persistence and use Obsidian SecretStorage;
@@ -727,6 +751,10 @@ RED tests have now been pushed on the audit branch:
 - `e4f66ff` — plaintext external reconciliation must reject managed explicit empty Git trees before publishing replacement V4 metadata.
 - `d7ee3db` — external reconciliation must reject internal V4 subtree tampering even when the advertised head remains unchanged and cached shards could otherwise be reused.
 - `6d85a80` — generation-1 publication evidence must not trust a forged plugin marker across a parent that lost the V4 head unless the candidate SHA is the locally verified baseline.
+- `f894dcf` — plugin publication classification must not trust valid marker/head progression when the candidate hides managed user-tree edits.
+- `3fc0246` — authenticated publication metadata must not be trusted when the changed Git blob body disagrees with the claimed/current record.
+- `72b2a79` — publication tree verification must have aggregate read/node budgets rather than recurse without a resource ceiling.
+- `10b4aae` — cached remote shards must still be bound to immutable publication-tree evidence before a candidate publication advances trust.
 
 Refined root-cause design:
 - create one canonical shard-record hash function and use it for writer hash creation, remote shard verification, and local persisted-cache verification;
@@ -784,6 +812,9 @@ Root-cause fixes are now on the audit branch:
 - `27eb8eb` — bind Git tree entry modes to their canonical object types before any downstream consumer trusts the tree evidence.
 - `77ed62b` — reject managed explicit empty Git trees during plaintext external reconciliation using the same bounded descendant proof as Force Push.
 - `c32c886` — verify external publication ancestry against exact immutable V4 head evidence and require the external tip to preserve the verified V4 root tree before reconciliation.
+- `8e91084` — verify candidate plugin-publication user-tree changes against authenticated parent/current records and bind locally matched plaintext bytes to the changed Git blob object ID.
+- `1c9b6f5` — bound non-recursive publication-tree verification to 4,096 reads and 250,000 decoded nodes, failing closed on truncation or budget exhaustion.
+- `5104c91` — bind cached shard reuse to unchanged immutable shard blob SHAs between the trusted baseline and candidate publication tree.
 - `6151868d066c050deef9159d3beda389e2ae0ce7`, `d9cde1a72496a8c86df5c85b975d39b92998f873`, `0c301523e774d54bc03191aa7a897da98691ac81`, `06335328777bd5010e928c1951f1cdb581aac2f0` — bounded journal writer/reader contract, safe journal markers, cross-page consistency, descriptor validation before blob reads, and preview-limit precedence.
 - fixture-only followups `4ce0affffce484398db30b0de339af8a2dd1e5cf`, `e5ae96eda6003faa4233346bd5104561e2258923`, `40fc418844c40a52ef4baa39c7318f21a5547782`, `b876e4076084e544ec13ec0ef60c9ef7e0cbcc8a` keep tests protocol-shaped rather than weakening production validation.
 - fixture-only follow-up `b7635b7` makes recovery Git fixtures honor immutable ref reads and model non-recursive tree evidence under the publication-tree verifier; production behavior is unchanged.
@@ -795,11 +826,11 @@ Recent crash/memory hardening:
 
 Verification status:
 - The repository was executed through the connected local engineering workspace with Node `v24.11.0` and pnpm `9.12.3`.
-- Final post-fix gates on the current production source: `pnpm run test:fast` **535/535**, `pnpm run test:recovery` **50/50**, `pnpm run test:resource` **12/12**, and `pnpm run build` PASS.
+- Final post-fix gates on the current production source: `pnpm run test:fast` **539/539**, `pnpm run test:recovery` **50/50**, `pnpm run test:resource` **13/13**, and `pnpm run build` PASS.
 - Final release checks also pass on regenerated artifacts: `pnpm run validate:metadata` and `pnpm run validate:package`.
 - After publication-tree hardening exposed stale recovery fixtures, `b7635b7` restored the recovery gate to **50/50** by removing immutable-ref fallback to the mutable tip and supplying protocol-shaped non-recursive tree evidence.
-- The 535/535 fast run was executed with one unrelated uncommitted test-only helper in `tests/v4/github-transport.test.ts`; it does not modify production source or add/change a test case. Do not describe that run as a pristine exact-Git-tree qualification until that concurrent WIP is committed or removed.
-- Focused regressions in the latest audit pass: settings-secrets **55/55**, sync-session **108/108**, remote-index **20/20**, recovery **50/50**, recovery-boundary **3/3**, recovery-topology-ordering **1/1**, vault-write **3/3**, github-bootstrap-ref-conflict **2/2**, github-empty-ref **3/3**, github-transport **43/43**, github-tree-mode-validation **1/1**, storage-history **4/4**, github-immutable-read-fallback **13/13**, and benchmark **3/3**; publication-race **1/1** and runtime-retry **1/1** also pass with the stricter non-recursive tree evidence model. The benchmark qualification also reproduced the prior wall-clock flake under full-suite contention before `0762038...`, with later full fast runs remaining green through the current **535/535** audit head. Prior history-service **13/13**, sync-coordinator **25/25**, sync-policy **2/2**, storage-codec **12/12**, and opaque-leakage **2/2** remain covered by the full fast gate.
+- The 539/539 fast run was executed with one unrelated uncommitted test-only helper in `tests/v4/github-transport.test.ts`; it does not modify production source or add/change a test case. Do not describe that run as a pristine exact-Git-tree qualification until that concurrent WIP is committed or removed.
+- Focused regressions in the latest audit pass: settings-secrets **55/55**, sync-session **112/112**, remote-index **20/20**, recovery **50/50**, recovery-boundary **3/3**, recovery-topology-ordering **1/1**, publication-tree-budget **1/1**, vault-write **3/3**, github-bootstrap-ref-conflict **2/2**, github-empty-ref **3/3**, github-transport **43/43**, github-tree-mode-validation **1/1**, storage-history **4/4**, github-immutable-read-fallback **13/13**, and benchmark **3/3**; publication-race **1/1** and runtime-retry **1/1** also pass with the stricter non-recursive tree evidence model. The benchmark qualification also reproduced the prior wall-clock flake under full-suite contention before `0762038...`, with later full fast runs remaining green through the current **539/539** audit head. Prior history-service **13/13**, sync-coordinator **25/25**, sync-policy **2/2**, storage-codec **12/12**, and opaque-leakage **2/2** remain covered by the full fast gate.
 - Real GitHub E2E remains excluded from the default fast tier and was not run in this closure; inspect hosted checks for the exact pushed SHA separately before treating the branch as release-qualified.
 
 ### TDD plan
