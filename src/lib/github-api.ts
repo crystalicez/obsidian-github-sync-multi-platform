@@ -1,6 +1,7 @@
 import { requestUrl, type RequestUrlParam, type RequestUrlResponse } from "obsidian";
 import { fromBase64, toBase64, toHex, utf8ToBytes } from "./bytes";
 import type { GitHubCreateTreeEntry, GitHubGitCommit, GitHubGitRef } from "./github-git-types";
+import { assertSafeGitHubBranch, assertSafeGitHubRepositoryCoordinates } from "./github-config";
 import { V4RepositoryBootstrapRaceError } from "./v4/bootstrap-race";
 import {
   canRetryV4MutationAfterUnknownOutcome,
@@ -23,6 +24,24 @@ import { readImmutableGitFile } from "./v4/immutable-git-read";
 
 const V4_BOOTSTRAP_PATH = ".obsidian-github-sync-v4/bootstrap";
 const GIT_COMMIT_SHA = /^[0-9a-f]{40}$/iu;
+
+function isEmptyGitRepositoryConflictText(value: string): boolean {
+  const normalized = value.trim().toLowerCase().replace(/[.!]+$/u, "");
+  return normalized === "empty"
+    || normalized.endsWith(" - empty")
+    || normalized.includes("git repository is empty");
+}
+
+function requiredGitHubString(value: unknown, label: string): string {
+  if (typeof value !== "string" || value.length === 0) throw new Error(`Malformed GitHub response: missing ${label}.`);
+  return value;
+}
+
+function requiredGitObjectSha(value: unknown, label: string): string {
+  const sha = requiredGitHubString(value, label);
+  if (!GIT_COMMIT_SHA.test(sha)) throw new Error(`Malformed GitHub response: invalid ${label}.`);
+  return sha;
+}
 
 export interface GitHubConfig {
   owner: string;
@@ -83,6 +102,8 @@ export class GitHubClient {
   private operationSignal?: AbortSignal;
 
   constructor(config: GitHubConfig, options: GitHubClientOptions = {}) {
+    assertSafeGitHubRepositoryCoordinates(config.owner, config.repo);
+    assertSafeGitHubBranch(config.branch);
     this.config = config;
     this.transportPolicy = resolveV4TransportPolicy(options.transportPolicy);
     this.transportMetrics = options.transportMetrics ?? new V4TransportMetrics();
@@ -207,8 +228,10 @@ export class GitHubClient {
       });
 
       if (response.status === 200) {
-        const json = response.json as { content?: string; encoding?: string; sha?: string };
-        const sha = json.sha ?? "";
+        const json = response.json as { content?: string; encoding?: string; sha?: string; path?: unknown; type?: unknown };
+        const sha = requiredGitObjectSha(json.sha, "Contents blob SHA");
+        if (json.type !== "file") throw new Error("Malformed GitHub response: Contents object is not a file.");
+        if (json.path !== path) throw new Error("Malformed GitHub response: Contents path does not match the requested path.");
         if (json.encoding === "base64" && typeof json.content === "string") {
           let decoded: Uint8Array | undefined;
           try {
@@ -217,15 +240,12 @@ export class GitHubClient {
             decoded = undefined;
           }
           if (decoded) {
-            let verified = true;
-            if (/^[0-9a-f]{40}$/u.test(sha)) {
-              try { verified = await this.gitBlobSha1(decoded) === sha; } catch { verified = false; }
-            }
+            let verified = false;
+            try { verified = await this.gitBlobSha1(decoded) === sha; } catch { verified = false; }
             if (verified) return { bytes: decoded, sha };
           }
         }
-        if (sha) return { bytes: await this.getBlob(sha), sha };
-        throw new Error(`GitHub Contents response has no decodable payload for ${path}.`);
+        return { bytes: await this.getBlob(sha), sha };
       }
       if (response.status === 404) {
         return GIT_COMMIT_SHA.test(ref) ? this.getImmutableFileFromTree(path, ref) : null;
@@ -241,15 +261,27 @@ export class GitHubClient {
   }
 
   async getBlob(sha: string): Promise<Uint8Array> {
-    const url = `${this.baseUrl}/git/blobs/${sha}`;
+    const expectedSha = requiredGitObjectSha(sha, "Git blob SHA");
+    const url = `${this.baseUrl}/git/blobs/${expectedSha}`;
     const response = await this.request({
       url,
       method: "GET",
       headers: { ...this.headers, Accept: "application/vnd.github.raw+json" },
       throw: false,
     });
-    if (response.status === 200) return new Uint8Array(response.arrayBuffer);
-    throw new Error("Failed to get blob " + sha + ": HTTP " + response.status + " - " + response.text);
+    if (response.status !== 200) {
+      throw new Error("Failed to get blob " + expectedSha + ": HTTP " + response.status + " - " + response.text);
+    }
+    if (!(response.arrayBuffer instanceof ArrayBuffer)) throw new Error("Malformed GitHub response: missing raw Git blob bytes.");
+    const bytes = new Uint8Array(response.arrayBuffer);
+    let actualSha: string;
+    try {
+      actualSha = await this.gitBlobSha1(bytes);
+    } catch (error) {
+      throw new Error("Unable to verify raw Git blob response.", { cause: error });
+    }
+    if (actualSha !== expectedSha) throw new Error("Git blob SHA verification failed.");
+    return bytes;
   }
 
   async listCommits(options: { page?: number; perPage?: number } = {}): Promise<GitHubCommitSummary[]> {
@@ -262,33 +294,130 @@ export class GitHubClient {
       throw: false,
     });
     if (response.status !== 200) throw this.gitHttpError("Failed to list commits", response.status, response.text);
-    const commits = response.json as Array<{
-      sha?: string;
-      commit?: { message?: string; author?: { name?: string; date?: string } };
-      parents?: Array<{ sha?: string }>;
-    }>;
-    return commits.map(commit => ({
-      sha: commit.sha ?? "",
-      message: commit.commit?.message ?? "",
-      authorName: commit.commit?.author?.name ?? "",
-      authoredAt: commit.commit?.author?.date ?? "",
-      parentShas: (commit.parents ?? []).map(parent => parent.sha ?? "").filter(Boolean),
-    }));
+    if (!Array.isArray(response.json)) throw new Error("Malformed GitHub response: commit list is not an array.");
+    return response.json.map((raw: unknown) => {
+      if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("Malformed GitHub response: commit list entry is invalid.");
+      const commit = raw as {
+        sha?: string;
+        commit?: { message?: string; author?: { name?: string; date?: string } | null };
+        parents?: Array<{ sha?: string }>;
+      };
+      if (!commit.commit || typeof commit.commit !== "object" || typeof commit.commit.message !== "string") {
+        throw new Error("Malformed GitHub response: commit metadata is invalid.");
+      }
+      if (commit.parents !== undefined && !Array.isArray(commit.parents)) throw new Error("Malformed GitHub response: commit parent list is invalid.");
+      return {
+        sha: requiredGitObjectSha(commit.sha, "commit-list SHA"),
+        message: commit.commit.message,
+        authorName: commit.commit.author?.name ?? "",
+        authoredAt: commit.commit.author?.date ?? "",
+        parentShas: (commit.parents ?? []).map(parent => requiredGitObjectSha(parent?.sha, "commit-list parent SHA")),
+      };
+    });
   }
 
   async getTreeAt(treeSha: string, recursive = true): Promise<GitHubTree> {
+    const expectedTreeSha = requiredGitObjectSha(treeSha, "requested tree SHA");
     const response = await this.request({
-      url: `${this.baseUrl}/git/trees/${encodeURIComponent(treeSha)}${recursive ? "?recursive=1" : ""}`,
+      url: `${this.baseUrl}/git/trees/${encodeURIComponent(expectedTreeSha)}${recursive ? "?recursive=1" : ""}`,
       method: "GET",
       headers: this.headers,
       throw: false,
     });
     if (response.status !== 200) throw this.gitHttpError("Failed to get historical tree", response.status, response.text);
-    return response.json as GitHubTree;
+    const raw = response.json as Partial<GitHubTree> | undefined;
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("Malformed GitHub response: tree response is invalid.");
+    if (!Array.isArray(raw.tree)) throw new Error("Malformed GitHub response: tree entries are not an array.");
+    if (typeof raw.truncated !== "boolean") throw new Error("Malformed GitHub response: tree truncated flag is not boolean.");
+    const seenPaths = new Set<string>();
+    const tree = raw.tree.map((entry, index) => {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) throw new Error(`Malformed GitHub response: tree entry ${index} is invalid.`);
+      if (typeof entry.path !== "string" || entry.path.length === 0 || typeof entry.mode !== "string" || typeof entry.sha !== "string" || !GIT_COMMIT_SHA.test(entry.sha)) {
+        throw new Error(`Malformed GitHub response: tree entry ${index} fields are invalid.`);
+      }
+      if (seenPaths.has(entry.path)) throw new Error(`Malformed GitHub response: duplicate tree path ${entry.path}.`);
+      seenPaths.add(entry.path);
+      if (entry.type !== "blob" && entry.type !== "tree" && entry.type !== "commit") {
+        throw new Error(`Malformed GitHub response: tree entry ${index} type is invalid.`);
+      }
+      const modeMatchesType = entry.type === "blob"
+        ? entry.mode === "100644" || entry.mode === "100755" || entry.mode === "120000"
+        : entry.type === "tree"
+          ? entry.mode === "040000"
+          : entry.mode === "160000";
+      if (!modeMatchesType) {
+        throw new Error(`Malformed GitHub response: tree entry ${index} mode does not match its type.`);
+      }
+      if (entry.type === "blob" && (!Number.isSafeInteger(entry.size) || (entry.size ?? -1) < 0)) {
+        throw new Error(`Malformed GitHub response: tree entry ${index} blob size is invalid.`);
+      }
+      if (entry.type !== "blob" && entry.size !== undefined && (!Number.isSafeInteger(entry.size) || entry.size < 0)) {
+        throw new Error(`Malformed GitHub response: tree entry ${index} size is invalid.`);
+      }
+      return { ...entry, url: typeof entry.url === "string" ? entry.url : "" } as GitHubTreeNode;
+    });
+    const responseTreeSha = requiredGitObjectSha(raw.sha, "tree SHA");
+    if (responseTreeSha !== expectedTreeSha) {
+      throw new Error("Malformed GitHub response: tree SHA does not match the requested tree.");
+    }
+    return {
+      sha: responseTreeSha,
+      url: typeof raw.url === "string" ? raw.url : "",
+      tree,
+      truncated: raw.truncated,
+    };
+  }
+
+  private async assertBootstrapTreeShape(rootTreeSha: string, markerSha: string, markerSize: number): Promise<void> {
+    const [directoryName, markerName] = V4_BOOTSTRAP_PATH.split("/");
+    const root = await this.getTreeAt(rootTreeSha, false);
+    if (root.truncated || root.tree.length !== 1) {
+      throw new Error("GitHub bootstrap tree shape contains unexpected root entries.");
+    }
+    const directory = root.tree[0];
+    if (directory.path !== directoryName || directory.type !== "tree" || directory.mode !== "040000") {
+      throw new Error("GitHub bootstrap tree shape does not contain the expected bootstrap directory.");
+    }
+    const nested = await this.getTreeAt(directory.sha, false);
+    if (nested.truncated || nested.tree.length !== 1) {
+      throw new Error("GitHub bootstrap tree shape contains unexpected bootstrap-directory entries.");
+    }
+    const marker = nested.tree[0];
+    if (
+      marker.path !== markerName
+      || marker.type !== "blob"
+      || marker.mode !== "100644"
+      || marker.sha !== markerSha
+      || marker.size !== markerSize
+    ) {
+      throw new Error("GitHub bootstrap tree shape does not match the requested bootstrap marker.");
+    }
+  }
+
+  private configuredRefName(): string {
+    return `refs/heads/${this.config.branch}`;
   }
 
   private branchRefPath(): string {
     return this.config.branch.split("/").map(encodeURIComponent).join("/");
+  }
+
+  private parseConfiguredGitRef(value: unknown, expectedSha?: string): GitHubGitRef {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      throw new Error("Malformed GitHub response: branch ref is invalid.");
+    }
+    const json = value as { ref?: unknown; object?: { sha?: unknown; type?: unknown } };
+    const ref = requiredGitHubString(json.ref, "git ref name");
+    if (ref !== this.configuredRefName()) {
+      throw new Error(`Malformed GitHub response: unexpected branch ref name ${ref}.`);
+    }
+    const sha = requiredGitObjectSha(json.object?.sha, "git ref SHA");
+    if (expectedSha !== undefined && sha !== requiredGitObjectSha(expectedSha, "expected git ref SHA")) {
+      throw new Error("Malformed GitHub response: git ref mutation SHA does not match the requested commit.")
+    }
+    const type = requiredGitHubString(json.object?.type, "git ref object type");
+    if (type !== "commit") throw new Error(`Malformed GitHub response: branch ref points to unsupported object type ${type}.`);
+    return { ref, sha, type };
   }
 
   private gitHttpError(action: string, status: number, text: string): Error & { status?: number } {
@@ -305,14 +434,15 @@ export class GitHubClient {
       throw: false,
     });
     if (response.status !== 200) throw this.gitHttpError("Failed to get git ref", response.status, response.text);
-    const json = response.json as { ref?: string; object?: { sha?: string; type?: string } };
-    return { ref: json.ref ?? `refs/heads/${this.config.branch}`, sha: json.object?.sha ?? "", type: json.object?.type ?? "commit" };
+    return this.parseConfiguredGitRef(response.json);
   }
 
   async getGitRefOrNull(): Promise<GitHubGitRef | null> {
     try { return await this.getGitRef(); }
     catch (error) {
-      if ((error as { status?: number }).status === 404) return null;
+      const status = (error as { status?: number }).status;
+      if (status === 404) return null;
+      if (status === 409 && isEmptyGitRepositoryConflictText((error as Error).message)) return null;
       throw error;
     }
   }
@@ -327,27 +457,45 @@ export class GitHubClient {
     if (response.status === 200 && Array.isArray(response.json)) {
       const first = (response.json as Array<{ ref?: string; object?: { sha?: string; type?: string } }>)[0];
       if (!first) return null;
-      return { ref: first.ref ?? "", sha: first.object?.sha ?? "", type: first.object?.type ?? "commit" };
+      const sha = requiredGitObjectSha(first.object?.sha, "git ref SHA");
+      const type = requiredGitHubString(first.object?.type, "git ref object type");
+      return { ref: requiredGitHubString(first.ref, "git ref name"), sha, type };
     }
-    if (response.status === 404 || response.status === 409) return null;
+    if (response.status === 404) return null;
+    if (response.status === 409 && isEmptyGitRepositoryConflictText(response.text)) return null;
     throw this.gitHttpError("Failed to inspect git refs", response.status, response.text);
+  }
+
+  private assertConfiguredBootstrapRef(ref: GitHubGitRef, commitSha: string): GitHubGitRef {
+    if (ref.sha !== commitSha) {
+      throw new V4RepositoryBootstrapRaceError(
+        ref.sha,
+        new Error("V4 configured bootstrap branch does not point to the verified bootstrap commit."),
+      );
+    }
+    return ref;
   }
 
   private async ensureConfiguredBootstrapRef(commitSha: string): Promise<GitHubGitRef> {
     const configured = await this.getGitRefOrNull();
-    if (configured) return configured;
+    if (configured) return this.assertConfiguredBootstrapRef(configured, commitSha);
     for (let attempt = 1; attempt <= 2; attempt++) {
       try {
         await this.createGitRef(commitSha);
-        return await this.getGitRef();
+        return this.assertConfiguredBootstrapRef(await this.getGitRef(), commitSha);
       } catch (error) {
-        if (!(error instanceof V4GitMutationOutcomeUnknownError)) throw error;
-        const observed = await this.getGitRefOrNull();
-        if (observed) {
-          if (observed.sha !== commitSha) throw new Error("V4 bootstrap branch changed during ambiguous creation.");
-          return observed;
+        if (error instanceof V4GitMutationOutcomeUnknownError) {
+          const observed = await this.getGitRefOrNull();
+          if (observed) return this.assertConfiguredBootstrapRef(observed, commitSha);
+          if (attempt === 2) throw error;
+          continue;
         }
-        if (attempt === 2) throw error;
+        const status = (error as { status?: number }).status;
+        if (status === 409 || status === 422) {
+          const observed = await this.getGitRefOrNull();
+          if (observed) return this.assertConfiguredBootstrapRef(observed, commitSha);
+        }
+        throw error;
       }
     }
     throw new Error("V4 bootstrap branch could not be initialized.");
@@ -358,9 +506,10 @@ export class GitHubClient {
     if (initialRef) return null;
 
     const encodedPath = V4_BOOTSTRAP_PATH.split("/").map(encodeURIComponent).join("/");
+    const bootstrapBytes = utf8ToBytes("obsidian-github-sync-v4\n");
     const bodyValue = {
       message: "obsidian-sync-v4:bootstrap",
-      content: toBase64(utf8ToBytes("obsidian-github-sync-v4\n")),
+      content: toBase64(bootstrapBytes),
     };
     let commitSha: string | undefined;
     for (let attempt = 1; attempt <= 2 && !commitSha; attempt++) {
@@ -372,8 +521,10 @@ export class GitHubClient {
           successStatuses: [200, 201],
           action: "Failed to bootstrap empty repository",
         });
-        commitSha = (response.json as { commit?: { sha?: string } }).commit?.sha;
-        if (!commitSha) throw new Error("GitHub bootstrap response is missing its commit SHA.");
+        commitSha = requiredGitObjectSha(
+          (response.json as { commit?: { sha?: string } }).commit?.sha,
+          "bootstrap commit SHA",
+        );
       } catch (error) {
         if (!(error instanceof V4GitMutationOutcomeUnknownError)) {
           const status = (error as { status?: number }).status;
@@ -386,28 +537,61 @@ export class GitHubClient {
           throw error;
         }
         const observed = await this.inspectAnyGitRef();
-        if (observed?.sha) commitSha = observed.sha;
-        else if (attempt === 2) throw error;
+        if (observed?.sha) throw new V4RepositoryBootstrapRaceError(observed.sha, error);
+        if (attempt === 2) throw error;
       }
     }
     if (!commitSha) throw new Error("GitHub bootstrap response is missing its commit SHA.");
+    const bootstrapCommit = await this.getGitCommit(commitSha);
+    if (bootstrapCommit.parentShas.length > 0) {
+      throw new V4RepositoryBootstrapRaceError(
+        bootstrapCommit.parentShas[0],
+        new Error("Successful GitHub bootstrap commit is not a root commit."),
+      );
+    }
+    if (bootstrapCommit.message !== bodyValue.message) {
+      throw new Error("GitHub bootstrap commit message does not match the requested bootstrap mutation.");
+    }
+    const bootstrapFile = await this.getFileBytes(V4_BOOTSTRAP_PATH, commitSha);
+    const bootstrapContentMatches = !!bootstrapFile
+      && bootstrapFile.bytes.byteLength === bootstrapBytes.byteLength
+      && bootstrapFile.bytes.every((byte, index) => byte === bootstrapBytes[index]);
+    if (!bootstrapContentMatches) {
+      throw new Error("GitHub bootstrap marker content does not match the requested bootstrap mutation.");
+    }
+    await this.assertBootstrapTreeShape(bootstrapCommit.treeSha, bootstrapFile.sha, bootstrapBytes.byteLength);
     return this.ensureConfiguredBootstrapRef(commitSha);
   }
 
   async getGitCommit(sha: string): Promise<GitHubGitCommit> {
+    const expectedCommitSha = requiredGitObjectSha(sha, "requested commit SHA");
     const response = await this.request({
-      url: `${this.baseUrl}/git/commits/${encodeURIComponent(sha)}`,
+      url: `${this.baseUrl}/git/commits/${encodeURIComponent(expectedCommitSha)}`,
       method: "GET",
       headers: this.headers,
       throw: false,
     });
     if (response.status !== 200) throw this.gitHttpError("Failed to get git commit", response.status, response.text);
     const json = response.json as { sha?: string; message?: string; tree?: { sha?: string }; parents?: Array<{ sha?: string }> };
-    return { sha: json.sha ?? sha, treeSha: json.tree?.sha ?? "", parentShas: (json.parents ?? []).map(parent => parent.sha ?? "").filter(Boolean), message: json.message };
+    if (json.parents !== undefined && !Array.isArray(json.parents)) throw new Error("Malformed GitHub response: commit parents are invalid.");
+    const parentShas = (json.parents ?? []).map(parent => requiredGitObjectSha(parent?.sha, "commit parent SHA"));
+    const responseCommitSha = requiredGitObjectSha(json.sha, "commit SHA");
+    if (responseCommitSha !== expectedCommitSha) {
+      throw new Error("Malformed GitHub response: commit SHA does not match the requested commit.");
+    }
+    return {
+      sha: responseCommitSha,
+      treeSha: requiredGitObjectSha(json.tree?.sha, "commit tree SHA"),
+      parentShas,
+      message: json.message,
+    };
   }
 
   async createGitBlob(content: Uint8Array | ArrayBuffer): Promise<string> {
     const bytes = content instanceof Uint8Array ? content : new Uint8Array(content);
+    // Authenticate the deterministic Git object id before entering the base64/HTTP phase so the
+    // temporary SHA-1 payload copy does not overlap the transport transient reservation.
+    const expectedSha = await this.gitBlobSha1(bytes);
     const transientBytes = estimateV4GitBlobTransportBytes(bytes.byteLength);
     return this.transportResources.withTransportBytes(transientBytes, async () => {
       const bodyValue = { content: toBase64(bytes), encoding: "base64" };
@@ -420,7 +604,9 @@ export class GitHubClient {
         reservationAlreadyHeld: true,
         action: "Failed to create git blob",
       });
-      return (response.json as { sha?: string }).sha ?? "";
+      const responseSha = requiredGitObjectSha((response.json as { sha?: string }).sha, "created blob SHA");
+      if (responseSha !== expectedSha) throw new Error("GitHub created blob SHA does not match the uploaded bytes.");
+      return responseSha;
     });
   }
 
@@ -434,7 +620,7 @@ export class GitHubClient {
       successStatuses: [201],
       action: "Failed to create git tree",
     });
-    return (response.json as { sha?: string }).sha ?? "";
+    return requiredGitObjectSha((response.json as { sha?: string }).sha, "created tree SHA");
   }
 
   async createGitCommit(
@@ -443,7 +629,9 @@ export class GitHubClient {
     parents: string[],
     options: { originalCannotBeReachable?: boolean } = {},
   ): Promise<string> {
-    const bodyValue = { message, tree, parents };
+    const expectedTreeSha = requiredGitObjectSha(tree, "created commit tree SHA");
+    const expectedParentShas = parents.map(parent => requiredGitObjectSha(parent, "created commit parent SHA"));
+    const bodyValue = { message, tree: expectedTreeSha, parents: expectedParentShas };
     const response = await this.mutationRequest({
       options: { url: `${this.baseUrl}/git/commits`, method: "POST", headers: this.headers, throw: false },
       bodyValue,
@@ -452,26 +640,37 @@ export class GitHubClient {
       successStatuses: [201],
       action: "Failed to create git commit",
     });
-    return (response.json as { sha?: string }).sha ?? "";
+    const responseSha = requiredGitObjectSha((response.json as { sha?: string }).sha, "created commit SHA");
+    const observed = await this.getGitCommit(responseSha);
+    const parentsMatch = observed.parentShas.length === expectedParentShas.length
+      && observed.parentShas.every((parent, index) => parent === expectedParentShas[index]);
+    if (observed.treeSha !== expectedTreeSha || observed.message !== message || !parentsMatch) {
+      throw new Error("GitHub created commit does not match the requested message, tree, and parents.");
+    }
+    return responseSha;
   }
 
   async updateGitRef(sha: string, _expectedSha?: string): Promise<void> {
-    await this.mutationRequest({
+    const expectedSha = requiredGitObjectSha(sha, "updated git ref SHA");
+    const response = await this.mutationRequest({
       options: { url: `${this.baseUrl}/git/refs/heads/${this.branchRefPath()}`, method: "PATCH", headers: this.headers, throw: false },
-      bodyValue: { sha, force: false },
+      bodyValue: { sha: expectedSha, force: false },
       retryClass: "reachable-ref",
       successStatuses: [200],
       action: "Failed to update git ref",
     });
+    this.parseConfiguredGitRef(response.json, expectedSha);
   }
 
   async createGitRef(sha: string): Promise<void> {
-    await this.mutationRequest({
+    const expectedSha = requiredGitObjectSha(sha, "created git ref SHA");
+    const response = await this.mutationRequest({
       options: { url: `${this.baseUrl}/git/refs`, method: "POST", headers: this.headers, throw: false },
-      bodyValue: { ref: `refs/heads/${this.config.branch}`, sha },
+      bodyValue: { ref: this.configuredRefName(), sha: expectedSha },
       retryClass: "reachable-ref",
       successStatuses: [201],
       action: "Failed to create git ref",
     });
+    this.parseConfiguredGitRef(response.json, expectedSha);
   }
 }

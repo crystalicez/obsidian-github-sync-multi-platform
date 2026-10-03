@@ -20,6 +20,7 @@ interface V4ViewRenderGeneration {
 
 export class V4SyncCenterView extends ItemView {
   private service?: V4HistoryService
+  private serviceGeneration?: number
   private page = 1
   private selected?: V4HistoryCommit
   private objectUrl?: string
@@ -59,6 +60,8 @@ export class V4SyncCenterView extends ItemView {
     this.unsubscribeProgress = undefined
     this.clearProgressElements()
     this.releaseObjectUrl()
+    this.service = undefined
+    this.serviceGeneration = undefined
   }
 
   private beginRender(): V4ViewRenderGeneration | undefined {
@@ -73,7 +76,15 @@ export class V4SyncCenterView extends ItemView {
   }
 
   private async ensureService(): Promise<V4HistoryService> {
-    this.service ??= await this.plugin.v4Runtime.createHistoryService()
+    const generation = this.plugin.v4Runtime.settingsGeneration
+    if (!this.service || this.serviceGeneration !== generation) {
+      const service = await this.plugin.v4Runtime.createHistoryService()
+      if (this.plugin.v4Runtime.settingsGeneration !== generation) {
+        throw new Error("V4 history settings generation changed.")
+      }
+      this.service = service
+      this.serviceGeneration = generation
+    }
     return this.service
   }
 

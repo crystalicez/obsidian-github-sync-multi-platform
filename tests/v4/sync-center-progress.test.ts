@@ -54,6 +54,7 @@ function createSyncCenterPluginFixture(source: FakeProgressSource | { progressSn
   };
   const app = { workspace: { getActiveFile: () => ({ path: "Notes/project.md" }) } };
   const runtime = Object.assign(source, {
+    settingsGeneration: 0,
     async createHistoryService() { return service; },
     async fileIdForPath() { return "file-id"; },
     async manualSync() { return {}; },
@@ -255,4 +256,30 @@ test("stale image preview completion cannot revoke or replace a reopened view UR
     URL.createObjectURL = originalCreate;
     URL.revokeObjectURL = originalRevoke;
   }
+});
+
+
+test("Sync Center recreates its history service when the runtime settings generation changes", async () => {
+  const source = new FakeProgressSource();
+  const plugin = createSyncCenterPluginFixture(source, () => undefined) as any;
+  let creations = 0;
+  plugin.v4Runtime.createHistoryService = async () => ({
+    generation: ++creations,
+    async listCommits() { return { items: [], hasMore: false }; },
+    async getCommitChanges() { return []; },
+    async getFileVersions() { return []; },
+    async previewChange() { throw new Error("unused"); },
+  });
+
+  const view = new V4SyncCenterView(new WorkspaceLeaf(plugin.app), plugin);
+  await view.onOpen();
+  assert.equal(creations, 1);
+  const first = (view as any).service;
+
+  plugin.v4Runtime.settingsGeneration++;
+  const second = await (view as any).ensureService();
+
+  assert.equal(creations, 2);
+  assert.notEqual(second, first);
+  await view.onClose();
 });

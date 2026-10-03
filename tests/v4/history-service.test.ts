@@ -83,7 +83,8 @@ function historyRecordByPath(index: V4LocalIndex, path: string) {
 test("v4 history paginates 50 commits, reads journal changes, and loads preview lazily", async () => {
   let blobReads = 0;
   const journalRefs: Array<string | undefined> = [];
-  const journal = { journalId: "j1", page: 0, pageCount: 1, changes: [{ fileId: "f1", kind: "modify", path: "note.md", after: { remotePath: "note.md", sha: "", size: 5, pathId: "p", plaintextSha256: "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824", remoteVersion: "j1", storage: "single", mtime: 1 } }] };
+  const descriptor = { remotePath: "note.md", sha: "", size: 5, pathId: "p", plaintextSha256: "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824", remoteVersion: "j1", storage: "single" as const, mtime: 1 };
+  const journal = { journalId: "j1", page: 0, pageCount: 1, changes: [{ fileId: "f1", kind: "modify", path: "note.md", before: descriptor, after: descriptor }] };
   const commits = Array.from({ length: 70 }, (_, index) => ({ sha: `c${index}`, message: index === 0 ? "obsidian-sync-v4:j1" : `external ${index}`, authorName: "A", authoredAt: new Date(index).toISOString(), parentShas: [] }));
   const github = {
     async listCommits({ page, perPage }: { page?: number; perPage?: number }) { const start = ((page ?? 1) - 1) * (perPage ?? 50); return commits.slice(start, start + (perPage ?? 50)); },
@@ -209,4 +210,274 @@ test("v4 history refuses an oversized preview before loading blob bytes", async 
     after: { remotePath: "huge.bin", sha: "huge", size: 6 * 1024 * 1024 },
   }), /preview.*limit|too large/iu);
   assert.equal(blobReads, 0);
+});
+
+
+function historyJournalFixture(pageBody: (page: number) => unknown) {
+  let reads = 0;
+  const github = {
+    async listCommits() { return []; },
+    async getFileBytes(_path: string, _ref?: string) {
+      const page = reads++;
+      return { bytes: enc(JSON.stringify(pageBody(page))), sha: `journal-${page}` };
+    },
+    async getGitCommit(sha: string) { return { sha, treeSha: "tree", parentShas: [] }; },
+    async getTreeAt() { return { sha: "tree", url: "", truncated: false, tree: [] }; },
+    async getBlob() { return new Uint8Array(); },
+  };
+  return { github, get reads() { return reads; } };
+}
+
+test("v4 history does not classify path-like forged commit markers as plugin journals", async () => {
+  const github = {
+    async listCommits() {
+      return [{
+        sha: "external",
+        message: "obsidian-sync-v4:../../outside",
+        authorName: "A",
+        authoredAt: new Date(0).toISOString(),
+        parentShas: [],
+      }];
+    },
+    async getFileBytes() { throw new Error("journal read must not happen"); },
+    async getGitCommit(sha: string) { return { sha, treeSha: "tree", parentShas: [] }; },
+    async getTreeAt() { return { sha: "tree", url: "", truncated: false, tree: [] }; },
+    async getBlob() { return new Uint8Array(); },
+  };
+  const service = new V4HistoryService({
+    github,
+    config: { formatVersion: 4, mode: "plaintext", repoId: "o/r#main", pathLayout: "plaintext-v1" },
+  });
+
+  const page = await service.listCommits(1);
+
+  assert.equal(page.items[0].source, "external");
+  assert.equal(page.items[0].journalId, undefined);
+});
+
+test("v4 history rejects an excessive journal page count before issuing fanout reads", async () => {
+  const fixture = historyJournalFixture(page => ({
+    journalId: "123-safe",
+    page,
+    pageCount: page === 0 ? 1_000_000 : 1_000_000,
+    changes: [],
+  }));
+  const service = new V4HistoryService({
+    github: fixture.github,
+    config: { formatVersion: 4, mode: "plaintext", repoId: "o/r#main", pathLayout: "plaintext-v1" },
+  });
+  const commit = {
+    sha: "c1",
+    message: "obsidian-sync-v4:123-safe",
+    authorName: "A",
+    authoredAt: new Date(0).toISOString(),
+    parentShas: [],
+    source: "plugin" as const,
+    journalId: "123-safe",
+  };
+
+  await assert.rejects(() => service.getCommitChanges(commit), /journal.*page.*limit|page count/iu);
+  assert.equal(fixture.reads, 1);
+});
+
+test("v4 file history bounds aggregate journal page fanout across commits", async () => {
+  let reads = 0;
+  const commits = Array.from({ length: 5 }, (_, index) => ({
+    sha: `c-${index}`,
+    message: `obsidian-sync-v4:j-${index}`,
+    authorName: "A",
+    authoredAt: new Date(index).toISOString(),
+    parentShas: [],
+  }));
+  const github = {
+    async listCommits() { return commits; },
+    async getFileBytes(path: string) {
+      reads++;
+      const match = /\/journals\/([^/]+)\/(\d+)\.json$/u.exec(path);
+      assert.ok(match, `unexpected journal path: ${path}`);
+      const journalId = match[1];
+      const page = Number(match[2]);
+      return { bytes: enc(JSON.stringify({ journalId, page, pageCount: 256, changes: [] })), sha: `journal-${reads}` };
+    },
+    async getGitCommit(sha: string) { return { sha, treeSha: "tree", parentShas: [] }; },
+    async getTreeAt() { return { sha: "tree", url: "", truncated: false, tree: [] }; },
+    async getBlob() { return new Uint8Array(); },
+  };
+  const service = new V4HistoryService({
+    github,
+    config: { formatVersion: 4, mode: "plaintext", repoId: "o/r#main", pathLayout: "plaintext-v1" },
+  });
+
+  await assert.rejects(() => service.getFileVersions("target"), /history.*budget|journal.*budget|fanout/iu);
+  assert.ok(reads <= 1025, `aggregate journal reads were not bounded: ${reads}`);
+});
+
+test("v4 history rejects inconsistent journal page counts across one commit", async () => {
+  const fixture = historyJournalFixture(page => ({
+    journalId: "123-safe",
+    page,
+    pageCount: page === 0 ? 2 : 3,
+    changes: [],
+  }));
+  const service = new V4HistoryService({
+    github: fixture.github,
+    config: { formatVersion: 4, mode: "plaintext", repoId: "o/r#main", pathLayout: "plaintext-v1" },
+  });
+  const commit = {
+    sha: "c1",
+    message: "obsidian-sync-v4:123-safe",
+    authorName: "A",
+    authoredAt: new Date(0).toISOString(),
+    parentShas: [],
+    source: "plugin" as const,
+    journalId: "123-safe",
+  };
+
+  await assert.rejects(() => service.getCommitChanges(commit), /page count|journal.*consistent|journal.*mismatch/iu);
+  assert.equal(fixture.reads, 2);
+});
+
+
+test("v4 history rejects a journal page that exceeds the writer change-count contract", async () => {
+  const fixture = historyJournalFixture(page => ({
+    journalId: "123-safe",
+    page,
+    pageCount: 1,
+    changes: Array.from({ length: 501 }, (_, index) => ({
+      fileId: `f-${index}`,
+      kind: "modify",
+      path: `n-${index}.md`,
+    })),
+  }));
+  const service = new V4HistoryService({
+    github: fixture.github,
+    config: { formatVersion: 4, mode: "plaintext", repoId: "o/r#main", pathLayout: "plaintext-v1" },
+  });
+  const commit = {
+    sha: "c1",
+    message: "obsidian-sync-v4:123-safe",
+    authorName: "A",
+    authoredAt: new Date(0).toISOString(),
+    parentShas: [],
+    source: "plugin" as const,
+    journalId: "123-safe",
+  };
+
+  await assert.rejects(() => service.getCommitChanges(commit), /journal.*change.*limit|too many.*changes/iu);
+  assert.equal(fixture.reads, 1);
+});
+
+test("v4 history rejects malformed journal change shapes before exposing them to consumers", async () => {
+  const invalidChanges = [
+    { fileId: "f1", kind: "overwrite", path: "note.md" },
+    { fileId: "f1", kind: "modify", path: "../outside.md" },
+    { fileId: "f1", kind: "create", path: "note.md" },
+  ];
+  for (const invalidChange of invalidChanges) {
+    const fixture = historyJournalFixture(page => ({
+      journalId: "123-safe",
+      page,
+      pageCount: 1,
+      changes: [invalidChange],
+    }));
+    const service = new V4HistoryService({
+      github: fixture.github,
+      config: { formatVersion: 4, mode: "plaintext", repoId: "o/r#main", pathLayout: "plaintext-v1" },
+    });
+    const commit = {
+      sha: "c1",
+      message: "obsidian-sync-v4:123-safe",
+      authorName: "A",
+      authoredAt: new Date(0).toISOString(),
+      parentShas: [],
+      source: "plugin" as const,
+      journalId: "123-safe",
+    };
+
+    await assert.rejects(() => service.getCommitChanges(commit), /journal.*change|history.*change|path|descriptor|shape/iu);
+    assert.equal(fixture.reads, 1);
+  }
+});
+
+
+test("v4 history service rejects completion from an obsolete settings generation", async () => {
+  let current = true;
+  let release!: () => void;
+  const blocker = new Promise<void>(resolve => { release = resolve; });
+  const github = {
+    async listCommits() {
+      await blocker;
+      return [{
+        sha: "old",
+        message: "external",
+        authorName: "A",
+        authoredAt: new Date(0).toISOString(),
+        parentShas: [],
+      }];
+    },
+    async getFileBytes() { return null; },
+    async getGitCommit(sha: string) { return { sha, treeSha: "tree", parentShas: [] }; },
+    async getTreeAt() { return { sha: "tree", url: "", truncated: false, tree: [] }; },
+    async getBlob() { return new Uint8Array(); },
+  };
+  const service = new V4HistoryService({
+    github,
+    config: { formatVersion: 4, mode: "plaintext", repoId: "old/repo#main", pathLayout: "plaintext-v1" },
+    assertCurrent: () => {
+      if (!current) throw new Error("V4 history settings generation changed.");
+    },
+  });
+
+  const pending = service.listCommits(1);
+  current = false;
+  release();
+
+  await assert.rejects(pending, /settings generation changed/iu);
+});
+
+
+test("v4 history previews external Git changes as raw blobs instead of requiring V4 descriptors", async () => {
+  let blobReads = 0;
+  const github = {
+    async listCommits() { return []; },
+    async getFileBytes() { return null; },
+    async getGitCommit(sha: string) { return { sha, treeSha: "tree-current", parentShas: [] }; },
+    async getTreeAt() {
+      return {
+        sha: "tree-current",
+        url: "",
+        truncated: false,
+        tree: [{ path: "external.md", mode: "100644", type: "blob" as const, sha: "blob-external", size: 8, url: "" }],
+      };
+    },
+    async getBlob(sha: string) {
+      blobReads++;
+      assert.equal(sha, "blob-external");
+      return enc("external");
+    },
+  };
+  const service = new V4HistoryService({
+    github,
+    config: { formatVersion: 4, mode: "encrypted", repoId: "o/r#main", pathLayout: "opaque-stable-v1", algorithm: "AES-GCM", kdf: "PBKDF2-SHA-256", kdfParams: { iterations: 10, salt: "c2FsdA" } },
+    keyring: await deriveV4Keyring({ passphrase: "pass", repoId: "o/r#main", salt: enc("salt"), iterations: 10 }),
+  });
+  const commit = {
+    sha: "external-commit",
+    message: "external edit",
+    authorName: "A",
+    authoredAt: "",
+    parentShas: [],
+    source: "external" as const,
+  };
+  const preview = await service.previewChange(commit, {
+    source: "external",
+    fileId: "external.md",
+    kind: "create",
+    path: "external.md",
+    after: { remotePath: "external.md", sha: "blob-external", size: 8 },
+  });
+
+  assert.equal(preview.kind, "text");
+  assert.equal(preview.text, "external");
+  assert.equal(blobReads, 1);
 });

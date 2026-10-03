@@ -1,4 +1,4 @@
-import { TFile, Vault, type FileManager } from "obsidian";
+import { TFile, TFolder, Vault, type FileManager } from "obsidian";
 
 const TRANSIENT_VAULT_READ_ERROR_CODES = new Set(["EBUSY", "EPERM", "EAGAIN", "EMFILE"]);
 const VAULT_READ_RETRY_DELAYS_MS = [25, 50, 100, 200, 400, 800];
@@ -36,13 +36,21 @@ async function ensureVaultFolder(vault: Vault, folderPath: string): Promise<void
   for (const part of folderPath.split("/")) {
     current = current ? `${current}/${part}` : part;
     const existing = vault.getAbstractFileByPath(current);
-    if (existing instanceof TFile) throw new Error(`Cannot create folder ${current}; a file exists at that path.`);
+    if (existing instanceof TFile) throw new Error(`V4 local target changed: cannot create folder ${current}; a file exists at that path.`);
     if (!existing) await vault.createFolder(current);
   }
 }
 
+export async function removeEmptyVaultFolderIfExists(vault: Vault, path: string): Promise<void> {
+  const existing = vault.getAbstractFileByPath(path);
+  if (!(existing instanceof TFolder)) return;
+  if (existing.children.length > 0) throw new Error(`V4 local target changed: cannot replace non-empty folder ${path} with a file.`);
+  await vault.delete(existing, true);
+}
+
 export async function writeVaultFileBytes(vault: Vault, path: string, bytes: Uint8Array): Promise<void> {
   await ensureVaultFolder(vault, path.split("/").slice(0, -1).join("/"));
+  await removeEmptyVaultFolderIfExists(vault, path);
   const existing = vault.getAbstractFileByPath(path);
   const buffer = ((bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength)
     ? bytes.buffer

@@ -1,5 +1,6 @@
-import { randomBytes, sha256Hex, toBase64Url, utf8ToBytes } from "../bytes"
-import type { GitHubTree } from "../github-api"
+import { randomBytes, sha256Hex, toBase64Url, toHex, utf8ToBytes } from "../bytes"
+import type { GitHubTree, GitHubTreeNode } from "../github-api"
+import type { GitHubGitCommit } from "../github-git-types"
 import { evaluateV4ChangeGuard } from "./change-guard"
 import { canAttemptV4TextMerge, resolveV4Conflict, type V4ConflictPolicy, type V4ConflictResolution } from "./conflicts"
 import type { V4Keyring } from "./crypto"
@@ -15,21 +16,22 @@ import {
   type V4GitTreeProgressItem,
 } from "./git-tree-writer"
 import { reconcileV4CandidatePublication } from "./publish-reconciler"
-import { buildV4JournalPages, type V4JournalChange } from "./history-journal"
-import { isV4LocalIndexCacheComplete, type V4IndexFileRecord, type V4LocalIndex } from "./local-index"
+import { assertV4JournalChangeCapacity, buildV4JournalPages, type V4JournalChange } from "./history-journal"
+import { isV4LocalIndexCacheComplete, isV4LocalIndexShardConsistent, type V4IndexFileRecord, type V4LocalIndex } from "./local-index"
 import { assertV4LocalTargetPrecondition, createV4LocalIo, type V4LocalIo, type V4LocalTargetPrecondition, type V4SessionVault } from "./local-io"
 import { trashV4LocalUserFile } from "./local-delete-policy"
-import { bucketForV4PathId } from "./paths"
+import { bucketForV4PathId, normalizeV4VaultPath } from "./paths"
 import { planV4Sync, type V4LogicalFile, type V4PlannedChange, type V4SyncOperation } from "./planner"
-import { assertV4RemoteRecordSet, buildV4RemoteMetadata, v4RemoteShardPath } from "./remote-index"
-import { effectiveV4PathLayout, expectedV4PathLayout, V4_CONFIG_PATH, V4_ROOT, type V4RemoteConfig, type V4RemoteHead } from "./protocol-types"
-import { loadV4RemoteConfig, loadV4RemoteState, remoteV4StateFromLocalIndex, type V4RemoteState } from "./remote-loader"
+import { assertV4LogicalPathSetSafe, assertV4RemoteRecordSet, buildV4RemoteMetadata, decodeV4RemoteHead, decodeV4RemoteShard, v4RemoteShardPath } from "./remote-index"
+import { effectiveV4PathLayout, expectedV4PathLayout, V4_CONFIG_PATH, V4_HEAD_PATH, V4_ROOT, type V4RemoteConfig, type V4RemoteHead } from "./protocol-types"
+import { loadV4RemoteConfig, loadV4RemoteState, type V4RemoteState } from "./remote-loader"
 import { V4StorageCodec } from "./storage-codec"
 import { collectV4ContentSource, createV4WholeBufferContentSource, DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES, type V4ContentHandle, type V4ContentSource } from "./content-source"
 import type { V4StageRef } from "./staging-store"
 import { V4BoundedIoUnavailableError } from "./platform-io"
 import { shouldUseV4Parts, V4_PART_BYTES } from "./large-files"
 import { hashV4StableContentSource, V4SourceChangedError } from "./object-stream"
+import { hashV4ShardRecords } from "./shard-hash"
 import { selectV4WriterPartBytes } from "./part-write-policy"
 import type { V4PullBinding, V4PushBinding, V4ResolvedBatch, V4StagedWriteBinding } from "./resolved-batch"
 import { boundedMap } from "./bounded-map"
@@ -95,6 +97,10 @@ export interface V4SessionSyncResult {
   recoveryRunId?: string
 }
 
+const V4_EXTERNAL_PUBLICATION_ANCESTRY_LIMIT = 256
+const V4_PUBLICATION_TREE_READ_LIMIT = 4_096
+const V4_PUBLICATION_TREE_NODE_LIMIT = 250_000
+
 export class V4ChangeGuardError extends Error {
   constructor(public readonly changePercent: number, public readonly thresholdPercent: number) {
     super(`V4 change guard blocked sync: ${changePercent}% exceeds ${thresholdPercent}%.`)
@@ -111,6 +117,43 @@ export class V4RecoveryReplanRequiredError extends Error {
 
 function recordsFromIndex(index: V4LocalIndex): V4IndexFileRecord[] {
   return Object.values(index.shards).flatMap(shard => Object.values(shard.records)).filter(record => !record.deleted)
+}
+
+function localIndexMatchesRemoteHead(index: V4LocalIndex, head: V4RemoteHead): boolean {
+  if (index.mode !== head.mode || index.epoch !== head.epoch || index.generation !== head.generation) return false
+  const localBuckets = Object.keys(index.shardHashes).sort()
+  const remoteBuckets = Object.keys(head.shardHashes).sort()
+  return localBuckets.length === remoteBuckets.length
+    && localBuckets.every((bucket, position) => bucket === remoteBuckets[position]
+      && index.shardHashes[bucket] === head.shardHashes[bucket])
+}
+
+function sameV4RemoteHead(left: V4RemoteHead, right: V4RemoteHead): boolean {
+  if (
+    left.formatVersion !== right.formatVersion
+    || left.mode !== right.mode
+    || left.epoch !== right.epoch
+    || left.generation !== right.generation
+    || left.journalId !== right.journalId
+    || left.updatedAt !== right.updatedAt
+    || left.deviceId !== right.deviceId
+  ) return false
+  const leftBuckets = Object.keys(left.shardHashes).sort()
+  const rightBuckets = Object.keys(right.shardHashes).sort()
+  return leftBuckets.length === rightBuckets.length
+    && leftBuckets.every((bucket, index) => bucket === rightBuckets[index]
+      && left.shardHashes[bucket] === right.shardHashes[bucket])
+}
+
+function completePackRecords(record: V4IndexFileRecord, records: readonly V4IndexFileRecord[]): V4IndexFileRecord[] | undefined {
+  if (record.storage !== "pack" || !record.packId) return undefined
+  const group = records.filter(candidate => candidate.storage === "pack"
+    && candidate.packId === record.packId
+    && candidate.remotePath === record.remotePath)
+  if (!group.some(candidate => candidate.fileId === record.fileId)) {
+    throw new Error(`V4 packed record is missing from its metadata group: ${record.fileId}`)
+  }
+  return group
 }
 
 function logical(records: V4IndexFileRecord[]): V4LogicalFile[] {
@@ -133,8 +176,57 @@ function assertNoCaseInsensitiveCollisions(files: V4LogicalFile[]): void {
   }
 }
 
+function lowerBound(sorted: string[], target: string): number {
+  let low = 0
+  let high = sorted.length
+  while (low < high) {
+    const mid = low + ((high - low) >> 1)
+    if (sorted[mid] < target) low = mid + 1
+    else high = mid
+  }
+  return low
+}
+
+function trashBlocksAnyWrite(path: string, writePathSet: Set<string>, sortedWritePaths: string[]): boolean {
+  if (writePathSet.has(path)) return true
+
+  let slash = path.lastIndexOf("/")
+  while (slash > 0) {
+    if (writePathSet.has(path.slice(0, slash))) return true
+    slash = path.lastIndexOf("/", slash - 1)
+  }
+
+  const descendantPrefix = `${path}/`
+  const descendantIndex = lowerBound(sortedWritePaths, descendantPrefix)
+  return descendantIndex < sortedWritePaths.length
+    && sortedWritePaths[descendantIndex].startsWith(descendantPrefix)
+}
+
+export function orderRecoveryMutationsForFileTopology(mutations: V4RecoveryLocalMutation[]): V4RecoveryLocalMutation[] {
+  const writePathSet = new Set(mutations.flatMap(mutation => mutation.kind === "stage-write" ? [mutation.path] : []))
+  if (writePathSet.size === 0) return mutations
+  const sortedWritePaths = [...writePathSet].sort()
+  const blockingTrashIds = new Set(mutations.flatMap(mutation => mutation.kind === "trash"
+    && trashBlocksAnyWrite(mutation.path, writePathSet, sortedWritePaths)
+      ? [mutation.id]
+      : []))
+  if (blockingTrashIds.size === 0) return mutations
+  return [
+    ...mutations.filter(mutation => mutation.kind === "trash" && blockingTrashIds.has(mutation.id)),
+    ...mutations.filter(mutation => mutation.kind !== "trash" || !blockingTrashIds.has(mutation.id)),
+  ]
+}
+
 function recordPaths(record: V4IndexFileRecord): string[] {
   return record.storage === "chunked" ? record.partPaths ?? [] : [record.remotePath]
+}
+
+async function gitBlobSha1(bytes: Uint8Array): Promise<string> {
+  const header = utf8ToBytes(`blob ${bytes.byteLength}\0`)
+  const payload = new Uint8Array(header.byteLength + bytes.byteLength)
+  payload.set(header)
+  payload.set(bytes, header.byteLength)
+  return toHex(await crypto.subtle.digest("SHA-1", payload))
 }
 
 function descriptorFor(record: V4IndexFileRecord) {
@@ -237,6 +329,7 @@ export class V4SyncSession {
   private readonly localIo: V4LocalIo
   private readonly resources: V4ResourceController
   private readonly localReadCache: V4ByteCache
+  private readonly verifiedPublicationChanges = new Map<string, Array<{ path: string; before?: GitHubTreeNode; after?: GitHubTreeNode }>>()
   private readonly ephemeralStages = new Map<string, Uint8Array>()
   private ephemeralStageSequence = 0
 
@@ -270,6 +363,7 @@ export class V4SyncSession {
   }): Promise<V4SessionSyncResult> {
     throwIfV4Aborted(this.input.signal)
     this.localReadCache.clear()
+    this.verifiedPublicationChanges.clear()
     const ownedStages: V4StageRef[] = []
     let preserveStagesForRecovery = false
     try {
@@ -278,9 +372,11 @@ export class V4SyncSession {
     const ref = await this.input.github.getGitRefOrNull()
     const remoteConfig = await loadV4RemoteConfig({ github: this.input.github, desiredConfig: this.input.config }, ref?.sha, options.operation)
     const localCacheComplete = isV4LocalIndexCacheComplete(this.input.index)
-    const remote = ref && remoteConfig && remoteConfig.mode !== "encrypted" && localCacheComplete && ref.sha === this.input.index.remoteCommitSha && this.input.index.pathLayout === effectiveV4PathLayout(remoteConfig)
-      ? remoteV4StateFromLocalIndex(this.input.index, ref.sha, remoteConfig)
-      : await loadV4RemoteState({ github: this.input.github, index: this.input.index, keyring: this.input.keyring }, ref?.sha, remoteConfig)
+    const remote = await loadV4RemoteState(
+      { github: this.input.github, index: this.input.index, keyring: this.input.keyring },
+      ref?.sha,
+      remoteConfig,
+    )
     if (!remote && options.operation !== "forcePush") {
       throw new Error("Remote is not V4. Force Push is required before sync or Force Pull.")
     }
@@ -295,11 +391,13 @@ export class V4SyncSession {
     }
     const metadataRemoteRecords = (remote?.records ?? []).map(record => ({ ...record, partPaths: record.partPaths ? [...record.partPaths] : undefined }))
     let externalReconciled = false
+    let verifiedPluginTip: GitHubGitCommit | undefined
     if (remote && this.input.index.remoteCommitSha && remote.commitSha !== this.input.index.remoteCommitSha) {
       const tip = await this.input.github.getGitCommit(remote.commitSha)
-      const pluginMessage = `obsidian-sync-v4:${remote.head.journalId}`
-      if (tip.message?.split("\n", 1)[0] !== pluginMessage) {
-        await this.reconcileExternalCommit(remote, tip.treeSha)
+      if (await this.isVerifiedPluginPublication(remote, tip)) {
+        verifiedPluginTip = tip
+      } else {
+        await this.reconcileExternalCommit(remote, tip)
         externalReconciled = true
       }
     }
@@ -312,7 +410,10 @@ export class V4SyncSession {
       throw new Error("Legacy V4 migration cannot continue while encrypted records are excluded by sync scope. Include all legacy paths and retry Force Push.")
     }
     const remoteRecords = allRemoteRecords.filter(record => includePath(record.path))
-    const hasKnownBase = localCacheComplete && !!this.input.index.remoteCommitSha
+    const localBaseMatchesCurrentCommit = !remote
+      || remote.commitSha !== this.input.index.remoteCommitSha
+      || localIndexMatchesRemoteHead(this.input.index, remote.head)
+    const hasKnownBase = localCacheComplete && !!this.input.index.remoteCommitSha && localBaseMatchesCurrentCommit
     const causalState = isLayoutMigration || !hasKnownBase
       ? causalIdentityState(remoteRecords, options.changes ?? [])
       : undefined
@@ -328,6 +429,7 @@ export class V4SyncSession {
       .map(copy => [copy.path, copy.fileId] as const))
     const identitySeedByPath = new Map([...causalState?.identityByPath ?? [], ...runCopyIdentityByPath])
     const localFiles = (await this.scanLocalStable(identityBaseRecords, options.changes ?? [], identitySeedByPath, runCopyIdentityByPath)).filter(file => includePath(file.path))
+    if (remote && verifiedPluginTip) await this.assertLocallyMatchedPublicationBodies(remote, verifiedPluginTip, localFiles)
     const syntheticConflictCopyIds = new Set<string>()
     for (const copy of this.input.runState?.conflictCopyStages?.values() ?? []) {
       if (!copy.includeInSync || localFiles.some(file => file.fileId === copy.fileId || file.path === copy.path)) continue
@@ -397,7 +499,7 @@ export class V4SyncSession {
     const remoteCommitSha = remote?.commitSha
     const batch: V4ResolvedBatch = {
       runId: this.input.runState?.runId ?? toBase64Url(randomBytes(12)),
-      pulls: plan.pulls.map(change => this.bindPull(change, recordsById, remoteCommitSha)),
+      pulls: plan.pulls.map(change => this.bindPull(change, recordsById, allRemoteRecords, remoteCommitSha)),
       pushes: plan.pushes.map(change => this.bindPush(change, recordsById)),
       stagedWrites: [],
     }
@@ -418,18 +520,26 @@ export class V4SyncSession {
       const baseRecord = baseRecordsById.get(conflict.fileId)
       let remoteBytes: Uint8Array | undefined
       let resolution: V4ConflictResolution
-      const canMergeFromMetadata = this.input.conflictPolicy === "merge"
+      const conflictPolicy: V4ConflictPolicy = externalReconciled && this.input.conflictPolicy === "newer"
+        ? "copy"
+        : this.input.conflictPolicy
+      const basePackMetadataComplete = !baseRecord
+        || baseRecord.storage !== "pack"
+        || hasKnownBase
+        || remoteRecord?.remoteVersion === baseRecord.remoteVersion
+      const canMergeFromMetadata = conflictPolicy === "merge"
         && !!conflict.local && !!conflict.remote && !!baseRecord && !!remoteRecord
+        && basePackMetadataComplete
         && (remoteRecord.remoteVersion === baseRecord.remoteVersion || !!baseCommitSha)
         && canAttemptV4TextMerge(conflict.path, [baseRecord.size, conflict.local.size, conflict.remote.size])
       if (canMergeFromMetadata) {
         const localBytes = await this.readLocal(conflict.local!.path)
-        remoteBytes = await this.readRecord(remoteRecord!, remoteCommitSha)
+        remoteBytes = await this.readRecord(remoteRecord!, remoteCommitSha, completePackRecords(remoteRecord!, allRemoteRecords))
         const baseBytes = remoteRecord!.remoteVersion === baseRecord!.remoteVersion
           ? remoteBytes
-          : await this.readRecord(baseRecord!, baseCommitSha)
+          : await this.readRecord(baseRecord!, baseCommitSha, completePackRecords(baseRecord!, baseRecords))
         resolution = resolveV4Conflict({
-          policy: this.input.conflictPolicy,
+          policy: conflictPolicy,
           path: conflict.path,
           localMtime: conflict.local?.mtime ?? 0,
           remoteMtime: conflict.remote?.mtime ?? 0,
@@ -439,7 +549,7 @@ export class V4SyncSession {
         })
       } else {
         resolution = resolveV4Conflict({
-          policy: this.input.conflictPolicy,
+          policy: conflictPolicy,
           path: conflict.path,
           localMtime: conflict.local?.mtime ?? 0,
           remoteMtime: conflict.remote?.mtime ?? 0,
@@ -448,6 +558,7 @@ export class V4SyncSession {
       if (resolution.action === "ask") {
         if (!this.input.askConflict) throw new Error(`Conflict requires user decision: ${conflict.path}`)
         resolution = await this.input.askConflict({ path: conflict.path, localMtime: conflict.local?.mtime ?? 0, remoteMtime: conflict.remote?.mtime ?? 0 })
+        throwIfV4Aborted(this.input.signal)
         if (resolution.action === "ask") throw new Error(`Conflict cancelled: ${conflict.path}`)
       }
       if (remoteBytes && remoteRecord) prefetchedRemoteBodies.set(remoteRecord.fileId, remoteBytes)
@@ -456,7 +567,7 @@ export class V4SyncSession {
         const pull = this.changeBetween(conflict.local, conflict.remote)
         if (pull) {
           pullTotal++
-          batch.pulls.push(this.bindPull(pull, recordsById, remoteCommitSha))
+          batch.pulls.push(this.bindPull(pull, recordsById, allRemoteRecords, remoteCommitSha))
         }
       } else if (resolution.action === "merged" && conflict.local && resolution.mergedBytes) {
         const mergeMtime = this.now()
@@ -502,7 +613,13 @@ export class V4SyncSession {
             },
           }
           pullTotal++
-          const pullBinding: V4PullBinding = { change: copyChange, remoteRecord, remoteCommitSha, stage: carriedStage }
+          const pullBinding: V4PullBinding = {
+            change: copyChange,
+            remoteRecord,
+            remoteCommitSha,
+            packRecords: completePackRecords(remoteRecord, allRemoteRecords),
+            stage: carriedStage,
+          }
           batch.pulls.push(pullBinding)
           let pushBinding: V4PushBinding | undefined
           if (reservedCopy.includeInSync && !batch.pushes.some(binding => binding.change.fileId === copyFileId)) {
@@ -529,10 +646,24 @@ export class V4SyncSession {
       }
     }
 
+    const journalChangeCount = (externalReconciled ? plan.pulls.length : 0) + batch.pushes.length
+    assertV4JournalChangeCapacity(journalChangeCount)
+
+    await this.stagePackedPullGroups(batch.pulls, ownedStages, prefetchedRemoteBodies)
+
     for (const stagedCopy of stagedCopyPulls) {
       const remoteRecord = stagedCopy.pull.remoteRecord!
-      const bytes = prefetchedRemoteBodies.get(remoteRecord.fileId) ?? await this.readRecord(remoteRecord, stagedCopy.pull.remoteCommitSha)
-      const stage = await this.stageBytes(bytes, remoteRecord.mtime, stagedCopy.pull.change.before?.size ?? 0, ownedStages)
+      const prefetched = prefetchedRemoteBodies.get(remoteRecord.fileId)
+      const stage = stagedCopy.pull.stage ?? (prefetched
+        ? await this.stageBytes(prefetched, remoteRecord.mtime, stagedCopy.pull.change.before?.size ?? 0, ownedStages)
+        : remoteRecord.storage === "chunked" || remoteRecord.size > DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES
+          ? await this.stageRemotePull(stagedCopy.pull, ownedStages)
+          : await this.stageBytes(
+              await this.readRecord(remoteRecord, stagedCopy.pull.remoteCommitSha, stagedCopy.pull.packRecords),
+              remoteRecord.mtime,
+              stagedCopy.pull.change.before?.size ?? 0,
+              ownedStages,
+            ))
       stagedCopy.pull.stage = stage
       if (stagedCopy.push) stagedCopy.push.source = this.stageHandle(stage)
       if (this.input.runState) {
@@ -548,12 +679,27 @@ export class V4SyncSession {
       recoveryPlan = await this.prepareRecoveryLocalPayload(batch, ownedStages, localById)
       pulledFiles = batch.pulls.length
     } else {
+      const consumedPullStageIds = new Set<string>()
       for (const binding of batch.pulls) {
+        const appliedStage = binding.stage
         await this.applyPullBinding(binding, ownedStages, () => {
           pullCompleted++
           this.report({ currentPath: binding.change.path, currentDirection: "pull", pull: directional(pullCompleted, pullTotal) })
         })
+        if (appliedStage && appliedStage.size > DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES) {
+          consumedPullStageIds.add(appliedStage.stageId)
+        }
         pulledFiles++
+      }
+      for (const binding of batch.pushes) {
+        if (binding.source?.kind !== "stage" || !consumedPullStageIds.has(binding.source.stageId) || !binding.change.after) continue
+        binding.source = {
+          kind: "vault",
+          path: binding.change.after.path,
+          expectedHash: binding.change.after.hash,
+          expectedSize: binding.change.after.size,
+          expectedMtime: binding.change.after.mtime,
+        }
       }
       for (const binding of batch.stagedWrites) {
         await this.applyStagedWrite(binding)
@@ -599,6 +745,11 @@ export class V4SyncSession {
         pulledFiles,
         recoveryRunId: this.input.recoveryStore ? batch.runId : undefined,
       }
+    }
+
+    const currentGeneration = remote?.head.generation ?? 0
+    if (currentGeneration >= Number.MAX_SAFE_INTEGER) {
+      throw new Error("V4 remote generation cannot be incremented safely.")
     }
 
     const pushContentPaths = new Set(batch.pushes.flatMap(binding => binding.source?.kind === "vault" ? [binding.source.path] : []))
@@ -827,7 +978,7 @@ export class V4SyncSession {
     const buckets = new Set(finalByBucket.keys())
     const oldBuckets = new Set(remote ? Object.keys(remote.head.shardHashes) : [])
     for (const bucket of oldBuckets) if (!buckets.has(bucket)) deletions.add(v4RemoteShardPath(bucket, remote!.config.mode))
-    const generation = (remote?.head.generation ?? 0) + 1
+    const generation = currentGeneration + 1
     const changedBuckets = new Set<string>()
     for (const bucket of new Set([...oldByBucket.keys(), ...finalByBucket.keys()])) {
       if (bucketSignature(oldByBucket.get(bucket)) !== bucketSignature(finalByBucket.get(bucket))) changedBuckets.add(bucket)
@@ -835,7 +986,7 @@ export class V4SyncSession {
     const shardHashes = { ...(remote?.head.shardHashes ?? {}) }
     for (const bucket of oldBuckets) if (!buckets.has(bucket)) delete shardHashes[bucket]
     for (const bucket of changedBuckets) {
-      if (buckets.has(bucket)) shardHashes[bucket] = await sha256Hex(utf8ToBytes(bucketSignature(finalByBucket.get(bucket))))
+      if (buckets.has(bucket)) shardHashes[bucket] = await hashV4ShardRecords(finalByBucket.get(bucket) ?? [])
     }
     const head: V4RemoteHead = {
       formatVersion: 4,
@@ -867,9 +1018,28 @@ export class V4SyncSession {
         ...finalObjectPaths,
         ...[...buckets].map(bucket => v4RemoteShardPath(bucket, this.input.config.mode)),
       ])
+      const nonEmptyTreePaths = new Set<string>()
+      for (const node of tree.tree) {
+        let slash = node.path.lastIndexOf("/")
+        while (slash > 0) {
+          nonEmptyTreePaths.add(node.path.slice(0, slash))
+          slash = node.path.lastIndexOf("/", slash - 1)
+        }
+      }
       for (const node of tree.tree) {
         const internal = node.path.startsWith(`${V4_ROOT}/`)
-        if (node.type !== "blob" || (!internal && !includePath(node.path)) || written.has(node.path) || node.path.startsWith(`${V4_ROOT}/journals/`)) continue
+        const managed = internal || includePath(node.path)
+        if (!managed || written.has(node.path)) continue
+        if (node.type === "commit") {
+          throw new Error(`Force Push cannot safely mirror remote gitlink/submodule: ${node.path}`)
+        }
+        if (node.type === "tree") {
+          if (!nonEmptyTreePaths.has(node.path)) {
+            throw new Error(`Force Push cannot safely mirror explicit empty remote tree: ${node.path}`)
+          }
+          continue
+        }
+        if (node.type !== "blob" || node.path.startsWith(`${V4_ROOT}/journals/`)) continue
         deletions.add(node.path)
       }
     }
@@ -973,25 +1143,442 @@ export class V4SyncSession {
     }
   }
 
-  private async reconcileExternalCommit(remote: V4RemoteState, treeSha: string): Promise<void> {
+  private async publicationDirectoryEntries(
+    rootTreeSha: string,
+    directoryPath: string,
+    budget: { reads: number; nodes: number },
+  ): Promise<Map<string, GitHubTreeNode> | null> {
+    if (!this.input.github.getTreeAt) throw new Error("Plugin publication verification requires tree support.")
+    let treeSha = rootTreeSha
+    for (const segment of directoryPath.split("/")) {
+      if (budget.reads + 1 > V4_PUBLICATION_TREE_READ_LIMIT) {
+        throw new Error("Plugin publication tree verification read limit exceeded.")
+      }
+      budget.reads++
+      const tree = await this.input.github.getTreeAt(treeSha, false)
+      throwIfV4Aborted(this.input.signal)
+      if (tree.truncated) throw new Error("Plugin publication tree evidence is truncated; sync is unsafe.")
+      budget.nodes += tree.tree.length
+      if (budget.nodes > V4_PUBLICATION_TREE_NODE_LIMIT) {
+        throw new Error("Plugin publication tree verification node limit exceeded.")
+      }
+      const node = tree.tree.find(entry => entry.path === segment)
+      if (!node) return null
+      if (node.type !== "tree" || node.mode !== "040000") {
+        throw new Error(`Plugin publication internal tree is malformed at ${directoryPath}.`)
+      }
+      treeSha = node.sha
+    }
+
+    if (budget.reads + 1 > V4_PUBLICATION_TREE_READ_LIMIT) {
+      throw new Error("Plugin publication tree verification read limit exceeded.")
+    }
+    budget.reads++
+    const tree = await this.input.github.getTreeAt(treeSha, false)
+    throwIfV4Aborted(this.input.signal)
+    if (tree.truncated) throw new Error("Plugin publication tree evidence is truncated; sync is unsafe.")
+    budget.nodes += tree.tree.length
+    if (budget.nodes > V4_PUBLICATION_TREE_NODE_LIMIT) {
+      throw new Error("Plugin publication tree verification node limit exceeded.")
+    }
+    return new Map(tree.tree.map(node => [node.path, node]))
+  }
+
+  private async cachedPublicationShardsMatchTrustedBaseline(
+    remote: V4RemoteState,
+    tip: GitHubGitCommit,
+    budget: { reads: number; nodes: number },
+  ): Promise<boolean> {
+    const baselineSha = this.input.index.remoteCommitSha
+    if (!baselineSha || baselineSha === tip.sha) return true
+
+    const cachedBuckets = Object.entries(remote.head.shardHashes)
+      .filter(([bucket, expectedHash]) => isV4LocalIndexShardConsistent(this.input.index, bucket, expectedHash))
+      .map(([bucket]) => bucket)
+    if (cachedBuckets.length === 0) return true
+
+    const baseline = await this.input.github.getGitCommit(baselineSha)
+    throwIfV4Aborted(this.input.signal)
+    const [baselineIndex, tipIndex] = await Promise.all([
+      this.publicationDirectoryEntries(baseline.treeSha, `${V4_ROOT}/index`, budget),
+      this.publicationDirectoryEntries(tip.treeSha, `${V4_ROOT}/index`, budget),
+    ])
+    if (!baselineIndex || !tipIndex) return false
+
+    for (const bucket of cachedBuckets) {
+      const shardPath = v4RemoteShardPath(bucket, remote.config.mode)
+      const name = shardPath.slice(shardPath.lastIndexOf("/") + 1)
+      const before = baselineIndex.get(name)
+      const after = tipIndex.get(name)
+      if (
+        !before
+        || !after
+        || before.type !== "blob"
+        || after.type !== "blob"
+        || before.mode !== "100644"
+        || after.mode !== "100644"
+        || before.sha !== after.sha
+      ) return false
+    }
+    return true
+  }
+
+  private async changedGitTreeLeaves(
+    beforeTreeSha: string | undefined,
+    afterTreeSha: string | undefined,
+    prefix = "",
+    budget = { reads: 0, nodes: 0 },
+  ): Promise<Array<{ path: string; before?: GitHubTreeNode; after?: GitHubTreeNode }>> {
+    if (beforeTreeSha && afterTreeSha && beforeTreeSha === afterTreeSha) return []
+    if (!this.input.github.getTreeAt) throw new Error("Plugin publication verification requires tree support.")
+    const requestedReads = (beforeTreeSha ? 1 : 0) + (afterTreeSha ? 1 : 0)
+    if (budget.reads + requestedReads > V4_PUBLICATION_TREE_READ_LIMIT) {
+      throw new Error("Plugin publication tree verification read limit exceeded.")
+    }
+    budget.reads += requestedReads
+    const emptyTree: GitHubTree = { sha: "", url: "", tree: [], truncated: false }
+    const [beforeTree, afterTree] = await Promise.all([
+      beforeTreeSha ? this.input.github.getTreeAt(beforeTreeSha, false) : Promise.resolve(emptyTree),
+      afterTreeSha ? this.input.github.getTreeAt(afterTreeSha, false) : Promise.resolve(emptyTree),
+    ])
+    throwIfV4Aborted(this.input.signal)
+    if (beforeTree.truncated || afterTree.truncated) {
+      throw new Error("Plugin publication tree evidence is truncated; sync is unsafe.")
+    }
+    budget.nodes += beforeTree.tree.length + afterTree.tree.length
+    if (budget.nodes > V4_PUBLICATION_TREE_NODE_LIMIT) {
+      throw new Error("Plugin publication tree verification node limit exceeded.")
+    }
+
+    const beforeByPath = new Map(beforeTree.tree.map(node => [node.path, node]))
+    const afterByPath = new Map(afterTree.tree.map(node => [node.path, node]))
+    const names = new Set([...beforeByPath.keys(), ...afterByPath.keys()])
+    const changes: Array<{ path: string; before?: GitHubTreeNode; after?: GitHubTreeNode }> = []
+
+    for (const name of names) {
+      const before = beforeByPath.get(name)
+      const after = afterByPath.get(name)
+      const path = prefix ? `${prefix}/${name}` : name
+      if (!prefix && path === V4_ROOT) continue
+      if (
+        before
+        && after
+        && before.sha === after.sha
+        && before.type === after.type
+        && before.mode === after.mode
+      ) continue
+
+      const beforeIsTree = before?.type === "tree"
+      const afterIsTree = after?.type === "tree"
+      if (!beforeIsTree && !afterIsTree) {
+        changes.push({ path, before, after })
+        continue
+      }
+
+      if (before && !beforeIsTree) changes.push({ path, before })
+      if (after && !afterIsTree) changes.push({ path, after })
+      const nested = await this.changedGitTreeLeaves(
+        beforeIsTree ? before!.sha : undefined,
+        afterIsTree ? after!.sha : undefined,
+        path,
+        budget,
+      )
+      if (nested.length > 0) {
+        changes.push(...nested)
+      } else if (beforeIsTree || afterIsTree) {
+        changes.push({
+          path,
+          before: beforeIsTree ? before : undefined,
+          after: afterIsTree ? after : undefined,
+        })
+      }
+    }
+    return changes
+  }
+
+  private async plaintextRecordAtCommit(
+    path: string,
+    commitSha: string,
+    config: V4RemoteConfig,
+    shardCache?: Map<string, Promise<Record<string, V4IndexFileRecord>>>,
+  ): Promise<V4IndexFileRecord | null> {
+    const pathId = await sha256Hex(utf8ToBytes(`path:${path}`))
+    const bucket = bucketForV4PathId(pathId)
+    let recordsPromise = shardCache?.get(bucket)
+    if (!recordsPromise) {
+      recordsPromise = (async () => {
+        const shardFile = await this.input.github.getFileBytes(v4RemoteShardPath(bucket, config.mode), commitSha)
+        if (!shardFile) return {}
+        const shard = await decodeV4RemoteShard(shardFile.bytes, bucket, config, this.input.keyring)
+        return shard.records
+      })()
+      shardCache?.set(bucket, recordsPromise)
+    }
+    const records = await recordsPromise
+    const record = records[pathId]
+    return record?.path === path ? record : null
+  }
+
+  private async isPluginPublicationTreeConsistent(
+    remote: V4RemoteState,
+    tip: GitHubGitCommit,
+    parentSha: string,
+    budget: { reads: number; nodes: number },
+  ): Promise<boolean> {
+    const parent = await this.input.github.getGitCommit(parentSha)
+    throwIfV4Aborted(this.input.signal)
+    const changes = await this.changedGitTreeLeaves(parent.treeSha, tip.treeSha, "", budget)
+    if (changes.length === 0) {
+      this.verifiedPublicationChanges.set(tip.sha, changes)
+      return true
+    }
+    if (remote.config.mode === "encrypted") return false
+
+    const previousShardCache = new Map<string, Promise<Record<string, V4IndexFileRecord>>>()
+    const currentByRemotePath = new Map(remote.records.map(record => [record.remotePath, record]))
+    for (const change of changes) {
+      throwIfV4Aborted(this.input.signal)
+      if (change.after) {
+        if (change.after.type !== "blob" || change.after.mode !== "100644") return false
+        const record = currentByRemotePath.get(change.path)
+        if (!record || record.storage !== "single" || record.path !== change.path) return false
+        if (change.after.size !== undefined && change.after.size !== record.size) return false
+        const previous = await this.plaintextRecordAtCommit(change.path, parentSha, remote.config, previousShardCache)
+        if (
+          previous
+          && previous.storage === "single"
+          && previous.remotePath === change.path
+          && previous.plaintextSha256 === record.plaintextSha256
+          && previous.size === record.size
+        ) return false
+        continue
+      }
+
+      if (currentByRemotePath.has(change.path)) return false
+      const previous = await this.plaintextRecordAtCommit(change.path, parentSha, remote.config, previousShardCache)
+      if (!previous || previous.storage !== "single" || previous.remotePath !== change.path) return false
+    }
+    this.verifiedPublicationChanges.set(tip.sha, changes)
+    return true
+  }
+
+  private async assertLocallyMatchedPublicationBodies(
+    remote: V4RemoteState,
+    tip: GitHubGitCommit,
+    localFiles: readonly V4LogicalFile[],
+  ): Promise<void> {
+    if (remote.config.mode !== "plaintext") return
+    const parentSha = tip.parentShas[0]
+    if (!parentSha) return
+    const parent = await this.input.github.getGitCommit(parentSha)
+    throwIfV4Aborted(this.input.signal)
+    const changes = this.verifiedPublicationChanges.get(tip.sha)
+      ?? await this.changedGitTreeLeaves(parent.treeSha, tip.treeSha)
+    const currentByRemotePath = new Map(remote.records.map(record => [record.remotePath, record]))
+    const localByPath = new Map(localFiles.map(file => [file.path, file]))
+    for (const change of changes) {
+      throwIfV4Aborted(this.input.signal)
+      if (!change.after || change.after.type !== "blob" || change.after.mode !== "100644") continue
+      const record = currentByRemotePath.get(change.path)
+      if (!record || record.storage !== "single" || record.path !== change.path) continue
+      const local = localByPath.get(record.path)
+      if (!local || local.hash !== record.plaintextSha256 || local.size !== record.size) continue
+      const bytes = this.localReadCache.get(record.path)
+      if (!bytes || bytes.byteLength !== record.size) continue
+      if (await gitBlobSha1(bytes) !== change.after.sha) {
+        throw new Error(`Plugin publication blob does not match the locally verified record: ${record.path}`)
+      }
+    }
+  }
+
+  private async isVerifiedPluginPublication(
+    remote: V4RemoteState,
+    tip: GitHubGitCommit,
+    budget = { reads: 0, nodes: 0 },
+  ): Promise<boolean> {
+    const pluginMessage = `obsidian-sync-v4:${remote.head.journalId}`
+    if (tip.message?.split("\n", 1)[0] !== pluginMessage) return false
+    const tipHeadFile = await this.input.github.getFileBytes(V4_HEAD_PATH, tip.sha)
+    if (!tipHeadFile) return false
+    let tipHead: V4RemoteHead
+    try {
+      tipHead = await decodeV4RemoteHead(tipHeadFile.bytes, remote.config, this.input.keyring)
+    } catch {
+      return false
+    }
+    if (!sameV4RemoteHead(tipHead, remote.head)) return false
+    const trustedGenerationOne = tipHead.epoch === 1
+      && tipHead.generation === 1
+      && tip.sha === this.input.index.remoteCommitSha
+    const parentSha = tip.parentShas[0]
+    if (!parentSha) return trustedGenerationOne
+    const parentHeadFile = await this.input.github.getFileBytes(V4_HEAD_PATH, parentSha)
+    if (!parentHeadFile) return trustedGenerationOne
+    let parentHead: V4RemoteHead
+    try {
+      parentHead = await decodeV4RemoteHead(parentHeadFile.bytes, remote.config, this.input.keyring)
+    } catch {
+      return false
+    }
+    const validProgression = parentHead.mode === tipHead.mode
+      && parentHead.epoch === tipHead.epoch
+      && tipHead.generation === parentHead.generation + 1
+      && tipHead.journalId !== parentHead.journalId
+    if (!validProgression) return false
+    if (!(await this.cachedPublicationShardsMatchTrustedBaseline(remote, tip, budget))) return false
+    return this.isPluginPublicationTreeConsistent(remote, tip, parentSha, budget)
+  }
+
+  private async v4RootTreeSha(commit: GitHubGitCommit): Promise<string> {
+    if (!this.input.github.getTreeAt) throw new Error("External GitHub changes require tree support.")
+    const root = await this.input.github.getTreeAt(commit.treeSha, false)
+    throwIfV4Aborted(this.input.signal)
+    if (root.truncated) throw new Error("External GitHub root tree is truncated; sync is unsafe.")
+    const entry = root.tree.find(node => node.path === V4_ROOT)
+    if (!entry || entry.type !== "tree" || entry.mode !== "040000") {
+      throw new Error("External GitHub V4 internal subtree is missing or malformed.")
+    }
+    return entry.sha
+  }
+
+  private async findVerifiedPluginPublication(remote: V4RemoteState, tip: GitHubGitCommit): Promise<GitHubGitCommit> {
+    const pendingParentLists: string[][] = [tip.parentShas]
+    const visited = new Set<string>()
+    const publicationTreeBudget = { reads: 0, nodes: 0 }
+    for (let listIndex = 0; listIndex < pendingParentLists.length; listIndex++) {
+      const parents = pendingParentLists[listIndex]
+      for (const sha of parents) {
+        throwIfV4Aborted(this.input.signal)
+        if (visited.has(sha)) continue
+        if (visited.size >= V4_EXTERNAL_PUBLICATION_ANCESTRY_LIMIT) {
+          throw new Error("External GitHub ancestry exceeds the V4 verification limit.")
+        }
+        visited.add(sha)
+        const commit = await this.input.github.getGitCommit(sha)
+        throwIfV4Aborted(this.input.signal)
+        if (await this.isVerifiedPluginPublication(remote, commit, publicationTreeBudget)) return commit
+        throwIfV4Aborted(this.input.signal)
+        if (commit.parentShas.length > 0) pendingParentLists.push(commit.parentShas)
+      }
+    }
+    throw new Error("External GitHub ancestry does not contain a verified V4 publication for the current head.")
+  }
+
+  private async assertExternalV4SubtreeUnchanged(remote: V4RemoteState, tip: GitHubGitCommit): Promise<void> {
+    const baseline = await this.findVerifiedPluginPublication(remote, tip)
+    const baselineV4Root = await this.v4RootTreeSha(baseline)
+    const currentV4Root = await this.v4RootTreeSha(tip)
+    if (baselineV4Root !== currentV4Root) {
+      throw new Error("External GitHub changes modified the internal V4 subtree; sync is unsafe.")
+    }
+  }
+
+  private async reconcileExternalCommit(remote: V4RemoteState, tip: GitHubGitCommit): Promise<void> {
     if (remote.config.mode === "encrypted") {
       throw new Error("External GitHub changes touched an encrypted V4 branch without updating its journal. Use Force Push or Force Pull after reviewing the commit.")
     }
+    await this.assertExternalV4SubtreeUnchanged(remote, tip)
     if (!this.input.github.getTreeAt) throw new Error("External GitHub changes require recursive tree support.")
     if (remote.records.some(record => record.storage !== "single")) {
       throw new Error("External GitHub changes cannot be safely reconciled while large or packed V4 objects exist.")
     }
-    const tree = await this.input.github.getTreeAt(treeSha, true)
+    const tree = await this.input.github.getTreeAt(tip.treeSha, true)
     if (tree.truncated) throw new Error("External GitHub tree is truncated; sync is unsafe.")
     const existingByPath = new Map(remote.records.map(record => [record.path, record]))
+    const baselineBlobShaByPath = new Map<string, string>()
+    const baselineCommitSha = this.input.index.remoteCommitSha
+    if (baselineCommitSha && localIndexMatchesRemoteHead(this.input.index, remote.head)) {
+      const baselineCommit = await this.input.github.getGitCommit(baselineCommitSha)
+      const baselineTree = await this.input.github.getTreeAt(baselineCommit.treeSha, true)
+      if (baselineTree.truncated) throw new Error("External GitHub baseline tree is truncated; sync is unsafe.")
+      for (const node of baselineTree.tree) if (node.type === "blob") baselineBlobShaByPath.set(node.path, node.sha)
+    }
     const includePath = this.input.includePath ?? (() => true)
+    const nonEmptyTreePaths = new Set<string>()
+    for (const node of tree.tree) {
+      let slash = node.path.lastIndexOf("/")
+      while (slash > 0) {
+        nonEmptyTreePaths.add(node.path.slice(0, slash))
+        slash = node.path.lastIndexOf("/", slash - 1)
+      }
+    }
+    const managedExternalFilePaths: string[] = []
+    for (const node of tree.tree) {
+      const internal = node.path === V4_CONFIG_PATH || node.path.startsWith(`${V4_ROOT}/`)
+      if (node.type !== "blob" || internal || !includePath(node.path)) continue
+      if (node.mode !== "100644" && node.mode !== "100755") continue
+      let normalizedPath: string
+      try {
+        normalizedPath = normalizeV4VaultPath(node.path)
+      } catch (error) {
+        throw new Error(`Unsafe external Git path: ${node.path}`, { cause: error })
+      }
+      if (normalizedPath !== node.path) throw new Error(`External Git path is not normalized: ${node.path}`)
+      managedExternalFilePaths.push(node.path)
+    }
+    assertV4LogicalPathSetSafe(managedExternalFilePaths)
+
     const reconciled: V4IndexFileRecord[] = remote.records.filter(record => !includePath(record.path))
     for (const node of tree.tree) {
-      if (node.type !== "blob" || node.path === V4_CONFIG_PATH || node.path.startsWith(`${V4_ROOT}/`)) continue
+      const internal = node.path === V4_CONFIG_PATH || node.path.startsWith(`${V4_ROOT}/`)
+      if (node.type === "tree") {
+        if (!internal && includePath(node.path)) {
+          if (existingByPath.has(node.path)) {
+            throw new Error(`External Git directory replaced tracked file path: ${node.path}`)
+          }
+          if (!nonEmptyTreePaths.has(node.path)) {
+            throw new Error(`External Git explicit empty tree is unsupported in managed sync scope: ${node.path}`)
+          }
+        }
+        continue
+      }
+      if (node.type === "commit") {
+        let normalizedPath: string
+        try {
+          normalizedPath = normalizeV4VaultPath(node.path)
+        } catch (error) {
+          throw new Error(`Unsafe external Git path: ${node.path}`, { cause: error })
+        }
+        if (normalizedPath !== node.path) throw new Error(`External Git path is not normalized: ${node.path}`)
+        if (internal || includePath(node.path)) {
+          throw new Error(`External Git gitlink/submodule is unsupported in managed sync scope: ${node.path}`)
+        }
+        continue
+      }
+      if (node.type === "blob" && node.mode !== "100644" && node.mode !== "100755") {
+        let normalizedPath: string
+        try {
+          normalizedPath = normalizeV4VaultPath(node.path)
+        } catch (error) {
+          throw new Error(`Unsafe external Git path: ${node.path}`, { cause: error })
+        }
+        if (normalizedPath !== node.path) throw new Error(`External Git path is not normalized: ${node.path}`)
+        if (internal || includePath(node.path)) {
+          const kind = node.mode === "120000" ? "symlink" : `blob mode ${node.mode}`
+          throw new Error(`External Git ${kind} is unsupported in managed sync scope: ${node.path}`)
+        }
+        continue
+      }
+      if (node.type !== "blob" || internal) continue
+      let normalizedPath: string
+      try {
+        normalizedPath = normalizeV4VaultPath(node.path)
+      } catch (error) {
+        throw new Error(`Unsafe external Git path: ${node.path}`, { cause: error })
+      }
+      if (normalizedPath !== node.path) throw new Error(`External Git path is not normalized: ${node.path}`)
       if (!includePath(node.path)) continue
-      const file = await this.input.github.getFileBytes(node.path, remote.commitSha)
-      if (!file) continue
       const previous = existingByPath.get(node.path)
+      if (
+        previous
+        && previous.remotePath === node.path
+        && baselineBlobShaByPath.get(node.path) === node.sha
+      ) {
+        reconciled.push(previous)
+        continue
+      }
+      const file = await this.input.github.getFileBytes(node.path, remote.commitSha)
+      if (!file) throw new Error(`External Git blob is missing from immutable commit evidence: ${node.path}`)
       const pathId = previous?.pathId ?? await sha256Hex(utf8ToBytes(`path:${node.path}`))
       reconciled.push({
         path: node.path,
@@ -1000,11 +1587,12 @@ export class V4SyncSession {
         plaintextSha256: await sha256Hex(file.bytes),
         size: file.bytes.byteLength,
         mtime: this.now(),
-        remoteVersion: `external:${remote.commitSha}`,
+        remoteVersion: `external-${remote.commitSha}`,
         remotePath: node.path,
         storage: "single",
       })
     }
+    await assertV4RemoteRecordSet(reconciled, remote.config)
     remote.records = reconciled
   }
 
@@ -1114,11 +1702,12 @@ export class V4SyncSession {
       for (const [path, record] of moved) identityByPath.set(path, record)
     }
     const files = await this.localIo.listFiles()
+    const allowStatHashReuse = changes.length > 0 && !changes.some(change => change.type === "rescan")
     return boundedMap(files, this.resources.limits.maxVaultReads, async file => {
       this.report({ phase: "scanning-local", currentPath: file.path, currentDirection: undefined })
       const identity = identityByPath.get(file.path)
       const existing = identity ?? undefined
-      const unchangedStat = existing && existing.size === file.size && existing.mtime === file.mtime
+      const unchangedStat = allowStatHashReuse && existing && existing.size === file.size && existing.mtime === file.mtime
       if (!unchangedStat) this.report({ phase: "hashing", currentPath: file.path, currentDirection: undefined })
       const fileId = identity === null
         ? await this.newFileId(file.path)
@@ -1136,9 +1725,16 @@ export class V4SyncSession {
   private bindPull(
     change: V4PlannedChange,
     records: ReadonlyMap<string, V4IndexFileRecord>,
+    allRecords: readonly V4IndexFileRecord[],
     remoteCommitSha?: string,
   ): V4PullBinding {
-    return { change, remoteRecord: change.kind === "delete" ? undefined : records.get(change.fileId), remoteCommitSha }
+    const remoteRecord = change.kind === "delete" ? undefined : records.get(change.fileId)
+    return {
+      change,
+      remoteRecord,
+      remoteCommitSha,
+      packRecords: remoteRecord ? completePackRecords(remoteRecord, allRecords) : undefined,
+    }
   }
 
   private bindPush(
@@ -1255,6 +1851,56 @@ export class V4SyncSession {
     return this.readStage(stage)
   }
 
+  private async stagePackedPullGroups(
+    bindings: readonly V4PullBinding[],
+    ownedStages: V4StageRef[],
+    prefetchedRemoteBodies: ReadonlyMap<string, Uint8Array>,
+  ): Promise<void> {
+    const groups = new Map<string, V4PullBinding[]>()
+    for (const binding of bindings) {
+      if (binding.stage || binding.change.kind === "delete") continue
+      const record = binding.remoteRecord
+      if (!record || record.storage !== "pack" || !record.packId) continue
+      const prefetched = prefetchedRemoteBodies.get(record.fileId)
+      if (prefetched) {
+        this.report({ phase: "downloading", currentPath: binding.change.path, currentDirection: "pull" })
+        binding.stage = await this.stageBytes(prefetched, record.mtime, binding.change.before?.size ?? 0, ownedStages)
+        continue
+      }
+      const key = `${binding.remoteCommitSha ?? ""}\0${record.packId}\0${record.remotePath}`
+      const group = groups.get(key) ?? []
+      group.push(binding)
+      groups.set(key, group)
+    }
+
+    for (const group of groups.values()) {
+      const first = group[0]
+      const firstRecord = first.remoteRecord!
+      const records = first.packRecords ?? group.map(binding => binding.remoteRecord!)
+      if (!records.some(record => record.fileId === firstRecord.fileId)) throw new Error("V4 packed pull metadata is incomplete.")
+      const budget = estimateV4PackGroupResources(records.map(record => ({
+        fileId: record.fileId,
+        path: record.path,
+        size: record.size,
+      })))
+      await this.resources.withResidentBytes(budget.residentBytes, async () => {
+        this.report({ phase: "downloading", currentPath: first.change.path, currentDirection: "pull" })
+        const entries = await this.codec.readPackRecords(records, async path => {
+          const file = await this.input.github.getFileBytes(path, first.remoteCommitSha)
+          if (!file) throw new Error(`Missing V4 remote object: ${path}`)
+          return file.bytes
+        }, this.input.signal)
+        for (const binding of group) {
+          const record = binding.remoteRecord!
+          const bytes = entries.get(record.fileId)
+          if (!bytes) throw new Error(`V4 packed entry is missing after verified decode: ${record.fileId}`)
+          this.report({ phase: "downloading", currentPath: binding.change.path, currentDirection: "pull" })
+          binding.stage = await this.stageBytes(bytes, record.mtime, binding.change.before?.size ?? 0, ownedStages)
+        }
+      }, this.input.signal)
+    }
+  }
+
   private async stageRemotePull(binding: V4PullBinding, ownedStages: V4StageRef[]): Promise<V4StageRef> {
     const record = binding.remoteRecord
     if (!record) throw new Error(`Missing V4 remote record for ${binding.change.path}`)
@@ -1294,12 +1940,13 @@ export class V4SyncSession {
   ): Promise<{ payload: V4RecoveryPayload; pullCompletionIds: Set<string> }> {
     const mutations: V4RecoveryLocalMutation[] = []
     const pullCompletionIds = new Set<string>()
+    const pullMutationGroups: string[][] = []
     const addPull = async (binding: V4PullBinding) => {
       const change = binding.change
       if (change.kind === "delete") {
         const id = `pull:${change.fileId}:delete`
         mutations.push({ id, kind: "trash", path: change.path, precondition: this.pullPrecondition(change) })
-        pullCompletionIds.add(id)
+        pullMutationGroups.push([id])
         return
       }
       if (!binding.stage) {
@@ -1308,14 +1955,14 @@ export class V4SyncSession {
       }
       if (this.ephemeralStages.has(binding.stage.stageId)) throw new V4BoundedIoUnavailableError("bounded-append", change.path)
       const writeId = `pull:${change.fileId}:write`
+      const mutationIds = [writeId]
       mutations.push({ id: writeId, kind: "stage-write", path: change.path, stage: binding.stage, precondition: this.pullPrecondition(change) })
       if (change.kind === "rename" && change.previousPath) {
         const trashId = `pull:${change.fileId}:rename-trash`
         mutations.push({ id: trashId, kind: "trash", path: change.previousPath, precondition: this.pullPrecondition(change, change.previousPath) })
-        pullCompletionIds.add(trashId)
-      } else {
-        pullCompletionIds.add(writeId)
+        mutationIds.push(trashId)
       }
+      pullMutationGroups.push(mutationIds)
     }
     for (const binding of batch.pulls) await addPull(binding)
 
@@ -1354,7 +2001,16 @@ export class V4SyncSession {
         precondition,
       })
     }
-    return { payload: { mutations, completedMutationIds: [] }, pullCompletionIds }
+    const orderedMutations = orderRecoveryMutationsForFileTopology(mutations)
+    const orderById = new Map(orderedMutations.map((mutation, index) => [mutation.id, index]))
+    for (const ids of pullMutationGroups) {
+      let terminalId = ids[0]
+      for (const id of ids.slice(1)) {
+        if ((orderById.get(id) ?? -1) > (orderById.get(terminalId) ?? -1)) terminalId = id
+      }
+      pullCompletionIds.add(terminalId)
+    }
+    return { payload: { mutations: orderedMutations, completedMutationIds: [] }, pullCompletionIds }
   }
 
   private pullPrecondition(change: V4PlannedChange, path = change.path): V4LocalTargetPrecondition {
@@ -1405,7 +2061,7 @@ export class V4SyncSession {
     } else {
       if (!record) throw new Error(`Missing V4 remote record for ${change.path}`)
       this.report({ phase: "downloading", currentPath: change.path, currentDirection: "pull" })
-      bytes = await this.readRecord(record, binding.remoteCommitSha)
+      bytes = await this.readRecord(record, binding.remoteCommitSha, binding.packRecords)
       mtime = record.mtime
     }
     await assertV4LocalTargetPrecondition(this.localIo, targetPrecondition)
@@ -1489,12 +2145,24 @@ export class V4SyncSession {
     }, this.input.signal)
   }
 
-  private async readRecord(record: V4IndexFileRecord, remoteCommitSha?: string): Promise<Uint8Array> {
-    return this.codec.read(record, async path => {
+  private async readRecord(
+    record: V4IndexFileRecord,
+    remoteCommitSha?: string,
+    packRecords?: readonly V4IndexFileRecord[],
+  ): Promise<Uint8Array> {
+    const reader = async (path: string) => {
       const file = await this.input.github.getFileBytes(path, remoteCommitSha)
       if (!file) throw new Error(`Missing V4 remote object: ${path}`)
       return file.bytes
-    }, this.input.signal)
+    }
+    if (record.storage === "pack") {
+      if (!packRecords) throw new Error(`V4 packed read requires complete metadata: ${record.fileId}`)
+      const entries = await this.codec.readPackRecords(packRecords, reader, this.input.signal)
+      const bytes = entries.get(record.fileId)
+      if (!bytes) throw new Error(`V4 packed entry is missing after verified decode: ${record.fileId}`)
+      return bytes
+    }
+    return this.codec.read(record, reader, this.input.signal)
   }
 
   private changeBetween(before?: V4LogicalFile, after?: V4LogicalFile): V4PlannedChange | null {

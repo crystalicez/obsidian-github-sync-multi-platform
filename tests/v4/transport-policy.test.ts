@@ -16,8 +16,9 @@ test("transport defaults serialize mutations and keep GitHub spacing as runtime 
 
 test("rate-limit delay honors retry-after reset and the documented one-minute fallback", () => {
   assert.equal(resolveV4RateLimitDelay({ status: 429, headers: { "retry-after": "2" } }, 1, 10_000), 2_000)
-  assert.equal(resolveV4RateLimitDelay({ status: 429, headers: { "retry-after": "3600" } }, 1, 10_000), 3_600_000)
+  assert.equal(resolveV4RateLimitDelay({ status: 429, headers: { "retry-after": "3600" } }, 1, 10_000), DEFAULT_V4_TRANSPORT_POLICY.maxSecondaryCooldownMs)
   assert.equal(resolveV4RateLimitDelay({ status: 403, headers: { "x-ratelimit-reset": "20" } }, 1, 10_000), 10_000)
+  assert.equal(resolveV4RateLimitDelay({ status: 403, headers: { "x-ratelimit-reset": "9999999999" } }, 1, 10_000), DEFAULT_V4_TRANSPORT_POLICY.maxSecondaryCooldownMs)
   assert.equal(resolveV4RateLimitDelay({ status: 403, headers: {} }, 1, 10_000), 60_000)
   assert.equal(resolveV4RateLimitDelay({ status: 500 }, 1, 10_000), null)
 })

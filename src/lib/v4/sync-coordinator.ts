@@ -30,9 +30,15 @@ export interface V4SyncCoordinatorOptions {
   debounceMs?: number;
 }
 
+function maxV4ChangeMtime(changes: readonly V4QueuedChange[]): number {
+  let result = Number.NEGATIVE_INFINITY;
+  for (const change of changes) result = Math.max(result, change.mtime);
+  return result;
+}
+
 export function coalesceV4Changes(changes: V4QueuedChange[]): V4QueuedChange[] {
   if (changes.some(change => change.type === "rescan")) {
-    const rescanMtime = Math.max(...changes.map(change => change.mtime));
+    const rescanMtime = maxV4ChangeMtime(changes);
     const coalesced = coalesceV4Changes(changes.filter(change => change.type !== "rescan"));
     const causalChanges = coalesced.filter(change => change.type !== "rescan");
     return causalChanges.some(change => change.type !== "modify")
@@ -60,11 +66,11 @@ export function coalesceV4Changes(changes: V4QueuedChange[]): V4QueuedChange[] {
     const priorRenameDestinations = new Set<string>();
     for (const change of pathChanges) {
       if (change.type === "delete" && priorRenameDestinations.has(change.path)) {
-        return [...pathChanges, { type: "rescan", mtime: Math.max(...pathChanges.map(item => item.mtime)) }];
+        return [...pathChanges, { type: "rescan", mtime: maxV4ChangeMtime(pathChanges) }];
       }
       if (change.type !== "rename") continue;
       if (priorRenameEndpoints.has(change.oldPath) || priorRenameEndpoints.has(change.path)) {
-        return [...pathChanges, { type: "rescan", mtime: Math.max(...pathChanges.map(item => item.mtime)) }];
+        return [...pathChanges, { type: "rescan", mtime: maxV4ChangeMtime(pathChanges) }];
       }
       priorRenameEndpoints.add(change.oldPath);
       priorRenameEndpoints.add(change.path);
@@ -141,14 +147,22 @@ export class V4SyncCoordinator {
   get isSyncing(): boolean { return this.active !== undefined; }
   get pendingCount(): number { return this.disposed ? 0 : coalesceV4Changes(this.pending).length; }
 
+  cancelActive(reason: unknown = new V4CancelledError("V4 active sync cancelled.")): void {
+    this.activeController?.abort(reason)
+  }
+
+  cancelPending(): void {
+    if (this.timer !== undefined) this.cancel(this.timer)
+    this.timer = undefined
+    this.pending.length = 0
+    this.flushAfterActive = false
+  }
+
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
-    this.activeController?.abort(new V4CancelledError("V4 coordinator disposed."))
-    if (this.timer !== undefined) this.cancel(this.timer)
-    this.timer = undefined
-    this.flushAfterActive = false
-    this.pending.length = 0
+    this.cancelActive(new V4CancelledError("V4 coordinator disposed."))
+    this.cancelPending()
   }
 
   enqueue(change: V4QueuedChange): void {

@@ -1,5 +1,6 @@
 import { expectedV4PathLayout, V4_FORMAT_VERSION, type V4ObjectStorage, type V4PathLayout, type V4StorageMode } from "./protocol-types";
 import { bucketForV4PathId } from "./paths";
+import { hashV4ShardRecords } from "./shard-hash";
 
 export interface V4IndexFileRecord {
   path: string;
@@ -70,7 +71,10 @@ function isV4LocalIndexHeader(value: unknown): value is V4LocalIndexHeader {
   if (!Number.isSafeInteger(candidate.epoch) || (candidate.epoch ?? -1) < 0) return false;
   if (!Number.isSafeInteger(candidate.generation) || (candidate.generation ?? -1) < 0) return false;
   if (!candidate.shardHashes || typeof candidate.shardHashes !== "object" || Array.isArray(candidate.shardHashes)) return false;
-  return Object.entries(candidate.shardHashes).every(([bucket, hash]) => /^[0-9a-f]{2}$/u.test(bucket) && typeof hash === "string");
+  if (Object.keys(candidate.shardHashes).length > 256) return false;
+  return Object.entries(candidate.shardHashes).every(([bucket, hash]) =>
+    /^[0-9a-f]{2}$/u.test(bucket) && typeof hash === "string" && /^[0-9a-f]{64}$/u.test(hash)
+  );
 }
 
 function isRecordMap(value: unknown, bucket: string): value is Record<string, V4IndexFileRecord> {
@@ -107,7 +111,7 @@ export function isV4LocalIndexCacheComplete(index: V4LocalIndex): boolean {
   const expectedBuckets = Object.keys(index.shardHashes);
   if (Object.keys(index.shards).length !== expectedBuckets.length) return false;
   return expectedBuckets.every(bucket => /^[0-9a-f]{2}$/u.test(bucket)
-    && typeof index.shardHashes[bucket] === "string"
+    && /^[0-9a-f]{64}$/u.test(index.shardHashes[bucket] ?? "")
     && isV4LocalIndexShardConsistent(index, bucket, index.shardHashes[bucket]));
 }
 
@@ -128,6 +132,9 @@ export function createEmptyV4LocalIndex(input: { repoId: string; deviceId: strin
 async function saveV4LocalIndexShard(adapter: V4LocalIndexAdapter, root: string, index: V4LocalIndex, bucket: string): Promise<void> {
   const shard = index.shards[bucket];
   if (!shard || !isShardConsistent(shard, bucket, shard.hash)) throw new Error(`Invalid V4 local index shard: ${bucket}`);
+  if (await hashV4ShardRecords(Object.values(shard.records)) !== shard.hash) {
+    throw new Error(`V4 local index shard hash mismatch: ${bucket}`);
+  }
   index.shardHashes[bucket] = shard.hash;
   await adapter.mkdir(root);
   await adapter.mkdir(join(root, "shards"));
@@ -179,5 +186,10 @@ export async function loadV4LocalIndex(adapter: V4LocalIndexAdapter, root: strin
       throw error;
     }
   }
-  return isV4LocalIndexCacheComplete(index) ? index : invalidV4LocalIndex();
+  if (!isV4LocalIndexCacheComplete(index)) return invalidV4LocalIndex();
+  for (const bucket of Object.keys(index.shardHashes)) {
+    const shard = index.shards[bucket];
+    if (await hashV4ShardRecords(Object.values(shard.records)) !== index.shardHashes[bucket]) return invalidV4LocalIndex();
+  }
+  return index;
 }

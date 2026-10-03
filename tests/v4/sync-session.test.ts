@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test from "node:test";
 
 import type { GitHubCreateTreeEntry } from "../../src/lib/github-git-types";
@@ -12,16 +13,35 @@ import { decryptV4Payload, deriveV4Keyring, encryptV4Payload } from "../../src/l
 import { sha256Hex } from "../../src/lib/bytes";
 import { buildV4RemoteMetadata } from "../../src/lib/v4/remote-index";
 import { publishV4TreeChanges } from "../../src/lib/v4/git-tree-writer";
-import { V4_LARGE_FILE_THRESHOLD_BYTES } from "../../src/lib/v4/large-files";
+import { buildV4PartPaths, V4_LARGE_FILE_THRESHOLD_BYTES, V4_PART_BYTES } from "../../src/lib/v4/large-files";
 import type { V4SyncProgressPatch } from "../../src/lib/v4/progress";
 import { DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES, type V4ContentHandle, type V4ContentSource } from "../../src/lib/v4/content-source";
 import { planV4PackGroups } from "../../src/lib/v4/pack-planner";
 import { waitForCondition } from "../helpers/wait-for";
 import { V4SourceChangedError } from "../../src/lib/v4/object-stream";
 import { createV4StagingStore, type V4StageRef } from "../../src/lib/v4/staging-store";
+import { hashV4ShardRecords, toV4RemoteRecord } from "../../src/lib/v4/shard-hash";
 
 const enc = (value: string) => new TextEncoder().encode(value);
 const dec = (value: Uint8Array) => new TextDecoder().decode(value);
+
+function gitBlobSha1(bytes: Uint8Array): string {
+  const header = Buffer.from(`blob ${bytes.byteLength}\0`, "utf8");
+  return createHash("sha1").update(header).update(bytes).digest("hex");
+}
+
+async function shardHashesForRecords(records: V4IndexFileRecord[]): Promise<Record<string, string>> {
+  const byBucket = new Map<string, V4IndexFileRecord[]>();
+  for (const record of records) {
+    const bucket = record.pathId.slice(0, 2);
+    const bucketRecords = byBucket.get(bucket) ?? [];
+    bucketRecords.push(record);
+    byBucket.set(bucket, bucketRecords);
+  }
+  return Object.fromEntries(await Promise.all(
+    [...byBucket].map(async ([bucket, bucketRecords]) => [bucket, await hashV4ShardRecords(bucketRecords)] as const),
+  ));
+}
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -75,7 +95,7 @@ class MemoryVault implements V4SessionVault {
   async stat(path: string) { const file = this.files.get(path); return file ? { path, size: file.bytes.byteLength, mtime: file.mtime } : null; }
   async read(path: string) { this.operations.push(`read:${path}`); return new Uint8Array(this.files.get(path)!.bytes); }
   async openContentSource(handle: V4ContentHandle): Promise<V4ContentSource> {
-    if (handle.kind !== "vault") throw new Error("MemoryVault only opens vault handles.");
+    if (handle.kind === "stage") return this.staging.open({ stageId: handle.stageId, size: handle.expectedSize });
     const file = this.files.get(handle.path);
     if (!file) throw new Error(`Missing local file: ${handle.path}`);
     return {
@@ -107,6 +127,7 @@ class MemoryGitHub {
   files = new Map<string, Uint8Array>();
   blobs = new Map<string, Uint8Array>();
   trees = new Map<string, Map<string, Uint8Array>>();
+  treeViews = new Map<string, Map<string, Uint8Array>>();
   commits = new Map<string, { treeSha: string; parents: string[]; message: string }>();
   commitMessages: string[] = [];
   lastEntries: GitHubCreateTreeEntry[] = [];
@@ -118,15 +139,64 @@ class MemoryGitHub {
     this.readPaths.push(path);
     const commit = ref ? this.commits.get(ref) : undefined;
     const value = commit ? this.trees.get(commit.treeSha)?.get(path) : this.files.get(path);
-    return value ? { bytes: new Uint8Array(value), sha: `sha-${path}` } : null;
+    return value ? { bytes: new Uint8Array(value), sha: gitBlobSha1(value) } : null;
   }
   async getGitRefOrNull() { return this.ref; }
   async ensureGitRepositoryInitialized() { return null; }
   async getGitCommit(sha: string) { const value = this.commits.get(sha)!; return { sha, treeSha: value.treeSha, parentShas: value.parents, message: value.message }; }
-  async getTreeAt(treeSha: string) {
+  async getTreeAt(treeSha: string, recursive = true) {
     this.treeReads.push(treeSha);
-    const tree = this.trees.get(treeSha) ?? new Map();
-    return { sha: treeSha, url: "", truncated: false, tree: [...tree.entries()].map(([path, bytes], index) => ({ path, mode: "100644", type: "blob" as const, sha: `tree-blob-${index}`, size: bytes.byteLength, url: "" })) };
+    const tree = this.trees.get(treeSha) ?? this.treeViews.get(treeSha) ?? new Map();
+    if (!recursive) {
+      const rootBlobs: Array<{ path: string; bytes: Uint8Array }> = [];
+      const rootDirectories = new Map<string, Array<{ path: string; bytes: Uint8Array }>>();
+      for (const [path, bytes] of tree) {
+        const slash = path.indexOf("/");
+        if (slash < 0) {
+          rootBlobs.push({ path, bytes });
+          continue;
+        }
+        const directory = path.slice(0, slash);
+        const descendants = rootDirectories.get(directory) ?? [];
+        descendants.push({ path: path.slice(slash + 1), bytes });
+        rootDirectories.set(directory, descendants);
+      }
+      const blobEntries = await Promise.all(rootBlobs.map(async ({ path, bytes }) => ({
+        path,
+        mode: "100644",
+        type: "blob" as const,
+        sha: gitBlobSha1(bytes),
+        size: bytes.byteLength,
+        url: "",
+      })));
+      const directoryEntries = await Promise.all([...rootDirectories].map(async ([path, descendants]) => {
+        const signatures = await Promise.all(descendants.map(async descendant =>
+          `${descendant.path}:${await sha256Hex(descendant.bytes)}`));
+        const sha = await sha256Hex(enc(signatures.sort().join("\n")));
+        this.treeViews.set(sha, new Map(descendants.map(descendant => [descendant.path, new Uint8Array(descendant.bytes)])));
+        return {
+          path,
+          mode: "040000",
+          type: "tree" as const,
+          sha,
+          url: "",
+        };
+      }));
+      return { sha: treeSha, url: "", truncated: false, tree: [...blobEntries, ...directoryEntries] };
+    }
+    return {
+      sha: treeSha,
+      url: "",
+      truncated: false,
+      tree: await Promise.all([...tree.entries()].map(async ([path, bytes]) => ({
+        path,
+        mode: "100644",
+        type: "blob" as const,
+        sha: gitBlobSha1(bytes),
+        size: bytes.byteLength,
+        url: "",
+      }))),
+    };
   }
   async createGitBlob(bytes: Uint8Array) { const sha = `blob-${this.blobs.size + 1}`; this.blobs.set(sha, new Uint8Array(bytes)); return sha; }
   async createGitTree(entries: GitHubCreateTreeEntry[], baseTree?: string) {
@@ -947,7 +1017,7 @@ test("v4 normal pull routes rename cleanup through local trash semantics", async
   assert.deepEqual(target.operations.filter(operation => /^(?:trash|delete):old-name\.md$/u.test(operation)), ["trash:old-name.md"]);
 });
 
-test("v4 session validates only the config when the remote commit is unchanged", async () => {
+test("v4 session validates the remote head while reusing unchanged cached shards", async () => {
   const github = new MemoryGitHub();
   const vault = new MemoryVault();
   vault.files.set("a.md", { bytes: enc("one"), mtime: 1 });
@@ -959,10 +1029,60 @@ test("v4 session validates only the config when the remote commit is unchanged",
   github.readPaths.length = 0;
   await session.sync({ operation: "normal", allowThresholdOverride: false });
 
-  assert.deepEqual(github.readRefs, [github.ref!.sha]);
-  assert.deepEqual(github.readPaths, [V4_CONFIG_PATH]);
+  assert.deepEqual(github.readRefs, [github.ref!.sha, github.ref!.sha]);
+  assert.deepEqual(github.readPaths, [V4_CONFIG_PATH, V4_HEAD_PATH]);
   assert.deepEqual(github.treeReads, []);
 });
+
+test("v4 plaintext matching-SHA sync rejects a self-consistent local cache that disagrees with the remote head", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault();
+  vault.files.set("a.md", { bytes: enc("one"), mtime: 1 });
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "d1", mode: "plaintext" });
+  const session = new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 });
+  await session.sync({ operation: "forcePush", allowThresholdOverride: false });
+
+  const bucket = Object.keys(index.shards)[0];
+  const cachedRecord = Object.values(index.shards[bucket].records)[0];
+  const originalFileId = cachedRecord.fileId;
+  cachedRecord.fileId = "tampered-local-identity";
+  const tamperedHash = await hashV4ShardRecords(Object.values(index.shards[bucket].records));
+  index.shards[bucket].hash = tamperedHash;
+  index.shardHashes[bucket] = tamperedHash;
+
+  github.readPaths.length = 0;
+  const result = await session.sync({ operation: "normal", allowThresholdOverride: false });
+
+  assert.equal(result.mode, "noop");
+  assert.deepEqual(github.readPaths, [V4_CONFIG_PATH, V4_HEAD_PATH, `.obsidian-github-sync-v4/index/${bucket}.json`]);
+  assert.equal(indexRecordByPath(index, "a.md").fileId, originalFileId);
+});
+
+test("v4 encrypted stale device accepts the next authenticated plugin publication", async () => {
+  const github = new MemoryGitHub();
+  const keys = await deriveV4Keyring({ passphrase: "pass", repoId: "o/r#main", salt: enc("salt"), iterations: 10 });
+  const encryptedConfig: V4RemoteConfig = { formatVersion: V4_FORMAT_VERSION, mode: "encrypted", repoId: "o/r#main", pathLayout: "opaque-stable-v1", algorithm: "AES-GCM", kdf: "PBKDF2-SHA-256", kdfParams: { iterations: 10, salt: "c2FsdA" } };
+  const sourceVault = new MemoryVault();
+  sourceVault.files.set("secret.md", { bytes: enc("base"), mtime: 1 });
+  const sourceIndex = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "source", mode: "encrypted", pathLayout: "opaque-stable-v1" });
+
+  await new V4SyncSession({ github, vault: sourceVault, index: sourceIndex, config: encryptedConfig, keyring: keys, conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "forcePush", allowThresholdOverride: false });
+
+  const staleIndex = structuredClone(sourceIndex);
+  const staleVault = new MemoryVault();
+  staleVault.files.set("secret.md", { bytes: enc("base"), mtime: 1 });
+
+  sourceVault.files.set("secret.md", { bytes: enc("updated"), mtime: 2 });
+  await new V4SyncSession({ github, vault: sourceVault, index: sourceIndex, config: encryptedConfig, keyring: keys, conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "normal", allowThresholdOverride: false, changes: [{ type: "modify", path: "secret.md", mtime: 2 }] });
+
+  await new V4SyncSession({ github, vault: staleVault, index: staleIndex, config: encryptedConfig, keyring: keys, conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "normal", allowThresholdOverride: false, changes: [] });
+
+  assert.equal(dec(staleVault.files.get("secret.md")!.bytes), "updated");
+});
+
 
 test("v4 encrypted matching-SHA sync authenticates the remote head before publishing with a derived key", async () => {
   const github = new MemoryGitHub();
@@ -1009,6 +1129,101 @@ test("v4 Force Push cannot overwrite an encrypted remote without authenticating 
   assert.equal(plaintextVault.operations.some(operation => operation.startsWith("write:") || operation.startsWith("delete:") || operation.startsWith("trash:")), false);
 });
 
+test("v4 Force Push fails closed on an in-scope remote gitlink instead of claiming an exact mirror", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault();
+  vault.files.set("note.md", { bytes: enc("local"), mtime: 1 });
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "local", mode: "plaintext" });
+  await new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "forcePush", allowThresholdOverride: false });
+
+  const originalGetTreeAt = github.getTreeAt.bind(github);
+  github.getTreeAt = async (treeSha: string, recursive = true) => {
+    const tree = await originalGetTreeAt(treeSha, recursive);
+    return {
+      ...tree,
+      tree: [...tree.tree, {
+        path: "vendor/module",
+        mode: "160000",
+        type: "commit" as const,
+        sha: "f".repeat(40),
+        url: "",
+      }],
+    };
+  };
+  const before = { ref: github.ref!.sha, blobs: github.blobs.size, trees: github.trees.size, commits: github.commits.size };
+
+  await assert.rejects(
+    () => new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+      .sync({ operation: "forcePush", allowThresholdOverride: false }),
+    /Force Push.*gitlink|Force Push.*submodule|gitlink.*mirror|submodule.*mirror/iu,
+  );
+
+  assert.deepEqual({ ref: github.ref!.sha, blobs: github.blobs.size, trees: github.trees.size, commits: github.commits.size }, before);
+});
+
+test("v4 Force Push fails closed on an in-scope explicit empty Git tree", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault();
+  vault.files.set("note.md", { bytes: enc("local"), mtime: 1 });
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "local", mode: "plaintext" });
+  await new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "forcePush", allowThresholdOverride: false });
+
+  const originalGetTreeAt = github.getTreeAt.bind(github);
+  github.getTreeAt = async (treeSha: string, recursive = true) => {
+    const tree = await originalGetTreeAt(treeSha, recursive);
+    return {
+      ...tree,
+      tree: [...tree.tree, {
+        path: "empty-dir",
+        mode: "040000",
+        type: "tree" as const,
+        sha: "d".repeat(40),
+        url: "",
+      }],
+    };
+  };
+  const before = { ref: github.ref!.sha, blobs: github.blobs.size, trees: github.trees.size, commits: github.commits.size };
+
+  await assert.rejects(
+    () => new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+      .sync({ operation: "forcePush", allowThresholdOverride: false }),
+    /Force Push.*empty.*tree|empty.*tree.*mirror|tree.*mirror/iu,
+  );
+
+  assert.deepEqual({ ref: github.ref!.sha, blobs: github.blobs.size, trees: github.trees.size, commits: github.commits.size }, before);
+});
+
+test("v4 Force Push preserves an out-of-scope remote gitlink", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault();
+  vault.files.set("note.md", { bytes: enc("local"), mtime: 1 });
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "local", mode: "plaintext" });
+  const includePath = (path: string) => path !== "vendor/module";
+  await new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0, includePath })
+    .sync({ operation: "forcePush", allowThresholdOverride: false });
+
+  const originalGetTreeAt = github.getTreeAt.bind(github);
+  github.getTreeAt = async (treeSha: string, recursive = true) => {
+    const tree = await originalGetTreeAt(treeSha, recursive);
+    return {
+      ...tree,
+      tree: [...tree.tree, {
+        path: "vendor/module",
+        mode: "160000",
+        type: "commit" as const,
+        sha: "e".repeat(40),
+        url: "",
+      }],
+    };
+  };
+
+  const result = await new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0, includePath })
+    .sync({ operation: "forcePush", allowThresholdOverride: false });
+  assert.equal(result.mode, "force-push");
+});
+
 test("v4 encrypted correct-key matching-SHA no-op reads only config and authenticated head", async () => {
   const github = new MemoryGitHub();
   const vault = new MemoryVault();
@@ -1027,7 +1242,7 @@ test("v4 encrypted correct-key matching-SHA no-op reads only config and authenti
   assert.equal(result.mode, "noop");
   assert.deepEqual(github.readPaths, [V4_CONFIG_PATH, V4_HEAD_PATH]);
   assert.deepEqual(github.treeReads, []);
-  assert.deepEqual(vault.operations, []);
+  assert.deepEqual(vault.operations, ["read:secret.md"], "authoritative no-change scans still rehash local bytes");
 
   const bucket = Object.keys(index.shards)[0];
   const cachedRecord = Object.values(index.shards[bucket].records)[0];
@@ -1510,8 +1725,15 @@ test("v4 encrypted pack round trips through force pull and version-history previ
 
   const target = new MemoryVault();
   const targetIndex = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "b", mode: "encrypted" });
+  const originalGetFileBytes = github.getFileBytes.bind(github);
+  let pullPackReads = 0;
+  github.getFileBytes = async (path: string, ref?: string) => {
+    if (packPaths.includes(path)) pullPackReads++;
+    return originalGetFileBytes(path, ref);
+  };
   await new V4SyncSession({ github, vault: target, index: targetIndex, config: encryptedConfig, keyring: keys, conflictPolicy: "copy", abortChangePercent: 0 }).sync({ operation: "forcePull", allowThresholdOverride: false });
   assert.equal(dec(target.files.get("Folder/private-42.md")!.bytes), "secret-42");
+  assert.equal(pullPackReads, 1, "one packed immutable object should be fetched/decrypted once per pull generation");
 });
 
 test("v4 encrypted chunked rename reuses identity and parts without uploading content", async () => {
@@ -1905,7 +2127,7 @@ test("v4 confirmed Force Push migrates legacy encrypted paths in one commit", as
     epoch: 1,
     generation: 1,
     journalId: "legacy-v",
-    shardHashes: { [legacyPathId.slice(0, 2)]: "legacy-shard", [orphanPathId.slice(0, 2)]: "orphan-shard" },
+    shardHashes: await shardHashesForRecords([legacyRecord, orphanRecord]),
     updatedAt: 1,
     deviceId: "old",
   };
@@ -1998,7 +2220,7 @@ async function legacyMigrationEventFixture(input: { remotePath: string; localPat
     path: input.remotePath, pathId, fileId: input.fileId, plaintextSha256: await sha256Hex(remoteBytes), size: remoteBytes.byteLength, mtime: 1,
     remoteVersion: "legacy-v", remotePath: legacyObjectPath, storage: "single",
   };
-  const head: V4RemoteHead = { formatVersion: 4, mode: "encrypted", epoch: 1, generation: 1, journalId: "legacy-v", shardHashes: { [pathId.slice(0, 2)]: "legacy-shard" }, updatedAt: 1, deviceId: "old" };
+  const head: V4RemoteHead = { formatVersion: 4, mode: "encrypted", epoch: 1, generation: 1, journalId: "legacy-v", shardHashes: await shardHashesForRecords([legacyRecord]), updatedAt: 1, deviceId: "old" };
   const files = await buildV4RemoteMetadata({ config: legacyConfig, head, records: [legacyRecord], keyring: keys });
   files.push({ path: legacyObjectPath, bytes: await encryptV4Payload(keys.contentKey, remoteBytes, { kind: "content", aad: `${pathId}:legacy-v` }) });
   await publishV4TreeChanges(github, { message: "obsidian-sync-v4:legacy-v", files });
@@ -2082,7 +2304,7 @@ test("v4 confirmed migration accepts legacy packed records with retained loose e
   const retainedLegacyLoosePath = ".obsidian-github-sync-v4/data/Legacy/retained.enc";
   const legacyRecord: V4IndexFileRecord = { path: "Legacy/note.md", ...packed.records[0], encryptedPath: retainedLegacyLoosePath };
   const bucket = legacyRecord.pathId.slice(0, 2);
-  const head: V4RemoteHead = { formatVersion: 4, mode: "encrypted", epoch: 1, generation: 1, journalId: "legacy-packed-v", shardHashes: { [bucket]: "legacy-pack-shard" }, updatedAt: 1, deviceId: "old" };
+  const head: V4RemoteHead = { formatVersion: 4, mode: "encrypted", epoch: 1, generation: 1, journalId: "legacy-packed-v", shardHashes: await shardHashesForRecords([legacyRecord]), updatedAt: 1, deviceId: "old" };
   await publishV4TreeChanges(github, { message: "obsidian-sync-v4:legacy-packed-v", files: [{ path: retainedLegacyLoosePath, bytes: loose.files[0].bytes }, packed.file, ...await buildV4RemoteMetadata({ config: legacyConfig, head, records: [legacyRecord], keyring: keys })] });
   assert.deepEqual(await codec.read(legacyRecord, async path => (await github.getFileBytes(path, github.ref!.sha))!.bytes), plaintext);
   const oldPackPath = legacyRecord.remotePath;
@@ -2110,7 +2332,7 @@ test("v4 legacy migration refuses to delete encrypted records excluded by sync s
   const keys = await deriveV4Keyring({ passphrase: "pass", repoId: "o/r#main", salt: enc("salt"), iterations: 10 });
   const pathId = await (await import("../../src/lib/v4/paths")).pathIdForV4Path(keys.pathKey, "Excluded/note.md");
   const record: V4IndexFileRecord = { path: "Excluded/note.md", pathId, fileId: "excluded-file", plaintextSha256: await sha256Hex(plaintext), size: plaintext.byteLength, mtime: 1, remoteVersion: "legacy-v", remotePath: ".obsidian-github-sync-v4/data/Excluded/note.enc", storage: "single" };
-  const head: V4RemoteHead = { formatVersion: 4, mode: "encrypted", epoch: 1, generation: 1, journalId: "legacy-v", shardHashes: { [pathId.slice(0, 2)]: "legacy-shard" }, updatedAt: 1, deviceId: "old" };
+  const head: V4RemoteHead = { formatVersion: 4, mode: "encrypted", epoch: 1, generation: 1, journalId: "legacy-v", shardHashes: await shardHashesForRecords([record]), updatedAt: 1, deviceId: "old" };
   const files = await buildV4RemoteMetadata({ config: legacyConfig, head, records: [record], keyring: keys });
   files.push({ path: record.remotePath, bytes: await encryptV4Payload(keys.contentKey, plaintext, { kind: "content", aad: `${record.pathId}:legacy-v` }) });
   await publishV4TreeChanges(github, { message: "obsidian-sync-v4:legacy-v", files });
@@ -2208,7 +2430,7 @@ test("v4 stale device reconciles a direct GitHub edit after a newer plugin commi
   assert.ok(github.treeReads.includes("tree-external"));
 });
 
-test("v4 no-op reuses all 256 unchanged local index shards", async () => {
+test("v4 no-op reuses all 256 unchanged remote shards while rehashing authoritative local state", async () => {
   const github = new MemoryGitHub();
   const vault = new MemoryVault();
   const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "d", mode: "plaintext" });
@@ -2218,14 +2440,14 @@ test("v4 no-op reuses all 256 unchanged local index shards", async () => {
     const pathId = await sha256Hex(enc(`path:${path}`));
     const bucket = pathId.slice(0, 2);
     if (shardHashes[bucket]) continue;
-    const record = { path, pathId, fileId: `file-${bucket}`, plaintextSha256: `hash-${bucket}`, size: 1, mtime: 1, remoteVersion: "j1", remotePath: path, storage: "single" as const };
-    const hash = `shard-${bucket}`;
+    const record = { path, pathId, fileId: `file-${bucket}`, plaintextSha256: await sha256Hex(enc("x")), size: 1, mtime: 1, remoteVersion: "j1", remotePath: path, storage: "single" as const };
+    const hash = await hashV4ShardRecords([record]);
     shardHashes[bucket] = hash;
     index.shardHashes[bucket] = hash;
     index.shards[bucket] = { bucket, hash, records: { [pathId]: record } };
     vault.files.set(path, { bytes: enc("x"), mtime: 1 });
   }
-  index.remoteCommitSha = "commit-previous";
+  index.remoteCommitSha = "commit-noop";
   index.epoch = 1;
   index.generation = 1;
   const head: V4RemoteHead = { formatVersion: 4, mode: "plaintext", epoch: 1, generation: 1, journalId: "j1", shardHashes, updatedAt: 1, deviceId: "other" };
@@ -2242,7 +2464,37 @@ test("v4 no-op reuses all 256 unchanged local index shards", async () => {
 
   assert.equal(result.mode, "noop");
   assert.deepEqual(github.readPaths, [V4_CONFIG_PATH, V4_HEAD_PATH]);
-  assert.equal(vault.operations.length, 0);
+  assert.equal(vault.operations.filter(operation => operation.startsWith("read:")).length, 256);
+});
+
+test("v4 refuses to publish when the remote generation cannot be incremented safely", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault();
+  vault.files.set("note.md", { bytes: enc("base"), mtime: 1 });
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "local", mode: "plaintext" });
+
+  await new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "forcePush", allowThresholdOverride: false });
+
+  const currentHead = github.ref!.sha;
+  const currentTreeSha = github.commits.get(currentHead)!.treeSha;
+  const currentTree = github.trees.get(currentTreeSha)!;
+  const head = JSON.parse(dec(currentTree.get(V4_HEAD_PATH)!)) as V4RemoteHead;
+  head.generation = Number.MAX_SAFE_INTEGER;
+  currentTree.set(V4_HEAD_PATH, enc(JSON.stringify(head)));
+  github.files.set(V4_HEAD_PATH, enc(JSON.stringify(head)));
+  index.generation = Number.MAX_SAFE_INTEGER;
+
+  vault.files.set("note.md", { bytes: enc("local edit"), mtime: 2 });
+  const before = { ref: github.ref!.sha, blobs: github.blobs.size, trees: github.trees.size, commits: github.commits.size };
+
+  await assert.rejects(
+    () => new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+      .sync({ operation: "normal", allowThresholdOverride: false, changes: [{ type: "modify", path: "note.md", mtime: 2 }] }),
+    /generation.*overflow|generation.*safe|generation.*increment|maximum.*generation/iu,
+  );
+
+  assert.deepEqual({ ref: github.ref!.sha, blobs: github.blobs.size, trees: github.trees.size, commits: github.commits.size }, before);
 });
 
 test("v4 authenticated remote duplicate fileIds are rejected before normal or Force Pull mutation", async () => {
@@ -2256,7 +2508,7 @@ test("v4 authenticated remote duplicate fileIds are rejected before normal or Fo
     { path: "one.md", pathId: firstPathId, fileId: "duplicate-id", plaintextSha256: "a".repeat(64), size: 1, mtime: 1, remoteVersion: "v", remotePath, storage: "single" },
     { path: "two.md", pathId: secondPathId, fileId: "duplicate-id", plaintextSha256: "b".repeat(64), size: 1, mtime: 1, remoteVersion: "v", remotePath, storage: "single" },
   ];
-  const shardHashes = Object.fromEntries([...new Set(records.map(record => record.pathId.slice(0, 2)))].map(bucket => [bucket, `hash-${bucket}`]));
+  const shardHashes = await shardHashesForRecords(records);
   const head: V4RemoteHead = { formatVersion: 4, mode: "encrypted", epoch: 1, generation: 1, journalId: "malicious", shardHashes, updatedAt: 1, deviceId: "attacker" };
   await publishV4TreeChanges(github, { message: "obsidian-sync-v4:malicious", files: await buildV4RemoteMetadata({ config: encryptedConfig, head, records, keyring: keys }) });
   const before = { ref: github.ref!.sha, blobs: github.blobs.size, trees: github.trees.size, commits: github.commits.size };
@@ -2291,7 +2543,7 @@ test("v4 authenticated remote duplicate paths and fabricated pathIds reject befo
 
   for (const scenario of cases) {
     const github = new MemoryGitHub();
-    const shardHashes = Object.fromEntries([...new Set(scenario.records.map(item => item.pathId.slice(0, 2)))].map(bucket => [bucket, `hash-${bucket}`]));
+    const shardHashes = await shardHashesForRecords(scenario.records);
     const head: V4RemoteHead = { formatVersion: 4, mode: "encrypted", epoch: 1, generation: 1, journalId: "malicious", shardHashes, updatedAt: 1, deviceId: "attacker" };
     await publishV4TreeChanges(github, { message: "obsidian-sync-v4:malicious", files: await buildV4RemoteMetadata({ config: encryptedConfig, head, records: scenario.records, keyring: keys }) });
     const before = { ref: github.ref!.sha, blobs: github.blobs.size, trees: github.trees.size, commits: github.commits.size };
@@ -2623,4 +2875,864 @@ test("v4 pull rename preserves an old-path user edit that appears while remote b
     /local target changed/iu,
   );
   assert.equal(dec(localVault.files.get("old.md")!.bytes), "user-edit");
+});
+
+
+test("v4 keep-both chunked conflict streams the remote copy instead of whole-buffer reassembly", async () => {
+  const github = new MemoryGitHub();
+  const path = "conflict.bin";
+  const pathId = await sha256Hex(enc(`path:${path}`));
+  const bucket = pathId.slice(0, 2);
+  const fileId = "chunk-conflict-file";
+  const makeRecord = async (version: string, bytes: Uint8Array) => {
+    const partCount = Math.ceil(bytes.byteLength / V4_PART_BYTES);
+    const partPaths = buildV4PartPaths({ mode: "plaintext", logicalPath: path, version, partCount });
+    return {
+      path,
+      pathId,
+      fileId,
+      plaintextSha256: await sha256Hex(bytes),
+      size: bytes.byteLength,
+      mtime: version === "v1" ? 1 : 2,
+      remoteVersion: version,
+      remotePath: partPaths[0],
+      storage: "chunked" as const,
+      partPaths,
+    };
+  };
+  const publish = async (record: V4IndexFileRecord, bytes: Uint8Array, generation: number, expectedHeadSha?: string) => {
+    const shardHash = await hashV4ShardRecords([record]);
+    const head: V4RemoteHead = {
+      formatVersion: 4,
+      mode: "plaintext",
+      epoch: 1,
+      generation,
+      journalId: record.remoteVersion,
+      shardHashes: { [bucket]: shardHash },
+      updatedAt: generation,
+      deviceId: "remote",
+    };
+    const objectFiles = record.partPaths!.map((partPath, index) => {
+      const start = index * V4_PART_BYTES;
+      return { path: partPath, bytes: bytes.subarray(start, Math.min(bytes.byteLength, start + V4_PART_BYTES)) };
+    });
+    return publishV4TreeChanges(github, {
+      message: `obsidian-sync-v4:${record.remoteVersion}`,
+      files: [...objectFiles, ...await buildV4RemoteMetadata({ config: config(), head, records: [record] })],
+      expectedHeadSha,
+    });
+  };
+
+  const remoteBytes = new Uint8Array(V4_LARGE_FILE_THRESHOLD_BYTES + 1);
+  remoteBytes[0] = 1;
+  remoteBytes[remoteBytes.byteLength - 1] = 1;
+  const localBytes = new Uint8Array([3, 3]);
+  const baseRecord = await makeRecord("v1", remoteBytes);
+  const base = await publish(baseRecord, remoteBytes, 1);
+  remoteBytes[0] = 2;
+  remoteBytes[remoteBytes.byteLength - 1] = 2;
+  const remoteRecord = await makeRecord("v2", remoteBytes);
+  await publish(remoteRecord, remoteBytes, 2, base.commitSha);
+
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "local", mode: "plaintext" });
+  const baseHash = await hashV4ShardRecords([baseRecord]);
+  index.remoteCommitSha = base.commitSha;
+  index.epoch = 1;
+  index.generation = 1;
+  index.shardHashes = { [bucket]: baseHash };
+  index.shards = {
+    [bucket]: {
+      bucket,
+      hash: baseHash,
+      records: { [pathId]: { ...baseRecord, dirty: false } },
+    },
+  };
+  const vault = new MemoryVault();
+  vault.files.set(path, { bytes: localBytes, mtime: 3 });
+
+  const session = new V4SyncSession({
+    github,
+    vault,
+    index,
+    config: config(),
+    conflictPolicy: "copy",
+    abortChangePercent: 0,
+    now: () => 100,
+  });
+  const privateSession = session as unknown as {
+    readRecord(record: V4IndexFileRecord, remoteCommitSha?: string): Promise<Uint8Array>;
+  };
+  privateSession.readRecord = async record => {
+    if (record.storage === "chunked") throw new Error("whole-buffer chunk conflict copy forbidden");
+    throw new Error("unexpected whole-buffer remote read");
+  };
+
+  await session.sync({ operation: "normal", allowThresholdOverride: false, changes: [{ type: "modify", path, mtime: 3 }] });
+
+  const copyPath = [...vault.files.keys()].find(candidate => candidate.includes(".conflict-remote-"));
+  assert.ok(copyPath);
+  const copied = vault.files.get(copyPath!)?.bytes;
+  assert.ok(copied);
+  assert.equal(copied.byteLength, remoteBytes.byteLength);
+  assert.equal(copied[0], 2);
+  assert.equal(copied[copied.byteLength - 1], 2);
+  assert.deepEqual(vault.files.get(path)?.bytes, localBytes);
+});
+
+
+test("v4 external reconciliation reuses unchanged blobs instead of re-reading every file", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault();
+  vault.files.set("unchanged.md", { bytes: enc("same"), mtime: 1 });
+  vault.files.set("changed.md", { bytes: enc("before"), mtime: 1 });
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "local", mode: "plaintext" });
+
+  await new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "forcePush", allowThresholdOverride: false });
+
+  const previousHead = github.ref!.sha;
+  const previousTree = github.commits.get(previousHead)!.treeSha;
+  const changedBlob = await github.createGitBlob(enc("after"));
+  const externalTree = await github.createGitTree([
+    { path: "changed.md", mode: "100644", type: "blob", sha: changedBlob },
+  ], previousTree);
+  const externalCommit = await github.createGitCommit("external edit", externalTree, [previousHead]);
+  await github.updateGitRef(externalCommit, previousHead);
+
+  const originalGetTreeAt = github.getTreeAt.bind(github);
+  github.getTreeAt = async function(treeSha: string, recursive = true) {
+    if (!recursive) return originalGetTreeAt(treeSha, false);
+    this.treeReads.push(treeSha);
+    const tree = this.trees.get(treeSha) ?? new Map();
+    return {
+      sha: treeSha,
+      url: "",
+      truncated: false,
+      tree: await Promise.all([...tree.entries()].map(async ([path, bytes]) => ({
+        path,
+        mode: "100644",
+        type: "blob" as const,
+        sha: gitBlobSha1(bytes),
+        size: bytes.byteLength,
+        url: "",
+      }))),
+    };
+  };
+  github.readPaths.length = 0;
+  github.readRefs.length = 0;
+
+  await new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "normal", allowThresholdOverride: false, changes: [] });
+
+  assert.equal(github.readPaths.filter(path => path === "unchanged.md").length, 0, "unchanged external blobs must be reused from authenticated V4 metadata");
+  assert.ok(github.readPaths.includes("changed.md"), "changed external blob must still be read");
+  assert.equal(dec(vault.files.get("unchanged.md")!.bytes), "same");
+  assert.equal(dec(vault.files.get("changed.md")!.bytes), "after");
+});
+
+test("v4 external reconciliation rejects canonical file topology before blob reads", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault();
+  vault.files.set("base.md", { bytes: enc("base"), mtime: 1 });
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "local", mode: "plaintext" });
+
+  await new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "forcePush", allowThresholdOverride: false });
+
+  const previousHead = github.ref!.sha;
+  const previousTree = github.commits.get(previousHead)!.treeSha;
+  const parentBlob = await github.createGitBlob(enc("parent"));
+  const childBlob = await github.createGitBlob(enc("child"));
+  const externalTree = await github.createGitTree([
+    { path: "Dir", mode: "100644", type: "blob", sha: parentBlob },
+    { path: "dir/child.md", mode: "100644", type: "blob", sha: childBlob },
+  ], previousTree);
+  const externalCommit = await github.createGitCommit("external canonical topology collision", externalTree, [previousHead]);
+  await github.updateGitRef(externalCommit, previousHead);
+
+  github.readPaths.length = 0;
+  vault.operations.length = 0;
+
+  await assert.rejects(
+    () => new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+      .sync({ operation: "normal", allowThresholdOverride: false, changes: [] }),
+    /canonical|case-insensitive|ancestor|prefix|topology|collision/iu,
+  );
+
+  const collisionReads = github.readPaths.filter(path => path === "Dir" || path === "dir/child.md");
+  assert.deepEqual(collisionReads, [], "impossible external path topology must reject before blob body reads");
+  assert.deepEqual(vault.operations.filter(operation => /^(?:write|trash|delete|commit-stage):/u.test(operation)), []);
+});
+
+
+test("v4 external reconciliation rejects internal V4 subtree tampering before metadata publication", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault();
+  vault.files.set("note.md", { bytes: enc("local"), mtime: 1 });
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "local", mode: "plaintext" });
+
+  await new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "forcePush", allowThresholdOverride: false });
+
+  const previousHead = github.ref!.sha;
+  const previousTree = github.commits.get(previousHead)!.treeSha;
+  const bucket = Object.keys(index.shardHashes)[0];
+  assert.ok(bucket, "force push must create at least one V4 shard");
+  const shardPath = `${V4_ROOT}/index/${bucket}.json`;
+  const tamperedShard = await github.createGitBlob(enc(JSON.stringify({ bucket, records: {} })));
+  const externalTree = await github.createGitTree([
+    { path: shardPath, mode: "100644", type: "blob", sha: tamperedShard },
+  ], previousTree);
+  const externalCommit = await github.createGitCommit("external V4 shard tamper", externalTree, [previousHead]);
+  await github.updateGitRef(externalCommit, previousHead);
+
+  vault.operations.length = 0;
+  const beforeRef = github.ref!.sha;
+  await assert.rejects(
+    () => new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+      .sync({ operation: "normal", allowThresholdOverride: false, changes: [] }),
+    /internal.*V4|V4.*internal|metadata.*tamper|subtree.*changed/iu,
+  );
+
+  assert.equal(github.ref!.sha, beforeRef, "tampered internal V4 subtree must not be laundered into a plugin publication");
+  assert.equal(dec(vault.files.get("note.md")!.bytes), "local");
+  assert.deepEqual(vault.operations.filter(operation => /^(?:write|trash|delete|commit-stage):/u.test(operation)), []);
+});
+
+
+test("v4 external reconciliation rejects an in-scope explicit empty Git tree before metadata publication", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault();
+  vault.files.set("note.md", { bytes: enc("local"), mtime: 1 });
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "local", mode: "plaintext" });
+
+  await new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "forcePush", allowThresholdOverride: false });
+
+  const previousHead = github.ref!.sha;
+  const previousTree = github.commits.get(previousHead)!.treeSha;
+  const externalTree = await github.createGitTree([], previousTree);
+  const externalCommit = await github.createGitCommit("external explicit empty tree", externalTree, [previousHead]);
+  await github.updateGitRef(externalCommit, previousHead);
+
+  const originalGetTreeAt = github.getTreeAt.bind(github);
+  github.getTreeAt = async (treeSha: string, recursive = true) => {
+    const tree = await originalGetTreeAt(treeSha, recursive);
+    if (treeSha !== externalTree) return tree;
+    return {
+      ...tree,
+      tree: [...tree.tree, {
+        path: "EmptyFolder",
+        mode: "040000",
+        type: "tree" as const,
+        sha: "e".repeat(40),
+        url: "",
+      }],
+    };
+  };
+
+  vault.operations.length = 0;
+  const beforeRef = github.ref!.sha;
+  await assert.rejects(
+    () => new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+      .sync({ operation: "normal", allowThresholdOverride: false, changes: [] }),
+    /external.*empty.*tree|empty.*tree.*external|explicit.*empty.*tree/iu,
+  );
+
+  assert.equal(github.ref!.sha, beforeRef, "unsupported external empty tree must not publish replacement V4 metadata");
+  assert.equal(dec(vault.files.get("note.md")!.bytes), "local");
+  assert.deepEqual(vault.operations.filter(operation => /^(?:write|trash|delete|commit-stage):/u.test(operation)), []);
+});
+
+
+test("v4 external reconciliation fails closed on an in-scope gitlink before local deletion", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault();
+  vault.files.set("note.md", { bytes: enc("local"), mtime: 1 });
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "local", mode: "plaintext" });
+
+  await new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "forcePush", allowThresholdOverride: false });
+
+  const previousHead = github.ref!.sha;
+  const previousTree = github.commits.get(previousHead)!.treeSha;
+  const externalTree = `tree-gitlink-${github.trees.size + 1}`;
+  const externalFiles = new Map(github.trees.get(previousTree));
+  externalFiles.delete("note.md");
+  github.trees.set(externalTree, externalFiles);
+  const externalCommit = await github.createGitCommit("external submodule", externalTree, [previousHead]);
+  await github.updateGitRef(externalCommit, previousHead);
+
+  const originalGetTreeAt = github.getTreeAt.bind(github);
+  github.getTreeAt = async (treeSha: string, recursive = true) => {
+    const tree = await originalGetTreeAt(treeSha, recursive);
+    if (treeSha !== externalTree) return tree;
+    return {
+      ...tree,
+      tree: [...tree.tree, {
+        path: "note.md",
+        mode: "160000",
+        type: "commit" as const,
+        sha: "f".repeat(40),
+        url: "",
+      }],
+    };
+  };
+
+  vault.operations.length = 0;
+  const beforeRef = github.ref!.sha;
+  await assert.rejects(
+    () => new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+      .sync({ operation: "normal", allowThresholdOverride: false, changes: [] }),
+    /external.*gitlink|external.*submodule|gitlink.*unsupported|submodule.*unsupported/iu,
+  );
+
+  assert.equal(github.ref!.sha, beforeRef, "unsupported external gitlink must not publish a replacement metadata commit");
+  assert.equal(dec(vault.files.get("note.md")!.bytes), "local");
+  assert.deepEqual(vault.operations.filter(operation => /^(?:write|trash|delete|commit-stage):/u.test(operation)), []);
+});
+
+test("v4 external reconciliation rejects a tracked file replaced by a Git directory before local deletion", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault();
+  vault.files.set("note.md", { bytes: enc("local"), mtime: 1 });
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "local", mode: "plaintext" });
+
+  await new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "forcePush", allowThresholdOverride: false });
+
+  const previousHead = github.ref!.sha;
+  const previousTree = github.commits.get(previousHead)!.treeSha;
+  const externalTree = `tree-directory-${github.trees.size + 1}`;
+  const externalFiles = new Map(github.trees.get(previousTree));
+  externalFiles.delete("note.md");
+  externalFiles.set("note.md/child.md", enc("child"));
+  github.trees.set(externalTree, externalFiles);
+  const externalCommit = await github.createGitCommit("external file-to-directory replacement", externalTree, [previousHead]);
+  await github.updateGitRef(externalCommit, previousHead);
+
+  const originalGetTreeAt = github.getTreeAt.bind(github);
+  github.getTreeAt = async (treeSha: string, recursive = true) => {
+    const tree = await originalGetTreeAt(treeSha, recursive);
+    if (treeSha !== externalTree) return tree;
+    return {
+      ...tree,
+      tree: [{
+        path: "note.md",
+        mode: "040000",
+        type: "tree" as const,
+        sha: "c".repeat(40),
+        url: "",
+      }, ...tree.tree],
+    };
+  };
+
+  vault.operations.length = 0;
+  const beforeRef = github.ref!.sha;
+  await assert.rejects(
+    () => new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+      .sync({ operation: "normal", allowThresholdOverride: false, changes: [] }),
+    /external.*tree|external.*directory|tree.*tracked|directory.*tracked/iu,
+  );
+
+  assert.equal(github.ref!.sha, beforeRef, "unsupported file-to-directory replacement must not publish metadata");
+  assert.equal(dec(vault.files.get("note.md")!.bytes), "local");
+  assert.deepEqual(vault.operations.filter(operation => /^(?:write|trash|delete|commit-stage):/u.test(operation)), []);
+});
+
+test("v4 external reconciliation rejects canonical file-prefix topology before local mutation or metadata publication", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault();
+  vault.files.set("Dir", { bytes: enc("tracked"), mtime: 1 });
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "local", mode: "plaintext" });
+
+  await new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "forcePush", allowThresholdOverride: false });
+
+  const previousHead = github.ref!.sha;
+  const previousTree = github.commits.get(previousHead)!.treeSha;
+  const externalTree = `tree-canonical-prefix-${github.trees.size + 1}`;
+  const externalFiles = new Map(github.trees.get(previousTree));
+  externalFiles.set("dir/child.md", enc("child"));
+  github.trees.set(externalTree, externalFiles);
+  const externalCommit = await github.createGitCommit("external canonical path topology", externalTree, [previousHead]);
+  await github.updateGitRef(externalCommit, previousHead);
+
+  vault.operations.length = 0;
+  const beforeRef = github.ref!.sha;
+  await assert.rejects(
+    () => new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+      .sync({ operation: "normal", allowThresholdOverride: false, changes: [] }),
+    /canonical|path.*topology|ancestor|prefix|collision/iu,
+  );
+
+  assert.equal(github.ref!.sha, beforeRef, "unsafe external topology must not publish replacement V4 metadata");
+  assert.equal(dec(vault.files.get("Dir")!.bytes), "tracked");
+  assert.equal(vault.files.has("dir/child.md"), false);
+  assert.deepEqual(vault.operations.filter(operation => /^(?:write|trash|delete|commit-stage):/u.test(operation)), []);
+});
+
+
+test("v4 external reconciliation rejects an in-scope symlink before replacing local file content", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault();
+  vault.files.set("note.md", { bytes: enc("local"), mtime: 1 });
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "local", mode: "plaintext" });
+
+  await new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "forcePush", allowThresholdOverride: false });
+
+  const previousHead = github.ref!.sha;
+  const previousTree = github.commits.get(previousHead)!.treeSha;
+  const externalTree = `tree-symlink-${github.trees.size + 1}`;
+  const externalFiles = new Map(github.trees.get(previousTree));
+  externalFiles.set("note.md", enc("target.md"));
+  github.trees.set(externalTree, externalFiles);
+  const externalCommit = await github.createGitCommit("external symlink", externalTree, [previousHead]);
+  await github.updateGitRef(externalCommit, previousHead);
+
+  const originalGetTreeAt = github.getTreeAt.bind(github);
+  github.getTreeAt = async (treeSha: string, recursive = true) => {
+    const tree = await originalGetTreeAt(treeSha, recursive);
+    if (treeSha !== externalTree) return tree;
+    return {
+      ...tree,
+      tree: tree.tree.map(node => node.path === "note.md"
+        ? { ...node, mode: "120000", type: "blob" as const }
+        : node),
+    };
+  };
+
+  vault.operations.length = 0;
+  const beforeRef = github.ref!.sha;
+  await assert.rejects(
+    () => new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+      .sync({ operation: "normal", allowThresholdOverride: false, changes: [] }),
+    /external.*symlink|symlink.*unsupported|unsupported.*symlink/iu,
+  );
+
+  assert.equal(github.ref!.sha, beforeRef, "unsupported external symlink must not publish replacement metadata");
+  assert.equal(dec(vault.files.get("note.md")!.bytes), "local");
+  assert.deepEqual(vault.operations.filter(operation => /^(?:write|trash|delete|commit-stage):/u.test(operation)), []);
+});
+
+test("v4 rejects a non-canonical external Git path before any local pull mutation", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault();
+  vault.files.set("base.md", { bytes: enc("base"), mtime: 1 });
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "d", mode: "plaintext" });
+
+  await new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "forcePush", allowThresholdOverride: false });
+
+  const previousHead = github.ref!.sha;
+  const previousTree = github.commits.get(previousHead)!.treeSha;
+  const blobSha = await github.createGitBlob(enc("external"));
+  const externalTree = await github.createGitTree([
+    { path: "Folder\\evil.md", mode: "100644", type: "blob", sha: blobSha },
+  ], previousTree);
+  const externalCommit = await github.createGitCommit("external edit", externalTree, [previousHead]);
+  await github.updateGitRef(externalCommit, previousHead);
+
+  vault.operations.length = 0;
+
+  await assert.rejects(
+    () => new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+      .sync({ operation: "normal", allowThresholdOverride: false }),
+    /external.*path|not normalized|unsafe.*path/iu,
+  );
+
+  assert.deepEqual(vault.operations.filter(operation => /^(?:write|trash|delete):/u.test(operation)), []);
+  assert.equal(vault.files.has("Folder\\evil.md"), false);
+  assert.equal(vault.files.has("Folder/evil.md"), false);
+});
+
+
+test("v4 newer policy does not treat synthesized external reconciliation mtime as authoritative", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault();
+  vault.files.set("note.md", { bytes: enc("base"), mtime: 1 });
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "local", mode: "plaintext" });
+
+  await new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "newer", abortChangePercent: 0, now: () => 10 })
+    .sync({ operation: "forcePush", allowThresholdOverride: false });
+
+  const previousHead = github.ref!.sha;
+  const previousTree = github.commits.get(previousHead)!.treeSha;
+  const remoteBlob = await github.createGitBlob(enc("external remote"));
+  const externalTree = await github.createGitTree([
+    { path: "note.md", mode: "100644", type: "blob", sha: remoteBlob },
+  ], previousTree);
+  const externalCommit = await github.createGitCommit("manual GitHub edit", externalTree, [previousHead]);
+  await github.updateGitRef(externalCommit, previousHead);
+
+  vault.files.set("note.md", { bytes: enc("local edit"), mtime: 20 });
+
+  await new V4SyncSession({
+    github,
+    vault,
+    index,
+    config: config(),
+    conflictPolicy: "newer",
+    abortChangePercent: 0,
+    now: () => 100,
+  }).sync({
+    operation: "normal",
+    allowThresholdOverride: false,
+    changes: [{ type: "modify", path: "note.md", mtime: 20 }],
+  });
+
+  assert.equal(dec(vault.files.get("note.md")!.bytes), "local edit");
+  const copyPath = [...vault.files.keys()].find(path => path.includes(".conflict-remote-"));
+  assert.ok(copyPath, "external conflict must be preserved as a copy when remote mtime is synthetic");
+  assert.equal(dec(vault.files.get(copyPath!)!.bytes), "external remote");
+});
+
+
+test("v4 authoritative full scan detects same-size same-mtime local content changes", async () => {
+  const github = new MemoryGitHub()
+  const vault = new MemoryVault()
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "local", mode: "plaintext" })
+  vault.files.set("note.md", { bytes: enc("AAAA"), mtime: 1 })
+
+  await new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "forcePush", allowThresholdOverride: false })
+
+  const firstHead = github.ref!.sha
+  const firstHash = indexRecordByPath(index, "note.md").plaintextSha256
+  vault.files.set("note.md", { bytes: enc("BBBB"), mtime: 1 })
+
+  await new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "normal", allowThresholdOverride: false, changes: [] })
+
+  assert.notEqual(github.ref!.sha, firstHead)
+  assert.notEqual(indexRecordByPath(index, "note.md").plaintextSha256, firstHash)
+  assert.equal(indexRecordByPath(index, "note.md").plaintextSha256, await sha256Hex(enc("BBBB")))
+})
+
+test("v4 explicit rescan detects same-size same-mtime local content changes", async () => {
+  const github = new MemoryGitHub()
+  const vault = new MemoryVault()
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "local", mode: "plaintext" })
+  vault.files.set("note.md", { bytes: enc("AAAA"), mtime: 1 })
+
+  await new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "forcePush", allowThresholdOverride: false })
+
+  const firstHead = github.ref!.sha
+  vault.files.set("note.md", { bytes: enc("BBBB"), mtime: 1 })
+
+  await new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "normal", allowThresholdOverride: false, changes: [{ type: "rescan", mtime: 2 }] })
+
+  assert.notEqual(github.ref!.sha, firstHead)
+  assert.equal(indexRecordByPath(index, "note.md").plaintextSha256, await sha256Hex(enc("BBBB")))
+})
+
+
+test("v4 does not trust a forged plugin commit marker when the V4 head blob did not change", async () => {
+  const github = new MemoryGitHub()
+  const vault = new MemoryVault()
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "local", mode: "plaintext" })
+  vault.files.set("note.md", { bytes: enc("base"), mtime: 1 })
+
+  await new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "forcePush", allowThresholdOverride: false })
+
+  const previousHead = github.ref!.sha
+  const previousCommit = github.commits.get(previousHead)!
+  const forgedBlob = await github.createGitBlob(enc("forged external"))
+  const forgedTree = await github.createGitTree([
+    { path: "note.md", mode: "100644", type: "blob", sha: forgedBlob },
+  ], previousCommit.treeSha)
+  const forgedCommit = await github.createGitCommit(previousCommit.message, forgedTree, [previousHead])
+  await github.updateGitRef(forgedCommit, previousHead)
+
+  await new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "normal", allowThresholdOverride: false, changes: [] })
+
+  assert.equal(dec(vault.files.get("note.md")!.bytes), "forged external")
+  assert.equal(index.remoteCommitSha, github.ref!.sha)
+})
+
+test("v4 does not trust forged generation progression that hides managed blob edits", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault();
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "local", mode: "plaintext" });
+  vault.files.set("note.md", { bytes: enc("base"), mtime: 1 });
+
+  await new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "forcePush", allowThresholdOverride: false });
+
+  const previousHead = github.ref!.sha;
+  const previousCommit = github.commits.get(previousHead)!;
+  const previousHeadBytes = github.trees.get(previousCommit.treeSha)!.get(V4_HEAD_PATH)!;
+  const previousRemoteHead = JSON.parse(dec(previousHeadBytes)) as V4RemoteHead;
+  const forgedJournalId = "forged-journal";
+  const forgedHead: V4RemoteHead = {
+    ...previousRemoteHead,
+    generation: previousRemoteHead.generation + 1,
+    journalId: forgedJournalId,
+    updatedAt: previousRemoteHead.updatedAt + 1,
+    deviceId: "forger",
+  };
+
+  const forgedBlob = await github.createGitBlob(enc("forged external"));
+  const forgedHeadBlob = await github.createGitBlob(enc(JSON.stringify(forgedHead)));
+  const forgedTree = await github.createGitTree([
+    { path: "note.md", mode: "100644", type: "blob", sha: forgedBlob },
+    { path: V4_HEAD_PATH, mode: "100644", type: "blob", sha: forgedHeadBlob },
+  ], previousCommit.treeSha);
+  const forgedCommit = await github.createGitCommit(`obsidian-sync-v4:${forgedJournalId}`, forgedTree, [previousHead]);
+  await github.updateGitRef(forgedCommit, previousHead);
+
+  vault.operations.length = 0;
+  await assert.rejects(
+    () => new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+      .sync({ operation: "normal", allowThresholdOverride: false, changes: [] }),
+    /publication|internal.*V4|V4.*internal|subtree|journal|verified/iu,
+  );
+
+  assert.equal(index.remoteCommitSha, previousHead, "forged publication must not advance the trusted local baseline");
+  assert.equal(dec(vault.files.get("note.md")!.bytes), "base");
+  assert.deepEqual(vault.operations.filter(operation => /^(?:write|trash|delete|commit-stage):/u.test(operation)), []);
+});
+
+
+test("v4 does not trust forged plugin publication that tampers a cached internal shard", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault();
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "local", mode: "plaintext" });
+  vault.files.set("note.md", { bytes: enc("base"), mtime: 1 });
+
+  await new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "forcePush", allowThresholdOverride: false });
+
+  const previousHead = github.ref!.sha;
+  const previousCommit = github.commits.get(previousHead)!;
+  const previousTree = github.trees.get(previousCommit.treeSha)!;
+  const previousHeadBytes = previousTree.get(V4_HEAD_PATH)!;
+  const previousRemoteHead = JSON.parse(dec(previousHeadBytes)) as V4RemoteHead;
+  const bucket = Object.keys(previousRemoteHead.shardHashes)[0];
+  assert.ok(bucket);
+  const shardPath = `${V4_ROOT}/index/${bucket}.json`;
+  assert.ok(previousTree.has(shardPath));
+
+  const forgedJournalId = "forged-cached-shard";
+  const forgedHead: V4RemoteHead = {
+    ...previousRemoteHead,
+    generation: previousRemoteHead.generation + 1,
+    journalId: forgedJournalId,
+    updatedAt: previousRemoteHead.updatedAt + 1,
+    deviceId: "forger",
+  };
+
+  const forgedHeadBlob = await github.createGitBlob(enc(JSON.stringify(forgedHead)));
+  const forgedShardBlob = await github.createGitBlob(enc('{"tampered":true}'));
+  const forgedTree = await github.createGitTree([
+    { path: V4_HEAD_PATH, mode: "100644", type: "blob", sha: forgedHeadBlob },
+    { path: shardPath, mode: "100644", type: "blob", sha: forgedShardBlob },
+  ], previousCommit.treeSha);
+  const forgedCommit = await github.createGitCommit(`obsidian-sync-v4:${forgedJournalId}`, forgedTree, [previousHead]);
+  await github.updateGitRef(forgedCommit, previousHead);
+
+  vault.operations.length = 0;
+  await assert.rejects(
+    () => new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+      .sync({ operation: "normal", allowThresholdOverride: false, changes: [] }),
+    /publication|shard|internal.*V4|V4.*internal|hash|verified/iu,
+  );
+
+  assert.equal(index.remoteCommitSha, previousHead, "forged internal shard must not advance the trusted local baseline");
+  assert.equal(dec(vault.files.get("note.md")!.bytes), "base");
+  assert.deepEqual(vault.operations.filter(operation => /^(?:write|trash|delete|commit-stage):/u.test(operation)), []);
+});
+
+
+test("v4 does not trust forged publication metadata whose changed blob bytes disagree with the current record", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault();
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "local", mode: "plaintext" });
+  vault.files.set("note.md", { bytes: enc("base"), mtime: 1 });
+
+  await new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "forcePush", allowThresholdOverride: false });
+
+  const previousHead = github.ref!.sha;
+  const previousCommit = github.commits.get(previousHead)!;
+  const previousHeadBytes = github.trees.get(previousCommit.treeSha)!.get(V4_HEAD_PATH)!;
+  const previousRemoteHead = JSON.parse(dec(previousHeadBytes)) as V4RemoteHead;
+  const previousRecord = Object.values(index.shards).flatMap(shard => Object.values(shard.records))[0]!;
+  const forgedJournalId = "forged-body-mismatch";
+  const claimedBytes = enc("claimed metadata");
+  const forgedRecord: V4IndexFileRecord = {
+    ...toV4RemoteRecord(previousRecord),
+    plaintextSha256: await sha256Hex(claimedBytes),
+    size: claimedBytes.byteLength,
+    mtime: previousRecord.mtime + 1,
+    remoteVersion: forgedJournalId,
+  };
+  const forgedHead: V4RemoteHead = {
+    ...previousRemoteHead,
+    generation: previousRemoteHead.generation + 1,
+    journalId: forgedJournalId,
+    shardHashes: await shardHashesForRecords([forgedRecord]),
+    updatedAt: previousRemoteHead.updatedAt + 1,
+    deviceId: "forger",
+  };
+
+  const forgedBlob = await github.createGitBlob(enc("forged external"));
+  const metadataFiles = await buildV4RemoteMetadata({ config: config(), head: forgedHead, records: [forgedRecord] });
+  const metadataEntries = await Promise.all(metadataFiles.map(async file => ({
+    path: file.path,
+    mode: "100644" as const,
+    type: "blob" as const,
+    sha: await github.createGitBlob(file.bytes),
+  })));
+  const forgedTree = await github.createGitTree([
+    { path: "note.md", mode: "100644", type: "blob", sha: forgedBlob },
+    ...metadataEntries,
+  ], previousCommit.treeSha);
+  const forgedCommit = await github.createGitCommit(`obsidian-sync-v4:${forgedJournalId}`, forgedTree, [previousHead]);
+  await github.updateGitRef(forgedCommit, previousHead);
+
+  vault.files.set("note.md", { bytes: claimedBytes, mtime: 2 });
+  vault.operations.length = 0;
+  await assert.rejects(
+    () => new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+      .sync({ operation: "normal", allowThresholdOverride: false, changes: [] }),
+    /publication|blob|hash|record|verified/iu,
+  );
+
+  assert.equal(index.remoteCommitSha, previousHead, "forged publication must not advance the trusted local baseline");
+  assert.equal(dec(vault.files.get("note.md")!.bytes), "claimed metadata");
+  assert.deepEqual(vault.operations.filter(operation => /^(?:write|trash|delete|commit-stage):/u.test(operation)), []);
+});
+
+
+test("v4 generation-1 publication marker is not trusted across a parent that lost the V4 head", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault();
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "local", mode: "plaintext" });
+  vault.files.set("note.md", { bytes: enc("base"), mtime: 1 });
+
+  await new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "forcePush", allowThresholdOverride: false });
+
+  const trustedHead = github.ref!.sha;
+  const trustedCommit = github.commits.get(trustedHead)!;
+  const trustedTree = new Map(github.trees.get(trustedCommit.treeSha)!);
+  const bucket = Object.keys(index.shardHashes)[0];
+  assert.ok(bucket);
+  const shardPath = `${V4_ROOT}/index/${bucket}.json`;
+
+  const parentTree = new Map(trustedTree);
+  for (const path of [...parentTree.keys()]) if (path === V4_ROOT || path.startsWith(`${V4_ROOT}/`)) parentTree.delete(path);
+  github.trees.set("tree-parent-without-v4", parentTree);
+  github.commits.set("parent-without-v4", {
+    treeSha: "tree-parent-without-v4",
+    parents: [trustedHead],
+    message: "external temporary V4 removal",
+  });
+
+  const forgedTreeFiles = new Map(trustedTree);
+  forgedTreeFiles.set(shardPath, enc(JSON.stringify({ bucket, records: {} })));
+  github.trees.set("tree-forged-generation-1", forgedTreeFiles);
+  github.commits.set("forged-generation-1", {
+    treeSha: "tree-forged-generation-1",
+    parents: ["parent-without-v4"],
+    message: trustedCommit.message,
+  });
+  github.ref = { ref: "refs/heads/main", sha: "forged-generation-1", type: "commit" };
+  github.files = new Map(forgedTreeFiles);
+
+  vault.operations.length = 0;
+  await assert.rejects(
+    () => new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+      .sync({ operation: "normal", allowThresholdOverride: false, changes: [] }),
+    /internal.*V4|V4.*internal|subtree.*changed|publication.*verified|ancestry/iu,
+  );
+
+  assert.equal(index.remoteCommitSha, trustedHead);
+  assert.equal(dec(vault.files.get("note.md")!.bytes), "base");
+  assert.deepEqual(vault.operations.filter(operation => /^(?:write|trash|delete|commit-stage):/u.test(operation)), []);
+});
+
+
+test("v4 encrypted sync rejects a forged plugin marker when the encrypted V4 head blob did not change", async () => {
+  const github = new MemoryGitHub()
+  const vault = new MemoryVault()
+  const repoId = "o/r#main"
+  const configEncrypted: V4RemoteConfig = {
+    formatVersion: 4,
+    mode: "encrypted",
+    repoId,
+    pathLayout: "opaque-stable-v1",
+    algorithm: "AES-GCM",
+    kdf: "PBKDF2-SHA-256",
+    kdfParams: { iterations: 10, salt: "c2FsdA" },
+  }
+  const keyring = await deriveV4Keyring({ passphrase: "pass", repoId, salt: enc("salt"), iterations: 10 })
+  const index = createEmptyV4LocalIndex({ repoId, deviceId: "local", mode: "encrypted", pathLayout: "opaque-stable-v1" })
+  vault.files.set("secret.md", { bytes: enc("base"), mtime: 1 })
+
+  await new V4SyncSession({ github, vault, index, config: configEncrypted, keyring, conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "forcePush", allowThresholdOverride: false })
+
+  const previousHead = github.ref!.sha
+  const previousCommit = github.commits.get(previousHead)!
+  const arbitrary = await github.createGitBlob(enc("external"))
+  const forgedTree = await github.createGitTree([
+    { path: "unmanaged.bin", mode: "100644", type: "blob", sha: arbitrary },
+  ], previousCommit.treeSha)
+  const forgedCommit = await github.createGitCommit(previousCommit.message, forgedTree, [previousHead])
+  await github.updateGitRef(forgedCommit, previousHead)
+
+  await assert.rejects(
+    () => new V4SyncSession({ github, vault, index, config: configEncrypted, keyring, conflictPolicy: "copy", abortChangePercent: 0 })
+      .sync({ operation: "normal", allowThresholdOverride: false, changes: [] }),
+    /external GitHub changes.*encrypted|encrypted.*external/iu,
+  )
+})
+
+
+test("v4 external reconciliation fails closed when the immutable tree lists a blob but its file read is missing", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault();
+  vault.files.set("external.md", { bytes: enc("base"), mtime: 1 });
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "local", mode: "plaintext" });
+
+  await new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "forcePush", allowThresholdOverride: false });
+
+  const previousHead = github.ref!.sha;
+  const previousTree = github.commits.get(previousHead)!.treeSha;
+  const externalTree = new Map(github.trees.get(previousTree));
+  externalTree.set("external.md", enc("edited on GitHub"));
+  github.trees.set("tree-missing-read", externalTree);
+  github.commits.set("commit-missing-read", {
+    treeSha: "tree-missing-read",
+    parents: [previousHead],
+    message: "external edit",
+  });
+  github.ref = { ref: "refs/heads/main", sha: "commit-missing-read", type: "commit" };
+  github.files = new Map(externalTree);
+
+  const originalGetFileBytes = github.getFileBytes.bind(github);
+  github.getFileBytes = async (path: string, ref?: string) => {
+    if (ref === "commit-missing-read" && path === "external.md") return null;
+    return originalGetFileBytes(path, ref);
+  };
+  const indexBefore = structuredClone(index);
+  const bytesBefore = new Uint8Array(vault.files.get("external.md")!.bytes);
+
+  await assert.rejects(
+    () => new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+      .sync({ operation: "normal", allowThresholdOverride: false, changes: [] }),
+    /external.*blob.*missing|blob.*external.md.*missing|unsafe.*external/iu,
+  );
+
+  assert.deepEqual(vault.files.get("external.md")!.bytes, bytesBefore);
+  assert.deepEqual(index, indexBefore);
+  assert.equal(vault.operations.some(operation => operation.startsWith("trash:") || operation.startsWith("delete:")), false);
 });

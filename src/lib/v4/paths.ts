@@ -1,12 +1,29 @@
 import { toBase64Url, toHex, utf8ToBytes } from "../bytes";
 import { V4_ROOT } from "./protocol-types";
 
+const WINDOWS_RESERVED_SEGMENT = /^(?:con|prn|aux|nul|clock\$|conin\$|conout\$|com[1-9¹²³]|lpt[1-9¹²³])(?:\..*)?$/iu;
+const PORTABLE_SEGMENT_FORBIDDEN = /[\u0000-\u001f<>:"|?*]/u;
+const MAX_PORTABLE_SEGMENT_UTF8_BYTES = 255;
+
+function assertPortableV4PathSegment(segment: string, originalPath: string): void {
+  if (
+    !segment
+    || segment === "."
+    || segment === ".."
+    || PORTABLE_SEGMENT_FORBIDDEN.test(segment)
+    || /[ .]$/u.test(segment)
+    || WINDOWS_RESERVED_SEGMENT.test(segment)
+    || new TextEncoder().encode(segment).byteLength > MAX_PORTABLE_SEGMENT_UTF8_BYTES
+  ) {
+    throw new Error(`Unsafe cross-platform V4 vault path: ${originalPath}`);
+  }
+}
+
 export function normalizeV4VaultPath(path: string): string {
   const normalized = path.replace(/\\/gu, "/").replace(/^\/+|\/+$/gu, "").replace(/\/{2,}/gu, "/");
   const segments = normalized.split("/");
-  if (!normalized || segments.some(segment => !segment || segment === "." || segment === "..")) {
-    throw new Error(`Unsafe V4 vault path: ${path}`);
-  }
+  if (!normalized) throw new Error(`Unsafe V4 vault path: ${path}`);
+  for (const segment of segments) assertPortableV4PathSegment(segment, path);
   return normalized;
 }
 
