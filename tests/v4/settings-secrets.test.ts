@@ -1281,6 +1281,27 @@ test("layout-ready startup callback is inert after plugin unload", async () => {
 })
 
 
+test("failed startup secret-migration persistence scrubs only newly generated migration secrets", async () => {
+  const mainSource = await readFile("src/main.ts", "utf8");
+  const loadSettingsStart = mainSource.indexOf("async loadSettings()");
+  const tokenWasMissing = mainSource.indexOf("const missingGithubTokenSecretId", loadSettingsStart);
+  const passWasMissing = mainSource.indexOf("const missingEncryptionPassphraseSecretId", loadSettingsStart);
+  const migrate = mainSource.indexOf("migrateV4Secrets(", loadSettingsStart);
+  const rememberPending = mainSource.indexOf("this.pendingMigratedSecretIds", migrate);
+  const onloadStart = mainSource.indexOf("async onload()");
+  const persistMigrated = mainSource.indexOf("await this.persistData()", onloadStart);
+  const rollbackCatch = mainSource.indexOf("catch", persistMigrated);
+  const scrubLoop = mainSource.indexOf("for (const id of this.pendingMigratedSecretIds)", rollbackCatch);
+  const clearSecret = mainSource.indexOf('this.app.secretStorage.setSecret(id, "")', scrubLoop);
+  const rethrow = mainSource.indexOf("throw error", clearSecret);
+
+  assert.ok(tokenWasMissing > loadSettingsStart && passWasMissing > loadSettingsStart);
+  assert.ok(migrate > tokenWasMissing && rememberPending > migrate, "loadSettings must remember migration-created secret IDs");
+  assert.ok(persistMigrated > onloadStart && rollbackCatch > persistMigrated, "startup migration persistence must have a rollback boundary");
+  assert.ok(scrubLoop > rollbackCatch && clearSecret > scrubLoop && rethrow > clearSecret);
+});
+
+
 test("startup secret migration persistence completes before unload can short-circuit runtime creation", async () => {
   const mainSource = await readFile("src/main.ts", "utf8");
   const onloadStart = mainSource.indexOf("async onload()");
