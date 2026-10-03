@@ -1187,6 +1187,7 @@ export class V4SyncSession {
   private async cachedPublicationShardsMatchTrustedBaseline(
     remote: V4RemoteState,
     tip: GitHubGitCommit,
+    budget: { reads: number; nodes: number },
   ): Promise<boolean> {
     const baselineSha = this.input.index.remoteCommitSha
     if (!baselineSha || baselineSha === tip.sha) return true
@@ -1198,7 +1199,6 @@ export class V4SyncSession {
 
     const baseline = await this.input.github.getGitCommit(baselineSha)
     throwIfV4Aborted(this.input.signal)
-    const budget = { reads: 0, nodes: 0 }
     const [baselineIndex, tipIndex] = await Promise.all([
       this.publicationDirectoryEntries(baseline.treeSha, `${V4_ROOT}/index`, budget),
       this.publicationDirectoryEntries(tip.treeSha, `${V4_ROOT}/index`, budget),
@@ -1323,10 +1323,11 @@ export class V4SyncSession {
     remote: V4RemoteState,
     tip: GitHubGitCommit,
     parentSha: string,
+    budget: { reads: number; nodes: number },
   ): Promise<boolean> {
     const parent = await this.input.github.getGitCommit(parentSha)
     throwIfV4Aborted(this.input.signal)
-    const changes = await this.changedGitTreeLeaves(parent.treeSha, tip.treeSha)
+    const changes = await this.changedGitTreeLeaves(parent.treeSha, tip.treeSha, "", budget)
     if (changes.length === 0) {
       this.verifiedPublicationChanges.set(tip.sha, changes)
       return true
@@ -1393,6 +1394,7 @@ export class V4SyncSession {
   private async isVerifiedPluginPublication(
     remote: V4RemoteState,
     tip: GitHubGitCommit,
+    budget = { reads: 0, nodes: 0 },
   ): Promise<boolean> {
     const pluginMessage = `obsidian-sync-v4:${remote.head.journalId}`
     if (tip.message?.split("\n", 1)[0] !== pluginMessage) return false
@@ -1423,8 +1425,8 @@ export class V4SyncSession {
       && tipHead.generation === parentHead.generation + 1
       && tipHead.journalId !== parentHead.journalId
     if (!validProgression) return false
-    if (!(await this.cachedPublicationShardsMatchTrustedBaseline(remote, tip))) return false
-    return this.isPluginPublicationTreeConsistent(remote, tip, parentSha)
+    if (!(await this.cachedPublicationShardsMatchTrustedBaseline(remote, tip, budget))) return false
+    return this.isPluginPublicationTreeConsistent(remote, tip, parentSha, budget)
   }
 
   private async v4RootTreeSha(commit: GitHubGitCommit): Promise<string> {
@@ -1442,6 +1444,7 @@ export class V4SyncSession {
   private async findVerifiedPluginPublication(remote: V4RemoteState, tip: GitHubGitCommit): Promise<GitHubGitCommit> {
     const queue = [...tip.parentShas]
     const visited = new Set<string>()
+    const publicationTreeBudget = { reads: 0, nodes: 0 }
     while (queue.length > 0) {
       throwIfV4Aborted(this.input.signal)
       const sha = queue.shift()!
@@ -1452,7 +1455,7 @@ export class V4SyncSession {
       visited.add(sha)
       const commit = await this.input.github.getGitCommit(sha)
       throwIfV4Aborted(this.input.signal)
-      if (await this.isVerifiedPluginPublication(remote, commit)) return commit
+      if (await this.isVerifiedPluginPublication(remote, commit, publicationTreeBudget)) return commit
       throwIfV4Aborted(this.input.signal)
       for (const parent of commit.parentShas) if (!visited.has(parent)) queue.push(parent)
     }
