@@ -127,6 +127,7 @@ class MemoryGitHub {
   files = new Map<string, Uint8Array>();
   blobs = new Map<string, Uint8Array>();
   trees = new Map<string, Map<string, Uint8Array>>();
+  treeViews = new Map<string, Map<string, Uint8Array>>();
   commits = new Map<string, { treeSha: string; parents: string[]; message: string }>();
   commitMessages: string[] = [];
   lastEntries: GitHubCreateTreeEntry[] = [];
@@ -145,7 +146,7 @@ class MemoryGitHub {
   async getGitCommit(sha: string) { const value = this.commits.get(sha)!; return { sha, treeSha: value.treeSha, parentShas: value.parents, message: value.message }; }
   async getTreeAt(treeSha: string, recursive = true) {
     this.treeReads.push(treeSha);
-    const tree = this.trees.get(treeSha) ?? new Map();
+    const tree = this.trees.get(treeSha) ?? this.treeViews.get(treeSha) ?? new Map();
     if (!recursive) {
       const rootBlobs: Array<{ path: string; bytes: Uint8Array }> = [];
       const rootDirectories = new Map<string, Array<{ path: string; bytes: Uint8Array }>>();
@@ -171,11 +172,13 @@ class MemoryGitHub {
       const directoryEntries = await Promise.all([...rootDirectories].map(async ([path, descendants]) => {
         const signatures = await Promise.all(descendants.map(async descendant =>
           `${descendant.path}:${await sha256Hex(descendant.bytes)}`));
+        const sha = await sha256Hex(enc(signatures.sort().join("\n")));
+        this.treeViews.set(sha, new Map(descendants.map(descendant => [descendant.path, new Uint8Array(descendant.bytes)])));
         return {
           path,
           mode: "040000",
           type: "tree" as const,
-          sha: await sha256Hex(enc(signatures.sort().join("\n"))),
+          sha,
           url: "",
         };
       }));

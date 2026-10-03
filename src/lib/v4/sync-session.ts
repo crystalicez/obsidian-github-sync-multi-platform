@@ -17,7 +17,7 @@ import {
 } from "./git-tree-writer"
 import { reconcileV4CandidatePublication } from "./publish-reconciler"
 import { assertV4JournalChangeCapacity, buildV4JournalPages, type V4JournalChange } from "./history-journal"
-import { isV4LocalIndexCacheComplete, type V4IndexFileRecord, type V4LocalIndex } from "./local-index"
+import { isV4LocalIndexCacheComplete, isV4LocalIndexShardConsistent, type V4IndexFileRecord, type V4LocalIndex } from "./local-index"
 import { assertV4LocalTargetPrecondition, createV4LocalIo, type V4LocalIo, type V4LocalTargetPrecondition, type V4SessionVault } from "./local-io"
 import { trashV4LocalUserFile } from "./local-delete-policy"
 import { bucketForV4PathId, normalizeV4VaultPath } from "./paths"
@@ -1143,6 +1143,86 @@ export class V4SyncSession {
     }
   }
 
+  private async publicationDirectoryEntries(
+    rootTreeSha: string,
+    directoryPath: string,
+    budget: { reads: number; nodes: number },
+  ): Promise<Map<string, GitHubTreeNode> | null> {
+    if (!this.input.github.getTreeAt) throw new Error("Plugin publication verification requires tree support.")
+    let treeSha = rootTreeSha
+    for (const segment of directoryPath.split("/")) {
+      if (budget.reads + 1 > V4_PUBLICATION_TREE_READ_LIMIT) {
+        throw new Error("Plugin publication tree verification read limit exceeded.")
+      }
+      budget.reads++
+      const tree = await this.input.github.getTreeAt(treeSha, false)
+      throwIfV4Aborted(this.input.signal)
+      if (tree.truncated) throw new Error("Plugin publication tree evidence is truncated; sync is unsafe.")
+      budget.nodes += tree.tree.length
+      if (budget.nodes > V4_PUBLICATION_TREE_NODE_LIMIT) {
+        throw new Error("Plugin publication tree verification node limit exceeded.")
+      }
+      const node = tree.tree.find(entry => entry.path === segment)
+      if (!node) return null
+      if (node.type !== "tree" || node.mode !== "040000") {
+        throw new Error(`Plugin publication internal tree is malformed at ${directoryPath}.`)
+      }
+      treeSha = node.sha
+    }
+
+    if (budget.reads + 1 > V4_PUBLICATION_TREE_READ_LIMIT) {
+      throw new Error("Plugin publication tree verification read limit exceeded.")
+    }
+    budget.reads++
+    const tree = await this.input.github.getTreeAt(treeSha, false)
+    throwIfV4Aborted(this.input.signal)
+    if (tree.truncated) throw new Error("Plugin publication tree evidence is truncated; sync is unsafe.")
+    budget.nodes += tree.tree.length
+    if (budget.nodes > V4_PUBLICATION_TREE_NODE_LIMIT) {
+      throw new Error("Plugin publication tree verification node limit exceeded.")
+    }
+    return new Map(tree.tree.map(node => [node.path, node]))
+  }
+
+  private async cachedPublicationShardsMatchTrustedBaseline(
+    remote: V4RemoteState,
+    tip: GitHubGitCommit,
+  ): Promise<boolean> {
+    const baselineSha = this.input.index.remoteCommitSha
+    if (!baselineSha || baselineSha === tip.sha) return true
+
+    const cachedBuckets = Object.entries(remote.head.shardHashes)
+      .filter(([bucket, expectedHash]) => isV4LocalIndexShardConsistent(this.input.index, bucket, expectedHash))
+      .map(([bucket]) => bucket)
+    if (cachedBuckets.length === 0) return true
+
+    const baseline = await this.input.github.getGitCommit(baselineSha)
+    throwIfV4Aborted(this.input.signal)
+    const budget = { reads: 0, nodes: 0 }
+    const [baselineIndex, tipIndex] = await Promise.all([
+      this.publicationDirectoryEntries(baseline.treeSha, `${V4_ROOT}/index`, budget),
+      this.publicationDirectoryEntries(tip.treeSha, `${V4_ROOT}/index`, budget),
+    ])
+    if (!baselineIndex || !tipIndex) return false
+
+    for (const bucket of cachedBuckets) {
+      const shardPath = v4RemoteShardPath(bucket, remote.config.mode)
+      const name = shardPath.slice(shardPath.lastIndexOf("/") + 1)
+      const before = baselineIndex.get(name)
+      const after = tipIndex.get(name)
+      if (
+        !before
+        || !after
+        || before.type !== "blob"
+        || after.type !== "blob"
+        || before.mode !== "100644"
+        || after.mode !== "100644"
+        || before.sha !== after.sha
+      ) return false
+    }
+    return true
+  }
+
   private async changedGitTreeLeaves(
     beforeTreeSha: string | undefined,
     afterTreeSha: string | undefined,
@@ -1343,6 +1423,7 @@ export class V4SyncSession {
       && tipHead.generation === parentHead.generation + 1
       && tipHead.journalId !== parentHead.journalId
     if (!validProgression) return false
+    if (!(await this.cachedPublicationShardsMatchTrustedBaseline(remote, tip))) return false
     return this.isPluginPublicationTreeConsistent(remote, tip, parentSha)
   }
 
