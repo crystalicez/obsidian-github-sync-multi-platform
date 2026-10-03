@@ -3,7 +3,7 @@ import { Plugin, setIcon, Modal, Notice, TFile, TFolder } from "obsidian";
 import { SettingTab, PluginSettings, DEFAULT_SETTINGS } from "./setting";
 import { GitHubClient } from "./lib/github-api";
 import { normalizeScheduledSyncIntervalSeconds, shouldRunScheduledSync, shouldRunStartupSync } from "./lib/sync-policy";
-import { migrateV4Secrets, sanitizeV4SettingsForPersistence, storeV4Secrets } from "./lib/v4/secrets";
+import { migrateV4Secrets, sanitizeV4SettingsForPersistence, scrubV4SecretIds, storeV4Secrets } from "./lib/v4/secrets";
 import { V4PluginRuntime } from "./lib/v4/runtime";
 import { countV4ScopedPaths } from "./lib/v4/scope";
 import { compileV4IgnorePathRegex } from "./lib/v4/ignore";
@@ -60,7 +60,7 @@ export default class FastSync extends Plugin {
         this.pendingMigratedSecretIds = []
       } catch (error) {
         try {
-          for (const id of this.pendingMigratedSecretIds) this.app.secretStorage.setSecret(id, "")
+          scrubV4SecretIds(this.app.secretStorage, this.pendingMigratedSecretIds)
         } catch (cleanupError) {
           throw new Error("Secret migration persistence failed and pending credentials could not be scrubbed.", { cause: cleanupError })
         }
@@ -276,6 +276,10 @@ export default class FastSync extends Plugin {
     }
     const pendingGithubTokenSecret = preparedSettings.githubTokenSecretId !== previousSettings.githubTokenSecretId
     const pendingEncryptionPassphraseSecret = preparedSettings.encryptionPassphraseSecretId !== previousSettings.encryptionPassphraseSecretId
+    const pendingSecretIds = [
+      ...(pendingGithubTokenSecret ? [preparedSettings.githubTokenSecretId] : []),
+      ...(pendingEncryptionPassphraseSecret ? [preparedSettings.encryptionPassphraseSecretId] : []),
+    ]
 
     await this.v4Runtime?.quiesceForSettingsChange()
     try {
@@ -284,8 +288,7 @@ export default class FastSync extends Plugin {
         await this.persistSettingsData(preparedSettings)
       } catch (error) {
         try {
-          if (pendingGithubTokenSecret) this.app.secretStorage.setSecret(preparedSettings.githubTokenSecretId, "")
-          if (pendingEncryptionPassphraseSecret) this.app.secretStorage.setSecret(preparedSettings.encryptionPassphraseSecretId, "")
+          scrubV4SecretIds(this.app.secretStorage, pendingSecretIds)
         } catch (cleanupError) {
           throw new Error("Settings save failed and pending credentials could not be scrubbed.", { cause: cleanupError })
         }

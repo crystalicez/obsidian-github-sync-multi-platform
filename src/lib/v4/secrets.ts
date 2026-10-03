@@ -88,6 +88,23 @@ export function migrateV4Secrets<T extends V4SecretBackedSettings>(
   }
 }
 
+export function scrubV4SecretIds(storage: SecretStorageLike, ids: Iterable<string>): void {
+  let firstError: unknown
+  const seen = new Set<string>()
+  for (const id of ids) {
+    if (!id || seen.has(id)) continue
+    seen.add(id)
+    try {
+      storage.setSecret(id, "")
+    } catch (error) {
+      if (firstError === undefined) firstError = error
+    }
+  }
+  if (firstError !== undefined) {
+    throw new Error("One or more pending credentials could not be scrubbed.", { cause: firstError })
+  }
+}
+
 export function storeV4Secrets(
   settings: V4SecretBackedSettings,
   storage: SecretStorageLike,

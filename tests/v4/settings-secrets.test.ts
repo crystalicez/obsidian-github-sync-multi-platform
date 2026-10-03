@@ -1396,14 +1396,13 @@ test("failed startup secret-migration persistence scrubs only newly generated mi
   const onloadStart = mainSource.indexOf("async onload()");
   const persistMigrated = mainSource.indexOf("await this.persistData()", onloadStart);
   const rollbackCatch = mainSource.indexOf("catch", persistMigrated);
-  const scrubLoop = mainSource.indexOf("for (const id of this.pendingMigratedSecretIds)", rollbackCatch);
-  const clearSecret = mainSource.indexOf('this.app.secretStorage.setSecret(id, "")', scrubLoop);
-  const rethrow = mainSource.indexOf("throw error", clearSecret);
+  const scrubPending = mainSource.indexOf("scrubV4SecretIds(this.app.secretStorage, this.pendingMigratedSecretIds)", rollbackCatch);
+  const rethrow = mainSource.indexOf("throw error", scrubPending);
 
   assert.ok(tokenWasMissing > loadSettingsStart && passWasMissing > loadSettingsStart);
   assert.ok(migrate > tokenWasMissing && rememberPending > migrate, "loadSettings must remember migration-created secret IDs");
   assert.ok(persistMigrated > onloadStart && rollbackCatch > persistMigrated, "startup migration persistence must have a rollback boundary");
-  assert.ok(scrubLoop > rollbackCatch && clearSecret > scrubLoop && rethrow > clearSecret);
+  assert.ok(scrubPending > rollbackCatch && rethrow > scrubPending, "startup rollback must scrub every pending migration secret before rethrow");
 });
 
 
@@ -1454,16 +1453,16 @@ test("failed settings persistence scrubs only newly generated orphan secrets bef
   const quiesce = mainSource.indexOf("await this.v4Runtime?.quiesceForSettingsChange()", saveStart);
   const storeSecrets = mainSource.indexOf("storeV4Secrets(preparedSettings, this.app.secretStorage)", quiesce);
   const persistSettings = mainSource.indexOf("await this.persistSettingsData(preparedSettings)", storeSecrets);
+  const pendingSecretIds = mainSource.indexOf("const pendingSecretIds =", passGenerated);
   const rollbackCatch = mainSource.indexOf("catch", storeSecrets);
-  const clearToken = mainSource.indexOf('this.app.secretStorage.setSecret(preparedSettings.githubTokenSecretId, "")', rollbackCatch);
-  const clearPass = mainSource.indexOf('this.app.secretStorage.setSecret(preparedSettings.encryptionPassphraseSecretId, "")', rollbackCatch);
-  const rethrow = mainSource.indexOf("throw error", rollbackCatch);
+  const scrubPending = mainSource.indexOf("scrubV4SecretIds(this.app.secretStorage, pendingSecretIds)", rollbackCatch);
+  const rethrow = mainSource.indexOf("throw error", scrubPending);
 
   assert.ok(tokenGenerated > saveStart && passGenerated > saveStart);
-  assert.ok(storeSecrets > quiesce && persistSettings > storeSecrets);
+  assert.ok(pendingSecretIds > passGenerated && storeSecrets > quiesce && persistSettings > storeSecrets);
   assert.ok(rollbackCatch > persistSettings, "secret rollback must catch persistence failure after pending secrets are stored");
-  assert.ok(clearToken > rollbackCatch && clearPass > rollbackCatch, "newly generated pending secrets must be scrubbed on failed persistence");
-  assert.ok(rethrow > clearToken && rethrow > clearPass, "settings persistence failure must still propagate after secret cleanup");
+  assert.ok(scrubPending > rollbackCatch, "newly generated pending secrets must be scrubbed on failed persistence");
+  assert.ok(rethrow > scrubPending, "settings persistence failure must still propagate after secret cleanup");
   assert.match(mainSource.slice(saveStart, storeSecrets), /githubTokenSecretId\s*!==\s*previousSettings\.githubTokenSecretId/u);
   assert.match(mainSource.slice(saveStart, storeSecrets), /encryptionPassphraseSecretId\s*!==\s*previousSettings\.encryptionPassphraseSecretId/u);
 });
