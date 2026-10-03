@@ -1319,6 +1319,29 @@ test("late settings persistence cannot recreate runtime work after plugin unload
 });
 
 
+test("failed settings persistence scrubs only newly generated orphan secrets before rethrow", async () => {
+  const mainSource = await readFile("src/main.ts", "utf8");
+  const saveStart = mainSource.indexOf("async saveSettings(");
+  const tokenGenerated = mainSource.indexOf("preparedSettings.githubTokenSecretId = this.createSecretId", saveStart);
+  const passGenerated = mainSource.indexOf("preparedSettings.encryptionPassphraseSecretId = this.createSecretId", saveStart);
+  const quiesce = mainSource.indexOf("await this.v4Runtime?.quiesceForSettingsChange()", saveStart);
+  const storeSecrets = mainSource.indexOf("storeV4Secrets(preparedSettings, this.app.secretStorage)", quiesce);
+  const persistSettings = mainSource.indexOf("await this.persistSettingsData(preparedSettings)", storeSecrets);
+  const rollbackCatch = mainSource.indexOf("catch", storeSecrets);
+  const clearToken = mainSource.indexOf('this.app.secretStorage.setSecret(preparedSettings.githubTokenSecretId, "")', rollbackCatch);
+  const clearPass = mainSource.indexOf('this.app.secretStorage.setSecret(preparedSettings.encryptionPassphraseSecretId, "")', rollbackCatch);
+  const rethrow = mainSource.indexOf("throw error", rollbackCatch);
+
+  assert.ok(tokenGenerated > saveStart && passGenerated > saveStart);
+  assert.ok(storeSecrets > quiesce && persistSettings > storeSecrets);
+  assert.ok(rollbackCatch > persistSettings, "secret rollback must catch persistence failure after pending secrets are stored");
+  assert.ok(clearToken > rollbackCatch && clearPass > rollbackCatch, "newly generated pending secrets must be scrubbed on failed persistence");
+  assert.ok(rethrow > clearToken && rethrow > clearPass, "settings persistence failure must still propagate after secret cleanup");
+  assert.match(mainSource.slice(saveStart, storeSecrets), /githubTokenSecretId\s*!==\s*previousSettings\.githubTokenSecretId/u);
+  assert.match(mainSource.slice(saveStart, storeSecrets), /encryptionPassphraseSecretId\s*!==\s*previousSettings\.encryptionPassphraseSecretId/u);
+});
+
+
 test("settings save does not publish the new runtime generation before durable persistence succeeds", async () => {
   const mainSource = await readFile("src/main.ts", "utf8");
 
