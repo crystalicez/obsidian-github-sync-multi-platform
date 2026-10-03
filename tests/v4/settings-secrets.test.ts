@@ -10,6 +10,7 @@ import type { GitHubCreateTreeEntry } from "../../src/lib/github-git-types";
 import { deriveV4Keyring } from "../../src/lib/v4/crypto";
 import { publishV4TreeChanges } from "../../src/lib/v4/git-tree-writer";
 import { migrateV4Secrets, sanitizeV4SettingsForPersistence } from "../../src/lib/v4/secrets";
+import * as v4SecretsModule from "../../src/lib/v4/secrets";
 import { selectV4RuntimeConfig, V4PluginRuntime } from "../../src/lib/v4/runtime";
 import { buildV4RemoteMetadata } from "../../src/lib/v4/remote-index";
 import { V4StorageCodec } from "../../src/lib/v4/storage-codec";
@@ -137,6 +138,37 @@ test("v4 rejects aliased token and passphrase secret IDs before any secret write
 
   assert.equal(writes, 0, "aliased secret IDs must fail before SecretStorage mutation");
   assert.equal(stored.get(sharedId), "old-value");
+});
+
+
+test("v4 credential scrub attempts every pending secret before reporting cleanup failure", async () => {
+  const scrub = (v4SecretsModule as Record<string, unknown>).scrubV4SecretIds;
+  assert.equal(typeof scrub, "function", "credential cleanup must be centralized in a testable helper");
+
+  const stored = new Map<string, string>([
+    ["first", "secret-a"],
+    ["second", "secret-b"],
+  ]);
+  const attempts: string[] = [];
+
+  assert.throws(
+    () => (scrub as (storage: unknown, ids: string[]) => void)({
+      getSecret(id: string) { return stored.get(id) ?? null; },
+      setSecret(id: string, value: string) {
+        attempts.push(id);
+        if (id === "first") throw new Error("simulated first scrub failure");
+        stored.set(id, value);
+      },
+    }, ["first", "second"]),
+    /scrub|cleanup|credential/iu,
+  );
+
+  assert.deepEqual(attempts, ["first", "second"], "cleanup must continue after one secret scrub fails");
+  assert.equal(stored.get("second"), "", "later pending credentials must still be scrubbed");
+
+  const mainSource = await readFile("src/main.ts", "utf8");
+  assert.match(mainSource, /scrubV4SecretIds\(this\.app\.secretStorage,\s*this\.pendingMigratedSecretIds\)/u);
+  assert.match(mainSource, /scrubV4SecretIds\(this\.app\.secretStorage,\s*pendingSecretIds\)/u);
 });
 
 
