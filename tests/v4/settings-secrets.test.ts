@@ -67,6 +67,45 @@ test("v4 secret migration stores legacy values and returns runtime-only secrets"
   assert.equal(persisted.githubTokenSecretId, migrated.settings.githubTokenSecretId);
 });
 
+test("v4 secret migration rolls back partial SecretStorage writes when a later write fails", () => {
+  const runCase = (existingIds: boolean) => {
+    const tokenId = existingIds ? "existing-token" : "github-token-1";
+    const passId = existingIds ? "existing-pass" : "encryption-passphrase-2";
+    const stored = new Map<string, string>();
+    if (existingIds) {
+      stored.set(tokenId, "old-token");
+      stored.set(passId, "old-pass");
+    }
+    let writes = 0;
+    const storage = {
+      getSecret(id: string) { return stored.get(id) ?? null; },
+      setSecret(id: string, value: string) {
+        stored.set(id, value);
+        writes++;
+        if (writes === 2) throw new Error("simulated secret write failure");
+      },
+    };
+    let next = 0;
+
+    assert.throws(
+      () => migrateV4Secrets({
+        githubToken: "new-token",
+        encryptionPassphrase: "new-pass",
+        githubTokenSecretId: existingIds ? tokenId : "",
+        encryptionPassphraseSecretId: existingIds ? passId : "",
+      }, storage, prefix => `${prefix}-${++next}`),
+      /simulated secret write failure/u,
+    );
+
+    assert.equal(stored.get(tokenId) ?? "", existingIds ? "old-token" : "");
+    assert.equal(stored.get(passId) ?? "", existingIds ? "old-pass" : "");
+  };
+
+  runCase(true);
+  runCase(false);
+});
+
+
 test("v4 runtime selects explicit layouts and preserves encrypted KDF parameters for migration", () => {
   const legacy: V4RemoteConfig = {
     formatVersion: V4_FORMAT_VERSION,
