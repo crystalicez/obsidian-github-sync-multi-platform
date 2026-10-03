@@ -106,6 +106,40 @@ test("v4 secret migration rolls back partial SecretStorage writes when a later w
 });
 
 
+test("v4 rejects aliased token and passphrase secret IDs before any secret write", () => {
+  const sharedId = "shared-credential";
+  assert.throws(
+    () => assertPluginSettingsRuntimeSafe({
+      ...DEFAULT_SETTINGS,
+      githubTokenSecretId: sharedId,
+      encryptionPassphraseSecretId: sharedId,
+    }),
+    /secret.*id.*distinct|distinct.*secret|credential.*alias/iu,
+  );
+
+  const stored = new Map<string, string>([[sharedId, "old-value"]]);
+  let writes = 0;
+  assert.throws(
+    () => migrateV4Secrets({
+      githubToken: "new-token",
+      encryptionPassphrase: "new-pass",
+      githubTokenSecretId: sharedId,
+      encryptionPassphraseSecretId: sharedId,
+    }, {
+      getSecret(id: string) { return stored.get(id) ?? null; },
+      setSecret(id: string, value: string) {
+        writes++;
+        stored.set(id, value);
+      },
+    }, prefix => `${prefix}-new`),
+    /secret.*id.*distinct|distinct.*secret|credential.*alias/iu,
+  );
+
+  assert.equal(writes, 0, "aliased secret IDs must fail before SecretStorage mutation");
+  assert.equal(stored.get(sharedId), "old-value");
+});
+
+
 test("v4 runtime selects explicit layouts and preserves encrypted KDF parameters for migration", () => {
   const legacy: V4RemoteConfig = {
     formatVersion: V4_FORMAT_VERSION,
