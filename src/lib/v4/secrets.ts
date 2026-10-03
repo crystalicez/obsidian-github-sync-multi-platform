@@ -40,13 +40,30 @@ export function migrateV4Secrets<T extends V4SecretBackedSettings>(
   const legacyPassphrase =
     typeof settings.encryptionPassphrase === "string" ? settings.encryptionPassphrase : ""
 
-  if (legacyToken) {
-    storage.setSecret(githubTokenSecretId, legacyToken)
-    migrated = true
+  const migrationSnapshots = new Map<string, string | null>()
+  if (legacyToken) migrationSnapshots.set(githubTokenSecretId, storage.getSecret(githubTokenSecretId))
+  if (legacyPassphrase && !migrationSnapshots.has(encryptionPassphraseSecretId)) {
+    migrationSnapshots.set(encryptionPassphraseSecretId, storage.getSecret(encryptionPassphraseSecretId))
   }
-  if (legacyPassphrase) {
-    storage.setSecret(encryptionPassphraseSecretId, legacyPassphrase)
-    migrated = true
+
+  try {
+    if (legacyToken) {
+      storage.setSecret(githubTokenSecretId, legacyToken)
+      migrated = true
+    }
+    if (legacyPassphrase) {
+      storage.setSecret(encryptionPassphraseSecretId, legacyPassphrase)
+      migrated = true
+    }
+  } catch (error) {
+    for (const [id, previous] of migrationSnapshots) {
+      try {
+        storage.setSecret(id, previous ?? "")
+      } catch {
+        // Preserve the original migration failure; rollback is best-effort across every touched ID.
+      }
+    }
+    throw error
   }
 
   return {
