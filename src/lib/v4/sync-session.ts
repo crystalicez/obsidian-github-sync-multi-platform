@@ -1442,22 +1442,24 @@ export class V4SyncSession {
   }
 
   private async findVerifiedPluginPublication(remote: V4RemoteState, tip: GitHubGitCommit): Promise<GitHubGitCommit> {
-    const queue = [...tip.parentShas]
+    const pendingParentLists: string[][] = [tip.parentShas]
     const visited = new Set<string>()
     const publicationTreeBudget = { reads: 0, nodes: 0 }
-    while (queue.length > 0) {
-      throwIfV4Aborted(this.input.signal)
-      const sha = queue.shift()!
-      if (visited.has(sha)) continue
-      if (visited.size >= V4_EXTERNAL_PUBLICATION_ANCESTRY_LIMIT) {
-        throw new Error("External GitHub ancestry exceeds the V4 verification limit.")
+    for (let listIndex = 0; listIndex < pendingParentLists.length; listIndex++) {
+      const parents = pendingParentLists[listIndex]
+      for (const sha of parents) {
+        throwIfV4Aborted(this.input.signal)
+        if (visited.has(sha)) continue
+        if (visited.size >= V4_EXTERNAL_PUBLICATION_ANCESTRY_LIMIT) {
+          throw new Error("External GitHub ancestry exceeds the V4 verification limit.")
+        }
+        visited.add(sha)
+        const commit = await this.input.github.getGitCommit(sha)
+        throwIfV4Aborted(this.input.signal)
+        if (await this.isVerifiedPluginPublication(remote, commit, publicationTreeBudget)) return commit
+        throwIfV4Aborted(this.input.signal)
+        if (commit.parentShas.length > 0) pendingParentLists.push(commit.parentShas)
       }
-      visited.add(sha)
-      const commit = await this.input.github.getGitCommit(sha)
-      throwIfV4Aborted(this.input.signal)
-      if (await this.isVerifiedPluginPublication(remote, commit, publicationTreeBudget)) return commit
-      throwIfV4Aborted(this.input.signal)
-      for (const parent of commit.parentShas) if (!visited.has(parent)) queue.push(parent)
     }
     throw new Error("External GitHub ancestry does not contain a verified V4 publication for the current head.")
   }
