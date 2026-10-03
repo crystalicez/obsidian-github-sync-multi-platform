@@ -698,6 +698,13 @@ Audit method:
    - Fix: `e7beb37` preserves breadth-first ordering and the 256-commit verification limit by traversing parent lists with cursors/iteration instead of copying and shifting one flat queue; duplicate SHAs are skipped through the existing `visited` set. The same regression now runs in about **2.5ms CPU**.
    - Focused publication-tree resource coverage is green at **3/3**.
 
+101. **MEDIUM/HIGH credential persistence safety — a failed settings save could leave newly generated orphan credentials in SecretStorage.**
+   - Credential changes intentionally receive fresh secret IDs so a failed plugin-data persistence does not overwrite the still-persisted credential value. However, the new token/passphrase values were written to SecretStorage before `persistSettingsData()` and were not scrubbed if that durable settings write failed.
+   - The runtime generation stayed unchanged after persistence failure, but the failed save could still leave an unreachable durable credential copy whose ID was never committed to plugin data.
+   - RED: `22c359e` requires failed settings persistence to scrub only the newly generated pending token/passphrase secret IDs and still rethrow the save failure without touching the previously persisted secret IDs.
+   - Fix: `e838aad` tracks which secret IDs are new for the pending settings transaction, wraps secret staging plus settings persistence in one failure boundary, clears only those pending IDs on failure, and leaves the previously persisted credentials untouched.
+   - Focused settings-secrets coverage is green at **56/56** after the fix.
+
 ### Audited surfaces with no new confirmed defect so far
 
 - secret migration/persistence: raw token/passphrase are removed before plugin data persistence and use Obsidian SecretStorage;
@@ -771,6 +778,7 @@ RED tests have now been pushed on the audit branch:
 - `10b4aae` — cached remote shards must still be bound to immutable publication-tree evidence before a candidate publication advances trust.
 - `9e1c89a` — publication ancestry candidates must share one aggregate semantic tree-read/node budget rather than resetting the limit per candidate.
 - `0dd07bd` — repeated ancestry parent SHAs must not amplify CPU through flat-array queue shifting while only one unique commit is inspected.
+- `22c359e` — failed settings persistence must scrub newly generated pending credential IDs instead of leaving unreachable durable secret copies.
 
 Refined root-cause design:
 - create one canonical shard-record hash function and use it for writer hash creation, remote shard verification, and local persisted-cache verification;
@@ -833,6 +841,7 @@ Root-cause fixes are now on the audit branch:
 - `5104c91` — bind cached shard reuse to unchanged immutable shard blob SHAs between the trusted baseline and candidate publication tree.
 - `645ba05` — share one publication-tree verification budget across every ancestry candidate and its cached-shard/tree-consistency sub-checks.
 - `e7beb37` — traverse publication ancestry parent lists without copying/shift-based flat queues, preserving BFS and the 256-commit limit while bounding duplicate-parent CPU cost.
+- `e838aad` — scrub only newly generated pending SecretStorage IDs when settings persistence fails, preserving the previously committed credential references.
 - `6151868d066c050deef9159d3beda389e2ae0ce7`, `d9cde1a72496a8c86df5c85b975d39b92998f873`, `0c301523e774d54bc03191aa7a897da98691ac81`, `06335328777bd5010e928c1951f1cdb581aac2f0` — bounded journal writer/reader contract, safe journal markers, cross-page consistency, descriptor validation before blob reads, and preview-limit precedence.
 - fixture-only followups `4ce0affffce484398db30b0de339af8a2dd1e5cf`, `e5ae96eda6003faa4233346bd5104561e2258923`, `40fc418844c40a52ef4baa39c7318f21a5547782`, `b876e4076084e544ec13ec0ef60c9ef7e0cbcc8a` keep tests protocol-shaped rather than weakening production validation.
 - fixture-only follow-up `b7635b7` makes recovery Git fixtures honor immutable ref reads and model non-recursive tree evidence under the publication-tree verifier; production behavior is unchanged.
@@ -844,11 +853,11 @@ Recent crash/memory hardening:
 
 Verification status:
 - The repository was executed through the connected local engineering workspace with Node `v24.11.0` and pnpm `9.12.3`.
-- Final post-fix gates on the current production source: `pnpm run test:fast` **539/539**, `pnpm run test:recovery` **50/50**, `pnpm run test:resource` **15/15**, and `pnpm run build` PASS.
+- Final post-fix gates on the current production source: `pnpm run test:fast` **540/540**, `pnpm run test:recovery` **50/50**, `pnpm run test:resource` **15/15**, and `pnpm run build` PASS.
 - Final release checks also pass on regenerated artifacts: `pnpm run validate:metadata` and `pnpm run validate:package`.
 - After publication-tree hardening exposed stale recovery fixtures, `b7635b7` restored the recovery gate to **50/50** by removing immutable-ref fallback to the mutable tip and supplying protocol-shaped non-recursive tree evidence.
-- The 539/539 fast run was executed with one unrelated uncommitted test-only helper in `tests/v4/github-transport.test.ts`; it does not modify production source or add/change a test case. Do not describe that run as a pristine exact-Git-tree qualification until that concurrent WIP is committed or removed.
-- Focused regressions in the latest audit pass: settings-secrets **55/55**, sync-session **112/112**, remote-index **20/20**, recovery **50/50**, recovery-boundary **3/3**, recovery-topology-ordering **1/1**, publication-tree-budget **3/3**, vault-write **3/3**, github-bootstrap-ref-conflict **2/2**, github-empty-ref **3/3**, github-transport **43/43**, github-tree-mode-validation **1/1**, storage-history **4/4**, github-immutable-read-fallback **13/13**, and benchmark **3/3**; publication-race **1/1** and runtime-retry **1/1** also pass with the stricter non-recursive tree evidence model. The benchmark qualification also reproduced the prior wall-clock flake under full-suite contention before `0762038...`, with later full fast runs remaining green through the current **539/539** audit head. Prior history-service **13/13**, sync-coordinator **25/25**, sync-policy **2/2**, storage-codec **12/12**, and opaque-leakage **2/2** remain covered by the full fast gate.
+- The 540/540 fast run was executed with one unrelated uncommitted test-only helper in `tests/v4/github-transport.test.ts`; it does not modify production source or add/change a test case. Do not describe that run as a pristine exact-Git-tree qualification until that concurrent WIP is committed or removed.
+- Focused regressions in the latest audit pass: settings-secrets **56/56**, sync-session **112/112**, remote-index **20/20**, recovery **50/50**, recovery-boundary **3/3**, recovery-topology-ordering **1/1**, publication-tree-budget **3/3**, vault-write **3/3**, github-bootstrap-ref-conflict **2/2**, github-empty-ref **3/3**, github-transport **43/43**, github-tree-mode-validation **1/1**, storage-history **4/4**, github-immutable-read-fallback **13/13**, and benchmark **3/3**; publication-race **1/1** and runtime-retry **1/1** also pass with the stricter non-recursive tree evidence model. The benchmark qualification also reproduced the prior wall-clock flake under full-suite contention before `0762038...`, with later full fast runs remaining green through the current **540/540** audit head. Prior history-service **13/13**, sync-coordinator **25/25**, sync-policy **2/2**, storage-codec **12/12**, and opaque-leakage **2/2** remain covered by the full fast gate.
 - Real GitHub E2E remains excluded from the default fast tier and was not run in this closure; inspect hosted checks for the exact pushed SHA separately before treating the branch as release-qualified.
 
 ### TDD plan
