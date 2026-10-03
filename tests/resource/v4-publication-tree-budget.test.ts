@@ -176,3 +176,67 @@ test("plugin publication ancestry shares one aggregate tree-read budget", async 
   )
   assert.ok(treeReads <= 4_096, `ancestry publication verification performed ${treeReads} tree reads`)
 })
+
+test("plugin publication ancestry duplicate-parent fanout stays within CPU budget", async () => {
+  const duplicateCount = 100_000
+  let commitReads = 0
+  const currentHead: V4RemoteHead = {
+    formatVersion: V4_FORMAT_VERSION,
+    mode: "plaintext",
+    epoch: 1,
+    generation: 2,
+    journalId: "journal-current",
+    shardHashes: {},
+    updatedAt: 2,
+    deviceId: "remote",
+  }
+
+  const github = {
+    async getGitCommit(sha: string) {
+      commitReads++
+      assert.equal(sha, "duplicate-parent")
+      return {
+        sha,
+        treeSha: "duplicate-tree",
+        parentShas: [],
+        message: "external",
+      }
+    },
+  }
+
+  const session = new V4SyncSession({
+    github: github as never,
+    vault: {} as never,
+    index: createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "local", mode: "plaintext" }),
+    config: config(),
+    conflictPolicy: "copy",
+    abortChangePercent: 0,
+  }) as unknown as {
+    findVerifiedPluginPublication(remote: unknown, tip: unknown): Promise<unknown>
+  }
+
+  const remote = {
+    config: config(),
+    head: currentHead,
+    records: [],
+    commitSha: "external-tip",
+  }
+  const tip = {
+    sha: "external-tip",
+    treeSha: "external-tree",
+    parentShas: Array(duplicateCount).fill("duplicate-parent"),
+    message: "external",
+  }
+
+  const started = process.cpuUsage()
+  await assert.rejects(
+    () => session.findVerifiedPluginPublication(remote, tip),
+    /publication|ancestry/iu,
+  )
+  const elapsed = process.cpuUsage(started)
+  assert.equal(commitReads, 1, "duplicate ancestry parents must not cause duplicate commit reads")
+  assert.ok(
+    elapsed.user + elapsed.system < 250_000,
+    `ancestry duplicate-parent traversal used ${elapsed.user + elapsed.system}µs CPU`,
+  )
+})
