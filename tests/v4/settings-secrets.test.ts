@@ -1306,7 +1306,8 @@ test("startup secret migration persistence completes before unload can short-cir
   const mainSource = await readFile("src/main.ts", "utf8");
   const onloadStart = mainSource.indexOf("async onload()");
   const loadSettings = mainSource.indexOf("await this.loadSettings()", onloadStart);
-  const persistMigrated = mainSource.indexOf("if (this.secretsMigrated) await this.persistData()", loadSettings);
+  const migratedBlock = mainSource.indexOf("if (this.secretsMigrated)", loadSettings);
+  const persistMigrated = mainSource.indexOf("await this.persistData()", migratedBlock);
   const unloadGuard = mainSource.indexOf("if (this.unloaded) return", loadSettings);
   const createRuntime = mainSource.indexOf("this.v4Runtime = this.createV4Runtime()", loadSettings);
 

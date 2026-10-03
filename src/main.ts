@@ -30,6 +30,7 @@ export default class FastSync extends Plugin {
   scheduledSyncTimer: number | null = null
   startupSyncTimeout: number | null = null
   secretsMigrated: boolean = false
+  private pendingMigratedSecretIds: string[] = []
   private unloaded = false
   private statusDisplaySignature?: string
 
@@ -53,7 +54,19 @@ export default class FastSync extends Plugin {
   async onload() {
     this.unloaded = false
     await this.loadSettings()
-    if (this.secretsMigrated) await this.persistData()
+    if (this.secretsMigrated) {
+      try {
+        await this.persistData()
+        this.pendingMigratedSecretIds = []
+      } catch (error) {
+        try {
+          for (const id of this.pendingMigratedSecretIds) this.app.secretStorage.setSecret(id, "")
+        } catch (cleanupError) {
+          throw new Error("Secret migration persistence failed and pending credentials could not be scrubbed.", { cause: cleanupError })
+        }
+        throw error
+      }
+    }
     if (this.unloaded) return
 
     this.settingTab = new SettingTab(this.app, this)
@@ -228,12 +241,20 @@ export default class FastSync extends Plugin {
     const savedSettings = data.settings ?? data;
     const merged = Object.assign({}, DEFAULT_SETTINGS, savedSettings);
     assertPluginSettingsRuntimeSafe(merged)
+    const missingGithubTokenSecretId = !merged.githubTokenSecretId
+    const missingEncryptionPassphraseSecretId = !merged.encryptionPassphraseSecretId
+    const legacyGithubToken = typeof merged.githubToken === "string" && merged.githubToken.length > 0
+    const legacyEncryptionPassphrase = typeof merged.encryptionPassphrase === "string" && merged.encryptionPassphrase.length > 0
     const result = migrateV4Secrets(
       merged,
       this.app.secretStorage,
       prefix => this.createSecretId(prefix),
     )
     assertPluginSettingsRuntimeSafe(result.settings)
+    this.pendingMigratedSecretIds = [
+      ...(missingGithubTokenSecretId && legacyGithubToken ? [result.settings.githubTokenSecretId] : []),
+      ...(missingEncryptionPassphraseSecretId && legacyEncryptionPassphrase ? [result.settings.encryptionPassphraseSecretId] : []),
+    ]
     this.settings = result.settings as PluginSettings
     this.secretsMigrated = result.migrated
   }
