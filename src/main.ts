@@ -3,7 +3,7 @@ import { Plugin, setIcon, Modal, Notice, TFile, TFolder } from "obsidian";
 import { SettingTab, PluginSettings, DEFAULT_SETTINGS } from "./setting";
 import { GitHubClient } from "./lib/github-api";
 import { normalizeScheduledSyncIntervalSeconds, shouldRunScheduledSync, shouldRunStartupSync } from "./lib/sync-policy";
-import { migrateV4Secrets, sanitizeV4SettingsForPersistence, scrubV4SecretIds, storeV4Secrets } from "./lib/v4/secrets";
+import { migrateV4Secrets, sanitizeV4SettingsForPersistence, scrubV4SecretIds, storeV4Secrets, supersededV4SecretIds } from "./lib/v4/secrets";
 import { V4PluginRuntime } from "./lib/v4/runtime";
 import { countV4ScopedPaths } from "./lib/v4/scope";
 import { compileV4IgnorePathRegex } from "./lib/v4/ignore";
@@ -280,6 +280,7 @@ export default class FastSync extends Plugin {
       ...(pendingGithubTokenSecret ? [preparedSettings.githubTokenSecretId] : []),
       ...(pendingEncryptionPassphraseSecret ? [preparedSettings.encryptionPassphraseSecretId] : []),
     ]
+    const supersededSecretIds = supersededV4SecretIds(previousSettings, preparedSettings)
 
     await this.v4Runtime?.quiesceForSettingsChange()
     try {
@@ -293,6 +294,13 @@ export default class FastSync extends Plugin {
           throw new Error("Settings save failed and pending credentials could not be scrubbed.", { cause: cleanupError })
         }
         throw error
+      }
+      try {
+        scrubV4SecretIds(this.app.secretStorage, supersededSecretIds)
+      } catch {
+        if (!this.unloaded) {
+          new Notice("GitHub Sync: Settings saved, but an old credential could not be cleared from secure storage.")
+        }
       }
       if (this.unloaded) return
 

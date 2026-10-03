@@ -105,6 +105,24 @@ export function scrubV4SecretIds(storage: SecretStorageLike, ids: Iterable<strin
   }
 }
 
+export function supersededV4SecretIds(
+  previous: V4SecretBackedSettings,
+  next: V4SecretBackedSettings,
+): string[] {
+  const active = new Set([
+    next.githubTokenSecretId ?? "",
+    next.encryptionPassphraseSecretId ?? "",
+  ].filter(Boolean))
+  const superseded: string[] = []
+  const seen = new Set<string>()
+  for (const id of [previous.githubTokenSecretId ?? "", previous.encryptionPassphraseSecretId ?? ""]) {
+    if (!id || active.has(id) || seen.has(id)) continue
+    seen.add(id)
+    superseded.push(id)
+  }
+  return superseded
+}
+
 export function storeV4Secrets(
   settings: V4SecretBackedSettings,
   storage: SecretStorageLike,
