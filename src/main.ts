@@ -253,11 +253,23 @@ export default class FastSync extends Plugin {
     ) {
       preparedSettings.encryptionPassphraseSecretId = this.createSecretId("encryption-passphrase")
     }
+    const pendingGithubTokenSecret = preparedSettings.githubTokenSecretId !== previousSettings.githubTokenSecretId
+    const pendingEncryptionPassphraseSecret = preparedSettings.encryptionPassphraseSecretId !== previousSettings.encryptionPassphraseSecretId
 
     await this.v4Runtime?.quiesceForSettingsChange()
     try {
-      storeV4Secrets(preparedSettings, this.app.secretStorage)
-      await this.persistSettingsData(preparedSettings)
+      try {
+        storeV4Secrets(preparedSettings, this.app.secretStorage)
+        await this.persistSettingsData(preparedSettings)
+      } catch (error) {
+        try {
+          if (pendingGithubTokenSecret) this.app.secretStorage.setSecret(preparedSettings.githubTokenSecretId, "")
+          if (pendingEncryptionPassphraseSecret) this.app.secretStorage.setSecret(preparedSettings.encryptionPassphraseSecretId, "")
+        } catch (cleanupError) {
+          throw new Error("Settings save failed and pending credentials could not be scrubbed.", { cause: cleanupError })
+        }
+        throw error
+      }
       if (this.unloaded) return
 
       this.settings = preparedSettings
