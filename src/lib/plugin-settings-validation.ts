@@ -1,5 +1,6 @@
 import { assertSafeGitHubBranch, assertSafeGitHubRepositoryCoordinates } from "./github-config"
 import { compileV4IgnorePathRegex } from "./v4/ignore"
+import { assertDistinctV4SecretIds } from "./v4/secrets"
 
 type RuntimeSettings = Record<string, unknown>
 
@@ -47,6 +48,7 @@ export function assertPluginSettingsRuntimeSafe(value: unknown): void {
     "encryptionPassphraseSecretId",
     "clipboardReadTip",
   ]) optionalString(settings, key)
+  assertDistinctV4SecretIds(settings)
 
   if (settings.encryptionMode !== "plaintext" && settings.encryptionMode !== "encrypted") {
     throw new Error("Invalid plugin settings: encryptionMode is unsupported.")

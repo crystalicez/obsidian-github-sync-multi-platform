@@ -20,6 +20,14 @@ export interface SecretMigrationResult<T extends V4SecretBackedSettings> {
   migrated: boolean
 }
 
+export function assertDistinctV4SecretIds(settings: V4SecretBackedSettings): void {
+  const githubTokenSecretId = settings.githubTokenSecretId ?? ""
+  const encryptionPassphraseSecretId = settings.encryptionPassphraseSecretId ?? ""
+  if (githubTokenSecretId && encryptionPassphraseSecretId && githubTokenSecretId === encryptionPassphraseSecretId) {
+    throw new Error("GitHub token and encryption passphrase secret IDs must be distinct.")
+  }
+}
+
 function loadSecret(storage: SecretStorageLike, id: string): string {
   return id ? storage.getSecret(id) ?? "" : ""
 }
@@ -33,6 +41,7 @@ export function migrateV4Secrets<T extends V4SecretBackedSettings>(
   const githubTokenSecretId = settings.githubTokenSecretId || idFactory("github-token")
   const encryptionPassphraseSecretId =
     settings.encryptionPassphraseSecretId || idFactory("encryption-passphrase")
+  assertDistinctV4SecretIds({ githubTokenSecretId, encryptionPassphraseSecretId })
 
   if (!settings.githubTokenSecretId || !settings.encryptionPassphraseSecretId) migrated = true
 
@@ -83,6 +92,7 @@ export function storeV4Secrets(
   settings: V4SecretBackedSettings,
   storage: SecretStorageLike,
 ): void {
+  assertDistinctV4SecretIds(settings)
   if (settings.githubTokenSecretId) {
     storage.setSecret(settings.githubTokenSecretId, settings.githubToken ?? "")
   }
