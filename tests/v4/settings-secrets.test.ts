@@ -1468,6 +1468,42 @@ test("failed settings persistence scrubs only newly generated orphan secrets bef
 });
 
 
+test("successful credential rotation scrubs only superseded secret IDs after durable settings commit", async () => {
+  const superseded = (v4SecretsModule as Record<string, unknown>).supersededV4SecretIds;
+  assert.equal(typeof superseded, "function", "superseded credential selection must be centralized and testable");
+
+  const previous = {
+    githubTokenSecretId: "old-token",
+    encryptionPassphraseSecretId: "old-pass",
+  };
+  const next = {
+    githubTokenSecretId: "old-pass",
+    encryptionPassphraseSecretId: "new-pass",
+  };
+  assert.deepEqual(
+    (superseded as (previous: unknown, next: unknown) => string[])(previous, next),
+    ["old-token"],
+    "an old ID reused by the new generation must never be scrubbed",
+  );
+
+  const mainSource = await readFile("src/main.ts", "utf8");
+  const saveStart = mainSource.indexOf("async saveSettings(");
+  const persistSettings = mainSource.indexOf("await this.persistSettingsData(preparedSettings)", saveStart);
+  const supersededIds = mainSource.indexOf("const supersededSecretIds =", saveStart);
+  const scrubSuperseded = mainSource.indexOf("scrubV4SecretIds(this.app.secretStorage, supersededSecretIds)", persistSettings);
+  const publishSettings = mainSource.indexOf("this.settings = preparedSettings", persistSettings);
+
+  assert.ok(supersededIds > saveStart && supersededIds < persistSettings);
+  assert.ok(scrubSuperseded > persistSettings, "old credential cleanup must happen only after durable settings commit");
+  assert.ok(publishSettings > scrubSuperseded, "post-commit cleanup must not leave live runtime on the old generation");
+  assert.match(
+    mainSource.slice(persistSettings, publishSettings),
+    /try\s*\{[\s\S]*?scrubV4SecretIds\(this\.app\.secretStorage,\s*supersededSecretIds\)[\s\S]*?\}\s*catch/u,
+    "superseded credential cleanup must be best-effort after commit",
+  );
+});
+
+
 test("settings save does not publish the new runtime generation before durable persistence succeeds", async () => {
   const mainSource = await readFile("src/main.ts", "utf8");
 
