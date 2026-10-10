@@ -58,6 +58,10 @@ Evidence labels: **T** = targeted deterministic RED/GREEN regression; **S** = re
 - Real network: missing auth, offline/reconnect, rate-limit, slow responses, massive commit/file history, recovery notice and conflict/cancellation.
 - Document evidence with exact source SHA, screenshots from **test data only**, host/Obsidian version/theme/window/OS, passes and reproductions before changing advertised platform claims.
 
+### Completed clean-source verification
+
+Pushed implementation/report commit **`13dce59e3364ae7ec360c35435f074115bf3628a`** was checked out in detached worktree `.tmp/release-audit-clean-20261010`. `git status --short --branch` showed exactly `## HEAD (no branch)` **after** the gate run, with no other modifications. Node `v24.11.0` / pnpm `9.12.3`: frozen install, build, fast **571/571**, fast repeat **10/10**, recovery, resource, feasibility, release metadata/package validation and three GitHub E2E compile-only bundles all returned **exit code 0**. No credentialed E2E mutation, hosted CI qualification, master merge, UI screenshot validation or physical device test was performed. The pre-existing uncommitted `tests/v4/github-transport.test.ts` WIP in the **primary** workspace was excluded from this clean Git tree.
+
 ## Verification and PR gates
 
 Run focused `ui-styles-contract`, `sync-center-progress`, `main-progress`, `settings-debug-copy`, `settings-save-overlap`, and `settings-clipboard-lifecycle` tests, then `pnpm build`, `pnpm test:fast`, repeat x10, recovery, resource, feasibility, metadata/package and compile-only E2E. Verify in a **clean detached checkout** of the pushed code SHA. This is a local code audit; it does not authorize live-GitHub mutations, merging PR #8 or a stable release.

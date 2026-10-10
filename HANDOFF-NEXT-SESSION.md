@@ -1016,6 +1016,9 @@ Verification status:
 - **Not pristine yet:** primary workspace still contains unrelated uncommitted `tests/v4/github-transport.test.ts` test-helper changes; these gates are pre-commit, not clean exact-source qualification. After pushing fix commit, test the exact code SHA from a separate detached clean checkout and record results.
 - Real native Obsidian visual acceptance was **not** performed, because the only existing Obsidian window is associated with a separate user vault; we did not open, edit or capture unrelated private vault screens. Physical desktop/mobile, keyboard modal accessibility and hosted CI evidence remain required before release.
 
+- Comprehensive UI source-audit implementation/report committed and pushed as `13dce59e3364ae7ec360c35435f074115bf3628a`. **Clean exact-SHA proof:** detached `.tmp/release-audit-clean-20261010` checked out precisely that full SHA, `git status --short --branch` returned `## HEAD (no branch)` after testing. Node `v24.11.0` / pnpm `9.12.3`: frozen install, production build, standalone fast **571/571**, repeat **10/10**, recovery, resource, feasibility, metadata/package validators, and three E2E harness compile-only bundles all exited **0**. The unrelated dirty `tests/v4/github-transport.test.ts` helper remained only in the primary workspace, not this clean source.
+- **No physical visual validation:** report is an exhaustive *source surface inventory and deterministic interaction check*, not an Obsidian screen-by-screen screenshot/test on this SHA. Actual vault and keyboard/mobile acceptance remain open, particularly accessible Force confirmation.
+
 ### TDD plan
 
 Write RED regressions before fixes:
