@@ -760,6 +760,21 @@ Audit method:
    - Fix: `ccc3ebc` verifies the current journal directory against the head journal ID, requires canonical page blob names and counts, binds each immutable journal blob SHA to the commit tree leaf, authenticates AES-GCM ciphertext with the repository/journal/page AAD, and rejects invalid or inconsistent page headers before declaring the tip a plugin publication.
    - This is **publication-classification evidence**, not proof of semantic equivalence between every journal change descriptor and the full remote record set; keep residual publication integrity review separate.
 
+110. **MEDIUM Settings Save robustness/UX — overlapping submissions were not rejected at the plugin entry point and pending Save controls could be recreated enabled.**
+   - RED: `tests/v4/settings-save-overlap.test.ts` invokes `FastSync.saveSettings()` twice with delayed persistence and a deliberately permissive runtime mock, observing two entries into settings transition; a Settings Tab test proved the banner rerender enabled another Save while the first awaited.
+   - Actual `V4PluginRuntime.quiesceForSettingsChange()` already rejects a concurrent transition in production, so the demonstrated end-user bug is confusing double-submit/error feedback and absent plugin-level defense, **not confirmed cross-target corruption**.
+   - Fix: plugin-level in-progress guard, unconditional release on both quiescence and persistence failure, UI-level pending flag surviving banner rerender, and disabled Save/Discard while saving.
+   - GREEN: four focused scenarios including post-error and post-quiescence retry.
+
+111. **MEDIUM historical preview memory/resource — external Git blob previews could bypass the 5 MiB preflight through unknown or stale descriptor sizes.**
+   - RED: `tests/v4/history-service.test.ts` proves external version descriptor `size: 0` together with a tree blob missing its size or advertising 6 MiB previously entered the GitHub blob-download path.
+   - Fix: `V4HistoryService.previewChange()` requires a safe numeric size on the selected external Git tree blob and fails before `getBlob()` for unknown or over-limit sizes, while preserving regular external previews.
+   - Limitation: GitHub/Obsidian request-response buffering still occurs before any post-response check; this is a metadata preflight, not a streaming transport memory guarantee.
+
+112. **LOW Sync Center error resilience — unexpected provider rejection shapes broke the error display.**
+   - RED: Sync Center tests exercise `null` and string rejection from the async history provider. Prior `(error as Error).message` could throw on null or display undefined.
+   - Fix: nonempty Error/string messages or a generic fallback, with one visible Notice and stable error panel.
+
 ### Audited surfaces with no new confirmed defect so far
 
 - secret migration/persistence: raw token/passphrase are removed before plugin data persistence and use Obsidian SecretStorage;
@@ -938,6 +953,17 @@ Verification status:
 - Release-host preflight: connected Windows workspace returns `node --version` = `v24.11.0` and `corepack pnpm --version` = `9.12.3`, but `gh` executable was not found when attempting read-only `gh api`. Local official qualification/release is therefore blocked **on this host** until an authenticated GitHub CLI is provisioned; no global tooling changes were made.
 - Do not automatically promote audit-branch gates to release authority: after merge/version changes the target SHA must be requalified.
 - Follow-up clean-tree proof: a detached Git worktree at `.tmp/release-audit-clean-20261010` was checked out at exact full SHA `f6e7ab5130095da72f9fe41a23887fa1f8bdfb05`; Git status was clean before **and after** testing. Frozen install, build, fast once, repeat fast 10/10 complete, recovery, resource, feasibility, metadata/package validation, and all three E2E harness compile bundles each passed with exit code 0 using the pinned Node/pnpm. This excludes the unrelated dirty transport fixture from the primary workspace, superseding the non-pristine evidence caveat **for this clean audit SHA only**. No live E2E, physical device test, official qualification receipt, or stable release was created.
+
+### 2026-10-10 UX/UI/performance/rare-case follow-up verification
+
+- Root-cause fixes and RED/GREEN regressions committed and pushed as **`bc61530`** (`fix: harden settings save UX and history previews`). This audit keeps unrelated GitHub-transport helper WIP unstaged.
+
+- The traced risk matrix, three reproduced defects, bounded fixes, and remaining non-confirmed UX/performance hypotheses are recorded in `docs/engineering/production-ux-edge-audit-2026-10-10.md`.
+- RED → GREEN suites: Settings Save overlap/UX/failure handling **4/4**, Sync Center provider error and lifecycle **8/8**, and history-service suite including unknown/oversized external blob size preflight **PASS**.
+- Connected `lnwjud` Windows run: `pnpm build`, `pnpm test:fast`, `pnpm test:repeat` (10/10), `pnpm test:recovery`, `pnpm test:resource`, `pnpm test:feasibility`, `pnpm validate:metadata`, `pnpm validate:package`, and `pnpm test:github-e2e:compile` (three bundles) each exited 0. The final fast-repeat gate was rerun after the additional quiescence-error regression was added.
+- This qualification runs in the existing audit workspace containing the **unrelated, pre-existing, unstaged** `tests/v4/github-transport.test.ts` helper edit. Do **not** call it a pristine exact-Git-tree run. The previous separate clean detached audit-SHA evidence applies to its own earlier source, not to these new fixes.
+- Additional **pristine exact-source** verification: detached worktree `.tmp/release-audit-clean-20261010` at full SHA `bc6153061e3222d3c386f466e864df9fc171ed39` (pushed fix commit) was clean both before and after every gate. Exact Node `v24.11.0` / pnpm `9.12.3`: `corepack pnpm install --frozen-lockfile`, `pnpm build`, `pnpm test:fast`, `pnpm test:repeat` (10/10), `pnpm test:recovery`, `pnpm test:resource`, `pnpm test:feasibility`, `pnpm validate:metadata`, `pnpm validate:package`, and `pnpm test:github-e2e:compile` all exited 0. This clean-run evidence **supersedes the WIP caveat for that exact code SHA**, but is not an official `master`/live qualification receipt.
+- No destructive live GitHub E2E, physical-device qualification, stable release/tag publication, or PR merge was performed; those release gates remain open. Ordinary audit branch commits/pushes are tracked separately.
 
 ### TDD plan
 
@@ -1126,4 +1152,4 @@ For future work:
 ## Last updated
 
 - 2026-10-10 (Asia/Bangkok)
-- Reason: record additional encrypted-journal publication hardening and the non-destructive audit-branch release-readiness verification; preserve prior 2026-09-26 landed `master` closeout as historical evidence, not current audit PR status.
+- Reason: record encrypted-journal publication hardening, the additional UX/UI/resource/rare-case audit findings (110–112), regression fixes, and clean exact-source non-destructive verification; retain the 2026-09-26 landed `master` closeout only as historical context.
