@@ -17,7 +17,7 @@
 | --- | --- | --- |
 | Close production audit | Independently review and resolve current regressions, risky tree/journal changes and tracked WIP; document residual risks | Open PR #8; review outstanding |
 | Freeze source | Clean checkout of current `master`, immutable full commit SHA, coherent metadata | Not done |
-| Deterministic qualification | Exact `v24.11.0` Node, pnpm `9.12.3`, frozen install, build, fast ×1, fast ×10, recovery, resource, feasibility, E2E compile, metadata/package validation | Audit-workspace checks run separately; **not** master qualification |
+| Deterministic qualification | Exact `v24.11.0` Node, pnpm `9.12.3`, frozen install, build, fast ×1, fast ×10, recovery, resource, feasibility, E2E compile, metadata/package validation | All non-destructive checks PASS on a clean detached audit SHA; **not** master/live release qualification |
 | Hosted CI | Successful current-attempt CI of exact master SHA and artifact provenance | No current audit-SHA run found; investigate Actions execution before release |
 | Live GitHub | Exact-SHA qualification on isolated disposable target with pinned numeric repo ID; cleanup verified | Not run for this candidate |
 | Devices | Real desktop/mobile smoke tests for claimed platforms; verify sync/conflicts/offline/restart/upgrade | No new physical evidence |
@@ -30,6 +30,25 @@
 The public GitHub Actions runs API returned `total_count: 0` for audit commit `3886c33f6810eb95a37046ed585bd90fc6640aff`, even though the push succeeded. The most recent runs visible through the repository-wide API were dated 2026-08-16. This **does not prove** that Actions is disabled, but it means there is currently no hosted CI evidence for this pushed audit tip. Check repository Actions permissions, workflow eligibility, and the Actions run UI before treating the PR as CI-qualified. The official local exact-SHA release path remains available independently, but do not silently substitute audit-workspace checks for release authority.
 
 The connected Windows host reports Node `v24.11.0` and Corepack pnpm `9.12.3` (matching repository pins), but an attempted read-only `gh api` preflight returned `EXECUTABLE_NOT_FOUND` for `gh`. This host therefore cannot yet execute the official local qualification/release commands; provision an authenticated GitHub CLI on the chosen release machine before invoking them. No global tooling was installed during this pass.
+
+### Clean audit-SHA deterministic verification (2026-10-10)
+
+A detached Git worktree at `.tmp/release-audit-clean-20261010` was checked out at full SHA `f6e7ab5130095da72f9fe41a23887fa1f8bdfb05` (the previously pushed readiness-documentation commit). Git status was clean **before and after** verification: `## HEAD (no branch)`, with no modified or untracked source files. The pre-existing `tests/v4/github-transport.test.ts` edit in the primary workspace was therefore excluded from this run.
+
+Using Node `v24.11.0` and pnpm `9.12.3`, all of the following completed with exit code **0** in that detached worktree:
+
+- `corepack pnpm install --frozen-lockfile`
+- `corepack pnpm build`
+- `corepack pnpm test:fast`
+- `corepack pnpm test:repeat` (10 complete fast-suite runs)
+- `corepack pnpm test:recovery`
+- `corepack pnpm test:resource`
+- `corepack pnpm test:feasibility`
+- `corepack pnpm validate:metadata`
+- `corepack pnpm validate:package`
+- `corepack pnpm test:github-e2e:compile` (three compiled bundles; no live GitHub mutation)
+
+This is **clean exact-audit-SHA deterministic evidence**, not qualification of `master` or a stable release. The later documentation commit recording the result changes its own SHA; the production source and tests validated above were unchanged. No live disposable-repository E2E or physical-device test was run.
 
 ## Safe, autonomous follow-up
 
