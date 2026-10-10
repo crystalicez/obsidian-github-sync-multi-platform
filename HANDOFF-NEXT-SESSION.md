@@ -996,6 +996,10 @@ Verification status:
 - The main audit workspace retains the **unrelated pre-existing** unstaged `tests/v4/github-transport.test.ts` helper edit. Therefore these pre-commit test results are not yet exact-source clean checkout proof; separately validate the pushed fix SHA in a detached worktree.
 - No real-GitHub credentials, force operations, destructive E2E, physical device tests, PR merge or production release were used.
 
+- Source fixes/tests/release-readiness audit from this phase committed and pushed as `d8d7d83e21c22ecbc2111887e4b25ca8aa406d8a`. **Clean exact-source** detached worktree at that SHA was clean before/after checks; Node `v24.11.0`, pnpm `9.12.3`: frozen install, build, fast, repeat fast **10/10**, recovery, resource, feasibility, metadata/package validation, and E2E compile-only (three bundles) all exited 0. Unrelated dirty transport helper in primary workspace was excluded.
+- **Deferred accessibility/product decision:** `FastSync.showForceConfirm()` uses a pointer-only div slider without an evident keyboard unlock, focus target or slider ARIA semantics. A deliberate keyboard-accessible path must be designed and verified in real Obsidian without weakening destructive-operation confirmation. Also decide warning-only versus blocking Sync/Force while settings are unsaved. Neither interaction was changed in this patch.
+- Live destructive GitHub E2E, physical platform smoke, and stable release qualification remain unexecuted.
+
 ### TDD plan
 
 Write RED regressions before fixes:
