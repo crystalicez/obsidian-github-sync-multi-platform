@@ -18,12 +18,18 @@
 | Close production audit | Independently review and resolve current regressions, risky tree/journal changes and tracked WIP; document residual risks | Open PR #8; review outstanding |
 | Freeze source | Clean checkout of current `master`, immutable full commit SHA, coherent metadata | Not done |
 | Deterministic qualification | Exact `v24.11.0` Node, pnpm `9.12.3`, frozen install, build, fast ×1, fast ×10, recovery, resource, feasibility, E2E compile, metadata/package validation | Audit-workspace checks run separately; **not** master qualification |
-| Hosted CI | Successful current-attempt CI of exact master SHA and artifact provenance | Not verified |
+| Hosted CI | Successful current-attempt CI of exact master SHA and artifact provenance | No current audit-SHA run found; investigate Actions execution before release |
 | Live GitHub | Exact-SHA qualification on isolated disposable target with pinned numeric repo ID; cleanup verified | Not run for this candidate |
 | Devices | Real desktop/mobile smoke tests for claimed platforms; verify sync/conflicts/offline/restart/upgrade | No new physical evidence |
 | Windows 5 GiB | Force Push → no-op → clean-vault Force Pull SHA-256 equality and controlled recovery with bounded-memory measurements | `tests/baselines/v4/windows.json`: pending |
 | Android 5 GiB | Supported bounded read and atomic stage commit on device, then physical evidence | Unsupported; keep capability-failed |
 | Release qualification and assets | Official exact-SHA `pnpm qualify:local` receipt, `pnpm release:local -- <version>`, stable ref/draft/asset digests verified | Not run; requires maintainer release decision |
+
+### Hosted Actions observation (2026-10-10)
+
+The public GitHub Actions runs API returned `total_count: 0` for audit commit `3886c33f6810eb95a37046ed585bd90fc6640aff`, even though the push succeeded. The most recent runs visible through the repository-wide API were dated 2026-08-16. This **does not prove** that Actions is disabled, but it means there is currently no hosted CI evidence for this pushed audit tip. Check repository Actions permissions, workflow eligibility, and the Actions run UI before treating the PR as CI-qualified. The official local exact-SHA release path remains available independently, but do not silently substitute audit-workspace checks for release authority.
+
+The connected Windows host reports Node `v24.11.0` and Corepack pnpm `9.12.3` (matching repository pins), but an attempted read-only `gh api` preflight returned `EXECUTABLE_NOT_FOUND` for `gh`. This host therefore cannot yet execute the official local qualification/release commands; provision an authenticated GitHub CLI on the chosen release machine before invoking them. No global tooling was installed during this pass.
 
 ## Safe, autonomous follow-up
 

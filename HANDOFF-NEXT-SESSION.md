@@ -934,6 +934,8 @@ Verification status:
 - The fast/repeat runs included an **uncommitted, pre-existing test-helper edit** in `tests/v4/github-transport.test.ts`; the current workspace is not a pristine exact-SHA checkout and this WIP was deliberately left untouched and unstaged.
 - The review/qualification matrix and maintainer decision boundaries are recorded in `docs/engineering/production-release-readiness-2026-10-10.md`.
 - Release blockers remain: independent review of draft PR #8, a clean frozen `master` SHA and hosted CI, disposable-repository live E2E with verified cleanup, physical platform smoke evidence per published support claims, and exact-SHA local qualification before any stable publication. No destructive live test, tag, release, or merge was performed.
+- Hosted GitHub Actions check on 2026-10-10: after pushing readiness docs as `3886c33f6810eb95a37046ed585bd90fc6640aff`, the repository Actions runs API returned `total_count: 0` for that SHA; the newest repository-wide runs visible through the public API dated 2026-08-16. Root cause not determined; do not claim Actions are disabled or that hosted CI passed. Investigate repository Actions settings/workflow eligibility before using hosted qualification evidence.
+- Release-host preflight: connected Windows workspace returns `node --version` = `v24.11.0` and `corepack pnpm --version` = `9.12.3`, but `gh` executable was not found when attempting read-only `gh api`. Local official qualification/release is therefore blocked **on this host** until an authenticated GitHub CLI is provisioned; no global tooling changes were made.
 - Do not automatically promote audit-branch gates to release authority: after merge/version changes the target SHA must be requalified.
 
 ### TDD plan
