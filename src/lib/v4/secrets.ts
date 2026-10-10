@@ -126,12 +126,16 @@ export function supersededV4SecretIds(
 export function storeV4Secrets(
   settings: V4SecretBackedSettings,
   storage: SecretStorageLike,
+  selection: { githubToken: boolean; encryptionPassphrase: boolean } = {
+    githubToken: true,
+    encryptionPassphrase: true,
+  },
 ): void {
   assertDistinctV4SecretIds(settings)
-  if (settings.githubTokenSecretId) {
+  if (selection.githubToken && settings.githubTokenSecretId) {
     storage.setSecret(settings.githubTokenSecretId, settings.githubToken ?? "")
   }
-  if (settings.encryptionPassphraseSecretId) {
+  if (selection.encryptionPassphrase && settings.encryptionPassphraseSecretId) {
     storage.setSecret(
       settings.encryptionPassphraseSecretId,
       settings.encryptionPassphrase ?? "",

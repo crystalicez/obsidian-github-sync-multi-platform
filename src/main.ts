@@ -285,7 +285,10 @@ export default class FastSync extends Plugin {
     await this.v4Runtime?.quiesceForSettingsChange()
     try {
       try {
-        storeV4Secrets(preparedSettings, this.app.secretStorage)
+        storeV4Secrets(preparedSettings, this.app.secretStorage, {
+          githubToken: pendingGithubTokenSecret,
+          encryptionPassphrase: pendingEncryptionPassphraseSecret,
+        })
         await this.persistSettingsData(preparedSettings)
       } catch (error) {
         try {

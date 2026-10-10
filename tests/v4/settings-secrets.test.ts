@@ -1451,7 +1451,7 @@ test("failed settings persistence scrubs only newly generated orphan secrets bef
   const tokenGenerated = mainSource.indexOf("preparedSettings.githubTokenSecretId = this.createSecretId", saveStart);
   const passGenerated = mainSource.indexOf("preparedSettings.encryptionPassphraseSecretId = this.createSecretId", saveStart);
   const quiesce = mainSource.indexOf("await this.v4Runtime?.quiesceForSettingsChange()", saveStart);
-  const storeSecrets = mainSource.indexOf("storeV4Secrets(preparedSettings, this.app.secretStorage)", quiesce);
+  const storeSecrets = mainSource.indexOf("storeV4Secrets(preparedSettings, this.app.secretStorage", quiesce);
   const persistSettings = mainSource.indexOf("await this.persistSettingsData(preparedSettings)", storeSecrets);
   const pendingSecretIds = mainSource.indexOf("const pendingSecretIds =", passGenerated);
   const rollbackCatch = mainSource.indexOf("catch", storeSecrets);
