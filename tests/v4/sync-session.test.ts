@@ -3549,6 +3549,73 @@ test("v4 does not trust forged plugin publication that tampers a cached internal
 });
 
 
+test("v4 encrypted publication rejects tampered content objects when metadata shards are unchanged", async () => {
+  const github = new MemoryGitHub();
+  const vault = new MemoryVault();
+  const repoId = "o/r#main";
+  const configEncrypted: V4RemoteConfig = {
+    formatVersion: 4,
+    mode: "encrypted",
+    repoId,
+    pathLayout: "opaque-stable-v1",
+    algorithm: "AES-GCM",
+    kdf: "PBKDF2-SHA-256",
+    kdfParams: { iterations: 10, salt: "c2FsdA" },
+  };
+  const keyring = await deriveV4Keyring({ passphrase: "pass", repoId, salt: enc("salt"), iterations: 10 });
+  const index = createEmptyV4LocalIndex({ repoId, deviceId: "local", mode: "encrypted", pathLayout: "opaque-stable-v1" });
+  vault.files.set("secret.md", { bytes: enc("base"), mtime: 1 });
+
+  await new V4SyncSession({ github, vault, index, config: configEncrypted, keyring, conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "forcePush", allowThresholdOverride: false });
+
+  const previousHead = github.ref!.sha;
+  const previousCommit = github.commits.get(previousHead)!;
+  const record = indexRecordByPath(index, "secret.md");
+  assert.equal(record.storage, "single");
+  const records = Object.values(index.shards).flatMap(shard => Object.values(shard.records)).filter(candidate => !candidate.deleted);
+  const forgedJournalId = "forged-encrypted-object";
+  const forgedHead: V4RemoteHead = {
+    formatVersion: 4,
+    mode: "encrypted",
+    epoch: index.epoch,
+    generation: index.generation + 1,
+    journalId: forgedJournalId,
+    shardHashes: { ...index.shardHashes },
+    updatedAt: 9999,
+    deviceId: "forger",
+  };
+  const metadataFiles = await buildV4RemoteMetadata({
+    config: configEncrypted,
+    head: forgedHead,
+    records,
+    keyring,
+    buckets: [],
+  });
+  const headFile = metadataFiles.find(file => file.path === V4_HEAD_PATH);
+  assert.ok(headFile);
+  const forgedHeadBlob = await github.createGitBlob(headFile.bytes);
+  const tamperedObjectBlob = await github.createGitBlob(enc("not-valid-encrypted-content"));
+  const forgedTree = await github.createGitTree([
+    { path: V4_HEAD_PATH, mode: "100644", type: "blob", sha: forgedHeadBlob },
+    { path: record.remotePath, mode: "100644", type: "blob", sha: tamperedObjectBlob },
+  ], previousCommit.treeSha);
+  const forgedCommit = await github.createGitCommit(`obsidian-sync-v4:${forgedJournalId}`, forgedTree, [previousHead]);
+  await github.updateGitRef(forgedCommit, previousHead);
+
+  vault.operations.length = 0;
+  await assert.rejects(
+    () => new V4SyncSession({ github, vault, index, config: configEncrypted, keyring, conflictPolicy: "copy", abortChangePercent: 0 })
+      .sync({ operation: "normal", allowThresholdOverride: false, changes: [] }),
+    /publication|object|cipher|blob|verified|internal.*V4/iu,
+  );
+
+  assert.equal(index.remoteCommitSha, previousHead, "tampered encrypted object must not advance the trusted local baseline");
+  assert.equal(dec(vault.files.get("secret.md")!.bytes), "base");
+  assert.deepEqual(vault.operations.filter(operation => /^(?:write|trash|delete|commit-stage):/u.test(operation)), []);
+});
+
+
 test("v4 does not trust forged publication metadata whose changed blob bytes disagree with the current record", async () => {
   const github = new MemoryGitHub();
   const vault = new MemoryVault();
