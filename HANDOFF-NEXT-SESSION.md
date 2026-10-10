@@ -747,6 +747,14 @@ Audit method:
    - Fix: `fa6a36a` adds optional selective writes to `storeV4Secrets()` and passes the existing pending-token/pending-passphrase flags from `saveSettings()`, while retaining the default all-credentials behavior for direct compatibility callers.
    - Focused settings-secrets coverage is green at **62/62** after the fix.
 
+108. **HIGH encrypted publication object integrity — plugin publication classification could trust changed encrypted content objects whose authenticated metadata descriptors were unchanged.**
+   - Encrypted user content lives under the internal V4 `data/`, `parts/`, and `packs/` namespaces. Publication tree classification intentionally excludes the top-level internal V4 subtree from plaintext user-tree change detection.
+   - A forged commit could therefore preserve valid encrypted head progression and unchanged authenticated shard metadata while replacing an encrypted content object. Before this fix, that object-only mutation could be classified as the next plugin publication and advance the trusted baseline without proving that metadata authorized the content-object change.
+   - RED: `4b76f6c` changes only an encrypted content object while keeping the current record/shard metadata unchanged. The regression was strengthened so the local vault deliberately diverges and uses the metadata-only `newer` policy, proving rejection does not depend on a later local-match/body-read shortcut.
+   - Fix: `135b961` traverses changed encrypted `data/parts/packs` leaves under the existing shared publication-tree budget, requires every changed current object to be referenced by authenticated current metadata, and compares the exact object-relevant record descriptor against the authenticated parent shard. Parent shards are loaded only for buckets whose head hash changed, are themselves bound to the parent head's canonical shard hash, and are cached per bucket. An encrypted object cannot change when its record descriptor is unchanged even if another record in the same shard changed.
+   - Shared pack objects receive an additional bounded proof: a changed pack must bind to the immutable tree leaf SHA and decrypt/validate all current pack entries before the publication is trusted. Single/chunked objects avoid eager body downloads and remain AEAD/hash-checked when read normally.
+   - Focused sync-session coverage is green at **113/113** after the fix.
+
 ### Audited surfaces with no new confirmed defect so far
 
 - secret migration/persistence: raw token/passphrase are removed before plugin data persistence and use Obsidian SecretStorage;
@@ -827,6 +835,7 @@ RED tests have now been pushed on the audit branch:
 - `4d54485` — pending credential cleanup must attempt every unique secret ID before reporting a SecretStorage scrub failure.
 - `4a3f112` — successful credential rotation must scrub only superseded IDs after durable settings commit and must preserve IDs reused by the new generation.
 - `5361768` — unrelated settings saves must not rewrite unchanged token/passphrase values in SecretStorage.
+- `4b76f6c` — encrypted plugin publication classification must not trust content-object mutations when the authenticated record/shard metadata does not authorize that object change.
 
 Refined root-cause design:
 - create one canonical shard-record hash function and use it for writer hash creation, remote shard verification, and local persisted-cache verification;
@@ -896,6 +905,7 @@ Root-cause fixes are now on the audit branch:
 - `7ac4fc6` — scrub all unique pending credential IDs best-effort before surfacing cleanup failure in startup-migration and settings-save rollback paths.
 - `49b7ac2` — scrub superseded credential IDs only after durable settings commit, excluding any ID still active in the new generation.
 - `fa6a36a` — write only changed credentials during settings save by threading the pending-credential selection into `storeV4Secrets()`.
+- `135b961` — bind encrypted publication object changes to authenticated parent/current record descriptors and immutable tree evidence; fully verify changed shared packs within the writer pack-size contract.
 - `6151868d066c050deef9159d3beda389e2ae0ce7`, `d9cde1a72496a8c86df5c85b975d39b92998f873`, `0c301523e774d54bc03191aa7a897da98691ac81`, `06335328777bd5010e928c1951f1cdb581aac2f0` — bounded journal writer/reader contract, safe journal markers, cross-page consistency, descriptor validation before blob reads, and preview-limit precedence.
 - fixture-only followups `4ce0affffce484398db30b0de339af8a2dd1e5cf`, `e5ae96eda6003faa4233346bd5104561e2258923`, `40fc418844c40a52ef4baa39c7318f21a5547782`, `b876e4076084e544ec13ec0ef60c9ef7e0cbcc8a` keep tests protocol-shaped rather than weakening production validation.
 - fixture-only follow-up `b7635b7` makes recovery Git fixtures honor immutable ref reads and model non-recursive tree evidence under the publication-tree verifier; production behavior is unchanged.
@@ -907,11 +917,11 @@ Recent crash/memory hardening:
 
 Verification status:
 - The repository was executed through the connected local engineering workspace with Node `v24.11.0` and pnpm `9.12.3`.
-- Final post-fix gates on the current production source: `pnpm run test:fast` **546/546**, `pnpm run test:recovery` **50/50**, `pnpm run test:resource` **15/15**, and `pnpm run build` PASS.
+- Final post-fix gates on the current production source: `pnpm run test:fast` **547/547**, `pnpm run test:recovery` **50/50**, `pnpm run test:resource` **15/15**, and `pnpm run build` PASS.
 - Final release checks also pass on regenerated artifacts: `pnpm run validate:metadata` and `pnpm run validate:package`.
 - After publication-tree hardening exposed stale recovery fixtures, `b7635b7` restored the recovery gate to **50/50** by removing immutable-ref fallback to the mutable tip and supplying protocol-shaped non-recursive tree evidence.
-- The 546/546 fast run was executed with one unrelated uncommitted test-only helper in `tests/v4/github-transport.test.ts`; it does not modify production source or add/change a test case. Do not describe that run as a pristine exact-Git-tree qualification until that concurrent WIP is committed or removed.
-- Focused regressions in the latest audit pass: settings-secrets **62/62**, sync-session **112/112**, remote-index **20/20**, recovery **50/50**, recovery-boundary **3/3**, recovery-topology-ordering **1/1**, publication-tree-budget **3/3**, vault-write **3/3**, github-bootstrap-ref-conflict **2/2**, github-empty-ref **3/3**, github-transport **43/43**, github-tree-mode-validation **1/1**, storage-history **4/4**, github-immutable-read-fallback **13/13**, and benchmark **3/3**; publication-race **1/1** and runtime-retry **1/1** also pass with the stricter non-recursive tree evidence model. The benchmark qualification also reproduced the prior wall-clock flake under full-suite contention before `0762038...`, with later full fast runs remaining green through the current **546/546** audit head. Prior history-service **13/13**, sync-coordinator **25/25**, sync-policy **2/2**, storage-codec **12/12**, and opaque-leakage **2/2** remain covered by the full fast gate.
+- The 547/547 fast run was executed with one unrelated uncommitted test-only helper in `tests/v4/github-transport.test.ts`; it does not modify production source or add/change a test case. Do not describe that run as a pristine exact-Git-tree qualification until that concurrent WIP is committed or removed.
+- Focused regressions in the latest audit pass: settings-secrets **62/62**, sync-session **113/113**, remote-index **20/20**, recovery **50/50**, recovery-boundary **3/3**, recovery-topology-ordering **1/1**, publication-tree-budget **3/3**, vault-write **3/3**, github-bootstrap-ref-conflict **2/2**, github-empty-ref **3/3**, github-transport **43/43**, github-tree-mode-validation **1/1**, storage-history **4/4**, github-immutable-read-fallback **13/13**, and benchmark **3/3**; publication-race **1/1** and runtime-retry **1/1** also pass with the stricter non-recursive tree evidence model. The benchmark qualification also reproduced the prior wall-clock flake under full-suite contention before `0762038...`, with later full fast runs remaining green through the current **547/547** audit head. Prior history-service **13/13**, sync-coordinator **25/25**, sync-policy **2/2**, storage-codec **12/12**, and opaque-leakage **2/2** remain covered by the full fast gate.
 - Real GitHub E2E remains excluded from the default fast tier and was not run in this closure; inspect hosted checks for the exact pushed SHA separately before treating the branch as release-qualified.
 
 ### TDD plan
