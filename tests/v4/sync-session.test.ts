@@ -3617,6 +3617,62 @@ test("v4 encrypted publication rejects tampered content objects when metadata sh
 });
 
 
+test("v4 encrypted publication rejects tampered journal ciphertext before advancing trust", async () => {
+  const github = new MemoryGitHub();
+  const writerVault = new MemoryVault();
+  const repoId = "o/r#main";
+  const configEncrypted: V4RemoteConfig = {
+    formatVersion: 4,
+    mode: "encrypted",
+    repoId,
+    pathLayout: "opaque-stable-v1",
+    algorithm: "AES-GCM",
+    kdf: "PBKDF2-SHA-256",
+    kdfParams: { iterations: 10, salt: "c2FsdA" },
+  };
+  const keyring = await deriveV4Keyring({ passphrase: "pass", repoId, salt: enc("salt"), iterations: 10 });
+  const writerIndex = createEmptyV4LocalIndex({ repoId, deviceId: "writer", mode: "encrypted", pathLayout: "opaque-stable-v1" });
+  writerVault.files.set("secret.md", { bytes: enc("base"), mtime: 1 });
+
+  await new V4SyncSession({ github, vault: writerVault, index: writerIndex, config: configEncrypted, keyring, conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "forcePush", allowThresholdOverride: false });
+
+  const baseHead = github.ref!.sha;
+  const staleIndex = structuredClone(writerIndex);
+  staleIndex.deviceId = "stale";
+  const staleVault = new MemoryVault();
+  staleVault.files.set("secret.md", { bytes: enc("base"), mtime: 1 });
+
+  writerVault.files.set("secret.md", { bytes: enc("generation-two"), mtime: 2 });
+  await new V4SyncSession({ github, vault: writerVault, index: writerIndex, config: configEncrypted, keyring, conflictPolicy: "copy", abortChangePercent: 0 })
+    .sync({ operation: "normal", allowThresholdOverride: false });
+
+  const legitimateTip = github.ref!.sha;
+  const legitimateCommit = github.commits.get(legitimateTip)!;
+  const journalId = /^obsidian-sync-v4:(.+)$/u.exec(legitimateCommit.message)![1];
+  const journalPath = `${V4_ROOT}/journals/${journalId}/000000.enc`;
+  assert.ok(github.trees.get(legitimateCommit.treeSha)!.has(journalPath));
+
+  const tamperedJournalBlob = await github.createGitBlob(enc("not-valid-encrypted-journal"));
+  const forgedTree = await github.createGitTree([
+    { path: journalPath, mode: "100644", type: "blob", sha: tamperedJournalBlob },
+  ], legitimateCommit.treeSha);
+  const forgedCommit = await github.createGitCommit(legitimateCommit.message, forgedTree, [baseHead]);
+  await github.updateGitRef(forgedCommit, legitimateTip);
+
+  staleVault.operations.length = 0;
+  await assert.rejects(
+    () => new V4SyncSession({ github, vault: staleVault, index: staleIndex, config: configEncrypted, keyring, conflictPolicy: "copy", abortChangePercent: 0 })
+      .sync({ operation: "normal", allowThresholdOverride: false, changes: [] }),
+    /journal|publication|encrypted|verified|cipher/iu,
+  );
+
+  assert.equal(staleIndex.remoteCommitSha, baseHead, "tampered journal must not advance the trusted local baseline");
+  assert.equal(dec(staleVault.files.get("secret.md")!.bytes), "base");
+  assert.deepEqual(staleVault.operations.filter(operation => /^(?:write|trash|delete|commit-stage):/u.test(operation)), []);
+});
+
+
 test("v4 does not trust forged publication metadata whose changed blob bytes disagree with the current record", async () => {
   const github = new MemoryGitHub();
   const vault = new MemoryVault();
