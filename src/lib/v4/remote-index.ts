@@ -1,9 +1,11 @@
-import { bytesToUtf8, sha256Hex, utf8ToBytes } from "../bytes"
+import { bytesToUtf8, fromBase64Url, sha256Hex, toBase64Url, utf8ToBytes } from "../bytes"
 import { decryptV4Payload, encryptV4Payload, type V4Keyring } from "./crypto"
-import { buildV4PartPaths } from "./large-files"
+import { buildV4PartPaths, shouldUseV4Parts, V4_PART_BYTES } from "./large-files"
 import type { V4IndexFileRecord } from "./local-index"
 import { bucketForV4PathId, normalizeV4VaultPath, objectIdForV4File, opaqueV4ObjectPath, opaqueV4PackPath, pathIdForV4Path } from "./paths"
-import { effectiveV4PathLayout, V4_CONFIG_PATH, V4_HEAD_PATH, V4_ROOT, type V4RemoteConfig, type V4RemoteHead } from "./protocol-types"
+import { PACK_MAX_ENTRY_BYTES, PACK_MAX_FILES, PACK_MAX_PLAINTEXT_BYTES } from "./pack-planner"
+import { V4_GITHUB_SAFE_CONTENT_MUTATIONS_PER_REVISION } from "./part-write-policy"
+import { effectiveV4PathLayout, V4_CONFIG_PATH, V4_HEAD_PATH, V4_PBKDF2_ITERATIONS, V4_ROOT, type V4RemoteConfig, type V4RemoteHead } from "./protocol-types"
 import type { V4PreparedFile } from "./storage-codec"
 
 export interface V4RemoteShard {
@@ -11,7 +13,26 @@ export interface V4RemoteShard {
   records: Record<string, V4IndexFileRecord>
 }
 
-function assertNormalizedRemoteRecord(record: V4IndexFileRecord, config: V4RemoteConfig): void {
+export const V4_MAX_KDF_ITERATIONS = V4_PBKDF2_ITERATIONS
+export const V4_MAX_KDF_SALT_BYTES = 64
+const V4_PROTOCOL_TOKEN = /^[A-Za-z0-9_-]{1,128}$/u
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value)
+}
+
+function assertCanonicalKdfSalt(salt: unknown): asserts salt is string {
+  if (typeof salt !== "string" || salt.length < 2 || salt.length > 86 || !/^[A-Za-z0-9_-]+$/u.test(salt)) {
+    throw new Error("Invalid V4 encryption salt.")
+  }
+  let decoded: Uint8Array
+  try { decoded = fromBase64Url(salt) } catch { throw new Error("Invalid V4 encryption salt.") }
+  if (decoded.byteLength < 1 || decoded.byteLength > V4_MAX_KDF_SALT_BYTES || toBase64Url(decoded) !== salt) {
+    throw new Error("Invalid V4 encryption salt.")
+  }
+}
+
+export function assertV4RemoteRecordDescriptor(record: V4IndexFileRecord, config: V4RemoteConfig): void {
   let normalized: string
   try {
     normalized = normalizeV4VaultPath(record.path)
@@ -20,6 +41,12 @@ function assertNormalizedRemoteRecord(record: V4IndexFileRecord, config: V4Remot
   }
   if (normalized !== record.path) throw new Error(`V4 remote record path is not normalized: ${record.path}`)
   if (!record.fileId) throw new Error("V4 remote record has an empty fileId.")
+  if (!/^[0-9a-f]{64}$/u.test(record.plaintextSha256)) throw new Error("V4 remote record plaintext hash is invalid.")
+  if (!V4_PROTOCOL_TOKEN.test(record.remoteVersion)) throw new Error("V4 remote record version is invalid.")
+  if (!Number.isSafeInteger(record.size) || record.size < 0) throw new Error("V4 remote record size is invalid.")
+  if (!Number.isFinite(record.mtime)) throw new Error("V4 remote record mtime is invalid.")
+  if (typeof record.remotePath !== "string" || !record.remotePath) throw new Error("V4 remote record path descriptor is invalid.")
+  if (typeof record.remoteVersion !== "string") throw new Error("V4 remote record version is invalid.")
   if (record.encryptedPath !== undefined && record.encryptedPath !== record.remotePath) {
     const legacyPackedArtifact = effectiveV4PathLayout(config) === "encrypted-folders-v0"
       && record.storage === "pack"
@@ -33,19 +60,53 @@ function assertNormalizedRemoteRecord(record: V4IndexFileRecord, config: V4Remot
   }
   if (record.storage === "single") {
     if (record.partPaths !== undefined || record.packId !== undefined) throw new Error("V4 single storage has inconsistent part or pack descriptors.")
+    if (shouldUseV4Parts(record.size, record.size + (config.mode === "encrypted" ? 33 : 0))) {
+      throw new Error("V4 single storage exceeds the writer size limit.")
+    }
     if (config.mode === "plaintext" && record.remotePath !== record.path) throw new Error("V4 plaintext single storage path does not match its logical path.")
     return
   }
   if (record.storage === "chunked") {
-    if (!record.partPaths?.length || record.remotePath !== record.partPaths[0] || record.packId !== undefined) {
+    if (!Array.isArray(record.partPaths) || record.partPaths.length === 0 || record.remotePath !== record.partPaths[0] || record.packId !== undefined) {
       throw new Error("V4 chunked storage has inconsistent part descriptors.")
     }
-    if (!/^[A-Za-z0-9_-]+$/u.test(record.remoteVersion)) throw new Error("V4 chunked storage has an unsafe remote version.")
+    const predictedRemoteBytes = record.size + (config.mode === "encrypted" ? 33 : 0)
+    if (!shouldUseV4Parts(record.size, predictedRemoteBytes)) {
+      throw new Error("V4 chunked storage is below the writer chunking threshold.")
+    }
+    const minWriterParts = Math.ceil(record.size / V4_PART_BYTES)
+    const maxWriterParts = Math.ceil(record.size / (1024 * 1024))
+    if (
+      record.partPaths.length < minWriterParts
+      || record.partPaths.length > maxWriterParts
+      || record.partPaths.length > V4_GITHUB_SAFE_CONTENT_MUTATIONS_PER_REVISION
+    ) {
+      throw new Error("V4 chunked storage has a writer-incompatible part count.")
+    }
+    if (record.size > V4_GITHUB_SAFE_CONTENT_MUTATIONS_PER_REVISION * V4_PART_BYTES) {
+      throw new Error("V4 chunked storage exceeds the writer size budget.")
+    }
+    if (record.partPaths.some(path => typeof path !== "string" || !path)) throw new Error("V4 chunked storage has invalid part paths.")
+    if (config.mode === "plaintext") {
+      const expected = buildV4PartPaths({
+        mode: "plaintext",
+        logicalPath: record.path,
+        version: record.remoteVersion,
+        partCount: record.partPaths.length,
+      })
+      if (JSON.stringify(record.partPaths) !== JSON.stringify(expected)) throw new Error("V4 plaintext chunked storage paths are inconsistent.")
+    }
     return
   }
   if (record.storage === "pack") {
-    if (config.mode !== "encrypted" || !record.packId || !/^[A-Za-z0-9_-]+$/u.test(record.packId) || record.partPaths !== undefined) {
-      throw new Error("V4 pack storage has inconsistent descriptors.")
+    if (
+      config.mode !== "encrypted"
+      || !record.packId
+      || !V4_PROTOCOL_TOKEN.test(record.packId)
+      || record.partPaths !== undefined
+      || record.size > PACK_MAX_ENTRY_BYTES
+    ) {
+      throw new Error("V4 pack storage has inconsistent or oversized descriptors.")
     }
     return
   }
@@ -56,19 +117,63 @@ export function assertV4RemoteShardRecords(shard: V4RemoteShard, bucket: string,
   for (const [recordKey, record] of Object.entries(shard.records)) {
     if (recordKey !== record.pathId) throw new Error(`V4 shard record key does not match pathId: ${recordKey}`)
     if (bucketForV4PathId(record.pathId) !== bucket) throw new Error(`V4 record pathId is outside shard bucket: ${bucket}`)
-    assertNormalizedRemoteRecord(record, config)
+    assertV4RemoteRecordDescriptor(record, config)
+  }
+}
+
+export function assertV4LogicalPathSetSafe(paths: Iterable<string>): void {
+  const logicalPaths = new Set<string>()
+  const canonicalLogicalPaths = new Map<string, string>()
+  for (const path of paths) {
+    if (logicalPaths.has(path)) throw new Error(`Duplicate V4 remote logical path: ${path}`)
+    logicalPaths.add(path)
+    const canonicalPath = path.normalize("NFC").toLowerCase()
+    const canonicalPrevious = canonicalLogicalPaths.get(canonicalPath)
+    if (canonicalPrevious && canonicalPrevious !== path) {
+      throw new Error(`V4 remote logical path canonical collision: ${canonicalPrevious} <-> ${path}`)
+    }
+    canonicalLogicalPaths.set(canonicalPath, path)
+  }
+  for (const path of logicalPaths) {
+    let slash = path.indexOf("/")
+    while (slash > 0) {
+      const ancestor = path.slice(0, slash)
+      if (logicalPaths.has(ancestor)) {
+        throw new Error(`V4 remote logical path topology collision: ${ancestor} is a file ancestor of ${path}`)
+      }
+      slash = path.indexOf("/", slash + 1)
+    }
+  }
+  for (const [canonicalPath, originalPath] of canonicalLogicalPaths) {
+    let slash = canonicalPath.indexOf("/")
+    while (slash > 0) {
+      const canonicalAncestor = canonicalPath.slice(0, slash)
+      const originalAncestor = canonicalLogicalPaths.get(canonicalAncestor)
+      if (originalAncestor) {
+        throw new Error(`V4 remote logical path canonical topology collision: ${originalAncestor} is a file ancestor of ${originalPath}`)
+      }
+      slash = canonicalPath.indexOf("/", slash + 1)
+    }
   }
 }
 
 export async function assertV4RemoteRecordSet(records: V4IndexFileRecord[], config: V4RemoteConfig, keyring?: V4Keyring): Promise<void> {
   const fileIds = new Set<string>()
-  const logicalPaths = new Set<string>()
+  const packGroups = new Map<string, { files: number; plaintextBytes: number }>()
+  for (const record of records) assertV4RemoteRecordDescriptor(record, config)
+  assertV4LogicalPathSetSafe(records.map(record => record.path))
   for (const record of records) {
-    assertNormalizedRemoteRecord(record, config)
     if (fileIds.has(record.fileId)) throw new Error(`Duplicate V4 remote fileId: ${record.fileId}`)
     fileIds.add(record.fileId)
-    if (logicalPaths.has(record.path)) throw new Error(`Duplicate V4 remote logical path: ${record.path}`)
-    logicalPaths.add(record.path)
+    if (record.storage === "pack") {
+      const packId = record.packId!
+      const current = packGroups.get(packId) ?? { files: 0, plaintextBytes: 0 }
+      current.files++
+      current.plaintextBytes += record.size
+      if (current.files > PACK_MAX_FILES) throw new Error(`V4 remote pack exceeds file-count limit: ${packId}`)
+      if (current.plaintextBytes > PACK_MAX_PLAINTEXT_BYTES) throw new Error(`V4 remote pack exceeds plaintext byte limit: ${packId}`)
+      packGroups.set(packId, current)
+    }
     if (config.mode === "encrypted" && !keyring) throw new Error("Encryption passphrase is required to validate encrypted V4 records.")
     const expectedPathId = config.mode === "encrypted"
       ? await pathIdForV4Path(keyring!.pathKey, record.path)
@@ -100,12 +205,24 @@ export function encodeV4RemoteConfig(config: V4RemoteConfig): Uint8Array {
 }
 
 export function decodeV4RemoteConfig(bytes: Uint8Array): V4RemoteConfig {
-  const config = JSON.parse(bytesToUtf8(bytes)) as V4RemoteConfig
+  const parsed = JSON.parse(bytesToUtf8(bytes)) as unknown
+  if (!isRecord(parsed)) throw new Error("Invalid V4 remote config.")
+  const config = parsed as unknown as V4RemoteConfig
   if (config.formatVersion !== 4 || (config.mode !== "plaintext" && config.mode !== "encrypted")) {
     throw new Error("Unsupported remote format. Force Push is required to initialize V4.")
   }
+  if (typeof config.repoId !== "string" || !config.repoId) throw new Error("Invalid V4 remote repository identity.")
   if (config.pathLayout !== undefined && config.pathLayout !== "plaintext-v1" && config.pathLayout !== "opaque-stable-v1") {
     throw new Error("Unsupported V4 path layout.")
+  }
+  if (config.mode === "encrypted") {
+    if (config.algorithm !== "AES-GCM") throw new Error("Unsupported V4 encryption algorithm.")
+    if (config.kdf !== "PBKDF2-SHA-256") throw new Error("Unsupported V4 KDF.")
+    if (!isRecord(config.kdfParams)) throw new Error("Invalid V4 encrypted KDF parameters.")
+    if (!Number.isSafeInteger(config.kdfParams.iterations) || config.kdfParams.iterations < 1 || config.kdfParams.iterations > V4_MAX_KDF_ITERATIONS) {
+      throw new Error("Invalid V4 encrypted KDF iteration count.")
+    }
+    assertCanonicalKdfSalt(config.kdfParams.salt)
   }
   return config
 }
@@ -146,8 +263,24 @@ export async function decodeV4RemoteHead(
   config: V4RemoteConfig,
   keyring?: V4Keyring,
 ): Promise<V4RemoteHead> {
-  const head = await decodeMetadata<V4RemoteHead>(bytes, config, keyring, "head", config.repoId)
-  if (head.formatVersion !== 4 || head.mode !== config.mode) throw new Error("Invalid V4 remote head.")
+  const parsed = await decodeMetadata<unknown>(bytes, config, keyring, "head", config.repoId)
+  if (!isRecord(parsed)) throw new Error("Invalid V4 remote head.")
+  const head = parsed as unknown as V4RemoteHead
+  if (
+    head.formatVersion !== 4
+    || head.mode !== config.mode
+    || !Number.isSafeInteger(head.epoch) || head.epoch < 0
+    || !Number.isSafeInteger(head.generation) || head.generation < 0
+    || typeof head.journalId !== "string" || !V4_PROTOCOL_TOKEN.test(head.journalId)
+    || !Number.isFinite(head.updatedAt)
+    || typeof head.deviceId !== "string"
+    || !isRecord(head.shardHashes)
+  ) throw new Error("Invalid V4 remote head.")
+  const shardHashes = Object.entries(head.shardHashes)
+  if (
+    shardHashes.length > 256
+    || shardHashes.some(([bucket, hash]) => !/^[0-9a-f]{2}$/u.test(bucket) || typeof hash !== "string" || !/^[0-9a-f]{64}$/u.test(hash))
+  ) throw new Error("Invalid V4 remote head shard hashes.")
   return head
 }
 
@@ -157,8 +290,16 @@ export async function decodeV4RemoteShard(
   config: V4RemoteConfig,
   keyring?: V4Keyring,
 ): Promise<V4RemoteShard> {
-  const shard = await decodeMetadata<V4RemoteShard>(bytes, config, keyring, "index", `${config.repoId}:${bucket}`)
-  if (shard.bucket !== bucket) throw new Error(`V4 shard bucket mismatch: ${bucket}`)
+  const parsed = await decodeMetadata<unknown>(bytes, config, keyring, "index", `${config.repoId}:${bucket}`)
+  if (!isRecord(parsed) || parsed.bucket !== bucket || !isRecord(parsed.records)) {
+    throw new Error(`V4 shard bucket or record shape mismatch: ${bucket}`)
+  }
+  const shard = parsed as unknown as V4RemoteShard
+  for (const record of Object.values(shard.records)) {
+    if (Object.prototype.hasOwnProperty.call(record, "dirty") || Object.prototype.hasOwnProperty.call(record, "deleted")) {
+      throw new Error("V4 remote record contains local-only dirty/deleted state.")
+    }
+  }
   assertV4RemoteShardRecords(shard, bucket, config)
   return shard
 }

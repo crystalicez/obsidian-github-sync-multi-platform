@@ -1,6 +1,7 @@
 import { bytesToUtf8, fromBase64, sha256Hex, toBase64, utf8ToBytes } from "../bytes"
+import { boundedMap } from "./bounded-map"
 import { collectV4ContentSource, type V4ContentSource } from "./content-source"
-import { decryptV4Payload, encryptV4Payload, type V4Keyring } from "./crypto"
+import { decryptV4Payload, encryptV4Payload, V4_ENCRYPTED_PAYLOAD_OVERHEAD_BYTES, type V4Keyring } from "./crypto"
 import { throwIfV4Aborted } from "./cancellation"
 import {
   buildV4PartPaths,
@@ -15,6 +16,22 @@ import { normalizeV4VaultPath, objectIdForV4File, opaqueV4ObjectPath, opaqueV4Pa
 import { type V4FileRecord, type V4PathLayout, type V4StorageMode } from "./protocol-types"
 import type { V4ResourceController } from "./resource-controller"
 import type { V4StagedSink } from "./staging-store"
+
+const V4_CHUNK_READ_CONCURRENCY = 4
+const V4_PACK_PREFIX_BYTES = utf8ToBytes('{"version":1,"entries":{').byteLength
+const V4_PACK_SUFFIX_BYTES = utf8ToBytes('}}').byteLength
+
+function expectedV4PackArchiveBytes(records: readonly V4FileRecord[]): number {
+  let total = V4_PACK_PREFIX_BYTES + V4_PACK_SUFFIX_BYTES
+  for (let index = 0; index < records.length; index++) {
+    const record = records[index]
+    const keyBytes = utf8ToBytes(JSON.stringify(record.fileId)).byteLength
+    const encodedBytes = 4 * Math.ceil(record.size / 3)
+    total += (index > 0 ? 1 : 0) + keyBytes + 2 + encodedBytes + 1
+    if (!Number.isSafeInteger(total)) throw new RangeError("V4 pack archive is too large.")
+  }
+  return total
+}
 
 export interface V4PreparedFile {
   path: string
@@ -451,24 +468,75 @@ export class V4StorageCodec {
     }
 
     const plaintextSha256 = hash.digestHex()
-    if (total !== record.size) throw new Error(`V4 content size mismatch: expected ${record.size}, got ${total}.`)
+    if (total !== record.size) throw new Error(`V4 content size mismatch: ${record.remotePath}; expected ${record.size}, got ${total}.`)
     if (record.plaintextSha256 && plaintextSha256 !== record.plaintextSha256) throw new Error(`V4 content hash mismatch: ${record.remotePath}`)
     return { plaintextSha256, size: total }
+  }
+
+  async readPackRecords(
+    records: readonly V4FileRecord[],
+    reader: V4RemoteBytesReader,
+    signal: AbortSignal | undefined = this.options.signal,
+  ): Promise<Map<string, Uint8Array>> {
+    throwIfV4Aborted(signal)
+    if (this.options.mode !== "encrypted" || !this.options.keyring || records.length === 0) {
+      throw new Error("Invalid V4 pack record group.")
+    }
+    const first = records[0]
+    if (first.storage !== "pack" || !first.packId || !first.remotePath) throw new Error("Invalid V4 pack record.")
+    const packId = first.packId
+    const remotePath = first.remotePath
+    const fileIds = new Set<string>()
+    for (const record of records) {
+      if (record.storage !== "pack" || record.packId !== packId || record.remotePath !== remotePath) {
+        throw new Error("V4 pack record group is inconsistent.")
+      }
+      if (fileIds.has(record.fileId)) throw new Error(`Duplicate V4 packed fileId: ${record.fileId}`)
+      fileIds.add(record.fileId)
+    }
+
+    const payload = await reader(remotePath)
+    throwIfV4Aborted(signal)
+    const expectedArchiveBytes = expectedV4PackArchiveBytes(records)
+    if (payload.byteLength !== expectedArchiveBytes + V4_ENCRYPTED_PAYLOAD_OVERHEAD_BYTES) {
+      throw new Error("V4 pack payload size does not match its declared records.")
+    }
+    const archive = await this.crypto(() => decryptV4Payload(this.options.keyring!.contentKey, payload, { kind: "pack", aad: packId }))
+    if (archive.byteLength !== expectedArchiveBytes) throw new Error("V4 pack archive size does not match its declared records.")
+    let parsed: unknown
+    try { parsed = JSON.parse(bytesToUtf8(archive)) } catch { throw new Error("V4 pack archive JSON is invalid.") }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("V4 pack archive is invalid.")
+    const candidate = parsed as { version?: unknown; entries?: unknown }
+    if (candidate.version !== 1 || !candidate.entries || typeof candidate.entries !== "object" || Array.isArray(candidate.entries)) {
+      throw new Error("V4 pack archive is invalid.")
+    }
+    const entries = candidate.entries as Record<string, unknown>
+    const entryKeys = Object.keys(entries)
+    if (entryKeys.length !== fileIds.size || entryKeys.some(fileId => !fileIds.has(fileId))) {
+      throw new Error("V4 pack archive entry set does not match its declared records.")
+    }
+    const output = new Map<string, Uint8Array>()
+    for (const record of records) {
+      const encoded = entries[record.fileId]
+      if (typeof encoded !== "string") throw new Error(`V4 pack entry is missing: ${record.fileId}`)
+      const expectedEncodedLength = 4 * Math.ceil(record.size / 3)
+      if (encoded.length !== expectedEncodedLength) throw new Error("V4 packed entry size is inconsistent with its record.")
+      let plaintext: Uint8Array
+      try { plaintext = fromBase64(encoded) } catch { throw new Error("V4 packed entry base64 is invalid.") }
+      if (plaintext.byteLength !== record.size) throw new Error("V4 packed entry size is inconsistent with its record.")
+      if (record.plaintextSha256 && await this.crypto(() => sha256Hex(plaintext)) !== record.plaintextSha256) {
+        throw new Error("V4 packed content hash mismatch.")
+      }
+      output.set(record.fileId, plaintext)
+    }
+    return output
   }
 
   async read(record: V4FileRecord, reader: V4RemoteBytesReader, signal: AbortSignal | undefined = this.options.signal): Promise<Uint8Array> {
     throwIfV4Aborted(signal)
     if (record.storage === "pack") {
-      if (this.options.mode !== "encrypted" || !record.packId) throw new Error("Invalid V4 pack record.")
-      const payload = await reader(record.remotePath)
-      throwIfV4Aborted(signal)
-      const archive = await this.crypto(() => decryptV4Payload(this.options.keyring!.contentKey, payload, { kind: "pack", aad: record.packId! }))
-      const parsed = JSON.parse(bytesToUtf8(archive)) as { version?: number; entries?: Record<string, string> }
-      const encoded = parsed.version === 1 ? parsed.entries?.[record.fileId] : undefined
-      if (!encoded) throw new Error(`V4 pack entry is missing: ${record.fileId}`)
-      const plaintext = fromBase64(encoded)
-      if (record.plaintextSha256 && await this.crypto(() => sha256Hex(plaintext)) !== record.plaintextSha256) throw new Error("V4 packed content hash mismatch.")
-      return plaintext
+      const entries = await this.readPackRecords([record], reader, signal)
+      return entries.get(record.fileId)!
     }
     if (record.storage === "single") {
       const bytes = await reader(record.remotePath)
@@ -479,6 +547,9 @@ export class V4StorageCodec {
           kind: "content",
           aad: this.contentAad(record),
         }))
+      if (plaintext.byteLength !== record.size) {
+        throw new Error(`V4 content size mismatch: ${record.remotePath}; expected ${record.size}, got ${plaintext.byteLength}.`)
+      }
       if (record.plaintextSha256 && await this.crypto(() => sha256Hex(plaintext)) !== record.plaintextSha256) {
         throw new Error(`V4 content hash mismatch: ${record.remotePath}`)
       }
@@ -486,7 +557,7 @@ export class V4StorageCodec {
     }
     const partPaths = record.partPaths ?? []
     if (partPaths.length === 0) throw new Error("V4 chunked record has no parts.")
-    const parts = await Promise.all(partPaths.map(async (path, index) => {
+    const parts = await boundedMap(partPaths, V4_CHUNK_READ_CONCURRENCY, async (path, index) => {
       throwIfV4Aborted(signal)
       const bytes = await reader(path)
       throwIfV4Aborted(signal)
@@ -496,7 +567,11 @@ export class V4StorageCodec {
           kind: "part",
           aad: `${this.contentAad(record)}:${index}`,
         }))
-    }))
-    return joinAndVerifyV4Parts(parts, record.plaintextSha256)
+    })
+    const plaintext = await joinAndVerifyV4Parts(parts, record.plaintextSha256)
+    if (plaintext.byteLength !== record.size) {
+      throw new Error(`V4 content size mismatch: ${record.remotePath}; expected ${record.size}, got ${plaintext.byteLength}.`)
+    }
+    return plaintext
   }
 }

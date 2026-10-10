@@ -38,3 +38,11 @@ export function createV4ScopePredicate(settings: V4ScopeSettings): (path: string
   return settings.syncObsidianConfig;
   };
 }
+
+
+export function countV4ScopedPaths(paths: Iterable<string>, settings: V4ScopeSettings): number {
+  const include = createV4ScopePredicate(settings);
+  let count = 0;
+  for (const path of paths) if (include(path)) count++;
+  return count;
+}

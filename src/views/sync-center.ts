@@ -20,7 +20,9 @@ interface V4ViewRenderGeneration {
 
 export class V4SyncCenterView extends ItemView {
   private service?: V4HistoryService
+  private serviceGeneration?: number
   private page = 1
+  private mode: "commits" | "file" = "commits"
   private selected?: V4HistoryCommit
   private objectUrl?: string
   private progressCard?: HTMLElement
@@ -59,6 +61,8 @@ export class V4SyncCenterView extends ItemView {
     this.unsubscribeProgress = undefined
     this.clearProgressElements()
     this.releaseObjectUrl()
+    this.service = undefined
+    this.serviceGeneration = undefined
   }
 
   private beginRender(): V4ViewRenderGeneration | undefined {
@@ -73,7 +77,15 @@ export class V4SyncCenterView extends ItemView {
   }
 
   private async ensureService(): Promise<V4HistoryService> {
-    this.service ??= await this.plugin.v4Runtime.createHistoryService()
+    const generation = this.plugin.v4Runtime.settingsGeneration
+    if (!this.service || this.serviceGeneration !== generation) {
+      const service = await this.plugin.v4Runtime.createHistoryService()
+      if (this.plugin.v4Runtime.settingsGeneration !== generation) {
+        throw new Error("V4 history settings generation changed.")
+      }
+      this.service = service
+      this.serviceGeneration = generation
+    }
     return this.service
   }
 
@@ -84,8 +96,12 @@ export class V4SyncCenterView extends ItemView {
     const header = this.contentEl.createDiv({ cls: "github-sync-center__header" })
     header.createEl("h3", { text: title })
     const actions = header.createDiv({ cls: "github-sync-center__actions" })
-    actions.createEl("button", { text: "Commits" }).onclick = () => void this.renderCommitMode()
-    actions.createEl("button", { text: "Current file" }).onclick = () => void this.renderFileMode()
+    const commitsButton = actions.createEl("button", { text: "Commits" })
+    commitsButton.setAttribute("aria-pressed", String(this.mode === "commits"))
+    commitsButton.onclick = () => void this.renderCommitMode()
+    const fileButton = actions.createEl("button", { text: "Current file" })
+    fileButton.setAttribute("aria-pressed", String(this.mode === "file"))
+    fileButton.onclick = () => void this.renderFileMode()
     actions.createEl("button", { text: "Sync now", cls: "mod-cta" }).onclick = () => void this.plugin.v4Runtime.manualSync()
     this.clearProgressElements()
     this.progressCard = this.contentEl.createDiv({ cls: "github-sync-center__progress" })
@@ -260,6 +276,7 @@ export class V4SyncCenterView extends ItemView {
   private async renderCommitMode(): Promise<void> {
     const generation = this.beginRender()
     if (!generation) return
+    this.mode = "commits"
     const { body, detail } = this.shell("Commit history")
     body.createEl("p", { text: "Loading commits…", cls: "github-sync-center__muted" })
     try {
@@ -268,6 +285,7 @@ export class V4SyncCenterView extends ItemView {
       const page = await service.listCommits(this.page)
       if (!this.isCurrent(generation)) return
       body.empty()
+      if (this.selected && !page.items.some(item => item.sha === this.selected?.sha)) this.selected = undefined
       const pager = body.createDiv({ cls: "github-sync-center__pager" })
       const previous = pager.createEl("button", { text: "Previous" })
       previous.disabled = this.page <= 1
@@ -306,6 +324,10 @@ export class V4SyncCenterView extends ItemView {
       if (!this.isCurrent(generation)) return
       detail.empty()
       detail.createEl("h4", { text: `${changes.length} changed file${changes.length === 1 ? "" : "s"}` })
+      if (changes.length === 0) {
+        detail.createEl("p", { text: "No file changes to preview in this commit.", cls: "github-sync-center__muted" })
+        return
+      }
       const list = detail.createDiv({ cls: "github-sync-center__changes" })
       const preview = detail.createDiv({ cls: "github-sync-center__preview" })
       for (const change of changes) {
@@ -320,6 +342,7 @@ export class V4SyncCenterView extends ItemView {
   private async renderFileMode(): Promise<void> {
     const generation = this.beginRender()
     if (!generation) return
+    this.mode = "file"
     const active = this.app.workspace.getActiveFile()
     const { body, detail } = this.shell(active ? `Versions of ${active.path}` : "File versions")
     if (!active) { body.createEl("p", { text: "Open a file to view its versions." }); return }
@@ -378,7 +401,11 @@ export class V4SyncCenterView extends ItemView {
   private releaseObjectUrl(): void { if (this.objectUrl) URL.revokeObjectURL(this.objectUrl); this.objectUrl = undefined }
   private renderError(container: HTMLElement, error: unknown): void {
     container.empty()
-    const message = (error as Error).message
+    const message = error instanceof Error && error.message.trim()
+      ? error.message
+      : typeof error === "string" && error.trim()
+        ? error
+        : "Unable to load history. An unexpected error occurred."
     container.createEl("p", { text: message, cls: "github-sync-center__error" })
     new Notice(`GitHub Sync Center: ${message}`)
   }

@@ -13,6 +13,7 @@ export interface V4PullBinding {
   change: V4PlannedChange
   remoteRecord?: V4IndexFileRecord
   remoteCommitSha?: string
+  packRecords?: readonly V4IndexFileRecord[]
   stage?: V4StageRef
 }
 

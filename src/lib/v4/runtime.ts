@@ -2,7 +2,8 @@ import { Modal, Notice, Platform, TFile } from "obsidian"
 import type FastSync from "../../main"
 import { fromBase64Url, randomBytes, sha256Hex, toBase64Url, utf8ToBytes } from "../bytes"
 import { syncConsoleLog } from "../debug"
-import { readVaultFileBytes, writeVaultFileBytes, trashVaultFileIfExists } from "../vault"
+import { assertPluginSettingsRuntimeSafe } from "../plugin-settings-validation"
+import { readVaultFileBytes, removeEmptyVaultFolderIfExists, writeVaultFileBytes, trashVaultFileIfExists } from "../vault"
 import { deriveV4BootstrapRecoveryKey, deriveV4Keyring, type V4Keyring } from "./crypto"
 import {
   createEmptyV4LocalIndex,
@@ -16,7 +17,7 @@ import { createV4ScopePredicate, isPathInV4SyncScope } from "./scope"
 import { assertV4PathLayoutCompatible, V4ChangeGuardError, V4RecoveryReplanRequiredError, V4SyncSession, type V4SyncRunState } from "./sync-session"
 import type { V4ConflictResolution } from "./conflicts"
 import { V4SyncCoordinator, type V4QueuedChange, type V4SyncRequest } from "./sync-coordinator"
-import { expectedV4PathLayout, V4_FORMAT_VERSION, V4_CONFIG_PATH, type V4RemoteConfig, type V4StorageMode } from "./protocol-types"
+import { expectedV4PathLayout, V4_FORMAT_VERSION, V4_CONFIG_PATH, V4_PBKDF2_ITERATIONS, type V4RemoteConfig, type V4StorageMode } from "./protocol-types"
 import { V4HistoryService } from "./history-service"
 import type { V4SessionVault } from "./local-io"
 import { createV4ContentSource, createV4WholeBufferContentSource, DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES, type V4ContentSource } from "./content-source"
@@ -50,7 +51,7 @@ export function selectV4RuntimeConfig(discovered: V4RemoteConfig | null, mode: V
     pathLayout: expectedV4PathLayout(mode),
     algorithm: "AES-GCM",
     kdf: "PBKDF2-SHA-256",
-    kdfParams: { iterations: 600_000, salt: toBase64Url(randomBytes(16)) },
+    kdfParams: { iterations: V4_PBKDF2_ITERATIONS, salt: toBase64Url(randomBytes(16)) },
   }
 }
 
@@ -68,7 +69,7 @@ function createMemoryAdapter(owner: object): V4LocalIndexAdapter {
 function createRuntimePlatformIo(plugin: FastSync): { io: V4PlatformIo; stageRoot: string } {
   const vault = plugin.app.vault as FastSync["app"]["vault"] & {
     configDir?: string
-    adapter?: V4BinaryAdapterLike & { getFullPath?(path: string): string }
+    adapter?: V4BinaryAdapterLike & { getFullPath?(path: string): string; getBasePath?(): string }
   }
   const adapter = vault.adapter
   const configDir = vault.configDir || ".obsidian"
@@ -77,11 +78,15 @@ function createRuntimePlatformIo(plugin: FastSync): { io: V4PlatformIo; stageRoo
   const resolveDesktopPath = desktop && typeof adapter?.getFullPath === "function"
     ? (path: string) => adapter.getFullPath!(path)
     : undefined
+  const desktopRootPath = desktop && typeof adapter?.getBasePath === "function"
+    ? adapter.getBasePath()
+    : undefined
   return {
     io: createV4PlatformIo({
       platform: desktop ? "desktop" : "mobile",
       adapter,
       resolveDesktopPath,
+      desktopRootPath,
     }),
     stageRoot,
   }
@@ -133,6 +138,8 @@ export class V4PluginRuntime {
   private readonly keyringCache = new V4KeyringCache()
   private credentialGeneration = 0
   private debounceRunActive = false
+  private settingsTransitionActive = false
+  private settingsTransitionSawLocalChange = false
   private disposed = false
 
   constructor(private readonly plugin: FastSync) {
@@ -154,6 +161,44 @@ export class V4PluginRuntime {
     this.coordinator.dispose()
     this.progressStore.dispose()
     void this.coordinator.whenIdle().finally(() => this.keyringCache.dispose())
+  }
+
+  async quiesceForSettingsChange(): Promise<void> {
+    this.assertNotDisposed()
+    if (this.settingsTransitionActive) throw new Error("V4 settings change is already in progress.")
+    this.settingsTransitionActive = true
+    this.settingsTransitionSawLocalChange = false
+    try {
+      this.coordinator.cancelPending()
+      this.coordinator.cancelActive(new V4CancelledError("V4 settings changed."))
+      await this.coordinator.whenIdle()
+      this.coordinator.cancelPending()
+      this.debounceRunActive = false
+      if (this.progressStore.snapshot.lifecycle === "active" || this.progressStore.snapshot.lifecycle === "waiting") {
+        this.progressStore.update({
+          lifecycle: "idle",
+          phase: undefined,
+          currentPath: undefined,
+          currentDirection: undefined,
+          pull: { completed: 0, total: undefined },
+          push: { completed: 0, total: undefined },
+          errorMessage: undefined,
+          failurePhase: undefined,
+          failurePath: undefined,
+        })
+      }
+    } catch (error) {
+      this.finishSettingsChange()
+      throw error
+    }
+  }
+
+  finishSettingsChange(): void {
+    if (!this.settingsTransitionActive) return
+    const rescan = this.settingsTransitionSawLocalChange
+    this.settingsTransitionSawLocalChange = false
+    this.settingsTransitionActive = false
+    if (rescan && !this.disposed) this.enqueue({ type: "rescan", mtime: Date.now() })
   }
 
   credentialsChanged(): void {
@@ -188,6 +233,7 @@ export class V4PluginRuntime {
 
   get isSyncing(): boolean { return this.coordinator.isSyncing }
   get pendingCount(): number { return this.coordinator.pendingCount }
+  get settingsGeneration(): number { return this.credentialGeneration }
   get progressSnapshot(): V4SyncProgressSnapshot {
     return this.snapshotForConsumers(this.progressStore.snapshot)
   }
@@ -196,31 +242,57 @@ export class V4PluginRuntime {
     return this.progressStore.subscribe(snapshot => listener(this.snapshotForConsumers(snapshot)))
   }
 
-  manualSync(): Promise<unknown> { return this.coordinator.run({ operation: "normal", trigger: "manual" }) }
-  startupSync(): Promise<unknown> { return this.coordinator.run({ operation: "normal", trigger: "startup" }) }
-  scheduledSync(): Promise<unknown> { return this.coordinator.run({ operation: "normal", trigger: "scheduled" }) }
-  forcePush(allowThresholdOverride = false): Promise<unknown> { return this.coordinator.run({ operation: "forcePush", trigger: "forcePush", allowThresholdOverride }) }
-  forcePull(allowThresholdOverride = false): Promise<unknown> { return this.coordinator.run({ operation: "forcePull", trigger: "forcePull", allowThresholdOverride }) }
+  private runWhileSettingsStable(request: V4SyncRequest): Promise<unknown> {
+    if (this.disposed || this.settingsTransitionActive) return Promise.resolve({ status: "skipped", changedFiles: 0 })
+    return this.coordinator.run(request)
+  }
+
+  private assertSettingsTransitionInactive(): void {
+    this.assertNotDisposed()
+    if (this.settingsTransitionActive) throw new V4CancelledError("V4 settings change is in progress.")
+  }
+
+  manualSync(): Promise<unknown> { return this.runWhileSettingsStable({ operation: "normal", trigger: "manual" }) }
+  startupSync(): Promise<unknown> { return this.runWhileSettingsStable({ operation: "normal", trigger: "startup" }) }
+  scheduledSync(): Promise<unknown> { return this.runWhileSettingsStable({ operation: "normal", trigger: "scheduled" }) }
+  forcePush(allowThresholdOverride = false): Promise<unknown> { return this.runWhileSettingsStable({ operation: "forcePush", trigger: "forcePush", allowThresholdOverride }) }
+  forcePull(allowThresholdOverride = false): Promise<unknown> { return this.runWhileSettingsStable({ operation: "forcePull", trigger: "forcePull", allowThresholdOverride }) }
 
   async createHistoryService(): Promise<V4HistoryService> {
-    this.assertNotDisposed()
-    const loaded = await this.loadConfiguredRemoteConfig()
+    this.assertSettingsTransitionInactive()
+    const generation = this.credentialGeneration
+    const github = this.plugin.githubClient
+    const repoId = this.repoId()
+    const passphrase = this.plugin.settings.encryptionPassphrase
+    const loaded = await this.loadConfiguredRemoteConfig({ github, repoId })
+    this.assertSettingsGeneration(generation)
     if (!loaded) throw new Error("V4 history is not initialized. Force Push first.")
     const { remoteConfig, config } = loaded
     assertV4PathLayoutCompatible(remoteConfig, config, "normal")
     const keyring = config.mode === "encrypted"
-      ? await this.keyringForConfig(config, this.plugin.settings.encryptionPassphrase)
+      ? await this.keyringForConfig(config, passphrase)
       : undefined
-    return new V4HistoryService({ github: this.plugin.githubClient, config, keyring })
+    this.assertSettingsGeneration(generation)
+    return new V4HistoryService({
+      github,
+      config,
+      keyring,
+      assertCurrent: () => this.assertSettingsGeneration(generation),
+    })
   }
 
   async fileIdForPath(path: string): Promise<string | null> {
-    this.assertNotDisposed()
-    const loaded = await this.loadConfiguredRemoteConfig()
+    this.assertSettingsTransitionInactive()
+    const generation = this.credentialGeneration
+    const github = this.plugin.githubClient
+    const repoId = this.repoId()
+    const loaded = await this.loadConfiguredRemoteConfig({ github, repoId })
+    this.assertSettingsGeneration(generation)
     if (!loaded) throw new Error("V4 history is not initialized. Force Push first.")
     assertV4PathLayoutCompatible(loaded.remoteConfig, loaded.config, "normal")
     const config = loaded.config
     const index = await this.loadIndex(config)
+    this.assertSettingsGeneration(generation)
     for (const shard of Object.values(index.shards)) {
       for (const record of Object.values(shard.records)) if (!record.deleted && record.path === path) return record.fileId
     }
@@ -238,6 +310,10 @@ export class V4PluginRuntime {
     if (this.disposed) return
     if (!this.plugin.settings.syncEnabled || !this.plugin.settings.syncOnLocalChange || !this.plugin.isWatchEnabled) return
     if (change.type === "rescan") {
+      if (this.settingsTransitionActive) {
+        this.settingsTransitionSawLocalChange = true
+        return
+      }
       this.coordinator.enqueue(change)
       this.markWaiting()
       return
@@ -248,6 +324,10 @@ export class V4PluginRuntime {
       if (!this.inScope(change.path) && (!oldPath || !this.inScope(oldPath))) return
     } catch (error) {
       new Notice(`GitHub Sync: Invalid ignore regex: ${(error as Error).message}`)
+      return
+    }
+    if (this.settingsTransitionActive) {
+      this.settingsTransitionSawLocalChange = true
       return
     }
     this.coordinator.enqueue(change)
@@ -263,8 +343,17 @@ export class V4PluginRuntime {
     if (this.disposed) throw new Error("V4 runtime is disposed.")
   }
 
+  private assertSettingsGeneration(generation: number): void {
+    this.assertNotDisposed()
+    if (generation !== this.credentialGeneration) throw new V4CancelledError("V4 settings generation changed.")
+  }
+
   private beginWaitingRun(): void {
-    const push = { completed: 0, total: this.coordinator.pendingCount }
+    // Coalescing a growing debounce queue after every file event is quadratic.
+    // Once the burst exceeds this UI-only threshold, keep the exact queue
+    // untouched for the eventual flush and display an unknown progress total.
+    const total = this.coordinator.pendingRawCount <= 128 ? this.coordinator.pendingCount : undefined
+    const push = { completed: 0, total }
     if (!this.debounceRunActive) {
       this.debounceRunActive = true
       this.progressStore.beginRun({
@@ -312,13 +401,15 @@ export class V4PluginRuntime {
     return `${this.plugin.settings.githubOwner}/${this.plugin.settings.githubRepo}#${this.plugin.settings.githubBranch || "main"}`
   }
 
-  private async loadConfiguredRemoteConfig(): Promise<{ remoteConfig: V4RemoteConfig; config: V4RemoteConfig } | null> {
-    if (!this.plugin.githubClient) throw new Error("GitHub connection is not configured.")
-    const ref = await this.plugin.githubClient.getGitRefOrNull()
-    const remote = ref ? await this.plugin.githubClient.getFileBytes(V4_CONFIG_PATH, ref.sha) : null
+  private async loadConfiguredRemoteConfig(
+    target: { github: FastSync["githubClient"]; repoId: string } = { github: this.plugin.githubClient, repoId: this.repoId() },
+  ): Promise<{ remoteConfig: V4RemoteConfig; config: V4RemoteConfig } | null> {
+    if (!target.github) throw new Error("GitHub connection is not configured.")
+    const ref = await target.github.getGitRefOrNull()
+    const remote = ref ? await target.github.getFileBytes(V4_CONFIG_PATH, ref.sha) : null
     if (!remote) return null
     const remoteConfig = decodeV4RemoteConfig(remote.bytes)
-    const config = selectV4RuntimeConfig(remoteConfig, remoteConfig.mode, this.repoId())
+    const config = selectV4RuntimeConfig(remoteConfig, remoteConfig.mode, target.repoId)
     if (remoteConfig.repoId !== config.repoId) throw new Error("V4 remote repository identity mismatch.")
     return { remoteConfig, config }
   }
@@ -349,16 +440,19 @@ export class V4PluginRuntime {
         return file instanceof TFile && inScope(path) ? { path, size: file.stat.size, mtime: file.stat.mtime } : null
       },
       read: async (path: string) => {
+        await this.platformIo.assertVaultPathSafe(path, { mustExist: true })
         const file = this.plugin.app.vault.getAbstractFileByPath(path)
         if (!(file instanceof TFile)) throw new Error(`Missing local file: ${path}`)
         return readVaultFileBytes(this.plugin.app.vault, file)
       },
       write: async (path: string, bytes: Uint8Array) => {
+        await this.platformIo.assertVaultPathSafe(path)
         this.plugin.addIgnoredFile(path)
         try { await writeVaultFileBytes(this.plugin.app.vault, path, bytes) }
         finally { this.plugin.removeIgnoredFile(path) }
       },
       trash: async (path: string) => {
+        await this.platformIo.assertVaultPathSafe(path)
         this.plugin.addIgnoredFile(path)
         try { await trashVaultFileIfExists(this.plugin.app.vault, this.plugin.app.fileManager, path) }
         finally { this.plugin.removeIgnoredFile(path) }
@@ -366,6 +460,7 @@ export class V4PluginRuntime {
       openContentSource: (handle, signal) => createV4ContentSource(handle, {
         wholeBufferCeilingBytes: DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES,
         readVaultWhole: async path => {
+          await this.platformIo.assertVaultPathSafe(path, { mustExist: true })
           const file = this.plugin.app.vault.getAbstractFileByPath(path)
           if (!(file instanceof TFile)) throw new Error(`Missing local file: ${path}`)
           return readVaultFileBytes(this.plugin.app.vault, file)
@@ -379,7 +474,20 @@ export class V4PluginRuntime {
       commitStage: async ({ stage, path, precondition }) => {
         this.plugin.addIgnoredFile(path)
         try {
+          if (!precondition.exists) await removeEmptyVaultFolderIfExists(this.plugin.app.vault, path)
           await this.platformIo.commitStage(this.stagingStore.pathFor(stage.stageId), path, {
+            expectedTarget: precondition,
+            expectedStageSize: stage.size,
+            expectedStageSha256: stage.hash,
+          })
+        } finally {
+          this.plugin.removeIgnoredFile(path)
+        }
+      },
+      rollbackStage: async ({ stage, path, precondition }) => {
+        this.plugin.addIgnoredFile(path)
+        try {
+          await this.platformIo.rollbackStage(this.stagingStore.pathFor(stage.stageId), path, {
             expectedTarget: precondition,
             expectedStageSize: stage.size,
             expectedStageSha256: stage.hash,
@@ -393,6 +501,7 @@ export class V4PluginRuntime {
 
   private async execute(request: V4SyncRequest, changes: V4QueuedChange[], signal: AbortSignal): Promise<{ changedFiles: number }> {
     throwIfV4Aborted(signal)
+    assertPluginSettingsRuntimeSafe(this.plugin.settings)
     const continuingDebounceRun = this.debounceRunActive
     this.debounceRunActive = false
     const runPatch = {
@@ -542,7 +651,7 @@ export class V4PluginRuntime {
             keyring,
             conflictPolicy: this.plugin.settings.conflictPolicy,
             abortChangePercent: this.plugin.settings.abortChangePercent,
-            askConflict: input => this.askConflict(input.path),
+            askConflict: input => this.askConflict(input.path, signal),
             includePath,
             runState,
             recoveryStore,
@@ -581,7 +690,8 @@ export class V4PluginRuntime {
           lastError = error
           if (error instanceof V4ChangeGuardError && !request.allowThresholdOverride && request.operation !== "normal") {
             this.progressStore.update({ phase: "blocked", currentPath: undefined, currentDirection: undefined })
-            const confirmed = await this.confirmThresholdOverride(error, request.operation)
+            const confirmed = await this.confirmThresholdOverride(error, request.operation, signal)
+            throwIfV4Aborted(signal)
             if (!confirmed) throw new Error("Sync cancelled because the modification threshold was exceeded.")
             request.allowThresholdOverride = true
             casAttempt--
@@ -648,17 +758,21 @@ export class V4PluginRuntime {
     }
   }
 
-  private async askConflict(path: string): Promise<V4ConflictResolution> {
+  private async askConflict(path: string, signal: AbortSignal): Promise<V4ConflictResolution> {
     return new Promise(resolve => {
       const modal = new Modal(this.plugin.app)
       let settled = false
-      const finish = (resolution: V4ConflictResolution) => {
+      let onAbort: (() => void) | undefined
+      const settle = (resolution: V4ConflictResolution, close: boolean) => {
         if (settled) return
         settled = true
-        modal.close()
+        if (onAbort) signal.removeEventListener("abort", onAbort)
+        if (close) modal.close()
         resolve(resolution)
       }
-      modal.onClose = () => { if (!settled) { settled = true; resolve({ action: "ask" }) } }
+      const finish = (resolution: V4ConflictResolution) => settle(resolution, true)
+      onAbort = () => finish({ action: "ask" })
+      modal.onClose = () => settle({ action: "ask" }, false)
       modal.titleEl.setText("Resolve sync conflict")
       modal.contentEl.createEl("p", { text: `Both local and remote changed: ${path}` })
       const buttons = modal.contentEl.createDiv()
@@ -666,21 +780,34 @@ export class V4PluginRuntime {
       buttons.createEl("button", { text: "Use local" }).onclick = () => finish({ action: "use-local" })
       buttons.createEl("button", { text: "Use remote" }).onclick = () => finish({ action: "use-remote" })
       buttons.createEl("button", { text: "Cancel" }).onclick = () => finish({ action: "ask" })
+      if (signal.aborted) {
+        finish({ action: "ask" })
+        return
+      }
+      signal.addEventListener("abort", onAbort, { once: true })
       modal.open()
     })
   }
 
-  private async confirmThresholdOverride(error: V4ChangeGuardError, operation: "forcePush" | "forcePull"): Promise<boolean> {
+  private async confirmThresholdOverride(
+    error: V4ChangeGuardError,
+    operation: "forcePush" | "forcePull",
+    signal: AbortSignal,
+  ): Promise<boolean> {
     return new Promise(resolve => {
       const modal = new Modal(this.plugin.app)
       let settled = false
-      const finish = (value: boolean) => {
+      let onAbort: (() => void) | undefined
+      const settle = (value: boolean, close: boolean) => {
         if (settled) return
         settled = true
-        modal.close()
+        if (onAbort) signal.removeEventListener("abort", onAbort)
+        if (close) modal.close()
         resolve(value)
       }
-      modal.onClose = () => { if (!settled) { settled = true; resolve(false) } }
+      const finish = (value: boolean) => settle(value, true)
+      onAbort = () => finish(false)
+      modal.onClose = () => settle(false, false)
       modal.titleEl.setText("Modification threshold exceeded")
       modal.contentEl.createEl("p", { text: `${error.changePercent}% of logical files would change; the limit is ${error.thresholdPercent}%.` })
       modal.contentEl.createEl("p", { text: "Override the guard for this force operation only?" })
@@ -689,6 +816,11 @@ export class V4PluginRuntime {
       const confirm = buttons.createEl("button", { text: operation === "forcePush" ? "Override and force push" : "Override and force pull" })
       confirm.addClass("mod-warning")
       confirm.onclick = () => finish(true)
+      if (signal.aborted) {
+        finish(false)
+        return
+      }
+      signal.addEventListener("abort", onAbort, { once: true })
       modal.open()
     })
   }

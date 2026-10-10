@@ -1,13 +1,16 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test from "node:test";
 import { readFile } from "node:fs/promises";
-import { modalButtons, Notice, resetModalTestState, TFile } from "obsidian";
+import { modalButtons, Notice, Platform, resetModalTestState, TFile } from "obsidian";
 
 import { DEFAULT_SETTINGS } from "../../src/setting";
+import { assertPluginSettingsRuntimeSafe } from "../../src/lib/plugin-settings-validation";
 import type { GitHubCreateTreeEntry } from "../../src/lib/github-git-types";
 import { deriveV4Keyring } from "../../src/lib/v4/crypto";
 import { publishV4TreeChanges } from "../../src/lib/v4/git-tree-writer";
 import { migrateV4Secrets, sanitizeV4SettingsForPersistence } from "../../src/lib/v4/secrets";
+import * as v4SecretsModule from "../../src/lib/v4/secrets";
 import { selectV4RuntimeConfig, V4PluginRuntime } from "../../src/lib/v4/runtime";
 import { buildV4RemoteMetadata } from "../../src/lib/v4/remote-index";
 import { V4StorageCodec } from "../../src/lib/v4/storage-codec";
@@ -15,6 +18,10 @@ import { V4_CONFIG_PATH, V4_FORMAT_VERSION, V4_HEAD_PATH, V4_ROOT, type V4PathLa
 import { loadV4LocalIndex, type V4IndexFileRecord, type V4LocalIndex, type V4LocalIndexAdapter } from "../../src/lib/v4/local-index";
 import type { V4SyncProgressSnapshot } from "../../src/lib/v4/progress";
 import { waitForCondition } from "../helpers/wait-for";
+
+function testShardHash(records: unknown[]): string {
+  return createHash("sha256").update(JSON.stringify(records)).digest("hex");
+}
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -60,6 +67,110 @@ test("v4 secret migration stores legacy values and returns runtime-only secrets"
   assert.equal("encryptionPassphrase" in persisted, false);
   assert.equal(persisted.githubTokenSecretId, migrated.settings.githubTokenSecretId);
 });
+
+test("v4 secret migration rolls back partial SecretStorage writes when a later write fails", () => {
+  const runCase = (existingIds: boolean) => {
+    const tokenId = existingIds ? "existing-token" : "github-token-1";
+    const passId = existingIds ? "existing-pass" : "encryption-passphrase-2";
+    const stored = new Map<string, string>();
+    if (existingIds) {
+      stored.set(tokenId, "old-token");
+      stored.set(passId, "old-pass");
+    }
+    let writes = 0;
+    const storage = {
+      getSecret(id: string) { return stored.get(id) ?? null; },
+      setSecret(id: string, value: string) {
+        stored.set(id, value);
+        writes++;
+        if (writes === 2) throw new Error("simulated secret write failure");
+      },
+    };
+    let next = 0;
+
+    assert.throws(
+      () => migrateV4Secrets({
+        githubToken: "new-token",
+        encryptionPassphrase: "new-pass",
+        githubTokenSecretId: existingIds ? tokenId : "",
+        encryptionPassphraseSecretId: existingIds ? passId : "",
+      }, storage, prefix => `${prefix}-${++next}`),
+      /simulated secret write failure/u,
+    );
+
+    assert.equal(stored.get(tokenId) ?? "", existingIds ? "old-token" : "");
+    assert.equal(stored.get(passId) ?? "", existingIds ? "old-pass" : "");
+  };
+
+  runCase(true);
+  runCase(false);
+});
+
+
+test("v4 rejects aliased token and passphrase secret IDs before any secret write", () => {
+  const sharedId = "shared-credential";
+  assert.throws(
+    () => assertPluginSettingsRuntimeSafe({
+      ...DEFAULT_SETTINGS,
+      githubTokenSecretId: sharedId,
+      encryptionPassphraseSecretId: sharedId,
+    }),
+    /secret.*id.*distinct|distinct.*secret|credential.*alias/iu,
+  );
+
+  const stored = new Map<string, string>([[sharedId, "old-value"]]);
+  let writes = 0;
+  assert.throws(
+    () => migrateV4Secrets({
+      githubToken: "new-token",
+      encryptionPassphrase: "new-pass",
+      githubTokenSecretId: sharedId,
+      encryptionPassphraseSecretId: sharedId,
+    }, {
+      getSecret(id: string) { return stored.get(id) ?? null; },
+      setSecret(id: string, value: string) {
+        writes++;
+        stored.set(id, value);
+      },
+    }, prefix => `${prefix}-new`),
+    /secret.*id.*distinct|distinct.*secret|credential.*alias/iu,
+  );
+
+  assert.equal(writes, 0, "aliased secret IDs must fail before SecretStorage mutation");
+  assert.equal(stored.get(sharedId), "old-value");
+});
+
+
+test("v4 credential scrub attempts every pending secret before reporting cleanup failure", async () => {
+  const scrub = (v4SecretsModule as Record<string, unknown>).scrubV4SecretIds;
+  assert.equal(typeof scrub, "function", "credential cleanup must be centralized in a testable helper");
+
+  const stored = new Map<string, string>([
+    ["first", "secret-a"],
+    ["second", "secret-b"],
+  ]);
+  const attempts: string[] = [];
+
+  assert.throws(
+    () => (scrub as (storage: unknown, ids: string[]) => void)({
+      getSecret(id: string) { return stored.get(id) ?? null; },
+      setSecret(id: string, value: string) {
+        attempts.push(id);
+        if (id === "first") throw new Error("simulated first scrub failure");
+        stored.set(id, value);
+      },
+    }, ["first", "second"]),
+    /scrub|cleanup|credential/iu,
+  );
+
+  assert.deepEqual(attempts, ["first", "second"], "cleanup must continue after one secret scrub fails");
+  assert.equal(stored.get("second"), "", "later pending credentials must still be scrubbed");
+
+  const mainSource = await readFile("src/main.ts", "utf8");
+  assert.match(mainSource, /scrubV4SecretIds\(this\.app\.secretStorage,\s*this\.pendingMigratedSecretIds\)/u);
+  assert.match(mainSource, /scrubV4SecretIds\(this\.app\.secretStorage,\s*pendingSecretIds\)/u);
+});
+
 
 test("v4 runtime selects explicit layouts and preserves encrypted KDF parameters for migration", () => {
   const legacy: V4RemoteConfig = {
@@ -108,7 +219,34 @@ class RuntimeMemoryGitHub {
   }
   async ensureGitRepositoryInitialized() { return null; }
   async getGitCommit(sha: string) { const value = this.commits.get(sha)!; return { sha, treeSha: value.treeSha, parentShas: value.parents, message: value.message }; }
-  async getTreeAt(treeSha: string) { const tree = this.trees.get(treeSha) ?? new Map(); return { sha: treeSha, url: "", truncated: false, tree: [...tree.entries()].map(([path, bytes], index) => ({ path, mode: "100644", type: "blob" as const, sha: `tree-blob-${index}`, size: bytes.byteLength, url: "" })) }; }
+  async getTreeAt(treeSha: string, recursive = true) {
+    const tree = this.trees.get(treeSha) ?? new Map<string, Uint8Array>();
+    if (!recursive) {
+      const rootBlobs: Array<[string, Uint8Array]> = [];
+      const directories = new Map<string, string[]>();
+      for (const [path, bytes] of tree) {
+        const slash = path.indexOf("/");
+        if (slash < 0) {
+          rootBlobs.push([path, bytes]);
+          continue;
+        }
+        const directory = path.slice(0, slash);
+        const signatures = directories.get(directory) ?? [];
+        signatures.push(`${path.slice(slash + 1)}:${bytes.byteLength}:${Array.from(bytes).join(",")}`);
+        directories.set(directory, signatures);
+      }
+      return {
+        sha: treeSha,
+        url: "",
+        truncated: false,
+        tree: [
+          ...rootBlobs.map(([path, bytes], index) => ({ path, mode: "100644", type: "blob" as const, sha: `tree-blob-${index}`, size: bytes.byteLength, url: "" })),
+          ...[...directories].map(([path, signatures]) => ({ path, mode: "040000", type: "tree" as const, sha: `tree-dir:${path}:${signatures.sort().join("|")}`, url: "" })),
+        ],
+      };
+    }
+    return { sha: treeSha, url: "", truncated: false, tree: [...tree.entries()].map(([path, bytes], index) => ({ path, mode: "100644", type: "blob" as const, sha: `tree-blob-${index}`, size: bytes.byteLength, url: "" })) };
+  }
   async createGitBlob(bytes: Uint8Array) { const attempt = ++this.blobAttempts; if (this.createBlobOverride) return this.createBlobOverride(bytes, attempt); if (this.blobFailuresRemaining-- > 0) throw new Error("simulated upload failure"); const sha = `blob-${this.blobs.size + 1}`; this.blobs.set(sha, new Uint8Array(bytes)); return sha; }
   async createGitTree(entries: GitHubCreateTreeEntry[], baseTree?: string) { const tree = new Map(baseTree ? this.trees.get(baseTree) : undefined); for (const entry of entries) entry.sha === null ? tree.delete(entry.path) : tree.set(entry.path, new Uint8Array(this.blobs.get(entry.sha)!)); const sha = `tree-${this.trees.size + 1}`; this.trees.set(sha, tree); return sha; }
   async createGitCommit(message: string, treeSha: string, parents: string[]) { const sha = `commit-${this.commits.size + 1}`; this.commits.set(sha, { treeSha, parents, message }); return sha; }
@@ -147,6 +285,7 @@ class RuntimeMemoryGitHub {
 }
 
 function plaintextRuntimeFixture(pathInput: string | string[] = "secret.md", github = new RuntimeMemoryGitHub(), deviceId = "device") {
+  Platform.isDesktopApp = false;
   const paths = Array.isArray(pathInput) ? pathInput : [pathInput];
   const contents = new Map(paths.map(path => [path, new TextEncoder().encode("body")]));
   const vaultFiles = paths.map(path => {
@@ -664,6 +803,32 @@ test("v4 runtime reveals a pending debounce after the active sync completes", as
   fixture.runtime.dispose();
 });
 
+test("burst progress does not re-coalesce an unbounded pending queue on every vault event", () => {
+  const fixture = plaintextRuntimeFixture();
+  const coordinator = (fixture.runtime as unknown as { coordinator: object }).coordinator;
+  const original = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(coordinator), "pendingCount");
+  assert.ok(original?.get);
+  let pendingCountReads = 0;
+  Object.defineProperty(coordinator, "pendingCount", {
+    get() {
+      pendingCountReads++;
+      if (pendingCountReads > 128) throw new Error("Repeated full-queue progress coalescing exceeded the budget.");
+      return original.get!.call(coordinator);
+    },
+  });
+
+  try {
+    for (let index = 0; index < 300; index++) fixture.runtime.enqueueModify(`burst-${index}.md`, index + 1);
+    assert.equal(pendingCountReads, 128, "exact counts are useful only during a small debounce burst");
+    assert.equal(fixture.runtime.progressSnapshot.lifecycle, "waiting");
+    const workingProgress = (fixture.runtime as unknown as { progressStore: { state: V4SyncProgressSnapshot } }).progressStore.state;
+    assert.equal(workingProgress.push.total, undefined, "large bursts should report unknown total rather than repeatedly re-count once throttling publishes");
+    assert.equal(original.get.call(coordinator), 300, "sync's true coalesced queue count remains exact");
+  } finally {
+    fixture.runtime.dispose();
+  }
+});
+
 test("v4 runtime starts one waiting ledger per debounce cycle and disposes subscriptions safely", () => {
   const fixture = plaintextRuntimeFixture();
   const seen: V4SyncProgressSnapshot[] = [];
@@ -824,7 +989,8 @@ test("v4 runtime progress stays out of plugin data, local index files, and the r
   const mainSource = await readFile("src/main.ts", "utf8");
   assert.doesNotMatch(mainSource, /\bsyncProgress\b/u);
   assert.match(mainSource, /v4Runtime\?\.progressSnapshot\s*\?\?\s*createIdleV4Progress/u);
-  assert.match(mainSource, /async persistData\(\)[\s\S]*?saveData\(\{[\s\S]*?settings:\s*sanitizeV4SettingsForPersistence\(this\.settings\)/u);
+  assert.match(mainSource, /private async persistSettingsData\([^)]*settings:\s*PluginSettings[\s\S]*?saveData\(\{[\s\S]*?settings:\s*sanitizeV4SettingsForPersistence\(settings\)/u);
+  assert.match(mainSource, /async persistData\(\)[\s\S]*?persistSettingsData\(this\.settings\)/u);
   assert.match(mainSource, /startupSyncTimeout:\s*number\s*\|\s*null/u);
   assert.match(mainSource, /if \(this\.startupSyncTimeout !== null\) window\.clearTimeout\(this\.startupSyncTimeout\)/u);
   assert.match(mainSource, /onunload\(\)[\s\S]*?clearTimeout\(this\.startupSyncTimeout\)/u);
@@ -840,7 +1006,7 @@ async function encryptedToPlaintextRuntimeFixture(savedPassphrase: string) {
   const prepared = await new V4StorageCodec({ mode: "encrypted", pathLayout: "opaque-stable-v1", keyring: keys }).prepare("note.md", new TextEncoder().encode("plaintext body"), "old-v", 1, "stable-file");
   const record = { path: "note.md", ...prepared.record };
   const bucket = record.pathId.slice(0, 2);
-  const head: V4RemoteHead = { formatVersion: 4, mode: "encrypted", epoch: 1, generation: 1, journalId: "old-v", shardHashes: { [bucket]: "old-hash" }, updatedAt: 1, deviceId: "old" };
+  const head: V4RemoteHead = { formatVersion: 4, mode: "encrypted", epoch: 1, generation: 1, journalId: "old-v", shardHashes: { [bucket]: testShardHash([record]) }, updatedAt: 1, deviceId: "old" };
   await publishV4TreeChanges(github, { message: "obsidian-sync-v4:old-v", files: [...prepared.files, ...await buildV4RemoteMetadata({ config: remoteConfig, head, records: [record], keyring: keys })] });
   const oldObjectPath = record.remotePath;
   const vaultFile = new TFile("note.md", new TextEncoder().encode("plaintext body"));
@@ -983,7 +1149,13 @@ test("v4 runtime recovers after a published commit whose second local shard save
 function runtimeFixture(input: { remoteConfig: V4RemoteConfig; localIndexRepoId: string; localIndexPathLayout?: V4PathLayout; cachedShard?: boolean }) {
   const files = new Map<string, string>();
   const indexPath = ".obsidian/plugins/test/github-sync-v4-index/index.json";
-  const shardHashes = input.cachedShard ? { aa: "legacy-hash" } : {};
+  const legacyPathId = "aa".padEnd(64, "0");
+  const legacyRecord = {
+    path: "Legacy/note.md", pathId: legacyPathId, fileId: "legacy-file", plaintextSha256: "legacy-sha", size: 1, mtime: 1,
+    remoteVersion: "legacy-v", remotePath: ".obsidian-github-sync-v4/data/Legacy/token.enc", storage: "single" as const,
+  };
+  const legacyHash = testShardHash([legacyRecord]);
+  const shardHashes = input.cachedShard ? { aa: legacyHash } : {};
   files.set(indexPath, JSON.stringify({
     formatVersion: V4_FORMAT_VERSION,
     repoId: input.localIndexRepoId,
@@ -995,10 +1167,11 @@ function runtimeFixture(input: { remoteConfig: V4RemoteConfig; localIndexRepoId:
     generation: 1,
     shardHashes,
   }));
-  const legacyPathId = "aa".padEnd(64, "0");
-  if (input.cachedShard) files.set(".obsidian/plugins/test/github-sync-v4-index/shards/aa.json", JSON.stringify({ bucket: "aa", hash: "legacy-hash", records: {
-    [legacyPathId]: { path: "Legacy/note.md", pathId: legacyPathId, fileId: "legacy-file", plaintextSha256: "legacy-sha", size: 1, mtime: 1, remoteVersion: "legacy-v", remotePath: ".obsidian-github-sync-v4/data/Legacy/token.enc", storage: "single" },
-  } }));
+  if (input.cachedShard) files.set(".obsidian/plugins/test/github-sync-v4-index/shards/aa.json", JSON.stringify({
+    bucket: "aa",
+    hash: legacyHash,
+    records: { [legacyPathId]: legacyRecord },
+  }));
   let vaultLists = 0;
   const plugin = {
     app: {
@@ -1147,5 +1320,430 @@ test("v4 runtime keyring cache reuses one derived keyring until credential gener
 
 test("main settings save invalidates the runtime credential generation before future sync work", async () => {
   const source = await readFile("src/main.ts", "utf8")
-  assert.match(source, /async saveSettings\(\)[\s\S]*?v4Runtime\?\.credentialsChanged\(\)/u)
+  assert.match(source, /async saveSettings\([^)]*\)[\s\S]*?v4Runtime\?\.credentialsChanged\(\)/u)
 })
+
+
+test("settings UI quiesces an active runtime before publishing a new settings generation", async () => {
+  const mainSource = await readFile("src/main.ts", "utf8");
+  const settingsSource = await readFile("src/setting.tsx", "utf8");
+
+  assert.match(mainSource, /async saveSettings\([^)]*nextSettings[\s\S]*?await this\.v4Runtime\?\.quiesceForSettingsChange\(\)[\s\S]*?await this\.persistSettingsData\(preparedSettings\)[\s\S]*?this\.settings\s*=\s*preparedSettings[\s\S]*?credentialsChanged\(\)[\s\S]*?initGitHubClient\(\)/u);
+  assert.match(settingsSource, /const nextSettings\s*=\s*JSON\.parse\(JSON\.stringify\(this\.tempSettings\)\)[\s\S]*?await this\.plugin\.saveSettings\(nextSettings\)/u);
+  assert.doesNotMatch(settingsSource, /this\.plugin\.settings\s*=\s*JSON\.parse\(JSON\.stringify\(this\.tempSettings\)\)[\s\S]*?await this\.plugin\.saveSettings\(\)/u);
+});
+
+
+test("settings save validates ignore regex before quiescing or publishing a new generation", async () => {
+  const mainSource = await readFile("src/main.ts", "utf8");
+  const settingsSource = await readFile("src/setting.tsx", "utf8");
+
+  assert.match(
+    mainSource,
+    /async saveSettings\([^)]*nextSettings[\s\S]*?compileV4IgnorePathRegex\(nextSettings\.ignorePathRegex\)[\s\S]*?await this\.v4Runtime\?\.quiesceForSettingsChange\(\)[\s\S]*?await this\.persistSettingsData\(preparedSettings\)[\s\S]*?this\.settings\s*=\s*preparedSettings/u,
+  );
+  assert.match(
+    settingsSource,
+    /try\s*\{[\s\S]*?await this\.plugin\.saveSettings\(nextSettings\)[\s\S]*?Settings saved[\s\S]*?\}\s*catch\s*\(error\)[\s\S]*?Settings not saved/iu,
+  );
+});
+
+
+test("runtime settings validation fails closed on malformed persisted safety controls", () => {
+  const unsafeCases = [
+    { ...DEFAULT_SETTINGS, abortChangePercent: "abc" as unknown as number },
+    { ...DEFAULT_SETTINGS, syncPlugins: "false" as unknown as boolean },
+    { ...DEFAULT_SETTINGS, encryptionMode: "mystery" as unknown as "plaintext" },
+    { ...DEFAULT_SETTINGS, conflictPolicy: "overwrite" as unknown as "copy" },
+    { ...DEFAULT_SETTINGS, ignorePathRegex: 42 as unknown as string },
+    { ...DEFAULT_SETTINGS, githubBranch: 7 as unknown as string },
+  ];
+
+  for (const settings of unsafeCases) {
+    assert.throws(() => assertPluginSettingsRuntimeSafe(settings), /settings|invalid|malformed|unsafe/iu);
+  }
+
+  assert.doesNotThrow(() => assertPluginSettingsRuntimeSafe(DEFAULT_SETTINGS));
+});
+
+test("runtime and settings-save boundaries validate settings before any sync-generation mutation", async () => {
+  const mainSource = await readFile("src/main.ts", "utf8");
+  const runtimeSource = await readFile("src/lib/v4/runtime.ts", "utf8");
+
+  assert.match(
+    mainSource,
+    /async saveSettings\([^)]*nextSettings[\s\S]*?assertPluginSettingsRuntimeSafe\(nextSettings\)[\s\S]*?quiesceForSettingsChange/u,
+  );
+  assert.match(
+    runtimeSource,
+    /private async execute\([^)]*\)[\s\S]*?assertPluginSettingsRuntimeSafe\(this\.plugin\.settings\)[\s\S]*?githubClient/u,
+  );
+});
+
+
+test("persisted settings are validated before secret migration can mutate SecretStorage", async () => {
+  const mainSource = await readFile("src/main.ts", "utf8");
+  const loadSettingsStart = mainSource.indexOf("async loadSettings()");
+  const mergedSettings = mainSource.indexOf("const merged = Object.assign", loadSettingsStart);
+  const preValidation = mainSource.indexOf("assertPluginSettingsRuntimeSafe(merged)", mergedSettings);
+  const migrateSecrets = mainSource.indexOf("migrateV4Secrets(", mergedSettings);
+
+  assert.ok(loadSettingsStart >= 0 && mergedSettings > loadSettingsStart);
+  assert.ok(preValidation > mergedSettings, "persisted settings must be validated before secret migration side effects");
+  assert.ok(migrateSecrets > preValidation, "secret migration must start only after persisted settings validation succeeds");
+});
+
+
+test("persisted settings are validated after migration before installation or scheduling", async () => {
+  const mainSource = await readFile("src/main.ts", "utf8")
+  assert.match(
+    mainSource,
+    /async loadSettings\(\)[\s\S]*?migrateV4Secrets\([\s\S]*?assertPluginSettingsRuntimeSafe\(result\.settings\)[\s\S]*?this\.settings\s*=\s*result\.settings/u,
+  )
+})
+
+
+test("layout-ready startup callback is inert after plugin unload", async () => {
+  const mainSource = await readFile("src/main.ts", "utf8")
+  assert.match(
+    mainSource,
+    /this\.app\.workspace\.onLayoutReady\(\(\)\s*=>\s*\{\s*if\s*\(this\.unloaded\)\s*return[\s\S]*?setTimeout\(\(\)\s*=>\s*\{[\s\S]*?if\s*\(this\.unloaded\)\s*return/u,
+  )
+})
+
+
+test("failed startup secret-migration persistence scrubs only newly generated migration secrets", async () => {
+  const mainSource = await readFile("src/main.ts", "utf8");
+  const loadSettingsStart = mainSource.indexOf("async loadSettings()");
+  const tokenWasMissing = mainSource.indexOf("const missingGithubTokenSecretId", loadSettingsStart);
+  const passWasMissing = mainSource.indexOf("const missingEncryptionPassphraseSecretId", loadSettingsStart);
+  const migrate = mainSource.indexOf("migrateV4Secrets(", loadSettingsStart);
+  const rememberPending = mainSource.indexOf("this.pendingMigratedSecretIds", migrate);
+  const onloadStart = mainSource.indexOf("async onload()");
+  const persistMigrated = mainSource.indexOf("await this.persistData()", onloadStart);
+  const rollbackCatch = mainSource.indexOf("catch", persistMigrated);
+  const scrubPending = mainSource.indexOf("scrubV4SecretIds(this.app.secretStorage, this.pendingMigratedSecretIds)", rollbackCatch);
+  const rethrow = mainSource.indexOf("throw error", scrubPending);
+
+  assert.ok(tokenWasMissing > loadSettingsStart && passWasMissing > loadSettingsStart);
+  assert.ok(migrate > tokenWasMissing && rememberPending > migrate, "loadSettings must remember migration-created secret IDs");
+  assert.ok(persistMigrated > onloadStart && rollbackCatch > persistMigrated, "startup migration persistence must have a rollback boundary");
+  assert.ok(scrubPending > rollbackCatch && rethrow > scrubPending, "startup rollback must scrub every pending migration secret before rethrow");
+});
+
+
+test("startup secret migration persistence completes before unload can short-circuit runtime creation", async () => {
+  const mainSource = await readFile("src/main.ts", "utf8");
+  const onloadStart = mainSource.indexOf("async onload()");
+  const loadSettings = mainSource.indexOf("await this.loadSettings()", onloadStart);
+  const migratedBlock = mainSource.indexOf("if (this.secretsMigrated)", loadSettings);
+  const persistMigrated = mainSource.indexOf("await this.persistData()", migratedBlock);
+  const unloadGuard = mainSource.indexOf("if (this.unloaded) return", loadSettings);
+  const createRuntime = mainSource.indexOf("this.v4Runtime = this.createV4Runtime()", loadSettings);
+
+  assert.ok(onloadStart >= 0 && loadSettings > onloadStart && persistMigrated > loadSettings);
+  assert.ok(unloadGuard > persistMigrated, "legacy secret cleanup must persist before startup can return after unload");
+  assert.ok(createRuntime > unloadGuard, "runtime creation must remain blocked after the unload guard");
+});
+
+
+test("plugin startup cannot recreate runtime work after unload during async settings initialization", async () => {
+  const mainSource = await readFile("src/main.ts", "utf8");
+
+  assert.match(
+    mainSource,
+    /async onload\(\)[\s\S]*?await this\.loadSettings\(\)[\s\S]*?if\s*\(this\.secretsMigrated\)[\s\S]*?await this\.persistData\(\)[\s\S]*?if\s*\(this\.unloaded\)\s*return[\s\S]*?this\.v4Runtime\s*=\s*this\.createV4Runtime\(\)/u,
+  );
+});
+
+
+test("late settings persistence cannot recreate runtime work after plugin unload", async () => {
+  const mainSource = await readFile("src/main.ts", "utf8");
+
+  assert.match(
+    mainSource,
+    /async saveSettings\([^)]*nextSettings[\s\S]*?await this\.persistSettingsData\(preparedSettings\)[\s\S]*?if\s*\(this\.unloaded\)\s*return[\s\S]*?this\.settings\s*=\s*preparedSettings[\s\S]*?initGitHubClient\(\)[\s\S]*?registerScheduledSync\(\)/u,
+  );
+  assert.match(
+    mainSource,
+    /registerScheduledSync\(\)\s*\{\s*if\s*\(this\.unloaded\)\s*return/u,
+  );
+});
+
+
+test("failed settings persistence scrubs only newly generated orphan secrets before rethrow", async () => {
+  const mainSource = await readFile("src/main.ts", "utf8");
+  const saveStart = mainSource.indexOf("async saveSettings(");
+  const tokenGenerated = mainSource.indexOf("preparedSettings.githubTokenSecretId = this.createSecretId", saveStart);
+  const passGenerated = mainSource.indexOf("preparedSettings.encryptionPassphraseSecretId = this.createSecretId", saveStart);
+  const quiesce = mainSource.indexOf("await this.v4Runtime?.quiesceForSettingsChange()", saveStart);
+  const storeSecrets = mainSource.indexOf("storeV4Secrets(preparedSettings, this.app.secretStorage", quiesce);
+  const persistSettings = mainSource.indexOf("await this.persistSettingsData(preparedSettings)", storeSecrets);
+  const pendingSecretIds = mainSource.indexOf("const pendingSecretIds =", passGenerated);
+  const rollbackCatch = mainSource.indexOf("catch", storeSecrets);
+  const scrubPending = mainSource.indexOf("scrubV4SecretIds(this.app.secretStorage, pendingSecretIds)", rollbackCatch);
+  const rethrow = mainSource.indexOf("throw error", scrubPending);
+
+  assert.ok(tokenGenerated > saveStart && passGenerated > saveStart);
+  assert.ok(pendingSecretIds > passGenerated && storeSecrets > quiesce && persistSettings > storeSecrets);
+  assert.ok(rollbackCatch > persistSettings, "secret rollback must catch persistence failure after pending secrets are stored");
+  assert.ok(scrubPending > rollbackCatch, "newly generated pending secrets must be scrubbed on failed persistence");
+  assert.ok(rethrow > scrubPending, "settings persistence failure must still propagate after secret cleanup");
+  assert.match(mainSource.slice(saveStart, storeSecrets), /githubTokenSecretId\s*!==\s*previousSettings\.githubTokenSecretId/u);
+  assert.match(mainSource.slice(saveStart, storeSecrets), /encryptionPassphraseSecretId\s*!==\s*previousSettings\.encryptionPassphraseSecretId/u);
+});
+
+
+test("successful credential rotation scrubs only superseded secret IDs after durable settings commit", async () => {
+  const superseded = (v4SecretsModule as Record<string, unknown>).supersededV4SecretIds;
+  assert.equal(typeof superseded, "function", "superseded credential selection must be centralized and testable");
+
+  const previous = {
+    githubTokenSecretId: "old-token",
+    encryptionPassphraseSecretId: "old-pass",
+  };
+  const next = {
+    githubTokenSecretId: "old-pass",
+    encryptionPassphraseSecretId: "new-pass",
+  };
+  assert.deepEqual(
+    (superseded as (previous: unknown, next: unknown) => string[])(previous, next),
+    ["old-token"],
+    "an old ID reused by the new generation must never be scrubbed",
+  );
+
+  const mainSource = await readFile("src/main.ts", "utf8");
+  const saveStart = mainSource.indexOf("async saveSettings(");
+  const persistSettings = mainSource.indexOf("await this.persistSettingsData(preparedSettings)", saveStart);
+  const supersededIds = mainSource.indexOf("const supersededSecretIds =", saveStart);
+  const scrubSuperseded = mainSource.indexOf("scrubV4SecretIds(this.app.secretStorage, supersededSecretIds)", persistSettings);
+  const publishSettings = mainSource.indexOf("this.settings = preparedSettings", persistSettings);
+
+  assert.ok(supersededIds > saveStart && supersededIds < persistSettings);
+  assert.ok(scrubSuperseded > persistSettings, "old credential cleanup must happen only after durable settings commit");
+  assert.ok(publishSettings > scrubSuperseded, "post-commit cleanup must not leave live runtime on the old generation");
+  assert.match(
+    mainSource.slice(persistSettings, publishSettings),
+    /try\s*\{[\s\S]*?scrubV4SecretIds\(this\.app\.secretStorage,\s*supersededSecretIds\)[\s\S]*?\}\s*catch/u,
+    "superseded credential cleanup must be best-effort after commit",
+  );
+});
+
+
+test("settings save does not rewrite unchanged credentials in SecretStorage", async () => {
+  const writes: Array<[string, string]> = [];
+  const selectiveStore = v4SecretsModule.storeV4Secrets as unknown as (
+    settings: unknown,
+    storage: unknown,
+    selection: { githubToken: boolean; encryptionPassphrase: boolean },
+  ) => void;
+
+  selectiveStore(
+    {
+      githubToken: "token",
+      githubTokenSecretId: "github-token-id",
+      encryptionPassphrase: "pass",
+      encryptionPassphraseSecretId: "encryption-passphrase-id",
+    },
+    {
+      getSecret() { return null; },
+      setSecret(id: string, value: string) { writes.push([id, value]); },
+    },
+    { githubToken: false, encryptionPassphrase: false },
+  );
+  assert.deepEqual(writes, [], "unchanged credentials must not trigger SecretStorage writes");
+
+  const mainSource = await readFile("src/main.ts", "utf8");
+  assert.match(
+    mainSource,
+    /storeV4Secrets\(preparedSettings,\s*this\.app\.secretStorage,\s*\{[\s\S]*?githubToken:\s*pendingGithubTokenSecret[\s\S]*?encryptionPassphrase:\s*pendingEncryptionPassphraseSecret[\s\S]*?\}\)/u,
+  );
+});
+
+
+test("settings save does not publish the new runtime generation before durable persistence succeeds", async () => {
+  const mainSource = await readFile("src/main.ts", "utf8");
+
+  assert.match(
+    mainSource,
+    /async saveSettings\([^)]*nextSettings[\s\S]*?const previousSettings\s*=\s*this\.settings[\s\S]*?await this\.v4Runtime\?\.quiesceForSettingsChange\(\)[\s\S]*?await this\.persistSettingsData\(preparedSettings\)[\s\S]*?this\.settings\s*=\s*preparedSettings[\s\S]*?credentialsChanged\(\)[\s\S]*?initGitHubClient\(\)/u,
+  );
+  assert.doesNotMatch(
+    mainSource,
+    /await this\.v4Runtime\?\.quiesceForSettingsChange\(\)[\s\S]*?this\.settings\s*=\s*nextSettings[\s\S]*?await this\.persistData\(\)/u,
+  );
+  assert.match(
+    mainSource,
+    /githubToken !== previousSettings\.githubToken[\s\S]*?createSecretId\("github-token"\)/u,
+  );
+  assert.match(
+    mainSource,
+    /encryptionPassphrase !== previousSettings\.encryptionPassphrase[\s\S]*?createSecretId\("encryption-passphrase"\)/u,
+  );
+});
+
+
+test("force confirmation is bound to the settings generation that the user reviewed", async () => {
+  const mainSource = await readFile("src/main.ts", "utf8");
+
+  assert.match(
+    mainSource,
+    /async showForceConfirm\([^)]*\)[\s\S]*?const approvedGeneration\s*=\s*this\.v4Runtime\.settingsGeneration[\s\S]*?Repository:\s*\$\{repo\}[\s\S]*?Branch:\s*\$\{branch\}/u,
+  );
+  assert.match(
+    mainSource,
+    /const runConfirmedOperation[\s\S]*?this\.v4Runtime\.settingsGeneration\s*!==\s*approvedGeneration[\s\S]*?Settings changed[\s\S]*?return[\s\S]*?v4Runtime\.forcePush\(\)[\s\S]*?v4Runtime\.forcePull\(\)/iu,
+  );
+});
+
+
+test("runtime decision modals settle immediately when the active sync is aborted", async () => {
+  const runtimeSource = await readFile("src/lib/v4/runtime.ts", "utf8");
+
+  assert.match(
+    runtimeSource,
+    /askConflict\([^)]*signal:\s*AbortSignal[\s\S]*?onAbort\s*=\s*\(\)\s*=>\s*finish\(\{\s*action:\s*"ask"\s*\}\)[\s\S]*?signal\.addEventListener\("abort",\s*onAbort/u,
+  );
+  assert.match(
+    runtimeSource,
+    /confirmThresholdOverride\([\s\S]*?signal:\s*AbortSignal[\s\S]*?onAbort\s*=\s*\(\)\s*=>\s*finish\(false\)[\s\S]*?signal\.addEventListener\("abort",\s*onAbort/u,
+  );
+  assert.match(
+    runtimeSource,
+    /askConflict\(input\.path,\s*signal\)/u,
+  );
+  assert.match(
+    runtimeSource,
+    /confirmThresholdOverride\(error,\s*request\.operation,\s*signal\)/u,
+  );
+});
+
+
+test("aborted runtime decision modals preserve canonical cancellation after awaiting user input", async () => {
+  const runtimeSource = await readFile("src/lib/v4/runtime.ts", "utf8");
+  const sessionSource = await readFile("src/lib/v4/sync-session.ts", "utf8");
+
+  assert.match(
+    runtimeSource,
+    /await this\.confirmThresholdOverride\(error,\s*request\.operation,\s*signal\)[\s\S]*?throwIfV4Aborted\(signal\)[\s\S]*?if \(!confirmed\)/u,
+  );
+  assert.match(
+    sessionSource,
+    /await this\.input\.askConflict\([^)]*\)[\s\S]*?throwIfV4Aborted\(this\.input\.signal\)[\s\S]*?if \(resolution\.action === "ask"\)/u,
+  );
+});
+
+
+test("desktop runtime proves the vault root and guards small-file reads and mutations", async () => {
+  const runtimeSource = await readFile("src/lib/v4/runtime.ts", "utf8");
+
+  assert.match(
+    runtimeSource,
+    /getBasePath\?\(\):\s*string[\s\S]*?desktopRootPath[\s\S]*?getBasePath\(\)[\s\S]*?createV4PlatformIo\([\s\S]*?desktopRootPath/u,
+  );
+  assert.match(
+    runtimeSource,
+    /read:\s*async\s*\(path:[^)]*\)\s*=>\s*\{[\s\S]*?assertVaultPathSafe\(path,\s*\{\s*mustExist:\s*true\s*\}\)[\s\S]*?readVaultFileBytes/u,
+  );
+  assert.match(
+    runtimeSource,
+    /write:\s*async\s*\(path:[^)]*\)\s*=>\s*\{[\s\S]*?assertVaultPathSafe\(path\)[\s\S]*?writeVaultFileBytes/u,
+  );
+  assert.match(
+    runtimeSource,
+    /trash:\s*async\s*\(path:[^)]*\)\s*=>\s*\{[\s\S]*?assertVaultPathSafe\(path\)[\s\S]*?trashVaultFileIfExists/u,
+  );
+  assert.match(
+    runtimeSource,
+    /readVaultWhole:\s*async\s+path\s*=>\s*\{[\s\S]*?assertVaultPathSafe\(path,\s*\{\s*mustExist:\s*true\s*\}\)[\s\S]*?readVaultFileBytes/u,
+  );
+});
+
+
+test("settings persistence holds a runtime transition gate until the new generation is committed or aborted", async () => {
+  const mainSource = await readFile("src/main.ts", "utf8");
+  const runtimeSource = await readFile("src/lib/v4/runtime.ts", "utf8");
+
+  assert.match(
+    mainSource,
+    /await this\.v4Runtime\?\.quiesceForSettingsChange\(\)[\s\S]*?try\s*\{[\s\S]*?await this\.persistSettingsData\(preparedSettings\)[\s\S]*?this\.settings\s*=\s*preparedSettings[\s\S]*?credentialsChanged\(\)[\s\S]*?\}\s*finally\s*\{[\s\S]*?finishSettingsChange/u,
+  );
+  assert.match(runtimeSource, /private settingsTransitionActive\s*=\s*false/u);
+  assert.match(runtimeSource, /quiesceForSettingsChange\(\)[\s\S]*?settingsTransitionActive\s*=\s*true[\s\S]*?cancelPending\(\)[\s\S]*?cancelActive/u);
+  assert.match(runtimeSource, /finishSettingsChange\(\)[\s\S]*?settingsTransitionActive\s*=\s*false/u);
+  assert.match(runtimeSource, /manualSync\(\)[\s\S]*?runWhileSettingsStable/u);
+  assert.match(runtimeSource, /createHistoryService\(\)[\s\S]*?assertSettingsTransitionInactive/u);
+  assert.match(runtimeSource, /private enqueue\([^)]*\)[\s\S]*?settingsTransitionActive[\s\S]*?settingsTransitionSawLocalChange/u);
+});
+
+test("startup and scheduled callbacks are bound to the settings generation that scheduled them", async () => {
+  const mainSource = await readFile("src/main.ts", "utf8");
+
+  assert.match(
+    mainSource,
+    /registerScheduledSync\(\)[\s\S]*?const generation\s*=\s*this\.v4Runtime\.settingsGeneration[\s\S]*?setInterval\([\s\S]*?settingsGeneration\s*!==\s*generation[\s\S]*?return[\s\S]*?scheduledSync/u,
+  );
+  assert.match(
+    mainSource,
+    /onLayoutReady[\s\S]*?const generation\s*=\s*this\.v4Runtime\.settingsGeneration[\s\S]*?setTimeout\([\s\S]*?settingsGeneration\s*!==\s*generation[\s\S]*?return[\s\S]*?startupSync/u,
+  );
+});
+
+
+test("runtime settings preserve the legacy empty-branch fallback to main", () => {
+  assert.doesNotThrow(() => assertPluginSettingsRuntimeSafe({
+    ...DEFAULT_SETTINGS,
+    githubOwner: "owner",
+    githubRepo: "repo",
+    githubBranch: "",
+  }));
+});
+
+test("runtime settings reject unsafe Git branch/ref syntax before requests", () => {
+  for (const githubBranch of [
+    "../main",
+    "main/../other",
+    "/main",
+    "main/",
+    "main//other",
+    ".hidden",
+    "topic/.hidden",
+    "main..other",
+    "topic.lock",
+    "topic/child.lock",
+    "topic@{1}",
+    "topic?x",
+    "topic*x",
+    "topic[x",
+    "topic\\x",
+    "@",
+  ]) {
+    assert.throws(
+      () => assertPluginSettingsRuntimeSafe({ ...DEFAULT_SETTINGS, githubOwner: "owner", githubRepo: "repo", githubBranch }),
+      /branch|ref|unsafe|invalid/iu,
+      githubBranch,
+    );
+  }
+  assert.doesNotThrow(() => assertPluginSettingsRuntimeSafe({
+    ...DEFAULT_SETTINGS,
+    githubOwner: "owner",
+    githubRepo: "repo",
+    githubBranch: "feature/local-release-qualification",
+  }));
+});
+
+test("runtime settings reject GitHub owner/repository values that can alter REST paths", () => {
+  for (const settings of [
+    { ...DEFAULT_SETTINGS, githubOwner: "../user", githubRepo: "repo" },
+    { ...DEFAULT_SETTINGS, githubOwner: "owner/name", githubRepo: "repo" },
+    { ...DEFAULT_SETTINGS, githubOwner: "owner", githubRepo: "../repo" },
+    { ...DEFAULT_SETTINGS, githubOwner: "owner", githubRepo: "repo/contents" },
+    { ...DEFAULT_SETTINGS, githubOwner: "owner", githubRepo: "repo?ref=other" },
+    { ...DEFAULT_SETTINGS, githubOwner: "owner", githubRepo: "%2e%2e" },
+  ]) {
+    assert.throws(() => assertPluginSettingsRuntimeSafe(settings), /githubOwner|githubRepo|repository|owner|unsafe|invalid/iu);
+  }
+
+  assert.doesNotThrow(() => assertPluginSettingsRuntimeSafe({ ...DEFAULT_SETTINGS, githubOwner: "", githubRepo: "" }));
+  assert.doesNotThrow(() => assertPluginSettingsRuntimeSafe({ ...DEFAULT_SETTINGS, githubOwner: "crystalicez", githubRepo: "obsidian-github_sync.multi-platform" }));
+});

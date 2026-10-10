@@ -185,6 +185,13 @@
   justify-content: space-between;
   flex-wrap: wrap;
 }
+.github-sync-center__actions {
+  flex-wrap: wrap;
+}
+.github-sync-center__change span:last-child {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
 
 .github-sync-center__layout {
   display: grid;
@@ -372,4 +379,70 @@
   }
 }
 
-/*# sourceMappingURL=styles.css.map */
+@media (prefers-reduced-motion: reduce) {
+  .obsidian-github-sync-multi-platform-ribbon-icon {
+    animation: none;
+  }
+  .github-sync-force-confirm-fill,
+  .github-sync-force-confirm-handle {
+    transition: none;
+  }
+}
+.github-sync-settings-header {
+  border-bottom: 2px solid var(--interactive-accent);
+  padding-bottom: 4px;
+  margin-top: 24px;
+  margin-bottom: 12px;
+}
+.github-sync-settings-header .setting-item-name {
+  font-size: 1.15em !important;
+  font-weight: bold !important;
+  color: var(--interactive-accent) !important;
+}
+.github-sync-settings-header .setting-item-description {
+  display: none;
+}
+.github-sync-settings-dirty-banner {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--size-4-2);
+  background-color: var(--background-secondary-alt);
+  border: 1px solid var(--interactive-accent);
+  border-left: 5px solid var(--interactive-accent);
+  border-radius: var(--radius-m);
+  padding: var(--size-4-3) var(--size-4-5);
+  margin-bottom: var(--size-4-5);
+}
+.github-sync-settings-dirty-banner .github-sync-settings-dirty-text {
+  font-weight: bold;
+  color: var(--text-normal);
+}
+.github-sync-settings-dirty-banner > p {
+  flex: 1 1 17rem;
+  min-width: 0;
+  margin: 0;
+  color: var(--text-muted);
+  font-size: var(--font-ui-small);
+}
+.github-sync-settings-dirty-banner .github-sync-settings-dirty-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--size-4-2);
+}
+.github-sync-settings-dirty-banner .github-sync-settings-dirty-buttons button {
+  margin-left: 0;
+}
+@media (max-width: 480px) {
+  .github-sync-settings-dirty-banner {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .github-sync-settings-dirty-banner > p {
+    flex: initial;
+  }
+  .github-sync-settings-dirty-banner .github-sync-settings-dirty-buttons {
+    justify-content: flex-end;
+  }
+}

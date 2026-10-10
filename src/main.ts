@@ -3,8 +3,11 @@ import { Plugin, setIcon, Modal, Notice, TFile, TFolder } from "obsidian";
 import { SettingTab, PluginSettings, DEFAULT_SETTINGS } from "./setting";
 import { GitHubClient } from "./lib/github-api";
 import { normalizeScheduledSyncIntervalSeconds, shouldRunScheduledSync, shouldRunStartupSync } from "./lib/sync-policy";
-import { migrateV4Secrets, sanitizeV4SettingsForPersistence, storeV4Secrets } from "./lib/v4/secrets";
+import { migrateV4Secrets, sanitizeV4SettingsForPersistence, scrubV4SecretIds, storeV4Secrets, supersededV4SecretIds } from "./lib/v4/secrets";
 import { V4PluginRuntime } from "./lib/v4/runtime";
+import { countV4ScopedPaths } from "./lib/v4/scope";
+import { compileV4IgnorePathRegex } from "./lib/v4/ignore";
+import { assertPluginSettingsRuntimeSafe } from "./lib/plugin-settings-validation";
 import { createIdleV4Progress } from "./lib/v4/progress";
 import { formatV4ActiveSyncStatus } from "./lib/v4/status";
 import { V4SyncCenterView, V4_SYNC_CENTER_VIEW } from "./views/sync-center";
@@ -27,7 +30,9 @@ export default class FastSync extends Plugin {
   scheduledSyncTimer: number | null = null
   startupSyncTimeout: number | null = null
   secretsMigrated: boolean = false
+  private pendingMigratedSecretIds: string[] = []
   private unloaded = false
+  private settingsSaveInProgress = false
   private statusDisplaySignature?: string
 
   enableWatch() {
@@ -50,7 +55,20 @@ export default class FastSync extends Plugin {
   async onload() {
     this.unloaded = false
     await this.loadSettings()
-    if (this.secretsMigrated) await this.persistData()
+    if (this.secretsMigrated) {
+      try {
+        await this.persistData()
+        this.pendingMigratedSecretIds = []
+      } catch (error) {
+        try {
+          scrubV4SecretIds(this.app.secretStorage, this.pendingMigratedSecretIds)
+        } catch (cleanupError) {
+          throw new Error("Secret migration persistence failed and pending credentials could not be scrubbed.", { cause: cleanupError })
+        }
+        throw error
+      }
+    }
+    if (this.unloaded) return
 
     this.settingTab = new SettingTab(this.app, this)
     this.addSettingTab(this.settingTab)
@@ -126,12 +144,16 @@ export default class FastSync extends Plugin {
 
     // After the workspace layout is ready, run the startup sync once, then enable real-time watch
     this.app.workspace.onLayoutReady(() => {
+      if (this.unloaded) return
       if (shouldRunStartupSync(this.settings)) {
         // Delay 1.5 s to let Obsidian finish initialising
+        const generation = this.v4Runtime.settingsGeneration
         this.startupSyncTimeout = window.setTimeout(() => {
           this.startupSyncTimeout = null;
+          if (this.unloaded) return
           const runtime = this.v4Runtime;
-          if (runtime) void runtime.startupSync();
+          if (!runtime || runtime.settingsGeneration !== generation) return
+          void runtime.startupSync();
         }, 1500);
       } else {
         // Not configured – enable watch immediately
@@ -165,11 +187,14 @@ export default class FastSync extends Plugin {
   }
 
   registerScheduledSync() {
+    if (this.unloaded) return
     if (this.scheduledSyncTimer) window.clearInterval(this.scheduledSyncTimer);
     this.scheduledSyncTimer = null;
     if (!shouldRunScheduledSync(this.settings)) return;
     const seconds = normalizeScheduledSyncIntervalSeconds(this.settings.scheduledSyncIntervalSeconds);
+    const generation = this.v4Runtime.settingsGeneration
     this.scheduledSyncTimer = window.setInterval(() => {
+      if (this.v4Runtime.settingsGeneration !== generation) return
       void this.v4Runtime.scheduledSync()
     }, seconds * 1000);
   }
@@ -185,10 +210,14 @@ export default class FastSync extends Plugin {
   }
 
   /** Persist only current V4 settings; the V4 local index uses its own sharded adapter storage. */
-  async persistData() {
+  private async persistSettingsData(settings: PluginSettings) {
     await this.saveData({
-      settings: sanitizeV4SettingsForPersistence(this.settings),
+      settings: sanitizeV4SettingsForPersistence(settings),
     });
+  }
+
+  async persistData() {
+    await this.persistSettingsData(this.settings)
   }
 
   async openSyncCenter(): Promise<void> {
@@ -212,22 +241,92 @@ export default class FastSync extends Plugin {
     // Backward compatibility: older versions stored settings fields directly at the top level
     const savedSettings = data.settings ?? data;
     const merged = Object.assign({}, DEFAULT_SETTINGS, savedSettings);
+    assertPluginSettingsRuntimeSafe(merged)
+    const missingGithubTokenSecretId = !merged.githubTokenSecretId
+    const missingEncryptionPassphraseSecretId = !merged.encryptionPassphraseSecretId
+    const legacyGithubToken = typeof merged.githubToken === "string" && merged.githubToken.length > 0
+    const legacyEncryptionPassphrase = typeof merged.encryptionPassphrase === "string" && merged.encryptionPassphrase.length > 0
     const result = migrateV4Secrets(
       merged,
       this.app.secretStorage,
       prefix => this.createSecretId(prefix),
     )
+    assertPluginSettingsRuntimeSafe(result.settings)
+    this.pendingMigratedSecretIds = [
+      ...(missingGithubTokenSecretId && legacyGithubToken ? [result.settings.githubTokenSecretId] : []),
+      ...(missingEncryptionPassphraseSecretId && legacyEncryptionPassphrase ? [result.settings.encryptionPassphraseSecretId] : []),
+    ]
     this.settings = result.settings as PluginSettings
     this.secretsMigrated = result.migrated
   }
 
-  async saveSettings() {
-    this.v4Runtime?.credentialsChanged()
-    storeV4Secrets(this.settings, this.app.secretStorage)
-    this.initGitHubClient()
-    this.registerScheduledSync()
-    this.updateRibbonIcon(!!(this.settings.githubToken && this.settings.githubOwner && this.settings.githubRepo))
-    await this.persistData()
+  async saveSettings(nextSettings: PluginSettings = this.settings) {
+    assertPluginSettingsRuntimeSafe(nextSettings)
+    compileV4IgnorePathRegex(nextSettings.ignorePathRegex)
+    if (this.settingsSaveInProgress) throw new Error("GitHub Sync: Settings save already in progress.")
+    const previousSettings = this.settings
+    const preparedSettings = { ...nextSettings }
+
+    if (!preparedSettings.githubTokenSecretId || preparedSettings.githubToken !== previousSettings.githubToken) {
+      preparedSettings.githubTokenSecretId = this.createSecretId("github-token")
+    }
+    if (
+      !preparedSettings.encryptionPassphraseSecretId
+      || preparedSettings.encryptionPassphrase !== previousSettings.encryptionPassphrase
+    ) {
+      preparedSettings.encryptionPassphraseSecretId = this.createSecretId("encryption-passphrase")
+    }
+    const pendingGithubTokenSecret = preparedSettings.githubTokenSecretId !== previousSettings.githubTokenSecretId
+    const pendingEncryptionPassphraseSecret = preparedSettings.encryptionPassphraseSecretId !== previousSettings.encryptionPassphraseSecretId
+    const pendingSecretIds = [
+      ...(pendingGithubTokenSecret ? [preparedSettings.githubTokenSecretId] : []),
+      ...(pendingEncryptionPassphraseSecret ? [preparedSettings.encryptionPassphraseSecretId] : []),
+    ]
+    const supersededSecretIds = supersededV4SecretIds(previousSettings, preparedSettings)
+
+    this.settingsSaveInProgress = true
+    try {
+      await this.v4Runtime?.quiesceForSettingsChange()
+    } catch (error) {
+      this.settingsSaveInProgress = false
+      throw error
+    }
+    try {
+      try {
+        storeV4Secrets(preparedSettings, this.app.secretStorage, {
+          githubToken: pendingGithubTokenSecret,
+          encryptionPassphrase: pendingEncryptionPassphraseSecret,
+        })
+        await this.persistSettingsData(preparedSettings)
+      } catch (error) {
+        try {
+          scrubV4SecretIds(this.app.secretStorage, pendingSecretIds)
+        } catch (cleanupError) {
+          throw new Error("Settings save failed and pending credentials could not be scrubbed.", { cause: cleanupError })
+        }
+        throw error
+      }
+      try {
+        scrubV4SecretIds(this.app.secretStorage, supersededSecretIds)
+      } catch {
+        if (!this.unloaded) {
+          new Notice("GitHub Sync: Settings saved, but an old credential could not be cleared from secure storage.")
+        }
+      }
+      if (this.unloaded) return
+
+      this.settings = preparedSettings
+      this.v4Runtime?.credentialsChanged()
+      this.initGitHubClient()
+      this.registerScheduledSync()
+      this.updateRibbonIcon(!!(this.settings.githubToken && this.settings.githubOwner && this.settings.githubRepo))
+    } finally {
+      try {
+        this.v4Runtime?.finishSettingsChange()
+      } finally {
+        this.settingsSaveInProgress = false
+      }
+    }
   }
 
   showSavedFeedback() {
@@ -263,17 +362,27 @@ export default class FastSync extends Plugin {
 
     const span = this.statusBarItem.createEl("span", { text, cls });
     span.title = title;
+    span.setAttribute("role", "button");
+    span.setAttribute("tabindex", "0");
+    span.setAttribute("aria-label", "GitHub Sync: run manual sync");
     const runtime = this.v4Runtime;
-    span.onclick = () => {
+    const requestManualSync = () => {
       if (runtime && !runtime.isSyncing) {
         if (this.unloaded) return
         void runtime.manualSync()
       }
     };
+    span.onclick = requestManualSync;
+    span.onkeydown = event => {
+      if (event.key !== "Enter" && event.key !== " ") return
+      event.preventDefault()
+      requestManualSync()
+    };
     this.statusDisplaySignature = signature;
   }
 
   async showForceConfirm(operation: "forcePush" | "forcePull"): Promise<void> {
+    const approvedGeneration = this.v4Runtime.settingsGeneration
     await new Promise<void>((resolve) => {
       const modal = new Modal(this.app)
       let settled = false
@@ -285,7 +394,17 @@ export default class FastSync extends Plugin {
       modal.onClose = finish
       const repo = `${this.settings.githubOwner}/${this.settings.githubRepo}`
       const branch = this.settings.githubBranch || "main"
-      const localFileCount = this.app.vault.getFiles().filter(file => !file.path.startsWith(`${this.app.vault.configDir}/`)).length
+      const localFileCount = countV4ScopedPaths(
+        this.app.vault.getFiles().map(file => file.path),
+        {
+          configDir: this.app.vault.configDir,
+          pluginId: this.manifest.id,
+          ignorePathRegex: this.settings.ignorePathRegex,
+          syncObsidianConfig: this.settings.syncObsidianConfig,
+          syncBookmarks: this.settings.syncBookmarks,
+          syncPlugins: this.settings.syncPlugins,
+        },
+      )
 
       const title = operation === "forcePush" ? "Force push local vault to remote?" : "Force pull remote vault to local?";
       const message = operation === "forcePush"
@@ -335,6 +454,12 @@ export default class FastSync extends Plugin {
       const runConfirmedOperation = () => {
         if (resolved || !unlocked) return
         resolved = true
+        if (this.v4Runtime.settingsGeneration !== approvedGeneration) {
+          modal.close()
+          new Notice("GitHub Sync: Settings changed after this confirmation was opened. Reopen the force confirmation and review the target again.")
+          finish()
+          return
+        }
         modal.close()
         if (operation === "forcePush") void this.v4Runtime.forcePush()
         else void this.v4Runtime.forcePull()

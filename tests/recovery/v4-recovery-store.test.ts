@@ -2,6 +2,7 @@ import assert from "node:assert/strict"
 import { readFile } from "node:fs/promises"
 import test from "node:test"
 
+import { sha256Hex, toBase64, utf8ToBytes } from "../../src/lib/bytes"
 import { createV4RecoveryStore, V4RecoveryRequiredError } from "../../src/lib/v4/recovery-store"
 import type { V4LocalIndexAdapter } from "../../src/lib/v4/local-index"
 
@@ -62,6 +63,41 @@ test("recovery store chooses the highest valid generation even when slot content
   const recovered = await store.load()
   assert.equal(recovered?.header.generation, second.header.generation)
   assert.equal(recovered?.header.phase, "remote-verified")
+})
+
+test("recovery store rejects before writing when the current generation has no safe successor", async () => {
+  const adapter = new MemoryAdapter()
+  const store = createV4RecoveryStore({ adapter, root: "recovery", repoId: "owner/repo#main" })
+  const withoutIntegrity = {
+    schemaVersion: 1 as const,
+    generation: Number.MAX_SAFE_INTEGER,
+    runId: "run-max",
+    journalId: undefined,
+    phase: "index-committed" as const,
+    expectedRemoteHead: "head-old" as string | null,
+    candidateCommitSha: undefined,
+    verifiedRemoteHead: "head-new",
+    payloadCiphertext: undefined,
+  }
+  const integrity = await sha256Hex(utf8ToBytes(JSON.stringify({
+    schemaVersion: withoutIntegrity.schemaVersion,
+    generation: withoutIntegrity.generation,
+    runId: withoutIntegrity.runId,
+    journalId: withoutIntegrity.journalId,
+    phase: withoutIntegrity.phase,
+    expectedRemoteHead: withoutIntegrity.expectedRemoteHead,
+    candidateCommitSha: withoutIntegrity.candidateCommitSha,
+    verifiedRemoteHead: withoutIntegrity.verifiedRemoteHead,
+    payloadCiphertext: withoutIntegrity.payloadCiphertext,
+  })))
+  adapter.values.set("recovery/slot-1.json", JSON.stringify({ ...withoutIntegrity, integrity }))
+  const before = new Map(adapter.values)
+
+  await assert.rejects(
+    () => store.save(input("run-next")),
+    /recovery.*generation.*safe|generation.*increment/iu,
+  )
+  assert.deepEqual(adapter.values, before)
 })
 
 test("recovery store raises a typed recovery-required error when all present generations are invalid", async () => {
@@ -200,4 +236,239 @@ test("v4 recovery cancellation during a large staged final commit waits for the 
   assert.deepEqual(events, ["commit-stage"])
   assert.deepEqual(snapshot.payload?.completedMutationIds, ["stage:large"])
   assert.equal(snapshot.header.phase, "local-committing")
+})
+
+
+test("v4 recovery delegates a large interrupted stage swap to the atomic platform commit before replanning", async () => {
+  const { applyV4RecoveryLocalMutations, createV4RecoveryStore } = await import("../../src/lib/v4/recovery-store")
+  const { DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES } = await import("../../src/lib/v4/content-source")
+  const adapter = new MemoryAdapter()
+  const store = createV4RecoveryStore({ adapter, root: "recovery", repoId: "repo" })
+  const stage = {
+    stageId: "stage-interrupted",
+    hash: "a".repeat(64),
+    size: DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES + 1,
+    mtime: 22,
+  }
+  let snapshot = await store.save({
+    runId: "run-interrupted",
+    phase: "remote-verified",
+    expectedRemoteHead: "old",
+    candidateCommitSha: "candidate",
+    verifiedRemoteHead: "candidate",
+    payload: {
+      mutations: [{
+        id: "stage:interrupted",
+        kind: "stage-write",
+        path: "large.bin",
+        stage,
+        precondition: { path: "large.bin", exists: true, size: 3, mtime: 1 },
+      }],
+      completedMutationIds: [],
+    },
+  })
+  let commits = 0
+  const result = await applyV4RecoveryLocalMutations({
+    store,
+    snapshot,
+    io: {
+      async read() { return new Uint8Array() },
+      async write() {},
+      async trash() {},
+      async stat() { return null },
+      async commitStage() { commits++ },
+    },
+  })
+
+  assert.equal(commits, 1)
+  assert.equal(result.replanRequired, false)
+  snapshot = (await store.load())!
+  assert.deepEqual(snapshot.payload?.completedMutationIds, ["stage:interrupted"])
+});
+
+
+test("discarding replanned recovery rolls back unreceipted staged swaps before deleting stage residue", async () => {
+  const { discardV4RecoveryStages } = await import("../../src/lib/v4/recovery-store")
+  const stage = { stageId: "stage-replan", hash: "a".repeat(64), size: 10, mtime: 22 }
+  const mutation = {
+    id: "stage:replan",
+    kind: "stage-write" as const,
+    path: "note.md",
+    stage,
+    precondition: { path: "note.md", exists: true, size: 3, mtime: 1 },
+  }
+  const events: string[] = []
+  await discardV4RecoveryStages({
+    header: {
+      schemaVersion: 1,
+      generation: 1,
+      runId: "run",
+      phase: "replan-required",
+      expectedRemoteHead: "old",
+      integrity: "f".repeat(64),
+    },
+    payload: { mutations: [mutation], completedMutationIds: [] },
+  }, {
+    async listFiles() { return [] },
+    async read() { return new Uint8Array() },
+    async write() {},
+    async trash() {},
+    staging: {
+      beginStage: async () => { throw new Error("unused") },
+      stageSource: async () => { throw new Error("unused") },
+      open: async () => { throw new Error("unused") },
+      pathFor: () => "",
+      async remove(ref) { events.push(`remove:${ref.stageId}`) },
+    },
+    async rollbackStage(input) { events.push(`rollback:${input.stage.stageId}:${input.path}`) },
+  })
+
+  assert.deepEqual(events, ["rollback:stage-replan:note.md", "remove:stage-replan"])
+});
+
+test("discarding replanned recovery does not roll back a staged mutation with a durable receipt", async () => {
+  const { discardV4RecoveryStages } = await import("../../src/lib/v4/recovery-store")
+  const stage = { stageId: "stage-done", hash: "a".repeat(64), size: 10, mtime: 22 }
+  const events: string[] = []
+  await discardV4RecoveryStages({
+    header: {
+      schemaVersion: 1,
+      generation: 1,
+      runId: "run",
+      phase: "replan-required",
+      expectedRemoteHead: "old",
+      integrity: "f".repeat(64),
+    },
+    payload: {
+      mutations: [{
+        id: "stage:done",
+        kind: "stage-write",
+        path: "note.md",
+        stage,
+        precondition: { path: "note.md", exists: true, size: 3, mtime: 1 },
+      }],
+      completedMutationIds: ["stage:done"],
+    },
+  }, {
+    async listFiles() { return [] },
+    async read() { return new Uint8Array() },
+    async write() {},
+    async trash() {},
+    staging: {
+      beginStage: async () => { throw new Error("unused") },
+      stageSource: async () => { throw new Error("unused") },
+      open: async () => { throw new Error("unused") },
+      pathFor: () => "",
+      async remove(ref) { events.push(`remove:${ref.stageId}`) },
+    },
+    async rollbackStage() { events.push("rollback") },
+  })
+
+  assert.deepEqual(events, ["remove:stage-done"])
+});
+
+
+test("recovery store rejects integrity-valid payloads outside the writer safety contract", async () => {
+  const cases = [
+    {
+      label: "unsafe vault path",
+      payload: {
+        mutations: [{ id: "trash:unsafe", kind: "trash", path: "../outside.md", precondition: { path: "../outside.md", exists: true, size: 1, mtime: 1 } }],
+        completedMutationIds: [],
+      },
+    },
+    {
+      label: "duplicate mutation id",
+      payload: {
+        mutations: [
+          { id: "same", kind: "trash", path: "one.md", precondition: { path: "one.md", exists: false } },
+          { id: "same", kind: "trash", path: "two.md", precondition: { path: "two.md", exists: false } },
+        ],
+        completedMutationIds: [],
+      },
+    },
+    {
+      label: "unknown durable receipt",
+      payload: {
+        mutations: [{ id: "trash:one", kind: "trash", path: "one.md", precondition: { path: "one.md", exists: false } }],
+        completedMutationIds: ["trash:other"],
+      },
+    },
+    {
+      label: "invalid stage metadata",
+      payload: {
+        mutations: [{
+          id: "stage:one",
+          kind: "stage-write",
+          path: "one.md",
+          precondition: { path: "one.md", exists: false },
+          stage: { stageId: "../stage", hash: "not-a-hash", size: -1, mtime: Number.NaN },
+        }],
+        completedMutationIds: [],
+      },
+    },
+    {
+      label: "invalid existing precondition",
+      payload: {
+        mutations: [{
+          id: "trash:one",
+          kind: "trash",
+          path: "one.md",
+          precondition: { path: "one.md", exists: true, size: -1, mtime: Number.NaN },
+        }],
+        completedMutationIds: [],
+      },
+    },
+  ] as const
+
+  for (const entry of cases) {
+    const adapter = new MemoryAdapter()
+    const payloadBytes = utf8ToBytes(JSON.stringify(entry.payload))
+    const withoutIntegrity = {
+      schemaVersion: 1,
+      generation: 1,
+      runId: "run-safe-boundary",
+      phase: "remote-verified",
+      expectedRemoteHead: "a".repeat(40),
+      candidateCommitSha: "b".repeat(40),
+      verifiedRemoteHead: "b".repeat(40),
+      payloadCiphertext: toBase64(payloadBytes),
+    }
+    const integrity = await sha256Hex(utf8ToBytes(JSON.stringify(withoutIntegrity)))
+    adapter.values.set("recovery/slot-1.json", JSON.stringify({ ...withoutIntegrity, integrity }))
+    const store = createV4RecoveryStore({ adapter, root: "recovery", repoId: "owner/repo#main" })
+
+    await assert.rejects(
+      () => store.load(),
+      (error: unknown) => error instanceof V4RecoveryRequiredError,
+      entry.label,
+    )
+  }
+})
+
+
+test("recovery store refuses to persist an unsafe payload that could be replayed without reload", async () => {
+  const adapter = new MemoryAdapter()
+  const store = createV4RecoveryStore({ adapter, root: "recovery", repoId: "owner/repo#main" })
+
+  await assert.rejects(
+    () => store.save({
+      runId: "run-unsafe-save",
+      phase: "remote-verified",
+      expectedRemoteHead: "a".repeat(40),
+      candidateCommitSha: "b".repeat(40),
+      verifiedRemoteHead: "b".repeat(40),
+      payload: {
+        mutations: [{
+          id: "trash:unsafe",
+          kind: "trash",
+          path: "../outside.md",
+          precondition: { path: "../outside.md", exists: false },
+        }],
+        completedMutationIds: [],
+      },
+    }),
+    V4RecoveryRequiredError,
+  )
+  assert.equal(adapter.values.size, 0)
 })

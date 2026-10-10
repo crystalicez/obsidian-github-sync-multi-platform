@@ -108,6 +108,25 @@ test("status bar subscribes to detailed progress and cleans up once", async () =
   assert.equal(fixture.manualSyncCalls, 1);
 });
 
+test("clickable status bar is keyboard-operable and identifies its action", async () => {
+  const fixture = createMainProgressFixture();
+  await fixture.plugin.onload();
+  const bar = (fixture.plugin.statusBarItem as unknown as ElementStub).children[0] as any;
+  assert.equal(bar.attributes.role, "button");
+  assert.equal(bar.attributes.tabindex, "0");
+  assert.match(bar.attributes["aria-label"], /sync/iu);
+
+  let prevents = 0;
+  bar.onkeydown?.({ key: "Enter", preventDefault() { prevents++; } });
+  bar.onkeydown?.({ key: " ", preventDefault() { prevents++; } });
+  assert.equal(fixture.manualSyncCalls, 2);
+  assert.equal(prevents, 2);
+  fixture.setBusy(true);
+  bar.onkeydown?.({ key: "Enter", preventDefault() { prevents++; } });
+  assert.equal(fixture.manualSyncCalls, 2);
+  fixture.plugin.onunload();
+});
+
 test("status bar skips timing-only and duplicate lifecycle DOM updates", async () => {
   const fixture = createMainProgressFixture();
   await fixture.plugin.onload();
