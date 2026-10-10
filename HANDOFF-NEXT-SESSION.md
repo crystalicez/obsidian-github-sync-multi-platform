@@ -976,6 +976,8 @@ Verification status:
 - Connected `lnwjud` Windows verification after this change: `pnpm build`, focused settings-secrets **63/63**, `pnpm test:repeat` **10/10**, `pnpm test:recovery`, `pnpm test:resource`, `pnpm test:feasibility`, `pnpm validate:metadata`, `pnpm validate:package`, and `pnpm test:github-e2e:compile` all returned exit code 0.
 - These pre-commit checks ran in the audit workspace alongside the **unrelated and unstaged** `tests/v4/github-transport.test.ts` helper WIP. They are not clean exact-SHA qualification and are not a substitute for live E2E or physical device performance measurements; re-run a clean detached-SHA gate before promoting evidence.
 
+- Post-fix **clean exact-audit-SHA** verification: detached worktree `.tmp/release-audit-clean-20261010` checked out full `d108498252704946ee0f2c33cfc59e13d6323efe`, clean Git status after the tests (`## HEAD (no branch)`). With Node `v24.11.0` / pnpm `9.12.3`, frozen install, build, standalone fast, repeat fast **10/10**, recovery, resource, feasibility, metadata/package validation and three GitHub E2E harness bundles' compile-only checks all returned **exit code 0**. The unrelated dirty transport fixture remained only in the primary workspace and was not part of this source. No live remote mutation, physical-device proof or exact-`master` official receipt was created.
+
 ### TDD plan
 
 Write RED regressions before fixes:

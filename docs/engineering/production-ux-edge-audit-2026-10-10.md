@@ -57,6 +57,10 @@ Code and regression fixes were committed and pushed to the audit branch as **`bc
 
 The follow-up fix commit **`bc6153061e3222d3c386f466e864df9fc171ed39`** was also checked out in a detached, clean Git worktree (`.tmp/release-audit-clean-20261010`), excluding the unrelated dirty test-helper edit in the main workspace. Git status before and after was `## HEAD (no branch)`, without modified tracked files. With Node `v24.11.0` and pnpm `9.12.3`, frozen-lockfile install, build, standalone fast test, 10 repeated fast test runs, recovery, resource, feasibility, metadata validation, package validation, and all three E2E bundles' compile-only gate **all exited 0**. This is clean audit-branch source evidence; not a passing credentialed live GitHub E2E or final master release qualification.
 
+### Post-performance-fix exact-source evidence
+
+The pushed performance fix commit **`d108498252704946ee0f2c33cfc59e13d6323efe`** was checked out in the detached isolated worktree `.tmp/release-audit-clean-20261010`; the worktree had **no modified or untracked source files** after the full test run. With Node `v24.11.0` and pnpm `9.12.3`, frozen-lockfile install, production build, standalone fast suite, 10/10 repeated fast runs, recovery, resource, feasibility, release metadata/package validation, and three E2E harness bundles' compile-only check all exited **0** on this exact Git tree. The pre-existing WIP transport test fixture in the primary workspace was excluded from these results. These are deterministic audit-SHA checks, **not** a credentialed live GitHub E2E run, production master qualification or real-device performance measurement.
+
 ## Verification contract
 
 This review uses `node scripts/run-tests.mjs --tier=fast --filter=<suite>`, `pnpm build`, full fast, repeat, recovery, resource, feasibility, package validation and compile-only E2E as **non-destructive** gates. Test counts and exact SHA must be recorded in `HANDOFF-NEXT-SESSION.md` after completion. Never use `release:local`, `qualify:local`, or credentialed real GitHub E2E as routine audit smoke tests.
