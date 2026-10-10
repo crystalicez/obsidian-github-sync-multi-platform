@@ -755,6 +755,11 @@ Audit method:
    - Shared pack objects receive an additional bounded proof: a changed pack must bind to the immutable tree leaf SHA and decrypt/validate all current pack entries before the publication is trusted. Single/chunked objects avoid eager body downloads and remain AEAD/hash-checked when read normally.
    - Focused sync-session coverage is green at **113/113** after the fix.
 
+109. **HIGH encrypted publication journal integrity — a forged current journal object could pass plugin-publication classification without authenticating its page bytes.**
+   - RED: `ce92998` changes the encrypted journal blob of an otherwise legitimate generation-two publication and proves that the stale device must not advance its trusted remote baseline or mutate its local vault.
+   - Fix: `ccc3ebc` verifies the current journal directory against the head journal ID, requires canonical page blob names and counts, binds each immutable journal blob SHA to the commit tree leaf, authenticates AES-GCM ciphertext with the repository/journal/page AAD, and rejects invalid or inconsistent page headers before declaring the tip a plugin publication.
+   - This is **publication-classification evidence**, not proof of semantic equivalence between every journal change descriptor and the full remote record set; keep residual publication integrity review separate.
+
 ### Audited surfaces with no new confirmed defect so far
 
 - secret migration/persistence: raw token/passphrase are removed before plugin data persistence and use Obsidian SecretStorage;
@@ -923,6 +928,13 @@ Verification status:
 - The 547/547 fast run was executed with one unrelated uncommitted test-only helper in `tests/v4/github-transport.test.ts`; it does not modify production source or add/change a test case. Do not describe that run as a pristine exact-Git-tree qualification until that concurrent WIP is committed or removed.
 - Focused regressions in the latest audit pass: settings-secrets **62/62**, sync-session **113/113**, remote-index **20/20**, recovery **50/50**, recovery-boundary **3/3**, recovery-topology-ordering **1/1**, publication-tree-budget **3/3**, vault-write **3/3**, github-bootstrap-ref-conflict **2/2**, github-empty-ref **3/3**, github-transport **43/43**, github-tree-mode-validation **1/1**, storage-history **4/4**, github-immutable-read-fallback **13/13**, and benchmark **3/3**; publication-race **1/1** and runtime-retry **1/1** also pass with the stricter non-recursive tree evidence model. The benchmark qualification also reproduced the prior wall-clock flake under full-suite contention before `0762038...`, with later full fast runs remaining green through the current **547/547** audit head. Prior history-service **13/13**, sync-coordinator **25/25**, sync-policy **2/2**, storage-codec **12/12**, and opaque-leakage **2/2** remain covered by the full fast gate.
 - Real GitHub E2E remains excluded from the default fast tier and was not run in this closure; inspect hosted checks for the exact pushed SHA separately before treating the branch as release-qualified.
+
+2026-10-10 release-readiness follow-up on audit source tip `ccc3ebc5e1cf2e707c1c9e885447421e6ffc580f` (before the documentation-only handoff update):
+- Connected `lnwjud` Windows workspace: `corepack pnpm install --frozen-lockfile`, `corepack pnpm build`, `corepack pnpm test:fast`, `corepack pnpm test:repeat` (all 10 rounds), `corepack pnpm test:recovery`, `corepack pnpm test:resource`, `corepack pnpm test:feasibility`, `corepack pnpm validate:metadata`, `corepack pnpm validate:package`, and `corepack pnpm test:github-e2e:compile` all completed with exit code 0. These were executed as separate non-destructive local gates, not official exact-SHA qualification.
+- The fast/repeat runs included an **uncommitted, pre-existing test-helper edit** in `tests/v4/github-transport.test.ts`; the current workspace is not a pristine exact-SHA checkout and this WIP was deliberately left untouched and unstaged.
+- The review/qualification matrix and maintainer decision boundaries are recorded in `docs/engineering/production-release-readiness-2026-10-10.md`.
+- Release blockers remain: independent review of draft PR #8, a clean frozen `master` SHA and hosted CI, disposable-repository live E2E with verified cleanup, physical platform smoke evidence per published support claims, and exact-SHA local qualification before any stable publication. No destructive live test, tag, release, or merge was performed.
+- Do not automatically promote audit-branch gates to release authority: after merge/version changes the target SHA must be requalified.
 
 ### TDD plan
 
@@ -1110,5 +1122,5 @@ For future work:
 
 ## Last updated
 
-- 2026-09-26 (Asia/Bangkok)
-- Reason: verify successful deletion of all safe cleanup branches and normalize the durable handoff to the final repository state.
+- 2026-10-10 (Asia/Bangkok)
+- Reason: record additional encrypted-journal publication hardening and the non-destructive audit-branch release-readiness verification; preserve prior 2026-09-26 landed `master` closeout as historical evidence, not current audit PR status.
