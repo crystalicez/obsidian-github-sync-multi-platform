@@ -88,6 +88,10 @@ export class ElementStub {
     this.mutate();
   }
 
+  addEventListener(event: string, listener: () => void) {
+    if (event === "click") this.onclick = listener;
+  }
+
   remove() {
     if (!this.parent) return;
     this.parent.children = this.parent.children.filter(child => child !== this);

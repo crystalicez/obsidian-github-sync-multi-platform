@@ -362,12 +362,21 @@ export default class FastSync extends Plugin {
 
     const span = this.statusBarItem.createEl("span", { text, cls });
     span.title = title;
+    span.setAttribute("role", "button");
+    span.setAttribute("tabindex", "0");
+    span.setAttribute("aria-label", "GitHub Sync: run manual sync");
     const runtime = this.v4Runtime;
-    span.onclick = () => {
+    const requestManualSync = () => {
       if (runtime && !runtime.isSyncing) {
         if (this.unloaded) return
         void runtime.manualSync()
       }
+    };
+    span.onclick = requestManualSync;
+    span.onkeydown = event => {
+      if (event.key !== "Enter" && event.key !== " ") return
+      event.preventDefault()
+      requestManualSync()
     };
     this.statusDisplaySignature = signature;
   }

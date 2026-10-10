@@ -126,30 +126,6 @@
     }
 }
 
-/* Image display optimisation for mobile */
-.markdown-rendered img, 
-.markdown-source-view.mod-cm6 .cm-content img {
-    display: block;
-    max-width: 100%;
-    height: auto;
-    margin: 10px auto;
-    border-radius: var(--radius-s);
-    box-shadow: var(--shadow-s);
-}
-
-/* If the image has an explicit width set (e.g. ![|100]), keep it as-is; otherwise default to a wider display */
-.markdown-rendered img:not([width]),
-.markdown-source-view.mod-cm6 .cm-content img:not([width]) {
-    min-width: 200px; /* reasonable minimum width */
-}
-
-@media (max-width: 480px) {
-    .markdown-rendered img:not([width]),
-    .markdown-source-view.mod-cm6 .cm-content img:not([width]) {
-        width: 100%; /* fill viewport width on mobile */
-    }
-}
-
 .github-sync-settings-header {
   border-bottom: 2px solid var(--interactive-accent);
   padding-bottom: 4px;
@@ -169,6 +145,8 @@
   display: flex;
   justify-content: space-between;
   align-items: center;
+  flex-wrap: wrap;
+  gap: var(--size-4-2);
   background-color: var(--background-secondary-alt);
   border: 1px solid var(--interactive-accent);
   border-left: 5px solid var(--interactive-accent);
@@ -180,14 +158,92 @@
     font-weight: bold;
     color: var(--text-normal);
   }
+
+  > p {
+    flex: 1 1 17rem;
+    min-width: 0;
+    margin: 0;
+    color: var(--text-muted);
+    font-size: var(--font-ui-small);
+  }
   
   .github-sync-settings-dirty-buttons {
     display: flex;
+    flex-wrap: wrap;
     gap: var(--size-4-2);
     button {
-      margin-left: 4px;
+      margin-left: 0;
     }
   }
+}
+
+@media (max-width: 480px) {
+  .github-sync-settings-dirty-banner {
+    flex-direction: column;
+    align-items: stretch;
+    > p { flex: initial; }
+    .github-sync-settings-dirty-buttons { justify-content: flex-end; }
+  }
+}
+
+.github-sync-force-confirm-slider {
+  position: relative;
+  height: 44px;
+  margin: 14px 0 10px;
+  overflow: hidden;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  background: var(--background-secondary);
+  cursor: grab;
+  user-select: none;
+  touch-action: none;
+}
+.github-sync-force-confirm-slider:active { cursor: grabbing; }
+.github-sync-force-confirm-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 0%;
+  background: var(--interactive-accent);
+  opacity: 0.28;
+  transition: width 120ms ease;
+}
+.github-sync-force-confirm-handle {
+  position: absolute;
+  top: 4px;
+  left: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: min(240px, calc(100% - 8px));
+  height: 34px;
+  padding: 0 12px;
+  border-radius: 5px;
+  background: var(--background-primary);
+  border: 1px solid var(--background-modifier-border);
+  box-shadow: var(--shadow-s);
+  font-size: var(--font-ui-small);
+  font-weight: var(--font-medium);
+  white-space: nowrap;
+  transition: transform 120ms ease;
+}
+.github-sync-force-confirm-slider.is-complete {
+  border-color: var(--interactive-accent);
+  cursor: default;
+}
+.github-sync-force-confirm-slider.is-complete .github-sync-force-confirm-handle {
+  color: var(--text-on-accent);
+  background: var(--interactive-accent);
+  border-color: var(--interactive-accent);
+}
+.github-sync-force-confirm-unlocked {
+  color: var(--text-accent);
+  font-size: var(--font-ui-small);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .obsidian-github-sync-multi-platform-ribbon-icon { animation: none; }
+  .github-sync-force-confirm-fill,
+  .github-sync-force-confirm-handle { transition: none; }
 }
 
 .github-sync-center {
@@ -207,6 +263,8 @@
 }
 
 .github-sync-center__header { justify-content: space-between; flex-wrap: wrap; }
+.github-sync-center__actions { flex-wrap: wrap; }
+.github-sync-center__change span:last-child { min-width: 0; overflow-wrap: anywhere; }
 .github-sync-center__layout { display: grid; grid-template-columns: minmax(220px, 0.8fr) minmax(300px, 1.2fr); gap: var(--size-4-3); height: calc(100% - 54px); }
 .github-sync-center__layout { flex: 1; min-height: 0; height: auto; }
 .github-sync-center__master,

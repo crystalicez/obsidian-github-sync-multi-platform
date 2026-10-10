@@ -576,17 +576,26 @@ export class SettingTab extends PluginSettingTab {
     const debugButton = debugDiv.createEl("button")
     debugButton.setText("Copy debug information")
     debugButton.onclick = async () => {
-      await window.navigator.clipboard.writeText(
-        JSON.stringify(
-          createDebugPayload(
-            this.plugin.settings as unknown as Record<string, unknown>,
-            this.plugin.manifest.version
-          ),
-          null,
-          4
+      if (debugButton.disabled) return
+      debugButton.disabled = true
+      try {
+        if (!window.navigator.clipboard?.writeText) throw new Error("Clipboard unavailable")
+        await window.navigator.clipboard.writeText(
+          JSON.stringify(
+            createDebugPayload(
+              this.plugin.settings as unknown as Record<string, unknown>,
+              this.plugin.manifest.version
+            ),
+            null,
+            4
+          )
         )
-      )
-      new Notice("Copy debug information to the clipboard, may contain sensitive information!")
+        new Notice("GitHub Sync: Debug information copied. Review it before sharing; it may contain sensitive metadata.")
+      } catch {
+        new Notice("GitHub Sync: Could not copy debug information. Check clipboard permissions.")
+      } finally {
+        debugButton.disabled = false
+      }
     }
 
     if (Platform.isDesktopApp) {

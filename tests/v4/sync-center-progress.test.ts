@@ -68,6 +68,60 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
+test("Sync Center mode controls expose which history view is active", async () => {
+  const source = new FakeProgressSource();
+  const plugin = createSyncCenterPluginFixture(source, () => undefined);
+  const view = new V4SyncCenterView(new WorkspaceLeaf(plugin.app), plugin as never);
+  await view.onOpen();
+  assert.equal(view.contentEl.findByText("Commits")?.attributes["aria-pressed"], "true");
+  assert.equal(view.contentEl.findByText("Current file")?.attributes["aria-pressed"], "false");
+  await (view as any).renderFileMode();
+  assert.equal(view.contentEl.findByText("Commits")?.attributes["aria-pressed"], "false");
+  assert.equal(view.contentEl.findByText("Current file")?.attributes["aria-pressed"], "true");
+  await view.onClose();
+});
+
+test("Sync Center pager does not retain a commit detail from a different page", async () => {
+  const source = new FakeProgressSource();
+  const commits = [
+    { sha: "first", message: "Page one", authoredAt: "day-one", source: "external" as const },
+    { sha: "second", message: "Page two", authoredAt: "day-two", source: "external" as const },
+  ];
+  const plugin = createSyncCenterPluginFixture(source, () => undefined) as any;
+  plugin.v4Runtime.createHistoryService = async () => ({
+    async listCommits(page: number) { return { items: [commits[page - 1]], hasMore: page < 2 }; },
+    async getCommitChanges() { return [{ kind: "modify", path: "note.md" }]; },
+    async getFileVersions() { return []; },
+  });
+  const view = new V4SyncCenterView(new WorkspaceLeaf(plugin.app), plugin);
+  await view.onOpen();
+  const state = view as any;
+  await state.renderCommitDetail(commits[0], view.contentEl.findByClass("github-sync-center__detail"));
+  assert.match(view.contentEl.findByClass("github-sync-center__detail")!.flattenText(), /1 changed file/u);
+
+  state.page = 2;
+  await state.renderCommitMode();
+  const detail = view.contentEl.findByClass("github-sync-center__detail");
+  assert.ok(detail);
+  assert.match(detail.flattenText(), /Select a commit/u);
+  assert.doesNotMatch(detail.flattenText(), /changed file/u);
+  assert.equal(state.selected, undefined);
+  await view.onClose();
+});
+
+test("Sync Center commit detail explains when a commit changes no files", async () => {
+  const source = new FakeProgressSource();
+  const plugin = createSyncCenterPluginFixture(source, () => undefined);
+  const view = new V4SyncCenterView(new WorkspaceLeaf(plugin.app), plugin as never);
+  await view.onOpen();
+  const commit = { sha: "empty", message: "No file changes", authoredAt: "", source: "external" };
+  await (view as any).renderCommitDetail(commit, view.contentEl.findByClass("github-sync-center__detail"));
+  const detail = view.contentEl.findByClass("github-sync-center__detail");
+  assert.ok(detail);
+  assert.match(detail.flattenText(), /No file changes|No changed files|Nothing to preview/iu);
+  await view.onClose();
+});
+
 test("Sync Center progress card updates in isolation and unsubscribes on close", async () => {
   const source = new FakeProgressSource();
   let historyLoadCount = 0;

@@ -791,6 +791,13 @@ Audit method:
    - GREEN: focused Settings Save **6/6** including overlapping clicks, quiescence/disk failures, hidden-tab rerender, and explanatory target warning.
    - Maintainer UX decision remains open: whether to disable Sync/Force entirely while settings are dirty; this patch warns without altering existing action semantics.
 
+116. **MEDIUM UI stylesheet drift and cross-vault styling risk.** `pnpm build` does not compile SCSS, so distributed `styles.css` omitted the Settings headings/dirty banner despite source SCSS rules; source SCSS also had global Markdown image selectors that could affect user notes if recompiled. RED/GREEN `tests/v4/ui-styles-contract.test.ts`; removed unscoped selectors, brought both source and distributed styles in line for Settings, responsive and reduced-motion behavior, and force confirmation. Longer-term pinned CSS build integration remains open.
+117. **MEDIUM Sync Center history selection / empty result.** Changing commit-history pages could show detail from a commit on a different page, and a commit without changes displayed only an unhelpful empty layout. RED/GREEN `tests/v4/sync-center-progress.test.ts` checks page-specific clearing and a clear no-changes message.
+118. **LOW Status Bar keyboard accessibility.** Pointer-clickable sync status had no button semantics, focus target or Enter/Space handler. RED/GREEN `tests/v4/main-progress.test.ts` covers keyboard + existing busy/unload constraints.
+119. **LOW Copy Debug notice/failure handling.** Clipboard write errors were unhandled; success text was ambiguous. RED/GREEN `tests/v4/settings-debug-copy.test.ts` exercises secure-redacted payload, awaited success, permission denial without false-success.
+120. **LOW responsive Sync Center and active tab semantics.** Current-file/Commits mode buttons lacked active-state exposure and UI header/long path may overflow narrow views. RED/GREEN mode and CSS tests; `aria-pressed`, wrapped actions/path in both SCSS and published CSS.
+- Comprehensive source-level **every UI surface** matrix in `docs/engineering/full-ui-surface-audit-2026-10-10.md`. **Important:** no real Obsidian visual/device acceptance is claimed; the connected Obsidian window belongs to an unrelated vault and was deliberately not manipulated. P1 unresolved: keyboard-accessible, equally deliberate Force-confirmation design.
+
 ### Audited surfaces with no new confirmed defect so far
 
 - secret migration/persistence: raw token/passphrase are removed before plugin data persistence and use Obsidian SecretStorage;
@@ -999,6 +1006,15 @@ Verification status:
 - Source fixes/tests/release-readiness audit from this phase committed and pushed as `d8d7d83e21c22ecbc2111887e4b25ca8aa406d8a`. **Clean exact-source** detached worktree at that SHA was clean before/after checks; Node `v24.11.0`, pnpm `9.12.3`: frozen install, build, fast, repeat fast **10/10**, recovery, resource, feasibility, metadata/package validation, and E2E compile-only (three bundles) all exited 0. Unrelated dirty transport helper in primary workspace was excluded.
 - **Deferred accessibility/product decision:** `FastSync.showForceConfirm()` uses a pointer-only div slider without an evident keyboard unlock, focus target or slider ARIA semantics. A deliberate keyboard-accessible path must be designed and verified in real Obsidian without weakening destructive-operation confirmation. Also decide warning-only versus blocking Sync/Force while settings are unsaved. Neither interaction was changed in this patch.
 - Live destructive GitHub E2E, physical platform smoke, and stable release qualification remain unexecuted.
+
+### 2026-10-10 comprehensive UI source audit verification
+
+- Enumerated **all plugin UI surfaces** across Settings General/Connection/Encryption/Manual/Automation/Support; Sync Center Commit/Current File/Detail/Preview/Progress/empty/errors; Ribbon; Status Bar; Command Palette; Force/Conflict/threshold dialogs; Notices; responsive CSS and accessibility. Detailed pass/evidence/remaining-visual matrix: `docs/engineering/full-ui-surface-audit-2026-10-10.md`.
+- Confirmed RED/GREEN findings **116–120** and fixes. Focused UI tests: stylesheet contract **4/4**, Sync Center **11/11**, Status Bar **3/3**, Copy Debug **2/2**.
+- Connected `lnwjud` Windows engineering workspace with Node `v24.11.0` / pnpm `9.12.3`: `pnpm build`, `pnpm test:fast` **571/571**, `pnpm test:repeat` **10/10**, `pnpm test:recovery`, `pnpm test:resource`, `pnpm test:feasibility`, `pnpm validate:metadata`, `pnpm validate:package` and `pnpm test:github-e2e:compile` (three bundles) each exited 0.
+- During the first repeat run a prior source-text regression required the existing status-bar `if (runtime && !runtime.isSyncing)` guard structure; that original guard was preserved inside the shared keyboard/pointer handler and full fast + repeat were rerun GREEN. This is a test-shape compatibility adjustment with no weakened runtime semantics.
+- **Not pristine yet:** primary workspace still contains unrelated uncommitted `tests/v4/github-transport.test.ts` test-helper changes; these gates are pre-commit, not clean exact-source qualification. After pushing fix commit, test the exact code SHA from a separate detached clean checkout and record results.
+- Real native Obsidian visual acceptance was **not** performed, because the only existing Obsidian window is associated with a separate user vault; we did not open, edit or capture unrelated private vault screens. Physical desktop/mobile, keyboard modal accessibility and hosted CI evidence remain required before release.
 
 ### TDD plan
 
