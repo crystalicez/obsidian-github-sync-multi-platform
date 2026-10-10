@@ -47,15 +47,29 @@ Code and regression fixes were committed and pushed to the audit branch as **`bc
 | Priority | Concrete trace / scenario | Proposed evidence or decision |
 | --- | --- | --- |
 | P2 performance qualification | The quadratic repeated progress count was removed for debounce queues above 128 events (PERF-113), while exact coalescing remains at flush. | Measure 1k/10k/50k real event bursts, CPU time, resident memory, and final sync equivalence before treating the performance ceiling as validated on devices |
-| P1 UX/target safety | Settings tab's manual/Force operation buttons use **currently saved** credentials/scope even if visible settings fields are dirty and unsaved. The force confirmation names the saved target, but users may assume the edited target is already active. | Decide whether to disable these buttons while settings are dirty or display a prominent “Save/discard first” notice; verify exact target shown before any operation |
+| P1 UX/target safety | Settings manual/Force actions continue to use **currently saved** credentials/scope even when fields are dirty. The dirty banner now explicitly warns of this, and Force confirmation names the saved target. | Maintainer decision: retain warning-only workflow or block these actions until Save/Discard; physical usability/target-review test still needed |
 | P1 security/resource | General `createGitTree` semantic equivalence, buffered `requestUrl`, and remote metadata pre-parse ceilings remain prior documented residual risks. | Security sign-off or separately designed authenticated bounded proof / streaming transport; don't equate the new preview size gate with a global memory bound |
 | P2 history performance | `V4HistoryService.previewChange()` currently requests a **recursive** Git tree to locate a historical blob; large repositories may trigger expensive reads or safe truncation failures. | Benchmark large-tree history navigation; redesign as authenticated bounded path traversal only if measurements support it |
-| P2 UI feedback/privacy | `src/setting.tsx` copies debug payload before showing a sensitive-data warning; clipboard paste shows a 2-second message via an untracked timeout that can outlive a rerender/hide. Debug payload does redact sensitive keys. | Decide whether to ask for confirmation *before* copying debug diagnostics; add lifecycle-safe clipboard feedback when revisiting settings UI |
+| P2 UI feedback/privacy | Debug payload copies before the warning; sensitive-key redaction exists. Clipboard-paste feedback is now lifecycle-tracked with a current-view status region and cancellation on hide. | Maintainer decision: require explicit confirmation before copying diagnostic data; separately test real screen-reader behavior |
 | P1 platform readiness | Real Obsidian rendering, keyboard navigation, screen-reader labels, narrow Android layouts, offline/reconnect, large physical file round trip and recovery are outside the stub-based gate. | Manual platform smoke matrix and device evidence before public support claims |
 
 ## Exact-source deterministic verification
 
 The follow-up fix commit **`bc6153061e3222d3c386f466e864df9fc171ed39`** was also checked out in a detached, clean Git worktree (`.tmp/release-audit-clean-20261010`), excluding the unrelated dirty test-helper edit in the main workspace. Git status before and after was `## HEAD (no branch)`, without modified tracked files. With Node `v24.11.0` and pnpm `9.12.3`, frozen-lockfile install, build, standalone fast test, 10 repeated fast test runs, recovery, resource, feasibility, metadata validation, package validation, and all three E2E bundles' compile-only gate **all exited 0**. This is clean audit-branch source evidence; not a passing credentialed live GitHub E2E or final master release qualification.
+
+### UX-114 — MEDIUM: Clipboard paste completion can overwrite a newer settings form or accept non-string credentials
+
+- **RED proof:** `tests/v4/settings-clipboard-lifecycle.test.ts` reproduced (1) an older clipboard request overwriting a reopened form after `hide()`, (2) an earlier request overwriting the more recent successful paste, and (3) JSON containing numeric owner/object token/array branch mutating the typed settings draft.
+- **Fix:** a monotonically increasing paste-generation token, identity checks against the current draft, and an editable-field snapshot prevent stale results from applying after navigation, competing paste requests, or user edits during clipboard permission/read. Validate the four clipboard settings as nonempty strings before applying them together. Clipboard tips follow the current rendered view and their timers are cleaned on hide; the status area is announced politely for accessibility.
+- **GREEN:** all four focused cases including a human editing fields during an in-flight paste. Secret values never appear in tip text.
+- **Scope:** this closes UI draft corruption; final persistence still validates owner/repo/branch syntax and credentials. It does not attempt to infer whether clipboard contents were meant for the target repository.
+
+### UX-115 — LOW: Late Save completion could reopen Settings after the tab was hidden
+
+- **RED proof:** a delayed `saveSettings()` promise resolved after `SettingTab.hide()` and the old callback called `display()`, repopulating a tab whose draft had been discarded.
+- **Fix:** UI view-generation guard prevents obsolete Save completions from re-rendering after hide; pending-save state still clears so reopening works. The dirty banner also states that manual and Force operations use the **last saved repository/branch/scope** while edits are pending, without silently changing what target is used.
+- **GREEN:** focused Settings Save suite validates this lifecycle behavior, pending double-click guards, failed-save retry, and the target warning.
+- **Deferred product question:** whether actions should be disabled entirely until Save/Discard remains a maintainer UX policy choice. No Force operations were invoked in these tests.
 
 ### Post-performance-fix exact-source evidence
 

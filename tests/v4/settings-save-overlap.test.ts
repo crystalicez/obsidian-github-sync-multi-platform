@@ -134,6 +134,41 @@ test("settings UI prevents double-click save while the first save is pending", a
   assert.equal(save.disabled, false, "the control must become reusable after success");
 });
 
+test("dirty Settings banner identifies which credentials and scope sync actions will use", () => {
+  const plugin = { clipboardReadTip: "", settings: { ...DEFAULT_SETTINGS, githubOwner: "saved-owner" } };
+  const tab = new SettingTab({} as never, plugin as never);
+  tab.tempSettings = { ...DEFAULT_SETTINGS, githubOwner: "new-owner" };
+  tab.bannerEl = new ElementStub() as never;
+  tab.updateDirtyState();
+  assert.match((tab.bannerEl as unknown as ElementStub).flattenText(), /Sync.*Force.*saved|saved.*Sync.*Force/iu);
+});
+
+test("closing Settings during a pending save must not resurrect the hidden view", async () => {
+  const gate = deferred();
+  const plugin = {
+    clipboardReadTip: "",
+    settings: { ...DEFAULT_SETTINGS },
+    async saveSettings() { await gate.promise; },
+    updateStatusBar() {},
+  };
+  const tab = new SettingTab({} as never, plugin as never);
+  tab.tempSettings = { ...DEFAULT_SETTINGS, githubRepo: "new-repo" };
+  tab.bannerEl = new ElementStub() as never;
+  let rerenders = 0;
+  tab.display = () => { rerenders++; };
+  tab.updateDirtyState();
+  const save = (tab.bannerEl as unknown as ElementStub).findByText("Save changes");
+  assert.ok(save);
+  save.onclick?.();
+  tab.hide();
+  gate.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(rerenders, 0, "late async Save must not rerender a hidden Settings tab");
+  assert.equal(tab.tempSettings, null, "hidden settings must remain released");
+});
+
 test("quiescence failure also releases the plugin settings save guard", async () => {
   const v = fixture();
   v.failQuiesce();

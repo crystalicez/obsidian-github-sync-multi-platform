@@ -780,6 +780,17 @@ Audit method:
    - Fix: O(1) `V4SyncCoordinator.pendingRawCount`; UI progress computes the expensive exact coalesced count only when raw queue length is at most 128, and thereafter shows an unknown total until the pending events are drained. Final coalesced sync requests and event causality stay unchanged.
    - GREEN: focused settings-secrets **63/63** including 300-event, 128-read, 300-queued-record assertion. Real device CPU/RAM burst measurements remain pending.
 
+114. **MEDIUM Settings Clipboard lifecycle — stale paste completion could overwrite a reopened tab or newer import, and malformed clipboard JSON could inject non-string GitHub configuration values.**
+   - RED `tests/v4/settings-clipboard-lifecycle.test.ts`: previous request overwrites reopened settings; older request wins out-of-order; numeric owner/object token/array branch are accepted into typed draft.
+   - Fix: per-request paste generation, hide invalidation, draft identity and editable-field snapshot guards, nonempty string type validation before atomic application, live-region feedback and lifecycle-managed timer.
+   - GREEN: focused Clipboard suite **4/4**, including user editing repo coordinates while clipboard permissions/read are pending. This is settings UI hardening; persistence still performs full coordinate/branch validation.
+
+115. **LOW Settings Save lifecycle and dirty-target warning — late completed Save could rerender a hidden tab.**
+   - RED `tests/v4/settings-save-overlap.test.ts`: close settings during delayed save; old completion calls `display()` despite `hide()`.
+   - Fix: view epoch prevents stale Save-driven rerender after hide, preserves correct Save state on later revisit; dirty banner explicitly says Sync/Force actions still target the last saved repository/branch/scope.
+   - GREEN: focused Settings Save **6/6** including overlapping clicks, quiescence/disk failures, hidden-tab rerender, and explanatory target warning.
+   - Maintainer UX decision remains open: whether to disable Sync/Force entirely while settings are dirty; this patch warns without altering existing action semantics.
+
 ### Audited surfaces with no new confirmed defect so far
 
 - secret migration/persistence: raw token/passphrase are removed before plugin data persistence and use Obsidian SecretStorage;
@@ -977,6 +988,13 @@ Verification status:
 - These pre-commit checks ran in the audit workspace alongside the **unrelated and unstaged** `tests/v4/github-transport.test.ts` helper WIP. They are not clean exact-SHA qualification and are not a substitute for live E2E or physical device performance measurements; re-run a clean detached-SHA gate before promoting evidence.
 
 - Post-fix **clean exact-audit-SHA** verification: detached worktree `.tmp/release-audit-clean-20261010` checked out full `d108498252704946ee0f2c33cfc59e13d6323efe`, clean Git status after the tests (`## HEAD (no branch)`). With Node `v24.11.0` / pnpm `9.12.3`, frozen install, build, standalone fast, repeat fast **10/10**, recovery, resource, feasibility, metadata/package validation and three GitHub E2E harness bundles' compile-only checks all returned **exit code 0**. The unrelated dirty transport fixture remained only in the primary workspace and was not part of this source. No live remote mutation, physical-device proof or exact-`master` official receipt was created.
+
+### 2026-10-10 Settings clipboard and hidden-view race follow-up
+
+- Newly proved and fixed findings **114–115**; source and focused RED/GREEN evidence are in `docs/engineering/production-ux-edge-audit-2026-10-10.md`.
+- Pre-commit `lnwjud` Windows: `pnpm build`, `pnpm test:fast`, `pnpm test:repeat` **10/10**, Settings Save **6/6**, Clipboard Lifecycle **4/4** all completed with exit code 0.
+- The main audit workspace retains the **unrelated pre-existing** unstaged `tests/v4/github-transport.test.ts` helper edit. Therefore these pre-commit test results are not yet exact-source clean checkout proof; separately validate the pushed fix SHA in a detached worktree.
+- No real-GitHub credentials, force operations, destructive E2E, physical device tests, PR merge or production release were used.
 
 ### TDD plan
 
