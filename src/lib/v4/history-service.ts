@@ -89,18 +89,24 @@ export class V4HistoryService {
     const tree = await this.input.github.getTreeAt(versionCommit.treeSha, true)
     this.assertCurrent()
     if (tree.truncated) throw new Error("Historical Git tree is truncated; preview is unsafe.")
-    const shas = new Map(tree.tree.filter(node => node.type === "blob").map(node => [node.path, node.sha]))
+    const blobs = new Map(tree.tree.filter(node => node.type === "blob").map(node => [node.path, node]))
     let bytes: Uint8Array
     if (change.source === "external") {
-      const sha = shas.get(descriptor.remotePath)
-      if (!sha) throw new Error(`Version blob is missing: ${descriptor.remotePath}`)
-      bytes = await this.input.github.getBlob(sha)
+      const node = blobs.get(descriptor.remotePath)
+      if (!node) throw new Error(`Version blob is missing: ${descriptor.remotePath}`)
+      if (!Number.isSafeInteger(node.size) || node.size === undefined || node.size < 0) {
+        throw new Error("Historical external Git blob size is unavailable; preview is unsafe.")
+      }
+      if (node.size > V4_HISTORY_PREVIEW_MAX_BYTES) {
+        throw new Error(`V4 history preview exceeds the ${V4_HISTORY_PREVIEW_MAX_BYTES}-byte preview limit.`)
+      }
+      bytes = await this.input.github.getBlob(node.sha)
       this.assertCurrent()
     } else {
       const record = this.recordFromDescriptor(change, descriptor)
       const readBlob = async (path: string) => {
         this.assertCurrent()
-        const sha = shas.get(path)
+        const sha = blobs.get(path)?.sha
         if (!sha) throw new Error(`Version blob is missing: ${path}`)
         const blob = await this.input.github.getBlob(sha)
         this.assertCurrent()

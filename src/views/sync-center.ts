@@ -389,7 +389,11 @@ export class V4SyncCenterView extends ItemView {
   private releaseObjectUrl(): void { if (this.objectUrl) URL.revokeObjectURL(this.objectUrl); this.objectUrl = undefined }
   private renderError(container: HTMLElement, error: unknown): void {
     container.empty()
-    const message = (error as Error).message
+    const message = error instanceof Error && error.message.trim()
+      ? error.message
+      : typeof error === "string" && error.trim()
+        ? error
+        : "Unable to load history. An unexpected error occurred."
     container.createEl("p", { text: message, cls: "github-sync-center__error" })
     new Notice(`GitHub Sync Center: ${message}`)
   }

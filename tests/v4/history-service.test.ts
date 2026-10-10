@@ -436,6 +436,33 @@ test("v4 history service rejects completion from an obsolete settings generation
 });
 
 
+test("history preview refuses external Git blobs with missing or over-limit tree sizes before fetching content", async () => {
+  let blobReads = 0;
+  let treeSize: number | undefined;
+  const github = {
+    async listCommits() { return []; },
+    async getFileBytes() { return null; },
+    async getGitCommit(sha: string) { return { sha, treeSha: "tree-current", parentShas: [] }; },
+    async getTreeAt() {
+      return { sha: "tree-current", url: "", truncated: false, tree: [
+        { path: "video.png", mode: "100644", type: "blob" as const, sha: "large-blob", size: treeSize, url: "" },
+      ] };
+    },
+    async getBlob() { blobReads++; return enc("content"); },
+  };
+  const service = new V4HistoryService({ github, config: { formatVersion: 4, mode: "plaintext", repoId: "o/r#main" } });
+  const commit = { sha: "external", message: "external edit", authorName: "", authoredAt: "", parentShas: [], source: "external" as const };
+  const change = { source: "external" as const, fileId: "video.png", kind: "create" as const, path: "video.png",
+    after: { remotePath: "video.png", sha: "large-blob", size: 0 } };
+
+  await assert.rejects(service.previewChange(commit, change), /size|limit|unsafe|unavailable/iu);
+  assert.equal(blobReads, 0, "an unmeasured blob must never be eagerly downloaded for preview");
+
+  treeSize = 6 * 1024 * 1024;
+  await assert.rejects(service.previewChange(commit, change), /size|limit|unsafe|exceeds/iu);
+  assert.equal(blobReads, 0, "a known-large tree blob must be rejected before GitHub transport allocation");
+});
+
 test("v4 history previews external Git changes as raw blobs instead of requiring V4 descriptors", async () => {
   let blobReads = 0;
   const github = {

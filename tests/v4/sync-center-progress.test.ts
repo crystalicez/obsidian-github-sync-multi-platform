@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { WorkspaceLeaf } from "obsidian";
+import { Notice, WorkspaceLeaf } from "obsidian";
 import { createIdleV4Progress, V4ProgressStore, type V4SyncProgressSnapshot } from "../../src/lib/v4/progress";
 import { V4SyncCenterView } from "../../src/views/sync-center";
 
@@ -258,6 +258,22 @@ test("stale image preview completion cannot revoke or replace a reopened view UR
   }
 });
 
+
+test("Sync Center renders a useful error when an async provider throws null or a string", async () => {
+  for (const thrown of [null, "network unavailable"]) {
+    const source = new FakeProgressSource();
+    const plugin = createSyncCenterPluginFixture(source, () => undefined) as any;
+    plugin.v4Runtime.createHistoryService = async () => { throw thrown; };
+    const view = new V4SyncCenterView(new WorkspaceLeaf(plugin.app), plugin);
+    Notice.messages.length = 0;
+    await view.onOpen();
+    const visible = view.contentEl.flattenText();
+    assert.match(visible, thrown === null ? /Unable to load|unexpected error|failed/iu : /network unavailable/iu);
+    assert.equal(Notice.messages.length, 1);
+    assert.doesNotMatch(Notice.messages[0], /undefined|null/iu);
+    await view.onClose();
+  }
+});
 
 test("Sync Center recreates its history service when the runtime settings generation changes", async () => {
   const source = new FakeProgressSource();

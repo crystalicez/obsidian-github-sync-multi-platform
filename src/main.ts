@@ -32,6 +32,7 @@ export default class FastSync extends Plugin {
   secretsMigrated: boolean = false
   private pendingMigratedSecretIds: string[] = []
   private unloaded = false
+  private settingsSaveInProgress = false
   private statusDisplaySignature?: string
 
   enableWatch() {
@@ -262,6 +263,7 @@ export default class FastSync extends Plugin {
   async saveSettings(nextSettings: PluginSettings = this.settings) {
     assertPluginSettingsRuntimeSafe(nextSettings)
     compileV4IgnorePathRegex(nextSettings.ignorePathRegex)
+    if (this.settingsSaveInProgress) throw new Error("GitHub Sync: Settings save already in progress.")
     const previousSettings = this.settings
     const preparedSettings = { ...nextSettings }
 
@@ -282,7 +284,13 @@ export default class FastSync extends Plugin {
     ]
     const supersededSecretIds = supersededV4SecretIds(previousSettings, preparedSettings)
 
-    await this.v4Runtime?.quiesceForSettingsChange()
+    this.settingsSaveInProgress = true
+    try {
+      await this.v4Runtime?.quiesceForSettingsChange()
+    } catch (error) {
+      this.settingsSaveInProgress = false
+      throw error
+    }
     try {
       try {
         storeV4Secrets(preparedSettings, this.app.secretStorage, {
@@ -313,7 +321,11 @@ export default class FastSync extends Plugin {
       this.registerScheduledSync()
       this.updateRibbonIcon(!!(this.settings.githubToken && this.settings.githubOwner && this.settings.githubRepo))
     } finally {
-      this.v4Runtime?.finishSettingsChange()
+      try {
+        this.v4Runtime?.finishSettingsChange()
+      } finally {
+        this.settingsSaveInProgress = false
+      }
     }
   }
 
