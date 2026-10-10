@@ -3603,15 +3603,16 @@ test("v4 encrypted publication rejects tampered content objects when metadata sh
   const forgedCommit = await github.createGitCommit(`obsidian-sync-v4:${forgedJournalId}`, forgedTree, [previousHead]);
   await github.updateGitRef(forgedCommit, previousHead);
 
+  vault.files.set("secret.md", { bytes: enc("local-diverged"), mtime: 10_000 });
   vault.operations.length = 0;
   await assert.rejects(
-    () => new V4SyncSession({ github, vault, index, config: configEncrypted, keyring, conflictPolicy: "copy", abortChangePercent: 0 })
+    () => new V4SyncSession({ github, vault, index, config: configEncrypted, keyring, conflictPolicy: "newer", abortChangePercent: 0 })
       .sync({ operation: "normal", allowThresholdOverride: false, changes: [] }),
-    /publication|object|cipher|blob|verified|internal.*V4/iu,
+    /publication|object|cipher|blob|verified|internal.*V4|external GitHub changes.*encrypted V4 branch/iu,
   );
 
   assert.equal(index.remoteCommitSha, previousHead, "tampered encrypted object must not advance the trusted local baseline");
-  assert.equal(dec(vault.files.get("secret.md")!.bytes), "base");
+  assert.equal(dec(vault.files.get("secret.md")!.bytes), "local-diverged");
   assert.deepEqual(vault.operations.filter(operation => /^(?:write|trash|delete|commit-stage):/u.test(operation)), []);
 });
 
