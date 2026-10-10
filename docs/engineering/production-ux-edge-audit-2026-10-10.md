@@ -12,7 +12,7 @@ Code and regression fixes were committed and pushed to the audit branch as **`bc
 | History preview / memory | Sync Center preview action → `V4HistoryService.previewChange()` → Git tree metadata → `GitHubClient.getBlob()` / codec read → display | RED/GREEN test proves early rejection for missing or known-over-limit external blob size; not a streaming-response memory guarantee |
 | Sync Center error UX | Commit/history load → async provider rejection → `renderError()` → visible error + Notice | RED/GREEN test covers thrown `null` and nonempty string, in addition to normal Error instances |
 | Progress UI / interaction | `V4ProgressStore` → observable snapshots → Sync Center live region, phase/counters/timings | Existing lifecycle/render tests and reviewed source; no physical Obsidian accessibility session |
-| Realtime events / performance | Obsidian vault events → `V4PluginRuntime.enqueue()` → coordinator pending queue/debounce → progress count | Static risk analysis; large live vault-event burst benchmark not yet measured |
+| Realtime events / performance | Obsidian vault events → `V4PluginRuntime.enqueue()` → coordinator pending queue/debounce → progress count | RED/GREEN deterministic 300-event test proves bounded repeat coalescing; real 10k+ event-burst resource measurements remain outstanding |
 | GitHub remote/crypto/recovery | Remote loader → sync-session authenticated publication → WAL/local IO/recovery | Existing deep hardening plus full tests; no destructive live GitHub run in this review |
 
 ## Confirmed issues and applied changes
@@ -36,11 +36,17 @@ Code and regression fixes were committed and pushed to the audit branch as **`bc
 - **Fix:** display a nonempty `Error.message` or nonempty string, otherwise a safe generic message. Keep the user-visible error panel and Notice.
 - **Regression:** null/string rejection renders one understandable error and does not crash the view.
 
+### PERF-113 — MEDIUM: Repeated debounce progress counting was quadratic for large vault event bursts
+
+- **Reproduction:** A new real-runtime adversarial regression in `tests/v4/settings-secrets.test.ts` queues 300 distinct file modifications during the 5-second debounce and instruments `V4SyncCoordinator.pendingCount` so more than 128 full coalesces fail the test. The previous implementation requested the exact coalesced total for every event; RED failure proves work grew with every added queue item.
+- **Fix:** `V4SyncCoordinator.pendingRawCount` exposes the raw queue length in O(1). `V4PluginRuntime.beginWaitingRun()` computes the exact coalesced progress count only for queues up to 128 events; larger bursts display an unknown progress total until flush. The actual queued events and final exact coalescing algorithm are unchanged.
+- **Verification:** the new 300-event test is GREEN with exactly 128 expensive progress-count reads and 300 correct final coalesced entries. The Progress Store intentionally throttles sensitive progress display; the test checks the working state that the next throttle publication will expose. Physical 10k+ vault-event CPU/RAM measurement remains an independent performance qualification task.
+
 ## Follow-up risks and UX decisions (not confirmed defects in this pass)
 
 | Priority | Concrete trace / scenario | Proposed evidence or decision |
 | --- | --- | --- |
-| P1 performance | `V4PluginRuntime.markWaiting()` calls `beginWaitingRun()` on each idle local event; it reads `V4SyncCoordinator.pendingCount`, which re-coalesces all queued events each time. A burst of many distinct files could produce quadratic queue-processing work before the 5-second debounce expires. | Instrument 1k/10k/50k event bursts with CPU time and exact coalesced count; consider throttled/progress-only aggregation with a final exact count, without compromising sync causality |
+| P2 performance qualification | The quadratic repeated progress count was removed for debounce queues above 128 events (PERF-113), while exact coalescing remains at flush. | Measure 1k/10k/50k real event bursts, CPU time, resident memory, and final sync equivalence before treating the performance ceiling as validated on devices |
 | P1 UX/target safety | Settings tab's manual/Force operation buttons use **currently saved** credentials/scope even if visible settings fields are dirty and unsaved. The force confirmation names the saved target, but users may assume the edited target is already active. | Decide whether to disable these buttons while settings are dirty or display a prominent “Save/discard first” notice; verify exact target shown before any operation |
 | P1 security/resource | General `createGitTree` semantic equivalence, buffered `requestUrl`, and remote metadata pre-parse ceilings remain prior documented residual risks. | Security sign-off or separately designed authenticated bounded proof / streaming transport; don't equate the new preview size gate with a global memory bound |
 | P2 history performance | `V4HistoryService.previewChange()` currently requests a **recursive** Git tree to locate a historical blob; large repositories may trigger expensive reads or safe truncation failures. | Benchmark large-tree history navigation; redesign as authenticated bounded path traversal only if measurements support it |

@@ -803,6 +803,32 @@ test("v4 runtime reveals a pending debounce after the active sync completes", as
   fixture.runtime.dispose();
 });
 
+test("burst progress does not re-coalesce an unbounded pending queue on every vault event", () => {
+  const fixture = plaintextRuntimeFixture();
+  const coordinator = (fixture.runtime as unknown as { coordinator: object }).coordinator;
+  const original = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(coordinator), "pendingCount");
+  assert.ok(original?.get);
+  let pendingCountReads = 0;
+  Object.defineProperty(coordinator, "pendingCount", {
+    get() {
+      pendingCountReads++;
+      if (pendingCountReads > 128) throw new Error("Repeated full-queue progress coalescing exceeded the budget.");
+      return original.get!.call(coordinator);
+    },
+  });
+
+  try {
+    for (let index = 0; index < 300; index++) fixture.runtime.enqueueModify(`burst-${index}.md`, index + 1);
+    assert.equal(pendingCountReads, 128, "exact counts are useful only during a small debounce burst");
+    assert.equal(fixture.runtime.progressSnapshot.lifecycle, "waiting");
+    const workingProgress = (fixture.runtime as unknown as { progressStore: { state: V4SyncProgressSnapshot } }).progressStore.state;
+    assert.equal(workingProgress.push.total, undefined, "large bursts should report unknown total rather than repeatedly re-count once throttling publishes");
+    assert.equal(original.get.call(coordinator), 300, "sync's true coalesced queue count remains exact");
+  } finally {
+    fixture.runtime.dispose();
+  }
+});
+
 test("v4 runtime starts one waiting ledger per debounce cycle and disposes subscriptions safely", () => {
   const fixture = plaintextRuntimeFixture();
   const seen: V4SyncProgressSnapshot[] = [];

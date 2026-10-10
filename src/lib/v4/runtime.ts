@@ -349,7 +349,11 @@ export class V4PluginRuntime {
   }
 
   private beginWaitingRun(): void {
-    const push = { completed: 0, total: this.coordinator.pendingCount }
+    // Coalescing a growing debounce queue after every file event is quadratic.
+    // Once the burst exceeds this UI-only threshold, keep the exact queue
+    // untouched for the eventual flush and display an unknown progress total.
+    const total = this.coordinator.pendingRawCount <= 128 ? this.coordinator.pendingCount : undefined
+    const push = { completed: 0, total }
     if (!this.debounceRunActive) {
       this.debounceRunActive = true
       this.progressStore.beginRun({

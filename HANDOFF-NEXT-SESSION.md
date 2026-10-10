@@ -775,6 +775,11 @@ Audit method:
    - RED: Sync Center tests exercise `null` and string rejection from the async history provider. Prior `(error as Error).message` could throw on null or display undefined.
    - Fix: nonempty Error/string messages or a generic fallback, with one visible Notice and stable error panel.
 
+113. **MEDIUM performance — progress rendering repeatedly re-coalesced the entire pending debounce queue on each vault event (quadratic burst cost).**
+   - RED: new `tests/v4/settings-secrets.test.ts` regression submits 300 distinct modifications, instruments the `V4SyncCoordinator.pendingCount` read budget and confirms repeated full queue coalescing would exceed 128 reads.
+   - Fix: O(1) `V4SyncCoordinator.pendingRawCount`; UI progress computes the expensive exact coalesced count only when raw queue length is at most 128, and thereafter shows an unknown total until the pending events are drained. Final coalesced sync requests and event causality stay unchanged.
+   - GREEN: focused settings-secrets **63/63** including 300-event, 128-read, 300-queued-record assertion. Real device CPU/RAM burst measurements remain pending.
+
 ### Audited surfaces with no new confirmed defect so far
 
 - secret migration/persistence: raw token/passphrase are removed before plugin data persistence and use Obsidian SecretStorage;
@@ -964,6 +969,12 @@ Verification status:
 - This qualification runs in the existing audit workspace containing the **unrelated, pre-existing, unstaged** `tests/v4/github-transport.test.ts` helper edit. Do **not** call it a pristine exact-Git-tree run. The previous separate clean detached audit-SHA evidence applies to its own earlier source, not to these new fixes.
 - Additional **pristine exact-source** verification: detached worktree `.tmp/release-audit-clean-20261010` at full SHA `bc6153061e3222d3c386f466e864df9fc171ed39` (pushed fix commit) was clean both before and after every gate. Exact Node `v24.11.0` / pnpm `9.12.3`: `corepack pnpm install --frozen-lockfile`, `pnpm build`, `pnpm test:fast`, `pnpm test:repeat` (10/10), `pnpm test:recovery`, `pnpm test:resource`, `pnpm test:feasibility`, `pnpm validate:metadata`, `pnpm validate:package`, and `pnpm test:github-e2e:compile` all exited 0. This clean-run evidence **supersedes the WIP caveat for that exact code SHA**, but is not an official `master`/live qualification receipt.
 - No destructive live GitHub E2E, physical-device qualification, stable release/tag publication, or PR merge was performed; those release gates remain open. Ordinary audit branch commits/pushes are tracked separately.
+
+### 2026-10-10 event-burst performance follow-up
+
+- Additional confirmed finding **113** is fixed in `src/lib/v4/sync-coordinator.ts` and `src/lib/v4/runtime.ts`; a RED/GREEN 300-event regression in `tests/v4/settings-secrets.test.ts` proves progress coalescing is not requested more than 128 times per debounce burst and that all 300 events remain present for final exact coalescing.
+- Connected `lnwjud` Windows verification after this change: `pnpm build`, focused settings-secrets **63/63**, `pnpm test:repeat` **10/10**, `pnpm test:recovery`, `pnpm test:resource`, `pnpm test:feasibility`, `pnpm validate:metadata`, `pnpm validate:package`, and `pnpm test:github-e2e:compile` all returned exit code 0.
+- These pre-commit checks ran in the audit workspace alongside the **unrelated and unstaged** `tests/v4/github-transport.test.ts` helper WIP. They are not clean exact-SHA qualification and are not a substitute for live E2E or physical device performance measurements; re-run a clean detached-SHA gate before promoting evidence.
 
 ### TDD plan
 

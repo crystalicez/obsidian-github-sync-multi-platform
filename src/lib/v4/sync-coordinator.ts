@@ -146,6 +146,8 @@ export class V4SyncCoordinator {
 
   get isSyncing(): boolean { return this.active !== undefined; }
   get pendingCount(): number { return this.disposed ? 0 : coalesceV4Changes(this.pending).length; }
+  /** O(1) raw event count for UI progress; exact coalescing occurs at flush. */
+  get pendingRawCount(): number { return this.disposed ? 0 : this.pending.length; }
 
   cancelActive(reason: unknown = new V4CancelledError("V4 active sync cancelled.")): void {
     this.activeController?.abort(reason)
