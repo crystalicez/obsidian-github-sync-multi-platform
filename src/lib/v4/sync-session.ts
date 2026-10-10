@@ -1,10 +1,10 @@
-import { randomBytes, sha256Hex, toBase64Url, toHex, utf8ToBytes } from "../bytes"
+import { bytesToUtf8, randomBytes, sha256Hex, toBase64Url, toHex, utf8ToBytes } from "../bytes"
 import type { GitHubTree, GitHubTreeNode } from "../github-api"
 import type { GitHubGitCommit } from "../github-git-types"
 import { evaluateV4ChangeGuard } from "./change-guard"
 import { canAttemptV4TextMerge, resolveV4Conflict, type V4ConflictPolicy, type V4ConflictResolution } from "./conflicts"
 import type { V4Keyring } from "./crypto"
-import { encryptV4Payload } from "./crypto"
+import { decryptV4Payload, encryptV4Payload } from "./crypto"
 import {
   createV4CandidateCommit,
   publishV4CandidateRef,
@@ -16,7 +16,7 @@ import {
   type V4GitTreeProgressItem,
 } from "./git-tree-writer"
 import { reconcileV4CandidatePublication } from "./publish-reconciler"
-import { assertV4JournalChangeCapacity, buildV4JournalPages, type V4JournalChange } from "./history-journal"
+import { assertV4JournalChangeCapacity, buildV4JournalPages, V4_JOURNAL_PAGE_SIZE, V4_MAX_JOURNAL_PAGES, type V4JournalChange, type V4JournalPage } from "./history-journal"
 import { isV4LocalIndexCacheComplete, isV4LocalIndexShardConsistent, type V4IndexFileRecord, type V4LocalIndex } from "./local-index"
 import { assertV4LocalTargetPrecondition, createV4LocalIo, type V4LocalIo, type V4LocalTargetPrecondition, type V4SessionVault } from "./local-io"
 import { trashV4LocalUserFile } from "./local-delete-policy"
@@ -1238,6 +1238,58 @@ export class V4SyncSession {
     return true
   }
 
+  private async encryptedPublicationJournalMatches(
+    remote: V4RemoteState,
+    tip: GitHubGitCommit,
+    budget: { reads: number; nodes: number },
+  ): Promise<boolean> {
+    if (remote.config.mode !== "encrypted" || !this.input.keyring) return false
+    const journalId = remote.head.journalId
+    const entries = await this.publicationDirectoryEntries(
+      tip.treeSha,
+      `${V4_ROOT}/journals/${journalId}`,
+      budget,
+    )
+    if (!entries) return false
+
+    const readPage = async (page: number, expectedPageCount?: number): Promise<V4JournalPage | null> => {
+      const name = `${String(page).padStart(6, "0")}.enc`
+      const node = entries.get(name)
+      if (!node || node.type !== "blob" || node.mode !== "100644") return null
+      const file = await this.input.github.getFileBytes(`${V4_ROOT}/journals/${journalId}/${name}`, tip.sha)
+      throwIfV4Aborted(this.input.signal)
+      if (!file || file.sha !== node.sha) return null
+      let decoded: Uint8Array
+      try {
+        decoded = await decryptV4Payload(this.input.keyring!.journalKey, file.bytes, {
+          kind: "journal",
+          aad: `${remote.config.repoId}:${journalId}:${page}`,
+        })
+      } catch {
+        return null
+      }
+      let journal: V4JournalPage
+      try {
+        journal = JSON.parse(bytesToUtf8(decoded)) as V4JournalPage
+      } catch {
+        return null
+      }
+      if (!journal || typeof journal !== "object" || Array.isArray(journal)) return null
+      if (journal.journalId !== journalId || journal.page !== page) return null
+      if (!Number.isSafeInteger(journal.pageCount) || journal.pageCount < 1 || journal.pageCount > V4_MAX_JOURNAL_PAGES) return null
+      if (expectedPageCount !== undefined && journal.pageCount !== expectedPageCount) return null
+      if (!Array.isArray(journal.changes) || journal.changes.length > V4_JOURNAL_PAGE_SIZE) return null
+      return journal
+    }
+
+    const first = await readPage(0)
+    if (!first || entries.size !== first.pageCount) return false
+    for (let page = 1; page < first.pageCount; page++) {
+      if (!(await readPage(page, first.pageCount))) return false
+    }
+    return true
+  }
+
   private async encryptedPublicationObjectChanges(
     remote: V4RemoteState,
     parentHead: V4RemoteHead,
@@ -1450,6 +1502,7 @@ export class V4SyncSession {
     const changes = await this.changedGitTreeLeaves(parent.treeSha, tip.treeSha, "", budget)
     if (remote.config.mode === "encrypted") {
       if (changes.length > 0) return false
+      if (!(await this.encryptedPublicationJournalMatches(remote, tip, budget))) return false
       const objectChanges = await this.encryptedPublicationObjectChanges(remote, parentHead, parent, tip, budget)
       if (!objectChanges) return false
       this.verifiedPublicationChanges.set(tip.sha, objectChanges)
