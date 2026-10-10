@@ -1504,6 +1504,37 @@ test("successful credential rotation scrubs only superseded secret IDs after dur
 });
 
 
+test("settings save does not rewrite unchanged credentials in SecretStorage", async () => {
+  const writes: Array<[string, string]> = [];
+  const selectiveStore = v4SecretsModule.storeV4Secrets as unknown as (
+    settings: unknown,
+    storage: unknown,
+    selection: { githubToken: boolean; encryptionPassphrase: boolean },
+  ) => void;
+
+  selectiveStore(
+    {
+      githubToken: "token",
+      githubTokenSecretId: "github-token-id",
+      encryptionPassphrase: "pass",
+      encryptionPassphraseSecretId: "encryption-passphrase-id",
+    },
+    {
+      getSecret() { return null; },
+      setSecret(id: string, value: string) { writes.push([id, value]); },
+    },
+    { githubToken: false, encryptionPassphrase: false },
+  );
+  assert.deepEqual(writes, [], "unchanged credentials must not trigger SecretStorage writes");
+
+  const mainSource = await readFile("src/main.ts", "utf8");
+  assert.match(
+    mainSource,
+    /storeV4Secrets\(preparedSettings,\s*this\.app\.secretStorage,\s*\{[\s\S]*?githubToken:\s*pendingGithubTokenSecret[\s\S]*?encryptionPassphrase:\s*pendingEncryptionPassphraseSecret[\s\S]*?\}\)/u,
+  );
+});
+
+
 test("settings save does not publish the new runtime generation before durable persistence succeeds", async () => {
   const mainSource = await readFile("src/main.ts", "utf8");
 
