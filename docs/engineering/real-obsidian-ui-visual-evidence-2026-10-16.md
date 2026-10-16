@@ -73,7 +73,7 @@ This confirms reproducible CI-like smoke **for unconfigured synthetic Desktop UI
 
 ## Non-claims and next acceptance gates
 
-- **No live GitHub E2E:** no credentials, repository setup, network mutation, remote history/preview data, or Force operation was exercised.
+- **No live GitHub E2E in these visual UI screenshots:** this isolated Obsidian session never received credentials, accessed remote history, or performed remote mutation/Force operations. **Separately**, the maintainer authorized a disposable-repository protocol-level live GitHub E2E run on 2026-10-17, which passed with independently verified branch cleanup; see [live GitHub E2E evidence](live-github-e2e-2026-10-17.md). This does not constitute a configured native UI roundtrip.
 - **No physical Android/iOS screenshots:** CDP 375px emulation is desktop Electron only.
 - **No end-to-end accessible keyboard completion of Force:** intentional safety gate remains for separate design and review.
 - **No actual visual signoff of every theme, locale or plugin combination:** screenshots confirm real DOM/rendering for the listed synthetic states, not universal pixel-perfect behavior.
