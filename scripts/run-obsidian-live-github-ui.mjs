@@ -12,12 +12,15 @@ import {loadGitHubE2EEnv,qualificationE2EBranch,validateGitHubE2EConfig} from ".
 import {preflightE2ERemote,readE2EBranch,cleanupE2EBranch} from "./github-e2e-remote.mjs";
 import {CANONICAL_REPOSITORY_ID,readOriginFetchRepository} from "./github-repo.mjs";
 import {verifyPngBytes,visibleIntersection} from "./ui-visual-assertions.mjs";
+import {parseLiveUiMode,assertEncryptedRemoteTree} from "./obsidian-live-ui-mode.mjs";
 
 const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),"..");
 const opts=process.argv.slice(2);
 const option=(key,def)=>opts.find(x=>x.startsWith(`--${key}=`))?.slice(key.length+3)??def;
 const exe=option("obsidian","C:\\Program Files\\Obsidian\\Obsidian.exe");
 const dryRun=opts.includes("--preflight-only");
+const mode=parseLiveUiMode(option("mode",undefined));
+const passphrase=mode==="encrypted"?randomBytes(32).toString("base64url"):"";
 const id="encrypted-github-sync-multi-platform";
 const runId=randomBytes(8).toString("hex");
 const runRoot=path.join(root,".tmp","obsidian-live-github-e2e",runId);
@@ -28,10 +31,38 @@ const port=Number(option("port",String(20000+process.pid%35000)));
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 const assertTrue=(condition,message)=>assert.ok(condition,message);
 const readState=async({owner,repo,branch,token})=>readE2EBranch({owner,repo,branch,token});
+async function githubReadJson(route){
+ const url=`https://api.github.com/repos/${encodeURIComponent(configuration.owner)}/${encodeURIComponent(configuration.repo)}/${route}`;
+ const response=await fetch(url,{headers:{Authorization:`Bearer ${configuration.token}`,Accept:"application/vnd.github+json","X-GitHub-Api-Version":"2022-11-28"},signal:AbortSignal.timeout(20000)});
+ if(!response.ok)throw Error(`Encrypted remote read returned GitHub HTTP ${response.status}`);
+ return response.json();
+}
+async function verifyEncryptedGitHubTree(commitSha){
+ const commit=await githubReadJson(`git/commits/${commitSha}`);
+ assertTrue(/^[0-9a-f]{40}$/u.test(commit?.tree?.sha??""),"Encrypted commit has no valid Git tree");
+ const data=await githubReadJson(`git/trees/${commit.tree.sha}?recursive=1`);
+ assertTrue(data?.truncated===false,"Encrypted Git tree is truncated");
+ const inspected=assertEncryptedRemoteTree(data.tree,{logicalPaths:["UI-smoke.md"]});
+ const configNode=data.tree.find(node=>node.path===".obsidian-github-sync-v4/config.json"&&node.type==="blob");
+ const cipherNode=data.tree.find(node=>/^\.obsidian-github-sync-v4\/data\/[0-9a-f]{2}\/[0-9a-f]{64}\.enc$/u.test(node.path)&&node.type==="blob");
+ assertTrue(!!configNode?.sha&&!!cipherNode?.sha,"Encrypted config or ciphertext blob missing");
+ const configBlob=await githubReadJson(`git/blobs/${configNode.sha}`);
+ const configJson=JSON.parse(Buffer.from(configBlob.content.replace(/\s/gu,""),"base64").toString("utf8"));
+ assertTrue(configJson.mode==="encrypted"&&configJson.pathLayout==="opaque-stable-v1"&&configJson.algorithm==="AES-GCM","Remote encrypted metadata is not V4 opaque AES-GCM");
+ const cipherBlob=await githubReadJson(`git/blobs/${cipherNode.sha}`);
+ const bytes=Buffer.from(cipherBlob.content.replace(/\s/gu,""),"base64");
+ assertTrue(bytes.length>=33&&bytes.subarray(0,4).equals(Buffer.from([0x4f,0x47,0x53,0x34])),"Remote ciphertext does not carry authenticated encrypted payload header");
+ assertTrue(!bytes.includes(Buffer.from("Second revision from Obsidian")),"Remote ciphertext exposes synthetic note content");
+ return {mode:"encrypted",opaqueObjects:true,cipherHeaderValid:true,configValid:true,...inspected};
+}
 const runGit=(args)=>spawnSync("git",args,{cwd:root,encoding:"utf8",shell:false});
-const redact=(value)=>String(value?.message||value).replace(/gh[pousr]_[A-Za-z0-9_]+/gu,"[redacted]").replace(/github_pat_[A-Za-z0-9_]+/gu,"[redacted]").slice(0,550);
+const redact=(value)=>{
+ let msg=String(value?.message||value);
+ for(const secret of [configuration?.token,passphrase].filter(Boolean))msg=msg.replaceAll(secret,"[redacted]");
+ return msg.replace(/gh[pousr]_[A-Za-z0-9_]+/gu,"[redacted]").replace(/github_pat_[A-Za-z0-9_]+/gu,"[redacted]").slice(0,550);
+};
 let processHandle,ws,configuration,branch,verified=false,passed=false,initialSha,finalSha;
-let cleanupState="not-started",screenBytes=0;
+let cleanupState="not-started",screenBytes=0,remoteEncryptionVerified=false;
 const sendErrors=[];
 const requestMap=new Map();let serial=0;
 function send(method,params={},timeoutMs=25000){
@@ -72,9 +103,10 @@ async function captureSyncedCenter(){
     title:document.querySelector(".github-sync-center__header h3")?.textContent,
     lifecycle:app.plugins.plugins[${JSON.stringify(id)}].v4Runtime.progressSnapshot.lifecycle,
     syncAction:!![...el.querySelectorAll("button")].find(b=>b.textContent.trim()==="Sync now"),
-    leakedToken:el.innerText.includes(app.plugins.plugins["encrypted-github-sync-multi-platform"].settings.githubToken)};
+    leakedToken:el.innerText.includes(app.plugins.plugins["encrypted-github-sync-multi-platform"].settings.githubToken),
+    leakedPassphrase:!!app.plugins.plugins["encrypted-github-sync-multi-platform"].settings.encryptionPassphrase&&el.innerText.includes(app.plugins.plugins["encrypted-github-sync-multi-platform"].settings.encryptionPassphrase)};
  })()`);
- assertTrue(dims?.syncAction && dims?.lifecycle==="success" && !dims?.leakedToken,"Sync Center must show a completed sync without leaking credentials");
+ assertTrue(dims?.syncAction && dims?.lifecycle==="success" && !dims?.leakedToken && !dims?.leakedPassphrase,"Sync Center must show a completed sync without leaking credentials");
  const clip=visibleIntersection(dims.rect,dims.viewport);
  const png=await send("Page.captureScreenshot",{format:"png",captureBeyondViewport:false,fromSurface:true,clip});
  const bytes=Buffer.from(png.data??"","base64");
@@ -103,7 +135,7 @@ try{
  const before=await readState(configuration);
  assertTrue(before.kind==="absent","Randomized test branch unexpectedly exists");
  console.log(JSON.stringify({preflight:"PASSED",target:configuration.targetRepository,expectedRepoId:configuration.expectedRepoId,
-  defaultBranch:verifiedTarget.defaultBranch,disposableBranch:branch,branchBefore:"absent",sourceSHA:sha.stdout.trim()}));
+  defaultBranch:verifiedTarget.defaultBranch,disposableBranch:branch,branchBefore:"absent",sourceSHA:sha.stdout.trim(),mode}));
  if(dryRun){passed=true;}else{
   try{
    const existing=await fetch(`http://127.0.0.1:${port}/json/list`,{signal:AbortSignal.timeout(1200)});
@@ -152,7 +184,7 @@ try{
   // Credential does not enter stdout, screenshot, console or a tracked file.
   // The vault/profile are securely disposed after the isolated process exits.
   const prepared={
-   owner:configuration.owner,repo:configuration.repo,branch:configuration.branch,token:configuration.token
+   owner:configuration.owner,repo:configuration.repo,branch:configuration.branch,token:configuration.token,mode,passphrase
   };
   const setup=await evaluate(`(async()=>{
    const p=app.plugins.plugins[${JSON.stringify(id)}];
@@ -162,13 +194,13 @@ try{
    await p.saveSettings({...p.settings,
      githubOwner:data.owner,githubRepo:data.repo,githubBranch:data.branch,githubToken:data.token,
      syncEnabled:true,syncOnStartup:false,syncOnLocalChange:false,scheduledSyncEnabled:false,
-     encryptionMode:"plaintext",encryptionPassphrase:"",syncObsidianConfig:false,syncBookmarks:false,syncPlugins:false,
+     encryptionMode:data.mode,encryptionPassphrase:data.passphrase,syncObsidianConfig:false,syncBookmarks:false,syncPlugins:false,
    });
    return {configured:p.settings.githubOwner===data.owner&&p.settings.githubRepo===data.repo
      &&p.settings.githubBranch===data.branch && !!p.settings.githubToken,
-     mode:p.settings.encryptionMode,autoEnabled:p.settings.syncOnLocalChange};
+     mode:p.settings.encryptionMode,passphrasePresent:!!p.settings.encryptionPassphrase,autoEnabled:p.settings.syncOnLocalChange};
   })()`);
-  assertTrue(setup?.configured&&setup?.mode==="plaintext"&&!setup?.autoEnabled,"GitHub credentials not safely installed");
+  assertTrue(setup?.configured&&setup?.mode===mode&&setup.passphrasePresent===(mode==="encrypted")&&!setup?.autoEnabled,"GitHub credentials not safely installed");
   // First initialization via plugin runtime on an absent, random test branch.
   // Then test the *actual Sync Center button* for the next mutation.
   const initial=await evaluate(`(async()=>{
@@ -205,6 +237,10 @@ try{
   const remote=await readState(configuration);
   assertTrue(remote.kind==="present"&&remote.sha!==initialSha,"Remote HEAD did not advance after UI Sync now");
   finalSha=remote.sha;
+  if(mode==="encrypted"){
+   const encryptionProof=await verifyEncryptedGitHubTree(remote.sha);
+   remoteEncryptionVerified=Boolean(encryptionProof.configValid&&encryptionProof.cipherHeaderValid&&encryptionProof.opaqueObjects);
+  }
   await captureSyncedCenter();
   passed=true;
  }
@@ -232,5 +268,5 @@ try{
   try{await rm(runRoot,{recursive:true,force:true});}catch(error){console.error("WARNING: isolated test vault cleanup incomplete");process.exitCode=1;}
  }
  console.log(JSON.stringify({status:passed&&!process.exitCode?"PASS":"FAIL",cleanup:cleanupState,remoteHeadChanged:Boolean(initialSha&&finalSha&&initialSha!==finalSha),
-  screenshotCaptured:screenBytes>1000,screenshotPath:screenBytes>1000?screenshot:null,uiExceptions:sendErrors.length,runBranch:branch,repository:configuration?.targetRepository,token:"[not reported]"}));
+  screenshotCaptured:screenBytes>1000,screenshotPath:screenBytes>1000?screenshot:null,uiExceptions:sendErrors.length,mode,remoteEncryptionVerified,runBranch:branch,repository:configuration?.targetRepository,token:"[not reported]"}));
 }

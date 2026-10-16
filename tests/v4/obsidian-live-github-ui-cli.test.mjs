@@ -26,4 +26,6 @@ test("configured live UI harness uses a randomly named cleanup-restricted branch
  assert.match(code,/initialSha/);
  assert.match(code,/\.github-sync-center__actions button/u);
  assert.match(code,/GITHUB_E2E_EXPECTED_REPO_ID/u);
+ assert.match(code,/parseLiveUiMode/u);
+ assert.match(code,/verifyEncryptedGitHubTree/u);
 });
