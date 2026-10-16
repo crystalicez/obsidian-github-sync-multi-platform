@@ -41,7 +41,7 @@ These tests exercise the **real GitHub REST API** with simulated two-device vaul
 ## Remaining release blockers
 
 - The configured-repository Force Push/Pull confirmation remains pointer-only; keyboard/screen-reader alternative and destructive-operation safety signoff are open.
-- A native Obsidian settings-to-real-GitHub sync roundtrip in a strictly isolated **synthetic** vault remains separate from protocol-level E2E.
+- **Follow-up 2026-10-17:** This native Obsidian-to-GitHub gap was **partially closed**: a configured **plaintext** synthetic vault successfully initialized a new disposable branch and synced a locally edited note by clicking the **real Sync Center → Sync now** button, with an independently verified advanced commit and branch cleanup. A serious Electron dynamic-import regression was identified and fixed. See [native UI + live GitHub evidence](live-obsidian-github-ui-e2e-2026-10-17.md). Native encrypted UI, full manual Settings form entry and mobile acceptance remain OPEN.
 - Hosted CI checks, official clean `master` SHA qualification, physical mobile and large-file capacity claims remain open.
 - PR #8 remains **Draft**. No merge, stable tag or release was authorized.
 
