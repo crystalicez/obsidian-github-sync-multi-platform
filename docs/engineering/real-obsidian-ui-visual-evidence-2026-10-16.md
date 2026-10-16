@@ -39,12 +39,13 @@ The original fresh Windows 11 / Obsidian 1.14.4 run on CDP port **9250** passed 
 | [375px Settings simulation](ui-real-screenshots-2026-10-16/06-settings-narrow-375.png) | **Known failing usability case:** Obsidian desktop's own sidebar consumes most of the narrow viewport |
 | [Sync Center — commits](ui-real-screenshots-2026-10-16/07-sync-center-commits.png) | Normal right-hand dock, progress idle state and inline unconfigured-connection error |
 | [Sync Center — current file](ui-real-screenshots-2026-10-16/08-sync-center-current-file.png) | Real Markdown note in main pane and Current file mode in the sidebar |
+| [Sync Center — narrow dock, visible crop](ui-real-screenshots-2026-10-16/09-sync-center-narrow-dock.png) | Actual narrow dock cropped **within the visible viewport**; readable headline/actions and inline error, no bogus empty 375px viewport snapshot |
 | [Force Push — unconfigured, after fix](ui-real-screenshots-2026-10-16/10-force-push-unconfigured.png) | Rejected action: explanatory Notice and **no** destructive unlock dialog |
 | [Force Pull — unconfigured, after fix](ui-real-screenshots-2026-10-16/11-force-pull-unconfigured.png) | Same rejection; no remote operation |
 | [Force Push — old behavior (before fix)](ui-real-screenshots-2026-10-16/10-force-push-confirmation.png) | Historical evidence of the former misleading `Repository: /` dialog, **not** the current UX |
 | [Force Pull — old behavior (before fix)](ui-real-screenshots-2026-10-16/11-force-pull-confirmation.png) | Historical before-fix locked modal, retained for comparison |
 
-Other locally generated images: initial vault, Settings bottom, theme-light/dark, Sync Center at simulated 375px. The images are reproducible using the command above rather than adding every screenshot to the repository.
+Other locally generated images: actual loaded-vault workspace, Settings bottom, and theme-light/dark. The old test captured Sync Center after reducing the entire desktop viewport to 375px, which could move the right dock **outside the PNG**. That image is **withdrawn as evidence**. The replacement captures the actual visible narrow Obsidian dock with element-aligned CDP clipping and correct device-pixel-ratio scaling. The images can be reproduced using the command above.
 
 ## Confirmed UI findings through real screenshots
 
@@ -58,6 +59,11 @@ Other locally generated images: initial vault, Settings bottom, theme-light/dark
 Tested code commit **`216af46d812802811e2c8d2c32cfc39fe3c0ae6e`** in a separate detached worktree under `.tmp/release-audit-clean-20261010`, with frozen dependencies. Production Build, Fast Tests, Repeat **10/10**, Recovery, Resource, Feasibility, Metadata/Package validators and E2E **compile-only** bundles each exited 0. **Real Obsidian Desktop visual smoke also passed 27 checks and captured 12 screenshots** from that exact worktree. After these gates, `git status --short --branch` returned **`## HEAD (no branch)`** (clean). The unrelated local `tests/v4/github-transport.test.ts` helper WIP was excluded.
 
 The script now closes only the synthetic Obsidian process it started, unless `--keep-open` is requested; `--attach` never terminates a session. The screenshots represent synthetic unconfigured-user states, not authenticated GitHub workflows or a physical mobile device.
+
+### 2026-10-16 screenshot evidence integrity follow-up
+
+- **Finding UI-126 (MEDIUM, verified):** The earlier `09-sync-center-narrow-375` screenshot showed an almost blank desktop because CDP emulated a 375px full-window viewport while the real Obsidian right dock stayed beyond the cropped frame. The runner previously counted any nonempty PNG as a screenshot pass. The image was **not valid UI evidence**. The revised runner checks positive PNG signature/dimensions, DOM target viewport intersection, actual cropped screenshot size with display DPR, and fully loaded workspace text before recording success. Its actual-dock crop is visibly readable. New focused `tests/v4/ui-visual-assertions.test.mjs` covers the offscreen failure, clipping and malformed/truncated PNG; `pnpm test:ui:visual` executes those alongside its isolation CLI tests before building/launching.
+- **Native rerun:** real isolated Windows Obsidian 1.14.4 returned **43 checks / 12 screenshots / 0 observed JS exceptions**, and `09-sync-center-narrow-dock.png` was opened and visually reviewed. Earlier screenshot counts included false confidence about frame content and should not be conflated with this strengthened gate. The 375px desktop Settings case remains **unresolved** (175px content); device screenshots are not claimed.
 
 ## Non-claims and next acceptance gates
 

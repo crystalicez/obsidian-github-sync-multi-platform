@@ -13,6 +13,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { copyFile, lstat, mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { visibleIntersection, verifyPngBytes } from "./ui-visual-assertions.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const id = "encrypted-github-sync-multi-platform";
@@ -144,7 +145,16 @@ try {
   let settingsWs = null;
   // Exact real-vault identity guard. Do this before changing localStorage,
   // loading plugins, clicking UI, or capturing potentially private content.
-  const identity=await evaluate(`(()=>({base:app.vault.adapter.getBasePath(),name:app.vault.getName(),location:location.href}))()`);
+  let identity=null;
+  const startupDeadline=Date.now()+45000;
+  while(!identity && Date.now()<startupDeadline){
+    identity=await evaluate(`(()=>{
+      if(typeof app==="undefined" || !app?.vault?.adapter?.getBasePath || !app?.workspace) return null;
+      return {base:app.vault.adapter.getBasePath(),name:app.vault.getName(),location:location.href};
+    })()`);
+    if(!identity)await sleep(250);
+  }
+  checked("Obsidian vault API is ready",Boolean(identity),"index.html alone does not establish that the app has finished booting");
   checked("synthetic vault base path",String(identity.base).toLowerCase()===vault.toLowerCase(),identity.base);
   checked("synthetic vault basename",identity.name===path.basename(vault),identity.name);
   const pre=await evaluate(`(()=>({configured:!!(app.plugins.plugins[${JSON.stringify(id)}]?.settings?.githubToken),owner:app.plugins.plugins[${JSON.stringify(id)}]?.settings?.githubOwner||"",repo:app.plugins.plugins[${JSON.stringify(id)}]?.settings?.githubRepo||""}))()`);
@@ -171,14 +181,50 @@ try {
   checked("production plugin loads in Obsidian",pluginState.loaded,JSON.stringify(pluginState));
   checked("Settings tab registered",pluginState.tab);
   checked("plugin has no GitHub credentials",pluginState.noCredentials);
-  const record=async (name)=>{
+  let workspaceReady=null;
+  const workspaceDeadline=Date.now()+30000;
+  while(Date.now()<workspaceDeadline){
+    workspaceReady=await evaluate(`(()=>{
+      const text=document.body?.innerText??"";
+      return {ok:!!app.workspace.layoutReady && text.includes("UI-smoke") && !/Loading plugins|Loading vault/u.test(text),
+        sample:text.slice(0,160)};
+    })()`);
+    if(workspaceReady.ok)break;
+    await sleep(250);
+  }
+  checked("synthetic Obsidian workspace fully rendered",workspaceReady?.ok,JSON.stringify(workspaceReady));
+  const record=async (name,{visibleSelector,cropSelector}={})=>{
     const dom=await activeEvaluate(`(()=>({title:document.title,viewport:{width:innerWidth,height:innerHeight},text:(document.body.innerText||"").slice(0,800),settingsSections:document.querySelectorAll(".github-sync-settings-header").length,settingsContentWidth:(()=>{const e=document.querySelector(".vertical-tab-content");return e?Math.round(e.getBoundingClientRect().width):null})(),dirtyBanner:document.querySelectorAll(".github-sync-settings-dirty-banner").length,syncCenters:document.querySelectorAll(".github-sync-center").length,horizontalOverflow:Math.max(0,document.documentElement.scrollWidth-document.documentElement.clientWidth),centerLayout:(()=>{const layout=document.querySelector(".github-sync-center__layout")?.getBoundingClientRect();const detail=document.querySelector(".github-sync-center__detail")?.getBoundingClientRect();return layout&&detail?{availableWidth:Math.round(layout.width),detailRight:Math.round(detail.right),layoutRight:Math.round(layout.right),fits:detail.right<=layout.right+2}:null})(),notices:[...document.querySelectorAll(".notice")].map(e=>e.innerText.slice(0,120))}))()`);
-    const shot=await activeSend("Page.captureScreenshot",{format:"png",captureBeyondViewport:false,fromSurface:true});
-    checked(`screenshot buffer: ${name}`,Boolean(shot?.data&&shot.data.length>1000));
+    let clip;
+    let cropDpr=1;
+    if(visibleSelector||cropSelector){
+      const selector=cropSelector??visibleSelector;
+      const target=await activeEvaluate(`(()=>{
+        const el=document.querySelector(${JSON.stringify(selector)});
+        if(!el)return null;
+        const b=el.getBoundingClientRect();
+        return {rect:{x:b.x,y:b.y,width:b.width,height:b.height},viewport:{width:innerWidth,height:innerHeight},dpr:devicePixelRatio};
+      })()`);
+      checked(`screenshot target exists: ${name}`,Boolean(target),selector);
+      const intersection=visibleIntersection(target.rect,target.viewport);
+      checked(`screenshot target onscreen: ${name}`,true,JSON.stringify(intersection));
+      if(cropSelector){clip=intersection;cropDpr=target.dpr;}
+    }
+    const shot=await activeSend("Page.captureScreenshot",{
+      format:"png",captureBeyondViewport:false,fromSurface:true,...(clip?{clip}:{}),
+    });
+    const imageBytes=Buffer.from(shot?.data??"","base64");
+    const size=verifyPngBytes(imageBytes,{minWidth:80,minHeight:80});
+    if(clip){
+      checked(`cropped target actually captured: ${name}`,
+        Math.abs(size.width-clip.width*cropDpr)<=3&&Math.abs(size.height-clip.height*cropDpr)<=3,
+        `png=${JSON.stringify(size)} clip=${JSON.stringify(clip)}`);
+    }
+    checked(`valid screenshot PNG: ${name}`,true,`${size.width}x${size.height}`);
     const out=path.join(screenshots,name+".png");
     await mkdir(screenshots,{recursive:true});
-    await writeFile(out,Buffer.from(shot.data,"base64"));
-    evidence.screenshots.push({name,path:out,bytes:Math.floor(shot.data.length*.75),dom});
+    await writeFile(out,imageBytes);
+    evidence.screenshots.push({name,path:out,bytes:imageBytes.length,png:size,dom});
     return dom;
   };
   await record("00-vault");
@@ -222,7 +268,7 @@ try {
   activeEvaluate=settingsEvaluate;
   const opened=await settingsEvaluate(`(()=>({headers:document.querySelectorAll(".github-sync-settings-header").length,visible:!!document.querySelector(".github-sync-settings-dirty-banner, .github-sync-settings-header"),title:document.title}))()`);
   checked("Settings UI rendered",opened.visible,JSON.stringify(opened));
-  await record("01-settings-general");
+  await record("01-settings-general",{visibleSelector:".github-sync-settings-header"});
   await evaluate(`(()=>{
     const t=app.plugins.plugins[${JSON.stringify(id)}].settingTab;
     if(!t.tempSettings)throw Error("Settings draft not active");
@@ -231,7 +277,7 @@ try {
   })()`);
   const dirty=await settingsEvaluate(`(()=>({dirty:!!document.querySelector(".github-sync-settings-dirty-banner"),notice:document.querySelector(".github-sync-settings-dirty-banner")?.innerText?.slice(0,200)}))()`);
   checked("unsaved settings banner",dirty.dirty,dirty.notice);
-  await record("02-settings-dirty");
+  await record("02-settings-dirty",{visibleSelector:".github-sync-settings-dirty-banner"});
   await evaluate(`(()=>{const t=app.plugins.plugins[${JSON.stringify(id)}].settingTab;t.tempSettings.githubOwner=app.plugins.plugins[${JSON.stringify(id)}].settings.githubOwner;t.updateDirtyState();})()`);
   const scroll=await activeEvaluate(`(()=>{const els=[...document.querySelectorAll(".vertical-tab-content, .vertical-tab-content-container, .modal-content")].map(e=>({e,h:e.scrollHeight-e.clientHeight})).sort((a,b)=>b.h-a.h); const x=els[0]; if(x)x.e.scrollTop=x.e.scrollHeight;return {max:x?.h??0};})()`);
   if(scroll.max>100)await record("03-settings-bottom");else evidence.warnings.push("Settings scroll container could not be identified; bottom viewport not separately captured.");
@@ -244,7 +290,7 @@ try {
   // Browser-emulated narrow viewport on desktop Electron: NOT mobile-device proof.
   await activeEvaluate(`(()=>{const x=[...document.querySelectorAll(".vertical-tab-content, .vertical-tab-content-container, .modal-content")].sort((a,b)=>(b.scrollHeight-b.clientHeight)-(a.scrollHeight-a.clientHeight))[0];if(x)x.scrollTop=0;})()`);
   await activeSend("Emulation.setDeviceMetricsOverride",{width:375,height:760,deviceScaleFactor:1,mobile:false});
-  const narrow=await record("06-settings-narrow-375");
+  const narrow=await record("06-settings-narrow-375",{visibleSelector:".github-sync-settings-header"});
   if(narrow.horizontalOverflow>2)evidence.warnings.push(`375px viewport has ${narrow.horizontalOverflow}px document overflow; inspect screenshot manually`);
   if(narrow.settingsContentWidth!==null && narrow.settingsContentWidth<260)evidence.warnings.push(`Obsidian desktop Settings popout leaves only ${narrow.settingsContentWidth}px for plugin content at 375px viewport; not a mobile-device acceptance pass.`);
   await activeSend("Emulation.clearDeviceMetricsOverride");
@@ -254,7 +300,7 @@ try {
   try{settingsWs.close()}catch{}
   const syncState=await evaluate(`(async()=>{await app.plugins.plugins[${JSON.stringify(id)}].openSyncCenter();await new Promise(r=>setTimeout(r,700));return {count:document.querySelectorAll(".github-sync-center").length,body:document.body.innerText.slice(-500)}})()`);
   checked("Sync Center rendered",syncState.count>0,JSON.stringify(syncState));
-  const dock=await record("07-sync-center-commits");
+  const dock=await record("07-sync-center-commits",{visibleSelector:".github-sync-center"});
   checked("Sync Center details fit the actual Obsidian dock",dock.centerLayout?.fits,JSON.stringify(dock.centerLayout));
   const active=await evaluate(`(async()=>{
     const f=app.vault.getAbstractFileByPath("UI-smoke.md");
@@ -266,10 +312,13 @@ try {
     return {button:!!b,pressed:b?.getAttribute("aria-pressed"),center:document.querySelectorAll(".github-sync-center").length};
   })()`);
   checked("Current File navigation",active.button && active.center>0,JSON.stringify(active));
-  await record("08-sync-center-current-file");
-  await send("Emulation.setDeviceMetricsOverride",{width:375,height:760,deviceScaleFactor:1,mobile:false});
-  await record("09-sync-center-narrow-375");
-  await send("Emulation.clearDeviceMetricsOverride");
+  await record("08-sync-center-current-file",{visibleSelector:".github-sync-center"});
+  // A 375px *app viewport* pushes Obsidian's right dock offscreen; the
+  // previous test saved a nearly blank PNG and falsely counted it as passed.
+  // Capture the actually visible narrow dock, cropped to the live sidebar.
+  const dockNarrow=await record("09-sync-center-narrow-dock",{cropSelector:".github-sync-center"});
+  checked("narrow Sync Center uses the actual sidebar width",dockNarrow.centerLayout?.availableWidth<=640,
+    JSON.stringify(dockNarrow.centerLayout));
   // With no GitHub credentials, Force commands must refuse to open destructive dialogs.
   // This run never unlocks a Force control or invokes a remote operation.
   for(const mode of ["forcePush","forcePull"]){
