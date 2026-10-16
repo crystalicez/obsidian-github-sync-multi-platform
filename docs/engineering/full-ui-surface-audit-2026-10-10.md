@@ -50,6 +50,14 @@ Evidence labels: **T** = targeted deterministic RED/GREEN regression; **S** = re
 - **P2 / functional performance:** Very long history previews can generate large `<pre>` DOM nodes; real-device profiling needed before changing preview limits/truncation UX.
 - **P2 / communications/privacy:** Copy Debug still requires a maintainer decision whether warning/consent should appear **before** placing diagnostics on clipboard. Key sanitization was tested but metadata may still be identifying.
 
+### 2026-10-16 independent quality challenge — reproducible published CSS
+
+The previous selector-presence CSS tests were insufficient: when pinned Dart Sass `1.93.2` compiled `src/styles.scss`, its **complete output did not match** the tracked `styles.css`, even while all class-existence tests passed. This was a confirmed **RED**. The new `styles.css` content is built automatically through `pnpm build:css` (invoked from `pnpm build`) and checked byte-for-byte modulo Windows line endings using the same pinned compiler. It produces **GREEN 6/6** focused CSS checks, including a regression that enforces `styles.css text eol=lf` in `.gitattributes`. Both the missing Sass package used by the old `devcss` command and Windows `core.autocrlf=true` generated-file dirtiness have been addressed.
+
+**Clean SHA evidence:** code commit `dccc9eaa8b6328dffd28f2aa1998a1decb46dc5a`, standalone detached checkout `.tmp/release-audit-clean-20261010` with Git status `## HEAD (no branch)` after `pnpm build`, Fast tests and repeat 10/10. A frozen install, `pnpm build`, Fast suite, Repeat suite, Recovery, Resource, Feasibility, `validate:metadata`, `validate:package`, and three E2E harness compile-only bundles all returned exit code 0. Primary workspace's unrelated `tests/v4/github-transport.test.ts` WIP was not staged, included or changed.
+
+**Real-UI limitation:** a separate Windows Obsidian 1.14.4 process with isolated profile was launched, confirmed on CDP as an Obsidian starter page, and a project-local synthetic vault was prepared at `.tmp/ui-acceptance-20261010-vault`. The native Windows folder picker did not complete reliably; the **plugin's actual Settings, Sync Center and modals were not rendered or visually inspected**. A successful app launch is **not** a visual acceptance pass, and the user’s normal vault was not used.
+
 ## Acceptance checklist in a disposable vault
 
 - Windows Desktop: dark and light themes, 320–480px narrow pane, 100%/200% zoom; Settings all sections and dirty/clipboard/save states; every Sync Center state; error/empty/failed; status bar, ribbon, command palette.
