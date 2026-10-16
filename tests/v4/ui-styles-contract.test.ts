@@ -9,6 +9,11 @@ const { compile } = createRequire(import.meta.url)("sass") as typeof import("sas
 const source = readFileSync(resolve("src/styles.scss"), "utf8");
 const distributed = readFileSync(resolve("styles.css"), "utf8");
 
+test("generated stylesheet stays LF on Windows checkouts", () => {
+  const attributes = readFileSync(resolve(".gitattributes"), "utf8");
+  assert.match(attributes, /^styles\.css text eol=lf\s*$/mu);
+});
+
 test("tracked styles.css is exactly reproducible from the pinned Sass compiler", () => {
   const expected = compile(resolve("src/styles.scss"), { style: "expanded", sourceMap: false }).css;
   assert.equal(distributed.replace(/\r\n/gu, "\n").trimEnd(), expected.trimEnd(), "Published CSS has drifted from Sass source. Run pnpm build:css.");

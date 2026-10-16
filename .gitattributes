@@ -1,0 +1,2 @@
+# Sass generates LF; preserve identical generated CSS on Windows checkout.
+styles.css text eol=lf
