@@ -9,8 +9,8 @@
  *   node scripts/run-ui-screenshots.mjs --attach --port=9239 --vault=.tmp/ui-acceptance-20261010-vault
  */
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
-import { copyFile, lstat, mkdir, writeFile } from "node:fs/promises";
+import { spawn, spawnSync } from "node:child_process";
+import { copyFile, lstat, mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -19,10 +19,12 @@ const id = "encrypted-github-sync-multi-platform";
 const args = process.argv.slice(2);
 const option = (key, fallback) => args.find(s => s.startsWith(`--${key}=`))?.slice(key.length + 3) ?? fallback;
 const attach = args.includes("--attach");
-const port = Number(option("port", "9249"));
-const vault = path.resolve(root, option("vault", ".tmp/ui-visual-smoke/vault"));
-const profile = path.resolve(root, option("profile", ".tmp/ui-visual-smoke/profile"));
-const screenshots = path.resolve(root, option("out", ".tmp/ui-visual-smoke/screenshots"));
+const runId = `${Date.now()}-${process.pid}`;
+const runDir = path.join(".tmp", "ui-visual-smoke", "runs", runId);
+const port = Number(option("port", String(20000 + (process.pid % 25000))));
+const vault = path.resolve(root, option("vault", path.join(runDir, "vault")));
+const profile = path.resolve(root, option("profile", path.join(runDir, "profile")));
+const screenshots = path.resolve(root, option("out", path.join(runDir, "screenshots")));
 const exe = option("obsidian", "C:\\Program Files\\Obsidian\\Obsidian.exe");
 
 function assertProjectTmp(target, label) {
@@ -43,8 +45,16 @@ async function refuseSymlinkTraversal(target) {
   }
 }
 for (const p of [vault,profile,screenshots]) await refuseSymlinkTraversal(p);
-assert.notEqual(vault.toLowerCase(), profile.toLowerCase(), "Profile and vault must be separate");
+const overlap = (a, b) => {
+  const relative = path.relative(a, b);
+  return !relative || (!relative.startsWith("..") && !path.isAbsolute(relative));
+};
+assert.ok(!overlap(vault, profile) && !overlap(profile, vault), "Profile and vault must not overlap");
+assert.ok(!overlap(vault, screenshots) && !overlap(screenshots, vault), "Screenshots and vault must not overlap");
+assert.ok(!overlap(profile, screenshots) && !overlap(screenshots, profile), "Screenshots and profile must not overlap");
 assert.ok(Number.isInteger(port) && port >= 1024 && port <= 65535, "Valid isolated CDP port required");
+const markerFile = path.join(vault, ".obsidian-ui-screenshot-fixture");
+const markerValue = "obsidian-ui-screenshot-fixture-v1";
 
 const evidence = { repo: root, vault, profile, port, pluginId: id, checks: [], screenshots: [], warnings: [], exceptions: [] };
 const checked = (name, ok, detail = "") => {
@@ -79,6 +89,7 @@ if (!attach) {
   await mkdir(profile);
   await mkdir(path.join(vault, ".obsidian", "plugins", id), {recursive:true});
   await mkdir(path.join(vault, "Notes"), {recursive:true});
+  await writeFile(markerFile, markerValue + "\n", {flag:"wx"});
   for (const file of ["main.js", "manifest.json", "styles.css"]) {
     await copyFile(path.join(root,file),path.join(vault,".obsidian","plugins",id,file));
   }
@@ -92,8 +103,10 @@ if (!attach) {
   child.unref();
   evidence.launchedPid = child.pid;
 } else {
-  // Attach mode MUST validate the live vault identity and saved credentials
-  // before touching any file or opening any plugin UI.
+  // Refuse to attach to arbitrary Obsidian vaults even if the caller points
+  // somewhere below .tmp. This marker is created only for a fresh test vault.
+  assert.equal((await readFile(markerFile,"utf8")).trim(), markerValue, "Attach requires a vault created by the UI screenshot runner");
+  // The live vault path and credentials are checked below before any mutation.
 }
 
 let ws;
@@ -276,7 +289,13 @@ try {
   evidence.failure=String(err?.stack||err).slice(0,1800);
   process.exitCode=1;
 } finally {
-  try{await mkdir(screenshots,{recursive:true});await writeFile(path.join(screenshots,"report.json"),JSON.stringify(evidence,null,2)+"\n");}catch(e){console.error("Failed to write UI evidence:",String(e));process.exitCode=1;}
   if(ws)try{ws.close()}catch{}
+  // Only the process launched by THIS invocation may be terminated. Attach
+  // mode never shuts down an existing instance. --keep-open is opt-in.
+  if(!attach && evidence.launchedPid && !args.includes("--keep-open")) {
+    const stopped=spawnSync("taskkill", ["/PID", String(evidence.launchedPid), "/T", "/F"], {encoding:"utf8",timeout:15000});
+    if(stopped.status!==0) evidence.warnings.push("Could not shut down isolated Obsidian process; close its synthetic test window manually.");
+  }
+  try{await mkdir(screenshots,{recursive:true});await writeFile(path.join(screenshots,"report.json"),JSON.stringify(evidence,null,2)+"\n");}catch(e){console.error("Failed to write UI evidence:",String(e));process.exitCode=1;}
   console.log(JSON.stringify({status:process.exitCode?"FAILED":"PASSED",checks:evidence.checks.length,screenshots:evidence.screenshots.map(s=>({name:s.name,path:s.path,bytes:s.bytes})),warnings:evidence.warnings,exceptions:evidence.exceptions,failure:evidence.failure,report:path.join(screenshots,"report.json")},null,2));
 }

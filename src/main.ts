@@ -382,6 +382,10 @@ export default class FastSync extends Plugin {
   }
 
   async showForceConfirm(operation: "forcePush" | "forcePull"): Promise<void> {
+    if (![this.settings.githubOwner, this.settings.githubRepo, this.settings.githubToken].every(value => typeof value === "string" && value.trim().length > 0)) {
+      new Notice("GitHub Sync: Configure and save your GitHub owner, repository, and token before using Force operations.")
+      return
+    }
     const approvedGeneration = this.v4Runtime.settingsGeneration
     await new Promise<void>((resolve) => {
       const modal = new Modal(this.app)
