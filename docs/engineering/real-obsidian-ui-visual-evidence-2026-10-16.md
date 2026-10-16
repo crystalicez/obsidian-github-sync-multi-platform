@@ -53,6 +53,12 @@ Other locally generated images: initial vault, Settings bottom, theme-light/dark
 3. **UI-124 — P1 usability finding, still open:** At a **375px CDP-emulated desktop viewport**, Obsidian's Settings popout retains its own left navigation. Only **175px** remain for plugin settings, with severe wrapping. This is **not a physical Android viewport test** and may require native app/Settings navigation behavior rather than only plugin CSS. Do not claim mobile support from the desktop-emulated screenshot.
 4. **UI-125 — LOW UX issue, fixed for unconfigured repos:** Originally the Force confirmation for an empty synthetic vault displayed `Repository: /`. The plugin now validates nonempty **saved** GitHub owner, repo, and token before constructing any Force modal. The user sees `Configure and save your GitHub owner, repository, and token before using Force operations.` and no confirmation slider; 6 missing-field/operation combinations have RED/GREEN regression. The real Obsidian runner confirms both Force actions are rejected without any modal and records after-fix screenshots. **Separate P1 open:** configured-repo Force confirmation remains pointer-only and has not passed keyboard/screen-reader acceptance.
 
+### Clean exact-code-SHA qualification (2026-10-16)
+
+Tested code commit **`216af46d812802811e2c8d2c32cfc39fe3c0ae6e`** in a separate detached worktree under `.tmp/release-audit-clean-20261010`, with frozen dependencies. Production Build, Fast Tests, Repeat **10/10**, Recovery, Resource, Feasibility, Metadata/Package validators and E2E **compile-only** bundles each exited 0. **Real Obsidian Desktop visual smoke also passed 27 checks and captured 12 screenshots** from that exact worktree. After these gates, `git status --short --branch` returned **`## HEAD (no branch)`** (clean). The unrelated local `tests/v4/github-transport.test.ts` helper WIP was excluded.
+
+The script now closes only the synthetic Obsidian process it started, unless `--keep-open` is requested; `--attach` never terminates a session. The screenshots represent synthetic unconfigured-user states, not authenticated GitHub workflows or a physical mobile device.
+
 ## Non-claims and next acceptance gates
 
 - **No live GitHub E2E:** no credentials, repository setup, network mutation, remote history/preview data, or Force operation was exercised.

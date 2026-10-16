@@ -1042,6 +1042,9 @@ Verification status:
 - **Release acceptance remains OPEN:** no authenticated/destructive GitHub E2E, physical Android/iOS, full real light/dark theme comparison, keyboard/screen-reader-safe configured Force confirmation, or hosted CI qualification. Do not merge PR #8 or publish stable release solely on screenshot smoke evidence.
 - Primary repo still includes unrelated unstaged `tests/v4/github-transport.test.ts` WIP. Never stage/revert it. Qualify the exact pushed code SHA on the separate clean detached worktree after commit and record gates.
 
+- **Exact-SHA UI acceptance evidence (follow-up):** code commit `216af46d812802811e2c8d2c32cfc39fe3c0ae6e` (pushed on Draft PR #8), verified in **detached clean checkout** `.tmp/release-audit-clean-20261010` with frozen install, Production Build, Fast Tests, Repeat **10/10**, Recovery, Resource, Feasibility, Metadata/Package and three E2E harness compile-only bundles all exiting 0. Crucially, `corepack pnpm test:ui:visual` also launched **real Obsidian 1.14.4**, passed **27 assertions**, captured **12 PNGs** and observed no JavaScript exceptions from the exact same code SHA. Post-test Git status: **`## HEAD (no branch)`**. Source worktree still preserves the unrelated unstaged `tests/v4/github-transport.test.ts` helper WIP.
+- Remaining non-claims unchanged: no physical Android/iOS visual acceptance, actual GitHub live E2E mutation, fully keyboard-accessible configured Force slider, native all-theme/locale matrix, merge or release approval. Baseline and after-fix real-screen captures linked from `docs/engineering/real-obsidian-ui-visual-evidence-2026-10-16.md`.
+
 ### TDD plan
 
 Write RED regressions before fixes:
