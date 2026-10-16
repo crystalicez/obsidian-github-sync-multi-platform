@@ -14,6 +14,7 @@ import {CANONICAL_REPOSITORY_ID,readOriginFetchRepository} from "./github-repo.m
 import {verifyPngBytes,visibleIntersection} from "./ui-visual-assertions.mjs";
 import {parseLiveUiMode,assertEncryptedRemoteTree} from "./obsidian-live-ui-mode.mjs";
 import {cleanupGeneratedUiRun} from "./obsidian-live-ui-cleanup.mjs";
+import {restoreEncryptedToSecondObsidian} from "./obsidian-live-ui-peer.mjs";
 
 const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),"..");
 const opts=process.argv.slice(2);
@@ -21,6 +22,8 @@ const option=(key,def)=>opts.find(x=>x.startsWith(`--${key}=`))?.slice(key.lengt
 const exe=option("obsidian","C:\\Program Files\\Obsidian\\Obsidian.exe");
 const dryRun=opts.includes("--preflight-only");
 const mode=parseLiveUiMode(option("mode",undefined));
+const verifyPeer=opts.includes("--verify-peer");
+assert.ok(!verifyPeer||mode==="encrypted","A second-vault restore requires --mode=encrypted");
 const passphrase=mode==="encrypted"?randomBytes(32).toString("base64url"):"";
 const id="encrypted-github-sync-multi-platform";
 const runId=randomBytes(8).toString("hex");
@@ -63,7 +66,7 @@ const redact=(value)=>{
  return msg.replace(/gh[pousr]_[A-Za-z0-9_]+/gu,"[redacted]").replace(/github_pat_[A-Za-z0-9_]+/gu,"[redacted]").slice(0,550);
 };
 let processHandle,ws,configuration,branch,verified=false,passed=false,initialSha,finalSha;
-let cleanupState="not-started",screenBytes=0,remoteEncryptionVerified=false;
+let cleanupState="not-started",screenBytes=0,remoteEncryptionVerified=false,peerRestored=false,peerScreenshot=null;
 const sendErrors=[];
 const requestMap=new Map();let serial=0;
 function send(method,params={},timeoutMs=25000){
@@ -119,7 +122,7 @@ async function captureSyncedCenter(){
  return {width:size.width,height:size.height,bytes:screenBytes};
 }
 try{
- assertTrue(Number.isInteger(port)&&port>=1024&&port<=65535,"Safe CDP port required");
+ assertTrue(Number.isInteger(port)&&port>=1024&&port<=(verifyPeer?65534:65535),"Safe CDP port required");
  const sha=runGit(["rev-parse","HEAD"]);
  assertTrue(sha.status===0&&/^[0-9a-f]{40}$/u.test(sha.stdout.trim()),"Valid pinned source SHA required");
  const status=runGit(["status","--porcelain"]);
@@ -243,6 +246,17 @@ try{
    remoteEncryptionVerified=Boolean(encryptionProof.configValid&&encryptionProof.cipherHeaderValid&&encryptionProof.opaqueObjects);
   }
   await captureSyncedCenter();
+  if(verifyPeer){
+   const restored=await restoreEncryptedToSecondObsidian({
+    exe,runRoot,port:port+1,pluginId:id,sourceRoot:root,configuration,passphrase,
+    expectedContent:"# Synthetic remote UI E2E\n\nSecond revision from Obsidian.\n",
+   });
+   assertTrue(restored.peerRestored&&restored.bytesRestored>0,"Second real Obsidian vault could not decrypt remote data");
+   const afterPull=await readState(configuration);
+   assertTrue(afterPull.kind==="present"&&afterPull.sha===finalSha,"Second-device Force Pull unexpectedly changed GitHub HEAD");
+   peerRestored=true;
+   peerScreenshot=restored.peerScreenshot;
+  }
   passed=true;
  }
 }catch(error){
@@ -269,5 +283,5 @@ try{
   try{await cleanupGeneratedUiRun(runRoot,{repoRoot:root});}catch(error){console.error("WARNING: isolated test vault cleanup incomplete ("+String(error?.code||"unknown").slice(0,30)+")");process.exitCode=1;}
  }
  console.log(JSON.stringify({status:passed&&!process.exitCode?"PASS":"FAIL",cleanup:cleanupState,remoteHeadChanged:Boolean(initialSha&&finalSha&&initialSha!==finalSha),
-  screenshotCaptured:screenBytes>1000,screenshotPath:screenBytes>1000?screenshot:null,uiExceptions:sendErrors.length,mode,remoteEncryptionVerified,runBranch:branch,repository:configuration?.targetRepository,token:"[not reported]"}));
+  screenshotCaptured:screenBytes>1000,screenshotPath:screenBytes>1000?screenshot:null,uiExceptions:sendErrors.length,mode,remoteEncryptionVerified,peerRestored,peerScreenshot,runBranch:branch,repository:configuration?.targetRepository,token:"[not reported]"}));
 }

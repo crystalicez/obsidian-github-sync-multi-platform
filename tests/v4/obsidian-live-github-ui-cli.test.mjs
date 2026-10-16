@@ -19,6 +19,12 @@ test("live Obsidian UI runner fails closed for a dirty source checkout",()=>{
  assert.match(r.stderr,/clean source checkout|Missing|required|not found|GITHUB_E2E/iu);
  assert.doesNotMatch(r.stderr,/gh[pousr]_[A-Za-z0-9_]{12,}/gu);
 });
+test("peer restore must explicitly select encrypted mode before any remote access",()=>{
+ const r=spawnSync(process.execPath,[runner,"--verify-peer","--preflight-only"],{encoding:"utf8",timeout:15000});
+ assert.notEqual(r.status,0);
+ assert.match(r.stderr,/requires --mode=encrypted/iu);
+});
+
 test("configured live UI harness uses a randomly named cleanup-restricted branch, never a default branch",()=>{
  const code=readFileSync(runner,"utf8");
  assert.match(code,/qualificationE2EBranch\(sha\.stdout\.trim\(\),runId\)/u);
@@ -26,6 +32,8 @@ test("configured live UI harness uses a randomly named cleanup-restricted branch
  assert.match(code,/initialSha/);
  assert.match(code,/\.github-sync-center__actions button/u);
  assert.match(code,/GITHUB_E2E_EXPECTED_REPO_ID/u);
+ assert.match(code,/restoreEncryptedToSecondObsidian/u);
+ assert.match(code,/afterPull.sha===finalSha/u);
  assert.match(code,/parseLiveUiMode/u);
  assert.match(code,/verifyEncryptedGitHubTree/u);
 });
