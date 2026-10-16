@@ -175,7 +175,7 @@ try{
    const p=app.plugins.plugins[${JSON.stringify(id)}];
    try{
     const value=await p.v4Runtime.forcePush(false);
-    return {ok:true,status:value?.status??null,lifecycle:p.v4Runtime.progressSnapshot.lifecycle};
+    return {ok:true,status:value?.status??null,lifecycle:p.v4Runtime.progressSnapshot.lifecycle,phase:p.v4Runtime.progressSnapshot.failurePhase??null,error:p.v4Runtime.progressSnapshot.errorMessage?.slice(0,180)??null};
    }catch(err){return {ok:false,error:String(err?.message||err).slice(0,210),lifecycle:p.v4Runtime.progressSnapshot.lifecycle};}
   })()`,240000);
   assertTrue(initial.ok&&["success","no-change"].includes(initial.lifecycle),"Initial synthetic branch forcePush failed: "+JSON.stringify(initial));
