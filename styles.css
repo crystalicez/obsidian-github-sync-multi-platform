@@ -1,7 +1,6 @@
-@charset "UTF-8";
 .obsidian-github-sync-multi-platform-ribbon-icon {
   animation: rotate 2s linear infinite;
-  /* 旋转动画：2秒一圈，线性，无限循环 */
+  /* Rotation animation: one full turn every 2 s, linear, infinite */
 }
 
 @keyframes rotate {
@@ -31,24 +30,24 @@
 
 .github-sync-support-section {
   text-align: left;
-  padding: 20px;
+  padding: var(--size-4-5);
   background-color: var(--background-secondary);
-  border-radius: 12px;
-  margin: 20px 0;
+  border-radius: var(--radius-m);
+  margin: var(--size-4-5) 0;
 }
 .github-sync-support-section h3 {
   margin-top: 0;
-  margin-bottom: 10px;
+  margin-bottom: var(--size-4-2);
 }
 .github-sync-support-section p {
-  margin-bottom: 20px;
+  margin-bottom: var(--size-4-5);
   font-size: var(--font-ui-small);
   opacity: 0.8;
 }
 .github-sync-support-section .kofi-img {
   height: 36px;
   display: block;
-  margin-top: 10px;
+  margin-top: var(--size-4-2);
 }
 
 .obsidian-github-sync-multi-platform-settings {
@@ -102,7 +101,66 @@
   padding: 8px 10px;
 }
 
+.github-sync-settings-header {
+  border-bottom: 2px solid var(--interactive-accent);
+  padding-bottom: 4px;
+  margin-top: 24px;
+  margin-bottom: 12px;
+}
+.github-sync-settings-header .setting-item-name {
+  font-size: 1.15em !important;
+  font-weight: bold !important;
+  color: var(--interactive-accent) !important;
+}
+.github-sync-settings-header .setting-item-description {
+  display: none;
+}
 
+.github-sync-settings-dirty-banner {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--size-4-2);
+  background-color: var(--background-secondary-alt);
+  border: 1px solid var(--interactive-accent);
+  border-left: 5px solid var(--interactive-accent);
+  border-radius: var(--radius-m);
+  padding: var(--size-4-3) var(--size-4-5);
+  margin-bottom: var(--size-4-5);
+}
+.github-sync-settings-dirty-banner .github-sync-settings-dirty-text {
+  font-weight: bold;
+  color: var(--text-normal);
+}
+.github-sync-settings-dirty-banner > p {
+  flex: 1 1 17rem;
+  min-width: 0;
+  margin: 0;
+  color: var(--text-muted);
+  font-size: var(--font-ui-small);
+}
+.github-sync-settings-dirty-banner .github-sync-settings-dirty-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--size-4-2);
+}
+.github-sync-settings-dirty-banner .github-sync-settings-dirty-buttons button {
+  margin-left: 0;
+}
+
+@media (max-width: 480px) {
+  .github-sync-settings-dirty-banner {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .github-sync-settings-dirty-banner > p {
+    flex: initial;
+  }
+  .github-sync-settings-dirty-banner .github-sync-settings-dirty-buttons {
+    justify-content: flex-end;
+  }
+}
 .github-sync-force-confirm-slider {
   position: relative;
   height: 44px;
@@ -136,7 +194,7 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  width: min(240px, calc(100% - 8px));
+  width: min(240px, 100% - 8px);
   height: 34px;
   padding: 0 12px;
   border-radius: 5px;
@@ -165,6 +223,15 @@
   font-size: var(--font-ui-small);
 }
 
+@media (prefers-reduced-motion: reduce) {
+  .obsidian-github-sync-multi-platform-ribbon-icon {
+    animation: none;
+  }
+  .github-sync-force-confirm-fill,
+  .github-sync-force-confirm-handle {
+    transition: none;
+  }
+}
 .github-sync-center {
   padding: var(--size-4-3);
   height: 100%;
@@ -185,9 +252,11 @@
   justify-content: space-between;
   flex-wrap: wrap;
 }
+
 .github-sync-center__actions {
   flex-wrap: wrap;
 }
+
 .github-sync-center__change span:last-child {
   min-width: 0;
   overflow-wrap: anywhere;
@@ -197,6 +266,10 @@
   display: grid;
   grid-template-columns: minmax(220px, 0.8fr) minmax(300px, 1.2fr);
   gap: var(--size-4-3);
+  height: calc(100% - 54px);
+}
+
+.github-sync-center__layout {
   flex: 1;
   min-height: 0;
   height: auto;
@@ -372,77 +445,8 @@
     max-height: 55vh;
   }
 }
-
 @media (max-width: 480px) {
   .github-sync-center__progress-directions {
     grid-template-columns: 1fr;
-  }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .obsidian-github-sync-multi-platform-ribbon-icon {
-    animation: none;
-  }
-  .github-sync-force-confirm-fill,
-  .github-sync-force-confirm-handle {
-    transition: none;
-  }
-}
-.github-sync-settings-header {
-  border-bottom: 2px solid var(--interactive-accent);
-  padding-bottom: 4px;
-  margin-top: 24px;
-  margin-bottom: 12px;
-}
-.github-sync-settings-header .setting-item-name {
-  font-size: 1.15em !important;
-  font-weight: bold !important;
-  color: var(--interactive-accent) !important;
-}
-.github-sync-settings-header .setting-item-description {
-  display: none;
-}
-.github-sync-settings-dirty-banner {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: var(--size-4-2);
-  background-color: var(--background-secondary-alt);
-  border: 1px solid var(--interactive-accent);
-  border-left: 5px solid var(--interactive-accent);
-  border-radius: var(--radius-m);
-  padding: var(--size-4-3) var(--size-4-5);
-  margin-bottom: var(--size-4-5);
-}
-.github-sync-settings-dirty-banner .github-sync-settings-dirty-text {
-  font-weight: bold;
-  color: var(--text-normal);
-}
-.github-sync-settings-dirty-banner > p {
-  flex: 1 1 17rem;
-  min-width: 0;
-  margin: 0;
-  color: var(--text-muted);
-  font-size: var(--font-ui-small);
-}
-.github-sync-settings-dirty-banner .github-sync-settings-dirty-buttons {
-  display: flex;
-  flex-wrap: wrap;
-  gap: var(--size-4-2);
-}
-.github-sync-settings-dirty-banner .github-sync-settings-dirty-buttons button {
-  margin-left: 0;
-}
-@media (max-width: 480px) {
-  .github-sync-settings-dirty-banner {
-    flex-direction: column;
-    align-items: stretch;
-  }
-  .github-sync-settings-dirty-banner > p {
-    flex: initial;
-  }
-  .github-sync-settings-dirty-banner .github-sync-settings-dirty-buttons {
-    justify-content: flex-end;
   }
 }
