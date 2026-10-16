@@ -58,6 +58,14 @@ The previous selector-presence CSS tests were insufficient: when pinned Dart Sas
 
 **Real-UI limitation:** a separate Windows Obsidian 1.14.4 process with isolated profile was launched, confirmed on CDP as an Obsidian starter page, and a project-local synthetic vault was prepared at `.tmp/ui-acceptance-20261010-vault`. The native Windows folder picker did not complete reliably; the **plugin's actual Settings, Sync Center and modals were not rendered or visually inspected**. A successful app launch is **not** a visual acceptance pass, and the user’s normal vault was not used.
 
+### 2026-10-16 — actual Obsidian Desktop screenshot verification
+
+A reproducible **visual smoke script** now exists: `scripts/run-ui-screenshots.mjs` (via `pnpm test:ui:visual`). It launches real **Obsidian 1.14.4 on Windows** with a strictly project-local synthetic vault and separate Electron profile, safely enables the plugin in that profile, discovers the **separate Settings popout** in CDP, checks DOM/layout/locked Force dialogs, and stores actual PNGs plus a structured `report.json`. **A fresh-profile run passed 29 protocol/DOM checks and captured 12 images, with no observed JavaScript exceptions.** Selected synthetic-only screenshots and invocation guidance: `docs/engineering/real-obsidian-ui-visual-evidence-2026-10-16.md`.
+
+**Confirmed visual findings:** UI-122 MEDIUM, Sync Center's real 300px sidebar had only 276px of layout width, but demanded 220px+300px columns; its detail overflowed beyond the dock. Sidebar-relative container queries now keep the pane inside its bounds (verified `detailRight === layoutRight` at 1012px), RED/GREEN. UI-123 LOW, redundant inline-error Toasts obscured controls; the inline error remains but the duplicate Toast is gone, RED/GREEN. **Open:** UI-124, Obsidian's desktop Settings at CDP-emulated 375px retains its navigation and leaves only 175px for the plugin form; **not** Android/iOS acceptance. UI-125, unconfigured Force modal shows `Repository: /` and still uses pointer-only unlock; the runner checks locked state and only clicks Cancel.
+
+Screenshots and deterministic checks are **not** credentialed GitHub E2E, native mobile/device accessibility proof, or stable release qualification.
+
 ## Acceptance checklist in a disposable vault
 
 - Windows Desktop: dark and light themes, 320–480px narrow pane, 100%/200% zoom; Settings all sections and dirty/clipboard/save states; every Sync Center state; error/empty/failed; status bar, ribbon, command palette.

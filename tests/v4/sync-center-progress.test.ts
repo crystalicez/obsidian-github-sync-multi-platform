@@ -323,8 +323,7 @@ test("Sync Center renders a useful error when an async provider throws null or a
     await view.onOpen();
     const visible = view.contentEl.flattenText();
     assert.match(visible, thrown === null ? /Unable to load|unexpected error|failed/iu : /network unavailable/iu);
-    assert.equal(Notice.messages.length, 1);
-    assert.doesNotMatch(Notice.messages[0], /undefined|null/iu);
+    assert.equal(Notice.messages.length, 0, "Errors already displayed inside Sync Center must not spawn overlapping toast notices");
     await view.onClose();
   }
 });

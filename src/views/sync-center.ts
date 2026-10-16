@@ -1,4 +1,4 @@
-import { ItemView, Notice, WorkspaceLeaf } from "obsidian"
+import { ItemView, WorkspaceLeaf } from "obsidian"
 import type FastSync from "../main"
 import type { V4HistoryChange, V4HistoryCommit, V4HistoryService, V4VersionPreview } from "../lib/v4/history-service"
 import {
@@ -407,6 +407,6 @@ export class V4SyncCenterView extends ItemView {
         ? error
         : "Unable to load history. An unexpected error occurred."
     container.createEl("p", { text: message, cls: "github-sync-center__error" })
-    new Notice(`GitHub Sync Center: ${message}`)
+    // The error is already visible in this view; a toast would obscure its header and navigation.
   }
 }

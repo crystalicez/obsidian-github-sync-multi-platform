@@ -46,6 +46,14 @@ test("Sync Center layouts wrap header actions and long changed paths on small sc
   }
 });
 
+test("Sync Center responds to its containing sidebar instead of the full desktop window", () => {
+  for (const css of [source, distributed]) {
+    assert.match(css, /\.github-sync-center\s*\{[^}]*container-type:\s*inline-size/su);
+    assert.match(css, /@container\s*\(max-width:\s*640px\)/u);
+    assert.match(css, /\.github-sync-center__layout\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)/su);
+  }
+});
+
 test("mobile CSS stacks the settings dirty-state buttons in narrow viewports", () => {
   for (const css of [source, distributed]) {
     assert.match(css, /@media\s*\(max-width:\s*480px\)/u);

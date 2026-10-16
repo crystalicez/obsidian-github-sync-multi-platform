@@ -238,6 +238,8 @@
   overflow: hidden;
   display: flex;
   flex-direction: column;
+  min-width: 0;
+  container-type: inline-size;
 }
 
 .github-sync-center__header,
@@ -432,6 +434,17 @@
   text-align: right;
 }
 
+@container (max-width: 640px) {
+  .github-sync-center__layout {
+    grid-template-columns: minmax(0, 1fr);
+    overflow-y: auto;
+  }
+  .github-sync-center__master,
+  .github-sync-center__detail {
+    min-width: 0;
+    max-height: 55vh;
+  }
+}
 @media (max-width: 700px) {
   .github-sync-center {
     overflow: auto;

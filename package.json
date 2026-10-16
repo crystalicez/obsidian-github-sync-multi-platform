@@ -16,6 +16,7 @@
     "test:github-e2e:compile": "node scripts/run-github-e2e.mjs --compile-only",
     "zip": "node scripts/zip-source.mjs",
     "test:fast": "node scripts/run-tests.mjs --tier=fast",
+    "test:ui:visual": "pnpm build && node scripts/run-ui-screenshots.mjs",
     "test:repeat": "node scripts/run-test-repeat.mjs",
     "test:feasibility": "node scripts/run-tests.mjs --tier=feasibility",
     "test:resource": "node scripts/run-tests.mjs --tier=resource",
