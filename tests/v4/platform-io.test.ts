@@ -74,6 +74,12 @@ test("mobile without appendBinary rejects bounded append", async () => {
 });
 
 
+test("production CommonJS plugin prefers require for desktop built-ins in Electron renderer", async () => {
+  const code = await readFile(path.join(process.cwd(), "main.js"), "utf8");
+  assert.match(code, /require\(["']node:fs\/promises["']\)/u, "Desktop filesystem must use Obsidian CommonJS require rather than browser dynamic import");
+  assert.match(code, /require\(["']node:path["']\)/u, "Desktop paths must use Obsidian CommonJS require rather than browser dynamic import");
+});
+
 test("desktop dynamic Node IO is externalized and mobile minimum stays feature-gated", async () => {
   const buildConfig = await readFile(path.join(process.cwd(), "esbuild.config.mjs"), "utf8");
   const manifest = JSON.parse(await readFile(path.join(process.cwd(), "manifest.json"), "utf8")) as { minAppVersion: string };

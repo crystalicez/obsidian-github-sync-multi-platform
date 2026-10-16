@@ -70,11 +70,16 @@ function parent(path: string): string {
   return path.replace(/\\/gu, "/").split("/").slice(0, -1).join("/")
 }
 
-async function desktopFs() {
+// Obsidian loads the plugin as CommonJS inside Electron. Browser-style
+// dynamic import("node:*") is treated as a URL fetch by Chromium there and
+// fails even though the same import works in the Node test harness.
+async function desktopFs(): Promise<typeof import("node:fs/promises")> {
+  if (typeof exports === "object" && typeof require === "function") return require("node:fs/promises") as typeof import("node:fs/promises")
   return import("node:fs/promises")
 }
 
-async function desktopPath() {
+async function desktopPath(): Promise<typeof import("node:path")> {
+  if (typeof exports === "object" && typeof require === "function") return require("node:path") as typeof import("node:path")
   return import("node:path")
 }
 
