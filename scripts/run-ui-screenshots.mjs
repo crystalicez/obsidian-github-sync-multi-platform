@@ -333,6 +333,69 @@ try {
     checked(`${mode} refuses unconfigured repository`,safety.dialogs===before&&!safety.forceSlider&&safety.notices.some(t=>/Configure and save your GitHub owner/u.test(t)),JSON.stringify(safety));
     await record(mode==="forcePush"?"10-force-push-unconfigured":"11-force-pull-unconfigured");
   }
+  // Exercise the real Electron keyboard path without creating a GitHub client,
+  // storing credentials, or invoking either destructive action.
+  for (const mode of ["forcePush", "forcePull"]) {
+    const opened = await evaluate(`(()=>{
+      const plugin=app.plugins.plugins[${JSON.stringify(id)}];
+      if(plugin.githubClient)throw Error("UI fixture must not have a GitHub client");
+      plugin.settings.githubOwner="synthetic-owner";
+      plugin.settings.githubRepo="synthetic-repo";
+      plugin.settings.githubBranch="synthetic-branch";
+      plugin.settings.githubToken="invalid-fixture-token";
+      void plugin.showForceConfirm(${JSON.stringify(mode)});
+      const slider=document.querySelector(".github-sync-force-confirm-slider");
+      slider?.focus();
+      const dialog=slider?.closest(".modal-container");
+      const forceButton=[...(dialog?.querySelectorAll("button")??[])].find(e=>/^Force (push|pull)$/u.test(e.textContent.trim()));
+      return {slider:!!slider,focused:document.activeElement===slider,role:slider?.getAttribute("role"),
+        label:slider?.getAttribute("aria-label"),value:slider?.getAttribute("aria-valuenow"),
+        hidden:forceButton?.style.display==="none",hasClient:!!plugin.githubClient};
+    })()`);
+    checked(`${mode} real Obsidian keyboard slider initial state`,
+      opened.slider&&opened.focused&&opened.role==="slider"&&opened.value==="0"&&opened.hidden
+        &&!opened.hasClient&&opened.label.includes("synthetic-owner/synthetic-repo on synthetic-branch"),
+      JSON.stringify(opened));
+    for(let index=0;index<9;index++){
+      await send("Input.dispatchKeyEvent",{type:"keyDown",key:"ArrowRight",code:"ArrowRight",windowsVirtualKeyCode:39});
+      await send("Input.dispatchKeyEvent",{type:"keyUp",key:"ArrowRight",code:"ArrowRight",windowsVirtualKeyCode:39});
+    }
+    const partial=await evaluate(`(()=>{
+      const slider=document.querySelector(".github-sync-force-confirm-slider");
+      const dialog=slider?.closest(".modal-container");
+      const forceButton=[...(dialog?.querySelectorAll("button")??[])].find(e=>/^Force (push|pull)$/u.test(e.textContent.trim()));
+      return {value:slider?.getAttribute("aria-valuenow"),hidden:forceButton?.style.display==="none"};
+    })()`);
+    checked(`${mode} nine real ArrowRight presses cannot enable Force`,partial.value==="90"&&partial.hidden,JSON.stringify(partial));
+    await send("Input.dispatchKeyEvent",{type:"keyDown",key:"ArrowRight",code:"ArrowRight",windowsVirtualKeyCode:39});
+    await send("Input.dispatchKeyEvent",{type:"keyUp",key:"ArrowRight",code:"ArrowRight",windowsVirtualKeyCode:39});
+    const unlocked=await evaluate(`(()=>{
+      const slider=document.querySelector(".github-sync-force-confirm-slider");
+      const dialog=slider?.closest(".modal-container");
+      const forceButton=[...(dialog?.querySelectorAll("button")??[])].find(e=>/^Force (push|pull)$/u.test(e.textContent.trim()));
+      return {value:slider?.getAttribute("aria-valuenow"),text:slider?.getAttribute("aria-valuetext"),
+        actionVisible:!!forceButton&&forceButton.style.display!=="none"};
+    })()`);
+    checked(`${mode} ten real ArrowRight presses unlock but never execute`,
+      unlocked.value==="100"&&/Unlocked/u.test(unlocked.text)&&unlocked.actionVisible,JSON.stringify(unlocked));
+    await record(mode==="forcePush"?"12-force-push-keyboard-unlocked":"13-force-pull-keyboard-unlocked",
+      {visibleSelector:".github-sync-force-confirm-slider"});
+    const cancelled=await evaluate(`(()=>{
+      const plugin=app.plugins.plugins[${JSON.stringify(id)}];
+      const slider=document.querySelector(".github-sync-force-confirm-slider");
+      const dialog=slider?.closest(".modal-container");
+      const cancel=[...(dialog?.querySelectorAll("button")??[])].find(e=>e.textContent.trim()==="Cancel");
+      cancel?.click();
+      plugin.settings.githubOwner="";
+      plugin.settings.githubRepo="";
+      plugin.settings.githubBranch="main";
+      plugin.settings.githubToken="";
+      return {cancelFound:!!cancel,hasClient:!!plugin.githubClient,
+        cleared:!plugin.settings.githubToken&&!plugin.settings.githubOwner&&!plugin.settings.githubRepo};
+    })()`);
+    checked(`${mode} keyboard confirmation cancelled without a remote client`,
+      cancelled.cancelFound&&!cancelled.hasClient&&cancelled.cleared,JSON.stringify(cancelled));
+  }
   if(evidence.exceptions.length)evidence.warnings.push(`Runtime exceptions seen: ${evidence.exceptions.length}; inspect exceptions array`);
 } catch(err) {
   evidence.failure=String(err?.stack||err).slice(0,1800);

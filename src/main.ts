@@ -420,9 +420,17 @@ export default class FastSync extends Plugin {
       modal.contentEl.createEl("p", { text: `Repository: ${repo}` })
       modal.contentEl.createEl("p", { text: `Branch: ${branch}` })
       modal.contentEl.createEl("p", { text: `Local vault files: ${localFileCount}` })
-      modal.contentEl.createEl("p", { text: "Drag the confirmation control fully to the right, then click the unlocked action button." })
+      modal.contentEl.createEl("p", { text: "Drag the control to the right, or focus it and use the arrow keys or End to unlock. Then click the force action button." })
 
       const slider = modal.contentEl.createDiv({ cls: "github-sync-force-confirm-slider" })
+      slider.setAttribute("role", "slider")
+      slider.setAttribute("tabindex", "0")
+      slider.setAttribute("aria-orientation", "horizontal")
+      slider.setAttribute("aria-label", `Unlock ${operation === "forcePush" ? "force push" : "force pull"} for ${repo} on ${branch}`)
+      slider.setAttribute("aria-valuemin", "0")
+      slider.setAttribute("aria-valuemax", "100")
+      slider.setAttribute("aria-valuenow", "0")
+      slider.setAttribute("aria-valuetext", "0 percent toward unlock")
       const fill = slider.createDiv({ cls: "github-sync-force-confirm-fill" })
       const handle = slider.createDiv({ cls: "github-sync-force-confirm-handle" })
       const sliderLabel = handle.createEl("span", { text: operation === "forcePush" ? "Slide to unlock force push" : "Slide to unlock force pull" })
@@ -442,19 +450,25 @@ export default class FastSync extends Plugin {
       let dragging = false
       let unlocked = false
       let resolved = false
-      const resetSlider = () => {
-        fill.style.width = "0%"
-        handle.style.transform = "translateX(0)"
-      }
-      const unlockConfirmButton = () => {
+      let progress = 0
+      const setProgress = (next: number) => {
         if (unlocked) return
-        unlocked = true
-        fill.style.width = "100%"
-        slider.addClass("is-complete")
-        sliderLabel.setText("Unlocked")
-        confirmButton.style.display = ""
-        unlockMessage.style.display = ""
+        progress = Math.max(0, Math.min(100, Math.round(next)))
+        if (progress >= 97) {
+          progress = 100
+          unlocked = true
+          slider.addClass("is-complete")
+          sliderLabel.setText("Unlocked")
+          confirmButton.style.display = ""
+          unlockMessage.style.display = ""
+        }
+        const rect = slider.getBoundingClientRect()
+        fill.style.width = `${progress}%`
+        handle.style.transform = `translateX(${progress / 100 * Math.max(0, rect.width - handle.offsetWidth)}px)`
+        slider.setAttribute("aria-valuenow", String(progress))
+        slider.setAttribute("aria-valuetext", unlocked ? "Unlocked. Tab to the force action button to confirm." : `${progress} percent toward unlock`)
       }
+      const resetSlider = () => setProgress(0)
       const runConfirmedOperation = () => {
         if (resolved || !unlocked) return
         resolved = true
@@ -470,21 +484,33 @@ export default class FastSync extends Plugin {
         finish()
       }
       confirmButton.onclick = runConfirmedOperation
-      const setProgress = (clientX: number) => {
+      const setPointerProgress = (clientX: number) => {
         const rect = slider.getBoundingClientRect()
-        const progress = rect.width > 0 ? Math.max(0, Math.min(1, (clientX - rect.left) / rect.width)) : 0
-        fill.style.width = `${progress * 100}%`
-        handle.style.transform = `translateX(${progress * Math.max(0, rect.width - handle.offsetWidth)}px)`
-        if (progress >= 0.97) unlockConfirmButton()
+        setProgress(rect.width > 0 ? (clientX - rect.left) / rect.width * 100 : 0)
+      }
+      slider.onkeydown = (event: KeyboardEvent) => {
+        if (unlocked) return
+        let next: number
+        switch (event.key) {
+          case "ArrowRight":
+          case "ArrowUp": next = progress + 10; break
+          case "ArrowLeft":
+          case "ArrowDown": next = progress - 10; break
+          case "Home": next = 0; break
+          case "End": next = 100; break
+          default: return
+        }
+        event.preventDefault()
+        setProgress(next)
       }
       slider.onpointerdown = (event: PointerEvent) => {
         if (unlocked) return
         dragging = true
         slider.setPointerCapture?.(event.pointerId)
-        setProgress(event.clientX)
+        setPointerProgress(event.clientX)
       }
       slider.onpointermove = (event: PointerEvent) => {
-        if (dragging && !unlocked) setProgress(event.clientX)
+        if (dragging && !unlocked) setPointerProgress(event.clientX)
       }
       slider.onpointerup = (event: PointerEvent) => {
         if (!dragging) return

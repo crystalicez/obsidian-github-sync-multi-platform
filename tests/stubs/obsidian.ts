@@ -29,9 +29,11 @@ export class Notice {
 
 export const modalEvents: string[] = [];
 export const modalButtons: Array<{ text: string; click: () => void }> = [];
+export const modalInstances: Modal[] = [];
 export function resetModalTestState() {
   modalEvents.length = 0;
   modalButtons.length = 0;
+  modalInstances.length = 0;
 }
 
 export class ElementStub {
@@ -39,6 +41,7 @@ export class ElementStub {
   title = "";
   disabled = false;
   onclick?: () => void;
+  onkeydown?: (event: KeyboardEvent) => void;
   onpointerdown?: (event: PointerEvent) => void;
   onpointermove?: (event: PointerEvent) => void;
   onpointerup?: (event: PointerEvent) => void;
@@ -156,13 +159,16 @@ export class Modal {
   contentEl = new ElementStub();
   app: unknown;
 
+  onClose?: () => void;
+
   constructor(app: unknown) {
     this.app = app;
     modalEvents.push("construct");
+    modalInstances.push(this);
   }
 
   open() { modalEvents.push("open"); }
-  close() { modalEvents.push("close"); }
+  close() { modalEvents.push("close"); this.onClose?.(); }
 }
 
 export class WorkspaceLeaf {
