@@ -5,7 +5,7 @@
 import assert from "node:assert/strict";
 import {spawn,spawnSync} from "node:child_process";
 import {randomBytes} from "node:crypto";
-import {copyFile,mkdir,readFile,rm,writeFile} from "node:fs/promises";
+import {copyFile,mkdir,writeFile} from "node:fs/promises";
 import path from "node:path";
 import {fileURLToPath} from "node:url";
 import {loadGitHubE2EEnv,qualificationE2EBranch,validateGitHubE2EConfig} from "./github-e2e-env.mjs";
@@ -13,6 +13,7 @@ import {preflightE2ERemote,readE2EBranch,cleanupE2EBranch} from "./github-e2e-re
 import {CANONICAL_REPOSITORY_ID,readOriginFetchRepository} from "./github-repo.mjs";
 import {verifyPngBytes,visibleIntersection} from "./ui-visual-assertions.mjs";
 import {parseLiveUiMode,assertEncryptedRemoteTree} from "./obsidian-live-ui-mode.mjs";
+import {cleanupGeneratedUiRun} from "./obsidian-live-ui-cleanup.mjs";
 
 const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),"..");
 const opts=process.argv.slice(2);
@@ -265,7 +266,7 @@ try{
  // profile only after terminating the process. PNG is also deleted: it can be
  // retained only via an explicit sanitized export in a later reviewed workflow.
  if(!dryRun){
-  try{await rm(runRoot,{recursive:true,force:true});}catch(error){console.error("WARNING: isolated test vault cleanup incomplete");process.exitCode=1;}
+  try{await cleanupGeneratedUiRun(runRoot,{repoRoot:root});}catch(error){console.error("WARNING: isolated test vault cleanup incomplete ("+String(error?.code||"unknown").slice(0,30)+")");process.exitCode=1;}
  }
  console.log(JSON.stringify({status:passed&&!process.exitCode?"PASS":"FAIL",cleanup:cleanupState,remoteHeadChanged:Boolean(initialSha&&finalSha&&initialSha!==finalSha),
   screenshotCaptured:screenBytes>1000,screenshotPath:screenBytes>1000?screenshot:null,uiExceptions:sendErrors.length,mode,remoteEncryptionVerified,runBranch:branch,repository:configuration?.targetRepository,token:"[not reported]"}));
