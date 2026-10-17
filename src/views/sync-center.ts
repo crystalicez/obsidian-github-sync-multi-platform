@@ -316,7 +316,10 @@ export class V4SyncCenterView extends ItemView {
       }
       const labelFor = (entry: V4FileOverviewEntry) => entry.reason === "local-deleted"
         ? "Deleted locally"
-        : entry.reason === "remote-deleted" ? "Deleted remotely" : filterNames[entry.status]
+        : entry.reason === "remote-deleted" ? "Deleted remotely"
+          : entry.reason === "remote-renamed-from" ? "Moved on GitHub"
+            : entry.reason === "remote-renamed-to" ? "Renamed on GitHub"
+              : filterNames[entry.status]
       const fileList = body.createDiv({ cls: "github-sync-center__file-list" })
       const controls = toolbar.createDiv({ cls: "github-sync-center__file-controls" })
       const treeToggle = controls.createEl("button", { text: "Tree view" })
@@ -356,7 +359,11 @@ export class V4SyncCenterView extends ItemView {
           ? "Previously synchronized, but now missing locally. A future sync may propagate this deletion to GitHub. Check your changes before syncing."
           : entry.reason === "remote-deleted"
             ? "Previously synchronized, but now missing on GitHub. A future sync may remove the local file. Check your changes before syncing."
-            : undefined
+            : entry.reason === "remote-renamed-from"
+              ? `GitHub has moved this tracked file to ${entry.relatedPath}. Check the new location and your local edits before syncing.`
+              : entry.reason === "remote-renamed-to"
+                ? `Previously synchronized as ${entry.relatedPath}; the same file identity now appears here on GitHub. Review the move before syncing.`
+                : undefined
         detail.createEl("p", { text: deletionHelp ?? help[entry.status], cls: deletionHelp ? "github-sync-center__file-warning" : "github-sync-center__muted" })
         if (entry.local) {
           const open = detail.createEl("button", { text: "Open local file" })

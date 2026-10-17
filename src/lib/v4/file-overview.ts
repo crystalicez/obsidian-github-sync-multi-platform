@@ -6,8 +6,9 @@ export interface V4FileOverviewEntry {
   status: V4FileStatus;
   local: boolean;
   remote: boolean;
-  /** Tracked-file deletion; never label as a new one-sided file. */
-  reason?: "local-deleted" | "remote-deleted";
+  /** Tracked-file removal or verified remote rename; do not imply unrelated additions. */
+  reason?: "local-deleted" | "remote-deleted" | "remote-renamed-from" | "remote-renamed-to";
+  relatedPath?: string;
 }
 export interface V4FileOverview {
   entries: V4FileOverviewEntry[];
@@ -15,8 +16,8 @@ export interface V4FileOverview {
 }
 export interface V4FileOverviewInput {
   localFiles: Array<{ path: string; size: number; mtime: number }>;
-  remoteFiles: Array<{ path: string; remoteVersion: string }>;
-  baselineFiles: Array<{ path: string; remoteVersion: string; size: number; mtime: number }>;
+  remoteFiles: Array<{ path: string; remoteVersion: string; fileId?: string }>;
+  baselineFiles: Array<{ path: string; remoteVersion: string; size: number; mtime: number; fileId?: string }>;
   remoteCommitSha: string;
 }
 
@@ -26,6 +27,18 @@ export function buildV4FileOverview(input: V4FileOverviewInput): V4FileOverview 
   const local = new Map(input.localFiles.map(file => [file.path, file]));
   const remote = new Map(input.remoteFiles.map(file => [file.path, file]));
   const baseline = new Map(input.baselineFiles.map(file => [file.path, file]));
+  const uniqueIdentityPaths = (records: Array<{ path: string; fileId?: string }>) => {
+    const byId = new Map<string, string | null>();
+    for (const record of records) {
+      if (!record.fileId) continue;
+      // A duplicate identity is ambiguous; never invent a rename claim.
+      if (byId.has(record.fileId)) byId.set(record.fileId, null);
+      else byId.set(record.fileId, record.path);
+    }
+    return byId;
+  };
+  const remoteById = uniqueIdentityPaths(input.remoteFiles);
+  const baselineById = uniqueIdentityPaths(input.baselineFiles);
   const entries: V4FileOverviewEntry[] = [];
   for (const path of new Set([...local.keys(), ...remote.keys()])) {
     const here = local.get(path);
@@ -33,12 +46,26 @@ export function buildV4FileOverview(input: V4FileOverviewInput): V4FileOverview 
     const base = baseline.get(path);
     let status: V4FileStatus;
     let reason: V4FileOverviewEntry["reason"];
+    let relatedPath: string | undefined;
     if (!there) {
       status = base ? "changed" : "local-only";
-      if (base) reason = "remote-deleted";
+      if (base) {
+        const movedTo = base.fileId && remoteById.get(base.fileId);
+        if (movedTo && movedTo !== path && baselineById.get(base.fileId!) === path) {
+          reason = "remote-renamed-from";
+          relatedPath = movedTo;
+        } else reason = "remote-deleted";
+      }
     } else if (!here) {
-      status = base ? "changed" : "remote-only";
-      if (base) reason = "local-deleted";
+      const movedFrom = there.fileId && baselineById.get(there.fileId);
+      if (!base && movedFrom && movedFrom !== path && remoteById.get(there.fileId!) === path) {
+        status = "changed";
+        reason = "remote-renamed-to";
+        relatedPath = movedFrom;
+      } else {
+        status = base ? "changed" : "remote-only";
+        if (base) reason = "local-deleted";
+      }
     } else {
       status = base
         && base.remoteVersion === there.remoteVersion
@@ -46,7 +73,8 @@ export function buildV4FileOverview(input: V4FileOverviewInput): V4FileOverview 
         && base.mtime === here.mtime
         ? "synced" : "changed";
     }
-    entries.push({ path, status, local: !!here, remote: !!there, ...(reason ? { reason } : {}) });
+    entries.push({ path, status, local: !!here, remote: !!there,
+      ...(reason ? { reason } : {}), ...(relatedPath ? { relatedPath } : {}) });
   }
   entries.sort((a, b) => a.path.localeCompare(b.path));
   return { entries, remoteCommitSha: input.remoteCommitSha };

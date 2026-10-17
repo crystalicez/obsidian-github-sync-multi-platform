@@ -78,6 +78,44 @@ test("wide tree preserves every file once without quadratic sibling searching", 
   assert.equal(tree[0].children.at(-1)?.entry?.path, entries.at(-1)?.path);
 });
 
+test("tracked remote rename is identified by stable file ID, not mislabeled as deletion and unrelated download", () => {
+  const model = buildV4FileOverview({
+    remoteCommitSha: "pinned",
+    localFiles: [{ path: "Notes/old.md", size: 11, mtime: 30 }],
+    remoteFiles: [{ path: "Archive/new.md", remoteVersion: "v2", fileId: "stable-identity" }],
+    baselineFiles: [{ path: "Notes/old.md", remoteVersion: "v1", fileId: "stable-identity", size: 11, mtime: 30 }],
+  });
+  const byPath = new Map(model.entries.map(entry => [entry.path, entry]));
+  assert.deepEqual(
+    [byPath.get("Notes/old.md")?.status, byPath.get("Notes/old.md")?.reason, byPath.get("Notes/old.md")?.relatedPath],
+    ["changed", "remote-renamed-from", "Archive/new.md"],
+  );
+  assert.deepEqual(
+    [byPath.get("Archive/new.md")?.status, byPath.get("Archive/new.md")?.reason, byPath.get("Archive/new.md")?.relatedPath],
+    ["changed", "remote-renamed-to", "Notes/old.md"],
+  );
+  assert.deepEqual(countV4FileOverview(model.entries), { all: 2, changed: 2, "local-only": 0, "remote-only": 0, synced: 0 });
+});
+
+test("ambiguous or missing file identity never invents remote rename lineage", () => {
+  const input = {
+    remoteCommitSha: "pinned",
+    localFiles: [{ path: "old.md", size: 2, mtime: 1 }],
+    baselineFiles: [{ path: "old.md", remoteVersion: "one", fileId: "id", size: 2, mtime: 1 }],
+  };
+  const duplicate = buildV4FileOverview({ ...input, remoteFiles: [
+    { path: "new.md", remoteVersion: "two", fileId: "id" },
+    { path: "another.md", remoteVersion: "three", fileId: "id" },
+  ] });
+  assert.equal(duplicate.entries.find(entry => entry.path === "old.md")?.reason, "remote-deleted");
+  assert.equal(duplicate.entries.find(entry => entry.path === "new.md")?.status, "remote-only");
+  const unknown = buildV4FileOverview({ ...input, remoteFiles: [
+    { path: "new.md", remoteVersion: "two" },
+  ] });
+  assert.equal(unknown.entries.find(entry => entry.path === "old.md")?.reason, "remote-deleted");
+  assert.equal(unknown.entries.find(entry => entry.path === "new.md")?.status, "remote-only");
+});
+
 test("filtered tree keeps ancestors, individual path identities, and nested folders", () => {
   const files = [{ path: "A/B/1.md", status: "changed" as const, local: true, remote: true },
     { path: "A/B/2.md", status: "synced" as const, local: true, remote: true }];

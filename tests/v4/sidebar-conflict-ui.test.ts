@@ -76,6 +76,36 @@ test("tracked deletions appear as Changed with explicit sync-risk warnings in th
   await view.onClose();
 });
 
+test("remote rename lineage uses a stable file ID and never shows a deletion or unrelated download badge", async () => {
+  const plugin: any = {
+    githubClient: {},
+    app: { workspace: { getActiveFile: () => null, openLinkText: () => undefined } },
+    settings: { githubOwner: "owner", githubRepo: "repo", githubBranch: "test" },
+    v4Runtime: {
+      settingsGeneration: 1, progressSnapshot: createIdleV4Progress(),
+      subscribeProgress: () => () => undefined,
+      async fileOverview() {
+        return { remoteCommitSha: "a".repeat(40), entries: [
+          { path: "Notes/old.md", status: "changed", reason: "remote-renamed-from", relatedPath: "Archive/new.md", local: true, remote: false },
+          { path: "Archive/new.md", status: "changed", reason: "remote-renamed-to", relatedPath: "Notes/old.md", local: false, remote: true },
+        ] };
+      },
+    },
+  };
+  const view = new V4SyncCenterView(new WorkspaceLeaf(plugin.app), plugin);
+  await view.onOpen();
+  assert.equal(view.contentEl.findByText("Changed 2")?.attributes["aria-pressed"], "false");
+  assert.ok(view.contentEl.findByAttribute("aria-label", "Notes/old.md, Moved on GitHub"));
+  assert.ok(view.contentEl.findByAttribute("aria-label", "Archive/new.md, Renamed on GitHub"));
+  assert.match(view.contentEl.flattenText(), /Moved on GitHub/u);
+  assert.doesNotMatch(view.contentEl.flattenText(), /Deleted locally|Deleted remotely|Remote only [1-9]/u);
+  view.contentEl.findByAttribute("aria-label", "Notes/old.md, Moved on GitHub")?.onclick?.();
+  assert.match(view.contentEl.findByClass("github-sync-center__detail")!.flattenText(), /moved this tracked file to Archive\/new.md/u);
+  view.contentEl.findByAttribute("aria-label", "Archive/new.md, Renamed on GitHub")?.onclick?.();
+  assert.match(view.contentEl.findByClass("github-sync-center__detail")!.flattenText(), /Previously synchronized as Notes\/old.md/u);
+  await view.onClose();
+});
+
 test("manual review requires every hunk choice and cancellation preserves no merged bytes", async () => {
   resetModalTestState();
   const runtime = Object.create(V4PluginRuntime.prototype) as any;
