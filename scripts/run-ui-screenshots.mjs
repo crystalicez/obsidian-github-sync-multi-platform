@@ -696,6 +696,32 @@ try {
     return {action:r.action,remaining:document.querySelectorAll(".github-sync-conflict").length};
   })()`);
   checked("large paged review Cancel is a no-op",canceledLarge.action==="ask"&&canceledLarge.remaining===0,JSON.stringify(canceledLarge));
+  const denseReview=await evaluate(`(async()=>{
+    const p=app.plugins.plugins[${JSON.stringify(id)}];
+    const enc=new TextEncoder();
+    const dense="\\n".repeat(1100000);
+    window.__uiDenseConflict=p.v4Runtime.askConflict("Notes/dense-review.md",
+      new AbortController().signal,enc.encode(dense),enc.encode(dense+"other"));
+    await new Promise(resolve=>setTimeout(resolve,0));
+    return {visible:!!document.querySelector(".github-sync-conflict"),
+      editor:!!document.querySelector(".github-sync-conflict__editor"),
+      rows:document.querySelectorAll(".github-sync-conflict__line").length,
+      warning:[...document.querySelectorAll(".github-sync-conflict__intro")].some(e=>e.textContent.includes("line-dense")),
+      wholeFile:!![...document.querySelectorAll(".github-sync-conflict__actions button")]
+        .find(e=>e.textContent.trim()==="Use remote")};
+  })()`);
+  checked("native line-dense review refuses huge line arrays and keeps whole-file actions",
+    denseReview.visible&&!denseReview.editor&&denseReview.rows===0
+      &&denseReview.warning&&denseReview.wholeFile,JSON.stringify(denseReview));
+  const canceledDense=await evaluate(`(async()=>{
+    [...document.querySelectorAll(".github-sync-conflict__actions button")]
+      .find(e=>e.textContent.trim()==="Cancel").click();
+    const answer=await window.__uiDenseConflict;
+    delete window.__uiDenseConflict;
+    return {action:answer.action,remaining:document.querySelectorAll(".github-sync-conflict").length};
+  })()`);
+  checked("native dense review Cancel never writes or leaves a modal",
+    canceledDense.action==="ask"&&canceledDense.remaining===0,JSON.stringify(canceledDense));
   // With no GitHub credentials, Force commands must refuse to open destructive dialogs.
   // This run never unlocks a Force control or invokes a remote operation.
   for(const mode of ["forcePush","forcePull"]){

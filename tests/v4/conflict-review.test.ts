@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { buildV4ConflictReview, buildV4ConflictReviewAsync, decodeV4ReviewText, mergeV4ReviewedSections, mergeV4ReviewedLines, v4ReviewLineKey, V4_REVIEW_MAX_BYTES } from "../../src/lib/v4/conflict-review";
+import { buildV4ConflictReview, buildV4ConflictReviewAsync, canPrepareV4ConflictReviewPair, decodeV4ReviewText, mergeV4ReviewedSections, mergeV4ReviewedLines, v4ReviewLineKey, V4_REVIEW_MAX_BYTES } from "../../src/lib/v4/conflict-review";
 
 test("manual review isolates independent line hunks and merges only explicit selections", () => {
   const local = "A\nlocal first\nB\nlocal second\nC\n";
@@ -64,6 +64,14 @@ test("line-level review retains newlines, unchanged context, and allows empty ch
     });
     assert.equal(mergeV4ReviewedLines(sections, choices), a);
   }
+});
+
+test("line-density working-set budget rejects pathological tiny-line input before splitting into huge arrays", () => {
+  const dense = "\n".repeat(1_100_000);
+  assert.equal(canPrepareV4ConflictReviewPair(dense, dense + "changed"), false);
+  const manageable = Array.from({ length: 100000 }, (_, i) => `paragraph ${i}`).join("\n");
+  assert.equal(canPrepareV4ConflictReviewPair(manageable, manageable + "\nchanged"), true);
+  assert.equal(canPrepareV4ConflictReviewPair("one\ntwo", "one\nthree"), true);
 });
 
 test("binary, invalid UTF-8 and oversized input have no editable review", () => {

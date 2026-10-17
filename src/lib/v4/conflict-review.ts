@@ -11,6 +11,29 @@ export const V4_REVIEW_MAX_BYTES = 16 * 1024 * 1024;
 export const V4_REVIEW_MAX_RESULT_BYTES = 2 * V4_REVIEW_MAX_BYTES;
 const GAP_CELLS = 160_000;
 
+const V4_REVIEW_ESTIMATED_WORKING_SET_BYTES = 96 * 1024 * 1024;
+const V4_REVIEW_ESTIMATED_BYTES_PER_LINE = 64;
+
+/**
+ * Bound text/line-array bookkeeping before calling split("\\n").
+ * A 16 MiB note consisting only of newlines otherwise creates millions of
+ * string slots and line controls' metadata, potentially exhausting Obsidian.
+ * This is a working-set estimate, not a legacy fixed line-count cutoff.
+ */
+export function canPrepareV4ConflictReviewPair(local: string, remote: string): boolean {
+  const remaining = V4_REVIEW_ESTIMATED_WORKING_SET_BYTES - (local.length + remote.length) * 2;
+  if (remaining < 0) return false;
+  const maxSlots = Math.floor(remaining / V4_REVIEW_ESTIMATED_BYTES_PER_LINE);
+  let slots = 2;
+  for (const text of [local, remote]) {
+    for (let i = 0; i < text.length; i++) {
+      if (text.charCodeAt(i) === 10 && ++slots > maxSlots) return false;
+    }
+  }
+  return slots <= maxSlots;
+}
+
+
 export function v4ReviewLineKey(sectionIndex: number, side: V4ReviewLineSide, lineIndex: number): string {
   return `${sectionIndex}:${side}:${lineIndex}`;
 }

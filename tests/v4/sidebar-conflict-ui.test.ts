@@ -234,6 +234,23 @@ test("aborting during cooperatively prepared large review never opens a late mod
   assert.equal(modalInstances.length, 0);
 });
 
+test("pathologically dense newline files use whole-file conflict controls without allocating millions of line rows", async () => {
+  resetModalTestState();
+  const runtime = Object.create(V4PluginRuntime.prototype) as any;
+  runtime.plugin = { app: {} };
+  const dense = "\n".repeat(1_100_000);
+  const pending = runtime.askConflict("dense.md", new AbortController().signal,
+    new TextEncoder().encode(dense), new TextEncoder().encode(dense + "remote"));
+  const modal = modalInstances.at(-1)!;
+  assert.ok(modal);
+  assert.equal(modal.contentEl.findByText("Apply reviewed merge"), undefined);
+  assert.equal(modal.contentEl.findByClass("github-sync-conflict__line"), undefined);
+  assert.ok(modal.contentEl.findByText("Use local"));
+  assert.ok(modal.contentEl.findByText("Use remote"));
+  modal.contentEl.findByText("Cancel")!.onclick?.();
+  assert.deepEqual(await pending, { action: "ask" });
+});
+
 test("manual review remains safe when content is missing/binary, and abort closes modal", async () => {
   resetModalTestState();
   const runtime = Object.create(V4PluginRuntime.prototype) as any;
@@ -243,7 +260,7 @@ test("manual review remains safe when content is missing/binary, and abort close
     new Uint8Array([0]), new Uint8Array([1]));
   const modal = modalInstances.at(-1)!;
   assert.equal(modal.contentEl.findByText("Apply reviewed merge"), undefined);
-  assert.match(modal.contentEl.flattenText(), /supports UTF-8 text/u);
+  assert.match(modal.contentEl.flattenText(), /bounded memory budget/u);
   controller.abort();
   assert.deepEqual(await result, { action: "ask" });
 });

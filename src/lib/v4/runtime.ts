@@ -16,7 +16,7 @@ import { decodeV4RemoteConfig } from "./remote-index"
 import { createV4ScopePredicate, isPathInV4SyncScope } from "./scope"
 import { assertV4PathLayoutCompatible, V4ChangeGuardError, V4RecoveryReplanRequiredError, V4SyncSession, type V4SyncRunState } from "./sync-session"
 import type { V4ConflictResolution } from "./conflicts"
-import { buildV4ConflictReview, buildV4ConflictReviewAsync, decodeV4ReviewText, mergeV4ReviewedLines, v4ReviewLineKey, V4_REVIEW_MAX_BYTES, V4_REVIEW_MAX_RESULT_BYTES, type V4ReviewLineDecision, type V4ReviewChoice, type V4ReviewSection } from "./conflict-review"
+import { buildV4ConflictReview, buildV4ConflictReviewAsync, canPrepareV4ConflictReviewPair, decodeV4ReviewText, mergeV4ReviewedLines, v4ReviewLineKey, V4_REVIEW_MAX_BYTES, V4_REVIEW_MAX_RESULT_BYTES, type V4ReviewLineDecision, type V4ReviewChoice, type V4ReviewSection } from "./conflict-review"
 import { V4SyncCoordinator, type V4QueuedChange, type V4SyncRequest } from "./sync-coordinator"
 import { expectedV4PathLayout, V4_FORMAT_VERSION, V4_CONFIG_PATH, V4_PBKDF2_ITERATIONS, type V4RemoteConfig, type V4StorageMode } from "./protocol-types"
 import { V4HistoryService } from "./history-service"
@@ -801,8 +801,10 @@ export class V4PluginRuntime {
   private async askConflict(path: string, signal: AbortSignal, localBytes?: Uint8Array, remoteBytes?: Uint8Array): Promise<V4ConflictResolution> {
     const localText = localBytes ? decodeV4ReviewText(localBytes) : null
     const remoteText = remoteBytes ? decodeV4ReviewText(remoteBytes) : null
+    const reviewable = localText !== null && remoteText !== null
+      && canPrepareV4ConflictReviewPair(localText, remoteText)
     let prepared: V4ReviewSection[] | undefined
-    if (localText !== null && remoteText !== null && localText.length + remoteText.length > 150_000) {
+    if (reviewable && localText.length + remoteText.length > 150_000) {
       try {
         prepared = await buildV4ConflictReviewAsync(localText, remoteText, signal)
       } catch (error) {
@@ -830,7 +832,7 @@ export class V4PluginRuntime {
       modal.contentEl.createEl("h3", { text: path, cls: "github-sync-conflict__path" })
       modal.contentEl.createEl("p", { text: "Both local and remote changed. Nothing is applied until you choose a resolution.", cls: "github-sync-conflict__intro" })
       const buttons = modal.contentEl.createDiv({ cls: "github-sync-conflict__actions" })
-      if (localText !== null && remoteText !== null) {
+      if (reviewable && localText !== null && remoteText !== null) {
         const sections = prepared ?? buildV4ConflictReview(localText, remoteText)
         const hunks = sections.filter(section => section.kind === "difference")
         const selections = new Map<string, V4ReviewLineDecision>()
@@ -1031,7 +1033,7 @@ export class V4PluginRuntime {
           finish({ action: "merged", mergedBytes })
         }
       } else {
-        modal.contentEl.createEl("p", { text: "Line-by-line review supports UTF-8 text up to the available safe text budget (16 MiB per side). Binary or exceptionally large files use the whole-file decisions below.", cls: "github-sync-conflict__intro" })
+        modal.contentEl.createEl("p", { text: "Line-by-line review uses a bounded memory budget (up to 16 MiB per text side). Binary or exceptionally line-dense/large files use the whole-file decisions below.", cls: "github-sync-conflict__intro" })
       }
       buttons.createEl("button", { text: "Keep both" }).onclick = () => finish({ action: "keep-local-copy-remote" })
       buttons.createEl("button", { text: "Use local" }).onclick = () => finish({ action: "use-local" })
