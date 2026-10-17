@@ -24,7 +24,7 @@ Unlike traditional Git-based plugins, this tool interacts directly with the GitH
 -   **Atomic two-way sync**: Pulls first, plans with a three-way index, and publishes all required remote updates in one Git commit.
 -   **All vault file types**: Syncs notes, media, archives, Canvas files, and other files. The V4 remote format splits payloads over 50 MiB into verified parts; desktop uses bounded local I/O, while large mobile upload remains capability-gated pending a proven bounded read path.
 -   **Optional encryption**: Hides every directory name, filename, extension, and file content behind stable opaque objects; plaintext mode stores normal paths and bytes.
--   **Sync Center**: Browse 50 commits per page, inspect commit changes, and lazily preview commit or current-file versions.
+-   **Sync Center**: View a read-only, verified remote file inventory with All / Changed / Local only / Remote / Synced filters, path search, expandable tree view, and current-file/commit version history.
 
 ## 🛠 Tech Stack
 
@@ -73,6 +73,16 @@ The status bar shows the current sync phase with separate pull and push counts; 
 
 Phase changes appear immediately. Rapid path and counter changes are published at most once every 400 ms, while an active phase's elapsed time refreshes once per second. The latest completed run remains visible until the next run begins. Logical paths and timing details exist only in runtime memory and are never saved to plugin settings, the local index, or GitHub.
 
+### Files overview and interactive conflict review (unreleased audit branch)
+
+Open **GitHub Sync Center → Files** after configuring a repository. File statuses are read-only; use **Refresh status** to query the current exact GitHub branch snapshot. **All**, **Changed**, **Local only**, **Remote** and **Synced** filters work with path search, expandable folders, and a flat-list toggle. No per-file push, pull or deletion action is offered yet: **Sync now** runs the normal sync engine and its existing safeguards, and may delete or replace files depending on the configured policy.
+
+**Changed** also includes *previously synchronized files that were deleted on only one side*. Select the file to see **Deleted locally** or **Deleted remotely** and a warning before syncing. **Synced** means the current file metadata matches the last synchronized index (size, mtime and remote version), **not** a fresh byte-for-byte file hash verification. The overview reflects a particular remote commit SHA; it is not a continuously live view.
+
+For manual conflict resolution, choose the **Ask** conflict policy in Settings. Small UTF-8 text conflicts display Local and Remote side by side on desktop, or stacked in a narrow view. Review each highlighted change with **Accept local**, **Accept remote**, **Accept both** (local lines first), or **Discard both**; check **Merge preview** and use **Apply reviewed merge** only after deciding every change. **Keep both**, **Use local**, **Use remote** and **Cancel** are still available for whole-file decisions. Oversized or binary files use those whole-file choices instead of editable hunks. The UI does not bypass publication validation, cancellation or the change guard.
+
+See [engineering UI qualification and limitations](docs/engineering/file-status-and-conflict-review-2026-10-17.md). These changes are in draft PR #8 and are **not a published release qualification**.
+
 ## 🧪 Qualification status
 
 V4 uses three separate evidence layers; one layer never substitutes for another:
@@ -107,7 +117,7 @@ For detailed information about synchronization mechanisms, incremental sync, and
 -   **冲突检测**：基于内容哈希的智能检测，最大限度减少同步冲突。
 -   **全部文件类型**：同步笔记、图片、压缩包、Canvas 与其他附件；V4 远端格式会将超过 50 MiB 的内容拆分并校验。桌面端使用有界本地 I/O；移动端大文件上传在有界读取能力得到验证前保持能力门控。
 -   **可选加密**：隐藏所有目录名、文件名、扩展名和文件内容，并在固定技术分桶中保存稳定的不透明对象；明文模式直接保存原路径与内容。
--   **同步中心**：分页查看提交、变更列表，以及按需加载的提交/当前文件历史预览。
+-   **同步中心**：可在“Files”中按 All / Changed / Local only / Remote / Synced 过滤已验证的远端文件快照，支持路径搜索、树形目录和展开/收起；保留提交与当前文件历史预览。
 -   **可视化看板**：配套数据看板，直观展示写作进度与同步状态。
 
 ## 🛠 技术架构
@@ -134,6 +144,12 @@ For detailed information about synchronization mechanisms, incremental sync, and
     -   **Repo**: 您的私有笔记仓库名称.
     -   **Branch**: 默认为 `main`.
 3.  **Sync Options**: 开启“启用同步”即可享受实时同步体验.
+
+### 文件状态与交互式冲突处理（尚未发布的审计分支）
+
+配置好仓库后，在 **GitHub Sync Center → Files** 查看只读文件状态。可筛选、搜索路径、使用树形/平铺列表，并手动刷新。**Changed** 包含以前已同步但仅在本地或远端被删除的文件：详情将提醒后续同步可能传播删除。**Synced** 只代表大小、修改时间和远端版本等元数据与上次同步索引一致，**不等于重新逐字节校验内容**。单文件 Push/Pull/Delete 功能尚未开放；**Sync now** 仍执行现有完整同步策略。
+
+在设置中选择 **Ask** 冲突策略，小型 UTF-8 文本可在桌面端并排（窄窗口纵向）查看差异，逐段选择本地、远端、两者或丢弃两者，并确认合并预览后应用。二进制和大文件仍使用 Keep both / Use local / Use remote / Cancel 整文件选项。此功能位于 Draft PR #8，尚不代表正式发布或移动端真机验证。
 
 ## 🧪 资格验证状态
 
