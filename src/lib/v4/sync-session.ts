@@ -2342,6 +2342,9 @@ export class V4SyncSession {
       currentDirection: "push",
     })
     const bytes = await this.readStage(binding.stage)
+    // The stage read may yield to Obsidian note edits. Close that window
+    // with another exact source check immediately before any local mutation.
+    await this.assertReviewedTargetUnchanged(binding)
     if (binding.change.kind === "rename" && binding.change.previousPath) {
       await trashV4LocalUserFile(this.localIo, binding.change.previousPath)
     }

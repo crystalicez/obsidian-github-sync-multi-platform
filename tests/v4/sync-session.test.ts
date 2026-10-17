@@ -1616,6 +1616,36 @@ test("reviewed merge fails closed when local note changes while the modal is ope
     "the stale merge must not publish a new GitHub commit");
 });
 
+test("reviewed merge refuses a same-stat edit after the first guard but immediately before local Apply", async () => {
+  const fixture = await divergedConflictFixture(["review.md"]);
+  const before = fixture.localVault.files.get("review.md")!;
+  const newer = enc("w".repeat(before.bytes.byteLength));
+  let changedAfterGuard = 0;
+  await assert.rejects(
+    new V4SyncSession({
+      github: fixture.github,
+      vault: fixture.localVault,
+      index: fixture.localIndex,
+      config: config(), conflictPolicy: "ask", abortChangePercent: 0,
+      askConflict: async () => ({ action: "merged", mergedBytes: enc("reviewed-stage-output") }),
+      onProgress: event => {
+        // This is emitted in applyStagedWrite AFTER its first reviewed-source
+        // check; previous implementation never checked again before write().
+        if (event.phase === "applying" && event.currentDirection === "push"
+          && event.currentPath === "review.md" && changedAfterGuard === 0) {
+          changedAfterGuard++;
+          fixture.localVault.files.set("review.md", { bytes: newer, mtime: before.mtime });
+        }
+      },
+    }).sync({ operation: "normal", allowThresholdOverride: false,
+      changes: [{ type: "modify", path: "review.md", mtime: before.mtime }] }),
+    /changed|precondition|source/iu,
+  );
+  assert.equal(changedAfterGuard, 1, "fixture must mutate after the first guard");
+  assert.deepEqual(fixture.localVault.files.get("review.md")!.bytes, newer,
+    "never overwrite a note changed while staging was read");
+});
+
 test("choosing pinned remote after a same-stat local edit never silently replaces the newer note", async () => {
   const fixture = await divergedConflictFixture(["review.md"]);
   const previousHead = fixture.github.ref?.sha;
@@ -2790,7 +2820,7 @@ test("v4 merged conflict preserves bounded scan while verifying reviewed source 
   });
 
   assert.equal(result.pushedFiles, 2);
-  assert.equal(statCalls, 10, `expected initial stat and scan checks plus two reviewed-source guards (pre/post hash snapshots), got ${statCalls}`);
+  assert.equal(statCalls, 12, `expected initial stat and scan checks plus three reviewed-source guards (pre/post hash snapshots), got ${statCalls}`);
   assert.equal(dec(fixture.localVault.files.get("A.md")!.bytes), "merged:A.md");
   assert.equal(dec(fixture.github.files.get("A.md")!), "merged:A.md");
 });
