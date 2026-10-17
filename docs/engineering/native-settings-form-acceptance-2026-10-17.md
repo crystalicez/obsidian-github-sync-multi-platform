@@ -21,6 +21,8 @@ The CDP Settings popout is its own Electron JavaScript realm. The runner selects
 - Repeat using `corepack pnpm test:ui:visual` from a clean source checkout. Its test driver is `scripts/run-ui-screenshots.mjs`.
 - The existing warning at an emulated desktop width of 375px remains: Obsidian Settings leaves only 175px of plugin content. This is not an Android/iOS compatibility result.
 
+The initial exact-commit clean worktree exposed a real harness prerequisite: the CLI fixture tests called `mkdtempSync` under the ignored `.tmp` folder even when no `.tmp` existed in a fresh checkout. `tests/v4/ui-visual-smoke-cli.test.mjs` now creates the project-local root and checks with `lstatSync` that it is a real directory rather than a symlink/junction. The four focused fixture tests passed after the fix; clean exact-tip UI acceptance is repeated separately rather than silently relying on the primary workspace's old `.tmp`.
+
 ## Qualification boundary
 
 This improves **actual Settings entry, validation, persistence, and rollback** evidence. It does **not** verify user-token entry, encrypted passphrase secure storage using the Settings form, actual remote authentication, a real credentialed Settings-to-GitHub sync flow, mobile touch interaction, or physical screen reader usability.

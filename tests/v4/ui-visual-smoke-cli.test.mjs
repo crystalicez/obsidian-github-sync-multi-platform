@@ -1,10 +1,16 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync } from "node:fs";
+import { lstatSync, mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync } from "node:fs";
 import { resolve, join } from "node:path";
 import test from "node:test";
 
 const runner = resolve("scripts/run-ui-screenshots.mjs");
+const ownedTmp = resolve(".tmp");
+// A frozen-install clean checkout has no ignored .tmp yet. Do not rely on
+// previous runs to create it, and never follow a substituted symlink/junction.
+mkdirSync(ownedTmp, { recursive: true });
+const tmpInfo = lstatSync(ownedTmp);
+assert.ok(tmpInfo.isDirectory() && !tmpInfo.isSymbolicLink(), "UI fixture root must be a real project-local directory");
 
 test("visual UI runner refuses a vault outside ignored repository .tmp", () => {
   const result = spawnSync(process.execPath, [runner, "--attach", "--vault=../non-synthetic-vault"], {
