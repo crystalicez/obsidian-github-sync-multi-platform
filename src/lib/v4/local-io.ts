@@ -55,6 +55,9 @@ export class V4LocalTargetChangedError extends Error {
 }
 
 export async function assertV4LocalTargetPrecondition(io: Pick<V4LocalIo, "stat" | "read" | "openContentSource">, expected: V4LocalTargetPrecondition): Promise<void> {
+  // A stat-less adapter cannot establish target absence or preserve the
+  // reviewed source mtime. Never treat unavailable safety evidence as a pass.
+  if (!io.stat) throw new V4LocalTargetChangedError(expected.path)
   if (io.stat) {
     const current = await io.stat(expected.path)
     if (!expected.exists) {

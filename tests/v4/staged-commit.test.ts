@@ -37,6 +37,27 @@ test("local target precondition preserves create semantics when a user creates t
   )
 })
 
+test("local preconditions fail closed when adapter lacks a stat capability", async () => {
+  const noStat = {
+    async read() { return new TextEncoder().encode("newer note") },
+  };
+  // Without stat, a pending create cannot distinguish an absent target from
+  // one newly created by the user during download. Never overwrite it.
+  await assert.rejects(
+    assertV4LocalTargetPrecondition(noStat, { path: "new.md", exists: false }),
+    error => error instanceof V4LocalTargetChangedError,
+  );
+  // A reviewed source cannot safely assert matching size/mtime if this
+  // adapter has no stat capability, even if bytes might happen to match.
+  await assert.rejects(
+    assertV4LocalTargetPrecondition(noStat, {
+      path: "note.md", exists: true, size: 10, mtime: 1,
+      hash: await sha256Hex(new TextEncoder().encode("newer note")),
+    }),
+    error => error instanceof V4LocalTargetChangedError,
+  );
+});
+
 test("reviewed-source hash rejects same-size same-mtime edits that stat-only guards miss", async () => {
   const original = new TextEncoder().encode("note");
   const newer = new TextEncoder().encode("N0TE");
