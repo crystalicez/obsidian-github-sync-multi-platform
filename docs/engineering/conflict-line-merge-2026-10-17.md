@@ -30,4 +30,16 @@ Final sticky-action-footer screenshot set from rerun **102/102**:
 - [Reviewed lines, sticky command bar](ui-real-screenshots-2026-10-17/35-conflict-line-reviewed-sticky-actions.png)
 - [390px compact, sticky command bar](ui-real-screenshots-2026-10-17/36-conflict-line-compact-sticky-actions.png)
 
-**Production qualification remains conditional:** run full deterministic gates and independently qualify exact pushed commit on clean checkout; inspect screenshots; physically validate Android/iOS; hosted CI, independent reviewer, and pre-existing flaky credentialed encrypted delete/recreate scenario are still open. Do not merge or release Draft PR #8 without approval. The separate Files sidebar remains read-only with no Remove / bulk Delete controls.
+## Exact-SHA independent clean acceptance (post-push)
+
+**Code SHA:** `856302f298a4812f5f519b0dc082d477a3a7c723` (includes the line-selection feature commit `5fb98a1` and sticky-action-footer polish). A separate detached `.tmp/conflict-line-clean-20261017` checkout was created at this exact SHA, followed by `pnpm install --frozen-lockfile`. It completed:
+
+- Native **Obsidian Desktop 1.14.4** CDP visual runner: **102/102 assertions, 21 PNG screenshots, zero observed JavaScript exceptions**; production build included.
+- `pnpm test:fast`, `pnpm test:repeat` (**10/10 rounds**), `pnpm test:recovery`, `pnpm test:resource`, `pnpm test:feasibility`: all exit **0**.
+- `pnpm validate:metadata`, `pnpm validate:package`, `pnpm test:github-e2e:compile`: all exit **0**.
+- After running the gates, `git status --short --branch` in the independent checkout was exactly `## HEAD (no branch)`; `git rev-parse HEAD` matched the code SHA.
+- Source screenshot images 35 and 36 were fetched **back from the pushed GitHub commit** and visually inspected, confirming per-line Keep/Omit states, editable merged output, sticky Apply/Cancel actions, and narrow stacked layout.
+
+This verification did not access live credentials or mutate GitHub data. **A newly credentialed full GitHub E2E on the exact code SHA was not run**; an earlier full GitHub E2E at another source SHA remains blocked by intermittent encrypted delete/recreate failure. Hosted CI status and physical Android/iOS acceptance are not claimed.
+
+**Remaining release gates:** hosted CI evidence, physical Android/iOS, independent review, and root cause/mitigation for the older encrypted delete/recreate failure. PR #8 remains Draft; no merge/release. The separate Files sidebar stays read-only without Remove / bulk Delete controls.
