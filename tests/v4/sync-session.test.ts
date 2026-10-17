@@ -1588,6 +1588,55 @@ test("reviewed merge identical to pinned remote pulls locally without mutating G
   assert.equal(dec(fixture.localVault.files.get("review.md")!.bytes), "remote:review.md");
 });
 
+test("reviewed merge fails closed when local note changes while the modal is open (same mtime and size)", async () => {
+  const fixture = await divergedConflictFixture(["review.md"]);
+  const previousHead = fixture.github.ref?.sha;
+  const original = fixture.localVault.files.get("review.md")!;
+  const newer = enc("z".repeat(original.bytes.byteLength));
+  await assert.rejects(
+    new V4SyncSession({
+      github: fixture.github,
+      vault: fixture.localVault,
+      index: fixture.localIndex,
+      config: config(),
+      conflictPolicy: "ask",
+      abortChangePercent: 0,
+      askConflict: async input => {
+        assert.equal(dec(input.localBytes!), "local:review.md");
+        fixture.localVault.files.set("review.md", { bytes: newer, mtime: original.mtime });
+        return { action: "merged", mergedBytes: enc("reviewed merged content") };
+      },
+    }).sync({ operation: "normal", allowThresholdOverride: false,
+      changes: [{ type: "modify", path: "review.md", mtime: original.mtime }] }),
+    /changed|precondition|source/iu,
+  );
+  assert.deepEqual(fixture.localVault.files.get("review.md")?.bytes, newer,
+    "a later in-vault edit must not be overwritten by a stale reviewed merge");
+  assert.equal(fixture.github.ref?.sha, previousHead,
+    "the stale merge must not publish a new GitHub commit");
+});
+
+test("choosing pinned remote after a same-stat local edit never silently replaces the newer note", async () => {
+  const fixture = await divergedConflictFixture(["review.md"]);
+  const previousHead = fixture.github.ref?.sha;
+  const original = fixture.localVault.files.get("review.md")!;
+  const newer = enc("q".repeat(original.bytes.byteLength));
+  await assert.rejects(
+    new V4SyncSession({
+      github: fixture.github, vault: fixture.localVault, index: fixture.localIndex,
+      config: config(), conflictPolicy: "ask", abortChangePercent: 0,
+      askConflict: async () => {
+        fixture.localVault.files.set("review.md", { bytes: newer, mtime: original.mtime });
+        return { action: "use-remote" };
+      },
+    }).sync({ operation: "normal", allowThresholdOverride: false,
+      changes: [{ type: "modify", path: "review.md", mtime: original.mtime }] }),
+    /changed|precondition|source/iu,
+  );
+  assert.deepEqual(fixture.localVault.files.get("review.md")?.bytes, newer);
+  assert.equal(fixture.github.ref?.sha, previousHead);
+});
+
 test("manual conflict review receives verified small packed content and commits only the reviewed result", async () => {
   const fixture = await divergedConflictFixture(["review.md"]);
   let sawReview = false;
@@ -2718,7 +2767,7 @@ test("v4 merge fallback for a non-text conflict never reads the historical base 
   assert.equal(contentReads.length, 1, JSON.stringify(contentReads));
 });
 
-test("v4 merged conflict output does not trigger a second changed-path stat rescan", async () => {
+test("v4 merged conflict preserves bounded scan while verifying reviewed source before Apply", async () => {
   const fixture = await divergedConflictFixture(["A.md", "B.md"]);
   let statCalls = 0;
   const stat = fixture.localVault.stat.bind(fixture.localVault);
@@ -2741,7 +2790,7 @@ test("v4 merged conflict output does not trigger a second changed-path stat resc
   });
 
   assert.equal(result.pushedFiles, 2);
-  assert.equal(statCalls, 6, `expected initial stat plus pre/post hash snapshot checks only, got ${statCalls}`);
+  assert.equal(statCalls, 10, `expected initial stat and scan checks plus two reviewed-source guards (pre/post hash snapshots), got ${statCalls}`);
   assert.equal(dec(fixture.localVault.files.get("A.md")!.bytes), "merged:A.md");
   assert.equal(dec(fixture.github.files.get("A.md")!), "merged:A.md");
 });

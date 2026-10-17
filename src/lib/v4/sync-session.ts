@@ -606,7 +606,9 @@ export class V4SyncSession {
         const pull = this.changeBetween(conflict.local, conflict.remote)
         if (pull) {
           pullTotal++
-          batch.pulls.push(this.bindPull(pull, recordsById, allRemoteRecords, remoteCommitSha))
+          const selected = this.bindPull(pull, recordsById, allRemoteRecords, remoteCommitSha)
+          if (conflict.local?.path === pull.path) selected.expectedLocalHash = conflict.local.hash
+          batch.pulls.push(selected)
         }
       } else if (resolution.action === "merged" && conflict.local && resolution.mergedBytes) {
         const mergeMtime = this.now()
@@ -628,7 +630,9 @@ export class V4SyncSession {
           const pull = this.changeBetween(conflict.local, conflict.remote)
           if (pull) {
             pullTotal++
-            batch.pulls.push(this.bindPull(pull, recordsById, allRemoteRecords, remoteCommitSha))
+            const selected = this.bindPull(pull, recordsById, allRemoteRecords, remoteCommitSha)
+          if (conflict.local?.path === pull.path) selected.expectedLocalHash = conflict.local.hash
+          batch.pulls.push(selected)
           }
         } else {
           const mergedChange = this.changeBetween(conflict.remote, mergedAfter)
@@ -636,7 +640,7 @@ export class V4SyncSession {
             pushTotal++
             const binding: V4PushBinding = { change: mergedChange, source: this.stageHandle(stage) }
             batch.pushes.push(binding)
-            batch.stagedWrites.push({ change: mergedChange, stage })
+            batch.stagedWrites.push({ change: mergedChange, stage, expectedLocal: conflict.local })
           }
         }
       } else {
@@ -697,6 +701,16 @@ export class V4SyncSession {
           currentDirection: undefined,
           ...counters(true),
         })
+      }
+    }
+
+    // A user may keep editing the note while the Ask dialog is open.
+    // Validate the exact reviewed source before any local or remote changes;
+    // a matching size/mtime alone does not prove the content stayed the same.
+    for (const binding of batch.stagedWrites) await this.assertReviewedTargetUnchanged(binding)
+    for (const binding of batch.pulls) {
+      if (binding.expectedLocalHash) {
+        await assertV4LocalTargetPrecondition(this.localIo, this.pullBindingPrecondition(binding))
       }
     }
 
@@ -2173,7 +2187,7 @@ export class V4SyncSession {
       const change = binding.change
       if (change.kind === "delete") {
         const id = `pull:${change.fileId}:delete`
-        mutations.push({ id, kind: "trash", path: change.path, precondition: this.pullPrecondition(change) })
+        mutations.push({ id, kind: "trash", path: change.path, precondition: this.pullBindingPrecondition(binding) })
         pullMutationGroups.push([id])
         return
       }
@@ -2184,7 +2198,7 @@ export class V4SyncSession {
       if (this.ephemeralStages.has(binding.stage.stageId)) throw new V4BoundedIoUnavailableError("bounded-append", change.path)
       const writeId = `pull:${change.fileId}:write`
       const mutationIds = [writeId]
-      mutations.push({ id: writeId, kind: "stage-write", path: change.path, stage: binding.stage, precondition: this.pullPrecondition(change) })
+      mutations.push({ id: writeId, kind: "stage-write", path: change.path, stage: binding.stage, precondition: this.pullBindingPrecondition(binding) })
       if (change.kind === "rename" && change.previousPath) {
         const trashId = `pull:${change.fileId}:rename-trash`
         mutations.push({ id: trashId, kind: "trash", path: change.previousPath, precondition: this.pullPrecondition(change, change.previousPath) })
@@ -2201,6 +2215,7 @@ export class V4SyncSession {
       const precondition: V4LocalTargetPrecondition = current && current.path === path
         ? { path, exists: true, size: current.size, mtime: current.mtime }
         : { path, exists: false }
+      if (binding.expectedLocal) precondition.hash = binding.expectedLocal.hash
       mutations.push({ id: `local:${binding.change.fileId}:write`, kind: "stage-write", path, stage: binding.stage, precondition })
       if (binding.change.kind === "rename" && binding.change.previousPath) {
         const previous = localById.get(binding.change.fileId)
@@ -2241,6 +2256,12 @@ export class V4SyncSession {
     return { payload: { mutations: orderedMutations, completedMutationIds: [] }, pullCompletionIds }
   }
 
+  private pullBindingPrecondition(binding: V4PullBinding): V4LocalTargetPrecondition {
+    const precondition = this.pullPrecondition(binding.change)
+    if (binding.expectedLocalHash && precondition.exists) precondition.hash = binding.expectedLocalHash
+    return precondition
+  }
+
   private pullPrecondition(change: V4PlannedChange, path = change.path): V4LocalTargetPrecondition {
     const before = change.before
     if (before && before.path === path) return { path, exists: true, size: before.size, mtime: before.mtime }
@@ -2250,7 +2271,7 @@ export class V4SyncSession {
   private async applyPullBinding(binding: V4PullBinding, ownedStages: V4StageRef[], onCompleted: () => void): Promise<void> {
     const change = binding.change
     if (change.kind === "delete") {
-      await assertV4LocalTargetPrecondition(this.localIo, this.pullPrecondition(change))
+      await assertV4LocalTargetPrecondition(this.localIo, this.pullBindingPrecondition(binding))
       this.report({ phase: "applying", currentPath: change.path, currentDirection: "pull" })
       await trashV4LocalUserFile(this.localIo, change.path)
       onCompleted()
@@ -2261,7 +2282,7 @@ export class V4SyncSession {
       this.report({ phase: "downloading", currentPath: change.path, currentDirection: "pull" })
       binding.stage = await this.stageRemotePull(binding, ownedStages)
     }
-    const targetPrecondition = this.pullPrecondition(change)
+    const targetPrecondition = this.pullBindingPrecondition(binding)
     if (binding.stage && binding.stage.size > DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES) {
       await assertV4LocalTargetPrecondition(this.localIo, targetPrecondition)
       if (change.kind === "rename" && change.previousPath) {
@@ -2305,7 +2326,16 @@ export class V4SyncSession {
     onCompleted()
   }
 
+  private async assertReviewedTargetUnchanged(binding: V4StagedWriteBinding): Promise<void> {
+    const original = binding.expectedLocal
+    if (!original) return
+    await assertV4LocalTargetPrecondition(this.localIo, {
+      path: original.path, exists: true, size: original.size, mtime: original.mtime, hash: original.hash,
+    })
+  }
+
   private async applyStagedWrite(binding: V4StagedWriteBinding): Promise<void> {
+    await this.assertReviewedTargetUnchanged(binding)
     this.report({
       phase: "applying",
       currentPath: binding.change.path,

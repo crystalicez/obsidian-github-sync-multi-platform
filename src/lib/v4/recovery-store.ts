@@ -91,11 +91,12 @@ function isNormalizedVaultPath(value: unknown): value is string {
 
 function isRecoveryPrecondition(value: unknown, path: string): boolean {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false
-  const candidate = value as { path?: unknown; exists?: unknown; size?: unknown; mtime?: unknown }
+  const candidate = value as { path?: unknown; exists?: unknown; size?: unknown; mtime?: unknown; hash?: unknown }
   if (candidate.path !== path || typeof candidate.exists !== "boolean") return false
-  if (!candidate.exists) return candidate.size === undefined && candidate.mtime === undefined
+  if (!candidate.exists) return candidate.size === undefined && candidate.mtime === undefined && candidate.hash === undefined
   return Number.isSafeInteger(candidate.size) && (candidate.size as number) >= 0
     && typeof candidate.mtime === "number" && Number.isFinite(candidate.mtime) && candidate.mtime >= 0
+    && (candidate.hash === undefined || (typeof candidate.hash === "string" && /^[0-9a-f]{64}$/u.test(candidate.hash)))
 }
 
 function isStageRef(value: unknown): value is V4StageRef {

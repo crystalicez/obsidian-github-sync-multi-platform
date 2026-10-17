@@ -1,4 +1,6 @@
-import type { V4ContentHandle, V4ContentSource } from "./content-source"
+import { sha256Hex } from "../bytes"
+import { DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES, type V4ContentHandle, type V4ContentSource } from "./content-source"
+import { hashV4StableContentSource } from "./object-stream"
 import type { V4StageRef, V4StagingStore } from "./staging-store"
 
 export interface V4SessionVaultFile {
@@ -41,6 +43,8 @@ export interface V4LocalTargetPrecondition {
   exists: boolean
   size?: number
   mtime?: number
+  /** Optional SHA-256 of the reviewed source, checked even if stat is unchanged. */
+  hash?: string
 }
 
 export class V4LocalTargetChangedError extends Error {
@@ -50,14 +54,49 @@ export class V4LocalTargetChangedError extends Error {
   }
 }
 
-export async function assertV4LocalTargetPrecondition(io: Pick<V4LocalIo, "stat">, expected: V4LocalTargetPrecondition): Promise<void> {
-  if (!io.stat) return
-  const current = await io.stat(expected.path)
-  if (!expected.exists) {
-    if (current) throw new V4LocalTargetChangedError(expected.path)
-    return
+export async function assertV4LocalTargetPrecondition(io: Pick<V4LocalIo, "stat" | "read" | "openContentSource">, expected: V4LocalTargetPrecondition): Promise<void> {
+  if (io.stat) {
+    const current = await io.stat(expected.path)
+    if (!expected.exists) {
+      if (current) throw new V4LocalTargetChangedError(expected.path)
+      return
+    }
+    if (!current || current.size !== expected.size || current.mtime !== expected.mtime) {
+      throw new V4LocalTargetChangedError(expected.path)
+    }
   }
-  if (!current || current.size !== expected.size || current.mtime !== expected.mtime) {
-    throw new V4LocalTargetChangedError(expected.path)
+  if (expected.hash) {
+    // Stat-only checks miss edits that preserve size and mtime. For large
+    // originals, verify using a bounded content stream; never buffer a whole
+    // multi-GiB note just because the user selected "Use remote".
+    const assertStable = async () => {
+      if (!io.stat) return
+      const current = await io.stat(expected.path)
+      if (!current || current.size !== expected.size || current.mtime !== expected.mtime) {
+        throw new V4LocalTargetChangedError(expected.path)
+      }
+    }
+    let currentHash: string
+    try {
+      if ((expected.size ?? 0) > DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES) {
+        if (!io.openContentSource) throw new V4LocalTargetChangedError(expected.path)
+        const source = await io.openContentSource({
+          kind: "vault", path: expected.path, expectedHash: expected.hash,
+          expectedSize: expected.size!, expectedMtime: expected.mtime!,
+        })
+        currentHash = await hashV4StableContentSource(source, {
+          chunkBytes: 4 * 1024 * 1024, checkStable: assertStable,
+        })
+      } else {
+        const bytes = await io.read(expected.path)
+        if (bytes.byteLength !== expected.size) throw new V4LocalTargetChangedError(expected.path)
+        currentHash = await sha256Hex(bytes)
+        await assertStable()
+      }
+    } catch (error) {
+      if (error instanceof V4LocalTargetChangedError) throw error
+      throw new V4LocalTargetChangedError(expected.path)
+    }
+    if (currentHash !== expected.hash) throw new V4LocalTargetChangedError(expected.path)
   }
 }
