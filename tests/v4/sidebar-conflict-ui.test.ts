@@ -217,6 +217,19 @@ test("large line review pages at most 48 lines per side and can select later pag
   assert.equal(modal.contentEl.findByAttribute("aria-label", "Change 1 local line 1: keep"), undefined);
   modal.contentEl.findByAttribute("aria-label", "Change 1: local")!.onclick?.();
   assert.equal(modal.contentEl.findByText("Apply reviewed merge")?.disabled, false);
+  const output = modal.contentEl.findByAttribute("aria-label", "Editable merged result")!;
+  assert.ok(output.value.includes("old 49"));
+  assert.equal(output.value.includes("new 49"), false);
+  modal.contentEl.findByAttribute("aria-label", "Change 1 remote line 49: keep")!.onclick?.();
+  assert.ok(output.value.includes("old 49") && output.value.includes("new 48"),
+    "per-line override must work after a hunk-wide choice across pages");
+  assert.equal(modal.contentEl.findByText("Apply reviewed merge")?.disabled, false);
+  modal.contentEl.findByAttribute("aria-label", "Change 1: remote")!.onclick?.();
+  assert.equal(output.value.includes("old 49"), false,
+    "choosing a different whole-hunk shortcut must supersede earlier per-line overrides");
+  assert.ok(output.value.includes("new 48"));
+  modal.contentEl.findByText("Previous lines")!.onclick?.();
+  assert.equal(modal.contentEl.findByAttribute("aria-label", "Change 1 local line 1: omit")?.attributes["aria-pressed"], "true");
   modal.contentEl.findByText("Cancel")!.onclick?.();
   assert.deepEqual(await result, { action: "ask" });
 });

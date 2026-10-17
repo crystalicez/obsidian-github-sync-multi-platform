@@ -66,6 +66,21 @@ test("line-level review retains newlines, unchanged context, and allows empty ch
   }
 });
 
+
+test("hunk-wide defaults can be overridden on a single line without materializing decisions for all lines", () => {
+  const left = Array.from({ length: 100000 }, (_, i) => `local-${i}`);
+  const right = Array.from({ length: 100000 }, (_, i) => `remote-${i}`);
+  const sections = buildV4ConflictReview(left.join("\n"), right.join("\n"));
+  assert.equal(sections.length, 1);
+  const defaults = new Map([[0, "local" as const]]);
+  const overrides = new Map([[v4ReviewLineKey(0, "remote", 12), "keep" as const]]);
+  const merged = mergeV4ReviewedLines(sections, overrides, defaults);
+  assert.equal(merged, left.join("\n") + "\nremote-12");
+  assert.equal(overrides.size, 1, "hunk command must not require 200,000 per-line decisions");
+  assert.equal(mergeV4ReviewedLines(sections, new Map(), defaults), left.join("\n"));
+  assert.equal(mergeV4ReviewedLines(sections, new Map(), new Map()), null);
+});
+
 test("line-density working-set budget rejects pathological tiny-line input before splitting into huge arrays", () => {
   const dense = "\n".repeat(1_100_000);
   assert.equal(canPrepareV4ConflictReviewPair(dense, dense + "changed"), false);

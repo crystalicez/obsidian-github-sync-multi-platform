@@ -853,10 +853,47 @@ export class V4PluginRuntime {
           section.kind === "difference" ? sum + section.localLines.length + section.remoteLines.length : sum, 0)
         const contextLineCount = sections.reduce((sum, section) =>
           section.kind === "common" ? sum + section.lines.length : sum, 0)
+        // Shortcuts apply to a whole hunk in O(1) state instead of allocating
+        // one string/Map entry for every line of a very large difference.
+        const hunkDefaults = new Map<number, V4ReviewChoice>()
+        const partialLineCounts = new Map<number, number>()
+        let reviewedLineCount = 0
+        const decisionFor = (key: string): V4ReviewLineDecision | undefined => {
+          const explicit = selections.get(key)
+          if (explicit) return explicit
+          const [index, side] = key.split(":")
+          const choice = hunkDefaults.get(Number(index))
+          if (!choice) return undefined
+          return choice === "both" || choice === side ? "keep" : "omit"
+        }
+        const chooseLine = (index: number, side: "local" | "remote", line: number,
+          choice: V4ReviewLineDecision) => {
+          const key = v4ReviewLineKey(index, side, line)
+          if (!selections.has(key) && !hunkDefaults.has(index)) {
+            reviewedLineCount++
+            partialLineCounts.set(index, (partialLineCounts.get(index) ?? 0) + 1)
+          }
+          selections.set(key, choice)
+          update()
+        }
+        const chooseHunk = (index: number, section: Extract<V4ReviewSection, { kind: "difference" }>,
+          choice: V4ReviewChoice) => {
+          if (!hunkDefaults.has(index)) {
+            reviewedLineCount += section.localLines.length + section.remoteLines.length
+              - (partialLineCounts.get(index) ?? 0)
+          }
+          hunkDefaults.set(index, choice)
+          const prefix = `${index}:`
+          for (const key of selections.keys()) {
+            if (key.startsWith(prefix)) selections.delete(key)
+          }
+          partialLineCounts.delete(index)
+          update()
+        }
         let edited = false
         let previewReady = false
         const update = () => {
-          const merged = selections.size === count ? mergeV4ReviewedLines(sections, selections) : null
+          const merged = reviewedLineCount === count ? mergeV4ReviewedLines(sections, selections, hunkDefaults) : null
           previewReady = merged !== null
           if (!edited) output.value = merged ?? ""
           output.disabled = !previewReady
@@ -865,12 +902,12 @@ export class V4PluginRuntime {
           apply.disabled = !previewReady || tooLarge || signal.aborted
           reset.disabled = !previewReady || !edited
           summary.setText(tooLarge ? "Merged result exceeds the available safe text budget (32 MiB)."
-            : !previewReady ? `${selections.size}/${count} lines reviewed · choose Keep or Omit for every changed line.`
+            : !previewReady ? `${reviewedLineCount}/${count} lines reviewed · choose Keep or Omit for every changed line.`
               : edited ? "Custom text preserved. Review the exact result before applying; Reset restores line selections."
                 : "All lines reviewed · you can edit the merged text directly before applying.")
           for (const [key, pair] of controls) {
-            pair.keep.setAttribute("aria-pressed", String(selections.get(key) === "keep"))
-            pair.omit.setAttribute("aria-pressed", String(selections.get(key) === "omit"))
+            pair.keep.setAttribute("aria-pressed", String(decisionFor(key) === "keep"))
+            pair.omit.setAttribute("aria-pressed", String(decisionFor(key) === "omit"))
           }
         }
         output.oninput = () => {
@@ -941,8 +978,8 @@ export class V4PluginRuntime {
                 keep.setAttribute("aria-label", `Change ${activeHunk + 1} ${side.name} line ${lineIndex + 1}: keep`)
                 omit.setAttribute("aria-label", `Change ${activeHunk + 1} ${side.name} line ${lineIndex + 1}: omit`)
                 controls.set(key, { keep, omit })
-                keep.onclick = () => { selections.set(key, "keep"); update() }
-                omit.onclick = () => { selections.set(key, "omit"); update() }
+                keep.onclick = () => chooseLine(sectionIndex, side.name, lineIndex, "keep")
+                omit.onclick = () => chooseLine(sectionIndex, side.name, lineIndex, "omit")
               })
             }
             const shortcuts = block.createDiv({ cls: "github-sync-conflict__choices" })
@@ -955,13 +992,7 @@ export class V4PluginRuntime {
             for (const command of commands) {
               const button = shortcuts.createEl("button", { text: command.label })
               button.setAttribute("aria-label", `Change ${activeHunk + 1}: ${command.decision}`)
-              button.onclick = () => {
-                for (const side of sides) for (let i = 0; i < side.lines.length; i++) {
-                  const keep = command.decision === "both" || command.decision === side.name
-                  selections.set(v4ReviewLineKey(sectionIndex, side.name, i), keep ? "keep" : "omit")
-                }
-                update()
-              }
+              button.onclick = () => chooseHunk(sectionIndex, section, command.decision)
             }
             const after = sections[sectionIndex + 1]
             if (after?.kind === "common") {
@@ -1002,8 +1033,8 @@ export class V4PluginRuntime {
               keep.setAttribute("aria-label", `Change ${index + 1} ${side.name} line ${lineIndex + 1}: keep`)
               omit.setAttribute("aria-label", `Change ${index + 1} ${side.name} line ${lineIndex + 1}: omit`)
               controls.set(key, { keep, omit })
-              keep.onclick = () => { selections.set(key, "keep"); update() }
-              omit.onclick = () => { selections.set(key, "omit"); update() }
+              keep.onclick = () => chooseLine(sectionIndex, side.name, lineIndex, "keep")
+              omit.onclick = () => chooseLine(sectionIndex, side.name, lineIndex, "omit")
             })
           }
           const choose = block.createDiv({ cls: "github-sync-conflict__choices" })
@@ -1015,13 +1046,7 @@ export class V4PluginRuntime {
           ]
           for (const { choice, button } of choices) {
             button.setAttribute("aria-label", `Change ${index + 1}: ${choice}`)
-            button.onclick = () => {
-              for (const side of sides) side.lines.forEach((_, lineIndex) => {
-                const keep = choice === "both" || choice === side.name
-                selections.set(v4ReviewLineKey(sectionIndex, side.name, lineIndex), keep ? "keep" : "omit")
-              })
-              update()
-            }
+            button.onclick = () => chooseHunk(sectionIndex, section, choice)
           }
         }
         }

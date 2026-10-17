@@ -165,6 +165,7 @@ export async function buildV4ConflictReviewAsync(
 
 export function mergeV4ReviewedLines(
   sections: readonly V4ReviewSection[], choices: ReadonlyMap<string, V4ReviewLineDecision>,
+  defaults: ReadonlyMap<number, V4ReviewChoice> = new Map(),
 ): string | null {
   const lines: string[] = [];
   for (let index = 0; index < sections.length; index++) {
@@ -172,8 +173,11 @@ export function mergeV4ReviewedLines(
     if (section.kind === "common") { for (const line of section.lines) lines.push(line); continue; }
     for (const side of ["local", "remote"] as const) {
       const source = side === "local" ? section.localLines : section.remoteLines;
+      const fallback = defaults.get(index);
       for (let i = 0; i < source.length; i++) {
-        const decision = choices.get(v4ReviewLineKey(index, side, i));
+        const decision = choices.get(v4ReviewLineKey(index, side, i))
+          ?? (fallback === undefined ? undefined
+            : fallback === "both" || fallback === side ? "keep" : "omit");
         if (!decision) return null;
         if (decision === "keep") lines.push(source[i]);
       }

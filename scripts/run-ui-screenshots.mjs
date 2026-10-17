@@ -687,6 +687,24 @@ try {
   })()`);
   checked("paged conflict reuses DOM for later lines while preserving line identity",
     nextPage.later&&!nextPage.earlier&&nextPage.rows<=96,JSON.stringify(nextPage));
+  const bulkReview=await evaluate(`(()=>{
+    const started=performance.now();
+    document.querySelector('[aria-label="Change 1: local"]').click();
+    const afterShortcut=Math.round(performance.now()-started);
+    const editor=document.querySelector(".github-sync-conflict__editor");
+    const baseline=editor.value.includes("local text line 48")
+      &&!editor.value.includes("remote text line 48");
+    document.querySelector('[aria-label="Change 1 remote line 49: keep"]').click();
+    const override=editor.value.includes("local text line 48")
+      &&editor.value.includes("remote text line 48");
+    return {afterShortcut,baseline,override,
+      ready:!document.querySelector(".github-sync-conflict__apply").disabled,
+      mounted:document.querySelectorAll(".github-sync-conflict__line").length,
+      selected:document.querySelector('[aria-label="Change 1 remote line 49: keep"]').getAttribute("aria-pressed")};
+  })()`);
+  checked("native large hunk shortcut and one-line override preserve exact merged content without expanding DOM",
+    bulkReview.baseline&&bulkReview.override&&bulkReview.ready&&bulkReview.mounted<=96
+      &&bulkReview.selected==="true",JSON.stringify(bulkReview));
   await record("22-conflict-large-paged",{visibleSelector:".github-sync-conflict"});
   const canceledLarge=await evaluate(`(async()=>{
     [...document.querySelectorAll(".github-sync-conflict__actions button")]
