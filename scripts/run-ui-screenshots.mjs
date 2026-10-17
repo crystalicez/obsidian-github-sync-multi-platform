@@ -356,6 +356,95 @@ try {
   checked("native Settings UI restores unconfigured synthetic vault",
     !restored.owner&&!restored.repo&&restored.branch==="main"&&!restored.dataOwner&&!restored.dataRepo&&!restored.hasClient,
     JSON.stringify(restored));
+  // Exercise real password input and Obsidian Secret Storage with disposable
+  // literal fixture values. Leave owner/repo EMPTY throughout so no GitHub
+  // client can be constructed and no remote URL can be contacted.
+  const fixtureTokenA="ui-test-NOT-A-TOKEN-a";
+  const fixturePassA="ui-test-NOT-A-PASSPHRASE-a";
+  const fixtureTokenB="ui-test-NOT-A-TOKEN-b";
+  const fixturePassB="ui-test-NOT-A-PASSPHRASE-b";
+  const tokenField=await typeSettingsField("GitHub token",fixtureTokenA);
+  checked("actual GitHub token UI is masked password input",
+    tokenField.type==="password"&&tokenField.renderedValue===fixtureTokenA,
+    JSON.stringify({type:tokenField.type,fixtureMatched:tokenField.renderedValue===fixtureTokenA}));
+  const encryptionToggle=async()=>settingsEvaluate(`(()=>{
+    const item=[...document.querySelectorAll(".setting-item-name")]
+      .find(e=>e.textContent.trim()==="Encrypted sync")?.closest(".setting-item");
+    const toggle=item?.querySelector(".checkbox-container");
+    if(!toggle)throw Error("Encrypted sync toggle is missing");
+    toggle.click();
+    return {passphraseVisible:[...document.querySelectorAll(".setting-item-name")]
+      .some(e=>e.textContent.trim()==="Encryption passphrase")};
+  })()`);
+  const encryptedOn=await encryptionToggle();
+  checked("native encrypted mode toggle reveals passphrase field",encryptedOn.passphraseVisible,JSON.stringify(encryptedOn));
+  const passField=await typeSettingsField("Encryption passphrase",fixturePassA);
+  checked("actual encryption passphrase UI is masked password input",
+    passField.type==="password"&&passField.renderedValue===fixturePassA,
+    JSON.stringify({type:passField.type,fixtureMatched:passField.renderedValue===fixturePassA}));
+  await clickSettingsSave();
+  await sleep(550);
+  const secretA=await evaluate(`(async()=>{
+    const p=app.plugins.plugins[${JSON.stringify(id)}], data=(await p.loadData())?.settings??{};
+    const tokenId=p.settings.githubTokenSecretId,passId=p.settings.encryptionPassphraseSecretId;
+    return {tokenMatch:p.settings.githubToken===${JSON.stringify("ui-test-NOT-A-TOKEN-a")},
+      passMatch:p.settings.encryptionPassphrase===${JSON.stringify("ui-test-NOT-A-PASSPHRASE-a")},
+      mode:p.settings.encryptionMode,tokenId,passId,
+      secureTokenMatch:app.secretStorage.getSecret(tokenId)===${JSON.stringify("ui-test-NOT-A-TOKEN-a")},
+      securePassMatch:app.secretStorage.getSecret(passId)===${JSON.stringify("ui-test-NOT-A-PASSPHRASE-a")},
+      persistedTokenAbsent:!Object.hasOwn(data,"githubToken"),persistedPassAbsent:!Object.hasOwn(data,"encryptionPassphrase"),
+      hasClient:!!p.githubClient};
+  })()`);
+  checked("native password form stores both secrets only in Obsidian Secret Storage",
+    secretA.tokenMatch&&secretA.passMatch&&secretA.mode==="encrypted"&&secretA.tokenId&&secretA.passId
+      &&secretA.tokenId!==secretA.passId&&secretA.secureTokenMatch&&secretA.securePassMatch
+      &&secretA.persistedTokenAbsent&&secretA.persistedPassAbsent&&!secretA.hasClient,
+    JSON.stringify(secretA));
+  await typeSettingsField("GitHub token",fixtureTokenB);
+  await typeSettingsField("Encryption passphrase",fixturePassB);
+  await clickSettingsSave();
+  await sleep(550);
+  const secretB=await evaluate(`(async()=>{
+    const p=app.plugins.plugins[${JSON.stringify(id)}],data=(await p.loadData())?.settings??{};
+    const tokenId=p.settings.githubTokenSecretId,passId=p.settings.encryptionPassphraseSecretId;
+    return {tokenId,passId,
+      tokenMatch:p.settings.githubToken===${JSON.stringify("ui-test-NOT-A-TOKEN-b")},
+      passMatch:p.settings.encryptionPassphrase===${JSON.stringify("ui-test-NOT-A-PASSPHRASE-b")},
+      secureTokenMatch:app.secretStorage.getSecret(tokenId)===${JSON.stringify("ui-test-NOT-A-TOKEN-b")},
+      securePassMatch:app.secretStorage.getSecret(passId)===${JSON.stringify("ui-test-NOT-A-PASSPHRASE-b")},
+      oldTokenCleared:!app.secretStorage.getSecret(${JSON.stringify(secretA.tokenId)}),
+      oldPassCleared:!app.secretStorage.getSecret(${JSON.stringify(secretA.passId)}),
+      persistedTokenAbsent:!Object.hasOwn(data,"githubToken"),persistedPassAbsent:!Object.hasOwn(data,"encryptionPassphrase"),
+      hasClient:!!p.githubClient};
+  })()`);
+  checked("real Settings rotates secrets and scrubs superseded Secret Storage slots",
+    secretB.tokenId!==secretA.tokenId&&secretB.passId!==secretA.passId
+      &&secretB.tokenMatch&&secretB.passMatch&&secretB.secureTokenMatch&&secretB.securePassMatch
+      &&secretB.oldTokenCleared&&secretB.oldPassCleared
+      &&secretB.persistedTokenAbsent&&secretB.persistedPassAbsent&&!secretB.hasClient,
+    JSON.stringify(secretB));
+  await typeSettingsField("GitHub token","");
+  await typeSettingsField("Encryption passphrase","");
+  const encryptedOff=await encryptionToggle();
+  checked("native encrypted mode toggle hides passphrase field",!encryptedOff.passphraseVisible,JSON.stringify(encryptedOff));
+  await clickSettingsSave();
+  await sleep(550);
+  const secretsCleared=await evaluate(`(async()=>{
+    const p=app.plugins.plugins[${JSON.stringify(id)}],data=(await p.loadData())?.settings??{};
+    return {tokenEmpty:!p.settings.githubToken,passEmpty:!p.settings.encryptionPassphrase,
+      mode:p.settings.encryptionMode,oldTokenCleared:!app.secretStorage.getSecret(${JSON.stringify(secretB.tokenId)}),
+      oldPassCleared:!app.secretStorage.getSecret(${JSON.stringify(secretB.passId)}),
+      activeTokenEmpty:!app.secretStorage.getSecret(p.settings.githubTokenSecretId),
+      activePassEmpty:!app.secretStorage.getSecret(p.settings.encryptionPassphraseSecretId),
+      persistedTokenAbsent:!Object.hasOwn(data,"githubToken"),persistedPassAbsent:!Object.hasOwn(data,"encryptionPassphrase"),
+      hasClient:!!p.githubClient};
+  })()`);
+  checked("native Settings clears both secrets and restores plaintext unconfigured vault",
+    secretsCleared.tokenEmpty&&secretsCleared.passEmpty&&secretsCleared.mode==="plaintext"
+      &&secretsCleared.oldTokenCleared&&secretsCleared.oldPassCleared
+      &&secretsCleared.activeTokenEmpty&&secretsCleared.activePassEmpty
+      &&secretsCleared.persistedTokenAbsent&&secretsCleared.persistedPassAbsent&&!secretsCleared.hasClient,
+    JSON.stringify(secretsCleared));
   await evaluate(`(()=>{
     const t=app.plugins.plugins[${JSON.stringify(id)}].settingTab;
     if(!t.tempSettings)throw Error("Settings draft not active");
@@ -364,6 +453,7 @@ try {
   })()`);
   const dirty=await settingsEvaluate(`(()=>({dirty:!!document.querySelector(".github-sync-settings-dirty-banner"),notice:document.querySelector(".github-sync-settings-dirty-banner")?.innerText?.slice(0,200)}))()`);
   checked("unsaved settings banner",dirty.dirty,dirty.notice);
+  await settingsEvaluate(`(()=>document.querySelector(".github-sync-settings-dirty-banner")?.scrollIntoView({block:"start"}))()`);
   await record("02-settings-dirty",{visibleSelector:".github-sync-settings-dirty-banner"});
   await evaluate(`(()=>{const t=app.plugins.plugins[${JSON.stringify(id)}].settingTab;t.tempSettings.githubOwner=app.plugins.plugins[${JSON.stringify(id)}].settings.githubOwner;t.updateDirtyState();})()`);
   const scroll=await activeEvaluate(`(()=>{const els=[...document.querySelectorAll(".vertical-tab-content, .vertical-tab-content-container, .modal-content")].map(e=>({e,h:e.scrollHeight-e.clientHeight})).sort((a,b)=>b.h-a.h); const x=els[0]; if(x)x.e.scrollTop=x.e.scrollHeight;return {max:x?.h??0};})()`);
