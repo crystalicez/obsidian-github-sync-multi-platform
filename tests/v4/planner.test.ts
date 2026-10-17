@@ -81,6 +81,31 @@ test("v4 force operations can resolve cross-side namespace divergence", () => {
   assert.doesNotThrow(() => planV4Sync({ operation: "forcePull", base: [], local, remote }));
 });
 
+test("one-sided local removal propagates to GitHub on the next normal sync under the current V4 contract", () => {
+  const baseline = [file("shared.md", "shared", "base")];
+  const plan = planV4Sync({ operation: "normal", base: baseline, local: [], remote: baseline });
+  assert.deepEqual(plan.pushes.map(change => ({ kind: change.kind, path: change.path })), [
+    { kind: "delete", path: "shared.md" },
+  ]);
+  assert.deepEqual(plan.pulls, []);
+});
+
+test("one-sided remote removal propagates to the vault on the next normal sync under the current V4 contract", () => {
+  const baseline = [file("shared.md", "shared", "base")];
+  const plan = planV4Sync({ operation: "normal", base: baseline, local: baseline, remote: [] });
+  assert.deepEqual(plan.pulls.map(change => ({ kind: change.kind, path: change.path })), [
+    { kind: "delete", path: "shared.md" },
+  ]);
+  assert.deepEqual(plan.pushes, []);
+});
+
+test("unknown-base, one-sided removal cannot be described as a durable per-side delete", () => {
+  const local = [file("shared.md", "shared", "contents")];
+  const plan = planV4Sync({ operation: "normal", base: [], local, remote: [] });
+  assert.deepEqual(plan.pushes.map(change => change.kind), ["create"]);
+  assert.deepEqual(plan.pulls, []);
+});
+
 test("v4 normal sync allows a local delete-recreate when remote still matches the base", () => {
   const plan = planV4Sync({
     operation: "normal",
