@@ -351,6 +351,8 @@
 }
 
 .github-sync-conflict {
+  display: flex;
+  flex-direction: column;
   min-width: 0;
   max-height: min(78vh, 850px);
   overflow-y: auto;
@@ -483,6 +485,16 @@
   margin-top: var(--size-4-2);
 }
 
+.github-sync-conflict__actions {
+  order: 10;
+  position: sticky;
+  bottom: 0;
+  z-index: 3;
+  background: var(--modal-background, var(--background-primary));
+  padding: var(--size-4-2) 0;
+  border-top: 1px solid var(--background-modifier-border);
+}
+
 .github-sync-conflict__choices button[aria-pressed=true] {
   background: var(--interactive-accent);
   color: var(--text-on-accent);
@@ -511,7 +523,7 @@
 }
 
 .github-sync-conflict__apply {
-  margin-bottom: var(--size-4-2);
+  margin-bottom: 0;
 }
 
 @media (max-width: 620px) {

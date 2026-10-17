@@ -817,6 +817,7 @@ export class V4PluginRuntime {
       modal.contentEl.addClass("github-sync-conflict")
       modal.contentEl.createEl("h3", { text: path, cls: "github-sync-conflict__path" })
       modal.contentEl.createEl("p", { text: "Both local and remote changed. Nothing is applied until you choose a resolution.", cls: "github-sync-conflict__intro" })
+      const buttons = modal.contentEl.createDiv({ cls: "github-sync-conflict__actions" })
       const localText = localBytes ? decodeV4ReviewText(localBytes) : null
       const remoteText = remoteBytes ? decodeV4ReviewText(remoteBytes) : null
       if (localText !== null && remoteText !== null && canReviewV4Lines(localText, remoteText)) {
@@ -835,7 +836,7 @@ export class V4PluginRuntime {
           attr: { "aria-label": "Editable merged result", "spellcheck": "false", "rows": "8" } }) as HTMLTextAreaElement
         const reset = preview.createEl("button", { text: "Reset text to selected lines" })
         reset.setAttribute("aria-label", "Discard manual edits and restore selected lines")
-        const apply = modal.contentEl.createEl("button", { text: "Apply reviewed merge", cls: "mod-cta github-sync-conflict__apply" })
+        const apply = buttons.createEl("button", { text: "Apply reviewed merge", cls: "mod-cta github-sync-conflict__apply" })
         const count = sections.reduce((sum, section) =>
           section.kind === "difference" ? sum + section.localLines.length + section.remoteLines.length : sum, 0)
         let edited = false
@@ -928,7 +929,6 @@ export class V4PluginRuntime {
       } else {
         modal.contentEl.createEl("p", { text: "Line-by-line review is available for UTF-8 text up to 256 KiB and a bounded number of lines. For binary or larger files, use the whole-file decisions below.", cls: "github-sync-conflict__intro" })
       }
-      const buttons = modal.contentEl.createDiv({ cls: "github-sync-conflict__actions" })
       buttons.createEl("button", { text: "Keep both" }).onclick = () => finish({ action: "keep-local-copy-remote" })
       buttons.createEl("button", { text: "Use local" }).onclick = () => finish({ action: "use-local" })
       buttons.createEl("button", { text: "Use remote" }).onclick = () => finish({ action: "use-remote" })
