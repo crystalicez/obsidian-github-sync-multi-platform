@@ -17,6 +17,7 @@ import {
 } from "./git-tree-writer"
 import { reconcileV4CandidatePublication } from "./publish-reconciler"
 import { assertV4JournalChangeCapacity, buildV4JournalPages, V4_JOURNAL_PAGE_SIZE, V4_MAX_JOURNAL_PAGES, type V4JournalChange, type V4JournalPage } from "./history-journal"
+import { assertV4MetadataBytes } from "./metadata-bounds"
 import { isV4LocalIndexCacheComplete, isV4LocalIndexShardConsistent, type V4IndexFileRecord, type V4LocalIndex } from "./local-index"
 import { assertV4LocalTargetPrecondition, createV4LocalIo, type V4LocalIo, type V4LocalTargetPrecondition, type V4SessionVault } from "./local-io"
 import { trashV4LocalUserFile } from "./local-delete-policy"
@@ -1017,6 +1018,7 @@ export class V4SyncSession {
     const pages = buildV4JournalPages(journalId, journalChanges)
     for (const page of pages) {
       const raw = utf8ToBytes(JSON.stringify(page))
+      assertV4MetadataBytes(raw, "journal")
       files.push({
         path: journalPath(journalId, page.page, this.input.config.mode === "encrypted"),
         bytes: this.input.config.mode === "encrypted"
@@ -1259,6 +1261,11 @@ export class V4SyncSession {
       const file = await this.input.github.getFileBytes(`${V4_ROOT}/journals/${journalId}/${name}`, tip.sha)
       throwIfV4Aborted(this.input.signal)
       if (!file || file.sha !== node.sha) return null
+      try {
+        assertV4MetadataBytes(file.bytes, "journal", true)
+      } catch {
+        return null
+      }
       let decoded: Uint8Array
       try {
         decoded = await decryptV4Payload(this.input.keyring!.journalKey, file.bytes, {
@@ -1270,6 +1277,7 @@ export class V4SyncSession {
       }
       let journal: V4JournalPage
       try {
+        assertV4MetadataBytes(decoded, "journal")
         journal = JSON.parse(bytesToUtf8(decoded)) as V4JournalPage
       } catch {
         return null

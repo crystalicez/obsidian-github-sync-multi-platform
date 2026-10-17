@@ -1,6 +1,7 @@
 import { bytesToUtf8, fromBase64Url, sha256Hex, toBase64Url, utf8ToBytes } from "../bytes"
 import { decryptV4Payload, encryptV4Payload, type V4Keyring } from "./crypto"
 import { buildV4PartPaths, shouldUseV4Parts, V4_PART_BYTES } from "./large-files"
+import { assertV4MetadataBytes } from "./metadata-bounds"
 import type { V4IndexFileRecord } from "./local-index"
 import { bucketForV4PathId, normalizeV4VaultPath, objectIdForV4File, opaqueV4ObjectPath, opaqueV4PackPath, pathIdForV4Path } from "./paths"
 import { PACK_MAX_ENTRY_BYTES, PACK_MAX_FILES, PACK_MAX_PLAINTEXT_BYTES } from "./pack-planner"
@@ -201,10 +202,13 @@ export function v4RemoteShardPath(bucket: string, mode: V4RemoteConfig["mode"]):
 }
 
 export function encodeV4RemoteConfig(config: V4RemoteConfig): Uint8Array {
-  return utf8ToBytes(JSON.stringify(config))
+  const bytes = utf8ToBytes(JSON.stringify(config))
+  assertV4MetadataBytes(bytes, "config")
+  return bytes
 }
 
 export function decodeV4RemoteConfig(bytes: Uint8Array): V4RemoteConfig {
+  assertV4MetadataBytes(bytes, "config")
   const parsed = JSON.parse(bytesToUtf8(bytes)) as unknown
   if (!isRecord(parsed)) throw new Error("Invalid V4 remote config.")
   const config = parsed as unknown as V4RemoteConfig
@@ -235,6 +239,7 @@ async function encodeMetadata(
   aad: string,
 ): Promise<Uint8Array> {
   const bytes = utf8ToBytes(JSON.stringify(value))
+  assertV4MetadataBytes(bytes, kind === "index" ? "shard" : "head")
   if (config.mode === "plaintext") return bytes
   if (!keyring) throw new Error("Encryption passphrase is required to read encrypted V4 metadata.")
   return encryptV4Payload(keyring.indexKey, bytes, { kind, aad })
@@ -247,6 +252,8 @@ async function decodeMetadata<T>(
   kind: "head" | "index",
   aad: string,
 ): Promise<T> {
+  const metadataKind = kind === "index" ? "shard" : "head"
+  assertV4MetadataBytes(bytes, metadataKind, config.mode === "encrypted")
   let plaintext: Uint8Array
   try {
     plaintext = config.mode === "plaintext"
@@ -255,6 +262,7 @@ async function decodeMetadata<T>(
   } catch (error) {
     throw new Error(`Unable to decrypt V4 ${kind} metadata (${aad}). Check the encryption passphrase.`, { cause: error })
   }
+  assertV4MetadataBytes(plaintext, metadataKind)
   return JSON.parse(bytesToUtf8(plaintext)) as T
 }
 

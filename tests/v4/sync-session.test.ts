@@ -1989,6 +1989,43 @@ test("v4 deletion progress completes one logical push without a content upload",
   assert.equal(events.some(event => event.phase === "uploading" && event.currentPath === "delete.md"), false);
 });
 
+test("v4 encrypted two-device delete followed by recreate preserves the published object and new identity", async () => {
+  const github = new MemoryGitHub();
+  const keys = await deriveV4Keyring({ passphrase: "test-key", repoId: "o/r#main", salt: enc("salt"), iterations: 10 });
+  const encryptedConfig: V4RemoteConfig = {
+    formatVersion: 4, mode: "encrypted", repoId: "o/r#main", pathLayout: "opaque-stable-v1",
+    algorithm: "AES-GCM", kdf: "PBKDF2-SHA-256", kdfParams: { iterations: 10, salt: "c2FsdA" },
+  };
+  const a = new MemoryVault();
+  const b = new MemoryVault();
+  const indexA = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "device-a", mode: "encrypted", pathLayout: "opaque-stable-v1" });
+  const indexB = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "device-b", mode: "encrypted", pathLayout: "opaque-stable-v1" });
+  const run = (vault: MemoryVault, index: V4LocalIndex) =>
+    new V4SyncSession({ github, vault, index, config: encryptedConfig, keyring: keys, conflictPolicy: "copy", abortChangePercent: 0 });
+  a.files.set("Notes/reborn.md", { bytes: enc("generation-one\n"), mtime: 1 });
+  await run(a, indexA).sync({ operation: "forcePush", allowThresholdOverride: false });
+  await run(b, indexB).sync({ operation: "forcePull", allowThresholdOverride: false });
+  const oldRecord = { ...indexRecordByPath(indexA, "Notes/reborn.md") };
+  a.files.delete("Notes/reborn.md");
+  await run(a, indexA).sync({
+    operation: "normal", allowThresholdOverride: false,
+    changes: [{ type: "delete", path: "Notes/reborn.md", mtime: 2 }],
+  });
+  a.files.set("Notes/reborn.md", { bytes: enc("generation-two\n"), mtime: 3 });
+  await run(a, indexA).sync({
+    operation: "normal", allowThresholdOverride: false,
+    changes: [{ type: "modify", path: "Notes/reborn.md", mtime: 3 }],
+  });
+  const newRecord = indexRecordByPath(indexA, "Notes/reborn.md");
+  assert.notEqual(newRecord.fileId, oldRecord.fileId);
+  assert.notEqual(newRecord.remotePath, oldRecord.remotePath);
+  assert.equal(github.files.has(newRecord.remotePath), true, "published metadata must reference a stored object");
+  assert.equal(github.files.has(oldRecord.remotePath), false, "superseded object must be removed");
+  await run(b, indexB).sync({ operation: "normal", allowThresholdOverride: false });
+  assert.deepEqual(b.files.get("Notes/reborn.md")?.bytes, enc("generation-two\n"));
+  assert.equal(indexRecordByPath(indexB, "Notes/reborn.md").fileId, newRecord.fileId);
+});
+
 test("v4 delete then recreate in one debounce window creates a new encrypted identity atomically", async () => {
   const github = new MemoryGitHub();
   const vault = new MemoryVault();

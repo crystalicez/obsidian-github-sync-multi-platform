@@ -646,8 +646,37 @@ async function runDeleteRecreateScenario(config: GitHubConfig, mode: V4StorageMo
     });
     const newRecord = recordFor(a, "Notes/reborn.md");
     assert.notEqual(newRecord.fileId, oldFileId, "delete/recreate reused the old file identity");
+    const publishedSha = a.index.remoteCommitSha!;
+    const publishedTree = await a.client.getGitCommit(publishedSha);
+    const publishedEntries = await a.client.getTreeAt(publishedTree.treeSha, true);
+    assert.equal(publishedEntries.truncated, false, "Published recreate Git tree cannot be truncated.");
+    assert.equal(
+      publishedEntries.tree.some(node => node.path === newRecord.remotePath && node.type === "blob"),
+      true,
+      "Published recreate metadata references an object absent from its exact Git tree.",
+    );
+    assert.ok(
+      await a.client.getFileBytes(newRecord.remotePath, publishedSha),
+      "Published recreate object cannot be read by its exact immutable commit.",
+    );
 
-    await b.session.sync({ operation: "normal", allowThresholdOverride: false });
+    try {
+      await b.session.sync({ operation: "normal", allowThresholdOverride: false });
+    } catch (error) {
+      const afterFailureTree = await a.client.getTreeAt(publishedTree.treeSha, true);
+      const stillReadable = await a.client.getFileBytes(newRecord.remotePath, publishedSha)
+        .then(file => !!file, () => false);
+      const message = error instanceof Error ? `${error.message} ${String(error.cause ?? "")}` : String(error);
+      console.error(JSON.stringify({
+        diagnostic: "encrypted-delete-recreate-pull-failure",
+        mode,
+        publishedObjectInTree: afterFailureTree.tree.some(node => node.path === newRecord.remotePath && node.type === "blob"),
+        publishedObjectReadableAfterFailure: stillReadable,
+        missingPathIsNewPublishedObject: message.includes(newRecord.remotePath),
+        remoteCommitSameAsPublishingDevice: b.index.remoteCommitSha === publishedSha,
+      }));
+      throw error;
+    }
     assert.deepEqual(b.vault.files.get("Notes/reborn.md")?.bytes, bytes("generation-two\n"));
     assert.equal(recordFor(b, "Notes/reborn.md").fileId, newRecord.fileId);
   });
@@ -734,6 +763,10 @@ after(async () => {
   } finally {
     setRequestUrlHandler(null);
   }
+});
+
+test("V4 encrypted delete/recreate publishes a Git tree containing its new object", { timeout: 240_000 }, async () => {
+  await runDeleteRecreateScenario(config, "encrypted");
 });
 
 test("V4 real GitHub REST survives realistic superuser and two-device scenarios", { timeout: 900_000 }, async () => {
