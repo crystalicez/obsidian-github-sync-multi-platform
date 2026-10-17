@@ -653,6 +653,44 @@ try {
   })()`);
   checked("native review Cancel never applies or leaves the modal open",
     cancelled.action==="ask"&&cancelled.remaining===0,JSON.stringify(cancelled));
+  const largeReview=await evaluate(`(async()=>{
+    const p=app.plugins.plugins[${JSON.stringify(id)}];
+    const enc=new TextEncoder();
+    const a=Array.from({length:12000},(_,i)=>"local text line "+i).join("\\n");
+    const b=Array.from({length:12000},(_,i)=>"remote text line "+i).join("\\n");
+    const started=performance.now();
+    window.__uiLargeConflict=p.v4Runtime.askConflict("Notes/large-review.md",
+      new AbortController().signal,enc.encode(a),enc.encode(b));
+    await new Promise(resolve=>setTimeout(resolve,240));
+    const elapsed=Math.round(performance.now()-started);
+    return {elapsed,visible:!!document.querySelector(".github-sync-conflict"),
+      rows:document.querySelectorAll(".github-sync-conflict__line").length,
+      hasPaging:!![...document.querySelectorAll(".github-sync-conflict__pager button")]
+        .find(e=>e.textContent.trim()==="Next lines"),
+      disabled:document.querySelector(".github-sync-conflict__apply")?.disabled};
+  })()`);
+  checked("native 12k-line conflict uses a bounded page instead of 24k mounted rows",
+    largeReview.visible&&largeReview.rows<=96&&largeReview.hasPaging&&largeReview.disabled,
+    JSON.stringify(largeReview));
+  const nextPage=await evaluate(`(()=>{
+    [...document.querySelectorAll(".github-sync-conflict__pager button")]
+      .find(e=>e.textContent.trim()==="Next lines").click();
+    const later=!!document.querySelector('[aria-label="Change 1 remote line 49: keep"]');
+    const earlier=!!document.querySelector('[aria-label="Change 1 remote line 1: keep"]');
+    const rows=document.querySelectorAll(".github-sync-conflict__line").length;
+    return {later,earlier,rows};
+  })()`);
+  checked("paged conflict reuses DOM for later lines while preserving line identity",
+    nextPage.later&&!nextPage.earlier&&nextPage.rows<=96,JSON.stringify(nextPage));
+  await record("22-conflict-large-paged",{visibleSelector:".github-sync-conflict"});
+  const canceledLarge=await evaluate(`(async()=>{
+    [...document.querySelectorAll(".github-sync-conflict__actions button")]
+      .find(e=>e.textContent.trim()==="Cancel").click();
+    const r=await window.__uiLargeConflict;
+    delete window.__uiLargeConflict;
+    return {action:r.action,remaining:document.querySelectorAll(".github-sync-conflict").length};
+  })()`);
+  checked("large paged review Cancel is a no-op",canceledLarge.action==="ask"&&canceledLarge.remaining===0,JSON.stringify(canceledLarge));
   // With no GitHub credentials, Force commands must refuse to open destructive dialogs.
   // This run never unlocks a Force control or invokes a remote operation.
   for(const mode of ["forcePush","forcePull"]){

@@ -2,7 +2,7 @@ import { bytesToUtf8, randomBytes, sha256Hex, toBase64Url, toHex, utf8ToBytes } 
 import type { GitHubTree, GitHubTreeNode } from "../github-api"
 import type { GitHubGitCommit } from "../github-git-types"
 import { evaluateV4ChangeGuard } from "./change-guard"
-import { canAttemptV4TextMerge, resolveV4Conflict, type V4ConflictPolicy, type V4ConflictResolution } from "./conflicts"
+import { canAttemptV4TextMerge, isV4ReviewableTextPath, resolveV4Conflict, type V4ConflictPolicy, type V4ConflictResolution } from "./conflicts"
 import { V4_REVIEW_MAX_BYTES } from "./conflict-review"
 import type { V4Keyring } from "./crypto"
 import { decryptV4Payload, encryptV4Payload } from "./crypto"
@@ -584,7 +584,7 @@ export class V4SyncSession {
         const boundedRemote = remoteRecord && (remoteRecord.storage === "single"
           || (remoteRecord.storage === "pack" && !!reviewPackRecords && groupBytes <= V4_REVIEW_MAX_BYTES))
         if (conflict.local && remoteRecord && boundedRemote
-          && canAttemptV4TextMerge(conflict.path, [conflict.local.size, remoteRecord.size])
+          && isV4ReviewableTextPath(conflict.path)
           && conflict.local.size <= V4_REVIEW_MAX_BYTES && remoteRecord.size <= V4_REVIEW_MAX_BYTES) {
           localReview = await this.readLocal(conflict.local.path)
           if (localReview.byteLength <= V4_REVIEW_MAX_BYTES) {

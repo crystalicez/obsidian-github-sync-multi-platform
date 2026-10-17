@@ -1,6 +1,8 @@
 # Per-line conflict merge acceptance — 2026-10-17
 
-**Maintainer requirement:** Conflict Resolution must allow selecting and combining **individual lines**, not just choosing Local / Remote / Both / Discard for an entire diff hunk. The example screenshots from `silvanocerza/github-gitless-sync` are UX references only (that repository is AGPL-3.0). All implementation is independently authored in this Apache-2.0 repository.
+**Maintainer requirement:** Conflict Resolution must allow selecting and combining **individual lines**, not just choosing Local / Remote / Both / Discard for an entire diff hunk.
+
+**Update:** This document preserves the exact-SHA evidence of the original constrained implementation. The old 256 KiB / 600-line / 180,000-total-cell cutoff is superseded by [the scalable review implementation](scalable-conflict-review-2026-10-17.md). Do not cite the historical limits as current behavior. The example screenshots from `silvanocerza/github-gitless-sync` are UX references only (that repository is AGPL-3.0). All implementation is independently authored in this Apache-2.0 repository.
 
 ## UI and safety behavior
 

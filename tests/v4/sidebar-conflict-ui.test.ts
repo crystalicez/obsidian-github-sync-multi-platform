@@ -190,7 +190,7 @@ test("an oversized hand-edited merge cannot be applied and cancellation leaves n
   const apply = modal.contentEl.findByText("Apply reviewed merge")!;
   assert.equal(apply.disabled, false);
   const output = modal.contentEl.findByAttribute("aria-label", "Editable merged result")!;
-  output.value = "🔐".repeat(140000);
+  output.value = "🔐".repeat(8_500_000);
   output.oninput?.();
   assert.equal(apply.disabled, true);
   apply.onclick?.();
@@ -199,7 +199,7 @@ test("an oversized hand-edited merge cannot be applied and cancellation leaves n
 });
 
 
-test("oversized line count cannot expand thousands of interactive controls", async () => {
+test("large line review pages at most 48 lines per side and can select later pages", async () => {
   resetModalTestState();
   const runtime = Object.create(V4PluginRuntime.prototype) as any;
   runtime.plugin = { app: {} };
@@ -207,10 +207,31 @@ test("oversized line count cannot expand thousands of interactive controls", asy
   const remote = new TextEncoder().encode(Array.from({ length: 900 }, (_, i) => `new ${i}`).join("\n"));
   const result = runtime.askConflict("many-lines.md", new AbortController().signal, local, remote);
   const modal = modalInstances.at(-1)!;
-  assert.equal(modal.contentEl.findByText("Apply reviewed merge"), undefined);
-  assert.equal(modal.contentEl.findByClass("github-sync-conflict__line"), undefined);
+  const rows = (root: any): number => Number(root.classes?.has("github-sync-conflict__line") ?? false)
+    + (root.children ?? []).reduce((sum: number, child: any) => sum + rows(child), 0);
+  assert.ok(rows(modal.contentEl) <= 96, "only one visible 48-line window per side may be mounted");
+  assert.ok(modal.contentEl.findByText("Next lines"));
+  assert.equal(modal.contentEl.findByText("Apply reviewed merge")?.disabled, true);
+  modal.contentEl.findByText("Next lines")!.onclick?.();
+  assert.ok(modal.contentEl.findByAttribute("aria-label", "Change 1 local line 49: keep"));
+  assert.equal(modal.contentEl.findByAttribute("aria-label", "Change 1 local line 1: keep"), undefined);
+  modal.contentEl.findByAttribute("aria-label", "Change 1: local")!.onclick?.();
+  assert.equal(modal.contentEl.findByText("Apply reviewed merge")?.disabled, false);
   modal.contentEl.findByText("Cancel")!.onclick?.();
   assert.deepEqual(await result, { action: "ask" });
+});
+
+test("aborting during cooperatively prepared large review never opens a late modal", async () => {
+  resetModalTestState();
+  const runtime = Object.create(V4PluginRuntime.prototype) as any;
+  runtime.plugin = { app: {} };
+  const text = Array.from({ length: 14000 }, (_, i) => `long context paragraph ${i}`).join("\n");
+  const abort = new AbortController();
+  const waiting = runtime.askConflict("large.md", abort.signal,
+    new TextEncoder().encode(text), new TextEncoder().encode(text + "\nremote change"));
+  abort.abort();
+  assert.deepEqual(await waiting, { action: "ask" });
+  assert.equal(modalInstances.length, 0);
 });
 
 test("manual review remains safe when content is missing/binary, and abort closes modal", async () => {
@@ -222,7 +243,7 @@ test("manual review remains safe when content is missing/binary, and abort close
     new Uint8Array([0]), new Uint8Array([1]));
   const modal = modalInstances.at(-1)!;
   assert.equal(modal.contentEl.findByText("Apply reviewed merge"), undefined);
-  assert.match(modal.contentEl.flattenText(), /available for UTF-8 text/u);
+  assert.match(modal.contentEl.flattenText(), /supports UTF-8 text/u);
   controller.abort();
   assert.deepEqual(await result, { action: "ask" });
 });

@@ -392,6 +392,34 @@
   min-width: 0;
 }
 
+.github-sync-conflict__pager {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--size-4-1);
+  padding: var(--size-4-2);
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: var(--background-primary);
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.github-sync-conflict__pager span {
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  padding: 0 var(--size-4-1);
+}
+
+.github-sync-conflict__pager button {
+  font-size: var(--font-ui-smaller);
+  padding: var(--size-4-1) var(--size-4-2);
+}
+
+.github-sync-conflict__page {
+  min-width: 0;
+}
+
 .github-sync-conflict__common,
 .github-sync-conflict__line-text,
 .github-sync-conflict__output {
