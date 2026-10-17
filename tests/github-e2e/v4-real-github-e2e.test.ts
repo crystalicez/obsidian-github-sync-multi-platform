@@ -771,7 +771,18 @@ async function runControlledRaceScenario(config: GitHubConfig): Promise<void> {
     }
     interference.armed = false;
 
-    assert.equal(interference.fired, true, "controlled branch-head interference hook did not fire");
+    if (!interference.fired) {
+      // Diagnose failures occurring *before* the transport interception point
+      // without printing the request's Authorization header or the token.
+      const errorKind = publishError instanceof Error ? publishError.name : "none";
+      const raceClassified = isV4PublicationRaceError(publishError);
+      // The reason is essential to distinguish pre-publication reject from a
+      // missing PATCH, but never include the PAT or Authorization credentials.
+      const safeReason = publishError instanceof Error
+        ? publishError.message.replaceAll(config.token, "[redacted]").replace(/Bearer\s+\S+/giu, "Bearer [redacted]").slice(0, 220)
+        : "no error returned";
+      assert.fail(`controlled branch-head interference hook did not fire; pre-PATCH result=${errorKind}; publicationRace=${raceClassified}; reason=${safeReason}`);
+    }
     const externalCommitSha = interference.externalCommitSha;
     assert.ok(externalCommitSha, "controlled branch-head interference did not create an external commit");
     assert.ok(publishError, "plugin publish unexpectedly succeeded over an externally advanced branch");
@@ -809,6 +820,10 @@ after(async () => {
   } finally {
     setRequestUrlHandler(null);
   }
+});
+
+test("V4 controlled GitHub branch-head interference rejects a concurrent publish", { timeout: 210_000 }, async () => {
+  await runControlledRaceScenario(config);
 });
 
 test("V4 encrypted delete/recreate publishes a Git tree containing its new object", { timeout: 240_000 }, async () => {
