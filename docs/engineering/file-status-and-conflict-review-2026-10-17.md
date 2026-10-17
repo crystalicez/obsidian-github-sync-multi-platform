@@ -10,7 +10,7 @@ Configured Sync Center now opens to **Files** while retaining **Commits** and **
 
 `V4PluginRuntime.fileOverview()` fetches **one exact immutable Git ref** and the pinned V4 config/head/index shards; the remote index loader authenticates the remote metadata. It never misidentifies local-only files as remotely present because of an unversioned/stale index. It rejects settings-generation changes mid-fetch. Classification compares current scoped local paths/stat with the last synced index and current remote version. **Synced is a metadata-based status, not a byte-for-byte local hash comparison**; its details state this limitation explicitly.
 
-**Safety:** This is a **read-only file overview**. It does not implement individual Push / Pull / Delete / Remove actions yet because safe scoped writes need their own transactional semantics and review. The existing Sync now uses the normal conflict policy. A remote load error is visible, not misrepresented as an empty repository.
+**Safety / final UX decision:** This is a **read-only file overview**. The maintainer explicitly declined the upstream legacy per-file **Remove** and bulk **Delete (N)** controls, as well as a replacement per-file deletion chooser; none are implemented or planned. `Deleted locally` / `Deleted remotely` remain informative status labels. The existing Sync now uses the normal conflict policy and can propagate deletions as determined by the V4 planner. A remote load error is visible, not misrepresented as an empty repository. See [the decision record](files-sidebar-no-delete-decision-2026-10-17.md).
 
 ## Conflict review behavior
 
@@ -63,4 +63,4 @@ This is a **display-only fix**. The file overview now accepts the authenticated 
 
 ## Explicit remaining production work
 
-This does **not** yet provide per-file selective remote mutations, a syntax-highlighted Monaco merge editor, true 3-way common-ancestor merge review, reviewed text for large packed/chunked objects, physical mobile acceptance, or independently approved hosted CI. Live GitHub E2E on this precise source SHA is separately qualified (or remains unverified if not executed). The previous intermittent encrypted delete/recreate incident is still open. Draft PR #8 stays Draft; do not merge or publish without signoff.
+This does **not** include destructive per-file actions (deliberately excluded by product decision), a syntax-highlighted Monaco merge editor, true 3-way common-ancestor merge review, reviewed text for large packed/chunked objects, physical mobile acceptance, or independently approved hosted CI. Live GitHub E2E on this precise source SHA is separately qualified (or remains unverified if not executed). The previous intermittent encrypted delete/recreate incident is still open. Draft PR #8 stays Draft; do not merge or publish without signoff.

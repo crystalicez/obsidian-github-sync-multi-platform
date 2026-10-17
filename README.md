@@ -75,7 +75,7 @@ Phase changes appear immediately. Rapid path and counter changes are published a
 
 ### Files overview and interactive conflict review (unreleased audit branch)
 
-Open **GitHub Sync Center → Files** after configuring a repository. File statuses are read-only; use **Refresh status** to query the current exact GitHub branch snapshot. **All**, **Changed**, **Local only**, **Remote** and **Synced** filters work with path search, expandable folders, and a flat-list toggle. No per-file push, pull or deletion action is offered yet: **Sync now** runs the normal sync engine and its existing safeguards, and may delete or replace files depending on the configured policy.
+Open **GitHub Sync Center → Files** after configuring a repository. File statuses are read-only; use **Refresh status** to query the current exact GitHub branch snapshot. **All**, **Changed**, **Local only**, **Remote** and **Synced** filters work with path search, expandable folders, and a flat-list toggle. **No per-file Remove or bulk Delete (N) buttons are provided or planned** in this read-only Files view. Use **Sync now** for the existing full-sync workflow and its safeguards; normal sync can propagate deletions or restore content depending on the last synchronized state. This does not remove existing V4 sync deletion handling.
 
 **Changed** also includes *previously synchronized files that were deleted on only one side*. Select the file to see **Deleted locally** or **Deleted remotely** and a warning before syncing. **Synced** means the current file metadata matches the last synchronized index (size, mtime and remote version), **not** a fresh byte-for-byte file hash verification. The overview reflects a particular remote commit SHA; it is not a continuously live view.
 

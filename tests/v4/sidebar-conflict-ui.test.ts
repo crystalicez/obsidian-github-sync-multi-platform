@@ -32,6 +32,11 @@ test("Files sidebar displays authenticated inventory filters, tree and read-only
   assert.equal(view.contentEl.findByText("All 4")?.attributes["aria-pressed"], "true");
   assert.equal(view.contentEl.findByText("Changed 1")?.attributes["aria-pressed"], "false");
   assert.match(view.contentEl.flattenText(), /Read-only overview/su);
+  // Product decision: no per-file Remove or bulk Delete (N) action.
+  // Status labels such as "Deleted remotely" are informational only.
+  assert.equal(view.contentEl.findByText("Remove"), undefined);
+  assert.equal(view.contentEl.findByText("Delete"), undefined);
+  assert.equal(view.contentEl.findByText("Delete (2)"), undefined);
   view.contentEl.findByText("Changed 1")?.onclick?.();
   assert.match(tree.flattenText(), /changed\.md/su);
   assert.doesNotMatch(tree.flattenText(), /local\.md|remote\.md|synced\.md/su);
