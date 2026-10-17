@@ -8,6 +8,7 @@ import { deriveV4Keyring, type V4Keyring } from "../../src/lib/v4/crypto";
 import { V4HistoryService } from "../../src/lib/v4/history-service";
 import { createEmptyV4LocalIndex, type V4LocalIndex } from "../../src/lib/v4/local-index";
 import { isV4PublicationRaceError } from "../../src/lib/v4/publication-race";
+import { fetchGitHubE2EWithRetry } from "./support/request-retry";
 import { expectedV4PathLayout, V4_FORMAT_VERSION, type V4RemoteConfig, type V4StorageMode } from "../../src/lib/v4/protocol-types";
 import { V4StorageCodec } from "../../src/lib/v4/storage-codec";
 import { V4SyncSession, type V4SessionVault, type V4SyncRunState } from "../../src/lib/v4/sync-session";
@@ -72,21 +73,8 @@ function sameBytes(left: Uint8Array, right: Uint8Array): boolean {
   return true;
 }
 
-async function fetchWithRetry(url: string, init: RequestInit, attempts = 3): Promise<Response> {
-  let response: Response | undefined;
-  for (let attempt = 1; attempt <= attempts; attempt++) {
-    response = await fetch(url, init);
-    if (![401, 403, 429].includes(response.status) && response.status < 500) return response;
-    if (attempt < attempts) {
-      await response.arrayBuffer().catch(() => undefined);
-      await new Promise(resolve => setTimeout(resolve, attempt * 500));
-    }
-  }
-  return response!;
-}
-
 async function githubRequest(config: GitHubConfig, apiPath: string, init: RequestInit = {}): Promise<Response> {
-  return fetchWithRetry(`https://api.github.com/repos/${config.owner}/${config.repo}${apiPath}`, {
+  return fetchGitHubE2EWithRetry(`https://api.github.com/repos/${config.owner}/${config.repo}${apiPath}`, {
     ...init,
     headers: {
       Authorization: `Bearer ${config.token}`,
@@ -176,7 +164,7 @@ function installRequestUrlBridge(config: GitHubConfig): void {
       interference.externalCommitSha = await publishExternalCommit(config, interference.marker ?? "controlled-race");
     }
 
-    const response = await fetchWithRetry(request.url, {
+    const response = await fetchGitHubE2EWithRetry(request.url, {
       method,
       headers: request.headers,
       body: request.body,

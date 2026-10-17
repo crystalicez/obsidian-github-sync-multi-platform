@@ -4,6 +4,13 @@
 >
 > **Mandatory workflow rule:** Every AI session that makes a material change to code, tests, design decisions, branch/PR state, verification status, or next steps MUST update this file before ending or handing work off. GitHub is the source of truth.
 
+## 2026-10-18 E2E mutation retry hardening (after d367e60)
+
+- **Confirmed E2E harness correctness defect:** `tests/github-e2e/v4-real-github-e2e.test.ts` used a generic HTTP retry helper for the Obsidian request bridge and external GitHub calls. It replayed `POST` and `PATCH` after 5xx or 429 even when the first mutation outcome was unknown; it also retried 401. A repeated mutation can distort race evidence. This is a test-harness finding, **not proof of a runtime mutation retry bug or a root cause for the previous intermittent race failure**.
+- **RED→GREEN:** new behavioral `tests/v4/github-e2e-request-retry.test.ts` first failed 3/4 with literal `200 !== 503`, `201 !== 503`, and 401 retry count `3 !== 1`. Extracted `fetchGitHubE2EWithRetry` into `tests/github-e2e/support/request-retry.ts`: only `GET`/`HEAD` may retry HTTP 429/5xx; non-idempotent mutation responses and thrown network failures are never replayed. Six focused regression tests then passed **6/6**, including all four write methods and uncertain network outcome.
+- **Observed primary working-tree gates:** `corepack pnpm build` **exit 0**, `test:fast` **exit 0**, `test:repeat` **exit 0 (10/10)**, `test:github-e2e:compile` **exit 0 (three bundles)**, `validate:metadata` **exit 0**, `validate:package` **exit 0**, `test:recovery` **exit 0**, `test:resource` **exit 0**, and `test:feasibility` **exit 0**. These are not isolated exact-committed-SHA proof. No credentialed live-GitHub mutation was attempted in this iteration.
+- **Unchanged release blockers:** intermittent complete `controlled-external-branch-head-race` scenario still needs a fully logged live rerun and exact-SHA cleanup proof; hosted CI and independent review, real mobile acceptance, and maintainer PR approval remain open. PR #8 stays Draft. Original unstaged `tests/v4/github-transport.test.ts` WIP remains excluded. Evidence in `docs/engineering/github-e2e-request-retry-2026-10-18.md`. No merge or release.
+
 ## Active production audit — 2026-09-26
 
 Branch: `audit/2026-09-26-production-hardening`
