@@ -661,7 +661,12 @@ try {
     const started=performance.now();
     window.__uiLargeConflict=p.v4Runtime.askConflict("Notes/large-review.md",
       new AbortController().signal,enc.encode(a),enc.encode(b));
-    await new Promise(resolve=>setTimeout(resolve,240));
+    // Cooperative diff deliberately yields to the UI: wait for the actual
+    // review state, not a fixed 240ms that flakes on a cold clean checkout.
+    const deadline=performance.now()+12000;
+    while(!document.querySelector(".github-sync-conflict") && performance.now()<deadline){
+      await new Promise(resolve=>setTimeout(resolve,80));
+    }
     const elapsed=Math.round(performance.now()-started);
     return {elapsed,visible:!!document.querySelector(".github-sync-conflict"),
       rows:document.querySelectorAll(".github-sync-conflict__line").length,
