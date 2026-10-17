@@ -42,6 +42,42 @@ test("local stat divergence and unknown baseline remain changed, never assert sy
   assert.ok(model.entries.every(entry => entry.status === "changed"));
 });
 
+
+test("tracked one-sided deletions are changes, not new Local only or Remote-only files", () => {
+  const overview = buildV4FileOverview({
+    remoteCommitSha: "immutable-head",
+    localFiles: [
+      { path: "tracked-remote-removed.md", size: 9, mtime: 100 },
+      { path: "new-local.md", size: 3, mtime: 200 },
+    ],
+    remoteFiles: [
+      { path: "tracked-local-removed.md", remoteVersion: "version-1" },
+      { path: "new-remote.md", remoteVersion: "version-2" },
+    ],
+    baselineFiles: [
+      { path: "tracked-remote-removed.md", remoteVersion: "version-1", size: 9, mtime: 100 },
+      { path: "tracked-local-removed.md", remoteVersion: "version-1", size: 8, mtime: 50 },
+    ],
+  });
+  const byPath = new Map(overview.entries.map(entry => [entry.path, entry]));
+  assert.deepEqual([byPath.get("tracked-remote-removed.md")?.status, byPath.get("tracked-remote-removed.md")?.reason], ["changed", "remote-deleted"]);
+  assert.deepEqual([byPath.get("tracked-local-removed.md")?.status, byPath.get("tracked-local-removed.md")?.reason], ["changed", "local-deleted"]);
+  assert.equal(byPath.get("new-local.md")?.status, "local-only");
+  assert.equal(byPath.get("new-remote.md")?.status, "remote-only");
+  assert.deepEqual(countV4FileOverview(overview.entries), { all: 4, changed: 2, "local-only": 1, "remote-only": 1, synced: 0 });
+});
+
+test("wide tree preserves every file once without quadratic sibling searching", () => {
+  const entries = Array.from({ length: 12000 }, (_, i) => ({
+    path: `wide/${String(i).padStart(5, "0")}.md`, status: "changed" as const, local: true, remote: true,
+  }));
+  const tree = treeV4FileOverview(entries);
+  assert.equal(tree.length, 1);
+  assert.equal(tree[0].children.length, entries.length);
+  assert.equal(tree[0].children[0].entry?.path, entries[0].path);
+  assert.equal(tree[0].children.at(-1)?.entry?.path, entries.at(-1)?.path);
+});
+
 test("filtered tree keeps ancestors, individual path identities, and nested folders", () => {
   const files = [{ path: "A/B/1.md", status: "changed" as const, local: true, remote: true },
     { path: "A/B/2.md", status: "synced" as const, local: true, remote: true }];

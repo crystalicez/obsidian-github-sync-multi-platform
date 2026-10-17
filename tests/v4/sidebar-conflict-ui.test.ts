@@ -44,6 +44,38 @@ test("Files sidebar displays authenticated inventory filters, tree and read-only
   await view.onClose();
 });
 
+
+test("tracked deletions appear as Changed with explicit sync-risk warnings in the native sidebar", async () => {
+  const plugin: any = {
+    githubClient: {},
+    app: { workspace: { getActiveFile: () => null, openLinkText: () => undefined } },
+    settings: { githubOwner: "owner", githubRepo: "repo", githubBranch: "test" },
+    v4Runtime: {
+      settingsGeneration: 1, progressSnapshot: createIdleV4Progress(),
+      subscribeProgress: () => () => undefined,
+      async fileOverview() {
+        return { remoteCommitSha: "f".repeat(40), entries: [
+          { path: "tracked/local-deleted.md", status: "changed", reason: "local-deleted", local: false, remote: true },
+          { path: "tracked/remote-deleted.md", status: "changed", reason: "remote-deleted", local: true, remote: false },
+        ] };
+      },
+    },
+  };
+  const view = new V4SyncCenterView(new WorkspaceLeaf(plugin.app), plugin);
+  await view.onOpen();
+  assert.ok(view.contentEl.findByText("Changed 2"));
+  assert.equal(view.contentEl.findByText("Local only 0")?.attributes["aria-pressed"], "false");
+  const localMissing = view.contentEl.findByAttribute("aria-label", "tracked/local-deleted.md, Deleted locally");
+  assert.ok(localMissing);
+  localMissing.onclick?.();
+  assert.match(view.contentEl.findByClass("github-sync-center__detail")!.flattenText(), /may propagate this deletion to GitHub/u);
+  const remoteMissing = view.contentEl.findByAttribute("aria-label", "tracked/remote-deleted.md, Deleted remotely");
+  assert.ok(remoteMissing);
+  remoteMissing.onclick?.();
+  assert.match(view.contentEl.findByClass("github-sync-center__detail")!.flattenText(), /may remove the local file/u);
+  await view.onClose();
+});
+
 test("manual review requires every hunk choice and cancellation preserves no merged bytes", async () => {
   resetModalTestState();
   const runtime = Object.create(V4PluginRuntime.prototype) as any;

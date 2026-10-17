@@ -514,26 +514,42 @@ try {
       {path:"02_Areas/blog/drafts/post.md",status:"changed",local:true,remote:true},
       {path:"Notes/remote-idea.md",status:"remote-only",local:false,remote:true},
       {path:"Notes/reference.md",status:"synced",local:true,remote:true},
+      {path:"Notes/tracked-local-deleted.md",status:"changed",reason:"local-deleted",local:false,remote:true},
+      {path:"Notes/tracked-remote-deleted.md",status:"changed",reason:"remote-deleted",local:true,remote:false},
     ]});
     await view.renderFilesMode();
     return {chips:[...document.querySelectorAll(".github-sync-center__file-filters button")].map(e=>e.textContent.trim()),
       tree:!!document.querySelector(".github-sync-center__folder-toggle"),records:document.querySelectorAll(".github-sync-center__file-row").length};
   })()`);
   checked("native file-status filters and tree render from synthetic verified-shaped snapshot",
-    filesMock.chips.includes("All 5")&&filesMock.chips.includes("Changed 2")
+    filesMock.chips.includes("All 7")&&filesMock.chips.includes("Changed 4")
     &&filesMock.chips.includes("Local only 1")&&filesMock.chips.includes("Remote 1")
-    &&filesMock.chips.includes("Synced 1")&&filesMock.tree&&filesMock.records===5,
+    &&filesMock.chips.includes("Synced 1")&&filesMock.tree&&filesMock.records===7,
     JSON.stringify(filesMock));
   await record("17-files-tree",{cropSelector:".github-sync-center"});
   const changedMock=await evaluate(`(()=>{
     const button=[...document.querySelectorAll(".github-sync-center__file-filters button")]
-      .find(e=>e.textContent.trim()==="Changed 2");
+      .find(e=>e.textContent.trim()==="Changed 4");
     if(!button)throw Error("Changed filter missing");
     button.click();
     return {count:document.querySelectorAll(".github-sync-center__file-row").length,
       active:button.getAttribute("aria-pressed")};
   })()`);
-  checked("native Changed filter limits the tree to changed files",changedMock.count===2&&changedMock.active==="true",JSON.stringify(changedMock));
+  checked("native Changed filter includes tracked deletions",changedMock.count===4&&changedMock.active==="true",JSON.stringify(changedMock));
+  const deletionMock=await evaluate(`(()=>{
+    const local=document.querySelector('[aria-label="Notes/tracked-local-deleted.md, Deleted locally"]');
+    const remote=document.querySelector('[aria-label="Notes/tracked-remote-deleted.md, Deleted remotely"]');
+    if(!local||!remote)return {missing:true};
+    local.click();
+    const localWarning=document.querySelector(".github-sync-center__file-warning")?.textContent??"";
+    remote.click();
+    const remoteWarning=document.querySelector(".github-sync-center__file-warning")?.textContent??"";
+    remote.scrollIntoView({block:"nearest"});
+    return {localWarning:localWarning.includes("may propagate this deletion"),
+      remoteWarning:remoteWarning.includes("may remove the local file")};
+  })()`);
+  checked("native deleted-file warnings are explicit and distinguish deletion direction",
+    deletionMock.localWarning&&deletionMock.remoteWarning,JSON.stringify(deletionMock));
   await record("18-files-changed-filter",{cropSelector:".github-sync-center"});
   await evaluate(`(async()=>{
     const d=window.__syncUiDemo,p=app.plugins.plugins[${JSON.stringify(id)}];

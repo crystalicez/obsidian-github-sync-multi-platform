@@ -314,6 +314,9 @@ export class V4SyncCenterView extends ItemView {
       const filterNames: Record<V4FileFilter, string> = {
         all: "All", changed: "Changed", "local-only": "Local only", "remote-only": "Remote", synced: "Synced",
       }
+      const labelFor = (entry: V4FileOverviewEntry) => entry.reason === "local-deleted"
+        ? "Deleted locally"
+        : entry.reason === "remote-deleted" ? "Deleted remotely" : filterNames[entry.status]
       const fileList = body.createDiv({ cls: "github-sync-center__file-list" })
       const controls = toolbar.createDiv({ cls: "github-sync-center__file-controls" })
       const treeToggle = controls.createEl("button", { text: "Tree view" })
@@ -341,7 +344,7 @@ export class V4SyncCenterView extends ItemView {
         detail.empty()
         const title = detail.createEl("h4", { text: entry.path })
         title.title = entry.path
-        const name = filterNames[entry.status]
+        const name = labelFor(entry)
         detail.createDiv({ text: name, cls: `github-sync-center__file-status is-${entry.status}` })
         const help: Record<Exclude<V4FileFilter, "all">, string> = {
           "local-only": "Only in this vault at the inspected remote commit. Normal Sync can publish it.",
@@ -349,7 +352,12 @@ export class V4SyncCenterView extends ItemView {
           changed: "Local state or remote version differs from the last synchronized index. Review before syncing.",
           synced: "Matches the last synchronized index by file size, modification time and remote version. A full content comparison has not been performed.",
         }
-        detail.createEl("p", { text: help[entry.status], cls: "github-sync-center__muted" })
+        const deletionHelp = entry.reason === "local-deleted"
+          ? "Previously synchronized, but now missing locally. A future sync may propagate this deletion to GitHub. Check your changes before syncing."
+          : entry.reason === "remote-deleted"
+            ? "Previously synchronized, but now missing on GitHub. A future sync may remove the local file. Check your changes before syncing."
+            : undefined
+        detail.createEl("p", { text: deletionHelp ?? help[entry.status], cls: deletionHelp ? "github-sync-center__file-warning" : "github-sync-center__muted" })
         if (entry.local) {
           const open = detail.createEl("button", { text: "Open local file" })
           open.onclick = () => void this.app.workspace.openLinkText(entry.path, "", false)
@@ -367,10 +375,10 @@ export class V4SyncCenterView extends ItemView {
         if (!matches.length) fileList.createEl("p", { text: "No files match this filter.", cls: "github-sync-center__muted" })
         const createFileRow = (container: HTMLElement, entry: V4FileOverviewEntry, name: string) => {
           const button = container.createEl("button", { cls: "github-sync-center__file-row" })
-          button.setAttribute("aria-label", `${entry.path}, ${filterNames[entry.status]}`)
+          button.setAttribute("aria-label", `${entry.path}, ${labelFor(entry)}`)
           const path = button.createEl("span", { text: name, cls: "github-sync-center__file-name" })
           path.title = entry.path
-          button.createEl("span", { text: filterNames[entry.status], cls: `github-sync-center__file-status is-${entry.status}` })
+          button.createEl("span", { text: labelFor(entry), cls: `github-sync-center__file-status is-${entry.status}` })
           button.onclick = () => showDetails(entry)
         }
         const addTree = (container: HTMLElement, nodes: V4FileTreeNode[], depth: number) => {

@@ -6,6 +6,8 @@ export interface V4FileOverviewEntry {
   status: V4FileStatus;
   local: boolean;
   remote: boolean;
+  /** Tracked-file deletion; never label as a new one-sided file. */
+  reason?: "local-deleted" | "remote-deleted";
 }
 export interface V4FileOverview {
   entries: V4FileOverviewEntry[];
@@ -28,18 +30,23 @@ export function buildV4FileOverview(input: V4FileOverviewInput): V4FileOverview 
   for (const path of new Set([...local.keys(), ...remote.keys()])) {
     const here = local.get(path);
     const there = remote.get(path);
+    const base = baseline.get(path);
     let status: V4FileStatus;
-    if (!there) status = "local-only";
-    else if (!here) status = "remote-only";
-    else {
-      const base = baseline.get(path);
+    let reason: V4FileOverviewEntry["reason"];
+    if (!there) {
+      status = base ? "changed" : "local-only";
+      if (base) reason = "remote-deleted";
+    } else if (!here) {
+      status = base ? "changed" : "remote-only";
+      if (base) reason = "local-deleted";
+    } else {
       status = base
         && base.remoteVersion === there.remoteVersion
         && base.size === here.size
         && base.mtime === here.mtime
         ? "synced" : "changed";
     }
-    entries.push({ path, status, local: !!here, remote: !!there });
+    entries.push({ path, status, local: !!here, remote: !!there, ...(reason ? { reason } : {}) });
   }
   entries.sort((a, b) => a.path.localeCompare(b.path));
   return { entries, remoteCommitSha: input.remoteCommitSha };
@@ -66,24 +73,30 @@ export interface V4FileTreeNode {
 
 export function treeV4FileOverview(entries: readonly V4FileOverviewEntry[]): V4FileTreeNode[] {
   const root: V4FileTreeNode = { name: "", path: "", children: [] };
+  // A wide folder can have tens of thousands of siblings. Index every path
+  // once rather than linearly searching children (quadratic on flat vaults).
+  const nodes = new Map<string, V4FileTreeNode>([["", root]]);
   for (const entry of entries) {
     const parts = entry.path.split("/");
     let parent = root;
+    let path = "";
     for (let i = 0; i < parts.length; i++) {
-      const path = parts.slice(0, i + 1).join("/");
-      let node = parent.children.find(candidate => candidate.name === parts[i]);
+      path = path ? `${path}/${parts[i]}` : parts[i];
+      let node = nodes.get(path);
       if (!node) {
         node = { name: parts[i], path, children: [] };
+        nodes.set(path, node);
         parent.children.push(node);
       }
       if (i === parts.length - 1) node.entry = entry;
       parent = node;
     }
   }
-  const sort = (node: V4FileTreeNode) => {
+  const pending = [root];
+  while (pending.length) {
+    const node = pending.pop()!;
     node.children.sort((a, b) => Number(!!a.entry) - Number(!!b.entry) || a.name.localeCompare(b.name));
-    node.children.forEach(sort);
-  };
-  sort(root);
+    for (const child of node.children) pending.push(child);
+  }
   return root.children;
 }

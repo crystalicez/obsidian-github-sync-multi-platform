@@ -476,6 +476,12 @@
   border: 1px solid var(--background-modifier-border);
   border-radius: 999px;
 }
+.github-sync-center__file-warning {
+  color: var(--text-warning);
+  border-left: 3px solid var(--text-warning);
+  padding-left: var(--size-4-2);
+  overflow-wrap: anywhere;
+}
 .github-sync-center__file-status.is-changed { color: var(--text-warning); border-color: var(--text-warning); }
 .github-sync-center__file-status.is-local-only { color: var(--text-accent); border-color: var(--text-accent); }
 .github-sync-center__file-status.is-remote-only { color: var(--color-blue); border-color: var(--color-blue); }
