@@ -269,6 +269,93 @@ try {
   const opened=await settingsEvaluate(`(()=>({headers:document.querySelectorAll(".github-sync-settings-header").length,visible:!!document.querySelector(".github-sync-settings-dirty-banner, .github-sync-settings-header"),title:document.title}))()`);
   checked("Settings UI rendered",opened.visible,JSON.stringify(opened));
   await record("01-settings-general",{visibleSelector:".github-sync-settings-header"});
+  // Native Settings form acceptance: exercise actual Obsidian text component
+  // input events and the rendered Save button. No token is ever entered.
+  const formValues = {
+    "GitHub owner": "synthetic-owner",
+    "GitHub repo": "synthetic-repo",
+    "GitHub branch": "testing/settings-ui",
+  };
+  const typeSettingsField = async (name, value) => settingsEvaluate(`(()=>{
+    const label=${JSON.stringify(name)};
+    const labelEl=[...document.querySelectorAll(".setting-item-name")]
+      .find(e=>e.textContent?.trim()===label);
+    const input=labelEl?.closest(".setting-item")?.querySelector("input");
+    if(input?.tagName!=="INPUT")throw Error("Settings field is missing: "+label);
+    const ownerWindow=input.ownerDocument.defaultView;
+    const setter=Object.getOwnPropertyDescriptor(ownerWindow.HTMLInputElement.prototype,"value")?.set;
+    if(!setter)throw Error("Settings input has no native value setter: "+label);
+    setter.call(input,${JSON.stringify(value)});
+    input.dispatchEvent(new ownerWindow.Event("input",{bubbles:true}));
+    input.dispatchEvent(new ownerWindow.Event("change",{bubbles:true}));
+    return {renderedValue:input.value,type:input.type};
+  })()`);
+  const clickSettingsSave = async () => settingsEvaluate(`(()=>{
+    const button=[...document.querySelectorAll(".github-sync-settings-dirty-banner button")]
+      .find(e=>e.textContent.trim()==="Save changes");
+    if(!button || button.disabled)throw Error("Active Save changes button is missing");
+    button.click();
+    return true;
+  })()`);
+  const invalidField = await typeSettingsField("GitHub branch", "bad branch");
+  checked("native settings input changes branch text",invalidField.renderedValue==="bad branch",JSON.stringify(invalidField));
+  await clickSettingsSave();
+  await sleep(250);
+  const rejectedForm = await evaluate(`(()=>({
+    branch:app.plugins.plugins[${JSON.stringify(id)}].settings.githubBranch,
+    configured:!!app.plugins.plugins[${JSON.stringify(id)}].githubClient,
+  }))()`);
+  const rejectedUI = await settingsEvaluate(`(()=>({
+    dirty:!!document.querySelector(".github-sync-settings-dirty-banner"),
+    errors:[...document.querySelectorAll(".notice")].map(e=>e.innerText.slice(0,120)),
+  }))()`);
+  checked("invalid native branch never saves",rejectedForm.branch==="main"&&!rejectedForm.configured&&rejectedUI.dirty,
+    JSON.stringify({savedBranch:rejectedForm.branch,dirty:rejectedUI.dirty}));
+  checked("invalid branch displays a validation notice",rejectedUI.errors.some(t=>/settings not saved.*invalid github branch/iu.test(t)),
+    JSON.stringify(rejectedUI.errors));
+  for(const [name,value] of Object.entries(formValues)){
+    const typed=await typeSettingsField(name,value);
+    checked(`native settings form accepts ${name}`,typed.renderedValue===value,JSON.stringify(typed));
+  }
+  const draft=await evaluate(`(()=>{const t=app.plugins.plugins[${JSON.stringify(id)}].settingTab;
+    return {owner:t.tempSettings?.githubOwner,repo:t.tempSettings?.githubRepo,branch:t.tempSettings?.githubBranch,token:t.tempSettings?.githubToken};
+  })()`);
+  checked("real form input events update plugin draft",
+    draft.owner===formValues["GitHub owner"]&&draft.repo===formValues["GitHub repo"]
+    &&draft.branch===formValues["GitHub branch"]&&!draft.token,
+    JSON.stringify({owner:draft.owner,repo:draft.repo,branch:draft.branch,hasToken:!!draft.token}));
+  await record("01a-settings-real-form-edited",{visibleSelector:".github-sync-settings-header"});
+  await clickSettingsSave();
+  await sleep(600);
+  const savedForm=await evaluate(`(async()=>{
+    const p=app.plugins.plugins[${JSON.stringify(id)}];
+    const stored=await p.loadData();
+    return {owner:p.settings.githubOwner,repo:p.settings.githubRepo,branch:p.settings.githubBranch,
+      storedOwner:stored?.settings?.githubOwner,storedRepo:stored?.settings?.githubRepo,
+      storedBranch:stored?.settings?.githubBranch,hasClient:!!p.githubClient,
+      hasToken:!!p.settings.githubToken||!!stored?.settings?.githubToken};
+  })()`);
+  const savedUi=await settingsEvaluate(`(()=>({dirty:!!document.querySelector(".github-sync-settings-dirty-banner")}))()`);
+  checked("native Save persists owner repo and branch without GitHub client",
+    savedForm.owner===formValues["GitHub owner"]&&savedForm.repo===formValues["GitHub repo"]
+    &&savedForm.branch===formValues["GitHub branch"]
+    &&savedForm.storedOwner===savedForm.owner&&savedForm.storedRepo===savedForm.repo
+    &&savedForm.storedBranch===savedForm.branch&&!savedForm.hasClient&&!savedForm.hasToken&&!savedUi.dirty,
+    JSON.stringify(savedForm));
+  await record("01b-settings-real-form-saved",{visibleSelector:".github-sync-settings-header"});
+  // Restore the empty synthetic remote so subsequent Force refusal checks stay non-destructive.
+  for(const [name,value] of Object.entries({"GitHub owner":"","GitHub repo":"","GitHub branch":"main"})){
+    await typeSettingsField(name,value);
+  }
+  await clickSettingsSave();
+  await sleep(500);
+  const restored=await evaluate(`(async()=>{const p=app.plugins.plugins[${JSON.stringify(id)}];const data=await p.loadData();
+    return {owner:p.settings.githubOwner,repo:p.settings.githubRepo,branch:p.settings.githubBranch,
+      dataOwner:data?.settings?.githubOwner,dataRepo:data?.settings?.githubRepo,hasClient:!!p.githubClient};
+  })()`);
+  checked("native Settings UI restores unconfigured synthetic vault",
+    !restored.owner&&!restored.repo&&restored.branch==="main"&&!restored.dataOwner&&!restored.dataRepo&&!restored.hasClient,
+    JSON.stringify(restored));
   await evaluate(`(()=>{
     const t=app.plugins.plugins[${JSON.stringify(id)}].settingTab;
     if(!t.tempSettings)throw Error("Settings draft not active");
