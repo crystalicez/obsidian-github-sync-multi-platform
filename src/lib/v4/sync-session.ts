@@ -3,6 +3,7 @@ import type { GitHubTree, GitHubTreeNode } from "../github-api"
 import type { GitHubGitCommit } from "../github-git-types"
 import { evaluateV4ChangeGuard } from "./change-guard"
 import { canAttemptV4TextMerge, resolveV4Conflict, type V4ConflictPolicy, type V4ConflictResolution } from "./conflicts"
+import { V4_REVIEW_MAX_BYTES } from "./conflict-review"
 import type { V4Keyring } from "./crypto"
 import { decryptV4Payload, encryptV4Payload } from "./crypto"
 import {
@@ -73,7 +74,7 @@ export interface V4SyncSessionInput {
   conflictPolicy: V4ConflictPolicy
   abortChangePercent: number
   now?: () => number
-  askConflict?: (input: { path: string; localMtime: number; remoteMtime: number }) => Promise<V4ConflictResolution>
+  askConflict?: (input: { path: string; localMtime: number; remoteMtime: number; localBytes?: Uint8Array; remoteBytes?: Uint8Array }) => Promise<V4ConflictResolution>
   includePath?: (path: string) => boolean
   onProgress?: (patch: V4SyncProgressPatch) => void
   runState?: V4SyncRunState
@@ -573,7 +574,29 @@ export class V4SyncSession {
       }
       if (resolution.action === "ask") {
         if (!this.input.askConflict) throw new Error(`Conflict requires user decision: ${conflict.path}`)
-        resolution = await this.input.askConflict({ path: conflict.path, localMtime: conflict.local?.mtime ?? 0, remoteMtime: conflict.remote?.mtime ?? 0 })
+        // Bound both individual files and the entire packed group before
+        // decoding for review; large or binary content keeps whole-file choices.
+        let localReview: Uint8Array | undefined
+        let remoteReview: Uint8Array | undefined
+        const reviewPackRecords = remoteRecord?.storage === "pack"
+          ? completePackRecords(remoteRecord, allRemoteRecords) : undefined
+        const groupBytes = reviewPackRecords?.reduce((sum, record) => sum + record.size, 0) ?? 0
+        const boundedRemote = remoteRecord && (remoteRecord.storage === "single"
+          || (remoteRecord.storage === "pack" && !!reviewPackRecords && groupBytes <= V4_REVIEW_MAX_BYTES))
+        if (conflict.local && remoteRecord && boundedRemote
+          && canAttemptV4TextMerge(conflict.path, [conflict.local.size, remoteRecord.size])
+          && conflict.local.size <= V4_REVIEW_MAX_BYTES && remoteRecord.size <= V4_REVIEW_MAX_BYTES) {
+          localReview = await this.readLocal(conflict.local.path)
+          if (localReview.byteLength <= V4_REVIEW_MAX_BYTES) {
+            remoteReview = await this.readRecord(remoteRecord, remoteCommitSha, reviewPackRecords)
+            if (remoteReview.byteLength > V4_REVIEW_MAX_BYTES) { localReview = undefined; remoteReview = undefined }
+            else prefetchedRemoteBodies.set(remoteRecord.fileId, remoteReview)
+          } else localReview = undefined
+        }
+        resolution = await this.input.askConflict({
+          path: conflict.path, localMtime: conflict.local?.mtime ?? 0, remoteMtime: conflict.remote?.mtime ?? 0,
+          localBytes: localReview, remoteBytes: remoteReview,
+        })
         throwIfV4Aborted(this.input.signal)
         if (resolution.action === "ask") throw new Error(`Conflict cancelled: ${conflict.path}`)
       }

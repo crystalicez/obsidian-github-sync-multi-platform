@@ -701,7 +701,8 @@ for (const mode of ["plaintext", "encrypted"] as const) {
     }).sync({ operation: "normal", allowThresholdOverride: false, changes });
 
     assert.equal(result.mode, "pull");
-    assert.deepEqual(asked, [{ path: "A.md", localMtime: 10, remoteMtime: 20 }]);
+    assert.deepEqual(asked.map(({ path, localMtime, remoteMtime }) => ({ path, localMtime, remoteMtime })),
+      [{ path: "A.md", localMtime: 10, remoteMtime: 20 }]);
     assert.equal(fixture.github.ref!.sha, commitBefore);
     assert.equal(fixture.github.commits.size, commitsBefore);
     assert.deepEqual([...fixture.github.files.keys()].filter(path => path.startsWith(`${V4_ROOT}/journals/`)).sort(), journalPathsBefore);
@@ -1560,6 +1561,32 @@ test("v4 defers a merged local write until every conflict decision and exact tot
   assert.equal(result.pushedFiles, 2);
   assert.equal(dec(fixture.localVault.files.get("A.md")!.bytes), "merged:A.md");
   assert.equal(dec(fixture.github.files.get("A.md")!), "merged:A.md");
+});
+
+test("manual conflict review receives verified small packed content and commits only the reviewed result", async () => {
+  const fixture = await divergedConflictFixture(["review.md"]);
+  let sawReview = false;
+  const result = await new V4SyncSession({
+    github: fixture.github,
+    vault: fixture.localVault,
+    index: fixture.localIndex,
+    config: config(),
+    conflictPolicy: "ask",
+    abortChangePercent: 0,
+    askConflict: async input => {
+      assert.equal(input.path, "review.md");
+      assert.equal(dec(input.localBytes!), "local:review.md");
+      assert.equal(dec(input.remoteBytes!), "remote:review.md");
+      sawReview = true;
+      return { action: "merged", mergedBytes: enc("reviewed text\n") };
+    },
+  }).sync({ operation: "normal", allowThresholdOverride: false, changes: [{ type: "modify", path: "review.md", mtime: 3 }] });
+  assert.equal(sawReview, true);
+  assert.equal(result.pushedFiles, 1);
+  assert.equal(dec(fixture.localVault.files.get("review.md")!.bytes), "reviewed text\n");
+  const verifiedRemote = await fixture.github.getFileBytes("review.md");
+  assert.ok(verifiedRemote);
+  assert.equal(dec(verifiedRemote.bytes), "reviewed text\n");
 });
 
 test("v4 failed pull progress retains the active logical path", async () => {

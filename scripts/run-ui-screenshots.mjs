@@ -496,6 +496,97 @@ try {
   const dockNarrow=await record("09-sync-center-narrow-dock",{cropSelector:".github-sync-center"});
   checked("narrow Sync Center uses the actual sidebar width",dockNarrow.centerLayout?.availableWidth<=640,
     JSON.stringify(dockNarrow.centerLayout));
+  // Real Obsidian dock evidence for independently authored file-status UI.
+  // Synthetic inventory is supplied in memory; never open a network client.
+  const filesMock=await evaluate(`(async()=>{
+    const p=app.plugins.plugins[${JSON.stringify(id)}];
+    const leaves=app.workspace.getLeavesOfType("github-sync-v4-center");
+    const view=leaves[0]?.view;
+    if(!view)throw Error("Sync Center view absent");
+    window.__syncUiDemo={runtime:p.v4Runtime,realOverview:p.v4Runtime.fileOverview,
+      owner:p.settings.githubOwner,repo:p.settings.githubRepo,branch:p.settings.githubBranch,view};
+    p.settings.githubOwner="sample-owner";
+    p.settings.githubRepo="sample-repository";
+    p.settings.githubBranch="preview";
+    p.v4Runtime.fileOverview=async()=>({remoteCommitSha:"a".repeat(40),entries:[
+      {path:"02_Areas/blog/assets/logo.png",status:"local-only",local:true,remote:false},
+      {path:"02_Areas/blog/guide.md",status:"changed",local:true,remote:true},
+      {path:"02_Areas/blog/drafts/post.md",status:"changed",local:true,remote:true},
+      {path:"Notes/remote-idea.md",status:"remote-only",local:false,remote:true},
+      {path:"Notes/reference.md",status:"synced",local:true,remote:true},
+    ]});
+    await view.renderFilesMode();
+    return {chips:[...document.querySelectorAll(".github-sync-center__file-filters button")].map(e=>e.textContent.trim()),
+      tree:!!document.querySelector(".github-sync-center__folder-toggle"),records:document.querySelectorAll(".github-sync-center__file-row").length};
+  })()`);
+  checked("native file-status filters and tree render from synthetic verified-shaped snapshot",
+    filesMock.chips.includes("All 5")&&filesMock.chips.includes("Changed 2")
+    &&filesMock.chips.includes("Local only 1")&&filesMock.chips.includes("Remote 1")
+    &&filesMock.chips.includes("Synced 1")&&filesMock.tree&&filesMock.records===5,
+    JSON.stringify(filesMock));
+  await record("17-files-tree",{cropSelector:".github-sync-center"});
+  const changedMock=await evaluate(`(()=>{
+    const button=[...document.querySelectorAll(".github-sync-center__file-filters button")]
+      .find(e=>e.textContent.trim()==="Changed 2");
+    if(!button)throw Error("Changed filter missing");
+    button.click();
+    return {count:document.querySelectorAll(".github-sync-center__file-row").length,
+      active:button.getAttribute("aria-pressed")};
+  })()`);
+  checked("native Changed filter limits the tree to changed files",changedMock.count===2&&changedMock.active==="true",JSON.stringify(changedMock));
+  await record("18-files-changed-filter",{cropSelector:".github-sync-center"});
+  await evaluate(`(async()=>{
+    const d=window.__syncUiDemo,p=app.plugins.plugins[${JSON.stringify(id)}];
+    d.runtime.fileOverview=d.realOverview;
+    p.settings.githubOwner=d.owner;p.settings.githubRepo=d.repo;p.settings.githubBranch=d.branch;
+    await d.view.renderCommitMode();
+    delete window.__syncUiDemo;
+  })()`);
+  // Side-by-side hunk review in an actual native Obsidian modal. No run is
+  // enqueued, and Cancel is asserted to produce a no-op resolution.
+  const conflictOpened=await evaluate(`(()=>{
+    const p=app.plugins.plugins[${JSON.stringify(id)}];
+    const enc=new TextEncoder();
+    const local="## Notes\\nRate: 100\\nShared heading\\nLocal edits\\nFinal line";
+    const remote="## Notes\\nRate: 120\\nShared heading\\nRemote edits\\nFinal line";
+    window.__uiConflictPreview=p.v4Runtime.askConflict("Notes/sample-conflict.md",
+      new AbortController().signal,enc.encode(local),enc.encode(remote));
+    return true;
+  })()`);
+  await sleep(200);
+  const modalState=await evaluate(`(()=>({
+    visible:!!document.querySelector(".github-sync-conflict"),
+    hunks:document.querySelectorAll(".github-sync-conflict__hunk").length,
+    disabled:document.querySelector(".github-sync-conflict__apply")?.disabled,
+  }))()`);
+  checked("real desktop conflict modal shows two independent hunks and disabled Apply",
+    conflictOpened&&modalState.visible&&modalState.hunks===2&&modalState.disabled,JSON.stringify(modalState));
+  await record("19-conflict-desktop",{visibleSelector:".github-sync-conflict"});
+  const decisions=await evaluate(`(()=>{
+    const selections=[...document.querySelectorAll(".github-sync-conflict__hunk")];
+    const buttons=selections.map((el,i)=>el.querySelectorAll(".github-sync-conflict__choices button")[i===0?1:0]);
+    buttons.forEach(e=>e.click());
+    return {disabled:document.querySelector(".github-sync-conflict__apply")?.disabled,
+      text:document.querySelector(".github-sync-conflict__output")?.innerText?.slice(0,250)};
+  })()`);
+  checked("native conflict review enables Apply only after both changes chosen",
+    !decisions.disabled&&decisions.text.includes("Rate: 120")&&decisions.text.includes("Local edits"),
+    JSON.stringify(decisions));
+  await record("20-conflict-reviewed",{visibleSelector:".github-sync-conflict"});
+  await activeSend("Emulation.setDeviceMetricsOverride",{width:390,height:780,deviceScaleFactor:1,mobile:false});
+  await record("21-conflict-compact-390");
+  await activeSend("Emulation.clearDeviceMetricsOverride");
+  const cancelled=await evaluate(`(async()=>{
+    const button=[...document.querySelectorAll(".github-sync-conflict__actions button")]
+      .find(e=>e.textContent.trim()==="Cancel");
+    if(!button)throw Error("Native conflict Cancel missing");
+    button.click();
+    const result=await window.__uiConflictPreview;
+    delete window.__uiConflictPreview;
+    return {action:result.action,remaining:document.querySelectorAll(".github-sync-conflict").length};
+  })()`);
+  checked("native review Cancel never applies or leaves the modal open",
+    cancelled.action==="ask"&&cancelled.remaining===0,JSON.stringify(cancelled));
   // With no GitHub credentials, Force commands must refuse to open destructive dialogs.
   // This run never unlocks a Force control or invokes a remote operation.
   for(const mode of ["forcePush","forcePull"]){

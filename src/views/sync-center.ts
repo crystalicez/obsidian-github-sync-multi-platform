@@ -1,6 +1,7 @@
 import { ItemView, WorkspaceLeaf } from "obsidian"
 import type FastSync from "../main"
 import type { V4HistoryChange, V4HistoryCommit, V4HistoryService, V4VersionPreview } from "../lib/v4/history-service"
+import { countV4FileOverview, filterV4FileOverview, treeV4FileOverview, V4_FILE_FILTERS, type V4FileFilter, type V4FileOverview, type V4FileOverviewEntry, type V4FileTreeNode } from "../lib/v4/file-overview"
 import {
   formatV4Duration,
   formatV4PhaseLabel,
@@ -22,7 +23,12 @@ export class V4SyncCenterView extends ItemView {
   private service?: V4HistoryService
   private serviceGeneration?: number
   private page = 1
-  private mode: "commits" | "file" = "commits"
+  private mode: "files" | "commits" | "file" = "commits"
+  private fileOverview?: V4FileOverview
+  private fileFilter: V4FileFilter = "all"
+  private fileQuery = ""
+  private treeView = true
+  private collapsedPaths = new Set<string>()
   private selected?: V4HistoryCommit
   private objectUrl?: string
   private progressCard?: HTMLElement
@@ -51,7 +57,8 @@ export class V4SyncCenterView extends ItemView {
     this.renderGeneration++
     this.unsubscribeProgress?.()
     this.unsubscribeProgress = this.plugin.v4Runtime.subscribeProgress(snapshot => this.renderProgressCard(snapshot))
-    await this.renderCommitMode()
+    if (this.plugin.githubClient) await this.renderFilesMode()
+    else await this.renderCommitMode()
   }
   async onClose(): Promise<void> {
     this.isOpen = false
@@ -96,6 +103,9 @@ export class V4SyncCenterView extends ItemView {
     const header = this.contentEl.createDiv({ cls: "github-sync-center__header" })
     header.createEl("h3", { text: title })
     const actions = header.createDiv({ cls: "github-sync-center__actions" })
+    const filesButton = actions.createEl("button", { text: "Files" })
+    filesButton.setAttribute("aria-pressed", String(this.mode === "files"))
+    filesButton.onclick = () => void this.renderFilesMode()
     const commitsButton = actions.createEl("button", { text: "Commits" })
     commitsButton.setAttribute("aria-pressed", String(this.mode === "commits"))
     commitsButton.onclick = () => void this.renderCommitMode()
@@ -271,6 +281,123 @@ export class V4SyncCenterView extends ItemView {
       forcePull: "Force pull",
     } as const
     return trigger ? labels[trigger] : ""
+  }
+
+  private async renderFilesMode(): Promise<void> {
+    const generation = this.beginRender()
+    if (!generation) return
+    this.mode = "files"
+    const { body, detail } = this.shell("Files")
+    body.createEl("p", { text: "Reading the exact remote branch…", cls: "github-sync-center__muted" })
+    detail.createEl("p", { text: "Select a file for details.", cls: "github-sync-center__muted" })
+    try {
+      // This call reads the exact Git ref and authenticates V4 remote records.
+      // A cached local index alone must never masquerade as a remote listing.
+      const overview = await this.plugin.v4Runtime.fileOverview()
+      if (!this.isCurrent(generation)) return
+      this.fileOverview = overview
+      body.empty()
+      const toolbar = body.createDiv({ cls: "github-sync-center__file-toolbar" })
+      const repository = toolbar.createDiv({ cls: "github-sync-center__file-source" })
+      repository.createEl("strong", { text: "GitHub files" })
+      const source = repository.createEl("span", {
+        text: `${this.plugin.settings.githubOwner}/${this.plugin.settings.githubRepo} · ${this.plugin.settings.githubBranch}`,
+        cls: "github-sync-center__muted",
+      })
+      source.title = `Read-only snapshot at ${overview.remoteCommitSha}`
+      const filterInput = toolbar.createEl("input", { cls: "github-sync-center__file-search", attr: {
+        type: "search", placeholder: "Filter by path…", "aria-label": "Filter files by path",
+      } }) as HTMLInputElement
+      filterInput.value = this.fileQuery
+      const filters = toolbar.createDiv({ cls: "github-sync-center__file-filters", attr: { "aria-label": "File status filters" } })
+      const count = countV4FileOverview(overview.entries)
+      const filterNames: Record<V4FileFilter, string> = {
+        all: "All", changed: "Changed", "local-only": "Local only", "remote-only": "Remote", synced: "Synced",
+      }
+      const fileList = body.createDiv({ cls: "github-sync-center__file-list" })
+      const controls = toolbar.createDiv({ cls: "github-sync-center__file-controls" })
+      const treeToggle = controls.createEl("button", { text: "Tree view" })
+      treeToggle.setAttribute("aria-pressed", String(this.treeView))
+      treeToggle.onclick = () => {
+        this.treeView = !this.treeView
+        treeToggle.setAttribute("aria-pressed", String(this.treeView))
+        draw()
+      }
+      const refresh = controls.createEl("button", { text: "Refresh status" })
+      refresh.onclick = () => void this.renderFilesMode()
+      controls.createEl("span", { text: "Read-only overview · Sync now applies the normal conflict policy", cls: "github-sync-center__muted" })
+      const filterButtons = new Map<V4FileFilter, HTMLButtonElement>()
+      for (const filter of V4_FILE_FILTERS) {
+        const button = filters.createEl("button", { text: `${filterNames[filter]} ${count[filter]}` })
+        button.setAttribute("aria-pressed", String(this.fileFilter === filter))
+        button.onclick = () => {
+          this.fileFilter = filter
+          draw()
+        }
+        filterButtons.set(filter, button)
+      }
+      filterInput.oninput = () => { this.fileQuery = filterInput.value; draw() }
+      const showDetails = (entry: V4FileOverviewEntry) => {
+        detail.empty()
+        const title = detail.createEl("h4", { text: entry.path })
+        title.title = entry.path
+        const name = filterNames[entry.status]
+        detail.createDiv({ text: name, cls: `github-sync-center__file-status is-${entry.status}` })
+        const help: Record<Exclude<V4FileFilter, "all">, string> = {
+          "local-only": "Only in this vault at the inspected remote commit. Normal Sync can publish it.",
+          "remote-only": "Only on the inspected remote commit. Normal Sync can download it.",
+          changed: "Local state or remote version differs from the last synchronized index. Review before syncing.",
+          synced: "Matches the last synchronized index by file size, modification time and remote version. A full content comparison has not been performed.",
+        }
+        detail.createEl("p", { text: help[entry.status], cls: "github-sync-center__muted" })
+        if (entry.local) {
+          const open = detail.createEl("button", { text: "Open local file" })
+          open.onclick = () => void this.app.workspace.openLinkText(entry.path, "", false)
+        }
+        detail.createEl("p", { text: "File actions use Sync now; this overview does not bypass conflict checks or modify the remote.", cls: "github-sync-center__muted" })
+      }
+      const draw = () => {
+        if (!this.isCurrent(generation)) return
+        for (const [filter, button] of filterButtons) button.setAttribute("aria-pressed", String(this.fileFilter === filter))
+        fileList.empty()
+        const matches = filterV4FileOverview(overview.entries, this.fileFilter, this.fileQuery)
+        const shown = matches.slice(0, 400)
+        fileList.createDiv({ text: `${matches.length} file${matches.length === 1 ? "" : "s"} · ${overview.remoteCommitSha.slice(0, 10)}`, cls: "github-sync-center__muted" })
+        if (matches.length > shown.length) fileList.createEl("p", { text: "Showing the first 400 matches. Narrow the path search to see more.", cls: "github-sync-center__muted" })
+        if (!matches.length) fileList.createEl("p", { text: "No files match this filter.", cls: "github-sync-center__muted" })
+        const createFileRow = (container: HTMLElement, entry: V4FileOverviewEntry, name: string) => {
+          const button = container.createEl("button", { cls: "github-sync-center__file-row" })
+          button.setAttribute("aria-label", `${entry.path}, ${filterNames[entry.status]}`)
+          const path = button.createEl("span", { text: name, cls: "github-sync-center__file-name" })
+          path.title = entry.path
+          button.createEl("span", { text: filterNames[entry.status], cls: `github-sync-center__file-status is-${entry.status}` })
+          button.onclick = () => showDetails(entry)
+        }
+        const addTree = (container: HTMLElement, nodes: V4FileTreeNode[], depth: number) => {
+          for (const node of nodes) {
+            if (node.entry) createFileRow(container, node.entry, node.name)
+            else {
+              const wrap = container.createDiv({ cls: "github-sync-center__folder" })
+              const toggle = wrap.createEl("button", { cls: "github-sync-center__folder-toggle", text: `${this.collapsedPaths.has(node.path) ? "▸" : "▾"}  ${node.name}` })
+              toggle.setAttribute("aria-expanded", String(!this.collapsedPaths.has(node.path)))
+              toggle.setAttribute("aria-label", `Folder ${node.path}`)
+              const child = wrap.createDiv({ cls: "github-sync-center__folder-children" })
+              if (!this.collapsedPaths.has(node.path)) addTree(child, node.children, depth + 1)
+              toggle.onclick = () => {
+                if (this.collapsedPaths.has(node.path)) this.collapsedPaths.delete(node.path)
+                else this.collapsedPaths.add(node.path)
+                draw()
+              }
+            }
+          }
+        }
+        if (this.treeView) addTree(fileList, treeV4FileOverview(shown), 0)
+        else for (const entry of shown) createFileRow(fileList, entry, entry.path)
+      }
+      draw()
+    } catch (error) {
+      if (this.isCurrent(generation)) this.renderError(body, error)
+    }
   }
 
   private async renderCommitMode(): Promise<void> {

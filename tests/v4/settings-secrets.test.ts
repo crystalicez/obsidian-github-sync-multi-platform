@@ -1610,7 +1610,7 @@ test("runtime decision modals settle immediately when the active sync is aborted
   );
   assert.match(
     runtimeSource,
-    /askConflict\(input\.path,\s*signal\)/u,
+    /askConflict\(input\.path,\s*signal,\s*input\.localBytes,\s*input\.remoteBytes\)/u,
   );
   assert.match(
     runtimeSource,

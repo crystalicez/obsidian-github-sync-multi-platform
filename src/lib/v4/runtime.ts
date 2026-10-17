@@ -16,9 +16,12 @@ import { decodeV4RemoteConfig } from "./remote-index"
 import { createV4ScopePredicate, isPathInV4SyncScope } from "./scope"
 import { assertV4PathLayoutCompatible, V4ChangeGuardError, V4RecoveryReplanRequiredError, V4SyncSession, type V4SyncRunState } from "./sync-session"
 import type { V4ConflictResolution } from "./conflicts"
+import { buildV4ConflictReview, decodeV4ReviewText, mergeV4ReviewedSections, type V4ReviewChoice } from "./conflict-review"
 import { V4SyncCoordinator, type V4QueuedChange, type V4SyncRequest } from "./sync-coordinator"
 import { expectedV4PathLayout, V4_FORMAT_VERSION, V4_CONFIG_PATH, V4_PBKDF2_ITERATIONS, type V4RemoteConfig, type V4StorageMode } from "./protocol-types"
 import { V4HistoryService } from "./history-service"
+import { buildV4FileOverview, type V4FileOverview } from "./file-overview"
+import { loadV4RemoteState } from "./remote-loader"
 import type { V4SessionVault } from "./local-io"
 import { createV4ContentSource, createV4WholeBufferContentSource, DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES, type V4ContentSource } from "./content-source"
 import { createV4PlatformIo, type V4BinaryAdapterLike, type V4PlatformIo } from "./platform-io"
@@ -278,6 +281,43 @@ export class V4PluginRuntime {
       config,
       keyring,
       assertCurrent: () => this.assertSettingsGeneration(generation),
+    })
+  }
+
+  /** Read-only, exact-ref inventory. Never infer remote-only files from the stale local cache. */
+  async fileOverview(): Promise<V4FileOverview> {
+    this.assertSettingsTransitionInactive()
+    const generation = this.credentialGeneration
+    const github = this.plugin.githubClient
+    if (!github) throw new Error("GitHub connection is not configured.")
+    const ref = await github.getGitRefOrNull()
+    this.assertSettingsGeneration(generation)
+    if (!ref) throw new Error("Remote branch is not initialized.")
+    const configFile = await github.getFileBytes(V4_CONFIG_PATH, ref.sha)
+    this.assertSettingsGeneration(generation)
+    if (!configFile) throw new Error("V4 remote metadata is not initialized.")
+    const config = decodeV4RemoteConfig(configFile.bytes)
+    if (config.repoId !== this.repoId()) throw new Error("V4 remote repository identity mismatch.")
+    assertV4PathLayoutCompatible(config, selectV4RuntimeConfig(config, this.plugin.settings.encryptionMode, config.repoId), "normal")
+    const index = await this.loadIndex(config)
+    this.assertSettingsGeneration(generation)
+    const keyring = config.mode === "encrypted"
+      ? await this.keyringForConfig(config, this.plugin.settings.encryptionPassphrase)
+      : undefined
+    const remote = await loadV4RemoteState({ github, index, keyring }, ref.sha, config)
+    this.assertSettingsGeneration(generation)
+    if (!remote) throw new Error("V4 remote state is unavailable.")
+    const inScope = this.scopePredicate()
+    const localFiles = this.plugin.app.vault.getFiles().filter(file => inScope(file.path))
+      .map(file => ({ path: file.path, size: file.stat.size, mtime: file.stat.mtime }))
+    const baselineFiles = Object.values(index.shards)
+      .flatMap(shard => Object.values(shard.records))
+      .filter(record => !record.deleted && inScope(record.path))
+    return buildV4FileOverview({
+      localFiles,
+      remoteFiles: remote.records.filter(record => !record.deleted && inScope(record.path)),
+      baselineFiles,
+      remoteCommitSha: ref.sha,
     })
   }
 
@@ -651,7 +691,7 @@ export class V4PluginRuntime {
             keyring,
             conflictPolicy: this.plugin.settings.conflictPolicy,
             abortChangePercent: this.plugin.settings.abortChangePercent,
-            askConflict: input => this.askConflict(input.path, signal),
+            askConflict: input => this.askConflict(input.path, signal, input.localBytes, input.remoteBytes),
             includePath,
             runState,
             recoveryStore,
@@ -758,7 +798,7 @@ export class V4PluginRuntime {
     }
   }
 
-  private async askConflict(path: string, signal: AbortSignal): Promise<V4ConflictResolution> {
+  private async askConflict(path: string, signal: AbortSignal, localBytes?: Uint8Array, remoteBytes?: Uint8Array): Promise<V4ConflictResolution> {
     return new Promise(resolve => {
       const modal = new Modal(this.plugin.app)
       let settled = false
@@ -774,8 +814,75 @@ export class V4PluginRuntime {
       onAbort = () => finish({ action: "ask" })
       modal.onClose = () => settle({ action: "ask" }, false)
       modal.titleEl.setText("Resolve sync conflict")
-      modal.contentEl.createEl("p", { text: `Both local and remote changed: ${path}` })
-      const buttons = modal.contentEl.createDiv()
+      modal.contentEl.addClass("github-sync-conflict")
+      modal.contentEl.createEl("h3", { text: path, cls: "github-sync-conflict__path" })
+      modal.contentEl.createEl("p", { text: "Both local and remote changed. Nothing is applied until you choose a resolution.", cls: "github-sync-conflict__intro" })
+      const localText = localBytes ? decodeV4ReviewText(localBytes) : null
+      const remoteText = remoteBytes ? decodeV4ReviewText(remoteBytes) : null
+      if (localText !== null && remoteText !== null) {
+        const sections = buildV4ConflictReview(localText, remoteText)
+        const hunks = sections.filter(section => section.kind === "difference")
+        const selections = new Map<number, V4ReviewChoice>()
+        const review = modal.contentEl.createDiv({ cls: "github-sync-conflict__review" })
+        const headings = review.createDiv({ cls: "github-sync-conflict__columns github-sync-conflict__labels" })
+        headings.createEl("strong", { text: "Local · this vault" })
+        headings.createEl("strong", { text: "Remote · GitHub" })
+        const preview = modal.contentEl.createDiv({ cls: "github-sync-conflict__result" })
+        preview.createEl("strong", { text: "Merge preview" })
+        const summary = preview.createEl("span", { text: `Choose a version for each of ${hunks.length} changes.` })
+        const output = preview.createEl("pre", { cls: "github-sync-conflict__output" })
+        const apply = modal.contentEl.createEl("button", { text: "Apply reviewed merge", cls: "mod-cta github-sync-conflict__apply" })
+        apply.disabled = hunks.length !== 0
+        const update = () => {
+          const merged = mergeV4ReviewedSections(sections, selections)
+          apply.disabled = merged === null || signal.aborted
+          summary.setText(merged === null
+            ? `${selections.size}/${hunks.length} changes reviewed`
+            : "All changes reviewed · verify the result before applying.")
+          output.setText(merged ?? "Choose Local or Remote for every highlighted change.")
+        }
+        let hunk = 0
+        for (const section of sections) {
+          if (section.kind === "common") {
+            const common = review.createEl("pre", { cls: "github-sync-conflict__common", text: section.lines.join("\n") })
+            common.setAttribute("aria-label", "Unchanged lines")
+            continue
+          }
+          const index = hunk++
+          const block = review.createDiv({ cls: "github-sync-conflict__hunk" })
+          block.createEl("span", { text: `Change ${index + 1} of ${hunks.length}`, cls: "github-sync-conflict__hunk-title" })
+          const columns = block.createDiv({ cls: "github-sync-conflict__columns" })
+          const left = columns.createDiv({ cls: "github-sync-conflict__side is-local" })
+          left.createEl("pre", { text: section.localLines.join("\n") || "(no lines)" })
+          const right = columns.createDiv({ cls: "github-sync-conflict__side is-remote" })
+          right.createEl("pre", { text: section.remoteLines.join("\n") || "(no lines)" })
+          const choose = block.createDiv({ cls: "github-sync-conflict__choices" })
+          const choices: Array<{ choice: V4ReviewChoice; button: HTMLButtonElement }> = [
+            { choice: "local", button: choose.createEl("button", { text: "Accept local" }) },
+            { choice: "remote", button: choose.createEl("button", { text: "Accept remote" }) },
+            { choice: "both", button: choose.createEl("button", { text: "Accept both" }) },
+            { choice: "discard", button: choose.createEl("button", { text: "Discard both" }) },
+          ]
+          for (const { choice, button } of choices) {
+            button.setAttribute("aria-pressed", "false")
+            button.setAttribute("aria-label", `Change ${index + 1}: ${choice}`)
+            button.onclick = () => {
+              selections.set(index, choice)
+              for (const selection of choices) selection.button.setAttribute("aria-pressed", String(choice === selection.choice))
+              update()
+            }
+          }
+        }
+        update()
+        apply.onclick = () => {
+          const merged = mergeV4ReviewedSections(sections, selections)
+          if (merged === null || signal.aborted) return
+          finish({ action: "merged", mergedBytes: new TextEncoder().encode(merged) })
+        }
+      } else {
+        modal.contentEl.createEl("p", { text: "Side-by-side review is available for small UTF-8 text files. This file can be kept in both versions or resolved as a whole.", cls: "github-sync-conflict__intro" })
+      }
+      const buttons = modal.contentEl.createDiv({ cls: "github-sync-conflict__actions" })
       buttons.createEl("button", { text: "Keep both" }).onclick = () => finish({ action: "keep-local-copy-remote" })
       buttons.createEl("button", { text: "Use local" }).onclick = () => finish({ action: "use-local" })
       buttons.createEl("button", { text: "Use remote" }).onclick = () => finish({ action: "use-remote" })
