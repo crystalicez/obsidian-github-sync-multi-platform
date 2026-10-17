@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { buildV4ConflictReview, decodeV4ReviewText, mergeV4ReviewedSections, V4_REVIEW_MAX_BYTES } from "../../src/lib/v4/conflict-review";
+import { buildV4ConflictReview, decodeV4ReviewText, mergeV4ReviewedSections, mergeV4ReviewedLines, v4ReviewLineKey, V4_REVIEW_MAX_BYTES } from "../../src/lib/v4/conflict-review";
 
 test("manual review isolates independent line hunks and merges only explicit selections", () => {
   const local = "A\nlocal first\nB\nlocal second\nC\n";
@@ -30,6 +30,40 @@ test("manual review correctly handles insertions, deletions, Unicode and no-diff
     assert.equal(mergeV4ReviewedSections(sections, new Map([...Array(count)].map((_, i) => [i, "remote"]))), remote);
   }
   assert.equal(mergeV4ReviewedSections(buildV4ConflictReview("same", "same"), new Map()), "same");
+});
+
+
+test("line-level review can retain individual lines from each side within a single changed block", () => {
+  const left = "header\nlocal 1\nlocal 2\nlocal 3\nfooter";
+  const right = "header\nremote 1\nremote 2\nfooter";
+  const sections = buildV4ConflictReview(left, right);
+  const changes = sections.map((section, i) => ({section, i})).filter(item => item.section.kind === "difference");
+  assert.equal(changes.length, 1);
+  const index = changes[0].i;
+  const decisions = new Map<string, "keep" | "omit">([
+    [v4ReviewLineKey(index, "local", 0), "keep"],
+    [v4ReviewLineKey(index, "local", 1), "omit"],
+    [v4ReviewLineKey(index, "local", 2), "keep"],
+    [v4ReviewLineKey(index, "remote", 0), "omit"],
+    [v4ReviewLineKey(index, "remote", 1), "keep"],
+  ]);
+  assert.equal(mergeV4ReviewedLines(sections, new Map()), null);
+  assert.equal(mergeV4ReviewedLines(sections, decisions), "header\nlocal 1\nlocal 3\nremote 2\nfooter");
+  decisions.delete(v4ReviewLineKey(index, "local", 1));
+  assert.equal(mergeV4ReviewedLines(sections, decisions), null);
+});
+
+test("line-level review retains newlines, unchanged context, and allows empty chosen output", () => {
+  for (const [a, b] of [["one\ntwo\n", "one\nthree\n"], ["", "x"], ["x", ""], ["\n", "x\n"]]) {
+    const sections = buildV4ConflictReview(a, b);
+    const choices = new Map<string, "keep" | "omit">();
+    sections.forEach((section, sectionIndex) => {
+      if (section.kind !== "difference") return;
+      section.localLines.forEach((_, i) => choices.set(v4ReviewLineKey(sectionIndex, "local", i), "keep"));
+      section.remoteLines.forEach((_, i) => choices.set(v4ReviewLineKey(sectionIndex, "remote", i), "omit"));
+    });
+    assert.equal(mergeV4ReviewedLines(sections, choices), a);
+  }
 });
 
 test("binary, invalid UTF-8 and oversized input have no editable review", () => {

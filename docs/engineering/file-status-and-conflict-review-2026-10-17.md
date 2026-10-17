@@ -1,4 +1,4 @@
-# File-status sidebar and manual hunk conflict review — 2026-10-17
+# File-status sidebar and manual per-line conflict review — 2026-10-17
 
 **Scope:** Original UI implementation for `crystalicez/obsidian-github-sync-multi-platform`, on the audit branch. Inspired by the user's screenshots and open-source references, **not a copy or translation of their source**:
 - Sidebar reference: [firstsun-dev/git-files-sync](https://github.com/firstsun-dev/git-files-sync), MIT License.
@@ -16,7 +16,7 @@ Configured Sync Center now opens to **Files** while retaining **Commits** and **
 
 When conflictPolicy is **Ask**, the engine can now supply verified small local/remote UTF-8 text to the existing Obsidian modal, including packed records only when the entire logical pack group's declared size is bounded. It refuses text previews of oversized, non-UTF-8/binary, and large pack content; the existing safe whole-file Keep both / Use local / Use remote / Cancel choices remain available.
 
-Text conflicts have a **desktop two-column comparison**, independent line hunks, and per-hunk **Accept local / Accept remote / Accept both (local then remote) / Discard both**. Each hunk must be explicitly decided, and a merged preview is displayed before **Apply reviewed merge** is enabled. The result is handed back as `mergedBytes` to the existing staged conflict-resolution pipeline, preserving the transaction's all-decisions-before-writes rule. Abort / modal close / Cancel resolve without writing. The algorithm has hard `256 KiB` per-file and bounded LCS matrix/line-count limits; pathological texts fall back to one explicit whole-change hunk. At ≤620px the comparison columns stack with Local/Remote labels for compact use. This is a desktop-emulated compact acceptance, **not** an Android/iOS device test.
+**Updated 2026-10-17:** Desktop side-by-side comparison now supports **Keep / Omit per changed line** within the same diff hunk, with per-hunk shortcuts for speed, followed by an **editable merged text result**. The user must decide every changed line before Apply; manual text changes survive subsequent decisions until explicitly reset. Apply passes exactly the visible final text as `mergedBytes` into the existing staged conflict-resolution pipeline. Abort, modal close or Cancel resolve without writing. The per-side preview limit remains 256 KiB; line-level UI is bounded to at most 600 lines per side and 180,000 LCS cells, with a 512 KiB cap on manual output. Larger or binary files use existing whole-file controls, not an unbounded line list. At ≤620px the columns stack. This is desktop emulation, **not** a real Android/iOS acceptance test. See [exact per-line UI regression and screenshots](conflict-line-merge-2026-10-17.md).
 
 ## Tests and real UI evidence
 

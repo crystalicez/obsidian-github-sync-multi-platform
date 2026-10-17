@@ -137,6 +137,82 @@ test("manual review requires every hunk choice and cancellation preserves no mer
   assert.deepEqual(await cancelled, { action: "ask" });
 });
 
+
+test("one changed block permits independent per-line decisions and an explicitly editable merge result", async () => {
+  resetModalTestState();
+  const runtime = Object.create(V4PluginRuntime.prototype) as any;
+  runtime.plugin = { app: {} };
+  const result = runtime.askConflict("same-hunk.md", new AbortController().signal,
+    new TextEncoder().encode("shared\nlocal one\nlocal two\nend"),
+    new TextEncoder().encode("shared\nremote one\nremote two\nend"));
+  const modal = modalInstances.at(-1)!;
+  const apply = modal.contentEl.findByText("Apply reviewed merge")!;
+  const output = modal.contentEl.findByAttribute("aria-label", "Editable merged result")!;
+  assert.equal(apply.disabled, true);
+  assert.equal(output.disabled, true);
+  for (const [label, value] of [
+    ["Change 1 local line 1: keep", true],
+    ["Change 1 local line 2: omit", true],
+    ["Change 1 remote line 1: omit", true],
+  ] as const) {
+    const button = modal.contentEl.findByAttribute("aria-label", label)!;
+    button.onclick?.();
+    assert.equal(button.attributes["aria-pressed"], String(value));
+    assert.equal(apply.disabled, true);
+  }
+  modal.contentEl.findByAttribute("aria-label", "Change 1 remote line 2: keep")!.onclick?.();
+  assert.equal(apply.disabled, false);
+  assert.equal(output.value, "shared\nlocal one\nremote two\nend");
+  output.value = "shared\nmy own edited combination\nend";
+  output.oninput?.();
+  assert.equal(output.value, "shared\nmy own edited combination\nend");
+  // Changing a line choice cannot silently erase manual text edits.
+  modal.contentEl.findByAttribute("aria-label", "Change 1 remote line 1: keep")!.onclick?.();
+  assert.equal(output.value, "shared\nmy own edited combination\nend");
+  modal.contentEl.findByAttribute("aria-label", "Discard manual edits and restore selected lines")!.onclick?.();
+  assert.equal(output.value, "shared\nlocal one\nremote one\nremote two\nend");
+  output.value = "shared\nchosen text with ✨\nend";
+  output.oninput?.();
+  apply.onclick?.();
+  const outcome = await result;
+  assert.equal(outcome.action, "merged");
+  assert.equal(new TextDecoder().decode(outcome.mergedBytes), "shared\nchosen text with ✨\nend");
+});
+
+test("an oversized hand-edited merge cannot be applied and cancellation leaves no writes", async () => {
+  resetModalTestState();
+  const runtime = Object.create(V4PluginRuntime.prototype) as any;
+  runtime.plugin = { app: {} };
+  const result = runtime.askConflict("oversize.md", new AbortController().signal,
+    new TextEncoder().encode("a"), new TextEncoder().encode("b"));
+  const modal = modalInstances.at(-1)!;
+  modal.contentEl.findByAttribute("aria-label", "Change 1: remote")!.onclick?.();
+  const apply = modal.contentEl.findByText("Apply reviewed merge")!;
+  assert.equal(apply.disabled, false);
+  const output = modal.contentEl.findByAttribute("aria-label", "Editable merged result")!;
+  output.value = "🔐".repeat(140000);
+  output.oninput?.();
+  assert.equal(apply.disabled, true);
+  apply.onclick?.();
+  modal.contentEl.findByText("Cancel")!.onclick?.();
+  assert.deepEqual(await result, { action: "ask" });
+});
+
+
+test("oversized line count cannot expand thousands of interactive controls", async () => {
+  resetModalTestState();
+  const runtime = Object.create(V4PluginRuntime.prototype) as any;
+  runtime.plugin = { app: {} };
+  const local = new TextEncoder().encode(Array.from({ length: 900 }, (_, i) => `old ${i}`).join("\n"));
+  const remote = new TextEncoder().encode(Array.from({ length: 900 }, (_, i) => `new ${i}`).join("\n"));
+  const result = runtime.askConflict("many-lines.md", new AbortController().signal, local, remote);
+  const modal = modalInstances.at(-1)!;
+  assert.equal(modal.contentEl.findByText("Apply reviewed merge"), undefined);
+  assert.equal(modal.contentEl.findByClass("github-sync-conflict__line"), undefined);
+  modal.contentEl.findByText("Cancel")!.onclick?.();
+  assert.deepEqual(await result, { action: "ask" });
+});
+
 test("manual review remains safe when content is missing/binary, and abort closes modal", async () => {
   resetModalTestState();
   const runtime = Object.create(V4PluginRuntime.prototype) as any;
@@ -146,7 +222,7 @@ test("manual review remains safe when content is missing/binary, and abort close
     new Uint8Array([0]), new Uint8Array([1]));
   const modal = modalInstances.at(-1)!;
   assert.equal(modal.contentEl.findByText("Apply reviewed merge"), undefined);
-  assert.match(modal.contentEl.flattenText(), /available for small UTF-8 text files/u);
+  assert.match(modal.contentEl.flattenText(), /available for UTF-8 text/u);
   controller.abort();
   assert.deepEqual(await result, { action: "ask" });
 });

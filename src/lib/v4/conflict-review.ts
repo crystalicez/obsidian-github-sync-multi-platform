@@ -4,9 +4,51 @@ export type V4ReviewSection =
   | { kind: "common"; lines: string[] }
   | { kind: "difference"; localLines: string[]; remoteLines: string[] };
 
+
+/** Each divergent line must be explicitly kept or omitted before Apply. */
+export type V4ReviewLineDecision = "keep" | "omit";
+export type V4ReviewLineSide = "local" | "remote";
+
+/** Section indices are stable within the immutable side-by-side review. */
+export function v4ReviewLineKey(sectionIndex: number, side: V4ReviewLineSide, lineIndex: number): string {
+  return `${sectionIndex}:${side}:${lineIndex}`;
+}
+
+export function mergeV4ReviewedLines(
+  sections: readonly V4ReviewSection[],
+  choices: ReadonlyMap<string, V4ReviewLineDecision>,
+): string | null {
+  const lines: string[] = [];
+  for (let sectionIndex = 0; sectionIndex < sections.length; sectionIndex++) {
+    const section = sections[sectionIndex];
+    if (section.kind === "common") {
+      lines.push(...section.lines);
+      continue;
+    }
+    // Preserves source order within each side; for arbitrary interleaving use
+    // the explicitly editable final merge result before confirmation.
+    for (const side of ["local", "remote"] as const) {
+      const source = side === "local" ? section.localLines : section.remoteLines;
+      for (let i = 0; i < source.length; i++) {
+        const decision = choices.get(v4ReviewLineKey(sectionIndex, side, i));
+        if (!decision) return null;
+        if (decision === "keep") lines.push(source[i]);
+      }
+    }
+  }
+  return lines.join("\n");
+}
+
 export const V4_REVIEW_MAX_BYTES = 256 * 1024;
 const MAX_LINES = 600;
 const MAX_CELLS = 180_000;
+
+/** Rendering individual line controls is bounded independently of file bytes. */
+export function canReviewV4Lines(local: string, remote: string): boolean {
+  const left = local.split("\n").length;
+  const right = remote.split("\n").length;
+  return left <= MAX_LINES && right <= MAX_LINES && left * right <= MAX_CELLS;
+}
 
 export function decodeV4ReviewText(bytes: Uint8Array): string | null {
   if (bytes.byteLength > V4_REVIEW_MAX_BYTES) return null;

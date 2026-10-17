@@ -40,6 +40,8 @@ export class ElementStub {
   text = "";
   title = "";
   disabled = false;
+  value = "";
+  oninput?: () => void;
   onclick?: () => void;
   onkeydown?: (event: KeyboardEvent) => void;
   onpointerdown?: (event: PointerEvent) => void;

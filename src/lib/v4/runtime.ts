@@ -16,7 +16,7 @@ import { decodeV4RemoteConfig } from "./remote-index"
 import { createV4ScopePredicate, isPathInV4SyncScope } from "./scope"
 import { assertV4PathLayoutCompatible, V4ChangeGuardError, V4RecoveryReplanRequiredError, V4SyncSession, type V4SyncRunState } from "./sync-session"
 import type { V4ConflictResolution } from "./conflicts"
-import { buildV4ConflictReview, decodeV4ReviewText, mergeV4ReviewedSections, type V4ReviewChoice } from "./conflict-review"
+import { buildV4ConflictReview, canReviewV4Lines, decodeV4ReviewText, mergeV4ReviewedLines, v4ReviewLineKey, V4_REVIEW_MAX_BYTES, type V4ReviewLineDecision, type V4ReviewChoice } from "./conflict-review"
 import { V4SyncCoordinator, type V4QueuedChange, type V4SyncRequest } from "./sync-coordinator"
 import { expectedV4PathLayout, V4_FORMAT_VERSION, V4_CONFIG_PATH, V4_PBKDF2_ITERATIONS, type V4RemoteConfig, type V4StorageMode } from "./protocol-types"
 import { V4HistoryService } from "./history-service"
@@ -819,30 +819,57 @@ export class V4PluginRuntime {
       modal.contentEl.createEl("p", { text: "Both local and remote changed. Nothing is applied until you choose a resolution.", cls: "github-sync-conflict__intro" })
       const localText = localBytes ? decodeV4ReviewText(localBytes) : null
       const remoteText = remoteBytes ? decodeV4ReviewText(remoteBytes) : null
-      if (localText !== null && remoteText !== null) {
+      if (localText !== null && remoteText !== null && canReviewV4Lines(localText, remoteText)) {
         const sections = buildV4ConflictReview(localText, remoteText)
         const hunks = sections.filter(section => section.kind === "difference")
-        const selections = new Map<number, V4ReviewChoice>()
+        const selections = new Map<string, V4ReviewLineDecision>()
+        const controls = new Map<string, { keep: HTMLButtonElement; omit: HTMLButtonElement }>()
         const review = modal.contentEl.createDiv({ cls: "github-sync-conflict__review" })
         const headings = review.createDiv({ cls: "github-sync-conflict__columns github-sync-conflict__labels" })
         headings.createEl("strong", { text: "Local · this vault" })
         headings.createEl("strong", { text: "Remote · GitHub" })
         const preview = modal.contentEl.createDiv({ cls: "github-sync-conflict__result" })
-        preview.createEl("strong", { text: "Merge preview" })
-        const summary = preview.createEl("span", { text: `Choose a version for each of ${hunks.length} changes.` })
-        const output = preview.createEl("pre", { cls: "github-sync-conflict__output" })
+        preview.createEl("strong", { text: "Merged result · editable" })
+        const summary = preview.createEl("span", { text: "Decide whether to keep or omit each changed line." })
+        const output = preview.createEl("textarea", { cls: "github-sync-conflict__output github-sync-conflict__editor",
+          attr: { "aria-label": "Editable merged result", "spellcheck": "false", "rows": "8" } }) as HTMLTextAreaElement
+        const reset = preview.createEl("button", { text: "Reset text to selected lines" })
+        reset.setAttribute("aria-label", "Discard manual edits and restore selected lines")
         const apply = modal.contentEl.createEl("button", { text: "Apply reviewed merge", cls: "mod-cta github-sync-conflict__apply" })
-        apply.disabled = hunks.length !== 0
+        const count = sections.reduce((sum, section) =>
+          section.kind === "difference" ? sum + section.localLines.length + section.remoteLines.length : sum, 0)
+        let edited = false
+        let previewReady = false
         const update = () => {
-          const merged = mergeV4ReviewedSections(sections, selections)
-          apply.disabled = merged === null || signal.aborted
-          summary.setText(merged === null
-            ? `${selections.size}/${hunks.length} changes reviewed`
-            : "All changes reviewed · verify the result before applying.")
-          output.setText(merged ?? "Choose Local or Remote for every highlighted change.")
+          const merged = mergeV4ReviewedLines(sections, selections)
+          previewReady = merged !== null
+          if (!edited) output.value = merged ?? ""
+          output.disabled = !previewReady
+          const bytes = previewReady ? new TextEncoder().encode(output.value) : undefined
+          const tooLarge = !!bytes && bytes.byteLength > V4_REVIEW_MAX_BYTES * 2
+          apply.disabled = !previewReady || tooLarge || signal.aborted
+          reset.disabled = !previewReady || !edited
+          summary.setText(tooLarge ? "Merged result is too large (limit 512 KiB)."
+            : !previewReady ? `${selections.size}/${count} lines reviewed · choose Keep or Omit for every changed line.`
+              : edited ? "Custom text preserved. Review the exact result before applying; Reset restores line selections."
+                : "All lines reviewed · you can edit the merged text directly before applying.")
+          for (const [key, pair] of controls) {
+            pair.keep.setAttribute("aria-pressed", String(selections.get(key) === "keep"))
+            pair.omit.setAttribute("aria-pressed", String(selections.get(key) === "omit"))
+          }
+        }
+        output.oninput = () => {
+          if (!previewReady) return
+          edited = true
+          update()
+        }
+        reset.onclick = () => {
+          edited = false
+          update()
         }
         let hunk = 0
-        for (const section of sections) {
+        for (let sectionIndex = 0; sectionIndex < sections.length; sectionIndex++) {
+          const section = sections[sectionIndex]
           if (section.kind === "common") {
             const common = review.createEl("pre", { cls: "github-sync-conflict__common", text: section.lines.join("\n") })
             common.setAttribute("aria-label", "Unchanged lines")
@@ -850,37 +877,56 @@ export class V4PluginRuntime {
           }
           const index = hunk++
           const block = review.createDiv({ cls: "github-sync-conflict__hunk" })
-          block.createEl("span", { text: `Change ${index + 1} of ${hunks.length}`, cls: "github-sync-conflict__hunk-title" })
+          block.createEl("span", { text: `Change ${index + 1} of ${hunks.length} · select individual lines`, cls: "github-sync-conflict__hunk-title" })
           const columns = block.createDiv({ cls: "github-sync-conflict__columns" })
-          const left = columns.createDiv({ cls: "github-sync-conflict__side is-local" })
-          left.createEl("pre", { text: section.localLines.join("\n") || "(no lines)" })
-          const right = columns.createDiv({ cls: "github-sync-conflict__side is-remote" })
-          right.createEl("pre", { text: section.remoteLines.join("\n") || "(no lines)" })
+          const sides = [
+            { name: "local" as const, label: "Local", lines: section.localLines, cls: "is-local" },
+            { name: "remote" as const, label: "Remote", lines: section.remoteLines, cls: "is-remote" },
+          ]
+          for (const side of sides) {
+            const column = columns.createDiv({ cls: `github-sync-conflict__side ${side.cls}` })
+            if (!side.lines.length) column.createEl("span", { text: "(no lines)", cls: "github-sync-conflict__empty" })
+            side.lines.forEach((line, lineIndex) => {
+              const key = v4ReviewLineKey(sectionIndex, side.name, lineIndex)
+              const row = column.createDiv({ cls: "github-sync-conflict__line" })
+              row.createEl("code", { text: line || " ", cls: "github-sync-conflict__line-text" })
+              const buttons = row.createDiv({ cls: "github-sync-conflict__line-actions" })
+              const keep = buttons.createEl("button", { text: "Keep", attr: { type: "button" } })
+              const omit = buttons.createEl("button", { text: "Omit", attr: { type: "button" } })
+              keep.setAttribute("aria-label", `Change ${index + 1} ${side.name} line ${lineIndex + 1}: keep`)
+              omit.setAttribute("aria-label", `Change ${index + 1} ${side.name} line ${lineIndex + 1}: omit`)
+              controls.set(key, { keep, omit })
+              keep.onclick = () => { selections.set(key, "keep"); update() }
+              omit.onclick = () => { selections.set(key, "omit"); update() }
+            })
+          }
           const choose = block.createDiv({ cls: "github-sync-conflict__choices" })
           const choices: Array<{ choice: V4ReviewChoice; button: HTMLButtonElement }> = [
-            { choice: "local", button: choose.createEl("button", { text: "Accept local" }) },
-            { choice: "remote", button: choose.createEl("button", { text: "Accept remote" }) },
-            { choice: "both", button: choose.createEl("button", { text: "Accept both" }) },
-            { choice: "discard", button: choose.createEl("button", { text: "Discard both" }) },
+            { choice: "local", button: choose.createEl("button", { text: "Keep all local lines" }) },
+            { choice: "remote", button: choose.createEl("button", { text: "Keep all remote lines" }) },
+            { choice: "both", button: choose.createEl("button", { text: "Keep both sides" }) },
+            { choice: "discard", button: choose.createEl("button", { text: "Omit both sides" }) },
           ]
           for (const { choice, button } of choices) {
-            button.setAttribute("aria-pressed", "false")
             button.setAttribute("aria-label", `Change ${index + 1}: ${choice}`)
             button.onclick = () => {
-              selections.set(index, choice)
-              for (const selection of choices) selection.button.setAttribute("aria-pressed", String(choice === selection.choice))
+              for (const side of sides) side.lines.forEach((_, lineIndex) => {
+                const keep = choice === "both" || choice === side.name
+                selections.set(v4ReviewLineKey(sectionIndex, side.name, lineIndex), keep ? "keep" : "omit")
+              })
               update()
             }
           }
         }
         update()
         apply.onclick = () => {
-          const merged = mergeV4ReviewedSections(sections, selections)
-          if (merged === null || signal.aborted) return
-          finish({ action: "merged", mergedBytes: new TextEncoder().encode(merged) })
+          if (!previewReady || signal.aborted) return
+          const mergedBytes = new TextEncoder().encode(output.value)
+          if (mergedBytes.byteLength > V4_REVIEW_MAX_BYTES * 2) return
+          finish({ action: "merged", mergedBytes })
         }
       } else {
-        modal.contentEl.createEl("p", { text: "Side-by-side review is available for small UTF-8 text files. This file can be kept in both versions or resolved as a whole.", cls: "github-sync-conflict__intro" })
+        modal.contentEl.createEl("p", { text: "Line-by-line review is available for UTF-8 text up to 256 KiB and a bounded number of lines. For binary or larger files, use the whole-file decisions below.", cls: "github-sync-conflict__intro" })
       }
       const buttons = modal.contentEl.createDiv({ cls: "github-sync-conflict__actions" })
       buttons.createEl("button", { text: "Keep both" }).onclick = () => finish({ action: "keep-local-copy-remote" })

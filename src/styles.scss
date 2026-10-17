@@ -321,7 +321,7 @@
 }
 .github-sync-conflict__labels strong { min-width: 0; }
 .github-sync-conflict__common,
-.github-sync-conflict__side pre,
+.github-sync-conflict__line-text,
 .github-sync-conflict__output {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
@@ -352,6 +352,41 @@
 }
 .github-sync-conflict__side.is-local { border-color: var(--color-orange); }
 .github-sync-conflict__side.is-remote { border-color: var(--color-green); }
+.github-sync-conflict__line {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--size-4-1);
+  padding: var(--size-4-1);
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+.github-sync-conflict__line-text {
+  flex: 1 1 180px;
+  min-width: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  border-radius: var(--radius-s);
+  padding: var(--size-4-1);
+}
+.github-sync-conflict__line-actions {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 2px;
+}
+.github-sync-conflict__line-actions button {
+  font-size: var(--font-ui-smaller);
+  padding: var(--size-4-1) var(--size-4-2);
+  min-height: 28px;
+}
+.github-sync-conflict__line-actions button[aria-pressed="true"] {
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
+}
+.github-sync-conflict__empty {
+  color: var(--text-muted);
+  display: block;
+  padding: var(--size-4-2);
+}
 .github-sync-conflict__choices,
 .github-sync-conflict__actions {
   display: flex;
@@ -372,7 +407,10 @@
 }
 .github-sync-conflict__result span { color: var(--text-muted); font-size: var(--font-ui-smaller); }
 .github-sync-conflict__output {
-  max-height: 180px;
+  width: 100%;
+  min-height: 130px;
+  resize: vertical;
+  max-height: 280px;
   overflow: auto;
   background: var(--background-secondary);
   border-radius: var(--radius-s);

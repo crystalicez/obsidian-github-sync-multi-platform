@@ -580,8 +580,8 @@ try {
   const conflictOpened=await evaluate(`(()=>{
     const p=app.plugins.plugins[${JSON.stringify(id)}];
     const enc=new TextEncoder();
-    const local="## Notes\\nRate: 100\\nShared heading\\nLocal edits\\nFinal line";
-    const remote="## Notes\\nRate: 120\\nShared heading\\nRemote edits\\nFinal line";
+    const local="## Notes\\nRate: 100\\nOwner: Local\\nShared heading\\nLocal edits\\nFinal line";
+    const remote="## Notes\\nRate: 120\\nOwner: Remote\\nShared heading\\nRemote edits\\nFinal line";
     window.__uiConflictPreview=p.v4Runtime.askConflict("Notes/sample-conflict.md",
       new AbortController().signal,enc.encode(local),enc.encode(remote));
     return true;
@@ -596,15 +596,48 @@ try {
     conflictOpened&&modalState.visible&&modalState.hunks===2&&modalState.disabled,JSON.stringify(modalState));
   await record("19-conflict-desktop",{visibleSelector:".github-sync-conflict"});
   const decisions=await evaluate(`(()=>{
-    const selections=[...document.querySelectorAll(".github-sync-conflict__hunk")];
-    const buttons=selections.map((el,i)=>el.querySelectorAll(".github-sync-conflict__choices button")[i===0?1:0]);
-    buttons.forEach(e=>e.click());
-    return {disabled:document.querySelector(".github-sync-conflict__apply")?.disabled,
-      text:document.querySelector(".github-sync-conflict__output")?.innerText?.slice(0,250)};
+    const click=(label)=>{
+      const button=[...document.querySelectorAll(".github-sync-conflict__line-actions button")]
+        .find(el=>el.getAttribute("aria-label")===label);
+      if(!button)throw Error("Missing per-line decision: "+label);
+      button.click();
+    };
+    const steps=[
+      "Change 1 local line 1: keep",
+      "Change 1 local line 2: omit",
+      "Change 1 remote line 1: omit",
+      "Change 1 remote line 2: keep",
+      "Change 2 local line 1: keep",
+      "Change 2 remote line 1: omit",
+    ];
+    for(const label of steps.slice(0,-1))click(label);
+    const guarded=document.querySelector(".github-sync-conflict__apply").disabled;
+    click(steps[steps.length-1]);
+    const output=document.querySelector(".github-sync-conflict__output");
+    return {guarded,disabled:document.querySelector(".github-sync-conflict__apply").disabled,
+      choices:document.querySelectorAll('.github-sync-conflict__line-actions button[aria-pressed="true"]').length,
+      text:output.value.slice(0,250)};
   })()`);
-  checked("native conflict review enables Apply only after both changes chosen",
-    !decisions.disabled&&decisions.text.includes("Rate: 120")&&decisions.text.includes("Local edits"),
-    JSON.stringify(decisions));
+  checked("native conflict can merge individual lines from both sides of one change",
+    decisions.guarded&&!decisions.disabled&&decisions.choices===6
+      &&decisions.text.includes("Rate: 100")&&decisions.text.includes("Owner: Remote")
+      &&!decisions.text.includes("Owner: Local")&&!decisions.text.includes("Rate: 120")
+      &&decisions.text.includes("Local edits"),JSON.stringify(decisions));
+  const custom=await evaluate(`(()=>{
+    const editor=document.querySelector(".github-sync-conflict__editor");
+    const original=editor.value;
+    editor.value=original+"\\nEdited in preview";
+    editor.dispatchEvent(new Event("input",{bubbles:true}));
+    const button=[...document.querySelectorAll(".github-sync-conflict__line-actions button")]
+      .find(el=>el.getAttribute("aria-label")==="Change 1 remote line 1: keep");
+    button.click();
+    const preserved=editor.value.endsWith("Edited in preview");
+    document.querySelector('[aria-label="Discard manual edits and restore selected lines"]').click();
+    return {preserved,reset:editor.value.includes("Rate: 120")&&!editor.value.includes("Edited in preview"),
+      enabled:!document.querySelector(".github-sync-conflict__apply").disabled};
+  })()`);
+  checked("native editable merge preserves manual edits until explicit reset",
+    custom.preserved&&custom.reset&&custom.enabled,JSON.stringify(custom));
   await record("20-conflict-reviewed",{visibleSelector:".github-sync-conflict"});
   await activeSend("Emulation.setDeviceMetricsOverride",{width:390,height:780,deviceScaleFactor:1,mobile:false});
   await record("21-conflict-compact-390");
