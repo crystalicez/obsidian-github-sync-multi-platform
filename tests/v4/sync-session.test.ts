@@ -1563,6 +1563,31 @@ test("v4 defers a merged local write until every conflict decision and exact tot
   assert.equal(dec(fixture.github.files.get("A.md")!), "merged:A.md");
 });
 
+test("reviewed merge identical to pinned remote pulls locally without mutating GitHub", async () => {
+  const fixture = await divergedConflictFixture(["review.md"]);
+  const initialRef = fixture.github.ref?.sha;
+  let inspected = false;
+  const result = await new V4SyncSession({
+    github: fixture.github,
+    vault: fixture.localVault,
+    index: fixture.localIndex,
+    config: config(),
+    conflictPolicy: "ask",
+    abortChangePercent: 0,
+    askConflict: async input => {
+      assert.equal(dec(input.localBytes!), "local:review.md");
+      assert.equal(dec(input.remoteBytes!), "remote:review.md");
+      inspected = true;
+      return { action: "merged", mergedBytes: new Uint8Array(input.remoteBytes!) };
+    },
+  }).sync({ operation: "normal", allowThresholdOverride: false, changes: [{ type: "modify", path: "review.md", mtime: 3 }] });
+  assert.equal(inspected, true);
+  assert.equal(result.pushedFiles, 0, "reviewed remote content must not create a new GitHub commit");
+  assert.equal(result.pulledFiles, 1);
+  assert.equal(fixture.github.ref?.sha, initialRef, "reviewed remote content must not mutate the immutable remote branch");
+  assert.equal(dec(fixture.localVault.files.get("review.md")!.bytes), "remote:review.md");
+});
+
 test("manual conflict review receives verified small packed content and commits only the reviewed result", async () => {
   const fixture = await divergedConflictFixture(["review.md"]);
   let sawReview = false;

@@ -617,12 +617,27 @@ export class V4SyncSession {
           size: stage.size,
           mtime: stage.mtime,
         }
-        const mergedChange = this.changeBetween(conflict.remote, mergedAfter)
-        if (mergedChange) {
-          pushTotal++
-          const binding: V4PushBinding = { change: mergedChange, source: this.stageHandle(stage) }
-          batch.pushes.push(binding)
-          batch.stagedWrites.push({ change: mergedChange, stage })
+        // A reviewed result that exactly matches the pinned remote is a
+        // selection of remote content, not a new publication. Use the normal
+        // verified pull path to update the vault and preserve the remote ref.
+        // Matching both hash and size (and location) avoids treating a rename
+        // decision as a simple content-only pull.
+        if (conflict.remote && remoteRecord
+          && conflict.local.path === conflict.remote.path
+          && stage.hash === conflict.remote.hash && stage.size === conflict.remote.size) {
+          const pull = this.changeBetween(conflict.local, conflict.remote)
+          if (pull) {
+            pullTotal++
+            batch.pulls.push(this.bindPull(pull, recordsById, allRemoteRecords, remoteCommitSha))
+          }
+        } else {
+          const mergedChange = this.changeBetween(conflict.remote, mergedAfter)
+          if (mergedChange) {
+            pushTotal++
+            const binding: V4PushBinding = { change: mergedChange, source: this.stageHandle(stage) }
+            batch.pushes.push(binding)
+            batch.stagedWrites.push({ change: mergedChange, stage })
+          }
         }
       } else {
         if (resolution.action === "keep-local-copy-remote" && conflict.remote && remoteRecord) {

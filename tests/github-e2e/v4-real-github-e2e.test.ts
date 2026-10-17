@@ -581,6 +581,52 @@ async function runCopyConflictScenario(config: GitHubConfig, mode: V4StorageMode
   });
 }
 
+async function runReviewedRemoteNoPublicationScenario(config: GitHubConfig, mode: V4StorageMode): Promise<void> {
+  await runScenario(config, mode, "reviewed-remote-conflict-does-not-republish", async ({ context, device }) => {
+    const a = device("device-a");
+    a.vault.set("Notes/review.md", bytes("baseline\n"), 1);
+    await a.session.sync({ operation: "forcePush", allowThresholdOverride: false });
+
+    const b = device("device-b");
+    await b.session.sync({ operation: "forcePull", allowThresholdOverride: false });
+    a.vault.set("Notes/review.md", bytes("remote-approved\n"), 2);
+    await a.session.sync({
+      operation: "normal", allowThresholdOverride: false,
+      changes: [{ type: "modify", path: "Notes/review.md", mtime: 2 }],
+    });
+    const approvedSha = a.index.remoteCommitSha!;
+    await waitForBranchHead(config, approvedSha);
+    b.vault.set("Notes/review.md", bytes("local-draft\n"), 3);
+    let reviewSeen = false;
+    const reviewed = await new V4SyncSession({
+      github: b.client,
+      vault: b.vault,
+      index: b.index,
+      config: context.remoteConfig,
+      keyring: context.keyring,
+      conflictPolicy: "ask",
+      abortChangePercent: 0,
+      askConflict: async input => {
+        assert.equal(input.path, "Notes/review.md");
+        assert.deepEqual(input.localBytes, bytes("local-draft\n"));
+        assert.deepEqual(input.remoteBytes, bytes("remote-approved\n"));
+        reviewSeen = true;
+        return { action: "merged", mergedBytes: new Uint8Array(input.remoteBytes!) };
+      },
+    }).sync({
+      operation: "normal", allowThresholdOverride: false,
+      changes: [{ type: "modify", path: "Notes/review.md", mtime: 3 }],
+    });
+    assert.equal(reviewSeen, true);
+    assert.equal(reviewed.pushedFiles, 0, "identical reviewed remote must not be republished");
+    assert.equal(reviewed.pulledFiles, 1);
+    assert.deepEqual(b.vault.files.get("Notes/review.md")?.bytes, bytes("remote-approved\n"));
+    assert.equal((await b.client.getGitRefOrNull())?.sha, approvedSha, "review must not change GitHub branch head");
+    assert.equal(b.index.remoteCommitSha, approvedSha);
+    await verifyEncryptedObjectTransport(b, context, "Notes/review.md");
+  });
+}
+
 async function runRenameVsEditScenario(config: GitHubConfig, mode: V4StorageMode): Promise<void> {
   await runScenario(config, mode, "two-device-rename-vs-stale-edit", async ({ device }) => {
     const a = device("device-a");
@@ -767,6 +813,12 @@ after(async () => {
 
 test("V4 encrypted delete/recreate publishes a Git tree containing its new object", { timeout: 240_000 }, async () => {
   await runDeleteRecreateScenario(config, "encrypted");
+});
+
+test("V4 reviewed remote conflict preserves exact GitHub commit (both storage modes)", { timeout: 300_000 }, async () => {
+  for (const mode of ["plaintext", "encrypted"] as const) {
+    await runReviewedRemoteNoPublicationScenario(config, mode);
+  }
 });
 
 test("V4 real GitHub REST survives realistic superuser and two-device scenarios", { timeout: 900_000 }, async () => {
