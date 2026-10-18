@@ -21,6 +21,23 @@ The permanent **100 MB decimal maximum applies to test workloads** and release c
 * **Unqualified work:** native Obsidian Desktop UI/device acceptance; single Git blob at exact 8 MiB boundary through live GitHub REST; medium live GitHub Force Pull from 16 MB; hosted CI at the new commit SHA; independent review. Pack uploads have separate REST request sizing and are not covered by the medium chunk writer change.
 * All tests use isolated synthetic vaults/repositories; user notes, real/default branches, and the pre-existing uncommitted `tests/v4/github-transport.test.ts` were not modified. No merge/release.
 
+## Independent clean exact-code-SHA qualification (completed)
+
+The audit code commit `f8e2f724af11774a223952262b2b7d803a9be273` was pushed to `origin/audit/2026-09-26-production-hardening`, without the original unstaged `tests/v4/github-transport.test.ts` user work. Detached checkout `.tmp/rest-medium-clean-20261018` returned that exact code SHA and remained `## HEAD (no branch)` after the checks.
+
+Within the detached checkout, all completed with exit code **0**:
+
+- `corepack pnpm install --frozen-lockfile`
+- `corepack pnpm build`
+- `corepack pnpm test:fast` **666/666**
+- `corepack pnpm test:repeat` **10 consecutive green runs of 666 tests**
+- `corepack pnpm test:resource` **15/15**
+- `corepack pnpm test:soak` **4/4**, including real-file 16/32/50/100 MB cases and 32 MB legacy single decrypt
+- `corepack pnpm test:recovery`, `test:feasibility`, `validate:metadata`, `validate:package`, `test:github-e2e:compile` (three standard E2E bundles)
+- Standalone compile of the variable-size 16/32/50/100 MB live GitHub E2E bundle (compile only, **no network**)
+
+**Not qualified on this exact SHA:** credentialed GitHub 16 MB live Force Pull after fixing the <=32 MiB fixture, hosted CI, native Obsidian Desktop physical/UI testing, coordinated old-client roll-out. Earlier real GitHub **100 MB** test passed with 8 MiB new parts on a prior audit code SHA; it does not qualify this SHA or the new medium writer branch.
+
 ## Commands
 
 ```sh

@@ -4,6 +4,12 @@
 >
 > **Mandatory workflow rule:** Every AI session that makes a material change to code, tests, design decisions, branch/PR state, verification status, or next steps MUST update this file before ending or handing work off. GitHub is the source of truth.
 
+## 2026-10-18 clean code-SHA verification for medium REST-safe writer
+
+- Audit code SHA `f8e2f724af11774a223952262b2b7d803a9be273` is pushed. Detached clean checkout `.tmp/rest-medium-clean-20261018` HEAD matches that exact hash and remained pristine (`## HEAD (no branch)`) after qualification. The original `tests/v4/github-transport.test.ts` remains unstaged only in the main workspace.
+- Clean frozen install, production build, fast **666/666**, repeat **10/10 rounds x 666**, recovery, resource **15/15**, feasibility, 100 MB / medium 16/32/50 MB / historical encrypted 32 MB single-blob soak **4/4**, metadata/package validation, three usual GitHub E2E compiles and the new variable-size live E2E bundle standalone compile all **exit 0**.
+- **No new credentialed GitHub 16 MB completed pull test on this SHA:** initial 16 MB live test failed due to fixture forbidding a valid <=32MiB whole write, safe branch cleanup verified; retry after fixing fixture was blocked by host safety checks. This is distinct from older successful real GitHub REST 100 MB test. Native Obsidian UI/device acceptance, hosted CI, independent review, and old-client forward-compatible rollout decision remain open. Details in `docs/engineering/v4-rest-safe-medium-writer-2026-10-18.md`.
+
 ## 2026-10-18 approved REST-safe medium 8 MiB writer threshold — implemented
 
 - User explicitly approved **splitting new files above 8 MiB into 8 MiB max parts**, not just files over 50 MiB. New `shouldWriteV4Parts` is distinct from historical `shouldUseV4Parts`. Updated production `V4SyncSession`, buffered/streamed storage codec and remote descriptor validation. **Legacy single-blob records up to 50 MiB (with old encrypted-overhead rules) and legacy 48 MiB part descriptors remain accepted by current reader**. At exactly 8 MiB the writer may still use one object. Test files remain permanently capped at **100 MB decimal**.
