@@ -8,6 +8,7 @@ import type { GitHubCreateTreeEntry } from "../../src/lib/github-git-types"
 import { deriveV4Keyring, encryptV4Payload } from "../../src/lib/v4/crypto"
 import { sha256Hex } from "../../src/lib/bytes"
 import { V4StorageCodec } from "../../src/lib/v4/storage-codec"
+import { buildV4PartPaths, V4_LARGE_FILE_THRESHOLD_BYTES, V4_PART_BYTES } from "../../src/lib/v4/large-files"
 import { assertV4RemoteRecordDescriptor } from "../../src/lib/v4/remote-index"
 import { createEmptyV4LocalIndex } from "../../src/lib/v4/local-index"
 import { V4_FORMAT_VERSION, type V4RemoteConfig } from "../../src/lib/v4/protocol-types"
@@ -131,6 +132,82 @@ test("legacy 32 MB encrypted single-blob payload remains decryptable after write
   const decoded = await codec.read(record, async () => encrypted)
   assert.equal(await sha256Hex(decoded), record.plaintextSha256)
   assert.deepEqual(decoded, plaintext)
+})
+
+
+test("legacy encrypted 48 MiB part decodes through bounded sink and detects corruption", {
+  skip: process.env.V4_RUN_SOAK !== "1", timeout: 180_000,
+}, async () => {
+  const logicalBytes = V4_LARGE_FILE_THRESHOLD_BYTES + 1
+  assert.ok(logicalBytes < TEST_100MB_BYTES)
+  const plaintext = new Uint8Array(logicalBytes)
+  for (let i = 0; i < logicalBytes; i += 4093) plaintext[i] = (i / 4093) & 255
+  plaintext[logicalBytes - 1] = 0x7f
+  const hash = await sha256Hex(plaintext)
+  const repoId = "synthetic-owner/synthetic-repo#legacy48"
+  const keys = await deriveV4Keyring({ passphrase: "legacy48", repoId,
+    salt: new TextEncoder().encode("salt"), iterations: 10 })
+  const codec = new V4StorageCodec({ mode: "encrypted", pathLayout: "opaque-stable-v1", keyring: keys })
+  const fileId = "legacy-file", version = "legacy-v1"
+  const sample = await codec.prepare("legacy.bin", new Uint8Array([1]), version, 1, fileId)
+  const partPaths = buildV4PartPaths({ mode: "encrypted", logicalPath: "legacy.bin",
+    version, partCount: 2, opaqueId: "legacy-opaque-id" })
+  const chunks = [plaintext.subarray(0, V4_PART_BYTES), plaintext.subarray(V4_PART_BYTES)]
+  assert.equal(chunks[0].byteLength, 48 * 1024 * 1024)
+  const cipher = await Promise.all(chunks.map((part, index) => encryptV4Payload(keys.contentKey,
+    part, { kind: "part", aad: fileId + ":" + version + ":" + index })))
+  const blobs = new Map(partPaths.map((name, index) => [name, cipher[index]]))
+  const record = { ...sample.record, size: logicalBytes, plaintextSha256: hash,
+    remotePath: partPaths[0], storage: "chunked" as const, partPaths, encryptedPath: undefined }
+  assertV4RemoteRecordDescriptor({ ...record, path: "legacy.bin" }, {
+    formatVersion: V4_FORMAT_VERSION, mode: "encrypted", repoId,
+    pathLayout: "opaque-stable-v1", algorithm: "AES-GCM", kdf: "PBKDF2-SHA-256",
+    kdfParams: { iterations: 10, salt: "c2FsdA" },
+  })
+  let count = 0, bytes = 0
+  const digest = createHash("sha256")
+  const sink = { append: async (plaintextPart: Uint8Array) => {
+    count++
+    bytes += plaintextPart.byteLength
+    digest.update(plaintextPart)
+  }, finish: async () => { throw new Error("No filesystem commit expected") },
+     abort: async () => {} }
+  const decoded = await codec.readToSink({ record, reader: async name => {
+    const value = blobs.get(name)
+    if (!value) throw new Error("Missing part")
+    return value
+  }, sink })
+  assert.equal(decoded.size, logicalBytes)
+  assert.equal(decoded.plaintextSha256, hash)
+  assert.equal(bytes, logicalBytes)
+  assert.equal(count, 2)
+  assert.equal(digest.digest("hex"), hash)
+  const tampered = new Uint8Array(cipher[1])
+  tampered[tampered.length - 1] ^= 1
+  await assert.rejects(() => codec.readToSink({ record,
+    reader: async name => name === partPaths[1] ? tampered : blobs.get(name)!,
+    sink: { append: async () => {}, finish: sink.finish, abort: sink.abort },
+  }))
+  console.log(JSON.stringify({ test: "legacy-48m-encrypted", logicalBytes,
+    firstPartBytes: V4_PART_BYTES, appends: count, tamperingRejected: true }))
+})
+
+test("buffered encrypted 8 MiB plus one byte becomes two REST-safe parts", {
+  skip: process.env.V4_RUN_SOAK !== "1", timeout: 120_000,
+}, async () => {
+  const plaintext = new Uint8Array(8 * 1024 * 1024 + 1)
+  plaintext[0] = 13
+  plaintext[plaintext.length - 1] = 71
+  const repoId = "synthetic-owner/synthetic-repo#buffered"
+  const keys = await deriveV4Keyring({ passphrase: "buffered-boundary", repoId,
+    salt: new TextEncoder().encode("salt"), iterations: 10 })
+  const codec = new V4StorageCodec({ mode: "encrypted", pathLayout: "opaque-stable-v1", keyring: keys })
+  const prepared = await codec.prepare("medium.bin", plaintext, "v1", 1, "medium-file")
+  assert.equal(prepared.record.storage, "chunked")
+  assert.equal(prepared.files.length, 2)
+  assert.ok(prepared.files.every(part => part.bytes.byteLength <= 8 * 1024 * 1024 + 64))
+  const remote = new Map(prepared.files.map(part => [part.path, part.bytes]))
+  assert.deepEqual(await codec.read(prepared.record, async name => remote.get(name)!), plaintext)
 })
 
 test("16, 32 and 50 MB encrypted medium files round-trip through V4 with new 8 MiB part writer", {

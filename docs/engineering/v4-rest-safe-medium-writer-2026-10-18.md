@@ -38,6 +38,15 @@ Within the detached checkout, all completed with exit code **0**:
 
 **Not qualified on this exact SHA:** credentialed GitHub 16 MB live Force Pull after fixing the <=32 MiB fixture, hosted CI, native Obsidian Desktop physical/UI testing, coordinated old-client roll-out. Earlier real GitHub **100 MB** test passed with 8 MiB new parts on a prior audit code SHA; it does not qualify this SHA or the new medium writer branch.
 
+## Additional exact-size encrypted legacy compatibility proof
+
+After the clean-code-SHA qualification above, the soak suite gained two more **offline** regression cases (both at or below the permanent 100 MB test limit):
+
+- A manually built **historical 48 MiB encrypted part** plus the remaining bytes of a logical **50 MiB + 1 byte** file. The current V4 remote descriptor validator accepts the old chunk count; the production codec reads the two encrypted parts into a bounded sink, verifies the **full-file SHA-256**, and rejects ciphertext tampering.
+- An encrypted **8 MiB + 1 byte** input supplied to the non-streaming `V4StorageCodec.prepare` method. The current writer emits **two REST-safe parts**, and the reader restores exactly the original bytes.
+
+These validate the real cryptographic formats, beyond descriptor-only or virtual planner tests. `pnpm test:soak` then passed **6/6**. These are not GitHub API or native Obsidian results; the older-client **forward-compatibility rollout decision remains unresolved**.
+
 ## Commands
 
 ```sh

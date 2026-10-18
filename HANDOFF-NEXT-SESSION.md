@@ -10,6 +10,14 @@
 - Clean frozen install, production build, fast **666/666**, repeat **10/10 rounds x 666**, recovery, resource **15/15**, feasibility, 100 MB / medium 16/32/50 MB / historical encrypted 32 MB single-blob soak **4/4**, metadata/package validation, three usual GitHub E2E compiles and the new variable-size live E2E bundle standalone compile all **exit 0**.
 - **No new credentialed GitHub 16 MB completed pull test on this SHA:** initial 16 MB live test failed due to fixture forbidding a valid <=32MiB whole write, safe branch cleanup verified; retry after fixing fixture was blocked by host safety checks. This is distinct from older successful real GitHub REST 100 MB test. Native Obsidian UI/device acceptance, hosted CI, independent review, and old-client forward-compatible rollout decision remain open. Details in `docs/engineering/v4-rest-safe-medium-writer-2026-10-18.md`.
 
+## 2026-10-18 legacy encrypted part compatibility follow-up
+
+- Added the missing real cryptographic format proof for a **legacy 48 MiB encrypted part** inside a **50 MiB + 1 byte** logical fixture, decoded via the current V4 bounded sink. Validated full SHA-256, exactly two appended parts, old remote descriptor acceptance, and authenticated corruption rejection.
+- Added **8 MiB + 1 byte** direct buffered V4 codec writer regression: two encrypted <=8 MiB payload parts and exact decrypted byte equality.
+- Local cryptographic/real-file `pnpm test:soak` **6/6**, with all logical test payloads <=100 MB. This is *offline* data-format evidence, not a new live GitHub API run.
+- Existing GitHub medium 16 MB Force Pull remains unverified after the harness issue/host safety denial; hosted CI, native Obsidian physical test, and cross-version rollout/capability negotiation remain blockers to release. Preserve original unstaged `tests/v4/github-transport.test.ts`.
+- Details in `docs/engineering/v4-rest-safe-medium-writer-2026-10-18.md`.
+
 ## 2026-10-18 approved REST-safe medium 8 MiB writer threshold — implemented
 
 - User explicitly approved **splitting new files above 8 MiB into 8 MiB max parts**, not just files over 50 MiB. New `shouldWriteV4Parts` is distinct from historical `shouldUseV4Parts`. Updated production `V4SyncSession`, buffered/streamed storage codec and remote descriptor validation. **Legacy single-blob records up to 50 MiB (with old encrypted-overhead rules) and legacy 48 MiB part descriptors remain accepted by current reader**. At exactly 8 MiB the writer may still use one object. Test files remain permanently capped at **100 MB decimal**.
