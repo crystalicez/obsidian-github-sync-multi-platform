@@ -79,6 +79,7 @@ export interface V4SyncSessionInput {
   includePath?: (path: string) => boolean
   onProgress?: (patch: V4SyncProgressPatch) => void
   diagnostics?: V4RunDiagnostics
+  maxConcurrentPartReads?: 1 | 2
   runState?: V4SyncRunState
   recoveryStore?: V4RecoveryStore
   resourceLimits?: Partial<V4ResourceLimits>
@@ -363,6 +364,7 @@ export class V4SyncSession {
       resources: this.resources,
       signal: input.signal,
       diagnostics: input.diagnostics,
+      maxConcurrentPartReads: input.maxConcurrentPartReads,
     })
     this.now = input.now ?? (() => Date.now())
     this.localIo = createV4LocalIo(input.vault)

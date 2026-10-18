@@ -40,6 +40,36 @@ test("chunked download overlaps bounded remote reads while staging verified part
   assert.deepEqual(result, { plaintextSha256: await sha256Hex(body), size: 4 })
 })
 
+test("mobile-sized transfer budget keeps remote part reads sequential", async () => {
+  const body = new Uint8Array([11, 22])
+  const paths = ["a.enc", "b.enc"]
+  let releaseFirst!: () => void
+  const firstGate = new Promise<void>(resolve => { releaseFirst = resolve })
+  const requested: string[] = []
+  const appended: number[] = []
+  const codec = new V4StorageCodec({
+    mode: "plaintext", pathLayout: "plaintext-v1", maxConcurrentPartReads: 1,
+  })
+  const task = codec.readToSink({
+    record: {
+      path: "asset.bin", pathId: "p", fileId: "f", plaintextSha256: await sha256Hex(body),
+      size: 2, mtime: 1, remoteVersion: "v", remotePath: paths[0], storage: "chunked", partPaths: paths,
+    },
+    reader: async path => {
+      requested.push(path)
+      if (path === paths[0]) await firstGate
+      return body.subarray(paths.indexOf(path), paths.indexOf(path) + 1)
+    },
+    sink: { async append(bytes) { appended.push(bytes[0]) } },
+  })
+  await new Promise(resolve => setImmediate(resolve))
+  assert.deepEqual(requested, ["a.enc"])
+  releaseFirst()
+  assert.deepEqual(await task, { plaintextSha256: await sha256Hex(body), size: 2 })
+  assert.deepEqual(requested, ["a.enc", "b.enc"])
+  assert.deepEqual(appended, [11, 22])
+})
+
 test("failed prefetched GitHub part never reaches the staged sink", async () => {
   const body = new Uint8Array([11, 22, 33])
   const paths = ["0.enc", "1.enc", "2.enc"]

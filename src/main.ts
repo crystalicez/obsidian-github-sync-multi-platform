@@ -1,4 +1,4 @@
-import { Plugin, setIcon, Modal, Notice, TFile, TFolder } from "obsidian";
+import { Plugin, Platform, setIcon, Modal, Notice, TFile, TFolder } from "obsidian";
 
 import { SettingTab, PluginSettings, DEFAULT_SETTINGS } from "./setting";
 import { GitHubClient } from "./lib/github-api";
@@ -169,7 +169,7 @@ export default class FastSync extends Plugin {
         owner: this.settings.githubOwner,
         repo: this.settings.githubRepo,
         branch: this.settings.githubBranch || "main",
-      });
+      }, { transportPolicy: { writeConcurrency: Platform.isDesktopApp ? 2 : 1 } });
     } else this.githubClient = undefined as unknown as GitHubClient
   }
 

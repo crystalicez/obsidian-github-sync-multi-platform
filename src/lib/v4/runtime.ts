@@ -711,6 +711,7 @@ export class V4PluginRuntime {
             recoveryStore,
             signal,
             diagnostics,
+            maxConcurrentPartReads: Platform.isDesktopApp ? 2 : 1,
             onProgress: patch => {
               if (patch.phase === "checking-remote") return
               this.progressStore.update(patch)
