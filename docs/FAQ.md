@@ -33,7 +33,7 @@ V4 会检测真正的三方冲突，不再采用旧版 FAQ 中描述的“409 �
 
 ### Q4. 当前版本的 100 MB 文件测试范围，以及更大文件的支持状态？
 
-V4 格式保留对旧版 48 MiB 分片的读取兼容性。2026-10-18 的真实 GitHub REST 100 MB 测试表明，旧版 48 MiB 上传请求会收到 HTTP 422；新版大文件分片 writer 已限制为 8 MiB 并完成真实加密上传、no-op、分阶段恢复下载及 SHA-256 验证。新的 8–50 MiB 文件已改为分片写入；旧版 50 MiB 以下单对象仍可解码。批量 pack 和 Obsidian 原生桌面端仍须单独验证。
+V4 格式保留对旧版 48 MiB 分片的读取兼容性。2026-10-18 的真实 GitHub REST 100 MB 测试表明，旧版 48 MiB 上传请求会收到 HTTP 422；新版大文件分片 writer 已限制为 8 MiB 并完成真实加密上传、no-op、分阶段恢复下载及 SHA-256 验证。新的 8–50 MiB 文件已改为分片写入；旧版 50 MiB 以下单对象仍可解码。新版 pack writer 也已限制每个加密 pack 不超过 8 MiB；96 个小文件的本地往返测试通过，但真实 GitHub pack 上传和 Obsidian 原生桌面端仍须单独验证。
 
 从 2026-10-18 起，所有新执行的文件大小测试（包括虚拟流、soak 和实机测试）永久限制为 **100 MB（100,000,000 字节）**。早期超大文件实验仅留在 Git 历史中，不再作为当前测试命令或设备支持证据。公开支持结论必须来自 `tests/baselines/v4/` 中记录的实机测试：
 
@@ -75,7 +75,7 @@ If the user changes a local target while network work is in flight, the final pr
 
 ### Q4. What is the 100 MB release test scope and larger-file support status?
 
-V4 readers remain compatible with historical 48 MiB parts, but newly written chunked parts are now capped at 8 MiB after a real GitHub REST 100 MB test revealed HTTP 422 with the old 48 MiB upload. A Windows disk-backed Node V4 harness passed encrypted Force Push, no-op, staged interruption/retry and SHA-256 verification against real GitHub. This is not yet a native Obsidian Desktop app acceptance result; new 8–50 MiB uploads use chunked parts and old single blobs remain readable. Native Obsidian Desktop and pack uploads remain separate qualification gates.
+V4 readers remain compatible with historical 48 MiB parts, but newly written chunked parts are now capped at 8 MiB after a real GitHub REST 100 MB test revealed HTTP 422 with the old 48 MiB upload. A Windows disk-backed Node V4 harness passed encrypted Force Push, no-op, staged interruption/retry and SHA-256 verification against real GitHub. This is not yet a native Obsidian Desktop app acceptance result; new 8–50 MiB uploads use chunked parts and old single blobs remain readable. New encrypted pack writes are also capped at 8 MiB per packed Git blob and passed an offline 96-file encode/decode test. Credentialed GitHub pack uploads and native Obsidian Desktop remain separate qualification gates.
 
 Since 2026-10-18, **all current and future generated-file, virtual-stream, soak and physical large-file tests are capped at 100 MB (100,000,000 bytes)**. Earlier oversized experiments remain in Git history only; they are not active test commands or physical-device support evidence. Public support claims depend on recorded evidence in `tests/baselines/v4/`:
 

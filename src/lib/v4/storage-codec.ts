@@ -22,6 +22,15 @@ const V4_CHUNK_READ_CONCURRENCY = 4
 const V4_PACK_PREFIX_BYTES = utf8ToBytes('{"version":1,"entries":{').byteLength
 const V4_PACK_SUFFIX_BYTES = utf8ToBytes('}}').byteLength
 
+function assertRestSafeNewV4Pack(archiveBytes: number): void {
+  if (!Number.isSafeInteger(archiveBytes) || archiveBytes < 0) {
+    throw new RangeError("V4 pack archive is too large.")
+  }
+  if (archiveBytes + V4_ENCRYPTED_PAYLOAD_OVERHEAD_BYTES > V4_GITHUB_REST_SAFE_WRITER_BYTES) {
+    throw new RangeError("V4 pack exceeds GitHub REST-safe 8 MiB encrypted blob limit.")
+  }
+}
+
 function expectedV4PackArchiveBytes(records: readonly V4FileRecord[]): number {
   let total = V4_PACK_PREFIX_BYTES + V4_PACK_SUFFIX_BYTES
   for (let index = 0; index < records.length; index++) {
@@ -312,7 +321,7 @@ export class V4StorageCodec {
       return { entry, index, expectedSize, key, encodedBytes }
     })
     const archiveBytes = layouts.reduce((sum, layout) => sum + (layout.index > 0 ? 1 : 0) + layout.key.byteLength + 2 + layout.encodedBytes + 1, prefix.byteLength + suffix.byteLength)
-    if (!Number.isSafeInteger(archiveBytes)) throw new RangeError("V4 pack archive is too large.")
+    assertRestSafeNewV4Pack(archiveBytes)
     const archive = new Uint8Array(archiveBytes)
     let archiveOffset = 0
     const writeBytes = (bytes: Uint8Array): void => { archive.set(bytes, archiveOffset); archiveOffset += bytes.byteLength }
@@ -361,6 +370,7 @@ export class V4StorageCodec {
     if (archiveOffset !== archive.byteLength) throw new Error("V4 pack archive length mismatch.")
 
     const remotePath = await this.crypto(() => opaqueV4PackPath(this.options.keyring!.pathKey, packId))
+    assertRestSafeNewV4Pack(archive.byteLength)
     const bytes = await this.crypto(() => encryptV4Payload(this.options.keyring!.contentKey, archive, { kind: "pack", aad: packId }))
     return {
       records: records.map(record => ({ ...record, storage: "pack", remotePath, encryptedPath: remotePath, packId, partPaths: undefined })),
@@ -376,10 +386,17 @@ export class V4StorageCodec {
     if (entries.length === 0) throw new Error("Cannot create an empty V4 pack.")
     if (!/^[A-Za-z0-9_-]+$/u.test(packId)) throw new Error("Unsafe V4 pack id.")
     const remotePath = await this.crypto(() => opaqueV4PackPath(this.options.keyring!.pathKey, packId))
+    const estimatedArchiveBytes = V4_PACK_PREFIX_BYTES + V4_PACK_SUFFIX_BYTES
+      + entries.reduce((total, entry, index) => total
+        + (index > 0 ? 1 : 0)
+        + utf8ToBytes(JSON.stringify(entry.record.fileId)).byteLength
+        + 2 + 4 * Math.ceil(entry.plaintext.byteLength / 3) + 1, 0)
+    assertRestSafeNewV4Pack(estimatedArchiveBytes)
     const archive = utf8ToBytes(JSON.stringify({
       version: 1,
       entries: Object.fromEntries(entries.map(entry => [entry.record.fileId, toBase64(entry.plaintext)])),
     }))
+    assertRestSafeNewV4Pack(archive.byteLength)
     const bytes = await this.crypto(() => encryptV4Payload(this.options.keyring!.contentKey, archive, { kind: "pack", aad: packId }))
     return {
       records: entries.map(entry => ({ ...entry.record, storage: "pack", remotePath, encryptedPath: remotePath, packId, partPaths: undefined })),

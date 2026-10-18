@@ -10,6 +10,13 @@
 - Clean frozen install, production build, fast **666/666**, repeat **10/10 rounds x 666**, recovery, resource **15/15**, feasibility, 100 MB / medium 16/32/50 MB / historical encrypted 32 MB single-blob soak **4/4**, metadata/package validation, three usual GitHub E2E compiles and the new variable-size live E2E bundle standalone compile all **exit 0**.
 - **No new credentialed GitHub 16 MB completed pull test on this SHA:** initial 16 MB live test failed due to fixture forbidding a valid <=32MiB whole write, safe branch cleanup verified; retry after fixing fixture was blocked by host safety checks. This is distinct from older successful real GitHub REST 100 MB test. Native Obsidian UI/device acceptance, hosted CI, independent review, and old-client forward-compatible rollout decision remain open. Details in `docs/engineering/v4-rest-safe-medium-writer-2026-10-18.md`.
 
+## 2026-10-18 V4 GitHub REST-safe new pack writer
+
+- Audit found a **distinct oversize-path** after single-file 8 MiB caps: `planV4PackGroups` still admitted up to 32 MiB plaintext, which could become a JSON/Base64 encrypted Git blob much larger than 8 MiB. New pack planner now caps estimated **ciphertext bytes** to 8,388,608 including AES-GCM overhead. Both streamed and buffered pack creators fail closed on oversize before source read / serializing. **Historical pack readers remain unchanged**.
+- Real offline codec regression: 96 × 512 KiB logical files (**50,331,648 bytes**, under permanent 100 MB test ceiling) grouped into REST-safe ciphertext blobs and all 96 recovered through production `readPackRecords`. Historical encrypted >8 MiB pack remains readable. Focused planner **5/5** and resource pack-stream **6/6**.
+- Working-tree build, fast **667/667**, resource **18/18**, soak **6/6**, feasibility **139/139**, repeat **10 × 667/667** and GitHub E2E compile passed. Credentialed GitHub pack API test and exact committed-SHA qualification are separate gates. Preserve `tests/v4/github-transport.test.ts` WIP, Draft PR #8, no merge/release.
+- Report: `docs/engineering/v4-rest-safe-pack-2026-10-18.md`.
+
 ## 2026-10-18 clean-SHA parallel test-runner qualification
 
 - Audit code SHA `ff8933b5d2ed22a54d2c1bceece4918676aab9cb` was pushed. Detached `.tmp/parallel-runner-clean-20261018` matched the exact SHA and remained clean.

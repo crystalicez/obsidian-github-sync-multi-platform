@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { V4_GITHUB_REST_SAFE_WRITER_BYTES } from "../../src/lib/v4/large-files";
 import test from "node:test";
 
 import {
@@ -6,6 +7,7 @@ import {
   PACK_MAX_FILES,
   PACK_MAX_PLAINTEXT_BYTES,
   PACK_MIN_CHANGED_FILES,
+  estimateV4PackGroupResources,
   planV4PackGroups,
   type V4PackCandidateMeta,
 } from "../../src/lib/v4/pack-planner";
@@ -14,6 +16,23 @@ function candidate(index: number, options: { folder?: string; size?: number } = 
   const folder = options.folder ?? "Folder";
   return { fileId: `f${index}`, path: `${folder}/${index}.md`, size: options.size ?? 16 };
 }
+
+test("pack planner splits large groups before new GitHub REST encrypted blob would exceed 8 MiB", () => {
+  const candidates = Array.from({ length: 96 }, (_, index) =>
+    candidate(index, { size: 512 * 1024 }));
+  const groups = planV4PackGroups(candidates, {
+    maxPlaintextBytes: PACK_MAX_PLAINTEXT_BYTES,
+    maxTransportTransientBytes: 256 * 1024 * 1024,
+    maxResidentBytes: 256 * 1024 * 1024,
+  });
+  assert.ok(groups.length >= 6, "Large pack groups must be split on the physical REST blob boundary");
+  assert.deepEqual(groups.flat(), candidates, "Every eligible file is published exactly once");
+  for (const group of groups) {
+    const budget = estimateV4PackGroupResources(group);
+    assert.ok(budget.ciphertextBytes <= V4_GITHUB_REST_SAFE_WRITER_BYTES,
+      `Pack encrypted bytes ${budget.ciphertextBytes} exceed 8 MiB`);
+  }
+});
 
 test("pack planner freezes the current V4 pack thresholds", () => {
   assert.equal(PACK_MIN_CHANGED_FILES, 64);
@@ -41,13 +60,14 @@ test("pack planner preserves folder grouping, order, max files, and plaintext by
   ];
   const groups = planV4PackGroups(candidates);
 
-  assert.equal(groups[0].length, 500);
-  assert.equal(groups[1].length, 1);
-  assert.equal(groups[2].length, 64);
-  assert.equal(groups[3].length, 1);
+  assert.ok(groups[0].length > 0 && groups[0].length < 500);
+  assert.ok(groups.length >= 3);
+  assert.deepEqual(groups.flat(), candidates, "Each eligible file appears in order exactly once");
+  assert.ok(groups.every(group => group.length <= PACK_MAX_FILES));
+  assert.ok(groups.every(group => estimateV4PackGroupResources(group).ciphertextBytes <= V4_GITHUB_REST_SAFE_WRITER_BYTES));
   assert.equal(groups[0][0].fileId, "f0");
-  assert.equal(groups[1][0].fileId, "f500");
-  assert.equal(groups[2][0].fileId, "f501");
+  assert.ok(groups.some(group => group[0].fileId === "f501"));
+  assert.equal(groups.flat().at(-1)?.fileId, "f565");
   assert.ok(groups.every(group => new Set(group.map(item => item.path.split("/").slice(0, -1).join("/"))).size === 1));
   assert.ok(groups.every(group => group.reduce((sum, item) => sum + item.size, 0) <= PACK_MAX_PLAINTEXT_BYTES));
 });
