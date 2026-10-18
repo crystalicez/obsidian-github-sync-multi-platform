@@ -4,6 +4,14 @@
 >
 > **Mandatory workflow rule:** Every AI session that makes a material change to code, tests, design decisions, branch/PR state, verification status, or next steps MUST update this file before ending or handing work off. GitHub is the source of truth.
 
+## 2026-10-18 comprehensive production audit, confirmed GitHub 403 bug, and native UI rerun
+
+- Independently revisited V4 sync/upload/download/recovery, 8 MiB REST-safe parts/packs, legacy read compatibility, encrypted metadata, GitHub request scheduler/ref publication, platform I/O, keyring, Settings, Files read-only sidebar, Commit/History/Conflict/Force dialogs, CI/release and test infra. **Verdict: NOT production-ready.** Detailed prioritized audit: `docs/engineering/comprehensive-production-audit-2026-10-18.md`.
+- **RED/GREEN defect:** `github-api.ts` treated a normal GitHub `403 Forbidden` with nonzero quota + `x-ratelimit-reset` as a rate-limit condition, retrying three times instead of failing permission errors immediately. Fixed to require true rate-limit evidence; secondary throttle with nonzero quota uses fallback rather than irrelevant primary-reset header. New `tests/v4/github-403-rate-classification.test.ts` **3/3** passes; source documentation: GitHub REST rate-limit guide.
+- Working-tree post-fix `test:repeat` **10 × 670/670**, resource **18/18**, recovery **50/50** all exit 0; pre-fix full build, feasibility **139/139**, soak **6/6**, GitHub E2E compile, package/metadata checks all passed. New isolated Windows Obsidian native screenshot test (fresh synthetic vault/profile, **no credentials**) exited 0: **111 UI checks**, 0 JS exceptions, 375px Settings popout warning (only 175px content). UI screenshot runner safety tests **8/8**.
+- GitHub connector confirms PR #8 remains **open Draft, unmerged**. No hosted Actions job success for current SHA established; connector's workflow-run search returns PR-event runs only. Current version historical native Obsidian 100 MB proof remains **pending**; old client forward compatibility when writing 8–50 MiB chunked, mobile physical qualification and GitHub real pack current SHA remain open. No 5GB tests.
+- User WIP `tests/v4/github-transport.test.ts` deliberately untouched/unstaged. No merge, release, live GitHub mutation, credential logging, or user-vault access. A final clean exact-code-SHA regression run remains necessary after the audit fix is committed.
+
 ## 2026-10-18 clean code-SHA verification for medium REST-safe writer
 
 - Audit code SHA `f8e2f724af11774a223952262b2b7d803a9be273` is pushed. Detached clean checkout `.tmp/rest-medium-clean-20261018` HEAD matches that exact hash and remained pristine (`## HEAD (no branch)`) after qualification. The original `tests/v4/github-transport.test.ts` remains unstaged only in the main workspace.

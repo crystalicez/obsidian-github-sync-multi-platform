@@ -40,6 +40,12 @@ export function resolveV4RateLimitDelay(
   const retryAfter = Number(headers["retry-after"])
   if (Number.isFinite(retryAfter) && retryAfter >= 0) return Math.min(policy.maxSecondaryCooldownMs, retryAfter * 1_000)
   const reset = Number(headers["x-ratelimit-reset"])
+  // A secondary limit with remaining quota must use Retry-After or the bounded fallback.
+  // The primary-reset timestamp is not evidence that the primary quota is exhausted.
+  if (headers["x-ratelimit-remaining"] !== undefined && headers["x-ratelimit-remaining"] !== "0") {
+    const fallback = policy.secondaryLimitFallbackMs * 2 ** Math.max(0, attempt - 1)
+    return Math.min(policy.maxSecondaryCooldownMs, fallback)
+  }
   if (Number.isFinite(reset) && reset > 0) return Math.min(policy.maxSecondaryCooldownMs, Math.max(0, reset * 1_000 - nowMs))
   const fallback = policy.secondaryLimitFallbackMs * 2 ** Math.max(0, attempt - 1)
   return Math.min(policy.maxSecondaryCooldownMs, fallback)

@@ -143,7 +143,7 @@ export class GitHubClient {
       const responseHeaders = Object.fromEntries(Object.entries(response.headers ?? {}).map(([key, value]) => [key.toLowerCase(), value]));
       const rateLimited = response.status === 429 || (response.status === 403 && (
         responseHeaders["retry-after"] !== undefined
-        || responseHeaders["x-ratelimit-reset"] !== undefined
+        || /(?:secondary|primary)\s+rate\s+limit|rate\s+limit\s+exceeded|abuse\s+detection/iu.test(response.text ?? "")
         || responseHeaders["x-ratelimit-remaining"] === "0"
       ));
       if (rateLimited) {

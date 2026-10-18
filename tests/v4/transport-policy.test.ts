@@ -20,6 +20,11 @@ test("rate-limit delay honors retry-after reset and the documented one-minute fa
   assert.equal(resolveV4RateLimitDelay({ status: 403, headers: { "x-ratelimit-reset": "20" } }, 1, 10_000), 10_000)
   assert.equal(resolveV4RateLimitDelay({ status: 403, headers: { "x-ratelimit-reset": "9999999999" } }, 1, 10_000), DEFAULT_V4_TRANSPORT_POLICY.maxSecondaryCooldownMs)
   assert.equal(resolveV4RateLimitDelay({ status: 403, headers: {} }, 1, 10_000), 60_000)
+  // A normal nonzero primary quota with secondary throttle must not wait
+  // until the unrelated primary-reset timestamp in the far future.
+  assert.equal(resolveV4RateLimitDelay({
+    status: 403, headers: { "x-ratelimit-remaining": "4800", "x-ratelimit-reset": "2000000000" },
+  }, 1, 10_000), 60_000)
   assert.equal(resolveV4RateLimitDelay({ status: 500 }, 1, 10_000), null)
 })
 
