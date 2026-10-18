@@ -66,7 +66,7 @@ app.plugins.plugins["encrypted-github-sync-multi-platform"].githubClient.transpo
 ```
 
 5. Record process peak memory using Windows Task Manager / Resource Monitor or a repeatable profiler. Record the measurement method; do not mix RSS/private-working-set/JS-heap labels.
-6. Record the writer part count and part size observed in the disposable repository. The 100 MB case crosses the 50 MiB chunk threshold; the **observed** part count, not a modeled value, is qualification evidence.
+6. Record the writer part count and part size observed in the disposable repository. The newly written chunked part ceiling is **8 MiB** (historical 48 MiB parts remain readable). The 100 MB case crosses the 50 MiB chunk threshold; the **observed** part count, not a modeled value, is qualification evidence.
 
 ### 3. No-op sync
 

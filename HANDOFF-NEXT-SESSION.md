@@ -4,6 +4,14 @@
 >
 > **Mandatory workflow rule:** Every AI session that makes a material change to code, tests, design decisions, branch/PR state, verification status, or next steps MUST update this file before ending or handing work off. GitHub is the source of truth.
 
+## 2026-10-18 real encrypted GitHub REST 100 MB and empirically safer writer
+
+- **Actual GitHub E2E now passed:** Windows disk-backed synthetic source/target vaults on the production `V4SyncSession`, encrypted real GitHub REST Force Push → No-op → injected staged append interruption with no final target → clean Force Pull retry → full SHA-256 equality for **100,000,000 bytes**. SHA-256 `f079cad53add0091ed5d0409b0469f9f5cb745b8c280be685dda73203dea90e8`.
+- Initial 48 MiB new chunked writer **failed real GitHub REST `POST /git/blobs` HTTP 422** (input too large). E2E-specific 8 MiB size passed, then production `selectV4WriterPartBytes` was updated to cap **new chunked parts at 8 MiB**, keeping the 48 MiB legacy reader/descriptor size. The E2E-specific workaround was removed and the full live scenario **passed again with production default 8 MiB**, 1/1 in ~103 seconds. Branch `obsidian-sync-e2e/local-100mb-20261018-932df8e` was **confirmed deleted** by safe cleanup after each test; default branch and source repository were untouched. Unreachable Git blobs are not guaranteed garbage-collected.
+- A new purpose-built opt-in runner `scripts/run-windows-100mb-github.mjs` enforces a pinned numeric repository identity, a new namespaced branch, and cleanup. The offline disk-backed V4 100 MB encrypted soak also passes both normal and failure-recovery paths. Full evidence and limitations: `docs/engineering/real-github-100mb-rest-e2e-2026-10-18.md`; baseline separates live Node/REST evidence from **pending native Obsidian Desktop** physical qualification.
+- **Compatibility decision intentionally NOT made:** old clients require chunked records to exceed the legacy 50 MiB threshold. Files/packs **below 50 MiB** still use old single/pack upload paths, which may have API input-size issues; changing their representation without coordinating protocol compatibility could break old clients. Keep as explicit production risk for maintainer decision, not an implied 1–100 MB acceptance claim.
+- Current work is on audit working tree **before a frozen new code SHA**. Preserve original unstaged `tests/v4/github-transport.test.ts`, run deterministic exact-SHA gates after code commit, keep PR #8 Draft; no merge or release.
+
 ## 2026-10-18 clean code-SHA 100 MB qualification
 
 - Code/test SHA `932df8e20a773fc59138808badb870de63542218` was pushed on the audit branch. Independent detached `.tmp/permanent-100mb-clean-20261018` had exact `git rev-parse HEAD` and pristine `## HEAD (no branch)` status **after** validation.

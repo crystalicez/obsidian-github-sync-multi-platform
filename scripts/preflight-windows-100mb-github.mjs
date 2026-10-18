@@ -17,6 +17,14 @@ try {
     if (!/^[1-9][0-9]*$/u.test(value)) throw new Error("Expected numeric pinned test repository ID");
     loaded.env.GITHUB_E2E_EXPECTED_REPO_ID = value;
   }
+  const branchFlag = process.argv.slice(2).find(arg => arg.startsWith("--branch="));
+  if (branchFlag) {
+    const candidate = branchFlag.slice("--branch=".length);
+    if (!/^obsidian-sync-e2e\/local-[a-z0-9-]{8,80}$/u.test(candidate)) {
+      throw new Error("Explicit branch must be a namespaced disposable local branch");
+    }
+    loaded.env.GITHUB_E2E_BRANCH = candidate;
+  }
   const cfg = requireGitHubE2EConfig(loaded.env, { currentSourceRepo: source });
   if (!cfg.branch.startsWith("obsidian-sync-e2e/local-")) {
     throw new Error("Test branch must be within obsidian-sync-e2e/local-");

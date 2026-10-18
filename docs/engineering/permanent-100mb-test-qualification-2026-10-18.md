@@ -20,6 +20,10 @@ The read-only GitHub E2E preflight **failed closed**. The configured environment
 
 **Blocker:** independently verify an owned disposable GitHub target by pinned numeric repository ID, a fresh namespaced test branch and restricted credentials, then implement/qualify a real file-backed 100 MB Obsidian V4 round trip. The current `MemoryVault` E2E fixture has no large-file bounded read/staging interface and cannot be substituted for the physical 100 MB test. Ask for target authorization if the correct branch / repository identity cannot be proven. Hosted CI and physical Android/mobile acceptance remain separate gates.
 
+## New real GitHub 100 MB evidence (later on 2026-10-18)
+
+This report's earlier statement that the live test was pending has been superseded by `docs/engineering/real-github-100mb-rest-e2e-2026-10-18.md`: real GitHub REST encrypted 100 MB Node/disk-backed V4 round-trip and staged interruption recovery passed, with disposable branch cleanup verified. It does **not** make the native Obsidian Desktop app gate pass.
+
 ## Independent clean exact-code-SHA qualification
 
 Pushed code commit: `932df8e20a773fc59138808badb870de63542218`. A separate detached checkout at `.tmp/permanent-100mb-clean-20261018` reported `git rev-parse HEAD` equal to that SHA and `git status --short --branch` equal to `## HEAD (no branch)` **after** running tests. The original main checkout's unstaged user WIP is not part of this SHA.

@@ -39,7 +39,7 @@ test("resource regression keeps threshold-1 threshold threshold+1 and 100 MB pre
 
 test("resource regression bounds writer object memory independently of 100 MB logical size", () => {
   const selected = selectV4WriterPartBytes({ logicalBytes: 100_000_000, maxTransportTransientBytes: DEFAULT_V4_RESOURCE_LIMITS.maxTransportTransientBytes })
-  assert.equal(selected, V4_PART_BYTES)
+  assert.equal(selected, 8 * MiB)
   const transient = estimateV4GitBlobTransportBytes(selected + 33)
   assert.ok(transient <= DEFAULT_V4_RESOURCE_LIMITS.maxTransportTransientBytes)
   assert.ok(selected <= DEFAULT_V4_RESOURCE_LIMITS.maxResidentBytes)

@@ -33,7 +33,7 @@ V4 会检测真正的三方冲突，不再采用旧版 FAQ 中描述的“409 �
 
 ### Q4. 当前版本的 100 MB 文件测试范围，以及更大文件的支持状态？
 
-V4 远端格式在超过 50 MiB 时使用分片；当前兼容读取必须接受历史 48 MiB 分片。桌面端实现了有界读取、分阶段写入和最终校验提交，自动化测试还覆盖 512 MiB 虚拟路径以及独立的 2/5 GiB cryptographic soak harness。
+V4 格式保留对旧版 48 MiB 分片的读取兼容性。2026-10-18 的真实 GitHub REST 100 MB 测试表明，旧版 48 MiB 上传请求会收到 HTTP 422；新版大文件分片 writer 已限制为 8 MiB 并完成真实加密上传、no-op、分阶段恢复下载及 SHA-256 验证。小于 50 MiB 的单对象路径与批量 pack 仍须单独验证。
 
 从 2026-10-18 起，所有新执行的文件大小测试（包括虚拟流、soak 和实机测试）永久限制为 **100 MB（100,000,000 字节）**。早期超大文件实验仅留在 Git 历史中，不再作为当前测试命令或设备支持证据。公开支持结论必须来自 `tests/baselines/v4/` 中记录的实机测试：
 
@@ -75,16 +75,16 @@ If the user changes a local target while network work is in flight, the final pr
 
 ### Q4. What is the 100 MB release test scope and larger-file support status?
 
-The V4 remote format uses parts above 50 MiB and readers remain compatible with historical 48 MiB parts. Desktop code has bounded reads, staged writes, and verified final commit/rollback. The official Windows Task 15 automated gate and the separate 2/5 GiB cryptographic soak are recorded as passed.
+V4 readers remain compatible with historical 48 MiB parts, but newly written chunked parts are now capped at 8 MiB after a real GitHub REST 100 MB test revealed HTTP 422 with the old 48 MiB upload. A Windows disk-backed Node V4 harness passed encrypted Force Push, no-op, staged interruption/retry and SHA-256 verification against real GitHub. This is not yet a native Obsidian Desktop app acceptance result; smaller single-object and pack uploads remain a separate risk to qualify.
 
 Since 2026-10-18, **all current and future generated-file, virtual-stream, soak and physical large-file tests are capped at 100 MB (100,000,000 bytes)**. Earlier oversized experiments remain in Git history only; they are not active test commands or physical-device support evidence. Public support claims depend on recorded evidence in `tests/baselines/v4/`:
 
 - **Windows 100 MB**: pending a recorded real-device encrypted Force Push → no-op → clean-vault Force Pull → SHA-256 equality and recovery run. This release makes no physical-file support claim above 100 MB.
-- **Android 5 GiB**: the current supported implementation lacks bounded local read and bounded final stage-commit capability, so large mobile paths are capability-gated and classified `platform-capability-fail`.
+- **Android large files**: the current implementation lacks a proven bounded local read and atomic final stage-commit path; large mobile files remain capability-gated and are not certified by Windows evidence.
 
 ### Q5. Is repeated 5 GiB encrypted sync operationally suitable on GitHub Free?
 
-Technical completion and operational suitability are separate. With the current 48 MiB model, one 5 GiB revision is 107 data parts and about 114 modeled content/publication mutations, with a minimum 113-second one-second mutation-pacing floor before network, crypto, retries, or disk I/O. Repository growth is the stronger limitation: two full encrypted 5 GiB revisions already model slightly above GitHub's current 10 GB repository-size recommendation.
+Technical completion and operational suitability are separate. With the historical 48 MiB model, one 5 GiB revision is 107 data parts and about 114 modeled content/publication mutations, with a minimum 113-second one-second mutation-pacing floor before network, crypto, retries, or disk I/O. Repository growth is the stronger limitation: two full encrypted 5 GiB revisions already model slightly above GitHub's current 10 GB repository-size recommendation.
 
 The 5 GiB operational model is historical research, not a physical qualification requirement for this release. Without a real disposable-repository measurement, no 5 GiB release classification is justified; the model label `technical-pass-operational-limited` is not a physical support claim.
 

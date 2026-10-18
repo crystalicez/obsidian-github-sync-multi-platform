@@ -3,7 +3,7 @@ import { createHash } from "node:crypto"
 import test from "node:test"
 
 import { createV4IncrementalSha256 } from "../../src/lib/v4/incremental-hash"
-import { V4_PART_BYTES } from "../../src/lib/v4/large-files"
+import { V4_GITHUB_REST_SAFE_WRITER_BYTES } from "../../src/lib/v4/part-write-policy"
 
 const MiB = 1024 * 1024
 const MAX_TEST_BYTES = 100_000_000
@@ -41,7 +41,7 @@ async function hashGeneratedStream(logicalBytes: number, chunkBytes: number) {
     digest: v4.digestHex(),
     referenceDigest: node.digest("hex"),
     peakRssDelta: Math.max(0, peakRss - baselineRss),
-    partCount: Math.ceil(logicalBytes / V4_PART_BYTES),
+    partCount: Math.ceil(logicalBytes / V4_GITHUB_REST_SAFE_WRITER_BYTES),
   }
 }
 
@@ -52,7 +52,7 @@ for (const logicalBytes of sizesFromEnvironment()) {
     const result = await hashGeneratedStream(logicalBytes, chunkBytes)
     assert.equal(result.processed, logicalBytes)
     assert.equal(result.digest, result.referenceDigest)
-    assert.equal(result.partCount, Math.ceil(logicalBytes / V4_PART_BYTES))
+    assert.equal(result.partCount, Math.ceil(logicalBytes / V4_GITHUB_REST_SAFE_WRITER_BYTES))
     const allowedRssDelta = Number(process.env.V4_SOAK_MAX_RSS_DELTA ?? 512 * MiB)
     assert.ok(result.peakRssDelta <= allowedRssDelta, `RSS delta ${result.peakRssDelta} exceeded ${allowedRssDelta}`)
     console.log(JSON.stringify({ logicalBytes, chunkBytes, ...result }))

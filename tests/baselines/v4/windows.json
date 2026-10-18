@@ -50,6 +50,24 @@
     "partCount": null,
     "controlledRecovery": "pending"
   },
+  "liveGitHub100MBHarness": {
+    "status": "pass",
+    "classification": "windows-node-v4-disk-backed-real-github-rest-not-native-obsidian",
+    "logicalBytes": 100000000,
+    "writerPartBytes": 8388608,
+    "sourceSha256": "f079cad53add0091ed5d0409b0469f9f5cb745b8c280be685dda73203dea90e8",
+    "pulledSha256": "f079cad53add0091ed5d0409b0469f9f5cb745b8c280be685dda73203dea90e8",
+    "encryptedForcePush": "pass",
+    "noopPreservedHead": true,
+    "controlledStagedAppendInterruption": "pass",
+    "forcePullRecovery": "pass",
+    "disposableBranchCleanup": "verified",
+    "scenarioElapsedMs": 103278,
+    "sourceCodeQualification": "audit-working-tree-before-code-commit",
+    "nativeObsidianDesktop": "pending",
+    "peakMemoryBytes": null,
+    "transportRequestMetrics": null
+  },
   "performance": {
     "unchanged10kMs": null,
     "oneFileChangeMs": null,
