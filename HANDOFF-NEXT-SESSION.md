@@ -4,6 +4,13 @@
 >
 > **Mandatory workflow rule:** Every AI session that makes a material change to code, tests, design decisions, branch/PR state, verification status, or next steps MUST update this file before ending or handing work off. GitHub is the source of truth.
 
+## 2026-10-18 final clean-SHA gate for approved live GitHub E2E
+
+- Code/test/record commit **`acef6d76daed90c7767a05783de2d0fe137fffca`** was pushed to `audit/2026-09-26-production-hardening` after successful GitHub live tests. Detached independent checkout `.tmp/live-e2e-acef6d7-clean` matched this exact SHA and remained `## HEAD (no branch)` (no modified tracked files).
+- In this clean checkout, `pnpm install --frozen-lockfile`, production build, **10 consecutive fast rounds × 680/680**, recovery **55/55**, resource **18/18**, feasibility **139/139**, soak **6/6** with max **100,000,000 bytes**, standard three-bundle GitHub E2E compile, metadata validation and package validation all exited **0**. The clean checkout contains the new live 96-file pack regression and corrected 16/32/50/100 MB variable-size assertions. These are offline/code-SHA checks, separate from the earlier user-approved credentialed GitHub runs.
+- Actual GitHub results recorded immediately below: standard multi-device/copy/race **6/6**, encrypted 96-file packed (50,331,648 bytes) **1/1**, encrypted 16,000,000-byte disk roundtrip **1/1**, encrypted 100,000,000-byte disk stage-failure recovery **1/1**. Every branch `...a` through `...f` was subsequently checked absent using read-only pinned-target repo ID **1284153873** preflight. No plugin source repository, default branch or personal vault was mutated.
+- Remaining release work: actual native Obsidian Windows acceptance at 100 MB, Android/iOS physical smoke, Git tree semantic integrity proof, network buffering/memory bound, hosted exact-SHA CI and independent review. No merge or release. User WIP `tests/v4/github-transport.test.ts` excluded from all staged commits and clean checkout.
+
 ## 2026-10-18 user-approved live GitHub REST E2E, pinned disposable target
 
 - **Authorization and memory:** Maintainer explicitly authorized full **live testing against disposable repository numeric ID `1284153873`** and explicitly requires this **real repository's `HANDOFF-NEXT-SESSION.md`** as the canonical session memory. Continue to preflight repository ID, source-repository mismatch, default branch, and unique `obsidian-sync-e2e/local-*` branch before writes; verify post-run deletion. Never mutate the source/default branch or personal vault. All generated test file sizes stay **<= 100,000,000 decimal bytes**. No release/merge authorization.
