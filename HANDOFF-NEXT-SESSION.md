@@ -4,6 +4,12 @@
 >
 > **Mandatory workflow rule:** Every AI session that makes a material change to code, tests, design decisions, branch/PR state, verification status, or next steps MUST update this file before ending or handing work off. GitHub is the source of truth.
 
+## 2026-10-18 comprehensive production audit clean-SHA qualification
+
+- Audit code/test `642ecaacb469e01fac10ef57e19fb41d0c0bcda9` is pushed to audit branch, **detached independent** `.tmp/full-audit-clean-20261018` exactly at that SHA remained clean (`## HEAD (no branch)`).
+- Frozen install, build, **repeat 10 × fast 670/670**, resource **18/18**, soak **6/6**, recovery **50/50**, feasibility **139/139**, GitHub E2E three-bundle compile, metadata and package validation all exited 0. This corroborates new 403 rights-vs-rate regression, but **no live credentialed GitHub mutation** took place during the audit.
+- Source-guided risk-ranked report: `docs/engineering/comprehensive-production-audit-2026-10-18.md` (ten findings, including live/devices/CI/old-client capability gates). Unrelated WIP `tests/v4/github-transport.test.ts` remains uncommitted and excluded; Draft PR #8 not merged. 100 MB permanent test ceiling unchanged.
+
 ## 2026-10-18 comprehensive production audit, confirmed GitHub 403 bug, and native UI rerun
 
 - Independently revisited V4 sync/upload/download/recovery, 8 MiB REST-safe parts/packs, legacy read compatibility, encrypted metadata, GitHub request scheduler/ref publication, platform I/O, keyring, Settings, Files read-only sidebar, Commit/History/Conflict/Force dialogs, CI/release and test infra. **Verdict: NOT production-ready.** Detailed prioritized audit: `docs/engineering/comprehensive-production-audit-2026-10-18.md`.

@@ -111,7 +111,27 @@ Evidence codes: **X** = actually executed in this audit; **S** = static runtime 
 | Hosted CI | **NO VERIFIED RUN for review SHA** | The PR-event-only connector cannot establish status of push runs |
 | Current SHA native 100 MB / live pack / Android | **NOT EXECUTED** | Explicit release blockers |
 
-After fixing 403 classification, `pnpm test:repeat` completed **10 consecutive fast rounds of 670/670**, alongside resource and recovery. These working-tree results include the original user WIP and are **not** the final clean exact-SHA proof. The final clean-SHA receipt belongs in a separately committed documentation follow-up.
+After fixing 403 classification, `pnpm test:repeat` completed **10 consecutive fast rounds of 670/670**, alongside resource and recovery. These working-tree results include the original user WIP and are **not** the final clean exact-SHA proof. Clean exact-SHA verification is recorded immediately below. Its documentation follow-up changes only audit text, not the tested production code.
+
+## Independent exact-code-SHA post-fix qualification
+
+**Audited code/test SHA:** `642ecaacb469e01fac10ef57e19fb41d0c0bcda9`, already pushed to `origin/audit/2026-09-26-production-hardening`. The detached Windows worktree `.tmp/full-audit-clean-20261018` was independently checked out at precisely this SHA. `git status --short --branch` after all test processes exited was exactly `## HEAD (no branch)`: **no tracked changes and no untracked source**. The pre-existing modified user file `tests/v4/github-transport.test.ts` lived only in the main worktree, not this test checkout.
+
+Executed from this SHA with frozen Node/pnpm project lockfile install (all **exit code 0**):
+
+| Command | Actual outcome |
+| --- | --- |
+| `pnpm install --frozen-lockfile` | PASS |
+| `pnpm build` | PASS |
+| `pnpm test:repeat` | PASS: **10 complete fast suites of 670/670 each** |
+| `pnpm test:resource` | PASS: **18/18** |
+| `pnpm test:soak` | PASS: **6/6**, no >100 MB fixtures |
+| `pnpm test:recovery` | PASS: **50/50** |
+| `pnpm test:feasibility` | PASS: **139/139** |
+| `pnpm test:github-e2e:compile` | PASS: compiled three suites, **not live** |
+| `pnpm validate:metadata` and `pnpm validate:package` | PASS |
+
+This confirms the corrected 403 classification with the exact committed code, on a clean Windows checkout. **The native 111-check screenshot run used the main Windows workspace**, not this detached checkout, and the former remains one host/runtime UI observation rather than a 642ecaa exact-SHA native-app qualification. Current audit's code/test tree is qualified deterministically; outstanding external/device review gates in AUD-01–04 and AUD-08 remain blocking.
 
 ## Product behavior checked and intentional choices
 
