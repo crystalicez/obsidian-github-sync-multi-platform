@@ -24,7 +24,24 @@ The new V4 file writer already restricts individual encrypted blob parts to an e
 
 A detached Windows worktree at audit code SHA `c7e7120` passed frozen dependency install, build, fast **667/667**, resource **18/18**, soak **6/6**, recovery **50/50**, repeat **10 × 667/667**, and standard GitHub E2E compilation. The first **concurrent** Feasibility run yielded **138/139** due to an existing *test harness bug*: `tests/feasibility/local-release.test.mjs` called asynchronous `writeFile` to simulate a tampered release asset from a **synchronous** injected hook without awaiting it, so validation raced the artificial tamper.
 
-The fixture was corrected to perform **synchronous** `writeFileSync` inside that synchronous hook. No production release validation logic was weakened. Focused release tests then passed **37/37**, and the full feasibility suite **139/139**. A separate clean exact-SHA qualification incorporating the test-only fixture correction is required before recording a fully green final commit. The original failed run is retained as evidence, not silently counted as success.
+The fixture was corrected to perform **synchronous** `writeFileSync` inside that synchronous hook. No production release validation logic was weakened. Focused release tests then passed **37/37**, and the full feasibility suite **139/139**. The clean exact-SHA qualification of the corrected follow-up commit is recorded in the next section. The original failed run is retained as evidence, not silently counted as success.
+
+## Independent clean exact-code-SHA qualification — completed
+
+The final audit code/test commit `fc414808fd94414c13c807ce306cc396681f9d8c` was pushed to `origin/audit/2026-09-26-production-hardening`. Detached Windows checkout `.tmp/rest-safe-pack-final-20261018` matched that exact SHA, and `git status --short --branch` remained `## HEAD (no branch)` after validation. Frozen `pnpm install --frozen-lockfile` succeeded.
+
+At that pinned SHA, **all** commands below exited **0**, including concurrently launched deterministic suites:
+
+- Production `pnpm build`
+- `pnpm test:repeat`: **10 consecutive fast runs of 667/667**, including the updated pack planner tests
+- `pnpm test:resource`: **18/18**, including 96-file (50,331,648 bytes total) REST-safe encrypted pack writer/decryption and historical >8 MiB pack read
+- `pnpm test:soak`: **6/6** with no generated file exceeding 100 MB
+- `pnpm test:feasibility`: **139/139**, including deterministic synchronous release-asset tamper hook
+- `pnpm test:recovery`: **50/50**
+- `pnpm test:github-e2e:compile` (three bundles, **compile only**)
+- `pnpm validate:metadata` and `pnpm validate:package`
+
+This exact-code-SHA clean checkout supersedes the first c7e7120 concurrent feasibility failure described above. **Do not claim** hosted CI, native Obsidian physical UI, credentialed GitHub *pack* upload or cross-version client rollout qualification from these local results. Existing user WIP `tests/v4/github-transport.test.ts` was excluded from both pushed code commits.
 
 ## Outstanding validation and release gating
 
