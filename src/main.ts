@@ -283,6 +283,11 @@ export default class FastSync extends Plugin {
       ...(pendingEncryptionPassphraseSecret ? [preparedSettings.encryptionPassphraseSecretId] : []),
     ]
     const supersededSecretIds = supersededV4SecretIds(previousSettings, preparedSettings)
+    const keyContextFields = [
+      "githubOwner", "githubRepo", "githubBranch", "githubToken", "githubTokenSecretId",
+      "encryptionMode", "encryptionPassphrase", "encryptionPassphraseSecretId",
+    ] as const
+    const keyContextChanged = keyContextFields.some(field => previousSettings[field] !== preparedSettings[field])
 
     this.settingsSaveInProgress = true
     try {
@@ -316,7 +321,7 @@ export default class FastSync extends Plugin {
       if (this.unloaded) return
 
       this.settings = preparedSettings
-      this.v4Runtime?.credentialsChanged()
+      this.v4Runtime?.credentialsChanged(keyContextChanged)
       this.initGitHubClient()
       this.registerScheduledSync()
       this.updateRibbonIcon(!!(this.settings.githubToken && this.settings.githubOwner && this.settings.githubRepo))

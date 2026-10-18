@@ -5,6 +5,7 @@ import { readFile } from "node:fs/promises";
 import { modalButtons, Notice, Platform, resetModalTestState, TFile } from "obsidian";
 
 import { DEFAULT_SETTINGS } from "../../src/setting";
+import FastSync from "../../src/main";
 import { assertPluginSettingsRuntimeSafe } from "../../src/lib/plugin-settings-validation";
 import type { GitHubCreateTreeEntry } from "../../src/lib/github-git-types";
 import { deriveV4Keyring } from "../../src/lib/v4/crypto";
@@ -1318,9 +1319,79 @@ test("v4 runtime keyring cache reuses one derived keyring until credential gener
   fixture.runtime.dispose()
 })
 
+test("actual settings save preserves key context for UI changes and invalidates for passphrase rotation", async () => {
+  const writes = new Map<string, string>()
+  const invocations: boolean[] = []
+  const plugin = Object.create(FastSync.prototype) as FastSync
+  let serial = 0
+  const initial = {
+    ...DEFAULT_SETTINGS,
+    githubOwner: "owner",
+    githubRepo: "repo",
+    githubToken: "token",
+    githubTokenSecretId: "token-old",
+    encryptionMode: "encrypted" as const,
+    encryptionPassphrase: "pass-old",
+    encryptionPassphraseSecretId: "pass-old-id",
+  }
+  plugin.settings = initial
+  plugin.app = { secretStorage: {
+    getSecret(id: string) { return writes.get(id) ?? null },
+    setSecret(id: string, value: string) { writes.set(id, value) },
+  } } as never
+  plugin.v4Runtime = {
+    async quiesceForSettingsChange() {},
+    credentialsChanged(changed: boolean) { invocations.push(changed) },
+    finishSettingsChange() {},
+  } as never
+  plugin.saveData = async () => {}
+  plugin.initGitHubClient = () => {}
+  plugin.registerScheduledSync = () => {}
+  plugin.updateRibbonIcon = () => {}
+  ;(plugin as unknown as { createSecretId(prefix: string): string }).createSecretId = prefix => `${prefix}-new-${++serial}`
+  await plugin.saveSettings({ ...initial, statusBarStatusEnabled: !initial.statusBarStatusEnabled })
+  assert.deepEqual(invocations, [false])
+  assert.equal(plugin.settings.encryptionPassphrase, "pass-old")
+  await plugin.saveSettings({ ...plugin.settings, encryptionPassphrase: "pass-new" })
+  assert.deepEqual(invocations, [false, true])
+  assert.equal(plugin.settings.encryptionPassphrase, "pass-new")
+  assert.equal(writes.get(plugin.settings.encryptionPassphraseSecretId), "pass-new")
+})
+
+test("unrelated settings save keeps the same derived keyring while invalidating stale settings generation", async () => {
+  const fixture = plaintextRuntimeFixture()
+  const runtime = fixture.runtime as unknown as {
+    keyringForConfig(config: V4RemoteConfig, passphrase: string): Promise<unknown>
+    credentialsChanged(keyMaterialChanged?: boolean): void
+    settingsGeneration: number
+  }
+  const config: V4RemoteConfig = {
+    formatVersion: V4_FORMAT_VERSION,
+    mode: "encrypted",
+    repoId: "o/r#main",
+    pathLayout: "opaque-stable-v1",
+    algorithm: "AES-GCM",
+    kdf: "PBKDF2-SHA-256",
+    kdfParams: { iterations: 10, salt: "c2FsdA" },
+  }
+  try {
+    const first = await runtime.keyringForConfig(config, "pass")
+    const before = runtime.settingsGeneration
+    runtime.credentialsChanged(false)
+    assert.equal(runtime.settingsGeneration, before + 1)
+    assert.equal(await runtime.keyringForConfig(config, "pass"), first,
+      "a UI-only setting must not retire and rederive unchanged encryption keys")
+    runtime.credentialsChanged(true)
+    assert.notEqual(await runtime.keyringForConfig(config, "pass"), first,
+      "credential changes must still invalidate the encryption key")
+  } finally {
+    fixture.runtime.dispose()
+  }
+})
+
 test("main settings save invalidates the runtime credential generation before future sync work", async () => {
   const source = await readFile("src/main.ts", "utf8")
-  assert.match(source, /async saveSettings\([^)]*\)[\s\S]*?v4Runtime\?\.credentialsChanged\(\)/u)
+  assert.match(source, /async saveSettings\([^)]*\)[\s\S]*?v4Runtime\?\.credentialsChanged\(keyContextChanged\)/u)
 })
 
 
@@ -1328,7 +1399,7 @@ test("settings UI quiesces an active runtime before publishing a new settings ge
   const mainSource = await readFile("src/main.ts", "utf8");
   const settingsSource = await readFile("src/setting.tsx", "utf8");
 
-  assert.match(mainSource, /async saveSettings\([^)]*nextSettings[\s\S]*?await this\.v4Runtime\?\.quiesceForSettingsChange\(\)[\s\S]*?await this\.persistSettingsData\(preparedSettings\)[\s\S]*?this\.settings\s*=\s*preparedSettings[\s\S]*?credentialsChanged\(\)[\s\S]*?initGitHubClient\(\)/u);
+  assert.match(mainSource, /async saveSettings\([^)]*nextSettings[\s\S]*?await this\.v4Runtime\?\.quiesceForSettingsChange\(\)[\s\S]*?await this\.persistSettingsData\(preparedSettings\)[\s\S]*?this\.settings\s*=\s*preparedSettings[\s\S]*?credentialsChanged\(keyContextChanged\)[\s\S]*?initGitHubClient\(\)/u);
   assert.match(settingsSource, /const nextSettings\s*=\s*JSON\.parse\(JSON\.stringify\(this\.tempSettings\)\)[\s\S]*?await this\.plugin\.saveSettings\(nextSettings\)/u);
   assert.doesNotMatch(settingsSource, /this\.plugin\.settings\s*=\s*JSON\.parse\(JSON\.stringify\(this\.tempSettings\)\)[\s\S]*?await this\.plugin\.saveSettings\(\)/u);
 });
@@ -1566,7 +1637,7 @@ test("settings save does not publish the new runtime generation before durable p
 
   assert.match(
     mainSource,
-    /async saveSettings\([^)]*nextSettings[\s\S]*?const previousSettings\s*=\s*this\.settings[\s\S]*?await this\.v4Runtime\?\.quiesceForSettingsChange\(\)[\s\S]*?await this\.persistSettingsData\(preparedSettings\)[\s\S]*?this\.settings\s*=\s*preparedSettings[\s\S]*?credentialsChanged\(\)[\s\S]*?initGitHubClient\(\)/u,
+    /async saveSettings\([^)]*nextSettings[\s\S]*?const previousSettings\s*=\s*this\.settings[\s\S]*?await this\.v4Runtime\?\.quiesceForSettingsChange\(\)[\s\S]*?await this\.persistSettingsData\(preparedSettings\)[\s\S]*?this\.settings\s*=\s*preparedSettings[\s\S]*?credentialsChanged\(keyContextChanged\)[\s\S]*?initGitHubClient\(\)/u,
   );
   assert.doesNotMatch(
     mainSource,
@@ -1666,7 +1737,7 @@ test("settings persistence holds a runtime transition gate until the new generat
 
   assert.match(
     mainSource,
-    /await this\.v4Runtime\?\.quiesceForSettingsChange\(\)[\s\S]*?try\s*\{[\s\S]*?await this\.persistSettingsData\(preparedSettings\)[\s\S]*?this\.settings\s*=\s*preparedSettings[\s\S]*?credentialsChanged\(\)[\s\S]*?\}\s*finally\s*\{[\s\S]*?finishSettingsChange/u,
+    /await this\.v4Runtime\?\.quiesceForSettingsChange\(\)[\s\S]*?try\s*\{[\s\S]*?await this\.persistSettingsData\(preparedSettings\)[\s\S]*?this\.settings\s*=\s*preparedSettings[\s\S]*?credentialsChanged\(keyContextChanged\)[\s\S]*?\}\s*finally\s*\{[\s\S]*?finishSettingsChange/u,
   );
   assert.match(runtimeSource, /private settingsTransitionActive\s*=\s*false/u);
   assert.match(runtimeSource, /quiesceForSettingsChange\(\)[\s\S]*?settingsTransitionActive\s*=\s*true[\s\S]*?cancelPending\(\)[\s\S]*?cancelActive/u);

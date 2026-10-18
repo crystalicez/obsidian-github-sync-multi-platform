@@ -141,6 +141,7 @@ export class V4PluginRuntime {
   private readonly stagingStore: V4StagingStore
   private readonly keyringCache = new V4KeyringCache()
   private credentialGeneration = 0
+  private keyringGeneration = 0
   private debounceRunActive = false
   private settingsTransitionActive = false
   private settingsTransitionSawLocalChange = false
@@ -205,10 +206,13 @@ export class V4PluginRuntime {
     if (rescan && !this.disposed) this.enqueue({ type: "rescan", mtime: Date.now() })
   }
 
-  credentialsChanged(): void {
+  credentialsChanged(keyContextChanged = true): void {
     if (this.disposed) return
     this.credentialGeneration++
-    this.keyringCache.invalidate()
+    if (keyContextChanged) {
+      this.keyringGeneration++
+      this.keyringCache.invalidate()
+    }
   }
 
   private async keyringForConfig(config: V4RemoteConfig, passphrase: string, signal?: AbortSignal): Promise<V4Keyring> {
@@ -219,7 +223,7 @@ export class V4PluginRuntime {
       salt: config.kdfParams.salt,
       iterations: config.kdfParams.iterations,
       mode: config.mode,
-      credentialGeneration: this.credentialGeneration,
+      credentialGeneration: this.keyringGeneration,
     }, async () => {
       throwIfV4Aborted(signal)
       const derived = await deriveV4Keyring({

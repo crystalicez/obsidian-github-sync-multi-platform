@@ -6,9 +6,13 @@
 **Audit starting HEAD:** `4015cde91cf7fa52ed5f53f050b7a06e4c156ae4`
 **Decision boundary:** User asks for another detailed cross-project audit, **not authorization to release, merge, upgrade all installed clients, overwrite private notes or run destructive live GitHub tests**. Unrelated modified `tests/v4/github-transport.test.ts` is expressly excluded from all staged changes. Maximum file tests: **100,000,000 decimal bytes**.
 
+## First-release policy superseding AUD-01 (2026-10-18)
+
+The maintainer confirmed that no public version of this plugin has been released. Compatibility with clients running a prior version is therefore **not a release requirement**. The current 8 MiB REST-safe writer for new 8–50 MiB objects may be used without peer capability negotiation. AUD-01 below records a historical concern that is **closed by scope decision**, not an implementation bug. Do not add downgrade negotiation or delay release merely for older-client behavior. Preserve existing old-format readers unless another verified reason justifies removing them; prerelease development data may still use them. Remaining release gates include GitHub tree integrity and live pack/medium verification, native Obsidian 100 MB, mobile, transport memory, hosted CI, and independent review.
+
 ## Verdict and evidence semantics
 
-**Not production-ready / release must stay blocked.** The major local correctness suites are green and the actual native Windows isolated Obsidian UI test passes, but current code has unresolved *cross-version data compatibility and external-operation* gates. A green mock/Node harness does **not** establish that existing older devices can sync records written with the new writer, that GitHub responds correctly for every modern pack case, or that mobile staging is safe.
+**Not production-ready / release must stay blocked.** The major local correctness suites are green and the actual native Windows isolated Obsidian UI test passes, but current code has unresolved *external-operation, data integrity, and device* gates. A green mock/Node harness does **not** establish that existing older devices can sync records written with the new writer, that GitHub responds correctly for every modern pack case, or that mobile staging is safe.
 
 Evidence codes: **X** = actually executed in this audit; **S** = static runtime trace; **H** = previously recorded exact-SHA historical proof; **U** = unverified against current runtime/remote/device. Only mark a gate passed if process exit is 0, exact worktree/code SHA matches, and the test covers its claimed environment.
 
@@ -29,12 +33,12 @@ Evidence codes: **X** = actually executed in this audit; **S** = static runtime 
 
 ## Findings — sorted by production impact
 
-### AUD-01 — P1 / cross-version sync safety: new medium chunk format breaks older readers (CONFIRMED CONTRACT RISK; release decision required)
+### AUD-01 — CLOSED / older-client compatibility excluded from first release (historical finding)
 
 - **Trace:** `src/lib/v4/large-files.ts` separates `shouldWriteV4Parts` (>8 MiB) from old `shouldUseV4Parts` (>50 MiB); `src/lib/v4/storage-codec.ts` and `remote-index.ts` now accept new medium `storage:chunked` records.
 - **Scenario:** Device A upgrades and publishes 16 MB encrypted file as 2 parts, while Device B remains on V4 release expecting chunked only above legacy 50 MiB. B may reject the valid new record and fail to sync. This is a **forward-compatibility** problem; current-code backward read compatibility is independently tested.
 - **Impact:** Cross-device sync outage, failed restores on outdated clients. Prefer fail closed over metadata reinterpretation.
-- **Action:** Require coordinated all-device upgrade **or** add explicit capability/protocol negotiation and block writing the new format until peers support it. This is a product/protocol decision; do not silently force migration.
+- **Current disposition (2026-10-18):** No plugin version has shipped, so there are no supported older installed clients. This rollout concern does not gate the first release. New 8 MiB part writes remain enabled; existing readers retain prior-format support only as a low-cost way to read prerelease artifacts. Cross-device first-release tests remain required for the current code.
 
 ### AUD-02 — P1 / remote response memory: Obsidian requestUrl buffers before application validation (UNVERIFIED RUN-TIME RESOURCE RISK)
 
@@ -147,7 +151,7 @@ This confirms the corrected 403 classification with the exact committed code, on
 
 ## Safe next steps (order)
 
-1. **Block release** until older-client capability/upgrade policy and CI/device gates are decided and validated.
+1. **Block release** until the live data-integrity, CI and physical-device gates are tested and validated. Older-client rollout coordination is not required before the first release.
 2. Retain and test the newly fixed 403 classification; add clean exact-SHA worktree proof and preserve WIP.
 3. Obtain real GitHub multi-file pack and medium chunk receipts only in verified, explicitly authorized disposable branch; confirm deletion. Current audit deliberately performed no credentialed remote writes.
 4. Native Obsidian Desktop 100 MB staged recovery and per-device Android/iOS smoke on fresh synthetic vaults. Capture memory, duration, errors and real screenshots; no private notes.
