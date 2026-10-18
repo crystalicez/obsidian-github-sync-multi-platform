@@ -4,6 +4,13 @@
 >
 > **Mandatory workflow rule:** Every AI session that makes a material change to code, tests, design decisions, branch/PR state, verification status, or next steps MUST update this file before ending or handing work off. GitHub is the source of truth.
 
+## 2026-10-18 clean code-SHA qualification and read-only GitHub preflight
+
+- **Code/test SHA:** `ac7c163aade3bab8105e61fb5f7d2185e1df70ab` was pushed on `audit/2026-09-26-production-hardening`. Detached independent `.tmp/firstrelease-keyring-clean-20261018` matched exactly and remained `## HEAD (no branch)` after qualification; the primary workspace user WIP `tests/v4/github-transport.test.ts` was not in this checkout.
+- Inside the clean checkout, `pnpm install --frozen-lockfile`, build, **10 × fast 680/680**, recovery **55/55**, resource **18/18**, feasibility **139/139**, 100 MB-capped soak **6/6**, GitHub E2E three-bundle compile, metadata and package validation all exited 0. The test runner's known parallel isolation was also exercised. No hosted CI or native Obsidian 100 MB claim follows from these Node tests.
+- A separate **read-only** remote identity preflight passed against pinned disposable GitHub repository ID `1284153873`. It confirmed readable default ref, absent namespaced candidate `obsidian-sync-e2e/local-readonly-ac7c163-20261018`, and **0 mutations**. This proves target identity and absence at the time of the read, not permission to create/delete a test branch.
+- Release remains blocked by current-client live GitHub encrypted medium/pack, native Obsidian 100 MB and physical mobile acceptance, semantic Git tree publication proof, transport memory bounds, hosted exact-SHA CI and independent review. Older-client compatibility is **not** a blocker for this never-released plugin. No release, merge or credentialed write was performed.
+
 ## 2026-10-18 first-release policy and settings keyring retention
 
 - **Maintainer decision:** This plugin has **never been released**. Do **not** treat compatibility with older installed clients or staged upgrade negotiation as a release blocker. New clients already write encrypted medium files (>8 MiB) using 8 MiB REST-safe chunks. Keep the current decoder's historical-format acceptance for now; it is useful for already-produced development data and does not require old clients to coexist. Do not gate production on cross-version capability handshakes. This decision supersedes older audit notes and handoffs, but does not waive current-code data integrity, encryption, recovery or physical device testing.
