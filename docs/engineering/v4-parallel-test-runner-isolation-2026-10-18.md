@@ -22,6 +22,12 @@ Previously `scripts/run-tests.mjs` recursively removed and recreated the single 
 - `pnpm build` exited 0, `pnpm test:resource` **15/15**, `pnpm test:soak` **6/6** (all test logical payloads at most 100 MB), `pnpm test:recovery` **50/50**, and `pnpm test:github-e2e:compile` compiled three suites without credentialed network calls.
 - No live GitHub mutations, source/default branch updates, package release or merge. The original user WIP `tests/v4/github-transport.test.ts` remains untouched and unstaged.
 
+## Clean exact-code-SHA qualification
+
+Audit commit `ff8933b5d2ed22a54d2c1bceece4918676aab9cb` was pushed to `origin/audit/2026-09-26-production-hardening`. The independent detached Windows checkout `.tmp/parallel-runner-clean-20261018` had exactly that HEAD and remained `## HEAD (no branch)` after validation. Frozen `pnpm install --frozen-lockfile` succeeded.
+
+From this exact source SHA, **simultaneously executed** `pnpm test:repeat` (10 consecutive runs, each fast **666/666**) and `pnpm test:feasibility` (**139/139**) both exited 0. Other exact-SHA gates also passed: build, resource **15/15**, soak **6/6**, recovery **50/50**, and standard GitHub E2E compilation (no credentialed remote writes). After all runners finished, read-only directory inspection returned `unremovedOutputDirectories: []`. This removes the observed shared `.tmp/tests` race for these test suites; it is **not** a hosted CI or real GitHub 16 MB acceptance claim.
+
 ## Limits
 
 This fixes local/CI test *bundle-directory interference*, not API-level rate limits, native Obsidian device acceptance, hosted CI proof, or old-client compatibility. A clean pinned new-code-SHA run remains necessary when preparing release evidence. Do not count compile-only GitHub E2E as a live transport test.

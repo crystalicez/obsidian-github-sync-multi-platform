@@ -10,6 +10,12 @@
 - Clean frozen install, production build, fast **666/666**, repeat **10/10 rounds x 666**, recovery, resource **15/15**, feasibility, 100 MB / medium 16/32/50 MB / historical encrypted 32 MB single-blob soak **4/4**, metadata/package validation, three usual GitHub E2E compiles and the new variable-size live E2E bundle standalone compile all **exit 0**.
 - **No new credentialed GitHub 16 MB completed pull test on this SHA:** initial 16 MB live test failed due to fixture forbidding a valid <=32MiB whole write, safe branch cleanup verified; retry after fixing fixture was blocked by host safety checks. This is distinct from older successful real GitHub REST 100 MB test. Native Obsidian UI/device acceptance, hosted CI, independent review, and old-client forward-compatible rollout decision remain open. Details in `docs/engineering/v4-rest-safe-medium-writer-2026-10-18.md`.
 
+## 2026-10-18 clean-SHA parallel test-runner qualification
+
+- Audit code SHA `ff8933b5d2ed22a54d2c1bceece4918676aab9cb` was pushed. Detached `.tmp/parallel-runner-clean-20261018` matched the exact SHA and remained clean.
+- Clean frozen install, build, **two simultaneous real suite runners**: `test:repeat` **10 × fast 666/666** and `test:feasibility` **139/139** (includes new concurrency regression); plus resource **15/15**, soak **6/6**, recovery **50/50** and GitHub E2E compile all passed. Cleanup check after tests: **zero orphan `.tmp/tests-*` directories**.
+- Details: `docs/engineering/v4-parallel-test-runner-isolation-2026-10-18.md`. Original user WIP `tests/v4/github-transport.test.ts` untouched/unstaged. Remain Draft PR #8; no merge/release, no live GitHub mutation. Older-client rollout and native Windows Obsidian UI remain separate unapproved/unverified gates.
+
 ## 2026-10-18 parallel V4 test-runner output race fixed
 
 - Previously `test:repeat` and `test:feasibility` could collide over shared `.tmp/tests`: real clean-SHA concurrent feasibility showed `ENOTEMPTY`, while sequential feasibility passed. Updated `scripts/run-tests.mjs` to allocate unique per-run `.tmp/tests-*` via `mkdtemp`, refuse linked `.tmp`, and perform per-run cleanup in `finally` without deleting preexisting shared bundles.
