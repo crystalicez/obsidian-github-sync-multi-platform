@@ -1,4 +1,5 @@
-import { V4_PART_BYTES } from "./large-files"
+import { V4_PART_BYTES, V4_GITHUB_REST_SAFE_WRITER_BYTES } from "./large-files"
+export { V4_GITHUB_REST_SAFE_WRITER_BYTES } from "./large-files"
 import { estimateV4GitBlobTransportBytes } from "./resource-controller"
 
 const MiB = 1024 * 1024
@@ -6,7 +7,6 @@ const MiB = 1024 * 1024
 // A 48 MiB encrypted Git blob failed with HTTP 422 on the live GitHub REST API.
 // An 8 MiB part passed the 100 MB encrypted push/pull test. Keep historic
 // 48 MiB part decoding while bounding new REST mutations independently.
-export const V4_GITHUB_REST_SAFE_WRITER_BYTES = 8 * MiB
 
 // GitHub documents a secondary content-generation ceiling around 500 mutations/hour.
 // Keep 100 operations in reserve for metadata, bootstrap, retries, and other writers.

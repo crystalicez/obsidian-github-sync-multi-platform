@@ -26,14 +26,17 @@ async function* fileChunks(fullPath: string, size: number, chunkBytes: number, s
   assert.equal(total, size, "Bounded source ended before declared size")
 }
 
-export async function generateTest100MBFile(fullPath: string): Promise<string> {
+export async function generateTestFile(fullPath: string, logicalBytes: number): Promise<string> {
+  if (!Number.isSafeInteger(logicalBytes) || logicalBytes < 1 || logicalBytes > TEST_100MB_BYTES) {
+    throw new RangeError("Test fixture may not exceed 100 MB")
+  }
   const buffer = Buffer.allocUnsafe(CHUNK_BYTES)
   for (let index = 0; index < buffer.byteLength; index++) buffer[index] = (index * 31 + 17) & 255
   const file = await open(fullPath, "wx")
   try {
     let written = 0
-    while (written < TEST_100MB_BYTES) {
-      const desired = Math.min(buffer.byteLength, TEST_100MB_BYTES - written)
+    while (written < logicalBytes) {
+      const desired = Math.min(buffer.byteLength, logicalBytes - written)
       const result = await file.write(buffer, 0, desired, written)
       assert.ok(result.bytesWritten > 0)
       written += result.bytesWritten
@@ -41,15 +44,21 @@ export async function generateTest100MBFile(fullPath: string): Promise<string> {
   } finally {
     await file.close()
   }
-  assert.equal((await stat(fullPath)).size, TEST_100MB_BYTES)
-  return hashFile100MB(fullPath)
+  assert.equal((await stat(fullPath)).size, logicalBytes)
+  return hashTestFile(fullPath, logicalBytes)
 }
 
-export async function hashFile100MB(fullPath: string): Promise<string> {
+export async function hashTestFile(fullPath: string, logicalBytes: number): Promise<string> {
+  if (!Number.isSafeInteger(logicalBytes) || logicalBytes < 1 || logicalBytes > TEST_100MB_BYTES) {
+    throw new RangeError("Test fixture may not exceed 100 MB")
+  }
   const hash = createHash("sha256")
-  for await (const bytes of fileChunks(fullPath, TEST_100MB_BYTES, CHUNK_BYTES)) hash.update(bytes)
+  for await (const bytes of fileChunks(fullPath, logicalBytes, CHUNK_BYTES)) hash.update(bytes)
   return hash.digest("hex")
 }
+
+export const generateTest100MBFile = (fullPath: string) => generateTestFile(fullPath, TEST_100MB_BYTES)
+export const hashFile100MB = (fullPath: string) => hashTestFile(fullPath, TEST_100MB_BYTES)
 
 // Only supports a single explicit payload path and private stage files in a fresh synthetic vault.
 export class TestDisk100MBVault implements V4SessionVault {
@@ -59,6 +68,7 @@ export class TestDisk100MBVault implements V4SessionVault {
   boundedReads = 0
   stagedCommits = 0
   stagedWrites = 0
+  wholeWrites = 0
   failAppendAt: number | null = null
 
   constructor(root: string) {
@@ -121,7 +131,15 @@ export class TestDisk100MBVault implements V4SessionVault {
     return this.fileSource(this.payloadPath(), file.size)
   }
 
-  async write(): Promise<void> { throw new Error("100MB pull must use bounded stage commit") }
+  async write(name: string, bytes: Uint8Array, mtime?: number): Promise<void> {
+    if (name !== this.payloadName) throw new Error("Unexpected whole-write target path")
+    if (bytes.byteLength > DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES) {
+      throw new Error("Whole-write exceeds V4 local buffer ceiling")
+    }
+    await writeFile(this.payloadPath(), bytes, { flag: "wx" })
+    if (mtime !== undefined) await utimes(this.payloadPath(), mtime / 1000, mtime / 1000)
+    this.wholeWrites++
+  }
   async trash(): Promise<void> { throw new Error("Unexpected trash in 100MB test") }
 
   staging = createV4StagingStore({

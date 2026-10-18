@@ -4,12 +4,14 @@ Originally drafted 2026-07-30; permanent maximum test size set by maintainer on 
 
 **All current and future generated-file, virtual-stream, soak, and physical large-file test workloads must be no larger than 100 MB (100,000,000 decimal bytes).** The 100 MB cap concerns tests and acceptance claims, not the production format, transport implementation, or GitHub's repository guidance.
 
+**Current V4 write rule:** newly uploaded files above **8 MiB** are split into REST-safe parts no larger than 8 MiB. The historical 50 MiB single-blob and 48 MiB part reader compatibility remains unchanged. Medium 16/32/50 MB encrypted file-backed round-trips and 100 MB encrypted staged round-trips are required regression coverage.
+
 ## Required workloads
 
 1. Unchanged 10k-file metadata scan and one changed-file scan.
 2. 1,000 small changes and each conflict policy/action path.
 3. Bounded pack batch and threshold-1 / threshold / threshold+1 content sources.
-4. Virtual 100 MB planner, chunked upload/download and incremental cryptographic soak.
+4. Writer-boundary planning (8 MiB, 16 MB, 32 MB, 50 MB, 100 MB), encrypted medium 16/32/50 MB disk-backed round trips, old 32 MB encrypted single-blob decode, chunked upload/download, and incremental 100 MB cryptographic soak.
 5. Real Windows local 100 MB generated-file SHA-256 and bounded filesystem copy.
 6. Physical Obsidian encrypted Force Push → no-op → separate clean-vault Force Pull → SHA-256 equality, including controlled recovery on an explicitly verified disposable GitHub target.
 7. Android/mobile smoke only where its bounded I/O capability is independently supported. No claim of Android 100 MB support without evidence.

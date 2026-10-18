@@ -6,7 +6,8 @@ import { throwIfV4Aborted } from "./cancellation"
 import {
   buildV4PartPaths,
   joinAndVerifyV4Parts,
-  shouldUseV4Parts,
+  shouldWriteV4Parts,
+  V4_GITHUB_REST_SAFE_WRITER_BYTES,
   splitV4Parts,
   V4_LARGE_FILE_THRESHOLD_BYTES,
 } from "./large-files"
@@ -105,8 +106,8 @@ export class V4StorageCodec {
     const pathId = await this.pathId(path)
     const stableFileId = fileId ?? pathId
     const plaintextSha256 = await this.crypto(() => sha256Hex(plaintext))
-    const predictedBytes = plaintext.byteLength + (this.options.mode === "encrypted" ? 33 : 0)
-    if (shouldUseV4Parts(plaintext.byteLength, predictedBytes)) {
+    // Writer sizing uses a separate REST-safe threshold; old reader descriptors are unchanged.
+    if (shouldWriteV4Parts(plaintext.byteLength)) {
       return this.prepareParts(path, pathId, stableFileId, plaintext, plaintextSha256, version, mtime)
     }
 
@@ -151,8 +152,8 @@ export class V4StorageCodec {
     const path = normalizeV4VaultPath(input.logicalPath)
     const pathId = await this.pathId(path)
     const fileId = input.fileId
-    const predictedBytes = input.source.size + (this.options.mode === "encrypted" ? 33 : 0)
-    const chunked = shouldUseV4Parts(input.source.size, predictedBytes)
+    // Streamed writes use the REST-safe threshold, not the historical 50 MiB reader threshold.
+    const chunked = shouldWriteV4Parts(input.source.size)
     const opaqueId = chunked && this.options.mode === "encrypted"
       ? await this.crypto(() => objectIdForV4File(this.options.keyring!.pathKey, fileId))
       : undefined
@@ -395,7 +396,7 @@ export class V4StorageCodec {
     version: string,
     mtime: number,
   ): Promise<V4PreparedRemoteWrite> {
-    const parts = splitV4Parts(plaintext)
+    const parts = splitV4Parts(plaintext, V4_GITHUB_REST_SAFE_WRITER_BYTES)
     const opaqueId = this.options.mode === "encrypted"
       ? await this.crypto(() => objectIdForV4File(this.options.keyring!.pathKey, fileId))
       : undefined

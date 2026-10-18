@@ -18,7 +18,7 @@ This FAQ describes the current V4 implementation. Qualification status for very 
 
 不是。计划器按逻辑文件身份、路径和内容哈希判断变化；未变文件复用现有远端记录。内容保持不变的重命名可以复用已有加密对象/分片，不重新上传文件内容。
 
-但这不等于“文件内部增量/差分上传”。当一个大文件的内容发生变化时，当前 V4 会生成新的完整 `remoteVersion`；超过 50 MiB 的远端内容使用有序分片。当前协议没有 changed-part/delta sync，因此修改一个 5 GiB 加密文件可能产生接近一整个新 5 GiB 修订的数据增长。
+但这不等于“文件内部增量/差分上传”。当一个大文件的内容发生变化时，当前 V4 会生成新的完整 `remoteVersion`；新写入的超过 8 MiB 的文件使用每片不超过 8 MiB 的有序分片；旧版 50 MiB 门槛的单对象和 48 MiB 分片仍可读取。当前协议没有 changed-part/delta sync，因此修改一个 5 GiB 加密文件可能产生接近一整个新 5 GiB 修订的数据增长。
 
 ### Q3. 多设备同时修改同一文件时怎么处理？
 
@@ -33,7 +33,7 @@ V4 会检测真正的三方冲突，不再采用旧版 FAQ 中描述的“409 �
 
 ### Q4. 当前版本的 100 MB 文件测试范围，以及更大文件的支持状态？
 
-V4 格式保留对旧版 48 MiB 分片的读取兼容性。2026-10-18 的真实 GitHub REST 100 MB 测试表明，旧版 48 MiB 上传请求会收到 HTTP 422；新版大文件分片 writer 已限制为 8 MiB 并完成真实加密上传、no-op、分阶段恢复下载及 SHA-256 验证。小于 50 MiB 的单对象路径与批量 pack 仍须单独验证。
+V4 格式保留对旧版 48 MiB 分片的读取兼容性。2026-10-18 的真实 GitHub REST 100 MB 测试表明，旧版 48 MiB 上传请求会收到 HTTP 422；新版大文件分片 writer 已限制为 8 MiB 并完成真实加密上传、no-op、分阶段恢复下载及 SHA-256 验证。新的 8–50 MiB 文件已改为分片写入；旧版 50 MiB 以下单对象仍可解码。批量 pack 和 Obsidian 原生桌面端仍须单独验证。
 
 从 2026-10-18 起，所有新执行的文件大小测试（包括虚拟流、soak 和实机测试）永久限制为 **100 MB（100,000,000 字节）**。早期超大文件实验仅留在 Git 历史中，不再作为当前测试命令或设备支持证据。公开支持结论必须来自 `tests/baselines/v4/` 中记录的实机测试：
 
@@ -60,7 +60,7 @@ Yes. Normal sync plans from three states: the last verified base, local state, a
 
 No. The planner compares logical file identity, path, and content hash. Unchanged records are reused, and a content-preserving encrypted rename can reuse the existing object/parts without uploading the content again.
 
-This is not block-level delta sync. When a large file's content changes, current V4 creates a new complete `remoteVersion`. Remote payloads over 50 MiB use ordered parts, but V4 does not currently upload only the changed internal parts of a modified file. A changed 5 GiB encrypted file can therefore add roughly one new full revision to history.
+This is not block-level delta sync. When a large file's content changes, current V4 creates a new complete `remoteVersion`. New writes above 8 MiB use ordered parts up to 8 MiB each, while old single blobs up to the legacy 50 MiB boundary and historical 48 MiB parts remain readable. V4 does not currently upload only the changed internal parts of a modified file. A changed 5 GiB encrypted file can therefore add roughly one new full revision to history.
 
 ### Q3. How are simultaneous edits handled?
 
@@ -75,7 +75,7 @@ If the user changes a local target while network work is in flight, the final pr
 
 ### Q4. What is the 100 MB release test scope and larger-file support status?
 
-V4 readers remain compatible with historical 48 MiB parts, but newly written chunked parts are now capped at 8 MiB after a real GitHub REST 100 MB test revealed HTTP 422 with the old 48 MiB upload. A Windows disk-backed Node V4 harness passed encrypted Force Push, no-op, staged interruption/retry and SHA-256 verification against real GitHub. This is not yet a native Obsidian Desktop app acceptance result; smaller single-object and pack uploads remain a separate risk to qualify.
+V4 readers remain compatible with historical 48 MiB parts, but newly written chunked parts are now capped at 8 MiB after a real GitHub REST 100 MB test revealed HTTP 422 with the old 48 MiB upload. A Windows disk-backed Node V4 harness passed encrypted Force Push, no-op, staged interruption/retry and SHA-256 verification against real GitHub. This is not yet a native Obsidian Desktop app acceptance result; new 8–50 MiB uploads use chunked parts and old single blobs remain readable. Native Obsidian Desktop and pack uploads remain separate qualification gates.
 
 Since 2026-10-18, **all current and future generated-file, virtual-stream, soak and physical large-file tests are capped at 100 MB (100,000,000 bytes)**. Earlier oversized experiments remain in Git history only; they are not active test commands or physical-device support evidence. Public support claims depend on recorded evidence in `tests/baselines/v4/`:
 

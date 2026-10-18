@@ -1,6 +1,6 @@
 import { bytesToUtf8, fromBase64Url, sha256Hex, toBase64Url, utf8ToBytes } from "../bytes"
 import { decryptV4Payload, encryptV4Payload, type V4Keyring } from "./crypto"
-import { buildV4PartPaths, shouldUseV4Parts, V4_PART_BYTES } from "./large-files"
+import { buildV4PartPaths, shouldUseV4Parts, shouldWriteV4Parts, V4_PART_BYTES } from "./large-files"
 import { assertV4MetadataBytes } from "./metadata-bounds"
 import type { V4IndexFileRecord } from "./local-index"
 import { bucketForV4PathId, normalizeV4VaultPath, objectIdForV4File, opaqueV4ObjectPath, opaqueV4PackPath, pathIdForV4Path } from "./paths"
@@ -72,7 +72,7 @@ export function assertV4RemoteRecordDescriptor(record: V4IndexFileRecord, config
       throw new Error("V4 chunked storage has inconsistent part descriptors.")
     }
     const predictedRemoteBytes = record.size + (config.mode === "encrypted" ? 33 : 0)
-    if (!shouldUseV4Parts(record.size, predictedRemoteBytes)) {
+    if (!shouldWriteV4Parts(record.size) && !shouldUseV4Parts(record.size, predictedRemoteBytes)) {
       throw new Error("V4 chunked storage is below the writer chunking threshold.")
     }
     const minWriterParts = Math.ceil(record.size / V4_PART_BYTES)

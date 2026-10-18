@@ -17,8 +17,12 @@ import {
   resetGitHubE2EDisposableBranch,
   resolveGitHubE2ETarget,
 } from "./support/target-safety"
-import { TEST_100MB_BYTES, generateTest100MBFile, hashFile100MB, TestDisk100MBVault } from "../helpers/file-backed-100mb-vault"
+import { TEST_100MB_BYTES, generateTestFile, hashTestFile, TestDisk100MBVault } from "../helpers/file-backed-100mb-vault"
 
+const LIVE_FILE_BYTES = Number(process.env.V4_GITHUB_E2E_TEST_FILE_BYTES ?? TEST_100MB_BYTES)
+if (![16_000_000, 32_000_000, 50_000_000, TEST_100MB_BYTES].includes(LIVE_FILE_BYTES)) {
+  throw new RangeError("Live GitHub test must use an approved size no larger than 100 MB")
+}
 const targetEnvironment = readGitHubE2ETargetEnvironment()
 if (!/^obsidian-sync-e2e\/local-[a-z0-9-]{8,80}$/u.test(targetEnvironment.branch)) {
   throw new Error("Live 100 MB test requires a disposable local test branch")
@@ -55,7 +59,7 @@ after(async () => {
   }
 })
 
-test("GitHub: encrypted real 100 MB disk-file push, no-op, failed staged pull and verified retry", {
+test("GitHub: encrypted <=100 MB disk-file push, no-op, interrupted stage and verified retry", {
   timeout: 900_000,
 }, async () => {
   // Recheck the exact ref without mutating: an occupied branch must never be deleted at startup.
@@ -75,7 +79,7 @@ test("GitHub: encrypted real 100 MB disk-file push, no-op, failed staged pull an
   await mkdir(receiver.root)
 
   try {
-    const srcHash = await generateTest100MBFile(source.payloadPath())
+    const srcHash = await generateTestFile(source.payloadPath(), LIVE_FILE_BYTES)
     const client = new GitHubClient(target.config)
     const repoId = `${target.config.owner}/${target.config.repo}#${target.config.branch}`
     const salt = randomBytes(16)
@@ -108,31 +112,41 @@ test("GitHub: encrypted real 100 MB disk-file push, no-op, failed staged pull an
     assert.equal(sourceIndex.remoteCommitSha, publishedSha)
     console.log("GitHub 100 MB E2E: no-op preserved published head")
 
-    receiver.failAppendAt = 2
-    await assert.rejects(
-      () => session(receiver, pullIndex).sync({ operation: "forcePull", allowThresholdOverride: false }),
-      /Synthetic bounded stage append interruption/u,
-    )
-    assert.equal(await receiver.stat("payload.bin"), null, "Interrupted pull must not create a partial final target")
-    console.log("GitHub 100 MB E2E: interrupted staged pull left no final target")
+    const needsBoundedStage = LIVE_FILE_BYTES > 32 * 1024 * 1024
+    if (needsBoundedStage) {
+      receiver.failAppendAt = 2
+      await assert.rejects(
+        () => session(receiver, pullIndex).sync({ operation: "forcePull", allowThresholdOverride: false }),
+        /Synthetic bounded stage append interruption/u,
+      )
+      assert.equal(await receiver.stat("payload.bin"), null, "Interrupted pull must not create a partial final target")
+      console.log("GitHub <=100 MB E2E: interrupted staged pull left no final target")
+    }
     const pulled = await session(receiver, pullIndex).sync({
       operation: "forcePull", allowThresholdOverride: false,
     })
     assert.equal(pulled.mode, "force-pull")
-    assert.equal((await receiver.stat("payload.bin"))?.size, TEST_100MB_BYTES)
-    assert.equal(await hashFile100MB(receiver.payloadPath()), srcHash)
+    assert.equal((await receiver.stat("payload.bin"))?.size, LIVE_FILE_BYTES)
+    assert.equal(await hashTestFile(receiver.payloadPath(), LIVE_FILE_BYTES), srcHash)
     assert.equal(source.wholeReads, 0)
     assert.equal(receiver.wholeReads, 0)
     assert.ok(source.boundedReads > 1)
-    assert.ok(receiver.stagedWrites > 1)
-    assert.equal(receiver.stagedCommits, 1)
+    if (needsBoundedStage) {
+      assert.ok(receiver.stagedWrites > 1)
+      assert.equal(receiver.stagedCommits, 1)
+      assert.equal(receiver.wholeWrites, 0)
+    } else {
+      assert.equal(receiver.wholeWrites, 1, "Small download must use the bounded whole-buffer path")
+      assert.equal(receiver.stagedWrites, 0)
+      assert.equal(receiver.stagedCommits, 0)
+    }
     console.log(JSON.stringify({
       kind: "real-github-100mb-encrypted-verified",
-      bytes: TEST_100MB_BYTES, sha256: srcHash,
+      bytes: LIVE_FILE_BYTES, sha256: srcHash,
       elapsedMs: Math.round(performance.now() - started),
       sourceBoundedReads: source.boundedReads,
       receiverStagedWrites: receiver.stagedWrites,
-      recovered: true,
+      recovered: needsBoundedStage,
       branch: target.config.branch,
     }))
   } finally {

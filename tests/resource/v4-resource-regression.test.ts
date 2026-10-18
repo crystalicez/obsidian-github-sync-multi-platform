@@ -2,7 +2,7 @@ import assert from "node:assert/strict"
 import test from "node:test"
 
 import type { V4ContentSource } from "../../src/lib/v4/content-source"
-import { V4_LARGE_FILE_THRESHOLD_BYTES, V4_PART_BYTES } from "../../src/lib/v4/large-files"
+import { V4_LARGE_FILE_THRESHOLD_BYTES, V4_GITHUB_REST_SAFE_WRITER_BYTES } from "../../src/lib/v4/large-files"
 import { selectV4WriterPartBytes } from "../../src/lib/v4/part-write-policy"
 import { DEFAULT_V4_RESOURCE_LIMITS, estimateV4GitBlobTransportBytes } from "../../src/lib/v4/resource-controller"
 import { V4StorageCodec } from "../../src/lib/v4/storage-codec"
@@ -15,10 +15,13 @@ function unopened(size: number, onOpen: () => void): V4ContentSource {
 
 test("resource regression keeps threshold-1 threshold threshold+1 and 100 MB preparation lazy", async () => {
   const cases = [
-    { size: V4_LARGE_FILE_THRESHOLD_BYTES - 1, expected: 1 },
-    { size: V4_LARGE_FILE_THRESHOLD_BYTES, expected: 1 },
-    { size: V4_LARGE_FILE_THRESHOLD_BYTES + 1, expected: 2 },
-    { size: 100_000_000, expected: Math.ceil((100_000_000) / V4_PART_BYTES) },
+    { size: V4_GITHUB_REST_SAFE_WRITER_BYTES - 1, expected: 1 },
+    { size: V4_GITHUB_REST_SAFE_WRITER_BYTES, expected: 1 },
+    { size: V4_GITHUB_REST_SAFE_WRITER_BYTES + 1, expected: 2 },
+    { size: V4_LARGE_FILE_THRESHOLD_BYTES - 1, expected: Math.ceil((V4_LARGE_FILE_THRESHOLD_BYTES - 1) / V4_GITHUB_REST_SAFE_WRITER_BYTES) },
+    { size: V4_LARGE_FILE_THRESHOLD_BYTES, expected: Math.ceil(V4_LARGE_FILE_THRESHOLD_BYTES / V4_GITHUB_REST_SAFE_WRITER_BYTES) },
+    { size: V4_LARGE_FILE_THRESHOLD_BYTES + 1, expected: Math.ceil((V4_LARGE_FILE_THRESHOLD_BYTES + 1) / V4_GITHUB_REST_SAFE_WRITER_BYTES) },
+    { size: 100_000_000, expected: Math.ceil(100_000_000 / V4_GITHUB_REST_SAFE_WRITER_BYTES) },
   ]
   for (const input of cases) {
     let opened = 0
@@ -30,7 +33,7 @@ test("resource regression keeps threshold-1 threshold threshold+1 and 100 MB pre
       version: "qualification",
       mtime: 1,
       fileId: `f-${input.size}`,
-      partBytes: V4_PART_BYTES,
+      partBytes: V4_GITHUB_REST_SAFE_WRITER_BYTES,
     })
     assert.equal(opened, 0)
     assert.equal(prepared.objectCount, input.expected)
