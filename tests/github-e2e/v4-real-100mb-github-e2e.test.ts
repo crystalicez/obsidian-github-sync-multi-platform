@@ -128,17 +128,21 @@ test("GitHub: encrypted <=100 MB disk-file push, no-op, interrupted stage and ve
     assert.equal(pulled.mode, "force-pull")
     assert.equal((await receiver.stat("payload.bin"))?.size, LIVE_FILE_BYTES)
     assert.equal(await hashTestFile(receiver.payloadPath(), LIVE_FILE_BYTES), srcHash)
-    assert.equal(source.wholeReads, 0)
     assert.equal(receiver.wholeReads, 0)
-    assert.ok(source.boundedReads > 1)
+    if (needsBoundedStage) {
+      assert.equal(source.wholeReads, 0, "Files above 32 MiB must never use whole-file reads")
+      assert.ok(source.boundedReads > 1)
+    } else {
+      assert.ok(source.wholeReads > 0, "Small-file hashing uses the permitted whole-buffer path")
+      assert.ok(source.boundedReads >= 1, "The new medium writer still streams encrypted parts")
+    }
     if (needsBoundedStage) {
       assert.ok(receiver.stagedWrites > 1)
       assert.equal(receiver.stagedCommits, 1)
       assert.equal(receiver.wholeWrites, 0)
     } else {
       assert.equal(receiver.wholeWrites, 1, "Small download must use the bounded whole-buffer path")
-      assert.equal(receiver.stagedWrites, 0)
-      assert.equal(receiver.stagedCommits, 0)
+      assert.equal(receiver.stagedCommits, 0, "Small download must not commit a staged final file")
     }
     console.log(JSON.stringify({
       kind: "real-github-100mb-encrypted-verified",

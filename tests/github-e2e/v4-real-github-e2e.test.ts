@@ -824,6 +824,47 @@ test("V4 reviewed remote conflict preserves exact GitHub commit (both storage mo
   }
 });
 
+test("V4 encrypted GitHub packs round-trip 96 files within REST blob limits", { timeout: 480_000 }, async () => {
+  await runScenario(config, "encrypted", "96-file-encrypted-pack-live", async ({ device }) => {
+    const source = device("pack-source");
+    const fileCount = 96;
+    const fileBytes = 512 * 1024;
+    for (let i = 0; i < fileCount; i++) {
+      const name = `Packs/asset-${String(i).padStart(3, "0")}.bin`;
+      source.vault.set(name, deterministicBinary(fileBytes, i + 101), i + 1);
+    }
+    const published = await source.session.sync({ operation: "forcePush", allowThresholdOverride: false });
+    assert.equal(published.mode, "force-push");
+    const records = liveRecords(source);
+    assert.equal(records.length, fileCount);
+    assert.equal(records.filter(record => record.storage === "pack").length, fileCount,
+      "all eligible small files should use multi-file packs");
+    const packPaths = new Set(records.map(record => record.remotePath));
+    assert.ok(packPaths.size > 1 && packPaths.size < fileCount,
+      "96 logical files should share multiple bounded pack blobs");
+
+    const commitSha = source.index.remoteCommitSha;
+    assert.ok(commitSha);
+    const commit = await source.client.getGitCommit(commitSha);
+    const tree = await source.client.getTreeAt(commit.treeSha, true);
+    assert.equal(tree.truncated, false);
+    for (const remotePath of packPaths) {
+      const blob = tree.tree.find(node => node.path === remotePath);
+      assert.ok(blob && blob.type === "blob", `missing pack blob ${remotePath}`);
+      assert.ok(blob.size !== undefined && blob.size <= 8 * 1024 * 1024,
+        `GitHub pack blob exceeds 8 MiB: ${remotePath}`);
+    }
+    assert.equal(tree.tree.some(node => node.path.startsWith("Packs/")), false,
+      "encrypted GitHub tree must not reveal logical folder names");
+
+    const receiver = device("pack-receiver");
+    const pulled = await receiver.session.sync({ operation: "forcePull", allowThresholdOverride: false });
+    assert.equal(pulled.mode, "force-pull");
+    assertVaultEquals(receiver.vault, source.vault, "96-file encrypted GitHub pack round-trip");
+    assert.equal(liveRecords(receiver).length, fileCount);
+  });
+});
+
 test("V4 real GitHub REST survives realistic superuser and two-device scenarios", { timeout: 900_000 }, async () => {
   for (const mode of ["plaintext", "encrypted"] as const) {
     await runBaselineScenario(config, mode);
