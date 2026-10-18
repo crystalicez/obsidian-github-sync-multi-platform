@@ -33,6 +33,29 @@ test("oversized cache header cannot be persisted in an unreadable form", async (
   assert.equal(io.values.has("index/index.json"), false);
 });
 
+test("UTF-8 local header write budget matches the adapter byte-size preflight", async () => {
+  const io = adapter();
+  const cache = createEmptyV4LocalIndex({ repoId: "中".repeat(24 * 1024), deviceId: "d", mode: "plaintext" });
+  await assert.rejects(() => saveV4LocalIndex(io, "index", cache), /cache limit/);
+  assert.equal(io.values.has("index/index.json"), false);
+});
+
+test("cache header size from Obsidian stat prevents an oversized adapter read", async () => {
+  const backing = adapter();
+  const cache = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "d", mode: "plaintext" });
+  cache.remoteCommitSha = "stale-head";
+  await saveV4LocalIndex(backing, "index", cache);
+  let reads = 0;
+  const io = {
+    ...backing,
+    async stat(path: string) { return path === "index/index.json" ? { size: 67 * 1024 } : null; },
+    async read(path: string) { reads++; return backing.read(path); },
+  };
+  const loaded = await loadV4LocalIndex(io, "index");
+  assert.equal(loaded.remoteCommitSha, undefined);
+  assert.equal(reads, 0);
+});
+
 test("overlong valid cached shard is rebuilt rather than trusted", async () => {
   const io = adapter();
   const cache = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "d", mode: "plaintext" });

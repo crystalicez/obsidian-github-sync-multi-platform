@@ -44,6 +44,26 @@ test("oversized new recovery receipt is refused without overwriting a valid old 
   assert.equal((await store.load())?.header.generation, previous.header.generation);
 });
 
+test("recovery stat preflight skips oversized latest slot before adapter read", async () => {
+  const backing = adapter();
+  const originalStore = createV4RecoveryStore({ adapter: backing, root: "recovery", repoId: "o/r#main" });
+  const prior = await originalStore.save(input("publish-intent"));
+  const newest = await originalStore.save(input("remote-verified"));
+  const newestPath = `recovery/slot-${newest.header.generation % 2}.json`;
+  let newerReads = 0;
+  const io = {
+    ...backing,
+    async stat(path: string) { return { size: path === newestPath ? 33 * 1024 * 1024 : backing.values.get(path)!.length }; },
+    async read(path: string) {
+      if (path === newestPath) newerReads++;
+      return backing.read(path);
+    },
+  };
+  const recovered = await createV4RecoveryStore({ adapter: io, root: "recovery", repoId: "o/r#main" }).load();
+  assert.equal(recovered?.header.generation, prior.header.generation);
+  assert.equal(newerReads, 0);
+});
+
 test("older valid recovery generation survives an overlong newer slot", async () => {
   const io = adapter();
   const store = createV4RecoveryStore({ adapter: io, root: "recovery", repoId: "o/r#main" });

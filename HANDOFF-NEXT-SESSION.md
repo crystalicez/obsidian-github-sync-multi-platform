@@ -4,6 +4,14 @@
 >
 > **Mandatory workflow rule:** Every AI session that makes a material change to code, tests, design decisions, branch/PR state, verification status, or next steps MUST update this file before ending or handing work off. GitHub is the source of truth.
 
+## 2026-10-18 poteto-mode storage stat preflight
+
+- Second RED → GREEN unit after JSON parser caps: Obsidian `V4LocalIndexAdapter.stat` size hint is wired through `runtime.ts` and validated before `read()`. A 67 KiB index header or 33 MiB recovery slot with reported over-cap size is now ignored **without loading its contents**. Recovery falls back to the last valid receipt. The source continues post-read guards when `stat` is not implemented or a file changes between checks.
+- Writer validates UTF-8 encoded byte length and UTF-16 code units, so non-ASCII serialized data does not bypass the stat preflight contract. New tests cover Unicode, no-read preflight, oversize writes and older-receipt recovery. See `tests/v4/local-index-preparse-bounds.test.ts` and `tests/recovery/v4-recovery-preparse-bounds.test.ts`.
+- The second unit's post-fix working-tree build, fast **675/675**, recovery **54/54**, resource **18/18**, soak **6/6**, feasibility **139/139**, E2E compile, package/metadata all exited 0. The dedicated stat preflight tests pass **5/5** index and **4/4** recovery.
+- Read-only live GitHub preflight also passed: verified disposable repository numeric ID **1284153873**, default branch readable, absent namespaced test branch, **zero mutations**. No live qualification was run at this step.
+- Live GitHub pack, native Obsidian current build 100MB, compatibility/capability policy, transport memory and Git tree semantic proof remain blockers. Original user WIP is not staged.
+
 ## 2026-10-18 poteto-mode local cache and recovery hardening
 
 - Using the installed `agents-skills/poteto-mode` skill, applied RED/GREEN evidence to AUD-07. The old parser accepted oversized but structurally valid local index shards/headers and recovery slots, so stale cache or a newer oversized recovery generation could be trusted.

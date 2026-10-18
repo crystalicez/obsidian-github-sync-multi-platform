@@ -1,7 +1,7 @@
 import { bytesToUtf8, fromBase64, sha256Hex, toBase64, utf8ToBytes } from "../bytes"
 import { collectV4ContentSource, DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES } from "./content-source"
 import { decryptV4Payload, encryptV4Payload } from "./crypto"
-import type { V4LocalIndexAdapter } from "./local-index"
+import { isV4OversizedLocalJson, type V4LocalIndexAdapter } from "./local-index"
 import { assertV4LocalTargetPrecondition, V4LocalTargetChangedError, type V4LocalIo } from "./local-io"
 import { hashV4StableContentSource } from "./object-stream"
 import { normalizeV4VaultPath } from "./paths"
@@ -163,6 +163,7 @@ export function createV4RecoveryStore(options: {
     const path = slotPath(root, slot)
     if (!(await options.adapter.exists(path))) return { present: false }
     let parsed: unknown
+    if (await isV4OversizedLocalJson(options.adapter, path, V4_RECOVERY_SLOT_MAX_CHARS)) return { present: true }
     const serialized = await options.adapter.read(path)
     if (serialized.length > V4_RECOVERY_SLOT_MAX_CHARS) return { present: true }
     try { parsed = JSON.parse(serialized) } catch { return { present: true } }
@@ -228,7 +229,7 @@ export function createV4RecoveryStore(options: {
       const header: V4RecoveryHeader = { ...withoutIntegrity, integrity: await integrityFor(withoutIntegrity) }
       await ensureDirectoryChain(options.adapter, root)
       const serialized = JSON.stringify(header)
-      if (serialized.length > V4_RECOVERY_SLOT_MAX_CHARS) {
+      if (serialized.length > V4_RECOVERY_SLOT_MAX_CHARS || utf8ToBytes(serialized).byteLength > V4_RECOVERY_SLOT_MAX_CHARS) {
         throw new V4RecoveryRequiredError("V4 recovery slot exceeds the local storage limit.")
       }
       await options.adapter.write(slotPath(root, generation % 2), serialized)

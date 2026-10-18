@@ -70,13 +70,14 @@ Evidence codes: **X** = actually executed in this audit; **S** = static runtime 
 - **Scenario:** Long-lived Obsidian session switches credentials repeatedly. Retired secrets remain in managed JS memory longer than active use, despite best-effort zeroing on final disposal.
 - **Action:** Introduce lease/refcount semantics and test concurrent history/async cancellation before clearing older keyring. Do not simply zero on invalidate: in-flight reads might be corrupted. JavaScript cannot guarantee copy-free zeroization.
 
-### AUD-07 — P2 / local JSON and recovery parser bounds (FIXED, adapter-read risk remains)
+### AUD-07 — P2 / local JSON and recovery parser bounds (FIXED with stat preflight and parser fallback)
 
 - **Trace:** `src/lib/v4/local-index.ts:160–184` reads whole serialized header/shard then JSON.parse; `src/lib/v4/recovery-store.ts:145–170` decodes local base64 payload and parses. Remote V4 index/journal/config/head **do** have `assertV4MetadataBytes` pre-parse bounds; these are *not* universally absent.
 - **Scenario:** Corrupt, substituted or severely bloated local index/recovery file causes memory pressure before integrity checks.
 - **RED/GREEN:** Oversized but valid JSON was accepted as a trusted local index, or as the newest recovery generation ahead of an intact older copy. New tests prove this with actual `loadV4LocalIndex()` and `createV4RecoveryStore().load()` calls. Both tests initially failed before code change.
 - **Fix:** The local index header is bounded to 64 Ki UTF-16 code units, while shards and recovery slots are bounded to 32 Mi UTF-16 code units before `JSON.parse`. Writers reject serialized output above those caps. Invalid cache state forces a rebuild. Oversized recovery slots are treated as torn; if a previous generation is valid, the store recovers it, otherwise it raises `V4RecoveryRequiredError`.
-- **Limitation:** The adapters still return a complete string from `read()` before these checks. The fix bounds parsing and cache trust, not filesystem memory allocation. Tests limit individual synthetic inputs to less than 100 MB.
+- **Follow-up:** Real Obsidian adapters can expose `stat(path).size`. The index and recovery stores now reject oversized files from that byte count **before calling `read()`**; standalone adapters lacking `stat` retain the older post-read guard. Write limits check both UTF-16 string length and actual UTF-8 bytes so a multilingual index cannot be persisted only to fail the next size preflight. RED tests showed the earlier path read and trusted over-limit metadata; GREEN tests verify zero reads and fallback to the older valid recovery slot.
+- **Limitation:** This is a stat-then-read guard, not an atomic bounded file descriptor. A concurrent file replacement between `stat` and `read` can still allocate before the post-read guard rejects it. Native Obsidian implementation and cross-device acceptance remain separate evidence gates. Tests limit individual synthetic inputs to less than 100 MB.
 
 ### AUD-08 — P2 / hosted CI, release provenance, independent review (OPEN GATE)
 
