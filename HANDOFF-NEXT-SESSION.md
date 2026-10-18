@@ -4,6 +4,13 @@
 >
 > **Mandatory workflow rule:** Every AI session that makes a material change to code, tests, design decisions, branch/PR state, verification status, or next steps MUST update this file before ending or handing work off. GitHub is the source of truth.
 
+## 2026-10-18 poteto-mode local cache and recovery hardening
+
+- Using the installed `agents-skills/poteto-mode` skill, applied RED/GREEN evidence to AUD-07. The old parser accepted oversized but structurally valid local index shards/headers and recovery slots, so stale cache or a newer oversized recovery generation could be trusted.
+- `src/lib/v4/local-index.ts` now caps local header at **64 Ki UTF-16 code units** and each shard at **32 Mi** before `JSON.parse`; `src/lib/v4/recovery-store.ts` caps each slot at **32 Mi**. Writers also refuse output too large to load later. Invalid cache returns empty rebuild state; oversized recovery slots preserve fallback to the last valid generation.
+- New focused tests under `tests/v4/local-index-preparse-bounds.test.ts` **3/3** and `tests/recovery/v4-recovery-preparse-bounds.test.ts` **3/3**. Entire working-tree build and fast **672/672**, recovery **52/52**, resource **18/18**, soak **6/6**, feasibility **139/139**, E2E compilation, package/metadata checks exit 0. These are not yet exact clean SHA evidence.
+- Boundaries apply **after filesystem adapter read**, not to remote `requestUrl` buffering. Older-client chunk negotiation, Git tree semantics, keyring lifetime, 100 MB native-device and GitHub live current-SHA gates remain open. File test maximum remains 100 MB. Preserve `tests/v4/github-transport.test.ts` original WIP, no merge/release.
+
 ## 2026-10-18 comprehensive production audit clean-SHA qualification
 
 - Audit code/test `642ecaacb469e01fac10ef57e19fb41d0c0bcda9` is pushed to audit branch, **detached independent** `.tmp/full-audit-clean-20261018` exactly at that SHA remained clean (`## HEAD (no branch)`).

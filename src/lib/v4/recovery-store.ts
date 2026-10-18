@@ -11,6 +11,7 @@ import { reconcileV4CandidatePublication, type V4PublishReconcileResult, type V4
 
 import { throwIfV4Aborted } from "./cancellation"
 const V4_RECOVERY_SCHEMA_VERSION = 1 as const
+export const V4_RECOVERY_SLOT_MAX_CHARS = 32 * 1024 * 1024
 const VALID_PHASES = new Set<V4RecoveryPhase>([
   "publish-intent",
   "remote-verified",
@@ -162,7 +163,9 @@ export function createV4RecoveryStore(options: {
     const path = slotPath(root, slot)
     if (!(await options.adapter.exists(path))) return { present: false }
     let parsed: unknown
-    try { parsed = JSON.parse(await options.adapter.read(path)) } catch { return { present: true } }
+    const serialized = await options.adapter.read(path)
+    if (serialized.length > V4_RECOVERY_SLOT_MAX_CHARS) return { present: true }
+    try { parsed = JSON.parse(serialized) } catch { return { present: true } }
     if (!isHeader(parsed)) return { present: true }
     const header = parsed
     const { integrity, ...withoutIntegrity } = header
@@ -224,7 +227,11 @@ export function createV4RecoveryStore(options: {
       }
       const header: V4RecoveryHeader = { ...withoutIntegrity, integrity: await integrityFor(withoutIntegrity) }
       await ensureDirectoryChain(options.adapter, root)
-      await options.adapter.write(slotPath(root, generation % 2), JSON.stringify(header))
+      const serialized = JSON.stringify(header)
+      if (serialized.length > V4_RECOVERY_SLOT_MAX_CHARS) {
+        throw new V4RecoveryRequiredError("V4 recovery slot exceeds the local storage limit.")
+      }
+      await options.adapter.write(slotPath(root, generation % 2), serialized)
       return { header, payload: input.payload }
     },
   }

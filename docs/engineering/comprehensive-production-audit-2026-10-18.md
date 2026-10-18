@@ -70,11 +70,13 @@ Evidence codes: **X** = actually executed in this audit; **S** = static runtime 
 - **Scenario:** Long-lived Obsidian session switches credentials repeatedly. Retired secrets remain in managed JS memory longer than active use, despite best-effort zeroing on final disposal.
 - **Action:** Introduce lease/refcount semantics and test concurrent history/async cancellation before clearing older keyring. Do not simply zero on invalidate: in-flight reads might be corrupted. JavaScript cannot guarantee copy-free zeroization.
 
-### AUD-07 — P2 / local JSON and recovery blob pre-parse limits (UNVERIFIED LOCAL RESOURCE RISK)
+### AUD-07 — P2 / local JSON and recovery parser bounds (FIXED, adapter-read risk remains)
 
 - **Trace:** `src/lib/v4/local-index.ts:160–184` reads whole serialized header/shard then JSON.parse; `src/lib/v4/recovery-store.ts:145–170` decodes local base64 payload and parses. Remote V4 index/journal/config/head **do** have `assertV4MetadataBytes` pre-parse bounds; these are *not* universally absent.
 - **Scenario:** Corrupt, substituted or severely bloated local index/recovery file causes memory pressure before integrity checks.
-- **Action:** Validate byte/string length before parse and allocation; preserve recovery-required fail-closed semantics; regression on oversized local cache/recovery without reading private notes.
+- **RED/GREEN:** Oversized but valid JSON was accepted as a trusted local index, or as the newest recovery generation ahead of an intact older copy. New tests prove this with actual `loadV4LocalIndex()` and `createV4RecoveryStore().load()` calls. Both tests initially failed before code change.
+- **Fix:** The local index header is bounded to 64 Ki UTF-16 code units, while shards and recovery slots are bounded to 32 Mi UTF-16 code units before `JSON.parse`. Writers reject serialized output above those caps. Invalid cache state forces a rebuild. Oversized recovery slots are treated as torn; if a previous generation is valid, the store recovers it, otherwise it raises `V4RecoveryRequiredError`.
+- **Limitation:** The adapters still return a complete string from `read()` before these checks. The fix bounds parsing and cache trust, not filesystem memory allocation. Tests limit individual synthetic inputs to less than 100 MB.
 
 ### AUD-08 — P2 / hosted CI, release provenance, independent review (OPEN GATE)
 
