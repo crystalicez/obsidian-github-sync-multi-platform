@@ -19,6 +19,7 @@ import {
 } from "./v4/resource-controller";
 import { V4RequestScheduler } from "./v4/request-scheduler";
 import { V4TransportMetrics, type V4TransportMetricsSnapshot } from "./v4/transport-metrics";
+import type { V4RunDiagnostics } from "./v4/run-diagnostics";
 import { resolveV4TransportPolicy, type V4TransportPolicy } from "./v4/transport-policy";
 import { readImmutableGitFile } from "./v4/immutable-git-read";
 
@@ -100,6 +101,7 @@ export class GitHubClient {
   private readonly transportMetrics: V4TransportMetrics;
   private readonly transportResources: Pick<V4ResourceController, "withTransportBytes">;
   private operationSignal?: AbortSignal;
+  private runDiagnostics?: V4RunDiagnostics;
 
   constructor(config: GitHubConfig, options: GitHubClientOptions = {}) {
     assertSafeGitHubRepositoryCoordinates(config.owner, config.repo);
@@ -120,6 +122,7 @@ export class GitHubClient {
   }
 
   setV4AbortSignal(signal?: AbortSignal): void { this.operationSignal = signal; }
+  setV4RunDiagnostics(diagnostics?: V4RunDiagnostics): void { this.runDiagnostics = diagnostics; }
 
   get transportMetricsSnapshot(): V4TransportMetricsSnapshot {
     return this.transportMetrics.snapshot;
@@ -131,15 +134,22 @@ export class GitHubClient {
     const requestBytes = typeof options.body === "string" ? new TextEncoder().encode(options.body).byteLength : 0;
     return this.requestScheduler.run(kind, async () => {
       this.transportMetrics.recordRequest({ mutation: kind === "write", requestBytes, transientBytes });
+      const started = performance.now();
       let response: RequestUrlResponse;
       try {
         response = await requestUrl(options);
       } catch (error) {
         this.transportMetrics.recordNetworkFailure();
+        this.runDiagnostics?.recordRequest({
+          method, requestBytes, responseBytes: 0, elapsedMs: performance.now() - started, failed: true,
+        });
         throw error;
       }
       const responseBytes = response.arrayBuffer?.byteLength ?? (response.text ? new TextEncoder().encode(response.text).byteLength : 0);
       this.transportMetrics.recordResponse(response.status, responseBytes);
+      this.runDiagnostics?.recordRequest({
+        method, requestBytes, responseBytes, elapsedMs: performance.now() - started, failed: response.status >= 400,
+      });
       const responseHeaders = Object.fromEntries(Object.entries(response.headers ?? {}).map(([key, value]) => [key.toLowerCase(), value]));
       const rateLimited = response.status === 429 || (response.status === 403 && (
         responseHeaders["retry-after"] !== undefined

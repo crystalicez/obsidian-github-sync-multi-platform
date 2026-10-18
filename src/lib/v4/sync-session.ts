@@ -54,6 +54,7 @@ import type { V4QueuedChange } from "./sync-coordinator"
 import { applyV4RecoveryLocalMutations, type V4RecoveryStore } from "./recovery-store"
 import type { V4RecoveryLocalMutation, V4RecoveryPayload } from "./recovery-types"
 import type { V4DirectionalProgress, V4SyncProgressPatch } from "./progress"
+import type { V4RunDiagnostics } from "./run-diagnostics"
 import { deferV4Cancellation, throwIfV4Aborted } from "./cancellation"
 
 export type { V4SessionVault, V4SessionVaultFile } from "./local-io"
@@ -77,6 +78,7 @@ export interface V4SyncSessionInput {
   askConflict?: (input: { path: string; localMtime: number; remoteMtime: number; localBytes?: Uint8Array; remoteBytes?: Uint8Array }) => Promise<V4ConflictResolution>
   includePath?: (path: string) => boolean
   onProgress?: (patch: V4SyncProgressPatch) => void
+  diagnostics?: V4RunDiagnostics
   runState?: V4SyncRunState
   recoveryStore?: V4RecoveryStore
   resourceLimits?: Partial<V4ResourceLimits>
@@ -360,6 +362,7 @@ export class V4SyncSession {
       keyring: input.keyring,
       resources: this.resources,
       signal: input.signal,
+      diagnostics: input.diagnostics,
     })
     this.now = input.now ?? (() => Date.now())
     this.localIo = createV4LocalIo(input.vault)
@@ -2392,6 +2395,7 @@ export class V4SyncSession {
       const source = await this.localIo.openContentSource(handle, this.input.signal)
       return hashV4StableContentSource(source, {
         chunkBytes: Math.min(4 * 1024 * 1024, Math.max(1, expectedBytes)),
+        recordHashMs: milliseconds => this.input.diagnostics?.recordWork("hashing", milliseconds),
         checkStable: () => this.assertVaultSnapshot(handle),
         signal: this.input.signal,
       })
@@ -2399,7 +2403,9 @@ export class V4SyncSession {
     return this.resources.withResidentBytes(expectedBytes, async () => {
       const bytes = await this.resources.withVaultRead(() => this.localIo.read(path), this.input.signal)
       if (bytes.byteLength !== expectedBytes) throw new V4SourceChangedError(path, `read ${bytes.byteLength} bytes; expected ${expectedBytes}`)
-      const hash = await this.resources.withCrypto(() => sha256Hex(bytes), this.input.signal)
+      const hash = await this.resources.withCrypto(() => this.input.diagnostics
+        ? this.input.diagnostics.measureAsync("hashing", () => sha256Hex(bytes))
+        : sha256Hex(bytes), this.input.signal)
       await this.assertVaultSnapshot(handle)
       this.localReadCache.set(path, bytes)
       return hash

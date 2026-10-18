@@ -1,5 +1,6 @@
 import { ItemView, WorkspaceLeaf } from "obsidian"
 import type FastSync from "../main"
+import { formatV4Rate, formatV4Size } from "../lib/v4/run-diagnostics"
 import type { V4HistoryChange, V4HistoryCommit, V4HistoryService, V4VersionPreview } from "../lib/v4/history-service"
 import { countV4FileOverview, filterV4FileOverview, treeV4FileOverview, V4_FILE_FILTERS, type V4FileFilter, type V4FileOverview, type V4FileOverviewEntry, type V4FileTreeNode } from "../lib/v4/file-overview"
 import {
@@ -183,15 +184,31 @@ export class V4SyncCenterView extends ItemView {
           ["Total", formatV4Duration(snapshot.totalElapsedMs), true] as const,
           ...snapshot.timings.map(timing => {
             const phaseLabel = formatV4PhaseLabel(timing.phase)
-            const label = timing.phase === "encrypting" ? "Encryption" : phaseLabel
+            const label = timing.phase === "encrypting" && snapshot.diagnostics ? "Encrypting phase" : timing.phase === "encrypting" ? "Encryption" : phaseLabel
             return [label, formatV4PhaseTiming(timing).slice(phaseLabel.length + 1), false] as const
           }),
         ]
       : []
+    const d = snapshot.diagnostics
+    if (d) {
+      timingRows.push(
+        [`Upload API · ${formatV4Size(d.uploadBytes)}`, `${formatV4Rate(d.uploadBytes, d.uploadRequestMs)} · ${formatV4Duration(d.uploadRequestMs)}`, false],
+        [`Download API · ${formatV4Size(d.downloadBytes)}`, `${formatV4Rate(d.downloadBytes, d.downloadRequestMs)} · ${formatV4Duration(d.downloadRequestMs)}`, false],
+        [`GitHub API · ${d.apiRequests} requests`, d.apiRequests ? `${(d.apiLatencyMs / d.apiRequests).toFixed(0)} ms avg · ${d.apiMaxLatencyMs.toFixed(0)} ms max` : "—", false],
+        ["Hashing (measured)", formatV4Duration(d.hashingMs), false],
+        ["Encryption (measured)", formatV4Duration(d.encryptionMs), false],
+        ["Decryption (measured)", formatV4Duration(d.decryptionMs), false],
+        ["Peak renderer RAM", d.peakRendererRssBytes === undefined ? "N/A" : formatV4Size(d.peakRendererRssBytes), false],
+      )
+    }
     const timingsSignature = JSON.stringify(timingRows)
     if (timingsSignature !== this.progressTimingsSignature) {
       timingsElement.empty()
       for (const [label, duration, total] of timingRows) this.renderTiming(timingsElement, label, duration, total)
+      if (d) timingsElement.createEl("p", {
+        text: "GitHub API payload rates use transfer bytes per request time, not your full internet speed. API latency excludes queue/retry waits; measured work can overlap phases. RAM is sampled renderer RSS, not total Obsidian memory.",
+        cls: "github-sync-center__muted",
+      })
       this.progressTimingsSignature = timingsSignature
     }
   }

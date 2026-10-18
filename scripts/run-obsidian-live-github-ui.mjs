@@ -25,6 +25,7 @@ const mode=parseLiveUiMode(option("mode",undefined));
 const verifyPeer=opts.includes("--verify-peer");
 const journey=opts.includes("--journey");
 const native100mb=opts.includes("--native-100mb");
+const assertDiagnostics=opts.includes("--assert-diagnostics");
 assert.ok(!native100mb||(mode==="encrypted"&&verifyPeer),"Native 100 MB test requires encrypted mode and a second real Obsidian vault");
 assert.ok(!verifyPeer||mode==="encrypted","A second-vault restore requires --mode=encrypted");
 const passphrase=mode==="encrypted"?randomBytes(32).toString("base64url"):"";
@@ -73,6 +74,7 @@ let cleanupState="not-started",screenBytes=0,remoteEncryptionVerified=false,peer
 const sendErrors=[];
 const journeySteps=[];
 let nativeBinary=null;
+let diagnosticEvidence=null;
 const requestMap=new Map();let serial=0;
 function send(method,params={},timeoutMs=25000){
  return new Promise((resolve,reject)=>{
@@ -111,11 +113,22 @@ async function captureSyncedCenter(){
   return {rect:{x:b.x,y:b.y,width:b.width,height:b.height},viewport:{width:innerWidth,height:innerHeight},dpr:devicePixelRatio,
     title:document.querySelector(".github-sync-center__header h3")?.textContent,
     lifecycle:app.plugins.plugins[${JSON.stringify(id)}].v4Runtime.progressSnapshot.lifecycle,
+    metrics:app.plugins.plugins[${JSON.stringify(id)}].v4Runtime.progressSnapshot.diagnostics,
+    diagnosticRows:el.innerText.includes("Upload API")&&el.innerText.includes("GitHub API")&&el.innerText.includes("Peak renderer RAM"),
     syncAction:!![...el.querySelectorAll("button")].find(b=>b.textContent.trim()==="Sync now"),
     leakedToken:el.innerText.includes(app.plugins.plugins["encrypted-github-sync-multi-platform"].settings.githubToken),
     leakedPassphrase:!!app.plugins.plugins["encrypted-github-sync-multi-platform"].settings.encryptionPassphrase&&el.innerText.includes(app.plugins.plugins["encrypted-github-sync-multi-platform"].settings.encryptionPassphrase)};
  })()`);
  assertTrue(dims?.syncAction && dims?.lifecycle==="success" && !dims?.leakedToken && !dims?.leakedPassphrase,"Sync Center must show a completed sync without leaking credentials");
+ if(assertDiagnostics){
+  const d=dims.metrics;
+  assertTrue(dims.diagnosticRows&&d?.apiRequests>0&&d?.uploadBytes>0&&d?.downloadBytes>0,
+   "Live Obsidian UI did not render real GitHub throughput and API request metrics");
+  assertTrue(d.hashingMs>0&&d.encryptionMs>0&&d.apiLatencyMs>0,
+   "Live Obsidian did not record hashing, encryption and GitHub request timing");
+  assertTrue(d.peakRendererRssBytes>0,"Live Windows Obsidian renderer RSS was not sampled");
+  diagnosticEvidence=d;
+ }
  const clip=visibleIntersection(dims.rect,dims.viewport);
  const png=await send("Page.captureScreenshot",{format:"png",captureBeyondViewport:false,fromSurface:true,clip});
  const bytes=Buffer.from(png.data??"","base64");
@@ -308,6 +321,7 @@ try{
    assertTrue(remote.kind==="present"&&remote.sha!==before,"Native Obsidian 100 MB upload did not publish a commit");
    finalSha=remote.sha;
    nativeBinary={path:name,size,sha256:checksum.digest("hex")};
+   if(assertDiagnostics) await captureSyncedCenter();
    journeySteps.push("real Obsidian indexed and uploaded exact 100 MB binary");
   }
   if(verifyPeer){
@@ -359,5 +373,5 @@ try{
   try{await cleanupGeneratedUiRun(runRoot,{repoRoot:root});}catch(error){console.error("WARNING: isolated test vault cleanup incomplete ("+String(error?.code||"unknown").slice(0,30)+")");process.exitCode=1;}
  }
  console.log(JSON.stringify({status:passed&&!process.exitCode?"PASS":"FAIL",cleanup:cleanupState,remoteHeadChanged:Boolean(initialSha&&finalSha&&initialSha!==finalSha),
-  screenshotCaptured:screenBytes>1000,screenshotPath:screenBytes>1000?screenshot:null,uiExceptions:sendErrors.length,mode,remoteEncryptionVerified,peerRestored,peerScreenshot,journeySteps,native100mbBytes:nativeBinary?.size??0,native100mbSha256:nativeBinary?.sha256??null,runBranch:branch,repository:configuration?.targetRepository,token:"[not reported]"}));
+  screenshotCaptured:screenBytes>1000,screenshotPath:screenBytes>1000?screenshot:null,uiExceptions:sendErrors.length,mode,remoteEncryptionVerified,peerRestored,peerScreenshot,journeySteps,diagnostics:diagnosticEvidence,native100mbBytes:nativeBinary?.size??0,native100mbSha256:nativeBinary?.sha256??null,runBranch:branch,repository:configuration?.targetRepository,token:"[not reported]"}));
 }

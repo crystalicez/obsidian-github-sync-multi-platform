@@ -16,6 +16,7 @@ import { streamV4SourceParts, type V4PreparedObjectStream, V4SourceChangedError 
 import { normalizeV4VaultPath, objectIdForV4File, opaqueV4ObjectPath, opaqueV4PackPath, pathIdForV4Path } from "./paths"
 import { type V4FileRecord, type V4PathLayout, type V4StorageMode } from "./protocol-types"
 import type { V4ResourceController } from "./resource-controller"
+import type { V4RunDiagnostics, V4WorkKind } from "./run-diagnostics"
 import type { V4StagedSink } from "./staging-store"
 
 const V4_CHUNK_READ_CONCURRENCY = 4
@@ -78,17 +79,34 @@ export class V4StorageCodec {
     keyring?: V4Keyring
     resources?: Pick<V4ResourceController, "withCrypto"> & Partial<Pick<V4ResourceController, "reserveResidentBytes">>
     signal?: AbortSignal
+    diagnostics?: V4RunDiagnostics
   }) {
     if (options.mode === "encrypted" && !options.keyring) {
       throw new Error("Encrypted V4 storage requires a keyring.")
     }
   }
 
-  private async crypto<T>(task: () => Promise<T>): Promise<T> {
+  private async crypto<T>(task: () => Promise<T>, kind: V4WorkKind = "hashing"): Promise<T> {
     throwIfV4Aborted(this.options.signal)
-    const value = this.options.resources ? await this.options.resources.withCrypto(task, this.options.signal) : await task()
+    const measured = () => this.options.diagnostics
+      ? this.options.diagnostics.measureAsync(kind, task)
+      : task()
+    const value = this.options.resources ? await this.options.resources.withCrypto(measured, this.options.signal) : await measured()
     throwIfV4Aborted(this.options.signal)
     return value
+  }
+
+  private encrypt<T>(task: () => Promise<T>): Promise<T> {
+    return this.crypto(task, "encryption")
+  }
+
+  private decrypt<T>(task: () => Promise<T>): Promise<T> {
+    return this.crypto(task, "decryption")
+  }
+
+  private updateHash(hash: { update(data: Uint8Array): unknown }, bytes: Uint8Array): void {
+    if (this.options.diagnostics) this.options.diagnostics.measure("hashing", () => hash.update(bytes))
+    else hash.update(bytes)
   }
 
   private contentAad(record: { fileId: string; pathId: string; remoteVersion: string }): string {
@@ -125,7 +143,7 @@ export class V4StorageCodec {
       : await this.crypto(() => opaqueV4ObjectPath(this.options.keyring!.pathKey, stableFileId))
     const bytes = this.options.mode === "plaintext"
       ? plaintext
-      : await this.crypto(() => encryptV4Payload(this.options.keyring!.contentKey, plaintext, {
+      : await this.encrypt(() => encryptV4Payload(this.options.keyring!.contentKey, plaintext, {
         kind: "content",
         aad: this.contentAad({ fileId: stableFileId, pathId, remoteVersion: version }),
       }))
@@ -195,13 +213,13 @@ export class V4StorageCodec {
         const release = await reserve(input.source.size)
         try {
           const plaintext = await collectV4ContentSource(input.source, V4_LARGE_FILE_THRESHOLD_BYTES, signal)
-          hash.update(plaintext)
+          this.updateHash(hash, plaintext)
           total = plaintext.byteLength
           await input.checkSourceStable?.()
           if (hash.digestHex() !== input.expectedHash) { completed = true; return }
           const bytes = this.options.mode === "plaintext"
             ? plaintext
-            : await this.crypto(() => encryptV4Payload(this.options.keyring!.contentKey, plaintext, { kind: "content", aad: contentAad }))
+            : await this.encrypt(() => encryptV4Payload(this.options.keyring!.contentKey, plaintext, { kind: "content", aad: contentAad }))
           completed = true
           yield { path: objectPaths[0], bytes, release }
           return
@@ -221,12 +239,12 @@ export class V4StorageCodec {
         try {
           next = await iterator.next()
           if (next.done) throw new V4SourceChangedError(path, `source ended after ${total} bytes; expected ${input.source.size}`)
-          hash.update(next.value)
+          this.updateHash(hash, next.value)
           total += next.value.byteLength
           await input.checkSourceStable?.()
           const bytes = this.options.mode === "plaintext"
             ? next.value
-            : await this.crypto(() => encryptV4Payload(this.options.keyring!.contentKey, next.value, {
+            : await this.encrypt(() => encryptV4Payload(this.options.keyring!.contentKey, next.value, {
               kind: "part",
               aad: `${contentAad}:${index}`,
             }))
@@ -341,7 +359,7 @@ export class V4StorageCodec {
       for await (const chunk of layout.entry.source.chunks(chunkBytes, signal)) {
         if (offset + chunk.byteLength > plaintext.byteLength) throw new V4SourceChangedError(layout.entry.logicalPath, "source produced more bytes than expected")
         plaintext.set(chunk, offset)
-        hasher.update(chunk)
+        this.updateHash(hasher, chunk)
         offset += chunk.byteLength
         await layout.entry.checkSourceStable?.()
       }
@@ -371,7 +389,7 @@ export class V4StorageCodec {
 
     const remotePath = await this.crypto(() => opaqueV4PackPath(this.options.keyring!.pathKey, packId))
     assertRestSafeNewV4Pack(archive.byteLength)
-    const bytes = await this.crypto(() => encryptV4Payload(this.options.keyring!.contentKey, archive, { kind: "pack", aad: packId }))
+    const bytes = await this.encrypt(() => encryptV4Payload(this.options.keyring!.contentKey, archive, { kind: "pack", aad: packId }))
     return {
       records: records.map(record => ({ ...record, storage: "pack", remotePath, encryptedPath: remotePath, packId, partPaths: undefined })),
       file: { path: remotePath, bytes },
@@ -397,7 +415,7 @@ export class V4StorageCodec {
       entries: Object.fromEntries(entries.map(entry => [entry.record.fileId, toBase64(entry.plaintext)])),
     }))
     assertRestSafeNewV4Pack(archive.byteLength)
-    const bytes = await this.crypto(() => encryptV4Payload(this.options.keyring!.contentKey, archive, { kind: "pack", aad: packId }))
+    const bytes = await this.encrypt(() => encryptV4Payload(this.options.keyring!.contentKey, archive, { kind: "pack", aad: packId }))
     return {
       records: entries.map(entry => ({ ...entry.record, storage: "pack", remotePath, encryptedPath: remotePath, packId, partPaths: undefined })),
       file: { path: remotePath, bytes },
@@ -428,7 +446,7 @@ export class V4StorageCodec {
       path: partPaths[index],
       bytes: this.options.mode === "plaintext"
         ? part
-        : await this.crypto(() => encryptV4Payload(this.options.keyring!.contentKey, part, {
+        : await this.encrypt(() => encryptV4Payload(this.options.keyring!.contentKey, part, {
           kind: "part",
           aad: `${this.contentAad({ fileId, pathId, remoteVersion: version })}:${index}`,
         })),
@@ -462,7 +480,7 @@ export class V4StorageCodec {
     const append = async (plaintext: Uint8Array) => {
       if (signal?.aborted) throw signal.reason ?? new Error("V4 remote read aborted.")
       if (total + plaintext.byteLength > record.size) throw new Error(`V4 content size mismatch: ${record.remotePath}`)
-      hash.update(plaintext)
+      this.updateHash(hash, plaintext)
       total += plaintext.byteLength
       await sink.append(plaintext)
     }
@@ -475,7 +493,7 @@ export class V4StorageCodec {
         const bytes = await reader(partPaths[index])
         const plaintext = this.options.mode === "plaintext"
           ? bytes
-          : await this.crypto(() => decryptV4Payload(this.options.keyring!.contentKey, bytes, {
+          : await this.decrypt(() => decryptV4Payload(this.options.keyring!.contentKey, bytes, {
             kind: "part",
             aad: `${this.contentAad(record)}:${index}`,
           }))
@@ -519,7 +537,7 @@ export class V4StorageCodec {
     if (payload.byteLength !== expectedArchiveBytes + V4_ENCRYPTED_PAYLOAD_OVERHEAD_BYTES) {
       throw new Error("V4 pack payload size does not match its declared records.")
     }
-    const archive = await this.crypto(() => decryptV4Payload(this.options.keyring!.contentKey, payload, { kind: "pack", aad: packId }))
+    const archive = await this.decrypt(() => decryptV4Payload(this.options.keyring!.contentKey, payload, { kind: "pack", aad: packId }))
     if (archive.byteLength !== expectedArchiveBytes) throw new Error("V4 pack archive size does not match its declared records.")
     let parsed: unknown
     try { parsed = JSON.parse(bytesToUtf8(archive)) } catch { throw new Error("V4 pack archive JSON is invalid.") }
@@ -561,7 +579,7 @@ export class V4StorageCodec {
       throwIfV4Aborted(signal)
       const plaintext = this.options.mode === "plaintext"
         ? bytes
-        : await this.crypto(() => decryptV4Payload(this.options.keyring!.contentKey, bytes, {
+        : await this.decrypt(() => decryptV4Payload(this.options.keyring!.contentKey, bytes, {
           kind: "content",
           aad: this.contentAad(record),
         }))
@@ -581,7 +599,7 @@ export class V4StorageCodec {
       throwIfV4Aborted(signal)
       return this.options.mode === "plaintext"
         ? bytes
-        : this.crypto(() => decryptV4Payload(this.options.keyring!.contentKey, bytes, {
+        : this.decrypt(() => decryptV4Payload(this.options.keyring!.contentKey, bytes, {
           kind: "part",
           aad: `${this.contentAad(record)}:${index}`,
         }))

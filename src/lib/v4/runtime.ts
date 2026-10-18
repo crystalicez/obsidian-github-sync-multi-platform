@@ -27,6 +27,7 @@ import { createV4ContentSource, createV4WholeBufferContentSource, DEFAULT_V4_WHO
 import { createV4PlatformIo, type V4BinaryAdapterLike, type V4PlatformIo } from "./platform-io"
 import { createV4StagingStore, type V4StagingStore } from "./staging-store"
 import { V4ProgressStore, type V4SyncProgressSnapshot } from "./progress"
+import { V4RunDiagnostics } from "./run-diagnostics"
 import { createV4RecoveryStore, discardV4RecoveryStages, markV4RecoveryIndexCommitted, recoverV4PendingState, V4RecoveryRequiredError } from "./recovery-store"
 import { V4KeyringCache } from "./keyring-cache"
 import { V4CancelledError, throwIfV4Aborted } from "./cancellation"
@@ -547,6 +548,12 @@ export class V4PluginRuntime {
   private async execute(request: V4SyncRequest, changes: V4QueuedChange[], signal: AbortSignal): Promise<{ changedFiles: number }> {
     throwIfV4Aborted(signal)
     assertPluginSettingsRuntimeSafe(this.plugin.settings)
+    const diagnostics = new V4RunDiagnostics()
+    const refreshDiagnostics = () => {
+      diagnostics.sampleMemory()
+      this.progressStore.update({ diagnostics: diagnostics.snapshot })
+    }
+    const diagnosticsTimer = setInterval(refreshDiagnostics, 1_000)
     const continuingDebounceRun = this.debounceRunActive
     this.debounceRunActive = false
     const runPatch = {
@@ -560,6 +567,7 @@ export class V4PluginRuntime {
       errorMessage: undefined,
       failurePhase: undefined,
       failurePath: undefined,
+      diagnostics: diagnostics.snapshot,
     } as const
     if (continuingDebounceRun) this.progressStore.update({ ...runPatch, lifecycle: "active", phase: "checking-remote" })
     else {
@@ -584,6 +592,7 @@ export class V4PluginRuntime {
     })
     try {
       if (!this.plugin.githubClient) throw new Error("GitHub connection is not configured.")
+      this.plugin.githubClient.setV4RunDiagnostics?.(diagnostics)
       ;(this.plugin.githubClient as unknown as { setV4AbortSignal?(signal?: AbortSignal): void }).setV4AbortSignal?.(signal)
       throwIfV4Aborted(signal)
       let lastError: unknown
@@ -701,6 +710,7 @@ export class V4PluginRuntime {
             runState,
             recoveryStore,
             signal,
+            diagnostics,
             onProgress: patch => {
               if (patch.phase === "checking-remote") return
               this.progressStore.update(patch)
@@ -723,7 +733,8 @@ export class V4PluginRuntime {
           const recoveryRunId = result.recoveryRunId ?? recoveredRunId
           if (recoveryRunId) await markV4RecoveryIndexCommitted(recoveryStore, recoveryRunId)
           if (result.changedFiles === 0 && request.trigger === "manual") new Notice("GitHub Sync: No changes")
-          this.progressStore.finish(result.changedFiles === 0 ? "no-change" : "success", { lastSyncTime: Date.now() })
+          diagnostics.sampleMemory()
+          this.progressStore.finish(result.changedFiles === 0 ? "no-change" : "success", { lastSyncTime: Date.now(), diagnostics: diagnostics.snapshot })
           syncConsoleLog(this.plugin.settings, "info", "V4 sync completed", {
             operation: request.operation,
             trigger: request.trigger,
@@ -789,10 +800,13 @@ export class V4PluginRuntime {
         publicationCause: publicationRace?.cause,
         error,
       })
-      this.progressStore.finish("failed", { errorMessage: message })
+      diagnostics.sampleMemory()
+      this.progressStore.finish("failed", { errorMessage: message, diagnostics: diagnostics.snapshot })
       new Notice(`GitHub Sync failed: ${message}`)
       return { changedFiles: 0 }
     } finally {
+      clearInterval(diagnosticsTimer)
+      this.plugin.githubClient?.setV4RunDiagnostics?.(undefined)
       bootstrapRecoveryKeyCache?.key.fill(0)
       ;(this.plugin.githubClient as unknown as { setV4AbortSignal?(signal?: AbortSignal): void } | undefined)?.setV4AbortSignal?.(undefined)
       this.plugin.isSyncInProgress = false

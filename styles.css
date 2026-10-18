@@ -798,6 +798,15 @@
 
 .github-sync-center__timing {
   justify-content: space-between;
+  flex-wrap: wrap;
+}
+
+.github-sync-center__timing > span:first-child {
+  min-width: 0;
+}
+
+.github-sync-center__timing-duration {
+  margin-left: auto;
 }
 
 .github-sync-center__timing.is-total {

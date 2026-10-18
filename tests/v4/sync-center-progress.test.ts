@@ -122,6 +122,31 @@ test("Sync Center commit detail explains when a commit changes no files", async 
   await view.onClose();
 });
 
+test("Sync Center renders request throughput, crypto timings, API latency and sampled RAM", async () => {
+  const source = new FakeProgressSource();
+  const plugin = createSyncCenterPluginFixture(source, () => undefined);
+  const view = new V4SyncCenterView(new WorkspaceLeaf(plugin.app), plugin as never);
+  await view.onOpen();
+  source.publish({
+    ...uploadingFixture,
+    diagnostics: {
+      uploadBytes: 2_097_152, downloadBytes: 1_048_576,
+      uploadRequestMs: 1_000, downloadRequestMs: 2_000,
+      apiRequests: 4, apiFailures: 1, apiLatencyMs: 1_000, apiMaxLatencyMs: 500,
+      hashingMs: 125, encryptionMs: 250, decryptionMs: 500,
+      peakRendererRssBytes: 256 * 1_048_576,
+    },
+  });
+  const text = view.contentEl.flattenText();
+  assert.match(text, /Upload API · 2\.00 MiB.*2\.00 MiB\/s/su);
+  assert.match(text, /Download API · 1\.00 MiB.*0\.50 MiB\/s/su);
+  assert.match(text, /GitHub API · 4 requests.*250 ms avg · 500 ms max/su);
+  assert.match(text, /Hashing \(measured\).*0\.1s.*Encryption \(measured\).*0\.3s.*Decryption \(measured\).*0\.5s/su);
+  assert.match(text, /Peak renderer RAM.*256\.00 MiB/su);
+  assert.match(text, /not your full internet speed/u);
+  await view.onClose();
+});
+
 test("Sync Center progress card updates in isolation and unsubscribes on close", async () => {
   const source = new FakeProgressSource();
   let historyLoadCount = 0;

@@ -30,6 +30,7 @@ export interface V4StableHashOptions {
   chunkBytes: number
   checkStable?: () => Promise<void>
   signal?: AbortSignal
+  recordHashMs?: (milliseconds: number) => void
 }
 
 function assertPositiveSafeInteger(value: number, label: string): void {
@@ -44,7 +45,9 @@ export async function hashV4StableContentSource(source: V4ContentSource, options
   for await (const chunk of source.chunks(options.chunkBytes, options.signal)) {
     if (options.signal?.aborted) throw options.signal.reason ?? new Error("V4 source hashing aborted.")
     if (total + chunk.byteLength > source.size) throw new V4SourceChangedError(undefined, "source produced more bytes than declared")
-    hash.update(chunk)
+    const started = performance.now()
+    try { hash.update(chunk) }
+    finally { options.recordHashMs?.(Math.max(0, performance.now() - started)) }
     total += chunk.byteLength
     await options.checkStable?.()
   }
