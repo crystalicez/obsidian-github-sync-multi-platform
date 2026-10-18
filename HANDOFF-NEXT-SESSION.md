@@ -10,6 +10,12 @@
 - Clean frozen install, production build, fast **666/666**, repeat **10/10 rounds x 666**, recovery, resource **15/15**, feasibility, 100 MB / medium 16/32/50 MB / historical encrypted 32 MB single-blob soak **4/4**, metadata/package validation, three usual GitHub E2E compiles and the new variable-size live E2E bundle standalone compile all **exit 0**.
 - **No new credentialed GitHub 16 MB completed pull test on this SHA:** initial 16 MB live test failed due to fixture forbidding a valid <=32MiB whole write, safe branch cleanup verified; retry after fixing fixture was blocked by host safety checks. This is distinct from older successful real GitHub REST 100 MB test. Native Obsidian UI/device acceptance, hosted CI, independent review, and old-client forward-compatible rollout decision remain open. Details in `docs/engineering/v4-rest-safe-medium-writer-2026-10-18.md`.
 
+## 2026-10-18 exact-SHA legacy 48 MiB encrypted part proof
+
+- Audit commit `c93438002cb70c48503ec3d4929620abc5890e03` contains historical 48 MiB AES-GCM part read-to-sink SHA integrity/tamper rejection and 8 MiB + 1 byte buffered writer regression. Independent detached worktree `.tmp/rest-legacy-48m-clean-20261018` at exact SHA passed frozen pnpm install, build, fast **666/666**, resource **15/15**, soak **6/6**, repeat **10 x 666**, recovery, feasibility **138/138**, metadata/package validation and GitHub E2E compilation; detached Git status remained clean.
+- One **parallel test-runner collision** was found: feasibility versus repeat both rm/create shared `.tmp/tests`, causing `ENOTEMPTY`. Re-running feasibility alone after repeat passed **138/138**. A parallel-run isolation fix is pending; do not claim overlapping runners are safe. See `docs/engineering/v4-rest-safe-medium-writer-2026-10-18.md`.
+- Legacy object read compatibility is proven on current client; **older clients still cannot be assumed to read newly written 8–50 MiB chunk records**. No native desktop release proof, merge, or release. Original `tests/v4/github-transport.test.ts` WIP untouched.
+
 ## 2026-10-18 legacy encrypted part compatibility follow-up
 
 - Added the missing real cryptographic format proof for a **legacy 48 MiB encrypted part** inside a **50 MiB + 1 byte** logical fixture, decoded via the current V4 bounded sink. Validated full SHA-256, exactly two appended parts, old remote descriptor acceptance, and authenticated corruption rejection.

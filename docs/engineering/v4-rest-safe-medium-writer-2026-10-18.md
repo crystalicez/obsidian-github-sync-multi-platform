@@ -47,6 +47,12 @@ After the clean-code-SHA qualification above, the soak suite gained two more **o
 
 These validate the real cryptographic formats, beyond descriptor-only or virtual planner tests. `pnpm test:soak` then passed **6/6**. These are not GitHub API or native Obsidian results; the older-client **forward-compatibility rollout decision remains unresolved**.
 
+## Independent c934380 code-SHA confirmation
+
+The exact test/code commit **`c93438002cb70c48503ec3d4929620abc5890e03`** was verified from a fresh detached worktree `.tmp/rest-legacy-48m-clean-20261018`; `git status --short --branch` remained `## HEAD (no branch)` after testing. Frozen dependency install, build, fast **666/666**, resource **15/15**, cryptographic/real-file soak **6/6**, repeat **10 consecutive runs of 666**, recovery, feasibility **138/138**, release metadata/package checks and standard GitHub E2E compilation all completed with exit code 0.
+
+An *initial concurrent* run of `test:feasibility` while `test:repeat` was running failed with `ENOTEMPTY` when both runners attempted to recreate their **shared `.tmp/tests`** bundle directory. After repeat completed, **sequential feasibility passed 138/138**. This is a real test-infrastructure concurrency bug, not a sync engine assertion failure, and must be fixed before considering parallel local/CI qualification reliable. Do not report the simultaneous run as a pass. It remains separate from the native Obsidian Desktop and live 16 MB GitHub E2E release gates.
+
 ## Commands
 
 ```sh
