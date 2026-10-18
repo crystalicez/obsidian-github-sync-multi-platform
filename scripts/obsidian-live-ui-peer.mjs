@@ -15,6 +15,7 @@ export function assertSecondVaultRestore(state,expectedContent){
 }
 export async function restoreEncryptedToSecondObsidian({
  exe,runRoot,port,pluginId,sourceRoot,configuration,passphrase,expectedContent,
+ expectedFiles=[],absentPaths=[],exercisePeerConflict=false,
 }){
  assert.ok(Number.isInteger(port)&&port>=1024&&port<=65535,"Second CDP port is unsafe");
  assert.ok(path.basename(runRoot).match(/^[0-9a-f]{16}$/u),"Second vault requires a synthetic random run ID");
@@ -122,6 +123,23 @@ export async function restoreEncryptedToSecondObsidian({
    return {status:s.lifecycle,filename:file.path,content};
   })()`,300000);
   assertSecondVaultRestore(restored,expectedContent);
+  const verifiedFiles=await evaluate(`(async()=>{
+   const expected=${JSON.stringify(expectedFiles)};
+   const absent=${JSON.stringify(absentPaths)};
+   const files=[];
+   for(const item of expected){
+    const file=app.vault.getAbstractFileByPath(item.path);
+    if(!file)throw Error("Peer is missing a synced journey file");
+    const content=await app.vault.read(file);
+    if(content!==item.content)throw Error("Peer synced journey bytes do not match");
+    files.push(item.path);
+   }
+   for(const path of absent){
+    if(app.vault.getAbstractFileByPath(path))throw Error("Peer retains a deleted/renamed original");
+   }
+   return files;
+  })()`);
+  assert.equal(verifiedFiles.length,expectedFiles.length,"Second Obsidian journey file count");
   await pause(500);
   const visible=await evaluate(`(()=>({shown:document.body.innerText.includes("Second revision from Obsidian."),settingsVisible:!!document.querySelector(".vertical-tab-header")}))()`);
   assert.ok(visible.shown&&!visible.settingsVisible,"Restored synthetic note is not visible in the second Obsidian editor");
@@ -132,7 +150,19 @@ export async function restoreEncryptedToSecondObsidian({
   await mkdir(evidenceDir,{recursive:true});
   const evidencePath=path.join(evidenceDir,path.basename(runRoot)+"-peer-restored.png");
   await writeFile(evidencePath,bytes);
-  return {peerRestored:true,peerVaultPathMatches:true,filenameMatched:true,bytesRestored:Buffer.byteLength(restored.content,"utf8"),peerScreenshot:evidencePath};
+  let peerMutated=false;
+  if(exercisePeerConflict){
+   const result=await evaluate(`(async()=>{
+    const p=app.plugins.plugins[${JSON.stringify(pluginId)}];
+    const file=app.vault.getAbstractFileByPath("UI-smoke.md");
+    await app.vault.modify(file,"# Synthetic remote UI E2E\\n\\nPeer conflicting revision.\\n");
+    await p.v4Runtime.manualSync();
+    return {lifecycle:p.v4Runtime.progressSnapshot.lifecycle};
+   })()`,240000);
+   assert.equal(result.lifecycle,"success","Second real Obsidian peer edit must publish");
+   peerMutated=true;
+  }
+  return {peerRestored:true,peerVaultPathMatches:true,filenameMatched:true,bytesRestored:Buffer.byteLength(restored.content,"utf8"),peerScreenshot:evidencePath,verifiedJourneyFiles:verifiedFiles.length,peerMutated};
  }finally{
   if(ws){try{ws.close()}catch{}}
   if(child?.pid){

@@ -23,6 +23,7 @@ const exe=option("obsidian","C:\\Program Files\\Obsidian\\Obsidian.exe");
 const dryRun=opts.includes("--preflight-only");
 const mode=parseLiveUiMode(option("mode",undefined));
 const verifyPeer=opts.includes("--verify-peer");
+const journey=opts.includes("--journey");
 assert.ok(!verifyPeer||mode==="encrypted","A second-vault restore requires --mode=encrypted");
 const passphrase=mode==="encrypted"?randomBytes(32).toString("base64url"):"";
 const id="encrypted-github-sync-multi-platform";
@@ -68,6 +69,7 @@ const redact=(value)=>{
 let processHandle,ws,configuration,branch,verified=false,passed=false,initialSha,finalSha;
 let cleanupState="not-started",screenBytes=0,remoteEncryptionVerified=false,peerRestored=false,peerScreenshot=null;
 const sendErrors=[];
+const journeySteps=[];
 const requestMap=new Map();let serial=0;
 function send(method,params={},timeoutMs=25000){
  return new Promise((resolve,reject)=>{
@@ -246,14 +248,54 @@ try{
    remoteEncryptionVerified=Boolean(encryptionProof.configValid&&encryptionProof.cipherHeaderValid&&encryptionProof.opaqueObjects);
   }
   await captureSyncedCenter();
+  const expectedPeerFiles=[
+   {path:"Notes/renamed-สวัสดี 🌏.md",content:"# Native combined test\n\nEdited after rename.\n"},
+   {path:"Scratch.md",content:"Recreated after deletion.\n"},
+  ];
+  if(journey){
+   const original="Notes/สวัสดี 🌏.md";
+   const renamed=expectedPeerFiles[0].path;
+   const pluginExpr="app.plugins.plugins["+JSON.stringify(id)+"]";
+   const step=async(label,mutation)=>{
+    const before=finalSha;
+    const result=await evaluate(mutation,120000);
+    assertTrue(result?.ok,"Native combined action failed: "+label+" "+JSON.stringify(result));
+    const outcome=await evaluate("(async()=>{const p="+pluginExpr+";await p.v4Runtime.manualSync();return {lifecycle:p.v4Runtime.progressSnapshot.lifecycle,trigger:p.v4Runtime.progressSnapshot.trigger};})()",240000);
+    assertTrue(outcome.lifecycle==="success"&&outcome.trigger==="manual","Native combined sync failed: "+label+" "+JSON.stringify(outcome));
+    const remote=await readState(configuration);
+    assertTrue(remote.kind==="present"&&remote.sha!==before,"Combined user action was not published: "+label);
+    finalSha=remote.sha;
+    journeySteps.push(label);
+   };
+   await step("create nested Unicode and scratch notes",
+    "(async()=>{await app.vault.createFolder('Notes');await app.vault.create("+JSON.stringify(original)+",'# Native combined test\\n\\nInitial Unicode name.\\n');await app.vault.create('Scratch.md','Temporary note.\\n');return {ok:true};})()");
+   await step("rename, modify, and delete together",
+    "(async()=>{const file=app.vault.getAbstractFileByPath("+JSON.stringify(original)+");const scratch=app.vault.getAbstractFileByPath('Scratch.md');if(!file||!scratch)return {ok:false};await app.vault.rename(file,"+JSON.stringify(renamed)+");await app.vault.modify(file,"+JSON.stringify(expectedPeerFiles[0].content)+");await app.vault.delete(scratch);return {ok:true};})()");
+   await step("recreate deleted note",
+    "(async()=>{if(app.vault.getAbstractFileByPath('Scratch.md'))return {ok:false};await app.vault.create('Scratch.md',"+JSON.stringify(expectedPeerFiles[1].content)+");return {ok:true};})()");
+   const checked=await evaluate("(async()=>{const expected="+JSON.stringify(expectedPeerFiles)+";for(const entry of expected){const file=app.vault.getAbstractFileByPath(entry.path);if(!file||(await app.vault.read(file))!==entry.content)return {ok:false};}return {ok:!app.vault.getAbstractFileByPath("+JSON.stringify(original)+")};})()");
+   assertTrue(checked?.ok,"Native source files diverged after combined changes");
+  }
   if(verifyPeer){
    const restored=await restoreEncryptedToSecondObsidian({
     exe,runRoot,port:port+1,pluginId:id,sourceRoot:root,configuration,passphrase,
     expectedContent:"# Synthetic remote UI E2E\n\nSecond revision from Obsidian.\n",
+    expectedFiles:journey?expectedPeerFiles:[],absentPaths:journey?["Notes/สวัสดี 🌏.md"]:[],exercisePeerConflict:journey,
    });
    assertTrue(restored.peerRestored&&restored.bytesRestored>0,"Second real Obsidian vault could not decrypt remote data");
    const afterPull=await readState(configuration);
-   assertTrue(afterPull.kind==="present"&&afterPull.sha===finalSha,"Second-device Force Pull unexpectedly changed GitHub HEAD");
+   if(journey){
+    assertTrue(restored.peerMutated&&afterPull.kind==="present"&&afterPull.sha!==finalSha,
+     "Real peer edit did not publish a competing GitHub commit");
+    const localEdit=await evaluate("(async()=>{const p=app.plugins.plugins["+JSON.stringify(id)+"];const file=app.vault.getAbstractFileByPath('UI-smoke.md');await app.vault.modify(file,'# Synthetic remote UI E2E\\n\\nMain conflicting revision.\\n');await p.v4Runtime.manualSync();return {lifecycle:p.v4Runtime.progressSnapshot.lifecycle};})()",240000);
+    assertTrue(localEdit.lifecycle==="success","Real Obsidian conflict reconciliation did not succeed");
+    const checked=await evaluate("(async()=>{const files=app.vault.getFiles();let local=false,peer=false;for(const file of files){if(!file.path.endsWith('.md'))continue;const text=await app.vault.read(file);if(text.includes('Main conflicting revision.'))local=true;if(text.includes('Peer conflicting revision.'))peer=true;}return {local,peer,count:files.length};})()",240000);
+    assertTrue(checked.local&&checked.peer,"Local/remote conflicting text was not preserved in two Obsidian notes: "+JSON.stringify(checked));
+    journeySteps.push("two-device simultaneous conflict retained both revisions");
+    finalSha=(await readState(configuration)).sha;
+   }else{
+    assertTrue(afterPull.kind==="present"&&afterPull.sha===finalSha,"Second-device Force Pull unexpectedly changed GitHub HEAD");
+   }
    peerRestored=true;
    peerScreenshot=restored.peerScreenshot;
   }
@@ -283,5 +325,5 @@ try{
   try{await cleanupGeneratedUiRun(runRoot,{repoRoot:root});}catch(error){console.error("WARNING: isolated test vault cleanup incomplete ("+String(error?.code||"unknown").slice(0,30)+")");process.exitCode=1;}
  }
  console.log(JSON.stringify({status:passed&&!process.exitCode?"PASS":"FAIL",cleanup:cleanupState,remoteHeadChanged:Boolean(initialSha&&finalSha&&initialSha!==finalSha),
-  screenshotCaptured:screenBytes>1000,screenshotPath:screenBytes>1000?screenshot:null,uiExceptions:sendErrors.length,mode,remoteEncryptionVerified,peerRestored,peerScreenshot,runBranch:branch,repository:configuration?.targetRepository,token:"[not reported]"}));
+  screenshotCaptured:screenBytes>1000,screenshotPath:screenBytes>1000?screenshot:null,uiExceptions:sendErrors.length,mode,remoteEncryptionVerified,peerRestored,peerScreenshot,journeySteps,runBranch:branch,repository:configuration?.targetRepository,token:"[not reported]"}));
 }
