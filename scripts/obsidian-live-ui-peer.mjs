@@ -114,15 +114,17 @@ export async function restoreEncryptedToSecondObsidian({
     syncEnabled:true,syncOnStartup:false,syncOnLocalChange:false,scheduledSyncEnabled:false,
     syncObsidianConfig:false,syncBookmarks:false,syncPlugins:false,
    });
+   const started=performance.now();
    try{
     await p.v4Runtime.forcePull(false);
    }catch{ return {status:"failed",filename:null,content:null}; }
+   const peerPullWallMs=performance.now()-started;
    const s=p.v4Runtime.progressSnapshot;
    const file=app.vault.getAbstractFileByPath("UI-smoke.md");
    if(!file)return {status:s.lifecycle,filename:null,content:null};
    const content=await app.vault.read(file);
    await app.workspace.getLeaf("tab").openFile(file);
-   return {status:s.lifecycle,filename:file.path,content,diagnostics:s.diagnostics};
+   return {status:s.lifecycle,filename:file.path,content,diagnostics:s.diagnostics,peerPullWallMs};
   })()`,300000);
   assertSecondVaultRestore(restored,expectedContent);
   const verifiedFiles=await evaluate(`(async()=>{
@@ -175,7 +177,7 @@ export async function restoreEncryptedToSecondObsidian({
    assert.equal(result.lifecycle,"success","Second real Obsidian peer edit must publish");
    peerMutated=true;
   }
-  return {peerRestored:true,peerVaultPathMatches:true,filenameMatched:true,bytesRestored:Buffer.byteLength(restored.content,"utf8"),peerScreenshot:evidencePath,verifiedJourneyFiles:verifiedFiles.length,peerMutated,peerDiagnostics:restored.diagnostics};
+  return {peerRestored:true,peerVaultPathMatches:true,filenameMatched:true,bytesRestored:Buffer.byteLength(restored.content,"utf8"),peerScreenshot:evidencePath,verifiedJourneyFiles:verifiedFiles.length,peerMutated,peerDiagnostics:restored.diagnostics,peerPullWallMs:restored.peerPullWallMs};
  }finally{
   if(ws){try{ws.close()}catch{}}
   if(child?.pid){

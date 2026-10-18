@@ -488,16 +488,34 @@ export class V4StorageCodec {
     if (record.storage === "chunked") {
       const partPaths = record.partPaths ?? []
       if (partPaths.length === 0) throw new Error("V4 chunked record has no parts.")
-      for (let index = 0; index < partPaths.length; index++) {
-        if (signal?.aborted) throw signal.reason ?? new Error("V4 remote read aborted.")
-        const bytes = await reader(partPaths[index])
-        const plaintext = this.options.mode === "plaintext"
-          ? bytes
-          : await this.decrypt(() => decryptV4Payload(this.options.keyring!.contentKey, bytes, {
-            kind: "part",
-            aad: `${this.contentAad(record)}:${index}`,
-          }))
-        await append(plaintext)
+      const parallelReads = Math.ceil(record.size / partPaths.length) <= V4_GITHUB_REST_SAFE_WRITER_BYTES ? 2 : 1
+      const pending = new Map<number, Promise<Uint8Array>>()
+      let next = 0
+      const fill = () => {
+        while (next < partPaths.length && pending.size < parallelReads) {
+          const index = next++
+          const request = Promise.resolve().then(() => reader(partPaths[index]))
+          void request.catch(() => undefined)
+          pending.set(index, request)
+        }
+      }
+      try {
+        fill()
+        for (let index = 0; index < partPaths.length; index++) {
+          if (signal?.aborted) throw signal.reason ?? new Error("V4 remote read aborted.")
+          const bytes = await pending.get(index)!
+          pending.delete(index)
+          fill()
+          const plaintext = this.options.mode === "plaintext"
+            ? bytes
+            : await this.decrypt(() => decryptV4Payload(this.options.keyring!.contentKey, bytes, {
+              kind: "part",
+              aad: `${this.contentAad(record)}:${index}`,
+            }))
+          await append(plaintext)
+        }
+      } finally {
+        await Promise.allSettled(pending.values())
       }
     } else {
       await append(await this.read(record, reader))

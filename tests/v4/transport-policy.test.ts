@@ -8,10 +8,50 @@ import {
 } from "../../src/lib/v4/transport-policy"
 import { V4RequestScheduler } from "../../src/lib/v4/request-scheduler"
 
-test("transport defaults serialize mutations and keep GitHub spacing as runtime policy", () => {
-  assert.equal(DEFAULT_V4_TRANSPORT_POLICY.writeConcurrency, 1)
+test("transport defaults overlap two mutations while retaining GitHub start spacing", () => {
+  assert.equal(DEFAULT_V4_TRANSPORT_POLICY.writeConcurrency, 2)
   assert.equal(DEFAULT_V4_TRANSPORT_POLICY.mutationSpacingMs, 1_000)
   assert.equal(resolveV4TransportPolicy({ mutationSpacingMs: 17 }).mutationSpacingMs, 17)
+})
+
+test("two GitHub mutation uploads overlap without violating their start spacing", async () => {
+  let unblockFirst!: () => void
+  const firstBlocked = new Promise<void>(resolve => { unblockFirst = resolve })
+  let markSecond!: () => void
+  const secondStarted = new Promise<void>(resolve => { markSecond = resolve })
+  const starts: number[] = []
+  let active = 0
+  let peak = 0
+  const scheduler = new V4RequestScheduler({ writeConcurrency: 2, mutationSpacingMs: 25 })
+  const first = scheduler.run("write", async () => {
+    starts.push(Date.now())
+    active++
+    peak = Math.max(peak, active)
+    await firstBlocked
+    active--
+    return 1
+  })
+  const second = scheduler.run("write", async () => {
+    starts.push(Date.now())
+    active++
+    peak = Math.max(peak, active)
+    active--
+    markSecond()
+    return 2
+  })
+  try {
+    await Promise.race([
+      secondStarted,
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("second mutation failed to overlap")), 500)),
+    ])
+    assert.equal(starts.length, 2)
+    assert.ok(starts[1] - starts[0] >= 20, "the second mutation started before pacing elapsed")
+    assert.equal(peak, 2)
+  } finally {
+    unblockFirst()
+    await Promise.allSettled([first, second])
+  }
+  assert.deepEqual(await Promise.all([first, second]), [1, 2])
 })
 
 test("rate-limit delay honors retry-after reset and the documented one-minute fallback", () => {

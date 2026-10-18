@@ -9,7 +9,7 @@ export interface V4TransportPolicy {
 
 export const DEFAULT_V4_TRANSPORT_POLICY: V4TransportPolicy = {
   readConcurrency: 4,
-  writeConcurrency: 1,
+  writeConcurrency: 2,
   maxAttempts: 3,
   mutationSpacingMs: 1_000,
   secondaryLimitFallbackMs: 60_000,

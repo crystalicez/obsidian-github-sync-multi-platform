@@ -29,7 +29,7 @@ test("virtual 100 MB stream planning does not read or allocate the logical file"
   assert.equal(prepared.objectPaths.length, Math.ceil(MAX_TEST_BYTES / V4_PART_BYTES))
 })
 
-test("stream uploader releases each object before requesting the next one", async () => {
+test("stream uploader bounds retained objects and releases every part", async () => {
   let live = 0
   let maxLive = 0
   async function* objects() {
@@ -41,7 +41,7 @@ test("stream uploader releases each object before requesting the next one", asyn
         bytes: new Uint8Array(1024),
         release: () => { live-- },
       }
-      assert.equal(live, 0)
+      assert.ok(live <= 2)
     }
   }
   const github = {
@@ -55,6 +55,6 @@ test("stream uploader releases each object before requesting the next one", asyn
   }
   const uploaded = await uploadV4ObjectStream(github, { objects: objects() })
   assert.equal(uploaded.entries.length, 5)
-  assert.equal(maxLive, 1)
+  assert.ok(maxLive <= 2)
   assert.equal(live, 0)
 })
