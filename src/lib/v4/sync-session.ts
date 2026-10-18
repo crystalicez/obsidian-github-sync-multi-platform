@@ -79,7 +79,7 @@ export interface V4SyncSessionInput {
   includePath?: (path: string) => boolean
   onProgress?: (patch: V4SyncProgressPatch) => void
   diagnostics?: V4RunDiagnostics
-  maxConcurrentPartReads?: 1 | 2
+  maxConcurrentPartTransfers?: 1 | 2
   runState?: V4SyncRunState
   recoveryStore?: V4RecoveryStore
   resourceLimits?: Partial<V4ResourceLimits>
@@ -364,7 +364,7 @@ export class V4SyncSession {
       resources: this.resources,
       signal: input.signal,
       diagnostics: input.diagnostics,
-      maxConcurrentPartReads: input.maxConcurrentPartReads,
+      maxConcurrentPartTransfers: input.maxConcurrentPartTransfers,
     })
     this.now = input.now ?? (() => Date.now())
     this.localIo = createV4LocalIo(input.vault)
@@ -1007,6 +1007,7 @@ export class V4SyncSession {
         const progressItem = { fileId: after.fileId, path: after.path }
         const uploaded = await uploadV4ObjectStream(this.input.github, {
           objects: prepared.objects(this.input.signal),
+          maxConcurrentUploads: this.input.maxConcurrentPartTransfers ?? 2,
           progressItem,
           onLogicalFileUploadStarted: onUploadStarted,
           onLogicalFileUploaded: onUploaded,

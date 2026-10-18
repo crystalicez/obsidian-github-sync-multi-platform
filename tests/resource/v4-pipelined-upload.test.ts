@@ -37,6 +37,37 @@ test("streamed Git blobs upload in bounded pairs and publish tree entries in sou
   assert.equal(peak, 2)
 })
 
+test("mobile upload retains one blob and waits for each before opening the next", async () => {
+  let releaseFirst!: () => void
+  const firstGate = new Promise<void>(resolve => { releaseFirst = resolve })
+  const attempted: number[] = []
+  let live = 0
+  let maxLive = 0
+  const uploads = {
+    async createGitBlob(bytes: Uint8Array) {
+      attempted.push(bytes[0])
+      if (bytes[0] === 0) await firstGate
+      return String(bytes[0]).padStart(40, "0")
+    },
+  }
+  async function* objects() {
+    for (let index = 0; index < 3; index++) {
+      live++
+      maxLive = Math.max(live, maxLive)
+      yield { path: `${index}.part`, bytes: new Uint8Array([index]), release: () => { live-- } }
+    }
+  }
+  const job = uploadV4ObjectStream(uploads as never, { objects: objects(), maxConcurrentUploads: 1 })
+  await new Promise(resolve => setImmediate(resolve))
+  assert.deepEqual(attempted, [0])
+  assert.equal(maxLive, 1)
+  releaseFirst()
+  const result = await job
+  assert.deepEqual(result.entries.map(entry => entry.path), ["0.part", "1.part", "2.part"])
+  assert.equal(maxLive, 1)
+  assert.equal(live, 0)
+})
+
 test("failed streamed blob write releases every admitted buffer and never reports completion", async () => {
   const released: number[] = []
   let complete = false

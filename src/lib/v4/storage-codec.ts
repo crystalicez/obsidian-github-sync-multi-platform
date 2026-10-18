@@ -80,7 +80,7 @@ export class V4StorageCodec {
     resources?: Pick<V4ResourceController, "withCrypto"> & Partial<Pick<V4ResourceController, "reserveResidentBytes">>
     signal?: AbortSignal
     diagnostics?: V4RunDiagnostics
-    maxConcurrentPartReads?: 1 | 2
+    maxConcurrentPartTransfers?: 1 | 2
   }) {
     if (options.mode === "encrypted" && !options.keyring) {
       throw new Error("Encrypted V4 storage requires a keyring.")
@@ -490,7 +490,7 @@ export class V4StorageCodec {
       const partPaths = record.partPaths ?? []
       if (partPaths.length === 0) throw new Error("V4 chunked record has no parts.")
       const parallelReads = Math.ceil(record.size / partPaths.length) <= V4_GITHUB_REST_SAFE_WRITER_BYTES
-        ? this.options.maxConcurrentPartReads ?? 2
+        ? this.options.maxConcurrentPartTransfers ?? 2
         : 1
       const pending = new Map<number, Promise<Uint8Array>>()
       let next = 0

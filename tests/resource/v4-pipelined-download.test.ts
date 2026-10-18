@@ -48,7 +48,7 @@ test("mobile-sized transfer budget keeps remote part reads sequential", async ()
   const requested: string[] = []
   const appended: number[] = []
   const codec = new V4StorageCodec({
-    mode: "plaintext", pathLayout: "plaintext-v1", maxConcurrentPartReads: 1,
+    mode: "plaintext", pathLayout: "plaintext-v1", maxConcurrentPartTransfers: 1,
   })
   const task = codec.readToSink({
     record: {

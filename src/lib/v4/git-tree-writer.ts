@@ -187,6 +187,7 @@ export async function uploadV4ObjectStream(
   github: V4GitTreeGithub,
   input: {
     objects: AsyncIterable<V4StreamObject>;
+    maxConcurrentUploads?: 1 | 2;
     progressItem?: V4GitTreeProgressItem;
     onLogicalFileUploadStarted?: (item: V4GitTreeProgressItem) => void;
     onLogicalFileUploaded?: (item: V4GitTreeProgressItem) => void;
@@ -221,7 +222,7 @@ export async function uploadV4ObjectStream(
       })();
       void upload.catch(() => undefined);
       pending.push(upload);
-      if (pending.length === 2) await finishOldest();
+      if (pending.length === (input.maxConcurrentUploads ?? 2)) await finishOldest();
     }
     while (pending.length > 0) await finishOldest();
   } finally {
