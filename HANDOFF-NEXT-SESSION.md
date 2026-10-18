@@ -4,6 +4,13 @@
 >
 > **Mandatory workflow rule:** Every AI session that makes a material change to code, tests, design decisions, branch/PR state, verification status, or next steps MUST update this file before ending or handing work off. GitHub is the source of truth.
 
+## 2026-10-18 clean code-SHA 100 MB qualification
+
+- Code/test SHA `932df8e20a773fc59138808badb870de63542218` was pushed on the audit branch. Independent detached `.tmp/permanent-100mb-clean-20261018` had exact `git rev-parse HEAD` and pristine `## HEAD (no branch)` status **after** validation.
+- Inside the detached checkout: frozen pnpm install, build, fast, resource (15/15), 100 MB cryptographic soak (1/1), and actual 100 MB Windows file write/copy/hash all exit 0. On-disk, copy and cryptographic-soak SHA-256: `f079cad53add0091ed5d0409b0469f9f5cb745b8c280be685dda73203dea90e8`.
+- Working-tree repeat 10/10, feasibility, metadata/package validation and E2E compile passed earlier; an isolated repeat retry was refused at process capacity 17/16 and cannot be called an exact-SHA repeat result. Full live GitHub 100 MB encrypted Force Push/Pull **has not run**, as read-only preflight refused a missing pinned repo ID and a test branch outside the disposable namespace. No GitHub data mutation, merge or release.
+- Clean details recorded in `docs/engineering/permanent-100mb-test-qualification-2026-10-18.md`; original `tests/v4/github-transport.test.ts` unstaged WIP remains untouched.
+
 ## 2026-10-18 permanent 100 MB-only tests and initial Windows evidence
 
 - **Latest maintainer direction supersedes release-only scope:** All ongoing and future generated-file tests, virtual streams, soak and physical large-file tests must use at most **100 MB (100,000,000 bytes)**. No runnable 2/5 GiB soak/default is retained. Updated `scripts/run-soak.mjs` (strict >100 MB rejection), `tests/soak/v4-100mb-stream.test.ts`, `scripts/model-github-v4-large-file.mjs`, v4 benchmark/resource/feasibility/writer part fixtures and test discovery. The production sync engine was not limited to 100 MB.

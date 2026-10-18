@@ -20,4 +20,12 @@ The read-only GitHub E2E preflight **failed closed**. The configured environment
 
 **Blocker:** independently verify an owned disposable GitHub target by pinned numeric repository ID, a fresh namespaced test branch and restricted credentials, then implement/qualify a real file-backed 100 MB Obsidian V4 round trip. The current `MemoryVault` E2E fixture has no large-file bounded read/staging interface and cannot be substituted for the physical 100 MB test. Ask for target authorization if the correct branch / repository identity cannot be proven. Hosted CI and physical Android/mobile acceptance remain separate gates.
 
+## Independent clean exact-code-SHA qualification
+
+Pushed code commit: `932df8e20a773fc59138808badb870de63542218`. A separate detached checkout at `.tmp/permanent-100mb-clean-20261018` reported `git rev-parse HEAD` equal to that SHA and `git status --short --branch` equal to `## HEAD (no branch)` **after** running tests. The original main checkout's unstaged user WIP is not part of this SHA.
+
+Inside that detached checkout, `corepack pnpm install --frozen-lockfile`, `build`, `test:fast`, `test:resource` (15/15), `test:soak` (100,000,000 bytes, 1/1), and `test:windows:100mb` all completed with exit code 0. The clean 100 MB Windows SHA-256 was identical to the earlier working-tree test: `f079cad53add0091ed5d0409b0469f9f5cb745b8c280be685dda73203dea90e8`. Its isolated local report is `.tmp/permanent-100mb-clean-20261018/.tmp/windows-100mb-FuCKp0/report.json`.
+
+`test:repeat` passed 10/10 earlier in the main working tree but **was not rerun on the isolated SHA**: a further shell launch was refused by the lnwjud process pool limit (17/16). Working-tree feasibility, metadata/package validation and E2E bundle compilation all passed; those three commands were also not rerun from the detached code SHA in this iteration. Hosted CI, real encrypted GitHub 100 MB transfer, and physical mobile acceptance remain unverified.
+
 Neither the local file copy nor the virtual SHA soak constitutes production sync acceptance. No merge or release was performed.
