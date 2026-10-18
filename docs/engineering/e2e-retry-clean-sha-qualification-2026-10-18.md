@@ -30,7 +30,7 @@ The native UI command `node scripts/run-ui-screenshots.mjs --launch` also exited
 
 - Credentialed full live GitHub E2E has **not** been rerun on this SHA. The intermittent `controlled-external-branch-head-race` case remains unresolved, and exact disposable-target and cleanup proofs must accompany any live qualification.
 - GitHub's public Actions workflows API shows `CI` as active, but the exact code SHA has **zero observed hosted workflow runs**. This does not establish why Actions did not run. Inspect repository Actions settings and eligibility before counting hosted CI as passed.
-- The clean checkout is not `master`; independent review, real physical device coverage, Windows 5 GiB evidence and any release claims remain separate gates.
+- The clean checkout is not `master`; independent review, real physical device coverage, physical Windows 100 MB evidence (maintainer's 2026-10-18 release decision) and any release claims remain separate gates; 5 GiB physical qualification is not required.
 - No live GitHub mutation, stable release, merge, or production runtime change was performed in this qualification.
 
 Do not substitute the completed deterministic gates for live GitHub, hosted CI, physical devices, or maintainer sign-off.

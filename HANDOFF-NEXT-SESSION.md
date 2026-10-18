@@ -4,6 +4,13 @@
 >
 > **Mandatory workflow rule:** Every AI session that makes a material change to code, tests, design decisions, branch/PR state, verification status, or next steps MUST update this file before ending or handing work off. GitHub is the source of truth.
 
+## 2026-10-18 maintainer decision — physical Windows release test capped at 100 MB
+
+- **Final maintainer choice:** Test only **100 MB (100,000,000 decimal bytes)** as the physical Windows large-file release scenario; do **not** require a physical 5 GiB file. The Windows encrypted Force Push → no-op → separate clean-vault Force Pull → exact SHA-256 equality, observed bounded-memory measurements, and controlled recovery procedure still apply at 100 MB. **Physical 100 MB has not been run; baseline remains pending.**
+- Updated `tests/baselines/v4/windows.json` physical-file `logicalBytes=100000000` and explicit decimal-size scope, `docs/testing/v4-windows-android-validation.md` including bounded PowerShell fixture generation, current release readiness, bilingual FAQ, and clean audit-SHA report. New `tests/v4/windows-release-size-scope.test.mjs` enforces the size, pending result, safe file creation, and the distinction between historical virtual 2/5 GiB tests and the current physical release gate.
+- **Do not change** existing protocol limits, large-file guards, or historical virtual stress-test results because this is a release-qualification policy decision, not an instruction to remove code capability. Do not claim physical support above 100 MB based on virtual evidence. Android large-file support remains separately capability-gated.
+- No real 100 MB GitHub upload, Force Push, or Force Pull was carried out without a verified disposable target and explicit authorization. Original unstaged `tests/v4/github-transport.test.ts` WIP must remain untouched; no merge or release.
+
 ## 2026-10-18 clean exact-SHA qualification — previously blocked gate now PASSED
 
 - **Code SHA:** `4df548c31189d9864eff2a9b0fd9bf5fcda33ad1` in isolated detached `.tmp/e2e-retry-clean-20261018`; exact `git rev-parse HEAD` matched and `git status --short --branch` remained `## HEAD (no branch)` before and after qualification. This **supersedes the older 16/16 shell-capacity blocker** directly below. The main workspace's pre-existing unstaged `tests/v4/github-transport.test.ts` edit was not included.

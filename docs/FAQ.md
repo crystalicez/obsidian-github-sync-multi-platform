@@ -31,20 +31,20 @@ V4 会检测真正的三方冲突，不再采用旧版 FAQ 中描述的“409 �
 
 网络过程中如果本地目标又被用户修改，最终写入前的 precondition 会阻止静默覆盖，并转入重新规划/恢复路径。
 
-### Q4. 大文件和 5 GiB 的支持状态是什么？
+### Q4. 当前版本的 100 MB 文件测试范围，以及更大文件的支持状态？
 
 V4 远端格式在超过 50 MiB 时使用分片；当前兼容读取必须接受历史 48 MiB 分片。桌面端实现了有界读取、分阶段写入和最终校验提交，自动化测试还覆盖 512 MiB 虚拟路径以及独立的 2/5 GiB cryptographic soak harness。
 
-但是“自动化虚拟流通过”不等于“真实设备 5 GiB 通过”。公开支持结论必须来自 `tests/baselines/v4/` 中记录的物理测试：
+当前版本的 Windows 实机验收范围仅为 **100 MB（100,000,000 字节）**。虚拟 2/5 GiB 测试是历史自动化证据，不代表实机支持，也不是本次发布门槛。公开支持结论必须来自 `tests/baselines/v4/` 中记录的实机测试：
 
-- **Windows 5 GiB**：在完整 Force Push → no-op → 清洁 vault Force Pull → SHA-256 相等测试被记录之前，状态是待物理验证。
+- **Windows 100 MB**：在实机完整加密 Force Push → no-op → 清洁 vault Force Pull → SHA-256 相等及恢复验证被记录之前，状态是待验证；本次发布不声明超过 100 MB 的实机文件支持。
 - **Android 5 GiB**：当前实现没有经过支持路径证明的有界本地读取和最终 stage-commit，因此大文件会能力门控；状态为 `platform-capability-fail`，不宣称 Android 5 GiB。
 
 ### Q5. GitHub Free 适合反复同步 5 GiB 加密文件吗？
 
 一次操作“技术上可能完成”和“长期运行健康”是两回事。当前 48 MiB 模型对 5 GiB 文件约为 107 个数据分片、约 114 个内容/发布 mutation，并至少需要约 113 秒的 1 秒 mutation pacing（不含网络、加密、重试和磁盘 I/O）。更重要的是，两个完整加密 5 GiB 修订的模型增长已经略高于 GitHub 当前 10 GB 仓库大小建议。
 
-因此在真实一次性测量完成前，发布层面的 GitHub Free 5 GiB 状态仍是 `measurement-required`，尚不赋予发布分类；模型结论是 `technical-pass-operational-limited`，不能宣传为适合频繁修改的 5 GiB 工作负载。
+5 GiB 的运行模型仅作历史研究参考，不是本次发布的实机测试门槛。在一次性真实仓库测量完成前，不得给予 5 GiB 发布支持分类；`technical-pass-operational-limited` 只是模型结论，不能宣传为实机支持。
 
 ---
 
@@ -73,19 +73,19 @@ V4 detects a three-way conflict instead of using the old “retry 409 then overw
 
 If the user changes a local target while network work is in flight, the final precondition check refuses to silently overwrite that edit and moves the run into recovery/replanning.
 
-### Q4. What is the large-file / 5 GiB support status?
+### Q4. What is the 100 MB release test scope and larger-file support status?
 
 The V4 remote format uses parts above 50 MiB and readers remain compatible with historical 48 MiB parts. Desktop code has bounded reads, staged writes, and verified final commit/rollback. The official Windows Task 15 automated gate and the separate 2/5 GiB cryptographic soak are recorded as passed.
 
-A virtual stream is not a physical-device 5 GiB pass. Public support claims come only from recorded evidence in `tests/baselines/v4/`:
+The current release's physical Windows test scope is **100 MB (100,000,000 bytes)**. Historical virtual 2/5 GiB tests are not physical-device passes and are not required for this release. Public support claims depend on recorded evidence in `tests/baselines/v4/`:
 
-- **Windows 5 GiB**: pending a recorded physical Force Push → no-op → clean-vault Force Pull → SHA-256 equality run.
+- **Windows 100 MB**: pending a recorded real-device encrypted Force Push → no-op → clean-vault Force Pull → SHA-256 equality and recovery run. This release makes no physical-file support claim above 100 MB.
 - **Android 5 GiB**: the current supported implementation lacks bounded local read and bounded final stage-commit capability, so large mobile paths are capability-gated and classified `platform-capability-fail`.
 
 ### Q5. Is repeated 5 GiB encrypted sync operationally suitable on GitHub Free?
 
 Technical completion and operational suitability are separate. With the current 48 MiB model, one 5 GiB revision is 107 data parts and about 114 modeled content/publication mutations, with a minimum 113-second one-second mutation-pacing floor before network, crypto, retries, or disk I/O. Repository growth is the stronger limitation: two full encrypted 5 GiB revisions already model slightly above GitHub's current 10 GB repository-size recommendation.
 
-Until one disposable-repository measurement is recorded, the release status is `measurement-required` and no release classification is assigned yet. The current model classification is `technical-pass-operational-limited`, not “healthy for frequent 5 GiB edits.”
+The 5 GiB operational model is historical research, not a physical qualification requirement for this release. Without a real disposable-repository measurement, no 5 GiB release classification is justified; the model label `technical-pass-operational-limited` is not a physical support claim.
 
 See `docs/engineering/v4-github-free-operational-model.md` and `docs/testing/v4-windows-android-validation.md` for the evidence rules.

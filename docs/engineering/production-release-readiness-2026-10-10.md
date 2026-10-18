@@ -21,8 +21,8 @@
 | Hosted CI | Successful current-attempt CI of exact master SHA and artifact provenance | No current audit-SHA run found; investigate Actions execution before release |
 | Live GitHub | Exact-SHA qualification on isolated disposable target with pinned numeric repo ID; cleanup verified | Not run for this candidate |
 | Devices | Real desktop/mobile smoke tests for claimed platforms; verify sync/conflicts/offline/restart/upgrade | No new physical evidence |
-| Windows 5 GiB | Force Push → no-op → clean-vault Force Pull SHA-256 equality and controlled recovery with bounded-memory measurements | `tests/baselines/v4/windows.json`: pending |
-| Android 5 GiB | Supported bounded read and atomic stage commit on device, then physical evidence | Unsupported; keep capability-failed |
+| Windows 100 MB (current release decision 2026-10-18) | Exactly 100,000,000 bytes on physical Windows: encrypted Force Push → no-op → clean-vault Force Pull, SHA-256 equality, controlled recovery and memory measurements | `tests/baselines/v4/windows.json`: pending; 5 GiB physical test explicitly out of scope |
+| Android large-file support | No release claim from Windows qualification; require proven bounded read and atomic stage commit on device before any Android large-file claim | Unsupported; keep capability-failed |
 | Release qualification and assets | Official exact-SHA `pnpm qualify:local` receipt, `pnpm release:local -- <version>`, stable ref/draft/asset digests verified | Not run; requires maintainer release decision |
 
 ### Hosted Actions observation (2026-10-10)
@@ -62,7 +62,7 @@ This is **clean exact-audit-SHA deterministic evidence**, not qualification of `
 
 1. **PR merge:** approve the reviewed audit diff and decide when to merge to `master`; no automatic merge.
 2. **Live test target and authorization:** select an initialized disposable private GitHub repository, pin its numeric ID and tightly scoped token, and authorize destructive E2E there. Never point it at notes or the source repository.
-3. **Platform claims:** decide the minimal physical Windows/macOS/Linux/Android/iOS smoke matrix and whether a 5 GiB Windows result is mandatory before this release or specifically excluded from its claims. Android multi-GiB remains unsupported.
+3. **Platform claims:** the maintainer resolved the Windows large-file release gate on 2026-10-18: **100 MB (100,000,000 bytes) physical Windows qualification, not 5 GiB**. Decide the remaining Windows/macOS/Linux/Android/iOS smoke matrix separately. Android large-file support remains unsupported.
 4. **Security acceptance:** decide whether to accept the bounded-transport limitation, general Git-tree semantic response equivalence residual, keyring retirement lifetime and remote metadata pre-parse bounds, or require deeper hardening.
 5. **Publication:** choose the stable version and publication window, after the exact `master` SHA has passed qualification. Do not bypass the intentionally disabled Actions Stable Release workflow; use the supported local exact-SHA path.
 
