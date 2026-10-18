@@ -122,7 +122,7 @@ export async function restoreEncryptedToSecondObsidian({
    if(!file)return {status:s.lifecycle,filename:null,content:null};
    const content=await app.vault.read(file);
    await app.workspace.getLeaf("tab").openFile(file);
-   return {status:s.lifecycle,filename:file.path,content};
+   return {status:s.lifecycle,filename:file.path,content,diagnostics:s.diagnostics};
   })()`,300000);
   assertSecondVaultRestore(restored,expectedContent);
   const verifiedFiles=await evaluate(`(async()=>{
@@ -175,7 +175,7 @@ export async function restoreEncryptedToSecondObsidian({
    assert.equal(result.lifecycle,"success","Second real Obsidian peer edit must publish");
    peerMutated=true;
   }
-  return {peerRestored:true,peerVaultPathMatches:true,filenameMatched:true,bytesRestored:Buffer.byteLength(restored.content,"utf8"),peerScreenshot:evidencePath,verifiedJourneyFiles:verifiedFiles.length,peerMutated};
+  return {peerRestored:true,peerVaultPathMatches:true,filenameMatched:true,bytesRestored:Buffer.byteLength(restored.content,"utf8"),peerScreenshot:evidencePath,verifiedJourneyFiles:verifiedFiles.length,peerMutated,peerDiagnostics:restored.diagnostics};
  }finally{
   if(ws){try{ws.close()}catch{}}
   if(child?.pid){

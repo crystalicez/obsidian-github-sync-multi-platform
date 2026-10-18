@@ -75,6 +75,7 @@ const sendErrors=[];
 const journeySteps=[];
 let nativeBinary=null;
 let diagnosticEvidence=null;
+let peerDiagnosticEvidence=null;
 const requestMap=new Map();let serial=0;
 function send(method,params={},timeoutMs=25000){
  return new Promise((resolve,reject)=>{
@@ -331,6 +332,13 @@ try{
     expectedFiles:journey?expectedPeerFiles:[],absentPaths:journey?["Notes/สวัสดี 🌏.md"]:[],exercisePeerConflict:journey,expectedBinary:nativeBinary,
    });
    assertTrue(restored.peerRestored&&restored.bytesRestored>0,"Second real Obsidian vault could not decrypt remote data");
+   if(assertDiagnostics){
+    const d=restored.peerDiagnostics;
+    assertTrue(d?.apiRequests>0&&d?.downloadBytes>0&&d?.decryptionMs>0&&d?.peakRendererRssBytes>0,
+     "Second native Obsidian did not measure GitHub download/decryption/RAM");
+    if(native100mb)assertTrue(d.downloadBytes>=100_000_000,"Second native Obsidian did not download 100 MB through measured API requests");
+    peerDiagnosticEvidence=d;
+   }
    const afterPull=await readState(configuration);
    if(journey){
     assertTrue(restored.peerMutated&&afterPull.kind==="present"&&afterPull.sha!==finalSha,
@@ -373,5 +381,5 @@ try{
   try{await cleanupGeneratedUiRun(runRoot,{repoRoot:root});}catch(error){console.error("WARNING: isolated test vault cleanup incomplete ("+String(error?.code||"unknown").slice(0,30)+")");process.exitCode=1;}
  }
  console.log(JSON.stringify({status:passed&&!process.exitCode?"PASS":"FAIL",cleanup:cleanupState,remoteHeadChanged:Boolean(initialSha&&finalSha&&initialSha!==finalSha),
-  screenshotCaptured:screenBytes>1000,screenshotPath:screenBytes>1000?screenshot:null,uiExceptions:sendErrors.length,mode,remoteEncryptionVerified,peerRestored,peerScreenshot,journeySteps,diagnostics:diagnosticEvidence,native100mbBytes:nativeBinary?.size??0,native100mbSha256:nativeBinary?.sha256??null,runBranch:branch,repository:configuration?.targetRepository,token:"[not reported]"}));
+  screenshotCaptured:screenBytes>1000,screenshotPath:screenBytes>1000?screenshot:null,uiExceptions:sendErrors.length,mode,remoteEncryptionVerified,peerRestored,peerScreenshot,journeySteps,diagnostics:diagnosticEvidence,peerDiagnostics:peerDiagnosticEvidence,native100mbBytes:nativeBinary?.size??0,native100mbSha256:nativeBinary?.sha256??null,runBranch:branch,repository:configuration?.targetRepository,token:"[not reported]"}));
 }
