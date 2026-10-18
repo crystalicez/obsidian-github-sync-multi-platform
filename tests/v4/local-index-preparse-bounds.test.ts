@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import test from "node:test";
-import { createEmptyV4LocalIndex, loadV4LocalIndex, saveV4LocalIndex } from "../../src/lib/v4/local-index";
+import { createEmptyV4LocalIndex, fitsV4LocalJsonSizeLimit, loadV4LocalIndex, saveV4LocalIndex } from "../../src/lib/v4/local-index";
 
 function adapter() {
   const values = new Map<string, string>();
@@ -13,6 +13,14 @@ function adapter() {
     async mkdir() {},
   };
 }
+
+test("local JSON byte limiter matches UTF-8 for ASCII, BMP, astral and lone surrogate characters", () => {
+  for (const value of ["ASCII", "中", "🙂", "A中🙂", String.fromCharCode(0xd800)]) {
+    const encodedBytes = new TextEncoder().encode(value).byteLength;
+    assert.equal(fitsV4LocalJsonSizeLimit(value, encodedBytes), true, value);
+    assert.equal(fitsV4LocalJsonSizeLimit(value, encodedBytes - 1), false, value);
+  }
+});
 
 test("overlong valid local index header cannot authorize a cached remote commit", async () => {
   const io = adapter();
@@ -38,6 +46,35 @@ test("UTF-8 local header write budget matches the adapter byte-size preflight", 
   const cache = createEmptyV4LocalIndex({ repoId: "中".repeat(24 * 1024), deviceId: "d", mode: "plaintext" });
   await assert.rejects(() => saveV4LocalIndex(io, "index", cache), /cache limit/);
   assert.equal(io.values.has("index/index.json"), false);
+});
+
+test("stale byte-size hint cannot authorize an oversized UTF-8 cache header", async () => {
+  const backing = adapter();
+  const cache = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "d", mode: "plaintext" });
+  await saveV4LocalIndex(backing, "index", cache);
+  const header = JSON.parse(backing.values.get("index/index.json")!);
+  backing.values.set("index/index.json", JSON.stringify({ ...header, repoId: "中".repeat(23 * 1024) }));
+  const io = {
+    ...backing,
+    async stat() { return { size: 1024 }; },
+  };
+  const loaded = await loadV4LocalIndex(io, "index");
+  assert.equal(loaded.repoId, "");
+  assert.equal(loaded.generation, 0);
+});
+
+test("non-ASCII shard exceeding the byte cap is rejected even without stat", async () => {
+  const io = adapter();
+  const cache = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "d", mode: "plaintext" });
+  cache.remoteCommitSha = "untrusted-remote-commit";
+  const hash = createHash("sha256").update(JSON.stringify([])).digest("hex");
+  cache.shardHashes.ab = hash;
+  cache.shards.ab = { bucket: "ab", hash, records: {} };
+  await saveV4LocalIndex(io, "index", cache);
+  io.values.set("index/shards/ab.json", JSON.stringify({ ...cache.shards.ab, extra: "中".repeat(11 * 1024 * 1024) }));
+  const loaded = await loadV4LocalIndex(io, "index");
+  assert.equal(loaded.remoteCommitSha, undefined);
+  assert.deepEqual(loaded.shards, {});
 });
 
 test("cache header size from Obsidian stat prevents an oversized adapter read", async () => {

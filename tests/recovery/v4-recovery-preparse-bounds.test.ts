@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test from "node:test";
 import { createV4RecoveryStore, V4RecoveryRequiredError } from "../../src/lib/v4/recovery-store";
 
@@ -62,6 +63,31 @@ test("recovery stat preflight skips oversized latest slot before adapter read", 
   const recovered = await createV4RecoveryStore({ adapter: io, root: "recovery", repoId: "o/r#main" }).load();
   assert.equal(recovered?.header.generation, prior.header.generation);
   assert.equal(newerReads, 0);
+});
+
+test("newest byte-oversized Unicode recovery slot falls back to the older valid receipt", async () => {
+  const io = adapter();
+  const store = createV4RecoveryStore({ adapter: io, root: "recovery", repoId: "o/r#main" });
+  const prior = await store.save(input("publish-intent"));
+  const newest = await store.save(input("remote-verified"));
+  const path = `recovery/slot-${newest.header.generation % 2}.json`;
+  const forged = { ...JSON.parse(io.values.get(path)!), runId: "中".repeat(11 * 1024 * 1024) };
+  const integrityView = {
+    schemaVersion: forged.schemaVersion,
+    generation: forged.generation,
+    runId: forged.runId,
+    journalId: forged.journalId,
+    phase: forged.phase,
+    expectedRemoteHead: forged.expectedRemoteHead,
+    candidateCommitSha: forged.candidateCommitSha,
+    verifiedRemoteHead: forged.verifiedRemoteHead,
+    payloadCiphertext: forged.payloadCiphertext,
+  };
+  forged.integrity = createHash("sha256").update(JSON.stringify(integrityView)).digest("hex");
+  io.values.set(path, JSON.stringify(forged));
+  const recovered = await store.load();
+  assert.equal(recovered?.header.generation, prior.header.generation);
+  assert.equal(recovered?.header.phase, "publish-intent");
 });
 
 test("older valid recovery generation survives an overlong newer slot", async () => {

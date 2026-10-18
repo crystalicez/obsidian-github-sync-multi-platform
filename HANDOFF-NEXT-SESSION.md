@@ -4,6 +4,13 @@
 >
 > **Mandatory workflow rule:** Every AI session that makes a material change to code, tests, design decisions, branch/PR state, verification status, or next steps MUST update this file before ending or handing work off. GitHub is the source of truth.
 
+## 2026-10-18 poteto-mode Unicode local JSON byte-limit hardening
+
+- RED reproduction found that stale or absent adapter `stat` can allow a local index header, shard, or integrity-valid recovery receipt with non-ASCII JSON to exceed the stated UTF-8 byte cap while remaining below the UTF-16 string-length cap. The index could trust a stale cached remote head; recovery could select an over-limit newer generation rather than the valid older receipt. Focused baseline failed **2 index assertions** and **1 recovery assertion** on the intended behavior.
+- A shared, allocation-free UTF-8 size predicate now guards both persisted writes and post-read acceptance in `src/lib/v4/local-index.ts` and `src/lib/v4/recovery-store.ts`. It counts ASCII, multibyte BMP, supplementary-plane pairs, and malformed surrogates. Post-`stat` checks still reject a changed file after read, without allocating an extra byte buffer for size measurement. Original stat-before-read preflight remains.
+- GREEN focused **8/8 index** (including exact UTF-8 boundary cases) and **5/5 recovery**. Full working-tree build, fast **678/678**, repeat **10 consecutive rounds of 678/678**, recovery **55/55**, resource **18/18**, soak **6/6**, feasibility **139/139**, three GitHub E2E bundles compile, metadata validation and package validation all finished exit 0. Soak uses at most **100,000,000 bytes**. These results are working-tree evidence, not a clean exact-commit-SHA or hosted run.
+- No remote GitHub mutation, release, merge, production data operation, or old-client protocol change. The existing unrelated `tests/v4/github-transport.test.ts` WIP remains unstaged and untouched. Live GitHub pack/medium, native Obsidian 100 MB, mobile, old-client capability rollout, buffered response memory, Git tree semantic proof, and hosted review/CI remain open. Stat-before-read is not an atomic size-bounded file handle, so a racing filesystem replacement can still allocate before rejection.
+
 ## 2026-10-18 poteto-mode storage stat preflight
 
 - Second RED → GREEN unit after JSON parser caps: Obsidian `V4LocalIndexAdapter.stat` size hint is wired through `runtime.ts` and validated before `read()`. A 67 KiB index header or 33 MiB recovery slot with reported over-cap size is now ignored **without loading its contents**. Recovery falls back to the last valid receipt. The source continues post-read guards when `stat` is not implemented or a file changes between checks.
