@@ -107,7 +107,7 @@ async function waitUntil(predicate,ms,label){
  while(Date.now()<stop){const v=await predicate();if(v)return v;await sleep(320);}
  throw Error("Timed out: "+label);
 }
-async function captureSyncedCenter(){
+async function captureSyncedCenter({requireFileWork=false}={}){
  const dims=await evaluate(`(()=>{
   const el=document.querySelector(".github-sync-center");
   if(!el)return null;const b=el.getBoundingClientRect();
@@ -123,10 +123,12 @@ async function captureSyncedCenter(){
  assertTrue(dims?.syncAction && dims?.lifecycle==="success" && !dims?.leakedToken && !dims?.leakedPassphrase,"Sync Center must show a completed sync without leaking credentials");
  if(assertDiagnostics){
   const d=dims.metrics;
+  console.log(JSON.stringify({kind:"native-ui-metrics",metrics:d??null,rowsVisible:dims.diagnosticRows}));
   assertTrue(dims.diagnosticRows&&d?.apiRequests>0&&d?.uploadBytes>0&&d?.downloadBytes>0,
    "Live Obsidian UI did not render real GitHub throughput and API request metrics");
-  assertTrue(d.hashingMs>0&&d.encryptionMs>0&&d.apiLatencyMs>0,
-   "Live Obsidian did not record hashing, encryption and GitHub request timing");
+  assertTrue(d.apiLatencyMs>0,"Live Obsidian did not record GitHub request timing");
+  if(requireFileWork)assertTrue(d.hashingMs>0&&d.encryptionMs>0,
+   "Native 100 MB Obsidian upload did not record real hashing and encryption work");
   assertTrue(d.peakRendererRssBytes>0,"Live Windows Obsidian renderer RSS was not sampled");
   diagnosticEvidence=d;
  }
@@ -322,7 +324,7 @@ try{
    assertTrue(remote.kind==="present"&&remote.sha!==before,"Native Obsidian 100 MB upload did not publish a commit");
    finalSha=remote.sha;
    nativeBinary={path:name,size,sha256:checksum.digest("hex")};
-   if(assertDiagnostics) await captureSyncedCenter();
+   if(assertDiagnostics) await captureSyncedCenter({requireFileWork:true});
    journeySteps.push("real Obsidian indexed and uploaded exact 100 MB binary");
   }
   if(verifyPeer){
