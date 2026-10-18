@@ -4,6 +4,12 @@
 >
 > **Mandatory workflow rule:** Every AI session that makes a material change to code, tests, design decisions, branch/PR state, verification status, or next steps MUST update this file before ending or handing work off. GitHub is the source of truth.
 
+## 2026-10-18 real Obsidian multi-action conflict and 100 MB native qualification
+
+- **GREEN clean committed code SHA `d9c409dd32fb5b21c24b186cb2305adcdebac78c`:** Independent detached `.tmp/native-journey-d9c409d-clean`, frozen pnpm install and production build, actual Obsidian.exe UI + GitHub REST with encrypted disposable branch `obsidian-sync-e2e/local-d9c409dd32fb-6cde8568a702bc09`. `--mode=encrypted --verify-peer --journey` ended **PASS, uiExceptions=0, remoteEncryptionVerified=true, peerRestored=true, cleanup=absent-verified**. Four verified stages: native create nested Unicode plus scratch → encrypted manual sync; rename + modify + delete combined → sync; recreate deleted file → sync; second *real Obsidian process* Force Pull validates contents and original-path absence, then edits same note remotely while local also changes; Copy policy preserved **both** independent texts. GitHub branch deleted after run, no user vault or default branch used.
+- **Additional real-native max-file harness:** Optional `--native-100mb` requires encrypted mode and `--verify-peer`; writes exactly **100,000,000 bytes** with bounded 8 MiB filesystem writes **inside the fresh test vault**, checks actual Obsidian vault indexing, uploads through the real Obsidian V4 runtime to verified disposable GitHub branch, then second real Obsidian Force Pull checks its indexed file, physical size, and streaming SHA-256 equality. No larger fixture permitted. This option is **NOT YET RUN** at this checkpoint; do not call the 100 MB native gate passed before obtaining process exit code and remote branch cleanup proof.
+- Running the expanded harness does not waive physical Android/iOS testing, restart persistence, hosted CI, or independent review. Original unrelated `tests/v4/github-transport.test.ts` remains unstaged and untouched.
+
 ## 2026-10-18 native Obsidian Windows user-journey qualification
 
 - **Authorization / target:** User requests real Obsidian.exe with multi-action combinations against dedicated `diamond-crystal/test-vault-obsidian-encrypted-github-sync-multi-platform` (pinned repository ID `1284153873`), using unique `obsidian-sync-e2e/local-*` branch per run. Keep this **actual** `HANDOFF-NEXT-SESSION.md` as repo's durable memory. Never use a real user vault; <=100 MB permanent fixture cap.

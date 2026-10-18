@@ -4,8 +4,8 @@
 // Requires an EXPLICIT, pinned GITHUB_E2E_EXPECTED_REPO_ID (do not infer at runtime).
 import assert from "node:assert/strict";
 import {spawn,spawnSync} from "node:child_process";
-import {randomBytes} from "node:crypto";
-import {copyFile,mkdir,writeFile} from "node:fs/promises";
+import {createHash,randomBytes} from "node:crypto";
+import {copyFile,mkdir,open,stat,writeFile} from "node:fs/promises";
 import path from "node:path";
 import {fileURLToPath} from "node:url";
 import {loadGitHubE2EEnv,qualificationE2EBranch,validateGitHubE2EConfig} from "./github-e2e-env.mjs";
@@ -24,6 +24,8 @@ const dryRun=opts.includes("--preflight-only");
 const mode=parseLiveUiMode(option("mode",undefined));
 const verifyPeer=opts.includes("--verify-peer");
 const journey=opts.includes("--journey");
+const native100mb=opts.includes("--native-100mb");
+assert.ok(!native100mb||(mode==="encrypted"&&verifyPeer),"Native 100 MB test requires encrypted mode and a second real Obsidian vault");
 assert.ok(!verifyPeer||mode==="encrypted","A second-vault restore requires --mode=encrypted");
 const passphrase=mode==="encrypted"?randomBytes(32).toString("base64url"):"";
 const id="encrypted-github-sync-multi-platform";
@@ -70,6 +72,7 @@ let processHandle,ws,configuration,branch,verified=false,passed=false,initialSha
 let cleanupState="not-started",screenBytes=0,remoteEncryptionVerified=false,peerRestored=false,peerScreenshot=null;
 const sendErrors=[];
 const journeySteps=[];
+let nativeBinary=null;
 const requestMap=new Map();let serial=0;
 function send(method,params={},timeoutMs=25000){
  return new Promise((resolve,reject)=>{
@@ -276,11 +279,42 @@ try{
    const checked=await evaluate("(async()=>{const expected="+JSON.stringify(expectedPeerFiles)+";for(const entry of expected){const file=app.vault.getAbstractFileByPath(entry.path);if(!file||(await app.vault.read(file))!==entry.content)return {ok:false};}return {ok:!app.vault.getAbstractFileByPath("+JSON.stringify(original)+")};})()");
    assertTrue(checked?.ok,"Native source files diverged after combined changes");
   }
+  if(native100mb){
+   const name="Assets/payload-100mb.bin";
+   const size=100_000_000;
+   const before=finalSha;
+   await evaluate("(async()=>{await app.vault.createFolder('Assets');return true;})()");
+   const full=path.join(vault,"Assets","payload-100mb.bin");
+   const block=Buffer.allocUnsafe(8*1024*1024);
+   for(let i=0;i<block.length;i++)block[i]=(i*31+17)&255;
+   const checksum=createHash("sha256");
+   const handle=await open(full,"wx");
+   let written=0;
+   try{
+    while(written<size){
+     const wanted=Math.min(block.length,size-written);
+     const next=await handle.write(block,0,wanted,written);
+     assertTrue(next.bytesWritten>0,"Native 100 MB fixture write did not advance");
+     checksum.update(block.subarray(0,next.bytesWritten));
+     written+=next.bytesWritten;
+    }
+   }finally{await handle.close();}
+   assertTrue((await stat(full)).size===size,"Native 100 MB fixture size changed");
+   const observed=await waitUntil(()=>evaluate("(()=>{const f=app.vault.getAbstractFileByPath('Assets/payload-100mb.bin');return f?.stat?.size===100000000?{size:f.stat.size}:null;})()"),60000,"real Obsidian indexed new 100 MB binary");
+   assertTrue(observed.size===size,"Native Obsidian did not index the synthetic 100 MB file");
+   const uploaded=await evaluate("(async()=>{const p=app.plugins.plugins["+JSON.stringify(id)+"];await p.v4Runtime.manualSync();return {lifecycle:p.v4Runtime.progressSnapshot.lifecycle,trigger:p.v4Runtime.progressSnapshot.trigger};})()",480000);
+   assertTrue(uploaded.lifecycle==="success"&&uploaded.trigger==="manual","Native Obsidian 100 MB GitHub Push failed");
+   const remote=await readState(configuration);
+   assertTrue(remote.kind==="present"&&remote.sha!==before,"Native Obsidian 100 MB upload did not publish a commit");
+   finalSha=remote.sha;
+   nativeBinary={path:name,size,sha256:checksum.digest("hex")};
+   journeySteps.push("real Obsidian indexed and uploaded exact 100 MB binary");
+  }
   if(verifyPeer){
    const restored=await restoreEncryptedToSecondObsidian({
     exe,runRoot,port:port+1,pluginId:id,sourceRoot:root,configuration,passphrase,
     expectedContent:"# Synthetic remote UI E2E\n\nSecond revision from Obsidian.\n",
-    expectedFiles:journey?expectedPeerFiles:[],absentPaths:journey?["Notes/สวัสดี 🌏.md"]:[],exercisePeerConflict:journey,
+    expectedFiles:journey?expectedPeerFiles:[],absentPaths:journey?["Notes/สวัสดี 🌏.md"]:[],exercisePeerConflict:journey,expectedBinary:nativeBinary,
    });
    assertTrue(restored.peerRestored&&restored.bytesRestored>0,"Second real Obsidian vault could not decrypt remote data");
    const afterPull=await readState(configuration);
@@ -325,5 +359,5 @@ try{
   try{await cleanupGeneratedUiRun(runRoot,{repoRoot:root});}catch(error){console.error("WARNING: isolated test vault cleanup incomplete ("+String(error?.code||"unknown").slice(0,30)+")");process.exitCode=1;}
  }
  console.log(JSON.stringify({status:passed&&!process.exitCode?"PASS":"FAIL",cleanup:cleanupState,remoteHeadChanged:Boolean(initialSha&&finalSha&&initialSha!==finalSha),
-  screenshotCaptured:screenBytes>1000,screenshotPath:screenBytes>1000?screenshot:null,uiExceptions:sendErrors.length,mode,remoteEncryptionVerified,peerRestored,peerScreenshot,journeySteps,runBranch:branch,repository:configuration?.targetRepository,token:"[not reported]"}));
+  screenshotCaptured:screenBytes>1000,screenshotPath:screenBytes>1000?screenshot:null,uiExceptions:sendErrors.length,mode,remoteEncryptionVerified,peerRestored,peerScreenshot,journeySteps,native100mbBytes:nativeBinary?.size??0,native100mbSha256:nativeBinary?.sha256??null,runBranch:branch,repository:configuration?.targetRepository,token:"[not reported]"}));
 }

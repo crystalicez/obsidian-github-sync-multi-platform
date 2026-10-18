@@ -2,7 +2,9 @@
 // Only the caller's newly created synthetic run directory can be touched.
 import assert from "node:assert/strict";
 import {spawn,spawnSync} from "node:child_process";
-import {copyFile,mkdir,writeFile} from "node:fs/promises";
+import {createHash} from "node:crypto";
+import {createReadStream} from "node:fs";
+import {copyFile,mkdir,stat,writeFile} from "node:fs/promises";
 import {verifyPngBytes} from "./ui-visual-assertions.mjs";
 import path from "node:path";
 
@@ -15,7 +17,7 @@ export function assertSecondVaultRestore(state,expectedContent){
 }
 export async function restoreEncryptedToSecondObsidian({
  exe,runRoot,port,pluginId,sourceRoot,configuration,passphrase,expectedContent,
- expectedFiles=[],absentPaths=[],exercisePeerConflict=false,
+ expectedFiles=[],absentPaths=[],exercisePeerConflict=false,expectedBinary=null,
 }){
  assert.ok(Number.isInteger(port)&&port>=1024&&port<=65535,"Second CDP port is unsafe");
  assert.ok(path.basename(runRoot).match(/^[0-9a-f]{16}$/u),"Second vault requires a synthetic random run ID");
@@ -140,6 +142,17 @@ export async function restoreEncryptedToSecondObsidian({
    return files;
   })()`);
   assert.equal(verifiedFiles.length,expectedFiles.length,"Second Obsidian journey file count");
+  if(expectedBinary){
+   assert.equal(expectedBinary.size,100_000_000,"Native binary fixture must be exactly 100 MB");
+   assert.ok(/^Assets\/[A-Za-z0-9-]+\.bin$/u.test(expectedBinary.path),"Expected native binary must stay inside test Assets");
+   const indexed=await evaluate("(()=>{const f=app.vault.getAbstractFileByPath("+JSON.stringify(expectedBinary.path)+");return {size:f?.stat?.size??null};})()");
+   assert.equal(indexed.size,expectedBinary.size,"Second Obsidian did not index restored 100 MB file");
+   const full=path.join(vault,...expectedBinary.path.split("/"));
+   assert.equal((await stat(full)).size,expectedBinary.size);
+   const digest=createHash("sha256");
+   for await(const chunk of createReadStream(full,{highWaterMark:8*1024*1024}))digest.update(chunk);
+   assert.equal(digest.digest("hex"),expectedBinary.sha256,"Native Obsidian peer 100 MB bytes changed after GitHub Force Pull");
+  }
   await pause(500);
   const visible=await evaluate(`(()=>({shown:document.body.innerText.includes("Second revision from Obsidian."),settingsVisible:!!document.querySelector(".vertical-tab-header")}))()`);
   assert.ok(visible.shown&&!visible.settingsVisible,"Restored synthetic note is not visible in the second Obsidian editor");
