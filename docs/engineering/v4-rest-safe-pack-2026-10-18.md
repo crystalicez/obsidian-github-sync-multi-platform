@@ -20,6 +20,12 @@ The new V4 file writer already restricts individual encrypted blob parts to an e
 - A synthetic **historical encrypted pack larger than 8 MiB** decrypts via the unchanged reader despite the new writer cap, proving that the creation restriction does not delete old pack read capability.
 - On the working tree: `pnpm build`, fast **667/667**, resource **18/18**, soak **6/6**, feasibility **139/139** and standard GitHub E2E compilation passed. `pnpm test:repeat` passed **10 consecutive runs of 667/667**.
 
+## Detached clean-SHA qualification note
+
+A detached Windows worktree at audit code SHA `c7e7120` passed frozen dependency install, build, fast **667/667**, resource **18/18**, soak **6/6**, recovery **50/50**, repeat **10 × 667/667**, and standard GitHub E2E compilation. The first **concurrent** Feasibility run yielded **138/139** due to an existing *test harness bug*: `tests/feasibility/local-release.test.mjs` called asynchronous `writeFile` to simulate a tampered release asset from a **synchronous** injected hook without awaiting it, so validation raced the artificial tamper.
+
+The fixture was corrected to perform **synchronous** `writeFileSync` inside that synchronous hook. No production release validation logic was weakened. Focused release tests then passed **37/37**, and the full feasibility suite **139/139**. A separate clean exact-SHA qualification incorporating the test-only fixture correction is required before recording a fully green final commit. The original failed run is retained as evidence, not silently counted as success.
+
 ## Outstanding validation and release gating
 
 This work does **not** qualify a credentialed GitHub live many-file pack, native Obsidian Desktop, hosted CI at the committed SHA, mobile acceptance, or older V4 clients reading the *separate new 8–50 MiB individual-file chunk format*. Coordinate cross-version rollout before any release. Keep Draft PR #8 unmerged. Do not modify the original unstaged `tests/v4/github-transport.test.ts`.
