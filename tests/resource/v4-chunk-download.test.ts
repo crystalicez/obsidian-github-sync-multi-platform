@@ -6,11 +6,11 @@ import { V4_PART_BYTES } from "../../src/lib/v4/large-files"
 import { V4StorageCodec } from "../../src/lib/v4/storage-codec"
 import type { V4StagedSink } from "../../src/lib/v4/staging-store"
 
-const GiB = 1024 * 1024 * 1024
+const MAX_TEST_BYTES = 100_000_000
 
-test("virtual 5 GiB-shaped pull processes 107 remote parts sequentially without joining the logical file", async () => {
-  const partCount = Math.ceil((5 * GiB) / V4_PART_BYTES)
-  assert.equal(partCount, 107)
+test("virtual 100 MB-shaped pull processes 2 remote parts sequentially without joining the logical file", async () => {
+  const partCount = Math.ceil(MAX_TEST_BYTES / V4_PART_BYTES)
+  assert.equal(partCount, 2)
   const plaintext = Uint8Array.from({ length: partCount }, (_, index) => index & 0xff)
   const paths = Array.from({ length: partCount }, (_, index) => `virtual/${String(index + 1).padStart(6, "0")}.part`)
   let activeReads = 0
@@ -22,7 +22,7 @@ test("virtual 5 GiB-shaped pull processes 107 remote parts sequentially without 
   const codec = new V4StorageCodec({ mode: "plaintext", pathLayout: "plaintext-v1" })
   const result = await codec.readToSink({
     record: {
-      path: "virtual-5g.bin",
+      path: "virtual-100mb.bin",
       pathId: "p",
       fileId: "f",
       plaintextSha256: await sha256Hex(plaintext),

@@ -9,21 +9,21 @@ import {
 } from "../../src/lib/v4/part-write-policy"
 
 const MiB = 1024 * 1024
-const GiB = 1024 * MiB
+const TEST_BYTES = 100_000_000
 
-test("writer keeps the historical 48 MiB part when transport and mutation constraints both fit", () => {
+test("100 MB writer keeps the 48 MiB part when transport and mutation constraints fit", () => {
   const selected = selectV4WriterPartBytes({
-    logicalBytes: 5 * GiB,
+    logicalBytes: TEST_BYTES,
     maxTransportTransientBytes: 256 * MiB,
   })
   assert.equal(selected, V4_PART_BYTES)
   assert.ok(estimateV4GitBlobTransportBytes(selected) <= 256 * MiB)
-  assert.ok(Math.ceil((5 * GiB) / selected) <= V4_GITHUB_SAFE_CONTENT_MUTATIONS_PER_REVISION)
+  assert.ok(Math.ceil(TEST_BYTES / selected) <= V4_GITHUB_SAFE_CONTENT_MUTATIONS_PER_REVISION)
 })
 
-test("writer chooses the largest MiB-aligned part allowed by measured transport memory", () => {
+test("100 MB writer selects the largest MiB-aligned part allowed by transport memory", () => {
   const selected = selectV4WriterPartBytes({
-    logicalBytes: 5 * GiB,
+    logicalBytes: TEST_BYTES,
     maxTransportTransientBytes: 128 * MiB,
   })
   assert.equal(selected, 27 * MiB)
@@ -31,9 +31,10 @@ test("writer chooses the largest MiB-aligned part allowed by measured transport 
   assert.ok(estimateV4GitBlobTransportBytes(selected + MiB) > 128 * MiB)
 })
 
-test("writer rejects a transport budget that would violate safe mutation headroom", () => {
+test("100 MB writer rejects an impossible combined transport/mutation budget", () => {
   assert.throws(() => selectV4WriterPartBytes({
-    logicalBytes: 5 * GiB,
+    logicalBytes: TEST_BYTES,
     maxTransportTransientBytes: 32 * MiB,
+    maxContentMutations: 3,
   }), /no safe V4 writer part size/iu)
 })

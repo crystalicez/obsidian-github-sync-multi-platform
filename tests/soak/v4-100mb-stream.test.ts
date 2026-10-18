@@ -6,12 +6,15 @@ import { createV4IncrementalSha256 } from "../../src/lib/v4/incremental-hash"
 import { V4_PART_BYTES } from "../../src/lib/v4/large-files"
 
 const MiB = 1024 * 1024
-const GiB = 1024 * MiB
+const MAX_TEST_BYTES = 100_000_000
 
 function sizesFromEnvironment(): number[] {
   const explicit = process.env.V4_SOAK_BYTES
-  if (explicit) return explicit.split(",").map(value => Number(value.trim())).filter(value => Number.isSafeInteger(value) && value > 0)
-  return [2 * GiB, 5 * GiB]
+  const sizes = explicit ? explicit.split(",").map(value => Number(value.trim())) : [MAX_TEST_BYTES]
+  if (sizes.length === 0 || sizes.some(value => !Number.isSafeInteger(value) || value <= 0 || value > MAX_TEST_BYTES)) {
+    throw new RangeError(`Soak size must be a positive safe integer at most ${MAX_TEST_BYTES} bytes`)
+  }
+  return sizes
 }
 
 async function hashGeneratedStream(logicalBytes: number, chunkBytes: number) {

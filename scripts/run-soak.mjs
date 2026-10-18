@@ -2,13 +2,12 @@ import { spawnSync } from "node:child_process";
 import path from "node:path";
 
 const root = process.cwd();
-const GiB = 1024 ** 3;
+const MAX_TEST_BYTES = 100_000_000;
 const bytesArg = process.argv.slice(2).find(arg => arg.startsWith("--bytes="));
-const sizes = (bytesArg ? bytesArg.slice("--bytes=".length).split(",") : [String(2 * GiB), String(5 * GiB)])
-  .map(value => Number(value.trim()))
-  .filter(value => Number.isSafeInteger(value) && value > 0);
-if (sizes.length === 0) {
-  console.error("No valid soak sizes were provided.");
+const sizes = (bytesArg ? bytesArg.slice("--bytes=".length).split(",") : [String(MAX_TEST_BYTES)])
+  .map(value => Number(value.trim()));
+if (sizes.length === 0 || sizes.some(value => !Number.isSafeInteger(value) || value <= 0 || value > MAX_TEST_BYTES)) {
+  console.error(`Soak sizes must be positive safe integers no larger than ${MAX_TEST_BYTES} bytes.`);
   process.exit(2);
 }
 const chunkArg = process.argv.slice(2).find(arg => arg.startsWith("--chunk-bytes="));

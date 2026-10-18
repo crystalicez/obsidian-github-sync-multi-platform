@@ -34,7 +34,7 @@
     "status": "pending",
     "classification": null,
     "logicalBytes": 100000000,
-    "scope": "physical-windows-release-100mb-decimal",
+    "scope": "physical-windows-100mb-decimal",
     "encryptedForcePushSeconds": null,
     "noopSyncSeconds": null,
     "forcePullSeconds": null,

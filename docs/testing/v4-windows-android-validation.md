@@ -2,11 +2,11 @@
 
 Originally drafted: 2026-07-30 (Asia/Bangkok). Windows physical release scope updated by maintainer decision: 2026-10-18.
 
-This document separates automated/source evidence from physical-device evidence. **For the current release, the Windows physical large-file test is capped at 100 MB (100,000,000 bytes, decimal), not 5 GiB.** Historical virtual 2 GiB/5 GiB tests remain automated evidence, not a physical-device pass or a release requirement.
+This document separates automated/source evidence from physical-device evidence. **All active generated-file, virtual-stream and physical large-file tests are permanently capped at 100 MB (100,000,000 decimal bytes).** Previous larger-size experiments are available only in Git history. They are not active tests or physical support evidence.
 
 ## Status before physical qualification
 
-| Platform | Small-file V4 | Bounded local read | Bounded stage append | Final stage commit | Current release physical-file test / support claim |
+| Platform | Small-file V4 | Bounded local read | Bounded stage append | Final stage commit | Permanent 100 MB test scope / support claim |
 | --- | --- | --- | --- | --- | --- |
 | Windows desktop implementation | automated coverage | implemented via desktop path + Node file I/O | implemented | implemented with backup/swap/verify | **100 MB test pending; no physical >100 MB claim** |
 | Android/mobile implementation | existing normal-size path | **not available in the current supported path** | feature-detected `appendBinary` only | not implemented as a bounded atomic stage commit | **No large-file release claim; capability-gated** |
@@ -15,9 +15,9 @@ The whole-buffer compatibility ceiling is 32 MiB. Large mobile upload must fail 
 
 ## Recorded Windows automated evidence
 
-The official Windows Task 15 automated gate has been run against source commit `233c0681afe6869464252d56309b8dff00f538f4` and passed: build, fast `345/345`, repeat `345/345 × 10`, recovery `30/30`, resource `11/11`, feasibility `6/6`, package validation, and the separate 2 GiB + 5 GiB cryptographic virtual soak.
+The earlier Windows Task 15 gate passed at source commit `233c0681afe6869464252d56309b8dff00f538f4`. That is historical evidence only. The active cryptographic soak now generates exactly 100,000,000 bytes by default and refuses any larger test input.
 
-This closes the historical automated Windows portion of Task 15 only. It does **not** prove the new physical 100 MB round trip. The 5 GiB operational model remains historical background, not a blocker for this release.
+The source and virtual tests do **not** prove a 100 MB Obsidian/GitHub round trip. Run the physical procedure below on a verified disposable target before recording a sync pass.
 
 ## Safety rules for physical tests
 
@@ -27,7 +27,7 @@ This closes the historical automated Windows portion of Task 15 only. It does **
 - Record plugin source commit/archive hash, Obsidian version, plugin version, OS/device, available RAM, and free disk before the run.
 - Do not call a result a pass if any stage was simulated, skipped, or replaced by model evidence.
 
-## Windows 100 MB physical qualification (current release)
+## Windows 100 MB physical qualification (permanent test limit)
 
 ### 1. Generate exactly 100,000,000 bytes without a full-file in-memory allocation
 

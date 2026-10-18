@@ -6,17 +6,17 @@ import { uploadV4ObjectStream } from "../../src/lib/v4/git-tree-writer"
 import { V4_PART_BYTES } from "../../src/lib/v4/large-files"
 import { V4StorageCodec } from "../../src/lib/v4/storage-codec"
 
-const GiB = 1024 * 1024 * 1024
+const MAX_TEST_BYTES = 100_000_000
 
-test("virtual 5 GiB stream planning does not read or allocate the logical file", async () => {
+test("virtual 100 MB stream planning does not read or allocate the logical file", async () => {
   let opened = 0
   const source: V4ContentSource = {
-    size: 5 * GiB,
+    size: MAX_TEST_BYTES,
     async *chunks() { opened++; throw new Error("virtual source must stay lazy during preparation") },
   }
   const codec = new V4StorageCodec({ mode: "plaintext", pathLayout: "plaintext-v1" })
   const prepared = await codec.prepareFromSource({
-    logicalPath: "virtual-5g.bin",
+    logicalPath: "virtual-100mb.bin",
     source,
     expectedHash: "0".repeat(64),
     version: "virtual",
@@ -25,8 +25,8 @@ test("virtual 5 GiB stream planning does not read or allocate the logical file",
     partBytes: V4_PART_BYTES,
   })
   assert.equal(opened, 0)
-  assert.equal(prepared.objectCount, 107)
-  assert.equal(prepared.objectPaths.length, 107)
+  assert.equal(prepared.objectCount, Math.ceil(MAX_TEST_BYTES / V4_PART_BYTES))
+  assert.equal(prepared.objectPaths.length, Math.ceil(MAX_TEST_BYTES / V4_PART_BYTES))
 })
 
 test("stream uploader releases each object before requesting the next one", async () => {

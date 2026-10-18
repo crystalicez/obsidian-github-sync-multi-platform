@@ -22,6 +22,7 @@
     "test:resource": "node scripts/run-tests.mjs --tier=resource",
     "test:recovery": "node scripts/run-tests.mjs --tier=recovery",
     "test:soak": "node scripts/run-soak.mjs",
+    "test:windows:100mb": "node scripts/test-windows-100mb.mjs",
     "validate:metadata": "node scripts/validate-release-metadata.mjs",
     "validate:package": "node scripts/validate-package.mjs",
     "qualify:local": "node scripts/local-qualify.mjs",

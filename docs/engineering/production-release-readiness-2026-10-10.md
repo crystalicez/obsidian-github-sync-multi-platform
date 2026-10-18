@@ -21,7 +21,7 @@
 | Hosted CI | Successful current-attempt CI of exact master SHA and artifact provenance | No current audit-SHA run found; investigate Actions execution before release |
 | Live GitHub | Exact-SHA qualification on isolated disposable target with pinned numeric repo ID; cleanup verified | Not run for this candidate |
 | Devices | Real desktop/mobile smoke tests for claimed platforms; verify sync/conflicts/offline/restart/upgrade | No new physical evidence |
-| Windows 100 MB (current release decision 2026-10-18) | Exactly 100,000,000 bytes on physical Windows: encrypted Force Push → no-op → clean-vault Force Pull, SHA-256 equality, controlled recovery and memory measurements | `tests/baselines/v4/windows.json`: pending; 5 GiB physical test explicitly out of scope |
+| Windows 100 MB (permanent test limit since 2026-10-18) | Exactly 100,000,000 bytes on physical Windows: encrypted Force Push → no-op → clean-vault Force Pull, SHA-256 equality, controlled recovery and memory measurements | `tests/baselines/v4/windows.json`: pending; 5 GiB physical test explicitly out of scope |
 | Android large-file support | No release claim from Windows qualification; require proven bounded read and atomic stage commit on device before any Android large-file claim | Unsupported; keep capability-failed |
 | Release qualification and assets | Official exact-SHA `pnpm qualify:local` receipt, `pnpm release:local -- <version>`, stable ref/draft/asset digests verified | Not run; requires maintainer release decision |
 

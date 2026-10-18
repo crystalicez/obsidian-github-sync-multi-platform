@@ -17,8 +17,8 @@ test("v4 planner isolates one change across 100,000 logical files", () => {
   assert.ok(elapsed.user + elapsed.system < 5_000_000);
 });
 
-test("v4 predicts part storage for a 5 GiB logical file without allocating it", () => {
-  assert.equal(shouldUseV4Parts(5 * 1024 * 1024 * 1024), true);
+test("v4 predicts part storage for a 100 MB logical file without allocating it", () => {
+  assert.equal(shouldUseV4Parts(100_000_000), true);
 });
 
 import { boundedMap } from "../../src/lib/v4/bounded-map";

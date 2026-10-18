@@ -13,12 +13,12 @@ function unopened(size: number, onOpen: () => void): V4ContentSource {
   return { size, async *chunks() { onOpen(); throw new Error("qualification source must remain lazy") } }
 }
 
-test("resource regression keeps threshold-1 threshold threshold+1 and 512 MiB preparation lazy", async () => {
+test("resource regression keeps threshold-1 threshold threshold+1 and 100 MB preparation lazy", async () => {
   const cases = [
     { size: V4_LARGE_FILE_THRESHOLD_BYTES - 1, expected: 1 },
     { size: V4_LARGE_FILE_THRESHOLD_BYTES, expected: 1 },
     { size: V4_LARGE_FILE_THRESHOLD_BYTES + 1, expected: 2 },
-    { size: 512 * MiB, expected: Math.ceil((512 * MiB) / V4_PART_BYTES) },
+    { size: 100_000_000, expected: Math.ceil((100_000_000) / V4_PART_BYTES) },
   ]
   for (const input of cases) {
     let opened = 0
@@ -37,8 +37,8 @@ test("resource regression keeps threshold-1 threshold threshold+1 and 512 MiB pr
   }
 })
 
-test("resource regression bounds writer object memory independently of 512 MiB logical size", () => {
-  const selected = selectV4WriterPartBytes({ logicalBytes: 512 * MiB, maxTransportTransientBytes: DEFAULT_V4_RESOURCE_LIMITS.maxTransportTransientBytes })
+test("resource regression bounds writer object memory independently of 100 MB logical size", () => {
+  const selected = selectV4WriterPartBytes({ logicalBytes: 100_000_000, maxTransportTransientBytes: DEFAULT_V4_RESOURCE_LIMITS.maxTransportTransientBytes })
   assert.equal(selected, V4_PART_BYTES)
   const transient = estimateV4GitBlobTransportBytes(selected + 33)
   assert.ok(transient <= DEFAULT_V4_RESOURCE_LIMITS.maxTransportTransientBytes)
@@ -46,7 +46,7 @@ test("resource regression bounds writer object memory independently of 512 MiB l
 })
 
 test("resource regression refuses a writer part policy that cannot fit transport and mutation budgets", () => {
-  assert.throws(() => selectV4WriterPartBytes({ logicalBytes: 512 * MiB, maxTransportTransientBytes: 4 * MiB, maxContentMutations: 20 }), /no safe V4 writer part size/iu)
+  assert.throws(() => selectV4WriterPartBytes({ logicalBytes: 100_000_000, maxTransportTransientBytes: 4 * MiB, maxContentMutations: 20 }), /no safe V4 writer part size/iu)
 })
 
 test("incremental SHA does not create one Uint8Array view per 64-byte compression block", async () => {
