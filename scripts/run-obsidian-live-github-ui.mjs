@@ -281,8 +281,8 @@ try{
     const before=finalSha;
     const result=await evaluate(mutation,120000);
     assertTrue(result?.ok,"Native combined action failed: "+label+" "+JSON.stringify(result));
-    const outcome=await evaluate("(async()=>{const p="+pluginExpr+";await p.v4Runtime.manualSync();return {lifecycle:p.v4Runtime.progressSnapshot.lifecycle,trigger:p.v4Runtime.progressSnapshot.trigger};})()",240000);
-    assertTrue(outcome.lifecycle==="success"&&outcome.trigger==="manual","Native combined sync failed: "+label+" "+JSON.stringify(outcome));
+    const outcome=await evaluate("(async()=>{const p="+pluginExpr+";let thrown=null;try{await p.v4Runtime.manualSync()}catch(e){thrown=String(e?.message??e).slice(0,180)}const s=p.v4Runtime.progressSnapshot;return {lifecycle:s.lifecycle,trigger:s.trigger,phase:s.phase,failurePhase:s.failurePhase,error:s.errorMessage?.slice(0,250),thrown,apiFailures:s.diagnostics?.apiFailures};})()",240000);
+    assertTrue(outcome.lifecycle==="success"&&outcome.trigger==="manual","Native combined sync failed: "+label+" "+redact(JSON.stringify(outcome)));
     const remote=await readState(configuration);
     assertTrue(remote.kind==="present"&&remote.sha!==before,"Combined user action was not published: "+label);
     finalSha=remote.sha;
