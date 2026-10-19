@@ -78,6 +78,7 @@ let nativeUploadWallMs=null;
 let nativeDownloadWallMs=null;
 let diagnosticEvidence=null;
 let peerDiagnosticEvidence=null;
+const noOpEvidence=[];
 const requestMap=new Map();let serial=0;
 function send(method,params={},timeoutMs=25000){
  return new Promise((resolve,reject)=>{
@@ -269,6 +270,15 @@ try{
    remoteEncryptionVerified=Boolean(encryptionProof.configValid&&encryptionProof.cipherHeaderValid&&encryptionProof.opaqueObjects);
   }
   await captureSyncedCenter();
+  const verifyNoop=async label=>{
+   const before=(await readState(configuration)).sha;
+   const result=await evaluate("(async()=>{const p=app.plugins.plugins["+JSON.stringify(id)+"];const started=performance.now();const outcome=await p.v4Runtime.manualSync();const s=p.v4Runtime.progressSnapshot;return {lifecycle:s.lifecycle,changedFiles:outcome?.changedFiles,wallMs:performance.now()-started,apiRequests:s.diagnostics?.apiRequests,apiFailures:s.diagnostics?.apiFailures,uploadBytes:s.diagnostics?.uploadBytes,peakRendererRssBytes:s.diagnostics?.peakRendererRssBytes};})()",240000);
+   assertTrue(result.lifecycle==="no-change"&&result.changedFiles===0&&result.apiFailures===0&&result.uploadBytes===0,
+    "Native no-op mutated or failed: "+label+" "+redact(JSON.stringify(result)));
+   assertTrue((await readState(configuration)).sha===before,"Native no-op advanced GitHub HEAD: "+label);
+   noOpEvidence.push({label,...result});
+  };
+  await verifyNoop("warm-small-vault");
   const expectedPeerFiles=[
    {path:"Notes/renamed-สวัสดี 🌏.md",content:"# Native combined test\n\nEdited after rename.\n"},
    {path:"Scratch.md",content:"Recreated after deletion.\n"},
@@ -328,6 +338,7 @@ try{
    finalSha=remote.sha;
    nativeBinary={path:name,size,sha256:checksum.digest("hex")};
    if(assertDiagnostics) await captureSyncedCenter({requireFileWork:true});
+   await verifyNoop("warm-100mb-vault");
    journeySteps.push("real Obsidian indexed and uploaded exact 100 MB binary");
   }
   if(verifyPeer){
@@ -387,5 +398,5 @@ try{
   try{await cleanupGeneratedUiRun(runRoot,{repoRoot:root});}catch(error){console.error("WARNING: isolated test vault cleanup incomplete ("+String(error?.code||"unknown").slice(0,30)+")");process.exitCode=1;}
  }
  console.log(JSON.stringify({status:passed&&!process.exitCode?"PASS":"FAIL",cleanup:cleanupState,remoteHeadChanged:Boolean(initialSha&&finalSha&&initialSha!==finalSha),
-  screenshotCaptured:screenBytes>1000,screenshotPath:screenBytes>1000?screenshot:null,uiExceptions:sendErrors.length,mode,remoteEncryptionVerified,peerRestored,peerScreenshot,journeySteps,diagnostics:diagnosticEvidence,peerDiagnostics:peerDiagnosticEvidence,nativeUploadWallMs,nativeDownloadWallMs,native100mbBytes:nativeBinary?.size??0,native100mbSha256:nativeBinary?.sha256??null,runBranch:branch,repository:configuration?.targetRepository,token:"[not reported]"}));
+  screenshotCaptured:screenBytes>1000,screenshotPath:screenBytes>1000?screenshot:null,uiExceptions:sendErrors.length,mode,remoteEncryptionVerified,peerRestored,peerScreenshot,journeySteps,noOpEvidence,diagnostics:diagnosticEvidence,peerDiagnostics:peerDiagnosticEvidence,nativeUploadWallMs,nativeDownloadWallMs,native100mbBytes:nativeBinary?.size??0,native100mbSha256:nativeBinary?.sha256??null,runBranch:branch,repository:configuration?.targetRepository,token:"[not reported]"}));
 }
