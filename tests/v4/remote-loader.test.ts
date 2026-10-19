@@ -9,7 +9,7 @@ import {
   loadV4RemoteConfig,
   loadV4RemoteState,
 } from "../../src/lib/v4/remote-loader";
-import { expectedV4PathLayout, V4_FORMAT_VERSION, type V4RemoteConfig, type V4RemoteHead } from "../../src/lib/v4/protocol-types";
+import { expectedV4PathLayout, V4_CONFIG_PATH, V4_FORMAT_VERSION, type V4RemoteConfig, type V4RemoteHead } from "../../src/lib/v4/protocol-types";
 
 const enc = (value: string) => new TextEncoder().encode(value);
 
@@ -67,6 +67,24 @@ test("remote loader reads config head and shard at the requested immutable commi
   assert.deepEqual(state?.head, head);
   assert.deepEqual(state?.records, [record]);
   assert.equal(github.reads.every(read => read.ref === "commit-2"), true);
+});
+
+test("remote config reuses a validated snapshot only at its exact immutable commit", async () => {
+  const config: V4RemoteConfig = {
+    formatVersion: 4, mode: "plaintext", repoId: "o/r#main", pathLayout: "plaintext-v1",
+  };
+  const github = new MemoryRemoteGithub(new Map([[
+    V4_CONFIG_PATH,
+    enc(JSON.stringify(config)),
+  ]]));
+  const snapshot = { commitSha: "commit-1", config };
+  const same = await loadV4RemoteConfig({ github, desiredConfig: config, observedRemoteConfig: snapshot }, "commit-1", "normal");
+  assert.deepEqual(same, config);
+  assert.deepEqual(github.reads, [], "reusing a same-commit verified config must not repeat a GitHub API request");
+
+  const newer = await loadV4RemoteConfig({ github, desiredConfig: config, observedRemoteConfig: snapshot }, "commit-2", "normal");
+  assert.deepEqual(newer, config);
+  assert.deepEqual(github.reads, [{ path: V4_CONFIG_PATH, ref: "commit-2" }]);
 });
 
 test("remote loader keeps layout migration restricted to Force Push", () => {

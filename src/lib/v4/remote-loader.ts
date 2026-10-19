@@ -28,6 +28,11 @@ export interface V4RemoteLoaderGithub {
   getFileBytes(path: string, ref?: string): Promise<{ bytes: Uint8Array; sha: string } | null>
 }
 
+export interface V4ObservedRemoteConfig {
+  commitSha: string
+  config: V4RemoteConfig
+}
+
 export interface V4RemoteState {
   config: V4RemoteConfig
   head: V4RemoteHead
@@ -54,13 +59,18 @@ export function assertV4PathLayoutCompatible(
 }
 
 export async function loadV4RemoteConfig(
-  input: { github: V4RemoteLoaderGithub; desiredConfig: V4RemoteConfig },
+  input: { github: V4RemoteLoaderGithub; desiredConfig: V4RemoteConfig; observedRemoteConfig?: V4ObservedRemoteConfig },
   commitSha: string | undefined,
   operation: V4SyncOperation,
 ): Promise<V4RemoteConfig | null> {
-  const configFile = await input.github.getFileBytes(V4_CONFIG_PATH, commitSha)
-  if (!configFile) return null
-  const config = decodeV4RemoteConfig(configFile.bytes)
+  let config: V4RemoteConfig
+  if (input.observedRemoteConfig && input.observedRemoteConfig.commitSha === commitSha) {
+    config = input.observedRemoteConfig.config
+  } else {
+    const configFile = await input.github.getFileBytes(V4_CONFIG_PATH, commitSha)
+    if (!configFile) return null
+    config = decodeV4RemoteConfig(configFile.bytes)
+  }
   if (config.repoId !== input.desiredConfig.repoId) throw new Error("V4 remote repository identity mismatch.")
   assertV4PathLayoutCompatible(config, input.desiredConfig, operation)
   return config

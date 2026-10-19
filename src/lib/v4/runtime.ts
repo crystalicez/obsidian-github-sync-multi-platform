@@ -21,7 +21,7 @@ import { V4SyncCoordinator, type V4QueuedChange, type V4SyncRequest } from "./sy
 import { expectedV4PathLayout, V4_FORMAT_VERSION, V4_CONFIG_PATH, V4_PBKDF2_ITERATIONS, type V4RemoteConfig, type V4StorageMode } from "./protocol-types"
 import { V4HistoryService } from "./history-service"
 import { buildV4FileOverview, type V4FileOverview } from "./file-overview"
-import { loadV4RemoteState } from "./remote-loader"
+import { loadV4RemoteState, type V4ObservedRemoteConfig } from "./remote-loader"
 import type { V4SessionVault } from "./local-io"
 import { createV4ContentSource, createV4WholeBufferContentSource, DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES, type V4ContentSource } from "./content-source"
 import { createV4PlatformIo, type V4BinaryAdapterLike, type V4PlatformIo } from "./platform-io"
@@ -43,6 +43,7 @@ type V4RuntimeConfigSource = "observed-remote" | "speculative-empty"
 interface V4RuntimeConfigSelection {
   config: V4RemoteConfig
   source: V4RuntimeConfigSource
+  observedRemoteConfig?: V4ObservedRemoteConfig
 }
 
 export function selectV4RuntimeConfig(discovered: V4RemoteConfig | null, mode: V4StorageMode, repoId: string): V4RemoteConfig {
@@ -450,20 +451,22 @@ export class V4PluginRuntime {
 
   private async loadConfiguredRemoteConfig(
     target: { github: FastSync["githubClient"]; repoId: string } = { github: this.plugin.githubClient, repoId: this.repoId() },
-  ): Promise<{ remoteConfig: V4RemoteConfig; config: V4RemoteConfig } | null> {
+  ): Promise<{ remoteConfig: V4RemoteConfig; config: V4RemoteConfig; commitSha: string } | null> {
     if (!target.github) throw new Error("GitHub connection is not configured.")
     const ref = await target.github.getGitRefOrNull()
-    const remote = ref ? await target.github.getFileBytes(V4_CONFIG_PATH, ref.sha) : null
+    if (!ref) return null
+    const remote = await target.github.getFileBytes(V4_CONFIG_PATH, ref.sha)
     if (!remote) return null
     const remoteConfig = decodeV4RemoteConfig(remote.bytes)
     const config = selectV4RuntimeConfig(remoteConfig, remoteConfig.mode, target.repoId)
     if (remoteConfig.repoId !== config.repoId) throw new Error("V4 remote repository identity mismatch.")
-    return { remoteConfig, config }
+    return { remoteConfig, config, commitSha: ref.sha }
   }
 
   private async remoteOrNewConfig(): Promise<V4RuntimeConfigSelection> {
     const loaded = await this.loadConfiguredRemoteConfig()
-    if (loaded) return { config: loaded.config, source: "observed-remote" }
+    if (loaded) return { config: loaded.config, source: "observed-remote",
+      observedRemoteConfig: { commitSha: loaded.commitSha, config: loaded.remoteConfig } }
     const mode = this.plugin.settings.encryptionMode
     return { config: selectV4RuntimeConfig(null, mode, this.repoId()), source: "speculative-empty" }
   }
@@ -713,6 +716,7 @@ export class V4PluginRuntime {
             signal,
             diagnostics,
             maxConcurrentPartTransfers: Platform.isDesktopApp ? 2 : 1,
+            observedRemoteConfig: configSelection.observedRemoteConfig,
             onProgress: patch => {
               if (patch.phase === "checking-remote") return
               this.progressStore.update(patch)

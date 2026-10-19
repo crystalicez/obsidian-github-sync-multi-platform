@@ -26,7 +26,7 @@ import { bucketForV4PathId, normalizeV4VaultPath } from "./paths"
 import { planV4Sync, type V4LogicalFile, type V4PlannedChange, type V4SyncOperation } from "./planner"
 import { assertV4LogicalPathSetSafe, assertV4RemoteRecordSet, buildV4RemoteMetadata, decodeV4RemoteHead, decodeV4RemoteShard, v4RemoteShardPath } from "./remote-index"
 import { effectiveV4PathLayout, expectedV4PathLayout, V4_CONFIG_PATH, V4_HEAD_PATH, V4_ROOT, type V4RemoteConfig, type V4RemoteHead } from "./protocol-types"
-import { loadV4RemoteConfig, loadV4RemoteState, type V4RemoteState } from "./remote-loader"
+import { loadV4RemoteConfig, loadV4RemoteState, type V4ObservedRemoteConfig, type V4RemoteState } from "./remote-loader"
 import { V4StorageCodec } from "./storage-codec"
 import { collectV4ContentSource, createV4WholeBufferContentSource, DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES, type V4ContentHandle, type V4ContentSource } from "./content-source"
 import type { V4StageRef } from "./staging-store"
@@ -80,6 +80,7 @@ export interface V4SyncSessionInput {
   onProgress?: (patch: V4SyncProgressPatch) => void
   diagnostics?: V4RunDiagnostics
   maxConcurrentPartTransfers?: 1 | 2
+  observedRemoteConfig?: V4ObservedRemoteConfig
   runState?: V4SyncRunState
   recoveryStore?: V4RecoveryStore
   resourceLimits?: Partial<V4ResourceLimits>
@@ -392,7 +393,8 @@ export class V4SyncSession {
     const baseCommitSha = this.input.index.remoteCommitSha
     this.report({ phase: "checking-remote", currentPath: undefined, currentDirection: undefined })
     const ref = await this.input.github.getGitRefOrNull()
-    const remoteConfig = await loadV4RemoteConfig({ github: this.input.github, desiredConfig: this.input.config }, ref?.sha, options.operation)
+    const remoteConfig = await loadV4RemoteConfig({ github: this.input.github, desiredConfig: this.input.config,
+      observedRemoteConfig: this.input.observedRemoteConfig }, ref?.sha, options.operation)
     const localCacheComplete = isV4LocalIndexCacheComplete(this.input.index)
     const remote = await loadV4RemoteState(
       { github: this.input.github, index: this.input.index, keyring: this.input.keyring,
