@@ -352,6 +352,9 @@ export class GitHubClient {
       if (typeof entry.path !== "string" || entry.path.length === 0 || typeof entry.mode !== "string" || typeof entry.sha !== "string" || !GIT_COMMIT_SHA.test(entry.sha)) {
         throw new Error(`Malformed GitHub response: tree entry ${index} fields are invalid.`);
       }
+      if (entry.path.includes("\u0000") || entry.path.split("/").some(segment => !segment || segment === "." || segment === "..") || (!recursive && entry.path.includes("/"))) {
+        throw new Error(`Malformed GitHub response: tree entry ${index} path is invalid.`);
+      }
       if (seenPaths.has(entry.path)) throw new Error(`Malformed GitHub response: duplicate tree path ${entry.path}.`);
       seenPaths.add(entry.path);
       if (entry.type !== "blob" && entry.type !== "tree" && entry.type !== "commit") {
@@ -373,6 +376,19 @@ export class GitHubClient {
       }
       return { ...entry, url: typeof entry.url === "string" ? entry.url : "" } as GitHubTreeNode;
     });
+    if (recursive) {
+      const byPath = new Map(tree.map(node => [node.path, node]));
+      for (const node of tree) {
+        let slash = node.path.indexOf("/");
+        while (slash !== -1) {
+          const ancestor = byPath.get(node.path.slice(0, slash));
+          if (ancestor && ancestor.type !== "tree") {
+            throw new Error(`Malformed GitHub response: tree path has a non-directory ancestor at ${ancestor.path}.`);
+          }
+          slash = node.path.indexOf("/", slash + 1);
+        }
+      }
+    }
     const responseTreeSha = requiredGitObjectSha(raw.sha, "tree SHA");
     if (responseTreeSha !== expectedTreeSha) {
       throw new Error("Malformed GitHub response: tree SHA does not match the requested tree.");
