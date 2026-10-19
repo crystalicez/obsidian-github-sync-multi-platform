@@ -34,6 +34,56 @@ test("pack planner splits large groups before new GitHub REST encrypted blob wou
   }
 });
 
+
+test("incremental planner matches a full group-resource recalculation for mixed 1,200-note vaults", () => {
+  const candidates = Array.from({ length: 1_200 }, (_, index) => ({
+    fileId: index % 7 === 0 ? `สวัสดี-🌏-${index}` : `file-${index}`,
+    path: `${index < 550 ? "Notes" : index < 920 ? "Projects/Subfolder" : "Assets"}/note-${index}.md`,
+    size: index % 97 === 0 ? PACK_MAX_ENTRY_BYTES + 1 : index % 37 === 0 ? 256 * 1024 : index % 5 === 0 ? 0 : (index % 17) + 1,
+  }))
+  const budgets = [
+    { maxPlaintextBytes: PACK_MAX_PLAINTEXT_BYTES },
+    { maxPlaintextBytes: 64 * 1024 },
+    { maxResidentBytes: 2 * 1024 * 1024, maxTransportTransientBytes: 3 * 1024 * 1024 },
+    { maxPlaintextBytes: 512 * 1024, maxResidentBytes: 4 * 1024 * 1024, maxTransportTransientBytes: 5 * 1024 * 1024 },
+  ]
+  for (const options of budgets) {
+    const fits = (group: V4PackCandidateMeta[]) => {
+      const estimate = estimateV4PackGroupResources(group)
+      return estimate.plaintextBytes <= Math.min(PACK_MAX_PLAINTEXT_BYTES, options.maxPlaintextBytes ?? PACK_MAX_PLAINTEXT_BYTES)
+        && estimate.ciphertextBytes <= V4_GITHUB_REST_SAFE_WRITER_BYTES
+        && estimate.residentBytes <= (options.maxResidentBytes ?? Number.POSITIVE_INFINITY)
+        && estimate.transportBytes <= (options.maxTransportTransientBytes ?? Number.POSITIVE_INFINITY)
+    }
+    const eligible = candidates.filter(item => item.size <= PACK_MAX_ENTRY_BYTES && fits([item]))
+    const expected: V4PackCandidateMeta[][] = []
+    if (eligible.length >= PACK_MIN_CHANGED_FILES) {
+      for (let cursor = 0; cursor < eligible.length;) {
+        const folder = eligible[cursor].path.slice(0, eligible[cursor].path.lastIndexOf("/"))
+        const group: V4PackCandidateMeta[] = []
+        while (cursor < eligible.length && group.length < PACK_MAX_FILES) {
+          const item = eligible[cursor]
+          if (group.length > 0 && item.path.slice(0, item.path.lastIndexOf("/")) !== folder) break
+          if (group.length > 0 && !fits([...group, item])) break
+          group.push(item)
+          cursor++
+        }
+        expected.push(group)
+      }
+    }
+    assert.deepEqual(planV4PackGroups(candidates, options), expected, JSON.stringify(options))
+  }
+})
+
+test("10,000 small changed notes group in stable source order under the REST size cap", () => {
+  const candidates = Array.from({ length: 10_000 }, (_, index) => candidate(index, { size: 512 }))
+  const groups = planV4PackGroups(candidates)
+  assert.equal(groups.length, 20)
+  assert.deepEqual(groups.map(group => group.length), Array.from({ length: 20 }, () => 500))
+  assert.deepEqual(groups.flat(), candidates)
+  assert.ok(groups.every(group => estimateV4PackGroupResources(group).ciphertextBytes <= V4_GITHUB_REST_SAFE_WRITER_BYTES))
+})
+
 test("pack planner freezes the current V4 pack thresholds", () => {
   assert.equal(PACK_MIN_CHANGED_FILES, 64);
   assert.equal(PACK_MAX_FILES, 500);
