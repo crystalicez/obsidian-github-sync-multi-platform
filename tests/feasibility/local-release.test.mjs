@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createHash } from "node:crypto";
+import { writeFileSync } from "node:fs";
 import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -252,7 +253,8 @@ test("local staged artifact mutation is detected before first remote stable muta
   let masterRead = 0;
   h.services.readRemoteMasterSha = () => {
     masterRead += 1;
-    if (masterRead === 2) writeFile(h.packaged.assets[0].path, "tampered");
+    // The injected read hook is synchronous: finish tampering before release validation.
+    if (masterRead === 2) writeFileSync(h.packaged.assets[0].path, "tampered");
     return SHA;
   };
   await assert.rejects(() => releaseLocal({ cwd: "/repo", version: "1.0.8", services: h.services, runtimeNodeVersion: "v24.11.0" }), /staged release asset changed/i);

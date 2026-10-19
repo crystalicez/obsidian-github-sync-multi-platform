@@ -2,6 +2,7 @@ export const V4_FORMAT_VERSION = 4 as const;
 export const V4_ROOT = ".obsidian-github-sync-v4";
 export const V4_CONFIG_PATH = `${V4_ROOT}/config.json`;
 export const V4_HEAD_PATH = `${V4_ROOT}/head`;
+export const V4_PBKDF2_ITERATIONS = 600_000;
 
 export type V4StorageMode = "plaintext" | "encrypted";
 export type V4ObjectStorage = "single" | "chunked" | "pack";

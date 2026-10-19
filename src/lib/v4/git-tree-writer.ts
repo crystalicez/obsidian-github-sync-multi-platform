@@ -187,6 +187,7 @@ export async function uploadV4ObjectStream(
   github: V4GitTreeGithub,
   input: {
     objects: AsyncIterable<V4StreamObject>;
+    maxConcurrentUploads?: 1 | 2;
     progressItem?: V4GitTreeProgressItem;
     onLogicalFileUploadStarted?: (item: V4GitTreeProgressItem) => void;
     onLogicalFileUploaded?: (item: V4GitTreeProgressItem) => void;
@@ -196,21 +197,36 @@ export async function uploadV4ObjectStream(
   const entries: GitHubCreateTreeEntry[] = [];
   const fileShas: Record<string, string> = {};
   let started = false;
-  for await (const object of input.objects) {
-    if (!started && input.progressItem) {
-      started = true;
-      invokeProgressCallback(() => input.onLogicalFileUploadStarted?.(input.progressItem!));
+  const pending: Array<Promise<{ path: string; sha: string }>> = [];
+  const finishOldest = async () => {
+    const { path, sha } = await pending.shift()!;
+    fileShas[path] = sha;
+    entries.push({ path, mode: "100644", type: "blob", sha });
+  };
+  try {
+    for await (const object of input.objects) {
+      if (!started && input.progressItem) {
+        started = true;
+        invokeProgressCallback(() => input.onLogicalFileUploadStarted?.(input.progressItem!));
+      }
+      const upload = (async () => {
+        try {
+          const createBlob = () => github.createGitBlob(object.bytes);
+          const sha = input.withBlobTransport
+            ? await input.withBlobTransport(object.bytes, createBlob)
+            : await createBlob();
+          return { path: object.path, sha };
+        } finally {
+          object.release?.();
+        }
+      })();
+      void upload.catch(() => undefined);
+      pending.push(upload);
+      if (pending.length === (input.maxConcurrentUploads ?? 2)) await finishOldest();
     }
-    try {
-      const createBlob = () => github.createGitBlob(object.bytes);
-      const sha = input.withBlobTransport
-        ? await input.withBlobTransport(object.bytes, createBlob)
-        : await createBlob();
-      fileShas[object.path] = sha;
-      entries.push({ path: object.path, mode: "100644", type: "blob", sha });
-    } finally {
-      object.release?.();
-    }
+    while (pending.length > 0) await finishOldest();
+  } finally {
+    await Promise.allSettled(pending);
   }
   if (input.progressItem && started) invokeProgressCallback(() => input.onLogicalFileUploaded?.(input.progressItem!));
   return { entries, fileShas };

@@ -74,6 +74,11 @@ export class SettingTab extends PluginSettingTab {
   plugin: FastSync
   tempSettings: PluginSettings | null = null
   bannerEl: HTMLElement | null = null
+  private settingsSavePending = false
+  private settingsViewEpoch = 0
+  private clipboardPasteEpoch = 0
+  private clipboardTipTimer: ReturnType<typeof setTimeout> | null = null
+  private clipboardTipEl: HTMLElement | null = null
 
   constructor(app: App, plugin: FastSync) {
     super(app, plugin)
@@ -93,22 +98,38 @@ export class SettingTab extends PluginSettingTab {
       this.bannerEl.addClass("is-dirty")
       const banner = this.bannerEl.createDiv("github-sync-settings-dirty-banner")
       banner.createEl("span", { text: "You have unsaved changes!", cls: "github-sync-settings-dirty-text" })
+      banner.createEl("p", { text: "Sync and Force actions still use the last saved repository, branch, and scope until changes are saved." })
       
       const btnContainer = banner.createDiv("github-sync-settings-dirty-buttons")
       const saveBtn = btnContainer.createEl("button", { text: "Save changes", cls: "mod-cta" })
+      saveBtn.disabled = this.settingsSavePending
       saveBtn.onclick = async () => {
-        if (this.tempSettings) {
-          this.plugin.settings = JSON.parse(JSON.stringify(this.tempSettings))
-          await this.plugin.saveSettings()
-          this.plugin.initGitHubClient()
+        if (!this.tempSettings || this.settingsSavePending) return
+        this.settingsSavePending = true
+        saveBtn.disabled = true
+        discardBtn.disabled = true
+        const nextSettings = JSON.parse(JSON.stringify(this.tempSettings)) as PluginSettings
+        const viewEpoch = this.settingsViewEpoch
+        try {
+          await this.plugin.saveSettings(nextSettings)
           this.plugin.updateStatusBar()
           new Notice("GitHub Sync: Settings saved")
-          this.display()
+          if (viewEpoch === this.settingsViewEpoch && this.tempSettings) this.display()
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error)
+          new Notice(`GitHub Sync: Settings not saved: ${message}`)
+        } finally {
+          this.settingsSavePending = false
+          saveBtn.disabled = false
+          discardBtn.disabled = false
+          this.updateDirtyState()
         }
       }
 
       const discardBtn = btnContainer.createEl("button", { text: "Discard", cls: "mod-warning" })
+      discardBtn.disabled = this.settingsSavePending
       discardBtn.onclick = () => {
+        if (this.settingsSavePending) return
         this.tempSettings = JSON.parse(JSON.stringify(this.plugin.settings))
         this.display()
       }
@@ -118,6 +139,13 @@ export class SettingTab extends PluginSettingTab {
   }
 
   hide(): void {
+    this.settingsViewEpoch++
+    this.bannerEl = null
+    this.clipboardPasteEpoch++
+    if (this.clipboardTipTimer !== null) clearTimeout(this.clipboardTipTimer)
+    this.clipboardTipTimer = null
+    this.clipboardTipEl = null
+    this.plugin.clipboardReadTip = ""
     this.tempSettings = null
   }
 
@@ -125,9 +153,26 @@ export class SettingTab extends PluginSettingTab {
    * Read GitHub configuration JSON from the clipboard and populate settings automatically
    */
   async handleClipboardPaste(tipEl: HTMLElement): Promise<void> {
-    const showTip = (msg: string) => {
-      tipEl.setText(msg)
-      setTimeout(() => tipEl.setText(""), 2000)
+    const epoch = ++this.clipboardPasteEpoch
+    const draft = this.tempSettings
+    const startingCoordinates = draft && [draft.githubOwner, draft.githubRepo, draft.githubBranch, draft.githubToken]
+    const isCurrent = () => epoch === this.clipboardPasteEpoch && !!draft && this.tempSettings === draft
+    const draftUnchanged = () => !!draft && !!startingCoordinates
+      && [draft.githubOwner, draft.githubRepo, draft.githubBranch, draft.githubToken]
+        .every((value, index) => value === startingCoordinates[index])
+    const showTip = (message: string) => {
+      if (!isCurrent()) return
+      if (this.clipboardTipTimer !== null) clearTimeout(this.clipboardTipTimer)
+      this.plugin.clipboardReadTip = message
+      const activeTip = this.clipboardTipEl ?? tipEl
+      activeTip.setText(message)
+      this.clipboardTipTimer = setTimeout(() => {
+        if (!isCurrent()) return
+        this.plugin.clipboardReadTip = ""
+        const activeTip = this.clipboardTipEl ?? tipEl
+        activeTip.setText("")
+        this.clipboardTipTimer = null
+      }, 2000)
     }
 
     try {
@@ -136,18 +181,23 @@ export class SettingTab extends PluginSettingTab {
         return
       }
       const text = await navigator.clipboard.readText()
-      const parsed = JSON.parse(text)
-      if (typeof parsed === "object" && parsed !== null) {
-        const hasOwner = "githubOwner" in parsed || "owner" in parsed
-        const hasRepo = "githubRepo" in parsed || "repo" in parsed
-        const hasToken = "githubToken" in parsed || "token" in parsed
-        if (hasOwner && hasRepo && hasToken) {
-          if (this.tempSettings) {
-            this.tempSettings.githubOwner = parsed.githubOwner || parsed.owner
-            this.tempSettings.githubRepo = parsed.githubRepo || parsed.repo
-            this.tempSettings.githubBranch = parsed.githubBranch || parsed.branch || "main"
-            this.tempSettings.githubToken = parsed.githubToken || parsed.token
-          }
+      if (!isCurrent()) return
+      if (!draftUnchanged()) {
+        showTip("Settings changed while reading the clipboard. Paste again to apply.")
+        return
+      }
+      const parsed: unknown = JSON.parse(text)
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        const values = parsed as Record<string, unknown>
+        const owner = values.githubOwner || values.owner
+        const repo = values.githubRepo || values.repo
+        const token = values.githubToken || values.token
+        const branch = values.githubBranch || values.branch || "main"
+        if ([owner, repo, token, branch].every(value => typeof value === "string" && value.trim().length > 0)) {
+          draft!.githubOwner = owner as string
+          draft!.githubRepo = repo as string
+          draft!.githubBranch = branch as string
+          draft!.githubToken = token as string
           this.display()
           showTip("Configuration pasted into settings!")
           return
@@ -228,6 +278,9 @@ export class SettingTab extends PluginSettingTab {
       cls: "clipboard-read-button"
     })
     const clipboardTip = clipboardDiv.createEl("div", { cls: "clipboard-read-description" })
+    this.clipboardTipEl = clipboardTip
+    clipboardTip.setAttribute("role", "status")
+    clipboardTip.setAttribute("aria-live", "polite")
     clipboardTip.setText(this.plugin.clipboardReadTip)
     clipboardBtn.addEventListener("click", () => {
       void this.handleClipboardPaste(clipboardTip)
@@ -523,17 +576,26 @@ export class SettingTab extends PluginSettingTab {
     const debugButton = debugDiv.createEl("button")
     debugButton.setText("Copy debug information")
     debugButton.onclick = async () => {
-      await window.navigator.clipboard.writeText(
-        JSON.stringify(
-          createDebugPayload(
-            this.plugin.settings as unknown as Record<string, unknown>,
-            this.plugin.manifest.version
-          ),
-          null,
-          4
+      if (debugButton.disabled) return
+      debugButton.disabled = true
+      try {
+        if (!window.navigator.clipboard?.writeText) throw new Error("Clipboard unavailable")
+        await window.navigator.clipboard.writeText(
+          JSON.stringify(
+            createDebugPayload(
+              this.plugin.settings as unknown as Record<string, unknown>,
+              this.plugin.manifest.version
+            ),
+            null,
+            4
+          )
         )
-      )
-      new Notice("Copy debug information to the clipboard, may contain sensitive information!")
+        new Notice("GitHub Sync: Debug information copied. Review it before sharing; it may contain sensitive metadata.")
+      } catch {
+        new Notice("GitHub Sync: Could not copy debug information. Check clipboard permissions.")
+      } finally {
+        debugButton.disabled = false
+      }
     }
 
     if (Platform.isDesktopApp) {

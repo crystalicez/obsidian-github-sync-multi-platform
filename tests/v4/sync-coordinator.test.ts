@@ -267,6 +267,18 @@ test("v4 coordinator collapses folder events to one full rescan", async () => {
   assert.deepEqual(executions, [[{ type: "rescan", mtime: 2 }]]);
 });
 
+test("v4 coalescing handles a large local-event burst without spreading every mtime into Math.max", () => {
+  const count = 150_000;
+  const changes: V4QueuedChange[] = Array.from({ length: count }, (_, index) => ({
+    type: "modify",
+    path: `Burst/${index}.md`,
+    mtime: index + 1,
+  }));
+  changes.push({ type: "rescan", mtime: count + 1 });
+
+  assert.deepEqual(coalesceV4Changes(changes), [{ type: "rescan", mtime: count + 1 }]);
+});
+
 test("v4 folder changes preserve causal event order across delete-recreate interactions", () => {
   const changes: V4QueuedChange[] = [
     { type: "folderDelete", path: "F", mtime: 1 },
@@ -318,3 +330,61 @@ test("v4 coordinator aborts the active execution on dispose and starts no follow
   assert.equal((await coordinator.run({ operation: "normal", trigger: "manual" })).status, "skipped")
   assert.equal(executions, 1)
 })
+
+
+test("v4 coordinator can cancel an active run for settings rotation without disposing future syncs", async () => {
+  let executions = 0;
+  let observedSignal: AbortSignal | undefined;
+  const coordinator = new V4SyncCoordinator({
+    execute: async (_request, _changes, signal) => {
+      executions++;
+      observedSignal = signal;
+      if (executions > 1) return { changedFiles: 0 };
+      await new Promise<void>((resolve, reject) => {
+        if (signal.aborted) return reject(signal.reason);
+        signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+      });
+      return { changedFiles: 0 };
+    },
+  });
+
+  const active = coordinator.run({ operation: "normal", trigger: "manual" });
+  const cancellable = coordinator as unknown as { cancelActive(reason?: unknown): void };
+  cancellable.cancelActive(new Error("settings changed"));
+
+  await assert.rejects(active, /settings changed/iu);
+  assert.equal(observedSignal?.aborted, true);
+  await coordinator.whenIdle();
+  assert.equal(coordinator.isSyncing, false);
+
+  const followup = await coordinator.run({ operation: "normal", trigger: "manual" });
+  assert.equal(followup.status, "completed");
+  assert.equal(executions, 2);
+});
+
+
+test("v4 coordinator drops pending debounce work for a settings generation switch and remains reusable", async () => {
+  const timers = new FakeTimers();
+  const executions: V4QueuedChange[][] = [];
+  const coordinator = new V4SyncCoordinator({
+    execute: async (_request, changes) => { executions.push(changes); return { changedFiles: changes.length }; },
+    schedule: timers.schedule,
+    cancel: timers.cancel,
+  });
+
+  coordinator.enqueue({ type: "modify", path: "old-target.md", mtime: 1 });
+  assert.equal(coordinator.pendingCount, 1);
+  assert.equal(timers.timers.size, 1);
+
+  coordinator.cancelPending();
+
+  assert.equal(coordinator.pendingCount, 0);
+  assert.equal(timers.timers.size, 0);
+  await coordinator.run({ operation: "normal", trigger: "manual" });
+  assert.deepEqual(executions, [[]]);
+
+  coordinator.enqueue({ type: "modify", path: "new-target.md", mtime: 2 });
+  timers.fireLatest();
+  await coordinator.whenIdle();
+  assert.deepEqual(executions, [[], [{ type: "modify", path: "new-target.md", mtime: 2 }]]);
+});

@@ -1,11 +1,13 @@
 import { bytesToUtf8, fromBase64, sha256Hex, toBase64, utf8ToBytes } from "../bytes"
+import { boundedMap } from "./bounded-map"
 import { collectV4ContentSource, type V4ContentSource } from "./content-source"
-import { decryptV4Payload, encryptV4Payload, type V4Keyring } from "./crypto"
+import { decryptV4Payload, encryptV4Payload, V4_ENCRYPTED_PAYLOAD_OVERHEAD_BYTES, type V4Keyring } from "./crypto"
 import { throwIfV4Aborted } from "./cancellation"
 import {
   buildV4PartPaths,
   joinAndVerifyV4Parts,
-  shouldUseV4Parts,
+  shouldWriteV4Parts,
+  V4_GITHUB_REST_SAFE_WRITER_BYTES,
   splitV4Parts,
   V4_LARGE_FILE_THRESHOLD_BYTES,
 } from "./large-files"
@@ -14,7 +16,33 @@ import { streamV4SourceParts, type V4PreparedObjectStream, V4SourceChangedError 
 import { normalizeV4VaultPath, objectIdForV4File, opaqueV4ObjectPath, opaqueV4PackPath, pathIdForV4Path } from "./paths"
 import { type V4FileRecord, type V4PathLayout, type V4StorageMode } from "./protocol-types"
 import type { V4ResourceController } from "./resource-controller"
+import type { V4RunDiagnostics, V4WorkKind } from "./run-diagnostics"
 import type { V4StagedSink } from "./staging-store"
+
+const V4_CHUNK_READ_CONCURRENCY = 4
+const V4_PACK_PREFIX_BYTES = utf8ToBytes('{"version":1,"entries":{').byteLength
+const V4_PACK_SUFFIX_BYTES = utf8ToBytes('}}').byteLength
+
+function assertRestSafeNewV4Pack(archiveBytes: number): void {
+  if (!Number.isSafeInteger(archiveBytes) || archiveBytes < 0) {
+    throw new RangeError("V4 pack archive is too large.")
+  }
+  if (archiveBytes + V4_ENCRYPTED_PAYLOAD_OVERHEAD_BYTES > V4_GITHUB_REST_SAFE_WRITER_BYTES) {
+    throw new RangeError("V4 pack exceeds GitHub REST-safe 8 MiB encrypted blob limit.")
+  }
+}
+
+function expectedV4PackArchiveBytes(records: readonly V4FileRecord[]): number {
+  let total = V4_PACK_PREFIX_BYTES + V4_PACK_SUFFIX_BYTES
+  for (let index = 0; index < records.length; index++) {
+    const record = records[index]
+    const keyBytes = utf8ToBytes(JSON.stringify(record.fileId)).byteLength
+    const encodedBytes = 4 * Math.ceil(record.size / 3)
+    total += (index > 0 ? 1 : 0) + keyBytes + 2 + encodedBytes + 1
+    if (!Number.isSafeInteger(total)) throw new RangeError("V4 pack archive is too large.")
+  }
+  return total
+}
 
 export interface V4PreparedFile {
   path: string
@@ -51,17 +79,35 @@ export class V4StorageCodec {
     keyring?: V4Keyring
     resources?: Pick<V4ResourceController, "withCrypto"> & Partial<Pick<V4ResourceController, "reserveResidentBytes">>
     signal?: AbortSignal
+    diagnostics?: V4RunDiagnostics
+    maxConcurrentPartTransfers?: 1 | 2
   }) {
     if (options.mode === "encrypted" && !options.keyring) {
       throw new Error("Encrypted V4 storage requires a keyring.")
     }
   }
 
-  private async crypto<T>(task: () => Promise<T>): Promise<T> {
+  private async crypto<T>(task: () => Promise<T>, kind: V4WorkKind = "hashing"): Promise<T> {
     throwIfV4Aborted(this.options.signal)
-    const value = this.options.resources ? await this.options.resources.withCrypto(task, this.options.signal) : await task()
+    const measured = () => this.options.diagnostics
+      ? this.options.diagnostics.measureAsync(kind, task)
+      : task()
+    const value = this.options.resources ? await this.options.resources.withCrypto(measured, this.options.signal) : await measured()
     throwIfV4Aborted(this.options.signal)
     return value
+  }
+
+  private encrypt<T>(task: () => Promise<T>): Promise<T> {
+    return this.crypto(task, "encryption")
+  }
+
+  private decrypt<T>(task: () => Promise<T>): Promise<T> {
+    return this.crypto(task, "decryption")
+  }
+
+  private updateHash(hash: { update(data: Uint8Array): unknown }, bytes: Uint8Array): void {
+    if (this.options.diagnostics) this.options.diagnostics.measure("hashing", () => hash.update(bytes))
+    else hash.update(bytes)
   }
 
   private contentAad(record: { fileId: string; pathId: string; remoteVersion: string }): string {
@@ -88,8 +134,8 @@ export class V4StorageCodec {
     const pathId = await this.pathId(path)
     const stableFileId = fileId ?? pathId
     const plaintextSha256 = await this.crypto(() => sha256Hex(plaintext))
-    const predictedBytes = plaintext.byteLength + (this.options.mode === "encrypted" ? 33 : 0)
-    if (shouldUseV4Parts(plaintext.byteLength, predictedBytes)) {
+    // Writer sizing uses a separate REST-safe threshold; old reader descriptors are unchanged.
+    if (shouldWriteV4Parts(plaintext.byteLength)) {
       return this.prepareParts(path, pathId, stableFileId, plaintext, plaintextSha256, version, mtime)
     }
 
@@ -98,7 +144,7 @@ export class V4StorageCodec {
       : await this.crypto(() => opaqueV4ObjectPath(this.options.keyring!.pathKey, stableFileId))
     const bytes = this.options.mode === "plaintext"
       ? plaintext
-      : await this.crypto(() => encryptV4Payload(this.options.keyring!.contentKey, plaintext, {
+      : await this.encrypt(() => encryptV4Payload(this.options.keyring!.contentKey, plaintext, {
         kind: "content",
         aad: this.contentAad({ fileId: stableFileId, pathId, remoteVersion: version }),
       }))
@@ -134,8 +180,8 @@ export class V4StorageCodec {
     const path = normalizeV4VaultPath(input.logicalPath)
     const pathId = await this.pathId(path)
     const fileId = input.fileId
-    const predictedBytes = input.source.size + (this.options.mode === "encrypted" ? 33 : 0)
-    const chunked = shouldUseV4Parts(input.source.size, predictedBytes)
+    // Streamed writes use the REST-safe threshold, not the historical 50 MiB reader threshold.
+    const chunked = shouldWriteV4Parts(input.source.size)
     const opaqueId = chunked && this.options.mode === "encrypted"
       ? await this.crypto(() => objectIdForV4File(this.options.keyring!.pathKey, fileId))
       : undefined
@@ -168,13 +214,13 @@ export class V4StorageCodec {
         const release = await reserve(input.source.size)
         try {
           const plaintext = await collectV4ContentSource(input.source, V4_LARGE_FILE_THRESHOLD_BYTES, signal)
-          hash.update(plaintext)
+          this.updateHash(hash, plaintext)
           total = plaintext.byteLength
           await input.checkSourceStable?.()
           if (hash.digestHex() !== input.expectedHash) { completed = true; return }
           const bytes = this.options.mode === "plaintext"
             ? plaintext
-            : await this.crypto(() => encryptV4Payload(this.options.keyring!.contentKey, plaintext, { kind: "content", aad: contentAad }))
+            : await this.encrypt(() => encryptV4Payload(this.options.keyring!.contentKey, plaintext, { kind: "content", aad: contentAad }))
           completed = true
           yield { path: objectPaths[0], bytes, release }
           return
@@ -194,12 +240,12 @@ export class V4StorageCodec {
         try {
           next = await iterator.next()
           if (next.done) throw new V4SourceChangedError(path, `source ended after ${total} bytes; expected ${input.source.size}`)
-          hash.update(next.value)
+          this.updateHash(hash, next.value)
           total += next.value.byteLength
           await input.checkSourceStable?.()
           const bytes = this.options.mode === "plaintext"
             ? next.value
-            : await this.crypto(() => encryptV4Payload(this.options.keyring!.contentKey, next.value, {
+            : await this.encrypt(() => encryptV4Payload(this.options.keyring!.contentKey, next.value, {
               kind: "part",
               aad: `${contentAad}:${index}`,
             }))
@@ -294,7 +340,7 @@ export class V4StorageCodec {
       return { entry, index, expectedSize, key, encodedBytes }
     })
     const archiveBytes = layouts.reduce((sum, layout) => sum + (layout.index > 0 ? 1 : 0) + layout.key.byteLength + 2 + layout.encodedBytes + 1, prefix.byteLength + suffix.byteLength)
-    if (!Number.isSafeInteger(archiveBytes)) throw new RangeError("V4 pack archive is too large.")
+    assertRestSafeNewV4Pack(archiveBytes)
     const archive = new Uint8Array(archiveBytes)
     let archiveOffset = 0
     const writeBytes = (bytes: Uint8Array): void => { archive.set(bytes, archiveOffset); archiveOffset += bytes.byteLength }
@@ -314,7 +360,7 @@ export class V4StorageCodec {
       for await (const chunk of layout.entry.source.chunks(chunkBytes, signal)) {
         if (offset + chunk.byteLength > plaintext.byteLength) throw new V4SourceChangedError(layout.entry.logicalPath, "source produced more bytes than expected")
         plaintext.set(chunk, offset)
-        hasher.update(chunk)
+        this.updateHash(hasher, chunk)
         offset += chunk.byteLength
         await layout.entry.checkSourceStable?.()
       }
@@ -343,7 +389,8 @@ export class V4StorageCodec {
     if (archiveOffset !== archive.byteLength) throw new Error("V4 pack archive length mismatch.")
 
     const remotePath = await this.crypto(() => opaqueV4PackPath(this.options.keyring!.pathKey, packId))
-    const bytes = await this.crypto(() => encryptV4Payload(this.options.keyring!.contentKey, archive, { kind: "pack", aad: packId }))
+    assertRestSafeNewV4Pack(archive.byteLength)
+    const bytes = await this.encrypt(() => encryptV4Payload(this.options.keyring!.contentKey, archive, { kind: "pack", aad: packId }))
     return {
       records: records.map(record => ({ ...record, storage: "pack", remotePath, encryptedPath: remotePath, packId, partPaths: undefined })),
       file: { path: remotePath, bytes },
@@ -358,11 +405,18 @@ export class V4StorageCodec {
     if (entries.length === 0) throw new Error("Cannot create an empty V4 pack.")
     if (!/^[A-Za-z0-9_-]+$/u.test(packId)) throw new Error("Unsafe V4 pack id.")
     const remotePath = await this.crypto(() => opaqueV4PackPath(this.options.keyring!.pathKey, packId))
+    const estimatedArchiveBytes = V4_PACK_PREFIX_BYTES + V4_PACK_SUFFIX_BYTES
+      + entries.reduce((total, entry, index) => total
+        + (index > 0 ? 1 : 0)
+        + utf8ToBytes(JSON.stringify(entry.record.fileId)).byteLength
+        + 2 + 4 * Math.ceil(entry.plaintext.byteLength / 3) + 1, 0)
+    assertRestSafeNewV4Pack(estimatedArchiveBytes)
     const archive = utf8ToBytes(JSON.stringify({
       version: 1,
       entries: Object.fromEntries(entries.map(entry => [entry.record.fileId, toBase64(entry.plaintext)])),
     }))
-    const bytes = await this.crypto(() => encryptV4Payload(this.options.keyring!.contentKey, archive, { kind: "pack", aad: packId }))
+    assertRestSafeNewV4Pack(archive.byteLength)
+    const bytes = await this.encrypt(() => encryptV4Payload(this.options.keyring!.contentKey, archive, { kind: "pack", aad: packId }))
     return {
       records: entries.map(entry => ({ ...entry.record, storage: "pack", remotePath, encryptedPath: remotePath, packId, partPaths: undefined })),
       file: { path: remotePath, bytes },
@@ -378,7 +432,7 @@ export class V4StorageCodec {
     version: string,
     mtime: number,
   ): Promise<V4PreparedRemoteWrite> {
-    const parts = splitV4Parts(plaintext)
+    const parts = splitV4Parts(plaintext, V4_GITHUB_REST_SAFE_WRITER_BYTES)
     const opaqueId = this.options.mode === "encrypted"
       ? await this.crypto(() => objectIdForV4File(this.options.keyring!.pathKey, fileId))
       : undefined
@@ -393,7 +447,7 @@ export class V4StorageCodec {
       path: partPaths[index],
       bytes: this.options.mode === "plaintext"
         ? part
-        : await this.crypto(() => encryptV4Payload(this.options.keyring!.contentKey, part, {
+        : await this.encrypt(() => encryptV4Payload(this.options.keyring!.contentKey, part, {
           kind: "part",
           aad: `${this.contentAad({ fileId, pathId, remoteVersion: version })}:${index}`,
         })),
@@ -427,7 +481,7 @@ export class V4StorageCodec {
     const append = async (plaintext: Uint8Array) => {
       if (signal?.aborted) throw signal.reason ?? new Error("V4 remote read aborted.")
       if (total + plaintext.byteLength > record.size) throw new Error(`V4 content size mismatch: ${record.remotePath}`)
-      hash.update(plaintext)
+      this.updateHash(hash, plaintext)
       total += plaintext.byteLength
       await sink.append(plaintext)
     }
@@ -435,50 +489,124 @@ export class V4StorageCodec {
     if (record.storage === "chunked") {
       const partPaths = record.partPaths ?? []
       if (partPaths.length === 0) throw new Error("V4 chunked record has no parts.")
-      for (let index = 0; index < partPaths.length; index++) {
-        if (signal?.aborted) throw signal.reason ?? new Error("V4 remote read aborted.")
-        const bytes = await reader(partPaths[index])
-        const plaintext = this.options.mode === "plaintext"
-          ? bytes
-          : await this.crypto(() => decryptV4Payload(this.options.keyring!.contentKey, bytes, {
-            kind: "part",
-            aad: `${this.contentAad(record)}:${index}`,
-          }))
-        await append(plaintext)
+      const parallelReads = Math.ceil(record.size / partPaths.length) <= V4_GITHUB_REST_SAFE_WRITER_BYTES
+        ? this.options.maxConcurrentPartTransfers ?? 2
+        : 1
+      const pending = new Map<number, Promise<Uint8Array>>()
+      let next = 0
+      const fill = () => {
+        while (next < partPaths.length && pending.size < parallelReads) {
+          const index = next++
+          const request = Promise.resolve().then(() => reader(partPaths[index]))
+          void request.catch(() => undefined)
+          pending.set(index, request)
+        }
+      }
+      try {
+        fill()
+        for (let index = 0; index < partPaths.length; index++) {
+          if (signal?.aborted) throw signal.reason ?? new Error("V4 remote read aborted.")
+          const bytes = await pending.get(index)!
+          pending.delete(index)
+          fill()
+          const plaintext = this.options.mode === "plaintext"
+            ? bytes
+            : await this.decrypt(() => decryptV4Payload(this.options.keyring!.contentKey, bytes, {
+              kind: "part",
+              aad: `${this.contentAad(record)}:${index}`,
+            }))
+          await append(plaintext)
+        }
+      } finally {
+        await Promise.allSettled(pending.values())
       }
     } else {
       await append(await this.read(record, reader))
     }
 
     const plaintextSha256 = hash.digestHex()
-    if (total !== record.size) throw new Error(`V4 content size mismatch: expected ${record.size}, got ${total}.`)
+    if (total !== record.size) throw new Error(`V4 content size mismatch: ${record.remotePath}; expected ${record.size}, got ${total}.`)
     if (record.plaintextSha256 && plaintextSha256 !== record.plaintextSha256) throw new Error(`V4 content hash mismatch: ${record.remotePath}`)
     return { plaintextSha256, size: total }
+  }
+
+  async readPackRecords(
+    records: readonly V4FileRecord[],
+    reader: V4RemoteBytesReader,
+    signal: AbortSignal | undefined = this.options.signal,
+  ): Promise<Map<string, Uint8Array>> {
+    throwIfV4Aborted(signal)
+    if (this.options.mode !== "encrypted" || !this.options.keyring || records.length === 0) {
+      throw new Error("Invalid V4 pack record group.")
+    }
+    const first = records[0]
+    if (first.storage !== "pack" || !first.packId || !first.remotePath) throw new Error("Invalid V4 pack record.")
+    const packId = first.packId
+    const remotePath = first.remotePath
+    const fileIds = new Set<string>()
+    for (const record of records) {
+      if (record.storage !== "pack" || record.packId !== packId || record.remotePath !== remotePath) {
+        throw new Error("V4 pack record group is inconsistent.")
+      }
+      if (fileIds.has(record.fileId)) throw new Error(`Duplicate V4 packed fileId: ${record.fileId}`)
+      fileIds.add(record.fileId)
+    }
+
+    const payload = await reader(remotePath)
+    throwIfV4Aborted(signal)
+    const expectedArchiveBytes = expectedV4PackArchiveBytes(records)
+    if (payload.byteLength !== expectedArchiveBytes + V4_ENCRYPTED_PAYLOAD_OVERHEAD_BYTES) {
+      throw new Error("V4 pack payload size does not match its declared records.")
+    }
+    const archive = await this.decrypt(() => decryptV4Payload(this.options.keyring!.contentKey, payload, { kind: "pack", aad: packId }))
+    if (archive.byteLength !== expectedArchiveBytes) throw new Error("V4 pack archive size does not match its declared records.")
+    let parsed: unknown
+    try { parsed = JSON.parse(bytesToUtf8(archive)) } catch { throw new Error("V4 pack archive JSON is invalid.") }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("V4 pack archive is invalid.")
+    const candidate = parsed as { version?: unknown; entries?: unknown }
+    if (candidate.version !== 1 || !candidate.entries || typeof candidate.entries !== "object" || Array.isArray(candidate.entries)) {
+      throw new Error("V4 pack archive is invalid.")
+    }
+    const entries = candidate.entries as Record<string, unknown>
+    const entryKeys = Object.keys(entries)
+    if (entryKeys.length !== fileIds.size || entryKeys.some(fileId => !fileIds.has(fileId))) {
+      throw new Error("V4 pack archive entry set does not match its declared records.")
+    }
+    const output = new Map<string, Uint8Array>()
+    for (const record of records) {
+      const encoded = entries[record.fileId]
+      if (typeof encoded !== "string") throw new Error(`V4 pack entry is missing: ${record.fileId}`)
+      const expectedEncodedLength = 4 * Math.ceil(record.size / 3)
+      if (encoded.length !== expectedEncodedLength) throw new Error("V4 packed entry size is inconsistent with its record.")
+      let plaintext: Uint8Array
+      try { plaintext = fromBase64(encoded) } catch { throw new Error("V4 packed entry base64 is invalid.") }
+      if (plaintext.byteLength !== record.size) throw new Error("V4 packed entry size is inconsistent with its record.")
+      if (record.plaintextSha256 && await this.crypto(() => sha256Hex(plaintext)) !== record.plaintextSha256) {
+        throw new Error("V4 packed content hash mismatch.")
+      }
+      output.set(record.fileId, plaintext)
+    }
+    return output
   }
 
   async read(record: V4FileRecord, reader: V4RemoteBytesReader, signal: AbortSignal | undefined = this.options.signal): Promise<Uint8Array> {
     throwIfV4Aborted(signal)
     if (record.storage === "pack") {
-      if (this.options.mode !== "encrypted" || !record.packId) throw new Error("Invalid V4 pack record.")
-      const payload = await reader(record.remotePath)
-      throwIfV4Aborted(signal)
-      const archive = await this.crypto(() => decryptV4Payload(this.options.keyring!.contentKey, payload, { kind: "pack", aad: record.packId! }))
-      const parsed = JSON.parse(bytesToUtf8(archive)) as { version?: number; entries?: Record<string, string> }
-      const encoded = parsed.version === 1 ? parsed.entries?.[record.fileId] : undefined
-      if (!encoded) throw new Error(`V4 pack entry is missing: ${record.fileId}`)
-      const plaintext = fromBase64(encoded)
-      if (record.plaintextSha256 && await this.crypto(() => sha256Hex(plaintext)) !== record.plaintextSha256) throw new Error("V4 packed content hash mismatch.")
-      return plaintext
+      const entries = await this.readPackRecords([record], reader, signal)
+      return entries.get(record.fileId)!
     }
     if (record.storage === "single") {
       const bytes = await reader(record.remotePath)
       throwIfV4Aborted(signal)
       const plaintext = this.options.mode === "plaintext"
         ? bytes
-        : await this.crypto(() => decryptV4Payload(this.options.keyring!.contentKey, bytes, {
+        : await this.decrypt(() => decryptV4Payload(this.options.keyring!.contentKey, bytes, {
           kind: "content",
           aad: this.contentAad(record),
         }))
+      if (plaintext.byteLength !== record.size) {
+        throw new Error(`V4 content size mismatch: ${record.remotePath}; expected ${record.size}, got ${plaintext.byteLength}.`)
+      }
       if (record.plaintextSha256 && await this.crypto(() => sha256Hex(plaintext)) !== record.plaintextSha256) {
         throw new Error(`V4 content hash mismatch: ${record.remotePath}`)
       }
@@ -486,17 +614,21 @@ export class V4StorageCodec {
     }
     const partPaths = record.partPaths ?? []
     if (partPaths.length === 0) throw new Error("V4 chunked record has no parts.")
-    const parts = await Promise.all(partPaths.map(async (path, index) => {
+    const parts = await boundedMap(partPaths, V4_CHUNK_READ_CONCURRENCY, async (path, index) => {
       throwIfV4Aborted(signal)
       const bytes = await reader(path)
       throwIfV4Aborted(signal)
       return this.options.mode === "plaintext"
         ? bytes
-        : this.crypto(() => decryptV4Payload(this.options.keyring!.contentKey, bytes, {
+        : this.decrypt(() => decryptV4Payload(this.options.keyring!.contentKey, bytes, {
           kind: "part",
           aad: `${this.contentAad(record)}:${index}`,
         }))
-    }))
-    return joinAndVerifyV4Parts(parts, record.plaintextSha256)
+    })
+    const plaintext = await joinAndVerifyV4Parts(parts, record.plaintextSha256)
+    if (plaintext.byteLength !== record.size) {
+      throw new Error(`V4 content size mismatch: ${record.remotePath}; expected ${record.size}, got ${plaintext.byteLength}.`)
+    }
+    return plaintext
   }
 }

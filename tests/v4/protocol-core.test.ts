@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { decryptV4Payload, deriveV4Keyring, encryptV4Payload } from "../../src/lib/v4/crypto";
-import { objectIdForV4File, opaqueV4ObjectPath, opaqueV4PackPath } from "../../src/lib/v4/paths";
+import { normalizeV4VaultPath, objectIdForV4File, opaqueV4ObjectPath, opaqueV4PackPath } from "../../src/lib/v4/paths";
 import { effectiveV4PathLayout, expectedV4PathLayout } from "../../src/lib/v4/protocol-types";
 
 test("v4 keyring is stable for one repository and domain-separated", async () => {
@@ -61,4 +61,29 @@ test("v4 path layout distinguishes new plaintext, new encrypted, and legacy encr
   assert.equal(expectedV4PathLayout("plaintext"), "plaintext-v1");
   assert.equal(expectedV4PathLayout("encrypted"), "opaque-stable-v1");
   assert.equal(effectiveV4PathLayout({ formatVersion: 4, mode: "encrypted", repoId: "o/r#main" }), "encrypted-folders-v0");
+});
+
+
+test("v4 logical vault paths reject cross-platform unsafe filename segments", () => {
+  const unsafe = [
+    "CON.md",
+    "folder/prn",
+    "aux.txt",
+    "LPT9.log",
+    "name.",
+    "name ",
+    "bad:name.md",
+    "bad?.md",
+    "bad*.md",
+    "bad<name>.md",
+    "bad|name.md",
+    "bad\u0001name.md",
+  ];
+
+  for (const path of unsafe) {
+    assert.throws(() => normalizeV4VaultPath(path), /unsafe|portable|path/iu, path);
+  }
+
+  assert.equal(normalizeV4VaultPath("Folder/normal.note.md"), "Folder/normal.note.md");
+  assert.equal(normalizeV4VaultPath("console.md"), "console.md");
 });

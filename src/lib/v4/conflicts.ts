@@ -9,9 +9,13 @@ export interface V4ConflictResolution {
 const TEXT_EXTENSIONS = new Set(["md", "txt", "json", "canvas", "yaml", "yml", "csv", "css", "scss", "js", "ts", "tsx", "jsx", "html", "xml"]);
 export const V4_MAX_MERGE_BYTES = 2 * 1024 * 1024;
 
-export function canAttemptV4TextMerge(path: string, sizes: readonly number[]): boolean {
+export function isV4ReviewableTextPath(path: string): boolean {
   const extension = path.split(".").at(-1)?.toLowerCase() ?? "";
-  return TEXT_EXTENSIONS.has(extension) && sizes.every(size => Number.isSafeInteger(size) && size >= 0 && size <= V4_MAX_MERGE_BYTES);
+  return TEXT_EXTENSIONS.has(extension);
+}
+
+export function canAttemptV4TextMerge(path: string, sizes: readonly number[]): boolean {
+  return isV4ReviewableTextPath(path) && sizes.every(size => Number.isSafeInteger(size) && size >= 0 && size <= V4_MAX_MERGE_BYTES);
 }
 
 interface LineChange { start: number; end: number; replacement: string[]; }

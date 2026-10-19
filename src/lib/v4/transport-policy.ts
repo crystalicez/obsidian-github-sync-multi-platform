@@ -9,7 +9,7 @@ export interface V4TransportPolicy {
 
 export const DEFAULT_V4_TRANSPORT_POLICY: V4TransportPolicy = {
   readConcurrency: 4,
-  writeConcurrency: 1,
+  writeConcurrency: 2,
   maxAttempts: 3,
   mutationSpacingMs: 1_000,
   secondaryLimitFallbackMs: 60_000,
@@ -38,9 +38,15 @@ export function resolveV4RateLimitDelay(
   if (value?.status !== 403 && value?.status !== 429) return null
   const headers = Object.fromEntries(Object.entries(value.headers ?? {}).map(([key, header]) => [key.toLowerCase(), header]))
   const retryAfter = Number(headers["retry-after"])
-  if (Number.isFinite(retryAfter) && retryAfter >= 0) return retryAfter * 1_000
+  if (Number.isFinite(retryAfter) && retryAfter >= 0) return Math.min(policy.maxSecondaryCooldownMs, retryAfter * 1_000)
   const reset = Number(headers["x-ratelimit-reset"])
-  if (Number.isFinite(reset) && reset > 0) return Math.max(0, reset * 1_000 - nowMs)
+  // A secondary limit with remaining quota must use Retry-After or the bounded fallback.
+  // The primary-reset timestamp is not evidence that the primary quota is exhausted.
+  if (headers["x-ratelimit-remaining"] !== undefined && headers["x-ratelimit-remaining"] !== "0") {
+    const fallback = policy.secondaryLimitFallbackMs * 2 ** Math.max(0, attempt - 1)
+    return Math.min(policy.maxSecondaryCooldownMs, fallback)
+  }
+  if (Number.isFinite(reset) && reset > 0) return Math.min(policy.maxSecondaryCooldownMs, Math.max(0, reset * 1_000 - nowMs))
   const fallback = policy.secondaryLimitFallbackMs * 2 ** Math.max(0, attempt - 1)
   return Math.min(policy.maxSecondaryCooldownMs, fallback)
 }

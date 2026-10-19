@@ -2,7 +2,11 @@ import { modelV4LargeFileRevision } from "./v4-phase0-models.mjs";
 
 const MiB = 1024 ** 2;
 const GiB = 1024 ** 3;
-const logicalBytes = Number(process.env.LOGICAL_BYTES ?? 5 * GiB);
+const MAX_TEST_BYTES = 100_000_000;
+const logicalBytes = Number(process.env.LOGICAL_BYTES ?? MAX_TEST_BYTES);
+if (!Number.isSafeInteger(logicalBytes) || logicalBytes <= 0 || logicalBytes > MAX_TEST_BYTES) {
+  throw new RangeError(`Test model size must be between 1 and ${MAX_TEST_BYTES} bytes`);
+}
 const spacingMs = Number(process.env.GITHUB_MUTATION_SPACING_MS ?? 1_000);
 const hourlyGuidance = Number(process.env.GITHUB_CONTENT_HOURLY_GUIDANCE ?? 500);
 const safetyFraction = Number(process.env.GITHUB_CONTENT_SAFETY_FRACTION ?? 0.70);

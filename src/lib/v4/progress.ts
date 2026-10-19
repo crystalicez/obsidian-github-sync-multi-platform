@@ -1,4 +1,5 @@
 import type { V4SyncOperation } from "./planner";
+import type { V4RunDiagnosticsSnapshot } from "./run-diagnostics";
 import type { V4SyncTrigger } from "./sync-coordinator";
 
 export type V4SyncLifecycle = "idle" | "waiting" | "active" | "success" | "no-change" | "failed";
@@ -42,6 +43,7 @@ export interface V4SyncProgressSnapshot {
   trigger?: V4SyncTrigger;
   attempt: number;
   timings: V4PhaseTiming[];
+  diagnostics?: V4RunDiagnosticsSnapshot;
   totalElapsedMs: number;
   lastSyncTime: number;
   errorMessage?: string;
@@ -123,7 +125,8 @@ function immediateMetadataEqual(left: V4SyncProgressSnapshot, right: V4SyncProgr
     && left.lastSyncTime === right.lastSyncTime
     && left.errorMessage === right.errorMessage
     && left.failurePhase === right.failurePhase
-    && left.failurePath === right.failurePath;
+    && left.failurePath === right.failurePath
+    && JSON.stringify(left.diagnostics) === JSON.stringify(right.diagnostics);
 }
 
 function phaseOrLifecycleTransitioned(left: V4SyncProgressSnapshot, right: V4SyncProgressSnapshot): boolean {
@@ -149,6 +152,7 @@ function snapshotsEqual(left: V4SyncProgressSnapshot, right: V4SyncProgressSnaps
     && sensitiveProgressEqual(left, right)
     && immediateMetadataEqual(left, right)
     && left.totalElapsedMs === right.totalElapsedMs
+    && JSON.stringify(left.diagnostics) === JSON.stringify(right.diagnostics)
     && left.timings.length === right.timings.length
     && left.timings.every((timing, index) => {
       const other = right.timings[index];
@@ -162,7 +166,8 @@ function freezeSnapshot(snapshot: V4SyncProgressSnapshot): V4SyncProgressSnapsho
   const pull = Object.freeze({ ...snapshot.pull });
   const push = Object.freeze({ ...snapshot.push });
   const timings = Object.freeze(snapshot.timings.map(timing => Object.freeze({ ...timing })));
-  return Object.freeze({ ...snapshot, pull, push, timings: timings as V4PhaseTiming[] });
+  return Object.freeze({ ...snapshot, pull, push, timings: timings as V4PhaseTiming[],
+    diagnostics: snapshot.diagnostics ? Object.freeze({ ...snapshot.diagnostics }) : undefined });
 }
 
 export function createIdleV4Progress(): V4SyncProgressSnapshot {

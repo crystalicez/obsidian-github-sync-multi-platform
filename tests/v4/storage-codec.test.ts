@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { deriveV4Keyring } from "../../src/lib/v4/crypto";
+import { deriveV4Keyring, encryptV4Payload } from "../../src/lib/v4/crypto";
 import { V4StorageCodec } from "../../src/lib/v4/storage-codec";
 import { V4_LARGE_FILE_THRESHOLD_BYTES } from "../../src/lib/v4/large-files";
-import { sha256Hex } from "../../src/lib/bytes";
+import { sha256Hex, toBase64 } from "../../src/lib/bytes";
 
 const bytes = (value: string) => new TextEncoder().encode(value);
 
@@ -125,5 +125,152 @@ test("v4 streamed sink size mismatch identifies the remote object without requir
   await assert.rejects(
     () => codec.readToSink({ record, reader: async () => new Uint8Array([1, 2]), sink }),
     /V4 content size mismatch: \.obsidian-github-sync-v4\/objects\/opaque\.bin/u,
+  );
+});
+
+
+test("v4 whole-buffer chunk reader bounds concurrent remote part reads", async () => {
+  const codec = new V4StorageCodec({ mode: "plaintext", pathLayout: "plaintext-v1" });
+  const parts = Array.from({ length: 12 }, (_, index) => new Uint8Array([index + 1]));
+  const joined = new Uint8Array(parts.length);
+  parts.forEach((part, index) => joined.set(part, index));
+  const paths = parts.map((_, index) => `.obsidian-github-sync-v4/large/x/v1/${String(index + 1).padStart(6, "0")}.part`);
+  let active = 0;
+  let peak = 0;
+  const record = {
+    pathId: "aa".padEnd(64, "0"),
+    fileId: "f",
+    plaintextSha256: await sha256Hex(joined),
+    size: joined.byteLength,
+    mtime: 1,
+    remoteVersion: "v1",
+    remotePath: paths[0],
+    storage: "chunked" as const,
+    partPaths: paths,
+  };
+
+  const restored = await codec.read(record, async path => {
+    const index = paths.indexOf(path);
+    active++;
+    peak = Math.max(peak, active);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    active--;
+    return parts[index];
+  });
+
+  assert.deepEqual(restored, joined);
+  assert.equal(peak <= 4, true, `peak chunk reads must stay bounded, got ${peak}`);
+});
+
+
+test("v4 pack reader rejects writer-incompatible entry size before base64 allocation", async () => {
+  const keys = await deriveV4Keyring({ passphrase: "pass", repoId: "o/r#main", salt: bytes("salt"), iterations: 10 });
+  const codec = new V4StorageCodec({ mode: "encrypted", pathLayout: "opaque-stable-v1", keyring: keys });
+  const prepared = await codec.prepare("small.md", bytes("x"), "v-pack", 1, "small-file");
+  const packed = await codec.preparePack("pack-size", [{ record: prepared.record, plaintext: bytes("0123456789") }]);
+  const record = { ...packed.records[0], size: 1, plaintextSha256: await sha256Hex(bytes("0")) };
+
+  await assert.rejects(
+    () => codec.read(record, async () => packed.file.bytes),
+    /pack.*size|entry.*size|encoded.*size/iu,
+  );
+});
+
+
+test("v4 whole-buffer reads reject plaintext length that disagrees with remote metadata", async () => {
+  const codec = new V4StorageCodec({ mode: "plaintext", pathLayout: "plaintext-v1" });
+  const singleBytes = bytes("oversized-single");
+  const singleRecord = {
+    pathId: "aa".padEnd(64, "0"),
+    fileId: "single-file",
+    plaintextSha256: await sha256Hex(singleBytes),
+    size: 1,
+    mtime: 1,
+    remoteVersion: "v1",
+    remotePath: "single.md",
+    storage: "single" as const,
+  };
+  await assert.rejects(
+    () => codec.read(singleRecord, async () => singleBytes),
+    /size mismatch/iu,
+  );
+
+  const chunkA = bytes("abc");
+  const chunkB = bytes("def");
+  const chunked = new Uint8Array([...chunkA, ...chunkB]);
+  const partPaths = [".obsidian-github-sync-v4/large/x/v1/000001.part", ".obsidian-github-sync-v4/large/x/v1/000002.part"];
+  const chunkRecord = {
+    pathId: "bb".padEnd(64, "0"),
+    fileId: "chunk-file",
+    plaintextSha256: await sha256Hex(chunked),
+    size: 2,
+    mtime: 1,
+    remoteVersion: "v1",
+    remotePath: partPaths[0],
+    storage: "chunked" as const,
+    partPaths,
+  };
+  await assert.rejects(
+    () => codec.read(chunkRecord, async path => path === partPaths[0] ? chunkA : chunkB),
+    /size mismatch/iu,
+  );
+});
+
+
+test("v4 pack reader rejects payloads larger than the exact declared pack archive before decrypt/parse", async () => {
+  const keyring = await deriveV4Keyring({ passphrase: "pass", repoId: "o/r#main", salt: bytes("salt"), iterations: 10 });
+  const codec = new V4StorageCodec({ mode: "encrypted", pathLayout: "opaque-stable-v1", keyring });
+  const plaintext = bytes("a");
+  const record = {
+    pathId: "aa".padEnd(64, "0"),
+    fileId: "f".repeat(64),
+    plaintextSha256: await sha256Hex(plaintext),
+    size: plaintext.byteLength,
+    mtime: 1,
+    remoteVersion: "v1",
+    remotePath: "opaque-pack",
+    storage: "pack" as const,
+    packId: "pack-1",
+  };
+  const archive = bytes(JSON.stringify({
+    version: 1,
+    entries: {
+      [record.fileId]: toBase64(plaintext),
+      ["e".repeat(64)]: toBase64(new Uint8Array(1024 * 1024)),
+    },
+  }));
+  const payload = await encryptV4Payload(keyring.contentKey, archive, { kind: "pack", aad: record.packId });
+
+  await assert.rejects(
+    () => codec.readPackRecords([record], async () => payload),
+    /pack.*size|payload.*size|archive.*size|unexpected.*pack/iu,
+  );
+});
+
+test("v4 pack reader requires the archive entry set to match the declared pack records exactly", async () => {
+  const keyring = await deriveV4Keyring({ passphrase: "pass", repoId: "o/r#main", salt: bytes("salt"), iterations: 10 });
+  const codec = new V4StorageCodec({ mode: "encrypted", pathLayout: "opaque-stable-v1", keyring });
+  const plaintext = bytes("a");
+  const record = {
+    pathId: "aa".padEnd(64, "0"),
+    fileId: "f".repeat(64),
+    plaintextSha256: await sha256Hex(plaintext),
+    size: plaintext.byteLength,
+    mtime: 1,
+    remoteVersion: "v1",
+    remotePath: "opaque-pack",
+    storage: "pack" as const,
+    packId: "pack-1",
+  };
+  // Keep total archive size equal to the writer-shaped single-entry archive by replacing the expected key.
+  const archive = bytes(JSON.stringify({
+    version: 1,
+    entries: { ["e".repeat(64)]: toBase64(plaintext) },
+  }));
+  const payload = await encryptV4Payload(keyring.contentKey, archive, { kind: "pack", aad: record.packId });
+
+  await assert.rejects(
+    () => codec.readPackRecords([record], async () => payload),
+    /entry set|missing|pack entry/iu,
   );
 });

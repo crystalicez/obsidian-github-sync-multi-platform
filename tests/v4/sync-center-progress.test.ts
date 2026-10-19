@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { WorkspaceLeaf } from "obsidian";
+import { Notice, WorkspaceLeaf } from "obsidian";
 import { createIdleV4Progress, V4ProgressStore, type V4SyncProgressSnapshot } from "../../src/lib/v4/progress";
 import { V4SyncCenterView } from "../../src/views/sync-center";
 
@@ -54,6 +54,7 @@ function createSyncCenterPluginFixture(source: FakeProgressSource | { progressSn
   };
   const app = { workspace: { getActiveFile: () => ({ path: "Notes/project.md" }) } };
   const runtime = Object.assign(source, {
+    settingsGeneration: 0,
     async createHistoryService() { return service; },
     async fileIdForPath() { return "file-id"; },
     async manualSync() { return {}; },
@@ -66,6 +67,87 @@ function deferred<T>() {
   const promise = new Promise<T>(accept => { resolve = accept; });
   return { promise, resolve };
 }
+
+test("Sync Center mode controls expose which history view is active", async () => {
+  const source = new FakeProgressSource();
+  const plugin = createSyncCenterPluginFixture(source, () => undefined);
+  const view = new V4SyncCenterView(new WorkspaceLeaf(plugin.app), plugin as never);
+  await view.onOpen();
+  assert.equal(view.contentEl.findByText("Commits")?.attributes["aria-pressed"], "true");
+  assert.equal(view.contentEl.findByText("Current file")?.attributes["aria-pressed"], "false");
+  await (view as any).renderFileMode();
+  assert.equal(view.contentEl.findByText("Commits")?.attributes["aria-pressed"], "false");
+  assert.equal(view.contentEl.findByText("Current file")?.attributes["aria-pressed"], "true");
+  await view.onClose();
+});
+
+test("Sync Center pager does not retain a commit detail from a different page", async () => {
+  const source = new FakeProgressSource();
+  const commits = [
+    { sha: "first", message: "Page one", authoredAt: "day-one", source: "external" as const },
+    { sha: "second", message: "Page two", authoredAt: "day-two", source: "external" as const },
+  ];
+  const plugin = createSyncCenterPluginFixture(source, () => undefined) as any;
+  plugin.v4Runtime.createHistoryService = async () => ({
+    async listCommits(page: number) { return { items: [commits[page - 1]], hasMore: page < 2 }; },
+    async getCommitChanges() { return [{ kind: "modify", path: "note.md" }]; },
+    async getFileVersions() { return []; },
+  });
+  const view = new V4SyncCenterView(new WorkspaceLeaf(plugin.app), plugin);
+  await view.onOpen();
+  const state = view as any;
+  await state.renderCommitDetail(commits[0], view.contentEl.findByClass("github-sync-center__detail"));
+  assert.match(view.contentEl.findByClass("github-sync-center__detail")!.flattenText(), /1 changed file/u);
+
+  state.page = 2;
+  await state.renderCommitMode();
+  const detail = view.contentEl.findByClass("github-sync-center__detail");
+  assert.ok(detail);
+  assert.match(detail.flattenText(), /Select a commit/u);
+  assert.doesNotMatch(detail.flattenText(), /changed file/u);
+  assert.equal(state.selected, undefined);
+  await view.onClose();
+});
+
+test("Sync Center commit detail explains when a commit changes no files", async () => {
+  const source = new FakeProgressSource();
+  const plugin = createSyncCenterPluginFixture(source, () => undefined);
+  const view = new V4SyncCenterView(new WorkspaceLeaf(plugin.app), plugin as never);
+  await view.onOpen();
+  const commit = { sha: "empty", message: "No file changes", authoredAt: "", source: "external" };
+  await (view as any).renderCommitDetail(commit, view.contentEl.findByClass("github-sync-center__detail"));
+  const detail = view.contentEl.findByClass("github-sync-center__detail");
+  assert.ok(detail);
+  assert.match(detail.flattenText(), /No file changes|No changed files|Nothing to preview/iu);
+  await view.onClose();
+});
+
+test("Sync Center renders request throughput, crypto timings, API latency and sampled RAM", async () => {
+  const source = new FakeProgressSource();
+  const plugin = createSyncCenterPluginFixture(source, () => undefined);
+  const view = new V4SyncCenterView(new WorkspaceLeaf(plugin.app), plugin as never);
+  await view.onOpen();
+  source.publish({
+    ...uploadingFixture,
+    diagnostics: {
+      uploadBytes: 2_097_152, downloadBytes: 1_048_576,
+      uploadRequestMs: 1_000, downloadRequestMs: 2_000,
+      apiRequests: 4, apiFailures: 1, apiLatencyMs: 1_000, apiMaxLatencyMs: 500,
+      inFlightApiRequests: 2, oldestInFlightApiMs: 5_400,
+      hashingMs: 125, encryptionMs: 250, decryptionMs: 500,
+      peakRendererRssBytes: 256 * 1_048_576,
+    },
+  });
+  const text = view.contentEl.flattenText();
+  assert.match(text, /Upload API · 2\.00 MiB.*2\.00 MiB\/s/su);
+  assert.match(text, /Download API · 1\.00 MiB.*0\.50 MiB\/s/su);
+  assert.match(text, /GitHub API · 4 requests.*250 ms avg · 500 ms max/su);
+  assert.match(text, /GitHub in flight.*2 · oldest 5\.4s/su);
+  assert.match(text, /Hashing \(measured\).*0\.1s.*Encryption \(measured\).*0\.3s.*Decryption \(measured\).*0\.5s/su);
+  assert.match(text, /Peak renderer RAM.*256\.00 MiB/su);
+  assert.match(text, /not your full internet speed/u);
+  await view.onClose();
+});
 
 test("Sync Center progress card updates in isolation and unsubscribes on close", async () => {
   const source = new FakeProgressSource();
@@ -255,4 +337,45 @@ test("stale image preview completion cannot revoke or replace a reopened view UR
     URL.createObjectURL = originalCreate;
     URL.revokeObjectURL = originalRevoke;
   }
+});
+
+
+test("Sync Center renders a useful error when an async provider throws null or a string", async () => {
+  for (const thrown of [null, "network unavailable"]) {
+    const source = new FakeProgressSource();
+    const plugin = createSyncCenterPluginFixture(source, () => undefined) as any;
+    plugin.v4Runtime.createHistoryService = async () => { throw thrown; };
+    const view = new V4SyncCenterView(new WorkspaceLeaf(plugin.app), plugin);
+    Notice.messages.length = 0;
+    await view.onOpen();
+    const visible = view.contentEl.flattenText();
+    assert.match(visible, thrown === null ? /Unable to load|unexpected error|failed/iu : /network unavailable/iu);
+    assert.equal(Notice.messages.length, 0, "Errors already displayed inside Sync Center must not spawn overlapping toast notices");
+    await view.onClose();
+  }
+});
+
+test("Sync Center recreates its history service when the runtime settings generation changes", async () => {
+  const source = new FakeProgressSource();
+  const plugin = createSyncCenterPluginFixture(source, () => undefined) as any;
+  let creations = 0;
+  plugin.v4Runtime.createHistoryService = async () => ({
+    generation: ++creations,
+    async listCommits() { return { items: [], hasMore: false }; },
+    async getCommitChanges() { return []; },
+    async getFileVersions() { return []; },
+    async previewChange() { throw new Error("unused"); },
+  });
+
+  const view = new V4SyncCenterView(new WorkspaceLeaf(plugin.app), plugin);
+  await view.onOpen();
+  assert.equal(creations, 1);
+  const first = (view as any).service;
+
+  plugin.v4Runtime.settingsGeneration++;
+  const second = await (view as any).ensureService();
+
+  assert.equal(creations, 2);
+  assert.notEqual(second, first);
+  await view.onClose();
 });

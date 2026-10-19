@@ -1,15 +1,17 @@
 import { bytesToUtf8, fromBase64, sha256Hex, toBase64, utf8ToBytes } from "../bytes"
 import { collectV4ContentSource, DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES } from "./content-source"
 import { decryptV4Payload, encryptV4Payload } from "./crypto"
-import type { V4LocalIndexAdapter } from "./local-index"
+import { fitsV4LocalJsonSizeLimit, isV4OversizedLocalJson, type V4LocalIndexAdapter } from "./local-index"
 import { assertV4LocalTargetPrecondition, V4LocalTargetChangedError, type V4LocalIo } from "./local-io"
 import { hashV4StableContentSource } from "./object-stream"
+import { normalizeV4VaultPath } from "./paths"
 import type { V4StageRef } from "./staging-store"
 import type { V4RecoveryHeader, V4RecoveryPayload, V4RecoveryPhase, V4RecoverySnapshot } from "./recovery-types"
 import { reconcileV4CandidatePublication, type V4PublishReconcileResult, type V4PublishReconcilerGithub } from "./publish-reconciler"
 
 import { throwIfV4Aborted } from "./cancellation"
 const V4_RECOVERY_SCHEMA_VERSION = 1 as const
+export const V4_RECOVERY_SLOT_MAX_CHARS = 32 * 1024 * 1024
 const VALID_PHASES = new Set<V4RecoveryPhase>([
   "publish-intent",
   "remote-verified",
@@ -83,24 +85,53 @@ async function integrityFor(header: Omit<V4RecoveryHeader, "integrity">): Promis
   return sha256Hex(utf8ToBytes(JSON.stringify(integrityView(header))))
 }
 
+function isNormalizedVaultPath(value: unknown): value is string {
+  if (typeof value !== "string") return false
+  try { return normalizeV4VaultPath(value) === value } catch { return false }
+}
+
+function isRecoveryPrecondition(value: unknown, path: string): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false
+  const candidate = value as { path?: unknown; exists?: unknown; size?: unknown; mtime?: unknown; hash?: unknown }
+  if (candidate.path !== path || typeof candidate.exists !== "boolean") return false
+  if (!candidate.exists) return candidate.size === undefined && candidate.mtime === undefined && candidate.hash === undefined
+  return Number.isSafeInteger(candidate.size) && (candidate.size as number) >= 0
+    && typeof candidate.mtime === "number" && Number.isFinite(candidate.mtime) && candidate.mtime >= 0
+    && (candidate.hash === undefined || (typeof candidate.hash === "string" && /^[0-9a-f]{64}$/u.test(candidate.hash)))
+}
+
+function isStageRef(value: unknown): value is V4StageRef {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false
+  const stage = value as Partial<V4StageRef>
+  return typeof stage.stageId === "string" && /^[A-Za-z0-9_-]{1,128}$/u.test(stage.stageId)
+    && typeof stage.hash === "string" && /^[0-9a-f]{64}$/u.test(stage.hash)
+    && Number.isSafeInteger(stage.size) && (stage.size ?? -1) >= 0
+    && typeof stage.mtime === "number" && Number.isFinite(stage.mtime) && stage.mtime >= 0
+}
+
 function isPayload(value: unknown): value is V4RecoveryPayload {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false
   const payload = value as Partial<V4RecoveryPayload>
   if (!Array.isArray(payload.mutations) || !Array.isArray(payload.completedMutationIds)) return false
-  if (!payload.completedMutationIds.every(id => typeof id === "string")) return false
-  return payload.mutations.every(mutation => {
+
+  const mutationIds = new Set<string>()
+  for (const mutation of payload.mutations) {
     if (!mutation || typeof mutation !== "object" || Array.isArray(mutation)) return false
     const candidate = mutation as V4RecoveryPayload["mutations"][number]
-    if (typeof candidate.id !== "string" || typeof candidate.path !== "string") return false
-    if (!candidate.precondition || candidate.precondition.path !== candidate.path || typeof candidate.precondition.exists !== "boolean") return false
-    if (candidate.kind === "trash") return true
-    return candidate.kind === "stage-write"
-      && !!candidate.stage
-      && typeof candidate.stage.stageId === "string"
-      && typeof candidate.stage.hash === "string"
-      && Number.isSafeInteger(candidate.stage.size)
-      && Number.isFinite(candidate.stage.mtime)
-  })
+    if (typeof candidate.id !== "string" || candidate.id.length < 1 || candidate.id.length > 1024 || mutationIds.has(candidate.id)) return false
+    mutationIds.add(candidate.id)
+    if (!isNormalizedVaultPath(candidate.path)) return false
+    if (!isRecoveryPrecondition(candidate.precondition, candidate.path)) return false
+    if (candidate.kind === "trash") continue
+    if (candidate.kind !== "stage-write" || !isStageRef(candidate.stage)) return false
+  }
+
+  const completed = new Set<string>()
+  for (const id of payload.completedMutationIds) {
+    if (typeof id !== "string" || !mutationIds.has(id) || completed.has(id)) return false
+    completed.add(id)
+  }
+  return true
 }
 
 export function createV4RecoveryStore(options: {
@@ -132,7 +163,10 @@ export function createV4RecoveryStore(options: {
     const path = slotPath(root, slot)
     if (!(await options.adapter.exists(path))) return { present: false }
     let parsed: unknown
-    try { parsed = JSON.parse(await options.adapter.read(path)) } catch { return { present: true } }
+    if (await isV4OversizedLocalJson(options.adapter, path, V4_RECOVERY_SLOT_MAX_CHARS)) return { present: true }
+    const serialized = await options.adapter.read(path)
+    if (!fitsV4LocalJsonSizeLimit(serialized, V4_RECOVERY_SLOT_MAX_CHARS)) return { present: true }
+    try { parsed = JSON.parse(serialized) } catch { return { present: true } }
     if (!isHeader(parsed)) return { present: true }
     const header = parsed
     const { integrity, ...withoutIntegrity } = header
@@ -160,9 +194,16 @@ export function createV4RecoveryStore(options: {
   return {
     load,
     async save(input) {
+      if (input.payload && !isPayload(input.payload)) {
+        throw new V4RecoveryRequiredError("V4 recovery payload shape is invalid.")
+      }
       let previous: V4RecoverySnapshot | null = null
       try { previous = await load() } catch (error) { if (error instanceof V4RecoveryRequiredError) throw error; throw error }
-      const generation = (previous?.header.generation ?? 0) + 1
+      const previousGeneration = previous?.header.generation ?? 0
+      if (!Number.isSafeInteger(previousGeneration) || previousGeneration < 0 || previousGeneration >= Number.MAX_SAFE_INTEGER) {
+        throw new V4RecoveryRequiredError("V4 recovery generation cannot be incremented safely.")
+      }
+      const generation = previousGeneration + 1
       let payloadCiphertext: string | undefined
       if (input.payload) {
         let bytes = utf8ToBytes(JSON.stringify(input.payload))
@@ -187,7 +228,11 @@ export function createV4RecoveryStore(options: {
       }
       const header: V4RecoveryHeader = { ...withoutIntegrity, integrity: await integrityFor(withoutIntegrity) }
       await ensureDirectoryChain(options.adapter, root)
-      await options.adapter.write(slotPath(root, generation % 2), JSON.stringify(header))
+      const serialized = JSON.stringify(header)
+      if (!fitsV4LocalJsonSizeLimit(serialized, V4_RECOVERY_SLOT_MAX_CHARS)) {
+        throw new V4RecoveryRequiredError("V4 recovery slot exceeds the local storage limit.")
+      }
+      await options.adapter.write(slotPath(root, generation % 2), serialized)
       return { header, payload: input.payload }
     },
   }
@@ -287,11 +332,11 @@ export async function applyV4RecoveryLocalMutations(input: {
         input.onApplied?.(mutation)
         continue
       }
-      await assertV4LocalTargetPrecondition(input.io, mutation.precondition)
       if (mutation.stage.size > DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES) {
         if (!input.io.commitStage) throw new V4RecoveryRequiredError(`V4 recovery cannot commit staged content: ${mutation.id}`)
         await input.io.commitStage({ stage: mutation.stage, path: mutation.path, precondition: mutation.precondition })
       } else {
+        await assertV4LocalTargetPrecondition(input.io, mutation.precondition)
         if (!input.io.staging) throw new V4RecoveryRequiredError(`V4 recovery stage is unavailable: ${mutation.id}`)
         const source = await input.io.staging.open(mutation.stage)
         const bytes = await collectV4ContentSource(source, DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES, input.signal)
@@ -375,9 +420,18 @@ export async function markV4RecoveryIndexCommitted(store: V4RecoveryStore, runId
 }
 
 export async function discardV4RecoveryStages(snapshot: V4RecoverySnapshot, io: V4LocalIo, keepStageIds: ReadonlySet<string> = new Set()): Promise<void> {
-  const stageIds = new Set(snapshot.payload?.mutations.flatMap(mutation => mutation.kind === "stage-write" ? [mutation.stage.stageId] : []) ?? [])
-  for (const stageId of stageIds) {
-    if (keepStageIds.has(stageId)) continue
+  const payload = snapshot.payload
+  if (!payload) return
+  const completed = new Set(payload.completedMutationIds)
+  const processed = new Set<string>()
+  for (const mutation of payload.mutations) {
+    if (mutation.kind !== "stage-write") continue
+    const stageId = mutation.stage.stageId
+    if (processed.has(stageId) || keepStageIds.has(stageId)) continue
+    processed.add(stageId)
+    if (!completed.has(mutation.id) && io.rollbackStage) {
+      await io.rollbackStage({ stage: mutation.stage, path: mutation.path, precondition: mutation.precondition })
+    }
     try { await io.staging?.remove({ stageId }) } catch {}
   }
 }

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict"
+import { createHash } from "node:crypto"
 import test from "node:test"
 
 import type { GitHubCreateTreeEntry } from "../../src/lib/github-git-types"
@@ -11,6 +12,11 @@ import type { V4StageRef, V4StagedSink, V4StagingStore } from "../../src/lib/v4/
 
 const encode = (value: string) => new TextEncoder().encode(value)
 const decode = (value: Uint8Array) => new TextDecoder().decode(value)
+
+function gitBlobSha1(bytes: Uint8Array) {
+  const header = Buffer.from(`blob ${bytes.byteLength}\0`, "utf8")
+  return createHash("sha1").update(header).update(bytes).digest("hex")
+}
 
 class RecoveryAdapter implements V4LocalIndexAdapter {
   readonly values = new Map<string, string>()
@@ -61,21 +67,75 @@ class MemoryVault implements V4SessionVault {
   async trash(path: string) { this.events.push(`vault-trash:${path}`); this.files.delete(path) }
 }
 
+class StrictTopologyVault extends MemoryVault {
+  private assertWritablePath(path: string) {
+    for (const existing of this.files.keys()) {
+      if (existing === path) continue
+      if (existing.startsWith(`${path}/`) || path.startsWith(`${existing}/`)) {
+        throw new Error(`filesystem topology blocks write: ${path} vs ${existing}`)
+      }
+    }
+  }
+  override async write(path: string, bytes: Uint8Array, mtime = 0) {
+    this.assertWritablePath(path)
+    await super.write(path, bytes, mtime)
+  }
+}
+
 class MemoryGitHub {
   ref: { ref: string; sha: string; type: string } | null = null
   files = new Map<string, Uint8Array>()
   blobs = new Map<string, Uint8Array>()
   trees = new Map<string, Map<string, Uint8Array>>()
+  treeViews = new Map<string, Map<string, Uint8Array>>()
   commits = new Map<string, { treeSha: string; parents: string[]; message: string }>()
   constructor(private readonly events: string[] = []) {}
   async getGitRefOrNull() { return this.ref }
   async ensureGitRepositoryInitialized() { return null }
   async getFileBytes(path: string, ref?: string) {
     const tree = ref ? this.trees.get(this.commits.get(ref)!.treeSha) : undefined
-    const bytes = tree?.get(path) ?? this.files.get(path)
-    return bytes ? { bytes: new Uint8Array(bytes), sha: `sha-${path}` } : null
+    const bytes = ref ? tree?.get(path) : this.files.get(path)
+    return bytes ? { bytes: new Uint8Array(bytes), sha: gitBlobSha1(bytes) } : null
   }
   async getGitCommit(sha: string) { const c = this.commits.get(sha)!; return { sha, treeSha: c.treeSha, parentShas: c.parents, message: c.message } }
+  async getTreeAt(treeSha: string, recursive = true) {
+    const tree = this.trees.get(treeSha) ?? this.treeViews.get(treeSha) ?? new Map<string, Uint8Array>()
+    if (!recursive) {
+      const rootBlobs: Array<{ path: string; bytes: Uint8Array }> = []
+      const rootDirectories = new Map<string, Array<{ path: string; bytes: Uint8Array }>>()
+      for (const [path, bytes] of tree) {
+        const slash = path.indexOf("/")
+        if (slash < 0) {
+          rootBlobs.push({ path, bytes })
+          continue
+        }
+        const directory = path.slice(0, slash)
+        const descendants = rootDirectories.get(directory) ?? []
+        descendants.push({ path: path.slice(slash + 1), bytes })
+        rootDirectories.set(directory, descendants)
+      }
+      const blobEntries = rootBlobs.map(({ path, bytes }) => ({
+        path,
+        mode: "100644",
+        type: "blob" as const,
+        sha: gitBlobSha1(bytes),
+        size: bytes.byteLength,
+        url: "",
+      }))
+      const directoryEntries = [...rootDirectories].map(([path, descendants]) => {
+        const sha = createHash("sha1").update(descendants.map(item => `${item.path}:${gitBlobSha1(item.bytes)}`).sort().join("\n")).digest("hex")
+        this.treeViews.set(sha, new Map(descendants.map(item => [item.path, item.bytes])))
+        return { path, mode: "040000", type: "tree" as const, sha, url: "" }
+      })
+      return { sha: treeSha, url: "", truncated: false, tree: [...blobEntries, ...directoryEntries] }
+    }
+    return {
+      sha: treeSha,
+      url: "",
+      truncated: false,
+      tree: [...tree.entries()].map(([path, bytes]) => ({ path, mode: "100644", type: "blob" as const, sha: gitBlobSha1(bytes), size: bytes.byteLength, url: "" })),
+    }
+  }
   async createGitBlob(bytes: Uint8Array) { const sha = `blob-${this.blobs.size + 1}`; this.blobs.set(sha, new Uint8Array(bytes)); return sha }
   async createGitTree(entries: GitHubCreateTreeEntry[], baseTree?: string) {
     const tree = new Map(baseTree ? this.trees.get(baseTree) : undefined)
@@ -142,4 +202,56 @@ test("pure pull persists remote-verified without journalId before the first fina
   assert.equal(latest?.header.journalId, undefined)
   assert.equal(latest?.header.verifiedRemoteHead, github.ref?.sha)
   assert.equal(decode(vault.files.get("remote.md")!.bytes), "remote-body")
+})
+
+test("recovery pull removes blocking descendants before writing a parent file", async () => {
+  const github = new MemoryGitHub()
+  const sourceVault = new MemoryVault()
+  sourceVault.files.set("dir/file.md", { bytes: encode("old-child"), mtime: 1 })
+  const sourceIndex = createEmptyV4LocalIndex({ repoId: config.repoId, deviceId: "source-device", mode: "plaintext" })
+
+  await new V4SyncSession({
+    github,
+    vault: sourceVault,
+    index: sourceIndex,
+    config,
+    conflictPolicy: "copy",
+    abortChangePercent: 0,
+  }).sync({ operation: "forcePush" })
+
+  const targetIndex = structuredClone(sourceIndex)
+  const events: string[] = []
+  const targetVault = new StrictTopologyVault(events)
+  targetVault.files.set("dir/file.md", { bytes: encode("old-child"), mtime: 1 })
+
+  sourceVault.files.delete("dir/file.md")
+  sourceVault.files.set("dir", { bytes: encode("new-parent-file"), mtime: 2 })
+  await new V4SyncSession({
+    github,
+    vault: sourceVault,
+    index: sourceIndex,
+    config,
+    conflictPolicy: "copy",
+    abortChangePercent: 0,
+  }).sync({ operation: "forcePush" })
+
+  const adapter = new RecoveryAdapter(events)
+  const recoveryStore = createV4RecoveryStore({ adapter, root: "recovery-topology", repoId: config.repoId })
+  const runState = { runId: "topology-pull", conflictCopies: new Map() }
+  await new V4SyncSession({
+    github,
+    vault: targetVault,
+    index: targetIndex,
+    config,
+    conflictPolicy: "copy",
+    abortChangePercent: 0,
+    recoveryStore,
+    runState,
+  } as never).sync({ operation: "forcePull" })
+
+  const trash = events.findIndex(event => event === "vault-trash:dir/file.md")
+  const write = events.findIndex(event => event === "vault-write:dir")
+  assert.ok(trash >= 0 && write > trash, events.join("\n"))
+  assert.equal(targetVault.files.has("dir/file.md"), false)
+  assert.equal(decode(targetVault.files.get("dir")!.bytes), "new-parent-file")
 })

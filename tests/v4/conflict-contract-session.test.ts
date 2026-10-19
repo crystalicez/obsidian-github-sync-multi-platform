@@ -1,12 +1,19 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test from "node:test";
 
+import { sha256Hex } from "../../src/lib/bytes";
 import type { GitHubCreateTreeEntry } from "../../src/lib/github-git-types";
 import { createEmptyV4LocalIndex, type V4LocalIndex } from "../../src/lib/v4/local-index";
 import { V4_FORMAT_VERSION, type V4RemoteConfig } from "../../src/lib/v4/protocol-types";
 import { V4SyncSession, type V4SessionVault } from "../../src/lib/v4/sync-session";
 
 const enc = (value: string) => new TextEncoder().encode(value);
+
+function gitBlobSha1(bytes: Uint8Array) {
+  const header = Buffer.from(`blob ${bytes.byteLength}\0`, "utf8");
+  return createHash("sha1").update(header).update(bytes).digest("hex");
+}
 
 class MemoryVault implements V4SessionVault {
   files = new Map<string, { bytes: Uint8Array; mtime: number }>();
@@ -44,7 +51,7 @@ class MemoryGitHub {
   async getFileBytes(path: string, ref?: string) {
     const commit = ref ? this.commits.get(ref) : undefined;
     const value = commit ? this.trees.get(commit.treeSha)?.get(path) : this.files.get(path);
-    return value ? { bytes: new Uint8Array(value), sha: `sha-${path}` } : null;
+    return value ? { bytes: new Uint8Array(value), sha: gitBlobSha1(value) } : null;
   }
   async getGitRefOrNull() { return this.ref; }
   async ensureGitRepositoryInitialized() { return null; }
@@ -53,17 +60,52 @@ class MemoryGitHub {
     if (!value) throw new Error(`Missing commit ${sha}`);
     return { sha, treeSha: value.treeSha, parentShas: value.parents, message: value.message };
   }
-  async getTreeAt(treeSha: string) {
+  async getTreeAt(treeSha: string, recursive = true) {
     const tree = this.trees.get(treeSha) ?? new Map<string, Uint8Array>();
+    if (!recursive) {
+      const rootBlobs: Array<{ path: string; bytes: Uint8Array }> = [];
+      const rootDirectories = new Map<string, Array<{ path: string; bytes: Uint8Array }>>();
+      for (const [path, bytes] of tree) {
+        const slash = path.indexOf("/");
+        if (slash < 0) {
+          rootBlobs.push({ path, bytes });
+          continue;
+        }
+        const directory = path.slice(0, slash);
+        const descendants = rootDirectories.get(directory) ?? [];
+        descendants.push({ path: path.slice(slash + 1), bytes });
+        rootDirectories.set(directory, descendants);
+      }
+      const blobEntries = rootBlobs.map(({ path, bytes }) => ({
+        path,
+        mode: "100644",
+        type: "blob" as const,
+        sha: gitBlobSha1(bytes),
+        size: bytes.byteLength,
+        url: "",
+      }));
+      const directoryEntries = await Promise.all([...rootDirectories].map(async ([path, descendants]) => {
+        const signatures = await Promise.all(descendants.map(async descendant =>
+          `${descendant.path}:${await sha256Hex(descendant.bytes)}`));
+        return {
+          path,
+          mode: "040000",
+          type: "tree" as const,
+          sha: await sha256Hex(enc(signatures.sort().join("\n"))),
+          url: "",
+        }
+      }));
+      return { sha: treeSha, url: "", truncated: false, tree: [...blobEntries, ...directoryEntries] };
+    }
     return {
       sha: treeSha,
       url: "",
       truncated: false,
-      tree: [...tree.entries()].map(([path, bytes], index) => ({
+      tree: [...tree.entries()].map(([path, bytes]) => ({
         path,
         mode: "100644",
         type: "blob" as const,
-        sha: `tree-blob-${index}`,
+        sha: gitBlobSha1(bytes),
         size: bytes.byteLength,
         url: "",
       })),

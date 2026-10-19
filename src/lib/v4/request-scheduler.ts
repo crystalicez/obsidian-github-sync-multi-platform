@@ -34,6 +34,7 @@ export class V4RequestScheduler {
   private readonly onDelay?: (input: { reason: "cooldown" | "pacing"; milliseconds: number }) => void
   private cooldownUntil = 0
   private lastMutationStartedAt: number | undefined
+  private mutationStartGate: Promise<void> = Promise.resolve()
 
   constructor(options: V4RequestSchedulerOptions = {}) {
     this.policy = resolveV4TransportPolicy(options)
@@ -82,6 +83,16 @@ export class V4RequestScheduler {
   }
 
   private async waitForPolicy(kind: V4RequestKind, signal?: AbortSignal): Promise<void> {
+    if (kind === "write") {
+      const turn = this.mutationStartGate.then(() => this.waitForPolicyStart(kind, signal))
+      this.mutationStartGate = turn.catch(() => undefined)
+      await turn
+      return
+    }
+    await this.waitForPolicyStart(kind, signal)
+  }
+
+  private async waitForPolicyStart(kind: V4RequestKind, signal?: AbortSignal): Promise<void> {
     const now = this.now()
     const cooldownDelay = Math.max(0, this.cooldownUntil - now)
     const pacingDelay = kind === "write" && this.lastMutationStartedAt !== undefined

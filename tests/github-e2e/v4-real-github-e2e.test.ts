@@ -8,6 +8,7 @@ import { deriveV4Keyring, type V4Keyring } from "../../src/lib/v4/crypto";
 import { V4HistoryService } from "../../src/lib/v4/history-service";
 import { createEmptyV4LocalIndex, type V4LocalIndex } from "../../src/lib/v4/local-index";
 import { isV4PublicationRaceError } from "../../src/lib/v4/publication-race";
+import { fetchGitHubE2EWithRetry } from "./support/request-retry";
 import { expectedV4PathLayout, V4_FORMAT_VERSION, type V4RemoteConfig, type V4StorageMode } from "../../src/lib/v4/protocol-types";
 import { V4StorageCodec } from "../../src/lib/v4/storage-codec";
 import { V4SyncSession, type V4SessionVault, type V4SyncRunState } from "../../src/lib/v4/sync-session";
@@ -72,21 +73,8 @@ function sameBytes(left: Uint8Array, right: Uint8Array): boolean {
   return true;
 }
 
-async function fetchWithRetry(url: string, init: RequestInit, attempts = 3): Promise<Response> {
-  let response: Response | undefined;
-  for (let attempt = 1; attempt <= attempts; attempt++) {
-    response = await fetch(url, init);
-    if (![401, 403, 429].includes(response.status) && response.status < 500) return response;
-    if (attempt < attempts) {
-      await response.arrayBuffer().catch(() => undefined);
-      await new Promise(resolve => setTimeout(resolve, attempt * 500));
-    }
-  }
-  return response!;
-}
-
 async function githubRequest(config: GitHubConfig, apiPath: string, init: RequestInit = {}): Promise<Response> {
-  return fetchWithRetry(`https://api.github.com/repos/${config.owner}/${config.repo}${apiPath}`, {
+  return fetchGitHubE2EWithRetry(`https://api.github.com/repos/${config.owner}/${config.repo}${apiPath}`, {
     ...init,
     headers: {
       Authorization: `Bearer ${config.token}`,
@@ -176,7 +164,7 @@ function installRequestUrlBridge(config: GitHubConfig): void {
       interference.externalCommitSha = await publishExternalCommit(config, interference.marker ?? "controlled-race");
     }
 
-    const response = await fetchWithRetry(request.url, {
+    const response = await fetchGitHubE2EWithRetry(request.url, {
       method,
       headers: request.headers,
       body: request.body,
@@ -581,6 +569,52 @@ async function runCopyConflictScenario(config: GitHubConfig, mode: V4StorageMode
   });
 }
 
+async function runReviewedRemoteNoPublicationScenario(config: GitHubConfig, mode: V4StorageMode): Promise<void> {
+  await runScenario(config, mode, "reviewed-remote-conflict-does-not-republish", async ({ context, device }) => {
+    const a = device("device-a");
+    a.vault.set("Notes/review.md", bytes("baseline\n"), 1);
+    await a.session.sync({ operation: "forcePush", allowThresholdOverride: false });
+
+    const b = device("device-b");
+    await b.session.sync({ operation: "forcePull", allowThresholdOverride: false });
+    a.vault.set("Notes/review.md", bytes("remote-approved\n"), 2);
+    await a.session.sync({
+      operation: "normal", allowThresholdOverride: false,
+      changes: [{ type: "modify", path: "Notes/review.md", mtime: 2 }],
+    });
+    const approvedSha = a.index.remoteCommitSha!;
+    await waitForBranchHead(config, approvedSha);
+    b.vault.set("Notes/review.md", bytes("local-draft\n"), 3);
+    let reviewSeen = false;
+    const reviewed = await new V4SyncSession({
+      github: b.client,
+      vault: b.vault,
+      index: b.index,
+      config: context.remoteConfig,
+      keyring: context.keyring,
+      conflictPolicy: "ask",
+      abortChangePercent: 0,
+      askConflict: async input => {
+        assert.equal(input.path, "Notes/review.md");
+        assert.deepEqual(input.localBytes, bytes("local-draft\n"));
+        assert.deepEqual(input.remoteBytes, bytes("remote-approved\n"));
+        reviewSeen = true;
+        return { action: "merged", mergedBytes: new Uint8Array(input.remoteBytes!) };
+      },
+    }).sync({
+      operation: "normal", allowThresholdOverride: false,
+      changes: [{ type: "modify", path: "Notes/review.md", mtime: 3 }],
+    });
+    assert.equal(reviewSeen, true);
+    assert.equal(reviewed.pushedFiles, 0, "identical reviewed remote must not be republished");
+    assert.equal(reviewed.pulledFiles, 1);
+    assert.deepEqual(b.vault.files.get("Notes/review.md")?.bytes, bytes("remote-approved\n"));
+    assert.equal((await b.client.getGitRefOrNull())?.sha, approvedSha, "review must not change GitHub branch head");
+    assert.equal(b.index.remoteCommitSha, approvedSha);
+    await verifyEncryptedObjectTransport(b, context, "Notes/review.md");
+  });
+}
+
 async function runRenameVsEditScenario(config: GitHubConfig, mode: V4StorageMode): Promise<void> {
   await runScenario(config, mode, "two-device-rename-vs-stale-edit", async ({ device }) => {
     const a = device("device-a");
@@ -646,8 +680,37 @@ async function runDeleteRecreateScenario(config: GitHubConfig, mode: V4StorageMo
     });
     const newRecord = recordFor(a, "Notes/reborn.md");
     assert.notEqual(newRecord.fileId, oldFileId, "delete/recreate reused the old file identity");
+    const publishedSha = a.index.remoteCommitSha!;
+    const publishedTree = await a.client.getGitCommit(publishedSha);
+    const publishedEntries = await a.client.getTreeAt(publishedTree.treeSha, true);
+    assert.equal(publishedEntries.truncated, false, "Published recreate Git tree cannot be truncated.");
+    assert.equal(
+      publishedEntries.tree.some(node => node.path === newRecord.remotePath && node.type === "blob"),
+      true,
+      "Published recreate metadata references an object absent from its exact Git tree.",
+    );
+    assert.ok(
+      await a.client.getFileBytes(newRecord.remotePath, publishedSha),
+      "Published recreate object cannot be read by its exact immutable commit.",
+    );
 
-    await b.session.sync({ operation: "normal", allowThresholdOverride: false });
+    try {
+      await b.session.sync({ operation: "normal", allowThresholdOverride: false });
+    } catch (error) {
+      const afterFailureTree = await a.client.getTreeAt(publishedTree.treeSha, true);
+      const stillReadable = await a.client.getFileBytes(newRecord.remotePath, publishedSha)
+        .then(file => !!file, () => false);
+      const message = error instanceof Error ? `${error.message} ${String(error.cause ?? "")}` : String(error);
+      console.error(JSON.stringify({
+        diagnostic: "encrypted-delete-recreate-pull-failure",
+        mode,
+        publishedObjectInTree: afterFailureTree.tree.some(node => node.path === newRecord.remotePath && node.type === "blob"),
+        publishedObjectReadableAfterFailure: stillReadable,
+        missingPathIsNewPublishedObject: message.includes(newRecord.remotePath),
+        remoteCommitSameAsPublishingDevice: b.index.remoteCommitSha === publishedSha,
+      }));
+      throw error;
+    }
     assert.deepEqual(b.vault.files.get("Notes/reborn.md")?.bytes, bytes("generation-two\n"));
     assert.equal(recordFor(b, "Notes/reborn.md").fileId, newRecord.fileId);
   });
@@ -696,7 +759,18 @@ async function runControlledRaceScenario(config: GitHubConfig): Promise<void> {
     }
     interference.armed = false;
 
-    assert.equal(interference.fired, true, "controlled branch-head interference hook did not fire");
+    if (!interference.fired) {
+      // Diagnose failures occurring *before* the transport interception point
+      // without printing the request's Authorization header or the token.
+      const errorKind = publishError instanceof Error ? publishError.name : "none";
+      const raceClassified = isV4PublicationRaceError(publishError);
+      // The reason is essential to distinguish pre-publication reject from a
+      // missing PATCH, but never include the PAT or Authorization credentials.
+      const safeReason = publishError instanceof Error
+        ? publishError.message.replaceAll(config.token, "[redacted]").replace(/Bearer\s+\S+/giu, "Bearer [redacted]").slice(0, 220)
+        : "no error returned";
+      assert.fail(`controlled branch-head interference hook did not fire; pre-PATCH result=${errorKind}; publicationRace=${raceClassified}; reason=${safeReason}`);
+    }
     const externalCommitSha = interference.externalCommitSha;
     assert.ok(externalCommitSha, "controlled branch-head interference did not create an external commit");
     assert.ok(publishError, "plugin publish unexpectedly succeeded over an externally advanced branch");
@@ -734,6 +808,61 @@ after(async () => {
   } finally {
     setRequestUrlHandler(null);
   }
+});
+
+test("V4 controlled GitHub branch-head interference rejects a concurrent publish", { timeout: 210_000 }, async () => {
+  await runControlledRaceScenario(config);
+});
+
+test("V4 encrypted delete/recreate publishes a Git tree containing its new object", { timeout: 240_000 }, async () => {
+  await runDeleteRecreateScenario(config, "encrypted");
+});
+
+test("V4 reviewed remote conflict preserves exact GitHub commit (both storage modes)", { timeout: 300_000 }, async () => {
+  for (const mode of ["plaintext", "encrypted"] as const) {
+    await runReviewedRemoteNoPublicationScenario(config, mode);
+  }
+});
+
+test("V4 encrypted GitHub packs round-trip 96 files within REST blob limits", { timeout: 480_000 }, async () => {
+  await runScenario(config, "encrypted", "96-file-encrypted-pack-live", async ({ device }) => {
+    const source = device("pack-source");
+    const fileCount = 96;
+    const fileBytes = 512 * 1024;
+    for (let i = 0; i < fileCount; i++) {
+      const name = `Packs/asset-${String(i).padStart(3, "0")}.bin`;
+      source.vault.set(name, deterministicBinary(fileBytes, i + 101), i + 1);
+    }
+    const published = await source.session.sync({ operation: "forcePush", allowThresholdOverride: false });
+    assert.equal(published.mode, "force-push");
+    const records = liveRecords(source);
+    assert.equal(records.length, fileCount);
+    assert.equal(records.filter(record => record.storage === "pack").length, fileCount,
+      "all eligible small files should use multi-file packs");
+    const packPaths = new Set(records.map(record => record.remotePath));
+    assert.ok(packPaths.size > 1 && packPaths.size < fileCount,
+      "96 logical files should share multiple bounded pack blobs");
+
+    const commitSha = source.index.remoteCommitSha;
+    assert.ok(commitSha);
+    const commit = await source.client.getGitCommit(commitSha);
+    const tree = await source.client.getTreeAt(commit.treeSha, true);
+    assert.equal(tree.truncated, false);
+    for (const remotePath of packPaths) {
+      const blob = tree.tree.find(node => node.path === remotePath);
+      assert.ok(blob && blob.type === "blob", `missing pack blob ${remotePath}`);
+      assert.ok(blob.size !== undefined && blob.size <= 8 * 1024 * 1024,
+        `GitHub pack blob exceeds 8 MiB: ${remotePath}`);
+    }
+    assert.equal(tree.tree.some(node => node.path.startsWith("Packs/")), false,
+      "encrypted GitHub tree must not reveal logical folder names");
+
+    const receiver = device("pack-receiver");
+    const pulled = await receiver.session.sync({ operation: "forcePull", allowThresholdOverride: false });
+    assert.equal(pulled.mode, "force-pull");
+    assertVaultEquals(receiver.vault, source.vault, "96-file encrypted GitHub pack round-trip");
+    assert.equal(liveRecords(receiver).length, fileCount);
+  });
 });
 
 test("V4 real GitHub REST survives realistic superuser and two-device scenarios", { timeout: 900_000 }, async () => {

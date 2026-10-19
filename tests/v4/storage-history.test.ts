@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { buildV4PartPaths, joinAndVerifyV4Parts, splitV4Parts } from "../../src/lib/v4/large-files";
-import { buildV4JournalPages, fileVersionsFromV4Journals } from "../../src/lib/v4/history-journal";
+import { assertV4JournalChangeCapacity, buildV4JournalPages, fileVersionsFromV4Journals, V4_JOURNAL_PAGE_SIZE, V4_MAX_JOURNAL_PAGES } from "../../src/lib/v4/history-journal";
 import { sha256Hex } from "../../src/lib/bytes";
 import { V4StorageCodec } from "../../src/lib/v4/storage-codec";
 
@@ -30,6 +30,12 @@ test("v4 journals page large changes and preserve file history across rename", (
 
   assert.equal(pages.length, 2);
   assert.deepEqual(versions.map(version => version.path), ["old.md", "new.md"]);
+});
+
+test("v4 journal capacity can be preflighted without materializing an oversized change array", () => {
+  const maxChanges = V4_JOURNAL_PAGE_SIZE * V4_MAX_JOURNAL_PAGES;
+  assert.doesNotThrow(() => assertV4JournalChangeCapacity(maxChanges));
+  assert.throws(() => assertV4JournalChangeCapacity(maxChanges + 1), /journal.*change.*limit|journal.*capacity|page count/iu);
 });
 
 test("v4 whole-buffer codec read remains available for bounded history compatibility", async () => {

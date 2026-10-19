@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { TFile } from "obsidian"
+import { Platform, TFile } from "obsidian"
 
 import type { GitHubCreateTreeEntry } from "../../src/lib/github-git-types"
 import { V4PluginRuntime } from "../../src/lib/v4/runtime"
@@ -31,8 +31,32 @@ class MemoryGitHub {
     return { sha, treeSha: value.treeSha, parentShas: value.parents, message: value.message }
   }
 
-  async getTreeAt(treeSha: string) {
+  async getTreeAt(treeSha: string, recursive = true) {
     const tree = this.trees.get(treeSha) ?? new Map<string, Uint8Array>()
+    if (!recursive) {
+      const rootBlobs: Array<[string, Uint8Array]> = []
+      const directories = new Map<string, string[]>()
+      for (const [path, bytes] of tree) {
+        const slash = path.indexOf("/")
+        if (slash < 0) {
+          rootBlobs.push([path, bytes])
+          continue
+        }
+        const directory = path.slice(0, slash)
+        const signatures = directories.get(directory) ?? []
+        signatures.push(`${path.slice(slash + 1)}:${bytes.byteLength}:${Array.from(bytes).join(",")}`)
+        directories.set(directory, signatures)
+      }
+      return {
+        sha: treeSha,
+        url: "",
+        truncated: false,
+        tree: [
+          ...rootBlobs.map(([path, bytes], index) => ({ path, mode: "100644", type: "blob" as const, sha: `tree-blob-${index}`, size: bytes.byteLength, url: "" })),
+          ...[...directories].map(([path, signatures]) => ({ path, mode: "040000", type: "tree" as const, sha: `tree-dir:${path}:${signatures.sort().join("|")}`, url: "" })),
+        ],
+      }
+    }
     return {
       sha: treeSha,
       url: "",
@@ -110,6 +134,7 @@ class MemoryVault {
 }
 
 function fixture() {
+  Platform.isDesktopApp = false
   const githubClient = new MemoryGitHub()
   const vault = new MemoryVault()
   const ignoredFiles = new Set<string>()

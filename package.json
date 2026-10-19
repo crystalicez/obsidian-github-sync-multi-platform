@@ -6,8 +6,9 @@
   "author": "Crystalicez",
   "scripts": {
     "dev": "node esbuild.config.mjs",
-    "devcss": "sass --watch src/styles.scss styles.css && tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
-    "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
+    "devcss": "sass --watch --no-source-map --style=expanded src/styles.scss styles.css",
+    "build:css": "sass --no-source-map --style=expanded src/styles.scss styles.css",
+    "build": "pnpm build:css && tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
     "test": "node scripts/run-tests.mjs --tier=fast",
     "ver": "node ./scripts/update-version.js",
     "test:github-e2e": "node scripts/run-github-e2e.mjs",
@@ -15,11 +16,13 @@
     "test:github-e2e:compile": "node scripts/run-github-e2e.mjs --compile-only",
     "zip": "node scripts/zip-source.mjs",
     "test:fast": "node scripts/run-tests.mjs --tier=fast",
+    "test:ui:visual": "node --test tests/v4/ui-visual-assertions.test.mjs tests/v4/ui-visual-smoke-cli.test.mjs && pnpm build && node scripts/run-ui-screenshots.mjs",
     "test:repeat": "node scripts/run-test-repeat.mjs",
     "test:feasibility": "node scripts/run-tests.mjs --tier=feasibility",
     "test:resource": "node scripts/run-tests.mjs --tier=resource",
     "test:recovery": "node scripts/run-tests.mjs --tier=recovery",
     "test:soak": "node scripts/run-soak.mjs",
+    "test:windows:100mb": "node scripts/test-windows-100mb.mjs",
     "validate:metadata": "node scripts/validate-release-metadata.mjs",
     "validate:package": "node scripts/validate-package.mjs",
     "qualify:local": "node scripts/local-qualify.mjs",
@@ -39,9 +42,9 @@
     "esbuild": "^0.24.2",
     "eslint": "^9.39.3",
     "obsidian": "^1.12.3",
+    "sass": "1.93.2",
     "tslib": "^2.8.1",
     "typescript": "^5.9.3"
   },
-  "dependencies": {},
   "packageManager": "pnpm@9.12.3+sha512.cce0f9de9c5a7c95bef944169cc5dfe8741abfb145078c0d508b868056848a87c81e626246cb60967cbd7fd29a6c062ef73ff840d96b3c86c40ac92cf4a813ee"
 }

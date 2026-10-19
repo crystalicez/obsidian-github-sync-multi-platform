@@ -2,7 +2,8 @@ import { Modal, Notice, Platform, TFile } from "obsidian"
 import type FastSync from "../../main"
 import { fromBase64Url, randomBytes, sha256Hex, toBase64Url, utf8ToBytes } from "../bytes"
 import { syncConsoleLog } from "../debug"
-import { readVaultFileBytes, writeVaultFileBytes, trashVaultFileIfExists } from "../vault"
+import { assertPluginSettingsRuntimeSafe } from "../plugin-settings-validation"
+import { readVaultFileBytes, removeEmptyVaultFolderIfExists, writeVaultFileBytes, trashVaultFileIfExists } from "../vault"
 import { deriveV4BootstrapRecoveryKey, deriveV4Keyring, type V4Keyring } from "./crypto"
 import {
   createEmptyV4LocalIndex,
@@ -15,14 +16,18 @@ import { decodeV4RemoteConfig } from "./remote-index"
 import { createV4ScopePredicate, isPathInV4SyncScope } from "./scope"
 import { assertV4PathLayoutCompatible, V4ChangeGuardError, V4RecoveryReplanRequiredError, V4SyncSession, type V4SyncRunState } from "./sync-session"
 import type { V4ConflictResolution } from "./conflicts"
+import { buildV4ConflictReview, buildV4ConflictReviewAsync, canPrepareV4ConflictReviewPair, decodeV4ReviewText, mergeV4ReviewedLines, v4ReviewLineKey, V4_REVIEW_MAX_BYTES, V4_REVIEW_MAX_RESULT_BYTES, type V4ReviewLineDecision, type V4ReviewChoice, type V4ReviewSection } from "./conflict-review"
 import { V4SyncCoordinator, type V4QueuedChange, type V4SyncRequest } from "./sync-coordinator"
-import { expectedV4PathLayout, V4_FORMAT_VERSION, V4_CONFIG_PATH, type V4RemoteConfig, type V4StorageMode } from "./protocol-types"
+import { expectedV4PathLayout, V4_FORMAT_VERSION, V4_CONFIG_PATH, V4_PBKDF2_ITERATIONS, type V4RemoteConfig, type V4StorageMode } from "./protocol-types"
 import { V4HistoryService } from "./history-service"
+import { buildV4FileOverview, type V4FileOverview } from "./file-overview"
+import { loadV4RemoteState, type V4ObservedRemoteConfig } from "./remote-loader"
 import type { V4SessionVault } from "./local-io"
 import { createV4ContentSource, createV4WholeBufferContentSource, DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES, type V4ContentSource } from "./content-source"
 import { createV4PlatformIo, type V4BinaryAdapterLike, type V4PlatformIo } from "./platform-io"
 import { createV4StagingStore, type V4StagingStore } from "./staging-store"
 import { V4ProgressStore, type V4SyncProgressSnapshot } from "./progress"
+import { V4RunDiagnostics } from "./run-diagnostics"
 import { createV4RecoveryStore, discardV4RecoveryStages, markV4RecoveryIndexCommitted, recoverV4PendingState, V4RecoveryRequiredError } from "./recovery-store"
 import { V4KeyringCache } from "./keyring-cache"
 import { V4CancelledError, throwIfV4Aborted } from "./cancellation"
@@ -38,6 +43,7 @@ type V4RuntimeConfigSource = "observed-remote" | "speculative-empty"
 interface V4RuntimeConfigSelection {
   config: V4RemoteConfig
   source: V4RuntimeConfigSource
+  observedRemoteConfig?: V4ObservedRemoteConfig
 }
 
 export function selectV4RuntimeConfig(discovered: V4RemoteConfig | null, mode: V4StorageMode, repoId: string): V4RemoteConfig {
@@ -50,7 +56,7 @@ export function selectV4RuntimeConfig(discovered: V4RemoteConfig | null, mode: V
     pathLayout: expectedV4PathLayout(mode),
     algorithm: "AES-GCM",
     kdf: "PBKDF2-SHA-256",
-    kdfParams: { iterations: 600_000, salt: toBase64Url(randomBytes(16)) },
+    kdfParams: { iterations: V4_PBKDF2_ITERATIONS, salt: toBase64Url(randomBytes(16)) },
   }
 }
 
@@ -68,7 +74,7 @@ function createMemoryAdapter(owner: object): V4LocalIndexAdapter {
 function createRuntimePlatformIo(plugin: FastSync): { io: V4PlatformIo; stageRoot: string } {
   const vault = plugin.app.vault as FastSync["app"]["vault"] & {
     configDir?: string
-    adapter?: V4BinaryAdapterLike & { getFullPath?(path: string): string }
+    adapter?: V4BinaryAdapterLike & { getFullPath?(path: string): string; getBasePath?(): string }
   }
   const adapter = vault.adapter
   const configDir = vault.configDir || ".obsidian"
@@ -77,11 +83,15 @@ function createRuntimePlatformIo(plugin: FastSync): { io: V4PlatformIo; stageRoo
   const resolveDesktopPath = desktop && typeof adapter?.getFullPath === "function"
     ? (path: string) => adapter.getFullPath!(path)
     : undefined
+  const desktopRootPath = desktop && typeof adapter?.getBasePath === "function"
+    ? adapter.getBasePath()
+    : undefined
   return {
     io: createV4PlatformIo({
       platform: desktop ? "desktop" : "mobile",
       adapter,
       resolveDesktopPath,
+      desktopRootPath,
     }),
     stageRoot,
   }
@@ -111,13 +121,14 @@ function createRuntimeStagingStore(platformIo: V4PlatformIo, stageRoot: string):
 function createIndexAdapter(plugin: FastSync): V4LocalIndexAdapter {
   const vault = plugin.app.vault as FastSync["app"]["vault"] & {
     configDir?: string
-    adapter?: { read(path: string): Promise<string>; write(path: string, data: string): Promise<void>; exists(path: string): Promise<boolean>; mkdir(path: string): Promise<void> }
+    adapter?: { read(path: string): Promise<string>; write(path: string, data: string): Promise<void>; exists(path: string): Promise<boolean>; mkdir(path: string): Promise<void>; stat?(path: string): Promise<{ size: number } | null> }
   }
   if (!vault.adapter) return createMemoryAdapter(plugin)
   const base = `${vault.configDir || ".obsidian"}/plugins/${plugin.manifest.id}`
   const resolve = (path: string) => `${base}/${path.replace(/^\/+/, "")}`
   return {
     read: path => vault.adapter!.read(resolve(path)),
+    stat: async path => vault.adapter!.stat?.(resolve(path)) ?? null,
     write: (path, value) => vault.adapter!.write(resolve(path), value),
     exists: path => vault.adapter!.exists(resolve(path)),
     mkdir: async path => { try { await vault.adapter!.mkdir(resolve(path)) } catch (error) { if (!/exist/i.test((error as Error).message)) throw error } },
@@ -132,7 +143,10 @@ export class V4PluginRuntime {
   private readonly stagingStore: V4StagingStore
   private readonly keyringCache = new V4KeyringCache()
   private credentialGeneration = 0
+  private keyringGeneration = 0
   private debounceRunActive = false
+  private settingsTransitionActive = false
+  private settingsTransitionSawLocalChange = false
   private disposed = false
 
   constructor(private readonly plugin: FastSync) {
@@ -156,10 +170,51 @@ export class V4PluginRuntime {
     void this.coordinator.whenIdle().finally(() => this.keyringCache.dispose())
   }
 
-  credentialsChanged(): void {
+  async quiesceForSettingsChange(): Promise<void> {
+    this.assertNotDisposed()
+    if (this.settingsTransitionActive) throw new Error("V4 settings change is already in progress.")
+    this.settingsTransitionActive = true
+    this.settingsTransitionSawLocalChange = false
+    try {
+      this.coordinator.cancelPending()
+      this.coordinator.cancelActive(new V4CancelledError("V4 settings changed."))
+      await this.coordinator.whenIdle()
+      this.coordinator.cancelPending()
+      this.debounceRunActive = false
+      if (this.progressStore.snapshot.lifecycle === "active" || this.progressStore.snapshot.lifecycle === "waiting") {
+        this.progressStore.update({
+          lifecycle: "idle",
+          phase: undefined,
+          currentPath: undefined,
+          currentDirection: undefined,
+          pull: { completed: 0, total: undefined },
+          push: { completed: 0, total: undefined },
+          errorMessage: undefined,
+          failurePhase: undefined,
+          failurePath: undefined,
+        })
+      }
+    } catch (error) {
+      this.finishSettingsChange()
+      throw error
+    }
+  }
+
+  finishSettingsChange(): void {
+    if (!this.settingsTransitionActive) return
+    const rescan = this.settingsTransitionSawLocalChange
+    this.settingsTransitionSawLocalChange = false
+    this.settingsTransitionActive = false
+    if (rescan && !this.disposed) this.enqueue({ type: "rescan", mtime: Date.now() })
+  }
+
+  credentialsChanged(keyContextChanged = true): void {
     if (this.disposed) return
     this.credentialGeneration++
-    this.keyringCache.invalidate()
+    if (keyContextChanged) {
+      this.keyringGeneration++
+      this.keyringCache.invalidate()
+    }
   }
 
   private async keyringForConfig(config: V4RemoteConfig, passphrase: string, signal?: AbortSignal): Promise<V4Keyring> {
@@ -170,7 +225,7 @@ export class V4PluginRuntime {
       salt: config.kdfParams.salt,
       iterations: config.kdfParams.iterations,
       mode: config.mode,
-      credentialGeneration: this.credentialGeneration,
+      credentialGeneration: this.keyringGeneration,
     }, async () => {
       throwIfV4Aborted(signal)
       const derived = await deriveV4Keyring({
@@ -188,6 +243,7 @@ export class V4PluginRuntime {
 
   get isSyncing(): boolean { return this.coordinator.isSyncing }
   get pendingCount(): number { return this.coordinator.pendingCount }
+  get settingsGeneration(): number { return this.credentialGeneration }
   get progressSnapshot(): V4SyncProgressSnapshot {
     return this.snapshotForConsumers(this.progressStore.snapshot)
   }
@@ -196,31 +252,95 @@ export class V4PluginRuntime {
     return this.progressStore.subscribe(snapshot => listener(this.snapshotForConsumers(snapshot)))
   }
 
-  manualSync(): Promise<unknown> { return this.coordinator.run({ operation: "normal", trigger: "manual" }) }
-  startupSync(): Promise<unknown> { return this.coordinator.run({ operation: "normal", trigger: "startup" }) }
-  scheduledSync(): Promise<unknown> { return this.coordinator.run({ operation: "normal", trigger: "scheduled" }) }
-  forcePush(allowThresholdOverride = false): Promise<unknown> { return this.coordinator.run({ operation: "forcePush", trigger: "forcePush", allowThresholdOverride }) }
-  forcePull(allowThresholdOverride = false): Promise<unknown> { return this.coordinator.run({ operation: "forcePull", trigger: "forcePull", allowThresholdOverride }) }
+  private runWhileSettingsStable(request: V4SyncRequest): Promise<unknown> {
+    if (this.disposed || this.settingsTransitionActive) return Promise.resolve({ status: "skipped", changedFiles: 0 })
+    return this.coordinator.run(request)
+  }
+
+  private assertSettingsTransitionInactive(): void {
+    this.assertNotDisposed()
+    if (this.settingsTransitionActive) throw new V4CancelledError("V4 settings change is in progress.")
+  }
+
+  manualSync(): Promise<unknown> { return this.runWhileSettingsStable({ operation: "normal", trigger: "manual" }) }
+  startupSync(): Promise<unknown> { return this.runWhileSettingsStable({ operation: "normal", trigger: "startup" }) }
+  scheduledSync(): Promise<unknown> { return this.runWhileSettingsStable({ operation: "normal", trigger: "scheduled" }) }
+  forcePush(allowThresholdOverride = false): Promise<unknown> { return this.runWhileSettingsStable({ operation: "forcePush", trigger: "forcePush", allowThresholdOverride }) }
+  forcePull(allowThresholdOverride = false): Promise<unknown> { return this.runWhileSettingsStable({ operation: "forcePull", trigger: "forcePull", allowThresholdOverride }) }
 
   async createHistoryService(): Promise<V4HistoryService> {
-    this.assertNotDisposed()
-    const loaded = await this.loadConfiguredRemoteConfig()
+    this.assertSettingsTransitionInactive()
+    const generation = this.credentialGeneration
+    const github = this.plugin.githubClient
+    const repoId = this.repoId()
+    const passphrase = this.plugin.settings.encryptionPassphrase
+    const loaded = await this.loadConfiguredRemoteConfig({ github, repoId })
+    this.assertSettingsGeneration(generation)
     if (!loaded) throw new Error("V4 history is not initialized. Force Push first.")
     const { remoteConfig, config } = loaded
     assertV4PathLayoutCompatible(remoteConfig, config, "normal")
     const keyring = config.mode === "encrypted"
+      ? await this.keyringForConfig(config, passphrase)
+      : undefined
+    this.assertSettingsGeneration(generation)
+    return new V4HistoryService({
+      github,
+      config,
+      keyring,
+      assertCurrent: () => this.assertSettingsGeneration(generation),
+    })
+  }
+
+  /** Read-only, exact-ref inventory. Never infer remote-only files from the stale local cache. */
+  async fileOverview(): Promise<V4FileOverview> {
+    this.assertSettingsTransitionInactive()
+    const generation = this.credentialGeneration
+    const github = this.plugin.githubClient
+    if (!github) throw new Error("GitHub connection is not configured.")
+    const ref = await github.getGitRefOrNull()
+    this.assertSettingsGeneration(generation)
+    if (!ref) throw new Error("Remote branch is not initialized.")
+    const configFile = await github.getFileBytes(V4_CONFIG_PATH, ref.sha)
+    this.assertSettingsGeneration(generation)
+    if (!configFile) throw new Error("V4 remote metadata is not initialized.")
+    const config = decodeV4RemoteConfig(configFile.bytes)
+    if (config.repoId !== this.repoId()) throw new Error("V4 remote repository identity mismatch.")
+    assertV4PathLayoutCompatible(config, selectV4RuntimeConfig(config, this.plugin.settings.encryptionMode, config.repoId), "normal")
+    const index = await this.loadIndex(config)
+    this.assertSettingsGeneration(generation)
+    const keyring = config.mode === "encrypted"
       ? await this.keyringForConfig(config, this.plugin.settings.encryptionPassphrase)
       : undefined
-    return new V4HistoryService({ github: this.plugin.githubClient, config, keyring })
+    const remote = await loadV4RemoteState({ github, index, keyring,
+      maxConcurrentShardReads: Platform.isDesktopApp ? 2 : 1 }, ref.sha, config)
+    this.assertSettingsGeneration(generation)
+    if (!remote) throw new Error("V4 remote state is unavailable.")
+    const inScope = this.scopePredicate()
+    const localFiles = this.plugin.app.vault.getFiles().filter(file => inScope(file.path))
+      .map(file => ({ path: file.path, size: file.stat.size, mtime: file.stat.mtime }))
+    const baselineFiles = Object.values(index.shards)
+      .flatMap(shard => Object.values(shard.records))
+      .filter(record => !record.deleted && inScope(record.path))
+    return buildV4FileOverview({
+      localFiles,
+      remoteFiles: remote.records.filter(record => !record.deleted && inScope(record.path)),
+      baselineFiles,
+      remoteCommitSha: ref.sha,
+    })
   }
 
   async fileIdForPath(path: string): Promise<string | null> {
-    this.assertNotDisposed()
-    const loaded = await this.loadConfiguredRemoteConfig()
+    this.assertSettingsTransitionInactive()
+    const generation = this.credentialGeneration
+    const github = this.plugin.githubClient
+    const repoId = this.repoId()
+    const loaded = await this.loadConfiguredRemoteConfig({ github, repoId })
+    this.assertSettingsGeneration(generation)
     if (!loaded) throw new Error("V4 history is not initialized. Force Push first.")
     assertV4PathLayoutCompatible(loaded.remoteConfig, loaded.config, "normal")
     const config = loaded.config
     const index = await this.loadIndex(config)
+    this.assertSettingsGeneration(generation)
     for (const shard of Object.values(index.shards)) {
       for (const record of Object.values(shard.records)) if (!record.deleted && record.path === path) return record.fileId
     }
@@ -238,6 +358,10 @@ export class V4PluginRuntime {
     if (this.disposed) return
     if (!this.plugin.settings.syncEnabled || !this.plugin.settings.syncOnLocalChange || !this.plugin.isWatchEnabled) return
     if (change.type === "rescan") {
+      if (this.settingsTransitionActive) {
+        this.settingsTransitionSawLocalChange = true
+        return
+      }
       this.coordinator.enqueue(change)
       this.markWaiting()
       return
@@ -248,6 +372,10 @@ export class V4PluginRuntime {
       if (!this.inScope(change.path) && (!oldPath || !this.inScope(oldPath))) return
     } catch (error) {
       new Notice(`GitHub Sync: Invalid ignore regex: ${(error as Error).message}`)
+      return
+    }
+    if (this.settingsTransitionActive) {
+      this.settingsTransitionSawLocalChange = true
       return
     }
     this.coordinator.enqueue(change)
@@ -263,8 +391,17 @@ export class V4PluginRuntime {
     if (this.disposed) throw new Error("V4 runtime is disposed.")
   }
 
+  private assertSettingsGeneration(generation: number): void {
+    this.assertNotDisposed()
+    if (generation !== this.credentialGeneration) throw new V4CancelledError("V4 settings generation changed.")
+  }
+
   private beginWaitingRun(): void {
-    const push = { completed: 0, total: this.coordinator.pendingCount }
+    // Coalescing a growing debounce queue after every file event is quadratic.
+    // Once the burst exceeds this UI-only threshold, keep the exact queue
+    // untouched for the eventual flush and display an unknown progress total.
+    const total = this.coordinator.pendingRawCount <= 128 ? this.coordinator.pendingCount : undefined
+    const push = { completed: 0, total }
     if (!this.debounceRunActive) {
       this.debounceRunActive = true
       this.progressStore.beginRun({
@@ -312,20 +449,24 @@ export class V4PluginRuntime {
     return `${this.plugin.settings.githubOwner}/${this.plugin.settings.githubRepo}#${this.plugin.settings.githubBranch || "main"}`
   }
 
-  private async loadConfiguredRemoteConfig(): Promise<{ remoteConfig: V4RemoteConfig; config: V4RemoteConfig } | null> {
-    if (!this.plugin.githubClient) throw new Error("GitHub connection is not configured.")
-    const ref = await this.plugin.githubClient.getGitRefOrNull()
-    const remote = ref ? await this.plugin.githubClient.getFileBytes(V4_CONFIG_PATH, ref.sha) : null
+  private async loadConfiguredRemoteConfig(
+    target: { github: FastSync["githubClient"]; repoId: string } = { github: this.plugin.githubClient, repoId: this.repoId() },
+  ): Promise<{ remoteConfig: V4RemoteConfig; config: V4RemoteConfig; commitSha: string } | null> {
+    if (!target.github) throw new Error("GitHub connection is not configured.")
+    const ref = await target.github.getGitRefOrNull()
+    if (!ref) return null
+    const remote = await target.github.getFileBytes(V4_CONFIG_PATH, ref.sha)
     if (!remote) return null
     const remoteConfig = decodeV4RemoteConfig(remote.bytes)
-    const config = selectV4RuntimeConfig(remoteConfig, remoteConfig.mode, this.repoId())
+    const config = selectV4RuntimeConfig(remoteConfig, remoteConfig.mode, target.repoId)
     if (remoteConfig.repoId !== config.repoId) throw new Error("V4 remote repository identity mismatch.")
-    return { remoteConfig, config }
+    return { remoteConfig, config, commitSha: ref.sha }
   }
 
   private async remoteOrNewConfig(): Promise<V4RuntimeConfigSelection> {
     const loaded = await this.loadConfiguredRemoteConfig()
-    if (loaded) return { config: loaded.config, source: "observed-remote" }
+    if (loaded) return { config: loaded.config, source: "observed-remote",
+      observedRemoteConfig: { commitSha: loaded.commitSha, config: loaded.remoteConfig } }
     const mode = this.plugin.settings.encryptionMode
     return { config: selectV4RuntimeConfig(null, mode, this.repoId()), source: "speculative-empty" }
   }
@@ -349,16 +490,19 @@ export class V4PluginRuntime {
         return file instanceof TFile && inScope(path) ? { path, size: file.stat.size, mtime: file.stat.mtime } : null
       },
       read: async (path: string) => {
+        await this.platformIo.assertVaultPathSafe(path, { mustExist: true })
         const file = this.plugin.app.vault.getAbstractFileByPath(path)
         if (!(file instanceof TFile)) throw new Error(`Missing local file: ${path}`)
         return readVaultFileBytes(this.plugin.app.vault, file)
       },
       write: async (path: string, bytes: Uint8Array) => {
+        await this.platformIo.assertVaultPathSafe(path)
         this.plugin.addIgnoredFile(path)
         try { await writeVaultFileBytes(this.plugin.app.vault, path, bytes) }
         finally { this.plugin.removeIgnoredFile(path) }
       },
       trash: async (path: string) => {
+        await this.platformIo.assertVaultPathSafe(path)
         this.plugin.addIgnoredFile(path)
         try { await trashVaultFileIfExists(this.plugin.app.vault, this.plugin.app.fileManager, path) }
         finally { this.plugin.removeIgnoredFile(path) }
@@ -366,6 +510,7 @@ export class V4PluginRuntime {
       openContentSource: (handle, signal) => createV4ContentSource(handle, {
         wholeBufferCeilingBytes: DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES,
         readVaultWhole: async path => {
+          await this.platformIo.assertVaultPathSafe(path, { mustExist: true })
           const file = this.plugin.app.vault.getAbstractFileByPath(path)
           if (!(file instanceof TFile)) throw new Error(`Missing local file: ${path}`)
           return readVaultFileBytes(this.plugin.app.vault, file)
@@ -379,7 +524,20 @@ export class V4PluginRuntime {
       commitStage: async ({ stage, path, precondition }) => {
         this.plugin.addIgnoredFile(path)
         try {
+          if (!precondition.exists) await removeEmptyVaultFolderIfExists(this.plugin.app.vault, path)
           await this.platformIo.commitStage(this.stagingStore.pathFor(stage.stageId), path, {
+            expectedTarget: precondition,
+            expectedStageSize: stage.size,
+            expectedStageSha256: stage.hash,
+          })
+        } finally {
+          this.plugin.removeIgnoredFile(path)
+        }
+      },
+      rollbackStage: async ({ stage, path, precondition }) => {
+        this.plugin.addIgnoredFile(path)
+        try {
+          await this.platformIo.rollbackStage(this.stagingStore.pathFor(stage.stageId), path, {
             expectedTarget: precondition,
             expectedStageSize: stage.size,
             expectedStageSha256: stage.hash,
@@ -393,6 +551,13 @@ export class V4PluginRuntime {
 
   private async execute(request: V4SyncRequest, changes: V4QueuedChange[], signal: AbortSignal): Promise<{ changedFiles: number }> {
     throwIfV4Aborted(signal)
+    assertPluginSettingsRuntimeSafe(this.plugin.settings)
+    const diagnostics = new V4RunDiagnostics()
+    const refreshDiagnostics = () => {
+      diagnostics.sampleMemory()
+      this.progressStore.update({ diagnostics: diagnostics.snapshot })
+    }
+    const diagnosticsTimer = setInterval(refreshDiagnostics, 1_000)
     const continuingDebounceRun = this.debounceRunActive
     this.debounceRunActive = false
     const runPatch = {
@@ -406,6 +571,7 @@ export class V4PluginRuntime {
       errorMessage: undefined,
       failurePhase: undefined,
       failurePath: undefined,
+      diagnostics: diagnostics.snapshot,
     } as const
     if (continuingDebounceRun) this.progressStore.update({ ...runPatch, lifecycle: "active", phase: "checking-remote" })
     else {
@@ -430,6 +596,7 @@ export class V4PluginRuntime {
     })
     try {
       if (!this.plugin.githubClient) throw new Error("GitHub connection is not configured.")
+      this.plugin.githubClient.setV4RunDiagnostics?.(diagnostics)
       ;(this.plugin.githubClient as unknown as { setV4AbortSignal?(signal?: AbortSignal): void }).setV4AbortSignal?.(signal)
       throwIfV4Aborted(signal)
       let lastError: unknown
@@ -542,11 +709,14 @@ export class V4PluginRuntime {
             keyring,
             conflictPolicy: this.plugin.settings.conflictPolicy,
             abortChangePercent: this.plugin.settings.abortChangePercent,
-            askConflict: input => this.askConflict(input.path),
+            askConflict: input => this.askConflict(input.path, signal, input.localBytes, input.remoteBytes),
             includePath,
             runState,
             recoveryStore,
             signal,
+            diagnostics,
+            maxConcurrentPartTransfers: Platform.isDesktopApp ? 2 : 1,
+            observedRemoteConfig: configSelection.observedRemoteConfig,
             onProgress: patch => {
               if (patch.phase === "checking-remote") return
               this.progressStore.update(patch)
@@ -569,7 +739,8 @@ export class V4PluginRuntime {
           const recoveryRunId = result.recoveryRunId ?? recoveredRunId
           if (recoveryRunId) await markV4RecoveryIndexCommitted(recoveryStore, recoveryRunId)
           if (result.changedFiles === 0 && request.trigger === "manual") new Notice("GitHub Sync: No changes")
-          this.progressStore.finish(result.changedFiles === 0 ? "no-change" : "success", { lastSyncTime: Date.now() })
+          diagnostics.sampleMemory()
+          this.progressStore.finish(result.changedFiles === 0 ? "no-change" : "success", { lastSyncTime: Date.now(), diagnostics: diagnostics.snapshot })
           syncConsoleLog(this.plugin.settings, "info", "V4 sync completed", {
             operation: request.operation,
             trigger: request.trigger,
@@ -581,7 +752,8 @@ export class V4PluginRuntime {
           lastError = error
           if (error instanceof V4ChangeGuardError && !request.allowThresholdOverride && request.operation !== "normal") {
             this.progressStore.update({ phase: "blocked", currentPath: undefined, currentDirection: undefined })
-            const confirmed = await this.confirmThresholdOverride(error, request.operation)
+            const confirmed = await this.confirmThresholdOverride(error, request.operation, signal)
+            throwIfV4Aborted(signal)
             if (!confirmed) throw new Error("Sync cancelled because the modification threshold was exceeded.")
             request.allowThresholdOverride = true
             casAttempt--
@@ -634,10 +806,13 @@ export class V4PluginRuntime {
         publicationCause: publicationRace?.cause,
         error,
       })
-      this.progressStore.finish("failed", { errorMessage: message })
+      diagnostics.sampleMemory()
+      this.progressStore.finish("failed", { errorMessage: message, diagnostics: diagnostics.snapshot })
       new Notice(`GitHub Sync failed: ${message}`)
       return { changedFiles: 0 }
     } finally {
+      clearInterval(diagnosticsTimer)
+      this.plugin.githubClient?.setV4RunDiagnostics?.(undefined)
       bootstrapRecoveryKeyCache?.key.fill(0)
       ;(this.plugin.githubClient as unknown as { setV4AbortSignal?(signal?: AbortSignal): void } | undefined)?.setV4AbortSignal?.(undefined)
       this.plugin.isSyncInProgress = false
@@ -648,39 +823,300 @@ export class V4PluginRuntime {
     }
   }
 
-  private async askConflict(path: string): Promise<V4ConflictResolution> {
+  private async askConflict(path: string, signal: AbortSignal, localBytes?: Uint8Array, remoteBytes?: Uint8Array): Promise<V4ConflictResolution> {
+    const localText = localBytes ? decodeV4ReviewText(localBytes) : null
+    const remoteText = remoteBytes ? decodeV4ReviewText(remoteBytes) : null
+    const reviewable = localText !== null && remoteText !== null
+      && canPrepareV4ConflictReviewPair(localText, remoteText)
+    let prepared: V4ReviewSection[] | undefined
+    if (reviewable && localText.length + remoteText.length > 150_000) {
+      try {
+        prepared = await buildV4ConflictReviewAsync(localText, remoteText, signal)
+      } catch (error) {
+        if (signal.aborted) return { action: "ask" }
+        throw error
+      }
+    }
+    if (signal.aborted) return { action: "ask" }
     return new Promise(resolve => {
       const modal = new Modal(this.plugin.app)
       let settled = false
-      const finish = (resolution: V4ConflictResolution) => {
+      let onAbort: (() => void) | undefined
+      const settle = (resolution: V4ConflictResolution, close: boolean) => {
         if (settled) return
         settled = true
-        modal.close()
+        if (onAbort) signal.removeEventListener("abort", onAbort)
+        if (close) modal.close()
         resolve(resolution)
       }
-      modal.onClose = () => { if (!settled) { settled = true; resolve({ action: "ask" }) } }
+      const finish = (resolution: V4ConflictResolution) => settle(resolution, true)
+      onAbort = () => finish({ action: "ask" })
+      modal.onClose = () => settle({ action: "ask" }, false)
       modal.titleEl.setText("Resolve sync conflict")
-      modal.contentEl.createEl("p", { text: `Both local and remote changed: ${path}` })
-      const buttons = modal.contentEl.createDiv()
+      modal.contentEl.addClass("github-sync-conflict")
+      modal.contentEl.createEl("h3", { text: path, cls: "github-sync-conflict__path" })
+      modal.contentEl.createEl("p", { text: "Both local and remote changed. Nothing is applied until you choose a resolution.", cls: "github-sync-conflict__intro" })
+      const buttons = modal.contentEl.createDiv({ cls: "github-sync-conflict__actions" })
+      if (reviewable && localText !== null && remoteText !== null) {
+        const sections = prepared ?? buildV4ConflictReview(localText, remoteText)
+        const hunks = sections.filter(section => section.kind === "difference")
+        const selections = new Map<string, V4ReviewLineDecision>()
+        const controls = new Map<string, { keep: HTMLButtonElement; omit: HTMLButtonElement }>()
+        const review = modal.contentEl.createDiv({ cls: "github-sync-conflict__review" })
+        const headings = review.createDiv({ cls: "github-sync-conflict__columns github-sync-conflict__labels" })
+        headings.createEl("strong", { text: "Local · this vault" })
+        headings.createEl("strong", { text: "Remote · GitHub" })
+        const preview = modal.contentEl.createDiv({ cls: "github-sync-conflict__result" })
+        preview.createEl("strong", { text: "Merged result · editable" })
+        const summary = preview.createEl("span", { text: "Decide whether to keep or omit each changed line." })
+        const output = preview.createEl("textarea", { cls: "github-sync-conflict__output github-sync-conflict__editor",
+          attr: { "aria-label": "Editable merged result", "spellcheck": "false", "rows": "8" } }) as HTMLTextAreaElement
+        const reset = preview.createEl("button", { text: "Reset text to selected lines" })
+        reset.setAttribute("aria-label", "Discard manual edits and restore selected lines")
+        const apply = buttons.createEl("button", { text: "Apply reviewed merge", cls: "mod-cta github-sync-conflict__apply" })
+        const count = sections.reduce((sum, section) =>
+          section.kind === "difference" ? sum + section.localLines.length + section.remoteLines.length : sum, 0)
+        const contextLineCount = sections.reduce((sum, section) =>
+          section.kind === "common" ? sum + section.lines.length : sum, 0)
+        // Shortcuts apply to a whole hunk in O(1) state instead of allocating
+        // one string/Map entry for every line of a very large difference.
+        const hunkDefaults = new Map<number, V4ReviewChoice>()
+        const partialLineCounts = new Map<number, number>()
+        let reviewedLineCount = 0
+        const decisionFor = (key: string): V4ReviewLineDecision | undefined => {
+          const explicit = selections.get(key)
+          if (explicit) return explicit
+          const [index, side] = key.split(":")
+          const choice = hunkDefaults.get(Number(index))
+          if (!choice) return undefined
+          return choice === "both" || choice === side ? "keep" : "omit"
+        }
+        const chooseLine = (index: number, side: "local" | "remote", line: number,
+          choice: V4ReviewLineDecision) => {
+          const key = v4ReviewLineKey(index, side, line)
+          if (!selections.has(key) && !hunkDefaults.has(index)) {
+            reviewedLineCount++
+            partialLineCounts.set(index, (partialLineCounts.get(index) ?? 0) + 1)
+          }
+          selections.set(key, choice)
+          update()
+        }
+        const chooseHunk = (index: number, section: Extract<V4ReviewSection, { kind: "difference" }>,
+          choice: V4ReviewChoice) => {
+          if (!hunkDefaults.has(index)) {
+            reviewedLineCount += section.localLines.length + section.remoteLines.length
+              - (partialLineCounts.get(index) ?? 0)
+          }
+          hunkDefaults.set(index, choice)
+          const prefix = `${index}:`
+          for (const key of selections.keys()) {
+            if (key.startsWith(prefix)) selections.delete(key)
+          }
+          partialLineCounts.delete(index)
+          update()
+        }
+        let edited = false
+        let previewReady = false
+        const update = () => {
+          const merged = reviewedLineCount === count ? mergeV4ReviewedLines(sections, selections, hunkDefaults) : null
+          previewReady = merged !== null
+          if (!edited) output.value = merged ?? ""
+          output.disabled = !previewReady
+          const tooLarge = previewReady && output.value.length * 3 > V4_REVIEW_MAX_RESULT_BYTES
+            && new TextEncoder().encode(output.value).byteLength > V4_REVIEW_MAX_RESULT_BYTES
+          apply.disabled = !previewReady || tooLarge || signal.aborted
+          reset.disabled = !previewReady || !edited
+          summary.setText(tooLarge ? "Merged result exceeds the available safe text budget (32 MiB)."
+            : !previewReady ? `${reviewedLineCount}/${count} lines reviewed · choose Keep or Omit for every changed line.`
+              : edited ? "Custom text preserved. Review the exact result before applying; Reset restores line selections."
+                : "All lines reviewed · you can edit the merged text directly before applying.")
+          for (const [key, pair] of controls) {
+            pair.keep.setAttribute("aria-pressed", String(decisionFor(key) === "keep"))
+            pair.omit.setAttribute("aria-pressed", String(decisionFor(key) === "omit"))
+          }
+        }
+        output.oninput = () => {
+          if (!previewReady) return
+          edited = true
+          update()
+        }
+        reset.onclick = () => {
+          edited = false
+          update()
+        }
+        // Large reviews render one difference and one line window at a time.
+        // The underlying choices remain global, but DOM nodes never scale
+        // with vault size or the number of changes in a long note.
+        if (count + contextLineCount > 160 || sections.length > 180) {
+          const changed = sections.map((section, index) => ({ section, index }))
+            .filter((item): item is { section: Extract<V4ReviewSection, { kind: "difference" }>; index: number } =>
+              item.section.kind === "difference")
+          const nav = review.createDiv({ cls: "github-sync-conflict__pager" })
+          const pageHost = review.createDiv({ cls: "github-sync-conflict__page" })
+          let activeHunk = 0, activePage = 0
+          const pageSize = 48
+          const renderPage = () => {
+            controls.clear()
+            nav.empty()
+            pageHost.empty()
+            const item = changed[activeHunk]
+            if (!item) return
+            const { section, index: sectionIndex } = item
+            const pageCount = Math.max(1, Math.ceil(Math.max(section.localLines.length, section.remoteLines.length) / pageSize))
+            const navButton = (title: string, disabled: boolean, action: () => void) => {
+              const button = nav.createEl("button", { text: title })
+              button.disabled = disabled
+              button.onclick = action
+            }
+            navButton("Previous change", activeHunk === 0, () => { activeHunk--; activePage = 0; renderPage() })
+            nav.createEl("span", { text: `Change ${activeHunk + 1}/${changed.length} · lines ${activePage * pageSize + 1}–${Math.min((activePage + 1) * pageSize, Math.max(section.localLines.length, section.remoteLines.length))}` })
+            navButton("Next change", activeHunk >= changed.length - 1, () => { activeHunk++; activePage = 0; renderPage() })
+            navButton("Previous lines", activePage === 0, () => { activePage--; renderPage() })
+            nav.createEl("span", { text: `Page ${activePage + 1}/${pageCount}` })
+            navButton("Next lines", activePage >= pageCount - 1, () => { activePage++; renderPage() })
+            const before = sections[sectionIndex - 1]
+            if (before?.kind === "common") {
+              pageHost.createEl("pre", { cls: "github-sync-conflict__common",
+                text: (before.lines.length > 3 ? "…\n" : "") + before.lines.slice(-3).join("\n") })
+            }
+            const block = pageHost.createDiv({ cls: "github-sync-conflict__hunk" })
+            block.createEl("span", { cls: "github-sync-conflict__hunk-title",
+              text: `Change ${activeHunk + 1} of ${changed.length} · select individual lines` })
+            const columns = block.createDiv({ cls: "github-sync-conflict__columns" })
+            const sides = [
+              { name: "local" as const, lines: section.localLines, cls: "is-local" },
+              { name: "remote" as const, lines: section.remoteLines, cls: "is-remote" },
+            ]
+            for (const side of sides) {
+              const column = columns.createDiv({ cls: `github-sync-conflict__side ${side.cls}` })
+              const start = activePage * pageSize
+              const lines = side.lines.slice(start, start + pageSize)
+              if (!lines.length) column.createEl("span", { text: "(no lines on this page)", cls: "github-sync-conflict__empty" })
+              lines.forEach((line, i) => {
+                const lineIndex = start + i
+                const key = v4ReviewLineKey(sectionIndex, side.name, lineIndex)
+                const row = column.createDiv({ cls: "github-sync-conflict__line" })
+                row.createEl("code", { text: line || " ", cls: "github-sync-conflict__line-text" })
+                const actions = row.createDiv({ cls: "github-sync-conflict__line-actions" })
+                const keep = actions.createEl("button", { text: "Keep" })
+                const omit = actions.createEl("button", { text: "Omit" })
+                keep.setAttribute("aria-label", `Change ${activeHunk + 1} ${side.name} line ${lineIndex + 1}: keep`)
+                omit.setAttribute("aria-label", `Change ${activeHunk + 1} ${side.name} line ${lineIndex + 1}: omit`)
+                controls.set(key, { keep, omit })
+                keep.onclick = () => chooseLine(sectionIndex, side.name, lineIndex, "keep")
+                omit.onclick = () => chooseLine(sectionIndex, side.name, lineIndex, "omit")
+              })
+            }
+            const shortcuts = block.createDiv({ cls: "github-sync-conflict__choices" })
+            const commands: Array<{ label: string; decision: V4ReviewChoice }> = [
+              { label: "Keep all local lines", decision: "local" },
+              { label: "Keep all remote lines", decision: "remote" },
+              { label: "Keep both sides", decision: "both" },
+              { label: "Omit both sides", decision: "discard" },
+            ]
+            for (const command of commands) {
+              const button = shortcuts.createEl("button", { text: command.label })
+              button.setAttribute("aria-label", `Change ${activeHunk + 1}: ${command.decision}`)
+              button.onclick = () => chooseHunk(sectionIndex, section, command.decision)
+            }
+            const after = sections[sectionIndex + 1]
+            if (after?.kind === "common") {
+              pageHost.createEl("pre", { cls: "github-sync-conflict__common",
+                text: after.lines.slice(0, 3).join("\n") + (after.lines.length > 3 ? "\n…" : "") })
+            }
+            update()
+            review.scrollTop = 0
+          }
+          renderPage()
+        } else {
+        let hunk = 0
+        for (let sectionIndex = 0; sectionIndex < sections.length; sectionIndex++) {
+          const section = sections[sectionIndex]
+          if (section.kind === "common") {
+            const common = review.createEl("pre", { cls: "github-sync-conflict__common", text: section.lines.join("\n") })
+            common.setAttribute("aria-label", "Unchanged lines")
+            continue
+          }
+          const index = hunk++
+          const block = review.createDiv({ cls: "github-sync-conflict__hunk" })
+          block.createEl("span", { text: `Change ${index + 1} of ${hunks.length} · select individual lines`, cls: "github-sync-conflict__hunk-title" })
+          const columns = block.createDiv({ cls: "github-sync-conflict__columns" })
+          const sides = [
+            { name: "local" as const, label: "Local", lines: section.localLines, cls: "is-local" },
+            { name: "remote" as const, label: "Remote", lines: section.remoteLines, cls: "is-remote" },
+          ]
+          for (const side of sides) {
+            const column = columns.createDiv({ cls: `github-sync-conflict__side ${side.cls}` })
+            if (!side.lines.length) column.createEl("span", { text: "(no lines)", cls: "github-sync-conflict__empty" })
+            side.lines.forEach((line, lineIndex) => {
+              const key = v4ReviewLineKey(sectionIndex, side.name, lineIndex)
+              const row = column.createDiv({ cls: "github-sync-conflict__line" })
+              row.createEl("code", { text: line || " ", cls: "github-sync-conflict__line-text" })
+              const buttons = row.createDiv({ cls: "github-sync-conflict__line-actions" })
+              const keep = buttons.createEl("button", { text: "Keep", attr: { type: "button" } })
+              const omit = buttons.createEl("button", { text: "Omit", attr: { type: "button" } })
+              keep.setAttribute("aria-label", `Change ${index + 1} ${side.name} line ${lineIndex + 1}: keep`)
+              omit.setAttribute("aria-label", `Change ${index + 1} ${side.name} line ${lineIndex + 1}: omit`)
+              controls.set(key, { keep, omit })
+              keep.onclick = () => chooseLine(sectionIndex, side.name, lineIndex, "keep")
+              omit.onclick = () => chooseLine(sectionIndex, side.name, lineIndex, "omit")
+            })
+          }
+          const choose = block.createDiv({ cls: "github-sync-conflict__choices" })
+          const choices: Array<{ choice: V4ReviewChoice; button: HTMLButtonElement }> = [
+            { choice: "local", button: choose.createEl("button", { text: "Keep all local lines" }) },
+            { choice: "remote", button: choose.createEl("button", { text: "Keep all remote lines" }) },
+            { choice: "both", button: choose.createEl("button", { text: "Keep both sides" }) },
+            { choice: "discard", button: choose.createEl("button", { text: "Omit both sides" }) },
+          ]
+          for (const { choice, button } of choices) {
+            button.setAttribute("aria-label", `Change ${index + 1}: ${choice}`)
+            button.onclick = () => chooseHunk(sectionIndex, section, choice)
+          }
+        }
+        }
+        update()
+        apply.onclick = () => {
+          if (!previewReady || signal.aborted) return
+          const mergedBytes = new TextEncoder().encode(output.value)
+          if (mergedBytes.byteLength > V4_REVIEW_MAX_RESULT_BYTES) return
+          finish({ action: "merged", mergedBytes })
+        }
+      } else {
+        modal.contentEl.createEl("p", { text: "Line-by-line review uses a bounded memory budget (up to 16 MiB per text side). Binary or exceptionally line-dense/large files use the whole-file decisions below.", cls: "github-sync-conflict__intro" })
+      }
       buttons.createEl("button", { text: "Keep both" }).onclick = () => finish({ action: "keep-local-copy-remote" })
       buttons.createEl("button", { text: "Use local" }).onclick = () => finish({ action: "use-local" })
       buttons.createEl("button", { text: "Use remote" }).onclick = () => finish({ action: "use-remote" })
       buttons.createEl("button", { text: "Cancel" }).onclick = () => finish({ action: "ask" })
+      if (signal.aborted) {
+        finish({ action: "ask" })
+        return
+      }
+      signal.addEventListener("abort", onAbort, { once: true })
       modal.open()
     })
   }
 
-  private async confirmThresholdOverride(error: V4ChangeGuardError, operation: "forcePush" | "forcePull"): Promise<boolean> {
+  private async confirmThresholdOverride(
+    error: V4ChangeGuardError,
+    operation: "forcePush" | "forcePull",
+    signal: AbortSignal,
+  ): Promise<boolean> {
     return new Promise(resolve => {
       const modal = new Modal(this.plugin.app)
       let settled = false
-      const finish = (value: boolean) => {
+      let onAbort: (() => void) | undefined
+      const settle = (value: boolean, close: boolean) => {
         if (settled) return
         settled = true
-        modal.close()
+        if (onAbort) signal.removeEventListener("abort", onAbort)
+        if (close) modal.close()
         resolve(value)
       }
-      modal.onClose = () => { if (!settled) { settled = true; resolve(false) } }
+      const finish = (value: boolean) => settle(value, true)
+      onAbort = () => finish(false)
+      modal.onClose = () => settle(false, false)
       modal.titleEl.setText("Modification threshold exceeded")
       modal.contentEl.createEl("p", { text: `${error.changePercent}% of logical files would change; the limit is ${error.thresholdPercent}%.` })
       modal.contentEl.createEl("p", { text: "Override the guard for this force operation only?" })
@@ -689,6 +1125,11 @@ export class V4PluginRuntime {
       const confirm = buttons.createEl("button", { text: operation === "forcePush" ? "Override and force push" : "Override and force pull" })
       confirm.addClass("mod-warning")
       confirm.onclick = () => finish(true)
+      if (signal.aborted) {
+        finish(false)
+        return
+      }
+      signal.addEventListener("abort", onAbort, { once: true })
       modal.open()
     })
   }

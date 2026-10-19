@@ -20,6 +20,14 @@ export interface SecretMigrationResult<T extends V4SecretBackedSettings> {
   migrated: boolean
 }
 
+export function assertDistinctV4SecretIds(settings: V4SecretBackedSettings): void {
+  const githubTokenSecretId = settings.githubTokenSecretId ?? ""
+  const encryptionPassphraseSecretId = settings.encryptionPassphraseSecretId ?? ""
+  if (githubTokenSecretId && encryptionPassphraseSecretId && githubTokenSecretId === encryptionPassphraseSecretId) {
+    throw new Error("GitHub token and encryption passphrase secret IDs must be distinct.")
+  }
+}
+
 function loadSecret(storage: SecretStorageLike, id: string): string {
   return id ? storage.getSecret(id) ?? "" : ""
 }
@@ -33,6 +41,7 @@ export function migrateV4Secrets<T extends V4SecretBackedSettings>(
   const githubTokenSecretId = settings.githubTokenSecretId || idFactory("github-token")
   const encryptionPassphraseSecretId =
     settings.encryptionPassphraseSecretId || idFactory("encryption-passphrase")
+  assertDistinctV4SecretIds({ githubTokenSecretId, encryptionPassphraseSecretId })
 
   if (!settings.githubTokenSecretId || !settings.encryptionPassphraseSecretId) migrated = true
 
@@ -40,13 +49,30 @@ export function migrateV4Secrets<T extends V4SecretBackedSettings>(
   const legacyPassphrase =
     typeof settings.encryptionPassphrase === "string" ? settings.encryptionPassphrase : ""
 
-  if (legacyToken) {
-    storage.setSecret(githubTokenSecretId, legacyToken)
-    migrated = true
+  const migrationSnapshots = new Map<string, string | null>()
+  if (legacyToken) migrationSnapshots.set(githubTokenSecretId, storage.getSecret(githubTokenSecretId))
+  if (legacyPassphrase && !migrationSnapshots.has(encryptionPassphraseSecretId)) {
+    migrationSnapshots.set(encryptionPassphraseSecretId, storage.getSecret(encryptionPassphraseSecretId))
   }
-  if (legacyPassphrase) {
-    storage.setSecret(encryptionPassphraseSecretId, legacyPassphrase)
-    migrated = true
+
+  try {
+    if (legacyToken) {
+      storage.setSecret(githubTokenSecretId, legacyToken)
+      migrated = true
+    }
+    if (legacyPassphrase) {
+      storage.setSecret(encryptionPassphraseSecretId, legacyPassphrase)
+      migrated = true
+    }
+  } catch (error) {
+    for (const [id, previous] of migrationSnapshots) {
+      try {
+        storage.setSecret(id, previous ?? "")
+      } catch {
+        // Preserve the original migration failure; rollback is best-effort across every touched ID.
+      }
+    }
+    throw error
   }
 
   return {
@@ -62,14 +88,54 @@ export function migrateV4Secrets<T extends V4SecretBackedSettings>(
   }
 }
 
+export function scrubV4SecretIds(storage: SecretStorageLike, ids: Iterable<string>): void {
+  let firstError: unknown
+  const seen = new Set<string>()
+  for (const id of ids) {
+    if (!id || seen.has(id)) continue
+    seen.add(id)
+    try {
+      storage.setSecret(id, "")
+    } catch (error) {
+      if (firstError === undefined) firstError = error
+    }
+  }
+  if (firstError !== undefined) {
+    throw new Error("One or more pending credentials could not be scrubbed.", { cause: firstError })
+  }
+}
+
+export function supersededV4SecretIds(
+  previous: V4SecretBackedSettings,
+  next: V4SecretBackedSettings,
+): string[] {
+  const active = new Set([
+    next.githubTokenSecretId ?? "",
+    next.encryptionPassphraseSecretId ?? "",
+  ].filter(Boolean))
+  const superseded: string[] = []
+  const seen = new Set<string>()
+  for (const id of [previous.githubTokenSecretId ?? "", previous.encryptionPassphraseSecretId ?? ""]) {
+    if (!id || active.has(id) || seen.has(id)) continue
+    seen.add(id)
+    superseded.push(id)
+  }
+  return superseded
+}
+
 export function storeV4Secrets(
   settings: V4SecretBackedSettings,
   storage: SecretStorageLike,
+  selection: { githubToken: boolean; encryptionPassphrase: boolean } = {
+    githubToken: true,
+    encryptionPassphrase: true,
+  },
 ): void {
-  if (settings.githubTokenSecretId) {
+  assertDistinctV4SecretIds(settings)
+  if (selection.githubToken && settings.githubTokenSecretId) {
     storage.setSecret(settings.githubTokenSecretId, settings.githubToken ?? "")
   }
-  if (settings.encryptionPassphraseSecretId) {
+  if (selection.encryptionPassphrase && settings.encryptionPassphraseSecretId) {
     storage.setSecret(
       settings.encryptionPassphraseSecretId,
       settings.encryptionPassphrase ?? "",

@@ -1,5 +1,6 @@
 import { expectedV4PathLayout, V4_FORMAT_VERSION, type V4ObjectStorage, type V4PathLayout, type V4StorageMode } from "./protocol-types";
 import { bucketForV4PathId } from "./paths";
+import { hashV4ShardRecords } from "./shard-hash";
 
 export interface V4IndexFileRecord {
   path: string;
@@ -42,9 +43,39 @@ export interface V4LocalIndexAdapter {
   write(path: string, value: string): Promise<void>;
   exists(path: string): Promise<boolean>;
   mkdir(path: string): Promise<void>;
+  stat?(path: string): Promise<{ size: number } | null>;
 }
 
 type V4LocalIndexHeader = Omit<V4LocalIndex, "shards">;
+
+export const V4_LOCAL_INDEX_HEADER_MAX_CHARS = 64 * 1024;
+export const V4_LOCAL_INDEX_SHARD_MAX_CHARS = 32 * 1024 * 1024;
+
+export function fitsV4LocalJsonSizeLimit(serialized: string, maxBytes: number): boolean {
+  if (serialized.length > maxBytes) return false;
+  let bytes = 0;
+  for (let i = 0; i < serialized.length; i++) {
+    const code = serialized.charCodeAt(i);
+    if (code < 0x80) bytes++;
+    else if (code < 0x800) bytes += 2;
+    else if (code >= 0xd800 && code <= 0xdbff
+      && i + 1 < serialized.length
+      && serialized.charCodeAt(i + 1) >= 0xdc00
+      && serialized.charCodeAt(i + 1) <= 0xdfff) {
+      bytes += 4;
+      i++;
+    } else bytes += 3;
+    if (bytes > maxBytes) return false;
+  }
+  return true;
+}
+
+export async function isV4OversizedLocalJson(
+  adapter: V4LocalIndexAdapter, path: string, maximumBytes: number,
+): Promise<boolean> {
+  const stat = await adapter.stat?.(path);
+  return !!stat && (!Number.isSafeInteger(stat.size) || stat.size < 0 || stat.size > maximumBytes);
+}
 
 function join(root: string, child: string): string {
   return `${root.replace(/\/+$/u, "")}/${child.replace(/^\/+/, "")}`;
@@ -70,7 +101,10 @@ function isV4LocalIndexHeader(value: unknown): value is V4LocalIndexHeader {
   if (!Number.isSafeInteger(candidate.epoch) || (candidate.epoch ?? -1) < 0) return false;
   if (!Number.isSafeInteger(candidate.generation) || (candidate.generation ?? -1) < 0) return false;
   if (!candidate.shardHashes || typeof candidate.shardHashes !== "object" || Array.isArray(candidate.shardHashes)) return false;
-  return Object.entries(candidate.shardHashes).every(([bucket, hash]) => /^[0-9a-f]{2}$/u.test(bucket) && typeof hash === "string");
+  if (Object.keys(candidate.shardHashes).length > 256) return false;
+  return Object.entries(candidate.shardHashes).every(([bucket, hash]) =>
+    /^[0-9a-f]{2}$/u.test(bucket) && typeof hash === "string" && /^[0-9a-f]{64}$/u.test(hash)
+  );
 }
 
 function isRecordMap(value: unknown, bucket: string): value is Record<string, V4IndexFileRecord> {
@@ -107,7 +141,7 @@ export function isV4LocalIndexCacheComplete(index: V4LocalIndex): boolean {
   const expectedBuckets = Object.keys(index.shardHashes);
   if (Object.keys(index.shards).length !== expectedBuckets.length) return false;
   return expectedBuckets.every(bucket => /^[0-9a-f]{2}$/u.test(bucket)
-    && typeof index.shardHashes[bucket] === "string"
+    && /^[0-9a-f]{64}$/u.test(index.shardHashes[bucket] ?? "")
     && isV4LocalIndexShardConsistent(index, bucket, index.shardHashes[bucket]));
 }
 
@@ -128,15 +162,22 @@ export function createEmptyV4LocalIndex(input: { repoId: string; deviceId: strin
 async function saveV4LocalIndexShard(adapter: V4LocalIndexAdapter, root: string, index: V4LocalIndex, bucket: string): Promise<void> {
   const shard = index.shards[bucket];
   if (!shard || !isShardConsistent(shard, bucket, shard.hash)) throw new Error(`Invalid V4 local index shard: ${bucket}`);
+  if (await hashV4ShardRecords(Object.values(shard.records)) !== shard.hash) {
+    throw new Error(`V4 local index shard hash mismatch: ${bucket}`);
+  }
   index.shardHashes[bucket] = shard.hash;
   await adapter.mkdir(root);
   await adapter.mkdir(join(root, "shards"));
-  await adapter.write(join(root, `shards/${bucket}.json`), JSON.stringify(shard));
+  const serialized = JSON.stringify(shard);
+  if (!fitsV4LocalJsonSizeLimit(serialized, V4_LOCAL_INDEX_SHARD_MAX_CHARS)) throw new Error("V4 local index shard exceeds the cache limit.");
+  await adapter.write(join(root, `shards/${bucket}.json`), serialized);
 }
 
 async function saveV4LocalIndexHeader(adapter: V4LocalIndexAdapter, root: string, index: V4LocalIndex): Promise<void> {
   await adapter.mkdir(root);
-  await adapter.write(join(root, "index.json"), JSON.stringify(header(index)));
+  const serialized = JSON.stringify(header(index));
+  if (!fitsV4LocalJsonSizeLimit(serialized, V4_LOCAL_INDEX_HEADER_MAX_CHARS)) throw new Error("V4 local index header exceeds the cache limit.");
+  await adapter.write(join(root, "index.json"), serialized);
 }
 
 export async function saveV4LocalIndex(
@@ -154,7 +195,9 @@ export async function saveV4LocalIndex(
 export async function loadV4LocalIndex(adapter: V4LocalIndexAdapter, root: string): Promise<V4LocalIndex> {
   const headerPath = join(root, "index.json");
   if (!(await adapter.exists(headerPath))) return invalidV4LocalIndex();
+  if (await isV4OversizedLocalJson(adapter, headerPath, V4_LOCAL_INDEX_HEADER_MAX_CHARS)) return invalidV4LocalIndex();
   const serializedHeader = await adapter.read(headerPath);
+  if (!fitsV4LocalJsonSizeLimit(serializedHeader, V4_LOCAL_INDEX_HEADER_MAX_CHARS)) return invalidV4LocalIndex();
   let parsed: unknown;
   try {
     parsed = JSON.parse(serializedHeader);
@@ -171,7 +214,9 @@ export async function loadV4LocalIndex(adapter: V4LocalIndexAdapter, root: strin
   for (const bucket of Object.keys(index.shardHashes)) {
     const path = join(root, `shards/${bucket}.json`);
     if (!(await adapter.exists(path))) return invalidV4LocalIndex();
+    if (await isV4OversizedLocalJson(adapter, path, V4_LOCAL_INDEX_SHARD_MAX_CHARS)) return invalidV4LocalIndex();
     const serialized = await adapter.read(path);
+    if (!fitsV4LocalJsonSizeLimit(serialized, V4_LOCAL_INDEX_SHARD_MAX_CHARS)) return invalidV4LocalIndex();
     try {
       index.shards[bucket] = JSON.parse(serialized) as V4LocalIndexShard;
     } catch (error) {
@@ -179,5 +224,10 @@ export async function loadV4LocalIndex(adapter: V4LocalIndexAdapter, root: strin
       throw error;
     }
   }
-  return isV4LocalIndexCacheComplete(index) ? index : invalidV4LocalIndex();
+  if (!isV4LocalIndexCacheComplete(index)) return invalidV4LocalIndex();
+  for (const bucket of Object.keys(index.shardHashes)) {
+    const shard = index.shards[bucket];
+    if (await hashV4ShardRecords(Object.values(shard.records)) !== index.shardHashes[bucket]) return invalidV4LocalIndex();
+  }
+  return index;
 }

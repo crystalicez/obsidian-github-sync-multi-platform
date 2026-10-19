@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { isPathInV4SyncScope, type V4ScopeSettings } from "../../src/lib/v4/scope";
+import { countV4ScopedPaths, isPathInV4SyncScope, type V4ScopeSettings } from "../../src/lib/v4/scope";
 
 const base: V4ScopeSettings = {
   configDir: ".obsidian",
@@ -38,4 +38,25 @@ test("v4 scope applies ignore regex to normalized plaintext paths", () => {
   assert.equal(isPathInV4SyncScope("Archive/a.md", settings), false);
   assert.equal(isPathInV4SyncScope("Notes/a.tmp", settings), false);
   assert.equal(isPathInV4SyncScope("Notes/a.md", settings), true);
+});
+
+
+test("force-operation file counts use the same V4 scope as the runtime", () => {
+  const paths = [
+    "Notes/a.md",
+    ".obsidian/app.json",
+    ".obsidian/bookmarks.json",
+    ".obsidian/community-plugins.json",
+    ".obsidian/plugins/example/main.js",
+    ".obsidian/plugins/encrypted-github-sync-multi-platform/data.json",
+    ".obsidian/workspace.json",
+  ];
+  const settings = {
+    ...base,
+    syncObsidianConfig: true,
+    syncBookmarks: true,
+    syncPlugins: true,
+  };
+
+  assert.equal(countV4ScopedPaths(paths, settings), 5);
 });

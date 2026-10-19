@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { TFile } from "obsidian"
+import { Platform, TFile } from "obsidian"
 
 import { sha256Hex, utf8ToBytes } from "../../src/lib/bytes"
 import type { GitHubCreateTreeEntry } from "../../src/lib/github-git-types"
@@ -108,6 +108,7 @@ class MemoryObsidianVault {
 }
 
 function fixture() {
+  Platform.isDesktopApp = false
   const githubClient = new MemoryGitHub()
   const vault = new MemoryObsidianVault()
   const ignoredFiles = new Set<string>()

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict"
+import { createHash } from "node:crypto"
 import test from "node:test"
 
 import type { GitHubCreateTreeEntry } from "../../src/lib/github-git-types"
@@ -7,6 +8,11 @@ import { V4_FORMAT_VERSION, type V4RemoteConfig } from "../../src/lib/v4/protoco
 import { V4SyncSession, type V4SessionVault } from "../../src/lib/v4/sync-session"
 
 const enc = (value: string) => new TextEncoder().encode(value)
+
+function gitBlobSha1(bytes: Uint8Array) {
+  const header = Buffer.from(`blob ${bytes.byteLength}\0`, "utf8")
+  return createHash("sha1").update(header).update(bytes).digest("hex")
+}
 
 class MemoryVault implements V4SessionVault {
   files = new Map<string, { bytes: Uint8Array; mtime: number }>()
@@ -44,7 +50,7 @@ class MemoryGitHub {
   async getFileBytes(path: string, ref?: string) {
     const commit = ref ? this.commits.get(ref) : undefined
     const value = commit ? this.trees.get(commit.treeSha)?.get(path) : this.files.get(path)
-    return value ? { bytes: new Uint8Array(value), sha: `sha-${path}` } : null
+    return value ? { bytes: new Uint8Array(value), sha: gitBlobSha1(value) } : null
   }
   async getGitRefOrNull() { return this.ref }
   async ensureGitRepositoryInitialized() { return null }
@@ -53,17 +59,56 @@ class MemoryGitHub {
     if (!value) throw new Error(`Missing commit ${sha}`)
     return { sha, treeSha: value.treeSha, parentShas: value.parents, message: value.message }
   }
-  async getTreeAt(treeSha: string) {
-    const tree = this.trees.get(treeSha) ?? new Map<string, Uint8Array>()
+  async getTreeAt(treeSha: string, recursive = true) {
+    const viewPrefix = "view:"
+    let rootTreeSha = treeSha
+    let prefix = ""
+    if (treeSha.startsWith(viewPrefix)) {
+      const separator = treeSha.indexOf(":", viewPrefix.length)
+      if (separator < 0) throw new Error(`Malformed tree view: ${treeSha}`)
+      rootTreeSha = treeSha.slice(viewPrefix.length, separator)
+      prefix = treeSha.slice(separator + 1)
+    }
+    const rootTree = this.trees.get(rootTreeSha) ?? new Map<string, Uint8Array>()
+    const tree = new Map<string, Uint8Array>()
+    for (const [path, bytes] of rootTree) {
+      if (!prefix) tree.set(path, bytes)
+      else if (path.startsWith(`${prefix}/`)) tree.set(path.slice(prefix.length + 1), bytes)
+    }
+    if (!recursive) {
+      const rootBlobs: Array<{ path: string; bytes: Uint8Array }> = []
+      const rootDirectories = new Set<string>()
+      for (const [path, bytes] of tree) {
+        const slash = path.indexOf("/")
+        if (slash < 0) rootBlobs.push({ path, bytes })
+        else rootDirectories.add(path.slice(0, slash))
+      }
+      const blobEntries = rootBlobs.map(({ path, bytes }) => ({
+        path,
+        mode: "100644",
+        type: "blob" as const,
+        sha: gitBlobSha1(bytes),
+        size: bytes.byteLength,
+        url: "",
+      }))
+      const directoryEntries = [...rootDirectories].map(path => ({
+        path,
+        mode: "040000",
+        type: "tree" as const,
+        sha: `view:${rootTreeSha}:${prefix ? `${prefix}/${path}` : path}`,
+        url: "",
+      }))
+      return { sha: treeSha, url: "", truncated: false, tree: [...blobEntries, ...directoryEntries] }
+    }
     return {
       sha: treeSha,
       url: "",
       truncated: false,
-      tree: [...tree.entries()].map(([path, bytes], index) => ({
+      tree: [...tree.entries()].map(([path, bytes]) => ({
         path,
         mode: "100644",
         type: "blob" as const,
-        sha: `tree-blob-${index}`,
+        sha: gitBlobSha1(bytes),
         size: bytes.byteLength,
         url: "",
       })),

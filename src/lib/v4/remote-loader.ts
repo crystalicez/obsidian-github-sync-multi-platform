@@ -1,10 +1,12 @@
 import type { V4Keyring } from "./crypto"
+import { boundedMap } from "./bounded-map"
 import {
   isV4LocalIndexShardConsistent,
   type V4IndexFileRecord,
   type V4LocalIndex,
 } from "./local-index"
 import type { V4SyncOperation } from "./planner"
+import { hashV4ShardRecords, toV4RemoteRecord } from "./shard-hash"
 import {
   assertV4RemoteRecordSet,
   assertV4RemoteShardRecords,
@@ -24,6 +26,11 @@ import {
 
 export interface V4RemoteLoaderGithub {
   getFileBytes(path: string, ref?: string): Promise<{ bytes: Uint8Array; sha: string } | null>
+}
+
+export interface V4ObservedRemoteConfig {
+  commitSha: string
+  config: V4RemoteConfig
 }
 
 export interface V4RemoteState {
@@ -52,20 +59,25 @@ export function assertV4PathLayoutCompatible(
 }
 
 export async function loadV4RemoteConfig(
-  input: { github: V4RemoteLoaderGithub; desiredConfig: V4RemoteConfig },
+  input: { github: V4RemoteLoaderGithub; desiredConfig: V4RemoteConfig; observedRemoteConfig?: V4ObservedRemoteConfig },
   commitSha: string | undefined,
   operation: V4SyncOperation,
 ): Promise<V4RemoteConfig | null> {
-  const configFile = await input.github.getFileBytes(V4_CONFIG_PATH, commitSha)
-  if (!configFile) return null
-  const config = decodeV4RemoteConfig(configFile.bytes)
+  let config: V4RemoteConfig
+  if (input.observedRemoteConfig && input.observedRemoteConfig.commitSha === commitSha) {
+    config = input.observedRemoteConfig.config
+  } else {
+    const configFile = await input.github.getFileBytes(V4_CONFIG_PATH, commitSha)
+    if (!configFile) return null
+    config = decodeV4RemoteConfig(configFile.bytes)
+  }
   if (config.repoId !== input.desiredConfig.repoId) throw new Error("V4 remote repository identity mismatch.")
   assertV4PathLayoutCompatible(config, input.desiredConfig, operation)
   return config
 }
 
 export async function loadV4RemoteState(
-  input: { github: V4RemoteLoaderGithub; index: V4LocalIndex; keyring?: V4Keyring },
+  input: { github: V4RemoteLoaderGithub; index: V4LocalIndex; keyring?: V4Keyring; maxConcurrentShardReads?: 1 | 2 },
   commitSha: string | undefined,
   config: V4RemoteConfig | null,
 ): Promise<V4RemoteState | null> {
@@ -73,45 +85,28 @@ export async function loadV4RemoteState(
   const headFile = await input.github.getFileBytes(V4_HEAD_PATH, commitSha)
   if (!headFile) throw new Error("V4 remote head is missing.")
   const head = await decodeV4RemoteHead(headFile.bytes, config, input.keyring)
-  const records: V4IndexFileRecord[] = []
-  for (const bucket of Object.keys(head.shardHashes)) {
-    const cached = isV4LocalIndexShardConsistent(input.index, bucket, head.shardHashes[bucket])
+  const shardRecords = await boundedMap(Object.keys(head.shardHashes), input.maxConcurrentShardReads ?? 1, async bucket => {
+    const expectedHash = head.shardHashes[bucket]
+    let cached = isV4LocalIndexShardConsistent(input.index, bucket, expectedHash)
       ? input.index.shards[bucket]
       : undefined
+    if (cached && await hashV4ShardRecords(Object.values(cached.records)) !== expectedHash) cached = undefined
     if (cached) {
-      assertV4RemoteShardRecords({ bucket, records: cached.records }, bucket, config)
-      records.push(...Object.values(cached.records))
-      continue
+      const remoteRecords = Object.fromEntries(
+        Object.entries(cached.records).map(([pathId, record]) => [pathId, toV4RemoteRecord(record)]),
+      )
+      assertV4RemoteShardRecords({ bucket, records: remoteRecords }, bucket, config)
+      return Object.values(remoteRecords)
     }
     const file = await input.github.getFileBytes(v4RemoteShardPath(bucket, config.mode), commitSha)
     if (!file) throw new Error(`V4 remote shard is missing: ${bucket}`)
-    records.push(...Object.values((await decodeV4RemoteShard(file.bytes, bucket, config, input.keyring)).records))
-  }
+    const shard = await decodeV4RemoteShard(file.bytes, bucket, config, input.keyring)
+    if (await hashV4ShardRecords(Object.values(shard.records)) !== expectedHash) {
+      throw new Error(`V4 remote shard hash mismatch: ${bucket}`)
+    }
+    return Object.values(shard.records)
+  })
+  const records: V4IndexFileRecord[] = shardRecords.flat()
   await assertV4RemoteRecordSet(records, config, input.keyring)
   return { config, head, records, commitSha: commitSha ?? "" }
-}
-
-export function remoteV4StateFromLocalIndex(
-  index: V4LocalIndex,
-  commitSha: string,
-  config: V4RemoteConfig,
-): V4RemoteState {
-  return {
-    config,
-    head: {
-      formatVersion: 4,
-      mode: index.mode,
-      epoch: index.epoch,
-      generation: index.generation,
-      journalId: "",
-      shardHashes: { ...index.shardHashes },
-      updatedAt: 0,
-      deviceId: index.deviceId,
-    },
-    records: recordsFromIndex(index).map(record => ({
-      ...record,
-      partPaths: record.partPaths ? [...record.partPaths] : undefined,
-    })),
-    commitSha,
-  }
 }

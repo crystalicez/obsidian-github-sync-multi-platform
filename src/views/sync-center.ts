@@ -1,6 +1,8 @@
-import { ItemView, Notice, WorkspaceLeaf } from "obsidian"
+import { ItemView, WorkspaceLeaf } from "obsidian"
 import type FastSync from "../main"
+import { formatV4Rate, formatV4Size } from "../lib/v4/run-diagnostics"
 import type { V4HistoryChange, V4HistoryCommit, V4HistoryService, V4VersionPreview } from "../lib/v4/history-service"
+import { countV4FileOverview, filterV4FileOverview, treeV4FileOverview, V4_FILE_FILTERS, type V4FileFilter, type V4FileOverview, type V4FileOverviewEntry, type V4FileTreeNode } from "../lib/v4/file-overview"
 import {
   formatV4Duration,
   formatV4PhaseLabel,
@@ -20,7 +22,14 @@ interface V4ViewRenderGeneration {
 
 export class V4SyncCenterView extends ItemView {
   private service?: V4HistoryService
+  private serviceGeneration?: number
   private page = 1
+  private mode: "files" | "commits" | "file" = "commits"
+  private fileOverview?: V4FileOverview
+  private fileFilter: V4FileFilter = "all"
+  private fileQuery = ""
+  private treeView = true
+  private collapsedPaths = new Set<string>()
   private selected?: V4HistoryCommit
   private objectUrl?: string
   private progressCard?: HTMLElement
@@ -49,7 +58,8 @@ export class V4SyncCenterView extends ItemView {
     this.renderGeneration++
     this.unsubscribeProgress?.()
     this.unsubscribeProgress = this.plugin.v4Runtime.subscribeProgress(snapshot => this.renderProgressCard(snapshot))
-    await this.renderCommitMode()
+    if (this.plugin.githubClient) await this.renderFilesMode()
+    else await this.renderCommitMode()
   }
   async onClose(): Promise<void> {
     this.isOpen = false
@@ -59,6 +69,8 @@ export class V4SyncCenterView extends ItemView {
     this.unsubscribeProgress = undefined
     this.clearProgressElements()
     this.releaseObjectUrl()
+    this.service = undefined
+    this.serviceGeneration = undefined
   }
 
   private beginRender(): V4ViewRenderGeneration | undefined {
@@ -73,7 +85,15 @@ export class V4SyncCenterView extends ItemView {
   }
 
   private async ensureService(): Promise<V4HistoryService> {
-    this.service ??= await this.plugin.v4Runtime.createHistoryService()
+    const generation = this.plugin.v4Runtime.settingsGeneration
+    if (!this.service || this.serviceGeneration !== generation) {
+      const service = await this.plugin.v4Runtime.createHistoryService()
+      if (this.plugin.v4Runtime.settingsGeneration !== generation) {
+        throw new Error("V4 history settings generation changed.")
+      }
+      this.service = service
+      this.serviceGeneration = generation
+    }
     return this.service
   }
 
@@ -84,8 +104,15 @@ export class V4SyncCenterView extends ItemView {
     const header = this.contentEl.createDiv({ cls: "github-sync-center__header" })
     header.createEl("h3", { text: title })
     const actions = header.createDiv({ cls: "github-sync-center__actions" })
-    actions.createEl("button", { text: "Commits" }).onclick = () => void this.renderCommitMode()
-    actions.createEl("button", { text: "Current file" }).onclick = () => void this.renderFileMode()
+    const filesButton = actions.createEl("button", { text: "Files" })
+    filesButton.setAttribute("aria-pressed", String(this.mode === "files"))
+    filesButton.onclick = () => void this.renderFilesMode()
+    const commitsButton = actions.createEl("button", { text: "Commits" })
+    commitsButton.setAttribute("aria-pressed", String(this.mode === "commits"))
+    commitsButton.onclick = () => void this.renderCommitMode()
+    const fileButton = actions.createEl("button", { text: "Current file" })
+    fileButton.setAttribute("aria-pressed", String(this.mode === "file"))
+    fileButton.onclick = () => void this.renderFileMode()
     actions.createEl("button", { text: "Sync now", cls: "mod-cta" }).onclick = () => void this.plugin.v4Runtime.manualSync()
     this.clearProgressElements()
     this.progressCard = this.contentEl.createDiv({ cls: "github-sync-center__progress" })
@@ -157,15 +184,32 @@ export class V4SyncCenterView extends ItemView {
           ["Total", formatV4Duration(snapshot.totalElapsedMs), true] as const,
           ...snapshot.timings.map(timing => {
             const phaseLabel = formatV4PhaseLabel(timing.phase)
-            const label = timing.phase === "encrypting" ? "Encryption" : phaseLabel
+            const label = timing.phase === "encrypting" && snapshot.diagnostics ? "Encrypting phase" : timing.phase === "encrypting" ? "Encryption" : phaseLabel
             return [label, formatV4PhaseTiming(timing).slice(phaseLabel.length + 1), false] as const
           }),
         ]
       : []
+    const d = snapshot.diagnostics
+    if (d) {
+      timingRows.push(
+        [`Upload API · ${formatV4Size(d.uploadBytes)}`, `${formatV4Rate(d.uploadBytes, d.uploadRequestMs)} · ${formatV4Duration(d.uploadRequestMs)}`, false],
+        [`Download API · ${formatV4Size(d.downloadBytes)}`, `${formatV4Rate(d.downloadBytes, d.downloadRequestMs)} · ${formatV4Duration(d.downloadRequestMs)}`, false],
+        [`GitHub API · ${d.apiRequests} requests`, d.apiRequests ? `${(d.apiLatencyMs / d.apiRequests).toFixed(0)} ms avg · ${d.apiMaxLatencyMs.toFixed(0)} ms max` : "—", false],
+        ["GitHub in flight", d.inFlightApiRequests > 0 ? `${d.inFlightApiRequests} · oldest ${formatV4Duration(d.oldestInFlightApiMs)}` : "0", false],
+        ["Hashing (measured)", formatV4Duration(d.hashingMs), false],
+        ["Encryption (measured)", formatV4Duration(d.encryptionMs), false],
+        ["Decryption (measured)", formatV4Duration(d.decryptionMs), false],
+        ["Peak renderer RAM", d.peakRendererRssBytes === undefined ? "N/A" : formatV4Size(d.peakRendererRssBytes), false],
+      )
+    }
     const timingsSignature = JSON.stringify(timingRows)
     if (timingsSignature !== this.progressTimingsSignature) {
       timingsElement.empty()
       for (const [label, duration, total] of timingRows) this.renderTiming(timingsElement, label, duration, total)
+      if (d) timingsElement.createEl("p", {
+        text: "GitHub API payload rates use transfer bytes per request time, not your full internet speed. API latency excludes queue/retry waits. GitHub in-flight counts active HTTP calls, not queued work. Measured work can overlap phases. RAM is sampled renderer RSS, not total Obsidian memory.",
+        cls: "github-sync-center__muted",
+      })
       this.progressTimingsSignature = timingsSignature
     }
   }
@@ -257,9 +301,142 @@ export class V4SyncCenterView extends ItemView {
     return trigger ? labels[trigger] : ""
   }
 
+  private async renderFilesMode(): Promise<void> {
+    const generation = this.beginRender()
+    if (!generation) return
+    this.mode = "files"
+    const { body, detail } = this.shell("Files")
+    body.createEl("p", { text: "Reading the exact remote branch…", cls: "github-sync-center__muted" })
+    detail.createEl("p", { text: "Select a file for details.", cls: "github-sync-center__muted" })
+    try {
+      // This call reads the exact Git ref and authenticates V4 remote records.
+      // A cached local index alone must never masquerade as a remote listing.
+      const overview = await this.plugin.v4Runtime.fileOverview()
+      if (!this.isCurrent(generation)) return
+      this.fileOverview = overview
+      body.empty()
+      const toolbar = body.createDiv({ cls: "github-sync-center__file-toolbar" })
+      const repository = toolbar.createDiv({ cls: "github-sync-center__file-source" })
+      repository.createEl("strong", { text: "GitHub files" })
+      const source = repository.createEl("span", {
+        text: `${this.plugin.settings.githubOwner}/${this.plugin.settings.githubRepo} · ${this.plugin.settings.githubBranch}`,
+        cls: "github-sync-center__muted",
+      })
+      source.title = `Read-only snapshot at ${overview.remoteCommitSha}`
+      const filterInput = toolbar.createEl("input", { cls: "github-sync-center__file-search", attr: {
+        type: "search", placeholder: "Filter by path…", "aria-label": "Filter files by path",
+      } }) as HTMLInputElement
+      filterInput.value = this.fileQuery
+      const filters = toolbar.createDiv({ cls: "github-sync-center__file-filters", attr: { "aria-label": "File status filters" } })
+      const count = countV4FileOverview(overview.entries)
+      const filterNames: Record<V4FileFilter, string> = {
+        all: "All", changed: "Changed", "local-only": "Local only", "remote-only": "Remote", synced: "Synced",
+      }
+      const labelFor = (entry: V4FileOverviewEntry) => entry.reason === "local-deleted"
+        ? "Deleted locally"
+        : entry.reason === "remote-deleted" ? "Deleted remotely"
+          : entry.reason === "remote-renamed-from" ? "Moved on GitHub"
+            : entry.reason === "remote-renamed-to" ? "Renamed on GitHub"
+              : filterNames[entry.status]
+      const fileList = body.createDiv({ cls: "github-sync-center__file-list" })
+      const controls = toolbar.createDiv({ cls: "github-sync-center__file-controls" })
+      const treeToggle = controls.createEl("button", { text: "Tree view" })
+      treeToggle.setAttribute("aria-pressed", String(this.treeView))
+      treeToggle.onclick = () => {
+        this.treeView = !this.treeView
+        treeToggle.setAttribute("aria-pressed", String(this.treeView))
+        draw()
+      }
+      const refresh = controls.createEl("button", { text: "Refresh status" })
+      refresh.onclick = () => void this.renderFilesMode()
+      controls.createEl("span", { text: "Read-only overview · Sync now applies the normal conflict policy", cls: "github-sync-center__muted" })
+      const filterButtons = new Map<V4FileFilter, HTMLButtonElement>()
+      for (const filter of V4_FILE_FILTERS) {
+        const button = filters.createEl("button", { text: `${filterNames[filter]} ${count[filter]}` })
+        button.setAttribute("aria-pressed", String(this.fileFilter === filter))
+        button.onclick = () => {
+          this.fileFilter = filter
+          draw()
+        }
+        filterButtons.set(filter, button)
+      }
+      filterInput.oninput = () => { this.fileQuery = filterInput.value; draw() }
+      const showDetails = (entry: V4FileOverviewEntry) => {
+        detail.empty()
+        const title = detail.createEl("h4", { text: entry.path })
+        title.title = entry.path
+        const name = labelFor(entry)
+        detail.createDiv({ text: name, cls: `github-sync-center__file-status is-${entry.status}` })
+        const help: Record<Exclude<V4FileFilter, "all">, string> = {
+          "local-only": "Only in this vault at the inspected remote commit. Normal Sync can publish it.",
+          "remote-only": "Only on the inspected remote commit. Normal Sync can download it.",
+          changed: "Local state or remote version differs from the last synchronized index. Review before syncing.",
+          synced: "Matches the last synchronized index by file size, modification time and remote version. A full content comparison has not been performed.",
+        }
+        const deletionHelp = entry.reason === "local-deleted"
+          ? "Previously synchronized, but now missing locally. A future sync may propagate this deletion to GitHub. Check your changes before syncing."
+          : entry.reason === "remote-deleted"
+            ? "Previously synchronized, but now missing on GitHub. A future sync may remove the local file. Check your changes before syncing."
+            : entry.reason === "remote-renamed-from"
+              ? `GitHub has moved this tracked file to ${entry.relatedPath}. Check the new location and your local edits before syncing.`
+              : entry.reason === "remote-renamed-to"
+                ? `Previously synchronized as ${entry.relatedPath}; the same file identity now appears here on GitHub. Review the move before syncing.`
+                : undefined
+        detail.createEl("p", { text: deletionHelp ?? help[entry.status], cls: deletionHelp ? "github-sync-center__file-warning" : "github-sync-center__muted" })
+        if (entry.local) {
+          const open = detail.createEl("button", { text: "Open local file" })
+          open.onclick = () => void this.app.workspace.openLinkText(entry.path, "", false)
+        }
+        detail.createEl("p", { text: "File actions use Sync now; this overview does not bypass conflict checks or modify the remote.", cls: "github-sync-center__muted" })
+      }
+      const draw = () => {
+        if (!this.isCurrent(generation)) return
+        for (const [filter, button] of filterButtons) button.setAttribute("aria-pressed", String(this.fileFilter === filter))
+        fileList.empty()
+        const matches = filterV4FileOverview(overview.entries, this.fileFilter, this.fileQuery)
+        const shown = matches.slice(0, 400)
+        fileList.createDiv({ text: `${matches.length} file${matches.length === 1 ? "" : "s"} · ${overview.remoteCommitSha.slice(0, 10)}`, cls: "github-sync-center__muted" })
+        if (matches.length > shown.length) fileList.createEl("p", { text: "Showing the first 400 matches. Narrow the path search to see more.", cls: "github-sync-center__muted" })
+        if (!matches.length) fileList.createEl("p", { text: "No files match this filter.", cls: "github-sync-center__muted" })
+        const createFileRow = (container: HTMLElement, entry: V4FileOverviewEntry, name: string) => {
+          const button = container.createEl("button", { cls: "github-sync-center__file-row" })
+          button.setAttribute("aria-label", `${entry.path}, ${labelFor(entry)}`)
+          const path = button.createEl("span", { text: name, cls: "github-sync-center__file-name" })
+          path.title = entry.path
+          button.createEl("span", { text: labelFor(entry), cls: `github-sync-center__file-status is-${entry.status}` })
+          button.onclick = () => showDetails(entry)
+        }
+        const addTree = (container: HTMLElement, nodes: V4FileTreeNode[], depth: number) => {
+          for (const node of nodes) {
+            if (node.entry) createFileRow(container, node.entry, node.name)
+            else {
+              const wrap = container.createDiv({ cls: "github-sync-center__folder" })
+              const toggle = wrap.createEl("button", { cls: "github-sync-center__folder-toggle", text: `${this.collapsedPaths.has(node.path) ? "▸" : "▾"}  ${node.name}` })
+              toggle.setAttribute("aria-expanded", String(!this.collapsedPaths.has(node.path)))
+              toggle.setAttribute("aria-label", `Folder ${node.path}`)
+              const child = wrap.createDiv({ cls: "github-sync-center__folder-children" })
+              if (!this.collapsedPaths.has(node.path)) addTree(child, node.children, depth + 1)
+              toggle.onclick = () => {
+                if (this.collapsedPaths.has(node.path)) this.collapsedPaths.delete(node.path)
+                else this.collapsedPaths.add(node.path)
+                draw()
+              }
+            }
+          }
+        }
+        if (this.treeView) addTree(fileList, treeV4FileOverview(shown), 0)
+        else for (const entry of shown) createFileRow(fileList, entry, entry.path)
+      }
+      draw()
+    } catch (error) {
+      if (this.isCurrent(generation)) this.renderError(body, error)
+    }
+  }
+
   private async renderCommitMode(): Promise<void> {
     const generation = this.beginRender()
     if (!generation) return
+    this.mode = "commits"
     const { body, detail } = this.shell("Commit history")
     body.createEl("p", { text: "Loading commits…", cls: "github-sync-center__muted" })
     try {
@@ -268,6 +445,7 @@ export class V4SyncCenterView extends ItemView {
       const page = await service.listCommits(this.page)
       if (!this.isCurrent(generation)) return
       body.empty()
+      if (this.selected && !page.items.some(item => item.sha === this.selected?.sha)) this.selected = undefined
       const pager = body.createDiv({ cls: "github-sync-center__pager" })
       const previous = pager.createEl("button", { text: "Previous" })
       previous.disabled = this.page <= 1
@@ -306,6 +484,10 @@ export class V4SyncCenterView extends ItemView {
       if (!this.isCurrent(generation)) return
       detail.empty()
       detail.createEl("h4", { text: `${changes.length} changed file${changes.length === 1 ? "" : "s"}` })
+      if (changes.length === 0) {
+        detail.createEl("p", { text: "No file changes to preview in this commit.", cls: "github-sync-center__muted" })
+        return
+      }
       const list = detail.createDiv({ cls: "github-sync-center__changes" })
       const preview = detail.createDiv({ cls: "github-sync-center__preview" })
       for (const change of changes) {
@@ -320,6 +502,7 @@ export class V4SyncCenterView extends ItemView {
   private async renderFileMode(): Promise<void> {
     const generation = this.beginRender()
     if (!generation) return
+    this.mode = "file"
     const active = this.app.workspace.getActiveFile()
     const { body, detail } = this.shell(active ? `Versions of ${active.path}` : "File versions")
     if (!active) { body.createEl("p", { text: "Open a file to view its versions." }); return }
@@ -378,8 +561,12 @@ export class V4SyncCenterView extends ItemView {
   private releaseObjectUrl(): void { if (this.objectUrl) URL.revokeObjectURL(this.objectUrl); this.objectUrl = undefined }
   private renderError(container: HTMLElement, error: unknown): void {
     container.empty()
-    const message = (error as Error).message
+    const message = error instanceof Error && error.message.trim()
+      ? error.message
+      : typeof error === "string" && error.trim()
+        ? error
+        : "Unable to load history. An unexpected error occurred."
     container.createEl("p", { text: message, cls: "github-sync-center__error" })
-    new Notice(`GitHub Sync Center: ${message}`)
+    // The error is already visible in this view; a toast would obscure its header and navigation.
   }
 }
