@@ -1046,6 +1046,7 @@ export class V4SyncSession {
       this.localReadCache.delete(after.path)
     }
 
+    this.input.diagnostics?.setPublicationStage("preparing-metadata")
     const finalRecords = [...recordsById.values()]
     await assertV4RemoteRecordSet(finalRecords, this.input.config, this.input.keyring)
     const finalObjectPaths = new Set(finalRecords.flatMap(recordPaths))
@@ -1132,8 +1133,11 @@ export class V4SyncSession {
     for (const item of stagedPushItems) {
       if (!uploadedPushIds.has(item.fileId)) completePush(item)
     }
+    this.input.diagnostics?.setPublicationStage("uploading-metadata", files.length)
+    this.report({ phase: "uploading", currentPath: undefined, currentDirection: undefined })
     const uploaded = await uploadV4TreeFiles(this.input.github, {
       files,
+      onBlobUploaded: () => this.input.diagnostics?.recordMetadataUploaded(),
       onLogicalFileUploadStarted: onUploadStarted,
       onLogicalFileUploaded: onUploaded,
       withBlobTransport,
@@ -1144,6 +1148,7 @@ export class V4SyncSession {
         push: directional(pushCompleted, pushTotal),
       }),
     })
+    this.input.diagnostics?.setPublicationStage("creating-commit")
     const candidate = await createV4CandidateCommit(this.input.github, {
       base: publicationBase,
       message: `obsidian-sync-v4:${journalId}`,
@@ -1161,6 +1166,7 @@ export class V4SyncSession {
       })
       : undefined
     preserveStagesForRecovery = !!recoverySnapshot && (recoveryPlan?.payload.mutations.length ?? 0) > 0
+    this.input.diagnostics?.setPublicationStage("publishing")
     await deferV4Cancellation(this.input.signal, () => publishV4CandidateRef(this.input.github, candidate, this.input.signal))
     if (this.input.recoveryStore && recoverySnapshot) {
       const publication = await reconcileV4CandidatePublication(this.input.github, {

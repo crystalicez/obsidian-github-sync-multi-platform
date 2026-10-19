@@ -140,7 +140,7 @@ export async function resolveV4PublicationBase(
 
 export async function uploadV4TreeFiles(
   github: V4GitTreeGithub,
-  input: Pick<V4GitTreeWriteInput, "files" | "onLogicalFileUploadStarted" | "onLogicalFileUploaded" | "onUploadsComplete" | "withBlobTransport">,
+  input: Pick<V4GitTreeWriteInput, "files" | "onLogicalFileUploadStarted" | "onLogicalFileUploaded" | "onUploadsComplete" | "withBlobTransport"> & { onBlobUploaded?: () => void },
 ): Promise<V4UploadedTreeFiles> {
   const progressItemsByFile = input.files.map(file => {
     const seen = new Set<string>();
@@ -167,6 +167,7 @@ export async function uploadV4TreeFiles(
     const sha = input.withBlobTransport
       ? await input.withBlobTransport(file.bytes, createBlob)
       : await createBlob();
+    invokeProgressCallback(input.onBlobUploaded);
     for (const item of progressItems) {
       const remaining = (remainingBlobsByFileId.get(item.fileId) ?? 1) - 1;
       remainingBlobsByFileId.set(item.fileId, remaining);

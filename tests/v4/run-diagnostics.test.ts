@@ -66,6 +66,32 @@ test("in-flight GitHub request ages update without waiting for a response", () =
   assert.equal(recorder.snapshot.inFlightApiRequests, 0)
 })
 
+test("publication diagnostics distinguish metadata preparation, uploaded objects and commit publication without logical paths", () => {
+  let clock = 10
+  const recorder = new V4RunDiagnostics(() => clock, () => undefined)
+  recorder.setPublicationStage("preparing-metadata")
+  clock = 310
+  assert.equal(recorder.snapshot.publicationStage, "preparing-metadata")
+  assert.equal(recorder.snapshot.publicationStageMs, 300)
+  assert.equal(recorder.snapshot.metadataTotal, undefined)
+  recorder.setPublicationStage("uploading-metadata", 3)
+  clock = 540
+  recorder.recordMetadataUploaded()
+  recorder.recordMetadataUploaded()
+  assert.equal(recorder.snapshot.publicationStageMs, 230)
+  assert.equal(recorder.snapshot.metadataUploaded, 2)
+  assert.equal(recorder.snapshot.metadataTotal, 3)
+  recorder.recordMetadataUploaded()
+  recorder.setPublicationStage("creating-commit")
+  clock = 620
+  assert.equal(recorder.snapshot.publicationStageMs, 80)
+  assert.equal(recorder.snapshot.metadataUploaded, 3)
+  recorder.setPublicationStage("publishing")
+  clock = 645
+  assert.equal(recorder.snapshot.publicationStageMs, 25)
+  assert.equal(recorder.snapshot.publicationStage, "publishing")
+})
+
 test("peak RSS is sampled without crashing when RAM probes are unavailable", () => {
   let ram: number | undefined = 128 * 1_048_576
   const recorder = new V4RunDiagnostics(() => 0, () => ram)

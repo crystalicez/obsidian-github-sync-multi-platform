@@ -128,6 +128,10 @@ export class GitHubClient {
     return this.transportMetrics.snapshot;
   }
 
+  get transportSchedulerSnapshot() {
+    return this.requestScheduler.snapshot;
+  }
+
   private async request(options: RequestUrlParam, transientBytes = 0): Promise<RequestUrlResponse> {
     const method = (options.method ?? "GET").toUpperCase();
     const kind = method === "GET" || method === "HEAD" ? "read" : "write";

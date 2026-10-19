@@ -8,6 +8,15 @@ import { sleepV4Abortable, throwIfV4Aborted, v4CancellationError } from "./cance
 
 export type V4RequestKind = "read" | "write"
 
+export interface V4RequestSchedulerSnapshot {
+  queuedReads: number
+  queuedWrites: number
+  activeReads: number
+  activeWrites: number
+  cooldownRemainingMs: number
+  mutationPacingRemainingMs: number
+}
+
 export interface V4RequestSchedulerOptions extends Partial<V4TransportPolicy> {
   sleep?: (milliseconds: number) => Promise<void>
   now?: () => number
@@ -46,6 +55,19 @@ export class V4RequestScheduler {
     this.now = options.now ?? (() => Date.now())
     this.onRetry = options.onRetry
     this.onDelay = options.onDelay
+  }
+
+  get snapshot(): V4RequestSchedulerSnapshot {
+    const now = this.now()
+    return {
+      queuedReads: this.queues.read.length,
+      queuedWrites: this.queues.write.length,
+      activeReads: this.active.read,
+      activeWrites: this.active.write,
+      cooldownRemainingMs: Math.max(0, this.cooldownUntil - now),
+      mutationPacingRemainingMs: this.lastMutationStartedAt === undefined
+        ? 0 : Math.max(0, this.lastMutationStartedAt + this.policy.mutationSpacingMs - now),
+    }
   }
 
   run<T>(kind: V4RequestKind, task: () => Promise<T>, signal?: AbortSignal): Promise<T> {

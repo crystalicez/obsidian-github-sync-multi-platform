@@ -331,7 +331,7 @@ try{
     now:()=>performance.now(),
     sleep,
     timeoutMs:nativeWaitMs,
-    poll:()=>evaluate("(()=>{const p="+bulkPlugin+";const j=globalThis.__bulkSyncE2E;const s=p.v4Runtime.progressSnapshot;const d=s.diagnostics;return {done:j.done,thrown:j.thrown,lifecycle:s.lifecycle,phase:s.phase,wallMs:performance.now()-j.startedAt,pushCompleted:s.push?.completed,pushTotal:s.push?.total,apiRequests:d?.apiRequests,apiFailures:d?.apiFailures,inFlightApiRequests:d?.inFlightApiRequests,oldestInFlightApiMs:d?.oldestInFlightApiMs,uploadBytes:d?.uploadBytes,peakRss:d?.peakRendererRssBytes,error:s.errorMessage?.slice(0,200),transport:p.githubClient?.transportMetricsSnapshot}})()",15000),
+    poll:()=>evaluate("(()=>{const p="+bulkPlugin+";const j=globalThis.__bulkSyncE2E;const s=p.v4Runtime.progressSnapshot;const d=s.diagnostics;return {done:j.done,thrown:j.thrown,lifecycle:s.lifecycle,phase:s.phase,wallMs:performance.now()-j.startedAt,pushCompleted:s.push?.completed,pushTotal:s.push?.total,apiRequests:d?.apiRequests,apiFailures:d?.apiFailures,inFlightApiRequests:d?.inFlightApiRequests,oldestInFlightApiMs:d?.oldestInFlightApiMs,uploadBytes:d?.uploadBytes,peakRss:d?.peakRendererRssBytes,publicationStage:d?.publicationStage,publicationStageMs:d?.publicationStageMs,metadataUploaded:d?.metadataUploaded,metadataTotal:d?.metadataTotal,error:s.errorMessage?.slice(0,200),transport:p.githubClient?.transportMetricsSnapshot,scheduler:p.githubClient?.transportSchedulerSnapshot}})()",15000),
     onProgress:state=>{const {error,thrown,...safe}=state;console.log(JSON.stringify({nativeBulkProgress:safe}));},
    });
    assertTrue(output.lifecycle==="success"&&output.apiFailures===0&&output.uploadBytes>0,"Native bulk-note sync failed: "+redact(JSON.stringify(output)));

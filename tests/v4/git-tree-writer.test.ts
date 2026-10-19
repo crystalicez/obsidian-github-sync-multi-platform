@@ -46,6 +46,22 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
+test("metadata blob progress counts successful uploads before publication starts", async () => {
+  const github = new MemoryV4GitHub();
+  const events: string[] = [];
+  const result = await uploadV4TreeFiles(github, {
+    files: [
+      { path: "index/01.enc", bytes: bytes("a") },
+      { path: "index/02.enc", bytes: bytes("b") },
+      { path: "head.enc", bytes: bytes("c") },
+    ],
+    onBlobUploaded: () => { events.push("blob"); },
+    onUploadsComplete: () => { events.push("complete"); },
+  });
+  assert.deepEqual(events, ["blob", "blob", "blob", "complete"]);
+  assert.deepEqual(result.entries.map(entry => entry.path), ["index/01.enc", "index/02.enc", "head.enc"]);
+})
+
 test("V4 tree writer initializes an empty branch with a root commit", async () => {
   const github = new MemoryV4GitHub();
   const result = await publishV4TreeChanges(github, {

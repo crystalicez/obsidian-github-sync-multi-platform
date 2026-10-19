@@ -1,4 +1,5 @@
 export type V4WorkKind = "hashing" | "encryption" | "decryption"
+export type V4PublicationStage = "preparing-metadata" | "uploading-metadata" | "creating-commit" | "publishing"
 
 export interface V4RunDiagnosticsSnapshot {
   uploadBytes: number
@@ -15,11 +16,16 @@ export interface V4RunDiagnosticsSnapshot {
   encryptionMs: number
   decryptionMs: number
   peakRendererRssBytes?: number
+  publicationStage?: V4PublicationStage
+  publicationStageMs?: number
+  metadataUploaded?: number
+  metadataTotal?: number
 }
 
 export class V4RunDiagnostics {
   private readonly inFlight = new Map<number, number>()
   private nextRequestId = 0
+  private publicationStageStartedAt?: number
   private readonly data: V4RunDiagnosticsSnapshot = {
     uploadBytes: 0,
     downloadBytes: 0,
@@ -44,6 +50,19 @@ export class V4RunDiagnostics {
     },
   ) {
     this.sampleMemory()
+  }
+
+  setPublicationStage(stage: V4PublicationStage, metadataTotal?: number): void {
+    this.data.publicationStage = stage
+    this.publicationStageStartedAt = this.now()
+    if (metadataTotal !== undefined) {
+      this.data.metadataTotal = metadataTotal
+      this.data.metadataUploaded = 0
+    }
+  }
+
+  recordMetadataUploaded(): void {
+    if (this.data.publicationStage === "uploading-metadata") this.data.metadataUploaded = (this.data.metadataUploaded ?? 0) + 1
   }
 
   sampleMemory(): void {
@@ -102,7 +121,14 @@ export class V4RunDiagnostics {
     if (this.inFlight.size > 0) {
       oldestInFlightApiMs = Math.max(0, this.now() - Math.min(...this.inFlight.values()))
     }
-    return { ...this.data, inFlightApiRequests: this.inFlight.size, oldestInFlightApiMs }
+    return {
+      ...this.data,
+      inFlightApiRequests: this.inFlight.size,
+      oldestInFlightApiMs,
+      ...(this.publicationStageStartedAt !== undefined
+        ? { publicationStageMs: Math.max(0, this.now() - this.publicationStageStartedAt) }
+        : {}),
+    }
   }
 }
 
