@@ -85,6 +85,14 @@ test("remote config reuses a validated snapshot only at its exact immutable comm
   const newer = await loadV4RemoteConfig({ github, desiredConfig: config, observedRemoteConfig: snapshot }, "commit-2", "normal");
   assert.deepEqual(newer, config);
   assert.deepEqual(github.reads, [{ path: V4_CONFIG_PATH, ref: "commit-2" }]);
+
+  const unexpected = new MemoryRemoteGithub(new Map([[
+    V4_CONFIG_PATH, enc(JSON.stringify({ ...config, repoId: "another/vault#main" })),
+  ]]));
+  await assert.rejects(
+    loadV4RemoteConfig({ github: unexpected, desiredConfig: config, observedRemoteConfig: snapshot }, "commit-2", "normal"),
+    /repository identity mismatch/iu,
+  );
 });
 
 test("remote loader keeps layout migration restricted to Force Push", () => {
