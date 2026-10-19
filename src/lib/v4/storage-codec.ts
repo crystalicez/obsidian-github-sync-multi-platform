@@ -231,34 +231,38 @@ export class V4StorageCodec {
       }
 
       const iterator = streamV4SourceParts(input.source, input.partBytes, signal)[Symbol.asyncIterator]()
-      for (let index = 0; index < partCount; index++) {
-        if (signal?.aborted) throw signal.reason ?? new Error("V4 object stream aborted.")
-        await input.checkSourceStable?.()
-        const expectedPartBytes = Math.min(input.partBytes, input.source.size - total)
-        const release = await reserve(expectedPartBytes)
-        let next: IteratorResult<Uint8Array>
-        try {
-          next = await iterator.next()
-          if (next.done) throw new V4SourceChangedError(path, `source ended after ${total} bytes; expected ${input.source.size}`)
-          this.updateHash(hash, next.value)
-          total += next.value.byteLength
+      try {
+        for (let index = 0; index < partCount; index++) {
+          if (signal?.aborted) throw signal.reason ?? new Error("V4 object stream aborted.")
           await input.checkSourceStable?.()
-          const bytes = this.options.mode === "plaintext"
-            ? next.value
-            : await this.encrypt(() => encryptV4Payload(this.options.keyring!.contentKey, next.value, {
-              kind: "part",
-              aad: `${contentAad}:${index}`,
-            }))
-          yield { path: objectPaths[index], bytes, release }
-        } catch (error) {
-          release()
-          throw error
+          const expectedPartBytes = Math.min(input.partBytes, input.source.size - total)
+          const release = await reserve(expectedPartBytes)
+          let next: IteratorResult<Uint8Array>
+          try {
+            next = await iterator.next()
+            if (next.done) throw new V4SourceChangedError(path, `source ended after ${total} bytes; expected ${input.source.size}`)
+            this.updateHash(hash, next.value)
+            total += next.value.byteLength
+            await input.checkSourceStable?.()
+            const bytes = this.options.mode === "plaintext"
+              ? next.value
+              : await this.encrypt(() => encryptV4Payload(this.options.keyring!.contentKey, next.value, {
+                kind: "part",
+                aad: `${contentAad}:${index}`,
+              }))
+            yield { path: objectPaths[index], bytes, release }
+          } catch (error) {
+            release()
+            throw error
+          }
         }
+        const tail = await iterator.next()
+        if (!tail.done) throw new V4SourceChangedError(path, "source produced more parts than declared")
+        await input.checkSourceStable?.()
+        completed = true
+      } finally {
+        await iterator.return?.()
       }
-      const tail = await iterator.next()
-      if (!tail.done) throw new V4SourceChangedError(path, "source produced more parts than declared")
-      await input.checkSourceStable?.()
-      completed = true
     }.bind(this)
 
     return {

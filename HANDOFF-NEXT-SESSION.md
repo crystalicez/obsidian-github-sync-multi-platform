@@ -4,6 +4,14 @@
 >
 > **Mandatory workflow rule:** Every AI session that makes a material change to code, tests, design decisions, branch/PR state, verification status, or next steps MUST update this file before ending or handing work off. GitHub is the source of truth.
 
+## 2026-10-19 Poteto Mode bounded-source integrity and iterator lifecycle
+
+- **Branch/base:** Continue from pushed `4d2e3b12c085bce95f38eea85cb27c530bc0ce61` in isolated `.tmp/stream-integrity-4d2e3b1-clean`. The original primary checkout at `44fd253` has unrelated WIP and must not be reset/rebased.
+- **Data-integrity RED:** `streamV4SourceParts` stopped validating source size after one empty trailing chunk. A declared three-byte source yielding three bytes, then an empty chunk, then a fourth byte completed without error. The same helper held an underlying async source iterator open on consumer cancellation; `V4StorageCodec.prepareFromSource` also failed to close its manually driven multipart iterator when an upload stopped or failed. Focused behavior tests **0/3 before fix** with exact missing-rejection/uncleared-finalizer failures.
+- **Fix:** Consume trailing empty chunks until actual end or reject any nonempty overflow. Both async generator boundaries now use `try/finally` and `iterator.return?.()` so source cleanup is awaited on completion, cancellation and error. No GitHub protocol, encryption format, persistent schema or sync policy changes.
+- **GREEN:** Focused regressions **5/5**, including rejected hidden trailing bytes, cancellation during trailing empty chunks, early source stop, stopped prepared multipart upload, and failed Git blob upload. On latest-source isolated checkout `pnpm build`, `pnpm test:fast`, `pnpm test:repeat` (10 complete fast rounds), `pnpm test:resource`, `pnpm test:recovery`, `pnpm test:feasibility`, `pnpm test:soak` (6/6, max 100,000,000 bytes), three-bundle GitHub E2E compile, metadata/package validation and `git diff --check` all exited 0.
+- **Limit:** This is a real bounded-stream edge-case regression, not a claim that the separate native 1,000-note Sync timeout or intermittent conflict P0 is fixed. No credentialed GitHub writes or native mobile/Obsidian tests for this specific patch. Physical Android/iOS, mobile RAM, hostile Git-tree integrity, hosted CI and independent review remain open. No merge or release.
+
 ## 2026-10-19 isolated latest-remote UTF-8 transport telemetry hardening
 
 - **Integration base:** Detached worktree `.tmp/transport-telemetry-c15b01c-clean` from fetched remote audit SHA `c15b01cadd2f9c3834b11b7c094c2ba46517621d`. Primary worktree remains at `44fd253` with unrelated user WIP, including `tests/v4/github-transport.test.ts`, fully preserved. Do not blindly rebase the dirty primary checkout.

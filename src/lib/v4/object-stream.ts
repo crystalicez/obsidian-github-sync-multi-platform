@@ -66,48 +66,54 @@ export async function* streamV4SourceParts(
   let carry: Uint8Array | undefined
   let total = 0
 
-  while (total < source.size) {
-    if (signal?.aborted) throw signal.reason ?? new Error("V4 source streaming aborted.")
-    const wanted = Math.min(partBytes, source.size - total)
+  try {
+    while (total < source.size) {
+      if (signal?.aborted) throw signal.reason ?? new Error("V4 source streaming aborted.")
+      const wanted = Math.min(partBytes, source.size - total)
 
-    if (!carry) {
-      const next = await iterator.next()
-      if (next.done) throw new V4SourceChangedError(undefined, `source ended after ${total} bytes; expected ${source.size}`)
-      if (next.value.byteLength === 0) continue
-      if (next.value.byteLength === wanted) {
-        total += wanted
-        yield next.value
-        continue
+      if (!carry) {
+        const next = await iterator.next()
+        if (next.done) throw new V4SourceChangedError(undefined, `source ended after ${total} bytes; expected ${source.size}`)
+        if (next.value.byteLength === 0) continue
+        if (next.value.byteLength === wanted) {
+          total += wanted
+          yield next.value
+          continue
+        }
+        if (next.value.byteLength > wanted) {
+          const part = next.value.subarray(0, wanted)
+          carry = next.value.subarray(wanted)
+          total += wanted
+          yield part
+          continue
+        }
+        carry = next.value
       }
-      if (next.value.byteLength > wanted) {
-        const part = next.value.subarray(0, wanted)
-        carry = next.value.subarray(wanted)
-        total += wanted
-        yield part
-        continue
+
+      const part = new Uint8Array(wanted)
+      let filled = 0
+      while (filled < wanted) {
+        if (carry && carry.byteLength > 0) {
+          const take = Math.min(carry.byteLength, wanted - filled)
+          part.set(carry.subarray(0, take), filled)
+          filled += take
+          carry = take === carry.byteLength ? undefined : carry.subarray(take)
+          continue
+        }
+        const next = await iterator.next()
+        if (next.done) throw new V4SourceChangedError(undefined, `source ended after ${total + filled} bytes; expected ${source.size}`)
+        carry = next.value
       }
-      carry = next.value
+      total += wanted
+      yield part
     }
 
-    const part = new Uint8Array(wanted)
-    let filled = 0
-    while (filled < wanted) {
-      if (carry && carry.byteLength > 0) {
-        const take = Math.min(carry.byteLength, wanted - filled)
-        part.set(carry.subarray(0, take), filled)
-        filled += take
-        carry = take === carry.byteLength ? undefined : carry.subarray(take)
-        continue
-      }
-      const next = await iterator.next()
-      if (next.done) throw new V4SourceChangedError(undefined, `source ended after ${total + filled} bytes; expected ${source.size}`)
-      carry = next.value
+    if (carry?.byteLength) throw new V4SourceChangedError(undefined, "source produced more bytes than declared")
+    for (let extra = await iterator.next(); !extra.done; extra = await iterator.next()) {
+      if (signal?.aborted) throw signal.reason ?? new Error("V4 source streaming aborted.")
+      if (extra.value.byteLength > 0) throw new V4SourceChangedError(undefined, "source produced more bytes than declared")
     }
-    total += wanted
-    yield part
+  } finally {
+    await iterator.return?.()
   }
-
-  if (carry?.byteLength) throw new V4SourceChangedError(undefined, "source produced more bytes than declared")
-  const extra = await iterator.next()
-  if (!extra.done && extra.value.byteLength > 0) throw new V4SourceChangedError(undefined, "source produced more bytes than declared")
 }
