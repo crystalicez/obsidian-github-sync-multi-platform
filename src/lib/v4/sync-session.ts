@@ -395,7 +395,8 @@ export class V4SyncSession {
     const remoteConfig = await loadV4RemoteConfig({ github: this.input.github, desiredConfig: this.input.config }, ref?.sha, options.operation)
     const localCacheComplete = isV4LocalIndexCacheComplete(this.input.index)
     const remote = await loadV4RemoteState(
-      { github: this.input.github, index: this.input.index, keyring: this.input.keyring },
+      { github: this.input.github, index: this.input.index, keyring: this.input.keyring,
+        maxConcurrentShardReads: this.input.maxConcurrentPartTransfers },
       ref?.sha,
       remoteConfig,
     )

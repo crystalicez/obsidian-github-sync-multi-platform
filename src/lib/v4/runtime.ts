@@ -310,7 +310,8 @@ export class V4PluginRuntime {
     const keyring = config.mode === "encrypted"
       ? await this.keyringForConfig(config, this.plugin.settings.encryptionPassphrase)
       : undefined
-    const remote = await loadV4RemoteState({ github, index, keyring }, ref.sha, config)
+    const remote = await loadV4RemoteState({ github, index, keyring,
+      maxConcurrentShardReads: Platform.isDesktopApp ? 2 : 1 }, ref.sha, config)
     this.assertSettingsGeneration(generation)
     if (!remote) throw new Error("V4 remote state is unavailable.")
     const inScope = this.scopePredicate()
