@@ -25,6 +25,8 @@ const mode=parseLiveUiMode(option("mode",undefined));
 const verifyPeer=opts.includes("--verify-peer");
 const journey=opts.includes("--journey");
 const native100mb=opts.includes("--native-100mb");
+const nativeThousandNotes=opts.includes("--native-1000-notes");
+assert.ok(!nativeThousandNotes||(mode==="encrypted"&&verifyPeer),"Native 1,000-note test requires encrypted mode and a second real Obsidian vault");
 const assertDiagnostics=opts.includes("--assert-diagnostics");
 assert.ok(!native100mb||(mode==="encrypted"&&verifyPeer),"Native 100 MB test requires encrypted mode and a second real Obsidian vault");
 assert.ok(!verifyPeer||mode==="encrypted","A second-vault restore requires --mode=encrypted");
@@ -76,6 +78,7 @@ const journeySteps=[];
 let nativeBinary=null;
 let nativeUploadWallMs=null;
 let nativeDownloadWallMs=null;
+let bulkEvidence=null;
 let diagnosticEvidence=null;
 let peerDiagnosticEvidence=null;
 const noOpEvidence=[];
@@ -307,6 +310,28 @@ try{
    const checked=await evaluate("(async()=>{const expected="+JSON.stringify(expectedPeerFiles)+";for(const entry of expected){const file=app.vault.getAbstractFileByPath(entry.path);if(!file||(await app.vault.read(file))!==entry.content)return {ok:false};}return {ok:!app.vault.getAbstractFileByPath("+JSON.stringify(original)+")};})()");
    assertTrue(checked?.ok,"Native source files diverged after combined changes");
   }
+  if(nativeThousandNotes){
+   const filler="x".repeat(480);
+   const expression="(async()=>{await app.vault.createFolder('Bulk');const text="+JSON.stringify(filler)+";for(let i=0;i<1000;i++){const path='Bulk/note-'+String(i).padStart(4,'0')+'.md';await app.vault.create(path,'# Bulk '+i+'\\n\\n'+text+'\\n')}return app.vault.getFiles().filter(f=>f.path.startsWith('Bulk/')).length})()";
+   const started=performance.now();
+   const created=await evaluate(expression,480000);
+   assertTrue(created===1000,"Real Obsidian did not index 1,000 notes");
+   const createdWallMs=performance.now()-started;
+   const before=finalSha;
+   const output=await evaluate("(async()=>{const p=app.plugins.plugins["+JSON.stringify(id)+"];const t=performance.now();await p.v4Runtime.manualSync();const s=p.v4Runtime.progressSnapshot;return {lifecycle:s.lifecycle,wallMs:performance.now()-t,apiRequests:s.diagnostics?.apiRequests,apiFailures:s.diagnostics?.apiFailures,uploadBytes:s.diagnostics?.uploadBytes,peakRss:s.diagnostics?.peakRendererRssBytes,error:s.errorMessage?.slice(0,200)}})()",900000);
+   assertTrue(output.lifecycle==="success"&&output.apiFailures===0&&output.uploadBytes>0,"Native 1,000-note sync failed: "+redact(JSON.stringify(output)));
+   const after=await readState(configuration);
+   assertTrue(after.kind==="present"&&after.sha!==before,"Native 1,000-note sync did not advance GitHub HEAD");
+   finalSha=after.sha;
+   const commit=await githubReadJson("git/commits/"+after.sha);
+   const tree=await githubReadJson("git/trees/"+commit.tree.sha+"?recursive=1");
+   assertTrue(tree.truncated===false&&!tree.tree.some(item=>item.path.startsWith("Bulk/")),
+    "Encrypted GitHub tree leaks logical 1,000-note paths");
+   for(let i=0;i<1000;i++)expectedPeerFiles.push({path:"Bulk/note-"+String(i).padStart(4,"0")+".md",content:"# Bulk "+i+"\n\n"+filler+"\n"});
+   bulkEvidence={count:1000,createdWallMs,...output};
+   await verifyNoop("warm-1000-notes");
+   journeySteps.push("real Obsidian encrypted 1,000-note batch sync");
+  }
   if(native100mb){
    const name="Assets/payload-100mb.bin";
    const size=100_000_000;
@@ -398,5 +423,5 @@ try{
   try{await cleanupGeneratedUiRun(runRoot,{repoRoot:root});}catch(error){console.error("WARNING: isolated test vault cleanup incomplete ("+String(error?.code||"unknown").slice(0,30)+")");process.exitCode=1;}
  }
  console.log(JSON.stringify({status:passed&&!process.exitCode?"PASS":"FAIL",cleanup:cleanupState,remoteHeadChanged:Boolean(initialSha&&finalSha&&initialSha!==finalSha),
-  screenshotCaptured:screenBytes>1000,screenshotPath:screenBytes>1000?screenshot:null,uiExceptions:sendErrors.length,mode,remoteEncryptionVerified,peerRestored,peerScreenshot,journeySteps,noOpEvidence,diagnostics:diagnosticEvidence,peerDiagnostics:peerDiagnosticEvidence,nativeUploadWallMs,nativeDownloadWallMs,native100mbBytes:nativeBinary?.size??0,native100mbSha256:nativeBinary?.sha256??null,runBranch:branch,repository:configuration?.targetRepository,token:"[not reported]"}));
+  screenshotCaptured:screenBytes>1000,screenshotPath:screenBytes>1000?screenshot:null,uiExceptions:sendErrors.length,mode,remoteEncryptionVerified,peerRestored,peerScreenshot,journeySteps,noOpEvidence,bulkEvidence,diagnostics:diagnosticEvidence,peerDiagnostics:peerDiagnosticEvidence,nativeUploadWallMs,nativeDownloadWallMs,native100mbBytes:nativeBinary?.size??0,native100mbSha256:nativeBinary?.sha256??null,runBranch:branch,repository:configuration?.targetRepository,token:"[not reported]"}));
 }
