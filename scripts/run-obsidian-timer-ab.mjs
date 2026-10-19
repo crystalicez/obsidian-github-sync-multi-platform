@@ -86,17 +86,17 @@ const runExpression = `(()=> {
   globalThis.__timerAb = state;
   for (const kind of ["browser", "node"]) {
     const controller = new AbortController();
-    const starts = [], delays = [];
+    const starts = [], wallStarts = [], delays = [];
     const timer = kind === "browser" ? window.setTimeout.bind(window) : require("node:timers").setTimeout;
     const scheduler = new Constructor({
       mutationSpacingMs: 1000, writeConcurrency: 2, maxAttempts: 1,
       sleep: ms => new Promise(resolve => timer(resolve, ms)),
       onDelay: e => delays.push(e.milliseconds),
     });
-    const job = { kind, started: 0, finished: false, errors: [], starts, delays, aborted: false, controller, scheduler };
+    const job = { kind, started: 0, finished: false, errors: [], starts, wallStarts, delays, aborted: false, controller, scheduler };
     jobs[kind] = job;
     const tasks = Array.from({ length: 10 }, (_, i) => scheduler.run("write", async () => {
-      starts.push(performance.now()); job.started++; return i;
+      starts.push(performance.now()); wallStarts.push(Date.now()); job.started++; return i;
     }, controller.signal));
     Promise.allSettled(tasks).then(results => {
       job.finished = true;
@@ -111,8 +111,10 @@ async function observe() {
     const map = {};
     for (const [kind, job] of Object.entries(s.jobs)) {
       const intervals = job.starts.slice(1).map((t, i) => Math.round(t - job.starts[i]));
+      const wallIntervals = job.wallStarts.slice(1).map((t, i) => t - job.wallStarts[i]);
       map[kind] = {
-        completed: job.started, finished: job.finished, errors: job.errors,
+        kind, completed: job.started, finished: job.finished, errors: job.errors,
+        minWallSpacingMs: wallIntervals.length ? Math.min(...wallIntervals) : null,
         minSpacingMs: intervals.length ? Math.min(...intervals) : null,
         maxSpacingMs: intervals.length ? Math.max(...intervals) : null,
         elapsedMs: job.starts.length ? Math.round(job.starts.at(-1) - job.starts[0]) : 0,
@@ -143,7 +145,8 @@ async function runPair(label, timeoutMs) {
   const info = { kind: "native-timer-ab", label, ...final };
   console.log(JSON.stringify(info));
   for (const v of Object.values(final.jobs)) {
-    if (v.completed >= 2) requireProof(v.minSpacingMs >= 1000, "GitHub write spacing dropped below policy for " + v.kind);
+    if (v.completed >= 2) requireProof(v.minWallSpacingMs >= 1000,
+      "Scheduler policy clock allowed writes sooner than 1,000 ms for " + v.kind);
     requireProof(v.errors.length === (v.finished && v.completed === 10 ? 0 : 10 - v.completed), "A/B cancellation did not account for remaining tasks");
   }
   await evaluate("(()=>{globalThis.__timerAb.active=false; return true})()");
