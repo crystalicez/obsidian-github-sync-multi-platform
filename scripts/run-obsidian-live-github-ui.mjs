@@ -349,8 +349,8 @@ try{
    if(journey){
     assertTrue(restored.peerMutated&&afterPull.kind==="present"&&afterPull.sha!==finalSha,
      "Real peer edit did not publish a competing GitHub commit");
-    const localEdit=await evaluate("(async()=>{const p=app.plugins.plugins["+JSON.stringify(id)+"];const file=app.vault.getAbstractFileByPath('UI-smoke.md');await app.vault.modify(file,'# Synthetic remote UI E2E\\n\\nMain conflicting revision.\\n');await p.v4Runtime.manualSync();return {lifecycle:p.v4Runtime.progressSnapshot.lifecycle};})()",240000);
-    assertTrue(localEdit.lifecycle==="success","Real Obsidian conflict reconciliation did not succeed");
+    const localEdit=await evaluate("(async()=>{const p=app.plugins.plugins["+JSON.stringify(id)+"];const file=app.vault.getAbstractFileByPath('UI-smoke.md');await app.vault.modify(file,'# Synthetic remote UI E2E\\n\\nMain conflicting revision.\\n');await p.v4Runtime.manualSync();const s=p.v4Runtime.progressSnapshot;return {lifecycle:s.lifecycle,error:s.errorMessage?.slice(0,240),failurePhase:s.failurePhase,apiFailures:s.diagnostics?.apiFailures};})()",240000);
+    assertTrue(localEdit.lifecycle==="success","Real Obsidian conflict reconciliation did not succeed: "+redact(JSON.stringify(localEdit)));
     const checked=await evaluate("(async()=>{const files=app.vault.getFiles();let local=false,peer=false;for(const file of files){if(!file.path.endsWith('.md'))continue;const text=await app.vault.read(file);if(text.includes('Main conflicting revision.'))local=true;if(text.includes('Peer conflicting revision.'))peer=true;}return {local,peer,count:files.length};})()",240000);
     assertTrue(checked.local&&checked.peer,"Local/remote conflicting text was not preserved in two Obsidian notes: "+JSON.stringify(checked));
     journeySteps.push("two-device simultaneous conflict retained both revisions");
