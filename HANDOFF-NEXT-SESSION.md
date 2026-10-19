@@ -4,6 +4,13 @@
 >
 > **Mandatory workflow rule:** Every AI session that makes a material change to code, tests, design decisions, branch/PR state, verification status, or next steps MUST update this file before ending or handing work off. GitHub is the source of truth.
 
+## 2026-10-19 isolated latest-remote UTF-8 transport telemetry hardening
+
+- **Integration base:** Detached worktree `.tmp/transport-telemetry-c15b01c-clean` from fetched remote audit SHA `c15b01cadd2f9c3834b11b7c094c2ba46517621d`. Primary worktree remains at `44fd253` with unrelated user WIP, including `tests/v4/github-transport.test.ts`, fully preserved. Do not blindly rebase the dirty primary checkout.
+- **Bug and minimal fix:** A GitHub mutation request body, often multi-MiB base64 JSON, was re-encoded with `TextEncoder.encode` solely to count telemetry request bytes, allocating a full-size redundant `Uint8Array`. The same was true for text-only responses. `utf8ByteLength` in `src/lib/bytes.ts` counts exact UTF-8 bytes without that allocation; `src/lib/github-api.ts` applies it to both metrics. GitHub transport, hashing, encryption, and sync protocol remain unchanged.
+- **RED/GREEN evidence:** `tests/v4/github-payload-accounting.test.ts` mocks the actual GitHub blob REST call with a 1 MiB payload and large multibyte response, validates Git blob SHA-1, wire-size and 600,000-byte response accounting, and fails if the telemetry tries to encode an oversized string. Original code failed this assertion; fixed code passed. UTF-8 ASCII, Thai, supplementary plane, and lone-surrogate cases also pass.
+- **Isolated worktree verification:** `pnpm install --frozen-lockfile`, `pnpm build`, `pnpm test:fast`, `pnpm test:resource`, `pnpm test:recovery`, `pnpm test:feasibility`, `pnpm test:soak` (6/6; capped at 100,000,000 bytes), `pnpm test:github-e2e:compile` (three bundles), `pnpm validate:metadata`, `pnpm validate:package` all exit 0 on top of `c15b01c`. No claim of memory-peak reduction, native speedup, mobile qualification, or GitHub E2E is made from those offline checks. The 1,000-note native timeout, P0 intermittent Sync/conflict, rate-limit safety, Android/iOS and independent review remain open. Maximum generated test file **100,000,000 decimal bytes**.
+
 ## 2026-10-19 real Obsidian 1,000-note timeout and HTTP in-flight visibility
 
 - **User instruction:** Continue work in poteto-mode. User explicitly closed the two Obsidian instances left from earlier testing. Treat those sessions as gone; new qualification must use **fresh isolated Obsidian.exe profiles and vaults** and close its own processes. This real repository's `HANDOFF-NEXT-SESSION.md` remains the canonical durable project memory. Keep all primary checkout WIP untouched; work in `.tmp/remote-shard-perf-fe47-clean`.

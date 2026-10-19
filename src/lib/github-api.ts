@@ -1,5 +1,5 @@
 import { requestUrl, type RequestUrlParam, type RequestUrlResponse } from "obsidian";
-import { fromBase64, toBase64, toHex, utf8ToBytes } from "./bytes";
+import { fromBase64, toBase64, toHex, utf8ByteLength, utf8ToBytes } from "./bytes";
 import type { GitHubCreateTreeEntry, GitHubGitCommit, GitHubGitRef } from "./github-git-types";
 import { assertSafeGitHubBranch, assertSafeGitHubRepositoryCoordinates } from "./github-config";
 import { V4RepositoryBootstrapRaceError } from "./v4/bootstrap-race";
@@ -131,7 +131,7 @@ export class GitHubClient {
   private async request(options: RequestUrlParam, transientBytes = 0): Promise<RequestUrlResponse> {
     const method = (options.method ?? "GET").toUpperCase();
     const kind = method === "GET" || method === "HEAD" ? "read" : "write";
-    const requestBytes = typeof options.body === "string" ? new TextEncoder().encode(options.body).byteLength : 0;
+    const requestBytes = typeof options.body === "string" ? utf8ByteLength(options.body) : 0;
     return this.requestScheduler.run(kind, async () => {
       this.transportMetrics.recordRequest({ mutation: kind === "write", requestBytes, transientBytes });
       const started = performance.now();
@@ -148,7 +148,7 @@ export class GitHubClient {
       } finally {
         finishRequest?.();
       }
-      const responseBytes = response.arrayBuffer?.byteLength ?? (response.text ? new TextEncoder().encode(response.text).byteLength : 0);
+      const responseBytes = response.arrayBuffer?.byteLength ?? (response.text ? utf8ByteLength(response.text) : 0);
       this.transportMetrics.recordResponse(response.status, responseBytes);
       this.runDiagnostics?.recordRequest({
         method, requestBytes, responseBytes, elapsedMs: performance.now() - started, failed: response.status >= 400,

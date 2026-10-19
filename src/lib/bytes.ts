@@ -43,6 +43,16 @@ export function utf8ToBytes(value: string): Uint8Array {
   return textEncoder.encode(value);
 }
 
+export function utf8ByteLength(value: string): number {
+  if (!/[^\x00-\x7F]/u.test(value)) return value.length;
+  let bytes = 0;
+  for (const char of value) {
+    const codePoint = char.codePointAt(0)!;
+    bytes += codePoint < 0x80 ? 1 : codePoint < 0x800 ? 2 : codePoint < 0x10000 ? 3 : 4;
+  }
+  return bytes;
+}
+
 export function bytesToUtf8(value: ArrayBuffer | Uint8Array): string {
   return textDecoder.decode(asUint8Array(value));
 }
