@@ -133,6 +133,7 @@ test("Sync Center renders request throughput, crypto timings, API latency and sa
       uploadBytes: 2_097_152, downloadBytes: 1_048_576,
       uploadRequestMs: 1_000, downloadRequestMs: 2_000,
       apiRequests: 4, apiFailures: 1, apiLatencyMs: 1_000, apiMaxLatencyMs: 500,
+      inFlightApiRequests: 2, oldestInFlightApiMs: 5_400,
       hashingMs: 125, encryptionMs: 250, decryptionMs: 500,
       peakRendererRssBytes: 256 * 1_048_576,
     },
@@ -141,6 +142,7 @@ test("Sync Center renders request throughput, crypto timings, API latency and sa
   assert.match(text, /Upload API · 2\.00 MiB.*2\.00 MiB\/s/su);
   assert.match(text, /Download API · 1\.00 MiB.*0\.50 MiB\/s/su);
   assert.match(text, /GitHub API · 4 requests.*250 ms avg · 500 ms max/su);
+  assert.match(text, /GitHub in flight.*2 · oldest 5\.4s/su);
   assert.match(text, /Hashing \(measured\).*0\.1s.*Encryption \(measured\).*0\.3s.*Decryption \(measured\).*0\.5s/su);
   assert.match(text, /Peak renderer RAM.*256\.00 MiB/su);
   assert.match(text, /not your full internet speed/u);

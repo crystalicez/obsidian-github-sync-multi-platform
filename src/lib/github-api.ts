@@ -135,6 +135,7 @@ export class GitHubClient {
     return this.requestScheduler.run(kind, async () => {
       this.transportMetrics.recordRequest({ mutation: kind === "write", requestBytes, transientBytes });
       const started = performance.now();
+      const finishRequest = this.runDiagnostics?.beginRequest();
       let response: RequestUrlResponse;
       try {
         response = await requestUrl(options);
@@ -144,6 +145,8 @@ export class GitHubClient {
           method, requestBytes, responseBytes: 0, elapsedMs: performance.now() - started, failed: true,
         });
         throw error;
+      } finally {
+        finishRequest?.();
       }
       const responseBytes = response.arrayBuffer?.byteLength ?? (response.text ? new TextEncoder().encode(response.text).byteLength : 0);
       this.transportMetrics.recordResponse(response.status, responseBytes);

@@ -121,7 +121,7 @@ async function captureSyncedCenter({requireFileWork=false}={}){
     title:document.querySelector(".github-sync-center__header h3")?.textContent,
     lifecycle:app.plugins.plugins[${JSON.stringify(id)}].v4Runtime.progressSnapshot.lifecycle,
     metrics:app.plugins.plugins[${JSON.stringify(id)}].v4Runtime.progressSnapshot.diagnostics,
-    diagnosticRows:el.innerText.includes("Upload API")&&el.innerText.includes("GitHub API")&&el.innerText.includes("Peak renderer RAM"),
+    diagnosticRows:el.innerText.includes("Upload API")&&el.innerText.includes("GitHub API")&&el.innerText.includes("GitHub in flight")&&el.innerText.includes("Peak renderer RAM"),
     syncAction:!![...el.querySelectorAll("button")].find(b=>b.textContent.trim()==="Sync now"),
     leakedToken:el.innerText.includes(app.plugins.plugins["encrypted-github-sync-multi-platform"].settings.githubToken),
     leakedPassphrase:!!app.plugins.plugins["encrypted-github-sync-multi-platform"].settings.encryptionPassphrase&&el.innerText.includes(app.plugins.plugins["encrypted-github-sync-multi-platform"].settings.encryptionPassphrase)};
@@ -132,7 +132,8 @@ async function captureSyncedCenter({requireFileWork=false}={}){
   console.log(JSON.stringify({kind:"native-ui-metrics",metrics:d??null,rowsVisible:dims.diagnosticRows}));
   assertTrue(dims.diagnosticRows&&d?.apiRequests>0&&d?.uploadBytes>0&&d?.downloadBytes>0,
    "Live Obsidian UI did not render real GitHub throughput and API request metrics");
-  assertTrue(d.apiLatencyMs>0,"Live Obsidian did not record GitHub request timing");
+  assertTrue(d.apiLatencyMs>0&&d.inFlightApiRequests===0&&d.oldestInFlightApiMs===0,
+   "Live Obsidian API request metrics did not settle after completed Sync");
   if(requireFileWork)assertTrue(d.hashingMs>0&&d.encryptionMs>0,
    "Native 100 MB Obsidian upload did not record real hashing and encryption work");
   assertTrue(d.peakRendererRssBytes>0,"Live Windows Obsidian renderer RSS was not sampled");

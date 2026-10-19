@@ -195,6 +195,7 @@ export class V4SyncCenterView extends ItemView {
         [`Upload API · ${formatV4Size(d.uploadBytes)}`, `${formatV4Rate(d.uploadBytes, d.uploadRequestMs)} · ${formatV4Duration(d.uploadRequestMs)}`, false],
         [`Download API · ${formatV4Size(d.downloadBytes)}`, `${formatV4Rate(d.downloadBytes, d.downloadRequestMs)} · ${formatV4Duration(d.downloadRequestMs)}`, false],
         [`GitHub API · ${d.apiRequests} requests`, d.apiRequests ? `${(d.apiLatencyMs / d.apiRequests).toFixed(0)} ms avg · ${d.apiMaxLatencyMs.toFixed(0)} ms max` : "—", false],
+        ["GitHub in flight", d.inFlightApiRequests > 0 ? `${d.inFlightApiRequests} · oldest ${formatV4Duration(d.oldestInFlightApiMs)}` : "0", false],
         ["Hashing (measured)", formatV4Duration(d.hashingMs), false],
         ["Encryption (measured)", formatV4Duration(d.encryptionMs), false],
         ["Decryption (measured)", formatV4Duration(d.decryptionMs), false],
@@ -206,7 +207,7 @@ export class V4SyncCenterView extends ItemView {
       timingsElement.empty()
       for (const [label, duration, total] of timingRows) this.renderTiming(timingsElement, label, duration, total)
       if (d) timingsElement.createEl("p", {
-        text: "GitHub API payload rates use transfer bytes per request time, not your full internet speed. API latency excludes queue/retry waits; measured work can overlap phases. RAM is sampled renderer RSS, not total Obsidian memory.",
+        text: "GitHub API payload rates use transfer bytes per request time, not your full internet speed. API latency excludes queue/retry waits. GitHub in-flight counts active HTTP calls, not queued work. Measured work can overlap phases. RAM is sampled renderer RSS, not total Obsidian memory.",
         cls: "github-sync-center__muted",
       })
       this.progressTimingsSignature = timingsSignature

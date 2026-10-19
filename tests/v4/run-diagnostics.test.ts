@@ -40,10 +40,30 @@ test("hashing, encryption and decryption timings measure only their own work, in
   assert.deepEqual(recorder.snapshot, {
     uploadBytes: 0, downloadBytes: 0, uploadRequestMs: 0, downloadRequestMs: 0,
     apiRequests: 0, apiFailures: 0, apiLatencyMs: 0, apiMaxLatencyMs: 0,
+    inFlightApiRequests: 0, oldestInFlightApiMs: 0,
     hashingMs: 7, encryptionMs: 12, decryptionMs: 9,
   })
   assert.equal(formatV4Rate(0, 1_000), "—")
   assert.equal(formatV4Rate(1_048_576, 0), "—")
+})
+
+test("in-flight GitHub request ages update without waiting for a response", () => {
+  let clock = 20
+  const recorder = new V4RunDiagnostics(() => clock, () => undefined)
+  const finishA = recorder.beginRequest()
+  clock = 50
+  const finishB = recorder.beginRequest()
+  clock = 820
+  assert.equal(recorder.snapshot.inFlightApiRequests, 2)
+  assert.equal(recorder.snapshot.oldestInFlightApiMs, 800)
+  finishA()
+  assert.equal(recorder.snapshot.inFlightApiRequests, 1)
+  assert.equal(recorder.snapshot.oldestInFlightApiMs, 770)
+  finishB()
+  assert.equal(recorder.snapshot.inFlightApiRequests, 0)
+  assert.equal(recorder.snapshot.oldestInFlightApiMs, 0)
+  finishB()
+  assert.equal(recorder.snapshot.inFlightApiRequests, 0)
 })
 
 test("peak RSS is sampled without crashing when RAM probes are unavailable", () => {

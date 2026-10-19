@@ -9,6 +9,8 @@ export interface V4RunDiagnosticsSnapshot {
   apiFailures: number
   apiLatencyMs: number
   apiMaxLatencyMs: number
+  inFlightApiRequests: number
+  oldestInFlightApiMs: number
   hashingMs: number
   encryptionMs: number
   decryptionMs: number
@@ -16,6 +18,8 @@ export interface V4RunDiagnosticsSnapshot {
 }
 
 export class V4RunDiagnostics {
+  private readonly inFlight = new Map<number, number>()
+  private nextRequestId = 0
   private readonly data: V4RunDiagnosticsSnapshot = {
     uploadBytes: 0,
     downloadBytes: 0,
@@ -25,6 +29,8 @@ export class V4RunDiagnostics {
     apiFailures: 0,
     apiLatencyMs: 0,
     apiMaxLatencyMs: 0,
+    inFlightApiRequests: 0,
+    oldestInFlightApiMs: 0,
     hashingMs: 0,
     encryptionMs: 0,
     decryptionMs: 0,
@@ -49,6 +55,12 @@ export class V4RunDiagnostics {
     } catch {
       // Memory probes are optional and must not interrupt a sync.
     }
+  }
+
+  beginRequest(): () => void {
+    const id = ++this.nextRequestId
+    this.inFlight.set(id, this.now())
+    return () => { this.inFlight.delete(id) }
   }
 
   recordRequest(input: { method: string; requestBytes: number; responseBytes: number; elapsedMs: number; failed: boolean }): void {
@@ -86,7 +98,11 @@ export class V4RunDiagnostics {
   }
 
   get snapshot(): V4RunDiagnosticsSnapshot {
-    return { ...this.data }
+    let oldestInFlightApiMs = 0
+    if (this.inFlight.size > 0) {
+      oldestInFlightApiMs = Math.max(0, this.now() - Math.min(...this.inFlight.values()))
+    }
+    return { ...this.data, inFlightApiRequests: this.inFlight.size, oldestInFlightApiMs }
   }
 }
 
