@@ -15,6 +15,9 @@ export interface V4RequestSchedulerSnapshot {
   activeWrites: number
   cooldownRemainingMs: number
   mutationPacingRemainingMs: number
+  activePolicySleeps: number
+  oldestPolicySleepOverdueMs: number
+  maxPolicySleepOvershootMs: number
 }
 
 export interface V4RequestSchedulerOptions extends Partial<V4TransportPolicy> {
@@ -44,6 +47,9 @@ export class V4RequestScheduler {
   private cooldownUntil = 0
   private lastMutationStartedAt: number | undefined
   private mutationStartGate: Promise<void> = Promise.resolve()
+  private readonly policySleepDeadlines = new Map<number, number>()
+  private nextPolicySleepId = 0
+  private maxPolicySleepOvershootMs = 0
 
   constructor(options: V4RequestSchedulerOptions = {}) {
     this.policy = resolveV4TransportPolicy(options)
@@ -59,6 +65,10 @@ export class V4RequestScheduler {
 
   get snapshot(): V4RequestSchedulerSnapshot {
     const now = this.now()
+    let oldestPolicySleepOverdueMs = 0
+    for (const deadline of this.policySleepDeadlines.values()) {
+      oldestPolicySleepOverdueMs = Math.max(oldestPolicySleepOverdueMs, now - deadline)
+    }
     return {
       queuedReads: this.queues.read.length,
       queuedWrites: this.queues.write.length,
@@ -67,6 +77,9 @@ export class V4RequestScheduler {
       cooldownRemainingMs: Math.max(0, this.cooldownUntil - now),
       mutationPacingRemainingMs: this.lastMutationStartedAt === undefined
         ? 0 : Math.max(0, this.lastMutationStartedAt + this.policy.mutationSpacingMs - now),
+      activePolicySleeps: this.policySleepDeadlines.size,
+      oldestPolicySleepOverdueMs,
+      maxPolicySleepOvershootMs: this.maxPolicySleepOvershootMs,
     }
   }
 
@@ -123,7 +136,15 @@ export class V4RequestScheduler {
     const milliseconds = Math.max(cooldownDelay, pacingDelay)
     if (milliseconds > 0) {
       this.onDelay?.({ reason: cooldownDelay >= pacingDelay ? "cooldown" : "pacing", milliseconds })
-      await sleepV4Abortable(milliseconds, signal, this.sleep)
+      const deadline = this.now() + milliseconds
+      const sleepId = ++this.nextPolicySleepId
+      this.policySleepDeadlines.set(sleepId, deadline)
+      try {
+        await sleepV4Abortable(milliseconds, signal, this.sleep)
+        this.maxPolicySleepOvershootMs = Math.max(this.maxPolicySleepOvershootMs, this.now() - deadline)
+      } finally {
+        this.policySleepDeadlines.delete(sleepId)
+      }
     }
     throwIfV4Aborted(signal)
     if (kind === "write") this.lastMutationStartedAt = this.now()
