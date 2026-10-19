@@ -202,6 +202,18 @@ export class V4SyncCenterView extends ItemView {
         ["Peak renderer RAM", d.peakRendererRssBytes === undefined ? "N/A" : formatV4Size(d.peakRendererRssBytes), false],
       )
     }
+    if (d?.publicationStage && snapshot.lifecycle === "active") {
+      const stageLabel = {
+        "preparing-metadata": "Preparing metadata",
+        "uploading-metadata": "Uploading metadata",
+        "creating-commit": "Creating Git commit",
+        "publishing": "Publishing Git ref",
+      }[d.publicationStage]
+      const count = d.publicationStage === "uploading-metadata"
+        ? ` ${d.metadataUploaded ?? 0}/${d.metadataTotal ?? "?"} objects`
+        : ""
+      timingRows.push(["Remote publication", `${stageLabel}${count} · ${formatV4Duration(d.publicationStageMs ?? 0)}`, false])
+    }
     const timingsSignature = JSON.stringify(timingRows)
     if (timingsSignature !== this.progressTimingsSignature) {
       timingsElement.empty()

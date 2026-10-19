@@ -149,6 +149,28 @@ test("Sync Center renders request throughput, crypto timings, API latency and sa
   await view.onClose();
 });
 
+test("Sync Center exposes live metadata publication progress after logical pushes reach 100%", async () => {
+  const source = new FakeProgressSource();
+  const plugin = createSyncCenterPluginFixture(source, () => undefined);
+  const view = new V4SyncCenterView(new WorkspaceLeaf(plugin.app), plugin as never);
+  await view.onOpen();
+  const diagnostics = {
+    uploadBytes: 2048, downloadBytes: 0, uploadRequestMs: 2000, downloadRequestMs: 0,
+    apiRequests: 12, apiFailures: 0, apiLatencyMs: 2000, apiMaxLatencyMs: 500,
+    inFlightApiRequests: 1, oldestInFlightApiMs: 100, hashingMs: 4,
+    encryptionMs: 8, decryptionMs: 0, publicationStage: "uploading-metadata" as const,
+    publicationStageMs: 5200, metadataUploaded: 12, metadataTotal: 256,
+  };
+  source.publish({ ...uploadingFixture, currentPath: undefined, push: { completed: 1000, total: 1000 }, diagnostics });
+  assert.match(view.contentEl.flattenText(), /Push 1000\/1000.*Remote publication.*Uploading metadata 12\/256 objects · 5\.2s/su);
+  source.publish({ ...uploadingFixture, currentPath: undefined, push: { completed: 1000, total: 1000 },
+    diagnostics: { ...diagnostics, publicationStage: "creating-commit", publicationStageMs: 2300 } });
+  assert.match(view.contentEl.flattenText(), /Remote publication.*Creating Git commit · 2\.3s/su);
+  source.publish({ ...uploadingFixture, lifecycle: "success", diagnostics });
+  assert.doesNotMatch(view.contentEl.flattenText(), /Remote publication/u);
+  await view.onClose();
+});
+
 test("Sync Center progress card updates in isolation and unsubscribes on close", async () => {
   const source = new FakeProgressSource();
   let historyLoadCount = 0;
