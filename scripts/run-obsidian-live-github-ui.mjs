@@ -26,6 +26,7 @@ const dryRun=opts.includes("--preflight-only");
 const mode=parseLiveUiMode(option("mode",undefined));
 const verifyPeer=opts.includes("--verify-peer");
 const journey=opts.includes("--journey");
+const probeLifecycle=opts.includes("--probe-lifecycle");
 const native100mb=opts.includes("--native-100mb");
 const nativeNotes=opts.includes("--native-1000-notes")?1000:Number(option("native-notes","0"));
 assert.ok(Number.isSafeInteger(nativeNotes)&&nativeNotes>=0&&nativeNotes<=1000,"Native note count must be an integer from 0 to 1,000");
@@ -87,6 +88,7 @@ let nativeUploadWallMs=null;
 let nativeDownloadWallMs=null;
 let bulkEvidence=null;
 let hiddenPreconditionEvidence=null;
+let lifecycleProbeEvidence=null;
 let diagnosticEvidence=null;
 let peerDiagnosticEvidence=null;
 const noOpEvidence=[];
@@ -208,6 +210,8 @@ try{
   })()`),45000,"isolated Obsidian vault API");
   assertTrue(identity.base.toLowerCase()===vault.toLowerCase()&&identity.name===path.basename(vault),
    "Refusing live GitHub credentials: Obsidian vault is not the new synthetic vault");
+  await waitUntil(()=>evaluate("(()=>Boolean(app?.plugins?.isEnabled && app.plugins?.enabledPlugins && app.plugins?.plugins && app.plugins?.manifests))()"),
+   45000,"isolated Obsidian plugin manager initialized");
   const loaded=await evaluate(`(async()=>{
    const pid=${JSON.stringify(id)};
    if(!app.plugins.isEnabled())await app.plugins.setEnable(true);
@@ -433,6 +437,36 @@ try{
    peerRestored=true;
    peerScreenshot=restored.peerScreenshot;
   }
+  if(probeLifecycle){
+   // Only a synthetic vault: stub actual network before dispatching lifecycle events.
+   const observed=await evaluate(`(async()=>{
+    const p=app.plugins.plugins[${JSON.stringify(id)}];
+    if(!p?.lifecycleWake||!p.v4Runtime?.resumeSync)throw Error("Shared lifecycle controller absent");
+    const wake=p.lifecycleWake;
+    const previous={enabled:p.settings.syncEnabled,local:p.settings.syncOnLocalChange,
+     resume:p.v4Runtime.resumeSync,lastAttempt:wake.lastAttemptAt};
+    let calls=0;
+    try{
+     p.settings.syncEnabled=true;
+     p.settings.syncOnLocalChange=true;
+     wake.lastAttemptAt=null;
+     p.v4Runtime.resumeSync=async()=>{calls++;return {status:"completed"}};
+     window.dispatchEvent(new Event("offline"));
+     window.dispatchEvent(new Event("online"));
+     await new Promise(resolve=>setTimeout(resolve,120));
+     window.dispatchEvent(new Event("online"));
+     await new Promise(resolve=>setTimeout(resolve,60));
+     return {calls,visibility:document.visibilityState};
+    }finally{
+     p.v4Runtime.resumeSync=previous.resume;
+     p.settings.syncEnabled=previous.enabled;
+     p.settings.syncOnLocalChange=previous.local;
+     wake.lastAttemptAt=previous.lastAttempt;
+    }
+   })()`,15000);
+   assertTrue(observed?.calls===1,"Real Obsidian lifecycle online wake was not coalesced exactly once");
+   lifecycleProbeEvidence=observed;
+  }
   passed=true;
  }
 }catch(error){
@@ -459,5 +493,5 @@ try{
   try{await cleanupGeneratedUiRun(runRoot,{repoRoot:root});}catch(error){console.error("WARNING: isolated test vault cleanup incomplete ("+String(error?.code||"unknown").slice(0,30)+")");process.exitCode=1;}
  }
  console.log(JSON.stringify({status:passed&&!process.exitCode?"PASS":"FAIL",cleanup:cleanupState,remoteHeadChanged:Boolean(initialSha&&finalSha&&initialSha!==finalSha),
-  screenshotCaptured:screenBytes>1000,screenshotPath:screenBytes>1000?screenshot:null,uiExceptions:sendErrors.length,mode,remoteEncryptionVerified,peerRestored,peerScreenshot,journeySteps,noOpEvidence,bulkEvidence,diagnostics:diagnosticEvidence,peerDiagnostics:peerDiagnosticEvidence,nativeUploadWallMs,nativeDownloadWallMs,native100mbBytes:nativeBinary?.size??0,native100mbSha256:nativeBinary?.sha256??null,runBranch:branch,repository:configuration?.targetRepository,token:"[not reported]"}));
+  screenshotCaptured:screenBytes>1000,screenshotPath:screenBytes>1000?screenshot:null,uiExceptions:sendErrors.length,mode,remoteEncryptionVerified,peerRestored,peerScreenshot,journeySteps,noOpEvidence,bulkEvidence,lifecycleProbeEvidence,diagnostics:diagnosticEvidence,peerDiagnostics:peerDiagnosticEvidence,nativeUploadWallMs,nativeDownloadWallMs,native100mbBytes:nativeBinary?.size??0,native100mbSha256:nativeBinary?.sha256??null,runBranch:branch,repository:configuration?.targetRepository,token:"[not reported]"}));
 }
