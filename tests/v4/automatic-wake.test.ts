@@ -136,3 +136,64 @@ test("auto reconciliation requires a configured sync and an opted-in automatic t
   assert.equal(shouldRunV4AutomaticWake({ ...configured, syncEnabled: false }), false);
   assert.equal(shouldRunV4AutomaticWake({ ...configured, githubToken: "" }), false);
 });
+
+test("cooldown wake is deferred and delivered after the 30-second safety interval", async () => {
+  let now = 60_000;
+  let runs = 0;
+  let deferred!: () => void;
+  let delay = 0;
+  let cancelled = 0;
+  const wake = new V4AutomaticWake({
+    desktop: false, now: () => now, enabled: () => true,
+    isVisible: () => true, isOnline: () => true,
+    run: async () => { runs++; },
+    scheduleRetry: (callback, ms) => {
+      deferred = callback;
+      delay = ms;
+      return () => { cancelled++; };
+    },
+  });
+  wake.onNetworkChanged(false);
+  wake.onNetworkChanged(true);
+  await settle();
+  assert.equal(runs, 1);
+  now += 2_000;
+  wake.onNetworkChanged(false);
+  wake.onNetworkChanged(true);
+  await settle();
+  assert.equal(runs, 1);
+  assert.equal(delay, 28_000);
+  now += 28_000;
+  deferred();
+  await settle();
+  assert.equal(runs, 2);
+  assert.equal(cancelled, 0);
+  wake.dispose();
+});
+
+test("unload cancels a deferred wake without starting any more work", async () => {
+  let now = 1_000;
+  let runs = 0;
+  let scheduled!: () => void;
+  let cancellationCount = 0;
+  const wake = new V4AutomaticWake({
+    desktop: true, now: () => now, enabled: () => true,
+    isVisible: () => true, isOnline: () => true,
+    run: async () => { runs++; },
+    scheduleRetry: callback => { scheduled = callback; return () => { cancellationCount++; }; },
+  });
+  wake.onNetworkChanged(false);
+  wake.onNetworkChanged(true);
+  await settle();
+  now += 1_000;
+  wake.onNetworkChanged(false);
+  wake.onNetworkChanged(true);
+  await settle();
+  assert.equal(runs, 1);
+  wake.dispose();
+  assert.equal(cancellationCount, 1);
+  now += 30_000;
+  scheduled();
+  await settle();
+  assert.equal(runs, 1);
+});

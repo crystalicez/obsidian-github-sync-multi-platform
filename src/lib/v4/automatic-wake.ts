@@ -1,4 +1,5 @@
 import { hasGitHubSyncConfig, type SyncPolicySettings } from "../sync-policy"
+import { startV4PlatformTimeout } from "./platform-interval"
 
 export function shouldRunV4AutomaticWake(settings: SyncPolicySettings & { syncOnLocalChange?: boolean }): boolean {
   return Boolean(settings.syncEnabled && hasGitHubSyncConfig(settings)
@@ -18,6 +19,7 @@ export class V4AutomaticWake {
   private pending = false
   private running = false
   private disposed = false
+  private retryCancel: (() => void) | null = null
 
   constructor(private readonly options: {
     desktop: boolean
@@ -27,6 +29,7 @@ export class V4AutomaticWake {
     isOnline: () => boolean
     run: () => Promise<unknown>
     onError?: (error: unknown) => void
+    scheduleRetry?: (callback: () => void, delay: number) => (() => void)
   }) {
     const now = options.now()
     this.hiddenSince = options.isVisible() ? null : now
@@ -74,6 +77,12 @@ export class V4AutomaticWake {
   dispose(): void {
     this.disposed = true
     this.pending = false
+    this.clearRetry()
+  }
+
+  private clearRetry(): void {
+    this.retryCancel?.()
+    this.retryCancel = null
   }
 
   private request(): void {
@@ -85,11 +94,24 @@ export class V4AutomaticWake {
     if (this.disposed || !this.pending || this.running) return
     if (!this.options.enabled()) {
       this.pending = false
+      this.clearRetry()
       return
     }
     if (!this.options.isOnline() || (!this.options.desktop && !this.options.isVisible())) return
     const now = this.options.now()
-    if (this.lastAttemptAt !== null && now - this.lastAttemptAt < 30_000) return
+    if (this.lastAttemptAt !== null) {
+      const elapsed = now - this.lastAttemptAt
+      if (elapsed >= 0 && elapsed < 30_000) {
+        if (!this.retryCancel) {
+          const callback = () => { this.retryCancel = null; this.deliver() }
+          this.retryCancel = this.options.scheduleRetry?.(callback, 30_000 - elapsed)
+            ?? startV4PlatformTimeout(this.options.desktop, callback, 30_000 - elapsed)
+        }
+        return
+      }
+      // Wall clock corrections must not suppress reconciliation for hours.
+    }
+    this.clearRetry()
     this.pending = false
     this.running = true
     this.lastAttemptAt = now
