@@ -62,6 +62,7 @@ function createMainProgressFixture() {
   plugin.persistData = async () => undefined;
   plugin.initGitHubClient = () => undefined;
   plugin.registerScheduledSync = () => undefined;
+  plugin.registerLifecycleWake = () => undefined;
   plugin.updateRibbonIcon = () => undefined;
   plugin.addSettingTab = () => undefined;
   plugin.registerView = () => undefined;

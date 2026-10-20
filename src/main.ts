@@ -6,6 +6,8 @@ import { normalizeScheduledSyncIntervalSeconds, shouldRunScheduledSync, shouldRu
 import { migrateV4Secrets, sanitizeV4SettingsForPersistence, scrubV4SecretIds, storeV4Secrets, supersededV4SecretIds } from "./lib/v4/secrets";
 import { V4PluginRuntime } from "./lib/v4/runtime";
 import { selectV4GitHubSchedulerSleep } from "./lib/v4/desktop-transport-timer";
+import { V4AutomaticWake, shouldRunV4AutomaticWake } from "./lib/v4/automatic-wake";
+import { startV4PlatformInterval } from "./lib/v4/platform-interval";
 import { countV4ScopedPaths } from "./lib/v4/scope";
 import { compileV4IgnorePathRegex } from "./lib/v4/ignore";
 import { assertPluginSettingsRuntimeSafe } from "./lib/plugin-settings-validation";
@@ -28,7 +30,9 @@ export default class FastSync extends Plugin {
   saveNoticeTimeout: number | null = null
   isWatchEnabled: boolean = true
   ignoredFiles: Set<string> = new Set()
-  scheduledSyncTimer: number | null = null
+  private scheduledSyncCancel: (() => void) | null = null
+  private lifecycleHeartbeatCancel: (() => void) | null = null
+  private lifecycleWake: V4AutomaticWake | null = null
   startupSyncTimeout: number | null = null
   secretsMigrated: boolean = false
   private pendingMigratedSecretIds: string[] = []
@@ -78,6 +82,7 @@ export default class FastSync extends Plugin {
     this.v4Runtime = this.createV4Runtime()
     this.register(this.v4Runtime.subscribeProgress(() => this.updateStatusBar()))
     this.registerView(V4_SYNC_CENTER_VIEW, leaf => new V4SyncCenterView(leaf, this))
+    this.registerLifecycleWake()
     this.registerScheduledSync()
 
     // Create Ribbon Icons
@@ -179,8 +184,11 @@ export default class FastSync extends Plugin {
 
   onunload() {
     this.unloaded = true
-    if (this.scheduledSyncTimer) window.clearInterval(this.scheduledSyncTimer);
-    this.scheduledSyncTimer = null;
+    this.scheduledSyncCancel?.()
+    this.scheduledSyncCancel = null
+    this.lifecycleWake?.dispose()
+    this.lifecycleHeartbeatCancel?.()
+    this.lifecycleHeartbeatCancel = null
     if (this.startupSyncTimeout !== null) window.clearTimeout(this.startupSyncTimeout);
     this.startupSyncTimeout = null;
     this.v4Runtime?.dispose()
@@ -190,17 +198,50 @@ export default class FastSync extends Plugin {
     return new V4PluginRuntime(this)
   }
 
+  private registerLifecycleWake() {
+    const wake = new V4AutomaticWake({
+      desktop: Platform.isDesktopApp,
+      now: () => Date.now(),
+      enabled: () => !this.unloaded && shouldRunV4AutomaticWake(this.settings),
+      isVisible: () => !document.hidden,
+      isOnline: () => navigator.onLine !== false,
+      run: () => this.v4Runtime.resumeSync(),
+      onError: () => console.warn("GitHub Sync: resume reconciliation failed."),
+    })
+    this.lifecycleWake = wake
+    this.registerDomEvent(document, "visibilitychange", () => wake.onVisibilityChanged())
+    this.registerDomEvent(window, "pageshow", () => wake.onForeground())
+    this.registerDomEvent(window, "focus", () => wake.onForeground())
+    this.registerDomEvent(window, "offline", () => wake.onNetworkChanged(false))
+    this.registerDomEvent(window, "online", () => wake.onNetworkChanged(true))
+    this.register(() => {
+      wake.dispose()
+      this.lifecycleHeartbeatCancel?.()
+      this.lifecycleHeartbeatCancel = null
+    })
+  }
+
   registerScheduledSync() {
     if (this.unloaded) return
-    if (this.scheduledSyncTimer) window.clearInterval(this.scheduledSyncTimer);
-    this.scheduledSyncTimer = null;
-    if (!shouldRunScheduledSync(this.settings)) return;
-    const seconds = normalizeScheduledSyncIntervalSeconds(this.settings.scheduledSyncIntervalSeconds);
+    this.scheduledSyncCancel?.()
+    this.scheduledSyncCancel = null
+    this.lifecycleHeartbeatCancel?.()
+    this.lifecycleHeartbeatCancel = null
+    // One background Node interval is enough: Scheduled Sync owns the wake
+    // when enabled; an opt-in local-change-only setup needs a drift heartbeat.
+    if (Platform.isDesktopApp && shouldRunV4AutomaticWake(this.settings)
+      && !shouldRunScheduledSync(this.settings)) {
+      this.lifecycleHeartbeatCancel = startV4PlatformInterval(true, () => this.lifecycleWake?.onHeartbeat(), 30_000)
+    }
+    if (!shouldRunScheduledSync(this.settings)) return
+    const seconds = normalizeScheduledSyncIntervalSeconds(this.settings.scheduledSyncIntervalSeconds)
     const generation = this.v4Runtime.settingsGeneration
-    this.scheduledSyncTimer = window.setInterval(() => {
-      if (this.v4Runtime.settingsGeneration !== generation) return
+    this.scheduledSyncCancel = startV4PlatformInterval(Platform.isDesktopApp, () => {
+      if (this.unloaded || this.v4Runtime.settingsGeneration !== generation) return
+      if (!Platform.isDesktopApp && document.hidden) return
+      if (navigator.onLine === false) return
       void this.v4Runtime.scheduledSync()
-    }, seconds * 1000);
+    }, seconds * 1000)
   }
 
   updateRibbonIcon(status: boolean) {

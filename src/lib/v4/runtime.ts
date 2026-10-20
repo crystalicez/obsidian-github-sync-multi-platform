@@ -265,6 +265,24 @@ export class V4PluginRuntime {
   manualSync(): Promise<unknown> { return this.runWhileSettingsStable({ operation: "normal", trigger: "manual" }) }
   startupSync(): Promise<unknown> { return this.runWhileSettingsStable({ operation: "normal", trigger: "startup" }) }
   scheduledSync(): Promise<unknown> { return this.runWhileSettingsStable({ operation: "normal", trigger: "scheduled" }) }
+
+  /** Reuse the coordinator and its durable journal after the app resumes.
+   * Never overlap a running operation or bypass a settings transition.
+   */
+  async resumeSync(): Promise<unknown> {
+    if (this.disposed || this.settingsTransitionActive) return { status: "skipped", changedFiles: 0 }
+    const generation = this.settingsGeneration
+    try {
+      await this.coordinator.whenIdle()
+    } catch {
+      // The interrupted operation already reported its failure. Reconcile
+      // against the actual GitHub HEAD and persisted recovery on a new run.
+    }
+    if (this.disposed || this.settingsTransitionActive || this.settingsGeneration !== generation) {
+      return { status: "skipped", changedFiles: 0 }
+    }
+    return this.scheduledSync()
+  }
   forcePush(allowThresholdOverride = false): Promise<unknown> { return this.runWhileSettingsStable({ operation: "forcePush", trigger: "forcePush", allowThresholdOverride }) }
   forcePull(allowThresholdOverride = false): Promise<unknown> { return this.runWhileSettingsStable({ operation: "forcePull", trigger: "forcePull", allowThresholdOverride }) }
 

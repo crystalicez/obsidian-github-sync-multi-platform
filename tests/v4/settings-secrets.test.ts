@@ -1752,7 +1752,7 @@ test("startup and scheduled callbacks are bound to the settings generation that 
 
   assert.match(
     mainSource,
-    /registerScheduledSync\(\)[\s\S]*?const generation\s*=\s*this\.v4Runtime\.settingsGeneration[\s\S]*?setInterval\([\s\S]*?settingsGeneration\s*!==\s*generation[\s\S]*?return[\s\S]*?scheduledSync/u,
+    /registerScheduledSync\(\)[\s\S]*?const generation\s*=\s*this\.v4Runtime\.settingsGeneration[\s\S]*?startV4PlatformInterval\([\s\S]*?settingsGeneration\s*!==\s*generation[\s\S]*?return[\s\S]*?scheduledSync/u,
   );
   assert.match(
     mainSource,
