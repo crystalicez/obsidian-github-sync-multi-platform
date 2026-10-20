@@ -16,7 +16,7 @@ import {parseLiveUiMode,assertEncryptedRemoteTree} from "./obsidian-live-ui-mode
 import {cleanupGeneratedUiRun} from "./obsidian-live-ui-cleanup.mjs";
 import {restoreEncryptedToSecondObsidian} from "./obsidian-live-ui-peer.mjs";
 import {watchNativeBulkSync} from "./native-bulk-watch.mjs";
-import {parseNativeHiddenIdleMs,minimizeOwnedObsidianWindow} from "./native-hidden-window.mjs";
+import {parseNativeHiddenIdleMs,hideOwnedObsidianWindow} from "./native-hidden-window.mjs";
 
 const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),"..");
 const opts=process.argv.slice(2);
@@ -329,7 +329,7 @@ try{
    if(nativeHiddenIdleMs){
     const actualVault=await evaluate("(()=>app.vault.adapter.getBasePath())()");
     assertTrue(actualVault.toLowerCase()===vault.toLowerCase(),"Refusing to hide an unrelated Obsidian window");
-    minimizeOwnedObsidianWindow({runId,expectedProfile:profile});
+    hideOwnedObsidianWindow({runId,expectedProfile:profile});
     const hidden=()=>evaluate("document.visibilityState");
     await waitUntil(async()=>(await hidden())==="hidden",20000,"synthetic Obsidian entered hidden state");
     const idleStarted=performance.now();

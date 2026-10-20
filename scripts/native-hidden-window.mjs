@@ -10,7 +10,7 @@ export function parseNativeHiddenIdleMs(value, nativeNotes) {
   return milliseconds;
 }
 
-export function minimizeOwnedObsidianWindow({ runId, expectedProfile, spawn = spawnSync, platform = process.platform }) {
+export function hideOwnedObsidianWindow({ runId, expectedProfile, spawn = spawnSync, platform = process.platform }) {
   assert.equal(platform, "win32", "Native hidden-window qualification requires Windows");
   assert.match(runId, /^[0-9a-f]{16}$/u, "Expected random, 16-digit hexadecimal test-run identifier");
   assert.ok(typeof expectedProfile === "string" && expectedProfile.includes(runId)
@@ -24,7 +24,7 @@ export function minimizeOwnedObsidianWindow({ runId, expectedProfile, spawn = sp
     `$owned=@(Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'Obsidian.exe' -and $_.CommandLine -like '*${runId}*' -and $_.CommandLine.Contains('${escapedProfile}') })`,
     "$handles=@($owned | ForEach-Object { (Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue).MainWindowHandle } | Where-Object { $_ -ne [IntPtr]::Zero })",
     'if($handles.Count -ne 1){ throw "Expected exactly one owned synthetic Obsidian window, found $($handles.Count)" }',
-    "[NativeHidden.Window]::ShowWindowAsync($handles[0],6) | Out-Null",
+    "[NativeHidden.Window]::ShowWindowAsync($handles[0],0) | Out-Null",
     "Write-Output 'SYNTHETIC_OBSIDIAN_MINIMIZED'",
   ].join("; ");
   const result = spawn("powershell", ["-NoProfile", "-Command", command], {
