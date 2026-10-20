@@ -27,6 +27,8 @@ const mode=parseLiveUiMode(option("mode",undefined));
 const verifyPeer=opts.includes("--verify-peer");
 const journey=opts.includes("--journey");
 const probeLifecycle=opts.includes("--probe-lifecycle");
+const probeLiveResume=opts.includes("--probe-live-resume");
+assert.ok(!(probeLifecycle&&probeLiveResume),"Choose stubbed or live lifecycle probe, not both");
 const native100mb=opts.includes("--native-100mb");
 const nativeNotes=opts.includes("--native-1000-notes")?1000:Number(option("native-notes","0"));
 assert.ok(Number.isSafeInteger(nativeNotes)&&nativeNotes>=0&&nativeNotes<=1000,"Native note count must be an integer from 0 to 1,000");
@@ -38,6 +40,7 @@ assert.ok(!nativeThousandNotes||(mode==="encrypted"&&verifyPeer),"Native bulk-no
 const assertDiagnostics=opts.includes("--assert-diagnostics");
 assert.ok(!native100mb||(mode==="encrypted"&&verifyPeer),"Native 100 MB test requires encrypted mode and a second real Obsidian vault");
 assert.ok(!verifyPeer||mode==="encrypted","A second-vault restore requires --mode=encrypted");
+assert.ok(!probeLiveResume||(mode==="encrypted"&&verifyPeer),"Real lifecycle reconciliation needs encrypted mode and a second Obsidian vault");
 const passphrase=mode==="encrypted"?randomBytes(32).toString("base64url"):"";
 const id="encrypted-github-sync-multi-platform";
 const runId=randomBytes(8).toString("hex");
@@ -436,6 +439,59 @@ try{
    }
    peerRestored=true;
    peerScreenshot=restored.peerScreenshot;
+  }
+  if(probeLiveResume){
+   // Actual production V4 runtime and GitHub transport, no API stubbing.
+   // This test's vault, branch and credentials are scoped to the pinned E2E repo.
+   const beforeWake=(await readState(configuration)).sha;
+   const observed=await evaluate(`(async()=>{
+    const p=app.plugins.plugins[${JSON.stringify(id)}];
+    if(!p?.lifecycleWake||!p?.v4Runtime?.resumeSync)throw Error("Production lifecycle runtime absent");
+    const wake=p.lifecycleWake;
+    const runtime=p.v4Runtime;
+    const original=runtime.resumeSync;
+    const previous={enabled:p.settings.syncEnabled,local:p.settings.syncOnLocalChange,lastAttempt:wake.lastAttemptAt};
+    let calls=0;
+    const tasks=[];
+    try{
+     p.settings.syncEnabled=true;
+     p.settings.syncOnLocalChange=true;
+     wake.lastAttemptAt=null;
+     runtime.resumeSync=function(...args){
+      calls++;
+      const result=original.apply(this,args);
+      tasks.push(result);
+      return result;
+     };
+     window.dispatchEvent(new Event("offline"));
+     window.dispatchEvent(new Event("online"));
+     window.dispatchEvent(new Event("online"));
+     const deadline=Date.now()+12000;
+     while(tasks.length===0&&Date.now()<deadline)await new Promise(r=>setTimeout(r,50));
+     if(tasks.length!==1)throw Error("Expected exactly one real resume reconciliation");
+     const result=await tasks[0];
+     await new Promise(r=>setTimeout(r,250));
+     const state=runtime.progressSnapshot;
+     return {calls,resultStatus:result?.status,changedFiles:result?.changedFiles,
+      lifecycle:state.lifecycle,trigger:state.trigger,operation:state.operation,
+      apiRequests:state.diagnostics?.apiRequests,apiFailures:state.diagnostics?.apiFailures,
+      uploadBytes:state.diagnostics?.uploadBytes,visibility:document.visibilityState};
+    }finally{
+     runtime.resumeSync=original;
+     p.settings.syncEnabled=previous.enabled;
+     p.settings.syncOnLocalChange=previous.local;
+     wake.lastAttemptAt=previous.lastAttempt;
+    }
+   })()`,90000);
+   assertTrue(observed?.calls===1 && observed?.lifecycle==="no-change"
+    && observed?.trigger==="scheduled"&&observed?.operation==="normal"
+    && observed?.changedFiles===0 && observed?.apiRequests>0
+    && observed?.apiFailures===0 && observed?.uploadBytes===0,
+    "Actual lifecycle normal reconciliation failed: "+redact(JSON.stringify(observed)));
+   assertTrue((await readState(configuration)).sha===beforeWake,
+    "Live resume wake unexpectedly advanced remote GitHub HEAD");
+   lifecycleProbeEvidence={kind:"real-normal-reconciliation",...observed,remoteHeadUnchanged:true};
+   console.log(JSON.stringify({kind:"native-live-resume",evidence:lifecycleProbeEvidence}));
   }
   if(probeLifecycle){
    // Only a synthetic vault: stub actual network before dispatching lifecycle events.
