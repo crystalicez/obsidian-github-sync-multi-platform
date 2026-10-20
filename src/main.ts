@@ -240,7 +240,11 @@ export default class FastSync extends Plugin {
       if (this.unloaded || this.v4Runtime.settingsGeneration !== generation) return
       if (!Platform.isDesktopApp && document.hidden) return
       if (navigator.onLine === false) return
-      void this.v4Runtime.scheduledSync()
+      void this.v4Runtime.scheduledSync().catch(() => {
+        // Progress already records the failure. A timer callback must never
+        // leak a rejected promise to the Obsidian/Electron host.
+        console.warn("GitHub Sync: scheduled reconciliation failed.")
+      })
     }, seconds * 1000)
   }
 

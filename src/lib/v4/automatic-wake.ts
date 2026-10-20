@@ -44,7 +44,10 @@ export class V4AutomaticWake {
       this.hiddenSince ??= now
       return
     }
-    if (this.hiddenSince !== null && now - this.hiddenSince >= 5_000) this.request()
+    // A large backward system clock correction cannot make a real foreground
+    // transition into evidence that no time passed while Obsidian was hidden.
+    if (this.hiddenSince !== null
+      && (now - this.hiddenSince >= 5_000 || now - this.hiddenSince <= -5_000)) this.request()
     this.hiddenSince = null
     this.deliver()
   }
@@ -69,7 +72,9 @@ export class V4AutomaticWake {
   onHeartbeat(): void {
     if (this.disposed) return
     const now = this.options.now()
-    if (this.options.desktop && now - this.lastHeartbeatAt >= 90_000) this.request()
+    const drift = now - this.lastHeartbeatAt
+    // Sleep and user/NTP clock corrections may move Date.now in either direction.
+    if (this.options.desktop && (drift >= 90_000 || drift <= -30_000)) this.request()
     this.lastHeartbeatAt = now
     this.deliver()
   }

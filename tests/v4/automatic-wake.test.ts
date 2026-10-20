@@ -171,6 +171,46 @@ test("cooldown wake is deferred and delivered after the 30-second safety interva
   wake.dispose();
 });
 
+
+test("mobile foreground reconciliation survives a backward wall-clock correction while hidden", async () => {
+  let now = 240_000
+  let visible = false
+  let starts = 0
+  const wake = new V4AutomaticWake({
+    desktop: false, now: () => now, enabled: () => true,
+    isVisible: () => visible, isOnline: () => true,
+    run: async () => { starts++ },
+  })
+  // The OS changed local clock backward 90 seconds during screen lock.
+  now -= 90_000
+  visible = true
+  wake.onVisibilityChanged()
+  await settle()
+  assert.equal(starts, 1)
+  wake.onForeground()
+  await settle()
+  assert.equal(starts, 1)
+  wake.dispose()
+})
+
+test("desktop drift heartbeat reconciles after a large backward clock correction once", async () => {
+  let now = 600_000
+  let runs = 0
+  const wake = new V4AutomaticWake({
+    desktop: true, now: () => now, enabled: () => true,
+    isVisible: () => false, isOnline: () => true,
+    run: async () => { runs++ },
+  })
+  now -= 180_000
+  wake.onHeartbeat()
+  await settle()
+  assert.equal(runs, 1)
+  wake.onHeartbeat()
+  await settle()
+  assert.equal(runs, 1)
+  wake.dispose()
+})
+
 test("unload cancels a deferred wake without starting any more work", async () => {
   let now = 1_000;
   let runs = 0;
