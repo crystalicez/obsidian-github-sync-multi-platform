@@ -33,12 +33,16 @@ jobs:
         run: pnpm test:resource
       - name: Feasibility tests
         run: pnpm test:feasibility
+      - name: Bounded 100 MB cryptographic soak
+        run: pnpm test:soak
       - name: Compile real GitHub E2E harness
         run: >-
           node scripts/run-github-e2e.mjs
           --compile-only
           --out-dir=.tmp/github-e2e-input
           --write-input-manifest
+      - name: Validate release metadata
+        run: pnpm validate:metadata
       - name: Validate package
         run: pnpm validate:package
       - name: Upload release-qualifying GitHub E2E input

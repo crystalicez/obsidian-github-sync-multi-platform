@@ -45,10 +45,14 @@ jobs:
 
       - name: Feasibility tests
         run: pnpm test:feasibility
+      - name: Bounded 100 MB cryptographic soak
+        run: pnpm test:soak
 
       - name: Compile real GitHub E2E harness
         run: pnpm test:github-e2e:compile
 
+      - name: Validate release metadata
+        run: pnpm validate:metadata
       - name: Validate package
         run: pnpm validate:package
 
