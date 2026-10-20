@@ -5,6 +5,7 @@ import { GitHubClient } from "./lib/github-api";
 import { normalizeScheduledSyncIntervalSeconds, shouldRunScheduledSync, shouldRunStartupSync } from "./lib/sync-policy";
 import { migrateV4Secrets, sanitizeV4SettingsForPersistence, scrubV4SecretIds, storeV4Secrets, supersededV4SecretIds } from "./lib/v4/secrets";
 import { V4PluginRuntime } from "./lib/v4/runtime";
+import { selectV4GitHubSchedulerSleep } from "./lib/v4/desktop-transport-timer";
 import { countV4ScopedPaths } from "./lib/v4/scope";
 import { compileV4IgnorePathRegex } from "./lib/v4/ignore";
 import { assertPluginSettingsRuntimeSafe } from "./lib/plugin-settings-validation";
@@ -169,7 +170,10 @@ export default class FastSync extends Plugin {
         owner: this.settings.githubOwner,
         repo: this.settings.githubRepo,
         branch: this.settings.githubBranch || "main",
-      }, { transportPolicy: { writeConcurrency: Platform.isDesktopApp ? 2 : 1 } });
+      }, {
+        transportPolicy: { writeConcurrency: Platform.isDesktopApp ? 2 : 1 },
+        sleep: selectV4GitHubSchedulerSleep(Platform.isDesktopApp),
+      });
     } else this.githubClient = undefined as unknown as GitHubClient
   }
 
