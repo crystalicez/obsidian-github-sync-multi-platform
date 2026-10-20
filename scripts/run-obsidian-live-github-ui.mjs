@@ -28,7 +28,8 @@ const verifyPeer=opts.includes("--verify-peer");
 const journey=opts.includes("--journey");
 const probeLifecycle=opts.includes("--probe-lifecycle");
 const probeLiveResume=opts.includes("--probe-live-resume");
-assert.ok(!(probeLifecycle&&probeLiveResume),"Choose stubbed or live lifecycle probe, not both");
+const probeLiveChange=opts.includes("--probe-live-resume-change");
+assert.ok([probeLifecycle,probeLiveResume,probeLiveChange].filter(Boolean).length<=1,"Choose only one lifecycle probe");
 const native100mb=opts.includes("--native-100mb");
 const nativeNotes=opts.includes("--native-1000-notes")?1000:Number(option("native-notes","0"));
 assert.ok(Number.isSafeInteger(nativeNotes)&&nativeNotes>=0&&nativeNotes<=1000,"Native note count must be an integer from 0 to 1,000");
@@ -40,7 +41,7 @@ assert.ok(!nativeThousandNotes||(mode==="encrypted"&&verifyPeer),"Native bulk-no
 const assertDiagnostics=opts.includes("--assert-diagnostics");
 assert.ok(!native100mb||(mode==="encrypted"&&verifyPeer),"Native 100 MB test requires encrypted mode and a second real Obsidian vault");
 assert.ok(!verifyPeer||mode==="encrypted","A second-vault restore requires --mode=encrypted");
-assert.ok(!probeLiveResume||(mode==="encrypted"&&verifyPeer),"Real lifecycle reconciliation needs encrypted mode and a second Obsidian vault");
+assert.ok(!(probeLiveResume||probeLiveChange)||(mode==="encrypted"&&verifyPeer),"Real lifecycle reconciliation needs encrypted mode and a second Obsidian vault");
 const passphrase=mode==="encrypted"?randomBytes(32).toString("base64url"):"";
 const id="encrypted-github-sync-multi-platform";
 const runId=randomBytes(8).toString("hex");
@@ -440,10 +441,15 @@ try{
    peerRestored=true;
    peerScreenshot=restored.peerScreenshot;
   }
-  if(probeLiveResume){
+  if(probeLiveResume||probeLiveChange){
    // Actual production V4 runtime and GitHub transport, no API stubbing.
    // This test's vault, branch and credentials are scoped to the pinned E2E repo.
    const beforeWake=(await readState(configuration)).sha;
+   if(probeLiveChange){
+    const edited=await evaluate("(async()=>{const p=app.plugins.plugins["+JSON.stringify(id)+"];if(p.settings.syncOnLocalChange||p.settings.scheduledSyncEnabled)throw Error('Auto sync unexpectedly enabled before offline edit');const note=app.vault.getAbstractFileByPath('UI-smoke.md');if(!note)throw Error('Synthetic note missing');await app.vault.modify(note,'# Synthetic remote UI E2E\\n\\nChanged locally while auto sync is disabled.\\n');return await app.vault.read(note)})()");
+    assertTrue(edited.includes("Changed locally while auto sync is disabled."),
+      "Synthetic local change missing before real resume");
+   }
    const observed=await evaluate(`(async()=>{
     const p=app.plugins.plugins[${JSON.stringify(id)}];
     if(!p?.lifecycleWake||!p?.v4Runtime?.resumeSync)throw Error("Production lifecycle runtime absent");
@@ -483,14 +489,25 @@ try{
      wake.lastAttemptAt=previous.lastAttempt;
     }
    })()`,90000);
-   assertTrue(observed?.calls===1 && observed?.lifecycle==="no-change"
+   const changedOutcome=probeLiveChange && observed?.lifecycle==="success"
+    && observed?.changedFiles>0 && observed?.uploadBytes>0;
+   const noopOutcome=!probeLiveChange && observed?.lifecycle==="no-change"
+    && observed?.changedFiles===0 && observed?.uploadBytes===0;
+   assertTrue(observed?.calls===1 && (changedOutcome||noopOutcome)
     && observed?.trigger==="scheduled"&&observed?.operation==="normal"
-    && observed?.changedFiles===0 && observed?.apiRequests>0
-    && observed?.apiFailures===0 && observed?.uploadBytes===0,
+    && observed?.apiRequests>0 && observed?.apiFailures===0,
     "Actual lifecycle normal reconciliation failed: "+redact(JSON.stringify(observed)));
-   assertTrue((await readState(configuration)).sha===beforeWake,
-    "Live resume wake unexpectedly advanced remote GitHub HEAD");
-   lifecycleProbeEvidence={kind:"real-normal-reconciliation",...observed,remoteHeadUnchanged:true};
+   const afterWake=await readState(configuration);
+   assertTrue(afterWake.kind==="present"&&(probeLiveChange?afterWake.sha!==beforeWake:afterWake.sha===beforeWake),
+    "Real wake GitHub HEAD did not match expected changed/no-change semantics");
+   if(probeLiveChange){
+    const proof=await verifyEncryptedGitHubTree(afterWake.sha);
+    assertTrue(proof.configValid&&proof.cipherHeaderValid&&proof.opaqueObjects,
+      "Real lifecycle upload did not produce an encrypted Git tree");
+    finalSha=afterWake.sha;
+   }
+   lifecycleProbeEvidence={kind:"real-normal-reconciliation",...observed,
+    remoteHeadUnchanged:!probeLiveChange,remoteEncryptionVerified:probeLiveChange?true:undefined};
    console.log(JSON.stringify({kind:"native-live-resume",evidence:lifecycleProbeEvidence}));
   }
   if(probeLifecycle){
