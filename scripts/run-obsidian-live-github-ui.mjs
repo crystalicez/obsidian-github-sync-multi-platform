@@ -16,6 +16,7 @@ import {parseLiveUiMode,assertEncryptedRemoteTree} from "./obsidian-live-ui-mode
 import {cleanupGeneratedUiRun} from "./obsidian-live-ui-cleanup.mjs";
 import {restoreEncryptedToSecondObsidian} from "./obsidian-live-ui-peer.mjs";
 import {watchNativeBulkSync} from "./native-bulk-watch.mjs";
+import {parseNativeHiddenIdleMs,minimizeOwnedObsidianWindow} from "./native-hidden-window.mjs";
 
 const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),"..");
 const opts=process.argv.slice(2);
@@ -29,6 +30,7 @@ const native100mb=opts.includes("--native-100mb");
 const nativeNotes=opts.includes("--native-1000-notes")?1000:Number(option("native-notes","0"));
 assert.ok(Number.isSafeInteger(nativeNotes)&&nativeNotes>=0&&nativeNotes<=1000,"Native note count must be an integer from 0 to 1,000");
 const nativeThousandNotes=nativeNotes>0;
+const nativeHiddenIdleMs=parseNativeHiddenIdleMs(option("native-hidden-idle-ms",undefined),nativeNotes);
 const nativeWaitMs=Number(option("native-wait-ms","900000"));
 assert.ok(Number.isSafeInteger(nativeWaitMs)&&nativeWaitMs>=30000&&nativeWaitMs<=900000,"Native wait must be 30,000–900,000 ms");
 assert.ok(!nativeThousandNotes||(mode==="encrypted"&&verifyPeer),"Native bulk-note test requires encrypted mode and a second real Obsidian vault");
@@ -84,6 +86,7 @@ let nativeBinary=null;
 let nativeUploadWallMs=null;
 let nativeDownloadWallMs=null;
 let bulkEvidence=null;
+let hiddenPreconditionEvidence=null;
 let diagnosticEvidence=null;
 let peerDiagnosticEvidence=null;
 const noOpEvidence=[];
@@ -323,6 +326,23 @@ try{
    const created=await evaluate(expression,480000);
    assertTrue(created===nativeNotes,"Real Obsidian did not index requested bulk notes");
    const createdWallMs=performance.now()-started;
+   if(nativeHiddenIdleMs){
+    const actualVault=await evaluate("(()=>app.vault.adapter.getBasePath())()");
+    assertTrue(actualVault.toLowerCase()===vault.toLowerCase(),"Refusing to hide an unrelated Obsidian window");
+    minimizeOwnedObsidianWindow({runId,expectedProfile:profile});
+    const hidden=()=>evaluate("document.visibilityState");
+    await waitUntil(async()=>(await hidden())==="hidden",20000,"synthetic Obsidian entered hidden state");
+    const idleStarted=performance.now();
+    let samples=0;
+    while(performance.now()-idleStarted<nativeHiddenIdleMs){
+     assertTrue((await hidden())==="hidden","Synthetic Obsidian unexpectedly became visible during hidden idle");
+     samples++;
+     await sleep(Math.min(10000,Math.max(1,nativeHiddenIdleMs-(performance.now()-idleStarted))));
+    }
+    assertTrue((await hidden())==="hidden","Synthetic Obsidian left hidden state before starting bulk Sync");
+    hiddenPreconditionEvidence={idleMs:Math.round(performance.now()-idleStarted),samples,visibility:"hidden"};
+    console.log(JSON.stringify({nativeHiddenPrecondition:hiddenPreconditionEvidence}));
+   }
    const before=finalSha;
    const bulkPlugin="app.plugins.plugins["+JSON.stringify(id)+"]";
    const launched=await evaluate("(()=>{const p="+bulkPlugin+";const j={done:false,thrown:null,startedAt:performance.now()};globalThis.__bulkSyncE2E=j;void Promise.resolve().then(()=>p.v4Runtime.manualSync()).then(()=>{j.done=true},error=>{j.done=true;j.thrown=String(error?.message??error).slice(0,180)});return true})()");
@@ -331,10 +351,11 @@ try{
     now:()=>performance.now(),
     sleep,
     timeoutMs:nativeWaitMs,
-    poll:()=>evaluate("(()=>{const p="+bulkPlugin+";const j=globalThis.__bulkSyncE2E;const s=p.v4Runtime.progressSnapshot;const d=s.diagnostics;return {done:j.done,thrown:j.thrown,lifecycle:s.lifecycle,phase:s.phase,wallMs:performance.now()-j.startedAt,pushCompleted:s.push?.completed,pushTotal:s.push?.total,apiRequests:d?.apiRequests,apiFailures:d?.apiFailures,inFlightApiRequests:d?.inFlightApiRequests,oldestInFlightApiMs:d?.oldestInFlightApiMs,uploadBytes:d?.uploadBytes,peakRss:d?.peakRendererRssBytes,publicationStage:d?.publicationStage,publicationStageMs:d?.publicationStageMs,metadataUploaded:d?.metadataUploaded,metadataTotal:d?.metadataTotal,error:s.errorMessage?.slice(0,200),transport:p.githubClient?.transportMetricsSnapshot,scheduler:p.githubClient?.transportSchedulerSnapshot}})()",15000),
+    poll:()=>evaluate("(()=>{const p="+bulkPlugin+";const j=globalThis.__bulkSyncE2E;const s=p.v4Runtime.progressSnapshot;const d=s.diagnostics;return {done:j.done,thrown:j.thrown,lifecycle:s.lifecycle,phase:s.phase,wallMs:performance.now()-j.startedAt,pushCompleted:s.push?.completed,pushTotal:s.push?.total,apiRequests:d?.apiRequests,apiFailures:d?.apiFailures,inFlightApiRequests:d?.inFlightApiRequests,oldestInFlightApiMs:d?.oldestInFlightApiMs,uploadBytes:d?.uploadBytes,peakRss:d?.peakRendererRssBytes,publicationStage:d?.publicationStage,publicationStageMs:d?.publicationStageMs,metadataUploaded:d?.metadataUploaded,metadataTotal:d?.metadataTotal,visibility:document.visibilityState,error:s.errorMessage?.slice(0,200),transport:p.githubClient?.transportMetricsSnapshot,scheduler:p.githubClient?.transportSchedulerSnapshot}})()",15000),
     onProgress:state=>{const {error,thrown,...safe}=state;console.log(JSON.stringify({nativeBulkProgress:safe}));},
    });
    assertTrue(output.lifecycle==="success"&&output.apiFailures===0&&output.uploadBytes>0,"Native bulk-note sync failed: "+redact(JSON.stringify(output)));
+   if(nativeHiddenIdleMs)assertTrue(output.visibility==="hidden","Native bulk Sync unexpectedly became visible");
    const after=await readState(configuration);
    assertTrue(after.kind==="present"&&after.sha!==before,"Native bulk-note sync did not advance GitHub HEAD");
    finalSha=after.sha;
@@ -343,7 +364,7 @@ try{
    assertTrue(tree.truncated===false&&!tree.tree.some(item=>item.path.startsWith("Bulk/")),
     "Encrypted GitHub tree leaks bulk-note logical paths");
    for(let i=0;i<nativeNotes;i++)expectedPeerFiles.push({path:"Bulk/note-"+String(i).padStart(4,"0")+".md",content:"# Bulk "+i+"\n\n"+filler+"\n"});
-   bulkEvidence={count:nativeNotes,createdWallMs,...output};
+   bulkEvidence={count:nativeNotes,createdWallMs,hiddenPreconditionEvidence,...output};
    await verifyNoop("warm-"+nativeNotes+"-notes");
    journeySteps.push("real Obsidian encrypted "+nativeNotes+"-note batch sync");
   }
