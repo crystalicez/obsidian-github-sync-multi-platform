@@ -21,6 +21,8 @@ export interface PluginSettings {
   syncOnStartup: boolean
   interruptedRecoveryPolicy: V4InterruptedRecoveryPolicy
   interruptedRecoveryContext: string
+  githubCooldownUntil: number
+  githubCooldownContext: string
   syncOnLocalChange: boolean
   scheduledSyncEnabled: boolean
   scheduledSyncIntervalSeconds: number
@@ -58,6 +60,8 @@ export const DEFAULT_SETTINGS: PluginSettings = {
   syncOnStartup: true,
   interruptedRecoveryPolicy: "ask",
   interruptedRecoveryContext: "",
+  githubCooldownUntil: 0,
+  githubCooldownContext: "",
   syncOnLocalChange: true,
   scheduledSyncEnabled: false,
   scheduledSyncIntervalSeconds: 300,

@@ -140,6 +140,11 @@ export class V4SyncCenterView extends ItemView {
     const banner = this.recoveryBanner
     if (!banner) return
     banner.empty()
+    const until = this.plugin.getGitHubCooldownUntil?.() ?? 0
+    if (until > Date.now()) {
+      banner.createEl("strong", { text: "GitHub rate limit — Automatic Sync paused" })
+      banner.createEl("p", { text: `Next allowed Sync: ${new Date(until).toLocaleString()}. GitHub HEAD will be checked again before publishing.` })
+    }
     const state = this.plugin.getInterruptedRecoveryState?.() ?? "none"
     if (state === "none") return
     banner.createEl("strong", { text: state === "corrupt"

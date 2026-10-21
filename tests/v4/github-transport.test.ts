@@ -115,7 +115,7 @@ test("V4 request scheduler retries rate limits after the requested delay", async
   assert.deepEqual(sleeps, [2_000]);
 });
 
-test("GitHubClient routes REST calls through rate-limit retries", async () => {
+test("GitHubClient stops after one REST rate-limit response", async () => {
   let attempts = 0;
   setRequestUrlHandler(async () => {
     attempts += 1;
@@ -124,8 +124,8 @@ test("GitHubClient routes REST calls through rate-limit retries", async () => {
   });
   try {
     const client = new GitHubClient({ token: "token", owner: "owner", repo: "repo", branch: "main" }, { transportPolicy: { mutationSpacingMs: 0 } });
-    assert.deepEqual(await client.listCommits(), []);
-    assert.equal(attempts, 2);
+    await assert.rejects(() => client.listCommits(), /HTTP 429/);
+    assert.equal(attempts, 1);
   } finally {
     setRequestUrlHandler(null);
   }

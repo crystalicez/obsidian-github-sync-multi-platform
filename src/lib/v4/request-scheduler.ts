@@ -23,6 +23,7 @@ export interface V4RequestSchedulerSnapshot {
 export interface V4RequestSchedulerOptions extends Partial<V4TransportPolicy> {
   sleep?: (milliseconds: number) => Promise<void>
   now?: () => number
+  retryRateLimits?: boolean
   onRetry?: (milliseconds: number) => void
   onDelay?: (input: { reason: "cooldown" | "pacing"; milliseconds: number }) => void
 }
@@ -42,6 +43,7 @@ export class V4RequestScheduler {
   private readonly policy: V4TransportPolicy
   private readonly sleep: (milliseconds: number) => Promise<void>
   private readonly now: () => number
+  private readonly retryRateLimits: boolean
   private readonly onRetry?: (milliseconds: number) => void
   private readonly onDelay?: (input: { reason: "cooldown" | "pacing"; milliseconds: number }) => void
   private cooldownUntil = 0
@@ -59,6 +61,7 @@ export class V4RequestScheduler {
     }
     this.sleep = options.sleep ?? (milliseconds => new Promise(resolve => globalThis.setTimeout(resolve, milliseconds)))
     this.now = options.now ?? (() => Date.now())
+    this.retryRateLimits = options.retryRateLimits ?? true
     this.onRetry = options.onRetry
     this.onDelay = options.onDelay
   }
@@ -162,7 +165,7 @@ export class V4RequestScheduler {
       } catch (error) {
         lastError = error
         const delay = resolveV4RateLimitDelay(error, attempt, this.now(), this.policy)
-        if (delay === null || attempt === this.policy.maxAttempts) throw error
+        if (delay === null || !this.retryRateLimits || attempt === this.policy.maxAttempts) throw error
         this.cooldownUntil = Math.max(this.cooldownUntil, this.now() + delay)
         this.onRetry?.(delay)
       }

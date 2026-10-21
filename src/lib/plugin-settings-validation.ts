@@ -84,6 +84,12 @@ export function assertPluginSettingsRuntimeSafe(value: unknown): void {
     throw new Error("Invalid plugin settings: interruptedRecoveryPolicy is unsupported.")
   }
   optionalString(settings, "interruptedRecoveryContext")
+  optionalString(settings, "githubCooldownContext")
+  if (settings.githubCooldownUntil !== undefined
+    && (typeof settings.githubCooldownUntil !== "number"
+      || !Number.isSafeInteger(settings.githubCooldownUntil) || settings.githubCooldownUntil < 0)) {
+    throw new Error("Invalid plugin settings: githubCooldownUntil must be a non-negative integer timestamp.")
+  }
 
   if (settings.lastSyncTime !== undefined) {
     const lastSyncTime = settings.lastSyncTime

@@ -10,7 +10,8 @@ import type { V4RecoveryInspection } from "./lib/v4/recovery-store";
 import type { V4SyncProgressSnapshot } from "./lib/v4/progress";
 import { selectV4GitHubSchedulerSleep } from "./lib/v4/desktop-transport-timer";
 import { V4AutomaticWake, shouldRunV4AutomaticWake } from "./lib/v4/automatic-wake";
-import { startV4PlatformInterval } from "./lib/v4/platform-interval";
+import { startV4PlatformInterval, startV4PlatformTimeout } from "./lib/v4/platform-interval";
+import { activeGitHubCooldownUntil } from "./lib/v4/github-cooldown";
 import { countV4ScopedPaths } from "./lib/v4/scope";
 import { compileV4IgnorePathRegex } from "./lib/v4/ignore";
 import { assertPluginSettingsRuntimeSafe } from "./lib/plugin-settings-validation";
@@ -41,6 +42,8 @@ export default class FastSync extends Plugin {
   private recoveryModal: Modal | null = null
   private recoveryReviewEpoch = 0
   private recoveryStartupInitialized = false
+  private cooldownTimeoutCancel: (() => void) | null = null
+  private settingsWriteQueue: Promise<void> | null = null
   startupSyncTimeout: number | null = null
   secretsMigrated: boolean = false
   private pendingMigratedSecretIds: string[] = []
@@ -49,7 +52,7 @@ export default class FastSync extends Plugin {
   private statusDisplaySignature?: string
 
   enableWatch() {
-    this.isWatchEnabled = !this.recoveryStartupGate
+    this.isWatchEnabled = !this.recoveryStartupGate && !this.getGitHubCooldownUntil()
   }
 
   disableWatch() {
@@ -96,6 +99,10 @@ export default class FastSync extends Plugin {
     this.registerView(V4_SYNC_CENTER_VIEW, leaf => new V4SyncCenterView(leaf, this))
     this.registerLifecycleWake()
     this.registerScheduledSync()
+    this.scheduleGitHubCooldownResume()
+    if (this.getGitHubCooldownUntil()) {
+      new Notice(`GitHub rate limit: Automatic Sync paused until ${new Date(this.getGitHubCooldownUntil()).toLocaleString()}.`)
+    }
 
     // Create Ribbon Icons
     this.ribbonIcon = this.addRibbonIcon("loader-circle", "GitHub Sync: Sync", () => {
@@ -206,7 +213,7 @@ export default class FastSync extends Plugin {
       const startedWith = generation
       this.startupSyncTimeout = window.setTimeout(() => {
         this.startupSyncTimeout = null
-        if (!this.unloaded && !this.recoveryStartupGate && this.v4Runtime.settingsGeneration === startedWith) {
+        if (!this.unloaded && !this.recoveryStartupGate && !this.getGitHubCooldownUntil() && this.v4Runtime.settingsGeneration === startedWith) {
           void this.v4Runtime.startupSync()
         }
       }, 1500)
@@ -318,9 +325,63 @@ export default class FastSync extends Plugin {
     modal.open()
   }
 
+  /** A cooldown is tied to the saved vault/repository/credential context. */
+  getGitHubCooldownUntil(): number {
+    if (!this.settings) return 0
+    return activeGitHubCooldownUntil(
+      this.settings?.githubCooldownUntil ?? 0,
+      this.settings?.githubCooldownContext ?? "",
+      v4RecoveryPolicyContext(this.settings),
+    )
+  }
+
+  private refreshGitHubCooldownUI(): void {
+    this.updateStatusBar()
+    for (const leaf of this.app.workspace?.getLeavesOfType?.(V4_SYNC_CENTER_VIEW) ?? []) {
+      (leaf.view as V4SyncCenterView).refreshRecoveryNotice?.()
+    }
+  }
+
+  private scheduleGitHubCooldownResume(): void {
+    this.cooldownTimeoutCancel?.()
+    this.cooldownTimeoutCancel = null
+    const until = this.getGitHubCooldownUntil()
+    if (!until || this.unloaded) return
+    const delay = Math.min(Math.max(1, until - Date.now()), 0x7fffffff)
+    this.cooldownTimeoutCancel = startV4PlatformTimeout(Platform.isDesktopApp, () => {
+      this.cooldownTimeoutCancel = null
+      if (this.unloaded) return
+      if (this.getGitHubCooldownUntil()) {
+        this.scheduleGitHubCooldownResume()
+        return
+      }
+      this.enableWatch()
+      this.refreshGitHubCooldownUI()
+      // A new normal run reloads GitHub HEAD and the durable journal before any CAS.
+      if (!this.recoveryStartupGate && shouldRunV4AutomaticWake(this.settings)
+        && navigator.onLine !== false && (Platform.isDesktopApp || !document.hidden)) {
+        void this.v4Runtime.scheduledSync()
+      }
+    }, delay)
+  }
+
+  private recordGitHubCooldown(untilMs: number): void {
+    if (this.unloaded || !Number.isSafeInteger(untilMs) || untilMs <= Date.now()) return
+    if (untilMs <= this.getGitHubCooldownUntil()) return
+    this.settings.githubCooldownUntil = untilMs
+    this.settings.githubCooldownContext = v4RecoveryPolicyContext(this.settings)
+    this.disableWatch()
+    this.scheduleGitHubCooldownResume()
+    this.refreshGitHubCooldownUI()
+    new Notice(`GitHub rate limit: Automatic Sync paused until ${new Date(untilMs).toLocaleString()}.`)
+    void this.persistData().catch(() => {
+      new Notice("GitHub Sync: Could not save rate-limit cooldown; automatic Sync stays paused in this session.")
+    })
+  }
+
   initGitHubClient() {
     if (this.settings.githubToken && this.settings.githubOwner && this.settings.githubRepo) {
-      this.githubClient = new GitHubClient({
+      const client = new GitHubClient({
         token: this.settings.githubToken,
         owner: this.settings.githubOwner,
         repo: this.settings.githubRepo,
@@ -328,7 +389,12 @@ export default class FastSync extends Plugin {
       }, {
         transportPolicy: { writeConcurrency: Platform.isDesktopApp ? 2 : 1 },
         sleep: selectV4GitHubSchedulerSleep(Platform.isDesktopApp),
+        getRateLimitUntil: () => this.getGitHubCooldownUntil(),
+        onRateLimited: until => {
+          if (this.githubClient === client) this.recordGitHubCooldown(until)
+        },
       });
+      this.githubClient = client;
     } else this.githubClient = undefined as unknown as GitHubClient
   }
 
@@ -336,6 +402,8 @@ export default class FastSync extends Plugin {
     this.unloaded = true
     this.recoveryReviewEpoch++
     this.recoveryModal?.close()
+    this.cooldownTimeoutCancel?.()
+    this.cooldownTimeoutCancel = null
     this.scheduledSyncCancel?.()
     this.scheduledSyncCancel = null
     this.lifecycleWake?.dispose()
@@ -354,7 +422,7 @@ export default class FastSync extends Plugin {
     const wake = new V4AutomaticWake({
       desktop: Platform.isDesktopApp,
       now: () => Date.now(),
-      enabled: () => !this.unloaded && !this.recoveryStartupGate && shouldRunV4AutomaticWake(this.settings),
+      enabled: () => !this.unloaded && !this.recoveryStartupGate && !this.getGitHubCooldownUntil() && shouldRunV4AutomaticWake(this.settings),
       isVisible: () => !document.hidden,
       isOnline: () => navigator.onLine !== false,
       run: () => this.v4Runtime.resumeSync(),
@@ -389,7 +457,7 @@ export default class FastSync extends Plugin {
     const seconds = normalizeScheduledSyncIntervalSeconds(this.settings.scheduledSyncIntervalSeconds)
     const generation = this.v4Runtime.settingsGeneration
     this.scheduledSyncCancel = startV4PlatformInterval(Platform.isDesktopApp, () => {
-      if (this.unloaded || this.recoveryStartupGate || this.v4Runtime.settingsGeneration !== generation) return
+      if (this.unloaded || this.recoveryStartupGate || this.getGitHubCooldownUntil() || this.v4Runtime.settingsGeneration !== generation) return
       if (!Platform.isDesktopApp && document.hidden) return
       if (navigator.onLine === false) return
       void this.v4Runtime.scheduledSync()
@@ -407,10 +475,16 @@ export default class FastSync extends Plugin {
   }
 
   /** Persist only current V4 settings; the V4 local index uses its own sharded adapter storage. */
-  private async persistSettingsData(settings: PluginSettings) {
-    await this.saveData({
+  private async persistSettingsData(settings: PluginSettings): Promise<void> {
+    const save = () => this.saveData({
       settings: sanitizeV4SettingsForPersistence(settings),
-    });
+    })
+    // The first write begins immediately; later writes serialize to prevent stale snapshots.
+    const write = this.settingsWriteQueue ? this.settingsWriteQueue.then(save) : save()
+    const settled = write.then(() => undefined, () => undefined)
+    this.settingsWriteQueue = settled
+    void settled.then(() => { if (this.settingsWriteQueue === settled) this.settingsWriteQueue = null })
+    return write
   }
 
   async persistData() {
@@ -480,7 +554,14 @@ export default class FastSync extends Plugin {
     const previousRecoveryContext = v4RecoveryPolicyContext(previousSettings)
     const nextRecoveryContext = v4RecoveryPolicyContext(preparedSettings)
     const recoveryContextChanged = previousRecoveryContext !== nextRecoveryContext
-    if (recoveryContextChanged) preparedSettings.interruptedRecoveryPolicy = "ask"
+    if (recoveryContextChanged) {
+      preparedSettings.interruptedRecoveryPolicy = "ask"
+      preparedSettings.githubCooldownUntil = 0
+    } else {
+      preparedSettings.githubCooldownUntil = Math.max(
+        preparedSettings.githubCooldownUntil, this.settings.githubCooldownUntil)
+    }
+    preparedSettings.githubCooldownContext = nextRecoveryContext
     preparedSettings.interruptedRecoveryContext = nextRecoveryContext
     const pendingGithubTokenSecret = preparedSettings.githubTokenSecretId !== previousSettings.githubTokenSecretId
     const pendingEncryptionPassphraseSecret = preparedSettings.encryptionPassphraseSecretId !== previousSettings.encryptionPassphraseSecretId
@@ -528,6 +609,8 @@ export default class FastSync extends Plugin {
       }
       if (this.unloaded) return
 
+      if (!recoveryContextChanged) preparedSettings.githubCooldownUntil = Math.max(
+        preparedSettings.githubCooldownUntil, this.settings.githubCooldownUntil)
       this.settings = preparedSettings
       if (restartRecoveryProbe) {
         this.recoveryReviewEpoch++
@@ -538,6 +621,8 @@ export default class FastSync extends Plugin {
       }
       this.v4Runtime?.credentialsChanged(keyContextChanged)
       this.initGitHubClient()
+      this.scheduleGitHubCooldownResume()
+      if (this.getGitHubCooldownUntil()) this.disableWatch()
       this.registerScheduledSync()
       this.updateRibbonIcon(!!(this.settings.githubToken && this.settings.githubOwner && this.settings.githubRepo))
     } finally {
@@ -545,6 +630,7 @@ export default class FastSync extends Plugin {
         this.v4Runtime?.finishSettingsChange()
       } finally {
         this.settingsSaveInProgress = false
+        if (!this.unloaded && this.getGitHubCooldownUntil()) void this.persistData().catch(() => undefined)
         if (restartRecoveryProbe && !this.unloaded) void this.checkStartupRecovery()
       }
     }
@@ -573,7 +659,13 @@ export default class FastSync extends Plugin {
     }
 
     const snapshot = this.v4Runtime?.progressSnapshot ?? createIdleV4Progress();
-    const { text, title } = formatV4ActiveSyncStatus(snapshot);
+    let { text, title } = formatV4ActiveSyncStatus(snapshot);
+    const cooldownUntil = this.getGitHubCooldownUntil()
+    if (cooldownUntil) {
+      const resumeAt = new Date(cooldownUntil).toLocaleString()
+      text = `Rate limited until ${resumeAt}`
+      title = `GitHub rate limit: Sync paused until ${resumeAt}. Automatic Sync resumes after cooldown.`
+    }
     let cls = "github-sync-status-bar";
 
     if (snapshot.lifecycle === "waiting" || snapshot.lifecycle === "active") cls += " is-syncing";

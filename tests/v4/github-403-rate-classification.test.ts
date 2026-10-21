@@ -36,7 +36,7 @@ test("403 permission-denied with ordinary GitHub x-ratelimit-reset must not be r
   }
 });
 
-test("403 explicit primary rate exhaustion still retries under the configured policy", async () => {
+test("403 explicit primary rate exhaustion stops after one request under the cooldown policy", async () => {
   let requests = 0;
   setRequestUrlHandler(async () => {
     requests++;
@@ -46,13 +46,13 @@ test("403 explicit primary rate exhaustion still retries under the configured po
   });
   try {
     await assert.rejects(() => client().listCommits(), /403/);
-    assert.equal(requests, 3);
+    assert.equal(requests, 1);
   } finally {
     setRequestUrlHandler(undefined);
   }
 });
 
-test("403 secondary limit with nonzero primary remaining retries based on message", async () => {
+test("403 secondary limit with nonzero primary remaining stops without retry", async () => {
   let requests = 0;
   setRequestUrlHandler(async () => {
     requests++;
@@ -62,7 +62,7 @@ test("403 secondary limit with nonzero primary remaining retries based on messag
   });
   try {
     await assert.rejects(() => client().listCommits(), /403/);
-    assert.equal(requests, 3);
+    assert.equal(requests, 1);
   } finally {
     setRequestUrlHandler(undefined);
   }

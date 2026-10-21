@@ -18,6 +18,7 @@ import {
   type V4ResourceController,
 } from "./v4/resource-controller";
 import { V4RequestScheduler } from "./v4/request-scheduler";
+import { GitHubRateLimitCooldownError, githubRateLimitUntil } from "./v4/github-cooldown";
 import { V4TransportMetrics, type V4TransportMetricsSnapshot } from "./v4/transport-metrics";
 import type { V4RunDiagnostics } from "./v4/run-diagnostics";
 import { resolveV4TransportPolicy, type V4TransportPolicy } from "./v4/transport-policy";
@@ -57,6 +58,8 @@ export interface GitHubClientOptions {
   transportResources?: Pick<V4ResourceController, "withTransportBytes">;
   sleep?: (milliseconds: number) => Promise<void>;
   now?: () => number;
+  getRateLimitUntil?: () => number;
+  onRateLimited?: (untilMs: number) => void;
 }
 
 export interface GitHubTreeNode {
@@ -103,16 +106,21 @@ export class GitHubClient {
   private operationSignal?: AbortSignal;
   private runDiagnostics?: V4RunDiagnostics;
   private repositoryNodeId?: string;
+  private readonly getRateLimitUntil?: () => number;
+  private readonly onRateLimited?: (untilMs: number) => void;
 
   constructor(config: GitHubConfig, options: GitHubClientOptions = {}) {
     assertSafeGitHubRepositoryCoordinates(config.owner, config.repo);
     assertSafeGitHubBranch(config.branch);
     this.config = config;
+    this.getRateLimitUntil = options.getRateLimitUntil;
+    this.onRateLimited = options.onRateLimited;
     this.transportPolicy = resolveV4TransportPolicy(options.transportPolicy);
     this.transportMetrics = options.transportMetrics ?? new V4TransportMetrics();
     this.transportResources = options.transportResources ?? createV4ResourceController(DEFAULT_V4_RESOURCE_LIMITS);
     this.requestScheduler = new V4RequestScheduler({
       ...this.transportPolicy,
+      retryRateLimits: false,
       sleep: options.sleep,
       now: options.now,
       onRetry: () => this.transportMetrics.recordRetry(),
@@ -138,6 +146,8 @@ export class GitHubClient {
     const kind = method === "GET" || method === "HEAD" ? "read" : "write";
     const requestBytes = typeof options.body === "string" ? utf8ByteLength(options.body) : 0;
     return this.requestScheduler.run(kind, async () => {
+      const cooldownUntil = this.getRateLimitUntil?.() ?? 0;
+      if (cooldownUntil > Date.now()) throw new GitHubRateLimitCooldownError(cooldownUntil);
       this.transportMetrics.recordRequest({ mutation: kind === "write", requestBytes, transientBytes });
       const started = performance.now();
       const finishRequest = this.runDiagnostics?.beginRequest();
@@ -165,6 +175,7 @@ export class GitHubClient {
         || responseHeaders["x-ratelimit-remaining"] === "0"
       ));
       if (rateLimited) {
+        this.onRateLimited?.(githubRateLimitUntil(responseHeaders));
         const error = new Error(`GitHub request failed: HTTP ${response.status} - ${response.text || "rate limited"}`) as Error & { status?: number; headers?: Record<string, string> };
         error.status = response.status;
         error.headers = responseHeaders;
@@ -722,11 +733,13 @@ export class GitHubClient {
     if (payload && Object.hasOwn(payload, "errors")) {
       // GitHub may report GraphQL rate limits with HTTP 200. Do not resend CAS:
       // the caller must reconcile the HEAD before any later publication.
-      const rateLimited = Array.isArray(payload.errors) && payload.errors.some(item => {
+      const rateLimited = (response.headers?.["x-ratelimit-remaining"] === "0")
+        || Array.isArray(payload.errors) && payload.errors.some(item => {
         const error = item as { type?: unknown; message?: unknown } | null;
         return error?.type === "RATE_LIMITED"
           || (typeof error?.message === "string" && /rate limit|abuse detection/iu.test(error.message));
       });
+      if (rateLimited) this.onRateLimited?.(githubRateLimitUntil(response.headers ?? {}));
       throw this.gitHttpError(rateLimited ? "GraphQL strict CAS rate limited" : "GraphQL strict CAS rejected",
         422, "GraphQL reported an error.");
     }
