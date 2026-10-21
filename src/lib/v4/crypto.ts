@@ -3,6 +3,7 @@ import { randomBytes, toHex, utf8ToBytes } from "../bytes";
 const MAGIC = new Uint8Array([0x4f, 0x47, 0x53, 0x34]);
 const PAYLOAD_VERSION = 1;
 const NONCE_BYTES = 12;
+export const V4_ENCRYPTED_PAYLOAD_OVERHEAD_BYTES = MAGIC.byteLength + 1 + NONCE_BYTES + 16;
 
 export interface V4Keyring {
   masterKey: Uint8Array;
@@ -117,7 +118,7 @@ export async function encryptV4Payload(keyBytes: Uint8Array, plaintext: Uint8Arr
 }
 
 export async function decryptV4Payload(keyBytes: Uint8Array, payload: Uint8Array, context: V4PayloadContext): Promise<Uint8Array> {
-  if (payload.byteLength < MAGIC.byteLength + 1 + NONCE_BYTES + 16 || !hasMagic(payload)) {
+  if (payload.byteLength < V4_ENCRYPTED_PAYLOAD_OVERHEAD_BYTES || !hasMagic(payload)) {
     throw new Error("Invalid encrypted V4 payload header.");
   }
   if (payload[MAGIC.byteLength] !== PAYLOAD_VERSION) throw new Error("Unsupported encrypted V4 payload version.");
