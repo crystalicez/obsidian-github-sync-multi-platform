@@ -93,14 +93,16 @@ async function ensureDesktopParent(fullPath: string): Promise<void> {
   await fs.mkdir(path.dirname(fullPath), { recursive: true })
 }
 
-function desktopBoundedSource(fullPath: string, expectedSize: number): V4ContentSource {
+function desktopBoundedSource(fullPath: string, expectedSize: number, assertSafe?: () => Promise<void>): V4ContentSource {
   return {
     size: expectedSize,
     async *chunks(chunkBytes: number, signal?: AbortSignal) {
       if (!Number.isSafeInteger(chunkBytes) || chunkBytes < 1) throw new TypeError("chunkBytes must be a positive safe integer.")
       const fs = await desktopFs()
+      await assertSafe?.()
       const before = await fs.stat(fullPath)
       if (before.size !== expectedSize) throw new Error(`V4 desktop source size changed: expected ${expectedSize}, got ${before.size}.`)
+      await assertSafe?.()
       const handle = await fs.open(fullPath, "r")
       try {
         let offset = 0
@@ -145,26 +147,48 @@ export function createV4PlatformIo(options: V4PlatformIoOptions): V4PlatformIo {
       throw error
     }
   }
-  const assertRecoveryPaths = async (stagePath: string, targetPath: string): Promise<void> => {
-    if (!desktopReady || !options.desktopRootPath) throw new V4ManualRecoveryRequiredError(targetPath, "vault root is not verifiable")
+  // Normalize absolute vault adapter paths against the known Desktop vault root.
+  // The root itself may be a user-configured junction; links INSIDE the vault
+  // are not trusted to resolve to user-owned vault content.
+  const assertDesktopPathSafe = async (logical: string, mustExist = false): Promise<void> => {
+    if (!options.desktopRootPath) return // compatibility for isolated platform-IO tests
     const [fs, pathModule] = await Promise.all([desktopFs(), desktopPath()])
     const root = pathModule.resolve(options.desktopRootPath)
+    const requested = pathModule.resolve(full(logical))
+    const relative = pathModule.relative(root, requested)
+    if (relative === "" || relative === ".." || relative.startsWith(".." + pathModule.sep) || pathModule.isAbsolute(relative)) {
+      throw new V4ManualRecoveryRequiredError(logical, "path leaves the configured vault")
+    }
+    // Verify configured root is real before trusting any descendant.
+    const realRoot = await fs.realpath(root)
+    const rootStat = await fs.stat(realRoot)
+    if (!rootStat.isDirectory()) throw new V4ManualRecoveryRequiredError(logical, "vault root is not a directory")
+    let current = root
+    const segments = relative.split(pathModule.sep)
+    for (const [index, segment] of segments.entries()) {
+      current = pathModule.join(current, segment)
+      let info: Awaited<ReturnType<typeof fs.lstat>>
+      try { info = await fs.lstat(current) }
+      catch (error) {
+        if ((error as { code?: string }).code !== "ENOENT") throw error
+        if (mustExist) throw new V4ManualRecoveryRequiredError(logical, "required file is missing")
+        break
+      }
+      if (info.isSymbolicLink()) throw new V4ManualRecoveryRequiredError(logical, "symlink or junction prevents safe vault IO")
+      if (index < segments.length - 1 && !info.isDirectory()) {
+        throw new V4ManualRecoveryRequiredError(logical, "non-directory path component")
+      }
+      const actual = await fs.realpath(current)
+      const inside = pathModule.relative(realRoot, actual)
+      if (inside === ".." || inside.startsWith(".." + pathModule.sep) || pathModule.isAbsolute(inside)) {
+        throw new V4ManualRecoveryRequiredError(logical, "path resolves outside the vault")
+      }
+    }
+  }
+  const assertRecoveryPaths = async (stagePath: string, targetPath: string): Promise<void> => {
+    if (!desktopReady || !options.desktopRootPath) throw new V4ManualRecoveryRequiredError(targetPath, "vault root is not verifiable")
     for (const logical of [stagePath, stagePath + ".target-backup", stagePath + ".replacement-residue", targetPath]) {
-      const requested = pathModule.resolve(full(logical))
-      const relative = pathModule.relative(root, requested)
-      if (relative === "" || relative === ".." || relative.startsWith(".." + pathModule.sep) || pathModule.isAbsolute(relative)) {
-        throw new V4ManualRecoveryRequiredError(targetPath, "path leaves the configured vault")
-      }
-      let current = root
-      for (const segment of relative.split(pathModule.sep)) {
-        current = pathModule.join(current, segment)
-        let info: Awaited<ReturnType<typeof fs.lstat>>
-        try { info = await fs.lstat(current) } catch (error) {
-          if ((error as { code?: string }).code === "ENOENT") break
-          throw error
-        }
-        if (info.isSymbolicLink()) throw new V4ManualRecoveryRequiredError(targetPath, "symlink or junction prevents safe recovery")
-      }
+      await assertDesktopPathSafe(logical)
     }
   }
   const hashFile = async (file: string, size: number): Promise<string | null> => {
@@ -188,6 +212,11 @@ export function createV4PlatformIo(options: V4PlatformIoOptions): V4PlatformIo {
   return {
     capabilities,
     async readWhole(path) {
+      if (desktopReady && options.desktopRootPath) {
+        await assertDesktopPathSafe(path, true)
+        const fs = await desktopFs()
+        return new Uint8Array(await fs.readFile(full(path)))
+      }
       if (options.adapter?.readBinary) return new Uint8Array(await options.adapter.readBinary(path))
       if (desktopReady) {
         const fs = await desktopFs()
@@ -197,12 +226,14 @@ export function createV4PlatformIo(options: V4PlatformIoOptions): V4PlatformIo {
     },
     async openBoundedSource(path, expectedSize) {
       if (!desktopReady) throw new V4BoundedIoUnavailableError("bounded-read", path)
-      return desktopBoundedSource(full(path), expectedSize)
+      return desktopBoundedSource(full(path), expectedSize, () => assertDesktopPathSafe(path, true))
     },
     async writeStage(path, bytes) {
       if (desktopReady) {
+        await assertDesktopPathSafe(path)
         const target = full(path)
         await ensureDesktopParent(target)
+        await assertDesktopPathSafe(path)
         const fs = await desktopFs()
         await fs.writeFile(target, bytes)
         return
@@ -216,8 +247,10 @@ export function createV4PlatformIo(options: V4PlatformIoOptions): V4PlatformIo {
     },
     async appendStage(path, bytes) {
       if (desktopReady) {
+        await assertDesktopPathSafe(path)
         const target = full(path)
         await ensureDesktopParent(target)
+        await assertDesktopPathSafe(path)
         const fs = await desktopFs()
         await fs.appendFile(target, bytes)
         return
@@ -227,6 +260,7 @@ export function createV4PlatformIo(options: V4PlatformIoOptions): V4PlatformIo {
     },
     async removeStage(path) {
       if (desktopReady) {
+        await assertDesktopPathSafe(path)
         const fs = await desktopFs()
         await fs.rm(full(path), { force: true })
         return
@@ -235,8 +269,10 @@ export function createV4PlatformIo(options: V4PlatformIoOptions): V4PlatformIo {
     },
     async freeBytes(path) {
       if (!desktopReady) return undefined
+      await assertDesktopPathSafe(path)
       const target = full(path)
       await ensureDesktopParent(target)
+      await assertDesktopPathSafe(path)
       const [fs, pathModule] = await Promise.all([desktopFs(), desktopPath()])
       const stats = await fs.statfs(pathModule.dirname(target))
       return Number(stats.bavail) * Number(stats.bsize)
@@ -313,6 +349,7 @@ export function createV4PlatformIo(options: V4PlatformIoOptions): V4PlatformIo {
       const target = full(targetPath)
       const backup = `${stage}.target-backup`
       await ensureDesktopParent(target)
+      if (options.desktopRootPath) await assertRecoveryPaths(stagePath, targetPath)
       const statOrNull = async (path: string) => { try { return await fs.stat(path) } catch (error) { if ((error as { code?: string }).code === "ENOENT") return null; throw error } }
       const targetBefore = await statOrNull(target)
       const expected = commitOptions.expectedTarget
@@ -323,6 +360,11 @@ export function createV4PlatformIo(options: V4PlatformIoOptions): V4PlatformIo {
       }
       const stageStat = await fs.stat(stage)
       if (stageStat.size !== commitOptions.expectedStageSize) throw new Error(`V4 staged content size changed before commit: ${stagePath}`)
+      // Do not remove the only complete staged copy before checking its bytes.
+      // After a rename, hash mismatches may represent concurrent user edits.
+      if (await hashFile(stage, commitOptions.expectedStageSize) !== commitOptions.expectedStageSha256) {
+        throw new V4ManualRecoveryRequiredError(targetPath, "staged content hash changed before replacement")
+      }
       if (expected.exists && expected.hash) {
         if (await hashFile(target, expected.size!) !== expected.hash) {
           throw new V4ManualRecoveryRequiredError(targetPath, "the original target hash changed before staged commit")
@@ -336,6 +378,7 @@ export function createV4PlatformIo(options: V4PlatformIoOptions): V4PlatformIo {
       let backedUp = false
       let stageMoved = false
       try {
+        if (options.desktopRootPath) await assertRecoveryPaths(stagePath, targetPath)
         if (targetBefore) { await fs.rename(target, backup); backedUp = true }
         await fs.rename(stage, target); stageMoved = true
         const after = await fs.stat(target)
@@ -345,8 +388,21 @@ export function createV4PlatformIo(options: V4PlatformIoOptions): V4PlatformIo {
         if (hash.digestHex() !== commitOptions.expectedStageSha256) throw new Error(`V4 committed target hash mismatch: ${targetPath}`)
         if (backedUp) await fs.rm(backup, { force: true })
       } catch (error) {
-        if (stageMoved) { try { await fs.rm(target, { force: true }) } catch {} }
-        if (backedUp) { try { await fs.rename(backup, target) } catch {} }
+        if (stageMoved) {
+          // A caller/user may have changed the newly moved target while the
+          // verification was running. Never delete it or overwrite it with the
+          // backup based on a size or cached SHA guess.
+          throw new V4ManualRecoveryRequiredError(targetPath, `staged replacement requires review after an interrupted commit (${(error as Error).message})`)
+        }
+        if (backedUp) {
+          if (!(await confirmBackup(backup, expected)) || await statOrNull(target)) {
+            throw new V4ManualRecoveryRequiredError(targetPath, "backup cannot be proven safe after the staged rename failed")
+          }
+          try { await fs.rename(backup, target) }
+          catch {
+            throw new V4ManualRecoveryRequiredError(targetPath, "verified original backup could not be restored")
+          }
+        }
         throw error
       }
     },
