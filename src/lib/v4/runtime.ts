@@ -20,7 +20,7 @@ import { expectedV4PathLayout, V4_FORMAT_VERSION, V4_CONFIG_PATH, type V4RemoteC
 import { V4HistoryService } from "./history-service"
 import type { V4SessionVault } from "./local-io"
 import { createV4ContentSource, createV4WholeBufferContentSource, DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES, type V4ContentSource } from "./content-source"
-import { createV4PlatformIo, type V4BinaryAdapterLike, type V4PlatformIo } from "./platform-io"
+import { createV4PlatformIo, V4ManualRecoveryRequiredError, type V4BinaryAdapterLike, type V4PlatformIo } from "./platform-io"
 import { createV4StagingStore, type V4StagingStore } from "./staging-store"
 import { V4ProgressStore, type V4SyncProgressSnapshot } from "./progress"
 import { createV4RecoveryStore, discardV4RecoveryStages, markV4RecoveryIndexCommitted, recoverV4PendingState, V4RecoveryRequiredError } from "./recovery-store"
@@ -77,11 +77,13 @@ function createRuntimePlatformIo(plugin: FastSync): { io: V4PlatformIo; stageRoo
   const resolveDesktopPath = desktop && typeof adapter?.getFullPath === "function"
     ? (path: string) => adapter.getFullPath!(path)
     : undefined
+  const desktopRootPath = resolveDesktopPath ? resolveDesktopPath("") : undefined
   return {
     io: createV4PlatformIo({
       platform: desktop ? "desktop" : "mobile",
       adapter,
       resolveDesktopPath,
+      desktopRootPath,
     }),
     stageRoot,
   }
@@ -389,6 +391,16 @@ export class V4PluginRuntime {
           this.plugin.removeIgnoredFile(path)
         }
       },
+      rollbackStage: ({ stage, path, precondition }) => this.platformIo.rollbackStage(this.stagingStore.pathFor(stage.stageId), path, {
+        expectedTarget: precondition,
+        expectedStageSize: stage.size,
+        expectedStageSha256: stage.hash,
+      }),
+      finalizeStage: ({ stage, path, precondition }) => this.platformIo.finalizeStage(this.stagingStore.pathFor(stage.stageId), path, {
+        expectedTarget: precondition,
+        expectedStageSize: stage.size,
+        expectedStageSha256: stage.hash,
+      }),
     }
   }
 
@@ -636,7 +648,12 @@ export class V4PluginRuntime {
         error,
       })
       this.progressStore.finish("failed", { errorMessage: message })
-      new Notice(`GitHub Sync failed: ${message}`)
+      if (error instanceof V4ManualRecoveryRequiredError) {
+        // Never present a destructive override when backup evidence is missing.
+        this.askUserToReviewRecovery(error)
+      } else {
+        new Notice(`GitHub Sync failed: ${message}`)
+      }
       return { changedFiles: 0 }
     } finally {
       bootstrapRecoveryKeyCache?.key.fill(0)
@@ -647,6 +664,21 @@ export class V4PluginRuntime {
         if (this.coordinator.pendingCount > 0) this.beginWaitingRun()
       }
     }
+  }
+
+  private askUserToReviewRecovery(error: V4ManualRecoveryRequiredError): void {
+    const modal = new Modal(this.plugin.app)
+    modal.titleEl.setText("GitHub Sync: Recovery needs your review")
+    modal.contentEl.createEl("p", { text: "Automatic recovery has paused because the plugin cannot prove which file should be restored safely." })
+    modal.contentEl.createEl("p", { text: `Affected file: ${error.targetPath}` })
+    modal.contentEl.createEl("p", { text: error.message })
+    modal.contentEl.createEl("p", { text: "No automatic overwrite or backup deletion will be attempted. Keep the .target-backup and .replacement-residue files. Review a copy of the vault before making any manual changes." })
+    const buttons = modal.contentEl.createDiv()
+    buttons.createEl("button", { text: "Keep files unchanged" }).onclick = () => modal.close()
+    buttons.createEl("button", { text: "Copy recovery details" }).onclick = () => {
+      void navigator.clipboard?.writeText(error.message).catch(() => new Notice("Could not copy recovery details."))
+    }
+    modal.open()
   }
 
   private async askConflict(path: string): Promise<V4ConflictResolution> {

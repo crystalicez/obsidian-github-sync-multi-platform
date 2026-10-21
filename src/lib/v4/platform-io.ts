@@ -4,6 +4,19 @@ import { createV4IncrementalSha256 } from "./incremental-hash"
 export type V4PlatformKind = "desktop" | "mobile" | "other"
 export type V4BoundedIoCapability = "bounded-read" | "bounded-append" | "free-space" | "stage-commit"
 
+export class V4ManualRecoveryRequiredError extends Error {
+  constructor(public readonly targetPath: string, reason: string) {
+    super(`V4 staged recovery needs user review for ${targetPath}: ${reason}. Original backup and local files have been preserved.`)
+    this.name = "V4ManualRecoveryRequiredError"
+  }
+}
+
+export interface V4StageCommitOptions {
+  expectedTarget: { exists: boolean; size?: number; mtime?: number; hash?: string }
+  expectedStageSize: number
+  expectedStageSha256: string
+}
+
 export class V4BoundedIoUnavailableError extends Error {
   readonly capability: V4BoundedIoCapability
   readonly path?: string
@@ -40,17 +53,17 @@ export interface V4PlatformIo {
   appendStage(path: string, bytes: Uint8Array): Promise<void>
   removeStage(path: string): Promise<void>
   freeBytes(path: string): Promise<number | undefined>
-  commitStage(stagePath: string, targetPath: string, options: {
-    expectedTarget: { exists: boolean; size?: number; mtime?: number }
-    expectedStageSize: number
-    expectedStageSha256: string
-  }): Promise<void>
+  commitStage(stagePath: string, targetPath: string, options: V4StageCommitOptions): Promise<void>
+  rollbackStage(stagePath: string, targetPath: string, options: V4StageCommitOptions): Promise<void>
+  finalizeStage(stagePath: string, targetPath: string, options: V4StageCommitOptions): Promise<void>
 }
 
 export interface V4PlatformIoOptions {
   platform: V4PlatformKind
   adapter?: V4BinaryAdapterLike
   resolveDesktopPath?: (path: string) => string
+  /** Required to prove that crash-recovery paths cannot escape the vault. */
+  desktopRootPath?: string
 }
 
 function asArrayBuffer(bytes: Uint8Array): ArrayBuffer {
@@ -125,6 +138,53 @@ export function createV4PlatformIo(options: V4PlatformIoOptions): V4PlatformIo {
     if (!desktopReady) throw new V4BoundedIoUnavailableError("bounded-read", path)
     return options.resolveDesktopPath!(path)
   }
+  const statOrNull = async (file: string) => {
+    const fs = await desktopFs()
+    try { return await fs.stat(file) } catch (error) {
+      if ((error as { code?: string }).code === "ENOENT") return null
+      throw error
+    }
+  }
+  const assertRecoveryPaths = async (stagePath: string, targetPath: string): Promise<void> => {
+    if (!desktopReady || !options.desktopRootPath) throw new V4ManualRecoveryRequiredError(targetPath, "vault root is not verifiable")
+    const [fs, pathModule] = await Promise.all([desktopFs(), desktopPath()])
+    const root = pathModule.resolve(options.desktopRootPath)
+    for (const logical of [stagePath, stagePath + ".target-backup", stagePath + ".replacement-residue", targetPath]) {
+      const requested = pathModule.resolve(full(logical))
+      const relative = pathModule.relative(root, requested)
+      if (relative === "" || relative === ".." || relative.startsWith(".." + pathModule.sep) || pathModule.isAbsolute(relative)) {
+        throw new V4ManualRecoveryRequiredError(targetPath, "path leaves the configured vault")
+      }
+      let current = root
+      for (const segment of relative.split(pathModule.sep)) {
+        current = pathModule.join(current, segment)
+        let info: Awaited<ReturnType<typeof fs.lstat>>
+        try { info = await fs.lstat(current) } catch (error) {
+          if ((error as { code?: string }).code === "ENOENT") break
+          throw error
+        }
+        if (info.isSymbolicLink()) throw new V4ManualRecoveryRequiredError(targetPath, "symlink or junction prevents safe recovery")
+      }
+    }
+  }
+  const hashFile = async (file: string, size: number): Promise<string | null> => {
+    const before = await statOrNull(file)
+    if (!before || before.size !== size || !before.isFile()) return null
+    const hash = createV4IncrementalSha256()
+    for await (const chunk of desktopBoundedSource(file, size).chunks(4 * 1024 * 1024)) hash.update(chunk)
+    const after = await statOrNull(file)
+    if (!after || after.size !== before.size || after.mtimeMs !== before.mtimeMs || after.ctimeMs !== before.ctimeMs) return null
+    return hash.digestHex()
+  }
+  const confirmBackup = async (backup: string, expected: V4StageCommitOptions["expectedTarget"]): Promise<boolean> => {
+    // Metadata alone is not proof of the original content. Older WALs without
+    // an original SHA remain untouched for user review.
+    if (!expected.exists || !Number.isSafeInteger(expected.size) || !expected.hash || !/^[0-9a-f]{64}$/u.test(expected.hash)) return false
+    const info = await statOrNull(backup)
+    return !!info && info.size === expected.size
+      && (expected.mtime === undefined || Math.trunc(info.mtimeMs) === Math.trunc(expected.mtime))
+      && await hashFile(backup, info.size) === expected.hash
+  }
   return {
     capabilities,
     async readWhole(path) {
@@ -181,8 +241,73 @@ export function createV4PlatformIo(options: V4PlatformIoOptions): V4PlatformIo {
       const stats = await fs.statfs(pathModule.dirname(target))
       return Number(stats.bavail) * Number(stats.bsize)
     },
+    async rollbackStage(stagePath, targetPath, commitOptions) {
+      if (!desktopReady) return
+      await assertRecoveryPaths(stagePath, targetPath)
+      const fs = await desktopFs()
+      const target = full(targetPath)
+      const backup = full(stagePath) + ".target-backup"
+      if (!(await statOrNull(backup))) {
+        if (await statOrNull(full(stagePath) + ".replacement-residue")) {
+          throw new V4ManualRecoveryRequiredError(targetPath, "rollback residue exists without its original backup")
+        }
+        return
+      }
+      if (!(await confirmBackup(backup, commitOptions.expectedTarget))) {
+        throw new V4ManualRecoveryRequiredError(targetPath, "the backup has no matching original-content hash")
+      }
+      const residue = full(stagePath) + ".replacement-residue"
+      if (await statOrNull(residue)) {
+        // This is only safe to complete if it is exactly the staged replacement,
+        // left by a crash after the first rename of the rollback.
+        if (await statOrNull(target) || await hashFile(residue, commitOptions.expectedStageSize) !== commitOptions.expectedStageSha256) {
+          throw new V4ManualRecoveryRequiredError(targetPath, "an unverified rollback residue exists")
+        }
+      } else if (await statOrNull(target)) {
+        if (await hashFile(target, commitOptions.expectedStageSize) !== commitOptions.expectedStageSha256) {
+          throw new V4ManualRecoveryRequiredError(targetPath, "local target differs from the staged replacement")
+        }
+        // Park rather than delete the replacement. A crash during restoration
+        // leaves both the original backup and the candidate replacement intact.
+        await fs.rename(target, residue)
+      }
+      try {
+        await fs.rename(backup, target)
+      } catch (error) {
+        if (await statOrNull(residue) && !(await statOrNull(target))) {
+          try { await fs.rename(residue, target) } catch {}
+        }
+        throw error
+      }
+      if (await statOrNull(residue)) {
+        if (await hashFile(residue, commitOptions.expectedStageSize) !== commitOptions.expectedStageSha256) {
+          throw new V4ManualRecoveryRequiredError(targetPath, "rollback residue changed during recovery")
+        }
+        await fs.rm(residue)
+      }
+    },
+    async finalizeStage(stagePath, targetPath, commitOptions) {
+      if (!desktopReady) return
+      await assertRecoveryPaths(stagePath, targetPath)
+      const fs = await desktopFs()
+      const backup = full(stagePath) + ".target-backup"
+      if (!(await statOrNull(backup))) {
+        if (await statOrNull(full(stagePath) + ".replacement-residue")) {
+          throw new V4ManualRecoveryRequiredError(targetPath, "rollback residue exists without its original backup")
+        }
+        return
+      }
+      if (!(await confirmBackup(backup, commitOptions.expectedTarget))) {
+        throw new V4ManualRecoveryRequiredError(targetPath, "the backup has no matching original-content hash")
+      }
+      if (await hashFile(full(targetPath), commitOptions.expectedStageSize) !== commitOptions.expectedStageSha256) {
+        throw new V4ManualRecoveryRequiredError(targetPath, "final target differs from the durable staged receipt")
+      }
+      await fs.rm(backup)
+    },
     async commitStage(stagePath, targetPath, commitOptions) {
       if (!desktopReady) throw new V4BoundedIoUnavailableError("stage-commit", targetPath)
+      if (options.desktopRootPath) await assertRecoveryPaths(stagePath, targetPath)
       const fs = await desktopFs()
       const stage = full(stagePath)
       const target = full(targetPath)
@@ -198,7 +323,16 @@ export function createV4PlatformIo(options: V4PlatformIoOptions): V4PlatformIo {
       }
       const stageStat = await fs.stat(stage)
       if (stageStat.size !== commitOptions.expectedStageSize) throw new Error(`V4 staged content size changed before commit: ${stagePath}`)
-      await fs.rm(backup, { force: true })
+      if (expected.exists && expected.hash) {
+        if (await hashFile(target, expected.size!) !== expected.hash) {
+          throw new V4ManualRecoveryRequiredError(targetPath, "the original target hash changed before staged commit")
+        }
+      }
+      // A surviving backup belongs to an unresolved transaction.
+      // Never silently discard it at the start of the next commit.
+      if (await statOrNull(backup) || await statOrNull(stage + ".replacement-residue")) {
+        throw new V4ManualRecoveryRequiredError(targetPath, "unresolved staged backup or rollback residue exists")
+      }
       let backedUp = false
       let stageMoved = false
       try {

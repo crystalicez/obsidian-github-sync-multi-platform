@@ -17,7 +17,7 @@ import {
 import { reconcileV4CandidatePublication } from "./publish-reconciler"
 import { buildV4JournalPages, type V4JournalChange } from "./history-journal"
 import { isV4LocalIndexCacheComplete, type V4IndexFileRecord, type V4LocalIndex } from "./local-index"
-import { assertV4LocalTargetPrecondition, createV4LocalIo, type V4LocalIo, type V4LocalTargetPrecondition, type V4SessionVault } from "./local-io"
+import { assertV4LocalTargetPrecondition, createV4LocalIo, V4LocalTargetChangedError, type V4LocalIo, type V4LocalTargetPrecondition, type V4SessionVault } from "./local-io"
 import { trashV4LocalUserFile } from "./local-delete-policy"
 import { bucketForV4PathId } from "./paths"
 import { planV4Sync, type V4LogicalFile, type V4PlannedChange, type V4SyncOperation } from "./planner"
@@ -1353,6 +1353,28 @@ export class V4SyncSession {
         stage: copy.stage,
         precondition,
       })
+    }
+    // Prove the original bytes before persisting a WAL that may later need to
+    // restore a Desktop target-backup. The persisted hash is optional for
+    // historical WAL compatibility, but new large replacements always carry it.
+    for (const mutation of mutations) {
+      if (mutation.kind !== "stage-write" || mutation.stage.size <= DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES || !mutation.precondition.exists) continue
+      const expected = mutation.precondition
+      if (!this.localIo.stat || !this.localIo.openContentSource || !Number.isSafeInteger(expected.size) || expected.size! < 0) {
+        throw new V4LocalTargetChangedError(expected.path)
+      }
+      const checkStable = async () => {
+        const current = await this.localIo.stat!(expected.path)
+        if (!current || current.size !== expected.size || current.mtime !== expected.mtime) {
+          throw new V4LocalTargetChangedError(expected.path)
+        }
+      }
+      await checkStable()
+      const source = await this.localIo.openContentSource({
+        kind: "vault", path: expected.path, expectedHash: "", expectedSize: expected.size!, expectedMtime: expected.mtime!,
+      }, this.input.signal)
+      expected.hash = await hashV4StableContentSource(source, { chunkBytes: 4 * 1024 * 1024, checkStable, signal: this.input.signal })
+      await checkStable()
     }
     return { payload: { mutations, completedMutationIds: [] }, pullCompletionIds }
   }

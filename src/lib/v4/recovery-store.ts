@@ -91,11 +91,12 @@ function isNormalizedRecoveryPath(value: unknown): value is string {
 
 function isValidRecoveryPrecondition(value: unknown, path: string): boolean {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false
-  const candidate = value as { path?: unknown; exists?: unknown; size?: unknown; mtime?: unknown }
+  const candidate = value as { path?: unknown; exists?: unknown; size?: unknown; mtime?: unknown; hash?: unknown }
   if (candidate.path !== path || typeof candidate.exists !== "boolean") return false
-  if (!candidate.exists) return candidate.size === undefined && candidate.mtime === undefined
+  if (!candidate.exists) return candidate.size === undefined && candidate.mtime === undefined && candidate.hash === undefined
   return Number.isSafeInteger(candidate.size) && (candidate.size as number) >= 0
     && typeof candidate.mtime === "number" && Number.isFinite(candidate.mtime)
+    && (candidate.hash === undefined || (typeof candidate.hash === "string" && /^[0-9a-f]{64}$/u.test(candidate.hash)))
 }
 
 function isValidRecoveryStage(value: unknown): boolean {
@@ -296,7 +297,13 @@ export async function applyV4RecoveryLocalMutations(input: {
 
   for (const mutation of payload.mutations) {
     throwIfV4Aborted(input.signal)
-    if (completed.has(mutation.id)) continue
+    if (completed.has(mutation.id)) {
+      if (mutation.kind === "stage-write") {
+        await input.io.finalizeStage?.({ stage: mutation.stage, path: mutation.path, precondition: mutation.precondition })
+        try { await input.io.staging?.remove(mutation.stage) } catch {}
+      }
+      continue
+    }
     input.onApplying?.(mutation)
     try {
       if (mutation.kind === "trash") {
@@ -317,6 +324,7 @@ export async function applyV4RecoveryLocalMutations(input: {
 
       if (await targetMatchesStage(input.io, mutation.path, mutation.stage)) {
         await receipt(mutation.id)
+        await input.io.finalizeStage?.({ stage: mutation.stage, path: mutation.path, precondition: mutation.precondition })
         try { await input.io.staging?.remove(mutation.stage) } catch {}
         input.onApplied?.(mutation)
         continue
@@ -334,6 +342,7 @@ export async function applyV4RecoveryLocalMutations(input: {
       }
       await receipt(mutation.id)
       throwIfV4Aborted(input.signal)
+      await input.io.finalizeStage?.({ stage: mutation.stage, path: mutation.path, precondition: mutation.precondition })
       try { await input.io.staging?.remove(mutation.stage) } catch {}
       input.onApplied?.(mutation)
     } catch (error) {
@@ -409,10 +418,18 @@ export async function markV4RecoveryIndexCommitted(store: V4RecoveryStore, runId
 }
 
 export async function discardV4RecoveryStages(snapshot: V4RecoverySnapshot, io: V4LocalIo, keepStageIds: ReadonlySet<string> = new Set()): Promise<void> {
-  const stageIds = new Set(snapshot.payload?.mutations.flatMap(mutation => mutation.kind === "stage-write" ? [mutation.stage.stageId] : []) ?? [])
-  for (const stageId of stageIds) {
-    if (keepStageIds.has(stageId)) continue
-    try { await io.staging?.remove({ stageId }) } catch {}
+  const done = new Set(snapshot.payload?.completedMutationIds ?? [])
+  const processed = new Set<string>()
+  for (const mutation of snapshot.payload?.mutations ?? []) {
+    if (mutation.kind !== "stage-write") continue
+    if (keepStageIds.has(mutation.stage.stageId) || processed.has(mutation.stage.stageId)) continue
+    processed.add(mutation.stage.stageId)
+    const request = { stage: mutation.stage, path: mutation.path, precondition: mutation.precondition }
+    // Never remove the staged file while an unresolved target-backup might
+    // be the only copy of the user's original content.
+    if (done.has(mutation.id)) await io.finalizeStage?.(request)
+    else await io.rollbackStage?.(request)
+    try { await io.staging?.remove(mutation.stage) } catch {}
   }
 }
 
