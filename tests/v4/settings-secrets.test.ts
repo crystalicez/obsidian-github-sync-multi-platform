@@ -1478,7 +1478,7 @@ test("layout-ready startup callback is inert after plugin unload", async () => {
   const mainSource = await readFile("src/main.ts", "utf8")
   assert.match(
     mainSource,
-    /this\.app\.workspace\.onLayoutReady\(\(\)\s*=>\s*\{\s*if\s*\(this\.unloaded\)\s*return[\s\S]*?setTimeout\(\(\)\s*=>\s*\{[\s\S]*?if\s*\(this\.unloaded\)\s*return/u,
+    /this\.app\.workspace\.onLayoutReady\(\(\)\s*=>\s*\{\s*if\s*\(this\.unloaded\)\s*return[\s\S]*?checkStartupRecovery\(true\)[\s\S]*?async checkStartupRecovery\([^)]*\)[\s\S]*?if\s*\(this\.unloaded\)\s*return[\s\S]*?setTimeout\([\s\S]*?this\.unloaded/u,
   )
 })
 
@@ -1756,7 +1756,7 @@ test("startup and scheduled callbacks are bound to the settings generation that 
   );
   assert.match(
     mainSource,
-    /onLayoutReady[\s\S]*?const generation\s*=\s*this\.v4Runtime\.settingsGeneration[\s\S]*?setTimeout\([\s\S]*?settingsGeneration\s*!==\s*generation[\s\S]*?return[\s\S]*?startupSync/u,
+    /onLayoutReady[\s\S]*?checkStartupRecovery\(true\)[\s\S]*?const generation\s*=\s*this\.v4Runtime\.settingsGeneration[\s\S]*?const startedWith\s*=\s*generation[\s\S]*?setTimeout\([\s\S]*?settingsGeneration\s*===\s*startedWith[\s\S]*?startupSync/u,
   );
 });
 

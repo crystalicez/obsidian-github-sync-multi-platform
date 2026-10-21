@@ -28,7 +28,7 @@ import { createV4PlatformIo, type V4BinaryAdapterLike, type V4PlatformIo } from 
 import { createV4StagingStore, type V4StagingStore } from "./staging-store"
 import { V4ProgressStore, type V4SyncProgressSnapshot } from "./progress"
 import { V4RunDiagnostics } from "./run-diagnostics"
-import { createV4RecoveryStore, discardV4RecoveryStages, markV4RecoveryIndexCommitted, recoverV4PendingState, V4RecoveryRequiredError } from "./recovery-store"
+import { createV4RecoveryStore, discardV4RecoveryStages, markV4RecoveryIndexCommitted, recoverV4PendingState, V4RecoveryRequiredError, type V4RecoveryInspection } from "./recovery-store"
 import { V4KeyringCache } from "./keyring-cache"
 import { V4CancelledError, throwIfV4Aborted } from "./cancellation"
 import { V4PublicationRaceError, isV4PublicationRaceError } from "./publication-race"
@@ -260,6 +260,20 @@ export class V4PluginRuntime {
   private assertSettingsTransitionInactive(): void {
     this.assertNotDisposed()
     if (this.settingsTransitionActive) throw new V4CancelledError("V4 settings change is in progress.")
+  }
+
+  /** Examine local recovery headers only; no remote reads or data mutations. */
+  async inspectLocalRecovery(): Promise<V4RecoveryInspection> {
+    this.assertSettingsTransitionInactive()
+    const generation = this.settingsGeneration
+    const repoId = this.repoId()
+    const namespace = (await sha256Hex(utf8ToBytes(repoId))).slice(0, 32)
+    this.assertSettingsGeneration(generation)
+    const inspection = await createV4RecoveryStore({
+      adapter: this.adapter, repoId, root: `${V4_RECOVERY_ROOT}/${namespace}`,
+    }).inspect()
+    this.assertSettingsGeneration(generation)
+    return inspection
   }
 
   manualSync(): Promise<unknown> { return this.runWhileSettingsStable({ operation: "normal", trigger: "manual" }) }

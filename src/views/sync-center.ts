@@ -33,6 +33,7 @@ export class V4SyncCenterView extends ItemView {
   private selected?: V4HistoryCommit
   private objectUrl?: string
   private progressCard?: HTMLElement
+  private recoveryBanner?: HTMLElement
   private progressLive?: HTMLElement
   private progressContext?: HTMLElement
   private progressDetails?: HTMLElement
@@ -68,6 +69,7 @@ export class V4SyncCenterView extends ItemView {
     this.unsubscribeProgress?.()
     this.unsubscribeProgress = undefined
     this.clearProgressElements()
+    this.recoveryBanner = undefined
     this.releaseObjectUrl()
     this.service = undefined
     this.serviceGeneration = undefined
@@ -116,6 +118,8 @@ export class V4SyncCenterView extends ItemView {
     actions.createEl("button", { text: "Sync now", cls: "mod-cta" }).onclick = () => void this.plugin.v4Runtime.manualSync()
     this.clearProgressElements()
     this.progressCard = this.contentEl.createDiv({ cls: "github-sync-center__progress" })
+    this.recoveryBanner = this.progressCard.createDiv({ cls: "github-sync-center__recovery" })
+    this.refreshRecoveryNotice()
     const progressHeading = this.progressCard.createDiv({ cls: "github-sync-center__progress-heading" })
     this.progressLive = progressHeading.createEl("strong", { cls: "github-sync-center__progress-live" })
     this.progressLive.setAttribute("role", "status")
@@ -129,6 +133,25 @@ export class V4SyncCenterView extends ItemView {
     return {
       body: layout.createDiv({ cls: "github-sync-center__master" }),
       detail: layout.createDiv({ cls: "github-sync-center__detail" }),
+    }
+  }
+
+  refreshRecoveryNotice(): void {
+    const banner = this.recoveryBanner
+    if (!banner) return
+    banner.empty()
+    const state = this.plugin.getInterruptedRecoveryState?.() ?? "none"
+    if (state === "none") return
+    banner.createEl("strong", { text: state === "corrupt"
+      ? "Recovery journal cannot be verified"
+      : state === "resolving" ? "Verifying interrupted sync" : "Interrupted sync needs attention" })
+    banner.createEl("p", { text: state === "corrupt"
+      ? "Automatic Sync is paused. Do not discard the recovery journal; check the local vault and recovery diagnostics."
+      : state === "resolving" ? "Normal reconciliation is running. Automatic Sync remains paused until it succeeds."
+        : "Automatic Sync is paused. No Force Push or Force Pull will run. Resume when ready." })
+    if (state === "pending") {
+      banner.createEl("button", { text: "Verify and resume normal Sync" })
+        .onclick = () => { void this.plugin.resumeInterruptedRecovery() }
     }
   }
 

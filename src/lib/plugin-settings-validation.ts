@@ -79,6 +79,12 @@ export function assertPluginSettingsRuntimeSafe(value: unknown): void {
     }
   }
 
+  if (settings.interruptedRecoveryPolicy !== undefined
+    && !["ask", "auto", "notify"].includes(settings.interruptedRecoveryPolicy as string)) {
+    throw new Error("Invalid plugin settings: interruptedRecoveryPolicy is unsupported.")
+  }
+  optionalString(settings, "interruptedRecoveryContext")
+
   if (settings.lastSyncTime !== undefined) {
     const lastSyncTime = settings.lastSyncTime
     if (typeof lastSyncTime !== "number" || !Number.isFinite(lastSyncTime) || lastSyncTime < 0) {

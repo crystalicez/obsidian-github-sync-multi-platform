@@ -2,9 +2,12 @@ import { Plugin, Platform, setIcon, Modal, Notice, TFile, TFolder } from "obsidi
 
 import { SettingTab, PluginSettings, DEFAULT_SETTINGS } from "./setting";
 import { GitHubClient } from "./lib/github-api";
-import { normalizeScheduledSyncIntervalSeconds, shouldRunScheduledSync, shouldRunStartupSync } from "./lib/sync-policy";
+import { hasGitHubSyncConfig, normalizeScheduledSyncIntervalSeconds, shouldRunScheduledSync, shouldRunStartupSync } from "./lib/sync-policy";
 import { migrateV4Secrets, sanitizeV4SettingsForPersistence, scrubV4SecretIds, storeV4Secrets, supersededV4SecretIds } from "./lib/v4/secrets";
 import { V4PluginRuntime } from "./lib/v4/runtime";
+import { effectiveV4RecoveryPolicy, v4RecoveryPolicyContext } from "./lib/v4/recovery-startup-policy";
+import type { V4RecoveryInspection } from "./lib/v4/recovery-store";
+import type { V4SyncProgressSnapshot } from "./lib/v4/progress";
 import { selectV4GitHubSchedulerSleep } from "./lib/v4/desktop-transport-timer";
 import { V4AutomaticWake, shouldRunV4AutomaticWake } from "./lib/v4/automatic-wake";
 import { startV4PlatformInterval } from "./lib/v4/platform-interval";
@@ -33,6 +36,11 @@ export default class FastSync extends Plugin {
   private scheduledSyncCancel: (() => void) | null = null
   private lifecycleHeartbeatCancel: (() => void) | null = null
   private lifecycleWake: V4AutomaticWake | null = null
+  private recoveryStartupGate = true
+  private recoveryState: "none" | "pending" | "corrupt" | "resolving" = "none"
+  private recoveryModal: Modal | null = null
+  private recoveryReviewEpoch = 0
+  private recoveryStartupInitialized = false
   startupSyncTimeout: number | null = null
   secretsMigrated: boolean = false
   private pendingMigratedSecretIds: string[] = []
@@ -41,7 +49,7 @@ export default class FastSync extends Plugin {
   private statusDisplaySignature?: string
 
   enableWatch() {
-    this.isWatchEnabled = true
+    this.isWatchEnabled = !this.recoveryStartupGate
   }
 
   disableWatch() {
@@ -80,7 +88,11 @@ export default class FastSync extends Plugin {
 
     this.initGitHubClient()
     this.v4Runtime = this.createV4Runtime()
-    this.register(this.v4Runtime.subscribeProgress(() => this.updateStatusBar()))
+    this.recoveryStartupInitialized = true
+    this.register(this.v4Runtime.subscribeProgress(snapshot => {
+      this.updateStatusBar()
+      this.onRecoverySyncProgress(snapshot)
+    }))
     this.registerView(V4_SYNC_CENTER_VIEW, leaf => new V4SyncCenterView(leaf, this))
     this.registerLifecycleWake()
     this.registerScheduledSync()
@@ -148,24 +160,160 @@ export default class FastSync extends Plugin {
       callback: () => void this.openSyncCenter(),
     })
 
-    // After the workspace layout is ready, run the startup sync once, then enable real-time watch
+    // Inspect the local journal before enabling automatic wakes.
     this.app.workspace.onLayoutReady(() => {
       if (this.unloaded) return
-      if (shouldRunStartupSync(this.settings)) {
-        // Delay 1.5 s to let Obsidian finish initialising
-        const generation = this.v4Runtime.settingsGeneration
-        this.startupSyncTimeout = window.setTimeout(() => {
-          this.startupSyncTimeout = null;
-          if (this.unloaded) return
-          const runtime = this.v4Runtime;
-          if (!runtime || runtime.settingsGeneration !== generation) return
-          void runtime.startupSync();
-        }, 1500);
-      } else {
-        // Not configured – enable watch immediately
-        this.enableWatch();
-      }
+      void this.checkStartupRecovery(true)
     });
+  }
+
+  getInterruptedRecoveryState(): "none" | "pending" | "corrupt" | "resolving" {
+    return this.recoveryState
+  }
+
+  private setInterruptedRecoveryState(state: typeof this.recoveryState): void {
+    this.recoveryState = state
+    for (const leaf of this.app.workspace?.getLeavesOfType?.(V4_SYNC_CENTER_VIEW) ?? []) {
+      (leaf.view as V4SyncCenterView).refreshRecoveryNotice?.()
+    }
+  }
+
+  private onRecoverySyncProgress(snapshot: V4SyncProgressSnapshot): void {
+    if (this.recoveryState !== "pending" && this.recoveryState !== "resolving") return
+    if (snapshot.operation !== "normal" || (snapshot.lifecycle !== "success" && snapshot.lifecycle !== "no-change")) return
+    this.recoveryModal?.close()
+    this.recoveryStartupGate = false
+    this.setInterruptedRecoveryState("none")
+    this.enableWatch()
+  }
+
+  /** No remote or vault-file access during this startup decision. */
+  private async checkStartupRecovery(allowStartupSync = false): Promise<void> {
+    if (this.unloaded) return
+    const epoch = ++this.recoveryReviewEpoch
+    const generation = this.v4Runtime.settingsGeneration
+    this.recoveryStartupGate = true
+    this.disableWatch()
+    if (shouldRunStartupSync(this.settings)) {
+      this.recoveryStartupGate = false
+      this.setInterruptedRecoveryState("none")
+      if (!allowStartupSync) {
+        this.enableWatch()
+        return
+      }
+      const startedWith = generation
+      this.startupSyncTimeout = window.setTimeout(() => {
+        this.startupSyncTimeout = null
+        if (!this.unloaded && !this.recoveryStartupGate && this.v4Runtime.settingsGeneration === startedWith) {
+          void this.v4Runtime.startupSync()
+        }
+      }, 1500)
+      return
+    }
+    if (!hasGitHubSyncConfig(this.settings)) {
+      this.recoveryStartupGate = false
+      this.setInterruptedRecoveryState("none")
+      this.enableWatch()
+      return
+    }
+    let inspection: V4RecoveryInspection
+    try {
+      inspection = await this.v4Runtime.inspectLocalRecovery()
+    } catch {
+      if (this.unloaded || epoch !== this.recoveryReviewEpoch || generation !== this.v4Runtime.settingsGeneration) return
+      inspection = { status: "corrupt" }
+    }
+    if (this.unloaded || epoch !== this.recoveryReviewEpoch || generation !== this.v4Runtime.settingsGeneration) return
+    if (inspection.status === "corrupt") {
+      this.setInterruptedRecoveryState("corrupt")
+      new Notice("GitHub Sync: Local recovery journal cannot be verified. Automatic Sync paused; inspect recovery before proceeding.")
+      return
+    }
+    if (inspection.status !== "pending") {
+      this.recoveryStartupGate = false
+      this.setInterruptedRecoveryState("none")
+      this.enableWatch()
+      return
+    }
+    this.setInterruptedRecoveryState("pending")
+    const policy = effectiveV4RecoveryPolicy(
+      this.settings.interruptedRecoveryPolicy, this.settings.interruptedRecoveryContext,
+      v4RecoveryPolicyContext(this.settings),
+    )
+    if (policy === "auto" && this.settings.syncEnabled) {
+      void this.resumeInterruptedRecovery()
+    } else if (policy === "ask" && this.settings.syncEnabled) {
+      this.showInterruptedRecoveryPrompt()
+    } else {
+      new Notice("GitHub Sync: Interrupted Sync detected. Open Sync Center to resume manually.")
+    }
+  }
+
+  async resumeInterruptedRecovery(): Promise<void> {
+    if (this.unloaded || this.recoveryState !== "pending" || !this.settings.syncEnabled || !hasGitHubSyncConfig(this.settings)) return
+    const generation = this.v4Runtime.settingsGeneration
+    this.recoveryModal?.close()
+    this.setInterruptedRecoveryState("resolving")
+    try {
+      const result = await this.v4Runtime.resumeSync() as { status?: string }
+      if (this.unloaded) return
+      if (generation !== this.v4Runtime.settingsGeneration) {
+        if (this.getInterruptedRecoveryState() === "resolving") this.setInterruptedRecoveryState("pending")
+        return
+      }
+      const lifecycle = this.v4Runtime.progressSnapshot.lifecycle
+      if (result.status === "completed" && (lifecycle === "success" || lifecycle === "no-change")) {
+        this.recoveryStartupGate = false
+        this.setInterruptedRecoveryState("none")
+        this.enableWatch()
+      } else if (this.getInterruptedRecoveryState() === "resolving") {
+        this.setInterruptedRecoveryState("pending")
+        new Notice("GitHub Sync: Recovery has not completed. Automatic Sync remains paused.")
+      }
+    } catch {
+      if (!this.unloaded && this.getInterruptedRecoveryState() === "resolving") {
+        this.setInterruptedRecoveryState("pending")
+        new Notice("GitHub Sync: Recovery failed. Automatic retry is disabled.")
+      }
+    }
+  }
+
+  private showInterruptedRecoveryPrompt(): void {
+    if (this.recoveryModal || this.recoveryState !== "pending" || this.unloaded) return
+    const modal = new Modal(this.app)
+    this.recoveryModal = modal
+    const context = v4RecoveryPolicyContext(this.settings)
+    modal.titleEl.setText("Unfinished GitHub Sync detected")
+    modal.contentEl.createEl("p", { text: "A local recovery journal indicates an interrupted Sync. Continuing verifies the GitHub HEAD and uses normal reconciliation, not Force Push or Force Pull. No network request has been made for this check." })
+    const rememberLabel = modal.contentEl.createEl("label")
+    const checkbox = rememberLabel.createEl("input", { attr: { type: "checkbox" } }) as HTMLInputElement
+    rememberLabel.createEl("span", { text: " Remember my choice for this vault and repository" })
+    const actions = modal.contentEl.createDiv({ cls: "github-sync-conflict__actions" })
+    let decided = false
+    const choose = async (resume: boolean) => {
+      if (decided) return
+      decided = true
+      const remember = checkbox.checked
+      modal.close()
+      if (this.unloaded || this.recoveryState !== "pending" || context !== v4RecoveryPolicyContext(this.settings)) return
+      if (remember && this.v4Runtime.isSyncing) {
+        new Notice("GitHub Sync: Cannot remember a recovery choice while another Sync is active. Choice applies once.")
+      } else if (remember) {
+        try {
+          await this.saveSettings({ ...this.settings, interruptedRecoveryPolicy: resume ? "auto" : "notify" })
+        } catch {
+          new Notice("GitHub Sync: Could not remember recovery preference; this choice applies only once.")
+        }
+      }
+      if (this.unloaded || context !== v4RecoveryPolicyContext(this.settings)) return
+      if (resume) void this.resumeInterruptedRecovery()
+      else new Notice("GitHub Sync: Recovery deferred. Automatic Sync is paused; use Sync Center to resume.")
+    }
+    actions.createEl("button", { text: "Later" }).onclick = () => { void choose(false) }
+    const resume = actions.createEl("button", { text: "Verify and resume normal Sync", cls: "mod-cta" })
+    resume.onclick = () => { void choose(true) }
+    modal.onClose = () => { if (this.recoveryModal === modal) this.recoveryModal = null }
+    modal.open()
   }
 
   initGitHubClient() {
@@ -184,6 +332,8 @@ export default class FastSync extends Plugin {
 
   onunload() {
     this.unloaded = true
+    this.recoveryReviewEpoch++
+    this.recoveryModal?.close()
     this.scheduledSyncCancel?.()
     this.scheduledSyncCancel = null
     this.lifecycleWake?.dispose()
@@ -202,7 +352,7 @@ export default class FastSync extends Plugin {
     const wake = new V4AutomaticWake({
       desktop: Platform.isDesktopApp,
       now: () => Date.now(),
-      enabled: () => !this.unloaded && shouldRunV4AutomaticWake(this.settings),
+      enabled: () => !this.unloaded && !this.recoveryStartupGate && shouldRunV4AutomaticWake(this.settings),
       isVisible: () => !document.hidden,
       isOnline: () => navigator.onLine !== false,
       run: () => this.v4Runtime.resumeSync(),
@@ -237,7 +387,7 @@ export default class FastSync extends Plugin {
     const seconds = normalizeScheduledSyncIntervalSeconds(this.settings.scheduledSyncIntervalSeconds)
     const generation = this.v4Runtime.settingsGeneration
     this.scheduledSyncCancel = startV4PlatformInterval(Platform.isDesktopApp, () => {
-      if (this.unloaded || this.v4Runtime.settingsGeneration !== generation) return
+      if (this.unloaded || this.recoveryStartupGate || this.v4Runtime.settingsGeneration !== generation) return
       if (!Platform.isDesktopApp && document.hidden) return
       if (navigator.onLine === false) return
       void this.v4Runtime.scheduledSync()
@@ -302,6 +452,10 @@ export default class FastSync extends Plugin {
       ...(missingEncryptionPassphraseSecretId && legacyEncryptionPassphrase ? [result.settings.encryptionPassphraseSecretId] : []),
     ]
     this.settings = result.settings as PluginSettings
+    this.settings.interruptedRecoveryPolicy = effectiveV4RecoveryPolicy(
+      this.settings.interruptedRecoveryPolicy, this.settings.interruptedRecoveryContext,
+      v4RecoveryPolicyContext(this.settings),
+    )
     this.secretsMigrated = result.migrated
   }
 
@@ -321,6 +475,11 @@ export default class FastSync extends Plugin {
     ) {
       preparedSettings.encryptionPassphraseSecretId = this.createSecretId("encryption-passphrase")
     }
+    const previousRecoveryContext = v4RecoveryPolicyContext(previousSettings)
+    const nextRecoveryContext = v4RecoveryPolicyContext(preparedSettings)
+    const recoveryContextChanged = previousRecoveryContext !== nextRecoveryContext
+    if (recoveryContextChanged) preparedSettings.interruptedRecoveryPolicy = "ask"
+    preparedSettings.interruptedRecoveryContext = nextRecoveryContext
     const pendingGithubTokenSecret = preparedSettings.githubTokenSecretId !== previousSettings.githubTokenSecretId
     const pendingEncryptionPassphraseSecret = preparedSettings.encryptionPassphraseSecretId !== previousSettings.encryptionPassphraseSecretId
     const pendingSecretIds = [
@@ -333,6 +492,8 @@ export default class FastSync extends Plugin {
       "encryptionMode", "encryptionPassphrase", "encryptionPassphraseSecretId",
     ] as const
     const keyContextChanged = keyContextFields.some(field => previousSettings[field] !== preparedSettings[field])
+    const restartRecoveryProbe = this.recoveryStartupInitialized
+      && (recoveryContextChanged || (this.recoveryStartupGate && this.recoveryState === "none"))
 
     this.settingsSaveInProgress = true
     try {
@@ -366,6 +527,13 @@ export default class FastSync extends Plugin {
       if (this.unloaded) return
 
       this.settings = preparedSettings
+      if (restartRecoveryProbe) {
+        this.recoveryReviewEpoch++
+        this.recoveryModal?.close()
+        this.recoveryStartupGate = true
+        this.disableWatch()
+        this.setInterruptedRecoveryState("none")
+      }
       this.v4Runtime?.credentialsChanged(keyContextChanged)
       this.initGitHubClient()
       this.registerScheduledSync()
@@ -375,6 +543,7 @@ export default class FastSync extends Plugin {
         this.v4Runtime?.finishSettingsChange()
       } finally {
         this.settingsSaveInProgress = false
+        if (restartRecoveryProbe && !this.unloaded) void this.checkStartupRecovery()
       }
     }
   }

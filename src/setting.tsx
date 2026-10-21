@@ -1,5 +1,6 @@
 import { App, PluginSettingTab, Notice, Setting, Platform } from "obsidian";
 import { KofiImage } from "./lib/icons";
+import type { V4InterruptedRecoveryPolicy } from "./lib/v4/recovery-startup-policy";
 
 import FastSync from "./main";
 import { dump } from "./lib/helps";
@@ -18,6 +19,8 @@ export interface PluginSettings {
   encryptionPassphrase: string
   encryptionPassphraseSecretId: string
   syncOnStartup: boolean
+  interruptedRecoveryPolicy: V4InterruptedRecoveryPolicy
+  interruptedRecoveryContext: string
   syncOnLocalChange: boolean
   scheduledSyncEnabled: boolean
   scheduledSyncIntervalSeconds: number
@@ -53,6 +56,8 @@ export const DEFAULT_SETTINGS: PluginSettings = {
   encryptionPassphrase: "",
   encryptionPassphraseSecretId: "",
   syncOnStartup: true,
+  interruptedRecoveryPolicy: "ask",
+  interruptedRecoveryContext: "",
   syncOnLocalChange: true,
   scheduledSyncEnabled: false,
   scheduledSyncIntervalSeconds: 300,
@@ -437,6 +442,19 @@ export class SettingTab extends PluginSettingTab {
           this.updateDirtyState()
         })
       )
+
+    new Setting(set)
+      .setName("Interrupted sync recovery")
+      .setDesc("When unfinished recovery data is found on startup, ask before syncing, automatically resume a normal sync, or notify only. This is separate from startup sync and applies only to this vault.")
+      .addDropdown(dropdown => dropdown
+        .addOption("ask", "Ask every time (recommended)")
+        .addOption("auto", "Automatically resume normal sync")
+        .addOption("notify", "Notify only — sync manually")
+        .setValue(this.tempSettings!.interruptedRecoveryPolicy)
+        .onChange(value => {
+          this.tempSettings!.interruptedRecoveryPolicy = value as V4InterruptedRecoveryPolicy
+          this.updateDirtyState()
+        }))
 
     new Setting(set)
       .setName("Sync when local files change")

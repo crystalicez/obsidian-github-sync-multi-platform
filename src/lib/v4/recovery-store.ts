@@ -27,7 +27,15 @@ export class V4RecoveryRequiredError extends Error {
   }
 }
 
+export type V4RecoveryInspection =
+  | { status: "absent" }
+  | { status: "completed"; phase: "index-committed" }
+  | { status: "pending"; phase: Exclude<V4RecoveryPhase, "index-committed"> }
+  | { status: "corrupt" }
+
 export interface V4RecoveryStore {
+  /** Local-only header check; never decrypts, writes, or contacts GitHub. */
+  inspect(): Promise<V4RecoveryInspection>
   load(): Promise<V4RecoverySnapshot | null>
   save(input: Omit<V4RecoveryHeader, "schemaVersion" | "generation" | "payloadCiphertext" | "integrity"> & { payload?: V4RecoveryPayload }): Promise<V4RecoverySnapshot>
 }
@@ -174,6 +182,17 @@ export function createV4RecoveryStore(options: {
     return { present: true, header }
   }
 
+  const inspect = async (): Promise<V4RecoveryInspection> => {
+    const slots = await Promise.all([readSlot(0), readSlot(1)])
+    if (slots.some(slot => slot.present && !slot.header)) return { status: "corrupt" }
+    const headers = slots.flatMap(slot => slot.header ? [slot.header] : [])
+    if (!headers.length) return { status: "absent" }
+    const latest = headers.reduce((a, b) => b.generation > a.generation ? b : a)
+    return latest.phase === "index-committed"
+      ? { status: "completed", phase: latest.phase }
+      : { status: "pending", phase: latest.phase }
+  }
+
   const load = async (): Promise<V4RecoverySnapshot | null> => {
     const slots = await Promise.all([readSlot(0), readSlot(1)])
     const validHeaders = slots.flatMap(slot => slot.header ? [slot.header] : [])
@@ -192,6 +211,7 @@ export function createV4RecoveryStore(options: {
   }
 
   return {
+    inspect,
     load,
     async save(input) {
       if (input.payload && !isPayload(input.payload)) {
