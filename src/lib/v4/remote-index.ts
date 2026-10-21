@@ -13,6 +13,17 @@ export interface V4RemoteShard {
 }
 
 function assertNormalizedRemoteRecord(record: V4IndexFileRecord, config: V4RemoteConfig): void {
+  if (!record || typeof record !== "object" || Array.isArray(record)) throw new Error("V4 remote record descriptor is invalid.")
+  if (typeof record.path !== "string") throw new Error("V4 remote record path is invalid.")
+  if (typeof record.pathId !== "string" || !/^[0-9a-f]{64}$/u.test(record.pathId)) throw new Error("V4 remote record pathId is invalid.")
+  if (typeof record.fileId !== "string" || !record.fileId) throw new Error("V4 remote record fileId is invalid.")
+  if (typeof record.plaintextSha256 !== "string" || !record.plaintextSha256) throw new Error("V4 remote record plaintext hash is invalid.")
+  if (typeof record.remoteVersion !== "string" || !record.remoteVersion) {
+    throw new Error("V4 remote record version is invalid.")
+  }
+  if (!Number.isSafeInteger(record.size) || record.size < 0) throw new Error("V4 remote record size is invalid.")
+  if (typeof record.mtime !== "number" || !Number.isFinite(record.mtime)) throw new Error("V4 remote record mtime is invalid.")
+  if (typeof record.remotePath !== "string" || !record.remotePath) throw new Error("V4 remote record remote path is invalid.")
   let normalized: string
   try {
     normalized = normalizeV4VaultPath(record.path)
@@ -61,15 +72,43 @@ export function assertV4RemoteShardRecords(shard: V4RemoteShard, bucket: string,
   }
 }
 
+/**
+ * Reject remote file-to-directory and canonical spelling aliases before a local
+ * mutation can overwrite one of their logical paths on another filesystem.
+ * Fail closed: no persistent format migration or implicit rename is performed.
+ */
+export function assertV4LogicalPathSetSafe(paths: Iterable<string>): void {
+  const logicalPaths = new Set<string>()
+  const canonicalLogicalPaths = new Map<string, string>()
+  for (const path of paths) {
+    if (logicalPaths.has(path)) throw new Error(`Duplicate V4 remote logical path: ${path}`)
+    logicalPaths.add(path)
+    const canonicalPath = path.normalize("NFC").toLowerCase()
+    const canonicalPrevious = canonicalLogicalPaths.get(canonicalPath)
+    if (canonicalPrevious && canonicalPrevious !== path) {
+      throw new Error(`V4 remote logical path canonical collision: ${canonicalPrevious} <-> ${path}`)
+    }
+    canonicalLogicalPaths.set(canonicalPath, path)
+  }
+  for (const [canonicalPath, originalPath] of canonicalLogicalPaths) {
+    let slash = canonicalPath.indexOf("/")
+    while (slash > 0) {
+      const originalAncestor = canonicalLogicalPaths.get(canonicalPath.slice(0, slash))
+      if (originalAncestor) {
+        throw new Error(`V4 remote logical path topology collision: ${originalAncestor} is a file ancestor of ${originalPath}`)
+      }
+      slash = canonicalPath.indexOf("/", slash + 1)
+    }
+  }
+}
+
 export async function assertV4RemoteRecordSet(records: V4IndexFileRecord[], config: V4RemoteConfig, keyring?: V4Keyring): Promise<void> {
   const fileIds = new Set<string>()
-  const logicalPaths = new Set<string>()
+  for (const record of records) assertNormalizedRemoteRecord(record, config)
+  assertV4LogicalPathSetSafe(records.map(record => record.path))
   for (const record of records) {
-    assertNormalizedRemoteRecord(record, config)
     if (fileIds.has(record.fileId)) throw new Error(`Duplicate V4 remote fileId: ${record.fileId}`)
     fileIds.add(record.fileId)
-    if (logicalPaths.has(record.path)) throw new Error(`Duplicate V4 remote logical path: ${record.path}`)
-    logicalPaths.add(record.path)
     if (config.mode === "encrypted" && !keyring) throw new Error("Encryption passphrase is required to validate encrypted V4 records.")
     const expectedPathId = config.mode === "encrypted"
       ? await pathIdForV4Path(keyring!.pathKey, record.path)
