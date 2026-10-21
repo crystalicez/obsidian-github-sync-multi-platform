@@ -52,6 +52,8 @@ function success(r, codes, label) {
 let attemptedCreation = false
 let created = false
 let cleanupVerified = false
+let concurrentWinnerVerified = false
+let discardedResponseVerified = false
 let qualification = "not-run"
 let error
 try {
@@ -115,6 +117,46 @@ try {
   assert.equal(secondResult?.data?.updateRefs?.clientMutationId, "cas-second")
   assert.ok(!secondResult?.errors?.length, "Second CAS returned GraphQL errors")
   assert.equal((await readE2EBranch({ ...config, branch })).sha, second)
+
+  // Two independent writers concurrently compare against the SAME branch head.
+  // Both children are valid fast-forwards: exactly one compare-and-swap must win.
+  const siblings = []
+  for (const side of ["A", "B"]) {
+    const result = success(await request(`${api}/git/commits`, "POST", {
+      message: `obsidian-sync-v4:graphql-cas-concurrent-${side}`,
+      tree, parents: [second],
+    }), [201], "Create concurrent CAS candidate")
+    assert.match(result.sha, SHA)
+    siblings.push(result.sha)
+  }
+  const competing = await Promise.all([
+    cas(second, siblings[0], "cas-concurrent-A"),
+    cas(second, siblings[1], "cas-concurrent-B"),
+  ])
+  const successful = competing.map((result, index) =>
+    result.status === 200 && result.data?.data?.updateRefs?.clientMutationId ===
+      `cas-concurrent-${index === 0 ? "A" : "B"}` && !result.data?.errors?.length)
+  assert.equal(successful.filter(Boolean).length, 1, "Exactly one concurrent CAS must succeed")
+  assert.ok(competing.every((result, index) => successful[index]
+    || result.status >= 400 || Array.isArray(result.data?.errors)),
+  "Competing CAS must explicitly reject the losing writer")
+  const winner = siblings[successful.indexOf(true)]
+  assert.equal((await readE2EBranch({ ...config, branch })).sha, winner,
+    "Concurrent publication did not preserve its sole winner")
+  concurrentWinnerVerified = true
+
+  // Simulate a client losing the response AFTER the live server has applied CAS.
+  // This is a discarded client response, NOT a physical network outage.
+  const child = success(await request(`${api}/git/commits`, "POST", {
+    message: "obsidian-sync-v4:graphql-cas-lost-response",
+    tree, parents: [winner],
+  }), [201], "Create lost-response candidate")
+  assert.match(child.sha, SHA)
+  await cas(winner, child.sha, "cas-client-dropped-response") // intentionally ignore ACK
+  const observedAfterDiscard = await readE2EBranch({ ...config, branch })
+  assert.equal(observedAfterDiscard.sha, child.sha,
+    "Explicit HEAD reconciliation could not recover after simulated lost response")
+  discardedResponseVerified = true
   qualification = "pass"
 } catch (caught) {
   error = caught
@@ -136,6 +178,7 @@ try {
 console.log(JSON.stringify({
   test: "GraphQL strict CAS on uniquely created disposable test branch",
   branch, created, outcome: qualification, cleanupVerified,
+  concurrentWinnerVerified, discardedResponseVerified,
   ...(error ? { failure: String(error?.message || error).slice(0,300) } : {}),
 }))
 if (error || !cleanupVerified || qualification !== "pass") process.exitCode = 1

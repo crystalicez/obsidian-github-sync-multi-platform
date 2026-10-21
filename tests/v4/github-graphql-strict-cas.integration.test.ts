@@ -105,6 +105,56 @@ test("GraphQL missing acknowledgement is reconciled before success, not treated 
   } finally { setRequestUrlHandler(null) }
 })
 
+
+test("GraphQL HTTP 200 secondary rate limit rejects one CAS without retry or REST fallback", async () => {
+  let head = base
+  let posts = 0
+  let patches = 0
+  setRequestUrlHandler(async (raw: unknown) => {
+    const request = raw as { method: string; url: string; body?: string }
+    if (request.method === "GET" && request.url.endsWith("/repos/owner/repo")) {
+      return ok({ node_id: "R_repo_node", full_name: "owner/repo" })
+    }
+    if (request.method === "GET" && request.url.includes("/git/ref/heads/main")) return ref(head)
+    if (request.method === "POST" && request.url.endsWith("/graphql")) {
+      verifyRequest(request)
+      posts++
+      return ok({ errors: [{ type: "RATE_LIMITED", message: "You have exceeded a secondary rate limit" }] })
+    }
+    if (request.method === "PATCH") patches++
+    throw Error("unexpected request")
+  })
+  try {
+    await assert.rejects(() => publishV4CandidateRef(newClient(), candidate), /GraphQL strict CAS rate limited/)
+    assert.equal(head, base)
+    assert.equal(posts, 1)
+    assert.equal(patches, 0)
+  } finally { setRequestUrlHandler(null) }
+})
+
+test("GraphQL explicit HTTP 403 permission error never falls back to REST", async () => {
+  let posts = 0
+  let patches = 0
+  setRequestUrlHandler(async (raw: unknown) => {
+    const request = raw as { method: string; url: string }
+    if (request.method === "GET" && request.url.endsWith("/repos/owner/repo")) {
+      return ok({ node_id: "R_repo_node", full_name: "owner/repo" })
+    }
+    if (request.method === "GET" && request.url.includes("/git/ref/heads/main")) return ref(base)
+    if (request.method === "POST" && request.url.endsWith("/graphql")) {
+      posts++
+      return ok({ message: "Resource not accessible by integration" }, 403)
+    }
+    if (request.method === "PATCH") patches++
+    throw Error("unexpected request")
+  })
+  try {
+    await assert.rejects(() => publishV4CandidateRef(newClient(), candidate), /HTTP 403/)
+    assert.equal(posts, 1)
+    assert.equal(patches, 0)
+  } finally { setRequestUrlHandler(null) }
+})
+
 test("repository identity mismatch fails before GraphQL or REST ref mutation", async () => {
   let writes = 0
   setRequestUrlHandler(async (raw: unknown) => {

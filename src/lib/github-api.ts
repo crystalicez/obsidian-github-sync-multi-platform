@@ -720,7 +720,15 @@ export class GitHubClient {
     });
     const payload = response.json as { errors?: unknown; data?: { updateRefs?: { clientMutationId?: unknown } | null } } | null;
     if (payload && Object.hasOwn(payload, "errors")) {
-      throw this.gitHttpError("GraphQL strict CAS rejected", 422, "GraphQL reported an error.");
+      // GitHub may report GraphQL rate limits with HTTP 200. Do not resend CAS:
+      // the caller must reconcile the HEAD before any later publication.
+      const rateLimited = Array.isArray(payload.errors) && payload.errors.some(item => {
+        const error = item as { type?: unknown; message?: unknown } | null;
+        return error?.type === "RATE_LIMITED"
+          || (typeof error?.message === "string" && /rate limit|abuse detection/iu.test(error.message));
+      });
+      throw this.gitHttpError(rateLimited ? "GraphQL strict CAS rate limited" : "GraphQL strict CAS rejected",
+        422, "GraphQL reported an error.");
     }
     if (payload?.data?.updateRefs?.clientMutationId !== clientMutationId) {
       throw new V4GitMutationOutcomeUnknownError("reachable-ref", new Error("GraphQL CAS acknowledgement is missing or mismatched."));
