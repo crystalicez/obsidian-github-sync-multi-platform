@@ -26,7 +26,7 @@ The runner executes E2E test files serially so their destructive branch reset/cl
 
 This is a live network and multi-device correctness smoke suite. It is **not** physical-device qualification, 5 GiB qualification, pack-scale benchmarking, or a large-file performance claim. Physical Windows/Android evidence remains separate in `tests/baselines/v4/` and `docs/testing/v4-windows-android-validation.md`.
 
-Release-qualifying GitHub Actions deliberately do **not** compile the live suites on the credentialed runner. Ordinary read-only CI compiles the exact three E2E bundles and publishes a provenance-bound artifact; **GitHub E2E Live** consumes only those verified bundles on a fresh runner.
+**Policy from 2026-10-21: GitHub Actions are prohibited for this project.** Qualification is local/manual only with isolated credentials and exact target repository ID. The local `pnpm qualify:local` process compiles and verifies the E2E inputs before running against a unique disposable branch, and requires cleanup/absence evidence before producing an exact-SHA qualification receipt.
 
 ## Local/manual configuration
 
@@ -96,85 +96,21 @@ A hard process kill, machine loss, or power failure can prevent this outer clean
 
 An already-valid remote qualification receipt for the exact current SHA/version/toolchain/gate contract may short-circuit a later `qualify:local` invocation after source/master/toolchain verification; E2E credentials are needed when creating a new qualification, not to re-prove an existing valid receipt.
 
-## GitHub Actions live qualification
+## Local-only qualification — no hosted workflows
 
-In repository **Settings -> Environments**, create or update `github-e2e`:
+The only approved qualification workflow is the explicit maintainer-local `pnpm qualify:local` path. It verifies exact source commit SHA, canonical origin, toolchain, pinned disposable E2E repository identity, generated unique branch, real tests, and cleanup. There is no hosted qualification or GitHub Actions runner, and no need to configure GitHub Actions Environments.
 
-```text
-Settings -> Environments -> github-e2e
-Deployment branches and tags -> Selected branches and tags
-Allowed branch -> master
-Allowed tags -> none
-
-Variable: E2E_OWNER
-Variable: E2E_REPO
-Variable: E2E_REPO_ID
-Secret:   E2E_TOKEN
-```
-
-Do not choose **Protected branches only** while `master` has no branch-protection rule. The environment must explicitly allow `master` and no release tags.
-
-Do not create variables/secrets named `GITHUB_E2E_*`; GitHub reserves the `GITHUB_` prefix. The workflow maps environment configuration into process variables only in the fixed steps that need them.
-
-`E2E_REPO_ID` is the authority. `E2E_OWNER/E2E_REPO` only route the API request. Before target work, the workflow resolves current repository metadata and requires:
-
-```text
-resolved target ID == E2E_REPO_ID
-resolved target ID != source GITHUB_REPOSITORY_ID
-run-derived branch != actual target default branch
-actual target default-branch Git ref is readable
-```
-
-For each workflow run the destructive branch is exactly:
-
-```text
-obsidian-sync-e2e/run-${GITHUB_RUN_ID}
-```
-
-Different workflow run IDs therefore isolate branch state. Reruns of one workflow run intentionally reuse that run's branch.
-
-### Release-qualifying execution flow
-
-A qualifying current workflow attempt is:
-
-```text
-newest exact-SHA ordinary CI push run/current attempt succeeds
--> exact github-e2e-input artifact is selected and verified
--> fresh live runner validates archive digest/shape/manifest/bundle hashes
--> pinned target identity + default-ref capability are proven
--> same-attempt qualification receipt is uploaded successfully
--> exact three verified bundles execute serially with target credential
--> cleanup independently re-proves current pinned target identity/capability
--> cleanup succeeds in that same workflow attempt
-```
-
-The receipt artifact is named:
-
-```text
-github-e2e-target-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}
-```
-
-It binds the live attempt to its exact source SHA, authoritative CI producer/artifact, and observed target identity. Receipt persistence is blocking and occurs before scenario target mutation. The receipt does not itself prove the tests passed; `qualify` job success does that.
-
-A release qualification must be cohesive in one **current/latest workflow attempt**: `qualify` success, a valid same-attempt receipt, and `cleanup` success. Older job executions are never mixed with a newer attempt.
-
-If cleanup fails, **Re-run failed jobs** may safely remove residue. That cleanup-only attempt is maintenance evidence only and is **not** release qualification. To restore release qualification, use **Re-run all jobs** so the new current attempt runs `qualify`, writes a new receipt, executes the bundles, and completes cleanup.
+Do not dispatch or enable GitHub Actions. The absence of workflow runs is intentional and is not a release blocker.
 
 ## Cleanup residue
 
 Hard cancellation can prevent cleanup from running. Residue remains isolated by the run-specific branch.
 
-For an Actions run:
-
-```text
-obsidian-sync-e2e/run-<GITHUB_RUN_ID>
-```
-
 For official local qualification, use the exact `obsidian-sync-e2e/local-...` branch printed by `qualify:local`.
 
 Cleanup is fail-closed. Before each delete attempt for an official local qualification branch, the tool re-resolves the configured target, requires its numeric repository ID to equal `GITHUB_E2E_EXPECTED_REPO_ID`, rejects canonical/current source repository IDs, rejects the actual default branch, and proves the default Git ref is readable. Success requires another target proof followed by a fresh exact-branch read that is absent; an absence observed before that proof is not sufficient.
 
-For Actions residue, follow the pinned-ID/default-ref procedure documented by the workflow. Never treat an arbitrary 404/422 as sufficient cleanup proof, and never reuse cleanup guidance against the source repository or a real notes branch.
+Never treat an arbitrary 404/422 as sufficient cleanup proof, and never reuse cleanup guidance against the source repository or a real notes branch.
 
 ## Metrics
 

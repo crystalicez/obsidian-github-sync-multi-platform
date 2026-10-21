@@ -3,18 +3,30 @@ import test from "node:test";
 import { readdir, readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 
-const workflowDir = resolve(".github/workflows");
+test("repository ships no executable GitHub Actions workflows", async () => {
+  let entries = [];
+  try { entries = await readdir(resolve(".github/workflows")); }
+  catch (error) { if (error?.code !== "ENOENT") throw error; }
+  assert.deepEqual(entries.filter(name => /\.ya?ml$/iu.test(name)), [],
+    "GitHub Actions must remain absent; qualification and release use the local-only path");
+});
 
-test("external workflow actions are full-SHA pinned", async () => {
-  const failures = [];
-  const files = (await readdir(workflowDir)).filter(name => /\.ya?ml$/u.test(name)).sort();
-  for (const file of files) {
-    const text = await readFile(resolve(workflowDir, file), "utf8");
-    for (const [index, line] of text.split(/\r?\n/u).entries()) {
-      const match = line.match(/^\s*uses:\s*([^\s#]+)(?:\s+#.*)?$/u);
-      if (!match || match[1].startsWith("./")) continue;
-      if (!/^[^@\s]+@[0-9a-f]{40}$/u.test(match[1])) failures.push(`${file}:${index + 1}: ${match[1]}`);
-    }
-  }
-  assert.deepEqual(failures, []);
+test("maintainer qualification and publication stay exact-SHA and local-only", async () => {
+  const [qualify, release, lib, packageJson] = await Promise.all([
+    readFile(resolve("scripts/local-qualify.mjs"), "utf8"),
+    readFile(resolve("scripts/local-release.mjs"), "utf8"),
+    readFile(resolve("scripts/local-release-lib.mjs"), "utf8"),
+    readFile(resolve("package.json"), "utf8"),
+  ]);
+  const scripts = JSON.parse(packageJson).scripts;
+  assert.equal(scripts["qualify:local"], "node scripts/local-qualify.mjs");
+  assert.equal(scripts["release:local"], "node scripts/local-release.mjs");
+  assert.match(qualify, /requireCleanMaster/u);
+  assert.match(qualify, /readRemoteMasterSha/u);
+  assert.match(qualify, /cleanupE2EBranch/u);
+  assert.match(release, /validateQualificationReceipt/u);
+  assert.match(release, /createStableRef/u);
+  assert.match(release, /verifyReleaseAssets/u);
+  assert.match(lib, /"github-e2e-cleanup-verified"/u);
+  assert.doesNotMatch(qualify + release, /actions\/workflows\/|workflow_dispatch|gh workflow run/iu);
 });
