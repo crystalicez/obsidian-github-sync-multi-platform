@@ -1,6 +1,7 @@
 import type { GitHubCommitSummary, GitHubTree } from "../github-api"
 import { bytesToUtf8 } from "../bytes"
 import { decryptV4Payload, type V4Keyring } from "./crypto"
+import { assertV4MetadataBytes } from "./metadata-bounds"
 import type { V4JournalChange, V4JournalPage, V4VersionDescriptor } from "./history-journal"
 import type { V4IndexFileRecord } from "./local-index"
 import { expectedV4PathLayout, V4_ROOT, type V4RemoteConfig } from "./protocol-types"
@@ -109,9 +110,11 @@ export class V4HistoryService {
     const path = `${V4_ROOT}/journals/${journalId}/${String(page).padStart(6, "0")}.${encrypted ? "enc" : "json"}`
     const file = await this.input.github.getFileBytes(path, commitSha)
     if (!file) throw new Error(`V4 history journal is missing: ${journalId}/${page}`)
+    assertV4MetadataBytes(file.bytes, "journal", encrypted)
     const bytes = encrypted
       ? await decryptV4Payload(this.input.keyring!.journalKey, file.bytes, { kind: "journal", aad: `${this.input.config.repoId}:${journalId}:${page}` })
       : file.bytes
+    assertV4MetadataBytes(bytes, "journal")
     const journal = JSON.parse(bytesToUtf8(bytes)) as V4JournalPage
     if (journal.journalId !== journalId || journal.page !== page) throw new Error("V4 history journal identity mismatch.")
     return journal

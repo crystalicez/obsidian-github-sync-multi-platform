@@ -111,13 +111,14 @@ function createRuntimeStagingStore(platformIo: V4PlatformIo, stageRoot: string):
 function createIndexAdapter(plugin: FastSync): V4LocalIndexAdapter {
   const vault = plugin.app.vault as FastSync["app"]["vault"] & {
     configDir?: string
-    adapter?: { read(path: string): Promise<string>; write(path: string, data: string): Promise<void>; exists(path: string): Promise<boolean>; mkdir(path: string): Promise<void> }
+    adapter?: { read(path: string): Promise<string>; write(path: string, data: string): Promise<void>; exists(path: string): Promise<boolean>; mkdir(path: string): Promise<void>; stat?(path: string): Promise<{ size: number } | null> }
   }
   if (!vault.adapter) return createMemoryAdapter(plugin)
   const base = `${vault.configDir || ".obsidian"}/plugins/${plugin.manifest.id}`
   const resolve = (path: string) => `${base}/${path.replace(/^\/+/, "")}`
   return {
     read: path => vault.adapter!.read(resolve(path)),
+    stat: async path => vault.adapter!.stat?.(resolve(path)) ?? null,
     write: (path, value) => vault.adapter!.write(resolve(path), value),
     exists: path => vault.adapter!.exists(resolve(path)),
     mkdir: async path => { try { await vault.adapter!.mkdir(resolve(path)) } catch (error) { if (!/exist/i.test((error as Error).message)) throw error } },
