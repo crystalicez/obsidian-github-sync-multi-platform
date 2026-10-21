@@ -25,6 +25,7 @@ function fixture(status: "pending" | "corrupt" | "absent", policy: "ask" | "auto
   plugin.v4Runtime = {
     get settingsGeneration() { return 1 },
     get progressSnapshot() { return snapshot },
+    set progressSnapshot(value) { snapshot = value },
     async inspectLocalRecovery() { inspectCalls++; return { status, phase: "publish-intent" } },
     async resumeSync() {
       remoteCalls++
@@ -81,6 +82,32 @@ test("Notify only holds automatic work until an explicit normal Sync succeeds", 
   assert.equal(f.resumes, 0)
   assert.equal(modalEvents.length, 0)
   f.plugin.onRecoverySyncProgress({ ...createIdleV4Progress(), operation: "normal", trigger: "manual", lifecycle: "success" })
+  assert.equal(f.plugin.getInterruptedRecoveryState(), "none")
+  assert.equal(f.plugin.recoveryStartupGate, false)
+})
+
+test("stale scheduled success cannot bypass an unanswered recovery decision", async () => {
+  const f = fixture("pending", "notify")
+  await f.plugin.checkStartupRecovery()
+  f.plugin.onRecoverySyncProgress({ ...createIdleV4Progress(), operation: "normal", trigger: "scheduled", lifecycle: "success" })
+  assert.equal(f.plugin.getInterruptedRecoveryState(), "pending")
+  assert.equal(f.plugin.recoveryStartupGate, true)
+  assert.equal(f.resumes, 0)
+})
+
+test("old scheduled completion while explicitly resuming cannot release gate early", async () => {
+  const f = fixture("pending", "notify")
+  let complete!: (result: { status: string }) => void
+  f.plugin.v4Runtime.resumeSync = () => new Promise(resolve => { complete = resolve })
+  f.plugin.v4Runtime.progressSnapshot = { ...createIdleV4Progress(), lifecycle: "no-change" }
+  await f.plugin.checkStartupRecovery()
+  const result = f.plugin.resumeInterruptedRecovery()
+  assert.equal(f.plugin.getInterruptedRecoveryState(), "resolving")
+  f.plugin.onRecoverySyncProgress({ ...createIdleV4Progress(), operation: "normal", trigger: "scheduled", lifecycle: "success" })
+  assert.equal(f.plugin.getInterruptedRecoveryState(), "resolving")
+  assert.equal(f.plugin.recoveryStartupGate, true)
+  complete({ status: "completed" })
+  await result
   assert.equal(f.plugin.getInterruptedRecoveryState(), "none")
   assert.equal(f.plugin.recoveryStartupGate, false)
 })

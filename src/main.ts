@@ -179,7 +179,9 @@ export default class FastSync extends Plugin {
   }
 
   private onRecoverySyncProgress(snapshot: V4SyncProgressSnapshot): void {
-    if (this.recoveryState !== "pending" && this.recoveryState !== "resolving") return
+    // Only an explicit manual Sync may clear an unanswered recovery decision.
+    // resumeInterruptedRecovery handles its own result after the coordinator settles.
+    if (this.recoveryState !== "pending" || snapshot.trigger !== "manual") return
     if (snapshot.operation !== "normal" || (snapshot.lifecycle !== "success" && snapshot.lifecycle !== "no-change")) return
     this.recoveryModal?.close()
     this.recoveryStartupGate = false
