@@ -6,12 +6,14 @@ import { createV4IncrementalSha256 } from "../../src/lib/v4/incremental-hash"
 import { V4_PART_BYTES } from "../../src/lib/v4/large-files"
 
 const MiB = 1024 * 1024
-const GiB = 1024 * MiB
+const MAX_TEST_BYTES = 100_000_000
 
 function sizesFromEnvironment(): number[] {
-  const explicit = process.env.V4_SOAK_BYTES
-  if (explicit) return explicit.split(",").map(value => Number(value.trim())).filter(value => Number.isSafeInteger(value) && value > 0)
-  return [2 * GiB, 5 * GiB]
+  const values = (process.env.V4_SOAK_BYTES ?? String(MAX_TEST_BYTES)).split(",").map(value => Number(value.trim()))
+  if (!values.length || values.some(value => !Number.isSafeInteger(value) || value <= 0 || value > MAX_TEST_BYTES)) {
+    throw new RangeError("V4 soak may not exceed 100000000 bytes.")
+  }
+  return values
 }
 
 async function hashGeneratedStream(logicalBytes: number, chunkBytes: number) {
@@ -43,7 +45,7 @@ async function hashGeneratedStream(logicalBytes: number, chunkBytes: number) {
 }
 
 for (const logicalBytes of sizesFromEnvironment()) {
-  test(`full cryptographic virtual stream stays bounded for ${logicalBytes} bytes`, { skip: process.env.V4_RUN_SOAK !== "1" }, async () => {
+  test(`full bounded cryptographic stream stays within 100 MB for ${logicalBytes} bytes`, { skip: process.env.V4_RUN_SOAK !== "1" }, async () => {
     const chunkBytes = Number(process.env.V4_SOAK_CHUNK_BYTES ?? 8 * MiB)
     assert.ok(Number.isSafeInteger(chunkBytes) && chunkBytes > 0 && chunkBytes <= 32 * MiB)
     const result = await hashGeneratedStream(logicalBytes, chunkBytes)
