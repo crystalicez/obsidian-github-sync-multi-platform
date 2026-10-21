@@ -31,6 +31,15 @@ test("cooldown honors GitHub Retry-After, primary reset and 60-second fallback (
   assert.equal(githubRateLimitUntil({ "x-ratelimit-remaining": "10", "x-ratelimit-reset": "2000" }, now), now + 60_000)
   assert.equal(githubRateLimitUntil({}, now), now + 60_000)
   assert.equal(githubRateLimitUntil({ "retry-after": "invalid" }, now), now + 60_000)
+  const utc = Date.parse("Wed, 21 Oct 2026 10:00:00 GMT")
+  const dateDeadline = new Date(utc + 5 * 60_000).toUTCString()
+  assert.equal(githubRateLimitUntil({ "retry-after": dateDeadline }, utc), utc + 5 * 60_000,
+    "RFC 9110 Retry-After HTTP-date must not become a 60-second fallback")
+  assert.equal(githubRateLimitUntil({
+    "retry-after": dateDeadline,
+    "x-ratelimit-remaining": "0",
+    "x-ratelimit-reset": String((utc + 10 * 60_000) / 1_000),
+  }, utc), utc + 10 * 60_000, "The later primary reset must still win")
   assert.equal(githubRateLimitUntil({ "retry-after": "0" }, now), now + 60_000)
   assert.equal(githubRateLimitUntil({ "retry-after": "0.000" }, now), now + 60_000)
   assert.equal(githubRateLimitUntil({ "retry-after": "9999999999999999999999999" }, now), now + 60_000)

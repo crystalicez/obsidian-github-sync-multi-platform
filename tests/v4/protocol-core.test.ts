@@ -87,3 +87,17 @@ test("v4 logical vault paths reject cross-platform unsafe filename segments", ()
   assert.equal(normalizeV4VaultPath("Folder/normal.note.md"), "Folder/normal.note.md");
   assert.equal(normalizeV4VaultPath("console.md"), "console.md");
 });
+
+test("v4 portable paths reject malformed Unicode instead of aliasing distinct UTF-8 identities", () => {
+  const high = String.fromCharCode(0xd800);
+  const low = String.fromCharCode(0xdc00);
+  for (const path of [
+    `Notes/bad-${high}.md`,
+    `Notes/bad-${low}.md`,
+    `Notes/bad-${high}x.md`,
+    `Notes/bad-x${low}.md`,
+  ]) {
+    assert.throws(() => normalizeV4VaultPath(path), /Unsafe cross-platform V4 vault path/u);
+  }
+  assert.equal(normalizeV4VaultPath("Notes/😀.md"), "Notes/😀.md");
+});

@@ -3,9 +3,14 @@ export function githubRateLimitUntil(headers: Record<string, string>, now = Date
   const h = Object.fromEntries(Object.entries(headers).map(([name, value]) => [name.toLowerCase(), value]))
   const after = h["retry-after"]?.trim()
   const seconds = after && /^\d+(?:\.\d+)?$/u.test(after) ? Number(after) : 0
-  const retryUntil = seconds > 0 && Number.isSafeInteger(now + Math.ceil(seconds * 1_000))
+  const secondsUntil = seconds > 0 && Number.isSafeInteger(now + Math.ceil(seconds * 1_000))
     && now + Math.ceil(seconds * 1_000) <= 8_640_000_000_000_000
     ? now + Math.ceil(seconds * 1_000) : 0
+  // HTTP Retry-After also permits an IMF-fixdate, not just delay-seconds.
+  const dateUntil = after && /^[A-Za-z]{3}, \d{2} [A-Za-z]{3} \d{4} \d{2}:\d{2}:\d{2} GMT$/u.test(after)
+    ? Date.parse(after) : NaN
+  const retryUntil = Math.max(secondsUntil, Number.isSafeInteger(dateUntil) && dateUntil > now
+    && new Date(dateUntil).toUTCString() === after ? dateUntil : 0)
   const reset = h["x-ratelimit-reset"]?.trim()
   const resetSeconds = reset && /^\d+$/u.test(reset) ? Number(reset) : 0
   const resetUntil = h["x-ratelimit-remaining"] === "0"

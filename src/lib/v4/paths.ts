@@ -2,7 +2,8 @@ import { toBase64Url, toHex, utf8ToBytes } from "../bytes";
 import { V4_ROOT } from "./protocol-types";
 
 const WINDOWS_RESERVED_SEGMENT = /^(?:con|prn|aux|nul|clock\$|conin\$|conout\$|com[1-9¹²³]|lpt[1-9¹²³])(?:\..*)?$/iu;
-const PORTABLE_SEGMENT_FORBIDDEN = /[\u0000-\u001f<>:"|?*]/u;
+// In Unicode mode valid surrogate pairs are one scalar; lone surrogates match this range.
+const PORTABLE_SEGMENT_FORBIDDEN = /[\u0000-\u001f\uD800-\uDFFF<>:"|?*]/u;
 const MAX_PORTABLE_SEGMENT_UTF8_BYTES = 255;
 
 function assertPortableV4PathSegment(segment: string, originalPath: string): void {
