@@ -31,6 +31,13 @@ test("cooldown honors GitHub Retry-After, primary reset and 60-second fallback (
   assert.equal(githubRateLimitUntil({ "x-ratelimit-remaining": "10", "x-ratelimit-reset": "2000" }, now), now + 60_000)
   assert.equal(githubRateLimitUntil({}, now), now + 60_000)
   assert.equal(githubRateLimitUntil({ "retry-after": "invalid" }, now), now + 60_000)
+  assert.equal(githubRateLimitUntil({ "retry-after": "0" }, now), now + 60_000)
+  assert.equal(githubRateLimitUntil({ "retry-after": "0.000" }, now), now + 60_000)
+  assert.equal(githubRateLimitUntil({ "retry-after": "9999999999999999999999999" }, now), now + 60_000)
+  assert.equal(githubRateLimitUntil({ "x-ratelimit-remaining": "0", "x-ratelimit-reset": "99999999999999999999" }, now), now + 60_000)
+  assert.equal(githubRateLimitUntil({ "retry-after": "15", "x-ratelimit-remaining": "0", "x-ratelimit-reset": "2000" }, now), 2_000_000)
+  assert.equal(githubRateLimitUntil({ "retry-after": "3600", "x-ratelimit-remaining": "0", "x-ratelimit-reset": "2000" }, now), now + 3_600_000)
+  assert.equal(githubRateLimitUntil({ "retry-after": "0", "x-ratelimit-remaining": "0", "x-ratelimit-reset": "2000" }, now), 2_000_000)
   assert.equal(activeGitHubCooldownUntil(now + 60_000, "ctx", "ctx", now), now + 60_000)
   assert.equal(activeGitHubCooldownUntil(now + 60_000, "ctx", "different", now), 0)
   assert.equal(activeGitHubCooldownUntil(now - 1, "ctx", "ctx", now), 0)
@@ -65,6 +72,72 @@ test("HTTP 200 GraphQL rate-limit persists deadline and blocks new requests befo
     assert.equal(graphql, 1)
     assert.equal(rest, 1)
   } finally { setRequestUrlHandler(null) }
+})
+
+test("GraphQL HTTP 200 with mixed-case primary limit headers pauses until reset", async () => {
+  const next = "b".repeat(40), before = "a".repeat(40)
+  const reset = Math.ceil(Date.now() / 1_000) + 800
+  let deadline = 0, mutations = 0
+  const client = new GitHubClient({ owner: "owner", repo: "repo", branch: "main", token: "secret" }, {
+    getRateLimitUntil: () => deadline,
+    onRateLimited: timestamp => { deadline = timestamp },
+    transportPolicy: { mutationSpacingMs: 0 },
+  })
+  setRequestUrlHandler(async (input: unknown) => {
+    const request = input as { method: string; url: string }
+    if (request.method === "GET" && request.url.endsWith("/repos/owner/repo")) {
+      return { status: 200, text: "", headers: {},
+        json: { node_id: "R_repo_node", full_name: "owner/repo" } }
+    }
+    if (request.method === "POST" && request.url.endsWith("/graphql")) {
+      mutations++
+      return { status: 200, text: "", headers: {
+        "X-RateLimit-Remaining": "0", "X-RateLimit-Reset": String(reset), "Retry-After": "5",
+      }, json: { errors: [{ type: "FORBIDDEN", message: "Request rejected" }] } }
+    }
+    throw Error("Unexpected request")
+  })
+  try {
+    await assert.rejects(() => client.updateGitRef(next, before), /rate limited/)
+    assert.equal(mutations, 1)
+    assert.equal(deadline, reset * 1_000, "the longer primary-reset deadline must win")
+    await assert.rejects(() => client.updateGitRef(next, before), /Sync paused until/)
+    assert.equal(mutations, 1)
+  } finally { setRequestUrlHandler(null) }
+})
+
+test("later rate-limit responses extend cooldown without shortening its durable deadline", async () => {
+  const restoreTimers = browserTimerFixture()
+  const plugin = new FastSync() as FastSync & Record<string, any>
+  plugin.settings = {
+    ...DEFAULT_SETTINGS, githubOwner: "owner", githubRepo: "repo",
+    githubToken: "secret", githubTokenSecretId: "token-a",
+    encryptionPassphraseSecretId: "pass-a", statusBarStatusEnabled: false,
+  }
+  plugin.app = { workspace: { getLeavesOfType: () => [] } }
+  const saved: Array<{ settings: { githubCooldownUntil: number } }> = []
+  let allowFirst!: () => void
+  const firstBlocked = new Promise<void>(resolve => { allowFirst = resolve })
+  plugin.saveData = async (payload: { settings: { githubCooldownUntil: number } }) => {
+    saved.push(payload)
+    if (saved.length === 1) await firstBlocked
+  }
+  const now = Date.now()
+  try {
+    plugin.recordGitHubCooldown(now + 90_000)
+    plugin.recordGitHubCooldown(now + 150_000)
+    plugin.recordGitHubCooldown(now + 30_000)
+    assert.equal(plugin.getGitHubCooldownUntil(), now + 150_000)
+    allowFirst()
+    await plugin.settingsWriteQueue
+    assert.equal(saved.length, 2)
+    assert.equal(saved.at(-1)?.settings.githubCooldownUntil, now + 150_000)
+    assert.equal(plugin.isWatchEnabled, false)
+  } finally {
+    allowFirst()
+    plugin.cooldownTimeoutCancel?.()
+    restoreTimers()
+  }
 })
 
 test("REST HTTP 429 never blindly retries a write, but records the primary reset", async () => {

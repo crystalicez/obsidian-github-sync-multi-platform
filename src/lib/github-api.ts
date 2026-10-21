@@ -733,7 +733,9 @@ export class GitHubClient {
     if (payload && Object.hasOwn(payload, "errors")) {
       // GitHub may report GraphQL rate limits with HTTP 200. Do not resend CAS:
       // the caller must reconcile the HEAD before any later publication.
-      const rateLimited = (response.headers?.["x-ratelimit-remaining"] === "0")
+      const primaryExhausted = Object.entries(response.headers ?? {}).some(
+        ([name, value]) => name.toLowerCase() === "x-ratelimit-remaining" && value === "0");
+      const rateLimited = primaryExhausted
         || Array.isArray(payload.errors) && payload.errors.some(item => {
         const error = item as { type?: unknown; message?: unknown } | null;
         return error?.type === "RATE_LIMITED"
