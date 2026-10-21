@@ -49,7 +49,9 @@ export class V4LocalTargetChangedError extends Error {
 }
 
 export async function assertV4LocalTargetPrecondition(io: Pick<V4LocalIo, "stat">, expected: V4LocalTargetPrecondition): Promise<void> {
-  if (!io.stat) return
+  // Without stat there is no evidence that a local user file remains unchanged.
+  // Fail closed rather than permitting a recovered write or trash to proceed.
+  if (!io.stat) throw new V4LocalTargetChangedError(expected.path)
   const current = await io.stat(expected.path)
   if (!expected.exists) {
     if (current) throw new V4LocalTargetChangedError(expected.path)

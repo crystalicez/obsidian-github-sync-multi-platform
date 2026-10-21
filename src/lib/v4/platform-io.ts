@@ -64,10 +64,14 @@ function parent(path: string): string {
 }
 
 async function desktopFs() {
+  // Obsidian runs the production bundle as CommonJS inside Electron.
+  // Browser-side dynamic import of node:* may resolve as a URL rather than Node IO.
+  if (typeof exports === "object" && typeof require === "function") return require("node:fs/promises") as typeof import("node:fs/promises")
   return import("node:fs/promises")
 }
 
 async function desktopPath() {
+  if (typeof exports === "object" && typeof require === "function") return require("node:path") as typeof import("node:path")
   return import("node:path")
 }
 
