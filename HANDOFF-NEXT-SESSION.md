@@ -4,6 +4,14 @@
 >
 > **Mandatory workflow rule:** Every AI session that makes a material change to code, tests, design decisions, branch/PR state, verification status, or next steps MUST update this file before ending or handing work off. GitHub is the source of truth.
 
+## 2026-10-21 Stage D0 Recovery WAL input integrity (isolated only)
+
+- **Scope:** Continued master-derived staged branch `audit/2026-10-21-staged-production-integration` after C2b without touching root Zed checkout or untracked `AGENTS.md`. Never GitHub Actions, master push, release, personal-vault writes or generated test files above 100,000,000 bytes.
+- **Fail-first defects:** Existing `recovery-store.ts` accepted an integrity-valid WAL with traversal or non-normalized paths, duplicate mutation IDs, invalid stage/precondition metadata, and forged/duplicate completed mutation IDs. It also incremented `Number.MAX_SAFE_INTEGER` to an imprecise generation. Three new fail-first negative tests failed before fix; a normal legacy-format WAL round trip already passed.
+- **Fix:** Load **and** save now validate normalized portable paths, unique mutation identities and matching completion receipts, valid stage refs and existing-target precondition evidence. Refuse generation overflow before writing. Existing slot JSON schema 1, encryption framing, journal phases, publish policy and conflict semantics stay unchanged; finite historical negative mtimes remain accepted.
+- **Verification:** Targeted **4/4**; `pnpm build` PASS; Fast **451/451**, Repeat **10/10 × 451/451**, Recovery **47/47**, Resource **11/11**, Feasibility **132/132**, virtual 100,000,000-byte SHA Soak **1/1**, package/metadata validations and 3 GitHub E2E compile bundles PASS; `git diff --check` PASS. No live GitHub writes or native Obsidian UI test for this stage.
+- **Not done:** Stage D two-slot crash/rollback, platform staged IO and conflict recovery still require coordinated qualification. Recovery slot size and historical WAL read compatibility need separate review. C2 hash/pack/parts migration, Stage E CAS/cooldown and native/mobile acceptance remain open. Not production-ready.
+
 ## 2026-10-21 Stage C2b legacy shard-hash and pack writer/read compatibility (isolated only)
 
 - **Scope:** Continued user-approved staged integration from `e9b7baa279773e79ebd4e9fc3171e1ef23214951` in `.tmp/staged-production-6c67c8a` / `audit/2026-10-21-staged-production-integration`, no source-master push/release, no GitHub Actions, no original Zed `AGENTS.md` touch, no actual test file > **100,000,000 decimal bytes**.

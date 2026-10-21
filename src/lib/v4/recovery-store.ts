@@ -4,6 +4,7 @@ import { decryptV4Payload, encryptV4Payload } from "./crypto"
 import type { V4LocalIndexAdapter } from "./local-index"
 import { assertV4LocalTargetPrecondition, V4LocalTargetChangedError, type V4LocalIo } from "./local-io"
 import { hashV4StableContentSource } from "./object-stream"
+import { normalizeV4VaultPath } from "./paths"
 import type { V4StageRef } from "./staging-store"
 import type { V4RecoveryHeader, V4RecoveryPayload, V4RecoveryPhase, V4RecoverySnapshot } from "./recovery-types"
 import { reconcileV4CandidatePublication, type V4PublishReconcileResult, type V4PublishReconcilerGithub } from "./publish-reconciler"
@@ -83,24 +84,50 @@ async function integrityFor(header: Omit<V4RecoveryHeader, "integrity">): Promis
   return sha256Hex(utf8ToBytes(JSON.stringify(integrityView(header))))
 }
 
+function isNormalizedRecoveryPath(value: unknown): value is string {
+  if (typeof value !== "string") return false
+  try { return normalizeV4VaultPath(value) === value } catch { return false }
+}
+
+function isValidRecoveryPrecondition(value: unknown, path: string): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false
+  const candidate = value as { path?: unknown; exists?: unknown; size?: unknown; mtime?: unknown }
+  if (candidate.path !== path || typeof candidate.exists !== "boolean") return false
+  if (!candidate.exists) return candidate.size === undefined && candidate.mtime === undefined
+  return Number.isSafeInteger(candidate.size) && (candidate.size as number) >= 0
+    && typeof candidate.mtime === "number" && Number.isFinite(candidate.mtime)
+}
+
+function isValidRecoveryStage(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false
+  const stage = value as Partial<V4StageRef>
+  return typeof stage.stageId === "string" && /^[A-Za-z0-9_-]{1,128}$/u.test(stage.stageId)
+    && typeof stage.hash === "string" && /^[0-9a-f]{64}$/u.test(stage.hash)
+    && Number.isSafeInteger(stage.size) && (stage.size ?? -1) >= 0
+    && typeof stage.mtime === "number" && Number.isFinite(stage.mtime)
+}
+
 function isPayload(value: unknown): value is V4RecoveryPayload {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false
   const payload = value as Partial<V4RecoveryPayload>
   if (!Array.isArray(payload.mutations) || !Array.isArray(payload.completedMutationIds)) return false
-  if (!payload.completedMutationIds.every(id => typeof id === "string")) return false
-  return payload.mutations.every(mutation => {
+  const ids = new Set<string>()
+  for (const mutation of payload.mutations) {
     if (!mutation || typeof mutation !== "object" || Array.isArray(mutation)) return false
     const candidate = mutation as V4RecoveryPayload["mutations"][number]
-    if (typeof candidate.id !== "string" || typeof candidate.path !== "string") return false
-    if (!candidate.precondition || candidate.precondition.path !== candidate.path || typeof candidate.precondition.exists !== "boolean") return false
-    if (candidate.kind === "trash") return true
-    return candidate.kind === "stage-write"
-      && !!candidate.stage
-      && typeof candidate.stage.stageId === "string"
-      && typeof candidate.stage.hash === "string"
-      && Number.isSafeInteger(candidate.stage.size)
-      && Number.isFinite(candidate.stage.mtime)
-  })
+    if (typeof candidate.id !== "string" || !candidate.id || ids.has(candidate.id)) return false
+    ids.add(candidate.id)
+    if (!isNormalizedRecoveryPath(candidate.path)) return false
+    if (!isValidRecoveryPrecondition(candidate.precondition, candidate.path)) return false
+    if (candidate.kind === "trash") continue
+    if (candidate.kind !== "stage-write" || !isValidRecoveryStage(candidate.stage)) return false
+  }
+  const completed = new Set<string>()
+  for (const id of payload.completedMutationIds) {
+    if (typeof id !== "string" || !ids.has(id) || completed.has(id)) return false
+    completed.add(id)
+  }
+  return true
 }
 
 export function createV4RecoveryStore(options: {
@@ -160,9 +187,16 @@ export function createV4RecoveryStore(options: {
   return {
     load,
     async save(input) {
+      if (input.payload && !isPayload(input.payload)) {
+        throw new V4RecoveryRequiredError("V4 recovery payload shape is invalid.")
+      }
       let previous: V4RecoverySnapshot | null = null
       try { previous = await load() } catch (error) { if (error instanceof V4RecoveryRequiredError) throw error; throw error }
-      const generation = (previous?.header.generation ?? 0) + 1
+      const previousGeneration = previous?.header.generation ?? 0
+      if (!Number.isSafeInteger(previousGeneration) || previousGeneration >= Number.MAX_SAFE_INTEGER) {
+        throw new V4RecoveryRequiredError("V4 recovery generation cannot be incremented safely.")
+      }
+      const generation = previousGeneration + 1
       let payloadCiphertext: string | undefined
       if (input.payload) {
         let bytes = utf8ToBytes(JSON.stringify(input.payload))
