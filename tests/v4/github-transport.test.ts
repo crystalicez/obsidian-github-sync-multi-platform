@@ -719,7 +719,11 @@ test("GitHubClient retries a lost commit response only with explicit orphan-safe
 
 test("GitHubClient never blindly retries a normal ref mutation after a lost response", async () => {
   let attempts = 0
-  setRequestUrlHandler(async () => {
+  setRequestUrlHandler(async (input: unknown) => {
+    const request = input as { method: string; url: string }
+    if (request.method === "GET" && request.url === "https://api.github.com/repos/owner/repo") {
+      return { status: 200, text: "", headers: {}, json: { full_name: "owner/repo", node_id: "R_repo_node" } }
+    }
     attempts++
     throw new Error("ref response lost")
   })
@@ -729,7 +733,7 @@ test("GitHubClient never blindly retries a normal ref mutation after a lost resp
       { transportPolicy: { mutationSpacingMs: 0 } },
     )
     await assert.rejects(
-      () => client.updateGitRef("8888888888888888888888888888888888888888", "base"),
+      () => client.updateGitRef("8888888888888888888888888888888888888888", "a".repeat(40)),
       error => (error as Error).name === "V4GitMutationOutcomeUnknownError",
     )
     assert.equal(attempts, 1)
@@ -1341,12 +1345,15 @@ test("GitHub ref boundaries reject valid-looking 2xx responses for the wrong bra
 
   setRequestUrlHandler(async (options: unknown) => {
     const request = options as Record<string, any>;
-    if (request.method === "PATCH" && request.url.includes("/git/refs/heads/main")) {
-      return { status: 200, text: "", headers: {}, json: { ref: "refs/heads/main", object: { sha: "9".repeat(40), type: "commit" } } };
+    if (request.method === "GET" && request.url === "https://api.github.com/repos/owner/repo") {
+      return { status: 200, text: "", headers: {}, json: { node_id: "R_repo_node", full_name: "owner/repo" } };
+    }
+    if (request.method === "POST" && request.url === "https://api.github.com/graphql") {
+      return { status: 200, text: "", headers: {}, json: { data: { updateRefs: { clientMutationId: "wrong-ack" } } } };
     }
     throw new Error(`Unexpected request: ${request.method} ${request.url}`);
   });
-  await assert.rejects(() => client.updateGitRef(targetSha), /ref.*sha|mutation.*sha|object.*sha|malformed/iu);
+  await assert.rejects(() => client.updateGitRef(targetSha, "a".repeat(40)), /acknowledgement|unknown outcome/iu);
 
   setRequestUrlHandler(async (options: unknown) => {
     const request = options as Record<string, any>;

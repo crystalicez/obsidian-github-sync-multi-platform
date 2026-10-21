@@ -102,6 +102,7 @@ export class GitHubClient {
   private readonly transportResources: Pick<V4ResourceController, "withTransportBytes">;
   private operationSignal?: AbortSignal;
   private runDiagnostics?: V4RunDiagnostics;
+  private repositoryNodeId?: string;
 
   constructor(config: GitHubConfig, options: GitHubClientOptions = {}) {
     assertSafeGitHubRepositoryCoordinates(config.owner, config.repo);
@@ -683,16 +684,47 @@ export class GitHubClient {
     return responseSha;
   }
 
-  async updateGitRef(sha: string, _expectedSha?: string): Promise<void> {
-    const expectedSha = requiredGitObjectSha(sha, "updated git ref SHA");
+  /** Strict compare-and-swap; never fall back to REST fast-forward PATCH. */
+  async updateGitRef(sha: string, expectedSha?: string): Promise<void> {
+    const next = requiredGitObjectSha(sha, "updated git ref SHA");
+    const before = requiredGitObjectSha(expectedSha, "expected git ref SHA");
+    if (!this.repositoryNodeId) {
+      const info = await this.request({
+        url: this.baseUrl, method: "GET", headers: this.headers, throw: false,
+      });
+      if (info.status !== 200) throw this.gitHttpError("Failed to identify CAS repository", info.status, info.text);
+      const repository = info.json as { node_id?: unknown; full_name?: unknown } | null;
+      const name = `${this.config.owner}/${this.config.repo}`;
+      if (typeof repository?.full_name !== "string" || repository.full_name.toLowerCase() !== name.toLowerCase()
+        || typeof repository.node_id !== "string" || !/^[A-Za-z0-9_=-]{4,256}$/u.test(repository.node_id)) {
+        throw new Error("GitHub CAS repository identity is missing or mismatched.");
+      }
+      this.repositoryNodeId = repository.node_id;
+    }
+    const clientMutationId = `v4-cas-${next}`;
     const response = await this.mutationRequest({
-      options: { url: `${this.baseUrl}/git/refs/heads/${this.branchRefPath()}`, method: "PATCH", headers: this.headers, throw: false },
-      bodyValue: { sha: expectedSha, force: false },
+      options: { url: "https://api.github.com/graphql", method: "POST", headers: this.headers, throw: false },
+      bodyValue: {
+        query: "mutation V4StrictCAS($input: UpdateRefsInput!) { updateRefs(input: $input) { clientMutationId } }",
+        variables: {
+          input: {
+            repositoryId: this.repositoryNodeId,
+            refUpdates: [{ name: this.configuredRefName(), beforeOid: before, afterOid: next, force: false }],
+            clientMutationId,
+          },
+        },
+      },
       retryClass: "reachable-ref",
       successStatuses: [200],
-      action: "Failed to update git ref",
+      action: "Failed to update git ref with GraphQL CAS",
     });
-    this.parseConfiguredGitRef(response.json, expectedSha);
+    const payload = response.json as { errors?: unknown; data?: { updateRefs?: { clientMutationId?: unknown } | null } } | null;
+    if (payload && Object.hasOwn(payload, "errors")) {
+      throw this.gitHttpError("GraphQL strict CAS rejected", 422, "GraphQL reported an error.");
+    }
+    if (payload?.data?.updateRefs?.clientMutationId !== clientMutationId) {
+      throw new V4GitMutationOutcomeUnknownError("reachable-ref", new Error("GraphQL CAS acknowledgement is missing or mismatched."));
+    }
   }
 
   async createGitRef(sha: string): Promise<void> {

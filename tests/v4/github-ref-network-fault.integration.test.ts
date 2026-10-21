@@ -35,19 +35,24 @@ function client() {
   )
 }
 
-test("GitHubClient HTTP fault simulation accepts a committed ref after its PATCH response is lost", async () => {
+test("GitHubClient GraphQL CAS fault simulation reconciles a lost successful response", async () => {
   let head = baseSha
   let patchCalls = 0
   let headReads = 0
   setRequestUrlHandler(async (options: unknown) => {
     const request = options as { method: string; url: string; body?: string }
+    if (request.method === "GET" && request.url === "https://api.github.com/repos/owner/repo") {
+      return response(200, { node_id: "R_repo_node", full_name: "owner/repo" })
+    }
     if (request.method === "GET" && request.url.includes("/git/ref/heads/main")) {
       headReads++
       return response(200, ref(head))
     }
-    if (request.method === "PATCH" && request.url.endsWith("/git/refs/heads/main")) {
+    if (request.method === "POST" && request.url === "https://api.github.com/graphql") {
       patchCalls++
-      assert.deepEqual(JSON.parse(request.body ?? ""), { sha: candidateSha, force: false })
+      const input = JSON.parse(request.body ?? "").variables.input
+      assert.deepEqual(input.refUpdates, [{ name: "refs/heads/main", beforeOid: baseSha, afterOid: candidateSha, force: false }])
+      assert.equal(input.repositoryId, "R_repo_node")
       head = candidateSha
       throw new Error("connection lost after GitHub accepted PATCH")
     }
@@ -63,21 +68,24 @@ test("GitHubClient HTTP fault simulation accepts a committed ref after its PATCH
   }
 })
 
-test("GitHubClient HTTP fault simulation retries PATCH once after proving a lost request did not update HEAD", async () => {
+test("GitHubClient GraphQL CAS fault simulation retries once after proving the first request never changed HEAD", async () => {
   let head = baseSha
   let patchCalls = 0
   let headReads = 0
   setRequestUrlHandler(async (options: unknown) => {
     const request = options as { method: string; url: string; body?: string }
+    if (request.method === "GET" && request.url === "https://api.github.com/repos/owner/repo") {
+      return response(200, { node_id: "R_repo_node", full_name: "owner/repo" })
+    }
     if (request.method === "GET" && request.url.includes("/git/ref/heads/main")) {
       headReads++
       return response(200, ref(head))
     }
-    if (request.method === "PATCH" && request.url.endsWith("/git/refs/heads/main")) {
+    if (request.method === "POST" && request.url === "https://api.github.com/graphql") {
       patchCalls++
-      if (patchCalls === 1) throw new Error("connection lost before GitHub received PATCH")
+      if (patchCalls === 1) throw new Error("connection lost before GitHub received GraphQL CAS")
       head = candidateSha
-      return response(200, ref(head))
+      return response(200, { data: { updateRefs: { clientMutationId: JSON.parse(request.body ?? "").variables.input.clientMutationId } } })
     }
     throw new Error(`Unexpected request: ${request.method} ${request.url}`)
   })
@@ -91,15 +99,18 @@ test("GitHubClient HTTP fault simulation retries PATCH once after proving a lost
   }
 })
 
-test("GitHubClient HTTP fault simulation never replays a lost PATCH when another writer advances HEAD", async () => {
+test("GitHubClient GraphQL CAS never replays a lost response after another writer advances HEAD", async () => {
   let head = baseSha
   let patchCalls = 0
   setRequestUrlHandler(async (options: unknown) => {
     const request = options as { method: string; url: string }
+    if (request.method === "GET" && request.url === "https://api.github.com/repos/owner/repo") {
+      return response(200, { node_id: "R_repo_node", full_name: "owner/repo" })
+    }
     if (request.method === "GET" && request.url.includes("/git/ref/heads/main")) {
       return response(200, ref(head))
     }
-    if (request.method === "PATCH" && request.url.endsWith("/git/refs/heads/main")) {
+    if (request.method === "POST" && request.url === "https://api.github.com/graphql") {
       patchCalls++
       head = externalSha
       throw new Error("connection lost while another writer published")
@@ -138,15 +149,18 @@ test("GitHubClient HTTP fault simulation never replays a lost PATCH when another
   }
 })
 
-test("GitHubClient HTTP fault simulation does not retry a lost PATCH when reconciliation is also offline", async () => {
+test("GitHubClient GraphQL CAS does not retry a lost response when reconciliation is also offline", async () => {
   let patchCalls = 0
   setRequestUrlHandler(async (options: unknown) => {
     const request = options as { method: string; url: string }
+    if (request.method === "GET" && request.url === "https://api.github.com/repos/owner/repo") {
+      return response(200, { node_id: "R_repo_node", full_name: "owner/repo" })
+    }
     if (request.method === "GET" && request.url.includes("/git/ref/heads/main")) {
       if (patchCalls > 0) throw new Error("still offline")
       return response(200, ref(baseSha))
     }
-    if (request.method === "PATCH" && request.url.endsWith("/git/refs/heads/main")) {
+    if (request.method === "POST" && request.url === "https://api.github.com/graphql") {
       patchCalls++
       throw new Error("connection lost after PATCH was sent")
     }
