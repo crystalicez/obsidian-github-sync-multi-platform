@@ -1,3 +1,4 @@
+import { sha256Hex, utf8ToBytes } from "../bytes";
 import { expectedV4PathLayout, V4_FORMAT_VERSION, type V4ObjectStorage, type V4PathLayout, type V4StorageMode } from "./protocol-types";
 import { bucketForV4PathId } from "./paths";
 
@@ -21,6 +22,8 @@ export interface V4IndexFileRecord {
 export interface V4LocalIndexShard {
   bucket: string;
   hash: string;
+  /** SHA-256 over the serialized local records; not part of the remote protocol. */
+  contentDigest?: string;
   records: Record<string, V4IndexFileRecord>;
 }
 
@@ -151,9 +154,16 @@ export function createEmptyV4LocalIndex(input: { repoId: string; deviceId: strin
   };
 }
 
+async function localShardContentDigest(bucket: string, records: Record<string, V4IndexFileRecord>): Promise<string> {
+  return sha256Hex(utf8ToBytes(`v4-local-shard:${bucket}:${JSON.stringify(records)}`));
+}
+
 async function saveV4LocalIndexShard(adapter: V4LocalIndexAdapter, root: string, index: V4LocalIndex, bucket: string): Promise<void> {
   const shard = index.shards[bucket];
   if (!shard || !isShardConsistent(shard, bucket, shard.hash)) throw new Error(`Invalid V4 local index shard: ${bucket}`);
+  // A local cache label copied from the remote head does not authenticate its records.
+  // Seal the actual serialized records without changing remote shard hashes.
+  shard.contentDigest = await localShardContentDigest(bucket, shard.records);
   index.shardHashes[bucket] = shard.hash;
   await adapter.mkdir(root);
   await adapter.mkdir(join(root, "shards"));
@@ -206,12 +216,19 @@ export async function loadV4LocalIndex(adapter: V4LocalIndexAdapter, root: strin
     if (await isV4OversizedLocalJson(adapter, path, V4_LOCAL_INDEX_SHARD_MAX_BYTES)) return invalidV4LocalIndex();
     const serialized = await adapter.read(path);
     if (!fitsV4LocalJsonSizeLimit(serialized, V4_LOCAL_INDEX_SHARD_MAX_BYTES)) return invalidV4LocalIndex();
+    let loaded: V4LocalIndexShard;
     try {
-      index.shards[bucket] = JSON.parse(serialized) as V4LocalIndexShard;
+      loaded = JSON.parse(serialized) as V4LocalIndexShard;
     } catch (error) {
       if (error instanceof SyntaxError) return invalidV4LocalIndex();
       throw error;
     }
+    // Never authorize a cached remote HEAD from mutated or pre-D5 unsealed records.
+    // The remote protocol and its historical shard-hash algorithm are untouched.
+    if (!isShardConsistent(loaded, bucket, index.shardHashes[bucket])) return invalidV4LocalIndex();
+    if (!/^[0-9a-f]{64}$/u.test(loaded.contentDigest ?? "")) return invalidV4LocalIndex();
+    if (loaded.contentDigest !== await localShardContentDigest(bucket, loaded.records)) return invalidV4LocalIndex();
+    index.shards[bucket] = loaded;
   }
   return isV4LocalIndexCacheComplete(index) ? index : invalidV4LocalIndex();
 }

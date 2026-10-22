@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { readFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { modalButtons, Notice, resetModalTestState, TFile } from "obsidian";
 
 import { DEFAULT_SETTINGS } from "../../src/setting";
@@ -996,9 +997,13 @@ function runtimeFixture(input: { remoteConfig: V4RemoteConfig; localIndexRepoId:
     shardHashes,
   }));
   const legacyPathId = "aa".padEnd(64, "0");
-  if (input.cachedShard) files.set(".obsidian/plugins/test/github-sync-v4-index/shards/aa.json", JSON.stringify({ bucket: "aa", hash: "legacy-hash", records: {
-    [legacyPathId]: { path: "Legacy/note.md", pathId: legacyPathId, fileId: "legacy-file", plaintextSha256: "legacy-sha", size: 1, mtime: 1, remoteVersion: "legacy-v", remotePath: ".obsidian-github-sync-v4/data/Legacy/token.enc", storage: "single" },
-  } }));
+  if (input.cachedShard) {
+    const records = {
+      [legacyPathId]: { path: "Legacy/note.md", pathId: legacyPathId, fileId: "legacy-file", plaintextSha256: "legacy-sha", size: 1, mtime: 1, remoteVersion: "legacy-v", remotePath: ".obsidian-github-sync-v4/data/Legacy/token.enc", storage: "single" },
+    };
+    const contentDigest = createHash("sha256").update(`v4-local-shard:aa:${JSON.stringify(records)}`, "utf8").digest("hex");
+    files.set(".obsidian/plugins/test/github-sync-v4-index/shards/aa.json", JSON.stringify({ bucket: "aa", hash: "legacy-hash", contentDigest, records }));
+  }
   let vaultLists = 0;
   const plugin = {
     app: {

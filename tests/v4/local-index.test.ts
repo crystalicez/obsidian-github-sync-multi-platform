@@ -301,3 +301,25 @@ test("v4 local index persists the selected path layout", async () => {
 
   assert.equal((await loadV4LocalIndex(adapter, "index")).pathLayout, "opaque-stable-v1");
 });
+
+test("D5 local shard with unchanged remote hash label but corrupted record content cannot authorize cached HEAD", async () => {
+  const stored = new Map<string, string>();
+  const adapter = {
+    async read(p: string) { const value = stored.get(p); if (value === undefined) throw new Error(`missing ${p}`); return value; },
+    async write(p: string, value: string) { stored.set(p, value); },
+    async exists(p: string) { return stored.has(p); },
+    async mkdir(_p: string) {},
+  };
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "desktop", mode: "plaintext" });
+  index.remoteCommitSha = "known-remote-commit";
+  index.generation = 4;
+  addShard(index, "ab", "v1");
+  await saveV4LocalIndex(adapter, "idx", index);
+  const original = JSON.parse(stored.get("idx/shards/ab.json")!) as { records: Record<string, { plaintextSha256: string }>; hash: string };
+  const pathId = Object.keys(original.records)[0];
+  original.records[pathId].plaintextSha256 = "sha-v2"; // Same byte count as sha-v1.
+  stored.set("idx/shards/ab.json", JSON.stringify(original));
+  const loaded = await loadV4LocalIndex(adapter, "idx");
+  assert.equal(loaded.remoteCommitSha, undefined, "tampered local cache must force a remote reload");
+  assert.deepEqual(loaded.shards, {});
+});

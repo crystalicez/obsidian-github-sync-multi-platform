@@ -4,6 +4,14 @@
 >
 > **Mandatory workflow rule:** Every AI session that makes a material change to code, tests, design decisions, branch/PR state, verification status, or next steps MUST update this file before ending or handing work off. GitHub is the source of truth.
 
+## 2026-10-22 Stage D5 — local cache record integrity before trusting remote HEAD (audit only)
+
+- **Base:** `86ef9ed` (Stage D4); changes isolated to `audit/2026-10-21-staged-production-integration`. No GitHub Actions, master, release, personal vault, or generated test files >100,000,000 decimal bytes.
+- **Fail-first proof:** A saved local V4 index with valid matching header/shard `hash` labels but same-size tampering to `plaintextSha256` still loaded `remoteCommitSha` and was trusted as remote HEAD cache. New `tests/v4/local-index.test.ts` caught this; fixed test passes. The remote metadata/shard-hash contract is **unchanged**.
+- **Local-only cache seal:** Each newly saved local shard includes a domain-separated SHA-256 `contentDigest` of `JSON.stringify(shard.records)`; `loadV4LocalIndex` checks the digest after parsing and before authorizing cached `remoteCommitSha`. Missing/invalid/different digest invalidates the entire local cache and forces full remote metadata reload; the index is a disposable cache, not a user-data source. This is an integrity check for accidental/stale/corrupt local cache, not a cryptographic authenticity guarantee against an attacker who can rewrite both file and digest. Older unsealed local cache is deliberately invalidated, with no remote history format changes.
+- **Fixture compatibility:** An existing `tests/v4/settings-secrets.test.ts` runtime fixture manually forged a cached shard without any on-disk content checksum. Initial full Fast + Repeat detected 1/477 failure; test fixture now computes the valid local-only seal independently using Node SHA-256. After adjustment, focused settings 35/35, local index 11/11, full Fast 477/477, Repeat Fast 10/10 rounds, Recovery 58/58, Resource 11/11, Feasibility 132/132, virtual bounded 100,000,000-byte soak, metadata/package and GitHub E2E-compile, Production Build all PASS. No credentialed GitHub E2E or native Obsidian GUI test this stage.
+- **Residual:** D4 still does not establish small-file `vault.modifyBinary` atomicity or restore a crashed partially-written file. Stage E strict CAS, configuration snapshot, native Obsidian crash E2E, C2 remote protocol migration and platform-specific containment remain separate gates.
+
 ## 2026-10-22 Stage D4 — original-content SHA for every WAL mutation (audit branch only)
 
 - **Starting commit:** `db2d2e544d52222e24949a88a1dd9ccb6b574144` on `audit/2026-10-21-staged-production-integration`, isolated worktree. Never touch master, user/Zed root WIP, personal vault, GitHub Actions, or generated data above 100,000,000 decimal bytes.

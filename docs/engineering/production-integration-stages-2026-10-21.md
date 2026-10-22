@@ -38,6 +38,12 @@ On this **master-derived partial integration**, Build PASS, Fast **440/440**, Re
 - Verification of this intermediate `master`-derived audit stage: Build PASS; Fast **451/451**; Repeat **10/10 rounds, each 451/451**; Recovery **43/43**, Resource **11/11**, Feasibility **132/132**, 100,000,000-byte virtual SHA Soak **1/1**; metadata/package/E2E compile PASS. No Actions, remote GitHub writes, or release.
 - The C2 **format/size transition remains pending**. New REST-safe GitHub single-object limits and canonical shard hashes must not be adopted independently of the writer, reader, local cache and recovery contract.
 
+## Stage D5 — local-only shard checksum
+
+- Fail-first test changed a cached `plaintextSha256` entry without altering remote hash labels: old code trusted cached `remoteCommitSha`. New local-only `contentDigest` is independently computed at save time and validated at load; missing/invalid/modified data invalidates the cache, forcing a remote metadata re-read. Does not touch GitHub remote shard hashes or encrypted protocol.
+- Updated a test fixture that constructed unsealed local caches by hand. Initial Fast 1/477 failed on that fixture; after supplying a valid independent fixture seal, focused runtime settings 35/35, local index 11/11, full Fast 477/477, Repeat Fast 10/10 rounds, Recovery 58/58, Resource 11/11, Feasibility 132/132, virtual 100 MB soak, metadata/package/E2E compile and Build PASS. No native Obsidian or credentialed GitHub E2E was run.
+- This is an accidental corruption/staleness guard, **not** an authentication signature when an attacker can rewrite a local digest too. No previously released local cache compatibility was promised; old unsealed caches reload from remote.
+
 ## Stage D4 — original-content identity on every WAL mutation
 
 - Fail-first real SyncSession/RecoveryStore tests exposed that a user file edited between the WAL save and Force Pull can be silently overwritten/trash-deleted when size and mtime are unchanged. New WAL now persists and validates original SHA-256 for **all existing targets** (write, trash, rename trash); small files are bounded by resident budget and large files use streaming.
