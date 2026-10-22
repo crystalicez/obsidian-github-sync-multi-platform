@@ -14,12 +14,13 @@ const decode = (value: Uint8Array) => new TextDecoder().decode(value)
 
 class RecoveryAdapter implements V4LocalIndexAdapter {
   readonly values = new Map<string, string>()
-  constructor(private readonly events: string[]) {}
+  constructor(private readonly events: string[], private readonly onWrite?: (phase: string | undefined) => void) {}
   async read(path: string) { return this.values.get(path)! }
   async write(path: string, value: string) {
     this.values.set(path, value)
     const parsed = JSON.parse(value) as { phase?: string; candidateCommitSha?: string; journalId?: string }
     this.events.push(`recovery:${parsed.phase}:${parsed.candidateCommitSha ?? ""}:${parsed.journalId ?? ""}`)
+    this.onWrite?.(parsed.phase)
   }
   async exists(path: string) { return this.values.has(path) }
   async mkdir() {}
@@ -142,4 +143,64 @@ test("pure pull persists remote-verified without journalId before the first fina
   assert.equal(latest?.header.journalId, undefined)
   assert.equal(latest?.header.verifiedRemoteHead, github.ref?.sha)
   assert.equal(decode(vault.files.get("remote.md")!.bytes), "remote-body")
+})
+
+test("D4: same-size/same-mtime edit after WAL is not overwritten by a small Pull", async () => {
+  const github = new MemoryGitHub()
+  await seedRemote(github)
+  const events: string[] = []
+  const vault = new MemoryVault(events)
+  const original = encode("local-first")
+  const edited = encode("user-edited")
+  assert.equal(edited.byteLength, original.byteLength)
+  vault.files.set("remote.md", { bytes: original, mtime: 9 })
+  const index = createEmptyV4LocalIndex({ repoId: config.repoId, deviceId: "pull-safe", mode: "plaintext" })
+  let editedOnWalSave = false
+  const adapter = new RecoveryAdapter(events, phase => {
+    if (phase === "remote-verified" && !editedOnWalSave) {
+      editedOnWalSave = true
+      vault.files.set("remote.md", { bytes: edited, mtime: 9 })
+    }
+  })
+  const recoveryStore = createV4RecoveryStore({ adapter, root: "recovery", repoId: config.repoId })
+  const runState = { runId: "same-mtime-pull", conflictCopies: new Map() }
+  await assert.rejects(
+    new V4SyncSession({ github, vault, index, config, conflictPolicy: "copy", abortChangePercent: 0, recoveryStore, runState } as never).sync({ operation: "forcePull" }),
+    /replan|local.*changed/i,
+  )
+  assert.equal(editedOnWalSave, true)
+  assert.equal(decode(vault.files.get("remote.md")!.bytes), "user-edited")
+  assert.equal(events.filter(e => e === "vault-write:remote.md").length, 0)
+  const recovered = await recoveryStore.load()
+  assert.equal(recovered?.header.phase, "replan-required")
+  const write = recovered?.payload?.mutations.find(m => m.kind === "stage-write" && m.path === "remote.md")
+  assert.match(write?.precondition.hash ?? "", /^[0-9a-f]{64}$/)
+})
+
+test("D4: same-size/same-mtime edit after WAL is not trashed by Force Pull", async () => {
+  const github = new MemoryGitHub()
+  await seedRemote(github)
+  const events: string[] = []
+  const vault = new MemoryVault(events)
+  vault.files.set("orphan.md", { bytes: encode("local-first"), mtime: 9 })
+  const index = createEmptyV4LocalIndex({ repoId: config.repoId, deviceId: "trash-safe", mode: "plaintext" })
+  let editedOnWalSave = false
+  const adapter = new RecoveryAdapter(events, phase => {
+    if (phase === "remote-verified" && !editedOnWalSave) {
+      editedOnWalSave = true
+      vault.files.set("orphan.md", { bytes: encode("user-edited"), mtime: 9 })
+    }
+  })
+  const recoveryStore = createV4RecoveryStore({ adapter, root: "recovery", repoId: config.repoId })
+  const runState = { runId: "same-mtime-trash", conflictCopies: new Map() }
+  await assert.rejects(
+    new V4SyncSession({ github, vault, index, config, conflictPolicy: "copy", abortChangePercent: 0, recoveryStore, runState } as never).sync({ operation: "forcePull" }),
+    /replan|local.*changed/i,
+  )
+  assert.equal(editedOnWalSave, true)
+  assert.equal(decode(vault.files.get("orphan.md")!.bytes), "user-edited")
+  assert.equal(events.filter(e => e === "vault-trash:orphan.md").length, 0)
+  const recovered = await recoveryStore.load()
+  const trash = recovered?.payload?.mutations.find(m => m.kind === "trash" && m.path === "orphan.md")
+  assert.match(trash?.precondition.hash ?? "", /^[0-9a-f]{64}$/)
 })

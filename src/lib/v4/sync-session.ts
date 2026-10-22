@@ -1324,7 +1324,7 @@ export class V4SyncSession {
       const current = localById.get(binding.change.fileId)
       const path = binding.change.path
       const precondition: V4LocalTargetPrecondition = current && current.path === path
-        ? { path, exists: true, size: current.size, mtime: current.mtime }
+        ? { path, exists: true, size: current.size, mtime: current.mtime, hash: current.hash }
         : { path, exists: false }
       mutations.push({ id: `local:${binding.change.fileId}:write`, kind: "stage-write", path, stage: binding.stage, precondition })
       if (binding.change.kind === "rename" && binding.change.previousPath) {
@@ -1334,7 +1334,7 @@ export class V4SyncSession {
           kind: "trash",
           path: binding.change.previousPath,
           precondition: previous && previous.path === binding.change.previousPath
-            ? { path: binding.change.previousPath, exists: true, size: previous.size, mtime: previous.mtime }
+            ? { path: binding.change.previousPath, exists: true, size: previous.size, mtime: previous.mtime, hash: previous.hash }
             : { path: binding.change.previousPath, exists: false },
         })
       }
@@ -1354,13 +1354,13 @@ export class V4SyncSession {
         precondition,
       })
     }
-    // Prove the original bytes before persisting a WAL that may later need to
-    // restore a Desktop target-backup. The persisted hash is optional for
-    // historical WAL compatibility, but new large replacements always carry it.
+    // Pin original file identities for ALL mutations before persisting WAL.
+    // A same-size/same-mtime edit between the scan and publication must not
+    // authorize an overwrite or trash, including on the small-file path.
     for (const mutation of mutations) {
-      if (mutation.kind !== "stage-write" || mutation.stage.size <= DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES || !mutation.precondition.exists) continue
+      if (!mutation.precondition.exists) continue
       const expected = mutation.precondition
-      if (!this.localIo.stat || !this.localIo.openContentSource || !Number.isSafeInteger(expected.size) || expected.size! < 0) {
+      if (!this.localIo.stat || !Number.isSafeInteger(expected.size) || expected.size! < 0) {
         throw new V4LocalTargetChangedError(expected.path)
       }
       const checkStable = async () => {
@@ -1370,10 +1370,22 @@ export class V4SyncSession {
         }
       }
       await checkStable()
-      const source = await this.localIo.openContentSource({
-        kind: "vault", path: expected.path, expectedHash: "", expectedSize: expected.size!, expectedMtime: expected.mtime!,
-      }, this.input.signal)
-      expected.hash = await hashV4StableContentSource(source, { chunkBytes: 4 * 1024 * 1024, checkStable, signal: this.input.signal })
+      let observedHash: string
+      if (expected.size! <= DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES) {
+        observedHash = await this.resources.withResidentBytes(expected.size!, async () => {
+          const bytes = await this.resources.withVaultRead(() => this.localIo.read(expected.path), this.input.signal)
+          if (bytes.byteLength !== expected.size) throw new V4LocalTargetChangedError(expected.path)
+          return this.resources.withCrypto(() => sha256Hex(bytes), this.input.signal)
+        }, this.input.signal)
+      } else {
+        if (!this.localIo.openContentSource) throw new V4LocalTargetChangedError(expected.path)
+        const source = await this.localIo.openContentSource({
+          kind: "vault", path: expected.path, expectedHash: "", expectedSize: expected.size!, expectedMtime: expected.mtime!,
+        }, this.input.signal)
+        observedHash = await hashV4StableContentSource(source, { chunkBytes: 4 * 1024 * 1024, checkStable, signal: this.input.signal })
+      }
+      if (expected.hash && expected.hash !== observedHash) throw new V4LocalTargetChangedError(expected.path)
+      expected.hash = observedHash
       await checkStable()
     }
     return { payload: { mutations, completedMutationIds: [] }, pullCompletionIds }
@@ -1381,7 +1393,7 @@ export class V4SyncSession {
 
   private pullPrecondition(change: V4PlannedChange, path = change.path): V4LocalTargetPrecondition {
     const before = change.before
-    if (before && before.path === path) return { path, exists: true, size: before.size, mtime: before.mtime }
+    if (before && before.path === path) return { path, exists: true, size: before.size, mtime: before.mtime, hash: before.hash }
     return { path, exists: false }
   }
 
