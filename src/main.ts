@@ -2,6 +2,7 @@ import { Plugin, setIcon, Modal, Notice, TFile, TFolder } from "obsidian";
 
 import { SettingTab, PluginSettings, DEFAULT_SETTINGS } from "./setting";
 import { GitHubClient } from "./lib/github-api";
+import { V4RateLimitCooldownStore } from "./lib/v4/rate-limit-cooldown";
 import { normalizeScheduledSyncIntervalSeconds, shouldRunScheduledSync, shouldRunStartupSync } from "./lib/sync-policy";
 import { migrateV4Secrets, sanitizeV4SettingsForPersistence, storeV4Secrets } from "./lib/v4/secrets";
 import { V4PluginRuntime } from "./lib/v4/runtime";
@@ -29,6 +30,7 @@ export default class FastSync extends Plugin {
   secretsMigrated: boolean = false
   private unloaded = false
   private statusDisplaySignature?: string
+  private cooldownStore?: V4RateLimitCooldownStore
 
   enableWatch() {
     this.isWatchEnabled = true
@@ -51,6 +53,23 @@ export default class FastSync extends Plugin {
     this.unloaded = false
     await this.loadSettings()
     if (this.secretsMigrated) await this.persistData()
+
+    // Keep retry deadlines in two checksummed, private plugin-data slots.
+    // A new client (or next Obsidian start) inherits the same token quota.
+    const vault = this.app.vault as typeof this.app.vault & {
+      configDir?: string
+      adapter?: {
+        exists(path: string): Promise<boolean>
+        read(path: string): Promise<string>
+        write(path: string, data: string): Promise<void>
+      }
+    }
+    if (vault.adapter) {
+      this.cooldownStore = new V4RateLimitCooldownStore(
+        vault.adapter,
+        `${vault.configDir || ".obsidian"}/plugins/${this.manifest.id}`,
+      )
+    }
 
     this.settingTab = new SettingTab(this.app, this)
     this.addSettingTab(this.settingTab)
@@ -147,7 +166,7 @@ export default class FastSync extends Plugin {
         owner: this.settings.githubOwner,
         repo: this.settings.githubRepo,
         branch: this.settings.githubBranch || "main",
-      });
+      }, { cooldownStore: this.cooldownStore });
     } else this.githubClient = undefined as unknown as GitHubClient
   }
 

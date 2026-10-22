@@ -171,7 +171,15 @@ function installRequestUrlBridge(config: GitHubConfig): void {
   setRequestUrlHandler(async raw => {
     const request = raw as { url: string; method?: string; headers?: Record<string, string>; body?: string };
     const method = (request.method ?? "GET").toUpperCase();
-    if (interference.armed && !interference.fired && method === "PATCH" && request.url.includes(refSuffix)) {
+    // Simulate an external writer immediately before the plugin's real
+    // GraphQL CAS. The old REST PATCH interception alone cannot exercise
+    // beforeOid rejection after Stage E1.
+    const graphqlInput = method === "POST" && request.url === "https://api.github.com/graphql"
+      ? (() => { try { return JSON.parse(request.body ?? "") as { query?: string; variables?: { input?: { refUpdates?: Array<{ name?: string }> } } }; } catch { return null; } })()
+      : null;
+    const isTargetCas = !!graphqlInput?.query?.includes("updateRefs(")
+      && graphqlInput.variables?.input?.refUpdates?.some(ref => ref.name === `refs/heads/${config.branch}`);
+    if (interference.armed && !interference.fired && (isTargetCas || (method === "PATCH" && request.url.includes(refSuffix)))) {
       interference.fired = true;
       interference.externalCommitSha = await publishExternalCommit(config, interference.marker ?? "controlled-race");
     }
@@ -538,6 +546,11 @@ async function runStaleCatchupScenario(config: GitHubConfig, mode: V4StorageMode
     assert.deepEqual(b.vault.files.get("B-local.md")?.bytes, bytes("created on stale device b\n"));
     assertNoConflictCopies(b.vault, "disjoint stale catch-up created a conflict copy");
 
+    // A newly published GraphQL CAS can precede REST ref visibility. Prove
+    // that the expected commit is observable before checking a fresh reader;
+    // otherwise this assertion confounds an old HEAD read with lost data.
+    assert.ok(b.index.remoteCommitSha, "stale device did not record a published remote commit");
+    await waitForBranchHead(config, b.index.remoteCommitSha);
     const c = device("device-c");
     await c.session.sync({ operation: "forcePull", allowThresholdOverride: false });
     assertVaultEquals(c.vault, b.vault, "fresh device after disjoint stale catch-up");
@@ -736,7 +749,7 @@ after(async () => {
   }
 });
 
-test("V4 real GitHub REST survives realistic superuser and two-device scenarios", { timeout: 900_000 }, async () => {
+test("V4 real GitHub strict CAS survives realistic superuser and two-device scenarios", { timeout: 900_000 }, async () => {
   for (const mode of ["plaintext", "encrypted"] as const) {
     await runBaselineScenario(config, mode);
     await runStaleCatchupScenario(config, mode);

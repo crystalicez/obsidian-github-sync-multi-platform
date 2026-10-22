@@ -22,6 +22,51 @@ test("rate-limit delay honors retry-after reset and the documented one-minute fa
   assert.equal(resolveV4RateLimitDelay({ status: 500 }, 1, 10_000), null)
 })
 
+test("E2 fail-first: a terminal HTTP 429 cools down later requests despite exhausting retry budget", async () => {
+  let now = 1_000
+  const sleeps: number[] = []
+  const starts: number[] = []
+  const scheduler = new V4RequestScheduler({
+    maxAttempts: 1,
+    mutationSpacingMs: 0,
+    now: () => now,
+    sleep: async milliseconds => { sleeps.push(milliseconds); now += milliseconds },
+  })
+  await assert.rejects(() => scheduler.run("read", async () => {
+    starts.push(now)
+    throw Object.assign(new Error("rate limited"), { status: 429, headers: { "retry-after": "3" } })
+  }), /rate limited/)
+  assert.equal(scheduler.snapshot.cooldownRemainingMs, 3_000)
+  assert.equal(await scheduler.run("read", async () => { starts.push(now); return "ok" }), "ok")
+  assert.deepEqual(starts, [1_000, 4_000])
+  assert.deepEqual(sleeps, [3_000])
+})
+
+test("E2 fail-first: refused automatic rate-limit retries still hold the next run at the server deadline", async () => {
+  let now = 8_000
+  const scheduler = new V4RequestScheduler({
+    retryRateLimits: false, mutationSpacingMs: 0,
+    now: () => now, sleep: async milliseconds => { now += milliseconds },
+  })
+  await assert.rejects(() => scheduler.run("read", async () => {
+    throw Object.assign(new Error("limited"), { status: 403, headers: { "retry-after": "7" } })
+  }), /limited/)
+  assert.equal(scheduler.snapshot.cooldownRemainingMs, 7_000)
+  await scheduler.run("write", async () => { assert.equal(now, 15_000) })
+})
+
+test("E2 fail-first: scheduler restores a prior server cooldown and blocks first request after restart", async () => {
+  let now = 10_000
+  const scheduler = new V4RequestScheduler({
+    mutationSpacingMs: 0, now: () => now,
+    sleep: async milliseconds => { now += milliseconds },
+  })
+  scheduler.restoreCooldown(18_000)
+  assert.equal(scheduler.snapshot.cooldownRemainingMs, 8_000)
+  await scheduler.run("read", async () => { assert.equal(now, 18_000) })
+  assert.equal(scheduler.snapshot.cooldownRemainingMs, 0)
+})
+
 test("request scheduler applies one shared cooldown and mutation pacing", async () => {
   let now = 0
   const sleeps: number[] = []

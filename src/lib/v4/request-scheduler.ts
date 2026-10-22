@@ -25,6 +25,7 @@ export interface V4RequestSchedulerOptions extends Partial<V4TransportPolicy> {
   now?: () => number
   retryRateLimits?: boolean
   onRetry?: (milliseconds: number) => void
+  onCooldown?: (deadlineEpochMs: number) => Promise<void> | void
   onDelay?: (input: { reason: "cooldown" | "pacing"; milliseconds: number }) => void
 }
 
@@ -45,6 +46,7 @@ export class V4RequestScheduler {
   private readonly now: () => number
   private readonly retryRateLimits: boolean
   private readonly onRetry?: (milliseconds: number) => void
+  private readonly onCooldown?: (deadlineEpochMs: number) => Promise<void> | void
   private readonly onDelay?: (input: { reason: "cooldown" | "pacing"; milliseconds: number }) => void
   private cooldownUntil = 0
   private lastMutationStartedAt: number | undefined
@@ -63,7 +65,14 @@ export class V4RequestScheduler {
     this.now = options.now ?? (() => Date.now())
     this.retryRateLimits = options.retryRateLimits ?? true
     this.onRetry = options.onRetry
+    this.onCooldown = options.onCooldown
     this.onDelay = options.onDelay
+  }
+
+  /** Restore a previously observed server rate-limit deadline before any request runs. */
+  restoreCooldown(deadlineEpochMs: number): void {
+    if (!Number.isSafeInteger(deadlineEpochMs) || deadlineEpochMs <= 0) return
+    this.cooldownUntil = Math.max(this.cooldownUntil, deadlineEpochMs)
   }
 
   get snapshot(): V4RequestSchedulerSnapshot {
@@ -131,13 +140,15 @@ export class V4RequestScheduler {
   }
 
   private async waitForPolicyStart(kind: V4RequestKind, signal?: AbortSignal): Promise<void> {
-    const now = this.now()
-    const cooldownDelay = Math.max(0, this.cooldownUntil - now)
-    const pacingDelay = kind === "write" && this.lastMutationStartedAt !== undefined
-      ? Math.max(0, this.lastMutationStartedAt + this.policy.mutationSpacingMs - now)
-      : 0
-    const milliseconds = Math.max(cooldownDelay, pacingDelay)
-    if (milliseconds > 0) {
+    // Another request can discover a longer rate limit while this one sleeps.
+    for (;;) {
+      const now = this.now()
+      const cooldownDelay = Math.max(0, this.cooldownUntil - now)
+      const pacingDelay = kind === "write" && this.lastMutationStartedAt !== undefined
+        ? Math.max(0, this.lastMutationStartedAt + this.policy.mutationSpacingMs - now)
+        : 0
+      const milliseconds = Math.max(cooldownDelay, pacingDelay)
+      if (milliseconds <= 0) break
       this.onDelay?.({ reason: cooldownDelay >= pacingDelay ? "cooldown" : "pacing", milliseconds })
       const deadline = this.now() + milliseconds
       const sleepId = ++this.nextPolicySleepId
@@ -148,6 +159,7 @@ export class V4RequestScheduler {
       } finally {
         this.policySleepDeadlines.delete(sleepId)
       }
+      throwIfV4Aborted(signal)
     }
     throwIfV4Aborted(signal)
     if (kind === "write") this.lastMutationStartedAt = this.now()
@@ -165,8 +177,12 @@ export class V4RequestScheduler {
       } catch (error) {
         lastError = error
         const delay = resolveV4RateLimitDelay(error, attempt, this.now(), this.policy)
-        if (delay === null || !this.retryRateLimits || attempt === this.policy.maxAttempts) throw error
-        this.cooldownUntil = Math.max(this.cooldownUntil, this.now() + delay)
+        if (delay === null) throw error
+        const previousDeadline = this.cooldownUntil
+        this.restoreCooldown(Math.ceil(this.now() + delay))
+        // Persist before returning/retrying, including the terminal attempt.
+        if (this.cooldownUntil > previousDeadline) await this.onCooldown?.(this.cooldownUntil)
+        if (!this.retryRateLimits || attempt === this.policy.maxAttempts) throw error
         this.onRetry?.(delay)
       }
     }

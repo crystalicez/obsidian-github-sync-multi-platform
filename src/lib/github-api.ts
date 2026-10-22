@@ -1,5 +1,5 @@
 import { requestUrl, type RequestUrlParam, type RequestUrlResponse } from "obsidian";
-import { fromBase64, toBase64, toHex, utf8ToBytes } from "./bytes";
+import { fromBase64, sha256Hex, toBase64, toHex, utf8ToBytes } from "./bytes";
 import type { GitHubCreateTreeEntry, GitHubGitCommit, GitHubGitRef } from "./github-git-types";
 import { V4RepositoryBootstrapRaceError } from "./v4/bootstrap-race";
 import {
@@ -17,6 +17,7 @@ import {
   type V4ResourceController,
 } from "./v4/resource-controller";
 import { V4RequestScheduler } from "./v4/request-scheduler";
+import type { V4RateLimitCooldownStore } from "./v4/rate-limit-cooldown";
 import { V4TransportMetrics, type V4TransportMetricsSnapshot } from "./v4/transport-metrics";
 import { resolveV4TransportPolicy, type V4TransportPolicy } from "./v4/transport-policy";
 import { readImmutableGitFile } from "./v4/immutable-git-read";
@@ -37,6 +38,7 @@ export interface GitHubClientOptions {
   transportResources?: Pick<V4ResourceController, "withTransportBytes">;
   sleep?: (milliseconds: number) => Promise<void>;
   now?: () => number;
+  cooldownStore?: V4RateLimitCooldownStore;
 }
 
 export interface GitHubTreeNode {
@@ -82,9 +84,16 @@ export class GitHubClient {
   private readonly transportResources: Pick<V4ResourceController, "withTransportBytes">;
   private operationSignal?: AbortSignal;
   private repositoryNodeIdPromise?: Promise<string>;
+  private readonly cooldownScope?: Promise<string>;
+  private readonly cooldownStore?: V4RateLimitCooldownStore;
 
   constructor(config: GitHubConfig, options: GitHubClientOptions = {}) {
     this.config = config;
+    this.cooldownStore = options.cooldownStore;
+    // Token-scoped because GitHub rate limits apply across repos for one token.
+    this.cooldownScope = options.cooldownStore
+      ? sha256Hex(utf8ToBytes(`v4-rate-limit-github-token:${config.token}`))
+      : undefined;
     this.transportPolicy = resolveV4TransportPolicy(options.transportPolicy);
     this.transportMetrics = options.transportMetrics ?? new V4TransportMetrics();
     this.transportResources = options.transportResources ?? createV4ResourceController(DEFAULT_V4_RESOURCE_LIMITS);
@@ -93,6 +102,11 @@ export class GitHubClient {
       sleep: options.sleep,
       now: options.now,
       onRetry: () => this.transportMetrics.recordRetry(),
+      onCooldown: async deadline => {
+        if (this.cooldownStore && this.cooldownScope) {
+          await this.cooldownStore.save(await this.cooldownScope, deadline)
+        }
+      },
       onDelay: delay => delay.reason === "cooldown"
         ? this.transportMetrics.recordCooldown(delay.milliseconds)
         : this.transportMetrics.recordPacing(delay.milliseconds),
@@ -106,6 +120,11 @@ export class GitHubClient {
   }
 
   private async request(options: RequestUrlParam, transientBytes = 0): Promise<RequestUrlResponse> {
+    // Initialize before the first wire request, and refresh on each later one
+    // so a newly swapped client cannot bypass another client\'s rate limit.
+    if (this.cooldownStore && this.cooldownScope) {
+      this.requestScheduler.restoreCooldown(await this.cooldownStore.load(await this.cooldownScope))
+    }
     const method = (options.method ?? "GET").toUpperCase();
     const kind = method === "GET" || method === "HEAD" ? "read" : "write";
     const requestBytes = typeof options.body === "string" ? new TextEncoder().encode(options.body).byteLength : 0;
