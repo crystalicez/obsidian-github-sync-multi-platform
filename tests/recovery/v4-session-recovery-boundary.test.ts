@@ -145,6 +145,82 @@ test("pure pull persists remote-verified without journalId before the first fina
   assert.equal(decode(vault.files.get("remote.md")!.bytes), "remote-body")
 })
 
+test("D10 fail-first: remote pull precondition uses actual local snapshot, not base device mtime", async () => {
+  const github = new MemoryGitHub()
+  const source = new MemoryVault()
+  source.files.set("shared.md", { bytes: encode("base-bytes"), mtime: 10 })
+  const sourceIndex = createEmptyV4LocalIndex({ repoId: config.repoId, deviceId: "source", mode: "plaintext" })
+  await new V4SyncSession({github,vault:source,index:sourceIndex,config,conflictPolicy:"copy",abortChangePercent:0})
+    .sync({operation:"forcePush",allowThresholdOverride:false})
+
+  const events: string[]=[]
+  const target = new MemoryVault(events)
+  const index = createEmptyV4LocalIndex({repoId:config.repoId,deviceId:"target",mode:"plaintext"})
+  const adapter = new RecoveryAdapter(events)
+  const recoveryStore = createV4RecoveryStore({adapter,root:"local",repoId:config.repoId})
+  const runState = {runId:"first-pull",conflictCopies:new Map()}
+  await new V4SyncSession({github,vault:target,index,config,conflictPolicy:"copy",abortChangePercent:0,recoveryStore,runState} as never)
+    .sync({operation:"forcePull",allowThresholdOverride:false})
+  assert.equal(decode(target.files.get("shared.md")!.bytes),"base-bytes")
+  // Desktop staged swaps preserve exact bytes but use a fresh physical mtime.
+  // The remote/base timestamp (10) must not be used as the local precondition.
+  target.files.get("shared.md")!.mtime=5_000
+
+  source.files.set("shared.md",{bytes:encode("updated remotely"),mtime:20})
+  await new V4SyncSession({github,vault:source,index:sourceIndex,config,conflictPolicy:"copy",abortChangePercent:0})
+    .sync({operation:"normal",allowThresholdOverride:false,changes:[{type:"modify",path:"shared.md",mtime:20}]})
+
+  const next = new V4SyncSession({github,vault:target,index,config,conflictPolicy:"copy",abortChangePercent:0,
+    recoveryStore,runState:{runId:"next-pull",conflictCopies:new Map()}} as never)
+  await next.sync({operation:"normal",allowThresholdOverride:false})
+  assert.equal(decode(target.files.get("shared.md")!.bytes),"updated remotely")
+  const committed = await recoveryStore.load()
+  assert.ok(committed?.payload?.completedMutationIds.length)
+})
+
+
+test("D10: remote deletion accepts an unchanged local file with a device-specific mtime", async () => {
+  const github = new MemoryGitHub()
+  const remote = new MemoryVault()
+  remote.files.set("delete-me.md", {bytes:encode("intact-bytes"), mtime:10})
+  const remoteIndex = createEmptyV4LocalIndex({repoId:config.repoId,deviceId:"remote-delete",mode:"plaintext"})
+  await new V4SyncSession({github,vault:remote,index:remoteIndex,config,conflictPolicy:"copy",abortChangePercent:0})
+    .sync({operation:"forcePush",allowThresholdOverride:false})
+  const local = new MemoryVault()
+  const localIndex = createEmptyV4LocalIndex({repoId:config.repoId,deviceId:"local-delete",mode:"plaintext"})
+  const store = createV4RecoveryStore({adapter:new RecoveryAdapter([]),root:"d10-delete",repoId:config.repoId})
+  const session = (runId:string)=>new V4SyncSession({github,vault:local,index:localIndex,config,conflictPolicy:"copy",abortChangePercent:0,recoveryStore:store,runState:{runId,conflictCopies:new Map()}} as never)
+  await session("pull-delete-baseline").sync({operation:"forcePull",allowThresholdOverride:false})
+  local.files.get("delete-me.md")!.mtime=5_000
+  remote.files.delete("delete-me.md")
+  await new V4SyncSession({github,vault:remote,index:remoteIndex,config,conflictPolicy:"copy",abortChangePercent:0})
+    .sync({operation:"normal",allowThresholdOverride:false,changes:[{type:"delete",path:"delete-me.md",mtime:20}]})
+  await session("pull-delete-update").sync({operation:"normal",allowThresholdOverride:false})
+  assert.equal(local.files.has("delete-me.md"),false)
+})
+
+test("D10: remote rename cleans the unchanged former path despite device-specific mtime", async () => {
+  const github = new MemoryGitHub()
+  const remote = new MemoryVault()
+  remote.files.set("before-name.md", {bytes:encode("identical-body"),mtime:10})
+  const remoteIndex = createEmptyV4LocalIndex({repoId:config.repoId,deviceId:"remote-rename",mode:"plaintext"})
+  await new V4SyncSession({github,vault:remote,index:remoteIndex,config,conflictPolicy:"copy",abortChangePercent:0})
+    .sync({operation:"forcePush",allowThresholdOverride:false})
+  const local = new MemoryVault()
+  const localIndex = createEmptyV4LocalIndex({repoId:config.repoId,deviceId:"local-rename",mode:"plaintext"})
+  const store = createV4RecoveryStore({adapter:new RecoveryAdapter([]),root:"d10-rename",repoId:config.repoId})
+  const session = (runId:string)=>new V4SyncSession({github,vault:local,index:localIndex,config,conflictPolicy:"copy",abortChangePercent:0,recoveryStore:store,runState:{runId,conflictCopies:new Map()}} as never)
+  await session("rename-baseline").sync({operation:"forcePull",allowThresholdOverride:false})
+  local.files.get("before-name.md")!.mtime=6_000
+  remote.files.delete("before-name.md")
+  remote.files.set("after-name.md",{bytes:encode("identical-body"),mtime:30})
+  await new V4SyncSession({github,vault:remote,index:remoteIndex,config,conflictPolicy:"copy",abortChangePercent:0})
+    .sync({operation:"normal",allowThresholdOverride:false,changes:[{type:"rename",oldPath:"before-name.md",path:"after-name.md",mtime:30}]})
+  await session("rename-update").sync({operation:"normal",allowThresholdOverride:false})
+  assert.equal(local.files.has("before-name.md"),false)
+  assert.equal(decode(local.files.get("after-name.md")!.bytes),"identical-body")
+})
+
 test("D4: same-size/same-mtime edit after WAL is not overwritten by a small Pull", async () => {
   const github = new MemoryGitHub()
   await seedRemote(github)

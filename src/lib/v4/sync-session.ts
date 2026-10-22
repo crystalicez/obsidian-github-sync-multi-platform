@@ -549,7 +549,7 @@ export class V4SyncSession {
       pulledFiles = batch.pulls.length
     } else {
       for (const binding of batch.pulls) {
-        await this.applyPullBinding(binding, ownedStages, () => {
+        await this.applyPullBinding(binding, ownedStages, localById, () => {
           pullCompleted++
           this.report({ currentPath: binding.change.path, currentDirection: "pull", pull: directional(pullCompleted, pullTotal) })
         })
@@ -1298,7 +1298,7 @@ export class V4SyncSession {
       const change = binding.change
       if (change.kind === "delete") {
         const id = `pull:${change.fileId}:delete`
-        mutations.push({ id, kind: "trash", path: change.path, precondition: this.pullPrecondition(change) })
+        mutations.push({ id, kind: "trash", path: change.path, precondition: this.pullPrecondition(change, localById) })
         pullCompletionIds.add(id)
         return
       }
@@ -1308,10 +1308,10 @@ export class V4SyncSession {
       }
       if (this.ephemeralStages.has(binding.stage.stageId)) throw new V4BoundedIoUnavailableError("bounded-append", change.path)
       const writeId = `pull:${change.fileId}:write`
-      mutations.push({ id: writeId, kind: "stage-write", path: change.path, stage: binding.stage, precondition: this.pullPrecondition(change) })
+      mutations.push({ id: writeId, kind: "stage-write", path: change.path, stage: binding.stage, precondition: this.pullPrecondition(change, localById) })
       if (change.kind === "rename" && change.previousPath) {
         const trashId = `pull:${change.fileId}:rename-trash`
-        mutations.push({ id: trashId, kind: "trash", path: change.previousPath, precondition: this.pullPrecondition(change, change.previousPath) })
+        mutations.push({ id: trashId, kind: "trash", path: change.previousPath, precondition: this.pullPrecondition(change, localById, change.previousPath) })
         pullCompletionIds.add(trashId)
       } else {
         pullCompletionIds.add(writeId)
@@ -1391,16 +1391,25 @@ export class V4SyncSession {
     return { payload: { mutations, completedMutationIds: [] }, pullCompletionIds }
   }
 
-  private pullPrecondition(change: V4PlannedChange, path = change.path): V4LocalTargetPrecondition {
-    const before = change.before
-    if (before && before.path === path) return { path, exists: true, size: before.size, mtime: before.mtime, hash: before.hash }
+  private pullPrecondition(
+    change: V4PlannedChange,
+    localById: ReadonlyMap<string, V4LogicalFile>,
+    path = change.path,
+  ): V4LocalTargetPrecondition {
+    // change.before is the three-way base, not this device's physical file.
+    // An unchanged staged pull can have different local and remote mtimes.
+    // Use the scanned local snapshot with its hash to detect genuine edits.
+    const current = localById.get(change.fileId)
+    if (current?.path === path) {
+      return { path, exists: true, size: current.size, mtime: current.mtime, hash: current.hash }
+    }
     return { path, exists: false }
   }
 
-  private async applyPullBinding(binding: V4PullBinding, ownedStages: V4StageRef[], onCompleted: () => void): Promise<void> {
+  private async applyPullBinding(binding: V4PullBinding, ownedStages: V4StageRef[], localById: ReadonlyMap<string, V4LogicalFile>, onCompleted: () => void): Promise<void> {
     const change = binding.change
     if (change.kind === "delete") {
-      await assertV4LocalTargetPrecondition(this.localIo, this.pullPrecondition(change))
+      await assertV4LocalTargetPrecondition(this.localIo, this.pullPrecondition(change, localById))
       this.report({ phase: "applying", currentPath: change.path, currentDirection: "pull" })
       await trashV4LocalUserFile(this.localIo, change.path)
       onCompleted()
@@ -1411,21 +1420,19 @@ export class V4SyncSession {
       this.report({ phase: "downloading", currentPath: change.path, currentDirection: "pull" })
       binding.stage = await this.stageRemotePull(binding, ownedStages)
     }
-    const targetPrecondition = this.pullPrecondition(change)
+    const targetPrecondition = this.pullPrecondition(change, localById)
     if (binding.stage && binding.stage.size > DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES) {
       await assertV4LocalTargetPrecondition(this.localIo, targetPrecondition)
       if (change.kind === "rename" && change.previousPath) {
-        await assertV4LocalTargetPrecondition(this.localIo, {
-          path: change.previousPath, exists: true, size: change.before?.size, mtime: change.before?.mtime,
-        })
+        await assertV4LocalTargetPrecondition(this.localIo,
+          this.pullPrecondition(change, localById, change.previousPath))
       }
       if (!this.localIo.commitStage) throw new V4BoundedIoUnavailableError("stage-commit", change.path)
       this.report({ phase: "applying", currentPath: change.path, currentDirection: "pull" })
       await this.localIo.commitStage({ stage: binding.stage, path: change.path, precondition: targetPrecondition })
       if (change.kind === "rename" && change.previousPath) {
-        await assertV4LocalTargetPrecondition(this.localIo, {
-          path: change.previousPath, exists: true, size: change.before?.size, mtime: change.before?.mtime,
-        })
+        await assertV4LocalTargetPrecondition(this.localIo,
+          this.pullPrecondition(change, localById, change.previousPath))
         await trashV4LocalUserFile(this.localIo, change.previousPath)
       }
       onCompleted()
@@ -1445,9 +1452,8 @@ export class V4SyncSession {
     await assertV4LocalTargetPrecondition(this.localIo, targetPrecondition)
     this.report({ phase: "applying", currentPath: change.path, currentDirection: "pull" })
     if (change.kind === "rename" && change.previousPath) {
-      await assertV4LocalTargetPrecondition(this.localIo, {
-        path: change.previousPath, exists: true, size: change.before?.size, mtime: change.before?.mtime,
-      })
+      await assertV4LocalTargetPrecondition(this.localIo,
+        this.pullPrecondition(change, localById, change.previousPath))
       await trashV4LocalUserFile(this.localIo, change.previousPath)
     }
     await this.localIo.write(change.path, bytes, mtime)

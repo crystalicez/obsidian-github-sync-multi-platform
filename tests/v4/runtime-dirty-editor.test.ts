@@ -75,7 +75,7 @@ test("D8 fail-first: staged replay must not overwrite an unsaved active editor",
     await assert.rejects(
       vault.commitStage({
         stage, path: originalPath,
-        precondition: {path: originalPath, exists: true, size: info.size, mtime: Math.trunc(info.mtimeMs), hash: await sha256Hex(originalBytes)},
+        precondition: {path: originalPath, exists: true, size: info.size, mtime: Math.round(info.mtimeMs), hash: await sha256Hex(originalBytes)},
       }),
       /editor|unsaved|conflict|open/i,
     )
@@ -89,7 +89,7 @@ test("D8 fail-first: a still-open clean editor is deferred rather than risking a
     const info = await (await import("node:fs/promises")).stat(path.join(root,originalPath))
     await assert.rejects(vault.commitStage({
       stage, path: originalPath,
-      precondition: {path:originalPath,exists:true,size:info.size,mtime:Math.trunc(info.mtimeMs),hash:await sha256Hex(originalBytes)},
+      precondition: {path:originalPath,exists:true,size:info.size,mtime:Math.round(info.mtimeMs),hash:await sha256Hex(originalBytes)},
     }), /editor|open|conflict/i)
     assert.deepEqual(new Uint8Array(await readFile(path.join(root,originalPath))), originalBytes)
   })
@@ -101,7 +101,7 @@ test("D8: closing the note releases the fail-closed guard without losing staged 
     closeEditor()
     await vault.commitStage({
       stage, path:originalPath,
-      precondition:{path:originalPath,exists:true,size:info.size,mtime:Math.trunc(info.mtimeMs),hash:await sha256Hex(originalBytes)},
+      precondition:{path:originalPath,exists:true,size:info.size,mtime:Math.round(info.mtimeMs),hash:await sha256Hex(originalBytes)},
     })
     assert.deepEqual(new Uint8Array(await readFile(path.join(root,originalPath))), encode("# remote overwrite\n"))
   })

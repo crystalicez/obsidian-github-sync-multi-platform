@@ -98,7 +98,7 @@ test("D9 fail-first: Desktop replacement contains no async rename gap after the 
   assert.ok(commitSource)
   assert.match(commitSource, /renameSync\(stage, target\)/, "the commit must use a non-yielding metadata rename")
   assert.doesNotMatch(commitSource, /await\s+fs\.rename\(stage,\s*target\)/, "async stage-to-target rename reopens an editor race")
-  const precondition = { exists: true, size: targetStat.size, mtime: Math.trunc(targetStat.mtimeMs), hash: await sha256Hex(original) }
+  const precondition = { exists: true, size: targetStat.size, mtime: Math.round(targetStat.mtimeMs), hash: await sha256Hex(original) }
   // The old implementation awaits fs.promises.rename(stage,target) after the
   // last synchronous editor check. Simulate opening a note while that async
   // rename is being dispatched; its buffer could then be overwritten silently.
@@ -153,7 +153,7 @@ test("D8: editor opens during the awaited backup rename; original and stage rema
   const before = await stat(f.targetPath)
   let checks = 0
   await assert.rejects(f.platform.commitStage("stage.bin", "note.md", {
-    expectedTarget: { exists: true, size: before.size, mtime: Math.trunc(before.mtimeMs), hash: await sha256Hex(original) },
+    expectedTarget: { exists: true, size: before.size, mtime: Math.round(before.mtimeMs), hash: await sha256Hex(original) },
     expectedStageSize: remote.length, expectedStageSha256: await sha256Hex(remote),
     assertNoOpenEditor: () => {
       checks++

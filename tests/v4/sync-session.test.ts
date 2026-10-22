@@ -934,6 +934,8 @@ test("v4 normal pull routes rename cleanup through local trash semantics", async
     .sync({ operation: "forcePull", allowThresholdOverride: false });
   target.operations.length = 0;
 
+  // A staged native pull can preserve bytes yet acquire this device-specific mtime.
+  target.files.get("old-name.md")!.mtime = 5_000;
   const original = source.files.get("old-name.md")!;
   source.files.delete("old-name.md");
   source.files.set("new-name.md", { ...original, mtime: 2 });

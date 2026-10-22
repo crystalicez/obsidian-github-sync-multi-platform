@@ -1,5 +1,15 @@
 # Native Obsidian D6 acceptance — 2026-10-22 (Windows)
 
+## Stage D10 — two native Obsidian instances, encrypted GitHub, and persisted WAL after restart
+
+- Windows **Obsidian 1.14.4**, Plugin built from the audit D10 candidate; isolated disposable vaults `vault-e` and `vault-f` with independent Electron profiles and localhost renderer CDP ports 9241/9242. Credential values and temporary encryption passphrase were not logged. GitHub destination verified by pinned numeric repository ID **1284153873**, each unique branch absent before creation, all branch deletions verified afterward.
+- **Live pre-fix repro:** A encrypted Force Push → B Force Pull → A encrypted update → B normal Sync. B originally failed with `V4LocalTargetChangedError` instead of open-note protection. First cause: Desktop `Math.trunc(fs.stat.mtimeMs)` could differ from Obsidian adapter by one millisecond on actual NTFS. Second independent cause: planner `change.before` represented the remote/base file's timestamp rather than the actual unchanged local device's staged-file physical timestamp. Changing only the rounding did not solve the second issue.
+- **After fixing both:** A encrypted Push, B encrypted Pull, A normal encrypted Push, B open-note veto `V4OpenEditorConflictError`, B closes note and normal Sync recovers exact remote bytes. No destructive edit. In native UI the `Open note needs review` modal referenced the affected note and contained `Keep files unchanged`, with no force-overwrite button.
+- **Recovery durability:** B's blocked Pull preserved two recovery WAL slots and one staged binary; managed B process stopped, same profile reopened, journal and stage persisted, user note still original. After closing the pane, native normal Sync replayed the pending write and cleaned consumed stage **1 → 0**. Test branch deleted, verified absent.
+- **Unit safety:** Live-scanned local snapshot with SHA-256 now provides Pull preconditions for modify, delete and rename. Original-content mutation after scan remains hash-rejected. D10 fail-first tests demonstrate both the fractional NTFS mtime mismatch and stale-base-precondition failure.
+- **Final-bundle rerun:** Exact final D10 candidate `main.js` SHA-256 `550debd56549d5c7b1149652f5e40b4a13c3c4a877a35b75a6ccadc41d75549a`: full encrypted two-instance sync, guarded editor conflict modal and later recovery successful (`allCorrect:true`, branch `cleanup:true`), after the additional non-WAL former-path rename fix. Separate `sync-session.test.ts` exercises a local mtime discrepancy for that direct rename path.
+- **Not yet proven:** Crash exactly between the two `renameSync` calls, cross-process filesystem races, network volumes/slow synchronous metadata operations, mobile/macOS/Linux, and full 1000-note GUI lifecycle. Native E2E harness remains a throwaway ignored driver rather than a checked-in portable acceptance test.
+
 ## Stage D9 — no renderer-yield between Desktop filesystem renames
 
 - **Baseline issue:** D8 guards were checked before `await fs.rename`, but the promise could yield before the OS rename and a user might open an editor during that interval.

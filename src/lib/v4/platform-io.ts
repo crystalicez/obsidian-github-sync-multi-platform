@@ -219,7 +219,7 @@ export function createV4PlatformIo(options: V4PlatformIoOptions): V4PlatformIo {
     if (!expected.exists || !Number.isSafeInteger(expected.size) || !expected.hash || !/^[0-9a-f]{64}$/u.test(expected.hash)) return false
     const info = await statOrNull(backup)
     return !!info && info.size === expected.size
-      && (expected.mtime === undefined || Math.trunc(info.mtimeMs) === Math.trunc(expected.mtime))
+      && (expected.mtime === undefined || Math.round(info.mtimeMs) === Math.round(expected.mtime))
       && await hashFile(backup, info.size) === expected.hash
   }
   return {
@@ -230,7 +230,9 @@ export function createV4PlatformIo(options: V4PlatformIoOptions): V4PlatformIo {
       const info = await statOrNull(full(path))
       if (!info) return null
       if (!info.isFile()) throw new V4ManualRecoveryRequiredError(path, "target is not a regular file")
-      return { size: info.size, mtime: Math.trunc(info.mtimeMs) }
+      // Obsidian's FileSystemAdapter reports nearest-integer milliseconds.
+      // Truncation made the same NTFS timestamp appear changed by 1 ms.
+      return { size: info.size, mtime: Math.round(info.mtimeMs) }
     },
     async readWhole(path) {
       if (desktopReady && options.desktopRootPath) {
@@ -380,7 +382,7 @@ export function createV4PlatformIo(options: V4PlatformIoOptions): V4PlatformIo {
       const expected = commitOptions.expectedTarget
       if (expected.exists !== !!targetBefore
         || (expected.exists && expected.size !== undefined && targetBefore!.size !== expected.size)
-        || (expected.exists && expected.mtime !== undefined && Math.trunc(targetBefore!.mtimeMs) !== Math.trunc(expected.mtime))) {
+        || (expected.exists && expected.mtime !== undefined && Math.round(targetBefore!.mtimeMs) !== Math.round(expected.mtime))) {
         throw new Error(`V4 local target changed before staged commit: ${targetPath}`)
       }
       const stageStat = await fs.stat(stage)

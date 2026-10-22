@@ -7,6 +7,66 @@ import { TFile } from "obsidian"
 import { V4PluginRuntime } from "../../src/lib/v4/runtime"
 import { sha256Hex } from "../../src/lib/bytes"
 
+
+// Obsidian's FileSystemAdapter rounds its native mtime to the nearest ms.
+// The V4 desktop scan historically truncated fs.stat().mtimeMs, so the same
+// unchanged note differed by 1ms across the two APIs and blocked Pull.
+test("D10 fail-first: fractional Windows mtime is normalized like Obsidian's adapter", async () => {
+  const { stat, utimes } = await import("node:fs/promises")
+  const root = await mkdtemp(path.join(os.tmpdir(), "v4-obsidian-mtime-"))
+  try {
+    const target = path.join(root, "rounded.md")
+    const bytes = new TextEncoder().encode("native mtime")
+    await writeFile(target, bytes)
+    // Numeric seconds preserve sub-millisecond precision on NTFS, unlike a Date.
+    await utimes(target, 1_760_000_000.0008, 1_760_000_000.0008)
+    const raw = await stat(target)
+    assert.ok(raw.mtimeMs - Math.floor(raw.mtimeMs) > 0.5,
+      "This test requires a representable >0.5ms filesystem mtime fraction")
+    const file = new TFile("rounded.md", bytes)
+    file.stat.mtime = Math.round(raw.mtimeMs)
+    const fakeVault = {
+      configDir: ".obsidian",
+      adapter: { getFullPath: (logical: string) => path.join(root,logical),
+        async read() { return "" }, async write() {}, async exists() { return false }, async mkdir() {} },
+      getAbstractFileByPath: (logical: string) => logical === file.path ? file : null,
+      getFiles: () => [file],
+    }
+    const runtime = new V4PluginRuntime({
+      app: { vault: fakeVault },
+      manifest: { id: "v4-mtime" },
+      addIgnoredFile() {}, removeIgnoredFile() {},
+      settings: { githubOwner: "disposable", githubRepo: "repo", githubBranch: "main" },
+    } as never)
+    try {
+      const local = (runtime as unknown as {
+        sessionVault(scope: (path: string) => boolean): {
+          stat(p: string): Promise<{mtime: number,size: number} | null>
+          commitStage(args: {
+            path: string
+            stage: {stageId:string,size:number,hash:string}
+            precondition: {path:string,exists:boolean,size:number,mtime:number,hash:string}
+          }): Promise<void>
+        }
+        stagingStore: { pathFor(id: string): string }
+      }).sessionVault(() => true)
+      const measured = await local.stat("rounded.md")
+      assert.equal(measured?.mtime, file.stat.mtime,
+        "Desktop scan must agree with Obsidian adapter for an unchanged NTFS timestamp")
+      const stageData = new TextEncoder().encode("verified remote")
+      const stageFile = path.join(root, ".obsidian", "plugins", "v4-mtime", "github-sync-v4-stage", "rounded.bin")
+      await mkdir(path.dirname(stageFile), {recursive:true})
+      await writeFile(stageFile, stageData)
+      await local.commitStage({
+        stage: {stageId:"rounded",size:stageData.length,hash:await sha256Hex(stageData)},
+        path:"rounded.md",
+        precondition: {path:"rounded.md",exists:true,size:bytes.length,mtime:file.stat.mtime,hash:await sha256Hex(bytes)}
+      })
+      assert.deepEqual(new Uint8Array(await readFile(target)),stageData)
+    } finally { runtime.dispose() }
+  } finally { await rm(root,{recursive:true,force:true}) }
+})
+
 test("D6 desktop recovered target bytes/stat come from disk, not a stale Obsidian TFile cache", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "v4-staged-obsidian-cache-"))
   const first = new Uint8Array([1, 2, 3])
