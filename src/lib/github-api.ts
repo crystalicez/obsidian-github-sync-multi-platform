@@ -81,6 +81,7 @@ export class GitHubClient {
   private readonly transportMetrics: V4TransportMetrics;
   private readonly transportResources: Pick<V4ResourceController, "withTransportBytes">;
   private operationSignal?: AbortSignal;
+  private repositoryNodeIdPromise?: Promise<string>;
 
   constructor(config: GitHubConfig, options: GitHubClientOptions = {}) {
     this.config = config;
@@ -455,14 +456,67 @@ export class GitHubClient {
     return (response.json as { sha?: string }).sha ?? "";
   }
 
-  async updateGitRef(sha: string, _expectedSha?: string): Promise<void> {
-    await this.mutationRequest({
-      options: { url: `${this.baseUrl}/git/refs/heads/${this.branchRefPath()}`, method: "PATCH", headers: this.headers, throw: false },
-      bodyValue: { sha, force: false },
+  private async repositoryNodeId(): Promise<string> {
+    if (!this.repositoryNodeIdPromise) {
+      this.repositoryNodeIdPromise = (async () => {
+        const response = await this.request({
+          url: "https://api.github.com/graphql",
+          method: "POST",
+          headers: this.headers,
+          throw: false,
+          body: JSON.stringify({
+            query: "query($owner: String!, $repo: String!) { repository(owner: $owner, name: $repo) { id } }",
+            variables: { owner: this.config.owner, repo: this.config.repo },
+          }),
+        });
+        if (response.status !== 200) throw this.gitHttpError("Failed to resolve repository GraphQL ID", response.status, response.text);
+        const json = response.json as { data?: { repository?: { id?: unknown } | null }; errors?: unknown };
+        if (Array.isArray(json?.errors) && json.errors.length > 0) throw new Error("GitHub GraphQL repository lookup failed.");
+        const id = json?.data?.repository?.id;
+        if (typeof id !== "string" || id.length === 0) throw new Error("GitHub GraphQL repository lookup did not return a repository ID.");
+        return id;
+      })();
+      void this.repositoryNodeIdPromise.catch(() => { this.repositoryNodeIdPromise = undefined; });
+    }
+    return this.repositoryNodeIdPromise;
+  }
+
+  async updateGitRef(sha: string, expectedSha?: string): Promise<void> {
+    // A REST PATCH with force:false proves fast-forward ancestry, NOT equality
+    // to the originally observed HEAD. Only GraphQL updateRefs(beforeOid)
+    // supplies the server-side CAS needed by V4 WAL publication.
+    if (!expectedSha || !GIT_COMMIT_SHA.test(expectedSha)) {
+      throw new Error("Strict V4 CAS requires a full expected branch HEAD SHA (beforeOid).");
+    }
+    if (!GIT_COMMIT_SHA.test(sha)) throw new Error("Strict V4 CAS requires a full candidate commit SHA.");
+    const repositoryId = await this.repositoryNodeId();
+    const response = await this.mutationRequest({
+      options: { url: "https://api.github.com/graphql", method: "POST", headers: this.headers, throw: false },
+      bodyValue: {
+        query: "mutation($input: UpdateRefsInput!) { updateRefs(input: $input) { clientMutationId } }",
+        variables: {
+          input: {
+            repositoryId,
+            refUpdates: [{ name: `refs/heads/${this.config.branch}`, beforeOid: expectedSha, afterOid: sha, force: false }],
+          },
+        },
+      },
       retryClass: "reachable-ref",
       successStatuses: [200],
-      action: "Failed to update git ref",
+      action: "Failed to update git ref with strict CAS",
     });
+    const json = response.json as { data?: { updateRefs?: unknown }; errors?: unknown };
+    if (Array.isArray(json?.errors) && json.errors.length > 0) {
+      // GraphQL may respond HTTP 200 to a rejected beforeOid. Publication
+      // reconciliation will re-read the actual head and decide how to replan.
+      throw new Error("GitHub GraphQL strict CAS rejected: " + json.errors.map(error =>
+        typeof (error as { message?: unknown })?.message === "string"
+          ? (error as { message: string }).message : "unknown GraphQL error",
+      ).join("; "));
+    }
+    if (!json?.data?.updateRefs || typeof json.data.updateRefs !== "object") {
+      throw new Error("GitHub GraphQL strict CAS response is missing updateRefs confirmation.");
+    }
   }
 
   async createGitRef(sha: string): Promise<void> {

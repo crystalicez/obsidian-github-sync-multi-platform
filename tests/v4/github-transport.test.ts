@@ -355,9 +355,11 @@ test("GitHubClient retries a lost commit response only with explicit orphan-safe
 })
 
 test("GitHubClient never blindly retries a normal ref mutation after a lost response", async () => {
-  let attempts = 0
-  setRequestUrlHandler(async () => {
-    attempts++
+  let mutationAttempts = 0
+  setRequestUrlHandler(async (options: unknown) => {
+    const body = JSON.parse((options as { body: string }).body)
+    if (body.query.includes("repository(")) return { status: 200, text: "", headers: {}, json: { data: { repository: { id: "R_repo_node" } } } }
+    mutationAttempts++
     throw new Error("ref response lost")
   })
   try {
@@ -366,13 +368,68 @@ test("GitHubClient never blindly retries a normal ref mutation after a lost resp
       { transportPolicy: { mutationSpacingMs: 0 } },
     )
     await assert.rejects(
-      () => client.updateGitRef("candidate", "base"),
+      () => client.updateGitRef("b".repeat(40), "a".repeat(40)),
       error => (error as Error).name === "V4GitMutationOutcomeUnknownError",
     )
-    assert.equal(attempts, 1)
+    assert.equal(mutationAttempts, 1)
   } finally {
     setRequestUrlHandler(null)
   }
+})
+
+test("E1 fail-first: GitHubClient publishes existing branch through exact GraphQL beforeOid CAS only", async () => {
+  const requests: Array<Record<string, any>> = []
+  const oldSha = "a".repeat(40)
+  const newSha = "b".repeat(40)
+  setRequestUrlHandler(async (options: unknown) => {
+    const request = options as Record<string, any>
+    requests.push(request)
+    if (request.url !== "https://api.github.com/graphql") throw new Error("REST ref writes are forbidden")
+    const body = JSON.parse(request.body)
+    if (body.query.includes("repository(")) return { status: 200, text: "", headers: {}, json: { data: { repository: { id: "R_repo_node" } } } }
+    if (body.query.includes("updateRefs")) return { status: 200, text: "", headers: {}, json: { data: { updateRefs: { clientMutationId: null } } } }
+    throw new Error("unexpected GraphQL operation")
+  })
+  try {
+    const client = new GitHubClient({ token: "token", owner: "owner", repo: "repo", branch: "feature/deep" }, { transportPolicy: { mutationSpacingMs: 0 } })
+    await client.updateGitRef(newSha, oldSha)
+    assert.equal(requests.length, 2)
+    const mutation = JSON.parse(requests[1].body)
+    assert.equal(mutation.query.includes("updateRefs("), true)
+    assert.deepEqual(mutation.variables.input, {
+      repositoryId: "R_repo_node",
+      refUpdates: [{ name: "refs/heads/feature/deep", beforeOid: oldSha, afterOid: newSha, force: false }],
+    })
+    assert.equal(requests.every(request => request.headers.Authorization === "Bearer token"), true)
+  } finally { setRequestUrlHandler(null) }
+})
+
+test("E1 fail-first: missing expected HEAD is rejected locally without any remote mutation", async () => {
+  let requests = 0
+  setRequestUrlHandler(async () => { requests++; throw new Error("should not request") })
+  try {
+    const client = new GitHubClient({ token: "token", owner: "owner", repo: "repo", branch: "main" })
+    await assert.rejects(() => client.updateGitRef("b".repeat(40)), /expected|beforeOid|CAS/i)
+    assert.equal(requests, 0)
+  } finally { setRequestUrlHandler(null) }
+})
+
+test("E1 fail-first: GraphQL 200 with errors never publishes or silently falls back to REST", async () => {
+  const requests: string[] = []
+  setRequestUrlHandler(async (options: unknown) => {
+    const request = options as Record<string, any>
+    requests.push(request.url)
+    if (request.url !== "https://api.github.com/graphql") throw new Error("unsafe REST fallback")
+    const body = JSON.parse(request.body)
+    if (body.query.includes("repository(")) return { status: 200, text: "", headers: {}, json: { data: { repository: { id: "R_repo_node" } } } }
+    return { status: 200, text: "", headers: {}, json: { errors: [{ message: "beforeOid does not match current ref" }], data: { updateRefs: null } } }
+  })
+  try {
+    const client = new GitHubClient({ token: "token", owner: "owner", repo: "repo", branch: "main" }, { transportPolicy: { mutationSpacingMs: 0 } })
+    await assert.rejects(() => client.updateGitRef("b".repeat(40), "a".repeat(40)), /beforeOid|GraphQL|ref/i)
+    assert.equal(requests.length, 2)
+    assert.ok(requests.every(url => url.endsWith("/graphql")))
+  } finally { setRequestUrlHandler(null) }
 })
 
 test("empty-repository bootstrap observes initialization before retrying a lost Contents PUT", async () => {
