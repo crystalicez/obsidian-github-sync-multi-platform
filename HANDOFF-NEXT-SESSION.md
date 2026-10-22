@@ -4,6 +4,15 @@
 >
 > **Mandatory workflow rule:** Every AI session that makes a material change to code, tests, design decisions, branch/PR state, verification status, or next steps MUST update this file before ending or handing work off. GitHub is the source of truth.
 
+## 2026-10-22 Stage D8 — policy 1: block open-note mutations and preserve pending Recovery (audit only)
+
+- **Explicit user authorization:** Policy **1** on native unsaved-editor data loss: stop local mutation, keep Recovery WAL and staged bytes, ask the user to review. No automatic conflict copies or unsafe overwrites. Existing in-flight GitHub credential **policy B** remains unchanged. No GitHub Actions or master/release writes.
+- **Fail-first native evidence:** On actual Windows Obsidian 1.14.4, D6 runtime staged replacement erased dirty editor text; see `docs/engineering/native-obsidian-acceptance-2026-10-22.md`.
+- **Change:** Added `V4OpenEditorConflictError` and conservative workspace-leaf/activeEditor check to `src/lib/v4/runtime.ts` at local write, delete, staged commit and staged rollback. A note in an open leaf is blocked **even when clean**, because editor data can change after any awaited verification. A dedicated non-destructive modal explains saving/closing the note and reviewing conflict. Added a synchronous callback to Desktop platform IO to recheck before the first and second rename and to restore the original backup if opened mid-swap. Case-insensitive NFC path matching. All stages/WAL remain durable on failure.
+- **Tests:** Initial editor-focused fail-first tests failed. After fix: `runtime-dirty-editor` 4/4 PASS, filesystem guard-after-backup-rename PASS, published WAL+stage preservation and zero receipt PASS, entire Fast + 10x repeat + Recovery + Resource 11/11 + Feasibility + 100 MB bounded soak + Build + metadata/package + E2E-compile PASS.
+- **Real Obsidian follow-up:** Same isolated vault/profile with updated production bundle SHA-256 `57C4220676593C7D12232ABCD3DD0EE190ECA0A8797ADDE21F3169E188BB0102`: dirty unsaved editor held `USER_DIRTY_UNSAVED_EDIT`, target stayed `BASE_CONTENT`, no modify event, stage retained and `V4OpenEditorConflictError`; clean open editor also blocked preserving original and stage. Both exit 0. No private vault or test remote mutation; managed Obsidian process stopped.
+- **Remaining risk:** There is still a narrow OS rename vs new editor edit race after the last synchronous guard. Entire two-instance credentialed GUI Sync, exact between-syscall crash and editor conflict modal/UX need validation. **Not production-ready**, do not merge or release. Isolated branch only.
+
 ## 2026-10-22 Native D6 Windows acceptance — CRITICAL unsaved editor loss (release BLOCKED)
 
 - **Detailed evidence:** `docs/engineering/native-obsidian-acceptance-2026-10-22.md`. User explicitly authorized isolated-profile/native testing; only test vault `.tmp/native-obsidian-d6/vault-a` and Electron profile `.tmp/native-obsidian-d6/profile-a` within the audit worktree were touched. No personal Obsidian vault, master, or GitHub Actions.

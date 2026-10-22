@@ -15,6 +15,8 @@ export interface V4StageCommitOptions {
   expectedTarget: { exists: boolean; size?: number; mtime?: number; hash?: string }
   expectedStageSize: number
   expectedStageSha256: string
+  /** Synchronous editor guard, checked immediately before filesystem renames. */
+  assertNoOpenEditor?: () => void
 }
 
 export class V4BoundedIoUnavailableError extends Error {
@@ -316,9 +318,11 @@ export function createV4PlatformIo(options: V4PlatformIoOptions): V4PlatformIo {
         }
         // Park rather than delete the replacement. A crash during restoration
         // leaves both the original backup and the candidate replacement intact.
+        commitOptions.assertNoOpenEditor?.()
         await fs.rename(target, residue)
       }
       try {
+        commitOptions.assertNoOpenEditor?.()
         await fs.rename(backup, target)
       } catch (error) {
         if (await statOrNull(residue) && !(await statOrNull(target))) {
@@ -390,7 +394,11 @@ export function createV4PlatformIo(options: V4PlatformIoOptions): V4PlatformIo {
       let stageMoved = false
       try {
         if (options.desktopRootPath) await assertRecoveryPaths(stagePath, targetPath)
+        commitOptions.assertNoOpenEditor?.()
         if (targetBefore) { await fs.rename(target, backup); backedUp = true }
+        // The first rename awaited disk IO, so recheck before the actual
+        // replacement; if a user opened the note, restore its original backup.
+        commitOptions.assertNoOpenEditor?.()
         await fs.rename(stage, target); stageMoved = true
         const after = await fs.stat(target)
         if (after.size !== commitOptions.expectedStageSize) throw new Error(`V4 committed target size mismatch: ${targetPath}`)

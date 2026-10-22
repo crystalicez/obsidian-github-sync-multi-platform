@@ -81,6 +81,38 @@ async function saveIntent(adapter: Adapter, payload: V4RecoveryPayload): Promise
   return { store, snapshot }
 }
 
+
+test("D8: a dirty-editor veto keeps published-recovery WAL and stage without a receipt", async () => {
+  const adapter = new Adapter()
+  const vault = new Vault()
+  vault.preferStagedCommit = true
+  vault.files.set("note.md", { bytes: enc("original"), mtime: 10 })
+  const staged = await stage("editor-blocked", "remote")
+  vault.staging.stages.set(staged.ref.stageId, staged.bytes)
+  vault.commitStage = async () => { throw new Error("V4OpenEditorConflictError: editor still open") }
+  const store = createV4RecoveryStore({ adapter, root: "editor-veto", repoId: "owner/repo#main" })
+  const snapshot = await store.save({
+    runId: "editor-veto-run", phase: "remote-verified",
+    expectedRemoteHead: "old", verifiedRemoteHead: "new",
+    payload: {
+      mutations: [{ id: "apply:open-note", kind: "stage-write", path: "note.md",
+        stage: staged.ref, precondition: { path: "note.md", exists: true, size: 8, mtime: 10,
+          hash: await sha256Hex(enc("original")) } }],
+      completedMutationIds: [],
+    },
+  })
+  await assert.rejects(
+    () => applyV4RecoveryLocalMutations({ store, snapshot, io: vault }),
+    /V4OpenEditorConflictError/,
+  )
+  const persisted = await store.load()
+  assert.equal(persisted?.header.phase, "remote-verified")
+  assert.deepEqual(persisted?.payload?.completedMutationIds, [])
+  assert.equal(persisted?.payload?.mutations.length, 1)
+  assert.deepEqual(vault.files.get("note.md")?.bytes, enc("original"))
+  assert.deepEqual(vault.staging.stages.get(staged.ref.stageId), staged.bytes)
+})
+
 test("crash matrix: candidate created before publish-intent cannot mutate local state", async () => {
   const adapter = new Adapter()
   const vault = new Vault()

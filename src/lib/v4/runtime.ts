@@ -128,6 +128,13 @@ function createIndexAdapter(plugin: FastSync): V4LocalIndexAdapter {
   }
 }
 
+export class V4OpenEditorConflictError extends Error {
+  constructor(public readonly targetPath: string) {
+    super(`Sync paused for ${targetPath}: this note is open in an Obsidian editor. Close the editor after saving your changes, then review the conflict and retry. No automatic local overwrite was attempted.`)
+    this.name = "V4OpenEditorConflictError"
+  }
+}
+
 export class V4PluginRuntime {
   private readonly coordinator: V4SyncCoordinator
   private readonly adapter: V4LocalIndexAdapter
@@ -347,6 +354,30 @@ export class V4PluginRuntime {
     await saveV4LocalIndex(this.adapter, V4_INDEX_ROOT, index, previousShardHashes)
   }
 
+  /**
+   * A clean editor can become dirty between any two awaited operations.
+   * Until a pin/lock handshake with Obsidian exists, do not mutate a note
+   * open in a Markdown editor at all. This also protects unsaved buffers that
+   * are not reflected in disk stat/hash preconditions.
+   */
+  private assertNoOpenEditorMutation(path: string): void {
+    const workspace = this.plugin.app.workspace
+    if (!workspace) return // minimal offline runtime fixtures do not have a UI
+    if (typeof workspace.iterateAllLeaves !== "function") {
+      throw new V4OpenEditorConflictError(path)
+    }
+    const canonical = (value: string) => value.normalize("NFC").toLowerCase()
+    const target = canonical(path)
+    let open = workspace.activeEditor?.file?.path
+      ? canonical(workspace.activeEditor.file.path) === target
+      : false
+    workspace.iterateAllLeaves(leaf => {
+      const view = leaf.view as { file?: { path?: string } } | undefined
+      if (view?.file?.path && canonical(view.file.path) === target) open = true
+    })
+    if (open) throw new V4OpenEditorConflictError(path)
+  }
+
   private sessionVault(inScope = this.scopePredicate()): V4SessionVault {
     return {
       listFiles: async () => {
@@ -384,11 +415,13 @@ export class V4PluginRuntime {
         return readVaultFileBytes(this.plugin.app.vault, file)
       },
       write: async (path: string, bytes: Uint8Array) => {
+        this.assertNoOpenEditorMutation(path)
         this.plugin.addIgnoredFile(path)
         try { await writeVaultFileBytes(this.plugin.app.vault, path, bytes) }
         finally { this.plugin.removeIgnoredFile(path) }
       },
       trash: async (path: string) => {
+        this.assertNoOpenEditorMutation(path)
         this.plugin.addIgnoredFile(path)
         try {
           await trashVaultFileIfExists(this.plugin.app.vault, this.plugin.app.fileManager, path)
@@ -413,12 +446,14 @@ export class V4PluginRuntime {
       // Only Desktop with a verifiable vault root can safely replay a staged small-file swap.
       preferStagedCommit: this.platformIo.capabilities.recoveryStagedCommit,
       commitStage: async ({ stage, path, precondition }) => {
+        this.assertNoOpenEditorMutation(path)
         this.plugin.addIgnoredFile(path)
         try {
           await this.platformIo.commitStage(this.stagingStore.pathFor(stage.stageId), path, {
             expectedTarget: precondition,
             expectedStageSize: stage.size,
             expectedStageSha256: stage.hash,
+            assertNoOpenEditor: () => this.assertNoOpenEditorMutation(path),
           })
           this.recentlyStagedPaths.add(path)
         } finally {
@@ -429,6 +464,7 @@ export class V4PluginRuntime {
         expectedTarget: precondition,
         expectedStageSize: stage.size,
         expectedStageSha256: stage.hash,
+        assertNoOpenEditor: () => this.assertNoOpenEditorMutation(path),
       }),
       finalizeStage: async ({ stage, path, precondition }) => {
         await this.platformIo.finalizeStage(this.stagingStore.pathFor(stage.stageId), path, {
@@ -695,7 +731,9 @@ export class V4PluginRuntime {
         error,
       })
       this.progressStore.finish("failed", { errorMessage: message })
-      if (error instanceof V4ManualRecoveryRequiredError) {
+      if (error instanceof V4OpenEditorConflictError) {
+        this.askUserToReviewOpenEditor(error)
+      } else if (error instanceof V4ManualRecoveryRequiredError) {
         // Never present a destructive override when backup evidence is missing.
         this.askUserToReviewRecovery(error)
       } else {
@@ -711,6 +749,16 @@ export class V4PluginRuntime {
         if (this.coordinator.pendingCount > 0) this.beginWaitingRun()
       }
     }
+  }
+
+  private askUserToReviewOpenEditor(error: V4OpenEditorConflictError): void {
+    const modal = new Modal(this.plugin.app)
+    modal.titleEl.setText("GitHub Sync: Open note needs review")
+    modal.contentEl.createEl("p", { text: `Sync paused to protect edits in ${error.targetPath}.` })
+    modal.contentEl.createEl("p", { text: "Save your edits, close this note in all Obsidian panes, then retry Sync. The pending recovery journal and staged data are retained until the conflict is reviewed. No overwrite or deletion is authorized by closing this dialog." })
+    modal.contentEl.createEl("p", { text: "If the editor contains changes you want to keep, copy or save them before closing the note." })
+    modal.contentEl.createEl("button", { text: "Keep files unchanged" }).onclick = () => modal.close()
+    modal.open()
   }
 
   private askUserToReviewRecovery(error: V4ManualRecoveryRequiredError): void {

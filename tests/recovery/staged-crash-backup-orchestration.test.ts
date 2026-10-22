@@ -84,6 +84,26 @@ async function setup() {
   return { root, stagePath, targetPath, backupPath, platform, store, snapshot, stage, precondition, io }
 }
 
+
+test("D8: editor opens during the awaited backup rename; original and stage remain intact", async () => fixture(async f => {
+  await writeFile(f.targetPath, original)
+  await writeFile(f.stagePath, remote)
+  const before = await stat(f.targetPath)
+  let checks = 0
+  await assert.rejects(f.platform.commitStage("stage.bin", "note.md", {
+    expectedTarget: { exists: true, size: before.size, mtime: Math.trunc(before.mtimeMs), hash: await sha256Hex(original) },
+    expectedStageSize: remote.length, expectedStageSha256: await sha256Hex(remote),
+    assertNoOpenEditor: () => {
+      checks++
+      if (checks === 2) throw new Error("editor became open during the filesystem preflight")
+    },
+  }), /editor became open/)
+  assert.equal(checks, 2)
+  assert.deepEqual(new Uint8Array(await readFile(f.targetPath)), original)
+  assert.deepEqual(new Uint8Array(await readFile(f.stagePath)), remote)
+  assert.equal(await exists(f.backupPath), false)
+}))
+
 test("D2 WAL: aborted recovery restores backup-only crash before deleting staged evidence", async () => fixture(async f => {
   await writeFile(f.backupPath, original)
   await utimes(f.backupPath, new Date(10), new Date(10))
