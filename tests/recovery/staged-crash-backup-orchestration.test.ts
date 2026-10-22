@@ -1,5 +1,5 @@
 import assert from "node:assert/strict"
-import { mkdtemp, readFile, rm, writeFile, stat, utimes } from "node:fs/promises"
+import { mkdtemp, readFile, rm, writeFile, stat, utimes, rename } from "node:fs/promises"
 import path from "node:path"
 import os from "node:os"
 import test from "node:test"
@@ -49,6 +49,7 @@ async function setup() {
     },
   })
   const io = {
+    preferStagedCommit: true,
     async listFiles() { return [] },
     async stat(p: string) {
       try { const v = await stat(path.join(root, p)); return { path: p, size: v.size, mtime: 10 } }
@@ -63,6 +64,11 @@ async function setup() {
       async remove() { await platform.removeStage("stage.bin") },
       async beginStage(): Promise<never> { throw new Error("not used") },
       async stageSource(): Promise<never> { throw new Error("not used") },
+    },
+    async commitStage() {
+      await platform.commitStage("stage.bin", "note.md", {
+        expectedTarget: precondition, expectedStageSize: stage.size, expectedStageSha256: stage.hash,
+      })
     },
     async rollbackStage() {
       await platform.rollbackStage("stage.bin", "note.md", {
@@ -121,6 +127,58 @@ test("D2 WAL: a saved completion only finalizes a matching target and retains ba
     },
   })
   await assert.rejects(() => applyV4RecoveryLocalMutations({ store: f.store, snapshot: recorded, io: f.io }), /manual|review|ambiguous/i)
+  assert.deepEqual(new Uint8Array(await readFile(f.targetPath)), changed)
+  assert.deepEqual(new Uint8Array(await readFile(f.backupPath)), original)
+}))
+
+test("D6 native filesystem: a real small staged commit preserves exact bytes with a durable receipt", async () => fixture(async f => {
+  await writeFile(f.targetPath, original)
+  await utimes(f.targetPath, new Date(10), new Date(10))
+  await writeFile(f.stagePath, remote)
+  let inPlaceWrites = 0
+  f.io.write = async () => { inPlaceWrites++; throw new Error("unsafe in-place write called") }
+  const result = await applyV4RecoveryLocalMutations({ store: f.store, snapshot: f.snapshot, io: f.io })
+  assert.equal(result.replanRequired, false)
+  assert.equal(inPlaceWrites, 0)
+  assert.deepEqual(new Uint8Array(await readFile(f.targetPath)), remote)
+  assert.equal(await exists(f.stagePath), false)
+  assert.equal(await exists(f.backupPath), false)
+  assert.deepEqual((await f.store.load())?.payload?.completedMutationIds, ["write:note"])
+}))
+
+test("D6 native filesystem: crash after parking original but before moving small stage safely restores original", async () => fixture(async f => {
+  await writeFile(f.targetPath, original)
+  await utimes(f.targetPath, new Date(10), new Date(10))
+  await writeFile(f.stagePath, remote)
+  await rename(f.targetPath, f.backupPath) // Inject process kill after first rename.
+  await discardV4RecoveryStages(f.snapshot, f.io)
+  assert.deepEqual(new Uint8Array(await readFile(f.targetPath)), original)
+  assert.equal(await exists(f.backupPath), false)
+  assert.equal(await exists(f.stagePath), false)
+}))
+
+test("D6 native filesystem: small stage swap with missing receipt is recognized on restart", async () => fixture(async f => {
+  await writeFile(f.targetPath, original)
+  await utimes(f.targetPath, new Date(10), new Date(10))
+  await writeFile(f.stagePath, remote)
+  await rename(f.targetPath, f.backupPath)
+  await rename(f.stagePath, f.targetPath) // Inject process kill after replacement and before receipt.
+  f.io.write = async () => { throw new Error("unsafe in-place write called") }
+  const result = await applyV4RecoveryLocalMutations({ store: f.store, snapshot: f.snapshot, io: f.io })
+  assert.equal(result.replanRequired, false)
+  assert.deepEqual(new Uint8Array(await readFile(f.targetPath)), remote)
+  assert.equal(await exists(f.backupPath), false)
+  assert.deepEqual((await f.store.load())?.payload?.completedMutationIds, ["write:note"])
+}))
+
+test("D6 native filesystem: crash plus user edit keeps candidate and original for manual recovery", async () => fixture(async f => {
+  await writeFile(f.targetPath, original)
+  await utimes(f.targetPath, new Date(10), new Date(10))
+  await writeFile(f.stagePath, remote)
+  await rename(f.targetPath, f.backupPath)
+  await rename(f.stagePath, f.targetPath)
+  await writeFile(f.targetPath, changed)
+  await assert.rejects(() => discardV4RecoveryStages(f.snapshot, f.io), /manual|review|ambiguous/i)
   assert.deepEqual(new Uint8Array(await readFile(f.targetPath)), changed)
   assert.deepEqual(new Uint8Array(await readFile(f.backupPath)), original)
 }))

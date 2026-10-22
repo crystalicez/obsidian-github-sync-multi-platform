@@ -330,7 +330,7 @@ export async function applyV4RecoveryLocalMutations(input: {
         continue
       }
       await assertV4LocalTargetPrecondition(input.io, mutation.precondition)
-      if (mutation.stage.size > DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES) {
+      if (input.io.preferStagedCommit || mutation.stage.size > DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES) {
         if (!input.io.commitStage) throw new V4RecoveryRequiredError(`V4 recovery cannot commit staged content: ${mutation.id}`)
         await input.io.commitStage({ stage: mutation.stage, path: mutation.path, precondition: mutation.precondition })
       } else {

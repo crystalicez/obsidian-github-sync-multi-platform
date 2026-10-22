@@ -25,6 +25,7 @@ import { createV4StagingStore, type V4StagingStore } from "./staging-store"
 import { V4ProgressStore, type V4SyncProgressSnapshot } from "./progress"
 import { createV4RecoveryStore, discardV4RecoveryStages, markV4RecoveryIndexCommitted, recoverV4PendingState, V4RecoveryRequiredError } from "./recovery-store"
 import { V4KeyringCache } from "./keyring-cache"
+import { boundedMap } from "./bounded-map"
 import { V4CancelledError, throwIfV4Aborted } from "./cancellation"
 import { V4PublicationRaceError, isV4PublicationRaceError } from "./publication-race"
 import { assertV4SpeculativeConfigStillAbsent, guardV4SpeculativeConfigGithub } from "./speculative-config-guard"
@@ -133,6 +134,7 @@ export class V4PluginRuntime {
   private readonly progressStore = new V4ProgressStore()
   private readonly platformIo: V4PlatformIo
   private readonly stagingStore: V4StagingStore
+  private readonly recentlyStagedPaths = new Set<string>()
   private readonly keyringCache = new V4KeyringCache()
   private credentialGeneration = 0
   private debounceRunActive = false
@@ -154,6 +156,7 @@ export class V4PluginRuntime {
     if (this.disposed) return
     this.disposed = true
     this.debounceRunActive = false
+    this.recentlyStagedPaths.clear()
     this.coordinator.dispose()
     this.progressStore.dispose()
     void this.coordinator.whenIdle().finally(() => this.keyringCache.dispose())
@@ -346,12 +349,36 @@ export class V4PluginRuntime {
 
   private sessionVault(inScope = this.scopePredicate()): V4SessionVault {
     return {
-      listFiles: async () => this.plugin.app.vault.getFiles().filter(file => inScope(file.path)).map(file => ({ path: file.path, size: file.stat.size, mtime: file.stat.mtime })),
+      listFiles: async () => {
+        const files = this.plugin.app.vault.getFiles().filter(file => inScope(file.path))
+        if (!this.platformIo.capabilities.recoveryStagedCommit) {
+          return files.map(file => ({ path: file.path, size: file.stat.size, mtime: file.stat.mtime }))
+        }
+        // The Obsidian TFile listing may have stale stats until its watcher
+        // processes a staged rename. Bound live stat calls to avoid a file
+        // descriptor/IO storm while scanning large vaults.
+        const indexed = new Set(files.map(file => file.path))
+        for (const path of indexed) this.recentlyStagedPaths.delete(path)
+        const paths = [...indexed, ...[...this.recentlyStagedPaths].filter(path => inScope(path) && !indexed.has(path))]
+        const actual = await boundedMap(paths, 4, async path => {
+          const stat = await this.platformIo.statFile(path)
+          return stat ? { path, ...stat } : null
+        })
+        return actual.filter((file): file is { path: string; size: number; mtime: number } => !!file)
+      },
       stat: async (path: string) => {
+        if (!inScope(path)) return null
+        // Staged filesystem renames are visible on disk before Obsidian's watcher
+        // updates its TFile cache. Recovery must inspect the real target bytes.
+        if (this.platformIo.capabilities.recoveryStagedCommit) {
+          const info = await this.platformIo.statFile(path)
+          return info ? { path, ...info } : null
+        }
         const file = this.plugin.app.vault.getAbstractFileByPath(path)
-        return file instanceof TFile && inScope(path) ? { path, size: file.stat.size, mtime: file.stat.mtime } : null
+        return file instanceof TFile ? { path, size: file.stat.size, mtime: file.stat.mtime } : null
       },
       read: async (path: string) => {
+        if (this.platformIo.capabilities.recoveryStagedCommit) return this.platformIo.readWhole(path)
         const file = this.plugin.app.vault.getAbstractFileByPath(path)
         if (!(file instanceof TFile)) throw new Error(`Missing local file: ${path}`)
         return readVaultFileBytes(this.plugin.app.vault, file)
@@ -363,12 +390,16 @@ export class V4PluginRuntime {
       },
       trash: async (path: string) => {
         this.plugin.addIgnoredFile(path)
-        try { await trashVaultFileIfExists(this.plugin.app.vault, this.plugin.app.fileManager, path) }
+        try {
+          await trashVaultFileIfExists(this.plugin.app.vault, this.plugin.app.fileManager, path)
+          this.recentlyStagedPaths.delete(path)
+        }
         finally { this.plugin.removeIgnoredFile(path) }
       },
       openContentSource: (handle, signal) => createV4ContentSource(handle, {
         wholeBufferCeilingBytes: DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES,
         readVaultWhole: async path => {
+          if (this.platformIo.capabilities.recoveryStagedCommit) return this.platformIo.readWhole(path)
           const file = this.plugin.app.vault.getAbstractFileByPath(path)
           if (!(file instanceof TFile)) throw new Error(`Missing local file: ${path}`)
           return readVaultFileBytes(this.plugin.app.vault, file)
@@ -379,6 +410,8 @@ export class V4PluginRuntime {
         openStage: (stageId, expectedSize) => this.stagingStore.open({ stageId, size: expectedSize }),
       }, signal),
       staging: this.stagingStore,
+      // Only Desktop with a verifiable vault root can safely replay a staged small-file swap.
+      preferStagedCommit: this.platformIo.capabilities.recoveryStagedCommit,
       commitStage: async ({ stage, path, precondition }) => {
         this.plugin.addIgnoredFile(path)
         try {
@@ -387,6 +420,7 @@ export class V4PluginRuntime {
             expectedStageSize: stage.size,
             expectedStageSha256: stage.hash,
           })
+          this.recentlyStagedPaths.add(path)
         } finally {
           this.plugin.removeIgnoredFile(path)
         }
@@ -396,11 +430,14 @@ export class V4PluginRuntime {
         expectedStageSize: stage.size,
         expectedStageSha256: stage.hash,
       }),
-      finalizeStage: ({ stage, path, precondition }) => this.platformIo.finalizeStage(this.stagingStore.pathFor(stage.stageId), path, {
-        expectedTarget: precondition,
-        expectedStageSize: stage.size,
-        expectedStageSha256: stage.hash,
-      }),
+      finalizeStage: async ({ stage, path, precondition }) => {
+        await this.platformIo.finalizeStage(this.stagingStore.pathFor(stage.stageId), path, {
+          expectedTarget: precondition,
+          expectedStageSize: stage.size,
+          expectedStageSha256: stage.hash,
+        })
+        if (this.platformIo.capabilities.recoveryStagedCommit) this.recentlyStagedPaths.add(path)
+      },
     }
   }
 

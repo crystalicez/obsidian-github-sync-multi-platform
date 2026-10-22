@@ -48,6 +48,7 @@ class Vault implements V4SessionVault {
   writes = 0
   trashes = 0
   crashAfterSwap = false
+  preferStagedCommit = false
   async listFiles() { return [...this.files].map(([path, file]) => ({ path, size: file.bytes.byteLength, mtime: file.mtime })) }
   async stat(path: string) { const file = this.files.get(path); return file ? { path, size: file.bytes.byteLength, mtime: file.mtime } : null }
   async read(path: string) { const file = this.files.get(path); if (!file) throw new Error(`missing:${path}`); return new Uint8Array(file.bytes) }
@@ -202,4 +203,47 @@ test("crash matrix: index-save recovery can be terminalized twice only after dur
   assert.equal(first?.header.phase, "index-committed")
   assert.equal(second?.header.phase, "index-committed")
   assert.equal(second?.header.generation, first?.header.generation)
+})
+
+test("D6: desktop-sized staged replacement uses commitStage instead of in-place write and resumes after a lost receipt", async () => {
+  const adapter = new Adapter()
+  const vault = new Vault()
+  const oldBytes = enc("original")
+  const committed = await stage("s-small-crash", "replaced")
+  vault.files.set("note.md", { bytes: oldBytes, mtime: 17 })
+  vault.staging.stages.set(committed.ref.stageId, committed.bytes)
+  vault.preferStagedCommit = true
+  vault.crashAfterSwap = true
+  const store = createV4RecoveryStore({ adapter, root: "small-crash", repoId: "owner/repo#main" })
+  let snapshot = await store.save({
+    runId: "run-small-crash", phase: "remote-verified", expectedRemoteHead: "head-new", verifiedRemoteHead: "head-new",
+    payload: { mutations: [{
+      id: "small", kind: "stage-write", path: "note.md", stage: committed.ref,
+      precondition: { path: "note.md", exists: true, size: oldBytes.length, mtime: 17, hash: await sha256Hex(oldBytes) },
+    }], completedMutationIds: [] },
+  })
+  await assert.rejects(applyV4RecoveryLocalMutations({ store, snapshot, io: vault }), /crash:after-swap/u)
+  assert.equal(vault.writes, 0, "in-place write must never run on desktop staged path")
+  assert.equal(new TextDecoder().decode(vault.files.get("note.md")!.bytes), "replaced")
+  snapshot = (await store.load())!
+  await applyV4RecoveryLocalMutations({ store, snapshot, io: vault })
+  assert.equal(vault.writes, 0)
+  assert.equal((await store.load())?.payload?.completedMutationIds[0], "small")
+})
+
+test("D6: unsupported desktop commit capability fails closed rather than falling back to small in-place write", async () => {
+  const adapter = new Adapter()
+  const vault = new Vault()
+  vault.preferStagedCommit = true
+  vault.commitStage = undefined as never
+  const committed = await stage("s-missing-capability", "candidate")
+  vault.staging.stages.set(committed.ref.stageId, committed.bytes)
+  const store = createV4RecoveryStore({ adapter, root: "missing-commit", repoId: "owner/repo#main" })
+  const snapshot = await store.save({
+    runId: "run-no-commit", phase: "remote-verified", expectedRemoteHead: "published", verifiedRemoteHead: "published",
+    payload: { mutations: [{ id: "small", kind: "stage-write", path: "note.md", stage: committed.ref, precondition: { path: "note.md", exists: false } }], completedMutationIds: [] },
+  })
+  await assert.rejects(() => applyV4RecoveryLocalMutations({ store, snapshot, io: vault }), /commit|stage|unavailable/i)
+  assert.equal(vault.files.has("note.md"), false)
+  assert.equal(vault.writes, 0)
 })

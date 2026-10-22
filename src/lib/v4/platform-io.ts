@@ -42,11 +42,13 @@ export interface V4PlatformIoCapabilities {
   boundedRead: boolean
   boundedAppend: boolean
   freeSpace: boolean
+  recoveryStagedCommit: boolean
   requiresObsidian1123ForAppend: boolean
 }
 
 export interface V4PlatformIo {
   readonly capabilities: V4PlatformIoCapabilities
+  statFile(path: string): Promise<{ size: number; mtime: number } | null>
   readWhole(path: string): Promise<Uint8Array>
   openBoundedSource(path: string, expectedSize: number): Promise<V4ContentSource>
   writeStage(path: string, bytes: Uint8Array): Promise<void>
@@ -134,6 +136,7 @@ export function createV4PlatformIo(options: V4PlatformIoOptions): V4PlatformIo {
     boundedRead: desktopReady,
     boundedAppend: desktopReady || mobileAppend,
     freeSpace: desktopReady,
+    recoveryStagedCommit: desktopReady && !!options.desktopRootPath,
     requiresObsidian1123ForAppend: options.platform === "mobile" && mobileAppend,
   }
   const full = (path: string): string => {
@@ -211,6 +214,14 @@ export function createV4PlatformIo(options: V4PlatformIoOptions): V4PlatformIo {
   }
   return {
     capabilities,
+    async statFile(path) {
+      if (!desktopReady || !options.desktopRootPath) throw new V4BoundedIoUnavailableError("bounded-read", path)
+      await assertDesktopPathSafe(path)
+      const info = await statOrNull(full(path))
+      if (!info) return null
+      if (!info.isFile()) throw new V4ManualRecoveryRequiredError(path, "target is not a regular file")
+      return { size: info.size, mtime: Math.trunc(info.mtimeMs) }
+    },
     async readWhole(path) {
       if (desktopReady && options.desktopRootPath) {
         await assertDesktopPathSafe(path, true)
