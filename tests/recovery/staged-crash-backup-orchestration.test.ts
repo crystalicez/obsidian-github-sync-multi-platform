@@ -85,6 +85,68 @@ async function setup() {
 }
 
 
+
+test("D9 fail-first: Desktop replacement contains no async rename gap after the final editor guard", async () => fixture(async f => {
+  await writeFile(f.targetPath, original)
+  await writeFile(f.stagePath, remote)
+  const targetStat = await stat(f.targetPath)
+  // Code-level contract supplements the runtime fault injection. In Node ESM,
+  // import("node:fs/promises").rename is a stable named export and cannot be
+  // replaced by patching its CommonJS/default object alone.
+  const source = await readFile(path.join(process.cwd(), "src", "lib", "v4", "platform-io.ts"), "utf8")
+  const commitSource = source.split("    async commitStage(stagePath, targetPath, commitOptions) {")[1]
+  assert.ok(commitSource)
+  assert.match(commitSource, /renameSync\(stage, target\)/, "the commit must use a non-yielding metadata rename")
+  assert.doesNotMatch(commitSource, /await\s+fs\.rename\(stage,\s*target\)/, "async stage-to-target rename reopens an editor race")
+  const precondition = { exists: true, size: targetStat.size, mtime: Math.trunc(targetStat.mtimeMs), hash: await sha256Hex(original) }
+  // The old implementation awaits fs.promises.rename(stage,target) after the
+  // last synchronous editor check. Simulate opening a note while that async
+  // rename is being dispatched; its buffer could then be overwritten silently.
+  const fsPromises = (await import("node:module")).createRequire(path.join(process.cwd(), "package.json"))("node:fs/promises") as typeof import("node:fs/promises")
+  const actualRename = fsPromises.rename
+  let editorOpen = false
+  let lateOpens = 0
+  let asyncRenameCalls = 0
+  let editorChecks = 0
+  try {
+    fsPromises.rename = async (from, to) => {
+      asyncRenameCalls++
+      if (String(from) === f.stagePath && String(to) === f.targetPath) {
+        await new Promise<void>(resolve => setImmediate(resolve))
+        lateOpens++
+        editorOpen = true
+      }
+      return actualRename(from, to)
+    }
+    await f.platform.commitStage("stage.bin", "note.md", {
+      expectedTarget: precondition,
+      expectedStageSize: remote.length,
+      expectedStageSha256: await sha256Hex(remote),
+      assertNoOpenEditor: () => {
+        editorChecks++
+        if (editorOpen) throw new Error("Opened editor must not be overwritten")
+      },
+    })
+  } finally {
+    fsPromises.rename = actualRename
+  }
+  assert.ok(editorChecks >= 2)
+  assert.equal(asyncRenameCalls, 0, "rename pair must not yield to renderer between editor guard and replacement")
+  assert.equal(lateOpens, 0, "no window for an editor to open during async rename")
+  assert.deepEqual(new Uint8Array(await readFile(f.targetPath)), remote)
+  assert.equal(await exists(f.backupPath), false)
+}))
+
+test("D9 fail-first: crash rollback also must not yield between editor guard and rename", async () => {
+  const source = await readFile(path.join(process.cwd(), "src", "lib", "v4", "platform-io.ts"), "utf8")
+  const rollbackSource = source.split("    async rollbackStage(stagePath, targetPath, commitOptions) {")[1]
+    ?.split("    async finalizeStage(stagePath, targetPath, commitOptions) {")[0]
+  assert.ok(rollbackSource)
+  assert.match(rollbackSource, /renameSync\(target, residue\)/)
+  assert.match(rollbackSource, /renameSync\(backup, target\)/)
+  assert.doesNotMatch(rollbackSource, /await\s+fs\.rename\(/)
+})
+
 test("D8: editor opens during the awaited backup rename; original and stage remain intact", async () => fixture(async f => {
   await writeFile(f.targetPath, original)
   await writeFile(f.stagePath, remote)

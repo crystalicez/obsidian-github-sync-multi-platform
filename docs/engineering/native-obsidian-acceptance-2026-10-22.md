@@ -1,5 +1,12 @@
 # Native Obsidian D6 acceptance — 2026-10-22 (Windows)
 
+## Stage D9 — no renderer-yield between Desktop filesystem renames
+
+- **Baseline issue:** D8 guards were checked before `await fs.rename`, but the promise could yield before the OS rename and a user might open an editor during that interval.
+- **Mitigation:** Desktop uses `fs.renameSync` only for metadata renames in its critical stage replace and rollback; the editor guard runs before these calls. File hashing/reads and network I/O remain asynchronous. This removes the renderer event-loop gap during the rename pair, while external processes and abrupt OS kills remain outside that guarantee.
+- **Tests:** D9 contract tests for commit/rollback first failed with async rename and passed after the fix. Crash and Recovery regression suites green, and real Windows Obsidian 1.14.4 disposable plugin tests passed again: clean/dirty editor protection, new staged creation, closed note replacement with watcher create/modify and correct bytes/stage cleanup.
+- **Tradeoff:** A networked or unusually slow filesystem may block renderer briefly during synchronous metadata operations; quantify this with native timing before production release. No change to the approved policy 1 or pinned-credentials policy B.
+
 ## Stage D8 — approved fail-closed open-editor policy (follow-up, 2026-10-22)
 
 **User decision:** Choose policy **1**. Never automatically overwrite or trash a local note with pending editor changes. Because Obsidian may change a clean buffer during asynchronous filesystem verification, the runtime now conservatively pauses *all* staged write, normal write, trash, and staged rollback operations for any note currently open in an Obsidian workspace file leaf (even if its editor appears clean). Saving and closing the note before retry is required. The earlier Settings **policy B** (an active Sync continues with its original credentials) is unrelated and preserved.

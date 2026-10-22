@@ -87,6 +87,14 @@ async function desktopFs() {
   return import("node:fs/promises")
 }
 
+async function desktopFsSync(): Promise<typeof import("node:fs")> {
+  // Load outside the critical rename section. Only short directory-entry
+  // renames are synchronous: never hash/read/write large bytes on the renderer
+  // thread. The two renames must not yield after the last editor guard.
+  if (typeof exports === "object" && typeof require === "function") return require("node:fs") as typeof import("node:fs")
+  return import("node:fs")
+}
+
 async function desktopPath() {
   if (typeof exports === "object" && typeof require === "function") return require("node:path") as typeof import("node:path")
   return import("node:path")
@@ -294,6 +302,7 @@ export function createV4PlatformIo(options: V4PlatformIoOptions): V4PlatformIo {
       if (!desktopReady) return
       await assertRecoveryPaths(stagePath, targetPath)
       const fs = await desktopFs()
+      const fsSync = await desktopFsSync()
       const target = full(targetPath)
       const backup = full(stagePath) + ".target-backup"
       if (!(await statOrNull(backup))) {
@@ -319,14 +328,14 @@ export function createV4PlatformIo(options: V4PlatformIoOptions): V4PlatformIo {
         // Park rather than delete the replacement. A crash during restoration
         // leaves both the original backup and the candidate replacement intact.
         commitOptions.assertNoOpenEditor?.()
-        await fs.rename(target, residue)
+        fsSync.renameSync(target, residue)
       }
       try {
         commitOptions.assertNoOpenEditor?.()
-        await fs.rename(backup, target)
+        fsSync.renameSync(backup, target)
       } catch (error) {
         if (await statOrNull(residue) && !(await statOrNull(target))) {
-          try { await fs.rename(residue, target) } catch {}
+          try { fsSync.renameSync(residue, target) } catch {}
         }
         throw error
       }
@@ -360,6 +369,7 @@ export function createV4PlatformIo(options: V4PlatformIoOptions): V4PlatformIo {
       if (!desktopReady) throw new V4BoundedIoUnavailableError("stage-commit", targetPath)
       if (options.desktopRootPath) await assertRecoveryPaths(stagePath, targetPath)
       const fs = await desktopFs()
+      const fsSync = await desktopFsSync()
       const stage = full(stagePath)
       const target = full(targetPath)
       const backup = `${stage}.target-backup`
@@ -395,11 +405,11 @@ export function createV4PlatformIo(options: V4PlatformIoOptions): V4PlatformIo {
       try {
         if (options.desktopRootPath) await assertRecoveryPaths(stagePath, targetPath)
         commitOptions.assertNoOpenEditor?.()
-        if (targetBefore) { await fs.rename(target, backup); backedUp = true }
+        if (targetBefore) { fsSync.renameSync(target, backup); backedUp = true }
         // The first rename awaited disk IO, so recheck before the actual
         // replacement; if a user opened the note, restore its original backup.
         commitOptions.assertNoOpenEditor?.()
-        await fs.rename(stage, target); stageMoved = true
+        fsSync.renameSync(stage, target); stageMoved = true
         const after = await fs.stat(target)
         if (after.size !== commitOptions.expectedStageSize) throw new Error(`V4 committed target size mismatch: ${targetPath}`)
         const hash = createV4IncrementalSha256()
@@ -417,7 +427,7 @@ export function createV4PlatformIo(options: V4PlatformIoOptions): V4PlatformIo {
           if (!(await confirmBackup(backup, expected)) || await statOrNull(target)) {
             throw new V4ManualRecoveryRequiredError(targetPath, "backup cannot be proven safe after the staged rename failed")
           }
-          try { await fs.rename(backup, target) }
+          try { fsSync.renameSync(backup, target) }
           catch {
             throw new V4ManualRecoveryRequiredError(targetPath, "verified original backup could not be restored")
           }
