@@ -4,6 +4,15 @@
 >
 > **Mandatory workflow rule:** Every AI session that makes a material change to code, tests, design decisions, branch/PR state, verification status, or next steps MUST update this file before ending or handing work off. GitHub is the source of truth.
 
+## 2026-10-22 Stage D7 — immutable connection/encryption identity across an active Sync (audit only)
+
+- **Base:** `870112738ef7b076ba942486e878fceb986df6f5`, isolated audit worktree. No GitHub Actions, master writes, release, personal vault or credentialed GitHub mutations.
+- **Fail-first proof:** `tests/v4/settings-secrets.test.ts` injected a new GitHub client, owner/repository, branch, encryption mode, passphrase, ignore scope, and conflict policy while `manualSync` was suspended awaiting the first remote HEAD. The old runtime resumed against the wrong GitHub client / storage mode and failed. A second test mutates repo/client/encryption inside a losing Git ref publication immediately before a CAS retry.
+- **Fix:** `V4PluginRuntime.execute` captures the starting GitHub client, repo identity, storage mode, passphrase, device ID and credential generation once, and consistently passes these into config discovery, speculative bootstrap checks, index identity, key derivation, remote publication/reconciliation, and old-client abort cleanup. Sync no longer mixes new saved credentials/repository with its pre-existing WAL/publication transaction. No changes to stored data formats.
+- **Important backward policy:** Existing tested semantics deliberately permit conflict-policy/ignore-scope changes **between CAS retries**; to preserve this, each retry snapshots those policy fields once at attempt start. They do not change in the middle of a running attempt. Existing CAS tests previously failed under fully frozen policy; revised design preserves both safety and the existing semantics without suppressing tests.
+- **Tests:** Fail-first original mixed-config test FAIL, green after fix. Focused runtime/settings 37/37; full Fast, repeat Fast 10/10, Recovery, Resource 11/11, Feasibility, virtual bounded 100,000,000-byte soak, metadata/package and E2E-bundle compile, Production Build PASS. No real Obsidian acceptance or live GitHub mutation. An existing personal Obsidian vault was open on Windows; intentionally did not interact with or terminate it.
+- **Residual:** Strict atomic GitHub CAS and persistent cooldown (Stage E), actual two-instance Obsidian file watcher/editor-save/crash/restart qualification (D6), symlink TOCTOU and Mobile, coordinated C2 remote-format migration, and line-merge UX still pending. In-flight connection identity intentionally uses old credentials until that run ends; only the next run uses newly saved credentials.
+
 ## 2026-10-22 Stage D6 — Desktop small-file crash recovery through staged disk swap (audit branch only)
 
 - **Base:** `a6ca20321ff3344fcb74441652c998457ac7585c`, audit worktree `.tmp/staged-production-6c67c8a`. User explicitly asked to continue with poteto-mode. NO GitHub Actions, master push/merge, tag/release, personal vault or generated test files above 100,000,000 decimal bytes.

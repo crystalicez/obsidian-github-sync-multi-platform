@@ -168,7 +168,7 @@ export class V4PluginRuntime {
     this.keyringCache.invalidate()
   }
 
-  private async keyringForConfig(config: V4RemoteConfig, passphrase: string, signal?: AbortSignal): Promise<V4Keyring> {
+  private async keyringForConfig(config: V4RemoteConfig, passphrase: string, signal?: AbortSignal, generation = this.credentialGeneration): Promise<V4Keyring> {
     if (config.mode !== "encrypted" || !config.kdfParams) throw new Error("V4 encrypted keyring requires KDF parameters.")
     throwIfV4Aborted(signal)
     const keyring = await this.keyringCache.get({
@@ -176,7 +176,7 @@ export class V4PluginRuntime {
       salt: config.kdfParams.salt,
       iterations: config.kdfParams.iterations,
       mode: config.mode,
-      credentialGeneration: this.credentialGeneration,
+      credentialGeneration: generation,
     }, async () => {
       throwIfV4Aborted(signal)
       const derived = await deriveV4Keyring({
@@ -303,44 +303,44 @@ export class V4PluginRuntime {
     })
   }
 
-  private scopePredicate(): (path: string) => boolean {
+  private scopePredicate(settings: FastSync["settings"] = this.plugin.settings): (path: string) => boolean {
     return createV4ScopePredicate({
       configDir: this.plugin.app.vault.configDir || ".obsidian",
       pluginId: this.plugin.manifest.id,
-      ignorePathRegex: this.plugin.settings.ignorePathRegex,
-      syncObsidianConfig: this.plugin.settings.syncObsidianConfig,
-      syncBookmarks: this.plugin.settings.syncBookmarks,
-      syncPlugins: this.plugin.settings.syncPlugins,
+      ignorePathRegex: settings.ignorePathRegex,
+      syncObsidianConfig: settings.syncObsidianConfig,
+      syncBookmarks: settings.syncBookmarks,
+      syncPlugins: settings.syncPlugins,
     })
   }
 
-  private repoId(): string {
-    return `${this.plugin.settings.githubOwner}/${this.plugin.settings.githubRepo}#${this.plugin.settings.githubBranch || "main"}`
+  private repoId(settings: FastSync["settings"] = this.plugin.settings): string {
+    return `${settings.githubOwner}/${settings.githubRepo}#${settings.githubBranch || "main"}`
   }
 
-  private async loadConfiguredRemoteConfig(): Promise<{ remoteConfig: V4RemoteConfig; config: V4RemoteConfig } | null> {
-    if (!this.plugin.githubClient) throw new Error("GitHub connection is not configured.")
-    const ref = await this.plugin.githubClient.getGitRefOrNull()
-    const remote = ref ? await this.plugin.githubClient.getFileBytes(V4_CONFIG_PATH, ref.sha) : null
+  private async loadConfiguredRemoteConfig(github = this.plugin.githubClient, repoId = this.repoId()): Promise<{ remoteConfig: V4RemoteConfig; config: V4RemoteConfig } | null> {
+    if (!github) throw new Error("GitHub connection is not configured.")
+    const ref = await github.getGitRefOrNull()
+    const remote = ref ? await github.getFileBytes(V4_CONFIG_PATH, ref.sha) : null
     if (!remote) return null
     const remoteConfig = decodeV4RemoteConfig(remote.bytes)
-    const config = selectV4RuntimeConfig(remoteConfig, remoteConfig.mode, this.repoId())
+    const config = selectV4RuntimeConfig(remoteConfig, remoteConfig.mode, repoId)
     if (remoteConfig.repoId !== config.repoId) throw new Error("V4 remote repository identity mismatch.")
     return { remoteConfig, config }
   }
 
-  private async remoteOrNewConfig(): Promise<V4RuntimeConfigSelection> {
-    const loaded = await this.loadConfiguredRemoteConfig()
+  private async remoteOrNewConfig(github = this.plugin.githubClient, settings: FastSync["settings"] = this.plugin.settings, repoId = this.repoId(settings)): Promise<V4RuntimeConfigSelection> {
+    const loaded = await this.loadConfiguredRemoteConfig(github, repoId)
     if (loaded) return { config: loaded.config, source: "observed-remote" }
-    const mode = this.plugin.settings.encryptionMode
-    return { config: selectV4RuntimeConfig(null, mode, this.repoId()), source: "speculative-empty" }
+    const mode = settings.encryptionMode
+    return { config: selectV4RuntimeConfig(null, mode, repoId), source: "speculative-empty" }
   }
 
-  private async loadIndex(config: V4RemoteConfig): Promise<V4LocalIndex> {
+  private async loadIndex(config: V4RemoteConfig, deviceId = this.plugin.settings.vault): Promise<V4LocalIndex> {
     const loaded = await loadV4LocalIndex(this.adapter, V4_INDEX_ROOT)
     const pathLayout = config.pathLayout ?? expectedV4PathLayout(config.mode)
     if (loaded.repoId === config.repoId && loaded.mode === config.mode && loaded.pathLayout === pathLayout) return loaded
-    return createEmptyV4LocalIndex({ repoId: config.repoId, deviceId: this.plugin.settings.vault || "defaultVault", mode: config.mode, pathLayout: config.pathLayout })
+    return createEmptyV4LocalIndex({ repoId: config.repoId, deviceId: deviceId || "defaultVault", mode: config.mode, pathLayout: config.pathLayout })
   }
 
   private async saveIndex(index: V4LocalIndex, previousShardHashes: Record<string, string> = {}): Promise<void> {
@@ -442,6 +442,13 @@ export class V4PluginRuntime {
   }
 
   private async execute(request: V4SyncRequest, changes: V4QueuedChange[], signal: AbortSignal): Promise<{ changedFiles: number }> {
+    // A Settings save may replace the GitHub client while the run is suspended.
+    // Pin repository/client/encryption identity across retries and WAL recovery.
+    // Attempt-scoped conflict and ignore policies are captured separately below.
+    const settings = { ...this.plugin.settings }
+    const github = this.plugin.githubClient
+    const repoId = this.repoId(settings)
+    const runCredentialGeneration = this.credentialGeneration
     throwIfV4Aborted(signal)
     const continuingDebounceRun = this.debounceRunActive
     this.debounceRunActive = false
@@ -466,26 +473,30 @@ export class V4PluginRuntime {
     this.plugin.isSyncInProgress = true
     let bootstrapRecoveryKeyCache: { repoId: string; credentialGeneration: number; key: Uint8Array } | undefined
     const bootstrapRecoveryKeyFor = async (passphrase: string, repoId: string): Promise<Uint8Array> => {
-      if (bootstrapRecoveryKeyCache?.repoId === repoId && bootstrapRecoveryKeyCache.credentialGeneration === this.credentialGeneration) {
+      if (bootstrapRecoveryKeyCache?.repoId === repoId && bootstrapRecoveryKeyCache.credentialGeneration === runCredentialGeneration) {
         return bootstrapRecoveryKeyCache.key
       }
       bootstrapRecoveryKeyCache?.key.fill(0)
       const key = await deriveV4BootstrapRecoveryKey({ passphrase, repoId })
-      bootstrapRecoveryKeyCache = { repoId, credentialGeneration: this.credentialGeneration, key }
+      bootstrapRecoveryKeyCache = { repoId, credentialGeneration: runCredentialGeneration, key }
       return key
     }
-    syncConsoleLog(this.plugin.settings, "info", "V4 sync started", {
+    syncConsoleLog(settings, "info", "V4 sync started", {
       operation: request.operation,
       trigger: request.trigger,
     })
     try {
-      if (!this.plugin.githubClient) throw new Error("GitHub connection is not configured.")
-      ;(this.plugin.githubClient as unknown as { setV4AbortSignal?(signal?: AbortSignal): void }).setV4AbortSignal?.(signal)
+      if (!github) throw new Error("GitHub connection is not configured.")
+      ;(github as unknown as { setV4AbortSignal?(signal?: AbortSignal): void }).setV4AbortSignal?.(signal)
       throwIfV4Aborted(signal)
       let lastError: unknown
       let progressAttempt = 0
       const runState: V4SyncRunState = { runId: toBase64Url(randomBytes(12)), conflictCopies: new Map(), conflictCopyStages: new Map() }
       for (let casAttempt = 1; casAttempt <= 3; casAttempt++) {
+        // Conflict resolution and ignore scope may change after a losing CAS
+        // attempt; pin them for each attempt, never halfway through an attempt.
+        const attemptSettings = { ...this.plugin.settings }
+        const attemptScope = this.scopePredicate(attemptSettings)
         try {
           throwIfV4Aborted(signal)
           progressAttempt++
@@ -495,27 +506,27 @@ export class V4PluginRuntime {
             currentPath: undefined,
             currentDirection: undefined,
           })
-          const configSelection = await this.remoteOrNewConfig()
+          const configSelection = await this.remoteOrNewConfig(github, settings, repoId)
           const discovered = configSelection.config
-          const desiredMode = this.plugin.settings.encryptionMode
+          const desiredMode = settings.encryptionMode
           if (discovered.mode !== desiredMode && desiredMode === "encrypted") {
             throw new Error("Encrypted V4 requires a new empty repository or branch; plaintext history cannot be retained.")
           }
           if (discovered.mode !== desiredMode && request.operation !== "forcePush") {
             throw new Error("Remote storage mode differs. Force Push is required.")
           }
-          const config = selectV4RuntimeConfig(discovered, desiredMode, this.repoId())
+          const config = selectV4RuntimeConfig(discovered, desiredMode, repoId)
           this.progressStore.update({ phase: "loading-index", currentPath: undefined, currentDirection: undefined })
-          const index = await this.loadIndex(config)
+          const index = await this.loadIndex(config, settings.vault)
           const previousShardHashes = { ...index.shardHashes }
           if (configSelection.source === "speculative-empty") {
-            await assertV4SpeculativeConfigStillAbsent(this.plugin.githubClient, config.repoId)
+            await assertV4SpeculativeConfigStillAbsent(github, config.repoId)
           }
-          const passphrase = this.plugin.settings.encryptionPassphrase
+          const passphrase = settings.encryptionPassphrase
           const authenticationConfig = discovered.mode === "encrypted" ? discovered : config.mode === "encrypted" ? config : null
           if (authenticationConfig && !passphrase) throw new Error("Encryption passphrase is required.")
           const keyring = authenticationConfig
-            ? await this.keyringForConfig(authenticationConfig, passphrase, signal)
+            ? await this.keyringForConfig(authenticationConfig, passphrase, signal, runCredentialGeneration)
             : undefined
           const recoveryNamespace = (await sha256Hex(utf8ToBytes(config.repoId))).slice(0, 32)
           const recoveryRoot = `${V4_RECOVERY_ROOT}/${recoveryNamespace}`
@@ -557,13 +568,13 @@ export class V4PluginRuntime {
           }
           let reconciledRecovery = pendingRecovery
           if (pendingRecovery && pendingRecovery.header.phase !== "index-committed") {
-            const recoveryHead = (await this.plugin.githubClient.getGitRefOrNull())?.sha ?? null
+            const recoveryHead = (await github.getGitRefOrNull())?.sha ?? null
             const recovered = await recoverV4PendingState({
               store: recoveryStore,
               snapshot: pendingRecovery,
               io: this.sessionVault(() => true),
               currentRemoteHead: recoveryHead,
-              publicationGithub: this.plugin.githubClient,
+              publicationGithub: github,
               signal,
             })
             reconciledRecovery = recovered.snapshot
@@ -574,24 +585,23 @@ export class V4PluginRuntime {
               await discardV4RecoveryStages(recovered.snapshot, this.sessionVault(() => true), keepStageIds)
             }
           }
-          const inScope = this.scopePredicate()
           const includePath = (path: string): boolean => {
             for (const copy of runState.conflictCopies.values()) {
               if (copy.path === path) return copy.includeInSync
             }
-            return inScope(path)
+            return attemptScope(path)
           }
           const sessionGithub = configSelection.source === "speculative-empty"
-            ? guardV4SpeculativeConfigGithub(this.plugin.githubClient, config.repoId)
-            : this.plugin.githubClient
+            ? guardV4SpeculativeConfigGithub(github, config.repoId)
+            : github
           const result = await new V4SyncSession({
             github: sessionGithub,
             vault: this.sessionVault(includePath),
             index,
             config,
             keyring,
-            conflictPolicy: this.plugin.settings.conflictPolicy,
-            abortChangePercent: this.plugin.settings.abortChangePercent,
+            conflictPolicy: attemptSettings.conflictPolicy,
+            abortChangePercent: attemptSettings.abortChangePercent,
             askConflict: input => this.askConflict(input.path),
             includePath,
             runState,
@@ -620,7 +630,7 @@ export class V4PluginRuntime {
           if (recoveryRunId) await markV4RecoveryIndexCommitted(recoveryStore, recoveryRunId)
           if (result.changedFiles === 0 && request.trigger === "manual") new Notice("GitHub Sync: No changes")
           this.progressStore.finish(result.changedFiles === 0 ? "no-change" : "success", { lastSyncTime: Date.now() })
-          syncConsoleLog(this.plugin.settings, "info", "V4 sync completed", {
+          syncConsoleLog(settings, "info", "V4 sync completed", {
             operation: request.operation,
             trigger: request.trigger,
             changedFiles: result.changedFiles,
@@ -670,7 +680,7 @@ export class V4PluginRuntime {
       const message = (error as Error).message
       const snapshot = this.progressStore.snapshot
       const publicationRace = isV4PublicationRaceError(error) ? error : undefined
-      syncConsoleLog(this.plugin.settings, "warn", "V4 sync failed", {
+      syncConsoleLog(settings, "warn", "V4 sync failed", {
         operation: request.operation,
         trigger: request.trigger,
         attempt: snapshot.attempt,
@@ -694,7 +704,7 @@ export class V4PluginRuntime {
       return { changedFiles: 0 }
     } finally {
       bootstrapRecoveryKeyCache?.key.fill(0)
-      ;(this.plugin.githubClient as unknown as { setV4AbortSignal?(signal?: AbortSignal): void } | undefined)?.setV4AbortSignal?.(undefined)
+      ;(github as unknown as { setV4AbortSignal?(signal?: AbortSignal): void } | undefined)?.setV4AbortSignal?.(undefined)
       this.plugin.isSyncInProgress = false
       if (!this.disposed) {
         this.plugin.enableWatch()

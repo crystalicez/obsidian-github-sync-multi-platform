@@ -541,6 +541,77 @@ test("v4 incremental CAS retry drops an uncommitted out-of-scope copy when polic
   assert.equal(local.runtime.progressSnapshot.timings.find(item => item.phase === "checking-remote")?.occurrences, 2);
 });
 
+
+test("D7 fail-first: one active sync keeps its GitHub client and repository/mode/scope settings despite a save", async t => {
+  const fixture = plaintextRuntimeFixture()
+  t.after(() => fixture.runtime.dispose())
+  await fixture.runtime.forcePush()
+  assert.equal(fixture.runtime.progressSnapshot.lifecycle, "success")
+  fixture.contents.set("secret.md", new TextEncoder().encode("changed"))
+  fixture.vaultFile.stat = { size: 7, mtime: 3 }
+
+  const originalAbortSignals: Array<AbortSignal | undefined> = []
+  Object.assign(fixture.github, { setV4AbortSignal(signal?: AbortSignal) { originalAbortSignals.push(signal) } })
+  const readBaseline = fixture.github.refReads
+  const gate = deferred<void>()
+  fixture.github.refReadBarrier = gate.promise
+  const active = fixture.runtime.manualSync()
+  await waitForCondition(() => fixture.github.refReads > readBaseline, "sync blocked on initial remote HEAD")
+
+  const substitute = new RuntimeMemoryGitHub()
+  const substituteAbortSignals: Array<AbortSignal | undefined> = []
+  Object.assign(substitute, { setV4AbortSignal(signal?: AbortSignal) { substituteAbortSignals.push(signal) } })
+  fixture.plugin.githubClient = substitute
+  fixture.plugin.settings.githubOwner = "other"
+  fixture.plugin.settings.githubRepo = "vault"
+  fixture.plugin.settings.githubBranch = "experimental"
+  fixture.plugin.settings.encryptionMode = "encrypted"
+  fixture.plugin.settings.encryptionPassphrase = "changed-secret"
+  fixture.plugin.settings.ignorePathRegex = "^secret\\.md$"
+  fixture.plugin.settings.conflictPolicy = "remote" as never
+  fixture.runtime.credentialsChanged() // Mimics the Settings save hook.
+  gate.resolve()
+  await active
+
+  assert.equal(fixture.runtime.progressSnapshot.lifecycle, "success", fixture.runtime.progressSnapshot.errorMessage)
+  assert.equal(substitute.refReads, 0, "a different GitHub client must never join the in-flight transaction")
+  assert.equal(originalAbortSignals.length, 2, "the pinned GitHub client must receive and clear its own abort signal")
+  assert.ok(originalAbortSignals[0] instanceof AbortSignal)
+  assert.equal(originalAbortSignals[1], undefined)
+  assert.equal(substituteAbortSignals.length, 0, "never clear or mutate a new client that did not join this run")
+  assert.equal(substitute.commits.size, 0)
+  assert.ok(fixture.github.commits.size >= 2, "active sync must publish its change through the starting repository")
+  assert.equal(fixture.github.ref?.sha, [...fixture.github.commits.keys()].at(-1))
+})
+
+
+test("D7: CAS retry keeps the starting connection and encryption identity after Settings change", async t => {
+  const fixture = plaintextRuntimeFixture()
+  t.after(() => fixture.runtime.dispose())
+  await fixture.runtime.forcePush()
+  fixture.contents.set("secret.md", new TextEncoder().encode("changed"))
+  fixture.vaultFile.stat = { size: 7, mtime: 4 }
+
+  const substitute = new RuntimeMemoryGitHub()
+  fixture.github.updateFailuresRemaining = 1
+  fixture.github.onUpdateFailure = () => {
+    fixture.plugin.githubClient = substitute
+    fixture.plugin.settings.githubOwner = "other"
+    fixture.plugin.settings.githubRepo = "repo"
+    fixture.plugin.settings.githubBranch = "new-branch"
+    fixture.plugin.settings.encryptionMode = "encrypted"
+    fixture.plugin.settings.encryptionPassphrase = "new-passphrase"
+    fixture.runtime.credentialsChanged()
+  }
+
+  await fixture.runtime.manualSync()
+  assert.equal(substitute.refReads, 0)
+  assert.equal(substitute.commits.size, 0)
+  assert.notEqual(fixture.runtime.progressSnapshot.lifecycle, "failed", fixture.runtime.progressSnapshot.errorMessage)
+  assert.equal(fixture.runtime.progressSnapshot.attempt, 2)
+  assert.equal(new TextDecoder().decode(fixture.github.files.get("secret.md")), "changed")
+})
+
 test("v4 runtime retains terminal timings until the next run begins", async () => {
   const fixture = plaintextRuntimeFixture();
   await fixture.runtime.forcePush();
