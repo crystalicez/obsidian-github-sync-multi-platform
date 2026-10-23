@@ -67,12 +67,19 @@ export function estimateV4StagingSpace(input: { stageBytes: number; existingTarg
     if (!Number.isSafeInteger(value) || value < 0) throw new TypeError(`${label} must be a non-negative safe integer.`)
   }
   const backupBytes = input.atomicReplace ? 0 : input.existingTargetBytes
+  const additionalFreeBytesRequired = input.stageBytes + backupBytes
+  const peakFootprintBytes = input.existingTargetBytes + additionalFreeBytesRequired
+  // Never round space reservations past IEEE-754's exact integer range.
+  // Overflow must fail before consulting or mutating storage.
+  if (!Number.isSafeInteger(additionalFreeBytesRequired) || !Number.isSafeInteger(peakFootprintBytes)) {
+    throw new RangeError("V4 staging space estimate exceeds the safe integer range.")
+  }
   return {
     existingTargetBytes: input.existingTargetBytes,
     stageBytes: input.stageBytes,
     backupBytes,
-    peakFootprintBytes: input.existingTargetBytes + input.stageBytes + backupBytes,
-    additionalFreeBytesRequired: input.stageBytes + backupBytes,
+    peakFootprintBytes,
+    additionalFreeBytesRequired,
   }
 }
 
@@ -101,6 +108,9 @@ export function createV4StagingStore(options: {
   }
 
   const beginStage = async (stageOptions: { expectedSize: number; mtime: number; existingTargetBytes: number; atomicReplace: boolean; signal?: AbortSignal }): Promise<V4StagedSink> => {
+    for (const [label, value] of Object.entries({ expectedSize: stageOptions.expectedSize, existingTargetBytes: stageOptions.existingTargetBytes })) {
+      if (!Number.isSafeInteger(value) || value < 0) throw new TypeError(`${label} must be a non-negative safe integer.`)
+    }
     const stageId = randomId()
     const path = pathFor(stageId)
     const large = stageOptions.expectedSize > ceiling
@@ -112,7 +122,9 @@ export function createV4StagingStore(options: {
         atomicReplace: stageOptions.atomicReplace,
       })
       const available = await options.backend.freeBytes(path)
-      if (available === undefined) throw new V4UnknownStagingSpaceError(estimate.additionalFreeBytesRequired)
+      if (available === undefined || !Number.isSafeInteger(available) || available < 0) {
+        throw new V4UnknownStagingSpaceError(estimate.additionalFreeBytesRequired)
+      }
       if (available < estimate.additionalFreeBytesRequired) throw new V4InsufficientStagingSpaceError(estimate.additionalFreeBytesRequired, available)
     }
 

@@ -228,6 +228,77 @@ test("staging uses opaque ids under the plugin-private excluded root and hashes 
   assert.deepEqual(await collectV4ContentSource(await store.open(ref), 64), data);
 });
 
+test("staging space estimate rejects overflow instead of using rounded IEEE-754 sizes", () => {
+  assert.throws(
+    () => estimateV4StagingSpace({ stageBytes: Number.MAX_SAFE_INTEGER, existingTargetBytes: 1, atomicReplace: true }),
+    /safe integer|overflow|range/i,
+  );
+  assert.throws(
+    () => estimateV4StagingSpace({ stageBytes: Number.MAX_SAFE_INTEGER - 1, existingTargetBytes: 2, atomicReplace: false }),
+    /safe integer|overflow|range/i,
+  );
+  const exact = estimateV4StagingSpace({ stageBytes: Number.MAX_SAFE_INTEGER - 2, existingTargetBytes: 1, atomicReplace: false });
+  assert.equal(exact.peakFootprintBytes, Number.MAX_SAFE_INTEGER);
+  assert.equal(exact.additionalFreeBytesRequired, Number.MAX_SAFE_INTEGER - 1);
+});
+
+test("beginStage refuses invalid declared sizes before staging or querying storage", async () => {
+  let freeSpaceCalls = 0;
+  let writes = 0;
+  const store = createV4StagingStore({
+    root: "private/stage",
+    wholeBufferCeilingBytes: 8,
+    randomId: () => "size-checked",
+    backend: {
+      boundedAppend: true,
+      async write() { writes++; },
+      async append() { writes++; },
+      async remove() {},
+      async openSource() { throw new Error("not used"); },
+      async freeBytes() { freeSpaceCalls++; return 1_000_000; },
+    },
+  });
+  for (const value of [NaN, Infinity, -Infinity, -1, 0.5, Number.MAX_SAFE_INTEGER + 1]) {
+    await assert.rejects(
+      store.beginStage({ expectedSize: value, existingTargetBytes: 0, atomicReplace: true, mtime: 1 }),
+      /safe integer|non-negative|expectedSize/i,
+    );
+    await assert.rejects(
+      store.beginStage({ expectedSize: 0, existingTargetBytes: value, atomicReplace: true, mtime: 1 }),
+      /safe integer|non-negative|existingTargetBytes/i,
+    );
+  }
+  assert.equal(freeSpaceCalls, 0);
+  assert.equal(writes, 0);
+});
+
+test("large staging treats invalid free-byte metrics as unknown and does not create partial data", async () => {
+  let reportedSpace: number | undefined;
+  let writes = 0;
+  const store = createV4StagingStore({
+    root: "private/stage",
+    wholeBufferCeilingBytes: 8,
+    randomId: () => "invalid-space",
+    backend: {
+      boundedAppend: true,
+      async write() { writes++; },
+      async append() { writes++; },
+      async remove() {},
+      async openSource() { throw new Error("not used"); },
+      async freeBytes() { return reportedSpace; },
+    },
+  });
+  for (const value of [undefined, NaN, Infinity, -Infinity, -1, 8.5, Number.MAX_SAFE_INTEGER + 1]) {
+    reportedSpace = value;
+    await assert.rejects(
+      store.beginStage({ expectedSize: 9, existingTargetBytes: 3, atomicReplace: false, mtime: 1 }),
+      error => error instanceof V4UnknownStagingSpaceError,
+      `Invalid free-space metric ${String(value)} must never allow a write`,
+    );
+  }
+  assert.equal(writes, 0);
+});
+
 test("large staging requires known free space and accounts for non-atomic backup overhead", async () => {
   assert.deepEqual(estimateV4StagingSpace({ stageBytes: 100, existingTargetBytes: 40, atomicReplace: false }), {
     existingTargetBytes: 40,
