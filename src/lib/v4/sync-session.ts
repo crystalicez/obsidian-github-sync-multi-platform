@@ -237,6 +237,7 @@ export class V4SyncSession {
   private readonly localIo: V4LocalIo
   private readonly resources: V4ResourceController
   private readonly localReadCache: V4ByteCache
+  private readonly packObjectReadsInFlight = new Map<string, Promise<Uint8Array>>()
   private readonly ephemeralStages = new Map<string, Uint8Array>()
   private ephemeralStageSequence = 0
 
@@ -1270,11 +1271,7 @@ export class V4SyncSession {
     try {
       const result = await this.codec.readToSink({
         record,
-        reader: async path => {
-          const file = await this.input.github.getFileBytes(path, binding.remoteCommitSha)
-          if (!file) throw new Error(`Missing V4 remote object: ${path}`)
-          return file.bytes
-        },
+        reader: path => this.readRemoteRecordObject(path, record, binding.remoteCommitSha),
         sink,
         signal: this.input.signal,
       })
@@ -1535,12 +1532,45 @@ export class V4SyncSession {
     }, this.input.signal)
   }
 
-  private async readRecord(record: V4IndexFileRecord, remoteCommitSha?: string): Promise<Uint8Array> {
-    return this.codec.read(record, async path => {
+  private async readRemoteRecordObject(
+    path: string,
+    record: V4IndexFileRecord,
+    remoteCommitSha?: string,
+  ): Promise<Uint8Array> {
+    // A pack is one immutable encrypted Git blob shared by many logical files.
+    // Keep it in the EXISTING per-session byte budget, never across Sync runs,
+    // and never for a mutable branch ref. Each member is still AES-GCM and
+    // plaintext-SHA256 verified by the codec before it reaches the local vault.
+    const cacheKey = record.storage === "pack"
+      && record.remotePath === path
+      && record.packId
+      && /^[0-9a-f]{40}$/iu.test(remoteCommitSha ?? "")
+      ? `\u0000v4-pack:${remoteCommitSha}:${record.packId}:${path}`
+      : undefined
+    if (cacheKey) {
+      const cached = this.localReadCache.get(cacheKey)
+      if (cached) return cached
+      const inFlight = this.packObjectReadsInFlight.get(cacheKey)
+      if (inFlight) return inFlight
+    }
+    const fetchObject = async () => {
       const file = await this.input.github.getFileBytes(path, remoteCommitSha)
       if (!file) throw new Error(`Missing V4 remote object: ${path}`)
+      if (cacheKey) this.localReadCache.set(cacheKey, file.bytes)
       return file.bytes
-    }, this.input.signal)
+    }
+    if (!cacheKey) return fetchObject()
+    const inFlight = fetchObject()
+    this.packObjectReadsInFlight.set(cacheKey, inFlight)
+    try {
+      return await inFlight
+    } finally {
+      this.packObjectReadsInFlight.delete(cacheKey)
+    }
+  }
+
+  private async readRecord(record: V4IndexFileRecord, remoteCommitSha?: string): Promise<Uint8Array> {
+    return this.codec.read(record, path => this.readRemoteRecordObject(path, record, remoteCommitSha), this.input.signal)
   }
 
   private changeBetween(before?: V4LogicalFile, after?: V4LogicalFile): V4PlannedChange | null {

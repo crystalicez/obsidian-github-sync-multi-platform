@@ -1469,7 +1469,13 @@ test("v4 encrypted pack round trips through force pull and version-history previ
   assert.equal(Math.max(...events.map(event => event.push?.completed ?? 0)), 64);
   assert.equal(new Set(events.filter(event => event.phase === "uploading").map(event => event.currentPath).filter(Boolean)).size, 64);
 
-  const commitSha = github.ref!.sha;
+  // Real Git commits use forty hexadecimal characters. Pin a valid immutable
+  // test ref so this regression exercises the production cache gate.
+  const syntheticSha = github.ref!.sha;
+  const commitSha = "a".repeat(40);
+  github.commits.set(commitSha, github.commits.get(syntheticSha)!);
+  github.commits.delete(syntheticSha);
+  github.ref!.sha = commitSha;
   const published = github.commits.get(commitSha)!;
   const journalId = /^obsidian-sync-v4:(.+)$/u.exec(published.message)![1];
   const blobPaths = new Map<string, string>();
@@ -1510,10 +1516,32 @@ test("v4 encrypted pack round trips through force pull and version-history previ
   assert.equal(preview.kind, "text");
   assert.equal(preview.text, "secret-42");
 
+  const actualGetFileBytes = github.getFileBytes.bind(github);
+  let packDownloads = 0;
+  github.getFileBytes = async (path, ref) => {
+    if (path === packPaths[0]) packDownloads++;
+    return actualGetFileBytes(path, ref);
+  };
   const target = new MemoryVault();
   const targetIndex = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "b", mode: "encrypted" });
   await new V4SyncSession({ github, vault: target, index: targetIndex, config: encryptedConfig, keyring: keys, conflictPolicy: "copy", abortChangePercent: 0 }).sync({ operation: "forcePull", allowThresholdOverride: false });
   assert.equal(dec(target.files.get("Folder/private-42.md")!.bytes), "secret-42");
+  assert.equal(packDownloads, 1, "shared encrypted pack must be downloaded once per immutable commit per Sync session");
+  assert.equal(target.files.size, 64);
+  // No cached ciphertext may survive into the next session.
+  const secondTarget = new MemoryVault();
+  const secondIndex = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "c", mode: "encrypted" });
+  await new V4SyncSession({ github, vault: secondTarget, index: secondIndex, config: encryptedConfig, keyring: keys, conflictPolicy: "copy", abortChangePercent: 0 }).sync({ operation: "forcePull", allowThresholdOverride: false });
+  assert.equal(packDownloads, 2);
+  assert.equal(dec(secondTarget.files.get("Folder/private-42.md")!.bytes), "secret-42");
+  // A pack larger than the cache budget must not be retained, but all
+  // authenticated per-file downloads still succeed without cache.
+  const boundedTarget = new MemoryVault();
+  const boundedIndex = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "d", mode: "encrypted" });
+  await new V4SyncSession({ github, vault: boundedTarget, index: boundedIndex, config: encryptedConfig, keyring: keys, conflictPolicy: "copy", abortChangePercent: 0, resourceLimits: { maxCacheBytes: 1 } }).sync({ operation: "forcePull", allowThresholdOverride: false });
+  assert.equal(packDownloads, 66, "over-budget pack must be re-read instead of exceeding the cache limit");
+  assert.equal(boundedTarget.files.size, 64);
+  assert.equal(dec(boundedTarget.files.get("Folder/private-42.md")!.bytes), "secret-42");
 });
 
 test("v4 encrypted chunked rename reuses identity and parts without uploading content", async () => {
