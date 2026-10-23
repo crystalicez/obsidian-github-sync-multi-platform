@@ -7,6 +7,7 @@ import {
   publishV4TreeChanges,
   resolveV4PublicationBase,
   uploadV4TreeFiles,
+  uploadV4ObjectStream,
 } from "../../src/lib/v4/git-tree-writer";
 import type { GitHubCreateTreeEntry } from "../../src/lib/github-git-types";
 
@@ -59,6 +60,33 @@ test("V4 tree upload rejects duplicate object paths before writing any blobs", a
   );
   assert.deepEqual(github.blobs, []);
   assert.deepEqual(github.trees, []);
+  assert.deepEqual(github.createdRefs, []);
+  assert.deepEqual(github.updatedRefs, []);
+});
+
+test("V4 streamed object upload rejects duplicate paths without leaking held bytes", async () => {
+  const github = new MemoryV4GitHub();
+  const released: string[] = [];
+  const progress: string[] = [];
+  async function* objects() {
+    yield { path: "shared.enc", bytes: bytes("first"), release: () => released.push("first") };
+    yield { path: "shared.enc", bytes: bytes("second"), release: () => released.push("second") };
+  }
+  await assert.rejects(
+    () => uploadV4ObjectStream(github, {
+      objects: objects(),
+      progressItem: { fileId: "same-file", path: "Notes/note.md" },
+      onLogicalFileUploadStarted: () => { progress.push("started"); },
+      onLogicalFileUploaded: () => { progress.push("uploaded"); },
+    }),
+    /duplicate.*path/iu,
+  );
+  assert.equal(github.blobs.length, 1, "duplicate must be rejected before uploading its blob");
+  assert.deepEqual(github.events, ["blob:first"]);
+  assert.deepEqual(released, ["first", "second"]);
+  assert.deepEqual(progress, ["started"]);
+  assert.deepEqual(github.trees, []);
+  assert.deepEqual(github.commits, []);
   assert.deepEqual(github.createdRefs, []);
   assert.deepEqual(github.updatedRefs, []);
 });

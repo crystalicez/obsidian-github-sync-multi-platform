@@ -4,6 +4,14 @@
 >
 > **Mandatory workflow rule:** Every AI session that makes a material change to code, tests, design decisions, branch/PR state, verification status, or next steps MUST update this file before ending or handing work off. GitHub is the source of truth.
 
+## 2026-10-23 Stage D31 — streamed Git object path uniqueness (Node.js)
+
+- **Source and isolation:** Based on verified pushed D30 `877164d5273a58a0873fadb3bb722fa8d1febd10` in separate `.worktrees/d31-stream-duplicate-object-paths`, audit branch `audit/2026-10-23-d31-stream-duplicate-object-paths`. Main Zed checkout, independent D29 remote-head worktree, D25 Obsidian GUI/telemetry worktrees, original vault and secrets unchanged.
+- **RED:** `uploadV4ObjectStream` processed a second object with the same remote path, uploaded its bytes again and silently replaced the first `fileShas[path]`. Focused fail-first test reproduced no rejection (**15 passed, 1 failed**) with two different stream buffers and identical path.
+- **Fix:** Track streamed object paths, throw before second duplicate `createGitBlob`, inside the existing `try/finally` so `release()` is called for both yielded objects. Successful normal streams and legitimate one-blob/multiple-logical-file packs retain existing semantics. Regression additionally proves only first blob was sent, both releases occurred, logical upload success callback did not fire and no tree/commit/ref was published.
+- **GREEN:** Focused **16/16**; Build PASS; Fast **516/516**, Repeat **10×516/516**; Recovery **79/79**; Resource **11/11**; Feasibility **132/132**; virtual bounded **100,000,000 bytes** Soak **1/1**; GitHub E2E compile-only (3 bundles), metadata and package validation PASS. These are **local checks**, not real GitHub E2E, actual Obsidian UI or platform acceptance.
+- **Remaining risk:** Candidate tree entry collisions between explicit writes and deletions still require workflow/policy examination; this stage does not change deletion/conflict ordering. D25 latest two-instance GUI, C2 cross-device format, mobile/macOS/Linux and independent security audit remain release gates. Node.js+Obsidian API remain primary; native filesystem/Issue #9 remains deferred. No GitHub Actions, master/release, live GitHub, personal vault or test files beyond 100 MB.
+
 ## 2026-10-23 Stage D30 — reject duplicate Git tree object paths before blob upload (Node.js)
 
 - **Isolated branch/source:** Started at verified D28 SHA `4121151ec676594a93ce61e7b0b4c53e62a13104` in `.worktrees/d30-git-duplicate-paths`, branch `audit/2026-10-23-d30-git-tree-duplicate-paths`. Concurrent D29 remote-head validation and D25 GUI/telemetry worktrees were not modified. User's Zed root, personal vault, test credentials and other worktrees untouched.

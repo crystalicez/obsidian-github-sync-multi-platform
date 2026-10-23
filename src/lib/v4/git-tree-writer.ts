@@ -202,6 +202,7 @@ export async function uploadV4ObjectStream(
 ): Promise<V4UploadedTreeFiles> {
   const entries: GitHubCreateTreeEntry[] = [];
   const fileShas: Record<string, string> = {};
+  const seenPaths = new Set<string>();
   let started = false;
   for await (const object of input.objects) {
     if (!started && input.progressItem) {
@@ -209,6 +210,8 @@ export async function uploadV4ObjectStream(
       invokeProgressCallback(() => input.onLogicalFileUploadStarted?.(input.progressItem!));
     }
     try {
+      if (seenPaths.has(object.path)) throw new Error(`Duplicate V4 streamed Git object path: ${object.path}`);
+      seenPaths.add(object.path);
       const createBlob = () => github.createGitBlob(object.bytes);
       const sha = input.withBlobTransport
         ? await input.withBlobTransport(object.bytes, createBlob)
