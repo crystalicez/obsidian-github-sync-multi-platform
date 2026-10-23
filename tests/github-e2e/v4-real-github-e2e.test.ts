@@ -624,8 +624,16 @@ async function runRenameVsEditScenario(config: GitHubConfig, mode: V4StorageMode
       changes: [{ type: "modify", path: "Notes/rename-me.md", mtime: 3 }],
     });
 
+    // GraphQL CAS may succeed before REST refs expose the newly published head.
+    // A fresh reader must see b's exact SHA before we can call absent bytes data
+    // loss. Waiting is test synchronization, not a runtime retry workaround.
+    const expectedCommitSha = b.index.remoteCommitSha;
+    assert.ok(expectedCommitSha, "stale rename/edit device did not record the final remote commit");
+    await waitForBranchHead(config, expectedCommitSha);
+
     const c = device("device-c");
     await c.session.sync({ operation: "forcePull", allowThresholdOverride: false });
+    assert.equal(c.index.remoteCommitSha, expectedCommitSha, "fresh reader did not load the published SHA");
     assertVaultContainsBytes(c.vault, base, "rename lineage bytes were lost");
     assertVaultContainsBytes(c.vault, staleEdit, "stale edited lineage bytes were lost");
     for (const record of liveRecords(c)) {
@@ -635,7 +643,7 @@ async function runRenameVsEditScenario(config: GitHubConfig, mode: V4StorageMode
 }
 
 async function runDeleteRecreateScenario(config: GitHubConfig, mode: V4StorageMode): Promise<void> {
-  await runScenario(config, mode, "two-device-delete-recreate-identity-break", async ({ device }) => {
+  await runScenario(config, mode, "two-device-delete-recreate-identity-break", async ({ context, device }) => {
     const a = device("device-a");
     a.vault.set("Notes/reborn.md", bytes("generation-one\n"), 1);
     await a.session.sync({ operation: "forcePush", allowThresholdOverride: false });
@@ -659,6 +667,29 @@ async function runDeleteRecreateScenario(config: GitHubConfig, mode: V4StorageMo
     });
     const newRecord = recordFor(a, "Notes/reborn.md");
     assert.notEqual(newRecord.fileId, oldFileId, "delete/recreate reused the old file identity");
+    // GraphQL CAS may be visible before the REST branch ref read catches up.
+    // Verify the exact new published commit and its immutable object before
+    // asking another device to sync; keep a publication defect distinguishable
+    // from a peer reading a stale ref.
+    const publishedSha = a.index.remoteCommitSha!;
+    await waitForBranchHead(config, publishedSha);
+    const publishedCommit = await a.client.getGitCommit(publishedSha);
+    const publishedTree = await a.client.getTreeAt(publishedCommit.treeSha, true);
+    assert.equal(publishedTree.truncated, false, "delete/recreate commit tree is truncated");
+    assert.ok(publishedTree.tree.some(entry => entry.path === newRecord.remotePath && entry.type === "blob"),
+      `delete/recreate published head ${publishedSha} is missing object ${newRecord.remotePath}`);
+    const codec = new V4StorageCodec({
+      mode,
+      pathLayout: expectedV4PathLayout(mode),
+      keyring: context.keyring,
+    });
+    const publishedPlaintext = await codec.read(newRecord, async objectPath => {
+      const object = await a.client.getFileBytes(objectPath, publishedSha);
+      assert.ok(object, `delete/recreate missing immutable object ${objectPath}`);
+      return object.bytes;
+    });
+    assert.deepEqual(publishedPlaintext, bytes("generation-two\n"),
+      "delete/recreate decoded published object disagrees with local new generation");
 
     await b.session.sync({ operation: "normal", allowThresholdOverride: false });
     assert.deepEqual(b.vault.files.get("Notes/reborn.md")?.bytes, bytes("generation-two\n"));
@@ -750,6 +781,17 @@ after(async () => {
 });
 
 test("V4 real GitHub strict CAS survives realistic superuser and two-device scenarios", { timeout: 900_000 }, async () => {
+  if (process.env.GITHUB_E2E_ONLY_SCENARIO === "delete-recreate-plaintext"
+    || process.env.GITHUB_E2E_ONLY_SCENARIO === "delete-recreate-encrypted") {
+    await runDeleteRecreateScenario(config, process.env.GITHUB_E2E_ONLY_SCENARIO === "delete-recreate-encrypted" ? "encrypted" : "plaintext");
+    return;
+  }
+  if (process.env.GITHUB_E2E_ONLY_SCENARIO === "rename-vs-stale-edit-plaintext"
+    || process.env.GITHUB_E2E_ONLY_SCENARIO === "rename-vs-stale-edit-encrypted") {
+    await runRenameVsEditScenario(config, process.env.GITHUB_E2E_ONLY_SCENARIO === "rename-vs-stale-edit-encrypted" ? "encrypted" : "plaintext");
+    return;
+  }
+  if (process.env.GITHUB_E2E_ONLY_SCENARIO) throw new Error("Unknown manual GitHub E2E scenario filter.");
   for (const mode of ["plaintext", "encrypted"] as const) {
     await runBaselineScenario(config, mode);
     await runStaleCatchupScenario(config, mode);

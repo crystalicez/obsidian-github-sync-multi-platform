@@ -385,6 +385,31 @@ test("v4 plaintext unknown-base sync pulls remote state before publishing a dist
   assert.equal(dec(verifierVault.files.get("local-only.md")!.bytes), "local-only");
 });
 
+test("v4 separate delete then same-path recreate publishes a readable object to stale peer", async () => {
+  const github = new MemoryGitHub();
+  const aVault = new MemoryVault();
+  const aIndex = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "device-a", mode: "plaintext" });
+  const bVault = new MemoryVault();
+  const bIndex = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "device-b", mode: "plaintext" });
+  const a = new V4SyncSession({ github, vault: aVault, index: aIndex, config: config(), conflictPolicy: "copy", abortChangePercent: 0 });
+  const b = new V4SyncSession({ github, vault: bVault, index: bIndex, config: config(), conflictPolicy: "copy", abortChangePercent: 0 });
+  aVault.files.set("Notes/reborn.md", { bytes: enc("generation-one\n"), mtime: 1 });
+  await a.sync({ operation: "forcePush", allowThresholdOverride: false });
+  await b.sync({ operation: "forcePull", allowThresholdOverride: false });
+  const previousId = indexRecordByPath(aIndex, "Notes/reborn.md").fileId;
+  aVault.files.delete("Notes/reborn.md");
+  await a.sync({ operation: "normal", allowThresholdOverride: false, changes: [{ type: "delete", path: "Notes/reborn.md", mtime: 2 }] });
+  assert.equal(github.files.has("Notes/reborn.md"), false);
+  aVault.files.set("Notes/reborn.md", { bytes: enc("generation-two\n"), mtime: 3 });
+  await a.sync({ operation: "normal", allowThresholdOverride: false, changes: [{ type: "modify", path: "Notes/reborn.md", mtime: 3 }] });
+  const record = indexRecordByPath(aIndex, "Notes/reborn.md");
+  assert.notEqual(record.fileId, previousId);
+  assert.deepEqual(github.files.get("Notes/reborn.md"), enc("generation-two\n"), "latest git tree must actually contain recreated content");
+  await b.sync({ operation: "normal", allowThresholdOverride: false });
+  assert.deepEqual(bVault.files.get("Notes/reborn.md")?.bytes, enc("generation-two\n"));
+  assert.equal(indexRecordByPath(bIndex, "Notes/reborn.md").fileId, record.fileId);
+});
+
 for (const mode of ["plaintext", "encrypted"] as const) {
   test(`v4 ${mode} unknown-base queued delete removes the remote identity, object, and journal entry`, async () => {
     const fixture = await queuedUnknownBaseFixture(mode, [["note.md", "delete-me"]], []);
