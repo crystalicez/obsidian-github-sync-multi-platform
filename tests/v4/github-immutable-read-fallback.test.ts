@@ -121,6 +121,32 @@ test("exact Unicode/punctuation paths, executable blobs, and positive truncated 
   }, async client => assert.deepEqual((await client.getFileBytes("found.md", COMMIT_SHA))?.bytes, positive));
 });
 
+test("immutable commit identity mismatch cannot impersonate complete file absence", async () => {
+  await runScenario("Notes/reborn.md", COMMIT_SHA, {
+    commit: { status: 200, json: { sha: OTHER_TREE_SHA, tree: { sha: ROOT_TREE_SHA }, parents: [] } },
+    trees: { [ROOT_TREE_SHA]: { json: treePayload(ROOT_TREE_SHA, false, []) } },
+  }, async client => {
+    await assert.rejects(() => client.getFileBytes("Notes/reborn.md", COMMIT_SHA), /immutable.*commit.*(mismatch|identity)/iu);
+  });
+});
+
+test("immutable commit response without its requested identity cannot prove remote file absence", async () => {
+  await runScenario("Notes/reborn.md", COMMIT_SHA, {
+    commit: { status: 200, json: { tree: { sha: ROOT_TREE_SHA }, parents: [] } },
+    trees: { [ROOT_TREE_SHA]: { json: treePayload(ROOT_TREE_SHA, false, []) } },
+  }, async client => {
+    await assert.rejects(() => client.getFileBytes("Notes/reborn.md", COMMIT_SHA), /immutable.*commit.*identity.*mismatch/iu);
+  });
+});
+
+test("immutable tree identity mismatch cannot prove remote blob absence", async () => {
+  await runScenario("Notes/reborn.md", COMMIT_SHA, {
+    trees: { [ROOT_TREE_SHA]: { json: treePayload(OTHER_TREE_SHA, false, []) } },
+  }, async client => {
+    await assert.rejects(() => client.getFileBytes("Notes/reborn.md", COMMIT_SHA), /immutable.*tree.*(mismatch|identity)/iu);
+  });
+});
+
 test("complete evidence returns null for structural regular-file absence", async () => {
   await runScenario("missing.md", COMMIT_SHA, { trees: { [ROOT_TREE_SHA]: { json: treePayload(ROOT_TREE_SHA, false, []) } } }, async client => {
     assert.equal(await client.getFileBytes("missing.md", COMMIT_SHA), null);

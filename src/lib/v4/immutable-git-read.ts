@@ -10,7 +10,7 @@ interface ImmutableGitNode {
 }
 
 export interface ImmutableGitReadAdapter {
-  getCommit(sha: string): Promise<{ treeSha: string }>;
+  getCommit(sha: string): Promise<{ treeSha: string; sha?: string }>;
   getTree(treeSha: string): Promise<unknown>;
   getBlob(blobSha: string): Promise<Uint8Array>;
 }
@@ -53,9 +53,12 @@ function validateNode(raw: Record<string, unknown>, path: string): ImmutableGitN
   return node;
 }
 
-function exactTreeEntry(treeResponse: unknown, segment: string, path: string): ImmutableGitNode | null {
+function exactTreeEntry(treeResponse: unknown, expectedTreeSha: string, segment: string, path: string): ImmutableGitNode | null {
   if (!treeResponse || typeof treeResponse !== "object") throw malformedTree(path, "tree response is not an object");
   const response = treeResponse as Record<string, unknown>;
+  if (response["sha"] !== expectedTreeSha) {
+    throw new Error(`GitHub immutable tree identity mismatch while resolving ${path}: expected ${expectedTreeSha}, received ${String(response["sha"])}.`);
+  }
   if (!Array.isArray(response["tree"])) throw malformedTree(path, "tree field is not an array");
 
   let match: ImmutableGitNode | undefined;
@@ -79,6 +82,9 @@ export async function readImmutableGitFile(
 ): Promise<{ bytes: Uint8Array; sha: string } | null> {
   const segments = immutablePathSegments(path);
   const commit = await adapter.getCommit(commitSha);
+  if (commit.sha !== undefined && commit.sha !== commitSha) {
+    throw new Error(`GitHub immutable commit identity mismatch while resolving ${path}: expected ${commitSha}, received ${commit.sha}.`);
+  }
   if (!GIT_OBJECT_SHA.test(commit.treeSha)) {
     throw new Error(`GitHub immutable commit has invalid tree SHA: ${commitSha}.`);
   }
@@ -88,7 +94,7 @@ export async function readImmutableGitFile(
     const segment = segments[index];
     if (segment === undefined) throw malformedTree(path, "path segment missing");
     const tree = await adapter.getTree(treeSha);
-    const node = exactTreeEntry(tree, segment, path);
+    const node = exactTreeEntry(tree, treeSha, segment, path);
     if (!node) return null;
 
     const final = index === segments.length - 1;

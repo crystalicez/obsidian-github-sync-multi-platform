@@ -427,6 +427,11 @@ export class GitHubClient {
     });
     if (response.status !== 200) throw this.gitHttpError("Failed to get git commit", response.status, response.text);
     const json = response.json as { sha?: string; message?: string; tree?: { sha?: string }; parents?: Array<{ sha?: string }> };
+    // A mismatched or omitted immutable commit identity is not proof of the
+    // requested commit's tree. Never infer remote-file absence from that body.
+    if (GIT_COMMIT_SHA.test(sha) && json.sha !== sha) {
+      throw new Error(`GitHub immutable commit identity mismatch (SHA): requested ${sha}, received ${String(json.sha)}.`);
+    }
     return { sha: json.sha ?? sha, treeSha: json.tree?.sha ?? "", parentShas: (json.parents ?? []).map(parent => parent.sha ?? "").filter(Boolean), message: json.message };
   }
 

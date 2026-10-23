@@ -5,7 +5,7 @@ import type { GitHubCreateTreeEntry } from "../../src/lib/github-git-types";
 import { V4HistoryService } from "../../src/lib/v4/history-service";
 import type { V4JournalChange } from "../../src/lib/v4/history-journal";
 import { createEmptyV4LocalIndex, type V4IndexFileRecord, type V4LocalIndex } from "../../src/lib/v4/local-index";
-import { assertV4PathLayoutCompatible, V4ChangeGuardError, V4SyncSession, type V4SessionVault } from "../../src/lib/v4/sync-session";
+import { assertV4PathLayoutCompatible, V4ChangeGuardError, V4RemoteObjectMissingError, V4SyncSession, type V4SessionVault } from "../../src/lib/v4/sync-session";
 import { coalesceV4Changes, type V4QueuedChange } from "../../src/lib/v4/sync-coordinator";
 import { V4_CONFIG_PATH, V4_FORMAT_VERSION, V4_HEAD_PATH, V4_ROOT, type V4RemoteConfig, type V4RemoteHead } from "../../src/lib/v4/protocol-types";
 import { decryptV4Payload, deriveV4Keyring, encryptV4Payload } from "../../src/lib/v4/crypto";
@@ -1387,6 +1387,10 @@ test("v4 failed pull progress retains the active logical path", async () => {
   const events: V4SyncProgressPatch[] = [];
   const target = new MemoryVault();
   const targetIndex = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "target", mode: "plaintext" });
+  const missingRecord = Object.values(sourceIndex.shards).flatMap(shard => Object.values(shard.records))
+    .find(record => record.path === "broken.md");
+  assert.ok(missingRecord, "source index must still reference the published blob");
+  const expectedCommit = github.ref!.sha;
   await assert.rejects(
     () => new V4SyncSession({
       github,
@@ -1397,8 +1401,20 @@ test("v4 failed pull progress retains the active logical path", async () => {
       abortChangePercent: 0,
       onProgress: event => events.push(structuredClone(event)),
     }).sync({ operation: "forcePull", allowThresholdOverride: false }),
-    /Missing V4 remote object/iu,
+    (error: unknown) => {
+      assert.ok(error instanceof V4RemoteObjectMissingError);
+      assert.equal(error.remotePath, "broken.md");
+      assert.equal(error.remoteCommitSha, expectedCommit);
+      assert.equal(error.fileId, missingRecord.fileId);
+      assert.equal(error.remoteVersion, missingRecord.remoteVersion);
+      assert.equal(error.storage, "single");
+      assert.match(error.message, /Missing V4 remote object.*broken\.md/iu);
+      return true;
+    },
   );
+  assert.equal(target.files.size, 0, "failure must not write any unverified remote bytes");
+  assert.equal(targetIndex.remoteCommitSha, undefined, "failure must not advance the local base SHA");
+  assert.ok(github.readRefs.includes(expectedCommit), "missing read must be pinned to the published immutable commit");
   assert.equal(events.at(-1)?.phase, "downloading");
   assert.equal(events.at(-1)?.currentPath, "broken.md");
   assert.equal(events.at(-1)?.currentDirection, "pull");

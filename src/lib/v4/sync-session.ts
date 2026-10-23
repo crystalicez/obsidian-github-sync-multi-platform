@@ -96,6 +96,20 @@ export interface V4SessionSyncResult {
   recoveryRunId?: string | undefined
 }
 
+/** Preserve the immutable commit and logical identity that produced a missing-object read. */
+export class V4RemoteObjectMissingError extends Error {
+  constructor(
+    public readonly remotePath: string,
+    public readonly remoteCommitSha: string | undefined,
+    public readonly fileId: string,
+    public readonly remoteVersion: string,
+    public readonly storage: V4IndexFileRecord["storage"],
+  ) {
+    super(`Missing V4 remote object: ${remotePath} (commit=${remoteCommitSha ?? "unknown"}; fileId=${fileId}; version=${remoteVersion}; storage=${storage})`)
+    this.name = "V4RemoteObjectMissingError"
+  }
+}
+
 export class V4ChangeGuardError extends Error {
   constructor(public readonly changePercent: number, public readonly thresholdPercent: number) {
     super(`V4 change guard blocked sync: ${changePercent}% exceeds ${thresholdPercent}%.`)
@@ -1564,7 +1578,7 @@ export class V4SyncSession {
     }
     const fetchObject = async () => {
       const file = await this.input.github.getFileBytes(path, remoteCommitSha)
-      if (!file) throw new Error(`Missing V4 remote object: ${path}`)
+      if (!file) throw new V4RemoteObjectMissingError(path, remoteCommitSha, record.fileId, record.remoteVersion, record.storage)
       if (cacheKey) this.localReadCache.set(cacheKey, file.bytes)
       return file.bytes
     }
