@@ -273,6 +273,27 @@ test("V4 tree writer creates an exact candidate before mutating the branch ref",
   assert.deepEqual(github.updatedRefs, [{ sha: "commit-1", expected: "commit-old" }]);
 });
 
+test("V4 candidate rejects duplicate uploaded tree paths before Git tree or commit creation", async () => {
+  const github = new MemoryV4GitHub();
+  const base = { ref: null, previousHeadSha: undefined, baseTreeSha: undefined };
+  await assert.rejects(
+    () => createV4CandidateCommit(github, {
+      base,
+      message: "obsidian-sync-v4:duplicate-candidate",
+      entries: [
+        { path: ".obsidian-github-sync-v4/data/same.enc", mode: "100644", type: "blob", sha: "first" },
+        { path: ".obsidian-github-sync-v4/data/same.enc", mode: "100644", type: "blob", sha: "second" },
+      ],
+      deletions: ["unrelated.md"],
+    }),
+    /duplicate.*path/iu,
+  );
+  assert.deepEqual(github.trees, []);
+  assert.deepEqual(github.commits, []);
+  assert.deepEqual(github.createdRefs, []);
+  assert.deepEqual(github.updatedRefs, []);
+});
+
 test("V4 publication base resolves bootstrap before creating a normal candidate", async () => {
   const github = new MemoryV4GitHub();
   github.initializedRef = { ref: "refs/heads/main", sha: "bootstrap", type: "commit" };

@@ -235,6 +235,13 @@ export async function createV4CandidateCommit(
     deletions?: string[];
   },
 ): Promise<V4CandidateCommit> {
+  // Streamed and buffered uploads converge here; neither may provide two
+  // candidate writes to the same Git tree path. Preserve deletion semantics.
+  const writtenPaths = new Set<string>();
+  for (const entry of input.entries) {
+    if (writtenPaths.has(entry.path)) throw new Error(`Duplicate V4 candidate Git tree path: ${entry.path}`);
+    writtenPaths.add(entry.path);
+  }
   const entries = [...input.entries];
   for (const path of input.deletions ?? []) entries.push({ path, mode: "100644", type: "blob", sha: null });
   const treeSha = await github.createGitTree(entries, input.base.baseTreeSha);
