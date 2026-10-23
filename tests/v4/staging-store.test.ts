@@ -228,6 +228,50 @@ test("staging uses opaque ids under the plugin-private excluded root and hashes 
   assert.deepEqual(await collectV4ContentSource(await store.open(ref), 64), data);
 });
 
+test("staging rejects arithmetic overflow and malformed lengths before touching the backend", async () => {
+  const max = Number.MAX_SAFE_INTEGER;
+  assert.throws(
+    () => estimateV4StagingSpace({ stageBytes: 2, existingTargetBytes: max - 1, atomicReplace: false }),
+    /safe integer|range|overflow/i,
+  );
+  assert.throws(
+    () => estimateV4StagingSpace({ stageBytes: 1, existingTargetBytes: max, atomicReplace: true }),
+    /safe integer|range|overflow/i,
+  );
+  assert.deepEqual(estimateV4StagingSpace({ stageBytes: 0, existingTargetBytes: max, atomicReplace: true }), {
+    existingTargetBytes: max,
+    stageBytes: 0,
+    backupBytes: 0,
+    peakFootprintBytes: max,
+    additionalFreeBytesRequired: 0,
+  });
+
+  let calls = 0;
+  const store = createV4StagingStore({
+    root: "private/stage",
+    wholeBufferCeilingBytes: 16,
+    randomId: () => "bad",
+    backend: {
+      boundedAppend: true,
+      async write() { calls++; },
+      async append() { calls++; },
+      async remove() { calls++; },
+      async freeBytes() { calls++; return max; },
+      async openSource() { calls++; throw new Error("not used"); },
+    },
+  });
+  for (const [expectedSize, existingTargetBytes] of [
+    [-1, 0], [0.5, 0], [Number.NaN, 0], [1, -1], [1, 0.5],
+    [1, max],
+  ]) {
+    await assert.rejects(
+      store.beginStage({ expectedSize, existingTargetBytes, atomicReplace: true, mtime: 1 }),
+      /safe integer|range|overflow/i,
+    );
+  }
+  assert.equal(calls, 0, "invalid staging inputs must not trigger backend I/O");
+});
+
 test("large staging requires known free space and accounts for non-atomic backup overhead", async () => {
   assert.deepEqual(estimateV4StagingSpace({ stageBytes: 100, existingTargetBytes: 40, atomicReplace: false }), {
     existingTargetBytes: 40,

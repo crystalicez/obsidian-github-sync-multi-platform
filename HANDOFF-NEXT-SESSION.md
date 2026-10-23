@@ -4,6 +4,14 @@
 >
 > **Mandatory workflow rule:** Every AI session that makes a material change to code, tests, design decisions, branch/PR state, verification status, or next steps MUST update this file before ending or handing work off. GitHub is the source of truth.
 
+## 2026-10-23 Stage D26 — staging safe-integer footprint validation (Node.js only)
+
+- **Source and isolation:** Detached clean D24 base `f261b3e99c358663bbcf23298b098ac706e8a021` in `.worktrees/d26-staging-integer-f261b3e`, dedicated branch `audit/2026-10-23-d26-staging-integer-bounds`. Primary Zed checkout, concurrent D25 real-Obsidian worktrees, user vault and secrets were not modified.
+- **RED:** `estimateV4StagingSpace` validated each component but not their sum, returning imprecise numbers when backup plus staged file plus original target exceeded JavaScript `Number.MAX_SAFE_INTEGER`. `beginStage` skipped even individual numeric validation on its small-file path. New deterministic test failed **11/12** before the fix (missing expected overflow exception).
+- **Fix:** Validate the combined peak and incremental free-space estimates using `Number.isSafeInteger`; always apply the existing estimator before accepting any stage, including small-file paths. Bad inputs now reject before backend I/O or stage-ID allocation. Existing normal-path resource estimates and file formats are unchanged; no new dependencies, persistent-state or protocol changes.
+- **GREEN:** focused **12/12**; `pnpm build` PASS; `pnpm test:fast` **511/511** PASS and `pnpm test:repeat` **10×511/511** PASS; recovery **79/79** PASS; resource **11/11** PASS; feasibility **132/132** PASS; bounded virtual soak PASS; GitHub E2E three-bundle compile PASS; metadata and package checks PASS. These are **local checks**, not real GitHub, live Obsidian UI, power-cut, network-drive or mobile acceptance. The D25 live GUI qualification is a separate ongoing workstream.
+- **Boundaries:** Node.js + Obsidian API remain primary. GitHub Issue #9 (native/OS TOCTOU research) is explicitly deferred and untouched. No GitHub Actions, `master`, release, native binary, physical test file above 100 MB, or real-vault access. Keep unrelated existing worktrees and owners intact.
+
 ## 2026-10-23 Stage D24 — Node.js real GitHub E2E full matrix 3/3 PASS; deferred OS issue untouched
 
 - **No product runtime change:** Node.js + Obsidian API primary. GitHub [Issue #9](https://github.com/crystalicez/obsidian-github-sync-multi-platform/issues/9) (Native/OS TOCTOU research) stays **deferred until explicitly requested**. D24 was test-only tooling and engineering documentation. `src/`, remote protocol/WAL/conflict policy and release workflows untouched; no GitHub Actions, `master`, tags or binaries.
