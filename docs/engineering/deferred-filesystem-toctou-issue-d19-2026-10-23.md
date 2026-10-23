@@ -1,11 +1,11 @@
-# Deferred GitHub Issue Draft — Desktop filesystem TOCTOU / path-swap races
+# Archived GitHub Issue #9 Research — Desktop filesystem TOCTOU / path-swap races
 
-**2026-10-23. STATUS: DRAFT — NOT AN ACTUAL GITHUB ISSUE.** On creation attempt in `crystalicez/obsidian-github-sync-multi-platform`, the GitHub API returned **HTTP 410**: `Issues has been disabled in this repository.` The actual issue URL/number **does not exist**. **D20 update:** the user has explicitly approved enabling repository Issues, but the connected tools cannot change that repository setting. An administrator must enable Issues at [repository Settings → General → Features](https://github.com/crystalicez/obsidian-github-sync-multi-platform/settings) before the issue can be created. Do not use local credentials or unsupported API workarounds; keep this draft parked until the switch is enabled.
+**2026-10-23. STATUS: FILED and verified — [Issue #9](https://github.com/crystalicez/obsidian-github-sync-multi-platform/issues/9), OPEN but DEFERRED.** On creation attempt in `crystalicez/obsidian-github-sync-multi-platform`, the GitHub API returned **HTTP 410**: `Issues has been disabled in this repository.` This is a historical failure; Issue #9 now exists and has been verified. **D20 update:** the user has explicitly approved enabling repository Issues, but the connected tools cannot change that repository setting. The feature was enabled by the user; no additional setup is required. The user enabled Issues and the GitHub connector created and verified Issue #9. This document is now archived provenance, not a request to create or implement another issue.
 
-Suggested eventual title:
+Actual issue title:
 `[Deferred / Node.js-first] Desktop filesystem TOCTOU/path-swap races — D12–D18 findings and native research`
 
-When the user authorizes GitHub Issues, copy the text below into **one GitHub issue**, verify it exists, and replace this pending draft status with the actual issue number/URL in `HANDOFF-NEXT-SESSION.md`. Until then, this repository document is the parked single source of truth.
+Canonical deferred ticket: [#9](https://github.com/crystalicez/obsidian-github-sync-multi-platform/issues/9). The research text below is retained as an archived, linked source; creating a duplicate issue is unnecessary.
 
 ---
 
@@ -68,6 +68,6 @@ Audit branch: `audit/2026-10-21-staged-production-integration`; D18 validated st
 
 ## Parked issue handling rule
 
-**Do not automatically pick up, implement, close, or ship this issue.** Only resume after the user specifically says to review the deferred race-condition issue. Leave the pending draft here while GitHub Issues is disabled; after the user approves enabling Issues, create one actual GitHub Issue and record its URL/number.
+**Do not automatically pick up, implement, close, or ship [Issue #9](https://github.com/crystalicez/obsidian-github-sync-multi-platform/issues/9).** Only resume after the user specifically says to review this deferred race-condition issue. The GitHub issue has been created and verified; this document is retained for provenance.
 
 No GitHub Actions, `master` modifications, release, personal vault or >100MB physical file are part of this deferred ticket.
