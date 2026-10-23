@@ -34,7 +34,7 @@ On D15 code:
 - `pnpm test:feasibility`: **132/132 PASS**.
 - Bounded virtual cryptographic `pnpm test:soak`: **1/1 PASS**, 100,000,000 bytes simulated, no >100 MB physical fixture.
 - Metadata/package validation and 3 GitHub E2E bundle compilations PASS; compile-only not live repo acceptance.
-- *Native two-instance disposable Windows Obsidian encrypted small-journey test:* pending; update with actual result if executed.
+- **Native Windows Obsidian 1.14.4 encrypted two-instance small journey PASS:** exact D15 source commit `dc23dce35688bf7a777630d4978867b5f1478f55`, exit 0. Validated disposable test repo ID `1284153873` and absent-first unique branch; AES-GCM opaque remote tree, Unicode and nested file create/rename/modify/delete/recreate, genuine B restoration (`peerRestored:true`; peer download wall 8,399ms), two-device conflict retained both revisions, warm no-op 2,405.1ms, screenshots captured and **0 UI exceptions**. Test branch was deleted and verified absent; managed Obsidian processes and disposable vaults/profiles cleaned. This run was deliberately **small journey**, not another 1,000-note run; the full 1,000-note A→B proof remains D14 on the immediately preceding engine candidate.
 
 ## Next release qualifications
 
