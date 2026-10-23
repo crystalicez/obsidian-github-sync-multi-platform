@@ -24,6 +24,8 @@ import { createV4PlatformIo, V4ManualRecoveryRequiredError, type V4BinaryAdapter
 import { isV4UncVaultPath, V4_NETWORK_VAULT_WARNING } from "./network-storage"
 import { createV4StagingStore, type V4StagingStore } from "./staging-store"
 import { V4ProgressStore, type V4SyncProgressSnapshot } from "./progress"
+import { createV4RunDiagnostics } from "./run-diagnostics"
+import type { V4TransportMetricsSnapshot } from "./transport-metrics"
 import { createV4RecoveryStore, discardV4RecoveryStages, markV4RecoveryIndexCommitted, recoverV4PendingState, V4RecoveryRequiredError } from "./recovery-store"
 import { V4KeyringCache } from "./keyring-cache"
 import { boundedMap } from "./bounded-map"
@@ -141,6 +143,9 @@ export class V4PluginRuntime {
   private readonly coordinator: V4SyncCoordinator
   private readonly adapter: V4LocalIndexAdapter
   private readonly progressStore = new V4ProgressStore()
+  private diagnosticsClient?: FastSync["githubClient"]
+  private diagnosticsBaseline?: V4TransportMetricsSnapshot
+  private peakRendererRssBytes?: number
   private readonly platformIo: V4PlatformIo
   private readonly uncVault: boolean
   private networkStorageNoticeShown = false
@@ -299,9 +304,27 @@ export class V4PluginRuntime {
   }
 
   private snapshotForConsumers(snapshot: V4SyncProgressSnapshot): V4SyncProgressSnapshot {
-    return this.debounceRunActive && snapshot.lifecycle === "active" && snapshot.phase === "debouncing"
-      ? Object.freeze({ ...snapshot, lifecycle: "waiting" as const })
-      : snapshot
+    const lifecycle = this.debounceRunActive && snapshot.lifecycle === "active" && snapshot.phase === "debouncing"
+      ? "waiting" as const
+      : snapshot.lifecycle
+    if (!this.diagnosticsClient || !this.diagnosticsBaseline) {
+      return lifecycle === snapshot.lifecycle ? snapshot : Object.freeze({ ...snapshot, lifecycle })
+    }
+    if (Platform.isDesktopApp) {
+      try {
+        const rss = globalThis.process?.memoryUsage?.().rss
+        if (typeof rss === "number" && Number.isFinite(rss) && rss > 0) {
+          this.peakRendererRssBytes = Math.max(this.peakRendererRssBytes ?? 0, rss)
+        }
+      } catch { /* RAM sampling is optional and must never fail Sync. */ }
+    }
+    const diagnostics = createV4RunDiagnostics(
+      this.diagnosticsBaseline,
+      this.diagnosticsClient.transportMetricsSnapshot,
+      snapshot.totalElapsedMs,
+      this.peakRendererRssBytes,
+    )
+    return Object.freeze({ ...snapshot, lifecycle, diagnostics: Object.freeze(diagnostics) })
   }
 
   private inScope(path: string): boolean {
@@ -491,6 +514,9 @@ export class V4PluginRuntime {
     const repoId = this.repoId(settings)
     const runCredentialGeneration = this.credentialGeneration
     throwIfV4Aborted(signal)
+    this.diagnosticsClient = github
+    this.diagnosticsBaseline = github?.transportMetricsSnapshot
+    this.peakRendererRssBytes = undefined
     const continuingDebounceRun = this.debounceRunActive
     this.debounceRunActive = false
     const runPatch = {

@@ -32,6 +32,7 @@ export interface V4PhaseTiming {
 }
 
 export interface V4SyncProgressSnapshot {
+  diagnostics?: import("./run-diagnostics").V4RunDiagnostics;
   lifecycle: V4SyncLifecycle;
   phase?: V4SyncPhase;
   currentPath?: string;

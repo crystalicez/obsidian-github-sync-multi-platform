@@ -129,29 +129,33 @@ export class GitHubClient {
     const kind = method === "GET" || method === "HEAD" ? "read" : "write";
     const requestBytes = typeof options.body === "string" ? new TextEncoder().encode(options.body).byteLength : 0;
     return this.requestScheduler.run(kind, async () => {
-      this.transportMetrics.recordRequest({ mutation: kind === "write", requestBytes, transientBytes });
-      let response: RequestUrlResponse;
+      const requestId = this.transportMetrics.recordRequest({ mutation: kind === "write", requestBytes, transientBytes });
       try {
-        response = await requestUrl(options);
-      } catch (error) {
-        this.transportMetrics.recordNetworkFailure();
-        throw error;
+        let response: RequestUrlResponse;
+        try {
+          response = await requestUrl(options);
+        } catch (error) {
+          this.transportMetrics.recordNetworkFailure();
+          throw error;
+        }
+        const responseBytes = response.arrayBuffer?.byteLength ?? (response.text ? new TextEncoder().encode(response.text).byteLength : 0);
+        this.transportMetrics.recordResponse(response.status, responseBytes);
+        const responseHeaders = Object.fromEntries(Object.entries(response.headers ?? {}).map(([key, value]) => [key.toLowerCase(), value]));
+        const rateLimited = response.status === 429 || (response.status === 403 && (
+          responseHeaders["retry-after"] !== undefined
+          || responseHeaders["x-ratelimit-reset"] !== undefined
+          || responseHeaders["x-ratelimit-remaining"] === "0"
+        ));
+        if (rateLimited) {
+          const error = new Error(`GitHub request failed: HTTP ${response.status} - ${response.text || "rate limited"}`) as Error & { status?: number; headers?: Record<string, string> };
+          error.status = response.status;
+          error.headers = responseHeaders;
+          throw error;
+        }
+        return response;
+      } finally {
+        this.transportMetrics.finishRequest(requestId);
       }
-      const responseBytes = response.arrayBuffer?.byteLength ?? (response.text ? new TextEncoder().encode(response.text).byteLength : 0);
-      this.transportMetrics.recordResponse(response.status, responseBytes);
-      const responseHeaders = Object.fromEntries(Object.entries(response.headers ?? {}).map(([key, value]) => [key.toLowerCase(), value]));
-      const rateLimited = response.status === 429 || (response.status === 403 && (
-        responseHeaders["retry-after"] !== undefined
-        || responseHeaders["x-ratelimit-reset"] !== undefined
-        || responseHeaders["x-ratelimit-remaining"] === "0"
-      ));
-      if (rateLimited) {
-        const error = new Error(`GitHub request failed: HTTP ${response.status} - ${response.text || "rate limited"}`) as Error & { status?: number; headers?: Record<string, string> };
-        error.status = response.status;
-        error.headers = responseHeaders;
-        throw error;
-      }
-      return response;
     }, this.operationSignal);
   }
 

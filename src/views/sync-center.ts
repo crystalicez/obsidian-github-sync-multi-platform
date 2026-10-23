@@ -28,11 +28,13 @@ export class V4SyncCenterView extends ItemView {
   private progressContext?: HTMLElement
   private progressDetails?: HTMLElement
   private progressTimings?: HTMLElement
+  private progressDiagnostics?: HTMLElement
   private progressLifecycle?: V4SyncProgressSnapshot["lifecycle"]
   private progressLiveSignature?: string
   private progressContextSignature?: string
   private progressDetailsSignature?: string
   private progressTimingsSignature?: string
+  private progressDiagnosticsSignature?: string
   private unsubscribeProgress?: () => void
   private openGeneration = 0
   private renderGeneration = 0
@@ -97,6 +99,7 @@ export class V4SyncCenterView extends ItemView {
     this.progressContext = progressHeading.createEl("span", { cls: "github-sync-center__muted" })
     this.progressDetails = this.progressCard.createDiv({ cls: "github-sync-center__progress-details" })
     this.progressTimings = this.progressCard.createDiv({ cls: "github-sync-center__timings" })
+    this.progressDiagnostics = this.progressCard.createDiv({ cls: "github-sync-center__diagnostics" })
     this.renderProgressCard(this.plugin.v4Runtime.progressSnapshot)
     const layout = this.contentEl.createDiv({ cls: "github-sync-center__layout" })
     return {
@@ -111,7 +114,8 @@ export class V4SyncCenterView extends ItemView {
     const contextElement = this.progressContext
     const details = this.progressDetails
     const timingsElement = this.progressTimings
-    if (!card || !live || !contextElement || !details || !timingsElement) return
+    const diagnosticsElement = this.progressDiagnostics
+    if (!card || !live || !contextElement || !details || !timingsElement || !diagnosticsElement) return
 
     if (snapshot.lifecycle !== this.progressLifecycle) {
       if (this.progressLifecycle) card.removeClass(`is-${this.progressLifecycle}`)
@@ -168,6 +172,28 @@ export class V4SyncCenterView extends ItemView {
       for (const [label, duration, total] of timingRows) this.renderTiming(timingsElement, label, duration, total)
       this.progressTimingsSignature = timingsSignature
     }
+    const diagnosticsSignature = JSON.stringify(snapshot.diagnostics ?? null)
+    if (diagnosticsSignature !== this.progressDiagnosticsSignature) {
+      diagnosticsElement.empty()
+      if (snapshot.diagnostics) this.renderDiagnostics(diagnosticsElement, snapshot)
+      this.progressDiagnosticsSignature = diagnosticsSignature
+    }
+  }
+
+  private renderDiagnostics(container: HTMLElement, snapshot: V4SyncProgressSnapshot): void {
+    const d = snapshot.diagnostics
+    if (!d) return
+    const bytes = (count: number) => count >= 1048576 ? `${(count / 1048576).toFixed(1)} MiB`
+      : count >= 1024 ? `${(count / 1024).toFixed(1)} KiB` : `${count} B`
+    const rate = (count: number) => snapshot.totalElapsedMs > 0
+      ? `${bytes(count * 1000 / snapshot.totalElapsedMs)}/s` : "not measured"
+    this.renderTiming(container, "Upload API", `${bytes(d.uploadBytes)} · run avg ${rate(d.uploadBytes)}`)
+    this.renderTiming(container, "Download API", `${bytes(d.downloadBytes)} · run avg ${rate(d.downloadBytes)}`)
+    this.renderTiming(container, "GitHub API", `${d.apiRequests} requests · ${d.apiFailures} network/server errors · ${formatV4Duration(d.apiLatencyMs)} cumulative latency`)
+    this.renderTiming(container, "GitHub in flight", `${d.inFlightApiRequests} requests · oldest ${Math.round(d.oldestInFlightApiMs)}ms`)
+    this.renderTiming(container, "Peak renderer RAM", d.peakRendererRssBytes === undefined ? "unavailable" : bytes(d.peakRendererRssBytes))
+    this.renderTiming(container, "Hashing", d.hashingMs === undefined ? "not measured" : formatV4Duration(d.hashingMs))
+    this.renderTiming(container, "Encryption", d.encryptionMs === undefined ? "not measured" : formatV4Duration(d.encryptionMs))
   }
 
   private renderProgressDetails(container: HTMLElement, snapshot: V4SyncProgressSnapshot): void {
@@ -199,11 +225,13 @@ export class V4SyncCenterView extends ItemView {
     this.progressContext = undefined
     this.progressDetails = undefined
     this.progressTimings = undefined
+    this.progressDiagnostics = undefined
     this.progressLifecycle = undefined
     this.progressLiveSignature = undefined
     this.progressContextSignature = undefined
     this.progressDetailsSignature = undefined
     this.progressTimingsSignature = undefined
+    this.progressDiagnosticsSignature = undefined
   }
 
   private renderTiming(container: HTMLElement, label: string, duration: string, total = false): void {

@@ -95,6 +95,25 @@ test("Sync Center progress card updates in isolation and unsubscribes on close",
   assert.equal(source.unsubscribeCalls, 1);
 });
 
+
+test("Sync Center shows measured HTTP request and RSS diagnostics without inventing hashing times", async () => {
+  const source = new FakeProgressSource();
+  const plugin = createSyncCenterPluginFixture(source, () => undefined);
+  const view = new V4SyncCenterView(new WorkspaceLeaf(plugin.app), plugin as never);
+  await view.onOpen();
+  source.publish({ ...uploadingFixture, diagnostics: {
+    apiRequests: 7, apiFailures: 0, uploadBytes: 2048, downloadBytes: 4096,
+    apiLatencyMs: 750, inFlightApiRequests: 1, oldestInFlightApiMs: 55,
+    peakRendererRssBytes: 104857600,
+  } });
+  const shown = view.contentEl.flattenText();
+  assert.match(shown, /Upload API.*Download API.*GitHub API.*GitHub in flight.*Peak renderer RAM/su);
+  assert.match(shown, /7 requests/su);
+  assert.match(shown, /100\.0 MiB/su);
+  assert.match(shown, /not measured/su);
+  await view.onClose();
+});
+
 test("Sync Center shows failure context and does not duplicate subscriptions", async () => {
   const source = new FakeProgressSource();
   const plugin = createSyncCenterPluginFixture(source, () => undefined);
