@@ -42,7 +42,29 @@ Source analysis: `V4StorageCodec.preparePackFromSources` groups up to 500 small 
 
 Candidate optimization: `V4SyncSession.readRemoteRecordObject` caches the downloaded **ciphertext pack**, keyed by the immutable 40-hex-digit remote commit SHA, `packId` and object path, in the **existing per-session bounded V4ByteCache** (no extra unaccounted cache). A mutable or unpinned ref is never cached. Separate Sync sessions always re-fetch; over-budget packs are not cached; concurrent same-key reads are single-flight and failure never poisons cache. Each logical member is still independently AES-GCM decrypted, pack entry selected, plaintext SHA-256 and byte size checked by the unchanged codec, then staged under existing WAL/editor/containment gates.
 
-Expanded regression verifies **1** fetch for 64 members sharing one immutable pack; a new session downloads again (**2** cumulative), and `maxCacheBytes:1` falls back to 64 additional fetches without changing bytes (**66** cumulative). Focused 87/87 and Recovery 79/79 passed on the candidate. A new **exact-commit native 1,000-note A→B** acceptance remains mandatory before calling this fixed; no remote protocol layout change.
+Expanded regression verifies **1** fetch for 64 members sharing one immutable pack; a new session downloads again (**2** cumulative), and `maxCacheBytes:1` falls back to 64 additional fetches without changing bytes (**66** cumulative). Focused 87/87, full Fast 501/501, Repeat 10×501/501, Recovery 79/79, Resource 11/11, Feasibility 132/132, bounded virtual 100MB soak, Build, metadata/package validation and GitHub E2E bundle compilation all PASS. No remote protocol layout change.
+
+## Exact optimized candidate — full native acceptance PASS
+
+Obsidian 1.14.4 Windows two **actual independent instances**, production bundle from source commit **`7da4ddad9435cfdb5c3d9ea43093201dcd879ec5`**, same disposable GitHub repository (numeric pinned ID **1284153873**), unique test branch confirmed absent before test and removed with `absent-verified` afterward, exit **0**:
+
+| Live step | Observed outcome |
+| --- | --- |
+| Synthetic Unicode folder/note create; rename/modify/delete; deleted-note recreate | PASS |
+| Main Obsidian creates 1,000 notes | **9,013.3 ms** |
+| A encrypted 1,000-note Push | **281,968 ms**, `push.completed=1000/1000` |
+| Warm 1,000-note no-op | **2,422.2 ms**, zero changes / unchanged GitHub HEAD |
+| Peer B encrypted Force Pull | **202,250.4 ms**, **1,003 remote logical files** |
+| Read/compare all expected restored note bytes, including 1,000 bulk records | PASS |
+| Concurrent cross-device conflict | Both distinct revisions preserved, PASS |
+| Encrypted remote GitHub tree | Opaque filenames, valid AES-GCM header, PASS |
+| UI evidence / cleanup | Screenshot captured; **0 UI exceptions**; both managed Obsidian processes stopped; synthetic vaults/profiles disposed; remote branch absence verified |
+
+During B's applying phase, independent CDP inspection of the **verified disposable peer-vault** found `pull=971/1003`, **268 GitHub requests**, **2,355,463 response bytes** and **0 retries** at **193,203 ms**. The final native driver independently verified the complete decrypted file set and completed successfully. The before/after transport observations were taken at different stages, so the 2.36 MB is **not** a complete-run total. The prior unoptimized peer reached **830 requests / 276,886,229 response bytes** without completing download by 647s. This provides compelling native evidence that caching reused encrypted packs eliminates a major real bottleneck, without claiming the snapshots are identical workload intervals.
+
+All actions used the disposable test vault/repository only. No changes to `master`, releases or GitHub Actions; no original vault or secrets in tracked files. The tested code differs from earlier D13 candidate only by D14 scoped test harness and the new session-only immutable pack ciphertext cache.
+
+
 
 ## Remaining qualification
 
