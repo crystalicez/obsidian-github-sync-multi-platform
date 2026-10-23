@@ -62,14 +62,17 @@ export async function createV4ContentSource(handle: V4ContentHandle, resolver: V
 export async function collectV4ContentSource(source: V4ContentSource, maximumBytes: number, signal?: AbortSignal): Promise<Uint8Array> {
   if (!Number.isSafeInteger(maximumBytes) || maximumBytes < 0) throw new TypeError("maximumBytes must be a non-negative safe integer.")
   if (source.size > maximumBytes) throw new RangeError(`V4 content source ${source.size} exceeds collection limit ${maximumBytes}.`)
+  throwIfV4Aborted(signal)
   const output = new Uint8Array(source.size)
   let offset = 0
   const chunkBytes = Math.max(1, Math.min(1024 * 1024, source.size || 1))
   for await (const chunk of source.chunks(chunkBytes, signal)) {
+    throwIfV4Aborted(signal)
     if (offset + chunk.byteLength > output.byteLength) throw new Error("V4 content source produced more bytes than declared.")
     output.set(chunk, offset)
     offset += chunk.byteLength
   }
+  throwIfV4Aborted(signal)
   if (offset !== output.byteLength) throw new Error(`V4 content source produced ${offset} bytes; expected ${output.byteLength}.`)
   return output
 }
