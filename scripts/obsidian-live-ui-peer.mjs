@@ -126,7 +126,7 @@ export async function restoreEncryptedToSecondObsidian({
    const content=await app.vault.read(file);
    await app.workspace.getLeaf("tab").openFile(file);
    return {status:s.lifecycle,filename:file.path,content,diagnostics:s.diagnostics,peerPullWallMs};
-  })()`,300000);
+  })()`,expectedFiles.length>=1000?900000:300000);
   assertSecondVaultRestore(restored,expectedContent);
   const verifiedFiles=await evaluate(`(async()=>{
    const expected=${JSON.stringify(expectedFiles)};
