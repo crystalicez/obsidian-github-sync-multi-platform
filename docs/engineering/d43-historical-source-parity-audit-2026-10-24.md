@@ -1,0 +1,20 @@
+# D43 historical worktree source-path parity audit
+
+Date: 2026-10-24 Asia/Bangkok. Strictly read-only command `node scripts/audit-historical-worktree-gaps.mjs` executed on D43 commit `ac377313c230cc5f572ff5d425704cc68bffd634`. Tool uses only `git for-each-ref`, `git worktree list --porcelain`, `git ls-tree`, `git rev-parse`; does not delete, fetch, merge, clean, modify worktrees or use GitHub Actions.
+
+**Coverage:** 45 local audit refs, 93 registered worktrees, 91 distinct historical tips compared, **8 source file paths that exist in historical snapshots but not at current D43 HEAD**. These are path-presence indicators, not a semantic completeness proof: renamed/reimplemented modules and superseded/abandoned branches require a manual behavior comparison. Most 91 tips are predecessors or historical experiments; this audit does not claim any patch or feature should be merged solely based on ancestry.
+
+| Historical-only source path | Tips | Initial evidence / action |
+| --- | ---: | --- |
+| `src/lib/github-config.ts` | 66 | Previously validated owner/repo/branch coordinates. No matching named validation functions in current `src`; **HIGH priority parity investigation** (do not blindly trust user-controlled refs/URLs). |
+| `src/lib/plugin-settings-validation.ts` | 66 | Previously fail-closed checked runtime settings object, ignore regex, secret ID uniqueness and numeric bounds; no same named validator in current `src`. **HIGH priority parity investigation**, especially before secret mutation. |
+| `src/lib/v4/shard-hash.ts` | 66 | Remote-canonical record hashing helper absent as file; current `sync-session.ts` has `bucketSignature` and `local-index.ts` has independently prefixed hash, so equivalence **requires protocol byte-for-byte tests**, not a cherry-pick. |
+| `src/lib/v4/desktop-transport-timer.ts` | 13 | Separate desktop transport pacing helper absent; current scheduler handles delays inline. Desktop timer/resume parity remains **UNVERIFIED** across suspend/hidden cases. |
+| `src/lib/v4/automatic-wake.ts` | 11 | Old background lifecycle helper absent; current `main.ts` has startup/setInterval logic. Android/iOS remains best-effort and physical acceptance **OPEN**. |
+| `src/lib/v4/platform-interval.ts` | 11 | Old OS-interval helper absent; platform-aware timer behavior needs parity evidence. |
+| `src/lib/v4/recovery-startup-policy.ts` | 6 | Historical interrupted recovery consent/choice helper absent. Current staged recovery checks exist, but **user approval semantics need comparison**. Do not auto-recover without strong evidence. |
+| `src/lib/v4/github-cooldown.ts` | 4 | Older GitHub cooldown module name replaced by `rate-limit-cooldown.ts` and scheduler hook in current runtime; **candidate equivalent**, verify using retry-header tests. |
+
+**Important missing UI integration not captured by file-path audit:** Historical `conflict-review.ts` and `file-overview.ts` are now restored as pure strict-typed D43 modules with 14+7 passing tests, but there is still no active per-line conflict modal or Files status sidebar. Historical implementation directly fetched contents for conflict modal, potentially violating current metadata-first optimization and snapshot protections. Displaying `synced` from only size+mtime can be misleading on same-size same-mtime edits; require stronger verified snapshot before UI exposure.
+
+**Next safe integration order:** (1) defensively restore settings/secret ID input validation with fail-first tests, ensuring errors occur before secret writes or API construction, and document compatibility impacts; (2) compare old shard hashes with current remote writer on canonical fixture without changing wire format; (3) audit startup recovery and timer paths; (4) implement conflict/File sidebar adapters only with approved on-demand fetch, local editor/snapshot guard and conflict-review size boundary; (5) qualify current source in native Obsidian and on physical platforms. Never automatically merge all branches, alter GitHub CAS/crypto/data delete policies, delete worktrees, or release.
