@@ -1,9 +1,10 @@
-import { Plugin, setIcon, Modal, Notice, TFile, TFolder } from "obsidian";
+import { Plugin, setIcon, Modal, Notice, TFile, TFolder, Platform } from "obsidian";
 
 import { SettingTab, PluginSettings, DEFAULT_SETTINGS } from "./setting";
 import { GitHubClient } from "./lib/github-api";
 import { assertPluginSettingsRuntimeSafe } from "./lib/plugin-settings-validation";
 import { V4RateLimitCooldownStore } from "./lib/v4/rate-limit-cooldown";
+import { selectV4GitHubSchedulerSleep } from "./lib/v4/desktop-transport-timer";
 import { normalizeScheduledSyncIntervalSeconds, shouldRunScheduledSync, shouldRunStartupSync } from "./lib/sync-policy";
 import { migrateV4Secrets, sanitizeV4SettingsForPersistence, storeV4Secrets } from "./lib/v4/secrets";
 import { V4PluginRuntime } from "./lib/v4/runtime";
@@ -168,7 +169,10 @@ export default class FastSync extends Plugin {
         owner: this.settings.githubOwner,
         repo: this.settings.githubRepo,
         branch: this.settings.githubBranch || "main",
-      }, { cooldownStore: this.cooldownStore });
+      }, {
+        cooldownStore: this.cooldownStore,
+        sleep: selectV4GitHubSchedulerSleep(Platform.isDesktopApp === true),
+      });
     } else this.githubClient = undefined as unknown as GitHubClient
   }
 

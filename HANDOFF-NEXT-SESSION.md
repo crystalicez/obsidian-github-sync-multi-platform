@@ -4,6 +4,11 @@
 >
 > **Mandatory workflow rule:** Every AI session that makes a material change to code, tests, design decisions, branch/PR state, verification status, or next steps MUST update this file before ending or handing work off. GitHub is the source of truth.
 
+## 2026-10-24 Stage D45 — restore verified Desktop GitHub transport Node timer only
+
+- **Canonical isolated successor:** `.worktrees/d45-desktop-transport-timer`, `audit/2026-10-24-d45-desktop-transport-timer`, from clean/pushed D44 `2eec58816ad5a0445378a85bbfe803ac482b8d38`. Previous October 20 Desktop transport-timer implementation (`8a30a46`) was missing from D44: GitHub request scheduler used renderer/global timer, risking throttling in hidden Obsidian windows. Ported only `src/lib/v4/desktop-transport-timer.ts`, injected Desktop-only `sleep: selectV4GitHubSchedulerSleep(Platform.isDesktopApp === true)` in `FastSync.initGitHubClient`; **NO change** to mobile, UI, Obsidian autosync timers, Git CAS, retry, encryption, deletion/conflicts, protocol or recovery consent.
+- RED→GREEN original missing helper, historical 3 tests plus new binding regression (focused **4/4 PASS**): 1000ms mutation-spacing never starts early; cancellation suppresses pending write; mobile does not load Node module. Build/Maximum Strict TypeScript zero errors PASS. Offline qualification **572/572 fast**, **10×572/572 repeat**, recovery **79/79**, resource **11/11**, feasibility **134/134**, virtual 100MB soak **1/1**, GitHub E2E compile 3 bundles, package/release metadata validation PASS. Native qualification to be appended only after exact-source run. Details `docs/engineering/d45-desktop-github-transport-timer-2026-10-24.md`. D38 intermittent missing-object P0 remains OPEN. D42 exact 100MB native proof belongs to source `05ff11d`, not this stage.
+
 ## 2026-10-24 Stage D44 — restore historical GitHub coordinates/settings/secret safety before mutation
 
 - **Canonical isolated successor candidate:** `.worktrees/d44-restore-secret-validation`, branch `audit/2026-10-24-d44-restore-secret-validation`, direct child of D43 `0e7586ab3bff8ddb38ad381112d0b9475658b3c0`; D43 explicitly merged D42's final acceptance ancestry. No original Zed/root worktree, personal vault, main/release, GitHub Actions, unrelated historical worktree removal.
