@@ -142,6 +142,13 @@ export async function uploadV4TreeFiles(
   github: V4GitTreeGithub,
   input: Pick<V4GitTreeWriteInput, "files" | "onLogicalFileUploadStarted" | "onLogicalFileUploaded" | "onUploadsComplete" | "withBlobTransport">,
 ): Promise<V4UploadedTreeFiles> {
+  // A Git tree cannot safely represent two different blobs at one object path.
+  // Reject before any remote mutation instead of silently replacing fileShas[path].
+  const seenPaths = new Set<string>();
+  for (const file of input.files) {
+    if (seenPaths.has(file.path)) throw new Error(`Duplicate V4 Git tree object path: ${file.path}`);
+    seenPaths.add(file.path);
+  }
   const progressItemsByFile = input.files.map(file => {
     const seen = new Set<string>();
     return (file.progressItems ?? []).filter(item => {

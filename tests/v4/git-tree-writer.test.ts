@@ -46,6 +46,23 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
+test("V4 tree upload rejects duplicate object paths before writing any blobs", async () => {
+  const github = new MemoryV4GitHub();
+  await assert.rejects(
+    () => uploadV4TreeFiles(github, {
+      files: [
+        { path: "same.enc", bytes: bytes("first"), progressItems: [{ fileId: "first", path: "A.md" }] },
+        { path: "same.enc", bytes: bytes("second"), progressItems: [{ fileId: "second", path: "B.md" }] },
+      ],
+    }),
+    /duplicate.*path/iu,
+  );
+  assert.deepEqual(github.blobs, []);
+  assert.deepEqual(github.trees, []);
+  assert.deepEqual(github.createdRefs, []);
+  assert.deepEqual(github.updatedRefs, []);
+});
+
 test("V4 tree writer initializes an empty branch with a root commit", async () => {
   const github = new MemoryV4GitHub();
   const result = await publishV4TreeChanges(github, {

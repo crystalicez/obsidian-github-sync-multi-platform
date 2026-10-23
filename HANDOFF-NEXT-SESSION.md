@@ -4,6 +4,14 @@
 >
 > **Mandatory workflow rule:** Every AI session that makes a material change to code, tests, design decisions, branch/PR state, verification status, or next steps MUST update this file before ending or handing work off. GitHub is the source of truth.
 
+## 2026-10-23 Stage D30 — reject duplicate Git tree object paths before blob upload (Node.js)
+
+- **Isolated branch/source:** Started at verified D28 SHA `4121151ec676594a93ce61e7b0b4c53e62a13104` in `.worktrees/d30-git-duplicate-paths`, branch `audit/2026-10-23-d30-git-tree-duplicate-paths`. Concurrent D29 remote-head validation and D25 GUI/telemetry worktrees were not modified. User's Zed root, personal vault, test credentials and other worktrees untouched.
+- **RED:** `uploadV4TreeFiles` allowed two distinct Git blobs with the same remote tree path. The resulting `fileShas` keyed map silently overwrote the first SHA and both same-path tree entries reached `createGitTree`. A deterministic regression requiring fail-closed before blob/network writes failed (focused **14/15 PASS, 1 FAIL: Missing expected rejection**).
+- **Fix:** Check the `input.files` tree paths for duplicates in one pass before progress callbacks or any Git blob creation; reject with explicit `Duplicate V4 Git tree object path` error. This retains legitimate many-logical-file shared packs represented as **one** Git object with several progress items. No changes to remote format, encrypted bytes, CAS/reconciliation, WAL, conflicts, retry policy or protocol.
+- **GREEN local evidence:** Focused **15/15**; `pnpm build` PASS; Fast **515/515** PASS, repeat **10×515/515** PASS; Recovery **79/79**, Resource **11/11**, Feasibility **132/132** PASS; bounded 100,000,000-byte virtual Soak **1/1** PASS; E2E three GitHub test bundles compile PASS; metadata/package checks PASS; `git diff --check` PASS. **No** credentialed real GitHub E2E or actual Obsidian GUI was run on D30.
+- **Next gates:** This guard covers `uploadV4TreeFiles` input only, not arbitrary direct `createV4CandidateCommit` entries or streaming writer paths; continue independent review without silently changing conflict/deletion semantics. Latest combined candidate still needs real Windows Obsidian two-instance encrypted GUI/peer/crash acceptance, C2 cross-device compatibility, mobile/macOS/Linux, and independent security audit before release. Node.js remains primary, GitHub Issue #9 native helper research remains deferred. Never use GitHub Actions, `master`, release, personal vault or test files above 100 MB.
+
 ## 2026-10-23 Stage D28 — Reject duplicate encrypted-pack file IDs before publication
 
 - **Isolated scope:** Worktree `.worktrees/d28-duplicate-pack-fileids`, dedicated branch `audit/2026-10-23-d28-duplicate-pack-fileids`, base D27 `e620342ad4e9c980cceb3629eb54d52436ae8ef9`. Main Zed checkout and concurrent D25/D26/D27 worktrees unchanged.
