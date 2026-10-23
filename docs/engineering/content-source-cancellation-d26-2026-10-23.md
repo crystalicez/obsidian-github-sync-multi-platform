@@ -34,6 +34,16 @@ External async iterator cleanup is demonstrated at the synchronous cancellation 
 
 **Parallel D25 upstream evidence (to retain after safe rebase):** D25 independently proved a real Windows Obsidian encrypted two-instance functional journey on the same pre-D26 Node.js runtime (peer restore/rename/recreate and Copy conflict PASS), while its *strict diagnostic UI* gate failed because live GitHub/API/crypto/hash/peak-RAM rows are not wired into Sync Center. This independent UI instrumentation remains **unresolved**; it is not part of D26's narrowly scoped content source cancellation change.
 
+## Post-rebase qualification with upstream D25 merged
+
+The audit branch advanced from `a6d89d9` to `7027aac` while D26 was being validated. To preserve independent D25 work and all D26 evidence, D26 was replayed **on top of** `7027aacea2d0c4b2f231a04a2da4decf6f65d5f3`. The only overlapping file was `HANDOFF-NEXT-SESSION.md`; the conflict was resolved by retaining both the original D25 GUI/diagnostics sections and the new D26 section with no dropped facts. No force-push or source policy changes.
+
+Post-rebase gates on the combined tree: **Fast 517/517**, **Repeat 10×517/517**, **Recovery 79/79**, Build, Resource **11/11**, Feasibility **132/132**, virtual capped Soak **1/1**, metadata/package validations, and GitHub E2E compile-only (three bundles) **all PASS**. The +3 over the isolated D26 base total (514) comes from the previously independent tracked D25 invalid-input safety tests, not new D26 behavior. There was no D26 live GitHub or native GUI rerun after this narrow source change.
+
+## Integration branch safety
+
+While this change was being verified, the shared integration branch advanced again to `d05573990601ddad4e373139cb67e445c206828c` after the D26 replay onto `7027aac`. To avoid overwriting concurrent D25/D26 work or repeated history operations, the completed D26 work is kept on independent non-force-pushed branch `audit/2026-10-23-d26-content-cancellation` until a later explicit integration review. **Do not claim D26 has entered the shared audit branch or master.** The branch is based on `7027aac` and includes the entire upstream D25 GUI evidence present there. D26 commits are self-contained, tested and ready for a clean reviewed merge when shared audit settles.
+
 ## Isolation / release boundaries
 
 The user-owned original Zed checkout `work/zed-production-hardening` and untracked `AGENTS.md` remain unchanged. The original D24 audit worktree has concurrent uncommitted/untracked changes by another process, deliberately not staged, removed or overwritten here. Only D26 isolated source, focused test, this report and `HANDOFF-NEXT-SESSION.md` are in scope. No release readiness claim: current-code real Obsidian GUI on platforms, C2 cross-device remote coordination, line-level merge UX and network drive/platform-specific durability remain independent qualification items.
