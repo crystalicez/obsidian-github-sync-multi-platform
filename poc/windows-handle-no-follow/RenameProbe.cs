@@ -15,6 +15,14 @@ internal static class RenameProbe
     private const uint FILE_TRAVERSE = 0x20;
     private const uint SYNCHRONIZE = 0x100000;
     private const uint FILE_SHARE_ALL = 7;
+    private const uint FILE_SHARE_READ = 1;
+    // Research ONLY: opt in to a stricter opened-source share mode. This
+    // breaks compatibility with other processes that already need write/delete.
+    // It is NOT a safe choice for the actual Obsidian plugin without consent.
+    private static bool StrictMutationLease = false;
+    // Test-only intentionally exposed gap to demonstrate that comparing
+    // a File ID and then calling rename is NOT an atomic operation.
+    private static bool DemonstrateIdentityGap = false;
     private const uint OPEN_EXISTING = 3;
     private const uint FILE_OPEN = 1;
     private const uint FILE_FLAG_BACKUP_SEMANTICS = 0x02000000;
@@ -34,6 +42,8 @@ internal static class RenameProbe
     private const string Candidate = "D17-CANDIDATE-CONTENT\n";
     private static readonly byte[] OriginalBytes = Encoding.UTF8.GetBytes(Original);
     private static readonly byte[] CandidateBytes = Encoding.UTF8.GetBytes(Candidate);
+    private static string ExpectedOriginalId;
+    private static string ExpectedCandidateId;
 
     [StructLayout(LayoutKind.Sequential)]
     private struct UnicodeString { public ushort Length; public ushort MaximumLength; public IntPtr Buffer; }
@@ -51,6 +61,12 @@ internal static class RenameProbe
     private struct IoStatusBlock { public IntPtr Status; public IntPtr Information; }
     [StructLayout(LayoutKind.Sequential)]
     private struct FileAttributeTag { public uint Attributes; public uint ReparseTag; }
+    // FileIdInfo (class 18) is an OS identity, not a content hash.
+    [StructLayout(LayoutKind.Sequential)]
+    private struct FileIdInfo {
+        public ulong VolumeSerialNumber;
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst=16)] public byte[] FileId;
+    }
 
     [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true, EntryPoint="CreateFileW")]
     private static extern IntPtr CreateFile(string path, uint access, uint share,
@@ -59,6 +75,10 @@ internal static class RenameProbe
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool GetFileInformationByHandleEx(
         IntPtr handle, int informationClass, out FileAttributeTag info, uint size);
+    [DllImport("kernel32.dll", SetLastError=true, EntryPoint="GetFileInformationByHandleEx")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetFileIdInformation(
+        IntPtr handle, int informationClass, out FileIdInfo info, uint size);
     [DllImport("kernel32.dll", SetLastError=true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool SetFilePointerEx(IntPtr handle, long distance, out long newOffset, uint moveMethod);
@@ -124,7 +144,8 @@ internal static class RenameProbe
             uint options = FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT |
                 (directory ? FILE_DIRECTORY_FILE : FILE_NON_DIRECTORY_FILE);
             int status = NtCreateFile(out result, access, ref oa, ref iosb,
-                IntPtr.Zero, 0, FILE_SHARE_ALL, FILE_OPEN, options, IntPtr.Zero, 0);
+                IntPtr.Zero, 0, (StrictMutationLease && !directory ? FILE_SHARE_READ : FILE_SHARE_ALL),
+                FILE_OPEN, options, IntPtr.Zero, 0);
             if (optional && (status == unchecked((int)0xC0000034) || status == unchecked((int)0xC000003A)))
                 return IntPtr.Zero;
             if (status < 0 || Invalid(result))
@@ -164,6 +185,38 @@ internal static class RenameProbe
     {
         using (var sha = SHA256.Create()) return BitConverter.ToString(sha.ComputeHash(bytes)).Replace("-","").ToLowerInvariant();
     }
+    private static string IdentityKey(IntPtr file)
+    {
+        FileIdInfo id = ReadIdentity(file);
+        if (id.FileId == null || id.FileId.Length != 16)
+            throw new InvalidOperationException("MANUAL_REVIEW invalid FileIdInfo");
+        return id.VolumeSerialNumber.ToString("X16") + ":" +
+            BitConverter.ToString(id.FileId).Replace("-","");
+    }
+    private static string FixtureIntent(IntPtr originalFile, IntPtr candidateFile)
+    {
+        return "D18-WAL-INTENT-V2\noriginal=" + HashHex(OriginalBytes)
+            + "\ncandidate=" + HashHex(CandidateBytes)
+            + "\noriginalId=" + IdentityKey(originalFile)
+            + "\ncandidateId=" + IdentityKey(candidateFile) + "\n";
+    }
+    private static void CaptureFixtureIntent(IntPtr dir)
+    {
+        IntPtr originalFile = OpenChild(dir,"original.md",false,false);
+        IntPtr stageFile = IntPtr.Zero;
+        try
+        {
+            stageFile = OpenChild(dir,"candidate.stage",false,false);
+            // File handles are already pinned by the time these IDs are read.
+            if (!Equal(ReadSmallPinned(originalFile),OriginalBytes) ||
+                !Equal(ReadSmallPinned(stageFile),CandidateBytes))
+                throw new InvalidOperationException("MANUAL_REVIEW source files changed during intent capture");
+            Console.Out.WriteLine("INTENT:" +
+                Convert.ToBase64String(Encoding.UTF8.GetBytes(FixtureIntent(originalFile,stageFile))));
+            Console.Out.Flush();
+        }
+        finally { Close(ref stageFile); Close(ref originalFile); }
+    }
     private static void ProveIntent(IntPtr pinnedRoot)
     {
         // This is a test-only, pre-fsynced durable-intent fixture, not the
@@ -171,19 +224,63 @@ internal static class RenameProbe
         IntPtr h = OpenChild(pinnedRoot, ".wal-intent-d17", false, false);
         try
         {
-            string expected = "D17-WAL-INTENT-V1\noriginal=" + HashHex(OriginalBytes)
-                + "\ncandidate=" + HashHex(CandidateBytes) + "\n";
             string recorded = Encoding.ASCII.GetString(ReadSmallPinned(h));
-            if (!String.Equals(expected,recorded,StringComparison.Ordinal))
+            string[] lines = recorded.Split('\n');
+            if (lines.Length != 6 || lines[0] != "D18-WAL-INTENT-V2"
+                || lines[1] != "original=" + HashHex(OriginalBytes)
+                || lines[2] != "candidate=" + HashHex(CandidateBytes)
+                || !lines[3].StartsWith("originalId=",StringComparison.Ordinal)
+                || !lines[4].StartsWith("candidateId=",StringComparison.Ordinal)
+                || lines[5] != "")
                 throw new InvalidOperationException("MANUAL_REVIEW WAL intent is missing or corrupted");
+            string originalId=lines[3].Substring("originalId=".Length);
+            string candidateId=lines[4].Substring("candidateId=".Length);
+            if (originalId.Length != 49 || candidateId.Length != 49
+                || originalId[16] != ':' || candidateId[16] != ':')
+                throw new InvalidOperationException("MANUAL_REVIEW invalid WAL file IDs");
+            ExpectedOriginalId=originalId;
+            ExpectedCandidateId=candidateId;
         }
         finally { Close(ref h); }
+    }
+    private static FileIdInfo ReadIdentity(IntPtr h)
+    {
+        FileIdInfo result;
+        if (!GetFileIdInformation(h, 18, out result, 24))
+            throw new InvalidOperationException("MANUAL_REVIEW cannot read pinned file ID: " + Marshal.GetLastWin32Error());
+        return result;
+    }
+    private static bool SameIdentity(FileIdInfo a, FileIdInfo b)
+    {
+        if (a.VolumeSerialNumber != b.VolumeSerialNumber || a.FileId == null || b.FileId == null
+            || a.FileId.Length != 16 || b.FileId.Length != 16) return false;
+        for (int i=0;i<16;i++) if (a.FileId[i] != b.FileId[i]) return false;
+        return true;
+    }
+    // A pinned handle could have been renamed by a third-party process after we
+    // opened it. Hashing the handle alone would approve the WRONG logical path.
+    // Check that the expected name, relative to the PINNED directory, still
+    // refers to this exact volume/file object. The re-open itself is no-follow.
+    // A new rename can occur after this check: this is a PoC guard, not a lock.
+    private static void RequireNamedIdentity(IntPtr pinnedParent, string name, IntPtr pinned)
+    {
+        IntPtr current = OpenChild(pinnedParent, name, false, false);
+        try
+        {
+            if (!SameIdentity(ReadIdentity(current), ReadIdentity(pinned)))
+                throw new InvalidOperationException("MANUAL_REVIEW file ID no longer matches logical name " + name);
+        }
+        finally { Close(ref current); }
     }
     private static void Prove(IntPtr file, byte[] expected, string name)
     {
         byte[] actual = ReadSmallPinned(file);
         if (!Equal(actual, expected))
             throw new InvalidOperationException("MANUAL_REVIEW unverified " + name + " actual=" + BitConverter.ToString(actual) + " expected=" + BitConverter.ToString(expected));
+        string expectedId = Equal(expected,OriginalBytes) ? ExpectedOriginalId : ExpectedCandidateId;
+        if (String.IsNullOrEmpty(expectedId) ||
+            !String.Equals(IdentityKey(file),expectedId,StringComparison.Ordinal))
+            throw new InvalidOperationException("MANUAL_REVIEW WAL file ID changed for " + name);
     }
     // FILE_RENAME_INFORMATION: BOOLEAN ReplaceIfExists at offset 0,
     // HANDLE RootDirectory at offset 8 (x64), ULONG FileNameLength at 16,
@@ -244,6 +341,7 @@ internal static class RenameProbe
                     if (!Invalid(residue)) throw new InvalidOperationException("MANUAL_REVIEW target and residue coexist");
                     // Never delete/replace candidate; first park it.
                     // Use the existing proven target FILE HANDLE.
+                    RequireNamedIdentity(parent,"original.md",target);
                     RenamePinned(target,parent,"replacement.residue");
                     Close(ref target);
                     if (stepwise) PauseAt("PARK");
@@ -252,6 +350,7 @@ internal static class RenameProbe
                 // the directory entry may have changed; native rename is pinned
                 // and destination no-replace, so outside links cannot redirect.
                 RequireAbsent(parent,"original.md");
+                RequireNamedIdentity(parent,"original.backup",backup);
                 RenamePinned(backup,parent,"original.md");
                 if (stepwise) PauseAt("RESTORE");
                 return;
@@ -281,9 +380,16 @@ internal static class RenameProbe
             // We recheck bytes through pinned handles immediately before each rename.
             // This PoC still does NOT guarantee no concurrent write between these calls.
             Prove(original,OriginalBytes,"original");
+            // Strict mode holds the name against foreign rename opens via
+            // Win32 share-access denial. A second name-open with DELETE rights
+            // itself conflicts with that strict share mode; D18's normal mode
+            // retains explicit FileId/name binding.
+            if (!StrictMutationLease) RequireNamedIdentity(parent,"original.md",original);
+            if (DemonstrateIdentityGap) PauseAt("IDENTITY-GAP");
             RenamePinned(original,parent,"original.backup");
             PauseAt("BACKUP");
             Prove(stage,CandidateBytes,"stage");
+            if (!StrictMutationLease) RequireNamedIdentity(parent,"candidate.stage",stage);
             RequireAbsent(parent,"original.md");
             RenamePinned(stage,parent,"original.md");
             PauseAt("PUBLISH");
@@ -305,7 +411,7 @@ internal static class RenameProbe
             || !Path.GetFileName(root).StartsWith("d17-native-root-",StringComparison.Ordinal)
             || !File.Exists(Path.Combine(root,".d17-poc-only"))) return 3;
         string mode=args[1];
-        if (mode != "commit" && mode != "rollback-auto" && mode != "rollback-steps") return 4;
+        if (mode != "capture" && mode != "commit" && mode != "commit-locked" && mode != "commit-locked-gap" && mode != "commit-gap" && mode != "rollback-auto" && mode != "rollback-steps") return 4;
         IntPtr trusted=IntPtr.Zero, dir=IntPtr.Zero;
         try
         {
@@ -314,9 +420,15 @@ internal static class RenameProbe
                 FILE_FLAG_BACKUP_SEMANTICS|FILE_FLAG_OPEN_REPARSE_POINT,IntPtr.Zero);
             if (Invalid(trusted)) throw new InvalidOperationException("cannot open pinned root: " + Marshal.GetLastWin32Error());
             CheckNotReparse(trusted);
-            ProveIntent(trusted);
+            if (mode != "capture") ProveIntent(trusted);
             dir=OpenChild(trusted,"notes",true,false);
-            if (mode=="commit") Commit(dir);
+            if (mode=="capture") {
+                CaptureFixtureIntent(dir);
+                return 0;
+            }
+            StrictMutationLease = mode=="commit-locked" || mode=="commit-locked-gap";
+            DemonstrateIdentityGap = mode=="commit-gap" || mode=="commit-locked-gap";
+            if (mode=="commit" || mode=="commit-locked" || mode=="commit-gap" || mode=="commit-locked-gap") Commit(dir);
             else Rollback(dir,mode=="rollback-steps");
             Console.Out.WriteLine("COMPLETE"); Console.Out.Flush();
             return 0;

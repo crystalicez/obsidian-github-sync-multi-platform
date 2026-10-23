@@ -32,7 +32,7 @@ let passes=[]
 async function exists(name){try{await access(name);return true}catch(e){if(e.code==="ENOENT")return false;throw e}}
 async function equalsFile(name,data){assert.deepEqual(await readFile(name),data,"different content at "+path.basename(name))}
 async function absent(name){assert.equal(await exists(name),false,"unexpected file "+path.basename(name))}
-function native(root,mode,{cut,changeAtReady,changeAtBackup}={}) {
+function native(root,mode,{cut,changeAtReady,changeAtBackup,changeAtIdentityGap}={}) {
   const child=spawn(exe,[root,mode],{stdio:["pipe","pipe","pipe"],windowsHide:true})
   let stderr="",lines=[]
   let chain=Promise.resolve(),settled=false
@@ -50,6 +50,7 @@ function native(root,mode,{cut,changeAtReady,changeAtBackup}={}) {
       if(settled)return
       if(line==="READY"&&changeAtReady)await changeAtReady()
       if(line==="CUT:BACKUP"&&changeAtBackup)await changeAtBackup()
+      if(line==="CUT:IDENTITY-GAP"&&changeAtIdentityGap)await changeAtIdentityGap()
       if(line==="CUT:"+cut){settled=true;child.kill();return}
       if(line==="READY"||line.startsWith("CUT:"))child.stdin.write("GO\n")
     }).catch(err=>{settled=true;stderr+=" CONTROLLER:"+err.message;child.kill()})
@@ -59,6 +60,9 @@ function native(root,mode,{cut,changeAtReady,changeAtBackup}={}) {
 async function scenario(label,work){
   const root=await mkdtemp(path.join(tmp,"d17-native-root-"))
   const outside=await mkdtemp(path.join(tmp,"d17-native-outside-"))
+  // Protect ALL setup operations, including native capture and WAL fsync.
+  // An assertion during setup must not leave disposable paths behind.
+  try {
   const notes=path.join(root,"notes")
   await mkdir(notes)
   await writeFile(path.join(root,".d17-poc-only"),"D17 disposable only\n")
@@ -66,17 +70,24 @@ async function scenario(label,work){
   await writeFile(path.join(notes,"candidate.stage"),candidate)
   const external=path.join(outside,"sentinel.md")
   await writeFile(external,outsideBytes)
+  // A native read-only process captures OS file IDs of the ORIGINAL source
+  // objects before any mutation. They are persisted in test-only WAL intent.
+  // Do not infer file IDs from path strings or hashes alone.
+  const capture=await native(root,"capture")
+  assert.equal(capture.code,0,"native capture failed: "+capture.stderr)
+  const intentLine=capture.lines.find(s=>s.startsWith("INTENT:"))
+  assert.ok(intentLine,"native helper omitted identity capture")
+  const intent=Buffer.from(intentLine.slice("INTENT:".length),"base64")
+  assert.match(intent.toString(),/^D18-WAL-INTENT-V2\noriginal=/)
   // Real fsync of the test-only intent file before any mutation, not a
   // simulation of an entire WAL/dir fsync protocol or physical power loss.
   const intentPath=path.join(root,".wal-intent-d17")
-  const intent="D17-WAL-INTENT-V1\noriginal="+sha(original)+"\ncandidate="+sha(candidate)+"\n"
   const intentFd=fs.openSync(intentPath,"wx")
   try { fs.writeSync(intentFd,intent);fs.fsyncSync(intentFd) }
   finally { fs.closeSync(intentFd) }
   const x={root,outside,notes,external,intentPath,target:path.join(notes,"original.md"),
     stage:path.join(notes,"candidate.stage"),backup:path.join(notes,"original.backup"),
     residue:path.join(notes,"replacement.residue")}
-  try{
     const details=await work(x)
     await equalsFile(external,outsideBytes)
     passes.push({case:label,status:"PASS",...details})
@@ -99,6 +110,61 @@ try {
       await equalsFile(p.target,original)
       await equalsFile(p.stage,candidate)
       return {rootConfinement:true}
+    })
+    await scenario("D18-locked-source-rename-write-blocked",async p=>{
+      const refused=[]
+      const r=await native(p.root,"commit-locked",{changeAtReady:()=>{
+        try { fs.renameSync(p.target,path.join(p.notes,"user-moved.md")) }
+        catch(e) { if (!["EPERM","EACCES","EBUSY"].includes(e.code)) throw e; refused.push("rename:"+e.code) }
+        try { fs.writeFileSync(p.stage,unknown) }
+        catch(e) { if (!["EPERM","EACCES","EBUSY"].includes(e.code)) throw e; refused.push("stage-write:"+e.code) }
+      }})
+      assert.equal(refused.length,2,"strict handle must prohibit foreign rename and content write while open")
+      requireNativeOk(r)
+      await equalsFile(p.target,candidate)
+      await equalsFile(p.backup,original)
+      return {blocked:refused}
+    })
+    await scenario("D18-locked-strict-after-proof-gap-blocks-mutation",async p=>{
+      const refused=[]
+      const r=await native(p.root,"commit-locked-gap",{changeAtIdentityGap:()=>{
+        try { fs.renameSync(p.target,path.join(p.notes,"user-moved-too-late.md")) }
+        catch(e) { if (!["EPERM","EACCES","EBUSY"].includes(e.code)) throw e; refused.push("rename:"+e.code) }
+        try { fs.writeFileSync(p.target,unknown) }
+        catch(e) { if (!["EPERM","EACCES","EBUSY"].includes(e.code)) throw e; refused.push("write:"+e.code) }
+      }})
+      assert.ok(r.lines.includes("CUT:IDENTITY-GAP"))
+      assert.equal(refused.length,2,"strict mode must refuse a write and rename even after proof")
+      requireNativeOk(r)
+      await equalsFile(p.backup,original)
+      await equalsFile(p.target,candidate)
+      return {testBarrier:"after-original-proof",blocked:refused}
+    })
+    await scenario("D18-locked-open-writer-refuses-to-start",async p=>{
+      const openEditor=fs.openSync(p.target,"r+")
+      try {
+        const r=await native(p.root,"commit-locked")
+        requireNativeFail(r)
+        assert.match(r.stderr,/share|STATUS|0xC0000043|native relative open rejected/i)
+        await equalsFile(p.target,original)
+        await equalsFile(p.stage,candidate)
+        await absent(p.backup)
+      } finally {fs.closeSync(openEditor)}
+      return {safeRefusalWhenEditorHasWritableHandle:true}
+    })
+    await scenario("D18-stage-identity-changed-after-backup-refused",async p=>{
+      const parked=path.join(p.notes,"parked-stage.md")
+      const r=await native(p.root,"commit",{changeAtBackup:async()=>{
+        fs.renameSync(p.stage,parked)
+        await writeFile(p.stage,candidate)
+      }})
+      requireNativeFail(r)
+      assert.match(r.stderr,/file ID|MANUAL_REVIEW/i)
+      await equalsFile(p.backup,original)
+      await equalsFile(p.stage,candidate)
+      await equalsFile(parked,candidate)
+      await absent(p.target)
+      return {stageIdentityRefused:true}
     })
     await scenario("commit-retains-proof-backup",async p=>{
       const r=await native(p.root,"commit");requireNativeOk(r)
@@ -232,18 +298,76 @@ try {
       await equalsFile(p.backup,original)
       return {manualReview:true}
     })
-    await scenario("pinned-source-renamed-then-symlinked",async p=>{
-      const parked=path.join(p.notes,"parked-third-party.md")
-      const r=await native(p.root,"commit",{cut:"BACKUP",changeAtReady:()=>{
+    await scenario("D18-preopen-identical-original-id-swap-refused-by-wal",async p=>{
+      const moved=path.join(p.notes,"original-before-open-parked.md")
+      fs.renameSync(p.target,moved)
+      await writeFile(p.target,original)
+      const r=await native(p.root,"commit")
+      requireNativeFail(r)
+      assert.match(r.stderr,/WAL file ID changed|MANUAL_REVIEW/)
+      await equalsFile(moved,original)
+      await equalsFile(p.target,original)
+      await equalsFile(p.stage,candidate)
+      await absent(p.backup)
+      return {walBoundOriginalId:true}
+    })
+    await scenario("D18-preopen-identical-stage-id-swap-refused-by-wal",async p=>{
+      const moved=path.join(p.notes,"candidate-before-open-parked.md")
+      fs.renameSync(p.stage,moved)
+      await writeFile(p.stage,candidate)
+      const r=await native(p.root,"commit")
+      requireNativeFail(r)
+      assert.match(r.stderr,/WAL file ID changed|MANUAL_REVIEW/)
+      await equalsFile(moved,candidate)
+      await equalsFile(p.target,original)
+      await equalsFile(p.stage,candidate)
+      await absent(p.backup)
+      return {walBoundCandidateId:true}
+    })
+    // The permissive FileId/name check remains non-atomic. Demonstrate the
+    // exact gap with a deliberately extended protocol pause AFTER identity
+    // comparison, BEFORE NtSetInformationFile. This PASS is a finding of an
+    // unresolved danger, not evidence of safety. No outside file is touched.
+    await scenario("D18-demonstrated-nonatomic-identity-check-gap",async p=>{
+      const parked=path.join(p.notes,"third-party-user-renamed.md")
+      const r=await native(p.root,"commit-gap",{cut:"BACKUP",changeAtIdentityGap:()=>{
         fs.renameSync(p.target,parked)
         fs.symlinkSync(p.external,p.target,"file")
       }})
+      assert.ok(r.lines.includes("CUT:IDENTITY-GAP"))
       assert.ok(r.lines.includes("CUT:BACKUP"))
-      await equalsFile(p.backup,original);await equalsFile(p.stage,candidate)
-      const recover=await native(p.root,"rollback-auto")
-      requireNativeFail(recover)
+      assert.equal(r.code!==0,true,"test deliberately kills after backup syscall")
       await equalsFile(p.backup,original)
-      return {pinnedSourceStayedLocal:true,reviewRequired:true}
+      await absent(parked)
+      await equalsFile(p.stage,candidate)
+      return {residualFileIdCheckToRenameRaceObserved:true,NOT_SAFE_FOR_RELEASE:true}
+    })
+    await scenario("D18-source-renamed-then-symlinked-must-refuse",async p=>{
+      const parked=path.join(p.notes,"parked-third-party.md")
+      const r=await native(p.root,"commit",{changeAtReady:()=>{
+        fs.renameSync(p.target,parked)
+        fs.symlinkSync(p.external,p.target,"file")
+      }})
+      requireNativeFail(r)
+      assert.match(r.stderr,/MANUAL_REVIEW|reparse|identity/i)
+      await equalsFile(parked,original)
+      await equalsFile(p.stage,candidate)
+      await absent(p.backup)
+      return {renamedUserFilePreserved:true,manualReview:true}
+    })
+    await scenario("D18-same-content-new-file-id-must-refuse",async p=>{
+      const parked=path.join(p.notes,"parked-third-party.md")
+      const r=await native(p.root,"commit",{changeAtReady:async()=>{
+        fs.renameSync(p.target,parked)
+        await writeFile(p.target,original)
+      }})
+      requireNativeFail(r)
+      assert.match(r.stderr,/MANUAL_REVIEW|identity/i)
+      await equalsFile(parked,original)
+      await equalsFile(p.target,original)
+      await equalsFile(p.stage,candidate)
+      await absent(p.backup)
+      return {fileIdSwapRefused:true}
     })
     await scenario("edited-original-before-final-proof-rejected",async p=>{
       const r=await native(p.root,"commit",{changeAtReady:async()=>{await writeFile(p.target,unknown)}})
@@ -252,8 +376,9 @@ try {
       return {manualReview:true}
     })
   }
-  console.log(JSON.stringify({status:"PASS",scope:"D17 ISOLATED POC ONLY",iterations:repeat,
-    total:passes.length,byCase:Object.fromEntries([...new Set(passes.map(x=>x.case))].map(x=>[x,passes.filter(p=>p.case===x).length])),
+  const knownUnsafe=passes.filter(p=>p.NOT_SAFE_FOR_RELEASE)
+  console.log(JSON.stringify({status:"POC_COMPLETE_WITH_PROVEN_RESIDUAL_RACE",scope:"D17/D18 RESEARCH ONLY, NOT PRODUCTION-SAFE",iterations:repeat,
+    total:passes.length,protectiveEvidence:passes.length-knownUnsafe.length,demonstratedKnownUnsafe:knownUnsafe.length,byCase:Object.fromEntries([...new Set(passes.map(x=>x.case))].map(x=>[x,passes.filter(p=>p.case===x).length])),
     examples:passes.slice(0,4),trackedBinary:false,releaseIntegration:false}))
 }catch(e){
   console.error(JSON.stringify({status:"FAIL",reason:e.message,stack:e.stack?.slice(0,1800),
