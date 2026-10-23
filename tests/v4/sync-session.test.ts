@@ -2455,6 +2455,26 @@ test("v4 scan discards a changed hash snapshot and replans from fresh local meta
   assert.equal(indexRecordByPath(index, "note.md").mtime, 2);
 });
 
+
+test("D11 direct staged Pull finalizes verified backup before reporting mutation complete", async () => {
+  const events: string[] = [];
+  const github = new MemoryGitHub();
+  const vault = Object.assign(new MemoryVault(), {
+    async commitStage() { events.push("commit"); },
+    async finalizeStage() { events.push("finalize"); },
+  });
+  const index = createEmptyV4LocalIndex({repoId:"o/r#main",deviceId:"d11-direct",mode:"plaintext"});
+  const session = new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 });
+  await (session as unknown as {
+    applyPullBinding(binding: unknown, ownedStages: unknown[], localById: Map<string, unknown>, onCompleted: () => void): Promise<void>
+  }).applyPullBinding({
+    change: { kind:"modify", path:"fresh.md", fileId:"remote-f1" },
+    stage: { stageId:"dummy-stage", hash:"a".repeat(64), mtime:1, size:DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES+1 },
+    remoteCommitSha:"dummy-head",
+  }, [], new Map(), () => events.push("completed"));
+  assert.deepEqual(events, ["commit","finalize","completed"]);
+});
+
 test("v4 medium single-object push uses bounded source instead of whole-buffer vault read", async () => {
   const github = new MemoryGitHub();
   const vault = new MemoryVault();

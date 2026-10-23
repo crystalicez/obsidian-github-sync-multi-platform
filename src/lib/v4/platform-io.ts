@@ -308,8 +308,20 @@ export function createV4PlatformIo(options: V4PlatformIoOptions): V4PlatformIo {
       const target = full(targetPath)
       const backup = full(stagePath) + ".target-backup"
       if (!(await statOrNull(backup))) {
-        if (await statOrNull(full(stagePath) + ".replacement-residue")) {
-          throw new V4ManualRecoveryRequiredError(targetPath, "rollback residue exists without its original backup")
+        const residue = full(stagePath) + ".replacement-residue"
+        if (await statOrNull(residue)) {
+          // Crash after backup->target restored the original, but before
+          // removing the parked replacement. Proof-check *both* files;
+          // preserve them for manual review if anything differs.
+          if (!(await confirmBackup(target, commitOptions.expectedTarget))
+            || await hashFile(residue, commitOptions.expectedStageSize) !== commitOptions.expectedStageSha256) {
+            throw new V4ManualRecoveryRequiredError(targetPath, "rollback residue exists without a provably restored original")
+          }
+          commitOptions.assertNoOpenEditor?.()
+          if (!(await confirmBackup(target, commitOptions.expectedTarget))) {
+            throw new V4ManualRecoveryRequiredError(targetPath, "restored original changed during residue cleanup")
+          }
+          await fs.rm(residue)
         }
         return
       }
@@ -408,8 +420,8 @@ export function createV4PlatformIo(options: V4PlatformIoOptions): V4PlatformIo {
         if (options.desktopRootPath) await assertRecoveryPaths(stagePath, targetPath)
         commitOptions.assertNoOpenEditor?.()
         if (targetBefore) { fsSync.renameSync(target, backup); backedUp = true }
-        // The first rename awaited disk IO, so recheck before the actual
-        // replacement; if a user opened the note, restore its original backup.
+        // Recheck without yielding between the two synchronous renames.
+        // If the guard vetoes, restore the verified original backup.
         commitOptions.assertNoOpenEditor?.()
         fsSync.renameSync(stage, target); stageMoved = true
         const after = await fs.stat(target)
@@ -417,7 +429,8 @@ export function createV4PlatformIo(options: V4PlatformIoOptions): V4PlatformIo {
         const hash = createV4IncrementalSha256()
         for await (const chunk of desktopBoundedSource(target, commitOptions.expectedStageSize).chunks(4 * 1024 * 1024)) hash.update(chunk)
         if (hash.digestHex() !== commitOptions.expectedStageSha256) throw new Error(`V4 committed target hash mismatch: ${targetPath}`)
-        if (backedUp) await fs.rm(backup, { force: true })
+        // Retain the original until the caller saves a durable WAL receipt.
+        // finalizeStage re-verifies it and cleans it only after that receipt.
       } catch (error) {
         if (stageMoved) {
           // A caller/user may have changed the newly moved target while the

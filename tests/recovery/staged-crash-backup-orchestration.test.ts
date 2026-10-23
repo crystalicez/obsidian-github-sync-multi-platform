@@ -134,6 +134,12 @@ test("D9 fail-first: Desktop replacement contains no async rename gap after the 
   assert.equal(asyncRenameCalls, 0, "rename pair must not yield to renderer between editor guard and replacement")
   assert.equal(lateOpens, 0, "no window for an editor to open during async rename")
   assert.deepEqual(new Uint8Array(await readFile(f.targetPath)), remote)
+  assert.equal(await exists(f.backupPath), true, "Unreceipted commit must retain original backup")
+  await f.platform.finalizeStage("stage.bin", "note.md", {
+    expectedTarget: precondition,
+    expectedStageSize: remote.length,
+    expectedStageSha256: await sha256Hex(remote),
+  })
   assert.equal(await exists(f.backupPath), false)
 }))
 
@@ -164,6 +170,84 @@ test("D8: editor opens during the awaited backup rename; original and stage rema
   assert.deepEqual(new Uint8Array(await readFile(f.targetPath)), original)
   assert.deepEqual(new Uint8Array(await readFile(f.stagePath)), remote)
   assert.equal(await exists(f.backupPath), false)
+}))
+
+
+
+test("D11 fail-first: a returned staged commit keeps original backup until durable WAL receipt", async () => fixture(async f => {
+  await writeFile(f.targetPath, original)
+  await utimes(f.targetPath, new Date(10), new Date(10))
+  await writeFile(f.stagePath, remote)
+  await f.platform.commitStage("stage.bin", "note.md", {
+    expectedTarget: f.precondition,
+    expectedStageSize: f.stage.size, expectedStageSha256: f.stage.hash,
+  })
+  // Simulate journal receipt write failure after stage returned.
+  // The pending WAL must still be able to abort and restore original bytes.
+  assert.equal(await exists(f.backupPath), true, "Original backup must remain until receipt is saved")
+  await discardV4RecoveryStages(f.snapshot, f.io)
+  assert.deepEqual(new Uint8Array(await readFile(f.targetPath)), original)
+  assert.equal(await exists(f.backupPath), false)
+  assert.equal(await exists(f.stagePath), false)
+}))
+
+test("D11: proof-gated rollback residue cleanup succeeds only when the original target is intact", async () => fixture(async f => {
+  await writeFile(f.targetPath, original)
+  await utimes(f.targetPath, new Date(10), new Date(10))
+  await writeFile(f.stagePath + ".replacement-residue", remote)
+  await f.platform.rollbackStage("stage.bin", "note.md", {
+    expectedTarget: f.precondition,
+    expectedStageSize: f.stage.size, expectedStageSha256: f.stage.hash,
+  })
+  assert.deepEqual(new Uint8Array(await readFile(f.targetPath)), original)
+  assert.equal(await exists(f.stagePath + ".replacement-residue"), false)
+}))
+
+test("D11: no backup, changed target preserves rollback residue for manual review", async () => fixture(async f => {
+  await writeFile(f.targetPath, changed)
+  await writeFile(f.stagePath + ".replacement-residue", remote)
+  await assert.rejects(() => f.platform.rollbackStage("stage.bin", "note.md", {
+    expectedTarget: f.precondition, expectedStageSize: f.stage.size, expectedStageSha256: f.stage.hash,
+  }), /manual|review|residue/i)
+  assert.deepEqual(new Uint8Array(await readFile(f.targetPath)), changed)
+  assert.deepEqual(new Uint8Array(await readFile(f.stagePath + ".replacement-residue")), remote)
+}))
+
+test("D11: no backup, changed residue preserves both files for manual review", async () => fixture(async f => {
+  await writeFile(f.targetPath, original)
+  await utimes(f.targetPath, new Date(10), new Date(10))
+  await writeFile(f.stagePath + ".replacement-residue", changed)
+  await assert.rejects(() => f.platform.rollbackStage("stage.bin", "note.md", {
+    expectedTarget: f.precondition, expectedStageSize: f.stage.size, expectedStageSha256: f.stage.hash,
+  }), /manual|review|residue/i)
+  assert.deepEqual(new Uint8Array(await readFile(f.targetPath)), original)
+  assert.deepEqual(new Uint8Array(await readFile(f.stagePath + ".replacement-residue")), changed)
+}))
+
+test("D11: same-size/same-mtime user edit is not mistaken for a proven restored original", async () => fixture(async f => {
+  const tampered = new Uint8Array(original)
+  tampered[0] = 99
+  await writeFile(f.targetPath, tampered)
+  await utimes(f.targetPath, new Date(10), new Date(10))
+  await writeFile(f.stagePath + ".replacement-residue", remote)
+  await assert.rejects(() => f.platform.rollbackStage("stage.bin", "note.md", {
+    expectedTarget: f.precondition, expectedStageSize: f.stage.size, expectedStageSha256: f.stage.hash,
+  }), /manual|review|residue/i)
+  assert.deepEqual(new Uint8Array(await readFile(f.targetPath)), tampered)
+  assert.deepEqual(new Uint8Array(await readFile(f.stagePath + ".replacement-residue")), remote)
+}))
+
+test("D11: same-size modified stage residue is retained when candidate hash differs", async () => fixture(async f => {
+  const tampered = new Uint8Array(remote)
+  tampered[0] ^= 0xff
+  await writeFile(f.targetPath, original)
+  await utimes(f.targetPath, new Date(10), new Date(10))
+  await writeFile(f.stagePath + ".replacement-residue", tampered)
+  await assert.rejects(() => f.platform.rollbackStage("stage.bin", "note.md", {
+    expectedTarget: f.precondition, expectedStageSize: f.stage.size, expectedStageSha256: f.stage.hash,
+  }), /manual|review|residue/i)
+  assert.deepEqual(new Uint8Array(await readFile(f.targetPath)), original)
+  assert.deepEqual(new Uint8Array(await readFile(f.stagePath + ".replacement-residue")), tampered)
 }))
 
 test("D2 WAL: aborted recovery restores backup-only crash before deleting staged evidence", async () => fixture(async f => {

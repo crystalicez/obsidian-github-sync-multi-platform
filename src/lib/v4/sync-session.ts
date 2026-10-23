@@ -1435,6 +1435,12 @@ export class V4SyncSession {
           this.pullPrecondition(change, localById, change.previousPath))
         await trashV4LocalUserFile(this.localIo, change.previousPath)
       }
+      // In this no-WAL fallback, do not report completion before verified
+      // cleanup. Desktop commitStage retains the original until finalizeStage
+      // has checked the replacement and backup SHA-256 hashes.
+      await this.localIo.finalizeStage?.({
+        stage: binding.stage, path: change.path, precondition: targetPrecondition,
+      })
       onCompleted()
       return
     }
