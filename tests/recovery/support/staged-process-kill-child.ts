@@ -82,7 +82,7 @@ if (mode === "prepare" || mode === "prepare-rollback") {
   // The commit completed but caller has NOT yet persisted its WAL receipt.
   await platform.commitStage(stagePath, targetPath, options)
   process.exit(93)
-} else if (mode === "crash" || mode === "rollback-crash" || mode === "postcommit-crash") {
+} else if (mode === "crash" || mode === "rollback-crash") {
   const realRename = nodeFs.renameSync
   let count = 0
   nodeFs.renameSync = ((from: string, to: string) => {
@@ -94,17 +94,8 @@ if (mode === "prepare" || mode === "prepare-rollback") {
       process.exit(90 + count)
     }
   }) as typeof nodeFs.renameSync
-  if (mode === "after-commit-crash") {
-    // Commit has finished hash verification, but no durable WAL receipt exists.
-    // The original must still be available for a later abort/recovery decision.
-    nodeFs.renameSync = realRename
-    await platform.commitStage(stagePath, targetPath, options)
-    process.exit(93)
-  } else if (mode === "crash") {
-    await platform.commitStage(stagePath, targetPath, options)
-  } else {
-    await platform.rollbackStage(stagePath, targetPath, options)
-  }
+  if (mode === "crash") await platform.commitStage(stagePath, targetPath, options)
+  else await platform.rollbackStage(stagePath, targetPath, options)
   throw new Error("Fault injection did not terminate the child")
 } else {
   const snapshot = await store.load()
