@@ -37,8 +37,12 @@ export function resolveV4RateLimitDelay(
   const value = error as { status?: number; headers?: Record<string, string> } | null
   if (value?.status !== 403 && value?.status !== 429) return null
   const headers = Object.fromEntries(Object.entries(value.headers ?? {}).map(([key, header]) => [key.toLowerCase(), header]))
-  const retryAfter = Number(headers["retry-after"])
+  const retryAfterText = headers["retry-after"]?.trim()
+  const retryAfter = retryAfterText ? Number(retryAfterText) : NaN
   if (Number.isFinite(retryAfter) && retryAfter >= 0) return retryAfter * 1_000
+  // Retry-After also accepts an HTTP-date, not only a number of seconds.
+  const retryAfterDate = retryAfterText && /[a-z]/iu.test(retryAfterText) ? Date.parse(retryAfterText) : NaN
+  if (Number.isFinite(retryAfterDate)) return Math.max(0, retryAfterDate - nowMs)
   const reset = Number(headers["x-ratelimit-reset"])
   if (Number.isFinite(reset) && reset > 0) return Math.max(0, reset * 1_000 - nowMs)
   const fallback = policy.secondaryLimitFallbackMs * 2 ** Math.max(0, attempt - 1)

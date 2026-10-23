@@ -4,6 +4,14 @@
 >
 > **Mandatory workflow rule:** Every AI session that makes a material change to code, tests, design decisions, branch/PR state, verification status, or next steps MUST update this file before ending or handing work off. GitHub is the source of truth.
 
+## 2026-10-23 Stage D27 — HTTP Retry-After date and long-timer safety (Node.js)
+
+- **Isolated source:** Base is audited/pushed D26 `4f39c054b38614760fcb016ec0676bd7eae7b301`. Worktree `.worktrees/d27-retry-after-http-date`, distinct `audit/2026-10-23-d27-retry-after-date` branch. Existing Zed root, concurrent D25/D26 worktrees, user vault and secrets untouched.
+- **RED (real deterministic defects):** `resolveV4RateLimitDelay` treated standard HTTP-date `Retry-After` as unparseable and substituted the shorter 60,000ms policy fallback rather than the actual 120,000ms server deadline (focused regression failed, `60000 !== 120000`). Separately, `V4RequestScheduler` forwarded deadlines longer than signed 32-bit timer range to Node/Electron `setTimeout`; a second fail-first test rejected the unsafe >2,147,483,647ms delay.
+- **Fix:** Honor the existing numeric-second `Retry-After` form; also parse dated values with `Date.parse`, preserving exact non-negative remaining time. Empty/invalid headers fall through to existing reset/fallback handling. Split long policy waits into at most 2,147,483,647ms chunks and re-check the original cooldown/pacing deadline after each chunk. No changes to GitHub mutation spacing/concurrency/retry count, protocol, WAL, conflict handling, key material or UI.
+- **GREEN evidence:** Focused **8/8** after both RED cases; `pnpm build` PASS; `pnpm test:fast` **513/513** PASS; `pnpm test:repeat` **10×513/513** PASS; recovery **79/79**, resource **11/11**, feasibility **132/132**, virtual bounded **100,000,000-byte soak 1/1**, three GitHub E2E bundle compile, metadata and package checks all PASS. These are local tests; no live GitHub roundtrip or real Obsidian acceptance is claimed for D27.
+- **Safety and remaining qualification:** GitHub Issue #9 native filesystem TOCTOU research stays open and **DEFERRED**; Node.js and Obsidian API remain primary. No GitHub Actions, `master`, release, native binary, user vault, or physical test file over 100 MB. Latest-code actual Obsidian GUI acceptance, physical mobile/macOS/Linux, C2 cross-device format coordination and independent release/security review remain separate gates.
+
 ## 2026-10-23 Stage D26 — staging safe-integer footprint validation (Node.js only)
 
 - **Source and isolation:** Detached clean D24 base `f261b3e99c358663bbcf23298b098ac706e8a021` in `.worktrees/d26-staging-integer-f261b3e`, dedicated branch `audit/2026-10-23-d26-staging-integer-bounds`. Primary Zed checkout, concurrent D25 real-Obsidian worktrees, user vault and secrets were not modified.

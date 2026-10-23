@@ -154,7 +154,8 @@ export class V4RequestScheduler {
       const sleepId = ++this.nextPolicySleepId
       this.policySleepDeadlines.set(sleepId, deadline)
       try {
-        await sleepV4Abortable(milliseconds, signal, this.sleep)
+        // Node/Electron clamps longer timers; re-evaluate the deadline after each chunk.
+        await sleepV4Abortable(Math.min(milliseconds, 2_147_483_647), signal, this.sleep)
         this.maxPolicySleepOvershootMs = Math.max(this.maxPolicySleepOvershootMs, this.now() - deadline)
       } finally {
         this.policySleepDeadlines.delete(sleepId)

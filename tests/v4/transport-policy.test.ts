@@ -22,6 +22,49 @@ test("rate-limit delay honors retry-after reset and the documented one-minute fa
   assert.equal(resolveV4RateLimitDelay({ status: 500 }, 1, 10_000), null)
 })
 
+test("HTTP-date Retry-After sets the server deadline instead of the shorter fallback", async () => {
+  const now = Date.parse("Wed, 21 Oct 2037 07:26:00 GMT")
+  const header = "Wed, 21 Oct 2037 07:28:00 GMT"
+  assert.equal(resolveV4RateLimitDelay({ status: 429, headers: { "Retry-After": header } }, 1, now), 120_000)
+  assert.equal(resolveV4RateLimitDelay({ status: 429, headers: { "Retry-After": "3" } }, 1, now), 3_000)
+  assert.equal(resolveV4RateLimitDelay({ status: 429, headers: { "Retry-After": " " } }, 1, now), 60_000)
+  assert.equal(resolveV4RateLimitDelay({ status: 429, headers: { "Retry-After": "invalid" } }, 1, now), 60_000)
+
+  let clock = now
+  const sleeps: number[] = []
+  const deadlines: number[] = []
+  const scheduler = new V4RequestScheduler({
+    maxAttempts: 1, mutationSpacingMs: 0,
+    now: () => clock,
+    sleep: async ms => { sleeps.push(ms); clock += ms },
+    onCooldown: deadline => { deadlines.push(deadline) },
+  })
+  await assert.rejects(scheduler.run("read", async () => {
+    throw Object.assign(new Error("limited"), { status: 429, headers: { "retry-after": header } })
+  }), /limited/)
+  assert.deepEqual(deadlines, [now + 120_000])
+  await scheduler.run("read", async () => { assert.equal(clock, now + 120_000) })
+  assert.deepEqual(sleeps, [120_000])
+})
+
+test("long server deadlines are slept in timer-safe chunks without shortening the cooldown", async () => {
+  const maxTimer = 2_147_483_647
+  let now = 1_000
+  const sleeps: number[] = []
+  const scheduler = new V4RequestScheduler({
+    mutationSpacingMs: 0,
+    now: () => now,
+    sleep: async ms => {
+      assert.ok(ms <= maxTimer, "sleep must not overflow the platform timer")
+      sleeps.push(ms)
+      now += ms
+    },
+  })
+  scheduler.restoreCooldown(now + maxTimer + 123)
+  await scheduler.run("read", async () => { assert.equal(now, 1_000 + maxTimer + 123) })
+  assert.deepEqual(sleeps, [maxTimer, 123])
+})
+
 test("E2 fail-first: a terminal HTTP 429 cools down later requests despite exhausting retry budget", async () => {
   let now = 1_000
   const sleeps: number[] = []
