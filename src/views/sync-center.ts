@@ -19,23 +19,23 @@ interface V4ViewRenderGeneration {
 }
 
 export class V4SyncCenterView extends ItemView {
-  private service?: V4HistoryService
+  private service: V4HistoryService | undefined
   private page = 1
-  private selected?: V4HistoryCommit
-  private objectUrl?: string
-  private progressCard?: HTMLElement
-  private progressLive?: HTMLElement
-  private progressContext?: HTMLElement
-  private progressDetails?: HTMLElement
-  private progressTimings?: HTMLElement
-  private progressDiagnostics?: HTMLElement
-  private progressLifecycle?: V4SyncProgressSnapshot["lifecycle"]
-  private progressLiveSignature?: string
-  private progressContextSignature?: string
-  private progressDetailsSignature?: string
-  private progressTimingsSignature?: string
-  private progressDiagnosticsSignature?: string
-  private unsubscribeProgress?: () => void
+  private selected: V4HistoryCommit | undefined
+  private objectUrl: string | undefined
+  private progressCard: HTMLElement | undefined
+  private progressLive: HTMLElement | undefined
+  private progressContext: HTMLElement | undefined
+  private progressDetails: HTMLElement | undefined
+  private progressTimings: HTMLElement | undefined
+  private progressDiagnostics: HTMLElement | undefined
+  private progressLifecycle: V4SyncProgressSnapshot["lifecycle"] | undefined
+  private progressLiveSignature: string | undefined
+  private progressContextSignature: string | undefined
+  private progressDetailsSignature: string | undefined
+  private progressTimingsSignature: string | undefined
+  private progressDiagnosticsSignature: string | undefined
+  private unsubscribeProgress: (() => void) | undefined
   private openGeneration = 0
   private renderGeneration = 0
   private isOpen = false
@@ -43,9 +43,9 @@ export class V4SyncCenterView extends ItemView {
   constructor(leaf: WorkspaceLeaf, private readonly plugin: FastSync) { super(leaf) }
   getViewType(): string { return V4_SYNC_CENTER_VIEW }
   getDisplayText(): string { return "GitHub Sync Center" }
-  getIcon(): string { return "git-compare-arrows" }
+  override getIcon(): string { return "git-compare-arrows" }
 
-  async onOpen(): Promise<void> {
+  override async onOpen(): Promise<void> {
     this.isOpen = true
     this.openGeneration++
     this.renderGeneration++
@@ -53,7 +53,7 @@ export class V4SyncCenterView extends ItemView {
     this.unsubscribeProgress = this.plugin.v4Runtime.subscribeProgress(snapshot => this.renderProgressCard(snapshot))
     await this.renderCommitMode()
   }
-  async onClose(): Promise<void> {
+  override async onClose(): Promise<void> {
     this.isOpen = false
     this.openGeneration++
     this.renderGeneration++

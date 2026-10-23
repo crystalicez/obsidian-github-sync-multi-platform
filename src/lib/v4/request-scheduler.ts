@@ -21,7 +21,7 @@ export interface V4RequestSchedulerSnapshot {
 }
 
 export interface V4RequestSchedulerOptions extends Partial<V4TransportPolicy> {
-  sleep?: (milliseconds: number) => Promise<void>
+  sleep?: ((milliseconds: number) => Promise<void>) | undefined
   now?: () => number
   retryRateLimits?: boolean
   onRetry?: (milliseconds: number) => void
@@ -33,7 +33,7 @@ interface QueueItem<T> {
   task: () => Promise<T>
   resolve: (value: T) => void
   reject: (error: unknown) => void
-  signal?: AbortSignal
+  signal?: AbortSignal | undefined
   onAbort?: () => void
 }
 

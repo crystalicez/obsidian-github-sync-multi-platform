@@ -11,7 +11,7 @@ export interface V4MutationRetryEvidence {
 
 export class V4GitMutationOutcomeUnknownError extends Error {
   readonly retryClass: V4MutationRetryClass
-  readonly cause: unknown
+  override readonly cause: unknown
 
   constructor(retryClass: V4MutationRetryClass, cause: unknown) {
     super(`V4 Git mutation has an unknown outcome (${retryClass}).`)

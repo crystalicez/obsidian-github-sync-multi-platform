@@ -18,7 +18,7 @@ export interface V4HistoryGithub {
 
 export interface V4HistoryCommit extends GitHubCommitSummary {
   source: "plugin" | "external"
-  journalId?: string
+  journalId?: string | undefined
 }
 
 export interface V4CommitPage { items: V4HistoryCommit[]; page: number; hasMore: boolean }

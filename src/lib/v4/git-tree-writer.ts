@@ -11,7 +11,7 @@ export interface V4GitTreeFile { path: string; bytes: Uint8Array; progressItems?
 export interface V4GitTreeWriteInput {
   message: string;
   files: V4GitTreeFile[];
-  deletions?: string[];
+  deletions?: string[] | undefined;
   expectedHeadSha?: string | null;
   onLogicalFileUploadStarted?: (item: V4GitTreeProgressItem) => void;
   onLogicalFileUploaded?: (item: V4GitTreeProgressItem) => void;
@@ -19,7 +19,7 @@ export interface V4GitTreeWriteInput {
   withBlobTransport?: (bytes: Uint8Array, task: () => Promise<string>) => Promise<string>;
 }
 export interface V4GitTreeWriteResult {
-  previousHeadSha?: string;
+  previousHeadSha?: string | undefined;
   baseTreeSha?: string;
   treeSha: string;
   commitSha: string;
@@ -39,7 +39,7 @@ export interface V4GitTreeGithub {
 
 export interface V4PublicationBase {
   ref: GitHubGitRef | null;
-  previousHeadSha?: string;
+  previousHeadSha?: string | undefined;
   baseTreeSha?: string;
 }
 
@@ -49,7 +49,7 @@ export interface V4UploadedTreeFiles {
 }
 
 export interface V4CandidateCommit {
-  previousHeadSha?: string;
+  previousHeadSha?: string | undefined;
   baseTreeSha?: string;
   treeSha: string;
   commitSha: string;
@@ -232,7 +232,7 @@ export async function createV4CandidateCommit(
     base: V4PublicationBase;
     message: string;
     entries: GitHubCreateTreeEntry[];
-    deletions?: string[];
+    deletions?: string[] | undefined;
   },
 ): Promise<V4CandidateCommit> {
   // Streamed and buffered uploads converge here; neither may provide two

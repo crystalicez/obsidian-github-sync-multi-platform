@@ -135,7 +135,7 @@ export function createV4RecoveryStore(options: {
   adapter: V4LocalIndexAdapter
   root: string
   repoId: string
-  payloadKey?: Uint8Array
+  payloadKey?: Uint8Array | undefined
 }): V4RecoveryStore {
   const root = options.root.replace(/\/+$/u, "")
   if (!root) throw new Error("V4 recovery root is required.")
@@ -278,7 +278,7 @@ export async function applyV4RecoveryLocalMutations(input: {
   io: V4LocalIo
   onApplying?: (mutation: V4RecoveryPayload["mutations"][number]) => void
   onApplied?: (mutation: V4RecoveryPayload["mutations"][number]) => void
-  signal?: AbortSignal
+  signal?: AbortSignal | undefined
 }): Promise<V4RecoveryLocalApplyResult> {
   let snapshot = input.snapshot
   const payload: V4RecoveryPayload = snapshot.payload
@@ -359,7 +359,7 @@ export async function recoverV4PendingState(input: {
   io: V4LocalIo
   currentRemoteHead: string | null
   publicationGithub?: V4PublishReconcilerGithub
-  signal?: AbortSignal
+  signal?: AbortSignal | undefined
 }): Promise<V4RecoveryLocalApplyResult> {
   throwIfV4Aborted(input.signal)
   let snapshot = input.snapshot

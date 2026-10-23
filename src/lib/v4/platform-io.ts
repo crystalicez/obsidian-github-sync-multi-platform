@@ -21,7 +21,7 @@ export interface V4StageCommitOptions {
 
 export class V4BoundedIoUnavailableError extends Error {
   readonly capability: V4BoundedIoCapability
-  readonly path?: string
+  readonly path?: string | undefined
 
   constructor(capability: V4BoundedIoCapability, path?: string) {
     super(`V4 ${capability} is unavailable${path ? ` for ${path}` : ""}.`)
@@ -65,9 +65,9 @@ export interface V4PlatformIo {
 export interface V4PlatformIoOptions {
   platform: V4PlatformKind
   adapter?: V4BinaryAdapterLike
-  resolveDesktopPath?: (path: string) => string
+  resolveDesktopPath?: ((path: string) => string) | undefined
   /** Required to prove that crash-recovery paths cannot escape the vault. */
-  desktopRootPath?: string
+  desktopRootPath?: string | undefined
 }
 
 function asArrayBuffer(bytes: Uint8Array): ArrayBuffer {

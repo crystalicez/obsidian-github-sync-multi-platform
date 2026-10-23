@@ -11,8 +11,8 @@ export interface V4PushBinding {
 
 export interface V4PullBinding {
   change: V4PlannedChange
-  remoteRecord?: V4IndexFileRecord
-  remoteCommitSha?: string
+  remoteRecord?: V4IndexFileRecord | undefined
+  remoteCommitSha?: string | undefined
   stage?: V4StageRef
 }
 
@@ -23,7 +23,7 @@ export interface V4StagedWriteBinding {
 
 export interface V4ResolvedBatch {
   runId: string
-  journalId?: string
+  journalId?: string | undefined
   pulls: V4PullBinding[]
   pushes: V4PushBinding[]
   stagedWrites: V4StagedWriteBinding[]

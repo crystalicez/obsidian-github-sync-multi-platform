@@ -118,7 +118,7 @@ export class SettingTab extends PluginSettingTab {
     }
   }
 
-  hide(): void {
+  override hide(): void {
     this.tempSettings = null
   }
 

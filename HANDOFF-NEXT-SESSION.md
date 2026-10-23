@@ -4,6 +4,15 @@
 >
 > **Mandatory workflow rule:** Every AI session that makes a material change to code, tests, design decisions, branch/PR state, verification status, or next steps MUST update this file before ending or handing work off. GitHub is the source of truth.
 
+## 2026-10-23 Stage D36 — staged Maximum Strict TypeScript migration (NOT YET COMPLETE)
+
+- Isolated audit worktree `.worktrees/d36-max-strict-typescript` from committed D35 SHA `4a01b93db59dc600511603c48b5adf479175610f`; did not modify D35's concurrent uncommitted changes, original Zed worktree, vault, master, release, or remote test repository.
+- Default `tsconfig.json` **now enables all built-in `strict` flags**, plus `noImplicitOverride`, `noPropertyAccessFromIndexSignature`, `noFallthroughCasesInSwitch`, `noImplicitReturns`, `noUnusedLocals`, `noUnusedParameters`, `noUncheckedSideEffectImports`, `forceConsistentCasingInFileNames`, `allowUnreachableCode:false` and `allowUnusedLabels:false`; `pnpm build` PASS.
+- Separate `tsconfig.maximum-strict.json` enables `noUncheckedIndexedAccess` and `exactOptionalPropertyTypes`; `pnpm typecheck:max-strict` is explicitly **RED: 174 existing errors after initial 270**. Maximum Strict is therefore **not fully adopted as the passing production config**. Migration must continue before these last two flags become mandatory in normal build, not silently disable checks or inject blanket `any`/assertions.
+- Type-safe source migration made lifecycle initialization explicit, added actual base-class `override` annotations, safely accessed unknown Git tree records with indexed keys, and aligned intentionally cleared optional state with `undefined`; no V4 conflict/data protocol/retry semantics change.
+- Local proof: `pnpm build`, Fast **528/528**, Repeat **10×528/528**, Recovery **79/79**, Resource **11/11**, Feasibility **133/133** before new focused config test **1/1**, bounded virtual 100MB Soak, GitHub E2E compile-only3, metadata/package PASS. The new feasibility regression prevents weakening active strict flags/profile. Details and 174-error breakdown in `docs/engineering/d36-max-strict-ts-migration-2026-10-23.md`.
+- Next: fix strict indexed SHA/bytes access (verify crypto known-answer and performance), then exact optional API shape at each boundary; promote both flags into active config **only after** zero diagnostics and full local/live qualification. No GitHub Actions, native helper Issue #9 or unauthorized release/merge.
+
 ## 2026-10-23 Stage D35 — measured Node.js transport/API/RSS Sync Center diagnostics (partial instrumentation)
 
 - **Independent source:** Dedicated `.worktrees/d35-measured-transport-progress` audit branch `audit/2026-10-23-d35-measured-transport-progress`, based on pushed D34 `b9d57b5e4a3c904520d9035ce211b416a6c168d9`. No changes to write/delete conflict semantics, V4 wire format, cryptography, WAL, encryption mode, GitHub publication CAS, original Zed worktree, actual vault, master/release or native OS helper.

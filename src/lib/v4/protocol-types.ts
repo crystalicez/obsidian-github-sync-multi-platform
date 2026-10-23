@@ -12,7 +12,7 @@ export interface V4RemoteConfig {
   formatVersion: typeof V4_FORMAT_VERSION;
   mode: V4StorageMode;
   repoId: string;
-  pathLayout?: V4PathLayout;
+  pathLayout?: V4PathLayout | undefined;
   algorithm?: "AES-GCM";
   kdf?: "PBKDF2-SHA-256";
   kdfParams?: { iterations: number; salt: string };
@@ -46,8 +46,8 @@ export interface V4FileRecord {
   remoteVersion: string;
   remotePath: string;
   storage: V4ObjectStorage;
-  partPaths?: string[];
-  packId?: string;
-  encryptedPath?: string;
+  partPaths?: string[] | undefined;
+  packId?: string | undefined;
+  encryptedPath?: string | undefined;
   deleted?: boolean;
 }

@@ -59,10 +59,10 @@ function sanitizeConsoleValue(
     const status = safeErrorScalar(candidate.status);
     const code = safeErrorScalar(candidate.code);
     const retryClass = safeErrorScalar(candidate.retryClass);
-    if (status !== undefined) sanitized.status = status;
-    if (code !== undefined) sanitized.code = code;
-    if (retryClass !== undefined) sanitized.retryClass = retryClass;
-    if (candidate.cause !== undefined) sanitized.cause = sanitizeConsoleValue(candidate.cause, "cause", seen, depth + 1);
+    if (status !== undefined) sanitized["status"] = status;
+    if (code !== undefined) sanitized["code"] = code;
+    if (retryClass !== undefined) sanitized["retryClass"] = retryClass;
+    if (candidate.cause !== undefined) sanitized["cause"] = sanitizeConsoleValue(candidate.cause, "cause", seen, depth + 1);
     return sanitized;
   }
   if (Array.isArray(value)) {

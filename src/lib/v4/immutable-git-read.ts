@@ -36,16 +36,16 @@ function unsupportedNode(path: string, node: { type: unknown; mode: unknown }): 
 }
 
 function validateNode(raw: Record<string, unknown>, path: string): ImmutableGitNode {
-  if (typeof raw.path !== "string") throw malformedTree(path, "tree entry path is not a string");
-  if (raw.type !== "blob" && raw.type !== "tree" && raw.type !== "commit") {
-    throw malformedTree(path, `tree entry ${JSON.stringify(raw.path)} has unsupported type`);
+  if (typeof raw["path"] !== "string") throw malformedTree(path, "tree entry path is not a string");
+  if (raw["type"] !== "blob" && raw["type"] !== "tree" && raw["type"] !== "commit") {
+    throw malformedTree(path, `tree entry ${JSON.stringify(raw["path"])} has unsupported type`);
   }
-  if (typeof raw.mode !== "string") throw malformedTree(path, `tree entry ${JSON.stringify(raw.path)} has invalid mode`);
-  if (typeof raw.sha !== "string" || !GIT_OBJECT_SHA.test(raw.sha)) {
-    throw malformedTree(path, `tree entry ${JSON.stringify(raw.path)} has invalid SHA`);
+  if (typeof raw["mode"] !== "string") throw malformedTree(path, `tree entry ${JSON.stringify(raw["path"])} has invalid mode`);
+  if (typeof raw["sha"] !== "string" || !GIT_OBJECT_SHA.test(raw["sha"])) {
+    throw malformedTree(path, `tree entry ${JSON.stringify(raw["path"])} has invalid SHA`);
   }
 
-  const node: ImmutableGitNode = { path: raw.path, type: raw.type, mode: raw.mode, sha: raw.sha };
+  const node: ImmutableGitNode = { path: raw["path"], type: raw["type"], mode: raw["mode"], sha: raw["sha"] };
   const supported = (node.type === "tree" && node.mode === "040000")
     || (node.type === "commit" && node.mode === "160000")
     || (node.type === "blob" && (node.mode === "100644" || node.mode === "100755" || node.mode === "120000"));
@@ -56,10 +56,10 @@ function validateNode(raw: Record<string, unknown>, path: string): ImmutableGitN
 function exactTreeEntry(treeResponse: unknown, segment: string, path: string): ImmutableGitNode | null {
   if (!treeResponse || typeof treeResponse !== "object") throw malformedTree(path, "tree response is not an object");
   const response = treeResponse as Record<string, unknown>;
-  if (!Array.isArray(response.tree)) throw malformedTree(path, "tree field is not an array");
+  if (!Array.isArray(response["tree"])) throw malformedTree(path, "tree field is not an array");
 
   let match: ImmutableGitNode | undefined;
-  for (const rawEntry of response.tree) {
+  for (const rawEntry of response["tree"]) {
     if (!rawEntry || typeof rawEntry !== "object") throw malformedTree(path, "tree entry is not an object");
     const entry = validateNode(rawEntry as Record<string, unknown>, path);
     if (entry.path !== segment) continue;
@@ -68,7 +68,7 @@ function exactTreeEntry(treeResponse: unknown, segment: string, path: string): I
   }
 
   if (match) return match;
-  if (response.truncated === false) return null;
+  if (response["truncated"] === false) return null;
   throw incompleteTree(path, segment);
 }
 

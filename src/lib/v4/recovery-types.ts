@@ -12,7 +12,7 @@ export interface V4RecoveryHeader {
   schemaVersion: 1
   generation: number
   runId: string
-  journalId?: string
+  journalId?: string | undefined
   phase: V4RecoveryPhase
   expectedRemoteHead: string | null
   candidateCommitSha?: string

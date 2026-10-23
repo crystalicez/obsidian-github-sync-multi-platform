@@ -3,7 +3,7 @@ import { createV4IncrementalSha256 } from "./incremental-hash"
 import type { V4FileRecord } from "./protocol-types"
 
 export class V4SourceChangedError extends Error {
-  readonly path?: string
+  readonly path?: string | undefined
   readonly replanRequired = true
 
   constructor(path?: string, detail = "source changed while it was being read") {
@@ -29,7 +29,7 @@ export interface V4PreparedObjectStream {
 export interface V4StableHashOptions {
   chunkBytes: number
   checkStable?: () => Promise<void>
-  signal?: AbortSignal
+  signal?: AbortSignal | undefined
 }
 
 function assertPositiveSafeInteger(value: number, label: string): void {
@@ -56,7 +56,7 @@ export async function hashV4StableContentSource(source: V4ContentSource, options
 export async function* streamV4SourceParts(
   source: V4ContentSource,
   partBytes: number,
-  signal?: AbortSignal,
+  signal?: AbortSignal | undefined,
 ): AsyncIterable<Uint8Array> {
   assertPositiveSafeInteger(partBytes, "partBytes")
   const iterator = source.chunks(partBytes, signal)[Symbol.asyncIterator]()

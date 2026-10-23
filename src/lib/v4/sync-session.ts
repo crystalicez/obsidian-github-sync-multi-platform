@@ -66,17 +66,17 @@ export interface V4SyncSessionInput {
   vault: V4SessionVault
   index: V4LocalIndex
   config: V4RemoteConfig
-  keyring?: V4Keyring
+  keyring?: V4Keyring | undefined
   conflictPolicy: V4ConflictPolicy
   abortChangePercent: number
   now?: () => number
   askConflict?: (input: { path: string; localMtime: number; remoteMtime: number }) => Promise<V4ConflictResolution>
   includePath?: (path: string) => boolean
   onProgress?: (patch: V4SyncProgressPatch) => void
-  runState?: V4SyncRunState
-  recoveryStore?: V4RecoveryStore
+  runState?: V4SyncRunState | undefined
+  recoveryStore?: V4RecoveryStore | undefined
   resourceLimits?: Partial<V4ResourceLimits>
-  signal?: AbortSignal
+  signal?: AbortSignal | undefined
 }
 
 export interface V4SyncRunState {
@@ -92,7 +92,7 @@ export interface V4SessionSyncResult {
   pushedFiles: number
   pulledFiles: number
   commitSha?: string
-  recoveryRunId?: string
+  recoveryRunId?: string | undefined
 }
 
 export class V4ChangeGuardError extends Error {
@@ -1137,7 +1137,7 @@ export class V4SyncSession {
   private bindPull(
     change: V4PlannedChange,
     records: ReadonlyMap<string, V4IndexFileRecord>,
-    remoteCommitSha?: string,
+    remoteCommitSha?: string | undefined,
   ): V4PullBinding {
     return { change, remoteRecord: change.kind === "delete" ? undefined : records.get(change.fileId), remoteCommitSha }
   }
@@ -1535,7 +1535,7 @@ export class V4SyncSession {
   private async readRemoteRecordObject(
     path: string,
     record: V4IndexFileRecord,
-    remoteCommitSha?: string,
+    remoteCommitSha?: string | undefined,
   ): Promise<Uint8Array> {
     // A pack is one immutable encrypted Git blob shared by many logical files.
     // Keep it in the EXISTING per-session byte budget, never across Sync runs,

@@ -22,7 +22,7 @@ export type V4SyncDirection = "pull" | "push";
 
 export interface V4DirectionalProgress {
   completed: number;
-  total?: number;
+  total?: number | undefined;
 }
 
 export interface V4PhaseTiming {
@@ -34,25 +34,25 @@ export interface V4PhaseTiming {
 export interface V4SyncProgressSnapshot {
   diagnostics?: import("./run-diagnostics").V4RunDiagnostics;
   lifecycle: V4SyncLifecycle;
-  phase?: V4SyncPhase;
-  currentPath?: string;
-  currentDirection?: V4SyncDirection;
+  phase?: V4SyncPhase | undefined;
+  currentPath?: string | undefined;
+  currentDirection?: V4SyncDirection | undefined;
   pull: V4DirectionalProgress;
   push: V4DirectionalProgress;
-  operation?: V4SyncOperation;
-  trigger?: V4SyncTrigger;
+  operation?: V4SyncOperation | undefined;
+  trigger?: V4SyncTrigger | undefined;
   attempt: number;
   timings: V4PhaseTiming[];
   totalElapsedMs: number;
   lastSyncTime: number;
-  errorMessage?: string;
-  failurePhase?: V4SyncPhase;
-  failurePath?: string;
+  errorMessage?: string | undefined;
+  failurePhase?: V4SyncPhase | undefined;
+  failurePath?: string | undefined;
 }
 
 export type V4SyncProgressPatch = Partial<Omit<V4SyncProgressSnapshot, "pull" | "push" | "timings" | "totalElapsedMs">> & {
   pull?: Partial<V4DirectionalProgress>;
-  push?: Partial<V4DirectionalProgress>;
+  push?: Partial<V4DirectionalProgress> | undefined;
 };
 
 export type V4BeginRunPatch = Omit<V4SyncProgressPatch, "lifecycle"> & { lifecycle?: never };

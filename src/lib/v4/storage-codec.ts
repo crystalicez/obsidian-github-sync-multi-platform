@@ -41,7 +41,7 @@ export interface V4PackSourceEntry {
   expectedSize?: number
   version: string
   mtime: number
-  checkSourceStable?: () => Promise<void>
+  checkSourceStable?: (() => Promise<void>) | undefined
 }
 
 function assertUniqueV4PackFileIds(ids: readonly string[]): void {
@@ -52,9 +52,9 @@ export class V4StorageCodec {
   constructor(private readonly options: {
     mode: V4StorageMode
     pathLayout: V4PathLayout
-    keyring?: V4Keyring
+    keyring?: V4Keyring | undefined
     resources?: Pick<V4ResourceController, "withCrypto"> & Partial<Pick<V4ResourceController, "reserveResidentBytes">>
-    signal?: AbortSignal
+    signal?: AbortSignal | undefined
   }) {
     if (options.mode === "encrypted" && !options.keyring) {
       throw new Error("Encrypted V4 storage requires a keyring.")
@@ -131,7 +131,7 @@ export class V4StorageCodec {
     mtime: number
     fileId: string
     partBytes: number
-    checkSourceStable?: () => Promise<void>
+    checkSourceStable?: (() => Promise<void>) | undefined
   }): Promise<V4PreparedObjectStream> {
     if (!Number.isSafeInteger(input.partBytes) || input.partBytes < 1) throw new TypeError("V4 part size must be a positive safe integer.")
     if (!/^[0-9a-f]{64}$/u.test(input.expectedHash)) throw new Error("V4 streamed source requires an expected SHA-256 hash.")
@@ -280,7 +280,7 @@ export class V4StorageCodec {
   async preparePackFromSources(
     packId: string,
     entries: readonly V4PackSourceEntry[],
-    signal?: AbortSignal,
+    signal?: AbortSignal | undefined,
   ): Promise<V4PreparedPack> {
     signal ??= this.options.signal
     if (this.options.mode !== "encrypted") throw new Error("V4 packs are available only in encrypted mode.")
@@ -424,7 +424,7 @@ export class V4StorageCodec {
     record: V4FileRecord
     reader: V4RemoteBytesReader
     sink: V4StagedSink
-    signal?: AbortSignal
+    signal?: AbortSignal | undefined
   }): Promise<{ plaintextSha256: string; size: number }> {
     const { record, reader, sink } = input
     const signal = input.signal ?? this.options.signal

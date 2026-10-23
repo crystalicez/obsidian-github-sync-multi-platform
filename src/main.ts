@@ -11,16 +11,17 @@ import { formatV4ActiveSyncStatus } from "./lib/v4/status";
 import { V4SyncCenterView, V4_SYNC_CENTER_VIEW } from "./views/sync-center";
 
 
+// Obsidian initializes these fields in onload(), not in the Plugin constructor.
 export default class FastSync extends Plugin {
-  settingTab: SettingTab
-  settings: PluginSettings
-  githubClient: GitHubClient
-  v4Runtime: V4PluginRuntime
+  settingTab!: SettingTab
+  settings!: PluginSettings
+  githubClient!: GitHubClient
+  v4Runtime!: V4PluginRuntime
 
   isSyncInProgress: boolean = false
   clipboardReadTip: string = ""
 
-  ribbonIcon: HTMLElement
+  ribbonIcon!: HTMLElement
   statusBarItem: HTMLElement | null = null
   saveNoticeTimeout: number | null = null
   isWatchEnabled: boolean = true
@@ -49,7 +50,7 @@ export default class FastSync extends Plugin {
   }
 
 
-  async onload() {
+  override async onload() {
     this.unloaded = false
     await this.loadSettings()
     if (this.secretsMigrated) await this.persistData()
@@ -170,7 +171,7 @@ export default class FastSync extends Plugin {
     } else this.githubClient = undefined as unknown as GitHubClient
   }
 
-  onunload() {
+  override onunload() {
     this.unloaded = true
     if (this.scheduledSyncTimer) window.clearInterval(this.scheduledSyncTimer);
     this.scheduledSyncTimer = null;

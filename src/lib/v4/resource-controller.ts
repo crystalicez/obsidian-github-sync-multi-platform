@@ -29,7 +29,7 @@ interface Waiter {
   weight: number
   resolve: () => void
   reject: (error: unknown) => void
-  signal?: AbortSignal
+  signal?: AbortSignal | undefined
   onAbort?: () => void
 }
 

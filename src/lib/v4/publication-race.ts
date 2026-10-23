@@ -23,7 +23,7 @@ export class V4PublicationRaceError extends Error {
   readonly observedHeadSha: string | null
   readonly publicationOutcome: V4PublicationOutcome
   readonly evidence: string | undefined
-  readonly cause: unknown
+  override readonly cause: unknown
 
   constructor(input: V4PublicationRaceErrorInput) {
     super(input.message ?? "Remote branch changed while syncing.")

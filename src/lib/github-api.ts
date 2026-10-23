@@ -36,9 +36,9 @@ export interface GitHubClientOptions {
   transportPolicy?: Partial<V4TransportPolicy>;
   transportMetrics?: V4TransportMetrics;
   transportResources?: Pick<V4ResourceController, "withTransportBytes">;
-  sleep?: (milliseconds: number) => Promise<void>;
+  sleep?: ((milliseconds: number) => Promise<void>) | undefined;
   now?: () => number;
-  cooldownStore?: V4RateLimitCooldownStore;
+  cooldownStore?: V4RateLimitCooldownStore | undefined;
 }
 
 export interface GitHubTreeNode {
@@ -85,7 +85,7 @@ export class GitHubClient {
   private operationSignal?: AbortSignal;
   private repositoryNodeIdPromise?: Promise<string>;
   private readonly cooldownScope?: Promise<string>;
-  private readonly cooldownStore?: V4RateLimitCooldownStore;
+  private readonly cooldownStore?: V4RateLimitCooldownStore | undefined;
 
   constructor(config: GitHubConfig, options: GitHubClientOptions = {}) {
     this.config = config;

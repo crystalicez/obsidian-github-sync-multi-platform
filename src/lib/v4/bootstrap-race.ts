@@ -3,7 +3,7 @@ export class V4RepositoryBootstrapRaceError extends Error {
 
   constructor(
     readonly observedRefSha: string,
-    readonly cause: unknown,
+    override readonly cause: unknown,
   ) {
     super("GitHub repository bootstrap state changed concurrently.")
     this.name = "V4RepositoryBootstrapRaceError"
