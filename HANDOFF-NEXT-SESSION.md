@@ -4,6 +4,13 @@
 >
 > **Mandatory workflow rule:** Every AI session that makes a material change to code, tests, design decisions, branch/PR state, verification status, or next steps MUST update this file before ending or handing work off. GitHub is the source of truth.
 
+## 2026-10-23 Stage D13 — approved Network Drive policy B, best-effort with warning
+
+- **User decision B:** Network Drives remain allowed with warnings. Do not disable staged writes by storage type or bypass any integrity/recovery/editor safety checks. Network filesystem crash atomicity and slow-drive UI responsiveness remain unqualified.
+- **UX:** Persistent Desktop Settings warning applies even to mapped/cloud-mounted vaults that cannot be detected reliably. Recognizable UNC roots show a one-time per-runtime Notice before the first sync's ordinary checks. Not seeing this Notice is **not** proof of a local drive; mapped drive letters and Unix mounts are not reliably identifiable from paths.
+- **Implementation/tests:** `src/lib/v4/network-storage.ts`, `src/lib/v4/runtime.ts`, `src/setting.tsx`, `tests/v4/network-storage-warning.test.ts` and the minimal Obsidian DOM test stub. Focused 3/3 PASS. See `docs/engineering/network-drive-best-effort-d13-2026-10-23.md`. This stage does not introduce a new user confirmation/override setting or change the V4 remote protocol.
+- **Limits:** Need actual network-drive latency/durability study, OS-handle path containment, physical platform tests, exact-SHA 1,000-note Obsidian lifecycle, and C2 protocol/merge UX acceptance. No release or master changes.
+
 ## 2026-10-23 Stage D12 — late Desktop path-swap regression and synchronous rename guards
 
 - **Isolation:** Continued only in `.tmp/staged-production-6c67c8a` at audit branch from `49b309fa`. No `master`, GitHub Actions, release, personal vault or live GitHub mutation. User's open-note policy 1 and in-flight settings policy B unchanged.

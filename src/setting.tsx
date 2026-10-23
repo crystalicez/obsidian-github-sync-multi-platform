@@ -4,6 +4,7 @@ import { KofiImage } from "./lib/icons";
 import FastSync from "./main";
 import { dump } from "./lib/helps";
 import { createDebugPayload } from "./lib/debug";
+import { V4_NETWORK_VAULT_WARNING } from "./lib/v4/network-storage";
 
 export interface PluginSettings {
   // Whether auto-upload is enabled
@@ -203,6 +204,10 @@ export class SettingTab extends PluginSettingTab {
     // ==========================================
     // Section 2: GitHub Connection Settings
     // ==========================================
+    if (Platform.isDesktopApp) {
+      set.createEl("p", { cls: "setting-item-description", text: V4_NETWORK_VAULT_WARNING })
+    }
+
     new Setting(set)
       .setName("GitHub Connection Settings")
       .setHeading()

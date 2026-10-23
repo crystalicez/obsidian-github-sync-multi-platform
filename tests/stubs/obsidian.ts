@@ -143,6 +143,7 @@ export class ElementStub {
   }
 
   getBoundingClientRect() { return { left: 0, width: 300 }; }
+  addEventListener(_type: string, _listener: unknown) {}
   setPointerCapture(_pointerId: number) {}
   releasePointerCapture(_pointerId: number) {}
 }

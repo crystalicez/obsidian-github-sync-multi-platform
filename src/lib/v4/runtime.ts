@@ -21,6 +21,7 @@ import { V4HistoryService } from "./history-service"
 import type { V4SessionVault } from "./local-io"
 import { createV4ContentSource, createV4WholeBufferContentSource, DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES, type V4ContentSource } from "./content-source"
 import { createV4PlatformIo, V4ManualRecoveryRequiredError, type V4BinaryAdapterLike, type V4PlatformIo } from "./platform-io"
+import { isV4UncVaultPath, V4_NETWORK_VAULT_WARNING } from "./network-storage"
 import { createV4StagingStore, type V4StagingStore } from "./staging-store"
 import { V4ProgressStore, type V4SyncProgressSnapshot } from "./progress"
 import { createV4RecoveryStore, discardV4RecoveryStages, markV4RecoveryIndexCommitted, recoverV4PendingState, V4RecoveryRequiredError } from "./recovery-store"
@@ -66,7 +67,7 @@ function createMemoryAdapter(owner: object): V4LocalIndexAdapter {
   }
 }
 
-function createRuntimePlatformIo(plugin: FastSync): { io: V4PlatformIo; stageRoot: string } {
+function createRuntimePlatformIo(plugin: FastSync): { io: V4PlatformIo; stageRoot: string; desktopRootPath?: string } {
   const vault = plugin.app.vault as FastSync["app"]["vault"] & {
     configDir?: string
     adapter?: V4BinaryAdapterLike & { getFullPath?(path: string): string }
@@ -87,6 +88,7 @@ function createRuntimePlatformIo(plugin: FastSync): { io: V4PlatformIo; stageRoo
       desktopRootPath,
     }),
     stageRoot,
+    desktopRootPath,
   }
 }
 
@@ -140,6 +142,8 @@ export class V4PluginRuntime {
   private readonly adapter: V4LocalIndexAdapter
   private readonly progressStore = new V4ProgressStore()
   private readonly platformIo: V4PlatformIo
+  private readonly uncVault: boolean
+  private networkStorageNoticeShown = false
   private readonly stagingStore: V4StagingStore
   private readonly recentlyStagedPaths = new Set<string>()
   private readonly keyringCache = new V4KeyringCache()
@@ -151,6 +155,7 @@ export class V4PluginRuntime {
     this.adapter = createIndexAdapter(plugin)
     const executionIo = createRuntimePlatformIo(plugin)
     this.platformIo = executionIo.io
+    this.uncVault = isV4UncVaultPath(executionIo.desktopRootPath)
     this.stagingStore = createRuntimeStagingStore(this.platformIo, executionIo.stageRoot)
     this.coordinator = new V4SyncCoordinator({
       execute: (request, changes, signal) => this.execute(request, changes, signal),
@@ -522,6 +527,10 @@ export class V4PluginRuntime {
       trigger: request.trigger,
     })
     try {
+      if (this.uncVault && !this.networkStorageNoticeShown) {
+        this.networkStorageNoticeShown = true
+        new Notice(`GitHub Sync: UNC network vault detected. ${V4_NETWORK_VAULT_WARNING}`, 10000)
+      }
       if (!github) throw new Error("GitHub connection is not configured.")
       ;(github as unknown as { setV4AbortSignal?(signal?: AbortSignal): void }).setV4AbortSignal?.(signal)
       throwIfV4Aborted(signal)
