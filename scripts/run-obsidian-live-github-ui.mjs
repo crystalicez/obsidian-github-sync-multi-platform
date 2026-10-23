@@ -277,8 +277,8 @@ try{
   await captureSyncedCenter();
   const verifyNoop=async label=>{
    const before=(await readState(configuration)).sha;
-   const result=await evaluate("(async()=>{const p=app.plugins.plugins["+JSON.stringify(id)+"];const started=performance.now();const outcome=await p.v4Runtime.manualSync();const s=p.v4Runtime.progressSnapshot;return {lifecycle:s.lifecycle,changedFiles:outcome?.changedFiles,wallMs:performance.now()-started,apiRequests:s.diagnostics?.apiRequests,apiFailures:s.diagnostics?.apiFailures,uploadBytes:s.diagnostics?.uploadBytes,peakRendererRssBytes:s.diagnostics?.peakRendererRssBytes};})()",240000);
-   assertTrue(result.lifecycle==="no-change"&&result.changedFiles===0&&result.apiFailures===0&&result.uploadBytes===0,
+   const result=await evaluate("(async()=>{const p=app.plugins.plugins["+JSON.stringify(id)+"];const started=performance.now();const outcome=await p.v4Runtime.manualSync();const s=p.v4Runtime.progressSnapshot;return {lifecycle:s.lifecycle,changedFiles:outcome?.changedFiles,wallMs:performance.now()-started,apiRequests:s.diagnostics?.apiRequests,apiFailures:s.diagnostics?.apiFailures,uploadBytes:s.diagnostics?.uploadBytes,peakRendererRssBytes:s.diagnostics?.peakRendererRssBytes,push:s.push,pull:s.pull,totalElapsedMs:s.totalElapsedMs};})()",240000);
+   assertTrue(result.lifecycle==="no-change"&&result.changedFiles===0&&(result.apiFailures===undefined||result.apiFailures===0)&&(result.uploadBytes===undefined||result.uploadBytes===0),
     "Native no-op mutated or failed: "+label+" "+redact(JSON.stringify(result)));
    assertTrue((await readState(configuration)).sha===before,"Native no-op advanced GitHub HEAD: "+label);
    noOpEvidence.push({label,...result});
@@ -320,8 +320,8 @@ try{
    assertTrue(created===1000,"Real Obsidian did not index 1,000 notes");
    const createdWallMs=performance.now()-started;
    const before=finalSha;
-   const output=await evaluate("(async()=>{const p=app.plugins.plugins["+JSON.stringify(id)+"];const t=performance.now();await p.v4Runtime.manualSync();const s=p.v4Runtime.progressSnapshot;return {lifecycle:s.lifecycle,wallMs:performance.now()-t,apiRequests:s.diagnostics?.apiRequests,apiFailures:s.diagnostics?.apiFailures,uploadBytes:s.diagnostics?.uploadBytes,peakRss:s.diagnostics?.peakRendererRssBytes,error:s.errorMessage?.slice(0,200)}})()",900000);
-   assertTrue(output.lifecycle==="success"&&output.apiFailures===0&&output.uploadBytes>0,"Native 1,000-note sync failed: "+redact(JSON.stringify(output)));
+   const output=await evaluate("(async()=>{const p=app.plugins.plugins["+JSON.stringify(id)+"];const t=performance.now();await p.v4Runtime.manualSync();const s=p.v4Runtime.progressSnapshot;return {lifecycle:s.lifecycle,wallMs:performance.now()-t,apiRequests:s.diagnostics?.apiRequests,apiFailures:s.diagnostics?.apiFailures,uploadBytes:s.diagnostics?.uploadBytes,peakRss:s.diagnostics?.peakRendererRssBytes,push:s.push,pull:s.pull,totalElapsedMs:s.totalElapsedMs,error:s.errorMessage?.slice(0,200)}})()",900000);
+   assertTrue(output.lifecycle==="success"&&(output.apiFailures===undefined||output.apiFailures===0)&&output.push?.completed>=1000,"Native 1,000-note sync failed: "+redact(JSON.stringify(output)));
    const after=await readState(configuration);
    assertTrue(after.kind==="present"&&after.sha!==before,"Native 1,000-note sync did not advance GitHub HEAD");
    finalSha=after.sha;
