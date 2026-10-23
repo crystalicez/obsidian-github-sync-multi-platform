@@ -114,6 +114,37 @@ test("Sync Center shows measured HTTP request and RSS diagnostics without invent
   await view.onClose();
 });
 
+test("Sync Center recomputes measured run-average rates as time advances without new bytes", async () => {
+  const source = new FakeProgressSource();
+  const plugin = createSyncCenterPluginFixture(source, () => undefined);
+  const view = new V4SyncCenterView(new WorkspaceLeaf(plugin.app), plugin as never);
+  await view.onOpen();
+  const diagnostics = {
+    apiRequests: 1, apiFailures: 0, uploadBytes: 2048, downloadBytes: 0,
+    apiLatencyMs: 100, inFlightApiRequests: 0, oldestInFlightApiMs: 0,
+  };
+  source.publish({ ...uploadingFixture, totalElapsedMs: 1000, diagnostics });
+  assert.match(view.contentEl.flattenText(), /run avg 2\.0 KiB\/s/u);
+  source.publish({ ...uploadingFixture, totalElapsedMs: 2000, diagnostics });
+  assert.match(view.contentEl.flattenText(), /run avg 1\.0 KiB\/s/u);
+  await view.onClose();
+});
+
+test("elapsed ticks do not repaint diagnostics when no measured data is available", async () => {
+  const source = new FakeProgressSource();
+  const plugin = createSyncCenterPluginFixture(source, () => undefined);
+  const view = new V4SyncCenterView(new WorkspaceLeaf(plugin.app), plugin as never);
+  await view.onOpen();
+  const diagnosticsRegion = (view as unknown as {
+    progressDiagnostics: { ownMutationCount: number };
+  }).progressDiagnostics;
+  source.publish({ ...uploadingFixture, totalElapsedMs: 1000 });
+  const mutations = diagnosticsRegion.ownMutationCount;
+  source.publish({ ...uploadingFixture, totalElapsedMs: 2000 });
+  assert.equal(diagnosticsRegion.ownMutationCount, mutations);
+  await view.onClose();
+});
+
 test("Sync Center shows failure context and does not duplicate subscriptions", async () => {
   const source = new FakeProgressSource();
   const plugin = createSyncCenterPluginFixture(source, () => undefined);

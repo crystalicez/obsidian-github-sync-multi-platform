@@ -172,7 +172,9 @@ export class V4SyncCenterView extends ItemView {
       for (const [label, duration, total] of timingRows) this.renderTiming(timingsElement, label, duration, total)
       this.progressTimingsSignature = timingsSignature
     }
-    const diagnosticsSignature = JSON.stringify(snapshot.diagnostics ?? null)
+    const diagnosticsSignature = JSON.stringify(snapshot.diagnostics
+      ? [snapshot.diagnostics, snapshot.totalElapsedMs]
+      : null)
     if (diagnosticsSignature !== this.progressDiagnosticsSignature) {
       diagnosticsElement.empty()
       if (snapshot.diagnostics) this.renderDiagnostics(diagnosticsElement, snapshot)
