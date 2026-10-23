@@ -15,6 +15,12 @@
 | E — GitHub strict CAS and persistent cooldown | **E1 qualified:** strict GraphQL `updateRefs(beforeOid)` and real encrypted/plaintext multi-device E2E exit 0 + verified branch cleanup. **E2 integrated:** durable token-scoped cooldown via two checksummed plugin-data slots with fail-closed storage semantics; focused and full local gates green. | E1 live E2E PASS; E2 automated PASS; actual 429/live Obsidian still pending |
 | F — User-visible UX, full release candidate | Select telemetry/merge UI; all deterministic/local guards, actual Obsidian 2-instance encrypted + 1000-note scenario and safe GitHub target from same candidate SHA. Physical mobile/macOS/Linux later; independent security audit. | Pending |
 
+## Stage D22 — async staged sink terminal-operation safety (Node.js only)
+
+- In-process asynchronous sink lifecycle hardening is **integrated on this audit worktree**, independent of the deliberately deferred [filesystem OS TOCTOU Issue #9](https://github.com/crystalicez/obsidian-github-sync-multi-platform/issues/9).
+- RED fail-first: two delayed backend interleavings showed overlapping append/finish wrongly declared incomplete bytes, and a concurrent abort could delete *before* a suspended write, allowing late orphan stage resurrection. The fix serializes accepted backend writes with promise queue, prevents post-finish append, keeps state and terminal completion consistent, aborts safely after in-flight writes, preserves first failure/cleans provisional bytes. Six new regressions PASS; focused **11/11**; Fast **509/509**, repeat **10×509**, recovery **79**, Resource **11**, Feasibility **132**, virtual 100 MB Soak, build/package/metadata, GitHub E2E compile-only PASS. No live Obsidian/GitHub run in this scoped change.
+- See `docs/engineering/async-staging-sink-lifecycle-d22-2026-10-23.md`. No wire protocol/native helper/release decision changed. **Issue #9 is DEFERRED unless user explicitly asks.** Rest of C2 and line-merge UX remain pending.
+
 ## Stage C1 evidence — metadata bounds and local cache trust
 
 This stage adds remote **config 64 KiB**, **head 256 KiB**, **shard 16 MiB** and **journal 32 MiB** limits before parsing and decrypting, accounting for encrypted framing precisely. Writers reject new oversized metadata; existing oversized metadata fails closed rather than being silently rewritten. The remote encryption/data layout and conflict protocol are unchanged.

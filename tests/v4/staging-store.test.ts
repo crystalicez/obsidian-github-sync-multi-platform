@@ -18,6 +18,188 @@ function source(data: Uint8Array, width = 3): V4ContentSource {
   };
 }
 
+
+function gate() {
+  let open!: () => void;
+  const promise = new Promise<void>(resolve => { open = resolve; });
+  return { promise, open };
+}
+
+test("staging serializes two overlapping appends and finish never certifies pending bytes", async () => {
+  const files = new Map<string, Uint8Array>();
+  const firstWriteEntered = gate();
+  const allowFirstWrite = gate();
+  const actions: string[] = [];
+  const store = createV4StagingStore({
+    root: "private/stage",
+    wholeBufferCeilingBytes: 16,
+    randomId: () => "overlap",
+    backend: {
+      boundedAppend: true,
+      async write(path, data) {
+        actions.push("write-start"); firstWriteEntered.open();
+        await allowFirstWrite.promise;
+        files.set(path, new Uint8Array(data)); actions.push("write-end");
+      },
+      async append(path, data) {
+        actions.push("append");
+        const previous = files.get(path) ?? new Uint8Array();
+        const next = new Uint8Array(previous.length + data.length);
+        next.set(previous); next.set(data, previous.length); files.set(path, next);
+      },
+      async remove(path) { files.delete(path); },
+      async openSource() { throw new Error("not used"); },
+      async freeBytes() { return 1024; },
+    },
+  });
+  const sink = await store.beginStage({ expectedSize: 3, existingTargetBytes: 0, atomicReplace: true, mtime: 1 });
+  const first = sink.append(new Uint8Array([1, 2]));
+  await firstWriteEntered.promise;
+  const second = sink.append(new Uint8Array([3]));
+  let finished = false;
+  const finish = sink.finish({ plaintextSha256: "a".repeat(64), size: 3 }).then(v => { finished = true; return v; });
+  await Promise.resolve(); await Promise.resolve();
+  assert.equal(finished, false);
+  allowFirstWrite.open();
+  await Promise.all([first, second]);
+  const result = await finish;
+  assert.equal(result.size, 3);
+  assert.deepEqual(files.get("private/stage/overlap.bin"), new Uint8Array([1, 2, 3]));
+  assert.deepEqual(actions, ["write-start", "write-end", "append"]);
+});
+
+test("abort during an in-flight initial stage write cannot leave a resurrected partial file", async () => {
+  const files = new Map<string, Uint8Array>();
+  const entered = gate(), proceed = gate();
+  const stagePath = "private/stage/abort-race.bin";
+  const store = createV4StagingStore({
+    root: "private/stage", wholeBufferCeilingBytes: 16, randomId: () => "abort-race",
+    backend: {
+      boundedAppend: true,
+      async write(path, data) { entered.open(); await proceed.promise; files.set(path, new Uint8Array(data)); },
+      async append() { throw new Error("not used"); },
+      async remove(path) { files.delete(path); },
+      async openSource() { throw new Error("not used"); },
+      async freeBytes() { return 1024; },
+    },
+  });
+  const sink = await store.beginStage({ expectedSize: 2, existingTargetBytes: 0, atomicReplace: true, mtime: 1 });
+  const writing = sink.append(new Uint8Array([1, 2]));
+  await entered.promise;
+  const aborted = sink.abort();
+  proceed.open();
+  await Promise.all([writing, aborted]);
+  assert.equal(files.has(stagePath), false);
+  await assert.rejects(sink.append(new Uint8Array([3])), /closed|abort/i);
+  await assert.rejects(sink.finish({ plaintextSha256: "b".repeat(64), size: 2 }), /closed|abort/i);
+});
+
+
+test("staging preserves first backend write failure and skips queued writes or finish", async () => {
+  const entered = gate(), proceed = gate();
+  const files = new Map<string, Uint8Array>();
+  const failedWrite = new Error("injected disk full");
+  let attempted = 0;
+  const store = createV4StagingStore({
+    root: "private/stage", wholeBufferCeilingBytes: 16, randomId: () => "failed-write",
+    backend: {
+      boundedAppend: true,
+      async write(path, data) { attempted++; files.set(path, data); entered.open(); await proceed.promise; throw failedWrite; },
+      async append() { attempted++; throw new Error("must not append after failure"); },
+      async remove(path) { files.delete(path); },
+      async openSource() { throw new Error("not used"); },
+      async freeBytes() { return 1024; },
+    },
+  });
+  const sink = await store.beginStage({ expectedSize: 2, existingTargetBytes: 0, atomicReplace: true, mtime: 1 });
+  const first = sink.append(new Uint8Array([1]));
+  await entered.promise;
+  const second = sink.append(new Uint8Array([2]));
+  const finishing = sink.finish({ plaintextSha256: "a".repeat(64), size: 2 });
+  proceed.open();
+  for (const promise of [first, second, finishing]) await assert.rejects(promise, e => e === failedWrite);
+  assert.equal(attempted, 1);
+  assert.equal(files.size, 0);
+});
+
+test("staging abort preempts queued finish and waits for the in-flight write to settle", async () => {
+  const entered = gate(), proceed = gate();
+  const files = new Map<string, Uint8Array>();
+  const store = createV4StagingStore({
+    root: "private/stage", wholeBufferCeilingBytes: 16, randomId: () => "preempt",
+    backend: {
+      boundedAppend: true,
+      async write(path, data) { entered.open(); await proceed.promise; files.set(path, new Uint8Array(data)); },
+      async append() { throw new Error("not used"); },
+      async remove(path) { files.delete(path); },
+      async openSource() { throw new Error("not used"); },
+      async freeBytes() { return 1024; },
+    },
+  });
+  const sink = await store.beginStage({ expectedSize: 1, existingTargetBytes: 0, atomicReplace: true, mtime: 1 });
+  const writing = sink.append(new Uint8Array([1]));
+  await entered.promise;
+  const finishing = sink.finish({ plaintextSha256: "a".repeat(64), size: 1 });
+  const cancelled = sink.abort();
+  const cancelledAgain = sink.abort();
+  proceed.open();
+  await writing;
+  await assert.rejects(finishing, /already closed/i);
+  await Promise.all([cancelled, cancelledAgain]);
+  assert.equal(files.size, 0);
+});
+
+test("staging rejects overrun and invalid finish proof without leaving provisional bytes", async () => {
+  const files = new Map<string, Uint8Array>();
+  let removals = 0;
+  const store = createV4StagingStore({
+    root: "private/stage", wholeBufferCeilingBytes: 16, randomId: () => "overrun",
+    backend: {
+      boundedAppend: true,
+      async write(path, data) { files.set(path, new Uint8Array(data)); },
+      async append() { throw new Error("not used"); },
+      async remove(path) { removals++; files.delete(path); },
+      async openSource() { throw new Error("not used"); },
+      async freeBytes() { return 1024; },
+    },
+  });
+  const sink = await store.beginStage({ expectedSize: 1, existingTargetBytes: 0, atomicReplace: true, mtime: 1 });
+  await sink.append(new Uint8Array([1]));
+  await assert.rejects(sink.append(new Uint8Array([2])), /more bytes than declared/);
+  assert.equal(files.size, 0);
+  assert.ok(removals >= 1);
+  await assert.rejects(sink.finish({ plaintextSha256: "a".repeat(64), size: 1 }), /closed/i);
+
+  const sink2 = await store.beginStage({ expectedSize: 1, existingTargetBytes: 0, atomicReplace: true, mtime: 1 });
+  await sink2.append(new Uint8Array([3]));
+  await assert.rejects(sink2.finish({ plaintextSha256: "not-a-hash", size: 1 }), /SHA-256/);
+  assert.equal(files.size, 0);
+});
+
+test("abort racing the zero-byte finish write leaves no stage and no receipt", async () => {
+  const entered = gate(), proceed = gate();
+  const files = new Map<string, Uint8Array>();
+  const store = createV4StagingStore({
+    root: "private/stage", wholeBufferCeilingBytes: 16, randomId: () => "empty",
+    backend: {
+      boundedAppend: true,
+      async write(path, data) { entered.open(); await proceed.promise; files.set(path, data); },
+      async append() { throw new Error("not used"); },
+      async remove(path) { files.delete(path); },
+      async openSource() { throw new Error("not used"); },
+      async freeBytes() { return 1024; },
+    },
+  });
+  const sink = await store.beginStage({ expectedSize: 0, existingTargetBytes: 0, atomicReplace: true, mtime: 1 });
+  const finishing = sink.finish({ plaintextSha256: "a".repeat(64), size: 0 });
+  await entered.promise;
+  const aborting = sink.abort();
+  proceed.open();
+  await assert.rejects(finishing, /closed/);
+  await aborting;
+  assert.equal(files.size, 0);
+});
+
 test("staging uses opaque ids under the plugin-private excluded root and hashes while appending", async () => {
   const files = new Map<string, Uint8Array>();
   const backend = {

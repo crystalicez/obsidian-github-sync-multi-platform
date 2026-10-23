@@ -118,39 +118,75 @@ export function createV4StagingStore(options: {
 
     let total = 0
     let first = true
-    let closed = false
+    let state: "open" | "finishing" | "finished" | "aborting" | "aborted" | "failed" = "open"
+    let failed = false
+    let firstFailure: unknown
+    // Serialize backend mutations so finish cannot attest unflushed append
+    // operations, and abort cannot remove before a pending write recreates it.
+    let pending: Promise<void> = Promise.resolve()
+    const enqueue = <T>(action: () => Promise<T>): Promise<T> => {
+      const operation = pending.then(action)
+      pending = operation.then(() => undefined, () => undefined)
+      return operation
+    }
     const removePartial = async () => { try { await options.backend.remove(path) } catch {} }
+    const poison = async (error: unknown): Promise<never> => {
+      if (!failed) { failed = true; firstFailure = error }
+      state = "failed"
+      await removePartial()
+      throw error
+    }
+    const closedError = () => new Error("V4 staged sink is already closed.")
     return {
-      async append(bytes) {
-        if (closed) throw new Error("V4 staged sink is already closed.")
-        if (stageOptions.signal?.aborted) throw stageOptions.signal.reason ?? new Error("V4 staging aborted.")
-        if (total + bytes.byteLength > stageOptions.expectedSize) throw new Error("V4 staged sink received more bytes than declared.")
-        try {
-          if (first) { await options.backend.write(path, bytes); first = false }
-          else await options.backend.append(path, bytes)
-          total += bytes.byteLength
-        } catch (error) {
-          closed = true
-          await removePartial()
-          throw error
-        }
+      append(bytes) {
+        if (state !== "open") return Promise.reject(closedError())
+        if (stageOptions.signal?.aborted) return Promise.reject(stageOptions.signal.reason ?? new Error("V4 staging aborted."))
+        return enqueue(async () => {
+          if (failed) throw firstFailure
+          if (state === "aborting" || state === "aborted") throw closedError()
+          if (stageOptions.signal?.aborted) throw stageOptions.signal.reason ?? new Error("V4 staging aborted.")
+          if (total + bytes.byteLength > stageOptions.expectedSize)
+            return poison(new Error("V4 staged sink received more bytes than declared."))
+          try {
+            if (first) { await options.backend.write(path, bytes); first = false }
+            else await options.backend.append(path, bytes)
+            total += bytes.byteLength
+          } catch (error) {
+            return poison(error)
+          }
+        })
       },
-      async finish(result) {
-        if (closed) throw new Error("V4 staged sink is already closed.")
-        if (!/^[0-9a-f]{64}$/u.test(result.plaintextSha256)) throw new Error("V4 staged sink requires a SHA-256 hash.")
-        if (result.size !== total || total !== stageOptions.expectedSize) {
-          closed = true
-          await removePartial()
-          throw new Error(`V4 staged sink received ${total} bytes; expected ${stageOptions.expectedSize}.`)
-        }
-        if (first) { await options.backend.write(path, new Uint8Array()); first = false }
-        closed = true
-        return { stageId, hash: result.plaintextSha256, size: total, mtime: stageOptions.mtime }
+      finish(result) {
+        if (state !== "open") return Promise.reject(closedError())
+        state = "finishing"
+        return enqueue(async () => {
+          if (failed) throw firstFailure
+          if (state !== "finishing") throw closedError()
+          if (stageOptions.signal?.aborted)
+            return poison(stageOptions.signal.reason ?? new Error("V4 staging aborted."))
+          if (!/^[0-9a-f]{64}$/u.test(result.plaintextSha256))
+            return poison(new Error("V4 staged sink requires a SHA-256 hash."))
+          if (result.size !== total || total !== stageOptions.expectedSize)
+            return poison(new Error(`V4 staged sink received ${total} bytes; expected ${stageOptions.expectedSize}.`))
+          try {
+            if (first) { await options.backend.write(path, new Uint8Array()); first = false }
+          } catch (error) {
+            return poison(error)
+          }
+          // An abort requested while an empty-file write was pending wins.
+          if (state !== "finishing") throw closedError()
+          state = "finished"
+          return { stageId, hash: result.plaintextSha256, size: total, mtime: stageOptions.mtime }
+        })
       },
-      async abort() {
-        if (closed) return
-        closed = true
-        await removePartial()
+      abort() {
+        if (state === "finished" || state === "aborted") return Promise.resolve()
+        if (state === "aborting") return pending
+        state = "aborting"
+        return enqueue(async () => {
+          await removePartial()
+          state = "aborted"
+        })
       },
     }
   }
