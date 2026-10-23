@@ -331,7 +331,6 @@ export function createV4PlatformIo(options: V4PlatformIoOptions): V4PlatformIo {
       if (!desktopReady) return
       const pathModule = await desktopPath()
       await assertRecoveryPaths(stagePath, targetPath)
-      const fs = await desktopFs()
       const fsSync = await desktopFsSync()
       const target = full(targetPath)
       const backup = full(stagePath) + ".target-backup"
@@ -349,7 +348,10 @@ export function createV4PlatformIo(options: V4PlatformIoOptions): V4PlatformIo {
           if (!(await confirmBackup(target, commitOptions.expectedTarget))) {
             throw new V4ManualRecoveryRequiredError(targetPath, "restored original changed during residue cleanup")
           }
-          await fs.rm(residue)
+          // Do not yield between the last confirmed target proof and removing
+          // the plugin-owned residue; a late directory junction must fail closed.
+          if (options.desktopRootPath) assertRecoveryPathsSync(stagePath, targetPath, fsSync, pathModule)
+          fsSync.rmSync(residue)
         }
         return
       }
@@ -390,13 +392,14 @@ export function createV4PlatformIo(options: V4PlatformIoOptions): V4PlatformIo {
         if (await hashFile(residue, commitOptions.expectedStageSize) !== commitOptions.expectedStageSha256) {
           throw new V4ManualRecoveryRequiredError(targetPath, "rollback residue changed during recovery")
         }
-        await fs.rm(residue)
+        if (options.desktopRootPath) assertRecoveryPathsSync(stagePath, targetPath, fsSync, pathModule)
+        fsSync.rmSync(residue)
       }
     },
     async finalizeStage(stagePath, targetPath, commitOptions) {
       if (!desktopReady) return
       await assertRecoveryPaths(stagePath, targetPath)
-      const fs = await desktopFs()
+      const [fsSync, pathModule] = await Promise.all([desktopFsSync(), desktopPath()])
       const backup = full(stagePath) + ".target-backup"
       if (!(await statOrNull(backup))) {
         if (await statOrNull(full(stagePath) + ".replacement-residue")) {
@@ -410,7 +413,13 @@ export function createV4PlatformIo(options: V4PlatformIoOptions): V4PlatformIo {
       if (await hashFile(full(targetPath), commitOptions.expectedStageSize) !== commitOptions.expectedStageSha256) {
         throw new V4ManualRecoveryRequiredError(targetPath, "final target differs from the durable staged receipt")
       }
-      await fs.rm(backup)
+      // The last async content hash can yield while another process swaps a
+      // parent for a junction. Close that avoidable gap before deleting the
+      // only verified original backup, without awaiting between path checks
+      // and the native deletion. OS-handle-relative operations are still needed
+      // to eliminate a concurrent process race between the two syscalls.
+      if (options.desktopRootPath) assertRecoveryPathsSync(stagePath, targetPath, fsSync, pathModule)
+      fsSync.rmSync(backup)
     },
     async commitStage(stagePath, targetPath, commitOptions) {
       if (!desktopReady) throw new V4BoundedIoUnavailableError("stage-commit", targetPath)

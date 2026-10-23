@@ -1,6 +1,7 @@
 import assert from "node:assert/strict"
 import { renameSync, symlinkSync } from "node:fs"
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile, stat } from "node:fs/promises"
+import { createRequire, syncBuiltinESMExports } from "node:module"
 import os from "node:os"
 import path from "node:path"
 import test from "node:test"
@@ -225,6 +226,141 @@ test("D12: rollback refuses a junction installed immediately before restoring th
     assert.deepEqual(new Uint8Array(await readFile(path.join(parked, "note.md"))), added)
     assert.deepEqual(new Uint8Array(await readFile(path.join(root, "stage.bin.target-backup"))), unchanged)
   } finally {
+    await rm(root, { recursive: true, force: true })
+    await rm(external, { recursive: true, force: true })
+  }
+})
+
+test("D15: finalizeStage refuses a late parent junction before deleting a verified original backup", async t => {
+  const scratch = path.join(process.cwd(), ".tmp")
+  await mkdir(scratch, { recursive: true })
+  const root = await mkdtemp(path.join(scratch, "d15-finalize-root-"))
+  const external = await mkdtemp(path.join(scratch, "d15-finalize-external-"))
+  const promisedFs = createRequire(import.meta.url)("node:fs/promises") as typeof import("node:fs/promises")
+  const originalStat = promisedFs.stat
+  const folder = path.join(root, "notes")
+  const parked = path.join(root, "parked-notes")
+  const target = path.join(folder, "note.md")
+  const backup = path.join(folder, "stage.bin.target-backup")
+  const outsideBackup = path.join(external, "stage.bin.target-backup")
+  let targetStats = 0
+  let swapped = false
+  try {
+    await mkdir(folder)
+    await writeFile(target, added)
+    await writeFile(backup, unchanged)
+    await writeFile(outsideBackup, new Uint8Array([42, 43, 44]))
+    try {
+      const probe = path.join(root, "link-probe")
+      await symlink(external, probe, process.platform === "win32" ? "junction" : "dir")
+      await rm(probe)
+    } catch (error) {
+      if (["EPERM", "EACCES", "ENOSYS"].includes((error as { code?: string }).code ?? "")) {
+        t.skip("Directory junctions/symlinks unavailable")
+        return
+      }
+      throw error
+    }
+    const io = createV4PlatformIo({
+      platform: "desktop", desktopRootPath: root,
+      resolveDesktopPath: logical => path.join(root, logical),
+    })
+    const originalHash = await sha256Hex(unchanged)
+    const stageHash = await sha256Hex(added)
+    promisedFs.stat = (async (...args: Parameters<typeof originalStat>) => {
+      const result = await originalStat(...args)
+      if (String(args[0]) === target && ++targetStats === 3) {
+        // Last async stat in the target hash verification. Before cleanup,
+        // another process replaces the proven directory with a junction.
+        renameSync(folder, parked)
+        symlinkSync(external, folder, process.platform === "win32" ? "junction" : "dir")
+        swapped = true
+      }
+      return result
+    }) as typeof originalStat
+    syncBuiltinESMExports()
+    let finalizationError: unknown
+    try {
+      await io.finalizeStage("notes/stage.bin", "notes/note.md", {
+        expectedTarget: { exists: true, size: unchanged.byteLength, hash: originalHash },
+        expectedStageSize: added.byteLength, expectedStageSha256: stageHash,
+      })
+    } catch (error) { finalizationError = error }
+    assert.equal(swapped, true, `the external directory swap must occur (target stats: ${targetStats})`)
+    assert.match(String(finalizationError), /symlink|junction|unsafe|review/i)
+    assert.deepEqual(new Uint8Array(await readFile(outsideBackup)), new Uint8Array([42, 43, 44]))
+    assert.deepEqual(new Uint8Array(await readFile(path.join(parked, "stage.bin.target-backup"))), unchanged)
+  } finally {
+    promisedFs.stat = originalStat
+    syncBuiltinESMExports()
+    await rm(root, { recursive: true, force: true })
+    await rm(external, { recursive: true, force: true })
+  }
+})
+
+test("D15: rollback residue cleanup refuses a junction installed after its last original-content proof", async t => {
+  const scratch = path.join(process.cwd(), ".tmp")
+  await mkdir(scratch, { recursive: true })
+  const root = await mkdtemp(path.join(scratch, "d15-rollback-root-"))
+  const external = await mkdtemp(path.join(scratch, "d15-rollback-external-"))
+  const promisedFs = createRequire(import.meta.url)("node:fs/promises") as typeof import("node:fs/promises")
+  const originalStat = promisedFs.stat
+  const folder = path.join(root, "notes")
+  const parked = path.join(root, "parked-notes")
+  const target = path.join(folder, "note.md")
+  const residue = path.join(folder, "stage.bin.replacement-residue")
+  const outsideResidue = path.join(external, "stage.bin.replacement-residue")
+  let targetStats = 0
+  let swapped = false
+  try {
+    await mkdir(folder)
+    await writeFile(target, unchanged)
+    await writeFile(residue, added)
+    await writeFile(outsideResidue, new Uint8Array([42, 43, 44]))
+    try {
+      const probe = path.join(root, "link-probe")
+      await symlink(external, probe, process.platform === "win32" ? "junction" : "dir")
+      await rm(probe)
+    } catch (error) {
+      if (["EPERM", "EACCES", "ENOSYS"].includes((error as { code?: string }).code ?? "")) {
+        t.skip("Directory junctions/symlinks unavailable")
+        return
+      }
+      throw error
+    }
+    const io = createV4PlatformIo({
+      platform: "desktop", desktopRootPath: root,
+      resolveDesktopPath: logical => path.join(root, logical),
+    })
+    const originalHash = await sha256Hex(unchanged)
+    const stageHash = await sha256Hex(added)
+    promisedFs.stat = (async (...args: Parameters<typeof originalStat>) => {
+      const result = await originalStat(...args)
+      if (String(args[0]) === target && ++targetStats === 8) {
+        // There is no original-backup left: recovery has proof of restored
+        // target and verified candidate residue. The last proof yields.
+        renameSync(folder, parked)
+        symlinkSync(external, folder, process.platform === "win32" ? "junction" : "dir")
+        swapped = true
+      }
+      return result
+    }) as typeof originalStat
+    syncBuiltinESMExports()
+    let rollbackError: unknown
+    try {
+      await io.rollbackStage("notes/stage.bin", "notes/note.md", {
+        expectedTarget: { exists: true, size: unchanged.byteLength, hash: originalHash },
+        expectedStageSize: added.byteLength, expectedStageSha256: stageHash,
+      })
+    } catch (error) { rollbackError = error }
+    assert.equal(swapped, true, `late swap must occur (target stats: ${targetStats})`)
+    assert.match(String(rollbackError), /symlink|junction|unsafe|review/i)
+    assert.deepEqual(new Uint8Array(await readFile(outsideResidue)), new Uint8Array([42, 43, 44]))
+    assert.deepEqual(new Uint8Array(await readFile(path.join(parked, "stage.bin.replacement-residue"))), added)
+    assert.deepEqual(new Uint8Array(await readFile(path.join(parked, "note.md"))), unchanged)
+  } finally {
+    promisedFs.stat = originalStat
+    syncBuiltinESMExports()
     await rm(root, { recursive: true, force: true })
     await rm(external, { recursive: true, force: true })
   }
