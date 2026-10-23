@@ -223,11 +223,12 @@ try{
    const before={configured:!!(p.settings.githubToken||p.settings.githubOwner||p.settings.githubRepo)};
    if(before.configured)throw Error("Isolated vault was already configured");
    const data=${JSON.stringify(prepared)};
-   await p.saveSettings({...p.settings,
+   p.settings = {...p.settings,
      githubOwner:data.owner,githubRepo:data.repo,githubBranch:data.branch,githubToken:data.token,
      syncEnabled:true,syncOnStartup:false,syncOnLocalChange:false,scheduledSyncEnabled:false,
      encryptionMode:data.mode,encryptionPassphrase:data.passphrase,syncObsidianConfig:false,syncBookmarks:false,syncPlugins:false,
-   });
+   };
+   await p.saveSettings();
    return {configured:p.settings.githubOwner===data.owner&&p.settings.githubRepo===data.repo
      &&p.settings.githubBranch===data.branch && !!p.settings.githubToken,
      mode:p.settings.encryptionMode,passphrasePresent:!!p.settings.encryptionPassphrase,autoEnabled:p.settings.syncOnLocalChange};
