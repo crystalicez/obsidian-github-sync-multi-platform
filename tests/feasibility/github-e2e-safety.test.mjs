@@ -14,6 +14,7 @@ import {
   loadGitHubE2EEnv,
   parseEnvLine,
   qualificationE2EBranch,
+  resolvePinnedGitHubE2ERepoId,
   sanitizeGitHubE2ELiveEnv,
   validateGitHubE2EConfig,
 } from "../../scripts/github-e2e-env.mjs";
@@ -108,6 +109,17 @@ test("E2E config rejects missing credentials, invalid target IDs, and protected 
   assert.throws(() => validateGitHubE2EConfig({ owner: "owner", repo: "repo", branch: "e2e", token: "secret", expectedRepoId: "" }), /EXPECTED_REPO_ID/i);
   assert.throws(() => validateGitHubE2EConfig({ owner: "owner", repo: "repo", branch: "e2e", token: "secret", expectedRepoId: "01" }), /EXPECTED_REPO_ID/i);
   assert.equal(validateGitHubE2EConfig({ owner: "owner", repo: "repo", branch: "e2e", token: "secret", expectedRepoId: "123" }).expectedRepoId, "123");
+});
+
+test("native GUI E2E requires a pinned repository ID and rejects conflicting pins", () => {
+  assert.equal(resolvePinnedGitHubE2ERepoId("1284153873", undefined), "1284153873");
+  assert.equal(resolvePinnedGitHubE2ERepoId(undefined, "1284153873"), "1284153873");
+  assert.equal(resolvePinnedGitHubE2ERepoId("1284153873", "1284153873"), "1284153873");
+  assert.throws(() => resolvePinnedGitHubE2ERepoId("1284153873", "1284153874"), /conflicting/i);
+  for (const value of ["", "0", "01", "-5", "  "]) {
+    assert.throws(() => resolvePinnedGitHubE2ERepoId(undefined, value), /EXPECTED_REPO_ID/);
+  }
+  assert.throws(() => resolvePinnedGitHubE2ERepoId(undefined, undefined), /EXPECTED_REPO_ID/);
 });
 
 test("manual live E2E env keeps only the dedicated target token among standard GitHub tokens", () => {

@@ -56,6 +56,15 @@ function requireRepositoryId(value, name = "GITHUB_E2E_EXPECTED_REPO_ID") {
   return text;
 }
 
+export function resolvePinnedGitHubE2ERepoId(envPinned, cliPinned) {
+  const fromEnv = envPinned === undefined ? "" : String(envPinned).trim();
+  const fromCli = cliPinned === undefined ? "" : String(cliPinned).trim();
+  if (fromEnv && fromCli && fromEnv !== fromCli) {
+    throw new Error("Conflicting GITHUB_E2E_EXPECTED_REPO_ID and --expected-repo-id");
+  }
+  return requireRepositoryId(fromCli || fromEnv);
+}
+
 function requireSafeSegment(value, name) {
   if (typeof value !== "string" || value.trim() === "" || value.includes("/") || /\s/u.test(value)) {
     throw new Error(`Invalid ${name}`);

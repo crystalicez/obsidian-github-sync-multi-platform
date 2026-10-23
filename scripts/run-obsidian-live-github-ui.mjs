@@ -8,12 +8,12 @@ import {createHash,randomBytes} from "node:crypto";
 import {copyFile,mkdir,open,stat,writeFile} from "node:fs/promises";
 import path from "node:path";
 import {fileURLToPath} from "node:url";
-import {loadGitHubE2EEnv,qualificationE2EBranch,validateGitHubE2EConfig} from "./github-e2e-env.mjs";
+import {loadGitHubE2EEnv,qualificationE2EBranch,resolvePinnedGitHubE2ERepoId,validateGitHubE2EConfig} from "./github-e2e-env.mjs";
 import {preflightE2ERemote,readE2EBranch,cleanupE2EBranch} from "./github-e2e-remote.mjs";
 import {CANONICAL_REPOSITORY_ID,readOriginFetchRepository} from "./github-repo.mjs";
 import {verifyPngBytes,visibleIntersection} from "./ui-visual-assertions.mjs";
 import {parseLiveUiMode,assertEncryptedRemoteTree} from "./obsidian-live-ui-mode.mjs";
-import {cleanupGeneratedUiRun} from "./obsidian-live-ui-cleanup.mjs";
+import {cleanupGeneratedUiRun,cleanupGeneratedUiEvidence} from "./obsidian-live-ui-cleanup.mjs";
 import {restoreEncryptedToSecondObsidian} from "./obsidian-live-ui-peer.mjs";
 
 const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),"..");
@@ -157,10 +157,10 @@ try{
  assertTrue(status.status===0&&status.stdout.trim()==="","Live UI roundtrip requires a clean source checkout");
  const source=readOriginFetchRepository({runner:(cmd,args,opt)=>spawnSync(cmd,args,{...opt,shell:false}),cwd:root});
  const env=(await loadGitHubE2EEnv({cwd:root,env:process.env})).env;
- assertTrue(env.GITHUB_E2E_EXPECTED_REPO_ID,"Pinned expected repository ID is required");
+ const expectedRepoId=resolvePinnedGitHubE2ERepoId(env.GITHUB_E2E_EXPECTED_REPO_ID,option("expected-repo-id",undefined));
  branch=qualificationE2EBranch(sha.stdout.trim(),runId);
  configuration=validateGitHubE2EConfig({owner:env.GITHUB_E2E_OWNER,repo:env.GITHUB_E2E_REPO,
-  token:env.GITHUB_E2E_TOKEN,branch,expectedRepoId:env.GITHUB_E2E_EXPECTED_REPO_ID,currentSourceRepo:source});
+  token:env.GITHUB_E2E_TOKEN,branch,expectedRepoId,currentSourceRepo:source});
  assertTrue(configuration.expectedRepoId!==CANONICAL_REPOSITORY_ID,"Target ID equals source ID");
  const verifiedTarget=await preflightE2ERemote({config:{...configuration,currentSourceRepoId:CANONICAL_REPOSITORY_ID}});
  verified=true;
@@ -423,7 +423,8 @@ try{
  // retained only via an explicit sanitized export in a later reviewed workflow.
  if(!dryRun){
   try{await cleanupGeneratedUiRun(runRoot,{repoRoot:root});}catch(error){console.error("WARNING: isolated test vault cleanup incomplete ("+String(error?.code||"unknown").slice(0,30)+")");process.exitCode=1;}
+  try{await cleanupGeneratedUiEvidence(runRoot,{repoRoot:root});}catch(error){console.error("WARNING: synthetic UI evidence cleanup incomplete ("+String(error?.code||"unknown").slice(0,30)+")");process.exitCode=1;}
  }
  console.log(JSON.stringify({status:passed&&!process.exitCode?"PASS":"FAIL",cleanup:cleanupState,remoteHeadChanged:Boolean(initialSha&&finalSha&&initialSha!==finalSha),
-  screenshotCaptured:screenBytes>1000,screenshotPath:screenBytes>1000?screenshot:null,uiExceptions:sendErrors.length,mode,remoteEncryptionVerified,peerRestored,peerScreenshot,journeySteps,noOpEvidence,bulkEvidence,diagnostics:diagnosticEvidence,peerDiagnostics:peerDiagnosticEvidence,nativeUploadWallMs,nativeDownloadWallMs,native100mbBytes:nativeBinary?.size??0,native100mbSha256:nativeBinary?.sha256??null,runBranch:branch,repository:configuration?.targetRepository,token:"[not reported]"}));
+  screenshotCaptured:screenBytes>1000,screenshotPath:null,uiExceptions:sendErrors.length,mode,remoteEncryptionVerified,peerRestored,peerScreenshot:null,journeySteps,noOpEvidence,bulkEvidence,diagnostics:diagnosticEvidence,peerDiagnostics:peerDiagnosticEvidence,nativeUploadWallMs,nativeDownloadWallMs,native100mbBytes:nativeBinary?.size??0,native100mbSha256:nativeBinary?.sha256??null,runBranch:branch,repository:configuration?.targetRepository,token:"[not reported]"}));
 }
