@@ -8,7 +8,7 @@ import { DEFAULT_SETTINGS } from "../../src/setting";
 import type { GitHubCreateTreeEntry } from "../../src/lib/github-git-types";
 import { deriveV4Keyring } from "../../src/lib/v4/crypto";
 import { publishV4TreeChanges } from "../../src/lib/v4/git-tree-writer";
-import { migrateV4Secrets, sanitizeV4SettingsForPersistence } from "../../src/lib/v4/secrets";
+import { migrateV4Secrets, sanitizeV4SettingsForPersistence, storeV4Secrets } from "../../src/lib/v4/secrets";
 import { selectV4RuntimeConfig, V4PluginRuntime } from "../../src/lib/v4/runtime";
 import { buildV4RemoteMetadata } from "../../src/lib/v4/remote-index";
 import { V4StorageCodec } from "../../src/lib/v4/storage-codec";
@@ -60,6 +60,45 @@ test("v4 secret migration stores legacy values and returns runtime-only secrets"
   assert.equal("githubToken" in persisted, false);
   assert.equal("encryptionPassphrase" in persisted, false);
   assert.equal(persisted.githubTokenSecretId, migrated.settings.githubTokenSecretId);
+});
+
+test("aliased token and passphrase secret IDs fail before any secret write", () => {
+  const writes: Array<{ id: string; value: string }> = [];
+  const storage = {
+    getSecret: (_id: string) => null,
+    setSecret: (id: string, value: string) => { writes.push({ id, value }); },
+  };
+  const aliased = {
+    githubToken: "token-one", encryptionPassphrase: "pass-two",
+    githubTokenSecretId: "same-secret-id", encryptionPassphraseSecretId: "same-secret-id",
+  };
+  assert.throws(() => migrateV4Secrets(aliased, storage, prefix => `${prefix}-new`), /secret IDs must be distinct/iu);
+  assert.throws(() => storeV4Secrets(aliased, storage), /secret IDs must be distinct/iu);
+  assert.deepEqual(writes, [], "an unsafe secret ID collision must not overwrite either value");
+  const missing = { ...aliased, githubTokenSecretId: "", encryptionPassphraseSecretId: "" };
+  assert.throws(() => migrateV4Secrets(missing, storage, () => "generated-alias"), /secret IDs must be distinct/iu);
+  assert.deepEqual(writes, [], "duplicate generated IDs must fail before writes");
+});
+
+test("partial legacy secret migration write failure rolls back the first saved secret", () => {
+  const saved = new Map<string, string>([["github-token", "old-token"], ["encryption-passphrase", "old-pass"]]);
+  let failOnce = true;
+  const writes: string[] = [];
+  const storage = {
+    getSecret: (id: string) => saved.get(id) ?? null,
+    setSecret: (id: string, value: string) => {
+      writes.push(id);
+      if (id === "encryption-passphrase" && failOnce) { failOnce = false; throw new Error("second secret unavailable"); }
+      saved.set(id, value);
+    },
+  };
+  assert.throws(() => migrateV4Secrets({
+    githubToken: "replacement-token", encryptionPassphrase: "replacement-pass",
+    githubTokenSecretId: "github-token", encryptionPassphraseSecretId: "encryption-passphrase",
+  }, storage, prefix => prefix), /second secret unavailable/iu);
+  assert.equal(saved.get("github-token"), "old-token", "first write must be rolled back");
+  assert.equal(saved.get("encryption-passphrase"), "old-pass", "second secret remains original");
+  assert.ok(writes.length >= 3, "failed migration attempted rollback");
 });
 
 test("v4 runtime selects explicit layouts and preserves encrypted KDF parameters for migration", () => {

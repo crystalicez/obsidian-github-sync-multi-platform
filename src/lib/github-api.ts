@@ -1,5 +1,6 @@
 import { requestUrl, type RequestUrlParam, type RequestUrlResponse } from "obsidian";
 import { fromBase64, sha256Hex, toBase64, toHex, utf8ToBytes } from "./bytes";
+import { assertSafeGitHubBranch, assertSafeGitHubRepositoryCoordinates } from "./github-config";
 import type { GitHubCreateTreeEntry, GitHubGitCommit, GitHubGitRef } from "./github-git-types";
 import { V4RepositoryBootstrapRaceError } from "./v4/bootstrap-race";
 import {
@@ -88,6 +89,9 @@ export class GitHubClient {
   private readonly cooldownStore?: V4RateLimitCooldownStore | undefined;
 
   constructor(config: GitHubConfig, options: GitHubClientOptions = {}) {
+    // Fail before creating a scheduler or constructing an API URL for unsafe refs.
+    assertSafeGitHubRepositoryCoordinates(config.owner, config.repo)
+    assertSafeGitHubBranch(config.branch)
     this.config = config;
     this.cooldownStore = options.cooldownStore;
     // Token-scoped because GitHub rate limits apply across repos for one token.

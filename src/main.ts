@@ -2,6 +2,7 @@ import { Plugin, setIcon, Modal, Notice, TFile, TFolder } from "obsidian";
 
 import { SettingTab, PluginSettings, DEFAULT_SETTINGS } from "./setting";
 import { GitHubClient } from "./lib/github-api";
+import { assertPluginSettingsRuntimeSafe } from "./lib/plugin-settings-validation";
 import { V4RateLimitCooldownStore } from "./lib/v4/rate-limit-cooldown";
 import { normalizeScheduledSyncIntervalSeconds, shouldRunScheduledSync, shouldRunStartupSync } from "./lib/sync-policy";
 import { migrateV4Secrets, sanitizeV4SettingsForPersistence, storeV4Secrets } from "./lib/v4/secrets";
@@ -232,6 +233,8 @@ export default class FastSync extends Plugin {
     // Backward compatibility: older versions stored settings fields directly at the top level
     const savedSettings = data.settings ?? data;
     const merged = Object.assign({}, DEFAULT_SETTINGS, savedSettings);
+    // Validate persisted runtime data before any legacy secret migration writes.
+    assertPluginSettingsRuntimeSafe(merged)
     const result = migrateV4Secrets(
       merged,
       this.app.secretStorage,
@@ -242,6 +245,9 @@ export default class FastSync extends Plugin {
   }
 
   async saveSettings() {
+    // Reject corrupted pending settings before invalidating a running sync's
+    // credential snapshot or touching secret storage.
+    assertPluginSettingsRuntimeSafe(this.settings)
     this.v4Runtime?.credentialsChanged()
     storeV4Secrets(this.settings, this.app.secretStorage)
     this.initGitHubClient()

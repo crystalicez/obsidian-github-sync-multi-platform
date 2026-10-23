@@ -20,6 +20,15 @@ export interface SecretMigrationResult<T extends V4SecretBackedSettings> {
   migrated: boolean
 }
 
+/** Prevent credential and passphrase aliasing before any secret-storage mutation. */
+export function assertDistinctV4SecretIds(settings: V4SecretBackedSettings): void {
+  const tokenId = settings.githubTokenSecretId ?? ""
+  const passphraseId = settings.encryptionPassphraseSecretId ?? ""
+  if (tokenId && passphraseId && tokenId === passphraseId) {
+    throw new Error("GitHub token and encryption passphrase secret IDs must be distinct.")
+  }
+}
+
 function loadSecret(storage: SecretStorageLike, id: string): string {
   return id ? storage.getSecret(id) ?? "" : ""
 }
@@ -33,6 +42,7 @@ export function migrateV4Secrets<T extends V4SecretBackedSettings>(
   const githubTokenSecretId = settings.githubTokenSecretId || idFactory("github-token")
   const encryptionPassphraseSecretId =
     settings.encryptionPassphraseSecretId || idFactory("encryption-passphrase")
+  assertDistinctV4SecretIds({ githubTokenSecretId, encryptionPassphraseSecretId })
 
   if (!settings.githubTokenSecretId || !settings.encryptionPassphraseSecretId) migrated = true
 
@@ -40,13 +50,28 @@ export function migrateV4Secrets<T extends V4SecretBackedSettings>(
   const legacyPassphrase =
     typeof settings.encryptionPassphrase === "string" ? settings.encryptionPassphrase : ""
 
-  if (legacyToken) {
-    storage.setSecret(githubTokenSecretId, legacyToken)
-    migrated = true
+  // Snapshot before writing anything: a failed second write cannot strand a
+  // partially migrated credential. A partially executed failing write is also
+  // rolled back when SecretStorage remains available.
+  const previous = new Map<string, string | null>()
+  if (legacyToken) previous.set(githubTokenSecretId, storage.getSecret(githubTokenSecretId))
+  if (legacyPassphrase && !previous.has(encryptionPassphraseSecretId)) {
+    previous.set(encryptionPassphraseSecretId, storage.getSecret(encryptionPassphraseSecretId))
   }
-  if (legacyPassphrase) {
-    storage.setSecret(encryptionPassphraseSecretId, legacyPassphrase)
-    migrated = true
+  try {
+    if (legacyToken) {
+      storage.setSecret(githubTokenSecretId, legacyToken)
+      migrated = true
+    }
+    if (legacyPassphrase) {
+      storage.setSecret(encryptionPassphraseSecretId, legacyPassphrase)
+      migrated = true
+    }
+  } catch (error) {
+    for (const [id, value] of previous) {
+      try { storage.setSecret(id, value ?? "") } catch { /* Preserve first error; rollback best-effort. */ }
+    }
+    throw error
   }
 
   return {
@@ -66,6 +91,7 @@ export function storeV4Secrets(
   settings: V4SecretBackedSettings,
   storage: SecretStorageLike,
 ): void {
+  assertDistinctV4SecretIds(settings)
   if (settings.githubTokenSecretId) {
     storage.setSecret(settings.githubTokenSecretId, settings.githubToken ?? "")
   }
