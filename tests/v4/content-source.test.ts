@@ -17,6 +17,66 @@ async function* boundedChunks(data: Uint8Array, chunkBytes: number): AsyncIterab
   for (let offset = 0; offset < data.byteLength; offset += chunkBytes) yield data.slice(offset, offset + chunkBytes);
 }
 
+test("collect rejects an already aborted zero-byte non-cooperative source", async () => {
+  const controller = new AbortController();
+  controller.abort(new Error("cancel before empty collection"));
+  let called = false;
+  const source: V4ContentSource = {
+    size: 0,
+    async *chunks() { called = true; },
+  };
+  await assert.rejects(collectV4ContentSource(source, 0, controller.signal),
+    /cancel before empty collection/i);
+  assert.equal(called, false, "cancellation must be checked before entering a source");
+});
+
+test("collect rejects when a source ignores cancellation while providing chunks", async () => {
+  const controller = new AbortController();
+  const source: V4ContentSource = {
+    size: 2,
+    async *chunks() {
+      yield Uint8Array.from([1]);
+      controller.abort(new Error("cancel during source"));
+      yield Uint8Array.from([2]);
+    },
+  };
+  await assert.rejects(collectV4ContentSource(source, 2, controller.signal),
+    /cancel during source/i);
+});
+
+test("collect never reports success if abort arrives after last item before iterator closes", async () => {
+  const controller = new AbortController();
+  const source: V4ContentSource = {
+    size: 1,
+    async *chunks() {
+      yield Uint8Array.from([7]);
+      controller.abort(new Error("cancel after last item"));
+    },
+  };
+  await assert.rejects(collectV4ContentSource(source, 1, controller.signal),
+    /cancel after last item/i);
+});
+
+test("collect abort closes non-cooperative async iterator and runs its finally cleanup", async () => {
+  const controller = new AbortController();
+  const reason = new Error("abort and release iterator");
+  let cleaned = false;
+  const source: V4ContentSource = {
+    size: 2,
+    async *chunks() {
+      try {
+        yield Uint8Array.from([9]);
+        controller.abort(reason);
+        yield Uint8Array.from([8]);
+      } finally {
+        cleaned = true;
+      }
+    },
+  };
+  await assert.rejects(collectV4ContentSource(source, 2, controller.signal), /abort and release iterator/);
+  assert.equal(cleaned, true, "the abandoned source iterator must close after cancellation");
+});
+
 test("planner stays metadata-only and cannot import execution content or staging modules", async () => {
   const source = await readFile(path.join(process.cwd(), "src/lib/v4/planner.ts"), "utf8");
   assert.doesNotMatch(source, /content-source|staging-store|platform-io|local-io|runtime/u);
