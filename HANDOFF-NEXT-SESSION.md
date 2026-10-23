@@ -4,6 +4,13 @@
 >
 > **Mandatory workflow rule:** Every AI session that makes a material change to code, tests, design decisions, branch/PR state, verification status, or next steps MUST update this file before ending or handing work off. GitHub is the source of truth.
 
+## 2026-10-23 Stage D20 — User approved enabling GitHub Issues; UI action still required
+
+- **User consent received:** The user explicitly authorized enabling GitHub Issues on `crystalicez/obsidian-github-sync-multi-platform`, so the *policy decision* is resolved. This **does not authorize implementing** the deferred D12–D18 race issue or switching from Node.js to native.
+- **Execution blocker:** GitHub connector confirms user has repo `admin` permission, but exposed connector actions have **no update-repository-settings / enable-Issues operation**. The Windows host has no `gh` executable; an attempted alternate local-credential API route was blocked by the platform safety checks. Do not bypass that restriction, reveal/use secrets, or claim that `has_issues` was changed. GitHub `create_issue` previously returned HTTP 410 because Issues is disabled. **Actual Issue: NOT YET CREATED.**
+- **User's remaining action:** Open `https://github.com/crystalicez/obsidian-github-sync-multi-platform/settings` → **General** → **Features** → enable **Issues**. Once enabled, the connected GitHub `create_issue` tool can create **one** issue from `docs/engineering/deferred-filesystem-toctou-issue-d19-2026-10-23.md`. Verify the actual issue number and URL, record them in this handoff, but **leave issue deferred and do not fix/research it unless the user explicitly says to revisit it**.
+- **Code & branch:** Only this authorization/blocker handoff and D19 draft status updated on audit branch; no source, native binary, production code, master, release, personal vault, or GitHub Actions affected.
+
 ## 2026-10-23 Stage D19 — USER DECISION: Node.js-first; race-condition research DEFERRED
 
 - **Authoritative direction:** Continue **Node.js + Obsidian API** as primary Desktop/mobile implementation, keeping existing staging/WAL/backup/hash/recovery/containing path guards. Native D16–D18 experiments remain **research only**; do **not** integrate a native binary, select the helper-process-vs-N-API architecture or enable OS strict-share locking. The user **explicitly does not want to revisit/fix filesystem TOCTOU issues unless they later instruct us to look at the issue**. Future sessions must not automatically pick this up just because it is an open release-security research question.

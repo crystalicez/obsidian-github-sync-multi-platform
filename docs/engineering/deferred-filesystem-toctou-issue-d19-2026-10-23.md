@@ -1,6 +1,6 @@
 # Deferred GitHub Issue Draft — Desktop filesystem TOCTOU / path-swap races
 
-**2026-10-23. STATUS: DRAFT — NOT AN ACTUAL GITHUB ISSUE.** On creation attempt in `crystalicez/obsidian-github-sync-multi-platform`, the GitHub API returned **HTTP 410**: `Issues has been disabled in this repository.` The actual issue URL/number **does not exist**. **Do not enable the repository Issues feature without an explicit user decision.**
+**2026-10-23. STATUS: DRAFT — NOT AN ACTUAL GITHUB ISSUE.** On creation attempt in `crystalicez/obsidian-github-sync-multi-platform`, the GitHub API returned **HTTP 410**: `Issues has been disabled in this repository.` The actual issue URL/number **does not exist**. **D20 update:** the user has explicitly approved enabling repository Issues, but the connected tools cannot change that repository setting. An administrator must enable Issues at [repository Settings → General → Features](https://github.com/crystalicez/obsidian-github-sync-multi-platform/settings) before the issue can be created. Do not use local credentials or unsupported API workarounds; keep this draft parked until the switch is enabled.
 
 Suggested eventual title:
 `[Deferred / Node.js-first] Desktop filesystem TOCTOU/path-swap races — D12–D18 findings and native research`
