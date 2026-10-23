@@ -4,6 +4,13 @@
 >
 > **Mandatory workflow rule:** Every AI session that makes a material change to code, tests, design decisions, branch/PR state, verification status, or next steps MUST update this file before ending or handing work off. GitHub is the source of truth.
 
+## 2026-10-24 Stage D43 — pure line-review model recovered from historical snapshots (not yet UI-wired)
+
+- Separate `.worktrees/d43-ui-history-consolidation` from exact D42 SHA `05ff11d0206dad06eb97a8f2b34181096172fefd`; preserve D42 native physical 100MB E2E and all old worktrees. Historical line-review UI `5fb98a1`, `856302f`, `0d8b3b9`, `61a27a1` was NOT integrated in D41/D42. Isolated `git cherry-pick -n 5fb98a1` proved substantial current-runtime/style/test conflicts, safely reset clean; never merge obsolete UI wholesale.
+- Ported only old bounded/cooperative pure `src/lib/v4/conflict-review.ts` and its 14 tests, adapted index access for Maximum Strict `noUncheckedIndexedAccess`; build, strict 0 TS errors, focused **14/14**, full fast **554/554 PASS**. Current live modal STILL only Keep both / Use local / Use remote / Cancel; no UI/wire behavior changed. Details `docs/engineering/d43-conflict-review-integration-boundary-2026-10-24.md`.
+- **Architecture decision pending:** Metadata-first conflict semantics avoid eager remote fetch; old modal eagerly passed remote/local bytes. Safest proposal: fetch commit-pinned verified contents only after explicit Review lines, recheck source/editor snapshot before apply; confirm whether review bound should be 2 MiB (current automatic merge) or historical 16 MiB per side. Require user approval before connecting to live Sync; no silent downgrade of safeguards.
+- D42 pinned native **real Obsidian Windows 2 instances, encrypted exact 100,000,000 B: PASS exit 0**, sender 133,345,317 upload API bytes / 28 requests / 0 failures / 313,749,504 peak renderer RSS / 89.8ms measured encryption / 940.2ms hashing, upload 60.8s; peer 100,053,147 download B / 38 requests / 0 failures / 232,857,600 RSS / 85.2ms decrypt / 506.7ms hashing, restore 38.7s. Exact SHA256 f079cad53add0091ed5d0409b0469f9f5cb745b8c280be685dda73203dea90e8; 0 UI exceptions; two no-op checks 0 B upload; independent disposable branch checker `READ_ONLY_CLEANUP_VERIFIED_TWICE` exit 0. D42 full GitHub E2E is run separately and must be independently recorded.
+
 ## 2026-10-24 Stage D42 — consolidate audit ancestry and restore proven REST-safe 8 MiB writer
 
 - **Canonical isolated integration candidate:** `.worktrees/d42-restore-rest-safe-8mib-writer`, `audit/2026-10-24-d42-restore-rest-safe-8mib-writer` from clean D41 SHA `9cc75e0eb931ccc5eb58a429b8eec8015ca06daf`. NEVER update Zed root, delete snapshot worktrees, touch user's vault, merge default branch, or use GitHub Actions.
