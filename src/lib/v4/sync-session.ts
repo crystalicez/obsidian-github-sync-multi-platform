@@ -74,6 +74,8 @@ export interface V4SyncSessionInput {
   includePath?: (path: string) => boolean
   onProgress?: (patch: V4SyncProgressPatch) => void
   onDecryptionMeasured?: (milliseconds: number) => void
+  onEncryptionMeasured?: (milliseconds: number) => void
+  onHashingMeasured?: (milliseconds: number) => void
   runState?: V4SyncRunState | undefined
   recoveryStore?: V4RecoveryStore | undefined
   resourceLimits?: Partial<V4ResourceLimits>
@@ -267,6 +269,8 @@ export class V4SyncSession {
       resources: this.resources,
       signal: input.signal,
       ...(input.onDecryptionMeasured === undefined ? {} : { onDecryptionMeasured: input.onDecryptionMeasured }),
+      ...(input.onEncryptionMeasured === undefined ? {} : { onEncryptionMeasured: input.onEncryptionMeasured }),
+      ...(input.onHashingMeasured === undefined ? {} : { onHashingMeasured: input.onHashingMeasured }),
     })
     this.now = input.now ?? (() => Date.now())
     this.localIo = createV4LocalIo(input.vault)
@@ -1021,7 +1025,7 @@ export class V4SyncSession {
         path: node.path,
         pathId,
         fileId: previous?.fileId ?? pathId,
-        plaintextSha256: await sha256Hex(file.bytes),
+        plaintextSha256: await this.observeHash(() => sha256Hex(file.bytes)),
         size: file.bytes.byteLength,
         mtime: this.now(),
         remoteVersion: `external:${remote.commitSha}`,
@@ -1221,7 +1225,7 @@ export class V4SyncSession {
       this.ephemeralStages.set(stageId, copy)
       stage = {
         stageId,
-        hash: await this.resources.withCrypto(() => sha256Hex(copy)),
+        hash: await this.resources.withCrypto(() => this.observeHash(() => sha256Hex(copy))),
         size: copy.byteLength,
         mtime,
       }
@@ -1395,14 +1399,14 @@ export class V4SyncSession {
         observedHash = await this.resources.withResidentBytes(expected.size!, async () => {
           const bytes = await this.resources.withVaultRead(() => this.localIo.read(expected.path), this.input.signal)
           if (bytes.byteLength !== expected.size) throw new V4LocalTargetChangedError(expected.path)
-          return this.resources.withCrypto(() => sha256Hex(bytes), this.input.signal)
+          return this.resources.withCrypto(() => this.observeHash(() => sha256Hex(bytes)), this.input.signal)
         }, this.input.signal)
       } else {
         if (!this.localIo.openContentSource) throw new V4LocalTargetChangedError(expected.path)
         const source = await this.localIo.openContentSource({
           kind: "vault", path: expected.path, expectedHash: "", expectedSize: expected.size!, expectedMtime: expected.mtime!,
         }, this.input.signal)
-        observedHash = await hashV4StableContentSource(source, { chunkBytes: 4 * 1024 * 1024, checkStable, signal: this.input.signal })
+        observedHash = await hashV4StableContentSource(source, { chunkBytes: 4 * 1024 * 1024, checkStable, signal: this.input.signal, onHashingMeasured: this.input.onHashingMeasured })
       }
       if (expected.hash && expected.hash !== observedHash) throw new V4LocalTargetChangedError(expected.path)
       expected.hash = observedHash
@@ -1527,6 +1531,18 @@ export class V4SyncSession {
     throw new V4BoundedIoUnavailableError("bounded-read", handle.kind === "vault" ? handle.path : undefined)
   }
 
+  private async observeHash<T>(task: () => Promise<T>): Promise<T> {
+    const observer = this.input.onHashingMeasured
+    if (!observer) return task()
+    const started = performance.now()
+    try { return await task() } finally {
+      const elapsed = performance.now() - started
+      if (Number.isFinite(elapsed) && elapsed >= 0) {
+        try { observer(elapsed) } catch { /* Observability cannot change Sync results. */ }
+      }
+    }
+  }
+
   private async hashLocal(path: string, expectedBytes: number, expectedMtime: number): Promise<string> {
     const handle: Extract<V4ContentHandle, { kind: "vault" }> = {
       kind: "vault",
@@ -1543,12 +1559,13 @@ export class V4SyncSession {
         chunkBytes: Math.min(4 * 1024 * 1024, Math.max(1, expectedBytes)),
         checkStable: () => this.assertVaultSnapshot(handle),
         signal: this.input.signal,
+        onHashingMeasured: this.input.onHashingMeasured,
       })
     }
     return this.resources.withResidentBytes(expectedBytes, async () => {
       const bytes = await this.resources.withVaultRead(() => this.localIo.read(path), this.input.signal)
       if (bytes.byteLength !== expectedBytes) throw new V4SourceChangedError(path, `read ${bytes.byteLength} bytes; expected ${expectedBytes}`)
-      const hash = await this.resources.withCrypto(() => sha256Hex(bytes), this.input.signal)
+      const hash = await this.resources.withCrypto(() => this.observeHash(() => sha256Hex(bytes)), this.input.signal)
       await this.assertVaultSnapshot(handle)
       this.localReadCache.set(path, bytes)
       return hash

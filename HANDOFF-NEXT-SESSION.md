@@ -4,6 +4,13 @@
 >
 > **Mandatory workflow rule:** Every AI session that makes a material change to code, tests, design decisions, branch/PR state, verification status, or next steps MUST update this file before ending or handing work off. GitHub is the source of truth.
 
+## 2026-10-24 Stage D41 — observed content encryption and SHA-256 timings
+
+- **Scope:** Isolated `.worktrees/d41-measured-crypto-timings`, branch `audit/2026-10-24-d41-measured-crypto-timings` from clean pushed D40 `7a4dfcd7ae40a0cb9ddbe06f4d6a42fc08887dc8`. No original Zed/root/default/release, GitHub Actions, native-helper issue #9 or private vault changes.
+- **RED→GREEN observability:** New content AES-GCM encryption and real content SHA-256 work timers in `storage-codec`, sync-session local scans and incremental source hashes, forwarded via runtime to independent optional `V4RunDiagnostics.encryptionMs` and `.hashingMs` alongside D39 `.decryptionMs`. Incremental hash updates/finalization are timed separately from file I/O. Plaintext does not fabricate AES-GCM work; observer errors cannot change content/errors. Metadata SHA/HMAC and historical chunk reassembly hashing are not claimed as complete application hash CPU totals; real observed content-work sums only. Wire format, policies, crypto keys/AAD, CAS and rate limiter untouched. Details `docs/engineering/d41-observed-encryption-and-hashing-2026-10-24.md`.
+- **Offline gates:** First focused codec **RED** for missing encryption/hash timings, then focused **12/12 GREEN**; measured incremental hash callback + exception safety and diagnostics propagation tests GREEN. Frozen offline install PASS, build and Maximum Strict TypeScript 0 errors, fast **538/538 PASS**, repeat **10×538/538 PASS**, recovery **79/79**, resource **11/11**, feasibility **134/134**, bounded virtual 100,000,000-byte soak **1/1**, GitHub E2E 3 bundle compile, metadata/package and `git diff --check` PASS.
+- **Next:** Pin clean code SHA and run real Windows encrypted two-instance **exact 100,000,000-byte** `--native-100mb --verify-peer --journey --assert-diagnostics` and independently double-verify disposable GitHub branch deletion. Document exact source SHA and any failures; do not mislabel virtual soak as native. D38 intermittent missing-object P0 still OPEN; no unapproved data semantics, main/release merge, or GitHub Actions.
+
 ## 2026-10-24 Stage D40 — immutable Git identity and missing-object forensic hardening
 
 - **Safe scope:** New isolated `.worktrees/d40-missing-object-forensics` branch `audit/2026-10-24-d40-missing-object-forensics`, parent pushed D39 `1b0793e38939d29ad6190b846ad7d35bd1c8b717`. Root Zed checkout, user vaults, default/release, GitHub Actions and Native OS Helper Issue #9 untouched.

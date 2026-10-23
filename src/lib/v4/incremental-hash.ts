@@ -170,6 +170,28 @@ export function createV4IncrementalSha256(): V4IncrementalHash {
   return new V4IncrementalSha256()
 }
 
+/** Time only actual synchronous SHA-256 update/finalization, excluding source I/O. */
+export function createV4ObservedIncrementalSha256(onHashingMeasured?: (milliseconds: number) => void): V4IncrementalHash {
+  const hash = createV4IncrementalSha256()
+  if (!onHashingMeasured) return hash
+  const measured = <T>(task: () => T): T => {
+    const started = performance.now()
+    try {
+      return task()
+    } finally {
+      const elapsed = performance.now() - started
+      if (Number.isFinite(elapsed) && elapsed >= 0) {
+        try { onHashingMeasured(elapsed) } catch { /* Observability must not change hashing. */ }
+      }
+    }
+  }
+  return {
+    update: value => measured(() => hash.update(value)),
+    digest: () => measured(() => hash.digest()),
+    digestHex: () => measured(() => hash.digestHex()),
+  }
+}
+
 export async function sha256V4ChunksHex(chunks: AsyncIterable<Uint8Array>, signal?: AbortSignal): Promise<string> {
   const hash = createV4IncrementalSha256()
   for await (const chunk of chunks) {

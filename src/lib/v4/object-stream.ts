@@ -1,5 +1,5 @@
 import type { V4ContentSource } from "./content-source"
-import { createV4IncrementalSha256 } from "./incremental-hash"
+import { createV4ObservedIncrementalSha256 } from "./incremental-hash"
 import type { V4FileRecord } from "./protocol-types"
 
 export class V4SourceChangedError extends Error {
@@ -30,6 +30,7 @@ export interface V4StableHashOptions {
   chunkBytes: number
   checkStable?: () => Promise<void>
   signal?: AbortSignal | undefined
+  onHashingMeasured?: ((milliseconds: number) => void) | undefined
 }
 
 function assertPositiveSafeInteger(value: number, label: string): void {
@@ -39,7 +40,7 @@ function assertPositiveSafeInteger(value: number, label: string): void {
 export async function hashV4StableContentSource(source: V4ContentSource, options: V4StableHashOptions): Promise<string> {
   assertPositiveSafeInteger(options.chunkBytes, "chunkBytes")
   await options.checkStable?.()
-  const hash = createV4IncrementalSha256()
+  const hash = createV4ObservedIncrementalSha256(options.onHashingMeasured)
   let total = 0
   for await (const chunk of source.chunks(options.chunkBytes, options.signal)) {
     if (options.signal?.aborted) throw options.signal.reason ?? new Error("V4 source hashing aborted.")

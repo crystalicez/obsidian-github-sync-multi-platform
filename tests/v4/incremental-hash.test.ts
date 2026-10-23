@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { sha256Hex } from "../../src/lib/bytes";
-import { createV4IncrementalSha256, sha256V4ChunksHex } from "../../src/lib/v4/incremental-hash";
+import { createV4IncrementalSha256, createV4ObservedIncrementalSha256, sha256V4ChunksHex } from "../../src/lib/v4/incremental-hash";
 
 function deterministicBytes(size: number): Uint8Array {
   const bytes = new Uint8Array(size);
@@ -32,6 +32,20 @@ test("incremental SHA-256 matches the current whole-buffer hash", async () => {
   await verify(new Uint8Array([0xab]), [1]);
   await verify(deterministicBytes(1024 * 1024), [1, 3, 7, 64, 1021, 8192, 65537]);
   await verify(deterministicBytes(50 * 1024 * 1024 + 1), [31, 4096, 65536, 1024 * 1024, 3 * 1024 * 1024]);
+});
+
+test("observed incremental SHA-256 accounts for only hash operations and tolerates observer failure", async () => {
+  const payload = deterministicBytes(128 * 1024);
+  const samples: number[] = [];
+  const hash = createV4ObservedIncrementalSha256(ms => samples.push(ms));
+  hash.update(payload.subarray(0, 65_536));
+  hash.update(payload.subarray(65_536));
+  assert.equal(hash.digestHex(), await sha256Hex(payload));
+  assert.equal(samples.length, 3, "two hash updates and one digest, without source I/O time");
+  assert.ok(samples.every(ms => Number.isFinite(ms) && ms >= 0));
+  const observerFail = createV4ObservedIncrementalSha256(() => { throw Error("metrics failed"); });
+  observerFail.update(payload);
+  assert.equal(observerFail.digestHex(), await sha256Hex(payload));
 });
 
 test("incremental SHA helper hashes async chunk streams without concatenating", async () => {

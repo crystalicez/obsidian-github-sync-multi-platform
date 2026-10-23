@@ -8,6 +8,46 @@ import { sha256Hex } from "../../src/lib/bytes";
 
 const bytes = (value: string) => new TextEncoder().encode(value);
 
+test("content AES-GCM encryption and plaintext SHA-256 emit independent real work timings", async () => {
+  const keys = await deriveV4Keyring({ passphrase: "observed", repoId: "o/r#main", salt: bytes("salt"), iterations: 10 });
+  const encrypt: number[] = [];
+  const hash: number[] = [];
+  const codec = new V4StorageCodec({
+    mode: "encrypted", pathLayout: "opaque-stable-v1", keyring: keys,
+    onEncryptionMeasured: ms => encrypt.push(ms),
+    onHashingMeasured: ms => hash.push(ms),
+  });
+  const payload = bytes("content encryption and hashing measurement");
+  const prepared = await codec.prepare("Secret/observed.md", payload, "v1", 1, "file-observed");
+  assert.equal(encrypt.length, 1, "only real content AES-GCM encrypt is measured, not key or path derivation");
+  assert.equal(hash.length, 1, "plaintext SHA-256 runs once while preparing a single object");
+  assert.ok(encrypt.every(ms => Number.isFinite(ms) && ms >= 0));
+  assert.ok(hash.every(ms => Number.isFinite(ms) && ms >= 0));
+  assert.deepEqual(await codec.read(prepared.record, async () => prepared.files[0]!.bytes), payload);
+  assert.equal(encrypt.length, 1, "reading encrypted content must not count as encrypting");
+  assert.equal(hash.length, 2, "read-side plaintext SHA-256 verification is also real hashing");
+  const observerFailure = new V4StorageCodec({
+    mode: "encrypted", pathLayout: "opaque-stable-v1", keyring: keys,
+    onEncryptionMeasured: () => { throw new Error("observer failed"); },
+    onHashingMeasured: () => { throw new Error("observer failed"); },
+  });
+  const safe = await observerFailure.prepare("Secret/safe.md", payload, "v2", 2, "file-safe");
+  assert.deepEqual(await observerFailure.read(safe.record, async () => safe.files[0]!.bytes), payload);
+});
+
+test("plaintext content hashes are measured without synthetic encryption samples", async () => {
+  const encrypt: number[] = [];
+  const hash: number[] = [];
+  const codec = new V4StorageCodec({
+    mode: "plaintext", pathLayout: "plaintext-v1",
+    onEncryptionMeasured: ms => encrypt.push(ms), onHashingMeasured: ms => hash.push(ms),
+  });
+  const file = await codec.prepare("Notes/plain.md", bytes("public"), "v1", 1);
+  assert.deepEqual(await codec.read(file.record, async () => file.files[0]!.bytes), bytes("public"));
+  assert.equal(encrypt.length, 0);
+  assert.equal(hash.length, 2);
+});
+
 test("encrypted codec measures actual decryption work, including failed authentication, without changing bytes", async () => {
   const keys = await deriveV4Keyring({ passphrase: "timing-only", repoId: "o/r#main", salt: bytes("salt"), iterations: 10 });
   const samples: number[] = [];

@@ -147,6 +147,8 @@ export class V4PluginRuntime {
   private diagnosticsBaseline?: V4TransportMetricsSnapshot
   private peakRendererRssBytes: number | undefined
   private runDecryptionMs: number | undefined
+  private runEncryptionMs: number | undefined
+  private runHashingMs: number | undefined
   private readonly platformIo: V4PlatformIo
   private readonly uncVault: boolean
   private networkStorageNoticeShown = false
@@ -325,6 +327,8 @@ export class V4PluginRuntime {
       snapshot.totalElapsedMs,
       this.peakRendererRssBytes,
       this.runDecryptionMs,
+      this.runEncryptionMs,
+      this.runHashingMs,
     )
     return Object.freeze({ ...snapshot, lifecycle, diagnostics: Object.freeze(diagnostics) })
   }
@@ -520,6 +524,8 @@ export class V4PluginRuntime {
     this.diagnosticsBaseline = github?.transportMetricsSnapshot
     this.peakRendererRssBytes = undefined
     this.runDecryptionMs = undefined
+    this.runEncryptionMs = undefined
+    this.runHashingMs = undefined
     const continuingDebounceRun = this.debounceRunActive
     this.debounceRunActive = false
     const runPatch = {
@@ -681,6 +687,14 @@ export class V4PluginRuntime {
             runState,
             recoveryStore,
             signal,
+            onEncryptionMeasured: milliseconds => {
+              if (!Number.isFinite(milliseconds) || milliseconds < 0) return
+              this.runEncryptionMs = (this.runEncryptionMs ?? 0) + milliseconds
+            },
+            onHashingMeasured: milliseconds => {
+              if (!Number.isFinite(milliseconds) || milliseconds < 0) return
+              this.runHashingMs = (this.runHashingMs ?? 0) + milliseconds
+            },
             onDecryptionMeasured: milliseconds => {
               if (!Number.isFinite(milliseconds) || milliseconds < 0) return
               this.runDecryptionMs = (this.runDecryptionMs ?? 0) + milliseconds

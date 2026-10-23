@@ -25,6 +25,8 @@ export function createV4RunDiagnostics(
   _elapsedMs: number,
   peakRendererRssBytes?: number,
   decryptionMs?: number,
+  encryptionMs?: number,
+  hashingMs?: number,
 ): V4RunDiagnostics {
   const delta = (now: number, before: number) => Math.max(0, now - before)
   return {
@@ -38,5 +40,7 @@ export function createV4RunDiagnostics(
     oldestInFlightApiMs: current.oldestInFlightApiMs,
     ...(peakRendererRssBytes === undefined ? {} : { peakRendererRssBytes }),
     ...(decryptionMs === undefined ? {} : { decryptionMs }),
+    ...(encryptionMs === undefined ? {} : { encryptionMs }),
+    ...(hashingMs === undefined ? {} : { hashingMs }),
   }
 }
