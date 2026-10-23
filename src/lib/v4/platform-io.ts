@@ -204,6 +204,33 @@ export function createV4PlatformIo(options: V4PlatformIoOptions): V4PlatformIo {
       await assertDesktopPathSafe(logical)
     }
   }
+  const assertRecoveryPathsSync = (
+    stagePath: string, targetPath: string,
+    fsSync: typeof import("node:fs"), pathModule: typeof import("node:path"),
+  ): void => {
+    const root = pathModule.resolve(options.desktopRootPath!)
+    for (const logical of [stagePath, stagePath + ".target-backup", stagePath + ".replacement-residue", targetPath]) {
+      const relative = pathModule.relative(root, pathModule.resolve(full(logical)))
+      if (!relative || relative === ".." || relative.startsWith(".." + pathModule.sep) || pathModule.isAbsolute(relative)) {
+        throw new V4ManualRecoveryRequiredError(logical, "path leaves the configured vault")
+      }
+      let current = root
+      const segments = relative.split(pathModule.sep)
+      for (const [index, segment] of segments.entries()) {
+        current = pathModule.join(current, segment)
+        try {
+          const info = fsSync.lstatSync(current)
+          if (info.isSymbolicLink()) throw new V4ManualRecoveryRequiredError(logical, "late symlink or junction path change")
+          if (index < segments.length - 1 && !info.isDirectory()) {
+            throw new V4ManualRecoveryRequiredError(logical, "non-directory path component")
+          }
+        } catch (error) {
+          if ((error as { code?: string }).code === "ENOENT") break
+          throw error
+        }
+      }
+    }
+  }
   const hashFile = async (file: string, size: number): Promise<string | null> => {
     const before = await statOrNull(file)
     if (!before || before.size !== size || !before.isFile()) return null
@@ -302,6 +329,7 @@ export function createV4PlatformIo(options: V4PlatformIoOptions): V4PlatformIo {
     },
     async rollbackStage(stagePath, targetPath, commitOptions) {
       if (!desktopReady) return
+      const pathModule = await desktopPath()
       await assertRecoveryPaths(stagePath, targetPath)
       const fs = await desktopFs()
       const fsSync = await desktopFsSync()
@@ -342,14 +370,19 @@ export function createV4PlatformIo(options: V4PlatformIoOptions): V4PlatformIo {
         // Park rather than delete the replacement. A crash during restoration
         // leaves both the original backup and the candidate replacement intact.
         commitOptions.assertNoOpenEditor?.()
+        if (options.desktopRootPath) assertRecoveryPathsSync(stagePath, targetPath, fsSync, pathModule)
         fsSync.renameSync(target, residue)
       }
       try {
         commitOptions.assertNoOpenEditor?.()
+        if (options.desktopRootPath) assertRecoveryPathsSync(stagePath, targetPath, fsSync, pathModule)
         fsSync.renameSync(backup, target)
       } catch (error) {
         if (await statOrNull(residue) && !(await statOrNull(target))) {
-          try { fsSync.renameSync(residue, target) } catch {}
+          try {
+            if (options.desktopRootPath) assertRecoveryPathsSync(stagePath, targetPath, fsSync, pathModule)
+            fsSync.renameSync(residue, target)
+          } catch {}
         }
         throw error
       }
@@ -384,6 +417,7 @@ export function createV4PlatformIo(options: V4PlatformIoOptions): V4PlatformIo {
       if (options.desktopRootPath) await assertRecoveryPaths(stagePath, targetPath)
       const fs = await desktopFs()
       const fsSync = await desktopFsSync()
+      const pathModule = await desktopPath()
       const stage = full(stagePath)
       const target = full(targetPath)
       const backup = `${stage}.target-backup`
@@ -419,10 +453,12 @@ export function createV4PlatformIo(options: V4PlatformIoOptions): V4PlatformIo {
       try {
         if (options.desktopRootPath) await assertRecoveryPaths(stagePath, targetPath)
         commitOptions.assertNoOpenEditor?.()
+        if (options.desktopRootPath) assertRecoveryPathsSync(stagePath, targetPath, fsSync, pathModule)
         if (targetBefore) { fsSync.renameSync(target, backup); backedUp = true }
         // Recheck without yielding between the two synchronous renames.
         // If the guard vetoes, restore the verified original backup.
         commitOptions.assertNoOpenEditor?.()
+        if (options.desktopRootPath) assertRecoveryPathsSync(stagePath, targetPath, fsSync, pathModule)
         fsSync.renameSync(stage, target); stageMoved = true
         const after = await fs.stat(target)
         if (after.size !== commitOptions.expectedStageSize) throw new Error(`V4 committed target size mismatch: ${targetPath}`)
@@ -442,7 +478,10 @@ export function createV4PlatformIo(options: V4PlatformIoOptions): V4PlatformIo {
           if (!(await confirmBackup(backup, expected)) || await statOrNull(target)) {
             throw new V4ManualRecoveryRequiredError(targetPath, "backup cannot be proven safe after the staged rename failed")
           }
-          try { fsSync.renameSync(backup, target) }
+          try {
+            if (options.desktopRootPath) assertRecoveryPathsSync(stagePath, targetPath, fsSync, pathModule)
+            fsSync.renameSync(backup, target)
+          }
           catch {
             throw new V4ManualRecoveryRequiredError(targetPath, "verified original backup could not be restored")
           }

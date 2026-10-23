@@ -4,6 +4,14 @@
 >
 > **Mandatory workflow rule:** Every AI session that makes a material change to code, tests, design decisions, branch/PR state, verification status, or next steps MUST update this file before ending or handing work off. GitHub is the source of truth.
 
+## 2026-10-23 Stage D12 — late Desktop path-swap regression and synchronous rename guards
+
+- **Isolation:** Continued only in `.tmp/staged-production-6c67c8a` at audit branch from `49b309fa`. No `master`, GitHub Actions, release, personal vault or live GitHub mutation. User's open-note policy 1 and in-flight settings policy B unchanged.
+- **Physical Windows fail-first evidence:** A parent junction installed after asynchronous preflight caused `commitStage` to accept an out-of-vault destination (RED: `Missing expected rejection`). The matching `rollbackStage` regression observed actual outside-file bytes change from `[42,43,44]` to `[7,8,9]`. Both use disposable real paths, not simulated-memory IO.
+- **Bounded fix:** Added synchronous `lstatSync` checks for stage, target, backup and residue path components immediately after the editor callbacks and before the sensitive Desktop `renameSync` calls. On a late unsafe swap, stop and preserve original backup/stage evidence, including during attempted restoration. Tests in `tests/v4/staged-desktop-io-containment.test.ts` now pass **12/12**. Full details at `docs/engineering/desktop-late-path-swap-d12-2026-10-23.md`.
+- **Local qualification:** Production Build, Fast **498/498**, Recovery **79/79**, Fast Repeat **10 × 498/498**, Resource **11/11**, Feasibility **132/132**, virtual cryptographic soak at exactly **100,000,000 bytes** 1/1, metadata/package validation, and GitHub E2E compile-only (3 bundles) exit 0. No D12 native Obsidian GUI or credentialed GitHub writes.
+- **IMPORTANT residual:** A synchronous path check is **not atomic directory-handle-relative OS I/O**. Another process can race between the check and native rename. Extra metadata `lstatSync` calls can block Electron's renderer on slow/network filesystems; measure before release. Cross-process junction/handle pinning, full 1,000-note native scenario on this SHA, physical macOS/Linux/mobile, C2 protocol migration and line merge UX all remain release blockers. No merge/release.
+
 ## 2026-10-23 Stage D11 — real Windows child-process crash boundaries; rollback proof-gated completion
 
 - **Scope:** Isolated audit worktree `.tmp/staged-production-6c67c8a`, base commit `01a7ce4266d4f4051974a2a2a6bfb4a27f4e1503`. No change to `master`, no GitHub Actions, no personal vault. User policy 1 for open notes and credential settings policy B remain unchanged.

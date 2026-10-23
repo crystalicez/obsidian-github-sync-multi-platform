@@ -1,5 +1,6 @@
 import assert from "node:assert/strict"
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises"
+import { renameSync, symlinkSync } from "node:fs"
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile, stat } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import test from "node:test"
@@ -136,6 +137,97 @@ test("D3 desktop whole-file read refuses a junction escape even when the adapter
     await assert.rejects(() => io.readWhole("linked/private.bin"), /symlink|junction|vault|outside|unsafe|review/i)
     assert.deepEqual(new Uint8Array(await readFile(path.join(external, "private.bin"))), unchanged)
   })
+})
+
+test("D12: a parent junction appearing after async preflight cannot redirect staged commit outside the vault", async t => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "v4-stage-path-swap-"))
+  const external = await mkdtemp(path.join(os.tmpdir(), "v4-stage-path-outside-"))
+  try {
+    const folder = path.join(root, "notes")
+    const savedFolder = path.join(root, "saved-notes")
+    await mkdir(folder)
+    await writeFile(path.join(folder, "note.md"), unchanged)
+    await writeFile(path.join(root, "stage.bin"), added)
+    try {
+      await symlink(external, path.join(root, "link-probe"), process.platform === "win32" ? "junction" : "dir")
+      await rm(path.join(root, "link-probe"))
+    } catch (error) {
+      if (["EPERM", "EACCES", "ENOSYS"].includes((error as { code?: string }).code ?? "")) {
+        t.skip("Directory links unavailable on this host")
+        return
+      }
+      throw error
+    }
+    const io = createV4PlatformIo({
+      platform: "desktop", desktopRootPath: root, resolveDesktopPath: logical => path.join(root, logical),
+    })
+    const before = await stat(path.join(folder, "note.md"))
+    const originalHash = await sha256Hex(unchanged)
+    const candidateHash = await sha256Hex(added)
+    let guards = 0
+    await assert.rejects(() => io.commitStage("stage.bin", "notes/note.md", {
+      expectedTarget: { exists: true, size: unchanged.byteLength, mtime: Math.round(before.mtimeMs), hash: originalHash },
+      expectedStageSize: added.byteLength, expectedStageSha256: candidateHash,
+      assertNoOpenEditor: () => {
+        if (++guards !== 2) return
+        renameSync(folder, savedFolder)
+        symlinkSync(external, folder, process.platform === "win32" ? "junction" : "dir")
+      },
+    }), /symlink|junction|vault|unsafe|review/i)
+    assert.equal(guards, 2)
+    await assert.rejects(readFile(path.join(savedFolder, "note.md")), { code: "ENOENT" })
+    await assert.rejects(readFile(path.join(external, "note.md")), { code: "ENOENT" })
+    assert.deepEqual(new Uint8Array(await readFile(path.join(root, "stage.bin"))), added)
+    assert.deepEqual(new Uint8Array(await readFile(path.join(root, "stage.bin.target-backup"))), unchanged)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+    await rm(external, { recursive: true, force: true })
+  }
+})
+
+test("D12: rollback refuses a junction installed immediately before restoring the original", async t => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "v4-rollback-path-swap-"))
+  const external = await mkdtemp(path.join(os.tmpdir(), "v4-rollback-path-outside-"))
+  try {
+    const folder = path.join(root, "notes")
+    const parked = path.join(root, "saved-notes")
+    await mkdir(folder)
+    await writeFile(path.join(folder, "note.md"), added)
+    await writeFile(path.join(root, "stage.bin.target-backup"), unchanged)
+    await writeFile(path.join(external, "note.md"), new Uint8Array([42, 43, 44]))
+    try {
+      await symlink(external, path.join(root, "link-probe"), process.platform === "win32" ? "junction" : "dir")
+      await rm(path.join(root, "link-probe"))
+    } catch (error) {
+      if (["EPERM", "EACCES", "ENOSYS"].includes((error as { code?: string }).code ?? "")) {
+        t.skip("Directory links unavailable on this host")
+        return
+      }
+      throw error
+    }
+    const io = createV4PlatformIo({
+      platform: "desktop", desktopRootPath: root, resolveDesktopPath: logical => path.join(root, logical),
+    })
+    const originalHash = await sha256Hex(unchanged)
+    const stagedHash = await sha256Hex(added)
+    let guardAlreadySwapped = false
+    await assert.rejects(() => io.rollbackStage("stage.bin", "notes/note.md", {
+      expectedTarget: { exists: true, size: unchanged.byteLength, hash: originalHash },
+      expectedStageSize: added.byteLength, expectedStageSha256: stagedHash,
+      assertNoOpenEditor: () => {
+        if (guardAlreadySwapped) return
+        guardAlreadySwapped = true
+        renameSync(folder, parked)
+        symlinkSync(external, folder, process.platform === "win32" ? "junction" : "dir")
+      },
+    }), /symlink|junction|vault|unsafe|review/i)
+    assert.deepEqual(new Uint8Array(await readFile(path.join(external, "note.md"))), new Uint8Array([42, 43, 44]))
+    assert.deepEqual(new Uint8Array(await readFile(path.join(parked, "note.md"))), added)
+    assert.deepEqual(new Uint8Array(await readFile(path.join(root, "stage.bin.target-backup"))), unchanged)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+    await rm(external, { recursive: true, force: true })
+  }
 })
 
 test("D3 direct staged-file symlink cannot be overwritten, appended, read, or removed", async t => {
