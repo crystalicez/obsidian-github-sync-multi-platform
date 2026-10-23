@@ -15,6 +15,8 @@ export interface V4RunDiagnostics {
   /** Only populated by measured crypto/hash instrumentation; never infer from phase elapsed. */
   hashingMs?: number
   encryptionMs?: number
+  /** Sum of observed content-decrypt calls, not download or whole Pull duration. */
+  decryptionMs?: number
 }
 
 export function createV4RunDiagnostics(
@@ -22,6 +24,7 @@ export function createV4RunDiagnostics(
   current: V4TransportMetricsSnapshot,
   _elapsedMs: number,
   peakRendererRssBytes?: number,
+  decryptionMs?: number,
 ): V4RunDiagnostics {
   const delta = (now: number, before: number) => Math.max(0, now - before)
   return {
@@ -34,5 +37,6 @@ export function createV4RunDiagnostics(
     inFlightApiRequests: current.inFlightApiRequests,
     oldestInFlightApiMs: current.oldestInFlightApiMs,
     ...(peakRendererRssBytes === undefined ? {} : { peakRendererRssBytes }),
+    ...(decryptionMs === undefined ? {} : { decryptionMs }),
   }
 }

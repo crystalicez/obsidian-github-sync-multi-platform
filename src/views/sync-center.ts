@@ -196,6 +196,7 @@ export class V4SyncCenterView extends ItemView {
     this.renderTiming(container, "Peak renderer RAM", d.peakRendererRssBytes === undefined ? "unavailable" : bytes(d.peakRendererRssBytes))
     this.renderTiming(container, "Hashing", d.hashingMs === undefined ? "not measured" : formatV4Duration(d.hashingMs))
     this.renderTiming(container, "Encryption", d.encryptionMs === undefined ? "not measured" : formatV4Duration(d.encryptionMs))
+    this.renderTiming(container, "Decryption", d.decryptionMs === undefined ? "not measured" : formatV4Duration(d.decryptionMs))
   }
 
   private renderProgressDetails(container: HTMLElement, snapshot: V4SyncProgressSnapshot): void {

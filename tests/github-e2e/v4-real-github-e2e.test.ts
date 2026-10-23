@@ -294,6 +294,21 @@ function createDevice(name: string, config: GitHubConfig, context: ModeContext, 
     pathLayout: expectedV4PathLayout(context.mode),
   });
   const client = new GitHubClient(config);
+  // Diagnostic only: preserve the exact immutable ref that returned no object.
+  // This is essential for distinguishing stale metadata from a missing blob.
+  const getFileBytes = client.getFileBytes.bind(client);
+  client.getFileBytes = async (path, ref) => {
+    const file = await getFileBytes(path, ref);
+    if (!file && path === "Notes/reborn.md") {
+      console.error(JSON.stringify({
+        kind: "delete-recreate-missing-object-evidence", device: name,
+        refRequested: ref ?? null, localIndexCommitSha: index.remoteCommitSha,
+        localRecordFileIds: Object.values(index.shards).flatMap(shard => Object.values(shard.records))
+          .filter(record => record.path === path && !record.deleted).map(record => record.fileId),
+      }));
+    }
+    return file;
+  };
   const sessionInput = {
     github: client,
     vault,

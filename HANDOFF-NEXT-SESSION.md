@@ -4,6 +4,13 @@
 >
 > **Mandatory workflow rule:** Every AI session that makes a material change to code, tests, design decisions, branch/PR state, verification status, or next steps MUST update this file before ending or handing work off. GitHub is the source of truth.
 
+## 2026-10-24 Stage D39 — real content decryption timing (audit; not a P0 resolution)
+
+- **Source:** Pushed D38 `5e12382589853a9b1b8b5fe8f0c1c9a5e17e51e6` in new isolated `.worktrees/d39-measured-decryption-evidence`, branch `audit/2026-10-24-d39-measured-decryption-evidence`. Original Zed/root, master/release, private vault, GitHub Actions, Native Helper Issue #9 untouched.
+- **RED→GREEN:** `V4StorageCodec` measured-decryption test failed **9/10**, 0 observer events from actual AES-GCM read. Implemented optional, guarded duration observer around actual authenticated content decrypt calls after resource admission, including failed authentication; original bytes and errors unchanged. Plaintext does not claim decrypt work. UI adds Decryption timing and run diagnostics reset on every run; Hashing/Encryption remain deliberately `not measured`. Focused codec **10/10 PASS**. Details: `docs/engineering/d39-measured-decryption-and-missing-object-evidence-2026-10-24.md`.
+- **P0 missing-object:** D38 full live GitHub 2/3 RED intermittent delete/recreate is **OPEN**. Added synthetic E2E-only missing-object log of the exact ref argument, local index SHA and local file IDs when `Notes/reborn.md` returns null. This is read-only evidence for future repro; no GitHub client, CAS, retry, security or conflict behavior changed.
+- **Offline verification:** Frozen offline install, build/Maximum Strict 0 errors; Fast **532/532**, Repeat **10×532/532**, Recovery **79/79**, Resource **11/11**, Feasibility **134/134**, bounded virtual 100,000,000-byte Soak **1/1**, GitHub E2E compile-only 3 bundles, metadata/package and diff check all PASS. Latest focused verification after final observer-failure assertion remains to run. Exact-source native Obsidian strict diagnostics and independently verified GitHub cleanup pending; do not label production-ready or claim SHA-qualified live tests yet.
+
 ## 2026-10-24 Stage D38 — D35 elapsed-rate UI fix integrated with Maximum Strict TypeScript
 
 - **Safe branch:** From clean/pushed D37 `4588820b904502959b4c1729052e4ff599770629`, created new `audit/2026-10-24-d38-strict-telemetry-integration` in the existing isolated D37 worktree; original Zed/root, separate D35, master/release, user vault, and credentials untouched. New product/test commit `00d3732efab0b9f637e7cb8c8298b36509a1d561`.

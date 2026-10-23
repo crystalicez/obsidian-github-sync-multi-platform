@@ -73,6 +73,7 @@ export interface V4SyncSessionInput {
   askConflict?: (input: { path: string; localMtime: number; remoteMtime: number }) => Promise<V4ConflictResolution>
   includePath?: (path: string) => boolean
   onProgress?: (patch: V4SyncProgressPatch) => void
+  onDecryptionMeasured?: (milliseconds: number) => void
   runState?: V4SyncRunState | undefined
   recoveryStore?: V4RecoveryStore | undefined
   resourceLimits?: Partial<V4ResourceLimits>
@@ -251,6 +252,7 @@ export class V4SyncSession {
       keyring: input.keyring,
       resources: this.resources,
       signal: input.signal,
+      ...(input.onDecryptionMeasured === undefined ? {} : { onDecryptionMeasured: input.onDecryptionMeasured }),
     })
     this.now = input.now ?? (() => Date.now())
     this.localIo = createV4LocalIo(input.vault)

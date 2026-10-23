@@ -47,4 +47,8 @@ test("per-run diagnostics subtract old transport counts, report exact observed b
   assert.equal(report.inFlightApiRequests, 0)
   assert.equal(report.hashingMs, undefined)
   assert.equal(report.encryptionMs, undefined)
+  assert.equal(report.decryptionMs, undefined)
+  const measured = createV4RunDiagnostics(baseline, metrics.snapshot, 1000, 123_456, 12.5)
+  assert.equal(measured.decryptionMs, 12.5)
+  assert.equal(measured.hashingMs, undefined)
 })

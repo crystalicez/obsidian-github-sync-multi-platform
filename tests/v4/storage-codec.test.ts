@@ -8,6 +8,40 @@ import { sha256Hex } from "../../src/lib/bytes";
 
 const bytes = (value: string) => new TextEncoder().encode(value);
 
+test("encrypted codec measures actual decryption work, including failed authentication, without changing bytes", async () => {
+  const keys = await deriveV4Keyring({ passphrase: "timing-only", repoId: "o/r#main", salt: bytes("salt"), iterations: 10 });
+  const samples: number[] = [];
+  const codec = new V4StorageCodec({
+    mode: "encrypted", pathLayout: "opaque-stable-v1", keyring: keys,
+    onDecryptionMeasured: milliseconds => samples.push(milliseconds),
+  });
+  const prepared = await codec.prepare("Notes/measured.md", bytes("unchanged secret"), "v1", 1, "measured-file");
+  const restored = await codec.read(prepared.record, async () => prepared.files[0]!.bytes);
+  assert.deepEqual(restored, bytes("unchanged secret"));
+  assert.equal(samples.length, 1);
+  assert.ok(Number.isFinite(samples[0]) && samples[0]! >= 0);
+  const corrupted = new Uint8Array(prepared.files[0]!.bytes);
+  corrupted[corrupted.byteLength - 1] ^= 1;
+  await assert.rejects(() => codec.read(prepared.record, async () => corrupted));
+  assert.equal(samples.length, 2, "failed authentication must not hide attempted decryption work");
+  assert.ok(samples.every(value => Number.isFinite(value) && value >= 0));
+  const observerFailure = new V4StorageCodec({
+    mode: "encrypted", pathLayout: "opaque-stable-v1", keyring: keys,
+    onDecryptionMeasured: () => { throw new Error("telemetry callback unavailable"); },
+  });
+  assert.deepEqual(await observerFailure.read(prepared.record, async () => prepared.files[0]!.bytes), bytes("unchanged secret"));
+});
+
+test("plaintext codec emits no decryption timing", async () => {
+  let measured = 0;
+  const codec = new V4StorageCodec({
+    mode: "plaintext", pathLayout: "plaintext-v1", onDecryptionMeasured: () => { measured++; },
+  });
+  const prepared = await codec.prepare("Notes/plain.md", bytes("public"), "v1", 1);
+  assert.deepEqual(await codec.read(prepared.record, async () => prepared.files[0]!.bytes), bytes("public"));
+  assert.equal(measured, 0);
+});
+
 test("v4 plaintext codec stores a small file at its unchanged vault path", async () => {
   const codec = new V4StorageCodec({ mode: "plaintext", pathLayout: "plaintext-v1" });
   const prepared = await codec.prepare("Notes/สวัสดี.md", bytes("hello"), "v1", 10);

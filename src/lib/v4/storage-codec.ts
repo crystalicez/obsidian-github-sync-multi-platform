@@ -55,6 +55,7 @@ export class V4StorageCodec {
     keyring?: V4Keyring | undefined
     resources?: Pick<V4ResourceController, "withCrypto"> & Partial<Pick<V4ResourceController, "reserveResidentBytes">>
     signal?: AbortSignal | undefined
+    onDecryptionMeasured?: (milliseconds: number) => void
   }) {
     if (options.mode === "encrypted" && !options.keyring) {
       throw new Error("Encrypted V4 storage requires a keyring.")
@@ -66,6 +67,22 @@ export class V4StorageCodec {
     const value = this.options.resources ? await this.options.resources.withCrypto(task, this.options.signal) : await task()
     throwIfV4Aborted(this.options.signal)
     return value
+  }
+
+  private async decrypt<T>(task: () => Promise<T>): Promise<T> {
+    const observer = this.options.onDecryptionMeasured
+    if (!observer) return this.crypto(task)
+    return this.crypto(async () => {
+      const started = performance.now()
+      try {
+        return await task()
+      } finally {
+        const elapsed = performance.now() - started
+        if (Number.isFinite(elapsed) && elapsed >= 0) {
+          try { observer(elapsed) } catch { /* Telemetry must never change decryption results. */ }
+        }
+      }
+    })
   }
 
   private contentAad(record: { fileId: string; pathId: string; remoteVersion: string }): string {
@@ -453,7 +470,7 @@ export class V4StorageCodec {
         const bytes = await reader(this.objectPathAt(partPaths, index))
         const plaintext = this.options.mode === "plaintext"
           ? bytes
-          : await this.crypto(() => decryptV4Payload(this.options.keyring!.contentKey, bytes, {
+          : await this.decrypt(() => decryptV4Payload(this.options.keyring!.contentKey, bytes, {
             kind: "part",
             aad: `${this.contentAad(record)}:${index}`,
           }))
@@ -475,7 +492,7 @@ export class V4StorageCodec {
       if (this.options.mode !== "encrypted" || !record.packId) throw new Error("Invalid V4 pack record.")
       const payload = await reader(record.remotePath)
       throwIfV4Aborted(signal)
-      const archive = await this.crypto(() => decryptV4Payload(this.options.keyring!.contentKey, payload, { kind: "pack", aad: record.packId! }))
+      const archive = await this.decrypt(() => decryptV4Payload(this.options.keyring!.contentKey, payload, { kind: "pack", aad: record.packId! }))
       const parsed = JSON.parse(bytesToUtf8(archive)) as { version?: number; entries?: Record<string, string> }
       const encoded = parsed.version === 1 ? parsed.entries?.[record.fileId] : undefined
       if (!encoded) throw new Error(`V4 pack entry is missing: ${record.fileId}`)
@@ -488,7 +505,7 @@ export class V4StorageCodec {
       throwIfV4Aborted(signal)
       const plaintext = this.options.mode === "plaintext"
         ? bytes
-        : await this.crypto(() => decryptV4Payload(this.options.keyring!.contentKey, bytes, {
+        : await this.decrypt(() => decryptV4Payload(this.options.keyring!.contentKey, bytes, {
           kind: "content",
           aad: this.contentAad(record),
         }))
@@ -505,7 +522,7 @@ export class V4StorageCodec {
       throwIfV4Aborted(signal)
       return this.options.mode === "plaintext"
         ? bytes
-        : this.crypto(() => decryptV4Payload(this.options.keyring!.contentKey, bytes, {
+        : this.decrypt(() => decryptV4Payload(this.options.keyring!.contentKey, bytes, {
           kind: "part",
           aad: `${this.contentAad(record)}:${index}`,
         }))

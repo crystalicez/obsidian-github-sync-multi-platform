@@ -110,7 +110,13 @@ test("Sync Center shows measured HTTP request and RSS diagnostics without invent
   assert.match(shown, /Upload API.*Download API.*GitHub API.*GitHub in flight.*Peak renderer RAM/su);
   assert.match(shown, /7 requests/su);
   assert.match(shown, /100\.0 MiB/su);
-  assert.match(shown, /not measured/su);
+  assert.match(shown, /Decryption not measured/su);
+  source.publish({ ...uploadingFixture, diagnostics: {
+    apiRequests: 7, apiFailures: 0, uploadBytes: 2048, downloadBytes: 4096,
+    apiLatencyMs: 750, inFlightApiRequests: 0, oldestInFlightApiMs: 0,
+    decryptionMs: 1250,
+  } });
+  assert.match(view.contentEl.flattenText(), /Decryption 1\.3s/u);
   await view.onClose();
 });
 
