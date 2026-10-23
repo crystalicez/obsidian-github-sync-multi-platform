@@ -193,9 +193,19 @@ export async function decodeV4RemoteHead(
   config: V4RemoteConfig,
   keyring?: V4Keyring,
 ): Promise<V4RemoteHead> {
-  const head = await decodeMetadata<V4RemoteHead>(bytes, config, keyring, "head", config.repoId)
-  if (head.formatVersion !== 4 || head.mode !== config.mode) throw new Error("Invalid V4 remote head.")
-  return head
+  const decoded = await decodeMetadata<unknown>(bytes, config, keyring, "head", config.repoId)
+  if (!decoded || typeof decoded !== "object" || Array.isArray(decoded)) throw new Error("Invalid V4 remote head.")
+  const head = decoded as Partial<V4RemoteHead>
+  if (head.formatVersion !== 4 || head.mode !== config.mode
+    || !Number.isSafeInteger(head.epoch) || head.epoch! < 0
+    || !Number.isSafeInteger(head.generation) || head.generation! < 0 || head.generation! >= Number.MAX_SAFE_INTEGER
+    || typeof head.journalId !== "string"
+    || typeof head.updatedAt !== "number" || !Number.isFinite(head.updatedAt)
+    || typeof head.deviceId !== "string"
+    || !head.shardHashes || typeof head.shardHashes !== "object" || Array.isArray(head.shardHashes)
+    || !Object.entries(head.shardHashes).every(([bucket, hash]) => /^[0-9a-f]{2}$/u.test(bucket) && typeof hash === "string")
+  ) throw new Error("Invalid V4 remote head.")
+  return head as V4RemoteHead
 }
 
 export async function decodeV4RemoteShard(

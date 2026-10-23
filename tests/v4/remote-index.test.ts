@@ -41,6 +41,37 @@ test("v4 encrypted remote metadata does not expose paths and round trips", async
   assert.deepEqual(await decodeV4RemoteHead(headFile.bytes, config, keys), head);
 });
 
+test("v4 remote head rejects malformed generation and shard coordinates before sync", async () => {
+  const config: V4RemoteConfig = { formatVersion: 4, mode: "plaintext", repoId: "o/r#main", pathLayout: "plaintext-v1" };
+  const head: V4RemoteHead = {
+    formatVersion: 4, mode: "plaintext", epoch: 0, generation: 1,
+    journalId: "j1", shardHashes: { ab: "legacy-hash-label" }, updatedAt: 1, deviceId: "device",
+  };
+  assert.deepEqual(await decodeV4RemoteHead(enc(JSON.stringify(head)), config), head);
+  const invalid: Array<[string, unknown]> = [
+    ["null head", null],
+    ["missing generation", { ...head, generation: undefined }],
+    ["null generation", { ...head, generation: null }],
+    ["fractional generation", { ...head, generation: 1.5 }],
+    ["negative generation", { ...head, generation: -1 }],
+    ["unsafe generation", { ...head, generation: Number.MAX_SAFE_INTEGER + 1 }],
+    ["invalid epoch", { ...head, epoch: "1" }],
+    ["null shard hashes", { ...head, shardHashes: null }],
+    ["array shard hashes", { ...head, shardHashes: [] }],
+    ["invalid bucket name", { ...head, shardHashes: { zz: "hash" } }],
+    ["invalid shard hash", { ...head, shardHashes: { ab: 5 } }],
+    ["missing journal ID", { ...head, journalId: undefined }],
+    ["invalid timestamp", { ...head, updatedAt: "yesterday" }],
+    ["invalid device ID", { ...head, deviceId: null }],
+  ];
+  for (const [label, value] of invalid) {
+    await assert.rejects(
+      () => decodeV4RemoteHead(enc(JSON.stringify(value)), config),
+      /invalid V4 remote head/i, label,
+    );
+  }
+});
+
 test("v4 remote shard rejects record keys and path ids outside its bucket", async () => {
   const config: V4RemoteConfig = { formatVersion: V4_FORMAT_VERSION, mode: "plaintext", repoId: "o/r#main", pathLayout: "plaintext-v1" };
   const record = { path: "note.md", pathId: "bb".padEnd(64, "0"), fileId: "f", plaintextSha256: "hash", size: 4, mtime: 3, remoteVersion: "v", remotePath: "note.md", storage: "single" as const };

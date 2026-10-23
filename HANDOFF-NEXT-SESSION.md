@@ -4,6 +4,14 @@
 >
 > **Mandatory workflow rule:** Every AI session that makes a material change to code, tests, design decisions, branch/PR state, verification status, or next steps MUST update this file before ending or handing work off. GitHub is the source of truth.
 
+## 2026-10-23 Stage D29 — fail-closed V4 remote-head shape validation
+
+- **Isolated source:** D28 audited `4121151ec676594a93ce61e7b0b4c53e62a13104`, worktree `.worktrees/d29-remote-head-shape`, branch `audit/2026-10-23-d29-remote-head-shape`. Main Zed checkout and parallel GUI/telemetry/cancellation worktrees unchanged.
+- **RED:** `decodeV4RemoteHead` only checked `formatVersion` and `mode`; null JSON raised a generic TypeError, while malformed numeric `generation` / `epoch` and `shardHashes` could be accepted and later contaminate next-generation arithmetic or shard selection. Added 14-case deterministic malformed head test: focused **10/11, 1 FAIL** before the source fix.
+- **Fix:** Validate decoded object shape, non-negative safe integer `epoch`, incrementable `generation`, string `journalId`/`deviceId`, finite numeric `updatedAt`, and a map of two-character lowercase hexadecimal bucket names to string hash labels. Invalid input throws one explicit `Invalid V4 remote head.` error before downstream planning. Preserve valid historical string shard hash labels of any length; **no protocol/wire migration**. Existing plaintext/encrypted roundtrip tests are unchanged.
+- **GREEN:** focused **11/11**; `pnpm build`, fast **515/515**, recovery **79/79**, resource **11/11**, feasibility **132/132**, virtual cryptographic soak **100,000,000 bytes 1/1**, E2E bundle compile-only (3), metadata/package validation **all PASS**. Repeat fast **10×515/515 PASS**, no intermittent failures.
+- **Scope limits:** Node.js and Obsidian API primary; no native/Issue #9 change, live GitHub write, real Obsidian GUI, `master`, release or GitHub Actions; no personal vault or physical test files above 100 MB. GUI latest-SHA, macOS/Linux/mobile, C2 compatibility and independent review remain release gates.
+
 ## 2026-10-23 Stage D28 — Reject duplicate encrypted-pack file IDs before publication
 
 - **Isolated scope:** Worktree `.worktrees/d28-duplicate-pack-fileids`, dedicated branch `audit/2026-10-23-d28-duplicate-pack-fileids`, base D27 `e620342ad4e9c980cceb3629eb54d52436ae8ef9`. Main Zed checkout and concurrent D25/D26/D27 worktrees unchanged.
