@@ -85,6 +85,31 @@ test("v4 streamed encrypted parts preserve existing part paths AAD and read comp
   assert.equal(await sha256Hex(restored), record.plaintextSha256);
 });
 
+test("v4 rejects duplicate encrypted-pack file IDs before producing an ambiguous archive", async () => {
+  const { createV4WholeBufferContentSource } = await import("../../src/lib/v4/content-source");
+  const keys = await deriveV4Keyring({ passphrase: "pass", repoId: "o/r#main", salt: bytes("salt"), iterations: 10 });
+  const codec = new V4StorageCodec({ mode: "encrypted", pathLayout: "opaque-stable-v1", keyring: keys });
+  const first = await codec.prepare("Folder/a.md", bytes("first"), "v1", 1, "repeated-id");
+  const second = await codec.prepare("Folder/b.md", bytes("second"), "v1", 1, "repeated-id");
+
+  await assert.rejects(
+    () => codec.preparePack("duplicate-in-memory", [
+      { record: first.record, plaintext: bytes("first") },
+      { record: second.record, plaintext: bytes("second") },
+    ]),
+    /duplicate.*file.?id/i,
+  );
+  await assert.rejects(
+    async () => codec.preparePackFromSources("duplicate-streamed", [
+      { logicalPath: "Folder/a.md", fileId: "repeated-id", source: createV4WholeBufferContentSource(bytes("first")),
+        expectedHash: await sha256Hex(bytes("first")), version: "v1", mtime: 1 },
+      { logicalPath: "Folder/b.md", fileId: "repeated-id", source: createV4WholeBufferContentSource(bytes("second")),
+        expectedHash: await sha256Hex(bytes("second")), version: "v1", mtime: 1 },
+    ]),
+    /duplicate.*file.?id/i,
+  );
+});
+
 test("v4 source-built pack preserves version-1 archive and existing read compatibility", async () => {
   const { decryptV4Payload } = await import("../../src/lib/v4/crypto");
   const { bytesToUtf8, fromBase64, sha256Hex } = await import("../../src/lib/bytes");

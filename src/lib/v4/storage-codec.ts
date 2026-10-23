@@ -44,6 +44,10 @@ export interface V4PackSourceEntry {
   checkSourceStable?: () => Promise<void>
 }
 
+function assertUniqueV4PackFileIds(ids: readonly string[]): void {
+  if (new Set(ids).size !== ids.length) throw new Error("Duplicate V4 pack file id.")
+}
+
 export class V4StorageCodec {
   constructor(private readonly options: {
     mode: V4StorageMode
@@ -283,6 +287,7 @@ export class V4StorageCodec {
     if (entries.length === 0) throw new Error("Cannot create an empty V4 pack.")
     if (!/^[A-Za-z0-9_-]+$/u.test(packId)) throw new Error("Unsafe V4 pack id.")
 
+    assertUniqueV4PackFileIds(entries.map(entry => entry.fileId))
     const prefix = utf8ToBytes('{"version":1,"entries":{')
     const suffix = utf8ToBytes('}}')
     const layouts = entries.map((entry, index) => {
@@ -357,6 +362,7 @@ export class V4StorageCodec {
     if (this.options.mode !== "encrypted") throw new Error("V4 packs are available only in encrypted mode.")
     if (entries.length === 0) throw new Error("Cannot create an empty V4 pack.")
     if (!/^[A-Za-z0-9_-]+$/u.test(packId)) throw new Error("Unsafe V4 pack id.")
+    assertUniqueV4PackFileIds(entries.map(entry => entry.record.fileId))
     const remotePath = await this.crypto(() => opaqueV4PackPath(this.options.keyring!.pathKey, packId))
     const archive = utf8ToBytes(JSON.stringify({
       version: 1,

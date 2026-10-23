@@ -4,6 +4,14 @@
 >
 > **Mandatory workflow rule:** Every AI session that makes a material change to code, tests, design decisions, branch/PR state, verification status, or next steps MUST update this file before ending or handing work off. GitHub is the source of truth.
 
+## 2026-10-23 Stage D28 — Reject duplicate encrypted-pack file IDs before publication
+
+- **Isolated scope:** Worktree `.worktrees/d28-duplicate-pack-fileids`, dedicated branch `audit/2026-10-23-d28-duplicate-pack-fileids`, base D27 `e620342ad4e9c980cceb3629eb54d52436ae8ef9`. Main Zed checkout and concurrent D25/D26/D27 worktrees unchanged.
+- **Data-integrity root cause / RED:** Encrypted V4 pack archives are JSON maps indexed by `fileId`. Two distinct records with the same `fileId` could be accepted by either `V4StorageCodec.preparePack` (in-memory) or `preparePackFromSources` (streaming), producing ambiguous duplicate JSON keys or silently overwriting an entry via `Object.fromEntries`; the second record could reference bytes that do not match its plaintext hash. Added deterministic two-path malformed-input test first: focused **7/8 PASS, 1 FAIL** because no rejection was raised.
+- **Minimal fix:** Shared `assertUniqueV4PackFileIds` checks both producers before assembling the JSON archive. Duplicate IDs reject with an explicit error, preventing construction/upload of an inconsistent pack. No change to valid pack ciphertext format, fileId generation, conflict semantics, WAL, GitHub CAS, scheduling or keys. Defense in depth; no evidence that ordinary planner emits duplicate IDs.
+- **GREEN local verification:** Focused **8/8**, build PASS, tracked Fast **514/514**, Recovery **79/79**, Resource **11/11**, Feasibility **132/132**, virtual bounded **100,000,000-byte soak 1/1**, GitHub E2E three-bundle compile PASS, metadata and package validation PASS. Fast repeat **10×514/514 PASS**, with no intermittent failures.
+- **Scope and release caution:** Node.js+Obsidian API primary; GitHub Issue #9 (native desktop OS TOCTOU research) remains deliberately deferred. Did not touch original vault, real GitHub API, release/master/GitHub Actions, native helper or physical files >100MB. Latest-code actual two-instance Obsidian GUI acceptance, cross-device C2 format, line-merge UX, mobile/macOS/Linux and independent security review are distinct pending release gates.
+
 ## 2026-10-23 Stage D27 — HTTP Retry-After date and long-timer safety (Node.js)
 
 - **Isolated source:** Base is audited/pushed D26 `4f39c054b38614760fcb016ec0676bd7eae7b301`. Worktree `.worktrees/d27-retry-after-http-date`, distinct `audit/2026-10-23-d27-retry-after-date` branch. Existing Zed root, concurrent D25/D26 worktrees, user vault and secrets untouched.
