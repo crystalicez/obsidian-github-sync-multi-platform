@@ -86,7 +86,8 @@ exit; every case fails closed, leaving all bytes and WAL evidence untouched.
   Feasibility, 100,000,000-byte bounded virtual cryptographic soak,
   metadata/package validations and GitHub E2E **compile-only**: PASS.
 - No GitHub Actions, no source branch mutation outside the isolated audit
-  worktree, no actual Obsidian.exe process was killed in this D11 experiment.
+  worktree, no actual Obsidian.exe process was killed in the crash harness.
+- Separately, the final D11 bundle SHA-256 `fe91b08208ffd1a96468aa34a5a4d7d6dd9baa3ff536af2ccb6a49e0bdb03a68` was installed in **two disposable native Windows Obsidian 1.14.4 instances**. Live GitHub encrypted A→B Force Push/Pull, A update, B open-note conflict modal, close and resume passed with `allCorrect:true`, `openEditorModalVisible:true`, `destructiveOverrideShown:false`, and verified disposable branch cleanup. No personal vault or user Obsidian process was touched.
 
 ## Limits that remain
 
