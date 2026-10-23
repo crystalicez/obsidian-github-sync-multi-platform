@@ -15,6 +15,11 @@
 | E — GitHub strict CAS and persistent cooldown | **E1 qualified:** strict GraphQL `updateRefs(beforeOid)` and real encrypted/plaintext multi-device E2E exit 0 + verified branch cleanup. **E2 integrated:** durable token-scoped cooldown via two checksummed plugin-data slots with fail-closed storage semantics; focused and full local gates green. | E1 live E2E PASS; E2 automated PASS; actual 429/live Obsidian still pending |
 | F — User-visible UX, full release candidate | Select telemetry/merge UI; all deterministic/local guards, actual Obsidian 2-instance encrypted + 1000-note scenario and safe GitHub target from same candidate SHA. Physical mobile/macOS/Linux later; independent security audit. | Pending |
 
+## Stage D24 — real GitHub Node.js E2E fully green (test-only)
+
+- **D23 previously failed full E2E**, then added exact immutable GitHub HEAD/tree/read-decoded-content guards to the **test harness** (no product Sync change). D24 now proves **real GitHub full 3-suite matrix 3/3 PASS**, including independent Copy contract and encrypted external mutation refusal, with **13 scenario receipts** (6 plaintext + 6 encrypted + controlled external branch-head race), **0 retries and 0 unknown publication outcomes**. Branch `obsidian-sync-e2e/local-22af622ed8b5-d24-full-2758193d2c2b` in pinned test repo ID **1284153873** was absent before use, deleted on cleanup and independently verified absent repeatedly. See `docs/engineering/github-e2e-d24-exact-head-acceptance-2026-10-23.md`.
+- Only disposable test scripts and documentation added this stage; **Node.js + Obsidian API** remain primary, and OS/filesystem TOCTOU [Issue #9](https://github.com/crystalicez/obsidian-github-sync-multi-platform/issues/9) remains **DEFERRED until explicit user request**. No Native Helper, GitHub Actions, remote protocol/WAL change or runtime retry policy. The real GitHub gate is green *for the exact D22 product code with updated harness*; latest real Obsidian GUI, coordinated C2 and per-line conflict UI still block production readiness.
+
 ## Stage D22 — async staged sink terminal-operation safety (Node.js only)
 
 - In-process asynchronous sink lifecycle hardening is **integrated on this audit worktree**, independent of the deliberately deferred [filesystem OS TOCTOU Issue #9](https://github.com/crystalicez/obsidian-github-sync-multi-platform/issues/9).
