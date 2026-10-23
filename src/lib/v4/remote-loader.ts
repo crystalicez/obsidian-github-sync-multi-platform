@@ -75,7 +75,9 @@ export async function loadV4RemoteState(
   const head = await decodeV4RemoteHead(headFile.bytes, config, input.keyring)
   const records: V4IndexFileRecord[] = []
   for (const bucket of Object.keys(head.shardHashes)) {
-    const cached = isV4LocalIndexShardConsistent(input.index, bucket, head.shardHashes[bucket])
+    const shardHash = head.shardHashes[bucket]
+    if (shardHash === undefined) throw new Error("Missing V4 shard hash.")
+    const cached = isV4LocalIndexShardConsistent(input.index, bucket, shardHash)
       ? input.index.shards[bucket]
       : undefined
     if (cached) {
@@ -110,7 +112,7 @@ export function remoteV4StateFromLocalIndex(
     },
     records: recordsFromIndex(index).map(record => ({
       ...record,
-      partPaths: record.partPaths ? [...record.partPaths] : undefined,
+      ...(record.partPaths === undefined ? {} : { partPaths: [...record.partPaths] }),
     })),
     commitSha,
   }

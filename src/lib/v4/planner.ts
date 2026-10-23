@@ -14,16 +14,16 @@ export interface V4PlannedChange {
   kind: V4ChangeKind;
   path: string;
   previousPath?: string;
-  before?: V4LogicalFile;
-  after?: V4LogicalFile;
+  before?: V4LogicalFile | undefined;
+  after?: V4LogicalFile | undefined;
 }
 
 export interface V4PlannedConflict {
   fileId: string;
   path: string;
-  base?: V4LogicalFile;
-  local?: V4LogicalFile;
-  remote?: V4LogicalFile;
+  base?: V4LogicalFile | undefined;
+  local?: V4LogicalFile | undefined;
+  remote?: V4LogicalFile | undefined;
 }
 
 export interface V4SyncPlan {

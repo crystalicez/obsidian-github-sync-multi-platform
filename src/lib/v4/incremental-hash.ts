@@ -14,6 +14,12 @@ const SHA256_K = new Uint32Array([
   0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
 ])
 
+function readShaArrayWord(bytes: Uint8Array | Uint32Array, index: number): number {
+  const word = bytes[index]
+  if (word === undefined) throw new RangeError("SHA-256 array index is out of bounds.")
+  return word
+}
+
 function rotr(value: number, bits: number): number {
   return (value >>> bits) | (value << (32 - bits))
 }
@@ -100,7 +106,7 @@ class V4IncrementalSha256 implements V4IncrementalHash {
 
     const output = new Uint8Array(32)
     for (let i = 0; i < this.state.length; i++) {
-      const value = this.state[i]
+      const value = readShaArrayWord(this.state, i)
       output[i * 4] = value >>> 24
       output[i * 4 + 1] = value >>> 16
       output[i * 4 + 2] = value >>> 8
@@ -113,29 +119,29 @@ class V4IncrementalSha256 implements V4IncrementalHash {
     const w = this.words
     for (let i = 0; i < 16; i++) {
       const offset = baseOffset + i * 4
-      w[i] = ((bytes[offset] << 24) | (bytes[offset + 1] << 16) | (bytes[offset + 2] << 8) | bytes[offset + 3]) >>> 0
+      w[i] = ((readShaArrayWord(bytes, offset) << 24) | (readShaArrayWord(bytes, offset + 1) << 16) | (readShaArrayWord(bytes, offset + 2) << 8) | readShaArrayWord(bytes, offset + 3)) >>> 0
     }
     for (let i = 16; i < 64; i++) {
-      const v15 = w[i - 15]
-      const v2 = w[i - 2]
+      const v15 = readShaArrayWord(w, i - 15)
+      const v2 = readShaArrayWord(w, i - 2)
       const s0 = rotr(v15, 7) ^ rotr(v15, 18) ^ (v15 >>> 3)
       const s1 = rotr(v2, 17) ^ rotr(v2, 19) ^ (v2 >>> 10)
-      w[i] = (w[i - 16] + s0 + w[i - 7] + s1) >>> 0
+      w[i] = (readShaArrayWord(w, i - 16) + s0 + readShaArrayWord(w, i - 7) + s1) >>> 0
     }
 
-    let a = this.state[0]
-    let b = this.state[1]
-    let c = this.state[2]
-    let d = this.state[3]
-    let e = this.state[4]
-    let f = this.state[5]
-    let g = this.state[6]
-    let h = this.state[7]
+    let a = readShaArrayWord(this.state, 0)
+    let b = readShaArrayWord(this.state, 1)
+    let c = readShaArrayWord(this.state, 2)
+    let d = readShaArrayWord(this.state, 3)
+    let e = readShaArrayWord(this.state, 4)
+    let f = readShaArrayWord(this.state, 5)
+    let g = readShaArrayWord(this.state, 6)
+    let h = readShaArrayWord(this.state, 7)
 
     for (let i = 0; i < 64; i++) {
       const s1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25)
       const choice = (e & f) ^ (~e & g)
-      const temp1 = (h + s1 + choice + SHA256_K[i] + w[i]) >>> 0
+      const temp1 = (h + s1 + choice + readShaArrayWord(SHA256_K, i) + readShaArrayWord(w, i)) >>> 0
       const s0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22)
       const majority = (a & b) ^ (a & c) ^ (b & c)
       const temp2 = (s0 + majority) >>> 0
@@ -149,14 +155,14 @@ class V4IncrementalSha256 implements V4IncrementalHash {
       a = (temp1 + temp2) >>> 0
     }
 
-    this.state[0] = (this.state[0] + a) >>> 0
-    this.state[1] = (this.state[1] + b) >>> 0
-    this.state[2] = (this.state[2] + c) >>> 0
-    this.state[3] = (this.state[3] + d) >>> 0
-    this.state[4] = (this.state[4] + e) >>> 0
-    this.state[5] = (this.state[5] + f) >>> 0
-    this.state[6] = (this.state[6] + g) >>> 0
-    this.state[7] = (this.state[7] + h) >>> 0
+    this.state[0] = (readShaArrayWord(this.state, 0) + a) >>> 0
+    this.state[1] = (readShaArrayWord(this.state, 1) + b) >>> 0
+    this.state[2] = (readShaArrayWord(this.state, 2) + c) >>> 0
+    this.state[3] = (readShaArrayWord(this.state, 3) + d) >>> 0
+    this.state[4] = (readShaArrayWord(this.state, 4) + e) >>> 0
+    this.state[5] = (readShaArrayWord(this.state, 5) + f) >>> 0
+    this.state[6] = (readShaArrayWord(this.state, 6) + g) >>> 0
+    this.state[7] = (readShaArrayWord(this.state, 7) + h) >>> 0
   }
 }
 

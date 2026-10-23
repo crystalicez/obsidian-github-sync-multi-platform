@@ -11,10 +11,10 @@ export interface V4IndexFileRecord {
   mtime: number;
   remoteVersion: string;
   remotePath: string;
-  encryptedPath?: string;
+  encryptedPath?: string | undefined;
   storage: V4ObjectStorage;
-  partPaths?: string[];
-  packId?: string;
+  partPaths?: string[] | undefined;
+  packId?: string | undefined;
   dirty?: boolean;
   deleted?: boolean;
 }
@@ -225,7 +225,8 @@ export async function loadV4LocalIndex(adapter: V4LocalIndexAdapter, root: strin
     }
     // Never authorize a cached remote HEAD from mutated or pre-D5 unsealed records.
     // The remote protocol and its historical shard-hash algorithm are untouched.
-    if (!isShardConsistent(loaded, bucket, index.shardHashes[bucket])) return invalidV4LocalIndex();
+    const expectedHash = index.shardHashes[bucket];
+    if (expectedHash === undefined || !isShardConsistent(loaded, bucket, expectedHash)) return invalidV4LocalIndex();
     if (!/^[0-9a-f]{64}$/u.test(loaded.contentDigest ?? "")) return invalidV4LocalIndex();
     if (loaded.contentDigest !== await localShardContentDigest(bucket, loaded.records)) return invalidV4LocalIndex();
     index.shards[bucket] = loaded;

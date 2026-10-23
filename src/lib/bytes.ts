@@ -9,16 +9,29 @@ function asUint8Array(value: ArrayBuffer | Uint8Array): Uint8Array {
   return value instanceof Uint8Array ? value : new Uint8Array(value);
 }
 
+function readIndexedByte(bytes: Uint8Array, index: number): number {
+  const byte = bytes[index];
+  if (byte === undefined) throw new RangeError("Byte access out of bounds.");
+  return byte;
+}
+
+function getHexPair(bytes: Uint8Array, index: number): string {
+  const hex = HEX_TABLE[readIndexedByte(bytes, index)];
+  if (hex === undefined) throw new RangeError("Missing hex lookup.");
+  return hex;
+}
+
 function encodeBase64Bytes(bytes: Uint8Array, alphabet: string, padding: boolean): string {
+  if (alphabet.length !== 64) throw new RangeError("Invalid Base64 alphabet length.");
   const chunks: string[] = [];
   let chunk = "";
   let i = 0;
   for (; i + 2 < bytes.byteLength; i += 3) {
-    const value = (bytes[i] << 16) | (bytes[i + 1] << 8) | bytes[i + 2];
-    chunk += alphabet[(value >>> 18) & 63]
-      + alphabet[(value >>> 12) & 63]
-      + alphabet[(value >>> 6) & 63]
-      + alphabet[value & 63];
+    const value = (readIndexedByte(bytes, i) << 16) | (readIndexedByte(bytes, i + 1) << 8) | readIndexedByte(bytes, i + 2);
+    chunk += alphabet.charAt((value >>> 18) & 63)
+      + alphabet.charAt((value >>> 12) & 63)
+      + alphabet.charAt((value >>> 6) & 63)
+      + alphabet.charAt(value & 63);
     if (chunk.length >= BYTE_STRING_CHUNK_SIZE) {
       chunks.push(chunk);
       chunk = "";
@@ -26,11 +39,11 @@ function encodeBase64Bytes(bytes: Uint8Array, alphabet: string, padding: boolean
   }
 
   if (i < bytes.byteLength) {
-    const first = bytes[i];
-    const second = i + 1 < bytes.byteLength ? bytes[i + 1] : 0;
+    const first = readIndexedByte(bytes, i);
+    const second = i + 1 < bytes.byteLength ? readIndexedByte(bytes, i + 1) : 0;
     const value = (first << 16) | (second << 8);
-    chunk += alphabet[(value >>> 18) & 63] + alphabet[(value >>> 12) & 63];
-    if (i + 1 < bytes.byteLength) chunk += alphabet[(value >>> 6) & 63];
+    chunk += alphabet.charAt((value >>> 18) & 63) + alphabet.charAt((value >>> 12) & 63);
+    if (i + 1 < bytes.byteLength) chunk += alphabet.charAt((value >>> 6) & 63);
     else if (padding) chunk += "=";
     if (padding) chunk += "=";
   }
@@ -84,7 +97,7 @@ export function toHex(value: ArrayBuffer | Uint8Array): string {
   for (let offset = 0; offset < bytes.byteLength; offset += BYTE_STRING_CHUNK_SIZE) {
     let chunk = "";
     const end = Math.min(offset + BYTE_STRING_CHUNK_SIZE, bytes.byteLength);
-    for (let i = offset; i < end; i++) chunk += HEX_TABLE[bytes[i]];
+    for (let i = offset; i < end; i++) chunk += getHexPair(bytes, i);
     chunks.push(chunk);
   }
   return chunks.join("");

@@ -307,7 +307,7 @@ export class V4SyncCenterView extends ItemView {
       if (page.items.length === 0) body.createEl("p", { text: "No commits found." })
       for (const commit of page.items) {
         const row = body.createEl("button", { cls: "github-sync-center__row" })
-        row.createDiv({ text: commit.message.split("\n", 1)[0], cls: "github-sync-center__row-title" })
+        row.createDiv({ text: commit.message.split("\n", 1)[0] ?? "", cls: "github-sync-center__row-title" })
         row.createDiv({ text: `${commit.source === "plugin" ? "Synced" : "External"} · ${commit.authoredAt || commit.sha.slice(0, 8)}`, cls: "github-sync-center__muted" })
         row.onclick = () => void this.renderCommitDetail(commit, detail)
       }
@@ -325,7 +325,7 @@ export class V4SyncCenterView extends ItemView {
     this.selected = commit
     this.releaseObjectUrl()
     detail.empty()
-    detail.createEl("h4", { text: commit.message.split("\n", 1)[0] })
+    detail.createEl("h4", { text: commit.message.split("\n", 1)[0] ?? "" })
     detail.createEl("p", { text: "Loading changes…", cls: "github-sync-center__muted" })
     try {
       const service = await this.ensureService()

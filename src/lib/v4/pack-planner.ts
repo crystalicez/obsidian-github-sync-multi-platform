@@ -111,11 +111,14 @@ export function planV4PackGroups(
   if (eligible.length < PACK_MIN_CHANGED_FILES) return []
   const groups: V4PackCandidateMeta[][] = []
   for (let start = 0; start < eligible.length;) {
-    const folder = folderOf(eligible[start].path)
+    const initial = eligible[start]
+    if (!initial) throw new Error("V4 pack candidate missing.")
+    const folder = folderOf(initial.path)
     const group: V4PackCandidateMeta[] = []
     let resources = empty
     while (start < eligible.length && group.length < PACK_MAX_FILES) {
       const candidate = eligible[start]
+      if (!candidate) throw new Error("V4 pack candidate missing.")
       if (group.length > 0 && folderOf(candidate.path) !== folder) break
       const nextResources = appendV4PackCandidate(resources, candidate)
       if (group.length > 0 && !withinBudgets(nextResources)) break

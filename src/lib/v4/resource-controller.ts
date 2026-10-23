@@ -93,6 +93,7 @@ class FifoWeightedPool {
   private drain(): void {
     while (this.queue.length > 0) {
       const next = this.queue[0]
+      if (!next) return
       if (this.inUse + next.weight > this.maximum) return
       this.queue.shift()
       if (next.onAbort && next.signal) next.signal.removeEventListener("abort", next.onAbort)

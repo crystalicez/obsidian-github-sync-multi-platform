@@ -281,7 +281,7 @@ export class V4SyncSession {
     const localCacheComplete = isV4LocalIndexCacheComplete(this.input.index)
     const remote = ref && remoteConfig && remoteConfig.mode !== "encrypted" && localCacheComplete && ref.sha === this.input.index.remoteCommitSha && this.input.index.pathLayout === effectiveV4PathLayout(remoteConfig)
       ? remoteV4StateFromLocalIndex(this.input.index, ref.sha, remoteConfig)
-      : await loadV4RemoteState({ github: this.input.github, index: this.input.index, keyring: this.input.keyring }, ref?.sha, remoteConfig)
+      : await loadV4RemoteState({ github: this.input.github, index: this.input.index, ...(this.input.keyring === undefined ? {} : { keyring: this.input.keyring }) }, ref?.sha, remoteConfig)
     if (!remote && options.operation !== "forcePush") {
       throw new Error("Remote is not V4. Force Push is required before sync or Force Pull.")
     }
@@ -511,7 +511,7 @@ export class V4SyncSession {
             pushBinding = { change: copyChange }
             batch.pushes.push(pushBinding)
           }
-          if (!carriedStage) stagedCopyPulls.push({ pull: pullBinding, push: pushBinding, reserved: reservedCopy })
+          if (!carriedStage) stagedCopyPulls.push({ pull: pullBinding, ...(pushBinding === undefined ? {} : { push: pushBinding }), reserved: reservedCopy })
         }
         const localPush = this.changeBetween(conflict.remote, conflict.local)
         if (localPush) {
@@ -708,7 +708,12 @@ export class V4SyncSession {
         if (processedPackGroups.has(packGroupIndex)) continue
         processedPackGroups.add(packGroupIndex)
         const groupMeta = packGroups[packGroupIndex]
-        const groupContexts = groupMeta.map(candidate => contextByFileId.get(candidate.fileId)!)
+        if (!groupMeta) throw new Error("V4 pack group missing.")
+        const groupContexts = groupMeta.map(candidate => {
+          const context = contextByFileId.get(candidate.fileId)
+          if (!context) throw new Error("V4 pack group context missing.")
+          return context
+        })
         const groupBudget = estimateV4PackGroupResources(groupMeta)
         const progressItems = groupContexts.map(groupContext => ({ fileId: groupContext.change.fileId, path: groupContext.after!.path }))
         const uploadedPack = await this.resources.withResidentBytes(groupBudget.residentBytes, () =>
@@ -750,8 +755,10 @@ export class V4SyncSession {
         }
         for (let index = 0; index < uploadedPack.packed.records.length; index++) {
           const groupContext = groupContexts[index]
-          const groupAfter = groupContext.after!
-          const record: V4IndexFileRecord = { ...uploadedPack.packed.records[index], path: groupAfter.path }
+          const uploadedRecord = uploadedPack.packed.records[index]
+          if (!groupContext?.after || !uploadedRecord) throw new Error("V4 uploaded pack mapping is incomplete.")
+          const groupAfter = groupContext.after
+          const record: V4IndexFileRecord = { ...uploadedRecord, path: groupAfter.path }
           recordsById.set(record.fileId, record)
           journalByFileId.get(record.fileId)!.after = descriptorFor(record)
           this.localReadCache.delete(groupAfter.path)
@@ -848,7 +855,7 @@ export class V4SyncSession {
       updatedAt: this.now(),
       deviceId: this.input.index.deviceId,
     }
-    files.push(...await buildV4RemoteMetadata({ config: this.input.config, head, records: finalRecords, keyring: this.input.keyring, buckets: changedBuckets }))
+    files.push(...await buildV4RemoteMetadata({ config: this.input.config, head, records: finalRecords, ...(this.input.keyring === undefined ? {} : { keyring: this.input.keyring }), buckets: changedBuckets }))
     const pages = buildV4JournalPages(journalId, journalChanges)
     for (const page of pages) {
       const raw = utf8ToBytes(JSON.stringify(page))
@@ -1182,7 +1189,7 @@ export class V4SyncSession {
           mtime,
           existingTargetBytes,
           atomicReplace: false,
-          signal: this.input.signal,
+          ...(this.input.signal === undefined ? {} : { signal: this.input.signal }),
         })
       } catch (error) {
         const capabilityUnavailable = error instanceof V4BoundedIoUnavailableError
@@ -1266,7 +1273,7 @@ export class V4SyncSession {
       mtime: record.mtime,
       existingTargetBytes,
       atomicReplace: false,
-      signal: this.input.signal,
+      ...(this.input.signal === undefined ? {} : { signal: this.input.signal }),
     })
     try {
       const result = await this.codec.readToSink({

@@ -6,9 +6,9 @@
   "author": "Crystalicez",
   "scripts": {
     "dev": "node esbuild.config.mjs",
-    "devcss": "sass --watch src/styles.scss styles.css && tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
-    "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
-    "typecheck:max-strict": "tsc --noEmit --skipLibCheck --project tsconfig.maximum-strict.json",
+    "devcss": "sass --watch src/styles.scss styles.css && tsc -noEmit && node esbuild.config.mjs production",
+    "build": "tsc -noEmit && node esbuild.config.mjs production",
+    "typecheck:max-strict": "tsc --noEmit --project tsconfig.maximum-strict.json",
     "test": "node scripts/run-tests.mjs --tier=fast",
     "ver": "node ./scripts/update-version.js",
     "test:github-e2e": "node scripts/run-github-e2e.mjs",

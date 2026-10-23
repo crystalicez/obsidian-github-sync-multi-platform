@@ -20,7 +20,7 @@ export interface V4GitTreeWriteInput {
 }
 export interface V4GitTreeWriteResult {
   previousHeadSha?: string | undefined;
-  baseTreeSha?: string;
+  baseTreeSha?: string | undefined;
   treeSha: string;
   commitSha: string;
   fileShas: Record<string, string>;
@@ -40,7 +40,7 @@ export interface V4GitTreeGithub {
 export interface V4PublicationBase {
   ref: GitHubGitRef | null;
   previousHeadSha?: string | undefined;
-  baseTreeSha?: string;
+  baseTreeSha?: string | undefined;
 }
 
 export interface V4UploadedTreeFiles {
@@ -50,7 +50,7 @@ export interface V4UploadedTreeFiles {
 
 export interface V4CandidateCommit {
   previousHeadSha?: string | undefined;
-  baseTreeSha?: string;
+  baseTreeSha?: string | undefined;
   treeSha: string;
   commitSha: string;
   message: string;
@@ -65,7 +65,9 @@ async function mapWithConcurrency<T, R>(items: T[], concurrency: number, mapper:
     while (!failed && next < items.length) {
       const index = next++;
       try {
-        results[index] = await mapper(items[index]);
+        const item = items[index];
+        if (item === undefined) throw new RangeError("Git tree upload item missing.");
+        results[index] = await mapper(item);
       } catch (error) {
         if (!failed) {
           failed = true;
@@ -164,7 +166,11 @@ export async function uploadV4TreeFiles(
     }
   }
   const startedFileIds = new Set<string>();
-  const blobWrites = await mapWithConcurrency(input.files.map((file, index) => ({ file, progressItems: progressItemsByFile[index] })), 4, async ({ file, progressItems }) => {
+  const blobWrites = await mapWithConcurrency(input.files.map((file, index) => {
+    const progressItems = progressItemsByFile[index];
+    if (!progressItems) throw new RangeError("Missing V4 logical upload progress group.");
+    return { file, progressItems };
+  }), 4, async ({ file, progressItems }) => {
     for (const item of progressItems) {
       if (startedFileIds.has(item.fileId)) continue;
       startedFileIds.add(item.fileId);

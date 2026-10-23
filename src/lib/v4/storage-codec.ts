@@ -123,6 +123,12 @@ export class V4StorageCodec {
   }
 
 
+  private objectPathAt(paths: readonly string[], index: number): string {
+    const value = paths[index]
+    if (value === undefined) throw new Error("V4 object path index out of bounds.")
+    return value
+  }
+
   async prepareFromSource(input: {
     logicalPath: string
     source: V4ContentSource
@@ -149,6 +155,7 @@ export class V4StorageCodec {
       : [this.options.mode === "plaintext"
         ? path
         : await this.crypto(() => opaqueV4ObjectPath(this.options.keyring!.pathKey, fileId))]
+    const firstObjectPath = this.objectPathAt(objectPaths, 0)
     const contentAad = this.contentAad({ fileId, pathId, remoteVersion: input.version })
     const mode = this.options.mode
     const hash = createV4IncrementalSha256()
@@ -180,7 +187,7 @@ export class V4StorageCodec {
             ? plaintext
             : await this.crypto(() => encryptV4Payload(this.options.keyring!.contentKey, plaintext, { kind: "content", aad: contentAad }))
           completed = true
-          yield { path: objectPaths[0], bytes, release }
+          yield { path: this.objectPathAt(objectPaths, 0), bytes, release }
           return
         } catch (error) {
           release()
@@ -207,7 +214,7 @@ export class V4StorageCodec {
               kind: "part",
               aad: `${contentAad}:${index}`,
             }))
-          yield { path: objectPaths[index], bytes, release }
+          yield { path: this.objectPathAt(objectPaths, index), bytes, release }
         } catch (error) {
           release()
           throw error
@@ -235,8 +242,8 @@ export class V4StorageCodec {
           size: input.source.size,
           mtime: input.mtime,
           remoteVersion: input.version,
-          remotePath: objectPaths[0],
-          encryptedPath: mode === "encrypted" && !chunked ? objectPaths[0] : undefined,
+          remotePath: firstObjectPath,
+          encryptedPath: mode === "encrypted" && !chunked ? firstObjectPath : undefined,
           storage: chunked ? "chunked" : "single",
           partPaths: chunked ? [...objectPaths] : undefined,
         } satisfies V4FileRecord
@@ -396,7 +403,7 @@ export class V4StorageCodec {
       opaqueId,
     })
     const files = await Promise.all(parts.map(async (part, index) => ({
-      path: partPaths[index],
+      path: this.objectPathAt(partPaths, index),
       bytes: this.options.mode === "plaintext"
         ? part
         : await this.crypto(() => encryptV4Payload(this.options.keyring!.contentKey, part, {
@@ -412,7 +419,7 @@ export class V4StorageCodec {
         size: plaintext.byteLength,
         mtime,
         remoteVersion: version,
-        remotePath: partPaths[0],
+        remotePath: this.objectPathAt(partPaths, 0),
         storage: "chunked",
         partPaths,
       },
@@ -443,7 +450,7 @@ export class V4StorageCodec {
       if (partPaths.length === 0) throw new Error("V4 chunked record has no parts.")
       for (let index = 0; index < partPaths.length; index++) {
         if (signal?.aborted) throw signal.reason ?? new Error("V4 remote read aborted.")
-        const bytes = await reader(partPaths[index])
+        const bytes = await reader(this.objectPathAt(partPaths, index))
         const plaintext = this.options.mode === "plaintext"
           ? bytes
           : await this.crypto(() => decryptV4Payload(this.options.keyring!.contentKey, bytes, {

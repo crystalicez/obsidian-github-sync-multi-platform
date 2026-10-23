@@ -15,9 +15,9 @@ export interface V4RecoveryHeader {
   journalId?: string | undefined
   phase: V4RecoveryPhase
   expectedRemoteHead: string | null
-  candidateCommitSha?: string
-  verifiedRemoteHead?: string
-  payloadCiphertext?: string
+  candidateCommitSha?: string | undefined
+  verifiedRemoteHead?: string | undefined
+  payloadCiphertext?: string | undefined
   integrity: string
 }
 
@@ -45,5 +45,5 @@ export interface V4RecoveryPayload {
 
 export interface V4RecoverySnapshot {
   header: V4RecoveryHeader
-  payload?: V4RecoveryPayload
+  payload?: V4RecoveryPayload | undefined
 }

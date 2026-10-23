@@ -20,7 +20,9 @@ async function retryTransientVaultRead<T>(read: () => Promise<T>): Promise<T> {
     } catch (error) {
       lastError = error;
       if (!isTransientVaultReadError(error) || attempt === VAULT_READ_RETRY_DELAYS_MS.length) throw error;
-      await sleep(VAULT_READ_RETRY_DELAYS_MS[attempt]);
+      const retryDelay = VAULT_READ_RETRY_DELAYS_MS[attempt];
+      if (retryDelay === undefined) throw new RangeError("Vault read retry delay missing.");
+      await sleep(retryDelay);
     }
   }
   throw lastError;

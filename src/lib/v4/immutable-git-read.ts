@@ -86,6 +86,7 @@ export async function readImmutableGitFile(
   let treeSha = commit.treeSha;
   for (let index = 0; index < segments.length; index++) {
     const segment = segments[index];
+    if (segment === undefined) throw malformedTree(path, "path segment missing");
     const tree = await adapter.getTree(treeSha);
     const node = exactTreeEntry(tree, segment, path);
     if (!node) return null;

@@ -29,9 +29,9 @@ export interface V4PublishReconcileResult {
 export interface V4PublishReconcileInput {
   candidateCommitSha: string
   expectedHeadSha: string | null
-  journalId?: string
+  journalId?: string | undefined
   maxCommits?: number
-  signal?: AbortSignal
+  signal?: AbortSignal | undefined
 }
 
 function sameParents(left: string[], right: string[]): boolean {

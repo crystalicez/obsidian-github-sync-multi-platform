@@ -5,12 +5,12 @@ export interface V4VersionDescriptor {
   sha: string;
   size: number;
   partShas?: string[];
-  packId?: string;
+  packId?: string | undefined;
   pathId?: string;
   plaintextSha256?: string;
   remoteVersion?: string;
   storage?: "single" | "chunked" | "pack";
-  partPaths?: string[];
+  partPaths?: string[] | undefined;
   mtime?: number;
 }
 
@@ -18,9 +18,9 @@ export interface V4JournalChange {
   fileId: string;
   kind: V4ChangeKind;
   path: string;
-  previousPath?: string;
-  before?: V4VersionDescriptor;
-  after?: V4VersionDescriptor;
+  previousPath?: string | undefined;
+  before?: V4VersionDescriptor | undefined;
+  after?: V4VersionDescriptor | undefined;
 }
 
 export interface V4JournalPage {
@@ -41,7 +41,7 @@ export interface V4FileVersion {
   authoredAt: number;
   path: string;
   kind: V4ChangeKind;
-  descriptor?: V4VersionDescriptor;
+  descriptor?: V4VersionDescriptor | undefined;
 }
 
 export function buildV4JournalPages(journalId: string, changes: V4JournalChange[], pageSize = 500): V4JournalPage[] {

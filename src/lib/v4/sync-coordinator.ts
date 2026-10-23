@@ -50,11 +50,12 @@ export function coalesceV4Changes(changes: V4QueuedChange[]): V4QueuedChange[] {
     return pathChanges;
   }
 
+  const [first, second] = pathChanges;
   const isSimpleInverseRenameCycle = pathChanges.length === 2
-    && pathChanges[0].type === "rename"
-    && pathChanges[1].type === "rename"
-    && pathChanges[0].oldPath === pathChanges[1].path
-    && pathChanges[0].path === pathChanges[1].oldPath;
+    && first?.type === "rename"
+    && second?.type === "rename"
+    && first.oldPath === second.path
+    && first.path === second.oldPath;
   if (!isSimpleInverseRenameCycle) {
     const priorRenameEndpoints = new Set<string>();
     const priorRenameDestinations = new Set<string>();
@@ -123,8 +124,8 @@ export function coalesceV4Changes(changes: V4QueuedChange[]): V4QueuedChange[] {
 
 export class V4SyncCoordinator {
   private readonly pending: V4QueuedChange[] = [];
-  private active?: Promise<V4CoordinatorRunResult>;
-  private activeController?: AbortController;
+  private active: Promise<V4CoordinatorRunResult> | undefined;
+  private activeController: AbortController | undefined;
   private timer?: unknown;
   private flushAfterActive = false;
   private disposed = false;

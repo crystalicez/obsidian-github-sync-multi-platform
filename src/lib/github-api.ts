@@ -82,9 +82,9 @@ export class GitHubClient {
   private readonly transportPolicy: V4TransportPolicy;
   private readonly transportMetrics: V4TransportMetrics;
   private readonly transportResources: Pick<V4ResourceController, "withTransportBytes">;
-  private operationSignal?: AbortSignal;
-  private repositoryNodeIdPromise?: Promise<string>;
-  private readonly cooldownScope?: Promise<string>;
+  private operationSignal: AbortSignal | undefined;
+  private repositoryNodeIdPromise: Promise<string> | undefined;
+  private readonly cooldownScope: Promise<string> | undefined;
   private readonly cooldownStore?: V4RateLimitCooldownStore | undefined;
 
   constructor(config: GitHubConfig, options: GitHubClientOptions = {}) {

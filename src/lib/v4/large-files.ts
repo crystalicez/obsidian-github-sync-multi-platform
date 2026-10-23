@@ -21,7 +21,7 @@ export function buildV4PartPaths(input: {
   logicalPath: string;
   version: string;
   partCount: number;
-  opaqueId?: string;
+  opaqueId?: string | undefined;
 }): string[] {
   const normalized = normalizeV4VaultPath(input.logicalPath);
   const segments = normalized.split("/");

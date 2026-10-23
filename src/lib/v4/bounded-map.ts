@@ -14,7 +14,8 @@ export async function boundedMap<T, R>(
       const index = next++
       if (index >= items.length) return
       try {
-        results[index] = await mapper(items[index], index)
+        if (!(index in items)) throw new RangeError("Bounded map item missing.")
+        results[index] = await mapper(items[index] as T, index)
       } catch (error) {
         if (!failed) {
           failed = true

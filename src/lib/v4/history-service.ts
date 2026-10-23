@@ -38,7 +38,7 @@ function extension(path: string): string { return path.split(".").at(-1)?.toLowe
 export class V4HistoryService {
   private readonly codec: V4StorageCodec
 
-  constructor(private readonly input: { github: V4HistoryGithub; config: V4RemoteConfig; keyring?: V4Keyring }) {
+  constructor(private readonly input: { github: V4HistoryGithub; config: V4RemoteConfig; keyring?: V4Keyring | undefined }) {
     assertV4PathLayoutCompatible(input.config, { ...input.config, pathLayout: expectedV4PathLayout(input.config.mode) }, "normal")
     const pathLayout = input.config.pathLayout ?? expectedV4PathLayout(input.config.mode)
     this.codec = new V4StorageCodec({
@@ -50,7 +50,7 @@ export class V4HistoryService {
 
   async listCommits(page = 1): Promise<V4CommitPage> {
     const items = (await this.input.github.listCommits({ page, perPage: 50 })).map(commit => {
-      const match = /^obsidian-sync-v4:([^\s]+)$/u.exec(commit.message.split("\n", 1)[0])
+      const match = /^obsidian-sync-v4:([^\s]+)$/u.exec(commit.message.split("\n", 1)[0] ?? "")
       return { ...commit, source: match ? "plugin" as const : "external" as const, journalId: match?.[1] }
     })
     return { items, page, hasMore: items.length === 50 }

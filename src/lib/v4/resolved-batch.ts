@@ -13,7 +13,7 @@ export interface V4PullBinding {
   change: V4PlannedChange
   remoteRecord?: V4IndexFileRecord | undefined
   remoteCommitSha?: string | undefined
-  stage?: V4StageRef
+  stage?: V4StageRef | undefined
 }
 
 export interface V4StagedWriteBinding {

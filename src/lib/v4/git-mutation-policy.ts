@@ -6,7 +6,7 @@ export type V4MutationRetryClass =
 export type V4MutationFailureClass = "unknown-outcome" | "definitive"
 
 export interface V4MutationRetryEvidence {
-  originalCannotBeReachable?: boolean
+  originalCannotBeReachable?: boolean | undefined
 }
 
 export class V4GitMutationOutcomeUnknownError extends Error {

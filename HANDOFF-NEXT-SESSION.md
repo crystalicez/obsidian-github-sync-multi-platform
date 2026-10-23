@@ -4,6 +4,14 @@
 >
 > **Mandatory workflow rule:** Every AI session that makes a material change to code, tests, design decisions, branch/PR state, verification status, or next steps MUST update this file before ending or handing work off. GitHub is the source of truth.
 
+## 2026-10-23 Stage D37 — Maximum Strict TypeScript promoted to mandatory build (COMPLETE)
+
+- **D36 successor:** Isolated `.worktrees/d37-max-strict-index-safety`, branch `audit/2026-10-23-d37-max-strict-index-safety`, parent committed/pushed D36 `4566d9c2839228230cf8402a9a85432eafca8aef`; original Zed/root, D35 uncommitted UI rate-refresh changes, master/release, live GitHub and user vault untouched.
+- **Actual Maximum Strict:** Added `noUncheckedIndexedAccess:true` and `exactOptionalPropertyTypes:true` to default `tsconfig.json`, preserving D36 `strict:true` and all compiler extra safety flags. Explicit `skipLibCheck:false`; removed skipLibCheck bypass from build/devcss/max audit. **Both `pnpm build` and `pnpm typecheck:max-strict` PASS with zero errors**, including installed dependency declarations. Feasibility regression verifies mandatory flags and forbids library-check bypass.
+- **RED→GREEN TypeScript:** Maximum profile baseline D36 **174 errors**; D37 checkpoints **122 → 71 → 32 → 8 → 0**. Checked SHA-256/bytes reads, per-path Git codec guard (scoped `finalize()` path), per-index pack/group/queue validation, precise optional argument and transient state contracts. No new blanket `any`/nonnull assertions/ts-ignore, no wire format, crypto algorithm, Git CAS/retry or conflict/delete policy changes. Focused initial codec regression failed while migrating this method; fixed and **8/8 GREEN**; incremental SHA **2/2**.
+- **Validated exact source:** Frozen offline install PASS; Build+Max TypeScript PASS, Fast **528/528**, Repeat **10×528/528**, Recovery **79/79**, Resource **11/11**, Feasibility **134/134**, virtual bounded **100,000,000 bytes** SHA-reference Soak PASS, GitHub E2E compile-only **3 bundles**, metadata/package PASS. Detailed evidence `docs/engineering/d37-maximum-strict-typescript-2026-10-23.md`.
+- **Remaining gates:** D37 not independently credentialed GitHub/native GUI qualified; older D34 functional GUI evidence doesn't automatically transfer to this SHA. Reconcile separate D35 ongoing UI run-average fixes into an isolated combined candidate and rerun exact commit live GitHub + two-instance Windows Obsidian, telemetry full Hashing/Encryption acceptance, mobile/macOS/Linux, and independent security review before release. Node.js/Obsidian API primary; Issue #9 native helper deferred; no GitHub Actions.
+
 ## 2026-10-23 Stage D36 — staged Maximum Strict TypeScript migration (NOT YET COMPLETE)
 
 - Isolated audit worktree `.worktrees/d36-max-strict-typescript` from committed D35 SHA `4a01b93db59dc600511603c48b5adf479175610f`; did not modify D35's concurrent uncommitted changes, original Zed worktree, vault, master, release, or remote test repository.

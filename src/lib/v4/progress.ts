@@ -153,7 +153,7 @@ function snapshotsEqual(left: V4SyncProgressSnapshot, right: V4SyncProgressSnaps
     && left.timings.length === right.timings.length
     && left.timings.every((timing, index) => {
       const other = right.timings[index];
-      return timing.phase === other.phase
+      return other !== undefined && timing.phase === other.phase
         && timing.elapsedMs === other.elapsedMs
         && timing.occurrences === other.occurrences;
     });
@@ -240,8 +240,8 @@ export class V4ProgressStore {
   private timingRefreshHandle?: unknown;
   private throttlePending = false;
   private disposed = false;
-  private runStartedAt?: number;
-  private activePhaseStartedAt?: number;
+  private runStartedAt: number | undefined;
+  private activePhaseStartedAt: number | undefined;
   private lastAcceptedNow?: number;
   private readonly timingOrder: V4SyncPhase[] = [];
   private readonly timingByPhase = new Map<V4SyncPhase, TimingAccumulator>();

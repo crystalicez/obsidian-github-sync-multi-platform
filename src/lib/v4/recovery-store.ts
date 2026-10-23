@@ -28,7 +28,7 @@ export class V4RecoveryRequiredError extends Error {
 
 export interface V4RecoveryStore {
   load(): Promise<V4RecoverySnapshot | null>
-  save(input: Omit<V4RecoveryHeader, "schemaVersion" | "generation" | "payloadCiphertext" | "integrity"> & { payload?: V4RecoveryPayload }): Promise<V4RecoverySnapshot>
+  save(input: Omit<V4RecoveryHeader, "schemaVersion" | "generation" | "payloadCiphertext" | "integrity"> & { payload?: V4RecoveryPayload | undefined }): Promise<V4RecoverySnapshot>
 }
 
 function join(root: string, child: string): string {

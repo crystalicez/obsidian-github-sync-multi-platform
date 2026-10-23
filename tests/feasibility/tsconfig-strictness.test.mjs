@@ -9,7 +9,8 @@ test("TypeScript compiler keeps strict source checks and maximum migration gate"
   const active = read("tsconfig.json")
   const maximum = read("tsconfig.maximum-strict.json")
   for (const option of [
-    "strict", "noImplicitOverride", "noPropertyAccessFromIndexSignature",
+    "strict", "noUncheckedIndexedAccess", "exactOptionalPropertyTypes",
+    "noImplicitOverride", "noPropertyAccessFromIndexSignature",
     "noFallthroughCasesInSwitch", "noImplicitReturns", "noUnusedLocals",
     "noUnusedParameters", "noUncheckedSideEffectImports",
     "forceConsistentCasingInFileNames",
@@ -18,6 +19,7 @@ test("TypeScript compiler keeps strict source checks and maximum migration gate"
   }
   assert.equal(active.compilerOptions.allowUnreachableCode, false)
   assert.equal(active.compilerOptions.allowUnusedLabels, false)
+  assert.equal(active.compilerOptions.skipLibCheck, false)
   assert.equal(maximum.extends, "./tsconfig.json")
   assert.equal(maximum.compilerOptions.noUncheckedIndexedAccess, true)
   assert.equal(maximum.compilerOptions.exactOptionalPropertyTypes, true)

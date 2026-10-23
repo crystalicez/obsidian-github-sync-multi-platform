@@ -15,7 +15,7 @@ export interface V4ContentSource {
 export interface V4ContentSourceResolver {
   wholeBufferCeilingBytes?: number
   readVaultWhole(path: string): Promise<Uint8Array>
-  openVaultBounded?: (path: string, expectedSize: number) => Promise<V4ContentSource>
+  openVaultBounded?: ((path: string, expectedSize: number) => Promise<V4ContentSource>) | undefined
   openStage: (stageId: string, expectedSize: number) => Promise<V4ContentSource>
 }
 

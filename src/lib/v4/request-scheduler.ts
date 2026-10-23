@@ -22,7 +22,7 @@ export interface V4RequestSchedulerSnapshot {
 
 export interface V4RequestSchedulerOptions extends Partial<V4TransportPolicy> {
   sleep?: ((milliseconds: number) => Promise<void>) | undefined
-  now?: () => number
+  now?: (() => number) | undefined
   retryRateLimits?: boolean
   onRetry?: (milliseconds: number) => void
   onCooldown?: (deadlineEpochMs: number) => Promise<void> | void
@@ -45,9 +45,9 @@ export class V4RequestScheduler {
   private readonly sleep: (milliseconds: number) => Promise<void>
   private readonly now: () => number
   private readonly retryRateLimits: boolean
-  private readonly onRetry?: (milliseconds: number) => void
-  private readonly onCooldown?: (deadlineEpochMs: number) => Promise<void> | void
-  private readonly onDelay?: (input: { reason: "cooldown" | "pacing"; milliseconds: number }) => void
+  private readonly onRetry: ((milliseconds: number) => void) | undefined
+  private readonly onCooldown: ((deadlineEpochMs: number) => Promise<void> | void) | undefined
+  private readonly onDelay: ((input: { reason: "cooldown" | "pacing"; milliseconds: number }) => void) | undefined
   private cooldownUntil = 0
   private lastMutationStartedAt: number | undefined
   private mutationStartGate: Promise<void> = Promise.resolve()

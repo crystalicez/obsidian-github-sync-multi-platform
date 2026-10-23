@@ -30,7 +30,7 @@ export default class FastSync extends Plugin {
   startupSyncTimeout: number | null = null
   secretsMigrated: boolean = false
   private unloaded = false
-  private statusDisplaySignature?: string
+  private statusDisplaySignature: string | undefined
   private cooldownStore?: V4RateLimitCooldownStore
 
   enableWatch() {

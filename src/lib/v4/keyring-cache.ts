@@ -24,7 +24,7 @@ function clearKeyring(keyring: V4Keyring): void {
 }
 
 export class V4KeyringCache {
-  private entry?: V4KeyringCacheEntry
+  private entry: V4KeyringCacheEntry | undefined
   private readonly retired = new Set<V4Keyring>()
   private disposed = false
 

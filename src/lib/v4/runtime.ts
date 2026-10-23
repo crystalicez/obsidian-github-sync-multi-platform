@@ -69,7 +69,7 @@ function createMemoryAdapter(owner: object): V4LocalIndexAdapter {
   }
 }
 
-function createRuntimePlatformIo(plugin: FastSync): { io: V4PlatformIo; stageRoot: string; desktopRootPath?: string } {
+function createRuntimePlatformIo(plugin: FastSync): { io: V4PlatformIo; stageRoot: string; desktopRootPath?: string | undefined } {
   const vault = plugin.app.vault as FastSync["app"]["vault"] & {
     configDir?: string
     adapter?: V4BinaryAdapterLike & { getFullPath?(path: string): string }
@@ -145,7 +145,7 @@ export class V4PluginRuntime {
   private readonly progressStore = new V4ProgressStore()
   private diagnosticsClient?: FastSync["githubClient"]
   private diagnosticsBaseline?: V4TransportMetricsSnapshot
-  private peakRendererRssBytes?: number
+  private peakRendererRssBytes: number | undefined
   private readonly platformIo: V4PlatformIo
   private readonly uncVault: boolean
   private networkStorageNoticeShown = false
@@ -375,7 +375,7 @@ export class V4PluginRuntime {
     const loaded = await loadV4LocalIndex(this.adapter, V4_INDEX_ROOT)
     const pathLayout = config.pathLayout ?? expectedV4PathLayout(config.mode)
     if (loaded.repoId === config.repoId && loaded.mode === config.mode && loaded.pathLayout === pathLayout) return loaded
-    return createEmptyV4LocalIndex({ repoId: config.repoId, deviceId: deviceId || "defaultVault", mode: config.mode, pathLayout: config.pathLayout })
+    return createEmptyV4LocalIndex({ repoId: config.repoId, deviceId: deviceId || "defaultVault", mode: config.mode, pathLayout })
   }
 
   private async saveIndex(index: V4LocalIndex, previousShardHashes: Record<string, string> = {}): Promise<void> {

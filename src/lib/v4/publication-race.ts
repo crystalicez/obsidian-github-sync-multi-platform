@@ -11,7 +11,7 @@ export interface V4PublicationRaceErrorInput {
   expectedHeadSha: string | null
   observedHeadSha: string | null
   publicationOutcome: V4PublicationOutcome
-  evidence?: string
+  evidence?: string | undefined
   cause?: unknown
   message?: string
 }

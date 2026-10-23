@@ -76,7 +76,7 @@ export async function deriveV4BootstrapRecoveryKey(input: {
   const masterKey = await deriveV4PassphraseMasterKey({
     passphrase: input.passphrase,
     salt,
-    iterations: input.iterations,
+    ...(input.iterations === undefined ? {} : { iterations: input.iterations }),
   });
   try {
     return await hmacSha256(masterKey, `obsidian-github-sync-v4:${input.repoId}:bootstrap-recovery`);
