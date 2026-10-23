@@ -2544,7 +2544,7 @@ test("D11 direct staged Pull finalizes verified backup before reporting mutation
   assert.deepEqual(events, ["commit","finalize","completed"]);
 });
 
-test("v4 medium single-object push uses bounded source instead of whole-buffer vault read", async () => {
+test("v4 medium REST-safe chunked push uses bounded source instead of whole-buffer vault read", async () => {
   const github = new MemoryGitHub();
   const vault = new MemoryVault();
   const payload = new Uint8Array(DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES + 1);
@@ -2557,7 +2557,7 @@ test("v4 medium single-object push uses bounded source instead of whole-buffer v
     .sync({ operation: "forcePush", allowThresholdOverride: false });
 
   assert.equal(result.pushedFiles, 1);
-  assert.equal(indexRecordByPath(index, "medium.bin").storage, "single");
+  assert.equal(indexRecordByPath(index, "medium.bin").storage, "chunked");
   assert.equal(vault.operations.includes("read:medium.bin"), false);
 });
 

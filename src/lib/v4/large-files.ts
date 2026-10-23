@@ -4,6 +4,13 @@ import { V4_ROOT, type V4StorageMode } from "./protocol-types";
 
 export const V4_LARGE_FILE_THRESHOLD_BYTES = 50 * 1024 * 1024;
 export const V4_PART_BYTES = 48 * 1024 * 1024;
+/** Empirically verified maximum for NEW REST Git Blob content. Old 48 MiB parts stay readable. */
+export const V4_GITHUB_REST_SAFE_WRITER_BYTES = 8 * 1024 * 1024;
+
+export function shouldWriteV4Parts(logicalBytes: number): boolean {
+  if (!Number.isSafeInteger(logicalBytes) || logicalBytes < 0) throw new TypeError("logicalBytes must be a non-negative safe integer.");
+  return logicalBytes > V4_GITHUB_REST_SAFE_WRITER_BYTES;
+}
 
 export function shouldUseV4Parts(logicalBytes: number, predictedRemoteBytes = logicalBytes): boolean {
   return logicalBytes > V4_LARGE_FILE_THRESHOLD_BYTES || predictedRemoteBytes > V4_LARGE_FILE_THRESHOLD_BYTES;

@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { estimateV4PackGroupResources } from "../../src/lib/v4/pack-planner";
+import { V4_GITHUB_REST_SAFE_WRITER_BYTES } from "../../src/lib/v4/large-files";
 import {
   PACK_MAX_ENTRY_BYTES,
   PACK_MAX_FILES,
@@ -41,13 +43,10 @@ test("pack planner preserves folder grouping, order, max files, and plaintext by
   ];
   const groups = planV4PackGroups(candidates);
 
-  assert.equal(groups[0].length, 500);
-  assert.equal(groups[1].length, 1);
-  assert.equal(groups[2].length, 64);
-  assert.equal(groups[3].length, 1);
-  assert.equal(groups[0][0].fileId, "f0");
-  assert.equal(groups[1][0].fileId, "f500");
-  assert.equal(groups[2][0].fileId, "f501");
+  assert.ok(groups.length > 4, "REST-safe pack limit should split the old oversized packs");
+  assert.deepEqual(groups.flat(), candidates, "splitting may not omit/reorder candidates");
+  assert.ok(groups.every(group => group.length <= PACK_MAX_FILES));
   assert.ok(groups.every(group => new Set(group.map(item => item.path.split("/").slice(0, -1).join("/"))).size === 1));
   assert.ok(groups.every(group => group.reduce((sum, item) => sum + item.size, 0) <= PACK_MAX_PLAINTEXT_BYTES));
+  assert.ok(groups.every(group => estimateV4PackGroupResources(group).ciphertextBytes <= V4_GITHUB_REST_SAFE_WRITER_BYTES));
 });

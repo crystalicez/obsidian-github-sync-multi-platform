@@ -72,6 +72,22 @@ test("encrypted codec measures actual decryption work, including failed authenti
   assert.deepEqual(await observerFailure.read(prepared.record, async () => prepared.files[0]!.bytes), bytes("unchanged secret"));
 });
 
+test("new encrypted packs exceeding the previously verified REST-safe payload cap fail before upload", async () => {
+  const keyring = await deriveV4Keyring({ passphrase: "pack-cap", repoId: "o/r#main", salt: bytes("pack-salt"), iterations: 10 });
+  const codec = new V4StorageCodec({ mode: "encrypted", pathLayout: "opaque-stable-v1", keyring });
+  const sample = await codec.prepare("Notes/record.md", bytes("small"), "v1", 1, "file-pack-cap");
+  const large = new Uint8Array(7 * 1024 * 1024);
+  await assert.rejects(() => codec.preparePack("pack-cap", [{ record: sample.record, plaintext: large }]), /REST-safe 8 MiB/iu);
+  let opened = false;
+  await assert.rejects(() => codec.preparePackFromSources("pack-cap", [{
+    logicalPath: "Notes/record.md", fileId: "file-pack-cap",
+    source: { size: large.byteLength, async *chunks() { opened = true; yield large; } },
+    expectedHash: "0".repeat(64), expectedSize: large.byteLength,
+    version: "v1", mtime: 1,
+  }]), /REST-safe 8 MiB/iu);
+  assert.equal(opened, false, "oversized pack should fail before opening sources");
+});
+
 test("plaintext codec emits no decryption timing", async () => {
   let measured = 0;
   const codec = new V4StorageCodec({

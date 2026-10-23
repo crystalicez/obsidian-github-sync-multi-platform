@@ -28,7 +28,7 @@ import { V4StorageCodec } from "./storage-codec"
 import { collectV4ContentSource, createV4WholeBufferContentSource, DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES, type V4ContentHandle, type V4ContentSource } from "./content-source"
 import type { V4StageRef } from "./staging-store"
 import { V4BoundedIoUnavailableError } from "./platform-io"
-import { shouldUseV4Parts, V4_PART_BYTES } from "./large-files"
+import { shouldWriteV4Parts, V4_PART_BYTES } from "./large-files"
 import { hashV4StableContentSource, V4SourceChangedError } from "./object-stream"
 import { selectV4WriterPartBytes } from "./part-write-policy"
 import type { V4PullBinding, V4PushBinding, V4ResolvedBatch, V4StagedWriteBinding } from "./resolved-batch"
@@ -786,8 +786,7 @@ export class V4SyncSession {
         continue
       }
 
-      const predictedRemoteBytes = after.size + (this.input.config.mode === "encrypted" ? 33 : 0)
-      const usesV4Parts = shouldUseV4Parts(after.size, predictedRemoteBytes)
+      const usesV4Parts = shouldWriteV4Parts(after.size)
       if (usesV4Parts || after.size > DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES) {
         const source = await this.openPushContentSource(context.binding)
         const partBytes = usesV4Parts

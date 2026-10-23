@@ -3,7 +3,7 @@ import test from "node:test";
 
 import { sha256Hex } from "../../src/lib/bytes";
 import { deriveV4Keyring, encryptV4Payload } from "../../src/lib/v4/crypto";
-import { shouldUseV4Parts, splitV4Parts, V4_LARGE_FILE_THRESHOLD_BYTES } from "../../src/lib/v4/large-files";
+import { shouldUseV4Parts, shouldWriteV4Parts, splitV4Parts, V4_GITHUB_REST_SAFE_WRITER_BYTES, V4_LARGE_FILE_THRESHOLD_BYTES, V4_PART_BYTES } from "../../src/lib/v4/large-files";
 import type { V4FileRecord } from "../../src/lib/v4/protocol-types";
 import { V4StorageCodec } from "../../src/lib/v4/storage-codec";
 
@@ -15,6 +15,24 @@ test("v4 chunk threshold includes predicted encrypted overhead without changing 
   assert.equal(shouldUseV4Parts(threshold + 1, threshold + 1), true);
   assert.equal(shouldUseV4Parts(threshold - 16, threshold - 16 + 33), true);
   assert.equal(shouldUseV4Parts(threshold - 34, threshold - 34 + 33), false);
+});
+
+test("REST-safe 8 MiB writer splits medium and 100 MB payloads lazily while retaining 48 MiB legacy reader constants", async () => {
+  const limit = V4_GITHUB_REST_SAFE_WRITER_BYTES;
+  assert.equal(limit, 8 * 1024 * 1024);
+  assert.equal(V4_PART_BYTES, 48 * 1024 * 1024);
+  const codec = new V4StorageCodec({ mode: "plaintext", pathLayout: "plaintext-v1" });
+  for (const size of [limit - 1, limit, limit + 1, 16_000_000, 32_000_000, 50_000_000, 100_000_000]) {
+    assert.equal(shouldWriteV4Parts(size), size > limit);
+    let readSource = false;
+    const prepared = await codec.prepareFromSource({
+      logicalPath: "Assets/medium.bin",
+      source: { size, async *chunks() { readSource = true; throw new Error("source cannot open during planning"); } },
+      expectedHash: "a".repeat(64), version: "v1", mtime: 1, fileId: "file-medium", partBytes: limit,
+    });
+    assert.equal(prepared.objectCount, size > limit ? Math.ceil(size / limit) : 1);
+    assert.equal(readSource, false);
+  }
 });
 
 test("v4 chunk reader accepts valid variable-size parts and verifies the full logical hash", async () => {

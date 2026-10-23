@@ -1,4 +1,5 @@
-import { V4_PART_BYTES } from "./large-files"
+import { V4_PART_BYTES, V4_GITHUB_REST_SAFE_WRITER_BYTES } from "./large-files"
+export { V4_GITHUB_REST_SAFE_WRITER_BYTES } from "./large-files"
 import { estimateV4GitBlobTransportBytes } from "./resource-controller"
 
 const MiB = 1024 * 1024
@@ -18,7 +19,7 @@ function assertNonNegativeSafeInteger(value: number, label: string): void {
 }
 
 function largestTransportSafeMiB(maxTransportTransientBytes: number): number {
-  const maxMiB = Math.floor(V4_PART_BYTES / MiB)
+  const maxMiB = Math.floor(Math.min(V4_PART_BYTES, V4_GITHUB_REST_SAFE_WRITER_BYTES) / MiB)
   let low = 0
   let high = maxMiB
   while (low < high) {
@@ -39,7 +40,7 @@ export function selectV4WriterPartBytes(input: V4PartWritePolicyInput): number {
   const minimumForMutationHeadroom = input.logicalBytes === 0
     ? MiB
     : Math.ceil(Math.ceil(input.logicalBytes / mutationBudget) / MiB) * MiB
-  const selected = Math.min(V4_PART_BYTES, transportSafe)
+  const selected = Math.min(V4_GITHUB_REST_SAFE_WRITER_BYTES, transportSafe)
   if (selected < Math.max(MiB, minimumForMutationHeadroom)) {
     throw new Error(`There is no safe V4 writer part size for ${input.logicalBytes} bytes under the configured transport and mutation budgets.`)
   }

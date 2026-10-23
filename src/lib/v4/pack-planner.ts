@@ -1,4 +1,5 @@
 import { estimateV4GitBlobTransportBytes } from "./resource-controller"
+import { V4_GITHUB_REST_SAFE_WRITER_BYTES } from "./large-files"
 
 export const PACK_MIN_CHANGED_FILES = 64
 export const PACK_MAX_FILES = 500
@@ -102,6 +103,7 @@ export function planV4PackGroups(
   const withinBudgets = (state: V4PackAccumulator): boolean => {
     const budget = packResources(state)
     return budget.plaintextBytes <= maxPlaintextBytes
+      && budget.ciphertextBytes <= V4_GITHUB_REST_SAFE_WRITER_BYTES
       && budget.residentBytes <= maxResidentBytes
       && budget.transportBytes <= maxTransportTransientBytes
   }

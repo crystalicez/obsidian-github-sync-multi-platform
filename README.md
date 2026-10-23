@@ -64,7 +64,7 @@ Object sizes, commit timing, and plugin use may remain observable. Use the same 
 - Force push makes the V4 remote match the local vault; Force Pull mirrors the V4 remote locally and can delete files in scope.
 - Ignore regex rules match plaintext vault paths before encryption.
 - A global five-second debounce coalesces create, edit, delete, and rename bursts into one commit. Repeated manual or force actions report that a sync is already running.
-- Encrypted batches use bounded packs for large file counts; payloads over 50 MiB use ordered 48 MiB parts with full-file hash verification.
+- New REST uploads above 8 MiB use ordered parts capped at 8 MiB (12 data parts for a 100,000,000-byte file), with full-file SHA-256 verification; older 48 MiB parts and larger historical single blobs remain readable. Encrypted packs are also capped at 8 MiB of ciphertext.
 - The modification guard applies to normal and force operations. A blocked force operation requires a separate one-time override confirmation.
 
 ### Live Sync Status
@@ -77,11 +77,11 @@ Phase changes appear immediately. Rapid path and counter changes are published a
 
 V4 uses three separate evidence layers; one layer never substitutes for another:
 
-- **Deterministic CI/release gates** cover model behavior, recovery/crash handling, bounded resources, source snapshots, cancellation, transport pacing, and compile the destructive real-GitHub E2E harness. The official Windows Task 15 automated gate and separate 2 GiB + 5 GiB cryptographic virtual soak are recorded as passed.
+- **Local deterministic release gates (no GitHub Actions)** cover model behavior, recovery/crash handling, bounded resources, source snapshots, cancellation, transport pacing, and compile the destructive real-GitHub E2E harness. The official Windows Task 15 automated gate and separate 2 GiB + 5 GiB cryptographic virtual soak are recorded as passed.
 - **Live real-GitHub qualification** is a credentialed exact-SHA workflow against a dedicated disposable repository. It exercises plaintext/encrypted multi-device conflicts, branch-head races, exact Copy-policy lineage, and encrypted out-of-band mutation refusal. A commit is not described as live-qualified until that workflow's `qualify` and `cleanup` jobs actually succeed for the exact SHA.
-- **Physical-device/large-file evidence** remains separate. A physical encrypted 5 GiB Windows Force Push → no-op → clean-vault Force Pull round trip is not claimed until recorded in `tests/baselines/v4/windows.json`. Android currently lacks a supported bounded local read/final-stage-commit path for multi-gigabyte files, so Android 5 GiB is not a supported claim.
+- **Physical-device/large-file evidence** remains separate. The permanent physical test-file limit is 100,000,000 bytes, and an exact-size Windows Obsidian Force Push → no-op → second-instance Force Pull round trip is not claimed until it passes with the current pinned source SHA. Physical mobile acceptance remains separate.
 
-The current 48 MiB-part model for one 5 GiB revision is 107 data parts and about 114 modeled content/publication mutations with a minimum policy pacing floor of 113 seconds. Repeated full encrypted 5 GiB revisions are operationally limited by repository growth; see [the GitHub Free operational model](docs/engineering/v4-github-free-operational-model.md).
+The historical 48 MiB part format is **read compatibility only**: new GitHub REST writes use empirically verified 8 MiB parts, plus an enforced per-revision mutation budget. Files too large for the budget fail closed rather than automatically generating unsafe request sizes. See [the GitHub Free operational model](docs/engineering/v4-github-free-operational-model.md) for historical comparisons.
 
 See [real GitHub E2E qualification](docs/github-e2e.md), [release procedure](docs/releasing.md), [Windows/Android validation](docs/testing/v4-windows-android-validation.md), and [performance methodology](docs/engineering/v4-performance-methodology.md) for the evidence rules.
 
