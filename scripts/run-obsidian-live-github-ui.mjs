@@ -357,9 +357,9 @@ try{
    assertTrue((await stat(full)).size===size,"Native 100 MB fixture size changed");
    const observed=await waitUntil(()=>evaluate("(()=>{const f=app.vault.getAbstractFileByPath('Assets/payload-100mb.bin');return f?.stat?.size===100000000?{size:f.stat.size}:null;})()"),60000,"real Obsidian indexed new 100 MB binary");
    assertTrue(observed.size===size,"Native Obsidian did not index the synthetic 100 MB file");
-   const uploaded=await evaluate("(async()=>{const p=app.plugins.plugins["+JSON.stringify(id)+"];const started=performance.now();await p.v4Runtime.manualSync();return {lifecycle:p.v4Runtime.progressSnapshot.lifecycle,trigger:p.v4Runtime.progressSnapshot.trigger,wallMs:performance.now()-started};})()",480000);
+   const uploaded=await evaluate("(async()=>{const p=app.plugins.plugins["+JSON.stringify(id)+"];const started=performance.now();await p.v4Runtime.manualSync();const s=p.v4Runtime.progressSnapshot;return {lifecycle:s.lifecycle,trigger:s.trigger,wallMs:performance.now()-started,error:s.errorMessage?.slice(0,480),failurePhase:s.failurePhase,failurePath:s.failurePath,phase:s.phase,diagnostics:s.diagnostics};})()",480000);
    nativeUploadWallMs=uploaded.wallMs;
-   assertTrue(uploaded.lifecycle==="success"&&uploaded.trigger==="manual","Native Obsidian 100 MB GitHub Push failed");
+   assertTrue(uploaded.lifecycle==="success"&&uploaded.trigger==="manual","Native Obsidian 100 MB GitHub Push failed: "+redact(JSON.stringify(uploaded)));
    const remote=await readState(configuration);
    assertTrue(remote.kind==="present"&&remote.sha!==before,"Native Obsidian 100 MB upload did not publish a commit");
    finalSha=remote.sha;
