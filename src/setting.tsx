@@ -5,6 +5,7 @@ import FastSync from "./main";
 import { dump } from "./lib/helps";
 import { createDebugPayload } from "./lib/debug";
 import { V4_NETWORK_VAULT_WARNING } from "./lib/v4/network-storage";
+import { V4_DEFAULT_PBKDF2_ITERATIONS, V4_MAX_PBKDF2_ITERATIONS, V4_MIN_NEW_PBKDF2_ITERATIONS } from "./lib/v4/kdf-policy";
 
 export interface PluginSettings {
   // Whether auto-upload is enabled
@@ -18,6 +19,8 @@ export interface PluginSettings {
   encryptionMode: "plaintext" | "encrypted"
   encryptionPassphrase: string
   encryptionPassphraseSecretId: string
+  /** Applies only when initializing a new encrypted V4 repository. */
+  newVaultKdfIterations: number
   syncOnStartup: boolean
   syncOnLocalChange: boolean
   scheduledSyncEnabled: boolean
@@ -53,6 +56,7 @@ export const DEFAULT_SETTINGS: PluginSettings = {
   encryptionMode: "plaintext",
   encryptionPassphrase: "",
   encryptionPassphraseSecretId: "",
+  newVaultKdfIterations: V4_DEFAULT_PBKDF2_ITERATIONS,
   syncOnStartup: true,
   syncOnLocalChange: true,
   scheduledSyncEnabled: false,
@@ -323,6 +327,17 @@ export class SettingTab extends PluginSettingTab {
       )
 
     if (this.tempSettings!.encryptionMode === "encrypted") {
+      new Setting(set)
+        .setName("PBKDF2 iterations for new encrypted repositories")
+        .setDesc("600,000 by default; maximum 1,200,000. Used only when initializing a NEW encrypted repository. Existing encrypted repositories always use their remote KDF settings. Changing this does NOT re-encrypt or migrate existing data.")
+        .addSlider((slider) => slider
+          .setLimits(V4_MIN_NEW_PBKDF2_ITERATIONS, V4_MAX_PBKDF2_ITERATIONS, 100_000)
+          .setValue(this.tempSettings!.newVaultKdfIterations)
+          .setDynamicTooltip()
+          .onChange((value) => {
+            this.tempSettings!.newVaultKdfIterations = value
+            this.updateDirtyState()
+          }))
       new Setting(set)
         .setName("Encryption passphrase")
         .setDesc("Enter the same passphrase on every device. Losing it means the encrypted repo cannot be decrypted.")

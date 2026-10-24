@@ -1,6 +1,7 @@
 import { assertSafeGitHubBranch, assertSafeGitHubRepositoryCoordinates } from "./github-config"
 import { compileV4IgnorePathRegex } from "./v4/ignore"
 import { assertDistinctV4SecretIds } from "./v4/secrets"
+import { assertV4Pbkdf2Iterations, V4_MIN_NEW_PBKDF2_ITERATIONS } from "./v4/kdf-policy"
 
 type RuntimeSettings = Record<string, unknown>
 
@@ -49,6 +50,7 @@ export function assertPluginSettingsRuntimeSafe(value: unknown): void {
     "clipboardReadTip",
   ]) optionalString(settings, key)
   assertDistinctV4SecretIds(settings)
+  assertV4Pbkdf2Iterations(settings["newVaultKdfIterations"], V4_MIN_NEW_PBKDF2_ITERATIONS)
 
   if (settings["encryptionMode"] !== "plaintext" && settings["encryptionMode"] !== "encrypted") {
     throw new Error("Invalid plugin settings: encryptionMode is unsupported.")

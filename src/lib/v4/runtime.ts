@@ -4,6 +4,7 @@ import { fromBase64Url, randomBytes, sha256Hex, toBase64Url, utf8ToBytes } from 
 import { syncConsoleLog } from "../debug"
 import { readVaultFileBytes, writeVaultFileBytes, trashVaultFileIfExists } from "../vault"
 import { deriveV4BootstrapRecoveryKey, deriveV4Keyring, type V4Keyring } from "./crypto"
+import { assertV4Pbkdf2Iterations, V4_DEFAULT_PBKDF2_ITERATIONS, V4_MIN_NEW_PBKDF2_ITERATIONS } from "./kdf-policy"
 import {
   createEmptyV4LocalIndex,
   loadV4LocalIndex,
@@ -44,9 +45,10 @@ interface V4RuntimeConfigSelection {
   source: V4RuntimeConfigSource
 }
 
-export function selectV4RuntimeConfig(discovered: V4RemoteConfig | null, mode: V4StorageMode, repoId: string): V4RemoteConfig {
+export function selectV4RuntimeConfig(discovered: V4RemoteConfig | null, mode: V4StorageMode, repoId: string, newVaultKdfIterations = V4_DEFAULT_PBKDF2_ITERATIONS): V4RemoteConfig {
   if (discovered?.mode === mode) return { ...discovered, repoId, pathLayout: expectedV4PathLayout(mode) }
   if (mode === "plaintext") return { formatVersion: V4_FORMAT_VERSION, mode, repoId, pathLayout: expectedV4PathLayout(mode) }
+  assertV4Pbkdf2Iterations(newVaultKdfIterations, V4_MIN_NEW_PBKDF2_ITERATIONS)
   return {
     formatVersion: V4_FORMAT_VERSION,
     mode,
@@ -54,7 +56,7 @@ export function selectV4RuntimeConfig(discovered: V4RemoteConfig | null, mode: V
     pathLayout: expectedV4PathLayout(mode),
     algorithm: "AES-GCM",
     kdf: "PBKDF2-SHA-256",
-    kdfParams: { iterations: 600_000, salt: toBase64Url(randomBytes(16)) },
+    kdfParams: { iterations: newVaultKdfIterations, salt: toBase64Url(randomBytes(16)) },
   }
 }
 
@@ -595,7 +597,7 @@ export class V4PluginRuntime {
           if (discovered.mode !== desiredMode && request.operation !== "forcePush") {
             throw new Error("Remote storage mode differs. Force Push is required.")
           }
-          const config = selectV4RuntimeConfig(discovered, desiredMode, repoId)
+          const config = selectV4RuntimeConfig(discovered, desiredMode, repoId, settings.newVaultKdfIterations)
           this.progressStore.update({ phase: "loading-index", currentPath: undefined, currentDirection: undefined })
           const index = await this.loadIndex(config, settings.vault)
           const previousShardHashes = { ...index.shardHashes }

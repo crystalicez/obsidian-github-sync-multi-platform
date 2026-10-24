@@ -1,4 +1,5 @@
 import { randomBytes, toHex, utf8ToBytes } from "../bytes";
+import { assertV4Pbkdf2Iterations, V4_DEFAULT_PBKDF2_ITERATIONS } from "./kdf-policy";
 
 const MAGIC = new Uint8Array([0x4f, 0x47, 0x53, 0x34]);
 const PAYLOAD_VERSION = 1;
@@ -28,6 +29,8 @@ async function deriveV4PassphraseMasterKey(input: {
   salt: Uint8Array;
   iterations?: number;
 }): Promise<Uint8Array> {
+  const iterations = input.iterations ?? V4_DEFAULT_PBKDF2_ITERATIONS;
+  assertV4Pbkdf2Iterations(iterations);
   const passphraseBytes = utf8ToBytes(input.passphrase);
   let material: CryptoKey;
   try {
@@ -40,7 +43,7 @@ async function deriveV4PassphraseMasterKey(input: {
     name: "PBKDF2",
     hash: "SHA-256",
     salt: input.salt as any,
-    iterations: input.iterations ?? 600_000,
+    iterations,
   }, material, 256));
 }
 

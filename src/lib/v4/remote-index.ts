@@ -1,6 +1,7 @@
 import { bytesToUtf8, sha256Hex, utf8ToBytes } from "../bytes"
 import { decryptV4Payload, encryptV4Payload, type V4Keyring } from "./crypto"
 import { buildV4PartPaths } from "./large-files"
+import { V4_MAX_PBKDF2_ITERATIONS } from "./kdf-policy"
 import { assertV4MetadataBytes } from "./metadata-bounds"
 import type { V4IndexFileRecord } from "./local-index"
 import { bucketForV4PathId, normalizeV4VaultPath, objectIdForV4File, opaqueV4ObjectPath, opaqueV4PackPath, pathIdForV4Path } from "./paths"
@@ -194,7 +195,7 @@ export function decodeV4RemoteConfig(bytes: Uint8Array): V4RemoteConfig {
   if (config.kdfParams !== undefined) {
     const params = config.kdfParams
     if (!params || typeof params !== "object" || Array.isArray(params)
-      || !Number.isSafeInteger(params.iterations) || params.iterations < 1
+      || !Number.isSafeInteger(params.iterations) || params.iterations < 1 || params.iterations > V4_MAX_PBKDF2_ITERATIONS
       || typeof params.salt !== "string" || !/^[A-Za-z0-9_-]+$/u.test(params.salt)
       || params.salt.length % 4 === 1) {
       throw new Error("Invalid V4 remote KDF parameters.")

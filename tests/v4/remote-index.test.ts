@@ -59,6 +59,24 @@ test("D62 remote KDF fields reject malformed types and salt before key derivatio
   }
 });
 
+test("D63 remote PBKDF2 iteration cap rejects expensive configs without rewriting stored values", () => {
+  const base = { formatVersion: 4, mode: "encrypted", repoId: "o/r#main",
+    kdfParams: { iterations: 1_200_000, salt: "c2FsdA" } };
+  assert.equal(decodeV4RemoteConfig(enc(JSON.stringify(base))).kdfParams?.iterations, 1_200_000);
+  const high = { ...base, kdfParams: { ...base.kdfParams, iterations: 1_200_001 } };
+  assert.throws(() => decodeV4RemoteConfig(enc(JSON.stringify(high))), /PBKDF2|KDF|maximum|limit/i);
+  const lowLegacy = { ...base, kdfParams: { ...base.kdfParams, iterations: 10 } };
+  assert.equal(decodeV4RemoteConfig(enc(JSON.stringify(lowLegacy))).kdfParams?.iterations, 10,
+    "legacy values below the new-setting minimum must still be readable");
+});
+
+test("D63 direct PBKDF2 key derivation rejects over-cap iterations before crypto work", async () => {
+  await assert.rejects(
+    () => deriveV4Keyring({ passphrase: "synthetic", repoId: "o/r#main", salt: enc("salt"), iterations: 1_200_001 }),
+    /PBKDF2|iterations|maximum|limit/i,
+  );
+});
+
 test("v4 encrypted remote metadata does not expose paths and round trips", async () => {
   const keys = await deriveV4Keyring({ passphrase: "pass", repoId: "o/r#main", salt: enc("salt"), iterations: 10 });
   const config: V4RemoteConfig = { formatVersion: V4_FORMAT_VERSION, mode: "encrypted", repoId: "o/r#main", pathLayout: expectedV4PathLayout("encrypted"), algorithm: "AES-GCM", kdf: "PBKDF2-SHA-256", kdfParams: { iterations: 10, salt: "c2FsdA" } };

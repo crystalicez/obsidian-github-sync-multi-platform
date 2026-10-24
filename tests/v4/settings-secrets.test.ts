@@ -30,6 +30,18 @@ test("v4 settings defaults keep sensitive scopes and modification guard disabled
   assert.equal(DEFAULT_SETTINGS.abortChangePercent, 0);
 });
 
+test("D63 configurable new encrypted repository KDF does not rekey existing repositories", () => {
+  assert.equal(DEFAULT_SETTINGS.newVaultKdfIterations, 600_000);
+  const created = selectV4RuntimeConfig(null, "encrypted", "o/r#main", 900_000);
+  assert.equal(created.kdfParams?.iterations, 900_000);
+  const newDefault = selectV4RuntimeConfig(null, "encrypted", "o/r#main");
+  assert.equal(newDefault.kdfParams?.iterations, 600_000);
+  const existing = { ...created, kdfParams: { iterations: 700_000, salt: "c2FsdA" } };
+  assert.deepEqual(selectV4RuntimeConfig(existing, "encrypted", "o/r#main", 1_200_000).kdfParams,
+    existing.kdfParams, "settings changes must never rewrite KDF params of an initialized remote");
+  assert.throws(() => selectV4RuntimeConfig(null, "encrypted", "o/r#main", 1_200_001), /KDF|iterations|maximum/i);
+});
+
 test("v4 encrypted-mode settings copy promises stable opaque paths without readable folders", async () => {
   const source = await readFile("src/setting.tsx", "utf8");
   assert.match(source, /hides directory names, filenames, extensions, and content behind stable opaque objects/iu);
