@@ -21,7 +21,17 @@ The original missing-object observer examined a *recursive* tree returned after 
 - New pure evidence tests **4/4 PASS**: two-stage tree path exact immutable identity and no blob downloading, complete absence vs truncated/incomplete, HTTP 404, commit/tree SHA mismatch, duplicated nodes, malformed paths/refs and exception message scrubbing.
 - Maximum Strict TypeScript **0 errors**, production build PASS, GitHub E2E all **3 bundles** compile PASS.
 - Fast **586/586 PASS**, recovery **79/79**, resource **11/11**, feasibility **134/134**, virtual bounded 100,000,000-byte soak **1/1**, metadata and package validation PASS.
-- Full fast repeat completed **10 × 586/586 PASS**, verified ten distinct round markers and 586-pass summaries / exit 0. Exact-SHA focused credentialed live E2E recorded separately after execution and independently verified cleanup.
+- Full fast repeat completed **10 × 586/586 PASS**, verified ten distinct round markers and 586-pass summaries / exit 0.
+
+## Exact-SHA real GitHub focused E2E — three independent rounds
+
+Clean pushed D49 source SHA `d8ca191affb6a24263adff13629d9856220c4a34`, approved disposable repository `diamond-crystal/test-vault-obsidian-encrypted-github-sync-multi-platform` with pinned numeric ID `1284153873`. Executed `node scripts/run-github-e2e-disposable.mjs delete-plaintext` three separate times, each with a preflight-absent, unique synthetic branch and its own teardown. **3/3 PASS, exit 0 each**; two-device plaintext delete/recreate identity break succeeded, 0 retries, 0 cooldowns, 0 unknown publication outcomes. Device A observed 41 requests / 23 expected mutations; device B 11 requests / zero mutations in each round. No `Missing V4 remote object` occurred, so the D49 read-only probe correctly remained inactive; absence of failure does NOT prove P0 resolved.
+
+- Round 1: `obsidian-sync-e2e/local-d8ca191affb6-d24-delete-plaintext-1236297d2c7b`, elapsed scenario 33,312 ms; runner `CLEANUP_VERIFIED_TWICE`, independent read-only pinned-repository `READ_ONLY_CLEANUP_VERIFIED_TWICE`, exit 0.
+- Round 2: `obsidian-sync-e2e/local-d8ca191affb6-d24-delete-plaintext-49694c2678de`, elapsed scenario 33,509.3 ms; runner `CLEANUP_VERIFIED_TWICE`, independent `READ_ONLY_CLEANUP_VERIFIED_TWICE`, exit 0.
+- Round 3: `obsidian-sync-e2e/local-d8ca191affb6-d24-delete-plaintext-6857e653f7ed`, elapsed scenario 33,925.9 ms; runner `CLEANUP_VERIFIED_TWICE`, independent `READ_ONLY_CLEANUP_VERIFIED_TWICE`, exit 0.
+
+All three unique branches are independently absent-verified. These are **three scoped plaintext scenario runs, NOT a new full 3/3 GitHub matrix, native Obsidian 100 MB run or proof of an intermittent bug fix**. Latest previously qualified full/native E2E production source remains D46 (exact SHA `81aea119cc87`), whose `src/**` is unchanged by D47–D49.
 
 ## Safety and remaining release blockers
 
