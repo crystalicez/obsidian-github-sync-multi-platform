@@ -19,6 +19,7 @@ import { planV4PackGroups } from "../../src/lib/v4/pack-planner";
 import { waitForCondition } from "../helpers/wait-for";
 import { V4SourceChangedError } from "../../src/lib/v4/object-stream";
 import { createV4StagingStore, type V4StageRef } from "../../src/lib/v4/staging-store";
+import { V4LocalTargetChangedError } from "../../src/lib/v4/local-io";
 
 const enc = (value: string) => new TextEncoder().encode(value);
 const dec = (value: Uint8Array) => new TextDecoder().decode(value);
@@ -2820,3 +2821,94 @@ test("D51 WAL pre-stages every Pull before a delete: later missing immutable obj
   assert.equal(github.files.get("C-last.md")?.byteLength, enc("new-missing-body").byteLength,
     "published immutable content must still exist while its read is faulted");
 });
+
+for (const kind of ["delete", "modify"] as const) {
+  test(`D52 WAL pins SHA-256 of local ${kind} target after remote staging even if size and mtime are unchanged`, async () => {
+    const github = new MemoryGitHub();
+    const sourceVault = new MemoryVault();
+    sourceVault.files.set("A-target.md", { bytes: enc("abcde"), mtime: 1 });
+    sourceVault.files.set("B-later.md", { bytes: enc("prior"), mtime: 1 });
+    const sourceIndex = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "d52-source", mode: "plaintext" });
+    const source = new V4SyncSession({
+      github, vault: sourceVault, index: sourceIndex,
+      config: config(), conflictPolicy: "copy", abortChangePercent: 0,
+    });
+    await source.sync({ operation: "forcePush", allowThresholdOverride: false });
+
+    const peerVault = new MemoryVault();
+    const peerIndex = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "d52-peer", mode: "plaintext" });
+    await new V4SyncSession({
+      github, vault: peerVault, index: peerIndex, config: config(), conflictPolicy: "copy", abortChangePercent: 0,
+    }).sync({ operation: "forcePull", allowThresholdOverride: false });
+    const beforeIndex = structuredClone(peerIndex);
+    peerVault.operations.length = 0;
+
+    if (kind === "delete") sourceVault.files.delete("A-target.md");
+    else sourceVault.files.set("A-target.md", { bytes: enc("newer"), mtime: 2 });
+    sourceVault.files.set("B-later.md", { bytes: enc("fresh"), mtime: 2 });
+    await source.sync({
+      operation: "normal", allowThresholdOverride: false,
+      changes: [
+        { type: kind, path: "A-target.md", mtime: 2 },
+        { type: "modify", path: "B-later.md", mtime: 2 },
+      ],
+    });
+    const publishedSha = github.ref!.sha;
+    let sameStatEdit = 0;
+    const getFileBytes = github.getFileBytes.bind(github);
+    github.getFileBytes = async (path, ref) => {
+      if (path === "B-later.md" && ref === publishedSha && sameStatEdit++ === 0) {
+        const existing = peerVault.files.get("A-target.md");
+        assert.ok(existing);
+        peerVault.files.set("A-target.md", { bytes: enc("edcba"), mtime: existing.mtime });
+      }
+      return getFileBytes(path, ref);
+    };
+    const originalStaging = peerVault.staging;
+    let stageBegins = 0;
+    let stageFinishes = 0;
+    let stageRemoves = 0;
+    peerVault.staging = {
+      ...originalStaging,
+      async beginStage(options) {
+        stageBegins++;
+        const sink = await originalStaging.beginStage(options);
+        return {
+          ...sink,
+          async finish(result) { const stage = await sink.finish(result); stageFinishes++; return stage; },
+        };
+      },
+      async remove(stage) { stageRemoves++; await originalStaging.remove(stage); },
+    };
+    let walSaves = 0;
+    const recoveryStore = {
+      async load() { return null; },
+      async save(): Promise<never> {
+        walSaves++;
+        throw new Error("WAL save must not happen if target content identity changed");
+      },
+    };
+
+    await assert.rejects(
+      () => new V4SyncSession({
+        github, vault: peerVault, index: peerIndex, recoveryStore,
+        config: config(), conflictPolicy: "copy", abortChangePercent: 0,
+      }).sync({ operation: "normal", allowThresholdOverride: false }),
+      (error: unknown) => error instanceof V4LocalTargetChangedError && error.path === "A-target.md",
+    );
+
+    assert.equal(sameStatEdit, 1, "the edit must happen after local scan on a later immutable object read");
+    const expectedStages = kind === "delete" ? 1 : 2;
+    assert.equal(stageBegins, expectedStages);
+    assert.equal(stageFinishes, expectedStages);
+    assert.equal(stageRemoves, expectedStages, "all verified stages must be discarded after changed target");
+    assert.equal(walSaves, 0, "no mutation intent may be saved for stale local content");
+    assert.equal(dec(peerVault.files.get("A-target.md")!.bytes), "edcba", "concurrent user bytes were overwritten");
+    assert.equal(peerVault.files.get("A-target.md")!.mtime, 1, "same-mtime synthetic edit must remain unchanged");
+    assert.equal(dec(peerVault.files.get("B-later.md")!.bytes), "prior", "other local target changed");
+    assert.equal(peerVault.operations.some(operation => /^(?:trash|write|commit-stage|delete):/u.test(operation)), false,
+      "no local mutation can occur when pre-WAL content hash is stale");
+    assert.deepEqual(peerIndex, beforeIndex, "failed pull must preserve the previous local index");
+    assert.equal(github.ref!.sha, publishedSha, "failed peer Pull must not advance GitHub head");
+  });
+}
