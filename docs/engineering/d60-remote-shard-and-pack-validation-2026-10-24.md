@@ -1,0 +1,32 @@
+# D60 — Reject non-object V4 remote shards and unsafe encrypted packed-object paths
+
+Date: 2026-10-24 (Asia/Bangkok). Isolated audit worktree `.worktrees/d60-remote-shard-shape-guards`, branch `audit/2026-10-24-d60-remote-shard-shapes`, direct child of clean/pushed D59 `e5c064b95ef1523eaec03965b4ba96c3e9aa7cc0`. Exact **clean shipping source SHA** used for every D60 live test: `c8d0087ecc96fc207bcc8b03a2f5c2313f3cb5a2`.
+
+## Scope and safety
+
+This change touches only `src/lib/v4/remote-index.ts`, regression tests `tests/v4/staged-remote-descriptors.test.ts`, and this report/handoff. No root checkout / Zed files, historical D45 user WIP, other worktrees or default/release branch changed. No GitHub Actions, native OS helper, encryption/wire format, CAS/retry/publication, missing-remote-object semantics, local deletion, WAL replay, or no-WAL policy change. REST writer remains **8 MiB**, physical test cap **100,000,000 decimal bytes**. Live network mutations only against the preapproved disposable GitHub repository with numeric ID **1284153873**, on preflight-absent randomized branches verified removed independently.
+
+## Fail-first security findings
+
+1. **A malformed shard silently appeared empty.** `assertV4RemoteShardRecords` previously iterated `Object.entries(shard.records)` without first requiring `records` to be a non-array object. For example `records: []`, `records: ""`, `records: 0` and `records: false` produce zero entries, so the invalid GitHub metadata could be mistaken for an empty valid shard rather than rejected. This is a dangerous integrity/consistency boundary, although the test does not prove downstream local data deletion. Now reject non-object, null, and array shapes in the shard reader. **Preserve valid `records: {}`**.
+2. **Encrypted pack remotePath was not namespace-validated on legacy shards.** The `storage: "pack"` descriptor checked `packId` and encryption mode but did not check `remotePath`. In the old encrypted-folders layout an arbitrary outside-V4 path or V4 internal metadata path could be passed through the shard reader to a GitHub content lookup. The actual opaque-stable-v1 path is independently bound to a keyed pack ID by `assertV4RemoteRecordSet`; D60 adds an earlier, explicit guard for all layouts. Require exact `normalizeV4VaultPath` spelling, path under `.obsidian-github-sync-v4/packs/`, and `.enc` suffix. Errors do not echo the untrusted path. The legitimate historic encrypted packed record `.obsidian-github-sync-v4/packs/aa/old-pack-v1.enc` is still accepted. This is defensive validation, **not evidence of successful exfiltration or arbitrary local filesystem access**.
+
+RED tests were written first. Focused descriptor suite **failed 2 new cases** while existing eight passed: first reported a missing exception for the empty-array shard; second reported missing rejection of an unsafe encrypted pack path. The production validator was then changed (no wire migration), and the focused suite passed **10/10** including both new guards. Cases exercise both direct in-memory shard reader and actual `decodeV4RemoteShard` on JSON bytes, with a legitimate empty shard roundtrip.
+
+## Local quality gates
+
+- `pnpm.cmd install --frozen-lockfile`: PASS.
+- Maximum Strict TypeScript `tsconfig.maximum-strict.json`: **0 errors**; `node esbuild.config.mjs production` PASS.
+- Focused remote descriptor tests **10/10 PASS**; complete fast **609/609 PASS**; repeated fast **10 x 609/609 PASS / exit 0**, verified ten distinct round markers and ten 609-pass summaries from completed runner.
+- Recovery **79/79**, resource **11/11**, feasibility **134/134**, virtual 100,000,000-byte soak **1/1**, GitHub E2E **3 compilation bundles**, release/package validators and staged Git whitespace checks all PASS.
+- No tests or CI via GitHub Actions.
+
+## Real GitHub / actual Obsidian acceptance (exact clean code SHA)
+
+1. **Two actual Windows Obsidian instances, encrypted journey**: `node --env-file=../../.env.github-e2e scripts/run-obsidian-live-github-ui.mjs --mode=encrypted --verify-peer --journey --assert-diagnostics --expected-repo-id=1284153873`. Source SHA `c8d0087ecc96fc207bcc8b03a2f5c2313f3cb5a2`, branch `obsidian-sync-e2e/local-c8d0087ecc96-3a73877123110142`. **PASS / exit 0**, remote ciphertext verified, Unicode notes and nested folders, simultaneous rename/modify/delete, delete/recreate, keep-both conflict with both revisions retained, peer decrypted restore, no-op without a remote commit, Sync Center metrics visible, **0 UI exceptions**, sampled source 18 requests/0 failures and peer 14 requests/0 failures. Screenshot/temporary profiles cleaned by runner. Separate read-only branch checker returned **`READ_ONLY_CLEANUP_VERIFIED_TWICE` / exit 0**.
+2. **Focused real GitHub encrypted two-device delete/recreate**: `node scripts/run-github-e2e-disposable.mjs delete-encrypted`, same clean code SHA, new branch `obsidian-sync-e2e/local-c8d0087ecc96-d24-delete-encrypted-57eb3aeddf1e`. **1/1 PASS / exit 0**, device A 45 requests/23 expected mutations, B 14 requests/0 mutations, **0 retries, 0 unknown outcomes**; runner `CLEANUP_VERIFIED_TWICE` and independent read-only **`READ_ONLY_CLEANUP_VERIFIED_TWICE` / exit 0**.
+- Both live branches created only after absent preflight and confirmed absent after cleanup, numeric repo ID **1284153873**. Neither D60 run used physical 100 MB files. The last real Windows 100 MB roundtrip happened in D59; the last **full GitHub matrix 3/3** was D58. **Do not overstate D60 as full-matrix or cross-platform requalification.**
+
+## Remaining production release blockers / owner decisions
+
+The D38 intermittent missing immutable remote object and D45 pre-publish branch-head observed-null P0 remain open; D60 did not recapture or causally resolve either. D54–D57 partial multi-mutation WAL replay remains open: early Trash/finalize may precede a missing/hash-bad later stage. The previously proposed all-stage read-only preflight PoC was **not approved**, and generic “continue” does not grant permission to redesign recovery. Separate D50 no-WAL fallback **A** (require recovery store / fail closed on mutating Pull, recommended) vs **B** (bounded redesign) is still undecided. Real macOS/Linux, physical Android/iOS, native power-loss recovery, integrated manual line merge and independent security/C2 audit remain unqualified. **NOT production ready**. No default branch merge/release.
