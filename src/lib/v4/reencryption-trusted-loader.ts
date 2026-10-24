@@ -1,6 +1,6 @@
 import { fromBase64Url } from "../bytes"
-import { assertSafeGitHubBranch } from "../github-config"
-import type { GitHubClient, GitHubTree } from "../github-api"
+import { assertSafeGitHubBranch, assertSafeGitHubRepositoryCoordinates } from "../github-config"
+import type { GitHubClient, GitHubRepositoryIdentity, GitHubTree } from "../github-api"
 import { throwIfV4Aborted } from "./cancellation"
 import { deriveV4Keyring, type V4Keyring } from "./crypto"
 import { assertV4GitBlobIdentity } from "./git-blob-identity"
@@ -17,7 +17,7 @@ import { V4_CONFIG_PATH, V4_HEAD_PATH } from "./protocol-types"
  * and branch. This is not a migration/rotation/cutover entrypoint.
  */
 export interface V4GitHubReencryptionSourceInput {
-  readonly github: Pick<GitHubClient, "getGitRef" | "getGitCommit" | "getTreeAt" | "getBlob">
+  readonly github: Pick<GitHubClient, "getRepositoryIdentity" | "getGitRef" | "getGitCommit" | "getTreeAt" | "getBlob">
   readonly expectedRepoId: string
   readonly expectedBranch: string
   readonly passphrase: string
@@ -45,6 +45,23 @@ export async function verifyGitHubReencryptionSource(
     throw new Error("Re-encryption expected repository identity and branch do not match.")
   }
 
+  const selectedRepo = input.expectedRepoId.slice(0, -(input.expectedBranch.length + 1))
+  const [selectedOwner, selectedName] = selectedRepo.split("/")
+  assertSafeGitHubRepositoryCoordinates(selectedOwner ?? "", selectedName ?? "")
+  if (selectedRepo.split("/").length !== 2) {
+    throw new Error("Re-encryption expected repository identity is malformed.")
+  }
+  const assertPhysicalRepo = (value: GitHubRepositoryIdentity): number => {
+    if (!value || typeof value.id !== "number" || !Number.isSafeInteger(value.id) || value.id <= 0
+      || typeof value.fullName !== "string"
+      || value.fullName.toLowerCase() !== selectedRepo.toLowerCase()) {
+      throw new Error("Re-encryption GitHub repository identity mismatch.")
+    }
+    return value.id
+  }
+  throwIfV4Aborted(input.signal)
+  const initialPhysicalId = assertPhysicalRepo(await input.github.getRepositoryIdentity())
+  throwIfV4Aborted(input.signal)
   const expectedRef = `refs/heads/${input.expectedBranch}`
   const observe = async (): Promise<string> => {
     throwIfV4Aborted(input.signal)
@@ -143,12 +160,19 @@ export async function verifyGitHubReencryptionSource(
       if (!shardBytes) throw new Error("Re-encryption source index shard is missing from pinned commit.")
       shards[bucket] = await decodeV4RemoteShard(shardBytes, bucket, config, keyring)
     }
-    return await verifyV4ReencryptionSourceObjects({
+    const verified = await verifyV4ReencryptionSourceObjects({
       config, head, shards, keyring, pinnedSourceCommitSha: pinned,
       readCurrentSourceHeadSha: observe,
       readPinnedObject: immutableReader,
       signal: input.signal,
     })
+    throwIfV4Aborted(input.signal)
+    const finalPhysicalId = assertPhysicalRepo(await input.github.getRepositoryIdentity())
+    throwIfV4Aborted(input.signal)
+    if (finalPhysicalId !== initialPhysicalId) {
+      throw new Error("Re-encryption GitHub repository identity switched during verification.")
+    }
+    return verified
   } finally {
     salt.fill(0)
     if (keyring) clearKeyring(keyring)

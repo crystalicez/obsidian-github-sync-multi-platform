@@ -42,6 +42,11 @@ export interface GitHubClientOptions {
   cooldownStore?: V4RateLimitCooldownStore | undefined;
 }
 
+export interface GitHubRepositoryIdentity {
+  readonly id: number;
+  readonly fullName: string;
+}
+
 export interface GitHubTreeNode {
   path: string;
   mode: string;
@@ -324,6 +329,34 @@ export class GitHubClient {
     const error = new Error(`${action}: HTTP ${status} - ${text}`) as Error & { status?: number };
     error.status = status;
     return error;
+  }
+
+  /** Read physical GitHub repository identity; never infer it from a Git ref or a V4 config blob. */
+  async getRepositoryIdentity(): Promise<GitHubRepositoryIdentity> {
+    const response = await this.request({
+      url: this.baseUrl,
+      method: "GET",
+      headers: this.headers,
+      throw: false,
+    });
+    if (response.status !== 200) {
+      throw this.gitHttpError("Failed to read GitHub repository identity", response.status, response.text);
+    }
+    const raw = response.json as { id?: unknown; full_name?: unknown } | null;
+    const id = raw?.id;
+    const fullName = raw?.full_name;
+    if (typeof id !== "number" || !Number.isSafeInteger(id) || id <= 0
+      || typeof fullName !== "string"
+      || fullName.split("/").length !== 2) {
+      throw new Error("Invalid GitHub repository identity response.");
+    }
+    const [owner, repo] = fullName.split("/");
+    try {
+      assertSafeGitHubRepositoryCoordinates(owner ?? "", repo ?? "");
+    } catch {
+      throw new Error("Invalid GitHub repository identity response.");
+    }
+    return { id, fullName };
   }
 
   async getGitRef(): Promise<GitHubGitRef> {

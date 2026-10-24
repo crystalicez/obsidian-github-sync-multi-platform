@@ -68,10 +68,17 @@ async function createFixture() {
   let currentSha = commitSha;
   let blobReads = 0;
   let refReads = 0;
+  let repoReads = 0;
+  let repositoryId = 1284153873;
+  let repositoryFullName = "Owner/Repo";
   let commitReads = 0;
   let treeReads = 0;
   let mutateWhenBlobRead: ((path: string) => void) | undefined;
   const github = {
+    async getRepositoryIdentity() {
+      repoReads++;
+      return { id: repositoryId, fullName: repositoryFullName };
+    },
     async getGitRef() {
       refReads++;
       return { ref: "refs/heads/" + validBranch, type: "commit", sha: currentSha };
@@ -100,6 +107,9 @@ async function createFixture() {
   return {
     github, blobs, files, trees, get blobReads() { return blobReads; }, get refReads() { return refReads; },
     get commitReads() { return commitReads; }, get treeReads() { return treeReads; },
+    get repoReads() { return repoReads; },
+    setRepositoryId(id: number) { repositoryId = id; },
+    setRepositoryName(name: string) { repositoryFullName = name; },
     setCurrentSha(sha: string) { currentSha = sha; },
     onBlobRead(fn: (sha: string) => void) { mutateWhenBlobRead = fn; },
     config, keyring,
@@ -116,9 +126,38 @@ test("D70 loads and verifies config, head, index and ciphertext solely from exac
   assert.equal(value.verifiedRemoteObjectCount, 1);
   assert.equal(value.totalVerifiedPlaintextBytes, String(enc("File content secret").byteLength));
   assert.equal(f.refReads >= 3, true, "source HEAD must be observed before and after verification");
+  assert.equal(f.repoReads, 2, "physical repository identity must be checked before and after verification");
   assert.equal(f.commitReads, 1, "an immutable commit should be resolved once, not once per shard/object");
   assert.ok(f.treeReads <= 8, "shared immutable Git tree traversal should reuse a bounded cache");
   assert.ok(!JSON.stringify(value).includes("秘密"));
+});
+
+test("D72 blocks wrong or malformed GitHub repository identity before any Git tree request", async () => {
+  for (const [id, name] of [
+    [12, "other/repo"],
+    [12, "owner/other"],
+    [0, "owner/repo"],
+    [Number.MAX_SAFE_INTEGER + 1, "owner/repo"],
+    [12, "../repo"],
+  ] as const) {
+    const f = await createFixture();
+    f.setRepositoryId(id);
+    f.setRepositoryName(name);
+    await assert.rejects(() => verifyGitHubReencryptionSource({
+      github: f.github, expectedRepoId: repoId, expectedBranch: "main", passphrase: "correct",
+    }), /GitHub repository identity|repository source identity/i, String(name));
+    assert.equal(f.refReads, 0, "wrong physical repo must fail before any branch read");
+    assert.equal(f.blobReads, 0, "wrong physical repo must fail before any object read");
+  }
+});
+
+test("D72 detects physical GitHub repository switching even if old commit and config still match", async () => {
+  const f = await createFixture();
+  f.onBlobRead(() => f.setRepositoryId(987654321));
+  await assert.rejects(() => verifyGitHubReencryptionSource({
+    github: f.github, expectedRepoId: repoId, expectedBranch: "main", passphrase: "correct",
+  }), /GitHub repository identity|repository switched/i);
+  assert.ok(f.repoReads >= 2, "recheck physical identity at end");
 });
 
 test("D70 rejects wrong source branch/ref/type before any Git object read", async () => {
