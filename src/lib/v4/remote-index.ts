@@ -77,12 +77,26 @@ function assertNormalizedRemoteRecord(record: V4IndexFileRecord, config: V4Remot
     if (config.mode !== "encrypted" || !record.packId || !/^[A-Za-z0-9_-]+$/u.test(record.packId) || record.partPaths !== undefined) {
       throw new Error("V4 pack storage has inconsistent descriptors.")
     }
+    let normalizedPackPath: string
+    try {
+      normalizedPackPath = normalizeV4VaultPath(record.remotePath)
+    } catch {
+      throw new Error("V4 pack storage has an unsafe remote path.")
+    }
+    if (normalizedPackPath !== record.remotePath || !record.remotePath.startsWith(`${V4_ROOT}/packs/`)
+      || !record.remotePath.endsWith(".enc")) {
+      throw new Error("V4 pack storage has an invalid remote path namespace.")
+    }
     return
   }
   throw new Error("V4 remote record has an unsupported storage descriptor.")
 }
 
 export function assertV4RemoteShardRecords(shard: V4RemoteShard, bucket: string, config: V4RemoteConfig): void {
+  if (!shard || typeof shard !== "object" || Array.isArray(shard)
+    || !shard.records || typeof shard.records !== "object" || Array.isArray(shard.records)) {
+    throw new Error("V4 remote shard records descriptor is invalid.")
+  }
   for (const [recordKey, record] of Object.entries(shard.records)) {
     if (recordKey !== record.pathId) throw new Error(`V4 shard record key does not match pathId: ${recordKey}`)
     if (bucketForV4PathId(record.pathId) !== bucket) throw new Error(`V4 record pathId is outside shard bucket: ${bucket}`)

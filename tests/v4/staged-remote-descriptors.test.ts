@@ -126,6 +126,61 @@ test("D59 encrypted chunks stay readable only with normalized V4 part coordinate
   }, bucket, encrypted), /part|namespace/iu)
 })
 
+
+test("D60 GitHub shard records must be a keyed object, never an empty scalar or array", async () => {
+  const bucket = "ab"
+  const malformed: Array<[string, unknown]> = [
+    ["empty array", []],
+    ["empty string", ""],
+    ["number zero", 0],
+    ["boolean", false],
+    ["null", null],
+  ]
+  for (const [label, records] of malformed) {
+    const forged = { bucket, records } as unknown as Parameters<typeof assertV4RemoteShardRecords>[0]
+    assert.throws(
+      () => assertV4RemoteShardRecords(forged, bucket, config),
+      /shard|records|invalid|descriptor/iu,
+      `in-memory ${label}`,
+    )
+    await assert.rejects(
+      () => decodeV4RemoteShard(new TextEncoder().encode(JSON.stringify({ bucket, records })), bucket, config),
+      /shard|records|invalid|descriptor/iu,
+      `GitHub JSON ${label}`,
+    )
+  }
+  const legitimateEmpty = { bucket, records: {} }
+  assert.doesNotThrow(() => assertV4RemoteShardRecords(legitimateEmpty, bucket, config))
+  assert.deepEqual(
+    (await decodeV4RemoteShard(new TextEncoder().encode(JSON.stringify(legitimateEmpty)), bucket, config)).records,
+    {},
+  )
+})
+
+test("D60 encrypted packed storage cannot redirect its GitHub read outside V4 packs", async () => {
+  const value = await sample()
+  const legacy: V4RemoteConfig = { ...config, mode: "encrypted", pathLayout: undefined }
+  const bucket = value.pathId.slice(0, 2)
+  const canonical = ".obsidian-github-sync-v4/packs/aa/old-pack-v1.enc"
+  const valid = { ...value, storage: "pack" as const, packId: "old-pack-v1", remotePath: canonical }
+  assert.doesNotThrow(() => assertV4RemoteShardRecords({
+    bucket, records: { [value.pathId]: valid },
+  }, bucket, legacy))
+  const forgedPaths = [
+    "../Outside/secret.md",
+    "/.obsidian-github-sync-v4/packs/aa/old-pack-v1.enc",
+    ".obsidian-github-sync-v4/head",
+    ".obsidian-github-sync-v4/data/aa/fake.enc",
+    ".obsidian-github-sync-v4/packs/aa/../head",
+    ".obsidian-github-sync-v4/packs/aa/old-pack-v1.enc\\alias",
+  ]
+  for (const remotePath of forgedPaths) {
+    assert.throws(() => assertV4RemoteShardRecords({
+      bucket, records: { [value.pathId]: { ...valid, remotePath } },
+    }, bucket, legacy), /pack|path|unsafe|invalid|namespace/iu)
+  }
+})
+
 test("legacy 9 MiB single-blob record and external commit marker remain readable", async () => {
   const oldWriterSingle = { ...await sample(), size: 9 * 1024 * 1024, remoteVersion: "external:direct-github-commit" }
   await assert.doesNotReject(() => assertV4RemoteRecordSet([oldWriterSingle], config))
