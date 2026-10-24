@@ -1,4 +1,5 @@
 import { sha256Hex } from "../bytes";
+import { V4_ENCRYPTED_PAYLOAD_OVERHEAD_BYTES } from "./crypto";
 import { normalizeV4VaultPath } from "./paths";
 import { V4_ROOT, type V4StorageMode } from "./protocol-types";
 
@@ -7,9 +8,14 @@ export const V4_PART_BYTES = 48 * 1024 * 1024;
 /** Empirically verified maximum for NEW REST Git Blob content. Old 48 MiB parts stay readable. */
 export const V4_GITHUB_REST_SAFE_WRITER_BYTES = 8 * 1024 * 1024;
 
-export function shouldWriteV4Parts(logicalBytes: number): boolean {
+/** Maximum new plaintext blob bytes, accounting for on-wire AES-GCM overhead. */
+export function maxV4NewWriterPlaintextBytes(mode: V4StorageMode): number {
+  return V4_GITHUB_REST_SAFE_WRITER_BYTES - (mode === "encrypted" ? V4_ENCRYPTED_PAYLOAD_OVERHEAD_BYTES : 0);
+}
+
+export function shouldWriteV4Parts(logicalBytes: number, mode: V4StorageMode = "plaintext"): boolean {
   if (!Number.isSafeInteger(logicalBytes) || logicalBytes < 0) throw new TypeError("logicalBytes must be a non-negative safe integer.");
-  return logicalBytes > V4_GITHUB_REST_SAFE_WRITER_BYTES;
+  return logicalBytes > maxV4NewWriterPlaintextBytes(mode);
 }
 
 export function shouldUseV4Parts(logicalBytes: number, predictedRemoteBytes = logicalBytes): boolean {

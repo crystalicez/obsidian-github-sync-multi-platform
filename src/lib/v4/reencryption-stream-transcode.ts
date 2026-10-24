@@ -1,9 +1,9 @@
 import { randomBytes, toBase64Url } from "../bytes"
 import { throwIfV4Aborted } from "./cancellation"
 import type { V4ContentSource } from "./content-source"
-import { decryptV4Payload, V4_ENCRYPTED_PAYLOAD_OVERHEAD_BYTES, type V4Keyring } from "./crypto"
+import { decryptV4Payload, type V4Keyring } from "./crypto"
 import { assertV4Pbkdf2Iterations, V4_MIN_NEW_PBKDF2_ITERATIONS } from "./kdf-policy"
-import { V4_GITHUB_REST_SAFE_WRITER_BYTES } from "./large-files"
+import { maxV4NewWriterPlaintextBytes } from "./large-files"
 import type { V4IndexFileRecord } from "./local-index"
 import type { V4PreparedObjectStream } from "./object-stream"
 import type { V4OrphanReencryptionPlan } from "./reencryption-orphan-branch"
@@ -73,14 +73,9 @@ export async function createV4ReencryptedObjectStream(
   if (!/^[A-Za-z0-9_-]{1,128}$/u.test(version)) {
     throw new Error("Invalid re-encryption destination object version.")
   }
-  // For single files the existing production codec chooses the single shape
-  // up to 8 MiB of PLAINTEXT. A payload at that extreme exceeds REST's
-  // 8 MiB ciphertext budget. Fail closed until the output codec boundary is
-  // fixed; never silently publish an oversize new object.
-  const singleLimit = V4_GITHUB_REST_SAFE_WRITER_BYTES - V4_ENCRYPTED_PAYLOAD_OVERHEAD_BYTES
-  if (sourceRecord.size > singleLimit && sourceRecord.size <= V4_GITHUB_REST_SAFE_WRITER_BYTES) {
-    throw new Error("Re-encryption REST payload boundary is unsupported without chunking.")
-  }
+  // Writer chooses chunking using ciphertext size, not plaintext size.
+  // New object payloads must never exceed the fixed 8 MiB REST-safe cap.
+  const singleLimit = maxV4NewWriterPlaintextBytes("encrypted")
   await assertV4RemoteRecordSet([sourceRecord], sourceConfig, input.sourceKeyring)
   throwIfV4Aborted(input.signal)
   await input.verifySourceStillPinned()

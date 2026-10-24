@@ -6,6 +6,7 @@ import {
   buildV4PartPaths,
   joinAndVerifyV4Parts,
   shouldWriteV4Parts,
+  maxV4NewWriterPlaintextBytes,
   V4_GITHUB_REST_SAFE_WRITER_BYTES,
   splitV4Parts,
   V4_LARGE_FILE_THRESHOLD_BYTES,
@@ -141,7 +142,7 @@ export class V4StorageCodec {
     const pathId = await this.pathId(path)
     const stableFileId = fileId ?? pathId
     const plaintextSha256 = await this.hash(() => sha256Hex(plaintext))
-    if (shouldWriteV4Parts(plaintext.byteLength)) {
+    if (shouldWriteV4Parts(plaintext.byteLength, this.options.mode)) {
       return this.prepareParts(path, pathId, stableFileId, plaintext, plaintextSha256, version, mtime)
     }
 
@@ -192,11 +193,12 @@ export class V4StorageCodec {
     const path = normalizeV4VaultPath(input.logicalPath)
     const pathId = await this.pathId(path)
     const fileId = input.fileId
-    const chunked = shouldWriteV4Parts(input.source.size)
+    const chunked = shouldWriteV4Parts(input.source.size, this.options.mode)
+    const safePartBytes = Math.min(input.partBytes, maxV4NewWriterPlaintextBytes(this.options.mode))
     const opaqueId = chunked && this.options.mode === "encrypted"
       ? await this.crypto(() => objectIdForV4File(this.options.keyring!.pathKey, fileId))
       : undefined
-    const partCount = chunked ? Math.max(1, Math.ceil(input.source.size / input.partBytes)) : 1
+    const partCount = chunked ? Math.max(1, Math.ceil(input.source.size / safePartBytes)) : 1
     const objectPaths = chunked
       ? buildV4PartPaths({ mode: this.options.mode, logicalPath: path, version: input.version, partCount, opaqueId })
       : [this.options.mode === "plaintext"
@@ -242,11 +244,11 @@ export class V4StorageCodec {
         }
       }
 
-      const iterator = streamV4SourceParts(input.source, input.partBytes, signal)[Symbol.asyncIterator]()
+      const iterator = streamV4SourceParts(input.source, safePartBytes, signal)[Symbol.asyncIterator]()
       for (let index = 0; index < partCount; index++) {
         if (signal?.aborted) throw signal.reason ?? new Error("V4 object stream aborted.")
         await input.checkSourceStable?.()
-        const expectedPartBytes = Math.min(input.partBytes, input.source.size - total)
+        const expectedPartBytes = Math.min(safePartBytes, input.source.size - total)
         const release = await reserve(expectedPartBytes)
         let next: IteratorResult<Uint8Array>
         try {
@@ -445,7 +447,7 @@ export class V4StorageCodec {
     version: string,
     mtime: number,
   ): Promise<V4PreparedRemoteWrite> {
-    const parts = splitV4Parts(plaintext, V4_GITHUB_REST_SAFE_WRITER_BYTES)
+    const parts = splitV4Parts(plaintext, maxV4NewWriterPlaintextBytes(this.options.mode))
     const opaqueId = this.options.mode === "encrypted"
       ? await this.crypto(() => objectIdForV4File(this.options.keyring!.pathKey, fileId))
       : undefined

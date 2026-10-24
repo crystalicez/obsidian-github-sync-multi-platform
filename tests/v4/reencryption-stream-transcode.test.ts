@@ -177,7 +177,7 @@ test("D76 never finalizes a multipart source if a later encrypted part fails aut
   await assert.rejects(() => prepared.finalize(), /finish|complete|consum/i);
 });
 
-test("D76 rejects same-source destination, salt reuse, tombstone, stale source, unsafe version, and 8 MiB boundary", async () => {
+test("D76 rejects same-source destination, salt reuse, tombstone, stale source, and unsafe version", async () => {
   const f = await setup();
   const old = await f.oldCodec.prepare("check.md", str("content"), "v1", 5, "old-check");
   const s = sourceOf(f, old, "check.md");
@@ -200,8 +200,17 @@ test("D76 rejects same-source destination, salt reuse, tombstone, stale source, 
     },
   });
   await assert.rejects(async () => { for await (const _ of unstable.objects()) {} }, /source HEAD changed mid-stream/);
-  const boundaryRecord = { ...s.record, size: V4_GITHUB_REST_SAFE_WRITER_BYTES };
-  await assert.rejects(() => createV4ReencryptedObjectStream({
-    ...s.options, sourceRecord: boundaryRecord,
-  }), /REST|payload|boundary|limit/i);
+});
+
+test("D77 transcode fixes near-8 MiB encrypted boundary by safely chunking", async () => {
+  const f = await setup();
+  const size = V4_GITHUB_REST_SAFE_WRITER_BYTES - 8;
+  const plaintext = new Uint8Array(size).fill(0x5b);
+  const old = await f.oldCodec.prepare("near-boundary.bin", plaintext, "v1", 23, "old-boundary");
+  assert.equal(old.record.storage, "chunked");
+  const result = await consume(f, sourceOf(f, old, "near-boundary.bin"));
+  assert.equal(result.record.storage, "chunked");
+  assert.equal(result.record.plaintextSha256, await sha256Hex(plaintext));
+  assert.deepEqual(result.plain, plaintext);
+  assert.ok([...result.blobs.values()].every(b => b.length <= V4_GITHUB_REST_SAFE_WRITER_BYTES));
 });

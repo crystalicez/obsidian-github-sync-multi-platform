@@ -1,4 +1,5 @@
-import { V4_PART_BYTES, V4_GITHUB_REST_SAFE_WRITER_BYTES } from "./large-files"
+import { V4_PART_BYTES, V4_GITHUB_REST_SAFE_WRITER_BYTES, maxV4NewWriterPlaintextBytes } from "./large-files"
+import type { V4StorageMode } from "./protocol-types"
 export { V4_GITHUB_REST_SAFE_WRITER_BYTES } from "./large-files"
 import { estimateV4GitBlobTransportBytes } from "./resource-controller"
 
@@ -12,6 +13,7 @@ export interface V4PartWritePolicyInput {
   logicalBytes: number
   maxTransportTransientBytes: number
   maxContentMutations?: number
+  mode?: V4StorageMode
 }
 
 function assertNonNegativeSafeInteger(value: number, label: string): void {
@@ -37,10 +39,10 @@ export function selectV4WriterPartBytes(input: V4PartWritePolicyInput): number {
   if (!Number.isSafeInteger(mutationBudget) || mutationBudget < 1) throw new TypeError("maxContentMutations must be a positive safe integer.")
 
   const transportSafe = largestTransportSafeMiB(input.maxTransportTransientBytes)
-  const minimumForMutationHeadroom = input.logicalBytes === 0
-    ? MiB
-    : Math.ceil(Math.ceil(input.logicalBytes / mutationBudget) / MiB) * MiB
-  const selected = Math.min(V4_GITHUB_REST_SAFE_WRITER_BYTES, transportSafe)
+  const maxPlaintext = maxV4NewWriterPlaintextBytes(input.mode ?? "plaintext")
+  const ciphertextOverhead = V4_GITHUB_REST_SAFE_WRITER_BYTES - maxPlaintext
+  const minimumForMutationHeadroom = Math.max(MiB, Math.ceil(input.logicalBytes / mutationBudget))
+  const selected = Math.min(maxPlaintext, Math.max(0, transportSafe - ciphertextOverhead))
   if (selected < Math.max(MiB, minimumForMutationHeadroom)) {
     throw new Error(`There is no safe V4 writer part size for ${input.logicalBytes} bytes under the configured transport and mutation budgets.`)
   }

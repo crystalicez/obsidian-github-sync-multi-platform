@@ -786,13 +786,14 @@ export class V4SyncSession {
         continue
       }
 
-      const usesV4Parts = shouldWriteV4Parts(after.size)
+      const usesV4Parts = shouldWriteV4Parts(after.size, this.input.config.mode)
       if (usesV4Parts || after.size > DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES) {
         const source = await this.openPushContentSource(context.binding)
         const partBytes = usesV4Parts
           ? selectV4WriterPartBytes({
               logicalBytes: after.size,
               maxTransportTransientBytes: this.resources.limits.maxTransportTransientBytes,
+              mode: this.input.config.mode,
             })
           : V4_PART_BYTES
         const prepared = await this.codec.prepareFromSource({

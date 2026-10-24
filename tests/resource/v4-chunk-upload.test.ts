@@ -3,7 +3,7 @@ import test from "node:test"
 
 import type { V4ContentSource } from "../../src/lib/v4/content-source"
 import { uploadV4ObjectStream } from "../../src/lib/v4/git-tree-writer"
-import { V4_PART_BYTES } from "../../src/lib/v4/large-files"
+import { V4_GITHUB_REST_SAFE_WRITER_BYTES } from "../../src/lib/v4/large-files"
 import { V4StorageCodec } from "../../src/lib/v4/storage-codec"
 
 const GiB = 1024 * 1024 * 1024
@@ -22,11 +22,12 @@ test("virtual 5 GiB stream planning does not read or allocate the logical file",
     version: "virtual",
     mtime: 1,
     fileId: "virtual-file",
-    partBytes: V4_PART_BYTES,
+    partBytes: V4_GITHUB_REST_SAFE_WRITER_BYTES,
   })
   assert.equal(opened, 0)
-  assert.equal(prepared.objectCount, 107)
-  assert.equal(prepared.objectPaths.length, 107)
+  const expectedParts = Math.ceil(source.size / V4_GITHUB_REST_SAFE_WRITER_BYTES)
+  assert.equal(prepared.objectCount, expectedParts)
+  assert.equal(prepared.objectPaths.length, expectedParts)
 })
 
 test("stream uploader releases each object before requesting the next one", async () => {

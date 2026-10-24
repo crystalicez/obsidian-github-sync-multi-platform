@@ -2564,6 +2564,45 @@ test("v4 medium REST-safe chunked push uses bounded source instead of whole-buff
 });
 
 
+test("D77 encrypted Sync forcePush automatically chunks near-8 MiB plaintext before ciphertext exceeds Git REST cap", async () => {
+  const { V4_GITHUB_REST_SAFE_WRITER_BYTES } = await import("../../src/lib/v4/large-files");
+  const { V4_ENCRYPTED_PAYLOAD_OVERHEAD_BYTES } = await import("../../src/lib/v4/crypto");
+  const plaintextSize = V4_GITHUB_REST_SAFE_WRITER_BYTES - V4_ENCRYPTED_PAYLOAD_OVERHEAD_BYTES + 1;
+  const payload = new Uint8Array(plaintextSize).fill(0x6b);
+  const vault = new MemoryVault();
+  vault.files.set("boundary-private.bin", { bytes: payload, mtime: 1 });
+  let uploadedBlobs = 0;
+  class CappedGitHub extends MemoryGitHub {
+    async createGitBlob(bytes: Uint8Array) {
+      assert.ok(bytes.byteLength <= V4_GITHUB_REST_SAFE_WRITER_BYTES,
+        "Sync must not upload a ciphertext blob over 8 MiB");
+      uploadedBlobs++;
+      return super.createGitBlob(bytes);
+    }
+  }
+  const github = new CappedGitHub();
+  const encryptedConfig: V4RemoteConfig = {
+    formatVersion: V4_FORMAT_VERSION, mode: "encrypted", repoId: "o/r#main",
+    pathLayout: "opaque-stable-v1", algorithm: "AES-GCM",
+    kdf: "PBKDF2-SHA-256", kdfParams: { iterations: 10, salt: "c2FsdA" },
+  };
+  const keyring = await deriveV4Keyring({
+    passphrase: "D77", repoId: "o/r#main", salt: enc("salt"), iterations: 10,
+  });
+  const index = createEmptyV4LocalIndex({
+    repoId: "o/r#main", deviceId: "d77", mode: "encrypted", pathLayout: "opaque-stable-v1",
+  });
+  const result = await new V4SyncSession({
+    github, vault, index, config: encryptedConfig, keyring,
+    conflictPolicy: "copy", abortChangePercent: 0,
+  }).sync({ operation: "forcePush", allowThresholdOverride: false });
+  assert.equal(result.pushedFiles, 1);
+  assert.equal(indexRecordByPath(index, "boundary-private.bin").storage, "chunked");
+  assert.ok(uploadedBlobs >= 2);
+  assert.ok(vault.operations.filter(operation => operation === "read:boundary-private.bin").length <= 1,
+    "initial scan may hash via one whole-file read; the subsequent chunked upload must stream");
+});
+
 test("v4 pack session uploads the current bounded group before opening the next group", async () => {
   const MiB = 1024 * 1024;
   const fileBytes = 512 * 1024;
