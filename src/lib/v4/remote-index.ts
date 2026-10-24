@@ -49,10 +49,28 @@ function assertNormalizedRemoteRecord(record: V4IndexFileRecord, config: V4Remot
     return
   }
   if (record.storage === "chunked") {
-    if (!record.partPaths?.length || record.remotePath !== record.partPaths[0] || record.packId !== undefined) {
+    if (!Array.isArray(record.partPaths) || record.partPaths.length === 0
+      || record.remotePath !== record.partPaths[0] || record.packId !== undefined) {
       throw new Error("V4 chunked storage has inconsistent part descriptors.")
     }
     if (!/^[A-Za-z0-9_-]+$/u.test(record.remoteVersion)) throw new Error("V4 chunked storage has an unsafe remote version.")
+    const uniqueParts = new Set<string>()
+    for (const part of record.partPaths) {
+      if (typeof part !== "string" || !part
+        || !(part.startsWith(`${V4_ROOT}/large/`) || part.startsWith(`${V4_ROOT}/parts/`))) {
+        throw new Error("V4 chunked storage has an invalid part namespace.")
+      }
+      let normalized: string
+      try {
+        normalized = normalizeV4VaultPath(part)
+      } catch {
+        throw new Error("V4 chunked storage has an unsafe part path.")
+      }
+      if (normalized !== part || uniqueParts.has(part)) {
+        throw new Error("V4 chunked storage has a non-normalized or duplicate part path.")
+      }
+      uniqueParts.add(part)
+    }
     return
   }
   if (record.storage === "pack") {
