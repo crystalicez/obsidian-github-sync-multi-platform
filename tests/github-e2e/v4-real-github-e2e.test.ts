@@ -11,6 +11,8 @@ import { isV4PublicationRaceError } from "../../src/lib/v4/publication-race";
 import { expectedV4PathLayout, V4_FORMAT_VERSION, type V4RemoteConfig, type V4StorageMode } from "../../src/lib/v4/protocol-types";
 import { V4StorageCodec } from "../../src/lib/v4/storage-codec";
 import { V4RemoteObjectMissingError, V4SyncSession, type V4SessionVault, type V4SyncRunState } from "../../src/lib/v4/sync-session";
+import type { V4RecoveryStore } from "../../src/lib/v4/recovery-store";
+import type { V4StagingStore } from "../../src/lib/v4/staging-store";
 import {
   encodeGitHubE2ERefPath,
   readGitHubE2ETargetEnvironment,
@@ -55,6 +57,7 @@ interface ControlledMissingObjectFault {
   evidenceOutcome?: string;
 }
 const missingObjectFaults = new WeakMap<GitHubClient, ControlledMissingObjectFault>();
+const diagnosticRecoveryStores = new WeakMap<GitHubClient, V4RecoveryStore>();
 
 function branchPath(config: GitHubConfig): string {
   return encodeGitHubE2ERefPath(config.branch);
@@ -243,6 +246,7 @@ async function waitForBranchHead(config: GitHubConfig, expectedSha: string, time
 
 class MemoryVault implements V4SessionVault {
   readonly files = new Map<string, { bytes: Uint8Array; mtime: number }>();
+  staging?: V4StagingStore;
 
   set(path: string, content: Uint8Array, mtime = Date.now()): void {
     this.files.set(path, { bytes: new Uint8Array(content), mtime });
@@ -365,7 +369,11 @@ function createDevice(name: string, config: GitHubConfig, context: ModeContext, 
       let lastError: unknown;
       for (let attempt = 1; attempt <= 3; attempt++) {
         try {
-          return await new V4SyncSession({ ...sessionInput, runState }).sync(options);
+          const recoveryStore = diagnosticRecoveryStores.get(client);
+          return await new V4SyncSession({
+            ...sessionInput, runState,
+            ...(recoveryStore ? { recoveryStore } : {}),
+          }).sync(options);
         } catch (error) {
           lastError = error;
           const message = error instanceof Error ? error.message : String(error);
@@ -773,6 +781,30 @@ async function runDeleteRecreateScenario(config: GitHubConfig, mode: V4StorageMo
       const beforeHead = b.index.remoteCommitSha;
       const beforeMutations = b.client.transportMetricsSnapshot.mutations;
       const fault: ControlledMissingObjectFault = { expectedCommit: publishedSha, fired: false };
+      // Production runtime ALWAYS supplies a recovery store and a staging
+      // backend. The ordinary E2E MemoryVault does not, and its trash()
+      // simply deletes from a Map. Exercise the production-like pre-stage
+      // barrier rather than mislabeling the no-WAL mock as production data loss.
+      let stageBegins = 0;
+      let stageAborts = 0;
+      b.vault.staging = {
+        async beginStage() {
+          stageBegins++;
+          return {
+            async append() { throw new Error("Unexpected staged content before controlled missing read"); },
+            async finish() { throw new Error("Unexpected successful stage on controlled missing read"); },
+            async abort() { stageAborts++; },
+          };
+        },
+        async stageSource() { throw new Error("Unexpected push stage in pull-only diagnostic"); },
+        async open() { throw new Error("Unexpected completed stage in failing diagnostic"); },
+        async remove() {},
+        pathFor: stageId => `diagnostic-stage/${stageId}.bin`,
+      };
+      diagnosticRecoveryStores.set(b.client, {
+        async load() { return null; },
+        async save() { throw new Error("WAL mutation attempted before all remote content was staged"); },
+      });
       missingObjectFaults.set(b.client, fault);
       try {
         await assert.rejects(
@@ -784,6 +816,8 @@ async function runDeleteRecreateScenario(config: GitHubConfig, mode: V4StorageMo
           "a controlled missing read must remain a typed, fail-closed Sync error",
         );
         assert.equal(fault.fired, true, "fault did not intercept the exact immutable peer read");
+        assert.equal(stageBegins, 1, "WAL staging must start before any local trash");
+        assert.equal(stageAborts, 1, "failed WAL download must abort its incomplete stage");
         assert.equal(fault.evidenceOutcome, "blob-present-in-tree",
           "independent read-only immutable Git evidence did not see the published blob");
         assert.deepEqual(b.vault.files.get("Notes/reborn.md")?.bytes, beforeBytes,
@@ -797,12 +831,15 @@ async function runDeleteRecreateScenario(config: GitHubConfig, mode: V4StorageMo
           injected: fault.fired,
           independentTreeOutcome: fault.evidenceOutcome,
           originalBytesRetained: true,
+          recoveryStagingAborted: true,
           localBaseUnchanged: true,
           peerRemoteMutations: 0,
           originalErrorPreserved: true,
         }));
       } finally {
         missingObjectFaults.delete(b.client);
+        diagnosticRecoveryStores.delete(b.client);
+        delete b.vault.staging;
       }
       return;
     }
