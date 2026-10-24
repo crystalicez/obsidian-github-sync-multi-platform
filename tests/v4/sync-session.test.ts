@@ -4,7 +4,7 @@ import test from "node:test";
 import type { GitHubCreateTreeEntry } from "../../src/lib/github-git-types";
 import { V4HistoryService } from "../../src/lib/v4/history-service";
 import type { V4JournalChange } from "../../src/lib/v4/history-journal";
-import { createEmptyV4LocalIndex, type V4IndexFileRecord, type V4LocalIndex } from "../../src/lib/v4/local-index";
+import { createEmptyV4LocalIndex, type V4IndexFileRecord, type V4LocalIndex, type V4LocalIndexAdapter } from "../../src/lib/v4/local-index";
 import { assertV4PathLayoutCompatible, V4ChangeGuardError, V4RemoteObjectMissingError, V4SyncSession, type V4SessionVault } from "../../src/lib/v4/sync-session";
 import { coalesceV4Changes, type V4QueuedChange } from "../../src/lib/v4/sync-coordinator";
 import { V4_CONFIG_PATH, V4_FORMAT_VERSION, V4_HEAD_PATH, V4_ROOT, type V4RemoteConfig, type V4RemoteHead } from "../../src/lib/v4/protocol-types";
@@ -20,6 +20,7 @@ import { waitForCondition } from "../helpers/wait-for";
 import { V4SourceChangedError } from "../../src/lib/v4/object-stream";
 import { createV4StagingStore, type V4StageRef } from "../../src/lib/v4/staging-store";
 import { V4LocalTargetChangedError } from "../../src/lib/v4/local-io";
+import { createV4RecoveryStore, type V4RecoveryStore } from "../../src/lib/v4/recovery-store";
 
 const enc = (value: string) => new TextEncoder().encode(value);
 const dec = (value: Uint8Array) => new TextDecoder().decode(value);
@@ -2910,5 +2911,129 @@ for (const kind of ["delete", "modify"] as const) {
       "no local mutation can occur when pre-WAL content hash is stale");
     assert.deepEqual(peerIndex, beforeIndex, "failed pull must preserve the previous local index");
     assert.equal(github.ref!.sha, publishedSha, "failed peer Pull must not advance GitHub head");
+  });
+}
+
+for (const ambiguity of ["definite-before-write", "write-may-have-persisted"] as const) {
+  test(`D53 WAL save error (${ambiguity}) preserves staged bytes and forbids local changes`, async () => {
+    const github = new MemoryGitHub();
+    const remoteVault = new MemoryVault();
+    remoteVault.files.set("A-delete.md", { bytes: enc("old-A"), mtime: 1 });
+    remoteVault.files.set("B-update.md", { bytes: enc("old-B"), mtime: 1 });
+    const remoteIndex = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "d53-remote", mode: "plaintext" });
+    const remote = new V4SyncSession({
+      github, vault: remoteVault, index: remoteIndex,
+      config: config(), conflictPolicy: "copy", abortChangePercent: 0,
+    });
+    await remote.sync({ operation: "forcePush", allowThresholdOverride: false });
+    const peerVault = new MemoryVault();
+    const peerIndex = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "d53-peer", mode: "plaintext" });
+    await new V4SyncSession({
+      github, vault: peerVault, index: peerIndex, config: config(), conflictPolicy: "copy", abortChangePercent: 0,
+    }).sync({ operation: "forcePull", allowThresholdOverride: false });
+    const beforeIndex = structuredClone(peerIndex);
+    const beforeFiles = new Map([...peerVault.files].map(([path, file]) =>
+      [path, { bytes: new Uint8Array(file.bytes), mtime: file.mtime }] as const));
+    peerVault.operations.length = 0;
+
+    remoteVault.files.delete("A-delete.md");
+    remoteVault.files.set("B-update.md", { bytes: enc("new-B"), mtime: 2 });
+    await remote.sync({
+      operation: "normal", allowThresholdOverride: false,
+      changes: [
+        { type: "delete", path: "A-delete.md", mtime: 2 },
+        { type: "modify", path: "B-update.md", mtime: 2 },
+      ],
+    });
+    const publishedSha = github.ref!.sha;
+    const realStaging = peerVault.staging;
+    const finishedStages: V4StageRef[] = [];
+    let stageRemoved = 0;
+    peerVault.staging = {
+      ...realStaging,
+      async beginStage(options) {
+        const sink = await realStaging.beginStage(options);
+        return {
+          ...sink,
+          async finish(result) {
+            const stage = await sink.finish(result);
+            finishedStages.push(stage);
+            return stage;
+          },
+        };
+      },
+      async remove(ref) { stageRemoved++; await realStaging.remove(ref); },
+    };
+    // Exercise the real two-slot WAL serializer and reloader, not just a
+    // spy recording the input to save(). Simulate an error *after* durable
+    // adapter.write as well as a failure before any write.
+    const storedPaths = new Map<string, string>();
+    const adapter: V4LocalIndexAdapter = {
+      async read(path) {
+        const value = storedPaths.get(path);
+        if (value === undefined) throw new Error("Missing recovery slot");
+        return value;
+      },
+      async write(path, value) { storedPaths.set(path, value); },
+      async exists(path) { return storedPaths.has(path); },
+      async mkdir() {},
+    };
+    const actualStore = createV4RecoveryStore({
+      adapter, root: "d53-local-recovery", repoId: "o/r#main",
+    });
+    let attemptedSave = 0;
+    const failure = new Error("injected-wal-io-unknown-outcome");
+    const recoveryStore: V4RecoveryStore = {
+      load: () => actualStore.load(),
+      async save(input) {
+        attemptedSave++;
+        assert.equal(input.phase, "remote-verified");
+        if (ambiguity === "write-may-have-persisted") await actualStore.save(input);
+        throw failure;
+      },
+    };
+
+    await assert.rejects(
+      () => new V4SyncSession({
+        github, vault: peerVault, index: peerIndex, recoveryStore,
+        config: config(), conflictPolicy: "copy", abortChangePercent: 0,
+      }).sync({ operation: "normal", allowThresholdOverride: false }),
+      (error: unknown) => error === failure,
+      "the original WAL I/O error must propagate unchanged",
+    );
+
+    assert.equal(attemptedSave, 1, "WAL must be attempted exactly once");
+    assert.equal(finishedStages.length, 1, "required remote content must be verified and staged before WAL save");
+    assert.equal(finishedStages[0]!.size, enc("new-B").byteLength);
+    assert.equal(stageRemoved, 0,
+      "an ambiguous WAL save result must not discard bytes that a persisted WAL could reference");
+    const retainedSource = await realStaging.open(finishedStages[0]!);
+    const retained: Uint8Array[] = [];
+    for await (const chunk of retainedSource.chunks(1024)) retained.push(new Uint8Array(chunk));
+    assert.deepEqual(retained, [enc("new-B")], "the staged content must remain readable for recovery");
+    const reloaded = await actualStore.load();
+    if (ambiguity === "write-may-have-persisted") {
+      assert.equal(reloaded?.header.phase, "remote-verified",
+        "a persisted WAL must be readable through the actual slot validation and integrity checks");
+      assert.equal(reloaded.header.verifiedRemoteHead, publishedSha);
+      assert.deepEqual(reloaded.payload?.mutations.map(mutation =>
+        [mutation.kind, mutation.path]), [
+        ["trash", "A-delete.md"],
+        ["stage-write", "B-update.md"],
+      ]);
+      assert.equal(reloaded.payload?.mutations.find(m => m.kind === "stage-write")
+        ?.stage.stageId, finishedStages[0]!.stageId);
+      assert.equal(storedPaths.size, 1, "only the actual recovery slot should be present");
+    } else {
+      assert.equal(reloaded, null, "a definite pre-write failure must not fabricate a WAL");
+      assert.equal(storedPaths.size, 0);
+    }
+    assert.deepEqual(peerVault.files, beforeFiles, "failed WAL save must preserve user bytes and mtimes");
+    assert.deepEqual(peerIndex, beforeIndex, "failed WAL save must not advance local index/base");
+    assert.equal(peerVault.operations.some(op => /^(?:trash|write|commit-stage|delete):/u.test(op)), false,
+      "no local mutation may occur before WAL durability was confirmed");
+    assert.equal(github.ref!.sha, publishedSha, "failed peer Pull must not publish a new commit");
+    // Cleanup is deliberately NOT automatic in the production implementation:
+    // an ambiguous save failure may have persisted a WAL referencing this stage.
   });
 }
