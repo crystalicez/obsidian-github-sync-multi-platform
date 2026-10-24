@@ -5,6 +5,7 @@ import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { releaseLocal } from "../../scripts/local-release.mjs";
+import { requireReencryptionWizardReleaseGate, REENCRYPTION_RELEASE_CHECKS } from "../../scripts/reencryption-release-gate.mjs";
 
 const SHA = "a".repeat(40);
 const QUAL_OBJECT = "b".repeat(40);
@@ -83,6 +84,7 @@ async function harness(overrides = {}) {
     pnpmVersion: "9.12.3",
   };
   const services = {
+    requireReencryptionWizardReleaseGate() { calls.push("reencryption-gate"); },
     requireCleanMaster() { calls.push("clean"); return SHA; },
     requireCanonicalOriginEndpoints() { calls.push("origin"); return { fetchRepository: REPO, pushRepository: REPO }; },
     readRemoteMasterSha() { calls.push("master"); return masterSequence[Math.min(masterReads++, masterSequence.length - 1)]; },
@@ -139,6 +141,50 @@ const PHASES = [
   "stable-ref-create", "post-ref-recheck", "draft-create", "draft-asset-verify", "final-publish-check",
   "publish", "post-verify",
 ];
+
+test("first public release fails closed until the Re-encryption Wizard acceptance matrix passes", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "rekey-release-gate-"));
+  const fileName = "docs/release-gates/reencryption-wizard.json";
+  const blocked = { schemaVersion: 1, gate: "first-public-release-reencryption-wizard",
+    status: "blocked", checks: Object.fromEntries(REENCRYPTION_RELEASE_CHECKS.map(x => [x, "pending"])) };
+  await assert.rejects(
+    () => requireReencryptionWizardReleaseGate({ cwd }),
+    /Re-encryption Wizard.*absent or invalid/u,
+  );
+  await assert.rejects(
+    () => requireReencryptionWizardReleaseGate({ cwd: process.cwd() }),
+    /Re-encryption Wizard.*fully qualified/u,
+    "the actual repository release gate must remain blocked until accepted migration evidence exists",
+  );
+  await assert.rejects(
+    () => requireReencryptionWizardReleaseGate({
+      cwd, readText: async () => JSON.stringify(blocked),
+    }), /Re-encryption Wizard.*fully qualified/u,
+  );
+  await assert.rejects(
+    () => requireReencryptionWizardReleaseGate({
+      cwd, readText: async () => JSON.stringify({
+        ...blocked, status: "qualified",
+        checks: { ...Object.fromEntries(REENCRYPTION_RELEASE_CHECKS.map(x => [x, "passed"])),
+          multiDeviceCutoverAndStaleClientSafety: "pending" },
+      }),
+    }), /Re-encryption Wizard.*fully qualified/u,
+  );
+  await requireReencryptionWizardReleaseGate({
+    cwd, readText: async () => JSON.stringify({
+      ...blocked, status: "qualified",
+      checks: Object.fromEntries(REENCRYPTION_RELEASE_CHECKS.map(x => [x, "passed"])),
+    }),
+  });
+  const h = await harness({
+    services: { requireReencryptionWizardReleaseGate() { throw new Error("Re-encryption Wizard acceptance blocked"); } },
+  });
+  await assert.rejects(
+    () => releaseLocal({ cwd: "/repo", version: "1.0.8", services: h.services, runtimeNodeVersion: "v24.11.0" }),
+    /Re-encryption Wizard acceptance blocked/u,
+  );
+  assert.deepEqual(h.calls, [], "blocked release must perform no remote or artifact operations");
+});
 
 test("public release is unreachable before all exact verification phases", async () => {
   const h = await harness();

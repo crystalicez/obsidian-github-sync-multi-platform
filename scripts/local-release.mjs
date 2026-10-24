@@ -30,6 +30,7 @@ import {
 } from "./local-release-github.mjs";
 import { packagePlugin } from "./package-plugin.mjs";
 import { compareStableTriples, parseStableTriple, readReleaseMetadata, validateReleaseMetadata } from "./release-metadata.mjs";
+import { requireReencryptionWizardReleaseGate } from "./reencryption-release-gate.mjs";
 
 const PUBLICATION_GATES = Object.freeze([
   "install-frozen",
@@ -115,6 +116,7 @@ function requireReleaseShape(release, { version, draft }) {
 const DEFAULT_SERVICES = Object.freeze({
   requireCleanMaster,
   requireCanonicalOriginEndpoints,
+  requireReencryptionWizardReleaseGate,
   readRemoteMasterSha,
   readReleaseMetadata,
   validateReleaseMetadata,
@@ -152,6 +154,8 @@ export async function releaseLocal({
   const releaseRunner = (command, args, options = {}) => runner(command, args, { ...options, env: options.env ?? releaseEnv });
 
   phase("preflight");
+  // Block before any publication prerequisites, tags, or stable mutations.
+  await s.requireReencryptionWizardReleaseGate({ cwd });
   const sha = s.requireCleanMaster({ runner: releaseRunner, cwd });
   s.requireCanonicalOriginEndpoints({ runner: releaseRunner, cwd });
   if (s.readRemoteMasterSha({ runner: releaseRunner, cwd }) !== sha) throw new Error("Remote master does not equal local HEAD");

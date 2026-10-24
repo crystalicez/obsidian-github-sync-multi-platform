@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "gate": "first-public-release-reencryption-wizard",
+  "status": "blocked",
+  "checks": {
+    "ownerApprovedMigrationTopology": "pending",
+    "safePreviewAndBackup": "pending",
+    "completeReencryptionAndIntegrityVerification": "pending",
+    "interruptedMigrationRecovery": "pending",
+    "multiDeviceCutoverAndStaleClientSafety": "pending",
+    "gitHistoryAndOldKeyDisclosure": "pending",
+    "nativeDesktopAndMobileAcceptance": "pending"
+  }
+}

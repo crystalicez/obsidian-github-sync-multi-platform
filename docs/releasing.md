@@ -12,6 +12,10 @@ pnpm qualify:local
 
 **Maintainer policy (2026-10-21): GitHub Actions must not be used, configured, dispatched, relied on, or required at any time.** This repository's supported release path is local-only. No workflow YAML files may be shipped in `.github/workflows/`. The local `qualify:local` / `release:local` exact-SHA safety checks and verified remote E2E cleanup remain mandatory; neither command is authorized to run automatically or without maintainer release approval.
 
+## First public release: mandatory Re-encryption Wizard gate
+
+**BLOCKED pending implementation and qualification.** The owner explicitly requires the Re-encryption Wizard before the first public release. `scripts/local-release.mjs` checks the tracked `docs/release-gates/reencryption-wizard.json` state **before any remote publication mutation** and refuses to proceed unless every reviewed acceptance check is marked `passed` and the gate is `qualified`. Never change the gate to `qualified` merely to bypass a failure. The maintainer must review the actual tests and evidence in [D66's Wizard contract](engineering/d66-reencryption-wizard-pre-release-contract-2026-10-24.md), including exact-source native encrypted migration, interrupted recovery and second-device cutover. Qualification alone cannot override this blocker. GitHub Actions remain prohibited.
+
 ## 1. Bump release metadata
 
 Use the repository helper so `package.json`, `manifest.json`, and `versions.json` move together:
