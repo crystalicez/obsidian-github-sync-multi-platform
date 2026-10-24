@@ -17,6 +17,7 @@ import {
   resetGitHubE2EDisposableBranch,
   resolveGitHubE2ETarget,
 } from "./support/target-safety";
+import { observeV4PrePublishHeadNull } from "./support/pre-publish-head-null-evidence";
 
 const encoder = new TextEncoder();
 
@@ -354,7 +355,28 @@ function createDevice(name: string, config: GitHubConfig, context: ModeContext, 
           lastError = error;
           const message = error instanceof Error ? error.message : String(error);
           const retryable = options.operation === "normal" && isV4PublicationRaceError(error);
-          if (!retryable || attempt === 3) throw error;
+          if (!retryable || attempt === 3) {
+            // Failure-only, read-only observations. Preserve the original error
+            // and fail-closed publication result; never retry on this evidence.
+            await observeV4PrePublishHeadNull(error, {
+              device: name,
+              localIndexCommitSha: index.remoteCommitSha,
+              readBranch: async () => {
+                const response = await githubRequest(config, `/git/ref/heads/${branchPath(config)}?_=${Date.now()}`);
+                if (response.status !== 200) return { status: response.status };
+                const body = await response.json() as { object?: { sha?: string } };
+                return { status: response.status, sha: body.object?.sha };
+              },
+              readExpectedCommit: async sha => {
+                const response = await githubRequest(config, `/git/commits/${sha}`);
+                if (response.status !== 200) return { status: response.status };
+                const body = await response.json() as { sha?: string; tree?: { sha?: string } };
+                return { status: response.status, sha: body.sha, treeSha: body.tree?.sha };
+              },
+              report: evidence => console.error(JSON.stringify(evidence)),
+            });
+            throw error;
+          }
           runState.conflictCopyStages?.clear();
           console.warn(`GitHub E2E retrying normal sync after recoverable CAS race (attempt ${attempt + 1}/3): ${message}`);
         }
