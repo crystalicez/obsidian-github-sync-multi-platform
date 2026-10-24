@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createHash } from "node:crypto";
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { releaseLocal } from "../../scripts/local-release.mjs";
@@ -141,6 +141,22 @@ const PHASES = [
   "stable-ref-create", "post-ref-recheck", "draft-create", "draft-asset-verify", "final-publish-check",
   "publish", "post-verify",
 ];
+
+test("D74 release gate records owner-approved orphan topology but continues to block first release", async () => {
+  const manifest = JSON.parse(await readFile(
+    new URL("../../docs/release-gates/reencryption-wizard.json", import.meta.url), "utf8",
+  ));
+  assert.equal(manifest.status, "blocked");
+  assert.equal(manifest.checks.ownerApprovedMigrationTopology, "passed");
+  for (const check of REENCRYPTION_RELEASE_CHECKS) {
+    if (check === "ownerApprovedMigrationTopology") continue;
+    assert.equal(manifest.checks[check], "pending", check);
+  }
+  await assert.rejects(
+    () => requireReencryptionWizardReleaseGate({ cwd: process.cwd() }),
+    /Re-encryption Wizard.*fully qualified/u,
+  );
+});
 
 test("first public release fails closed until the Re-encryption Wizard acceptance matrix passes", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "rekey-release-gate-"));

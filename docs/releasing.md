@@ -16,6 +16,8 @@ pnpm qualify:local
 
 **BLOCKED pending implementation and qualification.** The owner explicitly requires the Re-encryption Wizard before the first public release. `scripts/local-release.mjs` checks the tracked `docs/release-gates/reencryption-wizard.json` state **before any remote publication mutation** and refuses to proceed unless every reviewed acceptance check is marked `passed` and the gate is `qualified`. Never change the gate to `qualified` merely to bypass a failure. The maintainer must review the actual tests and evidence in [D66's Wizard contract](engineering/d66-reencryption-wizard-pre-release-contract-2026-10-24.md), including exact-source native encrypted migration, interrupted recovery and second-device cutover. Qualification alone cannot override this blocker. GitHub Actions remain prohibited.
 
+**D74 owner decision (2026-10-24):** The destination topology is now approved as **Option A: a new orphan-root Git branch in the same repository, with no shared commit ancestry**. Only `ownerApprovedMigrationTopology` is marked `passed`; six other acceptance checks remain `pending`, and the overall gate is still `blocked`. The source branch must remain intact for recovery; destination data must be fully re-encrypted and verified on an independent second device before other devices switch. See [D74's approved migration contract](engineering/d74-approved-orphan-branch-migration-2026-10-24.md).
+
 ## 1. Bump release metadata
 
 Use the repository helper so `package.json`, `manifest.json`, and `versions.json` move together:

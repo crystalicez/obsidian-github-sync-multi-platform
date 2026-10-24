@@ -28,10 +28,10 @@ const base = {
   },
 };
 
-test("D67 read-only re-encryption preview is always blocked until destination topology is approved", () => {
+test("D74 read-only re-encryption preview stays blocked until migration/cutover is implemented", () => {
   const result = assessV4ReencryptionReadiness(base);
   assert.equal(result.status, "blocked");
-  assert.deepEqual(result.blockers, ["destination-topology-unapproved"]);
+  assert.deepEqual(result.blockers, ["migration-implementation-incomplete"]);
   assert.equal(result.sourceRepositoryId, "owner/repo#main");
   assert.equal(result.pinnedSourceCommitSha, SHA);
   assert.equal(result.existingIterations, 600_000);
@@ -57,7 +57,7 @@ test("D67 preflight blocks every unverified safety prerequisite independently", 
       ...base, evidence: { ...base.evidence, [key]: false },
     });
     assert.ok(result.blockers.includes(blocker), key);
-    assert.ok(result.blockers.includes("destination-topology-unapproved"));
+    assert.ok(result.blockers.includes("migration-implementation-incomplete"));
   }
   const missing = assessV4ReencryptionReadiness({ ...base, evidence: undefined });
   assert.ok(missing.blockers.includes("backup-unverified"));

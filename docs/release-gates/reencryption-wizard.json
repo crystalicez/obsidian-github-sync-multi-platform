@@ -3,7 +3,7 @@
   "gate": "first-public-release-reencryption-wizard",
   "status": "blocked",
   "checks": {
-    "ownerApprovedMigrationTopology": "pending",
+    "ownerApprovedMigrationTopology": "passed",
     "safePreviewAndBackup": "pending",
     "completeReencryptionAndIntegrityVerification": "pending",
     "interruptedMigrationRecovery": "pending",

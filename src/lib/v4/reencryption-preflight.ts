@@ -7,10 +7,12 @@ import { decodeV4RemoteConfig } from "./remote-index"
  * platform/runtime reads, NEVER from user-editable flags.
  *
  * This function cannot start migration, write to a vault, or change Git refs.
- * Until the owner chooses a destination topology, every result is blocked.
+ * Owner has approved topology A; the migration writer, verified backup,
+ * second-device cutover and crash recovery are still incomplete, so this
+ * preview deliberately remains blocked rather than authorizing publication.
  */
 export type V4ReencryptionBlocker =
-  | "destination-topology-unapproved"
+  | "migration-implementation-incomplete"
   | "source-authentication-unverified"
   | "source-snapshot-incomplete"
   | "backup-unverified"
@@ -114,9 +116,9 @@ export function assessV4ReencryptionReadiness(
     if (input.evidence?.[key] !== true) blockers.push(PROOF_TO_BLOCKER[key])
   }
 
-  // Deliberate hard blocker. No A/B migration destination or cutover behavior
-  // has owner approval, so this preview cannot authorize a write.
-  blockers.push("destination-topology-unapproved")
+  // The approved orphan-branch topology does NOT authorize incomplete
+  // migration/cutover code to write to a Git ref or a local vault.
+  blockers.push("migration-implementation-incomplete")
   return Object.freeze({
     status: "blocked",
     sourceRepositoryId: config.repoId,
