@@ -3,13 +3,19 @@ import test, { after } from "node:test";
 import { setRequestUrlHandler } from "obsidian";
 
 import { GitHubClient, type GitHubConfig } from "../../src/lib/github-api";
-import { randomBytes, toBase64, toBase64Url } from "../../src/lib/bytes";
+import { randomBytes, sha256Hex, toBase64, toBase64Url } from "../../src/lib/bytes";
 import { deriveV4Keyring, type V4Keyring } from "../../src/lib/v4/crypto";
 import { V4HistoryService } from "../../src/lib/v4/history-service";
 import { verifyGitHubReencryptionSource } from "../../src/lib/v4/reencryption-trusted-loader";
+import {
+  planV4OrphanReencryptionDestination,
+  assertV4OrphanDestinationRefObservations,
+  assertV4OrphanReencryptionRoot,
+} from "../../src/lib/v4/reencryption-orphan-branch";
+import { buildV4RemoteMetadata } from "../../src/lib/v4/remote-index";
 import { createEmptyV4LocalIndex, type V4LocalIndex } from "../../src/lib/v4/local-index";
 import { isV4PublicationRaceError } from "../../src/lib/v4/publication-race";
-import { expectedV4PathLayout, V4_FORMAT_VERSION, type V4RemoteConfig, type V4StorageMode } from "../../src/lib/v4/protocol-types";
+import { expectedV4PathLayout, V4_FORMAT_VERSION, type V4RemoteConfig, type V4RemoteHead, type V4StorageMode } from "../../src/lib/v4/protocol-types";
 import { V4StorageCodec } from "../../src/lib/v4/storage-codec";
 import { V4RemoteObjectMissingError, V4SyncSession, type V4SessionVault, type V4SyncRunState } from "../../src/lib/v4/sync-session";
 import type { V4RecoveryStore } from "../../src/lib/v4/recovery-store";
@@ -570,6 +576,122 @@ async function runReencryptionReadOnlyScenario(config: GitHubConfig): Promise<vo
   });
 }
 
+/**
+ * D75: publish ONLY a synthetic encrypted orphan root on the guarded disposable
+ * E2E branch. The real repository's default/source branch is READ ONLY.
+ * This proves GitHub orphan-ref mechanics, not a full data migration or cutover.
+ */
+async function runOrphanRootBootstrapScenario(config: GitHubConfig): Promise<void> {
+  const target = initialTarget;
+  const destinationRepoId = repoId(config);
+  const sourceRepoId = `${config.owner}/${config.repo}#${target.defaultBranch}`;
+  const sourceClient = new GitHubClient({ ...config, branch: target.defaultBranch });
+  const writer = new GitHubClient(config);
+  const physical = await writer.getRepositoryIdentity();
+  assert.equal(physical.id, Number(target.repositoryId));
+  const oldHead = await sourceClient.getGitRef();
+  assert.equal(oldHead.sha, target.defaultBranchSha);
+  assert.equal(await writer.getGitRefOrNull(), null);
+  assert.equal(await writer.getGitRefOrNull(), null);
+
+  const plan = planV4OrphanReencryptionDestination({
+    sourceRepoId, destinationRepoId,
+    sourceCommitSha: oldHead.sha,
+    sourcePhysicalRepositoryId: physical.id,
+    destinationPhysicalRepositoryId: physical.id,
+    expectedPhysicalRepositoryId: physical.id,
+    defaultBranch: target.defaultBranch,
+  });
+  const oldSalt = randomBytes(16);
+  const newSalt = randomBytes(16);
+  assert.notDeepEqual(oldSalt, newSalt);
+  const oldConfig: V4RemoteConfig = {
+    formatVersion: V4_FORMAT_VERSION, mode: "encrypted", repoId: sourceRepoId,
+    pathLayout: "opaque-stable-v1", algorithm: "AES-GCM", kdf: "PBKDF2-SHA-256",
+    kdfParams: { iterations: 600_000, salt: toBase64Url(oldSalt) },
+  };
+  const newConfig: V4RemoteConfig = {
+    ...oldConfig, repoId: destinationRepoId,
+    kdfParams: { iterations: 600_000, salt: toBase64Url(newSalt) },
+  };
+  const keyring = await deriveV4Keyring({
+    passphrase: "synthetic-d75-orphan-only",
+    repoId: destinationRepoId, salt: newSalt, iterations: 600_000,
+  });
+  const codec = new V4StorageCodec({ mode: "encrypted", pathLayout: "opaque-stable-v1", keyring });
+  const logicalPath = "Orphan/สวัสดี 🌏/note.md";
+  const plaintext = bytes("D75 synthetic encrypted orphan root — no old vault migrated");
+  const prepared = await codec.prepare(logicalPath, plaintext, "v1", 100, "d75-synthetic-file");
+  const record = { ...prepared.record, path: logicalPath };
+  const bucket = record.pathId.slice(0, 2);
+  const signature = await sha256Hex(bytes(JSON.stringify([record])));
+  const head: V4RemoteHead = {
+    formatVersion: V4_FORMAT_VERSION, mode: "encrypted", epoch: 1, generation: 1,
+    journalId: "d75-synthetic", deviceId: "d75-source", updatedAt: 100,
+    shardHashes: { [bucket]: signature },
+  };
+  const metadata = await buildV4RemoteMetadata({ config: newConfig, head, records: [record], keyring });
+  const uploaded = [...prepared.files, ...metadata];
+  assert.ok(uploaded.every(file => !file.path.includes("สวัสดี")));
+  const entries: Array<{ path: string; mode: "100644"; type: "blob"; sha: string }> = [];
+  for (const file of uploaded) {
+    entries.push({ path: file.path, mode: "100644", type: "blob",
+      sha: await writer.createGitBlob(file.bytes) });
+  }
+  // No base_tree! Never inherit the source repository tree or old ciphertext.
+  const rootTree = await writer.createGitTree(entries);
+  const rootCommit = await writer.createGitCommit(
+    "d75: synthetic orphan root (not a user re-encryption)",
+    rootTree, [], { originalCannotBeReachable: true },
+  );
+  const remoteRoot = await writer.getGitCommit(rootCommit);
+  const oldCommit = await sourceClient.getGitCommit(oldHead.sha);
+  assertV4OrphanReencryptionRoot({
+    plan, candidateCommit: remoteRoot, sourceTreeSha: oldCommit.treeSha,
+    sourceConfigBytes: bytes(JSON.stringify(oldConfig)),
+    destinationConfigBytes: bytes(JSON.stringify(newConfig)),
+  });
+  const finalRepo = await writer.getRepositoryIdentity();
+  const finalSource = await sourceClient.getGitRef();
+  assertV4OrphanDestinationRefObservations({
+    plan, observedSourceCommitShaBefore: oldHead.sha,
+    observedSourceCommitShaAfter: finalSource.sha,
+    destinationFirstObservation: await writer.getGitRefOrNull(),
+    destinationSecondObservation: await writer.getGitRefOrNull(),
+    observedPhysicalRepositoryIdBefore: physical.id,
+    observedPhysicalRepositoryIdAfter: finalRepo.id,
+  });
+  // Test-only publication to a random, twice-proven-absent, cleanup-scoped ref.
+  await writer.createGitRef(rootCommit);
+  await waitForBranchHead(config, rootCommit);
+
+  const secondDevice = new GitHubClient(config);
+  const before = secondDevice.transportMetricsSnapshot;
+  const verified = await verifyGitHubReencryptionSource({
+    github: secondDevice,
+    expectedRepoId: destinationRepoId,
+    expectedBranch: config.branch,
+    passphrase: "synthetic-d75-orphan-only",
+  });
+  const after = secondDevice.transportMetricsSnapshot;
+  assert.equal(verified.pinnedSourceCommitSha, rootCommit);
+  assert.equal(verified.verifiedFileCount, 1);
+  assert.equal(verified.verifiedRemoteObjectCount, 1);
+  assert.equal(verified.totalVerifiedPlaintextBytes, String(plaintext.byteLength));
+  assert.equal(after.mutations - before.mutations, 0);
+  assert.deepEqual((await secondDevice.getGitCommit(rootCommit)).parentShas, []);
+  assert.equal((await sourceClient.getGitRef()).sha, oldHead.sha,
+    "orphan fixture must never modify default/source branch");
+  console.log(JSON.stringify({
+    stage: "D75_ORPHAN_ROOT_LIVE_VERIFIED",
+    destinationBranch: config.branch,
+    orphanCommit: rootCommit, parentCount: remoteRoot.parentShas.length,
+    exactCommitVerifiedFiles: verified.verifiedFileCount,
+    secondReaderMutations: after.mutations - before.mutations,
+    sourceUnchanged: true,
+  }));
+}
+
 async function runBaselineScenario(config: GitHubConfig, mode: V4StorageMode): Promise<void> {
   await runScenario(config, mode, "baseline-edge-path-roundtrip", async ({ context, device }) => {
     const source = device("device-a");
@@ -984,6 +1106,10 @@ after(async () => {
 });
 
 test("V4 real GitHub strict CAS survives realistic superuser and two-device scenarios", { timeout: 900_000 }, async () => {
+  if (process.env.GITHUB_E2E_ONLY_SCENARIO === "orphan-root-encrypted") {
+    await runOrphanRootBootstrapScenario(config);
+    return;
+  }
   if (process.env.GITHUB_E2E_ONLY_SCENARIO === "readonly-rekey-encrypted") {
     await runReencryptionReadOnlyScenario(config);
     return;
@@ -1012,4 +1138,5 @@ test("V4 real GitHub strict CAS survives realistic superuser and two-device scen
   // Permanent manual full-suite coverage for the read-only rekey source gate.
   // Each runScenario resets only the independently approved disposable branch.
   await runReencryptionReadOnlyScenario(config);
+  await runOrphanRootBootstrapScenario(config);
 });

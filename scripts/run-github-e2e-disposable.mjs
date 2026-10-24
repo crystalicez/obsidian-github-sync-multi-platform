@@ -13,6 +13,7 @@ const allowed = new Map([
   ["rename-plaintext", "rename-vs-stale-edit-plaintext"],
   ["rename-encrypted", "rename-vs-stale-edit-encrypted"],
   ["readonly-rekey-encrypted", "readonly-rekey-encrypted"],
+  ["orphan-root-encrypted", "orphan-root-encrypted"],
   ["delete-plaintext", "delete-recreate-plaintext"],
   ["diagnostic-missing-plaintext", "diagnostic-missing-plaintext"],
   ["delete-encrypted", "delete-recreate-encrypted"],
@@ -20,7 +21,7 @@ const allowed = new Map([
 ]);
 const mode = process.argv[2];
 if (!allowed.has(mode) || process.argv.length !== 3) {
-  console.error("Usage: node scripts/run-github-e2e-disposable.mjs readonly-rekey-encrypted|rename-plaintext|rename-encrypted|delete-plaintext|delete-encrypted|diagnostic-missing-plaintext|full");
+  console.error("Usage: node scripts/run-github-e2e-disposable.mjs orphan-root-encrypted|readonly-rekey-encrypted|rename-plaintext|rename-encrypted|delete-plaintext|delete-encrypted|diagnostic-missing-plaintext|full");
   process.exitCode = 2;
 } else {
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
