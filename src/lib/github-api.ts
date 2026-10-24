@@ -237,6 +237,10 @@ export class GitHubClient {
       if (response.status === 200) {
         const json = response.json as { content?: string; encoding?: string; sha?: string };
         const sha = json.sha ?? "";
+        // A Contents 200 must identify its Git blob before its bytes are trusted.
+        if (!/^[0-9a-f]{40}$/u.test(sha)) {
+          throw new Error(`GitHub Contents response has invalid blob SHA for ${path}.`);
+        }
         if (json.encoding === "base64" && typeof json.content === "string") {
           let decoded: Uint8Array | undefined;
           try {
@@ -245,15 +249,12 @@ export class GitHubClient {
             decoded = undefined;
           }
           if (decoded) {
-            let verified = true;
-            if (/^[0-9a-f]{40}$/u.test(sha)) {
-              try { verified = await this.gitBlobSha1(decoded) === sha; } catch { verified = false; }
-            }
+            let verified = false;
+            try { verified = await this.gitBlobSha1(decoded) === sha; } catch { /* Do not accept unverified Contents bytes. */ }
             if (verified) return { bytes: decoded, sha };
           }
         }
-        if (sha) return { bytes: await this.getBlob(sha), sha };
-        throw new Error(`GitHub Contents response has no decodable payload for ${path}.`);
+        return { bytes: await this.getBlob(sha), sha };
       }
       if (response.status === 404) {
         return GIT_COMMIT_SHA.test(ref) ? this.getImmutableFileFromTree(path, ref) : null;
