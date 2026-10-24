@@ -28,6 +28,37 @@ test("v4 remote config decoder rejects an explicitly serialized legacy sentinel"
   assert.throws(() => decodeV4RemoteConfig(bytes), /Unsupported V4 path layout/u);
 });
 
+test("D62 remote KDF fields reject malformed types and salt before key derivation", () => {
+  const base = { formatVersion: 4, mode: "encrypted", repoId: "o/r#main", pathLayout: "opaque-stable-v1" };
+  const valid = { ...base, algorithm: "AES-GCM", kdf: "PBKDF2-SHA-256", kdfParams: { iterations: 600_000, salt: "c2FsdA" } };
+  assert.deepEqual(decodeV4RemoteConfig(enc(JSON.stringify(valid))), valid);
+  assert.deepEqual(decodeV4RemoteConfig(enc(JSON.stringify(base))), base, "legacy encrypted config without KDF fields remains readable");
+  const invalid: Array<[string, unknown]> = [
+    ["string iteration", { ...valid, kdfParams: { iterations: "600000", salt: "c2FsdA" } }],
+    ["zero iteration", { ...valid, kdfParams: { iterations: 0, salt: "c2FsdA" } }],
+    ["negative iteration", { ...valid, kdfParams: { iterations: -1, salt: "c2FsdA" } }],
+    ["fractional iteration", { ...valid, kdfParams: { iterations: 1.5, salt: "c2FsdA" } }],
+    ["unsafe integer iteration", { ...valid, kdfParams: { iterations: Number.MAX_SAFE_INTEGER + 1, salt: "c2FsdA" } }],
+    ["missing iteration", { ...valid, kdfParams: { salt: "c2FsdA" } }],
+    ["null salt", { ...valid, kdfParams: { iterations: 600_000, salt: null } }],
+    ["array salt", { ...valid, kdfParams: { iterations: 600_000, salt: ["c2FsdA"] } }],
+    ["empty salt", { ...valid, kdfParams: { iterations: 600_000, salt: "" } }],
+    ["malformed base64url salt", { ...valid, kdfParams: { iterations: 600_000, salt: "a?" } }],
+    ["impossible base64url length", { ...valid, kdfParams: { iterations: 600_000, salt: "a" } }],
+    ["null KDF params", { ...valid, kdfParams: null }],
+    ["array KDF params", { ...valid, kdfParams: [] }],
+    ["wrong KDF algorithm", { ...valid, kdf: "SHA-1" }],
+    ["wrong cipher algorithm", { ...valid, algorithm: "AES-CBC" }],
+  ];
+  for (const [label, config] of invalid) {
+    assert.throws(
+      () => decodeV4RemoteConfig(enc(JSON.stringify(config))),
+      /invalid V4 remote KDF|unsupported V4 encryption/i,
+      label,
+    );
+  }
+});
+
 test("v4 encrypted remote metadata does not expose paths and round trips", async () => {
   const keys = await deriveV4Keyring({ passphrase: "pass", repoId: "o/r#main", salt: enc("salt"), iterations: 10 });
   const config: V4RemoteConfig = { formatVersion: V4_FORMAT_VERSION, mode: "encrypted", repoId: "o/r#main", pathLayout: expectedV4PathLayout("encrypted"), algorithm: "AES-GCM", kdf: "PBKDF2-SHA-256", kdfParams: { iterations: 10, salt: "c2FsdA" } };

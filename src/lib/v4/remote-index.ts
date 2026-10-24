@@ -178,11 +178,27 @@ export function encodeV4RemoteConfig(config: V4RemoteConfig): Uint8Array {
 export function decodeV4RemoteConfig(bytes: Uint8Array): V4RemoteConfig {
   assertV4MetadataBytes(bytes, "config")
   const config = JSON.parse(bytesToUtf8(bytes)) as V4RemoteConfig
-  if (config.formatVersion !== 4 || (config.mode !== "plaintext" && config.mode !== "encrypted")) {
+  if (!config || typeof config !== "object" || Array.isArray(config)
+    || config.formatVersion !== 4 || (config.mode !== "plaintext" && config.mode !== "encrypted")) {
     throw new Error("Unsupported remote format. Force Push is required to initialize V4.")
   }
   if (config.pathLayout !== undefined && config.pathLayout !== "plaintext-v1" && config.pathLayout !== "opaque-stable-v1") {
     throw new Error("Unsupported V4 path layout.")
+  }
+  if (config.algorithm !== undefined && config.algorithm !== "AES-GCM") {
+    throw new Error("Unsupported V4 encryption algorithm.")
+  }
+  if (config.kdf !== undefined && config.kdf !== "PBKDF2-SHA-256") {
+    throw new Error("Unsupported V4 encryption KDF.")
+  }
+  if (config.kdfParams !== undefined) {
+    const params = config.kdfParams
+    if (!params || typeof params !== "object" || Array.isArray(params)
+      || !Number.isSafeInteger(params.iterations) || params.iterations < 1
+      || typeof params.salt !== "string" || !/^[A-Za-z0-9_-]+$/u.test(params.salt)
+      || params.salt.length % 4 === 1) {
+      throw new Error("Invalid V4 remote KDF parameters.")
+    }
   }
   return config
 }
