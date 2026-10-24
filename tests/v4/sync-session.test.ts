@@ -2715,3 +2715,108 @@ test("v4 pull rename preserves an old-path user edit that appears while remote b
   );
   assert.equal(dec(localVault.files.get("old.md")!.bytes), "user-edit");
 });
+
+test("D51 WAL pre-stages every Pull before a delete: later missing immutable object aborts all local mutations", async () => {
+  const github = new MemoryGitHub();
+  const sourceVault = new MemoryVault();
+  const sourceIndex = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "source-d51", mode: "plaintext" });
+  const peerVault = new MemoryVault();
+  const peerIndex = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "peer-d51", mode: "plaintext" });
+  const original = [
+    ["A-remove.md", "original-deleted"],
+    ["B-replace.md", "original-replaced"],
+    ["C-last.md", "original-last"],
+  ] as const;
+  for (const [path, content] of original) sourceVault.files.set(path, { bytes: enc(content), mtime: 1 });
+  const source = new V4SyncSession({
+    github, vault: sourceVault, index: sourceIndex, config: config(), conflictPolicy: "copy", abortChangePercent: 0,
+  });
+  await source.sync({ operation: "forcePush", allowThresholdOverride: false });
+  await new V4SyncSession({
+    github, vault: peerVault, index: peerIndex, config: config(), conflictPolicy: "copy", abortChangePercent: 0,
+  }).sync({ operation: "forcePull", allowThresholdOverride: false });
+
+  const beforeIndex = structuredClone(peerIndex);
+  const beforeFiles = new Map([...peerVault.files].map(([path, file]) =>
+    [path, { bytes: new Uint8Array(file.bytes), mtime: file.mtime }] as const));
+  peerVault.operations.length = 0;
+
+  sourceVault.files.delete("A-remove.md");
+  sourceVault.files.set("B-replace.md", { bytes: enc("new-good-body"), mtime: 2 });
+  sourceVault.files.set("C-last.md", { bytes: enc("new-missing-body"), mtime: 2 });
+  await source.sync({
+    operation: "normal", allowThresholdOverride: false,
+    changes: [
+      { type: "delete", path: "A-remove.md", mtime: 2 },
+      { type: "modify", path: "B-replace.md", mtime: 2 },
+      { type: "modify", path: "C-last.md", mtime: 2 },
+    ],
+  });
+  const publishedSha = github.ref!.sha;
+  const missingRecord = indexRecordByPath(sourceIndex, "C-last.md");
+
+  let injectedReads = 0;
+  const readFile = github.getFileBytes.bind(github);
+  github.getFileBytes = async (path, ref) => {
+    if (path === "C-last.md" && ref === publishedSha) {
+      injectedReads++;
+      return null; // Immutable content remains published: simulate one read failure.
+    }
+    return readFile(path, ref);
+  };
+
+  const staging = peerVault.staging;
+  let begun = 0;
+  let finished = 0;
+  let aborted = 0;
+  let removed = 0;
+  peerVault.staging = {
+    ...staging,
+    async beginStage(options) {
+      begun++;
+      const sink = await staging.beginStage(options);
+      return {
+        ...sink,
+        async finish(result) { const stage = await sink.finish(result); finished++; return stage; },
+        async abort() { aborted++; await sink.abort(); },
+      };
+    },
+    async remove(ref) { removed++; await staging.remove(ref); },
+  };
+  let recoverySaves = 0;
+  const recoveryStore = {
+    async load() { return null; },
+    async save(): Promise<never> {
+      recoverySaves++;
+      throw new Error("WAL save must not happen after a failed remote pre-stage");
+    },
+  };
+
+  await assert.rejects(
+    () => new V4SyncSession({
+      github, vault: peerVault, index: peerIndex, config: config(),
+      conflictPolicy: "copy", abortChangePercent: 0, recoveryStore,
+    }).sync({ operation: "normal", allowThresholdOverride: false }),
+    (error: unknown) => {
+      assert.ok(error instanceof V4RemoteObjectMissingError);
+      assert.equal(error.remoteCommitSha, publishedSha);
+      assert.equal(error.remotePath, "C-last.md");
+      assert.equal(error.fileId, missingRecord.fileId);
+      return true;
+    },
+  );
+
+  assert.equal(injectedReads, 1, "the failure must hit the last exact immutable object");
+  assert.equal(begun, 2, "good middle body must be staged before final missing object");
+  assert.equal(finished, 1, "good middle body must have a complete, verified stage");
+  assert.equal(aborted, 1, "incomplete final stage must be aborted");
+  assert.equal(removed, 1, "the completed earlier stage must also be cleaned");
+  assert.equal(recoverySaves, 0, "a failed pre-stage must never persist a WAL mutation intent");
+  assert.deepEqual(peerIndex, beforeIndex, "failed batch must not advance any local base metadata");
+  assert.deepEqual(peerVault.files, beforeFiles, "failed batch must preserve all old local contents and mtimes");
+  assert.equal(peerVault.operations.some(operation => /^(?:trash|write|commit-stage|delete):/u.test(operation)), false,
+    "no local write or delete is allowed before every remote body is available");
+  assert.equal(github.ref!.sha, publishedSha, "peer must not publish a new GitHub head on failed Pull");
+  assert.equal(github.files.get("C-last.md")?.byteLength, enc("new-missing-body").byteLength,
+    "published immutable content must still exist while its read is faulted");
+});
