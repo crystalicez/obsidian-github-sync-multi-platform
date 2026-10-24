@@ -171,4 +171,7 @@ test("D80 reset or auto-publish controls are not exposed by the journal interfac
   assert.equal("clear" in j, false);
   assert.equal("publish" in j, false);
   assert.equal("resumeUploads" in j, false);
+  assert.equal(Object.isFrozen(j), true, "journal context binding must resist runtime mutation");
+  assert.equal(j.sourceCommitSha, sourceCommitSha);
+  assert.equal(j.destinationRepoId, repoId);
 });

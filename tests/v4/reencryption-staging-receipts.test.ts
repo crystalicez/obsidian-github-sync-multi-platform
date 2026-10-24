@@ -6,6 +6,9 @@ import { deriveV4Keyring } from "../../src/lib/v4/crypto";
 import { computeV4GitBlobSha1 } from "../../src/lib/v4/git-blob-identity";
 import { planV4OrphanReencryptionDestination } from "../../src/lib/v4/reencryption-orphan-branch";
 import { stageV4ReencryptionVaultObjects } from "../../src/lib/v4/reencryption-staging-receipts";
+import { createV4ReencryptionRecoveryJournal } from "../../src/lib/v4/reencryption-recovery-journal";
+import { stageV4ReencryptionVaultObjectsWithJournal } from "../../src/lib/v4/reencryption-journaled-staging";
+import type { V4LocalIndexAdapter } from "../../src/lib/v4/local-index";
 import type { V4IndexFileRecord } from "../../src/lib/v4/local-index";
 import type { V4RemoteShard } from "../../src/lib/v4/remote-index";
 import type { V4RemoteConfig, V4RemoteHead } from "../../src/lib/v4/protocol-types";
@@ -86,6 +89,27 @@ async function fixture(extraSize = 0) {
     input, staged, receipts, targets, destinationCodec, sourceBytes,
     get stages() { return stages; }, get sourceChecks() { return sourceChecks; },
   };
+}
+
+class JournalTestAdapter implements V4LocalIndexAdapter {
+  files = new Map<string, string>();
+  async read(path: string) {
+    const value = this.files.get(path);
+    if (!value) throw new Error("journal slot absent");
+    return value;
+  }
+  async write(path: string, value: string) { this.files.set(path, value); }
+  async exists(path: string) { return this.files.has(path); }
+  async mkdir(_path: string) {}
+}
+
+function journal(adapter = new JournalTestAdapter(), sourcePin = sha, destination = newId) {
+  return createV4ReencryptionRecoveryJournal({
+    adapter,
+    root: ".obsidian/plugins/rekey-d81/journal",
+    destinationRepoId: destination, sourceCommitSha: sourcePin,
+    runId: "rekey-d81-exact-run", journalKey: new Uint8Array(32).fill(0x55),
+  });
 }
 
 test("D79 stages only finalized V4 output and matches full-vault parity without permitting publish", async () => {
@@ -193,6 +217,105 @@ test("D79 authenticates and stages multipart ciphertext one part at a time", asy
   assert.throws(() => big.partPaths!.push("forged-part"), TypeError,
     "completed multipart object paths must remain immutable after receipt validation");
   assert.deepEqual(await f.destinationCodec.read(big, async path => f.staged.get(path)!), f.targets.get(big.path));
+});
+
+test("D81 binds D79 staging to WAL intent BEFORE upload and confirms exact Git SHA afterwards", async () => {
+  const f = await fixture();
+  const adapter = new JournalTestAdapter();
+  const wal = journal(adapter);
+  let uploads = 0;
+  let leaseChecks = 0;
+  const result = await stageV4ReencryptionVaultObjectsWithJournal({
+    ...f.input, journal: wal,
+    async assertExclusiveStageLease() { leaseChecks++; },
+    async stageImmutableObject(path, ciphertext) {
+      uploads++;
+      const current = await journal(adapter).load();
+      assert.ok(current);
+      assert.equal(current.pendingIntents.length, 1, "intent must exist before Git Blob API is called");
+      assert.equal(current.pendingIntents[0]!.path, path);
+      assert.equal(current.pendingIntents[0]!.sha, computeV4GitBlobSha1(ciphertext));
+      assert.equal(current.receipts.length, uploads - 1);
+      return f.input.stageImmutableObject(path, ciphertext);
+    },
+  });
+  assert.equal(uploads, 2);
+  assert.ok(leaseChecks >= 6);
+  assert.deepEqual(result.journalSnapshot.receipts, result.receipts);
+  assert.equal(result.journalSnapshot.pendingIntents.length, 0);
+  assert.equal(result.journalSnapshot.requiresRemoteRevalidation, true);
+  assert.equal(result.journalSnapshot.permissionToPublish, false);
+  assert.equal(result.preview.destinationReadbackVerified, false);
+  assert.equal((await journal(adapter).load())!.receipts.length, 2);
+  const serialized = [...adapter.files.values()].join("");
+  assert.ok(!serialized.includes("秘密"));
+  assert.ok(!serialized.includes(result.receipts[0]!.path));
+});
+
+test("D81 timeout after upload intent leaves unresolved WAL; a retry cannot silently reuse it", async () => {
+  const f = await fixture();
+  const wal = journal();
+  let attempts = 0;
+  const run = () => stageV4ReencryptionVaultObjectsWithJournal({
+    ...f.input, journal: wal, async assertExclusiveStageLease() {},
+    async stageImmutableObject() { attempts++; throw new Error("ambiguous GitHub timeout"); },
+  });
+  await assert.rejects(run, /ambiguous GitHub timeout/);
+  assert.equal((await wal.load())!.pendingIntents.length, 1);
+  assert.equal((await wal.load())!.receipts.length, 0);
+  await assert.rejects(run, /previous run requires manual recovery/);
+  assert.equal(attempts, 1);
+});
+
+test("D81 wrong blob SHA stays pending and never becomes a completed journal receipt", async () => {
+  const f = await fixture();
+  const wal = journal();
+  await assert.rejects(() => stageV4ReencryptionVaultObjectsWithJournal({
+    ...f.input, journal: wal, async assertExclusiveStageLease() {},
+    async stageImmutableObject() { return "f".repeat(40); },
+  }), /blob SHA mismatch/);
+  assert.equal((await wal.load())!.pendingIntents.length, 1);
+  assert.equal((await wal.load())!.receipts.length, 0);
+});
+
+test("D81 bad source, wrong WAL binding or missing exclusive lease stops before any Git write", async () => {
+  const f = await fixture();
+  let uploads = 0;
+  const upload = async () => { uploads++; return "f".repeat(40); };
+  const corrupt = { ...f.input.sourceShards };
+  delete corrupt[Object.keys(corrupt)[0]!];
+  const wal = journal();
+  await assert.rejects(() => stageV4ReencryptionVaultObjectsWithJournal({
+    ...f.input, sourceShards: corrupt, journal: wal,
+    assertExclusiveStageLease: async () => {}, stageImmutableObject: upload,
+  }), /bucket|missing|shard/);
+  assert.equal(await wal.load(), null);
+  await assert.rejects(() => stageV4ReencryptionVaultObjectsWithJournal({
+    ...f.input, journal: journal(new JournalTestAdapter(), "b".repeat(40)),
+    assertExclusiveStageLease: async () => {}, stageImmutableObject: upload,
+  }), /binding mismatch/);
+  await assert.rejects(() => stageV4ReencryptionVaultObjectsWithJournal({
+    ...f.input, journal: wal,
+    async assertExclusiveStageLease() { throw new Error("exclusive lease not held"); },
+    stageImmutableObject: upload,
+  }), /exclusive lease not held/);
+  assert.equal(uploads, 0);
+});
+
+test("D81 cancellation after journaling intent, before sending bytes, leaves pending no receipt", async () => {
+  const f = await fixture();
+  const wal = journal();
+  const controller = new AbortController();
+  let uploads = 0;
+  await assert.rejects(() => stageV4ReencryptionVaultObjectsWithJournal({
+    ...f.input, journal: wal, signal: controller.signal,
+    async assertExclusiveStageLease() {
+      if ((await wal.load())?.pendingIntents.length) controller.abort(new Error("cancel after intent"));
+    },
+    async stageImmutableObject() { uploads++; return "f".repeat(40); },
+  }), /cancel after intent|abort/i);
+  assert.equal((await wal.load())!.pendingIntents.length, 1);
+  assert.equal(uploads, 0);
 });
 
 test("D79 refuses cancellation before producing an output report", async () => {

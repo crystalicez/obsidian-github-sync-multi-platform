@@ -43,6 +43,9 @@ export interface V4ReencryptionJournalSnapshot {
 }
 
 export interface V4ReencryptionRecoveryJournal {
+  /** Immutable identity to prevent accidental cross-source/cross-branch WAL reuse. */
+  readonly sourceCommitSha: string
+  readonly destinationRepoId: string
   load(): Promise<V4ReencryptionJournalSnapshot | null>
   /** Only allowed for two wholly absent slots; never clears previous work. */
   begin(): Promise<V4ReencryptionJournalSnapshot>
@@ -222,14 +225,16 @@ export function createV4ReencryptionRecoveryJournal(input: {
     return readback.state
   }
 
-  return {
+  return Object.freeze({
+    sourceCommitSha: input.sourceCommitSha,
+    destinationRepoId: input.destinationRepoId,
     load: async () => (await observe()).latest,
     begin: () => locked(async () => {
       const state = await observe()
       if (state.latest || state.damaged) invalid()
       return save(1, [], [])
     }),
-    recordUploadIntent: (receipt, expectedGeneration) => locked(async () => {
+    recordUploadIntent: (receipt: V4ReencryptionObjectReceipt, expectedGeneration: number) => locked(async () => {
       checkReceipt(receipt)
       const state = await observe()
       if (!state.latest || state.damaged) invalid()
@@ -243,7 +248,7 @@ export function createV4ReencryptionRecoveryJournal(input: {
       return save(state.latest.generation + 1, state.latest.receipts,
         [...state.latest.pendingIntents, { ...receipt }])
     }),
-    appendReceipt: (receipt, expectedGeneration) => locked(async () => {
+    appendReceipt: (receipt: V4ReencryptionObjectReceipt, expectedGeneration: number) => locked(async () => {
       checkReceipt(receipt)
       const state = await observe()
       if (!state.latest || state.damaged) invalid()
@@ -258,5 +263,5 @@ export function createV4ReencryptionRecoveryJournal(input: {
       return save(state.latest.generation + 1, [...state.latest.receipts, { ...receipt }],
         state.latest.pendingIntents.filter(r => r.path !== receipt.path))
     }),
-  }
+  })
 }
