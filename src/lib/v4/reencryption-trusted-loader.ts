@@ -3,6 +3,7 @@ import { assertSafeGitHubBranch } from "../github-config"
 import type { GitHubClient, GitHubTree } from "../github-api"
 import { throwIfV4Aborted } from "./cancellation"
 import { deriveV4Keyring, type V4Keyring } from "./crypto"
+import { assertV4GitBlobIdentity } from "./git-blob-identity"
 import { readImmutableGitFile } from "./immutable-git-read"
 import { verifyV4ReencryptionSourceObjects, type V4ReencryptionVerifiedSource } from "./reencryption-content-verifier"
 import { decodeV4RemoteConfig, decodeV4RemoteHead, decodeV4RemoteShard, v4RemoteShardPath, type V4RemoteShard } from "./remote-index"
@@ -98,7 +99,15 @@ export async function verifyGitHubReencryptionSource(
     const found = await readImmutableGitFile(path, pinned, {
       getCommit: readCommit,
       getTree: readTree,
-      getBlob: sha => input.github.getBlob(sha),
+      getBlob: async sha => {
+        throwIfV4Aborted(input.signal)
+        const bytes = await input.github.getBlob(sha)
+        throwIfV4Aborted(input.signal)
+        // A successful GitHub response is not proof that the bytes belong to
+        // the blob SHA named in the authenticated immutable Git tree.
+        assertV4GitBlobIdentity(bytes, sha)
+        return bytes
+      },
     })
     throwIfV4Aborted(input.signal)
     return found?.bytes ?? null

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test from "node:test";
 
 import { sha256Hex, toBase64Url, utf8ToBytes } from "../../src/lib/bytes";
@@ -9,6 +10,8 @@ import { V4StorageCodec } from "../../src/lib/v4/storage-codec";
 import { verifyGitHubReencryptionSource } from "../../src/lib/v4/reencryption-trusted-loader";
 
 const enc = utf8ToBytes;
+const gitBlobSha = (bytes: Uint8Array) =>
+  createHash("sha1").update(`blob ${bytes.byteLength}\0`).update(bytes).digest("hex");
 const commitSha = "a".repeat(40);
 const rootTreeSha = "b".repeat(40);
 const managedTreeSha = "c".repeat(40);
@@ -32,8 +35,8 @@ async function createFixture() {
     updatedAt: 1, deviceId: "device",
   };
   const prepared = await buildV4RemoteMetadata({ config, head, records: [record], keyring });
-  const files = new Map(prepared.map((f, i) => [f.path, { bytes: f.bytes, sha: String(i + 1).repeat(40).slice(0, 40) }]));
-  for (const object of file.files) files.set(object.path, { bytes: object.bytes, sha: "f".repeat(40) });
+  const files = new Map(prepared.map(f => [f.path, { bytes: f.bytes, sha: gitBlobSha(f.bytes) }]));
+  for (const object of file.files) files.set(object.path, { bytes: object.bytes, sha: gitBlobSha(object.bytes) });
   const trees = new Map<string, { sha: string; truncated: false; tree: Array<{ path: string; type: "tree" | "blob"; mode: "040000" | "100644"; sha: string }> }>();
   const treeIds = new Map<string, string>([["", rootTreeSha]]);
   let nextTree = 0;
@@ -188,13 +191,34 @@ test("D70 refuses a mismatched immutable Git commit or substituted tree identity
   );
 });
 
+test("D71 trusted reader rejects blob bytes not matching immutable tree SHA before decrypt", async () => {
+  const f = await createFixture();
+  const wrongBlob = {
+    ...f.github,
+    async getBlob(sha: string) {
+      const original = await f.github.getBlob(sha);
+      const substituted = original.slice();
+      substituted[0] = substituted[0]! ^ 1;
+      return substituted;
+    },
+  };
+  await assert.rejects(
+    () => verifyGitHubReencryptionSource({
+      github: wrongBlob, expectedRepoId: repoId, expectedBranch: "main", passphrase: "correct",
+    }),
+    /Git blob identity mismatch/i,
+  );
+});
+
 test("D70 rejects over-cap remote KDF metadata before deriving any key", async () => {
   const f = await createFixture();
   const configEntry = f.trees.get(managedTreeSha)!.tree.find(item => item.path === "config.json");
   assert.ok(configEntry);
-  f.blobs.set(configEntry.sha, enc(JSON.stringify({
+  const maliciousConfig = enc(JSON.stringify({
     ...f.config, kdfParams: { ...f.config.kdfParams, iterations: 1_200_001 },
-  })));
+  }));
+  configEntry.sha = gitBlobSha(maliciousConfig);
+  f.blobs.set(configEntry.sha, maliciousConfig);
   await assert.rejects(
     () => verifyGitHubReencryptionSource({ github: f.github, expectedRepoId: repoId, expectedBranch: "main", passphrase: "correct" }),
     /KDF|PBKDF2|iterations/i,
