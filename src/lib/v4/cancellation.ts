@@ -20,7 +20,7 @@ export function throwIfV4Aborted(signal?: AbortSignal): void {
 export async function sleepV4Abortable(
   milliseconds: number,
   signal: AbortSignal | undefined,
-  sleep: (milliseconds: number) => Promise<void>,
+  sleep: (milliseconds: number, signal?: AbortSignal) => Promise<void>,
 ): Promise<void> {
   throwIfV4Aborted(signal)
   if (!signal) return sleep(milliseconds)
@@ -30,7 +30,7 @@ export async function sleepV4Abortable(
     signal.addEventListener("abort", onAbort, { once: true })
   })
   try {
-    await Promise.race([sleep(milliseconds), aborted])
+    await Promise.race([sleep(milliseconds, signal), aborted])
     throwIfV4Aborted(signal)
   } finally {
     signal.removeEventListener("abort", onAbort)

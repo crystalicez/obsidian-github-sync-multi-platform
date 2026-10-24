@@ -21,7 +21,7 @@ export interface V4RequestSchedulerSnapshot {
 }
 
 export interface V4RequestSchedulerOptions extends Partial<V4TransportPolicy> {
-  sleep?: ((milliseconds: number) => Promise<void>) | undefined
+  sleep?: ((milliseconds: number, signal?: AbortSignal) => Promise<void>) | undefined
   now?: (() => number) | undefined
   retryRateLimits?: boolean
   onRetry?: (milliseconds: number) => void
@@ -42,7 +42,7 @@ export class V4RequestScheduler {
   private readonly active: Record<V4RequestKind, number> = { read: 0, write: 0 }
   private readonly queues: Record<V4RequestKind, Array<QueueItem<unknown>>> = { read: [], write: [] }
   private readonly policy: V4TransportPolicy
-  private readonly sleep: (milliseconds: number) => Promise<void>
+  private readonly sleep: (milliseconds: number, signal?: AbortSignal) => Promise<void>
   private readonly now: () => number
   private readonly retryRateLimits: boolean
   private readonly onRetry: ((milliseconds: number) => void) | undefined

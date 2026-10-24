@@ -37,7 +37,7 @@ export interface GitHubClientOptions {
   transportPolicy?: Partial<V4TransportPolicy>;
   transportMetrics?: V4TransportMetrics;
   transportResources?: Pick<V4ResourceController, "withTransportBytes">;
-  sleep?: ((milliseconds: number) => Promise<void>) | undefined;
+  sleep?: ((milliseconds: number, signal?: AbortSignal) => Promise<void>) | undefined;
   now?: () => number;
   cooldownStore?: V4RateLimitCooldownStore | undefined;
 }
