@@ -181,6 +181,44 @@ test("D60 encrypted packed storage cannot redirect its GitHub read outside V4 pa
   }
 })
 
+
+test("D61 untrusted remote deletion and dirty flags must be actual booleans", async () => {
+  const value = await sample()
+  const bucket = value.pathId.slice(0, 2)
+  const invalid: Array<[string, Record<string, unknown>]> = [
+    ["string false deletion", { deleted: "false" }],
+    ["string true deletion", { deleted: "true" }],
+    ["numeric deletion", { deleted: 1 }],
+    ["null deletion", { deleted: null }],
+    ["array deletion", { deleted: [] }],
+    ["object deletion", { deleted: {} }],
+    ["string false dirty", { dirty: "false" }],
+    ["numeric dirty", { dirty: 0 }],
+    ["null dirty", { dirty: null }],
+  ]
+  for (const [label, mutation] of invalid) {
+    const record = { ...value, ...mutation } as V4IndexFileRecord
+    await assert.rejects(
+      () => assertV4RemoteRecordSet([record], config),
+      /deleted|dirty|boolean|invalid|flag/iu,
+      label,
+    )
+    await assert.rejects(
+      () => decodeV4RemoteShard(new TextEncoder().encode(JSON.stringify({
+        bucket, records: { [value.pathId]: record },
+      })), bucket, config),
+      /deleted|dirty|boolean|invalid|flag/iu,
+      `untrusted GitHub shard ${label}`,
+    )
+  }
+  for (const deleted of [undefined, false, true]) {
+    for (const dirty of [undefined, false, true]) {
+      const record = { ...value, ...(deleted === undefined ? {} : { deleted }), ...(dirty === undefined ? {} : { dirty }) }
+      await assert.doesNotReject(() => assertV4RemoteRecordSet([record], config))
+    }
+  }
+})
+
 test("legacy 9 MiB single-blob record and external commit marker remain readable", async () => {
   const oldWriterSingle = { ...await sample(), size: 9 * 1024 * 1024, remoteVersion: "external:direct-github-commit" }
   await assert.doesNotReject(() => assertV4RemoteRecordSet([oldWriterSingle], config))

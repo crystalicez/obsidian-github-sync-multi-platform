@@ -14,6 +14,8 @@ export interface V4RemoteShard {
 
 function assertNormalizedRemoteRecord(record: V4IndexFileRecord, config: V4RemoteConfig): void {
   if (!record || typeof record !== "object" || Array.isArray(record)) throw new Error("V4 remote record descriptor is invalid.")
+  if (record.deleted !== undefined && typeof record.deleted !== "boolean") throw new Error("V4 remote record deleted flag is invalid.")
+  if (record.dirty !== undefined && typeof record.dirty !== "boolean") throw new Error("V4 remote record dirty flag is invalid.")
   if (typeof record.path !== "string") throw new Error("V4 remote record path is invalid.")
   if (typeof record.pathId !== "string" || !/^[0-9a-f]{64}$/u.test(record.pathId)) throw new Error("V4 remote record pathId is invalid.")
   if (typeof record.fileId !== "string" || !record.fileId) throw new Error("V4 remote record fileId is invalid.")
