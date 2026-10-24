@@ -6,6 +6,7 @@ import { GitHubClient, type GitHubConfig } from "../../src/lib/github-api";
 import { randomBytes, toBase64, toBase64Url } from "../../src/lib/bytes";
 import { deriveV4Keyring, type V4Keyring } from "../../src/lib/v4/crypto";
 import { V4HistoryService } from "../../src/lib/v4/history-service";
+import { verifyGitHubReencryptionSource } from "../../src/lib/v4/reencryption-trusted-loader";
 import { createEmptyV4LocalIndex, type V4LocalIndex } from "../../src/lib/v4/local-index";
 import { isV4PublicationRaceError } from "../../src/lib/v4/publication-race";
 import { expectedV4PathLayout, V4_FORMAT_VERSION, type V4RemoteConfig, type V4StorageMode } from "../../src/lib/v4/protocol-types";
@@ -520,6 +521,55 @@ function seedBaseline(vault: MemoryVault, mode: V4StorageMode): void {
   vault.set("Assets/medium-1m.bin", deterministicBinary(1024 * 1024, 0x51a7), 7);
 }
 
+/**
+ * D73 read-only live acceptance for D70-D72 pre-rekey source verification.
+ * Reuses only the owner-approved, ID-proven, disposable E2E branch.
+ */
+async function runReencryptionReadOnlyScenario(config: GitHubConfig): Promise<void> {
+  await runScenario(config, "encrypted", "readonly-rekey-encrypted", async ({ device }) => {
+    const source = device("d73-source");
+    seedBaseline(source.vault, "encrypted");
+    const pushed = await source.session.sync({ operation: "forcePush", allowThresholdOverride: false });
+    assert.equal(pushed.mode, "force-push");
+    const publishedSha = source.index.remoteCommitSha;
+    assert.match(publishedSha ?? "", /^[0-9a-f]{40}$/u);
+    await waitForBranchHead(config, publishedSha!);
+
+    // Create an independent GitHub client, not an already-cached sync reader.
+    // The new D72 identity, D71 Git blob, D70 immutable tree, D69 plaintext
+    // and D68 metadata checks all have to succeed against real REST responses.
+    const reader = new GitHubClient(config);
+    const before = reader.transportMetricsSnapshot;
+    const inspected = await verifyGitHubReencryptionSource({
+      github: reader,
+      expectedRepoId: repoId(config),
+      expectedBranch: config.branch,
+      passphrase: "v4-real-github-e2e",
+    });
+    const after = reader.transportMetricsSnapshot;
+    assert.equal(inspected.integrityScope, "all-live-objects");
+    assert.equal(inspected.pinnedSourceCommitSha, publishedSha);
+    assert.equal(inspected.verifiedFileCount, source.vault.files.size);
+    assert.ok(inspected.verifiedRemoteObjectCount > 0);
+    assert.equal(inspected.totalVerifiedPlaintextBytes,
+      [...source.vault.files.values()].reduce((sum, file) => sum + BigInt(file.bytes.byteLength), BigInt(0)).toString());
+    assert.equal(after.mutations, before.mutations,
+      "Re-encryption source verification must NEVER mutate the remote Git repository");
+    assert.equal((await reader.getGitRef()).sha, publishedSha,
+      "Read-only verification changed the published Git branch");
+    console.log(JSON.stringify({
+      stage: "D73_READ_ONLY_REENCRYPTION_SOURCE_VERIFIED",
+      branch: config.branch,
+      sourceSha: publishedSha,
+      files: inspected.verifiedFileCount,
+      remoteObjects: inspected.verifiedRemoteObjectCount,
+      plaintextBytes: inspected.totalVerifiedPlaintextBytes,
+      gitReadRequests: after.requests,
+      gitMutations: after.mutations - before.mutations,
+    }));
+  });
+}
+
 async function runBaselineScenario(config: GitHubConfig, mode: V4StorageMode): Promise<void> {
   await runScenario(config, mode, "baseline-edge-path-roundtrip", async ({ context, device }) => {
     const source = device("device-a");
@@ -934,6 +984,10 @@ after(async () => {
 });
 
 test("V4 real GitHub strict CAS survives realistic superuser and two-device scenarios", { timeout: 900_000 }, async () => {
+  if (process.env.GITHUB_E2E_ONLY_SCENARIO === "readonly-rekey-encrypted") {
+    await runReencryptionReadOnlyScenario(config);
+    return;
+  }
   if (process.env.GITHUB_E2E_ONLY_SCENARIO === "delete-recreate-plaintext"
     || process.env.GITHUB_E2E_ONLY_SCENARIO === "delete-recreate-encrypted"
     || process.env.GITHUB_E2E_ONLY_SCENARIO === "diagnostic-missing-plaintext") {
@@ -955,4 +1009,7 @@ test("V4 real GitHub strict CAS survives realistic superuser and two-device scen
     await runBinaryOverwriteScenario(config, mode);
   }
   await runControlledRaceScenario(config);
+  // Permanent manual full-suite coverage for the read-only rekey source gate.
+  // Each runScenario resets only the independently approved disposable branch.
+  await runReencryptionReadOnlyScenario(config);
 });
