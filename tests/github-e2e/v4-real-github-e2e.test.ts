@@ -18,6 +18,7 @@ import {
   resolveGitHubE2ETarget,
 } from "./support/target-safety";
 import { observeV4PrePublishHeadNull } from "./support/pre-publish-head-null-evidence";
+import { inspectImmutableMissingObject } from "./support/immutable-missing-evidence";
 
 const encoder = new TextEncoder();
 
@@ -86,7 +87,7 @@ async function fetchWithRetry(url: string, init: RequestInit, attempts = 3): Pro
   return response!;
 }
 
-async function githubRequest(config: GitHubConfig, apiPath: string, init: RequestInit = {}): Promise<Response> {
+async function githubRequest(config: GitHubConfig, apiPath: string, init: RequestInit = {}, attempts = 3): Promise<Response> {
   return fetchWithRetry(`https://api.github.com/repos/${config.owner}/${config.repo}${apiPath}`, {
     ...init,
     headers: {
@@ -96,7 +97,7 @@ async function githubRequest(config: GitHubConfig, apiPath: string, init: Reques
       "X-GitHub-Api-Version": "2026-03-10",
       ...(init.headers ?? {}),
     },
-  });
+  }, attempts);
 }
 
 async function expectJson<T>(response: Response, successStatuses: readonly number[], action: string): Promise<T> {
@@ -304,31 +305,29 @@ function createDevice(name: string, config: GitHubConfig, context: ModeContext, 
     if (path !== "Notes/reborn.md") return requested;
     return requested.then(file => {
       if (file) return file;
-      // For a rare missing read only: independently inspect the *same*
-      // immutable commit's tree. Do not turn an error into a retry or success.
+      // On the same rare null result, inspect each immutable Git level
+      // independently. Never turn the original miss into success or retry.
       return (async () => {
-        const treeEvidence: Record<string, unknown> = {};
-        if (ref && /^[0-9a-f]{40}$/iu.test(ref)) {
-          try {
-            const commit = await client.getGitCommit(ref);
-            const tree = await client.getTreeAt(commit.treeSha, true);
-            treeEvidence["commitTreeSha"] = commit.treeSha;
-            treeEvidence["treeTruncated"] = tree.truncated;
-            treeEvidence["treeResponseSha"] = tree.sha;
-            treeEvidence["matchingNodes"] = tree.tree
-              .filter(node => node.path === path)
-              .map(node => ({ sha: node.sha, type: node.type, mode: node.mode }));
-          } catch (error) {
-            treeEvidence["independentEvidenceError"] = error instanceof Error ? error.message : String(error);
-          }
-        }
-        console.error(JSON.stringify({
-          kind: "delete-recreate-missing-object-evidence", device: name,
-          refRequested: ref ?? null, localIndexCommitSha: index.remoteCommitSha,
-          localRecordFileIds: Object.values(index.shards).flatMap(shard => Object.values(shard.records))
-            .filter(record => record.path === path && !record.deleted).map(record => record.fileId),
-          ...treeEvidence,
-        }));
+        try {
+          const readOnly = async (kind: "commit" | "tree", sha: string) => {
+            const response = await githubRequest(config, `/git/${kind === "commit" ? "commits" : "trees"}/${sha}`, {}, 1);
+            return response.status === 200
+              ? { status: response.status, json: await response.json() as unknown }
+              : { status: response.status };
+          };
+          const evidence = await inspectImmutableMissingObject(path, ref, {
+            getCommit: sha => readOnly("commit", sha),
+            getTree: sha => readOnly("tree", sha),
+          });
+          console.error(JSON.stringify({
+            ...evidence,
+            device: name,
+            localIndexCommitSha: /^[0-9a-f]{40}$/u.test(index.remoteCommitSha ?? "")
+              ? index.remoteCommitSha : null,
+            localRecordFileIds: Object.values(index.shards).flatMap(shard => Object.values(shard.records))
+              .filter(record => record.path === path && !record.deleted).map(record => record.fileId),
+          }));
+        } catch { /* Diagnostics must not replace the original missing result. */ }
         return file;
       })();
     });
