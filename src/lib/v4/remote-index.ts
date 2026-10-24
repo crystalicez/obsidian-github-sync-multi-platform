@@ -1,4 +1,4 @@
-import { bytesToUtf8, sha256Hex, utf8ToBytes } from "../bytes"
+import { bytesToUtf8, fromBase64Url, sha256Hex, toBase64Url, utf8ToBytes } from "../bytes"
 import { decryptV4Payload, encryptV4Payload, type V4Keyring } from "./crypto"
 import { buildV4PartPaths } from "./large-files"
 import { V4_MAX_PBKDF2_ITERATIONS } from "./kdf-policy"
@@ -176,12 +176,35 @@ export function encodeV4RemoteConfig(config: V4RemoteConfig): Uint8Array {
   return bytes
 }
 
+const V4_MAX_KDF_SALT_BYTES = 64
+
+function assertCanonicalKdfSalt(salt: unknown): asserts salt is string {
+  // Bound the encoded representation before attempting any decoding or allocation.
+  if (typeof salt !== "string" || salt.length < 2 || salt.length > 86
+    || !/^[A-Za-z0-9_-]+$/u.test(salt)) {
+    throw new Error("Invalid V4 remote KDF salt.")
+  }
+  let decoded: Uint8Array
+  try {
+    decoded = fromBase64Url(salt)
+  } catch {
+    throw new Error("Invalid V4 remote KDF salt.")
+  }
+  if (decoded.byteLength < 1 || decoded.byteLength > V4_MAX_KDF_SALT_BYTES
+    || toBase64Url(decoded) !== salt) {
+    throw new Error("Invalid V4 remote KDF salt.")
+  }
+}
+
 export function decodeV4RemoteConfig(bytes: Uint8Array): V4RemoteConfig {
   assertV4MetadataBytes(bytes, "config")
   const config = JSON.parse(bytesToUtf8(bytes)) as V4RemoteConfig
   if (!config || typeof config !== "object" || Array.isArray(config)
     || config.formatVersion !== 4 || (config.mode !== "plaintext" && config.mode !== "encrypted")) {
     throw new Error("Unsupported remote format. Force Push is required to initialize V4.")
+  }
+  if (typeof config.repoId !== "string" || config.repoId.length === 0) {
+    throw new Error("Invalid V4 remote repository identity.")
   }
   if (config.pathLayout !== undefined && config.pathLayout !== "plaintext-v1" && config.pathLayout !== "opaque-stable-v1") {
     throw new Error("Unsupported V4 path layout.")
@@ -195,11 +218,10 @@ export function decodeV4RemoteConfig(bytes: Uint8Array): V4RemoteConfig {
   if (config.kdfParams !== undefined) {
     const params = config.kdfParams
     if (!params || typeof params !== "object" || Array.isArray(params)
-      || !Number.isSafeInteger(params.iterations) || params.iterations < 1 || params.iterations > V4_MAX_PBKDF2_ITERATIONS
-      || typeof params.salt !== "string" || !/^[A-Za-z0-9_-]+$/u.test(params.salt)
-      || params.salt.length % 4 === 1) {
+      || !Number.isSafeInteger(params.iterations) || params.iterations < 1 || params.iterations > V4_MAX_PBKDF2_ITERATIONS) {
       throw new Error("Invalid V4 remote KDF parameters.")
     }
+    assertCanonicalKdfSalt(params.salt)
   }
   return config
 }

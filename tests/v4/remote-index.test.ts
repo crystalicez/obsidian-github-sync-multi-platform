@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { sha256Hex } from "../../src/lib/bytes";
+import { sha256Hex, toBase64Url } from "../../src/lib/bytes";
 import { deriveV4Keyring } from "../../src/lib/v4/crypto";
 import { assertV4RemoteRecordSet, buildV4RemoteMetadata, decodeV4RemoteConfig, decodeV4RemoteHead, decodeV4RemoteShard, encodeV4RemoteConfig } from "../../src/lib/v4/remote-index";
 import { expectedV4PathLayout, V4_FORMAT_VERSION, type V4RemoteConfig, type V4RemoteHead } from "../../src/lib/v4/protocol-types";
@@ -26,6 +26,44 @@ test("v4 remote config decoder rejects an unknown path layout", () => {
 test("v4 remote config decoder rejects an explicitly serialized legacy sentinel", () => {
   const bytes = enc(JSON.stringify({ formatVersion: V4_FORMAT_VERSION, mode: "encrypted", repoId: "o/r#main", pathLayout: "encrypted-folders-v0" }));
   assert.throws(() => decodeV4RemoteConfig(bytes), /Unsupported V4 path layout/u);
+});
+
+test("D64 remote KDF salt accepts canonical 64-byte input but rejects unsafe or aliased encodings", () => {
+  const base = {
+    formatVersion: 4, mode: "encrypted", repoId: "o/r#main",
+    pathLayout: "opaque-stable-v1", algorithm: "AES-GCM", kdf: "PBKDF2-SHA-256",
+    kdfParams: { iterations: 600_000, salt: "c2FsdA" },
+  };
+  const maxSalt = toBase64Url(new Uint8Array(64).fill(0x5a));
+  assert.equal(decodeV4RemoteConfig(enc(JSON.stringify({
+    ...base, kdfParams: { ...base.kdfParams, salt: maxSalt },
+  }))).kdfParams?.salt, maxSalt);
+  for (const [label, salt] of [
+    ["65-byte salt", toBase64Url(new Uint8Array(65).fill(0x5a))],
+    ["non-canonical trailing bits", "c2FsdB"],
+    ["non-canonical single-byte salt", "AB"],
+    ["long-but-metadata-bounded remote salt", "A".repeat(1_000)],
+  ] as const) {
+    assert.throws(
+      () => decodeV4RemoteConfig(enc(JSON.stringify({
+        ...base, kdfParams: { ...base.kdfParams, salt },
+      }))),
+      /KDF|salt|canonical/i,
+      label,
+    );
+  }
+});
+
+test("D64 remote config refuses missing or incorrectly typed repository identity", () => {
+  for (const repoId of [undefined, null, "", 0, [], { name: "owner/repo#main" }]) {
+    assert.throws(
+      () => decodeV4RemoteConfig(enc(JSON.stringify({
+        formatVersion: 4, mode: "plaintext", repoId,
+      }))),
+      /repository|identity|config/i,
+      String(repoId),
+    );
+  }
 });
 
 test("D62 remote KDF fields reject malformed types and salt before key derivation", () => {
