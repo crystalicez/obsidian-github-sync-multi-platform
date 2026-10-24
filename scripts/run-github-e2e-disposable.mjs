@@ -13,12 +13,13 @@ const allowed = new Map([
   ["rename-plaintext", "rename-vs-stale-edit-plaintext"],
   ["rename-encrypted", "rename-vs-stale-edit-encrypted"],
   ["delete-plaintext", "delete-recreate-plaintext"],
+  ["diagnostic-missing-plaintext", "diagnostic-missing-plaintext"],
   ["delete-encrypted", "delete-recreate-encrypted"],
   ["full", null],
 ]);
 const mode = process.argv[2];
 if (!allowed.has(mode) || process.argv.length !== 3) {
-  console.error("Usage: node scripts/run-github-e2e-disposable.mjs rename-plaintext|rename-encrypted|delete-plaintext|delete-encrypted|full");
+  console.error("Usage: node scripts/run-github-e2e-disposable.mjs rename-plaintext|rename-encrypted|delete-plaintext|delete-encrypted|diagnostic-missing-plaintext|full");
   process.exitCode = 2;
 } else {
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));

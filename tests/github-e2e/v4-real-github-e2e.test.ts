@@ -10,7 +10,7 @@ import { createEmptyV4LocalIndex, type V4LocalIndex } from "../../src/lib/v4/loc
 import { isV4PublicationRaceError } from "../../src/lib/v4/publication-race";
 import { expectedV4PathLayout, V4_FORMAT_VERSION, type V4RemoteConfig, type V4StorageMode } from "../../src/lib/v4/protocol-types";
 import { V4StorageCodec } from "../../src/lib/v4/storage-codec";
-import { V4SyncSession, type V4SessionVault, type V4SyncRunState } from "../../src/lib/v4/sync-session";
+import { V4RemoteObjectMissingError, V4SyncSession, type V4SessionVault, type V4SyncRunState } from "../../src/lib/v4/sync-session";
 import {
   encodeGitHubE2ERefPath,
   readGitHubE2ETargetEnvironment,
@@ -47,6 +47,14 @@ interface InterferenceState {
 }
 
 const interference: InterferenceState = { armed: false, fired: false };
+
+// Test-only one-shot injection. No production request, response or Sync policy is changed.
+interface ControlledMissingObjectFault {
+  expectedCommit: string;
+  fired: boolean;
+  evidenceOutcome?: string;
+}
+const missingObjectFaults = new WeakMap<GitHubClient, ControlledMissingObjectFault>();
 
 function branchPath(config: GitHubConfig): string {
   return encodeGitHubE2ERefPath(config.branch);
@@ -304,6 +312,13 @@ function createDevice(name: string, config: GitHubConfig, context: ModeContext, 
     // Do not add Promise scheduling to unrelated request paths in the race test.
     if (path !== "Notes/reborn.md") return requested;
     return requested.then(file => {
+      const fault = missingObjectFaults.get(client);
+      if (file && fault && !fault.fired && ref === fault.expectedCommit) {
+        // Simulate an intermittent Contents+immutable read miss AFTER the real
+        // client has successfully read the exact published bytes.
+        fault.fired = true;
+        file = null;
+      }
       if (file) return file;
       // On the same rare null result, inspect each immutable Git level
       // independently. Never turn the original miss into success or retry.
@@ -319,6 +334,7 @@ function createDevice(name: string, config: GitHubConfig, context: ModeContext, 
             getCommit: sha => readOnly("commit", sha),
             getTree: sha => readOnly("tree", sha),
           });
+          if (fault?.fired && ref === fault.expectedCommit) fault.evidenceOutcome = evidence.outcome;
           console.error(JSON.stringify({
             ...evidence,
             device: name,
@@ -701,7 +717,7 @@ async function runRenameVsEditScenario(config: GitHubConfig, mode: V4StorageMode
   });
 }
 
-async function runDeleteRecreateScenario(config: GitHubConfig, mode: V4StorageMode): Promise<void> {
+async function runDeleteRecreateScenario(config: GitHubConfig, mode: V4StorageMode, controlledMissing = false): Promise<void> {
   await runScenario(config, mode, "two-device-delete-recreate-identity-break", async ({ context, device }) => {
     const a = device("device-a");
     a.vault.set("Notes/reborn.md", bytes("generation-one\n"), 1);
@@ -749,6 +765,47 @@ async function runDeleteRecreateScenario(config: GitHubConfig, mode: V4StorageMo
     });
     assert.deepEqual(publishedPlaintext, bytes("generation-two\n"),
       "delete/recreate decoded published object disagrees with local new generation");
+
+    if (controlledMissing) {
+      assert.equal(mode, "plaintext", "controlled fault must use the synthetic plaintext scenario");
+      const beforeBytes = b.vault.files.get("Notes/reborn.md")?.bytes.slice();
+      assert.ok(beforeBytes, "peer must have the original generation before fault injection");
+      const beforeHead = b.index.remoteCommitSha;
+      const beforeMutations = b.client.transportMetricsSnapshot.mutations;
+      const fault: ControlledMissingObjectFault = { expectedCommit: publishedSha, fired: false };
+      missingObjectFaults.set(b.client, fault);
+      try {
+        await assert.rejects(
+          () => b.session.sync({ operation: "normal", allowThresholdOverride: false }),
+          (error: unknown) => error instanceof V4RemoteObjectMissingError
+            && error.remoteCommitSha === publishedSha
+            && error.remotePath === "Notes/reborn.md"
+            && error.fileId === newRecord.fileId,
+          "a controlled missing read must remain a typed, fail-closed Sync error",
+        );
+        assert.equal(fault.fired, true, "fault did not intercept the exact immutable peer read");
+        assert.equal(fault.evidenceOutcome, "blob-present-in-tree",
+          "independent read-only immutable Git evidence did not see the published blob");
+        assert.deepEqual(b.vault.files.get("Notes/reborn.md")?.bytes, beforeBytes,
+          "failed pull altered the peer's original user note");
+        assert.equal(b.index.remoteCommitSha, beforeHead,
+          "failed pull advanced the peer's persisted remote base");
+        assert.equal(b.client.transportMetricsSnapshot.mutations, beforeMutations,
+          "failed pull unexpectedly mutated GitHub");
+        console.log(JSON.stringify({
+          kind: "synthetic-missing-object-fail-closed-proof",
+          injected: fault.fired,
+          independentTreeOutcome: fault.evidenceOutcome,
+          originalBytesRetained: true,
+          localBaseUnchanged: true,
+          peerRemoteMutations: 0,
+          originalErrorPreserved: true,
+        }));
+      } finally {
+        missingObjectFaults.delete(b.client);
+      }
+      return;
+    }
 
     await b.session.sync({ operation: "normal", allowThresholdOverride: false });
     assert.deepEqual(b.vault.files.get("Notes/reborn.md")?.bytes, bytes("generation-two\n"));
@@ -841,8 +898,9 @@ after(async () => {
 
 test("V4 real GitHub strict CAS survives realistic superuser and two-device scenarios", { timeout: 900_000 }, async () => {
   if (process.env.GITHUB_E2E_ONLY_SCENARIO === "delete-recreate-plaintext"
-    || process.env.GITHUB_E2E_ONLY_SCENARIO === "delete-recreate-encrypted") {
-    await runDeleteRecreateScenario(config, process.env.GITHUB_E2E_ONLY_SCENARIO === "delete-recreate-encrypted" ? "encrypted" : "plaintext");
+    || process.env.GITHUB_E2E_ONLY_SCENARIO === "delete-recreate-encrypted"
+    || process.env.GITHUB_E2E_ONLY_SCENARIO === "diagnostic-missing-plaintext") {
+    await runDeleteRecreateScenario(config, process.env.GITHUB_E2E_ONLY_SCENARIO === "delete-recreate-encrypted" ? "encrypted" : "plaintext", process.env.GITHUB_E2E_ONLY_SCENARIO === "diagnostic-missing-plaintext");
     return;
   }
   if (process.env.GITHUB_E2E_ONLY_SCENARIO === "rename-vs-stale-edit-plaintext"
