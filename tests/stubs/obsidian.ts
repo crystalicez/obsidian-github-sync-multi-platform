@@ -185,10 +185,15 @@ export class PluginSettingTab {
   }
 }
 
+export const settingSliderControls: Array<{
+  min: number; max: number; step: number; value: number;
+  change?: (value: number) => void;
+}> = [];
+
 export class Setting {
-  constructor(_container: unknown) {}
-  setName(_name: string) { return this; }
-  setDesc(_desc: string) { return this; }
+  constructor(private readonly container: ElementStub) {}
+  setName(name: string) { this.container.createEl("span", { text: name }); return this; }
+  setDesc(desc: string) { this.container.createEl("span", { text: desc }); return this; }
   setHeading() { return this; }
   setClass(_className: string) { return this; }
   addToggle(_cb: unknown) { return this; }
@@ -196,6 +201,25 @@ export class Setting {
   addTextArea(_cb: unknown) { return this; }
   addDropdown(_cb: unknown) { return this; }
   addButton(_cb: unknown) { return this; }
+  addSlider(cb: (slider: {
+    setLimits(min: number, max: number, step: number): unknown;
+    setValue(value: number): unknown;
+    setDynamicTooltip(): unknown;
+    onChange(handler: (value: number) => void): unknown;
+  }) => void) {
+    const state: typeof settingSliderControls[number] = { min: 0, max: 0, step: 1, value: 0 };
+    settingSliderControls.push(state);
+    const slider = {
+      setLimits(min: number, max: number, step: number) {
+        state.min = min; state.max = max; state.step = step; return this;
+      },
+      setValue(value: number) { state.value = value; return this; },
+      setDynamicTooltip() { return this; },
+      onChange(handler: (value: number) => void) { state.change = handler; return this; },
+    };
+    cb(slider);
+    return this;
+  }
 }
 
 export const Platform = { isDesktopApp: true, isMacOS: false };

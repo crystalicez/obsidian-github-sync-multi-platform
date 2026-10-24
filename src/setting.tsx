@@ -79,6 +79,7 @@ export class SettingTab extends PluginSettingTab {
   plugin: FastSync
   tempSettings: PluginSettings | null = null
   bannerEl: HTMLElement | null = null
+  private settingsSavePending = false
 
   constructor(app: App, plugin: FastSync) {
     super(app, plugin)
@@ -101,19 +102,39 @@ export class SettingTab extends PluginSettingTab {
       
       const btnContainer = banner.createDiv("github-sync-settings-dirty-buttons")
       const saveBtn = btnContainer.createEl("button", { text: "Save changes", cls: "mod-cta" })
+      saveBtn.disabled = this.settingsSavePending
       saveBtn.onclick = async () => {
-        if (this.tempSettings) {
-          this.plugin.settings = JSON.parse(JSON.stringify(this.tempSettings))
-          await this.plugin.saveSettings()
-          this.plugin.initGitHubClient()
+        if (!this.tempSettings || this.settingsSavePending) return
+        const draft = this.tempSettings
+        const draftSnapshot = JSON.stringify(draft)
+        const nextSettings = JSON.parse(draftSnapshot) as PluginSettings
+        this.settingsSavePending = true
+        saveBtn.disabled = true
+        discardBtn.disabled = true
+        try {
+          await this.plugin.saveSettings(nextSettings)
           this.plugin.updateStatusBar()
           new Notice("GitHub Sync: Settings saved")
-          this.display()
+          // Preserve edits made while an asynchronous save was in progress.
+          if (this.tempSettings === draft) {
+            if (JSON.stringify(draft) === draftSnapshot) {
+              this.tempSettings = JSON.parse(JSON.stringify(this.plugin.settings)) as PluginSettings
+            }
+            this.display()
+          }
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error)
+          new Notice(`GitHub Sync: Settings not saved: ${message}`)
+        } finally {
+          this.settingsSavePending = false
+          this.updateDirtyState()
         }
       }
 
       const discardBtn = btnContainer.createEl("button", { text: "Discard", cls: "mod-warning" })
+      discardBtn.disabled = this.settingsSavePending
       discardBtn.onclick = () => {
+        if (this.settingsSavePending) return
         this.tempSettings = JSON.parse(JSON.stringify(this.plugin.settings))
         this.display()
       }

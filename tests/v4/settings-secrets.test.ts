@@ -2,9 +2,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { readFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
-import { modalButtons, Notice, resetModalTestState, TFile } from "obsidian";
+import { modalButtons, Notice, resetModalTestState, settingSliderControls, TFile } from "obsidian";
 
-import { DEFAULT_SETTINGS } from "../../src/setting";
+import { DEFAULT_SETTINGS, SettingTab } from "../../src/setting";
+import FastSync from "../../src/main";
 import type { GitHubCreateTreeEntry } from "../../src/lib/github-git-types";
 import { deriveV4Keyring } from "../../src/lib/v4/crypto";
 import { publishV4TreeChanges } from "../../src/lib/v4/git-tree-writer";
@@ -40,6 +41,193 @@ test("D63 configurable new encrypted repository KDF does not rekey existing repo
   assert.deepEqual(selectV4RuntimeConfig(existing, "encrypted", "o/r#main", 1_200_000).kdfParams,
     existing.kdfParams, "settings changes must never rewrite KDF params of an initialized remote");
   assert.throws(() => selectV4RuntimeConfig(null, "encrypted", "o/r#main", 1_200_001), /KDF|iterations|maximum/i);
+});
+
+test("D65 encrypted settings render a bounded KDF control and never promise automatic rekey", () => {
+  settingSliderControls.length = 0;
+  const tab = new SettingTab({} as never, {
+    settings: { ...DEFAULT_SETTINGS, encryptionMode: "encrypted" },
+    manifest: { version: "1.0.8" }, clipboardReadTip: "",
+  } as never);
+  tab.display();
+  const text = tab.containerEl.flattenText();
+  assert.match(text, /PBKDF2 iterations for new encrypted repositories/u);
+  assert.match(text, /600,000 by default; maximum 1,200,000/u);
+  assert.match(text, /Existing encrypted repositories always use their remote KDF settings/u);
+  assert.match(text, /does NOT re-encrypt or migrate existing data/u);
+  assert.equal(settingSliderControls.length, 1);
+  const slider = settingSliderControls[0]!;
+  assert.deepEqual([slider.min, slider.max, slider.step, slider.value], [600_000, 1_200_000, 100_000, 600_000]);
+  slider.change?.(900_000);
+  assert.equal(tab.tempSettings?.newVaultKdfIterations, 900_000);
+  assert.equal(tab.isDirty(), true);
+});
+
+test("D65 Settings Save must not publish draft KDF settings until persistence completes", () => {
+  settingSliderControls.length = 0;
+  modalButtons.length = 0;
+  const original = { ...DEFAULT_SETTINGS, encryptionMode: "encrypted" as const };
+  let releaseSave: (() => void) | undefined;
+  const saveBarrier = new Promise<void>(resolve => { releaseSave = resolve; });
+  let saveCalls = 0;
+  const plugin = {
+    settings: original,
+    manifest: { version: "1.0.8" },
+    clipboardReadTip: "",
+    saveSettings: async (_next?: unknown) => { saveCalls++; await saveBarrier; },
+    updateStatusBar() {},
+    initGitHubClient() {},
+  };
+  const tab = new SettingTab({} as never, plugin as never);
+  tab.display();
+  settingSliderControls[0]?.change?.(900_000);
+  const save = modalButtons.find(b => b.text === "Save changes");
+  assert.ok(save, "Settings must expose Save changes after a KDF edit");
+  save.click();
+  save.click();
+  try {
+    assert.equal(saveCalls, 1, "double Save click must not enqueue a second persistence attempt");
+    assert.equal(plugin.settings.newVaultKdfIterations, 600_000,
+      "a pending disk write cannot publish an uncommitted KDF configuration");
+  } finally {
+    releaseSave?.();
+  }
+});
+
+test("D65 core settings save never exposes a draft or new key before durable storage succeeds", async () => {
+  const plugin = new FastSync();
+  const previous = { ...DEFAULT_SETTINGS, encryptionMode: "encrypted" as const, encryptionPassphrase: "old-pass", githubToken: "old-token",
+    githubTokenSecretId: "github-token-existing", encryptionPassphraseSecretId: "encryption-passphrase-existing" };
+  plugin.settings = previous;
+  const stored = new Map<string, string>([
+    [previous.githubTokenSecretId, previous.githubToken],
+    [previous.encryptionPassphraseSecretId, previous.encryptionPassphrase],
+  ]);
+  plugin.app = { secretStorage: {
+    getSecret(id: string) { return stored.get(id) ?? null; },
+    setSecret(id: string, secret: string) { stored.set(id, secret); },
+  } } as never;
+  let invalidations = 0;
+  plugin.v4Runtime = { credentialsChanged() { invalidations++; } } as never;
+  plugin.initGitHubClient = () => {};
+  plugin.registerScheduledSync = () => {};
+  plugin.updateRibbonIcon = () => {};
+  let finishWrite: (() => void) | undefined;
+  const barrier = new Promise<void>(resolve => { finishWrite = resolve; });
+  let written: unknown;
+  (plugin as unknown as { saveData(data: unknown): Promise<void> }).saveData = async data => {
+    written = data;
+    await barrier;
+  };
+  const draft = { ...previous, encryptionPassphrase: "new-pass", newVaultKdfIterations: 900_000 };
+  const running = plugin.saveSettings(draft);
+  await assert.rejects(
+    () => plugin.saveSettings({ ...draft, newVaultKdfIterations: 1_200_000 }),
+    /already in progress/u,
+  );
+  assert.equal(plugin.settings.encryptionPassphrase, "old-pass", "new passphrase must not appear before durable settings write");
+  assert.equal(stored.get(previous.encryptionPassphraseSecretId), "old-pass", "never overwrite the active secret ID");
+  assert.equal(invalidations, 0, "do not invalidate the running keyring before durable save");
+  finishWrite?.();
+  await running;
+  assert.equal(plugin.settings.encryptionPassphrase, "new-pass");
+  assert.equal(plugin.settings.newVaultKdfIterations, 900_000);
+  assert.notEqual(plugin.settings.encryptionPassphraseSecretId, previous.encryptionPassphraseSecretId);
+  assert.equal(stored.get(plugin.settings.encryptionPassphraseSecretId), "new-pass");
+  assert.deepEqual((written as { settings: { newVaultKdfIterations: number } }).settings.newVaultKdfIterations, 900_000);
+  assert.equal(invalidations, 1);
+});
+
+test("D65 failed settings persistence keeps previous settings and active credentials", async () => {
+  const plugin = new FastSync();
+  const previous = { ...DEFAULT_SETTINGS, githubToken: "old-token", encryptionPassphrase: "old-pass",
+    githubTokenSecretId: "github-token-existing", encryptionPassphraseSecretId: "encryption-passphrase-existing" };
+  plugin.settings = previous;
+  const stored = new Map<string, string>([
+    [previous.githubTokenSecretId, previous.githubToken],
+    [previous.encryptionPassphraseSecretId, previous.encryptionPassphrase],
+  ]);
+  plugin.app = { secretStorage: {
+    getSecret(id: string) { return stored.get(id) ?? null; },
+    setSecret(id: string, secret: string) { stored.set(id, secret); },
+  } } as never;
+  let invalidations = 0;
+  plugin.v4Runtime = { credentialsChanged() { invalidations++; } } as never;
+  plugin.initGitHubClient = () => {};
+  plugin.registerScheduledSync = () => {};
+  plugin.updateRibbonIcon = () => {};
+  (plugin as unknown as { saveData(data: unknown): Promise<void> }).saveData = async () => {
+    throw new Error("synthetic disk failure");
+  };
+  await assert.rejects(() => plugin.saveSettings({
+    ...previous, githubToken: "rotated-token", encryptionPassphrase: "rotated-pass",
+  }), /synthetic disk failure/u);
+  assert.deepEqual(plugin.settings, previous);
+  assert.equal(stored.get(previous.githubTokenSecretId), "old-token");
+  assert.equal(stored.get(previous.encryptionPassphraseSecretId), "old-pass");
+  assert.equal(invalidations, 0);
+  assert.ok([...stored.values()].includes("rotated-pass"),
+    "an ambiguous rejected write must preserve a candidate secret that could already be referenced on disk");
+});
+
+test("D65 ambiguous persisted-save acknowledgement keeps the authenticated replacement secret", async () => {
+  const plugin = new FastSync();
+  const original = { ...DEFAULT_SETTINGS, encryptionMode: "encrypted" as const,
+    encryptionPassphrase: "original", encryptionPassphraseSecretId: "encryption-passphrase-original",
+    githubTokenSecretId: "github-token-original" };
+  plugin.settings = original;
+  const stored = new Map<string, string>([[original.encryptionPassphraseSecretId, "original"]]);
+  plugin.app = { secretStorage: {
+    getSecret(id: string) { return stored.get(id) ?? null; },
+    setSecret(id: string, value: string) { stored.set(id, value); },
+  } } as never;
+  plugin.v4Runtime = { credentialsChanged() {} } as never;
+  plugin.initGitHubClient = () => {};
+  plugin.registerScheduledSync = () => {};
+  plugin.updateRibbonIcon = () => {};
+  let durableSettings: unknown;
+  (plugin as unknown as { saveData(value: unknown): Promise<void> }).saveData = async value => {
+    durableSettings = structuredClone(value);
+    throw new Error("synthetic lost write acknowledgement");
+  };
+  (plugin as unknown as { loadData(): Promise<unknown> }).loadData = async () => durableSettings;
+  await plugin.saveSettings({ ...original, encryptionPassphrase: "replacement" });
+  assert.equal(plugin.settings.encryptionPassphrase, "replacement");
+  assert.notEqual(plugin.settings.encryptionPassphraseSecretId, original.encryptionPassphraseSecretId);
+  assert.equal(stored.get(plugin.settings.encryptionPassphraseSecretId), "replacement",
+    "committed replacement secret must survive even when saveData rejects");
+});
+
+test("D65 failed UI save reports failure and retains its unsaved KDF draft", async () => {
+  settingSliderControls.length = 0;
+  modalButtons.length = 0;
+  const previous = { ...DEFAULT_SETTINGS, encryptionMode: "encrypted" as const };
+  const plugin = {
+    settings: previous, manifest: { version: "1.0.8" }, clipboardReadTip: "",
+    saveSettings: async () => { throw new Error("synthetic inaccessible settings storage"); },
+    updateStatusBar() {},
+  };
+  const tab = new SettingTab({} as never, plugin as never);
+  tab.display();
+  settingSliderControls[0]?.change?.(900_000);
+  const noticeOffset = Notice.messages.length;
+  const save = modalButtons.find(b => b.text === "Save changes");
+  assert.ok(save);
+  save.click();
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(plugin.settings.newVaultKdfIterations, 600_000);
+  assert.equal(tab.tempSettings?.newVaultKdfIterations, 900_000);
+  assert.equal(tab.isDirty(), true);
+  assert.ok(Notice.messages.slice(noticeOffset).some(s => s.includes("Settings not saved")));
+});
+
+test("D65 native acceptance harness stages settings instead of mutating live connection before save", async () => {
+  for (const filename of ["scripts/run-obsidian-live-github-ui.mjs", "scripts/obsidian-live-ui-peer.mjs"]) {
+    const source = await readFile(filename, "utf8");
+    assert.doesNotMatch(source, /p\.settings\s*=\s*\{\.\.\.p\.settings/u, filename);
+    assert.match(source, /await p\.saveSettings\(nextSettings\)/u, filename);
+  }
 });
 
 test("v4 encrypted-mode settings copy promises stable opaque paths without readable folders", async () => {
@@ -947,7 +1135,7 @@ test("v4 runtime progress stays out of plugin data, local index files, and the r
   const mainSource = await readFile("src/main.ts", "utf8");
   assert.doesNotMatch(mainSource, /\bsyncProgress\b/u);
   assert.match(mainSource, /v4Runtime\?\.progressSnapshot\s*\?\?\s*createIdleV4Progress/u);
-  assert.match(mainSource, /async persistData\(\)[\s\S]*?saveData\(\{[\s\S]*?settings:\s*sanitizeV4SettingsForPersistence\(this\.settings\)/u);
+  assert.match(mainSource, /async persistData\([^)]*\)[\s\S]*?saveData\(\{[\s\S]*?settings:\s*sanitizeV4SettingsForPersistence\(settings\)/u);
   assert.match(mainSource, /startupSyncTimeout:\s*number\s*\|\s*null/u);
   assert.match(mainSource, /if \(this\.startupSyncTimeout !== null\) window\.clearTimeout\(this\.startupSyncTimeout\)/u);
   assert.match(mainSource, /onunload\(\)[\s\S]*?clearTimeout\(this\.startupSyncTimeout\)/u);
@@ -1274,5 +1462,5 @@ test("v4 runtime keyring cache reuses one derived keyring until credential gener
 
 test("main settings save invalidates the runtime credential generation before future sync work", async () => {
   const source = await readFile("src/main.ts", "utf8")
-  assert.match(source, /async saveSettings\(\)[\s\S]*?v4Runtime\?\.credentialsChanged\(\)/u)
+  assert.match(source, /async saveSettings\([^)]*\)[\s\S]*?v4Runtime\?\.credentialsChanged\(\)/u)
 })

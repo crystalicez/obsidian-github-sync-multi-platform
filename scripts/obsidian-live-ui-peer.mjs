@@ -108,13 +108,13 @@ export async function restoreEncryptedToSecondObsidian({
     throw Error("Nonempty second-vault GitHub settings");
    if(app.vault.getAbstractFileByPath("UI-smoke.md"))
     throw Error("Second vault unexpectedly contained the sample note before restore");
-   p.settings = {...p.settings,
+   const nextSettings = {...p.settings,
     githubOwner:data.owner,githubRepo:data.repo,githubBranch:data.branch,githubToken:data.token,
     encryptionMode:"encrypted",encryptionPassphrase:data.passphrase,
     syncEnabled:true,syncOnStartup:false,syncOnLocalChange:false,scheduledSyncEnabled:false,
     syncObsidianConfig:false,syncBookmarks:false,syncPlugins:false,
    };
-   await p.saveSettings();
+   await p.saveSettings(nextSettings);
    const started=performance.now();
    try{
     await p.v4Runtime.forcePull(false);

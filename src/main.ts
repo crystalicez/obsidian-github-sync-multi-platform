@@ -31,6 +31,7 @@ export default class FastSync extends Plugin {
   scheduledSyncTimer: number | null = null
   startupSyncTimeout: number | null = null
   secretsMigrated: boolean = false
+  private settingsSaveInProgress = false
   private unloaded = false
   private statusDisplaySignature: string | undefined
   private cooldownStore?: V4RateLimitCooldownStore
@@ -210,9 +211,9 @@ export default class FastSync extends Plugin {
   }
 
   /** Persist only current V4 settings; the V4 local index uses its own sharded adapter storage. */
-  async persistData() {
+  async persistData(settings: PluginSettings = this.settings) {
     await this.saveData({
-      settings: sanitizeV4SettingsForPersistence(this.settings),
+      settings: sanitizeV4SettingsForPersistence(settings),
     });
   }
 
@@ -248,16 +249,85 @@ export default class FastSync extends Plugin {
     this.secretsMigrated = result.migrated
   }
 
-  async saveSettings() {
-    // Reject corrupted pending settings before invalidating a running sync's
-    // credential snapshot or touching secret storage.
-    assertPluginSettingsRuntimeSafe(this.settings)
-    this.v4Runtime?.credentialsChanged()
-    storeV4Secrets(this.settings, this.app.secretStorage)
-    this.initGitHubClient()
-    this.registerScheduledSync()
-    this.updateRibbonIcon(!!(this.settings.githubToken && this.settings.githubOwner && this.settings.githubRepo))
-    await this.persistData()
+  async saveSettings(nextSettings: PluginSettings = this.settings) {
+    // Never publish a draft to running syncs or overwrite active credentials
+    // before its persisted settings record has committed.
+    assertPluginSettingsRuntimeSafe(nextSettings)
+    if (this.settingsSaveInProgress) throw new Error("GitHub Sync: Settings save already in progress.")
+    const previous = this.settings
+    const prepared = { ...nextSettings }
+    if (!prepared.githubTokenSecretId || prepared.githubToken !== previous.githubToken) {
+      prepared.githubTokenSecretId = this.createSecretId("github-token")
+    }
+    if (!prepared.encryptionPassphraseSecretId || prepared.encryptionPassphrase !== previous.encryptionPassphrase) {
+      prepared.encryptionPassphraseSecretId = this.createSecretId("encryption-passphrase")
+    }
+    assertPluginSettingsRuntimeSafe(prepared)
+    const newTokenId = prepared.githubTokenSecretId !== previous.githubTokenSecretId
+      ? prepared.githubTokenSecretId : ""
+    const newPassphraseId = prepared.encryptionPassphraseSecretId !== previous.encryptionPassphraseSecretId
+      ? prepared.encryptionPassphraseSecretId : ""
+    const storage = this.app.secretStorage
+    this.settingsSaveInProgress = true
+    try {
+      // Allocate immutable IDs for replacements so failed writes cannot
+      // corrupt credentials still referenced by the durable previous record.
+      try {
+        if (newTokenId || newPassphraseId) {
+          storeV4Secrets({
+            githubTokenSecretId: newTokenId,
+            githubToken: prepared.githubToken,
+            encryptionPassphraseSecretId: newPassphraseId,
+            encryptionPassphrase: prepared.encryptionPassphrase,
+          }, storage)
+        }
+      } catch (error) {
+        // No settings-file write was attempted: only these newly allocated IDs
+        // can have changed, so a best-effort scrub is safe.
+        for (const id of [newTokenId, newPassphraseId].filter(Boolean)) {
+          try { storage.setSecret(id, "") } catch { /* Preserve first error. */ }
+        }
+        throw error
+      }
+      try {
+        await this.persistData(prepared)
+      } catch (error) {
+        // A rejected saveData() does NOT prove that its disk write failed.
+        // Reconcile only when a readback exactly verifies the new durable
+        // settings. Otherwise preserve both old and candidate secrets so a
+        // restart can safely discover either on-disk outcome.
+        let verifiedDurable = false
+        try {
+          const readback = await this.loadData()
+          const record = readback?.settings ?? readback
+          verifiedDurable = JSON.stringify(record) ===
+            JSON.stringify(sanitizeV4SettingsForPersistence(prepared))
+        } catch { /* Inconclusive: never scrub potentially committed keys. */ }
+        if (!verifiedDurable) throw error
+      }
+      this.settings = prepared
+      // In-progress sessions pin their original settings and GitHub client.
+      // The next session must not reuse a derived key after credential changes.
+      this.v4Runtime?.credentialsChanged()
+      if (!this.unloaded) {
+        this.initGitHubClient()
+        this.registerScheduledSync()
+        this.updateRibbonIcon(!!(prepared.githubToken && prepared.githubOwner && prepared.githubRepo))
+      }
+      // Scrub old credentials only after the new record is durable.
+      for (const [oldId, newId] of [
+        [previous.githubTokenSecretId, newTokenId],
+        [previous.encryptionPassphraseSecretId, newPassphraseId],
+      ]) {
+        if (!oldId || !newId || oldId === newId) continue
+        try { storage.setSecret(oldId, "") }
+        catch {
+          if (!this.unloaded) new Notice("GitHub Sync: Settings saved, but an old credential could not be cleared from secure storage.")
+        }
+      }
+    } finally {
+      this.settingsSaveInProgress = false
+    }
   }
 
   showSavedFeedback() {
