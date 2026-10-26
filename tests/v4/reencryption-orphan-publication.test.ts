@@ -10,6 +10,8 @@ import {
 } from "../../src/lib/v4/reencryption-orphan-publication"
 import { V4StorageCodec } from "../../src/lib/v4/storage-codec"
 import { verifyV4ReencryptionDestinationExactCommit } from "../../src/lib/v4/reencryption-destination-exact-commit"
+import { inspectV4ReencryptionOrphanAfterAmbiguousPublication } from "../../src/lib/v4/reencryption-orphan-recovery"
+import { publishAndVerifyV4ReencryptionOrphanRef } from "../../src/lib/v4/reencryption-orphan-publication-reconciled"
 import type { V4RemoteConfig } from "../../src/lib/v4/protocol-types"
 import type { V4ReencryptionStagingResult } from "../../src/lib/v4/reencryption-staging-receipts"
 import type { V4GitHubFrozenBackupVerificationReport } from "../../src/lib/v4/reencryption-trusted-loader"
@@ -245,6 +247,233 @@ test("D96 full in-memory GitHub lifecycle reads and decrypts every newly encrypt
     expectedReceipts: f.input.staged.receipts,
     destinationPassphrase: "old-wrong-secret",
   }), /auth|decrypt|integrity|metadata/i)
+})
+
+function recoveryInput(f: Awaited<ReturnType<typeof fixture>>, prepared: Awaited<ReturnType<typeof prepareV4ReencryptionOrphanCommit>>) {
+  return {
+    github: f.github, plan, prepared,
+    sourceTreeSha,
+    sourceConfig: f.input.sourceConfig,
+    expectedDestinationConfig: f.input.destinationConfig,
+    expectedRecords: f.input.staged.records,
+    expectedReceipts: f.input.staged.receipts,
+    destinationPassphrase: "new-secret",
+  }
+}
+
+test("D97 read-only recovery distinguishes two absent ref samples; no retry, overwrite or cutover", async () => {
+  const f = await fixture()
+  const prepared = await prepareV4ReencryptionOrphanCommit(f.input)
+  const mutationBefore = f.mutationCount
+  const report = await inspectV4ReencryptionOrphanAfterAmbiguousPublication(recoveryInput(f, prepared))
+  assert.equal(report.outcome, "destination-not-observed")
+  assert.equal(report.destinationContentsVerified, false)
+  assert.equal(report.verifiedFileCount, 0)
+  assert.equal(report.refPublicationProvenByThisRun, false)
+  assert.equal(report.automaticallyRetryCreateAuthorized, false)
+  assert.equal(report.overwriteAuthorized, false)
+  assert.equal(report.localCutoverAuthorized, false)
+  assert.equal(f.mutationCount, mutationBefore)
+  assert.equal(f.calls.filter(x => x === "ref-create").length, 0)
+  assert.ok(Object.isFrozen(report))
+})
+
+test("D97 recovery reports an unexpected occupying commit without touching the old or new refs", async () => {
+  const f = await fixture()
+  const prepared = await prepareV4ReencryptionOrphanCommit(f.input)
+  const before = f.mutationCount
+  f.occupyRef(sourceSha)
+  const report = await inspectV4ReencryptionOrphanAfterAmbiguousPublication(recoveryInput(f, prepared))
+  assert.equal(report.outcome, "destination-occupied-by-unexpected-commit")
+  assert.equal(report.destinationContentsVerified, false)
+  assert.equal(report.automaticallyRetryCreateAuthorized, false)
+  assert.equal(f.mutationCount, before)
+  assert.equal(f.calls.filter(x => x === "blob-read").length, 0)
+})
+
+test("D97 lost create-ref response recovers full encrypted orphan content with the NEW key but authorizes no cutover", async () => {
+  const f = await fixture()
+  const prepared = await prepareV4ReencryptionOrphanCommit(f.input)
+  f.loseCreateResponse()
+  await assert.rejects(() => publishV4ReencryptionOrphanRef({
+    github: f.github, plan, prepared,
+    assertExclusiveMigrationLease: async () => {},
+    assertDurablePublicationIntent: async () => {},
+  }), /response lost/)
+  const mutations = f.mutationCount
+  const report = await inspectV4ReencryptionOrphanAfterAmbiguousPublication(recoveryInput(f, prepared))
+  assert.deepEqual(report, {
+    integrityScope: "read-only-orphan-ref-and-complete-ciphertext-reconciliation",
+    destinationRepoId: targetId,
+    pinnedSourceCommitSha: sourceSha,
+    expectedOrphanCommitSha: candidateSha,
+    outcome: "destination-pinned-and-fully-verified",
+    destinationContentsVerified: true,
+    verifiedFileCount: 1,
+    verifiedPlaintextBytes: f.input.staged.preview.totalPlaintextBytes,
+    refPublicationProvenByThisRun: false,
+    automaticallyRetryCreateAuthorized: false,
+    overwriteAuthorized: false,
+    backupRestoreVerified: false,
+    localCutoverAuthorized: false,
+  })
+  assert.equal(f.mutationCount, mutations)
+  assert.equal(f.calls.filter(x => x === "ref-create").length, 1)
+  assert.ok(f.calls.filter(x => x === "blob-read").length >= 4)
+})
+
+test("D97 recovery rejects wrong destination secret and corrupted exact Git blob without granting success", async () => {
+  const f = await fixture()
+  const prepared = await prepareV4ReencryptionOrphanCommit(f.input)
+  f.occupyRef(candidateSha)
+  await assert.rejects(() => inspectV4ReencryptionOrphanAfterAmbiguousPublication({
+    ...recoveryInput(f, prepared), destinationPassphrase: "wrong-new-passphrase",
+  }), /auth|decrypt|integrity|metadata/i)
+  const entry = [...f.blobs.entries()].find(([, bytes]) => bytes.length > 0)!
+  const corrupt = entry[1].slice()
+  corrupt[0] = corrupt[0]! ^ 0xff
+  f.blobs.set(entry[0], corrupt)
+  await assert.rejects(() => inspectV4ReencryptionOrphanAfterAmbiguousPublication(
+    recoveryInput(f, prepared),
+  ), /Git blob|SHA|identity|mismatch/i)
+})
+
+test("D97 recovery fails closed for ref drift, malformed ref, repository change and unknown GitHub status", async () => {
+  const f = await fixture()
+  const prepared = await prepareV4ReencryptionOrphanCommit(f.input)
+  let reads = 0
+  const original = f.github.getGitRefOrNull
+  f.github.getGitRefOrNull = async () => {
+    const ref = await original()
+    reads++
+    if (reads === 2) return { ref: "refs/heads/rekey/new-branch", type: "commit", sha: sourceSha }
+    return ref
+  }
+  await assert.rejects(() => inspectV4ReencryptionOrphanAfterAmbiguousPublication(
+    recoveryInput(f, prepared),
+  ), /changed/i)
+
+  const wrong = await fixture()
+  const candidate = await prepareV4ReencryptionOrphanCommit(wrong.input)
+  wrong.markWrongRepo()
+  await assert.rejects(() => inspectV4ReencryptionOrphanAfterAmbiguousPublication(
+    recoveryInput(wrong, candidate),
+  ), /physical GitHub repository mismatch/i)
+
+  const invalidRef = await fixture()
+  const root = await prepareV4ReencryptionOrphanCommit(invalidRef.input)
+  invalidRef.github.getGitRefOrNull = async () => ({
+    ref: "refs/heads/main", type: "tag", sha: sourceSha,
+  })
+  await assert.rejects(() => inspectV4ReencryptionOrphanAfterAmbiguousPublication(
+    recoveryInput(invalidRef, root),
+  ), /wrong Git ref/i)
+
+  const unknown = await fixture()
+  const pre = await prepareV4ReencryptionOrphanCommit(unknown.input)
+  unknown.failRefReads()
+  await assert.rejects(() => inspectV4ReencryptionOrphanAfterAmbiguousPublication(
+    recoveryInput(unknown, pre),
+  ), /503/i)
+})
+
+test("D97 recovery checks candidate plan, branch scope, committed records and AbortSignal before Git reads", async () => {
+  const f = await fixture()
+  const prepared = await prepareV4ReencryptionOrphanCommit(f.input)
+  const before = f.calls.length
+  await assert.rejects(() => inspectV4ReencryptionOrphanAfterAmbiguousPublication({
+    ...recoveryInput(f, prepared), prepared: { ...prepared, commitSha: "HEAD" },
+  }), /candidate/i)
+  assert.equal(f.calls.length, before)
+
+  await assert.rejects(() => inspectV4ReencryptionOrphanAfterAmbiguousPublication({
+    ...recoveryInput(f, prepared),
+    github: { ...f.github, branchName: "main" },
+  }), /scope/i)
+
+  const controller = new AbortController()
+  controller.abort(new Error("user cancelled rekey"))
+  await assert.rejects(() => inspectV4ReencryptionOrphanAfterAmbiguousPublication({
+    ...recoveryInput(f, prepared), signal: controller.signal,
+  }), /cancelled rekey/i)
+  assert.equal(f.calls.length, before)
+})
+
+test("D98 publish + independent content verification is success only after every encrypted blob is decrypted", async () => {
+  const f = await fixture()
+  const prepared = await prepareV4ReencryptionOrphanCommit(f.input)
+  let intentWritten = false
+  const report = await publishAndVerifyV4ReencryptionOrphanRef({
+    ...recoveryInput(f, prepared),
+    assertDurablePublicationIntent: async () => { intentWritten = true; f.calls.push("intent") },
+    assertExclusiveMigrationLease: async () => {},
+  })
+  assert.equal(intentWritten, true)
+  assert.equal(report.publicationOutcome, "response-confirmed")
+  assert.equal(report.destinationContentsReadbackVerified, true)
+  assert.equal(report.verifiedFileCount, 1)
+  assert.equal(report.verifiedPlaintextBytes, f.input.staged.preview.totalPlaintextBytes)
+  assert.equal(report.initiatingDeviceCutoverAuthorized, false)
+  assert.equal(report.durableJournalIndependentlyAudited, false)
+  assert.equal(f.calls.filter(x => x === "ref-create").length, 1)
+  assert.ok(f.calls.indexOf("intent") < f.calls.indexOf("ref-create"))
+})
+
+test("D98 lost create response recovers exact new-key ciphertext without a second ref mutation", async () => {
+  const f = await fixture()
+  const prepared = await prepareV4ReencryptionOrphanCommit(f.input)
+  f.loseCreateResponse()
+  const report = await publishAndVerifyV4ReencryptionOrphanRef({
+    ...recoveryInput(f, prepared),
+    assertDurablePublicationIntent: async () => {},
+    assertExclusiveMigrationLease: async () => {},
+  })
+  assert.equal(report.publicationOutcome, "lost-response-reconciled")
+  assert.equal(report.destinationContentsReadbackVerified, true)
+  assert.equal(report.backupRestoreVerified, false)
+  assert.equal(f.calls.filter(x => x === "ref-create").length, 1)
+})
+
+test("D98 without a durable intent cannot make a remote ref; wrong new-key readback cannot report success", async () => {
+  const f = await fixture()
+  const prepared = await prepareV4ReencryptionOrphanCommit(f.input)
+  await assert.rejects(() => publishAndVerifyV4ReencryptionOrphanRef({
+    ...recoveryInput(f, prepared),
+    assertDurablePublicationIntent: async () => { throw new Error("directory fsync EPERM") },
+    assertExclusiveMigrationLease: async () => {},
+  }), /fsync EPERM/)
+  assert.equal(f.calls.filter(x => x === "ref-create").length, 0)
+
+  const bad = await fixture()
+  const root = await prepareV4ReencryptionOrphanCommit(bad.input)
+  const mutationBefore = bad.mutationCount
+  await assert.rejects(() => publishAndVerifyV4ReencryptionOrphanRef({
+    ...recoveryInput(bad, root),
+    destinationPassphrase: "wrong",
+    assertDurablePublicationIntent: async () => {},
+    assertExclusiveMigrationLease: async () => {},
+  }), /auth|decrypt|integrity|metadata/i)
+  assert.equal(bad.calls.filter(x => x === "ref-create").length, 1)
+  assert.equal(bad.mutationCount, mutationBefore + 1)
+  // Ref may now exist. A failed post-publication verification never switches
+  // the current vault or deletes any branch.
+})
+
+test("D98 refused GitHub reads after uncertain mutation remain unresolved; no blind retry", async () => {
+  const f = await fixture()
+  const prepared = await prepareV4ReencryptionOrphanCommit(f.input)
+  f.loseCreateResponse()
+  const original = f.github.createGitRef
+  f.github.createGitRef = async sha => {
+    try { await original(sha) }
+    finally { f.failRefReads() }
+  }
+  await assert.rejects(() => publishAndVerifyV4ReencryptionOrphanRef({
+    ...recoveryInput(f, prepared),
+    assertDurablePublicationIntent: async () => {},
+    assertExclusiveMigrationLease: async () => {},
+  }), /ambiguous|recovery/i)
+  assert.equal(f.calls.filter(x => x === "ref-create").length, 1)
 })
 
 test("D96 refuses remote ref collision, wrong repository, missing backup proof and staged SHA mismatch before any mutation", async () => {

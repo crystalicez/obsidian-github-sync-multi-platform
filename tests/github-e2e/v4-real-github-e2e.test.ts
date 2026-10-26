@@ -9,6 +9,7 @@ import { V4HistoryService } from "../../src/lib/v4/history-service";
 import { verifyGitHubReencryptionSource } from "../../src/lib/v4/reencryption-trusted-loader";
 import { verifyStagedV4ReencryptionGitBlobs } from "../../src/lib/v4/reencryption-blob-reconciliation";
 import { verifyV4ReencryptionDestinationExactCommit } from "../../src/lib/v4/reencryption-destination-exact-commit";
+import { inspectV4ReencryptionOrphanAfterAmbiguousPublication } from "../../src/lib/v4/reencryption-orphan-recovery";
 import { createV4ReencryptionRecoveryJournal } from "../../src/lib/v4/reencryption-recovery-journal";
 import { computeV4GitBlobSha1 } from "../../src/lib/v4/git-blob-identity";
 import type { V4LocalIndexAdapter } from "../../src/lib/v4/local-index";
@@ -748,6 +749,43 @@ async function runOrphanRootBootstrapScenario(config: GitHubConfig): Promise<voi
   assert.equal(complete.backupVerified, false);
   assert.equal(complete.secondDeviceRestored, false);
   assert.equal(secondDevice.transportMetricsSnapshot.mutations - beforeExactAudit, 0);
+
+  // D97 real GitHub evidence: simulate a lost create-ref HTTP response by
+  // discarding that response, then independently re-observing and decrypting
+  // the exact synthetic orphan from the disposable branch. READ ONLY.
+  // This test-only candidate descriptor refers to a root created above;
+  // it is not evidence of a production backup or durable migration intent.
+  const beforeRecoveryMutations = secondDevice.transportMetricsSnapshot.mutations;
+  const recovered = await inspectV4ReencryptionOrphanAfterAmbiguousPublication({
+    github: secondDevice, plan,
+    prepared: {
+      integrityScope: "unreferenced-encrypted-orphan-commit",
+      destinationRepoId, pinnedSourceCommitSha: oldHead.sha,
+      physicalRepositoryId: physical.id,
+      sourceTreeSha: oldCommit.treeSha, treeSha: rootTree, commitSha: rootCommit,
+      verifiedFileCount: 1, stagedCiphertextObjectCount: prepared.files.length,
+      encryptedMetadataObjectCount: metadata.length,
+      sourceAndBackupPreserved: true, rootHasZeroParents: true,
+      backupProvenanceVerified: false, installedRestoreVerified: false,
+      refPublished: false, cutoverAuthorized: false,
+    },
+    sourceTreeSha: oldCommit.treeSha,
+    sourceConfig: oldConfig,
+    expectedDestinationConfig: newConfig,
+    expectedRecords: [record],
+    expectedReceipts: prepared.files.map(file => ({
+      path: file.path, sha: computeV4GitBlobSha1(file.bytes),
+      byteLength: file.bytes.byteLength,
+    })),
+    destinationPassphrase: "synthetic-d75-orphan-only",
+  });
+  assert.equal(recovered.outcome, "destination-pinned-and-fully-verified");
+  assert.equal(recovered.destinationContentsVerified, true);
+  assert.equal(recovered.verifiedFileCount, 1);
+  assert.equal(recovered.verifiedPlaintextBytes, String(plaintext.byteLength));
+  assert.equal(recovered.automaticallyRetryCreateAuthorized, false);
+  assert.equal(recovered.localCutoverAuthorized, false);
+  assert.equal(secondDevice.transportMetricsSnapshot.mutations - beforeRecoveryMutations, 0);
 
   assert.deepEqual((await secondDevice.getGitCommit(rootCommit)).parentShas, []);
   assert.equal((await sourceClient.getGitRef()).sha, oldHead.sha,
