@@ -10,6 +10,7 @@ import { V4StorageCodec } from "../../src/lib/v4/storage-codec";
 import { verifyGitHubReencryptionSource, verifyGitHubReencryptionForkSource, verifyGitHubFrozenReencryptionBackup } from "../../src/lib/v4/reencryption-trusted-loader";
 import { proposeV4SameRepositoryReencryptionBackupBranch } from "../../src/lib/v4/reencryption-owner-decisions";
 import { inspectV4FrozenBackupAfterAmbiguousCreate } from "../../src/lib/v4/reencryption-backup-reconcile";
+import { createAndVerifyV4FrozenBackupRef } from "../../src/lib/v4/reencryption-backup-create-verified";
 
 const enc = utf8ToBytes;
 const gitBlobSha = (bytes: Uint8Array) =>
@@ -531,6 +532,8 @@ test("D95 uncertain create recovery verifies all real frozen encrypted objects a
     pinnedSourceCommitSha: commitSha,
     outcome: "matching-backup-full-readback",
     backupContentsReadbackVerified: true,
+    verifiedFileCount: 1,
+    verifiedPlaintextBytes: String(enc("File content secret").byteLength),
     creationProven: false,
     automaticallyRetryCreateAuthorized: false,
     overwriteAuthorized: false,
@@ -620,6 +623,143 @@ test("D95 refuses wrong physical identity, wrong client scope, invalid plan and 
     backup: defaultReader.github, plan: frozenPlan,
     expectedSourceTreeSha: rootTreeSha, originalPassphrase: "correct",
   }), /default branch changed/)
+})
+
+async function D99BackupFixture() {
+  const f = await createFixture()
+  const verifiedSource = await verifyGitHubReencryptionForkSource({
+    github: f.github, expectedRepoId: repoId, expectedBranch: "main", passphrase: "correct",
+  })
+  let target: string | null = null
+  let createAttempts = 0
+  let outcomeLost = false
+  let failAfterCreateRefRead = false
+  let failReadOnce = false
+  const backup = {
+    ...frozenBackupClient(f),
+    async getRepositoryDefaultBranch() { return "main" },
+    async getGitRef() {
+      if (!target) throw new Error("Backup branch does not exist.")
+      return { ref: "refs/heads/backup/2026-10-26", type: "commit", sha: target }
+    },
+    async getGitRefOrNull() {
+      if (failReadOnce) {
+        failReadOnce = false
+        throw new Error("GitHub 503 after create")
+      }
+      return target ? { ref: "refs/heads/backup/2026-10-26", type: "commit", sha: target } : null
+    },
+    async createGitRef(sha: string) {
+      createAttempts++
+      if (target) throw new Error("Ref collision")
+      target = sha
+      if (failAfterCreateRefRead) failReadOnce = true
+      if (outcomeLost) throw new Error("GitHub POST lost response")
+    },
+  }
+  const source = {
+    branchName: "main",
+    getRepositoryIdentity: () => f.github.getRepositoryIdentity(),
+    async getRepositoryDefaultBranch() { return "main" },
+    getGitCommit: (sha: string) => f.github.getGitCommit(sha),
+  }
+  const input = {
+    plan: frozenPlan, verifiedSource, source, backup, expectedSourceTreeSha: rootTreeSha,
+    originalPassphrase: "correct",
+    assertDurableBackupIntent: async () => {},
+    assertExclusiveMigrationLease: async () => {},
+  }
+  return {
+    f, input, get createAttempts() { return createAttempts },
+    occupy(sha = commitSha) { target = sha },
+    loseCreateResponse() { outcomeLost = true },
+    failPostCreateReadback() { failAfterCreateRefRead = true },
+  }
+}
+
+test("D99 creates a single frozen backup ref then decrypts and verifies the COMPLETE old-key content", async () => {
+  const f = await D99BackupFixture()
+  f.f.setCurrentSha("d".repeat(40)) // D90 old source keeps syncing independently
+  let intent = false
+  const report = await createAndVerifyV4FrozenBackupRef({
+    ...f.input,
+    assertDurableBackupIntent: async () => { intent = true },
+  })
+  assert.equal(intent, true)
+  assert.equal(report.publicationOutcome, "response-confirmed")
+  assert.equal(report.backupContentsReadbackVerified, true)
+  assert.equal(report.verifiedFileCount, 1)
+  assert.equal(report.verifiedPlaintextBytes, String(enc("File content secret").byteLength))
+  assert.equal(report.independentlyAuditedDurableIntent, false)
+  assert.equal(report.installedObsidianRestoreVerified, false)
+  assert.equal(report.initiatingDeviceCutoverAuthorized, false)
+  assert.equal(f.createAttempts, 1)
+  assert.ok(Object.isFrozen(report))
+})
+
+test("D99 ambiguous backup create response is fully reconciled without retry or old branch freeze", async () => {
+  const f = await D99BackupFixture()
+  f.loseCreateResponse()
+  f.f.setCurrentSha("d".repeat(40))
+  const report = await createAndVerifyV4FrozenBackupRef(f.input)
+  assert.equal(report.publicationOutcome, "lost-create-response-reconciled")
+  assert.equal(report.backupContentsReadbackVerified, true)
+  assert.equal(report.destinationPublicationAuthorized, false)
+  assert.equal(f.createAttempts, 1)
+})
+
+test("D100 deterministic GitHub 422 backup-ref rejection can never be reconciled as our success", async () => {
+  const f = await D99BackupFixture()
+  f.input.backup.createGitRef = async () => {
+    f.occupy(commitSha)
+    throw Object.assign(new Error("GitHub 422 rejected backup ref"), { status: 422 })
+  }
+  await assert.rejects(() => createAndVerifyV4FrozenBackupRef(f.input), /422 rejected/)
+})
+
+test("D99 post-create ref read error is distinct from lost create response", async () => {
+  const f = await D99BackupFixture()
+  f.failPostCreateReadback()
+  const report = await createAndVerifyV4FrozenBackupRef(f.input)
+  assert.equal(report.publicationOutcome, "post-create-readback-reconciled")
+  assert.equal(f.createAttempts, 1)
+})
+
+test("D99 pre-existing IDENTICAL ref is not falsely adopted as our successful backup create", async () => {
+  const f = await D99BackupFixture()
+  await assert.rejects(() => createAndVerifyV4FrozenBackupRef({
+    ...f.input,
+    assertDurableBackupIntent: async () => { f.occupy(commitSha) },
+  }), /already exists|branch/i)
+  assert.equal(f.createAttempts, 0)
+})
+
+test("D99 refuses missing durable backup-intent persistence and wrong original password", async () => {
+  const f = await D99BackupFixture()
+  await assert.rejects(() => createAndVerifyV4FrozenBackupRef({
+    ...f.input,
+    assertDurableBackupIntent: async () => { throw new Error("WAL directory fsync EPERM") },
+  }), /fsync EPERM/)
+  assert.equal(f.createAttempts, 0)
+
+  const mismatch = await D99BackupFixture()
+  await assert.rejects(() => createAndVerifyV4FrozenBackupRef({
+    ...mismatch.input, originalPassphrase: "incorrect",
+  }), /auth|decrypt|recovery|backup/i)
+  assert.equal(mismatch.createAttempts, 1)
+})
+
+test("D99 lease loss AFTER remote preflight but BEFORE backup create must not send GitHub POST", async () => {
+  const f = await D99BackupFixture()
+  let checks = 0
+  await assert.rejects(() => createAndVerifyV4FrozenBackupRef({
+    ...f.input,
+    assertExclusiveMigrationLease: async () => {
+      if (++checks === 2) throw new Error("initiating-device exclusive lease lost")
+    },
+  }), /lease lost/)
+  assert.equal(checks, 2)
+  assert.equal(f.createAttempts, 0)
 })
 
 test("D95 aborted recovery does no remote I/O", async () => {

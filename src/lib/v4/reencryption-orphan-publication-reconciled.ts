@@ -1,4 +1,5 @@
 import type { GitHubClient } from "../github-api"
+import { classifyV4MutationFailure } from "./git-mutation-policy"
 import { throwIfV4Aborted } from "./cancellation"
 import type { V4OrphanReencryptionPlan } from "./reencryption-orphan-branch"
 import {
@@ -24,7 +25,7 @@ export interface V4ReencryptionVerifiedOrphanPublishReport {
   readonly integrityScope: "create-only-orphan-ref-plus-complete-remote-readback"
   readonly destinationRepoId: string
   readonly destinationCommitSha: string
-  readonly publicationOutcome: "response-confirmed" | "lost-response-reconciled"
+  readonly publicationOutcome: "response-confirmed" | "lost-response-reconciled" | "post-create-readback-reconciled"
   readonly destinationContentsReadbackVerified: true
   readonly verifiedFileCount: number
   readonly verifiedPlaintextBytes: string
@@ -54,11 +55,27 @@ export async function publishAndVerifyV4ReencryptionOrphanRef(
 ): Promise<V4ReencryptionVerifiedOrphanPublishReport> {
   throwIfV4Aborted(input.signal)
   let journalIntentCompleted = false
-  let createResponseConfirmed = false
+  let createAttempted = false
+  let createResponseReceived = false
   let originalError: unknown
+  // Explicit transport delegation records the exact mutation boundary.
+  // A callback/identity/ref collision error BEFORE this boundary cannot be
+  // turned into a "lost successful create" merely by observing an existing ref.
+  const scopedCreateClient = {
+    branchName: input.github.branchName,
+    getRepositoryIdentity: () => input.github.getRepositoryIdentity(),
+    getRepositoryDefaultBranch: () => input.github.getRepositoryDefaultBranch(),
+    getGitRefOrNull: () => input.github.getGitRefOrNull(),
+    getGitCommit: (sha: string) => input.github.getGitCommit(sha),
+    async createGitRef(sha: string) {
+      createAttempted = true
+      await input.github.createGitRef(sha)
+      createResponseReceived = true
+    },
+  }
   try {
     await publishV4ReencryptionOrphanRef({
-      github: input.github,
+      github: scopedCreateClient,
       plan: input.plan,
       prepared: input.prepared,
       assertExclusiveMigrationLease: input.assertExclusiveMigrationLease,
@@ -69,10 +86,14 @@ export async function publishAndVerifyV4ReencryptionOrphanRef(
       },
       signal: input.signal,
     })
-    createResponseConfirmed = true
+    // No earlier ref-collision or intent failure can skip the actual POST.
+    if (!createAttempted || !createResponseReceived) {
+      throw new Error("Destination ref publication did not reach a confirmed create attempt.")
+    }
   } catch (error) {
     throwIfV4Aborted(input.signal)
-    if (!journalIntentCompleted) throw error
+    if (!journalIntentCompleted || !createAttempted
+      || (!createResponseReceived && classifyV4MutationFailure(error) === "definitive")) throw error
     originalError = error
   }
   // Verify independently even when createGitRef returned HTTP 201. A
@@ -103,7 +124,8 @@ export async function publishAndVerifyV4ReencryptionOrphanRef(
     integrityScope: "create-only-orphan-ref-plus-complete-remote-readback",
     destinationRepoId: input.plan.destinationRepoId,
     destinationCommitSha: input.prepared.commitSha,
-    publicationOutcome: createResponseConfirmed ? "response-confirmed" : "lost-response-reconciled",
+    publicationOutcome: originalError === undefined ? "response-confirmed"
+      : createResponseReceived ? "post-create-readback-reconciled" : "lost-response-reconciled",
     destinationContentsReadbackVerified: true,
     verifiedFileCount: proof.verifiedFileCount,
     verifiedPlaintextBytes: proof.verifiedPlaintextBytes,

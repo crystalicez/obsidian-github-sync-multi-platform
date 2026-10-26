@@ -4,6 +4,7 @@ import { toBase64Url, utf8ToBytes } from "../../src/lib/bytes"
 import { deriveV4Keyring } from "../../src/lib/v4/crypto"
 import { computeV4GitBlobSha1 } from "../../src/lib/v4/git-blob-identity"
 import { planV4OrphanReencryptionDestination } from "../../src/lib/v4/reencryption-orphan-branch"
+import { proposeV4SameRepositoryReencryptionBackupBranch } from "../../src/lib/v4/reencryption-owner-decisions"
 import {
   prepareV4ReencryptionOrphanCommit,
   publishV4ReencryptionOrphanRef,
@@ -12,6 +13,7 @@ import { V4StorageCodec } from "../../src/lib/v4/storage-codec"
 import { verifyV4ReencryptionDestinationExactCommit } from "../../src/lib/v4/reencryption-destination-exact-commit"
 import { inspectV4ReencryptionOrphanAfterAmbiguousPublication } from "../../src/lib/v4/reencryption-orphan-recovery"
 import { publishAndVerifyV4ReencryptionOrphanRef } from "../../src/lib/v4/reencryption-orphan-publication-reconciled"
+import { publishV4ThreeBranchDestinationAfterBackup } from "../../src/lib/v4/reencryption-three-branch-publish"
 import type { V4RemoteConfig } from "../../src/lib/v4/protocol-types"
 import type { V4ReencryptionStagingResult } from "../../src/lib/v4/reencryption-staging-receipts"
 import type { V4GitHubFrozenBackupVerificationReport } from "../../src/lib/v4/reencryption-trusted-loader"
@@ -459,6 +461,65 @@ test("D98 without a durable intent cannot make a remote ref; wrong new-key readb
   // the current vault or deletes any branch.
 })
 
+test("D99 refuses to misclassify pre-create name collision as our successful lost create response", async () => {
+  const f = await fixture()
+  const prepared = await prepareV4ReencryptionOrphanCommit(f.input)
+  await assert.rejects(() => publishAndVerifyV4ReencryptionOrphanRef({
+    ...recoveryInput(f, prepared),
+    assertExclusiveMigrationLease: async () => {},
+    assertDurablePublicationIntent: async () => {
+      // Another actor claimed this exact SHA/ref after our initial absence
+      // probes, but before our own create request. This is NOT our operation.
+      f.occupyRef(prepared.commitSha)
+    },
+  }), /present|overwrite/i)
+  assert.equal(f.calls.filter(x => x === "ref-create").length, 0)
+})
+
+test("D100 deterministic GitHub 422 after a competing identical ref cannot be accepted as our own publication", async () => {
+  const f = await fixture()
+  const prepared = await prepareV4ReencryptionOrphanCommit(f.input)
+  f.github.createGitRef = async () => {
+    f.occupyRef(prepared.commitSha)
+    throw Object.assign(new Error("GitHub 422 refused create-ref collision"), { status: 422 })
+  }
+  await assert.rejects(() => publishAndVerifyV4ReencryptionOrphanRef({
+    ...recoveryInput(f, prepared),
+    assertExclusiveMigrationLease: async () => {},
+    assertDurablePublicationIntent: async () => {},
+  }), /422 refused/)
+  // No successful owned ref creation, even though third-party ref points to
+  // exactly the same immutable Git candidate SHA.
+  assert.equal(f.calls.filter(x => x === "ref-create").length, 0)
+})
+
+test("D99 records a distinct post-create readback recovery outcome without claiming a lost create response", async () => {
+  const f = await fixture()
+  const prepared = await prepareV4ReencryptionOrphanCommit(f.input)
+  let firstAfterCreate = true
+  const originalRead = f.github.getGitRefOrNull
+  const originalWrite = f.github.createGitRef
+  f.github.createGitRef = async sha => {
+    await originalWrite(sha)
+    f.github.getGitRefOrNull = async () => {
+      if (firstAfterCreate) {
+        firstAfterCreate = false
+        throw new Error("GitHub 503 after successful create response")
+      }
+      return originalRead()
+    }
+  }
+  const report = await publishAndVerifyV4ReencryptionOrphanRef({
+    ...recoveryInput(f, prepared),
+    assertExclusiveMigrationLease: async () => {},
+    assertDurablePublicationIntent: async () => {},
+  })
+  assert.equal(report.publicationOutcome, "post-create-readback-reconciled")
+  assert.equal(report.destinationContentsReadbackVerified, true)
+  assert.equal(report.initiatingDeviceCutoverAuthorized, false)
+  assert.equal(f.calls.filter(x => x === "ref-create").length, 1)
+})
+
 test("D98 refused GitHub reads after uncertain mutation remain unresolved; no blind retry", async () => {
   const f = await fixture()
   const prepared = await prepareV4ReencryptionOrphanCommit(f.input)
@@ -474,6 +535,194 @@ test("D98 refused GitHub reads after uncertain mutation remain unresolved; no bl
     assertExclusiveMigrationLease: async () => {},
   }), /ambiguous|recovery/i)
   assert.equal(f.calls.filter(x => x === "ref-create").length, 1)
+})
+
+const D100backupPlan = proposeV4SameRepositoryReencryptionBackupBranch({
+  sourceRepoId: sourceId,
+  backupRepoId: "owner/repo#backup/frozen",
+  destinationRepoId: targetId,
+  pinnedSourceCommitSha: sourceSha,
+  sourcePhysicalRepositoryId: 22,
+  backupPhysicalRepositoryId: 22,
+  destinationPhysicalRepositoryId: 22,
+  expectedPhysicalRepositoryId: 22,
+  defaultBranch: "main",
+})
+
+function D100input(f: Awaited<ReturnType<typeof fixture>>, prepared: Awaited<ReturnType<typeof prepareV4ReencryptionOrphanCommit>>) {
+  const total = f.input.staged.preview.totalPlaintextBytes
+  return {
+    ...recoveryInput(f, prepared),
+    backupPlan: D100backupPlan,
+    backupRefReader: {
+      branchName: "backup/frozen",
+      async getRepositoryIdentity() { return { id: 22, fullName: "owner/repo" } },
+      async getRepositoryDefaultBranch() { return "main" },
+      async getGitRefOrNull() {
+        return { ref: "refs/heads/backup/frozen", type: "commit", sha: sourceSha }
+      },
+      async getGitCommit(sha: string) {
+        assert.equal(sha, sourceSha)
+        return { sha: sourceSha, treeSha: sourceTreeSha, parentShas: [] }
+      },
+    },
+    createdAndVerifiedBackup: {
+      integrityScope: "backup-ref-create-only-and-full-authenticated-content" as const,
+      backupRepoId: D100backupPlan.backupRepoId,
+      pinnedSourceCommitSha: sourceSha,
+      pinnedSourceTreeSha: sourceTreeSha,
+      publicationOutcome: "response-confirmed" as const,
+      verifiedFileCount: f.input.staged.records.length,
+      verifiedPlaintextBytes: total,
+      backupContentsReadbackVerified: true as const,
+      backupRefCreateAttemptedByThisRun: true as const,
+      independentlyProvenCreationProvenance: false as const,
+      independentlyAuditedDurableIntent: false as const,
+      installedObsidianRestoreVerified: false as const,
+      independentStorageVerified: false as const,
+      destinationPublicationAuthorized: false as const,
+      initiatingDeviceCutoverAuthorized: false as const,
+      oldSourceBranchMayKeepSyncing: true as const,
+    },
+    scratchRestore: {
+      integrityScope: "isolated-scratch-restore-roundtrip-only" as const,
+      pinnedSourceCommitSha: sourceSha,
+      roundTripFileCount: f.input.staged.records.length,
+      roundTripPlaintextBytes: total,
+      scratchReadbackMatched: true as const,
+      independentStorageVerified: false as const,
+      installedObsidianRestoreVerified: false as const,
+      permissionToPublish: false as const,
+      cutoverAuthorized: false as const,
+    },
+    assertCrashDurable: async () => {},
+    assertInitiatingVaultUnchanged: async () => {},
+    assertExclusiveMigrationLease: async () => {},
+    assertDurablePublicationIntent: async () => {},
+  }
+}
+
+test("D100 complete three-role proof permits one destination publication and remote encrypted parity, NEVER local cutover", async () => {
+  const f = await fixture()
+  const prepared = await prepareV4ReencryptionOrphanCommit(f.input)
+  const report = await publishV4ThreeBranchDestinationAfterBackup(D100input(f, prepared))
+  assert.deepEqual(report, {
+    integrityScope: "three-branch-verified-backup-and-destination-remote-only",
+    sourceRepoId: sourceId,
+    backupRepoId: D100backupPlan.backupRepoId,
+    destinationRepoId: targetId,
+    originalSourceCommitSha: sourceSha,
+    destinationCommitSha: candidateSha,
+    verifiedFileCount: 1,
+    verifiedPlaintextBytes: f.input.staged.preview.totalPlaintextBytes,
+    backupContentsReadbackVerified: true,
+    backupScratchRoundTripVerified: true,
+    destinationContentsReadbackVerified: true,
+    oldBranchSyncRemainsIndependent: true,
+    powerLossDurabilityIndependentlyAudited: false,
+    initiatingDeviceCutoverAuthorized: false,
+  })
+  assert.equal(f.calls.filter(x => x === "ref-create").length, 1)
+  assert.ok(Object.isFrozen(report))
+})
+
+test("D100 rejects nonmatching backup/scratch/source/destination evidence BEFORE any remote branch publication", async () => {
+  const mutants = [
+    (v: ReturnType<typeof D100input>) => ({
+      ...v, createdAndVerifiedBackup: { ...v.createdAndVerifiedBackup, pinnedSourceTreeSha: "f".repeat(40) },
+    }),
+    (v: ReturnType<typeof D100input>) => ({
+      ...v, createdAndVerifiedBackup: { ...v.createdAndVerifiedBackup, verifiedPlaintextBytes: "10101" },
+    }),
+    (v: ReturnType<typeof D100input>) => ({
+      ...v, createdAndVerifiedBackup: { ...v.createdAndVerifiedBackup, backupRefCreateAttemptedByThisRun: false as const },
+    }),
+    (v: ReturnType<typeof D100input>) => ({
+      ...v, scratchRestore: { ...v.scratchRestore, scratchReadbackMatched: false as const },
+    }),
+    (v: ReturnType<typeof D100input>) => ({
+      ...v, scratchRestore: { ...v.scratchRestore, pinnedSourceCommitSha: "f".repeat(40) },
+    }),
+    (v: ReturnType<typeof D100input>) => ({
+      ...v, backupPlan: { ...v.backupPlan, destinationRepoId: "owner/repo#wrong" },
+    }),
+    (v: ReturnType<typeof D100input>) => ({
+      ...v, createdAndVerifiedBackup: { ...v.createdAndVerifiedBackup, verifiedFileCount: 2 },
+    }),
+  ]
+  for (const mutate of mutants) {
+    const f = await fixture()
+    const prepared = await prepareV4ReencryptionOrphanCommit(f.input)
+    await assert.rejects(() => publishV4ThreeBranchDestinationAfterBackup(
+      mutate(D100input(f, prepared)) as Parameters<typeof publishV4ThreeBranchDestinationAfterBackup>[0],
+    ), /three-branch publication evidence/i)
+    assert.ok(!f.calls.includes("ref-create"))
+  }
+})
+
+test("D100 refuses unproven Windows WAL durability or concurrent local edits without creating the destination branch", async () => {
+  const f = await fixture()
+  const prepared = await prepareV4ReencryptionOrphanCommit(f.input)
+  const input = D100input(f, prepared)
+  await assert.rejects(() => publishV4ThreeBranchDestinationAfterBackup({
+    ...input, assertCrashDurable: async () => { throw new Error("Node Windows directory fsync EPERM") },
+  }), /fsync EPERM/)
+  assert.equal(f.calls.filter(x => x === "ref-create").length, 0)
+
+  await assert.rejects(() => publishV4ThreeBranchDestinationAfterBackup({
+    ...input, assertInitiatingVaultUnchanged: async () => { throw new Error("Local edit detected") },
+  }), /Local edit detected/)
+  assert.equal(f.calls.filter(x => x === "ref-create").length, 0)
+})
+
+test("D100 backup ref deleted or retargeted after proof is never accepted for destination creation", async () => {
+  for (const altered of [null, "f".repeat(40)]) {
+    const f = await fixture()
+    const prepared = await prepareV4ReencryptionOrphanCommit(f.input)
+    const input = D100input(f, prepared)
+    const backupRefReader = {
+      ...input.backupRefReader,
+      async getGitRefOrNull() {
+        return altered === null ? null
+          : { ref: "refs/heads/backup/frozen", type: "commit", sha: altered }
+      },
+    }
+    await assert.rejects(() => publishV4ThreeBranchDestinationAfterBackup({
+      ...input, backupRefReader,
+    }), /Backup ref disappeared or changed/i)
+    assert.equal(f.calls.filter(x => x === "ref-create").length, 0)
+  }
+})
+
+test("D100 backup moved after intent was persisted but before create MUST NOT publish destination", async () => {
+  const f = await fixture()
+  const prepared = await prepareV4ReencryptionOrphanCommit(f.input)
+  const input = D100input(f, prepared)
+  let backupMoved = false
+  const read = input.backupRefReader.getGitRefOrNull
+  const backupRefReader = {
+    ...input.backupRefReader,
+    getGitRefOrNull: async () => backupMoved ? null : read(),
+  }
+  await assert.rejects(() => publishV4ThreeBranchDestinationAfterBackup({
+    ...input, backupRefReader,
+    assertDurablePublicationIntent: async () => { backupMoved = true },
+  }), /Backup ref disappeared or changed/i)
+  assert.equal(f.calls.filter(x => x === "ref-create").length, 0)
+})
+
+test("D100 refuses actual GitHub default-branch drift into the Backup branch", async () => {
+  const f = await fixture()
+  const prepared = await prepareV4ReencryptionOrphanCommit(f.input)
+  const input = D100input(f, prepared)
+  const backupRefReader = {
+    ...input.backupRefReader,
+    async getRepositoryDefaultBranch() { return "backup/frozen" },
+  }
+  await assert.rejects(() => publishV4ThreeBranchDestinationAfterBackup({
+    ...input, backupRefReader,
+  }), /GitHub default branch/i)
+  assert.equal(f.calls.filter(x => x === "ref-create").length, 0)
 })
 
 test("D96 refuses remote ref collision, wrong repository, missing backup proof and staged SHA mismatch before any mutation", async () => {

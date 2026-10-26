@@ -32,6 +32,8 @@ export interface V4FrozenBackupRecoveryReport {
   readonly pinnedSourceCommitSha: string
   readonly outcome: V4FrozenBackupRecoveryOutcome
   readonly backupContentsReadbackVerified: boolean
+  readonly verifiedFileCount: number
+  readonly verifiedPlaintextBytes: string
   readonly creationProven: false
   readonly automaticallyRetryCreateAuthorized: false
   readonly overwriteAuthorized: false
@@ -118,12 +120,14 @@ export async function inspectV4FrozenBackupAfterAmbiguousCreate(
     throw new Error("Frozen backup Git ref changed between recovery observations.")
   }
   let outcome: V4FrozenBackupRecoveryOutcome
+  let verifiedFileCount = 0
+  let verifiedPlaintextBytes = "0"
   if (!second) {
     outcome = "ref-unobserved-at-two-checks"
   } else if (second.sha !== plan.pinnedSourceCommitSha) {
     outcome = "ref-occupied-by-other-commit"
   } else {
-    await verifyGitHubFrozenReencryptionBackup({
+    const fullReadback = await verifyGitHubFrozenReencryptionBackup({
       github: backup,
       plan,
       expectedSourceTreeSha: input.expectedSourceTreeSha,
@@ -135,6 +139,8 @@ export async function inspectV4FrozenBackupAfterAmbiguousCreate(
     if (!after || after.sha !== plan.pinnedSourceCommitSha) {
       throw new Error("Frozen backup Git ref changed during full readback.")
     }
+    verifiedFileCount = fullReadback.verifiedFileCount
+    verifiedPlaintextBytes = fullReadback.verifiedPlaintextBytes
     outcome = "matching-backup-full-readback"
   }
   await checkRepo()
@@ -148,6 +154,8 @@ export async function inspectV4FrozenBackupAfterAmbiguousCreate(
     pinnedSourceCommitSha: plan.pinnedSourceCommitSha,
     outcome,
     backupContentsReadbackVerified: outcome === "matching-backup-full-readback",
+    verifiedFileCount,
+    verifiedPlaintextBytes,
     creationProven: false,
     automaticallyRetryCreateAuthorized: false,
     overwriteAuthorized: false,
