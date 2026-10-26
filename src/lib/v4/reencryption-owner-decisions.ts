@@ -92,6 +92,7 @@ export function proposeV4SameRepositoryReencryptionBackupBranch(
     throw new Error("Re-encryption backup must use the exact same physical GitHub repository identity.")
   }
   if (source.branch === destination.branch
+    || destination.branch === input.defaultBranch
     || backup.branch === source.branch
     || backup.branch === destination.branch
     || backup.branch === input.defaultBranch) {

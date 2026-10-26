@@ -68,6 +68,13 @@ test("D87 must never propose the DEFAULT branch as a re-encryption destination",
   }), /destination|default|branch/i)
 })
 
+test("D87 prevents a backup proposal when the requested new destination would replace the default branch", () => {
+  assert.throws(() => proposeV4SameRepositoryReencryptionBackupBranch({
+    ...options, destinationRepoId: "owner/repo#main",
+    sourceRepoId: "owner/repo#old-source",
+  }), /branch|default|distinct/i)
+})
+
 test("D87 refuses backup on a different repository or a wrong numeric physical repo identity", () => {
   for (const difference of [
     { backupRepoId: "owner/other#backup/rekey" },
