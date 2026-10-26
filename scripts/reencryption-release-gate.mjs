@@ -30,6 +30,12 @@ export async function requireReencryptionWizardReleaseGate({
     || manifest.schemaVersion !== 1
     || manifest.gate !== "first-public-release-reencryption-wizard"
     || manifest.status !== "qualified"
+    // Choice B accepts a verified same-repository backup, NOT unverified or independent storage.
+    || !manifest.backupPolicy || typeof manifest.backupPolicy !== "object"
+    || Array.isArray(manifest.backupPolicy)
+    || manifest.backupPolicy.acceptedMode !== "verified-same-repository-branch"
+    || manifest.backupPolicy.sharedRepositoryFailureDomainAccepted !== true
+    || manifest.backupPolicy.independentCopyRequired !== false
     || !manifest.checks || typeof manifest.checks !== "object"
     || Array.isArray(manifest.checks)
     || REENCRYPTION_RELEASE_CHECKS.some(check => manifest.checks[check] !== "passed")) {

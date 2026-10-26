@@ -16,6 +16,11 @@ export const V4_OWNER_REENCRYPTION_DECISIONS = Object.freeze({
   oldBranchRetention: "delete-only-after-explicit-user-action",
   // A separate branch in the SAME repository shares the same failure domain.
   independentBackupProvidedByChoiceC: false,
+  // Owner explicitly accepted shared-repository loss risk for the release gate.
+  // A fully verified backup branch is STILL required before the gate may pass.
+  releaseBackupAcceptance: "verified-same-repository-branch",
+  sharedRepositoryFailureDomainAccepted: true,
+  independentBackupMandatoryForRelease: false,
   automaticCutoverAuthorized: false,
 } as const)
 

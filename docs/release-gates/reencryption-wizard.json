@@ -2,6 +2,11 @@
   "schemaVersion": 1,
   "gate": "first-public-release-reencryption-wizard",
   "status": "blocked",
+  "backupPolicy": {
+    "acceptedMode": "verified-same-repository-branch",
+    "sharedRepositoryFailureDomainAccepted": true,
+    "independentCopyRequired": false
+  },
   "checks": {
     "ownerApprovedMigrationTopology": "passed",
     "safePreviewAndBackup": "pending",

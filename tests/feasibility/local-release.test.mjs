@@ -147,6 +147,11 @@ test("D74 release gate records owner-approved orphan topology but continues to b
     new URL("../../docs/release-gates/reencryption-wizard.json", import.meta.url), "utf8",
   ));
   assert.equal(manifest.status, "blocked");
+  assert.deepEqual(manifest.backupPolicy, {
+    acceptedMode: "verified-same-repository-branch",
+    sharedRepositoryFailureDomainAccepted: true,
+    independentCopyRequired: false,
+  });
   assert.equal(manifest.checks.ownerApprovedMigrationTopology, "passed");
   for (const check of REENCRYPTION_RELEASE_CHECKS) {
     if (check === "ownerApprovedMigrationTopology") continue;
@@ -162,7 +167,11 @@ test("first public release fails closed until the Re-encryption Wizard acceptanc
   const cwd = await mkdtemp(join(tmpdir(), "rekey-release-gate-"));
   const fileName = "docs/release-gates/reencryption-wizard.json";
   const blocked = { schemaVersion: 1, gate: "first-public-release-reencryption-wizard",
-    status: "blocked", checks: Object.fromEntries(REENCRYPTION_RELEASE_CHECKS.map(x => [x, "pending"])) };
+    status: "blocked", backupPolicy: {
+      acceptedMode: "verified-same-repository-branch",
+      sharedRepositoryFailureDomainAccepted: true,
+      independentCopyRequired: false,
+    }, checks: Object.fromEntries(REENCRYPTION_RELEASE_CHECKS.map(x => [x, "pending"])) };
   await assert.rejects(
     () => requireReencryptionWizardReleaseGate({ cwd }),
     /Re-encryption Wizard.*absent or invalid/u,
@@ -186,6 +195,24 @@ test("first public release fails closed until the Re-encryption Wizard acceptanc
       }),
     }), /Re-encryption Wizard.*fully qualified/u,
   );
+  for (const badPolicy of [undefined, {
+    acceptedMode: "verified-same-repository-branch",
+    sharedRepositoryFailureDomainAccepted: false,
+    independentCopyRequired: false,
+  }, {
+    acceptedMode: "unverified-same-repository-branch",
+    sharedRepositoryFailureDomainAccepted: true,
+    independentCopyRequired: false,
+  }]) {
+    await assert.rejects(
+      () => requireReencryptionWizardReleaseGate({
+        cwd, readText: async () => JSON.stringify({
+          ...blocked, status: "qualified", backupPolicy: badPolicy,
+          checks: Object.fromEntries(REENCRYPTION_RELEASE_CHECKS.map(x => [x, "passed"])),
+        }),
+      }), /Re-encryption Wizard.*fully qualified/u,
+    );
+  }
   await requireReencryptionWizardReleaseGate({
     cwd, readText: async () => JSON.stringify({
       ...blocked, status: "qualified",

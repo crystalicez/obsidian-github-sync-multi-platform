@@ -18,6 +18,8 @@ pnpm qualify:local
 
 **D74 owner decision (2026-10-24):** The destination topology is now approved as **Option A: a new orphan-root Git branch in the same repository, with no shared commit ancestry**. Only `ownerApprovedMigrationTopology` is marked `passed`; six other acceptance checks remain `pending`, and the overall gate is still `blocked`. The source branch must remain intact for recovery; destination data must be fully re-encrypted and verified on an independent second device before other devices switch. See [D74's approved migration contract](engineering/d74-approved-orphan-branch-migration-2026-10-24.md).
 
+**D88 owner backup policy (2026-10-26):** The owner knowingly accepted a **verified backup branch in the SAME GitHub repository** as sufficient backup *location* for first-release Re-encryption (shared repository/account failure risk accepted). It is **not** an independently stored copy. `backupPolicy` in the release manifest pins this choice; the release checker enforces it. **No backup proof has passed**: `safePreviewAndBackup` and all other unfinished checks remain pending, and `status` stays `blocked`. An actual safe backup-ref writer, authenticated full readback/restore, source/stale-client fencing, Node.js WAL durability and independent second-device migration acceptance are still required. See [D88's explicit backup acceptance contract](engineering/d88-owner-verified-same-repository-backup-policy-2026-10-26.md).
+
 ## 1. Bump release metadata
 
 Use the repository helper so `package.json`, `manifest.json`, and `versions.json` move together:
