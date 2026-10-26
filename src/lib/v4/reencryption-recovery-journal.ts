@@ -66,7 +66,7 @@ function safeRoot(root: string): string {
   return root
 }
 
-function checkReceipt(value: unknown): asserts value is V4ReencryptionObjectReceipt {
+export function assertV4ReencryptionJournalObjectReceipt(value: unknown): asserts value is V4ReencryptionObjectReceipt {
   if (!value || typeof value !== "object" || Array.isArray(value)) invalid()
   const r = value as Partial<V4ReencryptionObjectReceipt>
   if (typeof r.path !== "string" || !REMOTE_OPAQUE_PATH.test(r.path)
@@ -161,7 +161,7 @@ export function createV4ReencryptionRecoveryJournal(input: {
         || !Array.isArray(v.pendingIntents)) return { present: true }
       const seen = new Set<string>()
       for (const receipt of [...v.receipts, ...v.pendingIntents]) {
-        checkReceipt(receipt)
+        assertV4ReencryptionJournalObjectReceipt(receipt)
         if (seen.has(receipt.path)) return { present: true }
         seen.add(receipt.path)
       }
@@ -235,7 +235,7 @@ export function createV4ReencryptionRecoveryJournal(input: {
       return save(1, [], [])
     }),
     recordUploadIntent: (receipt: V4ReencryptionObjectReceipt, expectedGeneration: number) => locked(async () => {
-      checkReceipt(receipt)
+      assertV4ReencryptionJournalObjectReceipt(receipt)
       const state = await observe()
       if (!state.latest || state.damaged) invalid()
       if (state.latest.generation !== expectedGeneration) {
@@ -249,7 +249,7 @@ export function createV4ReencryptionRecoveryJournal(input: {
         [...state.latest.pendingIntents, { ...receipt }])
     }),
     appendReceipt: (receipt: V4ReencryptionObjectReceipt, expectedGeneration: number) => locked(async () => {
-      checkReceipt(receipt)
+      assertV4ReencryptionJournalObjectReceipt(receipt)
       const state = await observe()
       if (!state.latest || state.damaged) invalid()
       if (state.latest.generation !== expectedGeneration) {

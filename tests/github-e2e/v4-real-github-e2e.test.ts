@@ -7,6 +7,10 @@ import { randomBytes, sha256Hex, toBase64, toBase64Url } from "../../src/lib/byt
 import { deriveV4Keyring, type V4Keyring } from "../../src/lib/v4/crypto";
 import { V4HistoryService } from "../../src/lib/v4/history-service";
 import { verifyGitHubReencryptionSource } from "../../src/lib/v4/reencryption-trusted-loader";
+import { verifyStagedV4ReencryptionGitBlobs } from "../../src/lib/v4/reencryption-blob-reconciliation";
+import { createV4ReencryptionRecoveryJournal } from "../../src/lib/v4/reencryption-recovery-journal";
+import { computeV4GitBlobSha1 } from "../../src/lib/v4/git-blob-identity";
+import type { V4LocalIndexAdapter } from "../../src/lib/v4/local-index";
 import {
   planV4OrphanReencryptionDestination,
   assertV4OrphanDestinationRefObservations,
@@ -679,6 +683,47 @@ async function runOrphanRootBootstrapScenario(config: GitHubConfig): Promise<voi
   assert.equal(verified.verifiedRemoteObjectCount, 1);
   assert.equal(verified.totalVerifiedPlaintextBytes, String(plaintext.byteLength));
   assert.equal(after.mutations - before.mutations, 0);
+
+  // D82: the *same disposable encrypted orphan* can be independently
+  // reconciled by immutable Git Blob SHA. This audit is read-only, and a
+  // matching pending intent is NOT promoted into a confirmed WAL receipt.
+  const walFiles = new Map<string, string>();
+  const walAdapter: V4LocalIndexAdapter = {
+    async read(path) {
+      const stored = walFiles.get(path);
+      if (stored === undefined) throw new Error("Synthetic D82 WAL entry missing");
+      return stored;
+    },
+    async write(path, value) { walFiles.set(path, value); },
+    async exists(path) { return walFiles.has(path); },
+    async mkdir(_path) {},
+  };
+  const wal = createV4ReencryptionRecoveryJournal({
+    adapter: walAdapter,
+    root: ".obsidian/plugins/e2e-d82/rekey",
+    destinationRepoId, sourceCommitSha: oldHead.sha,
+    runId: "d82-live-proof", journalKey: randomBytes(32),
+  });
+  const noteCiphertext = prepared.files.find(file => file.path === record.remotePath);
+  assert.ok(noteCiphertext, "Expected a synthetic encrypted V4 note blob");
+  const initialWal = await wal.begin();
+  await wal.recordUploadIntent({
+    path: noteCiphertext.path,
+    sha: computeV4GitBlobSha1(noteCiphertext.bytes),
+    byteLength: noteCiphertext.bytes.byteLength,
+  }, initialWal.generation);
+  const beforeBlobAudit = secondDevice.transportMetricsSnapshot.mutations;
+  const audited = await verifyStagedV4ReencryptionGitBlobs({
+    plan, journal: wal, github: secondDevice,
+  });
+  assert.equal(audited.status, "verified");
+  assert.equal(audited.verifiedObjectCount, 1);
+  assert.equal(audited.pendingIntentCount, 1);
+  assert.equal(audited.permissionToPublish, false);
+  assert.equal(audited.destinationContentVerified, false);
+  assert.equal((await wal.load())!.pendingIntents.length, 1);
+  assert.equal(secondDevice.transportMetricsSnapshot.mutations - beforeBlobAudit, 0);
+
   assert.deepEqual((await secondDevice.getGitCommit(rootCommit)).parentShas, []);
   assert.equal((await sourceClient.getGitRef()).sha, oldHead.sha,
     "orphan fixture must never modify default/source branch");
