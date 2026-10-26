@@ -14,6 +14,9 @@ import { verifyV4ReencryptionDestinationExactCommit } from "../../src/lib/v4/ree
 import { inspectV4ReencryptionOrphanAfterAmbiguousPublication } from "../../src/lib/v4/reencryption-orphan-recovery"
 import { publishAndVerifyV4ReencryptionOrphanRef } from "../../src/lib/v4/reencryption-orphan-publication-reconciled"
 import { publishV4ThreeBranchDestinationAfterBackup } from "../../src/lib/v4/reencryption-three-branch-publish"
+import { publishV4JournaledThreeBranchDestination, reconcileV4PendingOrphanWithJournal } from "../../src/lib/v4/reencryption-ref-journal-coordinator"
+import { createV4ReencryptionRecoveryJournal } from "../../src/lib/v4/reencryption-recovery-journal"
+import type { V4LocalIndexAdapter } from "../../src/lib/v4/local-index"
 import type { V4RemoteConfig } from "../../src/lib/v4/protocol-types"
 import type { V4ReencryptionStagingResult } from "../../src/lib/v4/reencryption-staging-receipts"
 import type { V4GitHubFrozenBackupVerificationReport } from "../../src/lib/v4/reencryption-trusted-loader"
@@ -723,6 +726,201 @@ test("D100 refuses actual GitHub default-branch drift into the Backup branch", a
     ...input, backupRefReader,
   }), /GitHub default branch/i)
   assert.equal(f.calls.filter(x => x === "ref-create").length, 0)
+})
+
+async function D102DestinationJournal(receipts: readonly { path: string; sha: string; byteLength: number }[]) {
+  const files = new Map<string, string>()
+  const adapter: V4LocalIndexAdapter = {
+    async exists(path) { return files.has(path) },
+    async read(path) {
+      const data = files.get(path)
+      if (data === undefined) throw new Error("missing")
+      return data
+    },
+    async write(path, data) { files.set(path, data) },
+    async mkdir(_path) {},
+  }
+  const open = () => createV4ReencryptionRecoveryJournal({
+    adapter, root: "v4/rekey-destination",
+    destinationRepoId: targetId, sourceCommitSha: sourceSha,
+    runId: "d102-destination-run", journalKey: new Uint8Array(32).fill(0x36),
+  })
+  const journal = open()
+  let snapshot = await journal.begin()
+  const backupIntent = {
+    role: "backup" as const, repoId: D100backupPlan.backupRepoId,
+    commitSha: sourceSha, treeSha: sourceTreeSha,
+  }
+  snapshot = await journal.recordRefIntent(backupIntent, snapshot.generation)
+  snapshot = await journal.markRefReadbackObserved(backupIntent, snapshot.generation)
+  snapshot = await journal.recordStagingHandoff(backupIntent, snapshot.generation)
+  for (const receipt of receipts) {
+    snapshot = await journal.recordUploadIntent(receipt, snapshot.generation)
+    snapshot = await journal.appendReceipt(receipt, snapshot.generation)
+  }
+  const wal = {
+    async assertExclusiveStageLease() {},
+    async assertCrashDurable() {},
+  }
+  // No-op WAL is test ONLY: does NOT certify power-loss-safe Windows writes.
+  return { journal, open, wal, files }
+}
+
+test("D102 WAL-bound 3-branch publication requires persisted blob receipts and records verified Destination ref", async () => {
+  const f = await fixture()
+  const prepared = await prepareV4ReencryptionOrphanCommit(f.input)
+  const j = await D102DestinationJournal(f.input.staged.receipts)
+  const result = await publishV4JournaledThreeBranchDestination({
+    ...D100input(f, prepared), journal: j.journal, wal: j.wal,
+  })
+  assert.equal(result.destinationContentsReadbackVerified, true)
+  assert.equal(result.initiatingDeviceCutoverAuthorized, false)
+  assert.equal(f.calls.filter(c => c === "ref-create").length, 1)
+  const restarted = await j.open().load()
+  assert.ok(restarted)
+  assert.deepEqual(restarted.verifiedRefObservations, [
+    {
+      role: "backup",
+      repoId: D100backupPlan.backupRepoId,
+      commitSha: sourceSha, treeSha: sourceTreeSha,
+    },
+    {
+      role: "destination",
+      repoId: targetId,
+      commitSha: candidateSha,
+      treeSha: candidateTreeSha,
+    },
+  ])
+  assert.equal(restarted.pendingRefIntents.length, 0)
+  assert.equal(restarted.cutoverAuthorized, false)
+  await assert.rejects(() => publishV4JournaledThreeBranchDestination({
+    ...D100input(f, prepared), journal: j.open(), wal: j.wal,
+  }), /previous ref intent|unresolved mutations|previous/i)
+  assert.equal(f.calls.filter(c => c === "ref-create").length, 1)
+})
+
+test("D102 refuses Destination mutation if encrypted WAL is missing even one staged object receipt", async () => {
+  const f = await fixture()
+  const prepared = await prepareV4ReencryptionOrphanCommit(f.input)
+  const j = await D102DestinationJournal([])
+  await assert.rejects(() => publishV4JournaledThreeBranchDestination({
+    ...D100input(f, prepared), journal: j.journal, wal: j.wal,
+  }), /staged blob receipts/i)
+  assert.equal((await j.journal.load())?.pendingRefIntents.length, 0)
+  assert.equal(f.calls.filter(c => c === "ref-create").length, 0)
+})
+
+test("D102 fails closed for unsupported Windows WAL durability before Destination ref intent", async () => {
+  const f = await fixture()
+  const prepared = await prepareV4ReencryptionOrphanCommit(f.input)
+  const j = await D102DestinationJournal(f.input.staged.receipts)
+  await assert.rejects(() => publishV4JournaledThreeBranchDestination({
+    ...D100input(f, prepared), journal: j.journal,
+    wal: {
+      ...j.wal,
+      assertCrashDurable: async () => { throw new Error("Node directory fsync EPERM") },
+    },
+  }), /fsync EPERM/i)
+  assert.deepEqual((await j.journal.load())?.pendingRefIntents, [])
+  assert.equal(f.calls.filter(c => c === "ref-create").length, 0)
+})
+
+test("D102 ambiguous Destination network result with unreadable GitHub leaves exact pending WAL for manual recovery", async () => {
+  const f = await fixture()
+  const prepared = await prepareV4ReencryptionOrphanCommit(f.input)
+  const j = await D102DestinationJournal(f.input.staged.receipts)
+  const original = f.github.createGitRef
+  f.github.createGitRef = async sha => {
+    try { await original(sha) }
+    finally {
+      f.github.getGitRefOrNull = async () => { throw new Error("GitHub 503 unavailable after create") }
+    }
+  }
+  await assert.rejects(() => publishV4JournaledThreeBranchDestination({
+    ...D100input(f, prepared), journal: j.journal, wal: j.wal,
+  }), /ambiguous|readback|recovery/i)
+  const pending = await j.open().load()
+  assert.ok(pending)
+  assert.deepEqual(pending.pendingRefIntents, [{
+    role: "destination", repoId: targetId,
+    commitSha: candidateSha, treeSha: candidateTreeSha,
+  }])
+  assert.equal(pending.requiresRemoteRevalidation, true)
+  assert.equal(pending.permissionToPublish, false)
+  assert.equal(f.calls.filter(c => c === "ref-create").length, 1)
+})
+
+function D103originalProof(f: Awaited<ReturnType<typeof fixture>>) {
+  return {
+    integrityScope: "all-live-objects" as const,
+    pinnedSourceCommitSha: sourceSha,
+    verifiedFileCount: f.input.staged.records.length,
+    verifiedRemoteObjectCount: f.input.staged.receipts.length,
+    totalVerifiedPlaintextBytes: f.input.staged.preview.totalPlaintextBytes,
+  }
+}
+
+test("D103 Destination lost POST/GET recovered after restart by read-only Git+new-key full verification", async () => {
+  const f = await fixture()
+  const prepared = await prepareV4ReencryptionOrphanCommit(f.input)
+  const j = await D102DestinationJournal(f.input.staged.receipts)
+  const originalGet = f.github.getGitRefOrNull
+  const originalCreate = f.github.createGitRef
+  f.github.createGitRef = async sha => {
+    try { await originalCreate(sha) }
+    finally {
+      f.github.getGitRefOrNull = async () => { throw new Error("GitHub 503 unreadable ref after POST") }
+    }
+  }
+  await assert.rejects(() => publishV4JournaledThreeBranchDestination({
+    ...D100input(f, prepared), journal: j.journal, wal: j.wal,
+  }), /ambiguous|recovery|readback/i)
+  assert.equal(f.calls.filter(c => c === "ref-create").length, 1)
+  assert.equal((await j.open().load())?.pendingRefIntents.length, 1)
+  f.github.getGitRefOrNull = originalGet
+  const backupReader = D100input(f, prepared).backupRefReader
+  const report = await reconcileV4PendingOrphanWithJournal({
+    ...recoveryInput(f, prepared),
+    backupPlan: D100backupPlan,
+    backupRefReader: backupReader,
+    verifiedOriginalSource: D103originalProof(f),
+    journal: j.open(), wal: j.wal,
+  })
+  assert.equal(report.destinationContentsVerified, true)
+  assert.equal(report.verifiedFileCount, 1)
+  assert.equal(report.automaticallyRetryCreateAuthorized, false)
+  assert.equal(report.initiatingDeviceCutoverAuthorized, false)
+  assert.equal(f.calls.filter(c => c === "ref-create").length, 1)
+  const recovered = await j.open().load()
+  assert.ok(recovered)
+  assert.equal(recovered.pendingRefIntents.length, 0)
+  assert.equal(recovered.verifiedRefObservations.length, 2)
+  assert.equal(recovered.permissionToPublish, false)
+  await assert.rejects(() => reconcileV4PendingOrphanWithJournal({
+    ...recoveryInput(f, prepared), backupPlan: D100backupPlan,
+    backupRefReader: backupReader, verifiedOriginalSource: D103originalProof(f),
+    journal: j.open(), wal: j.wal,
+  }), /exact pending Destination intent/i)
+})
+
+test("D103 incomplete/moved Destination readback keeps WAL pending and never retries GitHub POST", async () => {
+  const f = await fixture()
+  const prepared = await prepareV4ReencryptionOrphanCommit(f.input)
+  const j = await D102DestinationJournal(f.input.staged.receipts)
+  let state = (await j.journal.load())!
+  state = await j.journal.recordRefIntent({
+    role: "destination", repoId: targetId,
+    commitSha: candidateSha, treeSha: candidateTreeSha,
+  }, state.generation)
+  f.occupyRef(sourceSha) // Different commit has claimed the destination name
+  await assert.rejects(() => reconcileV4PendingOrphanWithJournal({
+    ...recoveryInput(f, prepared), backupPlan: D100backupPlan,
+    backupRefReader: D100input(f, prepared).backupRefReader,
+    verifiedOriginalSource: D103originalProof(f),
+    journal: j.journal, wal: j.wal,
+  }), /missing|conflicting|incomplete/i)
+  assert.equal(f.calls.filter(c => c === "ref-create").length, 0)
+  assert.equal((await j.journal.load())?.pendingRefIntents.length, 1)
 })
 
 test("D96 refuses remote ref collision, wrong repository, missing backup proof and staged SHA mismatch before any mutation", async () => {

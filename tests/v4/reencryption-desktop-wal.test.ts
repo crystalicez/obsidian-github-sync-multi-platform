@@ -62,6 +62,50 @@ test("D86 real disk journal intent+receipt survive new instances and leave no pl
   } finally { await t.cleanup() }
 })
 
+test("D103 real Node OS filesystem persists encrypted Backup + Destination ref intents through release/reacquire, without cutover permission", async () => {
+  const t = await sandbox()
+  try {
+    const store = await acquireV4DesktopRekeyWalStorage({ rootAbsolute: t.root, journalRoot })
+    const journal = makeJournal(store.adapter)
+    let state = await journal.begin()
+    const backup = {
+      role: "backup" as const,
+      repoId: "owner/repo#backup/old-snapshot",
+      commitSha: pinned,
+      treeSha: "b".repeat(40),
+    }
+    const destination = {
+      role: "destination" as const, repoId: dest,
+      commitSha: "c".repeat(40), treeSha: "d".repeat(40),
+    }
+    state = await journal.recordRefIntent(backup, state.generation)
+    state = await journal.markRefReadbackObserved(backup, state.generation)
+    state = await journal.recordRefIntent(destination, state.generation)
+    const storedBytes = [
+      await readFile(join(t.root, "rekey", "wal", "slot-0.json"), "utf8"),
+      await readFile(join(t.root, "rekey", "wal", "slot-1.json"), "utf8"),
+    ].join("")
+    assert.ok(!storedBytes.includes(backup.repoId))
+    // Destination repo/branch identity is intentionally stored in the existing authenticated WAL slot header.
+    assert.ok(storedBytes.includes(destination.repoId))
+    assert.ok(!storedBytes.includes(destination.commitSha))
+    await store.release()
+
+    const reopened = await acquireV4DesktopRekeyWalStorage({ rootAbsolute: t.root, journalRoot })
+    try {
+      const recovered = await makeJournal(reopened.adapter).load()
+      assert.ok(recovered)
+      assert.deepEqual(recovered.pendingRefIntents, [destination])
+      assert.deepEqual(recovered.verifiedRefObservations, [backup])
+      assert.equal(recovered.permissionToPublish, false)
+      assert.equal(recovered.cutoverAuthorized, false)
+      assert.equal(recovered.requiresRemoteRevalidation, true)
+      const noAutoRetry = makeJournal(reopened.adapter)
+      await assert.rejects(() => noAutoRetry.recordRefIntent(destination, recovered.generation), /duplicate/i)
+    } finally { await reopened.release() }
+  } finally { await t.cleanup() }
+})
+
 test("D86 does not certify power-loss durability when Windows directory fsync is unsupported", async () => {
   const t = await sandbox()
   try {

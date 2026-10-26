@@ -166,6 +166,195 @@ test("D80 pending upload intent survives restart and mismatched receipt cannot c
   assert.equal(completed.permissionToPublish, false);
 });
 
+
+const backupIntent = {
+  role: "backup" as const,
+  repoId: "owner/repo#backup/frozen-old-key",
+  commitSha: sourceCommitSha,
+  treeSha: "c".repeat(40),
+};
+const destinationIntent = {
+  role: "destination" as const,
+  repoId,
+  commitSha: "d".repeat(40),
+  treeSha: "e".repeat(40),
+};
+
+test("D101 encrypted two-slot WAL persists BOTH Git ref create-intents through restart with exact SHA/tree identity", async () => {
+  const adapter = new MemoryAdapter();
+  let journal = create(adapter);
+  const begun = await journal.begin();
+  let snap = await journal.recordRefIntent(backupIntent, begun.generation);
+  assert.deepEqual(snap.pendingRefIntents, [backupIntent]);
+  assert.equal(snap.verifiedRefObservations.length, 0);
+  assert.equal(snap.permissionToPublish, false);
+  assert.equal(snap.cutoverAuthorized, false);
+  const raw = [...adapter.files.values()].join("");
+  assert.ok(!raw.includes(backupIntent.repoId));
+  // Source SHA is intentionally in the existing WAL authenticated header as the run identity.
+  assert.ok(raw.includes(sourceCommitSha));
+  assert.ok(!raw.includes(backupIntent.treeSha));
+  journal = create(adapter); // simulated process restart after GitHub POST outcome was lost
+  const afterRestart = await journal.load();
+  assert.ok(afterRestart);
+  assert.deepEqual(afterRestart.pendingRefIntents, [backupIntent]);
+  assert.equal(afterRestart.requiresRemoteRevalidation, true);
+  assert.equal(afterRestart.permissionToPublish, false);
+  await assert.rejects(() => journal.recordRefIntent(backupIntent, afterRestart.generation), /duplicate/i);
+  await assert.rejects(() => journal.recordRefIntent(destinationIntent, afterRestart.generation), /requires completed staging|verified Backup/i);
+  await assert.rejects(() => journal.recordUploadIntent(receipt(1), afterRestart.generation), /unresolved ref/i);
+
+  snap = await journal.markRefReadbackObserved(backupIntent, afterRestart.generation);
+  assert.equal(snap.pendingRefIntents.length, 0);
+  assert.deepEqual(snap.verifiedRefObservations, [backupIntent]);
+  const upload = await journal.recordUploadIntent(receipt(1), snap.generation);
+  snap = await journal.appendReceipt(receipt(1), upload.generation);
+  snap = await journal.recordRefIntent(destinationIntent, snap.generation);
+  assert.deepEqual(snap.pendingRefIntents, [destinationIntent]);
+  assert.equal(snap.permissionToPublish, false);
+  journal = create(adapter);
+  const refLost = await journal.load();
+  assert.ok(refLost);
+  assert.deepEqual(refLost.pendingRefIntents, [destinationIntent]);
+  assert.deepEqual(refLost.verifiedRefObservations, [backupIntent]);
+  assert.equal(refLost.requiresRemoteRevalidation, true);
+  await assert.rejects(() => journal.recordRefIntent(destinationIntent, refLost.generation), /duplicate/i);
+  await assert.rejects(() => journal.recordUploadIntent(receipt(2), refLost.generation), /unresolved ref/i);
+  snap = await journal.markRefReadbackObserved(destinationIntent, refLost.generation);
+  assert.deepEqual(snap.verifiedRefObservations, [backupIntent, destinationIntent]);
+  assert.equal(snap.permissionToPublish, false);
+  assert.equal(snap.cutoverAuthorized, false);
+  assert.ok(Object.isFrozen(snap.pendingRefIntents));
+  assert.ok(Object.isFrozen(snap.verifiedRefObservations[0]));
+});
+
+test("D101 journal ref-intent and receipt fail closed on wrong commit/tree/repo/role/stale generation", async () => {
+  const adapter = new MemoryAdapter();
+  const journal = create(adapter);
+  const begun = await journal.begin();
+  const invalid = [
+    { ...backupIntent, role: "destination" },
+    { ...backupIntent, repoId: repoId },
+    { ...backupIntent, repoId: "other/repo#backup/frozen-old-key" },
+    { ...backupIntent, commitSha: "a".repeat(39) },
+    { ...backupIntent, treeSha: "HEAD" },
+    { ...backupIntent, role: "unknown" },
+  ];
+  const original = new Map(adapter.files);
+  for (const item of invalid) {
+    await assert.rejects(() => journal.recordRefIntent(item as typeof backupIntent, begun.generation));
+    assert.deepEqual(adapter.files, original);
+  }
+  const pending = await journal.recordRefIntent(backupIntent, begun.generation);
+  await assert.rejects(() => journal.markRefReadbackObserved({ ...backupIntent, treeSha: "f".repeat(40) }, pending.generation), /does not match/i);
+  await assert.rejects(() => journal.markRefReadbackObserved(backupIntent, begun.generation), /stale/i);
+  assert.deepEqual((await journal.load())?.pendingRefIntents, [backupIntent]);
+  await assert.rejects(() => journal.recordRefIntent(backupIntent, pending.generation), /duplicate/i);
+});
+
+test("D101 WAL torn destination ref intent never grants retry, reuse, publication or cutover", async () => {
+  class TornAdapter extends MemoryAdapter {
+    tear = false;
+    override async write(path: string, value: string) {
+      if (this.tear) { this.files.set(path, value.slice(0, 14)); throw new Error("torn destination WAL write"); }
+      await super.write(path, value);
+    }
+  }
+  const adapter = new TornAdapter();
+  let journal = create(adapter);
+  let snap = await journal.begin();
+  snap = await journal.recordRefIntent(backupIntent, snap.generation);
+  snap = await journal.markRefReadbackObserved(backupIntent, snap.generation);
+  adapter.tear = true;
+  await assert.rejects(() => journal.recordRefIntent(destinationIntent, snap.generation), /torn destination WAL write/i);
+  adapter.tear = false;
+  journal = create(adapter);
+  const restored = await journal.load();
+  assert.ok(restored);
+  assert.deepEqual(restored.verifiedRefObservations, [backupIntent]);
+  assert.deepEqual(restored.pendingRefIntents, []);
+  assert.equal(restored.requiresRemoteRevalidation, true);
+  assert.equal(restored.permissionToPublish, false);
+  await assert.rejects(() => journal.recordRefIntent(destinationIntent, restored.generation),
+    /recovery|journal/i);
+});
+
+test("D103 a corrupted older WAL slot is readable for manual recovery but cannot certify safe Git mutation", async () => {
+  const adapter = new MemoryAdapter();
+  const journal = create(adapter);
+  let state = await journal.begin();
+  state = await journal.recordRefIntent(backupIntent, state.generation);
+  const olderSlot = [...adapter.files.keys()].find(path => path.endsWith("slot-1.json"));
+  assert.ok(olderSlot);
+  adapter.files.set(olderSlot, "{broken");
+  const loaded = await create(adapter).load();
+  assert.ok(loaded);
+  assert.equal(loaded.generation, state.generation);
+  assert.deepEqual(loaded.pendingRefIntents, [backupIntent]);
+  assert.equal(loaded.requiresRemoteRevalidation, true);
+  await assert.rejects(() => create(adapter).assertHealthySnapshot(state.generation),
+    V4ReencryptionJournalRecoveryRequiredError);
+  await assert.rejects(() => journal.markRefReadbackObserved(backupIntent, state.generation),
+    V4ReencryptionJournalRecoveryRequiredError);
+});
+
+test("D103 missing older WAL slot after generation two prevents further mutations despite a valid newest slot", async () => {
+  const adapter = new MemoryAdapter();
+  const journal = create(adapter);
+  const begin = await journal.begin();
+  const pending = await journal.recordRefIntent(backupIntent, begin.generation);
+  const oldSlot = [...adapter.files.keys()].find(path => path.endsWith("slot-1.json"));
+  assert.ok(oldSlot);
+  adapter.files.delete(oldSlot);
+  const view = await journal.load();
+  assert.ok(view);
+  assert.deepEqual(view.pendingRefIntents, [backupIntent]);
+  assert.equal(view.requiresRemoteRevalidation, true);
+  await assert.rejects(() => journal.assertHealthySnapshot(pending.generation),
+    V4ReencryptionJournalRecoveryRequiredError);
+  await assert.rejects(() => journal.markRefReadbackObserved(backupIntent, pending.generation),
+    V4ReencryptionJournalRecoveryRequiredError);
+});
+
+test("D104 one-time Backup-to-Staging WAL handoff survives restart even with ZERO ciphertext receipts", async () => {
+  const adapter = new MemoryAdapter();
+  let journal = create(adapter);
+  let state = await journal.begin();
+  state = await journal.recordRefIntent(backupIntent, state.generation);
+  state = await journal.markRefReadbackObserved(backupIntent, state.generation);
+  assert.equal(state.stageHandoffStarted, false);
+  const beforeGeneration = state.generation;
+  state = await journal.recordStagingHandoff(backupIntent, state.generation);
+  assert.equal(state.generation, beforeGeneration + 1);
+  assert.equal(state.stageHandoffStarted, true);
+  assert.equal(state.receipts.length, 0);
+  assert.equal(state.permissionToPublish, false);
+  assert.equal(state.cutoverAuthorized, false);
+  journal = create(adapter);
+  const restarted = await journal.load();
+  assert.ok(restarted);
+  assert.equal(restarted.stageHandoffStarted, true);
+  assert.equal(restarted.requiresRemoteRevalidation, true);
+  await assert.rejects(() => journal.recordStagingHandoff(backupIntent, restarted.generation),
+    /already started|stale/i);
+  await assert.rejects(() => journal.recordStagingHandoff(
+    { ...backupIntent, treeSha: "f".repeat(40) }, restarted.generation),
+  /already started|stale/i);
+  assert.equal((await journal.load())?.generation, restarted.generation);
+});
+
+test("D101 legacy encrypted staging-only WAL payload still opens as ref-free recovery evidence", async () => {
+  const adapter = new MemoryAdapter();
+  const journal = create(adapter);
+  const started = await journal.begin();
+  const loaded = await create(adapter).load();
+  assert.ok(loaded);
+  assert.equal(started.generation, 1);
+  assert.deepEqual(loaded.pendingRefIntents, []);
+  assert.deepEqual(loaded.verifiedRefObservations, []);
+  assert.equal(loaded.requiresRemoteRevalidation, true);
+});
+
 test("D80 reset or auto-publish controls are not exposed by the journal interface", async () => {
   const j = create();
   assert.equal("clear" in j, false);

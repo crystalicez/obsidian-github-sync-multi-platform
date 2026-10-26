@@ -3,7 +3,7 @@ import { computeV4GitBlobSha1 } from "./git-blob-identity"
 import { inspectV4ReencryptionInventory } from "./reencryption-inventory"
 import type { V4ReencryptionObjectReceipt, V4ReencryptionStageInput, V4ReencryptionStagingResult } from "./reencryption-staging-receipts"
 import { stageV4ReencryptionVaultObjects } from "./reencryption-staging-receipts"
-import type { V4ReencryptionRecoveryJournal, V4ReencryptionJournalSnapshot } from "./reencryption-recovery-journal"
+import type { V4ReencryptionRecoveryJournal, V4ReencryptionJournalSnapshot, V4ReencryptionRefIntent } from "./reencryption-recovery-journal"
 
 /**
  * Binds D79's staged Git immutable objects to D80's encrypted intent WAL.
@@ -15,6 +15,12 @@ export interface V4JournaledReencryptionStageInput extends V4ReencryptionStageIn
   readonly journal: V4ReencryptionRecoveryJournal
   /** Must be a trusted platform-held exclusive lease, across processes. */
   readonly assertExclusiveStageLease: () => Promise<void>
+  /** D102 explicit same-run transition AFTER full Backup readback. No
+   * automatic resume of an existing WAL after a restart/crash. */
+  readonly beginAfterVerifiedBackup?: {
+    readonly expectedJournalGeneration: number
+    readonly backupRef: V4ReencryptionRefIntent
+  } | undefined
 }
 
 export interface V4JournaledReencryptionStagingResult extends V4ReencryptionStagingResult {
@@ -52,10 +58,36 @@ export async function stageV4ReencryptionVaultObjectsWithJournal(
   await input.assertExclusiveStageLease()
   throwIfV4Aborted(input.signal)
   const previous = await input.journal.load()
+  let progress: V4ReencryptionJournalSnapshot
   if (previous) {
-    throw new Error("Re-encryption WAL previous run requires manual recovery; automatic reuse is forbidden.")
+    const handoff = input.beginAfterVerifiedBackup
+    const approved = previous.verifiedRefObservations.length === 1
+      ? previous.verifiedRefObservations[0] : undefined
+    if (!handoff || !approved
+      || !Number.isSafeInteger(handoff.expectedJournalGeneration)
+      || previous.generation !== handoff.expectedJournalGeneration
+      || approved.role !== "backup"
+      || approved.repoId !== handoff.backupRef.repoId
+      || approved.commitSha !== input.plan.pinnedSourceCommitSha
+      || approved.commitSha !== handoff.backupRef.commitSha
+      || approved.treeSha !== handoff.backupRef.treeSha
+      || previous.stageHandoffStarted
+      || previous.pendingRefIntents.length !== 0
+      || previous.pendingIntents.length !== 0
+      || previous.receipts.length !== 0) {
+      throw new Error("Re-encryption WAL previous run requires manual recovery; automatic reuse is forbidden.")
+    }
+    // Explicit first-stage-only handoff, NOT replay/resume. All subsequent
+    // runs will have receipts/intent and will be rejected.
+    // Persist the one-time phase boundary BEFORE the first possible remote
+    // blob upload, even for an empty vault. A restart must never replay it.
+    progress = await input.journal.recordStagingHandoff(handoff.backupRef, previous.generation)
+  } else {
+    if (input.beginAfterVerifiedBackup) {
+      throw new Error("Re-encryption WAL verified Backup handoff has no source journal.")
+    }
+    progress = await input.journal.begin()
   }
-  let progress = await input.journal.begin()
   let stagedObjects = 0
   const result = await stageV4ReencryptionVaultObjects({
     ...input,

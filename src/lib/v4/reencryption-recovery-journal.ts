@@ -1,4 +1,5 @@
 import { bytesToUtf8, fromBase64, sha256Hex, toBase64, utf8ToBytes } from "../bytes"
+import { assertSafeGitHubBranch, assertSafeGitHubRepositoryCoordinates } from "../github-config"
 import { decryptV4Payload, encryptV4Payload } from "./crypto"
 import type { V4LocalIndexAdapter } from "./local-index"
 import { V4_GITHUB_REST_SAFE_WRITER_BYTES } from "./large-files"
@@ -27,16 +28,30 @@ interface Slot {
   readonly digest: string
 }
 
+export interface V4ReencryptionRefIntent {
+  readonly role: "backup" | "destination"
+  readonly repoId: string
+  readonly commitSha: string
+  readonly treeSha: string
+}
+
 interface Payload {
   readonly status: "staging-only"
   readonly pendingIntents: readonly V4ReencryptionObjectReceipt[]
   readonly receipts: readonly V4ReencryptionObjectReceipt[]
+  /** Optional on legacy D80/D81 journals; encrypted within the WAL. */
+  readonly refIntents?: readonly V4ReencryptionRefIntent[]
+  readonly refReceipts?: readonly V4ReencryptionRefIntent[]
+  readonly stageHandoffStarted?: boolean
 }
 
 export interface V4ReencryptionJournalSnapshot {
   readonly generation: number
   readonly receipts: readonly V4ReencryptionObjectReceipt[]
   readonly pendingIntents: readonly V4ReencryptionObjectReceipt[]
+  readonly pendingRefIntents: readonly V4ReencryptionRefIntent[]
+  readonly verifiedRefObservations: readonly V4ReencryptionRefIntent[]
+  readonly stageHandoffStarted: boolean
   readonly requiresRemoteRevalidation: true
   readonly permissionToPublish: false
   readonly cutoverAuthorized: false
@@ -47,12 +62,21 @@ export interface V4ReencryptionRecoveryJournal {
   readonly sourceCommitSha: string
   readonly destinationRepoId: string
   load(): Promise<V4ReencryptionJournalSnapshot | null>
+  /** Unlike load(), refuses ANY damaged sibling slot. Required immediately
+   * before sending an irreversible Git ref creation request. */
+  assertHealthySnapshot(expectedGeneration: number): Promise<V4ReencryptionJournalSnapshot>
   /** Only allowed for two wholly absent slots; never clears previous work. */
   begin(): Promise<V4ReencryptionJournalSnapshot>
   /** Persist upload intent BEFORE invoking GitHub; ambiguous results stay pending. */
   recordUploadIntent(receipt: V4ReencryptionObjectReceipt, expectedGeneration: number): Promise<V4ReencryptionJournalSnapshot>
   /** Called only after the exact expected Git Blob SHA receipt is observed. */
   appendReceipt(receipt: V4ReencryptionObjectReceipt, expectedGeneration: number): Promise<V4ReencryptionJournalSnapshot>
+  /** Persist a create-only Git ref intent BEFORE its very first POST attempt. */
+  recordRefIntent(intent: V4ReencryptionRefIntent, expectedGeneration: number): Promise<V4ReencryptionJournalSnapshot>
+  /** One-shot WAL transition AFTER authenticated Backup ref readback, BEFORE staging any new ciphertext. */
+  recordStagingHandoff(backup: V4ReencryptionRefIntent, expectedGeneration: number): Promise<V4ReencryptionJournalSnapshot>
+  /** Only AFTER separate complete Git/crypto readback; never grants publication or local cutover. */
+  markRefReadbackObserved(intent: V4ReencryptionRefIntent, expectedGeneration: number): Promise<V4ReencryptionJournalSnapshot>
 }
 
 function invalid(): never { throw new V4ReencryptionJournalRecoveryRequiredError() }
@@ -73,6 +97,34 @@ export function assertV4ReencryptionJournalObjectReceipt(value: unknown): assert
     || typeof r.sha !== "string" || !GIT_SHA.test(r.sha)
     || !Number.isSafeInteger(r.byteLength) || (r.byteLength ?? 0) <= 0
     || (r.byteLength ?? 0) > V4_GITHUB_REST_SAFE_WRITER_BYTES) invalid()
+}
+
+function assertRefIntent(value: unknown, sourceCommitSha: string, destinationRepoId: string): asserts value is V4ReencryptionRefIntent {
+  if (!value || typeof value !== "object" || Array.isArray(value)) invalid()
+  const r = value as Partial<V4ReencryptionRefIntent>
+  if ((r.role !== "backup" && r.role !== "destination")
+    || typeof r.repoId !== "string" || r.repoId.length >= 200
+    || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+#[A-Za-z0-9_./-]+$/u.test(r.repoId)
+    || typeof r.commitSha !== "string" || !GIT_SHA.test(r.commitSha)
+    || typeof r.treeSha !== "string" || !GIT_SHA.test(r.treeSha)
+    || r.repoId.split("#")[0]!.toLowerCase() !== destinationRepoId.split("#")[0]!.toLowerCase()
+    || (r.role === "destination" && (r.repoId !== destinationRepoId || r.commitSha === sourceCommitSha))
+    || (r.role === "backup" && (r.repoId === destinationRepoId || r.commitSha !== sourceCommitSha))) {
+    invalid()
+  }
+  const [ownerRepo, branch] = r.repoId.split("#")
+  const [owner, repo] = ownerRepo!.split("/")
+  try {
+    assertSafeGitHubRepositoryCoordinates(owner ?? "", repo ?? "")
+    assertSafeGitHubBranch(branch ?? "")
+  } catch {
+    invalid()
+  }
+}
+
+function equalRef(a: V4ReencryptionRefIntent, b: V4ReencryptionRefIntent): boolean {
+  return a.role === b.role && a.repoId === b.repoId
+    && a.commitSha === b.commitSha && a.treeSha === b.treeSha
 }
 
 function isSlot(value: unknown): value is Slot {
@@ -99,11 +151,17 @@ function snapshot(
   generation: number,
   receipts: readonly V4ReencryptionObjectReceipt[],
   pendingIntents: readonly V4ReencryptionObjectReceipt[],
+  pendingRefIntents: readonly V4ReencryptionRefIntent[],
+  verifiedRefObservations: readonly V4ReencryptionRefIntent[],
+  stageHandoffStarted: boolean,
 ): V4ReencryptionJournalSnapshot {
   return Object.freeze({
     generation,
     receipts: Object.freeze(receipts.map(r => Object.freeze({ ...r }))),
     pendingIntents: Object.freeze(pendingIntents.map(r => Object.freeze({ ...r }))),
+    pendingRefIntents: Object.freeze(pendingRefIntents.map(r => Object.freeze({ ...r }))),
+    verifiedRefObservations: Object.freeze(verifiedRefObservations.map(r => Object.freeze({ ...r }))),
+    stageHandoffStarted,
     requiresRemoteRevalidation: true,
     permissionToPublish: false,
     cutoverAuthorized: false,
@@ -165,7 +223,24 @@ export function createV4ReencryptionRecoveryJournal(input: {
         if (seen.has(receipt.path)) return { present: true }
         seen.add(receipt.path)
       }
-      return { present: true, state: snapshot(data.generation, v.receipts, v.pendingIntents) }
+      const refIntents = v.refIntents ?? []
+      const refReceipts = v.refReceipts ?? []
+      if (v.stageHandoffStarted !== undefined && typeof v.stageHandoffStarted !== "boolean") return { present: true }
+      const stageHandoffStarted = v.stageHandoffStarted === true
+      if (!Array.isArray(refIntents) || !Array.isArray(refReceipts)
+        || refIntents.length + refReceipts.length > 2) return { present: true }
+      const usedRoles = new Set<string>()
+      for (const item of [...refIntents, ...refReceipts]) {
+        assertRefIntent(item, input.sourceCommitSha, input.destinationRepoId)
+        if (usedRoles.has(item.role)) return { present: true }
+        usedRoles.add(item.role)
+      }
+      if (usedRoles.has("destination")
+        && !refReceipts.some(item => item.role === "backup")) return { present: true }
+      if (stageHandoffStarted && !refReceipts.some(r => r.role === "backup")) return { present: true }
+      if (usedRoles.has("destination") && v.pendingIntents.length > 0) return { present: true }
+      return { present: true, state: snapshot(data.generation, v.receipts, v.pendingIntents,
+        refIntents, refReceipts, stageHandoffStarted) }
     } catch {
       return { present: true }
     }
@@ -176,10 +251,11 @@ export function createV4ReencryptionRecoveryJournal(input: {
     const candidates = slots.flatMap(s => s.state ? [s.state] : [])
     if (!candidates.length) {
       if (slots.some(s => s.present)) invalid()
-      return { latest: null as V4ReencryptionJournalSnapshot | null, damaged: false }
+      return { latest: null as V4ReencryptionJournalSnapshot | null, damaged: false, incomplete: false }
     }
     const latest = candidates.reduce((a, b) => a.generation > b.generation ? a : b)
-    return { latest, damaged: slots.some(s => s.present && !s.state) }
+    return { latest, damaged: slots.some(s => s.present && !s.state),
+      incomplete: latest.generation > 1 && slots.some(s => !s.present) }
   }
 
   let busy = false
@@ -193,9 +269,12 @@ export function createV4ReencryptionRecoveryJournal(input: {
     generation: number,
     receipts: readonly V4ReencryptionObjectReceipt[],
     pendingIntents: readonly V4ReencryptionObjectReceipt[],
+    refIntents: readonly V4ReencryptionRefIntent[],
+    refReceipts: readonly V4ReencryptionRefIntent[],
+    stageHandoffStarted: boolean,
   ) => {
     if (!Number.isSafeInteger(generation) || generation < 1) invalid()
-    const payload = utf8ToBytes(JSON.stringify({ status: "staging-only", receipts, pendingIntents }))
+    const payload = utf8ToBytes(JSON.stringify({ status: "staging-only", receipts, pendingIntents, refIntents, refReceipts, stageHandoffStarted }))
     if (payload.length > MAX_JOURNAL_BYTES / 2) invalid()
     let ciphertext: string
     try {
@@ -229,29 +308,43 @@ export function createV4ReencryptionRecoveryJournal(input: {
     sourceCommitSha: input.sourceCommitSha,
     destinationRepoId: input.destinationRepoId,
     load: async () => (await observe()).latest,
+    assertHealthySnapshot: (expectedGeneration: number) => locked(async () => {
+      const observed = await observe()
+      if (!observed.latest || observed.damaged || observed.incomplete
+        || observed.latest.generation !== expectedGeneration) {
+        throw new V4ReencryptionJournalRecoveryRequiredError()
+      }
+      return observed.latest
+    }),
     begin: () => locked(async () => {
       const state = await observe()
       if (state.latest || state.damaged) invalid()
-      return save(1, [], [])
+      return save(1, [], [], [], [], false)
     }),
     recordUploadIntent: (receipt: V4ReencryptionObjectReceipt, expectedGeneration: number) => locked(async () => {
       assertV4ReencryptionJournalObjectReceipt(receipt)
       const state = await observe()
-      if (!state.latest || state.damaged) invalid()
+      if (!state.latest || state.damaged || state.incomplete) invalid()
       if (state.latest.generation !== expectedGeneration) {
         throw new Error("Re-encryption WAL stale generation: source of truth changed.")
+      }
+      if (state.latest.pendingRefIntents.length > 0
+        || state.latest.verifiedRefObservations.some(r => r.role === "destination")) {
+        throw new Error("Re-encryption WAL cannot upload staged blobs during unresolved ref publication.")
       }
       if ([...state.latest.receipts, ...state.latest.pendingIntents].some(r => r.path === receipt.path)) {
         throw new Error("Re-encryption WAL duplicate staged object path.")
       }
       if (state.latest.generation >= Number.MAX_SAFE_INTEGER) invalid()
       return save(state.latest.generation + 1, state.latest.receipts,
-        [...state.latest.pendingIntents, { ...receipt }])
+        [...state.latest.pendingIntents, { ...receipt }],
+        state.latest.pendingRefIntents, state.latest.verifiedRefObservations,
+        state.latest.stageHandoffStarted)
     }),
     appendReceipt: (receipt: V4ReencryptionObjectReceipt, expectedGeneration: number) => locked(async () => {
       assertV4ReencryptionJournalObjectReceipt(receipt)
       const state = await observe()
-      if (!state.latest || state.damaged) invalid()
+      if (!state.latest || state.damaged || state.incomplete) invalid()
       if (state.latest.generation !== expectedGeneration) {
         throw new Error("Re-encryption WAL stale generation: source of truth changed.")
       }
@@ -261,7 +354,68 @@ export function createV4ReencryptionRecoveryJournal(input: {
       }
       if (state.latest.generation >= Number.MAX_SAFE_INTEGER) invalid()
       return save(state.latest.generation + 1, [...state.latest.receipts, { ...receipt }],
-        state.latest.pendingIntents.filter(r => r.path !== receipt.path))
+        state.latest.pendingIntents.filter(r => r.path !== receipt.path),
+        state.latest.pendingRefIntents, state.latest.verifiedRefObservations,
+        state.latest.stageHandoffStarted)
+    }),
+    recordStagingHandoff: (backup: V4ReencryptionRefIntent, expectedGeneration: number) => locked(async () => {
+      assertRefIntent(backup, input.sourceCommitSha, input.destinationRepoId)
+      const state = await observe()
+      if (!state.latest || state.damaged || state.incomplete
+        || state.latest.generation !== expectedGeneration
+        || backup.role !== "backup"
+        || state.latest.stageHandoffStarted
+        || state.latest.receipts.length > 0
+        || state.latest.pendingIntents.length > 0
+        || state.latest.pendingRefIntents.length > 0
+        || state.latest.verifiedRefObservations.length !== 1
+        || !equalRef(state.latest.verifiedRefObservations[0]!, backup)) {
+        throw new Error("Re-encryption WAL staging handoff already started, is stale, or lacks the exact verified Backup.")
+      }
+      if (state.latest.generation >= Number.MAX_SAFE_INTEGER) invalid()
+      return save(state.latest.generation + 1, state.latest.receipts, state.latest.pendingIntents,
+        state.latest.pendingRefIntents, state.latest.verifiedRefObservations, true)
+    }),
+    recordRefIntent: (intent: V4ReencryptionRefIntent, expectedGeneration: number) => locked(async () => {
+      assertRefIntent(intent, input.sourceCommitSha, input.destinationRepoId)
+      const state = await observe()
+      if (!state.latest || state.damaged || state.incomplete) invalid()
+      if (state.latest.generation !== expectedGeneration) {
+        throw new Error("Re-encryption WAL stale ref-intent generation.")
+      }
+      if ([...state.latest.pendingRefIntents, ...state.latest.verifiedRefObservations]
+        .some(previous => previous.role === intent.role)) {
+        throw new Error("Re-encryption WAL duplicate Git ref role cannot be created twice.")
+      }
+      if (intent.role === "destination" && (
+        state.latest.pendingIntents.length !== 0
+        || !state.latest.verifiedRefObservations.some(r => r.role === "backup"))) {
+        throw new Error("Re-encryption WAL destination requires completed staging and verified Backup ref.")
+      }
+      if (intent.role === "backup" && (state.latest.receipts.length > 0
+        || state.latest.pendingIntents.length > 0)) {
+        throw new Error("Re-encryption WAL Backup ref must be planned before staging new ciphertext.")
+      }
+      if (state.latest.generation >= Number.MAX_SAFE_INTEGER) invalid()
+      return save(state.latest.generation + 1, state.latest.receipts, state.latest.pendingIntents,
+        [...state.latest.pendingRefIntents, { ...intent }], state.latest.verifiedRefObservations,
+        state.latest.stageHandoffStarted)
+    }),
+    markRefReadbackObserved: (intent: V4ReencryptionRefIntent, expectedGeneration: number) => locked(async () => {
+      assertRefIntent(intent, input.sourceCommitSha, input.destinationRepoId)
+      const state = await observe()
+      if (!state.latest || state.damaged || state.incomplete) invalid()
+      if (state.latest.generation !== expectedGeneration) {
+        throw new Error("Re-encryption WAL stale ref-readback generation.")
+      }
+      const matching = state.latest.pendingRefIntents.find(r => r.role === intent.role)
+      if (!matching || !equalRef(matching, intent)) {
+        throw new Error("Re-encryption WAL ref readback does not match the exact pending intent.")
+      }
+      if (state.latest.generation >= Number.MAX_SAFE_INTEGER) invalid()
+      return save(state.latest.generation + 1, state.latest.receipts, state.latest.pendingIntents,
+        state.latest.pendingRefIntents.filter(r => r.role !== intent.role),
+        [...state.latest.verifiedRefObservations, { ...intent }], state.latest.stageHandoffStarted)
     }),
   })
 }

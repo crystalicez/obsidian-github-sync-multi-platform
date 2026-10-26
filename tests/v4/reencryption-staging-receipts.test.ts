@@ -252,6 +252,67 @@ test("D81 binds D79 staging to WAL intent BEFORE upload and confirms exact Git S
   assert.ok(!serialized.includes(result.receipts[0]!.path));
 });
 
+test("D102 D90 three-branch flow stages fresh ciphertext AFTER explicitly verified Backup WAL ref, not a new journal", async () => {
+  const f = await fixture();
+  const wal = journal();
+  let state = await wal.begin();
+  const backupRef = {
+    role: "backup" as const, repoId: "owner/repo#backup/frozen",
+    commitSha: sha, treeSha: "b".repeat(40),
+  };
+  state = await wal.recordRefIntent(backupRef, state.generation);
+  state = await wal.markRefReadbackObserved(backupRef, state.generation);
+  const result = await stageV4ReencryptionVaultObjectsWithJournal({
+    ...f.input, journal: wal,
+    beginAfterVerifiedBackup: { expectedJournalGeneration: state.generation, backupRef },
+    async assertExclusiveStageLease() {},
+  });
+  assert.equal(result.receipts.length, 2);
+  assert.equal(result.journalSnapshot.stageHandoffStarted, true);
+  assert.equal(result.journalSnapshot.verifiedRefObservations.length, 1);
+  assert.deepEqual(result.journalSnapshot.verifiedRefObservations[0], backupRef);
+  assert.equal(result.journalSnapshot.pendingRefIntents.length, 0);
+  assert.deepEqual(result.journalSnapshot.receipts, result.receipts);
+  assert.equal(result.journalSnapshot.permissionToPublish, false);
+  assert.equal(result.journalSnapshot.cutoverAuthorized, false);
+  await assert.rejects(() => stageV4ReencryptionVaultObjectsWithJournal({
+    ...f.input, journal: wal,
+    beginAfterVerifiedBackup: { expectedJournalGeneration: state.generation, backupRef },
+    async assertExclusiveStageLease() {},
+  }), /previous run requires manual recovery/i);
+});
+
+test("D102 refuses accidental reuse of an older Backup journal, wrong exact backup SHA or unresolved backup intent", async () => {
+  const f = await fixture();
+  const wal = journal();
+  let state = await wal.begin();
+  const backupRef = {
+    role: "backup" as const, repoId: "owner/repo#backup/frozen",
+    commitSha: sha, treeSha: "b".repeat(40),
+  };
+  state = await wal.recordRefIntent(backupRef, state.generation);
+  let uploads = 0;
+  const stage = (beginAfterVerifiedBackup?: { expectedJournalGeneration: number; backupRef: typeof backupRef }) =>
+    stageV4ReencryptionVaultObjectsWithJournal({
+      ...f.input, journal: wal, beginAfterVerifiedBackup,
+      async assertExclusiveStageLease() {},
+      async stageImmutableObject(path, value) {
+        uploads++;
+        return f.input.stageImmutableObject(path, value);
+      },
+    });
+  await assert.rejects(() => stage({ expectedJournalGeneration: state.generation, backupRef }),
+    /previous run requires manual recovery/i);
+  state = await wal.markRefReadbackObserved(backupRef, state.generation);
+  await assert.rejects(() => stage({ expectedJournalGeneration: state.generation - 1, backupRef }),
+    /previous run requires manual recovery/i);
+  await assert.rejects(() => stage({ expectedJournalGeneration: state.generation,
+    backupRef: { ...backupRef, treeSha: "f".repeat(40) },
+  }), /previous run requires manual recovery/i);
+  await assert.rejects(() => stage(), /previous run requires manual recovery/i);
+  assert.equal(uploads, 0);
+});
+
 test("D81 timeout after upload intent leaves unresolved WAL; a retry cannot silently reuse it", async () => {
   const f = await fixture();
   const wal = journal();

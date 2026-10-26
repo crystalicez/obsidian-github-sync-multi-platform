@@ -11,6 +11,9 @@ import { verifyGitHubReencryptionSource, verifyGitHubReencryptionForkSource, ver
 import { proposeV4SameRepositoryReencryptionBackupBranch } from "../../src/lib/v4/reencryption-owner-decisions";
 import { inspectV4FrozenBackupAfterAmbiguousCreate } from "../../src/lib/v4/reencryption-backup-reconcile";
 import { createAndVerifyV4FrozenBackupRef } from "../../src/lib/v4/reencryption-backup-create-verified";
+import { createV4JournaledFrozenBackup, reconcileV4PendingFrozenBackupWithJournal } from "../../src/lib/v4/reencryption-ref-journal-coordinator";
+import { createV4ReencryptionRecoveryJournal } from "../../src/lib/v4/reencryption-recovery-journal";
+import type { V4LocalIndexAdapter } from "../../src/lib/v4/local-index";
 
 const enc = utf8ToBytes;
 const gitBlobSha = (bytes: Uint8Array) =>
@@ -760,6 +763,192 @@ test("D99 lease loss AFTER remote preflight but BEFORE backup create must not se
   }), /lease lost/)
   assert.equal(checks, 2)
   assert.equal(f.createAttempts, 0)
+})
+
+async function D102Journal() {
+  const files = new Map<string, string>()
+  const adapter: V4LocalIndexAdapter = {
+    async exists(path) { return files.has(path) },
+    async read(path) {
+      const value = files.get(path)
+      if (value === undefined) throw new Error("missing")
+      return value
+    },
+    async write(path, data) { files.set(path, data) },
+    async mkdir(_path) {},
+  }
+  const open = () => createV4ReencryptionRecoveryJournal({
+    adapter, root: "v4/rekey-journal",
+    destinationRepoId: frozenPlan.destinationRepoId,
+    sourceCommitSha: commitSha, runId: "d102-backup-run",
+    journalKey: new Uint8Array(32).fill(0x62),
+  })
+  const journal = open()
+  await journal.begin()
+  const wal = {
+    assertExclusiveStageLease: async () => {},
+    assertCrashDurable: async () => {},
+  }
+  // This mock WAL is NOT evidence of OS durability.
+  return { journal, open, wal, files }
+}
+
+test("D102 Backup can only be created with exact encrypted WAL ref intent, then confirms separate authenticated readback", async () => {
+  const f = await D99BackupFixture()
+  const j = await D102Journal()
+  const result = await createV4JournaledFrozenBackup({
+    ...f.input, journal: j.journal, wal: j.wal,
+  })
+  assert.equal(result.backupContentsReadbackVerified, true)
+  assert.equal(result.independentlyAuditedDurableIntent, false)
+  assert.equal(f.createAttempts, 1)
+  const restarted = await j.open().load()
+  assert.ok(restarted)
+  assert.equal(restarted.pendingRefIntents.length, 0)
+  assert.deepEqual(restarted.verifiedRefObservations, [{
+    role: "backup", repoId: frozenPlan.backupRepoId,
+    commitSha, treeSha: rootTreeSha,
+  }])
+  assert.equal(restarted.cutoverAuthorized, false)
+  assert.ok(![...j.files.values()].join("").includes(frozenPlan.backupRepoId))
+  await assert.rejects(() => createV4JournaledFrozenBackup({
+    ...f.input, journal: j.open(), wal: j.wal,
+  }), /previous ref intent/i)
+  assert.equal(f.createAttempts, 1)
+})
+
+test("D102 Windows unproven WAL durability blocks Backup mutation and leaves no ref intent", async () => {
+  const f = await D99BackupFixture()
+  const j = await D102Journal()
+  await assert.rejects(() => createV4JournaledFrozenBackup({
+    ...f.input, journal: j.journal,
+    wal: {
+      ...j.wal,
+      assertCrashDurable: async () => { throw new Error("Windows fsync EPERM") },
+    },
+  }), /fsync EPERM/i)
+  assert.equal(f.createAttempts, 0)
+  assert.deepEqual((await j.journal.load())?.pendingRefIntents, [])
+})
+
+test("D103 a corrupt sibling WAL slot after durable intent but before POST stops Backup ref creation", async () => {
+  const f = await D99BackupFixture()
+  const j = await D102Journal()
+  let checks = 0
+  await assert.rejects(() => createV4JournaledFrozenBackup({
+    ...f.input, journal: j.journal,
+    wal: {
+      ...j.wal,
+      assertCrashDurable: async () => {
+        if (++checks === 2) {
+          const older = [...j.files.keys()].find(path => path.endsWith("slot-1.json"))
+          assert.ok(older)
+          j.files.set(older, "{broken sibling")
+        }
+      },
+    },
+  }), /manual recovery|required|journal/i)
+  assert.equal(f.createAttempts, 0)
+  const recovered = await j.open().load()
+  assert.ok(recovered)
+  assert.equal(recovered.pendingRefIntents.length, 1)
+  assert.equal(recovered.requiresRemoteRevalidation, true)
+})
+
+test("D102 lost GitHub Backup create outcome with unavailable readback retains WAL intent and forbids blind retry", async () => {
+  const f = await D99BackupFixture()
+  const j = await D102Journal()
+  const originalWrite = f.input.backup.createGitRef
+  f.input.backup.createGitRef = async sha => {
+    try { await originalWrite(sha) }
+    finally {
+      f.input.backup.getGitRefOrNull = async () => {
+        throw new Error("GitHub 503 during Backup recovery")
+      }
+    }
+  }
+  f.loseCreateResponse()
+  await assert.rejects(() => createV4JournaledFrozenBackup({
+    ...f.input, journal: j.journal, wal: j.wal,
+  }), /ambiguous|recovery/i)
+  const state = await j.open().load()
+  assert.ok(state)
+  assert.deepEqual(state.pendingRefIntents, [{
+    role: "backup", repoId: frozenPlan.backupRepoId,
+    commitSha, treeSha: rootTreeSha,
+  }])
+  assert.equal(state.requiresRemoteRevalidation, true)
+  assert.equal(state.permissionToPublish, false)
+  await assert.rejects(() => createV4JournaledFrozenBackup({
+    ...f.input, journal: j.open(), wal: j.wal,
+  }), /previous ref intent/i)
+  assert.equal(f.createAttempts, 1)
+})
+
+test("D103 real lost Backup create response can be independently read/decrypted after restart and reconciled into WAL", async () => {
+  const f = await D99BackupFixture()
+  const j = await D102Journal()
+  const existingRead = f.input.backup.getGitRefOrNull
+  const originalWrite = f.input.backup.createGitRef
+  f.input.backup.createGitRef = async sha => {
+    try { await originalWrite(sha) }
+    finally {
+      f.input.backup.getGitRefOrNull = async () => {
+        throw new Error("GitHub 503 lost during first Backup recovery")
+      }
+    }
+  }
+  f.loseCreateResponse()
+  await assert.rejects(() => createV4JournaledFrozenBackup({
+    ...f.input, journal: j.journal, wal: j.wal,
+  }), /ambiguous|recovery/i)
+  assert.equal(f.createAttempts, 1)
+  assert.equal((await j.open().load())?.pendingRefIntents.length, 1)
+  // Operator obtained new storage lease after investigating the old process.
+  // The new session ONLY READS GitHub and marks verified observation.
+  f.input.backup.getGitRefOrNull = existingRead
+  const report = await reconcileV4PendingFrozenBackupWithJournal({
+    plan: frozenPlan, backup: f.input.backup,
+    expectedSourceTreeSha: rootTreeSha, originalPassphrase: "correct",
+    verifiedOriginalSource: f.input.verifiedSource,
+    journal: j.open(), wal: j.wal,
+  })
+  assert.equal(report.backedUpContentsVerified, true)
+  assert.equal(report.automaticallyRetryCreateAuthorized, false)
+  assert.equal(report.initiatingDeviceCutoverAuthorized, false)
+  assert.equal(f.createAttempts, 1)
+  const state = await j.open().load()
+  assert.ok(state)
+  assert.deepEqual(state.pendingRefIntents, [])
+  assert.equal(state.verifiedRefObservations.length, 1)
+  assert.equal(state.permissionToPublish, false)
+  await assert.rejects(() => reconcileV4PendingFrozenBackupWithJournal({
+    plan: frozenPlan, backup: f.input.backup,
+    expectedSourceTreeSha: rootTreeSha, originalPassphrase: "correct",
+    verifiedOriginalSource: f.input.verifiedSource,
+    journal: j.open(), wal: j.wal,
+  }), /one exact unresolved/i)
+})
+
+test("D103 Backup recovery cannot clear unresolved WAL after a mismatched remote ref", async () => {
+  const f = await D99BackupFixture()
+  const j = await D102Journal()
+  const started = (await j.journal.load())!
+  await j.journal.recordRefIntent({
+    role: "backup", repoId: frozenPlan.backupRepoId,
+    commitSha, treeSha: rootTreeSha,
+  }, started.generation)
+  f.input.backup.getGitRefOrNull = async () => ({
+    ref: "refs/heads/backup/2026-10-26", sha: "f".repeat(40), type: "commit",
+  })
+  await assert.rejects(() => reconcileV4PendingFrozenBackupWithJournal({
+    plan: frozenPlan, backup: f.input.backup,
+    expectedSourceTreeSha: rootTreeSha, originalPassphrase: "correct",
+    verifiedOriginalSource: f.input.verifiedSource,
+    journal: j.journal, wal: j.wal,
+  }), /missing|conflicting|authenticated/i)
+  assert.equal(f.createAttempts, 0)
+  assert.equal((await j.journal.load())?.pendingRefIntents.length, 1)
 })
 
 test("D95 aborted recovery does no remote I/O", async () => {
