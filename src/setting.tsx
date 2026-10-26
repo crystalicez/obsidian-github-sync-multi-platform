@@ -371,6 +371,13 @@ export class SettingTab extends PluginSettingTab {
         })
     }
 
+    new Setting(set)
+      .setName("Create encrypted branch")
+      .setDesc("Re-encryption Wizard preview. Requires an existing encrypted V4 branch and will ultimately create a frozen backup branch plus a newly encrypted orphan branch. Source and other devices remain unchanged. Publication is currently disabled until production safety gates pass.")
+      .addButton((button) => button
+        .setButtonText("Preview wizard")
+        .onClick(() => this.plugin.openReencryptionWizard()))
+
     // ==========================================
     // Section 4: Manual & Force Operations
     // ==========================================

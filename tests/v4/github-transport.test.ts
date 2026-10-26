@@ -565,6 +565,39 @@ test("immutable commit and content reads omit timestamp cache-busting while ref 
   }
 })
 
+test("D92 default branch lookup fails closed on missing, unsafe and unavailable GitHub responses", async () => {
+  const client = new GitHubClient(
+    { token: "token", owner: "owner", repo: "repo", branch: "main" },
+    { transportPolicy: { mutationSpacingMs: 0 } },
+  )
+  const urls: string[] = []
+  try {
+    setRequestUrlHandler(async (options: unknown) => {
+      const request = options as { url: string; method: string }
+      urls.push(request.url)
+      assert.equal(request.method, "GET")
+      return { status: 200, text: "", headers: {}, json: { default_branch: "stable/source" } }
+    })
+    assert.equal(await client.getRepositoryDefaultBranch(), "stable/source")
+    assert.equal(urls.length, 1)
+    assert.match(urls[0]!, /\/repos\/owner\/repo$/u)
+
+    for (const json of [
+      {}, null, { default_branch: "" }, { default_branch: "bad//branch" },
+      { default_branch: "main.lock" }, { default_branch: "bad..branch" },
+      { default_branch: 5 }, { default_branch: "@{" },
+    ]) {
+      setRequestUrlHandler(async () => ({ status: 200, text: "", headers: {}, json }))
+      await assert.rejects(() => client.getRepositoryDefaultBranch(), /default branch|GitHub branch/i)
+    }
+
+    setRequestUrlHandler(async () => ({ status: 403, text: "forbidden", headers: {}, json: {} }))
+    await assert.rejects(() => client.getRepositoryDefaultBranch(), /403/u)
+  } finally {
+    setRequestUrlHandler(null)
+  }
+})
+
 test("GitHubClient refuses missing or malformed ref fields instead of fabricating a branch/type", async () => {
   const valid = { ref: "refs/heads/main", object: { sha: "a".repeat(40), type: "commit" } }
   const bodies: unknown[] = [

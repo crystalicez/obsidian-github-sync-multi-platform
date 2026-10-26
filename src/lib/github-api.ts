@@ -122,6 +122,9 @@ export class GitHubClient {
     });
   }
 
+  /** Exact configured ref name for trusted branch-scoped operations. */
+  get branchName(): string { return this.config.branch; }
+
   setV4AbortSignal(signal?: AbortSignal): void { this.operationSignal = signal; }
 
   get transportMetricsSnapshot(): V4TransportMetricsSnapshot {
@@ -357,6 +360,25 @@ export class GitHubClient {
       throw new Error("Invalid GitHub repository identity response.");
     }
     return { id, fullName };
+  }
+
+  /** Read the actual GitHub default branch; a re-encryption destination may never target it. */
+  async getRepositoryDefaultBranch(): Promise<string> {
+    const response = await this.request({
+      url: this.baseUrl,
+      method: "GET",
+      headers: this.headers,
+      throw: false,
+    });
+    if (response.status !== 200) {
+      throw this.gitHttpError("Failed to read GitHub default branch", response.status, response.text);
+    }
+    const json = response.json as { default_branch?: unknown } | null;
+    if (typeof json?.default_branch !== "string") {
+      throw new Error("Invalid GitHub default branch response.");
+    }
+    assertSafeGitHubBranch(json.default_branch);
+    return json.default_branch;
   }
 
   async getGitRef(): Promise<GitHubGitRef> {

@@ -11,6 +11,7 @@ import { V4PluginRuntime } from "./lib/v4/runtime";
 import { createIdleV4Progress } from "./lib/v4/progress";
 import { formatV4ActiveSyncStatus } from "./lib/v4/status";
 import { V4SyncCenterView, V4_SYNC_CENTER_VIEW } from "./views/sync-center";
+import { V4ReencryptionWizardModal } from "./views/reencryption-wizard";
 
 
 // Obsidian initializes these fields in onload(), not in the Plugin constructor.
@@ -371,6 +372,14 @@ export default class FastSync extends Plugin {
       }
     };
     this.statusDisplaySignature = signature;
+  }
+
+  openReencryptionWizard(): void {
+    if (this.settingTab.isDirty()) {
+      new Notice("Save or discard pending settings edits before previewing Re-encryption.")
+      return
+    }
+    new V4ReencryptionWizardModal(this).open()
   }
 
   async showForceConfirm(operation: "forcePush" | "forcePull"): Promise<void> {

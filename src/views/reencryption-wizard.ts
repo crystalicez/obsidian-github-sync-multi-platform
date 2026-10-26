@@ -1,0 +1,450 @@
+import { Modal, Setting } from "obsidian"
+import type FastSync from "../main"
+import type { PluginSettings } from "../setting"
+import { GitHubClient } from "../lib/github-api"
+import { V4_DEFAULT_PBKDF2_ITERATIONS, V4_MAX_PBKDF2_ITERATIONS, V4_MIN_NEW_PBKDF2_ITERATIONS } from "../lib/v4/kdf-policy"
+import { verifyGitHubReencryptionSource } from "../lib/v4/reencryption-trusted-loader"
+import {
+  proposeV4ReencryptionWizardDraft,
+  suggestV4ReencryptionBranchNames,
+  type V4ReencryptionWizardProposal,
+} from "../lib/v4/reencryption-wizard-plan"
+
+/**
+ * D92: deliberately read-only Wizard. The source verifier reads immutable
+ * encrypted Git objects, but no part of this view can create a ref, persist
+ * a new passphrase, alter local notes, switch branches, or start a migration.
+ *
+ * Never call a publication/migration method from this class until the release
+ * gate and crash-safe publication/cutover architecture are independently proven.
+ */
+const STEPS = [
+  "Preflight & snapshot",
+  "Destination & encryption",
+  "Review & confirm",
+  "Run & verify",
+  "Finish & switch",
+] as const
+
+interface VerifiedSource {
+  readonly physicalRepositoryId: number
+  readonly defaultBranch: string
+  readonly pinnedSourceCommitSha: string
+  readonly verifiedFileCount: number
+  readonly verifiedRemoteObjectCount: number
+  readonly totalVerifiedPlaintextBytes: string
+}
+
+interface RefCheck {
+  readonly destinationRepoId: string
+  readonly backupRepoId: string
+  readonly pinnedSourceCommitSha: string
+  readonly physicalRepositoryId: number
+}
+
+export class V4ReencryptionWizardModal extends Modal {
+  private step = 0
+  private readonly initialSettings: PluginSettings
+  private source: VerifiedSource | undefined
+  private checked: RefCheck | undefined
+  private busy = false
+  private closed = false
+  private requestEpoch = 0
+  private abortController: AbortController | undefined
+  private errorMessage = ""
+  private destinationBranch = ""
+  private backupBranch = ""
+  private newPassphrase = ""
+  private confirmPassphrase = ""
+  private iterations = V4_DEFAULT_PBKDF2_ITERATIONS
+
+  constructor(private readonly plugin: FastSync) {
+    super(plugin.app)
+    this.initialSettings = plugin.settings
+    const provisional = suggestV4ReencryptionBranchNames(
+      new Date(), "0".repeat(40),
+    )
+    this.destinationBranch = provisional.destinationBranch
+    this.backupBranch = provisional.backupBranch
+  }
+
+  override onOpen(): void {
+    this.closed = false
+    this.render()
+  }
+
+  override onClose(): void {
+    this.closed = true
+    this.requestEpoch++
+    this.busy = false
+    this.abortController?.abort()
+    this.abortController = undefined
+    this.source = undefined
+    this.checked = undefined
+    this.newPassphrase = ""
+    this.confirmPassphrase = ""
+    this.contentEl.empty()
+  }
+
+  private matchesConnection(): boolean {
+    return this.initialSettings === this.plugin.settings
+      && this.plugin.settings.githubOwner.length > 0
+      && this.plugin.settings.githubRepo.length > 0
+      && this.plugin.settings.githubToken.length > 0
+      && this.plugin.settings.encryptionMode === "encrypted"
+      && this.plugin.settings.encryptionPassphrase.length > 0
+  }
+
+  private sourceRepoId(): string {
+    const s = this.initialSettings
+    return `${s.githubOwner}/${s.githubRepo}#${s.githubBranch}`
+  }
+
+  private scopedClient(branch: string): GitHubClient {
+    const settings = this.initialSettings
+    const client = new GitHubClient({
+      owner: settings.githubOwner,
+      repo: settings.githubRepo,
+      token: settings.githubToken,
+      branch,
+    })
+    client.setV4AbortSignal(this.abortController?.signal)
+    return client
+  }
+
+  private plan(): V4ReencryptionWizardProposal {
+    if (!this.source || !this.matchesConnection()) {
+      throw new Error("Verify the encrypted source and save any changed connection settings first.")
+    }
+    return proposeV4ReencryptionWizardDraft({
+      owner: this.initialSettings.githubOwner,
+      repo: this.initialSettings.githubRepo,
+      sourceBranch: this.initialSettings.githubBranch,
+      destinationBranch: this.destinationBranch,
+      backupBranch: this.backupBranch,
+      defaultBranch: this.source.defaultBranch,
+      sourceCommitSha: this.source.pinnedSourceCommitSha,
+      sourcePhysicalRepositoryId: this.source.physicalRepositoryId,
+      requestedIterations: this.iterations,
+      oldPassphrase: this.initialSettings.encryptionPassphrase,
+      newPassphrase: this.newPassphrase,
+      confirmation: this.confirmPassphrase,
+    })
+  }
+
+  private async verifySource(): Promise<void> {
+    if (this.busy) return
+    this.source = undefined
+    this.checked = undefined
+    this.errorMessage = ""
+    if (!this.matchesConnection()) {
+      this.errorMessage = "Save a configured encrypted GitHub connection with its original passphrase before verification."
+      this.render()
+      return
+    }
+    if (this.plugin.v4Runtime.isSyncing) {
+      this.errorMessage = "A Sync operation is active. Try again after it finishes."
+      this.render()
+      return
+    }
+    this.busy = true
+    const epoch = ++this.requestEpoch
+    const controller = new AbortController()
+    this.abortController = controller
+    this.render()
+    try {
+      const client = this.scopedClient(this.initialSettings.githubBranch)
+      const expectedFullName = `${this.initialSettings.githubOwner}/${this.initialSettings.githubRepo}`
+      const repo = await client.getRepositoryIdentity()
+      if (repo.fullName.toLowerCase() !== expectedFullName.toLowerCase()) {
+        throw new Error("GitHub repository identity does not match settings.")
+      }
+      const defaultBranch = await client.getRepositoryDefaultBranch()
+      const proof = await verifyGitHubReencryptionSource({
+        github: client, expectedRepoId: this.sourceRepoId(),
+        expectedBranch: this.initialSettings.githubBranch,
+        passphrase: this.initialSettings.encryptionPassphrase,
+        signal: controller.signal,
+      })
+      if (this.closed || controller.signal.aborted || epoch !== this.requestEpoch) return
+      if (!this.matchesConnection()) throw new Error("Connection settings changed during verification.")
+      this.source = {
+        physicalRepositoryId: repo.id,
+        defaultBranch,
+        pinnedSourceCommitSha: proof.pinnedSourceCommitSha,
+        verifiedFileCount: proof.verifiedFileCount,
+        verifiedRemoteObjectCount: proof.verifiedRemoteObjectCount,
+        totalVerifiedPlaintextBytes: proof.totalVerifiedPlaintextBytes,
+      }
+      const names = suggestV4ReencryptionBranchNames(new Date(), proof.pinnedSourceCommitSha)
+      this.destinationBranch = names.destinationBranch
+      this.backupBranch = names.backupBranch
+      this.errorMessage = ""
+    } catch (error) {
+      if (!this.closed && !controller.signal.aborted && epoch === this.requestEpoch) {
+        // Network/backend exceptions can include sensitive request context.
+        // Never display raw error text or vault filenames here.
+        this.errorMessage = error instanceof Error && /identity|settings changed|passphrase/i.test(error.message)
+          ? "Source verification failed: check repository identity, configuration, passphrase and connection."
+          : "Source verification failed. Check connection, credentials and remote data integrity."
+      }
+    } finally {
+      if (epoch === this.requestEpoch) {
+        this.busy = false
+        this.abortController = undefined
+        if (!this.closed) this.render()
+      }
+    }
+  }
+
+  private async checkBranchAvailability(): Promise<void> {
+    if (this.busy) return
+    this.checked = undefined
+    this.errorMessage = ""
+    let proposal: V4ReencryptionWizardProposal
+    try {
+      proposal = this.plan()
+    } catch (error) {
+      this.errorMessage = error instanceof Error ? error.message : "Invalid Wizard plan."
+      this.render()
+      return
+    }
+    if (this.plugin.v4Runtime.isSyncing) {
+      this.errorMessage = "Wait for the active Sync to finish before checking the branch names."
+      this.render()
+      return
+    }
+    this.busy = true
+    const epoch = ++this.requestEpoch
+    const controller = new AbortController()
+    this.abortController = controller
+    this.render()
+    try {
+      const [destination, backup] = await Promise.all([
+        this.scopedClient(this.destinationBranch).getGitRefOrNull(),
+        this.scopedClient(this.backupBranch).getGitRefOrNull(),
+      ])
+      if (this.closed || controller.signal.aborted || epoch !== this.requestEpoch) return
+      if (destination !== null || backup !== null) {
+        throw new Error("A proposed branch already exists. Choose unused branch names.")
+      }
+      const repo = await this.scopedClient(this.initialSettings.githubBranch).getRepositoryIdentity()
+      if (repo.id !== proposal.physicalRepositoryId
+        || repo.fullName.toLowerCase() !== `${this.initialSettings.githubOwner}/${this.initialSettings.githubRepo}`.toLowerCase()) {
+        throw new Error("Repository identity changed.")
+      }
+      if (!this.matchesConnection() || this.plan().destinationRepoId !== proposal.destinationRepoId
+        || this.plan().backupRepoId !== proposal.backupRepoId) {
+        throw new Error("Wizard settings changed during verification.")
+      }
+      this.checked = {
+        destinationRepoId: proposal.destinationRepoId,
+        backupRepoId: proposal.backupRepoId,
+        pinnedSourceCommitSha: proposal.pinnedSourceCommitSha,
+        physicalRepositoryId: proposal.physicalRepositoryId,
+      }
+    } catch (error) {
+      if (!this.closed && !controller.signal.aborted && epoch === this.requestEpoch) {
+        this.errorMessage = error instanceof Error && /already exists|settings changed|identity changed/i.test(error.message)
+          ? error.message
+          : "Branch verification failed. GitHub must confirm both names are unused."
+      }
+    } finally {
+      if (epoch === this.requestEpoch) {
+        this.busy = false
+        this.abortController = undefined
+        if (!this.closed) this.render()
+      }
+    }
+  }
+
+  private row(container: HTMLElement, heading: string, detail: string): void {
+    new Setting(container).setName(heading).setDesc(detail)
+  }
+
+  private renderPreflight(container: HTMLElement): void {
+    const s = this.initialSettings
+    this.row(container, "Current source (read-only)", `${s.githubOwner}/${s.githubRepo}#${s.githubBranch}`)
+    this.row(container, "Mode", s.encryptionMode === "encrypted" ? "Encrypted V4 source required" : "Current connection is not encrypted")
+    this.row(container, "Remote source verification", this.source
+      ? `Verified ${this.source.verifiedFileCount} files, ${this.source.verifiedRemoteObjectCount} objects (${this.source.totalVerifiedPlaintextBytes} plaintext bytes) at immutable commit ${this.source.pinnedSourceCommitSha}`
+      : "Not verified. This read-only check decrypts and validates every live source object from one pinned Git commit and may be expensive.")
+    new Setting(container)
+      .setName("Check encrypted source")
+      .setDesc("Read GitHub only. No backup or destination branch will be created.")
+      .addButton(button => button
+        .setButtonText(this.busy ? "Verifying…" : this.source ? "Verify again" : "Verify source (read-only)")
+        .setDisabled(this.busy)
+        .onClick(() => void this.verifySource()))
+    if (this.source) {
+      this.row(container, "Pinned source snapshot", this.source.pinnedSourceCommitSha)
+      this.row(container, "Actual default branch", this.source.defaultBranch)
+    }
+  }
+
+  private renderDestination(container: HTMLElement): void {
+    container.createEl("p", { text: "The destination is a newly encrypted orphan branch. The separate frozen backup preserves the source snapshot; the old branch remains active." })
+    new Setting(container).setName("New destination branch")
+      .setDesc("Must not exist, equal the source, backup or default branch.")
+      .addText(text => text.setValue(this.destinationBranch).onChange(value => {
+        this.destinationBranch = value
+        this.checked = undefined
+        this.errorMessage = ""
+      }))
+    new Setting(container).setName("Pinned backup branch")
+      .setDesc("Separate from destination and source. This name must not exist.")
+      .addText(text => text.setValue(this.backupBranch).onChange(value => {
+        this.backupBranch = value
+        this.checked = undefined
+        this.errorMessage = ""
+      }))
+    new Setting(container).setName("New encryption passphrase")
+      .setDesc("This stays in this unsaved Wizard only. Losing it means the new encrypted branch cannot be decrypted.")
+      .addText(text => {
+        text.inputEl.type = "password"
+        text.setValue(this.newPassphrase).onChange(value => {
+          this.newPassphrase = value
+          this.checked = undefined
+          this.errorMessage = ""
+        })
+      })
+    new Setting(container).setName("Confirm new passphrase")
+      .addText(text => {
+        text.inputEl.type = "password"
+        text.setValue(this.confirmPassphrase).onChange(value => {
+          this.confirmPassphrase = value
+          this.checked = undefined
+          this.errorMessage = ""
+        })
+      })
+    new Setting(container).setName("PBKDF2 iterations")
+      .setDesc("Default 600,000; maximum 1,200,000. New encrypted branch only.")
+      .addSlider(slider => slider
+        .setLimits(V4_MIN_NEW_PBKDF2_ITERATIONS, V4_MAX_PBKDF2_ITERATIONS, 100_000)
+        .setValue(this.iterations)
+        .setDynamicTooltip()
+        .onChange(value => {
+          this.iterations = value
+          this.checked = undefined
+          this.errorMessage = ""
+        }))
+  }
+
+  private renderReview(container: HTMLElement): void {
+    const proposal = this.plan()
+    this.row(container, "Source (continues to Sync independently)", proposal.sourceRepoId)
+    this.row(container, "Frozen backup (pinned source commit)", proposal.backupRepoId)
+    this.row(container, "New orphan destination (fresh encryption)", proposal.destinationRepoId)
+    this.row(container, "Source Git commit", proposal.pinnedSourceCommitSha)
+    this.row(container, "PBKDF2 iterations for new branch", String(proposal.requestedIterations))
+    this.row(container, "Expected source files / logical bytes",
+      `${this.source?.verifiedFileCount ?? 0} files / ${this.source?.totalVerifiedPlaintextBytes ?? "unverified"} bytes`)
+    container.createEl("p", {
+      cls: "github-sync-rekey__warning",
+      text: "All three branches remain in ONE GitHub repository. Repository loss may affect all three. Old ciphertext remains in the source/backup/history. Other devices stay on the old branch unless you manually reconfigure them. There is no cross-branch auto-sync or merge.",
+    })
+    new Setting(container).setName("Destination and backup branch availability")
+      .setDesc(this.checked
+        ? "Both refs were absent at the time of the check. This is not a create-time guarantee."
+        : "Not checked. Confirm both new names are currently absent.")
+      .addButton(button => button.setButtonText(this.busy ? "Checking…" : "Check both branches")
+        .setDisabled(this.busy)
+        .onClick(() => void this.checkBranchAvailability()))
+    this.row(container, "Publication authorization", "BLOCKED — the production migration, durable WAL, restore and installed-device release gates are unfinished.")
+  }
+
+  private renderRun(container: HTMLElement): void {
+    container.createEl("p", {
+      text: "Execution is not yet available. This page previews the approved sequence; it does not initiate a migration or create Git refs.",
+    })
+    const phases = [
+      "Freeze the source snapshot and verify frozen backup",
+      "Download and decrypt authenticated source objects",
+      "Re-encrypt every live file using fresh branch-scoped keys",
+      "Upload and publish the zero-parent orphan Git commit",
+      "Verify complete destination tree, files, backup and restore",
+    ]
+    const list = container.createEl("ol")
+    for (const phase of phases) list.createEl("li", { text: `Pending — ${phase}` })
+    this.row(container, "Status", "NOT STARTED. No network writes, encryption changes or local cutover were made by this Wizard.")
+    this.row(container, "Recovery", "Durable Windows WAL, interruption recovery and installed Obsidian acceptance must pass before execution can be enabled.")
+  }
+
+  private renderFinish(container: HTMLElement): void {
+    container.createEl("p", { text: "Not completed. Source, backup and destination must be verified in a real run before the initiating device can switch." })
+    this.row(container, "Initiating device", "Switch branch, credentials and local index only after verified durable success. No Force Pull/Push.")
+    this.row(container, "Other devices", "Stay on the old branch, or manually enter the new branch and passphrase whenever desired.")
+    this.row(container, "Retention", "Never auto-delete source or backup branches.")
+    this.row(container, "Current release gate", "BLOCKED — no automatic switch is currently possible.")
+  }
+
+  private render(): void {
+    if (this.closed) return
+    this.titleEl.setText("Create encrypted branch · Preview only")
+    const content = this.contentEl
+    content.empty()
+    content.addClass("github-sync-rekey")
+    const progress = content.createDiv({ cls: "github-sync-rekey__steps", attr: { "aria-label": "Re-encryption Wizard steps" } })
+    STEPS.forEach((label, index) => {
+      progress.createEl("span", {
+        cls: index === this.step ? "github-sync-rekey__step is-current" : "github-sync-rekey__step",
+        text: `${index + 1}. ${label}`,
+      })
+    })
+    const section = content.createDiv({ cls: "github-sync-rekey__body" })
+    section.createEl("h3", { text: STEPS[this.step] ?? STEPS[0] })
+    section.createEl("p", { cls: "github-sync-rekey__warning", text: "Development preview — publishing and device cutover are disabled until all production safety gates pass." })
+    if (this.step === 0) this.renderPreflight(section)
+    else if (this.step === 1) this.renderDestination(section)
+    else if (this.step === 2) {
+      try { this.renderReview(section) }
+      catch (error) {
+        this.errorMessage = error instanceof Error ? error.message : "Invalid proposed branches."
+      }
+    } else if (this.step === 3) this.renderRun(section)
+    else this.renderFinish(section)
+    if (this.errorMessage) {
+      content.createEl("p", { cls: "github-sync-rekey__error", attr: { role: "alert" }, text: this.errorMessage })
+    }
+    const navigation = content.createDiv({ cls: "github-sync-rekey__navigation" })
+    const close = navigation.createEl("button", { text: "Close" })
+    close.onclick = () => this.close()
+    if (this.step > 0) {
+      const back = navigation.createEl("button", { text: "Back" })
+      back.disabled = this.busy
+      back.onclick = () => {
+        this.step--
+        this.errorMessage = ""
+        this.render()
+      }
+    }
+    if (this.step < STEPS.length - 1) {
+      const next = navigation.createEl("button", {
+        text: this.step === 2 ? "View execution requirements" : this.step === 3 ? "View planned finish" : "Next",
+        cls: "mod-cta",
+      })
+      next.disabled = this.busy || (this.step === 0 && !this.source) || (this.step === 2 && !this.checked)
+      next.onclick = () => {
+        if (this.busy) return
+        this.errorMessage = ""
+        try {
+          if (this.step === 0 && !this.source) return
+          if (this.step >= 1 && this.step <= 2) {
+            const proposal = this.plan()
+            if (this.step === 2 && (!this.checked
+              || this.checked.destinationRepoId !== proposal.destinationRepoId
+              || this.checked.backupRepoId !== proposal.backupRepoId
+              || this.checked.pinnedSourceCommitSha !== proposal.pinnedSourceCommitSha
+              || this.checked.physicalRepositoryId !== proposal.physicalRepositoryId)) {
+              throw new Error("Check the destination and backup ref names again.")
+            }
+          }
+          this.step++
+        } catch (error) {
+          this.errorMessage = error instanceof Error ? error.message : "Invalid Wizard configuration."
+        }
+        this.render()
+      }
+    }
+  }
+}

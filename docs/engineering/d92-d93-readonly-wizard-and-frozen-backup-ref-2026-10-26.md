@@ -1,0 +1,42 @@
+# D92–D93 — First implemented Re-encryption Wizard preview and guarded frozen backup-ref writer (2026-10-26)
+
+## Scope and authorizing decisions
+
+Implements the first concrete UI/runtime read-only components from owner-approved D90 independent branch fork and D91 mandatory **THREE roles**: old writable/source branch, separate frozen old-key backup ref, and fresh encrypted zero-parent destination (all within same physical GitHub repository). These are three *roles*, not a demand that the repository contain only three total refs. No fleet-wide freeze/ack, migration-specific old-branch Sync block or forced cross-device cutover is introduced.
+
+**Release status remains BLOCKED.** This stage intentionally cannot re-encrypt/publish destination, create a real backup from the GUI, switch encryption secrets, mutate existing vault data or declare full recovery. It is incremental implementation, NOT the complete Wizard. Do not make the preview label look production-ready or bypass release gates.
+
+## D92 — Settings entry + UI
+
+- `src/setting.tsx` exposes **Settings → Encryption Settings → Create encrypted branch → Preview wizard** even though the public migration action is disabled. Rejects opening with pending unsaved Settings edits; normal settings fields retain their existing meaning (PBKDF2 slider alone does not re-encrypt).
+- `src/views/reencryption-wizard.ts` implements all **five approved named screens** with no production mutation path: (1) explicit *read-only* verified encrypted source (pinned commit, every live object AES-GCM/plaintext integrity through the existing D70 trusted loader) and GitHub actual physical repository/default branch, (2) editable new destination/backup branch names, new passphrase+confirmation in **modal memory only**, and PBKDF2 600k–1.2m, (3) exact three-ref review, counts, same-repo and old-key-history warnings, separate GitHub **read-only ref absence probes**, (4) execution/phase preview flagged **NOT STARTED**, and (5) blocked finish/cutover preview. No false success, automated status migration or autorenaming of old-branch clients.
+- Newly added `src/lib/v4/reencryption-wizard-plan.ts` validates physical ID, immutable SHA, GitHub branch safety, distinct three-branch roles, actual default branch collision, passphrase confirmation and new passphrase different from old. It composes the existing D74 orphan and D87 backup proposals, and **always returns `publicationAuthorized:false`, `localCutoverAuthorized:false`, `actualBackupCreated:false`, `actualDestinationCreated:false`**. Passphrases are never part of the returned proposal.
+- Source verify is user-initiated and may consume GitHub quota/time proportional to file/object count; no auto-run on opening the dialog. Its full immutable reader independently verifies every live ciphertext object but by design cannot prove local edits are resolved or installed-device cutover safety. The in-progress Sync guard applies to these reads only, not old-branch Sync on other devices. Closing aborts work, invalidates outstanding generation/attempts and clears newly entered passphrases. Raw underlying errors (which may leak path/response data) are not shown in the GUI.
+- `GitHubClient.getRepositoryDefaultBranch` reads actual REST default branch and fails closed for malformed/non-200 replies; `branchName` provides read-only access to the precise configured branch for trusted future Git operations.
+- UI CSS is in `src/styles.scss` **AND** tracked `styles.css` to ensure Obsidian loads the new modal styling. Local `pnpm exec sass` failed because Sass is not installed in this worktree; equivalent flattened CSS selectors were applied through guarded edit and package validation succeeded. No package dependency/lockfile change.
+
+## D93 — Guarded create-ONLY frozen backup ref (not wired to UI)
+
+- `src/lib/v4/reencryption-frozen-backup-ref.ts` introduces `createV4FrozenSameRepositoryBackupRef`, an **explicitly invoked** helper to create a new *backup ref ONLY*. Caller supplies existing D87 3-branch proposal, a trusted all-live-source verification result and an independently trusted exact-source-tree SHA. All three sources must agree on the same pinned commit SHA. A forged structural proof from an untrusted caller is NOT cryptographic authentication.
+- Both trusted branch-scoped GitHub clients expose exact `branchName`; **wrong source/backup scope rejected before any remote read/write**. Checks physical GitHub repository numeric ID/name, consistent actual default branch, pinned immutable source commit/tree and parents. Probes backup absence twice; `GitHubClient.createGitRef` is called at most **ONCE** on the specific backup branch, never overwrites or force-updates an existing ref; treats ambiguous/lost HTTP outcome as unknown, without blind retry. Reads exact backup ref twice and its immutable Git commit/tree, and rechecks repo identity after creation.
+- **D90 source independence respected:** source HEAD may advance because B/C continue old-branch Sync; snapshot anchor is its **immutable commit**, not a remote writer-fence. No old-branch ref modification or merge occurs.
+- Successful report is pointer-only and explicitly **does NOT** prove readable complete backup contents, installed Obsidian restore, independent storage, or any permission to publish destination/cut over. A backup ref can be moved later by an authorized GitHub writer; enforcement of long-term immutability/branch protection is NOT covered. A network failure after mutation may leave a reachable partially-verified backup ref; recovery must inspect and reconcile, not create another ref blindly.
+- This function is **NOT imported by the Wizard, main plugin, ordinary Sync, or a live GitHub script**, so no actual backup branch is created by this stage.
+
+## Automated evidence
+
+- `tests/v4/reencryption-wizard-plan.test.ts`: six safe/unsafe proposal tests incl. branch collisions, actual default, KDF limits, passwords redacted.
+- `tests/v4/reencryption-wizard-ui.test.ts`: three offline modal tests that verify **zero network writes on open**, fail-closed unsupported/busy source and visibly blocked run/finish screens. This does NOT replace native Obsidian screenshot/accessibility checks.
+- `tests/v4/github-transport.test.ts`: read-only default-branch lookup regression for valid/malformed/403.
+- `tests/v4/reencryption-frozen-backup-ref.test.ts`: nine isolated mock GitHub scenarios incl. create-once success, wrong scoped client/no I/O, existing branch collision, malformed proof, wrong repo/tree/default, ambiguous create, incorrect post-ref/commit, AbortSignal, allowed source HEAD drift.
+- Full local check: `pnpm test:fast` **789/789 PASS**, `pnpm test:recovery` **79/79**, `pnpm test:resource` **11/11**, `pnpm test:feasibility` **136/136**, `pnpm typecheck:max-strict`, `pnpm build`, `pnpm test:github-e2e:compile` (three bundles), `pnpm validate:package`, `pnpm validate:metadata` all **PASS**. No production/live GitHub migration or real Obsidian UI verification was performed.
+
+## Remaining release blockers and next safe steps
+
+1. Trusted snapshot/backup coordinator to prove complete frozen backup readback and actual restore, not pointer-only. It must handle ambiguous create outcomes without overwriting existing refs.
+2. Immutable whole-vault destination staging/writer, commit/ref create-only publication and independent exact-commit content verification; no partially published destination or reused old ciphertext/history.
+3. Safe interruption recovery and **Node.js-only crash durability on Windows**: directory fsync returned `EPERM`; D86's WAL cannot claim power-loss durability. No Native OS helper selected and no durability gate waived.
+4. User-confirmed Review step, initiating-device only crash-safe branch+key/index switch preserving local unsynced data, and optional/manual cutover instructions for other devices; no automatic old-device block.
+5. Native desktop/mobile Obsidian acceptance, isolated two-device restore, cancellation/crash/rate-limit/large-file tests within the owner-requested 100 MB physical file cap, performance/UI screenshots and security audit. No GitHub Actions.
+
+The `docs/release-gates/reencryption-wizard.json` gate remains `status:"blocked"` with topology approved and all actual completion checks pending. Approval of UX does not override safety evidence.
