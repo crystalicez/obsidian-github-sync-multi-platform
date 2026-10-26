@@ -14,6 +14,10 @@ import type { V4StagedSink } from "./staging-store"
  */
 export interface V4ReencryptionSourceVerificationInput extends V4ReencryptionInventoryInput {
   readonly keyring: V4Keyring
+  /** Default preserves legacy fail-closed behavior. The fork mode reads
+   * ONLY immutable Git objects at a SHA pinned from an authenticated ref.
+   * A later old-branch HEAD advance is not corruption of that snapshot. */
+  readonly sourceRefPolicy?: "require-stable-head" | "pinned-immutable-commit" | undefined
   readonly readCurrentSourceHeadSha: () => Promise<string | null>
   readonly readPinnedObject: (path: string, exactCommitSha: string) => Promise<Uint8Array | null>
   readonly signal?: AbortSignal | undefined
@@ -45,7 +49,15 @@ export async function verifyV4ReencryptionSourceObjects(
   // coordinates agree with the authenticated, pinned metadata snapshot.
   const inventory = await inspectV4ReencryptionInventory(input)
   throwIfV4Aborted(input.signal)
-  assertUnchangedHead(await input.readCurrentSourceHeadSha(), input.pinnedSourceCommitSha)
+  if (input.sourceRefPolicy !== undefined
+    && input.sourceRefPolicy !== "require-stable-head"
+    && input.sourceRefPolicy !== "pinned-immutable-commit") {
+    throw new Error("Invalid re-encryption source ref policy.")
+  }
+  const requireStableHead = input.sourceRefPolicy !== "pinned-immutable-commit"
+  if (requireStableHead) {
+    assertUnchangedHead(await input.readCurrentSourceHeadSha(), input.pinnedSourceCommitSha)
+  }
 
   const codec = new V4StorageCodec({
     mode: "encrypted",
@@ -97,7 +109,9 @@ export async function verifyV4ReencryptionSourceObjects(
     }
   }
   throwIfV4Aborted(input.signal)
-  assertUnchangedHead(await input.readCurrentSourceHeadSha(), input.pinnedSourceCommitSha)
+  if (requireStableHead) {
+    assertUnchangedHead(await input.readCurrentSourceHeadSha(), input.pinnedSourceCommitSha)
+  }
   if (verifiedFileCount !== inventory.fileCount
     || verifiedPlaintextBytes.toString() !== inventory.totalLogicalBytes
     || verifiedObjectPaths.size !== inventory.distinctRemoteObjectCount) {

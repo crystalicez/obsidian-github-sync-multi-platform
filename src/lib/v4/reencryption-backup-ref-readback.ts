@@ -6,7 +6,7 @@ import type { V4SameRepoReencryptionBackupBranchProposal } from "./reencryption-
 
 const GIT_SHA = /^[0-9a-f]{40}$/u
 
-type ReadOnlyGit = Pick<GitHubClient, "getRepositoryIdentity" | "getGitRef" | "getGitCommit">
+type ReadOnlyGit = Pick<GitHubClient, "branchName" | "getRepositoryIdentity" | "getGitRef" | "getGitCommit">
 
 export interface V4SameRepositoryBackupRefReadbackInput {
   /** Two separately branch-scoped GitHub clients; never mutate either branch. */
@@ -19,11 +19,13 @@ export interface V4SameRepositoryBackupRefReadbackInput {
 }
 
 export interface V4SameRepositoryBackupRefReadbackReport {
-  readonly integrityScope: "same-repository-backup-ref-pointer-only"
+  readonly integrityScope: "same-repository-frozen-backup-ref-pointer-only"
   readonly backupRepoId: string
   readonly pinnedSourceCommitSha: string
   readonly pinnedSourceTreeSha: string
-  readonly refAndCommitPointersMatch: true
+  readonly backupRefPinnedToSourceSnapshot: true
+  readonly sourceRefReadable: true
+  readonly sourceBranchMayAdvanceIndependently: true
   readonly backupCreationProven: false
   readonly backupContentsReadbackVerified: false
   readonly independentStorageVerified: false
@@ -83,10 +85,11 @@ function assertCommit(commit: GitHubGitCommit, pinned: string, tree: string): vo
 
 /**
  * D89: READ-ONLY branch/commit pointer inspection. A backup ref pointing at
- * the exact source commit shares the original Git object tree. This is NOT
- * proof that our writer created the ref, that every reachable blob can be
- * read/decrypted, or that an independent backup exists. Stale-client fencing,
- * durable WAL, full restore and cutover remain mandatory separate gates.
+ * the exact pinned source snapshot commit shares the original Git object tree.
+ * D94 supersedes the old source-ref-frozen assumption: source HEAD can move
+ * independently after the snapshot boundary (D90), without invalidating the
+ * immutable backup snapshot. This is NOT proof of backup provenance, full
+ * content readback, installed Obsidian restore or cutover safety.
  *
  * Double observations detect changes at their sample points, not transient
  * ABA changes between reads. Do not use this result as an atomic ref CAS.
@@ -96,6 +99,9 @@ export async function inspectV4SameRepositoryBackupRef(
 ): Promise<V4SameRepositoryBackupRefReadbackReport> {
   throwIfV4Aborted(input.signal)
   const { source, backup } = validatePlan(input.plan, input.expectedSourceTreeSha)
+  if (input.source.branchName !== source.branch || input.backup.branchName !== backup.branch) {
+    throw new Error("Re-encryption backup GitHub client branch scope mismatch.")
+  }
   const { physicalRepositoryId: physicalId, pinnedSourceCommitSha: pinned } = input.plan
   const { expectedSourceTreeSha: tree } = input
   const checkIdentity = async (client: ReadOnlyGit) => {
@@ -104,19 +110,30 @@ export async function inspectV4SameRepositoryBackupRef(
     throwIfV4Aborted(input.signal)
     assertIdentity(identity, physicalId, source.fullName)
   }
-  const checkRef = async (client: ReadOnlyGit, branch: string) => {
+  const checkSourceRef = async () => {
     throwIfV4Aborted(input.signal)
-    const ref = await client.getGitRef()
+    const ref = await input.source.getGitRef()
     throwIfV4Aborted(input.signal)
-    if (!ref || ref.ref !== `refs/heads/${branch}`
+    // Source HEAD is an independent timeline. Its valid advancement since
+    // the pinned snapshot must NOT invalidate a correct frozen backup.
+    if (!ref || ref.ref !== `refs/heads/${source.branch}`
+      || ref.type !== "commit" || !GIT_SHA.test(ref.sha)) {
+      throw new Error("Re-encryption source Git ref is absent, malformed or points to the wrong branch.")
+    }
+  }
+  const checkBackupRef = async () => {
+    throwIfV4Aborted(input.signal)
+    const ref = await input.backup.getGitRef()
+    throwIfV4Aborted(input.signal)
+    if (!ref || ref.ref !== `refs/heads/${backup.branch}`
       || ref.type !== "commit" || ref.sha !== pinned) {
-      throw new Error("Re-encryption backup Git ref is absent, ambiguous or changed from the pinned source commit.")
+      throw new Error("Re-encryption frozen backup Git ref is absent, ambiguous or changed from the pinned source commit.")
     }
   }
   await checkIdentity(input.source)
   await checkIdentity(input.backup)
-  await checkRef(input.source, source.branch)
-  await checkRef(input.backup, backup.branch)
+  await checkSourceRef()
+  await checkBackupRef()
   throwIfV4Aborted(input.signal)
   const sourceCommit = await input.source.getGitCommit(pinned)
   throwIfV4Aborted(input.signal)
@@ -128,16 +145,18 @@ export async function inspectV4SameRepositoryBackupRef(
     || sourceCommit.parentShas.some((sha, i) => sha !== backupCommit.parentShas[i])) {
     throw new Error("Re-encryption backup commit ancestry differs from the pinned source.")
   }
-  await checkRef(input.source, source.branch)
-  await checkRef(input.backup, backup.branch)
+  await checkSourceRef()
+  await checkBackupRef()
   await checkIdentity(input.source)
   await checkIdentity(input.backup)
   return Object.freeze({
-    integrityScope: "same-repository-backup-ref-pointer-only",
+    integrityScope: "same-repository-frozen-backup-ref-pointer-only",
     backupRepoId: input.plan.backupRepoId,
     pinnedSourceCommitSha: pinned,
     pinnedSourceTreeSha: tree,
-    refAndCommitPointersMatch: true,
+    backupRefPinnedToSourceSnapshot: true,
+    sourceRefReadable: true,
+    sourceBranchMayAdvanceIndependently: true,
     backupCreationProven: false,
     backupContentsReadbackVerified: false,
     independentStorageVerified: false,

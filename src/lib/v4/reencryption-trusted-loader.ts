@@ -8,6 +8,7 @@ import { readImmutableGitFile } from "./immutable-git-read"
 import { verifyV4ReencryptionSourceObjects, type V4ReencryptionVerifiedSource } from "./reencryption-content-verifier"
 import { decodeV4RemoteConfig, decodeV4RemoteHead, decodeV4RemoteShard, v4RemoteShardPath, type V4RemoteShard } from "./remote-index"
 import { V4_CONFIG_PATH, V4_HEAD_PATH } from "./protocol-types"
+import type { V4SameRepoReencryptionBackupBranchProposal } from "./reencryption-owner-decisions"
 
 /**
  * Trusted read-only bridge between the public GitHub Git API and D69's
@@ -24,6 +25,39 @@ export interface V4GitHubReencryptionSourceInput {
   readonly signal?: AbortSignal | undefined
 }
 
+interface V4GitHubVerifiedSnapshotInput extends V4GitHubReencryptionSourceInput {
+  /** A frozen backup ref can point to a commit whose config still names the original source branch. */
+  readonly expectedPinnedCommitSha?: string | undefined
+  readonly expectedSourceTreeSha?: string | undefined
+  readonly expectedPhysicalRepositoryId?: number | undefined
+  /** D95: only the source fork preflight can permit later source HEAD drift. */
+  readonly sourceRefPolicy?: "require-stable-head" | "pinned-immutable-commit" | undefined
+}
+
+export interface V4GitHubFrozenBackupVerificationInput {
+  readonly github: V4GitHubReencryptionSourceInput["github"] & Pick<GitHubClient, "branchName">
+  readonly plan: V4SameRepoReencryptionBackupBranchProposal
+  readonly expectedSourceTreeSha: string
+  readonly passphrase: string
+  readonly signal?: AbortSignal | undefined
+}
+
+export interface V4GitHubFrozenBackupVerificationReport {
+  readonly integrityScope: "authenticated-frozen-backup-all-live-objects"
+  readonly backupRepoId: string
+  readonly pinnedSourceCommitSha: string
+  readonly pinnedSourceTreeSha: string
+  readonly verifiedFileCount: number
+  readonly verifiedRemoteObjectCount: number
+  readonly verifiedPlaintextBytes: string
+  readonly backupContentsReadbackVerified: true
+  readonly backupCreationProven: false
+  readonly installedObsidianRestoreVerified: false
+  readonly independentStorageVerified: false
+  readonly destinationPublicationAuthorized: false
+  readonly cutoverAuthorized: false
+}
+
 function assertCommitIdentity(value: unknown): asserts value is string {
   if (typeof value !== "string" || !/^[0-9a-f]{40}$/u.test(value)) {
     throw new Error("Re-encryption source ref must identify a full immutable Git commit SHA.")
@@ -36,21 +70,23 @@ function clearKeyring(keyring: V4Keyring): void {
   }
 }
 
-export async function verifyGitHubReencryptionSource(
-  input: V4GitHubReencryptionSourceInput,
+async function verifyGitHubReencryptionSnapshotAtRef(
+  input: V4GitHubVerifiedSnapshotInput,
 ): Promise<V4ReencryptionVerifiedSource> {
   throwIfV4Aborted(input.signal)
   assertSafeGitHubBranch(input.expectedBranch)
-  if (typeof input.expectedRepoId !== "string" || !input.expectedRepoId.endsWith(`#${input.expectedBranch}`)) {
+  const match = typeof input.expectedRepoId === "string"
+    ? /^([^#/]+)\/([^#/]+)#(.+)$/u.exec(input.expectedRepoId) : null
+  if (!match) throw new Error("Re-encryption expected repository identity is malformed.")
+  const [, selectedOwner, selectedName, configBranch] = match
+  assertSafeGitHubRepositoryCoordinates(selectedOwner ?? "", selectedName ?? "")
+  assertSafeGitHubBranch(configBranch ?? "")
+  if (input.expectedPinnedCommitSha === undefined && configBranch !== input.expectedBranch) {
     throw new Error("Re-encryption expected repository identity and branch do not match.")
   }
-
-  const selectedRepo = input.expectedRepoId.slice(0, -(input.expectedBranch.length + 1))
-  const [selectedOwner, selectedName] = selectedRepo.split("/")
-  assertSafeGitHubRepositoryCoordinates(selectedOwner ?? "", selectedName ?? "")
-  if (selectedRepo.split("/").length !== 2) {
-    throw new Error("Re-encryption expected repository identity is malformed.")
-  }
+  if (input.expectedPinnedCommitSha !== undefined) assertCommitIdentity(input.expectedPinnedCommitSha)
+  if (input.expectedSourceTreeSha !== undefined) assertCommitIdentity(input.expectedSourceTreeSha)
+  const selectedRepo = `${selectedOwner}/${selectedName}`
   const assertPhysicalRepo = (value: GitHubRepositoryIdentity): number => {
     if (!value || typeof value.id !== "number" || !Number.isSafeInteger(value.id) || value.id <= 0
       || typeof value.fullName !== "string"
@@ -61,6 +97,10 @@ export async function verifyGitHubReencryptionSource(
   }
   throwIfV4Aborted(input.signal)
   const initialPhysicalId = assertPhysicalRepo(await input.github.getRepositoryIdentity())
+  if (input.expectedPhysicalRepositoryId !== undefined
+    && initialPhysicalId !== input.expectedPhysicalRepositoryId) {
+    throw new Error("Re-encryption GitHub physical repository ID differs from the pinned source.")
+  }
   throwIfV4Aborted(input.signal)
   const expectedRef = `refs/heads/${input.expectedBranch}`
   const observe = async (): Promise<string> => {
@@ -75,6 +115,9 @@ export async function verifyGitHubReencryptionSource(
   }
 
   const pinned = await observe()
+  if (input.expectedPinnedCommitSha !== undefined && pinned !== input.expectedPinnedCommitSha) {
+    throw new Error("Re-encryption frozen backup branch is not pinned to the authenticated source commit.")
+  }
   // Bounded metadata cache: avoid O(files × Git-path-depth) request growth.
   // Never cache ciphertext blobs or skip verification on a cache hit.
   const TREE_CACHE_MAX_NODES = 8_192
@@ -84,7 +127,17 @@ export async function verifyGitHubReencryptionSource(
   let commitPromise: ReturnType<typeof input.github.getGitCommit> | undefined
   const readCommit = (sha: string) => {
     if (sha !== pinned) throw new Error("Re-encryption immutable commit changed.")
-    commitPromise ??= input.github.getGitCommit(sha)
+    commitPromise ??= input.github.getGitCommit(sha).then(commit => {
+      if (!commit || commit.sha !== pinned || !/^[0-9a-f]{40}$/u.test(commit.treeSha)
+        || !Array.isArray(commit.parentShas)
+        || commit.parentShas.some(parent => !/^[0-9a-f]{40}$/u.test(parent))) {
+        throw new Error("Re-encryption immutable Git commit identity mismatch or invalid ancestry.")
+      }
+      if (input.expectedSourceTreeSha !== undefined && commit.treeSha !== input.expectedSourceTreeSha) {
+        throw new Error("Re-encryption frozen backup root Git tree differs from the authenticated source.")
+      }
+      return commit
+    })
     return commitPromise
   }
   const readTree = async (sha: string): Promise<GitHubTree> => {
@@ -162,6 +215,7 @@ export async function verifyGitHubReencryptionSource(
     }
     const verified = await verifyV4ReencryptionSourceObjects({
       config, head, shards, keyring, pinnedSourceCommitSha: pinned,
+      sourceRefPolicy: input.sourceRefPolicy,
       readCurrentSourceHeadSha: observe,
       readPinnedObject: immutableReader,
       signal: input.signal,
@@ -177,4 +231,90 @@ export async function verifyGitHubReencryptionSource(
     salt.fill(0)
     if (keyring) clearKeyring(keyring)
   }
+}
+
+/** Original D70 source preflight: config identity and observed ref are the same branch. */
+export function verifyGitHubReencryptionSource(
+  input: V4GitHubReencryptionSourceInput,
+): Promise<V4ReencryptionVerifiedSource> {
+  return verifyGitHubReencryptionSnapshotAtRef(input)
+}
+
+/**
+ * D95: obtain ONE authenticated source Git ref first, then authenticate the
+ * whole logical vault from its exact immutable SHA. Other old-branch devices
+ * may advance their branch HEAD during this read without invalidating the
+ * already pinned snapshot. Never treat this read-only report as write approval.
+ */
+export function verifyGitHubReencryptionForkSource(
+  input: V4GitHubReencryptionSourceInput,
+): Promise<V4ReencryptionVerifiedSource> {
+  return verifyGitHubReencryptionSnapshotAtRef({
+    ...input, sourceRefPolicy: "pinned-immutable-commit",
+  })
+}
+
+/**
+ * D94: authenticate EVERY live ciphertext object THROUGH the already-created
+ * frozen backup branch, without requiring the original source branch to stop
+ * Syncing. The V4 config still identifies the original old-key source branch,
+ * not the backup ref used to retain the pinned original commit.
+ *
+ * This is read-only independent GitHub readback of source ciphertext. It
+ * proves neither backup creation provenance nor local restore durability.
+ */
+export async function verifyGitHubFrozenReencryptionBackup(
+  input: V4GitHubFrozenBackupVerificationInput,
+): Promise<V4GitHubFrozenBackupVerificationReport> {
+  throwIfV4Aborted(input.signal)
+  const { plan } = input
+  if (!plan || plan.proof !== "owner-approved-same-repo-backup-topology-only"
+    || plan.status !== "blocked-pending-safe-backup-ref-implementation"
+    || plan.actualBackupCreated !== false || plan.backupReadbackVerified !== false
+    || plan.permissionToPublish !== false || plan.cutoverAuthorized !== false
+    || plan.oldBranchDeletionAuthorized !== false
+    || !Number.isSafeInteger(plan.physicalRepositoryId) || plan.physicalRepositoryId < 1
+    || !/^[0-9a-f]{40}$/u.test(plan.pinnedSourceCommitSha)
+    || !/^[0-9a-f]{40}$/u.test(input.expectedSourceTreeSha)) {
+    throw new Error("Frozen backup full readback requires a blocked authenticated snapshot proposal.")
+  }
+  const sourceId = /^([^#/]+)\/([^#/]+)#(.+)$/u.exec(plan.sourceRepoId)
+  const backupId = /^([^#/]+)\/([^#/]+)#(.+)$/u.exec(plan.backupRepoId)
+  const destinationId = /^([^#/]+)\/([^#/]+)#(.+)$/u.exec(plan.destinationRepoId)
+  if (!sourceId || !backupId || !destinationId) {
+    throw new Error("Frozen backup branch repository identities are invalid.")
+  }
+  const names = [sourceId, backupId, destinationId].map(value => `${value[1]}/${value[2]}`.toLowerCase())
+  if (names.some(value => value !== names[0])
+    || new Set([sourceId[3], backupId[3], destinationId[3]]).size !== 3
+    || backupId[3] !== plan.backupBranch
+    || input.github.branchName !== backupId[3]) {
+    throw new Error("Frozen backup GitHub branch scope, repository or three-branch topology mismatch.")
+  }
+  const verified = await verifyGitHubReencryptionSnapshotAtRef({
+    github: input.github,
+    expectedRepoId: plan.sourceRepoId,
+    expectedBranch: plan.backupBranch,
+    expectedPinnedCommitSha: plan.pinnedSourceCommitSha,
+    expectedSourceTreeSha: input.expectedSourceTreeSha,
+    expectedPhysicalRepositoryId: plan.physicalRepositoryId,
+    passphrase: input.passphrase,
+    signal: input.signal,
+  })
+  throwIfV4Aborted(input.signal)
+  return Object.freeze({
+    integrityScope: "authenticated-frozen-backup-all-live-objects",
+    backupRepoId: plan.backupRepoId,
+    pinnedSourceCommitSha: plan.pinnedSourceCommitSha,
+    pinnedSourceTreeSha: input.expectedSourceTreeSha,
+    verifiedFileCount: verified.verifiedFileCount,
+    verifiedRemoteObjectCount: verified.verifiedRemoteObjectCount,
+    verifiedPlaintextBytes: verified.totalVerifiedPlaintextBytes,
+    backupContentsReadbackVerified: true,
+    backupCreationProven: false,
+    installedObsidianRestoreVerified: false,
+    independentStorageVerified: false,
+    destinationPublicationAuthorized: false,
+    cutoverAuthorized: false,
+  })
 }

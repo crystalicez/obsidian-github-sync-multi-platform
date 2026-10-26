@@ -40,11 +40,13 @@ function fixture() {
   let sourceRefIndex = 0
   let backupRefIndex = 0
   const source = {
+    branchName: "main",
     async getRepositoryIdentity() { calls.push("source:identity"); return repo },
     async getGitRef() { calls.push("source:ref"); return sourceRefs[Math.min(sourceRefIndex++, sourceRefs.length - 1)]! },
     async getGitCommit(_sha: string) { calls.push("source:commit"); return commit },
   }
   const backup = {
+    branchName: "backup/old-encrypted",
     async getRepositoryIdentity() { calls.push("backup:identity"); return repo },
     async getGitRef() { calls.push("backup:ref"); return backupRefs[Math.min(backupRefIndex++, backupRefs.length - 1)]! },
     async getGitCommit(_sha: string) { calls.push("backup:commit"); return commit },
@@ -63,11 +65,13 @@ test("D89 only proves same-repo backup ref pinned to the exact authenticated sou
   const f = fixture()
   const result = await inspect(f)
   assert.deepEqual(result, {
-    integrityScope: "same-repository-backup-ref-pointer-only",
+    integrityScope: "same-repository-frozen-backup-ref-pointer-only",
     backupRepoId: proposal.backupRepoId,
     pinnedSourceCommitSha: sourceCommitSha,
     pinnedSourceTreeSha: sourceTreeSha,
-    refAndCommitPointersMatch: true,
+    backupRefPinnedToSourceSnapshot: true,
+    sourceRefReadable: true,
+    sourceBranchMayAdvanceIndependently: true,
     backupCreationProven: false,
     backupContentsReadbackVerified: false,
     independentStorageVerified: false,
@@ -91,12 +95,14 @@ test("D89 refuses physical repo or owner/repo identity mismatch", async () => {
   }
 })
 
-test("D89 refuses missing, wrong or symbolic source and backup Git ref pointers", async () => {
+test("D94 rejects malformed/wrong-branch source and any wrong backup ref", async () => {
   for (const key of ["sourceRefs", "backupRefs"] as const) {
-    for (const change of [
-      { ref: "refs/heads/unexpected" }, { sha: "d".repeat(40) },
+    const changes = [
+      { ref: "refs/heads/unexpected" },
       { sha: "HEAD" }, { type: "tree" }, { ref: "" },
-    ]) {
+      ...(key === "backupRefs" ? [{ sha: "d".repeat(40) }] : []),
+    ]
+    for (const change of changes) {
       const f = fixture()
       Object.assign(f[key][0]!, change)
       await assert.rejects(inspect(f), /ref|commit/i)
@@ -104,12 +110,17 @@ test("D89 refuses missing, wrong or symbolic source and backup Git ref pointers"
   }
 })
 
-test("D89 detects backup ref change or source ref change during inspection", async () => {
-  for (const key of ["sourceRefs", "backupRefs"] as const) {
-    const f = fixture()
-    f[key][1] = { ...f[key][1]!, sha: "d".repeat(40) }
-    await assert.rejects(inspect(f), /ref|changed/i)
-  }
+test("D94 detects frozen backup pointer drift while permitting old source HEAD drift", async () => {
+  const backupDrift = fixture()
+  backupDrift.backupRefs[1] = { ...backupDrift.backupRefs[1]!, sha: "d".repeat(40) }
+  await assert.rejects(inspect(backupDrift), /ref|changed/i)
+
+  const oldBranchAdvanced = fixture()
+  oldBranchAdvanced.sourceRefs[0] = { ...oldBranchAdvanced.sourceRefs[0]!, sha: "d".repeat(40) }
+  oldBranchAdvanced.sourceRefs[1] = { ...oldBranchAdvanced.sourceRefs[1]!, sha: "e".repeat(40) }
+  const result = await inspect(oldBranchAdvanced)
+  assert.equal(result.backupRefPinnedToSourceSnapshot, true)
+  assert.equal(result.sourceBranchMayAdvanceIndependently, true)
 })
 
 test("D89 checks immutable commit identity and tree on both clients", async () => {

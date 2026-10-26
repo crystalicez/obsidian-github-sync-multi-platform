@@ -7,7 +7,9 @@ import { deriveV4Keyring } from "../../src/lib/v4/crypto";
 import { buildV4RemoteMetadata } from "../../src/lib/v4/remote-index";
 import type { V4RemoteConfig, V4RemoteHead } from "../../src/lib/v4/protocol-types";
 import { V4StorageCodec } from "../../src/lib/v4/storage-codec";
-import { verifyGitHubReencryptionSource } from "../../src/lib/v4/reencryption-trusted-loader";
+import { verifyGitHubReencryptionSource, verifyGitHubReencryptionForkSource, verifyGitHubFrozenReencryptionBackup } from "../../src/lib/v4/reencryption-trusted-loader";
+import { proposeV4SameRepositoryReencryptionBackupBranch } from "../../src/lib/v4/reencryption-owner-decisions";
+import { inspectV4FrozenBackupAfterAmbiguousCreate } from "../../src/lib/v4/reencryption-backup-reconcile";
 
 const enc = utf8ToBytes;
 const gitBlobSha = (bytes: Uint8Array) =>
@@ -273,6 +275,31 @@ test("D70 refuses source ref change during Git object traversal and after verifi
   );
 });
 
+test("D95 authenticated fork source pins initial immutable commit while other devices advance old branch", async () => {
+  const fork = await createFixture()
+  fork.onBlobRead(() => fork.setCurrentSha("d".repeat(40)))
+  const verified = await verifyGitHubReencryptionForkSource({
+    github: fork.github, expectedRepoId: repoId, expectedBranch: "main",
+    passphrase: "correct",
+  })
+  assert.equal(verified.integrityScope, "all-live-objects")
+  assert.equal(verified.pinnedSourceCommitSha, commitSha)
+  assert.equal(verified.verifiedFileCount, 1)
+  // Only the initial old-branch HEAD pin is required. Every following object
+  // is looked up by its immutable SHA, not by the mutable ref.
+  assert.equal(fork.refReads, 1)
+  assert.equal(fork.repoReads, 2)
+  assert.ok(fork.blobReads > 0)
+
+  const malicious = await createFixture()
+  malicious.setCurrentSha("not-a-commit")
+  await assert.rejects(() => verifyGitHubReencryptionForkSource({
+    github: malicious.github, expectedRepoId: repoId, expectedBranch: "main",
+    passphrase: "correct",
+  }), /source ref|commit SHA|immutable/i)
+  assert.equal(malicious.blobReads, 0)
+})
+
 test("D70 source proof aborts before any Git read on cancellation", async () => {
   const f = await createFixture();
   const controller = new AbortController();
@@ -292,3 +319,316 @@ test("D70 never writes to GitHub and refuses a ref that is a short SHA or branch
   }), /source ref|source HEAD|commit/i);
   assert.equal(f.blobReads, 0);
 });
+
+const frozenPlan = proposeV4SameRepositoryReencryptionBackupBranch({
+  sourceRepoId: repoId,
+  backupRepoId: "owner/repo#backup/2026-10-26",
+  destinationRepoId: "owner/repo#rekey/2026-10-26",
+  pinnedSourceCommitSha: commitSha,
+  sourcePhysicalRepositoryId: 1284153873,
+  backupPhysicalRepositoryId: 1284153873,
+  destinationPhysicalRepositoryId: 1284153873,
+  expectedPhysicalRepositoryId: 1284153873,
+  defaultBranch: "main",
+})
+
+type GitFixture = Awaited<ReturnType<typeof createFixture>>
+function frozenBackupClient(f: GitFixture) {
+  return {
+    ...f.github,
+    branchName: "backup/2026-10-26",
+    async getGitRef() {
+      await f.github.getGitRef()
+      return { ref: "refs/heads/backup/2026-10-26", type: "commit", sha: commitSha }
+    },
+  }
+}
+
+test("D94 authenticates all frozen backup contents even when old source HEAD advances independently", async () => {
+  const f = await createFixture()
+  // Simulate a device B committing to the old branch after A froze the backup.
+  f.setCurrentSha("d".repeat(40))
+  const report = await verifyGitHubFrozenReencryptionBackup({
+    github: frozenBackupClient(f),
+    plan: frozenPlan, expectedSourceTreeSha: rootTreeSha, passphrase: "correct",
+  })
+  assert.deepEqual(report, {
+    integrityScope: "authenticated-frozen-backup-all-live-objects",
+    backupRepoId: frozenPlan.backupRepoId,
+    pinnedSourceCommitSha: commitSha,
+    pinnedSourceTreeSha: rootTreeSha,
+    verifiedFileCount: 1,
+    verifiedRemoteObjectCount: 1,
+    verifiedPlaintextBytes: String(enc("File content secret").byteLength),
+    backupContentsReadbackVerified: true,
+    backupCreationProven: false,
+    installedObsidianRestoreVerified: false,
+    independentStorageVerified: false,
+    destinationPublicationAuthorized: false,
+    cutoverAuthorized: false,
+  })
+  assert.equal(f.refReads >= 3, true)
+  assert.equal(f.repoReads, 2)
+  assert.ok(f.blobReads > 1)
+  assert.ok(Object.isFrozen(report))
+})
+
+test("D94 refuses forged backup plans, branch scope and wrong physical repository BEFORE Git IO", async () => {
+  const invalids = [
+    { plan: { ...frozenPlan, pinnedSourceCommitSha: "d".repeat(40) } },
+    { plan: { ...frozenPlan, physicalRepositoryId: 4 } },
+    { plan: { ...frozenPlan, backupRepoId: "owner/other#backup/2026-10-26" } },
+    { plan: { ...frozenPlan, backupReadbackVerified: true } },
+    { plan: { ...frozenPlan, destinationRepoId: frozenPlan.backupRepoId } },
+    { plan: { ...frozenPlan, status: "ready" } },
+    { expectedSourceTreeSha: "HEAD" },
+  ]
+  for (const modified of invalids) {
+    const f = await createFixture()
+    await assert.rejects(() => verifyGitHubFrozenReencryptionBackup({
+      github: frozenBackupClient(f), plan: frozenPlan,
+      expectedSourceTreeSha: rootTreeSha, passphrase: "correct",
+      ...modified,
+    } as Parameters<typeof verifyGitHubFrozenReencryptionBackup>[0]), /backup|branch|repository|identity|snapshot|commit/i)
+    assert.equal(f.blobReads, 0)
+  }
+  const f = await createFixture()
+  const wrongBranch = { ...frozenBackupClient(f), branchName: "other" }
+  await assert.rejects(() => verifyGitHubFrozenReencryptionBackup({
+    github: wrongBranch, plan: frozenPlan, expectedSourceTreeSha: rootTreeSha, passphrase: "correct",
+  }), /branch/i)
+  assert.equal(f.repoReads, 0)
+})
+
+test("D94 fails closed for moved backup ref, wrong tree or corrupted ciphertext", async () => {
+  const f = await createFixture()
+  const wrongRef = {
+    ...frozenBackupClient(f),
+    async getGitRef() { return { ref: "refs/heads/backup/2026-10-26", type: "commit", sha: "d".repeat(40) } },
+  }
+  await assert.rejects(() => verifyGitHubFrozenReencryptionBackup({
+    github: wrongRef, plan: frozenPlan, expectedSourceTreeSha: rootTreeSha, passphrase: "correct",
+  }), /pinned|commit/i)
+  assert.equal(f.blobReads, 0)
+
+  const wrongTree = await createFixture()
+  await assert.rejects(() => verifyGitHubFrozenReencryptionBackup({
+    github: frozenBackupClient(wrongTree), plan: frozenPlan,
+    expectedSourceTreeSha: "f".repeat(40), passphrase: "correct",
+  }), /root Git tree/i)
+  assert.equal(wrongTree.blobReads, 0)
+
+  const corrupt = await createFixture()
+  const altered = {
+    ...frozenBackupClient(corrupt),
+    async getBlob(sha: string) {
+      const bytes = await corrupt.github.getBlob(sha)
+      const copy = bytes.slice()
+      copy[0] = copy[0]! ^ 1
+      return copy
+    },
+  }
+  await assert.rejects(() => verifyGitHubFrozenReencryptionBackup({
+    github: altered, plan: frozenPlan, expectedSourceTreeSha: rootTreeSha, passphrase: "correct",
+  }), /blob identity|integrity/i)
+})
+
+test("D94 detects backup HEAD drift while verifying, abort and wrong passphrase", async () => {
+  const f = await createFixture()
+  let reads = 0
+  const moving = {
+    ...frozenBackupClient(f),
+    async getGitRef() {
+      reads++
+      return {
+        ref: "refs/heads/backup/2026-10-26", type: "commit",
+        sha: reads === 1 ? commitSha : "d".repeat(40),
+      }
+    },
+  }
+  await assert.rejects(() => verifyGitHubFrozenReencryptionBackup({
+    github: moving, plan: frozenPlan, expectedSourceTreeSha: rootTreeSha, passphrase: "correct",
+  }), /source HEAD|changed|pinned/i)
+
+  const badPassword = await createFixture()
+  await assert.rejects(() => verifyGitHubFrozenReencryptionBackup({
+    github: frozenBackupClient(badPassword), plan: frozenPlan,
+    expectedSourceTreeSha: rootTreeSha, passphrase: "wrong",
+  }), /auth|decrypt|passphrase/i)
+
+  const aborted = await createFixture()
+  const ctrl = new AbortController()
+  ctrl.abort(new Error("cancelled frozen read"))
+  await assert.rejects(() => verifyGitHubFrozenReencryptionBackup({
+    github: frozenBackupClient(aborted), plan: frozenPlan,
+    expectedSourceTreeSha: rootTreeSha, passphrase: "correct", signal: ctrl.signal,
+  }), /cancelled frozen read/i)
+  assert.equal(aborted.repoReads, 0)
+})
+
+function backupRecoveryClient(
+  f: GitFixture,
+  initial: null | string = commitSha,
+) {
+  const client = frozenBackupClient(f)
+  let refSha: null | string = initial
+  let readCount = 0
+  let defaultName = "main"
+  let failRead = false
+  return {
+    github: {
+      ...client,
+      async getRepositoryDefaultBranch() { return defaultName },
+      async getGitRefOrNull() {
+        readCount++
+        if (failRead) throw new Error("GitHub 503: unresolved backup ref")
+        return refSha === null ? null : {
+          ref: "refs/heads/backup/2026-10-26", type: "commit", sha: refSha,
+        }
+      },
+    },
+    get readCount() { return readCount },
+    changeRef(next: string | null) { refSha = next },
+    changeDefault(next: string) { defaultName = next },
+    failReads() { failRead = true },
+  }
+}
+
+test("D95 distinguishes absent and conflicting backup refs WITHOUT retry authorization or content reads", async () => {
+  for (const [sha, status] of [
+    [null, "ref-unobserved-at-two-checks"],
+    ["d".repeat(40), "ref-occupied-by-other-commit"],
+  ] as const) {
+    const f = await createFixture()
+    const recovery = backupRecoveryClient(f, sha)
+    const result = await inspectV4FrozenBackupAfterAmbiguousCreate({
+      backup: recovery.github, plan: frozenPlan,
+      expectedSourceTreeSha: rootTreeSha, originalPassphrase: "correct",
+    })
+    assert.equal(result.outcome, status)
+    assert.equal(result.backupContentsReadbackVerified, false)
+    assert.equal(result.automaticallyRetryCreateAuthorized, false)
+    assert.equal(result.overwriteAuthorized, false)
+    assert.equal(result.destinationPublicationAuthorized, false)
+    assert.equal(result.cutoverAuthorized, false)
+    assert.equal(f.blobReads, 0)
+    assert.equal(recovery.readCount, 2)
+    assert.ok(Object.isFrozen(result))
+  }
+})
+
+test("D95 uncertain create recovery verifies all real frozen encrypted objects and never authorizes cutover", async () => {
+  const f = await createFixture()
+  f.setCurrentSha("d".repeat(40)) // independent old branch has advanced
+  const recovery = backupRecoveryClient(f)
+  const report = await inspectV4FrozenBackupAfterAmbiguousCreate({
+    backup: recovery.github, plan: frozenPlan,
+    expectedSourceTreeSha: rootTreeSha, originalPassphrase: "correct",
+  })
+  assert.deepEqual(report, {
+    integrityScope: "ambiguous-backup-create-read-only-reconciliation",
+    backupRepoId: frozenPlan.backupRepoId,
+    pinnedSourceCommitSha: commitSha,
+    outcome: "matching-backup-full-readback",
+    backupContentsReadbackVerified: true,
+    creationProven: false,
+    automaticallyRetryCreateAuthorized: false,
+    overwriteAuthorized: false,
+    installedObsidianRestoreVerified: false,
+    independentStorageVerified: false,
+    destinationPublicationAuthorized: false,
+    cutoverAuthorized: false,
+  })
+  assert.equal(recovery.readCount, 3)
+  assert.ok(f.blobReads > 1)
+})
+
+test("D95 refuses unknown API outcome or changes in backup ref during reconciliation", async () => {
+  const missing = await createFixture()
+  const recovery = backupRecoveryClient(missing)
+  recovery.failReads()
+  await assert.rejects(() => inspectV4FrozenBackupAfterAmbiguousCreate({
+    backup: recovery.github, plan: frozenPlan,
+    expectedSourceTreeSha: rootTreeSha, originalPassphrase: "correct",
+  }), /503/)
+  assert.equal(missing.blobReads, 0)
+
+  const drifting = await createFixture()
+  const move = backupRecoveryClient(drifting)
+  const reads = move.github.getGitRefOrNull
+  let index = 0
+  move.github.getGitRefOrNull = async () => {
+    const ref = await reads()
+    index++
+    if (index === 2) return { ...ref!, sha: "d".repeat(40) }
+    return ref
+  }
+  await assert.rejects(() => inspectV4FrozenBackupAfterAmbiguousCreate({
+    backup: move.github, plan: frozenPlan,
+    expectedSourceTreeSha: rootTreeSha, originalPassphrase: "correct",
+  }), /changed/)
+  assert.equal(drifting.blobReads, 0)
+
+  const after = await createFixture()
+  const changedAfter = backupRecoveryClient(after)
+  const read = changedAfter.github.getGitRefOrNull
+  let checks = 0
+  changedAfter.github.getGitRefOrNull = async () => {
+    checks++
+    return checks === 3 ? null : read()
+  }
+  await assert.rejects(() => inspectV4FrozenBackupAfterAmbiguousCreate({
+    backup: changedAfter.github, plan: frozenPlan,
+    expectedSourceTreeSha: rootTreeSha, originalPassphrase: "correct",
+  }), /changed/)
+})
+
+test("D95 refuses wrong physical identity, wrong client scope, invalid plan and changed default branch", async () => {
+  const f = await createFixture()
+  f.setRepositoryId(5)
+  const client = backupRecoveryClient(f)
+  await assert.rejects(() => inspectV4FrozenBackupAfterAmbiguousCreate({
+    backup: client.github, plan: frozenPlan,
+    expectedSourceTreeSha: rootTreeSha, originalPassphrase: "correct",
+  }), /repository/)
+  assert.equal(f.blobReads, 0)
+
+  const wrongScope = await createFixture()
+  const other = backupRecoveryClient(wrongScope)
+  await assert.rejects(() => inspectV4FrozenBackupAfterAmbiguousCreate({
+    backup: { ...other.github, branchName: "backup/wrong" }, plan: frozenPlan,
+    expectedSourceTreeSha: rootTreeSha, originalPassphrase: "correct",
+  }), /scope|branch/)
+  assert.equal(wrongScope.repoReads, 0)
+
+  const invalid = await createFixture()
+  const original = backupRecoveryClient(invalid)
+  await assert.rejects(() => inspectV4FrozenBackupAfterAmbiguousCreate({
+    backup: original.github,
+    plan: { ...frozenPlan, status: "unsafe" } as unknown as typeof frozenPlan,
+    expectedSourceTreeSha: rootTreeSha, originalPassphrase: "correct",
+  }), /blocked/)
+  assert.equal(invalid.repoReads, 0)
+
+  const wrongDefault = await createFixture()
+  const defaultReader = backupRecoveryClient(wrongDefault)
+  const def = defaultReader.github.getRepositoryDefaultBranch
+  let count = 0
+  defaultReader.github.getRepositoryDefaultBranch = async () =>
+    ++count === 1 ? def() : "unexpected"
+  await assert.rejects(() => inspectV4FrozenBackupAfterAmbiguousCreate({
+    backup: defaultReader.github, plan: frozenPlan,
+    expectedSourceTreeSha: rootTreeSha, originalPassphrase: "correct",
+  }), /default branch changed/)
+})
+
+test("D95 aborted recovery does no remote I/O", async () => {
+  const f = await createFixture()
+  const ctrl = new AbortController()
+  ctrl.abort(new Error("stop recovery"))
+  await assert.rejects(() => inspectV4FrozenBackupAfterAmbiguousCreate({
+    backup: backupRecoveryClient(f).github, plan: frozenPlan,
+    expectedSourceTreeSha: rootTreeSha, originalPassphrase: "correct", signal: ctrl.signal,
+  }), /stop recovery/)
+  assert.equal(f.repoReads, 0)
+})

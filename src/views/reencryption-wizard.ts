@@ -3,7 +3,7 @@ import type FastSync from "../main"
 import type { PluginSettings } from "../setting"
 import { GitHubClient } from "../lib/github-api"
 import { V4_DEFAULT_PBKDF2_ITERATIONS, V4_MAX_PBKDF2_ITERATIONS, V4_MIN_NEW_PBKDF2_ITERATIONS } from "../lib/v4/kdf-policy"
-import { verifyGitHubReencryptionSource } from "../lib/v4/reencryption-trusted-loader"
+import { verifyGitHubReencryptionForkSource } from "../lib/v4/reencryption-trusted-loader"
 import {
   proposeV4ReencryptionWizardDraft,
   suggestV4ReencryptionBranchNames,
@@ -160,13 +160,19 @@ export class V4ReencryptionWizardModal extends Modal {
         throw new Error("GitHub repository identity does not match settings.")
       }
       const defaultBranch = await client.getRepositoryDefaultBranch()
-      const proof = await verifyGitHubReencryptionSource({
+      const proof = await verifyGitHubReencryptionForkSource({
         github: client, expectedRepoId: this.sourceRepoId(),
         expectedBranch: this.initialSettings.githubBranch,
         passphrase: this.initialSettings.encryptionPassphrase,
         signal: controller.signal,
       })
+      const repoAfter = await client.getRepositoryIdentity()
+      const defaultBranchAfter = await client.getRepositoryDefaultBranch()
       if (this.closed || controller.signal.aborted || epoch !== this.requestEpoch) return
+      if (repo.id !== repoAfter.id || repo.fullName.toLowerCase() !== repoAfter.fullName.toLowerCase()
+        || defaultBranch !== defaultBranchAfter) {
+        throw new Error("Repository identity or default branch changed during source verification.")
+      }
       if (!this.matchesConnection()) throw new Error("Connection settings changed during verification.")
       this.source = {
         physicalRepositoryId: repo.id,

@@ -120,6 +120,44 @@ test("D69 refuses preflight HEAD mismatch and post-read source mutation", async 
   await assert.rejects(() => verifyV4ReencryptionSourceObjects(post), /source HEAD|source commit|changed/i);
 });
 
+test("D95 immutable fork source permits valid later source HEAD advances without skipping authenticated bytes", async () => {
+  const f = await fixture()
+  const source = await inputOf(f)
+  source.setCurrentHead(MUTATED_SHA)
+  const proof = await verifyV4ReencryptionSourceObjects({
+    ...source, sourceRefPolicy: "pinned-immutable-commit",
+  })
+  assert.equal(proof.pinnedSourceCommitSha, SHA)
+  assert.equal(proof.verifiedFileCount, 1)
+  assert.equal(source.reads, 1)
+
+  const editedDuringRead = await inputOf(f)
+  const oldRead = editedDuringRead.readPinnedObject
+  editedDuringRead.readPinnedObject = async (path, sha) => {
+    const bytes = await oldRead(path, sha)
+    editedDuringRead.setCurrentHead(MUTATED_SHA)
+    return bytes
+  }
+  assert.equal((await verifyV4ReencryptionSourceObjects({
+    ...editedDuringRead, sourceRefPolicy: "pinned-immutable-commit",
+  })).verifiedFileCount, 1)
+
+  const unsafe = await inputOf(f)
+  const invalid = "invalid-policy" as unknown as "pinned-immutable-commit"
+  await assert.rejects(
+    () => verifyV4ReencryptionSourceObjects({ ...unsafe, sourceRefPolicy: invalid }),
+    /source ref policy/i,
+  )
+  assert.equal(unsafe.reads, 0)
+
+  const badCipher = await inputOf(f)
+  badCipher.readPinnedObject = async () => new Uint8Array([0, 1, 2])
+  await assert.rejects(
+    () => verifyV4ReencryptionSourceObjects({ ...badCipher, sourceRefPolicy: "pinned-immutable-commit" }),
+    /integrity|auth|decrypt/i,
+  )
+})
+
 test("D69 rejects corrupt or incomplete index before any object transfer", async () => {
   const f = await fixture();
   const source = await inputOf(f);

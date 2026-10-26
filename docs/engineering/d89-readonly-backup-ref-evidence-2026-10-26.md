@@ -1,5 +1,7 @@
 # D89 — Same-repository backup ref: read-only pinned-pointer evidence
 
+> **Historical note, superseded by D94 (2026-10-26):** The D89 requirement for the LIVE source branch HEAD to equal the pinned snapshot commit was replaced under the owner's D90 independent-branch-fork policy. Other devices may Sync the old branch and advance source HEAD. The frozen backup ref STILL must point at the immutable pinned snapshot commit, with identical immutable Git commit/tree proven via both clients. Current output fields are `backupRefPinnedToSourceSnapshot`, `sourceRefReadable`, and `sourceBranchMayAdvanceIndependently` (not `refAndCommitPointersMatch`). See `docs/engineering/d92-d93-readonly-wizard-and-frozen-backup-ref-2026-10-26.md` D94 follow-up. The historical D89 numbered evidence below describes the original implementation only.
+
 Date: 2026-10-26 (Asia/Bangkok). Base clean/pushed D88 commit `820b3e1d375a13b203d5b481139c0713b4bc7523`. Continued in isolated `.worktrees/d87-owner-rekey-policy`; no new GitHub branch, credentialed mutation, vault contents, or release.
 
 ## Why this matters
