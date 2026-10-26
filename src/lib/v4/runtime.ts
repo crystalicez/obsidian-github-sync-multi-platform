@@ -23,6 +23,8 @@ import type { V4SessionVault } from "./local-io"
 import { createV4ContentSource, createV4WholeBufferContentSource, DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES, type V4ContentSource } from "./content-source"
 import { createV4PlatformIo, V4ManualRecoveryRequiredError, type V4BinaryAdapterLike, type V4PlatformIo } from "./platform-io"
 import { isV4UncVaultPath, V4_NETWORK_VAULT_WARNING } from "./network-storage"
+import { createV4DesktopInitiatorLocalReader } from "./reencryption-desktop-initiator-reader"
+import type { V4InitiatorLocalReader } from "./reencryption-initiator-parity"
 import { createV4StagingStore, type V4StagingStore } from "./staging-store"
 import { V4ProgressStore, type V4SyncProgressSnapshot } from "./progress"
 import { createV4RunDiagnostics } from "./run-diagnostics"
@@ -153,6 +155,7 @@ export class V4PluginRuntime {
   private runHashingMs: number | undefined
   private readonly platformIo: V4PlatformIo
   private readonly uncVault: boolean
+  private readonly desktopVaultRoot: string | undefined
   private networkStorageNoticeShown = false
   private readonly stagingStore: V4StagingStore
   private readonly recentlyStagedPaths = new Set<string>()
@@ -165,6 +168,7 @@ export class V4PluginRuntime {
     this.adapter = createIndexAdapter(plugin)
     const executionIo = createRuntimePlatformIo(plugin)
     this.platformIo = executionIo.io
+    this.desktopVaultRoot = executionIo.desktopRootPath
     this.uncVault = isV4UncVaultPath(executionIo.desktopRootPath)
     this.stagingStore = createRuntimeStagingStore(this.platformIo, executionIo.stageRoot)
     this.coordinator = new V4SyncCoordinator({
@@ -212,6 +216,82 @@ export class V4PluginRuntime {
     })
     throwIfV4Aborted(signal)
     return keyring
+  }
+
+  /**
+   * D106 read-only factory bound to REAL Obsidian scope/queue/editor state and
+   * physical Node vault I/O. No migration is started and this cannot grant
+   * local cutover. An external WAL lease still must be supplied and independently
+   * crash-durability audited before any future ref mutation.
+   */
+  createReencryptionInitiatorLocalReader(
+    assertExclusiveInitiatorLease: () => Promise<void>,
+  ): V4InitiatorLocalReader {
+    this.assertNotDisposed()
+    if (!this.desktopVaultRoot || !this.platformIo.capabilities.boundedRead
+      || !this.platformIo.capabilities.recoveryStagedCommit || this.uncVault) {
+      throw new Error("Re-encryption live initiating-vault parity requires a verified local Desktop filesystem.")
+    }
+    if (typeof assertExclusiveInitiatorLease !== "function") {
+      throw new Error("Re-encryption initiating-vault parity requires a real exclusive WAL lease.")
+    }
+    const initial = { ...this.plugin.settings }
+    const generation = this.credentialGeneration
+    const sourceScope = {
+      configDir: this.plugin.app.vault.configDir || ".obsidian",
+      pluginId: this.plugin.manifest.id,
+      ignorePathRegex: initial.ignorePathRegex,
+      syncObsidianConfig: initial.syncObsidianConfig,
+      syncBookmarks: initial.syncBookmarks,
+      syncPlugins: initial.syncPlugins,
+    }
+    const assertConnection = async () => {
+      this.assertNotDisposed()
+      const latest = this.plugin.settings
+      if (this.credentialGeneration !== generation
+        || latest.githubOwner !== initial.githubOwner || latest.githubRepo !== initial.githubRepo
+        || latest.githubBranch !== initial.githubBranch || latest.githubToken !== initial.githubToken
+        || latest.encryptionMode !== initial.encryptionMode
+        || latest.encryptionPassphrase !== initial.encryptionPassphrase
+        || latest.encryptionPassphraseSecretId !== initial.encryptionPassphraseSecretId
+        || latest.githubTokenSecretId !== initial.githubTokenSecretId
+        || latest.vault !== initial.vault
+        || latest.ignorePathRegex !== initial.ignorePathRegex
+        || latest.syncObsidianConfig !== initial.syncObsidianConfig
+        || latest.syncBookmarks !== initial.syncBookmarks
+        || latest.syncPlugins !== initial.syncPlugins
+        || (this.plugin.app.vault.configDir || ".obsidian") !== sourceScope.configDir
+        || this.plugin.manifest.id !== sourceScope.pluginId) {
+        throw new Error("Re-encryption source connection or local Sync scope changed.")
+      }
+    }
+    return createV4DesktopInitiatorLocalReader({
+      rootAbsolute: this.desktopVaultRoot,
+      scope: sourceScope,
+      assertExclusiveInitiatorLease,
+      assertIdleAndNoPendingEdits: async () => {
+        this.assertNotDisposed()
+        if (this.coordinator.isSyncing || this.coordinator.pendingCount > 0
+          || this.debounceRunActive || this.recentlyStagedPaths.size > 0) {
+          throw new Error("Re-encryption source Sync or pending local mutations are not idle.")
+        }
+      },
+      assertSourceConfigurationUnchanged: assertConnection,
+      listOpenEditorPaths: async () => {
+        const workspace = this.plugin.app.workspace
+        if (!workspace || typeof workspace.iterateAllLeaves !== "function") {
+          throw new Error("Re-encryption cannot prove that Obsidian editors are closed.")
+        }
+        const open = new Set<string>()
+        const active = workspace.activeEditor?.file?.path
+        if (active) open.add(active)
+        workspace.iterateAllLeaves(leaf => {
+          const file = (leaf.view as { file?: { path?: string } } | undefined)?.file?.path
+          if (file) open.add(file)
+        })
+        return [...open]
+      },
+    })
   }
 
   get isSyncing(): boolean { return this.coordinator.isSyncing }
