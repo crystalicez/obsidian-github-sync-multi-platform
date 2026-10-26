@@ -7,8 +7,8 @@ import { decodeV4RemoteConfig } from "./remote-index"
  * platform/runtime reads, NEVER from user-editable flags.
  *
  * This function cannot start migration, write to a vault, or change Git refs.
- * Owner has approved topology A; the migration writer, verified backup,
- * second-device cutover and crash recovery are still incomplete, so this
+ * Owner approved an independent orphan-branch fork; the migration writer,
+ * verified backup and crash recovery are still incomplete, so this
  * preview deliberately remains blocked rather than authorizing publication.
  */
 export type V4ReencryptionBlocker =
@@ -20,7 +20,6 @@ export type V4ReencryptionBlocker =
   | "pending-recovery"
   | "conflicts-unresolved"
   | "local-edits-unresolved"
-  | "other-devices-not-coordinated"
   | "git-history-risk-not-acknowledged"
   | "source-head-changed"
   | "source-head-unverified"
@@ -36,7 +35,6 @@ export interface V4ReencryptionEvidence {
   readonly recoveryClear: boolean
   readonly conflictsResolved: boolean
   readonly localChangesResolved: boolean
-  readonly otherDevicesPaused: boolean
   readonly oldHistoryRiskAcknowledged: boolean
 }
 
@@ -70,7 +68,6 @@ const PROOF_TO_BLOCKER = {
   recoveryClear: "pending-recovery",
   conflictsResolved: "conflicts-unresolved",
   localChangesResolved: "local-edits-unresolved",
-  otherDevicesPaused: "other-devices-not-coordinated",
   oldHistoryRiskAcknowledged: "git-history-risk-not-acknowledged",
 } as const satisfies { [K in keyof V4ReencryptionEvidence]: V4ReencryptionBlocker }
 

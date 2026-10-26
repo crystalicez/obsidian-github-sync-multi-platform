@@ -2,13 +2,20 @@ import { assertSafeGitHubBranch, assertSafeGitHubRepositoryCoordinates } from ".
 
 /**
  * Explicit owner answers on 2026-10-26. These are policy choices, NOT
- * evidence that offline old clients have stopped, data is independently
- * backed up, or that the platform can prevent edits from other plugins.
+ * evidence of a completed backup/restore or control over other clients.
+ * Independent old-branch Sync remains allowed by explicit owner decision.
  *
  * Do not release a Wizard or invoke GitHub mutations from this module.
  */
 export const V4_OWNER_REENCRYPTION_DECISIONS = Object.freeze({
-  oldBranchSync: "pause-all-old-branch-devices",
+  // D90 FINAL: branch FORK rather than fleet-wide cutover. Old branch stays writable.
+  migrationTopology: "independent-orphan-branch-fork",
+  oldBranchSync: "continue-independently-no-migration-block",
+  otherDeviceCutover: "optional-manual-switch-branch-and-encryption",
+  initiatorCutover: "switch-only-after-verified-new-branch-and-recovery",
+  requireAllDevicesOnlineForMigration: false,
+  oldBranchSyncBlockedByMigration: false,
+  migrationSpecificPreSyncGuardRequired: false,
   vaultEditing: "pause-during-migration",
   backup: "separate-branch-in-original-github-repository",
   backupArchivePassword: "not-applicable",

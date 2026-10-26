@@ -573,6 +573,9 @@ test("GitHubClient refuses missing or malformed ref fields instead of fabricatin
     { ref: valid.ref, object: { type: "commit" } },
     { ref: valid.ref },
     { ref: "", object: valid.object },
+    // A 200 OK from another branch or a non-commit object is not our HEAD.
+    { ref: "refs/heads/other", object: valid.object },
+    { ref: valid.ref, object: { sha: "a".repeat(40), type: "tag" } },
     null,
   ]
   try {

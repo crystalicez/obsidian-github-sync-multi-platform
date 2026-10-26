@@ -370,9 +370,9 @@ export class GitHubClient {
     const json = response.json as { ref?: string; object?: { sha?: string; type?: string } };
     // Do not fabricate ref/type fields missing from an untrusted GitHub reply.
     if (!json || typeof json !== "object" || Array.isArray(json)
-      || typeof json.ref !== "string" || !json.ref.startsWith("refs/heads/")
+      || json.ref !== `refs/heads/${this.config.branch}`
       || typeof json.object?.sha !== "string" || json.object.sha.length === 0
-      || typeof json.object.type !== "string" || json.object.type.length === 0) {
+      || json.object.type !== "commit") {
       throw new Error("Invalid GitHub ref response: missing explicit ref, commit SHA or object type.");
     }
     return { ref: json.ref, sha: json.object.sha, type: json.object.type };

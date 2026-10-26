@@ -23,7 +23,6 @@ const base = {
     recoveryClear: true,
     conflictsResolved: true,
     localChangesResolved: true,
-    otherDevicesPaused: true,
     oldHistoryRiskAcknowledged: true,
   },
 };
@@ -49,7 +48,6 @@ test("D67 preflight blocks every unverified safety prerequisite independently", 
     recoveryClear: "pending-recovery",
     conflictsResolved: "conflicts-unresolved",
     localChangesResolved: "local-edits-unresolved",
-    otherDevicesPaused: "other-devices-not-coordinated",
     oldHistoryRiskAcknowledged: "git-history-risk-not-acknowledged",
   } as const;
   for (const [key, blocker] of Object.entries(expected)) {
@@ -62,6 +60,14 @@ test("D67 preflight blocks every unverified safety prerequisite independently", 
   const missing = assessV4ReencryptionReadiness({ ...base, evidence: undefined });
   assert.ok(missing.blockers.includes("backup-unverified"));
   assert.ok(missing.blockers.includes("sync-in-progress"));
+});
+
+test("D90 an independent branch fork requires neither other-device acknowledgement nor migration-specific Sync guard", () => {
+  const preview = assessV4ReencryptionReadiness({
+    ...base,
+    evidence: { ...base.evidence, otherDevicesPaused: false, migrationPreSyncCheckReady: false },
+  });
+  assert.deepEqual(preview.blockers, ["migration-implementation-incomplete"]);
 });
 
 test("D67 source head races fail closed and no unpinned source commit is accepted", () => {

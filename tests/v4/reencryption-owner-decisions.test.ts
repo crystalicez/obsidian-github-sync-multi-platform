@@ -18,9 +18,15 @@ const options = {
   defaultBranch: "main",
 }
 
-test("D87 records all six owner answers verbatim without treating in-repo copy as independent", () => {
+test("D90 adopts independent branch fork while retaining verified same-repo backup policy", () => {
   const policy = V4_OWNER_REENCRYPTION_DECISIONS
-  assert.equal(policy.oldBranchSync, "pause-all-old-branch-devices")
+  assert.equal(policy.migrationTopology, "independent-orphan-branch-fork")
+  assert.equal(policy.oldBranchSync, "continue-independently-no-migration-block")
+  assert.equal(policy.otherDeviceCutover, "optional-manual-switch-branch-and-encryption")
+  assert.equal(policy.initiatorCutover, "switch-only-after-verified-new-branch-and-recovery")
+  assert.equal(policy.requireAllDevicesOnlineForMigration, false)
+  assert.equal(policy.oldBranchSyncBlockedByMigration, false)
+  assert.equal(policy.migrationSpecificPreSyncGuardRequired, false)
   assert.equal(policy.vaultEditing, "pause-during-migration")
   assert.equal(policy.backup, "separate-branch-in-original-github-repository")
   assert.equal(policy.backupArchivePassword, "not-applicable")

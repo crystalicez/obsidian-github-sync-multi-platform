@@ -1,5 +1,7 @@
 # D87 — Owner decisions for first Re-encryption Wizard (2026-10-26)
 
+> **HISTORICAL, SUPERSEDED:** D90 (2026-10-26) explicitly replaced the fleet-wide old-device freeze/acknowledgement from D87 with an independent encrypted orphan-branch fork. The old branch remains independently writable; other clients may follow manually or stay on the old branch. D88 also approved verified same-repository backup as sufficient location. Follow [D90 final policy](d90-owner-independent-reencryption-fork-policy-2026-10-26.md) and the latest `HANDOFF-NEXT-SESSION.md`, not the superseded D87 choices below.
+
 This records the **explicit responses** to the six proposed questions; newer decisions here supersede statements in D74–D86 handoffs that listed these choices as unresolved. Work based on clean/pushed D86 `32aeddfee5a167637889e3b6c8dedf832bfc2e0c` in isolated audit worktree `.worktrees/d87-owner-rekey-policy`.
 
 ## Accepted choices
