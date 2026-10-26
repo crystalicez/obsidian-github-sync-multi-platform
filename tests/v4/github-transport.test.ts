@@ -565,6 +565,34 @@ test("immutable commit and content reads omit timestamp cache-busting while ref 
   }
 })
 
+test("GitHubClient refuses missing or malformed ref fields instead of fabricating a branch/type", async () => {
+  const valid = { ref: "refs/heads/main", object: { sha: "a".repeat(40), type: "commit" } }
+  const bodies: unknown[] = [
+    { object: valid.object },
+    { ref: valid.ref, object: { sha: "a".repeat(40) } },
+    { ref: valid.ref, object: { type: "commit" } },
+    { ref: valid.ref },
+    { ref: "", object: valid.object },
+    null,
+  ]
+  try {
+    const client = new GitHubClient(
+      { token: "token", owner: "owner", repo: "repo", branch: "main" },
+      { transportPolicy: { mutationSpacingMs: 0 } },
+    )
+    for (const json of bodies) {
+      setRequestUrlHandler(async () => ({ status: 200, text: "", headers: {}, json }))
+      await assert.rejects(client.getGitRef(), /GitHub.*ref|invalid.*ref/i)
+    }
+    setRequestUrlHandler(async () => ({ status: 200, text: "", headers: {}, json: valid }))
+    assert.deepEqual(await client.getGitRef(), {
+      ref: valid.ref, sha: valid.object.sha, type: valid.object.type,
+    })
+  } finally {
+    setRequestUrlHandler(null)
+  }
+})
+
 test("GitHubClient holds the transport reservation across mutation serialization and request", async () => {
   let active = false
   let reserved = 0

@@ -368,7 +368,14 @@ export class GitHubClient {
     });
     if (response.status !== 200) throw this.gitHttpError("Failed to get git ref", response.status, response.text);
     const json = response.json as { ref?: string; object?: { sha?: string; type?: string } };
-    return { ref: json.ref ?? `refs/heads/${this.config.branch}`, sha: json.object?.sha ?? "", type: json.object?.type ?? "commit" };
+    // Do not fabricate ref/type fields missing from an untrusted GitHub reply.
+    if (!json || typeof json !== "object" || Array.isArray(json)
+      || typeof json.ref !== "string" || !json.ref.startsWith("refs/heads/")
+      || typeof json.object?.sha !== "string" || json.object.sha.length === 0
+      || typeof json.object.type !== "string" || json.object.type.length === 0) {
+      throw new Error("Invalid GitHub ref response: missing explicit ref, commit SHA or object type.");
+    }
+    return { ref: json.ref, sha: json.object.sha, type: json.object.type };
   }
 
   async getGitRefOrNull(): Promise<GitHubGitRef | null> {
