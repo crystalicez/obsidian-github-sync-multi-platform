@@ -1,5 +1,7 @@
 # D90 — FINAL owner decision: Re-encryption is an independent branch fork (2026-10-26)
 
+> **D91 UX follow-up (owner approved):** Re-encryption MUST produce/retain the **three branch roles** source + pinned frozen backup + newly encrypted orphan destination in the same physical GitHub repository. The owner explicitly accepted the 5-step separate Wizard and its safety/metrics/finish flow. See [D91 approved Wizard UX](d91-owner-approved-reencryption-wizard-ux-2026-10-26.md). This supplements, and does not weaken, D90 independence of old-branch clients.
+
 **Authority:** The owner explicitly approved this model after discussing and rejecting the previous multi-device migration/freeze/check approach. This **supersedes the old-device pause/ack requirement in D87 and the proposed migration-specific Pre-Sync blocking from the interrupted D90 experiment**. It does NOT reverse the approved same-repo backup location B, Node.js-only restriction, old-branch retention, migration safety/recovery release gate, or the policy of no GitHub Actions.
 
 ## Product behavior
