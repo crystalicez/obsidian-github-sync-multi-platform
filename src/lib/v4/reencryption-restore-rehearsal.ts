@@ -78,6 +78,9 @@ export async function verifyV4ReencryptionBackupRestoreRehearsal(
   // Authenticate entire source snapshot and every backed-up plaintext byte
   // before a single scratch stage is created.
   const backupProof = await verifyV4ReencryptionBackupReadback(input)
+  // The frozen snapshot is immutable. Old source HEAD advancement is normal
+  // in the owner-approved D90 fork mode; do NOT block other devices' Sync.
+  const stableSourceHeadRequired = input.sourceRefPolicy !== "pinned-immutable-commit"
   throwIfV4Aborted(input.signal)
   await input.assertScratchIsIsolated()
   const expected = Object.values(input.shards).flatMap(shard =>
@@ -98,7 +101,8 @@ export async function verifyV4ReencryptionBackupRestoreRehearsal(
     let stageError: unknown
     try {
       if (await input.backup.readCurrentSnapshotId() !== input.backup.snapshotId
-        || await input.readCurrentSourceHeadSha() !== input.pinnedSourceCommitSha) {
+        || (stableSourceHeadRequired
+          && await input.readCurrentSourceHeadSha() !== input.pinnedSourceCommitSha)) {
         throw new Error("Backup rehearsal source or snapshot changed before staging.")
       }
       const source = await input.backup.openFile(record.path, record.size)
@@ -147,7 +151,8 @@ export async function verifyV4ReencryptionBackupRestoreRehearsal(
   throwIfV4Aborted(input.signal)
   await input.assertScratchIsIsolated()
   if (await input.backup.readCurrentSnapshotId() !== input.backup.snapshotId
-    || await input.readCurrentSourceHeadSha() !== input.pinnedSourceCommitSha
+    || (stableSourceHeadRequired
+      && await input.readCurrentSourceHeadSha() !== input.pinnedSourceCommitSha)
     || count !== backupProof.matchedLiveFileCount
     || total.toString() !== backupProof.verifiedPlaintextBytes) {
     throw new Error("Backup rehearsal complete-vault readback or source pin changed.")

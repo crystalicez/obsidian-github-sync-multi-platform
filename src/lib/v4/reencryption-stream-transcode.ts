@@ -18,7 +18,8 @@ import { V4StorageCodec } from "./storage-codec"
  *
  * This module does NOT write GitHub refs, mutate an Obsidian vault, rotate
  * settings, or permit per-device cutover. An independently authenticated whole
- * source inventory, backup and source quiescence remain separate mandatory gates.
+ * source inventory, frozen backup proof and local-initiator edit isolation remain
+ * separate mandatory gates; D90 permits other old-branch devices to Sync.
  */
 export interface V4ReencryptionTranscodeInput {
   readonly plan: V4OrphanReencryptionPlan

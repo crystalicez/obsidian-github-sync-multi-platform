@@ -154,7 +154,8 @@ export async function assertV4ReencryptionVaultParity(
   }
   // This is a non-authorizing METADATA parity report. Tombstones/history
   // remain in the old branch, and second-device complete-content proof,
-  // backup integrity, WAL and stale-client fencing are required separately.
+  // Backup integrity, durable WAL and safe initiating-device cutover are
+  // separate gates. D90 does NOT fence old-branch clients.
   return Object.freeze({
     integrityScope: "metadata-parity-only",
     destinationContentVerified: false,

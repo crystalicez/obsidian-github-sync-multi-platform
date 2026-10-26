@@ -119,7 +119,7 @@ test("D74 rejects parent ancestry, source commit/tree reuse, key/KDF/salt reuse 
   }
 });
 
-test("D74 requires two absent destination ref observations and a stable pinned source", () => {
+test("D96 requires pinned initial source snapshot and two absent destination refs without fencing later old-branch commits", () => {
   const plan = planV4OrphanReencryptionDestination(topology);
   const proof = assertV4OrphanDestinationRefObservations({
     plan,
@@ -138,9 +138,21 @@ test("D74 requires two absent destination ref observations and a stable pinned s
   });
   assert.ok(Object.isFrozen(proof));
   assert.ok(!("safeToPublish" in proof));
+  const laterOldBranchCommit = assertV4OrphanDestinationRefObservations({
+    plan,
+    observedSourceCommitShaBefore: SOURCE_SHA,
+    observedSourceCommitShaAfter: "e".repeat(40),
+    destinationFirstObservation: null,
+    destinationSecondObservation: null,
+    observedPhysicalRepositoryIdBefore: 1234,
+    observedPhysicalRepositoryIdAfter: 1234,
+  })
+  assert.deepEqual(laterOldBranchCommit, proof);
+  // Observation proof is NOT permission to publish: create-ref collision
+  // checks and actual durable migration prerequisites remain mandatory.
 });
 
-test("D74 refuses a present/ambiguous destination, source movement and switched repository", () => {
+test("D96 refuses destination occupancy, unpinned initial source, malformed later source and physical repo switch", () => {
   const plan = planV4OrphanReencryptionDestination(topology);
   const stable = {
     plan,
@@ -156,7 +168,6 @@ test("D74 refuses a present/ambiguous destination, source movement and switched 
     { destinationSecondObservation: DEST_SHA },
     { destinationSecondObservation: undefined },
     { observedSourceCommitShaBefore: "e".repeat(40) },
-    { observedSourceCommitShaAfter: "e".repeat(40) },
     { observedSourceCommitShaAfter: null },
     { observedPhysicalRepositoryIdAfter: 4321 },
     { observedPhysicalRepositoryIdBefore: 0 },

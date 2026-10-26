@@ -34,6 +34,9 @@ export interface V4BackupSnapshotReader {
 export interface V4ReencryptionBackupReadbackInput extends V4ReencryptionInventoryInput {
   readonly backup: V4BackupSnapshotReader
   readonly readCurrentSourceHeadSha: () => Promise<string | null>
+  /** D90: a backed-up immutable source snapshot is not invalidated by other devices
+   * advancing the old branch HEAD. Explicitly opt in after snapshot pin validation. */
+  readonly sourceRefPolicy?: "require-stable-head" | "pinned-immutable-commit" | undefined
   readonly signal?: AbortSignal | undefined
 }
 
@@ -84,6 +87,12 @@ export async function verifyV4ReencryptionBackupReadback(
   input: V4ReencryptionBackupReadbackInput,
 ): Promise<V4ReencryptionBackupReadbackReport> {
   throwIfV4Aborted(input.signal)
+  if (input.sourceRefPolicy !== undefined
+    && input.sourceRefPolicy !== "require-stable-head"
+    && input.sourceRefPolicy !== "pinned-immutable-commit") {
+    throw new Error("Invalid frozen backup source ref policy.")
+  }
+  const stableSourceHeadRequired = input.sourceRefPolicy !== "pinned-immutable-commit"
   if (!input.backup || !SNAPSHOT_SHA.test(input.backup.snapshotId)
     || !COMMIT_SHA.test(input.pinnedSourceCommitSha)
     || input.backup.sourceCommitSha !== input.pinnedSourceCommitSha) {
@@ -106,7 +115,9 @@ export async function verifyV4ReencryptionBackupReadback(
   if (originalFiles.size !== source.fileCount || originalFiles.size > MAX_BACKUP_MANIFEST_FILES) {
     throw new Error("Re-encryption backup source inventory exceeds the bounded full-readback limit.")
   }
-  assertStableHead(await input.readCurrentSourceHeadSha(), input.pinnedSourceCommitSha)
+  if (stableSourceHeadRequired) {
+    assertStableHead(await input.readCurrentSourceHeadSha(), input.pinnedSourceCommitSha)
+  }
   throwIfV4Aborted(input.signal)
   assertStableSnapshot(await input.backup.readCurrentSnapshotId(), input.backup.snapshotId)
   throwIfV4Aborted(input.signal)
@@ -165,7 +176,9 @@ export async function verifyV4ReencryptionBackupReadback(
   throwIfV4Aborted(input.signal)
   assertStableSnapshot(await input.backup.readCurrentSnapshotId(), input.backup.snapshotId)
   throwIfV4Aborted(input.signal)
-  assertStableHead(await input.readCurrentSourceHeadSha(), input.pinnedSourceCommitSha)
+  if (stableSourceHeadRequired) {
+    assertStableHead(await input.readCurrentSourceHeadSha(), input.pinnedSourceCommitSha)
+  }
   if (count !== source.fileCount || bytesReadTotal.toString() !== source.totalLogicalBytes) {
     throw new Error("Re-encryption backup entire-vault plaintext totals do not match.")
   }

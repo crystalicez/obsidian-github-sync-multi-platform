@@ -279,6 +279,49 @@ test("D85 round-trip restores all backup files into isolated scratch and cleans 
   assert.equal(JSON.stringify(report).includes("秘密"), false)
 })
 
+test("D96 frozen backup full readback and scratch restore allow independent later source HEAD commits", async () => {
+  const f = await fixture()
+  f.changeHead("e".repeat(40))
+  const backupProof = await verifyV4ReencryptionBackupReadback({
+    ...f.input, sourceRefPolicy: "pinned-immutable-commit",
+  })
+  assert.equal(backupProof.backupContentsMatchSource, true)
+  assert.equal(f.headChecks, 0, "moving old-branch HEAD is not the immutable backup snapshot")
+
+  const scratch = new D85Scratch()
+  const restored = await verifyV4ReencryptionBackupRestoreRehearsal({
+    ...f.input, sourceRefPolicy: "pinned-immutable-commit",
+    scratch: scratch.store(), async assertScratchIsIsolated() {},
+  })
+  assert.equal(restored.roundTripFileCount, 3)
+  assert.equal(restored.scratchReadbackMatched, true)
+  assert.equal(restored.installedObsidianRestoreVerified, false)
+  assert.equal(f.headChecks, 0)
+  assert.equal(scratch.files.size, 0)
+})
+
+test("D96 immutable-backup option never tolerates changed snapshot identity, wrong contents or invalid ref policy", async () => {
+  const f = await fixture()
+  f.changeHead("e".repeat(40))
+  f.changeSnapshot("c".repeat(64))
+  await assert.rejects(() => verifyV4ReencryptionBackupReadback({
+    ...f.input, sourceRefPolicy: "pinned-immutable-commit",
+  }), /snapshot|changed/i)
+
+  const corrupt = await fixture()
+  corrupt.backupFiles.set("Notes/秘密 🌸.md", utf8ToBytes("damaged"))
+  await assert.rejects(() => verifyV4ReencryptionBackupReadback({
+    ...corrupt.input, sourceRefPolicy: "pinned-immutable-commit",
+  }), /backup|hash|mismatch|SHA/i)
+
+  const invalid = await fixture()
+  await assert.rejects(() => verifyV4ReencryptionBackupReadback({
+    ...invalid.input,
+    sourceRefPolicy: "not-a-real-policy" as unknown as "pinned-immutable-commit",
+  }), /source ref policy/i)
+  assert.equal(invalid.reads, 0)
+})
+
 test("D85 rejects corrupt backup before opening any scratch stage", async () => {
   const f = await fixture()
   const scratch = new D85Scratch()

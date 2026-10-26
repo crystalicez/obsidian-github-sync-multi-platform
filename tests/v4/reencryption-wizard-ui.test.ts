@@ -69,6 +69,43 @@ test("D92 Wizard preflight refuses unencrypted and busy source without network I
   }
 })
 
+test("D96 Wizard rejects in-place and replacement connection edits after dialog opens", async () => {
+  const plugin = fakePlugin()
+  const wizard = new V4ReencryptionWizardModal(plugin)
+  wizard.onOpen()
+  const internal = wizard as unknown as {
+    matchesConnection(): boolean
+    verifySource(): Promise<void>
+  }
+  assert.equal(internal.matchesConnection(), true)
+
+  const originalToken = plugin.settings.githubToken
+  plugin.settings.githubToken = "secret-rotated-in-place"
+  assert.equal(internal.matchesConnection(), false)
+  let apiCalls = 0
+  setRequestUrlHandler(async () => {
+    apiCalls++
+    throw new Error("Wizard must not run a verified source read with changed settings.")
+  })
+  try {
+    await internal.verifySource()
+    assert.equal(apiCalls, 0)
+    const text = (wizard.contentEl as unknown as { flattenText(): string }).flattenText()
+    assert.match(text, /configured encrypted GitHub connection/i)
+    assert.ok(!text.includes("secret-rotated-in-place"))
+    plugin.settings.githubToken = originalToken
+    assert.equal(internal.matchesConnection(), true)
+    const original = plugin.settings
+    plugin.settings = { ...original, githubBranch: "another" }
+    assert.equal(internal.matchesConnection(), false)
+    plugin.settings = original
+    assert.equal(internal.matchesConnection(), true)
+  } finally {
+    setRequestUrlHandler(null)
+    wizard.onClose()
+  }
+})
+
 test("D92 Wizard has no direct GitHub mutation or local settings-save capability", () => {
   const wizard = new V4ReencryptionWizardModal(fakePlugin())
   wizard.onOpen()

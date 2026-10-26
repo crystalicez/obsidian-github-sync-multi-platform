@@ -30,8 +30,9 @@ export interface V4OrphanReencryptionPlan {
 }
 
 /**
- * Two independent EXACT target-ref absence probes and stable source/physical
- * repository observations. These must be provided by trusted GitHub API reads.
+ * Two independent EXACT target-ref absence probes and validated original
+ * snapshot/physical repository observations. Source HEAD may independently
+ * advance AFTER the pinned snapshot was selected, per owner-approved D90.
  * A probe result is not an atomic CAS or permission to publish; GitHub's ref
  * creation must still fail on collision and unknown outcomes need reconciliation.
  */
@@ -60,10 +61,13 @@ export function assertV4OrphanDestinationRefObservations(
     throw new Error("Re-encryption destination is not an approved orphan-branch plan.")
   }
   assertCommitSha(input.plan.pinnedSourceCommitSha, "pinned source commit SHA")
-  if (input.observedSourceCommitShaBefore !== input.plan.pinnedSourceCommitSha
-    || input.observedSourceCommitShaAfter !== input.plan.pinnedSourceCommitSha) {
-    throw new Error("Re-encryption source branch HEAD changed or cannot be verified.")
+  // The initial authenticated source observation establishes the immutable
+  // snapshot boundary. A later valid commit on the old branch is expected
+  // under D90: NEVER globally fence or invalidate other devices' Sync.
+  if (input.observedSourceCommitShaBefore !== input.plan.pinnedSourceCommitSha) {
+    throw new Error("Re-encryption source snapshot initial Git ref does not match the pinned commit.")
   }
+  assertCommitSha(input.observedSourceCommitShaAfter, "later live source ref SHA")
   if (input.destinationFirstObservation !== null || input.destinationSecondObservation !== null) {
     throw new Error("Re-encryption destination branch is present or its absence is ambiguous.")
   }

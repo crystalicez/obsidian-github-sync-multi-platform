@@ -60,7 +60,8 @@ export class V4ReencryptionWizardModal extends Modal {
 
   constructor(private readonly plugin: FastSync) {
     super(plugin.app)
-    this.initialSettings = plugin.settings
+    // Copy the connection at open time; Obsidian Settings may be mutated in place.
+    this.initialSettings = Object.freeze({ ...plugin.settings })
     const provisional = suggestV4ReencryptionBranchNames(
       new Date(), "0".repeat(40),
     )
@@ -87,12 +88,18 @@ export class V4ReencryptionWizardModal extends Modal {
   }
 
   private matchesConnection(): boolean {
-    return this.initialSettings === this.plugin.settings
-      && this.plugin.settings.githubOwner.length > 0
-      && this.plugin.settings.githubRepo.length > 0
-      && this.plugin.settings.githubToken.length > 0
-      && this.plugin.settings.encryptionMode === "encrypted"
-      && this.plugin.settings.encryptionPassphrase.length > 0
+    const current = this.plugin.settings
+    const snapshot = this.initialSettings
+    return current.githubOwner === snapshot.githubOwner
+      && current.githubRepo === snapshot.githubRepo
+      && current.githubBranch === snapshot.githubBranch
+      && current.githubToken === snapshot.githubToken
+      && current.encryptionMode === snapshot.encryptionMode
+      && current.encryptionPassphrase === snapshot.encryptionPassphrase
+      && snapshot.githubOwner.length > 0 && snapshot.githubRepo.length > 0
+      && snapshot.githubBranch.length > 0 && snapshot.githubToken.length > 0
+      && snapshot.encryptionMode === "encrypted"
+      && snapshot.encryptionPassphrase.length > 0
   }
 
   private sourceRepoId(): string {
