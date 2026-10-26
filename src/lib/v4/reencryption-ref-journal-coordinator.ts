@@ -413,6 +413,7 @@ export async function publishV4JournaledThreeBranchDestination(
   const result = await publishV4ThreeBranchDestinationAfterBackup({
     github: input.github, plan, backupPlan, createdAndVerifiedBackup,
     scratchRestore: input.scratchRestore, backupRefReader: input.backupRefReader,
+    initiatorLocalParity: input.initiatorLocalParity,
     prepared: input.prepared, sourceTreeSha: input.sourceTreeSha,
     sourceConfig: input.sourceConfig, expectedDestinationConfig: input.expectedDestinationConfig,
     expectedRecords: input.expectedRecords, expectedReceipts: input.expectedReceipts,

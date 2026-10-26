@@ -1,5 +1,9 @@
 import type { GitHubClient } from "../github-api"
 import { throwIfV4Aborted } from "./cancellation"
+import {
+  verifyV4ReencryptionInitiatorLocalParity,
+  type V4ReencryptionInitiatorParityInput,
+} from "./reencryption-initiator-parity"
 import type { V4SameRepoReencryptionBackupBranchProposal } from "./reencryption-owner-decisions"
 import type { V4CreatedAndVerifiedBackupReport } from "./reencryption-backup-create-verified"
 import type { V4ReencryptionRestoreRehearsalReport } from "./reencryption-restore-rehearsal"
@@ -13,6 +17,8 @@ const SHA = /^[a-f0-9]{40}$/u
 
 export interface V4ThreeBranchPublicationInput extends V4ReencryptionVerifiedOrphanPublishInput {
   readonly backupPlan: V4SameRepoReencryptionBackupBranchProposal
+  /** D105: per-mutation full plaintext SHA-256 parity of initiating live Vault. */
+  readonly initiatorLocalParity: V4ReencryptionInitiatorParityInput
   /** Read-only actual frozen Backup ref observer; never the live Source ref. */
   readonly backupRefReader: Pick<GitHubClient, "branchName" | "getRepositoryIdentity" | "getRepositoryDefaultBranch" | "getGitRefOrNull" | "getGitCommit">
   readonly createdAndVerifiedBackup: V4CreatedAndVerifiedBackupReport
@@ -86,7 +92,12 @@ export async function publishV4ThreeBranchDestinationAfterBackup(
     || proof.verifiedFileCount !== scratch.roundTripFileCount
     || proof.verifiedFileCount !== p.verifiedFileCount
     || !/^(?:0|[1-9][0-9]*)$/u.test(proof.verifiedPlaintextBytes)
-    || scratch.roundTripPlaintextBytes !== proof.verifiedPlaintextBytes) {
+    || scratch.roundTripPlaintextBytes !== proof.verifiedPlaintextBytes
+    || !input.initiatorLocalParity
+    || input.initiatorLocalParity.pinnedSourceCommitSha !== plan.pinnedSourceCommitSha
+    || input.initiatorLocalParity.verifiedSource.pinnedSourceCommitSha !== plan.pinnedSourceCommitSha
+    || input.initiatorLocalParity.verifiedSource.verifiedFileCount !== proof.verifiedFileCount
+    || input.initiatorLocalParity.verifiedSource.totalVerifiedPlaintextBytes !== proof.verifiedPlaintextBytes) {
     throw new Error("Re-encryption three-branch publication evidence does not match the pinned backup, source, scratch restore and orphan.")
   }
 
@@ -131,6 +142,15 @@ export async function publishV4ThreeBranchDestinationAfterBackup(
     await input.assertExclusiveMigrationLease()
     throwIfV4Aborted(input.signal)
     await input.assertInitiatingVaultUnchanged()
+    throwIfV4Aborted(input.signal)
+    const parity = await verifyV4ReencryptionInitiatorLocalParity({
+      ...input.initiatorLocalParity, signal: input.signal,
+    })
+    if (parity.initiatorLocalCutoverAuthorized !== false
+      || parity.checkedFileCount !== proof.verifiedFileCount
+      || parity.checkedPlaintextBytes !== proof.verifiedPlaintextBytes) {
+      throw new Error("Re-encryption initiating-device full local content parity failed.")
+    }
     throwIfV4Aborted(input.signal)
     // Fails closed on Windows Node-only WAL where directory fsync gives EPERM.
     await input.assertCrashDurable()

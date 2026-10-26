@@ -557,6 +557,35 @@ function D100input(f: Awaited<ReturnType<typeof fixture>>, prepared: Awaited<Ret
   return {
     ...recoveryInput(f, prepared),
     backupPlan: D100backupPlan,
+    initiatorLocalParity: {
+      pinnedSourceCommitSha: sourceSha,
+      verifiedSource: {
+        integrityScope: "all-live-objects" as const,
+        pinnedSourceCommitSha: sourceSha,
+        verifiedFileCount: f.input.staged.records.length,
+        verifiedRemoteObjectCount: f.input.staged.receipts.length,
+        totalVerifiedPlaintextBytes: total,
+      },
+      sourceRecords: f.input.staged.records,
+      reader: {
+        async listFiles() {
+          return f.input.staged.records.map(record => ({
+            path: record.path, size: record.size, mtime: 123,
+          }))
+        },
+        async openFile(_path: string) {
+          const bytes = utf8ToBytes("Vault has real encrypted content")
+          return {
+            size: bytes.byteLength,
+            async *chunks(_n: number) { yield bytes },
+          }
+        },
+        async listOpenEditorPaths() { return [] as string[] },
+        async assertIdleAndNoPendingEdits() {},
+        async assertSourceConfigurationUnchanged() {},
+        async assertExclusiveInitiatorLease() {},
+      },
+    },
     backupRefReader: {
       branchName: "backup/frozen",
       async getRepositoryIdentity() { return { id: 22, fullName: "owner/repo" } },
@@ -675,6 +704,49 @@ test("D100 refuses unproven Windows WAL durability or concurrent local edits wit
   await assert.rejects(() => publishV4ThreeBranchDestinationAfterBackup({
     ...input, assertInitiatingVaultUnchanged: async () => { throw new Error("Local edit detected") },
   }), /Local edit detected/)
+  assert.equal(f.calls.filter(x => x === "ref-create").length, 0)
+})
+
+test("D105 D100 publication fails BEFORE create-only Git ref mutation for same-size unsynced local bytes", async () => {
+  const f = await fixture()
+  const prepared = await prepareV4ReencryptionOrphanCommit(f.input)
+  const input = D100input(f, prepared)
+  const reader = {
+    ...input.initiatorLocalParity.reader,
+    async openFile(_path: string) {
+      const bytes = utf8ToBytes("X".repeat(utf8ToBytes("Vault has real encrypted content").length))
+      return {
+        size: bytes.length,
+        async *chunks() { yield bytes },
+      }
+    },
+  }
+  await assert.rejects(() => publishV4ThreeBranchDestinationAfterBackup({
+    ...input,
+    initiatorLocalParity: { ...input.initiatorLocalParity, reader },
+  }), /SHA-256/i)
+  assert.equal(f.calls.filter(x => x === "ref-create").length, 0)
+})
+
+test("D105 D100 publication rechecks local vault after durable intent before destination ref creation", async () => {
+  const f = await fixture()
+  const prepared = await prepareV4ReencryptionOrphanCommit(f.input)
+  const input = D100input(f, prepared)
+  let extraFileAppeared = false
+  const reader = {
+    ...input.initiatorLocalParity.reader,
+    async listFiles() {
+      const files = await input.initiatorLocalParity.reader.listFiles()
+      return extraFileAppeared
+        ? [...files, { path: "unsynced.md", size: 7, mtime: 123 }]
+        : files
+    },
+  }
+  await assert.rejects(() => publishV4ThreeBranchDestinationAfterBackup({
+    ...input,
+    initiatorLocalParity: { ...input.initiatorLocalParity, reader },
+    assertDurablePublicationIntent: async () => { extraFileAppeared = true },
+  }), /unexpected|missing/i)
   assert.equal(f.calls.filter(x => x === "ref-create").length, 0)
 })
 
