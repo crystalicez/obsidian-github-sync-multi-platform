@@ -5,6 +5,10 @@ import { sha256Hex, toBase64Url, utf8ToBytes } from "../../src/lib/bytes"
 import { createV4WholeBufferContentSource, type V4ContentSource } from "../../src/lib/v4/content-source"
 import { deriveV4Keyring } from "../../src/lib/v4/crypto"
 import { verifyV4ReencryptionBackupReadback } from "../../src/lib/v4/reencryption-backup-readback"
+import { verifyV4ReencryptionBackupRestoreRehearsal } from "../../src/lib/v4/reencryption-restore-rehearsal"
+import { createV4StagingStore, type V4StagingBackend } from "../../src/lib/v4/staging-store"
+import { mkdtemp, mkdir, writeFile, appendFile, readFile, rm } from "node:fs/promises"
+import { join } from "node:path"
 import { type V4IndexFileRecord } from "../../src/lib/v4/local-index"
 import { V4StorageCodec } from "../../src/lib/v4/storage-codec"
 import { type V4RemoteShard } from "../../src/lib/v4/remote-index"
@@ -220,6 +224,141 @@ test("D84 aborts a partially streamed read without ever returning a verified bac
   await assert.rejects(() => verifyV4ReencryptionBackupReadback({
     ...f.input, signal: controller.signal,
   }), /read stopped mid file|cancel|abort/i)
+})
+
+class D85Scratch {
+  readonly files = new Map<string, Uint8Array>()
+  corrupt = false
+  fail = false
+  onWrite?: () => void
+  private n = 0
+  readonly backend: V4StagingBackend = {
+    boundedAppend: true,
+    write: async (p, b) => {
+      if (this.fail) throw new Error("scratch disk full")
+      this.files.set(p, b.slice()); this.onWrite?.()
+    },
+    append: async (p, b) => {
+      const prev = this.files.get(p) ?? new Uint8Array()
+      const next = new Uint8Array(prev.length + b.length)
+      next.set(prev); next.set(b, prev.length); this.files.set(p, next)
+    },
+    remove: async p => { this.files.delete(p) },
+    openSource: async (p, size) => {
+      const b = this.files.get(p)!.slice()
+      assert.equal(b.length, size)
+      if (this.corrupt && b.length) b[0] ^= 1
+      return createV4WholeBufferContentSource(b)
+    },
+    freeBytes: async () => 100 * 1024 * 1024,
+  }
+  store() {
+    return createV4StagingStore({
+      root: "d85/scratch", backend: this.backend, wholeBufferCeilingBytes: 1024 * 1024,
+      randomId: () => "stage-" + (++this.n),
+    })
+  }
+}
+
+test("D85 round-trip restores all backup files into isolated scratch and cleans them", async () => {
+  const f = await fixture(true)
+  const scratch = new D85Scratch()
+  const report = await verifyV4ReencryptionBackupRestoreRehearsal({
+    ...f.input, scratch: scratch.store(), async assertScratchIsIsolated() {},
+  })
+  assert.deepEqual(report, {
+    integrityScope: "isolated-scratch-restore-roundtrip-only",
+    pinnedSourceCommitSha: sourceCommitSha, roundTripFileCount: 4,
+    roundTripPlaintextBytes: String(8 * 1024 * 1024 + 17 + 12 + 4),
+    scratchReadbackMatched: true, independentStorageVerified: false,
+    installedObsidianRestoreVerified: false,
+    permissionToPublish: false, cutoverAuthorized: false,
+  })
+  assert.ok(Object.isFrozen(report))
+  assert.equal(scratch.files.size, 0)
+  assert.equal(JSON.stringify(report).includes("秘密"), false)
+})
+
+test("D85 rejects corrupt backup before opening any scratch stage", async () => {
+  const f = await fixture()
+  const scratch = new D85Scratch()
+  f.backupFiles.set("Notes/秘密 🌸.md", utf8ToBytes("damaged"))
+  await assert.rejects(() => verifyV4ReencryptionBackupRestoreRehearsal({
+    ...f.input, scratch: scratch.store(), async assertScratchIsIsolated() {},
+  }), /backup|SHA|mismatch/i)
+  assert.equal(scratch.files.size, 0)
+})
+
+test("D85 corrupted scratch bytes fail independent readback and clean the artifact", async () => {
+  const f = await fixture()
+  const scratch = new D85Scratch()
+  scratch.corrupt = true
+  await assert.rejects(() => verifyV4ReencryptionBackupRestoreRehearsal({
+    ...f.input, scratch: scratch.store(), async assertScratchIsIsolated() {},
+  }), /scratch restore readback SHA/i)
+  assert.equal(scratch.files.size, 0)
+})
+
+test("D85 snapshot drift, scratch write failure and unsafe scratch guard all fail closed", async () => {
+  const f = await fixture()
+  const scratch = new D85Scratch()
+  scratch.onWrite = () => f.changeSnapshot("f".repeat(64))
+  await assert.rejects(() => verifyV4ReencryptionBackupRestoreRehearsal({
+    ...f.input, scratch: scratch.store(), async assertScratchIsIsolated() {},
+  }), /snapshot changed/i)
+  assert.equal(scratch.files.size, 0)
+  const g = await fixture()
+  const fail = new D85Scratch()
+  fail.fail = true
+  await assert.rejects(() => verifyV4ReencryptionBackupRestoreRehearsal({
+    ...g.input, scratch: fail.store(), async assertScratchIsIsolated() {},
+  }), /scratch disk full/i)
+  assert.equal(fail.files.size, 0)
+  const h = await fixture()
+  const guard = new D85Scratch()
+  await assert.rejects(() => verifyV4ReencryptionBackupRestoreRehearsal({
+    ...h.input, scratch: guard.store(),
+    async assertScratchIsIsolated() { throw new Error("scratch is a live vault") },
+  }), /scratch is a live vault/i)
+  assert.equal(h.reads, 0)
+  assert.equal(guard.files.size, 0)
+})
+
+test("D85 real OS filesystem rehearsal reopens and hashes persisted bytes then deletes scratch files", async () => {
+  const tmpRoot = join(process.cwd(), ".tmp")
+  await mkdir(tmpRoot, { recursive: true })
+  const sandbox = await mkdtemp(join(tmpRoot, "d85-sandbox-"))
+  try {
+    const f = await fixture()
+    let count = 0
+    const disk: V4StagingBackend = {
+      boundedAppend: true,
+      async write(p, bytes) {
+        await mkdir(join(sandbox, ...p.split("/").slice(0, -1)), { recursive: true })
+        await writeFile(join(sandbox, ...p.split("/")), bytes)
+      },
+      async append(p, bytes) { await appendFile(join(sandbox, ...p.split("/")), bytes) },
+      async remove(p) { await rm(join(sandbox, ...p.split("/")), { force: true }) },
+      async openSource(p, size) {
+        const bytes = await readFile(join(sandbox, ...p.split("/")))
+        assert.equal(bytes.length, size)
+        return createV4WholeBufferContentSource(bytes)
+      },
+      async freeBytes() { return 100 * 1024 * 1024 },
+    }
+    const scratch = createV4StagingStore({
+      root: "d85/scratch", backend: disk, wholeBufferCeilingBytes: 1024 * 1024,
+      randomId: () => "disk-" + (++count),
+    })
+    const result = await verifyV4ReencryptionBackupRestoreRehearsal({
+      ...f.input, scratch, async assertScratchIsIsolated() {},
+    })
+    assert.equal(result.roundTripFileCount, 3)
+    const { readdir } = await import("node:fs/promises")
+    assert.deepEqual(await readdir(join(sandbox, "d85", "scratch")), [])
+  } finally {
+    await rm(sandbox, { recursive: true, force: true })
+  }
 })
 
 test("D84 aborts fail-closed and does not claim independent backup or a physical restore", async () => {
