@@ -8,6 +8,7 @@ import { deriveV4Keyring, type V4Keyring } from "../../src/lib/v4/crypto";
 import { V4HistoryService } from "../../src/lib/v4/history-service";
 import { verifyGitHubReencryptionSource } from "../../src/lib/v4/reencryption-trusted-loader";
 import { verifyStagedV4ReencryptionGitBlobs } from "../../src/lib/v4/reencryption-blob-reconciliation";
+import { verifyV4ReencryptionDestinationExactCommit } from "../../src/lib/v4/reencryption-destination-exact-commit";
 import { createV4ReencryptionRecoveryJournal } from "../../src/lib/v4/reencryption-recovery-journal";
 import { computeV4GitBlobSha1 } from "../../src/lib/v4/git-blob-identity";
 import type { V4LocalIndexAdapter } from "../../src/lib/v4/local-index";
@@ -723,6 +724,30 @@ async function runOrphanRootBootstrapScenario(config: GitHubConfig): Promise<voi
   assert.equal(audited.destinationContentVerified, false);
   assert.equal((await wal.load())!.pendingIntents.length, 1);
   assert.equal(secondDevice.transportMetricsSnapshot.mutations - beforeBlobAudit, 0);
+
+  // D83: independently validate the *entire committed destination tree*,
+  // authenticated V4 head/index and all encrypted plaintext at EXACT root SHA.
+  // This does not authorize publication or a device cutover.
+  const beforeExactAudit = secondDevice.transportMetricsSnapshot.mutations;
+  const complete = await verifyV4ReencryptionDestinationExactCommit({
+    github: secondDevice, plan, destinationCommitSha: rootCommit,
+    sourceTreeSha: oldCommit.treeSha,
+    sourceConfig: oldConfig, expectedDestinationConfig: newConfig,
+    expectedRecords: [record],
+    expectedReceipts: prepared.files.map(file => ({
+      path: file.path, sha: computeV4GitBlobSha1(file.bytes),
+      byteLength: file.bytes.byteLength,
+    })),
+    destinationPassphrase: "synthetic-d75-orphan-only",
+  });
+  assert.equal(complete.verifiedFileCount, 1);
+  assert.equal(complete.verifiedRemoteObjectCount, prepared.files.length);
+  assert.equal(complete.totalVerifiedPlaintextBytes, String(plaintext.byteLength));
+  assert.equal(complete.permissionToPublish, false);
+  assert.equal(complete.cutoverAuthorized, false);
+  assert.equal(complete.backupVerified, false);
+  assert.equal(complete.secondDeviceRestored, false);
+  assert.equal(secondDevice.transportMetricsSnapshot.mutations - beforeExactAudit, 0);
 
   assert.deepEqual((await secondDevice.getGitCommit(rootCommit)).parentShas, []);
   assert.equal((await sourceClient.getGitRef()).sha, oldHead.sha,
