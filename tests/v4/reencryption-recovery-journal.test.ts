@@ -557,6 +557,108 @@ test("D113 an ordinary valid two-slot upload/receipt transition still opens afte
   assert.equal(recovered.cutoverAuthorized, false)
 })
 
+test("D114 valid complete three-branch WAL lifecycle survives restart at every generation", async () => {
+  const adapter = new MemoryAdapter()
+  const journal = create(adapter)
+  let state = await journal.begin()
+  const verify = async () => {
+    const restarted = create(adapter)
+    assert.deepEqual(await restarted.load(), state)
+    const healthy = await restarted.assertHealthySnapshot(state.generation)
+    assert.deepEqual(healthy, state)
+    assert.equal(healthy.requiresRemoteRevalidation, true)
+    assert.equal(healthy.permissionToPublish, false)
+    assert.equal(healthy.cutoverAuthorized, false)
+  }
+  await verify()
+  state = await journal.recordRefIntent(backupIntent, state.generation)
+  await verify()
+  state = await journal.markRefReadbackObserved(backupIntent, state.generation)
+  await verify()
+  state = await journal.recordStagingHandoff(backupIntent, state.generation)
+  await verify()
+  state = await journal.recordUploadIntent(receipt(1), state.generation)
+  await verify()
+  state = await journal.appendReceipt(receipt(1), state.generation)
+  await verify()
+  state = await journal.recordCandidatePreparationIntent("1".repeat(64), state.generation)
+  await verify()
+  state = await journal.recordPreparedCandidateReceipt(candidateReceipt, state.generation)
+  await verify()
+  state = await journal.recordRefIntent(destinationIntent, state.generation)
+  await verify()
+  state = await journal.markRefReadbackObserved(destinationIntent, state.generation)
+  await verify()
+})
+
+test("D114 divergent authenticated Backup ref observations cannot complete a pending intent", async () => {
+  const first = new MemoryAdapter()
+  const second = new MemoryAdapter()
+  const original = create(first)
+  const a = await original.begin()
+  await original.recordRefIntent(backupIntent, a.generation) // first gen-2
+  const alternate = { ...backupIntent, treeSha: "b".repeat(40) }
+  const other = create(second)
+  const b = await other.begin()
+  const pending = await other.recordRefIntent(alternate, b.generation)
+  await other.markRefReadbackObserved(alternate, pending.generation) // second gen-3
+  const fromFirst = [...first.files.entries()].find(([path]) => path.endsWith("slot-0.json"))
+  const inSecond = [...second.files.keys()].find(path => path.endsWith("slot-0.json"))
+  assert.ok(fromFirst && inSecond)
+  second.files.set(inSecond, fromFirst[1])
+  const bytesBefore = new Map(second.files)
+  await assert.rejects(() => create(second).load(), V4ReencryptionJournalRecoveryRequiredError)
+  await assert.rejects(() => create(second).assertHealthySnapshot(3), V4ReencryptionJournalRecoveryRequiredError)
+  await assert.rejects(() => create(second).recordStagingHandoff(alternate, 3), V4ReencryptionJournalRecoveryRequiredError)
+  assert.deepEqual(second.files, bytesBefore)
+})
+
+test("D114 divergent authenticated candidate-preparation fingerprints cannot complete a prepared commit", async () => {
+  const first = new MemoryAdapter()
+  const second = new MemoryAdapter()
+  const make = async (adapter: MemoryAdapter, digest: string) => {
+    const journal = create(adapter)
+    let state = await journal.begin()
+    state = await journal.recordRefIntent(backupIntent, state.generation)
+    state = await journal.markRefReadbackObserved(backupIntent, state.generation)
+    state = await journal.recordStagingHandoff(backupIntent, state.generation)
+    return { journal, state: await journal.recordCandidatePreparationIntent(digest, state.generation) }
+  }
+  await make(first, "1".repeat(64)) // first gen-5
+  const { journal, state } = await make(second, "2".repeat(64))
+  await journal.recordPreparedCandidateReceipt(candidateReceipt, state.generation) // second gen-6
+  const firstSlot = [...first.files.entries()].find(([path]) => path.endsWith("slot-1.json"))
+  const secondSlot = [...second.files.keys()].find(path => path.endsWith("slot-1.json"))
+  assert.ok(firstSlot && secondSlot)
+  second.files.set(secondSlot, firstSlot[1])
+  await assert.rejects(() => create(second).load(), V4ReencryptionJournalRecoveryRequiredError)
+  await assert.rejects(() => create(second).recordRefIntent(destinationIntent, 6), V4ReencryptionJournalRecoveryRequiredError)
+})
+
+test("D114 divergent authenticated prepared Git commits cannot authorize Destination ref intent", async () => {
+  const first = new MemoryAdapter()
+  const second = new MemoryAdapter()
+  const make = async (adapter: MemoryAdapter, commitSha: string) => {
+    const journal = create(adapter)
+    let state = await journal.begin()
+    state = await journal.recordRefIntent(backupIntent, state.generation)
+    state = await journal.markRefReadbackObserved(backupIntent, state.generation)
+    state = await journal.recordStagingHandoff(backupIntent, state.generation)
+    state = await journal.recordCandidatePreparationIntent("1".repeat(64), state.generation)
+    return { journal, state: await journal.recordPreparedCandidateReceipt({ ...candidateReceipt, commitSha }, state.generation) }
+  }
+  await make(first, candidateReceipt.commitSha) // first gen-6
+  const differentCommitSha = "b".repeat(40)
+  const { journal, state } = await make(second, differentCommitSha)
+  await journal.recordRefIntent({ ...destinationIntent, commitSha: differentCommitSha }, state.generation) // second gen-7
+  const firstSlot = [...first.files.entries()].find(([path]) => path.endsWith("slot-0.json"))
+  const secondSlot = [...second.files.keys()].find(path => path.endsWith("slot-0.json"))
+  assert.ok(firstSlot && secondSlot)
+  second.files.set(secondSlot, firstSlot[1])
+  await assert.rejects(() => create(second).load(), V4ReencryptionJournalRecoveryRequiredError)
+  await assert.rejects(() => create(second).assertHealthySnapshot(7), V4ReencryptionJournalRecoveryRequiredError)
+})
+
 test("D108 rejects authenticated nonadjacent WAL generations instead of accepting replayed old slot", async () => {
   const adapter = new MemoryAdapter();
   const journal = create(adapter);
