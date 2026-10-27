@@ -221,6 +221,26 @@ test("D96 creates destination branch ONLY after supplied durable intent and via 
   assert.ok(!JSON.stringify(res).includes("new-secret"))
 })
 
+test("D125 refuses a candidate SHA changed after Git commit verification and durable intent", async () => {
+  const f = await fixture()
+  const verified = await prepareV4ReencryptionOrphanCommit(f.input)
+  // A caller can reconstruct a mutable structural candidate during recovery.
+  // TypeScript readonly does not establish run-time object immutability.
+  const candidate = { ...verified }
+  let intentRecorded = false
+  await assert.rejects(() => publishV4ReencryptionOrphanRef({
+    github: f.github, plan, prepared: candidate,
+    assertExclusiveMigrationLease: async () => {},
+    assertDurablePublicationIntent: async () => {
+      intentRecorded = true
+      candidate.commitSha = "e".repeat(40)
+    },
+  }), /candidate|changed|commit|intent/i)
+  assert.equal(intentRecorded, true)
+  assert.equal(f.calls.filter(c => c === "ref-create").length, 0,
+    "an independently verified candidate SHA cannot switch before GitHub create-ref")
+})
+
 test("D96 full in-memory GitHub lifecycle reads and decrypts every newly encrypted orphan blob from the published exact commit", async () => {
   const f = await fixture()
   const candidate = await prepareV4ReencryptionOrphanCommit(f.input)
@@ -1296,6 +1316,43 @@ test("D124 WAL coordinator pins source parity before writing the one-shot Destin
   assert.equal(f.calls.filter(x => x === "ref-create").length, 0)
   assert.equal((await j.open().load())?.pendingRefIntents.length, 1,
     "once written, the one-shot intent is preserved for operator recovery")
+})
+
+test("D125 WAL coordinator refuses changed candidate identity before GitHub ref creation", async () => {
+  const f = await fixture()
+  const sealed = await prepareV4ReencryptionOrphanCommit(f.input)
+  const candidate = { ...sealed }
+  const j = await D102DestinationJournal(f.input.staged.receipts,
+    f.input.staged.records, f.input.destinationConfig, true, sealed)
+  const originalGetCommit = f.github.getGitCommit
+  let gitCommitVerified = false
+  f.github.getGitCommit = async sha => {
+    gitCommitVerified = true
+    return originalGetCommit(sha)
+  }
+  let changedDuringWalRead = false
+  const journal = {
+    ...j.journal,
+    async assertHealthySnapshot(...args: Parameters<typeof j.journal.assertHealthySnapshot>) {
+      const result = await j.journal.assertHealthySnapshot(...args)
+      if (gitCommitVerified && !changedDuringWalRead) {
+        changedDuringWalRead = true
+        candidate.commitSha = "e".repeat(40)
+      }
+      return result
+    },
+  }
+  await assert.rejects(() => publishV4JournaledThreeBranchDestination({
+    ...D100input(f, candidate), journal, wal: j.wal,
+  }), /candidate|changed|commit|intent/i)
+  assert.equal(gitCommitVerified, true)
+  assert.equal(changedDuringWalRead, true)
+  assert.equal(f.calls.filter(c => c === "ref-create").length, 0,
+    "even a persisted, healthy WAL cannot justify posting a different candidate SHA")
+  const pending = await j.open().load()
+  assert.ok(pending)
+  assert.equal(pending.pendingRefIntents.length, 1,
+    "failed publication must retain the one-shot WAL intent for manual recovery")
 })
 
 test("D102 refuses Destination mutation if encrypted WAL is missing even one staged object receipt", async () => {

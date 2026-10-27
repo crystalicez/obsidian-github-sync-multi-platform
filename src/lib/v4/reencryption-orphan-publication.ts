@@ -327,36 +327,51 @@ export async function publishV4ReencryptionOrphanRef(input: {
     || prepared.rootHasZeroParents !== true) {
     throw new Error("Re-encryption orphan publication requires the verified unreferenced candidate.")
   }
+  // TypeScript readonly is not a runtime proof. A recovered or caller-built
+  // candidate may be mutable even when normal preparation returns a frozen
+  // object. Pin the exact verified identity before any asynchronous reads.
+  const pinnedPrepared = Object.freeze({ ...prepared })
+  const pinnedIdentity = JSON.stringify(pinnedPrepared)
+  const assertCandidateUnchanged = () => {
+    if (JSON.stringify(prepared) !== pinnedIdentity) {
+      throw new Error("Re-encryption prepared candidate changed after validation; refusing Git ref mutation.")
+    }
+  }
   await input.assertExclusiveMigrationLease()
   await assertWriterIdentity(github, plan, signal)
   await assertAbsent(github, signal)
-  const commit = await github.getGitCommit(prepared.commitSha)
+  const commit = await github.getGitCommit(pinnedPrepared.commitSha)
   throwIfV4Aborted(signal)
-  if (commit.sha !== prepared.commitSha || commit.treeSha !== prepared.treeSha
+  if (commit.sha !== pinnedPrepared.commitSha || commit.treeSha !== pinnedPrepared.treeSha
     || commit.parentShas.length !== 0) {
     throw new Error("Re-encryption orphan publication root ancestry/commit changed.")
   }
+  assertCandidateUnchanged()
   await input.assertDurablePublicationIntent()
   throwIfV4Aborted(signal)
   await input.assertExclusiveMigrationLease()
   await assertAbsent(github, signal)
   await assertWriterIdentity(github, plan, signal)
   throwIfV4Aborted(signal)
+  // Never send a commit SHA that differs from the root we authenticated
+  // before WAL intent; no awaited work between final check and Git POST.
+  assertCandidateUnchanged()
   // Ambiguous HTTP response must propagate. Exactly ONE create attempt.
-  await github.createGitRef(prepared.commitSha)
+  await github.createGitRef(pinnedPrepared.commitSha)
   throwIfV4Aborted(signal)
   for (let i = 0; i < 2; i++) {
     const ref = await github.getGitRefOrNull()
     throwIfV4Aborted(signal)
     if (!ref || ref.ref !== `refs/heads/${plan.destinationBranch}`
-      || ref.type !== "commit" || ref.sha !== prepared.commitSha) {
+      || ref.type !== "commit" || ref.sha !== pinnedPrepared.commitSha) {
       throw new Error("Re-encryption orphan destination ref publication is not confirmed.")
     }
   }
   await assertWriterIdentity(github, plan, signal)
+  assertCandidateUnchanged()
   return Object.freeze({
     status: "destination-ref-create-confirmed",
-    commitSha: prepared.commitSha,
+    commitSha: pinnedPrepared.commitSha,
     originalSourceBranchUnchangedByThisOperation: true,
     destinationContentReadbackVerified: false,
     installedRestoreVerified: false,
