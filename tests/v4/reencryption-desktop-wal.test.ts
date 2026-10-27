@@ -117,6 +117,65 @@ test("D103 real Node OS filesystem persists encrypted Backup + Destination ref i
   } finally { await t.cleanup() }
 })
 
+test("D115 newly-created nested WAL parents are included in the directory durability gate", async () => {
+  const t = await sandbox()
+  const nestedRoot = "rekey/extra/nested/wal"
+  try {
+    const store = await acquireV4DesktopRekeyWalStorage({
+      rootAbsolute: t.root, journalRoot: nestedRoot,
+    })
+    try {
+      const journal = createV4ReencryptionRecoveryJournal({
+        adapter: store.adapter, root: nestedRoot, sourceCommitSha: pinned,
+        destinationRepoId: dest, journalKey: key, runId: "d115-rekey-run",
+      })
+      const begun = await journal.begin()
+      assert.equal(begun.generation, 1)
+      const directoryPaths = [
+        t.root,
+        join(t.root, "rekey"),
+        join(t.root, "rekey", "extra"),
+        join(t.root, "rekey", "extra", "nested"),
+        join(t.root, "rekey", "extra", "nested", "wal"),
+      ]
+      const fs = await import("node:fs/promises")
+      let fullySupported = true
+      for (const candidate of directoryPaths) {
+        let handle: Awaited<ReturnType<typeof fs.open>> | undefined
+        try {
+          handle = await fs.open(candidate, "r")
+          await handle.sync()
+        } catch (error) {
+          const code = (error as NodeJS.ErrnoException).code
+          if (!["EPERM", "EACCES", "EINVAL", "ENOTSUP", "EISDIR"].includes(code ?? "")) throw error
+          fullySupported = false
+        } finally {
+          await handle?.close()
+        }
+      }
+      if (fullySupported) await store.assertCrashDurable()
+      else await assert.rejects(() => store.assertCrashDurable(), /fsync|durability/i)
+      assert.deepEqual((await readdir(directoryPaths[directoryPaths.length - 1]!)).sort(),
+        [".exclusive.lock", "slot-1.json"])
+      assert.equal((await makeJournalForRoot(store.adapter, nestedRoot).load())?.generation, 1)
+    } finally {
+      await store.release()
+    }
+  } finally {
+    await t.cleanup()
+  }
+})
+
+function makeJournalForRoot(
+  adapter: Parameters<typeof createV4ReencryptionRecoveryJournal>[0]["adapter"],
+  root: string,
+) {
+  return createV4ReencryptionRecoveryJournal({
+    adapter, root, sourceCommitSha: pinned, destinationRepoId: dest,
+    journalKey: key, runId: "d115-rekey-run",
+  })
+}
+
 test("D86 does not certify power-loss durability when Windows directory fsync is unsupported", async () => {
   const t = await sandbox()
   try {

@@ -108,18 +108,35 @@ export async function acquireV4DesktopRekeyWalStorage(options: {
 
   let closed = false
   let directorySyncConfirmed = false
-  const syncDirectory = async (): Promise<void> => {
+  // WAL directory creation changes PARENT directory entries. Fsyncing only
+  // the WAL leaf cannot prove that newly created parents survive power loss.
+  // The trusted root is pre-existing; sync each parent within its boundary
+  // once after mkdir, then sync the WAL leaf after every later slot rename.
+  let ancestorSyncConfirmed = false
+  const syncOneDirectory = async (name: string): Promise<boolean> => {
     let handle: Awaited<ReturnType<typeof fs.open>> | undefined
     try {
-      handle = await fs.open(directory, "r")
+      handle = await fs.open(name, "r")
       await handle.sync()
-      directorySyncConfirmed = true
+      return true
     } catch (error) {
       if (!SYNC_UNSUPPORTED.has((error as NodeJS.ErrnoException).code ?? "")) throw error
-      directorySyncConfirmed = false
+      return false
     } finally {
       await handle?.close()
     }
+  }
+  const syncCreatedDirectoryParents = async (): Promise<boolean> => {
+    let parent = root
+    for (const segment of parts) {
+      if (!(await syncOneDirectory(parent))) return false
+      parent = path.join(parent, segment)
+    }
+    return true
+  }
+  const syncDirectory = async (): Promise<void> => {
+    const leafSynced = await syncOneDirectory(directory)
+    directorySyncConfirmed = ancestorSyncConfirmed && leafSynced
   }
   const assertHeld = async (): Promise<void> => {
     if (closed) throw new V4DesktopRekeyWalLockError("Re-encryption Desktop WAL lease already released.")
@@ -145,6 +162,7 @@ export async function acquireV4DesktopRekeyWalStorage(options: {
   try {
     await lockHandle.writeFile(token, "utf8")
     await lockHandle.sync()
+    ancestorSyncConfirmed = await syncCreatedDirectoryParents()
     await syncDirectory()
     // Never silently ignore a temp slot that may represent an interrupted
     // transaction. It can contain evidence newer than the last valid WAL.
