@@ -207,6 +207,7 @@ test("D101 encrypted two-slot WAL persists BOTH Git ref create-intents through r
   snap = await journal.markRefReadbackObserved(backupIntent, afterRestart.generation);
   assert.equal(snap.pendingRefIntents.length, 0);
   assert.deepEqual(snap.verifiedRefObservations, [backupIntent]);
+  snap = await journal.recordStagingHandoff(backupIntent, snap.generation);
   const upload = await journal.recordUploadIntent(receipt(1), snap.generation);
   snap = await journal.appendReceipt(receipt(1), upload.generation);
   snap = await journal.recordRefIntent(destinationIntent, snap.generation);
@@ -265,6 +266,7 @@ test("D101 WAL torn destination ref intent never grants retry, reuse, publicatio
   let snap = await journal.begin();
   snap = await journal.recordRefIntent(backupIntent, snap.generation);
   snap = await journal.markRefReadbackObserved(backupIntent, snap.generation);
+  snap = await journal.recordStagingHandoff(backupIntent, snap.generation);
   adapter.tear = true;
   await assert.rejects(() => journal.recordRefIntent(destinationIntent, snap.generation), /torn destination WAL write/i);
   adapter.tear = false;
@@ -341,6 +343,48 @@ test("D104 one-time Backup-to-Staging WAL handoff survives restart even with ZER
     { ...backupIntent, treeSha: "f".repeat(40) }, restarted.generation),
   /already started|stale/i);
   assert.equal((await journal.load())?.generation, restarted.generation);
+});
+
+test("D108 low-level WAL rejects blob uploads and destination intent before one-shot Backup-to-Staging handoff", async () => {
+  const adapter = new MemoryAdapter();
+  const journal = create(adapter);
+  let snapshot = await journal.begin();
+  snapshot = await journal.recordRefIntent(backupIntent, snapshot.generation);
+  snapshot = await journal.markRefReadbackObserved(backupIntent, snapshot.generation);
+  const before = new Map(adapter.files);
+
+  await assert.rejects(() => journal.recordUploadIntent(receipt(1), snapshot.generation),
+    /Staging handoff/i);
+  await assert.rejects(() => journal.recordRefIntent(destinationIntent, snapshot.generation),
+    /one-shot Staging handoff/i);
+  assert.deepEqual(adapter.files, before, "No alternate lower-level caller may skip the journal phase boundary");
+  assert.deepEqual((await journal.load())?.verifiedRefObservations, [backupIntent]);
+
+  snapshot = await journal.recordStagingHandoff(backupIntent, snapshot.generation);
+  assert.equal(snapshot.stageHandoffStarted, true);
+  snapshot = await journal.recordRefIntent(destinationIntent, snapshot.generation);
+  assert.deepEqual(snapshot.pendingRefIntents, [destinationIntent]);
+  assert.equal(snapshot.permissionToPublish, false);
+  assert.equal(snapshot.cutoverAuthorized, false);
+});
+
+test("D108 rejects authenticated nonadjacent WAL generations instead of accepting replayed old slot", async () => {
+  const adapter = new MemoryAdapter();
+  const journal = create(adapter);
+  let current = await journal.begin();
+  const firstSlot = [...adapter.files.entries()].find(([path]) => path.endsWith("slot-1.json"));
+  assert.ok(firstSlot);
+  current = await journal.recordRefIntent(backupIntent, current.generation);
+  current = await journal.markRefReadbackObserved(backupIntent, current.generation);
+  current = await journal.recordStagingHandoff(backupIntent, current.generation);
+  current = await journal.recordUploadIntent(receipt(1), current.generation);
+  current = await journal.appendReceipt(receipt(1), current.generation);
+  assert.equal(current.generation, 6);
+  adapter.files.set(firstSlot[0], firstSlot[1]); // Valid *old* gen-1 MAC/AES-GCM in place of gen-5.
+  await assert.rejects(() => create(adapter).load(), V4ReencryptionJournalRecoveryRequiredError);
+  await assert.rejects(() => create(adapter).assertHealthySnapshot(6), V4ReencryptionJournalRecoveryRequiredError);
+  await assert.rejects(() => create(adapter).recordRefIntent(destinationIntent, 6),
+    V4ReencryptionJournalRecoveryRequiredError);
 });
 
 test("D101 legacy encrypted staging-only WAL payload still opens as ref-free recovery evidence", async () => {

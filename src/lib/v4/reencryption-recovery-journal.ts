@@ -237,7 +237,11 @@ export function createV4ReencryptionRecoveryJournal(input: {
       }
       if (usedRoles.has("destination")
         && !refReceipts.some(item => item.role === "backup")) return { present: true }
-      if (stageHandoffStarted && !refReceipts.some(r => r.role === "backup")) return { present: true }
+      const backupObserved = refReceipts.some(r => r.role === "backup")
+      if (stageHandoffStarted && !backupObserved) return { present: true }
+      if (usedRoles.has("destination") && !stageHandoffStarted) return { present: true }
+      if (backupObserved && !stageHandoffStarted
+        && (v.pendingIntents.length > 0 || v.receipts.length > 0)) return { present: true }
       if (usedRoles.has("destination") && v.pendingIntents.length > 0) return { present: true }
       return { present: true, state: snapshot(data.generation, v.receipts, v.pendingIntents,
         refIntents, refReceipts, stageHandoffStarted) }
@@ -253,6 +257,10 @@ export function createV4ReencryptionRecoveryJournal(input: {
       if (slots.some(s => s.present)) invalid()
       return { latest: null as V4ReencryptionJournalSnapshot | null, damaged: false, incomplete: false }
     }
+    // Adjacent alternate slots are required. Skipped authenticated generations
+    // indicate replay/rollback or filesystem corruption, never normal WAL.
+    if (candidates.length === 2
+      && Math.abs(candidates[0]!.generation - candidates[1]!.generation) !== 1) invalid()
     const latest = candidates.reduce((a, b) => a.generation > b.generation ? a : b)
     return { latest, damaged: slots.some(s => s.present && !s.state),
       incomplete: latest.generation > 1 && slots.some(s => !s.present) }
@@ -332,6 +340,10 @@ export function createV4ReencryptionRecoveryJournal(input: {
         || state.latest.verifiedRefObservations.some(r => r.role === "destination")) {
         throw new Error("Re-encryption WAL cannot upload staged blobs during unresolved ref publication.")
       }
+      if (state.latest.verifiedRefObservations.some(r => r.role === "backup")
+        && !state.latest.stageHandoffStarted) {
+        throw new Error("Re-encryption WAL requires a one-shot Staging handoff after verified Backup.")
+      }
       if ([...state.latest.receipts, ...state.latest.pendingIntents].some(r => r.path === receipt.path)) {
         throw new Error("Re-encryption WAL duplicate staged object path.")
       }
@@ -347,6 +359,10 @@ export function createV4ReencryptionRecoveryJournal(input: {
       if (!state.latest || state.damaged || state.incomplete) invalid()
       if (state.latest.generation !== expectedGeneration) {
         throw new Error("Re-encryption WAL stale generation: source of truth changed.")
+      }
+      if (state.latest.verifiedRefObservations.some(r => r.role === "backup")
+        && !state.latest.stageHandoffStarted) {
+        throw new Error("Re-encryption WAL cannot complete blobs before the one-shot Staging handoff.")
       }
       const matching = state.latest.pendingIntents.find(r => r.path === receipt.path)
       if (!matching || matching.sha !== receipt.sha || matching.byteLength !== receipt.byteLength) {
@@ -388,9 +404,10 @@ export function createV4ReencryptionRecoveryJournal(input: {
         throw new Error("Re-encryption WAL duplicate Git ref role cannot be created twice.")
       }
       if (intent.role === "destination" && (
-        state.latest.pendingIntents.length !== 0
+        !state.latest.stageHandoffStarted
+        || state.latest.pendingIntents.length !== 0
         || !state.latest.verifiedRefObservations.some(r => r.role === "backup"))) {
-        throw new Error("Re-encryption WAL destination requires completed staging and verified Backup ref.")
+        throw new Error("Re-encryption WAL destination requires the one-shot Staging handoff, completed staging and verified Backup ref.")
       }
       if (intent.role === "backup" && (state.latest.receipts.length > 0
         || state.latest.pendingIntents.length > 0)) {
@@ -407,6 +424,9 @@ export function createV4ReencryptionRecoveryJournal(input: {
       if (!state.latest || state.damaged || state.incomplete) invalid()
       if (state.latest.generation !== expectedGeneration) {
         throw new Error("Re-encryption WAL stale ref-readback generation.")
+      }
+      if (intent.role === "destination" && !state.latest.stageHandoffStarted) {
+        throw new Error("Re-encryption WAL destination readback requires the one-shot Staging handoff.")
       }
       const matching = state.latest.pendingRefIntents.find(r => r.role === intent.role)
       if (!matching || !equalRef(matching, intent)) {
