@@ -513,6 +513,50 @@ test("D108 low-level WAL rejects blob uploads and destination intent before one-
   assert.equal(snapshot.cutoverAuthorized, false);
 });
 
+test("D113 rejects two individually authenticated adjacent WAL slots from divergent same-run histories", async () => {
+  const firstHistory = new MemoryAdapter()
+  const independentHistory = new MemoryAdapter()
+  const first = create(firstHistory)
+  const second = create(independentHistory)
+
+  const a = await first.begin()
+  await first.recordUploadIntent(receipt(1), a.generation) // g2 pending receipt(1)
+
+  const b = await second.begin()
+  const alternate = await second.recordUploadIntent(receipt(2), b.generation)
+  const newer = await second.appendReceipt(receipt(2), alternate.generation) // g3 receipt(2)
+  assert.equal(newer.generation, 3)
+  const slot2 = [...firstHistory.files.entries()].find(([path]) => path.endsWith("slot-0.json"))
+  assert.ok(slot2)
+  const targetSlot = [...independentHistory.files.keys()].find(path => path.endsWith("slot-0.json"))
+  assert.ok(targetSlot)
+  // Both slots carry VALID AES-GCM authentication and the exact same
+  // journal key/run/source/destination identity. Generation adjacency alone
+  // wrongly accepted the two incompatible histories as a single WAL.
+  independentHistory.files.set(targetSlot, slot2[1])
+  await assert.rejects(() => create(independentHistory).load(),
+    V4ReencryptionJournalRecoveryRequiredError)
+  await assert.rejects(() => create(independentHistory).assertHealthySnapshot(3),
+    V4ReencryptionJournalRecoveryRequiredError)
+  await assert.rejects(() => create(independentHistory).recordUploadIntent(receipt(3), 3),
+    V4ReencryptionJournalRecoveryRequiredError)
+})
+
+test("D113 an ordinary valid two-slot upload/receipt transition still opens after restart", async () => {
+  const adapter = new MemoryAdapter()
+  const journal = create(adapter)
+  const started = await journal.begin()
+  const pending = await journal.recordUploadIntent(receipt(1), started.generation)
+  const received = await journal.appendReceipt(receipt(1), pending.generation)
+  const recovered = await create(adapter).assertHealthySnapshot(received.generation)
+  assert.equal(recovered.generation, 3)
+  assert.deepEqual(recovered.receipts, [receipt(1)])
+  assert.deepEqual(recovered.pendingIntents, [])
+  assert.equal(recovered.requiresRemoteRevalidation, true)
+  assert.equal(recovered.permissionToPublish, false)
+  assert.equal(recovered.cutoverAuthorized, false)
+})
+
 test("D108 rejects authenticated nonadjacent WAL generations instead of accepting replayed old slot", async () => {
   const adapter = new MemoryAdapter();
   const journal = create(adapter);

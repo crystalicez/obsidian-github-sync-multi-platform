@@ -147,6 +147,81 @@ function equalRef(a: V4ReencryptionRefIntent, b: V4ReencryptionRefIntent): boole
     && a.manifestSha256 === b.manifestSha256
 }
 
+/**
+ * D113: generation adjacency alone does not establish WAL ancestry. Each
+ * legitimate save() below advances exactly ONE phase or ONE object, and the
+ * two live slots must describe that same single transition. A valid MAC on
+ * two divergent same-run histories must never certify remote publication.
+ */
+function isAdjacentWalTransition(
+  older: V4ReencryptionJournalSnapshot,
+  newer: V4ReencryptionJournalSnapshot,
+): boolean {
+  if (newer.generation !== older.generation + 1) return false
+  const sameObject = (a: V4ReencryptionObjectReceipt, b: V4ReencryptionObjectReceipt) =>
+    a.path === b.path && a.sha === b.sha && a.byteLength === b.byteLength
+  const sameRef = equalRef
+  const sameList = <T>(
+    a: readonly T[], b: readonly T[], equal: (x: T, y: T) => boolean,
+  ): boolean => a.length === b.length && a.every((x, i) => equal(x, b[i]!))
+  const objectsSame = (a: readonly V4ReencryptionObjectReceipt[],
+    b: readonly V4ReencryptionObjectReceipt[]) => sameList(a, b, sameObject)
+  const refsSame = (a: readonly V4ReencryptionRefIntent[], b: readonly V4ReencryptionRefIntent[]) =>
+    sameList(a, b, sameRef)
+  const samePrepared = (a: V4ReencryptionPreparedCandidateReceipt | null,
+    b: V4ReencryptionPreparedCandidateReceipt | null) =>
+    a === b || (a !== null && b !== null
+      && a.commitSha === b.commitSha && a.treeSha === b.treeSha
+      && a.manifestSha256 === b.manifestSha256)
+
+  // Every legitimate operation preserves all non-target fields.
+  const objects = objectsSame(older.receipts, newer.receipts)
+  const pending = objectsSame(older.pendingIntents, newer.pendingIntents)
+  const refIntents = refsSame(older.pendingRefIntents, newer.pendingRefIntents)
+  const observed = refsSame(older.verifiedRefObservations, newer.verifiedRefObservations)
+  const stage = older.stageHandoffStarted === newer.stageHandoffStarted
+  const candidate = older.candidatePreparationSha256 === newer.candidatePreparationSha256
+  const prepared = samePrepared(older.preparedCandidateReceipt, newer.preparedCandidateReceipt)
+  const appendOne = <T>(
+    before: readonly T[], after: readonly T[], equal: (x: T, y: T) => boolean,
+  ) => after.length === before.length + 1
+    && before.every((x, i) => equal(x, after[i]!))
+  const newObjectIntent = objects && refIntents && observed && stage && candidate && prepared
+    && appendOne(older.pendingIntents, newer.pendingIntents, sameObject)
+  if (newObjectIntent) return true
+
+  const newObjectReceipt = refIntents && observed && stage && candidate && prepared
+    && appendOne(older.receipts, newer.receipts, sameObject)
+    && older.pendingIntents.length === newer.pendingIntents.length + 1
+    && older.pendingIntents.some(intent => {
+      const added = newer.receipts[newer.receipts.length - 1]!
+      return sameObject(intent, added)
+        && objectsSame(older.pendingIntents.filter(r => r.path !== intent.path), newer.pendingIntents)
+    })
+  if (newObjectReceipt) return true
+
+  if (objects && pending && stage && candidate && prepared) {
+    if (observed && appendOne(older.pendingRefIntents, newer.pendingRefIntents, sameRef)) return true
+    if (!refIntents && !observed) {
+      const added = newer.verifiedRefObservations[newer.verifiedRefObservations.length - 1]
+      if (added && appendOne(older.verifiedRefObservations, newer.verifiedRefObservations, sameRef)
+        && older.pendingRefIntents.length === newer.pendingRefIntents.length + 1
+        && older.pendingRefIntents.some(intent => sameRef(intent, added)
+          && refsSame(older.pendingRefIntents.filter(r => r.role !== intent.role), newer.pendingRefIntents))) {
+        return true
+      }
+    }
+  }
+  if (objects && pending && refIntents && observed) {
+    if (!older.stageHandoffStarted && newer.stageHandoffStarted && candidate && prepared) return true
+    if (stage && older.candidatePreparationSha256 === null
+      && newer.candidatePreparationSha256 !== null && prepared) return true
+    if (stage && candidate && older.preparedCandidateReceipt === null
+      && newer.preparedCandidateReceipt !== null) return true
+  }
+  return false
+}
+
 function isSlot(value: unknown): value is Slot {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false
   const s = value as Partial<Slot>
@@ -304,6 +379,10 @@ export function createV4ReencryptionRecoveryJournal(input: {
     // indicate replay/rollback or filesystem corruption, never normal WAL.
     if (candidates.length === 2
       && Math.abs(candidates[0]!.generation - candidates[1]!.generation) !== 1) invalid()
+    if (candidates.length === 2) {
+      const sorted = [...candidates].sort((a, b) => a.generation - b.generation)
+      if (!isAdjacentWalTransition(sorted[0]!, sorted[1]!)) invalid()
+    }
     const latest = candidates.reduce((a, b) => a.generation > b.generation ? a : b)
     return { latest, damaged: slots.some(s => s.present && !s.state),
       incomplete: latest.generation > 1 && slots.some(s => !s.present) }
