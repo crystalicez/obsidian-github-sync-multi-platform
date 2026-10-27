@@ -235,10 +235,17 @@ test("D106 installed-runtime adapter binds real physical files, live scope, conn
       ignorePathRegex: "", syncObsidianConfig: false, syncBookmarks: false, syncPlugins: false,
     }
     let openEditor: string | null = null
+    let unboundMarkdownEditor = false
+    let unboundActiveEditor = false
     const workspace = {
-      get activeEditor() { return openEditor ? { file: { path: openEditor } } : null },
-      iterateAllLeaves(visitor: (leaf: { view: { file?: { path: string } } }) => void) {
-        visitor({ view: openEditor ? { file: { path: openEditor } } : {} })
+      get activeEditor() {
+        return unboundActiveEditor ? { file: null }
+          : openEditor ? { file: { path: openEditor } } : null
+      },
+      iterateAllLeaves(visitor: (leaf: { view: { file?: { path: string }; getViewType?: () => string } }) => void) {
+        visitor({ view: unboundMarkdownEditor
+          ? { getViewType: () => "markdown" }
+          : openEditor ? { file: { path: openEditor } } : {} })
       },
     }
     const plugin = {
@@ -267,7 +274,18 @@ test("D106 installed-runtime adapter binds real physical files, live scope, conn
 
       openEditor = "notes/a.md"
       await assert.rejects(() => verifyV4ReencryptionInitiatorLocalParity({ ...proof, reader }), /editor/i)
+      openEditor = "draft/unsaved-new.md"
+      await assert.rejects(() => verifyV4ReencryptionInitiatorLocalParity({ ...proof, reader }), /editor/i,
+        "a new editor outside the authenticated source inventory must still block migration parity")
       openEditor = null
+      unboundMarkdownEditor = true
+      await assert.rejects(() => verifyV4ReencryptionInitiatorLocalParity({ ...proof, reader }), /editor|markdown|unbound/i,
+        "a Markdown editor with no saved file path cannot be treated as no editor")
+      unboundMarkdownEditor = false
+      unboundActiveEditor = true
+      await assert.rejects(() => verifyV4ReencryptionInitiatorLocalParity({ ...proof, reader }), /editor|unsaved/i,
+        "an active editor without a bound file must fail closed")
+      unboundActiveEditor = false
 
       mutableSettings.githubBranch = "different"
       await assert.rejects(() => verifyV4ReencryptionInitiatorLocalParity({ ...proof, reader }), /connection|scope/i)

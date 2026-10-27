@@ -115,9 +115,12 @@ export async function verifyV4ReencryptionInitiatorLocalParity(
     throwIfV4Aborted(input.signal)
     const open = await reader.listOpenEditorPaths()
     throwIfV4Aborted(input.signal)
-    if (!Array.isArray(open) || open.some(path => typeof path !== "string")
-      || open.some(path => expectedCanonical.has(path.normalize("NFC").toLowerCase()))) {
-      throw new Error("Re-encryption initiator cannot verify cutover with a source file open in an editor.")
+    // An uncommitted new note need not exist on disk or in sourceRecords.
+    // Reject *all* open file editors, not just paths in the pinned remote
+    // manifest. Otherwise parity can falsely claim no editors were observed
+    // while an unsaved non-source document is open.
+    if (!Array.isArray(open) || open.length > 0) {
+      throw new Error("Re-encryption initiator cannot verify migration while any editor remains open.")
     }
   }
 

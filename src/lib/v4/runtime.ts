@@ -283,12 +283,30 @@ export class V4PluginRuntime {
           throw new Error("Re-encryption cannot prove that Obsidian editors are closed.")
         }
         const open = new Set<string>()
-        const active = workspace.activeEditor?.file?.path
+        const activeEditor = workspace.activeEditor
+        const active = activeEditor?.file?.path
+        if (activeEditor && !active) {
+          throw new Error("Re-encryption cannot prove an unsaved active editor is closed.")
+        }
         if (active) open.add(active)
+        let unboundMarkdownEditor = false
         workspace.iterateAllLeaves(leaf => {
-          const file = (leaf.view as { file?: { path?: string } } | undefined)?.file?.path
+          const view = leaf.view as {
+            file?: { path?: string }
+            getViewType?: () => string
+          } | undefined
+          const file = view?.file?.path
           if (file) open.add(file)
+          // A new unsaved Markdown tab can have no TFile/path, so physical
+          // vault inventory cannot see its contents. Refuse the migration
+          // preflight instead of falsely claiming there are no open editors.
+          if (view?.getViewType?.() === "markdown" && !file) {
+            unboundMarkdownEditor = true
+          }
         })
+        if (unboundMarkdownEditor) {
+          throw new Error("Re-encryption cannot prove an unsaved Markdown editor is closed.")
+        }
         return [...open]
       },
     })

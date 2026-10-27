@@ -154,6 +154,18 @@ test("D105 dirty/open editor, active sync, settings drift, or lost exclusive lea
   }
 })
 
+test("D122 refuses an open editor outside remote source inventory, including an unsaved new note", async () => {
+  for (const editorPath of ["draft/new-unsaved.md", ".obsidian/workspace.json"]) {
+    const f = await fixture()
+    f.openEditor([editorPath])
+    await assert.rejects(
+      () => verifyV4ReencryptionInitiatorLocalParity(f.input),
+      /editor/i,
+      "an open editor not listed in remote source is still uncommitted local edit risk",
+    )
+  }
+})
+
 test("D105 detects local file writes during full-vault scan even if original content was hashed correctly", async () => {
   const f = await fixture()
   let changed = false
