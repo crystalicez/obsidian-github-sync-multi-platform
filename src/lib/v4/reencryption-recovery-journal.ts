@@ -37,6 +37,12 @@ export interface V4ReencryptionRefIntent {
   readonly manifestSha256?: string
 }
 
+export interface V4ReencryptionPreparedCandidateReceipt {
+  readonly commitSha: string
+  readonly treeSha: string
+  readonly manifestSha256: string
+}
+
 interface Payload {
   readonly status: "staging-only"
   readonly pendingIntents: readonly V4ReencryptionObjectReceipt[]
@@ -46,6 +52,7 @@ interface Payload {
   readonly refReceipts?: readonly V4ReencryptionRefIntent[]
   readonly stageHandoffStarted?: boolean
   readonly candidatePreparationSha256?: string
+  readonly preparedCandidateReceipt?: V4ReencryptionPreparedCandidateReceipt
 }
 
 export interface V4ReencryptionJournalSnapshot {
@@ -57,6 +64,7 @@ export interface V4ReencryptionJournalSnapshot {
   readonly stageHandoffStarted: boolean
   /** One-shot encrypted pre-commit candidate manifest intent; null on D80/D81 legacy. */
   readonly candidatePreparationSha256: string | null
+  readonly preparedCandidateReceipt: V4ReencryptionPreparedCandidateReceipt | null
   readonly requiresRemoteRevalidation: true
   readonly permissionToPublish: false
   readonly cutoverAuthorized: false
@@ -82,6 +90,8 @@ export interface V4ReencryptionRecoveryJournal {
   recordStagingHandoff(backup: V4ReencryptionRefIntent, expectedGeneration: number): Promise<V4ReencryptionJournalSnapshot>
   /** One-shot BEFORE metadata blobs/tree/commit. Never auto replay after crash. */
   recordCandidatePreparationIntent(digest: string, expectedGeneration: number): Promise<V4ReencryptionJournalSnapshot>
+  /** One-shot receipt AFTER exact zero-parent Git commit/tree verification, BEFORE Destination ref. */
+  recordPreparedCandidateReceipt(receipt: V4ReencryptionPreparedCandidateReceipt, expectedGeneration: number): Promise<V4ReencryptionJournalSnapshot>
   /** Only AFTER separate complete Git/crypto readback; never grants publication or local cutover. */
   markRefReadbackObserved(intent: V4ReencryptionRefIntent, expectedGeneration: number): Promise<V4ReencryptionJournalSnapshot>
 }
@@ -165,6 +175,7 @@ function snapshot(
   verifiedRefObservations: readonly V4ReencryptionRefIntent[],
   stageHandoffStarted: boolean,
   candidatePreparationSha256: string | null,
+  preparedCandidateReceipt: V4ReencryptionPreparedCandidateReceipt | null,
 ): V4ReencryptionJournalSnapshot {
   return Object.freeze({
     generation,
@@ -174,6 +185,7 @@ function snapshot(
     verifiedRefObservations: Object.freeze(verifiedRefObservations.map(r => Object.freeze({ ...r }))),
     stageHandoffStarted,
     candidatePreparationSha256,
+    preparedCandidateReceipt: preparedCandidateReceipt ? Object.freeze({ ...preparedCandidateReceipt }) : null,
     requiresRemoteRevalidation: true,
     permissionToPublish: false,
     cutoverAuthorized: false,
@@ -240,6 +252,15 @@ export function createV4ReencryptionRecoveryJournal(input: {
       if (v.stageHandoffStarted !== undefined && typeof v.stageHandoffStarted !== "boolean") return { present: true }
       const stageHandoffStarted = v.stageHandoffStarted === true
       const candidatePreparationSha256 = v.candidatePreparationSha256 ?? null
+      const preparedCandidateReceipt = v.preparedCandidateReceipt ?? null
+      if (preparedCandidateReceipt !== null
+        && (typeof preparedCandidateReceipt !== "object" || Array.isArray(preparedCandidateReceipt)
+          || typeof preparedCandidateReceipt.commitSha !== "string" || !GIT_SHA.test(preparedCandidateReceipt.commitSha)
+          || typeof preparedCandidateReceipt.treeSha !== "string" || !GIT_SHA.test(preparedCandidateReceipt.treeSha)
+          || typeof preparedCandidateReceipt.manifestSha256 !== "string"
+          || !/^[0-9a-f]{64}$/u.test(preparedCandidateReceipt.manifestSha256)
+          || preparedCandidateReceipt.commitSha === input.sourceCommitSha
+          || candidatePreparationSha256 === null)) return { present: true }
       if (candidatePreparationSha256 !== null && (typeof candidatePreparationSha256 !== "string"
         || !/^[0-9a-f]{64}$/u.test(candidatePreparationSha256))) return { present: true }
       if (!Array.isArray(refIntents) || !Array.isArray(refReceipts)
@@ -257,11 +278,16 @@ export function createV4ReencryptionRecoveryJournal(input: {
       if (usedRoles.has("destination") && !stageHandoffStarted) return { present: true }
       if (candidatePreparationSha256 && (!stageHandoffStarted || !backupObserved || v.pendingIntents.length)) return { present: true }
       if (usedRoles.has("destination") && !candidatePreparationSha256) return { present: true }
+      if (usedRoles.has("destination") && (!preparedCandidateReceipt
+        || [...refIntents, ...refReceipts].some(r => r.role === "destination"
+          && (r.commitSha !== preparedCandidateReceipt.commitSha
+            || r.treeSha !== preparedCandidateReceipt.treeSha
+            || r.manifestSha256 !== preparedCandidateReceipt.manifestSha256)))) return { present: true }
       if (backupObserved && !stageHandoffStarted
         && (v.pendingIntents.length > 0 || v.receipts.length > 0)) return { present: true }
       if (usedRoles.has("destination") && v.pendingIntents.length > 0) return { present: true }
       return { present: true, state: snapshot(data.generation, v.receipts, v.pendingIntents,
-        refIntents, refReceipts, stageHandoffStarted, candidatePreparationSha256) }
+        refIntents, refReceipts, stageHandoffStarted, candidatePreparationSha256, preparedCandidateReceipt) }
     } catch {
       return { present: true }
     }
@@ -298,9 +324,10 @@ export function createV4ReencryptionRecoveryJournal(input: {
     refReceipts: readonly V4ReencryptionRefIntent[],
     stageHandoffStarted: boolean,
     candidatePreparationSha256: string | null = null,
+    preparedCandidateReceipt: V4ReencryptionPreparedCandidateReceipt | null = null,
   ) => {
     if (!Number.isSafeInteger(generation) || generation < 1) invalid()
-    const payload = utf8ToBytes(JSON.stringify({ status: "staging-only", receipts, pendingIntents, refIntents, refReceipts, stageHandoffStarted, candidatePreparationSha256 }))
+    const payload = utf8ToBytes(JSON.stringify({ status: "staging-only", receipts, pendingIntents, refIntents, refReceipts, stageHandoffStarted, candidatePreparationSha256, preparedCandidateReceipt }))
     if (payload.length > MAX_JOURNAL_BYTES / 2) invalid()
     let ciphertext: string
     try {
@@ -345,7 +372,7 @@ export function createV4ReencryptionRecoveryJournal(input: {
     begin: () => locked(async () => {
       const state = await observe()
       if (state.latest || state.damaged) invalid()
-      return save(1, [], [], [], [], false, null)
+      return save(1, [], [], [], [], false, null, null)
     }),
     recordUploadIntent: (receipt: V4ReencryptionObjectReceipt, expectedGeneration: number) => locked(async () => {
       assertV4ReencryptionJournalObjectReceipt(receipt)
@@ -431,6 +458,29 @@ export function createV4ReencryptionRecoveryJournal(input: {
         state.latest.pendingRefIntents, state.latest.verifiedRefObservations,
         state.latest.stageHandoffStarted, digest)
     }),
+    recordPreparedCandidateReceipt: (receipt: V4ReencryptionPreparedCandidateReceipt, expectedGeneration: number) => locked(async () => {
+      if (!receipt || typeof receipt !== "object" || Array.isArray(receipt)
+        || typeof receipt.commitSha !== "string" || !GIT_SHA.test(receipt.commitSha)
+        || typeof receipt.treeSha !== "string" || !GIT_SHA.test(receipt.treeSha)
+        || typeof receipt.manifestSha256 !== "string"
+        || !/^[0-9a-f]{64}$/u.test(receipt.manifestSha256)
+        || receipt.commitSha === input.sourceCommitSha) invalid()
+      const state = await observe()
+      if (!state.latest || state.damaged || state.incomplete
+        || state.latest.generation !== expectedGeneration
+        || !state.latest.candidatePreparationSha256
+        || state.latest.preparedCandidateReceipt !== null
+        || state.latest.pendingIntents.length > 0
+        || state.latest.pendingRefIntents.length > 0
+        || state.latest.verifiedRefObservations.length !== 1
+        || state.latest.verifiedRefObservations[0]?.role !== "backup") {
+        throw new Error("Re-encryption WAL candidate prepared receipt requires exactly one completed one-shot preparation.")
+      }
+      if (state.latest.generation >= Number.MAX_SAFE_INTEGER) invalid()
+      return save(state.latest.generation + 1, state.latest.receipts, state.latest.pendingIntents,
+        state.latest.pendingRefIntents, state.latest.verifiedRefObservations,
+        state.latest.stageHandoffStarted, state.latest.candidatePreparationSha256, { ...receipt })
+    }),
     recordRefIntent: (intent: V4ReencryptionRefIntent, expectedGeneration: number) => locked(async () => {
       assertRefIntent(intent, input.sourceCommitSha, input.destinationRepoId)
       const state = await observe()
@@ -449,6 +499,12 @@ export function createV4ReencryptionRecoveryJournal(input: {
         || !state.latest.verifiedRefObservations.some(r => r.role === "backup"))) {
         throw new Error("Re-encryption WAL destination requires the one-shot Staging handoff, completed staging and verified Backup ref.")
       }
+      if (intent.role === "destination" && (!state.latest.preparedCandidateReceipt
+        || state.latest.preparedCandidateReceipt.commitSha !== intent.commitSha
+        || state.latest.preparedCandidateReceipt.treeSha !== intent.treeSha
+        || state.latest.preparedCandidateReceipt.manifestSha256 !== intent.manifestSha256)) {
+        throw new Error("Re-encryption WAL destination requires exact independently observed candidate receipt.")
+      }
       if (intent.role === "backup" && (state.latest.receipts.length > 0
         || state.latest.pendingIntents.length > 0)) {
         throw new Error("Re-encryption WAL Backup ref must be planned before staging new ciphertext.")
@@ -456,7 +512,8 @@ export function createV4ReencryptionRecoveryJournal(input: {
       if (state.latest.generation >= Number.MAX_SAFE_INTEGER) invalid()
       return save(state.latest.generation + 1, state.latest.receipts, state.latest.pendingIntents,
         [...state.latest.pendingRefIntents, { ...intent }], state.latest.verifiedRefObservations,
-        state.latest.stageHandoffStarted, state.latest.candidatePreparationSha256)
+        state.latest.stageHandoffStarted, state.latest.candidatePreparationSha256,
+        state.latest.preparedCandidateReceipt)
     }),
     markRefReadbackObserved: (intent: V4ReencryptionRefIntent, expectedGeneration: number) => locked(async () => {
       assertRefIntent(intent, input.sourceCommitSha, input.destinationRepoId)
@@ -476,7 +533,7 @@ export function createV4ReencryptionRecoveryJournal(input: {
       return save(state.latest.generation + 1, state.latest.receipts, state.latest.pendingIntents,
         state.latest.pendingRefIntents.filter(r => r.role !== intent.role),
         [...state.latest.verifiedRefObservations, { ...intent }], state.latest.stageHandoffStarted,
-        state.latest.candidatePreparationSha256)
+        state.latest.candidatePreparationSha256, state.latest.preparedCandidateReceipt)
     }),
   })
 }

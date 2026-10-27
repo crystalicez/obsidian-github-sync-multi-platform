@@ -180,6 +180,11 @@ const destinationIntent = {
   treeSha: "e".repeat(40),
   manifestSha256: "f".repeat(64),
 };
+const candidateReceipt = {
+  commitSha: destinationIntent.commitSha,
+  treeSha: destinationIntent.treeSha,
+  manifestSha256: destinationIntent.manifestSha256,
+};
 
 test("D101 encrypted two-slot WAL persists BOTH Git ref create-intents through restart with exact SHA/tree identity", async () => {
   const adapter = new MemoryAdapter();
@@ -212,6 +217,7 @@ test("D101 encrypted two-slot WAL persists BOTH Git ref create-intents through r
   const upload = await journal.recordUploadIntent(receipt(1), snap.generation);
   snap = await journal.appendReceipt(receipt(1), upload.generation);
   snap = await journal.recordCandidatePreparationIntent("1".repeat(64), snap.generation);
+  snap = await journal.recordPreparedCandidateReceipt(candidateReceipt, snap.generation);
   snap = await journal.recordRefIntent(destinationIntent, snap.generation);
   assert.deepEqual(snap.pendingRefIntents, [destinationIntent]);
   assert.equal(snap.permissionToPublish, false);
@@ -239,6 +245,7 @@ test("D110 encrypted destination WAL refuses an unbound or malformed candidate m
   state = await journal.markRefReadbackObserved(backupIntent, state.generation)
   state = await journal.recordStagingHandoff(backupIntent, state.generation)
   state = await journal.recordCandidatePreparationIntent("1".repeat(64), state.generation)
+  state = await journal.recordPreparedCandidateReceipt(candidateReceipt, state.generation)
   const original = new Map(adapter.files)
   for (const value of [undefined, "HEAD", "a".repeat(63), "G".repeat(64)]) {
     await assert.rejects(() => journal.recordRefIntent({
@@ -295,6 +302,7 @@ test("D101 WAL torn destination ref intent never grants retry, reuse, publicatio
   snap = await journal.markRefReadbackObserved(backupIntent, snap.generation);
   snap = await journal.recordStagingHandoff(backupIntent, snap.generation);
   snap = await journal.recordCandidatePreparationIntent("1".repeat(64), snap.generation);
+  snap = await journal.recordPreparedCandidateReceipt(candidateReceipt, snap.generation);
   adapter.tear = true;
   await assert.rejects(() => journal.recordRefIntent(destinationIntent, snap.generation), /torn destination WAL write/i);
   adapter.tear = false;
@@ -372,6 +380,42 @@ test("D104 one-time Backup-to-Staging WAL handoff survives restart even with ZER
   /already started|stale/i);
   assert.equal((await journal.load())?.generation, restarted.generation);
 });
+
+test("D112 prepared candidate receipt is one-shot and binds Commit/Tree/manifest before Destination ref", async () => {
+  const adapter = new MemoryAdapter()
+  let journal = create(adapter)
+  let state = await journal.begin()
+  state = await journal.recordRefIntent(backupIntent, state.generation)
+  state = await journal.markRefReadbackObserved(backupIntent, state.generation)
+  state = await journal.recordStagingHandoff(backupIntent, state.generation)
+  state = await journal.recordCandidatePreparationIntent("1".repeat(64), state.generation)
+  const original = new Map(adapter.files)
+  await assert.rejects(() => journal.recordRefIntent(destinationIntent, state.generation), /candidate receipt/i)
+  await assert.rejects(() => journal.recordPreparedCandidateReceipt({
+    ...candidateReceipt, treeSha: "not-a-git-sha",
+  }, state.generation), V4ReencryptionJournalRecoveryRequiredError)
+  assert.deepEqual(adapter.files, original)
+  state = await journal.recordPreparedCandidateReceipt(candidateReceipt, state.generation)
+  assert.deepEqual(state.preparedCandidateReceipt, candidateReceipt)
+  assert.equal(state.cutoverAuthorized, false)
+  const raw = [...adapter.files.values()].join("")
+  assert.ok(!raw.includes(candidateReceipt.manifestSha256))
+  journal = create(adapter)
+  const restarted = await journal.load()
+  assert.ok(restarted)
+  assert.deepEqual(restarted.preparedCandidateReceipt, candidateReceipt)
+  await assert.rejects(() => journal.recordPreparedCandidateReceipt(candidateReceipt, restarted.generation), /prepared receipt/i)
+  await assert.rejects(() => journal.recordRefIntent({
+    ...destinationIntent, treeSha: "c".repeat(40),
+  }, restarted.generation), /exact independently observed candidate receipt/i)
+  await assert.rejects(() => journal.recordRefIntent({
+    ...destinationIntent, manifestSha256: "a".repeat(64),
+  }, restarted.generation), /exact independently observed candidate receipt/i)
+  state = await journal.recordRefIntent(destinationIntent, restarted.generation)
+  assert.deepEqual(state.preparedCandidateReceipt, candidateReceipt)
+  assert.deepEqual(state.pendingRefIntents, [destinationIntent])
+  assert.equal(state.permissionToPublish, false)
+})
 
 test("D111 one-shot candidate preparation WAL marker survives restart and blocks any further ciphertext staging", async () => {
   const adapter = new MemoryAdapter()
@@ -462,6 +506,7 @@ test("D108 low-level WAL rejects blob uploads and destination intent before one-
   snapshot = await journal.recordStagingHandoff(backupIntent, snapshot.generation);
   assert.equal(snapshot.stageHandoffStarted, true);
   snapshot = await journal.recordCandidatePreparationIntent("1".repeat(64), snapshot.generation);
+  snapshot = await journal.recordPreparedCandidateReceipt(candidateReceipt, snapshot.generation);
   snapshot = await journal.recordRefIntent(destinationIntent, snapshot.generation);
   assert.deepEqual(snapshot.pendingRefIntents, [destinationIntent]);
   assert.equal(snapshot.permissionToPublish, false);

@@ -233,6 +233,24 @@ export async function prepareV4JournaledOrphanCandidate(
     ...input, assertExclusiveMigrationLease: assertSealed,
   })
   await assertSealed()
+  const preparedReceipt = {
+    commitSha: prepared.commitSha,
+    treeSha: prepared.treeSha,
+    manifestSha256: computeV4ReencryptionCandidateManifestDigest({
+      prepared, sourceTreeSha: input.sourceTreeSha,
+      destinationConfig: input.destinationConfig,
+      expectedRecords: staged.records, expectedReceipts: staged.receipts,
+    }),
+  }
+  const observed = await input.journal.recordPreparedCandidateReceipt(preparedReceipt, recorded.generation)
+  await hold(input.wal, input.signal)
+  await input.journal.assertHealthySnapshot(observed.generation)
+  if (observed.preparedCandidateReceipt?.commitSha !== preparedReceipt.commitSha
+    || observed.preparedCandidateReceipt.treeSha !== preparedReceipt.treeSha
+    || observed.preparedCandidateReceipt.manifestSha256 !== preparedReceipt.manifestSha256
+    || observed.cutoverAuthorized !== false) {
+    throw new Error("Re-encryption orphan candidate WAL receipt did not preserve the verified commit/tree.")
+  }
   return prepared
 }
 
@@ -460,6 +478,17 @@ export async function reconcileV4PendingOrphanWithJournal(
   if (starting.candidatePreparationSha256 !== candidateDigest) {
     throw new Error("Re-encryption destination recovery has a mismatched one-shot candidate preparation WAL intent.")
   }
+  const completed = starting.preparedCandidateReceipt
+  const expectedManifest = computeV4ReencryptionCandidateManifestDigest({
+    prepared, sourceTreeSha: input.sourceTreeSha,
+    destinationConfig: input.expectedDestinationConfig,
+    expectedRecords: input.expectedRecords, expectedReceipts: input.expectedReceipts,
+  })
+  if (!completed || completed.commitSha !== prepared.commitSha
+    || completed.treeSha !== prepared.treeSha
+    || completed.manifestSha256 !== expectedManifest) {
+    throw new Error("Re-encryption destination recovery requires the exact sealed candidate prepared receipt.")
+  }
   await input.journal.assertHealthySnapshot(starting.generation)
   await checkBackup()
   const full = await inspectV4ReencryptionOrphanAfterAmbiguousPublication({
@@ -554,6 +583,12 @@ export async function publishV4JournaledThreeBranchDestination(
       expectedRecords: input.expectedRecords, expectedReceipts: input.expectedReceipts,
     }),
   })
+  const completed = starting.preparedCandidateReceipt
+  if (!completed || completed.commitSha !== intent.commitSha
+    || completed.treeSha !== intent.treeSha
+    || completed.manifestSha256 !== intent.manifestSha256) {
+    throw new Error("Re-encryption destination publication requires the exact sealed candidate prepared receipt.")
+  }
   const recorded = await persistExactIntent(input, intent)
   const result = await publishV4ThreeBranchDestinationAfterBackup({
     github: input.github, plan, backupPlan, createdAndVerifiedBackup,

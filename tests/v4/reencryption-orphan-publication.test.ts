@@ -8,6 +8,7 @@ import { proposeV4SameRepositoryReencryptionBackupBranch } from "../../src/lib/v
 import {
   prepareV4ReencryptionOrphanCommit,
   publishV4ReencryptionOrphanRef,
+  type V4PreparedOrphanCommit,
 } from "../../src/lib/v4/reencryption-orphan-publication"
 import { V4StorageCodec } from "../../src/lib/v4/storage-codec"
 import { verifyV4ReencryptionDestinationExactCommit } from "../../src/lib/v4/reencryption-destination-exact-commit"
@@ -852,7 +853,7 @@ test("D110 recovery refuses changed manifest/KDF/receipt even with exact pinned 
   for (const mutation of ["record", "receipt", "config"] as const) {
     const f = await fixture()
     const prepared = await prepareV4ReencryptionOrphanCommit(f.input)
-    const j = await D102DestinationJournal(f.input.staged.receipts, f.input.staged.records, f.input.destinationConfig)
+    const j = await D102DestinationJournal(f.input.staged.receipts, f.input.staged.records, f.input.destinationConfig, true, prepared)
     let state = (await j.journal.load())!
     state = await j.journal.recordRefIntent({
       role: "destination", repoId: targetId,
@@ -893,6 +894,7 @@ async function D102DestinationJournal(
   records: readonly V4IndexFileRecord[],
   destinationConfig: V4RemoteConfig,
   sealCandidate = true,
+  prepared?: V4PreparedOrphanCommit,
 ) {
   const files = new Map<string, string>()
   const adapter: V4LocalIndexAdapter = {
@@ -924,6 +926,7 @@ async function D102DestinationJournal(
     snapshot = await journal.appendReceipt(receipt, snapshot.generation)
   }
   if (sealCandidate) {
+    if (!prepared) throw new Error("Test fixture requires exact prepared candidate proof.")
     snapshot = await journal.recordCandidatePreparationIntent(
       computeV4ReencryptionPreparationDigest({
         sourceCommitSha: sourceSha, sourceTreeSha,
@@ -932,6 +935,13 @@ async function D102DestinationJournal(
         deviceId: "device-D96", journalId: "rekey-D96", createdAt: 1234567,
         expectedRecords: records, expectedReceipts: receipts,
       }), snapshot.generation)
+    snapshot = await journal.recordPreparedCandidateReceipt({
+      commitSha: prepared.commitSha, treeSha: prepared.treeSha,
+      manifestSha256: computeV4ReencryptionCandidateManifestDigest({
+        prepared, sourceTreeSha, destinationConfig,
+        expectedRecords: records, expectedReceipts: receipts,
+      }),
+    }, snapshot.generation)
   }
   const wal = {
     async assertExclusiveStageLease() {},
@@ -987,6 +997,10 @@ test("D111 one-shot candidate preparation persists WAL BEFORE Git metadata/tree/
     deviceId: f.input.deviceId, journalId: f.input.journalId, createdAt: f.input.createdAt,
     expectedRecords: f.input.staged.records, expectedReceipts: f.input.staged.receipts,
   }))
+  assert.deepEqual(restarted.preparedCandidateReceipt, {
+    commitSha: prepared.commitSha, treeSha: prepared.treeSha,
+    manifestSha256: D110manifestDigest(f, prepared),
+  })
   assert.equal(restarted.permissionToPublish, false)
   assert.equal(restarted.cutoverAuthorized, false)
   const mutationCount = f.mutationCount
@@ -994,6 +1008,36 @@ test("D111 one-shot candidate preparation persists WAL BEFORE Git metadata/tree/
     ...f.input, journal: j.open(), wal: j.wal,
   }), /one-shot preparation/i)
   assert.equal(f.mutationCount, mutationCount)
+})
+
+test("D112 failed post-commit WAL receipt leaves sealed preparation but cannot create Destination branch", async () => {
+  const f = await fixture()
+  const j = await D102DestinationJournal(f.input.staged.receipts, f.input.staged.records, f.input.destinationConfig, false)
+  const brokenJournal = {
+    ...j.journal,
+    async recordPreparedCandidateReceipt() {
+      throw new Error("Post-commit WAL receipt persist failed")
+    },
+  }
+  await assert.rejects(() => prepareV4JournaledOrphanCandidate({
+    ...f.input, journal: brokenJournal, wal: j.wal,
+  }), /Post-commit WAL receipt persist failed/i)
+  assert.ok(f.calls.includes("commit-create"))
+  assert.equal(f.calls.filter(c => c === "ref-create").length, 0)
+  const state = await j.open().load()
+  assert.ok(state)
+  assert.match(state.candidatePreparationSha256 ?? "", /^[0-9a-f]{64}$/u)
+  assert.equal(state.preparedCandidateReceipt, null)
+  assert.equal(state.cutoverAuthorized, false)
+  await assert.rejects(() => j.journal.recordRefIntent({
+    role: "destination", repoId: targetId, commitSha: candidateSha,
+    treeSha: candidateTreeSha, manifestSha256: "a".repeat(64),
+  }, state.generation), /candidate receipt/i)
+  const originalMutations = f.mutationCount
+  await assert.rejects(() => prepareV4JournaledOrphanCandidate({
+    ...f.input, journal: j.open(), wal: j.wal,
+  }), /one-shot preparation/i)
+  assert.equal(f.mutationCount, originalMutations)
 })
 
 test("D111 WAL durability failure AFTER sealed candidate intent blocks ALL metadata Git writes and replay", async () => {
@@ -1142,7 +1186,7 @@ test("D111 publishing Destination refuses an unsealed candidate even when ref an
 test("D102 WAL-bound 3-branch publication requires persisted blob receipts and records verified Destination ref", async () => {
   const f = await fixture()
   const prepared = await prepareV4ReencryptionOrphanCommit(f.input)
-  const j = await D102DestinationJournal(f.input.staged.receipts, f.input.staged.records, f.input.destinationConfig)
+  const j = await D102DestinationJournal(f.input.staged.receipts, f.input.staged.records, f.input.destinationConfig, true, prepared)
   const result = await publishV4JournaledThreeBranchDestination({
     ...D100input(f, prepared), journal: j.journal, wal: j.wal,
   })
@@ -1176,7 +1220,7 @@ test("D102 WAL-bound 3-branch publication requires persisted blob receipts and r
 test("D102 refuses Destination mutation if encrypted WAL is missing even one staged object receipt", async () => {
   const f = await fixture()
   const prepared = await prepareV4ReencryptionOrphanCommit(f.input)
-  const j = await D102DestinationJournal([], f.input.staged.records, f.input.destinationConfig)
+  const j = await D102DestinationJournal([], f.input.staged.records, f.input.destinationConfig, false)
   await assert.rejects(() => publishV4JournaledThreeBranchDestination({
     ...D100input(f, prepared), journal: j.journal, wal: j.wal,
   }), /staged blob receipts/i)
@@ -1187,7 +1231,7 @@ test("D102 refuses Destination mutation if encrypted WAL is missing even one sta
 test("D102 fails closed for unsupported Windows WAL durability before Destination ref intent", async () => {
   const f = await fixture()
   const prepared = await prepareV4ReencryptionOrphanCommit(f.input)
-  const j = await D102DestinationJournal(f.input.staged.receipts, f.input.staged.records, f.input.destinationConfig)
+  const j = await D102DestinationJournal(f.input.staged.receipts, f.input.staged.records, f.input.destinationConfig, true, prepared)
   await assert.rejects(() => publishV4JournaledThreeBranchDestination({
     ...D100input(f, prepared), journal: j.journal,
     wal: {
@@ -1202,7 +1246,7 @@ test("D102 fails closed for unsupported Windows WAL durability before Destinatio
 test("D102 ambiguous Destination network result with unreadable GitHub leaves exact pending WAL for manual recovery", async () => {
   const f = await fixture()
   const prepared = await prepareV4ReencryptionOrphanCommit(f.input)
-  const j = await D102DestinationJournal(f.input.staged.receipts, f.input.staged.records, f.input.destinationConfig)
+  const j = await D102DestinationJournal(f.input.staged.receipts, f.input.staged.records, f.input.destinationConfig, true, prepared)
   const original = f.github.createGitRef
   f.github.createGitRef = async sha => {
     try { await original(sha) }
@@ -1238,7 +1282,7 @@ function D103originalProof(f: Awaited<ReturnType<typeof fixture>>) {
 test("D103 Destination lost POST/GET recovered after restart by read-only Git+new-key full verification", async () => {
   const f = await fixture()
   const prepared = await prepareV4ReencryptionOrphanCommit(f.input)
-  const j = await D102DestinationJournal(f.input.staged.receipts, f.input.staged.records, f.input.destinationConfig)
+  const j = await D102DestinationJournal(f.input.staged.receipts, f.input.staged.records, f.input.destinationConfig, true, prepared)
   const originalGet = f.github.getGitRefOrNull
   const originalCreate = f.github.createGitRef
   f.github.createGitRef = async sha => {
@@ -1281,7 +1325,7 @@ test("D103 Destination lost POST/GET recovered after restart by read-only Git+ne
 test("D103 incomplete/moved Destination readback keeps WAL pending and never retries GitHub POST", async () => {
   const f = await fixture()
   const prepared = await prepareV4ReencryptionOrphanCommit(f.input)
-  const j = await D102DestinationJournal(f.input.staged.receipts, f.input.staged.records, f.input.destinationConfig)
+  const j = await D102DestinationJournal(f.input.staged.receipts, f.input.staged.records, f.input.destinationConfig, true, prepared)
   let state = (await j.journal.load())!
   state = await j.journal.recordRefIntent({
     role: "destination", repoId: targetId,

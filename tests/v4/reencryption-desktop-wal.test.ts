@@ -83,6 +83,10 @@ test("D103 real Node OS filesystem persists encrypted Backup + Destination ref i
     state = await journal.markRefReadbackObserved(backup, state.generation)
     state = await journal.recordStagingHandoff(backup, state.generation)
     state = await journal.recordCandidatePreparationIntent("1".repeat(64), state.generation)
+    state = await journal.recordPreparedCandidateReceipt({
+      commitSha: destination.commitSha, treeSha: destination.treeSha,
+      manifestSha256: destination.manifestSha256,
+    }, state.generation)
     state = await journal.recordRefIntent(destination, state.generation)
     const storedBytes = [
       await readFile(join(t.root, "rekey", "wal", "slot-0.json"), "utf8"),
