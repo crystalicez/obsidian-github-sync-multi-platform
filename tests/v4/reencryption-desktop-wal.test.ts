@@ -135,6 +135,64 @@ test("D126 real Windows WAL lease serializes two journal instances sharing its l
   }
 })
 
+test("D127 cannot release the WAL lease while an adapter write is still in flight", async () => {
+  const t = await sandbox()
+  try {
+    const storage = await acquireV4DesktopRekeyWalStorage({ rootAbsolute: t.root, journalRoot })
+    let released = false
+    try {
+      const initial = await makeJournal(storage.adapter).begin()
+      const logical = journalRoot + "/slot-1.json"
+      const encrypted = await storage.adapter.read(logical)
+      // Start a real Windows filesystem write but deliberately do NOT await
+      // its first asynchronous lease/inode checks before trying release().
+      const pendingWrite = storage.adapter.write(logical, encrypted)
+      const releaseAfterDrain = storage.release()
+      await assert.rejects(() => storage.adapter.exists(logical), V4DesktopRekeyWalLockError,
+        "once release begins, new work must be refused until old I/O drains")
+      await pendingWrite
+      await releaseAfterDrain
+      released = true
+      const reopened = await acquireV4DesktopRekeyWalStorage({ rootAbsolute: t.root, journalRoot })
+      try {
+        assert.equal((await makeJournal(reopened.adapter).assertHealthySnapshot(initial.generation)).generation,
+          initial.generation)
+      } finally {
+        await reopened.release()
+      }
+    } finally {
+      if (!released) {
+        try { await storage.release() } catch { /* preserve failure evidence on disposal */ }
+      }
+    }
+  } finally {
+    await t.cleanup()
+  }
+})
+
+test("D127 two concurrent release calls cannot both unlink one WAL lease", async () => {
+  const t = await sandbox()
+  try {
+    const storage = await acquireV4DesktopRekeyWalStorage({ rootAbsolute: t.root, journalRoot })
+    const initial = await makeJournal(storage.adapter).begin()
+    const firstRelease = storage.release()
+    await assert.rejects(() => storage.release(), V4DesktopRekeyWalLockError)
+    await assert.rejects(() => storage.adapter.exists(journalRoot + "/slot-1.json"),
+      V4DesktopRekeyWalLockError, "no new adapter work after release began")
+    await firstRelease
+    await assert.rejects(() => storage.release(), V4DesktopRekeyWalLockError)
+    const reopened = await acquireV4DesktopRekeyWalStorage({ rootAbsolute: t.root, journalRoot })
+    try {
+      assert.equal((await makeJournal(reopened.adapter).assertHealthySnapshot(initial.generation)).generation,
+        initial.generation)
+    } finally {
+      await reopened.release()
+    }
+  } finally {
+    await t.cleanup()
+  }
+})
+
 test("D86 real disk journal intent+receipt survive new instances and leave no plain receipt", async () => {
   const t = await sandbox()
   try {

@@ -147,6 +147,29 @@ export async function acquireV4DesktopRekeyWalStorage(options: {
   }
 
   let closed = false
+  let releasing = false
+  let activeOperations = 0
+  let finishDrain: (() => void) | undefined
+  // Claim synchronously, before the first fs await. A release must NEVER
+  // unlink its exclusive lock while an adapter read/write is still in flight.
+  const withLiveLease = async <T>(operation: () => Promise<T>): Promise<T> => {
+    if (closed || releasing) throw new V4DesktopRekeyWalLockError()
+    activeOperations++
+    try { return await operation() } finally {
+      activeOperations--
+      if (activeOperations === 0) {
+        const resolve = finishDrain
+        finishDrain = undefined
+        resolve?.()
+      }
+    }
+  }
+  const drainActiveOperations = async (): Promise<void> => {
+    if (activeOperations === 0) return
+    // Releasing is already true; no new operations may enter. Wait for any
+    // reads/writes still active after a Promise.all fail-fast rejection.
+    await new Promise<void>(resolve => { finishDrain = resolve })
+  }
   const directorySyncProof = new V4RekeyWalDirectorySyncProof()
   // WAL directory creation changes PARENT directory entries. Fsyncing only
   // the WAL leaf cannot prove that newly created parents survive power loss.
@@ -243,7 +266,7 @@ export async function acquireV4DesktopRekeyWalStorage(options: {
       throw error
     }
   }
-  const adapter: V4LocalIndexAdapter = Object.freeze({
+  const rawAdapter: V4LocalIndexAdapter = Object.freeze({
     async exists(logical: string) {
       const filename = slotPath(logical)
       await assertHeld()
@@ -318,18 +341,39 @@ export async function acquireV4DesktopRekeyWalStorage(options: {
     },
   })
 
+  // Hide the raw filesystem adapter. Each outward operation holds the live
+  // lease until ALL async I/O (including temporary-file cleanup) finishes.
+  const adapter: V4LocalIndexAdapter = Object.freeze({
+    exists: (logical: string) => withLiveLease(() => rawAdapter.exists(logical)),
+    read: (logical: string) => withLiveLease(() => rawAdapter.read(logical)),
+    mkdir: (logical: string) => withLiveLease(() => rawAdapter.mkdir(logical)),
+    write: (logical: string, value: string) => withLiveLease(() => rawAdapter.write(logical, value)),
+  })
+
   return Object.freeze({
     adapter, lockPath,
-    assertExclusiveStageLease: assertHeld,
-    async assertCrashDurable() {
+    assertExclusiveStageLease: () => withLiveLease(assertHeld),
+    assertCrashDurable: () => withLiveLease(async () => {
       await assertHeld()
       directorySyncProof.assertConfirmed()
-    },
+    }),
     async release() {
-      await assertHeld()
-      closed = true
-      await fs.unlink(lockPath)
-      try { await syncDirectory() } finally { await lockHandle.close() }
+      // Claim release before any await; new operations are now forbidden.
+      // Retain the OS lock while earlier I/O drains, including sibling reads
+      // still running after a fail-fast Promise.all rejected elsewhere.
+      if (closed || releasing) {
+        throw new V4DesktopRekeyWalLockError("Re-encryption Desktop WAL lease is already releasing or released.")
+      }
+      releasing = true
+      try {
+        await drainActiveOperations()
+        await assertHeld()
+        await fs.unlink(lockPath)
+        closed = true
+        try { await syncDirectory() } finally { await lockHandle.close() }
+      } finally {
+        releasing = false
+      }
     },
   })
 }
