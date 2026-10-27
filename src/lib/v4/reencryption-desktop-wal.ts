@@ -28,6 +28,44 @@ const SAFE_DIR = /^[a-zA-Z0-9_-]{1,64}$/u
 const DENIED_WINDOWS_NAMES = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])$/iu
 const SYNC_UNSUPPORTED = new Set(["EPERM", "EACCES", "EINVAL", "ENOTSUP", "EISDIR"])
 
+/**
+ * Each WAL rename changes the leaf directory. A previous successful fsync
+ * must NEVER certify a later rename whose fsync throws before completion.
+ * Kept independently testable so exceptional I/O outcomes cannot leave a
+ * stale-positive durability claim.
+ */
+export class V4RekeyWalDirectorySyncProof {
+  private confirmed = false
+  private latestAttempt = 0
+  private activeSyncs = 0
+  private overlapObserved = false
+
+  async refresh(parentSyncConfirmed: boolean, syncLeaf: () => Promise<boolean>): Promise<void> {
+    const attempt = ++this.latestAttempt
+    this.confirmed = false
+    this.activeSyncs++
+    if (this.activeSyncs > 1) this.overlapObserved = true
+    try {
+      const leafSynced = await syncLeaf()
+      // An overlapping or older completion cannot vouch for all later WAL
+      // renames. Require a fresh, nonoverlapping sync before declaring durable.
+      this.confirmed = attempt === this.latestAttempt
+        && this.activeSyncs === 1 && !this.overlapObserved
+        && parentSyncConfirmed && leafSynced
+    } finally {
+      this.activeSyncs--
+      if (this.activeSyncs > 0) this.confirmed = false
+      else this.overlapObserved = false
+    }
+  }
+
+  assertConfirmed(): void {
+    if (!this.confirmed) {
+      throw new Error("Re-encryption Desktop WAL directory fsync is not supported; crash durability is unproven.")
+    }
+  }
+}
+
 function validRelativeRoot(root: string): readonly string[] {
   const parts = root.split("/")
   if (parts.length < 2 || parts.length > 8
@@ -109,7 +147,7 @@ export async function acquireV4DesktopRekeyWalStorage(options: {
   }
 
   let closed = false
-  let directorySyncConfirmed = false
+  const directorySyncProof = new V4RekeyWalDirectorySyncProof()
   // WAL directory creation changes PARENT directory entries. Fsyncing only
   // the WAL leaf cannot prove that newly created parents survive power loss.
   // The trusted root is pre-existing; sync each parent within its boundary
@@ -137,8 +175,7 @@ export async function acquireV4DesktopRekeyWalStorage(options: {
     return true
   }
   const syncDirectory = async (): Promise<void> => {
-    const leafSynced = await syncOneDirectory(directory)
-    directorySyncConfirmed = ancestorSyncConfirmed && leafSynced
+    await directorySyncProof.refresh(ancestorSyncConfirmed, () => syncOneDirectory(directory))
   }
   const assertHeld = async (): Promise<void> => {
     if (closed) throw new V4DesktopRekeyWalLockError("Re-encryption Desktop WAL lease already released.")
@@ -286,9 +323,7 @@ export async function acquireV4DesktopRekeyWalStorage(options: {
     assertExclusiveStageLease: assertHeld,
     async assertCrashDurable() {
       await assertHeld()
-      if (!directorySyncConfirmed) {
-        throw new Error("Re-encryption Desktop WAL directory fsync is not supported; crash durability is unproven.")
-      }
+      directorySyncProof.assertConfirmed()
     },
     async release() {
       await assertHeld()

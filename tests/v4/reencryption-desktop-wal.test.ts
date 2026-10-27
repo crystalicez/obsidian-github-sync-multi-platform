@@ -5,7 +5,7 @@ import { link, mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } from 
 import { join } from "node:path"
 
 import { createV4ReencryptionRecoveryJournal } from "../../src/lib/v4/reencryption-recovery-journal"
-import { acquireV4DesktopRekeyWalStorage, V4DesktopRekeyWalLockError } from "../../src/lib/v4/reencryption-desktop-wal"
+import { acquireV4DesktopRekeyWalStorage, V4DesktopRekeyWalLockError, V4RekeyWalDirectorySyncProof } from "../../src/lib/v4/reencryption-desktop-wal"
 
 const pinned = "a".repeat(40)
 const dest = "owner/repo#rekey/d86"
@@ -29,6 +29,80 @@ async function sandbox() {
   const root = await mkdtemp(join(testRoot, "d86-desktop-wal-"))
   return { root, async cleanup() { await rm(root, { recursive: true, force: true }) } }
 }
+
+test("D119 a failed WAL leaf fsync revokes earlier confirmed crash durability before propagating", async () => {
+  const proof = new V4RekeyWalDirectorySyncProof()
+  assert.throws(() => proof.assertConfirmed(), /fsync|durability/i)
+  let calls = 0
+  const successfulSync = async () => { calls += 1; return true }
+  await proof.refresh(true, successfulSync)
+  proof.assertConfirmed()
+  await assert.rejects(
+    () => proof.refresh(true, async () => {
+      calls += 1
+      throw Object.assign(new Error("simulated disk I/O fault"), { code: "EIO" })
+    }),
+    /simulated disk I\/O fault/,
+  )
+  assert.throws(() => proof.assertConfirmed(), /fsync|durability/i,
+    "the prior successful leaf fsync cannot certify a later failed rename")
+  await proof.refresh(true, async () => false)
+  assert.throws(() => proof.assertConfirmed(), /fsync|durability/i)
+  await proof.refresh(false, successfulSync)
+  assert.throws(() => proof.assertConfirmed(), /fsync|durability/i,
+    "even a successful leaf fsync cannot overcome missing parent durability")
+  await proof.refresh(true, successfulSync)
+  proof.assertConfirmed()
+  assert.equal(calls, 4)
+})
+
+test("D119 consecutive concurrent directory sync attempts cannot retain stale-positive evidence", async () => {
+  const proof = new V4RekeyWalDirectorySyncProof()
+  await proof.refresh(true, async () => true)
+  proof.assertConfirmed()
+  let rejectPending: (error: Error) => void = () => {
+    throw new Error("fault injector not armed")
+  }
+  const fault = new Promise<boolean>((_resolve, reject) => {
+    rejectPending = reject
+  })
+  const refreshing = proof.refresh(true, () => fault)
+  assert.throws(() => proof.assertConfirmed(), /fsync|durability/i,
+    "a pending flush invalidates the old proof immediately")
+  rejectPending(new Error("simulated async directory flush failure"))
+  await assert.rejects(refreshing, /async directory flush failure/)
+  assert.throws(() => proof.assertConfirmed(), /fsync|durability/i)
+})
+
+test("D119 overlapping leaf flushes fail closed in either completion order until a fresh serialized flush", async () => {
+  for (const resolveNewestFirst of [true, false]) {
+    const proof = new V4RekeyWalDirectorySyncProof()
+    let completeOld: (value: boolean) => void = () => { throw new Error("old unresolved") }
+    let completeNew: (value: boolean) => void = () => { throw new Error("new unresolved") }
+    const oldPromise = new Promise<boolean>(resolve => { completeOld = resolve })
+    const newPromise = new Promise<boolean>(resolve => { completeNew = resolve })
+    const oldFlush = proof.refresh(true, () => oldPromise)
+    const newFlush = proof.refresh(true, () => newPromise)
+    assert.throws(() => proof.assertConfirmed(), /fsync|durability/i)
+    if (resolveNewestFirst) {
+      completeNew(true)
+      await newFlush
+      assert.throws(() => proof.assertConfirmed(), /fsync|durability/i)
+      completeOld(true)
+      await oldFlush
+    } else {
+      completeOld(true)
+      await oldFlush
+      assert.throws(() => proof.assertConfirmed(), /fsync|durability/i)
+      completeNew(true)
+      await newFlush
+    }
+    assert.throws(() => proof.assertConfirmed(), /fsync|durability/i,
+      "overlapping fsyncs cannot certify WAL rename ordering")
+    await proof.refresh(true, async () => true)
+    proof.assertConfirmed()
+  }
+})
 
 test("D86 real disk journal intent+receipt survive new instances and leave no plain receipt", async () => {
   const t = await sandbox()
