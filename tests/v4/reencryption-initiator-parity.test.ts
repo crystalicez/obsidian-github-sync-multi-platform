@@ -122,6 +122,58 @@ test("D105 unexpected local addition, missing file or size drift refuses migrati
   }
 })
 
+test("D123 remote source record SHA mutation during async inventory cannot redefine trusted evidence", async () => {
+  const f = await fixture(["notes/a.md"])
+  const original = f.files.get("notes/a.md")!
+  const tamperedBytes = utf8ToBytes("X".repeat(original.bytes.length))
+  const tamperedSha = await sha256Hex(tamperedBytes)
+  let changed = false
+  f.setOnList(() => {
+    if (changed) return
+    changed = true
+    // Simulate a mutable source index object being changed after the
+    // synchronous authentication/size preflight but before disk hashing.
+    f.files.set("notes/a.md", { bytes: tamperedBytes, mtime: original.mtime })
+    ;(f.input.sourceRecords[0] as { plaintextSha256: string }).plaintextSha256 = tamperedSha
+  })
+  await assert.rejects(
+    () => verifyV4ReencryptionInitiatorLocalParity(f.input),
+    /SHA-256|source record|changed/i,
+    "the authenticated SHA must be captured before awaits, not reread from a mutable index object",
+  )
+  assert.equal(changed, true)
+})
+
+test("D123 reused mutable inventory entries cannot conceal a post-hash edit", async () => {
+  const f = await fixture(["notes/a.md"])
+  const original = f.files.get("notes/a.md")!
+  const sharedEntry = { path: "notes/a.md", size: original.bytes.length, mtime: original.mtime }
+  let enumerations = 0
+  const reader = {
+    ...f.input.reader,
+    async listFiles() {
+      enumerations++
+      if (enumerations === 3) {
+        // The final physical inventory query races a new write AFTER the
+        // second full SHA pass. This adapter returns a reused metadata
+        // object, so old snapshots must not alias its updated mtime.
+        f.files.set("notes/a.md", {
+          bytes: utf8ToBytes("X".repeat(original.bytes.length)),
+          mtime: original.mtime + 1,
+        })
+        sharedEntry.mtime += 1
+      }
+      return [sharedEntry]
+    },
+  }
+  await assert.rejects(
+    () => verifyV4ReencryptionInitiatorLocalParity({ ...f.input, reader }),
+    /changed during|SHA-256/i,
+    "a later mtime update must not retroactively alter the earlier inventory snapshot",
+  )
+  assert.equal(enumerations, 3)
+})
+
 test("D105 same-size same-mtime unsynced edit is detected by SHA-256, not stat heuristics", async () => {
   const f = await fixture()
   const old = f.files.get("notes/a.md")!

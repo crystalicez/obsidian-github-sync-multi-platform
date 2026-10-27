@@ -65,7 +65,15 @@ export async function verifyV4ReencryptionInitiatorLocalParity(
   input: V4ReencryptionInitiatorParityInput,
 ): Promise<V4ReencryptionInitiatorParityReport> {
   throwIfV4Aborted(input.signal)
-  const { verifiedSource, reader, sourceRecords, pinnedSourceCommitSha } = input
+  const { reader, pinnedSourceCommitSha } = input
+  // Capture authenticated remote evidence by VALUE before the first await.
+  // Readonly TypeScript annotations are not runtime immutability: a caller
+  // holding an index record could otherwise replace its SHA during parity.
+  const verifiedSource = input.verifiedSource
+    ? Object.freeze({ ...input.verifiedSource }) : input.verifiedSource
+  const sourceRecords = Array.isArray(input.sourceRecords)
+    ? input.sourceRecords.map(record => record ? Object.freeze({ ...record }) : record)
+    : input.sourceRecords
   if (!GIT_SHA.test(pinnedSourceCommitSha)
     || verifiedSource?.integrityScope !== "all-live-objects"
     || verifiedSource.pinnedSourceCommitSha !== pinnedSourceCommitSha
@@ -150,7 +158,12 @@ export async function verifyV4ReencryptionInitiatorLocalParity(
       if (!remote || remote.size !== file.size) {
         throw new Error("Re-encryption initiator contains an unexpected, missing, or changed local file.")
       }
-      map.set(file.path, file)
+      // The reader is permitted to reuse mutable metadata objects between
+      // listFiles calls. Capture this inventory's primitive values by copy;
+      // otherwise a late update could retroactively mutate 'start' too.
+      map.set(file.path, Object.freeze({
+        path: file.path, size: file.size, mtime: file.mtime,
+      }))
     }
     if (map.size !== expected.size) {
       throw new Error("Re-encryption initiator physical vault has missing remote source files.")
