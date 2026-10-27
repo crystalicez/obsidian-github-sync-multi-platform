@@ -30,6 +30,55 @@ const receipt = (n: number) => ({
   byteLength: 343,
 });
 
+test("D121 rejects successful target write when the older authenticated WAL slot disappears", async () => {
+  const adapter = new MemoryAdapter()
+  const journal = create(adapter)
+  const begun = await journal.begin()
+  let writes = 0
+  adapter.write = async (path: string, value: string) => {
+    writes++
+    adapter.files.set(path, value)
+    const sibling = [...adapter.files.keys()].find(name => name.endsWith("slot-1.json"))
+    assert.ok(sibling)
+    adapter.files.delete(sibling)
+  }
+  await assert.rejects(
+    () => journal.recordUploadIntent(receipt(91), begun.generation),
+    V4ReencryptionJournalRecoveryRequiredError,
+    "new valid WAL generation cannot certify a mutation when its predecessor vanished",
+  )
+  assert.equal(writes, 1)
+  const partial = await create(adapter).load()
+  assert.ok(partial)
+  assert.deepEqual(partial.pendingIntents, [receipt(91)])
+  await assert.rejects(() => create(adapter).assertHealthySnapshot(2),
+    V4ReencryptionJournalRecoveryRequiredError)
+})
+
+test("D121 rejects successful target write when the older WAL slot is corrupted", async () => {
+  const adapter = new MemoryAdapter()
+  const journal = create(adapter)
+  const begun = await journal.begin()
+  adapter.write = async (path: string, value: string) => {
+    adapter.files.set(path, value)
+    const sibling = [...adapter.files.keys()].find(name => name.endsWith("slot-1.json"))
+    assert.ok(sibling)
+    adapter.files.set(sibling, "{damaged predecessor")
+  }
+  await assert.rejects(
+    () => journal.recordUploadIntent(receipt(92), begun.generation),
+    V4ReencryptionJournalRecoveryRequiredError,
+    "a valid newest slot never overrides an unreadable predecessor at write acknowledgment",
+  )
+  const view = await create(adapter).load()
+  assert.ok(view)
+  assert.equal(view.generation, 2)
+  assert.equal(view.requiresRemoteRevalidation, true)
+  assert.equal(view.permissionToPublish, false)
+  await assert.rejects(() => create(adapter).assertHealthySnapshot(2),
+    V4ReencryptionJournalRecoveryRequiredError)
+})
+
 test("D120 rejects authenticated same-generation sibling upload intent returned after write", async () => {
   const base = new MemoryAdapter()
   const beginning = await create(base).begin()

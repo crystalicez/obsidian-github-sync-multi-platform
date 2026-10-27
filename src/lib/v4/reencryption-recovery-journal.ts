@@ -439,6 +439,18 @@ export function createV4ReencryptionRecoveryJournal(input: {
     const expected = snapshot(generation, receipts, pendingIntents, refIntents,
       refReceipts, stageHandoffStarted, candidatePreparationSha256, preparedCandidateReceipt)
     if (!readback.state || JSON.stringify(readback.state) !== JSON.stringify(expected)) invalid()
+    // The write acknowledgment is meaningful only if the alternating older
+    // slot also survived and proves exactly one legitimate WAL transition.
+    // An intact new slot with a missing/torn/replayed predecessor is recovery
+    // evidence, NOT a successfully certified new mutation.
+    const predecessor = await readSlot(1 - generation % 2)
+    if (generation === 1) {
+      if (predecessor.present) invalid()
+    } else if (!predecessor.state
+      || predecessor.state.generation !== generation - 1
+      || !isAdjacentWalTransition(predecessor.state, readback.state)) {
+      invalid()
+    }
     return readback.state
   }
 
