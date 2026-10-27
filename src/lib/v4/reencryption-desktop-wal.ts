@@ -59,6 +59,12 @@ export class V4RekeyWalDirectorySyncProof {
     }
   }
 
+  // Any new WAL mutation invalidates prior fsync evidence synchronously,
+  // BEFORE its first asynchronous filesystem operation or rename.
+  invalidate(): void {
+    this.confirmed = false
+  }
+
   assertConfirmed(): void {
     if (!this.confirmed) {
       throw new Error("Re-encryption Desktop WAL directory fsync is not supported; crash durability is unproven.")
@@ -148,6 +154,7 @@ export async function acquireV4DesktopRekeyWalStorage(options: {
 
   let closed = false
   let releasing = false
+  let writing = false
   let activeOperations = 0
   let finishDrain: (() => void) | undefined
   // Claim synchronously, before the first fs await. A release must NEVER
@@ -347,7 +354,18 @@ export async function acquireV4DesktopRekeyWalStorage(options: {
     exists: (logical: string) => withLiveLease(() => rawAdapter.exists(logical)),
     read: (logical: string) => withLiveLease(() => rawAdapter.read(logical)),
     mkdir: (logical: string) => withLiveLease(() => rawAdapter.mkdir(logical)),
-    write: (logical: string, value: string) => withLiveLease(() => rawAdapter.write(logical, value)),
+    async write(logical: string, value: string) {
+      // A real WAL lease may have multiple consumers. Do not permit direct
+      // adapter callers to race two independent slot renames under that lease.
+      if (writing || closed || releasing) {
+        throw new V4DesktopRekeyWalLockError("Re-encryption Desktop WAL already has an active writer.")
+      }
+      writing = true
+      // A previously fsynced generation cannot certify a newly begun write.
+      directorySyncProof.invalidate()
+      try { await withLiveLease(() => rawAdapter.write(logical, value)) }
+      finally { writing = false }
+    },
   })
 
   return Object.freeze({
@@ -355,6 +373,9 @@ export async function acquireV4DesktopRekeyWalStorage(options: {
     assertExclusiveStageLease: () => withLiveLease(assertHeld),
     assertCrashDurable: () => withLiveLease(async () => {
       await assertHeld()
+      if (writing) {
+        throw new Error("Re-encryption Desktop WAL has an active write; crash durability is unproven.")
+      }
       directorySyncProof.assertConfirmed()
     }),
     async release() {

@@ -56,6 +56,19 @@ test("D119 a failed WAL leaf fsync revokes earlier confirmed crash durability be
   assert.equal(calls, 4)
 })
 
+test("D128 starting another WAL write synchronously revokes previous directory-sync proof", async () => {
+  const proof = new V4RekeyWalDirectorySyncProof()
+  await proof.refresh(true, async () => true)
+  proof.assertConfirmed()
+  proof.invalidate()
+  assert.throws(() => proof.assertConfirmed(), /fsync|durability/i,
+    "previous fsync is not proof for a newly started slot transition")
+  await proof.refresh(true, async () => false)
+  assert.throws(() => proof.assertConfirmed(), /fsync|durability/i)
+  await proof.refresh(true, async () => true)
+  proof.assertConfirmed()
+})
+
 test("D119 consecutive concurrent directory sync attempts cannot retain stale-positive evidence", async () => {
   const proof = new V4RekeyWalDirectorySyncProof()
   await proof.refresh(true, async () => true)
@@ -127,6 +140,35 @@ test("D126 real Windows WAL lease serializes two journal instances sharing its l
       assert.equal(snapshot.requiresRemoteRevalidation, true)
       assert.equal(snapshot.permissionToPublish, false)
       assert.equal(snapshot.cutoverAuthorized, false)
+    } finally {
+      await storage.release()
+    }
+  } finally {
+    await t.cleanup()
+  }
+})
+
+test("D128 real Windows WAL adapter rejects simultaneous writes to distinct WAL slots", async () => {
+  const t = await sandbox()
+  try {
+    const storage = await acquireV4DesktopRekeyWalStorage({ rootAbsolute: t.root, journalRoot })
+    try {
+      const initial = await makeJournal(storage.adapter).begin()
+      const logical = journalRoot + "/slot-1.json"
+      const sealed = await storage.adapter.read(logical)
+      const [first, second] = await Promise.allSettled([
+        storage.adapter.write(logical, sealed),
+        storage.adapter.write(journalRoot + "/slot-0.json", sealed),
+      ])
+      assert.equal(first.status, "fulfilled", "first WAL writer must complete normally")
+      assert.equal(second.status, "rejected",
+        "one WAL lease must not allow two overlapping raw adapter writes")
+      const after = await makeJournal(storage.adapter).assertHealthySnapshot(initial.generation)
+      assert.equal(after.generation, initial.generation)
+      assert.equal(after.permissionToPublish, false)
+      assert.equal(after.cutoverAuthorized, false)
+      assert.deepEqual((await readdir(join(t.root, "rekey", "wal"))).sort(),
+        [".exclusive.lock", "slot-1.json"])
     } finally {
       await storage.release()
     }
