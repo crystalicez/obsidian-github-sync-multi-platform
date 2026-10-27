@@ -1,4 +1,5 @@
 import { throwIfV4Aborted } from "./cancellation"
+import { computeV4ReencryptionCandidateManifestDigest } from "./reencryption-candidate-manifest-digest"
 import type { V4ReencryptionVerifiedSource } from "./reencryption-content-verifier"
 import {
   inspectV4FrozenBackupAfterAmbiguousCreate,
@@ -54,6 +55,7 @@ export interface V4JournaledDestinationPublicationInput
 function sameRef(a: V4ReencryptionRefIntent, b: V4ReencryptionRefIntent): boolean {
   return a.role === b.role && a.repoId === b.repoId
     && a.commitSha === b.commitSha && a.treeSha === b.treeSha
+    && a.manifestSha256 === b.manifestSha256
 }
 
 function findExactRef(
@@ -319,6 +321,11 @@ export async function reconcileV4PendingOrphanWithJournal(
   const intent: V4ReencryptionRefIntent = {
     role: "destination", repoId: plan.destinationRepoId,
     commitSha: prepared.commitSha, treeSha: prepared.treeSha,
+    manifestSha256: computeV4ReencryptionCandidateManifestDigest({
+      prepared, sourceTreeSha: input.sourceTreeSha,
+      destinationConfig: input.expectedDestinationConfig,
+      expectedRecords: input.expectedRecords, expectedReceipts: input.expectedReceipts,
+    }),
   }
   const backupIntent: V4ReencryptionRefIntent = {
     role: "backup", repoId: b.backupRepoId,
@@ -442,6 +449,11 @@ export async function publishV4JournaledThreeBranchDestination(
     repoId: plan.destinationRepoId,
     commitSha: input.prepared.commitSha,
     treeSha: input.prepared.treeSha,
+    manifestSha256: computeV4ReencryptionCandidateManifestDigest({
+      prepared: input.prepared, sourceTreeSha: input.sourceTreeSha,
+      destinationConfig: input.expectedDestinationConfig,
+      expectedRecords: input.expectedRecords, expectedReceipts: input.expectedReceipts,
+    }),
   })
   const recorded = await persistExactIntent(input, intent)
   const result = await publishV4ThreeBranchDestinationAfterBackup({

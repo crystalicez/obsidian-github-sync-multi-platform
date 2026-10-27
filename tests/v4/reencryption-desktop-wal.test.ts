@@ -77,6 +77,7 @@ test("D103 real Node OS filesystem persists encrypted Backup + Destination ref i
     const destination = {
       role: "destination" as const, repoId: dest,
       commitSha: "c".repeat(40), treeSha: "d".repeat(40),
+      manifestSha256: "e".repeat(64),
     }
     state = await journal.recordRefIntent(backup, state.generation)
     state = await journal.markRefReadbackObserved(backup, state.generation)
@@ -90,6 +91,7 @@ test("D103 real Node OS filesystem persists encrypted Backup + Destination ref i
     // Destination repo/branch identity is intentionally stored in the existing authenticated WAL slot header.
     assert.ok(storedBytes.includes(destination.repoId))
     assert.ok(!storedBytes.includes(destination.commitSha))
+    assert.ok(!storedBytes.includes(destination.manifestSha256))
     await store.release()
 
     const reopened = await acquireV4DesktopRekeyWalStorage({ rootAbsolute: t.root, journalRoot })
@@ -97,6 +99,7 @@ test("D103 real Node OS filesystem persists encrypted Backup + Destination ref i
       const recovered = await makeJournal(reopened.adapter).load()
       assert.ok(recovered)
       assert.deepEqual(recovered.pendingRefIntents, [destination])
+      assert.equal(recovered.pendingRefIntents[0]?.manifestSha256, destination.manifestSha256)
       assert.deepEqual(recovered.verifiedRefObservations, [backup])
       assert.equal(recovered.permissionToPublish, false)
       assert.equal(recovered.cutoverAuthorized, false)

@@ -33,6 +33,8 @@ export interface V4ReencryptionRefIntent {
   readonly repoId: string
   readonly commitSha: string
   readonly treeSha: string
+  /** Required ONLY for Destination; binds commit/tree to exact manifest. */
+  readonly manifestSha256?: string
 }
 
 interface Payload {
@@ -108,7 +110,9 @@ function assertRefIntent(value: unknown, sourceCommitSha: string, destinationRep
     || typeof r.commitSha !== "string" || !GIT_SHA.test(r.commitSha)
     || typeof r.treeSha !== "string" || !GIT_SHA.test(r.treeSha)
     || r.repoId.split("#")[0]!.toLowerCase() !== destinationRepoId.split("#")[0]!.toLowerCase()
-    || (r.role === "destination" && (r.repoId !== destinationRepoId || r.commitSha === sourceCommitSha))
+    || (r.role === "destination" && (r.repoId !== destinationRepoId || r.commitSha === sourceCommitSha
+      || typeof r.manifestSha256 !== "string" || !/^[0-9a-f]{64}$/u.test(r.manifestSha256)))
+    || (r.role === "backup" && r.manifestSha256 !== undefined)
     || (r.role === "backup" && (r.repoId === destinationRepoId || r.commitSha !== sourceCommitSha))) {
     invalid()
   }
@@ -125,6 +129,7 @@ function assertRefIntent(value: unknown, sourceCommitSha: string, destinationRep
 function equalRef(a: V4ReencryptionRefIntent, b: V4ReencryptionRefIntent): boolean {
   return a.role === b.role && a.repoId === b.repoId
     && a.commitSha === b.commitSha && a.treeSha === b.treeSha
+    && a.manifestSha256 === b.manifestSha256
 }
 
 function isSlot(value: unknown): value is Slot {

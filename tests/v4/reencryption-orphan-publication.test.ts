@@ -16,6 +16,7 @@ import { publishAndVerifyV4ReencryptionOrphanRef } from "../../src/lib/v4/reencr
 import { publishV4ThreeBranchDestinationAfterBackup } from "../../src/lib/v4/reencryption-three-branch-publish"
 import { publishV4JournaledThreeBranchDestination, reconcileV4PendingOrphanWithJournal } from "../../src/lib/v4/reencryption-ref-journal-coordinator"
 import { createV4ReencryptionRecoveryJournal } from "../../src/lib/v4/reencryption-recovery-journal"
+import { computeV4ReencryptionCandidateManifestDigest } from "../../src/lib/v4/reencryption-candidate-manifest-digest"
 import type { V4LocalIndexAdapter } from "../../src/lib/v4/local-index"
 import type { V4RemoteConfig } from "../../src/lib/v4/protocol-types"
 import type { V4ReencryptionStagingResult } from "../../src/lib/v4/reencryption-staging-receipts"
@@ -800,6 +801,93 @@ test("D100 refuses actual GitHub default-branch drift into the Backup branch", a
   assert.equal(f.calls.filter(x => x === "ref-create").length, 0)
 })
 
+function D110manifestDigest(f: Awaited<ReturnType<typeof fixture>>,
+  prepared: Awaited<ReturnType<typeof prepareV4ReencryptionOrphanCommit>>) {
+  const input = D100input(f, prepared)
+  return computeV4ReencryptionCandidateManifestDigest({
+    prepared, sourceTreeSha: input.sourceTreeSha,
+    destinationConfig: input.expectedDestinationConfig,
+    expectedRecords: input.expectedRecords, expectedReceipts: input.expectedReceipts,
+  })
+}
+
+test("D110 candidate digest is stable across config object insertion order and detects any changed manifest evidence", async () => {
+  const f = await fixture()
+  const prepared = await prepareV4ReencryptionOrphanCommit(f.input)
+  const input = D100input(f, prepared)
+  const original = D110manifestDigest(f, prepared)
+  assert.match(original, /^[0-9a-f]{64}$/u)
+  const configReordered = Object.fromEntries(Object.entries(input.expectedDestinationConfig).reverse()) as typeof input.expectedDestinationConfig
+  const reordered = computeV4ReencryptionCandidateManifestDigest({
+    prepared, sourceTreeSha: input.sourceTreeSha,
+    destinationConfig: configReordered,
+    expectedRecords: [...input.expectedRecords].reverse(),
+    expectedReceipts: [...input.expectedReceipts].reverse(),
+  })
+  assert.equal(original, reordered)
+  for (const modified of [
+    { expectedRecords: input.expectedRecords.map(r => ({ ...r, plaintextSha256: "f".repeat(64) })) },
+    { expectedReceipts: input.expectedReceipts.map(r => ({ ...r, sha: "f".repeat(40) })) },
+    { destinationConfig: {
+      ...input.expectedDestinationConfig,
+      kdfParams: { ...input.expectedDestinationConfig.kdfParams!, salt: "forged-new-salt" },
+    } },
+  ]) {
+    const digest = computeV4ReencryptionCandidateManifestDigest({
+      prepared, sourceTreeSha: input.sourceTreeSha,
+      destinationConfig: modified.destinationConfig ?? input.expectedDestinationConfig,
+      expectedRecords: modified.expectedRecords ?? input.expectedRecords,
+      expectedReceipts: modified.expectedReceipts ?? input.expectedReceipts,
+    })
+    assert.notEqual(original, digest)
+  }
+  assert.throws(() => computeV4ReencryptionCandidateManifestDigest({
+    prepared, sourceTreeSha: "f".repeat(40),
+    destinationConfig: input.expectedDestinationConfig,
+    expectedRecords: input.expectedRecords, expectedReceipts: input.expectedReceipts,
+  }), /inputs disagree/i)
+})
+
+test("D110 recovery refuses changed manifest/KDF/receipt even with exact pinned destination Git commit", async () => {
+  for (const mutation of ["record", "receipt", "config"] as const) {
+    const f = await fixture()
+    const prepared = await prepareV4ReencryptionOrphanCommit(f.input)
+    const j = await D102DestinationJournal(f.input.staged.receipts)
+    let state = (await j.journal.load())!
+    state = await j.journal.recordRefIntent({
+      role: "destination", repoId: targetId,
+      commitSha: candidateSha, treeSha: candidateTreeSha,
+      manifestSha256: D110manifestDigest(f, prepared),
+    }, state.generation)
+    const baseline = recoveryInput(f, prepared)
+    const altered = {
+      ...baseline,
+      expectedRecords: mutation === "record"
+        ? baseline.expectedRecords.map(r => ({ ...r, plaintextSha256: "f".repeat(64) }))
+        : baseline.expectedRecords,
+      expectedReceipts: mutation === "receipt"
+        ? baseline.expectedReceipts.map(r => ({ ...r, sha: "f".repeat(40) }))
+        : baseline.expectedReceipts,
+      expectedDestinationConfig: mutation === "config"
+        ? { ...baseline.expectedDestinationConfig,
+            kdfParams: { ...baseline.expectedDestinationConfig.kdfParams!, salt: "altered" } }
+        : baseline.expectedDestinationConfig,
+    }
+    await assert.rejects(() => reconcileV4PendingOrphanWithJournal({
+      ...altered, backupPlan: D100backupPlan,
+      backupRefReader: D100input(f, prepared).backupRefReader,
+      verifiedOriginalSource: D103originalProof(f),
+      journal: j.open(), wal: j.wal,
+    }), /exact pending Destination intent/i)
+    assert.equal(f.calls.filter(c => c === "ref-create").length, 0)
+    const stillPending = await j.open().load()
+    assert.ok(stillPending)
+    assert.equal(stillPending.pendingRefIntents.length, 1)
+    assert.equal(stillPending.permissionToPublish, false)
+    assert.equal(stillPending.cutoverAuthorized, false)
+  }
+})
+
 async function D102DestinationJournal(receipts: readonly { path: string; sha: string; byteLength: number }[]) {
   const files = new Map<string, string>()
   const adapter: V4LocalIndexAdapter = {
@@ -861,6 +949,7 @@ test("D102 WAL-bound 3-branch publication requires persisted blob receipts and r
       repoId: targetId,
       commitSha: candidateSha,
       treeSha: candidateTreeSha,
+      manifestSha256: D110manifestDigest(f, prepared),
     },
   ])
   assert.equal(restarted.pendingRefIntents.length, 0)
@@ -916,6 +1005,7 @@ test("D102 ambiguous Destination network result with unreadable GitHub leaves ex
   assert.deepEqual(pending.pendingRefIntents, [{
     role: "destination", repoId: targetId,
     commitSha: candidateSha, treeSha: candidateTreeSha,
+    manifestSha256: D110manifestDigest(f, prepared),
   }])
   assert.equal(pending.requiresRemoteRevalidation, true)
   assert.equal(pending.permissionToPublish, false)
@@ -983,6 +1073,7 @@ test("D103 incomplete/moved Destination readback keeps WAL pending and never ret
   state = await j.journal.recordRefIntent({
     role: "destination", repoId: targetId,
     commitSha: candidateSha, treeSha: candidateTreeSha,
+    manifestSha256: D110manifestDigest(f, prepared),
   }, state.generation)
   f.occupyRef(sourceSha) // Different commit has claimed the destination name
   await assert.rejects(() => reconcileV4PendingOrphanWithJournal({

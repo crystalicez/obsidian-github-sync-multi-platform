@@ -178,6 +178,7 @@ const destinationIntent = {
   repoId,
   commitSha: "d".repeat(40),
   treeSha: "e".repeat(40),
+  manifestSha256: "f".repeat(64),
 };
 
 test("D101 encrypted two-slot WAL persists BOTH Git ref create-intents through restart with exact SHA/tree identity", async () => {
@@ -228,6 +229,30 @@ test("D101 encrypted two-slot WAL persists BOTH Git ref create-intents through r
   assert.ok(Object.isFrozen(snap.pendingRefIntents));
   assert.ok(Object.isFrozen(snap.verifiedRefObservations[0]));
 });
+
+test("D110 encrypted destination WAL refuses an unbound or malformed candidate manifest fingerprint", async () => {
+  const adapter = new MemoryAdapter()
+  const journal = create(adapter)
+  let state = await journal.begin()
+  state = await journal.recordRefIntent(backupIntent, state.generation)
+  state = await journal.markRefReadbackObserved(backupIntent, state.generation)
+  state = await journal.recordStagingHandoff(backupIntent, state.generation)
+  const original = new Map(adapter.files)
+  for (const value of [undefined, "HEAD", "a".repeat(63), "G".repeat(64)]) {
+    await assert.rejects(() => journal.recordRefIntent({
+      ...destinationIntent, manifestSha256: value,
+    }, state.generation), V4ReencryptionJournalRecoveryRequiredError)
+    assert.deepEqual(adapter.files, original)
+  }
+  state = await journal.recordRefIntent(destinationIntent, state.generation)
+  assert.equal(state.pendingRefIntents[0]?.manifestSha256, destinationIntent.manifestSha256)
+  const serialized = [...adapter.files.values()].join("")
+  assert.ok(!serialized.includes(destinationIntent.manifestSha256))
+  await assert.rejects(() => journal.markRefReadbackObserved({
+    ...destinationIntent, manifestSha256: "a".repeat(64),
+  }, state.generation), /does not match/i)
+  assert.deepEqual((await create(adapter).load())?.pendingRefIntents, [destinationIntent])
+})
 
 test("D101 journal ref-intent and receipt fail closed on wrong commit/tree/repo/role/stale generation", async () => {
   const adapter = new MemoryAdapter();
