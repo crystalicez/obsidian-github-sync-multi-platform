@@ -432,7 +432,13 @@ export function createV4ReencryptionRecoveryJournal(input: {
     }
     await input.adapter.write(pathFor(generation % 2), serialized)
     const readback = await readSlot(generation % 2)
-    if (!readback.state || readback.state.generation !== generation) invalid()
+    // An authenticated slot with this generation is NOT sufficient evidence
+    // of this write: a same-key/same-run sibling WAL can have the same
+    // generation but a different pending intent or prepared Git commit.
+    // Compare the complete canonical snapshot before returning to any caller.
+    const expected = snapshot(generation, receipts, pendingIntents, refIntents,
+      refReceipts, stageHandoffStarted, candidatePreparationSha256, preparedCandidateReceipt)
+    if (!readback.state || JSON.stringify(readback.state) !== JSON.stringify(expected)) invalid()
     return readback.state
   }
 

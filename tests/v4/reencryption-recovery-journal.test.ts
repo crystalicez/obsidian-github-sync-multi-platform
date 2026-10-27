@@ -30,6 +30,67 @@ const receipt = (n: number) => ({
   byteLength: 343,
 });
 
+test("D120 rejects authenticated same-generation sibling upload intent returned after write", async () => {
+  const base = new MemoryAdapter()
+  const beginning = await create(base).begin()
+  const fork = new MemoryAdapter()
+  fork.files = new Map(base.files)
+  const sibling = await create(fork).recordUploadIntent(receipt(82), beginning.generation)
+  assert.deepEqual(sibling.pendingIntents, [receipt(82)])
+  const siblingSlot = [...fork.files].find(([name]) => name.endsWith("slot-0.json"))?.[1]
+  assert.ok(siblingSlot)
+  let substitutions = 0
+  const intercepted = new MemoryAdapter()
+  intercepted.files = new Map(base.files)
+  intercepted.write = async (name: string, _bytes: string) => {
+    substitutions++
+    intercepted.files.set(name, siblingSlot)
+  }
+  const attempt = create(intercepted)
+  await assert.rejects(
+    () => attempt.recordUploadIntent(receipt(81), beginning.generation),
+    V4ReencryptionJournalRecoveryRequiredError,
+    "matching generation plus valid AES-GCM MAC is NOT proof of the caller's attempted WAL transition",
+  )
+  assert.equal(substitutions, 1)
+  const remoteRevalidationOnly = await create(intercepted).assertHealthySnapshot(2)
+  assert.deepEqual(remoteRevalidationOnly.pendingIntents, [receipt(82)])
+  assert.equal(remoteRevalidationOnly.requiresRemoteRevalidation, true)
+  assert.equal(remoteRevalidationOnly.permissionToPublish, false)
+  assert.equal(remoteRevalidationOnly.cutoverAuthorized, false)
+})
+
+test("D120 rejects authenticated same-generation sibling prepared-candidate receipt returned after write", async () => {
+  const base = new MemoryAdapter()
+  let state = await create(base).begin()
+  state = await create(base).recordRefIntent(backupIntent, state.generation)
+  state = await create(base).markRefReadbackObserved(backupIntent, state.generation)
+  state = await create(base).recordStagingHandoff(backupIntent, state.generation)
+  state = await create(base).recordCandidatePreparationIntent("1".repeat(64), state.generation)
+  const fork = new MemoryAdapter()
+  fork.files = new Map(base.files)
+  const mismatched = { ...candidateReceipt, commitSha: "9".repeat(40) }
+  const sibling = await create(fork).recordPreparedCandidateReceipt(mismatched, state.generation)
+  assert.deepEqual(sibling.preparedCandidateReceipt, mismatched)
+  const targetName = `slot-${sibling.generation % 2}.json`
+  const siblingSlot = [...fork.files].find(([name]) => name.endsWith(targetName))?.[1]
+  assert.ok(siblingSlot)
+  const intercepted = new MemoryAdapter()
+  intercepted.files = new Map(base.files)
+  intercepted.write = async (name: string, _bytes: string) => {
+    intercepted.files.set(name, siblingSlot)
+  }
+  await assert.rejects(
+    () => create(intercepted).recordPreparedCandidateReceipt(candidateReceipt, state.generation),
+    V4ReencryptionJournalRecoveryRequiredError,
+    "a matching WAL generation cannot substitute a different Git candidate commit receipt",
+  )
+  const recovered = await create(intercepted).assertHealthySnapshot(sibling.generation)
+  assert.deepEqual(recovered.preparedCandidateReceipt, mismatched)
+  assert.equal(recovered.permissionToPublish, false)
+  assert.equal(recovered.cutoverAuthorized, false)
+})
+
 test("D80 two-slot encrypted WAL is readable after restart but never authorizes reusing staged receipts", async () => {
   const adapter = new MemoryAdapter();
   const store = create(adapter);
