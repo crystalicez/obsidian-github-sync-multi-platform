@@ -211,6 +211,7 @@ test("D101 encrypted two-slot WAL persists BOTH Git ref create-intents through r
   snap = await journal.recordStagingHandoff(backupIntent, snap.generation);
   const upload = await journal.recordUploadIntent(receipt(1), snap.generation);
   snap = await journal.appendReceipt(receipt(1), upload.generation);
+  snap = await journal.recordCandidatePreparationIntent("1".repeat(64), snap.generation);
   snap = await journal.recordRefIntent(destinationIntent, snap.generation);
   assert.deepEqual(snap.pendingRefIntents, [destinationIntent]);
   assert.equal(snap.permissionToPublish, false);
@@ -221,7 +222,7 @@ test("D101 encrypted two-slot WAL persists BOTH Git ref create-intents through r
   assert.deepEqual(refLost.verifiedRefObservations, [backupIntent]);
   assert.equal(refLost.requiresRemoteRevalidation, true);
   await assert.rejects(() => journal.recordRefIntent(destinationIntent, refLost.generation), /duplicate/i);
-  await assert.rejects(() => journal.recordUploadIntent(receipt(2), refLost.generation), /unresolved ref/i);
+  await assert.rejects(() => journal.recordUploadIntent(receipt(2), refLost.generation), /unresolved ref|candidate preparation/i);
   snap = await journal.markRefReadbackObserved(destinationIntent, refLost.generation);
   assert.deepEqual(snap.verifiedRefObservations, [backupIntent, destinationIntent]);
   assert.equal(snap.permissionToPublish, false);
@@ -237,6 +238,7 @@ test("D110 encrypted destination WAL refuses an unbound or malformed candidate m
   state = await journal.recordRefIntent(backupIntent, state.generation)
   state = await journal.markRefReadbackObserved(backupIntent, state.generation)
   state = await journal.recordStagingHandoff(backupIntent, state.generation)
+  state = await journal.recordCandidatePreparationIntent("1".repeat(64), state.generation)
   const original = new Map(adapter.files)
   for (const value of [undefined, "HEAD", "a".repeat(63), "G".repeat(64)]) {
     await assert.rejects(() => journal.recordRefIntent({
@@ -292,6 +294,7 @@ test("D101 WAL torn destination ref intent never grants retry, reuse, publicatio
   snap = await journal.recordRefIntent(backupIntent, snap.generation);
   snap = await journal.markRefReadbackObserved(backupIntent, snap.generation);
   snap = await journal.recordStagingHandoff(backupIntent, snap.generation);
+  snap = await journal.recordCandidatePreparationIntent("1".repeat(64), snap.generation);
   adapter.tear = true;
   await assert.rejects(() => journal.recordRefIntent(destinationIntent, snap.generation), /torn destination WAL write/i);
   adapter.tear = false;
@@ -370,6 +373,77 @@ test("D104 one-time Backup-to-Staging WAL handoff survives restart even with ZER
   assert.equal((await journal.load())?.generation, restarted.generation);
 });
 
+test("D111 one-shot candidate preparation WAL marker survives restart and blocks any further ciphertext staging", async () => {
+  const adapter = new MemoryAdapter()
+  let journal = create(adapter)
+  let state = await journal.begin()
+  state = await journal.recordRefIntent(backupIntent, state.generation)
+  state = await journal.markRefReadbackObserved(backupIntent, state.generation)
+  state = await journal.recordStagingHandoff(backupIntent, state.generation)
+  const digest = "a".repeat(64)
+  state = await journal.recordCandidatePreparationIntent(digest, state.generation)
+  assert.equal(state.candidatePreparationSha256, digest)
+  assert.equal(state.receipts.length, 0)
+  const raw = [...adapter.files.values()].join("")
+  assert.ok(!raw.includes(digest))
+  journal = create(adapter)
+  const recovered = await journal.load()
+  assert.ok(recovered)
+  assert.equal(recovered.candidatePreparationSha256, digest)
+  const original = new Map(adapter.files)
+  await assert.rejects(() => journal.recordCandidatePreparationIntent(digest, recovered.generation), /one-shot/i)
+  await assert.rejects(() => journal.recordCandidatePreparationIntent("b".repeat(64), recovered.generation), /one-shot/i)
+  await assert.rejects(() => journal.recordUploadIntent(receipt(3), recovered.generation), /after candidate preparation/i)
+  assert.deepEqual(adapter.files, original)
+  assert.equal(recovered.permissionToPublish, false)
+  assert.equal(recovered.cutoverAuthorized, false)
+})
+
+test("D111 torn encrypted candidate-preparation WAL slot never authorizes a Destination ref or replay", async () => {
+  class TornAdapter extends MemoryAdapter {
+    fail = false
+    override async write(path: string, value: string) {
+      if (this.fail) {
+        this.files.set(path, value.slice(0, 11))
+        throw new Error("torn candidate-intent WAL slot")
+      }
+      await super.write(path, value)
+    }
+  }
+  const adapter = new TornAdapter()
+  const journal = create(adapter)
+  let state = await journal.begin()
+  state = await journal.recordRefIntent(backupIntent, state.generation)
+  state = await journal.markRefReadbackObserved(backupIntent, state.generation)
+  state = await journal.recordStagingHandoff(backupIntent, state.generation)
+  adapter.fail = true
+  await assert.rejects(() => journal.recordCandidatePreparationIntent("c".repeat(64), state.generation),
+    /torn candidate-intent WAL slot/)
+  adapter.fail = false
+  const recovered = await create(adapter).load()
+  assert.ok(recovered)
+  assert.equal(recovered.candidatePreparationSha256, null)
+  assert.equal(recovered.permissionToPublish, false)
+  assert.equal(recovered.cutoverAuthorized, false)
+  await assert.rejects(() => create(adapter).recordCandidatePreparationIntent("c".repeat(64), recovered.generation),
+    V4ReencryptionJournalRecoveryRequiredError)
+  await assert.rejects(() => create(adapter).recordRefIntent(destinationIntent, recovered.generation),
+    V4ReencryptionJournalRecoveryRequiredError)
+})
+
+test("D111 refuses candidate preparation during unresolved staged ciphertext or without verified Backup", async () => {
+  const adapter = new MemoryAdapter()
+  const journal = create(adapter)
+  let state = await journal.begin()
+  await assert.rejects(() => journal.recordCandidatePreparationIntent("a".repeat(64), state.generation), /one-shot/i)
+  state = await journal.recordRefIntent(backupIntent, state.generation)
+  state = await journal.markRefReadbackObserved(backupIntent, state.generation)
+  state = await journal.recordStagingHandoff(backupIntent, state.generation)
+  state = await journal.recordUploadIntent(receipt(4), state.generation)
+  await assert.rejects(() => journal.recordCandidatePreparationIntent("a".repeat(64), state.generation), /one-shot/i)
+  assert.equal((await journal.load())?.candidatePreparationSha256, null)
+})
+
 test("D108 low-level WAL rejects blob uploads and destination intent before one-shot Backup-to-Staging handoff", async () => {
   const adapter = new MemoryAdapter();
   const journal = create(adapter);
@@ -387,6 +461,7 @@ test("D108 low-level WAL rejects blob uploads and destination intent before one-
 
   snapshot = await journal.recordStagingHandoff(backupIntent, snapshot.generation);
   assert.equal(snapshot.stageHandoffStarted, true);
+  snapshot = await journal.recordCandidatePreparationIntent("1".repeat(64), snapshot.generation);
   snapshot = await journal.recordRefIntent(destinationIntent, snapshot.generation);
   assert.deepEqual(snapshot.pendingRefIntents, [destinationIntent]);
   assert.equal(snapshot.permissionToPublish, false);

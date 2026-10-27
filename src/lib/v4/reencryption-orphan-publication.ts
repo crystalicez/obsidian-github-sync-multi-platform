@@ -53,6 +53,9 @@ export interface V4PreparedOrphanCommit {
   readonly verifiedFileCount: number
   readonly stagedCiphertextObjectCount: number
   readonly encryptedMetadataObjectCount: number
+  readonly deviceId: string
+  readonly journalId: string
+  readonly createdAt: number
   readonly sourceAndBackupPreserved: true
   readonly rootHasZeroParents: true
   readonly backupProvenanceVerified: false
@@ -281,6 +284,8 @@ export async function prepareV4ReencryptionOrphanCommit(
     verifiedFileCount: staged.records.length,
     stagedCiphertextObjectCount: staged.receipts.length,
     encryptedMetadataObjectCount: metadata.length,
+    deviceId: input.deviceId, journalId: input.journalId,
+    createdAt: input.createdAt,
     sourceAndBackupPreserved: true,
     rootHasZeroParents: true,
     backupProvenanceVerified: false,

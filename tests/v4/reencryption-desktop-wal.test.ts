@@ -82,6 +82,7 @@ test("D103 real Node OS filesystem persists encrypted Backup + Destination ref i
     state = await journal.recordRefIntent(backup, state.generation)
     state = await journal.markRefReadbackObserved(backup, state.generation)
     state = await journal.recordStagingHandoff(backup, state.generation)
+    state = await journal.recordCandidatePreparationIntent("1".repeat(64), state.generation)
     state = await journal.recordRefIntent(destination, state.generation)
     const storedBytes = [
       await readFile(join(t.root, "rekey", "wal", "slot-0.json"), "utf8"),
@@ -92,6 +93,7 @@ test("D103 real Node OS filesystem persists encrypted Backup + Destination ref i
     assert.ok(storedBytes.includes(destination.repoId))
     assert.ok(!storedBytes.includes(destination.commitSha))
     assert.ok(!storedBytes.includes(destination.manifestSha256))
+    assert.ok(!storedBytes.includes("1".repeat(64)), "candidate phase hash stays encrypted")
     await store.release()
 
     const reopened = await acquireV4DesktopRekeyWalStorage({ rootAbsolute: t.root, journalRoot })
@@ -100,6 +102,7 @@ test("D103 real Node OS filesystem persists encrypted Backup + Destination ref i
       assert.ok(recovered)
       assert.deepEqual(recovered.pendingRefIntents, [destination])
       assert.equal(recovered.pendingRefIntents[0]?.manifestSha256, destination.manifestSha256)
+      assert.equal(recovered.candidatePreparationSha256, "1".repeat(64))
       assert.deepEqual(recovered.verifiedRefObservations, [backup])
       assert.equal(recovered.permissionToPublish, false)
       assert.equal(recovered.cutoverAuthorized, false)

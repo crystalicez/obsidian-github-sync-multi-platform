@@ -29,6 +29,61 @@ function canonical(value: unknown): string {
   throw new Error("Re-encryption manifest fingerprint contains an unsupported value.")
 }
 
+export interface V4ReencryptionPreparationManifestInput {
+  readonly sourceCommitSha: string
+  readonly sourceTreeSha: string
+  readonly destinationRepoId: string
+  readonly destinationConfig: V4RemoteConfig
+  readonly sourceConfig: V4RemoteConfig
+  readonly deviceId: string
+  readonly journalId: string
+  readonly createdAt: number
+  readonly expectedRecords: readonly V4IndexFileRecord[]
+  readonly expectedReceipts: readonly V4ReencryptionObjectReceipt[]
+}
+
+/** D111: one-way, source-pinned, PRE-commit manifest identity. The Git
+ * candidate commit/tree does not exist yet and therefore cannot be included.
+ * Stored ONLY inside the encrypted, one-shot candidate-preparation WAL phase. */
+export function computeV4ReencryptionPreparationDigest(
+  input: V4ReencryptionPreparationManifestInput,
+): string {
+  if (!input || !/^[0-9a-f]{40}$/u.test(input.sourceCommitSha)
+    || !/^[0-9a-f]{40}$/u.test(input.sourceTreeSha)
+    || !input.destinationConfig || input.destinationConfig.repoId !== input.destinationRepoId
+    || input.destinationConfig.mode !== "encrypted"
+    || input.sourceConfig?.mode !== "encrypted"
+    || !/^[A-Za-z0-9_-]{8,128}$/u.test(input.deviceId)
+    || !/^[A-Za-z0-9_-]{8,128}$/u.test(input.journalId)
+    || !Number.isSafeInteger(input.createdAt) || input.createdAt < 1
+    || !Array.isArray(input.expectedRecords) || !Array.isArray(input.expectedReceipts)) {
+    throw new Error("Re-encryption candidate preparation needs a pinned Source and valid final manifest.")
+  }
+  const sha = createV4IncrementalSha256()
+  const feed = (value: unknown) => {
+    const bytes = utf8ToBytes(canonical(value))
+    sha.update(utf8ToBytes(`${bytes.byteLength}:`))
+    sha.update(bytes)
+  }
+  sha.update(utf8ToBytes("v4-reencryption-candidate-preparation-v1\0"))
+  feed(input.sourceCommitSha)
+  feed(input.sourceTreeSha)
+  feed(input.destinationRepoId)
+  feed(input.destinationConfig)
+  feed(input.sourceConfig)
+  feed(input.deviceId)
+  feed(input.journalId)
+  feed(input.createdAt)
+  const records = [...input.expectedRecords].sort((a, b) =>
+    a.pathId.localeCompare(b.pathId) || a.path.localeCompare(b.path))
+  const receipts = [...input.expectedReceipts].sort((a, b) => a.path.localeCompare(b.path))
+  feed(records.length)
+  for (const record of records) feed(record)
+  feed(receipts.length)
+  for (const receipt of receipts) feed(receipt)
+  return sha.digestHex()
+}
+
 /**
  * D110: domain-separated deterministic SHA-256 of the exact recovery
  * candidate + public encryption config + all planned metadata/objects.

@@ -1,5 +1,13 @@
 import { throwIfV4Aborted } from "./cancellation"
-import { computeV4ReencryptionCandidateManifestDigest } from "./reencryption-candidate-manifest-digest"
+import {
+  computeV4ReencryptionCandidateManifestDigest,
+  computeV4ReencryptionPreparationDigest,
+} from "./reencryption-candidate-manifest-digest"
+import {
+  prepareV4ReencryptionOrphanCommit,
+  type V4OrphanStagedCommitInput,
+  type V4PreparedOrphanCommit,
+} from "./reencryption-orphan-publication"
 import type { V4ReencryptionVerifiedSource } from "./reencryption-content-verifier"
 import {
   inspectV4FrozenBackupAfterAmbiguousCreate,
@@ -47,6 +55,9 @@ export interface V4JournaledBackupCreationInput
 
 export interface V4JournaledThreeBranchStageInput
   extends Omit<V4JournaledReencryptionStageInput, "journal" | "assertExclusiveStageLease" | "assertCrashDurable">, JournalBound {}
+
+export interface V4JournaledOrphanPreparationInput
+  extends Omit<V4OrphanStagedCommitInput, "assertExclusiveMigrationLease">, JournalBound {}
 
 export interface V4JournaledDestinationPublicationInput
   extends Omit<V4ThreeBranchPublicationInput,
@@ -157,6 +168,72 @@ export async function stageV4JournaledThreeBranchVault(
     assertExclusiveStageLease: () => hold(input.wal, input.signal),
     assertCrashDurable: () => hold(input.wal, input.signal),
   })
+}
+
+/**
+ * D111: a one-shot encrypted WAL intent BEFORE generating any unreachable
+ * new-key metadata blob, Git tree or zero-parent commit. On a lost response
+ * the old intent remains and this helper NEVER auto-retries.
+ *
+ * All metadata/tree/commit POST boundaries recheck the same OS WAL lease,
+ * actual durability and exact generation/manifest evidence.
+ */
+export async function prepareV4JournaledOrphanCandidate(
+  input: V4JournaledOrphanPreparationInput,
+): Promise<V4PreparedOrphanCommit> {
+  const { plan, staged, verifiedBackup } = input
+  assertJournalIdentity(input.journal, plan.pinnedSourceCommitSha, plan.destinationRepoId)
+  await hold(input.wal, input.signal)
+  const starting = await input.journal.load()
+  if (!starting || !starting.stageHandoffStarted
+    || starting.candidatePreparationSha256 !== null
+    || starting.pendingIntents.length > 0 || starting.pendingRefIntents.length > 0
+    || verifiedBackup?.backupContentsReadbackVerified !== true
+    || verifiedBackup.pinnedSourceCommitSha !== plan.pinnedSourceCommitSha
+    || verifiedBackup.pinnedSourceTreeSha !== input.sourceTreeSha
+    || !starting.verifiedRefObservations.some(r => r.role === "backup"
+      && r.repoId === verifiedBackup.backupRepoId
+      && r.commitSha === plan.pinnedSourceCommitSha && r.treeSha === input.sourceTreeSha)) {
+    throw new Error("Re-encryption orphan candidate requires exact WAL Backup, complete staging, and unused one-shot preparation.")
+  }
+  const receipts = new Map(starting.receipts.map(r => [r.path, r] as const))
+  if (receipts.size !== starting.receipts.length
+    || receipts.size !== staged.receipts.length
+    || staged.receipts.some(r => {
+      const persisted = receipts.get(r.path)
+      return !persisted || persisted.sha !== r.sha || persisted.byteLength !== r.byteLength
+    })) {
+    throw new Error("Re-encryption orphan candidate staged ciphertext differs from authenticated WAL receipts.")
+  }
+  const fingerprintCurrentCandidateInputs = () => computeV4ReencryptionPreparationDigest({
+    sourceCommitSha: plan.pinnedSourceCommitSha,
+    sourceTreeSha: input.sourceTreeSha,
+    destinationRepoId: plan.destinationRepoId,
+    destinationConfig: input.destinationConfig,
+    sourceConfig: input.sourceConfig, deviceId: input.deviceId,
+    journalId: input.journalId, createdAt: input.createdAt,
+    expectedRecords: staged.records,
+    expectedReceipts: staged.receipts,
+  })
+  const digest = fingerprintCurrentCandidateInputs()
+  await input.journal.assertHealthySnapshot(starting.generation)
+  const recorded = await input.journal.recordCandidatePreparationIntent(digest, starting.generation)
+  const assertSealed = async () => {
+    await hold(input.wal, input.signal)
+    const saved = await input.journal.assertHealthySnapshot(recorded.generation)
+    if (saved.candidatePreparationSha256 !== digest
+      || fingerprintCurrentCandidateInputs() !== digest
+      || saved.pendingIntents.length || saved.pendingRefIntents.length
+      || saved.cutoverAuthorized !== false) {
+      throw new Error("Re-encryption orphan candidate inputs or WAL intent changed before Git mutation.")
+    }
+  }
+  await assertSealed()
+  const prepared = await prepareV4ReencryptionOrphanCommit({
+    ...input, assertExclusiveMigrationLease: assertSealed,
+  })
+  await assertSealed()
+  return prepared
 }
 
 /**
@@ -372,6 +449,17 @@ export async function reconcileV4PendingOrphanWithJournal(
     })) {
     throw new Error("Re-encryption destination WAL recovery has mismatched staged ciphertext receipts.")
   }
+  const candidateDigest = computeV4ReencryptionPreparationDigest({
+    sourceCommitSha: plan.pinnedSourceCommitSha, sourceTreeSha: input.sourceTreeSha,
+    destinationRepoId: plan.destinationRepoId,
+    destinationConfig: input.expectedDestinationConfig,
+    sourceConfig: input.sourceConfig, deviceId: prepared.deviceId,
+    journalId: prepared.journalId, createdAt: prepared.createdAt,
+    expectedRecords: input.expectedRecords, expectedReceipts: input.expectedReceipts,
+  })
+  if (starting.candidatePreparationSha256 !== candidateDigest) {
+    throw new Error("Re-encryption destination recovery has a mismatched one-shot candidate preparation WAL intent.")
+  }
   await input.journal.assertHealthySnapshot(starting.generation)
   await checkBackup()
   const full = await inspectV4ReencryptionOrphanAfterAmbiguousPublication({
@@ -443,6 +531,17 @@ export async function publishV4JournaledThreeBranchDestination(
       return !persisted || persisted.sha !== r.sha || persisted.byteLength !== r.byteLength
     })) {
     throw new Error("Re-encryption WAL staged blob receipts do not match the completed destination inventory.")
+  }
+  const candidateDigest = computeV4ReencryptionPreparationDigest({
+    sourceCommitSha: plan.pinnedSourceCommitSha, sourceTreeSha: input.sourceTreeSha,
+    destinationRepoId: plan.destinationRepoId,
+    destinationConfig: input.expectedDestinationConfig,
+    sourceConfig: input.sourceConfig, deviceId: input.prepared.deviceId,
+    journalId: input.prepared.journalId, createdAt: input.prepared.createdAt,
+    expectedRecords: input.expectedRecords, expectedReceipts: input.expectedReceipts,
+  })
+  if (starting.candidatePreparationSha256 !== candidateDigest) {
+    throw new Error("Re-encryption destination publication needs the exact sealed candidate preparation WAL intent.")
   }
   const intent: V4ReencryptionRefIntent = Object.freeze({
     role: "destination",
