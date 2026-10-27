@@ -176,6 +176,129 @@ function makeJournalForRoot(
   })
 }
 
+test("D116 each WAL phase survives a fresh real filesystem lease before the next transition", async () => {
+  const t = await sandbox()
+  const backup = {
+    role: "backup" as const, repoId: "owner/repo#backup/d116",
+    commitSha: pinned, treeSha: "c".repeat(40),
+  }
+  const destination = {
+    role: "destination" as const, repoId: dest,
+    commitSha: "d".repeat(40), treeSha: "e".repeat(40),
+    manifestSha256: "f".repeat(64),
+  }
+  type Journal = ReturnType<typeof makeJournal>
+  type Snapshot = Awaited<ReturnType<Journal["begin"]>>
+  let generation = 0
+  let previous: Snapshot | null = null
+  const advance = async (mutate: (journal: Journal, currentGeneration: number) => Promise<Snapshot>) => {
+    const storage = await acquireV4DesktopRekeyWalStorage({ rootAbsolute: t.root, journalRoot })
+    try {
+      const journal = makeJournal(storage.adapter)
+      if (previous) {
+        assert.deepEqual(await journal.assertHealthySnapshot(generation), previous)
+      } else {
+        assert.equal(await journal.load(), null)
+      }
+      const next = await mutate(journal, generation)
+      assert.equal(next.generation, generation + 1)
+      assert.deepEqual(await journal.assertHealthySnapshot(next.generation), next)
+      assert.equal(next.requiresRemoteRevalidation, true)
+      assert.equal(next.permissionToPublish, false)
+      assert.equal(next.cutoverAuthorized, false)
+      generation = next.generation
+      previous = next
+    } finally {
+      await storage.release()
+    }
+  }
+
+  try {
+    await advance(journal => journal.begin())
+    await advance((journal, g) => journal.recordRefIntent(backup, g))
+    await advance((journal, g) => journal.markRefReadbackObserved(backup, g))
+    await advance((journal, g) => journal.recordStagingHandoff(backup, g))
+    await advance((journal, g) => journal.recordUploadIntent(receipt, g))
+    await advance((journal, g) => journal.appendReceipt(receipt, g))
+    await advance((journal, g) => journal.recordCandidatePreparationIntent("1".repeat(64), g))
+    await advance((journal, g) => journal.recordPreparedCandidateReceipt({
+      commitSha: destination.commitSha, treeSha: destination.treeSha,
+      manifestSha256: destination.manifestSha256,
+    }, g))
+    await advance((journal, g) => journal.recordRefIntent(destination, g))
+    await advance((journal, g) => journal.markRefReadbackObserved(destination, g))
+    assert.equal(generation, 10)
+    const storage = await acquireV4DesktopRekeyWalStorage({ rootAbsolute: t.root, journalRoot })
+    try {
+      const reopened = await makeJournal(storage.adapter).assertHealthySnapshot(generation)
+      assert.deepEqual(reopened, previous)
+      assert.deepEqual(reopened.verifiedRefObservations, [backup, destination])
+      const bytes = (await Promise.all(["slot-0.json", "slot-1.json"].map(name =>
+        readFile(join(t.root, "rekey", "wal", name), "utf8")))).join("")
+      assert.ok(!bytes.includes(backup.repoId))
+      assert.ok(!bytes.includes(destination.commitSha))
+      assert.ok(!bytes.includes(receipt.path))
+    } finally {
+      await storage.release()
+    }
+  } finally {
+    await t.cleanup()
+  }
+})
+
+test("D116 lost storage write acknowledgment persists encrypted intent but never permits blind upload retry", async () => {
+  const t = await sandbox()
+  try {
+    const storage = await acquireV4DesktopRekeyWalStorage({ rootAbsolute: t.root, journalRoot })
+    try {
+      const started = await makeJournal(storage.adapter).begin()
+      let loseAcknowledgment = true
+      const adapter = {
+        ...storage.adapter,
+        async write(path: string, value: string) {
+          await storage.adapter.write(path, value)
+          if (loseAcknowledgment) {
+            loseAcknowledgment = false
+            throw new Error("simulated lost WAL write acknowledgment after atomic rename")
+          }
+        },
+      }
+      const journal = makeJournal(adapter)
+      await assert.rejects(
+        () => journal.recordUploadIntent(receipt, started.generation),
+        /lost WAL write acknowledgment/,
+      )
+      const actual = await makeJournal(storage.adapter).assertHealthySnapshot(2)
+      assert.deepEqual(actual.pendingIntents, [receipt])
+      assert.equal(actual.permissionToPublish, false)
+    } finally {
+      await storage.release()
+    }
+    const reopened = await acquireV4DesktopRekeyWalStorage({ rootAbsolute: t.root, journalRoot })
+    try {
+      const journal = makeJournal(reopened.adapter)
+      const pending = await journal.assertHealthySnapshot(2)
+      const bytesBefore = await Promise.all(["slot-0.json", "slot-1.json"].map(name =>
+        readFile(join(t.root, "rekey", "wal", name), "utf8")))
+      await assert.rejects(() => journal.recordUploadIntent(receipt, pending.generation), /duplicate/i)
+      await assert.rejects(
+        () => journal.appendReceipt({ ...receipt, sha: "f".repeat(40) }, pending.generation),
+        /does not match/i,
+      )
+      assert.deepEqual(pending.pendingIntents, [receipt])
+      assert.equal(pending.requiresRemoteRevalidation, true)
+      assert.equal(pending.permissionToPublish, false)
+      assert.equal(pending.cutoverAuthorized, false)
+      assert.deepEqual(await Promise.all(["slot-0.json", "slot-1.json"].map(name =>
+        readFile(join(t.root, "rekey", "wal", name), "utf8"))), bytesBefore)
+    } finally {
+      await reopened.release()
+    }
+  } finally {
+    await t.cleanup()
+  }
+})
+
 test("D86 does not certify power-loss durability when Windows directory fsync is unsupported", async () => {
   const t = await sandbox()
   try {
