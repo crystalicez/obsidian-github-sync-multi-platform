@@ -15,6 +15,10 @@ export interface V4JournaledReencryptionStageInput extends V4ReencryptionStageIn
   readonly journal: V4ReencryptionRecoveryJournal
   /** Must be a trusted platform-held exclusive lease, across processes. */
   readonly assertExclusiveStageLease: () => Promise<void>
+  /** Mandatory for approved 3-branch staging. D86 Windows Node directory fsync
+   * failures MUST abort before any remote Git Blob mutation. Optional only
+   * for legacy isolated D81 staging experiments, which cannot publish. */
+  readonly assertCrashDurable?: (() => Promise<void>) | undefined
   /** D102 explicit same-run transition AFTER full Backup readback. No
    * automatic resume of an existing WAL after a restart/crash. */
   readonly beginAfterVerifiedBackup?: {
@@ -46,6 +50,19 @@ export async function stageV4ReencryptionVaultObjectsWithJournal(
   }
   await input.assertExclusiveStageLease()
   throwIfV4Aborted(input.signal)
+  if (input.beginAfterVerifiedBackup && typeof input.assertCrashDurable !== "function") {
+    throw new Error("Re-encryption three-branch Staging requires a real crash-durable WAL barrier.")
+  }
+  const assertThreeBranchWalDurable = async () => {
+    throwIfV4Aborted(input.signal)
+    await input.assertExclusiveStageLease()
+    throwIfV4Aborted(input.signal)
+    if (input.beginAfterVerifiedBackup) {
+      await input.assertCrashDurable!()
+      throwIfV4Aborted(input.signal)
+    }
+  }
+  await assertThreeBranchWalDurable()
   // Preflight before even touching a local journal, let alone GitHub.
   await inspectV4ReencryptionInventory({
     config: input.sourceConfig,
@@ -82,6 +99,8 @@ export async function stageV4ReencryptionVaultObjectsWithJournal(
     // Persist the one-time phase boundary BEFORE the first possible remote
     // blob upload, even for an empty vault. A restart must never replay it.
     progress = await input.journal.recordStagingHandoff(handoff.backupRef, previous.generation)
+    await assertThreeBranchWalDurable()
+    await input.journal.assertHealthySnapshot(progress.generation)
   } else {
     if (input.beginAfterVerifiedBackup) {
       throw new Error("Re-encryption WAL verified Backup handoff has no source journal.")
@@ -99,8 +118,10 @@ export async function stageV4ReencryptionVaultObjectsWithJournal(
       })
       // WAL intent MUST complete before any network-side blob stage begins.
       progress = await input.journal.recordUploadIntent(planned, progress.generation)
-      throwIfV4Aborted(input.signal)
-      await input.assertExclusiveStageLease()
+      // The encrypted intent must be power-loss durable BEFORE GitHub can
+      // persist an unreachable blob; confirmed write/readback is not enough.
+      await assertThreeBranchWalDurable()
+      await input.journal.assertHealthySnapshot(progress.generation)
       throwIfV4Aborted(input.signal)
       const returnedSha = await input.stageImmutableObject(path, ciphertext)
       // The remote may have written a blob even when this throws. Never retry
@@ -112,6 +133,7 @@ export async function stageV4ReencryptionVaultObjectsWithJournal(
         throw new Error("Re-encryption WAL staged immutable blob SHA mismatch; intent remains unresolved.")
       }
       progress = await input.journal.appendReceipt(planned, progress.generation)
+      await assertThreeBranchWalDurable()
       stagedObjects++
       return returnedSha
     },
@@ -119,6 +141,7 @@ export async function stageV4ReencryptionVaultObjectsWithJournal(
   await input.assertExclusiveStageLease()
   throwIfV4Aborted(input.signal)
   const verifiedJournal = await input.journal.load()
+  await assertThreeBranchWalDurable()
   if (!verifiedJournal || verifiedJournal.generation !== progress.generation
     || verifiedJournal.pendingIntents.length !== 0
     || verifiedJournal.receipts.length !== result.receipts.length

@@ -5,6 +5,11 @@ import {
   type V4FrozenBackupRecoveryInput,
 } from "./reencryption-backup-reconcile"
 import type { V4DesktopRekeyWalStorage } from "./reencryption-desktop-wal"
+import {
+  stageV4ReencryptionVaultObjectsWithJournal,
+  type V4JournaledReencryptionStageInput,
+  type V4JournaledReencryptionStagingResult,
+} from "./reencryption-journaled-staging"
 import type { V4SameRepoReencryptionBackupBranchProposal } from "./reencryption-owner-decisions"
 import {
   inspectV4ReencryptionOrphanAfterAmbiguousPublication,
@@ -38,6 +43,9 @@ interface JournalBound {
 
 export interface V4JournaledBackupCreationInput
   extends Omit<V4CreateAndVerifyBackupInput, "assertDurableBackupIntent" | "assertExclusiveMigrationLease">, JournalBound {}
+
+export interface V4JournaledThreeBranchStageInput
+  extends Omit<V4JournaledReencryptionStageInput, "journal" | "assertExclusiveStageLease" | "assertCrashDurable">, JournalBound {}
 
 export interface V4JournaledDestinationPublicationInput
   extends Omit<V4ThreeBranchPublicationInput,
@@ -121,6 +129,32 @@ async function recordIndependentReadback(
     throw new Error("Re-encryption WAL failed to record exact independent ref readback.")
   }
   await hold(binding.wal, binding.signal)
+}
+
+/**
+ * D109: the approved three-branch staging path uses the SAME OS-bound WAL
+ * as frozen Backup and orphan Destination publication. Unlike standalone
+ * pre-release D81 experiments, a real WAL crash-durable barrier is required
+ * before every irreversible Git Blob mutation and after writing each exact
+ * intent/receipt. The platform barrier fails closed on Windows EPERM.
+ *
+ * No refs, source files, settings or local secrets are changed here.
+ */
+export async function stageV4JournaledThreeBranchVault(
+  input: V4JournaledThreeBranchStageInput,
+): Promise<V4JournaledReencryptionStagingResult> {
+  assertJournalIdentity(input.journal, input.plan.pinnedSourceCommitSha, input.plan.destinationRepoId)
+  if (!input.beginAfterVerifiedBackup) {
+    throw new Error("Re-encryption three-branch staging requires a verified frozen Backup handoff.")
+  }
+  await hold(input.wal, input.signal)
+  return stageV4ReencryptionVaultObjectsWithJournal({
+    ...input,
+    journal: input.journal,
+    beginAfterVerifiedBackup: input.beginAfterVerifiedBackup,
+    assertExclusiveStageLease: () => hold(input.wal, input.signal),
+    assertCrashDurable: () => hold(input.wal, input.signal),
+  })
 }
 
 /**

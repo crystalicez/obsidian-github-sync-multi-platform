@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { mkdtemp, mkdir, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { sha256Hex, toBase64Url, utf8ToBytes } from "../../src/lib/bytes";
 import { deriveV4Keyring } from "../../src/lib/v4/crypto";
@@ -7,7 +10,9 @@ import { computeV4GitBlobSha1 } from "../../src/lib/v4/git-blob-identity";
 import { planV4OrphanReencryptionDestination } from "../../src/lib/v4/reencryption-orphan-branch";
 import { stageV4ReencryptionVaultObjects } from "../../src/lib/v4/reencryption-staging-receipts";
 import { createV4ReencryptionRecoveryJournal } from "../../src/lib/v4/reencryption-recovery-journal";
+import { acquireV4DesktopRekeyWalStorage } from "../../src/lib/v4/reencryption-desktop-wal";
 import { stageV4ReencryptionVaultObjectsWithJournal } from "../../src/lib/v4/reencryption-journaled-staging";
+import { stageV4JournaledThreeBranchVault } from "../../src/lib/v4/reencryption-ref-journal-coordinator";
 import type { V4LocalIndexAdapter } from "../../src/lib/v4/local-index";
 import type { V4IndexFileRecord } from "../../src/lib/v4/local-index";
 import type { V4RemoteShard } from "../../src/lib/v4/remote-index";
@@ -266,6 +271,7 @@ test("D102 D90 three-branch flow stages fresh ciphertext AFTER explicitly verifi
     ...f.input, journal: wal,
     beginAfterVerifiedBackup: { expectedJournalGeneration: state.generation, backupRef },
     async assertExclusiveStageLease() {},
+    async assertCrashDurable() {},
   });
   assert.equal(result.receipts.length, 2);
   assert.equal(result.journalSnapshot.stageHandoffStarted, true);
@@ -279,6 +285,7 @@ test("D102 D90 three-branch flow stages fresh ciphertext AFTER explicitly verifi
     ...f.input, journal: wal,
     beginAfterVerifiedBackup: { expectedJournalGeneration: state.generation, backupRef },
     async assertExclusiveStageLease() {},
+    async assertCrashDurable() {},
   }), /previous run requires manual recovery/i);
 });
 
@@ -296,6 +303,7 @@ test("D102 refuses accidental reuse of an older Backup journal, wrong exact back
     stageV4ReencryptionVaultObjectsWithJournal({
       ...f.input, journal: wal, beginAfterVerifiedBackup,
       async assertExclusiveStageLease() {},
+      async assertCrashDurable() {},
       async stageImmutableObject(path, value) {
         uploads++;
         return f.input.stageImmutableObject(path, value);
@@ -311,6 +319,182 @@ test("D102 refuses accidental reuse of an older Backup journal, wrong exact back
   }), /previous run requires manual recovery/i);
   await assert.rejects(() => stage(), /previous run requires manual recovery/i);
   assert.equal(uploads, 0);
+});
+
+test("D109 approved three-branch staging refuses missing real WAL crash-durability barrier before any upload", async () => {
+  const f = await fixture();
+  const wal = journal();
+  let state = await wal.begin();
+  const backupRef = {
+    role: "backup" as const, repoId: "owner/repo#backup/frozen",
+    commitSha: sha, treeSha: "b".repeat(40),
+  };
+  state = await wal.recordRefIntent(backupRef, state.generation);
+  state = await wal.markRefReadbackObserved(backupRef, state.generation);
+  const before = state.generation;
+  await assert.rejects(() => stageV4ReencryptionVaultObjectsWithJournal({
+    ...f.input, journal: wal,
+    beginAfterVerifiedBackup: { expectedJournalGeneration: before, backupRef },
+    async assertExclusiveStageLease() {},
+  }), /crash-durable WAL barrier/i);
+  assert.equal(f.stages, 0);
+  assert.equal((await wal.load())?.generation, before);
+  assert.equal((await wal.load())?.stageHandoffStarted, false);
+});
+
+test("D109 Windows fsync EPERM stops three-branch staging even before the one-shot handoff", async () => {
+  const f = await fixture();
+  const wal = journal();
+  let state = await wal.begin();
+  const backupRef = {
+    role: "backup" as const, repoId: "owner/repo#backup/frozen",
+    commitSha: sha, treeSha: "b".repeat(40),
+  };
+  state = await wal.recordRefIntent(backupRef, state.generation);
+  state = await wal.markRefReadbackObserved(backupRef, state.generation);
+  await assert.rejects(() => stageV4ReencryptionVaultObjectsWithJournal({
+    ...f.input, journal: wal,
+    beginAfterVerifiedBackup: { expectedJournalGeneration: state.generation, backupRef },
+    async assertExclusiveStageLease() {},
+    async assertCrashDurable() { throw new Error("Windows Node directory fsync EPERM"); },
+  }), /fsync EPERM/i);
+  assert.equal(f.stages, 0);
+  assert.equal((await wal.load())?.stageHandoffStarted, false);
+});
+
+test("D109 fsync failure AFTER encrypted blob intent but BEFORE GitHub POST leaves pending WAL and zero uploaded blobs", async () => {
+  const f = await fixture();
+  const wal = journal();
+  let state = await wal.begin();
+  const backupRef = {
+    role: "backup" as const, repoId: "owner/repo#backup/frozen",
+    commitSha: sha, treeSha: "b".repeat(40),
+  };
+  state = await wal.recordRefIntent(backupRef, state.generation);
+  state = await wal.markRefReadbackObserved(backupRef, state.generation);
+  let durabilityChecks = 0;
+  await assert.rejects(() => stageV4ReencryptionVaultObjectsWithJournal({
+    ...f.input, journal: wal,
+    beginAfterVerifiedBackup: { expectedJournalGeneration: state.generation, backupRef },
+    async assertExclusiveStageLease() {},
+    async assertCrashDurable() {
+      if (++durabilityChecks === 3) throw new Error("fsync interrupted after staged blob intent");
+    },
+  }), /fsync interrupted/i);
+  assert.equal(durabilityChecks, 3);
+  assert.equal(f.stages, 0, "no remote blob upload after non-durable Git blob intent");
+  const pending = await wal.load();
+  assert.ok(pending);
+  assert.equal(pending.stageHandoffStarted, true);
+  assert.equal(pending.pendingIntents.length, 1);
+  assert.equal(pending.receipts.length, 0);
+  assert.equal(pending.requiresRemoteRevalidation, true);
+  assert.equal(pending.permissionToPublish, false);
+  await assert.rejects(() => stageV4ReencryptionVaultObjectsWithJournal({
+    ...f.input, journal: wal,
+    beginAfterVerifiedBackup: { expectedJournalGeneration: state.generation, backupRef },
+    async assertExclusiveStageLease() {},
+    async assertCrashDurable() {},
+  }), /previous run requires manual recovery/i);
+  assert.equal(f.stages, 0);
+});
+
+test("D109 same-run Backup→Staging coordinator binds WAL durable guard without caller-supplied staging callback", async () => {
+  const f = await fixture();
+  const journalInstance = journal();
+  let state = await journalInstance.begin();
+  const backupRef = {
+    role: "backup" as const, repoId: "owner/repo#backup/frozen",
+    commitSha: sha, treeSha: "b".repeat(40),
+  };
+  state = await journalInstance.recordRefIntent(backupRef, state.generation);
+  state = await journalInstance.markRefReadbackObserved(backupRef, state.generation);
+  let durableChecks = 0;
+  let leaseChecks = 0;
+  const result = await stageV4JournaledThreeBranchVault({
+    ...f.input, journal: journalInstance,
+    beginAfterVerifiedBackup: { expectedJournalGeneration: state.generation, backupRef },
+    wal: {
+      async assertExclusiveStageLease() { leaseChecks++ },
+      async assertCrashDurable() { durableChecks++ },
+    },
+  });
+  assert.equal(f.stages, 2);
+  assert.ok(durableChecks >= 6);
+  assert.ok(leaseChecks >= durableChecks);
+  assert.equal(result.journalSnapshot.stageHandoffStarted, true);
+  assert.equal(result.journalSnapshot.receipts.length, 2);
+  assert.equal(result.journalSnapshot.permissionToPublish, false);
+  assert.equal(result.journalSnapshot.cutoverAuthorized, false);
+});
+
+test("D109 same-run coordinator propagates Windows WAL fsync EPERM without entering staging", async () => {
+  const f = await fixture();
+  const journalInstance = journal();
+  let state = await journalInstance.begin();
+  const backupRef = {
+    role: "backup" as const, repoId: "owner/repo#backup/frozen",
+    commitSha: sha, treeSha: "b".repeat(40),
+  };
+  state = await journalInstance.recordRefIntent(backupRef, state.generation);
+  state = await journalInstance.markRefReadbackObserved(backupRef, state.generation);
+  await assert.rejects(() => stageV4JournaledThreeBranchVault({
+    ...f.input, journal: journalInstance,
+    beginAfterVerifiedBackup: { expectedJournalGeneration: state.generation, backupRef },
+    wal: {
+      async assertExclusiveStageLease() {},
+      async assertCrashDurable() { throw new Error("D86 Windows directory fsync EPERM"); },
+    },
+  }), /fsync EPERM/i);
+  assert.equal(f.stages, 0);
+  assert.equal((await journalInstance.load())?.stageHandoffStarted, false);
+});
+
+test("D109 REAL Windows WAL filesystem capability blocks Git staging POST when directory sync is unsupported", async () => {
+  const tempParent = join(process.cwd(), ".tmp");
+  await mkdir(tempParent, { recursive: true });
+  const root = await mkdtemp(join(tempParent, "d109-actual-rekey-stage-"));
+  const journalRoot = "rekey/wal";
+  try {
+    const wal = await acquireV4DesktopRekeyWalStorage({ rootAbsolute: root, journalRoot });
+    try {
+      const j = createV4ReencryptionRecoveryJournal({
+        adapter: wal.adapter, root: journalRoot, destinationRepoId: newId,
+        sourceCommitSha: sha, runId: "rekey-d109-real-wal",
+        journalKey: new Uint8Array(32).fill(0x55),
+      });
+      let state = await j.begin();
+      const backupRef = {
+        role: "backup" as const, repoId: "owner/repo#backup/frozen",
+        commitSha: sha, treeSha: "b".repeat(40),
+      };
+      state = await j.recordRefIntent(backupRef, state.generation);
+      state = await j.markRefReadbackObserved(backupRef, state.generation);
+      const f = await fixture();
+      let physicalDurabilityError: unknown;
+      try { await wal.assertCrashDurable() }
+      catch (error) { physicalDurabilityError = error }
+      if (physicalDurabilityError) {
+        await assert.rejects(() => stageV4JournaledThreeBranchVault({
+          ...f.input, journal: j, wal,
+          beginAfterVerifiedBackup: { expectedJournalGeneration: state.generation, backupRef },
+        }), /fsync|durability/i);
+        assert.equal(f.stages, 0);
+        assert.equal((await j.load())?.stageHandoffStarted, false);
+      } else {
+        // On a platform where the real barrier succeeds, this fixture has
+        // only in-memory immutable Git blob callbacks, NOT live GitHub.
+        const result = await stageV4JournaledThreeBranchVault({
+          ...f.input, journal: j, wal,
+          beginAfterVerifiedBackup: { expectedJournalGeneration: state.generation, backupRef },
+        });
+        assert.equal(result.journalSnapshot.receipts.length, 2);
+        assert.equal(result.journalSnapshot.cutoverAuthorized, false);
+      }
+    } finally { await wal.release() }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("D81 timeout after upload intent leaves unresolved WAL; a retry cannot silently reuse it", async () => {
