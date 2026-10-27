@@ -144,6 +144,37 @@ test("D106 physical file modified or replaced during streaming read fails closed
   } finally { await f.cleanup() }
 })
 
+test("D107 physical disk first-hashed note changed while later note is read is rejected on the second SHA pass", async () => {
+  const f = await sandbox()
+  try {
+    const first = "first physical note"
+    const second = "second physical note"
+    await f.write("notes/first.md", first)
+    await f.write("notes/second.md", second)
+    const original = f.reader()
+    let changedAfterFirstHash = false
+    const reader = {
+      ...original,
+      async openFile(path: string) {
+        if (path === "notes/second.md" && !changedAfterFirstHash) {
+          changedAfterFirstHash = true
+          // External writer changes a previously hashed note, with same size.
+          await f.write("notes/first.md", "X".repeat(first.length))
+        }
+        return original.openFile(path)
+      },
+    }
+    const proof = await exactSource([
+      { path: "notes/first.md", bytes: utf8ToBytes(first) },
+      { path: "notes/second.md", bytes: utf8ToBytes(second) },
+    ])
+    await assert.rejects(() => verifyV4ReencryptionInitiatorLocalParity({
+      ...proof, reader,
+    }), /SHA-256|changed during/i)
+    assert.equal(changedAfterFirstHash, true)
+  } finally { await f.cleanup() }
+})
+
 test("D106 desktop reader rejects traversal/absolute paths, unsafe root and missing guard functions", async () => {
   const f = await sandbox()
   try {

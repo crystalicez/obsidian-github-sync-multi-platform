@@ -167,6 +167,29 @@ test("D105 detects local file writes during full-vault scan even if original con
   await assert.rejects(() => verifyV4ReencryptionInitiatorLocalParity(f.input), /changed during/i)
 })
 
+test("D107 second SHA-256 pass detects an intervening same-size same-mtime edit to an already-hashed note", async () => {
+  const f = await fixture()
+  let poisoned = false
+  // Once a.md has been fully hashed, poison it immediately before reading
+  // the later note. Restore identical metadata so inventory comparison alone
+  // cannot detect the stale SHA proof from the first pass.
+  f.setOnOpen(path => {
+    if (path === "notes/🪄.md" && !poisoned) {
+      poisoned = true
+      const original = f.files.get("notes/a.md")!
+      f.files.set("notes/a.md", {
+        bytes: utf8ToBytes("X".repeat(original.bytes.length)), mtime: original.mtime,
+      })
+    }
+  })
+  await assert.rejects(
+    () => verifyV4ReencryptionInitiatorLocalParity(f.input),
+    /SHA-256/i,
+  )
+  assert.equal(poisoned, true)
+  assert.equal(f.files.get("notes/a.md")!.mtime, 1700000000000)
+})
+
 test("D105 rejects forged inventory totals and aborts before reading local bytes", async () => {
   const f = await fixture()
   const input = { ...f.input, verifiedSource: {

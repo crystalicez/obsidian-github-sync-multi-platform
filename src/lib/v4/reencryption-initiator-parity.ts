@@ -155,41 +155,61 @@ export async function verifyV4ReencryptionInitiatorLocalParity(
     return map
   }
 
-  const start = await observe()
-  let bytesVerified = BigInt(0)
-  for (const [path, record] of expected) {
-    await fence()
-    const opened = await reader.openFile(path)
-    throwIfV4Aborted(input.signal)
-    if (!opened || opened.size !== record.size || typeof opened.chunks !== "function") {
-      throw new Error("Re-encryption initiator local file size or stream changed.")
+  const assertSameInventory = (first: ReadonlyMap<string, V4InitiatingFile>,
+    later: ReadonlyMap<string, V4InitiatingFile>): void => {
+    if (later.size !== first.size
+      || [...first].some(([path, original]) => {
+        const current = later.get(path)
+        return !current || current.size !== original.size || current.mtime !== original.mtime
+      })) {
+      throw new Error("Re-encryption initiator local vault changed during the full parity scan.")
     }
-    let read = 0
-    const hasher = createV4IncrementalSha256()
-    for await (const chunk of opened.chunks(MAX_CHUNK_BYTES, input.signal)) {
+  }
+
+  const hashAllFiles = async (): Promise<bigint> => {
+    let bytesVerified = BigInt(0)
+    for (const [path, record] of expected) {
+      await fence()
+      const opened = await reader.openFile(path)
       throwIfV4Aborted(input.signal)
-      if (!(chunk instanceof Uint8Array) || !chunk.byteLength
-        || chunk.byteLength > MAX_CHUNK_BYTES || read + chunk.byteLength > record.size) {
-        throw new Error("Re-encryption initiator local content chunk is invalid or too large.")
+      if (!opened || opened.size !== record.size || typeof opened.chunks !== "function") {
+        throw new Error("Re-encryption initiator local file size or stream changed.")
       }
-      hasher.update(chunk)
-      read += chunk.byteLength
+      let read = 0
+      const hasher = createV4IncrementalSha256()
+      for await (const chunk of opened.chunks(MAX_CHUNK_BYTES, input.signal)) {
+        throwIfV4Aborted(input.signal)
+        if (!(chunk instanceof Uint8Array) || !chunk.byteLength
+          || chunk.byteLength > MAX_CHUNK_BYTES || read + chunk.byteLength > record.size) {
+          throw new Error("Re-encryption initiator local content chunk is invalid or too large.")
+        }
+        hasher.update(chunk)
+        read += chunk.byteLength
+      }
+      throwIfV4Aborted(input.signal)
+      if (read !== record.size || hasher.digestHex() !== record.plaintextSha256) {
+        throw new Error("Re-encryption initiator local content does not match authenticated source SHA-256.")
+      }
+      bytesVerified += BigInt(read)
     }
-    throwIfV4Aborted(input.signal)
-    if (read !== record.size || hasher.digestHex() !== record.plaintextSha256) {
-      throw new Error("Re-encryption initiator local content does not match authenticated source SHA-256.")
+    if (bytesVerified.toString() !== verifiedSource.totalVerifiedPlaintextBytes) {
+      throw new Error("Re-encryption initiator verified byte totals changed during parity scan.")
     }
-    bytesVerified += BigInt(read)
+    return bytesVerified
   }
+
+  // Rehash the complete physical inventory after the first pass. A file can
+  // be modified AFTER it was read on pass one, then have its size/mtime
+  // restored before the final directory listing. A single-pass proof would
+  // miss this. A second full pass detects such intervening modifications,
+  // though neither pass is an OS-enforced global write lock/snapshot.
+  const start = await observe()
+  await hashAllFiles()
+  const between = await observe()
+  assertSameInventory(start, between)
+  const bytesVerified = await hashAllFiles()
   const end = await observe()
-  if (bytesVerified.toString() !== verifiedSource.totalVerifiedPlaintextBytes
-    || end.size !== start.size
-    || [...start].some(([path, first]) => {
-      const last = end.get(path)
-      return !last || last.size !== first.size || last.mtime !== first.mtime
-    })) {
-    throw new Error("Re-encryption initiator local vault changed during the full parity scan.")
-  }
+  assertSameInventory(start, end)
   await fence()
   return Object.freeze({
     integrityScope: "initiator-live-vault-exact-pinned-source-parity",
