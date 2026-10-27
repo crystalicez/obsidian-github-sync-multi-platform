@@ -53,6 +53,22 @@ export interface V4ReencryptionInitiatorParityReport {
 }
 
 /**
+ * Pin the authenticated Source evidence ONCE for an entire async publication
+ * operation (including the caller's WAL intent step). Per-scan D123 copying
+ * does not prevent a caller from substituting a new SHA between scans.
+ * Do not freeze/replace the live reader: all physical-vault checks stay live.
+ */
+export function captureV4ReencryptionInitiatorParityEvidence(
+  input: V4ReencryptionInitiatorParityInput,
+): V4ReencryptionInitiatorParityInput {
+  return Object.freeze({
+    ...input,
+    verifiedSource: Object.freeze({ ...input.verifiedSource }),
+    sourceRecords: Object.freeze(input.sourceRecords.map(record => Object.freeze({ ...record }))),
+  })
+}
+
+/**
  * Read-only D105 initiating-device proof. This is not a write lease or
  * guarantee that a file cannot mutate milliseconds AFTER the final sample.
  * A future cutover transaction must retain a real event/IO fence and invoke

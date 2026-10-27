@@ -9,6 +9,7 @@ import {
   type V4PreparedOrphanCommit,
 } from "./reencryption-orphan-publication"
 import type { V4ReencryptionVerifiedSource } from "./reencryption-content-verifier"
+import { captureV4ReencryptionInitiatorParityEvidence } from "./reencryption-initiator-parity"
 import {
   inspectV4FrozenBackupAfterAmbiguousCreate,
   type V4FrozenBackupRecoveryInput,
@@ -536,6 +537,11 @@ export async function publishV4JournaledThreeBranchDestination(
 ): Promise<V4ThreeBranchPublicationReport> {
   const { plan, backupPlan, createdAndVerifiedBackup } = input
   assertJournalIdentity(input.journal, plan.pinnedSourceCommitSha, plan.destinationRepoId)
+  // Pin the original Source hashes BEFORE awaiting WAL lease, reads or intent
+  // persistence. D100 also snapshots on entry for non-journaled callers.
+  const pinnedLocalParity = captureV4ReencryptionInitiatorParityEvidence(
+    input.initiatorLocalParity,
+  )
   const verifiedBackup: V4ReencryptionRefIntent = {
     role: "backup",
     repoId: backupPlan.backupRepoId,
@@ -593,7 +599,7 @@ export async function publishV4JournaledThreeBranchDestination(
   const result = await publishV4ThreeBranchDestinationAfterBackup({
     github: input.github, plan, backupPlan, createdAndVerifiedBackup,
     scratchRestore: input.scratchRestore, backupRefReader: input.backupRefReader,
-    initiatorLocalParity: input.initiatorLocalParity,
+    initiatorLocalParity: pinnedLocalParity,
     prepared: input.prepared, sourceTreeSha: input.sourceTreeSha,
     sourceConfig: input.sourceConfig, expectedDestinationConfig: input.expectedDestinationConfig,
     expectedRecords: input.expectedRecords, expectedReceipts: input.expectedReceipts,

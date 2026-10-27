@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { toBase64Url, utf8ToBytes } from "../../src/lib/bytes"
+import { sha256Hex, toBase64Url, utf8ToBytes } from "../../src/lib/bytes"
 import { deriveV4Keyring } from "../../src/lib/v4/crypto"
 import { computeV4GitBlobSha1 } from "../../src/lib/v4/git-blob-identity"
 import { planV4OrphanReencryptionDestination } from "../../src/lib/v4/reencryption-orphan-branch"
@@ -752,6 +752,42 @@ test("D105 D100 publication rechecks local vault after durable intent before des
   assert.equal(f.calls.filter(x => x === "ref-create").length, 0)
 })
 
+test("D124 rejects cross-guard source SHA substitution after durable intent before Destination ref create", async () => {
+  const f = await fixture()
+  const prepared = await prepareV4ReencryptionOrphanCommit(f.input)
+  const input = D100input(f, prepared)
+  const remoteEvidence = input.initiatorLocalParity.sourceRecords.map(r => ({ ...r }))
+  const original = utf8ToBytes("Vault has real encrypted content")
+  const changed = utf8ToBytes("X".repeat(original.length))
+  const changedSha = await sha256Hex(changed)
+  let localBytes: Uint8Array = original
+  let mutated = false
+  const reader = {
+    ...input.initiatorLocalParity.reader,
+    async openFile(_path: string) {
+      const bytes = localBytes
+      return {
+        size: bytes.length,
+        async *chunks() { yield bytes },
+      }
+    },
+  }
+  await assert.rejects(() => publishV4ThreeBranchDestinationAfterBackup({
+    ...input,
+    initiatorLocalParity: { ...input.initiatorLocalParity, sourceRecords: remoteEvidence, reader },
+    assertDurablePublicationIntent: async () => {
+      mutated = true
+      localBytes = changed
+      // This mutable caller-owned record can be replaced after the first
+      // full parity proof. It must NOT become new remote truth at guard #2.
+      remoteEvidence[0]!.plaintextSha256 = changedSha
+    },
+  }), /SHA-256|source|parity|changed|authenticated/i)
+  assert.equal(mutated, true)
+  assert.equal(f.calls.filter(x => x === "ref-create").length, 0,
+    "never publish a Git ref using a locally substituted Source Index hash")
+})
+
 test("D100 backup ref deleted or retargeted after proof is never accepted for destination creation", async () => {
   for (const altered of [null, "f".repeat(40)]) {
     const f = await fixture()
@@ -1215,6 +1251,51 @@ test("D102 WAL-bound 3-branch publication requires persisted blob receipts and r
     ...D100input(f, prepared), journal: j.open(), wal: j.wal,
   }), /previous ref intent|unresolved mutations|previous/i)
   assert.equal(f.calls.filter(c => c === "ref-create").length, 1)
+})
+
+test("D124 WAL coordinator pins source parity before writing the one-shot Destination ref intent", async () => {
+  const f = await fixture()
+  const prepared = await prepareV4ReencryptionOrphanCommit(f.input)
+  const j = await D102DestinationJournal(f.input.staged.receipts, f.input.staged.records,
+    f.input.destinationConfig, true, prepared)
+  const input = D100input(f, prepared)
+  const evidence = input.initiatorLocalParity.sourceRecords.map(r => ({ ...r }))
+  const original = utf8ToBytes("Vault has real encrypted content")
+  const changed = utf8ToBytes("Z".repeat(original.length))
+  const changedSha = await sha256Hex(changed)
+  let currentBytes: Uint8Array = original
+  let intentWritten = false
+  const reader = {
+    ...input.initiatorLocalParity.reader,
+    async openFile(_path: string) {
+      const bytes = currentBytes
+      return {
+        size: bytes.length,
+        async *chunks() { yield bytes },
+      }
+    },
+  }
+  const journal = {
+    ...j.journal,
+    async recordRefIntent(...args: Parameters<typeof j.journal.recordRefIntent>) {
+      const result = await j.journal.recordRefIntent(...args)
+      // The authenticated WAL intent was just persisted; there is now an
+      // async gap before D100's first parity readback.
+      intentWritten = true
+      currentBytes = changed
+      evidence[0]!.plaintextSha256 = changedSha
+      return result
+    },
+  }
+  await assert.rejects(() => publishV4JournaledThreeBranchDestination({
+    ...input, journal,
+    wal: j.wal,
+    initiatorLocalParity: { ...input.initiatorLocalParity, sourceRecords: evidence, reader },
+  }), /SHA-256|source|parity|changed|authenticated/i)
+  assert.equal(intentWritten, true)
+  assert.equal(f.calls.filter(x => x === "ref-create").length, 0)
+  assert.equal((await j.open().load())?.pendingRefIntents.length, 1,
+    "once written, the one-shot intent is preserved for operator recovery")
 })
 
 test("D102 refuses Destination mutation if encrypted WAL is missing even one staged object receipt", async () => {

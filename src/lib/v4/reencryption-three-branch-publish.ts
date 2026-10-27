@@ -1,6 +1,7 @@
 import type { GitHubClient } from "../github-api"
 import { throwIfV4Aborted } from "./cancellation"
 import {
+  captureV4ReencryptionInitiatorParityEvidence,
   verifyV4ReencryptionInitiatorLocalParity,
   type V4ReencryptionInitiatorParityInput,
 } from "./reencryption-initiator-parity"
@@ -101,6 +102,14 @@ export async function publishV4ThreeBranchDestinationAfterBackup(
     throw new Error("Re-encryption three-branch publication evidence does not match the pinned backup, source, scratch restore and orphan.")
   }
 
+  // Every boundary must prove parity against the SAME original authenticated
+  // source. D123 pins evidence within ONE parity call, but this publisher
+  // invokes it repeatedly across async Git reads, WAL intent, and create-ref.
+  // Caller-owned records must not become a new SHA authority between guards.
+  const pinnedLocalParity = captureV4ReencryptionInitiatorParityEvidence(
+    input.initiatorLocalParity,
+  )
+
   // A D99 snapshot report does not prove the frozen Backup ref has not
   // subsequently moved. Reobserve it before mutation and after publication.
   const assertBackupStillFrozen = async () => {
@@ -144,7 +153,7 @@ export async function publishV4ThreeBranchDestinationAfterBackup(
     await input.assertInitiatingVaultUnchanged()
     throwIfV4Aborted(input.signal)
     const parity = await verifyV4ReencryptionInitiatorLocalParity({
-      ...input.initiatorLocalParity, signal: input.signal,
+      ...pinnedLocalParity, signal: input.signal,
     })
     if (parity.initiatorLocalCutoverAuthorized !== false
       || parity.checkedFileCount !== proof.verifiedFileCount
