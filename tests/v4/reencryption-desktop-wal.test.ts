@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
 import test from "node:test"
 import { execFileSync } from "node:child_process"
-import { mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises"
+import { link, mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 
 import { createV4ReencryptionRecoveryJournal } from "../../src/lib/v4/reencryption-recovery-journal"
@@ -413,6 +413,103 @@ test("D86 refuses symbolic-link/junction directory and does not follow a slot sy
       assert.equal(await readFile(victim, "utf8"), "protected")
     } finally { await store.release() }
   } finally { await t.cleanup(); await elsewhere.cleanup() }
+})
+
+test("D118 refuses external hardlinked WAL slot for exists, read and write without disclosing data", async t => {
+  const area = await sandbox()
+  const outside = await sandbox()
+  try {
+    const protectedFile = join(outside.root, "protected.json")
+    const secret = "outside private WAL-like bytes"
+    await writeFile(protectedFile, secret)
+    const storage = await acquireV4DesktopRekeyWalStorage({
+      rootAbsolute: area.root, journalRoot,
+    })
+    try {
+      const linked = join(area.root, "rekey", "wal", "slot-1.json")
+      try {
+        await link(protectedFile, linked)
+      } catch (error) {
+        if (["EPERM", "EACCES", "ENOTSUP", "EXDEV"].includes((error as NodeJS.ErrnoException).code ?? "")) {
+          t.diagnostic("Hardlink creation is unsupported for this Windows volume/user.")
+          return
+        }
+        throw error
+      }
+      await assert.rejects(() => storage.adapter.exists("rekey/wal/slot-1.json"), /hardlink|unsafe/i)
+      await assert.rejects(() => storage.adapter.read("rekey/wal/slot-1.json"), /hardlink|unsafe/i)
+      await assert.rejects(() => storage.adapter.write("rekey/wal/slot-1.json", "{}"), /hardlink|unsafe/i)
+      await assert.rejects(() => makeJournal(storage.adapter).begin(), /hardlink|unsafe|recovery/i)
+      assert.equal(await readFile(protectedFile, "utf8"), secret)
+      assert.equal(await readFile(linked, "utf8"), secret)
+    } finally {
+      await storage.release()
+    }
+  } finally {
+    await area.cleanup()
+    await outside.cleanup()
+  }
+})
+
+test("D118 refuses hardlinked exclusive lock and keeps its token intact for manual review", async t => {
+  const area = await sandbox()
+  const outside = await sandbox()
+  try {
+    const storage = await acquireV4DesktopRekeyWalStorage({
+      rootAbsolute: area.root, journalRoot,
+    })
+    const alias = join(outside.root, "lock-alias")
+    let linked = false
+    try {
+      const tokenBefore = await readFile(storage.lockPath, "utf8")
+      try {
+        await link(storage.lockPath, alias)
+        linked = true
+      } catch (error) {
+        if (["EPERM", "EACCES", "ENOTSUP", "EXDEV"].includes((error as NodeJS.ErrnoException).code ?? "")) {
+          t.diagnostic("Lock hardlink creation is unsupported on this Windows volume/account.")
+          return
+        }
+        throw error
+      }
+      await assert.rejects(() => storage.assertExclusiveStageLease(), /lock|lease/i)
+      await assert.rejects(() => makeJournal(storage.adapter).begin(), /lock|lease/i)
+      await assert.rejects(() => storage.release(), /lock|lease/i)
+      assert.equal(await readFile(storage.lockPath, "utf8"), tokenBefore)
+      assert.equal(await readFile(alias, "utf8"), tokenBefore)
+    } finally {
+      if (linked) await rm(alias)
+      await storage.release()
+    }
+  } finally {
+    await area.cleanup()
+    await outside.cleanup()
+  }
+})
+
+test("D118 bounded descriptor-based WAL read keeps valid encrypted slot reopenable", async () => {
+  const area = await sandbox()
+  try {
+    const storage = await acquireV4DesktopRekeyWalStorage({
+      rootAbsolute: area.root, journalRoot,
+    })
+    try {
+      const begun = await makeJournal(storage.adapter).begin()
+      assert.equal(begun.generation, 1)
+      const slot = await storage.adapter.read("rekey/wal/slot-1.json")
+      assert.equal(typeof slot, "string")
+      assert.ok(!slot.includes(receipt.path))
+      assert.equal((await makeJournal(storage.adapter).assertHealthySnapshot(1)).generation, 1)
+      const tooBig = "x".repeat(2 * 1024 * 1024 + 1)
+      await writeFile(join(area.root, "rekey", "wal", "slot-1.json"), tooBig)
+      await assert.rejects(() => storage.adapter.read("rekey/wal/slot-1.json"), /size limit/i)
+      await assert.rejects(() => makeJournal(storage.adapter).load(), /recovery/i)
+    } finally {
+      await storage.release()
+    }
+  } finally {
+    await area.cleanup()
+  }
 })
 
 test("D86 interrupted slot temp residue forces manual recovery rather than silently resuming", async () => {

@@ -100,7 +100,9 @@ export async function acquireV4DesktopRekeyWalStorage(options: {
   const token = toBase64Url(randomBytes(24))
   let lockHandle: Awaited<ReturnType<typeof fs.open>>
   try {
-    lockHandle = await fs.open(lockPath, "wx", 0o600)
+    // Exclusive creation is unchanged; read/write access lets us verify the
+    // ownership token through the same pinned inode instead of reopening by path.
+    lockHandle = await fs.open(lockPath, "wx+", 0o600)
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new V4DesktopRekeyWalLockError()
     throw error
@@ -146,12 +148,18 @@ export async function acquireV4DesktopRekeyWalStorage(options: {
       const link = await fs.lstat(lockPath)
       const held = await lockHandle.stat()
       if (!link.isFile() || link.isSymbolicLink()
+        || link.nlink !== 1 || held.nlink !== 1
+        || link.ino === 0 || held.ino === 0
         || link.ino !== held.ino || link.dev !== held.dev) {
         throw new V4DesktopRekeyWalLockError()
       }
       stat = link
-      const current = await fs.readFile(lockPath, "utf8")
-      if (current !== token || stat.size !== token.length) {
+      // Read through the pinned lock handle, not a second pathname open.
+      // A concurrent rename/symlink swap cannot redirect token validation.
+      const currentBytes = Buffer.alloc(token.length + 1)
+      const { bytesRead } = await lockHandle.read(currentBytes, 0, currentBytes.length, 0)
+      if (stat.size !== token.length || bytesRead !== token.length
+        || currentBytes.toString("utf8", 0, bytesRead) !== token) {
         throw new V4DesktopRekeyWalLockError()
       }
     } catch {
@@ -189,8 +197,8 @@ export async function acquireV4DesktopRekeyWalStorage(options: {
     await ensureSafeDir(parts, false)
     try {
       const info = await fs.lstat(filename)
-      if (!info.isFile() || info.isSymbolicLink()) {
-        throw new Error("Re-encryption Desktop WAL unsafe symlink/junction slot.")
+      if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1) {
+        throw new Error("Re-encryption Desktop WAL unsafe symlink, junction or hardlinked slot.")
       }
       return true
     } catch (error) {
@@ -208,9 +216,36 @@ export async function acquireV4DesktopRekeyWalStorage(options: {
       const filename = slotPath(logical)
       await assertHeld()
       if (!(await safeFile(filename))) throw new Error("Re-encryption Desktop WAL slot not found.")
-      const stat = await fs.stat(filename)
-      if (stat.size > MAX_SLOT_BYTES) throw new Error("Re-encryption Desktop WAL slot exceeds size limit.")
-      return fs.readFile(filename, "utf8")
+      // Bind validation and data access to the SAME opened inode. Reading by
+      // pathname after lstat allowed a concurrent path replacement (including
+      // an external symlink) to redirect the read outside the WAL root.
+      const handle = await fs.open(filename, "r")
+      try {
+        const current = await fs.lstat(filename, { bigint: true })
+        const opened = await handle.stat({ bigint: true })
+        if (!current.isFile() || current.isSymbolicLink() || current.nlink !== BigInt(1)
+          || !opened.isFile() || opened.nlink !== BigInt(1)
+          || current.ino === BigInt(0) || opened.ino === BigInt(0)
+          || current.dev !== opened.dev || current.ino !== opened.ino) {
+          throw new Error("Re-encryption Desktop WAL slot changed during read.")
+        }
+        if (opened.size > BigInt(MAX_SLOT_BYTES)) throw new Error("Re-encryption Desktop WAL slot exceeds size limit.")
+        // Even if an uncooperative external writer grows the inode AFTER
+        // stat(), never allocate/read beyond our 2 MiB slot size budget.
+        const chunks: Buffer[] = []
+        let count = 0
+        while (count <= MAX_SLOT_BYTES) {
+          const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, MAX_SLOT_BYTES + 1 - count))
+          const { bytesRead } = await handle.read(chunk, 0, chunk.length, count)
+          if (bytesRead === 0) break
+          count += bytesRead
+          chunks.push(chunk.subarray(0, bytesRead))
+        }
+        if (count > MAX_SLOT_BYTES) throw new Error("Re-encryption Desktop WAL slot exceeds size limit.")
+        return Buffer.concat(chunks, count).toString("utf8")
+      } finally {
+        await handle.close()
+      }
     },
     async mkdir(logical: string) {
       await assertHeld()
