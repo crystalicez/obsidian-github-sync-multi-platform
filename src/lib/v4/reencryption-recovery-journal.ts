@@ -11,6 +11,15 @@ const GIT_SHA = /^[0-9a-f]{40}$/u
 const SAFE_RUN = /^[A-Za-z0-9_-]{8,128}$/u
 const REMOTE_OPAQUE_PATH = /^\.obsidian-github-sync-v4\/(?:data|packs)\/[0-9a-f]{2}\/[0-9a-f]{64}\.enc$|^\.obsidian-github-sync-v4\/parts\/[0-9a-f]{2}\/[0-9a-f]{64}\/[A-Za-z0-9_-]{1,128}\/\d{6}\.enc$/u
 
+/**
+ * Per-Node-process guard shared by all journal instances using one storage
+ * adapter. An instance-local busy bit alone allows two callers to observe
+ * the same WAL generation and overwrite the same next slot concurrently.
+ * This is NOT a substitute for the desktop OS-exclusive WAL lock: separate
+ * adapters/processes still need their real storage-level writer fence.
+ */
+const activeJournalAdapters = new WeakSet<V4LocalIndexAdapter>()
+
 export class V4ReencryptionJournalRecoveryRequiredError extends Error {
   constructor() {
     super("Re-encryption recovery journal needs manual revalidation before it can be modified.")
@@ -390,9 +399,15 @@ export function createV4ReencryptionRecoveryJournal(input: {
 
   let busy = false
   const locked = async <T>(operation: () => Promise<T>): Promise<T> => {
-    if (busy) invalid()
+    // Claim synchronously BEFORE observe() awaits: two instances must not
+    // consume one WAL generation and overwrite the same next slot.
+    if (busy || activeJournalAdapters.has(input.adapter)) invalid()
     busy = true
-    try { return await operation() } finally { busy = false }
+    activeJournalAdapters.add(input.adapter)
+    try { return await operation() } finally {
+      activeJournalAdapters.delete(input.adapter)
+      busy = false
+    }
   }
 
   const save = async (
@@ -457,7 +472,7 @@ export function createV4ReencryptionRecoveryJournal(input: {
   return Object.freeze({
     sourceCommitSha: input.sourceCommitSha,
     destinationRepoId: input.destinationRepoId,
-    load: async () => (await observe()).latest,
+    load: () => locked(async () => (await observe()).latest),
     assertHealthySnapshot: (expectedGeneration: number) => locked(async () => {
       const observed = await observe()
       if (!observed.latest || observed.damaged || observed.incomplete

@@ -104,6 +104,37 @@ test("D119 overlapping leaf flushes fail closed in either completion order until
   }
 })
 
+test("D126 real Windows WAL lease serializes two journal instances sharing its live adapter", async () => {
+  const t = await sandbox()
+  try {
+    const storage = await acquireV4DesktopRekeyWalStorage({ rootAbsolute: t.root, journalRoot })
+    try {
+      const start = await makeJournal(storage.adapter).begin()
+      const alternative = {
+        ...receipt,
+        path: `.obsidian-github-sync-v4/data/bb/${"b".repeat(64)}.enc`,
+        sha: "c".repeat(40),
+      }
+      const both = await Promise.allSettled([
+        makeJournal(storage.adapter).recordUploadIntent(receipt, start.generation),
+        makeJournal(storage.adapter).recordUploadIntent(alternative, start.generation),
+      ])
+      assert.equal(both[0]?.status, "fulfilled")
+      assert.equal(both[1]?.status, "rejected",
+        "same-process journal instances cannot contend under one OS WAL lease")
+      const snapshot = await makeJournal(storage.adapter).assertHealthySnapshot(2)
+      assert.deepEqual(snapshot.pendingIntents, [receipt])
+      assert.equal(snapshot.requiresRemoteRevalidation, true)
+      assert.equal(snapshot.permissionToPublish, false)
+      assert.equal(snapshot.cutoverAuthorized, false)
+    } finally {
+      await storage.release()
+    }
+  } finally {
+    await t.cleanup()
+  }
+})
+
 test("D86 real disk journal intent+receipt survive new instances and leave no plain receipt", async () => {
   const t = await sandbox()
   try {

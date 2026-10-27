@@ -30,6 +30,60 @@ const receipt = (n: number) => ({
   byteLength: 343,
 });
 
+test("D126 concurrent journal instances sharing one WAL adapter cannot both acknowledge generation 2", async () => {
+  const adapter = new MemoryAdapter()
+  const initial = await create(adapter).begin()
+  const originalWrite = adapter.write.bind(adapter)
+  let enterFirstWrite: () => void = () => { throw new Error("first writer not armed") }
+  const firstWriting = new Promise<void>(resolve => { enterFirstWrite = resolve })
+  let unblockFirst: () => void = () => { throw new Error("first writer not armed") }
+  const firstBlocked = new Promise<void>(resolve => { unblockFirst = resolve })
+  let secondWrites = 0
+  let firstHeld = false
+  adapter.write = async (path: string, value: string) => {
+    if (!firstHeld) {
+      firstHeld = true
+      enterFirstWrite()
+      await firstBlocked
+    } else {
+      secondWrites++
+    }
+    await originalWrite(path, value)
+  }
+  const first = create(adapter).recordUploadIntent(receipt(95), initial.generation)
+  await firstWriting
+  const second = create(adapter).recordUploadIntent(receipt(96), initial.generation)
+  await assert.rejects(() => create(adapter).load(), V4ReencryptionJournalRecoveryRequiredError,
+    "even forensic reads must not report an inconsistent snapshot during another instance's write")
+  // Unlike each journal's local busy bit, the adapter-wide guard must reject
+  // the second instance immediately while the first is between WAL observe
+  // and write. Keep the first operation blocked to prove this property.
+  const outcome = await Promise.race([
+    second.then(() => "resolved" as const, () => "rejected" as const),
+    new Promise<"second-write">(resolve => {
+      const check = async () => {
+        for (let i = 0; i < 200; i++) {
+          if (secondWrites > 0) return resolve("second-write")
+          await Promise.resolve()
+        }
+        resolve("second-write")
+      }
+      void check()
+    }),
+  ])
+  unblockFirst()
+  const settled = await Promise.allSettled([first, second])
+  assert.equal(outcome, "rejected",
+    "a second journal instance must fail while the first still owns the adapter")
+  assert.equal(settled[0]!.status, "fulfilled")
+  assert.equal(settled[1]!.status, "rejected")
+  assert.equal(secondWrites, 0, "only one authenticated WAL generation 2 may be written")
+  const saved = await create(adapter).assertHealthySnapshot(2)
+  assert.deepEqual(saved.pendingIntents, [receipt(95)])
+  assert.equal(saved.permissionToPublish, false)
+  assert.equal(saved.cutoverAuthorized, false)
+})
+
 test("D121 rejects successful target write when the older authenticated WAL slot disappears", async () => {
   const adapter = new MemoryAdapter()
   const journal = create(adapter)
