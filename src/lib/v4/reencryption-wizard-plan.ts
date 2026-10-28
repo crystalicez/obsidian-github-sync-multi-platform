@@ -34,6 +34,13 @@ export interface V4ReencryptionWizardProposal {
   readonly destinationOrphan: true
   readonly sourceRemainsSyncable: true
   readonly otherDeviceCutover: "optional-manual"
+  /** Observes changes; never claims to prevent other programs from writing. */
+  readonly initiatorVaultChangeDetection: "cross-platform-best-effort"
+  readonly externalWritesPrevented: false
+  /** One intentional review/confirmation before any real execution. */
+  readonly userConfirmation: "once-before-execution"
+  /** Desired finish behavior only; this proposal grants NO cutover authority. */
+  readonly initiatorCutover: "automatic-after-verified-crash-safe-completion"
   readonly sourceAndBackupRetained: true
   readonly actualBackupCreated: false
   readonly actualDestinationCreated: false
@@ -102,6 +109,10 @@ export function proposeV4ReencryptionWizardDraft(input: V4ReencryptionWizardDraf
     destinationOrphan: true,
     sourceRemainsSyncable: true,
     otherDeviceCutover: "optional-manual",
+    initiatorVaultChangeDetection: "cross-platform-best-effort",
+    externalWritesPrevented: false,
+    userConfirmation: "once-before-execution",
+    initiatorCutover: "automatic-after-verified-crash-safe-completion",
     sourceAndBackupRetained: true,
     actualBackupCreated: false,
     actualDestinationCreated: false,

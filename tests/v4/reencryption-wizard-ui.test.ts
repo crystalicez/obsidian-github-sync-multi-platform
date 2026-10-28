@@ -106,6 +106,23 @@ test("D96 Wizard rejects in-place and replacement connection edits after dialog 
   }
 })
 
+test("D130 Wizard preview explains cross-platform best-effort and one-confirmation automatic finish without authorizing execution", () => {
+  const wizard = new V4ReencryptionWizardModal(fakePlugin())
+  wizard.onOpen()
+  const debug = wizard as unknown as { step: number; render(): void }
+  let content = (wizard.contentEl as unknown as { flattenText(): string }).flattenText()
+  assert.match(content, /best.effort/i)
+  assert.match(content, /external.*write|external.*edit/i)
+  debug.step = 4
+  debug.render()
+  content = (wizard.contentEl as unknown as { flattenText(): string }).flattenText()
+  assert.match(content, /automatic/i)
+  assert.match(content, /once|one confirmation/i)
+  assert.match(content, /crash.safe/i)
+  assert.match(content, /BLOCKED|disabled/i)
+  wizard.onClose()
+})
+
 test("D92 Wizard has no direct GitHub mutation or local settings-save capability", () => {
   const wizard = new V4ReencryptionWizardModal(fakePlugin())
   wizard.onOpen()

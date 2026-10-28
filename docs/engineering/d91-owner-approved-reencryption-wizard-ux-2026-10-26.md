@@ -1,5 +1,7 @@
 # D91 — Owner-approved Re-encryption Wizard UX and mandatory 3-branch topology (2026-10-26)
 
+> **Later refinement D130 (2026-10-28):** The owner chose a common cross-platform **best-effort** initiator Vault change-detection policy rather than a required Native Helper / OS-wide external-writer fence for the first release. Confirm **once before execution**, then automatically cut over the initiating device **only after verified, crash-safe successful completion**, without another Finish confirmation. This does not waive storage durability, recovery, or integrity requirements. See [D130](d130-cross-platform-best-effort-single-confirmation-2026-10-28.md). The historical D91 topology and three-branch independent-fork policy remain binding; execution is still Preview-only.
+
 ## Decision status
 
 **APPROVED by owner:** On reviewing option A versus B, owner explicitly selected **A: retain THREE branches** and approved the other Wizard/UI/UX proposals from the immediately preceding discussion. This is a settled product decision. It is NOT evidence that an end-user Wizard or production re-encryption exists.

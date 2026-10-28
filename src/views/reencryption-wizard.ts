@@ -279,6 +279,8 @@ export class V4ReencryptionWizardModal extends Modal {
     const s = this.initialSettings
     this.row(container, "Current source (read-only)", `${s.githubOwner}/${s.githubRepo}#${s.githubBranch}`)
     this.row(container, "Mode", s.encryptionMode === "encrypted" ? "Encrypted V4 source required" : "Current connection is not encrypted")
+    this.row(container, "Vault change detection (planned)",
+      "Cross-platform best-effort: recheck file inventory, hashes, open editors and Sync state. External apps can still write after the last check; this is NOT an OS-wide write lock.")
     this.row(container, "Remote source verification", this.source
       ? `Verified ${this.source.verifiedFileCount} files, ${this.source.verifiedRemoteObjectCount} objects (${this.source.totalVerifiedPlaintextBytes} plaintext bytes) at immutable commit ${this.source.pinnedSourceCommitSha}`
       : "Not verified. This read-only check decrypts and validates every live source object from one pinned Git commit and may be expensive.")
@@ -350,6 +352,10 @@ export class V4ReencryptionWizardModal extends Modal {
     this.row(container, "New orphan destination (fresh encryption)", proposal.destinationRepoId)
     this.row(container, "Source Git commit", proposal.pinnedSourceCommitSha)
     this.row(container, "PBKDF2 iterations for new branch", String(proposal.requestedIterations))
+    this.row(container, "User approval (planned)",
+      "One confirmation before execution authorizes the full verified migration and automatic initiating-device cutover. No second confirmation after a successful run.")
+    this.row(container, "Best-effort change detection (planned)",
+      "Uniform cross-platform detection; cannot prevent changes by external programs. Abort on detected drift. Never treat this as a full Vault write fence.")
     this.row(container, "Expected source files / logical bytes",
       `${this.source?.verifiedFileCount ?? 0} files / ${this.source?.totalVerifiedPlaintextBytes ?? "unverified"} bytes`)
     container.createEl("p", {
@@ -385,10 +391,11 @@ export class V4ReencryptionWizardModal extends Modal {
 
   private renderFinish(container: HTMLElement): void {
     container.createEl("p", { text: "Not completed. Source, backup and destination must be verified in a real run before the initiating device can switch." })
-    this.row(container, "Initiating device", "Switch branch, credentials and local index only after verified durable success. No Force Pull/Push.")
+    this.row(container, "Initiating device",
+      "After one confirmation before execution, automatically switch branch, passphrase and local index ONLY after verified crash-safe completion. No second confirmation, no Force Pull/Push.")
     this.row(container, "Other devices", "Stay on the old branch, or manually enter the new branch and passphrase whenever desired.")
     this.row(container, "Retention", "Never auto-delete source or backup branches.")
-    this.row(container, "Current release gate", "BLOCKED — no automatic switch is currently possible.")
+    this.row(container, "Current release gate", "BLOCKED — the planned automatic switch is NOT implemented or authorized.")
   }
 
   private render(): void {
