@@ -195,6 +195,24 @@ test("D135 cannot switch persistence adapter or durability callback while an ini
   assert.equal(s.files.has(intentRoot + "/intent.json"), false)
 })
 
+test("D136 bounds D135 Intent writer to the same 8 KiB ceiling enforced after restart", async () => {
+  const s = store()
+  const largeDestination = "owner/repo#rekey/" + "x".repeat(9_000)
+  const src = createEmptyV4LocalIndex({ repoId: source, deviceId: "device1", mode: "encrypted" })
+  src.remoteCommitSha = oldSha
+  const dst = createEmptyV4LocalIndex({ repoId: largeDestination, deviceId: "device1", mode: "encrypted" })
+  dst.remoteCommitSha = newSha
+  await saveV4LocalIndex(s.adapter, root, src)
+  await saveV4LocalIndex(s.adapter, shadow, dst)
+  const writes = s.writes.length
+  await assert.rejects(
+    () => prepareV4ReencryptionLocalCutoverIntent({ ...s.input(), destinationRepoId: largeDestination }),
+    /bounded|size limit/i,
+  )
+  assert.equal(s.writes.length, writes)
+  assert.equal(s.dirs.has(intentRoot), false)
+})
+
 test("D135 same-adapter overlapping intent attempts cannot both write", async () => {
   const s = store()
   await s.seed()

@@ -1,13 +1,15 @@
 import { sha256Hex, utf8ToBytes } from "../bytes"
 import { assertSafeGitHubBranch, assertSafeGitHubRepositoryCoordinates } from "../github-config"
 import {
-  isV4LocalIndexCacheComplete, loadV4LocalIndex, type V4LocalIndex, type V4LocalIndexAdapter,
+  fitsV4LocalJsonSizeLimit, isV4LocalIndexCacheComplete, loadV4LocalIndex,
+  type V4LocalIndex, type V4LocalIndexAdapter,
 } from "./local-index"
 import { expectedV4PathLayout } from "./protocol-types"
 
 const SHA = /^[a-f0-9]{40}$/u
 const RUN = /^[A-Za-z0-9_-]{8,128}$/u
 const SEGMENT = /^[A-Za-z0-9_.-]+$/u
+export const V4_REENCRYPTION_LOCAL_CUTOVER_INTENT_MAX_BYTES = 8 * 1024
 const activeIntents = new WeakMap<V4LocalIndexAdapter, Set<string>>()
 
 export interface V4ReencryptionLocalCutoverIntentInput {
@@ -204,6 +206,9 @@ export async function prepareV4ReencryptionLocalCutoverIntent(
     const recordSha256 = await sha256Hex(utf8ToBytes(JSON.stringify(payload)))
     const record: V4ReencryptionLocalCutoverIntentRecord = { ...payload, recordSha256 }
     const serialized = JSON.stringify(record)
+    if (!fitsV4LocalJsonSizeLimit(serialized, V4_REENCRYPTION_LOCAL_CUTOVER_INTENT_MAX_BYTES)) {
+      throw new Error("Local cutover intent exceeds the bounded restart-reader size limit.")
+    }
     if (!sameInput(input, pinned, adapter, lease, durable)) {
       throw new Error("Local cutover intent storage contract changed before write.")
     }

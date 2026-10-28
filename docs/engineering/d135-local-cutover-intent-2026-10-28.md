@@ -6,7 +6,7 @@ Date: 2026-10-28. The Wizard is still preview-only. Release gate remains **block
 
 `src/lib/v4/reencryption-local-cutover-intent.ts` prepares one independent, run-scoped, nonsecret **prepared-uncommitted** intent at `<active-index-root>-rekey-intent-<run-id>/intent.json`. It never changes Source/Shadow Index files, normal Settings, SecretStorage, the user Vault or remote branches. It does **not** resume Sync, commit a migration, approve local cutover or clear the old passphrase.
 
-The record fixes schema/phase, run ID, exact Source/Backup/Destination repository identities, pinned Source/Destination Git commit SHAs, WAL generation, active Source Index root, Shadow Destination Index root, device ID and both SecretStorage **identifiers**, not their values. Its SHA-256 is a corruption checksum. It is **not a MAC, a trusted WAL receipt or authentication of local files**. A malicious writer able to rewrite the record can also recompute the checksum.
+The record fixes schema/phase, run ID, exact Source/Backup/Destination repository identities, pinned Source/Destination Git commit SHAs, WAL generation, active Source Index root, Shadow Destination Index root, device ID and both SecretStorage **identifiers**, not their values. D136 hardened the existing D135 writer to refuse serialized Intent records larger than the shared **8 KiB** restart-reader limit before any Intent directory creation. Oversized but syntactically safe Git branch identities can no longer produce an Intent that the subsequent reader must reject. Its SHA-256 is a corruption checksum. It is **not a MAC, a trusted WAL receipt or authentication of local files**. A malicious writer able to rewrite the record can also recompute the checksum.
 
 ## Safe preparation
 
