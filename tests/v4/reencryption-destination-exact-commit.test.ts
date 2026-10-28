@@ -10,6 +10,7 @@ import { buildV4RemoteMetadata } from "../../src/lib/v4/remote-index"
 import { createEmptyV4LocalIndex, loadV4LocalIndex, saveV4LocalIndex, type V4IndexFileRecord, type V4LocalIndexAdapter } from "../../src/lib/v4/local-index"
 import { verifyV4ReencryptionShadowAgainstDestination } from "../../src/lib/v4/reencryption-shadow-remote-binding"
 import { inspectV4ReencryptionCrossSurfaceProof } from "../../src/lib/v4/reencryption-cross-surface-proof"
+import { inspectV4ReencryptionLiveBackupCrossSurface } from "../../src/lib/v4/reencryption-live-backup-cross-surface"
 import { computeV4ReencryptionCandidateManifestDigest } from "../../src/lib/v4/reencryption-candidate-manifest-digest"
 import { prepareV4ReencryptionLocalCutoverIntent } from "../../src/lib/v4/reencryption-local-cutover-intent"
 import type { V4PreparedOrphanCommit } from "../../src/lib/v4/reencryption-orphan-publication"
@@ -601,4 +602,192 @@ test("D138 propagates lease or WAL storage failure without granting cutover and 
   failed.restart.journal.assertHealthySnapshot = async () => { throw Error("WAL corrupted") }
   await assert.rejects(() => inspectV4ReencryptionCrossSurfaceProof(failed.input()), /WAL corrupted/)
   assert.deepEqual(failed.holderCounts(), { calls: 1, held: false })
+})
+
+// D143 reuses the REAL AES-GCM + Git object fixture from D83/D137/D138.
+// Only the Backup branch client is additional and is always GET-only.
+async function d143Scenario() {
+  const s = await d138Scenario()
+  let refSha = pinned
+  let tree = sourceTree
+  let repositoryId = 88
+  let defaultBranch = "main"
+  let reads = 0
+  let onRead: (() => void) | undefined
+  const backupReader = {
+    branchName: "backup/run_d138",
+    async getRepositoryIdentity() {
+      reads++
+      onRead?.()
+      return { id: repositoryId, fullName: "owner/repo" }
+    },
+    async getRepositoryDefaultBranch() {
+      reads++
+      return defaultBranch
+    },
+    async getGitRefOrNull() {
+      reads++
+      return { ref: "refs/heads/backup/run_d138", type: "commit", sha: refSha }
+    },
+    async getGitCommit(sha: string) {
+      reads++
+      return { sha, treeSha: tree, parentShas: ["7".repeat(40)] }
+    },
+  }
+  return {
+    ...s, backupReader,
+    input: () => ({ ...s.input(), backupReader }),
+    moveBackup(sha: string) { refSha = sha },
+    changeTree(sha: string) { tree = sha },
+    changeRepository(id: number) { repositoryId = id },
+    changeDefault(branch: string) { defaultBranch = branch },
+    onRepositoryRead(callback: () => void) { onRead = callback },
+    backupReads() { return reads },
+  }
+}
+
+test("D143 one held lease reobserves the live frozen Backup before/after authenticated Destination, never cutover", async () => {
+  const s = await d143Scenario()
+  const baseline = new Map(s.files)
+  const writes = s.getWrites()
+  const result = await inspectV4ReencryptionLiveBackupCrossSurface(s.input())
+  assert.deepEqual(result, {
+    integrityScope: "read-only-live-backup-and-full-destination-cross-surface",
+    observation: "all-three-ref-evidence-coherent-uncommitted",
+    localCutoverAuthorized: false, resumeSyncAuthorized: false,
+    rollbackAuthorized: false, remoteWritesAuthorized: false,
+    oldPassphraseCleanupAuthorized: false,
+  })
+  assert.equal(s.backupReads(), 8)
+  assert.deepEqual(s.holderCounts(), { calls: 1, held: false })
+  assert.deepEqual(s.files, baseline)
+  assert.equal(s.getWrites(), writes)
+  assert.doesNotMatch(JSON.stringify(result), /old-d138-secret|new-d83-secret|秘密|Unicode/)
+})
+
+test("D143 Backup ref movement while Destination is verified forces manual review", async () => {
+  const s = await d143Scenario()
+  const originalBlob = s.f.github.getBlob
+  let moved = false
+  s.f.github.getBlob = async sha => {
+    if (!moved) { moved = true; s.moveBackup("9".repeat(40)) }
+    return originalBlob(sha)
+  }
+  const result = await inspectV4ReencryptionLiveBackupCrossSurface(s.input())
+  assert.equal(moved, true)
+  assert.equal(result.observation, "manual-recovery-required")
+  assert.equal(result.resumeSyncAuthorized, false)
+  assert.equal(result.oldPassphraseCleanupAuthorized, false)
+  assert.deepEqual(s.holderCounts(), { calls: 1, held: false })
+})
+
+test("D143 missing/moved Backup, mismatched source tree or physical repository cannot look coherent", async () => {
+  for (const kind of ["moved", "tree", "repository", "default", "missing"] as const) {
+    const s = await d143Scenario()
+    if (kind === "moved") s.moveBackup("9".repeat(40))
+    if (kind === "tree") s.changeTree("8".repeat(40))
+    if (kind === "repository") s.changeRepository(999)
+    if (kind === "default") s.changeDefault("backup/run_d138")
+    if (kind === "missing") s.backupReader.getGitRefOrNull = async () => null
+    const result = await inspectV4ReencryptionLiveBackupCrossSurface(s.input())
+    assert.equal(result.observation, "manual-recovery-required")
+    assert.equal(result.localCutoverAuthorized, false)
+    assert.equal(s.f.reads, 0, "Backup failure must stop before remote ciphertext validation")
+  }
+})
+
+test("D143 a replaced Backup reader method during D138 WAL read cannot forge a full proof", async () => {
+  const s = await d143Scenario()
+  const originalWal = s.restart.journal.assertHealthySnapshot
+  let replaced = false
+  s.restart.journal.assertHealthySnapshot = async generation => {
+    if (!replaced) {
+      replaced = true
+      const oldRef = s.backupReader.getGitRefOrNull
+      s.backupReader.getGitRefOrNull = async () => oldRef()
+    }
+    return originalWal(generation)
+  }
+  const report = await inspectV4ReencryptionLiveBackupCrossSurface(s.input())
+  assert.equal(replaced, true)
+  assert.equal(report.observation, "manual-recovery-required")
+})
+
+test("D143 a Destination GET reader swapped during first Backup lookup cannot masquerade as D138 proof", async () => {
+  const s = await d143Scenario()
+  let changed = false
+  s.onRepositoryRead(() => {
+    if (changed) return
+    changed = true
+    const previous = s.f.github.getGitRef
+    s.f.github.getGitRef = async () => previous()
+  })
+  const report = await inspectV4ReencryptionLiveBackupCrossSurface(s.input())
+  assert.equal(changed, true)
+  assert.equal(report.observation, "manual-recovery-required")
+  assert.equal(report.resumeSyncAuthorized, false)
+})
+
+test("D143 method replacement inside first live Backup GET is detected", async () => {
+  const s = await d143Scenario()
+  let mutated = false
+  s.onRepositoryRead(() => {
+    if (mutated) return
+    mutated = true
+    const oldCommit = s.backupReader.getGitCommit
+    s.backupReader.getGitCommit = async sha => oldCommit(sha)
+  })
+  const report = await inspectV4ReencryptionLiveBackupCrossSurface(s.input())
+  assert.equal(mutated, true)
+  assert.equal(report.observation, "manual-recovery-required")
+  assert.equal(s.f.reads, 0)
+})
+
+test("D143 mismatched configured Backup branch rejects input before any remote reads", async () => {
+  const s = await d143Scenario()
+  s.backupReader.branchName = "rekey/d83"
+  await assert.rejects(
+    () => inspectV4ReencryptionLiveBackupCrossSurface(s.input()), /exact same-repository frozen Backup/i,
+  )
+  assert.equal(s.backupReads(), 0)
+})
+
+test("D143 loss of the exclusive lease during the final live Backup GET cannot report coherent state", async () => {
+  const s = await d143Scenario()
+  let calls = 0
+  let lost = false
+  s.onRepositoryRead(() => { if (++calls === 2) lost = true })
+  const assertLease = async () => {
+    if (lost) throw new Error("lease lost while final Backup GET was in flight")
+  }
+  s.restart.assertExclusiveInitiatorLease = assertLease
+  s.shadow.assertExclusiveInitiatorLease = assertLease
+  await assert.rejects(
+    () => inspectV4ReencryptionLiveBackupCrossSurface(s.input()),
+    /lease lost while final Backup GET was in flight/,
+  )
+  assert.equal(calls, 2)
+  assert.deepEqual(s.holderCounts(), { calls: 1, held: false })
+})
+
+test("D143 transport errors propagate; uncooperative holder cannot forge success", async () => {
+  const fail = await d143Scenario()
+  fail.backupReader.getGitCommit = async () => { throw new Error("Backup GET network failure") }
+  await assert.rejects(
+    () => inspectV4ReencryptionLiveBackupCrossSurface(fail.input()), /Backup GET network failure/,
+  )
+  assert.deepEqual(fail.holderCounts(), { calls: 1, held: false })
+  const missing = await d143Scenario()
+  const result = await inspectV4ReencryptionLiveBackupCrossSurface({
+    ...missing.input(),
+    withExclusiveInitiatorLease: async () => ({
+      integrityScope: "read-only-live-backup-and-full-destination-cross-surface" as const,
+      observation: "all-three-ref-evidence-coherent-uncommitted" as const,
+      localCutoverAuthorized: false as const, resumeSyncAuthorized: false as const,
+      rollbackAuthorized: false as const, remoteWritesAuthorized: false as const,
+      oldPassphraseCleanupAuthorized: false as const,
+    }) as never,
+  })
+  assert.equal(result.observation, "manual-recovery-required")
+  assert.equal(missing.backupReads(), 0)
 })
