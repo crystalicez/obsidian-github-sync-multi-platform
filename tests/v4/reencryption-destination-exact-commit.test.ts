@@ -9,6 +9,11 @@ import { verifyV4ReencryptionDestinationExactCommit } from "../../src/lib/v4/ree
 import { buildV4RemoteMetadata } from "../../src/lib/v4/remote-index"
 import { createEmptyV4LocalIndex, loadV4LocalIndex, saveV4LocalIndex, type V4IndexFileRecord, type V4LocalIndexAdapter } from "../../src/lib/v4/local-index"
 import { verifyV4ReencryptionShadowAgainstDestination } from "../../src/lib/v4/reencryption-shadow-remote-binding"
+import { inspectV4ReencryptionCrossSurfaceProof } from "../../src/lib/v4/reencryption-cross-surface-proof"
+import { computeV4ReencryptionCandidateManifestDigest } from "../../src/lib/v4/reencryption-candidate-manifest-digest"
+import { prepareV4ReencryptionLocalCutoverIntent } from "../../src/lib/v4/reencryption-local-cutover-intent"
+import type { V4PreparedOrphanCommit } from "../../src/lib/v4/reencryption-orphan-publication"
+import type { V4ReencryptionJournalSnapshot } from "../../src/lib/v4/reencryption-recovery-journal"
 import { type V4RemoteConfig, type V4RemoteHead } from "../../src/lib/v4/protocol-types"
 import { V4StorageCodec } from "../../src/lib/v4/storage-codec"
 
@@ -101,7 +106,7 @@ async function fixture() {
     },
   }
   return {
-    entries, blobs, github, records: b.records, receipts: b.receipts, head: b.head,
+    entries, blobs, github, records: b.records, receipts: b.receipts.map(receipt => ({ ...receipt })), head: b.head,
     get reads() { return reads }, get refs() { return refs }, get repoChecks() { return repoChecks },
     changeRef(next: string) { pinnedRef = next },
   }
@@ -355,4 +360,245 @@ test("D137 changed scope before remote read and missing Shadow refuse verificati
     () => verifyV4ReencryptionShadowAgainstDestination(missing.input()), /Shadow is incomplete/i,
   )
   assert.equal(missing.f.reads, 0)
+})
+
+const d138Backup = "owner/repo#backup/run_d138"
+const d138Generation = 21
+
+async function d138Scenario() {
+  const s = await d137Scenario()
+  const shadow = s.input()
+  const sourceIndex = createEmptyV4LocalIndex({ repoId: original, deviceId: "d83", mode: "encrypted" })
+  sourceIndex.remoteCommitSha = pinned
+  await saveV4LocalIndex(s.adapter, shadow.activeIndexRoot, sourceIndex)
+
+  const prepared: V4PreparedOrphanCommit = {
+    integrityScope: "unreferenced-encrypted-orphan-commit",
+    destinationRepoId: destination, pinnedSourceCommitSha: pinned,
+    physicalRepositoryId: 88, sourceTreeSha: sourceTree, treeSha,
+    commitSha: rootSha, verifiedFileCount: 3,
+    stagedCiphertextObjectCount: shadow.remote.expectedReceipts.length,
+    encryptedMetadataObjectCount: 2 + Object.keys(s.f.head.shardHashes).length,
+    deviceId: "d83", journalId: "d138_journal", createdAt: 123,
+    sourceAndBackupPreserved: true, rootHasZeroParents: true,
+    backupProvenanceVerified: false, installedRestoreVerified: false,
+    refPublished: false, cutoverAuthorized: false,
+  }
+  const savedShadow = await loadV4LocalIndex(s.adapter, d137Shadow)
+  const digest = computeV4ReencryptionCandidateManifestDigest({
+    prepared, sourceTreeSha: sourceTree, destinationConfig: shadow.remote.expectedDestinationConfig,
+    expectedReceipts: shadow.remote.expectedReceipts,
+    expectedRecords: Object.values(savedShadow.shards).flatMap(shard => Object.values(shard.records)),
+  })
+  let wal: V4ReencryptionJournalSnapshot = {
+    generation: d138Generation, receipts: [], pendingIntents: [], pendingRefIntents: [],
+    verifiedRefObservations: [
+      { role: "backup", repoId: d138Backup, commitSha: pinned, treeSha: sourceTree },
+      { role: "destination", repoId: destination, commitSha: rootSha, treeSha,
+        manifestSha256: digest },
+    ],
+    stageHandoffStarted: true, candidatePreparationSha256: "f".repeat(64),
+    preparedCandidateReceipt: { commitSha: rootSha, treeSha, manifestSha256: digest },
+    requiresRemoteRevalidation: true, permissionToPublish: false, cutoverAuthorized: false,
+  }
+  const journal = {
+    sourceCommitSha: pinned, destinationRepoId: destination,
+    async assertHealthySnapshot(generation: number) {
+      assert.equal(generation, d138Generation)
+      return wal
+    },
+  }
+  const secrets = new Map([["old-d138", "old-d138-secret"], ["new-d138", "new-d83-secret"]])
+  const expected = {
+    sourceRepoId: original, destinationRepoId: destination, destinationCommitSha: rootSha,
+    sourcePassphraseSecretId: "old-d138", destinationPassphraseSecretId: "new-d138", deviceId: "d83",
+  }
+  const settings = {
+    githubOwner: "owner", githubRepo: "repo", githubBranch: "main",
+    encryptionMode: "encrypted", encryptionPassphraseSecretId: "old-d138", vault: "d83",
+  }
+  const restart = {
+    runId: d137Run, indexRoot: shadow.activeIndexRoot, expected, settings,
+    sourceCommitSha: pinned, backupRepoId: d138Backup, expectedWalGeneration: d138Generation,
+    indexAdapter: s.adapter, journal,
+    getSecret: (id: string) => secrets.get(id) ?? null,
+    assertExclusiveInitiatorLease: shadow.assertExclusiveInitiatorLease,
+    assertCrashDurable: shadow.assertCrashDurable,
+  }
+  await prepareV4ReencryptionLocalCutoverIntent({
+    adapter: s.adapter, activeIndexRoot: restart.indexRoot, runId: d137Run,
+    sourceRepoId: original, backupRepoId: d138Backup, destinationRepoId: destination,
+    sourceCommitSha: pinned, destinationCommitSha: rootSha,
+    sourcePassphraseSecretId: "old-d138", destinationPassphraseSecretId: "new-d138",
+    deviceId: "d83", walGeneration: d138Generation,
+    assertExclusiveInitiatorLease: shadow.assertExclusiveInitiatorLease,
+    assertCrashDurable: shadow.assertCrashDurable,
+  })
+  let held = false
+  let holderCalls = 0
+  const withExclusiveInitiatorLease = async <T>(action: () => Promise<T>): Promise<T> => {
+    if (held) throw new Error("duplicate exclusive holder")
+    held = true
+    holderCalls++
+    try { return await action() } finally { held = false }
+  }
+  const input = () => ({ restart, shadow, preparedCandidate: prepared, withExclusiveInitiatorLease })
+  return {
+    ...s, restart, shadow, prepared, secrets, journal, input,
+    setWal: (value: V4ReencryptionJournalSnapshot) => { wal = value },
+    getWal: () => wal,
+    holderCounts: () => ({ calls: holderCalls, held }),
+  }
+}
+
+test("D138 uses one held lease to reconcile authenticated WAL, exact Intent, Source, Shadow, manifest and full Git content", async () => {
+  const s = await d138Scenario()
+  const initial = new Map(s.files)
+  const writes = s.getWrites()
+  const report = await inspectV4ReencryptionCrossSurfaceProof(s.input())
+  assert.deepEqual(report, {
+    integrityScope: "read-only-wal-intent-local-shadow-and-verified-git",
+    observation: "all-surfaces-coherent-uncommitted",
+    localCutoverAuthorized: false, resumeSyncAuthorized: false,
+    rollbackAuthorized: false, remoteWritesAuthorized: false, oldPassphraseCleanupAuthorized: false,
+  })
+  assert.deepEqual(s.holderCounts(), { calls: 1, held: false })
+  assert.deepEqual(s.files, initial)
+  assert.equal(s.getWrites(), writes)
+  assert.doesNotMatch(JSON.stringify(report), /d138-secret|new-d83-secret|秘密|Unicode/)
+})
+
+test("D138 rejects WAL manifest that authenticates different ciphertext receipts without trusting a valid Git proof", async () => {
+  const s = await d138Scenario()
+  s.shadow.remote.expectedReceipts[0]!.byteLength++
+  const report = await inspectV4ReencryptionCrossSurfaceProof(s.input())
+  assert.equal(report.observation, "manual-recovery-required")
+  assert.equal(report.localCutoverAuthorized, false)
+  assert.equal(s.f.reads, 0)
+})
+
+test("D138 detects GitHub GET reader replacement before D137 starts, while WAL is inspected", async () => {
+  const s = await d138Scenario()
+  const originalRead = s.restart.journal.assertHealthySnapshot
+  let swapped = false
+  s.restart.journal.assertHealthySnapshot = async generation => {
+    if (!swapped) {
+      swapped = true
+      const read = s.f.github.getGitRef
+      s.f.github.getGitRef = async () => read()
+    }
+    return originalRead(generation)
+  }
+  const report = await inspectV4ReencryptionCrossSurfaceProof(s.input())
+  assert.equal(swapped, true)
+  assert.equal(report.observation, "manual-recovery-required")
+  assert.equal(s.f.reads, 0)
+})
+
+test("D138 refuses a changed WAL generation or ref receipt after its full remote verification starts", async () => {
+  const s = await d138Scenario()
+  const blob = s.f.github.getBlob
+  let altered = false
+  s.f.github.getBlob = async sha => {
+    if (!altered) {
+      altered = true
+      const current = s.getWal()
+      s.setWal({ ...current, verifiedRefObservations: [
+        current.verifiedRefObservations[0]!,
+        { ...current.verifiedRefObservations[1]!, treeSha: "9".repeat(40) },
+      ] })
+    }
+    return blob(sha)
+  }
+  const report = await inspectV4ReencryptionCrossSurfaceProof(s.input())
+  assert.equal(altered, true)
+  assert.equal(report.observation, "manual-recovery-required")
+  assert.deepEqual(s.holderCounts(), { calls: 1, held: false })
+})
+
+test("D138 refuses changed Source Index or Intent even if encrypted Git remote remains valid", async () => {
+  const s = await d138Scenario()
+  const blob = s.f.github.getBlob
+  let changed = false
+  s.f.github.getBlob = async sha => {
+    if (!changed) {
+      changed = true
+      const source = await loadV4LocalIndex(s.adapter, "private/index")
+      source.generation++
+      await saveV4LocalIndex(s.adapter, "private/index", source)
+    }
+    return blob(sha)
+  }
+  const report = await inspectV4ReencryptionCrossSurfaceProof(s.input())
+  assert.equal(changed, true)
+  assert.equal(report.observation, "manual-recovery-required")
+})
+
+test("D138 detects wrong SecretStorage new value before decrypting remote and rejects changing identity", async () => {
+  const s = await d138Scenario()
+  s.secrets.set("new-d138", "another-password")
+  assert.equal((await inspectV4ReencryptionCrossSurfaceProof(s.input())).observation, "manual-recovery-required")
+  assert.equal(s.f.reads, 0)
+  const other = await d138Scenario()
+  other.prepared.commitSha = "1".repeat(40)
+  await assert.rejects(
+    () => inspectV4ReencryptionCrossSurfaceProof(other.input()), /one pinned candidate/i,
+  )
+})
+
+test("D138 rejects a torn local Intent and an independently attested Backup tree mismatch", async () => {
+  const torn = await d138Scenario()
+  torn.files.set("private/index-rekey-intent-" + d137Run + "/intent.json", "{truncated")
+  assert.equal((await inspectV4ReencryptionCrossSurfaceProof(torn.input())).observation,
+    "manual-recovery-required")
+  assert.equal(torn.f.reads, 0)
+
+  const badBackup = await d138Scenario()
+  const wal = badBackup.getWal()
+  badBackup.setWal({
+    ...wal, verifiedRefObservations: [
+      { ...wal.verifiedRefObservations[0]!, treeSha: "9".repeat(40) },
+      wal.verifiedRefObservations[1]!,
+    ],
+  })
+  assert.equal((await inspectV4ReencryptionCrossSurfaceProof(badBackup.input())).observation,
+    "manual-recovery-required")
+  assert.equal(badBackup.f.reads, 0)
+})
+
+test("D138 leaves the holder on remote transport error and denies a holder that never inspects", async () => {
+  const transport = await d138Scenario()
+  transport.f.github.getBlob = async () => { throw new Error("synthetic GitHub GET failure") }
+  await assert.rejects(() => inspectV4ReencryptionCrossSurfaceProof(transport.input()),
+    /synthetic GitHub GET failure/)
+  assert.deepEqual(transport.holderCounts(), { calls: 1, held: false })
+
+  const empty = await d138Scenario()
+  const input = empty.input()
+  const report = await inspectV4ReencryptionCrossSurfaceProof({
+    ...input, withExclusiveInitiatorLease: async () => ({
+      integrityScope: "read-only-wal-intent-local-shadow-and-verified-git" as const,
+      observation: "all-surfaces-coherent-uncommitted" as const,
+      localCutoverAuthorized: false as const, resumeSyncAuthorized: false as const,
+      rollbackAuthorized: false as const, remoteWritesAuthorized: false as const,
+      oldPassphraseCleanupAuthorized: false as const,
+    }) as never,
+  })
+  assert.equal(report.observation, "manual-recovery-required")
+  assert.equal(empty.f.reads, 0)
+})
+
+test("D138 propagates lease or WAL storage failure without granting cutover and releases lease after error", async () => {
+  const s = await d138Scenario()
+  const input = s.input()
+  await assert.rejects(
+    () => inspectV4ReencryptionCrossSurfaceProof({
+      ...input,
+      restart: { ...input.restart, assertExclusiveInitiatorLease: async () => { throw Error("lease lost") } },
+    }), /one pinned candidate/i,
+  )
+  const failed = await d138Scenario()
+  failed.restart.journal.assertHealthySnapshot = async () => { throw Error("WAL corrupted") }
+  await assert.rejects(() => inspectV4ReencryptionCrossSurfaceProof(failed.input()), /WAL corrupted/)
+  assert.deepEqual(failed.holderCounts(), { calls: 1, held: false })
 })
