@@ -123,6 +123,50 @@ test("D130 Wizard preview explains cross-platform best-effort and one-confirmati
   wizard.onClose()
 })
 
+test("D133 old-passphrase loss warning appears before migration confirmation, without exposing secrets or another confirmation", () => {
+  const wizard = new V4ReencryptionWizardModal(fakePlugin())
+  wizard.onOpen()
+  const debug = wizard as unknown as {
+    step: number
+    render(): void
+    source: {
+      physicalRepositoryId: number; defaultBranch: string; pinnedSourceCommitSha: string
+      verifiedFileCount: number; verifiedRemoteObjectCount: number; totalVerifiedPlaintextBytes: string
+    }
+    newPassphrase: string; confirmPassphrase: string
+  }
+  const flattened = () => (wizard.contentEl as unknown as { flattenText(): string }).flattenText()
+  debug.step = 1
+  debug.render()
+  assert.match(flattened(), /old passphrase/i)
+  assert.match(flattened(), /source.*backup|backup.*source/i)
+  debug.source = {
+    physicalRepositoryId: 123456, defaultBranch: "main",
+    pinnedSourceCommitSha: "a".repeat(40),
+    verifiedFileCount: 0, verifiedRemoteObjectCount: 0, totalVerifiedPlaintextBytes: "0",
+  }
+  debug.newPassphrase = "new-passphrase-never-render"
+  debug.confirmPassphrase = "new-passphrase-never-render"
+  debug.step = 2
+  debug.render()
+  const review = flattened()
+  assert.match(review, /old passphrase/i)
+  assert.match(review, /save|keep.*copy/i)
+  assert.match(review, /source.*backup|backup.*source/i)
+  assert.match(review, /after.*crash.safe|after.*verified/i)
+  assert.match(review, /SecretStorage/i)
+  assert.doesNotMatch(review, /source-passphrase-never-render|new-passphrase-never-render|source-token-never-render/)
+  assert.match(review, /BLOCKED/)
+  debug.step = 4
+  debug.render()
+  const finish = flattened()
+  assert.match(finish, /old passphrase/i)
+  assert.match(finish, /clear|remove/i)
+  assert.match(finish, /crash.safe|verified/i)
+  assert.match(finish, /BLOCKED/)
+  wizard.onClose()
+})
+
 test("D92 Wizard has no direct GitHub mutation or local settings-save capability", () => {
   const wizard = new V4ReencryptionWizardModal(fakePlugin())
   wizard.onOpen()

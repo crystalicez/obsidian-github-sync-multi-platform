@@ -299,6 +299,10 @@ export class V4ReencryptionWizardModal extends Modal {
 
   private renderDestination(container: HTMLElement): void {
     container.createEl("p", { text: "The destination is a newly encrypted orphan branch. The separate frozen backup preserves the source snapshot; the old branch remains active." })
+    container.createEl("p", {
+      cls: "github-sync-rekey__warning",
+      text: "Important: After verified crash-safe cutover, the old passphrase will be cleared from this device's Obsidian SecretStorage. The original Source and Backup branches still require your OLD passphrase to decrypt. Save your old passphrase securely outside this plugin before starting Re-encryption if you may need those branches later. Other devices are not changed.",
+    })
     new Setting(container).setName("New destination branch")
       .setDesc("Must not exist, equal the source, backup or default branch.")
       .addText(text => text.setValue(this.destinationBranch).onChange(value => {
@@ -356,6 +360,10 @@ export class V4ReencryptionWizardModal extends Modal {
       "One confirmation before execution authorizes the full verified migration and automatic initiating-device cutover. No second confirmation after a successful run.")
     this.row(container, "Best-effort change detection (planned)",
       "Uniform cross-platform detection; cannot prevent changes by external programs. Abort on detected drift. Never treat this as a full Vault write fence.")
+    container.createEl("p", {
+      cls: "github-sync-rekey__warning",
+      text: "OLD PASSPHRASE WARNING: Save a secure copy of your old passphrase before confirming. After verified crash-safe cutover, this device will clear its old passphrase from Obsidian SecretStorage, with no extra confirmation. The Source and Backup branches and old encrypted Git history remain unchanged and still need that old passphrase to decrypt. This is a planned policy; no secrets are cleared in Preview.",
+    })
     this.row(container, "Expected source files / logical bytes",
       `${this.source?.verifiedFileCount ?? 0} files / ${this.source?.totalVerifiedPlaintextBytes ?? "unverified"} bytes`)
     container.createEl("p", {
@@ -395,6 +403,8 @@ export class V4ReencryptionWizardModal extends Modal {
       "After one confirmation before execution, automatically switch branch, passphrase and local index ONLY after verified crash-safe completion. No second confirmation, no Force Pull/Push.")
     this.row(container, "Other devices", "Stay on the old branch, or manually enter the new branch and passphrase whenever desired.")
     this.row(container, "Retention", "Never auto-delete source or backup branches.")
+    this.row(container, "Old passphrase cleanup (planned)",
+      "Clear the old passphrase from this device's SecretStorage only AFTER verified crash-safe cutover and recovery commit. The old Source/Backup still need it; keep your own copy if required. No cleanup is implemented in Preview.")
     this.row(container, "Current release gate", "BLOCKED — the planned automatic switch is NOT implemented or authorized.")
   }
 

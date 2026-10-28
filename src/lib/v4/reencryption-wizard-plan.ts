@@ -41,6 +41,12 @@ export interface V4ReencryptionWizardProposal {
   readonly userConfirmation: "once-before-execution"
   /** Desired finish behavior only; this proposal grants NO cutover authority. */
   readonly initiatorCutover: "automatic-after-verified-crash-safe-completion"
+  /** Owner D133: do not retain obsolete local passphrase after a proven commit. */
+  readonly oldPassphraseLocalRetention: "clear-after-proven-durable-cutover"
+  /** Source/Backup/history still require the old passphrase to decrypt. */
+  readonly oldPassphraseRequiredForOldBranches: true
+  /** Proposal and read-only Wizard can NEVER clear SecretStorage. */
+  readonly oldPassphraseCleanupAuthorized: false
   readonly sourceAndBackupRetained: true
   readonly actualBackupCreated: false
   readonly actualDestinationCreated: false
@@ -113,6 +119,9 @@ export function proposeV4ReencryptionWizardDraft(input: V4ReencryptionWizardDraf
     externalWritesPrevented: false,
     userConfirmation: "once-before-execution",
     initiatorCutover: "automatic-after-verified-crash-safe-completion",
+    oldPassphraseLocalRetention: "clear-after-proven-durable-cutover",
+    oldPassphraseRequiredForOldBranches: true,
+    oldPassphraseCleanupAuthorized: false,
     sourceAndBackupRetained: true,
     actualBackupCreated: false,
     actualDestinationCreated: false,
