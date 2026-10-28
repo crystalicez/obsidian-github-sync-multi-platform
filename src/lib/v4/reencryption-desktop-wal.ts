@@ -6,8 +6,11 @@ import type { V4LocalIndexAdapter } from "./local-index"
  * NOT connected to the production migration wizard.
  *
  * The new run must hold a process-exclusive .exclusive.lock. Losing the lock
- * fails closed. No timeout, PID or automatic stale-lock reclamation: a crash
- * can leave the lock behind, and an operator must investigate before retry.
+ * fails closed. This lock excludes only COOPERATING WAL clients; it does NOT
+ * prevent an independent OS process, external writer, or Obsidian editor from
+ * modifying the underlying files. Never use it as a global Vault edit fence
+ * or as cutover authority. No timeout, PID or automatic stale-lock reclamation:
+ * a crash can leave the lock behind for manual investigation.
  */
 export class V4DesktopRekeyWalRecoveryRequiredError extends Error {
   constructor() {

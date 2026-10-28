@@ -2,10 +2,12 @@
 // with an open O_DSYNC file handle, never a graceful close/cleanup.
 // The parent supplies only a newly created disposable directory.
 import { constants, closeSync, ftruncateSync, fsyncSync, openSync, writeSync } from "node:fs"
-import { join } from "node:path"
+import { join, resolve, sep } from "node:path"
 
 const [root, slot, phase, ciphertext] = process.argv.slice(2)
-if (!root || !["slot-a.bin", "slot-b.bin"].includes(slot)
+const disposableParent = resolve(process.cwd(), ".tmp") + sep
+if (!root || !resolve(root).startsWith(disposableParent)
+  || !["slot-a.bin", "slot-b.bin", "slot-0.json", "slot-1.json"].includes(slot)
   || !["before-open", "after-open", "after-truncate", "after-partial",
     "after-full", "after-sync"].includes(phase)
   || typeof ciphertext !== "string" || ciphertext.length < 100 || ciphertext.length > 8192) {
