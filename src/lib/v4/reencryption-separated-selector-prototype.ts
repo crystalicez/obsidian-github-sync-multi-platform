@@ -97,8 +97,13 @@ export async function sealV4ReencryptionSeparatedSelectorTestVector(
   }
 }
 
-async function authentic(encoded: string, identity: V4ReencryptionProposedCommitIdentity,
-  journalKey: Uint8Array): Promise<boolean> {
+/** Diagnostic only: validates exact authenticated bytes; never certifies durability or cutover. */
+export async function authenticateV4ReencryptionSeparatedSelectorTestVector(
+  encoded: string, identity: V4ReencryptionProposedCommitIdentity,
+  journalKey: Uint8Array,
+): Promise<boolean> {
+  assertV4ReencryptionProposedCommitIdentity(identity)
+  assertKey(journalKey)
   const bytes = decode(encoded)
   if (!bytes) return false
   const key = await derivedKey(journalKey)
@@ -202,7 +207,7 @@ export async function inspectV4ReencryptionSeparatedSelectorAfterRestart(
       await pinned.durable()
       if (!unchanged() || !matchingSettings(input)) return MANUAL
       const selector = await read()
-      if (!selector || !await authentic(selector, identity, pinned.key) || !unchanged()) return MANUAL
+      if (!selector || !await authenticateV4ReencryptionSeparatedSelectorTestVector(selector, identity, pinned.key) || !unchanged()) return MANUAL
       const source = JSON.stringify(await loadV4LocalIndex(pinned.adapter, roots.sourceIndexRoot))
       const shadow = JSON.stringify(await loadV4LocalIndex(pinned.adapter, roots.shadowIndexRoot))
       if (!matchesIndex(JSON.parse(source) as V4LocalIndex, identity.sourceRepoId,
