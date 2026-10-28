@@ -98,7 +98,7 @@ function parseRepo(value: string): { owner: string; repo: string; branch: string
   return { owner, repo, branch }
 }
 
-function validateIdentity(identity: V4ReencryptionProposedCommitIdentity): void {
+export function assertV4ReencryptionProposedCommitIdentity(identity: V4ReencryptionProposedCommitIdentity): void {
   if (!identity || typeof identity !== "object" || Array.isArray(identity)
     || Object.keys(identity).sort().join("|") !== IDENTITY_KEYS.join("|")
     || !RUN.test(identity.runId)
@@ -158,7 +158,7 @@ export async function sealV4ReencryptionProposedCommitTestVector(
   identity: V4ReencryptionProposedCommitIdentity,
   journalKey: Uint8Array,
 ): Promise<string> {
-  validateIdentity(identity)
+  assertV4ReencryptionProposedCommitIdentity(identity)
   validateKey(journalKey)
   const plaintext = utf8ToBytes(JSON.stringify(marker(identity)))
   if (plaintext.byteLength > MAX_RECEIPT_BYTES / 2) throw new Error("Proposed cutover marker exceeds size limit.")
@@ -218,7 +218,7 @@ function matchesIndex(index: V4LocalIndex, identity: V4ReencryptionProposedCommi
       Object.values(shard.records).every(record => record.dirty !== true && record.deleted !== true))
 }
 
-function matchesWal(wal: V4ReencryptionJournalSnapshot, identity: V4ReencryptionProposedCommitIdentity): boolean {
+export function matchesV4ReencryptionPreparedWal(wal: V4ReencryptionJournalSnapshot, identity: V4ReencryptionProposedCommitIdentity): boolean {
   const backup = wal.verifiedRefObservations.find(r => r.role === "backup")
   const dest = wal.verifiedRefObservations.find(r => r.role === "destination")
   const prepared = wal.preparedCandidateReceipt
@@ -272,7 +272,7 @@ export async function inspectV4ReencryptionProposedCommitAfterRestart(
   input: V4ReencryptionProposedCommitInspectionInput,
 ): Promise<V4ReencryptionProposedCommitReport> {
   if (!input) throw new Error("Missing proposed cutover inspection input.")
-  validateIdentity(input.identity)
+  assertV4ReencryptionProposedCommitIdentity(input.identity)
   validateKey(input.journalKey)
   if (typeof input.adapter?.read !== "function"
     || typeof input.adapter.exists !== "function"
@@ -328,7 +328,7 @@ export async function inspectV4ReencryptionProposedCommitAfterRestart(
     if (!oldSecret || !newSecret || !unchanged()) return MANUAL
     const firstWal = await captured.walRead.call(captured.journal, identity.walGeneration)
     const walBytes = JSON.stringify(firstWal)
-    if (!matchesWal(firstWal, identity) || !unchanged()) return MANUAL
+    if (!matchesV4ReencryptionPreparedWal(firstWal, identity) || !unchanged()) return MANUAL
     await captured.lease()
     await captured.durable()
     const second = await readMarker(captured.adapter, path)
@@ -337,7 +337,7 @@ export async function inspectV4ReencryptionProposedCommitAfterRestart(
     const secondWal = await captured.walRead.call(captured.journal, identity.walGeneration)
     if (!unchanged() || second !== first
       || firstActive !== secondActive || firstShadow !== secondShadow
-      || walBytes !== JSON.stringify(secondWal) || !matchesWal(secondWal, identity)
+      || walBytes !== JSON.stringify(secondWal) || !matchesV4ReencryptionPreparedWal(secondWal, identity)
       || !matchingSettings(input.settings, identity)
       || captured.secret(identity.sourcePassphraseSecretId) !== oldSecret
       || captured.secret(identity.destinationPassphraseSecretId) !== newSecret
