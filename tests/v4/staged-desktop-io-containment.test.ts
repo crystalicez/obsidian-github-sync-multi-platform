@@ -353,7 +353,7 @@ test("D15: rollback residue cleanup refuses a junction installed after its last 
         expectedStageSize: added.byteLength, expectedStageSha256: stageHash,
       })
     } catch (error) { rollbackError = error }
-    assert.equal(swapped, true, `late swap must occur (target stats: ${targetStats})`)
+    assert.equal(swapped, true, `late swap must occur (target stats: ${targetStats}; rollback error: ${String(rollbackError)})`)
     assert.match(String(rollbackError), /symlink|junction|unsafe|review/i)
     assert.deepEqual(new Uint8Array(await readFile(outsideResidue)), new Uint8Array([42, 43, 44]))
     assert.deepEqual(new Uint8Array(await readFile(path.join(parked, "stage.bin.replacement-residue"))), added)

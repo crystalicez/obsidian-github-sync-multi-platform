@@ -7,7 +7,8 @@ import { computeV4GitBlobSha1 } from "../../src/lib/v4/git-blob-identity"
 import { planV4OrphanReencryptionDestination } from "../../src/lib/v4/reencryption-orphan-branch"
 import { verifyV4ReencryptionDestinationExactCommit } from "../../src/lib/v4/reencryption-destination-exact-commit"
 import { buildV4RemoteMetadata } from "../../src/lib/v4/remote-index"
-import type { V4IndexFileRecord } from "../../src/lib/v4/local-index"
+import { createEmptyV4LocalIndex, loadV4LocalIndex, saveV4LocalIndex, type V4IndexFileRecord, type V4LocalIndexAdapter } from "../../src/lib/v4/local-index"
+import { verifyV4ReencryptionShadowAgainstDestination } from "../../src/lib/v4/reencryption-shadow-remote-binding"
 import { type V4RemoteConfig, type V4RemoteHead } from "../../src/lib/v4/protocol-types"
 import { V4StorageCodec } from "../../src/lib/v4/storage-codec"
 
@@ -71,7 +72,7 @@ async function makeBase() {
   const receipts = files.filter(file => !metadata.includes(file)).map(file => ({
     path: file.path, sha: computeV4GitBlobSha1(file.bytes), byteLength: file.bytes.byteLength,
   }))
-  return { records, entries, blobValues, receipts }
+  return { records, entries, blobValues, receipts, head }
 }
 const basePromise = makeBase()
 
@@ -100,7 +101,7 @@ async function fixture() {
     },
   }
   return {
-    entries, blobs, github, records: b.records, receipts: b.receipts,
+    entries, blobs, github, records: b.records, receipts: b.receipts, head: b.head,
     get reads() { return reads }, get refs() { return refs }, get repoChecks() { return repoChecks },
     changeRef(next: string) { pinnedRef = next },
   }
@@ -223,4 +224,135 @@ test("D83 wrong key, changed repo identity, malformed or cancelled audit fail cl
   await assert.rejects(() => verifyV4ReencryptionDestinationExactCommit({
     ...args(f), signal: controller.signal,
   }), /cancelled|abort/i)
+})
+
+const d137Run = "run_d137_shadow"
+const d137Shadow = "private/index-rekey-" + d137Run
+async function d137Scenario() {
+  const f = await fixture()
+  const files = new Map<string, string>()
+  let writes = 0
+  const adapter: V4LocalIndexAdapter = {
+    async read(path) { const raw = files.get(path); if (raw === undefined) throw Error("missing"); return raw },
+    async write(path, value) { writes++; files.set(path, value) },
+    async exists(path) { return files.has(path) },
+    async mkdir() {},
+  }
+  const index = createEmptyV4LocalIndex({ repoId: destination, deviceId: "d83", mode: "encrypted" })
+  index.remoteCommitSha = rootSha
+  index.epoch = f.head.epoch
+  index.generation = f.head.generation
+  for (const record of f.records) {
+    const bucket = record.pathId.slice(0, 2)
+    if (!index.shards[bucket]) {
+      index.shards[bucket] = { bucket, hash: f.head.shardHashes[bucket]!, records: {} }
+      index.shardHashes[bucket] = f.head.shardHashes[bucket]!
+    }
+    index.shards[bucket]!.records[record.pathId] = {
+      ...record, ...(record.partPaths ? { partPaths: [...record.partPaths] } : {}),
+    }
+  }
+  await saveV4LocalIndex(adapter, d137Shadow, index)
+  const { expectedRecords: _ignored, ...remote } = args(f)
+  const lease = async () => {}
+  const durable = async () => {}
+  const input = () => ({
+    adapter, activeIndexRoot: "private/index", runId: d137Run,
+    expectedDeviceId: "d83", remote, assertExclusiveInitiatorLease: lease, assertCrashDurable: durable,
+  })
+  return { f, adapter, files, input, getWrites: () => writes }
+}
+
+test("D137 verified immutable remote plaintext and all committed records bind to Shadow without a write", async () => {
+  const s = await d137Scenario()
+  const before = new Map(s.files)
+  const writes = s.getWrites()
+  const report = await verifyV4ReencryptionShadowAgainstDestination(s.input())
+  assert.deepEqual(report, {
+    integrityScope: "read-only-verified-git-content-to-local-shadow",
+    observation: "shadow-matches-verified-destination-uncommitted",
+    destinationRepoId: destination, destinationCommitSha: rootSha, verifiedFileCount: 3,
+    localCutoverAuthorized: false, resumeSyncAuthorized: false,
+    remoteWritesAuthorized: false, oldPassphraseCleanupAuthorized: false,
+  })
+  assert.ok(s.f.reads > 4)
+  assert.ok(s.f.refs >= 2)
+  assert.deepEqual(s.files, before)
+  assert.equal(s.getWrites(), writes)
+  assert.doesNotMatch(JSON.stringify(report), /Unicode|秘密|new-d83-secret/)
+})
+
+test("D137 rejects forged Shadow records even after its local content digest was recomputed", async () => {
+  const s = await d137Scenario()
+  const local = await loadV4LocalIndex(s.adapter, d137Shadow)
+  const record = Object.values(Object.values(local.shards)[0]!.records)[0]!
+  record.path = "forged/notes.md"
+  await saveV4LocalIndex(s.adapter, d137Shadow, local)
+  await assert.rejects(() => verifyV4ReencryptionShadowAgainstDestination(s.input()),
+    /record|manifest|committed|SHA|index/i)
+})
+
+test("D137 rejects a self-consistent Shadow header that does not match authenticated encrypted HEAD", async () => {
+  const s = await d137Scenario()
+  const local = await loadV4LocalIndex(s.adapter, d137Shadow)
+  local.epoch += 1
+  await saveV4LocalIndex(s.adapter, d137Shadow, local)
+  await assert.rejects(() => verifyV4ReencryptionShadowAgainstDestination(s.input()), /Shadow header|Git HEAD/i)
+})
+
+test("D137 rejects moved Git ref and Shadow changed during authenticated Git fetch", async () => {
+  const moved = await d137Scenario()
+  moved.f.changeRef("9".repeat(40))
+  await assert.rejects(() => verifyV4ReencryptionShadowAgainstDestination(moved.input()), /branch changed/i)
+  const changed = await d137Scenario()
+  const original = changed.f.github.getBlob
+  let modified = false
+  changed.f.github.getBlob = async sha => {
+    if (!modified) {
+      modified = true
+      const local = await loadV4LocalIndex(changed.adapter, d137Shadow)
+      local.generation++
+      await saveV4LocalIndex(changed.adapter, d137Shadow, local)
+    }
+    return original(sha)
+  }
+  await assert.rejects(
+    () => verifyV4ReencryptionShadowAgainstDestination(changed.input()), /Shadow changed|changed during/i,
+  )
+  assert.equal(modified, true)
+})
+
+test("D137 a GitHub client method swapped mid-read cannot produce a successful binding", async () => {
+  const s = await d137Scenario()
+  const original = s.f.github.getBlob
+  let mutated = false
+  s.f.github.getBlob = async sha => {
+    if (!mutated) {
+      mutated = true
+      s.f.github.getGitRef = async () => ({
+        ref: "refs/heads/rekey/d83", type: "commit" as const, sha: rootSha,
+      })
+    }
+    return original(sha)
+  }
+  await assert.rejects(
+    () => verifyV4ReencryptionShadowAgainstDestination(s.input()), /inputs changed|report does not bind/i,
+  )
+  assert.equal(mutated, true)
+})
+
+test("D137 changed scope before remote read and missing Shadow refuse verification", async () => {
+  const s = await d137Scenario()
+  const input = s.input()
+  const mutable = { ...input }
+  mutable.assertExclusiveInitiatorLease = async () => { mutable.remote.sourceTreeSha = "9".repeat(40) }
+  await assert.rejects(
+    () => verifyV4ReencryptionShadowAgainstDestination(mutable), /inputs changed/i,
+  )
+  const missing = await d137Scenario()
+  missing.files.clear()
+  await assert.rejects(
+    () => verifyV4ReencryptionShadowAgainstDestination(missing.input()), /Shadow is incomplete/i,
+  )
+  assert.equal(missing.f.reads, 0)
 })

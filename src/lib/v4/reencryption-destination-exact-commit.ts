@@ -4,7 +4,7 @@ import { throwIfV4Aborted } from "./cancellation"
 import { deriveV4Keyring, type V4Keyring } from "./crypto"
 import { assertV4GitBlobIdentity } from "./git-blob-identity"
 import { V4_GITHUB_REST_SAFE_WRITER_BYTES } from "./large-files"
-import type { V4IndexFileRecord } from "./local-index"
+import type { V4IndexFileRecord, V4LocalIndex } from "./local-index"
 import { assertV4OrphanReencryptionRoot, type V4OrphanReencryptionPlan } from "./reencryption-orphan-branch"
 import { inspectV4ReencryptionInventory } from "./reencryption-inventory"
 import type { V4ReencryptionObjectReceipt } from "./reencryption-staging-receipts"
@@ -28,6 +28,8 @@ export interface V4ReencryptionDestinationExactCommitInput {
   readonly expectedDestinationConfig: V4RemoteConfig
   /** Fully finalized D79 destination record manifest. Do NOT expose file paths in logs. */
   readonly expectedRecords: readonly V4IndexFileRecord[]
+  /** Optional local-cache header binding to the independently decrypted Git HEAD. */
+  readonly expectedLocalIndexHead?: Pick<V4LocalIndex, "deviceId" | "epoch" | "generation" | "shardHashes"> | undefined
   /** All completed D79 ciphertext object receipts. */
   readonly expectedReceipts: readonly V4ReencryptionObjectReceipt[]
   readonly destinationPassphrase: string
@@ -171,6 +173,18 @@ export async function verifyV4ReencryptionDestinationExactCommit(
     })
     throwIfV4Aborted(input.signal)
     const head = await decodeV4RemoteHead(await getPinnedFile(V4_HEAD_PATH), config, keyring)
+    if (input.expectedLocalIndexHead) {
+      const expected = input.expectedLocalIndexHead
+      const actualBuckets = Object.keys(head.shardHashes).sort()
+      const expectedBuckets = Object.keys(expected.shardHashes ?? {}).sort()
+      if (head.deviceId !== expected.deviceId
+        || head.epoch !== expected.epoch || head.generation !== expected.generation
+        || actualBuckets.length !== expectedBuckets.length
+        || actualBuckets.some((bucket, i) =>
+          bucket !== expectedBuckets[i] || head.shardHashes[bucket] !== expected.shardHashes[bucket])) {
+        throw new Error("Re-encryption Destination Shadow header differs from authenticated encrypted Git HEAD.")
+      }
+    }
     const shards: Record<string, V4RemoteShard> = Object.create(null) as Record<string, V4RemoteShard>
     for (const bucket of Object.keys(head.shardHashes)) {
       throwIfV4Aborted(input.signal)
