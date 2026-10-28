@@ -4,6 +4,12 @@
 >
 > **Mandatory workflow rule:** Every AI session that makes a material change to code, tests, design decisions, branch/PR state, verification status, or next steps MUST update this file before ending or handing work off. GitHub is the source of truth.
 
+## 2026-10-28 Stage D145 — Owner approved Option A (work in progress; release blocked)
+
+- **Owner decision:** A approved. Preserve the original Source Index, separate Shadow Index and one independent authoritative selector design. This permits architecture development only. Re-encryption remains strictly crash-safe, Wizard Preview-only, release blocked. Do not infer durability from Settings readback, use Native Helper without approval, remove old secret, switch active Index or mutate Git refs.
+- **Implementation in progress:** `src/lib/v4/reencryption-separated-selector.ts` derives three distinct roots and provides a pure non-authorizing, fail-closed Source/Shadow/selector/Settings/secret/WAL classifier. Test `tests/v4/reencryption-separated-selector.test.ts` includes all 24 logical write orders and 744 crash survival subsets; initial focused 5/5 PASS. Final-source focused 5/5 PASS, full Fast 1048/1048, isolated `pnpm test:repeat` 10×1048/1048 PASS (exit 0), Recovery 88/88, Resource 11/11, Feasibility 136/136, Maximum Strict TypeScript, Production Build, E2E compile-only three bundles, metadata/package validators and bounded 100,000,000-byte matching SHA-256 crypto soak all PASS. Source and Shadow remain untouched by the new diagnostic. No live Obsidian/GitHub or OS power-loss qualification performed.
+- **Engineering note:** `docs/engineering/d145-option-a-immutable-source-shadow-selector-2026-10-28.md`. No physical selector writer yet; separate authentication, durability and live restart proof still mandatory before cutover.
+
 ## 2026-10-28 Stage D144 — Cross-phase continuity audit: Source and Destination readbacks are sequential, NOT one commit (RELEASE BLOCKED)
 
 - **New finding:** D143 wraps D138/D136 and requires the *active local Index + saved Settings to select Source*, while D142's hypothetical marker restart reader requires *the same active Index root + Settings to select Destination*. Their positive observations **cannot both describe one stable storage snapshot**. An unproved Settings/Index/SecretStorage transition must intervene. Never combine positive D143 and D142 return values as an atomic or crash-durable local commit receipt. This is a **design blocker** requiring owner choice for a real transaction authority.
