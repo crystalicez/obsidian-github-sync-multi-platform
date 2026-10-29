@@ -37,6 +37,26 @@ export default class FastSync extends Plugin {
   private statusDisplaySignature: string | undefined
   private cooldownStore?: V4RateLimitCooldownStore
 
+  /**
+   * UI and host timers do not await callback Promises. Observe unexpected
+   * errors without repeating a Sync whose remote outcome may be unknown.
+   * Normal V4 runtime failures already display their own status and Notice.
+   */
+  runSyncFromUi(operation: () => Promise<unknown>): void {
+    if (this.unloaded) return
+    const reportUnexpectedFailure = () => {
+      if (this.unloaded) return
+      try {
+        new Notice("GitHub Sync: Sync stopped unexpectedly. Review Sync status before retrying manually.")
+      } catch { /* Do not throw again from a detached event callback. */ }
+    }
+    try {
+      void operation().catch(reportUnexpectedFailure)
+    } catch {
+      reportUnexpectedFailure()
+    }
+  }
+
   enableWatch() {
     this.isWatchEnabled = true
   }
@@ -87,7 +107,7 @@ export default class FastSync extends Plugin {
 
     // Create Ribbon Icons
     this.ribbonIcon = this.addRibbonIcon("loader-circle", "GitHub Sync: Sync", () => {
-      void this.v4Runtime.manualSync()
+      this.runSyncFromUi(() => this.v4Runtime.manualSync())
     })
 
     this.addRibbonIcon("arrow-up-circle", "GitHub Sync: Force Push", () => {
@@ -133,7 +153,7 @@ export default class FastSync extends Plugin {
     this.addCommand({
       id: "sync-all-files",
       name: "GitHub Sync: Sync",
-      callback: () => void this.v4Runtime.manualSync(),
+      callback: () => this.runSyncFromUi(() => this.v4Runtime.manualSync()),
     })
 
     this.addCommand({
@@ -155,7 +175,7 @@ export default class FastSync extends Plugin {
         this.startupSyncTimeout = window.setTimeout(() => {
           this.startupSyncTimeout = null;
           const runtime = this.v4Runtime;
-          if (runtime) void runtime.startupSync();
+          if (runtime) this.runSyncFromUi(() => runtime.startupSync());
         }, 1500);
       } else {
         // Not configured – enable watch immediately
@@ -197,7 +217,7 @@ export default class FastSync extends Plugin {
     if (!shouldRunScheduledSync(this.settings)) return;
     const seconds = normalizeScheduledSyncIntervalSeconds(this.settings.scheduledSyncIntervalSeconds);
     this.scheduledSyncTimer = window.setInterval(() => {
-      void this.v4Runtime.scheduledSync()
+      this.runSyncFromUi(() => this.v4Runtime.scheduledSync())
     }, seconds * 1000);
   }
 
@@ -368,7 +388,7 @@ export default class FastSync extends Plugin {
     span.onclick = () => {
       if (runtime && !runtime.isSyncing) {
         if (this.unloaded) return
-        void runtime.manualSync()
+        this.runSyncFromUi(() => runtime.manualSync())
       }
     };
     this.statusDisplaySignature = signature;
@@ -445,8 +465,8 @@ export default class FastSync extends Plugin {
         if (resolved || !unlocked) return
         resolved = true
         modal.close()
-        if (operation === "forcePush") void this.v4Runtime.forcePush()
-        else void this.v4Runtime.forcePull()
+        if (operation === "forcePush") this.runSyncFromUi(() => this.v4Runtime.forcePush())
+        else this.runSyncFromUi(() => this.v4Runtime.forcePull())
         finish()
       }
       confirmButton.onclick = runConfirmedOperation

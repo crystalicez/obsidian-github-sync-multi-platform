@@ -88,7 +88,7 @@ export class V4SyncCenterView extends ItemView {
     const actions = header.createDiv({ cls: "github-sync-center__actions" })
     actions.createEl("button", { text: "Commits" }).onclick = () => void this.renderCommitMode()
     actions.createEl("button", { text: "Current file" }).onclick = () => void this.renderFileMode()
-    actions.createEl("button", { text: "Sync now", cls: "mod-cta" }).onclick = () => void this.plugin.v4Runtime.manualSync()
+    actions.createEl("button", { text: "Sync now", cls: "mod-cta" }).onclick = () => this.plugin.runSyncFromUi(() => this.plugin.v4Runtime.manualSync())
     this.clearProgressElements()
     this.progressCard = this.contentEl.createDiv({ cls: "github-sync-center__progress" })
     const progressHeading = this.progressCard.createDiv({ cls: "github-sync-center__progress-heading" })

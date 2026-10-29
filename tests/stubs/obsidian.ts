@@ -149,12 +149,14 @@ export class ElementStub {
 }
 
 export class Modal {
+  static lastCreated: Modal | undefined;
   titleEl = new ElementStub();
   contentEl = new ElementStub();
   app: unknown;
 
   constructor(app: unknown) {
     this.app = app;
+    Modal.lastCreated = this;
     modalEvents.push("construct");
   }
 
