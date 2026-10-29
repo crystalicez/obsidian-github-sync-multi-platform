@@ -160,8 +160,9 @@ export class Modal {
     modalEvents.push("construct");
   }
 
+  onClose(): void {}
   open() { modalEvents.push("open"); }
-  close() { modalEvents.push("close"); }
+  close() { modalEvents.push("close"); this.onClose(); }
 }
 
 export class WorkspaceLeaf {

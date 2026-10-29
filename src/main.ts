@@ -405,15 +405,34 @@ export default class FastSync extends Plugin {
   async showForceConfirm(operation: "forcePush" | "forcePull"): Promise<void> {
     await new Promise<void>((resolve) => {
       const modal = new Modal(this.app)
+      const confirmedSettings = { ...this.settings }
+      // A confirmation authorizes the displayed target and sync scope, not
+      // whichever Settings snapshot may be installed before the button click.
+      // Only presentation and automatic scheduling settings are immaterial.
+      const presentationOrSchedule = new Set<keyof PluginSettings>([
+        "lastSyncTime", "statusBarStatusEnabled", "consoleLoggingEnabled",
+        "clipboardReadTip", "syncOnStartup", "syncOnLocalChange",
+        "scheduledSyncEnabled", "scheduledSyncIntervalSeconds",
+      ])
+      const stillConfirmed = () => !this.settingsSaveInProgress
+        && !this.settingTab?.isDirty()
+        && (Object.keys(confirmedSettings) as (keyof PluginSettings)[])
+          .every(key => presentationOrSchedule.has(key)
+            || confirmedSettings[key] === this.settings[key])
       let settled = false
+      let resolved = false
+
       const finish = () => {
         if (settled) return
         settled = true
         resolve()
       }
-      modal.onClose = finish
-      const repo = `${this.settings.githubOwner}/${this.settings.githubRepo}`
-      const branch = this.settings.githubBranch || "main"
+      modal.onClose = () => {
+        resolved = true
+        finish()
+      }
+      const repo = `${confirmedSettings.githubOwner}/${confirmedSettings.githubRepo}`
+      const branch = confirmedSettings.githubBranch || "main"
       const localFileCount = this.app.vault.getFiles().filter(file => !file.path.startsWith(`${this.app.vault.configDir}/`)).length
 
       const title = operation === "forcePush" ? "Force push local vault to remote?" : "Force pull remote vault to local?";
@@ -447,7 +466,7 @@ export default class FastSync extends Plugin {
 
       let dragging = false
       let unlocked = false
-      let resolved = false
+
       const resetSlider = () => {
         fill.style.width = "0%"
         handle.style.transform = "translateX(0)"
@@ -463,6 +482,14 @@ export default class FastSync extends Plugin {
       }
       const runConfirmedOperation = () => {
         if (resolved || !unlocked) return
+        if (!stillConfirmed() || this.unloaded) {
+          resolved = true
+          modal.close()
+          if (!this.unloaded) {
+            new Notice("GitHub Sync: Force confirmation expired because Sync settings changed. Review the current target and confirm again.")
+          }
+          return
+        }
         resolved = true
         modal.close()
         if (operation === "forcePush") this.runSyncFromUi(() => this.v4Runtime.forcePush())

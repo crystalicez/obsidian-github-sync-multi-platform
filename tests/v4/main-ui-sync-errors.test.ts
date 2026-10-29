@@ -188,6 +188,97 @@ test("D156 after deliberate slider confirmation Force Push/Pull failures are con
   } finally { ui.cleanup(); resetModalTestState(); Notice.messages.length = 0 }
 })
 
+
+test("D157 stale Force confirmation cannot switch repository, branch, credentials, encryption, vault or scope", async () => {
+  const scenarios = [
+    { name: "repository replacement", apply: (s: typeof DEFAULT_SETTINGS) => ({ ...s, githubRepo: "different-repository" }) },
+    { name: "owner replacement", apply: (s: typeof DEFAULT_SETTINGS) => ({ ...s, githubOwner: "other-owner" }) },
+    { name: "in-place branch mutation", apply: (s: typeof DEFAULT_SETTINGS) => { s.githubBranch = "unapproved-branch"; return s } },
+    { name: "credential rotation", apply: (s: typeof DEFAULT_SETTINGS) => ({ ...s, githubToken: "new-token-hidden" }) },
+    { name: "encryption mode", apply: (s: typeof DEFAULT_SETTINGS) => ({ ...s, encryptionMode: "encrypted" as const }) },
+    { name: "new passphrase", apply: (s: typeof DEFAULT_SETTINGS) => ({ ...s, encryptionPassphrase: "hidden-passphrase" }) },
+    { name: "different vault", apply: (s: typeof DEFAULT_SETTINGS) => ({ ...s, vault: "differentVault" }) },
+    { name: "ignore regex", apply: (s: typeof DEFAULT_SETTINGS) => ({ ...s, ignorePathRegex: "^secret/" }) },
+    { name: "config sync scope", apply: (s: typeof DEFAULT_SETTINGS) => ({ ...s, syncPlugins: !s.syncPlugins }) },
+    { name: "conflict policy", apply: (s: typeof DEFAULT_SETTINGS) => ({ ...s, conflictPolicy: "ask" as const }) },
+  ]
+  for (const kind of ["forcePush", "forcePull"] as const) {
+    const ui = setupUi()
+    resetModalTestState()
+    Notice.messages.length = 0
+    try {
+      await ui.plugin.onload()
+      ui.setMode("resolve")
+      for (const scenario of scenarios) {
+        const before = { ...ui.plugin.settings }
+        resetModalTestState()
+        const dialog = ui.plugin.showForceConfirm(kind)
+        const modal = Modal.lastCreated!
+        const action = modalButtons.find(b => b.text === (kind === "forcePush" ? "Force push" : "Force pull"))
+        const slider = modal.contentEl.findByClass("github-sync-force-confirm-slider")
+        assert.ok(action && slider, scenario.name)
+        assert.match(modal.contentEl.flattenText(), /Repository: owner\/vault/)
+        assert.match(modal.contentEl.flattenText(), /Branch: main/)
+        slider.onpointerdown?.({ pointerId: 1, clientX: 300 } as PointerEvent)
+        ui.plugin.settings = scenario.apply(ui.plugin.settings)
+        action.click()
+        await dialog
+        await tick()
+        assert.deepEqual(ui.attempts, [], kind + " " + scenario.name)
+        assert.match(Notice.messages.at(-1) ?? "", /Force confirmation expired/)
+        assert.doesNotMatch(Notice.messages.at(-1) ?? "", /new-token-hidden|hidden-passphrase|unapproved-branch/)
+        action.click()
+        assert.equal(ui.attempts.length, 0, "stale confirmation must not start again after close")
+        ui.plugin.settings = before
+      }
+      // Cosmetic progress updates must not invalidate an otherwise valid target.
+      resetModalTestState()
+      const valid = ui.plugin.showForceConfirm(kind)
+      const action = modalButtons.find(b => b.text === (kind === "forcePush" ? "Force push" : "Force pull"))
+      const slider = Modal.lastCreated?.contentEl.findByClass("github-sync-force-confirm-slider")
+      assert.ok(action && slider)
+      slider.onpointerdown?.({ pointerId: 1, clientX: 300 } as PointerEvent)
+      ui.plugin.settings.lastSyncTime += 1
+      ui.plugin.settings.statusBarStatusEnabled = !ui.plugin.settings.statusBarStatusEnabled
+      action.click()
+      action.click()
+      await valid
+      await tick()
+      assert.deepEqual(ui.attempts, [kind], "fresh, unchanged target executes exactly once")
+    } finally {
+      ui.cleanup()
+      Notice.messages.length = 0
+      resetModalTestState()
+    }
+  }
+})
+
+test("D157 closing or cancelling an unlocked Force confirmation revokes stale button capability", async () => {
+  const ui = setupUi()
+  resetModalTestState()
+  try {
+    await ui.plugin.onload()
+    ui.setMode("resolve")
+    for (const mode of ["cancel", "close"] as const) {
+      resetModalTestState()
+      const dialog = ui.plugin.showForceConfirm("forcePull")
+      const action = modalButtons.find(b => b.text === "Force pull")
+      const slider = Modal.lastCreated?.contentEl.findByClass("github-sync-force-confirm-slider")
+      assert.ok(action && slider)
+      slider.onpointerdown?.({ pointerId: 1, clientX: 300 } as PointerEvent)
+      if (mode === "cancel") {
+        modalButtons.find(b => b.text === "Cancel")!.click()
+      } else {
+        Modal.lastCreated!.close()
+      }
+      await dialog
+      action.click()
+      await tick()
+      assert.deepEqual(ui.attempts, [], "closed or cancelled dialogs never authorize a destructive operation")
+    }
+  } finally { ui.cleanup(); resetModalTestState() }
+})
+
 test("D156 Force action is still disabled until deliberate confirmation, even with a rejecting Sync executor", async () => {
   const ui = setupUi()
   resetModalTestState()
