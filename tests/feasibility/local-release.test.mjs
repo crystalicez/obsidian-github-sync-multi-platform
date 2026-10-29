@@ -213,11 +213,31 @@ test("first public release fails closed until the Re-encryption Wizard acceptanc
       }), /Re-encryption Wizard.*fully qualified/u,
     );
   }
+  const qualified = {
+    ...blocked, status: "qualified",
+    checks: Object.fromEntries(REENCRYPTION_RELEASE_CHECKS.map(x => [x, "passed"])),
+  };
+  for (const [label, manifest] of [
+    ["unknown top-level criterion", { ...qualified, futureAcceptance: "pending" }],
+    ["unknown backup policy", { ...qualified,
+      backupPolicy: { ...qualified.backupPolicy, secondCopyRequired: "pending" } }],
+    ["future pending check", { ...qualified,
+      checks: { ...qualified.checks, physicalPowerLossQualification: "pending" } }],
+    ["future passed check", { ...qualified,
+      checks: { ...qualified.checks, physicalPowerLossQualification: "passed" } }],
+    ["missing known check", { ...qualified,
+      checks: Object.fromEntries(Object.entries(qualified.checks)
+        .filter(([key]) => key !== "nativeDesktopAndMobileAcceptance")) }],
+  ]) {
+    await assert.rejects(
+      () => requireReencryptionWizardReleaseGate({
+        cwd, readText: async () => JSON.stringify(manifest),
+      }), /Re-encryption Wizard.*fully qualified/u,
+      label + " must not silently pass an older release script",
+    );
+  }
   await requireReencryptionWizardReleaseGate({
-    cwd, readText: async () => JSON.stringify({
-      ...blocked, status: "qualified",
-      checks: Object.fromEntries(REENCRYPTION_RELEASE_CHECKS.map(x => [x, "passed"])),
-    }),
+    cwd, readText: async () => JSON.stringify(qualified),
   });
   const h = await harness({
     services: { requireReencryptionWizardReleaseGate() { throw new Error("Re-encryption Wizard acceptance blocked"); } },
