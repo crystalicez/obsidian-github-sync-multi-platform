@@ -496,6 +496,55 @@ test("v4 runtime keeps the exact upload failure phase and logical path", async (
   fixture.runtime.dispose();
 });
 
+test("D160 runtime records failed state for unusual adapter throws without reflecting opaque payloads", async () => {
+  const unexpected = "Unexpected Sync failure. Review Sync status before retrying manually.";
+  for (const thrown of [
+    null,
+    "private-token: sensitive data in an arbitrary rejection",
+    { secret: "private payload", path: "vault/private.md" },
+    new Error(""),
+    new Error("    "),
+  ]) {
+    const fixture = plaintextRuntimeFixture();
+    fixture.github.createBlobOverride = async () => { throw thrown; };
+    Notice.messages.length = 0;
+    try {
+      const result = await fixture.runtime.forcePush();
+      assert.equal(result.status, "completed", "runtime catches errors and reports failure through its progress state");
+      assert.equal(fixture.runtime.progressSnapshot.lifecycle, "failed");
+      assert.equal(fixture.runtime.progressSnapshot.failurePhase, "uploading");
+      assert.equal(fixture.runtime.progressSnapshot.errorMessage, unexpected);
+      assert.deepEqual(Notice.messages.filter(text => text.startsWith("GitHub Sync failed:")), [
+        `GitHub Sync failed: ${unexpected}`,
+      ]);
+      assert.ok(fixture.github.blobAttempts > 0, "injected failure must be reached during real upload");
+      assert.equal(fixture.github.ref, null, "failed upload must not publish a remote ref");
+      assert.doesNotMatch(Notice.messages.join(" "), /private-token|sensitive data|private payload|vault\/private/u);
+    } finally {
+      fixture.runtime.dispose();
+      Notice.messages.length = 0;
+    }
+  }
+});
+
+test("D160 genuine Error upload failure still retains actionable terminal phase and message", async () => {
+  const fixture = plaintextRuntimeFixture();
+  fixture.github.createBlobOverride = async () => { throw new Error("synthetic upstream rejection"); };
+  Notice.messages.length = 0;
+  try {
+    await fixture.runtime.forcePush();
+    assert.equal(fixture.runtime.progressSnapshot.lifecycle, "failed");
+    assert.equal(fixture.runtime.progressSnapshot.failurePhase, "uploading");
+    assert.equal(fixture.runtime.progressSnapshot.errorMessage, "synthetic upstream rejection");
+    assert.ok(Notice.messages.includes("GitHub Sync failed: synthetic upstream rejection"));
+    assert.ok(fixture.github.blobAttempts > 0);
+    assert.equal(fixture.github.ref, null, "failed upload must not publish a remote ref");
+  } finally {
+    fixture.runtime.dispose();
+    Notice.messages.length = 0;
+  }
+});
+
 test("v4 runtime emits a warning when verbose logging is enabled and sync fails", async () => {
   const fixture = plaintextRuntimeFixture();
   fixture.plugin.settings.consoleLoggingEnabled = true;

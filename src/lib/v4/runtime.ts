@@ -876,7 +876,12 @@ export class V4PluginRuntime {
       throw lastError
     } catch (error) {
       if (error instanceof V4CancelledError) return { changedFiles: 0 }
-      const message = (error as Error).message
+      // Third-party adapters can reject with null, a string, or an arbitrary
+      // value. Never throw again while publishing the terminal failed state,
+      // or expose a raw non-Error payload (which may contain credentials).
+      const message = error instanceof Error && typeof error.message === "string" && error.message.trim()
+        ? error.message
+        : "Unexpected Sync failure. Review Sync status before retrying manually."
       const snapshot = this.progressStore.snapshot
       const publicationRace = isV4PublicationRaceError(error) ? error : undefined
       syncConsoleLog(settings, "warn", "V4 sync failed", {
