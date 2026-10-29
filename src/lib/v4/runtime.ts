@@ -185,7 +185,14 @@ export class V4PluginRuntime {
     this.recentlyStagedPaths.clear()
     this.coordinator.dispose()
     this.progressStore.dispose()
-    void this.coordinator.whenIdle().finally(() => this.keyringCache.dispose())
+    // Observe *both* outcomes of the final active Sync. A detached finally()
+    // would still reject if the Sync unexpectedly failed, creating an
+    // unhandled shutdown Promise while clearing secrets. Its own caller
+    // continues to observe the original run rejection independently.
+    void this.coordinator.whenIdle().then(
+      () => this.keyringCache.dispose(),
+      () => this.keyringCache.dispose(),
+    )
   }
 
   credentialsChanged(): void {
