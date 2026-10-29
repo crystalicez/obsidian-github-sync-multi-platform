@@ -159,7 +159,7 @@ export class GitHubClient {
           || responseHeaders["x-ratelimit-remaining"] === "0"
         ));
         if (rateLimited) {
-          const error = new Error(`GitHub request failed: HTTP ${response.status} - ${response.text || "rate limited"}`) as Error & { status?: number; headers?: Record<string, string> };
+          const error = new Error(`GitHub request failed: HTTP ${response.status} (rate-limited).`) as Error & { status?: number; headers?: Record<string, string> };
           error.status = response.status;
           error.headers = responseHeaders;
           throw error;
@@ -180,7 +180,7 @@ export class GitHubClient {
         try {
           const response = await this.request({ ...input.options, body }, transientBytes);
           if (input.successStatuses.includes(response.status)) return response;
-          const error = this.gitHttpError(input.action, response.status, response.text);
+          const error = this.gitHttpError(input.action, response.status);
           if (classifyV4MutationFailure(error) !== "unknown-outcome") throw error;
           lastUnknown = error;
         } catch (error) {
@@ -267,7 +267,7 @@ export class GitHubClient {
       if (response.status === 404) {
         return GIT_COMMIT_SHA.test(ref) ? this.getImmutableFileFromTree(path, ref) : null;
       }
-      throw new Error("Failed to get file bytes " + path + ": HTTP " + response.status + " - " + response.text);
+      throw this.gitHttpError("Failed to get file bytes", response.status);
     } catch (error) {
       const httpError = error as { status?: number };
       if (httpError.status === 404) {
@@ -286,7 +286,7 @@ export class GitHubClient {
       throw: false,
     });
     if (response.status === 200) return new Uint8Array(response.arrayBuffer);
-    throw new Error("Failed to get blob " + sha + ": HTTP " + response.status + " - " + response.text);
+    throw this.gitHttpError("Failed to get blob", response.status);
   }
 
   async listCommits(options: { page?: number; perPage?: number } = {}): Promise<GitHubCommitSummary[]> {
@@ -298,7 +298,7 @@ export class GitHubClient {
       headers: this.headers,
       throw: false,
     });
-    if (response.status !== 200) throw this.gitHttpError("Failed to list commits", response.status, response.text);
+    if (response.status !== 200) throw this.gitHttpError("Failed to list commits", response.status);
     const commits = response.json as Array<{
       sha?: string;
       commit?: { message?: string; author?: { name?: string; date?: string } };
@@ -320,7 +320,7 @@ export class GitHubClient {
       headers: this.headers,
       throw: false,
     });
-    if (response.status !== 200) throw this.gitHttpError("Failed to get historical tree", response.status, response.text);
+    if (response.status !== 200) throw this.gitHttpError("Failed to get historical tree", response.status);
     return response.json as GitHubTree;
   }
 
@@ -328,8 +328,10 @@ export class GitHubClient {
     return this.config.branch.split("/").map(encodeURIComponent).join("/");
   }
 
-  private gitHttpError(action: string, status: number, text: string): Error & { status?: number } {
-    const error = new Error(`${action}: HTTP ${status} - ${text}`) as Error & { status?: number };
+  private gitHttpError(action: string, status: number): Error & { status?: number } {
+    // GitHub error bodies are untrusted and may echo credentials or file data.
+    // Keep the status for retry decisions, never include the body in notices.
+    const error = new Error(`${action}: HTTP ${status}`) as Error & { status?: number };
     error.status = status;
     return error;
   }
@@ -343,7 +345,7 @@ export class GitHubClient {
       throw: false,
     });
     if (response.status !== 200) {
-      throw this.gitHttpError("Failed to read GitHub repository identity", response.status, response.text);
+      throw this.gitHttpError("Failed to read GitHub repository identity", response.status);
     }
     const raw = response.json as { id?: unknown; full_name?: unknown } | null;
     const id = raw?.id;
@@ -371,7 +373,7 @@ export class GitHubClient {
       throw: false,
     });
     if (response.status !== 200) {
-      throw this.gitHttpError("Failed to read GitHub default branch", response.status, response.text);
+      throw this.gitHttpError("Failed to read GitHub default branch", response.status);
     }
     const json = response.json as { default_branch?: unknown } | null;
     if (typeof json?.default_branch !== "string") {
@@ -388,7 +390,7 @@ export class GitHubClient {
       headers: this.headers,
       throw: false,
     });
-    if (response.status !== 200) throw this.gitHttpError("Failed to get git ref", response.status, response.text);
+    if (response.status !== 200) throw this.gitHttpError("Failed to get git ref", response.status);
     const json = response.json as { ref?: string; object?: { sha?: string; type?: string } };
     // Do not fabricate ref/type fields missing from an untrusted GitHub reply.
     if (!json || typeof json !== "object" || Array.isArray(json)
@@ -421,7 +423,7 @@ export class GitHubClient {
       return { ref: first.ref ?? "", sha: first.object?.sha ?? "", type: first.object?.type ?? "commit" };
     }
     if (response.status === 404 || response.status === 409) return null;
-    throw this.gitHttpError("Failed to inspect git refs", response.status, response.text);
+    throw this.gitHttpError("Failed to inspect git refs", response.status);
   }
 
   private async ensureConfiguredBootstrapRef(commitSha: string): Promise<GitHubGitRef> {
@@ -492,7 +494,7 @@ export class GitHubClient {
       headers: this.headers,
       throw: false,
     });
-    if (response.status !== 200) throw this.gitHttpError("Failed to get git commit", response.status, response.text);
+    if (response.status !== 200) throw this.gitHttpError("Failed to get git commit", response.status);
     const json = response.json as { sha?: string; message?: string; tree?: { sha?: string }; parents?: Array<{ sha?: string }> };
     // A mismatched or omitted immutable commit identity is not proof of the
     // requested commit's tree. Never infer remote-file absence from that body.
@@ -564,7 +566,7 @@ export class GitHubClient {
             variables: { owner: this.config.owner, repo: this.config.repo },
           }),
         });
-        if (response.status !== 200) throw this.gitHttpError("Failed to resolve repository GraphQL ID", response.status, response.text);
+        if (response.status !== 200) throw this.gitHttpError("Failed to resolve repository GraphQL ID", response.status);
         const json = response.json as { data?: { repository?: { id?: unknown } | null }; errors?: unknown };
         if (Array.isArray(json?.errors) && json.errors.length > 0) throw new Error("GitHub GraphQL repository lookup failed.");
         const id = json?.data?.repository?.id;
@@ -604,10 +606,8 @@ export class GitHubClient {
     if (Array.isArray(json?.errors) && json.errors.length > 0) {
       // GraphQL may respond HTTP 200 to a rejected beforeOid. Publication
       // reconciliation will re-read the actual head and decide how to replan.
-      throw new Error("GitHub GraphQL strict CAS rejected: " + json.errors.map(error =>
-        typeof (error as { message?: unknown })?.message === "string"
-          ? (error as { message: string }).message : "unknown GraphQL error",
-      ).join("; "));
+      // Never display untrusted GraphQL errors[].message in user-visible status.
+      throw new Error("GitHub GraphQL strict CAS rejected. Re-check the branch HEAD (beforeOid).");
     }
     if (!json?.data?.updateRefs || typeof json.data.updateRefs !== "object") {
       throw new Error("GitHub GraphQL strict CAS response is missing updateRefs confirmation.");
