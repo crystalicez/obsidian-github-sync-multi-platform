@@ -102,6 +102,15 @@ export class V4ReencryptionWizardModal extends Modal {
       && snapshot.encryptionPassphrase.length > 0
   }
 
+  // A Sync can start after the initial idle check while a slow GitHub
+  // request is in flight. Never mark an old Preview observation as ready
+  // while a local Sync is actively changing the vault/connection state.
+  private assertSyncStillIdle(): void {
+    if (this.plugin.v4Runtime.isSyncing) {
+      throw new Error("Sync started during verification. Wait for it to finish and verify again.")
+    }
+  }
+
   private sourceRepoId(): string {
     const s = this.initialSettings
     return `${s.githubOwner}/${s.githubRepo}#${s.githubBranch}`
@@ -163,19 +172,27 @@ export class V4ReencryptionWizardModal extends Modal {
       const client = this.scopedClient(this.initialSettings.githubBranch)
       const expectedFullName = `${this.initialSettings.githubOwner}/${this.initialSettings.githubRepo}`
       const repo = await client.getRepositoryIdentity()
+      if (this.closed || controller.signal.aborted || epoch !== this.requestEpoch) return
+      this.assertSyncStillIdle()
       if (repo.fullName.toLowerCase() !== expectedFullName.toLowerCase()) {
         throw new Error("GitHub repository identity does not match settings.")
       }
       const defaultBranch = await client.getRepositoryDefaultBranch()
+      if (this.closed || controller.signal.aborted || epoch !== this.requestEpoch) return
+      this.assertSyncStillIdle()
+      if (!this.matchesConnection()) throw new Error("Connection settings changed during verification.")
       const proof = await verifyGitHubReencryptionForkSource({
         github: client, expectedRepoId: this.sourceRepoId(),
         expectedBranch: this.initialSettings.githubBranch,
         passphrase: this.initialSettings.encryptionPassphrase,
         signal: controller.signal,
       })
+      if (this.closed || controller.signal.aborted || epoch !== this.requestEpoch) return
+      this.assertSyncStillIdle()
       const repoAfter = await client.getRepositoryIdentity()
       const defaultBranchAfter = await client.getRepositoryDefaultBranch()
       if (this.closed || controller.signal.aborted || epoch !== this.requestEpoch) return
+      this.assertSyncStillIdle()
       if (repo.id !== repoAfter.id || repo.fullName.toLowerCase() !== repoAfter.fullName.toLowerCase()
         || defaultBranch !== defaultBranchAfter) {
         throw new Error("Repository identity or default branch changed during source verification.")
@@ -197,9 +214,11 @@ export class V4ReencryptionWizardModal extends Modal {
       if (!this.closed && !controller.signal.aborted && epoch === this.requestEpoch) {
         // Network/backend exceptions can include sensitive request context.
         // Never display raw error text or vault filenames here.
-        this.errorMessage = error instanceof Error && /identity|settings changed|passphrase/i.test(error.message)
-          ? "Source verification failed: check repository identity, configuration, passphrase and connection."
-          : "Source verification failed. Check connection, credentials and remote data integrity."
+        this.errorMessage = error instanceof Error && error.message.startsWith("Sync started during verification.")
+          ? "Sync started during verification. Wait for it to finish and verify again."
+          : error instanceof Error && /identity|settings changed|passphrase/i.test(error.message)
+            ? "Source verification failed: check repository identity, configuration, passphrase and connection."
+            : "Source verification failed. Check connection, credentials and remote data integrity."
       }
     } finally {
       if (epoch === this.requestEpoch) {
@@ -238,6 +257,8 @@ export class V4ReencryptionWizardModal extends Modal {
         this.scopedClient(this.backupBranch).getGitRefOrNull(),
       ])
       if (this.closed || controller.signal.aborted || epoch !== this.requestEpoch) return
+      this.assertSyncStillIdle()
+      if (!this.matchesConnection()) throw new Error("Wizard settings changed during verification.")
       if (destination !== null || backup !== null) {
         throw new Error("A proposed branch already exists. Choose unused branch names.")
       }
@@ -251,6 +272,7 @@ export class V4ReencryptionWizardModal extends Modal {
         sourceClient.getGitRef(),
       ])
       if (this.closed || controller.signal.aborted || epoch !== this.requestEpoch) return
+      this.assertSyncStillIdle()
       if (repo.id !== proposal.physicalRepositoryId
         || repo.fullName.toLowerCase() !== `${this.initialSettings.githubOwner}/${this.initialSettings.githubRepo}`.toLowerCase()) {
         throw new Error("Repository identity changed.")
@@ -273,7 +295,7 @@ export class V4ReencryptionWizardModal extends Modal {
       }
     } catch (error) {
       if (!this.closed && !controller.signal.aborted && epoch === this.requestEpoch) {
-        this.errorMessage = error instanceof Error && /already exists|settings changed|identity changed|source branch or default branch changed/i.test(error.message)
+        this.errorMessage = error instanceof Error && /already exists|settings changed|identity changed|source branch or default branch changed|^Sync started during verification[.]/i.test(error.message)
           ? error.message
           : "Branch verification failed. GitHub must confirm both names are unused."
       }

@@ -260,6 +260,98 @@ test("D153 Wizard branch availability rechecks exact pinned Source HEAD and defa
   }
 })
 
+
+test("D154 Wizard discards async preview reads if Sync starts, settings change or dialog closes", async () => {
+  const respond = (json: unknown, status = 200) => ({
+    status, text: status === 200 ? "" : "unavailable", json, headers: {},
+  })
+  for (const mode of ["source", "branches"] as const) {
+    for (const interruption of ["sync", "settings", "close"] as const) {
+      const plugin = fakePlugin()
+      const wizard = new V4ReencryptionWizardModal(plugin)
+      const view = wizard as unknown as {
+        source?: {
+          physicalRepositoryId: number; defaultBranch: string; pinnedSourceCommitSha: string;
+          verifiedFileCount: number; verifiedRemoteObjectCount: number;
+          totalVerifiedPlaintextBytes: string
+        }
+        checked?: {pinnedSourceCommitSha: string}
+        destinationBranch: string; backupBranch: string
+        newPassphrase: string; confirmPassphrase: string
+        step: number; render(): void
+        verifySource(): Promise<void>; checkBranchAvailability(): Promise<void>
+      }
+      if (mode === "branches") {
+        view.source = {
+          physicalRepositoryId: 444, defaultBranch: "main",
+          pinnedSourceCommitSha: "a".repeat(40),
+          verifiedFileCount: 0, verifiedRemoteObjectCount: 0,
+          totalVerifiedPlaintextBytes: "0",
+        }
+        view.destinationBranch = "rekey/2026-10-29-abcdef01"
+        view.backupBranch = "backup/rekey-2026-10-29-abcdef01"
+        view.newPassphrase = "new-preview-only-secret"
+        view.confirmPassphrase = "new-preview-only-secret"
+      }
+      let entered!: () => void
+      let release!: () => void
+      const requestEntered = new Promise<void>(resolve => { entered = resolve })
+      const requestReleased = new Promise<void>(resolve => { release = resolve })
+      const requests: Array<{url: string; method?: string; body?: unknown}> = []
+      setRequestUrlHandler(async raw => {
+        const request = raw as {url: string; method?: string; body?: unknown}
+        requests.push(request)
+        assert.equal(request.method, "GET", "Preview must be read-only")
+        assert.equal(request.body, undefined, "Preview must not upload data")
+        if (request.url.includes("/git/ref/heads/")) {
+          return request.url.includes("/heads/main?")
+            ? respond({ref: "refs/heads/main",
+              object: {sha: "a".repeat(40), type: "commit"}})
+            : respond({}, 404)
+        }
+        assert.equal(request.url, "https://api.github.com/repos/owner/vault")
+        entered()
+        await requestReleased
+        return respond({id: 444, full_name: "owner/vault", default_branch: "main"})
+      })
+      try {
+        wizard.onOpen()
+        if (mode === "branches") {
+          view.step = 2
+          view.render()
+        }
+        const pending = mode === "source"
+          ? view.verifySource() : view.checkBranchAvailability()
+        await requestEntered
+        if (interruption === "sync") {
+          (plugin.v4Runtime as unknown as {isSyncing: boolean}).isSyncing = true
+        } else if (interruption === "settings") {
+          plugin.settings.githubToken = "changed-token-never-render"
+        } else {
+          wizard.onClose()
+        }
+        release()
+        await pending
+        assert.equal(view.checked, undefined, mode + "/" + interruption)
+        if (mode === "source") {
+          assert.equal(view.source, undefined, "stale verification must not persist source")
+          assert.ok(requests.length <= 2, "no full encrypted source scan after interrupted preflight")
+        }
+        const content = (wizard.contentEl as unknown as {flattenText(): string}).flattenText()
+        if (interruption === "sync") {
+          assert.match(content, /Sync started during verification/i)
+        }
+        assert.doesNotMatch(content, /source-passphrase-never-render|source-token-never-render|changed-token-never-render|new-preview-only-secret/u)
+        assert.ok(requests.every(r => r.method === "GET" && r.body === undefined))
+      } finally {
+        wizard.onClose()
+        release()
+        setRequestUrlHandler(null)
+      }
+    }
+  }
+})
+
 test("D92 Wizard has no direct GitHub mutation or local settings-save capability", () => {
   const wizard = new V4ReencryptionWizardModal(fakePlugin())
   wizard.onOpen()
