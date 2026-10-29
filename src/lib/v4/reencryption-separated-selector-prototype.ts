@@ -144,8 +144,11 @@ function matchingSettings(input: V4ReencryptionProposedCommitInspectionInput): b
 /**
  * Diagnostic-only restart reader. It reads an independently stored selector
  * and both immutable Source and Shadow Index roots twice under an external
- * exclusive lease, bracketing the independently authenticated WAL. Readback
- * and a caller-provided durability callback do NOT establish crash durability.
+ * exclusive lease, bracketing the independently authenticated WAL. Two equal
+ * reads can miss an external writer's change-and-restore (ABA); a cooperating
+ * WAL lease does NOT fence independent OS processes or external editors.
+ * Readback and a caller-provided durability callback do NOT establish crash
+ * durability or authorize a production cutover.
  */
 export async function inspectV4ReencryptionSeparatedSelectorAfterRestart(
   input: V4ReencryptionProposedCommitInspectionInput,
