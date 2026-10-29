@@ -158,7 +158,7 @@ export class V4SyncCoordinator {
     if (this.timer !== undefined) this.cancel(this.timer);
     this.timer = this.schedule(() => {
       this.timer = undefined;
-      void this.flushLocalChanges();
+      this.observeBackgroundRun(this.flushLocalChanges());
     }, this.debounceMs);
   }
 
@@ -182,6 +182,23 @@ export class V4SyncCoordinator {
 
   async whenIdle(): Promise<void> {
     while (this.active) await this.active;
+  }
+
+  /**
+   * Only timer/follow-up runs have no caller to observe a rejection. Do not
+   * retry: the failed attempt may have an ambiguous remote write outcome.
+   * User-invoked runs still return their original rejecting Promise.
+   */
+  private observeBackgroundRun(run: Promise<V4CoordinatorRunResult>): void {
+    void run.catch(() => {
+      if (this.disposed) return;
+      try {
+        this.options.notice?.("GitHub Sync: Automatic Sync stopped unexpectedly. Review Sync status before retrying manually.");
+      } catch {
+        // Even a broken notification handler must not create another unhandled
+        // rejection from this detached background task.
+      }
+    });
   }
 
   private async flushLocalChanges(): Promise<V4CoordinatorRunResult> {
@@ -222,7 +239,7 @@ export class V4SyncCoordinator {
       }
       if (this.pending.length > 0 && this.flushAfterActive) {
         this.flushAfterActive = false;
-        void this.flushLocalChanges();
+        this.observeBackgroundRun(this.flushLocalChanges());
       }
     });
     this.active = tracked;

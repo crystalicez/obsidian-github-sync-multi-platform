@@ -40,6 +40,95 @@ test("v4 coordinator globally debounces and coalesces local changes for five sec
   assert.equal(executions[0].request.trigger, "localChange");
 });
 
+test("D155 debounced automatic Sync catches unexpected rejection without retrying a remote mutation", async () => {
+  const timers = new FakeTimers();
+  const notices: string[] = [];
+  let attempts = 0;
+  const coordinator = new V4SyncCoordinator({
+    execute: async () => {
+      attempts++;
+      if (attempts === 1) throw new Error("secret GitHub failure payload");
+      return { changedFiles: 0 };
+    },
+    notice: message => notices.push(message),
+    schedule: timers.schedule,
+    cancel: timers.cancel,
+  });
+  coordinator.enqueue({ type: "modify", path: "note.md", mtime: 1 });
+  timers.fireLatest();
+  await new Promise<void>(resolve => setImmediate(resolve));
+
+  assert.equal(coordinator.isSyncing, false);
+  assert.equal(attempts, 1, "never blindly replay failed automatic GitHub mutation");
+  assert.equal(timers.timers.size, 0);
+  assert.equal(notices.length, 1);
+  assert.match(notices[0]!, /Automatic Sync stopped unexpectedly/);
+  assert.doesNotMatch(notices[0]!, /secret|payload|note.md/i);
+  assert.equal((await coordinator.run({ operation: "normal", trigger: "manual" })).status, "completed");
+  assert.equal(attempts, 2, "a new explicit user Sync remains possible");
+});
+
+test("D155 after-active local-change follow-up also contains rejection without a retry loop", async () => {
+  const timers = new FakeTimers();
+  const notices: string[] = [];
+  let release!: () => void;
+  const firstPaused = new Promise<void>(resolve => { release = resolve; });
+  const executions: V4QueuedChange[][] = [];
+  const coordinator = new V4SyncCoordinator({
+    execute: async (_request, changes) => {
+      executions.push(changes);
+      if (executions.length === 1) await firstPaused;
+      if (executions.length === 2) throw new Error("private remote failure body");
+      return { changedFiles: changes.length };
+    },
+    notice: message => notices.push(message),
+    schedule: timers.schedule,
+    cancel: timers.cancel,
+  });
+  const first = coordinator.run({ operation: "normal", trigger: "manual" });
+  coordinator.enqueue({ type: "rename", oldPath: "a.md", path: "b.md", mtime: 12 });
+  timers.fireLatest();
+  release();
+  assert.equal((await first).status, "completed");
+  await new Promise<void>(resolve => setImmediate(resolve));
+
+  assert.deepEqual(executions, [[], [{ type: "rename", oldPath: "a.md", path: "b.md", mtime: 12 }]]);
+  assert.equal(coordinator.isSyncing, false);
+  assert.equal(notices.length, 1);
+  assert.match(notices[0]!, /Automatic Sync stopped unexpectedly/);
+  assert.doesNotMatch(notices[0]!, /private|body|a.md|b.md/);
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(executions.length, 2, "no automatic retry after unknown write outcome");
+  await coordinator.run({ operation: "normal", trigger: "manual" });
+  assert.equal(executions.length, 3);
+});
+
+test("D155 manual rejection remains observable and failed background work after disposal shows no notice", async () => {
+  const notices: string[] = [];
+  let attempts = 0;
+  const timers = new FakeTimers();
+  const coordinator = new V4SyncCoordinator({
+    execute: async () => {
+      attempts++;
+      throw new Error("sensitive unexpected failure");
+    },
+    notice: message => notices.push(message),
+    schedule: timers.schedule,
+    cancel: timers.cancel,
+  });
+  await assert.rejects(
+    coordinator.run({ operation: "normal", trigger: "manual" }),
+    /sensitive unexpected failure/,
+  );
+  assert.deepEqual(notices, [], "caller still owns manual failure handling");
+  coordinator.enqueue({ type: "modify", path: "later.md", mtime: 2 });
+  timers.fireLatest();
+  coordinator.dispose();
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(attempts, 2);
+  assert.deepEqual(notices, [], "closing the plugin suppresses stale detached failure notices");
+});
+
 test("v4 coordinator rejects repeated user operations while a sync is active", async () => {
   let release!: () => void;
   const blocker = new Promise<void>(resolve => { release = resolve; });
