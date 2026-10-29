@@ -167,6 +167,99 @@ test("D133 old-passphrase loss warning appears before migration confirmation, wi
   wizard.onClose()
 })
 
+
+
+test("D153 Wizard branch availability rechecks exact pinned Source HEAD and default branch via GET only", async () => {
+  const expectedSha = "a".repeat(40)
+  const otherSha = "b".repeat(40)
+  const respond = (json: unknown, status = 200) => ({
+    status, text: status === 200 ? "" : "unavailable", json, headers: {},
+  })
+  for (const scenario of [
+    "stable", "source-moved", "default-moved", "wrong-source-ref",
+    "missing-source-ref", "source-request-fails", "repository-swapped", "destination-collision",
+  ] as const) {
+    const plugin = fakePlugin()
+    const wizard = new V4ReencryptionWizardModal(plugin)
+    const view = wizard as unknown as {
+      source: {
+        physicalRepositoryId: number; defaultBranch: string; pinnedSourceCommitSha: string;
+        verifiedFileCount: number; verifiedRemoteObjectCount: number;
+        totalVerifiedPlaintextBytes: string
+      }
+      checked?: {
+        pinnedSourceCommitSha: string; physicalRepositoryId: number;
+        destinationRepoId: string; backupRepoId: string
+      }
+      step: number; render(): void; checkBranchAvailability(): Promise<void>
+      destinationBranch: string; backupBranch: string;
+      newPassphrase: string; confirmPassphrase: string
+    }
+    view.source = {
+      physicalRepositoryId: 444, defaultBranch: "main", pinnedSourceCommitSha: expectedSha,
+      verifiedFileCount: 0, verifiedRemoteObjectCount: 0, totalVerifiedPlaintextBytes: "0",
+    }
+    view.destinationBranch = "rekey/2026-10-29-abcdef01"
+    view.backupBranch = "backup/rekey-2026-10-29-abcdef01"
+    view.newPassphrase = "different-preview-only-passphrase"
+    view.confirmPassphrase = "different-preview-only-passphrase"
+    const requests: Array<{url: string; method?: string; body?: unknown}> = []
+    setRequestUrlHandler(async raw => {
+      const request = raw as {url: string; method?: string; body?: unknown}
+      requests.push(request)
+      assert.equal(request.method, "GET", "Preview must never send a mutation")
+      assert.equal(request.body, undefined, "Preview must never send request payloads")
+      if (request.url.includes("/git/ref/heads/")) {
+        if (request.url.includes("/heads/main?")) {
+          if (scenario === "missing-source-ref") return respond({}, 404)
+          if (scenario === "source-request-fails") return respond({}, 403)
+          return respond({
+            ref: scenario === "wrong-source-ref" ? "refs/heads/other" : "refs/heads/main",
+            object: { sha: scenario === "source-moved" ? otherSha : expectedSha, type: "commit" },
+          })
+        }
+        return scenario === "destination-collision"
+          && request.url.includes("/heads/rekey/")
+          ? respond({ ref: "refs/heads/rekey/2026-10-29-abcdef01",
+              object: { sha: otherSha, type: "commit" } })
+          : respond({}, 404)
+      }
+      assert.match(request.url, /^https:\/\/api\.github\.com\/repos\/owner\/vault$/u)
+      return respond({
+        id: scenario === "repository-swapped" ? 999 : 444,
+        full_name: "owner/vault",
+        default_branch: scenario === "default-moved" ? "alternate" : "main",
+      })
+    })
+    try {
+      wizard.onOpen()
+      view.step = 2
+      view.render()
+      await view.checkBranchAvailability()
+      const text = (wizard.contentEl as unknown as {flattenText(): string}).flattenText()
+      if (scenario === "stable") {
+        assert.equal(view.checked?.pinnedSourceCommitSha, expectedSha)
+        assert.equal(view.checked?.physicalRepositoryId, 444)
+        assert.match(text, /Both refs were absent at the time/i)
+        assert.equal(requests.length, 5, "two ref lookups + repo identity + default branch + source HEAD")
+      } else {
+        assert.equal(view.checked, undefined, scenario + " must not mark branch names ready")
+        if (scenario === "source-moved" || scenario === "default-moved") {
+          assert.match(text, /source again/i, "stale source must tell user to repeat verification")
+        }
+        assert.match(text, /Not checked|Check the destination/i)
+      }
+      assert.ok(requests.every(request => request.method === "GET" && request.body === undefined))
+      assert.ok(!text.includes("source-token-never-render"))
+      assert.ok(!text.includes("source-passphrase-never-render"))
+      assert.ok(!text.includes("different-preview-only-passphrase"))
+    } finally {
+      wizard.onClose()
+      setRequestUrlHandler(null)
+    }
+  }
+})
+
 test("D92 Wizard has no direct GitHub mutation or local settings-save capability", () => {
   const wizard = new V4ReencryptionWizardModal(fakePlugin())
   wizard.onOpen()

@@ -241,10 +241,25 @@ export class V4ReencryptionWizardModal extends Modal {
       if (destination !== null || backup !== null) {
         throw new Error("A proposed branch already exists. Choose unused branch names.")
       }
-      const repo = await this.scopedClient(this.initialSettings.githubBranch).getRepositoryIdentity()
+      // Branch absence is only useful for the same verified Source snapshot.
+      // Recheck the pinned HEAD and default branch; do not quietly approve an
+      // old preview after another device changed the source or its policy.
+      const sourceClient = this.scopedClient(this.initialSettings.githubBranch)
+      const [repo, defaultBranch, sourceRef] = await Promise.all([
+        sourceClient.getRepositoryIdentity(),
+        sourceClient.getRepositoryDefaultBranch(),
+        sourceClient.getGitRef(),
+      ])
+      if (this.closed || controller.signal.aborted || epoch !== this.requestEpoch) return
       if (repo.id !== proposal.physicalRepositoryId
         || repo.fullName.toLowerCase() !== `${this.initialSettings.githubOwner}/${this.initialSettings.githubRepo}`.toLowerCase()) {
         throw new Error("Repository identity changed.")
+      }
+      if (defaultBranch !== this.source?.defaultBranch
+        || sourceRef.ref !== `refs/heads/${this.initialSettings.githubBranch}`
+        || sourceRef.type !== "commit"
+        || sourceRef.sha !== proposal.pinnedSourceCommitSha) {
+        throw new Error("Source branch or default branch changed. Return to Preflight and verify the source again.")
       }
       if (!this.matchesConnection() || this.plan().destinationRepoId !== proposal.destinationRepoId
         || this.plan().backupRepoId !== proposal.backupRepoId) {
@@ -258,7 +273,7 @@ export class V4ReencryptionWizardModal extends Modal {
       }
     } catch (error) {
       if (!this.closed && !controller.signal.aborted && epoch === this.requestEpoch) {
-        this.errorMessage = error instanceof Error && /already exists|settings changed|identity changed/i.test(error.message)
+        this.errorMessage = error instanceof Error && /already exists|settings changed|identity changed|source branch or default branch changed/i.test(error.message)
           ? error.message
           : "Branch verification failed. GitHub must confirm both names are unused."
       }
@@ -372,8 +387,8 @@ export class V4ReencryptionWizardModal extends Modal {
     })
     new Setting(container).setName("Destination and backup branch availability")
       .setDesc(this.checked
-        ? "Both refs were absent at the time of the check. This is not a create-time guarantee."
-        : "Not checked. Confirm both new names are currently absent.")
+        ? "Both refs were absent at the time of the check, and Source HEAD/default branch still matched. This is not a create-time guarantee or a remote lock."
+        : "Not checked. Confirm both new names are absent and the verified Source has not changed.")
       .addButton(button => button.setButtonText(this.busy ? "Checking…" : "Check both branches")
         .setDisabled(this.busy)
         .onClick(() => void this.checkBranchAvailability()))
