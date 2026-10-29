@@ -406,6 +406,25 @@ export default class FastSync extends Plugin {
     await new Promise<void>((resolve) => {
       const modal = new Modal(this.app)
       const confirmedSettings = { ...this.settings }
+      const confirmedGithubClient = this.githubClient
+      // File counts alone would miss a delete-and-recreate with a different
+      // path. Compare the visible path inventory, not only its total.
+      const visibleVaultPaths = () => this.app.vault.getFiles()
+        .filter(file => !file.path.startsWith(`${this.app.vault.configDir}/`))
+        .map(file => file.path)
+        .sort()
+      const confirmedLocalPaths = visibleVaultPaths()
+      const sameVisibleVaultInventory = (): boolean => {
+        try {
+          const currentPaths = visibleVaultPaths()
+          return currentPaths.length === confirmedLocalPaths.length
+            && currentPaths.every((path, index) => path === confirmedLocalPaths[index])
+        } catch {
+          // Never authorize a destructive operation if the Vault inventory
+          // cannot be re-observed at confirmation time.
+          return false
+        }
+      }
       // A confirmation authorizes the displayed target and sync scope, not
       // whichever Settings snapshot may be installed before the button click.
       // Only presentation and automatic scheduling settings are immaterial.
@@ -415,6 +434,8 @@ export default class FastSync extends Plugin {
         "scheduledSyncEnabled", "scheduledSyncIntervalSeconds",
       ])
       const stillConfirmed = () => !this.settingsSaveInProgress
+        && this.githubClient === confirmedGithubClient
+        && sameVisibleVaultInventory()
         && !this.settingTab?.isDirty()
         && (Object.keys(confirmedSettings) as (keyof PluginSettings)[])
           .every(key => presentationOrSchedule.has(key)
@@ -433,7 +454,7 @@ export default class FastSync extends Plugin {
       }
       const repo = `${confirmedSettings.githubOwner}/${confirmedSettings.githubRepo}`
       const branch = confirmedSettings.githubBranch || "main"
-      const localFileCount = this.app.vault.getFiles().filter(file => !file.path.startsWith(`${this.app.vault.configDir}/`)).length
+      const localFileCount = confirmedLocalPaths.length
 
       const title = operation === "forcePush" ? "Force push local vault to remote?" : "Force pull remote vault to local?";
       const message = operation === "forcePush"

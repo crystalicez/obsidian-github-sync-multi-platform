@@ -189,6 +189,82 @@ test("D156 after deliberate slider confirmation Force Push/Pull failures are con
 })
 
 
+
+test("D158 Force confirmation refuses a swapped GitHub client or a changed visible vault inventory", async () => {
+  for (const kind of ["forcePush", "forcePull"] as const) {
+    const ui = setupUi()
+    resetModalTestState()
+    Notice.messages.length = 0
+    try {
+      await ui.plugin.onload()
+      ui.setMode("resolve")
+      const originalClient = { id: "first-connection" }
+      ui.plugin.githubClient = originalClient
+      const actionLabel = kind === "forcePush" ? "Force push" : "Force pull"
+      const startDialog = () => {
+        resetModalTestState()
+        const done = ui.plugin.showForceConfirm(kind)
+        const action = modalButtons.find(button => button.text === actionLabel)
+        const slider = Modal.lastCreated?.contentEl.findByClass("github-sync-force-confirm-slider")
+        assert.ok(action && slider)
+        slider.onpointerdown?.({ pointerId: 1, clientX: 300 } as PointerEvent)
+        return { done, action }
+      }
+
+      // The textual owner/branch/token is unchanged, but a new GitHubClient
+      // has replaced the one to which the original approval was bound.
+      const swapped = startDialog()
+      ui.plugin.githubClient = { id: "second-connection" }
+      swapped.action.click()
+      await swapped.done
+      assert.deepEqual(ui.attempts, [], kind + " must reject a replaced client with identical settings")
+      assert.match(Notice.messages.at(-1) ?? "", /confirmation expired/u)
+      assert.doesNotMatch(Notice.messages.at(-1) ?? "", /first-connection|second-connection/u)
+
+      // Count change: the displayed vault inventory was no longer accurate.
+      ui.plugin.githubClient = originalClient
+      const changedCount = startDialog()
+      ui.plugin.app.vault.getFiles = () => [{ path: "added.md" }]
+      changedCount.action.click()
+      await changedCount.done
+      assert.deepEqual(ui.attempts, [], kind + " must reject a changed file count")
+
+      // Even a same-count rename is a distinct visible vault inventory.
+      ui.plugin.app.vault.getFiles = () => [{ path: "original.md" }]
+      const changedPaths = startDialog()
+      assert.match(Modal.lastCreated!.contentEl.flattenText(), /Local vault files: 1/u)
+      ui.plugin.app.vault.getFiles = () => [{ path: "renamed.md" }]
+      changedPaths.action.click()
+      await changedPaths.done
+      assert.deepEqual(ui.attempts, [], kind + " must reject changed file paths at equal count")
+
+      // A read failure must fail closed, not authorize destructive writes.
+      ui.plugin.app.vault.getFiles = () => [{ path: "recover.md" }]
+      const unavailableInventory = startDialog()
+      ui.plugin.app.vault.getFiles = () => { throw new Error("private path enumeration failure") }
+      unavailableInventory.action.click()
+      await unavailableInventory.done
+      assert.deepEqual(ui.attempts, [])
+      assert.doesNotMatch(Notice.messages.at(-1) ?? "", /private path enumeration failure/u)
+
+      // Opening fresh confirmation against the current client and inventory
+      // still allows a single intentionally authorized force operation.
+      ui.plugin.app.vault.getFiles = () => [{ path: "recover.md" }]
+      const valid = startDialog()
+      valid.action.click()
+      valid.action.click()
+      await valid.done
+      await tick()
+      assert.deepEqual(ui.attempts, [kind])
+      assert.equal(Notice.messages.length, 4, "the four invalid confirmations each produce one sanitized notice")
+    } finally {
+      ui.cleanup()
+      resetModalTestState()
+      Notice.messages.length = 0
+    }
+  }
+})
+
 test("D157 stale Force confirmation cannot switch repository, branch, credentials, encryption, vault or scope", async () => {
   const scenarios = [
     { name: "repository replacement", apply: (s: typeof DEFAULT_SETTINGS) => ({ ...s, githubRepo: "different-repository" }) },
