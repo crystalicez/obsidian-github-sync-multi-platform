@@ -17,7 +17,7 @@ import { verifyV4ReencryptionDestinationExactCommit } from "../../src/lib/v4/ree
 import { inspectV4ReencryptionOrphanAfterAmbiguousPublication } from "../../src/lib/v4/reencryption-orphan-recovery"
 import { publishAndVerifyV4ReencryptionOrphanRef } from "../../src/lib/v4/reencryption-orphan-publication-reconciled"
 import { publishV4ThreeBranchDestinationAfterBackup } from "../../src/lib/v4/reencryption-three-branch-publish"
-import { publishV4JournaledThreeBranchDestination, prepareV4JournaledOrphanCandidate, prepareV4BestEffortJournaledOrphanCandidate, reconcileV4PendingOrphanWithJournal } from "../../src/lib/v4/reencryption-ref-journal-coordinator"
+import { publishV4JournaledThreeBranchDestination, publishV4BestEffortJournaledThreeBranchDestination, prepareV4JournaledOrphanCandidate, prepareV4BestEffortJournaledOrphanCandidate, reconcileV4PendingOrphanWithJournal, reconcileV4PendingOrphanWithJournalBestEffort } from "../../src/lib/v4/reencryption-ref-journal-coordinator"
 import { acquireV4DesktopRekeyWalStorage } from "../../src/lib/v4/reencryption-desktop-wal"
 import { createV4ReencryptionRecoveryJournal } from "../../src/lib/v4/reencryption-recovery-journal"
 import { computeV4ReencryptionCandidateManifestDigest, computeV4ReencryptionPreparationDigest } from "../../src/lib/v4/reencryption-candidate-manifest-digest"
@@ -1449,6 +1449,208 @@ test("D102 WAL-bound 3-branch publication requires persisted blob receipts and r
     ...D100input(f, prepared), journal: j.open(), wal: j.wal,
   }), /previous ref intent|unresolved mutations|previous/i)
   assert.equal(f.calls.filter(c => c === "ref-create").length, 1)
+})
+
+test("D169 best-effort Destination publication writes one ref only after authenticated WAL and full new-key readback", async () => {
+  const f = await fixture()
+  const prepared = await prepareV4ReencryptionOrphanCommit(f.input)
+  const j = await D102DestinationJournal(f.input.staged.receipts, f.input.staged.records, f.input.destinationConfig, true, prepared)
+  const input = {
+    ...D100input(f, prepared), journal: j.journal,
+    wal: d168BestEffortWal(), acknowledgement: d168RiskAcknowledgement,
+  }
+  const result = await publishV4BestEffortJournaledThreeBranchDestination(input)
+  assert.equal(result.destinationContentsReadbackVerified, true)
+  assert.equal(result.backupScratchRoundTripVerified, true)
+  assert.equal(result.verifiedFileCount, 1)
+  assert.equal(result.powerLossDurabilityIndependentlyAudited, false)
+  assert.equal(result.initiatingDeviceCutoverAuthorized, false)
+  assert.equal(f.calls.filter(c => c === "ref-create").length, 1)
+  const state = await j.open().load()
+  assert.ok(state)
+  assert.equal(state.pendingRefIntents.length, 0)
+  assert.deepEqual(state.verifiedRefObservations[1], {
+    role: "destination", repoId: targetId, commitSha: candidateSha,
+    treeSha: candidateTreeSha, manifestSha256: D110manifestDigest(f, prepared),
+  })
+  assert.equal(state.cutoverAuthorized, false)
+  await assert.rejects(() => publishV4BestEffortJournaledThreeBranchDestination({
+    ...input, journal: j.open(),
+  }), /previous|unresolved|Manual Recovery/i)
+  assert.equal(f.calls.filter(c => c === "ref-create").length, 1)
+})
+
+test("D169 missing risk acknowledgement denies Destination publication before WAL and network I/O", async () => {
+  const f = await fixture()
+  const prepared = await prepareV4ReencryptionOrphanCommit(f.input)
+  const j = await D102DestinationJournal(f.input.staged.receipts, f.input.staged.records, f.input.destinationConfig, true, prepared)
+  let checks = 0
+  await assert.rejects(() => publishV4BestEffortJournaledThreeBranchDestination({
+    ...D100input(f, prepared), journal: j.journal,
+    wal: {
+      async assertExclusiveStageLease() { checks++ },
+      async assertBestEffortCheckpoint() {
+        checks++
+        return "best-effort-readback-only" as const
+      },
+    },
+    acknowledgement: "declined" as typeof d168RiskAcknowledgement,
+  }), /risk acknowledgement/i)
+  assert.equal(checks, 0)
+  assert.equal(f.calls.filter(c => c === "ref-create").length, 0)
+  assert.equal((await j.open().load())?.pendingRefIntents.length, 0)
+})
+
+test("D169 damaged WAL after Destination ref intent stops before GitHub POST and preserves pending intent", async () => {
+  const f = await fixture()
+  const prepared = await prepareV4ReencryptionOrphanCommit(f.input)
+  const j = await D102DestinationJournal(f.input.staged.receipts, f.input.staged.records, f.input.destinationConfig, true, prepared)
+  let failed = false
+  const input = {
+    ...D100input(f, prepared), journal: j.journal, acknowledgement: d168RiskAcknowledgement,
+    wal: {
+      async assertExclusiveStageLease() {},
+      async assertBestEffortCheckpoint() {
+        if ((await j.journal.load())?.pendingRefIntents.length) {
+          failed = true
+          throw new Error("simulated unreadable WAL after Destination intent")
+        }
+        return "best-effort-readback-only" as const
+      },
+    },
+  }
+  await assert.rejects(() => publishV4BestEffortJournaledThreeBranchDestination(input), /Manual Recovery/i)
+  assert.equal(failed, true)
+  assert.equal(f.calls.filter(c => c === "ref-create").length, 0)
+  const state = await j.open().load()
+  assert.equal(state?.pendingRefIntents.length, 1)
+  assert.equal(state?.cutoverAuthorized, false)
+  await assert.rejects(() => publishV4BestEffortJournaledThreeBranchDestination({
+    ...input, journal: j.open(), wal: d168BestEffortWal(),
+  }), /previous|unresolved|Manual Recovery/i)
+  assert.equal(f.calls.filter(c => c === "ref-create").length, 0)
+})
+
+test("D169 lost Destination POST response recovers by full read-only GitHub verification without a second POST", async () => {
+  const f = await fixture()
+  const prepared = await prepareV4ReencryptionOrphanCommit(f.input)
+  const j = await D102DestinationJournal(f.input.staged.receipts, f.input.staged.records, f.input.destinationConfig, true, prepared)
+  const originalRead = f.github.getGitRefOrNull
+  const originalCreate = f.github.createGitRef
+  f.github.createGitRef = async sha => {
+    try { await originalCreate(sha) }
+    finally {
+      f.github.getGitRefOrNull = async () => { throw new Error("GitHub 503 after ref creation") }
+    }
+  }
+  await assert.rejects(() => publishV4BestEffortJournaledThreeBranchDestination({
+    ...D100input(f, prepared), journal: j.journal,
+    wal: d168BestEffortWal(), acknowledgement: d168RiskAcknowledgement,
+  }), /ambiguous|recovery|readback/i)
+  assert.equal(f.calls.filter(c => c === "ref-create").length, 1)
+  assert.equal((await j.open().load())?.pendingRefIntents.length, 1)
+  f.github.getGitRefOrNull = originalRead
+  const report = await reconcileV4PendingOrphanWithJournalBestEffort({
+    ...recoveryInput(f, prepared), backupPlan: D100backupPlan,
+    backupRefReader: D100input(f, prepared).backupRefReader,
+    verifiedOriginalSource: D103originalProof(f),
+    journal: j.open(), wal: d168BestEffortWal(), acknowledgement: d168RiskAcknowledgement,
+  })
+  assert.equal(report.destinationContentsVerified, true)
+  assert.equal(report.verifiedFileCount, 1)
+  assert.equal(report.automaticallyRetryCreateAuthorized, false)
+  assert.equal(report.initiatingDeviceCutoverAuthorized, false)
+  assert.equal(f.calls.filter(c => c === "ref-create").length, 1)
+  const recovered = await j.open().load()
+  assert.equal(recovered?.pendingRefIntents.length, 0)
+  assert.equal(recovered?.verifiedRefObservations.length, 2)
+  assert.equal(recovered?.cutoverAuthorized, false)
+})
+
+test("D169 conflicted Destination ref during best-effort recovery preserves pending WAL and never rewrites GitHub", async () => {
+  const f = await fixture()
+  const prepared = await prepareV4ReencryptionOrphanCommit(f.input)
+  const j = await D102DestinationJournal(f.input.staged.receipts, f.input.staged.records, f.input.destinationConfig, true, prepared)
+  const originalCreate = f.github.createGitRef
+  f.github.createGitRef = async sha => {
+    await originalCreate(sha)
+    f.github.getGitRefOrNull = async () => { throw new Error("GitHub 503 prevents reconciliation") }
+    throw new Error("simulated GitHub response loss")
+  }
+  await assert.rejects(() => publishV4BestEffortJournaledThreeBranchDestination({
+    ...D100input(f, prepared), journal: j.journal,
+    wal: d168BestEffortWal(), acknowledgement: d168RiskAcknowledgement,
+  }), /ambiguous|recovery/i)
+  f.occupyRef("f".repeat(40))
+  f.github.getGitRefOrNull = async () => ({
+    ref: "refs/heads/rekey/new-branch", type: "commit", sha: "f".repeat(40),
+  })
+  await assert.rejects(() => reconcileV4PendingOrphanWithJournalBestEffort({
+    ...recoveryInput(f, prepared), backupPlan: D100backupPlan,
+    backupRefReader: D100input(f, prepared).backupRefReader,
+    verifiedOriginalSource: D103originalProof(f),
+    journal: j.open(), wal: d168BestEffortWal(), acknowledgement: d168RiskAcknowledgement,
+  }), /missing|conflicting|incomplete/i)
+  const state = await j.open().load()
+  assert.equal(state?.pendingRefIntents.length, 1)
+  assert.equal(state?.verifiedRefObservations.length, 1)
+  assert.equal(state?.cutoverAuthorized, false)
+  assert.equal(f.calls.filter(c => c === "ref-create").length, 1)
+})
+
+test("D169 real Windows WAL permits exact best-effort Destination ref publication and preserves local cutover denial", async () => {
+  const parent = join(process.cwd(), ".tmp")
+  await mkdir(parent, { recursive: true })
+  const root = await mkdtemp(join(parent, "d169-publish-wal-"))
+  try {
+    const storage = await acquireV4DesktopRekeyWalStorage({
+      rootAbsolute: root, journalRoot: "v4/rekey-destination",
+    })
+    try {
+      const f = await fixture()
+      const prepared = await prepareV4ReencryptionOrphanCommit(f.input)
+      const journal = createV4ReencryptionRecoveryJournal({
+        adapter: storage.adapter, root: "v4/rekey-destination",
+        destinationRepoId: targetId, sourceCommitSha: sourceSha,
+        runId: "d169-publish-run", journalKey: new Uint8Array(32).fill(0x36),
+      })
+      let state = await journal.begin()
+      const backup = {
+        role: "backup" as const, repoId: D100backupPlan.backupRepoId,
+        commitSha: sourceSha, treeSha: sourceTreeSha,
+      }
+      state = await journal.recordRefIntent(backup, state.generation)
+      state = await journal.markRefReadbackObserved(backup, state.generation)
+      state = await journal.recordStagingHandoff(backup, state.generation)
+      for (const receipt of f.input.staged.receipts) {
+        state = await journal.recordUploadIntent(receipt, state.generation)
+        state = await journal.appendReceipt(receipt, state.generation)
+      }
+      state = await journal.recordCandidatePreparationIntent(
+        computeV4ReencryptionPreparationDigest({
+          sourceCommitSha: sourceSha, sourceTreeSha, destinationRepoId: targetId,
+          destinationConfig: f.input.destinationConfig, sourceConfig: f.input.sourceConfig,
+          deviceId: prepared.deviceId, journalId: prepared.journalId,
+          createdAt: prepared.createdAt,
+          expectedRecords: f.input.staged.records, expectedReceipts: f.input.staged.receipts,
+        }), state.generation)
+      state = await journal.recordPreparedCandidateReceipt({
+        commitSha: prepared.commitSha, treeSha: prepared.treeSha,
+        manifestSha256: D110manifestDigest(f, prepared),
+      }, state.generation)
+      const report = await publishV4BestEffortJournaledThreeBranchDestination({
+        ...D100input(f, prepared), journal, wal: storage,
+        acknowledgement: d168RiskAcknowledgement,
+      })
+      assert.equal(report.destinationContentsReadbackVerified, true)
+      assert.equal(report.initiatingDeviceCutoverAuthorized, false)
+      assert.equal(f.calls.filter(c => c === "ref-create").length, 1)
+      const saved = await journal.assertHealthySnapshot(state.generation + 2)
+      assert.equal(saved.pendingRefIntents.length, 0)
+      assert.equal(saved.verifiedRefObservations.length, 2)
+      assert.equal(saved.cutoverAuthorized, false)
+    } finally { await storage.release() }
+  } finally { await rm(root, { recursive: true, force: true }) }
 })
 
 test("D124 WAL coordinator pins source parity before writing the one-shot Destination ref intent", async () => {

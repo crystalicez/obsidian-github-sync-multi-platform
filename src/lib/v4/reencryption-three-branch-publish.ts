@@ -61,6 +61,29 @@ export interface V4ThreeBranchPublicationReport {
 export async function publishV4ThreeBranchDestinationAfterBackup(
   input: V4ThreeBranchPublicationInput,
 ): Promise<V4ThreeBranchPublicationReport> {
+  return publishThreeBranchDestination(input, input.assertCrashDurable)
+}
+
+export interface V4BestEffortThreeBranchPublicationInput
+  extends Omit<V4ThreeBranchPublicationInput, "assertCrashDurable"> {
+  readonly acknowledgement: "accept-best-effort-power-loss-recovery-risk"
+  readonly assertBestEffortWalCheckpoint: () => Promise<void>
+}
+
+export async function publishV4ThreeBranchDestinationAfterBackupBestEffort(
+  input: V4BestEffortThreeBranchPublicationInput,
+): Promise<V4ThreeBranchPublicationReport> {
+  if (input.acknowledgement !== "accept-best-effort-power-loss-recovery-risk"
+    || typeof input.assertBestEffortWalCheckpoint !== "function") {
+    throw new Error("Best-effort Destination publication requires explicit risk acknowledgement and authenticated WAL.")
+  }
+  return publishThreeBranchDestination(input, input.assertBestEffortWalCheckpoint)
+}
+
+async function publishThreeBranchDestination(
+  input: Omit<V4ThreeBranchPublicationInput, "assertCrashDurable">,
+  checkpoint: () => Promise<void>,
+): Promise<V4ThreeBranchPublicationReport> {
   throwIfV4Aborted(input.signal)
   const { plan, backupPlan: b, prepared: p, createdAndVerifiedBackup: proof, scratchRestore: scratch } = input
   if (!plan || !b || !p || !proof || !scratch
@@ -161,8 +184,7 @@ export async function publishV4ThreeBranchDestinationAfterBackup(
       throw new Error("Re-encryption initiating-device full local content parity failed.")
     }
     throwIfV4Aborted(input.signal)
-    // Fails closed on Windows Node-only WAL where directory fsync gives EPERM.
-    await input.assertCrashDurable()
+    await checkpoint()
     throwIfV4Aborted(input.signal)
   }
   await guard()

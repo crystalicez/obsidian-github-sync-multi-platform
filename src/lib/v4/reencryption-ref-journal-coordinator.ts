@@ -34,6 +34,7 @@ import {
 } from "./reencryption-backup-create-verified"
 import {
   publishV4ThreeBranchDestinationAfterBackup,
+  publishV4ThreeBranchDestinationAfterBackupBestEffort,
   type V4ThreeBranchPublicationInput,
   type V4ThreeBranchPublicationReport,
 } from "./reencryption-three-branch-publish"
@@ -574,6 +575,30 @@ export interface V4JournaledOrphanRecoveryReport {
 export async function reconcileV4PendingOrphanWithJournal(
   input: V4JournaledOrphanRecoveryInput,
 ): Promise<V4JournaledOrphanRecoveryReport> {
+  return reconcileJournaledOrphan(input, () => hold(input.wal, input.signal))
+}
+
+export interface V4BestEffortJournaledOrphanRecoveryInput
+  extends Omit<V4JournaledOrphanRecoveryInput, "wal"> {
+  readonly wal: BestEffortJournalBinding["wal"]
+  readonly acknowledgement: "accept-best-effort-power-loss-recovery-risk"
+}
+
+export async function reconcileV4PendingOrphanWithJournalBestEffort(
+  input: V4BestEffortJournaledOrphanRecoveryInput,
+): Promise<V4JournaledOrphanRecoveryReport> {
+  if (input.acknowledgement !== "accept-best-effort-power-loss-recovery-risk"
+    || typeof input.wal?.assertExclusiveStageLease !== "function"
+    || typeof input.wal.assertBestEffortCheckpoint !== "function") {
+    throw new Error("Best-effort Destination recovery requires risk acknowledgement and live WAL storage.")
+  }
+  return reconcileJournaledOrphan(input, bestEffortJournalCheckpoint(input))
+}
+
+async function reconcileJournaledOrphan(
+  input: Omit<V4JournaledOrphanRecoveryInput, "wal">,
+  checkpoint: JournalCheckpoint,
+): Promise<V4JournaledOrphanRecoveryReport> {
   const { plan, prepared, backupPlan: b } = input
   assertJournalIdentity(input.journal, plan.pinnedSourceCommitSha, plan.destinationRepoId)
   if (!prepared || !b || !input.verifiedOriginalSource
@@ -622,7 +647,7 @@ export async function reconcileV4PendingOrphanWithJournal(
       throw new Error("Re-encryption destination WAL recovery frozen Backup tree changed.")
     }
   }
-  await hold(input.wal, input.signal)
+  await checkpoint()
   const starting = await input.journal.load()
   if (!starting || starting.pendingRefIntents.length !== 1
     || !findExactRef(starting.pendingRefIntents, intent)
@@ -681,7 +706,7 @@ export async function reconcileV4PendingOrphanWithJournal(
     throw new Error("Re-encryption destination WAL recovery remote content is missing, conflicting or incomplete.")
   }
   await checkBackup()
-  await recordIndependentReadback(input, intent, starting.generation, () => hold(input.wal, input.signal))
+  await recordIndependentReadback(input, intent, starting.generation, checkpoint)
   return Object.freeze({
     integrityScope: "read-only-orphan-reconciliation-to-encrypted-wal",
     destinationRepoId: intent.repoId,
@@ -706,6 +731,31 @@ export async function reconcileV4PendingOrphanWithJournal(
 export async function publishV4JournaledThreeBranchDestination(
   input: V4JournaledDestinationPublicationInput,
 ): Promise<V4ThreeBranchPublicationReport> {
+  return publishJournaledDestination(input, () => hold(input.wal, input.signal), false)
+}
+
+export interface V4BestEffortJournaledDestinationPublicationInput
+  extends Omit<V4JournaledDestinationPublicationInput, "wal"> {
+  readonly wal: BestEffortJournalBinding["wal"]
+  readonly acknowledgement: "accept-best-effort-power-loss-recovery-risk"
+}
+
+export async function publishV4BestEffortJournaledThreeBranchDestination(
+  input: V4BestEffortJournaledDestinationPublicationInput,
+): Promise<V4ThreeBranchPublicationReport> {
+  if (input.acknowledgement !== "accept-best-effort-power-loss-recovery-risk"
+    || typeof input.wal?.assertExclusiveStageLease !== "function"
+    || typeof input.wal.assertBestEffortCheckpoint !== "function") {
+    throw new Error("Best-effort Destination publication requires risk acknowledgement and live WAL storage.")
+  }
+  return publishJournaledDestination(input, bestEffortJournalCheckpoint(input), true)
+}
+
+async function publishJournaledDestination(
+  input: Omit<V4JournaledDestinationPublicationInput, "wal">,
+  checkpoint: JournalCheckpoint,
+  bestEffort: boolean,
+): Promise<V4ThreeBranchPublicationReport> {
   const { plan, backupPlan, createdAndVerifiedBackup } = input
   assertJournalIdentity(input.journal, plan.pinnedSourceCommitSha, plan.destinationRepoId)
   // Pin the original Source hashes BEFORE awaiting WAL lease, reads or intent
@@ -719,7 +769,7 @@ export async function publishV4JournaledThreeBranchDestination(
     commitSha: backupPlan.pinnedSourceCommitSha,
     treeSha: createdAndVerifiedBackup.pinnedSourceTreeSha,
   }
-  await hold(input.wal, input.signal)
+  await checkpoint()
   const starting = await input.journal.load()
   if (!starting || !findExactRef(starting.verifiedRefObservations, verifiedBackup)
     || !starting.stageHandoffStarted
@@ -766,8 +816,8 @@ export async function publishV4JournaledThreeBranchDestination(
     || completed.manifestSha256 !== intent.manifestSha256) {
     throw new Error("Re-encryption destination publication requires the exact sealed candidate prepared receipt.")
   }
-  const recorded = await persistExactIntent(input, intent, () => hold(input.wal, input.signal))
-  const result = await publishV4ThreeBranchDestinationAfterBackup({
+  const recorded = await persistExactIntent(input, intent, checkpoint)
+  const verifiedInput = {
     github: input.github, plan, backupPlan, createdAndVerifiedBackup,
     scratchRestore: input.scratchRestore, backupRefReader: input.backupRefReader,
     initiatorLocalParity: pinnedLocalParity,
@@ -777,16 +827,25 @@ export async function publishV4JournaledThreeBranchDestination(
     destinationPassphrase: input.destinationPassphrase,
     assertInitiatingVaultUnchanged: input.assertInitiatingVaultUnchanged,
     signal: input.signal,
-    assertCrashDurable: () => hold(input.wal, input.signal),
-    assertExclusiveMigrationLease: () => hold(input.wal, input.signal),
-    assertDurablePublicationIntent: () => assertStillPersisted(input, intent, recorded.generation, () => hold(input.wal, input.signal)),
-  })
+    assertExclusiveMigrationLease: () => checkpoint(recorded.generation),
+    assertDurablePublicationIntent: () => assertStillPersisted(input, intent, recorded.generation, checkpoint),
+  }
+  const result = bestEffort
+    ? await publishV4ThreeBranchDestinationAfterBackupBestEffort({
+      ...verifiedInput,
+      acknowledgement: "accept-best-effort-power-loss-recovery-risk",
+      assertBestEffortWalCheckpoint: () => checkpoint(recorded.generation),
+    })
+    : await publishV4ThreeBranchDestinationAfterBackup({
+      ...verifiedInput,
+      assertCrashDurable: () => checkpoint(recorded.generation),
+    })
   if (!result.destinationContentsReadbackVerified
     || result.destinationRepoId !== intent.repoId
     || result.destinationCommitSha !== intent.commitSha
     || result.initiatingDeviceCutoverAuthorized !== false) {
     throw new Error("Re-encryption WAL destination full readback disagrees with the published Git ref.")
   }
-  await recordIndependentReadback(input, intent, recorded.generation, () => hold(input.wal, input.signal))
+  await recordIndependentReadback(input, intent, recorded.generation, checkpoint)
   return result
 }
