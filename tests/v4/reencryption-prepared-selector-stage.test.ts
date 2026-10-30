@@ -11,6 +11,8 @@ import {
 } from "../../src/lib/v4/reencryption-separated-selector-prototype"
 import { planV4ReencryptionSeparatedRoots } from "../../src/lib/v4/reencryption-separated-selector"
 import { V4_RUNTIME_INDEX_ROOT } from "../../src/lib/v4/reencryption-index-root"
+import { armV4ReencryptionSyncFence, assertV4ReencryptionSyncFenceClear, V4_REENCRYPTION_SYNC_FENCE_ROOT } from "../../src/lib/v4/reencryption-sync-fence"
+import { stageV4FencedBestEffortPreparedSelector, inspectV4FencedBestEffortPreparedSelectorAfterRestart } from "../../src/lib/v4/reencryption-fenced-prepared-selector"
 import { acquireV4DesktopRekeyWalStorage } from "../../src/lib/v4/reencryption-desktop-wal"
 import { createV4ReencryptionRecoveryJournal, type V4ReencryptionJournalSnapshot } from "../../src/lib/v4/reencryption-recovery-journal"
 import type { V4ReencryptionProposedCommitIdentity } from "../../src/lib/v4/reencryption-proposed-commit-receipt"
@@ -139,12 +141,124 @@ function fixture(indexRoot = identity.indexRoot) {
     }))
   }
   return {
-    files, dirs, writes, key, adapter, settings, secrets, wal, journal, seed, input,
+    files, dirs, writes, key, adapter, settings, secrets, wal, journal, seed, input, owner,
     setWal(next: V4ReencryptionJournalSnapshot) { snapshot = next },
     walSnapshot: () => snapshot,
     get checks() { return checks },
   }
 }
+
+const fenceMarker = V4_REENCRYPTION_SYNC_FENCE_ROOT + "/active.json"
+
+async function armFixtureFence(s: ReturnType<typeof fixture>): Promise<void> {
+  const input = s.input()
+  await s.owner(async () => {
+    await armV4ReencryptionSyncFence({
+      adapter: s.adapter, runId: input.identity.runId,
+      sourceRepoId: input.identity.sourceRepoId,
+      destinationRepoId: input.identity.destinationRepoId,
+      assertExclusiveInitiatorLease: input.restart.assertExclusiveInitiatorLease,
+    })
+  })
+}
+
+test("D176 exact fence binding permits only prepared evidence, never committed Cutover", async () => {
+  const s = fixture(V4_RUNTIME_INDEX_ROOT)
+  await s.seed()
+  await armFixtureFence(s)
+  const originals = new Map(s.files)
+  const writes = s.writes.length
+  const input = s.input()
+  const stage = await stageV4FencedBestEffortPreparedSelector(input)
+  assert.equal(stage.status, "authenticated-prepared-selector-uncommitted")
+  assert.equal(stage.localCutoverAuthorized, false)
+  assert.equal(stage.resumeSyncAuthorized, false)
+  assert.deepEqual(s.writes.slice(writes), [
+    V4_RUNTIME_INDEX_ROOT + "-rekey-selector-" + identity.runId + "/prepared.json",
+  ])
+  for (const [path, value] of originals) assert.equal(s.files.get(path), value, path)
+  assert.equal(s.settings.githubBranch, "main")
+  await assert.rejects(() => assertV4ReencryptionSyncFenceClear(s.adapter))
+  const reopened = await inspectV4FencedBestEffortPreparedSelectorAfterRestart(s.input())
+  assert.equal(reopened.observation, "authenticated-prepared-selector-uncommitted")
+  assert.equal(reopened.localCutoverAuthorized, false)
+  assert.equal(reopened.resumeSyncAuthorized, false)
+  assert.equal(reopened.oldPassphraseCleanupAuthorized, false)
+  assert.equal(s.writes.length, writes + 1)
+  await assert.rejects(() => stageV4FencedBestEffortPreparedSelector(s.input()), /Existing.*Manual Recovery/)
+})
+
+test("D176 missing, foreign, torn, extra-field and noncanonical fence refuse any prepared Selector writes", async () => {
+  const s = fixture(V4_RUNTIME_INDEX_ROOT)
+  await s.seed()
+  const before = s.writes.length
+  await assert.rejects(() => stageV4FencedBestEffortPreparedSelector(s.input()), /fence/i)
+  assert.equal(s.writes.length, before)
+  await armFixtureFence(s)
+  const good = s.files.get(fenceMarker)!
+  const cases = [
+    good.replace(identity.runId, "different_run_176"),
+    good.replace(identity.sourceRepoId, "owner/vault#other"),
+    good.replace(identity.destinationRepoId, "owner/vault#rekey/foreign"),
+    good.slice(0, -7),
+    good + "\n",
+    good.replace('"schemaVersion":1', '"schemaVersion":1,"authorized":true'),
+    "z".repeat(513),
+  ]
+  for (const tampered of cases) {
+    s.files.set(fenceMarker, tampered)
+    const count = s.writes.length
+    await assert.rejects(() => stageV4FencedBestEffortPreparedSelector(s.input()), /fence/i)
+    assert.equal(s.writes.length, count)
+    assert.equal((await inspectV4FencedBestEffortPreparedSelectorAfterRestart(s.input())).observation,
+      "manual-recovery-required")
+    await assert.rejects(() => assertV4ReencryptionSyncFenceClear(s.adapter))
+  }
+  s.files.set(fenceMarker, good)
+  s.dirs.delete(V4_REENCRYPTION_SYNC_FENCE_ROOT)
+  const count = s.writes.length
+  await assert.rejects(() => stageV4FencedBestEffortPreparedSelector(s.input()), /fence/i)
+  assert.equal(s.writes.length, count)
+})
+
+test("D176 fence mutation during prepared evidence write retains ambiguous record and never retries", async () => {
+  const s = fixture(V4_RUNTIME_INDEX_ROOT)
+  await s.seed()
+  await armFixtureFence(s)
+  const originalWrite = s.adapter.write
+  const marker = s.files.get(fenceMarker)!
+  s.adapter.write = async (path, content) => {
+    await originalWrite(path, content)
+    if (path.endsWith("/prepared.json")) s.files.set(fenceMarker, marker.replace(identity.runId, "swapped_run_176"))
+  }
+  const before = s.writes.length
+  await assert.rejects(() => stageV4FencedBestEffortPreparedSelector(s.input()), /fence/i)
+  assert.equal(s.writes.length, before + 1)
+  const stageRoot = V4_RUNTIME_INDEX_ROOT + "-rekey-selector-" + identity.runId
+  assert.equal(s.files.has(stageRoot + "/prepared.json"), true)
+  assert.equal(s.files.has(stageRoot + "/selector.json"), false)
+  await assert.rejects(() => assertV4ReencryptionSyncFenceClear(s.adapter))
+  assert.equal((await inspectV4FencedBestEffortPreparedSelectorAfterRestart(s.input())).observation,
+    "manual-recovery-required")
+  await assert.rejects(() => stageV4FencedBestEffortPreparedSelector(s.input()))
+  assert.equal(s.writes.length, before + 1)
+})
+
+test("D176 missing fence during restart never certifies a previously staged record", async () => {
+  const s = fixture(V4_RUNTIME_INDEX_ROOT)
+  await s.seed()
+  await armFixtureFence(s)
+  await stageV4FencedBestEffortPreparedSelector(s.input())
+  const writes = s.writes.length
+  s.files.delete(fenceMarker)
+  const report = await inspectV4FencedBestEffortPreparedSelectorAfterRestart(s.input())
+  assert.equal(report.observation, "manual-recovery-required")
+  assert.equal(report.localCutoverAuthorized, false)
+  assert.equal(report.resumeSyncAuthorized, false)
+  assert.equal(s.writes.length, writes)
+  assert.equal(s.dirs.has(V4_REENCRYPTION_SYNC_FENCE_ROOT), true)
+  await assert.rejects(() => assertV4ReencryptionSyncFenceClear(s.adapter))
+})
 
 test("D175 stages and reopens authenticated prepared Selector next to the actual Runtime Index root", async () => {
   const s = fixture(V4_RUNTIME_INDEX_ROOT)

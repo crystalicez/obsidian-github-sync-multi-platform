@@ -1,0 +1,24 @@
+# D176 — Fence-bound prepared Selector stage and read-only restart
+
+Date: 2026-10-30. Status: internal non-authorizing migration preparation. Re-encryption Wizard remains **Preview-only**; release gate **blocked**.
+
+## Gap closed
+
+D173/D174 introduced a one-shot, plugin-private Sync Fence and synchronous quiescence reservation, while D170–D172 developed encrypted WAL/Intent and prepared Selector evidence. A D172 stage could previously consume a healthy authenticated WAL and local Intent **without verifying that the one-shot Sync Fence belonged to the same migration run and Source/Destination branches**. This exposed a cross-run binding gap if these internal APIs were later wired into a Wizard.
+
+New `src/lib/v4/reencryption-fenced-prepared-selector.ts` provides two explicitly internal entrypoints:
+
+- `stageV4FencedBestEffortPreparedSelector()` wraps D172's existing one-shot encrypted prepared Selector writer. It requires the already-created D173 fence `github-sync-v4-rekey-sync-fence/active.json` and exact run/source/destination identities under the **same cooperating initiator lease** used for D172's WAL/Intent/Index validation. It checks the independent fence **twice before** and **twice after** the D172 stage (across its body). The marker must be exactly the canonical nonsecret JSON with `phase: "migration-fenced-uncommitted"`, matching run ID and both Git refs, with no extra properties or trailing data. Missing, foreign, torn, absent-directory or changing markers deny the stage. D172 performs its own complete authenticated WAL/verified Backup + zero-parent Destination, source and shadow cache, Source settings and old/new secret presence checks before writing exactly one `prepared.json`. If a fence changes after the prepared write, the function **throws** and retains the ambiguous prepared evidence for Manual Recovery; never retries or writes `selector.json`.
+- `inspectV4FencedBestEffortPreparedSelectorAfterRestart()` performs read-only D172 encrypted prepared Selector revalidation with the same fence binding under its held lease. Any corrupted, missing or changed fence returns `manual-recovery-required` without writing. Even matching fence and AES-GCM prepared evidence return only `authenticated-prepared-selector-uncommitted`, with **no** authority for Cutover, Resume Sync, rollback or old-key cleanup.
+
+The Sync Fence is **not authenticated** and is **not a commit receipt**. Its nonsecret identity matching protects against accidental cross-run selection; it is not a security boundary against a malicious local process. The D173 root-existence blocking rule remains authoritative for Sync pausing even if the marker JSON is corrupt or absent. This stage does not assert cross-process exclusion, physical power-loss durability, an authoritative Selector or a persistent transaction boundary. Windows Node directory fsync remains unsupported; the owner-approved best-effort readback must never be renamed as a true fsync guarantee.
+
+## Regression evidence
+
+New D176 scenarios in `tests/v4/reencryption-prepared-selector-stage.test.ts` cover: exact fence and authenticated prepared Selector with run scoped to the **actual** `github-sync-v4-index` Runtime Source root; Source settings/index retained, no `selector.json`; replay rejection; missing or wrong run/Source/Destination marker, extra fields, truncated and over-limit data, missing directory; fence mutation after `prepared.json` is written retaining residue with no retry; missing marker after restart denying a formerly authenticated prepared Selector; and independent D173 Sync Fence still blocking Sync. All existing D172 prepared evidence, Windows authenticated WAL reopen, remote D137 binding and D175 root compatibility tests remain green.
+
+D176 focused prepared-stage tests **13/13 PASS**. Full Fast **1156/1156 PASS**; Recovery, Feasibility, Resource **11/11**, Maximum Strict TypeScript, Production Build, GitHub E2E compile-only **3 bundles**, metadata/package validators and bounded **100,000,000-byte** cryptographic SHA-256 soak all **PASS**. This was local-only testing, not credentialed GitHub E2E, installed Obsidian Desktop/Mobile or power-cut acceptance.
+
+## Remaining release blockers
+
+This API is an **internal guarded adapter**, not a Wizard Run. The installed Wizard still does not invoke the D174 Fence preflight or the authenticated Backup/Destination publication workflow. Future work must prove a single stable initiating-vault/parity/lease across the whole live migration, safely wire the run from D174 through WAL and remote ref publication, and design a separately authenticated **committed** local Selector/receipt with restart-safe Settings/SecretStorage/active Index reconciliation, multi-device safety and Manual Recovery UX. Do not automatically release Fence, resume Sync, clean old passphrase/branches, mutate a real user vault or enable GitHub Actions. Keep `docs/release-gates/reencryption-wizard.json` at `blocked`.
