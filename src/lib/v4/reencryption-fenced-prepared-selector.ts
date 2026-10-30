@@ -11,7 +11,7 @@ import {
 const PATH = V4_REENCRYPTION_SYNC_FENCE_ROOT + "/active.json"
 const MAX_FENCE_BYTES = 512
 
-interface PinnedFence {
+export interface V4ReencryptionPinnedFenceIdentity {
   readonly runId: string
   readonly sourceRepoId: string
   readonly destinationRepoId: string
@@ -23,9 +23,9 @@ interface PinnedFence {
  * WAL/Intent/Selector observations. The mere existence of the fence keeps
  * normal Sync paused, even if its identity has been corrupted.
  */
-async function assertExactFence(
-  adapter: V4LocalIndexAdapter,
-  pinned: PinnedFence,
+export async function assertV4ReencryptionExactSyncFence(
+  adapter: Pick<V4LocalIndexAdapter, "read" | "exists">,
+  pinned: V4ReencryptionPinnedFenceIdentity,
   assertLease: () => Promise<void>,
 ): Promise<void> {
   const expected = JSON.stringify({
@@ -89,12 +89,12 @@ function wrapFencedHolder(input: V4BestEffortPreparedSelectorStageInput):
         if (!unchanged()) {
           throw new Error("Fenced Re-encryption identity changed; Manual Recovery required.")
         }
-        await assertExactFence(adapter, pinned, assertLease)
+        await assertV4ReencryptionExactSyncFence(adapter, pinned, assertLease)
         if (!unchanged()) {
           throw new Error("Fenced Re-encryption identity changed; Manual Recovery required.")
         }
         const result = await body()
-        await assertExactFence(adapter, pinned, assertLease)
+        await assertV4ReencryptionExactSyncFence(adapter, pinned, assertLease)
         if (!unchanged()) {
           throw new Error("Fenced Re-encryption identity changed; Manual Recovery required.")
         }
