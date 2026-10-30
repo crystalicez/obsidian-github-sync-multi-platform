@@ -100,6 +100,7 @@ export interface V4DesktopRekeyWalStorage {
    * rather than claiming power-loss durable intent without directory sync.
    */
   assertCrashDurable(): Promise<void>
+  assertBestEffortCheckpoint(): Promise<"best-effort-readback-only">
   release(): Promise<void>
 }
 
@@ -380,6 +381,36 @@ export async function acquireV4DesktopRekeyWalStorage(options: {
         throw new Error("Re-encryption Desktop WAL has an active write; crash durability is unproven.")
       }
       directorySyncProof.assertConfirmed()
+    }),
+    assertBestEffortCheckpoint: () => withLiveLease(async () => {
+      await assertHeld()
+      if (writing) {
+        throw new Error("Re-encryption Desktop WAL has an active write; retry after it settles.")
+      }
+      const entries = await fs.readdir(directory)
+      if (entries.some(entry => ![".exclusive.lock", "slot-0.json", "slot-1.json"].includes(entry))) {
+        throw new V4DesktopRekeyWalRecoveryRequiredError()
+      }
+      const slots = ["slot-0.json", "slot-1.json"]
+      const present: string[] = []
+      for (const slot of slots) {
+        if (await safeFile(path.join(directory, slot))) present.push(options.journalRoot + "/" + slot)
+      }
+      if (present.length === 0) {
+        throw new Error("Re-encryption Desktop WAL has no saved recovery checkpoint.")
+      }
+      for (const slot of present) {
+        const first = await rawAdapter.read(slot)
+        const second = await rawAdapter.read(slot)
+        if (first !== second) {
+          throw new V4DesktopRekeyWalRecoveryRequiredError()
+        }
+      }
+      await assertHeld()
+      if (writing) {
+        throw new Error("Re-encryption Desktop WAL changed during recovery checkpoint readback.")
+      }
+      return "best-effort-readback-only" as const
     }),
     async release() {
       // Claim release before any await; new operations are now forbidden.

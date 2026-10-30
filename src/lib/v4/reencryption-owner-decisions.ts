@@ -23,6 +23,9 @@ export const V4_OWNER_REENCRYPTION_DECISIONS = Object.freeze({
   powerLossTestAcceptance: "simulation-only-best-effort",
   physicalPowerLossGuaranteeClaimed: false,
   unverifiedDurabilityMayAuthorizeCutover: false,
+  unsupportedDirectorySyncPolicy: "best-effort-with-explicit-warning-and-manual-recovery",
+  bestEffortWalReadbackRequired: true,
+  uncertainRestartRequiresManualRecovery: true,
   oldBranchRetention: "delete-only-after-explicit-user-action",
   // A separate branch in the SAME repository shares the same failure domain.
   independentBackupProvidedByChoiceC: false,

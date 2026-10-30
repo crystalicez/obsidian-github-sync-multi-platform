@@ -338,7 +338,7 @@ export class V4ReencryptionWizardModal extends Modal {
     container.createEl("p", { text: "The destination is a newly encrypted orphan branch. The separate frozen backup preserves the source snapshot; the old branch remains active." })
     container.createEl("p", {
       cls: "github-sync-rekey__warning",
-      text: "Important: After verified crash-safe cutover, the old passphrase will be cleared from this device's Obsidian SecretStorage. The original Source and Backup branches still require your OLD passphrase to decrypt. Save your old passphrase securely outside this plugin before starting Re-encryption if you may need those branches later. Other devices are not changed.",
+      text: "Important: After a fully verified cutover, the old passphrase is planned to be cleared from this device's Obsidian SecretStorage. The original Source and Backup branches still require your OLD passphrase to decrypt. Save your old passphrase securely outside this plugin before starting Re-encryption if you may need those branches later. Other devices are not changed.",
     })
     new Setting(container).setName("New destination branch")
       .setDesc("Must not exist, equal the source, backup or default branch.")
@@ -394,12 +394,12 @@ export class V4ReencryptionWizardModal extends Modal {
     this.row(container, "Source Git commit", proposal.pinnedSourceCommitSha)
     this.row(container, "PBKDF2 iterations for new branch", String(proposal.requestedIterations))
     this.row(container, "User approval (planned)",
-      "One confirmation before execution authorizes the full verified migration and automatic initiating-device cutover. No second confirmation after a successful run.")
+      "One confirmation before execution will include acknowledgement of best-effort power-loss risk and authorize a fully verified migration. No second confirmation after successful completion.")
     this.row(container, "Best-effort change detection (planned)",
       "Uniform cross-platform detection; cannot prevent changes by external programs. Abort on detected drift. Never treat this as a full Vault write fence.")
     container.createEl("p", {
       cls: "github-sync-rekey__warning",
-      text: "OLD PASSPHRASE WARNING: Save a secure copy of your old passphrase before confirming. After verified crash-safe cutover, this device will clear its old passphrase from Obsidian SecretStorage, with no extra confirmation. The Source and Backup branches and old encrypted Git history remain unchanged and still need that old passphrase to decrypt. This is a planned policy; no secrets are cleared in Preview.",
+      text: "OLD PASSPHRASE WARNING: Save a secure copy of your old passphrase before confirming. After a fully verified cutover, this device is planned to clear its old passphrase from Obsidian SecretStorage, with no extra confirmation. The Source and Backup branches and old encrypted Git history remain unchanged and still need that old passphrase to decrypt. This is a planned policy; no secrets are cleared in Preview.",
     })
     this.row(container, "Expected source files / logical bytes",
       `${this.source?.verifiedFileCount ?? 0} files / ${this.source?.totalVerifiedPlaintextBytes ?? "unverified"} bytes`)
@@ -414,7 +414,7 @@ export class V4ReencryptionWizardModal extends Modal {
       .addButton(button => button.setButtonText(this.busy ? "Checking…" : "Check both branches")
         .setDisabled(this.busy)
         .onClick(() => void this.checkBranchAvailability()))
-    this.row(container, "Publication authorization", "BLOCKED — the production migration, durable WAL, restore and installed-device release gates are unfinished.")
+    this.row(container, "Publication authorization", "BLOCKED — the production migration, best-effort WAL recovery, safe cutover and installed-device release gates are unfinished.")
   }
 
   private renderRun(container: HTMLElement): void {
@@ -431,17 +431,17 @@ export class V4ReencryptionWizardModal extends Modal {
     const list = container.createEl("ol")
     for (const phase of phases) list.createEl("li", { text: `Pending — ${phase}` })
     this.row(container, "Status", "NOT STARTED. No network writes, encryption changes or local cutover were made by this Wizard.")
-    this.row(container, "Recovery", "Durable Windows WAL, interruption recovery and installed Obsidian acceptance must pass before execution can be enabled.")
+    this.row(container, "Recovery", "Best-effort WAL readback, authenticated interruption recovery, safe local cutover and installed Obsidian acceptance must pass before execution can be enabled. Unknown states require Manual Recovery.")
   }
 
   private renderFinish(container: HTMLElement): void {
     container.createEl("p", { text: "Not completed. Source, backup and destination must be verified in a real run before the initiating device can switch." })
     this.row(container, "Initiating device",
-      "After one confirmation before execution, automatically switch branch, passphrase and local index ONLY after verified crash-safe completion. No second confirmation, no Force Pull/Push.")
+      "After one confirmation before execution, automatically switch branch, passphrase and local index ONLY after verified end-to-end completion and best-effort recovery checks. No second confirmation, no Force Pull/Push.")
     this.row(container, "Other devices", "Stay on the old branch, or manually enter the new branch and passphrase whenever desired.")
     this.row(container, "Retention", "Never auto-delete source or backup branches.")
     this.row(container, "Old passphrase cleanup (planned)",
-      "Clear the old passphrase from this device's SecretStorage only AFTER verified crash-safe cutover and recovery commit. The old Source/Backup still need it; keep your own copy if required. No cleanup is implemented in Preview.")
+      "Clear the old passphrase from this device's SecretStorage only AFTER verified cutover and recovery commit. The old Source/Backup still need it; keep your own copy if required. No cleanup is implemented in Preview.")
     this.row(container, "Current release gate", "BLOCKED — the planned automatic switch is NOT implemented or authorized.")
   }
 
@@ -461,6 +461,7 @@ export class V4ReencryptionWizardModal extends Modal {
     const section = content.createDiv({ cls: "github-sync-rekey__body" })
     section.createEl("h3", { text: STEPS[this.step] ?? STEPS[0] })
     section.createEl("p", { cls: "github-sync-rekey__warning", text: "Development preview — publishing and device cutover are disabled until all production safety gates pass." })
+    section.createEl("p", { cls: "github-sync-rekey__warning", text: "BEST-EFFORT RECOVERY WARNING: Sudden power loss can lose recent WAL, Settings or SecretStorage writes even after a successful readback. There is no physical power-loss guarantee. Keep secure copies of BOTH passphrases; preserve Source and Backup. Inconsistent state after restart requires Manual Recovery, not automatic Sync or deletion." })
     if (this.step === 0) this.renderPreflight(section)
     else if (this.step === 1) this.renderDestination(section)
     else if (this.step === 2) {

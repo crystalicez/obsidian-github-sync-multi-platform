@@ -30,6 +30,51 @@ async function sandbox() {
   return { root, async cleanup() { await rm(root, { recursive: true, force: true }) } }
 }
 
+test("D164 best-effort WAL checkpoint verifies settled disk readback but never claims physical durability", async () => {
+  const t = await sandbox()
+  try {
+    const store = await acquireV4DesktopRekeyWalStorage({ rootAbsolute: t.root, journalRoot })
+    try {
+      await assert.rejects(() => store.assertBestEffortCheckpoint(), /no saved recovery checkpoint/u)
+      const journal = makeJournal(store.adapter)
+      const started = await journal.begin()
+      const uploaded = await journal.recordUploadIntent(receipt, started.generation)
+      assert.equal(await store.assertBestEffortCheckpoint(), "best-effort-readback-only")
+      const actual = await journal.assertHealthySnapshot(uploaded.generation)
+      assert.equal(actual.generation, uploaded.generation)
+      assert.deepEqual(actual.pendingIntents, [receipt])
+      assert.equal(actual.cutoverAuthorized, false)
+      assert.equal(actual.permissionToPublish, false)
+    } finally {
+      await store.release()
+    }
+  } finally {
+    await t.cleanup()
+  }
+})
+
+test("D164 best-effort WAL check refuses unrecognized residue and does not authenticate corrupt ciphertext", async () => {
+  const t = await sandbox()
+  try {
+    const store = await acquireV4DesktopRekeyWalStorage({ rootAbsolute: t.root, journalRoot })
+    try {
+      await makeJournal(store.adapter).begin()
+      const slot = join(t.root, "rekey", "wal", "slot-1.json")
+      await writeFile(slot, "corrupted but stable")
+      assert.equal(await store.assertBestEffortCheckpoint(), "best-effort-readback-only")
+      await assert.rejects(() => makeJournal(store.adapter).assertHealthySnapshot(1), /invalid|malformed|journal|corrupt|Unexpected|JSON|snapshot/i)
+      const residue = join(t.root, "rekey", "wal", ".slot-foreign.tmp")
+      await writeFile(residue, "unexpected")
+      await assert.rejects(() => store.assertBestEffortCheckpoint(), /manual recovery required/i)
+    } finally {
+      await store.release()
+    }
+    await assert.rejects(() => store.assertBestEffortCheckpoint(), V4DesktopRekeyWalLockError)
+  } finally {
+    await t.cleanup()
+  }
+})
+
 test("D119 a failed WAL leaf fsync revokes earlier confirmed crash durability before propagating", async () => {
   const proof = new V4RekeyWalDirectorySyncProof()
   assert.throws(() => proof.assertConfirmed(), /fsync|durability/i)
