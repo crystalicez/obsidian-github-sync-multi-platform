@@ -18,6 +18,7 @@ import {
   type V4ResourceController,
 } from "./v4/resource-controller";
 import { V4RequestScheduler } from "./v4/request-scheduler";
+import { V4CancelledError } from "./v4/cancellation";
 import type { V4RateLimitCooldownStore } from "./v4/rate-limit-cooldown";
 import { V4TransportMetrics, type V4TransportMetricsSnapshot } from "./v4/transport-metrics";
 import { resolveV4TransportPolicy, type V4TransportPolicy } from "./v4/transport-policy";
@@ -25,6 +26,13 @@ import { readImmutableGitFile } from "./v4/immutable-git-read";
 
 const V4_BOOTSTRAP_PATH = ".obsidian-github-sync-v4/bootstrap";
 const GIT_COMMIT_SHA = /^[0-9a-f]{40}$/iu;
+
+class GitHubTransportUnconfirmedError extends Error {
+  constructor() {
+    super("GitHub transport request failed; remote result is unconfirmed.");
+    this.name = "GitHubTransportUnconfirmedError";
+  }
+}
 
 export interface GitHubConfig {
   owner: string;
@@ -146,9 +154,11 @@ export class GitHubClient {
         let response: RequestUrlResponse;
         try {
           response = await requestUrl(options);
-        } catch (error) {
+        } catch {
           this.transportMetrics.recordNetworkFailure();
-          throw error;
+          // requestUrl rejection is not a confirmed HTTP response.
+          if (this.operationSignal?.aborted) throw new V4CancelledError();
+          throw new GitHubTransportUnconfirmedError();
         }
         const responseBytes = response.arrayBuffer?.byteLength ?? (response.text ? new TextEncoder().encode(response.text).byteLength : 0);
         this.transportMetrics.recordResponse(response.status, responseBytes);
@@ -272,6 +282,9 @@ export class GitHubClient {
       const httpError = error as { status?: number };
       if (httpError.status === 404) {
         return GIT_COMMIT_SHA.test(ref) ? this.getImmutableFileFromTree(path, ref) : null;
+      }
+      if (error instanceof GitHubTransportUnconfirmedError && GIT_COMMIT_SHA.test(ref)) {
+        return this.getImmutableFileFromTree(path, ref);
       }
       throw error;
     }

@@ -74,7 +74,7 @@ test("immutable fallback descends through an exact positive entry in a truncated
   }
 })
 
-test("immutable fallback also activates when Contents throws an error carrying status 404", async () => {
+test("immutable fallback verifies Git tree after unconfirmed Contents failures regardless of claimed HTTP status", async () => {
   const payload = new TextEncoder().encode("thrown-404-fallback\n")
   let contentsCalls = 0
   setRequestUrlHandler(async (options: unknown) => {
@@ -82,7 +82,7 @@ test("immutable fallback also activates when Contents throws an error carrying s
     const path = new URL(url).pathname
     if (path.includes("/contents/")) {
       contentsCalls++
-      throw Object.assign(new Error("Contents unavailable"), { status: 404 })
+      throw Object.assign(new Error("private-token: Contents unavailable"), { status: contentsCalls === 1 ? 404 : 403 })
     }
     if (path.endsWith(`/git/commits/${COMMIT_SHA}`)) {
       return response({ status: 200, json: { sha: COMMIT_SHA, tree: { sha: ROOT_TREE_SHA }, parents: [] } })
@@ -99,10 +99,12 @@ test("immutable fallback also activates when Contents throws an error carrying s
       { token: "token", owner: "owner", repo: "repo", branch: "main" },
       { transportPolicy: { mutationSpacingMs: 0 } },
     )
-    const file = await client.getFileBytes("file.md", COMMIT_SHA)
-    assert.deepEqual(file?.bytes, payload)
-    assert.equal(file?.sha, BLOB_SHA)
-    assert.equal(contentsCalls, 1)
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const file = await client.getFileBytes("file.md", COMMIT_SHA)
+      assert.deepEqual(file?.bytes, payload)
+      assert.equal(file?.sha, BLOB_SHA)
+    }
+    assert.equal(contentsCalls, 2)
   } finally {
     setRequestUrlHandler(null)
   }

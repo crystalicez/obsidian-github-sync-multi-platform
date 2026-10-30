@@ -92,3 +92,80 @@ test("D161 GraphQL HTTP-200 rejected strict CAS does not echo errors[].message",
     setRequestUrlHandler(null)
   }
 })
+
+test("D162 thrown requestUrl failures do not leak secrets or masquerade as confirmed file absence", async () => {
+  for (const thrown of [
+    Object.assign(new Error(leaked), { status: 404, headers: { "retry-after": "120" } }),
+    leaked,
+    null,
+  ]) {
+    let requests = 0
+    setRequestUrlHandler(async () => { requests++; throw thrown })
+    try {
+      const github = client()
+      await assert.rejects(github.getFileBytes("private.md"), error => {
+        assert.ok(error instanceof Error)
+        assert.equal(error.message, "GitHub transport request failed; remote result is unconfirmed.")
+        assert.equal((error as { status?: number }).status, undefined)
+        assert.equal((error as { cause?: unknown }).cause, undefined)
+        assert.doesNotMatch(JSON.stringify(error), /private-token|do-not-display|private-note/u)
+        return true
+      })
+      assert.equal(requests, 1)
+      assert.equal(github.transportMetricsSnapshot.statusClasses.network, 1)
+    } finally {
+      setRequestUrlHandler(null)
+    }
+  }
+})
+
+test("D162 thrown adapter status does not turn an uncertain ref write into a definitive failure or retry", async () => {
+  let attempts = 0
+  setRequestUrlHandler(async () => {
+    attempts++
+    throw Object.assign(new Error(leaked), { status: 422, headers: { "retry-after": "0" }, cause: leaked })
+  })
+  try {
+    const github = new GitHubClient(
+      { owner: "owner", repo: "vault", branch: "main", token: "token" },
+      { transportPolicy: { mutationSpacingMs: 0, maxAttempts: 2 } },
+    )
+    await assert.rejects(github.createGitRef("a".repeat(40)), error => {
+      assert.ok(error instanceof Error)
+      assert.equal(error.name, "V4GitMutationOutcomeUnknownError")
+      assert.match(error.message, /unknown outcome/u)
+      assert.doesNotMatch(JSON.stringify(error, Object.getOwnPropertyNames(error)), /private-token|do-not-display|private-note/u)
+      const cause = (error as Error & { cause?: unknown }).cause
+      assert.ok(cause instanceof Error)
+      assert.equal(cause.message, "GitHub transport request failed; remote result is unconfirmed.")
+      assert.equal((cause as { status?: number }).status, undefined)
+      return true
+    })
+    assert.equal(attempts, 1, "A reachable-ref write must never replay after an uncertain transport failure")
+    assert.equal(github.transportMetricsSnapshot.statusClasses.network, 1)
+    assert.equal(github.transportMetricsSnapshot.unknownOutcomes, 1)
+  } finally {
+    setRequestUrlHandler(null)
+  }
+})
+
+test("D162 requestUrl abort does not expose adapter message and keeps read cancellation", async () => {
+  const abort = new AbortController()
+  setRequestUrlHandler(async () => {
+    abort.abort()
+    throw new Error(leaked)
+  })
+  try {
+    const github = client()
+    github.setV4AbortSignal(abort.signal)
+    await assert.rejects(github.listCommits(), error => {
+      assert.ok(error instanceof Error)
+      assert.equal(error.name, "V4CancelledError")
+      assert.doesNotMatch(error.message, /private-token|do-not-display|private-note/u)
+      return true
+    })
+    assert.equal(github.transportMetricsSnapshot.statusClasses.network, 1)
+  } finally {
+    setRequestUrlHandler(null)
+  }
+})
