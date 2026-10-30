@@ -10,6 +10,7 @@ import {
   authenticateV4ReencryptionSeparatedSelectorTestVector,
 } from "../../src/lib/v4/reencryption-separated-selector-prototype"
 import { planV4ReencryptionSeparatedRoots } from "../../src/lib/v4/reencryption-separated-selector"
+import { V4_RUNTIME_INDEX_ROOT } from "../../src/lib/v4/reencryption-index-root"
 import { acquireV4DesktopRekeyWalStorage } from "../../src/lib/v4/reencryption-desktop-wal"
 import { createV4ReencryptionRecoveryJournal, type V4ReencryptionJournalSnapshot } from "../../src/lib/v4/reencryption-recovery-journal"
 import type { V4ReencryptionProposedCommitIdentity } from "../../src/lib/v4/reencryption-proposed-commit-receipt"
@@ -29,7 +30,8 @@ const preparedPath = roots.selectorPath.replace(/selector\.json$/u, "prepared.js
 const intentPath = identity.indexRoot + "-rekey-intent-" + identity.runId + "/intent.json"
 const consent = "accept-best-effort-power-loss-recovery-risk" as const
 
-function fixture() {
+function fixture(indexRoot = identity.indexRoot) {
+  const activeRoots = planV4ReencryptionSeparatedRoots(indexRoot, identity.runId)
   const files = new Map<string, string>()
   const dirs = new Set<string>()
   const writes: string[] = []
@@ -97,7 +99,7 @@ function fixture() {
   }
   const input = () => ({
     restart: {
-      runId: identity.runId, indexRoot: identity.indexRoot,
+      runId: identity.runId, indexRoot,
       sourceCommitSha: identity.sourceCommitSha, backupRepoId: identity.backupRepoId,
       expectedWalGeneration: identity.walGeneration,
       expected: {
@@ -112,7 +114,7 @@ function fixture() {
       getSecret: (id: string) => secrets.get(id) ?? null,
       assertExclusiveInitiatorLease: lease,
     },
-    identity: { ...identity }, journalKey: key, withExclusiveInitiatorLease: owner,
+    identity: { ...identity, indexRoot }, journalKey: key, withExclusiveInitiatorLease: owner,
   })
   const seed = async () => {
     const source = createEmptyV4LocalIndex({
@@ -123,10 +125,10 @@ function fixture() {
       repoId: identity.destinationRepoId, deviceId: identity.deviceId, mode: "encrypted",
     })
     shadow.remoteCommitSha = identity.destinationCommitSha
-    await saveV4LocalIndex(adapter, roots.sourceIndexRoot, source)
-    await saveV4LocalIndex(adapter, roots.shadowIndexRoot, shadow)
+    await saveV4LocalIndex(adapter, activeRoots.sourceIndexRoot, source)
+    await saveV4LocalIndex(adapter, activeRoots.shadowIndexRoot, shadow)
     await owner(async () => prepareV4ReencryptionLocalCutoverIntent({
-      adapter, activeIndexRoot: identity.indexRoot, runId: identity.runId,
+      adapter, activeIndexRoot: indexRoot, runId: identity.runId,
       sourceRepoId: identity.sourceRepoId, backupRepoId: identity.backupRepoId,
       destinationRepoId: identity.destinationRepoId,
       sourceCommitSha: identity.sourceCommitSha, destinationCommitSha: identity.destinationCommitSha,
@@ -143,6 +145,30 @@ function fixture() {
     get checks() { return checks },
   }
 }
+
+test("D175 stages and reopens authenticated prepared Selector next to the actual Runtime Index root", async () => {
+  const s = fixture(V4_RUNTIME_INDEX_ROOT)
+  await s.seed()
+  const prior = new Map(s.files)
+  const writes = s.writes.length
+  const runRoots = planV4ReencryptionSeparatedRoots(V4_RUNTIME_INDEX_ROOT, identity.runId)
+  const expectedEvidence = runRoots.selectorPath.replace(/selector\.json$/u, "prepared.json")
+  const stage = await stageV4BestEffortPreparedSelectorEvidence(s.input())
+  assert.equal(stage.evidencePath, expectedEvidence)
+  assert.equal(stage.localCutoverAuthorized, false)
+  assert.equal(stage.resumeSyncAuthorized, false)
+  assert.deepEqual(s.writes.slice(writes), [expectedEvidence])
+  for (const [path, value] of prior) assert.equal(s.files.get(path), value, path)
+  assert.equal(s.files.has(runRoots.selectorPath), false)
+  assert.equal(s.files.has(roots.selectorPath), false)
+  const read = await inspectV4BestEffortPreparedSelectorAfterRestart(s.input())
+  assert.equal(read.observation, "authenticated-prepared-selector-uncommitted")
+  assert.equal(read.localCutoverAuthorized, false)
+  assert.equal(read.resumeSyncAuthorized, false)
+  assert.equal(s.writes.length, writes + 1)
+  assert.equal(s.settings.githubBranch, "main")
+  assert.equal(s.settings.encryptionPassphraseSecretId, "old-secret")
+})
 
 test("D172 reopened prepared evidence remains uncommitted and read-only", async () => {
   const s = fixture()

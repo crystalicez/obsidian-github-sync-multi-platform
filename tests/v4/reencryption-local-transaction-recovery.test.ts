@@ -7,6 +7,7 @@ import {
 import type { V4ReencryptionJournalSnapshot } from "../../src/lib/v4/reencryption-recovery-journal"
 import { prepareV4ReencryptionLocalCutoverIntent } from "../../src/lib/v4/reencryption-local-cutover-intent"
 import { inspectV4BestEffortReencryptionLocalTransactionAfterCrash } from "../../src/lib/v4/reencryption-best-effort-local-restart"
+import { V4_RUNTIME_INDEX_ROOT } from "../../src/lib/v4/reencryption-index-root"
 import {
   classifyV4ReencryptionLocalRecovery,
   inspectV4ReencryptionLocalTransactionAfterCrash,
@@ -24,7 +25,7 @@ const runId = "run_d139_123"
 const shadowRoot = indexRoot + "-rekey-" + runId
 const intentPath = indexRoot + "-rekey-intent-" + runId + "/intent.json"
 
-function fixture() {
+function fixture(activeRoot = indexRoot) {
   const files = new Map<string, string>()
   const dirs = new Set<string>()
   let writes = 0
@@ -90,19 +91,19 @@ function fixture() {
     try { return await body() } finally { held = false }
   }
   const input = () => ({
-    runId, indexRoot, expected, settings, indexAdapter: adapter,
+    runId, indexRoot: activeRoot, expected, settings, indexAdapter: adapter,
     sourceCommitSha: sourceSha, backupRepoId: backup, expectedWalGeneration: 14,
     journal, getSecret: (id: string) => secrets.get(id) ?? null,
     assertExclusiveInitiatorLease, assertCrashDurable, withExclusiveInitiatorLease,
   })
   const seed = async (includeIntent = true) => {
-    await saveV4LocalIndex(adapter, indexRoot, makeIndex(source, sourceSha))
-    await saveV4LocalIndex(adapter, shadowRoot, makeIndex(destination, destinationSha))
+    await saveV4LocalIndex(adapter, activeRoot, makeIndex(source, sourceSha))
+    await saveV4LocalIndex(adapter, activeRoot + "-rekey-" + runId, makeIndex(destination, destinationSha))
     if (includeIntent) {
       // Intent writer requires both predicates, supplied here by a test-only held lease.
       await withExclusiveInitiatorLease(async () =>
         prepareV4ReencryptionLocalCutoverIntent({
-          adapter, activeIndexRoot: indexRoot, runId,
+          adapter, activeIndexRoot: activeRoot, runId,
           sourceRepoId: source, backupRepoId: backup, destinationRepoId: destination,
           sourceCommitSha: sourceSha, destinationCommitSha: destinationSha,
           sourcePassphraseSecretId: "secret-old", destinationPassphraseSecretId: "secret-new",
@@ -117,8 +118,8 @@ function fixture() {
     settings.encryptionPassphraseSecretId = "secret-new"
   }
   const selectDestinationIndex = async () => {
-    const destinationIndex = await loadV4LocalIndex(adapter, shadowRoot)
-    await saveV4LocalIndex(adapter, indexRoot, destinationIndex)
+    const destinationIndex = await loadV4LocalIndex(adapter, activeRoot + "-rekey-" + runId)
+    await saveV4LocalIndex(adapter, activeRoot, destinationIndex)
   }
   return {
     files, dirs, adapter, seed, input, settings, secrets, journal, expected,
@@ -130,6 +131,31 @@ function fixture() {
 }
 
 const selectors: readonly V4ReencryptionLocalCutoverSelection[] = ["source", "destination", "mixed"]
+
+test("D175 crash-window recovery reads the existing runtime Index root, keeps Source and Shadow untouched", async () => {
+  const s = fixture(V4_RUNTIME_INDEX_ROOT)
+  await s.seed()
+  const prior = new Map(s.files)
+  const before = s.counts().writes
+  const report = await inspectV4ReencryptionLocalTransactionAfterCrash(s.input())
+  assert.equal(report.observation, "source-prepared-uncommitted")
+  assert.equal(report.localCutoverAuthorized, false)
+  assert.equal(report.resumeSyncAuthorized, false)
+  assert.deepEqual(s.files, prior)
+  assert.equal(s.counts().writes, before)
+  const { assertCrashDurable: _strict, ...readOnly } = s.input()
+  const bestEffort = await inspectV4BestEffortReencryptionLocalTransactionAfterCrash({
+    ...readOnly,
+    acknowledgement: "accept-best-effort-power-loss-recovery-risk",
+    wal: {
+      async assertExclusiveStageLease() {},
+      async assertBestEffortCheckpoint() { return "best-effort-readback-only" as const },
+    },
+  })
+  assert.equal(bestEffort.observation, "source-prepared-uncommitted")
+  assert.equal(bestEffort.localCutoverAuthorized, false)
+  assert.deepEqual(s.files, prior)
+})
 
 const d171Consent = "accept-best-effort-power-loss-recovery-risk" as const
 

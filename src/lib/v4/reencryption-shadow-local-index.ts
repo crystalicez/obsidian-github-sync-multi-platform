@@ -7,7 +7,7 @@ import { expectedV4PathLayout } from "./protocol-types"
 
 const SHA = /^[a-f0-9]{40}$/u
 const RUN = /^[A-Za-z0-9_-]{8,128}$/u
-const SAFE_SEGMENT = /^[A-Za-z0-9_.-]+$/u
+import { isSafeV4ReencryptionSourceIndexRoot } from "./reencryption-index-root"
 
 // Cooperative in-process guard only. A real cross-process lease and a durable
 // exclusive directory-claim protocol remain obligations of the storage adapter.
@@ -76,10 +76,7 @@ function matchesStagedReadback(actual: V4LocalIndex, snapshot: V4LocalIndex): bo
 function validate(input: V4ReencryptionShadowLocalIndexInput): string {
   if (!input || typeof input.activeRoot !== "string"
     || !RUN.test(input.runId)
-    || !input.activeRoot.split("/").every(part => SAFE_SEGMENT.test(part) && part !== "." && part !== "..")
-    || input.activeRoot.split("/").length < 2
-    || input.activeRoot.endsWith("/")
-    || input.activeRoot.includes("\\")
+    || !isSafeV4ReencryptionSourceIndexRoot(input.activeRoot)
     || !SHA.test(input.expectedDestinationCommitSha)
     || typeof input.expectedDestinationRepoId !== "string"
     || !/^([^/#]+)\/([^/#]+)#([^#]+)$/u.test(input.expectedDestinationRepoId)

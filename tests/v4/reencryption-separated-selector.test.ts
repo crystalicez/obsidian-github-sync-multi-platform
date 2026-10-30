@@ -1,4 +1,5 @@
 import assert from "node:assert/strict"
+import { V4_RUNTIME_INDEX_ROOT, isSafeV4ReencryptionSourceIndexRoot } from "../../src/lib/v4/reencryption-index-root"
 import test from "node:test"
 import {
   classifyV4ReencryptionSeparatedSelector, planV4ReencryptionSeparatedRoots,
@@ -23,6 +24,28 @@ function assertNoAuthority(state: V4ReencryptionSeparatedSelectorSnapshot): void
   assert.ok(Object.isFrozen(report))
   assert.deepEqual(classifyV4ReencryptionSeparatedSelector(state), report)
 }
+
+test("D175 runtime Source Index uses its original single-segment plugin-private root without relocation", () => {
+  const run = "run_d175_123"
+  const roots = planV4ReencryptionSeparatedRoots(V4_RUNTIME_INDEX_ROOT, run)
+  assert.deepEqual(roots, {
+    sourceIndexRoot: "github-sync-v4-index",
+    shadowIndexRoot: "github-sync-v4-index-rekey-" + run,
+    selectorPath: "github-sync-v4-index-rekey-selector-" + run + "/selector.json",
+  })
+  assert.equal(isSafeV4ReencryptionSourceIndexRoot(V4_RUNTIME_INDEX_ROOT), true)
+  for (const path of [
+    "index", "github-sync-v4-stage", "github-sync-v4-recovery",
+    "github-sync-v4-index/", "/github-sync-v4-index",
+    "./github-sync-v4-index", "../github-sync-v4-index",
+    "github-sync-v4-index\\outside", "github-sync-v4-index/../outside",
+    "github-sync-v4-index//shadow", "", ".",
+  ]) {
+    assert.equal(isSafeV4ReencryptionSourceIndexRoot(path), false, path)
+    assert.throws(() => planV4ReencryptionSeparatedRoots(path, run), /Invalid immutable/)
+  }
+  assert.equal(isSafeV4ReencryptionSourceIndexRoot("private/v4-index"), true)
+})
 
 test("D145 plan keeps immutable Source, independent Shadow and separate selector paths", () => {
   const roots = planV4ReencryptionSeparatedRoots("private/v4-index", "run_d145_123")

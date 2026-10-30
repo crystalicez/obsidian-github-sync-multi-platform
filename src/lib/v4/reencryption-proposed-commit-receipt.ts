@@ -5,6 +5,7 @@ import { isV4LocalIndexCacheComplete, loadV4LocalIndex, type V4LocalIndex, type 
 import { expectedV4PathLayout } from "./protocol-types"
 import type { V4ReencryptionRecoveryJournal, V4ReencryptionJournalSnapshot } from "./reencryption-recovery-journal"
 import type { V4LocalCutoverSettings } from "./reencryption-local-cutover-inspection"
+import { isSafeV4ReencryptionSourceIndexRoot } from "./reencryption-index-root"
 
 const SHA = /^[0-9a-f]{40}$/u
 const DIGEST = /^[0-9a-f]{64}$/u
@@ -103,10 +104,7 @@ export function assertV4ReencryptionProposedCommitIdentity(identity: V4Reencrypt
     || Object.keys(identity).sort().join("|") !== IDENTITY_KEYS.join("|")
     || !RUN.test(identity.runId)
     || !RUN.test(identity.deviceId)
-    || typeof identity.indexRoot !== "string"
-    || identity.indexRoot.split("/").length < 2
-    || !identity.indexRoot.split("/").every(part =>
-      /^[A-Za-z0-9_.-]+$/u.test(part) && part !== "." && part !== "..")
+    || !isSafeV4ReencryptionSourceIndexRoot(identity.indexRoot)
     || !Number.isSafeInteger(identity.walGeneration) || identity.walGeneration < 1
     || !SHA.test(identity.sourceCommitSha) || !SHA.test(identity.sourceTreeSha)
     || !SHA.test(identity.destinationCommitSha) || !SHA.test(identity.destinationTreeSha)

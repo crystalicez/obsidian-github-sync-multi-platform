@@ -9,6 +9,7 @@ import { verifyV4ReencryptionDestinationExactCommit } from "../../src/lib/v4/ree
 import { buildV4RemoteMetadata } from "../../src/lib/v4/remote-index"
 import { createEmptyV4LocalIndex, loadV4LocalIndex, saveV4LocalIndex, type V4IndexFileRecord, type V4LocalIndexAdapter } from "../../src/lib/v4/local-index"
 import { verifyV4ReencryptionShadowAgainstDestination } from "../../src/lib/v4/reencryption-shadow-remote-binding"
+import { V4_RUNTIME_INDEX_ROOT } from "../../src/lib/v4/reencryption-index-root"
 import { inspectV4ReencryptionCrossSurfaceProof } from "../../src/lib/v4/reencryption-cross-surface-proof"
 import { inspectV4ReencryptionLiveBackupCrossSurface } from "../../src/lib/v4/reencryption-live-backup-cross-surface"
 import { computeV4ReencryptionCandidateManifestDigest } from "../../src/lib/v4/reencryption-candidate-manifest-digest"
@@ -234,7 +235,8 @@ test("D83 wrong key, changed repo identity, malformed or cancelled audit fail cl
 
 const d137Run = "run_d137_shadow"
 const d137Shadow = "private/index-rekey-" + d137Run
-async function d137Scenario() {
+async function d137Scenario(activeIndexRoot = "private/index") {
+  const activeShadow = activeIndexRoot + "-rekey-" + d137Run
   const f = await fixture()
   const files = new Map<string, string>()
   let writes = 0
@@ -258,16 +260,30 @@ async function d137Scenario() {
       ...record, ...(record.partPaths ? { partPaths: [...record.partPaths] } : {}),
     }
   }
-  await saveV4LocalIndex(adapter, d137Shadow, index)
+  await saveV4LocalIndex(adapter, activeShadow, index)
   const { expectedRecords: _ignored, ...remote } = args(f)
   const lease = async () => {}
   const durable = async () => {}
   const input = () => ({
-    adapter, activeIndexRoot: "private/index", runId: d137Run,
+    adapter, activeIndexRoot, runId: d137Run,
     expectedDeviceId: "d83", remote, assertExclusiveInitiatorLease: lease, assertCrashDurable: durable,
   })
   return { f, adapter, files, input, getWrites: () => writes }
 }
+
+test("D175 verified remote Destination binds to a Shadow beside the unchanged runtime Source root", async () => {
+  const s = await d137Scenario(V4_RUNTIME_INDEX_ROOT)
+  const before = new Map(s.files)
+  const writes = s.getWrites()
+  const report = await verifyV4ReencryptionShadowAgainstDestination(s.input())
+  assert.equal(report.observation, "shadow-matches-verified-destination-uncommitted")
+  assert.equal(report.verifiedFileCount, 3)
+  assert.equal(report.localCutoverAuthorized, false)
+  assert.equal(report.resumeSyncAuthorized, false)
+  assert.deepEqual(s.files, before)
+  assert.equal(s.getWrites(), writes)
+  assert.equal(s.files.has(d137Shadow + "/header.json"), false)
+})
 
 test("D137 verified immutable remote plaintext and all committed records bind to Shadow without a write", async () => {
   const s = await d137Scenario()

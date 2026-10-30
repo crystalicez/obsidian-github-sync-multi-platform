@@ -37,7 +37,8 @@ import { V4CancelledError, throwIfV4Aborted } from "./cancellation"
 import { V4PublicationRaceError, isV4PublicationRaceError } from "./publication-race"
 import { assertV4SpeculativeConfigStillAbsent, guardV4SpeculativeConfigGithub } from "./speculative-config-guard"
 
-const V4_INDEX_ROOT = "github-sync-v4-index"
+import { V4_RUNTIME_INDEX_ROOT } from "./reencryption-index-root"
+const V4_INDEX_ROOT = V4_RUNTIME_INDEX_ROOT
 const V4_STAGE_ROOT = "github-sync-v4-stage"
 const V4_RECOVERY_ROOT = "github-sync-v4-recovery"
 const fallbackStores = new WeakMap<object, Map<string, string>>()

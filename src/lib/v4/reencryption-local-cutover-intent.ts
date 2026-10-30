@@ -11,7 +11,7 @@ import type { V4ReencryptionRecoveryJournal } from "./reencryption-recovery-jour
 
 const SHA = /^[a-f0-9]{40}$/u
 const RUN = /^[A-Za-z0-9_-]{8,128}$/u
-const SEGMENT = /^[A-Za-z0-9_.-]+$/u
+import { isSafeV4ReencryptionSourceIndexRoot } from "./reencryption-index-root"
 export const V4_REENCRYPTION_LOCAL_CUTOVER_INTENT_MAX_BYTES = 8 * 1024
 const activeIntents = new WeakMap<V4LocalIndexAdapter, Set<string>>()
 
@@ -80,9 +80,7 @@ function validIdentity(repoId: string): { owner: string; repo: string; branch: s
 
 function validate(input: CutoverIntentCoreInput, checkpoint: () => Promise<void>): PinnedIntent {
   if (!input || typeof input.activeIndexRoot !== "string"
-    || input.activeIndexRoot.split("/").length < 2
-    || !input.activeIndexRoot.split("/").every(segment => SEGMENT.test(segment)
-      && segment !== "." && segment !== "..")
+    || !isSafeV4ReencryptionSourceIndexRoot(input.activeIndexRoot)
     || typeof input.runId !== "string" || !RUN.test(input.runId)
     || !SHA.test(input.sourceCommitSha) || !SHA.test(input.destinationCommitSha)
     || input.sourceCommitSha === input.destinationCommitSha

@@ -3,6 +3,7 @@ import test from "node:test"
 import { createEmptyV4LocalIndex, loadV4LocalIndex, saveV4LocalIndex, type V4LocalIndexAdapter } from "../../src/lib/v4/local-index"
 import type { V4ReencryptionJournalSnapshot } from "../../src/lib/v4/reencryption-recovery-journal"
 import {
+  assertV4ReencryptionProposedCommitIdentity,
   sealV4ReencryptionProposedCommitTestVector,
   inspectV4ReencryptionProposedCommitAfterRestart,
   type V4ReencryptionProposedCommitIdentity,
@@ -10,6 +11,7 @@ import {
   type V4ReencryptionProposedCommitReport,
 } from "../../src/lib/v4/reencryption-proposed-commit-receipt"
 import { encryptV4Payload } from "../../src/lib/v4/crypto"
+import { V4_RUNTIME_INDEX_ROOT } from "../../src/lib/v4/reencryption-index-root"
 import { toBase64, utf8ToBytes } from "../../src/lib/bytes"
 
 const identity: V4ReencryptionProposedCommitIdentity = {
@@ -119,6 +121,18 @@ function fixture() {
 async function inspect(s: ReturnType<typeof fixture>): Promise<V4ReencryptionProposedCommitReport> {
   return inspectV4ReencryptionProposedCommitAfterRestart(s.input())
 }
+
+test("D175 proposed Cutover identity accepts only the existing single-segment runtime Index root", () => {
+  assert.doesNotThrow(() => assertV4ReencryptionProposedCommitIdentity({
+    ...identity, indexRoot: V4_RUNTIME_INDEX_ROOT,
+  }))
+  for (const indexRoot of ["index", "github-sync-v4-stage", "../github-sync-v4-index",
+    "github-sync-v4-index/..", "github-sync-v4-index\\wrong"]) {
+    assert.throws(() => assertV4ReencryptionProposedCommitIdentity({
+      ...identity, indexRoot,
+    }), /Invalid proposed cutover receipt identity/)
+  }
+})
 
 test("D142 genuine AES-GCM proposed marker + stable destination index/WAL is still NEVER durable authorization", async () => {
   const s = fixture()

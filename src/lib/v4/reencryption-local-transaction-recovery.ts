@@ -1,6 +1,7 @@
 import { isV4LocalIndexCacheComplete, loadV4LocalIndex, type V4LocalIndex } from "./local-index"
 import { inspectV4ReencryptionRestartEvidence, type V4ReencryptionRestartInspectionInput } from "./reencryption-local-cutover-restart"
 import { expectedV4PathLayout } from "./protocol-types"
+import { isSafeV4ReencryptionSourceIndexRoot } from "./reencryption-index-root"
 
 export type V4ReencryptionLocalCutoverSelection = "source" | "destination" | "mixed"
 
@@ -104,10 +105,7 @@ function indexSelection(input: V4ReencryptionLocalRecoveryInput, index: V4LocalI
 function validate(input: V4ReencryptionLocalRecoveryInput): void {
   if (!input || typeof input.withExclusiveInitiatorLease !== "function"
     || typeof input.runId !== "string" || !/^[A-Za-z0-9_-]{8,128}$/u.test(input.runId)
-    || typeof input.indexRoot !== "string"
-    || input.indexRoot.split("/").length < 2
-    || !input.indexRoot.split("/").every(part =>
-      /^[A-Za-z0-9_.-]+$/u.test(part) && part !== "." && part !== "..")
+    || !isSafeV4ReencryptionSourceIndexRoot(input.indexRoot)
     || !/^[0-9a-f]{40}$/u.test(input.sourceCommitSha)
     || !/^[0-9a-f]{40}$/u.test(input.expected?.destinationCommitSha)
     || input.sourceCommitSha === input.expected.destinationCommitSha

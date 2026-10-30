@@ -6,6 +6,7 @@ import { join } from "node:path"
 import { createEmptyV4LocalIndex, loadV4LocalIndex, saveV4LocalIndex, type V4LocalIndexAdapter } from "../../src/lib/v4/local-index"
 import { prepareV4ReencryptionLocalCutoverIntent, prepareV4BestEffortReencryptionLocalCutoverIntent } from "../../src/lib/v4/reencryption-local-cutover-intent"
 import { acquireV4DesktopRekeyWalStorage } from "../../src/lib/v4/reencryption-desktop-wal"
+import { V4_RUNTIME_INDEX_ROOT } from "../../src/lib/v4/reencryption-index-root"
 import { createV4ReencryptionRecoveryJournal, type V4ReencryptionJournalSnapshot } from "../../src/lib/v4/reencryption-recovery-journal"
 
 const source = "owner/repo#main"
@@ -18,7 +19,7 @@ const runId = "run12345"
 const shadow = root + "-rekey-" + runId
 const intentRoot = root + "-rekey-intent-" + runId
 
-function store() {
+function store(activeRoot = root) {
   const files = new Map<string, string>()
   const dirs = new Set<string>()
   const writes: string[] = []
@@ -34,11 +35,11 @@ function store() {
     return index
   }
   const seed = async () => {
-    await saveV4LocalIndex(adapter, root, makeIndex(source, oldSha))
-    await saveV4LocalIndex(adapter, shadow, makeIndex(destination, newSha))
+    await saveV4LocalIndex(adapter, activeRoot, makeIndex(source, oldSha))
+    await saveV4LocalIndex(adapter, activeRoot + "-rekey-" + runId, makeIndex(destination, newSha))
   }
   const input = () => ({
-    adapter, activeIndexRoot: root, runId,
+    adapter, activeIndexRoot: activeRoot, runId,
     sourceRepoId: source, backupRepoId: backup, destinationRepoId: destination,
     sourceCommitSha: oldSha, destinationCommitSha: newSha,
     sourcePassphraseSecretId: "old-secret-id", destinationPassphraseSecretId: "new-secret-id",
@@ -48,6 +49,24 @@ function store() {
   })
   return { files, dirs, writes, adapter, seed, input }
 }
+
+test("D175 production runtime Index root permits only an isolated local intent without modifying Source/Shadow", async () => {
+  const s = store(V4_RUNTIME_INDEX_ROOT)
+  await s.seed()
+  const originals = new Map(s.files)
+  const before = s.writes.length
+  const report = await prepareV4ReencryptionLocalCutoverIntent(s.input())
+  assert.equal(report.status, "local-cutover-intent-prepared-uncommitted")
+  assert.equal(report.localCutoverAuthorized, false)
+  assert.equal(report.resumeSyncAuthorized, false)
+  const expectedPath = V4_RUNTIME_INDEX_ROOT + "-rekey-intent-" + runId + "/intent.json"
+  assert.equal(report.intentPath, expectedPath)
+  assert.deepEqual(s.writes.slice(before), [expectedPath])
+  for (const [path, value] of originals) assert.equal(s.files.get(path), value, path)
+  assert.equal((await loadV4LocalIndex(s.adapter, V4_RUNTIME_INDEX_ROOT)).repoId, source)
+  assert.equal((await loadV4LocalIndex(s.adapter, V4_RUNTIME_INDEX_ROOT + "-rekey-" + runId)).repoId, destination)
+  await assert.rejects(() => prepareV4ReencryptionLocalCutoverIntent(s.input()), /existing|manual recovery/i)
+})
 
 const d170Consent = "accept-best-effort-power-loss-recovery-risk" as const
 const candidateTree = "c".repeat(40)

@@ -6,6 +6,7 @@ import {
   saveV4LocalIndex, type V4LocalIndex, type V4LocalIndexAdapter,
 } from "../../src/lib/v4/local-index"
 import { stageV4ReencryptionShadowLocalIndex } from "../../src/lib/v4/reencryption-shadow-local-index"
+import { V4_RUNTIME_INDEX_ROOT } from "../../src/lib/v4/reencryption-index-root"
 
 const source = "owner/vault#main"
 const dest = "owner/vault#rekey/2026-10-28"
@@ -60,6 +61,23 @@ function store() {
     }),
   }
 }
+
+test("D175 Shadow staging uses the existing runtime Source Index root and never moves it", async () => {
+  const s = store()
+  const original = index(source, oldCommit)
+  await saveV4LocalIndex(s.adapter, V4_RUNTIME_INDEX_ROOT, original)
+  const before = new Map(s.files)
+  const report = await stageV4ReencryptionShadowLocalIndex({
+    ...s.input(), activeRoot: V4_RUNTIME_INDEX_ROOT,
+  })
+  assert.equal(report.stagingRoot, V4_RUNTIME_INDEX_ROOT + "-rekey-" + runId)
+  assert.equal(report.localCutoverAuthorized, false)
+  assert.equal(report.resumeSyncAuthorized, false)
+  for (const [path, value] of before) assert.equal(s.files.get(path), value)
+  assert.equal((await loadV4LocalIndex(s.adapter, V4_RUNTIME_INDEX_ROOT)).repoId, source)
+  assert.equal((await loadV4LocalIndex(s.adapter, report.stagingRoot)).repoId, dest)
+  assert.equal(s.files.has(active + "/header.json"), false)
+})
 
 test("D134 stages independent destination index and re-reads full shards, never changes active or grants cutover/cleanup", async () => {
   const s=store()

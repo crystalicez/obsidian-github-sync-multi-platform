@@ -10,6 +10,7 @@ import {
   type V4ReencryptionLocalCutoverIntentRecord,
 } from "./reencryption-local-cutover-intent"
 
+import { isSafeV4ReencryptionSourceIndexRoot } from "./reencryption-index-root"
 const RUN = /^[A-Za-z0-9_-]{8,128}$/u
 const SHA = /^[0-9a-f]{40}$/u
 
@@ -43,9 +44,7 @@ const PREPARED: V4ReencryptionRestartInspection = Object.freeze({
 })
 
 function validRoot(root: string): boolean {
-  return typeof root === "string" && root.split("/").length >= 2
-    && root.split("/").every(segment => /^[A-Za-z0-9_.-]+$/u.test(segment)
-      && segment !== "." && segment !== "..")
+  return isSafeV4ReencryptionSourceIndexRoot(root)
 }
 
 function validate(input: V4ReencryptionRestartInspectionInput): void {

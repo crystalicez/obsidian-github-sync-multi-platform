@@ -8,6 +8,7 @@ import {
 } from "../../src/lib/v4/local-index"
 import { createV4ReencryptionRecoveryJournal, type V4ReencryptionJournalSnapshot } from "../../src/lib/v4/reencryption-recovery-journal"
 import { acquireV4DesktopRekeyWalStorage } from "../../src/lib/v4/reencryption-desktop-wal"
+import { V4_RUNTIME_INDEX_ROOT } from "../../src/lib/v4/reencryption-index-root"
 import { inspectV4BestEffortReencryptionRestartEvidence } from "../../src/lib/v4/reencryption-best-effort-local-restart"
 import { prepareV4ReencryptionLocalCutoverIntent } from "../../src/lib/v4/reencryption-local-cutover-intent"
 import { inspectV4ReencryptionRestartEvidence } from "../../src/lib/v4/reencryption-local-cutover-restart"
@@ -25,7 +26,7 @@ const shadow = root + "-rekey-" + runId
 const intentPath = root + "-rekey-intent-" + runId + "/intent.json"
 const pathId = "aa" + "0".repeat(62)
 
-function fixture() {
+function fixture(activeRoot = root) {
   const files = new Map<string, string>()
   const dirs = new Set<string>()
   let writes = 0
@@ -92,16 +93,16 @@ function fixture() {
   const lease = async () => { leases++ }
   const durable = async () => { barriers++ }
   const input = (expectedWalGeneration = 12) => ({
-    runId, expected, settings, indexAdapter: adapter, indexRoot: root,
+    runId, expected, settings, indexAdapter: adapter, indexRoot: activeRoot,
     sourceCommitSha: oldSha, backupRepoId: backup, expectedWalGeneration,
     journal, getSecret: (id: string) => secrets.get(id) ?? null,
     assertExclusiveInitiatorLease: lease, assertCrashDurable: durable,
   })
   const seed = async (walGeneration = 12) => {
-    await saveV4LocalIndex(adapter, root, makeIndex(source, oldSha))
-    await saveV4LocalIndex(adapter, shadow, makeIndex(destination, newSha))
+    await saveV4LocalIndex(adapter, activeRoot, makeIndex(source, oldSha))
+    await saveV4LocalIndex(adapter, activeRoot + "-rekey-" + runId, makeIndex(destination, newSha))
     await prepareV4ReencryptionLocalCutoverIntent({
-      adapter, activeIndexRoot: root, runId,
+      adapter, activeIndexRoot: activeRoot, runId,
       sourceRepoId: source, backupRepoId: backup, destinationRepoId: destination,
       sourceCommitSha: oldSha, destinationCommitSha: newSha,
       sourcePassphraseSecretId: oldSecret, destinationPassphraseSecretId: newSecret,
@@ -116,6 +117,25 @@ function fixture() {
     counts: () => ({ writes, walReads, leases, barriers, readIntentCount }),
   }
 }
+
+test("D175 fresh restart inspection accepts the real plugin-private runtime Index root without granting Cutover", async () => {
+  const s = fixture(V4_RUNTIME_INDEX_ROOT)
+  await s.seed()
+  const prior = new Map(s.files)
+  const before = s.counts().writes
+  const report = await inspectV4ReencryptionRestartEvidence(s.input())
+  assert.equal(report.observation, "source-with-prepared-intent-uncommitted")
+  assert.equal(report.localCutoverAuthorized, false)
+  assert.equal(report.resumeSyncAuthorized, false)
+  assert.equal(report.oldPassphraseCleanupAuthorized, false)
+  assert.deepEqual(s.files, prior)
+  assert.equal(s.counts().writes, before)
+  const bestEffort = d171Input(s)
+  const afterRestart = await inspectV4BestEffortReencryptionRestartEvidence(bestEffort.input)
+  assert.equal(afterRestart.observation, "source-with-prepared-intent-uncommitted")
+  assert.equal(afterRestart.resumeSyncAuthorized, false)
+  assert.deepEqual(s.files, prior)
+})
 
 const d171Consent = "accept-best-effort-power-loss-recovery-risk" as const
 

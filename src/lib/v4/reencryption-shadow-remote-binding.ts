@@ -7,10 +7,10 @@ import {
   type V4ReencryptionDestinationExactCommitInput,
 } from "./reencryption-destination-exact-commit"
 import { expectedV4PathLayout } from "./protocol-types"
+import { isSafeV4ReencryptionSourceIndexRoot } from "./reencryption-index-root"
 
 const SHA = /^[0-9a-f]{40}$/u
 const RUN = /^[A-Za-z0-9_-]{8,128}$/u
-const SEGMENT = /^[A-Za-z0-9_.-]+$/u
 
 export interface V4ReencryptionShadowRemoteBindingInput {
   readonly adapter: V4LocalIndexAdapter
@@ -35,9 +35,7 @@ export interface V4ReencryptionShadowRemoteBindingReport {
 }
 
 function validRoot(value: string): boolean {
-  return typeof value === "string" && value.split("/").length >= 2
-    && value.split("/").every(segment => SEGMENT.test(segment)
-      && segment !== "." && segment !== "..")
+  return isSafeV4ReencryptionSourceIndexRoot(value)
 }
 
 function validIndex(index: V4LocalIndex, repoId: string, sha: string, deviceId: string): boolean {

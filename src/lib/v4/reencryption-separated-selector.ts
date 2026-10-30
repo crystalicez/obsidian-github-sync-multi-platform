@@ -9,16 +9,14 @@ export interface V4ReencryptionSeparatedRoots {
   readonly selectorPath: string
 }
 
+import { isSafeV4ReencryptionSourceIndexRoot } from "./reencryption-index-root"
+
 const RUN = /^[A-Za-z0-9_-]{8,128}$/u
-const SEGMENT = /^[A-Za-z0-9_.-]+$/u
 
 export function planV4ReencryptionSeparatedRoots(
   sourceIndexRoot: string, runId: string,
 ): V4ReencryptionSeparatedRoots {
-  if (typeof sourceIndexRoot !== "string"
-    || sourceIndexRoot.split("/").length < 2
-    || !sourceIndexRoot.split("/").every(segment =>
-      SEGMENT.test(segment) && segment !== "." && segment !== "..")
+  if (!isSafeV4ReencryptionSourceIndexRoot(sourceIndexRoot)
     || typeof runId !== "string" || !RUN.test(runId)) {
     throw new Error("Invalid immutable Source/Shadow selector roots.")
   }
