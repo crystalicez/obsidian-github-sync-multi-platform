@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { mkdtemp, mkdir, rm } from "node:fs/promises";
+import { join } from "node:path";
 import test from "node:test";
 
 import { sha256Hex, toBase64Url, utf8ToBytes } from "../../src/lib/bytes";
@@ -11,7 +13,8 @@ import { verifyGitHubReencryptionSource, verifyGitHubReencryptionForkSource, ver
 import { proposeV4SameRepositoryReencryptionBackupBranch } from "../../src/lib/v4/reencryption-owner-decisions";
 import { inspectV4FrozenBackupAfterAmbiguousCreate } from "../../src/lib/v4/reencryption-backup-reconcile";
 import { createAndVerifyV4FrozenBackupRef } from "../../src/lib/v4/reencryption-backup-create-verified";
-import { createV4JournaledFrozenBackup, reconcileV4PendingFrozenBackupWithJournal } from "../../src/lib/v4/reencryption-ref-journal-coordinator";
+import { createV4JournaledFrozenBackup, createV4BestEffortJournaledFrozenBackup, reconcileV4PendingFrozenBackupWithJournal, reconcileV4PendingFrozenBackupWithJournalBestEffort } from "../../src/lib/v4/reencryption-ref-journal-coordinator";
+import { acquireV4DesktopRekeyWalStorage } from "../../src/lib/v4/reencryption-desktop-wal";
 import { createV4ReencryptionRecoveryJournal } from "../../src/lib/v4/reencryption-recovery-journal";
 import type { V4LocalIndexAdapter } from "../../src/lib/v4/local-index";
 
@@ -829,6 +832,217 @@ test("D102 Windows unproven WAL durability blocks Backup mutation and leaves no 
   }), /fsync EPERM/i)
   assert.equal(f.createAttempts, 0)
   assert.deepEqual((await j.journal.load())?.pendingRefIntents, [])
+})
+
+test("D166 best-effort Backup explicitly accepts risk, authenticates WAL around one create-only ref, and never cuts over", async () => {
+  const f = await D99BackupFixture()
+  const j = await D102Journal()
+  let checkpoints = 0
+  const input = {
+    ...f.input, journal: j.journal,
+    wal: {
+      assertExclusiveStageLease: async () => {},
+      assertBestEffortCheckpoint: async () => {
+        checkpoints++
+        return "best-effort-readback-only" as const
+      },
+    },
+    acknowledgement: "accept-best-effort-power-loss-recovery-risk" as const,
+  }
+  const result = await createV4BestEffortJournaledFrozenBackup(input)
+  assert.equal(result.backupContentsReadbackVerified, true)
+  assert.equal(result.destinationPublicationAuthorized, false)
+  assert.equal(result.initiatingDeviceCutoverAuthorized, false)
+  assert.equal(result.independentlyAuditedDurableIntent, false)
+  assert.equal(f.createAttempts, 1)
+  assert.ok(checkpoints >= 6)
+  const snapshot = await j.open().assertHealthySnapshot(3)
+  assert.equal(snapshot.pendingRefIntents.length, 0)
+  assert.equal(snapshot.verifiedRefObservations[0]?.repoId, frozenPlan.backupRepoId)
+  assert.equal(snapshot.cutoverAuthorized, false)
+  await assert.rejects(() => createV4BestEffortJournaledFrozenBackup({
+    ...input, journal: j.open(),
+  }), /previous ref intent/i)
+  assert.equal(f.createAttempts, 1)
+})
+
+test("D166 missing best-effort risk acknowledgement fails before WAL or network writes", async () => {
+  const f = await D99BackupFixture()
+  const j = await D102Journal()
+  let checks = 0
+  await assert.rejects(() => createV4BestEffortJournaledFrozenBackup({
+    ...f.input, journal: j.journal,
+    wal: {
+      assertExclusiveStageLease: async () => { checks++ },
+      assertBestEffortCheckpoint: async () => {
+        checks++
+        return "best-effort-readback-only" as const
+      },
+    },
+    acknowledgement: "not-accepted" as "accept-best-effort-power-loss-recovery-risk",
+  }), /acknowledgement/i)
+  assert.equal(checks, 0)
+  assert.equal(f.createAttempts, 0)
+  assert.deepEqual((await j.journal.load())?.pendingRefIntents, [])
+})
+
+test("D166 failed WAL checkpoint after intent keeps pending ref and prevents GitHub create", async () => {
+  const f = await D99BackupFixture()
+  const j = await D102Journal()
+  let checks = 0
+  const wal = {
+    assertExclusiveStageLease: async () => {},
+    assertBestEffortCheckpoint: async () => {
+      if (++checks === 4) throw new Error("WAL disk read failed")
+      return "best-effort-readback-only" as const
+    },
+  }
+  await assert.rejects(() => createV4BestEffortJournaledFrozenBackup({
+    ...f.input, journal: j.journal, wal,
+    acknowledgement: "accept-best-effort-power-loss-recovery-risk",
+  }), /Manual Recovery/i)
+  assert.equal(checks, 4)
+  assert.equal(f.createAttempts, 0)
+  const pending = await j.open().assertHealthySnapshot(2)
+  assert.equal(pending.pendingRefIntents.length, 1)
+  assert.equal(pending.permissionToPublish, false)
+  assert.equal(pending.cutoverAuthorized, false)
+})
+
+test("D166 best-effort unresolved GitHub create never retries the same frozen Backup", async () => {
+  const f = await D99BackupFixture()
+  const j = await D102Journal()
+  const original = f.input.backup.createGitRef
+  f.input.backup.createGitRef = async sha => {
+    try { await original(sha) }
+    finally {
+      f.input.backup.getGitRefOrNull = async () => {
+        throw new Error("GitHub 503 during Backup reconciliation")
+      }
+    }
+  }
+  f.loseCreateResponse()
+  const input = {
+    ...f.input, journal: j.journal,
+    wal: {
+      assertExclusiveStageLease: async () => {},
+      assertBestEffortCheckpoint: async () => "best-effort-readback-only" as const,
+    },
+    acknowledgement: "accept-best-effort-power-loss-recovery-risk" as const,
+  }
+  await assert.rejects(() => createV4BestEffortJournaledFrozenBackup(input), /ambiguous|recovery/i)
+  assert.equal(f.createAttempts, 1)
+  assert.equal((await j.open().load())?.pendingRefIntents.length, 1)
+  await assert.rejects(() => createV4BestEffortJournaledFrozenBackup({
+    ...input, journal: j.open(),
+  }), /previous ref intent/i)
+  assert.equal(f.createAttempts, 1)
+})
+
+test("D166 real Windows WAL permits approved best-effort frozen Backup readback without claiming fsync durability", async () => {
+  const parent = join(process.cwd(), ".tmp")
+  await mkdir(parent, { recursive: true })
+  const root = await mkdtemp(join(parent, "d166-best-effort-backup-"))
+  try {
+    const f = await D99BackupFixture()
+    const wal = await acquireV4DesktopRekeyWalStorage({
+      rootAbsolute: root, journalRoot: "v4/rekey-journal",
+    })
+    try {
+      const journal = createV4ReencryptionRecoveryJournal({
+        adapter: wal.adapter, root: "v4/rekey-journal",
+        destinationRepoId: frozenPlan.destinationRepoId, sourceCommitSha: commitSha,
+        runId: "d166-backup-run", journalKey: new Uint8Array(32).fill(0x65),
+      })
+      await journal.begin()
+      const result = await createV4BestEffortJournaledFrozenBackup({
+        ...f.input, journal, wal,
+        acknowledgement: "accept-best-effort-power-loss-recovery-risk",
+      })
+      assert.equal(result.backupContentsReadbackVerified, true)
+      assert.equal(f.createAttempts, 1)
+      const state = await journal.assertHealthySnapshot(3)
+      assert.equal(state.verifiedRefObservations.length, 1)
+      assert.equal(state.cutoverAuthorized, false)
+      assert.equal(state.requiresRemoteRevalidation, true)
+    } finally {
+      await wal.release()
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("D166 best-effort Backup after ambiguous GitHub response recovers by read-only ref verification, never replay", async () => {
+  const f = await D99BackupFixture()
+  const j = await D102Journal()
+  const originalRead = f.input.backup.getGitRefOrNull
+  const originalWrite = f.input.backup.createGitRef
+  f.input.backup.createGitRef = async sha => {
+    try { await originalWrite(sha) }
+    finally {
+      f.input.backup.getGitRefOrNull = async () => {
+        throw new Error("GitHub 503 readback unavailable")
+      }
+    }
+  }
+  f.loseCreateResponse()
+  const wal = {
+    assertExclusiveStageLease: async () => {},
+    assertBestEffortCheckpoint: async () => "best-effort-readback-only" as const,
+  }
+  const acknowledgement = "accept-best-effort-power-loss-recovery-risk" as const
+  await assert.rejects(() => createV4BestEffortJournaledFrozenBackup({
+    ...f.input, journal: j.journal, wal, acknowledgement,
+  }), /ambiguous|recovery/i)
+  assert.equal((await j.open().load())?.pendingRefIntents.length, 1)
+  f.input.backup.getGitRefOrNull = originalRead
+  const result = await reconcileV4PendingFrozenBackupWithJournalBestEffort({
+    plan: frozenPlan, backup: f.input.backup, journal: j.open(), wal,
+    expectedSourceTreeSha: rootTreeSha, originalPassphrase: "correct",
+    verifiedOriginalSource: f.input.verifiedSource, acknowledgement,
+  })
+  assert.equal(result.backedUpContentsVerified, true)
+  assert.equal(result.automaticallyRetryCreateAuthorized, false)
+  assert.equal(result.initiatingDeviceCutoverAuthorized, false)
+  assert.equal(f.createAttempts, 1)
+  assert.deepEqual((await j.open().assertHealthySnapshot(3)).pendingRefIntents, [])
+  await assert.rejects(() => reconcileV4PendingFrozenBackupWithJournalBestEffort({
+    plan: frozenPlan, backup: f.input.backup, journal: j.open(), wal,
+    expectedSourceTreeSha: rootTreeSha, originalPassphrase: "correct",
+    verifiedOriginalSource: f.input.verifiedSource, acknowledgement,
+  }), /one exact unresolved/i)
+  assert.equal(f.createAttempts, 1)
+})
+
+test("D166 uncertain best-effort Recovery cannot clear pending WAL after wrong Git ref", async () => {
+  const f = await D99BackupFixture()
+  const j = await D102Journal()
+  const starting = (await j.journal.load())!
+  await j.journal.recordRefIntent({
+    role: "backup", repoId: frozenPlan.backupRepoId,
+    commitSha, treeSha: rootTreeSha,
+  }, starting.generation)
+  const wal = {
+    assertExclusiveStageLease: async () => {},
+    assertBestEffortCheckpoint: async () => "best-effort-readback-only" as const,
+  }
+  const input = {
+    plan: frozenPlan, backup: f.input.backup, journal: j.journal, wal,
+    expectedSourceTreeSha: rootTreeSha, originalPassphrase: "correct",
+    verifiedOriginalSource: f.input.verifiedSource,
+    acknowledgement: "accept-best-effort-power-loss-recovery-risk" as const,
+  }
+  f.input.backup.getGitRefOrNull = async () => ({
+    ref: "refs/heads/backup/2026-10-26", sha: "f".repeat(40), type: "commit",
+  })
+  await assert.rejects(() => reconcileV4PendingFrozenBackupWithJournalBestEffort(input), /missing|conflicting|authenticated/i)
+  assert.equal(f.createAttempts, 0)
+  assert.equal((await j.open().assertHealthySnapshot(2)).pendingRefIntents.length, 1)
+  await assert.rejects(() => reconcileV4PendingFrozenBackupWithJournalBestEffort({
+    ...input, acknowledgement: "declined" as "accept-best-effort-power-loss-recovery-risk",
+  }), /acknowledgement/i)
+  assert.equal((await j.open().assertHealthySnapshot(2)).pendingRefIntents.length, 1)
 })
 
 test("D103 a corrupt sibling WAL slot after durable intent but before POST stops Backup ref creation", async () => {

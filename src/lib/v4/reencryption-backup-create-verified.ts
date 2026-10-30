@@ -66,6 +66,29 @@ export interface V4CreatedAndVerifiedBackupReport {
 export async function createAndVerifyV4FrozenBackupRef(
   input: V4CreateAndVerifyBackupInput,
 ): Promise<V4CreatedAndVerifiedBackupReport> {
+  return createAndVerifyBackup(input, input.assertDurableBackupIntent)
+}
+
+export interface V4BestEffortBackupInput
+  extends Omit<V4CreateAndVerifyBackupInput, "assertDurableBackupIntent"> {
+  readonly acknowledgement: "accept-best-effort-power-loss-recovery-risk"
+  readonly assertBestEffortBackupIntent: () => Promise<void>
+}
+
+export async function createAndVerifyV4FrozenBackupRefBestEffort(
+  input: V4BestEffortBackupInput,
+): Promise<V4CreatedAndVerifiedBackupReport> {
+  if (input.acknowledgement !== "accept-best-effort-power-loss-recovery-risk"
+    || typeof input.assertBestEffortBackupIntent !== "function") {
+    throw new Error("Best-effort Backup requires explicit risk acknowledgement and a WAL checkpoint.")
+  }
+  return createAndVerifyBackup(input, input.assertBestEffortBackupIntent)
+}
+
+async function createAndVerifyBackup(
+  input: Omit<V4CreateAndVerifyBackupInput, "assertDurableBackupIntent">,
+  checkpoint: () => Promise<void>,
+): Promise<V4CreatedAndVerifiedBackupReport> {
   throwIfV4Aborted(input.signal)
   const { plan, verifiedSource, backup, source } = input
   if (!plan || !verifiedSource
@@ -107,7 +130,7 @@ export async function createAndVerifyV4FrozenBackupRef(
   try {
     // Intent is stored before D93 can send its create-only GitHub request.
     // Preflight failures may leave a harmless intent, never a false mutation.
-    await input.assertDurableBackupIntent()
+    await checkpoint()
     throwIfV4Aborted(input.signal)
     await createV4FrozenSameRepositoryBackupRef({
       plan, verifiedSource, source, backup: scopedBackup,
