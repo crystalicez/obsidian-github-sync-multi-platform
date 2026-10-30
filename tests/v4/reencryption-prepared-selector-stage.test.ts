@@ -3,6 +3,8 @@ import test from "node:test"
 import { mkdir, mkdtemp, rm } from "node:fs/promises"
 import { join } from "node:path"
 import { createEmptyV4LocalIndex, loadV4LocalIndex, saveV4LocalIndex, type V4LocalIndexAdapter } from "../../src/lib/v4/local-index"
+import { sha256Hex, utf8ToBytes } from "../../src/lib/bytes"
+import { sealV4ReencryptionCommitPairTestVectors, inspectV4ReencryptionCommitPairTestVectors } from "../../src/lib/v4/reencryption-commit-pair-test-vectors"
 import { prepareV4ReencryptionLocalCutoverIntent } from "../../src/lib/v4/reencryption-local-cutover-intent"
 import { stageV4BestEffortPreparedSelectorEvidence, inspectV4BestEffortPreparedSelectorAfterRestart } from "../../src/lib/v4/reencryption-prepared-selector-stage"
 import {
@@ -402,6 +404,47 @@ test("D181 exhaustive local crash boundary matrix never treats Settings/Index an
       }
     }
   }
+})
+
+test("D182 fully authenticated paired test vectors in local storage remain unexpected post-crash residue", async () => {
+  const s = await d180Fixture()
+  const current = s.input().identity
+  const source = await loadV4LocalIndex(s.adapter, V4_RUNTIME_INDEX_ROOT)
+  const shadow = await loadV4LocalIndex(s.adapter,
+    V4_RUNTIME_INDEX_ROOT + "-rekey-" + current.runId)
+  const digest = async (value: string) => sha256Hex(utf8ToBytes(value))
+  const sourceSettings = JSON.stringify(s.settings)
+  const targetSettings = JSON.stringify({
+    ...s.settings, githubBranch: "rekey/2026",
+    encryptionPassphraseSecretId: "new-secret",
+  })
+  const contract = {
+    transactionId: "ac".repeat(16),
+    identity: current,
+    sourceIndexSha256: await digest(JSON.stringify(source)),
+    destinationShadowSha256: await digest(JSON.stringify(shadow)),
+    preparedEvidenceSha256: await digest(s.files.get(d180Prepared)!),
+    walSnapshotSha256: await digest(JSON.stringify(s.walSnapshot())),
+    sourceSettingsSha256: await digest(sourceSettings),
+    destinationSettingsSha256: await digest(targetSettings),
+  }
+  const pair = await sealV4ReencryptionCommitPairTestVectors(contract, s.key)
+  assert.equal((await inspectV4ReencryptionCommitPairTestVectors(contract, s.key, pair)).observation,
+    "both-test-vectors-authenticate-uncommitted")
+  s.files.set(d180Selector, pair.selectorTestVector)
+  s.dirs.add(d180Proposed)
+  s.files.set(d180Proposed + "/marker.json", pair.receiptTestVector)
+  const original = new Map(s.files)
+  const writes = s.writes.length
+  const result = await inspectV4FencedLocalCrashTriageAfterRestart(s.input())
+  assert.equal(result.observation, "manual-recovery-required")
+  assert.equal(result.reason, "unrecognized-selector-or-commit-artifact")
+  assert.equal(result.localCutoverAuthorized, false)
+  assert.equal(result.resumeSyncAuthorized, false)
+  assert.equal(result.oldPassphraseCleanupAuthorized, false)
+  assert.deepEqual(s.files, original)
+  assert.equal(s.writes.length, writes)
+  await assert.rejects(() => assertV4ReencryptionSyncFenceClear(s.adapter))
 })
 
 test("D176 exact fence binding permits only prepared evidence, never committed Cutover", async () => {
