@@ -315,6 +315,95 @@ test("D180 asynchronous SecretStorage or Settings mutation while reading Prepare
   }
 })
 
+test("D181 holder skipping callback or forging a positive result cannot certify crash recovery", async () => {
+  const s = await d180Fixture()
+  const authentic = await inspectV4FencedLocalCrashTriageAfterRestart(s.input())
+  assert.equal(authentic.observation, "source-prepared-uncommitted")
+  const initialWrites = s.writes.length
+  const skipped = s.input()
+  skipped.withExclusiveInitiatorLease = async () => authentic as never
+  const skippedResult = await inspectV4FencedLocalCrashTriageAfterRestart(skipped)
+  assert.equal(skippedResult.observation, "manual-recovery-required")
+  assert.equal(skippedResult.reason, "fence-wal-or-storage-uncertain")
+
+  const forged = s.input()
+  forged.withExclusiveInitiatorLease = async action => s.owner(async () => {
+    await action()
+    return { ...authentic, observation: "destination-observed-without-commit-proof" } as never
+  })
+  const forgedResult = await inspectV4FencedLocalCrashTriageAfterRestart(forged)
+  assert.equal(forgedResult.observation, "manual-recovery-required")
+  assert.equal(forgedResult.resumeSyncAuthorized, false)
+  assert.equal(s.writes.length, initialWrites)
+  await assert.rejects(() => assertV4ReencryptionSyncFenceClear(s.adapter))
+})
+
+test("D181 holder double invocation returning the first success and post-callback drift fail closed", async () => {
+  for (const cause of ["double", "after-settings", "after-secret"] as const) {
+    const s = await d180Fixture()
+    const input = s.input()
+    input.withExclusiveInitiatorLease = async action => s.owner(async () => {
+      const first = await action()
+      if (cause === "double") await action()
+      else if (cause === "after-settings") s.settings.githubBranch = "another-branch"
+      else s.secrets.set("new-secret", "post-holder-secret-changed")
+      return first
+    })
+    const writes = s.writes.length
+    const result = await inspectV4FencedLocalCrashTriageAfterRestart(input)
+    assert.equal(result.observation, "manual-recovery-required", cause)
+    assert.equal(result.reason, "fence-wal-or-storage-uncertain", cause)
+    assert.equal(result.resumeSyncAuthorized, false)
+    assert.equal(s.writes.length, writes)
+  }
+})
+
+test("D181 exhaustive local crash boundary matrix never treats Settings/Index and mock receipt residue as authority", async () => {
+  for (const settings of ["source", "destination"] as const) {
+    for (const activeIndex of ["source", "destination"] as const) {
+      for (const residue of ["absent", "selector", "receipt"] as const) {
+        for (const prepared of ["healthy", "torn"] as const) {
+          const s = await d180Fixture()
+          if (settings === "destination") {
+            s.settings.githubBranch = "rekey/2026"
+            s.settings.encryptionPassphraseSecretId = "new-secret"
+          }
+          if (activeIndex === "destination") {
+            const shadow = await loadV4LocalIndex(s.adapter,
+              V4_RUNTIME_INDEX_ROOT + "-rekey-" + identity.runId)
+            await saveV4LocalIndex(s.adapter, V4_RUNTIME_INDEX_ROOT, shadow)
+          }
+          if (residue === "selector") s.files.set(d180Selector,
+            await sealV4ReencryptionSeparatedSelectorTestVector(s.input().identity, s.key))
+          if (residue === "receipt") s.files.set(d180Proposed + "/marker.json", "future-looking")
+          if (prepared === "torn") s.files.set(d180Prepared, "{torn")
+
+          const before = new Map(s.files)
+          const writes = s.writes.length
+          const result = await inspectV4FencedLocalCrashTriageAfterRestart(s.input())
+          const label = [settings, activeIndex, residue, prepared].join("/")
+          const expected = residue !== "absent"
+            ? "unrecognized-selector-or-commit-artifact"
+            : prepared === "torn"
+              ? "missing-or-invalid-prepared-evidence"
+              : settings === "source" && activeIndex === "source"
+                ? "source-still-selected"
+                : settings === "destination" && activeIndex === "destination"
+                  ? "destination-looking-without-authoritative-commit"
+                  : "mixed-or-changed-local-state"
+          assert.equal(result.reason, expected, label)
+          assert.equal(result.localCutoverAuthorized, false, label)
+          assert.equal(result.resumeSyncAuthorized, false, label)
+          assert.equal(result.rollbackAuthorized, false, label)
+          assert.equal(result.oldPassphraseCleanupAuthorized, false, label)
+          assert.deepEqual(s.files, before, label)
+          assert.equal(s.writes.length, writes, label)
+        }
+      }
+    }
+  }
+})
+
 test("D176 exact fence binding permits only prepared evidence, never committed Cutover", async () => {
   const s = fixture(V4_RUNTIME_INDEX_ROOT)
   await s.seed()

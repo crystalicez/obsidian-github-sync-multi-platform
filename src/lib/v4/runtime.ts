@@ -352,11 +352,18 @@ export class V4PluginRuntime {
       throw new Error("Re-encryption requires no active, pending or staged Sync work.")
     }
     const originalGeneration = this.credentialGeneration
+    // Pin the caller's migration identity and lease function before ANY await.
+    // The input object can be mutated by the caller while disk I/O is pending.
+    const runId = input.runId
+    const destinationRepoId = input.destinationRepoId
+    const initiatorLease = input.assertExclusiveInitiatorLease
     const sourceRepoId = this.repoId(initial)
     const assertPinned = () => {
       this.assertNotDisposed()
       const now = this.plugin.settings
-      if (this.plugin.app.vault.adapter !== this.indexAdapterBacking
+      if (input.runId !== runId || input.destinationRepoId !== destinationRepoId
+        || input.assertExclusiveInitiatorLease !== initiatorLease
+        || this.plugin.app.vault.adapter !== this.indexAdapterBacking
         || this.credentialGeneration !== originalGeneration
         || now.githubOwner !== initial.githubOwner || now.githubRepo !== initial.githubRepo
         || now.githubBranch !== initial.githubBranch || now.githubToken !== initial.githubToken
@@ -374,12 +381,12 @@ export class V4PluginRuntime {
     try {
       assertPinned()
       const report = await armV4ReencryptionSyncFence({
-        adapter: this.adapter, runId: input.runId, sourceRepoId,
-        destinationRepoId: input.destinationRepoId,
+        adapter: this.adapter, runId, sourceRepoId,
+        destinationRepoId,
         assertExclusiveInitiatorLease: async () => {
           assertQuiescent()
           assertPinned()
-          await input.assertExclusiveInitiatorLease()
+          await initiatorLease()
           assertQuiescent()
           assertPinned()
         },

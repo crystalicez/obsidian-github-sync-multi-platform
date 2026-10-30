@@ -1036,6 +1036,65 @@ test("D174 changed Source settings during awaited lease fail closed before fence
   f.runtime.dispose()
 })
 
+test("D181 mutable Re-encryption Run, Destination or lease callback cannot retarget an in-flight fence", async () => {
+  for (const kind of ["run", "destination", "lease"] as const) {
+    const f = plaintextRuntimeFixture()
+    Object.assign(f.plugin.settings, {
+      encryptionMode: "encrypted", encryptionPassphrase: "source-key",
+      encryptionPassphraseSecretId: "old-secret",
+    })
+    Object.assign(f.plugin, { disableWatch() { f.plugin.isWatchEnabled = false } })
+    f.indexAdapter.mkdir = async path => { f.indexFiles.set(path, "directory") }
+    let calls = 0
+    const input = {
+      runId: "d181_mutable_001",
+      destinationRepoId: "o/r#rekey/2026",
+      assertExclusiveInitiatorLease: async () => {
+        calls++
+        if (kind === "run") input.runId = "d181_other_run"
+        if (kind === "destination") input.destinationRepoId = "o/r#rekey/other"
+        if (kind === "lease") {
+          input.assertExclusiveInitiatorLease = async () => {
+            throw Error("must not call a substituted initiator lease")
+          }
+        }
+      },
+    }
+    await assert.rejects(() => f.runtime.armReencryptionSyncFence(input), /Manual Recovery/)
+    assert.equal(calls, 1, kind)
+    assert.equal(f.indexFiles.has(".obsidian/plugins/test/github-sync-v4-rekey-sync-fence/active.json"), false, kind)
+    assert.equal(f.plugin.isWatchEnabled, false, kind)
+    assert.deepEqual(await f.runtime.manualSync(), { status: "busy", changedFiles: 0 })
+    assert.equal(f.github.refReads, 0, kind)
+    f.runtime.dispose()
+  }
+})
+
+test("D181 mutation after the fence marker write preserves it and never resumes Sync", async () => {
+  const f = plaintextRuntimeFixture()
+  Object.assign(f.plugin.settings, {
+    encryptionMode: "encrypted", encryptionPassphrase: "source-key",
+    encryptionPassphraseSecretId: "old-secret",
+  })
+  Object.assign(f.plugin, { disableWatch() { f.plugin.isWatchEnabled = false } })
+  f.indexAdapter.mkdir = async path => { f.indexFiles.set(path, "directory") }
+  let calls = 0
+  const input = {
+    runId: "d181_marker_written",
+    destinationRepoId: "o/r#rekey/2026",
+    assertExclusiveInitiatorLease: async () => {
+      if (++calls === 3) input.runId = "d181_retargeted"
+    },
+  }
+  await assert.rejects(() => f.runtime.armReencryptionSyncFence(input), /Manual Recovery/)
+  assert.equal(calls, 3)
+  assert.equal(f.indexFiles.has(".obsidian/plugins/test/github-sync-v4-rekey-sync-fence/active.json"), true)
+  assert.equal(f.plugin.isWatchEnabled, false)
+  assert.deepEqual(await f.runtime.manualSync(), { status: "busy", changedFiles: 0 })
+  assert.equal(f.github.refReads, 0)
+  f.runtime.dispose()
+})
+
 test("D173 live V4 runtime pauses every Sync trigger and Force operation before GitHub I/O when a migration fence exists", async () => {
   const fixture = plaintextRuntimeFixture()
   assert.equal((await fixture.runtime.forcePush() as { status: string }).status, "completed")

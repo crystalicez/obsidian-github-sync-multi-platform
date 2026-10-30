@@ -222,57 +222,67 @@ export async function inspectV4FencedLocalCrashTriageAfterRestart(
     return prepared
   }
 
-  let invoked = false
-  try {
-    return await holder(async () => {
-      if (invoked) return UNCERTAIN
-      invoked = true
-      await fence()
-      if (!unchanged()) return UNCERTAIN
-      const intentBytes = await expectedIntentBytes(id)
-      if (!unchanged()) return UNCERTAIN
-      const first = await readEvidence(intentBytes)
-      if (first === "unexpected") return UNRECOGNIZED
-      if (first === "missing") return PREPARED_BAD
+  const inspectHeld = async (): Promise<V4ReencryptionCrashTriageReport> => {
+    await fence()
+    if (!unchanged()) return UNCERTAIN
+    const intentBytes = await expectedIntentBytes(id)
+    if (!unchanged()) return UNCERTAIN
+    const first = await readEvidence(intentBytes)
+    if (first === "unexpected") return UNRECOGNIZED
+    if (first === "missing") return PREPARED_BAD
 
-      const walProof = await inspectV4BestEffortWalRecovery({
-        storage: wal, journal, expected: {
-          sourceCommitSha: id.sourceCommitSha,
-          destinationRepoId: id.destinationRepoId,
-          generation: id.walGeneration,
-        },
-      })
-      const walSnapshot = await journalRead.call(journal, id.walGeneration)
-      if (walProof.observation !== "authenticated-uncommitted"
-        || !matchesV4ReencryptionPreparedWal(walSnapshot, id)
-        || !unchanged()) return UNCERTAIN
-      const pinnedWal = JSON.stringify(walSnapshot)
-
-      const crash = await inspectV4BestEffortReencryptionLocalTransactionAfterCrash({
-        ...restart, withExclusiveInitiatorLease: borrowed,
-      })
-      if (!unchanged()) return UNCERTAIN
-      if (crash.observation === "source-prepared-uncommitted") {
-        const source = await inspectV4FencedBestEffortPreparedSelectorAfterRestart({
-          ...input, withExclusiveInitiatorLease: borrowed,
-        })
-        if (source.observation !== "authenticated-prepared-selector-uncommitted"
-          || !unchanged()) return PREPARED_BAD
-      }
-
-      await fence()
-      const second = await readEvidence(intentBytes)
-      if (second === "unexpected") return UNRECOGNIZED
-      if (typeof second !== "string" || second !== first
-        || await unexpectedCommitArtifact(adapter, roots.selectorPath, proposedRoot)
-        || JSON.stringify(await journalRead.call(journal, id.walGeneration)) !== pinnedWal
-        || !unchanged()) return UNCERTAIN
-      await fence()
-      if (!unchanged()) return UNCERTAIN
-      if (crash.observation === "source-prepared-uncommitted") return SOURCE
-      if (crash.observation === "destination-observed-without-commit-proof") return DEST
-      return MIXED
+    const walProof = await inspectV4BestEffortWalRecovery({
+      storage: wal, journal, expected: {
+        sourceCommitSha: id.sourceCommitSha,
+        destinationRepoId: id.destinationRepoId,
+        generation: id.walGeneration,
+      },
     })
+    const walSnapshot = await journalRead.call(journal, id.walGeneration)
+    if (walProof.observation !== "authenticated-uncommitted"
+      || !matchesV4ReencryptionPreparedWal(walSnapshot, id)
+      || !unchanged()) return UNCERTAIN
+    const pinnedWal = JSON.stringify(walSnapshot)
+
+    const crash = await inspectV4BestEffortReencryptionLocalTransactionAfterCrash({
+      ...restart, withExclusiveInitiatorLease: borrowed,
+    })
+    if (!unchanged()) return UNCERTAIN
+    if (crash.observation === "source-prepared-uncommitted") {
+      const source = await inspectV4FencedBestEffortPreparedSelectorAfterRestart({
+        ...input, withExclusiveInitiatorLease: borrowed,
+      })
+      if (source.observation !== "authenticated-prepared-selector-uncommitted"
+        || !unchanged()) return PREPARED_BAD
+    }
+
+    await fence()
+    const second = await readEvidence(intentBytes)
+    if (second === "unexpected") return UNRECOGNIZED
+    if (typeof second !== "string" || second !== first
+      || await unexpectedCommitArtifact(adapter, roots.selectorPath, proposedRoot)
+      || JSON.stringify(await journalRead.call(journal, id.walGeneration)) !== pinnedWal
+      || !unchanged()) return UNCERTAIN
+    await fence()
+    if (!unchanged()) return UNCERTAIN
+    if (crash.observation === "source-prepared-uncommitted") return SOURCE
+    if (crash.observation === "destination-observed-without-commit-proof") return DEST
+    return MIXED
+  }
+
+  let callbackCount = 0
+  let callbackReport: V4ReencryptionCrashTriageReport | null = null
+  try {
+    const holderReport = await holder(async () => {
+      callbackCount++
+      if (callbackCount !== 1) return UNCERTAIN
+      // Require one actual inspection and return only its genuine report.
+      const inspected = await inspectHeld()
+      callbackReport = inspected
+      return inspected
+    })
+    return callbackCount === 1 && callbackReport === holderReport && unchanged()
+      ? holderReport : UNCERTAIN
   } catch {
     return UNCERTAIN
   }
