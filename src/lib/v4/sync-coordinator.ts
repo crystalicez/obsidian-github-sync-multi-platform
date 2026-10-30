@@ -128,6 +128,8 @@ export class V4SyncCoordinator {
   private activeController: AbortController | undefined;
   private timer?: unknown;
   private flushAfterActive = false;
+  private reencryptionReserved = false;
+  private reencryptionDirty = false;
   private disposed = false;
   private readonly schedule: (callback: () => void, delay: number) => unknown;
   private readonly cancel: (handle: any) => void;
@@ -142,6 +144,25 @@ export class V4SyncCoordinator {
   get isSyncing(): boolean { return this.active !== undefined; }
   get pendingCount(): number { return this.disposed ? 0 : coalesceV4Changes(this.pending).length; }
 
+  /**
+   * Irreversible in this runtime. Reserve synchronously, before any awaited
+   * WAL or filesystem operation, so a timer or manual Sync cannot race arming.
+   * A local event seen after reservation poisons the proof instead of vanishing.
+   */
+  reserveReencryptionQuiescence(): () => void {
+    if (this.disposed || this.reencryptionReserved || this.active
+      || this.pending.length > 0 || this.timer !== undefined || this.flushAfterActive) {
+      throw new Error("Re-encryption needs idle Sync with no queued or debounced changes.")
+    }
+    this.reencryptionReserved = true
+    return () => {
+      if (this.disposed || !this.reencryptionReserved || this.reencryptionDirty
+        || this.active || this.pending.length > 0 || this.timer !== undefined || this.flushAfterActive) {
+        throw new Error("Re-encryption quiescence changed; Manual Recovery required.")
+      }
+    }
+  }
+
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
@@ -154,6 +175,7 @@ export class V4SyncCoordinator {
 
   enqueue(change: V4QueuedChange): void {
     if (this.disposed) return;
+    if (this.reencryptionReserved) { this.reencryptionDirty = true; return; }
     this.pending.push(change);
     if (this.timer !== undefined) this.cancel(this.timer);
     this.timer = this.schedule(() => {
@@ -164,6 +186,11 @@ export class V4SyncCoordinator {
 
   async run(request: V4SyncRequest): Promise<V4CoordinatorRunResult> {
     if (this.disposed) return { status: "skipped", changedFiles: 0 };
+    if (this.reencryptionReserved) {
+      if (request.trigger === "scheduled" || request.trigger === "startup") return { status: "skipped", changedFiles: 0 };
+      this.options.notice?.("GitHub Sync: Re-encryption preparation has paused Sync. Review migration recovery before retrying.");
+      return { status: "busy", changedFiles: 0 };
+    }
     if (this.active) {
       if (request.trigger === "scheduled" || request.trigger === "startup") return { status: "skipped", changedFiles: 0 };
       this.options.notice?.("GitHub Sync: Sync already in progress");
@@ -202,7 +229,7 @@ export class V4SyncCoordinator {
   }
 
   private async flushLocalChanges(): Promise<V4CoordinatorRunResult> {
-    if (this.disposed) return { status: "skipped", changedFiles: 0 };
+    if (this.disposed || this.reencryptionReserved) return { status: "skipped", changedFiles: 0 };
     if (this.active) {
       this.flushAfterActive = true;
       return { status: "busy", changedFiles: 0 };
@@ -219,7 +246,7 @@ export class V4SyncCoordinator {
   }
 
   private start(request: V4SyncRequest, changes: V4QueuedChange[]): Promise<V4CoordinatorRunResult> {
-    if (this.disposed) return Promise.resolve({ status: "skipped", changedFiles: 0 });
+    if (this.disposed || this.reencryptionReserved) return Promise.resolve({ status: "skipped", changedFiles: 0 });
     const controller = new AbortController();
     this.activeController = controller;
     let resolveExecution!: (result: V4CoordinatorRunResult) => void;

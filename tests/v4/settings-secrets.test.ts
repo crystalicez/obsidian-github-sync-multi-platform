@@ -11,6 +11,7 @@ import { deriveV4Keyring } from "../../src/lib/v4/crypto";
 import { publishV4TreeChanges } from "../../src/lib/v4/git-tree-writer";
 import { migrateV4Secrets, sanitizeV4SettingsForPersistence, storeV4Secrets } from "../../src/lib/v4/secrets";
 import { selectV4RuntimeConfig, V4PluginRuntime } from "../../src/lib/v4/runtime";
+import type { V4SyncCoordinator } from "../../src/lib/v4/sync-coordinator";
 import { buildV4RemoteMetadata } from "../../src/lib/v4/remote-index";
 import { V4StorageCodec } from "../../src/lib/v4/storage-codec";
 import { V4_CONFIG_PATH, V4_FORMAT_VERSION, V4_HEAD_PATH, V4_ROOT, type V4PathLayout, type V4RemoteConfig, type V4RemoteHead } from "../../src/lib/v4/protocol-types";
@@ -898,6 +899,141 @@ test("D7: CAS retry keeps the starting connection and encryption identity after 
   assert.notEqual(fixture.runtime.progressSnapshot.lifecycle, "failed", fixture.runtime.progressSnapshot.errorMessage)
   assert.equal(fixture.runtime.progressSnapshot.attempt, 2)
   assert.equal(new TextDecoder().decode(fixture.github.files.get("secret.md")), "changed")
+})
+
+test("D174 live V4 Runtime reserves idle Sync synchronously before one-shot migration fence I/O", async () => {
+  const f = plaintextRuntimeFixture()
+  Object.assign(f.plugin.settings, {
+    encryptionMode: "encrypted", encryptionPassphrase: "source-key",
+    encryptionPassphraseSecretId: "old-secret", githubTokenSecretId: "token-1",
+  })
+  Object.assign(f.plugin, { disableWatch() { f.plugin.isWatchEnabled = false } })
+  f.indexAdapter.mkdir = async path => { f.indexFiles.set(path, "directory") }
+  let entered!: () => void
+  let resume!: () => void
+  const awaitingLease = new Promise<void>(resolve => { resume = resolve })
+  const started = new Promise<void>(resolve => { entered = resolve })
+  const operation = f.runtime.armReencryptionSyncFence({
+    runId: "d174_test_run_01", destinationRepoId: "o/r#rekey/2026",
+    assertExclusiveInitiatorLease: async () => { entered(); await awaitingLease },
+  })
+  await started
+  const refReads = f.github.refReads
+  assert.deepEqual(await f.runtime.startupSync(), { status: "skipped", changedFiles: 0 })
+  assert.deepEqual(await f.runtime.manualSync(), { status: "busy", changedFiles: 0 })
+  assert.deepEqual(await f.runtime.forcePull(), { status: "busy", changedFiles: 0 })
+  assert.deepEqual(await f.runtime.scheduledSync(), { status: "skipped", changedFiles: 0 })
+  assert.equal(f.github.refReads, refReads)
+  resume()
+  assert.deepEqual(await operation, {
+    status: "reencryption-sync-fence-armed-uncommitted",
+    localCutoverAuthorized: false, resumeSyncAuthorized: false,
+    rollbackAuthorized: false, oldPassphraseCleanupAuthorized: false,
+  })
+  assert.equal(f.indexFiles.has(".obsidian/plugins/test/github-sync-v4-rekey-sync-fence/active.json"), true)
+  assert.equal(f.plugin.isWatchEnabled, false)
+  f.runtime.enqueueModify("secret.md", 42)
+  assert.equal(f.runtime.pendingCount, 0)
+  assert.equal(f.github.refReads, 0)
+  f.runtime.dispose()
+})
+
+test("D174 file change after fence write prevents migration proof and retains fence on disk", async () => {
+  const f = plaintextRuntimeFixture()
+  Object.assign(f.plugin.settings, {
+    encryptionMode: "encrypted", encryptionPassphrase: "source-key",
+    encryptionPassphraseSecretId: "old-secret",
+  })
+  Object.assign(f.plugin, { disableWatch() { f.plugin.isWatchEnabled = false } })
+  f.indexAdapter.mkdir = async path => { f.indexFiles.set(path, "directory") }
+  let leaseCalls = 0
+  await assert.rejects(() => f.runtime.armReencryptionSyncFence({
+    runId: "d174_test_run_04", destinationRepoId: "o/r#rekey/2026",
+    assertExclusiveInitiatorLease: async () => {
+      leaseCalls++
+      if (leaseCalls === 3) {
+        // This executes after the marker write but before its final readback.
+        const coordinator = (f.runtime as unknown as { coordinator: V4SyncCoordinator }).coordinator
+        coordinator.enqueue({ type: "modify", path: "changed.md", mtime: 10 })
+      }
+    },
+  }), /Manual Recovery/)
+  assert.equal(leaseCalls, 3)
+  assert.equal(f.indexFiles.has(".obsidian/plugins/test/github-sync-v4-rekey-sync-fence/active.json"), true)
+  assert.equal(f.plugin.isWatchEnabled, false)
+  assert.equal(f.runtime.pendingCount, 0)
+  assert.deepEqual(await f.runtime.forcePush(), { status: "busy", changedFiles: 0 })
+  assert.equal(f.github.refReads, 0)
+  f.runtime.dispose()
+})
+
+test("D174 cannot arm migration fence on a missing persistent Obsidian storage adapter", async () => {
+  const f = plaintextRuntimeFixture()
+  Object.assign(f.plugin.settings, {
+    encryptionMode: "encrypted", encryptionPassphrase: "source-key",
+    encryptionPassphraseSecretId: "old-secret",
+  })
+  Object.assign(f.plugin.app.vault, { adapter: undefined })
+  await assert.rejects(() => f.runtime.armReencryptionSyncFence({
+    runId: "d174_no_disk_05", destinationRepoId: "o/r#rekey/2026",
+    assertExclusiveInitiatorLease: async () => { throw Error("must not acquire") },
+  }), /configured encrypted Source/)
+  assert.equal(f.github.refReads, 0)
+  f.runtime.dispose()
+})
+
+test("D174 refuses idle reservation with pending edits and does not write a fence", async () => {
+  const f = plaintextRuntimeFixture()
+  Object.assign(f.plugin.settings, {
+    encryptionMode: "encrypted", encryptionPassphrase: "source-key",
+    encryptionPassphraseSecretId: "old-secret",
+  })
+  f.runtime.enqueueModify("secret.md", 1)
+  let leaseCalls = 0
+  await assert.rejects(() => f.runtime.armReencryptionSyncFence({
+    runId: "d174_test_run_02", destinationRepoId: "o/r#rekey/2026",
+    assertExclusiveInitiatorLease: async () => { leaseCalls++ },
+  }), /no active, pending or staged/)
+  assert.equal(leaseCalls, 0)
+  assert.equal(f.indexFiles.has(".obsidian/plugins/test/github-sync-v4-rekey-sync-fence/active.json"), false)
+  f.runtime.dispose()
+})
+
+test("D174 swapping the Obsidian backing adapter during an awaited lease refuses publication", async () => {
+  const f = plaintextRuntimeFixture()
+  Object.assign(f.plugin.settings, {
+    encryptionMode: "encrypted", encryptionPassphrase: "source-key",
+    encryptionPassphraseSecretId: "old-secret",
+  })
+  Object.assign(f.plugin, { disableWatch() { f.plugin.isWatchEnabled = false } })
+  const originalAdapter = f.plugin.app.vault.adapter
+  await assert.rejects(() => f.runtime.armReencryptionSyncFence({
+    runId: "d174_swap_adapter_06", destinationRepoId: "o/r#rekey/2026",
+    assertExclusiveInitiatorLease: async () => {
+      Object.assign(f.plugin.app.vault, { adapter: { ...originalAdapter } })
+    },
+  }), /Manual Recovery/)
+  assert.equal(f.indexFiles.has(".obsidian/plugins/test/github-sync-v4-rekey-sync-fence/active.json"), false)
+  assert.equal(f.plugin.isWatchEnabled, false)
+  f.runtime.dispose()
+})
+
+test("D174 changed Source settings during awaited lease fail closed before fence publication", async () => {
+  const f = plaintextRuntimeFixture()
+  Object.assign(f.plugin.settings, {
+    encryptionMode: "encrypted", encryptionPassphrase: "source-key",
+    encryptionPassphraseSecretId: "old-secret",
+  })
+  Object.assign(f.plugin, { disableWatch() { f.plugin.isWatchEnabled = false } })
+  f.indexAdapter.mkdir = async path => { f.indexFiles.set(path, "directory") }
+  await assert.rejects(() => f.runtime.armReencryptionSyncFence({
+    runId: "d174_test_run_03", destinationRepoId: "o/r#rekey/2026",
+    assertExclusiveInitiatorLease: async () => { f.plugin.settings.githubBranch = "other" },
+  }), /Manual Recovery/)
+  assert.equal(f.indexFiles.has(".obsidian/plugins/test/github-sync-v4-rekey-sync-fence/active.json"), false)
+  assert.equal(f.plugin.isWatchEnabled, false)
+  assert.deepEqual(await f.runtime.manualSync(), { status: "busy", changedFiles: 0 })
+  f.runtime.dispose()
 })
 
 test("D173 live V4 runtime pauses every Sync trigger and Force operation before GitHub I/O when a migration fence exists", async () => {

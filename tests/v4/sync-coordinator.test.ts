@@ -19,6 +19,64 @@ class FakeTimers {
   }
 }
 
+test("D174 synchronous Re-encryption reservation refuses active Sync and preserves its original completion", async () => {
+  let finish!: () => void
+  const hold = new Promise<void>(resolve => { finish = resolve })
+  let runs = 0
+  const coordinator = new V4SyncCoordinator({ execute: async () => {
+    runs++
+    await hold
+    return { changedFiles: 1 }
+  } })
+  const active = coordinator.run({ operation: "normal", trigger: "manual" })
+  assert.throws(() => coordinator.reserveReencryptionQuiescence(), /idle Sync/)
+  finish()
+  assert.deepEqual(await active, { status: "completed", changedFiles: 1 })
+  const assertQuiet = coordinator.reserveReencryptionQuiescence()
+  assert.doesNotThrow(assertQuiet)
+  assert.equal((await coordinator.run({ operation: "normal", trigger: "startup" })).status, "skipped")
+  assert.equal((await coordinator.run({ operation: "forcePush", trigger: "forcePush" })).status, "busy")
+  assert.equal(runs, 1)
+  assert.throws(() => coordinator.reserveReencryptionQuiescence(), /idle Sync/)
+  coordinator.dispose()
+  assert.throws(assertQuiet, /Manual Recovery/)
+})
+
+test("D174 pending timer cannot be cleared to claim quiescence and queued data is not lost", async () => {
+  const timers = new FakeTimers()
+  let runs = 0
+  const coordinator = new V4SyncCoordinator({
+    execute: async (_request, changes) => { runs++; return { changedFiles: changes.length } },
+    schedule: timers.schedule, cancel: timers.cancel,
+  })
+  coordinator.enqueue({ type: "modify", path: "note.md", mtime: 1 })
+  assert.throws(() => coordinator.reserveReencryptionQuiescence(), /idle Sync/)
+  assert.equal(timers.timers.size, 1)
+  timers.fireLatest()
+  await coordinator.whenIdle()
+  assert.equal(runs, 1)
+  const assertQuiet = coordinator.reserveReencryptionQuiescence()
+  assert.doesNotThrow(assertQuiet)
+})
+
+test("D174 changes arriving while a fence is being written poison quiescence without launching Sync", async () => {
+  const notices: string[] = []
+  let executions = 0
+  const coordinator = new V4SyncCoordinator({
+    execute: async () => { executions++; return { changedFiles: 0 } },
+    notice: value => notices.push(value),
+  })
+  const assertQuiet = coordinator.reserveReencryptionQuiescence()
+  assert.doesNotThrow(assertQuiet)
+  coordinator.enqueue({ type: "rename", oldPath: "before.md", path: "after.md", mtime: 1 })
+  assert.throws(assertQuiet, /Manual Recovery/)
+  assert.equal((await coordinator.run({ operation: "normal", trigger: "scheduled" })).status, "skipped")
+  assert.equal((await coordinator.run({ operation: "normal", trigger: "manual" })).status, "busy")
+  assert.equal(coordinator.pendingCount, 0)
+  assert.equal(executions, 0)
+  assert.match(notices[0]!, /Re-encryption preparation/)
+})
+
 test("v4 coordinator globally debounces and coalesces local changes for five seconds", async () => {
   const timers = new FakeTimers();
   const executions: Array<{ request: V4SyncRequest; changes: V4QueuedChange[] }> = [];

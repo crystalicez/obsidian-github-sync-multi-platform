@@ -24,7 +24,7 @@ import { createV4ContentSource, createV4WholeBufferContentSource, DEFAULT_V4_WHO
 import { createV4PlatformIo, V4ManualRecoveryRequiredError, type V4BinaryAdapterLike, type V4PlatformIo } from "./platform-io"
 import { isV4UncVaultPath, V4_NETWORK_VAULT_WARNING } from "./network-storage"
 import { createV4DesktopInitiatorLocalReader } from "./reencryption-desktop-initiator-reader"
-import { assertV4ReencryptionSyncFenceClear, V4ReencryptionSyncFencedError } from "./reencryption-sync-fence"
+import { armV4ReencryptionSyncFence, assertV4ReencryptionSyncFenceClear, V4ReencryptionSyncFencedError, type V4ReencryptionSyncFenceReport } from "./reencryption-sync-fence"
 import type { V4InitiatorLocalReader } from "./reencryption-initiator-parity"
 import { createV4StagingStore, type V4StagingStore } from "./staging-store"
 import { V4ProgressStore, type V4SyncProgressSnapshot } from "./progress"
@@ -147,6 +147,7 @@ export class V4OpenEditorConflictError extends Error {
 export class V4PluginRuntime {
   private readonly coordinator: V4SyncCoordinator
   private readonly adapter: V4LocalIndexAdapter
+  private readonly indexAdapterBacking: object | undefined
   private readonly progressStore = new V4ProgressStore()
   private diagnosticsClient?: FastSync["githubClient"]
   private diagnosticsBaseline?: V4TransportMetricsSnapshot
@@ -167,6 +168,7 @@ export class V4PluginRuntime {
   private disposed = false
 
   constructor(private readonly plugin: FastSync) {
+    this.indexAdapterBacking = plugin.app.vault.adapter
     this.adapter = createIndexAdapter(plugin)
     const executionIo = createRuntimePlatformIo(plugin)
     this.platformIo = executionIo.io
@@ -323,6 +325,73 @@ export class V4PluginRuntime {
 
   get isSyncing(): boolean { return this.coordinator.isSyncing }
   get pendingCount(): number { return this.coordinator.pendingCount }
+
+  /**
+   * Internal D174 preflight only. No Wizard Run/remote mutation or local
+   * cutover is started here. Failure keeps this runtime paused until restart.
+   */
+  async armReencryptionSyncFence(input: {
+    readonly runId: string
+    readonly destinationRepoId: string
+    readonly assertExclusiveInitiatorLease: () => Promise<void>
+  }): Promise<V4ReencryptionSyncFenceReport> {
+    this.assertNotDisposed()
+    const initial = { ...this.plugin.settings }
+    if (this.uncVault || !this.indexAdapterBacking
+      || this.plugin.app.vault.adapter !== this.indexAdapterBacking
+      || initial.encryptionMode !== "encrypted"
+      || !initial.encryptionPassphraseSecretId
+      || !initial.githubOwner || !initial.githubRepo
+      || !initial.vault || typeof input?.assertExclusiveInitiatorLease !== "function") {
+      throw new Error("Re-encryption Sync fence requires configured encrypted Source and exclusive lease.")
+    }
+    if (this.coordinator.isSyncing || this.coordinator.pendingCount !== 0
+      || this.debounceRunActive || this.recentlyStagedPaths.size > 0
+      || this.plugin.isSyncInProgress) {
+      throw new Error("Re-encryption requires no active, pending or staged Sync work.")
+    }
+    const originalGeneration = this.credentialGeneration
+    const sourceRepoId = this.repoId(initial)
+    const assertPinned = () => {
+      this.assertNotDisposed()
+      const now = this.plugin.settings
+      if (this.plugin.app.vault.adapter !== this.indexAdapterBacking
+        || this.credentialGeneration !== originalGeneration
+        || now.githubOwner !== initial.githubOwner || now.githubRepo !== initial.githubRepo
+        || now.githubBranch !== initial.githubBranch || now.githubToken !== initial.githubToken
+        || now.encryptionMode !== initial.encryptionMode
+        || now.encryptionPassphrase !== initial.encryptionPassphrase
+        || now.encryptionPassphraseSecretId !== initial.encryptionPassphraseSecretId
+        || now.githubTokenSecretId !== initial.githubTokenSecretId || now.vault !== initial.vault
+        || this.debounceRunActive || this.recentlyStagedPaths.size > 0
+        || this.plugin.isSyncInProgress) {
+        throw new Error("Re-encryption Source or Sync status changed; Manual Recovery required.")
+      }
+    }
+    // The coordinator synchronously rejects new Syncs BEFORE the first await.
+    const assertQuiescent = this.coordinator.reserveReencryptionQuiescence()
+    try {
+      assertPinned()
+      const report = await armV4ReencryptionSyncFence({
+        adapter: this.adapter, runId: input.runId, sourceRepoId,
+        destinationRepoId: input.destinationRepoId,
+        assertExclusiveInitiatorLease: async () => {
+          assertQuiescent()
+          assertPinned()
+          await input.assertExclusiveInitiatorLease()
+          assertQuiescent()
+          assertPinned()
+        },
+      })
+      assertQuiescent()
+      assertPinned()
+      return report
+    } finally {
+      // Even an ambiguous mkdir/write response must not restart Sync here.
+      this.reencryptionSyncFenced = true
+      this.plugin.disableWatch?.()
+    }
+  }
   get progressSnapshot(): V4SyncProgressSnapshot {
     return this.snapshotForConsumers(this.progressStore.snapshot)
   }
