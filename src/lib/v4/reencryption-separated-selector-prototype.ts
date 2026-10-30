@@ -11,12 +11,13 @@ import {
 import { planV4ReencryptionSeparatedRoots } from "./reencryption-separated-selector"
 
 const CONTEXT = "v4-rekey-separated-selector-prototype-v1"
+const PREPARED_CONTEXT = "v4-rekey-prepared-selector-evidence-v1"
 const MAX_BYTES = 8 * 1024
 const BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u
 
 interface SelectorRecord {
   readonly schemaVersion: 1
-  readonly phase: "destination-selector-test-vector-uncommitted"
+  readonly phase: "destination-selector-test-vector-uncommitted" | "source-selector-prepared-uncommitted"
   readonly identity: V4ReencryptionProposedCommitIdentity
 }
 
@@ -49,20 +50,20 @@ function assertKey(key: Uint8Array): void {
   }
 }
 
-function record(identity: V4ReencryptionProposedCommitIdentity): SelectorRecord {
-  return { schemaVersion: 1, phase: "destination-selector-test-vector-uncommitted", identity }
+function record(identity: V4ReencryptionProposedCommitIdentity, phase: SelectorRecord["phase"]): SelectorRecord {
+  return { schemaVersion: 1, phase, identity }
 }
 
-function aad(identity: V4ReencryptionProposedCommitIdentity): string {
-  return CONTEXT + ":" + identity.runId + ":" + identity.sourceCommitSha
+function aad(identity: V4ReencryptionProposedCommitIdentity, context: string): string {
+  return context + ":" + identity.runId + ":" + identity.sourceCommitSha
     + ":" + identity.destinationRepoId + ":" + identity.destinationCommitSha
 }
 
-async function derivedKey(journalKey: Uint8Array): Promise<Uint8Array> {
+async function derivedKey(journalKey: Uint8Array, context: string): Promise<Uint8Array> {
   const key = await crypto.subtle.importKey("raw", journalKey as any,
     { name: "HMAC", hash: "SHA-256" }, false, ["sign"])
   return new Uint8Array(await crypto.subtle.sign("HMAC", key,
-    utf8ToBytes(CONTEXT + ":key") as any))
+    utf8ToBytes(context + ":key") as any))
 }
 
 function decode(encoded: string): Uint8Array | null {
@@ -80,16 +81,29 @@ function decode(encoded: string): Uint8Array | null {
 export async function sealV4ReencryptionSeparatedSelectorTestVector(
   identity: V4ReencryptionProposedCommitIdentity, journalKey: Uint8Array,
 ): Promise<string> {
+  return sealSelector(identity, journalKey, CONTEXT, "destination-selector-test-vector-uncommitted")
+}
+
+export async function sealV4ReencryptionPreparedSelectorEvidence(
+  identity: V4ReencryptionProposedCommitIdentity, journalKey: Uint8Array,
+): Promise<string> {
+  return sealSelector(identity, journalKey, PREPARED_CONTEXT, "source-selector-prepared-uncommitted")
+}
+
+async function sealSelector(
+  identity: V4ReencryptionProposedCommitIdentity, journalKey: Uint8Array,
+  context: string, phase: SelectorRecord["phase"],
+): Promise<string> {
   assertV4ReencryptionProposedCommitIdentity(identity)
   assertKey(journalKey)
-  const plaintext = utf8ToBytes(JSON.stringify(record(identity)))
+  const plaintext = utf8ToBytes(JSON.stringify(record(identity, phase)))
   if (plaintext.length > MAX_BYTES / 2) {
     plaintext.fill(0)
     throw new Error("Separated selector test vector exceeds its size limit.")
   }
-  const key = await derivedKey(journalKey)
+  const key = await derivedKey(journalKey, context)
   try {
-    const bytes = await encryptV4Payload(key, plaintext, { kind: "journal", aad: aad(identity) })
+    const bytes = await encryptV4Payload(key, plaintext, { kind: "journal", aad: aad(identity, context) })
     try { return toBase64(bytes) } finally { bytes.fill(0) }
   } finally {
     key.fill(0)
@@ -102,19 +116,33 @@ export async function authenticateV4ReencryptionSeparatedSelectorTestVector(
   encoded: string, identity: V4ReencryptionProposedCommitIdentity,
   journalKey: Uint8Array,
 ): Promise<boolean> {
+  return authenticateSelector(encoded, identity, journalKey, CONTEXT, "destination-selector-test-vector-uncommitted")
+}
+
+export async function authenticateV4ReencryptionPreparedSelectorEvidence(
+  encoded: string, identity: V4ReencryptionProposedCommitIdentity,
+  journalKey: Uint8Array,
+): Promise<boolean> {
+  return authenticateSelector(encoded, identity, journalKey, PREPARED_CONTEXT, "source-selector-prepared-uncommitted")
+}
+
+async function authenticateSelector(
+  encoded: string, identity: V4ReencryptionProposedCommitIdentity,
+  journalKey: Uint8Array, context: string, phase: SelectorRecord["phase"],
+): Promise<boolean> {
   assertV4ReencryptionProposedCommitIdentity(identity)
   assertKey(journalKey)
   const bytes = decode(encoded)
   if (!bytes) return false
-  const key = await derivedKey(journalKey)
+  const key = await derivedKey(journalKey, context)
   try {
     let plaintext: Uint8Array
     try {
-      plaintext = await decryptV4Payload(key, bytes, { kind: "journal", aad: aad(identity) })
+      plaintext = await decryptV4Payload(key, bytes, { kind: "journal", aad: aad(identity, context) })
     } catch { return false }
     try {
       return plaintext.length <= MAX_BYTES / 2
-        && bytesToUtf8(plaintext) === JSON.stringify(record(identity))
+        && bytesToUtf8(plaintext) === JSON.stringify(record(identity, phase))
     } finally { plaintext.fill(0) }
   } finally {
     key.fill(0)
