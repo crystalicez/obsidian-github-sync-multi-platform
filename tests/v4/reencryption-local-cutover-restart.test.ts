@@ -1,10 +1,14 @@
 import assert from "node:assert/strict"
 import test from "node:test"
 import { createHash } from "node:crypto"
+import { mkdir, mkdtemp, rm } from "node:fs/promises"
+import { join } from "node:path"
 import {
   createEmptyV4LocalIndex, saveV4LocalIndex, type V4LocalIndexAdapter,
 } from "../../src/lib/v4/local-index"
-import type { V4ReencryptionJournalSnapshot } from "../../src/lib/v4/reencryption-recovery-journal"
+import { createV4ReencryptionRecoveryJournal, type V4ReencryptionJournalSnapshot } from "../../src/lib/v4/reencryption-recovery-journal"
+import { acquireV4DesktopRekeyWalStorage } from "../../src/lib/v4/reencryption-desktop-wal"
+import { inspectV4BestEffortReencryptionRestartEvidence } from "../../src/lib/v4/reencryption-best-effort-local-restart"
 import { prepareV4ReencryptionLocalCutoverIntent } from "../../src/lib/v4/reencryption-local-cutover-intent"
 import { inspectV4ReencryptionRestartEvidence } from "../../src/lib/v4/reencryption-local-cutover-restart"
 
@@ -87,13 +91,13 @@ function fixture() {
   }
   const lease = async () => { leases++ }
   const durable = async () => { barriers++ }
-  const input = () => ({
+  const input = (expectedWalGeneration = 12) => ({
     runId, expected, settings, indexAdapter: adapter, indexRoot: root,
-    sourceCommitSha: oldSha, backupRepoId: backup, expectedWalGeneration: 12,
+    sourceCommitSha: oldSha, backupRepoId: backup, expectedWalGeneration,
     journal, getSecret: (id: string) => secrets.get(id) ?? null,
     assertExclusiveInitiatorLease: lease, assertCrashDurable: durable,
   })
-  const seed = async () => {
+  const seed = async (walGeneration = 12) => {
     await saveV4LocalIndex(adapter, root, makeIndex(source, oldSha))
     await saveV4LocalIndex(adapter, shadow, makeIndex(destination, newSha))
     await prepareV4ReencryptionLocalCutoverIntent({
@@ -101,7 +105,7 @@ function fixture() {
       sourceRepoId: source, backupRepoId: backup, destinationRepoId: destination,
       sourceCommitSha: oldSha, destinationCommitSha: newSha,
       sourcePassphraseSecretId: oldSecret, destinationPassphraseSecretId: newSecret,
-      deviceId: "device1", walGeneration: 12,
+      deviceId: "device1", walGeneration,
       assertExclusiveInitiatorLease: lease, assertCrashDurable: durable,
     })
   }
@@ -112,6 +116,157 @@ function fixture() {
     counts: () => ({ writes, walReads, leases, barriers, readIntentCount }),
   }
 }
+
+const d171Consent = "accept-best-effort-power-loss-recovery-risk" as const
+
+function d171Input(s: ReturnType<typeof fixture>, generation = 12) {
+  const { assertCrashDurable: _strict, ...core } = s.input(generation)
+  let checkpoints = 0
+  const wal = {
+    async assertExclusiveStageLease() {},
+    async assertBestEffortCheckpoint() {
+      checkpoints++
+      return "best-effort-readback-only" as const
+    },
+  }
+  return { input: { ...core, wal, acknowledgement: d171Consent }, get checkpoints() { return checkpoints } }
+}
+
+test("D171 best-effort restart classifies pinned Source and complete prepared intent without resuming Sync", async () => {
+  const s = fixture()
+  await s.seed()
+  const copies = new Map(s.files)
+  const before = s.counts()
+  const run = d171Input(s)
+  const report = await inspectV4BestEffortReencryptionRestartEvidence(run.input)
+  assert.deepEqual(report, {
+    integrityScope: "read-only-local-intent-shadow-and-encrypted-wal",
+    evidence: "best-effort-wal-readback-not-power-loss-durable",
+    observation: "source-with-prepared-intent-uncommitted",
+    localCutoverAuthorized: false, resumeSyncAuthorized: false,
+    rollbackAuthorized: false, remoteWritesAuthorized: false,
+    oldPassphraseCleanupAuthorized: false,
+  })
+  assert.deepEqual(s.files, copies)
+  assert.equal(s.counts().writes, before.writes)
+  assert.equal(s.counts().readIntentCount, before.readIntentCount + 2)
+  assert.equal(s.counts().barriers, before.barriers)
+  assert.ok(run.checkpoints >= 12)
+  assert.doesNotMatch(JSON.stringify(report), /old-plaintext-must-not-leak|new-plaintext-must-not-leak/)
+})
+
+test("D171 best-effort restart refuses missing acknowledgement, tampered intent, changed settings and incomplete WAL", async () => {
+  const s = fixture()
+  await s.seed()
+  const run = d171Input(s)
+  const before = s.counts()
+  await assert.rejects(() => inspectV4BestEffortReencryptionRestartEvidence({
+    ...run.input, acknowledgement: "declined" as typeof d171Consent,
+  }), /acknowledgement/i)
+  assert.equal(run.checkpoints, 0)
+  assert.equal(s.counts().readIntentCount, before.readIntentCount)
+
+  const original = s.files.get(intentPath)!
+  s.files.set(intentPath, original.replace(oldSecret, "forged-secret"))
+  assert.equal((await inspectV4BestEffortReencryptionRestartEvidence(run.input)).observation,
+    "manual-recovery-required")
+  s.files.set(intentPath, original)
+  s.settings.githubBranch = "rekey/2026-10-28"
+  assert.equal((await inspectV4BestEffortReencryptionRestartEvidence(run.input)).observation,
+    "manual-recovery-required")
+  s.settings.githubBranch = "main"
+
+  const validWal = s.currentWal()
+  s.changeWal({ ...validWal, verifiedRefObservations: validWal.verifiedRefObservations.slice(0, 1) })
+  assert.equal((await inspectV4BestEffortReencryptionRestartEvidence(run.input)).observation,
+    "manual-recovery-required")
+  s.changeWal(validWal)
+  assert.equal(s.counts().writes, before.writes)
+})
+
+test("D171 best-effort restart rejects stale generation, lost WAL lease and input mutation", async () => {
+  const s = fixture()
+  await s.seed()
+  const run = d171Input(s)
+  await assert.rejects(() => inspectV4BestEffortReencryptionRestartEvidence({
+    ...run.input, expectedWalGeneration: 11,
+  }), /Manual Recovery/i)
+  await assert.rejects(() => inspectV4BestEffortReencryptionRestartEvidence({
+    ...run.input,
+    wal: { ...run.input.wal, async assertExclusiveStageLease() { throw Error("lease lost") } },
+  }), /lease lost/)
+
+  const input = d171Input(s).input
+  const beforeWrites = s.counts().writes
+  let altered = false
+  input.wal.assertBestEffortCheckpoint = async () => {
+    if (!altered) { altered = true; s.settings.githubBranch = "moved" }
+    return "best-effort-readback-only" as const
+  }
+  await assert.rejects(() => inspectV4BestEffortReencryptionRestartEvidence(input), /Manual Recovery/i)
+  assert.equal(altered, true)
+  assert.equal(s.counts().writes, beforeWrites)
+})
+
+test("D171 fresh Windows WAL reader reopens and authenticates a preexisting local intent without writes", async () => {
+  const parent = join(process.cwd(), ".tmp")
+  await mkdir(parent, { recursive: true })
+  const directory = await mkdtemp(join(parent, "d171-restart-"))
+  const journalKey = new Uint8Array(32).fill(0x53)
+  try {
+    const first = await acquireV4DesktopRekeyWalStorage({
+      rootAbsolute: directory, journalRoot: "rekey/wal",
+    })
+    try {
+      const journal = createV4ReencryptionRecoveryJournal({
+        adapter: first.adapter, root: "rekey/wal",
+        sourceCommitSha: oldSha, destinationRepoId: destination,
+        runId: "d171-restart-wal", journalKey,
+      })
+      let snapshot = await journal.begin()
+      const frozen = { role: "backup" as const, repoId: backup,
+        commitSha: oldSha, treeSha: "c".repeat(40) }
+      snapshot = await journal.recordRefIntent(frozen, snapshot.generation)
+      snapshot = await journal.markRefReadbackObserved(frozen, snapshot.generation)
+      snapshot = await journal.recordStagingHandoff(frozen, snapshot.generation)
+      snapshot = await journal.recordCandidatePreparationIntent("f".repeat(64), snapshot.generation)
+      snapshot = await journal.recordPreparedCandidateReceipt({
+        commitSha: newSha, treeSha: "d".repeat(40), manifestSha256: "e".repeat(64),
+      }, snapshot.generation)
+      const dest = {
+        role: "destination" as const, repoId: destination,
+        commitSha: newSha, treeSha: "d".repeat(40), manifestSha256: "e".repeat(64),
+      }
+      snapshot = await journal.recordRefIntent(dest, snapshot.generation)
+      snapshot = await journal.markRefReadbackObserved(dest, snapshot.generation)
+      assert.equal(snapshot.generation, 8)
+    } finally { await first.release() }
+
+    const reopened = await acquireV4DesktopRekeyWalStorage({
+      rootAbsolute: directory, journalRoot: "rekey/wal",
+    })
+    try {
+      const journal = createV4ReencryptionRecoveryJournal({
+        adapter: reopened.adapter, root: "rekey/wal",
+        sourceCommitSha: oldSha, destinationRepoId: destination,
+        runId: "d171-restart-wal", journalKey,
+      })
+      const s = fixture()
+      await s.seed(8)
+      const originals = new Map(s.files)
+      const { assertCrashDurable: _strict, ...input } = s.input(8)
+      const report = await inspectV4BestEffortReencryptionRestartEvidence({
+        ...input, journal, wal: reopened, acknowledgement: d171Consent,
+      })
+      assert.equal(report.observation, "source-with-prepared-intent-uncommitted")
+      assert.equal(report.resumeSyncAuthorized, false)
+      assert.equal(report.localCutoverAuthorized, false)
+      assert.deepEqual(s.files, originals)
+      const snap = await journal.assertHealthySnapshot(8)
+      assert.equal(snap.verifiedRefObservations.length, 2)
+    } finally { await reopened.release() }
+  } finally { await rm(directory, { recursive: true, force: true }) }
+})
 
 test("D136 brackets the exact independent intent and Source/Shadow indices around two healthy WAL reads without mutations", async () => {
   const s = fixture()

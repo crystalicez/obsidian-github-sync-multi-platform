@@ -6,6 +6,7 @@ import {
 } from "../../src/lib/v4/local-index"
 import type { V4ReencryptionJournalSnapshot } from "../../src/lib/v4/reencryption-recovery-journal"
 import { prepareV4ReencryptionLocalCutoverIntent } from "../../src/lib/v4/reencryption-local-cutover-intent"
+import { inspectV4BestEffortReencryptionLocalTransactionAfterCrash } from "../../src/lib/v4/reencryption-best-effort-local-restart"
 import {
   classifyV4ReencryptionLocalRecovery,
   inspectV4ReencryptionLocalTransactionAfterCrash,
@@ -129,6 +130,77 @@ function fixture() {
 }
 
 const selectors: readonly V4ReencryptionLocalCutoverSelection[] = ["source", "destination", "mixed"]
+
+const d171Consent = "accept-best-effort-power-loss-recovery-risk" as const
+
+function bestEffortCrashInput(s: ReturnType<typeof fixture>) {
+  const { assertCrashDurable: _strict, ...core } = s.input()
+  return {
+    ...core, acknowledgement: d171Consent,
+    wal: {
+      async assertExclusiveStageLease() {},
+      async assertBestEffortCheckpoint() { return "best-effort-readback-only" as const },
+    },
+  }
+}
+
+test("D171 best-effort crash classification remains read-only for Source, mixed and Destination selectors", async () => {
+  const sourceVault = fixture()
+  await sourceVault.seed()
+  const before = new Map(sourceVault.files)
+  const writes = sourceVault.counts().writes
+  const sourceReport = await inspectV4BestEffortReencryptionLocalTransactionAfterCrash(
+    bestEffortCrashInput(sourceVault),
+  )
+  assert.deepEqual(sourceReport, {
+    integrityScope: "read-only-local-transaction-crash-window",
+    evidence: "best-effort-wal-readback-not-power-loss-durable",
+    observation: "source-prepared-uncommitted",
+    localCutoverAuthorized: false, resumeSyncAuthorized: false,
+    rollbackAuthorized: false, remoteWritesAuthorized: false,
+    oldPassphraseCleanupAuthorized: false,
+  })
+  assert.deepEqual(sourceVault.files, before)
+  assert.equal(sourceVault.counts().writes, writes)
+
+  const mixed = fixture()
+  await mixed.seed()
+  mixed.selectDestinationSettings()
+  const mixedReport = await inspectV4BestEffortReencryptionLocalTransactionAfterCrash(bestEffortCrashInput(mixed))
+  assert.equal(mixedReport.observation, "manual-recovery-required")
+  assert.equal(mixedReport.resumeSyncAuthorized, false)
+
+  const destinationVault = fixture()
+  await destinationVault.seed()
+  await destinationVault.selectDestinationIndex()
+  destinationVault.selectDestinationSettings()
+  const destWrites = destinationVault.counts().writes
+  const destReport = await inspectV4BestEffortReencryptionLocalTransactionAfterCrash(
+    bestEffortCrashInput(destinationVault),
+  )
+  assert.equal(destReport.observation, "destination-observed-without-commit-proof")
+  assert.equal(destReport.localCutoverAuthorized, false)
+  assert.equal(destReport.resumeSyncAuthorized, false)
+  assert.equal(destReport.oldPassphraseCleanupAuthorized, false)
+  assert.equal(destinationVault.counts().writes, destWrites)
+})
+
+test("D171 best-effort crash reader refuses lost WAL lease and missing risk acknowledgement", async () => {
+  const s = fixture()
+  await s.seed()
+  const before = s.counts().writes
+  await assert.rejects(() => inspectV4BestEffortReencryptionLocalTransactionAfterCrash({
+    ...bestEffortCrashInput(s), acknowledgement: "declined" as typeof d171Consent,
+  }), /acknowledgement/i)
+  await assert.rejects(() => inspectV4BestEffortReencryptionLocalTransactionAfterCrash({
+    ...bestEffortCrashInput(s),
+    wal: {
+      async assertExclusiveStageLease() { throw Error("exclusive WAL lease lost") },
+      async assertBestEffortCheckpoint() { return "best-effort-readback-only" as const },
+    },
+  }), /lease lost/)
+  assert.equal(s.counts().writes, before)
+})
 
 test("D139 pure crash matrix never authorizes a cutover for any setting/index/secret combination", () => {
   let checked = 0
