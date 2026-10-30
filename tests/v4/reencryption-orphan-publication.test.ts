@@ -1,5 +1,7 @@
 import assert from "node:assert/strict"
 import test from "node:test"
+import { mkdtemp, mkdir, rm } from "node:fs/promises"
+import { join } from "node:path"
 import { sha256Hex, toBase64Url, utf8ToBytes } from "../../src/lib/bytes"
 import { deriveV4Keyring } from "../../src/lib/v4/crypto"
 import { computeV4GitBlobSha1 } from "../../src/lib/v4/git-blob-identity"
@@ -15,7 +17,8 @@ import { verifyV4ReencryptionDestinationExactCommit } from "../../src/lib/v4/ree
 import { inspectV4ReencryptionOrphanAfterAmbiguousPublication } from "../../src/lib/v4/reencryption-orphan-recovery"
 import { publishAndVerifyV4ReencryptionOrphanRef } from "../../src/lib/v4/reencryption-orphan-publication-reconciled"
 import { publishV4ThreeBranchDestinationAfterBackup } from "../../src/lib/v4/reencryption-three-branch-publish"
-import { publishV4JournaledThreeBranchDestination, prepareV4JournaledOrphanCandidate, reconcileV4PendingOrphanWithJournal } from "../../src/lib/v4/reencryption-ref-journal-coordinator"
+import { publishV4JournaledThreeBranchDestination, prepareV4JournaledOrphanCandidate, prepareV4BestEffortJournaledOrphanCandidate, reconcileV4PendingOrphanWithJournal } from "../../src/lib/v4/reencryption-ref-journal-coordinator"
+import { acquireV4DesktopRekeyWalStorage } from "../../src/lib/v4/reencryption-desktop-wal"
 import { createV4ReencryptionRecoveryJournal } from "../../src/lib/v4/reencryption-recovery-journal"
 import { computeV4ReencryptionCandidateManifestDigest, computeV4ReencryptionPreparationDigest } from "../../src/lib/v4/reencryption-candidate-manifest-digest"
 import type { V4LocalIndexAdapter, V4IndexFileRecord } from "../../src/lib/v4/local-index"
@@ -1030,6 +1033,181 @@ test("D111 sealed preparation fingerprint includes source crypto config and the 
   ]) {
     assert.notEqual(computeV4ReencryptionPreparationDigest({ ...baseline, ...changed }), expected)
   }
+})
+
+const d168RiskAcknowledgement = "accept-best-effort-power-loss-recovery-risk" as const
+
+function d168BestEffortWal() {
+  return {
+    async assertExclusiveStageLease() {},
+    async assertBestEffortCheckpoint() { return "best-effort-readback-only" as const },
+  }
+}
+
+test("D168 best-effort candidate records one authenticated preparation and receipt, creates zero-parent commit without publishing", async () => {
+  const f = await fixture()
+  const j = await D102DestinationJournal(f.input.staged.receipts, f.input.staged.records, f.input.destinationConfig, false)
+  const input = {
+    ...f.input, journal: j.journal, wal: d168BestEffortWal(),
+    acknowledgement: d168RiskAcknowledgement,
+  }
+  const prepared = await prepareV4BestEffortJournaledOrphanCandidate(input)
+  assert.equal(prepared.commitSha, candidateSha)
+  assert.equal(prepared.treeSha, candidateTreeSha)
+  assert.equal(prepared.rootHasZeroParents, true)
+  assert.equal(prepared.refPublished, false)
+  assert.equal(prepared.cutoverAuthorized, false)
+  assert.equal(f.calls.filter(x => x === "blob-create").length, 3)
+  assert.equal(f.calls.filter(x => x === "tree-create").length, 1)
+  assert.equal(f.calls.filter(x => x === "commit-create").length, 1)
+  assert.equal(f.calls.filter(x => x === "ref-create").length, 0)
+  const snapshot = await j.open().load()
+  assert.ok(snapshot)
+  assert.deepEqual(snapshot.preparedCandidateReceipt, {
+    commitSha: prepared.commitSha, treeSha: prepared.treeSha,
+    manifestSha256: D110manifestDigest(f, prepared),
+  })
+  assert.equal(snapshot.permissionToPublish, false)
+  assert.equal(snapshot.cutoverAuthorized, false)
+  const count = f.mutationCount
+  await assert.rejects(() => prepareV4BestEffortJournaledOrphanCandidate({
+    ...input, journal: j.open(),
+  }), /one-shot preparation|Manual Recovery/i)
+  assert.equal(f.mutationCount, count)
+})
+
+test("D168 absent risk acknowledgement refuses before WAL or GitHub mutation", async () => {
+  const f = await fixture()
+  const j = await D102DestinationJournal(f.input.staged.receipts, f.input.staged.records, f.input.destinationConfig, false)
+  let reads = 0
+  await assert.rejects(() => prepareV4BestEffortJournaledOrphanCandidate({
+    ...f.input, journal: j.journal,
+    wal: {
+      async assertExclusiveStageLease() { reads++ },
+      async assertBestEffortCheckpoint() {
+        reads++
+        return "best-effort-readback-only" as const
+      },
+    },
+    acknowledgement: "declined" as typeof d168RiskAcknowledgement,
+  }), /risk acknowledgement/i)
+  assert.equal(reads, 0)
+  assert.equal(f.mutationCount, 0)
+  assert.equal((await j.open().load())?.candidatePreparationSha256, null)
+})
+
+test("D168 WAL checkpoint failure after one-shot candidate intent blocks all Git metadata writes and retries", async () => {
+  const f = await fixture()
+  const j = await D102DestinationJournal(f.input.staged.receipts, f.input.staged.records, f.input.destinationConfig, false)
+  let checkpoints = 0
+  const input = {
+    ...f.input, journal: j.journal,
+    wal: {
+      async assertExclusiveStageLease() {},
+      async assertBestEffortCheckpoint() {
+        checkpoints++
+        if (checkpoints === 4) throw new Error("interrupted WAL slot readback")
+        return "best-effort-readback-only" as const
+      },
+    },
+    acknowledgement: d168RiskAcknowledgement,
+  }
+  await assert.rejects(() => prepareV4BestEffortJournaledOrphanCandidate(input), /Manual Recovery/i)
+  assert.equal(f.mutationCount, 0)
+  const state = await j.open().load()
+  assert.match(state?.candidatePreparationSha256 ?? "", /^[0-9a-f]{64}$/u)
+  assert.equal(state?.preparedCandidateReceipt, null)
+  assert.equal(state?.cutoverAuthorized, false)
+  await assert.rejects(() => prepareV4BestEffortJournaledOrphanCandidate({
+    ...input, journal: j.open(), wal: d168BestEffortWal(),
+  }), /one-shot preparation|Manual Recovery/i)
+  assert.equal(f.mutationCount, 0)
+})
+
+test("D168 lost metadata GitHub response cannot repeat one-shot best-effort candidate creation", async () => {
+  const f = await fixture()
+  const j = await D102DestinationJournal(f.input.staged.receipts, f.input.staged.records, f.input.destinationConfig, false)
+  const original = f.github.createGitBlob
+  f.github.createGitBlob = async bytes => {
+    await original(bytes)
+    throw new Error("GitHub 503 lost metadata Blob response")
+  }
+  const input = { ...f.input, journal: j.journal, wal: d168BestEffortWal(), acknowledgement: d168RiskAcknowledgement }
+  await assert.rejects(() => prepareV4BestEffortJournaledOrphanCandidate(input), /503 lost metadata/i)
+  assert.equal(f.calls.filter(c => c === "blob-create").length, 1)
+  assert.equal(f.calls.filter(c => c === "tree-create" || c === "commit-create" || c === "ref-create").length, 0)
+  const snapshot = await j.open().load()
+  assert.match(snapshot?.candidatePreparationSha256 ?? "", /^[0-9a-f]{64}$/u)
+  assert.equal(snapshot?.preparedCandidateReceipt, null)
+  await assert.rejects(() => prepareV4BestEffortJournaledOrphanCandidate({
+    ...input, journal: j.open(),
+  }), /one-shot preparation|Manual Recovery/i)
+  assert.equal(f.calls.filter(c => c === "blob-create").length, 1)
+})
+
+test("D168 mutation of sealed staged ciphertext manifest after first metadata write blocks further writes", async () => {
+  const f = await fixture()
+  const j = await D102DestinationJournal(f.input.staged.receipts, f.input.staged.records, f.input.destinationConfig, false)
+  const original = f.github.createGitBlob
+  let changed = false
+  f.github.createGitBlob = async bytes => {
+    const sha = await original(bytes)
+    if (!changed) {
+      changed = true
+      f.input.staged.records[0] = {
+        ...f.input.staged.records[0]!, plaintextSha256: "f".repeat(64),
+      }
+    }
+    return sha
+  }
+  await assert.rejects(() => prepareV4BestEffortJournaledOrphanCandidate({
+    ...f.input, journal: j.journal, wal: d168BestEffortWal(), acknowledgement: d168RiskAcknowledgement,
+  }), /candidate inputs or WAL intent changed/i)
+  assert.equal(changed, true)
+  assert.equal(f.calls.filter(c => c === "blob-create").length, 1)
+  assert.equal(f.calls.filter(c => c === "tree-create" || c === "commit-create" || c === "ref-create").length, 0)
+  assert.equal((await j.open().load())?.cutoverAuthorized, false)
+})
+
+test("D168 real Windows WAL authenticates a zero-parent orphan candidate without publishing a ref", async () => {
+  const parent = join(process.cwd(), ".tmp")
+  await mkdir(parent, { recursive: true })
+  const root = await mkdtemp(join(parent, "d168-orphan-wal-"))
+  try {
+    const storage = await acquireV4DesktopRekeyWalStorage({
+      rootAbsolute: root, journalRoot: "v4/rekey-destination",
+    })
+    try {
+      const f = await fixture()
+      const journal = createV4ReencryptionRecoveryJournal({
+        adapter: storage.adapter, root: "v4/rekey-destination",
+        destinationRepoId: targetId, sourceCommitSha: sourceSha,
+        runId: "d168-orphan-run", journalKey: new Uint8Array(32).fill(0x36),
+      })
+      let state = await journal.begin()
+      const backup = {
+        role: "backup" as const, repoId: D100backupPlan.backupRepoId,
+        commitSha: sourceSha, treeSha: sourceTreeSha,
+      }
+      state = await journal.recordRefIntent(backup, state.generation)
+      state = await journal.markRefReadbackObserved(backup, state.generation)
+      state = await journal.recordStagingHandoff(backup, state.generation)
+      for (const receipt of f.input.staged.receipts) {
+        state = await journal.recordUploadIntent(receipt, state.generation)
+        state = await journal.appendReceipt(receipt, state.generation)
+      }
+      const prepared = await prepareV4BestEffortJournaledOrphanCandidate({
+        ...f.input, journal, wal: storage, acknowledgement: d168RiskAcknowledgement,
+      })
+      assert.equal(prepared.commitSha, candidateSha)
+      assert.equal(prepared.rootHasZeroParents, true)
+      assert.equal(f.calls.filter(c => c === "ref-create").length, 0)
+      const saved = await journal.assertHealthySnapshot(state.generation + 2)
+      assert.equal(saved.preparedCandidateReceipt?.commitSha, candidateSha)
+      assert.equal(saved.permissionToPublish, false)
+      assert.equal(saved.cutoverAuthorized, false)
+    } finally { await storage.release() }
+  } finally { await rm(root, { recursive: true, force: true }) }
 })
 
 test("D111 one-shot candidate preparation persists WAL BEFORE Git metadata/tree/commit and refuses a second attempt", async () => {

@@ -222,9 +222,33 @@ export async function stageV4BestEffortJournaledThreeBranchVault(
 export async function prepareV4JournaledOrphanCandidate(
   input: V4JournaledOrphanPreparationInput,
 ): Promise<V4PreparedOrphanCommit> {
+  return prepareJournaledOrphanCandidate(input, () => hold(input.wal, input.signal))
+}
+
+export interface V4BestEffortJournaledOrphanPreparationInput
+  extends Omit<V4JournaledOrphanPreparationInput, "wal"> {
+  readonly wal: BestEffortJournalBinding["wal"]
+  readonly acknowledgement: "accept-best-effort-power-loss-recovery-risk"
+}
+
+export async function prepareV4BestEffortJournaledOrphanCandidate(
+  input: V4BestEffortJournaledOrphanPreparationInput,
+): Promise<V4PreparedOrphanCommit> {
+  if (input.acknowledgement !== "accept-best-effort-power-loss-recovery-risk"
+    || typeof input.wal?.assertExclusiveStageLease !== "function"
+    || typeof input.wal.assertBestEffortCheckpoint !== "function") {
+    throw new Error("Best-effort orphan preparation requires risk acknowledgement and live WAL storage.")
+  }
+  return prepareJournaledOrphanCandidate(input, bestEffortJournalCheckpoint(input))
+}
+
+async function prepareJournaledOrphanCandidate(
+  input: Omit<V4JournaledOrphanPreparationInput, "wal">,
+  checkpoint: JournalCheckpoint,
+): Promise<V4PreparedOrphanCommit> {
   const { plan, staged, verifiedBackup } = input
   assertJournalIdentity(input.journal, plan.pinnedSourceCommitSha, plan.destinationRepoId)
-  await hold(input.wal, input.signal)
+  await checkpoint()
   const starting = await input.journal.load()
   if (!starting || !starting.stageHandoffStarted
     || starting.candidatePreparationSha256 !== null
@@ -260,7 +284,7 @@ export async function prepareV4JournaledOrphanCandidate(
   await input.journal.assertHealthySnapshot(starting.generation)
   const recorded = await input.journal.recordCandidatePreparationIntent(digest, starting.generation)
   const assertSealed = async () => {
-    await hold(input.wal, input.signal)
+    await checkpoint(recorded.generation)
     const saved = await input.journal.assertHealthySnapshot(recorded.generation)
     if (saved.candidatePreparationSha256 !== digest
       || fingerprintCurrentCandidateInputs() !== digest
@@ -284,7 +308,7 @@ export async function prepareV4JournaledOrphanCandidate(
     }),
   }
   const observed = await input.journal.recordPreparedCandidateReceipt(preparedReceipt, recorded.generation)
-  await hold(input.wal, input.signal)
+  await checkpoint(observed.generation)
   await input.journal.assertHealthySnapshot(observed.generation)
   if (observed.preparedCandidateReceipt?.commitSha !== preparedReceipt.commitSha
     || observed.preparedCandidateReceipt.treeSha !== preparedReceipt.treeSha
