@@ -58,7 +58,7 @@ export interface V4JournaledBackupCreationInput
   extends Omit<V4CreateAndVerifyBackupInput, "assertDurableBackupIntent" | "assertExclusiveMigrationLease">, JournalBound {}
 
 export interface V4JournaledThreeBranchStageInput
-  extends Omit<V4JournaledReencryptionStageInput, "journal" | "assertExclusiveStageLease" | "assertCrashDurable">, JournalBound {}
+  extends Omit<V4JournaledReencryptionStageInput, "journal" | "assertExclusiveStageLease" | "assertCrashDurable" | "assertBestEffortWalCheckpoint">, JournalBound {}
 
 export interface V4JournaledOrphanPreparationInput
   extends Omit<V4OrphanStagedCommitInput, "assertExclusiveMigrationLease">, JournalBound {}
@@ -174,6 +174,40 @@ export async function stageV4JournaledThreeBranchVault(
     beginAfterVerifiedBackup: input.beginAfterVerifiedBackup,
     assertExclusiveStageLease: () => hold(input.wal, input.signal),
     assertCrashDurable: () => hold(input.wal, input.signal),
+  })
+}
+
+export interface V4BestEffortJournaledThreeBranchStageInput
+  extends Omit<V4JournaledThreeBranchStageInput, "wal"> {
+  readonly wal: BestEffortJournalBinding["wal"]
+  readonly acknowledgement: "accept-best-effort-power-loss-recovery-risk"
+}
+
+/**
+ * The owner-approved best-effort route is intentionally limited to one
+ * verified-Backup handoff. Generation-bound WAL authentication precedes
+ * each immutable Git Blob request; the normal strict route is unchanged.
+ */
+export async function stageV4BestEffortJournaledThreeBranchVault(
+  input: V4BestEffortJournaledThreeBranchStageInput,
+): Promise<V4JournaledReencryptionStagingResult> {
+  if (input.acknowledgement !== "accept-best-effort-power-loss-recovery-risk"
+    || !input.beginAfterVerifiedBackup
+    || typeof input.wal?.assertExclusiveStageLease !== "function"
+    || typeof input.wal.assertBestEffortCheckpoint !== "function") {
+    throw new Error("Best-effort Staging requires verified Backup, live WAL and explicit risk acknowledgement.")
+  }
+  assertJournalIdentity(input.journal, input.plan.pinnedSourceCommitSha, input.plan.destinationRepoId)
+  const checkpoint = bestEffortJournalCheckpoint(input)
+  await checkpoint(input.beginAfterVerifiedBackup.expectedJournalGeneration)
+  return stageV4ReencryptionVaultObjectsWithJournal({
+    ...input,
+    assertExclusiveStageLease: async () => {
+      throwIfV4Aborted(input.signal)
+      await input.wal.assertExclusiveStageLease()
+      throwIfV4Aborted(input.signal)
+    },
+    assertBestEffortWalCheckpoint: generation => checkpoint(generation),
   })
 }
 
@@ -301,8 +335,8 @@ export async function createV4JournaledFrozenBackup(
   return result
 }
 
-type BestEffortBackupJournalBinding = {
-  readonly plan: V4SameRepoReencryptionBackupBranchProposal
+type BestEffortJournalBinding = {
+  readonly plan: Pick<V4SameRepoReencryptionBackupBranchProposal, "pinnedSourceCommitSha" | "destinationRepoId">
   readonly journal: V4ReencryptionRecoveryJournal
   readonly wal: Pick<V4DesktopRekeyWalStorage,
     "assertExclusiveStageLease" | "assertBestEffortCheckpoint">
@@ -310,14 +344,14 @@ type BestEffortBackupJournalBinding = {
   readonly acknowledgement: "accept-best-effort-power-loss-recovery-risk"
 }
 
-function bestEffortBackupCheckpoint(input: BestEffortBackupJournalBinding): JournalCheckpoint {
+function bestEffortJournalCheckpoint(input: BestEffortJournalBinding): JournalCheckpoint {
   const { plan, journal, wal } = input
   return async (requestedGeneration) => {
     throwIfV4Aborted(input.signal)
     await wal.assertExclusiveStageLease()
     throwIfV4Aborted(input.signal)
     const generation = requestedGeneration ?? (await journal.load())?.generation
-    if (!generation) throw new Error("Best-effort Backup needs an existing authenticated WAL run.")
+    if (!generation) throw new Error("Best-effort Re-encryption needs an existing authenticated WAL run.")
     const report = await inspectV4BestEffortWalRecovery({
       storage: wal, journal,
       expected: {
@@ -329,7 +363,7 @@ function bestEffortBackupCheckpoint(input: BestEffortBackupJournalBinding): Jour
     throwIfV4Aborted(input.signal)
     if (report.observation !== "authenticated-uncommitted"
       || report.generation !== generation || report.remoteWritesAuthorized !== false) {
-      throw new Error("Best-effort Re-encryption Backup WAL is uncertain; Manual Recovery is required.")
+      throw new Error("Best-effort Re-encryption WAL is uncertain; Manual Recovery is required.")
     }
     await wal.assertExclusiveStageLease()
     throwIfV4Aborted(input.signal)
@@ -357,7 +391,7 @@ export async function createV4BestEffortJournaledFrozenBackup(
   }
   const { plan, journal } = input
   assertJournalIdentity(journal, plan.pinnedSourceCommitSha, plan.destinationRepoId)
-  const checkpoint = bestEffortBackupCheckpoint(input)
+  const checkpoint = bestEffortJournalCheckpoint(input)
   const intent: V4ReencryptionRefIntent = Object.freeze({
     role: "backup",
     repoId: plan.backupRepoId,
@@ -417,7 +451,10 @@ export async function reconcileV4PendingFrozenBackupWithJournal(
 }
 
 export interface V4BestEffortJournaledBackupRecoveryInput
-  extends Omit<V4JournaledFrozenBackupRecoveryInput, "wal">, BestEffortBackupJournalBinding {}
+  extends Omit<V4JournaledFrozenBackupRecoveryInput, "wal"> {
+  readonly wal: BestEffortJournalBinding["wal"]
+  readonly acknowledgement: "accept-best-effort-power-loss-recovery-risk"
+}
 
 export async function reconcileV4PendingFrozenBackupWithJournalBestEffort(
   input: V4BestEffortJournaledBackupRecoveryInput,
@@ -427,7 +464,7 @@ export async function reconcileV4PendingFrozenBackupWithJournalBestEffort(
     || typeof input.wal.assertBestEffortCheckpoint !== "function") {
     throw new Error("Best-effort Backup Recovery needs risk acknowledgement and live WAL storage.")
   }
-  return reconcileFrozenBackup(input, bestEffortBackupCheckpoint(input))
+  return reconcileFrozenBackup(input, bestEffortJournalCheckpoint(input))
 }
 
 async function reconcileFrozenBackup(

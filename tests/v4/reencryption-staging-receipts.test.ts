@@ -12,7 +12,7 @@ import { stageV4ReencryptionVaultObjects } from "../../src/lib/v4/reencryption-s
 import { createV4ReencryptionRecoveryJournal } from "../../src/lib/v4/reencryption-recovery-journal";
 import { acquireV4DesktopRekeyWalStorage } from "../../src/lib/v4/reencryption-desktop-wal";
 import { stageV4ReencryptionVaultObjectsWithJournal } from "../../src/lib/v4/reencryption-journaled-staging";
-import { stageV4JournaledThreeBranchVault } from "../../src/lib/v4/reencryption-ref-journal-coordinator";
+import { stageV4JournaledThreeBranchVault, stageV4BestEffortJournaledThreeBranchVault } from "../../src/lib/v4/reencryption-ref-journal-coordinator";
 import type { V4LocalIndexAdapter } from "../../src/lib/v4/local-index";
 import type { V4IndexFileRecord } from "../../src/lib/v4/local-index";
 import type { V4RemoteShard } from "../../src/lib/v4/remote-index";
@@ -496,6 +496,166 @@ test("D109 REAL Windows WAL filesystem capability blocks Git staging POST when d
     await rm(root, { recursive: true, force: true });
   }
 });
+
+async function d167BackupReady(j = journal()) {
+  let state = await j.begin()
+  const backupRef = {
+    role: "backup" as const, repoId: "owner/repo#backup/frozen",
+    commitSha: sha, treeSha: "b".repeat(40),
+  }
+  state = await j.recordRefIntent(backupRef, state.generation)
+  state = await j.markRefReadbackObserved(backupRef, state.generation)
+  return { journal: j, beginAfterVerifiedBackup: { expectedJournalGeneration: state.generation, backupRef } }
+}
+
+const d167Consent = "accept-best-effort-power-loss-recovery-risk" as const
+
+test("D167 best-effort staged new-key ciphertext is authenticated per generation, never permits publication", async () => {
+  const f = await fixture()
+  const ready = await d167BackupReady()
+  let checkpoints = 0
+  let leases = 0
+  const input = {
+    ...f.input, ...ready, acknowledgement: d167Consent,
+    wal: {
+      async assertExclusiveStageLease() { leases++ },
+      async assertBestEffortCheckpoint() {
+        checkpoints++
+        return "best-effort-readback-only" as const
+      },
+    },
+  }
+  const result = await stageV4BestEffortJournaledThreeBranchVault(input)
+  assert.equal(f.stages, 2)
+  assert.equal(result.receipts.length, 2)
+  assert.deepEqual(result.journalSnapshot.receipts, result.receipts)
+  assert.equal(result.journalSnapshot.pendingIntents.length, 0)
+  assert.equal(result.journalSnapshot.stageHandoffStarted, true)
+  assert.equal(result.journalSnapshot.cutoverAuthorized, false)
+  assert.equal(result.journalSnapshot.permissionToPublish, false)
+  assert.ok(checkpoints >= 15)
+  assert.ok(leases >= checkpoints / 3)
+  for (const record of result.records) {
+    assert.deepEqual(await f.destinationCodec.read(record, path => Promise.resolve(f.staged.get(path)!)), f.targets.get(record.path))
+  }
+  await assert.rejects(() => stageV4BestEffortJournaledThreeBranchVault(input), /Manual Recovery/i)
+  assert.equal(f.stages, 2)
+})
+
+test("D167 a strict and best-effort callback cannot both authorize the same Staging handoff", async () => {
+  const f = await fixture()
+  const ready = await d167BackupReady()
+  await assert.rejects(() => stageV4ReencryptionVaultObjectsWithJournal({
+    ...f.input, ...ready,
+    async assertExclusiveStageLease() {},
+    async assertCrashDurable() {},
+    async assertBestEffortWalCheckpoint() {},
+  }), /exactly one/i)
+  assert.equal(f.stages, 0)
+  assert.equal((await ready.journal.load())?.stageHandoffStarted, false)
+})
+
+test("D167 missing risk acknowledgement or stale Backup generation prevents staged mutations", async () => {
+  const f = await fixture()
+  const ready = await d167BackupReady()
+  let calls = 0
+  const wal = {
+    async assertExclusiveStageLease() { calls++ },
+    async assertBestEffortCheckpoint() {
+      calls++
+      return "best-effort-readback-only" as const
+    },
+  }
+  await assert.rejects(() => stageV4BestEffortJournaledThreeBranchVault({
+    ...f.input, ...ready, wal,
+    acknowledgement: "declined" as typeof d167Consent,
+  }), /acknowledgement/i)
+  assert.equal(calls, 0)
+  await assert.rejects(() => stageV4BestEffortJournaledThreeBranchVault({
+    ...f.input, ...ready, wal, acknowledgement: d167Consent,
+    beginAfterVerifiedBackup: {
+      ...ready.beginAfterVerifiedBackup,
+      expectedJournalGeneration: ready.beginAfterVerifiedBackup.expectedJournalGeneration - 1,
+    },
+  }), /Manual Recovery/i)
+  assert.equal(f.stages, 0)
+  assert.equal((await ready.journal.load())?.stageHandoffStarted, false)
+})
+
+test("D167 interrupted best-effort WAL after blob intent keeps unresolved state and prevents network upload", async () => {
+  const f = await fixture()
+  const ready = await d167BackupReady()
+  const wal = {
+    async assertExclusiveStageLease() {},
+    async assertBestEffortCheckpoint() {
+      if ((await ready.journal.load())?.pendingIntents.length) throw new Error("simulated torn disk write")
+      return "best-effort-readback-only" as const
+    },
+  }
+  const input = { ...f.input, ...ready, wal, acknowledgement: d167Consent }
+  await assert.rejects(() => stageV4BestEffortJournaledThreeBranchVault(input), /Manual Recovery/i)
+  assert.equal(f.stages, 0)
+  const pending = await ready.journal.load()
+  assert.equal(pending?.stageHandoffStarted, true)
+  assert.equal(pending?.pendingIntents.length, 1)
+  assert.equal(pending?.receipts.length, 0)
+  assert.equal(pending?.cutoverAuthorized, false)
+  await assert.rejects(() => stageV4BestEffortJournaledThreeBranchVault(input), /previous run|Manual Recovery/i)
+  assert.equal(f.stages, 0)
+})
+
+test("D167 an ambiguous GitHub Blob response cannot be replayed on the same journal", async () => {
+  const f = await fixture()
+  const ready = await d167BackupReady()
+  let attempts = 0
+  const input = {
+    ...f.input, ...ready, acknowledgement: d167Consent,
+    wal: {
+      async assertExclusiveStageLease() {},
+      async assertBestEffortCheckpoint() { return "best-effort-readback-only" as const },
+    },
+    async stageImmutableObject() {
+      attempts++
+      throw new Error("simulated lost GitHub Blob POST response")
+    },
+  }
+  await assert.rejects(() => stageV4BestEffortJournaledThreeBranchVault(input), /lost GitHub Blob POST response/i)
+  assert.equal(attempts, 1)
+  const pending = await ready.journal.load()
+  assert.equal(pending?.pendingIntents.length, 1)
+  assert.equal(pending?.permissionToPublish, false)
+  await assert.rejects(() => stageV4BestEffortJournaledThreeBranchVault(input), /Manual Recovery|previous run/i)
+  assert.equal(attempts, 1)
+})
+
+test("D167 real Windows WAL permits best-effort new-key staging while strict fsync remains independent", async () => {
+  const parent = join(process.cwd(), ".tmp")
+  await mkdir(parent, { recursive: true })
+  const root = await mkdtemp(join(parent, "d167-staging-wal-"))
+  try {
+    const wal = await acquireV4DesktopRekeyWalStorage({ rootAbsolute: root, journalRoot: "rekey/wal" })
+    try {
+      const j = createV4ReencryptionRecoveryJournal({
+        adapter: wal.adapter, root: "rekey/wal", destinationRepoId: newId,
+        sourceCommitSha: sha, runId: "d167-staging-wal",
+        journalKey: new Uint8Array(32).fill(0x55),
+      })
+      const ready = await d167BackupReady(j)
+      const f = await fixture()
+      const result = await stageV4BestEffortJournaledThreeBranchVault({
+        ...f.input, ...ready, wal, acknowledgement: d167Consent,
+      })
+      assert.equal(result.receipts.length, 2)
+      assert.equal(f.stages, 2)
+      assert.equal((await j.assertHealthySnapshot(result.journalSnapshot.generation)).pendingIntents.length, 0)
+      assert.equal(result.journalSnapshot.cutoverAuthorized, false)
+      await assert.rejects(() => stageV4BestEffortJournaledThreeBranchVault({
+        ...f.input, ...ready, wal, acknowledgement: d167Consent,
+      }), /Manual Recovery|previous run/i)
+      assert.equal(f.stages, 2)
+    } finally { await wal.release() }
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
 
 test("D81 timeout after upload intent leaves unresolved WAL; a retry cannot silently reuse it", async () => {
   const f = await fixture();

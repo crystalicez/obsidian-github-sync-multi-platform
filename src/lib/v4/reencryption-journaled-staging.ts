@@ -15,10 +15,10 @@ export interface V4JournaledReencryptionStageInput extends V4ReencryptionStageIn
   readonly journal: V4ReencryptionRecoveryJournal
   /** Must be a trusted platform-held exclusive lease, across processes. */
   readonly assertExclusiveStageLease: () => Promise<void>
-  /** Mandatory for approved 3-branch staging. D86 Windows Node directory fsync
-   * failures MUST abort before any remote Git Blob mutation. Optional only
-   * for legacy isolated D81 staging experiments, which cannot publish. */
+  /** Strict three-branch route: unsupported directory fsync blocks mutations.
+   * Best-effort uses a separate authenticated generation-bound callback. */
   readonly assertCrashDurable?: (() => Promise<void>) | undefined
+  readonly assertBestEffortWalCheckpoint?: ((generation: number) => Promise<void>) | undefined
   /** D102 explicit same-run transition AFTER full Backup readback. No
    * automatic resume of an existing WAL after a restart/crash. */
   readonly beginAfterVerifiedBackup?: {
@@ -50,20 +50,27 @@ export async function stageV4ReencryptionVaultObjectsWithJournal(
   }
   await input.assertExclusiveStageLease()
   throwIfV4Aborted(input.signal)
-  if (input.beginAfterVerifiedBackup && typeof input.assertCrashDurable !== "function") {
-    throw new Error("Re-encryption three-branch Staging requires a real crash-durable WAL barrier.")
+  if (input.beginAfterVerifiedBackup
+    ? (typeof input.assertCrashDurable === "function")
+      === (typeof input.assertBestEffortWalCheckpoint === "function")
+    : input.assertBestEffortWalCheckpoint !== undefined) {
+    throw new Error("Re-encryption three-branch Staging requires exactly one crash-durable WAL barrier or authenticated best-effort checkpoint.")
   }
-  const assertThreeBranchWalDurable = async () => {
+  const assertThreeBranchWalCheckpoint = async (generation?: number) => {
     throwIfV4Aborted(input.signal)
     await input.assertExclusiveStageLease()
     throwIfV4Aborted(input.signal)
     if (input.beginAfterVerifiedBackup) {
-      await input.assertCrashDurable!()
+      if (input.assertCrashDurable) {
+        await input.assertCrashDurable()
+      } else {
+        await input.assertBestEffortWalCheckpoint!(generation ?? input.beginAfterVerifiedBackup.expectedJournalGeneration)
+      }
       throwIfV4Aborted(input.signal)
     }
   }
-  await assertThreeBranchWalDurable()
-  // Preflight before even touching a local journal, let alone GitHub.
+  await assertThreeBranchWalCheckpoint()
+  // Authenticate the inventory before recording handoff or touching GitHub.
   await inspectV4ReencryptionInventory({
     config: input.sourceConfig,
     head: input.sourceHead,
@@ -99,7 +106,7 @@ export async function stageV4ReencryptionVaultObjectsWithJournal(
     // Persist the one-time phase boundary BEFORE the first possible remote
     // blob upload, even for an empty vault. A restart must never replay it.
     progress = await input.journal.recordStagingHandoff(handoff.backupRef, previous.generation)
-    await assertThreeBranchWalDurable()
+    await assertThreeBranchWalCheckpoint(progress.generation)
     await input.journal.assertHealthySnapshot(progress.generation)
   } else {
     if (input.beginAfterVerifiedBackup) {
@@ -118,9 +125,9 @@ export async function stageV4ReencryptionVaultObjectsWithJournal(
       })
       // WAL intent MUST complete before any network-side blob stage begins.
       progress = await input.journal.recordUploadIntent(planned, progress.generation)
-      // The encrypted intent must be power-loss durable BEFORE GitHub can
-      // persist an unreachable blob; confirmed write/readback is not enough.
-      await assertThreeBranchWalDurable()
+      // Strict mode requires crash durability. Owner-approved best-effort
+      // requires authenticated WAL readback of this exact intent generation.
+      await assertThreeBranchWalCheckpoint(progress.generation)
       await input.journal.assertHealthySnapshot(progress.generation)
       throwIfV4Aborted(input.signal)
       const returnedSha = await input.stageImmutableObject(path, ciphertext)
@@ -133,7 +140,7 @@ export async function stageV4ReencryptionVaultObjectsWithJournal(
         throw new Error("Re-encryption WAL staged immutable blob SHA mismatch; intent remains unresolved.")
       }
       progress = await input.journal.appendReceipt(planned, progress.generation)
-      await assertThreeBranchWalDurable()
+      await assertThreeBranchWalCheckpoint(progress.generation)
       stagedObjects++
       return returnedSha
     },
@@ -141,7 +148,7 @@ export async function stageV4ReencryptionVaultObjectsWithJournal(
   await input.assertExclusiveStageLease()
   throwIfV4Aborted(input.signal)
   const verifiedJournal = await input.journal.load()
-  await assertThreeBranchWalDurable()
+  await assertThreeBranchWalCheckpoint(progress.generation)
   if (!verifiedJournal || verifiedJournal.generation !== progress.generation
     || verifiedJournal.pendingIntents.length !== 0
     || verifiedJournal.receipts.length !== result.receipts.length
