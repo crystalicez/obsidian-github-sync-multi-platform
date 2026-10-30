@@ -24,6 +24,7 @@ import { createV4ContentSource, createV4WholeBufferContentSource, DEFAULT_V4_WHO
 import { createV4PlatformIo, V4ManualRecoveryRequiredError, type V4BinaryAdapterLike, type V4PlatformIo } from "./platform-io"
 import { isV4UncVaultPath, V4_NETWORK_VAULT_WARNING } from "./network-storage"
 import { createV4DesktopInitiatorLocalReader } from "./reencryption-desktop-initiator-reader"
+import { assertV4ReencryptionSyncFenceClear, V4ReencryptionSyncFencedError } from "./reencryption-sync-fence"
 import type { V4InitiatorLocalReader } from "./reencryption-initiator-parity"
 import { createV4StagingStore, type V4StagingStore } from "./staging-store"
 import { V4ProgressStore, type V4SyncProgressSnapshot } from "./progress"
@@ -162,6 +163,7 @@ export class V4PluginRuntime {
   private readonly keyringCache = new V4KeyringCache()
   private credentialGeneration = 0
   private debounceRunActive = false
+  private reencryptionSyncFenced = false
   private disposed = false
 
   constructor(private readonly plugin: FastSync) {
@@ -331,7 +333,10 @@ export class V4PluginRuntime {
 
   manualSync(): Promise<unknown> { return this.coordinator.run({ operation: "normal", trigger: "manual" }) }
   startupSync(): Promise<unknown> { return this.coordinator.run({ operation: "normal", trigger: "startup" }) }
-  scheduledSync(): Promise<unknown> { return this.coordinator.run({ operation: "normal", trigger: "scheduled" }) }
+  scheduledSync(): Promise<unknown> {
+    if (this.reencryptionSyncFenced) return Promise.resolve({ status: "skipped", changedFiles: 0 })
+    return this.coordinator.run({ operation: "normal", trigger: "scheduled" })
+  }
   forcePush(allowThresholdOverride = false): Promise<unknown> { return this.coordinator.run({ operation: "forcePush", trigger: "forcePush", allowThresholdOverride }) }
   forcePull(allowThresholdOverride = false): Promise<unknown> { return this.coordinator.run({ operation: "forcePull", trigger: "forcePull", allowThresholdOverride }) }
 
@@ -368,7 +373,7 @@ export class V4PluginRuntime {
   enqueueRescan(): void { this.enqueue({ type: "rescan", mtime: Date.now() }) }
 
   private enqueue(change: V4QueuedChange): void {
-    if (this.disposed) return
+    if (this.disposed || this.reencryptionSyncFenced) return
     if (!this.plugin.settings.syncEnabled || !this.plugin.settings.syncOnLocalChange || !this.plugin.isWatchEnabled) return
     if (change.type === "rescan") {
       this.coordinator.enqueue(change)
@@ -652,7 +657,6 @@ export class V4PluginRuntime {
       this.progressStore.beginRun(runPatch)
       this.progressStore.update({ phase: "checking-remote" })
     }
-    if (request.trigger === "startup") this.plugin.enableWatch()
     this.plugin.isSyncInProgress = true
     let bootstrapRecoveryKeyCache: { repoId: string; credentialGeneration: number; key: Uint8Array } | undefined
     const bootstrapRecoveryKeyFor = async (passphrase: string, repoId: string): Promise<Uint8Array> => {
@@ -669,6 +673,8 @@ export class V4PluginRuntime {
       trigger: request.trigger,
     })
     try {
+      await assertV4ReencryptionSyncFenceClear(this.adapter)
+      if (request.trigger === "startup") this.plugin.enableWatch()
       if (this.uncVault && !this.networkStorageNoticeShown) {
         this.networkStorageNoticeShown = true
         new Notice(`GitHub Sync: UNC network vault detected. ${V4_NETWORK_VAULT_WARNING}`, 10000)
@@ -686,6 +692,7 @@ export class V4PluginRuntime {
         const attemptScope = this.scopePredicate(attemptSettings)
         try {
           throwIfV4Aborted(signal)
+          await assertV4ReencryptionSyncFenceClear(this.adapter)
           progressAttempt++
           this.progressStore.update({
             phase: "checking-remote",
@@ -875,6 +882,11 @@ export class V4PluginRuntime {
       }
       throw lastError
     } catch (error) {
+      if (error instanceof V4ReencryptionSyncFencedError) {
+        this.reencryptionSyncFenced = true
+        this.plugin.disableWatch?.()
+        this.progressStore.update({ phase: "blocked" })
+      }
       if (error instanceof V4CancelledError) return { changedFiles: 0 }
       // Third-party adapters can reject with null, a string, or an arbitrary
       // value. Never throw again while publishing the terminal failed state,
@@ -912,7 +924,7 @@ export class V4PluginRuntime {
       bootstrapRecoveryKeyCache?.key.fill(0)
       ;(github as unknown as { setV4AbortSignal?(signal?: AbortSignal): void } | undefined)?.setV4AbortSignal?.(undefined)
       this.plugin.isSyncInProgress = false
-      if (!this.disposed) {
+      if (!this.disposed && !this.reencryptionSyncFenced) {
         this.plugin.enableWatch()
         if (this.coordinator.pendingCount > 0) this.beginWaitingRun()
       }

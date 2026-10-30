@@ -30,7 +30,10 @@ test("D13 known UNC vault warns only once while allowing sync to reach ordinary 
   const plugin = {
     app: { vault: {
       configDir: ".obsidian",
-      adapter: { getFullPath: () => "\\\\server\\share\\vault" },
+      adapter: {
+        getFullPath: () => "\\\\server\\share\\vault",
+        async exists() { return false },
+      },
     } },
     manifest: { id: "network-warning-test" },
     settings: { ...DEFAULT_SETTINGS, githubOwner: "owner", githubRepo: "repo" },

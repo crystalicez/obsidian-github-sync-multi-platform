@@ -900,6 +900,37 @@ test("D7: CAS retry keeps the starting connection and encryption identity after 
   assert.equal(new TextDecoder().decode(fixture.github.files.get("secret.md")), "changed")
 })
 
+test("D173 live V4 runtime pauses every Sync trigger and Force operation before GitHub I/O when a migration fence exists", async () => {
+  const fixture = plaintextRuntimeFixture()
+  assert.equal((await fixture.runtime.forcePush() as { status: string }).status, "completed")
+  const githubCalls = fixture.github.refReads
+  const blobCalls = fixture.github.blobAttempts
+  const original = fixture.github.ref?.sha
+  fixture.indexFiles.set(".obsidian/plugins/test/github-sync-v4-rekey-sync-fence", "directory-present")
+  Object.assign(fixture.plugin, { disableWatch() { fixture.plugin.isWatchEnabled = false } })
+  const operations = [
+    () => fixture.runtime.manualSync(),
+    () => fixture.runtime.startupSync(),
+    () => fixture.runtime.forcePush(),
+    () => fixture.runtime.forcePull(),
+  ]
+  for (const sync of operations) {
+    const result = await sync() as { status: string; changedFiles: number }
+    assert.deepEqual(result, { status: "completed", changedFiles: 0 })
+    assert.equal(fixture.runtime.progressSnapshot.lifecycle, "failed")
+    assert.match(fixture.runtime.progressSnapshot.errorMessage ?? "", /Re-encryption is pending/)
+    assert.equal(fixture.github.refReads, githubCalls)
+    assert.equal(fixture.github.blobAttempts, blobCalls)
+    assert.equal(fixture.github.ref?.sha, original)
+  }
+  assert.equal(fixture.plugin.isWatchEnabled, false)
+  assert.deepEqual(await fixture.runtime.scheduledSync(), { status: "skipped", changedFiles: 0 })
+  fixture.runtime.enqueueModify("secret.md", Date.now())
+  assert.equal(fixture.runtime.pendingCount, 0)
+  assert.equal(fixture.github.refReads, githubCalls)
+  fixture.runtime.dispose()
+})
+
 test("v4 runtime retains terminal timings until the next run begins", async () => {
   const fixture = plaintextRuntimeFixture();
   await fixture.runtime.forcePush();
