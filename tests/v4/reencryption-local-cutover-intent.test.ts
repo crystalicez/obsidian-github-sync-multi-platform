@@ -1,8 +1,12 @@
 import assert from "node:assert/strict"
 import test from "node:test"
 import { createHash } from "node:crypto"
+import { mkdir, mkdtemp, rm } from "node:fs/promises"
+import { join } from "node:path"
 import { createEmptyV4LocalIndex, loadV4LocalIndex, saveV4LocalIndex, type V4LocalIndexAdapter } from "../../src/lib/v4/local-index"
-import { prepareV4ReencryptionLocalCutoverIntent } from "../../src/lib/v4/reencryption-local-cutover-intent"
+import { prepareV4ReencryptionLocalCutoverIntent, prepareV4BestEffortReencryptionLocalCutoverIntent } from "../../src/lib/v4/reencryption-local-cutover-intent"
+import { acquireV4DesktopRekeyWalStorage } from "../../src/lib/v4/reencryption-desktop-wal"
+import { createV4ReencryptionRecoveryJournal, type V4ReencryptionJournalSnapshot } from "../../src/lib/v4/reencryption-recovery-journal"
 
 const source = "owner/repo#main"
 const backup = "owner/repo#backup/run12345"
@@ -44,6 +48,169 @@ function store() {
   })
   return { files, dirs, writes, adapter, seed, input }
 }
+
+const d170Consent = "accept-best-effort-power-loss-recovery-risk" as const
+const candidateTree = "c".repeat(40)
+const candidateManifest = "d".repeat(64)
+
+function bestEffortFixture(s: ReturnType<typeof store>) {
+  const snapshot: V4ReencryptionJournalSnapshot = {
+    generation: 7,
+    receipts: [], pendingIntents: [], pendingRefIntents: [],
+    verifiedRefObservations: [
+      { role: "backup", repoId: backup, commitSha: oldSha, treeSha: "e".repeat(40) },
+      { role: "destination", repoId: destination, commitSha: newSha,
+        treeSha: candidateTree, manifestSha256: candidateManifest },
+    ],
+    stageHandoffStarted: true,
+    candidatePreparationSha256: "f".repeat(64),
+    preparedCandidateReceipt: {
+      commitSha: newSha, treeSha: candidateTree, manifestSha256: candidateManifest,
+    },
+    requiresRemoteRevalidation: true, permissionToPublish: false, cutoverAuthorized: false,
+  }
+  let checks = 0
+  const journal = {
+    sourceCommitSha: oldSha, destinationRepoId: destination,
+    async assertHealthySnapshot(generation: number) {
+      if (generation !== snapshot.generation) throw Error("bad generation")
+      return snapshot
+    },
+  }
+  const wal = {
+    async assertExclusiveStageLease() {},
+    async assertBestEffortCheckpoint() { checks++; return "best-effort-readback-only" as const },
+  }
+  return {
+    snapshot, journal, wal,
+    input: () => {
+      const { assertCrashDurable: _strict, ...core } = s.input()
+      return { ...core, journal, wal, acknowledgement: d170Consent }
+    },
+    get checks() { return checks },
+  }
+}
+
+test("D170 best-effort writes only uncommitted intent after exact completed Backup/Destination WAL evidence", async () => {
+  const s = store()
+  await s.seed()
+  const f = bestEffortFixture(s)
+  const originals = new Map(s.files)
+  const before = s.writes.length
+  const result = await prepareV4BestEffortReencryptionLocalCutoverIntent(f.input())
+  assert.equal(result.status, "local-cutover-intent-prepared-uncommitted")
+  assert.equal(result.localCutoverAuthorized, false)
+  assert.equal(result.resumeSyncAuthorized, false)
+  assert.equal(result.oldPassphraseCleanupAuthorized, false)
+  assert.deepEqual(s.writes.slice(before), [intentRoot + "/intent.json"])
+  for (const [path, bytes] of originals) assert.equal(s.files.get(path), bytes)
+  const saved = JSON.parse(s.files.get(result.intentPath)!) as Record<string, unknown>
+  assert.equal(saved.phase, "prepared-uncommitted")
+  assert.equal(saved.walGeneration, 7)
+  assert.equal(saved.sourcePassphraseSecretId, "old-secret-id")
+  assert.equal(saved.destinationPassphraseSecretId, "new-secret-id")
+  assert.equal(f.checks, 9)
+  await assert.rejects(() => prepareV4BestEffortReencryptionLocalCutoverIntent(f.input()), /existing|manual recovery/i)
+  assert.equal(s.writes.length, before + 1)
+})
+
+test("D170 no consent and incomplete or foreign destination WAL refuse all intent writes", async () => {
+  const s = store()
+  await s.seed()
+  const f = bestEffortFixture(s)
+  const before = s.writes.length
+  await assert.rejects(() => prepareV4BestEffortReencryptionLocalCutoverIntent({
+    ...f.input(), acknowledgement: "declined" as typeof d170Consent,
+  }), /acknowledgement/i)
+  assert.equal(f.checks, 0)
+  const incomplete = bestEffortFixture(s)
+  for (const change of [
+    { pendingRefIntents: [{ role: "destination" as const, repoId: destination, commitSha: newSha, treeSha: candidateTree }] },
+    { verifiedRefObservations: [incomplete.snapshot.verifiedRefObservations[0]!] },
+    { preparedCandidateReceipt: null },
+    { stageHandoffStarted: false },
+  ]) {
+    const corrupted = { ...incomplete.snapshot, ...change }
+    const input = incomplete.input()
+    await assert.rejects(() => prepareV4BestEffortReencryptionLocalCutoverIntent({
+      ...input,
+      journal: { ...input.journal, async assertHealthySnapshot() { return corrupted as V4ReencryptionJournalSnapshot } },
+    }), /Manual Recovery/i)
+  }
+  assert.equal(s.writes.length, before)
+  assert.equal(s.dirs.has(intentRoot), false)
+})
+
+test("D170 interrupted best-effort checkpoint after writing intent preserves ambiguity, never retries", async () => {
+  const s = store()
+  await s.seed()
+  const f = bestEffortFixture(s)
+  const input = f.input()
+  let interrupted = false
+  const wal = {
+    ...input.wal,
+    async assertBestEffortCheckpoint() {
+      if (s.files.has(intentRoot + "/intent.json")) {
+        interrupted = true
+        throw Error("simulated WAL readback interruption")
+      }
+      return "best-effort-readback-only" as const
+    },
+  }
+  await assert.rejects(() => prepareV4BestEffortReencryptionLocalCutoverIntent({ ...input, wal }), /Manual Recovery/i)
+  assert.equal(interrupted, true)
+  assert.equal(s.files.has(intentRoot + "/intent.json"), true)
+  assert.equal((await loadV4LocalIndex(s.adapter, root)).repoId, source)
+  assert.equal((await loadV4LocalIndex(s.adapter, shadow)).repoId, destination)
+  await assert.rejects(() => prepareV4BestEffortReencryptionLocalCutoverIntent(f.input()), /existing|manual recovery/i)
+})
+
+test("D170 real Windows encrypted WAL authenticates a complete remote fork before preparing only a local intent", async () => {
+  const parent = join(process.cwd(), ".tmp")
+  await mkdir(parent, { recursive: true })
+  const directory = await mkdtemp(join(parent, "d170-local-intent-"))
+  try {
+    const wal = await acquireV4DesktopRekeyWalStorage({
+      rootAbsolute: directory, journalRoot: "rekey/wal",
+    })
+    try {
+      const journal = createV4ReencryptionRecoveryJournal({
+        adapter: wal.adapter, root: "rekey/wal",
+        sourceCommitSha: oldSha, destinationRepoId: destination,
+        runId: "d170-local-intent", journalKey: new Uint8Array(32).fill(0x52),
+      })
+      let state = await journal.begin()
+      const frozen = { role: "backup" as const, repoId: backup,
+        commitSha: oldSha, treeSha: "e".repeat(40) }
+      state = await journal.recordRefIntent(frozen, state.generation)
+      state = await journal.markRefReadbackObserved(frozen, state.generation)
+      state = await journal.recordStagingHandoff(frozen, state.generation)
+      state = await journal.recordCandidatePreparationIntent("f".repeat(64), state.generation)
+      state = await journal.recordPreparedCandidateReceipt({
+        commitSha: newSha, treeSha: candidateTree, manifestSha256: candidateManifest,
+      }, state.generation)
+      const intended = {
+        role: "destination" as const, repoId: destination,
+        commitSha: newSha, treeSha: candidateTree, manifestSha256: candidateManifest,
+      }
+      state = await journal.recordRefIntent(intended, state.generation)
+      state = await journal.markRefReadbackObserved(intended, state.generation)
+      const s = store()
+      await s.seed()
+      const { assertCrashDurable: _unused, ...core } = s.input()
+      const report = await prepareV4BestEffortReencryptionLocalCutoverIntent({
+        ...core, walGeneration: state.generation,
+        wal, journal, acknowledgement: d170Consent,
+      })
+      assert.equal(report.localCutoverAuthorized, false)
+      assert.equal(report.resumeSyncAuthorized, false)
+      assert.equal((await journal.assertHealthySnapshot(state.generation)).verifiedRefObservations.length, 2)
+      assert.equal((await loadV4LocalIndex(s.adapter, root)).remoteCommitSha, oldSha)
+      assert.equal((await loadV4LocalIndex(s.adapter, shadow)).remoteCommitSha, newSha)
+      assert.equal(s.files.has(intentRoot + "/intent.json"), true)
+    } finally { await wal.release() }
+  } finally { await rm(directory, { recursive: true, force: true }) }
+})
 
 test("D135 prepares nonsecret intent independently, retaining both local indices and denying cutover", async () => {
   const s = store()

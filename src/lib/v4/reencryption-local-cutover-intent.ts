@@ -5,6 +5,9 @@ import {
   type V4LocalIndex, type V4LocalIndexAdapter,
 } from "./local-index"
 import { expectedV4PathLayout } from "./protocol-types"
+import { inspectV4BestEffortWalRecovery } from "./reencryption-best-effort-wal-recovery"
+import type { V4DesktopRekeyWalStorage } from "./reencryption-desktop-wal"
+import type { V4ReencryptionRecoveryJournal } from "./reencryption-recovery-journal"
 
 const SHA = /^[a-f0-9]{40}$/u
 const RUN = /^[A-Za-z0-9_-]{8,128}$/u
@@ -59,8 +62,10 @@ export interface V4ReencryptionLocalCutoverIntentResult {
   readonly oldPassphraseCleanupAuthorized: false
 }
 
-type PinnedIntent = Omit<V4ReencryptionLocalCutoverIntentInput,
-  "adapter" | "assertExclusiveInitiatorLease" | "assertCrashDurable">
+type CutoverIntentCoreInput = Omit<V4ReencryptionLocalCutoverIntentInput, "assertCrashDurable">
+
+type PinnedIntent = Omit<CutoverIntentCoreInput,
+  "adapter" | "assertExclusiveInitiatorLease">
 
 function validIdentity(repoId: string): { owner: string; repo: string; branch: string } {
   const match = /^([^/#]+)\/([^/#]+)#(.+)$/u.exec(repoId)
@@ -73,7 +78,7 @@ function validIdentity(repoId: string): { owner: string; repo: string; branch: s
   return { owner, repo, branch }
 }
 
-function validate(input: V4ReencryptionLocalCutoverIntentInput): PinnedIntent {
+function validate(input: CutoverIntentCoreInput, checkpoint: () => Promise<void>): PinnedIntent {
   if (!input || typeof input.activeIndexRoot !== "string"
     || input.activeIndexRoot.split("/").length < 2
     || !input.activeIndexRoot.split("/").every(segment => SEGMENT.test(segment)
@@ -90,7 +95,7 @@ function validate(input: V4ReencryptionLocalCutoverIntentInput): PinnedIntent {
     || [input.sourcePassphraseSecretId, input.destinationPassphraseSecretId].some(id =>
       id.length > 256 || /[\u0000-\u001f\u007f]/u.test(id))
     || typeof input.assertExclusiveInitiatorLease !== "function"
-    || typeof input.assertCrashDurable !== "function"
+    || typeof checkpoint !== "function"
     || typeof input.adapter?.exists !== "function"
     || typeof input.adapter.read !== "function"
     || typeof input.adapter.write !== "function"
@@ -134,15 +139,15 @@ function checkIndex(index: V4LocalIndex, pinned: PinnedIntent, role: "source" | 
 }
 
 function sameInput(
-  input: V4ReencryptionLocalCutoverIntentInput,
+  input: CutoverIntentCoreInput,
   pinned: PinnedIntent,
   adapter: V4LocalIndexAdapter,
   lease: () => Promise<void>,
-  durable: () => Promise<void>,
+  checkpointUnchanged: () => boolean,
 ): boolean {
   return input.adapter === adapter
     && input.assertExclusiveInitiatorLease === lease
-    && input.assertCrashDurable === durable
+    && checkpointUnchanged()
     && (Object.keys(pinned) as Array<keyof PinnedIntent>)
       .every(key => input[key] === pinned[key])
 }
@@ -159,10 +164,95 @@ function sameInput(
 export async function prepareV4ReencryptionLocalCutoverIntent(
   input: V4ReencryptionLocalCutoverIntentInput,
 ): Promise<V4ReencryptionLocalCutoverIntentResult> {
-  const pinned = validate(input)
+  const durable = input.assertCrashDurable
+  if (typeof durable !== "function") {
+    throw new Error("Strict local cutover intent requires a crash-durable checkpoint.")
+  }
+  return prepareCutoverIntent(input, durable, () => input.assertCrashDurable === durable)
+}
+
+export interface V4BestEffortReencryptionLocalCutoverIntentInput extends CutoverIntentCoreInput {
+  readonly acknowledgement: "accept-best-effort-power-loss-recovery-risk"
+  readonly journal: Pick<V4ReencryptionRecoveryJournal,
+    "sourceCommitSha" | "destinationRepoId" | "assertHealthySnapshot">
+  readonly wal: Pick<V4DesktopRekeyWalStorage,
+    "assertExclusiveStageLease" | "assertBestEffortCheckpoint">
+}
+
+/**
+ * Only creates the uncommitted, nonsecret local recovery Intent.
+ * It never selects Destination, changes Settings/SecretStorage, or grants Sync.
+ */
+export async function prepareV4BestEffortReencryptionLocalCutoverIntent(
+  input: V4BestEffortReencryptionLocalCutoverIntentInput,
+): Promise<V4ReencryptionLocalCutoverIntentResult> {
+  if (input.acknowledgement !== "accept-best-effort-power-loss-recovery-risk"
+    || typeof input.wal?.assertExclusiveStageLease !== "function"
+    || typeof input.wal.assertBestEffortCheckpoint !== "function"
+    || typeof input.journal?.assertHealthySnapshot !== "function"
+    || input.journal.sourceCommitSha !== input.sourceCommitSha
+    || input.journal.destinationRepoId !== input.destinationRepoId) {
+    throw new Error("Best-effort local intent requires risk acknowledgement and matching authenticated WAL.")
+  }
+  const wal = input.wal
+  const journal = input.journal
+  const read = journal.assertHealthySnapshot
+  const check = wal.assertBestEffortCheckpoint
+  const lock = wal.assertExclusiveStageLease
+  const unchanged = () => input.wal === wal && input.journal === journal
+    && wal.assertBestEffortCheckpoint === check
+    && wal.assertExclusiveStageLease === lock
+    && journal.assertHealthySnapshot === read
+    && journal.sourceCommitSha === input.sourceCommitSha
+    && journal.destinationRepoId === input.destinationRepoId
+  const checkpoint = async () => {
+    if (!unchanged()) throw new Error("Best-effort local intent WAL binding changed; Manual Recovery required.")
+    await lock.call(wal)
+    const proof = await inspectV4BestEffortWalRecovery({
+      storage: wal, journal,
+      expected: {
+        sourceCommitSha: input.sourceCommitSha,
+        destinationRepoId: input.destinationRepoId,
+        generation: input.walGeneration,
+      },
+    })
+    if (!unchanged() || proof.observation !== "authenticated-uncommitted"
+      || proof.generation !== input.walGeneration || proof.localCutoverAuthorized !== false) {
+      throw new Error("Best-effort local intent WAL is uncertain; Manual Recovery required.")
+    }
+    const saved = await read.call(journal, input.walGeneration)
+    const backup = saved.verifiedRefObservations.find(ref => ref.role === "backup")
+    const destination = saved.verifiedRefObservations.find(ref => ref.role === "destination")
+    const candidate = saved.preparedCandidateReceipt
+    if (saved.generation !== input.walGeneration
+      || saved.pendingIntents.length || saved.pendingRefIntents.length
+      || saved.verifiedRefObservations.length !== 2
+      || saved.stageHandoffStarted !== true
+      || saved.cutoverAuthorized !== false || saved.permissionToPublish !== false
+      || !saved.candidatePreparationSha256 || !candidate
+      || !backup || backup.repoId !== input.backupRepoId
+      || backup.commitSha !== input.sourceCommitSha
+      || !destination || destination.repoId !== input.destinationRepoId
+      || destination.commitSha !== input.destinationCommitSha
+      || destination.treeSha !== candidate.treeSha
+      || destination.manifestSha256 !== candidate.manifestSha256
+      || candidate.commitSha !== input.destinationCommitSha) {
+      throw new Error("Best-effort local intent lacks complete authenticated three-branch WAL evidence; Manual Recovery required.")
+    }
+    await lock.call(wal)
+    if (!unchanged()) throw new Error("Best-effort local intent WAL binding changed; Manual Recovery required.")
+  }
+  return prepareCutoverIntent(input, checkpoint, unchanged)
+}
+
+async function prepareCutoverIntent(
+  input: CutoverIntentCoreInput,
+  checkpoint: () => Promise<void>,
+  checkpointUnchanged: () => boolean,
+): Promise<V4ReencryptionLocalCutoverIntentResult> {
+  const pinned = validate(input, checkpoint)
   const adapter = input.adapter
   const lease = input.assertExclusiveInitiatorLease
-  const durable = input.assertCrashDurable
   const intentRoot = pinned.activeIndexRoot + "-rekey-intent-" + pinned.runId
   const shadowRoot = pinned.activeIndexRoot + "-rekey-" + pinned.runId
   const intentPath = intentRoot + "/intent.json"
@@ -172,15 +262,15 @@ export async function prepareV4ReencryptionLocalCutoverIntent(
   activeIntents.set(adapter, claim)
   try {
     await lease()
-    if (!sameInput(input, pinned, adapter, lease, durable)) {
+    if (!sameInput(input, pinned, adapter, lease, checkpointUnchanged)) {
       throw new Error("Local cutover intent storage contract changed before staging.")
     }
-    await durable()
+    await checkpoint()
     const sourceIndex = await loadV4LocalIndex(adapter, pinned.activeIndexRoot)
     const destinationIndex = await loadV4LocalIndex(adapter, shadowRoot)
     checkIndex(sourceIndex, pinned, "source")
     checkIndex(destinationIndex, pinned, "destination")
-    if (!sameInput(input, pinned, adapter, lease, durable)) {
+    if (!sameInput(input, pinned, adapter, lease, checkpointUnchanged)) {
       throw new Error("Local cutover intent input changed before staging.")
     }
     await lease()
@@ -209,23 +299,23 @@ export async function prepareV4ReencryptionLocalCutoverIntent(
     if (!fitsV4LocalJsonSizeLimit(serialized, V4_REENCRYPTION_LOCAL_CUTOVER_INTENT_MAX_BYTES)) {
       throw new Error("Local cutover intent exceeds the bounded restart-reader size limit.")
     }
-    if (!sameInput(input, pinned, adapter, lease, durable)) {
+    if (!sameInput(input, pinned, adapter, lease, checkpointUnchanged)) {
       throw new Error("Local cutover intent storage contract changed before write.")
     }
     await adapter.mkdir(intentRoot)
     await adapter.write(intentPath, serialized)
-    await durable()
+    await checkpoint()
     await lease()
     const actual = await adapter.read(intentPath)
     if (actual !== serialized) throw new Error("Local cutover intent readback mismatch; manual recovery required.")
-    await durable()
+    await checkpoint()
     await lease()
-    if (!sameInput(input, pinned, adapter, lease, durable)) {
+    if (!sameInput(input, pinned, adapter, lease, checkpointUnchanged)) {
       throw new Error("Local cutover intent identity changed during preparation.")
     }
     checkIndex(await loadV4LocalIndex(adapter, pinned.activeIndexRoot), pinned, "source")
     checkIndex(await loadV4LocalIndex(adapter, shadowRoot), pinned, "destination")
-    if (!sameInput(input, pinned, adapter, lease, durable)) {
+    if (!sameInput(input, pinned, adapter, lease, checkpointUnchanged)) {
       throw new Error("Local cutover intent storage contract changed after readback.")
     }
     return Object.freeze({
