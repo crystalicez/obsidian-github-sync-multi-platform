@@ -10,6 +10,11 @@ import { buildV4RemoteMetadata } from "../../src/lib/v4/remote-index"
 import { createEmptyV4LocalIndex, loadV4LocalIndex, saveV4LocalIndex, type V4IndexFileRecord, type V4LocalIndexAdapter } from "../../src/lib/v4/local-index"
 import { verifyV4ReencryptionShadowAgainstDestination } from "../../src/lib/v4/reencryption-shadow-remote-binding"
 import { V4_RUNTIME_INDEX_ROOT } from "../../src/lib/v4/reencryption-index-root"
+import { armV4ReencryptionSyncFence, V4_REENCRYPTION_SYNC_FENCE_ROOT } from "../../src/lib/v4/reencryption-sync-fence"
+import { inspectV4FencedFullRemoteShadowAfterRestart, type V4FencedFullRemoteShadowInput } from "../../src/lib/v4/reencryption-fenced-full-shadow-verification"
+import type { V4FencedThreeBranchRevalidationInput } from "../../src/lib/v4/reencryption-fenced-three-branch-revalidation"
+import type { V4ReencryptionProposedCommitIdentity } from "../../src/lib/v4/reencryption-proposed-commit-receipt"
+import type { V4ThreeBranchPublicationReport } from "../../src/lib/v4/reencryption-three-branch-publish"
 import { inspectV4ReencryptionCrossSurfaceProof } from "../../src/lib/v4/reencryption-cross-surface-proof"
 import { inspectV4ReencryptionLiveBackupCrossSurface } from "../../src/lib/v4/reencryption-live-backup-cross-surface"
 import { computeV4ReencryptionCandidateManifestDigest } from "../../src/lib/v4/reencryption-candidate-manifest-digest"
@@ -40,7 +45,7 @@ const plan = planV4OrphanReencryptionDestination({
   expectedPhysicalRepositoryId: 88, defaultBranch: "main",
 })
 
-async function makeBase() {
+async function makeBase(deviceId = "d83") {
   const keyring = await deriveV4Keyring({
     repoId: destination, passphrase: "new-d83-secret",
     salt: enc("new-d83-salt"), iterations: 600_000,
@@ -67,7 +72,7 @@ async function makeBase() {
   }
   const head: V4RemoteHead = {
     formatVersion: 4, mode: "encrypted", epoch: 1, generation: 1, journalId: "synthetic",
-    deviceId: "d83", updatedAt: 4, shardHashes,
+    deviceId, updatedAt: 4, shardHashes,
   }
   const metadata = await buildV4RemoteMetadata({ config: dstConfig, head, records, keyring })
   files.push(...metadata)
@@ -82,9 +87,10 @@ async function makeBase() {
   return { records, entries, blobValues, receipts, head }
 }
 const basePromise = makeBase()
+const d178BasePromise = makeBase("device_d178")
 
-async function fixture() {
-  const b = await basePromise
+async function fixture(deviceId = "d83") {
+  const b = await (deviceId === "device_d178" ? d178BasePromise : basePromise)
   const entries = b.entries.map(e => ({ ...e }))
   const blobs = new Map(b.blobValues)
   let reads = 0
@@ -235,18 +241,19 @@ test("D83 wrong key, changed repo identity, malformed or cancelled audit fail cl
 
 const d137Run = "run_d137_shadow"
 const d137Shadow = "private/index-rekey-" + d137Run
-async function d137Scenario(activeIndexRoot = "private/index") {
+async function d137Scenario(activeIndexRoot = "private/index", expectedDeviceId = "d83") {
   const activeShadow = activeIndexRoot + "-rekey-" + d137Run
-  const f = await fixture()
+  const f = await fixture(expectedDeviceId)
   const files = new Map<string, string>()
+  const dirs = new Set<string>()
   let writes = 0
   const adapter: V4LocalIndexAdapter = {
     async read(path) { const raw = files.get(path); if (raw === undefined) throw Error("missing"); return raw },
     async write(path, value) { writes++; files.set(path, value) },
-    async exists(path) { return files.has(path) },
-    async mkdir() {},
+    async exists(path) { return files.has(path) || dirs.has(path) },
+    async mkdir(path) { dirs.add(path) },
   }
-  const index = createEmptyV4LocalIndex({ repoId: destination, deviceId: "d83", mode: "encrypted" })
+  const index = createEmptyV4LocalIndex({ repoId: destination, deviceId: expectedDeviceId, mode: "encrypted" })
   index.remoteCommitSha = rootSha
   index.epoch = f.head.epoch
   index.generation = f.head.generation
@@ -266,10 +273,234 @@ async function d137Scenario(activeIndexRoot = "private/index") {
   const durable = async () => {}
   const input = () => ({
     adapter, activeIndexRoot, runId: d137Run,
-    expectedDeviceId: "d83", remote, assertExclusiveInitiatorLease: lease, assertCrashDurable: durable,
+    expectedDeviceId, remote, assertExclusiveInitiatorLease: lease, assertCrashDurable: durable,
   })
-  return { f, adapter, files, input, getWrites: () => writes }
+  return { f, adapter, files, dirs, input, getWrites: () => writes }
 }
+
+const d178Backup = "owner/repo#backup/d178"
+const d178Bytes = String(14 + 8 * 1024 * 1024 + 13)
+
+async function d178Scenario() {
+  const s = await d137Scenario(V4_RUNTIME_INDEX_ROOT, "device_d178")
+  let held = false
+  let fullRefChecks = 0
+  let walChecks = 0
+  let snapshotReads = 0
+  const lease = async () => { assert.equal(held, true) }
+  const holder = async <T>(callback: () => Promise<T>): Promise<T> => {
+    assert.equal(held, false)
+    held = true
+    try { return await callback() } finally { held = false }
+  }
+  const identity: V4ReencryptionProposedCommitIdentity = {
+    runId: d137Run, walGeneration: 8, indexRoot: V4_RUNTIME_INDEX_ROOT,
+    deviceId: "device_d178",
+    sourceRepoId: original, backupRepoId: d178Backup, destinationRepoId: destination,
+    sourceCommitSha: pinned, sourceTreeSha: sourceTree,
+    destinationCommitSha: rootSha, destinationTreeSha: treeSha,
+    manifestSha256: "e".repeat(64),
+    sourcePassphraseSecretId: "old-secret", destinationPassphraseSecretId: "new-secret",
+  }
+  const publication: V4ThreeBranchPublicationReport = {
+    integrityScope: "three-branch-verified-backup-and-destination-remote-only",
+    sourceRepoId: original, backupRepoId: d178Backup, destinationRepoId: destination,
+    originalSourceCommitSha: pinned, destinationCommitSha: rootSha,
+    verifiedFileCount: 3, verifiedPlaintextBytes: d178Bytes,
+    backupContentsReadbackVerified: true, backupScratchRoundTripVerified: true,
+    destinationContentsReadbackVerified: true, oldBranchSyncRemainsIndependent: true,
+    powerLossDurabilityIndependentlyAudited: false, initiatingDeviceCutoverAuthorized: false,
+  }
+  let snapshot: V4ReencryptionJournalSnapshot = {
+    generation: 8, receipts: s.f.receipts.map(r => ({ ...r })), pendingIntents: [], pendingRefIntents: [],
+    verifiedRefObservations: [
+      { role: "backup", repoId: d178Backup, commitSha: pinned, treeSha: sourceTree },
+      { role: "destination", repoId: destination, commitSha: rootSha, treeSha,
+        manifestSha256: identity.manifestSha256 },
+    ],
+    preparedCandidateReceipt: {
+      commitSha: rootSha, treeSha, manifestSha256: identity.manifestSha256,
+    },
+    candidatePreparationSha256: "f".repeat(64), stageHandoffStarted: true,
+    requiresRemoteRevalidation: true, permissionToPublish: false, cutoverAuthorized: false,
+  }
+  const journal = {
+    sourceCommitSha: pinned, destinationRepoId: destination,
+    async assertHealthySnapshot(gen: number) {
+      assert.equal(held, true)
+      assert.equal(gen, 8)
+      snapshotReads++
+      return structuredClone(snapshot)
+    },
+  }
+  const wal = {
+    async assertExclusiveStageLease() { assert.equal(held, true) },
+    async assertBestEffortCheckpoint() {
+      assert.equal(held, true)
+      walChecks++
+      return "best-effort-readback-only" as const
+    },
+  }
+  const gh = Object.assign(s.f.github, {
+    branchName: "rekey/d83",
+    async getRepositoryDefaultBranch() { assert.equal(held, true); return "main" },
+    async getGitRefOrNull() {
+      assert.equal(held, true)
+      fullRefChecks++
+      return s.f.github.getGitRef()
+    },
+  })
+  type Reader = V4FencedThreeBranchRevalidationInput["readers"]["source"]
+  const branchReader = (repoId: string): Reader => {
+    const branch = repoId.split("#")[1]!
+    return {
+      branchName: branch,
+      async getRepositoryIdentity() { assert.equal(held, true); return { id: 88, fullName: "owner/repo" } },
+      async getRepositoryDefaultBranch() { assert.equal(held, true); return "main" },
+      async getGitRefOrNull() {
+        assert.equal(held, true)
+        return { ref: "refs/heads/" + branch, type: "commit" as const, sha: pinned }
+      },
+      async getGitCommit() {
+        assert.equal(held, true)
+        return { sha: pinned, treeSha: sourceTree,
+          parentShas: ["1".repeat(40)], message: "source" }
+      },
+    } as Reader
+  }
+  const readers: V4FencedThreeBranchRevalidationInput["readers"] = {
+    source: branchReader(original), backup: branchReader(d178Backup),
+    destination: gh as unknown as Reader,
+  }
+  const branches: V4FencedThreeBranchRevalidationInput = {
+    identity, publication, physicalRepositoryId: 88,
+    adapter: s.adapter, journal, wal, readers,
+    acknowledgement: "accept-best-effort-power-loss-recovery-risk",
+    assertExclusiveInitiatorLease: lease,
+    withExclusiveInitiatorLease: holder,
+  }
+  const shadow = {
+    ...s.input(),
+    assertExclusiveInitiatorLease: lease,
+  }
+  const input: V4FencedFullRemoteShadowInput = { branches, shadow }
+  await holder(async () => armV4ReencryptionSyncFence({
+    adapter: s.adapter, runId: identity.runId,
+    sourceRepoId: original, destinationRepoId: destination,
+    assertExclusiveInitiatorLease: lease,
+  }))
+  const inspect = () => inspectV4FencedFullRemoteShadowAfterRestart(input)
+  return {
+    s, input, inspect, identity, journal, wal, publication, gh, snapshot: () => snapshot,
+    setSnapshot: (next: V4ReencryptionJournalSnapshot) => { snapshot = next },
+    get walChecks() { return walChecks },
+    get snapshotReads() { return snapshotReads },
+    get fullRefChecks() { return fullRefChecks },
+  }
+}
+
+test("D178 real complete encrypted Git content verifies against Shadow with Fence and WAL but never permits Cutover", async () => {
+  const f = await d178Scenario()
+  const files = new Map(f.s.files)
+  const writes = f.s.getWrites()
+  const result = await f.inspect()
+  assert.deepEqual(result, {
+    integrityScope: "read-only-fenced-full-destination-content-and-shadow",
+    observation: "complete-destination-matches-shadow-uncommitted",
+    evidence: "best-effort-wal-readback-not-power-loss-durable",
+    completeRemoteContentReverified: true,
+    localCutoverAuthorized: false, resumeSyncAuthorized: false,
+    rollbackAuthorized: false, remoteWritesAuthorized: false,
+    oldPassphraseCleanupAuthorized: false,
+  })
+  assert.deepEqual(f.s.files, files)
+  assert.equal(f.s.getWrites(), writes)
+  assert.ok(f.s.f.reads >= 4)
+  assert.ok(f.fullRefChecks >= 4)
+  assert.ok(f.snapshotReads >= 4)
+  assert.ok(f.walChecks >= 6)
+  assert.equal(f.s.files.has(V4_RUNTIME_INDEX_ROOT + "-rekey-selector-" + d137Run + "/selector.json"), false)
+  assert.equal(f.s.dirs.has(V4_REENCRYPTION_SYNC_FENCE_ROOT), true)
+})
+
+test("D178 tampered content, Shadow, historical byte count and missing WAL upload receipt fail closed", async () => {
+  const cases = ["ciphertext", "shadow", "bytes", "receipt", "fence", "passphrase"] as const
+  for (const cause of cases) {
+    const f = await d178Scenario()
+    if (cause === "ciphertext") {
+      const sha = f.s.f.receipts[0]!.sha
+      f.s.f.blobs.set(sha, new Uint8Array([1, 2, 3]))
+    } else if (cause === "shadow") {
+      const root = V4_RUNTIME_INDEX_ROOT + "-rekey-" + d137Run
+      const index = await loadV4LocalIndex(f.s.adapter, root)
+      index.epoch += 1
+      await saveV4LocalIndex(f.s.adapter, root, index)
+    } else if (cause === "bytes") {
+      (f.input.branches as { publication: V4ThreeBranchPublicationReport }).publication =
+        { ...f.publication, verifiedPlaintextBytes: "1" }
+    } else if (cause === "receipt") {
+      f.setSnapshot({ ...f.snapshot(), receipts: f.snapshot().receipts.slice(1) })
+    } else if (cause === "fence") {
+      f.s.files.set(V4_REENCRYPTION_SYNC_FENCE_ROOT + "/active.json", "{torn")
+    } else {
+      (f.input.shadow.remote as { destinationPassphrase: string }).destinationPassphrase = "wrong-passphrase"
+    }
+    const before = f.s.getWrites()
+    assert.equal((await f.inspect()).observation, "manual-recovery-required", cause)
+    assert.equal(f.s.getWrites(), before, cause)
+  }
+})
+
+test("D178 a Destination ref moved during full ciphertext scan denies full-content proof", async () => {
+  const f = await d178Scenario()
+  const originalGetBlob = f.gh.getBlob
+  let moved = false
+  f.gh.getBlob = async (sha: string) => {
+    const bytes = await originalGetBlob(sha)
+    if (!moved) {
+      moved = true
+      f.s.f.changeRef("9".repeat(40))
+    }
+    return bytes
+  }
+  const before = f.s.getWrites()
+  assert.equal((await f.inspect()).observation, "manual-recovery-required")
+  assert.equal(moved, true)
+  assert.equal(f.s.getWrites(), before)
+})
+
+test("D178 equivalent WAL ciphertext receipts in a different order still authenticate", async () => {
+  const f = await d178Scenario()
+  const original = f.input.shadow.remote.expectedReceipts
+  ;(f.input.shadow.remote as { expectedReceipts: typeof original }).expectedReceipts = [...original].reverse()
+  assert.equal((await f.inspect()).observation, "complete-destination-matches-shadow-uncommitted")
+})
+
+test("D178 changing Source reader or publication evidence during Git blob scan denies observation", async () => {
+  for (const cause of ["source-reader", "publication"] as const) {
+    const f = await d178Scenario()
+    const getBlob = f.gh.getBlob
+    let modified = false
+    f.gh.getBlob = async (sha: string) => {
+      const bytes = await getBlob(sha)
+      if (!modified) {
+        modified = true
+        if (cause === "source-reader") {
+          f.input.branches.readers.source.getGitCommit = async () => ({
+            sha: pinned, treeSha: sourceTree, parentShas: ["1".repeat(40)], message: "swapped",
+          })
+        } else {
+          (f.input.branches.publication as { verifiedPlaintextBytes: string }).verifiedPlaintextBytes = "1"
+        }
+      }
+      return bytes
+    }
+    const writes = f.s.getWrites()
+    assert.equal((await f.inspect()).observation, "manual-recovery-required", cause)
+    assert.equal(modified, true)
+    assert.equal(f.s.getWrites(), writes)
+  }
+})
 
 test("D175 verified remote Destination binds to a Shadow beside the unchanged runtime Source root", async () => {
   const s = await d137Scenario(V4_RUNTIME_INDEX_ROOT)
@@ -294,6 +525,7 @@ test("D137 verified immutable remote plaintext and all committed records bind to
     integrityScope: "read-only-verified-git-content-to-local-shadow",
     observation: "shadow-matches-verified-destination-uncommitted",
     destinationRepoId: destination, destinationCommitSha: rootSha, verifiedFileCount: 3,
+    verifiedPlaintextBytes: String(14 + 8 * 1024 * 1024 + 13),
     localCutoverAuthorized: false, resumeSyncAuthorized: false,
     remoteWritesAuthorized: false, oldPassphraseCleanupAuthorized: false,
   })

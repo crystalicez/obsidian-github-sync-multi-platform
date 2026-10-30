@@ -28,6 +28,8 @@ export interface V4ReencryptionShadowRemoteBindingReport {
   readonly destinationRepoId: string
   readonly destinationCommitSha: string
   readonly verifiedFileCount: number
+  /** Computed from fully decrypted Git content, never a historical report. */
+  readonly verifiedPlaintextBytes: string
   readonly localCutoverAuthorized: false
   readonly resumeSyncAuthorized: false
   readonly remoteWritesAuthorized: false
@@ -182,6 +184,7 @@ export async function verifyV4ReencryptionShadowAgainstDestination(
     destinationRepoId: plan.destinationRepoId,
     destinationCommitSha: scope.destinationCommitSha,
     verifiedFileCount: expectedRecords.length,
+    verifiedPlaintextBytes: verified.totalVerifiedPlaintextBytes,
     localCutoverAuthorized: false,
     resumeSyncAuthorized: false,
     remoteWritesAuthorized: false,

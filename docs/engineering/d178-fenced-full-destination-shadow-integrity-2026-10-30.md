@@ -1,0 +1,29 @@
+# D178 — Fenced complete Destination Git content versus immutable Shadow
+
+Date: 2026-10-30. Status: **read-only internal migration verification**, not committed cutover. First-release Wizard remains **Preview-only** and its release gate **blocked**.
+
+## Goal
+
+D177 independently re-read Source, frozen Backup and zero-parent Destination Git refs/commit trees twice under an encrypted WAL and D173 Sync Fence. However, current ref/commit checks cannot replace complete remote ciphertext and plaintext verification. An earlier D100 publication report is historical, not proof that current Destination objects still match the local encrypted Shadow.
+
+D178 composes the existing **D177 remote-ref/Fence/WAL read-only gate** and **D137/D83 full encrypted Git destination content/Shadow binding** under **one outer cooperative initiating-device lease**. It neither publishes remote refs nor installs a Selector.
+
+## Implemented
+
+- New `src/lib/v4/reencryption-fenced-full-shadow-verification.ts` exports `inspectV4FencedFullRemoteShadowAfterRestart()` and the explicit `V4FencedFullRemoteShadowReport`. It checks exact D142 run, branch/commit/tree/device/index-root identities and physical repo; requires the *same concrete Destination GitHub reader object* for D177 and D137, not one reader for refs and a second unrelated reader for content. Source and Backup readers and publication values/method references are pinned across the entire full-content read.
+- Within the **same outer cooperative lease**, it validates the canonical D173 Fence, uses D177 for fresh Git ref/commit, authenticated D165 best-effort WAL and physical repo/default-branch checks, and binds all D137 expected ciphertext receipts by path, Git SHA and byte length to the authenticated WAL receipts (unique path set, no unresolved WAL intents). Receipt ordering alone cannot cause a false rejection.
+- Calls D137 against the real plugin-private `github-sync-v4-index-rekey-<run>` Shadow. D137 performs full D83 verification of *every Destination Git object*: exact zero-parent orphan Commit/Tree, V4 config, AES-GCM encrypted HEAD/shards, committed records, ciphertext Git Blob SHA, new-passphrase decryption, and every plaintext file SHA-256 and length. It independently reloads Shadow before/after the remote scan and requires no local Index/Settings write. D178 now also compares D137's **verified decrypted plaintext byte total** with the D100 publication report, not merely its file count.
+- After the full content scan D178 **rechecks** the same Fence, all three remote refs/commit trees under D177, authenticated WAL and same receipts. A moved Source/Backup/Destination ref, swapped Git reader method, mutated publication, remote corrupt blob, changed Shadow, lost WAL or foreign Fence returns `manual-recovery-required`. All returned permissions, including `localCutoverAuthorized`, `resumeSyncAuthorized`, `rollbackAuthorized`, `remoteWritesAuthorized` and `oldPassphraseCleanupAuthorized`, remain **false**.
+- D137's original strict entrypoint is preserved. This D178 read-only composition supplies an explicitly documented best-effort WAL readback checkpoint for D137's read-only boundaries. **This is not an independent physical crash-durability guarantee**, especially under Windows Node's unsupported directory fsync. Do not pass these readback results to any future committing API as a proof of physical fsync.
+
+## Tested
+
+Five new D178 scenarios are added to the existing authentic encrypted destination verification suite (`tests/v4/reencryption-destination-exact-commit.test.ts`). They construct **actual AES-GCM encrypted metadata and blobs** (Unicode/empty/chunked cases), a local Shadow beside the real Runtime Source root, a canonical D173 Fence, D142 prepared WAL snapshot and three independent mock branch readers. They verify complete content under the lease with zero remote/local writes; corrupt ciphertext, mismatched Shadow header, forged historical byte count, missing authenticated WAL receipt, tampered Fence and wrong new passphrase fail closed; moving the Destination ref during the Git scan fails closed; permuted equivalent WAL receipts still verify; substituting the Source reader or modifying publication evidence mid-read is detected.
+
+Existing D83, D137, D138, D143, D175–D177 tests continue passing. **Full Fast 1169/1169 PASS**, Recovery, Feasibility, Resource **11/11**, Maximum Strict TypeScript, Production Build, GitHub E2E compile-only **3 bundles**, metadata/package validation and the bounded **100,000,000-byte** SHA-256 soak all PASS. No credentialed live GitHub migration, installed Desktop/Mobile Obsidian acceptance or physical power-cut simulation in D178.
+
+## Remaining release blockers
+
+The report's scope is deliberately **full Destination content against Shadow**; it does **not** freshly re-download/decrypt the frozen Backup's complete content. Source and Backup remote refs and pinned Commit/Trees are revalidated under D177, backed by D100 historical full Backup verification, but this is not equivalent to re-running the complete Backup content verifier. This module does **not** yet combine the installed D174 Sync quiescence preflight with the D170 Local Intent, D176 Prepared Selector, full D138 Source/settings/SecretStorage evidence or the live Wizard Run, although each has separate internal tests.
+
+An independently authenticated **committed** Selector/Receipt, best-effort crash-window ordering of Settings/SecretStorage/active Index, multi-device constraints, Manual Recovery UX and installed acceptance remain unimplemented. The one-process/cooperative lease does not exclude foreign writers or make physical power-loss durability guaranteed. No automatic Fence unarm, Sync resume, branch cleanup, old-passphrase deletion, Native Helper, GitHub Actions, release or merge. Keep `docs/release-gates/reencryption-wizard.json` at `blocked`.
