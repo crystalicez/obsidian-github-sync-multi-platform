@@ -2,7 +2,7 @@ import assert from "node:assert/strict"
 import test from "node:test"
 import { mkdir, mkdtemp, rm } from "node:fs/promises"
 import { join } from "node:path"
-import { createEmptyV4LocalIndex, saveV4LocalIndex, type V4LocalIndexAdapter } from "../../src/lib/v4/local-index"
+import { createEmptyV4LocalIndex, loadV4LocalIndex, saveV4LocalIndex, type V4LocalIndexAdapter } from "../../src/lib/v4/local-index"
 import { prepareV4ReencryptionLocalCutoverIntent } from "../../src/lib/v4/reencryption-local-cutover-intent"
 import { stageV4BestEffortPreparedSelectorEvidence, inspectV4BestEffortPreparedSelectorAfterRestart } from "../../src/lib/v4/reencryption-prepared-selector-stage"
 import {
@@ -13,6 +13,8 @@ import { planV4ReencryptionSeparatedRoots } from "../../src/lib/v4/reencryption-
 import { V4_RUNTIME_INDEX_ROOT } from "../../src/lib/v4/reencryption-index-root"
 import { armV4ReencryptionSyncFence, assertV4ReencryptionSyncFenceClear, V4_REENCRYPTION_SYNC_FENCE_ROOT } from "../../src/lib/v4/reencryption-sync-fence"
 import { stageV4FencedBestEffortPreparedSelector, inspectV4FencedBestEffortPreparedSelectorAfterRestart } from "../../src/lib/v4/reencryption-fenced-prepared-selector"
+import { inspectV4FencedLocalCrashTriageAfterRestart } from "../../src/lib/v4/reencryption-fenced-local-crash-triage"
+import { sealV4ReencryptionSeparatedSelectorTestVector } from "../../src/lib/v4/reencryption-separated-selector-prototype"
 import { acquireV4DesktopRekeyWalStorage } from "../../src/lib/v4/reencryption-desktop-wal"
 import { createV4ReencryptionRecoveryJournal, type V4ReencryptionJournalSnapshot } from "../../src/lib/v4/reencryption-recovery-journal"
 import type { V4ReencryptionProposedCommitIdentity } from "../../src/lib/v4/reencryption-proposed-commit-receipt"
@@ -161,6 +163,157 @@ async function armFixtureFence(s: ReturnType<typeof fixture>): Promise<void> {
     })
   })
 }
+
+async function d180Fixture() {
+  const s = fixture(V4_RUNTIME_INDEX_ROOT)
+  await s.seed()
+  await armFixtureFence(s)
+  await stageV4FencedBestEffortPreparedSelector(s.input())
+  return s
+}
+
+const d180Prepared = V4_RUNTIME_INDEX_ROOT + "-rekey-selector-" + identity.runId + "/prepared.json"
+const d180Selector = V4_RUNTIME_INDEX_ROOT + "-rekey-selector-" + identity.runId + "/selector.json"
+const d180Intent = V4_RUNTIME_INDEX_ROOT + "-rekey-intent-" + identity.runId + "/intent.json"
+const d180Proposed = V4_RUNTIME_INDEX_ROOT + "-rekey-proposed-" + identity.runId
+
+test("D180 read-only crash triage authenticates Source/Fence/Intent/Prepared/WAL with no repair or Sync", async () => {
+  const s = await d180Fixture()
+  const beforeFiles = new Map(s.files)
+  const beforeDirs = new Set(s.dirs)
+  const beforeWrites = s.writes.length
+  const result = await inspectV4FencedLocalCrashTriageAfterRestart(s.input())
+  assert.deepEqual(result, {
+    integrityScope: "read-only-fenced-local-crash-triage-uncommitted",
+    evidence: "best-effort-wal-readback-not-power-loss-durable",
+    observation: "source-prepared-uncommitted",
+    reason: "source-still-selected",
+    localCutoverAuthorized: false, resumeSyncAuthorized: false,
+    rollbackAuthorized: false, remoteWritesAuthorized: false,
+    oldPassphraseCleanupAuthorized: false,
+  })
+  assert.equal(Object.isFrozen(result), true)
+  assert.deepEqual(s.files, beforeFiles)
+  assert.deepEqual(s.dirs, beforeDirs)
+  assert.equal(s.writes.length, beforeWrites)
+  await assert.rejects(() => assertV4ReencryptionSyncFenceClear(s.adapter))
+})
+
+test("D180 destination-looking state still has no commit authority or old-key cleanup", async () => {
+  const s = await d180Fixture()
+  const shadow = await loadV4LocalIndex(s.adapter, V4_RUNTIME_INDEX_ROOT + "-rekey-" + identity.runId)
+  await saveV4LocalIndex(s.adapter, V4_RUNTIME_INDEX_ROOT, shadow)
+  s.settings.githubBranch = "rekey/2026"
+  s.settings.encryptionPassphraseSecretId = "new-secret"
+  const before = new Map(s.files)
+  const writes = s.writes.length
+  const report = await inspectV4FencedLocalCrashTriageAfterRestart(s.input())
+  assert.equal(report.observation, "destination-observed-without-commit-proof")
+  assert.equal(report.reason, "destination-looking-without-authoritative-commit")
+  assert.equal(report.resumeSyncAuthorized, false)
+  assert.equal(report.rollbackAuthorized, false)
+  assert.equal(report.oldPassphraseCleanupAuthorized, false)
+  assert.deepEqual(s.files, before)
+  assert.equal(s.writes.length, writes)
+  assert.equal(s.secrets.get("old-secret"), "old-value")
+  await assert.rejects(() => assertV4ReencryptionSyncFenceClear(s.adapter))
+})
+
+test("D180 both interrupted Settings-first and Index-first windows need Manual Recovery", async () => {
+  for (const phase of ["settings-first", "index-first"] as const) {
+    const s = await d180Fixture()
+    if (phase === "settings-first") {
+      s.settings.githubBranch = "rekey/2026"
+      s.settings.encryptionPassphraseSecretId = "new-secret"
+    } else {
+      const shadow = await loadV4LocalIndex(s.adapter, V4_RUNTIME_INDEX_ROOT + "-rekey-" + identity.runId)
+      await saveV4LocalIndex(s.adapter, V4_RUNTIME_INDEX_ROOT, shadow)
+    }
+    const before = new Map(s.files)
+    const writes = s.writes.length
+    const report = await inspectV4FencedLocalCrashTriageAfterRestart(s.input())
+    assert.equal(report.observation, "manual-recovery-required", phase)
+    assert.equal(report.reason, "mixed-or-changed-local-state", phase)
+    assert.equal(report.localCutoverAuthorized, false)
+    assert.deepEqual(s.files, before)
+    assert.equal(s.writes.length, writes)
+  }
+})
+
+test("D180 even a valid-looking future Selector or proposed Commit marker is unexpected residue, never authority", async () => {
+  for (const kind of ["authenticated-selector", "proposed-root", "marker-only"] as const) {
+    const s = await d180Fixture()
+    if (kind === "authenticated-selector") {
+      s.files.set(d180Selector,
+        await sealV4ReencryptionSeparatedSelectorTestVector(s.input().identity, s.key))
+    } else if (kind === "proposed-root") {
+      s.dirs.add(d180Proposed)
+    } else {
+      s.files.set(d180Proposed + "/marker.json", "garbage")
+    }
+    const before = new Map(s.files)
+    const writes = s.writes.length
+    const report = await inspectV4FencedLocalCrashTriageAfterRestart(s.input())
+    assert.equal(report.observation, "manual-recovery-required", kind)
+    assert.equal(report.reason, "unrecognized-selector-or-commit-artifact", kind)
+    assert.equal(report.resumeSyncAuthorized, false)
+    assert.equal(report.rollbackAuthorized, false)
+    assert.deepEqual(s.files, before)
+    assert.equal(s.writes.length, writes)
+  }
+})
+
+test("D180 missing or altered Prepared Selector/Intent or corrupt WAL/Fence always fails closed", async () => {
+  for (const kind of ["missing-prepared", "forged-prepared", "torn-intent",
+    "wrong-intent-sha", "stale-wal", "lost-fence", "foreign-fence", "missing-secret"] as const) {
+    const s = await d180Fixture()
+    if (kind === "missing-prepared") s.files.delete(d180Prepared)
+    if (kind === "forged-prepared") s.files.set(d180Prepared, "valid-base64-but-wrong")
+    if (kind === "torn-intent") s.files.set(d180Intent, "{")
+    if (kind === "wrong-intent-sha") {
+      const intent = s.files.get(d180Intent)!
+      s.files.set(d180Intent, intent.replace(/"recordSha256":"[a-f0-9]{64}"/u,
+        '"recordSha256":"' + "0".repeat(64) + '"'))
+    }
+    if (kind === "stale-wal") s.setWal({ ...s.walSnapshot(), generation: 999 })
+    if (kind === "lost-fence") s.files.delete(fenceMarker)
+    if (kind === "foreign-fence") s.files.set(fenceMarker,
+      s.files.get(fenceMarker)!.replace(identity.runId, "run_d180_foreign"))
+    if (kind === "missing-secret") s.secrets.delete("old-secret")
+    const before = new Map(s.files)
+    const writes = s.writes.length
+    const report = await inspectV4FencedLocalCrashTriageAfterRestart(s.input())
+    assert.equal(report.observation, "manual-recovery-required", kind)
+    assert.equal(report.localCutoverAuthorized, false)
+    assert.equal(report.resumeSyncAuthorized, false)
+    assert.equal(report.oldPassphraseCleanupAuthorized, false)
+    assert.deepEqual(s.files, before)
+    assert.equal(s.writes.length, writes)
+  }
+})
+
+test("D180 asynchronous SecretStorage or Settings mutation while reading Prepared evidence is detected", async () => {
+  for (const cause of ["settings", "secret"] as const) {
+    const s = await d180Fixture()
+    const originalRead = s.adapter.read
+    let changed = false
+    s.adapter.read = async path => {
+      const value = await originalRead(path)
+      if (path === d180Prepared && !changed) {
+        changed = true
+        if (cause === "settings") s.settings.githubBranch = "rekey/2026"
+        else s.secrets.set("new-secret", "new-key-changed-mid-read")
+      }
+      return value
+    }
+    const writes = s.writes.length
+    const report = await inspectV4FencedLocalCrashTriageAfterRestart(s.input())
+    assert.equal(changed, true)
+    assert.equal(report.observation, "manual-recovery-required")
+    assert.equal(report.resumeSyncAuthorized, false)
+    assert.equal(s.writes.length, writes)
+  }
+})
 
 test("D176 exact fence binding permits only prepared evidence, never committed Cutover", async () => {
   const s = fixture(V4_RUNTIME_INDEX_ROOT)
@@ -437,7 +590,7 @@ test("D172 changed Source Settings or encrypted evidence during awaited checkpoi
   assert.equal(await s.adapter.exists(roots.selectorPath), false)
 })
 
-test("D172 real Windows encrypted WAL backs staged selector while only isolated local evidence changes", async () => {
+test("D172/D180 real Windows WAL reopened under a fresh lease permits read-only fenced crash triage", async () => {
   const parent = join(process.cwd(), ".tmp")
   await mkdir(parent, { recursive: true })
   const directory = await mkdtemp(join(parent, "d172-prepared-"))
@@ -470,6 +623,7 @@ test("D172 real Windows encrypted WAL backs staged selector while only isolated 
       const s = fixture()
       staged = s
       await s.seed()
+      await armFixtureFence(s)
       const before = new Map(s.files)
       const input = s.input()
       input.restart.journal = journal
@@ -505,6 +659,17 @@ test("D172 real Windows encrypted WAL backs staged selector while only isolated 
       assert.equal(report.resumeSyncAuthorized, false)
       assert.equal(report.localCutoverAuthorized, false)
       assert.deepEqual(staged.files, before)
+      const triage = await inspectV4FencedLocalCrashTriageAfterRestart(input)
+      assert.equal(triage.observation, "source-prepared-uncommitted")
+      assert.equal(triage.reason, "source-still-selected")
+      assert.equal(triage.localCutoverAuthorized, false)
+      assert.equal(triage.resumeSyncAuthorized, false)
+      assert.deepEqual(staged.files, before)
+      staged.files.set(roots.selectorPath, "unexpected commit-looking residue")
+      const ambiguous = await inspectV4FencedLocalCrashTriageAfterRestart(input)
+      assert.equal(ambiguous.observation, "manual-recovery-required")
+      assert.equal(ambiguous.reason, "unrecognized-selector-or-commit-artifact")
+      await assert.rejects(() => assertV4ReencryptionSyncFenceClear(staged!.adapter))
     } finally { await reopened.release() }
   } finally { await rm(directory, { recursive: true, force: true }) }
 })
