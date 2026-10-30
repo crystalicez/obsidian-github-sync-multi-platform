@@ -16,6 +16,9 @@ import type { V4FencedThreeBranchRevalidationInput } from "../../src/lib/v4/reen
 import type { V4ReencryptionProposedCommitIdentity } from "../../src/lib/v4/reencryption-proposed-commit-receipt"
 import type { V4ThreeBranchPublicationReport } from "../../src/lib/v4/reencryption-three-branch-publish"
 import { inspectV4ReencryptionCrossSurfaceProof } from "../../src/lib/v4/reencryption-cross-surface-proof"
+import { inspectV4FencedPrecommitReadinessAfterRestart } from "../../src/lib/v4/reencryption-fenced-precommit-readiness"
+import { stageV4FencedBestEffortPreparedSelector } from "../../src/lib/v4/reencryption-fenced-prepared-selector"
+import type { V4BestEffortPreparedSelectorStageInput } from "../../src/lib/v4/reencryption-prepared-selector-stage"
 import { inspectV4ReencryptionLiveBackupCrossSurface } from "../../src/lib/v4/reencryption-live-backup-cross-surface"
 import { computeV4ReencryptionCandidateManifestDigest } from "../../src/lib/v4/reencryption-candidate-manifest-digest"
 import { prepareV4ReencryptionLocalCutoverIntent } from "../../src/lib/v4/reencryption-local-cutover-intent"
@@ -614,10 +617,10 @@ test("D137 changed scope before remote read and missing Shadow refuse verificati
 const d138Backup = "owner/repo#backup/run_d138"
 const d138Generation = 21
 
-async function d138Scenario() {
-  const s = await d137Scenario()
+async function d138Scenario(activeIndexRoot = "private/index", expectedDeviceId = "d83") {
+  const s = await d137Scenario(activeIndexRoot, expectedDeviceId)
   const shadow = s.input()
-  const sourceIndex = createEmptyV4LocalIndex({ repoId: original, deviceId: "d83", mode: "encrypted" })
+  const sourceIndex = createEmptyV4LocalIndex({ repoId: original, deviceId: expectedDeviceId, mode: "encrypted" })
   sourceIndex.remoteCommitSha = pinned
   await saveV4LocalIndex(s.adapter, shadow.activeIndexRoot, sourceIndex)
 
@@ -628,12 +631,12 @@ async function d138Scenario() {
     commitSha: rootSha, verifiedFileCount: 3,
     stagedCiphertextObjectCount: shadow.remote.expectedReceipts.length,
     encryptedMetadataObjectCount: 2 + Object.keys(s.f.head.shardHashes).length,
-    deviceId: "d83", journalId: "d138_journal", createdAt: 123,
+    deviceId: expectedDeviceId, journalId: "d138_journal", createdAt: 123,
     sourceAndBackupPreserved: true, rootHasZeroParents: true,
     backupProvenanceVerified: false, installedRestoreVerified: false,
     refPublished: false, cutoverAuthorized: false,
   }
-  const savedShadow = await loadV4LocalIndex(s.adapter, d137Shadow)
+  const savedShadow = await loadV4LocalIndex(s.adapter, activeIndexRoot + "-rekey-" + d137Run)
   const digest = computeV4ReencryptionCandidateManifestDigest({
     prepared, sourceTreeSha: sourceTree, destinationConfig: shadow.remote.expectedDestinationConfig,
     expectedReceipts: shadow.remote.expectedReceipts,
@@ -660,11 +663,11 @@ async function d138Scenario() {
   const secrets = new Map([["old-d138", "old-d138-secret"], ["new-d138", "new-d83-secret"]])
   const expected = {
     sourceRepoId: original, destinationRepoId: destination, destinationCommitSha: rootSha,
-    sourcePassphraseSecretId: "old-d138", destinationPassphraseSecretId: "new-d138", deviceId: "d83",
+    sourcePassphraseSecretId: "old-d138", destinationPassphraseSecretId: "new-d138", deviceId: expectedDeviceId,
   }
   const settings = {
     githubOwner: "owner", githubRepo: "repo", githubBranch: "main",
-    encryptionMode: "encrypted", encryptionPassphraseSecretId: "old-d138", vault: "d83",
+    encryptionMode: "encrypted", encryptionPassphraseSecretId: "old-d138", vault: expectedDeviceId,
   }
   const restart = {
     runId: d137Run, indexRoot: shadow.activeIndexRoot, expected, settings,
@@ -679,7 +682,7 @@ async function d138Scenario() {
     sourceRepoId: original, backupRepoId: d138Backup, destinationRepoId: destination,
     sourceCommitSha: pinned, destinationCommitSha: rootSha,
     sourcePassphraseSecretId: "old-d138", destinationPassphraseSecretId: "new-d138",
-    deviceId: "d83", walGeneration: d138Generation,
+    deviceId: expectedDeviceId, walGeneration: d138Generation,
     assertExclusiveInitiatorLease: shadow.assertExclusiveInitiatorLease,
     assertCrashDurable: shadow.assertCrashDurable,
   })
@@ -699,6 +702,181 @@ async function d138Scenario() {
     holderCounts: () => ({ calls: holderCalls, held }),
   }
 }
+
+async function d179Scenario() {
+  const s = await d138Scenario(V4_RUNTIME_INDEX_ROOT, "device_d178")
+  s.setWal({ ...s.getWal(), receipts: s.shadow.remote.expectedReceipts.map(r => ({ ...r })) })
+  const exclusive = s.input().withExclusiveInitiatorLease
+  const lease = async () => { assert.equal(s.holderCounts().held, true) }
+  const wal = {
+    async assertExclusiveStageLease() { await lease() },
+    async assertBestEffortCheckpoint() {
+      await lease()
+      return "best-effort-readback-only" as const
+    },
+  }
+  const id: V4ReencryptionProposedCommitIdentity = {
+    runId: d137Run, walGeneration: d138Generation, indexRoot: V4_RUNTIME_INDEX_ROOT,
+    deviceId: "device_d178", sourceRepoId: original, backupRepoId: d138Backup,
+    destinationRepoId: destination, sourceCommitSha: pinned, sourceTreeSha: sourceTree,
+    destinationCommitSha: rootSha, destinationTreeSha: treeSha,
+    manifestSha256: s.getWal().preparedCandidateReceipt!.manifestSha256,
+    sourcePassphraseSecretId: "old-d138", destinationPassphraseSecretId: "new-d138",
+  }
+  const client = Object.assign(s.f.github, {
+    branchName: "rekey/d83",
+    async getRepositoryDefaultBranch() { await lease(); return "main" },
+    async getGitRefOrNull() { await lease(); return s.f.github.getGitRef() },
+  })
+  type Reader = V4FencedThreeBranchRevalidationInput["readers"]["source"]
+  const reader = (repoId: string): Reader => {
+    const branch = repoId.split("#")[1]!
+    return {
+      branchName: branch,
+      async getRepositoryIdentity() { await lease(); return { id: 88, fullName: "owner/repo" } },
+      async getRepositoryDefaultBranch() { await lease(); return "main" },
+      async getGitRefOrNull() {
+        await lease()
+        return { ref: "refs/heads/" + branch, type: "commit" as const, sha: pinned }
+      },
+      async getGitCommit() {
+        await lease()
+        return { sha: pinned, treeSha: sourceTree,
+          parentShas: ["1".repeat(40)], message: "source" }
+      },
+    } as Reader
+  }
+  const publication: V4ThreeBranchPublicationReport = {
+    integrityScope: "three-branch-verified-backup-and-destination-remote-only",
+    sourceRepoId: original, backupRepoId: d138Backup, destinationRepoId: destination,
+    originalSourceCommitSha: pinned, destinationCommitSha: rootSha,
+    verifiedFileCount: 3, verifiedPlaintextBytes: d178Bytes,
+    backupContentsReadbackVerified: true, backupScratchRoundTripVerified: true,
+    destinationContentsReadbackVerified: true, oldBranchSyncRemainsIndependent: true,
+    powerLossDurabilityIndependentlyAudited: false, initiatingDeviceCutoverAuthorized: false,
+  }
+  const readers = {
+    source: reader(original), backup: reader(d138Backup),
+    destination: client as unknown as Reader,
+  }
+  const branches: V4FencedThreeBranchRevalidationInput = {
+    identity: id, publication, readers, physicalRepositoryId: 88,
+    adapter: s.adapter, wal, journal: s.journal,
+    acknowledgement: "accept-best-effort-power-loss-recovery-risk",
+    assertExclusiveInitiatorLease: lease, withExclusiveInitiatorLease: exclusive,
+  }
+  const shadow = { ...s.shadow, assertExclusiveInitiatorLease: lease }
+  const restart = {
+    ...s.restart, assertExclusiveInitiatorLease: lease, wal,
+    acknowledgement: "accept-best-effort-power-loss-recovery-risk" as const,
+  }
+  const prepared: V4BestEffortPreparedSelectorStageInput = {
+    restart, identity: { ...id }, journalKey: new Uint8Array(32).fill(0x79),
+    withExclusiveInitiatorLease: exclusive,
+  }
+  await exclusive(async () => armV4ReencryptionSyncFence({
+    adapter: s.adapter, runId: id.runId, sourceRepoId: id.sourceRepoId,
+    destinationRepoId: id.destinationRepoId,
+    assertExclusiveInitiatorLease: lease,
+  }))
+  const staged = await stageV4FencedBestEffortPreparedSelector(prepared)
+  assert.equal(staged.status, "authenticated-prepared-selector-uncommitted")
+  const input = { full: { branches, shadow }, prepared, candidate: s.prepared }
+  return { s, id, input, publication, prepared, staged,
+    inspect: () => inspectV4FencedPrecommitReadinessAfterRestart(input) }
+}
+
+test("D179 encrypted Source/Intent/Secrets, D176 prepared Selector, D178 full Git content share one lease", async () => {
+  const f = await d179Scenario()
+  const before = new Map(f.s.files)
+  const writes = f.s.getWrites()
+  const count = f.s.holderCounts().calls
+  const report = await f.inspect()
+  assert.deepEqual(report, {
+    integrityScope: "read-only-fenced-source-wal-intent-secrets-full-git-and-prepared-selector",
+    observation: "all-prepared-surfaces-coherent-uncommitted",
+    evidence: "best-effort-wal-readback-not-power-loss-durable",
+    completeDestinationContentReverified: true,
+    localCutoverAuthorized: false, resumeSyncAuthorized: false,
+    rollbackAuthorized: false, remoteWritesAuthorized: false,
+    oldPassphraseCleanupAuthorized: false,
+  })
+  assert.deepEqual(f.s.files, before)
+  assert.equal(f.s.getWrites(), writes)
+  assert.deepEqual(f.s.holderCounts(), { calls: count + 1, held: false })
+  assert.ok(f.s.f.reads >= 8)
+  assert.equal(f.s.secrets.get("old-d138"), "old-d138-secret")
+  assert.equal(f.s.restart.settings.githubBranch, "main")
+  assert.equal(f.s.files.has(V4_RUNTIME_INDEX_ROOT + "-rekey-selector-" + d137Run + "/selector.json"), false)
+})
+
+test("D179 altered Intent, Source settings, Secrets, prepared evidence and WAL always block Cutover", async () => {
+  for (const cause of ["intent", "source", "secret", "prepared", "wal", "candidate", "fence"] as const) {
+    const f = await d179Scenario()
+    if (cause === "intent") {
+      const path = V4_RUNTIME_INDEX_ROOT + "-rekey-intent-" + d137Run + "/intent.json"
+      f.s.files.set(path, "{tampered")
+    }
+    if (cause === "source") f.s.restart.settings.githubBranch = "unrelated"
+    if (cause === "secret") f.s.secrets.set("new-d138", "wrong-new-key")
+    if (cause === "prepared") f.s.files.set(f.staged.evidencePath, "not-authenticated")
+    if (cause === "wal") f.s.setWal({ ...f.s.getWal(), generation: d138Generation + 1 })
+    if (cause === "candidate") {
+      (f.input as { candidate: V4PreparedOrphanCommit }).candidate =
+        { ...f.s.prepared, treeSha: "8".repeat(40) }
+    }
+    if (cause === "fence") {
+      f.s.files.set(V4_REENCRYPTION_SYNC_FENCE_ROOT + "/active.json", "{missing")
+    }
+    const writes = f.s.getWrites()
+    assert.equal((await f.inspect()).observation, "manual-recovery-required", cause)
+    assert.equal(f.s.getWrites(), writes, cause)
+    assert.equal(f.s.holderCounts().held, false)
+  }
+})
+
+test("D179 Source Secret changes during authenticated Git read and cannot certify prepared evidence", async () => {
+  const f = await d179Scenario()
+  const getBlob = f.s.f.github.getBlob
+  let changed = false
+  f.s.f.github.getBlob = async sha => {
+    const bytes = await getBlob(sha)
+    if (!changed) {
+      changed = true
+      f.s.secrets.set("new-d138", "secret-changed-during-fetch")
+    }
+    return bytes
+  }
+  const before = f.s.getWrites()
+  assert.equal((await f.inspect()).observation, "manual-recovery-required")
+  assert.equal(changed, true)
+  assert.equal(f.s.getWrites(), before)
+  assert.equal(f.s.holderCounts().held, false)
+})
+
+test("D179 Source Index modified during remote scan invalidates all local proof without Cutover", async () => {
+  const f = await d179Scenario()
+  const getBlob = f.s.f.github.getBlob
+  let changed = false
+  f.s.f.github.getBlob = async sha => {
+    const bytes = await getBlob(sha)
+    if (!changed) {
+      changed = true
+      const index = await loadV4LocalIndex(f.s.adapter, V4_RUNTIME_INDEX_ROOT)
+      index.epoch++
+      await saveV4LocalIndex(f.s.adapter, V4_RUNTIME_INDEX_ROOT, index)
+    }
+    return bytes
+  }
+  const before = f.s.getWrites()
+  const report = await f.inspect()
+  assert.equal(changed, true)
+  assert.equal(report.observation, "manual-recovery-required")
+  assert.equal(report.localCutoverAuthorized, false)
+  assert.equal(report.resumeSyncAuthorized, false)
+  assert.equal(f.s.getWrites(), before + 1)
+  assert.equal(f.s.holderCounts().held, false)
+})
 
 test("D138 uses one held lease to reconcile authenticated WAL, exact Intent, Source, Shadow, manifest and full Git content", async () => {
   const s = await d138Scenario()
