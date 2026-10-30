@@ -20,6 +20,9 @@ export const V4_OWNER_REENCRYPTION_DECISIONS = Object.freeze({
   backup: "separate-branch-in-original-github-repository",
   backupArchivePassword: "not-applicable",
   desktopWal: "nodejs-only-no-native-helper",
+  powerLossTestAcceptance: "simulation-only-best-effort",
+  physicalPowerLossGuaranteeClaimed: false,
+  unverifiedDurabilityMayAuthorizeCutover: false,
   oldBranchRetention: "delete-only-after-explicit-user-action",
   // A separate branch in the SAME repository shares the same failure domain.
   independentBackupProvidedByChoiceC: false,

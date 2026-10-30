@@ -4,6 +4,12 @@
 >
 > **Mandatory workflow rule:** Every AI session that makes a material change to code, tests, design decisions, branch/PR state, verification status, or next steps MUST update this file before ending or handing work off. GitHub is the source of truth.
 
+## 2026-10-30 Stage D163 — owner power-loss simulation-only acceptance (decision recorded; RELEASE BLOCKED)
+
+- **New owner direction superseding a narrow part of earlier strict physical qualification language:** No actual electrical power interruption or destructive hardware test for Re-encryption. Accept **simulation-only best-effort** coverage for sudden-power-loss fault behavior. Use deterministic torn/lost/reordered write fault injection, process termination/restart and simulated WAL/Selector, Settings, SecretStorage and local Index partial persistence; do not require a physical power-cut rig or claim the simulation proves physical durability.
+- **Preserved safety and scope:** No blind Git ref mutation replay, no unproved local Cutover, no unsafe old-passphrase/Source/Backup cleanup, no cross-branch force or unverified Recovery. Uncertain restart state retains evidence and requires manual Recovery. This is an owner decision on **test methods**, not an instruction to remove the runtime `assertCrashDurable()` barrier or to treat Windows Node `fsync EPERM` as durable; weakening actual persistence protocol requires a separate explicit owner decision. No GitHub Actions/Native Helper, no real user Vault writes. Re-encryption Wizard Preview-only and checked-in release gate `blocked` until complete implementation and other acceptance checks.
+- **Recorded in:** `src/lib/v4/reencryption-owner-decisions.ts`, pinned test `tests/v4/reencryption-owner-decisions.test.ts`, and `docs/engineering/d163-owner-simulation-only-power-loss-acceptance-2026-10-30.md`. Keep D86/D140/D141/D149 evidence and limits intact; no physical power-loss guarantee is claimed.
+
 ## 2026-10-30 Stage D162 — requestUrl thrown-exception trust-boundary hardening (delivered locally; RELEASE BLOCKED)
 
 - **Owner direction:** Continue Production hardening from D161 on real Windows worktree `.worktrees/d87-owner-rekey-policy`; preserve strict Crash-safe Re-encryption, Node.js-first, no GitHub Actions, Native Helper or unapproved release. Do not trust an adapter-thrown exception as an authoritative HTTP response or expose private raw Error fields to user-facing Sync Status. Preserve read-only immutable commit fallback.
