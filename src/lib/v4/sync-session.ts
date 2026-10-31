@@ -1,5 +1,6 @@
 import { randomBytes, sha256Hex, toBase64Url, utf8ToBytes } from "../bytes"
 import type { GitHubTree } from "../github-api"
+import type { GitHubGitCommit } from "../github-git-types"
 import { evaluateV4ChangeGuard } from "./change-guard"
 import { canAttemptV4TextMerge, resolveV4Conflict, type V4ConflictPolicy, type V4ConflictResolution } from "./conflicts"
 import type { V4Keyring } from "./crypto"
@@ -360,7 +361,8 @@ export class V4SyncSession {
       let commit = tip
       let head = remote.head
       let precedingHead: V4RemoteHead | undefined
-      let verifiedRoot: { sha: string; head: V4RemoteHead } | undefined
+      let precedingCommit: GitHubGitCommit | undefined
+      let verifiedRoot: { sha: string; treeSha: string; head: V4RemoteHead } | undefined
       const unchangedThroughHistory = new Set(Object.keys(remote.head.shardHashes))
       let hasCoherentPluginAdvance = false
       for (let remaining = remote.head.generation; remaining > 0; remaining--) {
@@ -368,7 +370,7 @@ export class V4SyncSession {
         if (commit.message?.split("\n", 1)[0] !== `obsidian-sync-v4:${head.journalId}`) break
         if (commit.parentShas.length === 0) {
           hasCoherentPluginAdvance = !baseCommitSha && head.generation === 1
-          if (hasCoherentPluginAdvance) verifiedRoot = { sha: commit.sha, head }
+          if (hasCoherentPluginAdvance) verifiedRoot = { sha: commit.sha, treeSha: commit.treeSha, head }
           break
         }
         if (commit.parentShas.length !== 1) break
@@ -379,7 +381,7 @@ export class V4SyncSession {
             const bootstrap = await this.input.github.getGitCommit(parentSha)
             hasCoherentPluginAdvance = bootstrap.parentShas.length === 0
               && bootstrap.message === "obsidian-sync-v4:bootstrap"
-            if (hasCoherentPluginAdvance) verifiedRoot = { sha: commit.sha, head }
+            if (hasCoherentPluginAdvance) verifiedRoot = { sha: commit.sha, treeSha: commit.treeSha, head }
           }
           break
         }
@@ -396,7 +398,9 @@ export class V4SyncSession {
           break
         }
         head = parentHead
-        commit = await this.input.github.getGitCommit(parentSha)
+        const parentCommit = await this.input.github.getGitCommit(parentSha)
+        if (parentSha === tip.parentShas[0]) precedingCommit = parentCommit
+        commit = parentCommit
       }
       let tipTree: GitHubTree | undefined
       if (hasCoherentPluginAdvance) {
@@ -459,7 +463,9 @@ export class V4SyncSession {
           }
           if (stableRecords.length > 0) {
             const anchorSha = knownBase ? baseCommitSha! : tip.parentShas[0]!
-            const anchor = await this.input.github.getGitCommit(anchorSha)
+            const anchor = precedingCommit?.sha === anchorSha
+              ? precedingCommit
+              : await this.input.github.getGitCommit(anchorSha)
             const anchorTree = await this.input.github.getTreeAt(anchor.treeSha, true)
             assertV4CompleteRecursiveGitTree(anchorTree, anchor.treeSha, "V4 unchanged-blob anchor")
             const anchorBlobs = new Map(anchorTree.tree.filter(node => node.type === "blob").map(node => [node.path, node.sha]))
@@ -499,9 +505,8 @@ export class V4SyncSession {
               }
               if (rootStableRecords.length > 0) {
                 throwIfV4Aborted(this.input.signal)
-                const root = await this.input.github.getGitCommit(verifiedRoot.sha)
-                const rootTree = await this.input.github.getTreeAt(root.treeSha, true)
-                assertV4CompleteRecursiveGitTree(rootTree, root.treeSha, "V4 stable-record history anchor")
+                const rootTree = await this.input.github.getTreeAt(verifiedRoot.treeSha, true)
+                assertV4CompleteRecursiveGitTree(rootTree, verifiedRoot.treeSha, "V4 stable-record history anchor")
                 const rootBlobs = new Map(rootTree.tree.filter(node => node.type === "blob").map(node => [node.path, node.sha]))
                 hasCoherentPluginAdvance = rootStableRecords.every(record => {
                   const paths = record.storage === "chunked" ? record.partPaths ?? [] : [record.remotePath]

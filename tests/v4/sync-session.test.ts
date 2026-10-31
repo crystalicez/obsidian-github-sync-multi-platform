@@ -2868,7 +2868,14 @@ test("D200 encrypted first-time ancestry audit accepts 128, 129 and 257 valid ge
       github, vault, index, config: remoteConfig, keyring, conflictPolicy: "copy", abortChangePercent: 0,
     })
     github.treeReads.length = 0
+    const commitReads: string[] = []
+    const readCommit = github.getGitCommit.bind(github)
+    github.getGitCommit = async sha => {
+      commitReads.push(sha)
+      return readCommit(sha)
+    }
     await session().sync({ operation: "forcePull", allowThresholdOverride: false })
+    assert.equal(commitReads.length, count, "Fresh-device audit must read each verified generation commit exactly once")
     assert.ok(github.treeReads.length <= 3, "Long history must not require one recursive tree read per generation")
     assert.equal(dec(vault.files.get("note.md")!.bytes), "remote-newer")
     assert.equal(index.remoteCommitSha, previous)
