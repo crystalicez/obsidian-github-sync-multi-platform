@@ -26,6 +26,14 @@ const STEPS = [
   "Finish & switch",
 ] as const
 
+const SAFE_BRANCH_CHECK_ERRORS = new Set([
+  "Wizard settings changed during verification.",
+  "A proposed branch already exists. Choose unused branch names.",
+  "Repository identity changed.",
+  "Source branch or default branch changed. Return to Preflight and verify the source again.",
+  "Sync started during verification. Wait for it to finish and verify again.",
+])
+
 interface VerifiedSource {
   readonly physicalRepositoryId: number
   readonly defaultBranch: string
@@ -306,7 +314,7 @@ export class V4ReencryptionWizardModal extends Modal {
       }
     } catch (error) {
       if (!this.closed && !controller.signal.aborted && epoch === this.requestEpoch) {
-        this.errorMessage = error instanceof Error && /already exists|settings changed|identity changed|source branch or default branch changed|^Sync started during verification[.]/i.test(error.message)
+        this.errorMessage = error instanceof Error && SAFE_BRANCH_CHECK_ERRORS.has(error.message)
           ? error.message
           : "Branch verification failed. GitHub must confirm both names are unused."
       }

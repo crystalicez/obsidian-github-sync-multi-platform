@@ -2,6 +2,7 @@ import assert from "node:assert/strict"
 import test from "node:test"
 import { setRequestUrlHandler } from "obsidian"
 import type FastSync from "../../src/main"
+import { GitHubClient } from "../../src/lib/github-api"
 import { V4ReencryptionWizardModal } from "../../src/views/reencryption-wizard"
 
 function fakePlugin(
@@ -216,6 +217,7 @@ test("D153 Wizard branch availability rechecks exact pinned Source HEAD and defa
   for (const scenario of [
     "stable", "source-moved", "default-moved", "wrong-source-ref",
     "missing-source-ref", "source-request-fails", "repository-swapped", "destination-collision",
+    "untrusted-ref-error", "untrusted-repo-error",
   ] as const) {
     const plugin = fakePlugin()
     const wizard = new V4ReencryptionWizardModal(plugin)
@@ -248,6 +250,9 @@ test("D153 Wizard branch availability rechecks exact pinned Source HEAD and defa
       assert.equal(request.method, "GET", "Preview must never send a mutation")
       assert.equal(request.body, undefined, "Preview must never send request payloads")
       if (request.url.includes("/git/ref/heads/")) {
+        if (scenario === "untrusted-ref-error" && request.url.includes("/heads/rekey/")) {
+          throw new Error("A proposed branch already exists. source-token-never-render")
+        }
         if (request.url.includes("/heads/main?")) {
           if (scenario === "missing-source-ref") return respond({}, 404)
           if (scenario === "source-request-fails") return respond({}, 403)
@@ -263,6 +268,9 @@ test("D153 Wizard branch availability rechecks exact pinned Source HEAD and defa
           : respond({}, 404)
       }
       assert.match(request.url, /^https:\/\/api\.github\.com\/repos\/owner\/vault$/u)
+      if (scenario === "untrusted-repo-error") {
+        throw new Error("Repository identity changed. source-token-never-render")
+      }
       return respond({
         id: scenario === "repository-swapped" ? 999 : 444,
         full_name: "owner/vault",
@@ -284,6 +292,9 @@ test("D153 Wizard branch availability rechecks exact pinned Source HEAD and defa
         assert.equal(view.checked, undefined, scenario + " must not mark branch names ready")
         if (scenario === "source-moved" || scenario === "default-moved") {
           assert.match(text, /source again/i, "stale source must tell user to repeat verification")
+        }
+        if (scenario === "untrusted-ref-error" || scenario === "untrusted-repo-error") {
+          assert.match(text, /Branch verification failed. GitHub must confirm both names are unused/i)
         }
         assert.match(text, /Not checked|Check the destination/i)
       }
@@ -367,6 +378,56 @@ test("D188 Wizard refuses a backup or destination created during Source revalida
       wizard.onClose()
       setRequestUrlHandler(null)
     }
+  }
+})
+
+test("D189 Wizard never displays a credential-bearing GitHub client error as trusted review guidance", async () => {
+  const plugin = fakePlugin()
+  const wizard = new V4ReencryptionWizardModal(plugin)
+  const view = wizard as unknown as {
+    source: {
+      physicalRepositoryId: number; defaultBranch: string; pinnedSourceCommitSha: string;
+      verifiedFileCount: number; verifiedRemoteObjectCount: number;
+      totalVerifiedPlaintextBytes: string
+    }
+    step: number; render(): void; checkBranchAvailability(): Promise<void>
+    destinationBranch: string; backupBranch: string
+    newPassphrase: string; confirmPassphrase: string
+    checked?: { destinationRepoId: string }
+  }
+  view.source = {
+    physicalRepositoryId: 444, defaultBranch: "main",
+    pinnedSourceCommitSha: "a".repeat(40),
+    verifiedFileCount: 0, verifiedRemoteObjectCount: 0,
+    totalVerifiedPlaintextBytes: "0",
+  }
+  view.destinationBranch = "rekey/2026-10-31-a1b2c3d4"
+  view.backupBranch = "backup/rekey-2026-10-31-a1b2c3d4"
+  view.newPassphrase = "new-secret-never-render"
+  view.confirmPassphrase = "new-secret-never-render"
+  const originalReader = GitHubClient.prototype.getGitRefOrNull
+  GitHubClient.prototype.getGitRefOrNull = async () => {
+    throw new Error("A proposed branch already exists. source-token-never-render")
+  }
+  let networkCalls = 0
+  setRequestUrlHandler(async () => {
+    networkCalls++
+    throw Error("Unexpected network request during injected error.")
+  })
+  try {
+    wizard.onOpen()
+    view.step = 2
+    view.render()
+    await view.checkBranchAvailability()
+    const text = (wizard.contentEl as unknown as { flattenText(): string }).flattenText()
+    assert.equal(view.checked, undefined)
+    assert.match(text, /Branch verification failed. GitHub must confirm both names are unused/i)
+    assert.doesNotMatch(text, /source-token-never-render|new-secret-never-render/i)
+    assert.equal(networkCalls, 0)
+  } finally {
+    GitHubClient.prototype.getGitRefOrNull = originalReader
+    wizard.onClose()
+    setRequestUrlHandler(null)
   }
 })
 
