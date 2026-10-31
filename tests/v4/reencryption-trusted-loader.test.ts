@@ -220,6 +220,28 @@ test("D70 rejects missing or substituted metadata/content and never infers absen
   );
 });
 
+test("D190 Re-encryption source proof rejects a truncated tree even when every requested entry is present", async () => {
+  for (const truncatedTreeSha of [rootTreeSha, managedTreeSha]) {
+    const fixture = await createFixture();
+    const partial = {
+      ...fixture.github,
+      async getTreeAt(sha: string, recursive = true) {
+        const complete = await fixture.github.getTreeAt(sha, recursive);
+        return sha === truncatedTreeSha ? { ...complete, truncated: true } : complete;
+      },
+    };
+    await assert.rejects(
+      () => verifyGitHubReencryptionSource({
+        github: partial, expectedRepoId: repoId,
+        expectedBranch: validBranch, passphrase: "correct",
+      }),
+      /incomplete|truncated/i,
+      "Never certify full Source integrity using a truncated Git tree",
+    );
+    assert.equal(fixture.blobReads, 0, "No ciphertext can be trusted after a truncated ancestor tree");
+  }
+});
+
 test("D70 refuses a mismatched immutable Git commit or substituted tree identity", async () => {
   const f = await createFixture();
   const wrongCommit = { ...f.github, async getGitCommit(_sha: string) {

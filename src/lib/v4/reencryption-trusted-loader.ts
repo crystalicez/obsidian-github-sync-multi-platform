@@ -146,10 +146,11 @@ async function verifyGitHubReencryptionSnapshotAtRef(
     if (cached) return cached
     const tree = await input.github.getTreeAt(sha, false)
     throwIfV4Aborted(input.signal)
-    // A truncated tree cannot prove path absence and must never be cached.
     if (tree.sha !== sha) throw new Error("Re-encryption immutable Git tree identity mismatch.")
-    if (tree.truncated !== false || !Array.isArray(tree.tree)
-      || tree.tree.length > TREE_CACHE_MAX_SINGLE_NODES) return tree
+    if (tree.truncated !== false) {
+      throw new Error("Re-encryption immutable Git tree is incomplete or truncated.")
+    }
+    if (!Array.isArray(tree.tree) || tree.tree.length > TREE_CACHE_MAX_SINGLE_NODES) return tree
     while (cachedNodeCount + tree.tree.length > TREE_CACHE_MAX_NODES && treeCache.size) {
       const first = treeCache.keys().next().value
       if (first === undefined) break
