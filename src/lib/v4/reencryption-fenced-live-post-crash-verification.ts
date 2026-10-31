@@ -283,6 +283,10 @@ export async function inspectV4FencedLivePostCrashAfterRestart(
     })
     if (!unchanged() || result.integrityScope !== "read-only-fenced-post-crash-test-pair-window"
       || result.reason === "fence-wal-lease-or-storage-uncertain"
+      || result.artifactWindow === "unverifiable"
+      || result.artifactWindow === "unrecognized-layout"
+      || (result.artifactWindow === "pair-present"
+        && result.pairEvidence !== "cryptographically-linked-uncommitted")
       || result.localCutoverAuthorized !== false || result.resumeSyncAuthorized !== false) {
       throw Error("D185 local post-crash evidence uncertain.")
     }

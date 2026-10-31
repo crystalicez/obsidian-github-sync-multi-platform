@@ -1144,6 +1144,43 @@ test("D185 a Destination-looking Settings/Index cannot become an authorized comm
   assert.equal(f.s.getWrites(), writes)
 })
 
+test("D186 unrecognized or unauthenticated local commit artifacts must not advertise a complete live proof", async () => {
+  for (const cause of ["oversized-selector", "orphan-receipt", "invalid-pair"] as const) {
+    const f = await d179Scenario()
+    const { contract, pair } = await d183PreparedPair(f)
+    await d185PlacePairedEvidence(f, pair)
+    const root = V4_RUNTIME_INDEX_ROOT + "-rekey-proposed-" + f.id.runId
+    const selector = V4_RUNTIME_INDEX_ROOT + "-rekey-selector-" + f.id.runId + "/selector.json"
+    if (cause === "oversized-selector") {
+      f.s.adapter.stat = async path => ({
+        size: path === selector ? 64 * 1024 * 1024 : (f.s.files.get(path)?.length ?? 0),
+      })
+    } else if (cause === "orphan-receipt") {
+      const originalExists = f.s.adapter.exists
+      f.s.adapter.exists = async path => path === root ? false : originalExists(path)
+    } else {
+      f.s.files.set(selector, "invalid-AES-GCM-selector")
+    }
+    const writes = f.s.getWrites()
+    const files = new Map(f.s.files)
+    const gitReads = f.s.f.reads
+    const refReads = f.s.f.refs
+    const report = await inspectV4FencedLivePostCrashAfterRestart(d185Input(f, contract))
+    assert.equal(report.observation, "manual-recovery-required", cause)
+    assert.equal(report.reason, "local-or-live-git-proof-uncertain", cause)
+    assert.equal(report.local, null, cause)
+    assert.equal(report.fullDestinationContentReverifiedAfterRestart, false, cause)
+    assert.equal(report.liveThreeBranchRefsReverifiedAfterRestart, false, cause)
+    assert.equal(report.localCutoverAuthorized, false, cause)
+    assert.equal(report.resumeSyncAuthorized, false, cause)
+    assert.equal(f.s.f.reads, gitReads, cause)
+    assert.equal(f.s.f.refs, refReads, cause)
+    assert.equal(f.s.getWrites(), writes, cause)
+    assert.deepEqual(f.s.files, files, cause)
+    assert.equal(f.s.holderCounts().held, false, cause)
+  }
+})
+
 test("D185 remote Source, Backup or Destination ref drift and damaged encrypted Git Blob fail closed", async () => {
   for (const cause of ["source-ref", "backup-ref", "destination-ref", "blob", "non-orphan", "wal"] as const) {
     const f = await d179Scenario()
