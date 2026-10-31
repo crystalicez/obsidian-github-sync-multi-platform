@@ -17,6 +17,8 @@ import type { V4ReencryptionProposedCommitIdentity } from "../../src/lib/v4/reen
 import type { V4ThreeBranchPublicationReport } from "../../src/lib/v4/reencryption-three-branch-publish"
 import { inspectV4ReencryptionCrossSurfaceProof } from "../../src/lib/v4/reencryption-cross-surface-proof"
 import { inspectV4FencedPrecommitReadinessAfterRestart } from "../../src/lib/v4/reencryption-fenced-precommit-readiness"
+import { inspectV4FencedCrashWindowPairAfterRestart } from "../../src/lib/v4/reencryption-fenced-crash-window-pair-inspection"
+import { inspectV4FencedLocalCrashTriageAfterRestart } from "../../src/lib/v4/reencryption-fenced-local-crash-triage"
 import { deriveV4FencedCommitPairSnapshotTestContract, inspectV4FencedCommitPairSnapshotTestVectors } from "../../src/lib/v4/reencryption-fenced-commit-pair-snapshot-provenance"
 import { sealV4ReencryptionCommitPairTestVectors, type V4ReencryptionCommitPairTestContract } from "../../src/lib/v4/reencryption-commit-pair-test-vectors"
 import { stageV4FencedBestEffortPreparedSelector } from "../../src/lib/v4/reencryption-fenced-prepared-selector"
@@ -996,6 +998,39 @@ test("D183 transaction ID altered during an awaited Git Blob read cannot bind a 
   assert.equal(report.localCutoverAuthorized, false)
   assert.equal(f.s.getWrites(), writes)
   assert.equal(f.s.holderCounts().held, false)
+})
+
+test("D184 historical D183 full-Git-proven pair on local disk remains diagnostic-only after restart", async () => {
+  const f = await d179Scenario()
+  const { contract, pair } = await d183PreparedPair(f)
+  const proposed = V4_RUNTIME_INDEX_ROOT + "-rekey-proposed-" + f.id.runId
+  const selector = V4_RUNTIME_INDEX_ROOT + "-rekey-selector-" + f.id.runId + "/selector.json"
+  await f.s.adapter.mkdir(proposed)
+  await f.s.adapter.write(proposed + "/marker.json", pair.receiptTestVector)
+  await f.s.adapter.write(selector, pair.selectorTestVector)
+  const sourceSettings = { ...f.input.prepared.restart.settings }
+  const firstFiles = new Map(f.s.files)
+  const writes = f.s.getWrites()
+  const gitReads = f.s.f.reads
+  const calls = f.s.holderCounts().calls
+  const report = await inspectV4FencedCrashWindowPairAfterRestart({
+    prepared: f.prepared, contract, sourceSettings,
+  })
+  assert.equal(report.observation, "manual-recovery-required")
+  assert.equal(report.reason, "linked-test-pair-not-authoritative")
+  assert.equal(report.pairEvidence, "cryptographically-linked-uncommitted")
+  assert.equal(report.settingsSelection, "source")
+  assert.equal(report.activeIndexSelection, "source")
+  assert.equal(report.localCutoverAuthorized, false)
+  assert.equal(report.resumeSyncAuthorized, false)
+  assert.equal(report.oldPassphraseCleanupAuthorized, false)
+  assert.deepEqual(f.s.files, firstFiles)
+  assert.equal(f.s.getWrites(), writes)
+  assert.equal(f.s.f.reads, gitReads, "D184 historical witness is not live Git proof")
+  assert.deepEqual(f.s.holderCounts(), { calls: calls + 1, held: false })
+  const legacy = await inspectV4FencedLocalCrashTriageAfterRestart(f.prepared)
+  assert.equal(legacy.observation, "manual-recovery-required")
+  assert.equal(legacy.reason, "unrecognized-selector-or-commit-artifact")
 })
 
 test("D179 encrypted Source/Intent/Secrets, D176 prepared Selector, D178 full Git content share one lease", async () => {

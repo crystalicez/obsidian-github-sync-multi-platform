@@ -16,6 +16,7 @@ import { V4_RUNTIME_INDEX_ROOT } from "../../src/lib/v4/reencryption-index-root"
 import { armV4ReencryptionSyncFence, assertV4ReencryptionSyncFenceClear, V4_REENCRYPTION_SYNC_FENCE_ROOT } from "../../src/lib/v4/reencryption-sync-fence"
 import { stageV4FencedBestEffortPreparedSelector, inspectV4FencedBestEffortPreparedSelectorAfterRestart } from "../../src/lib/v4/reencryption-fenced-prepared-selector"
 import { inspectV4FencedLocalCrashTriageAfterRestart } from "../../src/lib/v4/reencryption-fenced-local-crash-triage"
+import { inspectV4FencedCrashWindowPairAfterRestart } from "../../src/lib/v4/reencryption-fenced-crash-window-pair-inspection"
 import { sealV4ReencryptionSeparatedSelectorTestVector } from "../../src/lib/v4/reencryption-separated-selector-prototype"
 import { acquireV4DesktopRekeyWalStorage } from "../../src/lib/v4/reencryption-desktop-wal"
 import { createV4ReencryptionRecoveryJournal, type V4ReencryptionJournalSnapshot } from "../../src/lib/v4/reencryption-recovery-journal"
@@ -445,6 +446,234 @@ test("D182 fully authenticated paired test vectors in local storage remain unexp
   assert.deepEqual(s.files, original)
   assert.equal(s.writes.length, writes)
   await assert.rejects(() => assertV4ReencryptionSyncFenceClear(s.adapter))
+})
+
+async function d184Fixture() {
+  const s = await d180Fixture()
+  const sourceSettings = { ...s.settings }
+  const original = await loadV4LocalIndex(s.adapter, V4_RUNTIME_INDEX_ROOT)
+  const shadow = await loadV4LocalIndex(s.adapter,
+    V4_RUNTIME_INDEX_ROOT + "-rekey-" + identity.runId)
+  const digest = (value: string) => sha256Hex(utf8ToBytes(value))
+  const contract = {
+    transactionId: "ac".repeat(16),
+    identity: s.input().identity,
+    sourceIndexSha256: await digest(JSON.stringify(original)),
+    destinationShadowSha256: await digest(JSON.stringify(shadow)),
+    preparedEvidenceSha256: await digest(s.files.get(d180Prepared)!),
+    walSnapshotSha256: await digest(JSON.stringify(s.walSnapshot())),
+    sourceSettingsSha256: await digest(JSON.stringify(sourceSettings)),
+    destinationSettingsSha256: await digest(JSON.stringify({
+      ...sourceSettings, githubBranch: "rekey/2026",
+      encryptionPassphraseSecretId: "new-secret",
+    })),
+  }
+  const pair = await sealV4ReencryptionCommitPairTestVectors(contract, s.key)
+  const input = { prepared: s.input(), contract, sourceSettings }
+  return { s, contract, pair, input }
+}
+function d184Place(
+  f: Awaited<ReturnType<typeof d184Fixture>>,
+  phase: "absent" | "directory" | "receipt" | "selector" | "paired" | "foreign",
+): void {
+  if (phase === "directory" || phase === "receipt" || phase === "paired" || phase === "foreign") {
+    f.s.dirs.add(d180Proposed)
+  }
+  if (phase === "receipt" || phase === "paired") {
+    f.s.files.set(d180Proposed + "/marker.json", f.pair.receiptTestVector)
+  }
+  if (phase === "selector" || phase === "paired" || phase === "foreign") {
+    f.s.files.set(d180Selector, f.pair.selectorTestVector)
+  }
+  if (phase === "foreign") {
+    f.s.files.set(d180Proposed + "/marker.json", f.pair.receiptTestVector.slice(0, -4))
+  }
+}
+test("D184 unopened Receipt/Selector cannot commit a properly prepared Source", async () => {
+  const f = await d184Fixture()
+  const original = new Map(f.s.files)
+  const writes = f.s.writes.length
+  const report = await inspectV4FencedCrashWindowPairAfterRestart(f.input)
+  assert.deepEqual(report, {
+    integrityScope: "read-only-fenced-post-crash-test-pair-window",
+    evidence: "historical-d183-witness-and-best-effort-wal-readback-not-durable",
+    observation: "source-prepared-uncommitted",
+    reason: "source-still-selected-no-pair",
+    artifactWindow: "absent",
+    settingsSelection: "source",
+    activeIndexSelection: "source",
+    pairEvidence: "absent",
+    localCutoverAuthorized: false, resumeSyncAuthorized: false,
+    rollbackAuthorized: false, remoteWritesAuthorized: false,
+    oldPassphraseCleanupAuthorized: false,
+  })
+  assert.equal(Object.isFrozen(report), true)
+  assert.deepEqual(f.s.files, original)
+  assert.equal(f.s.writes.length, writes)
+  await assert.rejects(() => assertV4ReencryptionSyncFenceClear(f.s.adapter))
+})
+
+test("D184 authentic D182 Receipt+Selector on disk remains Manual Recovery, not an authoritative Commit", async () => {
+  const f = await d184Fixture()
+  d184Place(f, "paired")
+  assert.equal((await inspectV4ReencryptionCommitPairTestVectors(
+    f.contract, f.s.key, f.pair,
+  )).observation, "both-test-vectors-authenticate-uncommitted")
+  const before = new Map(f.s.files)
+  const writes = f.s.writes.length
+  const report = await inspectV4FencedCrashWindowPairAfterRestart(f.input)
+  assert.equal(report.observation, "manual-recovery-required")
+  assert.equal(report.reason, "linked-test-pair-not-authoritative")
+  assert.equal(report.artifactWindow, "pair-present")
+  assert.equal(report.pairEvidence, "cryptographically-linked-uncommitted")
+  assert.equal(report.localCutoverAuthorized, false)
+  assert.equal(report.resumeSyncAuthorized, false)
+  assert.equal(report.rollbackAuthorized, false)
+  assert.equal(report.remoteWritesAuthorized, false)
+  assert.equal(report.oldPassphraseCleanupAuthorized, false)
+  assert.equal(f.s.secrets.get("old-secret"), "old-value")
+  assert.deepEqual(f.s.files, before)
+  assert.equal(f.s.writes.length, writes)
+  await assert.rejects(() => assertV4ReencryptionSyncFenceClear(f.s.adapter))
+})
+
+test("D184 complete local interruption matrix: Settings x Active Index x Receipt/Selector (36 states)", async () => {
+  for (const settings of ["source", "destination", "mixed"] as const) {
+    for (const index of ["source", "destination"] as const) {
+      for (const phase of ["absent", "directory", "receipt", "selector", "paired", "foreign"] as const) {
+        const f = await d184Fixture()
+        if (settings === "destination") {
+          f.s.settings.githubBranch = "rekey/2026"
+          f.s.settings.encryptionPassphraseSecretId = "new-secret"
+        } else if (settings === "mixed") {
+          f.s.settings.githubBranch = "rekey/2026"
+        }
+        if (index === "destination") {
+          const shadow = await loadV4LocalIndex(f.s.adapter,
+            V4_RUNTIME_INDEX_ROOT + "-rekey-" + identity.runId)
+          await saveV4LocalIndex(f.s.adapter, V4_RUNTIME_INDEX_ROOT, shadow)
+        }
+        d184Place(f, phase)
+        const original = new Map(f.s.files)
+        const writes = f.s.writes.length
+        const report = await inspectV4FencedCrashWindowPairAfterRestart(f.input)
+        const label = [settings, index, phase].join("/")
+        const expectedReason = index === "destination" ? "historical-evidence-missing-or-changed"
+          : phase !== "absent" && phase !== "paired"
+            ? "partial-or-foreign-commit-artifacts"
+            : settings !== "source" ? "settings-or-index-partially-switched"
+              : phase === "absent" ? "source-still-selected-no-pair"
+                : "linked-test-pair-not-authoritative"
+        assert.equal(report.reason, expectedReason, label)
+        assert.equal(report.settingsSelection, settings, label)
+        assert.equal(report.activeIndexSelection, index, label)
+        assert.equal(report.observation, expectedReason === "source-still-selected-no-pair"
+          ? "source-prepared-uncommitted" : "manual-recovery-required", label)
+        assert.equal(report.localCutoverAuthorized, false, label)
+        assert.equal(report.resumeSyncAuthorized, false, label)
+        assert.equal(report.oldPassphraseCleanupAuthorized, false, label)
+        assert.deepEqual(f.s.files, original, label)
+        assert.equal(f.s.writes.length, writes, label)
+        assert.equal(f.s.secrets.get("old-secret"), "old-value", label)
+      }
+    }
+  }
+})
+
+test("D184 missing, corrupted or changed pre-Commit evidence never authenticates a hypothetical pair", async () => {
+  for (const cause of ["fence", "prepared", "intent", "wal", "shadow", "source", "old-secret",
+    "new-secret", "historical-settings", "historical-wal-hash", "transaction",
+    "invalid-tx", "extra-contract-field"] as const) {
+    const f = await d184Fixture()
+    d184Place(f, "paired")
+    if (cause === "fence") f.s.files.set(fenceMarker, "{broken")
+    else if (cause === "prepared") f.s.files.set(d180Prepared, "{broken")
+    else if (cause === "intent") f.s.files.set(d180Intent, "{broken")
+    else if (cause === "wal") f.s.setWal({ ...f.s.walSnapshot(), generation: 80 })
+    else if (cause === "shadow") f.s.files.set(
+      V4_RUNTIME_INDEX_ROOT + "-rekey-" + identity.runId + "/index.json", "{broken")
+    else if (cause === "source") f.s.files.set(V4_RUNTIME_INDEX_ROOT + "/index.json", "{broken")
+    else if (cause === "old-secret") f.s.secrets.delete("old-secret")
+    else if (cause === "new-secret") f.s.secrets.set("new-secret", "different")
+    else if (cause === "historical-settings") f.input.sourceSettings.githubBranch = "rekey/2026"
+    else if (cause === "historical-wal-hash") f.input.contract.walSnapshotSha256 = "1".repeat(64)
+    else if (cause === "invalid-tx") f.input.contract.transactionId = "0".repeat(32)
+    else if (cause === "extra-contract-field") Object.assign(f.input.contract, { extra: true })
+    else f.input.contract.transactionId = "bb".repeat(16)
+    const writes = f.s.writes.length
+    const report = await inspectV4FencedCrashWindowPairAfterRestart(f.input)
+    assert.equal(report.observation, "manual-recovery-required", cause)
+    if (cause === "source" || cause === "shadow" || cause === "historical-wal-hash") {
+      assert.equal(report.reason, "historical-evidence-missing-or-changed", cause)
+    }
+    assert.equal(report.localCutoverAuthorized, false, cause)
+    assert.equal(report.resumeSyncAuthorized, false, cause)
+    assert.equal(f.s.writes.length, writes, cause)
+  }
+})
+
+test("D184 torn and oversized proposed receipt or selector cannot consume unbounded evidence", async () => {
+  for (const cause of ["receipt-too-big", "selector-too-big", "marker-without-root"] as const) {
+    const f = await d184Fixture()
+    d184Place(f, "paired")
+    if (cause === "receipt-too-big") f.s.files.set(
+      d180Proposed + "/marker.json", "Z".repeat(8193))
+    if (cause === "selector-too-big") f.s.files.set(d180Selector, "Z".repeat(8193))
+    if (cause === "marker-without-root") f.s.dirs.delete(d180Proposed)
+    const original = new Map(f.s.files)
+    const writes = f.s.writes.length
+    const result = await inspectV4FencedCrashWindowPairAfterRestart(f.input)
+    assert.equal(result.reason, "partial-or-foreign-commit-artifacts", cause)
+    assert.equal(result.pairEvidence, "unverifiable", cause)
+    assert.equal(result.localCutoverAuthorized, false, cause)
+    assert.deepEqual(f.s.files, original, cause)
+    assert.equal(f.s.writes.length, writes, cause)
+  }
+})
+
+test("D184 local artifacts changed between readbacks deny even a previously authenticated pair", async () => {
+  const f = await d184Fixture()
+  d184Place(f, "paired")
+  const originalRead = f.s.adapter.read
+  let pairReads = 0
+  f.s.adapter.read = async path => {
+    const value = await originalRead(path)
+    if (path === d180Selector && ++pairReads === 2) {
+      f.s.files.set(d180Proposed + "/marker.json", "changed-after-authentication")
+    }
+    return value
+  }
+  const writes = f.s.writes.length
+  const result = await inspectV4FencedCrashWindowPairAfterRestart(f.input)
+  assert.equal(pairReads >= 2, true)
+  assert.equal(result.observation, "manual-recovery-required")
+  assert.equal(result.reason, "fence-wal-lease-or-storage-uncertain")
+  assert.equal(f.s.writes.length, writes)
+})
+
+test("D184 a forged Holder result, double invocation and post-Holder Settings mutation fail closed", async () => {
+  for (const cause of ["skip", "double", "post-settings", "post-secret"] as const) {
+    const f = await d184Fixture()
+    const original = f.input.prepared.withExclusiveInitiatorLease
+    const successful = await inspectV4FencedCrashWindowPairAfterRestart(f.input)
+    if (cause === "skip") {
+      f.input.prepared.withExclusiveInitiatorLease = async () => successful as never
+    } else {
+      f.input.prepared.withExclusiveInitiatorLease = async action => original(async () => {
+        const report = await action()
+        if (cause === "double") await action()
+        else if (cause === "post-settings") f.s.settings.githubBranch = "rekey/2026"
+        else f.s.secrets.set("old-secret", "new-value-after-holder")
+        return report
+      })
+    }
+    const writes = f.s.writes.length
+    const report = await inspectV4FencedCrashWindowPairAfterRestart(f.input)
+    assert.equal(report.observation, "manual-recovery-required", cause)
+    assert.equal(report.reason, "fence-wal-lease-or-storage-uncertain", cause)
+    assert.equal(report.resumeSyncAuthorized, false, cause)
+    assert.equal(f.s.writes.length, writes, cause)
+  }
 })
 
 test("D176 exact fence binding permits only prepared evidence, never committed Cutover", async () => {
