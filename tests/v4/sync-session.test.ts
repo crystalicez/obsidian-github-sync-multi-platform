@@ -2762,6 +2762,141 @@ test("D198 a stale device accepts two consecutive genuine plugin advances", asyn
   }
 })
 
+test("D199 detects an external ancestor hidden three plugin commits behind the tip", async () => {
+  for (const mode of ["plaintext", "encrypted"] as const) {
+    const { github, vault, index, remoteConfig, keyring } = await unknownBaseFixture(mode, "remote-newer")
+    const baseline = github.ref!.sha
+    const writerIndex = structuredClone(index)
+    const bucket = Object.keys(writerIndex.shards)[0]!
+    writerIndex.shards[bucket]!.hash = writerIndex.shardHashes[bucket]!
+    const writerVault = new MemoryVault()
+    const pluginShas: string[] = []
+    for (const [step, content] of ["generation two", "generation three", "generation four"].entries()) {
+      writerVault.files.set("note.md", { bytes: enc(content), mtime: 50 + step * 50 })
+      await new V4SyncSession({
+        github, vault: writerVault, index: writerIndex, config: remoteConfig, keyring,
+        conflictPolicy: "copy", abortChangePercent: 0,
+      }).sync({ operation: "normal", allowThresholdOverride: false })
+      pluginShas.push(github.ref!.sha)
+    }
+    assert.equal(github.commits.get(pluginShas[0]!)!.parents[0], baseline)
+    const foreignText = "direct GitHub content before generation two"
+    const externalTree = new Map(github.trees.get(github.commits.get(baseline)!.treeSha)!)
+    externalTree.set("foreign.md", enc(foreignText))
+    github.trees.set(`tree-d199-external-${mode}`, externalTree)
+    github.commits.set(`commit-d199-external-${mode}`, {
+      treeSha: `tree-d199-external-${mode}`, parents: [baseline], message: "Edited directly in GitHub",
+    })
+    github.commits.get(pluginShas[0]!)!.parents = [`commit-d199-external-${mode}`]
+    for (const sha of pluginShas) {
+      const commit = github.commits.get(sha)!
+      const tree = new Map(github.trees.get(commit.treeSha)!)
+      tree.set("foreign.md", enc(foreignText))
+      github.trees.set(`tree-d199-${mode}-${sha}`, tree)
+      commit.treeSha = `tree-d199-${mode}-${sha}`
+    }
+    const tip = pluginShas[pluginShas.length - 1]!
+    github.files = new Map(github.trees.get(github.commits.get(tip)!.treeSha)!)
+    vault.operations.length = 0
+    const session = () => new V4SyncSession({
+      github, vault, index, config: remoteConfig, keyring,
+      conflictPolicy: "copy", abortChangePercent: 0,
+    })
+    if (mode === "encrypted") {
+      await assert.rejects(() => session().sync({ operation: "normal", allowThresholdOverride: false }),
+        /External GitHub changes touched an encrypted V4 branch/u)
+      assert.equal(github.ref?.sha, tip)
+      assert.equal(index.remoteCommitSha, baseline)
+      assert.deepEqual(vault.operations, [], "Encrypted Sync must not mutate the vault on a concealed ancestor")
+    } else {
+      await session().sync({ operation: "normal", allowThresholdOverride: false })
+      assert.equal(dec(vault.files.get("foreign.md")!.bytes), foreignText)
+      assert.equal(dec(github.files.get("foreign.md")!), foreignText)
+      const freshVault = new MemoryVault()
+      const freshIndex = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "reader", mode: "plaintext" })
+      await new V4SyncSession({
+        github, vault: freshVault, index: freshIndex, config: remoteConfig,
+        conflictPolicy: "copy", abortChangePercent: 0,
+      }).sync({ operation: "forcePull", allowThresholdOverride: false })
+      assert.equal(dec(freshVault.files.get("foreign.md")!.bytes), foreignText)
+    }
+  }
+})
+
+test("D199 encrypted first-time ancestry audit accepts 128 commits but refuses 129 without local mutations", async () => {
+  for (const count of [128, 129]) {
+    const { github, index: initialIndex, remoteConfig, keyring } = await unknownBaseFixture("encrypted", null)
+    let previous = github.ref!.sha
+    for (let generation = 2; generation <= count; generation++) {
+      const head: V4RemoteHead = {
+        formatVersion: V4_FORMAT_VERSION, mode: "encrypted", epoch: initialIndex.epoch,
+        generation, journalId: `synthetic-${generation}`,
+        shardHashes: { ...initialIndex.shardHashes }, updatedAt: generation, deviceId: "writer",
+      }
+      const files = await buildV4RemoteMetadata({
+        config: remoteConfig, head, records: [], keyring, buckets: [],
+      })
+      const tree = new Map(github.trees.get(github.commits.get(previous)!.treeSha)!)
+      tree.set(V4_HEAD_PATH, files.find(file => file.path === V4_HEAD_PATH)!.bytes)
+      const treeSha = `tree-d199-history-${count}-${generation}`
+      const sha = `commit-d199-history-${count}-${generation}`
+      github.trees.set(treeSha, tree)
+      github.commits.set(sha, { treeSha, parents: [previous], message: `obsidian-sync-v4:${head.journalId}` })
+      previous = sha
+    }
+    github.ref = { ref: "refs/heads/main", sha: previous, type: "commit" }
+    github.files = new Map(github.trees.get(github.commits.get(previous)!.treeSha)!)
+    const index = createEmptyV4LocalIndex({
+      repoId: "o/r#main", deviceId: "first-time", mode: "encrypted", pathLayout: "opaque-stable-v1",
+    })
+    const vault = new MemoryVault()
+    const session = () => new V4SyncSession({
+      github, vault, index, config: remoteConfig, keyring, conflictPolicy: "copy", abortChangePercent: 0,
+    })
+    if (count === 129) {
+      await assert.rejects(
+        () => session().sync({ operation: "forcePull", allowThresholdOverride: false }),
+        /128-commit ancestry verification limit/u,
+      )
+      assert.equal(index.remoteCommitSha, undefined)
+      assert.deepEqual(vault.operations, [])
+    } else {
+      await session().sync({ operation: "forcePull", allowThresholdOverride: false })
+      assert.equal(dec(vault.files.get("note.md")!.bytes), "remote-newer")
+      assert.equal(index.remoteCommitSha, previous)
+    }
+    assert.equal(github.ref?.sha, previous, "Ancestry verification cannot move the remote branch")
+  }
+})
+
+test("D199 a single anchored plugin advance reads only the tip Git commit", async () => {
+  const { github, index, remoteConfig } = await unknownBaseFixture("plaintext", null)
+  const staleIndex = structuredClone(index)
+  const writerIndex = structuredClone(index)
+  const bucket = Object.keys(writerIndex.shards)[0]!
+  writerIndex.shards[bucket]!.hash = writerIndex.shardHashes[bucket]!
+  const writerVault = new MemoryVault()
+  writerVault.files.set("note.md", { bytes: enc("updated by writer"), mtime: 50 })
+  await new V4SyncSession({
+    github, vault: writerVault, index: writerIndex, config: remoteConfig,
+    conflictPolicy: "copy", abortChangePercent: 0,
+  }).sync({ operation: "normal", allowThresholdOverride: false })
+  const tip = github.ref!.sha
+  const commitReads: string[] = []
+  const getCommit = github.getGitCommit.bind(github)
+  github.getGitCommit = async (sha: string) => {
+    commitReads.push(sha)
+    return getCommit(sha)
+  }
+  const vault = new MemoryVault()
+  await new V4SyncSession({
+    github, vault, index: staleIndex, config: remoteConfig,
+    conflictPolicy: "copy", abortChangePercent: 0,
+  }).sync({ operation: "forcePull", allowThresholdOverride: false })
+  assert.equal(dec(vault.files.get("note.md")!.bytes), "updated by writer")
+  assert.deepEqual(commitReads, [tip], "An anchored one-commit update must not traverse older Git commits")
+})
+
 test("D194 a copied plugin commit message cannot hide out-of-band GitHub edits", async () => {
   for (const mode of ["plaintext", "encrypted"] as const) {
     const fixture = await unknownBaseFixture(mode, "remote-newer")

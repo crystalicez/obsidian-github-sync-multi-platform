@@ -127,6 +127,8 @@ export class V4RecoveryReplanRequiredError extends Error {
   }
 }
 
+const MAX_V4_ANCESTRY_AUDIT_COMMITS = 128
+
 function assertV4CompleteRecursiveGitTree(tree: GitHubTree, expectedSha: string, context: string): void {
   if (tree?.sha !== expectedSha || tree.truncated !== false || !Array.isArray(tree.tree)
     || tree.tree.length > 100_000) {
@@ -344,45 +346,53 @@ export class V4SyncSession {
     let externalReconciled = false
     if (remote && remote.commitSha !== this.input.index.remoteCommitSha) {
       const tip = await this.input.github.getGitCommit(remote.commitSha)
-      const pluginMessage = `obsidian-sync-v4:${remote.head.journalId}`
-      const hasPluginMessage = tip.message?.split("\n", 1)[0] === pluginMessage
+      let commit = tip
+      let head = remote.head
       let hasCoherentPluginAdvance = false
-      if (hasPluginMessage && tip.parentShas.length === 1) {
-        const previousFile = await this.input.github.getFileBytes(V4_HEAD_PATH, tip.parentShas[0]!)
-        if (previousFile) {
-          const previousHead = await decodeV4RemoteHead(previousFile.bytes, remote.config, this.input.keyring)
-          hasCoherentPluginAdvance = previousHead.epoch === remote.head.epoch
-            && previousHead.generation + 1 === remote.head.generation
-            && previousHead.journalId !== remote.head.journalId
-          if (hasCoherentPluginAdvance && tip.parentShas[0] !== baseCommitSha) {
-            const parent = await this.input.github.getGitCommit(tip.parentShas[0]!)
-            hasCoherentPluginAdvance = parent.message?.split("\n", 1)[0] === `obsidian-sync-v4:${previousHead.journalId}`
-              && parent.parentShas.length <= 1
-            if (hasCoherentPluginAdvance && parent.parentShas.length === 0) {
-              hasCoherentPluginAdvance = previousHead.generation === 1
-            } else if (hasCoherentPluginAdvance && parent.parentShas.length === 1) {
-              const grandparentFile = await this.input.github.getFileBytes(V4_HEAD_PATH, parent.parentShas[0]!)
-              if (grandparentFile) {
-                const grandparentHead = await decodeV4RemoteHead(grandparentFile.bytes, remote.config, this.input.keyring)
-                hasCoherentPluginAdvance = grandparentHead.epoch === previousHead.epoch
-                  && grandparentHead.generation + 1 === previousHead.generation
-                  && grandparentHead.journalId !== previousHead.journalId
-              } else if (previousHead.generation === 1) {
-                const grandparent = await this.input.github.getGitCommit(parent.parentShas[0]!)
-                hasCoherentPluginAdvance = grandparent.parentShas.length === 0
-                  && grandparent.message === "obsidian-sync-v4:bootstrap"
-              } else {
-                hasCoherentPluginAdvance = false
-              }
-            }
-          }
-        } else if (!baseCommitSha && remote.head.generation === 1) {
-          const parent = await this.input.github.getGitCommit(tip.parentShas[0]!)
-          hasCoherentPluginAdvance = parent.parentShas.length === 0
-            && parent.message === "obsidian-sync-v4:bootstrap"
+      let auditExhausted = true
+      for (let depth = 0; depth < MAX_V4_ANCESTRY_AUDIT_COMMITS; depth++) {
+        throwIfV4Aborted(this.input.signal)
+        if (commit.message?.split("\n", 1)[0] !== `obsidian-sync-v4:${head.journalId}`) {
+          auditExhausted = false
+          break
         }
-      } else if (!baseCommitSha && hasPluginMessage && tip.parentShas.length === 0 && remote.head.generation === 1) {
-        hasCoherentPluginAdvance = true
+        if (commit.parentShas.length === 0) {
+          hasCoherentPluginAdvance = !baseCommitSha && head.generation === 1
+          auditExhausted = false
+          break
+        }
+        if (commit.parentShas.length !== 1) {
+          auditExhausted = false
+          break
+        }
+        const parentSha = commit.parentShas[0]!
+        const parentFile = await this.input.github.getFileBytes(V4_HEAD_PATH, parentSha)
+        if (!parentFile) {
+          if (!baseCommitSha && head.generation === 1) {
+            const bootstrap = await this.input.github.getGitCommit(parentSha)
+            hasCoherentPluginAdvance = bootstrap.parentShas.length === 0
+              && bootstrap.message === "obsidian-sync-v4:bootstrap"
+          }
+          auditExhausted = false
+          break
+        }
+        const parentHead = await decodeV4RemoteHead(parentFile.bytes, remote.config, this.input.keyring)
+        if (parentHead.epoch !== head.epoch
+          || parentHead.generation + 1 !== head.generation
+          || parentHead.journalId === head.journalId) {
+          auditExhausted = false
+          break
+        }
+        if (parentSha === baseCommitSha) {
+          hasCoherentPluginAdvance = true
+          auditExhausted = false
+          break
+        }
+        head = parentHead
+        commit = await this.input.github.getGitCommit(parentSha)
+      }
+      if (auditExhausted && remote.config.mode === "encrypted") {
+        throw new Error(`Encrypted V4 Git history exceeds the ${MAX_V4_ANCESTRY_AUDIT_COMMITS}-commit ancestry verification limit. Review the branch history before reconnecting.`)
       }
       if (!hasCoherentPluginAdvance) {
         await this.reconcileExternalCommit(remote, tip.treeSha)
