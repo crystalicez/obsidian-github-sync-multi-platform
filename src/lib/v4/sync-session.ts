@@ -128,12 +128,47 @@ export class V4RecoveryReplanRequiredError extends Error {
   }
 }
 
+type V4PathTopology = {
+  directoryCasing: Map<string, string>
+  blobPaths: Set<string>
+}
+
+function assertV4PathTopology(
+  path: string,
+  kind: "blob" | "tree",
+  topology: V4PathTopology,
+  errorMessage: string,
+): void {
+  let directory = ""
+  for (const segment of path.split("/").slice(0, -1)) {
+    directory = directory ? `${directory}/${segment}` : segment
+    const folded = directory.normalize("NFC").toLowerCase()
+    if (topology.blobPaths.has(folded)
+      || (topology.directoryCasing.has(folded) && topology.directoryCasing.get(folded) !== directory)) {
+      throw new Error(errorMessage)
+    }
+    topology.directoryCasing.set(folded, directory)
+  }
+  const foldedPath = path.normalize("NFC").toLowerCase()
+  if (kind === "tree") {
+    if (topology.blobPaths.has(foldedPath)
+      || (topology.directoryCasing.has(foldedPath) && topology.directoryCasing.get(foldedPath) !== path)) {
+      throw new Error(errorMessage)
+    }
+    topology.directoryCasing.set(foldedPath, path)
+  } else {
+    if (topology.directoryCasing.has(foldedPath)) throw new Error(errorMessage)
+    topology.blobPaths.add(foldedPath)
+  }
+}
+
 function assertV4CompleteRecursiveGitTree(tree: GitHubTree, expectedSha: string, context: string): void {
   if (tree?.sha !== expectedSha || tree.truncated !== false || !Array.isArray(tree.tree)
     || tree.tree.length > 100_000) {
     throw new Error(`${context} GitHub tree is incomplete or mismatched; sync is unsafe.`)
   }
   const seen = new Set<string>()
+  const topology: V4PathTopology = { directoryCasing: new Map(), blobPaths: new Set() }
   for (const node of tree.tree) {
     if (!node || typeof node.path !== "string"
       || typeof node.sha !== "string" || !/^[0-9a-f]{40}$/u.test(node.sha)
@@ -149,6 +184,10 @@ function assertV4CompleteRecursiveGitTree(tree: GitHubTree, expectedSha: string,
     if (canonicalPath !== node.path || seen.has(foldedPath)) {
       throw new Error(`${context} GitHub tree has a noncanonical or duplicate path; sync is unsafe.`)
     }
+    assertV4PathTopology(
+      canonicalPath, node.type === "tree" ? "tree" : "blob", topology,
+      `${context} GitHub tree has a case-insensitive path topology collision; sync is unsafe.`,
+    )
     seen.add(foldedPath)
   }
 }
@@ -169,10 +208,12 @@ function logical(records: V4IndexFileRecord[]): V4LogicalFile[] {
 
 function assertNoCaseInsensitiveCollisions(files: V4LogicalFile[]): void {
   const seen = new Map<string, string>()
+  const topology: V4PathTopology = { directoryCasing: new Map(), blobPaths: new Set() }
   for (const file of files) {
     const key = file.path.normalize("NFC").toLowerCase()
     const previous = seen.get(key)
     if (previous && previous !== file.path) throw new Error(`Case-insensitive path collision: ${previous} <-> ${file.path}`)
+    assertV4PathTopology(file.path, "blob", topology, "Case-insensitive path topology collision; sync is unsafe.")
     seen.set(key, file.path)
   }
 }

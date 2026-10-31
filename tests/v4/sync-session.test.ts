@@ -3569,9 +3569,9 @@ test("D201 encrypted Sync rejects a coherent tip missing an indexed opaque objec
   assert.deepEqual(vault.operations, [])
 })
 
-test("D201 incomplete tip tree evidence refuses Sync before any mutation", async () => {
+test("D201/D207 incomplete or unsafe tip tree evidence refuses Sync before any mutation", async () => {
   for (const mode of ["plaintext", "encrypted"] as const) {
-    for (const invalid of ["truncated", "mismatched", "unsafe"] as const) {
+    for (const invalid of ["truncated", "mismatched", "unsafe", "case-folded-directory", "file-directory"] as const) {
       const { github, vault, index, remoteConfig, keyring } = await unknownBaseFixture(mode, "remote-newer")
       const baseline = github.ref!.sha
       const writerIndex = structuredClone(index)
@@ -3591,9 +3591,16 @@ test("D201 incomplete tip tree evidence refuses Sync before any mutation", async
         if (sha !== tipTreeSha) return tree
         if (invalid === "truncated") return { ...tree, truncated: true }
         if (invalid === "mismatched") return { ...tree, sha: "incorrect-tree-identity" }
+        const paths = invalid === "case-folded-directory"
+          ? ["Notes/first.md", "notes/second.md"]
+          : invalid === "file-directory"
+            ? ["shadow.md", "shadow.md/child.md"]
+            : ["../unsafe.md"]
         return {
           ...tree,
-          tree: [...tree.tree, { path: "../unsafe.md", type: "blob" as const, mode: "100644", sha: "a".repeat(40) }],
+          tree: [...tree.tree, ...paths.map(path => ({
+            path, type: "blob" as const, mode: "100644", sha: "a".repeat(40),
+          }))],
         }
       }
       vault.operations.length = 0
@@ -3602,12 +3609,69 @@ test("D201 incomplete tip tree evidence refuses Sync before any mutation", async
           github, vault, index, config: remoteConfig, keyring,
           conflictPolicy: "copy", abortChangePercent: 0,
         }).sync({ operation: "normal", allowThresholdOverride: false }),
-        /GitHub tree is incomplete or mismatched|GitHub tree has an unsafe path/u,
+        /GitHub tree is incomplete or mismatched|GitHub tree has an unsafe path|GitHub tree has a case-insensitive path topology collision/u,
       )
       assert.equal(github.ref?.sha, tip)
       assert.equal(index.remoteCommitSha, baseline)
       assert.deepEqual(vault.operations, [])
     }
+  }
+})
+
+test("D207 Sync refuses to publish case-folded folder aliases or file/directory collisions", async () => {
+  for (const mode of ["plaintext", "encrypted"] as const) {
+    for (const paths of [
+      ["Notes/a.md", "notes/b.md"],
+      ["notes/b.md", "Notes/a.md"],
+      ["shadow.md", "shadow.md/child.md"],
+      ["shadow.md/child.md", "shadow.md"],
+    ]) {
+      const { github, index, remoteConfig, keyring } = await unknownBaseFixture(mode, null)
+      const originalRef = github.ref!.sha
+      const originalCommitCount = github.commitMessages.length
+      const vault = new MemoryVault()
+      for (const path of paths) vault.files.set(path, { bytes: enc("local only"), mtime: 1 })
+      await assert.rejects(
+        () => new V4SyncSession({
+          github, vault, index, config: remoteConfig, keyring,
+          conflictPolicy: "copy", abortChangePercent: 0,
+        }).sync({ operation: "normal", allowThresholdOverride: false }),
+        /Case-insensitive path topology collision/u,
+      )
+      assert.equal(github.ref?.sha, originalRef)
+      assert.equal(index.remoteCommitSha, originalRef)
+      assert.equal(github.commitMessages.length, originalCommitCount)
+      assert.deepEqual(vault.operations.filter(operation => operation.startsWith("write:")
+        || operation.startsWith("delete:") || operation.startsWith("trash:")
+        || operation.startsWith("commit-stage:")), [])
+    }
+  }
+})
+
+test("D207 Sync accepts distinct nested files with consistent folder casing", async () => {
+  for (const mode of ["plaintext", "encrypted"] as const) {
+    const { github, index, remoteConfig, keyring } = await unknownBaseFixture(mode, null)
+    const bucket = Object.keys(index.shards)[0]!
+    index.shards[bucket]!.hash = index.shardHashes[bucket]!
+    const vault = new MemoryVault()
+    vault.files.set("note.md", { bytes: enc("remote-newer"), mtime: 20 })
+    vault.files.set("Notes/first.md", { bytes: enc("first"), mtime: 30 })
+    vault.files.set("Notes/second.md", { bytes: enc("second"), mtime: 31 })
+    await new V4SyncSession({
+      github, vault, index, config: remoteConfig, keyring,
+      conflictPolicy: "copy", abortChangePercent: 0,
+    }).sync({ operation: "normal", allowThresholdOverride: false })
+    const restored = new MemoryVault()
+    const freshIndex = createEmptyV4LocalIndex({
+      repoId: "o/r#main", deviceId: "D207-peer", mode,
+      pathLayout: mode === "encrypted" ? "opaque-stable-v1" : "plaintext-v1",
+    })
+    await new V4SyncSession({
+      github, vault: restored, index: freshIndex, config: remoteConfig, keyring,
+      conflictPolicy: "copy", abortChangePercent: 0,
+    }).sync({ operation: "forcePull", allowThresholdOverride: false })
+    assert.equal(dec(restored.files.get("Notes/first.md")!.bytes), "first")
+    assert.equal(dec(restored.files.get("Notes/second.md")!.bytes), "second")
   }
 })
 
