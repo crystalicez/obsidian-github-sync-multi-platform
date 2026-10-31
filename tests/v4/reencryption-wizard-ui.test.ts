@@ -126,6 +126,41 @@ test("D130 Wizard preview explains cross-platform best-effort and one-confirmati
   wizard.onClose()
 })
 
+test("D187 Wizard Preview shows safe Manual Recovery actions without GitHub or settings writes", () => {
+  let apiCalls = 0
+  setRequestUrlHandler(async () => {
+    apiCalls++
+    throw new Error("Recovery guidance must not make a GitHub request.")
+  })
+  const plugin = fakePlugin()
+  const originalSettings = JSON.stringify(plugin.settings)
+  try {
+    const wizard = new V4ReencryptionWizardModal(plugin)
+    wizard.onOpen()
+    const view = wizard as unknown as { step: number; render(): void }
+    view.step = 3
+    view.render()
+    const text = (wizard.contentEl as unknown as { flattenText(): string }).flattenText()
+    assert.match(text, /Manual Recovery checklist/i)
+    assert.match(text, /only if a future migration is interrupted/i)
+    assert.match(text, /Preview has made no changes/i)
+    assert.match(text, /stop.*Sync.*device/i)
+    assert.match(text, /vault.*plugin data/i)
+    assert.match(text, /BOTH passphrases/i)
+    assert.match(text, /Source.*Backup.*Destination.*history/i)
+    assert.match(text, /WAL.*Selector.*Receipt/i)
+    assert.match(text, /do not.*(force push|Force Push)/i)
+    assert.match(text, /do not.*resume Sync/i)
+    assert.doesNotMatch(text, /source-passphrase-never-render|source-token-never-render/i)
+    assert.equal(apiCalls, 0)
+    assert.equal(JSON.stringify(plugin.settings), originalSettings)
+    wizard.onClose()
+    assert.equal(apiCalls, 0)
+  } finally {
+    setRequestUrlHandler(null)
+  }
+})
+
 test("D133 old-passphrase loss warning appears before migration confirmation, without exposing secrets or another confirmation", () => {
   const wizard = new V4ReencryptionWizardModal(fakePlugin())
   wizard.onOpen()

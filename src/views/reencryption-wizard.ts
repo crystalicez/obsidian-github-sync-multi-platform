@@ -432,6 +432,17 @@ export class V4ReencryptionWizardModal extends Modal {
     for (const phase of phases) list.createEl("li", { text: `Pending — ${phase}` })
     this.row(container, "Status", "NOT STARTED. No network writes, encryption changes or local cutover were made by this Wizard.")
     this.row(container, "Recovery", "Best-effort WAL readback, authenticated interruption recovery, safe local cutover and installed Obsidian acceptance must pass before execution can be enabled. Unknown states require Manual Recovery.")
+    container.createEl("h4", { text: "Manual Recovery checklist (read-only guidance)" })
+    container.createEl("p", { text: "Use these steps only if a future migration is interrupted or its state becomes uncertain. This Preview has made no changes." })
+    const recoverySteps = [
+      "Stop Sync on every device that uses this repository. Do not let another device write while recovery is reviewed.",
+      "Make a secure copy of the vault and plugin data before changing anything. Keep BOTH passphrases securely outside logs and screenshots.",
+      "Preserve the Source, Backup and Destination branches and Git history. Do not delete, reset or force push any branch.",
+      "Keep local WAL, Selector and Receipt files unchanged, including incomplete files. They may be needed to identify the interrupted stage.",
+      "Do not resume Sync, delete old secrets, retry migration or roll back automatically. Review the saved evidence and branch state before any manual action.",
+    ]
+    const checklist = container.createEl("ol")
+    for (const step of recoverySteps) checklist.createEl("li", { text: step })
   }
 
   private renderFinish(container: HTMLElement): void {
