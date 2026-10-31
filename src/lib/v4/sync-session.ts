@@ -354,6 +354,28 @@ export class V4SyncSession {
           hasCoherentPluginAdvance = previousHead.epoch === remote.head.epoch
             && previousHead.generation + 1 === remote.head.generation
             && previousHead.journalId !== remote.head.journalId
+          if (hasCoherentPluginAdvance && tip.parentShas[0] !== baseCommitSha) {
+            const parent = await this.input.github.getGitCommit(tip.parentShas[0]!)
+            hasCoherentPluginAdvance = parent.message?.split("\n", 1)[0] === `obsidian-sync-v4:${previousHead.journalId}`
+              && parent.parentShas.length <= 1
+            if (hasCoherentPluginAdvance && parent.parentShas.length === 0) {
+              hasCoherentPluginAdvance = previousHead.generation === 1
+            } else if (hasCoherentPluginAdvance && parent.parentShas.length === 1) {
+              const grandparentFile = await this.input.github.getFileBytes(V4_HEAD_PATH, parent.parentShas[0]!)
+              if (grandparentFile) {
+                const grandparentHead = await decodeV4RemoteHead(grandparentFile.bytes, remote.config, this.input.keyring)
+                hasCoherentPluginAdvance = grandparentHead.epoch === previousHead.epoch
+                  && grandparentHead.generation + 1 === previousHead.generation
+                  && grandparentHead.journalId !== previousHead.journalId
+              } else if (previousHead.generation === 1) {
+                const grandparent = await this.input.github.getGitCommit(parent.parentShas[0]!)
+                hasCoherentPluginAdvance = grandparent.parentShas.length === 0
+                  && grandparent.message === "obsidian-sync-v4:bootstrap"
+              } else {
+                hasCoherentPluginAdvance = false
+              }
+            }
+          }
         } else if (!baseCommitSha && remote.head.generation === 1) {
           const parent = await this.input.github.getGitCommit(tip.parentShas[0]!)
           hasCoherentPluginAdvance = parent.parentShas.length === 0

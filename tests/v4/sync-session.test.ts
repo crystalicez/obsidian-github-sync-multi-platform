@@ -2674,6 +2674,94 @@ test("D197 first-time Restore accepts a generation-one V4 commit on an empty-rep
   }
 })
 
+test("D198 a plugin-shaped tip cannot hide an out-of-band immediate parent commit", async () => {
+  for (const mode of ["plaintext", "encrypted"] as const) {
+    const fixture = await unknownBaseFixture(mode, "remote-newer")
+    const { github, vault, index, remoteConfig, keyring } = fixture
+    const baseline = github.ref!.sha
+    const writerIndex = structuredClone(index)
+    writerIndex.shards[Object.keys(writerIndex.shards)[0]!]!.hash =
+      writerIndex.shardHashes[Object.keys(writerIndex.shards)[0]!]!
+    writerIndex.deviceId = "writer"
+    const writerVault = new MemoryVault()
+    writerVault.files.set("note.md", { bytes: enc("plugin-written update"), mtime: 50 })
+    await new V4SyncSession({
+      github, vault: writerVault, index: writerIndex, config: remoteConfig, keyring,
+      conflictPolicy: "copy", abortChangePercent: 0,
+    }).sync({ operation: "normal", allowThresholdOverride: false })
+    const pluginTip = github.ref!.sha
+    const pluginCommit = github.commits.get(pluginTip)!
+    assert.equal(pluginCommit.parents[0], baseline)
+    const externalTree = new Map(github.trees.get(github.commits.get(baseline)!.treeSha)!)
+    externalTree.set("foreign.md", enc("direct GitHub edit between plugin commits"))
+    github.trees.set(`tree-d198-external-${mode}`, externalTree)
+    github.commits.set(`commit-d198-external-${mode}`, {
+      treeSha: `tree-d198-external-${mode}`, parents: [baseline],
+      message: mode === "encrypted" ? github.commits.get(baseline)!.message : "Edit on GitHub directly",
+    })
+    const tipTree = new Map(github.trees.get(pluginCommit.treeSha)!)
+    tipTree.set("foreign.md", enc("direct GitHub edit between plugin commits"))
+    github.trees.set(`tree-d198-tip-${mode}`, tipTree)
+    pluginCommit.treeSha = `tree-d198-tip-${mode}`
+    pluginCommit.parents = [`commit-d198-external-${mode}`]
+    github.files = new Map(tipTree)
+    vault.operations.length = 0
+
+    const session = new V4SyncSession({
+      github, vault, index, config: remoteConfig, keyring, conflictPolicy: "copy", abortChangePercent: 0,
+    })
+    if (mode === "encrypted") {
+      await assert.rejects(
+        () => session.sync({ operation: "normal", allowThresholdOverride: false }),
+        /External GitHub changes touched an encrypted V4 branch/u,
+      )
+      assert.equal(github.ref?.sha, pluginTip)
+      assert.equal(index.remoteCommitSha, baseline)
+      assert.deepEqual(vault.operations, [], "Unknown encrypted ancestry must not mutate the local vault")
+    } else {
+      await session.sync({ operation: "normal", allowThresholdOverride: false })
+      assert.equal(dec(vault.files.get("foreign.md")!.bytes), "direct GitHub edit between plugin commits")
+      assert.ok(vault.files.has("note.md"), "The existing note remains available under conflict policy")
+      assert.equal(dec(github.files.get("foreign.md")!), "direct GitHub edit between plugin commits")
+      const restored = new MemoryVault()
+      const restoredIndex = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "reader", mode: "plaintext" })
+      await new V4SyncSession({
+        github, vault: restored, index: restoredIndex, config: remoteConfig,
+        conflictPolicy: "copy", abortChangePercent: 0,
+      }).sync({ operation: "forcePull", allowThresholdOverride: false })
+      assert.equal(dec(restored.files.get("foreign.md")!.bytes), "direct GitHub edit between plugin commits")
+    }
+  }
+})
+
+test("D198 a stale device accepts two consecutive genuine plugin advances", async () => {
+  for (const mode of ["plaintext", "encrypted"] as const) {
+    const { github, index, remoteConfig, keyring } = await unknownBaseFixture(mode, null)
+    const staleIndex = structuredClone(index)
+    const writerIndex = structuredClone(index)
+    const bucket = Object.keys(writerIndex.shards)[0]!
+    writerIndex.shards[bucket]!.hash = writerIndex.shardHashes[bucket]!
+    const writerVault = new MemoryVault()
+    writerVault.files.set("note.md", { bytes: enc("remote-newer"), mtime: 20 })
+    for (const [i, content] of ["plugin generation 2", "plugin generation 3"].entries()) {
+      writerVault.files.set("note.md", { bytes: enc(content), mtime: 50 + i * 50 })
+      await new V4SyncSession({
+        github, vault: writerVault, index: writerIndex, config: remoteConfig, keyring,
+        conflictPolicy: "copy", abortChangePercent: 0,
+      }).sync({ operation: "normal", allowThresholdOverride: false })
+    }
+    const tip = github.ref!.sha
+    const staleVault = new MemoryVault()
+    await new V4SyncSession({
+      github, vault: staleVault, index: staleIndex, config: remoteConfig, keyring,
+      conflictPolicy: "copy", abortChangePercent: 0,
+    }).sync({ operation: "forcePull", allowThresholdOverride: false })
+    assert.equal(dec(staleVault.files.get("note.md")!.bytes), "plugin generation 3")
+    assert.equal(staleIndex.remoteCommitSha, tip)
+    assert.equal(github.ref?.sha, tip, "No extra remote commit on a trusted Force Pull")
+  }
+})
+
 test("D194 a copied plugin commit message cannot hide out-of-band GitHub edits", async () => {
   for (const mode of ["plaintext", "encrypted"] as const) {
     const fixture = await unknownBaseFixture(mode, "remote-newer")
