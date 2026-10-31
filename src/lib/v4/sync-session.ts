@@ -22,7 +22,7 @@ import { trashV4LocalUserFile } from "./local-delete-policy"
 import { bucketForV4PathId, normalizeV4VaultPath } from "./paths"
 import { computeV4GitBlobSha1 } from "./git-blob-identity"
 import { planV4Sync, type V4LogicalFile, type V4PlannedChange, type V4SyncOperation } from "./planner"
-import { assertV4RemoteRecordSet, buildV4RemoteMetadata, decodeV4RemoteHead, v4RemoteShardPath } from "./remote-index"
+import { assertV4RemoteRecordSet, buildV4RemoteMetadata, decodeV4RemoteHead, decodeV4RemoteShard, v4RemoteShardPath } from "./remote-index"
 import { effectiveV4PathLayout, expectedV4PathLayout, V4_CONFIG_PATH, V4_HEAD_PATH, V4_ROOT, type V4RemoteConfig, type V4RemoteHead } from "./protocol-types"
 import { loadV4RemoteConfig, loadV4RemoteState, remoteV4StateFromLocalIndex, type V4RemoteState } from "./remote-loader"
 import { V4StorageCodec } from "./storage-codec"
@@ -347,7 +347,7 @@ export class V4SyncSession {
       let commit = tip
       let head = remote.head
       let precedingHead: V4RemoteHead | undefined
-      let verifiedRootSha: string | undefined
+      let verifiedRoot: { sha: string; head: V4RemoteHead } | undefined
       const unchangedThroughHistory = new Set(Object.keys(remote.head.shardHashes))
       let hasCoherentPluginAdvance = false
       for (let remaining = remote.head.generation; remaining > 0; remaining--) {
@@ -355,7 +355,7 @@ export class V4SyncSession {
         if (commit.message?.split("\n", 1)[0] !== `obsidian-sync-v4:${head.journalId}`) break
         if (commit.parentShas.length === 0) {
           hasCoherentPluginAdvance = !baseCommitSha && head.generation === 1
-          if (hasCoherentPluginAdvance) verifiedRootSha = commit.sha
+          if (hasCoherentPluginAdvance) verifiedRoot = { sha: commit.sha, head }
           break
         }
         if (commit.parentShas.length !== 1) break
@@ -366,7 +366,7 @@ export class V4SyncSession {
             const bootstrap = await this.input.github.getGitCommit(parentSha)
             hasCoherentPluginAdvance = bootstrap.parentShas.length === 0
               && bootstrap.message === "obsidian-sync-v4:bootstrap"
-            if (hasCoherentPluginAdvance) verifiedRootSha = commit.sha
+            if (hasCoherentPluginAdvance) verifiedRoot = { sha: commit.sha, head }
           }
           break
         }
@@ -428,13 +428,51 @@ export class V4SyncSession {
               const paths = record.storage === "chunked" ? record.partPaths ?? [] : [record.remotePath]
               return paths.length > 0 && paths.every(path => tipBlobs.has(path) && tipBlobs.get(path) === anchorBlobs.get(path))
             })
-            if (hasCoherentPluginAdvance && !knownBase && verifiedRootSha && verifiedRootSha !== anchorSha) {
-              const rootStableRecords = stableRecords.filter(record => unchangedThroughHistory.has(record.pathId.slice(0, 2)))
+            if (hasCoherentPluginAdvance && !knownBase && verifiedRoot && verifiedRoot.sha !== anchorSha) {
+              const rootStableRecords: V4IndexFileRecord[] = []
+              const changedBuckets = new Map<string, V4IndexFileRecord[]>()
+              for (const record of stableRecords) {
+                const bucket = record.pathId.slice(0, 2)
+                if (unchangedThroughHistory.has(bucket)) {
+                  rootStableRecords.push(record)
+                } else {
+                  const candidates = changedBuckets.get(bucket) ?? []
+                  candidates.push(record)
+                  changedBuckets.set(bucket, candidates)
+                }
+              }
+              for (const [bucket, candidates] of changedBuckets) {
+                if (verifiedRoot.head.shardHashes[bucket] === undefined) continue
+                throwIfV4Aborted(this.input.signal)
+                const rootFile = await this.input.github.getFileBytes(
+                  v4RemoteShardPath(bucket, remote.config.mode), verifiedRoot.sha,
+                )
+                if (!rootFile) throw new Error(`V4 root shard is missing: ${bucket}; sync is unsafe.`)
+                const rootShard = await decodeV4RemoteShard(rootFile.bytes, bucket, remote.config, this.input.keyring)
+                const rootRecords = Object.values(rootShard.records).sort((left, right) => left.pathId.localeCompare(right.pathId))
+                if (await sha256Hex(utf8ToBytes(bucketSignature(rootRecords))) !== verifiedRoot.head.shardHashes[bucket]) {
+                  throw new Error(`V4 root shard does not match its authenticated HEAD: ${bucket}; sync is unsafe.`)
+                }
+                for (const record of candidates) {
+                  const original = rootShard.records[record.pathId]
+                  if (original && !original.deleted
+                    && original.fileId === record.fileId
+                    && original.remoteVersion === record.remoteVersion
+                    && original.remotePath === record.remotePath
+                    && original.storage === record.storage
+                    && original.packId === record.packId
+                    && original.plaintextSha256 === record.plaintextSha256
+                    && original.size === record.size
+                    && JSON.stringify(original.partPaths ?? []) === JSON.stringify(record.partPaths ?? [])) {
+                    rootStableRecords.push(record)
+                  }
+                }
+              }
               if (rootStableRecords.length > 0) {
                 throwIfV4Aborted(this.input.signal)
-                const root = await this.input.github.getGitCommit(verifiedRootSha)
+                const root = await this.input.github.getGitCommit(verifiedRoot.sha)
                 const rootTree = await this.input.github.getTreeAt(root.treeSha, true)
-                assertV4CompleteRecursiveGitTree(rootTree, root.treeSha, "V4 unchanged-shard history anchor")
+                assertV4CompleteRecursiveGitTree(rootTree, root.treeSha, "V4 stable-record history anchor")
                 const rootBlobs = new Map(rootTree.tree.filter(node => node.type === "blob").map(node => [node.path, node.sha]))
                 hasCoherentPluginAdvance = rootStableRecords.every(record => {
                   const paths = record.storage === "chunked" ? record.partPaths ?? [] : [record.remotePath]
