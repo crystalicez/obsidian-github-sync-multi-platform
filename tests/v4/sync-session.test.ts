@@ -2538,6 +2538,142 @@ test("D196 external edit resolved by local-wins conflict has one final history v
   assert.equal(indexRecordByPath(index, "conflicted.md").plaintextSha256, await sha256Hex(enc("from local")))
 })
 
+test("D197 a first-time device detects a direct GitHub edit before trusting remote metadata", async () => {
+  for (const mode of ["plaintext", "encrypted"] as const) {
+    const fixture = await unknownBaseFixture(mode, null)
+    const { github, remoteConfig, keyring } = fixture
+    const parent = github.ref!.sha
+    const tree = new Map(github.trees.get(github.commits.get(parent)!.treeSha)!)
+    tree.set("foreign.md", enc("added outside the plugin"))
+    github.trees.set(`tree-d197-${mode}`, tree)
+    github.commits.set(`commit-d197-${mode}`, {
+      treeSha: `tree-d197-${mode}`, parents: [parent], message: github.commits.get(parent)!.message,
+    })
+    github.ref = { ref: "refs/heads/main", sha: `commit-d197-${mode}`, type: "commit" }
+    github.files = new Map(tree)
+    const firstIndex = createEmptyV4LocalIndex({
+      repoId: "o/r#main", deviceId: "first-time", mode,
+      pathLayout: mode === "encrypted" ? "opaque-stable-v1" : "plaintext-v1",
+    })
+    const firstVault = new MemoryVault()
+    const session = new V4SyncSession({
+      github, vault: firstVault, index: firstIndex, config: remoteConfig, keyring,
+      conflictPolicy: "copy", abortChangePercent: 0,
+    })
+    if (mode === "encrypted") {
+      await assert.rejects(
+        () => session.sync({ operation: "normal", allowThresholdOverride: false }),
+        /External GitHub changes touched an encrypted V4 branch/u,
+      )
+      assert.equal(github.ref?.sha, `commit-d197-${mode}`)
+      assert.equal(firstIndex.remoteCommitSha, undefined)
+      assert.deepEqual(firstVault.operations, [])
+    } else {
+      const result = await session.sync({ operation: "normal", allowThresholdOverride: false })
+      assert.notEqual(result.mode, "noop")
+      assert.equal(dec(firstVault.files.get("foreign.md")!.bytes), "added outside the plugin")
+      assert.equal(dec(firstVault.files.get("note.md")!.bytes), "remote-newer")
+      assert.notEqual(github.ref?.sha, `commit-d197-${mode}`)
+      const verifiedVault = new MemoryVault()
+      const verifiedIndex = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "reader", mode: "plaintext" })
+      await new V4SyncSession({
+        github, vault: verifiedVault, index: verifiedIndex, config: remoteConfig,
+        conflictPolicy: "copy", abortChangePercent: 0,
+      }).sync({ operation: "forcePull", allowThresholdOverride: false })
+      assert.equal(dec(verifiedVault.files.get("foreign.md")!.bytes), "added outside the plugin")
+    }
+  }
+})
+
+test("D197 a first-time device accepts an authentic multi-generation plugin tip", async () => {
+  for (const mode of ["plaintext", "encrypted"] as const) {
+    const { github, index: writerIndex, remoteConfig, keyring } = await unknownBaseFixture(mode, null)
+    const writerVault = new MemoryVault()
+    writerVault.files.set("note.md", { bytes: enc("remote-newer"), mtime: 20 })
+    writerVault.files.set("second.md", { bytes: enc("added by plugin"), mtime: 30 })
+    writerIndex.deviceId = "writer"
+    const first = github.ref!.sha
+    await new V4SyncSession({
+      github, vault: writerVault, index: writerIndex, config: remoteConfig, keyring,
+      conflictPolicy: "copy", abortChangePercent: 0,
+    }).sync({ operation: "normal", allowThresholdOverride: false })
+    const latest = github.ref!.sha
+    assert.notEqual(latest, first)
+    const index = createEmptyV4LocalIndex({
+      repoId: "o/r#main", deviceId: "first-time", mode,
+      pathLayout: mode === "encrypted" ? "opaque-stable-v1" : "plaintext-v1",
+    })
+    const vault = new MemoryVault()
+    await new V4SyncSession({
+      github, vault, index, config: remoteConfig, keyring, conflictPolicy: "copy", abortChangePercent: 0,
+    }).sync({ operation: "forcePull", allowThresholdOverride: false })
+    assert.equal(dec(vault.files.get("note.md")!.bytes), "remote-newer")
+    assert.equal(dec(vault.files.get("second.md")!.bytes), "added by plugin")
+    assert.equal(github.ref?.sha, latest, "First-time trusted Pull must not mutate the branch")
+    assert.equal(index.remoteCommitSha, latest)
+  }
+})
+
+test("D197 a missing parent HEAD is not enough to trust a forged generation-one encrypted tip", async () => {
+  const { github, remoteConfig, keyring } = await unknownBaseFixture("encrypted", null)
+  const initial = github.ref!.sha
+  const initialTree = github.trees.get(github.commits.get(initial)!.treeSha)!
+  const headless = new Map(initialTree)
+  headless.delete(V4_HEAD_PATH)
+  headless.set("foreign.md", enc("out-of-band"))
+  github.trees.set("tree-d197-headless", headless)
+  github.commits.set("commit-d197-headless", {
+    treeSha: "tree-d197-headless", parents: [initial], message: "Remove V4 HEAD",
+  })
+  const forged = new Map(initialTree)
+  forged.set("foreign.md", enc("out-of-band"))
+  github.trees.set("tree-d197-forged-gen1", forged)
+  github.commits.set("commit-d197-forged-gen1", {
+    treeSha: "tree-d197-forged-gen1", parents: ["commit-d197-headless"],
+    message: github.commits.get(initial)!.message,
+  })
+  github.ref = { ref: "refs/heads/main", sha: "commit-d197-forged-gen1", type: "commit" }
+  github.files = new Map(forged)
+  const index = createEmptyV4LocalIndex({
+    repoId: "o/r#main", deviceId: "first-time", mode: "encrypted", pathLayout: "opaque-stable-v1",
+  })
+  const vault = new MemoryVault()
+  await assert.rejects(
+    () => new V4SyncSession({
+      github, vault, index, config: remoteConfig, keyring, conflictPolicy: "copy", abortChangePercent: 0,
+    }).sync({ operation: "forcePull", allowThresholdOverride: false }),
+    /External GitHub changes touched an encrypted V4 branch/u,
+  )
+  assert.equal(github.ref?.sha, "commit-d197-forged-gen1")
+  assert.equal(index.remoteCommitSha, undefined)
+  assert.deepEqual(vault.operations, [])
+})
+
+test("D197 first-time Restore accepts a generation-one V4 commit on an empty-repository bootstrap", async () => {
+  for (const mode of ["plaintext", "encrypted"] as const) {
+    const { github, remoteConfig, keyring } = await unknownBaseFixture(mode, null)
+    const pluginSha = github.ref!.sha
+    github.trees.set("tree-d197-bootstrap", new Map([
+      [".obsidian-github-sync-v4/bootstrap", enc("obsidian-github-sync-v4\n")],
+    ]))
+    github.commits.set("commit-d197-bootstrap", {
+      treeSha: "tree-d197-bootstrap", parents: [], message: "obsidian-sync-v4:bootstrap",
+    })
+    github.commits.get(pluginSha)!.parents = ["commit-d197-bootstrap"]
+    const index = createEmptyV4LocalIndex({
+      repoId: "o/r#main", deviceId: "new-device", mode,
+      pathLayout: mode === "encrypted" ? "opaque-stable-v1" : "plaintext-v1",
+    })
+    const vault = new MemoryVault()
+    await new V4SyncSession({
+      github, vault, index, config: remoteConfig, keyring, conflictPolicy: "copy", abortChangePercent: 0,
+    }).sync({ operation: "forcePull", allowThresholdOverride: false })
+    assert.equal(dec(vault.files.get("note.md")!.bytes), "remote-newer")
+    assert.equal(index.remoteCommitSha, pluginSha)
+    assert.equal(github.ref?.sha, pluginSha)
+  }
+})
+
 test("D194 a copied plugin commit message cannot hide out-of-band GitHub edits", async () => {
   for (const mode of ["plaintext", "encrypted"] as const) {
     const fixture = await unknownBaseFixture(mode, "remote-newer")

@@ -342,18 +342,25 @@ export class V4SyncSession {
     }
     const metadataRemoteRecords = (remote?.records ?? []).map(record => ({ ...record, partPaths: record.partPaths ? [...record.partPaths] : undefined }))
     let externalReconciled = false
-    if (remote && this.input.index.remoteCommitSha && remote.commitSha !== this.input.index.remoteCommitSha) {
+    if (remote && remote.commitSha !== this.input.index.remoteCommitSha) {
       const tip = await this.input.github.getGitCommit(remote.commitSha)
       const pluginMessage = `obsidian-sync-v4:${remote.head.journalId}`
+      const hasPluginMessage = tip.message?.split("\n", 1)[0] === pluginMessage
       let hasCoherentPluginAdvance = false
-      if (tip.message?.split("\n", 1)[0] === pluginMessage && tip.parentShas.length === 1) {
+      if (hasPluginMessage && tip.parentShas.length === 1) {
         const previousFile = await this.input.github.getFileBytes(V4_HEAD_PATH, tip.parentShas[0]!)
         if (previousFile) {
           const previousHead = await decodeV4RemoteHead(previousFile.bytes, remote.config, this.input.keyring)
           hasCoherentPluginAdvance = previousHead.epoch === remote.head.epoch
             && previousHead.generation + 1 === remote.head.generation
             && previousHead.journalId !== remote.head.journalId
+        } else if (!baseCommitSha && remote.head.generation === 1) {
+          const parent = await this.input.github.getGitCommit(tip.parentShas[0]!)
+          hasCoherentPluginAdvance = parent.parentShas.length === 0
+            && parent.message === "obsidian-sync-v4:bootstrap"
         }
+      } else if (!baseCommitSha && hasPluginMessage && tip.parentShas.length === 0 && remote.head.generation === 1) {
+        hasCoherentPluginAdvance = true
       }
       if (!hasCoherentPluginAdvance) {
         await this.reconcileExternalCommit(remote, tip.treeSha)
