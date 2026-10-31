@@ -346,6 +346,7 @@ export class V4SyncSession {
       const tip = await this.input.github.getGitCommit(remote.commitSha)
       let commit = tip
       let head = remote.head
+      let precedingHead: V4RemoteHead | undefined
       let hasCoherentPluginAdvance = false
       for (let remaining = remote.head.generation; remaining > 0; remaining--) {
         throwIfV4Aborted(this.input.signal)
@@ -369,6 +370,7 @@ export class V4SyncSession {
         if (parentHead.epoch !== head.epoch
           || parentHead.generation + 1 !== head.generation
           || parentHead.journalId === head.journalId) break
+        if (commit.sha === remote.commitSha) precedingHead = parentHead
         if (parentSha === baseCommitSha) {
           hasCoherentPluginAdvance = true
           break
@@ -392,6 +394,35 @@ export class V4SyncSession {
             ? !record.partPaths?.every(path => blobPaths.has(path))
             : !blobPaths.has(record.remotePath)))
         hasCoherentPluginAdvance = !hasUnindexedPath && !hasMissingObject
+        if (hasCoherentPluginAdvance) {
+          const knownBase = localCacheComplete && baseCommitSha && this.input.index.epoch === remote.head.epoch
+            ? new Map(recordsFromIndex(this.input.index).map(record => [record.fileId, record]))
+            : undefined
+          const stableRecords = knownBase
+            ? remote.records.filter(record => {
+              const previous = knownBase.get(record.fileId)
+              return !record.deleted && previous !== undefined
+                && previous.remoteVersion === record.remoteVersion
+                && previous.remotePath === record.remotePath
+                && previous.storage === record.storage
+                && JSON.stringify(previous.partPaths ?? []) === JSON.stringify(record.partPaths ?? [])
+            })
+            : remote.records.filter(record => !record.deleted && precedingHead !== undefined
+              && remote.head.shardHashes[record.pathId.slice(0, 2)] !== undefined
+              && remote.head.shardHashes[record.pathId.slice(0, 2)] === precedingHead.shardHashes[record.pathId.slice(0, 2)])
+          if (stableRecords.length > 0) {
+            const anchorSha = knownBase ? baseCommitSha! : tip.parentShas[0]!
+            const anchor = await this.input.github.getGitCommit(anchorSha)
+            const anchorTree = await this.input.github.getTreeAt(anchor.treeSha, true)
+            assertV4CompleteRecursiveGitTree(anchorTree, anchor.treeSha, "V4 unchanged-blob anchor")
+            const anchorBlobs = new Map(anchorTree.tree.filter(node => node.type === "blob").map(node => [node.path, node.sha]))
+            const tipBlobs = new Map(tipTree.tree.filter(node => node.type === "blob").map(node => [node.path, node.sha]))
+            hasCoherentPluginAdvance = stableRecords.every(record => {
+              const paths = record.storage === "chunked" ? record.partPaths ?? [] : [record.remotePath]
+              return paths.length > 0 && paths.every(path => tipBlobs.has(path) && tipBlobs.get(path) === anchorBlobs.get(path))
+            })
+          }
+        }
       }
       if (!hasCoherentPluginAdvance) {
         await this.reconcileExternalCommit(remote, tip.treeSha, tipTree)

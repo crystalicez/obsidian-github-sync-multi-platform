@@ -2959,6 +2959,180 @@ test("D199 a single anchored plugin advance reads only the tip Git commit", asyn
   assert.deepEqual(commitReads, [tip], "An anchored one-commit update must not traverse older Git commits")
 })
 
+test("D202 a first-time device detects a same-path blob edit hidden behind an unchanged V4 shard", async () => {
+  for (const mode of ["plaintext", "encrypted"] as const) {
+    const { github, index, remoteConfig, keyring } = await unknownBaseFixture(mode, null)
+    const base = github.ref!.sha
+    const writerIndex = structuredClone(index)
+    const bucket = Object.keys(writerIndex.shards)[0]!
+    writerIndex.shards[bucket]!.hash = writerIndex.shardHashes[bucket]!
+    const writerVault = new MemoryVault()
+    writerVault.files.set("note.md", { bytes: enc("remote-newer"), mtime: 20 })
+    writerVault.files.set("second.md", { bytes: enc("a legitimate addition"), mtime: 90 })
+    await new V4SyncSession({
+      github, vault: writerVault, index: writerIndex, config: remoteConfig, keyring,
+      conflictPolicy: "copy", abortChangePercent: 0,
+    }).sync({ operation: "normal", allowThresholdOverride: false })
+    const pluginTip = github.ref!.sha
+    const tipCommit = github.commits.get(pluginTip)!
+    assert.deepEqual(tipCommit.parents, [base])
+    const baseHead = await decodeV4RemoteHead(github.trees.get(github.commits.get(base)!.treeSha)!.get(V4_HEAD_PATH)!, remoteConfig, keyring)
+    const tipHead = await decodeV4RemoteHead(github.trees.get(tipCommit.treeSha)!.get(V4_HEAD_PATH)!, remoteConfig, keyring)
+    const note = indexRecordByPath(writerIndex, "note.md")
+    assert.equal(tipHead.shardHashes[note.pathId.slice(0, 2)], baseHead.shardHashes[note.pathId.slice(0, 2)])
+    const tree = new Map(github.trees.get(tipCommit.treeSha)!)
+    const original = tree.get(note.remotePath)!
+    tree.set(note.remotePath, mode === "plaintext" ? enc("github-newer")
+      : new Uint8Array(original.map((byte, i) => i === 0 ? byte ^ 1 : byte)))
+    const treeSha = `tree-d202-first-${mode}`
+    const commitSha = `commit-d202-first-${mode}`
+    github.trees.set(treeSha, tree)
+    github.commits.set(commitSha, { treeSha, parents: [base], message: tipCommit.message })
+    github.ref = { ref: "refs/heads/main", sha: commitSha, type: "commit" }
+    github.files = new Map(tree)
+    const freshIndex = createEmptyV4LocalIndex({
+      repoId: "o/r#main", deviceId: "fresh", mode,
+      pathLayout: mode === "encrypted" ? "opaque-stable-v1" : "plaintext-v1",
+    })
+    const freshVault = new MemoryVault()
+    const session = () => new V4SyncSession({
+      github, vault: freshVault, index: freshIndex, config: remoteConfig, keyring,
+      conflictPolicy: "copy", abortChangePercent: 0,
+    })
+    if (mode === "encrypted") {
+      await assert.rejects(
+        () => session().sync({ operation: "forcePull", allowThresholdOverride: false }),
+        /External GitHub changes touched an encrypted V4 branch/u,
+      )
+      assert.equal(github.ref?.sha, commitSha)
+      assert.equal(freshIndex.remoteCommitSha, undefined)
+      assert.deepEqual(freshVault.operations, [])
+    } else {
+      await session().sync({ operation: "forcePull", allowThresholdOverride: false })
+      assert.equal(dec(freshVault.files.get("note.md")!.bytes), "github-newer")
+      assert.equal(dec(freshVault.files.get("second.md")!.bytes), "a legitimate addition")
+    }
+  }
+})
+
+test("D202 a plugin-shaped tip cannot silently replace an unchanged indexed Git blob", async () => {
+  for (const mode of ["plaintext", "encrypted"] as const) {
+    const { github, vault, index, remoteConfig, keyring } = await unknownBaseFixture(mode, "remote-newer")
+    const baseline = github.ref!.sha
+    const bucket = Object.keys(index.shards)[0]!
+    index.shards[bucket]!.hash = index.shardHashes[bucket]!
+    const writerIndex = structuredClone(index)
+    writerIndex.deviceId = "writer"
+    const writerVault = new MemoryVault()
+    writerVault.files.set("note.md", { bytes: enc("remote-newer"), mtime: 20 })
+    writerVault.files.set("second.md", { bytes: enc("published by plugin"), mtime: 80 })
+    await new V4SyncSession({
+      github, vault: writerVault, index: writerIndex, config: remoteConfig, keyring,
+      conflictPolicy: "copy", abortChangePercent: 0,
+    }).sync({ operation: "normal", allowThresholdOverride: false })
+    const genuineTip = github.ref!.sha
+    const genuineCommit = github.commits.get(genuineTip)!
+    assert.deepEqual(genuineCommit.parents, [baseline])
+    const indexedPath = indexRecordByPath(index, "note.md").remotePath
+    const baselineBytes = github.trees.get(github.commits.get(baseline)!.treeSha)!.get(indexedPath)!
+    const tipTree = new Map(github.trees.get(genuineCommit.treeSha)!)
+    assert.deepEqual(tipTree.get(indexedPath), baselineBytes, "The real writer left the note unmodified")
+    tipTree.set(indexedPath, mode === "plaintext"
+      ? enc("github-newer")
+      : new Uint8Array(baselineBytes.map((byte, i) => i === 0 ? byte ^ 1 : byte)))
+    const treeSha = `tree-d202-replaced-${mode}`
+    const tipSha = `commit-d202-replaced-${mode}`
+    github.trees.set(treeSha, tipTree)
+    github.commits.set(tipSha, { treeSha, parents: [baseline], message: genuineCommit.message })
+    github.ref = { ref: "refs/heads/main", sha: tipSha, type: "commit" }
+    github.files = new Map(tipTree)
+    vault.operations.length = 0
+
+    const session = () => new V4SyncSession({
+      github, vault, index, config: remoteConfig, keyring, conflictPolicy: "newer", abortChangePercent: 0,
+    })
+    if (mode === "encrypted") {
+      await assert.rejects(
+        () => session().sync({ operation: "normal", allowThresholdOverride: false }),
+        /External GitHub changes touched an encrypted V4 branch/u,
+      )
+      assert.equal(github.ref?.sha, tipSha)
+      assert.equal(index.remoteCommitSha, baseline)
+      assert.deepEqual(vault.operations, [])
+    } else {
+      await session().sync({ operation: "normal", allowThresholdOverride: false })
+      assert.equal(dec(vault.files.get("note.md")!.bytes), "github-newer")
+      assert.equal(dec(vault.files.get("second.md")!.bytes), "published by plugin")
+      const restored = new MemoryVault()
+      const freshIndex = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "fresh", mode: "plaintext" })
+      await new V4SyncSession({
+        github, vault: restored, index: freshIndex, config: remoteConfig,
+        conflictPolicy: "copy", abortChangePercent: 0,
+      }).sync({ operation: "forcePull", allowThresholdOverride: false })
+      assert.equal(dec(restored.files.get("note.md")!.bytes), "github-newer")
+    }
+  }
+})
+
+test("D202 a stale device checks its trusted base across two concealed plugin-shaped generations", async () => {
+  for (const mode of ["plaintext", "encrypted"] as const) {
+    const { github, vault, index, remoteConfig, keyring } = await unknownBaseFixture(mode, "remote-newer")
+    const baseline = github.ref!.sha
+    const bucket = Object.keys(index.shards)[0]!
+    index.shards[bucket]!.hash = index.shardHashes[bucket]!
+    const writerIndex = structuredClone(index)
+    const writerVault = new MemoryVault()
+    writerVault.files.set("note.md", { bytes: enc("remote-newer"), mtime: 20 })
+    const pluginCommits: string[] = []
+    for (const [path, content] of [["second.md", "second plugin file"], ["third.md", "third plugin file"]] as const) {
+      writerVault.files.set(path, { bytes: enc(content), mtime: 100 + pluginCommits.length })
+      await new V4SyncSession({
+        github, vault: writerVault, index: writerIndex, config: remoteConfig, keyring,
+        conflictPolicy: "copy", abortChangePercent: 0,
+      }).sync({ operation: "normal", allowThresholdOverride: false })
+      pluginCommits.push(github.ref!.sha)
+    }
+    assert.deepEqual(github.commits.get(pluginCommits[0]!)!.parents, [baseline])
+    assert.deepEqual(github.commits.get(pluginCommits[1]!)!.parents, [pluginCommits[0]!])
+    const physicalPath = indexRecordByPath(index, "note.md").remotePath
+    const baselineBytes = github.trees.get(github.commits.get(baseline)!.treeSha)!.get(physicalPath)!
+    const tamperedBytes = mode === "plaintext" ? enc("github-newer")
+      : new Uint8Array(baselineBytes.map((byte, i) => i === 0 ? byte ^ 1 : byte))
+    for (const [step, sha] of pluginCommits.entries()) {
+      const commit = github.commits.get(sha)!
+      const tree = new Map(github.trees.get(commit.treeSha)!)
+      tree.set(physicalPath, tamperedBytes)
+      const treeSha = `tree-d202-hidden-history-${mode}-${step}`
+      github.trees.set(treeSha, tree)
+      commit.treeSha = treeSha
+    }
+    const tip = pluginCommits[1]!
+    github.files = new Map(github.trees.get(github.commits.get(tip)!.treeSha)!)
+    assert.equal(computeV4GitBlobSha1(github.files.get(physicalPath)!),
+      computeV4GitBlobSha1(github.trees.get(github.commits.get(pluginCommits[0]!)!.treeSha)!.get(physicalPath)!),
+      "The latest parent and tip have the same forged blob; only the older trusted anchor reveals the edit")
+    vault.operations.length = 0
+    const session = () => new V4SyncSession({
+      github, vault, index, config: remoteConfig, keyring,
+      conflictPolicy: "newer", abortChangePercent: 0,
+    })
+    if (mode === "encrypted") {
+      await assert.rejects(
+        () => session().sync({ operation: "normal", allowThresholdOverride: false }),
+        /External GitHub changes touched an encrypted V4 branch/u,
+      )
+      assert.equal(github.ref?.sha, tip)
+      assert.equal(index.remoteCommitSha, baseline)
+      assert.deepEqual(vault.operations, [])
+    } else {
+      await session().sync({ operation: "normal", allowThresholdOverride: false })
+      assert.equal(dec(vault.files.get("note.md")!.bytes), "github-newer")
+      assert.equal(dec(vault.files.get("second.md")!.bytes), "second plugin file")
+      assert.equal(dec(vault.files.get("third.md")!.bytes), "third plugin file")
+    }
+  }
+})
+
 test("D201 a coherent V4 tip cannot hide an unindexed Git tree file", async () => {
   for (const mode of ["plaintext", "encrypted"] as const) {
     const { github, vault, index, remoteConfig, keyring } = await unknownBaseFixture(mode, "remote-newer")
@@ -3251,6 +3425,7 @@ test("v4 no-op reuses all 256 unchanged local index shards", async () => {
   const tree = new Map<string, Uint8Array>([
     [V4_CONFIG_PATH, enc(JSON.stringify(config()))],
     [V4_HEAD_PATH, enc(JSON.stringify(head))],
+    ...[...vault.files].map(([path, file]) => [path, file.bytes] as const),
   ]);
   const previousTree = new Map(tree);
   previousTree.set(V4_HEAD_PATH, enc(JSON.stringify({ ...head, generation: 1, journalId: "j0", updatedAt: 1 })));
