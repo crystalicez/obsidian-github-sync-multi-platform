@@ -207,15 +207,26 @@ function logical(records: V4IndexFileRecord[]): V4LogicalFile[] {
 }
 
 function assertNoCaseInsensitiveCollisions(files: V4LogicalFile[]): void {
-  const seen = new Map<string, string>()
+  const seen = new Map<string, V4LogicalFile>()
   const topology: V4PathTopology = { directoryCasing: new Map(), blobPaths: new Set() }
   for (const file of files) {
     const key = file.path.normalize("NFC").toLowerCase()
     const previous = seen.get(key)
-    if (previous && previous !== file.path) throw new Error(`Case-insensitive path collision: ${previous} <-> ${file.path}`)
+    if (previous && (previous.path !== file.path || previous.fileId !== file.fileId)) {
+      throw new Error(`Case-insensitive path collision: ${previous.path} <-> ${file.path}`)
+    }
     assertV4PathTopology(file.path, "blob", topology, "Case-insensitive path topology collision; sync is unsafe.")
-    seen.set(key, file.path)
+    seen.set(key, file)
   }
+}
+
+function assertProjectedV4PathTopology(files: V4LogicalFile[], changes: V4PlannedChange[]): void {
+  const byId = new Map(files.map(file => [file.fileId, file]))
+  for (const change of changes) {
+    if (change.after) byId.set(change.fileId, change.after)
+    else byId.delete(change.fileId)
+  }
+  assertNoCaseInsensitiveCollisions([...byId.values()])
 }
 
 function recordPaths(record: V4IndexFileRecord): string[] {
@@ -795,6 +806,15 @@ export class V4SyncSession {
         })
       }
     }
+
+    assertProjectedV4PathTopology(localFiles, [
+      ...batch.pulls.map(binding => binding.change),
+      ...batch.stagedWrites.map(binding => binding.change),
+    ])
+    assertProjectedV4PathTopology(
+      logical(isLayoutMigration ? [] : allRemoteRecords),
+      batch.pushes.map(binding => binding.change),
+    )
 
     for (const stagedCopy of stagedCopyPulls) {
       const remoteRecord = stagedCopy.pull.remoteRecord!

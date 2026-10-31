@@ -3618,6 +3618,78 @@ test("D201/D207 incomplete or unsafe tip tree evidence refuses Sync before any m
   }
 })
 
+test("D208 Sync cannot combine individually safe local and remote paths into a colliding tree", async () => {
+  for (const mode of ["plaintext", "encrypted"] as const) {
+    for (const [remotePath, localPath] of [
+      ["Notes/remote.md", "notes/local.md"],
+      ["container.md", "container.md/child.md"],
+      ["container.md/child.md", "container.md"],
+    ]) {
+      const { github, index, remoteConfig, keyring } = await unknownBaseFixture(mode, null)
+      const originalRef = github.ref!.sha
+      const writerIndex = structuredClone(index)
+      const bucket = Object.keys(writerIndex.shards)[0]!
+      writerIndex.shards[bucket]!.hash = writerIndex.shardHashes[bucket]!
+      const writerVault = new MemoryVault()
+      writerVault.files.set("note.md", { bytes: enc("remote-newer"), mtime: 20 })
+      writerVault.files.set(remotePath, { bytes: enc("remote file"), mtime: 30 })
+      await new V4SyncSession({
+        github, vault: writerVault, index: writerIndex, config: remoteConfig, keyring,
+        conflictPolicy: "copy", abortChangePercent: 0,
+      }).sync({ operation: "normal", allowThresholdOverride: false })
+      const publishedRef = github.ref!.sha
+      assert.notEqual(publishedRef, originalRef)
+      const localVault = new MemoryVault()
+      localVault.files.set("note.md", { bytes: enc("remote-newer"), mtime: 20 })
+      localVault.files.set(localPath, { bytes: enc("local file"), mtime: 31 })
+      const mutationCount = github.commitMessages.length
+      await assert.rejects(
+        () => new V4SyncSession({
+          github, vault: localVault, index, config: remoteConfig, keyring,
+          conflictPolicy: "copy", abortChangePercent: 0,
+        }).sync({ operation: "normal", allowThresholdOverride: false }),
+        /Case-insensitive path topology collision/u,
+      )
+      assert.equal(github.ref?.sha, publishedRef)
+      assert.equal(github.commitMessages.length, mutationCount)
+      assert.equal(index.remoteCommitSha, originalRef)
+      assert.deepEqual(localVault.operations.filter(operation => operation.startsWith("write:")
+        || operation.startsWith("delete:") || operation.startsWith("trash:")
+        || operation.startsWith("commit-stage:")), [])
+
+      await new V4SyncSession({
+        github, vault: localVault, index, config: remoteConfig, keyring,
+        conflictPolicy: "copy", abortChangePercent: 0,
+      }).sync({ operation: "forcePull", allowThresholdOverride: false })
+      assert.equal(localVault.files.has(localPath), false)
+      assert.equal(dec(localVault.files.get(remotePath)!.bytes), "remote file")
+      assert.equal(index.remoteCommitSha, publishedRef)
+      assert.equal(github.ref?.sha, publishedRef)
+    }
+  }
+})
+
+test("D208 case-only folder rename preserves identity and publishes one canonical directory", async () => {
+  for (const mode of ["plaintext", "encrypted"] as const) {
+    const fixture = await queuedUnknownBaseFixture(mode,
+      [["Notes/a.md", "a-content"], ["Notes/sub/b.md", "b-content"]],
+      [["notes/a.md", "a-content"], ["notes/sub/b.md", "b-content"]])
+    const originalId = fixture.remoteRecords["Notes/a.md"].fileId
+    await new V4SyncSession({
+      github: fixture.github, vault: fixture.vault, index: fixture.index,
+      config: fixture.remoteConfig, keyring: fixture.keyring,
+      conflictPolicy: "copy", abortChangePercent: 0,
+    }).sync({ operation: "normal", allowThresholdOverride: false, changes: [
+      { type: "folderRename", oldPath: "Notes", path: "notes", mtime: 30 },
+    ] })
+    assert.equal(indexRecordByPath(fixture.index, "notes/a.md").fileId, originalId)
+    const restored = await forcePullQueuedFixture(fixture)
+    assert.equal(restored.vault.files.has("Notes/a.md"), false)
+    assert.equal(dec(restored.vault.files.get("notes/a.md")!.bytes), "a-content")
+    assert.equal(dec(restored.vault.files.get("notes/sub/b.md")!.bytes), "b-content")
+  }
+})
+
 test("D207 Sync refuses to publish case-folded folder aliases or file/directory collisions", async () => {
   for (const mode of ["plaintext", "encrypted"] as const) {
     for (const paths of [
