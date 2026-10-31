@@ -541,7 +541,7 @@ test("D95 distinguishes absent and conflicting backup refs WITHOUT retry authori
     assert.equal(result.destinationPublicationAuthorized, false)
     assert.equal(result.cutoverAuthorized, false)
     assert.equal(f.blobReads, 0)
-    assert.equal(recovery.readCount, 2)
+    assert.equal(recovery.readCount, 3)
     assert.ok(Object.isFrozen(result))
   }
 })
@@ -570,8 +570,35 @@ test("D95 uncertain create recovery verifies all real frozen encrypted objects a
     destinationPublicationAuthorized: false,
     cutoverAuthorized: false,
   })
-  assert.equal(recovery.readCount, 3)
+  assert.equal(recovery.readCount, 4)
   assert.ok(f.blobReads > 1)
+})
+
+test("D191 backup recovery refuses a ref changed during final repository and default-branch proof", async () => {
+  for (const [initial, changed] of [
+    [commitSha, "d".repeat(40)],
+    [null, commitSha],
+    ["d".repeat(40), "e".repeat(40)],
+  ] as const) {
+    const fixture = await createFixture()
+    const recovery = backupRecoveryClient(fixture, initial)
+    const getDefault = recovery.github.getRepositoryDefaultBranch
+    let defaultReads = 0
+    recovery.github.getRepositoryDefaultBranch = async () => {
+      const observed = await getDefault()
+      if (++defaultReads === 2) recovery.changeRef(changed)
+      return observed
+    }
+    await assert.rejects(
+      () => inspectV4FrozenBackupAfterAmbiguousCreate({
+        backup: recovery.github, plan: frozenPlan,
+        expectedSourceTreeSha: rootTreeSha, originalPassphrase: "correct",
+      }),
+      /ref changed/i,
+      "A late remote ref change must not become a trusted backup recovery report",
+    )
+    assert.equal(defaultReads, 2)
+  }
 })
 
 test("D95 refuses unknown API outcome or changes in backup ref during reconciliation", async () => {

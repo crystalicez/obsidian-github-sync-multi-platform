@@ -148,6 +148,10 @@ export async function inspectV4FrozenBackupAfterAmbiguousCreate(
   if (finalDefault !== expectedDefault) {
     throw new Error("Frozen backup GitHub default branch changed during recovery.")
   }
+  const finalRef = await readRef()
+  if (finalRef?.sha !== second?.sha) {
+    throw new Error("Frozen backup Git ref changed during final repository proof.")
+  }
   return Object.freeze({
     integrityScope: "ambiguous-backup-create-read-only-reconciliation",
     backupRepoId: plan.backupRepoId,
