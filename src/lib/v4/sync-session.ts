@@ -127,8 +127,6 @@ export class V4RecoveryReplanRequiredError extends Error {
   }
 }
 
-const MAX_V4_ANCESTRY_AUDIT_COMMITS = 128
-
 function assertV4CompleteRecursiveGitTree(tree: GitHubTree, expectedSha: string, context: string): void {
   if (tree?.sha !== expectedSha || tree.truncated !== false || !Array.isArray(tree.tree)
     || tree.tree.length > 100_000) {
@@ -349,22 +347,14 @@ export class V4SyncSession {
       let commit = tip
       let head = remote.head
       let hasCoherentPluginAdvance = false
-      let auditExhausted = true
-      for (let depth = 0; depth < MAX_V4_ANCESTRY_AUDIT_COMMITS; depth++) {
+      for (let remaining = remote.head.generation; remaining > 0; remaining--) {
         throwIfV4Aborted(this.input.signal)
-        if (commit.message?.split("\n", 1)[0] !== `obsidian-sync-v4:${head.journalId}`) {
-          auditExhausted = false
-          break
-        }
+        if (commit.message?.split("\n", 1)[0] !== `obsidian-sync-v4:${head.journalId}`) break
         if (commit.parentShas.length === 0) {
           hasCoherentPluginAdvance = !baseCommitSha && head.generation === 1
-          auditExhausted = false
           break
         }
-        if (commit.parentShas.length !== 1) {
-          auditExhausted = false
-          break
-        }
+        if (commit.parentShas.length !== 1) break
         const parentSha = commit.parentShas[0]!
         const parentFile = await this.input.github.getFileBytes(V4_HEAD_PATH, parentSha)
         if (!parentFile) {
@@ -373,26 +363,18 @@ export class V4SyncSession {
             hasCoherentPluginAdvance = bootstrap.parentShas.length === 0
               && bootstrap.message === "obsidian-sync-v4:bootstrap"
           }
-          auditExhausted = false
           break
         }
         const parentHead = await decodeV4RemoteHead(parentFile.bytes, remote.config, this.input.keyring)
         if (parentHead.epoch !== head.epoch
           || parentHead.generation + 1 !== head.generation
-          || parentHead.journalId === head.journalId) {
-          auditExhausted = false
-          break
-        }
+          || parentHead.journalId === head.journalId) break
         if (parentSha === baseCommitSha) {
           hasCoherentPluginAdvance = true
-          auditExhausted = false
           break
         }
         head = parentHead
         commit = await this.input.github.getGitCommit(parentSha)
-      }
-      if (auditExhausted && remote.config.mode === "encrypted") {
-        throw new Error(`Encrypted V4 Git history exceeds the ${MAX_V4_ANCESTRY_AUDIT_COMMITS}-commit ancestry verification limit. Review the branch history before reconnecting.`)
       }
       if (!hasCoherentPluginAdvance) {
         await this.reconcileExternalCommit(remote, tip.treeSha)

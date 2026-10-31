@@ -11,7 +11,7 @@ import { V4_CONFIG_PATH, V4_FORMAT_VERSION, V4_HEAD_PATH, V4_ROOT, type V4Remote
 import { decryptV4Payload, deriveV4Keyring, encryptV4Payload } from "../../src/lib/v4/crypto";
 import { sha256Hex } from "../../src/lib/bytes";
 import { computeV4GitBlobSha1 } from "../../src/lib/v4/git-blob-identity";
-import { buildV4RemoteMetadata } from "../../src/lib/v4/remote-index";
+import { buildV4RemoteMetadata, decodeV4RemoteHead } from "../../src/lib/v4/remote-index";
 import { publishV4TreeChanges } from "../../src/lib/v4/git-tree-writer";
 import { V4_LARGE_FILE_THRESHOLD_BYTES } from "../../src/lib/v4/large-files";
 import type { V4SyncProgressPatch } from "../../src/lib/v4/progress";
@@ -2823,8 +2823,8 @@ test("D199 detects an external ancestor hidden three plugin commits behind the t
   }
 })
 
-test("D199 encrypted first-time ancestry audit accepts 128 commits but refuses 129 without local mutations", async () => {
-  for (const count of [128, 129]) {
+test("D200 encrypted first-time ancestry audit accepts 128, 129 and 257 valid generations", async () => {
+  for (const count of [128, 129, 257]) {
     const { github, index: initialIndex, remoteConfig, keyring } = await unknownBaseFixture("encrypted", null)
     let previous = github.ref!.sha
     for (let generation = 2; generation <= count; generation++) {
@@ -2853,19 +2853,81 @@ test("D199 encrypted first-time ancestry audit accepts 128 commits but refuses 1
     const session = () => new V4SyncSession({
       github, vault, index, config: remoteConfig, keyring, conflictPolicy: "copy", abortChangePercent: 0,
     })
-    if (count === 129) {
+    await session().sync({ operation: "forcePull", allowThresholdOverride: false })
+    assert.equal(dec(vault.files.get("note.md")!.bytes), "remote-newer")
+    assert.equal(index.remoteCommitSha, previous)
+    assert.equal(github.ref?.sha, previous, "Ancestry verification cannot move the remote branch")
+  }
+})
+
+test("D200 detects an external commit beyond the former 128-generation limit", async () => {
+  for (const mode of ["plaintext", "encrypted"] as const) {
+    const { github, remoteConfig, keyring } = await unknownBaseFixture(mode, null)
+    const baseSha = github.ref!.sha
+    let previous = baseSha
+    const generationCount = 140
+    const pluginShas: string[] = []
+    const baseHead = await decodeV4RemoteHead(github.files.get(V4_HEAD_PATH)!, remoteConfig, keyring)
+    for (let generation = 2; generation <= generationCount; generation++) {
+      const head: V4RemoteHead = {
+        ...baseHead, generation, journalId: `deep-${generation}`, updatedAt: generation,
+      }
+      const files = await buildV4RemoteMetadata({ config: remoteConfig, head, records: [], keyring, buckets: [] })
+      const tree = new Map(github.trees.get(github.commits.get(previous)!.treeSha)!)
+      tree.set(V4_HEAD_PATH, files.find(file => file.path === V4_HEAD_PATH)!.bytes)
+      const treeSha = `tree-d200-deep-${mode}-${generation}`
+      const sha = `commit-d200-deep-${mode}-${generation}`
+      github.trees.set(treeSha, tree)
+      github.commits.set(sha, { treeSha, parents: [previous], message: `obsidian-sync-v4:${head.journalId}` })
+      pluginShas.push(sha)
+      previous = sha
+    }
+    const foreignText = "remote note added before all later plugin generations"
+    const externalTree = new Map(github.trees.get(github.commits.get(baseSha)!.treeSha)!)
+    externalTree.set("foreign.md", enc(foreignText))
+    github.trees.set(`tree-d200-foreign-${mode}`, externalTree)
+    github.commits.set(`commit-d200-foreign-${mode}`, {
+      treeSha: `tree-d200-foreign-${mode}`, parents: [baseSha], message: "Direct GitHub edit",
+    })
+    github.commits.get(pluginShas[0]!)!.parents = [`commit-d200-foreign-${mode}`]
+    for (const sha of pluginShas) {
+      const commit = github.commits.get(sha)!
+      const tree = new Map(github.trees.get(commit.treeSha)!)
+      tree.set("foreign.md", enc(foreignText))
+      github.trees.set(`tree-d200-with-foreign-${mode}-${sha}`, tree)
+      commit.treeSha = `tree-d200-with-foreign-${mode}-${sha}`
+    }
+    github.ref = { ref: "refs/heads/main", sha: previous, type: "commit" }
+    github.files = new Map(github.trees.get(github.commits.get(previous)!.treeSha)!)
+    const index = createEmptyV4LocalIndex({
+      repoId: "o/r#main", deviceId: "new-device", mode,
+      pathLayout: mode === "encrypted" ? "opaque-stable-v1" : "plaintext-v1",
+    })
+    const vault = new MemoryVault()
+    const session = () => new V4SyncSession({
+      github, vault, index, config: remoteConfig, keyring,
+      conflictPolicy: "copy", abortChangePercent: 0,
+    })
+    if (mode === "encrypted") {
       await assert.rejects(
-        () => session().sync({ operation: "forcePull", allowThresholdOverride: false }),
-        /128-commit ancestry verification limit/u,
+        () => session().sync({ operation: "normal", allowThresholdOverride: false }),
+        /External GitHub changes touched an encrypted V4 branch/u,
       )
+      assert.equal(github.ref?.sha, previous)
       assert.equal(index.remoteCommitSha, undefined)
       assert.deepEqual(vault.operations, [])
     } else {
-      await session().sync({ operation: "forcePull", allowThresholdOverride: false })
-      assert.equal(dec(vault.files.get("note.md")!.bytes), "remote-newer")
-      assert.equal(index.remoteCommitSha, previous)
+      await session().sync({ operation: "normal", allowThresholdOverride: false })
+      assert.equal(dec(vault.files.get("foreign.md")!.bytes), foreignText)
+      assert.equal(dec(github.files.get("foreign.md")!), foreignText)
+      const restored = new MemoryVault()
+      const restoredIndex = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "reader", mode: "plaintext" })
+      await new V4SyncSession({
+        github, vault: restored, index: restoredIndex, config: remoteConfig,
+        conflictPolicy: "copy", abortChangePercent: 0,
+      }).sync({ operation: "forcePull", allowThresholdOverride: false })
+      assert.equal(dec(restored.files.get("foreign.md")!.bytes), foreignText)
     }
-    assert.equal(github.ref?.sha, previous, "Ancestry verification cannot move the remote branch")
   }
 })
 
