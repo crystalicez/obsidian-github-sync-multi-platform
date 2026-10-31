@@ -22,8 +22,8 @@ import { trashV4LocalUserFile } from "./local-delete-policy"
 import { bucketForV4PathId, normalizeV4VaultPath } from "./paths"
 import { computeV4GitBlobSha1 } from "./git-blob-identity"
 import { planV4Sync, type V4LogicalFile, type V4PlannedChange, type V4SyncOperation } from "./planner"
-import { assertV4RemoteRecordSet, buildV4RemoteMetadata, v4RemoteShardPath } from "./remote-index"
-import { effectiveV4PathLayout, expectedV4PathLayout, V4_CONFIG_PATH, V4_ROOT, type V4RemoteConfig, type V4RemoteHead } from "./protocol-types"
+import { assertV4RemoteRecordSet, buildV4RemoteMetadata, decodeV4RemoteHead, v4RemoteShardPath } from "./remote-index"
+import { effectiveV4PathLayout, expectedV4PathLayout, V4_CONFIG_PATH, V4_HEAD_PATH, V4_ROOT, type V4RemoteConfig, type V4RemoteHead } from "./protocol-types"
 import { loadV4RemoteConfig, loadV4RemoteState, remoteV4StateFromLocalIndex, type V4RemoteState } from "./remote-loader"
 import { V4StorageCodec } from "./storage-codec"
 import { collectV4ContentSource, createV4WholeBufferContentSource, DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES, type V4ContentHandle, type V4ContentSource } from "./content-source"
@@ -345,7 +345,17 @@ export class V4SyncSession {
     if (remote && this.input.index.remoteCommitSha && remote.commitSha !== this.input.index.remoteCommitSha) {
       const tip = await this.input.github.getGitCommit(remote.commitSha)
       const pluginMessage = `obsidian-sync-v4:${remote.head.journalId}`
-      if (tip.message?.split("\n", 1)[0] !== pluginMessage) {
+      let hasCoherentPluginAdvance = false
+      if (tip.message?.split("\n", 1)[0] === pluginMessage && tip.parentShas.length === 1) {
+        const previousFile = await this.input.github.getFileBytes(V4_HEAD_PATH, tip.parentShas[0]!)
+        if (previousFile) {
+          const previousHead = await decodeV4RemoteHead(previousFile.bytes, remote.config, this.input.keyring)
+          hasCoherentPluginAdvance = previousHead.epoch === remote.head.epoch
+            && previousHead.generation + 1 === remote.head.generation
+            && previousHead.journalId !== remote.head.journalId
+        }
+      }
+      if (!hasCoherentPluginAdvance) {
         await this.reconcileExternalCommit(remote, tip.treeSha)
         externalReconciled = true
       }

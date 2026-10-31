@@ -2343,6 +2343,43 @@ test("D192 plaintext external GitHub reconciliation cannot treat partial Git evi
   }
 })
 
+test("D194 a copied plugin commit message cannot hide out-of-band GitHub edits", async () => {
+  for (const mode of ["plaintext", "encrypted"] as const) {
+    const fixture = await unknownBaseFixture(mode, "remote-newer")
+    const { github, vault, index, remoteConfig, keyring } = fixture
+    const base = github.ref!.sha
+    const baseCommit = github.commits.get(base)!
+    const tree = new Map(github.trees.get(baseCommit.treeSha)!)
+    if (mode === "plaintext") tree.set("note.md", enc("external edit hidden by copied commit message"))
+    else tree.set("foreign.md", enc("out-of-band change"))
+    github.trees.set("tree-d194-forged", tree)
+    github.commits.set("commit-d194-forged", {
+      treeSha: "tree-d194-forged", parents: [base], message: baseCommit.message,
+    })
+    github.ref = { ref: "refs/heads/main", sha: "commit-d194-forged", type: "commit" }
+    github.files = new Map(tree)
+    vault.operations.length = 0
+    const session = new V4SyncSession({
+      github, vault, index, config: remoteConfig, keyring,
+      conflictPolicy: "newer", abortChangePercent: 0,
+    })
+    if (mode === "encrypted") {
+      await assert.rejects(
+        () => session.sync({ operation: "normal", allowThresholdOverride: false }),
+        /External GitHub changes touched an encrypted V4 branch/u,
+      )
+      assert.deepEqual(vault.operations, [], "Encrypted out-of-band change must not touch the vault")
+      assert.equal(index.remoteCommitSha, base)
+      assert.equal(github.ref?.sha, "commit-d194-forged", "Encrypted Sync must not publish over unrecognized history")
+    } else {
+      const result = await session.sync({ operation: "normal", allowThresholdOverride: false })
+      assert.ok(result.mode === "pull" || result.mode === "pull-push")
+      assert.equal(dec(vault.files.get("note.md")!.bytes), "external edit hidden by copied commit message")
+      assert.equal(dec(github.files.get("note.md")!), "external edit hidden by copied commit message")
+    }
+  }
+})
+
 test("D193 external plaintext Sync rejects forged blob evidence and unsafe recursive entries before mutation", async () => {
   for (const scenario of [
     "wrong-blob-sha", "altered-bytes", "symlink", "duplicate", "unsafe-path",
@@ -2458,20 +2495,25 @@ test("v4 no-op reuses all 256 unchanged local index shards", async () => {
   index.remoteCommitSha = "commit-previous";
   index.epoch = 1;
   index.generation = 1;
-  const head: V4RemoteHead = { formatVersion: 4, mode: "plaintext", epoch: 1, generation: 1, journalId: "j1", shardHashes, updatedAt: 1, deviceId: "other" };
+  const head: V4RemoteHead = { formatVersion: 4, mode: "plaintext", epoch: 1, generation: 2, journalId: "j1", shardHashes, updatedAt: 2, deviceId: "other" };
   const tree = new Map<string, Uint8Array>([
     [V4_CONFIG_PATH, enc(JSON.stringify(config()))],
     [V4_HEAD_PATH, enc(JSON.stringify(head))],
   ]);
+  const previousTree = new Map(tree);
+  previousTree.set(V4_HEAD_PATH, enc(JSON.stringify({ ...head, generation: 1, journalId: "j0", updatedAt: 1 })));
+  github.trees.set("tree-previous", previousTree);
+  github.commits.set("commit-previous", { treeSha: "tree-previous", parents: [], message: "obsidian-sync-v4:j0" });
   github.trees.set("tree-noop", tree);
-  github.commits.set("commit-noop", { treeSha: "tree-noop", parents: [], message: "obsidian-sync-v4:j1" });
+  github.commits.set("commit-noop", { treeSha: "tree-noop", parents: ["commit-previous"], message: "obsidian-sync-v4:j1" });
   github.ref = { ref: "refs/heads/main", sha: "commit-noop", type: "commit" };
   github.files = new Map(tree);
 
   const result = await new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 }).sync({ operation: "normal", allowThresholdOverride: false });
 
   assert.equal(result.mode, "noop");
-  assert.deepEqual(github.readPaths, [V4_CONFIG_PATH, V4_HEAD_PATH]);
+  assert.deepEqual(github.readPaths, [V4_CONFIG_PATH, V4_HEAD_PATH, V4_HEAD_PATH]);
+  assert.deepEqual(github.readRefs, ["commit-noop", "commit-noop", "commit-previous"]);
   assert.equal(vault.operations.length, 0);
 });
 
