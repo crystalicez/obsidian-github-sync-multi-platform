@@ -18,6 +18,7 @@ import type { V4ThreeBranchPublicationReport } from "../../src/lib/v4/reencrypti
 import { inspectV4ReencryptionCrossSurfaceProof } from "../../src/lib/v4/reencryption-cross-surface-proof"
 import { inspectV4FencedPrecommitReadinessAfterRestart } from "../../src/lib/v4/reencryption-fenced-precommit-readiness"
 import { inspectV4FencedCrashWindowPairAfterRestart } from "../../src/lib/v4/reencryption-fenced-crash-window-pair-inspection"
+import { inspectV4FencedLivePostCrashAfterRestart } from "../../src/lib/v4/reencryption-fenced-live-post-crash-verification"
 import { inspectV4FencedLocalCrashTriageAfterRestart } from "../../src/lib/v4/reencryption-fenced-local-crash-triage"
 import { deriveV4FencedCommitPairSnapshotTestContract, inspectV4FencedCommitPairSnapshotTestVectors } from "../../src/lib/v4/reencryption-fenced-commit-pair-snapshot-provenance"
 import { sealV4ReencryptionCommitPairTestVectors, type V4ReencryptionCommitPairTestContract } from "../../src/lib/v4/reencryption-commit-pair-test-vectors"
@@ -1031,6 +1032,243 @@ test("D184 historical D183 full-Git-proven pair on local disk remains diagnostic
   const legacy = await inspectV4FencedLocalCrashTriageAfterRestart(f.prepared)
   assert.equal(legacy.observation, "manual-recovery-required")
   assert.equal(legacy.reason, "unrecognized-selector-or-commit-artifact")
+})
+
+const d185Input = (
+  f: Awaited<ReturnType<typeof d179Scenario>>,
+  contract: V4ReencryptionCommitPairTestContract,
+) => ({
+  local: {
+    prepared: f.prepared, contract,
+    sourceSettings: { ...f.prepared.restart.settings },
+  },
+  remote: f.input.full,
+})
+async function d185PlacePairedEvidence(
+  f: Awaited<ReturnType<typeof d179Scenario>>,
+  pair: Awaited<ReturnType<typeof sealV4ReencryptionCommitPairTestVectors>>,
+) {
+  const root = V4_RUNTIME_INDEX_ROOT + "-rekey-proposed-" + f.id.runId
+  await f.s.adapter.mkdir(root)
+  await f.s.adapter.write(root + "/marker.json", pair.receiptTestVector)
+  await f.s.adapter.write(
+    V4_RUNTIME_INDEX_ROOT + "-rekey-selector-" + f.id.runId + "/selector.json",
+    pair.selectorTestVector,
+  )
+}
+
+test("D185 single held lease brackets local post-crash readback with two fresh complete Destination Git scans", async () => {
+  const f = await d179Scenario()
+  const { contract } = await d183PreparedPair(f)
+  // Production GitHub clients may have cyclic runtime state; the verifier
+  // must pin methods without serializing an entire client object.
+  Object.assign(f.s.f.github, { circularClientState: f.s.f.github })
+  const input = d185Input(f, contract)
+  const original = new Map(f.s.files)
+  const originalWrites = f.s.getWrites()
+  const calls = f.s.holderCounts().calls
+  const reads = f.s.f.reads
+  const refs = f.s.f.refs
+  const report = await inspectV4FencedLivePostCrashAfterRestart(input)
+  assert.deepEqual(report, {
+    integrityScope: "read-only-post-crash-local-pair-and-current-complete-git",
+    evidence: "best-effort-wal-readback-not-power-loss-durable",
+    observation: "source-prepared-and-git-reverified-uncommitted",
+    reason: "source-and-git-coherent-but-uncommitted",
+    local: {
+      integrityScope: "read-only-fenced-post-crash-test-pair-window",
+      evidence: "historical-d183-witness-and-best-effort-wal-readback-not-durable",
+      observation: "source-prepared-uncommitted",
+      reason: "source-still-selected-no-pair",
+      artifactWindow: "absent", settingsSelection: "source",
+      activeIndexSelection: "source", pairEvidence: "absent",
+      localCutoverAuthorized: false, resumeSyncAuthorized: false,
+      rollbackAuthorized: false, remoteWritesAuthorized: false,
+      oldPassphraseCleanupAuthorized: false,
+    },
+    fullDestinationContentReverifiedAfterRestart: true,
+    liveThreeBranchRefsReverifiedAfterRestart: true,
+    localCutoverAuthorized: false, resumeSyncAuthorized: false,
+    rollbackAuthorized: false, remoteWritesAuthorized: false,
+    oldPassphraseCleanupAuthorized: false,
+  })
+  assert.equal(Object.isFrozen(report), true)
+  assert.equal(Object.isFrozen(report.local), true)
+  assert.deepEqual(f.s.holderCounts(), { calls: calls + 1, held: false })
+  assert.ok(f.s.f.reads >= reads + 8, "two full AES-GCM Git ciphertext reads")
+  assert.ok(f.s.f.refs > refs, "live GitHub ref queries cannot be historical-only")
+  assert.deepEqual(f.s.files, original)
+  assert.equal(f.s.getWrites(), originalWrites)
+  assert.equal(f.s.secrets.get("old-d138"), "old-d138-secret")
+})
+
+test("D185 on-disk valid D182 pair plus current full Git proof still requires Manual Recovery", async () => {
+  const f = await d179Scenario()
+  const { contract, pair } = await d183PreparedPair(f)
+  await d185PlacePairedEvidence(f, pair)
+  const writes = f.s.getWrites()
+  const files = new Map(f.s.files)
+  const report = await inspectV4FencedLivePostCrashAfterRestart(d185Input(f, contract))
+  assert.equal(report.observation, "crash-window-git-reverified-manual-recovery")
+  assert.equal(report.reason, "local-crash-window-still-requires-manual-recovery")
+  assert.equal(report.local?.reason, "linked-test-pair-not-authoritative")
+  assert.equal(report.local?.pairEvidence, "cryptographically-linked-uncommitted")
+  assert.equal(report.fullDestinationContentReverifiedAfterRestart, true)
+  assert.equal(report.liveThreeBranchRefsReverifiedAfterRestart, true)
+  assert.equal(report.resumeSyncAuthorized, false)
+  assert.equal(report.localCutoverAuthorized, false)
+  assert.equal(report.rollbackAuthorized, false)
+  assert.equal(report.oldPassphraseCleanupAuthorized, false)
+  assert.equal(f.s.getWrites(), writes)
+  assert.deepEqual(f.s.files, files)
+})
+
+test("D185 a Destination-looking Settings/Index cannot become an authorized commit even with live Git proof", async () => {
+  const f = await d179Scenario()
+  const { contract, pair } = await d183PreparedPair(f)
+  const input = d185Input(f, contract)
+  await d185PlacePairedEvidence(f, pair)
+  const shadow = await loadV4LocalIndex(f.s.adapter, V4_RUNTIME_INDEX_ROOT + "-rekey-" + f.id.runId)
+  await saveV4LocalIndex(f.s.adapter, V4_RUNTIME_INDEX_ROOT, shadow)
+  input.local.prepared.restart.settings.githubBranch = "rekey/d83"
+  input.local.prepared.restart.settings.encryptionPassphraseSecretId = f.id.destinationPassphraseSecretId
+  const writes = f.s.getWrites()
+  const result = await inspectV4FencedLivePostCrashAfterRestart(input)
+  assert.equal(result.observation, "crash-window-git-reverified-manual-recovery")
+  assert.equal(result.local?.reason, "historical-evidence-missing-or-changed")
+  assert.equal(result.local?.activeIndexSelection, "destination")
+  assert.equal(result.local?.settingsSelection, "destination")
+  assert.equal(result.fullDestinationContentReverifiedAfterRestart, true)
+  assert.equal(result.resumeSyncAuthorized, false)
+  assert.equal(result.oldPassphraseCleanupAuthorized, false)
+  assert.equal(f.s.getWrites(), writes)
+})
+
+test("D185 remote Source, Backup or Destination ref drift and damaged encrypted Git Blob fail closed", async () => {
+  for (const cause of ["source-ref", "backup-ref", "destination-ref", "blob", "non-orphan", "wal"] as const) {
+    const f = await d179Scenario()
+    const { contract, pair } = await d183PreparedPair(f)
+    await d185PlacePairedEvidence(f, pair)
+    if (cause === "source-ref" || cause === "backup-ref") {
+      const reader = f.input.full.branches.readers[cause === "source-ref" ? "source" : "backup"]
+      reader.getGitRefOrNull = async () => ({
+        ref: "refs/heads/" + reader.branchName, type: "commit" as const, sha: "9".repeat(40),
+      })
+    } else if (cause === "destination-ref") f.s.f.changeRef("9".repeat(40))
+    else if (cause === "blob") {
+      const blob = f.s.f.blobs.get(f.s.f.receipts[0]!.sha)!
+      const damaged = blob.slice()
+      damaged[damaged.length - 1] ^= 1
+      f.s.f.blobs.set(f.s.f.receipts[0]!.sha, damaged)
+    } else if (cause === "non-orphan") {
+      f.s.f.github.getGitCommit = async () => ({
+        sha: rootSha, treeSha, parentShas: [pinned], message: "bad parent",
+      })
+    } else f.s.setWal({ ...f.s.getWal(), generation: 999 })
+    const writes = f.s.getWrites()
+    const result = await inspectV4FencedLivePostCrashAfterRestart(d185Input(f, contract))
+    assert.equal(result.observation, "manual-recovery-required", cause)
+    assert.equal(result.reason, "local-or-live-git-proof-uncertain", cause)
+    assert.equal(result.local, null, cause)
+    assert.equal(result.fullDestinationContentReverifiedAfterRestart, false, cause)
+    assert.equal(result.resumeSyncAuthorized, false, cause)
+    assert.equal(f.s.getWrites(), writes, cause)
+    assert.equal(f.s.holderCounts().held, false)
+  }
+})
+
+test("D185 a Git ref moving between two full-content rechecks fails closed despite unchanged local Receipt", async () => {
+  const f = await d179Scenario()
+  const { contract, pair } = await d183PreparedPair(f)
+  await d185PlacePairedEvidence(f, pair)
+  const originalRead = f.s.adapter.read
+  const selectorPath = V4_RUNTIME_INDEX_ROOT + "-rekey-selector-" + f.id.runId + "/selector.json"
+  let selectorReads = 0
+  f.s.adapter.read = async path => {
+    const value = await originalRead(path)
+    if (path === selectorPath && ++selectorReads === 3) {
+      // D184's second inspection begins after the FIRST D178 complete scan.
+      f.s.f.changeRef("9".repeat(40))
+    }
+    return value
+  }
+  const writes = f.s.getWrites()
+  const report = await inspectV4FencedLivePostCrashAfterRestart(d185Input(f, contract))
+  assert.ok(selectorReads >= 3)
+  assert.equal(report.observation, "manual-recovery-required")
+  assert.equal(report.fullDestinationContentReverifiedAfterRestart, false)
+  assert.equal(report.local, null)
+  assert.equal(report.resumeSyncAuthorized, false)
+  assert.equal(f.s.getWrites(), writes)
+  assert.equal(f.s.holderCounts().held, false)
+})
+
+test("D185 mutated SecretStorage, Source Index or Git reader during Git Blob retrieval refuses remote proof", async () => {
+  for (const cause of ["secret", "source-index", "reader"] as const) {
+    const f = await d179Scenario()
+    const { contract } = await d183PreparedPair(f)
+    const oldBlob = f.s.f.github.getBlob
+    let changed = false
+    f.s.f.github.getBlob = async sha => {
+      const bytes = await oldBlob(sha)
+      if (!changed) {
+        changed = true
+        if (cause === "secret") f.s.secrets.set("new-d138", "swapped-mid-remote")
+        else if (cause === "source-index") {
+          const index = await loadV4LocalIndex(f.s.adapter, V4_RUNTIME_INDEX_ROOT)
+          index.epoch++
+          await saveV4LocalIndex(f.s.adapter, V4_RUNTIME_INDEX_ROOT, index)
+        } else {
+          f.input.full.branches.readers.source.getGitCommit = async () => ({
+            sha: pinned, treeSha: sourceTree,
+            parentShas: [], message: "swapped reader",
+          })
+        }
+      }
+      return bytes
+    }
+    const writes = f.s.getWrites()
+    const result = await inspectV4FencedLivePostCrashAfterRestart(d185Input(f, contract))
+    assert.equal(changed, true, cause)
+    assert.equal(result.observation, "manual-recovery-required", cause)
+    assert.equal(result.fullDestinationContentReverifiedAfterRestart, false, cause)
+    assert.equal(result.resumeSyncAuthorized, false, cause)
+    assert.equal(f.s.getWrites(), writes + (cause === "source-index" ? 1 : 0), cause)
+    assert.equal(f.s.holderCounts().held, false, cause)
+  }
+})
+
+test("D185 forged, double-called or post-mutating outer Holder cannot report positive current Git evidence", async () => {
+  for (const cause of ["skip", "double", "post-settings", "post-ref-method"] as const) {
+    const f = await d179Scenario()
+    const { contract } = await d183PreparedPair(f)
+    const input = d185Input(f, contract)
+    const originalHolder = f.prepared.withExclusiveInitiatorLease
+    const previous = cause === "skip"
+      ? await inspectV4FencedLivePostCrashAfterRestart(input)
+      : null
+    const wrapper = async <T>(action: () => Promise<T>): Promise<T> => {
+      if (cause === "skip") return previous as T
+      return originalHolder(async () => {
+        const first = await action()
+        if (cause === "double") await action()
+        else if (cause === "post-settings") f.prepared.restart.settings.githubBranch = "other"
+        else f.input.full.branches.readers.backup.getGitRefOrNull = async () => ({
+          ref: "refs/heads/backup/d178", type: "commit" as const, sha: pinned,
+        })
+        return first
+      })
+    }
+    f.prepared.withExclusiveInitiatorLease = wrapper
+    f.input.full.branches.withExclusiveInitiatorLease = wrapper
+    const writes = f.s.getWrites()
+    const report = await inspectV4FencedLivePostCrashAfterRestart(input)
+    assert.equal(report.observation, "manual-recovery-required", cause)
+    assert.equal(report.fullDestinationContentReverifiedAfterRestart, false, cause)
+    assert.equal(report.resumeSyncAuthorized, false, cause)
+    assert.equal(f.s.getWrites(), writes, cause)
+    assert.equal(f.s.holderCounts().held, false, cause)
+  }
 })
 
 test("D179 encrypted Source/Intent/Secrets, D176 prepared Selector, D178 full Git content share one lease", async () => {
