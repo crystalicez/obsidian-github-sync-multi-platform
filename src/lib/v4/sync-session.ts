@@ -128,6 +128,13 @@ export class V4RecoveryReplanRequiredError extends Error {
   }
 }
 
+export class V4PublishedLocalApplyError extends Error {
+  constructor(public readonly publishedCommitSha: string, public readonly targetPath: string, cause: unknown) {
+    super(`GitHub ref update succeeded at ${publishedCommitSha}, but local Merge apply failed for ${targetPath}. Review the local note and remote branch before retrying; do not Force Push or Force Pull without manual recovery.`, { cause })
+    this.name = "V4PublishedLocalApplyError"
+  }
+}
+
 type V4PathTopology = {
   directoryCasing: Map<string, string>
   blobPaths: Set<string>
@@ -819,6 +826,12 @@ export class V4SyncSession {
       batch.pushes.map(binding => binding.change),
     )
 
+    if (!this.input.recoveryStore) {
+      for (const binding of batch.stagedWrites) {
+        await this.assertStagedWritePreconditions(binding, localById)
+      }
+    }
+
     for (const stagedCopy of stagedCopyPulls) {
       const remoteRecord = stagedCopy.pull.remoteRecord!
       const bytes = prefetchedRemoteBodies.get(remoteRecord.fileId) ?? await this.readRecord(remoteRecord, stagedCopy.pull.remoteCommitSha)
@@ -844,9 +857,6 @@ export class V4SyncSession {
           this.report({ currentPath: binding.change.path, currentDirection: "pull", pull: directional(pullCompleted, pullTotal) })
         })
         pulledFiles++
-      }
-      for (const binding of batch.stagedWrites) {
-        await this.applyStagedWrite(binding, localById)
       }
     }
 
@@ -1225,6 +1235,11 @@ export class V4SyncSession {
       })
       : undefined
     preserveStagesForRecovery = !!recoverySnapshot && (recoveryPlan?.payload.mutations.length ?? 0) > 0
+    if (!this.input.recoveryStore) {
+      for (const binding of batch.stagedWrites) {
+        await this.assertStagedWritePreconditions(binding, localById)
+      }
+    }
     await deferV4Cancellation(this.input.signal, () => publishV4CandidateRef(this.input.github, candidate, this.input.signal))
     if (this.input.recoveryStore && recoverySnapshot) {
       const publication = await reconcileV4CandidatePublication(this.input.github, {
@@ -1265,6 +1280,15 @@ export class V4SyncSession {
         }
       }
       preserveStagesForRecovery = false
+    }
+    if (!this.input.recoveryStore) {
+      for (const binding of batch.stagedWrites) {
+        try {
+          await this.applyStagedWrite(binding, localById)
+        } catch (error) {
+          throw new V4PublishedLocalApplyError(candidate.commitSha, binding.change.path, error)
+        }
+      }
     }
     const published = { ...candidate, fileShas: uploaded.fileShas }
     this.replaceIndex(finalRecords, head, published.commitSha)
@@ -1788,6 +1812,20 @@ export class V4SyncSession {
     onCompleted()
   }
 
+  private async assertStagedWritePreconditions(
+    binding: V4StagedWriteBinding,
+    localById: ReadonlyMap<string, V4LogicalFile>,
+  ): Promise<V4LocalTargetPrecondition | undefined> {
+    const change = binding.change
+    const target = this.pullPrecondition(change, localById)
+    const previous = change.kind === "rename" && change.previousPath
+      ? this.pullPrecondition(change, localById, change.previousPath)
+      : undefined
+    await assertV4LocalTargetPrecondition(this.localIo, target)
+    if (previous) await assertV4LocalTargetPrecondition(this.localIo, previous)
+    return previous
+  }
+
   private async applyStagedWrite(binding: V4StagedWriteBinding, localById: ReadonlyMap<string, V4LogicalFile>): Promise<void> {
     const change = binding.change
     this.report({
@@ -1796,12 +1834,7 @@ export class V4SyncSession {
       currentDirection: "push",
     })
     const bytes = await this.readStage(binding.stage)
-    const target = this.pullPrecondition(change, localById)
-    const previous = change.kind === "rename" && change.previousPath
-      ? this.pullPrecondition(change, localById, change.previousPath)
-      : undefined
-    await assertV4LocalTargetPrecondition(this.localIo, target)
-    if (previous) await assertV4LocalTargetPrecondition(this.localIo, previous)
+    const previous = await this.assertStagedWritePreconditions(binding, localById)
     await this.localIo.write(change.path, bytes, binding.stage.mtime)
     if (previous) {
       await assertV4LocalTargetPrecondition(this.localIo, previous)

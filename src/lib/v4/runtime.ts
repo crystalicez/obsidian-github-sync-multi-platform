@@ -14,7 +14,7 @@ import {
 } from "./local-index"
 import { decodeV4RemoteConfig } from "./remote-index"
 import { createV4ScopePredicate, isPathInV4SyncScope } from "./scope"
-import { assertV4PathLayoutCompatible, V4ChangeGuardError, V4RecoveryReplanRequiredError, V4SyncSession, type V4SyncRunState } from "./sync-session"
+import { assertV4PathLayoutCompatible, V4ChangeGuardError, V4PublishedLocalApplyError, V4RecoveryReplanRequiredError, V4SyncSession, type V4SyncRunState } from "./sync-session"
 import type { V4ConflictResolution } from "./conflicts"
 import { V4SyncCoordinator, type V4QueuedChange, type V4SyncRequest } from "./sync-coordinator"
 import { expectedV4PathLayout, V4_FORMAT_VERSION, V4_CONFIG_PATH, type V4RemoteConfig, type V4StorageMode } from "./protocol-types"
@@ -993,6 +993,8 @@ export class V4PluginRuntime {
       } else if (error instanceof V4ManualRecoveryRequiredError) {
         // Never present a destructive override when backup evidence is missing.
         this.askUserToReviewRecovery(error)
+      } else if (error instanceof V4PublishedLocalApplyError) {
+        this.askUserToReviewPublishedMerge(error)
       } else {
         new Notice(`GitHub Sync failed: ${message}`)
       }
@@ -1006,6 +1008,21 @@ export class V4PluginRuntime {
         if (this.coordinator.pendingCount > 0) this.beginWaitingRun()
       }
     }
+  }
+
+  private askUserToReviewPublishedMerge(error: V4PublishedLocalApplyError): void {
+    const modal = new Modal(this.plugin.app)
+    modal.titleEl.setText("GitHub Sync: Published Merge needs manual review")
+    modal.contentEl.createEl("p", { text: "GitHub accepted the new commit, but this device could not finish applying the merged note locally. The Local Index may still reference the older commit." })
+    modal.contentEl.createEl("p", { text: `Affected note: ${error.targetPath}` })
+    modal.contentEl.createEl("p", { text: `Published commit: ${error.publishedCommitSha}` })
+    modal.contentEl.createEl("p", { text: "Preserve the current Vault and remote branch. Back up the Vault, inspect all recently merged notes (some may already be written), compare the published commit, and resolve differences manually before retrying. Do not Force Push or Force Pull to dismiss this warning." })
+    const buttons = modal.contentEl.createDiv()
+    buttons.createEl("button", { text: "Keep files unchanged" }).onclick = () => modal.close()
+    buttons.createEl("button", { text: "Copy recovery details" }).onclick = () => {
+      void navigator.clipboard?.writeText(error.message).catch(() => new Notice("Could not copy recovery details."))
+    }
+    modal.open()
   }
 
   private askUserToReviewOpenEditor(error: V4OpenEditorConflictError): void {

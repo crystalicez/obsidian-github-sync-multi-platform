@@ -5,7 +5,7 @@ import type { GitHubCreateTreeEntry } from "../../src/lib/github-git-types";
 import { V4HistoryService } from "../../src/lib/v4/history-service";
 import type { V4JournalChange } from "../../src/lib/v4/history-journal";
 import { createEmptyV4LocalIndex, type V4IndexFileRecord, type V4LocalIndex, type V4LocalIndexAdapter } from "../../src/lib/v4/local-index";
-import { assertV4PathLayoutCompatible, V4ChangeGuardError, V4RemoteObjectMissingError, V4SyncSession, type V4SessionVault } from "../../src/lib/v4/sync-session";
+import { assertV4PathLayoutCompatible, V4ChangeGuardError, V4PublishedLocalApplyError, V4RemoteObjectMissingError, V4SyncSession, type V4SessionVault } from "../../src/lib/v4/sync-session";
 import { coalesceV4Changes, type V4QueuedChange } from "../../src/lib/v4/sync-coordinator";
 import { V4_CONFIG_PATH, V4_FORMAT_VERSION, V4_HEAD_PATH, V4_ROOT, type V4RemoteConfig, type V4RemoteHead } from "../../src/lib/v4/protocol-types";
 import { decryptV4Payload, deriveV4Keyring, encryptV4Payload } from "../../src/lib/v4/crypto";
@@ -1431,13 +1431,126 @@ test("D210 staged Merge preserves an old-path note created during destination wr
       }).sync({ operation: "normal", allowThresholdOverride: false, changes: [
         { type: "rename", oldPath: "note.md", path: "renamed.md", mtime: 30 },
       ] }),
-      error => error instanceof V4LocalTargetChangedError,
+      error => error instanceof V4PublishedLocalApplyError
+        && error.targetPath === "renamed.md"
+        && error.cause instanceof V4LocalTargetChangedError,
     )
     assert.equal(dec(fixture.vault.files.get("note.md")!.bytes), "human-during-write")
     assert.equal(dec(fixture.vault.files.get("renamed.md")!.bytes), "merged-content")
     assert.deepEqual(fixture.vault.operations.filter(operation => operation.startsWith("trash:")), [])
     assert.equal(fixture.index.remoteCommitSha, fixture.previousCommit)
+    assert.notEqual(fixture.github.ref?.sha, fixture.publishedCommit)
+  }
+})
+
+test("D212 Git upload failure leaves a no-WAL Merge rename's original local content untouched", async () => {
+  for (const mode of ["plaintext", "encrypted"] as const) {
+    const fixture = await d210MergeRenameFixture(mode)
+    fixture.vault.operations.length = 0
+    fixture.github.createGitBlob = async () => { throw new Error("D212 simulated Git upload failure") }
+    await assert.rejects(
+      () => new V4SyncSession({
+        github: fixture.github, vault: fixture.vault, index: fixture.index,
+        config: fixture.remoteConfig, keyring: fixture.keyring,
+        conflictPolicy: "ask", abortChangePercent: 0,
+        askConflict: async () => ({ action: "merged", mergedBytes: enc("merged-content") }),
+      }).sync({ operation: "normal", allowThresholdOverride: false, changes: [
+        { type: "rename", oldPath: "note.md", path: "renamed.md", mtime: 30 },
+      ] }),
+      /D212 simulated Git upload failure/u,
+    )
+    assert.equal(dec(fixture.vault.files.get("renamed.md")!.bytes), "local-edit")
+    assert.equal(fixture.vault.files.has("note.md"), false)
+    assert.deepEqual(fixture.vault.operations.filter(op => /^(?:write|trash|commit-stage):/u.test(op)), [])
+    assert.equal(fixture.index.remoteCommitSha, fixture.previousCommit)
     assert.equal(fixture.github.ref?.sha, fixture.publishedCommit)
+  }
+})
+
+test("D212 a same-size same-mtime local edit during upload prevents Merge publication", async () => {
+  for (const mode of ["plaintext", "encrypted"] as const) {
+    const fixture = await d210MergeRenameFixture(mode)
+    const upload = fixture.github.createGitBlob.bind(fixture.github)
+    let edited = false
+    fixture.github.createGitBlob = async bytes => {
+      if (!edited) {
+        edited = true
+        fixture.vault.files.set("renamed.md", { bytes: enc("human-edit"), mtime: 30 })
+      }
+      return upload(bytes)
+    }
+    await assert.rejects(
+      () => new V4SyncSession({
+        github: fixture.github, vault: fixture.vault, index: fixture.index,
+        config: fixture.remoteConfig, keyring: fixture.keyring,
+        conflictPolicy: "ask", abortChangePercent: 0,
+        askConflict: async () => ({ action: "merged", mergedBytes: enc("merged-content") }),
+      }).sync({ operation: "normal", allowThresholdOverride: false, changes: [
+        { type: "rename", oldPath: "note.md", path: "renamed.md", mtime: 30 },
+      ] }),
+      error => error instanceof V4LocalTargetChangedError,
+    )
+    assert.equal(edited, true)
+    assert.equal(dec(fixture.vault.files.get("renamed.md")!.bytes), "human-edit")
+    assert.equal(fixture.github.ref?.sha, fixture.publishedCommit)
+    assert.equal(fixture.index.remoteCommitSha, fixture.previousCommit)
+    assert.deepEqual(fixture.vault.operations.filter(op => /^(?:write|trash|commit-stage):/u.test(op)), [])
+  }
+})
+
+test("D212 no-WAL Merge rename writes local result only after successful Git ref update", async () => {
+  for (const mode of ["plaintext", "encrypted"] as const) {
+    const fixture = await d210MergeRenameFixture(mode)
+    const write = fixture.vault.write.bind(fixture.vault)
+    let observedPublication = false
+    fixture.vault.write = async (path, bytes, mtime) => {
+      if (path === "renamed.md") {
+        observedPublication = fixture.github.ref?.sha !== fixture.publishedCommit
+        assert.equal(observedPublication, true, "Merge must not replace the local note before Git ref publication")
+      }
+      await write(path, bytes, mtime)
+    }
+    const result = await new V4SyncSession({
+      github: fixture.github, vault: fixture.vault, index: fixture.index,
+      config: fixture.remoteConfig, keyring: fixture.keyring,
+      conflictPolicy: "ask", abortChangePercent: 0,
+      askConflict: async () => ({ action: "merged", mergedBytes: enc("merged-content") }),
+    }).sync({ operation: "normal", allowThresholdOverride: false, changes: [
+      { type: "rename", oldPath: "note.md", path: "renamed.md", mtime: 30 },
+    ] })
+    assert.equal(observedPublication, true)
+    assert.equal(dec(fixture.vault.files.get("renamed.md")!.bytes), "merged-content")
+    assert.equal(result.mode, "push")
+    assert.equal(fixture.index.remoteCommitSha, fixture.github.ref!.sha)
+  }
+})
+
+test("D212 failed local Merge write after publication keeps the old note and index for manual reconciliation", async () => {
+  for (const mode of ["plaintext", "encrypted"] as const) {
+    const fixture = await d210MergeRenameFixture(mode)
+    fixture.vault.write = async (path) => {
+      if (path === "renamed.md") throw new Error("D212 simulated Vault write failure")
+    }
+    await assert.rejects(
+      () => new V4SyncSession({
+        github: fixture.github, vault: fixture.vault, index: fixture.index,
+        config: fixture.remoteConfig, keyring: fixture.keyring,
+        conflictPolicy: "ask", abortChangePercent: 0,
+        askConflict: async () => ({ action: "merged", mergedBytes: enc("merged-content") }),
+      }).sync({ operation: "normal", allowThresholdOverride: false, changes: [
+        { type: "rename", oldPath: "note.md", path: "renamed.md", mtime: 30 },
+      ] }),
+      error => error instanceof V4PublishedLocalApplyError
+        && error.targetPath === "renamed.md"
+        && error.publishedCommitSha === fixture.github.ref?.sha
+        && error.cause instanceof Error
+        && /D212 simulated Vault write failure/u.test(error.cause.message)
+        && /manual recovery/u.test(error.message),
+    )
+    assert.equal(dec(fixture.vault.files.get("renamed.md")!.bytes), "local-edit")
+    assert.equal(fixture.vault.files.has("note.md"), false)
+    assert.notEqual(fixture.github.ref?.sha, fixture.publishedCommit)
+    assert.equal(fixture.index.remoteCommitSha, fixture.previousCommit)
   }
 })
 
@@ -4253,7 +4366,7 @@ test("v4 merged conflict output does not trigger a second changed-path stat resc
   });
 
   assert.equal(result.pushedFiles, 2);
-  assert.equal(statCalls, 8, `expected initial stat, pre/post hash snapshots and two staged-write safety stats, got ${statCalls}`);
+  assert.equal(statCalls, 12, `expected initial stat, pre/post hash snapshots and six staged-write prepublication/application safety stats, got ${statCalls}`);
   assert.equal(dec(fixture.localVault.files.get("A.md")!.bytes), "merged:A.md");
   assert.equal(dec(fixture.github.files.get("A.md")!), "merged:A.md");
 });
