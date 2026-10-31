@@ -843,7 +843,7 @@ export class V4SyncSession {
         pulledFiles++
       }
       for (const binding of batch.stagedWrites) {
-        await this.applyStagedWrite(binding)
+        await this.applyStagedWrite(binding, localById)
       }
     }
 
@@ -1785,17 +1785,25 @@ export class V4SyncSession {
     onCompleted()
   }
 
-  private async applyStagedWrite(binding: V4StagedWriteBinding): Promise<void> {
+  private async applyStagedWrite(binding: V4StagedWriteBinding, localById: ReadonlyMap<string, V4LogicalFile>): Promise<void> {
+    const change = binding.change
     this.report({
       phase: "applying",
-      currentPath: binding.change.path,
+      currentPath: change.path,
       currentDirection: "push",
     })
     const bytes = await this.readStage(binding.stage)
-    if (binding.change.kind === "rename" && binding.change.previousPath) {
-      await trashV4LocalUserFile(this.localIo, binding.change.previousPath)
+    const target = this.pullPrecondition(change, localById)
+    const previous = change.kind === "rename" && change.previousPath
+      ? this.pullPrecondition(change, localById, change.previousPath)
+      : undefined
+    await assertV4LocalTargetPrecondition(this.localIo, target)
+    if (previous) await assertV4LocalTargetPrecondition(this.localIo, previous)
+    await this.localIo.write(change.path, bytes, binding.stage.mtime)
+    if (previous) {
+      await assertV4LocalTargetPrecondition(this.localIo, previous)
+      if (previous.exists) await trashV4LocalUserFile(this.localIo, previous.path)
     }
-    await this.localIo.write(binding.change.path, bytes, binding.stage.mtime)
   }
 
   private async readLocal(path: string): Promise<Uint8Array> {

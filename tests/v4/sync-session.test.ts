@@ -1337,6 +1337,139 @@ test("v4 keep-local-copy-remote leaves pull incomplete with applying context whe
   assert.deepEqual(lastDirectional(events, "pull"), { completed: 0, total: 1 });
 });
 
+async function d210MergeRenameFixture(mode: "plaintext" | "encrypted") {
+  const fixture = await unknownBaseFixture(mode, "remote-newer")
+  const bucket = fixture.remoteRecord.pathId.slice(0, 2)
+  fixture.index.shards[bucket]!.hash = fixture.index.shardHashes[bucket]!
+  const writerIndex = structuredClone(fixture.index)
+  writerIndex.deviceId = "writer-d210"
+  const writerVault = new MemoryVault()
+  writerVault.files.set("note.md", { bytes: enc("remote-edit"), mtime: 40 })
+  await new V4SyncSession({
+    github: fixture.github, vault: writerVault, index: writerIndex,
+    config: fixture.remoteConfig, keyring: fixture.keyring,
+    conflictPolicy: "copy", abortChangePercent: 0,
+  }).sync({ operation: "normal", allowThresholdOverride: false, changes: [
+    { type: "modify", path: "note.md", mtime: 40 },
+  ] })
+  const previousCommit = fixture.index.remoteCommitSha
+  const publishedCommit = fixture.github.ref!.sha
+  fixture.vault.files.delete("note.md")
+  fixture.vault.files.set("renamed.md", { bytes: enc("local-edit"), mtime: 30 })
+  return { ...fixture, previousCommit, publishedCommit }
+}
+
+test("D210 staged Merge rename never trashes a new user note at the remote old path", async () => {
+  for (const mode of ["plaintext", "encrypted"] as const) {
+    const fixture = await d210MergeRenameFixture(mode)
+    let asked = false
+    await assert.rejects(
+      () => new V4SyncSession({
+        github: fixture.github, vault: fixture.vault, index: fixture.index,
+        config: fixture.remoteConfig, keyring: fixture.keyring,
+        conflictPolicy: "ask", abortChangePercent: 0,
+        askConflict: async () => {
+          asked = true
+          fixture.vault.files.set("note.md", { bytes: enc("human-new-note"), mtime: 50 })
+          return { action: "merged", mergedBytes: enc("merged-content") }
+        },
+      }).sync({ operation: "normal", allowThresholdOverride: false, changes: [
+        { type: "rename", oldPath: "note.md", path: "renamed.md", mtime: 30 },
+      ] }),
+      error => error instanceof V4LocalTargetChangedError,
+    )
+    assert.equal(asked, true)
+    assert.equal(dec(fixture.vault.files.get("note.md")!.bytes), "human-new-note")
+    assert.equal(dec(fixture.vault.files.get("renamed.md")!.bytes), "local-edit")
+    assert.deepEqual(fixture.vault.operations.filter(operation => operation.startsWith("trash:")
+      || operation.startsWith("write:")), [])
+    assert.equal(fixture.index.remoteCommitSha, fixture.previousCommit)
+    assert.equal(fixture.github.ref?.sha, fixture.publishedCommit)
+  }
+})
+
+test("D210 staged Merge refuses to overwrite a locally modified rename target", async () => {
+  for (const mode of ["plaintext", "encrypted"] as const) {
+    const fixture = await d210MergeRenameFixture(mode)
+    await assert.rejects(
+      () => new V4SyncSession({
+        github: fixture.github, vault: fixture.vault, index: fixture.index,
+        config: fixture.remoteConfig, keyring: fixture.keyring,
+        conflictPolicy: "ask", abortChangePercent: 0,
+        askConflict: async () => {
+          fixture.vault.files.set("renamed.md", { bytes: enc("human-edit"), mtime: 30 })
+          return { action: "merged", mergedBytes: enc("merged-content") }
+        },
+      }).sync({ operation: "normal", allowThresholdOverride: false, changes: [
+        { type: "rename", oldPath: "note.md", path: "renamed.md", mtime: 30 },
+      ] }),
+      error => error instanceof V4LocalTargetChangedError,
+    )
+    assert.equal(dec(fixture.vault.files.get("renamed.md")!.bytes), "human-edit")
+    assert.equal(fixture.vault.files.has("note.md"), false)
+    assert.deepEqual(fixture.vault.operations.filter(operation => operation.startsWith("trash:")
+      || operation.startsWith("write:")), [])
+    assert.equal(fixture.index.remoteCommitSha, fixture.previousCommit)
+    assert.equal(fixture.github.ref?.sha, fixture.publishedCommit)
+  }
+})
+
+test("D210 staged Merge preserves an old-path note created during destination write", async () => {
+  for (const mode of ["plaintext", "encrypted"] as const) {
+    const fixture = await d210MergeRenameFixture(mode)
+    const originalWrite = fixture.vault.write.bind(fixture.vault)
+    fixture.vault.write = async (path, bytes, mtime) => {
+      await originalWrite(path, bytes, mtime)
+      if (path === "renamed.md") fixture.vault.files.set("note.md", { bytes: enc("human-during-write"), mtime: 50 })
+    }
+    await assert.rejects(
+      () => new V4SyncSession({
+        github: fixture.github, vault: fixture.vault, index: fixture.index,
+        config: fixture.remoteConfig, keyring: fixture.keyring,
+        conflictPolicy: "ask", abortChangePercent: 0,
+        askConflict: async () => ({ action: "merged", mergedBytes: enc("merged-content") }),
+      }).sync({ operation: "normal", allowThresholdOverride: false, changes: [
+        { type: "rename", oldPath: "note.md", path: "renamed.md", mtime: 30 },
+      ] }),
+      error => error instanceof V4LocalTargetChangedError,
+    )
+    assert.equal(dec(fixture.vault.files.get("note.md")!.bytes), "human-during-write")
+    assert.equal(dec(fixture.vault.files.get("renamed.md")!.bytes), "merged-content")
+    assert.deepEqual(fixture.vault.operations.filter(operation => operation.startsWith("trash:")), [])
+    assert.equal(fixture.index.remoteCommitSha, fixture.previousCommit)
+    assert.equal(fixture.github.ref?.sha, fixture.publishedCommit)
+  }
+})
+
+test("D210 valid staged Merge rename publishes and restores without trashing an absent old path", async () => {
+  for (const mode of ["plaintext", "encrypted"] as const) {
+    const fixture = await d210MergeRenameFixture(mode)
+    const result = await new V4SyncSession({
+      github: fixture.github, vault: fixture.vault, index: fixture.index,
+      config: fixture.remoteConfig, keyring: fixture.keyring,
+      conflictPolicy: "ask", abortChangePercent: 0,
+      askConflict: async () => ({ action: "merged", mergedBytes: enc("merged-content") }),
+    }).sync({ operation: "normal", allowThresholdOverride: false, changes: [
+      { type: "rename", oldPath: "note.md", path: "renamed.md", mtime: 30 },
+    ] })
+    assert.equal(result.mode, "push")
+    assert.equal(dec(fixture.vault.files.get("renamed.md")!.bytes), "merged-content")
+    assert.equal(fixture.vault.files.has("note.md"), false)
+    assert.deepEqual(fixture.vault.operations.filter(operation => operation.startsWith("trash:")), [])
+    const restored = new MemoryVault()
+    const index = createEmptyV4LocalIndex({
+      repoId: "o/r#main", deviceId: "d210-peer", mode,
+      pathLayout: mode === "encrypted" ? "opaque-stable-v1" : "plaintext-v1",
+    })
+    await new V4SyncSession({
+      github: fixture.github, vault: restored, index, config: fixture.remoteConfig,
+      keyring: fixture.keyring, conflictPolicy: "copy", abortChangePercent: 0,
+    }).sync({ operation: "forcePull", allowThresholdOverride: false })
+    assert.equal(dec(restored.files.get("renamed.md")!.bytes), "merged-content")
+    assert.equal(restored.files.has("note.md"), false)
+  }
+})
+
 test("v4 defers a merged local write until every conflict decision and exact total are final", async () => {
   const fixture = await divergedConflictFixture(["A.md", "B.md"]);
   const secondDecision = deferred<{ action: "use-local" }>();
@@ -4077,7 +4210,7 @@ test("v4 merged conflict output does not trigger a second changed-path stat resc
   });
 
   assert.equal(result.pushedFiles, 2);
-  assert.equal(statCalls, 6, `expected initial stat plus pre/post hash snapshot checks only, got ${statCalls}`);
+  assert.equal(statCalls, 8, `expected initial stat, pre/post hash snapshots and two staged-write safety stats, got ${statCalls}`);
   assert.equal(dec(fixture.localVault.files.get("A.md")!.bytes), "merged:A.md");
   assert.equal(dec(fixture.github.files.get("A.md")!), "merged:A.md");
 });
