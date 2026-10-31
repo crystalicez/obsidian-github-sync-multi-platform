@@ -4324,6 +4324,72 @@ test("v4 pull preserves a local user edit that appears while remote bytes are in
 });
 
 
+test("D209 failed small Pull rename retains its original local file without WAL", async () => {
+  for (const mode of ["plaintext", "encrypted"] as const) {
+    const { github, vault, index, remoteConfig, keyring, remoteRecord } = await unknownBaseFixture(mode, "remote-newer")
+    const bucket = remoteRecord.pathId.slice(0, 2)
+    index.shards[bucket]!.hash = index.shardHashes[bucket]!
+    const previousRef = github.ref!.sha
+    const writerIndex = structuredClone(index)
+    writerIndex.deviceId = "writer-d209"
+    const writerVault = new MemoryVault()
+    writerVault.files.set("renamed.md", { bytes: enc("remote-newer"), mtime: 30 })
+    await new V4SyncSession({
+      github, vault: writerVault, index: writerIndex, config: remoteConfig, keyring,
+      conflictPolicy: "copy", abortChangePercent: 0,
+    }).sync({ operation: "normal", allowThresholdOverride: false, changes: [
+      { type: "rename", oldPath: "note.md", path: "renamed.md", mtime: 30 },
+    ] })
+    const tipRef = github.ref!.sha
+    assert.notEqual(tipRef, previousRef)
+
+    const write = vault.write.bind(vault)
+    vault.write = async (path, bytes, mtime) => {
+      if (path === "renamed.md") throw new Error("injected destination write failure")
+      await write(path, bytes, mtime)
+    }
+    await assert.rejects(() => new V4SyncSession({
+      github, vault, index, config: remoteConfig, keyring,
+      conflictPolicy: "copy", abortChangePercent: 0,
+    }).sync({ operation: "normal", allowThresholdOverride: false }), /injected destination write failure/u)
+
+    assert.equal(vault.files.has("note.md"), true, "failed rename must retain the original")
+    assert.equal(dec(vault.files.get("note.md")!.bytes), "remote-newer")
+    assert.equal(vault.files.has("renamed.md"), false)
+    assert.deepEqual(vault.operations.filter(operation => operation.startsWith("trash:")), [])
+    assert.equal(index.remoteCommitSha, previousRef)
+    assert.equal(github.ref?.sha, tipRef)
+
+    const racingIndex = structuredClone(index)
+    const racingVault = new MemoryVault()
+    racingVault.files.set("note.md", { bytes: enc("remote-newer"), mtime: 20 })
+    const normalWrite = racingVault.write.bind(racingVault)
+    racingVault.write = async (path, bytes, mtime) => {
+      await normalWrite(path, bytes, mtime)
+      if (path === "renamed.md") racingVault.files.set("note.md", { bytes: enc("human-change"), mtime: 20 })
+    }
+    await assert.rejects(() => new V4SyncSession({
+      github, vault: racingVault, index: racingIndex, config: remoteConfig, keyring,
+      conflictPolicy: "copy", abortChangePercent: 0,
+    }).sync({ operation: "normal", allowThresholdOverride: false }), /local target changed/iu)
+    assert.equal(dec(racingVault.files.get("note.md")!.bytes), "human-change")
+    assert.equal(dec(racingVault.files.get("renamed.md")!.bytes), "remote-newer")
+    assert.deepEqual(racingVault.operations.filter(operation => operation.startsWith("trash:")), [])
+    assert.equal(racingIndex.remoteCommitSha, previousRef)
+    assert.equal(github.ref?.sha, tipRef)
+
+    vault.write = write
+    await new V4SyncSession({
+      github, vault, index, config: remoteConfig, keyring,
+      conflictPolicy: "copy", abortChangePercent: 0,
+    }).sync({ operation: "normal", allowThresholdOverride: false })
+    assert.equal(vault.files.has("note.md"), false)
+    assert.equal(dec(vault.files.get("renamed.md")!.bytes), "remote-newer")
+    assert.equal(index.remoteCommitSha, tipRef)
+    assert.equal(github.ref?.sha, tipRef)
+  }
+})
+
 test("v4 pull rename preserves an old-path user edit that appears while remote bytes are in flight", async () => {
   const github = new MemoryGitHub();
   const remoteVault = new MemoryVault();

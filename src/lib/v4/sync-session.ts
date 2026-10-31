@@ -1774,9 +1774,13 @@ export class V4SyncSession {
     if (change.kind === "rename" && change.previousPath) {
       await assertV4LocalTargetPrecondition(this.localIo,
         this.pullPrecondition(change, localById, change.previousPath))
-      await trashV4LocalUserFile(this.localIo, change.previousPath)
     }
     await this.localIo.write(change.path, bytes, mtime)
+    if (change.kind === "rename" && change.previousPath) {
+      await assertV4LocalTargetPrecondition(this.localIo,
+        this.pullPrecondition(change, localById, change.previousPath))
+      await trashV4LocalUserFile(this.localIo, change.previousPath)
+    }
     if (!binding.stage) this.localReadCache.set(change.path, bytes)
     onCompleted()
   }
