@@ -210,6 +210,9 @@ function assertNoCaseInsensitiveCollisions(files: V4LogicalFile[]): void {
   const seen = new Map<string, V4LogicalFile>()
   const topology: V4PathTopology = { directoryCasing: new Map(), blobPaths: new Set() }
   for (const file of files) {
+    if (normalizeV4VaultPath(file.path) !== file.path) {
+      throw new Error(`Unsafe cross-platform V4 vault path: ${file.path}`)
+    }
     const key = file.path.normalize("NFC").toLowerCase()
     const previous = seen.get(key)
     if (previous && (previous.path !== file.path || previous.fileId !== file.fileId)) {

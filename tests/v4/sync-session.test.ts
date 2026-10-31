@@ -3751,6 +3751,49 @@ test("D201/D207 incomplete or unsafe tip tree evidence refuses Sync before any m
   }
 })
 
+test("D211 rejects unsafe or noncanonical local Vault paths before Pull or Git publication", async () => {
+  for (const mode of ["plaintext", "encrypted"] as const) {
+    for (const unsafePath of ["Notes/bad?.md", "Notes//double.md", "AUX.md", "../outside.md"]) {
+      const { github, vault, index, remoteConfig, keyring } = await unknownBaseFixture(mode, null)
+      const initialCommit = github.ref!.sha
+      const initialCommitCount = github.commitMessages.length
+      vault.files.set(unsafePath, { bytes: enc("local unsafe"), mtime: 50 })
+      vault.operations.length = 0
+      await assert.rejects(
+        () => new V4SyncSession({
+          github, vault, index, config: remoteConfig, keyring,
+          conflictPolicy: "copy", abortChangePercent: 0,
+        }).sync({ operation: "normal", allowThresholdOverride: false }),
+        /Unsafe cross-platform V4 vault path/u,
+      )
+      assert.equal(vault.files.has("note.md"), false, "unrelated remote Pull must not run before local path rejection")
+      assert.equal(dec(vault.files.get(unsafePath)!.bytes), "local unsafe")
+      assert.deepEqual(vault.operations.filter(op => /^(?:write|trash|commit-stage):/u.test(op)), [])
+      assert.equal(github.ref?.sha, initialCommit)
+      assert.equal(github.commitMessages.length, initialCommitCount)
+      assert.equal(index.remoteCommitSha, initialCommit)
+    }
+  }
+})
+
+test("D211 excluded local Vault paths are not validated or synced", async () => {
+  for (const mode of ["plaintext", "encrypted"] as const) {
+    const { github, vault, index, remoteConfig, keyring } = await unknownBaseFixture(mode, null)
+    const initialCommit = github.ref!.sha
+    vault.files.set("Notes/bad?.md", { bytes: enc("excluded"), mtime: 20 })
+    const result = await new V4SyncSession({
+      github, vault, index, config: remoteConfig, keyring,
+      conflictPolicy: "copy", abortChangePercent: 0,
+      includePath: path => path !== "Notes/bad?.md",
+    }).sync({ operation: "normal", allowThresholdOverride: false })
+    assert.equal(result.pulledFiles, 1)
+    assert.equal(dec(vault.files.get("note.md")!.bytes), "remote-newer")
+    assert.equal(dec(vault.files.get("Notes/bad?.md")!.bytes), "excluded")
+    assert.equal(index.remoteCommitSha, initialCommit)
+    assert.equal(github.ref?.sha, initialCommit)
+  }
+})
+
 test("D208 Sync cannot combine individually safe local and remote paths into a colliding tree", async () => {
   for (const mode of ["plaintext", "encrypted"] as const) {
     for (const [remotePath, localPath] of [
