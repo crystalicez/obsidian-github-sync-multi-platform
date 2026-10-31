@@ -2343,6 +2343,102 @@ test("D192 plaintext external GitHub reconciliation cannot treat partial Git evi
   }
 })
 
+test("D195 identical local and external GitHub edits must repair stale remote metadata instead of no-op", async () => {
+  const github = new MemoryGitHub()
+  const vault = new MemoryVault()
+  vault.files.set("shared.md", { bytes: enc("initial"), mtime: 1 })
+  vault.files.set("untouched.md", { bytes: enc("unchanged"), mtime: 1 })
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "writer", mode: "plaintext" })
+  const session = () => new V4SyncSession({
+    github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0,
+  })
+  await session().sync({ operation: "forcePush", allowThresholdOverride: false })
+  const parent = github.ref!.sha
+  const unchangedRecord = structuredClone(indexRecordByPath(index, "untouched.md"))
+  const externalTree = new Map(github.trees.get(github.commits.get(parent)!.treeSha)!)
+  externalTree.set("shared.md", enc("same edit"))
+  github.trees.set("tree-d195-external", externalTree)
+  github.commits.set("commit-d195-external", {
+    treeSha: "tree-d195-external", parents: [parent], message: "Direct GitHub edit",
+  })
+  github.ref = { ref: "refs/heads/main", sha: "commit-d195-external", type: "commit" }
+  github.files = new Map(externalTree)
+  vault.files.set("shared.md", { bytes: enc("same edit"), mtime: 2 })
+  vault.operations.length = 0
+  const result = await session().sync({ operation: "normal", allowThresholdOverride: false })
+  assert.notEqual(result.mode, "noop", "Remote index must be repaired even when both file contents match")
+  assert.notEqual(github.ref?.sha, "commit-d195-external", "Publish one metadata repair commit")
+  assert.equal(dec(vault.files.get("shared.md")!.bytes), "same edit")
+  assert.ok(!vault.operations.some(operation => /^(write:|trash:|delete:|commit-stage:)/u.test(operation)),
+    "Metadata repair must not mutate local files")
+  assert.equal(indexRecordByPath(index, "shared.md").plaintextSha256, await sha256Hex(enc("same edit")))
+  assert.deepEqual(indexRecordByPath(index, "untouched.md"), unchangedRecord,
+    "Unchanged remote files must keep their version, hash and mtime")
+  const repairedHead = JSON.parse(dec(github.files.get(V4_HEAD_PATH)!)) as V4RemoteHead
+  const repairedJournal = JSON.parse(dec(github.files.get(`${V4_ROOT}/journals/${repairedHead.journalId}/000000.json`)!))
+  assert.ok(repairedJournal.changes.some((change: { path: string; kind: string; after?: { plaintextSha256?: string } }) =>
+    change.path === "shared.md" && change.kind === "modify"
+    && change.after?.plaintextSha256 === indexRecordByPath(index, "shared.md").plaintextSha256),
+  "History must record the external edit even if local bytes already match")
+
+  const restored = new MemoryVault()
+  const restoredIndex = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "reader", mode: "plaintext" })
+  await new V4SyncSession({
+    github, vault: restored, index: restoredIndex, config: config(), conflictPolicy: "copy", abortChangePercent: 0,
+  }).sync({ operation: "forcePull", allowThresholdOverride: false })
+  assert.equal(dec(restored.files.get("shared.md")!.bytes), "same edit",
+    "Fresh device must restore the edited content from the repaired Git metadata")
+
+  const repairedCommit = github.ref!.sha
+  const unchangedExternalTree = new Map(github.trees.get(github.commits.get(repairedCommit)!.treeSha)!)
+  github.trees.set("tree-d195-no-content-change", unchangedExternalTree)
+  github.commits.set("commit-d195-no-content-change", {
+    treeSha: "tree-d195-no-content-change", parents: [repairedCommit], message: "GitHub message-only commit",
+  })
+  github.ref = { ref: "refs/heads/main", sha: "commit-d195-no-content-change", type: "commit" }
+  github.files = new Map(unchangedExternalTree)
+  const unchangedResult = await session().sync({ operation: "normal", allowThresholdOverride: false })
+  assert.equal(unchangedResult.mode, "noop", "No metadata repair is needed for a message-only external commit")
+  assert.equal(github.ref?.sha, "commit-d195-no-content-change", "Do not publish an unnecessary repair commit")
+  assert.equal(index.remoteCommitSha, "commit-d195-no-content-change")
+})
+
+test("D195 matching local and external deletions still publish the remote metadata tombstone", async () => {
+  const github = new MemoryGitHub()
+  const vault = new MemoryVault()
+  vault.files.set("removed.md", { bytes: enc("was here"), mtime: 1 })
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "writer", mode: "plaintext" })
+  const session = () => new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+  await session().sync({ operation: "forcePush", allowThresholdOverride: false })
+  const base = github.ref!.sha
+  const tree = new Map(github.trees.get(github.commits.get(base)!.treeSha)!)
+  tree.delete("removed.md")
+  github.trees.set("tree-d195-delete", tree)
+  github.commits.set("commit-d195-delete", {
+    treeSha: "tree-d195-delete", parents: [base], message: "Delete file on GitHub",
+  })
+  github.ref = { ref: "refs/heads/main", sha: "commit-d195-delete", type: "commit" }
+  github.files = new Map(tree)
+  vault.files.delete("removed.md")
+  vault.operations.length = 0
+
+  const result = await session().sync({ operation: "normal", allowThresholdOverride: false })
+  assert.notEqual(result.mode, "noop")
+  assert.notEqual(github.ref?.sha, "commit-d195-delete")
+  assert.ok(!Object.values(index.shards).some(shard => Object.values(shard.records).some(record => record.path === "removed.md")))
+  assert.ok(!vault.operations.some(op => /^(write:|trash:|delete:|commit-stage:)/u.test(op)))
+  const head = JSON.parse(dec(github.files.get(V4_HEAD_PATH)!)) as V4RemoteHead
+  const journal = JSON.parse(dec(github.files.get(`${V4_ROOT}/journals/${head.journalId}/000000.json`)!))
+  assert.ok(journal.changes.some((change: { path: string; kind: string }) =>
+    change.path === "removed.md" && change.kind === "delete"))
+  const restored = new MemoryVault()
+  const restoredIndex = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "reader", mode: "plaintext" })
+  await new V4SyncSession({
+    github, vault: restored, index: restoredIndex, config: config(), conflictPolicy: "copy", abortChangePercent: 0,
+  }).sync({ operation: "forcePull", allowThresholdOverride: false })
+  assert.equal(restored.files.has("removed.md"), false)
+})
+
 test("D194 a copied plugin commit message cannot hide out-of-band GitHub edits", async () => {
   for (const mode of ["plaintext", "encrypted"] as const) {
     const fixture = await unknownBaseFixture(mode, "remote-newer")

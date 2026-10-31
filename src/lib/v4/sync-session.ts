@@ -363,6 +363,13 @@ export class V4SyncSession {
 
     const includePath = this.input.includePath ?? (() => true)
     const allRemoteRecords = remote?.records ?? []
+    let externalMetadataNeedsRepair = false
+    if (externalReconciled) {
+      const metadataBuckets = recordsByBucket(metadataRemoteRecords)
+      const reconciledBuckets = recordsByBucket(allRemoteRecords)
+      externalMetadataNeedsRepair = metadataBuckets.size !== reconciledBuckets.size
+        || [...metadataBuckets].some(([bucket, records]) => bucketSignature(records) !== bucketSignature(reconciledBuckets.get(bucket)))
+    }
     const isLayoutMigration = !!remote
       && effectiveV4PathLayout(remote.config) !== expectedV4PathLayout(this.input.config.mode)
     if (isLayoutMigration && allRemoteRecords.some(record => !includePath(record.path))) {
@@ -443,7 +450,7 @@ export class V4SyncSession {
       this.report({ phase: "blocked", currentPath: undefined, currentDirection: undefined, ...counters(conflictsResolved) })
       throw new V4ChangeGuardError(guard.changePercent, guard.thresholdPercent)
     }
-    if (changedFiles === 0 && options.operation !== "forcePush") {
+    if (changedFiles === 0 && options.operation !== "forcePush" && !externalMetadataNeedsRepair) {
       if (remote) this.replaceIndex(allRemoteRecords, remote.head, remote.commitSha)
       this.localReadCache.clear()
       return { mode: "noop", operation: options.operation, changedFiles: 0, pushedFiles: 0, pulledFiles: 0 }
@@ -666,7 +673,18 @@ export class V4SyncSession {
     if (externalReconciled) {
       const beforeById = new Map(metadataRemoteRecords.map(record => [record.fileId, record]))
       const afterById = new Map(allRemoteRecords.map(record => [record.fileId, record]))
-      for (const change of plan.pulls) {
+      const externalChanges = changedFiles === 0 && externalMetadataNeedsRepair
+        ? [...new Set([...beforeById.keys(), ...afterById.keys()])].flatMap(fileId => {
+            const before = beforeById.get(fileId)
+            const after = afterById.get(fileId)
+            if (before && after && before.path === after.path && before.plaintextSha256 === after.plaintextSha256) return []
+            const toLogical = (record: V4IndexFileRecord | undefined): V4LogicalFile | undefined =>
+              record && { path: record.path, fileId: record.fileId, hash: record.plaintextSha256, size: record.size, mtime: record.mtime }
+            const change = this.changeBetween(toLogical(before), toLogical(after))
+            return change ? [change] : []
+          })
+        : plan.pulls
+      for (const change of externalChanges) {
         const before = beforeById.get(change.fileId)
         const after = afterById.get(change.fileId)
         journalChanges.push({
@@ -1060,12 +1078,17 @@ export class V4SyncSession {
         throw new Error("External GitHub blob does not match the pinned Git tree; sync is unsafe.")
       }
       const previous = existingByPath.get(node.path)
+      const plaintextSha256 = await this.observeHash(() => sha256Hex(file.bytes))
+      if (previous && previous.plaintextSha256 === plaintextSha256 && previous.size === file.bytes.byteLength) {
+        reconciled.push(previous)
+        continue
+      }
       const pathId = previous?.pathId ?? await sha256Hex(utf8ToBytes(`path:${node.path}`))
       reconciled.push({
         path: node.path,
         pathId,
         fileId: previous?.fileId ?? pathId,
-        plaintextSha256: await this.observeHash(() => sha256Hex(file.bytes)),
+        plaintextSha256,
         size: file.bytes.byteLength,
         mtime: this.now(),
         remoteVersion: `external:${remote.commitSha}`,
