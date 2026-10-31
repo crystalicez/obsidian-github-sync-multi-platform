@@ -10,6 +10,7 @@ import { coalesceV4Changes, type V4QueuedChange } from "../../src/lib/v4/sync-co
 import { V4_CONFIG_PATH, V4_FORMAT_VERSION, V4_HEAD_PATH, V4_ROOT, type V4RemoteConfig, type V4RemoteHead } from "../../src/lib/v4/protocol-types";
 import { decryptV4Payload, deriveV4Keyring, encryptV4Payload } from "../../src/lib/v4/crypto";
 import { sha256Hex } from "../../src/lib/bytes";
+import { computeV4GitBlobSha1 } from "../../src/lib/v4/git-blob-identity";
 import { buildV4RemoteMetadata } from "../../src/lib/v4/remote-index";
 import { publishV4TreeChanges } from "../../src/lib/v4/git-tree-writer";
 import { V4_LARGE_FILE_THRESHOLD_BYTES } from "../../src/lib/v4/large-files";
@@ -120,7 +121,7 @@ class MemoryGitHub {
     this.readPaths.push(path);
     const commit = ref ? this.commits.get(ref) : undefined;
     const value = commit ? this.trees.get(commit.treeSha)?.get(path) : this.files.get(path);
-    return value ? { bytes: new Uint8Array(value), sha: `sha-${path}` } : null;
+    return value ? { bytes: new Uint8Array(value), sha: computeV4GitBlobSha1(value) } : null;
   }
   async getGitRefOrNull() { return this.ref; }
   async ensureGitRepositoryInitialized() { return null; }
@@ -128,7 +129,7 @@ class MemoryGitHub {
   async getTreeAt(treeSha: string) {
     this.treeReads.push(treeSha);
     const tree = this.trees.get(treeSha) ?? new Map();
-    return { sha: treeSha, url: "", truncated: false, tree: [...tree.entries()].map(([path, bytes], index) => ({ path, mode: "100644", type: "blob" as const, sha: `tree-blob-${index}`, size: bytes.byteLength, url: "" })) };
+    return { sha: treeSha, url: "", truncated: false, tree: [...tree.entries()].map(([path, bytes], index) => ({ path, mode: "100644", type: "blob" as const, sha: computeV4GitBlobSha1(bytes), size: bytes.byteLength, url: "" })) };
   }
   async createGitBlob(bytes: Uint8Array) { const sha = `blob-${this.blobs.size + 1}`; this.blobs.set(sha, new Uint8Array(bytes)); return sha; }
   async createGitTree(entries: GitHubCreateTreeEntry[], baseTree?: string) {
@@ -2249,8 +2250,8 @@ test("v4 nested folder delete removes descendants from the final state", async (
   assert.equal(Object.values(index.shards).flatMap(shard => Object.values(shard.records)).some(record => record.path.startsWith("Folder/")), false);
 });
 
-test("D192 Force Push refuses an incomplete or wrong Git tree without moving the ref", async () => {
-  for (const scenario of ["missing-completeness", "wrong-tree"] as const) {
+test("D192/D193 Force Push refuses incomplete, mismatched and unsafe Git tree entries before moving the ref", async () => {
+  for (const scenario of ["missing-completeness", "wrong-tree", "symlink", "duplicate", "unsafe-path"] as const) {
     const github = new MemoryGitHub()
     const vault = new MemoryVault()
     vault.files.set("existing.md", { bytes: enc("keep"), mtime: 1 })
@@ -2266,8 +2267,18 @@ test("D192 Force Push refuses an incomplete or wrong Git tree without moving the
     github.getTreeAt = async (sha: string) => {
       const response = await getTree(sha)
       if (scenario === "wrong-tree") return { ...response, sha: "other-tree" }
-      const { truncated: _ignored, ...withoutCompleteness } = response
-      return withoutCompleteness as typeof response
+      if (scenario === "missing-completeness") {
+        const { truncated: _ignored, ...withoutCompleteness } = response
+        return withoutCompleteness as typeof response
+      }
+      const entries = [...response.tree]
+      const pos = entries.findIndex(entry => entry.path === "existing.md")
+      assert.notEqual(pos, -1)
+      const node = entries[pos]!
+      if (scenario === "symlink") entries[pos] = { ...node, mode: "120000" }
+      if (scenario === "duplicate") entries.push({ ...node })
+      if (scenario === "unsafe-path") entries[pos] = { ...node, path: "../outside.md" }
+      return { ...response, tree: entries }
     }
     vault.operations.length = 0
     await assert.rejects(
@@ -2332,6 +2343,62 @@ test("D192 plaintext external GitHub reconciliation cannot treat partial Git evi
   }
 })
 
+test("D193 external plaintext Sync rejects forged blob evidence and unsafe recursive entries before mutation", async () => {
+  for (const scenario of [
+    "wrong-blob-sha", "altered-bytes", "symlink", "duplicate", "unsafe-path",
+  ] as const) {
+    const github = new MemoryGitHub()
+    const vault = new MemoryVault()
+    vault.files.set("tracked.md", { bytes: enc("local baseline"), mtime: 1 })
+    const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "device-a", mode: "plaintext" })
+    await new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+      .sync({ operation: "forcePush", allowThresholdOverride: false })
+    const staleIndex = structuredClone(index)
+    const initialBytes = new Uint8Array(vault.files.get("tracked.md")!.bytes)
+    const initialCommit = github.ref!.sha
+    const externalTree = new Map(github.trees.get(github.commits.get(initialCommit)!.treeSha)!)
+    externalTree.set("tracked.md", enc("changed on GitHub"))
+    github.trees.set("tree-d193", externalTree)
+    github.commits.set("commit-d193", {
+      treeSha: "tree-d193", parents: [initialCommit], message: "Direct GitHub edit",
+    })
+    github.ref = { ref: "refs/heads/main", sha: "commit-d193", type: "commit" }
+    github.files = new Map(externalTree)
+
+    const getTree = github.getTreeAt.bind(github)
+    github.getTreeAt = async (sha: string) => {
+      const tree = await getTree(sha)
+      if (sha !== "tree-d193") return tree
+      const entries = [...tree.tree]
+      const pos = entries.findIndex(entry => entry.path === "tracked.md")
+      assert.notEqual(pos, -1)
+      const node = entries[pos]!
+      if (scenario === "symlink") entries[pos] = { ...node, mode: "120000" }
+      if (scenario === "unsafe-path") entries[pos] = { ...node, path: "../outside.md" }
+      if (scenario === "duplicate") entries.push({ ...node })
+      return { ...tree, tree: entries }
+    }
+    const getFile = github.getFileBytes.bind(github)
+    github.getFileBytes = async (path: string, ref?: string) => {
+      const file = await getFile(path, ref)
+      if (path !== "tracked.md" || ref !== "commit-d193" || !file) return file
+      if (scenario === "wrong-blob-sha") return { ...file, sha: "f".repeat(40) }
+      if (scenario === "altered-bytes") return { ...file, bytes: enc("forged! on GitHub") }
+      return file
+    }
+    const commitCount = github.commits.size
+    vault.operations.length = 0
+    await assert.rejects(() => new V4SyncSession({
+      github, vault, index: staleIndex, config: config(), conflictPolicy: "copy", abortChangePercent: 0,
+    }).sync({ operation: "normal", allowThresholdOverride: false }),
+    /GitHub|unsafe|invalid|mismatch|identity|duplicate/i, scenario)
+    assert.deepEqual(vault.files.get("tracked.md")?.bytes, initialBytes, scenario)
+    assert.ok(!vault.operations.some(op => /^(write:|trash:|delete:|commit-stage:)/u.test(op)), scenario)
+    assert.equal(github.ref?.sha, "commit-d193", scenario)
+    assert.equal(github.commits.size, commitCount, scenario)
+  }
+})
+
 test("v4 stale device reconciles a direct GitHub edit after a newer plugin commit", async () => {
   const github = new MemoryGitHub();
   const first = new MemoryVault();
@@ -2356,6 +2423,13 @@ test("v4 stale device reconciles a direct GitHub edit after a newer plugin commi
   github.commits.set("commit-external", { treeSha: "tree-external", parents: [pluginTip], message: "Edit external.md on GitHub" });
   github.ref = { ref: "refs/heads/main", sha: "commit-external", type: "commit" };
   github.files = new Map(externalTree);
+  const getTree = github.getTreeAt.bind(github);
+  github.getTreeAt = async (sha: string) => {
+    const tree = await getTree(sha);
+    return sha === "tree-external"
+      ? { ...tree, tree: tree.tree.map(node => node.path === "external.md" ? { ...node, mode: "100755" } : node) }
+      : tree;
+  };
 
   await new V4SyncSession({ github, vault: staleVault, index: staleIndex, config: config(), conflictPolicy: "copy", abortChangePercent: 0 }).sync({ operation: "normal", allowThresholdOverride: false });
 

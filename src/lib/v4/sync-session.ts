@@ -19,7 +19,8 @@ import { buildV4JournalPages, type V4JournalChange } from "./history-journal"
 import { isV4LocalIndexCacheComplete, type V4IndexFileRecord, type V4LocalIndex } from "./local-index"
 import { assertV4LocalTargetPrecondition, createV4LocalIo, V4LocalTargetChangedError, type V4LocalIo, type V4LocalTargetPrecondition, type V4SessionVault } from "./local-io"
 import { trashV4LocalUserFile } from "./local-delete-policy"
-import { bucketForV4PathId } from "./paths"
+import { bucketForV4PathId, normalizeV4VaultPath } from "./paths"
+import { computeV4GitBlobSha1 } from "./git-blob-identity"
 import { planV4Sync, type V4LogicalFile, type V4PlannedChange, type V4SyncOperation } from "./planner"
 import { assertV4RemoteRecordSet, buildV4RemoteMetadata, v4RemoteShardPath } from "./remote-index"
 import { effectiveV4PathLayout, expectedV4PathLayout, V4_CONFIG_PATH, V4_ROOT, type V4RemoteConfig, type V4RemoteHead } from "./protocol-types"
@@ -123,6 +124,31 @@ export class V4RecoveryReplanRequiredError extends Error {
   constructor(public readonly verifiedRemoteHead: string) {
     super(`V4 local recovery requires replanning against verified remote head ${verifiedRemoteHead}.`)
     this.name = "V4RecoveryReplanRequiredError"
+  }
+}
+
+function assertV4CompleteRecursiveGitTree(tree: GitHubTree, expectedSha: string, context: string): void {
+  if (tree?.sha !== expectedSha || tree.truncated !== false || !Array.isArray(tree.tree)
+    || tree.tree.length > 100_000) {
+    throw new Error(`${context} GitHub tree is incomplete or mismatched; sync is unsafe.`)
+  }
+  const seen = new Set<string>()
+  for (const node of tree.tree) {
+    if (!node || typeof node.path !== "string"
+      || typeof node.sha !== "string" || !/^[0-9a-f]{40}$/u.test(node.sha)
+      || (node.type === "tree" ? node.mode !== "040000"
+        : node.type !== "blob" || (node.mode !== "100644" && node.mode !== "100755"))
+      || (node.size !== undefined && (!Number.isSafeInteger(node.size) || node.size < 0))) {
+      throw new Error(`${context} GitHub tree has an invalid or unsupported entry; sync is unsafe.`)
+    }
+    let canonicalPath: string
+    try { canonicalPath = normalizeV4VaultPath(node.path) }
+    catch { throw new Error(`${context} GitHub tree has an unsafe path; sync is unsafe.`) }
+    const foldedPath = canonicalPath.normalize("NFC").toLowerCase()
+    if (canonicalPath !== node.path || seen.has(foldedPath)) {
+      throw new Error(`${context} GitHub tree has a noncanonical or duplicate path; sync is unsafe.`)
+    }
+    seen.add(foldedPath)
   }
 }
 
@@ -889,9 +915,7 @@ export class V4SyncSession {
     if (options.operation === "forcePush" && ref && this.input.github.getTreeAt) {
       const commit = await this.input.github.getGitCommit(ref.sha)
       const tree = await this.input.github.getTreeAt(commit.treeSha, true)
-      if (tree.sha !== commit.treeSha || tree.truncated !== false || !Array.isArray(tree.tree)) {
-        throw new Error("GitHub tree is incomplete or mismatched; Force Push cannot safely mirror the repository.")
-      }
+      assertV4CompleteRecursiveGitTree(tree, commit.treeSha, "Force Push")
       const written = new Set([
         ...files.map(file => file.path),
         ...finalObjectPaths,
@@ -1012,9 +1036,7 @@ export class V4SyncSession {
       throw new Error("External GitHub changes cannot be safely reconciled while large or packed V4 objects exist.")
     }
     const tree = await this.input.github.getTreeAt(treeSha, true)
-    if (tree.sha !== treeSha || tree.truncated !== false || !Array.isArray(tree.tree)) {
-      throw new Error("External GitHub tree is incomplete or mismatched; sync is unsafe.")
-    }
+    assertV4CompleteRecursiveGitTree(tree, treeSha, "External")
     const existingByPath = new Map(remote.records.map(record => [record.path, record]))
     const includePath = this.input.includePath ?? (() => true)
     const reconciled: V4IndexFileRecord[] = remote.records.filter(record => !includePath(record.path))
@@ -1023,6 +1045,10 @@ export class V4SyncSession {
       if (!includePath(node.path)) continue
       const file = await this.input.github.getFileBytes(node.path, remote.commitSha)
       if (!file) throw new Error("External GitHub blob is missing from the pinned commit; sync is unsafe.")
+      if (file.sha !== node.sha || computeV4GitBlobSha1(file.bytes) !== node.sha
+        || (node.size !== undefined && file.bytes.byteLength !== node.size)) {
+        throw new Error("External GitHub blob does not match the pinned Git tree; sync is unsafe.")
+      }
       const previous = existingByPath.get(node.path)
       const pathId = previous?.pathId ?? await sha256Hex(utf8ToBytes(`path:${node.path}`))
       reconciled.push({

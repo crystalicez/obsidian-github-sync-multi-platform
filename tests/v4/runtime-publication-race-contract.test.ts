@@ -4,6 +4,7 @@ import { TFile } from "obsidian"
 
 import type { GitHubCreateTreeEntry } from "../../src/lib/github-git-types"
 import { V4PluginRuntime } from "../../src/lib/v4/runtime"
+import { computeV4GitBlobSha1 } from "../../src/lib/v4/git-blob-identity"
 
 class MemoryGitHub {
   ref: { ref: string; sha: string; type: string } | null = null
@@ -17,7 +18,7 @@ class MemoryGitHub {
   async getFileBytes(path: string, ref?: string) {
     const commit = ref ? this.commits.get(ref) : undefined
     const value = commit ? this.trees.get(commit.treeSha)?.get(path) : this.files.get(path)
-    return value ? { bytes: new Uint8Array(value), sha: `sha-${path}` } : null
+    return value ? { bytes: new Uint8Array(value), sha: computeV4GitBlobSha1(value) } : null
   }
   async getGitRefOrNull() {
     this.refReads++
@@ -44,7 +45,7 @@ class MemoryGitHub {
         path,
         mode: "100644",
         type: "blob" as const,
-        sha: `tree-blob-${index}`,
+        sha: computeV4GitBlobSha1(bytes),
         size: bytes.byteLength,
         url: "",
       })),
