@@ -889,7 +889,9 @@ export class V4SyncSession {
     if (options.operation === "forcePush" && ref && this.input.github.getTreeAt) {
       const commit = await this.input.github.getGitCommit(ref.sha)
       const tree = await this.input.github.getTreeAt(commit.treeSha, true)
-      if (tree.truncated) throw new Error("GitHub tree is truncated; Force Push cannot safely mirror the repository.")
+      if (tree.sha !== commit.treeSha || tree.truncated !== false || !Array.isArray(tree.tree)) {
+        throw new Error("GitHub tree is incomplete or mismatched; Force Push cannot safely mirror the repository.")
+      }
       const written = new Set([
         ...files.map(file => file.path),
         ...finalObjectPaths,
@@ -1010,7 +1012,9 @@ export class V4SyncSession {
       throw new Error("External GitHub changes cannot be safely reconciled while large or packed V4 objects exist.")
     }
     const tree = await this.input.github.getTreeAt(treeSha, true)
-    if (tree.truncated) throw new Error("External GitHub tree is truncated; sync is unsafe.")
+    if (tree.sha !== treeSha || tree.truncated !== false || !Array.isArray(tree.tree)) {
+      throw new Error("External GitHub tree is incomplete or mismatched; sync is unsafe.")
+    }
     const existingByPath = new Map(remote.records.map(record => [record.path, record]))
     const includePath = this.input.includePath ?? (() => true)
     const reconciled: V4IndexFileRecord[] = remote.records.filter(record => !includePath(record.path))
@@ -1018,7 +1022,7 @@ export class V4SyncSession {
       if (node.type !== "blob" || node.path === V4_CONFIG_PATH || node.path.startsWith(`${V4_ROOT}/`)) continue
       if (!includePath(node.path)) continue
       const file = await this.input.github.getFileBytes(node.path, remote.commitSha)
-      if (!file) continue
+      if (!file) throw new Error("External GitHub blob is missing from the pinned commit; sync is unsafe.")
       const previous = existingByPath.get(node.path)
       const pathId = previous?.pathId ?? await sha256Hex(utf8ToBytes(`path:${node.path}`))
       reconciled.push({

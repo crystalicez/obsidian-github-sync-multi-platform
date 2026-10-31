@@ -2249,6 +2249,89 @@ test("v4 nested folder delete removes descendants from the final state", async (
   assert.equal(Object.values(index.shards).flatMap(shard => Object.values(shard.records)).some(record => record.path.startsWith("Folder/")), false);
 });
 
+test("D192 Force Push refuses an incomplete or wrong Git tree without moving the ref", async () => {
+  for (const scenario of ["missing-completeness", "wrong-tree"] as const) {
+    const github = new MemoryGitHub()
+    const vault = new MemoryVault()
+    vault.files.set("existing.md", { bytes: enc("keep"), mtime: 1 })
+    const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "writer", mode: "plaintext" })
+    const session = () => new V4SyncSession({
+      github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0,
+    })
+    await session().sync({ operation: "forcePush", allowThresholdOverride: false })
+    const previousCommit = github.ref!.sha
+    const existingContent = new Uint8Array(vault.files.get("existing.md")!.bytes)
+    vault.files.set("new.md", { bytes: enc("new local file"), mtime: 2 })
+    const getTree = github.getTreeAt.bind(github)
+    github.getTreeAt = async (sha: string) => {
+      const response = await getTree(sha)
+      if (scenario === "wrong-tree") return { ...response, sha: "other-tree" }
+      const { truncated: _ignored, ...withoutCompleteness } = response
+      return withoutCompleteness as typeof response
+    }
+    vault.operations.length = 0
+    await assert.rejects(
+      () => session().sync({ operation: "forcePush", allowThresholdOverride: false }),
+      /GitHub tree.*(incomplete|mismatch|unsafe)/i,
+      scenario,
+    )
+    assert.equal(github.ref?.sha, previousCommit, "Never publish from incomplete Git tree evidence")
+    assert.deepEqual(vault.files.get("existing.md")?.bytes, existingContent)
+    assert.ok(!vault.operations.some(operation => /^(write:|trash:|delete:|commit-stage:)/u.test(operation)))
+  }
+})
+
+test("D192 plaintext external GitHub reconciliation cannot treat partial Git evidence as file deletion", async () => {
+  for (const scenario of ["missing-blob", "missing-completeness", "wrong-tree"] as const) {
+    const github = new MemoryGitHub()
+    const vault = new MemoryVault()
+    vault.files.set("tracked.md", { bytes: enc("local baseline"), mtime: 1 })
+    const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "device-a", mode: "plaintext" })
+    await new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 })
+      .sync({ operation: "forcePush", allowThresholdOverride: false })
+    const pinnedIndex = structuredClone(index)
+    const originalContents = new Uint8Array(vault.files.get("tracked.md")!.bytes)
+    const originalCommit = github.ref!.sha
+    const externalTree = new Map(github.trees.get(github.commits.get(originalCommit)!.treeSha)!)
+    externalTree.set("tracked.md", enc("edited externally"))
+    github.trees.set("tree-d192-external", externalTree)
+    github.commits.set("commit-d192-external", {
+      treeSha: "tree-d192-external", parents: [originalCommit], message: "Direct GitHub edit",
+    })
+    github.ref = { ref: "refs/heads/main", sha: "commit-d192-external", type: "commit" }
+    github.files = new Map(externalTree)
+    const originalReadFile = github.getFileBytes.bind(github)
+    github.getFileBytes = async (path: string, ref?: string) =>
+      scenario === "missing-blob" && path === "tracked.md" && ref === "commit-d192-external"
+        ? null : originalReadFile(path, ref)
+    const originalReadTree = github.getTreeAt.bind(github)
+    github.getTreeAt = async (sha: string) => {
+      const response = await originalReadTree(sha)
+      if (sha !== "tree-d192-external") return response
+      if (scenario === "wrong-tree") return { ...response, sha: "tree-forged" }
+      if (scenario === "missing-completeness") {
+        const { truncated: _ignored, ...withoutCompleteness } = response
+        return withoutCompleteness as typeof response
+      }
+      return response
+    }
+    const commitCount = github.commits.size
+    vault.operations.length = 0
+    await assert.rejects(
+      () => new V4SyncSession({
+        github, vault, index: pinnedIndex, config: config(),
+        conflictPolicy: "copy", abortChangePercent: 0,
+      }).sync({ operation: "normal", allowThresholdOverride: false }),
+      /external.*(incomplete|mismatch|missing)|GitHub.*(tree|blob).*unsafe/i,
+      scenario,
+    )
+    assert.deepEqual(vault.files.get("tracked.md")?.bytes, originalContents, scenario)
+    assert.deepEqual(vault.operations, [], "Never mutate vault after incomplete external Git evidence")
+    assert.equal(github.ref?.sha, "commit-d192-external", "Never publish a remote change")
+    assert.equal(github.commits.size, commitCount, "No new remote commit")
+  }
+})
+
 test("v4 stale device reconciles a direct GitHub edit after a newer plugin commit", async () => {
   const github = new MemoryGitHub();
   const first = new MemoryVault();
