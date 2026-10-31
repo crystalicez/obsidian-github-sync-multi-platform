@@ -347,12 +347,15 @@ export class V4SyncSession {
       let commit = tip
       let head = remote.head
       let precedingHead: V4RemoteHead | undefined
+      let verifiedRootSha: string | undefined
+      const unchangedThroughHistory = new Set(Object.keys(remote.head.shardHashes))
       let hasCoherentPluginAdvance = false
       for (let remaining = remote.head.generation; remaining > 0; remaining--) {
         throwIfV4Aborted(this.input.signal)
         if (commit.message?.split("\n", 1)[0] !== `obsidian-sync-v4:${head.journalId}`) break
         if (commit.parentShas.length === 0) {
           hasCoherentPluginAdvance = !baseCommitSha && head.generation === 1
+          if (hasCoherentPluginAdvance) verifiedRootSha = commit.sha
           break
         }
         if (commit.parentShas.length !== 1) break
@@ -363,6 +366,7 @@ export class V4SyncSession {
             const bootstrap = await this.input.github.getGitCommit(parentSha)
             hasCoherentPluginAdvance = bootstrap.parentShas.length === 0
               && bootstrap.message === "obsidian-sync-v4:bootstrap"
+            if (hasCoherentPluginAdvance) verifiedRootSha = commit.sha
           }
           break
         }
@@ -370,6 +374,9 @@ export class V4SyncSession {
         if (parentHead.epoch !== head.epoch
           || parentHead.generation + 1 !== head.generation
           || parentHead.journalId === head.journalId) break
+        for (const bucket of unchangedThroughHistory) {
+          if (head.shardHashes[bucket] !== parentHead.shardHashes[bucket]) unchangedThroughHistory.delete(bucket)
+        }
         if (commit.sha === remote.commitSha) precedingHead = parentHead
         if (parentSha === baseCommitSha) {
           hasCoherentPluginAdvance = true
@@ -421,6 +428,20 @@ export class V4SyncSession {
               const paths = record.storage === "chunked" ? record.partPaths ?? [] : [record.remotePath]
               return paths.length > 0 && paths.every(path => tipBlobs.has(path) && tipBlobs.get(path) === anchorBlobs.get(path))
             })
+            if (hasCoherentPluginAdvance && !knownBase && verifiedRootSha && verifiedRootSha !== anchorSha) {
+              const rootStableRecords = stableRecords.filter(record => unchangedThroughHistory.has(record.pathId.slice(0, 2)))
+              if (rootStableRecords.length > 0) {
+                throwIfV4Aborted(this.input.signal)
+                const root = await this.input.github.getGitCommit(verifiedRootSha)
+                const rootTree = await this.input.github.getTreeAt(root.treeSha, true)
+                assertV4CompleteRecursiveGitTree(rootTree, root.treeSha, "V4 unchanged-shard history anchor")
+                const rootBlobs = new Map(rootTree.tree.filter(node => node.type === "blob").map(node => [node.path, node.sha]))
+                hasCoherentPluginAdvance = rootStableRecords.every(record => {
+                  const paths = record.storage === "chunked" ? record.partPaths ?? [] : [record.remotePath]
+                  return paths.length > 0 && paths.every(path => tipBlobs.get(path) === rootBlobs.get(path))
+                })
+              }
+            }
           }
         }
       }
