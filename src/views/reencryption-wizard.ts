@@ -252,9 +252,11 @@ export class V4ReencryptionWizardModal extends Modal {
     this.abortController = controller
     this.render()
     try {
+      const destinationClient = this.scopedClient(this.destinationBranch)
+      const backupClient = this.scopedClient(this.backupBranch)
       const [destination, backup] = await Promise.all([
-        this.scopedClient(this.destinationBranch).getGitRefOrNull(),
-        this.scopedClient(this.backupBranch).getGitRefOrNull(),
+        destinationClient.getGitRefOrNull(),
+        backupClient.getGitRefOrNull(),
       ])
       if (this.closed || controller.signal.aborted || epoch !== this.requestEpoch) return
       this.assertSyncStillIdle()
@@ -282,6 +284,15 @@ export class V4ReencryptionWizardModal extends Modal {
         || sourceRef.type !== "commit"
         || sourceRef.sha !== proposal.pinnedSourceCommitSha) {
         throw new Error("Source branch or default branch changed. Return to Preflight and verify the source again.")
+      }
+      const [destinationAfter, backupAfter] = await Promise.all([
+        destinationClient.getGitRefOrNull(),
+        backupClient.getGitRefOrNull(),
+      ])
+      if (this.closed || controller.signal.aborted || epoch !== this.requestEpoch) return
+      this.assertSyncStillIdle()
+      if (destinationAfter !== null || backupAfter !== null) {
+        throw new Error("A proposed branch already exists. Choose unused branch names.")
       }
       if (!this.matchesConnection() || this.plan().destinationRepoId !== proposal.destinationRepoId
         || this.plan().backupRepoId !== proposal.backupRepoId) {
@@ -409,7 +420,7 @@ export class V4ReencryptionWizardModal extends Modal {
     })
     new Setting(container).setName("Destination and backup branch availability")
       .setDesc(this.checked
-        ? "Both refs were absent at the time of the check, and Source HEAD/default branch still matched. This is not a create-time guarantee or a remote lock."
+        ? "Both refs were absent before and after Source HEAD/default-branch revalidation. This is not a create-time guarantee or a remote lock."
         : "Not checked. Confirm both new names are absent and the verified Source has not changed.")
       .addButton(button => button.setButtonText(this.busy ? "Checking…" : "Check both branches")
         .setDisabled(this.busy)

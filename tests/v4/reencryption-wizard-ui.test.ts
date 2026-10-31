@@ -278,8 +278,8 @@ test("D153 Wizard branch availability rechecks exact pinned Source HEAD and defa
       if (scenario === "stable") {
         assert.equal(view.checked?.pinnedSourceCommitSha, expectedSha)
         assert.equal(view.checked?.physicalRepositoryId, 444)
-        assert.match(text, /Both refs were absent at the time/i)
-        assert.equal(requests.length, 5, "two ref lookups + repo identity + default branch + source HEAD")
+        assert.match(text, /Both refs were absent before and after Source/i)
+        assert.equal(requests.length, 7, "two pairs of ref lookups bracketing repo identity, default branch and source HEAD")
       } else {
         assert.equal(view.checked, undefined, scenario + " must not mark branch names ready")
         if (scenario === "source-moved" || scenario === "default-moved") {
@@ -298,6 +298,77 @@ test("D153 Wizard branch availability rechecks exact pinned Source HEAD and defa
   }
 })
 
+
+test("D188 Wizard refuses a backup or destination created during Source revalidation", async () => {
+  const sourceSha = "a".repeat(40)
+  const newlyCreatedSha = "b".repeat(40)
+  const destination = "rekey/2026-10-31-a1b2c3d4"
+  const backup = "backup/rekey-2026-10-31-a1b2c3d4"
+  const respond = (json: unknown, status = 200) => ({
+    status, text: status === 200 ? "" : "not found", json, headers: {},
+  })
+  for (const created of ["destination", "backup"] as const) {
+    const plugin = fakePlugin()
+    const wizard = new V4ReencryptionWizardModal(plugin)
+    const view = wizard as unknown as {
+      source: {
+        physicalRepositoryId: number; defaultBranch: string; pinnedSourceCommitSha: string;
+        verifiedFileCount: number; verifiedRemoteObjectCount: number;
+        totalVerifiedPlaintextBytes: string
+      }
+      checked?: { destinationRepoId: string }
+      step: number; render(): void; checkBranchAvailability(): Promise<void>
+      destinationBranch: string; backupBranch: string
+      newPassphrase: string; confirmPassphrase: string
+    }
+    view.source = {
+      physicalRepositoryId: 444, defaultBranch: "main",
+      pinnedSourceCommitSha: sourceSha, verifiedFileCount: 0,
+      verifiedRemoteObjectCount: 0, totalVerifiedPlaintextBytes: "0",
+    }
+    view.destinationBranch = destination
+    view.backupBranch = backup
+    view.newPassphrase = "new-secret-never-render"
+    view.confirmPassphrase = "new-secret-never-render"
+    let sourceRechecked = false
+    const requests: Array<{url: string; method?: string; body?: unknown}> = []
+    setRequestUrlHandler(async raw => {
+      const request = raw as {url: string; method?: string; body?: unknown}
+      requests.push(request)
+      assert.equal(request.method, "GET")
+      assert.equal(request.body, undefined)
+      if (request.url.includes("/git/ref/heads/")) {
+        if (request.url.includes("/heads/main?")) {
+          sourceRechecked = true
+          return respond({ref: "refs/heads/main", object: {sha: sourceSha, type: "commit"}})
+        }
+        const branch = created === "destination" ? destination : backup
+        if (sourceRechecked && request.url.includes("/heads/" + branch + "?")) {
+          return respond({ref: "refs/heads/" + branch,
+            object: {sha: newlyCreatedSha, type: "commit"}})
+        }
+        return respond({}, 404)
+      }
+      assert.equal(request.url, "https://api.github.com/repos/owner/vault")
+      return respond({id: 444, full_name: "owner/vault", default_branch: "main"})
+    })
+    try {
+      wizard.onOpen()
+      view.step = 2
+      view.render()
+      await view.checkBranchAvailability()
+      const text = (wizard.contentEl as unknown as {flattenText(): string}).flattenText()
+      assert.equal(sourceRechecked, true, created)
+      assert.equal(view.checked, undefined, created + " became occupied during verification")
+      assert.match(text, /already exists|Branch verification failed/i)
+      assert.doesNotMatch(text, /new-secret-never-render|source-token-never-render/)
+      assert.ok(requests.every(r => r.method === "GET" && r.body === undefined))
+    } finally {
+      wizard.onClose()
+      setRequestUrlHandler(null)
+    }
+  }
+})
 
 test("D154 Wizard discards async preview reads if Sync starts, settings change or dialog closes", async () => {
   const respond = (json: unknown, status = 200) => ({
