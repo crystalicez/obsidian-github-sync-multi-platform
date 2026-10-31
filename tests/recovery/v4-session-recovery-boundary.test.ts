@@ -3,6 +3,7 @@ import test from "node:test"
 
 import type { GitHubCreateTreeEntry } from "../../src/lib/github-git-types"
 import { createV4WholeBufferContentSource } from "../../src/lib/v4/content-source"
+import { computeV4GitBlobSha1 } from "../../src/lib/v4/git-blob-identity"
 import { createEmptyV4LocalIndex, type V4LocalIndexAdapter } from "../../src/lib/v4/local-index"
 import { V4_FORMAT_VERSION, type V4RemoteConfig } from "../../src/lib/v4/protocol-types"
 import { createV4RecoveryStore } from "../../src/lib/v4/recovery-store"
@@ -74,9 +75,15 @@ class MemoryGitHub {
   async getFileBytes(path: string, ref?: string) {
     const tree = ref ? this.trees.get(this.commits.get(ref)!.treeSha) : undefined
     const bytes = tree?.get(path) ?? this.files.get(path)
-    return bytes ? { bytes: new Uint8Array(bytes), sha: `sha-${path}` } : null
+    return bytes ? { bytes: new Uint8Array(bytes), sha: computeV4GitBlobSha1(bytes) } : null
   }
   async getGitCommit(sha: string) { const c = this.commits.get(sha)!; return { sha, treeSha: c.treeSha, parentShas: c.parents, message: c.message } }
+  async getTreeAt(treeSha: string) {
+    const tree = this.trees.get(treeSha) ?? new Map<string, Uint8Array>()
+    return { sha: treeSha, url: "", truncated: false,
+      tree: [...tree].map(([path, bytes]) => ({ path, mode: "100644", type: "blob" as const,
+        sha: computeV4GitBlobSha1(bytes), size: bytes.byteLength, url: "" })) }
+  }
   async createGitBlob(bytes: Uint8Array) { const sha = `blob-${this.blobs.size + 1}`; this.blobs.set(sha, new Uint8Array(bytes)); return sha }
   async createGitTree(entries: GitHubCreateTreeEntry[], baseTree?: string) {
     const tree = new Map(baseTree ? this.trees.get(baseTree) : undefined)

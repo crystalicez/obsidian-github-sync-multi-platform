@@ -12,6 +12,7 @@ import { decodeV4RemoteHead, decodeV4RemoteShard, v4RemoteShardPath } from "../.
 import { createV4RecoveryStore } from "../../src/lib/v4/recovery-store";
 import { V4StorageCodec } from "../../src/lib/v4/storage-codec";
 import { V4SyncSession, type V4SessionVault } from "../../src/lib/v4/sync-session";
+import { computeV4GitBlobSha1 } from "../../src/lib/v4/git-blob-identity";
 import type { V4ContentHandle, V4ContentSource } from "../../src/lib/v4/content-source";
 
 const encode = (value: string) => new TextEncoder().encode(value);
@@ -73,14 +74,14 @@ class MemoryGitHub {
   async getFileBytes(path: string, ref?: string) {
     const commit = ref ? this.commits.get(ref) : undefined;
     const value = commit ? this.trees.get(commit.treeSha)?.get(path) : this.files.get(path);
-    return value ? { bytes: new Uint8Array(value), sha: `sha-${path}` } : null;
+    return value ? { bytes: new Uint8Array(value), sha: computeV4GitBlobSha1(value) } : null;
   }
   async getGitRefOrNull() { return this.ref; }
   async ensureGitRepositoryInitialized() { return null; }
   async getGitCommit(sha: string) { const commit = this.commits.get(sha)!; return { sha, treeSha: commit.treeSha, parentShas: commit.parents, message: commit.message }; }
   async getTreeAt(treeSha: string) {
     const tree = this.trees.get(treeSha) ?? new Map();
-    return { sha: treeSha, url: "", truncated: false, tree: [...tree.entries()].map(([path, bytes], index) => ({ path, mode: "100644", type: "blob" as const, sha: `tree-blob-${index}`, size: bytes.byteLength, url: "" })) };
+    return { sha: treeSha, url: "", truncated: false, tree: [...tree.entries()].map(([path, bytes]) => ({ path, mode: "100644", type: "blob" as const, sha: computeV4GitBlobSha1(bytes), size: bytes.byteLength, url: "" })) };
   }
   async getBlob() { throw new Error("Opaque leakage gate does not load content previews."); }
   async createGitBlob(bytes: Uint8Array) { const sha = `blob-${this.blobs.size + 1}`; this.blobs.set(sha, new Uint8Array(bytes)); return sha; }

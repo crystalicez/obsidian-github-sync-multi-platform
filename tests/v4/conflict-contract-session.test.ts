@@ -5,6 +5,7 @@ import type { GitHubCreateTreeEntry } from "../../src/lib/github-git-types";
 import { createEmptyV4LocalIndex, type V4LocalIndex } from "../../src/lib/v4/local-index";
 import { V4_FORMAT_VERSION, type V4RemoteConfig } from "../../src/lib/v4/protocol-types";
 import { V4SyncSession, type V4SessionVault } from "../../src/lib/v4/sync-session";
+import { computeV4GitBlobSha1 } from "../../src/lib/v4/git-blob-identity";
 
 const enc = (value: string) => new TextEncoder().encode(value);
 
@@ -44,7 +45,7 @@ class MemoryGitHub {
   async getFileBytes(path: string, ref?: string) {
     const commit = ref ? this.commits.get(ref) : undefined;
     const value = commit ? this.trees.get(commit.treeSha)?.get(path) : this.files.get(path);
-    return value ? { bytes: new Uint8Array(value), sha: `sha-${path}` } : null;
+    return value ? { bytes: new Uint8Array(value), sha: computeV4GitBlobSha1(value) } : null;
   }
   async getGitRefOrNull() { return this.ref; }
   async ensureGitRepositoryInitialized() { return null; }
@@ -59,11 +60,11 @@ class MemoryGitHub {
       sha: treeSha,
       url: "",
       truncated: false,
-      tree: [...tree.entries()].map(([path, bytes], index) => ({
+      tree: [...tree.entries()].map(([path, bytes]) => ({
         path,
         mode: "100644",
         type: "blob" as const,
-        sha: `tree-blob-${index}`,
+        sha: computeV4GitBlobSha1(bytes),
         size: bytes.byteLength,
         url: "",
       })),

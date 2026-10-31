@@ -376,8 +376,25 @@ export class V4SyncSession {
         head = parentHead
         commit = await this.input.github.getGitCommit(parentSha)
       }
+      let tipTree: GitHubTree | undefined
+      if (hasCoherentPluginAdvance) {
+        if (!this.input.github.getTreeAt) throw new Error("V4 Git tree verification requires recursive tree support.")
+        tipTree = await this.input.github.getTreeAt(tip.treeSha, true)
+        assertV4CompleteRecursiveGitTree(tipTree, tip.treeSha, "V4 tip")
+        const blobPaths = new Set(tipTree.tree.filter(node => node.type === "blob").map(node => node.path))
+        const indexedPaths = new Set(remote.records.filter(record => !record.deleted).map(record => record.path))
+        const hasUnindexedPath = [...blobPaths].some(path => path !== V4_CONFIG_PATH
+          && !path.startsWith(`${V4_ROOT}/`)
+          && !indexedPaths.has(path))
+        const hasMissingObject = remote.config.mode === "encrypted"
+          && remote.records.some(record => !record.deleted
+          && (record.storage === "chunked"
+            ? !record.partPaths?.every(path => blobPaths.has(path))
+            : !blobPaths.has(record.remotePath)))
+        hasCoherentPluginAdvance = !hasUnindexedPath && !hasMissingObject
+      }
       if (!hasCoherentPluginAdvance) {
-        await this.reconcileExternalCommit(remote, tip.treeSha)
+        await this.reconcileExternalCommit(remote, tip.treeSha, tipTree)
         externalReconciled = true
       }
     }
@@ -1080,7 +1097,7 @@ export class V4SyncSession {
     }
   }
 
-  private async reconcileExternalCommit(remote: V4RemoteState, treeSha: string): Promise<void> {
+  private async reconcileExternalCommit(remote: V4RemoteState, treeSha: string, verifiedTree?: GitHubTree): Promise<void> {
     if (remote.config.mode === "encrypted") {
       throw new Error("External GitHub changes touched an encrypted V4 branch without updating its journal. Use Force Push or Force Pull after reviewing the commit.")
     }
@@ -1088,7 +1105,7 @@ export class V4SyncSession {
     if (remote.records.some(record => record.storage !== "single")) {
       throw new Error("External GitHub changes cannot be safely reconciled while large or packed V4 objects exist.")
     }
-    const tree = await this.input.github.getTreeAt(treeSha, true)
+    const tree = verifiedTree ?? await this.input.github.getTreeAt(treeSha, true)
     assertV4CompleteRecursiveGitTree(tree, treeSha, "External")
     const existingByPath = new Map(remote.records.map(record => [record.path, record]))
     const includePath = this.input.includePath ?? (() => true)
