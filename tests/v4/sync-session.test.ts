@@ -2439,6 +2439,105 @@ test("D195 matching local and external deletions still publish the remote metada
   assert.equal(restored.files.has("removed.md"), false)
 })
 
+test("D196 mixed GitHub edits and local Push/Pull preserve every external history entry", async () => {
+  const github = new MemoryGitHub()
+  const vault = new MemoryVault()
+  for (const path of ["matching.md", "remote.md", "removed.md", "local.md", "unchanged.md"]) {
+    vault.files.set(path, { bytes: enc(`base:${path}`), mtime: 1 })
+  }
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "writer", mode: "plaintext" })
+  const makeSession = () => new V4SyncSession({
+    github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0,
+  })
+  await makeSession().sync({ operation: "forcePush", allowThresholdOverride: false })
+  const parent = github.ref!.sha
+  const unchangedRecord = structuredClone(indexRecordByPath(index, "unchanged.md"))
+  const tree = new Map(github.trees.get(github.commits.get(parent)!.treeSha)!)
+  tree.set("matching.md", enc("same content on both devices"))
+  tree.set("remote.md", enc("GitHub edit"))
+  tree.delete("removed.md")
+  github.trees.set("tree-d196-mixed", tree)
+  github.commits.set("commit-d196-mixed", {
+    treeSha: "tree-d196-mixed", parents: [parent], message: "Direct GitHub mixed edit",
+  })
+  github.ref = { ref: "refs/heads/main", sha: "commit-d196-mixed", type: "commit" }
+  github.files = new Map(tree)
+  vault.files.set("matching.md", { bytes: enc("same content on both devices"), mtime: 2 })
+  vault.files.set("local.md", { bytes: enc("local change"), mtime: 2 })
+  vault.files.delete("removed.md")
+  vault.operations.length = 0
+
+  const result = await makeSession().sync({ operation: "normal", allowThresholdOverride: false })
+  assert.equal(result.mode, "pull-push")
+  assert.equal(dec(vault.files.get("remote.md")!.bytes), "GitHub edit")
+  assert.equal(dec(github.files.get("local.md")!), "local change")
+  assert.equal(dec(vault.files.get("matching.md")!.bytes), "same content on both devices")
+  assert.equal(github.files.has("removed.md"), false)
+  assert.deepEqual(indexRecordByPath(index, "unchanged.md"), unchangedRecord)
+  const head = JSON.parse(dec(github.files.get(V4_HEAD_PATH)!)) as V4RemoteHead
+  const journal = JSON.parse(dec(github.files.get(`${V4_ROOT}/journals/${head.journalId}/000000.json`)!)) as {
+    changes: V4JournalChange[]
+  }
+  const changes = journal.changes
+  assert.deepEqual(changes.map(change => [change.path, change.kind]).sort((a, b) => a[0]!.localeCompare(b[0]!)), [
+    ["local.md", "modify"], ["matching.md", "modify"], ["remote.md", "modify"], ["removed.md", "delete"],
+  ], "Every committed external edit and independent local push needs exactly one history entry")
+  for (const [path, content] of [
+    ["matching.md", "same content on both devices"], ["remote.md", "GitHub edit"], ["local.md", "local change"],
+  ]) {
+    const change = changes.find(item => item.path === path)!
+    assert.equal(change.after?.plaintextSha256, await sha256Hex(enc(content)))
+    assert.ok(change.before, `Missing historical base for ${path}`)
+  }
+  assert.equal(changes.find(change => change.path === "removed.md")?.after, undefined)
+  assert.ok(changes.find(change => change.path === "removed.md")?.before)
+
+  const restoredVault = new MemoryVault()
+  const restoredIndex = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "new-device", mode: "plaintext" })
+  await new V4SyncSession({
+    github, vault: restoredVault, index: restoredIndex, config: config(),
+    conflictPolicy: "copy", abortChangePercent: 0,
+  }).sync({ operation: "forcePull", allowThresholdOverride: false })
+  assert.equal(dec(restoredVault.files.get("matching.md")!.bytes), "same content on both devices")
+  assert.equal(dec(restoredVault.files.get("remote.md")!.bytes), "GitHub edit")
+  assert.equal(dec(restoredVault.files.get("local.md")!.bytes), "local change")
+  assert.equal(restoredVault.files.has("removed.md"), false)
+})
+
+test("D196 external edit resolved by local-wins conflict has one final history version", async () => {
+  const github = new MemoryGitHub()
+  const vault = new MemoryVault()
+  vault.files.set("conflicted.md", { bytes: enc("base"), mtime: 1 })
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "writer", mode: "plaintext" })
+  const session = () => new V4SyncSession({
+    github, vault, index, config: config(), conflictPolicy: "newer", abortChangePercent: 0, now: () => 50,
+  })
+  await session().sync({ operation: "forcePush", allowThresholdOverride: false })
+  const baseCommit = github.ref!.sha
+  const externalTree = new Map(github.trees.get(github.commits.get(baseCommit)!.treeSha)!)
+  externalTree.set("conflicted.md", enc("from GitHub"))
+  github.trees.set("tree-d196-conflict", externalTree)
+  github.commits.set("commit-d196-conflict", {
+    treeSha: "tree-d196-conflict", parents: [baseCommit], message: "GitHub edit conflicts with local",
+  })
+  github.ref = { ref: "refs/heads/main", sha: "commit-d196-conflict", type: "commit" }
+  github.files = new Map(externalTree)
+  vault.files.set("conflicted.md", { bytes: enc("from local"), mtime: 100 })
+  const result = await session().sync({ operation: "normal", allowThresholdOverride: false })
+  assert.equal(result.mode, "push")
+  assert.equal(dec(github.files.get("conflicted.md")!), "from local")
+  const head = JSON.parse(dec(github.files.get(V4_HEAD_PATH)!)) as V4RemoteHead
+  const journal = JSON.parse(dec(github.files.get(`${V4_ROOT}/journals/${head.journalId}/000000.json`)!)) as {
+    changes: V4JournalChange[]
+  }
+  const entries = journal.changes.filter(change => change.path === "conflicted.md")
+  assert.equal(entries.length, 1, "One logical file must have a single final journal version")
+  assert.equal(entries[0]!.kind, "modify")
+  assert.equal(entries[0]!.before?.plaintextSha256, await sha256Hex(enc("base")))
+  assert.equal(entries[0]!.after?.plaintextSha256, await sha256Hex(enc("from local")))
+  assert.equal(indexRecordByPath(index, "conflicted.md").plaintextSha256, await sha256Hex(enc("from local")))
+})
+
 test("D194 a copied plugin commit message cannot hide out-of-band GitHub edits", async () => {
   for (const mode of ["plaintext", "encrypted"] as const) {
     const fixture = await unknownBaseFixture(mode, "remote-newer")

@@ -670,31 +670,28 @@ export class V4SyncSession {
     const files: V4GitTreeFile[] = []
     const deletions = new Set<string>()
     const journalChanges: V4JournalChange[] = []
+    const journalByFileId = new Map<string, V4JournalChange>()
     if (externalReconciled) {
       const beforeById = new Map(metadataRemoteRecords.map(record => [record.fileId, record]))
       const afterById = new Map(allRemoteRecords.map(record => [record.fileId, record]))
-      const externalChanges = changedFiles === 0 && externalMetadataNeedsRepair
-        ? [...new Set([...beforeById.keys(), ...afterById.keys()])].flatMap(fileId => {
-            const before = beforeById.get(fileId)
-            const after = afterById.get(fileId)
-            if (before && after && before.path === after.path && before.plaintextSha256 === after.plaintextSha256) return []
-            const toLogical = (record: V4IndexFileRecord | undefined): V4LogicalFile | undefined =>
-              record && { path: record.path, fileId: record.fileId, hash: record.plaintextSha256, size: record.size, mtime: record.mtime }
-            const change = this.changeBetween(toLogical(before), toLogical(after))
-            return change ? [change] : []
-          })
-        : plan.pulls
-      for (const change of externalChanges) {
-        const before = beforeById.get(change.fileId)
-        const after = afterById.get(change.fileId)
-        journalChanges.push({
-          fileId: change.fileId,
+      const toLogical = (record: V4IndexFileRecord | undefined): V4LogicalFile | undefined =>
+        record && { path: record.path, fileId: record.fileId, hash: record.plaintextSha256, size: record.size, mtime: record.mtime }
+      for (const fileId of new Set([...beforeById.keys(), ...afterById.keys()])) {
+        const before = beforeById.get(fileId)
+        const after = afterById.get(fileId)
+        if (before && after && before.path === after.path && before.plaintextSha256 === after.plaintextSha256) continue
+        const change = this.changeBetween(toLogical(before), toLogical(after))
+        if (!change) continue
+        const journal: V4JournalChange = {
+          fileId,
           kind: change.kind,
           path: change.path,
           previousPath: change.previousPath,
           before: before ? descriptorFor(before) : undefined,
           after: after ? descriptorFor(after) : undefined,
-        })
+        }
+        journalChanges.push(journal)
+        journalByFileId.set(fileId, journal)
       }
     }
     const journalId = `${this.now()}-${toBase64Url(randomBytes(6))}`
@@ -733,16 +730,23 @@ export class V4SyncSession {
         && this.input.config.mode === "encrypted")
       return { binding, change, previous, after, reusesEncryptedContent }
     })
-    const journalByFileId = new Map<string, V4JournalChange>()
     for (const context of pushContexts) {
-      const journal: V4JournalChange = {
+      const existing = journalByFileId.get(context.change.fileId)
+      const journal: V4JournalChange = existing ?? {
         fileId: context.change.fileId,
         kind: context.change.kind,
         path: context.change.path,
         previousPath: context.change.previousPath,
         before: context.previous ? descriptorFor(context.previous) : undefined,
       }
-      journalChanges.push(journal)
+      if (existing) {
+        journal.kind = context.change.kind
+        journal.path = context.change.path
+        journal.previousPath = context.change.previousPath
+        journal.after = undefined
+      } else {
+        journalChanges.push(journal)
+      }
       journalByFileId.set(context.change.fileId, journal)
     }
     const packCandidates: V4PackCandidateMeta[] = this.input.config.mode === "encrypted"
