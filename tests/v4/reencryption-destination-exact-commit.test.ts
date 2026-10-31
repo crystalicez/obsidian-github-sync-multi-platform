@@ -17,6 +17,8 @@ import type { V4ReencryptionProposedCommitIdentity } from "../../src/lib/v4/reen
 import type { V4ThreeBranchPublicationReport } from "../../src/lib/v4/reencryption-three-branch-publish"
 import { inspectV4ReencryptionCrossSurfaceProof } from "../../src/lib/v4/reencryption-cross-surface-proof"
 import { inspectV4FencedPrecommitReadinessAfterRestart } from "../../src/lib/v4/reencryption-fenced-precommit-readiness"
+import { deriveV4FencedCommitPairSnapshotTestContract, inspectV4FencedCommitPairSnapshotTestVectors } from "../../src/lib/v4/reencryption-fenced-commit-pair-snapshot-provenance"
+import { sealV4ReencryptionCommitPairTestVectors, type V4ReencryptionCommitPairTestContract } from "../../src/lib/v4/reencryption-commit-pair-test-vectors"
 import { stageV4FencedBestEffortPreparedSelector } from "../../src/lib/v4/reencryption-fenced-prepared-selector"
 import type { V4BestEffortPreparedSelectorStageInput } from "../../src/lib/v4/reencryption-prepared-selector-stage"
 import { inspectV4ReencryptionLiveBackupCrossSurface } from "../../src/lib/v4/reencryption-live-backup-cross-surface"
@@ -785,6 +787,216 @@ async function d179Scenario() {
   return { s, id, input, publication, prepared, staged,
     inspect: () => inspectV4FencedPrecommitReadinessAfterRestart(input) }
 }
+
+const d183TransactionId = "ac".repeat(16)
+const d183Input = (f: Awaited<ReturnType<typeof d179Scenario>>) => ({
+  readiness: f.input, transactionId: d183TransactionId,
+})
+async function d183PreparedPair(f: Awaited<ReturnType<typeof d179Scenario>>) {
+  const report = await deriveV4FencedCommitPairSnapshotTestContract(d183Input(f))
+  assert.equal(report.observation, "snapshot-contract-derived-uncommitted")
+  assert.ok(report.contract)
+  const contract = report.contract!
+  const pair = await sealV4ReencryptionCommitPairTestVectors(contract, f.prepared.journalKey)
+  return { contract, pair }
+}
+
+test("D183 derives real D179 Source/Shadow/Prepared/WAL/Settings hashes under one held lease without writes", async () => {
+  const f = await d179Scenario()
+  const firstFiles = new Map(f.s.files)
+  const before = f.s.getWrites()
+  const calls = f.s.holderCounts().calls
+  const result = await deriveV4FencedCommitPairSnapshotTestContract(d183Input(f))
+  assert.equal(result.observation, "snapshot-contract-derived-uncommitted")
+  assert.equal(result.evidence, "best-effort-wal-readback-not-power-loss-durable")
+  assert.equal(result.localCutoverAuthorized, false)
+  assert.equal(result.resumeSyncAuthorized, false)
+  assert.ok(result.contract)
+  assert.equal(Object.isFrozen(result.contract), true)
+  assert.equal(Object.isFrozen(result.contract!.identity), true)
+  const actual = result.contract!
+  const hash = (text: string) => sha256Hex(utf8ToBytes(text))
+  const source = await loadV4LocalIndex(f.s.adapter, V4_RUNTIME_INDEX_ROOT)
+  const shadow = await loadV4LocalIndex(f.s.adapter, V4_RUNTIME_INDEX_ROOT + "-rekey-" + f.id.runId)
+  assert.equal(actual.transactionId, d183TransactionId)
+  assert.deepEqual(actual.identity, f.id)
+  assert.equal(actual.sourceIndexSha256, await hash(JSON.stringify(source)))
+  assert.equal(actual.destinationShadowSha256, await hash(JSON.stringify(shadow)))
+  assert.equal(actual.preparedEvidenceSha256, await hash(f.s.files.get(f.staged.evidencePath)!))
+  assert.equal(actual.walSnapshotSha256, await hash(JSON.stringify(f.s.getWal())))
+  assert.equal(actual.sourceSettingsSha256, await hash(JSON.stringify(f.input.prepared.restart.settings)))
+  assert.equal(actual.destinationSettingsSha256, await hash(JSON.stringify({
+    ...f.input.prepared.restart.settings,
+    githubBranch: destination.split("#")[1],
+    encryptionPassphraseSecretId: f.id.destinationPassphraseSecretId,
+  })))
+  assert.deepEqual(f.s.files, firstFiles)
+  assert.equal(f.s.getWrites(), before)
+  assert.deepEqual(f.s.holderCounts(), { calls: calls + 1, held: false })
+  assert.ok(f.s.f.reads >= 8)
+})
+
+test("D183 re-derives all snapshot hashes and authenticates pair only as uncommitted", async () => {
+  const f = await d179Scenario()
+  const { contract, pair } = await d183PreparedPair(f)
+  const writes = f.s.getWrites()
+  const previousCalls = f.s.holderCounts().calls
+  const report = await inspectV4FencedCommitPairSnapshotTestVectors(d183Input(f), contract, pair)
+  assert.equal(report.observation, "snapshot-bound-pair-authenticated-uncommitted")
+  assert.deepEqual(report.contract, contract)
+  assert.equal(report.localCutoverAuthorized, false)
+  assert.equal(report.resumeSyncAuthorized, false)
+  assert.equal(report.rollbackAuthorized, false)
+  assert.equal(report.remoteWritesAuthorized, false)
+  assert.equal(report.oldPassphraseCleanupAuthorized, false)
+  assert.equal(f.s.getWrites(), writes)
+  assert.deepEqual(f.s.holderCounts(), { calls: previousCalls + 1, held: false })
+  assert.equal(f.s.files.has(V4_RUNTIME_INDEX_ROOT + "-rekey-selector-" + f.id.runId + "/selector.json"), false)
+  assert.doesNotMatch(JSON.stringify(report), /old-d138-secret|new-d83-secret/)
+})
+
+test("D183 caller digest claims, transaction IDs, mismatched AES pair and historical WAL fail closed", async () => {
+  const f = await d179Scenario()
+  const { contract, pair } = await d183PreparedPair(f)
+  const edits: Array<{ kind: string; contract: V4ReencryptionCommitPairTestContract }> = [
+    { kind: "source", contract: { ...contract, sourceIndexSha256: "1".repeat(64) } },
+    { kind: "shadow", contract: { ...contract, destinationShadowSha256: "1".repeat(64) } },
+    { kind: "wal", contract: { ...contract, walSnapshotSha256: "1".repeat(64) } },
+    { kind: "prepared", contract: { ...contract, preparedEvidenceSha256: "1".repeat(64) } },
+    { kind: "settings", contract: { ...contract, sourceSettingsSha256: "1".repeat(64) } },
+    { kind: "target", contract: { ...contract, destinationSettingsSha256: "1".repeat(64) } },
+    { kind: "transaction", contract: { ...contract, transactionId: "ed".repeat(16) } },
+  ]
+  for (const c of edits) {
+    const writes = f.s.getWrites()
+    const report = await inspectV4FencedCommitPairSnapshotTestVectors(d183Input(f), c.contract, pair)
+    assert.equal(report.observation, "manual-recovery-required", c.kind)
+    assert.equal(report.contract, null, c.kind)
+    assert.equal(report.localCutoverAuthorized, false, c.kind)
+    assert.equal(f.s.getWrites(), writes, c.kind)
+  }
+  const other = await sealV4ReencryptionCommitPairTestVectors(contract, f.prepared.journalKey)
+  assert.equal((await inspectV4FencedCommitPairSnapshotTestVectors(d183Input(f), contract, {
+    receiptTestVector: other.receiptTestVector, selectorTestVector: pair.selectorTestVector,
+  })).observation, "manual-recovery-required")
+})
+
+test("D183 stale WAL, torn Prepared, changed Source and wrong new Secret never certify snapshot provenance", async () => {
+  for (const cause of ["wal", "prepared", "source", "secret", "fence", "residue"] as const) {
+    const f = await d179Scenario()
+    if (cause === "wal") f.s.setWal({ ...f.s.getWal(), generation: 99 })
+    else if (cause === "prepared") f.s.files.set(f.staged.evidencePath, "{torn")
+    else if (cause === "source") f.input.prepared.restart.settings.githubBranch = "different"
+    else if (cause === "secret") f.s.secrets.set("new-d138", "wrong-secret")
+    else if (cause === "fence") f.s.files.set(V4_REENCRYPTION_SYNC_FENCE_ROOT + "/active.json", "{torn")
+    else f.s.files.set(V4_RUNTIME_INDEX_ROOT + "-rekey-proposed-" + f.id.runId + "/marker.json", "unexpected")
+    const writes = f.s.getWrites()
+    const result = await deriveV4FencedCommitPairSnapshotTestContract(d183Input(f))
+    assert.equal(result.observation, "manual-recovery-required", cause)
+    assert.equal(result.contract, null, cause)
+    assert.equal(result.resumeSyncAuthorized, false)
+    assert.equal(f.s.getWrites(), writes, cause)
+    assert.equal(f.s.holderCounts().held, false)
+  }
+})
+
+test("D183 mutation during real Git Blob read denies provenance even when original contract authenticates", async () => {
+  for (const cause of ["source-index", "secret", "destination-ref"] as const) {
+    const f = await d179Scenario()
+    const { contract, pair } = await d183PreparedPair(f)
+    const getBlob = f.s.f.github.getBlob
+    let changed = false
+    f.s.f.github.getBlob = async sha => {
+      const bytes = await getBlob(sha)
+      if (!changed) {
+        changed = true
+        if (cause === "source-index") {
+          const source = await loadV4LocalIndex(f.s.adapter, V4_RUNTIME_INDEX_ROOT)
+          source.epoch++
+          await saveV4LocalIndex(f.s.adapter, V4_RUNTIME_INDEX_ROOT, source)
+        } else if (cause === "secret") f.s.secrets.set("new-d138", "different-key-mid-git")
+        else f.s.f.changeRef("9".repeat(40))
+      }
+      return bytes
+    }
+    const writes = f.s.getWrites()
+    const result = await inspectV4FencedCommitPairSnapshotTestVectors(d183Input(f), contract, pair)
+    assert.equal(changed, true, cause)
+    assert.equal(result.observation, "manual-recovery-required", cause)
+    assert.equal(result.contract, null, cause)
+    assert.equal(result.localCutoverAuthorized, false, cause)
+    assert.equal(f.s.getWrites(), writes + (cause === "source-index" ? 1 : 0), cause)
+    assert.equal(f.s.holderCounts().held, false)
+  }
+})
+
+test("D183 holder must execute provenance reader once, not skip or forge a success result", async () => {
+  const f = await d179Scenario()
+  const original = f.input.full.branches.withExclusiveInitiatorLease
+  const input = d183Input(f)
+  const branches = f.input.full.branches
+  const prepared = f.input.prepared
+  const forged = async <T>(_body: () => Promise<T>): Promise<T> => ({
+    integrityScope: "read-only-fenced-d179-verified-commit-pair-snapshot-contract",
+    observation: "snapshot-contract-derived-uncommitted",
+  } as T)
+  branches.withExclusiveInitiatorLease = forged
+  prepared.withExclusiveInitiatorLease = forged
+  assert.equal((await deriveV4FencedCommitPairSnapshotTestContract(input)).observation,
+    "manual-recovery-required")
+  branches.withExclusiveInitiatorLease = original
+  prepared.withExclusiveInitiatorLease = original
+})
+
+test("D183 post-holder Git reader or publication mutation refuses apparently valid snapshot proof", async () => {
+  for (const cause of ["reader", "publication"] as const) {
+    const f = await d179Scenario()
+    const original = f.input.full.branches.withExclusiveInitiatorLease
+    const guarded = async <T>(action: () => Promise<T>): Promise<T> =>
+      original(async () => {
+        const result = await action()
+        if (cause === "reader") {
+          f.input.full.branches.readers.source.getGitCommit = async () => ({
+            sha: pinned, treeSha: sourceTree,
+            parentShas: ["1".repeat(40)], message: "post-holder-swap",
+          })
+        } else f.publication.verifiedPlaintextBytes = "0"
+        return result
+      })
+    f.input.full.branches.withExclusiveInitiatorLease = guarded
+    f.input.prepared.withExclusiveInitiatorLease = guarded
+    const writes = f.s.getWrites()
+    const report = await deriveV4FencedCommitPairSnapshotTestContract(d183Input(f))
+    assert.equal(report.observation, "manual-recovery-required", cause)
+    assert.equal(report.contract, null, cause)
+    assert.equal(report.resumeSyncAuthorized, false, cause)
+    assert.equal(f.s.getWrites(), writes, cause)
+    assert.equal(f.s.holderCounts().held, false)
+  }
+})
+
+test("D183 transaction ID altered during an awaited Git Blob read cannot bind a different attempt", async () => {
+  const f = await d179Scenario()
+  const input = d183Input(f)
+  const originalBlob = f.s.f.github.getBlob
+  let changed = false
+  f.s.f.github.getBlob = async sha => {
+    const bytes = await originalBlob(sha)
+    if (!changed) {
+      changed = true
+      input.transactionId = "ed".repeat(16)
+    }
+    return bytes
+  }
+  const writes = f.s.getWrites()
+  const report = await deriveV4FencedCommitPairSnapshotTestContract(input)
+  assert.equal(changed, true)
+  assert.equal(report.observation, "manual-recovery-required")
+  assert.equal(report.contract, null)
+  assert.equal(report.localCutoverAuthorized, false)
+  assert.equal(f.s.getWrites(), writes)
+  assert.equal(f.s.holderCounts().held, false)
+})
 
 test("D179 encrypted Source/Intent/Secrets, D176 prepared Selector, D178 full Git content share one lease", async () => {
   const f = await d179Scenario()
