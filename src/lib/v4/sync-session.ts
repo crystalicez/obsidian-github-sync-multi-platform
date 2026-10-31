@@ -211,6 +211,19 @@ function bucketSignature(records: V4IndexFileRecord[] | undefined): string {
   return JSON.stringify(records ?? [])
 }
 
+function sameV4StoredContent(previous: V4IndexFileRecord | undefined, current: V4IndexFileRecord): boolean {
+  return previous !== undefined && !previous.deleted && !current.deleted
+    && previous.pathId === current.pathId
+    && previous.fileId === current.fileId
+    && previous.remoteVersion === current.remoteVersion
+    && previous.remotePath === current.remotePath
+    && previous.storage === current.storage
+    && previous.packId === current.packId
+    && previous.plaintextSha256 === current.plaintextSha256
+    && previous.size === current.size
+    && JSON.stringify(previous.partPaths ?? []) === JSON.stringify(current.partPaths ?? [])
+}
+
 function journalPath(journalId: string, page: number, encrypted: boolean): string {
   return `${V4_ROOT}/journals/${journalId}/${String(page).padStart(6, "0")}.${encrypted ? "enc" : "json"}`
 }
@@ -417,6 +430,33 @@ export class V4SyncSession {
             : remote.records.filter(record => !record.deleted && precedingHead !== undefined
               && remote.head.shardHashes[record.pathId.slice(0, 2)] !== undefined
               && remote.head.shardHashes[record.pathId.slice(0, 2)] === precedingHead.shardHashes[record.pathId.slice(0, 2)])
+          if (!knownBase && precedingHead) {
+            const changedTipBuckets = new Map<string, V4IndexFileRecord[]>()
+            for (const record of remote.records) {
+              if (record.deleted) continue
+              const bucket = record.pathId.slice(0, 2)
+              if (precedingHead.shardHashes[bucket] === undefined
+                || precedingHead.shardHashes[bucket] === remote.head.shardHashes[bucket]) continue
+              const candidates = changedTipBuckets.get(bucket) ?? []
+              candidates.push(record)
+              changedTipBuckets.set(bucket, candidates)
+            }
+            for (const [bucket, candidates] of changedTipBuckets) {
+              throwIfV4Aborted(this.input.signal)
+              const parentFile = await this.input.github.getFileBytes(
+                v4RemoteShardPath(bucket, remote.config.mode), tip.parentShas[0]!,
+              )
+              if (!parentFile) throw new Error(`V4 parent shard is missing: ${bucket}; sync is unsafe.`)
+              const parentShard = await decodeV4RemoteShard(parentFile.bytes, bucket, remote.config, this.input.keyring)
+              const parentRecords = Object.values(parentShard.records).sort((left, right) => left.pathId.localeCompare(right.pathId))
+              if (await sha256Hex(utf8ToBytes(bucketSignature(parentRecords))) !== precedingHead.shardHashes[bucket]) {
+                throw new Error(`V4 parent shard does not match its authenticated HEAD: ${bucket}; sync is unsafe.`)
+              }
+              for (const record of candidates) {
+                if (sameV4StoredContent(parentShard.records[record.pathId], record)) stableRecords.push(record)
+              }
+            }
+          }
           if (stableRecords.length > 0) {
             const anchorSha = knownBase ? baseCommitSha! : tip.parentShas[0]!
             const anchor = await this.input.github.getGitCommit(anchorSha)
@@ -454,18 +494,7 @@ export class V4SyncSession {
                   throw new Error(`V4 root shard does not match its authenticated HEAD: ${bucket}; sync is unsafe.`)
                 }
                 for (const record of candidates) {
-                  const original = rootShard.records[record.pathId]
-                  if (original && !original.deleted
-                    && original.fileId === record.fileId
-                    && original.remoteVersion === record.remoteVersion
-                    && original.remotePath === record.remotePath
-                    && original.storage === record.storage
-                    && original.packId === record.packId
-                    && original.plaintextSha256 === record.plaintextSha256
-                    && original.size === record.size
-                    && JSON.stringify(original.partPaths ?? []) === JSON.stringify(record.partPaths ?? [])) {
-                    rootStableRecords.push(record)
-                  }
+                  if (sameV4StoredContent(rootShard.records[record.pathId], record)) rootStableRecords.push(record)
                 }
               }
               if (rootStableRecords.length > 0) {

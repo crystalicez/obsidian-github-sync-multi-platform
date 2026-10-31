@@ -11,7 +11,7 @@ import { V4_CONFIG_PATH, V4_FORMAT_VERSION, V4_HEAD_PATH, V4_ROOT, type V4Remote
 import { decryptV4Payload, deriveV4Keyring, encryptV4Payload } from "../../src/lib/v4/crypto";
 import { sha256Hex } from "../../src/lib/bytes";
 import { computeV4GitBlobSha1 } from "../../src/lib/v4/git-blob-identity";
-import { buildV4RemoteMetadata, decodeV4RemoteHead } from "../../src/lib/v4/remote-index";
+import { buildV4RemoteMetadata, decodeV4RemoteHead, v4RemoteShardPath } from "../../src/lib/v4/remote-index";
 import { publishV4TreeChanges } from "../../src/lib/v4/git-tree-writer";
 import { V4_LARGE_FILE_THRESHOLD_BYTES } from "../../src/lib/v4/large-files";
 import type { V4SyncProgressPatch } from "../../src/lib/v4/progress";
@@ -149,6 +149,20 @@ function indexRecordByPath(index: V4LocalIndex, path: string): V4IndexFileRecord
   const record = Object.values(index.shards).flatMap(shard => Object.values(shard.records)).find(candidate => !candidate.deleted && candidate.path === path);
   assert.ok(record, `missing index record for ${path}`);
   return record;
+}
+
+async function testShardHashes(records: V4IndexFileRecord[]): Promise<Record<string, string>> {
+  const byBucket = new Map<string, V4IndexFileRecord[]>()
+  for (const record of records) {
+    const bucket = record.pathId.slice(0, 2)
+    const bucketRecords = byBucket.get(bucket) ?? []
+    bucketRecords.push(record)
+    byBucket.set(bucket, bucketRecords)
+  }
+  return Object.fromEntries(await Promise.all([...byBucket].map(async ([bucket, bucketRecords]) => [
+    bucket,
+    await sha256Hex(enc(JSON.stringify(bucketRecords.sort((a, b) => a.pathId.localeCompare(b.pathId))))),
+  ] as const)))
 }
 
 async function divergedConflictFixture(conflictPaths: string[], ordinaryPullPaths: string[] = []) {
@@ -1979,7 +1993,7 @@ test("v4 confirmed Force Push migrates legacy encrypted paths in one commit", as
     epoch: 1,
     generation: 1,
     journalId: "legacy-v",
-    shardHashes: { [legacyPathId.slice(0, 2)]: "legacy-shard", [orphanPathId.slice(0, 2)]: "orphan-shard" },
+    shardHashes: await testShardHashes([legacyRecord, orphanRecord]),
     updatedAt: 1,
     deviceId: "old",
   };
@@ -2072,7 +2086,7 @@ async function legacyMigrationEventFixture(input: { remotePath: string; localPat
     path: input.remotePath, pathId, fileId: input.fileId, plaintextSha256: await sha256Hex(remoteBytes), size: remoteBytes.byteLength, mtime: 1,
     remoteVersion: "legacy-v", remotePath: legacyObjectPath, storage: "single",
   };
-  const head: V4RemoteHead = { formatVersion: 4, mode: "encrypted", epoch: 1, generation: 1, journalId: "legacy-v", shardHashes: { [pathId.slice(0, 2)]: "legacy-shard" }, updatedAt: 1, deviceId: "old" };
+  const head: V4RemoteHead = { formatVersion: 4, mode: "encrypted", epoch: 1, generation: 1, journalId: "legacy-v", shardHashes: await testShardHashes([legacyRecord]), updatedAt: 1, deviceId: "old" };
   const files = await buildV4RemoteMetadata({ config: legacyConfig, head, records: [legacyRecord], keyring: keys });
   files.push({ path: legacyObjectPath, bytes: await encryptV4Payload(keys.contentKey, remoteBytes, { kind: "content", aad: `${pathId}:legacy-v` }) });
   await publishV4TreeChanges(github, { message: "obsidian-sync-v4:legacy-v", files });
@@ -2184,7 +2198,7 @@ test("v4 legacy migration refuses to delete encrypted records excluded by sync s
   const keys = await deriveV4Keyring({ passphrase: "pass", repoId: "o/r#main", salt: enc("salt"), iterations: 10 });
   const pathId = await (await import("../../src/lib/v4/paths")).pathIdForV4Path(keys.pathKey, "Excluded/note.md");
   const record: V4IndexFileRecord = { path: "Excluded/note.md", pathId, fileId: "excluded-file", plaintextSha256: await sha256Hex(plaintext), size: plaintext.byteLength, mtime: 1, remoteVersion: "legacy-v", remotePath: ".obsidian-github-sync-v4/data/Excluded/note.enc", storage: "single" };
-  const head: V4RemoteHead = { formatVersion: 4, mode: "encrypted", epoch: 1, generation: 1, journalId: "legacy-v", shardHashes: { [pathId.slice(0, 2)]: "legacy-shard" }, updatedAt: 1, deviceId: "old" };
+  const head: V4RemoteHead = { formatVersion: 4, mode: "encrypted", epoch: 1, generation: 1, journalId: "legacy-v", shardHashes: await testShardHashes([record]), updatedAt: 1, deviceId: "old" };
   const files = await buildV4RemoteMetadata({ config: legacyConfig, head, records: [record], keyring: keys });
   files.push({ path: record.remotePath, bytes: await encryptV4Payload(keys.contentKey, plaintext, { kind: "content", aad: `${record.pathId}:legacy-v` }) });
   await publishV4TreeChanges(github, { message: "obsidian-sync-v4:legacy-v", files });
@@ -2959,6 +2973,130 @@ test("D199 a single anchored plugin advance reads only the tip Git commit", asyn
   }).sync({ operation: "forcePull", allowThresholdOverride: false })
   assert.equal(dec(vault.files.get("note.md")!.bytes), "updated by writer")
   assert.deepEqual(commitReads, [tip], "An anchored one-commit update must not traverse older Git commits")
+})
+
+test("D205 a fresh device detects latest-tip tampering of a post-root file when its shard also changes", async () => {
+  for (const mode of ["plaintext", "encrypted"] as const) {
+    const { github, index, remoteConfig, keyring } = await unknownBaseFixture(mode, null)
+    const baseSha = github.ref!.sha
+    const originalBucket = indexRecordByPath(index, "note.md").pathId.slice(0, 2)
+    const pathId = async (path: string) => mode === "encrypted"
+      ? (await import("../../src/lib/v4/paths")).pathIdForV4Path(keyring!.pathKey, path)
+      : sha256Hex(enc(`path:${path}`))
+    let introduced = ""
+    let sibling = ""
+    let targetBucket = ""
+    for (let i = 0; i < 4096 && !introduced; i++) {
+      const path = `introduced-${i}.md`
+      const bucket = (await pathId(path)).slice(0, 2)
+      if (bucket !== originalBucket) { introduced = path; targetBucket = bucket }
+    }
+    for (let i = 0; i < 4096 && !sibling; i++) {
+      const path = `sibling-${i}.md`
+      if ((await pathId(path)).slice(0, 2) === targetBucket) sibling = path
+    }
+    assert.ok(introduced && sibling, "Fixture must create two new notes in the same non-root bucket")
+    const writerIndex = structuredClone(index)
+    writerIndex.shards[originalBucket]!.hash = writerIndex.shardHashes[originalBucket]!
+    const writerVault = new MemoryVault()
+    writerVault.files.set("note.md", { bytes: enc("remote-newer"), mtime: 20 })
+    writerVault.files.set(introduced, { bytes: enc("created later by plugin"), mtime: 90 })
+    const write = () => new V4SyncSession({
+      github, vault: writerVault, index: writerIndex, config: remoteConfig, keyring,
+      conflictPolicy: "copy", abortChangePercent: 0,
+    }).sync({ operation: "normal", allowThresholdOverride: false })
+    await write()
+    const introducedSha = github.ref!.sha
+    const introducedRecord = indexRecordByPath(writerIndex, introduced)
+    writerVault.files.set(sibling, { bytes: enc("valid sibling update"), mtime: 95 })
+    await write()
+    const tip = github.ref!.sha
+    assert.deepEqual(github.commits.get(introducedSha)!.parents, [baseSha])
+    assert.deepEqual(github.commits.get(tip)!.parents, [introducedSha])
+    const tipRecord = indexRecordByPath(writerIndex, introduced)
+    assert.equal(tipRecord.remoteVersion, introducedRecord.remoteVersion)
+    assert.equal(tipRecord.plaintextSha256, introducedRecord.plaintextSha256)
+    const earlierHead = await decodeV4RemoteHead(
+      github.trees.get(github.commits.get(introducedSha)!.treeSha)!.get(V4_HEAD_PATH)!,
+      remoteConfig, keyring,
+    )
+    const tipHead = await decodeV4RemoteHead(
+      github.trees.get(github.commits.get(tip)!.treeSha)!.get(V4_HEAD_PATH)!,
+      remoteConfig, keyring,
+    )
+    assert.notEqual(tipHead.shardHashes[targetBucket], earlierHead.shardHashes[targetBucket])
+    const cleanIndex = createEmptyV4LocalIndex({
+      repoId: "o/r#main", deviceId: "clean-reader", mode,
+      pathLayout: mode === "encrypted" ? "opaque-stable-v1" : "plaintext-v1",
+    })
+    const cleanVault = new MemoryVault()
+    await new V4SyncSession({
+      github, vault: cleanVault, index: cleanIndex, config: remoteConfig, keyring,
+      conflictPolicy: "copy", abortChangePercent: 0,
+    }).sync({ operation: "forcePull", allowThresholdOverride: false })
+    assert.equal(dec(cleanVault.files.get(introduced)!.bytes), "created later by plugin")
+    assert.equal(dec(cleanVault.files.get(sibling)!.bytes), "valid sibling update")
+    assert.equal(cleanIndex.remoteCommitSha, tip)
+    if (mode === "plaintext") {
+      const parentShardPath = v4RemoteShardPath(targetBucket, remoteConfig.mode)
+      const parentShardBytes = github.trees.get(github.commits.get(introducedSha)!.treeSha)!.get(parentShardPath)!
+      const invalidShard = JSON.parse(dec(parentShardBytes)) as { records: Record<string, V4IndexFileRecord> }
+      invalidShard.records[tipRecord.pathId]!.mtime += 1
+      const inconsistentBytes = enc(JSON.stringify(invalidShard))
+      const originalGetFile = github.getFileBytes.bind(github)
+      github.getFileBytes = async (path: string, ref?: string) => {
+        if (path === parentShardPath && ref === introducedSha) {
+          return { bytes: inconsistentBytes, sha: computeV4GitBlobSha1(inconsistentBytes) }
+        }
+        return originalGetFile(path, ref)
+      }
+      const rejectedIndex = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "rejected", mode: "plaintext" })
+      const rejectedVault = new MemoryVault()
+      try {
+        await assert.rejects(() => new V4SyncSession({
+          github, vault: rejectedVault, index: rejectedIndex, config: remoteConfig,
+          conflictPolicy: "copy", abortChangePercent: 0,
+        }).sync({ operation: "forcePull", allowThresholdOverride: false }),
+        /V4 parent shard does not match its authenticated HEAD/u)
+        assert.equal(github.ref?.sha, tip)
+        assert.equal(rejectedIndex.remoteCommitSha, undefined)
+        assert.deepEqual(rejectedVault.operations, [])
+      } finally {
+        github.getFileBytes = originalGetFile
+      }
+    }
+    const clean = github.trees.get(github.commits.get(introducedSha)!.treeSha)!.get(tipRecord.remotePath)!
+    const tampered = mode === "plaintext" ? enc("direct edit in latest commit")
+      : new Uint8Array(clean.map((byte, i) => i === 0 ? byte ^ 1 : byte))
+    const commit = github.commits.get(tip)!
+    const tree = new Map(github.trees.get(commit.treeSha)!)
+    tree.set(tipRecord.remotePath, tampered)
+    const treeSha = `tree-d205-late-file-${mode}`
+    github.trees.set(treeSha, tree)
+    commit.treeSha = treeSha
+    github.files = new Map(tree)
+
+    const freshIndex = createEmptyV4LocalIndex({
+      repoId: "o/r#main", deviceId: "fresh", mode,
+      pathLayout: mode === "encrypted" ? "opaque-stable-v1" : "plaintext-v1",
+    })
+    const freshVault = new MemoryVault()
+    const run = () => new V4SyncSession({
+      github, vault: freshVault, index: freshIndex, config: remoteConfig, keyring,
+      conflictPolicy: "copy", abortChangePercent: 0,
+    }).sync({ operation: "forcePull", allowThresholdOverride: false })
+    if (mode === "encrypted") {
+      await assert.rejects(run, /External GitHub changes touched an encrypted V4 branch/u)
+      assert.equal(github.ref?.sha, tip)
+      assert.equal(freshIndex.remoteCommitSha, undefined)
+      assert.deepEqual(freshVault.operations, [])
+    } else {
+      await run()
+      assert.equal(dec(freshVault.files.get(introduced)!.bytes), "direct edit in latest commit")
+      assert.equal(dec(freshVault.files.get(sibling)!.bytes), "valid sibling update")
+      assert.equal(dec(freshVault.files.get("note.md")!.bytes), "remote-newer")
+    }
+  }
 })
 
 test("D204 a real changed record and a sibling shard update restore without false tampering alarms", async () => {
