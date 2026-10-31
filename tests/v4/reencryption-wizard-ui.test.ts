@@ -218,6 +218,7 @@ test("D153 Wizard branch availability rechecks exact pinned Source HEAD and defa
     "stable", "source-moved", "default-moved", "wrong-source-ref",
     "missing-source-ref", "source-request-fails", "repository-swapped", "destination-collision",
     "untrusted-ref-error", "untrusted-repo-error",
+    "late-source-moved", "late-default-moved", "late-repository-swapped",
   ] as const) {
     const plugin = fakePlugin()
     const wizard = new V4ReencryptionWizardModal(plugin)
@@ -244,6 +245,8 @@ test("D153 Wizard branch availability rechecks exact pinned Source HEAD and defa
     view.newPassphrase = "different-preview-only-passphrase"
     view.confirmPassphrase = "different-preview-only-passphrase"
     const requests: Array<{url: string; method?: string; body?: unknown}> = []
+    let sourceHeadReads = 0
+    let branchReadsAfterSource = 0
     setRequestUrlHandler(async raw => {
       const request = raw as {url: string; method?: string; body?: unknown}
       requests.push(request)
@@ -254,13 +257,16 @@ test("D153 Wizard branch availability rechecks exact pinned Source HEAD and defa
           throw new Error("A proposed branch already exists. source-token-never-render")
         }
         if (request.url.includes("/heads/main?")) {
+          sourceHeadReads++
           if (scenario === "missing-source-ref") return respond({}, 404)
           if (scenario === "source-request-fails") return respond({}, 403)
           return respond({
             ref: scenario === "wrong-source-ref" ? "refs/heads/other" : "refs/heads/main",
-            object: { sha: scenario === "source-moved" ? otherSha : expectedSha, type: "commit" },
+            object: { sha: scenario === "source-moved"
+              || (scenario === "late-source-moved" && sourceHeadReads > 1) ? otherSha : expectedSha, type: "commit" },
           })
         }
+        if (sourceHeadReads > 0) branchReadsAfterSource++
         return scenario === "destination-collision"
           && request.url.includes("/heads/rekey/")
           ? respond({ ref: "refs/heads/rekey/2026-10-29-abcdef01",
@@ -272,9 +278,11 @@ test("D153 Wizard branch availability rechecks exact pinned Source HEAD and defa
         throw new Error("Repository identity changed. source-token-never-render")
       }
       return respond({
-        id: scenario === "repository-swapped" ? 999 : 444,
+        id: scenario === "repository-swapped"
+          || (scenario === "late-repository-swapped" && branchReadsAfterSource >= 2) ? 999 : 444,
         full_name: "owner/vault",
-        default_branch: scenario === "default-moved" ? "alternate" : "main",
+        default_branch: scenario === "default-moved"
+          || (scenario === "late-default-moved" && branchReadsAfterSource >= 2) ? "alternate" : "main",
       })
     })
     try {
@@ -287,10 +295,11 @@ test("D153 Wizard branch availability rechecks exact pinned Source HEAD and defa
         assert.equal(view.checked?.pinnedSourceCommitSha, expectedSha)
         assert.equal(view.checked?.physicalRepositoryId, 444)
         assert.match(text, /Both refs were absent before and after Source/i)
-        assert.equal(requests.length, 7, "two pairs of ref lookups bracketing repo identity, default branch and source HEAD")
+        assert.equal(requests.length, 10, "two pairs of branch lookups and two Source identity/default/HEAD observations")
       } else {
         assert.equal(view.checked, undefined, scenario + " must not mark branch names ready")
-        if (scenario === "source-moved" || scenario === "default-moved") {
+        if (scenario === "source-moved" || scenario === "default-moved"
+          || scenario === "late-source-moved" || scenario === "late-default-moved") {
           assert.match(text, /source again/i, "stale source must tell user to repeat verification")
         }
         if (scenario === "untrusted-ref-error" || scenario === "untrusted-repo-error") {

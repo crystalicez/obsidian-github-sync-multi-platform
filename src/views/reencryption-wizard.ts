@@ -302,6 +302,23 @@ export class V4ReencryptionWizardModal extends Modal {
       if (destinationAfter !== null || backupAfter !== null) {
         throw new Error("A proposed branch already exists. Choose unused branch names.")
       }
+      const [repoAfter, defaultBranchAfter, sourceRefAfter] = await Promise.all([
+        sourceClient.getRepositoryIdentity(),
+        sourceClient.getRepositoryDefaultBranch(),
+        sourceClient.getGitRef(),
+      ])
+      if (this.closed || controller.signal.aborted || epoch !== this.requestEpoch) return
+      this.assertSyncStillIdle()
+      if (repoAfter.id !== proposal.physicalRepositoryId
+        || repoAfter.fullName.toLowerCase() !== `${this.initialSettings.githubOwner}/${this.initialSettings.githubRepo}`.toLowerCase()) {
+        throw new Error("Repository identity changed.")
+      }
+      if (defaultBranchAfter !== this.source?.defaultBranch
+        || sourceRefAfter.ref !== `refs/heads/${this.initialSettings.githubBranch}`
+        || sourceRefAfter.type !== "commit"
+        || sourceRefAfter.sha !== proposal.pinnedSourceCommitSha) {
+        throw new Error("Source branch or default branch changed. Return to Preflight and verify the source again.")
+      }
       if (!this.matchesConnection() || this.plan().destinationRepoId !== proposal.destinationRepoId
         || this.plan().backupRepoId !== proposal.backupRepoId) {
         throw new Error("Wizard settings changed during verification.")
@@ -428,7 +445,7 @@ export class V4ReencryptionWizardModal extends Modal {
     })
     new Setting(container).setName("Destination and backup branch availability")
       .setDesc(this.checked
-        ? "Both refs were absent before and after Source HEAD/default-branch revalidation. This is not a create-time guarantee or a remote lock."
+        ? "Both refs were absent before and after Source revalidation. Source repository identity, default branch and pinned HEAD were checked again after the final branch lookups. This is not a create-time guarantee or a remote lock."
         : "Not checked. Confirm both new names are absent and the verified Source has not changed.")
       .addButton(button => button.setButtonText(this.busy ? "Checking…" : "Check both branches")
         .setDisabled(this.busy)
