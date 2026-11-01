@@ -29,6 +29,8 @@ import { inspectV4FencedPendingCutoverSurfacesAfterRestart } from "../../src/lib
 import { inspectV4FencedPendingCommitPreflightAfterRestart } from "../../src/lib/v4/reencryption-fenced-pending-commit-preflight"
 import { stageV4FencedCutoverActivationDecision, inspectV4FencedCutoverActivationDecisionAfterRestart } from "../../src/lib/v4/reencryption-activation-decision-stage"
 import { inspectV4CutoverActivationDecision } from "../../src/lib/v4/reencryption-activation-decision-crypto"
+import { stageV4FencedActivationSettingsSwitchPlan, inspectV4FencedActivationSettingsSwitchPlanAfterRestart } from "../../src/lib/v4/reencryption-activation-switch-plan-stage"
+import { inspectV4ActivationSettingsSwitchPlan } from "../../src/lib/v4/reencryption-activation-switch-plan-crypto"
 import { inspectV4ReencryptionPendingCutoverIntent } from "../../src/lib/v4/reencryption-cutover-intent-crypto"
 import { inspectV4ReencryptionCutoverCandidateAfterRestart } from "../../src/lib/v4/reencryption-cutover-candidate-restart"
 import { decodeV4ReencryptionCutoverCandidateManifest } from "../../src/lib/v4/reencryption-cutover-candidate-manifest"
@@ -1542,6 +1544,156 @@ async function d217CurrentFrozenBackup(f: Awaited<ReturnType<typeof d179Scenario
     setRef(sha: string) { observedBackupSha = sha },
   }
 }
+
+test("D231 one-lease Settings Switch Plan binds exact old/new Settings and distinct Index roots without activating", async () => {
+  const f = await d179Scenario()
+  const b = await d217CurrentFrozenBackup(f)
+  await stageV4FencedLiveReencryptionIntent({
+    readiness: f.input, backup: b.backup, transactionId: d183TransactionId,
+  })
+  const input = {
+    readiness: f.input, backup: b.backup, transactionId: d183TransactionId,
+    readPersistedSettings: async () => ({ ...f.prepared.restart.settings }),
+  }
+  await stageV4FencedCutoverActivationDecision(input)
+  const previousFiles = new Map(f.s.files)
+  const previousSecrets = new Map(f.s.secrets)
+  const holderCount = f.s.holderCounts().calls
+  const result = await stageV4FencedActivationSettingsSwitchPlan(input)
+  assert.equal(result.status, "settings-switch-plan-staged-not-applied")
+  assert.equal(result.localCutoverAuthorized, false)
+  assert.equal(result.resumeSyncAuthorized, false)
+  assert.equal(result.oldPassphraseCleanupAuthorized, false)
+  assert.equal(f.s.holderCounts().calls, holderCount + 1)
+  assert.equal(f.s.holderCounts().held, false)
+  assert.equal(f.s.files.size, previousFiles.size + 1)
+  for (const [path, value] of previousFiles) assert.equal(f.s.files.get(path), value, path)
+  assert.deepEqual(f.s.secrets, previousSecrets)
+  const ciphertext = f.s.files.get(result.planPath)
+  assert.ok(ciphertext, "only isolated new Settings Plan is written")
+  assert.ok(!ciphertext.includes("encryptionPassphraseSecretId"))
+  assert.ok(!ciphertext.includes("githubBranch"))
+  const recovered = await inspectV4FencedActivationSettingsSwitchPlanAfterRestart(input)
+  assert.deepEqual(recovered, {
+    integrityScope: "read-only-restarted-settings-switch-plan",
+    observation: "authenticated-settings-switch-plan-not-applied",
+    evidence: "best-effort-wal-readback-not-power-loss-durable",
+    localCutoverAuthorized: false, commitDecisionAuthorized: false,
+    resumeSyncAuthorized: false, rollbackAuthorized: false,
+    remoteWritesAuthorized: false, oldPassphraseCleanupAuthorized: false,
+  })
+  await assert.rejects(stageV4FencedActivationSettingsSwitchPlan(input),
+    /existing Settings Switch Plan requires Manual Recovery/)
+})
+
+test("D231 Settings Switch Plan rejects changed settings, key, recorded decision and truncated ciphertext", async () => {
+  const f = await d179Scenario()
+  const b = await d217CurrentFrozenBackup(f)
+  await stageV4FencedLiveReencryptionIntent({
+    readiness: f.input, backup: b.backup, transactionId: d183TransactionId,
+  })
+  const input = {
+    readiness: f.input, backup: b.backup, transactionId: d183TransactionId,
+    readPersistedSettings: async () => ({ ...f.prepared.restart.settings }),
+  }
+  const staged = await stageV4FencedCutoverActivationDecision(input)
+  const plan = await stageV4FencedActivationSettingsSwitchPlan(input)
+  const root = plan.planPath.slice(0, -"/settings-switch-plan.json".length)
+  const manifest = f.s.files.get(root + "/contract.json")!
+  const contract = decodeV4ReencryptionCutoverCandidateManifest(manifest)
+  const settings = { ...f.prepared.restart.settings }
+  const sources = {
+    manifest, receiptCiphertext: f.s.files.get(root + "/receipt.json")!,
+    selectorCiphertext: f.s.files.get(root + "/selector.json")!,
+    intentCiphertext: f.s.files.get(root + "/intent.json")!,
+    activationDecisionCiphertext: f.s.files.get(staged.decisionPath)!,
+  }
+  const ciphertext = f.s.files.get(plan.planPath)!
+  assert.equal((await inspectV4ActivationSettingsSwitchPlan(
+    contract, f.prepared.journalKey, sources, settings, ciphertext,
+  )).observation, "authenticated-settings-switch-plan-not-applied")
+  assert.equal((await inspectV4ActivationSettingsSwitchPlan(
+    contract, f.prepared.journalKey, sources, { ...settings, githubBranch: "untrusted" },
+    ciphertext,
+  )).observation, "manual-recovery-required")
+  assert.equal((await inspectV4ActivationSettingsSwitchPlan(
+    contract, new Uint8Array(32).fill(4), sources, settings, ciphertext,
+  )).observation, "manual-recovery-required")
+  assert.equal((await inspectV4ActivationSettingsSwitchPlan(
+    contract, f.prepared.journalKey,
+    { ...sources, activationDecisionCiphertext: sources.intentCiphertext },
+    settings, ciphertext,
+  )).observation, "manual-recovery-required")
+  assert.equal((await inspectV4ActivationSettingsSwitchPlan(
+    contract, f.prepared.journalKey, sources, settings, ciphertext.slice(0, -8),
+  )).observation, "manual-recovery-required")
+})
+
+test("D231 interrupted or torn Settings Switch Plan preserves residue and refuses replay", async () => {
+  const f = await d179Scenario()
+  const b = await d217CurrentFrozenBackup(f)
+  await stageV4FencedLiveReencryptionIntent({
+    readiness: f.input, backup: b.backup, transactionId: d183TransactionId,
+  })
+  const input = {
+    readiness: f.input, backup: b.backup, transactionId: d183TransactionId,
+    readPersistedSettings: async () => ({ ...f.prepared.restart.settings }),
+  }
+  await stageV4FencedCutoverActivationDecision(input)
+  const path = f.id.indexRoot + "-rekey-cutover-candidate-" + f.id.runId
+    + "/settings-switch-plan.json"
+  const write = f.s.adapter.write
+  f.s.adapter.write = async (target, serialized) => {
+    if (target === path) {
+      f.s.files.set(path, serialized.slice(0, 18))
+      throw Error("injected interrupted Settings Plan write")
+    }
+    return write(target, serialized)
+  }
+  const secretsBefore = new Map(f.s.secrets)
+  await assert.rejects(stageV4FencedActivationSettingsSwitchPlan(input),
+    /injected interrupted Settings Plan write/)
+  assert.ok(f.s.files.has(path), "partial ciphertext evidence persists")
+  assert.equal((await inspectV4FencedActivationSettingsSwitchPlanAfterRestart(input))
+    .observation, "manual-recovery-required")
+  await assert.rejects(stageV4FencedActivationSettingsSwitchPlan(input),
+    /existing Settings Switch Plan requires Manual Recovery/)
+  assert.deepEqual(f.s.secrets, secretsBefore)
+  assert.equal(f.s.holderCounts().held, false)
+})
+
+test("D231 post-write Git ref drift or persisted Source Settings drift denies a successful Settings Plan", async () => {
+  for (const failure of ["backup", "destination", "settings"] as const) {
+    const f = await d179Scenario()
+    const b = await d217CurrentFrozenBackup(f)
+    await stageV4FencedLiveReencryptionIntent({
+      readiness: f.input, backup: b.backup, transactionId: d183TransactionId,
+    })
+    const settings = { ...f.prepared.restart.settings }
+    const input = {
+      readiness: f.input, backup: b.backup, transactionId: d183TransactionId,
+      readPersistedSettings: async () => ({ ...settings }),
+    }
+    await stageV4FencedCutoverActivationDecision(input)
+    const path = f.id.indexRoot + "-rekey-cutover-candidate-" + f.id.runId
+      + "/settings-switch-plan.json"
+    const write = f.s.adapter.write
+    f.s.adapter.write = async (target, serialized) => {
+      await write(target, serialized)
+      if (target === path) {
+        if (failure === "backup") b.setRef("9".repeat(40))
+        else if (failure === "destination") f.s.f.changeRef("9".repeat(40))
+        else settings.githubBranch = "unknown-destination"
+      }
+    }
+    await assert.rejects(stageV4FencedActivationSettingsSwitchPlan(input))
+    assert.ok(f.s.files.has(path), failure + " residue must be preserved")
+    const recovered = await inspectV4FencedActivationSettingsSwitchPlanAfterRestart(input)
+    assert.equal(recovered.observation, "manual-recovery-required", failure)
+    assert.equal(recovered.resumeSyncAuthorized, false, failure)
+    assert.equal(f.s.holderCounts().held, false, failure)
+  }
+})
 
 test("D230 one owner lease stores encrypted decision only after two fresh full Git and local proofs", async () => {
   const f = await d179Scenario()

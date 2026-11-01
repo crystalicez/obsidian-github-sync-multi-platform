@@ -59,7 +59,8 @@ const MANUAL: V4CutoverActivationDecisionRestartReport = Object.freeze({
   observation: "manual-recovery-required",
 })
 
-function createFencedSession(input: V4FencedPendingCommitPreflightInput) {
+/** Shared fenced, read-only proof session for later isolated activation artifacts. */
+export function createV4FencedActivationSession(input: V4FencedPendingCommitPreflightInput) {
   const readiness = input.readiness
   const prepared = readiness?.prepared
   const full = readiness?.full
@@ -309,7 +310,8 @@ function createFencedSession(input: V4FencedPendingCommitPreflightInput) {
     return { ...local, ciphertext }
   }
   return { root, decisionPath, key, holder, check, unchanged, prove,
-    readOne, readSources, readAuthenticated, adapter, methods }
+    readOne, readSources, readAuthenticated, adapter, methods,
+    sourceSettings: restart.settings, readPersistedSettings: reader }
 }
 
 /**
@@ -320,7 +322,7 @@ function createFencedSession(input: V4FencedPendingCommitPreflightInput) {
 export async function stageV4FencedCutoverActivationDecision(
   input: V4FencedPendingCommitPreflightInput,
 ): Promise<V4CutoverActivationDecisionStageReport> {
-  const session = createFencedSession(input)
+  const session = createV4FencedActivationSession(input)
   const { root, decisionPath, adapter, holder, methods } = session
   const claimed = active.get(adapter) ?? new Set<string>()
   if (claimed.has(root)) throw Error("D230 concurrent decision staging requires Manual Recovery.")
@@ -381,8 +383,8 @@ export async function stageV4FencedCutoverActivationDecision(
 export async function inspectV4FencedCutoverActivationDecisionAfterRestart(
   input: V4FencedPendingCommitPreflightInput,
 ): Promise<V4CutoverActivationDecisionRestartReport> {
-  let session: ReturnType<typeof createFencedSession>
-  try { session = createFencedSession(input) } catch { return MANUAL }
+  let session: ReturnType<typeof createV4FencedActivationSession>
+  try { session = createV4FencedActivationSession(input) } catch { return MANUAL }
   let calls = 0
   let completed: V4CutoverActivationDecisionRestartReport | null = null
   try {
