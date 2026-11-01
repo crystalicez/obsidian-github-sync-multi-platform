@@ -1,35 +1,21 @@
 import { bytesToUtf8, fromBase64, sha256Hex, toBase64, utf8ToBytes } from "../bytes"
 import { decryptV4Payload, encryptV4Payload } from "./crypto"
 import {
-  assertV4ReencryptionProposedCommitIdentity,
-  type V4ReencryptionProposedCommitIdentity,
-} from "./reencryption-proposed-commit-receipt"
+  assertV4ReencryptionCutoverSnapshotContract,
+  type V4ReencryptionCutoverSnapshotContract,
+} from "./reencryption-cutover-snapshot-contract"
+
+export { assertV4ReencryptionCutoverSnapshotContract as assertV4ReencryptionCommitPairTestContract }
+  from "./reencryption-cutover-snapshot-contract"
 
 const RECEIPT_CONTEXT = "v4-rekey-d182-receipt-contract-test-vector-v1"
 const SELECTOR_CONTEXT = "v4-rekey-d182-selector-contract-test-vector-v1"
 const SHA256 = /^[a-f0-9]{64}$/u
-const TX = /^[a-f0-9]{32}$/u
 const MAX_ENCODED_BYTES = 8 * 1024
 const BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u
-const CONTRACT_KEYS = Object.freeze([
-  "transactionId", "identity", "sourceIndexSha256", "destinationShadowSha256",
-  "preparedEvidenceSha256", "walSnapshotSha256", "sourceSettingsSha256",
-  "destinationSettingsSha256",
-].sort())
 
-/** A proposed data contract ONLY, not a permission or a durable commit format. */
-export interface V4ReencryptionCommitPairTestContract {
-  /** 128-bit per-attempt random ID supplied by the eventual trusted caller. */
-  readonly transactionId: string
-  readonly identity: V4ReencryptionProposedCommitIdentity
-  /** Digests must be computed from independently verified canonical snapshots. */
-  readonly sourceIndexSha256: string
-  readonly destinationShadowSha256: string
-  readonly preparedEvidenceSha256: string
-  readonly walSnapshotSha256: string
-  readonly sourceSettingsSha256: string
-  readonly destinationSettingsSha256: string
-}
+/** Compatibility alias for D182/D183 test vectors; shared cutover snapshot is neutral. */
+export type V4ReencryptionCommitPairTestContract = V4ReencryptionCutoverSnapshotContract
 export interface V4ReencryptionCommitPairTestVectors {
   readonly receiptTestVector: string
   readonly selectorTestVector: string
@@ -77,19 +63,6 @@ const NONE = observation("manual-recovery-required", "both-absent")
 const PARTIAL = observation("manual-recovery-required", "one-artifact-missing")
 const INVALID = observation("manual-recovery-required", "invalid-or-mismatched-pair")
 
-export function assertV4ReencryptionCommitPairTestContract(contract: V4ReencryptionCommitPairTestContract): void {
-  if (!contract || typeof contract !== "object" || Array.isArray(contract)
-    || Object.keys(contract).sort().join("|") !== CONTRACT_KEYS.join("|")
-    || !TX.test(contract.transactionId) || /^0+$/u.test(contract.transactionId)
-    || ![
-      contract.sourceIndexSha256, contract.destinationShadowSha256,
-      contract.preparedEvidenceSha256, contract.walSnapshotSha256,
-      contract.sourceSettingsSha256, contract.destinationSettingsSha256,
-    ].every(value => typeof value === "string" && SHA256.test(value))) {
-    throw new Error("Invalid Re-encryption commit pair test contract.")
-  }
-  assertV4ReencryptionProposedCommitIdentity(contract.identity)
-}
 function assertKey(journalKey: Uint8Array): void {
   if (!(journalKey instanceof Uint8Array) || journalKey.byteLength !== 32) {
     throw new Error("Commit pair test vectors need the independent 32-byte journal key.")
@@ -196,7 +169,7 @@ async function matchesSealed(
 export async function sealV4ReencryptionCommitPairTestVectors(
   contract: V4ReencryptionCommitPairTestContract, journalKey: Uint8Array,
 ): Promise<V4ReencryptionCommitPairTestVectors> {
-  assertV4ReencryptionCommitPairTestContract(contract)
+  assertV4ReencryptionCutoverSnapshotContract(contract)
   assertKey(journalKey)
   const pinned = JSON.stringify(contract)
   const keyCopy = Uint8Array.from(journalKey)
@@ -226,7 +199,7 @@ export async function inspectV4ReencryptionCommitPairTestVectors(
   pair: { readonly receiptTestVector: string | null; readonly selectorTestVector: string | null },
 ): Promise<V4ReencryptionCommitPairTestInspection> {
   try {
-    assertV4ReencryptionCommitPairTestContract(contract)
+    assertV4ReencryptionCutoverSnapshotContract(contract)
     assertKey(journalKey)
     if (!pair) return INVALID
     const receipt = pair.receiptTestVector

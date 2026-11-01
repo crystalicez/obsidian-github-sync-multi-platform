@@ -22,6 +22,10 @@ import { stageV4FencedCommitPairTestArtifacts } from "../../src/lib/v4/reencrypt
 import { inspectV4FencedPersistedTestPairAfterRestart } from "../../src/lib/v4/reencryption-fenced-persisted-test-pair-restart"
 import { inspectV4FencedLivePersistedTestPairAndBackupAfterRestart } from "../../src/lib/v4/reencryption-fenced-live-persisted-test-pair-recovery"
 import { classifyV4ReencryptionManualRecovery } from "../../src/lib/v4/reencryption-manual-recovery-triage"
+import { stageV4ReencryptionCutoverCandidate } from "../../src/lib/v4/reencryption-cutover-candidate-stage"
+import { inspectV4ReencryptionCutoverCandidateAfterRestart } from "../../src/lib/v4/reencryption-cutover-candidate-restart"
+import { decodeV4ReencryptionCutoverCandidateManifest } from "../../src/lib/v4/reencryption-cutover-candidate-manifest"
+import { inspectV4ReencryptionCutoverCandidatePair } from "../../src/lib/v4/reencryption-cutover-candidate-crypto"
 import { encodeV4ReencryptionPersistedTestContract, decodeV4ReencryptionPersistedTestContract } from "../../src/lib/v4/reencryption-persisted-test-contract"
 import { inspectV4FencedLivePostCrashAfterRestart, inspectV4FencedLivePostCrashAndBackupAfterRestart } from "../../src/lib/v4/reencryption-fenced-live-post-crash-verification"
 import type { V4FencedFrozenBackupContentInput } from "../../src/lib/v4/reencryption-fenced-backup-content"
@@ -1531,6 +1535,215 @@ async function d217CurrentFrozenBackup(f: Awaited<ReturnType<typeof d179Scenario
     setRef(sha: string) { observedBackupSha = sha },
   }
 }
+
+test("D223 production-namespace candidate stages real AES-GCM Receipt/Selector under one held WAL+Fence lease", async () => {
+  const f = await d179Scenario()
+  const derived = await deriveV4FencedCommitPairSnapshotTestContract(d183Input(f))
+  assert.equal(derived.observation, "snapshot-contract-derived-uncommitted")
+  assert.ok(derived.contract)
+  const filesBefore = new Map(f.s.files)
+  const secretsBefore = new Map(f.s.secrets)
+  const walBefore = JSON.stringify(f.s.getWal())
+  const writesBefore = f.s.getWrites()
+  const holdersBefore = f.s.holderCounts().calls
+  const report = await stageV4ReencryptionCutoverCandidate({
+    prepared: f.prepared, contract: derived.contract!,
+  })
+  const root = V4_RUNTIME_INDEX_ROOT + "-rekey-cutover-candidate-" + f.id.runId
+  assert.deepEqual(report, {
+    status: "production-namespace-pair-staged-uncommitted",
+    manifestPath: root + "/contract.json",
+    receiptPath: root + "/receipt.json",
+    selectorPath: root + "/selector.json",
+    evidence: "best-effort-wal-readback-not-power-loss-durable",
+    localCutoverAuthorized: false, resumeSyncAuthorized: false,
+    rollbackAuthorized: false, remoteWritesAuthorized: false,
+    oldPassphraseCleanupAuthorized: false,
+  })
+  assert.equal(f.s.holderCounts().calls, holdersBefore + 1)
+  assert.equal(f.s.holderCounts().held, false)
+  const persistedManifest = f.s.files.get(report.manifestPath)!
+  const recoveredContract = decodeV4ReencryptionCutoverCandidateManifest(persistedManifest)
+  assert.deepEqual(recoveredContract, derived.contract)
+  assert.doesNotMatch(persistedManifest, /old-d138-secret|new-d83-secret/)
+  const auth = await inspectV4ReencryptionCutoverCandidatePair(
+    recoveredContract, f.prepared.journalKey, {
+      receiptCiphertext: f.s.files.get(report.receiptPath)!,
+      selectorCiphertext: f.s.files.get(report.selectorPath)!,
+    },
+  )
+  assert.equal(auth.observation, "cryptographically-linked-candidate-uncommitted")
+  assert.equal(auth.localCutoverAuthorized, false)
+  assert.equal(auth.resumeSyncAuthorized, false)
+  assert.deepEqual(f.s.secrets, secretsBefore)
+  assert.equal(JSON.stringify(f.s.getWal()), walBefore)
+  for (const [path, value] of filesBefore) assert.equal(f.s.files.get(path), value)
+  assert.equal(f.s.getWrites(), writesBefore + 3)
+  assert.ok(f.s.files.has(V4_REENCRYPTION_SYNC_FENCE_ROOT + "/active.json"))
+  const writes = f.s.getWrites()
+  await assert.rejects(() => stageV4ReencryptionCutoverCandidate({
+    prepared: f.prepared, contract: derived.contract!,
+  }), /existing|residue|Manual Recovery/i)
+  assert.equal(f.s.getWrites(), writes, "never overwrite even a fully linked candidate")
+})
+
+test("D223 interrupted candidate directory, manifest, Receipt or Selector preserves all partial evidence", async () => {
+  for (const phase of ["directory", "manifest", "receipt", "selector"] as const) {
+    const f = await d179Scenario()
+    const derived = await deriveV4FencedCommitPairSnapshotTestContract(d183Input(f))
+    assert.ok(derived.contract)
+    const root = V4_RUNTIME_INDEX_ROOT + "-rekey-cutover-candidate-" + f.id.runId
+    const expected = phase === "directory" ? null
+      : phase === "manifest" ? "contract.json"
+      : phase === "receipt" ? "receipt.json" : "selector.json"
+    const oldWrite = f.s.adapter.write
+    const oldMkdir = f.s.adapter.mkdir
+    if (phase === "directory") {
+      f.s.adapter.mkdir = async path => {
+        await oldMkdir(path)
+        if (path === root) throw Error("simulated-crash-" + phase)
+      }
+    } else {
+      f.s.adapter.write = async (path, value) => {
+        await oldWrite(path, value)
+        if (path === root + "/" + expected) throw Error("simulated-crash-" + phase)
+      }
+    }
+    const oldFiles = new Map(f.s.files)
+    await assert.rejects(() => stageV4ReencryptionCutoverCandidate({
+      prepared: f.prepared, contract: derived.contract!,
+    }), /simulated-crash-/)
+    assert.equal(f.s.holderCounts().held, false, phase)
+    assert.equal(f.s.dirs.has(root), true, phase)
+    assert.equal(f.s.files.has(root + "/contract.json"), phase !== "directory", phase)
+    assert.equal(f.s.files.has(root + "/receipt.json"),
+      phase === "receipt" || phase === "selector", phase)
+    assert.equal(f.s.files.has(root + "/selector.json"), phase === "selector", phase)
+    for (const [path, value] of oldFiles) assert.equal(f.s.files.get(path), value, phase)
+    assert.ok(f.s.files.has(V4_REENCRYPTION_SYNC_FENCE_ROOT + "/active.json"))
+    f.s.adapter.write = oldWrite
+    f.s.adapter.mkdir = oldMkdir
+    const before = f.s.getWrites()
+    await assert.rejects(() => stageV4ReencryptionCutoverCandidate({
+      prepared: f.prepared, contract: derived.contract!,
+    }), /existing|residue|Manual Recovery/i, phase)
+    assert.equal(f.s.getWrites(), before, phase)
+  }
+})
+
+test("D223 restart reconstructs production-namespace candidate from disk with NO caller historical contract", async () => {
+  const f = await d179Scenario()
+  const derived = await deriveV4FencedCommitPairSnapshotTestContract(d183Input(f))
+  assert.ok(derived.contract)
+  await stageV4ReencryptionCutoverCandidate({
+    prepared: f.prepared, contract: derived.contract!,
+  })
+  const files = new Map(f.s.files)
+  const writes = f.s.getWrites()
+  const holders = f.s.holderCounts().calls
+  const recreated = {
+    ...f.prepared,
+    identity: { ...f.prepared.identity },
+    journalKey: Uint8Array.from(f.prepared.journalKey),
+    restart: { ...f.prepared.restart, settings: { ...f.prepared.restart.settings } },
+  }
+  const observed = await inspectV4ReencryptionCutoverCandidateAfterRestart(recreated)
+  assert.deepEqual(observed, {
+    integrityScope: "read-only-production-namespace-candidate-restart",
+    observation: "authenticated-candidate-uncommitted",
+    candidateCryptographicallyLinked: true,
+    evidence: "best-effort-wal-readback-not-power-loss-durable",
+    localCutoverAuthorized: false, resumeSyncAuthorized: false,
+    rollbackAuthorized: false, remoteWritesAuthorized: false,
+    oldPassphraseCleanupAuthorized: false,
+  })
+  assert.equal(f.s.holderCounts().calls, holders + 1)
+  assert.equal(f.s.holderCounts().held, false)
+  assert.deepEqual(f.s.files, files)
+  assert.equal(f.s.getWrites(), writes)
+})
+
+test("D223 post-Restart never authenticates incomplete, foreign or corrupted candidate artifacts", async () => {
+  for (const cause of ["missing-manifest", "torn-manifest", "foreign-transaction",
+    "extra-manifest-field", "missing-receipt", "corrupt-receipt",
+    "missing-selector", "corrupt-selector", "wal", "fence", "old-secret", "new-secret"] as const) {
+    const f = await d179Scenario()
+    const derived = await deriveV4FencedCommitPairSnapshotTestContract(d183Input(f))
+    assert.ok(derived.contract)
+    const report = await stageV4ReencryptionCutoverCandidate({
+      prepared: f.prepared, contract: derived.contract!,
+    })
+    if (cause === "missing-manifest") f.s.files.delete(report.manifestPath)
+    else if (cause === "torn-manifest") f.s.files.set(report.manifestPath, "{")
+    else if (cause === "foreign-transaction") {
+      f.s.files.set(report.manifestPath,
+        f.s.files.get(report.manifestPath)!.replace(d183TransactionId, "b7".repeat(16)))
+    } else if (cause === "extra-manifest-field") {
+      f.s.files.set(report.manifestPath,
+        f.s.files.get(report.manifestPath)!.replace(',"phase":', ',"authorized":true,"phase":'))
+    } else if (cause === "missing-receipt") f.s.files.delete(report.receiptPath)
+    else if (cause === "corrupt-receipt") f.s.files.set(report.receiptPath, "!")
+    else if (cause === "missing-selector") f.s.files.delete(report.selectorPath)
+    else if (cause === "corrupt-selector") f.s.files.set(report.selectorPath, "!")
+    else if (cause === "wal") f.s.setWal({ ...f.s.getWal(), generation: 999 })
+    else if (cause === "fence") f.s.files.set(V4_REENCRYPTION_SYNC_FENCE_ROOT + "/active.json", "{")
+    else if (cause === "old-secret") f.s.secrets.delete(f.id.sourcePassphraseSecretId)
+    else f.s.secrets.delete(f.id.destinationPassphraseSecretId)
+    const before = new Map(f.s.files)
+    const writes = f.s.getWrites()
+    const observation = await inspectV4ReencryptionCutoverCandidateAfterRestart(f.prepared)
+    assert.equal(observation.observation, "manual-recovery-required", cause)
+    assert.equal(observation.candidateCryptographicallyLinked, false, cause)
+    assert.equal(observation.localCutoverAuthorized, false, cause)
+    assert.equal(observation.resumeSyncAuthorized, false, cause)
+    assert.equal(observation.oldPassphraseCleanupAuthorized, false, cause)
+    assert.equal(f.s.holderCounts().held, false, cause)
+    assert.deepEqual(f.s.files, before, cause)
+    assert.equal(f.s.getWrites(), writes, cause)
+  }
+})
+
+test("D223 Restart detects manifest changed immediately after second successful read", async () => {
+  const f = await d179Scenario()
+  const derived = await deriveV4FencedCommitPairSnapshotTestContract(d183Input(f))
+  assert.ok(derived.contract)
+  const report = await stageV4ReencryptionCutoverCandidate({
+    prepared: f.prepared, contract: derived.contract!,
+  })
+  const original = f.s.adapter.read
+  let reads = 0
+  f.s.adapter.read = async path => {
+    const data = await original(path)
+    if (path === report.manifestPath && ++reads === 2) f.s.files.set(path, "{torn-after-read")
+    return data
+  }
+  const writes = f.s.getWrites()
+  const observation = await inspectV4ReencryptionCutoverCandidateAfterRestart(f.prepared)
+  assert.equal(observation.observation, "manual-recovery-required")
+  assert.equal(observation.candidateCryptographicallyLinked, false)
+  assert.equal(observation.resumeSyncAuthorized, false)
+  assert.equal(f.s.getWrites(), writes)
+  assert.equal(f.s.holderCounts().held, false)
+})
+
+test("D223 losing authenticated WAL after writing Receipt prevents Selector and leaves Sync fenced", async () => {
+  const f = await d179Scenario()
+  const derived = await deriveV4FencedCommitPairSnapshotTestContract(d183Input(f))
+  assert.ok(derived.contract)
+  const root = V4_RUNTIME_INDEX_ROOT + "-rekey-cutover-candidate-" + f.id.runId
+  const oldWrite = f.s.adapter.write
+  f.s.adapter.write = async (path, data) => {
+    await oldWrite(path, data)
+    if (path === root + "/receipt.json") f.s.setWal({ ...f.s.getWal(), generation: 999 })
+  }
+  await assert.rejects(() => stageV4ReencryptionCutoverCandidate({
+    prepared: f.prepared, contract: derived.contract!,
+  }), /WAL|identity|Manual Recovery/i)
+  assert.equal(f.s.files.has(root + "/receipt.json"), true)
+  assert.equal(f.s.files.has(root + "/selector.json"), false)
+  assert.equal(f.s.holderCounts().held, false)
+  assert.ok(f.s.files.has(V4_REENCRYPTION_SYNC_FENCE_ROOT + "/active.json"))
+})
 
 test("D222 genuine D184+D221 disk/Git evidence maps to Manual Recovery without promoting test pair to Commit", async () => {
   const f = await d179Scenario()
