@@ -26,6 +26,7 @@ import { stageV4ReencryptionCutoverCandidate } from "../../src/lib/v4/reencrypti
 import { stageV4FencedLiveReencryptionCandidate, stageV4FencedLiveReencryptionIntent } from "../../src/lib/v4/reencryption-fenced-live-candidate-stage"
 import { inspectV4ReencryptionPendingCutoverIntentAfterRestart } from "../../src/lib/v4/reencryption-cutover-intent-restart"
 import { inspectV4FencedPendingCutoverSurfacesAfterRestart } from "../../src/lib/v4/reencryption-fenced-intent-surface-restart"
+import { inspectV4FencedPendingCommitPreflightAfterRestart } from "../../src/lib/v4/reencryption-fenced-pending-commit-preflight"
 import { inspectV4ReencryptionPendingCutoverIntent } from "../../src/lib/v4/reencryption-cutover-intent-crypto"
 import { inspectV4ReencryptionCutoverCandidateAfterRestart } from "../../src/lib/v4/reencryption-cutover-candidate-restart"
 import { decodeV4ReencryptionCutoverCandidateManifest } from "../../src/lib/v4/reencryption-cutover-candidate-manifest"
@@ -1539,6 +1540,144 @@ async function d217CurrentFrozenBackup(f: Awaited<ReturnType<typeof d179Scenario
     setRef(sha: string) { observedBackupSha = sha },
   }
 }
+
+test("D229 commit preflight independently verifies current full old Backup, new Destination and persisted local Intent in one lease", async () => {
+  const f = await d179Scenario()
+  const b = await d217CurrentFrozenBackup(f)
+  await stageV4FencedLiveReencryptionIntent({
+    readiness: f.input, backup: b.backup, transactionId: d183TransactionId,
+  })
+  const files = new Map(f.s.files)
+  const secrets = new Map(f.s.secrets)
+  const beforeWrites = f.s.getWrites()
+  const beforeHolders = f.s.holderCounts().calls
+  let settingsReads = 0
+  const settings = { ...f.prepared.restart.settings }
+  const report = await inspectV4FencedPendingCommitPreflightAfterRestart({
+    readiness: f.input, backup: b.backup, transactionId: d183TransactionId,
+    readPersistedSettings: async () => {
+      settingsReads++
+      return { ...settings }
+    },
+  })
+  assert.deepEqual(report, {
+    integrityScope: "fenced-live-full-git-and-persisted-local-pending-intent",
+    observation: "full-live-commit-preflight-uncommitted",
+    evidence: "best-effort-wal-readback-not-power-loss-durable",
+    oldBackupContentReverified: true, newDestinationContentReverified: true,
+    localCutoverAuthorized: false, commitDecisionAuthorized: false,
+    resumeSyncAuthorized: false, rollbackAuthorized: false,
+    remoteWritesAuthorized: false, oldPassphraseCleanupAuthorized: false,
+  })
+  assert.ok(b.blobReads >= 16, "full old-key Backup ciphertext scanned more than once")
+  assert.ok(f.s.f.reads >= 16, "full new-key Destination ciphertext scanned more than once")
+  assert.ok(settingsReads >= 4, "persisted Settings independently read before and after live proofs")
+  assert.equal(f.s.holderCounts().calls, beforeHolders + 1)
+  assert.equal(f.s.holderCounts().held, false)
+  assert.equal(f.s.getWrites(), beforeWrites)
+  assert.deepEqual(f.s.files, files)
+  assert.deepEqual(f.s.secrets, secrets)
+})
+
+test("D229 stale local Intent, changed transaction, missing key or changed current Backup/Destination rejects preflight", async () => {
+  for (const failure of [
+    "old-head", "new-head", "missing-old", "wrong-transaction",
+    "missing-intent", "changed-settings", "lost-wal",
+  ] as const) {
+    const f = await d179Scenario()
+    const b = await d217CurrentFrozenBackup(f)
+    const staged = await stageV4FencedLiveReencryptionIntent({
+      readiness: f.input, backup: b.backup, transactionId: d183TransactionId,
+    })
+    const settings = { ...f.prepared.restart.settings }
+    if (failure === "old-head") b.setRef("9".repeat(40))
+    if (failure === "new-head") f.s.f.changeRef("9".repeat(40))
+    if (failure === "missing-old") f.s.secrets.delete(f.id.sourcePassphraseSecretId)
+    if (failure === "missing-intent") f.s.files.delete(staged.intentPath)
+    if (failure === "changed-settings") settings.githubBranch = "rekey/d83"
+    if (failure === "lost-wal") f.s.setWal({ ...f.s.getWal(), generation: 999 })
+    const writesBefore = f.s.getWrites()
+    const report = await inspectV4FencedPendingCommitPreflightAfterRestart({
+      readiness: f.input, backup: b.backup,
+      transactionId: failure === "wrong-transaction" ? "ab".repeat(16) : d183TransactionId,
+      readPersistedSettings: async () => ({ ...settings }),
+    })
+    assert.equal(report.observation, "manual-recovery-required", failure)
+    assert.equal(report.oldBackupContentReverified, false, failure)
+    assert.equal(report.newDestinationContentReverified, false, failure)
+    assert.equal(report.commitDecisionAuthorized, false, failure)
+    assert.equal(report.resumeSyncAuthorized, false, failure)
+    assert.equal(f.s.getWrites(), writesBefore, failure)
+    assert.equal(f.s.holderCounts().held, false, failure)
+  }
+})
+
+test("D229 remote refs drifting during or after live Git content scans deny apparently fresh local Intent", async () => {
+  for (const moved of ["backup", "destination"] as const) {
+    const f = await d179Scenario()
+    const b = await d217CurrentFrozenBackup(f)
+    await stageV4FencedLiveReencryptionIntent({
+      readiness: f.input, backup: b.backup, transactionId: d183TransactionId,
+    })
+    if (moved === "backup") {
+      const original = f.s.f.github.getBlob
+      let scans = 0
+      f.s.f.github.getBlob = async sha => {
+        const bytes = await original(sha)
+        if (++scans === 1) b.setRef("9".repeat(40))
+        return bytes
+      }
+    } else {
+      const original = b.github.getBlob
+      let scans = 0
+      b.github.getBlob = async sha => {
+        const bytes = await original(sha)
+        if (++scans === 1) f.s.f.changeRef("9".repeat(40))
+        return bytes
+      }
+    }
+    const writesBefore = f.s.getWrites()
+    const report = await inspectV4FencedPendingCommitPreflightAfterRestart({
+      readiness: f.input, backup: b.backup, transactionId: d183TransactionId,
+      readPersistedSettings: async () => ({ ...f.prepared.restart.settings }),
+    })
+    assert.equal(report.observation, "manual-recovery-required", moved)
+    assert.equal(report.commitDecisionAuthorized, false, moved)
+    assert.equal(report.resumeSyncAuthorized, false, moved)
+    assert.equal(f.s.getWrites(), writesBefore, moved)
+    assert.equal(f.s.holderCounts().held, false, moved)
+  }
+})
+
+test("D229 forged nonexecuting holder and post-holder callback replacement never authorize a Commit", async () => {
+  for (const failure of ["fake-holder", "changed-reader"] as const) {
+    const f = await d179Scenario()
+    const b = await d217CurrentFrozenBackup(f)
+    await stageV4FencedLiveReencryptionIntent({
+      readiness: f.input, backup: b.backup, transactionId: d183TransactionId,
+    })
+    const input = {
+      readiness: f.input, backup: b.backup, transactionId: d183TransactionId,
+      readPersistedSettings: async () => ({ ...f.prepared.restart.settings }),
+    }
+    if (failure === "fake-holder") {
+      f.prepared.withExclusiveInitiatorLease = async <T>(_body: () => Promise<T>): Promise<T> =>
+        Object.freeze({}) as T
+    } else {
+      const originalHolder = f.prepared.withExclusiveInitiatorLease
+      f.prepared.withExclusiveInitiatorLease = async <T>(body: () => Promise<T>): Promise<T> =>
+        originalHolder(async () => {
+          const value = await body()
+          input.readPersistedSettings = async () => null as never
+          return value
+        })
+    }
+    const report = await inspectV4FencedPendingCommitPreflightAfterRestart(input)
+    assert.equal(report.observation, "manual-recovery-required", failure)
+    assert.equal(report.commitDecisionAuthorized, false, failure)
+    assert.equal(report.resumeSyncAuthorized, false, failure)
+  }
+})
 
 test("D228 persisted Settings, Source/Shadow Index, Prepared and WAL match all six authenticated Intent digests", async () => {
   const f = await d179Scenario()
