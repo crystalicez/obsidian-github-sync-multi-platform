@@ -20,6 +20,7 @@ import { inspectV4FencedPrecommitReadinessAfterRestart } from "../../src/lib/v4/
 import { inspectV4FencedCrashWindowPairAfterRestart } from "../../src/lib/v4/reencryption-fenced-crash-window-pair-inspection"
 import { stageV4FencedCommitPairTestArtifacts } from "../../src/lib/v4/reencryption-fenced-persisted-test-pair"
 import { inspectV4FencedPersistedTestPairAfterRestart } from "../../src/lib/v4/reencryption-fenced-persisted-test-pair-restart"
+import { inspectV4FencedLivePersistedTestPairAndBackupAfterRestart } from "../../src/lib/v4/reencryption-fenced-live-persisted-test-pair-recovery"
 import { encodeV4ReencryptionPersistedTestContract, decodeV4ReencryptionPersistedTestContract } from "../../src/lib/v4/reencryption-persisted-test-contract"
 import { inspectV4FencedLivePostCrashAfterRestart, inspectV4FencedLivePostCrashAndBackupAfterRestart } from "../../src/lib/v4/reencryption-fenced-live-post-crash-verification"
 import type { V4FencedFrozenBackupContentInput } from "../../src/lib/v4/reencryption-fenced-backup-content"
@@ -1529,6 +1530,169 @@ async function d217CurrentFrozenBackup(f: Awaited<ReturnType<typeof d179Scenario
     setRef(sha: string) { observedBackupSha = sha },
   }
 }
+
+test("D221 persisted historical pair and current encrypted Backup + Destination all verify under ONE holder", async () => {
+  const f = await d179Scenario()
+  await stageV4FencedCommitPairTestArtifacts(d183Input(f))
+  const b = await d217CurrentFrozenBackup(f)
+  const beforeFiles = new Map(f.s.files)
+  const beforeSecrets = new Map(f.s.secrets)
+  const beforeWal = JSON.stringify(f.s.getWal())
+  const beforeWrites = f.s.getWrites()
+  const beforeCalls = f.s.holderCounts().calls
+  const result = await inspectV4FencedLivePersistedTestPairAndBackupAfterRestart({
+    prepared: f.prepared, remote: f.input.full, backup: b.backup,
+  })
+  assert.deepEqual(result, {
+    integrityScope: "read-only-restarted-test-pair-current-git-and-frozen-backup",
+    observation: "manual-recovery-required",
+    reason: "test-pair-and-full-remote-coherent-but-not-a-commit",
+    historicalTestPairCryptographicallyLinked: true,
+    fullDestinationContentReverifiedAfterRestart: true,
+    fullBackupContentReverifiedAfterRestart: true,
+    liveThreeBranchRefsReverifiedAfterRestart: true,
+    evidence: "best-effort-wal-readback-not-power-loss-durable",
+    localCutoverAuthorized: false, resumeSyncAuthorized: false,
+    rollbackAuthorized: false, remoteWritesAuthorized: false,
+    oldPassphraseCleanupAuthorized: false,
+  })
+  assert.ok(b.blobReads >= 8, "two complete D94 old-key Backup scans")
+  assert.ok(f.s.f.reads >= 8, "two complete current Destination scans")
+  assert.equal(f.s.holderCounts().calls, beforeCalls + 1, "no recursively acquired initiating-device lock")
+  assert.equal(f.s.holderCounts().held, false)
+  assert.deepEqual(f.s.files, beforeFiles)
+  assert.deepEqual(f.s.secrets, beforeSecrets)
+  assert.equal(f.s.getWrites(), beforeWrites)
+  assert.equal(JSON.stringify(f.s.getWal()), beforeWal)
+})
+
+test("D221 current Backup/Destination drift, broken WAL, local artifacts or Secrets fail closed", async () => {
+  for (const cause of ["backup-ref", "backup-ciphertext", "destination-ref",
+    "wal", "fence", "manifest", "old-secret", "new-secret"] as const) {
+    const f = await d179Scenario()
+    await stageV4FencedCommitPairTestArtifacts(d183Input(f))
+    const b = await d217CurrentFrozenBackup(f)
+    const manifest = V4_RUNTIME_INDEX_ROOT + "-rekey-proposed-" + f.id.runId + "/contract.json"
+    if (cause === "backup-ref") b.setRef("9".repeat(40))
+    else if (cause === "backup-ciphertext") b.corruptAfterFirstPass()
+    else if (cause === "destination-ref") f.s.f.changeRef("9".repeat(40))
+    else if (cause === "wal") f.s.setWal({ ...f.s.getWal(), generation: 999 })
+    else if (cause === "fence") f.s.files.set(
+      V4_REENCRYPTION_SYNC_FENCE_ROOT + "/active.json", "{torn",
+    )
+    else if (cause === "manifest") f.s.files.set(manifest, "{not-json")
+    else if (cause === "old-secret") f.s.secrets.delete(f.id.sourcePassphraseSecretId)
+    else f.s.secrets.set(f.id.destinationPassphraseSecretId, "incorrect-new-passphrase")
+    const beforeFiles = new Map(f.s.files)
+    const beforeWrites = f.s.getWrites()
+    const result = await inspectV4FencedLivePersistedTestPairAndBackupAfterRestart({
+      prepared: f.prepared, remote: f.input.full, backup: b.backup,
+    })
+    assert.equal(result.reason, "local-or-current-git-proof-uncertain", cause)
+    assert.equal(result.historicalTestPairCryptographicallyLinked, false, cause)
+    assert.equal(result.fullDestinationContentReverifiedAfterRestart, false, cause)
+    assert.equal(result.fullBackupContentReverifiedAfterRestart, false, cause)
+    assert.equal(result.liveThreeBranchRefsReverifiedAfterRestart, false, cause)
+    assert.equal(result.localCutoverAuthorized, false, cause)
+    assert.equal(result.resumeSyncAuthorized, false, cause)
+    assert.equal(result.oldPassphraseCleanupAuthorized, false, cause)
+    assert.deepEqual(f.s.files, beforeFiles, cause)
+    assert.equal(f.s.getWrites(), beforeWrites, cause)
+    assert.equal(f.s.holderCounts().held, false, cause)
+  }
+})
+
+test("D221 a valid independently advanced old Source still permits read-only live proof", async () => {
+  const f = await d179Scenario()
+  await stageV4FencedCommitPairTestArtifacts(d183Input(f))
+  const b = await d217CurrentFrozenBackup(f)
+  const source = f.input.full.branches.readers.source
+  const latest = "9".repeat(40)
+  source.getGitRefOrNull = async () => ({
+    ref: "refs/heads/main", sha: latest, type: "commit",
+  })
+  source.getGitCommit = async sha => ({
+    sha, treeSha: "8".repeat(40), parentShas: [f.id.sourceCommitSha],
+    message: "old-key device independent sync",
+  })
+  const report = await inspectV4FencedLivePersistedTestPairAndBackupAfterRestart({
+    prepared: f.prepared, remote: f.input.full, backup: b.backup,
+  })
+  assert.equal(report.reason, "test-pair-and-full-remote-coherent-but-not-a-commit")
+  assert.equal(report.fullBackupContentReverifiedAfterRestart, true)
+  assert.equal(report.fullDestinationContentReverifiedAfterRestart, true)
+  assert.equal(report.localCutoverAuthorized, false)
+  assert.equal(report.resumeSyncAuthorized, false)
+  assert.equal(f.s.holderCounts().held, false)
+})
+
+test("D221 manifest changes during complete old-key Backup ciphertext read cannot certify current proof", async () => {
+  const f = await d179Scenario()
+  await stageV4FencedCommitPairTestArtifacts(d183Input(f))
+  const b = await d217CurrentFrozenBackup(f)
+  const manifest = V4_RUNTIME_INDEX_ROOT + "-rekey-proposed-" + f.id.runId + "/contract.json"
+  const originalGetBlob = b.github.getBlob
+  let mutated = false
+  b.github.getBlob = async sha => {
+    const bytes = await originalGetBlob(sha)
+    if (!mutated) {
+      mutated = true
+      f.s.files.set(manifest, "{torn-mid-backup")
+    }
+    return bytes
+  }
+  const beforeWrites = f.s.getWrites()
+  const report = await inspectV4FencedLivePersistedTestPairAndBackupAfterRestart({
+    prepared: f.prepared, remote: f.input.full, backup: b.backup,
+  })
+  assert.equal(mutated, true, "actual D94 Backup Git Blob method must be reached")
+  assert.equal(report.reason, "local-or-current-git-proof-uncertain")
+  assert.equal(report.historicalTestPairCryptographicallyLinked, false)
+  assert.equal(report.fullBackupContentReverifiedAfterRestart, false)
+  assert.equal(report.localCutoverAuthorized, false)
+  assert.equal(f.s.getWrites(), beforeWrites)
+})
+
+test("D221 post-holder Backup Git method substitution or forged non-executing holder fails closed", async () => {
+  for (const cause of ["post-holder-backup-method", "forged-holder"] as const) {
+    const f = await d179Scenario()
+    await stageV4FencedCommitPairTestArtifacts(d183Input(f))
+    const b = await d217CurrentFrozenBackup(f)
+    const originalHolder = f.prepared.withExclusiveInitiatorLease
+    const changedHolder = cause === "post-holder-backup-method"
+      ? async <T>(callback: () => Promise<T>): Promise<T> =>
+        originalHolder(async () => {
+          const result = await callback()
+          b.github.getGitRef = async () => ({
+            ref: "refs/heads/" + b.github.branchName,
+            sha: "9".repeat(40), type: "commit",
+          })
+          return result
+        })
+      : async <T>(_callback: () => Promise<T>): Promise<T> => ({
+        integrityScope: "read-only-restarted-test-pair-current-git-and-frozen-backup",
+        observation: "manual-recovery-required",
+        reason: "test-pair-and-full-remote-coherent-but-not-a-commit",
+        historicalTestPairCryptographicallyLinked: true,
+        fullBackupContentReverifiedAfterRestart: true,
+        fullDestinationContentReverifiedAfterRestart: true,
+        liveThreeBranchRefsReverifiedAfterRestart: true,
+      } as T)
+    f.prepared.withExclusiveInitiatorLease = changedHolder
+    f.input.full.branches.withExclusiveInitiatorLease = changedHolder
+    b.backup.withExclusiveInitiatorLease = changedHolder
+    const beforeWrites = f.s.getWrites()
+    const report = await inspectV4FencedLivePersistedTestPairAndBackupAfterRestart({
+      prepared: f.prepared, remote: f.input.full, backup: b.backup,
+    })
+    assert.equal(report.reason, "local-or-current-git-proof-uncertain", cause)
+    assert.equal(report.historicalTestPairCryptographicallyLinked, false, cause)
+    assert.equal(report.localCutoverAuthorized, false, cause)
+    assert.equal(report.resumeSyncAuthorized, false, cause)
+    assert.equal(f.s.getWrites(), beforeWrites, cause)
+    assert.equal(f.s.holderCounts().held, false, cause)
+  }
+})
 
 test("D217 one held lease covers local crash windows, full Destination and two fresh frozen Backup scans", async () => {
   const f = await d179Scenario()
