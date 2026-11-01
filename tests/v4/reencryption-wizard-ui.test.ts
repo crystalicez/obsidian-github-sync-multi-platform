@@ -162,6 +162,40 @@ test("D187 Wizard Preview shows safe Manual Recovery actions without GitHub or s
   }
 })
 
+test("D222 Wizard explains distinct Manual Recovery scenarios as preview examples only, without I/O or Cutover", () => {
+  const plugin = fakePlugin()
+  const original = JSON.stringify(plugin.settings)
+  let calls = 0
+  setRequestUrlHandler(async () => {
+    calls++
+    throw Error("The Manual Recovery guide must never fetch GitHub.")
+  })
+  try {
+    const wizard = new V4ReencryptionWizardModal(plugin)
+    wizard.onOpen()
+    const debug = wizard as unknown as { step: number; render(): void }
+    debug.step = 3
+    debug.render()
+    const text = (wizard.contentEl as unknown as { flattenText(): string }).flattenText()
+    assert.match(text, /Manual Recovery examples — not a live scan/)
+    assert.match(text, /has NOT inspected local WAL\/Selector\/Receipt or current Git branches/)
+    assert.match(text, /Receipt\/Selector staging was interrupted/)
+    assert.match(text, /Historical test pair matches; current Git remains uncertain/)
+    assert.match(text, /Encrypted test pair and current Git content match, but no commit exists/)
+    assert.match(text, /Settings and local Index no longer both point at Source/)
+    assert.match(text, /Evidence is missing, foreign, torn or cannot be verified/)
+    assert.match(text, /No example authorizes Sync Resume, rollback, a branch switch, or old-key deletion/)
+    assert.doesNotMatch(text, /source-passphrase-never-render|source-token-never-render/)
+    assert.match(text, /NOT STARTED/)
+    assert.equal(JSON.stringify(plugin.settings), original)
+    assert.equal(calls, 0)
+    wizard.onClose()
+    assert.equal(calls, 0)
+  } finally {
+    setRequestUrlHandler(null)
+  }
+})
+
 test("D133 old-passphrase loss warning appears before migration confirmation, without exposing secrets or another confirmation", () => {
   const wizard = new V4ReencryptionWizardModal(fakePlugin())
   wizard.onOpen()

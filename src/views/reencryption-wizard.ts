@@ -9,6 +9,10 @@ import {
   suggestV4ReencryptionBranchNames,
   type V4ReencryptionWizardProposal,
 } from "../lib/v4/reencryption-wizard-plan"
+import {
+  V4_MANUAL_RECOVERY_GUIDANCE,
+  V4_MANUAL_RECOVERY_PREVIEW_CONDITIONS,
+} from "../lib/v4/reencryption-manual-recovery-triage"
 
 /**
  * D92: deliberately read-only Wizard. The source verifier reads immutable
@@ -479,6 +483,14 @@ export class V4ReencryptionWizardModal extends Modal {
     ]
     const checklist = container.createEl("ol")
     for (const step of recoverySteps) checklist.createEl("li", { text: step })
+    container.createEl("h4", { text: "Manual Recovery examples — not a live scan" })
+    container.createEl("p", {
+      text: "These examples explain possible future crash-window evidence; this Preview has NOT inspected local WAL/Selector/Receipt or current Git branches. Even a fully authenticated test pair is NOT a committed migration. No example authorizes Sync Resume, rollback, a branch switch, or old-key deletion.",
+    })
+    for (const condition of V4_MANUAL_RECOVERY_PREVIEW_CONDITIONS) {
+      const guidance = V4_MANUAL_RECOVERY_GUIDANCE[condition]
+      this.row(container, guidance.heading, guidance.explanation + " " + guidance.nextReview)
+    }
   }
 
   private renderFinish(container: HTMLElement): void {

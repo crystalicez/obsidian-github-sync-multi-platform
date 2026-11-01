@@ -21,6 +21,7 @@ import { inspectV4FencedCrashWindowPairAfterRestart } from "../../src/lib/v4/ree
 import { stageV4FencedCommitPairTestArtifacts } from "../../src/lib/v4/reencryption-fenced-persisted-test-pair"
 import { inspectV4FencedPersistedTestPairAfterRestart } from "../../src/lib/v4/reencryption-fenced-persisted-test-pair-restart"
 import { inspectV4FencedLivePersistedTestPairAndBackupAfterRestart } from "../../src/lib/v4/reencryption-fenced-live-persisted-test-pair-recovery"
+import { classifyV4ReencryptionManualRecovery } from "../../src/lib/v4/reencryption-manual-recovery-triage"
 import { encodeV4ReencryptionPersistedTestContract, decodeV4ReencryptionPersistedTestContract } from "../../src/lib/v4/reencryption-persisted-test-contract"
 import { inspectV4FencedLivePostCrashAfterRestart, inspectV4FencedLivePostCrashAndBackupAfterRestart } from "../../src/lib/v4/reencryption-fenced-live-post-crash-verification"
 import type { V4FencedFrozenBackupContentInput } from "../../src/lib/v4/reencryption-fenced-backup-content"
@@ -1530,6 +1531,43 @@ async function d217CurrentFrozenBackup(f: Awaited<ReturnType<typeof d179Scenario
     setRef(sha: string) { observedBackupSha = sha },
   }
 }
+
+test("D222 genuine D184+D221 disk/Git evidence maps to Manual Recovery without promoting test pair to Commit", async () => {
+  const f = await d179Scenario()
+  await stageV4FencedCommitPairTestArtifacts(d183Input(f))
+  const b = await d217CurrentFrozenBackup(f)
+  const contractPath = V4_RUNTIME_INDEX_ROOT + "-rekey-proposed-" + f.id.runId + "/contract.json"
+  const historicalContract = decodeV4ReencryptionPersistedTestContract(f.s.files.get(contractPath)!)
+  const sourceSettings = { ...f.prepared.restart.settings }
+  const local = await inspectV4FencedCrashWindowPairAfterRestart({
+    prepared: f.prepared, contract: historicalContract, sourceSettings,
+  })
+  assert.equal(local.artifactWindow, "pair-present")
+  assert.equal(local.pairEvidence, "cryptographically-linked-uncommitted")
+  const before = f.s.getWrites()
+  const complete = await inspectV4FencedLivePersistedTestPairAndBackupAfterRestart({
+    prepared: f.prepared, remote: f.input.full, backup: b.backup,
+  })
+  const triage = classifyV4ReencryptionManualRecovery(local, complete)
+  assert.equal(triage.condition, "linked-test-pair-current-git-verified-uncommitted")
+  assert.equal(triage.observation, "manual-recovery-required")
+  assert.equal(triage.resumeSyncAuthorized, false)
+  assert.equal(triage.localCutoverAuthorized, false)
+  assert.equal(triage.oldPassphraseCleanupAuthorized, false)
+  assert.equal(f.s.getWrites(), before)
+  // The stored historical test pair stays authentic, but the current frozen
+  // Backup is now no longer pinned. Classification MUST lose live Git status.
+  b.setRef("9".repeat(40))
+  const changed = await inspectV4FencedLivePersistedTestPairAndBackupAfterRestart({
+    prepared: f.prepared, remote: f.input.full, backup: b.backup,
+  })
+  const uncertain = classifyV4ReencryptionManualRecovery(local, changed)
+  assert.equal(uncertain.condition, "linked-test-pair-current-git-unverified")
+  assert.equal(uncertain.resumeSyncAuthorized, false)
+  assert.equal(uncertain.localCutoverAuthorized, false)
+  assert.equal(f.s.getWrites(), before)
+  assert.equal(f.s.holderCounts().held, false)
+})
 
 test("D221 persisted historical pair and current encrypted Backup + Destination all verify under ONE holder", async () => {
   const f = await d179Scenario()
