@@ -23,7 +23,9 @@ import { inspectV4FencedPersistedTestPairAfterRestart } from "../../src/lib/v4/r
 import { inspectV4FencedLivePersistedTestPairAndBackupAfterRestart } from "../../src/lib/v4/reencryption-fenced-live-persisted-test-pair-recovery"
 import { classifyV4ReencryptionManualRecovery } from "../../src/lib/v4/reencryption-manual-recovery-triage"
 import { stageV4ReencryptionCutoverCandidate } from "../../src/lib/v4/reencryption-cutover-candidate-stage"
-import { stageV4FencedLiveReencryptionCandidate } from "../../src/lib/v4/reencryption-fenced-live-candidate-stage"
+import { stageV4FencedLiveReencryptionCandidate, stageV4FencedLiveReencryptionIntent } from "../../src/lib/v4/reencryption-fenced-live-candidate-stage"
+import { inspectV4ReencryptionPendingCutoverIntentAfterRestart } from "../../src/lib/v4/reencryption-cutover-intent-restart"
+import { inspectV4ReencryptionPendingCutoverIntent } from "../../src/lib/v4/reencryption-cutover-intent-crypto"
 import { inspectV4ReencryptionCutoverCandidateAfterRestart } from "../../src/lib/v4/reencryption-cutover-candidate-restart"
 import { decodeV4ReencryptionCutoverCandidateManifest } from "../../src/lib/v4/reencryption-cutover-candidate-manifest"
 import { inspectV4ReencryptionCutoverCandidatePair } from "../../src/lib/v4/reencryption-cutover-candidate-crypto"
@@ -1536,6 +1538,162 @@ async function d217CurrentFrozenBackup(f: Awaited<ReturnType<typeof d179Scenario
     setRef(sha: string) { observedBackupSha = sha },
   }
 }
+
+test("D227 one held lease writes authenticated Intent after current old/new Git proof without selecting a live branch", async () => {
+  const f = await d179Scenario()
+  const b = await d217CurrentFrozenBackup(f)
+  const originalFiles = new Map(f.s.files)
+  const originalSecrets = new Map(f.s.secrets)
+  const originalWal = JSON.stringify(f.s.getWal())
+  const beforeHolders = f.s.holderCounts().calls
+  const beforeWrites = f.s.getWrites()
+  const result = await stageV4FencedLiveReencryptionIntent({
+    readiness: f.input, backup: b.backup, transactionId: d183TransactionId,
+  })
+  const root = V4_RUNTIME_INDEX_ROOT + "-rekey-cutover-candidate-" + f.id.runId
+  assert.equal(result.status, "production-namespace-intent-staged-uncommitted")
+  assert.equal(result.intentPath, root + "/intent.json")
+  assert.equal(result.provenance, "two-full-current-destination-and-frozen-backup-proofs-bracketing-write")
+  assert.equal(result.localCutoverAuthorized, false)
+  assert.equal(result.resumeSyncAuthorized, false)
+  assert.equal(result.oldPassphraseCleanupAuthorized, false)
+  assert.equal(f.s.holderCounts().calls, beforeHolders + 1)
+  assert.equal(f.s.holderCounts().held, false)
+  assert.equal(f.s.getWrites(), beforeWrites + 4)
+  assert.ok(b.blobReads >= 16)
+  assert.ok(f.s.f.reads >= 16)
+  const contract = decodeV4ReencryptionCutoverCandidateManifest(f.s.files.get(result.manifestPath)!)
+  assert.deepEqual(await inspectV4ReencryptionPendingCutoverIntent(
+    contract, f.prepared.journalKey, {
+      receiptCiphertext: f.s.files.get(result.receiptPath)!,
+      selectorCiphertext: f.s.files.get(result.selectorPath)!,
+    }, f.s.files.get(result.intentPath)!,
+  ), {
+    integrityScope: "production-namespace-cutover-intent-crypto-only",
+    observation: "authenticated-intent-uncommitted",
+    localCutoverAuthorized: false, resumeSyncAuthorized: false,
+    rollbackAuthorized: false, remoteWritesAuthorized: false,
+    oldPassphraseCleanupAuthorized: false,
+  })
+  const restarted = await inspectV4ReencryptionPendingCutoverIntentAfterRestart(f.prepared)
+  assert.equal(restarted.observation, "authenticated-intent-uncommitted")
+  assert.equal(restarted.localCutoverAuthorized, false)
+  assert.equal(restarted.resumeSyncAuthorized, false)
+  assert.equal(restarted.oldPassphraseCleanupAuthorized, false)
+  for (const [path, value] of originalFiles) assert.equal(f.s.files.get(path), value, path)
+  assert.deepEqual(f.s.secrets, originalSecrets)
+  assert.equal(JSON.stringify(f.s.getWal()), originalWal)
+})
+
+test("D227 interrupted last intent write is detectable after Restart and remains non-authorizing", async () => {
+  const f = await d179Scenario()
+  const b = await d217CurrentFrozenBackup(f)
+  const root = V4_RUNTIME_INDEX_ROOT + "-rekey-cutover-candidate-" + f.id.runId
+  const original = f.s.adapter.write
+  let interrupted = false
+  f.s.adapter.write = async (path, value) => {
+    await original(path, value)
+    if (path === root + "/intent.json") {
+      interrupted = true
+      throw Error("simulated acknowledgement lost after intent disk write")
+    }
+  }
+  await assert.rejects(() => stageV4FencedLiveReencryptionIntent({
+    readiness: f.input, backup: b.backup, transactionId: d183TransactionId,
+  }), /acknowledgement lost/)
+  assert.equal(interrupted, true)
+  for (const name of ["contract.json", "receipt.json", "selector.json", "intent.json"]) {
+    assert.ok(f.s.files.has(root + "/" + name), name)
+  }
+  assert.equal(f.s.holderCounts().held, false)
+  assert.ok(f.s.files.has(V4_REENCRYPTION_SYNC_FENCE_ROOT + "/active.json"))
+  const restarted = await inspectV4ReencryptionPendingCutoverIntentAfterRestart(f.prepared)
+  assert.equal(restarted.observation, "authenticated-intent-uncommitted")
+  assert.equal(restarted.localCutoverAuthorized, false)
+  assert.equal(restarted.resumeSyncAuthorized, false)
+})
+
+test("D227 tampering, incomplete artifacts, WAL loss or one-sided foreign intent on Restart fail closed", async () => {
+  for (const failure of ["missing-intent", "torn-intent", "swap-candidate", "wal-drift", "missing-old-secret"] as const) {
+    const f = await d179Scenario()
+    const b = await d217CurrentFrozenBackup(f)
+    const result = await stageV4FencedLiveReencryptionIntent({
+      readiness: f.input, backup: b.backup, transactionId: d183TransactionId,
+    })
+    if (failure === "missing-intent") f.s.files.delete(result.intentPath)
+    if (failure === "torn-intent") f.s.files.set(result.intentPath, f.s.files.get(result.intentPath)!.slice(0, -8))
+    if (failure === "swap-candidate") f.s.files.set(result.receiptPath, f.s.files.get(result.receiptPath)!.slice(0, -8))
+    if (failure === "wal-drift") f.s.setWal({ ...f.s.getWal(), generation: 999 })
+    if (failure === "missing-old-secret") f.s.secrets.delete(f.id.sourcePassphraseSecretId)
+    const after = await inspectV4ReencryptionPendingCutoverIntentAfterRestart(f.prepared)
+    assert.equal(after.observation, "manual-recovery-required", failure)
+    assert.equal(after.localCutoverAuthorized, false, failure)
+    assert.equal(after.resumeSyncAuthorized, false, failure)
+    assert.equal(after.oldPassphraseCleanupAuthorized, false, failure)
+  }
+})
+
+test("D227 Git Backup or Destination drift after writing Intent retains encrypted residue but refuses success", async () => {
+  for (const changed of ["backup", "destination"] as const) {
+    const f = await d179Scenario()
+    const b = await d217CurrentFrozenBackup(f)
+    const root = V4_RUNTIME_INDEX_ROOT + "-rekey-cutover-candidate-" + f.id.runId
+    const original = f.s.adapter.write
+    let reached = false
+    f.s.adapter.write = async (path, data) => {
+      await original(path, data)
+      if (path === root + "/intent.json") {
+        reached = true
+        if (changed === "backup") b.setRef("9".repeat(40))
+        else f.s.f.changeRef("9".repeat(40))
+      }
+    }
+    await assert.rejects(() => stageV4FencedLiveReencryptionIntent({
+      readiness: f.input, backup: b.backup, transactionId: d183TransactionId,
+    }), /Backup|Git|proof|commit|changed|ref|shadow/i, changed)
+    assert.equal(reached, true, changed)
+    assert.ok(f.s.files.has(root + "/intent.json"), changed)
+    assert.equal(f.s.holderCounts().held, false, changed)
+    const after = await inspectV4ReencryptionPendingCutoverIntentAfterRestart(f.prepared)
+    assert.equal(after.localCutoverAuthorized, false, changed)
+    assert.equal(after.resumeSyncAuthorized, false, changed)
+  }
+})
+
+test("D227 Restart refuses intent changed immediately after its second authenticated read", async () => {
+  const f = await d179Scenario()
+  const b = await d217CurrentFrozenBackup(f)
+  const result = await stageV4FencedLiveReencryptionIntent({
+    readiness: f.input, backup: b.backup, transactionId: d183TransactionId,
+  })
+  const original = f.s.adapter.read
+  let intentReads = 0
+  f.s.adapter.read = async path => {
+    const value = await original(path)
+    if (path === result.intentPath && ++intentReads === 2) {
+      f.s.files.set(path, value.slice(0, -8))
+    }
+    return value
+  }
+  const report = await inspectV4ReencryptionPendingCutoverIntentAfterRestart(f.prepared)
+  assert.equal(intentReads, 3)
+  assert.equal(report.observation, "manual-recovery-required")
+  assert.equal(report.localCutoverAuthorized, false)
+  assert.equal(report.resumeSyncAuthorized, false)
+})
+
+test("D227 Restart requires a genuinely executed exclusive owner holder", async () => {
+  const f = await d179Scenario()
+  const b = await d217CurrentFrozenBackup(f)
+  await stageV4FencedLiveReencryptionIntent({
+    readiness: f.input, backup: b.backup, transactionId: d183TransactionId,
+  })
+  f.prepared.withExclusiveInitiatorLease = async <T>(_body: () => Promise<T>): Promise<T> =>
+    Object.freeze({}) as T
+  const report = await inspectV4ReencryptionPendingCutoverIntentAfterRestart(f.prepared)
+  assert.equal(report.observation, "manual-recovery-required")
+  assert.equal(report.localCutoverAuthorized, false)
+})
 
 test("D224 one real owner lease derives exact candidate from fresh old-key Backup and new-key Destination Git content", async () => {
   const f = await d179Scenario()

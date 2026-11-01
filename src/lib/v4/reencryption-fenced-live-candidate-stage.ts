@@ -14,6 +14,7 @@ import {
   type V4ReencryptionCutoverCandidateStageReport,
 } from "./reencryption-cutover-candidate-stage"
 import { matchesV4ReencryptionPreparedWal } from "./reencryption-proposed-commit-receipt"
+import { stageV4ReencryptionPendingCutoverIntent } from "./reencryption-cutover-intent-stage"
 
 const RISK = "accept-best-effort-power-loss-recovery-risk"
 const TRANSACTION = /^[0-9a-f]{32}$/u
@@ -29,6 +30,11 @@ export interface V4FencedLiveCandidateStageReport extends V4ReencryptionCutoverC
   readonly provenance: "two-full-current-destination-and-frozen-backup-proofs-bracketing-write"
 }
 
+export interface V4FencedLiveIntentStageReport extends Omit<V4FencedLiveCandidateStageReport, "status"> {
+  readonly status: "production-namespace-intent-staged-uncommitted"
+  readonly intentPath: string
+}
+
 /**
  * D224: the only composition here that can *derive* rather than accept the
  * D223 candidate contract. It is still a NON-AUTHORIZING staged candidate:
@@ -40,9 +46,15 @@ export interface V4FencedLiveCandidateStageReport extends V4ReencryptionCutoverC
  * (complete old-key frozen Backup), D223 candidate persistence, and repeats
  * of both full proofs. Every inner tool borrows the same held lease.
  */
-export async function stageV4FencedLiveReencryptionCandidate(
-  input: V4FencedLiveCandidateStageInput,
-): Promise<V4FencedLiveCandidateStageReport> {
+async function stageInternal(
+  input: V4FencedLiveCandidateStageInput, persistIntent: false,
+): Promise<V4FencedLiveCandidateStageReport>
+async function stageInternal(
+  input: V4FencedLiveCandidateStageInput, persistIntent: true,
+): Promise<V4FencedLiveIntentStageReport>
+async function stageInternal(
+  input: V4FencedLiveCandidateStageInput, persistIntent: boolean,
+): Promise<V4FencedLiveCandidateStageReport | V4FencedLiveIntentStageReport> {
   const readiness = input?.readiness
   const prepared = readiness?.prepared
   const full = readiness?.full
@@ -259,7 +271,7 @@ export async function stageV4FencedLiveReencryptionCandidate(
     ...backup, withExclusiveInitiatorLease: borrowed,
   }
   let invoked = 0
-  let completed: V4FencedLiveCandidateStageReport | null = null
+  let completed: V4FencedLiveCandidateStageReport | V4FencedLiveIntentStageReport | null = null
   const report = await holder(async () => {
     if (++invoked !== 1) throw Error("D224 initiator lease holder invoked more than once.")
     await check()
@@ -282,7 +294,11 @@ export async function stageV4FencedLiveReencryptionCandidate(
       throw Error("D224 persisted Cutover candidate is incomplete.")
     }
     await check()
-    // Both Git content domains are revalidated AFTER candidate persistence.
+    const intent = persistIntent ? await stageV4ReencryptionPendingCutoverIntent({
+      adapter, candidate, contract: first.contract, journalKey: key, assertHeld: check,
+    }) : null
+    await check()
+    // Both Git content domains are revalidated AFTER every Candidate/Intent write.
     const secondBackup = await inspectV4FencedFrozenBackupContentAfterRestart(backupInput)
     const second = await deriveV4FencedCommitPairSnapshotTestContract(snapshotInput)
     if (secondBackup.observation !== "complete-frozen-backup-reverified-uncommitted"
@@ -294,9 +310,13 @@ export async function stageV4FencedLiveReencryptionCandidate(
       throw Error("D224 full Backup/Destination proof changed after staged Receipt/Selector.")
     }
     await check()
-    completed = Object.freeze({
+    completed = Object.freeze(intent ? {
       ...candidate,
-      provenance: "two-full-current-destination-and-frozen-backup-proofs-bracketing-write",
+      status: intent.status, intentPath: intent.intentPath,
+      provenance: "two-full-current-destination-and-frozen-backup-proofs-bracketing-write" as const,
+    } : {
+      ...candidate,
+      provenance: "two-full-current-destination-and-frozen-backup-proofs-bracketing-write" as const,
     })
     return completed
   })
@@ -304,4 +324,21 @@ export async function stageV4FencedLiveReencryptionCandidate(
     throw Error("D224 forged holder response or final migration identity drift.")
   }
   return report
+}
+
+/** D224 compatibility: stage the verified Candidate without Cutover intent. */
+export function stageV4FencedLiveReencryptionCandidate(
+  input: V4FencedLiveCandidateStageInput,
+): Promise<V4FencedLiveCandidateStageReport> {
+  return stageInternal(input, false)
+}
+
+/**
+ * D227: append a domain-separated Intent under the SAME outer lease, with
+ * full old/new Git proofs on both sides. The resulting record is NOT a Commit.
+ */
+export function stageV4FencedLiveReencryptionIntent(
+  input: V4FencedLiveCandidateStageInput,
+): Promise<V4FencedLiveIntentStageReport> {
+  return stageInternal(input, true)
 }
