@@ -46,7 +46,8 @@ function requireStats(value: MobileStats | null, kind: MobileStats["type"]): Mob
     || value.size < 0 || !Number.isFinite(value.mtime) || value.mtime < 0) {
     throw new Error("Re-encryption Mobile adapter returned invalid file or directory metadata.")
   }
-  return value
+  // Capture primitive metadata, never a mutable adapter-owned object.
+  return Object.freeze({ type: value.type, size: value.size, mtime: value.mtime })
 }
 
 function sameFile(a: MobileStats, b: MobileStats): boolean {
@@ -54,7 +55,7 @@ function sameFile(a: MobileStats, b: MobileStats): boolean {
 }
 
 /**
- * Read-only, adapter-enumerated mobile Vault parity reader. Adapter.list("")
+ * Read-only, adapter-enumerated mobile Vault parity reader. Adapter.list("/")
  * is used instead of Obsidian's potentially stale getFiles() cache.
  * No OS-wide lock, physical symlink proof or atomic filesystem snapshot is
  * claimed. Larger files require a bounded-read adapter not available here.

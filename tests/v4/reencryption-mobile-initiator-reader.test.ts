@@ -168,6 +168,38 @@ test("D214 Mobile refuses metadata drift during read and after chunk consumption
   await assert.rejects(async () => { await iterator.next() }, /changed during hashing/i)
 })
 
+test("D215 reused mutable Mobile stat object cannot conceal an on-read mtime change", async () => {
+  const adapter = new MobileAdapter()
+  adapter.set("a.md", bytes("original"), 21)
+  const shared = { type: "file" as const, size: 8, mtime: 21 }
+  adapter.stat = async () => shared
+  const reader = createV4MobileInitiatorLocalReader({ adapter, scope, ...guards() })
+  adapter.onRead = () => { shared.mtime = 22 }
+  await assert.rejects(async () => {
+    const file = await reader.openFile("a.md")
+    for await (const _chunk of file.chunks(8)) {}
+  }, /changed during read/i, "metadata returned earlier must not be mutated retroactively")
+  assert.equal(adapter.writes, 0)
+})
+
+test("D215 mutable Mobile stat cannot redefine a bounded openFile size during readBinary", async () => {
+  const adapter = new MobileAdapter()
+  adapter.set("a.md", bytes("original"), 21)
+  const shared = { type: "file" as const, size: 8, mtime: 21 }
+  adapter.stat = async () => shared
+  const reader = createV4MobileInitiatorLocalReader({ adapter, scope, ...guards() })
+  adapter.onRead = () => {
+    shared.size = 9
+    adapter.set("a.md", bytes("different"), 21)
+  }
+  const file = await reader.openFile("a.md")
+  assert.equal(file.size, 8)
+  await assert.rejects(async () => {
+    for await (const _chunk of file.chunks(8)) {}
+  }, /changed|invalid bytes/i, "readBinary cannot silently return more bytes than the original declared size")
+  assert.equal(adapter.writes, 0)
+})
+
 test("D214 Mobile rejects unsafe, duplicated, out-of-parent and incomplete adapter listings", async () => {
   for (const listing of [
     { files: ["../outside.md"], folders: [] },
