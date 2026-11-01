@@ -31,6 +31,8 @@ import { stageV4FencedCutoverActivationDecision, inspectV4FencedCutoverActivatio
 import { inspectV4CutoverActivationDecision } from "../../src/lib/v4/reencryption-activation-decision-crypto"
 import { stageV4FencedActivationSettingsSwitchPlan, inspectV4FencedActivationSettingsSwitchPlanAfterRestart } from "../../src/lib/v4/reencryption-activation-switch-plan-stage"
 import { inspectV4ActivationSettingsSwitchPlan } from "../../src/lib/v4/reencryption-activation-switch-plan-crypto"
+import { writeV4FencedActiveSelectorFirstPhase, inspectV4FencedActiveSelectorAfterRestart } from "../../src/lib/v4/reencryption-active-selector-commit-stage"
+import { inspectV4ActiveSelectorCommitPair } from "../../src/lib/v4/reencryption-active-selector-commit-crypto"
 import { inspectV4ReencryptionPendingCutoverIntent } from "../../src/lib/v4/reencryption-cutover-intent-crypto"
 import { inspectV4ReencryptionCutoverCandidateAfterRestart } from "../../src/lib/v4/reencryption-cutover-candidate-restart"
 import { decodeV4ReencryptionCutoverCandidateManifest } from "../../src/lib/v4/reencryption-cutover-candidate-manifest"
@@ -1544,6 +1546,209 @@ async function d217CurrentFrozenBackup(f: Awaited<ReturnType<typeof d179Scenario
     setRef(sha: string) { observedBackupSha = sha },
   }
 }
+
+async function d232Scenario() {
+  const f = await d179Scenario()
+  const b = await d217CurrentFrozenBackup(f)
+  await stageV4FencedLiveReencryptionIntent({
+    readiness: f.input, backup: b.backup, transactionId: d183TransactionId,
+  })
+  const settings = { ...f.prepared.restart.settings }
+  const input = {
+    readiness: f.input, backup: b.backup, transactionId: d183TransactionId,
+    readPersistedSettings: async () => ({ ...settings }),
+  }
+  await stageV4FencedCutoverActivationDecision(input)
+  await stageV4FencedActivationSettingsSwitchPlan(input)
+  return { f, b, settings, input }
+}
+
+test("D232 commits physical Destination Selector last, Source Settings/Indexes and two secrets remain unchanged under Sync Fence", async () => {
+  const { f, input } = await d232Scenario()
+  const filesBefore = new Map(f.s.files)
+  const secretsBefore = new Map(f.s.secrets)
+  const writesBefore = f.s.getWrites()
+  const holdersBefore = f.s.holderCounts().calls
+  const saved = await writeV4FencedActiveSelectorFirstPhase(input)
+  assert.equal(saved.status, "destination-selector-written-settings-pending")
+  assert.equal(saved.commitDecisionAuthorized, false)
+  assert.equal(saved.localCutoverAuthorized, false)
+  assert.equal(saved.resumeSyncAuthorized, false)
+  assert.equal(saved.oldPassphraseCleanupAuthorized, false)
+  assert.equal(f.s.holderCounts().calls, holdersBefore + 1)
+  assert.equal(f.s.holderCounts().held, false)
+  assert.equal(f.s.getWrites(), writesBefore + 2)
+  assert.equal(f.s.files.size, filesBefore.size + 2)
+  for (const [path, content] of filesBefore) assert.equal(f.s.files.get(path), content, path)
+  assert.deepEqual(f.s.secrets, secretsBefore)
+  assert.ok(f.s.files.has(saved.receiptPath))
+  assert.ok(f.s.files.has(saved.selectorPath))
+  assert.ok(saved.selectorPath.endsWith("/selector.json"))
+  assert.ok(saved.selectorPath.includes("-rekey-selector-"))
+  const report = await inspectV4FencedActiveSelectorAfterRestart(input)
+  assert.deepEqual(report, {
+    integrityScope: "read-only-physical-selector-settings-pending",
+    observation: "authenticated-selector-settings-pending",
+    artifactWindow: "both-linked",
+    evidence: "best-effort-local-readback-no-post-switch-full-git-proof",
+    commitDecisionAuthorized: false, localCutoverAuthorized: false,
+    resumeSyncAuthorized: false, rollbackAuthorized: false,
+    remoteWritesAuthorized: false, oldPassphraseCleanupAuthorized: false,
+  })
+  assert.equal((await inspectV4FencedPendingCommitPreflightAfterRestart(input))
+    .observation, "manual-recovery-required", "old preflight MUST reject physical Selector")
+  await assert.rejects(writeV4FencedActiveSelectorFirstPhase(input),
+    /existing Selector or Receipt requires Manual Recovery/)
+})
+
+test("D232 independently authenticated physical pair rejects foreign key, swapped ciphertext and changed D231 plan", async () => {
+  const { f, input } = await d232Scenario()
+  const saved = await writeV4FencedActiveSelectorFirstPhase(input)
+  const root = f.id.indexRoot + "-rekey-cutover-candidate-" + f.id.runId
+  const manifest = f.s.files.get(root + "/contract.json")!
+  const contract = decodeV4ReencryptionCutoverCandidateManifest(manifest)
+  const sources = {
+    manifest, receiptCiphertext: f.s.files.get(root + "/receipt.json")!,
+    selectorCiphertext: f.s.files.get(root + "/selector.json")!,
+    intentCiphertext: f.s.files.get(root + "/intent.json")!,
+    activationDecisionCiphertext: f.s.files.get(root + "/activation-decision.json")!,
+    settingsSwitchPlanCiphertext: f.s.files.get(root + "/settings-switch-plan.json")!,
+  }
+  const oldSettings = { ...f.prepared.restart.settings }
+  const pair = {
+    receiptCiphertext: f.s.files.get(saved.receiptPath)!,
+    selectorCiphertext: f.s.files.get(saved.selectorPath)!,
+  }
+  assert.equal((await inspectV4ActiveSelectorCommitPair(
+    contract, f.prepared.journalKey, sources, oldSettings, pair,
+  )).observation, "authenticated-destination-selector-settings-pending")
+  assert.equal((await inspectV4ActiveSelectorCommitPair(
+    contract, new Uint8Array(32).fill(5), sources, oldSettings, pair,
+  )).observation, "manual-recovery-required")
+  assert.equal((await inspectV4ActiveSelectorCommitPair(
+    contract, f.prepared.journalKey, sources, oldSettings,
+    { ...pair, receiptCiphertext: pair.selectorCiphertext },
+  )).observation, "manual-recovery-required")
+  assert.equal((await inspectV4ActiveSelectorCommitPair(
+    contract, f.prepared.journalKey,
+    { ...sources, settingsSwitchPlanCiphertext: sources.activationDecisionCiphertext },
+    oldSettings, pair,
+  )).observation, "manual-recovery-required")
+  assert.equal((await inspectV4ActiveSelectorCommitPair(
+    contract, f.prepared.journalKey, sources, oldSettings,
+    { ...pair, selectorCiphertext: null },
+  )).artifactWindow, "receipt-only")
+  assert.equal((await inspectV4ActiveSelectorCommitPair(
+    contract, f.prepared.journalKey, sources, oldSettings,
+    { ...pair, receiptCiphertext: null },
+  )).artifactWindow, "selector-only")
+})
+
+test("D232 crash after Receipt write and after Selector write exposes distinct Manual Recovery windows without overwriting", async () => {
+  for (const phase of ["receipt", "selector"] as const) {
+    const { f, input } = await d232Scenario()
+    const root = f.id.indexRoot + "-rekey-cutover-candidate-" + f.id.runId
+    const receiptPath = root + "/selector-commit-receipt.json"
+    const selectorPath = f.id.indexRoot + "-rekey-selector-" + f.id.runId + "/selector.json"
+    const originalWrite = f.s.adapter.write
+    let didBreak = false
+    const target = phase === "receipt" ? receiptPath : selectorPath
+    f.s.adapter.write = async (path, value) => {
+      if (path === target && !didBreak) {
+        didBreak = true
+        f.s.files.set(path, value.slice(0, 16))
+        throw Error("injected interrupted " + phase + " write")
+      }
+      return originalWrite(path, value)
+    }
+    const oldSecret = new Map(f.s.secrets)
+    await assert.rejects(writeV4FencedActiveSelectorFirstPhase(input),
+      /injected interrupted/)
+    assert.equal(didBreak, true)
+    assert.ok(f.s.files.has(receiptPath))
+    assert.equal(f.s.files.has(selectorPath), phase === "selector")
+    const report = await inspectV4FencedActiveSelectorAfterRestart(input)
+    assert.equal(report.observation, "manual-recovery-required", phase)
+    assert.equal(report.artifactWindow, phase === "receipt" ? "receipt-only" : "foreign-or-torn")
+    assert.equal(report.resumeSyncAuthorized, false)
+    assert.deepEqual(f.s.secrets, oldSecret)
+    assert.equal(f.s.holderCounts().held, false)
+    await assert.rejects(writeV4FencedActiveSelectorFirstPhase(input),
+      /existing Selector or Receipt requires Manual Recovery/)
+  }
+})
+
+test("D232 live Git movement before or after physical Selector refuses success and retains forensic artifacts", async () => {
+  for (const phase of ["receipt-backup", "receipt-destination", "selector-backup"] as const) {
+    const { f, b, input } = await d232Scenario()
+    const receipt = f.id.indexRoot + "-rekey-cutover-candidate-" + f.id.runId + "/selector-commit-receipt.json"
+    const selector = f.id.indexRoot + "-rekey-selector-" + f.id.runId + "/selector.json"
+    const originalWrite = f.s.adapter.write
+    f.s.adapter.write = async (path, value) => {
+      await originalWrite(path, value)
+      if (path === receipt && phase === "receipt-backup") b.setRef("9".repeat(40))
+      if (path === receipt && phase === "receipt-destination") f.s.f.changeRef("9".repeat(40))
+      if (path === selector && phase === "selector-backup") b.setRef("9".repeat(40))
+    }
+    await assert.rejects(writeV4FencedActiveSelectorFirstPhase(input))
+    assert.ok(f.s.files.has(receipt), phase)
+    assert.equal(f.s.files.has(selector), phase === "selector-backup")
+    const recovered = await inspectV4FencedActiveSelectorAfterRestart(input)
+    assert.equal(recovered.observation, "manual-recovery-required", phase)
+    assert.equal(recovered.resumeSyncAuthorized, false, phase)
+    assert.equal(f.s.holderCounts().held, false, phase)
+  }
+})
+
+test("D232 Restart detects Source Settings, Shadow Index, SecretStorage and Selector tampering without rewriting", async () => {
+  const { f, input, b, settings } = await d232Scenario()
+  const saved = await writeV4FencedActiveSelectorFirstPhase(input)
+  const ciphertext = f.s.files.get(saved.selectorPath)!
+  const shadowPath = f.id.indexRoot + "-rekey-" + f.id.runId + "/index.json"
+  const shadow = f.s.files.get(shadowPath)!
+  const oldSecret = f.s.secrets.get(f.id.sourcePassphraseSecretId)!
+  const check = async (kind: string) => {
+    assert.equal((await inspectV4FencedActiveSelectorAfterRestart(input))
+      .observation, "manual-recovery-required", kind)
+  }
+  const writesBefore = f.s.getWrites()
+  settings.githubBranch = "unauthorized"
+  await check("persisted Settings")
+  settings.githubBranch = f.prepared.restart.settings.githubBranch
+  f.s.files.set(shadowPath, JSON.stringify({
+    ...JSON.parse(shadow), repoId: "other/repo#branch",
+  }))
+  await check("Shadow Index")
+  f.s.files.set(shadowPath, shadow)
+  f.s.secrets.delete(f.id.sourcePassphraseSecretId)
+  await check("missing old Secret")
+  f.s.secrets.set(f.id.sourcePassphraseSecretId, oldSecret)
+  f.s.files.set(saved.selectorPath, ciphertext.slice(0, 12))
+  await check("torn Selector")
+  f.s.files.set(saved.selectorPath, ciphertext)
+  b.setRef("9".repeat(40))
+  await check("stale Backup Git HEAD")
+  b.setRef(f.id.sourceCommitSha)
+  assert.equal((await inspectV4FencedActiveSelectorAfterRestart(input)).observation,
+    "authenticated-selector-settings-pending")
+  assert.equal(f.s.getWrites(), writesBefore, "all Restart inspections are read-only")
+})
+
+test("D232 forged owner holder cannot create Selector or Receipt and never forges a Cutover", async () => {
+  const { f, b, input } = await d232Scenario()
+  const fake = async <T>(_body: () => Promise<T>): Promise<T> =>
+    Object.freeze({}) as T
+  Object.assign(f.prepared, { withExclusiveInitiatorLease: fake })
+  Object.assign(f.input.full.branches, { withExclusiveInitiatorLease: fake })
+  Object.assign(b.backup, { withExclusiveInitiatorLease: fake })
+  const before = new Map(f.s.files)
+  await assert.rejects(writeV4FencedActiveSelectorFirstPhase(input),
+    /owner holder cannot certify Selector write/)
+  assert.deepEqual(f.s.files, before)
+  assert.equal(f.s.holderCounts().held, false)
+  assert.equal((await inspectV4FencedActiveSelectorAfterRestart(input))
+    .observation, "manual-recovery-required")
+})
 
 test("D231 one-lease Settings Switch Plan binds exact old/new Settings and distinct Index roots without activating", async () => {
   const f = await d179Scenario()
