@@ -27,6 +27,8 @@ import { stageV4FencedLiveReencryptionCandidate, stageV4FencedLiveReencryptionIn
 import { inspectV4ReencryptionPendingCutoverIntentAfterRestart } from "../../src/lib/v4/reencryption-cutover-intent-restart"
 import { inspectV4FencedPendingCutoverSurfacesAfterRestart } from "../../src/lib/v4/reencryption-fenced-intent-surface-restart"
 import { inspectV4FencedPendingCommitPreflightAfterRestart } from "../../src/lib/v4/reencryption-fenced-pending-commit-preflight"
+import { stageV4FencedCutoverActivationDecision, inspectV4FencedCutoverActivationDecisionAfterRestart } from "../../src/lib/v4/reencryption-activation-decision-stage"
+import { inspectV4CutoverActivationDecision } from "../../src/lib/v4/reencryption-activation-decision-crypto"
 import { inspectV4ReencryptionPendingCutoverIntent } from "../../src/lib/v4/reencryption-cutover-intent-crypto"
 import { inspectV4ReencryptionCutoverCandidateAfterRestart } from "../../src/lib/v4/reencryption-cutover-candidate-restart"
 import { decodeV4ReencryptionCutoverCandidateManifest } from "../../src/lib/v4/reencryption-cutover-candidate-manifest"
@@ -1540,6 +1542,237 @@ async function d217CurrentFrozenBackup(f: Awaited<ReturnType<typeof d179Scenario
     setRef(sha: string) { observedBackupSha = sha },
   }
 }
+
+test("D230 one owner lease stores encrypted decision only after two fresh full Git and local proofs", async () => {
+  const f = await d179Scenario()
+  const b = await d217CurrentFrozenBackup(f)
+  const saved = await stageV4FencedLiveReencryptionIntent({
+    readiness: f.input, backup: b.backup, transactionId: d183TransactionId,
+  })
+  const filesBefore = new Map(f.s.files)
+  const secretsBefore = new Map(f.s.secrets)
+  const writesBefore = f.s.getWrites()
+  const holdersBefore = f.s.holderCounts().calls
+  const input = {
+    readiness: f.input, backup: b.backup, transactionId: d183TransactionId,
+    readPersistedSettings: async () => ({ ...f.prepared.restart.settings }),
+  }
+  const staged = await stageV4FencedCutoverActivationDecision(input)
+  assert.equal(staged.status, "cutover-activation-decision-staged-not-applied")
+  assert.equal(staged.commitDecisionAuthorized, false)
+  assert.equal(staged.localCutoverAuthorized, false)
+  assert.equal(staged.resumeSyncAuthorized, false)
+  assert.equal(f.s.holderCounts().calls, holdersBefore + 1)
+  assert.equal(f.s.holderCounts().held, false)
+  assert.ok(f.s.getWrites() > writesBefore)
+  const ciphertext = f.s.files.get(staged.decisionPath)
+  assert.ok(ciphertext)
+  assert.ok(!ciphertext.includes("cutover-decision-recorded"), "decision is encrypted")
+  for (const [path, data] of filesBefore) assert.equal(f.s.files.get(path), data, path)
+  assert.equal(f.s.files.size, filesBefore.size + 1, "only isolated decision was written")
+  assert.deepEqual(f.s.secrets, secretsBefore)
+  assert.equal(f.s.files.get(saved.intentPath), filesBefore.get(saved.intentPath))
+  const recovered = await inspectV4FencedCutoverActivationDecisionAfterRestart(input)
+  assert.deepEqual(recovered, {
+    integrityScope: "read-only-cutover-activation-decision-after-restart",
+    observation: "authenticated-decision-activation-pending",
+    evidence: "best-effort-wal-readback-not-power-loss-durable",
+    localCutoverAuthorized: false, commitDecisionAuthorized: false,
+    resumeSyncAuthorized: false, rollbackAuthorized: false,
+    remoteWritesAuthorized: false, oldPassphraseCleanupAuthorized: false,
+  })
+  assert.deepEqual(f.s.secrets, secretsBefore)
+  await assert.rejects(stageV4FencedCutoverActivationDecision(input),
+    /prior decision requires Manual Recovery/)
+})
+
+test("D230 distinct decision ciphertext authenticates manifest and Intent but is not itself Cutover authority", async () => {
+  const f = await d179Scenario()
+  const b = await d217CurrentFrozenBackup(f)
+  const saved = await stageV4FencedLiveReencryptionIntent({
+    readiness: f.input, backup: b.backup, transactionId: d183TransactionId,
+  })
+  const input = {
+    readiness: f.input, backup: b.backup, transactionId: d183TransactionId,
+    readPersistedSettings: async () => ({ ...f.prepared.restart.settings }),
+  }
+  const staged = await stageV4FencedCutoverActivationDecision(input)
+  const root = staged.decisionPath.slice(0, -"/activation-decision.json".length)
+  const sources = {
+    manifest: f.s.files.get(root + "/contract.json")!,
+    receiptCiphertext: f.s.files.get(root + "/receipt.json")!,
+    selectorCiphertext: f.s.files.get(root + "/selector.json")!,
+    intentCiphertext: f.s.files.get(saved.intentPath)!,
+  }
+  const contract = decodeV4ReencryptionCutoverCandidateManifest(sources.manifest)
+  const ciphertext = f.s.files.get(staged.decisionPath)!
+  assert.equal((await inspectV4CutoverActivationDecision(
+    contract, f.prepared.journalKey, sources, ciphertext,
+  )).observation, "authenticated-decision-activation-pending")
+  assert.equal((await inspectV4CutoverActivationDecision(
+    contract, new Uint8Array(32).fill(7), sources, ciphertext,
+  )).observation, "manual-recovery-required")
+  assert.equal((await inspectV4CutoverActivationDecision(
+    contract, f.prepared.journalKey, { ...sources, intentCiphertext: sources.receiptCiphertext }, ciphertext,
+  )).observation, "manual-recovery-required")
+  assert.equal((await inspectV4CutoverActivationDecision(
+    contract, f.prepared.journalKey, sources, ciphertext.slice(0, -8),
+  )).observation, "manual-recovery-required")
+  assert.equal((await inspectV4CutoverActivationDecision(
+    contract, f.prepared.journalKey, sources, null,
+  )).observation, "manual-recovery-required")
+})
+
+test("D230 restart detects altered persisted decision, historical Intent, Settings and remote Backup/Destination", async () => {
+  const f = await d179Scenario()
+  const b = await d217CurrentFrozenBackup(f)
+  const saved = await stageV4FencedLiveReencryptionIntent({
+    readiness: f.input, backup: b.backup, transactionId: d183TransactionId,
+  })
+  const settings = { ...f.prepared.restart.settings }
+  const input = {
+    readiness: f.input, backup: b.backup, transactionId: d183TransactionId,
+    readPersistedSettings: async () => ({ ...settings }),
+  }
+  const staged = await stageV4FencedCutoverActivationDecision(input)
+  const bytes = f.s.files.get(staged.decisionPath)!
+  const intent = f.s.files.get(saved.intentPath)!
+  const originalSecret = f.s.secrets.get(f.id.sourcePassphraseSecretId)!
+  const writes = f.s.getWrites()
+  const check = async (name: string) => {
+    const result = await inspectV4FencedCutoverActivationDecisionAfterRestart(input)
+    assert.equal(result.observation, "manual-recovery-required", name)
+    assert.equal(result.resumeSyncAuthorized, false, name)
+    assert.equal(result.commitDecisionAuthorized, false, name)
+    assert.equal(f.s.getWrites(), writes, name)
+  }
+  f.s.files.set(staged.decisionPath, bytes.slice(0, -8))
+  await check("torn decision")
+  f.s.files.set(staged.decisionPath, bytes)
+  f.s.files.set(saved.intentPath, intent + " ")
+  await check("foreign Intent")
+  f.s.files.set(saved.intentPath, intent)
+  settings.githubBranch = "rekey/d83"
+  await check("changed persisted settings")
+  settings.githubBranch = f.prepared.restart.settings.githubBranch
+  b.setRef("9".repeat(40))
+  await check("moved Backup HEAD")
+  b.setRef(f.id.sourceCommitSha)
+  f.s.f.changeRef("9".repeat(40))
+  await check("moved Destination HEAD")
+  f.s.f.changeRef(f.id.destinationCommitSha)
+  f.s.secrets.delete(f.id.sourcePassphraseSecretId)
+  await check("old secret removed")
+  f.s.secrets.set(f.id.sourcePassphraseSecretId, originalSecret)
+  f.s.files.set(staged.decisionPath, bytes)
+  assert.equal(
+    (await inspectV4FencedCutoverActivationDecisionAfterRestart(input)).observation,
+    "authenticated-decision-activation-pending",
+  )
+})
+
+test("D230 ambiguous decision write leaves residue, never retries over it and never resumes Sync", async () => {
+  const f = await d179Scenario()
+  const b = await d217CurrentFrozenBackup(f)
+  await stageV4FencedLiveReencryptionIntent({
+    readiness: f.input, backup: b.backup, transactionId: d183TransactionId,
+  })
+  const input = {
+    readiness: f.input, backup: b.backup, transactionId: d183TransactionId,
+    readPersistedSettings: async () => ({ ...f.prepared.restart.settings }),
+  }
+  const path = f.id.indexRoot + "-rekey-cutover-candidate-" + f.id.runId
+    + "/activation-decision.json"
+  const write = f.s.adapter.write
+  let interrupted = false
+  f.s.adapter.write = async (target, data) => {
+    if (target === path && !interrupted) {
+      interrupted = true
+      f.s.files.set(target, data.slice(0, 17))
+      throw Error("injected local partial write")
+    }
+    return write(target, data)
+  }
+  await assert.rejects(stageV4FencedCutoverActivationDecision(input),
+    /injected local partial write/)
+  assert.equal(interrupted, true)
+  assert.ok(f.s.files.has(path))
+  const recovered = await inspectV4FencedCutoverActivationDecisionAfterRestart(input)
+  assert.equal(recovered.observation, "manual-recovery-required")
+  assert.equal(recovered.localCutoverAuthorized, false)
+  assert.equal(recovered.resumeSyncAuthorized, false)
+  await assert.rejects(stageV4FencedCutoverActivationDecision(input),
+    /prior decision requires Manual Recovery/)
+})
+
+test("D230 remote Backup drift AFTER writing decision keeps authenticated residue without success", async () => {
+  const f = await d179Scenario()
+  const b = await d217CurrentFrozenBackup(f)
+  await stageV4FencedLiveReencryptionIntent({
+    readiness: f.input, backup: b.backup, transactionId: d183TransactionId,
+  })
+  const input = {
+    readiness: f.input, backup: b.backup, transactionId: d183TransactionId,
+    readPersistedSettings: async () => ({ ...f.prepared.restart.settings }),
+  }
+  const path = f.id.indexRoot + "-rekey-cutover-candidate-" + f.id.runId
+    + "/activation-decision.json"
+  const write = f.s.adapter.write
+  f.s.adapter.write = async (target, data) => {
+    await write(target, data)
+    if (target === path) b.setRef("9".repeat(40))
+  }
+  await assert.rejects(stageV4FencedCutoverActivationDecision(input),
+    /complete fresh Git and persisted local proof failed/)
+  assert.ok(f.s.files.has(path), "committed decision evidence must not be silently discarded")
+  assert.equal(
+    (await inspectV4FencedCutoverActivationDecisionAfterRestart(input)).observation,
+    "manual-recovery-required",
+  )
+})
+
+test("D230 forged owner holder or changed persisted Settings reader cannot certify staged activation", async () => {
+  for (const failure of ["nonexecuting-holder", "post-holder-settings-reader"] as const) {
+    const f = await d179Scenario()
+    const b = await d217CurrentFrozenBackup(f)
+    await stageV4FencedLiveReencryptionIntent({
+      readiness: f.input, backup: b.backup, transactionId: d183TransactionId,
+    })
+    const input = {
+      readiness: f.input, backup: b.backup, transactionId: d183TransactionId,
+      readPersistedSettings: async () => ({ ...f.prepared.restart.settings }),
+    }
+    const originalHolder = f.prepared.withExclusiveInitiatorLease
+    const replaced = failure === "nonexecuting-holder"
+      ? async <T>(_body: () => Promise<T>): Promise<T> => Object.freeze({}) as T
+      : async <T>(body: () => Promise<T>): Promise<T> => originalHolder(async () => {
+        const result = await body()
+        input.readPersistedSettings = async () => ({
+          ...f.prepared.restart.settings, githubBranch: "rekey/d83",
+        })
+        return result
+      })
+    Object.assign(f.prepared, { withExclusiveInitiatorLease: replaced })
+    Object.assign(f.input.full.branches, { withExclusiveInitiatorLease: replaced })
+    Object.assign(b.backup, { withExclusiveInitiatorLease: replaced })
+    const path = f.id.indexRoot + "-rekey-cutover-candidate-" + f.id.runId
+      + "/activation-decision.json"
+    const writesBefore = f.s.getWrites()
+    await assert.rejects(stageV4FencedCutoverActivationDecision(input),
+      /cannot certify a decision/)
+    if (failure === "nonexecuting-holder") {
+      assert.equal(f.s.files.has(path), false)
+      assert.equal(f.s.getWrites(), writesBefore)
+    } else {
+      assert.equal(f.s.files.has(path), true, "ambiguous post-holder write is preserved")
+      assert.equal(
+        (await inspectV4FencedCutoverActivationDecisionAfterRestart(input)).observation,
+        "manual-recovery-required",
+      )
+    }
+    assert.equal(f.s.holderCounts().held, false)
+  }
+})
 
 test("D229 commit preflight independently verifies current full old Backup, new Destination and persisted local Intent in one lease", async () => {
   const f = await d179Scenario()
