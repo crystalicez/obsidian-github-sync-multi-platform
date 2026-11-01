@@ -23,6 +23,7 @@ import { inspectV4FencedPersistedTestPairAfterRestart } from "../../src/lib/v4/r
 import { inspectV4FencedLivePersistedTestPairAndBackupAfterRestart } from "../../src/lib/v4/reencryption-fenced-live-persisted-test-pair-recovery"
 import { classifyV4ReencryptionManualRecovery } from "../../src/lib/v4/reencryption-manual-recovery-triage"
 import { stageV4ReencryptionCutoverCandidate } from "../../src/lib/v4/reencryption-cutover-candidate-stage"
+import { stageV4FencedLiveReencryptionCandidate } from "../../src/lib/v4/reencryption-fenced-live-candidate-stage"
 import { inspectV4ReencryptionCutoverCandidateAfterRestart } from "../../src/lib/v4/reencryption-cutover-candidate-restart"
 import { decodeV4ReencryptionCutoverCandidateManifest } from "../../src/lib/v4/reencryption-cutover-candidate-manifest"
 import { inspectV4ReencryptionCutoverCandidatePair } from "../../src/lib/v4/reencryption-cutover-candidate-crypto"
@@ -1535,6 +1536,138 @@ async function d217CurrentFrozenBackup(f: Awaited<ReturnType<typeof d179Scenario
     setRef(sha: string) { observedBackupSha = sha },
   }
 }
+
+test("D224 one real owner lease derives exact candidate from fresh old-key Backup and new-key Destination Git content", async () => {
+  const f = await d179Scenario()
+  const b = await d217CurrentFrozenBackup(f)
+  const files = new Map(f.s.files)
+  const oldSecrets = new Map(f.s.secrets)
+  const wal = JSON.stringify(f.s.getWal())
+  const holders = f.s.holderCounts().calls
+  const writes = f.s.getWrites()
+  const result = await stageV4FencedLiveReencryptionCandidate({
+    readiness: f.input, backup: b.backup, transactionId: d183TransactionId,
+  })
+  assert.equal(result.status, "production-namespace-pair-staged-uncommitted")
+  assert.equal(result.provenance,
+    "two-full-current-destination-and-frozen-backup-proofs-bracketing-write")
+  assert.equal(result.localCutoverAuthorized, false)
+  assert.equal(result.resumeSyncAuthorized, false)
+  assert.equal(result.oldPassphraseCleanupAuthorized, false)
+  assert.equal(f.s.holderCounts().calls, holders + 1, "one outer lock for ALL Git+disk phases")
+  assert.equal(f.s.holderCounts().held, false)
+  assert.ok(b.blobReads >= 16, "two D216 runs with two full Backup passes each")
+  assert.ok(f.s.f.reads >= 16, "two D183 runs, each with full new-key Git verification")
+  const recorded = decodeV4ReencryptionCutoverCandidateManifest(f.s.files.get(result.manifestPath)!)
+  assert.equal(recorded.transactionId, d183TransactionId)
+  assert.equal(recorded.identity.backupRepoId, f.id.backupRepoId)
+  assert.equal((await inspectV4ReencryptionCutoverCandidateAfterRestart(f.prepared))
+    .observation, "authenticated-candidate-uncommitted")
+  assert.equal(f.s.getWrites(), writes + 3)
+  for (const [path, value] of files) assert.equal(f.s.files.get(path), value, path)
+  assert.deepEqual(f.s.secrets, oldSecrets)
+  assert.equal(JSON.stringify(f.s.getWal()), wal)
+})
+
+test("D224 live frozen Backup already drifted prevents any Cutover candidate write", async () => {
+  for (const cause of ["backup-ref", "backup-ciphertext", "missing-old-key"] as const) {
+    const f = await d179Scenario()
+    const b = await d217CurrentFrozenBackup(f)
+    if (cause === "backup-ref") b.setRef("9".repeat(40))
+    else if (cause === "backup-ciphertext") b.corruptAfterFirstPass()
+    else f.s.secrets.delete(f.id.sourcePassphraseSecretId)
+    const before = new Map(f.s.files)
+    const writes = f.s.getWrites()
+    await assert.rejects(() => stageV4FencedLiveReencryptionCandidate({
+      readiness: f.input, backup: b.backup, transactionId: d183TransactionId,
+    }), /Backup|identity|passphrase|keys|proof|snapshot/i, cause)
+    assert.equal(f.s.getWrites(), writes, cause)
+    assert.deepEqual(f.s.files, before, cause)
+    assert.equal(f.s.holderCounts().held, false, cause)
+  }
+})
+
+test("D224 full Git Backup/Destination or WAL drift AFTER candidate writing retains uncommitted bytes", async () => {
+  for (const cause of ["late-backup-ref", "late-destination-ref", "late-wal"] as const) {
+    const f = await d179Scenario()
+    const b = await d217CurrentFrozenBackup(f)
+    const root = V4_RUNTIME_INDEX_ROOT + "-rekey-cutover-candidate-" + f.id.runId
+    const originalWrite = f.s.adapter.write
+    let reached = false
+    f.s.adapter.write = async (path, value) => {
+      await originalWrite(path, value)
+      if (path === root + "/selector.json") {
+        reached = true
+        if (cause === "late-backup-ref") b.setRef("9".repeat(40))
+        else if (cause === "late-destination-ref") f.s.f.changeRef("9".repeat(40))
+        else f.s.setWal({ ...f.s.getWal(), generation: 999 })
+      }
+    }
+    await assert.rejects(() => stageV4FencedLiveReencryptionCandidate({
+      readiness: f.input, backup: b.backup, transactionId: d183TransactionId,
+    }), /Backup|WAL|Git|identity|proof|checkpoint|candidate|changed/i, cause)
+    assert.equal(reached, true, cause)
+    assert.equal(f.s.files.has(root + "/contract.json"), true, cause)
+    assert.equal(f.s.files.has(root + "/receipt.json"), true, cause)
+    assert.equal(f.s.files.has(root + "/selector.json"), true, cause)
+    assert.ok(f.s.files.has(V4_REENCRYPTION_SYNC_FENCE_ROOT + "/active.json"), cause)
+    assert.equal(f.s.holderCounts().held, false, cause)
+    // The triple on disk is still only CANDIDATE bytes, never a Cutover.
+    const observed = await inspectV4ReencryptionCutoverCandidateAfterRestart(f.prepared)
+    assert.equal(observed.localCutoverAuthorized, false, cause)
+    assert.equal(observed.resumeSyncAuthorized, false, cause)
+    assert.equal(observed.oldPassphraseCleanupAuthorized, false, cause)
+  }
+})
+
+test("D224 cancellation just after held full-Git proof rejects the completed candidate", async () => {
+  const f = await d179Scenario()
+  const b = await d217CurrentFrozenBackup(f)
+  const controller = new AbortController()
+  Object.assign(f.input.full.shadow.remote, { signal: controller.signal })
+  const originalHolder = f.prepared.withExclusiveInitiatorLease
+  const changedHolder = async <T>(body: () => Promise<T>): Promise<T> =>
+    originalHolder(async () => {
+      const value = await body()
+      controller.abort()
+      return value
+    })
+  f.prepared.withExclusiveInitiatorLease = changedHolder
+  f.input.full.branches.withExclusiveInitiatorLease = changedHolder
+  b.backup.withExclusiveInitiatorLease = changedHolder
+  const root = V4_RUNTIME_INDEX_ROOT + "-rekey-cutover-candidate-" + f.id.runId
+  await assert.rejects(() => stageV4FencedLiveReencryptionCandidate({
+    readiness: f.input, backup: b.backup, transactionId: d183TransactionId,
+  }), /identity drift|changed|methods|scope|SecretStorage/i)
+  assert.equal(controller.signal.aborted, true)
+  assert.equal(f.s.files.has(root + "/selector.json"), true)
+  assert.ok(f.s.files.has(V4_REENCRYPTION_SYNC_FENCE_ROOT + "/active.json"))
+  assert.equal(f.s.holderCounts().held, false)
+})
+
+test("D224 post-holder Git method substitution invalidates a completed candidate proof", async () => {
+  const f = await d179Scenario()
+  const b = await d217CurrentFrozenBackup(f)
+  const originalHolder = f.prepared.withExclusiveInitiatorLease
+  const changedHolder = async <T>(work: () => Promise<T>): Promise<T> =>
+    originalHolder(async () => {
+      const result = await work()
+      b.github.getGitRef = async () => ({
+        ref: "refs/heads/" + b.github.branchName,
+        type: "commit" as const, sha: "9".repeat(40),
+      })
+      return result
+    })
+  f.prepared.withExclusiveInitiatorLease = changedHolder
+  f.input.full.branches.withExclusiveInitiatorLease = changedHolder
+  b.backup.withExclusiveInitiatorLease = changedHolder
+  const root = V4_RUNTIME_INDEX_ROOT + "-rekey-cutover-candidate-" + f.id.runId
+  await assert.rejects(() => stageV4FencedLiveReencryptionCandidate({
+    readiness: f.input, backup: b.backup, transactionId: d183TransactionId,
+  }), /drift|changed|method|Git/i)
+  assert.equal(f.s.files.has(root + "/selector.json"), true)
+  assert.equal(f.s.holderCounts().held, false)
+})
 
 test("D223 production-namespace candidate stages real AES-GCM Receipt/Selector under one held WAL+Fence lease", async () => {
   const f = await d179Scenario()
