@@ -77,7 +77,7 @@ const NONE = observation("manual-recovery-required", "both-absent")
 const PARTIAL = observation("manual-recovery-required", "one-artifact-missing")
 const INVALID = observation("manual-recovery-required", "invalid-or-mismatched-pair")
 
-function assertContract(contract: V4ReencryptionCommitPairTestContract): void {
+export function assertV4ReencryptionCommitPairTestContract(contract: V4ReencryptionCommitPairTestContract): void {
   if (!contract || typeof contract !== "object" || Array.isArray(contract)
     || Object.keys(contract).sort().join("|") !== CONTRACT_KEYS.join("|")
     || !TX.test(contract.transactionId) || /^0+$/u.test(contract.transactionId)
@@ -196,7 +196,7 @@ async function matchesSealed(
 export async function sealV4ReencryptionCommitPairTestVectors(
   contract: V4ReencryptionCommitPairTestContract, journalKey: Uint8Array,
 ): Promise<V4ReencryptionCommitPairTestVectors> {
-  assertContract(contract)
+  assertV4ReencryptionCommitPairTestContract(contract)
   assertKey(journalKey)
   const pinned = JSON.stringify(contract)
   const keyCopy = Uint8Array.from(journalKey)
@@ -226,7 +226,7 @@ export async function inspectV4ReencryptionCommitPairTestVectors(
   pair: { readonly receiptTestVector: string | null; readonly selectorTestVector: string | null },
 ): Promise<V4ReencryptionCommitPairTestInspection> {
   try {
-    assertContract(contract)
+    assertV4ReencryptionCommitPairTestContract(contract)
     assertKey(journalKey)
     if (!pair) return INVALID
     const receipt = pair.receiptTestVector

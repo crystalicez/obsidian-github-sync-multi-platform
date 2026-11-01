@@ -19,6 +19,8 @@ import { inspectV4ReencryptionCrossSurfaceProof } from "../../src/lib/v4/reencry
 import { inspectV4FencedPrecommitReadinessAfterRestart } from "../../src/lib/v4/reencryption-fenced-precommit-readiness"
 import { inspectV4FencedCrashWindowPairAfterRestart } from "../../src/lib/v4/reencryption-fenced-crash-window-pair-inspection"
 import { stageV4FencedCommitPairTestArtifacts } from "../../src/lib/v4/reencryption-fenced-persisted-test-pair"
+import { inspectV4FencedPersistedTestPairAfterRestart } from "../../src/lib/v4/reencryption-fenced-persisted-test-pair-restart"
+import { encodeV4ReencryptionPersistedTestContract, decodeV4ReencryptionPersistedTestContract } from "../../src/lib/v4/reencryption-persisted-test-contract"
 import { inspectV4FencedLivePostCrashAfterRestart, inspectV4FencedLivePostCrashAndBackupAfterRestart } from "../../src/lib/v4/reencryption-fenced-live-post-crash-verification"
 import type { V4FencedFrozenBackupContentInput } from "../../src/lib/v4/reencryption-fenced-backup-content"
 import { proposeV4SameRepositoryReencryptionBackupBranch } from "../../src/lib/v4/reencryption-owner-decisions"
@@ -1037,6 +1039,138 @@ test("D184 historical D183 full-Git-proven pair on local disk remains diagnostic
   assert.equal(legacy.reason, "unrecognized-selector-or-commit-artifact")
 })
 
+test("D220 restored input bootstraps saved nonsecret contract without a caller-supplied D183 witness", async () => {
+  const f = await d179Scenario()
+  const staged = await stageV4FencedCommitPairTestArtifacts(d183Input(f))
+  const contractPath = V4_RUNTIME_INDEX_ROOT + "-rekey-proposed-" + f.id.runId + "/contract.json"
+  const raw = f.s.files.get(contractPath)!
+  const contract = decodeV4ReencryptionPersistedTestContract(raw)
+  assert.equal(contract.transactionId, d183TransactionId)
+  assert.equal(contract.identity.destinationCommitSha, f.id.destinationCommitSha)
+  assert.equal(encodeV4ReencryptionPersistedTestContract(contract), raw)
+  assert.doesNotMatch(raw, /old-d138-secret|new-d83-secret/)
+  const beforeFiles = new Map(f.s.files)
+  const beforeWrites = f.s.getWrites()
+  const initialHolders = f.s.holderCounts().calls
+  // This input is recreated from the separately retained storage surfaces.
+  // The historical D183 contract and in-memory pair are NOT supplied.
+  const recreated = {
+    ...f.prepared,
+    journalKey: Uint8Array.from(f.prepared.journalKey),
+    identity: { ...f.id },
+    restart: { ...f.prepared.restart, settings: { ...f.prepared.restart.settings } },
+  }
+  const report = await inspectV4FencedPersistedTestPairAfterRestart(recreated)
+  assert.deepEqual(report, {
+    integrityScope: "read-only-restarted-untrusted-contract-and-linked-test-pair",
+    observation: "manual-recovery-required",
+    historicalTestPairCryptographicallyLinked: true,
+    evidence: "best-effort-wal-readback-not-power-loss-durable",
+    localCutoverAuthorized: false, resumeSyncAuthorized: false,
+    rollbackAuthorized: false, remoteWritesAuthorized: false,
+    oldPassphraseCleanupAuthorized: false,
+  })
+  assert.equal(f.s.holderCounts().calls, initialHolders + 1, "one nonreentrant external holder")
+  assert.equal(f.s.holderCounts().held, false)
+  assert.deepEqual(f.s.files, beforeFiles)
+  assert.equal(f.s.getWrites(), beforeWrites)
+  assert.ok(f.s.files.has(staged.receiptPath))
+  assert.ok(f.s.files.has(staged.selectorPath))
+})
+
+test("D220 invalid or foreign saved bootstrap manifest cannot authenticate test Selector", async () => {
+  const cases = ["missing", "torn", "foreign-identity", "extra-field",
+    "canonical-wrong-transaction", "oversized", "wrong-receipt", "missing-selector"] as const
+  for (const cause of cases) {
+    const f = await d179Scenario()
+    await stageV4FencedCommitPairTestArtifacts(d183Input(f))
+    const path = V4_RUNTIME_INDEX_ROOT + "-rekey-proposed-" + f.id.runId + "/contract.json"
+    const selector = V4_RUNTIME_INDEX_ROOT + "-rekey-selector-" + f.id.runId + "/selector.json"
+    const receipt = V4_RUNTIME_INDEX_ROOT + "-rekey-proposed-" + f.id.runId + "/marker.json"
+    const saved = f.s.files.get(path)!
+    if (cause === "missing") f.s.files.delete(path)
+    else if (cause === "torn") f.s.files.set(path, "{")
+    else if (cause === "foreign-identity") f.s.files.set(path, saved.replace(f.id.runId, "different-run-220"))
+    else if (cause === "extra-field") f.s.files.set(path, saved.replace(',"phase":', ',"untrusted":true,"phase":'))
+    else if (cause === "canonical-wrong-transaction") {
+      const parsed = JSON.parse(saved) as { schemaVersion: 1; phase: string; contract: V4ReencryptionCommitPairTestContract }
+      const tampered = { ...parsed.contract, transactionId: "1".repeat(32) }
+      f.s.files.set(path, encodeV4ReencryptionPersistedTestContract(tampered))
+    } else if (cause === "oversized") f.s.files.set(path, saved + " ".repeat(10_000))
+    else if (cause === "wrong-receipt") f.s.files.set(receipt, "AAAA" + f.s.files.get(receipt)!.slice(4))
+    else f.s.files.delete(selector)
+    const files = new Map(f.s.files)
+    const writes = f.s.getWrites()
+    const result = await inspectV4FencedPersistedTestPairAfterRestart(f.prepared)
+    assert.equal(result.historicalTestPairCryptographicallyLinked, false, cause)
+    assert.equal(result.observation, "manual-recovery-required", cause)
+    assert.equal(result.localCutoverAuthorized, false, cause)
+    assert.equal(result.resumeSyncAuthorized, false, cause)
+    assert.equal(f.s.getWrites(), writes, cause)
+    assert.deepEqual(f.s.files, files, cause)
+    assert.equal(f.s.holderCounts().held, false, cause)
+  }
+})
+
+test("D220 mutation after initial contract read, expired fence or altered WAL always requires Manual Recovery", async () => {
+  for (const cause of ["manifest-between-reads", "wal", "fence", "secret", "missing-holder"] as const) {
+    const f = await d179Scenario()
+    await stageV4FencedCommitPairTestArtifacts(d183Input(f))
+    const manifest = V4_RUNTIME_INDEX_ROOT + "-rekey-proposed-" + f.id.runId + "/contract.json"
+    if (cause === "manifest-between-reads") {
+      const original = f.s.adapter.read
+      let reads = 0
+      f.s.adapter.read = async path => {
+        const value = await original(path)
+        if (path === manifest && ++reads === 2) {
+          f.s.files.set(manifest, value.slice(0, -1))
+        }
+        return value
+      }
+    } else if (cause === "wal") f.s.setWal({ ...f.s.getWal(), generation: 777 })
+    else if (cause === "fence") f.s.files.set(V4_REENCRYPTION_SYNC_FENCE_ROOT + "/active.json", "{bad")
+    else if (cause === "secret") f.s.secrets.delete(f.id.sourcePassphraseSecretId)
+    else f.prepared.withExclusiveInitiatorLease = async <T>(_body: () => Promise<T>) => ({
+      historicalTestPairCryptographicallyLinked: true,
+      observation: "manual-recovery-required",
+    } as T)
+    const writes = f.s.getWrites()
+    const result = await inspectV4FencedPersistedTestPairAfterRestart(f.prepared)
+    assert.equal(result.historicalTestPairCryptographicallyLinked, false, cause)
+    assert.equal(result.resumeSyncAuthorized, false, cause)
+    assert.equal(result.oldPassphraseCleanupAuthorized, false, cause)
+    assert.equal(f.s.getWrites(), writes, cause)
+    assert.equal(f.s.holderCounts().held, false, cause)
+  }
+})
+
+test("D220 interrupt after persisting contract leaves bootstrap-only residue and never Receipt/Selector", async () => {
+  const f = await d179Scenario()
+  const root = V4_RUNTIME_INDEX_ROOT + "-rekey-proposed-" + f.id.runId
+  const contractPath = root + "/contract.json"
+  const receiptPath = root + "/marker.json"
+  const selectorPath = V4_RUNTIME_INDEX_ROOT + "-rekey-selector-" + f.id.runId + "/selector.json"
+  const original = f.s.adapter.write
+  f.s.adapter.write = async (path, value) => {
+    await original(path, value)
+    if (path === contractPath) throw Error("simulated-crash-after-contract")
+  }
+  await assert.rejects(() => stageV4FencedCommitPairTestArtifacts(d183Input(f)),
+    /simulated-crash-after-contract/)
+  assert.equal(f.s.files.has(contractPath), true)
+  assert.equal(f.s.files.has(receiptPath), false)
+  assert.equal(f.s.files.has(selectorPath), false)
+  const report = await inspectV4FencedPersistedTestPairAfterRestart(f.prepared)
+  assert.equal(report.historicalTestPairCryptographicallyLinked, false)
+  assert.equal(report.resumeSyncAuthorized, false)
+  assert.equal(f.s.holderCounts().held, false)
+  f.s.adapter.write = original
+  const writes = f.s.getWrites()
+  await assert.rejects(() => stageV4FencedCommitPairTestArtifacts(d183Input(f)),
+    /stale|partial|Manual Recovery/i)
+  assert.equal(f.s.getWrites(), writes)
+})
+
 test("D219 one lease writes and re-reads a linked D182 Receipt then Selector without switching Source", async () => {
   const f = await d179Scenario()
   const beforeFiles = new Map(f.s.files)
@@ -1063,6 +1197,8 @@ test("D219 one lease writes and re-reads a linked D182 Receipt then Selector wit
   assert.equal(f.s.holderCounts().calls, initialCalls + 1)
   assert.equal(f.s.holderCounts().held, false)
   assert.ok(f.s.files.has(report.receiptPath))
+  assert.ok(f.s.files.has(receiptRoot + "/contract.json"), "restart-readable nonsecret contract must be persisted")
+  assert.doesNotMatch(f.s.files.get(receiptRoot + "/contract.json")!, /old-d138-secret|new-d83-secret/)
   assert.ok(f.s.files.has(report.selectorPath))
   assert.deepEqual(await loadV4LocalIndex(f.s.adapter, V4_RUNTIME_INDEX_ROOT), beforeSource)
   assert.deepEqual(await loadV4LocalIndex(
@@ -1148,6 +1284,7 @@ test("D219 interrupted mkdir/Receipt/Selector writes persist distinct Manual Rec
       /simulated-interruption/)
     assert.equal(f.s.holderCounts().held, false, phase)
     assert.equal(f.s.dirs.has(receiptRoot), true, phase)
+    assert.equal(f.s.files.has(receiptRoot + "/contract.json"), phase !== "directory", phase)
     assert.equal(f.s.files.has(receipt), phase !== "directory", phase)
     assert.equal(f.s.files.has(selector), phase === "selector", phase)
     assert.equal(JSON.stringify(f.prepared.restart.settings), initialSettings)

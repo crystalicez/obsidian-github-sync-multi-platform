@@ -13,6 +13,10 @@ import { inspectV4FencedCrashWindowPairAfterRestart } from "./reencryption-fence
 import { assertV4ReencryptionExactSyncFence } from "./reencryption-fenced-prepared-selector"
 import { matchesV4ReencryptionPreparedWal } from "./reencryption-proposed-commit-receipt"
 import { planV4ReencryptionSeparatedRoots } from "./reencryption-separated-selector"
+import {
+  decodeV4ReencryptionPersistedTestContract,
+  encodeV4ReencryptionPersistedTestContract,
+} from "./reencryption-persisted-test-contract"
 import type { V4LocalIndexAdapter } from "./local-index"
 
 const MAX_RECORD_BYTES = 8 * 1024
@@ -76,6 +80,7 @@ export async function stageV4FencedCommitPairTestArtifacts(
   const selectorRoot = roots.selectorPath.slice(0, -"/selector.json".length)
   const receiptRoot = id.indexRoot + "-rekey-proposed-" + id.runId
   const receiptPath = receiptRoot + "/marker.json"
+  const contractPath = receiptRoot + "/contract.json"
   const checkpoint = wal.assertBestEffortCheckpoint
   const walLease = wal.assertExclusiveStageLease
   const walRead = journal.assertHealthySnapshot
@@ -248,6 +253,7 @@ export async function stageV4FencedCommitPairTestArtifacts(
       if (++called !== 1) throw Error("D219 exclusive holder invoked repeatedly.")
       await check()
       if (await exists.call(adapter, receiptRoot) || await exists.call(adapter, receiptPath)
+        || await exists.call(adapter, contractPath)
         || await exists.call(adapter, roots.selectorPath)
         || await exists.call(adapter, selectorRoot) !== true) {
         throw Error("D219 stale/foreign partial Receipt or Selector requires Manual Recovery.")
@@ -258,6 +264,7 @@ export async function stageV4FencedCommitPairTestArtifacts(
         throw Error("D219 current Source/Shadow/remote provenance not independently verified.")
       }
       const contract = derived.contract
+      const contractBytes = encodeV4ReencryptionPersistedTestContract(contract)
       const pair = await sealV4ReencryptionCommitPairTestVectors(contract, key)
       const proof = await inspectV4FencedCommitPairSnapshotTestVectors(
         nestedInput, contract, pair,
@@ -270,12 +277,23 @@ export async function stageV4FencedCommitPairTestArtifacts(
       }
       await check()
       if (await exists.call(adapter, receiptRoot) || await exists.call(adapter, receiptPath)
+        || await exists.call(adapter, contractPath)
         || await exists.call(adapter, roots.selectorPath)) {
         throw Error("D219 test artifacts already exist; never overwrite.")
       }
-      // First persistent boundary: create the proposed Receipt directory.
+      // First persistent boundary: directory, then a NONSECRET untrusted
+      // AAD bootstrap contract so Restart can authenticate later ciphertext
+      // without the initiating process's now-lost D183 in-memory witness.
       await mkdir.call(adapter, receiptRoot)
       await check()
+      await write.call(adapter, contractPath, contractBytes)
+      await check()
+      if (await read.call(adapter, contractPath) !== contractBytes
+        || JSON.stringify(decodeV4ReencryptionPersistedTestContract(contractBytes))
+          !== JSON.stringify(contract)) {
+        throw Error("D220 persisted test contract readback is invalid.")
+      }
+      // Receipt must never exist before its own matching contract is readable.
       await write.call(adapter, receiptPath, pair.receiptTestVector)
       await check()
       if (await read.call(adapter, receiptPath) !== pair.receiptTestVector) {
@@ -285,10 +303,12 @@ export async function stageV4FencedCommitPairTestArtifacts(
       // authoritative and blocked by the unchanged migration Sync Fence.
       await write.call(adapter, roots.selectorPath, pair.selectorTestVector)
       await check()
-      const [receipt, selector] = await Promise.all([
+      const [manifest, receipt, selector] = await Promise.all([
+        read.call(adapter, contractPath),
         read.call(adapter, receiptPath), read.call(adapter, roots.selectorPath),
       ])
-      if (receipt !== pair.receiptTestVector || selector !== pair.selectorTestVector
+      if (manifest !== contractBytes
+        || receipt !== pair.receiptTestVector || selector !== pair.selectorTestVector
         || (await inspectV4ReencryptionCommitPairTestVectors(
           contract, key, { receiptTestVector: receipt, selectorTestVector: selector },
         )).observation !== "both-test-vectors-authenticate-uncommitted") {
@@ -299,7 +319,8 @@ export async function stageV4FencedCommitPairTestArtifacts(
         contract, sourceSettings: JSON.parse(sourceSettings) as typeof restart.settings,
       })
       await check()
-      if (crash.artifactWindow !== "pair-present"
+      if (await read.call(adapter, contractPath) !== contractBytes
+        || crash.artifactWindow !== "pair-present"
         || crash.pairEvidence !== "cryptographically-linked-uncommitted"
         || crash.reason !== "linked-test-pair-not-authoritative"
         || crash.localCutoverAuthorized !== false || crash.resumeSyncAuthorized !== false) {
