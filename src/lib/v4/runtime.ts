@@ -24,6 +24,7 @@ import { createV4ContentSource, createV4WholeBufferContentSource, DEFAULT_V4_WHO
 import { createV4PlatformIo, V4ManualRecoveryRequiredError, type V4BinaryAdapterLike, type V4PlatformIo } from "./platform-io"
 import { isV4UncVaultPath, V4_NETWORK_VAULT_WARNING } from "./network-storage"
 import { createV4DesktopInitiatorLocalReader } from "./reencryption-desktop-initiator-reader"
+import { createV4MobileInitiatorLocalReader } from "./reencryption-mobile-initiator-reader"
 import { armV4ReencryptionSyncFence, assertV4ReencryptionSyncFenceClear, V4ReencryptionSyncFencedError, type V4ReencryptionSyncFenceReport } from "./reencryption-sync-fence"
 import type { V4InitiatorLocalReader } from "./reencryption-initiator-parity"
 import { createV4StagingStore, type V4StagingStore } from "./staging-store"
@@ -231,17 +232,18 @@ export class V4PluginRuntime {
   }
 
   /**
-   * D106 read-only factory bound to REAL Obsidian scope/queue/editor state and
-   * physical Node vault I/O. No migration is started and this cannot grant
-   * local cutover. An external WAL lease still must be supplied and independently
-   * crash-durability audited before any future ref mutation.
+   * Read-only factory bound to live scope/queue/editor state and real
+   * Desktop filesystem or Mobile DataAdapter inventory. Mobile cannot
+   * establish an OS-wide file lock or prove symlink/physical-snapshot safety.
+   * Both return non-authorizing parity evidence; no migration is started.
    */
   createReencryptionInitiatorLocalReader(
     assertExclusiveInitiatorLease: () => Promise<void>,
   ): V4InitiatorLocalReader {
     this.assertNotDisposed()
-    if (!this.desktopVaultRoot || !this.platformIo.capabilities.boundedRead
-      || !this.platformIo.capabilities.recoveryStagedCommit || this.uncVault) {
+    if (Platform.isDesktopApp === true
+      && (!this.desktopVaultRoot || !this.platformIo.capabilities.boundedRead
+        || !this.platformIo.capabilities.recoveryStagedCommit || this.uncVault)) {
       throw new Error("Re-encryption live initiating-vault parity requires a verified local Desktop filesystem.")
     }
     if (typeof assertExclusiveInitiatorLease !== "function") {
@@ -273,12 +275,12 @@ export class V4PluginRuntime {
         || latest.syncBookmarks !== initial.syncBookmarks
         || latest.syncPlugins !== initial.syncPlugins
         || (this.plugin.app.vault.configDir || ".obsidian") !== sourceScope.configDir
-        || this.plugin.manifest.id !== sourceScope.pluginId) {
+        || this.plugin.manifest.id !== sourceScope.pluginId
+        || this.plugin.app.vault.adapter !== this.indexAdapterBacking) {
         throw new Error("Re-encryption source connection or local Sync scope changed.")
       }
     }
-    return createV4DesktopInitiatorLocalReader({
-      rootAbsolute: this.desktopVaultRoot,
+    const guards = {
       scope: sourceScope,
       assertExclusiveInitiatorLease,
       assertIdleAndNoPendingEdits: async () => {
@@ -321,6 +323,14 @@ export class V4PluginRuntime {
         }
         return [...open]
       },
+    }
+    if (Platform.isDesktopApp === true) {
+      return createV4DesktopInitiatorLocalReader({
+        ...guards, rootAbsolute: this.desktopVaultRoot!,
+      })
+    }
+    return createV4MobileInitiatorLocalReader({
+      ...guards, adapter: this.plugin.app.vault.adapter,
     })
   }
 
