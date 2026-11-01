@@ -25,6 +25,7 @@ import { classifyV4ReencryptionManualRecovery } from "../../src/lib/v4/reencrypt
 import { stageV4ReencryptionCutoverCandidate } from "../../src/lib/v4/reencryption-cutover-candidate-stage"
 import { stageV4FencedLiveReencryptionCandidate, stageV4FencedLiveReencryptionIntent } from "../../src/lib/v4/reencryption-fenced-live-candidate-stage"
 import { inspectV4ReencryptionPendingCutoverIntentAfterRestart } from "../../src/lib/v4/reencryption-cutover-intent-restart"
+import { inspectV4FencedPendingCutoverSurfacesAfterRestart } from "../../src/lib/v4/reencryption-fenced-intent-surface-restart"
 import { inspectV4ReencryptionPendingCutoverIntent } from "../../src/lib/v4/reencryption-cutover-intent-crypto"
 import { inspectV4ReencryptionCutoverCandidateAfterRestart } from "../../src/lib/v4/reencryption-cutover-candidate-restart"
 import { decodeV4ReencryptionCutoverCandidateManifest } from "../../src/lib/v4/reencryption-cutover-candidate-manifest"
@@ -1538,6 +1539,145 @@ async function d217CurrentFrozenBackup(f: Awaited<ReturnType<typeof d179Scenario
     setRef(sha: string) { observedBackupSha = sha },
   }
 }
+
+test("D228 persisted Settings, Source/Shadow Index, Prepared and WAL match all six authenticated Intent digests", async () => {
+  const f = await d179Scenario()
+  const b = await d217CurrentFrozenBackup(f)
+  const result = await stageV4FencedLiveReencryptionIntent({
+    readiness: f.input, backup: b.backup, transactionId: d183TransactionId,
+  })
+  const files = new Map(f.s.files)
+  const secrets = new Map(f.s.secrets)
+  const writesBefore = f.s.getWrites()
+  const holdersBefore = f.s.holderCounts().calls
+  const persistedSettings = { ...f.prepared.restart.settings }
+  let settingsReads = 0
+  const recovered = await inspectV4FencedPendingCutoverSurfacesAfterRestart({
+    prepared: f.prepared,
+    readPersistedSettings: async () => {
+      settingsReads++
+      return { ...persistedSettings }
+    },
+  })
+  assert.deepEqual(recovered, {
+    integrityScope: "read-only-fenced-pending-intent-cross-surface-restart",
+    observation: "source-and-destination-snapshots-match-pending-intent-uncommitted",
+    localCutoverAuthorized: false, resumeSyncAuthorized: false,
+    rollbackAuthorized: false, remoteWritesAuthorized: false,
+    oldPassphraseCleanupAuthorized: false,
+  })
+  assert.ok(settingsReads >= 2)
+  assert.equal(f.s.holderCounts().calls, holdersBefore + 1, "all independent restart reads share one held owner lease")
+  assert.equal(f.s.holderCounts().held, false)
+  assert.equal(f.s.getWrites(), writesBefore, "Restart is read-only")
+  assert.equal(f.s.files.get(result.intentPath), files.get(result.intentPath))
+  assert.deepEqual(f.s.files, files)
+  assert.deepEqual(f.s.secrets, secrets)
+})
+
+test("D228 interrupted local Settings/Index/Prepared/WAL or unauthorized active Selector requires Manual Recovery", async () => {
+  for (const failure of [
+    "settings-branch", "settings-secret", "settings-unreadable",
+    "active-index", "shadow-index", "prepared-evidence",
+    "wal-drift", "missing-old-secret", "live-selector-residue",
+    "missing-intent",
+  ] as const) {
+    const f = await d179Scenario()
+    const b = await d217CurrentFrozenBackup(f)
+    const result = await stageV4FencedLiveReencryptionIntent({
+      readiness: f.input, backup: b.backup, transactionId: d183TransactionId,
+    })
+    const settings = { ...f.prepared.restart.settings }
+    if (failure === "settings-branch") settings.githubBranch = "rekey/d83"
+    if (failure === "settings-secret") settings.encryptionPassphraseSecretId = f.id.destinationPassphraseSecretId
+    if (failure === "active-index" || failure === "shadow-index") {
+      const root = failure === "active-index" ? V4_RUNTIME_INDEX_ROOT
+        : V4_RUNTIME_INDEX_ROOT + "-rekey-" + f.id.runId
+      const path = root + "/index.json"
+      f.s.files.set(path, f.s.files.get(path)!.replace(
+        failure === "active-index" ? f.id.sourceCommitSha : f.id.destinationCommitSha,
+        "9".repeat(40),
+      ))
+    }
+    if (failure === "prepared-evidence") {
+      const path = V4_RUNTIME_INDEX_ROOT + "-rekey-selector-" + f.id.runId + "/prepared.json"
+      f.s.files.set(path, f.s.files.get(path)! + " ")
+    }
+    if (failure === "wal-drift") f.s.setWal({ ...f.s.getWal(), generation: 999 })
+    if (failure === "missing-old-secret") f.s.secrets.delete(f.id.sourcePassphraseSecretId)
+    if (failure === "live-selector-residue") {
+      f.s.files.set(V4_RUNTIME_INDEX_ROOT + "-rekey-selector-" + f.id.runId + "/selector.json", "{}")
+    }
+    if (failure === "missing-intent") f.s.files.delete(result.intentPath)
+    const writesBefore = f.s.getWrites()
+    const recovery = await inspectV4FencedPendingCutoverSurfacesAfterRestart({
+      prepared: f.prepared,
+      readPersistedSettings: async () => failure === "settings-unreadable" ? null : { ...settings },
+    })
+    assert.equal(recovery.observation, "manual-recovery-required", failure)
+    assert.equal(recovery.resumeSyncAuthorized, false, failure)
+    assert.equal(recovery.localCutoverAuthorized, false, failure)
+    assert.equal(recovery.oldPassphraseCleanupAuthorized, false, failure)
+    assert.equal(f.s.getWrites(), writesBefore, failure)
+    assert.equal(f.s.holderCounts().held, false, failure)
+  }
+})
+
+test("D228 persisted Settings changed during authenticated Intent restart cannot report a coherent Source", async () => {
+  const f = await d179Scenario()
+  const b = await d217CurrentFrozenBackup(f)
+  await stageV4FencedLiveReencryptionIntent({
+    readiness: f.input, backup: b.backup, transactionId: d183TransactionId,
+  })
+  const persisted = { ...f.prepared.restart.settings }
+  let reads = 0
+  const recovery = await inspectV4FencedPendingCutoverSurfacesAfterRestart({
+    prepared: f.prepared,
+    readPersistedSettings: async () => {
+      if (++reads === 2) persisted.githubBranch = "rekey/d83"
+      return { ...persisted }
+    },
+  })
+  assert.ok(reads >= 2)
+  assert.equal(recovery.observation, "manual-recovery-required")
+  assert.equal(recovery.resumeSyncAuthorized, false)
+})
+
+test("D228 a fake holder, changed read callback or unknown active commit cannot create cutover authority", async () => {
+  for (const failure of ["holder", "reader", "proposed-root"] as const) {
+    const f = await d179Scenario()
+    const b = await d217CurrentFrozenBackup(f)
+    await stageV4FencedLiveReencryptionIntent({
+      readiness: f.input, backup: b.backup, transactionId: d183TransactionId,
+    })
+    const settings = { ...f.prepared.restart.settings }
+    const input = {
+      prepared: f.prepared,
+      readPersistedSettings: async () => ({ ...settings }),
+    }
+    if (failure === "proposed-root") {
+      const proposedRoot = V4_RUNTIME_INDEX_ROOT + "-rekey-proposed-" + f.id.runId
+      await f.s.adapter.mkdir(proposedRoot)
+      f.s.files.set(proposedRoot + "/marker.json", "foreign")
+    }
+    if (failure === "holder") {
+      f.prepared.withExclusiveInitiatorLease = async <T>(_work: () => Promise<T>): Promise<T> =>
+        Object.freeze({}) as T
+    }
+    if (failure === "reader") {
+      const originalHolder = f.prepared.withExclusiveInitiatorLease
+      f.prepared.withExclusiveInitiatorLease = async <T>(work: () => Promise<T>): Promise<T> =>
+        originalHolder(async () => {
+          const reported = await work()
+          input.readPersistedSettings = async () => ({ ...settings, githubBranch: "rekey/d83" })
+          return reported
+        })
+    }
+    const report = await inspectV4FencedPendingCutoverSurfacesAfterRestart(input)
+    assert.equal(report.observation, "manual-recovery-required", failure)
+    assert.equal(report.localCutoverAuthorized, false, failure)
+  }
+})
 
 test("D227 one held lease writes authenticated Intent after current old/new Git proof without selecting a live branch", async () => {
   const f = await d179Scenario()
