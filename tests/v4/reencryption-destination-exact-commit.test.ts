@@ -18,6 +18,7 @@ import type { V4ThreeBranchPublicationReport } from "../../src/lib/v4/reencrypti
 import { inspectV4ReencryptionCrossSurfaceProof } from "../../src/lib/v4/reencryption-cross-surface-proof"
 import { inspectV4FencedPrecommitReadinessAfterRestart } from "../../src/lib/v4/reencryption-fenced-precommit-readiness"
 import { inspectV4FencedCrashWindowPairAfterRestart } from "../../src/lib/v4/reencryption-fenced-crash-window-pair-inspection"
+import { stageV4FencedCommitPairTestArtifacts } from "../../src/lib/v4/reencryption-fenced-persisted-test-pair"
 import { inspectV4FencedLivePostCrashAfterRestart, inspectV4FencedLivePostCrashAndBackupAfterRestart } from "../../src/lib/v4/reencryption-fenced-live-post-crash-verification"
 import type { V4FencedFrozenBackupContentInput } from "../../src/lib/v4/reencryption-fenced-backup-content"
 import { proposeV4SameRepositoryReencryptionBackupBranch } from "../../src/lib/v4/reencryption-owner-decisions"
@@ -1034,6 +1035,233 @@ test("D184 historical D183 full-Git-proven pair on local disk remains diagnostic
   const legacy = await inspectV4FencedLocalCrashTriageAfterRestart(f.prepared)
   assert.equal(legacy.observation, "manual-recovery-required")
   assert.equal(legacy.reason, "unrecognized-selector-or-commit-artifact")
+})
+
+test("D219 one lease writes and re-reads a linked D182 Receipt then Selector without switching Source", async () => {
+  const f = await d179Scenario()
+  const beforeFiles = new Map(f.s.files)
+  const beforeSource = await loadV4LocalIndex(f.s.adapter, V4_RUNTIME_INDEX_ROOT)
+  const beforeShadow = await loadV4LocalIndex(
+    f.s.adapter, V4_RUNTIME_INDEX_ROOT + "-rekey-" + f.id.runId,
+  )
+  const beforeSettings = JSON.stringify(f.prepared.restart.settings)
+  const beforeSecrets = new Map(f.s.secrets)
+  const beforeWal = JSON.stringify(f.s.getWal())
+  const initialCalls = f.s.holderCounts().calls
+  const report = await stageV4FencedCommitPairTestArtifacts(d183Input(f))
+  const receiptRoot = V4_RUNTIME_INDEX_ROOT + "-rekey-proposed-" + f.id.runId
+  const selectorPath = V4_RUNTIME_INDEX_ROOT + "-rekey-selector-" + f.id.runId + "/selector.json"
+  assert.deepEqual(report, {
+    status: "linked-persistent-test-artifacts-uncommitted",
+    receiptPath: receiptRoot + "/marker.json",
+    selectorPath,
+    evidence: "best-effort-wal-readback-not-power-loss-durable",
+    localCutoverAuthorized: false, resumeSyncAuthorized: false,
+    rollbackAuthorized: false, remoteWritesAuthorized: false,
+    oldPassphraseCleanupAuthorized: false,
+  })
+  assert.equal(f.s.holderCounts().calls, initialCalls + 1)
+  assert.equal(f.s.holderCounts().held, false)
+  assert.ok(f.s.files.has(report.receiptPath))
+  assert.ok(f.s.files.has(report.selectorPath))
+  assert.deepEqual(await loadV4LocalIndex(f.s.adapter, V4_RUNTIME_INDEX_ROOT), beforeSource)
+  assert.deepEqual(await loadV4LocalIndex(
+    f.s.adapter, V4_RUNTIME_INDEX_ROOT + "-rekey-" + f.id.runId,
+  ), beforeShadow)
+  assert.equal(JSON.stringify(f.prepared.restart.settings), beforeSettings)
+  assert.deepEqual(f.s.secrets, beforeSecrets)
+  assert.equal(JSON.stringify(f.s.getWal()), beforeWal)
+  for (const [path, bytes] of beforeFiles) assert.equal(f.s.files.get(path), bytes)
+  assert.ok(f.s.files.has(V4_REENCRYPTION_SYNC_FENCE_ROOT + "/active.json"))
+  const { contract } = await d183PreparedPairFromBeforeStageForD219(f, beforeFiles)
+  const inspected = await inspectV4FencedCrashWindowPairAfterRestart({
+    prepared: f.prepared, contract,
+    sourceSettings: { ...f.prepared.restart.settings },
+  })
+  assert.equal(inspected.artifactWindow, "pair-present")
+  assert.equal(inspected.pairEvidence, "cryptographically-linked-uncommitted")
+  assert.equal(inspected.reason, "linked-test-pair-not-authoritative")
+  assert.equal(inspected.localCutoverAuthorized, false)
+  assert.equal(inspected.resumeSyncAuthorized, false)
+  const writes = f.s.getWrites()
+  await assert.rejects(() => stageV4FencedCommitPairTestArtifacts(d183Input(f)),
+    /stale|partial|existing|Manual Recovery/i)
+  assert.equal(f.s.getWrites(), writes, "never silently overwrite completed test pair")
+})
+
+async function d183PreparedPairFromBeforeStageForD219(
+  f: Awaited<ReturnType<typeof d179Scenario>>, beforeFiles: Map<string, string>,
+) {
+  // Recover the exact D183 contract from the original local readback without
+  // mutating the now-staged local state or treating that witness as an authority.
+  const source = await loadV4LocalIndex(f.s.adapter, V4_RUNTIME_INDEX_ROOT)
+  const shadow = await loadV4LocalIndex(
+    f.s.adapter, V4_RUNTIME_INDEX_ROOT + "-rekey-" + f.id.runId,
+  )
+  const walBytes = JSON.stringify(f.s.getWal())
+  const settingsBytes = JSON.stringify(f.prepared.restart.settings)
+  const targetBytes = JSON.stringify({
+    ...f.prepared.restart.settings,
+    githubBranch: f.id.destinationRepoId.split("#")[1],
+    encryptionPassphraseSecretId: f.id.destinationPassphraseSecretId,
+  })
+  const digest = (value: string) => sha256Hex(enc(value))
+  const contract: V4ReencryptionCommitPairTestContract = {
+    transactionId: d183TransactionId, identity: f.id,
+    sourceIndexSha256: await digest(JSON.stringify(source)),
+    destinationShadowSha256: await digest(JSON.stringify(shadow)),
+    preparedEvidenceSha256: await digest(beforeFiles.get(f.staged.evidencePath)!),
+    walSnapshotSha256: await digest(walBytes),
+    sourceSettingsSha256: await digest(settingsBytes),
+    destinationSettingsSha256: await digest(targetBytes),
+  }
+  return { contract }
+}
+
+test("D219 interrupted mkdir/Receipt/Selector writes persist distinct Manual Recovery windows", async () => {
+  for (const phase of ["directory", "receipt", "selector"] as const) {
+    const f = await d179Scenario()
+    const { contract } = await d183PreparedPair(f)
+    const initialSettings = JSON.stringify(f.prepared.restart.settings)
+    const initialSecrets = new Map(f.s.secrets)
+    const selector = V4_RUNTIME_INDEX_ROOT + "-rekey-selector-" + f.id.runId + "/selector.json"
+    const receiptRoot = V4_RUNTIME_INDEX_ROOT + "-rekey-proposed-" + f.id.runId
+    const receipt = receiptRoot + "/marker.json"
+    const expected = phase === "directory" ? "receipt-directory-only"
+      : phase === "receipt" ? "receipt-only" : "pair-present"
+    const oldWrite = f.s.adapter.write
+    const oldMkdir = f.s.adapter.mkdir
+    if (phase === "directory") {
+      f.s.adapter.mkdir = async path => {
+        await oldMkdir(path)
+        if (path === receiptRoot) throw Error("simulated-interruption-" + phase)
+      }
+    } else {
+      f.s.adapter.write = async (path, content) => {
+        await oldWrite(path, content)
+        if (path === (phase === "receipt" ? receipt : selector)) {
+          throw Error("simulated-interruption-" + phase)
+        }
+      }
+    }
+    await assert.rejects(() => stageV4FencedCommitPairTestArtifacts(d183Input(f)),
+      /simulated-interruption/)
+    assert.equal(f.s.holderCounts().held, false, phase)
+    assert.equal(f.s.dirs.has(receiptRoot), true, phase)
+    assert.equal(f.s.files.has(receipt), phase !== "directory", phase)
+    assert.equal(f.s.files.has(selector), phase === "selector", phase)
+    assert.equal(JSON.stringify(f.prepared.restart.settings), initialSettings)
+    assert.deepEqual(f.s.secrets, initialSecrets)
+    const crash = await inspectV4FencedCrashWindowPairAfterRestart({
+      prepared: f.prepared, contract, sourceSettings: { ...f.prepared.restart.settings },
+    })
+    assert.equal(crash.artifactWindow, expected, phase)
+    assert.equal(crash.observation, "manual-recovery-required", phase)
+    assert.equal(crash.localCutoverAuthorized, false, phase)
+    assert.equal(crash.resumeSyncAuthorized, false, phase)
+    if (phase === "selector") {
+      assert.equal(crash.pairEvidence, "cryptographically-linked-uncommitted")
+      assert.equal(crash.reason, "linked-test-pair-not-authoritative")
+    }
+    f.s.adapter.write = oldWrite
+    f.s.adapter.mkdir = oldMkdir
+    const writes = f.s.getWrites()
+    await assert.rejects(() => stageV4FencedCommitPairTestArtifacts(d183Input(f)),
+      /stale|partial|existing|Manual Recovery/i, phase)
+    assert.equal(f.s.getWrites(), writes, "no overwrite on retry " + phase)
+  }
+})
+
+test("D219 lost WAL after the Receipt write cannot persist Selector or resume Sync", async () => {
+  const f = await d179Scenario()
+  const oldWrite = f.s.adapter.write
+  const receiptRoot = V4_RUNTIME_INDEX_ROOT + "-rekey-proposed-" + f.id.runId
+  f.s.adapter.write = async (path, value) => {
+    await oldWrite(path, value)
+    if (path === receiptRoot + "/marker.json") {
+      f.s.setWal({ ...f.s.getWal(), generation: 99 })
+    }
+  }
+  const selector = V4_RUNTIME_INDEX_ROOT + "-rekey-selector-" + f.id.runId + "/selector.json"
+  await assert.rejects(() => stageV4FencedCommitPairTestArtifacts(d183Input(f)),
+    /WAL|run|Manual Recovery/)
+  assert.equal(f.s.files.has(receiptRoot + "/marker.json"), true)
+  assert.equal(f.s.files.has(selector), false)
+  assert.equal(f.s.holderCounts().held, false)
+  assert.ok(f.s.files.has(V4_REENCRYPTION_SYNC_FENCE_ROOT + "/active.json"))
+})
+
+test("D219 a corrupt persisted Receipt cannot be upgraded to a linked Selector", async () => {
+  const f = await d179Scenario()
+  const receiptRoot = V4_RUNTIME_INDEX_ROOT + "-rekey-proposed-" + f.id.runId
+  const receiptPath = receiptRoot + "/marker.json"
+  const selectorPath = V4_RUNTIME_INDEX_ROOT + "-rekey-selector-" + f.id.runId + "/selector.json"
+  const oldWrite = f.s.adapter.write
+  f.s.adapter.write = async (path, value) => {
+    await oldWrite(path, path === receiptPath ? value.slice(0, -4) + "AAAA" : value)
+  }
+  await assert.rejects(() => stageV4FencedCommitPairTestArtifacts(d183Input(f)),
+    /Receipt|readback|mismatch|Manual Recovery/)
+  assert.equal(f.s.files.has(receiptPath), true)
+  assert.equal(f.s.files.has(selectorPath), false)
+  assert.equal(f.s.holderCounts().held, false)
+  assert.equal(f.s.files.has(V4_REENCRYPTION_SYNC_FENCE_ROOT + "/active.json"), true)
+})
+
+test("D219 preexisting receipt residue is never overwritten, even before sealing", async () => {
+  const f = await d179Scenario()
+  const root = V4_RUNTIME_INDEX_ROOT + "-rekey-proposed-" + f.id.runId
+  await f.s.adapter.mkdir(root)
+  await f.s.adapter.write(root + "/marker.json", "foreign-evidence")
+  const writes = f.s.getWrites()
+  const files = new Map(f.s.files)
+  await assert.rejects(() => stageV4FencedCommitPairTestArtifacts(d183Input(f)),
+    /stale|foreign|partial|Manual Recovery/i)
+  assert.equal(f.s.getWrites(), writes)
+  assert.deepEqual(f.s.files, files)
+  assert.equal(f.s.holderCounts().held, false)
+})
+
+test("D219 cancellation after Receipt readback preserves evidence and never writes Selector", async () => {
+  const f = await d179Scenario()
+  const controller = new AbortController()
+  Object.assign(f.input.full.shadow.remote, { signal: controller.signal })
+  const receiptPath = V4_RUNTIME_INDEX_ROOT + "-rekey-proposed-" + f.id.runId + "/marker.json"
+  const selectorPath = V4_RUNTIME_INDEX_ROOT + "-rekey-selector-" + f.id.runId + "/selector.json"
+  const oldWrite = f.s.adapter.write
+  f.s.adapter.write = async (path, value) => {
+    await oldWrite(path, value)
+    if (path === receiptPath) controller.abort(new Error("test abort after Receipt"))
+  }
+  await assert.rejects(() => stageV4FencedCommitPairTestArtifacts(d183Input(f)),
+    /cancel|abort|Manual Recovery/i)
+  assert.equal(f.s.files.has(receiptPath), true)
+  assert.equal(f.s.files.has(selectorPath), false)
+  assert.equal(f.s.holderCounts().held, false)
+  assert.ok(f.s.files.has(V4_REENCRYPTION_SYNC_FENCE_ROOT + "/active.json"))
+})
+
+test("D219 post-holder Git reader mutation refuses an apparently successful staged proof", async () => {
+  const f = await d179Scenario()
+  const originalHolder = f.prepared.withExclusiveInitiatorLease
+  const gh = f.s.f.github
+  const outer = async <T>(body: () => Promise<T>): Promise<T> =>
+    originalHolder(async () => {
+      const completed = await body()
+      gh.getGitRef = async () => ({
+        ref: "refs/heads/rekey/d83", sha: "9".repeat(40), type: "commit",
+      })
+      return completed
+    })
+  f.prepared.withExclusiveInitiatorLease = outer
+  f.input.full.branches.withExclusiveInitiatorLease = outer
+  const receiptPath = V4_RUNTIME_INDEX_ROOT + "-rekey-proposed-" + f.id.runId + "/marker.json"
+  const selectorPath = V4_RUNTIME_INDEX_ROOT + "-rekey-selector-" + f.id.runId + "/selector.json"
+  await assert.rejects(() => stageV4FencedCommitPairTestArtifacts(d183Input(f)),
+    /holder|trusted|changed/)
+  assert.equal(f.s.files.has(receiptPath), true)
+  assert.equal(f.s.files.has(selectorPath), true)
+  assert.equal(f.s.holderCounts().held, false)
 })
 
 const d185Input = (
