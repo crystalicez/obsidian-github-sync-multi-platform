@@ -11,6 +11,9 @@ import type { V4RemoteConfig, V4RemoteHead } from "../../src/lib/v4/protocol-typ
 import { V4StorageCodec } from "../../src/lib/v4/storage-codec";
 import { verifyGitHubReencryptionSource, verifyGitHubReencryptionForkSource, verifyGitHubFrozenReencryptionBackup } from "../../src/lib/v4/reencryption-trusted-loader";
 import { proposeV4SameRepositoryReencryptionBackupBranch } from "../../src/lib/v4/reencryption-owner-decisions";
+import { inspectV4FencedFrozenBackupContentAfterRestart } from "../../src/lib/v4/reencryption-fenced-backup-content";
+import { V4_REENCRYPTION_SYNC_FENCE_ROOT } from "../../src/lib/v4/reencryption-sync-fence";
+import type { V4ReencryptionProposedCommitIdentity } from "../../src/lib/v4/reencryption-proposed-commit-receipt";
 import { inspectV4FrozenBackupAfterAmbiguousCreate } from "../../src/lib/v4/reencryption-backup-reconcile";
 import { createAndVerifyV4FrozenBackupRef } from "../../src/lib/v4/reencryption-backup-create-verified";
 import { createV4JournaledFrozenBackup, createV4BestEffortJournaledFrozenBackup, reconcileV4PendingFrozenBackupWithJournal, reconcileV4PendingFrozenBackupWithJournalBestEffort } from "../../src/lib/v4/reencryption-ref-journal-coordinator";
@@ -1212,6 +1215,178 @@ test("D103 Backup recovery cannot clear unresolved WAL after a mismatched remote
   }), /missing|conflicting|authenticated/i)
   assert.equal(f.createAttempts, 0)
   assert.equal((await j.journal.load())?.pendingRefIntents.length, 1)
+})
+
+const d216Identity: V4ReencryptionProposedCommitIdentity = {
+  runId: "d216_backup_readback", walGeneration: 8, indexRoot: "private/v4-index",
+  deviceId: "device216", sourceRepoId: repoId,
+  backupRepoId: frozenPlan.backupRepoId, destinationRepoId: frozenPlan.destinationRepoId,
+  sourceCommitSha: commitSha, sourceTreeSha: rootTreeSha,
+  destinationCommitSha: "d".repeat(40), destinationTreeSha: "e".repeat(40),
+  manifestSha256: "f".repeat(64),
+  sourcePassphraseSecretId: "old-key", destinationPassphraseSecretId: "new-key",
+}
+const d216FencePath = V4_REENCRYPTION_SYNC_FENCE_ROOT + "/active.json"
+async function d216Fixture() {
+  const f = await createFixture()
+  const backup = frozenBackupClient(f)
+  const files = new Map<string, string>([
+    [V4_REENCRYPTION_SYNC_FENCE_ROOT, ""],
+    [d216FencePath, JSON.stringify({
+      schemaVersion: 1, phase: "migration-fenced-uncommitted",
+      runId: d216Identity.runId, sourceRepoId: d216Identity.sourceRepoId,
+      destinationRepoId: d216Identity.destinationRepoId,
+    })],
+  ])
+  let held = false
+  let owners = 0
+  let fenceReads = 0
+  let walChanged = false
+  const adapter = {
+    async exists(path: string) { return files.has(path) },
+    async read(path: string) {
+      fenceReads++
+      const value = files.get(path)
+      if (value === undefined) throw Error("missing fence")
+      return value
+    },
+  }
+  const wal = {
+    async assertExclusiveStageLease() { assert.equal(held, true) },
+    async assertBestEffortCheckpoint() {
+      assert.equal(held, true)
+      return "best-effort-readback-only" as const
+    },
+  }
+  const journal = {
+    sourceCommitSha: d216Identity.sourceCommitSha,
+    destinationRepoId: d216Identity.destinationRepoId,
+    async assertHealthySnapshot(generation: number) {
+      assert.equal(held, true)
+      assert.equal(generation, d216Identity.walGeneration)
+      return {
+        generation: walChanged ? 9 : 8,
+        receipts: [], pendingIntents: [], pendingRefIntents: [],
+        verifiedRefObservations: [
+          { role: "backup" as const, repoId: d216Identity.backupRepoId,
+            commitSha: d216Identity.sourceCommitSha, treeSha: d216Identity.sourceTreeSha },
+          { role: "destination" as const, repoId: d216Identity.destinationRepoId,
+            commitSha: d216Identity.destinationCommitSha, treeSha: d216Identity.destinationTreeSha,
+            manifestSha256: d216Identity.manifestSha256 },
+        ],
+        preparedCandidateReceipt: {
+          commitSha: d216Identity.destinationCommitSha, treeSha: d216Identity.destinationTreeSha,
+          manifestSha256: d216Identity.manifestSha256,
+        },
+        candidatePreparationSha256: "a".repeat(64),
+        stageHandoffStarted: true, requiresRemoteRevalidation: true,
+        permissionToPublish: false, cutoverAuthorized: false,
+      }
+    },
+  }
+  const lease = async () => { assert.equal(held, true) }
+  const holder = async <T>(body: () => Promise<T>): Promise<T> => {
+    owners++
+    assert.equal(held, false)
+    held = true
+    try { return await body() } finally { held = false }
+  }
+  const input = {
+    identity: d216Identity,
+    backup: { github: backup, plan: frozenPlan,
+      expectedSourceTreeSha: rootTreeSha, passphrase: "correct" },
+    adapter, wal, journal,
+    assertExclusiveInitiatorLease: lease, withExclusiveInitiatorLease: holder,
+  }
+  return {
+    f, files, input, get ownerCalls() { return owners }, get fenceReads() { return fenceReads },
+    corruptWal() { walChanged = true },
+    replaceHolder(next: typeof holder) { input.withExclusiveInitiatorLease = next },
+  }
+}
+
+test("D216 held-fence Backup recovery re-decrypts all frozen Git blobs twice with no write authority", async () => {
+  const x = await d216Fixture()
+  x.f.setCurrentSha("9".repeat(40)) // Old Source branch remains independently writable.
+  const result = await inspectV4FencedFrozenBackupContentAfterRestart(x.input)
+  assert.equal(result.observation, "complete-frozen-backup-reverified-uncommitted")
+  assert.equal(result.completeBackupContentReverified, true)
+  assert.equal(result.verifiedFileCount, 1)
+  assert.equal(result.verifiedPlaintextBytes, String(enc("File content secret").length))
+  assert.equal(x.f.repoReads, 4, "each complete pass must re-observe physical repository identity")
+  assert.ok(x.f.blobReads >= 8, "both passes must re-fetch all encrypted metadata and content")
+  assert.ok(x.fenceReads >= 6)
+  assert.equal(x.ownerCalls, 1)
+  assert.equal(result.localCutoverAuthorized, false)
+  assert.equal(result.resumeSyncAuthorized, false)
+  assert.equal(result.oldPassphraseCleanupAuthorized, false)
+})
+
+test("D216 Backup ref moving between complete reads fails closed with the old branch unchanged", async () => {
+  const x = await d216Fixture()
+  let reads = 0
+  x.input.backup.github.getGitRef = async () => ({
+    ref: "refs/heads/backup/2026-10-26", type: "commit",
+    sha: ++reads <= 2 ? commitSha : "9".repeat(40),
+  })
+  const result = await inspectV4FencedFrozenBackupContentAfterRestart(x.input)
+  assert.equal(result.observation, "manual-recovery-required")
+  assert.equal(result.completeBackupContentReverified, false)
+  assert.ok(x.f.blobReads >= 4)
+  assert.equal(result.remoteWritesAuthorized, false)
+})
+
+test("D216 changed Backup ciphertext on second read denies any positive recovery proof", async () => {
+  const x = await d216Fixture()
+  x.f.onBlobRead(sha => {
+    if (x.f.blobReads < 5) return
+    const content = x.f.blobs.get(sha)
+    if (!content) return
+    const changed = content.slice()
+    changed[0] = changed[0]! ^ 1
+    x.f.blobs.set(sha, changed)
+  })
+  const result = await inspectV4FencedFrozenBackupContentAfterRestart(x.input)
+  assert.equal(result.observation, "manual-recovery-required")
+  assert.ok(x.f.blobReads >= 5)
+  assert.equal(result.localCutoverAuthorized, false)
+})
+
+test("D216 missing or forged Fence, WAL, repo ID or source passphrase requires Manual Recovery", async () => {
+  const variants = [
+    (x: Awaited<ReturnType<typeof d216Fixture>>) => { x.files.delete(d216FencePath) },
+    (x: Awaited<ReturnType<typeof d216Fixture>>) => { x.files.set(d216FencePath, "{broken") },
+    (x: Awaited<ReturnType<typeof d216Fixture>>) => { x.corruptWal() },
+    (x: Awaited<ReturnType<typeof d216Fixture>>) => { x.f.setRepositoryId(123) },
+    (x: Awaited<ReturnType<typeof d216Fixture>>) => { x.input.backup.passphrase = "incorrect" },
+  ]
+  for (const change of variants) {
+    const x = await d216Fixture()
+    change(x)
+    const result = await inspectV4FencedFrozenBackupContentAfterRestart(x.input)
+    assert.equal(result.observation, "manual-recovery-required")
+    assert.equal(result.localCutoverAuthorized, false)
+    assert.equal(result.oldPassphraseCleanupAuthorized, false)
+  }
+})
+
+test("D216 skipped or repeated lease callback cannot fabricate full Backup success", async () => {
+  const skipped = await d216Fixture()
+  skipped.replaceHolder(async () =>
+    ({ observation: "complete-frozen-backup-reverified-uncommitted" }) as never)
+  const result = await inspectV4FencedFrozenBackupContentAfterRestart(skipped.input)
+  assert.equal(result.observation, "manual-recovery-required")
+  assert.equal(skipped.f.blobReads, 0)
+
+  const repeated = await d216Fixture()
+  repeated.replaceHolder(async body => {
+    const result = await body()
+    await body()
+    return result
+  })
+  const second = await inspectV4FencedFrozenBackupContentAfterRestart(repeated.input)
+  assert.equal(second.observation, "manual-recovery-required")
+  assert.equal(second.resumeSyncAuthorized, false)
 })
 
 test("D95 aborted recovery does no remote I/O", async () => {
