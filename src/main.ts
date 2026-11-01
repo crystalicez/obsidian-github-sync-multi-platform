@@ -6,7 +6,8 @@ import { assertPluginSettingsRuntimeSafe } from "./lib/plugin-settings-validatio
 import { V4RateLimitCooldownStore } from "./lib/v4/rate-limit-cooldown";
 import { selectV4GitHubSchedulerSleep } from "./lib/v4/desktop-transport-timer";
 import { normalizeScheduledSyncIntervalSeconds, shouldRunScheduledSync, shouldRunStartupSync } from "./lib/sync-policy";
-import { migrateV4Secrets, sanitizeV4SettingsForPersistence, storeV4Secrets } from "./lib/v4/secrets";
+import { hydrateV4SecretsReadOnly, migrateV4Secrets, sanitizeV4SettingsForPersistence, storeV4Secrets } from "./lib/v4/secrets";
+import { assertV4ReencryptionSyncFenceClear } from "./lib/v4/reencryption-sync-fence";
 import { V4PluginRuntime } from "./lib/v4/runtime";
 import { createIdleV4Progress } from "./lib/v4/progress";
 import { formatV4ActiveSyncStatus } from "./lib/v4/status";
@@ -80,7 +81,10 @@ export default class FastSync extends Plugin {
   override async onload() {
     this.unloaded = false
     await this.loadSettings()
-    if (this.secretsMigrated) await this.persistData()
+    if (this.secretsMigrated) {
+      if (await this.canMigrateStartupSecrets()) await this.persistData()
+      else this.secretsMigrated = false
+    }
 
     // Keep retry deadlines in two checksummed, private plugin-data slots.
     // A new client (or next Obsidian start) inherits the same token quota.
@@ -257,6 +261,28 @@ export default class FastSync extends Plugin {
     return `${prefix}-${Array.from(bytes, byte => byte.toString(16).padStart(2, "0")).join("")}`
   }
 
+  /** Startup runs before V4 runtime exists; inspect the actual vault adapter fence. */
+  private async canMigrateStartupSecrets(): Promise<boolean> {
+    const vault = this.app?.vault as typeof this.app.vault & {
+      configDir?: string
+      adapter?: { exists(path: string): Promise<boolean> }
+    }
+    const adapter = vault?.adapter
+    const manifestId = this.manifest?.id
+    const configDir = vault?.configDir || ".obsidian"
+    if (!adapter || typeof adapter.exists !== "function" || !manifestId) return false
+    const root = `${configDir}/plugins/${manifestId}`
+    try {
+      await assertV4ReencryptionSyncFenceClear({
+        exists: path => adapter.exists(`${root}/${path}`),
+      })
+    } catch {
+      return false
+    }
+    return this.app.vault.adapter === adapter && this.manifest.id === manifestId
+      && (this.app.vault.configDir || ".obsidian") === configDir
+  }
+
   async loadSettings() {
     const data = await this.loadData() ?? {};
     // Backward compatibility: older versions stored settings fields directly at the top level
@@ -264,6 +290,12 @@ export default class FastSync extends Plugin {
     const merged = Object.assign({}, DEFAULT_SETTINGS, savedSettings);
     // Validate persisted runtime data before any legacy secret migration writes.
     assertPluginSettingsRuntimeSafe(merged)
+    if (!await this.canMigrateStartupSecrets()) {
+      // Fenced startup must not overwrite existing SecretStorage values.
+      this.settings = hydrateV4SecretsReadOnly(merged, this.app.secretStorage) as PluginSettings
+      this.secretsMigrated = false
+      return
+    }
     const result = migrateV4Secrets(
       merged,
       this.app.secretStorage,

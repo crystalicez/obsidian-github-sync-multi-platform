@@ -26,6 +26,85 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
+test("D226 installed startup never rewrites legacy secrets or plugin data under a migration fence", async () => {
+  const root = ".obsidian/plugins/test/github-sync-v4-rekey-sync-fence";
+  const scenarios = [
+    { name: "clear startup migrates", paths: [], inaccessible: false, allowed: true },
+    { name: "root only", paths: [root], inaccessible: false },
+    { name: "marker only", paths: [root + "/active.json"], inaccessible: false },
+    { name: "root and marker", paths: [root, root + "/active.json"], inaccessible: false },
+    { name: "modern backed secrets under fence", paths: [root], inaccessible: false, modern: true },
+    { name: "fence storage unreadable", paths: [], inaccessible: true },
+  ];
+  for (const scenario of scenarios) {
+    const stored = new Map<string, string>([
+      ["github-token-original", "original-token"],
+      ["encryption-passphrase-original", "original-passphrase"],
+    ]);
+    const original = { ...DEFAULT_SETTINGS, githubTokenSecretId: "github-token-original",
+      encryptionPassphraseSecretId: "encryption-passphrase-original",
+      githubToken: scenario.modern ? "" : "legacy-stale-token",
+      encryptionPassphrase: scenario.modern ? "" : "legacy-stale-passphrase" };
+    const writes: unknown[] = [];
+    const secretWrites: string[] = [];
+    const paths = new Set(scenario.paths);
+    const plugin = new FastSync() as FastSync & Record<string, any>;
+    plugin.app = {
+      secretStorage: {
+        getSecret(id: string) { return stored.get(id) ?? null; },
+        setSecret(id: string, value: string) { secretWrites.push(id); stored.set(id, value); },
+      },
+      vault: {
+        configDir: ".obsidian",
+        adapter: {
+          async exists(path: string) {
+            if (scenario.inaccessible) throw new Error("fence disk unreadable");
+            return paths.has(path);
+          },
+          async read() { throw new Error("unneeded"); },
+          async write() { throw new Error("unneeded"); },
+        },
+        getFiles: () => [], on: () => ({}),
+      },
+      workspace: { onLayoutReady: (callback: () => void) => callback() },
+    } as never;
+    plugin.manifest = { id: "test" } as never;
+    plugin.loadData = async () => ({ settings: original });
+    plugin.saveData = async (value: unknown) => { writes.push(value); };
+    plugin.initGitHubClient = () => {};
+    plugin.registerScheduledSync = () => {};
+    plugin.updateRibbonIcon = () => {};
+    plugin.addSettingTab = () => {};
+    plugin.registerView = () => {};
+    plugin.addCommand = () => {};
+    plugin.registerEvent = () => {};
+    plugin.register = () => {};
+    plugin.addRibbonIcon = () => ({}) as never;
+    plugin.createV4Runtime = () => ({
+      subscribeProgress: () => () => {}, dispose() {},
+    }) as never;
+    try {
+      await plugin.onload();
+      if (scenario.allowed) {
+        assert.equal(plugin.secretsMigrated, true, scenario.name);
+        assert.equal(writes.length, 1, scenario.name + ": normal migration still persists");
+        assert.equal(stored.get("encryption-passphrase-original"), "legacy-stale-passphrase", scenario.name);
+        continue;
+      }
+      assert.equal(plugin.secretsMigrated, false, scenario.name);
+      assert.deepEqual(writes, [], scenario.name + ": no startup config write");
+      assert.deepEqual(secretWrites, [], scenario.name + ": no SecretStorage write");
+      assert.equal(stored.get("github-token-original"), "original-token", scenario.name);
+      assert.equal(stored.get("encryption-passphrase-original"), "original-passphrase", scenario.name);
+      assert.equal(plugin.settings.githubToken, "original-token", scenario.name);
+      assert.equal(plugin.settings.encryptionPassphrase, "original-passphrase",
+        scenario.name + ": existing SecretStorage ID takes priority over stale legacy plaintext");
+    } finally {
+      plugin.onunload();
+    }
+  }
+});
+
 test("v4 settings defaults keep sensitive scopes and modification guard disabled", () => {
   assert.equal(DEFAULT_SETTINGS.syncObsidianConfig, false);
   assert.equal(DEFAULT_SETTINGS.syncBookmarks, false);

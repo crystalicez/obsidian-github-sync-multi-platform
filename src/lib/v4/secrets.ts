@@ -33,6 +33,28 @@ function loadSecret(storage: SecretStorageLike, id: string): string {
   return id ? storage.getSecret(id) ?? "" : ""
 }
 
+/**
+ * Hydrate credentials without allocating IDs or writing SecretStorage.
+ * Fenced or unreadable startup recovery must not alter either old key.
+ */
+export function hydrateV4SecretsReadOnly<T extends V4SecretBackedSettings>(
+  settings: T,
+  storage: SecretStorageLike,
+): T & { githubToken: string; encryptionPassphrase: string; githubTokenSecretId: string; encryptionPassphraseSecretId: string } {
+  assertDistinctV4SecretIds(settings)
+  const githubTokenSecretId = settings.githubTokenSecretId ?? ""
+  const encryptionPassphraseSecretId = settings.encryptionPassphraseSecretId ?? ""
+  return {
+    ...settings,
+    githubTokenSecretId,
+    encryptionPassphraseSecretId,
+    githubToken: loadSecret(storage, githubTokenSecretId)
+      || (typeof settings.githubToken === "string" ? settings.githubToken : ""),
+    encryptionPassphrase: loadSecret(storage, encryptionPassphraseSecretId)
+      || (typeof settings.encryptionPassphrase === "string" ? settings.encryptionPassphrase : ""),
+  }
+}
+
 export function migrateV4Secrets<T extends V4SecretBackedSettings>(
   settings: T,
   storage: SecretStorageLike,
