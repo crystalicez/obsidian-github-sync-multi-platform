@@ -8,7 +8,7 @@ const REPO = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+#[A-Za-z0-9_./-]+$/u
 /** A migration fence is a one-way pause until independently verified recovery. */
 export class V4ReencryptionSyncFencedError extends Error {
   constructor() {
-    super("Re-encryption is pending or its local fence cannot be verified. Sync and Force operations are paused; keep the recovery files and review the migration before proceeding.")
+    super("Re-encryption is pending or its local fence cannot be verified. Sync, Force and Settings writes are paused; keep the recovery files and review the migration before proceeding.")
     this.name = "V4ReencryptionSyncFencedError"
   }
 }

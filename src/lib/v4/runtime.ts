@@ -167,6 +167,7 @@ export class V4PluginRuntime {
   private credentialGeneration = 0
   private debounceRunActive = false
   private reencryptionSyncFenced = false
+  private reencryptionFencePending = false
   private disposed = false
 
   constructor(private readonly plugin: FastSync) {
@@ -205,6 +206,25 @@ export class V4PluginRuntime {
     if (this.disposed) return
     this.credentialGeneration++
     this.keyringCache.invalidate()
+  }
+
+  /**
+   * A live Re-encryption fence preserves original Settings and BOTH keys
+   * for Manual Recovery, including after an Obsidian restart. Read the
+   * actual on-disk fence at each Settings write boundary.
+   */
+  async assertReencryptionSettingsSaveAllowed(): Promise<void> {
+    if (this.disposed || this.reencryptionSyncFenced || this.reencryptionFencePending
+      || !this.indexAdapterBacking
+      || this.plugin.app.vault.adapter !== this.indexAdapterBacking) {
+      throw new V4ReencryptionSyncFencedError()
+    }
+    await assertV4ReencryptionSyncFenceClear(this.adapter)
+    if (this.disposed || this.reencryptionSyncFenced || this.reencryptionFencePending
+      || !this.indexAdapterBacking
+      || this.plugin.app.vault.adapter !== this.indexAdapterBacking) {
+      throw new V4ReencryptionSyncFencedError()
+    }
   }
 
   private async keyringForConfig(config: V4RemoteConfig, passphrase: string, signal?: AbortSignal, generation = this.credentialGeneration): Promise<V4Keyring> {
@@ -358,7 +378,7 @@ export class V4PluginRuntime {
     }
     if (this.coordinator.isSyncing || this.coordinator.pendingCount !== 0
       || this.debounceRunActive || this.recentlyStagedPaths.size > 0
-      || this.plugin.isSyncInProgress) {
+      || this.plugin.isSyncInProgress || this.plugin.isSettingsSaveInProgress?.()) {
       throw new Error("Re-encryption requires no active, pending or staged Sync work.")
     }
     const originalGeneration = this.credentialGeneration
@@ -382,12 +402,13 @@ export class V4PluginRuntime {
         || now.encryptionPassphraseSecretId !== initial.encryptionPassphraseSecretId
         || now.githubTokenSecretId !== initial.githubTokenSecretId || now.vault !== initial.vault
         || this.debounceRunActive || this.recentlyStagedPaths.size > 0
-        || this.plugin.isSyncInProgress) {
+        || this.plugin.isSyncInProgress || this.plugin.isSettingsSaveInProgress?.()) {
         throw new Error("Re-encryption Source or Sync status changed; Manual Recovery required.")
       }
     }
     // The coordinator synchronously rejects new Syncs BEFORE the first await.
     const assertQuiescent = this.coordinator.reserveReencryptionQuiescence()
+    this.reencryptionFencePending = true
     try {
       assertPinned()
       const report = await armV4ReencryptionSyncFence({
@@ -407,6 +428,7 @@ export class V4PluginRuntime {
     } finally {
       // Even an ambiguous mkdir/write response must not restart Sync here.
       this.reencryptionSyncFenced = true
+      this.reencryptionFencePending = false
       this.plugin.disableWatch?.()
     }
   }

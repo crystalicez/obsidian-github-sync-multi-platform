@@ -33,6 +33,9 @@ export default class FastSync extends Plugin {
   startupSyncTimeout: number | null = null
   secretsMigrated: boolean = false
   private settingsSaveInProgress = false
+
+  /** Synchronously checked by the Re-encryption arming gate before disk I/O. */
+  isSettingsSaveInProgress(): boolean { return this.settingsSaveInProgress }
   private unloaded = false
   private statusDisplaySignature: string | undefined
   private cooldownStore?: V4RateLimitCooldownStore
@@ -276,6 +279,13 @@ export default class FastSync extends Plugin {
     assertPluginSettingsRuntimeSafe(nextSettings)
     if (this.settingsSaveInProgress) throw new Error("GitHub Sync: Settings save already in progress.")
     const previous = this.settings
+    const settingsRuntime = this.v4Runtime
+    const assertReencryptionSafe = async (): Promise<void> => {
+      if (this.v4Runtime !== settingsRuntime) {
+        throw new Error("Re-encryption Settings runtime changed; Manual Recovery required.")
+      }
+      await settingsRuntime?.assertReencryptionSettingsSaveAllowed?.()
+    }
     const prepared = { ...nextSettings }
     if (!prepared.githubTokenSecretId || prepared.githubToken !== previous.githubToken) {
       prepared.githubTokenSecretId = this.createSecretId("github-token")
@@ -291,6 +301,8 @@ export default class FastSync extends Plugin {
     const storage = this.app.secretStorage
     this.settingsSaveInProgress = true
     try {
+      // Preserve the original key and pinned Settings during Manual Recovery.
+      await assertReencryptionSafe()
       // Allocate immutable IDs for replacements so failed writes cannot
       // corrupt credentials still referenced by the durable previous record.
       try {
@@ -311,6 +323,7 @@ export default class FastSync extends Plugin {
         throw error
       }
       try {
+        await assertReencryptionSafe()
         await this.persistData(prepared)
       } catch (error) {
         // A rejected saveData() does NOT prove that its disk write failed.
@@ -326,6 +339,9 @@ export default class FastSync extends Plugin {
         } catch { /* Inconclusive: never scrub potentially committed keys. */ }
         if (!verifiedDurable) throw error
       }
+      // The fence may have appeared during an ambiguous disk write.
+      // Never publish changed Settings or clear the old secret in that case.
+      await assertReencryptionSafe()
       this.settings = prepared
       // In-progress sessions pin their original settings and GitHub client.
       // The next session must not reuse a derived key after credential changes.

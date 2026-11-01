@@ -447,6 +447,174 @@ function plaintextRuntimeFixture(pathInput: string | string[] = "secret.md", git
   return { runtime: new V4PluginRuntime(plugin as never), plugin, github, contents, vaultFile, vaultFiles, indexFiles, indexAdapter };
 }
 
+/**
+ * D225: FastSync Settings Save uses the actual V4 Runtime disk fence reader.
+ * The two objects intentionally share one persistent Obsidian adapter/Secret
+ * store. This exercises the installed boundary without a live user Vault.
+ */
+function d225SettingsAndRuntimeFixture() {
+  const f = plaintextRuntimeFixture()
+  const writer = new FastSync()
+  const previous = {
+    ...DEFAULT_SETTINGS, encryptionMode: "encrypted" as const,
+    vault: "device", githubOwner: "o", githubRepo: "r", githubBranch: "main",
+    githubToken: "old-token", githubTokenSecretId: "d225-old-token",
+    encryptionPassphrase: "old-pass", encryptionPassphraseSecretId: "d225-old-pass",
+  }
+  writer.settings = previous
+  const secrets = new Map<string, string>([
+    [previous.githubTokenSecretId, previous.githubToken],
+    [previous.encryptionPassphraseSecretId, previous.encryptionPassphrase],
+  ])
+  writer.app = {
+    ...f.plugin.app,
+    secretStorage: {
+      getSecret(id: string) { return secrets.get(id) ?? null },
+      setSecret(id: string, value: string) { secrets.set(id, value) },
+    },
+  } as never
+  writer.v4Runtime = f.runtime
+  writer.initGitHubClient = () => {}
+  writer.registerScheduledSync = () => {}
+  writer.updateRibbonIcon = () => {}
+  Object.assign(f.plugin.settings, previous)
+  Object.assign(f.plugin, {
+    isSettingsSaveInProgress: () => writer.isSettingsSaveInProgress(),
+    disableWatch() { f.plugin.isWatchEnabled = false },
+  })
+  let writes = 0
+  ;(writer as unknown as { saveData(data: unknown): Promise<void> }).saveData = async () => {
+    writes++
+  }
+  return {
+    f, writer, previous, secrets,
+    root: ".obsidian/plugins/test/github-sync-v4-rekey-sync-fence",
+    getWrites: () => writes,
+    setSave: (save: (data: unknown) => Promise<void>) => {
+      ;(writer as unknown as { saveData(data: unknown): Promise<void> }).saveData = async data => {
+        writes++
+        await save(data)
+      }
+    },
+  }
+}
+
+test("D225 persisted Re-encryption fence blocks Settings Save across restarts without scrubbing old keys", async () => {
+  for (const shape of ["directory", "marker", "both", "unreadable"] as const) {
+    const h = d225SettingsAndRuntimeFixture()
+    const exists = h.f.indexAdapter.exists
+    if (shape === "directory" || shape === "both") h.f.indexFiles.set(h.root, "dir")
+    if (shape === "marker" || shape === "both") h.f.indexFiles.set(h.root + "/active.json", "{torn")
+    if (shape === "unreadable") {
+      h.f.indexAdapter.exists = async path => {
+        if (path === h.root) throw Error("simulated inaccessible Vault")
+        return exists(path)
+      }
+    }
+    const restarted = new V4PluginRuntime(h.f.plugin as never)
+    h.writer.v4Runtime = restarted
+    const before = new Map(h.secrets)
+    await assert.rejects(() => h.writer.saveSettings({
+      ...h.previous, encryptionPassphrase: "rotated-secret", githubBranch: "rekey/new",
+    }), /Re-encryption is pending/i, shape)
+    assert.equal(h.getWrites(), 0, shape)
+    assert.equal(h.writer.settings, h.previous, shape)
+    assert.deepEqual(h.secrets, before, shape)
+    assert.equal(h.writer.isSettingsSaveInProgress(), false, shape)
+    restarted.dispose()
+    h.f.runtime.dispose()
+  }
+})
+
+test("D225 missing or swapped Obsidian disk adapter never permits a Settings write", async () => {
+  for (const cause of ["missing", "swapped-during-check"] as const) {
+    const h = d225SettingsAndRuntimeFixture()
+    if (cause === "missing") {
+      Object.assign(h.f.plugin.app.vault, { adapter: undefined })
+    } else {
+      const adapter = h.f.indexAdapter
+      adapter.exists = async path => {
+        if (path === h.root) {
+          Object.assign(h.f.plugin.app.vault, { adapter: { ...adapter } })
+        }
+        return false
+      }
+    }
+    const secrets = new Map(h.secrets)
+    await assert.rejects(() => h.writer.saveSettings({
+      ...h.previous, encryptionPassphrase: "rotated-secret",
+    }), /Re-encryption is pending/i, cause)
+    assert.equal(h.getWrites(), 0, cause)
+    assert.deepEqual(h.secrets, secrets, cause)
+    assert.equal(h.writer.settings, h.previous, cause)
+    h.f.runtime.dispose()
+  }
+})
+
+test("D225 a pending in-process migration fence stops Settings Save BEFORE disk root exists", async () => {
+  const h = d225SettingsAndRuntimeFixture()
+  const gate = deferred<void>()
+  const entered = deferred<void>()
+  h.f.indexAdapter.mkdir = async path => { h.f.indexFiles.set(path, "dir") }
+  const arming = h.f.runtime.armReencryptionSyncFence({
+    runId: "d225_fence_pending",
+    destinationRepoId: "o/r#rekey/d225",
+    assertExclusiveInitiatorLease: async () => {
+      entered.resolve()
+      await gate.promise
+    },
+  })
+  await entered.promise
+  assert.equal(h.f.indexFiles.has(h.root), false, "the fence is not yet written")
+  const secretsBefore = new Map(h.secrets)
+  await assert.rejects(() => h.writer.saveSettings({
+    ...h.previous, encryptionPassphrase: "rotated-secret",
+  }), /Re-encryption is pending/i)
+  assert.deepEqual(h.secrets, secretsBefore)
+  assert.equal(h.getWrites(), 0)
+  gate.resolve()
+  await arming
+  assert.equal(h.f.indexFiles.has(h.root + "/active.json"), true)
+  h.f.runtime.dispose()
+})
+
+test("D225 an in-flight Settings Save prevents starting a migration, until save settles", async () => {
+  const h = d225SettingsAndRuntimeFixture()
+  const entered = deferred<void>()
+  const release = deferred<void>()
+  h.setSave(async () => { entered.resolve(); await release.promise })
+  const saving = h.writer.saveSettings({ ...h.previous, newVaultKdfIterations: 900_000 })
+  await entered.promise
+  assert.equal(h.writer.isSettingsSaveInProgress(), true)
+  await assert.rejects(() => h.f.runtime.armReencryptionSyncFence({
+    runId: "d225_block_by_save",
+    destinationRepoId: "o/r#rekey/d225",
+    assertExclusiveInitiatorLease: async () => { throw Error("never acquired") },
+  }), /active|pending|staged|Settings/i)
+  assert.equal(h.f.indexFiles.has(h.root), false)
+  release.resolve()
+  await saving
+  assert.equal(h.writer.settings.newVaultKdfIterations, 900_000)
+  assert.equal(h.writer.isSettingsSaveInProgress(), false)
+  h.f.runtime.dispose()
+})
+
+test("D225 a fence appearing DURING Settings disk write retains both old and new keys for Manual Recovery", async () => {
+  const h = d225SettingsAndRuntimeFixture()
+  h.setSave(async () => { h.f.indexFiles.set(h.root, "dir") })
+  const before = new Map(h.secrets)
+  await assert.rejects(() => h.writer.saveSettings({
+    ...h.previous, encryptionPassphrase: "rotated-secret",
+  }), /Re-encryption is pending/i)
+  assert.equal(h.getWrites(), 1, "ambiguous settings save may already have committed")
+  assert.equal(h.writer.settings, h.previous, "never publish a new in-memory branch after the fence appears")
+  assert.equal(h.secrets.get(h.previous.encryptionPassphraseSecretId), before.get(h.previous.encryptionPassphraseSecretId))
+  assert.ok([...h.secrets.values()].includes("rotated-secret"),
+    "the replacement key might be referenced by an already persisted Settings file")
+  assert.equal(h.writer.isSettingsSaveInProgress(), false)
+  h.f.runtime.dispose()
+})
+
 function runtimeRemoteIndexRecords(github: RuntimeMemoryGitHub): V4IndexFileRecord[] {
   return [...github.files]
     .filter(([path]) => path.startsWith(`${V4_ROOT}/index/`) && path.endsWith(".json"))
