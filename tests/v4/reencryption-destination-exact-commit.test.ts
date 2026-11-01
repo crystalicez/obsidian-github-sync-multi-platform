@@ -1192,6 +1192,52 @@ test("D217 one held lease covers local crash windows, full Destination and two f
   assert.equal(result.oldPassphraseCleanupAuthorized, false)
 })
 
+test("D218 complete restart proof accepts a second device advancing only the old Source during Backup verification", async () => {
+  const f = await d179Scenario()
+  const { contract } = await d183PreparedPair(f)
+  const b = await d217CurrentFrozenBackup(f)
+  const source = f.input.full.branches.readers.source
+  let sourceSha = f.id.sourceCommitSha
+  let sourceRefReads = 0
+  const advancedSha = "9".repeat(40)
+  source.getGitRefOrNull = async () => {
+    sourceRefReads++
+    return { ref: "refs/heads/main", type: "commit", sha: sourceSha }
+  }
+  source.getGitCommit = async sha => sha === advancedSha
+    ? { sha, treeSha: "8".repeat(40), parentShas: [f.id.sourceCommitSha], message: "other-device-sync" }
+    : { sha: f.id.sourceCommitSha, treeSha: f.id.sourceTreeSha,
+      parentShas: ["1".repeat(40)], message: "original" }
+  const originalBlob = b.github.getBlob
+  let switched = false
+  b.github.getBlob = async sha => {
+    const bytes = await originalBlob(sha)
+    if (!switched) {
+      switched = true
+      sourceSha = advancedSha
+    }
+    return bytes
+  }
+  const before = new Map(f.s.files)
+  const writes = f.s.getWrites()
+  const calls = f.s.holderCounts().calls
+  const result = await inspectV4FencedLivePostCrashAndBackupAfterRestart({
+    ...d185Input(f, contract), backup: b.backup,
+  })
+  assert.equal(switched, true)
+  assert.ok(sourceRefReads >= 4, "both D178 full scans still check current Source")
+  assert.equal(result.observation, "source-prepared-and-git-reverified-uncommitted")
+  assert.equal(result.fullBackupContentReverifiedAfterRestart, true)
+  assert.equal(result.fullDestinationContentReverifiedAfterRestart, true)
+  assert.equal(result.localCutoverAuthorized, false)
+  assert.equal(result.resumeSyncAuthorized, false)
+  assert.equal(result.oldPassphraseCleanupAuthorized, false)
+  assert.equal(f.s.holderCounts().calls, calls + 1)
+  assert.equal(f.s.holderCounts().held, false)
+  assert.deepEqual(f.s.files, before)
+  assert.equal(f.s.getWrites(), writes)
+})
+
 test("D217 late Backup HEAD change or damaged ciphertext fails the complete composed proof", async () => {
   for (const caseName of ["backup-ref", "backup-blob"] as const) {
     const f = await d179Scenario()

@@ -37,7 +37,10 @@ export interface V4FencedThreeBranchRevalidationInput {
 
 export interface V4FencedThreeBranchRevalidationReport {
   readonly integrityScope: "read-only-current-git-refs-and-authenticated-uncommitted-wal"
-  readonly observation: "three-refs-match-pinned-wal-uncommitted" | "manual-recovery-required"
+  readonly observation:
+    | "three-refs-match-pinned-wal-uncommitted"
+    | "backup-destination-pinned-source-independent-uncommitted"
+    | "manual-recovery-required"
   readonly evidence: "best-effort-wal-readback-not-power-loss-durable"
   readonly completeRemoteContentReverified: false
   readonly localCutoverAuthorized: false
@@ -61,16 +64,22 @@ const MANUAL: V4FencedThreeBranchRevalidationReport =
   Object.freeze({ ...BASE, observation: "manual-recovery-required" })
 const OBSERVED: V4FencedThreeBranchRevalidationReport =
   Object.freeze({ ...BASE, observation: "three-refs-match-pinned-wal-uncommitted" })
+const SOURCE_INDEPENDENT: V4FencedThreeBranchRevalidationReport =
+  Object.freeze({ ...BASE, observation: "backup-destination-pinned-source-independent-uncommitted" })
 
 const ROLES = ["source", "backup", "destination"] as const
+const SHA = /^[0-9a-f]{40}$/u
 
 /**
- * D177 read-only gate between historical D100 remote publication and the
- * D176 prepared Selector. Checks the actual Git refs twice under the caller's
- * cooperative lease, with authenticated best-effort WAL and the D173 fence.
+ * D177/D218 read-only gate between historical D100 publication and the
+ * D176 prepared Selector. Checks all Git refs twice under the initiating
+ * device lease with authenticated best-effort WAL and the D173 fence.
+ * Only the frozen Backup and orphan Destination stay pinned: D90 permits an
+ * independent Source HEAD, which must still name a readable, well-formed
+ * commit. This does NOT prove Source ancestry or guard against remote ABA.
  *
- * This is NOT a replacement for full Git ciphertext / plaintext parity:
- * matching branch refs and commit trees do not authenticate remote content.
+ * This is NOT a replacement for full Git ciphertext/plaintext parity:
+ * matching immutable Backup/Destination refs do not authenticate content.
  * It never publishes, switches settings, creates receipts or resumes Sync.
  */
 export async function inspectV4FencedThreeBranchPublicationAfterRestart(
@@ -198,6 +207,7 @@ export async function inspectV4FencedThreeBranchPublicationAfterRestart(
   }
   const checkRemote = async () => {
     const branchNames = new Set<string>()
+    let sourceAdvanced = false
     for (const m of pinnedMethods) {
       await assertHeld()
       const repo = await m.repo.call(m.client)
@@ -212,21 +222,29 @@ export async function inspectV4FencedThreeBranchPublicationAfterRestart(
       }
       branchNames.add(defaultBranch)
       const ref = await m.ref.call(m.client)
-      const sha = m.role === "destination" ? identity.destinationCommitSha : identity.sourceCommitSha
+      // D90: Source remains independently writable on other devices.
+      // Only Backup and Destination are frozen to the migration-pinned SHA.
+      const sha = m.role === "source" ? ref?.sha
+        : m.role === "destination" ? identity.destinationCommitSha : identity.sourceCommitSha
       if (!unchanged() || ref?.ref !== `refs/heads/${m.branch}`
-        || ref.type !== "commit" || ref.sha !== sha) {
-        throw Error("Re-encryption GitHub branch missing or moved.")
+        || ref.type !== "commit" || typeof sha !== "string"
+        || !SHA.test(sha) || ref.sha !== sha) {
+        throw Error("Re-encryption GitHub branch missing, malformed or moved.")
       }
       const commit = await m.commit.call(m.client, sha)
       const tree = m.role === "destination" ? identity.destinationTreeSha : identity.sourceTreeSha
-      if (!unchanged() || commit?.sha !== sha || commit.treeSha !== tree
+      if (!unchanged() || commit?.sha !== sha
+        || !SHA.test(commit.treeSha)
+        || (m.role !== "source" && commit.treeSha !== tree)
         || !Array.isArray(commit.parentShas)
+        || commit.parentShas.some(parent => typeof parent !== "string" || !SHA.test(parent))
         || (m.role === "destination" && commit.parentShas.length !== 0)) {
         throw Error("Re-encryption remote commit/tree/orphan proof changed.")
       }
+      if (m.role === "source" && sha !== identity.sourceCommitSha) sourceAdvanced = true
     }
     if (branchNames.size !== 1) throw Error("Re-encryption repository defaults changed during verification.")
-    return [...branchNames][0]!
+    return { defaultBranch: [...branchNames][0]!, sourceAdvanced }
   }
 
   let invoked = false
@@ -236,17 +254,20 @@ export async function inspectV4FencedThreeBranchPublicationAfterRestart(
       invoked = true
       await checkFence()
       const first = await checkWal()
-      const firstDefault = await checkRemote()
+      const firstRemote = await checkRemote()
       await checkFence()
-      const secondDefault = await checkRemote()
+      const secondRemote = await checkRemote()
       const second = await checkWal()
       await checkFence()
-      if (!unchanged() || first !== second || firstDefault !== secondDefault) {
+      if (!unchanged() || first !== second
+        || firstRemote.defaultBranch !== secondRemote.defaultBranch) {
         throw Error("Re-encryption remote and WAL observations changed.")
       }
-      return OBSERVED
+      return firstRemote.sourceAdvanced || secondRemote.sourceAdvanced
+        ? SOURCE_INDEPENDENT : OBSERVED
     })
-    return invoked && unchanged() && report === OBSERVED ? OBSERVED : MANUAL
+    return invoked && unchanged()
+      && (report === OBSERVED || report === SOURCE_INDEPENDENT) ? report : MANUAL
   } catch {
     return MANUAL
   }

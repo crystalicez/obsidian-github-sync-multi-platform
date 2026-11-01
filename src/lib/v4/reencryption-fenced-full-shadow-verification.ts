@@ -48,7 +48,7 @@ const OBSERVED: V4FencedFullRemoteShadowReport = Object.freeze({
 
 /**
  * D178 non-mutating composition:
- *   D177 pinned three branches + Fence + WAL
+ *   D177/D218 readable independent Source + pinned Backup/Destination + Fence + WAL
  *   D137 full encrypted Git tree / every ciphertext blob / decrypted SHA
  *        bound to the immutable local destination Shadow
  *   D177 second full three-branch observation + WAL and Fence
@@ -214,9 +214,10 @@ export async function inspectV4FencedFullRemoteShadowAfterRestart(
     const report = await inspectV4FencedThreeBranchPublicationAfterRestart({
       ...branches, withExclusiveInitiatorLease: borrowed,
     })
-    if (report.observation !== "three-refs-match-pinned-wal-uncommitted"
+    if ((report.observation !== "three-refs-match-pinned-wal-uncommitted"
+        && report.observation !== "backup-destination-pinned-source-independent-uncommitted")
       || report.completeRemoteContentReverified !== false
-      || !unchanged()) throw Error("D178 three branches no longer match pinned WAL.")
+      || !unchanged()) throw Error("D178 frozen Backup/Destination or Source branch proof no longer matches WAL.")
   }
 
   let invoked = false

@@ -218,8 +218,86 @@ test("D177 missing or foreign Fence, wrong run, stale reports and missing acknow
   assert.equal(s.writes, before)
 })
 
-test("D177 moved Source/Backup/Destination ref and wrong orphan tree/parents always require manual recovery", async () => {
-  for (const role of ["source", "backup", "destination"] as const) {
+test("D218 independently advanced Source HEAD remains readable while frozen Backup and Destination stay pinned", async () => {
+  const s = fixture()
+  await s.arm()
+  const before = new Map(s.files)
+  const writes = s.writes
+  s.states.source.sha = "9".repeat(40)
+  s.states.source.tree = "8".repeat(40)
+  s.states.source.parents = [identity.sourceCommitSha]
+  const result = await inspectV4FencedThreeBranchPublicationAfterRestart(s.input())
+  assert.equal(result.observation, "backup-destination-pinned-source-independent-uncommitted")
+  assert.equal(result.localCutoverAuthorized, false)
+  assert.equal(result.resumeSyncAuthorized, false)
+  assert.equal(result.remoteWritesAuthorized, false)
+  assert.equal(result.oldPassphraseCleanupAuthorized, false)
+  assert.deepEqual(s.files, before)
+  assert.equal(s.writes, writes)
+})
+
+test("D218 Source can advance again between live ref scans without masquerading as a frozen Backup", async () => {
+  const s = fixture()
+  await s.arm()
+  let reads = 0
+  const source = s.readers.source
+  const original = source.getGitRefOrNull
+  source.getGitRefOrNull = async () => {
+    reads++
+    s.states.source.sha = reads === 1 ? "9".repeat(40) : "8".repeat(40)
+    s.states.source.tree = reads === 1 ? "7".repeat(40) : "6".repeat(40)
+    s.states.source.parents = [identity.sourceCommitSha]
+    return original.call(source)
+  }
+  const result = await inspectV4FencedThreeBranchPublicationAfterRestart(s.input())
+  assert.equal(reads, 2)
+  assert.equal(result.observation, "backup-destination-pinned-source-independent-uncommitted")
+  assert.equal(result.completeRemoteContentReverified, false)
+  assert.equal(result.localCutoverAuthorized, false)
+})
+
+test("D218 an independent Source advance does not excuse a moved frozen Backup or Destination", async () => {
+  for (const frozen of ["backup", "destination"] as const) {
+    const s = fixture()
+    await s.arm()
+    s.states.source.sha = "9".repeat(40)
+    s.states.source.tree = "8".repeat(40)
+    s.states.source.parents = [identity.sourceCommitSha]
+    s.states[frozen].sha = "7".repeat(40)
+    const result = await inspectV4FencedThreeBranchPublicationAfterRestart(s.input())
+    assert.equal(result.observation, "manual-recovery-required", frozen)
+    assert.equal(result.localCutoverAuthorized, false, frozen)
+    assert.equal(result.remoteWritesAuthorized, false, frozen)
+  }
+})
+
+test("D218 missing, malformed and mismatched independent Source refs or commits still fail closed", async () => {
+  for (const cause of ["short-ref", "wrong-ref", "missing-ref", "wrong-commit", "bad-tree", "bad-parent"] as const) {
+    const s = fixture()
+    await s.arm()
+    if (cause === "short-ref") s.states.source.sha = "HEAD"
+    else if (cause === "wrong-ref") {
+      s.readers.source.getGitRefOrNull = async () => ({
+        ref: "refs/heads/other", sha: "9".repeat(40), type: "commit",
+      })
+    } else if (cause === "missing-ref") s.readers.source.getGitRefOrNull = async () => null
+    else if (cause === "wrong-commit") {
+      s.states.source.sha = "9".repeat(40)
+      s.readers.source.getGitCommit = async () => ({
+        sha: "7".repeat(40), treeSha: "8".repeat(40),
+        parentShas: [identity.sourceCommitSha], message: "",
+      })
+    } else if (cause === "bad-tree") s.states.source.tree = "bad-tree"
+    else s.states.source.parents = ["not-sha"]
+    const result = await inspectV4FencedThreeBranchPublicationAfterRestart(s.input())
+    assert.equal(result.observation, "manual-recovery-required", cause)
+    assert.equal(result.localCutoverAuthorized, false)
+    assert.equal(result.resumeSyncAuthorized, false)
+  }
+})
+
+test("D218 moved frozen Backup/Destination ref and wrong orphan tree/parents always require manual recovery", async () => {
+  for (const role of ["backup", "destination"] as const) {
     const s = fixture()
     await s.arm()
     s.states[role].sha = "9".repeat(40)
@@ -283,10 +361,10 @@ test("D177 a moved branch or changed default between complete read passes denies
     await s.arm()
     let count = 0
     if (mutation === "second-ref") {
-      const original = s.readers.source.getGitRefOrNull
-      s.readers.source.getGitRefOrNull = async () => {
+      const original = s.readers.backup.getGitRefOrNull
+      s.readers.backup.getGitRefOrNull = async () => {
         count++
-        const ref = await original.call(s.readers.source)
+        const ref = await original.call(s.readers.backup)
         return count === 2 && ref ? { ...ref, sha: "8".repeat(40) } : ref
       }
     } else {
