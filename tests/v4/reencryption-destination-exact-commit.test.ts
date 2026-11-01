@@ -18,7 +18,9 @@ import type { V4ThreeBranchPublicationReport } from "../../src/lib/v4/reencrypti
 import { inspectV4ReencryptionCrossSurfaceProof } from "../../src/lib/v4/reencryption-cross-surface-proof"
 import { inspectV4FencedPrecommitReadinessAfterRestart } from "../../src/lib/v4/reencryption-fenced-precommit-readiness"
 import { inspectV4FencedCrashWindowPairAfterRestart } from "../../src/lib/v4/reencryption-fenced-crash-window-pair-inspection"
-import { inspectV4FencedLivePostCrashAfterRestart } from "../../src/lib/v4/reencryption-fenced-live-post-crash-verification"
+import { inspectV4FencedLivePostCrashAfterRestart, inspectV4FencedLivePostCrashAndBackupAfterRestart } from "../../src/lib/v4/reencryption-fenced-live-post-crash-verification"
+import type { V4FencedFrozenBackupContentInput } from "../../src/lib/v4/reencryption-fenced-backup-content"
+import { proposeV4SameRepositoryReencryptionBackupBranch } from "../../src/lib/v4/reencryption-owner-decisions"
 import { inspectV4FencedLocalCrashTriageAfterRestart } from "../../src/lib/v4/reencryption-fenced-local-crash-triage"
 import { deriveV4FencedCommitPairSnapshotTestContract, inspectV4FencedCommitPairSnapshotTestVectors } from "../../src/lib/v4/reencryption-fenced-commit-pair-snapshot-provenance"
 import { sealV4ReencryptionCommitPairTestVectors, type V4ReencryptionCommitPairTestContract } from "../../src/lib/v4/reencryption-commit-pair-test-vectors"
@@ -1056,6 +1058,261 @@ async function d185PlacePairedEvidence(
     pair.selectorTestVector,
   )
 }
+
+async function d217CurrentFrozenBackup(f: Awaited<ReturnType<typeof d179Scenario>>) {
+  const oldPassphrase = f.s.secrets.get(f.id.sourcePassphraseSecretId)
+  assert.ok(oldPassphrase)
+  const oldConfig = config(original, "d217-original-salt")
+  const keyring = await deriveV4Keyring({
+    repoId: original, passphrase: oldPassphrase, salt: enc("d217-original-salt"),
+    iterations: oldConfig.kdfParams!.iterations,
+  })
+  const codec = new V4StorageCodec({ mode: "encrypted", pathLayout: "opaque-stable-v1", keyring })
+  const originalFile = await codec.prepare("Original/秘密 backup.md", enc("recovery original"), "v1", 8, "d217-original-file")
+  const record = { ...originalFile.record, path: "Original/秘密 backup.md" }
+  const bucket = record.pathId.slice(0, 2)
+  const oldHead: V4RemoteHead = {
+    formatVersion: 4, mode: "encrypted", epoch: 1, generation: 1,
+    journalId: "d217", deviceId: f.id.deviceId, updatedAt: 8,
+    shardHashes: { [bucket]: await sha256Hex(enc(JSON.stringify([record]))) },
+  }
+  const files = [...await buildV4RemoteMetadata({
+    config: oldConfig, head: oldHead, records: [record], keyring,
+  }), ...originalFile.files]
+
+  // Synthesize immutable Git trees, but run the REAL D94 AES-GCM decoder,
+  // Git blob identity checks and complete plaintext SHA verifier.
+  const blobs = new Map(files.map(file => [computeV4GitBlobSha1(file.bytes), file.bytes.slice()]))
+  type GitEntry = { path: string; mode: "100644" | "040000"; type: "blob" | "tree"; sha: string; url: string }
+  const trees = new Map<string, GitEntry[]>()
+  const dirs = new Map<string, string>([["", sourceTree]])
+  let nextTree = 1000
+  for (const file of files) {
+    const parts = file.path.split("/")
+    let dir = ""
+    for (const part of parts.slice(0, -1)) {
+      const path = dir ? dir + "/" + part : part
+      if (!dirs.has(path)) {
+        const sha = (++nextTree).toString(16).padStart(40, "0")
+        const parentSha = dirs.get(dir)!
+        trees.set(parentSha, [...trees.get(parentSha) ?? [],
+          { path: part, sha, type: "tree", mode: "040000", url: "" }])
+        dirs.set(path, sha)
+      }
+      dir = path
+    }
+    const parentSha = dirs.get(dir)!
+    trees.set(parentSha, [...trees.get(parentSha) ?? [],
+      { path: parts[parts.length - 1]!, type: "blob", mode: "100644",
+        sha: computeV4GitBlobSha1(file.bytes), url: "" }])
+  }
+  let blobReads = 0
+  let refReads = 0
+  let observedBackupSha = pinned
+  let corruptAfterFirstPass = false
+  let breakRefAfterFirstPass = false
+  const github = {
+    branchName: f.id.backupRepoId.split("#")[1]!,
+    async getRepositoryIdentity() { return { id: 88, fullName: "owner/repo" } },
+    async getGitRef() {
+      refReads++
+      return {
+        ref: "refs/heads/" + f.id.backupRepoId.split("#")[1]!,
+        type: "commit" as const,
+        sha: breakRefAfterFirstPass && refReads > 2 ? "9".repeat(40) : observedBackupSha,
+      }
+    },
+    async getGitCommit(sha: string) {
+      if (sha !== pinned) throw Error("changed immutable Backup commit")
+      return { sha, treeSha: sourceTree, parentShas: ["1".repeat(40)], message: "frozen backup" }
+    },
+    async getTreeAt(sha: string, recursive?: boolean) {
+      assert.equal(recursive, false)
+      const tree = trees.get(sha)
+      if (!tree) throw Error("missing original source tree")
+      return { sha, url: "", truncated: false, tree }
+    },
+    async getBlob(sha: string) {
+      blobReads++
+      const original = blobs.get(sha)
+      if (!original) throw Error("missing original object")
+      const copy = original.slice()
+      if (corruptAfterFirstPass && blobReads > blobs.size) copy[0] ^= 1
+      return copy
+    },
+  }
+  const proposal = proposeV4SameRepositoryReencryptionBackupBranch({
+    sourceRepoId: f.id.sourceRepoId, backupRepoId: f.id.backupRepoId,
+    destinationRepoId: f.id.destinationRepoId, pinnedSourceCommitSha: f.id.sourceCommitSha,
+    sourcePhysicalRepositoryId: 88, backupPhysicalRepositoryId: 88,
+    destinationPhysicalRepositoryId: 88, expectedPhysicalRepositoryId: 88,
+    defaultBranch: "main",
+  })
+  const backup: V4FencedFrozenBackupContentInput = {
+    identity: f.id, adapter: f.s.adapter,
+    wal: f.input.full.branches.wal, journal: f.input.full.branches.journal,
+    assertExclusiveInitiatorLease: f.prepared.restart.assertExclusiveInitiatorLease,
+    withExclusiveInitiatorLease: f.prepared.withExclusiveInitiatorLease,
+    backup: { github, plan: proposal, passphrase: oldPassphrase,
+      expectedSourceTreeSha: f.id.sourceTreeSha },
+  }
+  return {
+    backup, github,
+    get blobReads() { return blobReads }, get refReads() { return refReads },
+    corruptAfterFirstPass() { corruptAfterFirstPass = true },
+    moveRefAfterFirstPass() { breakRefAfterFirstPass = true },
+    setRef(sha: string) { observedBackupSha = sha },
+  }
+}
+
+test("D217 one held lease covers local crash windows, full Destination and two fresh frozen Backup scans", async () => {
+  const f = await d179Scenario()
+  const { contract } = await d183PreparedPair(f)
+  const b = await d217CurrentFrozenBackup(f)
+  const files = new Map(f.s.files)
+  const writes = f.s.getWrites()
+  const calls = f.s.holderCounts().calls
+  const input = { ...d185Input(f, contract), backup: b.backup }
+  const result = await inspectV4FencedLivePostCrashAndBackupAfterRestart(input)
+  assert.equal(result.observation, "source-prepared-and-git-reverified-uncommitted")
+  assert.equal(result.fullDestinationContentReverifiedAfterRestart, true)
+  assert.equal(result.fullBackupContentReverifiedAfterRestart, true)
+  assert.equal(result.liveThreeBranchRefsReverifiedAfterRestart, true)
+  assert.equal(result.integrityScope, "read-only-post-crash-local-current-full-git-and-frozen-backup")
+  assert.ok(b.blobReads >= 8, "two independent passes through real AES-GCM Backup")
+  assert.ok(b.refReads >= 4)
+  assert.equal(f.s.holderCounts().calls, calls + 1, "never recursively acquire outer lease")
+  assert.equal(f.s.holderCounts().held, false)
+  assert.deepEqual(f.s.files, files)
+  assert.equal(f.s.getWrites(), writes)
+  assert.equal(result.localCutoverAuthorized, false)
+  assert.equal(result.resumeSyncAuthorized, false)
+  assert.equal(result.rollbackAuthorized, false)
+  assert.equal(result.remoteWritesAuthorized, false)
+  assert.equal(result.oldPassphraseCleanupAuthorized, false)
+})
+
+test("D217 late Backup HEAD change or damaged ciphertext fails the complete composed proof", async () => {
+  for (const caseName of ["backup-ref", "backup-blob"] as const) {
+    const f = await d179Scenario()
+    const { contract } = await d183PreparedPair(f)
+    const b = await d217CurrentFrozenBackup(f)
+    if (caseName === "backup-ref") b.moveRefAfterFirstPass()
+    else b.corruptAfterFirstPass()
+    const before = f.s.getWrites()
+    const result = await inspectV4FencedLivePostCrashAndBackupAfterRestart({
+      ...d185Input(f, contract), backup: b.backup,
+    })
+    assert.equal(result.observation, "manual-recovery-required", caseName)
+    assert.equal(result.fullBackupContentReverifiedAfterRestart, false, caseName)
+    assert.equal(result.fullDestinationContentReverifiedAfterRestart, false, caseName)
+    assert.equal(result.localCutoverAuthorized, false, caseName)
+    assert.equal(result.resumeSyncAuthorized, false, caseName)
+    assert.ok(b.blobReads >= 4, "the first Backup pass must read real encrypted content")
+    assert.equal(f.s.getWrites(), before)
+    assert.equal(f.s.holderCounts().held, false)
+  }
+})
+
+test("D217 mismatched WAL/adapter/holder or Backup Secret fails before any Git read", async () => {
+  for (const cause of ["wal", "adapter", "holder", "secret", "physical-repo"] as const) {
+    const f = await d179Scenario()
+    const { contract } = await d183PreparedPair(f)
+    const b = await d217CurrentFrozenBackup(f)
+    if (cause === "wal") Object.assign(b.backup, {
+      wal: { ...b.backup.wal, assertBestEffortCheckpoint: async () => "best-effort-readback-only" },
+    })
+    else if (cause === "adapter") Object.assign(b.backup, {
+      adapter: { ...b.backup.adapter },
+    })
+    else if (cause === "holder") Object.assign(b.backup, {
+      withExclusiveInitiatorLease: async <T>(body: () => Promise<T>) => body(),
+    })
+    else if (cause === "secret") Object.assign(b.backup.backup, { passphrase: "different-passphrase" })
+    else Object.assign(b.backup.backup, {
+      plan: { ...b.backup.backup.plan, physicalRepositoryId: 999 },
+    })
+    const before = f.s.getWrites()
+    const result = await inspectV4FencedLivePostCrashAndBackupAfterRestart({
+      ...d185Input(f, contract), backup: b.backup,
+    })
+    assert.equal(result.observation, "manual-recovery-required", cause)
+    assert.equal(result.fullBackupContentReverifiedAfterRestart, false, cause)
+    assert.equal(b.blobReads, 0, cause)
+    assert.equal(f.s.getWrites(), before)
+    assert.equal(f.s.holderCounts().held, false)
+  }
+})
+
+test("D217 local SecretStorage or WAL changing during Backup decrypt invalidates the unified proof", async () => {
+  for (const cause of ["secret", "wal"] as const) {
+    const f = await d179Scenario()
+    const { contract } = await d183PreparedPair(f)
+    const b = await d217CurrentFrozenBackup(f)
+    const originalBlob = b.github.getBlob
+    let changed = false
+    b.github.getBlob = async sha => {
+      const bytes = await originalBlob(sha)
+      if (!changed) {
+        changed = true
+        if (cause === "secret") f.s.secrets.set(f.id.destinationPassphraseSecretId, "changed")
+        else f.s.setWal({ ...f.s.getWal(), generation: 777 })
+      }
+      return bytes
+    }
+    const writes = f.s.getWrites()
+    const result = await inspectV4FencedLivePostCrashAndBackupAfterRestart({
+      ...d185Input(f, contract), backup: b.backup,
+    })
+    assert.equal(changed, true, cause)
+    assert.equal(result.observation, "manual-recovery-required", cause)
+    assert.equal(result.fullBackupContentReverifiedAfterRestart, false, cause)
+    assert.equal(result.localCutoverAuthorized, false, cause)
+    assert.equal(result.oldPassphraseCleanupAuthorized, false, cause)
+    assert.equal(f.s.getWrites(), writes, cause)
+    assert.equal(f.s.holderCounts().held, false, cause)
+  }
+})
+
+test("D217 a post-holder Backup Git reader swap cannot certify an earlier coherent snapshot", async () => {
+  const f = await d179Scenario()
+  const { contract } = await d183PreparedPair(f)
+  const b = await d217CurrentFrozenBackup(f)
+  const original = f.prepared.withExclusiveInitiatorLease
+  const wrapper = async <T>(body: () => Promise<T>): Promise<T> =>
+    original(async () => {
+      const result = await body()
+      b.github.getGitRef = async () => ({
+        ref: "refs/heads/" + b.github.branchName,
+        type: "commit" as const, sha: "9".repeat(40),
+      })
+      return result
+    })
+  f.prepared.withExclusiveInitiatorLease = wrapper
+  f.input.full.branches.withExclusiveInitiatorLease = wrapper
+  Object.assign(b.backup, { withExclusiveInitiatorLease: wrapper })
+  const writes = f.s.getWrites()
+  const result = await inspectV4FencedLivePostCrashAndBackupAfterRestart({
+    ...d185Input(f, contract), backup: b.backup,
+  })
+  assert.ok(b.blobReads >= 8)
+  assert.equal(result.observation, "manual-recovery-required")
+  assert.equal(result.fullBackupContentReverifiedAfterRestart, false)
+  assert.equal(result.localCutoverAuthorized, false)
+  assert.equal(f.s.getWrites(), writes)
+  assert.equal(f.s.holderCounts().held, false)
+})
+
+test("D217 absent Backup never falls back to the legacy D185 partial proof", async () => {
+  const f = await d179Scenario()
+  const { contract } = await d183PreparedPair(f)
+  const result = await inspectV4FencedLivePostCrashAndBackupAfterRestart({
+    ...d185Input(f, contract), backup: undefined as never,
+  })
+  assert.equal(result.observation, "manual-recovery-required")
+  assert.equal(result.fullBackupContentReverifiedAfterRestart, false)
+  assert.equal(result.localCutoverAuthorized, false)
+})
 
 test("D185 single held lease brackets local post-crash readback with two fresh complete Destination Git scans", async () => {
   const f = await d179Scenario()

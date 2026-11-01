@@ -1,4 +1,5 @@
 import { toBase64 } from "../bytes"
+import { inspectV4FencedFrozenBackupContentAfterRestart, type V4FencedFrozenBackupContentInput } from "./reencryption-fenced-backup-content"
 import {
   inspectV4FencedCrashWindowPairAfterRestart,
   type V4FencedCrashWindowPairInput,
@@ -22,6 +23,10 @@ export interface V4FencedLivePostCrashInput {
   readonly remote: V4FencedFullRemoteShadowInput
 }
 
+export interface V4FencedLivePostCrashAndBackupInput extends V4FencedLivePostCrashInput {
+  readonly backup: V4FencedFrozenBackupContentInput
+}
+
 export interface V4FencedLivePostCrashReport {
   readonly integrityScope: "read-only-post-crash-local-pair-and-current-complete-git"
   readonly evidence: "best-effort-wal-readback-not-power-loss-durable"
@@ -43,6 +48,11 @@ export interface V4FencedLivePostCrashReport {
   readonly oldPassphraseCleanupAuthorized: false
 }
 
+export interface V4FencedLivePostCrashAndBackupReport extends Omit<V4FencedLivePostCrashReport, "integrityScope"> {
+  readonly integrityScope: "read-only-post-crash-local-current-full-git-and-frozen-backup"
+  readonly fullBackupContentReverifiedAfterRestart: boolean
+}
+
 const BASE = Object.freeze({
   integrityScope: "read-only-post-crash-local-pair-and-current-complete-git" as const,
   evidence: "best-effort-wal-readback-not-power-loss-durable" as const,
@@ -60,6 +70,12 @@ const UNCERTAIN: V4FencedLivePostCrashReport = Object.freeze({
   fullDestinationContentReverifiedAfterRestart: false,
   liveThreeBranchRefsReverifiedAfterRestart: false,
 })
+const BACKUP_UNCERTAIN: V4FencedLivePostCrashAndBackupReport = Object.freeze({
+  ...UNCERTAIN,
+  integrityScope: "read-only-post-crash-local-current-full-git-and-frozen-backup",
+  fullBackupContentReverifiedAfterRestart: false,
+})
+
 function report(local: V4FencedCrashWindowPairReport): V4FencedLivePostCrashReport {
   const source = local.observation === "source-prepared-uncommitted"
     && local.artifactWindow === "absent"
@@ -86,9 +102,11 @@ function report(local: V4FencedCrashWindowPairReport): V4FencedLivePostCrashRepo
  * state, is still MANUAL ONLY. Physical crash durability and noncooperating
  * Git writers are NOT established by this readback.
  */
-export async function inspectV4FencedLivePostCrashAfterRestart(
+async function inspectPostCrash(
   input: V4FencedLivePostCrashInput,
-): Promise<V4FencedLivePostCrashReport> {
+  backup?: V4FencedFrozenBackupContentInput,
+): Promise<V4FencedLivePostCrashReport | V4FencedLivePostCrashAndBackupReport> {
+  const uncertain = backup ? BACKUP_UNCERTAIN : UNCERTAIN
   const local = input?.local
   const remote = input?.remote
   const prepared = local?.prepared
@@ -97,7 +115,7 @@ export async function inspectV4FencedLivePostCrashAfterRestart(
   const shadow = remote?.shadow
   const contract = local?.contract
   const id = contract?.identity
-  if (!restart || !branches || !shadow || !contract || !id || !prepared) return UNCERTAIN
+  if (!restart || !branches || !shadow || !contract || !id || !prepared) return uncertain
 
   const holder = prepared.withExclusiveInitiatorLease
   const lease = restart.assertExclusiveInitiatorLease
@@ -123,15 +141,71 @@ export async function inspectV4FencedLivePostCrashAfterRestart(
     || JSON.stringify(id) !== JSON.stringify(branches.identity)
     || JSON.stringify(id) !== JSON.stringify(prepared.identity)
     || !gh || !Object.is(gh, readers?.destination)
-    || !readers || ROLES.some(role => !readers[role])) return UNCERTAIN
+    || !readers || ROLES.some(role => !readers[role])) return uncertain
 
   let oldSecret: string | null
   let newSecret: string | null
   try {
     oldSecret = getSecret(id.sourcePassphraseSecretId)
     newSecret = getSecret(id.destinationPassphraseSecretId)
-  } catch { return UNCERTAIN }
-  if (!oldSecret || !newSecret) return UNCERTAIN
+  } catch { return uncertain }
+  if (!oldSecret || !newSecret) return uncertain
+
+  // The strict D217 path binds the separately authenticated D94 Backup to the
+  // same D185 Run, storage, WAL, secret, and initiating-device holder.
+  const backupReader = backup?.backup
+  const backupGithub = backupReader?.github
+  const backupPlan = backupReader?.plan
+  if (backup && (!backupReader || !backupGithub || !backupPlan
+    || JSON.stringify(backup.identity) !== JSON.stringify(id)
+    || backup.adapter !== adapter || backup.wal !== wal || backup.journal !== journal
+    || backup.assertExclusiveInitiatorLease !== lease
+    || backup.withExclusiveInitiatorLease !== holder
+    || backupPlan.physicalRepositoryId !== branches.physicalRepositoryId
+    || backupPlan.sourceRepoId !== id.sourceRepoId
+    || backupPlan.backupRepoId !== id.backupRepoId
+    || backupPlan.destinationRepoId !== id.destinationRepoId
+    || backupPlan.pinnedSourceCommitSha !== id.sourceCommitSha
+    || backupReader.expectedSourceTreeSha !== id.sourceTreeSha
+    || backupReader.passphrase !== oldSecret
+    || backupGithub.branchName !== readers.backup.branchName)) return uncertain
+
+  const backupMethods = backupGithub ? {
+    identity: backupGithub.getRepositoryIdentity,
+    ref: backupGithub.getGitRef, commit: backupGithub.getGitCommit,
+    tree: backupGithub.getTreeAt, blob: backupGithub.getBlob,
+  } : null
+  const originalBackup = backup
+  const originalBackupReader = backupReader
+  const originalBackupGithub = backupGithub
+  const originalBackupPlan = backupPlan
+  const originalBackupPassphrase = backupReader?.passphrase
+  const originalBackupSignal = backupReader?.signal
+  const originalBackupScope = backup ? JSON.stringify({
+    identity: backup.identity, plan: backupPlan,
+    tree: backupReader?.expectedSourceTreeSha,
+  }) : ""
+  const backupUnchanged = () => !backup || (
+    (input as V4FencedLivePostCrashAndBackupInput).backup === originalBackup
+    && backup.backup === originalBackupReader
+    && backup.backup.github === originalBackupGithub
+    && backup.backup.plan === originalBackupPlan
+    && backup.backup.passphrase === originalBackupPassphrase
+    && backup.backup.signal === originalBackupSignal
+    && JSON.stringify({
+      identity: backup.identity, plan: backup.backup.plan,
+      tree: backup.backup.expectedSourceTreeSha,
+    }) === originalBackupScope
+    && backup.adapter === adapter && backup.wal === wal && backup.journal === journal
+    && backup.assertExclusiveInitiatorLease === lease
+    && backup.withExclusiveInitiatorLease === holder
+    && backupGithub?.getRepositoryIdentity === backupMethods?.identity
+    && backupGithub?.getGitRef === backupMethods?.ref
+    && backupGithub?.getGitCommit === backupMethods?.commit
+    && backupGithub?.getTreeAt === backupMethods?.tree
+    && backupGithub?.getBlob === backupMethods?.blob
+    && backupGithub?.branchName === readers.backup.branchName
+  )
 
   // Do not stringify the GitHub client itself: a real client may own cyclic
   // state and its function properties never appear in JSON.stringify.
@@ -198,7 +272,8 @@ export async function inspectV4FencedLivePostCrashAfterRestart(
     repo: gh.getRepositoryIdentity, ref: gh.getGitRef,
     commit: gh.getGitCommit, tree: gh.getTreeAt, blob: gh.getBlob,
   }
-  const unchanged = () => input.local === local && input.remote === remote
+  const unchanged = () => backupUnchanged()
+    && input.local === local && input.remote === remote
     && local.prepared === prepared && local.contract === contract
     && local.sourceSettings === initial.sourceSettings
     && JSON.stringify(local.sourceSettings) === initial.sourceSettingsBytes
@@ -305,14 +380,31 @@ export async function inspectV4FencedLivePostCrashAfterRestart(
     }
   }
 
+  const liveBackup = async () => {
+    if (!backup) return
+    await assertHeld()
+    const verified = await inspectV4FencedFrozenBackupContentAfterRestart({
+      ...backup, withExclusiveInitiatorLease: borrowed,
+    })
+    if (!unchanged()
+      || verified.observation !== "complete-frozen-backup-reverified-uncommitted"
+      || verified.completeBackupContentReverified !== true
+      || verified.localCutoverAuthorized !== false
+      || verified.resumeSyncAuthorized !== false
+      || verified.oldPassphraseCleanupAuthorized !== false) {
+      throw Error("D217 frozen Backup current encrypted contents could not be verified.")
+    }
+  }
+
   let bodyCount = 0
-  let bodyResult: V4FencedLivePostCrashReport | null = null
+  let bodyResult: V4FencedLivePostCrashReport | V4FencedLivePostCrashAndBackupReport | null = null
   try {
     const returned = await holder(async () => {
       bodyCount++
       if (bodyCount !== 1) throw Error("D185 Holder called inspection more than once.")
       const first = await localRead()
       await liveGit()
+      await liveBackup()
       const second = await localRead()
       if (JSON.stringify(first) !== JSON.stringify(second) || !unchanged()) {
         throw Error("D185 local evidence changed across full Git scan.")
@@ -322,10 +414,39 @@ export async function inspectV4FencedLivePostCrashAfterRestart(
       if (JSON.stringify(first) !== JSON.stringify(third) || !unchanged()) {
         throw Error("D185 local evidence changed after second full Git scan.")
       }
-      bodyResult = report(third)
+      const current = report(third)
+      bodyResult = backup
+        ? Object.freeze({
+          ...current,
+          integrityScope: "read-only-post-crash-local-current-full-git-and-frozen-backup" as const,
+          fullBackupContentReverifiedAfterRestart: true,
+        })
+        : current
       return bodyResult
     })
     return bodyCount === 1 && returned === bodyResult && unchanged()
-      ? returned : UNCERTAIN
-  } catch { return UNCERTAIN }
+      ? returned : uncertain
+  } catch { return uncertain }
+}
+
+/** Legacy D185 diagnostic: full Destination and local readback, Backup refs only. */
+export async function inspectV4FencedLivePostCrashAfterRestart(
+  input: V4FencedLivePostCrashInput,
+): Promise<V4FencedLivePostCrashReport> {
+  const report = await inspectPostCrash(input)
+  return report.integrityScope === UNCERTAIN.integrityScope ? report : UNCERTAIN
+}
+
+/**
+ * D217 strict, read-only recovery proof: one outer initiating-device holder,
+ * D185 full Destination/local scans and D216 two complete old-key frozen
+ * Backup scans. No independent lease acquisition, no commit/cutover authority.
+ */
+export async function inspectV4FencedLivePostCrashAndBackupAfterRestart(
+  input: V4FencedLivePostCrashAndBackupInput,
+): Promise<V4FencedLivePostCrashAndBackupReport> {
+  if (!input?.backup) return BACKUP_UNCERTAIN
+  const report = await inspectPostCrash(input, input.backup)
+  return report.integrityScope === BACKUP_UNCERTAIN.integrityScope
+    ? report : BACKUP_UNCERTAIN
 }
