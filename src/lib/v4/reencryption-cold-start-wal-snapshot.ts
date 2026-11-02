@@ -1,6 +1,7 @@
 import { sha256Hex, utf8ToBytes } from "../bytes"
 import type { V4LocalIndexAdapter } from "./local-index"
 import { createV4ReencryptionRecoveryJournal } from "./reencryption-recovery-journal"
+import type { V4ReencryptionObjectReceipt } from "./reencryption-staging-receipts"
 import {
   assertV4ReencryptionCutoverSnapshotContract,
   type V4ReencryptionCutoverSnapshotContract,
@@ -9,6 +10,24 @@ import { matchesV4ReencryptionPreparedWal } from "./reencryption-proposed-commit
 
 const MAX_SLOT_TEXT = 2 * 1024 * 1024
 
+function sameReceipts(
+  actual: readonly V4ReencryptionObjectReceipt[],
+  expected: readonly V4ReencryptionObjectReceipt[],
+): boolean {
+  if (actual.length !== expected.length) return false
+  const byPath = new Map(actual.map(r => [r.path, r] as const))
+  if (byPath.size !== actual.length) return false
+  for (const receipt of expected) {
+    if (!receipt || typeof receipt.path !== "string") return false
+    const match = byPath.get(receipt.path)
+    if (!match || match.sha !== receipt.sha || match.byteLength !== receipt.byteLength) {
+      return false
+    }
+    byPath.delete(receipt.path)
+  }
+  return byPath.size === 0
+}
+
 /** The WAL's physical location is supplied explicitly by a trusted owner. */
 export interface V4ColdStartWalSnapshotInput {
   readonly adapter: Pick<V4LocalIndexAdapter, "exists" | "read">
@@ -16,6 +35,8 @@ export interface V4ColdStartWalSnapshotInput {
   readonly contract: V4ReencryptionCutoverSnapshotContract
   /** Already recovered from the original pinned Backup, not from Destination. */
   readonly originalJournalKey: Uint8Array
+  /** When provided, require an exact set match with authenticated WAL ciphertext receipts. */
+  readonly expectedReceipts?: readonly V4ReencryptionObjectReceipt[]
   /** Validates the current plugin/vault owner at every awaited boundary. */
   readonly assertLiveOwner: () => void
 }
@@ -64,13 +85,15 @@ export async function inspectV4ColdStartWalSnapshot(
   let key: Uint8Array | undefined
   let originalKey: Uint8Array | undefined
   try {
-    const { adapter, root, contract, originalJournalKey, assertLiveOwner } = input
+    const { adapter, root, contract, originalJournalKey, expectedReceipts, assertLiveOwner } = input
     if (!adapter || typeof adapter.exists !== "function" || typeof adapter.read !== "function"
       || typeof assertLiveOwner !== "function"
       || !(originalJournalKey instanceof Uint8Array)
       || originalJournalKey.length !== 32) return MANUAL
     assertV4ReencryptionCutoverSnapshotContract(contract)
+    if (expectedReceipts !== undefined && !Array.isArray(expectedReceipts)) return MANUAL
     const contractText = JSON.stringify(contract)
+    const receiptText = JSON.stringify(expectedReceipts)
     const read = adapter.read
     const exists = adapter.exists
     key = Uint8Array.from(originalJournalKey)
@@ -80,6 +103,8 @@ export async function inspectV4ColdStartWalSnapshot(
       assertLiveOwner()
       if (input.adapter !== adapter || input.root !== root || input.contract !== contract
         || input.originalJournalKey !== originalJournalKey
+        || input.expectedReceipts !== expectedReceipts
+        || JSON.stringify(expectedReceipts) !== receiptText
         || input.assertLiveOwner !== assertLiveOwner
         || adapter.read !== read || adapter.exists !== exists
         || JSON.stringify(contract) !== contractText
@@ -127,6 +152,7 @@ export async function inspectV4ColdStartWalSnapshot(
     const first = await journal.assertHealthySnapshot(contract.identity.walGeneration)
     check()
     if (!matchesV4ReencryptionPreparedWal(first, contract.identity)
+      || (expectedReceipts !== undefined && !sameReceipts(first.receipts, expectedReceipts))
       || await sha256Hex(utf8ToBytes(JSON.stringify(first))) !== contract.walSnapshotSha256) {
       return MANUAL
     }
@@ -134,6 +160,7 @@ export async function inspectV4ColdStartWalSnapshot(
     check()
     if (JSON.stringify(first) !== JSON.stringify(second)
       || !matchesV4ReencryptionPreparedWal(second, contract.identity)
+      || (expectedReceipts !== undefined && !sameReceipts(second.receipts, expectedReceipts))
       || await sha256Hex(utf8ToBytes(JSON.stringify(second))) !== contract.walSnapshotSha256
       || JSON.stringify(await capture()) !== JSON.stringify(before)) return MANUAL
     check()

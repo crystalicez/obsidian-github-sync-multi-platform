@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises"
 import path from "node:path"
 
 import { sha256Hex, toBase64Url, utf8ToBytes } from "../../src/lib/bytes"
@@ -40,6 +40,9 @@ import { inspectV4ReencryptionColdStartIndexRoute, authenticateV4RuntimeIndexRou
 import { assertV4ReencryptionSyncFenceClear, V4_REENCRYPTION_SYNC_FENCE_ROOT } from "../../src/lib/v4/reencryption-sync-fence"
 import { inspectV4ReencryptionColdStartJournalKey } from "../../src/lib/v4/reencryption-cold-start-journal-key"
 import { inspectV4ColdStartDestination } from "../../src/lib/v4/reencryption-cold-start-destination"
+import { inspectV4ColdStartWalDestination } from "../../src/lib/v4/reencryption-cold-start-wal-destination"
+import { createV4ReencryptionRecoveryJournal } from "../../src/lib/v4/reencryption-recovery-journal"
+import { acquireV4DesktopRekeyWalStorage } from "../../src/lib/v4/reencryption-desktop-wal"
 import type { V4ReencryptionCutoverSnapshotContract } from "../../src/lib/v4/reencryption-cutover-snapshot-contract"
 import { V4PluginRuntime } from "../../src/lib/v4/runtime"
 import { inspectV4ReencryptionPendingCutoverIntent } from "../../src/lib/v4/reencryption-cutover-intent-crypto"
@@ -821,6 +824,293 @@ test("D238 current ref, SecretStorage and owner changes during full Git read fai
     assert.equal(result.resumeSyncAuthorized, false, cause)
     assert.equal(s.getWrites(), writes, cause)
   }
+})
+
+async function d239Scenario() {
+  const s = await d238Scenario()
+  const walFiles = new Map<string, string>()
+  let walWrites = 0
+  const walAdapter: V4LocalIndexAdapter = {
+    async read(file) {
+      const value = walFiles.get(file)
+      if (value === undefined) throw Error("missing encrypted WAL slot")
+      return value
+    },
+    async exists(file) { return walFiles.has(file) },
+    async write(file, value) { walWrites++; walFiles.set(file, value) },
+    async mkdir() {},
+  }
+  const root = "reencryption/d239-wal"
+  const journalKey = new Uint8Array(32).fill(0x38)
+  const id = s.input.contract.identity
+  const journal = createV4ReencryptionRecoveryJournal({
+    adapter: walAdapter, root, runId: id.runId,
+    sourceCommitSha: id.sourceCommitSha, destinationRepoId: id.destinationRepoId,
+    journalKey,
+  })
+  const backup = {
+    role: "backup" as const, repoId: id.backupRepoId,
+    commitSha: id.sourceCommitSha, treeSha: id.sourceTreeSha,
+  }
+  const destinationRef = {
+    role: "destination" as const, repoId: id.destinationRepoId,
+    commitSha: id.destinationCommitSha, treeSha: id.destinationTreeSha,
+    manifestSha256: id.manifestSha256,
+  }
+  let state = await journal.begin()
+  state = await journal.recordRefIntent(backup, state.generation)
+  state = await journal.markRefReadbackObserved(backup, state.generation)
+  state = await journal.recordStagingHandoff(backup, state.generation)
+  for (const receipt of s.input.remote.expectedReceipts) {
+    state = await journal.recordUploadIntent(receipt, state.generation)
+    state = await journal.appendReceipt(receipt, state.generation)
+  }
+  state = await journal.recordCandidatePreparationIntent("f".repeat(64), state.generation)
+  state = await journal.recordPreparedCandidateReceipt({
+    commitSha: id.destinationCommitSha, treeSha: id.destinationTreeSha,
+    manifestSha256: id.manifestSha256,
+  }, state.generation)
+  state = await journal.recordRefIntent(destinationRef, state.generation)
+  state = await journal.markRefReadbackObserved(destinationRef, state.generation)
+  s.input.contract.identity.walGeneration = state.generation
+  s.input.contract.walSnapshotSha256 = await sha256Hex(enc(JSON.stringify(state)))
+  await armV4ReencryptionSyncFence({
+    adapter: s.adapter, runId: id.runId,
+    sourceRepoId: id.sourceRepoId, destinationRepoId: id.destinationRepoId,
+    assertExclusiveInitiatorLease: async () => {},
+  })
+  let held = false
+  let checkpoints = 0
+  const { contract: _discard, ...destinationInput } = s.input
+  const input = {
+    contract: s.input.contract,
+    wal: {
+      adapter: walAdapter, root, originalJournalKey: Uint8Array.from(journalKey),
+      assertLiveOwner: s.input.assertLiveOwner,
+    },
+    destination: destinationInput,
+    withExclusiveRecoveryLease: async <T>(body: () => Promise<T>): Promise<T> => {
+      assert.equal(held, false)
+      held = true
+      try { return await body() }
+      finally { held = false }
+    },
+    assertExclusiveRecoveryLease: async () => { assert.equal(held, true) },
+    assertBestEffortWalCheckpoint: async (): Promise<"best-effort-readback-only"> => {
+      assert.equal(held, true)
+      checkpoints++
+      return "best-effort-readback-only"
+    },
+  }
+  return { ...s, input, walFiles, getWalWrites: () => walWrites,
+    getCheckpoints: () => checkpoints, isHeld: () => held }
+}
+
+test("D239 binds real encrypted WAL upload receipts to a double full new-key Git/Shadow scan under one fence", async () => {
+  const s = await d239Scenario()
+  const localFiles = new Map(s.files)
+  const walFiles = new Map(s.walFiles)
+  const beforeLocalWrites = s.getWrites()
+  const beforeWalWrites = s.getWalWrites()
+  const result = await inspectV4ColdStartWalDestination(s.input)
+  assert.equal(result.observation, "authenticated-wal-and-destination-still-fenced")
+  assert.equal(result.walReceiptsBoundToDestination, true)
+  assert.equal(result.completeDestinationContentsReverified, true)
+  assert.equal(result.verifiedFileCount, 3)
+  assert.equal(result.completeOldBackupReverified, false)
+  assert.equal(result.powerLossDurabilityProven, false)
+  assert.equal(result.commitDecisionAuthorized, false)
+  assert.equal(result.localCutoverAuthorized, false)
+  assert.equal(result.resumeSyncAuthorized, false)
+  assert.equal(result.remoteWritesAuthorized, false)
+  assert.equal(result.oldPassphraseCleanupAuthorized, false)
+  assert.ok(s.getCheckpoints() >= 4)
+  assert.equal(s.isHeld(), false)
+  assert.equal(s.getWrites(), beforeLocalWrites)
+  assert.equal(s.getWalWrites(), beforeWalWrites)
+  assert.deepEqual(s.files, localFiles)
+  assert.deepEqual(s.walFiles, walFiles)
+})
+
+test("D239 fresh Windows disk WAL and Index readers preserve ciphertext across lease release/reopen", async () => {
+  const s = await d239Scenario()
+  await mkdir(path.join(process.cwd(), ".tmp"), { recursive: true })
+  const directory = await mkdtemp(path.join(process.cwd(), ".tmp", "d239-joint-"))
+  const walDir = path.join(directory, "wal")
+  const indexDir = path.join(directory, "index")
+  await mkdir(walDir)
+  await mkdir(indexDir)
+  let first: Awaited<ReturnType<typeof acquireV4DesktopRekeyWalStorage>> | undefined
+  let reopened: Awaited<ReturnType<typeof acquireV4DesktopRekeyWalStorage>> | undefined
+  try {
+    for (const [relativePath, content] of s.files) {
+      const file = path.join(indexDir, relativePath)
+      await mkdir(path.dirname(file), { recursive: true })
+      await writeFile(file, content, "utf8")
+    }
+    const indexAdapter: Pick<V4LocalIndexAdapter, "read" | "exists"> = {
+      async read(file) { return readFile(path.join(indexDir, file), "utf8") },
+      async exists(file) {
+        try { await stat(path.join(indexDir, file)); return true }
+        catch { return false }
+      },
+    }
+    first = await acquireV4DesktopRekeyWalStorage({
+      rootAbsolute: walDir, journalRoot: s.input.wal.root,
+    })
+    for (const [file, content] of s.walFiles) await first.adapter.write(file, content)
+    assert.equal(await first.assertBestEffortCheckpoint(), "best-effort-readback-only")
+    await first.release()
+    first = undefined
+    reopened = await acquireV4DesktopRekeyWalStorage({
+      rootAbsolute: walDir, journalRoot: s.input.wal.root,
+    })
+    const storage = reopened
+    const observed = await inspectV4ColdStartWalDestination({
+      ...s.input,
+      wal: {
+        ...s.input.wal,
+        adapter: { read: file => storage.adapter.read(file), exists: file => storage.adapter.exists(file) },
+      },
+      destination: { ...s.input.destination, adapter: indexAdapter },
+      withExclusiveRecoveryLease: async <T>(body: () => Promise<T>) => {
+        await storage.assertExclusiveStageLease()
+        return body()
+      },
+      assertExclusiveRecoveryLease: () => storage.assertExclusiveStageLease(),
+      assertBestEffortWalCheckpoint: () => storage.assertBestEffortCheckpoint(),
+    })
+    assert.equal(observed.observation, "authenticated-wal-and-destination-still-fenced")
+    assert.equal(observed.resumeSyncAuthorized, false)
+    for (const [file, content] of s.walFiles) {
+      assert.equal(await storage.adapter.read(file), content)
+    }
+    for (const [file, content] of s.files) {
+      assert.equal(await readFile(path.join(indexDir, file), "utf8"), content)
+    }
+  } finally {
+    await reopened?.release()
+    await first?.release()
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test("D239 refuses receipt SHA/size/extra/duplicate drift before Destination Git scans", async () => {
+  for (const cause of ["sha", "size", "extra", "duplicate"] as const) {
+    const s = await d239Scenario()
+    const original = s.input.destination.remote.expectedReceipts
+    const records = original.map(receipt => ({ ...receipt }))
+    if (cause === "sha") records[0]!.sha = "9".repeat(40)
+    if (cause === "size") records[0]!.byteLength++
+    if (cause === "extra" || cause === "duplicate") records.push({ ...records[0]! })
+    if (cause === "extra") records[records.length - 1]!.path += ".extra"
+    Object.assign(s.input.destination.remote, { expectedReceipts: records })
+    const gitReads = s.f.reads
+    const report = await inspectV4ColdStartWalDestination(s.input)
+    assert.equal(report.observation, "manual-recovery-required", cause)
+    assert.equal(report.walReceiptsBoundToDestination, false, cause)
+    assert.equal(report.resumeSyncAuthorized, false, cause)
+    assert.equal(s.f.reads, gitReads, cause)
+    assert.equal(s.isHeld(), false)
+  }
+})
+
+test("D239 independently authenticated WAL receipts may be in a different order", async () => {
+  const s = await d239Scenario()
+  const original = s.input.destination.remote.expectedReceipts
+  Object.assign(s.input.destination.remote, { expectedReceipts: [...original].reverse() })
+  const report = await inspectV4ColdStartWalDestination(s.input)
+  assert.equal(report.observation, "authenticated-wal-and-destination-still-fenced")
+  assert.equal(report.walReceiptsBoundToDestination, true)
+})
+
+test("D239 mutable receipt input during Git scan never authenticates a joined result", async () => {
+  const s = await d239Scenario()
+  const originalBlob = s.git.getBlob
+  let changed = false
+  s.git.getBlob = async sha => {
+    const bytes = await originalBlob(sha)
+    if (!changed) {
+      changed = true
+      const receipt = s.input.destination.remote.expectedReceipts[0]!
+      Object.assign(receipt, { sha: "9".repeat(40) })
+    }
+    return bytes
+  }
+  const writes = s.getWrites()
+  const report = await inspectV4ColdStartWalDestination(s.input)
+  assert.equal(changed, true)
+  assert.equal(report.observation, "manual-recovery-required")
+  assert.equal(report.resumeSyncAuthorized, false)
+  assert.equal(s.getWrites(), writes)
+  assert.equal(s.isHeld(), false)
+})
+
+test("D239 refuses WAL slot or Sync Fence changes during current Git content readback", async () => {
+  for (const cause of ["wal", "fence", "owner"] as const) {
+    const s = await d239Scenario()
+    const originalRead = s.git.getBlob
+    let changed = false
+    s.git.getBlob = async sha => {
+      const blob = await originalRead(sha)
+      if (!changed) {
+        changed = true
+        if (cause === "wal") s.walFiles.set("reencryption/d239-wal/slot-1.json", "{torn")
+        if (cause === "fence") s.files.set(
+          V4_REENCRYPTION_SYNC_FENCE_ROOT + "/active.json", "{torn",
+        )
+        if (cause === "owner") s.invalidateOwner()
+      }
+      return blob
+    }
+    const report = await inspectV4ColdStartWalDestination(s.input)
+    assert.equal(changed, true, cause)
+    assert.equal(report.observation, "manual-recovery-required", cause)
+    assert.equal(report.localCutoverAuthorized, false)
+    assert.equal(s.isHeld(), false)
+  }
+})
+
+test("D239 rejects Git ref and SecretStorage drift after WAL revalidation", async () => {
+  for (const cause of ["ref", "secret"] as const) {
+    const s = await d239Scenario()
+    const originalCheckpoint = s.input.assertBestEffortWalCheckpoint
+    let calls = 0
+    s.input.assertBestEffortWalCheckpoint = async () => {
+      const result = await originalCheckpoint()
+      if (++calls === 4) {
+        if (cause === "ref") s.f.changeRef("9".repeat(40))
+        else s.secrets.set("new-d238", "changed-at-final-wal-checkpoint")
+      }
+      return result
+    }
+    const result = await inspectV4ColdStartWalDestination(s.input)
+    assert.equal(result.observation, "manual-recovery-required", cause)
+    assert.equal(result.walReceiptsBoundToDestination, false, cause)
+    assert.equal(result.localCutoverAuthorized, false, cause)
+    assert.equal(s.isHeld(), false)
+    assert.ok(calls >= 4)
+  }
+})
+
+test("D239 refuses unavailable best-effort checkpoint, missing fence and reentrant lease", async () => {
+  const uncheckpointed = await d239Scenario()
+  uncheckpointed.input.assertBestEffortWalCheckpoint = async () => {
+    throw Error("Cannot checkpoint WAL")
+  }
+  assert.equal((await inspectV4ColdStartWalDestination(uncheckpointed.input)).observation,
+    "manual-recovery-required")
+  const unfenced = await d239Scenario()
+  unfenced.files.delete(V4_REENCRYPTION_SYNC_FENCE_ROOT + "/active.json")
+  assert.equal((await inspectV4ColdStartWalDestination(unfenced.input)).observation,
+    "manual-recovery-required")
+  const twice = await d239Scenario()
+  const holder = twice.input.withExclusiveRecoveryLease
+  twice.input.withExclusiveRecoveryLease = async <T>(body: () => Promise<T>) =>
+    holder(async () => { const first = await body(); await body(); return first })
+  const report = await inspectV4ColdStartWalDestination(twice.input)
+  assert.equal(report.observation, "manual-recovery-required")
+  assert.equal(twice.isHeld(), false)
 })
 
 const d138Backup = "owner/repo#backup/run_d138"

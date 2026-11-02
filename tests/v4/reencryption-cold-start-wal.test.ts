@@ -94,8 +94,28 @@ async function scenario() {
     originalJournalKey: Uint8Array.from(journalKey),
     assertLiveOwner: () => { if (!live) throw Error("Owner lost") },
   }
-  return { storage, input, invalidOwner: () => { live = false } }
+  return { storage, input, receipt, invalidOwner: () => { live = false } }
 }
+
+test("D239 binds exact ciphertext receipt identity to authenticated old-key WAL", async () => {
+  const s = await scenario()
+  const expectedReceipts = [{ ...s.receipt }]
+  const matching = await inspectV4ColdStartWalSnapshot({
+    ...s.input, expectedReceipts,
+  })
+  assert.equal(matching.observation, "authenticated-current-wal-still-fenced")
+  for (const receipts of [
+    [], [{ ...s.receipt, sha: "9".repeat(40) }],
+    [{ ...s.receipt, byteLength: s.receipt.byteLength + 1 }],
+    [{ ...s.receipt }, { ...s.receipt }],
+  ]) {
+    const denied = await inspectV4ColdStartWalSnapshot({
+      ...s.input, expectedReceipts: receipts,
+    })
+    assert.equal(denied.observation, "manual-recovery-required")
+    assert.equal(denied.resumeSyncAuthorized, false)
+  }
+})
 
 test("D237 fresh WAL reader authenticates exact encrypted two-slot state with no writes or cutover authority", async () => {
   const s = await scenario()
