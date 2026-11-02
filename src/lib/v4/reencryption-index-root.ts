@@ -4,6 +4,9 @@
  * Do not interpret this as a vault-root or filesystem-absolute path.
  */
 export const V4_RUNTIME_INDEX_ROOT = "github-sync-v4-index"
+/** Persistent non-authorizing D234 route blocker; survives fence loss. */
+export const V4_REENCRYPTION_RUNTIME_ROUTE_ROOT = "github-sync-v4-rekey-runtime-route"
+export const V4_REENCRYPTION_RUNTIME_ROUTE_PATH = V4_REENCRYPTION_RUNTIME_ROUTE_ROOT + "/intent.json"
 
 const SEGMENT = /^[A-Za-z0-9_.-]+$/u
 

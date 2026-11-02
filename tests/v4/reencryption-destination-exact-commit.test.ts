@@ -34,6 +34,9 @@ import { inspectV4ActivationSettingsSwitchPlan } from "../../src/lib/v4/reencryp
 import { writeV4FencedActiveSelectorFirstPhase, inspectV4FencedActiveSelectorAfterRestart } from "../../src/lib/v4/reencryption-active-selector-commit-stage"
 import { inspectV4ActiveSelectorCommitPair } from "../../src/lib/v4/reencryption-active-selector-commit-crypto"
 import { persistV4FencedDestinationSettings, inspectV4FencedDestinationSettingsAfterRestart } from "../../src/lib/v4/reencryption-persisted-settings-cutover"
+import { inspectV4ReencryptionColdStartIndexRoute, authenticateV4RuntimeIndexRouteIntent, V4_REENCRYPTION_RUNTIME_ROUTE_PATH, V4_REENCRYPTION_RUNTIME_ROUTE_ROOT } from "../../src/lib/v4/reencryption-runtime-index-route"
+import { assertV4ReencryptionSyncFenceClear, V4_REENCRYPTION_SYNC_FENCE_ROOT } from "../../src/lib/v4/reencryption-sync-fence"
+import { V4PluginRuntime } from "../../src/lib/v4/runtime"
 import { inspectV4ReencryptionPendingCutoverIntent } from "../../src/lib/v4/reencryption-cutover-intent-crypto"
 import { inspectV4ReencryptionCutoverCandidateAfterRestart } from "../../src/lib/v4/reencryption-cutover-candidate-restart"
 import { decodeV4ReencryptionCutoverCandidateManifest } from "../../src/lib/v4/reencryption-cutover-candidate-manifest"
@@ -1548,6 +1551,148 @@ async function d217CurrentFrozenBackup(f: Awaited<ReturnType<typeof d179Scenario
   }
 }
 
+async function d234ColdStart(s: Awaited<ReturnType<typeof d233Scenario>>, key?: Uint8Array) {
+  const native = {
+    adapter: s.f.s.adapter,
+    readPersistedPluginData: async () => JSON.parse(s.saved),
+    getSecret: (id: string) => s.f.s.secrets.get(id) ?? null,
+    ...(key ? { journalKey: key } : {}),
+  }
+  return inspectV4ReencryptionColdStartIndexRoute(native)
+}
+
+test("D234 independent cold-start reads exact persisted Destination route and shadow but grants no Sync authority", async () => {
+  const s = await d233Scenario()
+  const savedFiles = new Map(s.f.s.files)
+  const oldSecrets = new Map(s.f.s.secrets)
+  const count = s.f.s.getWrites()
+  await persistV4FencedDestinationSettings(s.cutover)
+  const routeText = s.f.s.files.get(V4_REENCRYPTION_RUNTIME_ROUTE_PATH)
+  assert.ok(routeText)
+  assert.equal(s.f.s.files.size, savedFiles.size + 2)
+  for (const [path, value] of savedFiles) assert.equal(s.f.s.files.get(path), value, path)
+  assert.deepEqual(s.f.s.secrets, oldSecrets)
+  const marker = await authenticateV4RuntimeIndexRouteIntent(
+    routeText, s.f.prepared.journalKey,
+  )
+  assert.equal(marker.sourceRepoId, s.f.id.sourceRepoId)
+  assert.equal(marker.destinationRepoId, s.f.id.destinationRepoId)
+  assert.equal(marker.sourceIndexRoot, V4_RUNTIME_INDEX_ROOT)
+  assert.equal(marker.shadowIndexRoot, V4_RUNTIME_INDEX_ROOT + "-rekey-" + s.f.id.runId)
+  const unkeyed = await d234ColdStart(s)
+  assert.equal(unkeyed.observation, "destination-shadow-diagnostic-only")
+  assert.equal(unkeyed.diagnosticIndexRoot, marker.shadowIndexRoot)
+  assert.equal(unkeyed.routingHintAuthenticated, false)
+  assert.equal(unkeyed.resumeSyncAuthorized, false)
+  assert.equal(unkeyed.localCutoverAuthorized, false)
+  const keyed = await d234ColdStart(s, s.f.prepared.journalKey)
+  assert.equal(keyed.observation, "destination-shadow-diagnostic-only")
+  assert.equal(keyed.routingHintAuthenticated, true)
+  assert.equal(keyed.remoteWritesAuthorized, false)
+  assert.equal(s.f.s.getWrites(), count + 2)
+  await assert.rejects(() => assertV4ReencryptionSyncFenceClear(s.f.s.adapter))
+})
+
+test("D234 Runtime read-only Destination Shadow route uses native persistent plugin storage, never changes active Source", async () => {
+  const s = await d233Scenario()
+  await persistV4FencedDestinationSettings(s.cutover)
+  const writes = s.f.s.getWrites()
+  const prefix = ".obsidian/plugins/test-d234/"
+  const disk = s.f.s.adapter
+  const nativeAdapter = {
+    read: (path: string) => disk.read(path.replace(prefix, "")),
+    write: (path: string, text: string) => disk.write(path.replace(prefix, ""), text),
+    mkdir: (path: string) => disk.mkdir(path.replace(prefix, "")),
+    exists: (path: string) => disk.exists(path.replace(prefix, "")),
+  }
+  const runtime = new V4PluginRuntime({
+    app: {
+      vault: { configDir: ".obsidian", adapter: nativeAdapter },
+      secretStorage: { getSecret: (id: string) => s.f.s.secrets.get(id) ?? null },
+    },
+    manifest: { id: "test-d234" },
+    loadData: async () => JSON.parse(s.saved),
+  } as never)
+  try {
+    const observed = await runtime.inspectFencedReencryptionIndexRoute()
+    assert.equal(observed.observation, "destination-shadow-diagnostic-only")
+    assert.equal(runtime.getReencryptionColdStartIndexRoute(), observed)
+    const shadow = await runtime.readFencedReencryptionDestinationIndexForRecovery()
+    assert.equal(shadow?.repoId, s.f.id.destinationRepoId)
+    assert.equal(shadow?.remoteCommitSha, s.f.id.destinationCommitSha)
+    assert.equal(s.f.s.getWrites(), writes, "the read-only Runtime recovery route never writes")
+    await assert.rejects(() => runtime.assertReencryptionSettingsSaveAllowed(),
+      /Re-encryption|pending/i)
+  } finally {
+    runtime.dispose()
+  }
+})
+
+test("D234 a torn stable routing marker never performs native Settings write or allows retry", async () => {
+  const s = await d233Scenario()
+  const originalWrite = s.f.s.adapter.write
+  s.f.s.adapter.write = async (path, value) => {
+    if (path === V4_REENCRYPTION_RUNTIME_ROUTE_PATH) {
+      s.f.s.files.set(path, value.slice(0, 14))
+      throw Error("injected interrupted D234 routing marker write")
+    }
+    return originalWrite(path, value)
+  }
+  await assert.rejects(persistV4FencedDestinationSettings(s.cutover), /injected interrupted/)
+  assert.equal(s.saved, s.initial)
+  assert.equal(s.writes, 0)
+  assert.equal(s.f.s.files.has(V4_REENCRYPTION_RUNTIME_ROUTE_PATH), true)
+  assert.equal((await d234ColdStart(s)).observation, "manual-recovery-required")
+  await assert.rejects(() => assertV4ReencryptionSyncFenceClear(s.f.s.adapter))
+  await assert.rejects(persistV4FencedDestinationSettings(s.cutover),
+    /prior Settings write Intent needs Manual Recovery/)
+})
+
+test("D234 stuck routing marker blocks Sync even if the primary fence is accidentally deleted", async () => {
+  const s = await d233Scenario()
+  await persistV4FencedDestinationSettings(s.cutover)
+  const marker = s.f.s.files.get(V4_REENCRYPTION_RUNTIME_ROUTE_PATH)!
+  s.f.s.dirs.delete(V4_REENCRYPTION_SYNC_FENCE_ROOT)
+  s.f.s.files.delete(V4_REENCRYPTION_SYNC_FENCE_ROOT + "/active.json")
+  assert.equal((await d234ColdStart(s)).observation, "manual-recovery-required")
+  await assert.rejects(() => assertV4ReencryptionSyncFenceClear(s.f.s.adapter),
+    /Re-encryption|pending/i)
+  // The stable root alone (without marker content) also refuses Sync.
+  s.f.s.files.delete(V4_REENCRYPTION_RUNTIME_ROUTE_PATH)
+  assert.equal(s.f.s.dirs.has(V4_REENCRYPTION_RUNTIME_ROUTE_ROOT), true)
+  await assert.rejects(() => assertV4ReencryptionSyncFenceClear(s.f.s.adapter))
+  s.f.s.files.set(V4_REENCRYPTION_RUNTIME_ROUTE_PATH, marker)
+})
+
+test("D234 cold-start exact Settings / Selector / Intent / Index / key tampering fails closed", async () => {
+  const s = await d233Scenario()
+  await persistV4FencedDestinationSettings(s.cutover)
+  const routePath = V4_REENCRYPTION_RUNTIME_ROUTE_PATH
+  const contractPath = V4_RUNTIME_INDEX_ROOT + "-rekey-cutover-candidate-" + s.f.id.runId + "/contract.json"
+  const intentPath = V4_RUNTIME_INDEX_ROOT + "-rekey-cutover-candidate-" + s.f.id.runId + "/persisted-settings-write-intent.json"
+  const selectorPath = V4_RUNTIME_INDEX_ROOT + "-rekey-selector-" + s.f.id.runId + "/selector.json"
+  const shadowPath = V4_RUNTIME_INDEX_ROOT + "-rekey-" + s.f.id.runId + "/index.json"
+  const beforeWrites = s.f.s.getWrites()
+  for (const path of [routePath, contractPath, intentPath, selectorPath, shadowPath]) {
+    const original = s.f.s.files.get(path)!
+    assert.ok(original, path)
+    s.f.s.files.set(path, original.slice(0, 12))
+    assert.equal((await d234ColdStart(s, s.f.prepared.journalKey)).observation,
+      "manual-recovery-required", path)
+    s.f.s.files.set(path, original)
+  }
+  const changed = JSON.parse(s.saved)
+  changed.settings.ignorePathRegex = "changed-after-native-save"
+  s.setPersisted(changed)
+  assert.equal((await d234ColdStart(s)).observation, "manual-recovery-required")
+  s.setPersisted(JSON.parse(JSON.stringify({ ...changed, settings: {
+    ...changed.settings, ignorePathRegex: "^Local/",
+  } })))
+  s.f.s.secrets.delete(s.f.id.sourcePassphraseSecretId)
+  assert.equal((await d234ColdStart(s)).observation, "manual-recovery-required")
+  assert.equal(s.f.s.getWrites(), beforeWrites, "cold-start inspection never mutates disk")
+})
+
 async function d233Scenario() {
   const { f, b, input } = await d232Scenario()
   await writeV4FencedActiveSelectorFirstPhase(input)
@@ -1597,7 +1742,7 @@ test("D233 native plugin-data Settings commit preserves preferences and both pas
   assert.equal(s.f.s.holderCounts().calls, callsBefore + 1)
   assert.equal(s.f.s.holderCounts().held, false)
   assert.deepEqual(s.f.s.secrets, beforeSecrets)
-  assert.equal(s.f.s.files.size, beforeFiles.size + 1)
+  assert.equal(s.f.s.files.size, beforeFiles.size + 2)
   for (const [path, text] of beforeFiles) assert.equal(s.f.s.files.get(path), text, path)
   const original = JSON.parse(s.initial)
   const actual = JSON.parse(s.saved)

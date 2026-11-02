@@ -8,6 +8,7 @@ import { inspectV4FencedFrozenBackupContentAfterRestart } from "./reencryption-f
 import type { V4FencedPendingCommitPreflightInput } from "./reencryption-fenced-pending-commit-preflight"
 import { verifyV4ReencryptionShadowAgainstDestination } from "./reencryption-shadow-remote-binding"
 import { planV4ReencryptionSeparatedRoots } from "./reencryption-separated-selector"
+import { V4_REENCRYPTION_RUNTIME_ROUTE_ROOT, V4_REENCRYPTION_RUNTIME_ROUTE_PATH, sealV4RuntimeIndexRouteIntent, authenticateV4RuntimeIndexRouteIntent } from "./reencryption-runtime-index-route"
 import type { V4LocalCutoverSettings } from "./reencryption-local-cutover-inspection"
 
 const INTENT = "/persisted-settings-write-intent.json"
@@ -310,22 +311,46 @@ export async function persistV4FencedDestinationSettings(
         || sourceData(await read()).serialized !== original.serialized) {
         throw Error("D233 write-ahead Settings Intent is torn.")
       }
+      // The stable Runtime route hint outlives the primary Sync Fence and
+      // blocks Sync even if that directory is accidentally removed.
+      if (await session.methods.exists.call(session.adapter, V4_REENCRYPTION_RUNTIME_ROUTE_ROOT)
+        || await session.methods.exists.call(session.adapter, V4_REENCRYPTION_RUNTIME_ROUTE_PATH)) {
+        throw Error("D234 previous Runtime route marker needs Manual Recovery.")
+      }
+      const contractText = await session.readOne(session.root + "/contract.json")
+      const routeText = await sealV4RuntimeIndexRouteIntent(
+        state.contract, session.key, state.selector, sealed, contractText,
+      )
+      await session.adapter.mkdir(V4_REENCRYPTION_RUNTIME_ROUTE_ROOT)
+      await session.check()
+      await session.adapter.write(V4_REENCRYPTION_RUNTIME_ROUTE_PATH, routeText)
+      await session.check()
+      check()
+      if (await session.readOne(V4_REENCRYPTION_RUNTIME_ROUTE_PATH) !== routeText
+        || JSON.stringify(await authenticateV4RuntimeIndexRouteIntent(
+          routeText, session.key,
+        )) !== routeText
+        || sourceData(await read()).serialized !== original.serialized) {
+        throw Error("D234 Runtime route marker is torn or Settings changed before native save.")
+      }
       // No automatic rollback or cleanup after this boundary. Obsidian may
       // persist a complete new data.json even if saveData() throws.
       await write(JSON.parse(target))
       check()
       await session.check()
       if (sourceData(await read()).serialized !== target
-        || await session.readOne(path) !== sealed) {
-        throw Error("D233 Settings disk readback changed or is incomplete; Manual Recovery.")
+        || await session.readOne(path) !== sealed
+        || await session.readOne(V4_REENCRYPTION_RUNTIME_ROUTE_PATH) !== routeText) {
+        throw Error("D233 Settings/Runtime route disk readback changed or is incomplete; Manual Recovery.")
       }
       if (JSON.stringify(await material(session)) !== JSON.stringify(state)) {
         throw Error("D233 physical Selector changed during Settings write.")
       }
       await fullGitAfterSelector(session, input)
       if (sourceData(await read()).serialized !== target
-        || await session.readOne(path) !== sealed) {
-        throw Error("D233 final Settings write readback drifted.")
+        || await session.readOne(path) !== sealed
+        || await session.readOne(V4_REENCRYPTION_RUNTIME_ROUTE_PATH) !== routeText) {
+        throw Error("D233 final Settings/Runtime route write readback drifted.")
       }
       check()
       await session.check()
@@ -372,8 +397,15 @@ export async function inspectV4FencedDestinationSettingsAfterRestart(
         return completed
       }
       const state = await material(session)
-      const record = await parseIntent(session, await session.readOne(path))
-      if (record.transactionId !== state.contract.transactionId
+      const persistedIntent = await session.readOne(path)
+      const record = await parseIntent(session, persistedIntent)
+      const manifest = await session.readOne(session.root + "/contract.json")
+      const expectedRoute = await sealV4RuntimeIndexRouteIntent(
+        state.contract, session.key, state.selector, persistedIntent, manifest,
+      )
+      if (await session.readOne(V4_REENCRYPTION_RUNTIME_ROUTE_PATH) !== expectedRoute
+        || !await session.methods.exists.call(session.adapter, V4_REENCRYPTION_RUNTIME_ROUTE_ROOT)
+        || record.transactionId !== state.contract.transactionId
         || record.receiptCiphertextSha256 !== await digest(state.receipt)
         || record.selectorCiphertextSha256 !== await digest(state.selector)) {
         throw Error("D233 Settings Intent not linked to physical Selector.")
@@ -400,7 +432,10 @@ export async function inspectV4FencedDestinationSettingsAfterRestart(
           throw Error("D233 Destination Settings projection differs.")
         }
         await fullGitAfterSelector(session, input)
-        if ((await check()).content !== first.content) throw Error("D233 Git proof observed Settings drift.")
+        if ((await check()).content !== first.content
+          || await session.readOne(V4_REENCRYPTION_RUNTIME_ROUTE_PATH) !== expectedRoute) {
+          throw Error("D233 Git proof observed Settings or Runtime routing marker drift.")
+        }
         completed = COMPLETE
       } else {
         if (JSON.stringify(projection(sourceData(JSON.parse(first.content)).settings))

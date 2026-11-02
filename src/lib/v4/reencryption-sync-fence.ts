@@ -1,4 +1,5 @@
 import type { V4LocalIndexAdapter } from "./local-index"
+import { V4_REENCRYPTION_RUNTIME_ROUTE_ROOT, V4_REENCRYPTION_RUNTIME_ROUTE_PATH } from "./reencryption-index-root"
 
 export const V4_REENCRYPTION_SYNC_FENCE_ROOT = "github-sync-v4-rekey-sync-fence"
 const FENCE_PATH = V4_REENCRYPTION_SYNC_FENCE_ROOT + "/active.json"
@@ -74,7 +75,11 @@ export async function armV4ReencryptionSyncFence(
   try {
     await lease()
     if (!unchanged() || await exists.call(adapter, V4_REENCRYPTION_SYNC_FENCE_ROOT) !== false
-      || await exists.call(adapter, FENCE_PATH) !== false) throw new V4ReencryptionSyncFencedError()
+      || await exists.call(adapter, FENCE_PATH) !== false
+      || await exists.call(adapter, V4_REENCRYPTION_RUNTIME_ROUTE_ROOT) !== false
+      || await exists.call(adapter, V4_REENCRYPTION_RUNTIME_ROUTE_PATH) !== false) {
+      throw new V4ReencryptionSyncFencedError()
+    }
     await mkdir.call(adapter, V4_REENCRYPTION_SYNC_FENCE_ROOT)
     await lease()
     if (!unchanged()) throw new V4ReencryptionSyncFencedError()
@@ -100,7 +105,11 @@ export async function assertV4ReencryptionSyncFenceClear(
 ): Promise<void> {
   try {
     if (await adapter.exists(V4_REENCRYPTION_SYNC_FENCE_ROOT) !== false
-      || await adapter.exists(FENCE_PATH) !== false) throw new V4ReencryptionSyncFencedError()
+      || await adapter.exists(FENCE_PATH) !== false
+      || await adapter.exists(V4_REENCRYPTION_RUNTIME_ROUTE_ROOT) !== false
+      || await adapter.exists(V4_REENCRYPTION_RUNTIME_ROUTE_PATH) !== false) {
+      throw new V4ReencryptionSyncFencedError()
+    }
   } catch {
     throw new V4ReencryptionSyncFencedError()
   }

@@ -39,6 +39,7 @@ import { V4PublicationRaceError, isV4PublicationRaceError } from "./publication-
 import { assertV4SpeculativeConfigStillAbsent, guardV4SpeculativeConfigGithub } from "./speculative-config-guard"
 
 import { V4_RUNTIME_INDEX_ROOT } from "./reencryption-index-root"
+import { inspectV4ReencryptionColdStartIndexRoute, type V4ReencryptionColdStartRouteReport } from "./reencryption-runtime-index-route"
 const V4_INDEX_ROOT = V4_RUNTIME_INDEX_ROOT
 const V4_STAGE_ROOT = "github-sync-v4-stage"
 const V4_RECOVERY_ROOT = "github-sync-v4-recovery"
@@ -169,6 +170,7 @@ export class V4PluginRuntime {
   private reencryptionSyncFenced = false
   private reencryptionFencePending = false
   private disposed = false
+  private coldStartIndexRoute?: V4ReencryptionColdStartRouteReport
 
   constructor(private readonly plugin: FastSync) {
     this.indexAdapterBacking = plugin.app.vault.adapter
@@ -213,6 +215,36 @@ export class V4PluginRuntime {
    * for Manual Recovery, including after an Obsidian restart. Read the
    * actual on-disk fence at each Settings write boundary.
    */
+  /** Read native disk evidence after restart; never authorizes Sync. */
+  async inspectFencedReencryptionIndexRoute(): Promise<V4ReencryptionColdStartRouteReport> {
+    this.assertNotDisposed()
+    const observed = await inspectV4ReencryptionColdStartIndexRoute({
+      adapter: this.adapter,
+      readPersistedPluginData: () => this.plugin.loadData(),
+      getSecret: id => this.plugin.app.secretStorage.getSecret(id),
+    })
+    this.coldStartIndexRoute = observed
+    return observed
+  }
+
+  getReencryptionColdStartIndexRoute(): V4ReencryptionColdStartRouteReport | undefined {
+    return this.coldStartIndexRoute
+  }
+
+  /** Read local Destination Shadow for Manual Recovery, not as a Sync writer. */
+  async readFencedReencryptionDestinationIndexForRecovery(): Promise<V4LocalIndex | null> {
+    this.assertNotDisposed()
+    const observed = await this.inspectFencedReencryptionIndexRoute()
+    if (observed.observation !== "destination-shadow-diagnostic-only"
+      || !observed.diagnosticIndexRoot) return null
+    const root = observed.diagnosticIndexRoot
+    const candidate = await loadV4LocalIndex(this.adapter, root)
+    const after = await this.inspectFencedReencryptionIndexRoute()
+    if (after.observation !== "destination-shadow-diagnostic-only"
+      || after.diagnosticIndexRoot !== root) return null
+    return candidate
+  }
+
   async assertReencryptionSettingsSaveAllowed(): Promise<void> {
     if (this.disposed || this.reencryptionSyncFenced || this.reencryptionFencePending
       || !this.indexAdapterBacking

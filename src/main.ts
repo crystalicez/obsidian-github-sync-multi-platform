@@ -110,6 +110,15 @@ export default class FastSync extends Plugin {
 
     this.initGitHubClient()
     this.v4Runtime = this.createV4Runtime()
+    // D234: detect a restarted Settings cutover without allowing Sync.
+    const recoveredRoute = await this.v4Runtime.inspectFencedReencryptionIndexRoute?.()
+    if (recoveredRoute && recoveredRoute.observation !== "no-routing-artifact"
+      && recoveredRoute.observation !== "fenced-before-routing-intent") {
+      new Notice(
+        "GitHub Sync: Re-encryption recovery pending. Sync stays paused; keep both passphrases and review Manual Recovery before changing branches.",
+        10000,
+      )
+    }
     this.register(this.v4Runtime.subscribeProgress(() => this.updateStatusBar()))
     this.registerView(V4_SYNC_CENTER_VIEW, leaf => new V4SyncCenterView(leaf, this))
     this.registerScheduledSync()
