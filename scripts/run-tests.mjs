@@ -16,6 +16,8 @@ function optionValue(name, fallback = "") {
 
 const tier = optionValue("tier", "fast");
 const filter = optionValue("filter", "");
+// Native Node test-name filtering keeps expensive encrypted integration repros focused.
+const namePattern = optionValue("name-pattern", "");
 const knownTiers = new Set(["fast", "feasibility", "resource", "recovery", "github-e2e", "soak", "device"]);
 if (!knownTiers.has(tier)) {
   console.error(`Unknown test tier: ${tier}`);
@@ -64,7 +66,9 @@ try {
     });
     runnable.push(outfile);
   }
-  const result = spawnSync(process.execPath, ["--test", ...runnable], { cwd: root, stdio: "inherit" });
+  const result = spawnSync(process.execPath, [
+    "--test", ...(namePattern ? ["--test-name-pattern", namePattern] : []), ...runnable,
+  ], { cwd: root, stdio: "inherit" });
   if (result.error) throw result.error;
   process.exitCode = result.status ?? 1;
 } finally {

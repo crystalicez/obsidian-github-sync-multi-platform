@@ -311,7 +311,8 @@ export function createV4FencedActivationSession(input: V4FencedPendingCommitPref
   }
   return { root, decisionPath, key, holder, check, unchanged, prove,
     readOne, readSources, readAuthenticated, adapter, methods,
-    sourceSettings: restart.settings, readPersistedSettings: reader }
+    sourceSettings: restart.settings, readPersistedSettings: reader,
+    borrowedPreflight }
 }
 
 /**

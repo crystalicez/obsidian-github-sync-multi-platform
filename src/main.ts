@@ -9,6 +9,8 @@ import { normalizeScheduledSyncIntervalSeconds, shouldRunScheduledSync, shouldRu
 import { hydrateV4SecretsReadOnly, migrateV4Secrets, sanitizeV4SettingsForPersistence, storeV4Secrets } from "./lib/v4/secrets";
 import { assertV4ReencryptionSyncFenceClear } from "./lib/v4/reencryption-sync-fence";
 import { V4PluginRuntime } from "./lib/v4/runtime";
+import { persistV4FencedDestinationSettings, type V4FencedPluginSettingsCutoverReport } from "./lib/v4/reencryption-persisted-settings-cutover";
+import type { V4FencedPendingCommitPreflightInput } from "./lib/v4/reencryption-fenced-pending-commit-preflight";
 import { createIdleV4Progress } from "./lib/v4/progress";
 import { formatV4ActiveSyncStatus } from "./lib/v4/status";
 import { V4SyncCenterView, V4_SYNC_CENTER_VIEW } from "./views/sync-center";
@@ -303,6 +305,49 @@ export default class FastSync extends Plugin {
     )
     this.settings = result.settings as PluginSettings
     this.secretsMigrated = result.migrated
+  }
+
+  /**
+   * Re-encryption only: native Settings cutover after D232 Selector, with
+   * BOTH passphrases kept. Ordinary saveSettings() scrubs the previous key.
+   * Not wired to Wizard Run until Runtime Index routing is crash-recoverable.
+   */
+  async persistFencedReencryptionDestinationSettings(
+    input: V4FencedPendingCommitPreflightInput,
+  ): Promise<V4FencedPluginSettingsCutoverReport> {
+    if (this.unloaded || this.settingsSaveInProgress || this.isSyncInProgress
+      || !this.v4Runtime || !this.app.vault.adapter) {
+      throw new Error("Re-encryption Settings Cutover needs an idle active plugin; Manual Recovery.")
+    }
+    const runtime = this.v4Runtime
+    const backing = this.app.vault.adapter
+    const original = this.settings
+    const identity = (settings: PluginSettings) => JSON.stringify({
+      githubOwner: settings.githubOwner, githubRepo: settings.githubRepo,
+      githubBranch: settings.githubBranch, encryptionMode: settings.encryptionMode,
+      encryptionPassphraseSecretId: settings.encryptionPassphraseSecretId,
+      vault: settings.vault,
+    })
+    const originalId = identity(original)
+    const assertOwner = () => {
+      if (this.unloaded || !this.settingsSaveInProgress || this.isSyncInProgress
+        || this.v4Runtime !== runtime || this.app.vault.adapter !== backing
+        || this.settings !== original || identity(this.settings) !== originalId) {
+        throw new Error("Re-encryption Settings Cutover lost plugin/Settings ownership.")
+      }
+    }
+    this.settingsSaveInProgress = true
+    try {
+      return await persistV4FencedDestinationSettings({
+        ...input,
+        readPersistedPluginData: () => this.loadData(),
+        writePersistedPluginData: data => this.saveData(data),
+        assertLivePluginOwner: assertOwner,
+      })
+    } finally {
+      // A rejected native save may have committed: never revert or scrub.
+      this.settingsSaveInProgress = false
+    }
   }
 
   async saveSettings(nextSettings: PluginSettings = this.settings) {

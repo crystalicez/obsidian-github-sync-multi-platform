@@ -33,6 +33,7 @@ import { stageV4FencedActivationSettingsSwitchPlan, inspectV4FencedActivationSet
 import { inspectV4ActivationSettingsSwitchPlan } from "../../src/lib/v4/reencryption-activation-switch-plan-crypto"
 import { writeV4FencedActiveSelectorFirstPhase, inspectV4FencedActiveSelectorAfterRestart } from "../../src/lib/v4/reencryption-active-selector-commit-stage"
 import { inspectV4ActiveSelectorCommitPair } from "../../src/lib/v4/reencryption-active-selector-commit-crypto"
+import { persistV4FencedDestinationSettings, inspectV4FencedDestinationSettingsAfterRestart } from "../../src/lib/v4/reencryption-persisted-settings-cutover"
 import { inspectV4ReencryptionPendingCutoverIntent } from "../../src/lib/v4/reencryption-cutover-intent-crypto"
 import { inspectV4ReencryptionCutoverCandidateAfterRestart } from "../../src/lib/v4/reencryption-cutover-candidate-restart"
 import { decodeV4ReencryptionCutoverCandidateManifest } from "../../src/lib/v4/reencryption-cutover-candidate-manifest"
@@ -1546,6 +1547,172 @@ async function d217CurrentFrozenBackup(f: Awaited<ReturnType<typeof d179Scenario
     setRef(sha: string) { observedBackupSha = sha },
   }
 }
+
+async function d233Scenario() {
+  const { f, b, input } = await d232Scenario()
+  await writeV4FencedActiveSelectorFirstPhase(input)
+  let persisted: unknown = {
+    version: 13,
+    settings: {
+      ...f.prepared.restart.settings,
+      githubTokenSecretId: "github-token-d233",
+      syncEnabled: true, syncOnStartup: false, syncOnLocalChange: true,
+      scheduledSyncEnabled: false, ignorePathRegex: "^Local/",
+      conflictPolicy: "merge", scheduledSyncIntervalSeconds: 600,
+      customFeaturePreference: { nested: ["keep", "as-is"] },
+    },
+    unrelatedObsidianData: { preserved: "untouched" },
+  }
+  const initial = JSON.stringify(persisted)
+  let writes = 0
+  const callbacks = {
+    readPersistedPluginData: async (): Promise<unknown> => JSON.parse(JSON.stringify(persisted)),
+    writePersistedPluginData: async (data: unknown) => {
+      writes++
+      persisted = JSON.parse(JSON.stringify(data))
+    },
+    assertLivePluginOwner: () => assert.equal(f.s.holderCounts().held, true),
+  }
+  const cutover = { ...input, ...callbacks }
+  return {
+    f, b, cutover, callbacks, initial,
+    get saved() { return JSON.stringify(persisted) },
+    get writes() { return writes },
+    setPersisted(value: unknown) { persisted = value },
+  }
+}
+
+test("D233 native plugin-data Settings commit preserves preferences and both passphrases under full post-Selector Git proof", async () => {
+  const s = await d233Scenario()
+  const beforeFiles = new Map(s.f.s.files)
+  const beforeSecrets = new Map(s.f.s.secrets)
+  const callsBefore = s.f.s.holderCounts().calls
+  const report = await persistV4FencedDestinationSettings(s.cutover)
+  assert.equal(report.status, "destination-settings-written-selector-commit-pending")
+  assert.equal(report.commitDecisionAuthorized, false)
+  assert.equal(report.localCutoverAuthorized, false)
+  assert.equal(report.resumeSyncAuthorized, false)
+  assert.equal(report.oldPassphraseCleanupAuthorized, false)
+  assert.equal(s.writes, 1)
+  assert.equal(s.f.s.holderCounts().calls, callsBefore + 1)
+  assert.equal(s.f.s.holderCounts().held, false)
+  assert.deepEqual(s.f.s.secrets, beforeSecrets)
+  assert.equal(s.f.s.files.size, beforeFiles.size + 1)
+  for (const [path, text] of beforeFiles) assert.equal(s.f.s.files.get(path), text, path)
+  const original = JSON.parse(s.initial)
+  const actual = JSON.parse(s.saved)
+  assert.deepEqual(actual.unrelatedObsidianData, original.unrelatedObsidianData)
+  assert.deepEqual(actual.settings.customFeaturePreference, original.settings.customFeaturePreference)
+  assert.deepEqual({ ...actual.settings, githubBranch: original.settings.githubBranch,
+    encryptionPassphraseSecretId: original.settings.encryptionPassphraseSecretId }, original.settings)
+  assert.equal(actual.settings.githubBranch, destination.split("#")[1])
+  assert.equal(actual.settings.encryptionPassphraseSecretId, s.f.id.destinationPassphraseSecretId)
+  assert.equal(Object.hasOwn(actual.settings, "encryptionPassphrase"), false)
+  assert.equal(Object.hasOwn(actual.settings, "githubToken"), false)
+  assert.equal(s.f.prepared.restart.settings.githubBranch, original.settings.githubBranch,
+    "Source Settings witness remains unchanged")
+  assert.deepEqual(await inspectV4FencedDestinationSettingsAfterRestart(s.cutover), {
+    observation: "destination-settings-observed-uncommitted",
+    artifactWindow: "destination-settings",
+    integrityScope: "authenticated-plugin-settings-and-physical-selector",
+    evidence: "best-effort-readback-not-power-loss-durable",
+    commitDecisionAuthorized: false, localCutoverAuthorized: false,
+    resumeSyncAuthorized: false, rollbackAuthorized: false,
+    remoteWritesAuthorized: false, oldPassphraseCleanupAuthorized: false,
+  })
+  await assert.rejects(persistV4FencedDestinationSettings(s.cutover),
+    /prior Settings write Intent needs Manual Recovery/)
+})
+
+test("D233 write-ahead Intent interruption leaves old data and refuses automatic retry", async () => {
+  const s = await d233Scenario()
+  const path = s.f.id.indexRoot + "-rekey-cutover-candidate-" + s.f.id.runId
+    + "/persisted-settings-write-intent.json"
+  const prior = s.f.s.adapter.write
+  s.f.s.adapter.write = async (target, value) => {
+    if (target === path) {
+      s.f.s.files.set(path, value.slice(0, 10))
+      throw Error("injected partial Settings Intent")
+    }
+    return prior(target, value)
+  }
+  const secrets = new Map(s.f.s.secrets)
+  await assert.rejects(persistV4FencedDestinationSettings(s.cutover),
+    /injected partial Settings Intent/)
+  assert.equal(s.saved, s.initial)
+  assert.equal(s.writes, 0)
+  assert.deepEqual(s.f.s.secrets, secrets)
+  assert.ok(s.f.s.files.has(path))
+  assert.equal((await inspectV4FencedDestinationSettingsAfterRestart(s.cutover))
+    .observation, "manual-recovery-required")
+  await assert.rejects(persistV4FencedDestinationSettings(s.cutover),
+    /prior Settings write Intent needs Manual Recovery/)
+})
+
+test("D233 ambiguous native save failure preserves both secrets and classifies committed-or-not after Restart", async () => {
+  for (const effect of ["before-write", "after-write", "torn-settings"] as const) {
+    const s = await d233Scenario()
+    const savedWrite = s.callbacks.writePersistedPluginData
+    s.cutover.writePersistedPluginData = async (data) => {
+      if (effect === "before-write") throw Error("injected saveData rejects before write")
+      if (effect === "after-write") {
+        await savedWrite(data)
+        throw Error("injected saveData rejects after committing")
+      }
+      s.setPersisted({ settings: { ...JSON.parse(s.initial).settings,
+        githubBranch: destination.split("#")[1] } })
+      throw Error("injected half-written Settings data")
+    }
+    const preserved = new Map(s.f.s.secrets)
+    await assert.rejects(persistV4FencedDestinationSettings(s.cutover),
+      /injected/)
+    assert.deepEqual(s.f.s.secrets, preserved)
+    const restarted = await inspectV4FencedDestinationSettingsAfterRestart(s.cutover)
+    assert.equal(restarted.resumeSyncAuthorized, false)
+    assert.equal(restarted.artifactWindow, effect === "before-write"
+      ? "intent-only-source-settings" : effect === "after-write"
+        ? "destination-settings" : "foreign-or-torn", effect)
+    assert.equal(restarted.observation, effect === "after-write"
+      ? "destination-settings-observed-uncommitted" : "manual-recovery-required")
+    assert.equal(s.f.s.holderCounts().held, false)
+  }
+})
+
+test("D233 full Git content changed with fixed HEAD prevents any native Settings write", async () => {
+  const s = await d233Scenario()
+  const before = new Map(s.f.s.files)
+  const gh = s.f.s.f
+  const entry = gh.entries.find(e => e.path === gh.receipts[0]!.path)!
+  const bytes = gh.blobs.get(entry.sha)!
+  const damaged = bytes.slice()
+  damaged[damaged.length - 1] ^= 1
+  gh.blobs.set(entry.sha, damaged)
+  await assert.rejects(persistV4FencedDestinationSettings(s.cutover),
+    /Git|blob|ciphertext|integrity|proof/i)
+  assert.equal(s.saved, s.initial)
+  assert.equal(s.writes, 0)
+  assert.deepEqual(s.f.s.files, before)
+  assert.equal(s.f.s.holderCounts().held, false)
+})
+
+test("D233 persist changes or missing old/new secret fail closed after Settings write", async () => {
+  for (const kind of ["changed-preferences", "missing-old-secret", "moved-backup"] as const) {
+    const s = await d233Scenario()
+    await persistV4FencedDestinationSettings(s.cutover)
+    if (kind === "changed-preferences") {
+      const changed = JSON.parse(s.saved)
+      changed.settings.ignorePathRegex = "^Altered/"
+      s.setPersisted(changed)
+    } else if (kind === "missing-old-secret") {
+      s.f.s.secrets.delete(s.f.id.sourcePassphraseSecretId)
+    } else {
+      s.b.setRef("9".repeat(40))
+    }
+    const recovered = await inspectV4FencedDestinationSettingsAfterRestart(s.cutover)
+    assert.equal(recovered.observation, "manual-recovery-required", kind)
+    assert.equal(recovered.resumeSyncAuthorized, false, kind)
+  }
+})
 
 async function d232Scenario() {
   const f = await d179Scenario()
