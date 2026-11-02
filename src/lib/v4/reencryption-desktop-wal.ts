@@ -14,7 +14,7 @@ import type { V4LocalIndexAdapter } from "./local-index"
  */
 export class V4DesktopRekeyWalRecoveryRequiredError extends Error {
   constructor() {
-    super("Re-encryption Desktop WAL contains unrecognized interrupted temporary data; manual recovery required.")
+    super("Re-encryption Desktop WAL has pre-existing or interrupted recovery evidence; manual recovery required.")
     this.name = "V4DesktopRekeyWalRecoveryRequiredError"
   }
 }
@@ -106,16 +106,22 @@ export interface V4DesktopRekeyWalStorage {
 
 /**
  * rootAbsolute MUST be an existing, explicitly authorized, private directory.
- * It is NEVER inferred from the live user vault, and test callers use their
- * own disposable OS temp directory. Do not pass untrusted roots.
+ * The generic factory never infers one. The D243 owner boundary can derive
+ * this from Obsidian's pinned vault adapter after physical path validation.
+ * Tests use disposable OS directories. Never pass untrusted roots.
  */
 export async function acquireV4DesktopRekeyWalStorage(options: {
   readonly rootAbsolute: string
   readonly journalRoot: string
   readonly recoveryExistingOnly?: boolean
+  /** Refuse even an empty WAL leaf from an earlier attempt; no directory reuse. */
+  readonly requireNewJournalRoot?: boolean
 }): Promise<V4DesktopRekeyWalStorage> {
   const { fs, path } = await desktopIo()
   const parts = validRelativeRoot(options.journalRoot)
+  if (options.recoveryExistingOnly === true && options.requireNewJournalRoot === true) {
+    throw new Error("Re-encryption WAL cannot be new and existing-only simultaneously.")
+  }
   if (!path.isAbsolute(options.rootAbsolute)) {
     throw new Error("Re-encryption Desktop WAL requires a trusted absolute root.")
   }
@@ -127,16 +133,30 @@ export async function acquireV4DesktopRekeyWalStorage(options: {
   }
   const directory = path.join(root, ...parts)
   const lockPath = path.join(directory, ".exclusive.lock")
+  let initializingNewWalRoot = options.requireNewJournalRoot === true
   const ensureSafeDir = async (segments: readonly string[], create: boolean): Promise<void> => {
     let current = root
-    for (const segment of segments) {
+    for (const [i, segment] of segments.entries()) {
       current = path.join(current, segment)
       let stat: Awaited<ReturnType<typeof fs.lstat>>
-      try { stat = await fs.lstat(current) }
-      catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ENOENT" || !create) throw error
-        await fs.mkdir(current, { mode: 0o700 })
+      if (create && initializingNewWalRoot && i === parts.length - 1) {
+        // mkdir on the exact WAL leaf is the atomic create-only boundary.
+        // An empty leaf from an interrupted run is still recovery evidence.
+        try { await fs.mkdir(current, { mode: 0o700 }) }
+        catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+            throw new V4DesktopRekeyWalRecoveryRequiredError()
+          }
+          throw error
+        }
         stat = await fs.lstat(current)
+      } else {
+        try { stat = await fs.lstat(current) }
+        catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT" || !create) throw error
+          await fs.mkdir(current, { mode: 0o700 })
+          stat = await fs.lstat(current)
+        }
       }
       if (!stat.isDirectory() || stat.isSymbolicLink()
         || (await fs.realpath(current)).toLowerCase() !== current.toLowerCase()) {
@@ -146,6 +166,7 @@ export async function acquireV4DesktopRekeyWalStorage(options: {
   }
 
   await ensureSafeDir(parts, options.recoveryExistingOnly !== true)
+  initializingNewWalRoot = false
   if (options.recoveryExistingOnly === true) {
     const entries = await fs.readdir(directory)
     if (entries.length !== 2 || !entries.includes("slot-0.json") || !entries.includes("slot-1.json")) {
