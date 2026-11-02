@@ -112,6 +112,7 @@ export interface V4DesktopRekeyWalStorage {
 export async function acquireV4DesktopRekeyWalStorage(options: {
   readonly rootAbsolute: string
   readonly journalRoot: string
+  readonly recoveryExistingOnly?: boolean
 }): Promise<V4DesktopRekeyWalStorage> {
   const { fs, path } = await desktopIo()
   const parts = validRelativeRoot(options.journalRoot)
@@ -144,7 +145,20 @@ export async function acquireV4DesktopRekeyWalStorage(options: {
     }
   }
 
-  await ensureSafeDir(parts, true)
+  await ensureSafeDir(parts, options.recoveryExistingOnly !== true)
+  if (options.recoveryExistingOnly === true) {
+    const entries = await fs.readdir(directory)
+    if (entries.length !== 2 || !entries.includes("slot-0.json") || !entries.includes("slot-1.json")) {
+      throw new V4DesktopRekeyWalRecoveryRequiredError()
+    }
+    for (const slot of ["slot-0.json", "slot-1.json"]) {
+      const info = await fs.lstat(path.join(directory, slot))
+      if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1
+        || info.size > MAX_SLOT_BYTES) {
+        throw new V4DesktopRekeyWalRecoveryRequiredError()
+      }
+    }
+  }
   const token = toBase64Url(randomBytes(24))
   let lockHandle: Awaited<ReturnType<typeof fs.open>>
   try {
@@ -246,7 +260,11 @@ export async function acquireV4DesktopRekeyWalStorage(options: {
     // Never silently ignore a temp slot that may represent an interrupted
     // transaction. It can contain evidence newer than the last valid WAL.
     const entries = await fs.readdir(directory)
-    if (entries.some(entry => ![".exclusive.lock", "slot-0.json", "slot-1.json"].includes(entry))) {
+    if (entries.some(entry => ![".exclusive.lock", "slot-0.json", "slot-1.json"].includes(entry))
+      || (options.recoveryExistingOnly === true
+        && (entries.length !== 3
+          || !entries.includes("slot-0.json")
+          || !entries.includes("slot-1.json")))) {
       throw new V4DesktopRekeyWalRecoveryRequiredError()
     }
   } catch (error) {

@@ -43,6 +43,7 @@ import { inspectV4ColdStartDestination } from "../../src/lib/v4/reencryption-col
 import { inspectV4ColdStartWalDestination } from "../../src/lib/v4/reencryption-cold-start-wal-destination"
 import { createV4ReencryptionRecoveryJournal } from "../../src/lib/v4/reencryption-recovery-journal"
 import { acquireV4DesktopRekeyWalStorage } from "../../src/lib/v4/reencryption-desktop-wal"
+import { openV4ExistingDesktopWalForRecovery } from "../../src/lib/v4/reencryption-desktop-wal-recovery"
 import type { V4ReencryptionCutoverSnapshotContract } from "../../src/lib/v4/reencryption-cutover-snapshot-contract"
 import { V4PluginRuntime } from "../../src/lib/v4/runtime"
 import { inspectV4ReencryptionPendingCutoverIntent } from "../../src/lib/v4/reencryption-cutover-intent-crypto"
@@ -941,7 +942,7 @@ test("D239 fresh Windows disk WAL and Index readers preserve ciphertext across l
   await mkdir(walDir)
   await mkdir(indexDir)
   let first: Awaited<ReturnType<typeof acquireV4DesktopRekeyWalStorage>> | undefined
-  let reopened: Awaited<ReturnType<typeof acquireV4DesktopRekeyWalStorage>> | undefined
+  let reopened: Awaited<ReturnType<typeof openV4ExistingDesktopWalForRecovery>> | undefined
   try {
     for (const [relativePath, content] of s.files) {
       const file = path.join(indexDir, relativePath)
@@ -962,7 +963,7 @@ test("D239 fresh Windows disk WAL and Index readers preserve ciphertext across l
     assert.equal(await first.assertBestEffortCheckpoint(), "best-effort-readback-only")
     await first.release()
     first = undefined
-    reopened = await acquireV4DesktopRekeyWalStorage({
+    reopened = await openV4ExistingDesktopWalForRecovery({
       rootAbsolute: walDir, journalRoot: s.input.wal.root,
     })
     const storage = reopened

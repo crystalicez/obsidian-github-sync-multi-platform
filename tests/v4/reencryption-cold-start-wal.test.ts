@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { mkdir, mkdtemp, rm } from "node:fs/promises"
+import { mkdir, mkdtemp, readdir, rm, stat, writeFile } from "node:fs/promises"
 import path from "node:path"
 
 import { sha256Hex, utf8ToBytes } from "../../src/lib/bytes"
@@ -9,6 +9,7 @@ import type { V4ReencryptionCutoverSnapshotContract } from "../../src/lib/v4/ree
 import type { V4LocalIndexAdapter } from "../../src/lib/v4/local-index"
 import { createV4ReencryptionRecoveryJournal } from "../../src/lib/v4/reencryption-recovery-journal"
 import { acquireV4DesktopRekeyWalStorage } from "../../src/lib/v4/reencryption-desktop-wal"
+import { openV4ExistingDesktopWalForRecovery } from "../../src/lib/v4/reencryption-desktop-wal-recovery"
 
 const sourceCommitSha = "a".repeat(40)
 const sourceTreeSha = "b".repeat(40)
@@ -195,7 +196,7 @@ test("D237 real Windows Node WAL readback remains authenticated after release an
   await mkdir(path.join(process.cwd(), ".tmp"), { recursive: true })
   const root = await mkdtemp(path.join(process.cwd(), ".tmp", "d237-wal-"))
   let first: Awaited<ReturnType<typeof acquireV4DesktopRekeyWalStorage>> | undefined
-  let second: Awaited<ReturnType<typeof acquireV4DesktopRekeyWalStorage>> | undefined
+  let second: Awaited<ReturnType<typeof openV4ExistingDesktopWalForRecovery>> | undefined
   try {
     first = await acquireV4DesktopRekeyWalStorage({ rootAbsolute: root, journalRoot: walRoot })
     for (const [file, data] of s.storage.files) {
@@ -206,7 +207,7 @@ test("D237 real Windows Node WAL readback remains authenticated after release an
     assert.equal(await first.assertBestEffortCheckpoint(), "best-effort-readback-only")
     await first.release()
     first = undefined
-    second = await acquireV4DesktopRekeyWalStorage({ rootAbsolute: root, journalRoot: walRoot })
+    second = await openV4ExistingDesktopWalForRecovery({ rootAbsolute: root, journalRoot: walRoot })
     assert.equal(await second.assertBestEffortCheckpoint(), "best-effort-readback-only")
     const before = await second.adapter.read(walRoot + "/slot-0.json")
     const after = await second.adapter.read(walRoot + "/slot-1.json")
@@ -224,6 +225,88 @@ test("D237 real Windows Node WAL readback remains authenticated after release an
   } finally {
     await second?.release()
     await first?.release()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("D241 existing-only Windows recovery opener never creates a missing WAL directory", async () => {
+  await mkdir(path.join(process.cwd(), ".tmp"), { recursive: true })
+  const root = await mkdtemp(path.join(process.cwd(), ".tmp", "d241-wal-absent-"))
+  try {
+    const directory = path.join(root, ...walRoot.split("/"))
+    await assert.rejects(openV4ExistingDesktopWalForRecovery({
+      rootAbsolute: root, journalRoot: walRoot,
+    }))
+    await assert.rejects(stat(directory), { code: "ENOENT" })
+    assert.deepEqual(await readdir(root), [])
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("D241 existing-only recovery accepts both original encrypted slots after release and exposes no writer", async () => {
+  const s = await scenario()
+  await mkdir(path.join(process.cwd(), ".tmp"), { recursive: true })
+  const root = await mkdtemp(path.join(process.cwd(), ".tmp", "d241-wal-valid-"))
+  let created: Awaited<ReturnType<typeof acquireV4DesktopRekeyWalStorage>> | undefined
+  let reader: Awaited<ReturnType<typeof openV4ExistingDesktopWalForRecovery>> | undefined
+  try {
+    created = await acquireV4DesktopRekeyWalStorage({ rootAbsolute: root, journalRoot: walRoot })
+    for (const [name, content] of s.storage.files) await created.adapter.write(name, content)
+    await created.release()
+    created = undefined
+    reader = await openV4ExistingDesktopWalForRecovery({ rootAbsolute: root, journalRoot: walRoot })
+    assert.equal(Object.hasOwn(reader.adapter, "write"), false)
+    assert.equal(Object.hasOwn(reader.adapter, "mkdir"), false)
+    assert.equal(Object.isFrozen(reader.adapter), true)
+    assert.equal(await reader.assertBestEffortCheckpoint(), "best-effort-readback-only")
+    assert.equal((await inspectV4ColdStartWalSnapshot({
+      ...s.input, adapter: reader.adapter,
+    })).observation, "authenticated-current-wal-still-fenced")
+    for (const [name, content] of s.storage.files) {
+      assert.equal(await reader.adapter.read(name), content)
+    }
+    await reader.release()
+    reader = undefined
+    const directory = path.join(root, ...walRoot.split("/"))
+    assert.deepEqual((await readdir(directory)).sort(), ["slot-0.json", "slot-1.json"])
+  } finally {
+    await reader?.release()
+    await created?.release()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("D241 rejects incomplete, foreign-temp and already-locked WAL without changing recovery evidence", async () => {
+  await mkdir(path.join(process.cwd(), ".tmp"), { recursive: true })
+  const root = await mkdtemp(path.join(process.cwd(), ".tmp", "d241-wal-invalid-"))
+  const dir = path.join(root, ...walRoot.split("/"))
+  try {
+    await mkdir(dir, { recursive: true })
+    const slot0 = path.join(dir, "slot-0.json")
+    const slot1 = path.join(dir, "slot-1.json")
+    await writeFile(slot0, "encrypted-slot-evidence")
+    await assert.rejects(openV4ExistingDesktopWalForRecovery({
+      rootAbsolute: root, journalRoot: walRoot,
+    }))
+    assert.deepEqual(await readdir(dir), ["slot-0.json"])
+    await writeFile(slot1, "encrypted-slot-evidence")
+    await writeFile(path.join(dir, ".slot-interrupted.tmp"), "newer-recovery-evidence")
+    await assert.rejects(openV4ExistingDesktopWalForRecovery({
+      rootAbsolute: root, journalRoot: walRoot,
+    }))
+    assert.deepEqual((await readdir(dir)).sort(),
+      [".slot-interrupted.tmp", "slot-0.json", "slot-1.json"].sort())
+    await rm(path.join(dir, ".slot-interrupted.tmp"))
+    await writeFile(path.join(dir, ".exclusive.lock"), "another process owns this")
+    await assert.rejects(openV4ExistingDesktopWalForRecovery({
+      rootAbsolute: root, journalRoot: walRoot,
+    }))
+    assert.equal(await stat(path.join(dir, ".exclusive.lock")).then(s => s.isFile()), true)
+    assert.equal(await readdir(dir).then(items => items.includes(".exclusive.lock")), true)
+    assert.equal(await stat(slot0).then(s => s.size), "encrypted-slot-evidence".length)
+    assert.equal(await stat(slot1).then(s => s.size), "encrypted-slot-evidence".length)
+  } finally {
     await rm(root, { recursive: true, force: true })
   }
 })
