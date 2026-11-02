@@ -26,6 +26,7 @@ import { createV4PlatformIo, V4ManualRecoveryRequiredError, type V4BinaryAdapter
 import { isV4UncVaultPath, V4_NETWORK_VAULT_WARNING } from "./network-storage"
 import { createV4DesktopInitiatorLocalReader } from "./reencryption-desktop-initiator-reader"
 import { createV4MobileInitiatorLocalReader } from "./reencryption-mobile-initiator-reader"
+import { openV4NewDesktopPluginWalWriter, type V4DesktopPluginWalWriter } from "./reencryption-desktop-plugin-wal-writer"
 import { armV4ReencryptionSyncFence, assertV4ReencryptionSyncFenceClear, V4ReencryptionSyncFencedError, type V4ReencryptionSyncFenceReport } from "./reencryption-sync-fence"
 import type { V4InitiatorLocalReader } from "./reencryption-initiator-parity"
 import { createV4StagingStore, type V4StagingStore } from "./staging-store"
@@ -53,6 +54,15 @@ type V4RuntimeConfigSource = "observed-remote" | "speculative-empty"
 interface V4RuntimeConfigSelection {
   config: V4RemoteConfig
   source: V4RuntimeConfigSource
+}
+
+interface V4ArmedReencryptionInitiator {
+  readonly runId: string
+  readonly sourceRepoId: string
+  readonly destinationRepoId: string
+  readonly assertExclusiveInitiatorLease: () => Promise<void>
+  readonly assertPinned: () => void
+  readonly assertQuiescent: () => void
 }
 
 export function selectV4RuntimeConfig(discovered: V4RemoteConfig | null, mode: V4StorageMode, repoId: string, newVaultKdfIterations = V4_DEFAULT_PBKDF2_ITERATIONS): V4RemoteConfig {
@@ -173,6 +183,8 @@ export class V4PluginRuntime {
   private debounceRunActive = false
   private reencryptionSyncFenced = false
   private reencryptionFencePending = false
+  /** Set only after this live Runtime successfully persists the D173 Fence. */
+  private armedReencryptionInitiator: V4ArmedReencryptionInitiator | undefined
   private disposed = false
   private coldStartIndexRoute?: V4ReencryptionColdStartRouteReport
 
@@ -194,6 +206,7 @@ export class V4PluginRuntime {
   dispose(): void {
     if (this.disposed) return
     this.disposed = true
+    this.armedReencryptionInitiator = undefined
     this.debounceRunActive = false
     this.recentlyStagedPaths.clear()
     this.coordinator.dispose()
@@ -453,7 +466,11 @@ export class V4PluginRuntime {
     readonly assertExclusiveInitiatorLease: () => Promise<void>
   }): Promise<V4ReencryptionSyncFenceReport> {
     this.assertNotDisposed()
-    const initial = { ...this.plugin.settings }
+    const originalSettings = this.plugin.settings
+    const originalVault = this.plugin.app.vault
+    const originalConfigDir = originalVault.configDir || ".obsidian"
+    const originalPluginId = this.plugin.manifest.id
+    const initial = { ...originalSettings }
     if (this.uncVault || !this.indexAdapterBacking
       || this.plugin.app.vault.adapter !== this.indexAdapterBacking
       || initial.encryptionMode !== "encrypted"
@@ -479,6 +496,10 @@ export class V4PluginRuntime {
       const now = this.plugin.settings
       if (input.runId !== runId || input.destinationRepoId !== destinationRepoId
         || input.assertExclusiveInitiatorLease !== initiatorLease
+        || this.plugin.settings !== originalSettings
+        || this.plugin.app.vault !== originalVault
+        || (originalVault.configDir || ".obsidian") !== originalConfigDir
+        || this.plugin.manifest.id !== originalPluginId
         || this.plugin.app.vault.adapter !== this.indexAdapterBacking
         || this.credentialGeneration !== originalGeneration
         || now.githubOwner !== initial.githubOwner || now.githubRepo !== initial.githubRepo
@@ -487,6 +508,10 @@ export class V4PluginRuntime {
         || now.encryptionPassphrase !== initial.encryptionPassphrase
         || now.encryptionPassphraseSecretId !== initial.encryptionPassphraseSecretId
         || now.githubTokenSecretId !== initial.githubTokenSecretId || now.vault !== initial.vault
+        || now.ignorePathRegex !== initial.ignorePathRegex
+        || now.syncObsidianConfig !== initial.syncObsidianConfig
+        || now.syncBookmarks !== initial.syncBookmarks
+        || now.syncPlugins !== initial.syncPlugins
         || this.debounceRunActive || this.recentlyStagedPaths.size > 0
         || this.plugin.isSyncInProgress || this.plugin.isSettingsSaveInProgress?.()) {
         throw new Error("Re-encryption Source or Sync status changed; Manual Recovery required.")
@@ -510,14 +535,79 @@ export class V4PluginRuntime {
       })
       assertQuiescent()
       assertPinned()
+      this.armedReencryptionInitiator = Object.freeze({
+        runId, sourceRepoId, destinationRepoId,
+        assertExclusiveInitiatorLease: initiatorLease,
+        assertPinned, assertQuiescent,
+      })
       return report
     } finally {
       // Even an ambiguous mkdir/write response must not restart Sync here.
       this.reencryptionSyncFenced = true
       this.reencryptionFencePending = false
-      this.plugin.disableWatch?.()
+      try {
+        this.plugin.disableWatch?.()
+      } catch (error) {
+        // A failed final watch shutdown cannot leave a write-capable session.
+        this.armedReencryptionInitiator = undefined
+        throw error
+      }
     }
   }
+  /**
+   * D244: internal, explicitly invoked WAL authoring only AFTER this same
+   * live Runtime successfully armed its own persisted D173 Sync Fence.
+   * No startup/Recovery path reconstructs this authority after a restart.
+   * Not used by Wizard Run, and never authorizes Sync or Cutover.
+   */
+  async openNewReencryptionDesktopWalForArmedRun(): Promise<V4DesktopPluginWalWriter> {
+    this.assertNotDisposed()
+    const session = this.armedReencryptionInitiator
+    const backing = this.indexAdapterBacking
+    const vault = this.plugin.app.vault
+    const adapter = vault.adapter as typeof vault.adapter & {
+      getFullPath?: (path: string) => string
+    }
+    if (Platform.isDesktopApp !== true || this.uncVault || !session
+      || !this.reencryptionSyncFenced || this.reencryptionFencePending
+      || !backing || adapter !== backing || typeof adapter?.getFullPath !== "function") {
+      throw new Error("Re-encryption Desktop WAL requires this live initiating Runtime and its persisted Fence.")
+    }
+    const settings = this.plugin.settings
+    const configDir = vault.configDir || ".obsidian"
+    const pluginId = this.plugin.manifest.id
+    const assertLiveOwner = () => {
+      this.assertNotDisposed()
+      if (this.armedReencryptionInitiator !== session
+        || !this.reencryptionSyncFenced || this.reencryptionFencePending
+        || this.plugin.app.vault !== vault || vault.adapter !== backing
+        || this.plugin.settings !== settings
+        || (vault.configDir || ".obsidian") !== configDir
+        || this.plugin.manifest.id !== pluginId
+        || this.plugin.isSyncInProgress || this.plugin.isSettingsSaveInProgress?.()) {
+        throw new Error("Re-encryption Desktop WAL initiating owner changed; Manual Recovery required.")
+      }
+      session.assertQuiescent()
+      session.assertPinned()
+    }
+    const assertExclusiveInitiatorLease = async () => {
+      assertLiveOwner()
+      await session.assertExclusiveInitiatorLease()
+      assertLiveOwner()
+    }
+    assertLiveOwner()
+    return openV4NewDesktopPluginWalWriter({
+      adapter: adapter as typeof adapter & { getFullPath(path: string): string },
+      configDir, pluginId, runId: session.runId,
+      fenceAdapter: this.adapter,
+      sourceRepoId: session.sourceRepoId,
+      destinationRepoId: session.destinationRepoId,
+      assertLiveOwner,
+      assertExclusiveInitiatorLease,
+      assertSyncFenceArmed: async () => { assertLiveOwner() },
+    })
+  }
+
   get progressSnapshot(): V4SyncProgressSnapshot {
     return this.snapshotForConsumers(this.progressStore.snapshot)
   }

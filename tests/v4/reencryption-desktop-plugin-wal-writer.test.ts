@@ -7,6 +7,7 @@ import { createV4ReencryptionRecoveryJournal } from "../../src/lib/v4/reencrypti
 import { openV4DesktopPluginWalForRecovery } from "../../src/lib/v4/reencryption-desktop-plugin-wal-recovery"
 import { openV4NewDesktopPluginWalWriter } from "../../src/lib/v4/reencryption-desktop-plugin-wal-writer"
 import { planV4PluginPrivateWalLocation } from "../../src/lib/v4/reencryption-plugin-wal-location"
+import { armV4ReencryptionSyncFence, V4_REENCRYPTION_SYNC_FENCE_ROOT } from "../../src/lib/v4/reencryption-sync-fence"
 import type { V4LocalIndexAdapter } from "../../src/lib/v4/local-index"
 
 const runId = "d243-new-wal-123456"
@@ -14,6 +15,8 @@ const configDir = ".obsidian"
 const pluginId = "obsidian-encrypted-github-sync"
 const sourceCommitSha = "a".repeat(40)
 const destinationRepoId = "owner/repo#rekey/destination"
+const sourceRepoId = "owner/repo#main"
+const fencePath = V4_REENCRYPTION_SYNC_FENCE_ROOT + "/active.json"
 const key = new Uint8Array(32).fill(0x71)
 
 async function fixture() {
@@ -23,6 +26,22 @@ async function fixture() {
   const privateRoot = path.join(vault, ...layout.pluginStorageRoot.split("/"))
   const leaf = path.join(privateRoot, ...layout.journalRoot.split("/"))
   await mkdir(privateRoot, { recursive: true })
+  const fenceAdapter: V4LocalIndexAdapter = {
+    async read(name) { return readFile(path.join(privateRoot, name), "utf8") },
+    async exists(name) {
+      return stat(path.join(privateRoot, name)).then(() => true,
+        (error: NodeJS.ErrnoException) => {
+          if (error.code === "ENOENT") return false
+          throw error
+        })
+    },
+    async mkdir(name) { await mkdir(path.join(privateRoot, name)) },
+    async write(name, data) { await writeFile(path.join(privateRoot, name), data) },
+  }
+  await armV4ReencryptionSyncFence({
+    adapter: fenceAdapter, runId, sourceRepoId, destinationRepoId,
+    assertExclusiveInitiatorLease: async () => {},
+  })
   let ownerLive = true
   let leaseLive = true
   let fenceArmed = true
@@ -30,13 +49,13 @@ async function fixture() {
     getFullPath(logical: string) { return path.join(vault, ...logical.split("/").filter(Boolean)) },
   }
   const input = {
-    adapter, configDir, pluginId, runId,
+    adapter, configDir, pluginId, runId, fenceAdapter, sourceRepoId, destinationRepoId,
     assertLiveOwner: () => { if (!ownerLive) throw Error("owner lost") },
     assertExclusiveInitiatorLease: async () => { if (!leaseLive) throw Error("lease lost") },
     assertSyncFenceArmed: async () => { if (!fenceArmed) throw Error("Sync Fence missing") },
   }
   return {
-    vault, privateRoot, leaf, layout, input,
+    vault, privateRoot, leaf, layout, input, fenceAdapter,
     loseOwner() { ownerLive = false },
     loseLease() { leaseLive = false },
     loseFence() { fenceArmed = false },
@@ -121,7 +140,7 @@ test("D243 cannot author WAL without both live initiating lease and persisted fe
       if (cause === "fence") f.loseFence()
       if (cause === "owner") f.loseOwner()
       await assert.rejects(openV4NewDesktopPluginWalWriter(f.input))
-      assert.deepEqual(await readdir(f.privateRoot), [], cause)
+      assert.equal(await stat(f.leaf).then(() => true, () => false), false, cause)
     } finally {
       await rm(f.vault, { recursive: true, force: true })
     }
@@ -181,10 +200,85 @@ test("D243 rejects mutated fence/lease callback identity and out-of-root writes"
     await assert.rejects(writer.adapter.mkdir("../outside"))
     f.input.assertSyncFenceArmed = async () => {}
     await assert.rejects(writer.adapter.write(f.layout.journalRoot + "/slot-0.json", "bad"),
-      /callback changed/u)
+      /identity changed/u)
     await writer.release()
     writer = undefined
     assert.deepEqual(await readdir(f.leaf), [])
+  } finally {
+    await writer?.release()
+    await rm(f.vault, { recursive: true, force: true })
+  }
+})
+
+test("D244 a missing, malformed or wrong-run persisted Fence blocks WAL creation even when live callback agrees", async () => {
+  for (const state of ["missing", "torn", "wrong-run"] as const) {
+    const f = await fixture()
+    try {
+      const marker = path.join(f.privateRoot, fencePath)
+      if (state === "missing") await rm(marker)
+      if (state === "torn") await writeFile(marker, "{interrupted")
+      if (state === "wrong-run") {
+        const raw = JSON.parse(await readFile(marker, "utf8")) as { runId: string }
+        raw.runId = "another-fenced-run-456"
+        await writeFile(marker, JSON.stringify(raw))
+      }
+      await assert.rejects(openV4NewDesktopPluginWalWriter(f.input),
+        /Re-encryption is pending/u)
+      assert.equal(await stat(f.leaf).then(() => true, () => false), false)
+      assert.equal(await stat(marker).then(() => true, () => false), state !== "missing")
+    } finally {
+      await rm(f.vault, { recursive: true, force: true })
+    }
+  }
+})
+
+test("D244 disk Fence mutation after one WAL write freezes authoring and preserves the last encrypted slot", async () => {
+  for (const state of ["missing-marker", "torn-marker", "wrong-run"] as const) {
+    const f = await fixture()
+    let writer: Awaited<ReturnType<typeof openV4NewDesktopPluginWalWriter>> | undefined
+    try {
+      writer = await openV4NewDesktopPluginWalWriter(f.input)
+      const slot0 = f.layout.journalRoot + "/slot-0.json"
+      const slot1 = f.layout.journalRoot + "/slot-1.json"
+      await writer.adapter.write(slot0, "previous WAL ciphertext evidence")
+      const evidence = await readFile(path.join(f.leaf, "slot-0.json"), "utf8")
+      const marker = path.join(f.privateRoot, fencePath)
+      if (state === "missing-marker") await rm(marker)
+      if (state === "torn-marker") await writeFile(marker, "{torn")
+      if (state === "wrong-run") {
+        const raw = JSON.parse(await readFile(marker, "utf8")) as { runId: string }
+        raw.runId = "another-run-after-start"
+        await writeFile(marker, JSON.stringify(raw))
+      }
+      await assert.rejects(writer.adapter.write(slot1, "must not persist"),
+        /Re-encryption is pending/u)
+      await assert.rejects(writer.assertBestEffortCheckpoint(), /Re-encryption is pending/u)
+      assert.equal(await stat(path.join(f.leaf, "slot-1.json")).then(
+        () => true, () => false), false)
+      assert.equal(await readFile(path.join(f.leaf, "slot-0.json"), "utf8"), evidence)
+      await writer.release()
+      writer = undefined
+      assert.deepEqual(await readdir(f.leaf), ["slot-0.json"])
+    } finally {
+      await writer?.release()
+      await rm(f.vault, { recursive: true, force: true })
+    }
+  }
+})
+
+test("D244 swapping the persisted Fence reader or migration identity never authorizes another WAL mutation", async () => {
+  const f = await fixture()
+  let writer: Awaited<ReturnType<typeof openV4NewDesktopPluginWalWriter>> | undefined
+  try {
+    writer = await openV4NewDesktopPluginWalWriter(f.input)
+    f.input.sourceRepoId = "owner/repo#other"
+    await assert.rejects(writer.adapter.write(f.layout.journalRoot + "/slot-0.json", "wrong"),
+      /persisted Fence or identity changed/u)
+    f.input.sourceRepoId = sourceRepoId
+    const original = f.fenceAdapter.read
+    f.fenceAdapter.read = name => original(name)
+    await assert.rejects(writer.adapter.write(f.layout.journalRoot + "/slot-0.json", "wrong"))
+    assert.deepEqual(await readdir(f.leaf), [".exclusive.lock"])
   } finally {
     await writer?.release()
     await rm(f.vault, { recursive: true, force: true })

@@ -1,4 +1,5 @@
 import type { V4LocalIndexAdapter } from "./local-index"
+import { createV4PersistedWalFenceAssertion } from "./reencryption-persisted-wal-fence"
 import { acquireV4DesktopRekeyWalStorage, type V4DesktopRekeyWalStorage } from "./reencryption-desktop-wal"
 import { resolveV4DesktopPluginWalOwner, type V4DesktopPluginWalOwner } from "./reencryption-desktop-plugin-wal-owner"
 
@@ -19,7 +20,12 @@ export interface V4DesktopPluginWalWriter
  */
 export interface V4DesktopPluginWalWriterInput extends V4DesktopPluginWalOwner {
   readonly assertExclusiveInitiatorLease: () => Promise<void>
+  /** Additional live Runtime guard, NOT proof of a persisted Fence by itself. */
   readonly assertSyncFenceArmed: () => Promise<void>
+  /** The actual plugin-private Index adapter used to arm D173, not a stub. */
+  readonly fenceAdapter: Pick<V4LocalIndexAdapter, "read" | "exists">
+  readonly sourceRepoId: string
+  readonly destinationRepoId: string
 }
 
 /**
@@ -36,19 +42,33 @@ export async function openV4NewDesktopPluginWalWriter(
   if (typeof lease !== "function" || typeof fence !== "function") {
     throw Error("Desktop WAL authoring requires a live migration lease and persisted Sync Fence.")
   }
+  const persistedFence = createV4PersistedWalFenceAssertion({
+    adapter: input.fenceAdapter,
+    runId: input.runId,
+    sourceRepoId: input.sourceRepoId,
+    destinationRepoId: input.destinationRepoId,
+    assertLiveOwner: input.assertLiveOwner,
+  })
+  const { fenceAdapter, sourceRepoId, destinationRepoId } = input
   const owner = await resolveV4DesktopPluginWalOwner(input)
   const assertReady = async () => {
     owner.checkOwner()
-    if (input.assertExclusiveInitiatorLease !== lease || input.assertSyncFenceArmed !== fence) {
-      throw Error("Re-encryption WAL initiating lease or Sync Fence callback changed.")
+    if (input.assertExclusiveInitiatorLease !== lease || input.assertSyncFenceArmed !== fence
+      || input.fenceAdapter !== fenceAdapter || input.sourceRepoId !== sourceRepoId
+      || input.destinationRepoId !== destinationRepoId) {
+      throw Error("Re-encryption WAL initiating lease, persisted Fence or identity changed.")
     }
     await lease()
     owner.checkOwner()
     await fence()
     owner.checkOwner()
+    await persistedFence()
+    owner.checkOwner()
     await owner.assertPhysicalOwner()
-    if (input.assertExclusiveInitiatorLease !== lease || input.assertSyncFenceArmed !== fence) {
-      throw Error("Re-encryption WAL initiating lease or Sync Fence callback changed.")
+    if (input.assertExclusiveInitiatorLease !== lease || input.assertSyncFenceArmed !== fence
+      || input.fenceAdapter !== fenceAdapter || input.sourceRepoId !== sourceRepoId
+      || input.destinationRepoId !== destinationRepoId) {
+      throw Error("Re-encryption WAL initiating lease, persisted Fence or identity changed.")
     }
   }
   await assertReady()
