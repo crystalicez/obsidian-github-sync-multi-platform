@@ -2064,6 +2064,91 @@ test("D235 rederives the original journal key from immutable encrypted Backup co
   await assert.rejects(assertV4ReencryptionSyncFenceClear(s.f.s.adapter))
 })
 
+test("D240 independently recovered Backup key and saved Cutover Contract bind to one exact D239 input", async () => {
+  const s = await d235Scenario()
+  const manifestPath = V4_RUNTIME_INDEX_ROOT + "-rekey-cutover-candidate-"
+    + s.f.id.runId + "/contract.json"
+  const encoded = await s.f.s.adapter.read(manifestPath)
+  const contract = decodeV4ReencryptionCutoverCandidateManifest(encoded)
+  const binding = { contract, originalJournalKey: Uint8Array.from(s.oldJournalKey) }
+  const files = new Map(s.f.s.files)
+  const secrets = new Map(s.f.s.secrets)
+  const writes = s.f.s.getWrites()
+  const result = await inspectV4ReencryptionColdStartJournalKey({
+    ...s.input, expectedRecoveryBinding: binding,
+  })
+  assert.equal(result.observation, "authenticated-local-route-still-fenced")
+  assert.equal(result.completeBackupContentsReverified, true)
+  assert.equal(result.recoveredKeyAndContractBoundToCaller, true)
+  assert.equal(result.completeDestinationContentsReverified, false)
+  assert.equal(result.coldStartWalReverified, false)
+  assert.equal(result.resumeSyncAuthorized, false)
+  assert.equal(s.f.s.getWrites(), writes)
+  assert.deepEqual(s.f.s.files, files)
+  assert.deepEqual(s.f.s.secrets, secrets)
+  assert.deepEqual(binding.originalJournalKey, s.oldJournalKey)
+  const oldReport = await inspectV4ReencryptionColdStartJournalKey(s.input)
+  assert.equal(oldReport.recoveredKeyAndContractBoundToCaller, false)
+  assert.equal(oldReport.completeBackupContentsReverified, true)
+})
+
+test("D240 rejects foreign key and saved Contract binding without treating either as new proof", async () => {
+  for (const cause of ["key", "transaction", "generation"] as const) {
+    const s = await d235Scenario()
+    const encoded = await s.f.s.adapter.read(V4_RUNTIME_INDEX_ROOT
+      + "-rekey-cutover-candidate-" + s.f.id.runId + "/contract.json")
+    const contract = decodeV4ReencryptionCutoverCandidateManifest(encoded)
+    const key = Uint8Array.from(s.oldJournalKey)
+    if (cause === "key") key[0] ^= 1
+    if (cause === "transaction") Object.assign(contract, { transactionId: "1".repeat(32) })
+    if (cause === "generation") Object.assign(contract.identity, {
+      walGeneration: contract.identity.walGeneration + 1,
+    })
+    const writes = s.f.s.getWrites()
+    const report = await inspectV4ReencryptionColdStartJournalKey({
+      ...s.input, expectedRecoveryBinding: { contract, originalJournalKey: key },
+    })
+    assert.equal(report.observation, "manual-recovery-required", cause)
+    assert.equal(report.recoveredKeyAndContractBoundToCaller, false, cause)
+    assert.equal(report.localCutoverAuthorized, false, cause)
+    assert.equal(report.remoteWritesAuthorized, false, cause)
+    assert.equal(s.f.s.getWrites(), writes, cause)
+  }
+})
+
+test("D240 key, Contract and saved manifest mutation during Git read fail closed", async () => {
+  for (const cause of ["key", "contract", "manifest"] as const) {
+    const s = await d235Scenario()
+    const manifestPath = V4_RUNTIME_INDEX_ROOT + "-rekey-cutover-candidate-"
+      + s.f.id.runId + "/contract.json"
+    const contract = decodeV4ReencryptionCutoverCandidateManifest(
+      await s.f.s.adapter.read(manifestPath),
+    )
+    const binding = { contract, originalJournalKey: Uint8Array.from(s.oldJournalKey) }
+    const readBlob = s.b.github.getBlob
+    let altered = false
+    s.b.github.getBlob = async sha => {
+      const bytes = await readBlob(sha)
+      if (!altered) {
+        altered = true
+        if (cause === "key") binding.originalJournalKey[0] ^= 1
+        else if (cause === "contract") Object.assign(binding.contract, { transactionId: "1".repeat(32) })
+        else s.f.s.files.set(manifestPath, "{torn")
+      }
+      return bytes
+    }
+    const writes = s.f.s.getWrites()
+    const report = await inspectV4ReencryptionColdStartJournalKey({
+      ...s.input, expectedRecoveryBinding: binding,
+    })
+    assert.equal(altered, true, cause)
+    assert.equal(report.observation, "manual-recovery-required", cause)
+    assert.equal(report.recoveredKeyAndContractBoundToCaller, false, cause)
+    assert.equal(report.resumeSyncAuthorized, false, cause)
+    assert.equal(s.f.s.getWrites(), writes, cause)
+  }
+})
+
 test("D236 cold-start verification rejects a corrupt Backup shard after the original key is authenticated", async () => {
   const s = await d235Scenario()
   const pristine = s.b.github.getBlob

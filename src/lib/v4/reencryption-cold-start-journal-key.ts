@@ -6,6 +6,7 @@ import { readImmutableGitFile } from "./immutable-git-read"
 import { decodeV4RemoteConfig, decodeV4RemoteHead } from "./remote-index"
 import { V4_CONFIG_PATH, V4_HEAD_PATH } from "./protocol-types"
 import { decodeV4ReencryptionCutoverCandidateManifest } from "./reencryption-cutover-candidate-manifest"
+import type { V4ReencryptionCutoverSnapshotContract } from "./reencryption-cutover-snapshot-contract"
 import {
   inspectV4ReencryptionColdStartIndexRoute,
   type V4ReencryptionColdStartRouteInput,
@@ -24,6 +25,11 @@ export interface V4ReencryptionColdStartJournalInput
   readonly backupGit: BackupGit
   /** Reads the original key from Obsidian SecretStorage, never persists it. */
   readonly getSecret: (id: string) => string | null
+  /** Optional D240 cross-check. Neither value is trusted until the frozen Backup authenticates it. */
+  readonly expectedRecoveryBinding?: {
+    readonly contract: V4ReencryptionCutoverSnapshotContract
+    readonly originalJournalKey: Uint8Array
+  }
   /** Refuse if the plugin instance, adapter or GitHub credentials changed. */
   readonly assertLiveOwner: () => void
 }
@@ -34,6 +40,7 @@ export interface V4ReencryptionColdStartJournalReport {
   readonly originalKeyAuthenticated: boolean
   readonly pinnedBackupConfigAndEncryptedHeadVerified: boolean
   readonly completeBackupContentsReverified: boolean
+  readonly recoveredKeyAndContractBoundToCaller: boolean
   readonly completeDestinationContentsReverified: false
   readonly coldStartWalReverified: false
   readonly commitDecisionAuthorized: false
@@ -46,6 +53,7 @@ export interface V4ReencryptionColdStartJournalReport {
 const BASE = Object.freeze({
   integrityScope: "authenticated-original-key-and-complete-pinned-backup" as const,
   completeBackupContentsReverified: false as const,
+  recoveredKeyAndContractBoundToCaller: false as const,
   completeDestinationContentsReverified: false as const,
   coldStartWalReverified: false as const,
   commitDecisionAuthorized: false as const,
@@ -62,6 +70,12 @@ function parseId(value: string): { owner: string; repo: string; branch: string }
   const match = /^([^/#]+)\/([^/#]+)#(.+)$/u.exec(value)
   if (!match) throw Error("D235 invalid branch identity.")
   return { owner: match[1]!, repo: match[2]!, branch: match[3]! }
+}
+function same32Bytes(left: Uint8Array, right: Uint8Array): boolean {
+  if (left.length !== 32 || right.length !== 32) return false
+  let difference = 0
+  for (let i = 0; i < 32; i++) difference |= left[i]! ^ right[i]!
+  return difference === 0
 }
 function eraseKeyring(keyring: V4Keyring): void {
   for (const key of [
@@ -83,8 +97,16 @@ export async function inspectV4ReencryptionColdStartJournalKey(
   input: V4ReencryptionColdStartJournalInput,
 ): Promise<V4ReencryptionColdStartJournalReport> {
   let keyring: V4Keyring | undefined
+  let boundKeyCopy: Uint8Array | undefined
   try {
-    const { adapter, backupGit, getSecret, readPersistedPluginData, assertLiveOwner } = input
+    const { adapter, backupGit, getSecret, readPersistedPluginData, assertLiveOwner,
+      expectedRecoveryBinding } = input
+    const boundKey = expectedRecoveryBinding?.originalJournalKey
+    const boundContract = expectedRecoveryBinding?.contract
+    if (expectedRecoveryBinding && (!(boundKey instanceof Uint8Array)
+      || boundKey.length !== 32 || !boundContract)) return MANUAL
+    boundKeyCopy = boundKey ? Uint8Array.from(boundKey) : undefined
+    const boundContractText = boundContract ? JSON.stringify(boundContract) : null
     if (!adapter || !backupGit || typeof getSecret !== "function"
       || typeof readPersistedPluginData !== "function"
       || typeof assertLiveOwner !== "function") return MANUAL
@@ -106,6 +128,13 @@ export async function inspectV4ReencryptionColdStartJournalKey(
       && input.adapter === adapter && input.backupGit === backupGit
       && input.getSecret === getSecret && input.readPersistedPluginData === readPersistedPluginData
       && input.assertLiveOwner === assertLiveOwner
+      && input.expectedRecoveryBinding === expectedRecoveryBinding
+      && (!expectedRecoveryBinding || (
+        expectedRecoveryBinding.originalJournalKey === boundKey
+        && expectedRecoveryBinding.contract === boundContract
+        && JSON.stringify(boundContract) === boundContractText
+        && same32Bytes(boundKey!, boundKeyCopy!)
+      ))
     const check = () => {
       assertLiveOwner()
       if (!unchanged()) throw Error("D235 cold-start reader changed during verification.")
@@ -128,6 +157,9 @@ export async function inspectV4ReencryptionColdStartJournalKey(
     const manifestText = await pinned.read.call(adapter,
       "github-sync-v4-index-rekey-cutover-candidate-" + data.runId + "/contract.json")
     const contract = decodeV4ReencryptionCutoverCandidateManifest(manifestText)
+    if (boundContractText !== null && JSON.stringify(contract) !== boundContractText) {
+      return MANUAL
+    }
     const identity = contract.identity
     if (identity.runId !== data.runId || identity.sourceRepoId !== data.sourceRepoId
       || identity.destinationRepoId !== data.destinationRepoId) return MANUAL
@@ -185,6 +217,7 @@ export async function inspectV4ReencryptionColdStartJournalKey(
       iterations: config.kdfParams.iterations,
     })
     check()
+    if (boundKeyCopy && !same32Bytes(keyring.journalKey, boundKeyCopy)) return MANUAL
     const encryptedHead = await readImmutableGitFile(
       V4_HEAD_PATH, identity.sourceCommitSha, immutable,
     )
@@ -243,11 +276,15 @@ export async function inspectV4ReencryptionColdStartJournalKey(
       || lastRef.sha !== identity.sourceCommitSha || lastPhysical.id !== physical.id
       || lastPhysical.fullName !== physical.fullName || lastDefault !== defaultBranch
       || await pinned.read.call(adapter, V4_REENCRYPTION_RUNTIME_ROUTE_PATH) !== routeText
+      || await pinned.read.call(adapter,
+        "github-sync-v4-index-rekey-cutover-candidate-" + data.runId + "/contract.json") !== manifestText
       || getSecret(identity.sourcePassphraseSecretId) !== originalPassphrase
       || getSecret(identity.destinationPassphraseSecretId) !== destinationPassphrase) return MANUAL
+    check()
     return Object.freeze({
       ...BASE, observation: "authenticated-local-route-still-fenced",
       diagnosticIndexRoot: keyed.diagnosticIndexRoot,
+      recoveredKeyAndContractBoundToCaller: boundKeyCopy !== undefined,
       originalKeyAuthenticated: true,
       pinnedBackupConfigAndEncryptedHeadVerified: true,
       completeBackupContentsReverified: true,
@@ -256,5 +293,6 @@ export async function inspectV4ReencryptionColdStartJournalKey(
     return MANUAL
   } finally {
     if (keyring) eraseKeyring(keyring)
+    boundKeyCopy?.fill(0)
   }
 }
