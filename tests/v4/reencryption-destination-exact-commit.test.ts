@@ -1,5 +1,7 @@
 import assert from "node:assert/strict"
 import test from "node:test"
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
+import path from "node:path"
 
 import { sha256Hex, toBase64Url, utf8ToBytes } from "../../src/lib/bytes"
 import { deriveV4Keyring } from "../../src/lib/v4/crypto"
@@ -37,6 +39,8 @@ import { persistV4FencedDestinationSettings, inspectV4FencedDestinationSettingsA
 import { inspectV4ReencryptionColdStartIndexRoute, authenticateV4RuntimeIndexRouteIntent, V4_REENCRYPTION_RUNTIME_ROUTE_PATH, V4_REENCRYPTION_RUNTIME_ROUTE_ROOT } from "../../src/lib/v4/reencryption-runtime-index-route"
 import { assertV4ReencryptionSyncFenceClear, V4_REENCRYPTION_SYNC_FENCE_ROOT } from "../../src/lib/v4/reencryption-sync-fence"
 import { inspectV4ReencryptionColdStartJournalKey } from "../../src/lib/v4/reencryption-cold-start-journal-key"
+import { inspectV4ColdStartDestination } from "../../src/lib/v4/reencryption-cold-start-destination"
+import type { V4ReencryptionCutoverSnapshotContract } from "../../src/lib/v4/reencryption-cutover-snapshot-contract"
 import { V4PluginRuntime } from "../../src/lib/v4/runtime"
 import { inspectV4ReencryptionPendingCutoverIntent } from "../../src/lib/v4/reencryption-cutover-intent-crypto"
 import { inspectV4ReencryptionCutoverCandidateAfterRestart } from "../../src/lib/v4/reencryption-cutover-candidate-restart"
@@ -644,6 +648,179 @@ test("D137 changed scope before remote read and missing Shadow refuse verificati
     () => verifyV4ReencryptionShadowAgainstDestination(missing.input()), /Shadow is incomplete/i,
   )
   assert.equal(missing.f.reads, 0)
+})
+
+
+async function d238Scenario() {
+  const s = await d137Scenario(V4_RUNTIME_INDEX_ROOT, "device_d178")
+  const sourceIndex = createEmptyV4LocalIndex({
+    repoId: original, deviceId: "device_d178", mode: "encrypted",
+  })
+  sourceIndex.remoteCommitSha = pinned
+  await saveV4LocalIndex(s.adapter, V4_RUNTIME_INDEX_ROOT, sourceIndex)
+  const source = await loadV4LocalIndex(s.adapter, V4_RUNTIME_INDEX_ROOT)
+  const shadow = await loadV4LocalIndex(s.adapter, V4_RUNTIME_INDEX_ROOT + "-rekey-" + d137Run)
+  const contract: V4ReencryptionCutoverSnapshotContract = {
+    transactionId: "a".repeat(32),
+    identity: {
+      runId: d137Run, walGeneration: 10, indexRoot: V4_RUNTIME_INDEX_ROOT,
+      deviceId: "device_d178", sourceRepoId: original,
+      backupRepoId: "owner/repo#rekey/backup-d238",
+      destinationRepoId: destination,
+      sourceCommitSha: pinned, sourceTreeSha: sourceTree,
+      destinationCommitSha: rootSha, destinationTreeSha: treeSha,
+      manifestSha256: "e".repeat(64), sourcePassphraseSecretId: "old-d238",
+      destinationPassphraseSecretId: "new-d238",
+    },
+    sourceIndexSha256: await sha256Hex(enc(JSON.stringify(source))),
+    destinationShadowSha256: await sha256Hex(enc(JSON.stringify(shadow))),
+    walSnapshotSha256: "1".repeat(64), preparedEvidenceSha256: "2".repeat(64),
+    sourceSettingsSha256: "3".repeat(64), destinationSettingsSha256: "4".repeat(64),
+  }
+  const secrets = new Map([["old-d238", "old-pass"], ["new-d238", "new-d83-secret"]])
+  const git = Object.assign(s.f.github, {
+    branchName: "rekey/d83",
+    async getRepositoryDefaultBranch() { return "main" },
+  })
+  const { remote } = s.input()
+  let ownerValid = true
+  const input = {
+    adapter: s.adapter, contract, destinationGit: git, remote,
+    expectedPhysicalRepositoryId: 88,
+    getSecret: (id: string) => secrets.get(id) ?? null,
+    assertLiveOwner() { if (!ownerValid) throw Error("D238 owner lost") },
+  }
+  return { ...s, git, input, secrets, invalidateOwner() { ownerValid = false } }
+}
+
+test("D238 fresh owner revalidates complete Destination Git twice against exact Source/Shadow snapshot", async () => {
+  const s = await d238Scenario()
+  const writes = s.getWrites()
+  const files = new Map(s.files)
+  const report = await inspectV4ColdStartDestination(s.input)
+  assert.equal(report.observation, "complete-destination-still-fenced")
+  assert.equal(report.completeDestinationContentsReverified, true)
+  assert.equal(report.sourceAndShadowSnapshotMatched, true)
+  assert.equal(report.verifiedFileCount, 3)
+  assert.equal(report.coldStartWalReverified, false)
+  assert.equal(report.localCutoverAuthorized, false)
+  assert.equal(report.resumeSyncAuthorized, false)
+  assert.equal(report.remoteWritesAuthorized, false)
+  assert.equal(report.oldPassphraseCleanupAuthorized, false)
+  assert.deepEqual(s.files, files)
+  assert.equal(s.getWrites(), writes)
+  assert.ok(s.f.reads > 12, "both full scans must decrypt content from Git")
+})
+
+test("D238 a new read-only adapter reconstructs Source and Shadow from real Windows files", async () => {
+  const s = await d238Scenario()
+  await mkdir(path.join(process.cwd(), ".tmp"), { recursive: true })
+  const directory = await mkdtemp(path.join(process.cwd(), ".tmp", "d238-cold-destination-"))
+  try {
+    for (const [relativePath, content] of s.files) {
+      const absolute = path.join(directory, relativePath)
+      await mkdir(path.dirname(absolute), { recursive: true })
+      await writeFile(absolute, content, "utf8")
+    }
+    const reader: Pick<V4LocalIndexAdapter, "read" | "exists"> = {
+      async read(relativePath: string) {
+        return readFile(path.join(directory, relativePath), "utf8")
+      },
+      async exists(relativePath: string) {
+        try {
+          await readFile(path.join(directory, relativePath))
+          return true
+        } catch { return false }
+      },
+    }
+    const writes = s.getWrites()
+    const report = await inspectV4ColdStartDestination({
+      ...s.input, adapter: reader,
+    })
+    assert.equal(report.observation, "complete-destination-still-fenced")
+    assert.equal(report.resumeSyncAuthorized, false)
+    for (const [relativePath, content] of s.files) {
+      assert.equal(await readFile(path.join(directory, relativePath), "utf8"), content)
+    }
+    assert.equal(s.getWrites(), writes)
+  } finally {
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test("D238 refuses wrong native secret and source/shadow snapshot digests without Git mutation", async () => {
+  for (const cause of ["secret", "source", "shadow", "branch", "tree", "physical", "default", "pinned-physical"] as const) {
+    const s = await d238Scenario()
+    if (cause === "secret") s.secrets.set("new-d238", "different")
+    if (cause === "source") s.input.contract.sourceIndexSha256 = "0".repeat(64)
+    if (cause === "shadow") s.input.contract.destinationShadowSha256 = "0".repeat(64)
+    if (cause === "branch") s.git.branchName = "rekey/foreign"
+    if (cause === "tree") {
+      const getCommit = s.git.getGitCommit
+      s.git.getGitCommit = async sha => ({ ...(await getCommit(sha)), treeSha: "9".repeat(40) })
+    }
+    if (cause === "physical") {
+      s.git.getRepositoryIdentity = async () => ({ id: 99, fullName: "owner/repo" })
+    }
+    if (cause === "default") s.git.getRepositoryDefaultBranch = async () => "rekey/d83"
+    if (cause === "pinned-physical") s.input.expectedPhysicalRepositoryId = 99
+    const writes = s.getWrites()
+    const result = await inspectV4ColdStartDestination(s.input)
+    assert.equal(result.observation, "manual-recovery-required", cause)
+    assert.equal(result.completeDestinationContentsReverified, false, cause)
+    assert.equal(s.getWrites(), writes, cause)
+  }
+})
+
+test("D238 notices a changed default branch or cancellation signal during full Git reads", async () => {
+  const changedDefault = await d238Scenario()
+  let defaultReads = 0
+  changedDefault.git.getRepositoryDefaultBranch = async () =>
+    ++defaultReads === 1 ? "main" : "alternate"
+  assert.equal((await inspectV4ColdStartDestination(changedDefault.input)).observation,
+    "manual-recovery-required")
+  assert.ok(defaultReads > 1)
+
+  const changedSignal = await d238Scenario()
+  const originalBlob = changedSignal.git.getBlob
+  let replaced = false
+  changedSignal.git.getBlob = async sha => {
+    const bytes = await originalBlob(sha)
+    if (!replaced) {
+      replaced = true
+      Object.assign(changedSignal.input.remote, { signal: new AbortController().signal })
+    }
+    return bytes
+  }
+  const writes = changedSignal.getWrites()
+  assert.equal((await inspectV4ColdStartDestination(changedSignal.input)).observation,
+    "manual-recovery-required")
+  assert.equal(replaced, true)
+  assert.equal(changedSignal.getWrites(), writes)
+})
+
+test("D238 current ref, SecretStorage and owner changes during full Git read fail closed", async () => {
+  for (const cause of ["ref", "secret", "owner"] as const) {
+    const s = await d238Scenario()
+    const originalBlob = s.git.getBlob
+    let changed = false
+    s.git.getBlob = async sha => {
+      const result = await originalBlob(sha)
+      if (!changed) {
+        changed = true
+        if (cause === "ref") s.f.changeRef("9".repeat(40))
+        if (cause === "secret") s.secrets.set("new-d238", "other-secret")
+        if (cause === "owner") s.invalidateOwner()
+      }
+      return result
+    }
+    const writes = s.getWrites()
+    const result = await inspectV4ColdStartDestination(s.input)
+    assert.equal(changed, true, cause)
+    assert.equal(result.observation, "manual-recovery-required", cause)
+    assert.equal(result.resumeSyncAuthorized, false, cause)
+    assert.equal(s.getWrites(), writes, cause)
+  }
 })
 
 const d138Backup = "owner/repo#backup/run_d138"
