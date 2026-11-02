@@ -36,6 +36,7 @@ import { inspectV4ActiveSelectorCommitPair } from "../../src/lib/v4/reencryption
 import { persistV4FencedDestinationSettings, inspectV4FencedDestinationSettingsAfterRestart } from "../../src/lib/v4/reencryption-persisted-settings-cutover"
 import { inspectV4ReencryptionColdStartIndexRoute, authenticateV4RuntimeIndexRouteIntent, V4_REENCRYPTION_RUNTIME_ROUTE_PATH, V4_REENCRYPTION_RUNTIME_ROUTE_ROOT } from "../../src/lib/v4/reencryption-runtime-index-route"
 import { assertV4ReencryptionSyncFenceClear, V4_REENCRYPTION_SYNC_FENCE_ROOT } from "../../src/lib/v4/reencryption-sync-fence"
+import { inspectV4ReencryptionColdStartJournalKey } from "../../src/lib/v4/reencryption-cold-start-journal-key"
 import { V4PluginRuntime } from "../../src/lib/v4/runtime"
 import { inspectV4ReencryptionPendingCutoverIntent } from "../../src/lib/v4/reencryption-cutover-intent-crypto"
 import { inspectV4ReencryptionCutoverCandidateAfterRestart } from "../../src/lib/v4/reencryption-cutover-candidate-restart"
@@ -734,7 +735,7 @@ async function d138Scenario(activeIndexRoot = "private/index", expectedDeviceId 
   }
 }
 
-async function d179Scenario() {
+async function d179Scenario(journalKey?: Uint8Array) {
   const s = await d138Scenario(V4_RUNTIME_INDEX_ROOT, "device_d178")
   s.setWal({ ...s.getWal(), receipts: s.shadow.remote.expectedReceipts.map(r => ({ ...r })) })
   const exclusive = s.input().withExclusiveInitiatorLease
@@ -802,7 +803,7 @@ async function d179Scenario() {
     acknowledgement: "accept-best-effort-power-loss-recovery-risk" as const,
   }
   const prepared: V4BestEffortPreparedSelectorStageInput = {
-    restart, identity: { ...id }, journalKey: new Uint8Array(32).fill(0x79),
+    restart, identity: { ...id }, journalKey: journalKey ?? new Uint8Array(32).fill(0x79),
     withExclusiveInitiatorLease: exclusive,
   }
   await exclusive(async () => armV4ReencryptionSyncFence({
@@ -1551,6 +1552,97 @@ async function d217CurrentFrozenBackup(f: Awaited<ReturnType<typeof d179Scenario
   }
 }
 
+async function d235Scenario() {
+  const ring = await deriveV4Keyring({
+    repoId: original, passphrase: "old-d138-secret",
+    salt: enc("d217-original-salt"), iterations: 600_000,
+  })
+  const oldJournalKey = Uint8Array.from(ring.journalKey)
+  for (const part of [ring.masterKey, ring.pathKey, ring.contentKey,
+    ring.indexKey, ring.journalKey]) part.fill(0)
+  const s = await d233Scenario(oldJournalKey)
+  await persistV4FencedDestinationSettings(s.cutover)
+  let live = true
+  const input = {
+    adapter: s.f.s.adapter,
+    readPersistedPluginData: async () => JSON.parse(s.saved) as unknown,
+    getSecret: (id: string) => s.f.s.secrets.get(id) ?? null,
+    backupGit: s.b.github,
+    assertLiveOwner: () => { if (!live) throw Error("Obsidian session no longer owns vault.") },
+  }
+  return { ...s, input, oldJournalKey,
+    invalidateOwner() { live = false } }
+}
+
+test("D235 rederives the original journal key from immutable encrypted Backup config and HEAD after native Settings restart", async () => {
+  const s = await d235Scenario()
+  const oldFiles = new Map(s.f.s.files)
+  const oldSecrets = new Map(s.f.s.secrets)
+  const writes = s.f.s.getWrites()
+  const proven = await inspectV4ReencryptionColdStartJournalKey(s.input)
+  assert.equal(proven.observation, "authenticated-local-route-still-fenced")
+  assert.equal(proven.originalKeyAuthenticated, true)
+  assert.equal(proven.pinnedBackupConfigAndEncryptedHeadVerified, true)
+  assert.equal(proven.completeBackupContentsReverified, false)
+  assert.equal(proven.completeDestinationContentsReverified, false)
+  assert.equal(proven.coldStartWalReverified, false)
+  assert.equal(proven.resumeSyncAuthorized, false)
+  assert.equal(proven.commitDecisionAuthorized, false)
+  assert.equal(proven.oldPassphraseCleanupAuthorized, false)
+  assert.equal(proven.diagnosticIndexRoot, V4_RUNTIME_INDEX_ROOT + "-rekey-" + s.f.id.runId)
+  assert.equal(s.f.s.getWrites(), writes, "cold-start key recovery never writes")
+  assert.deepEqual(s.f.s.files, oldFiles)
+  assert.deepEqual(s.f.s.secrets, oldSecrets)
+  await assert.rejects(assertV4ReencryptionSyncFenceClear(s.f.s.adapter))
+})
+
+test("D235 wrong old SecretStorage passphrase, absent key and modified backup refs reject cold-start authentication", async () => {
+  const s = await d235Scenario()
+  const originalSecret = s.f.s.secrets.get(s.f.id.sourcePassphraseSecretId)!
+  s.f.s.secrets.set(s.f.id.sourcePassphraseSecretId, "wrong-old-passphrase")
+  assert.equal((await inspectV4ReencryptionColdStartJournalKey(s.input)).observation, "manual-recovery-required")
+  s.f.s.secrets.delete(s.f.id.sourcePassphraseSecretId)
+  assert.equal((await inspectV4ReencryptionColdStartJournalKey(s.input)).observation, "manual-recovery-required")
+  s.f.s.secrets.set(s.f.id.sourcePassphraseSecretId, originalSecret)
+  s.b.setRef("9".repeat(40))
+  assert.equal((await inspectV4ReencryptionColdStartJournalKey(s.input)).observation, "manual-recovery-required")
+  s.b.setRef(pinned)
+  assert.equal((await inspectV4ReencryptionColdStartJournalKey(s.input)).observation, "authenticated-local-route-still-fenced")
+})
+
+test("D235 altered immutable Git content, foreign physical repo, changed callbacks and Settings reject key authentication", async () => {
+  const s = await d235Scenario()
+  const getBlob = s.b.github.getBlob
+  s.b.github.getBlob = async sha => {
+    const bytes = await getBlob(sha)
+    bytes[0] ^= 1
+    return bytes
+  }
+  assert.equal((await inspectV4ReencryptionColdStartJournalKey(s.input)).observation, "manual-recovery-required")
+  s.b.github.getBlob = getBlob
+  const getRef = s.b.github.getGitRef
+  let checks = 0
+  s.b.github.getGitRef = async () => {
+    const observed = await getRef()
+    checks++
+    return checks > 1 ? { ...observed, sha: "9".repeat(40) } : observed
+  }
+  assert.equal((await inspectV4ReencryptionColdStartJournalKey(s.input)).observation, "manual-recovery-required")
+  s.b.github.getGitRef = getRef
+  const getRepo = s.b.github.getRepositoryIdentity
+  s.b.github.getRepositoryIdentity = async () => ({ id: 88, fullName: "other/repo" })
+  assert.equal((await inspectV4ReencryptionColdStartJournalKey(s.input)).observation, "manual-recovery-required")
+  s.b.github.getRepositoryIdentity = getRepo
+  const stored = JSON.parse(s.saved)
+  stored.settings.ignorePathRegex = "changed-by-background-settings"
+  s.setPersisted(stored)
+  assert.equal((await inspectV4ReencryptionColdStartJournalKey(s.input)).observation, "manual-recovery-required")
+  stored.settings.ignorePathRegex = "^Local/"
+  s.setPersisted(stored)
+  s.invalidateOwner()
+  assert.equal((await inspectV4ReencryptionColdStartJournalKey(s.input)).observation, "manual-recovery-required")
+})
+
 async function d234ColdStart(s: Awaited<ReturnType<typeof d233Scenario>>, key?: Uint8Array) {
   const native = {
     adapter: s.f.s.adapter,
@@ -1693,8 +1785,8 @@ test("D234 cold-start exact Settings / Selector / Intent / Index / key tampering
   assert.equal(s.f.s.getWrites(), beforeWrites, "cold-start inspection never mutates disk")
 })
 
-async function d233Scenario() {
-  const { f, b, input } = await d232Scenario()
+async function d233Scenario(journalKey?: Uint8Array) {
+  const { f, b, input } = await d232Scenario(journalKey)
   await writeV4FencedActiveSelectorFirstPhase(input)
   let persisted: unknown = {
     version: 13,
@@ -1859,8 +1951,8 @@ test("D233 persist changes or missing old/new secret fail closed after Settings 
   }
 })
 
-async function d232Scenario() {
-  const f = await d179Scenario()
+async function d232Scenario(journalKey?: Uint8Array) {
+  const f = await d179Scenario(journalKey)
   const b = await d217CurrentFrozenBackup(f)
   await stageV4FencedLiveReencryptionIntent({
     readiness: f.input, backup: b.backup, transactionId: d183TransactionId,

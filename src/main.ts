@@ -186,6 +186,35 @@ export default class FastSync extends Plugin {
       callback: () => void this.openSyncCenter(),
     })
 
+    this.addCommand({
+      id: "verify-reencryption-recovery-read-only",
+      name: "GitHub Sync: Verify Re-encryption Recovery (Read-only)",
+      callback: () => {
+        void this.v4Runtime.verifyFencedReencryptionOriginalKey().then(
+          result => {
+            if (this.unloaded) return
+            if (result?.originalKeyAuthenticated) {
+              new Notice(
+                "GitHub Sync: Original Backup config, encrypted HEAD and migration key verified. Sync remains paused until complete recovery checks.",
+                10000,
+              )
+            } else {
+              new Notice(
+                "GitHub Sync: Re-encryption recovery is incomplete or cannot be authenticated. Sync stays paused; keep both passphrases.",
+                10000,
+              )
+            }
+          },
+          () => {
+            if (!this.unloaded) new Notice(
+              "GitHub Sync: Read-only Backup verification unavailable. Sync stays paused; review Manual Recovery.",
+              10000,
+            )
+          },
+        )
+      },
+    })
+
     // After the workspace layout is ready, run the startup sync once, then enable real-time watch
     this.app.workspace.onLayoutReady(() => {
       if (shouldRunStartupSync(this.settings)) {

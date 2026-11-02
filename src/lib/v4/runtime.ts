@@ -1,5 +1,6 @@
 import { Modal, Notice, Platform, TFile } from "obsidian"
 import type FastSync from "../../main"
+import { GitHubClient } from "../github-api"
 import { fromBase64Url, randomBytes, sha256Hex, toBase64Url, utf8ToBytes } from "../bytes"
 import { syncConsoleLog } from "../debug"
 import { readVaultFileBytes, writeVaultFileBytes, trashVaultFileIfExists } from "../vault"
@@ -40,6 +41,9 @@ import { assertV4SpeculativeConfigStillAbsent, guardV4SpeculativeConfigGithub } 
 
 import { V4_RUNTIME_INDEX_ROOT } from "./reencryption-index-root"
 import { inspectV4ReencryptionColdStartIndexRoute, type V4ReencryptionColdStartRouteReport } from "./reencryption-runtime-index-route"
+import { decodeV4ReencryptionCutoverCandidateManifest } from "./reencryption-cutover-candidate-manifest"
+import { V4_REENCRYPTION_RUNTIME_ROUTE_PATH } from "./reencryption-index-root"
+import { inspectV4ReencryptionColdStartJournalKey, type V4ReencryptionColdStartJournalReport } from "./reencryption-cold-start-journal-key"
 const V4_INDEX_ROOT = V4_RUNTIME_INDEX_ROOT
 const V4_STAGE_ROOT = "github-sync-v4-stage"
 const V4_RECOVERY_ROOT = "github-sync-v4-recovery"
@@ -229,6 +233,56 @@ export class V4PluginRuntime {
 
   getReencryptionColdStartIndexRoute(): V4ReencryptionColdStartRouteReport | undefined {
     return this.coldStartIndexRoute
+  }
+
+  /**
+   * Explicit user-triggered, read-only GitHub check after Obsidian restart.
+   * Never run this as startup Sync: the old Backup may be unavailable and
+   * recovering the original key cannot authorize mutation.
+   */
+  async verifyFencedReencryptionOriginalKey(): Promise<V4ReencryptionColdStartJournalReport | null> {
+    this.assertNotDisposed()
+    const route = await this.inspectFencedReencryptionIndexRoute()
+    if (route.observation !== "destination-shadow-diagnostic-only"
+      && route.observation !== "source-settings-pending") return null
+
+    const settings = this.plugin.settings
+    const token = settings.githubToken
+    if (!token || !settings.githubOwner || !settings.githubRepo) {
+      throw new Error("Re-encryption read-only verification needs the configured GitHub token.")
+    }
+    const raw: unknown = JSON.parse(await this.adapter.read(V4_REENCRYPTION_RUNTIME_ROUTE_PATH))
+    const runId = (raw as { runId?: unknown })?.runId
+    if (typeof runId !== "string" || !/^[A-Za-z0-9_-]{8,128}$/u.test(runId)) {
+      throw new Error("Re-encryption routing Intent is not valid.")
+    }
+    const contract = decodeV4ReencryptionCutoverCandidateManifest(
+      await this.adapter.read(V4_INDEX_ROOT + "-rekey-cutover-candidate-" + runId + "/contract.json"),
+    )
+    const id = contract.identity
+    const match = /^([^/#]+)\/([^/#]+)#(.+)$/u.exec(id.backupRepoId)
+    if (!match || match[1] !== settings.githubOwner || match[2] !== settings.githubRepo
+      || id.runId !== runId) {
+      throw new Error("Re-encryption Backup repo differs from live plugin credentials.")
+    }
+    const backing = this.indexAdapterBacking
+    const github = new GitHubClient({
+      token, owner: settings.githubOwner, repo: settings.githubRepo, branch: match[3]!,
+    })
+    return inspectV4ReencryptionColdStartJournalKey({
+      adapter: this.adapter,
+      readPersistedPluginData: () => this.plugin.loadData(),
+      getSecret: secretId => this.plugin.app.secretStorage.getSecret(secretId),
+      backupGit: github,
+      assertLiveOwner: () => {
+        if (this.disposed || this.indexAdapterBacking !== backing
+          || this.plugin.app.vault.adapter !== backing
+          || this.plugin.settings !== settings || settings.githubToken !== token
+          || this.plugin.isSyncInProgress) {
+          throw Error("Re-encryption owner changed during read-only verification.")
+        }
+      },
+    })
   }
 
   /** Read local Destination Shadow for Manual Recovery, not as a Sync writer. */
