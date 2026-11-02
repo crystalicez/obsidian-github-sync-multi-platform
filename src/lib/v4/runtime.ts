@@ -27,6 +27,7 @@ import { isV4UncVaultPath, V4_NETWORK_VAULT_WARNING } from "./network-storage"
 import { createV4DesktopInitiatorLocalReader } from "./reencryption-desktop-initiator-reader"
 import { createV4MobileInitiatorLocalReader } from "./reencryption-mobile-initiator-reader"
 import { openV4NewDesktopPluginWalWriter, type V4DesktopPluginWalWriter } from "./reencryption-desktop-plugin-wal-writer"
+import { openV4NewMobilePluginWalWriter, type V4MobilePluginWalWriter } from "./reencryption-mobile-plugin-wal-writer"
 import { armV4ReencryptionSyncFence, assertV4ReencryptionSyncFenceClear, V4ReencryptionSyncFencedError, type V4ReencryptionSyncFenceReport } from "./reencryption-sync-fence"
 import type { V4InitiatorLocalReader } from "./reencryption-initiator-parity"
 import { createV4StagingStore, type V4StagingStore } from "./staging-store"
@@ -555,23 +556,18 @@ export class V4PluginRuntime {
     }
   }
   /**
-   * D244: internal, explicitly invoked WAL authoring only AFTER this same
-   * live Runtime successfully armed its own persisted D173 Sync Fence.
-   * No startup/Recovery path reconstructs this authority after a restart.
-   * Not used by Wizard Run, and never authorizes Sync or Cutover.
+   * D244/D245: only the same live Runtime that armed D173 may author WAL.
+   * This authority is transient and never restored from a persisted Fence.
    */
-  async openNewReencryptionDesktopWalForArmedRun(): Promise<V4DesktopPluginWalWriter> {
+  private reencryptionWalOwner() {
     this.assertNotDisposed()
     const session = this.armedReencryptionInitiator
     const backing = this.indexAdapterBacking
     const vault = this.plugin.app.vault
-    const adapter = vault.adapter as typeof vault.adapter & {
-      getFullPath?: (path: string) => string
-    }
-    if (Platform.isDesktopApp !== true || this.uncVault || !session
-      || !this.reencryptionSyncFenced || this.reencryptionFencePending
-      || !backing || adapter !== backing || typeof adapter?.getFullPath !== "function") {
-      throw new Error("Re-encryption Desktop WAL requires this live initiating Runtime and its persisted Fence.")
+    const desktop = Platform.isDesktopApp === true
+    if (!session || !this.reencryptionSyncFenced || this.reencryptionFencePending
+      || !backing || vault.adapter !== backing) {
+      throw Error("Re-encryption WAL requires this live initiating Runtime and its persisted Fence.")
     }
     const settings = this.plugin.settings
     const configDir = vault.configDir || ".obsidian"
@@ -584,8 +580,9 @@ export class V4PluginRuntime {
         || this.plugin.settings !== settings
         || (vault.configDir || ".obsidian") !== configDir
         || this.plugin.manifest.id !== pluginId
+        || (Platform.isDesktopApp === true) !== desktop
         || this.plugin.isSyncInProgress || this.plugin.isSettingsSaveInProgress?.()) {
-        throw new Error("Re-encryption Desktop WAL initiating owner changed; Manual Recovery required.")
+        throw Error("Re-encryption WAL initiating owner changed; Manual Recovery required.")
       }
       session.assertQuiescent()
       session.assertPinned()
@@ -596,15 +593,63 @@ export class V4PluginRuntime {
       assertLiveOwner()
     }
     assertLiveOwner()
+    return {
+      session, vault, backing, configDir, pluginId,
+      assertLiveOwner, assertExclusiveInitiatorLease,
+    }
+  }
+
+  /**
+   * Desktop-only internal authoring. Not invoked by the installed Wizard.
+   * Still requires actual persisted Sync Fence and create-only Node WAL lock.
+   */
+  async openNewReencryptionDesktopWalForArmedRun(): Promise<V4DesktopPluginWalWriter> {
+    if (Platform.isDesktopApp !== true || this.uncVault) {
+      throw Error("Re-encryption Desktop WAL requires a local Desktop Vault.")
+    }
+    const owner = this.reencryptionWalOwner()
+    const adapter = owner.vault.adapter as typeof owner.vault.adapter & {
+      getFullPath?: (path: string) => string
+    }
+    if (typeof adapter?.getFullPath !== "function") {
+      throw Error("Re-encryption Desktop WAL requires the native Obsidian path resolver.")
+    }
     return openV4NewDesktopPluginWalWriter({
       adapter: adapter as typeof adapter & { getFullPath(path: string): string },
-      configDir, pluginId, runId: session.runId,
+      configDir: owner.configDir, pluginId: owner.pluginId, runId: owner.session.runId,
       fenceAdapter: this.adapter,
-      sourceRepoId: session.sourceRepoId,
-      destinationRepoId: session.destinationRepoId,
-      assertLiveOwner,
-      assertExclusiveInitiatorLease,
-      assertSyncFenceArmed: async () => { assertLiveOwner() },
+      sourceRepoId: owner.session.sourceRepoId,
+      destinationRepoId: owner.session.destinationRepoId,
+      assertLiveOwner: owner.assertLiveOwner,
+      assertExclusiveInitiatorLease: owner.assertExclusiveInitiatorLease,
+      assertSyncFenceArmed: async () => { owner.assertLiveOwner() },
+    })
+  }
+
+  /**
+   * D245: internal Mobile best-effort WAL writer. No OS lock, atomic rename,
+   * durable write, auto-resume or Cutover permission. Not used by Wizard Run.
+   */
+  async openNewReencryptionMobileWalForArmedRun(): Promise<V4MobilePluginWalWriter> {
+    if (Platform.isDesktopApp === true) {
+      throw Error("Re-encryption Mobile WAL requires Obsidian Mobile.")
+    }
+    const owner = this.reencryptionWalOwner()
+    const adapter = owner.vault.adapter
+    if (!adapter || typeof adapter.stat !== "function"
+      || typeof adapter.list !== "function" || typeof adapter.read !== "function"
+      || typeof adapter.write !== "function" || typeof adapter.mkdir !== "function") {
+      throw Error("Re-encryption Mobile WAL requires a complete native Vault Adapter.")
+    }
+    return openV4NewMobilePluginWalWriter({
+      adapter,
+      configDir: owner.configDir, pluginId: owner.pluginId, runId: owner.session.runId,
+      fenceAdapter: this.adapter,
+      sourceRepoId: owner.session.sourceRepoId,
+      destinationRepoId: owner.session.destinationRepoId,
+      assertLiveOwner: owner.assertLiveOwner,
+      assertExclusiveInitiatorLease: owner.assertExclusiveInitiatorLease,
+      assertSyncFenceArmed: async () => { owner.assertLiveOwner() },
     })
   }
 
