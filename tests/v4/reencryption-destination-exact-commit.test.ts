@@ -1501,6 +1501,7 @@ async function d217CurrentFrozenBackup(f: Awaited<ReturnType<typeof d179Scenario
   const github = {
     branchName: f.id.backupRepoId.split("#")[1]!,
     async getRepositoryIdentity() { return { id: 88, fullName: "owner/repo" } },
+    async getRepositoryDefaultBranch() { return "main" },
     async getGitRef() {
       refReads++
       return {
@@ -1583,7 +1584,7 @@ test("D235 rederives the original journal key from immutable encrypted Backup co
   assert.equal(proven.observation, "authenticated-local-route-still-fenced")
   assert.equal(proven.originalKeyAuthenticated, true)
   assert.equal(proven.pinnedBackupConfigAndEncryptedHeadVerified, true)
-  assert.equal(proven.completeBackupContentsReverified, false)
+  assert.equal(proven.completeBackupContentsReverified, true)
   assert.equal(proven.completeDestinationContentsReverified, false)
   assert.equal(proven.coldStartWalReverified, false)
   assert.equal(proven.resumeSyncAuthorized, false)
@@ -1594,6 +1595,88 @@ test("D235 rederives the original journal key from immutable encrypted Backup co
   assert.deepEqual(s.f.s.files, oldFiles)
   assert.deepEqual(s.f.s.secrets, oldSecrets)
   await assert.rejects(assertV4ReencryptionSyncFenceClear(s.f.s.adapter))
+})
+
+test("D236 cold-start verification rejects a corrupt Backup shard after the original key is authenticated", async () => {
+  const s = await d235Scenario()
+  const pristine = s.b.github.getBlob
+  const headerShas = new Set<string>()
+  let corrupted = false
+  s.b.github.getBlob = async sha => {
+    const bytes = await pristine(sha)
+    if (headerShas.size < 2) headerShas.add(sha)
+    if (!headerShas.has(sha) && !corrupted) {
+      bytes[0] ^= 1
+      corrupted = true
+    }
+    return bytes
+  }
+  const writes = s.f.s.getWrites()
+  const result = await inspectV4ReencryptionColdStartJournalKey(s.input)
+  assert.equal(result.observation, "manual-recovery-required")
+  assert.equal(result.completeBackupContentsReverified, false)
+  assert.equal(result.resumeSyncAuthorized, false)
+  assert.equal(s.f.s.getWrites(), writes)
+  assert.equal(corrupted, true, "The full verifier must read an index or content object")
+})
+
+test("D236 a Git object failing on the second complete Backup scan is not certified", async () => {
+  const s = await d235Scenario()
+  const originalGetBlob = s.b.github.getBlob
+  const headerShas = new Set<string>()
+  const bodyReads = new Map<string, number>()
+  let corruptedOnSecondScan = false
+  s.b.github.getBlob = async sha => {
+    const bytes = await originalGetBlob(sha)
+    if (headerShas.size < 2) headerShas.add(sha)
+    if (!headerShas.has(sha)) {
+      const count = (bodyReads.get(sha) ?? 0) + 1
+      bodyReads.set(sha, count)
+      if (count === 2 && !corruptedOnSecondScan) {
+        bytes[0] ^= 1
+        corruptedOnSecondScan = true
+      }
+    }
+    return bytes
+  }
+  const result = await inspectV4ReencryptionColdStartJournalKey(s.input)
+  assert.equal(result.observation, "manual-recovery-required")
+  assert.equal(result.completeBackupContentsReverified, false)
+  assert.equal(corruptedOnSecondScan, true)
+})
+
+test("D236 a changed backup ref or native Settings during full readback never authorizes recovery", async () => {
+  const moved = await d235Scenario()
+  const originalRef = moved.b.github.getGitRef
+  let refs = 0
+  moved.b.github.getGitRef = async () => {
+    const result = await originalRef()
+    return ++refs >= 3 ? { ...result, sha: "9".repeat(40) } : result
+  }
+  const refReport = await inspectV4ReencryptionColdStartJournalKey(moved.input)
+  assert.equal(refReport.observation, "manual-recovery-required")
+  assert.equal(refReport.completeBackupContentsReverified, false)
+
+  const changed = await d235Scenario()
+  const originalBlob = changed.b.github.getBlob
+  const headerShas = new Set<string>()
+  let changedDuringScan = false
+  changed.b.github.getBlob = async sha => {
+    const bytes = await originalBlob(sha)
+    if (headerShas.size < 2) headerShas.add(sha)
+    if (!headerShas.has(sha) && !changedDuringScan) {
+      changedDuringScan = true
+      const persisted = JSON.parse(changed.saved)
+      persisted.settings.ignorePathRegex = "changed-during-backup-scan"
+      changed.setPersisted(persisted)
+    }
+    return bytes
+  }
+  const settingsReport = await inspectV4ReencryptionColdStartJournalKey(changed.input)
+  assert.equal(settingsReport.observation, "manual-recovery-required")
+  assert.equal(settingsReport.completeBackupContentsReverified, false)
+  assert.equal(settingsReport.remoteWritesAuthorized, false)
+  assert.equal(changedDuringScan, true)
 })
 
 test("D235 wrong old SecretStorage passphrase, absent key and modified backup refs reject cold-start authentication", async () => {

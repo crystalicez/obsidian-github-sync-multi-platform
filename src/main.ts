@@ -193,9 +193,9 @@ export default class FastSync extends Plugin {
         void this.v4Runtime.verifyFencedReencryptionOriginalKey().then(
           result => {
             if (this.unloaded) return
-            if (result?.originalKeyAuthenticated) {
+            if (result?.originalKeyAuthenticated && result.completeBackupContentsReverified) {
               new Notice(
-                "GitHub Sync: Original Backup config, encrypted HEAD and migration key verified. Sync remains paused until complete recovery checks.",
+                "GitHub Sync: Original key and all encrypted Frozen Backup files verified. Destination, WAL and recovery remain unverified; Sync stays paused.",
                 10000,
               )
             } else {

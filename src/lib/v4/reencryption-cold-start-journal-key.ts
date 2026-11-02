@@ -11,10 +11,12 @@ import {
   type V4ReencryptionColdStartRouteInput,
 } from "./reencryption-runtime-index-route"
 import { V4_REENCRYPTION_RUNTIME_ROUTE_PATH } from "./reencryption-index-root"
+import { proposeV4SameRepositoryReencryptionBackupBranch } from "./reencryption-owner-decisions"
+import { verifyGitHubFrozenReencryptionBackup } from "./reencryption-trusted-loader"
 
 const SHA = /^[0-9a-f]{40}$/u
 type BackupGit = Pick<GitHubClient,
-  "branchName" | "getRepositoryIdentity" | "getGitRef" | "getGitCommit" | "getTreeAt" | "getBlob">
+  "branchName" | "getRepositoryIdentity" | "getRepositoryDefaultBranch" | "getGitRef" | "getGitCommit" | "getTreeAt" | "getBlob">
 
 export interface V4ReencryptionColdStartJournalInput
   extends Omit<V4ReencryptionColdStartRouteInput, "journalKey" | "getSecret"> {
@@ -26,12 +28,12 @@ export interface V4ReencryptionColdStartJournalInput
   readonly assertLiveOwner: () => void
 }
 export interface V4ReencryptionColdStartJournalReport {
-  readonly integrityScope: "authenticated-original-key-and-pinned-backup-config-head"
+  readonly integrityScope: "authenticated-original-key-and-complete-pinned-backup"
   readonly observation: "authenticated-local-route-still-fenced" | "manual-recovery-required"
   readonly diagnosticIndexRoot: string | null
   readonly originalKeyAuthenticated: boolean
   readonly pinnedBackupConfigAndEncryptedHeadVerified: boolean
-  readonly completeBackupContentsReverified: false
+  readonly completeBackupContentsReverified: boolean
   readonly completeDestinationContentsReverified: false
   readonly coldStartWalReverified: false
   readonly commitDecisionAuthorized: false
@@ -42,7 +44,7 @@ export interface V4ReencryptionColdStartJournalReport {
   readonly oldPassphraseCleanupAuthorized: false
 }
 const BASE = Object.freeze({
-  integrityScope: "authenticated-original-key-and-pinned-backup-config-head" as const,
+  integrityScope: "authenticated-original-key-and-complete-pinned-backup" as const,
   completeBackupContentsReverified: false as const,
   completeDestinationContentsReverified: false as const,
   coldStartWalReverified: false as const,
@@ -73,9 +75,9 @@ function eraseKeyring(keyring: V4Keyring): void {
  * immutable frozen Backup's config and SecretStorage, never from an
  * unauthenticated local salt or the Destination's new password.
  *
- * The old encrypted Git HEAD is also authenticated before any route is
- * described as keyed. Full Backup/Destination content and WAL proofs are
- * deliberately NOT inferred; even a successful result cannot resume Sync.
+ * The encrypted HEAD authenticates the recovered key before a complete
+ * old-key Frozen Backup readback across every live object. Destination
+ * content and cold-start WAL are NOT inferred; no result can resume Sync.
  */
 export async function inspectV4ReencryptionColdStartJournalKey(
   input: V4ReencryptionColdStartJournalInput,
@@ -87,12 +89,14 @@ export async function inspectV4ReencryptionColdStartJournalKey(
       || typeof readPersistedPluginData !== "function"
       || typeof assertLiveOwner !== "function") return MANUAL
     const pinned = {
-      repo: backupGit.getRepositoryIdentity, ref: backupGit.getGitRef,
+      repo: backupGit.getRepositoryIdentity,
+      defaultBranch: backupGit.getRepositoryDefaultBranch, ref: backupGit.getGitRef,
       commit: backupGit.getGitCommit, tree: backupGit.getTreeAt,
       blob: backupGit.getBlob, branch: backupGit.branchName,
       read: adapter.read, exists: adapter.exists,
     }
     const unchanged = () => backupGit.getRepositoryIdentity === pinned.repo
+      && backupGit.getRepositoryDefaultBranch === pinned.defaultBranch
       && backupGit.getGitRef === pinned.ref
       && backupGit.getGitCommit === pinned.commit
       && backupGit.getTreeAt === pinned.tree
@@ -197,13 +201,47 @@ export async function inspectV4ReencryptionColdStartJournalKey(
       || keyed.observation !== first.observation
       || keyed.diagnosticIndexRoot !== first.diagnosticIndexRoot) return MANUAL
     check()
-    const [lastRef, lastPhysical] = await Promise.all([
+    const defaultBranch = await pinned.defaultBranch.call(backupGit)
+    check()
+    const plan = proposeV4SameRepositoryReencryptionBackupBranch({
+      sourceRepoId: identity.sourceRepoId,
+      backupRepoId: identity.backupRepoId,
+      destinationRepoId: identity.destinationRepoId,
+      pinnedSourceCommitSha: identity.sourceCommitSha,
+      sourcePhysicalRepositoryId: physical.id,
+      backupPhysicalRepositoryId: physical.id,
+      destinationPhysicalRepositoryId: physical.id,
+      expectedPhysicalRepositoryId: physical.id,
+      defaultBranch,
+    })
+    const fullInput = {
+      github: backupGit, plan, expectedSourceTreeSha: identity.sourceTreeSha,
+      passphrase: originalPassphrase,
+    }
+    const firstFull = await verifyGitHubFrozenReencryptionBackup(fullInput)
+    check()
+    const secondFull = await verifyGitHubFrozenReencryptionBackup(fullInput)
+    check()
+    if (!firstFull.backupContentsReadbackVerified || !secondFull.backupContentsReadbackVerified
+      || firstFull.verifiedFileCount !== secondFull.verifiedFileCount
+      || firstFull.verifiedRemoteObjectCount !== secondFull.verifiedRemoteObjectCount
+      || firstFull.verifiedPlaintextBytes !== secondFull.verifiedPlaintextBytes) return MANUAL
+
+    const finalRoute = await inspectV4ReencryptionColdStartIndexRoute({
+      adapter, readPersistedPluginData, getSecret, journalKey: keyring.journalKey,
+    })
+    check()
+    if (!finalRoute.routingHintAuthenticated
+      || finalRoute.observation !== keyed.observation
+      || finalRoute.diagnosticIndexRoot !== keyed.diagnosticIndexRoot) return MANUAL
+    const [lastRef, lastPhysical, lastDefault] = await Promise.all([
       pinned.ref.call(backupGit), pinned.repo.call(backupGit),
+      pinned.defaultBranch.call(backupGit),
     ])
     check()
     if (lastRef.ref !== expectedRef || lastRef.type !== "commit"
       || lastRef.sha !== identity.sourceCommitSha || lastPhysical.id !== physical.id
-      || lastPhysical.fullName !== physical.fullName
+      || lastPhysical.fullName !== physical.fullName || lastDefault !== defaultBranch
       || await pinned.read.call(adapter, V4_REENCRYPTION_RUNTIME_ROUTE_PATH) !== routeText
       || getSecret(identity.sourcePassphraseSecretId) !== originalPassphrase
       || getSecret(identity.destinationPassphraseSecretId) !== destinationPassphrase) return MANUAL
@@ -212,6 +250,7 @@ export async function inspectV4ReencryptionColdStartJournalKey(
       diagnosticIndexRoot: keyed.diagnosticIndexRoot,
       originalKeyAuthenticated: true,
       pinnedBackupConfigAndEncryptedHeadVerified: true,
+      completeBackupContentsReverified: true,
     })
   } catch {
     return MANUAL
