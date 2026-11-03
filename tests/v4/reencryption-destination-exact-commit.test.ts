@@ -2233,6 +2233,12 @@ async function d247Scenario() {
   const source = old.input
   const destination = {
     ...destinationSource.input, adapter: source.adapter,
+    // D247 must use the actual old-key Source Config from D235's Frozen
+    // Backup, not D238's independent synthetic source-salt fixture.
+    remote: {
+      ...destinationSource.input.remote,
+      sourceConfig: config(original, "d217-original-salt"),
+    },
     getSecret: source.getSecret, assertLiveOwner: source.assertLiveOwner,
   }
   const current = {
@@ -3037,6 +3043,84 @@ test("D247 rechecks frozen Backup after Destination scan and refuses changed old
   assert.equal(s.getHolderCalls(), 1)
   assert.deepEqual(s.walFiles, wal)
   assert.equal(s.old.f.s.getWrites(), writes)
+})
+
+test("D259 D247 rejects caller-supplied old Source Config that differs from the pinned Frozen Backup", async () => {
+  const s = await d247Scenario()
+  const remote = s.input.current.destination.remote
+  const originalSource = remote.sourceConfig
+  assert.ok(originalSource.kdfParams)
+  remote.sourceConfig = {
+    ...originalSource,
+    kdfParams: { ...originalSource.kdfParams, salt: toBase64Url(enc("d259-forged-old-source-salt")) },
+  }
+  const beforeLocal = new Map(s.old.f.s.files)
+  const beforeWal = new Map(s.walFiles)
+  const beforeSecrets = new Map(s.old.f.s.secrets)
+  const writes = s.old.f.s.getWrites()
+  const report = await inspectV4ColdStartCompleteRecovery(s.input)
+  assert.equal(report.observation, "manual-recovery-required")
+  assert.equal(report.completeOldBackupReverified, false)
+  assert.equal(report.completeDestinationContentsReverified, false)
+  assert.equal(report.resumeSyncAuthorized, false)
+  assert.equal(report.localCutoverAuthorized, false)
+  assert.equal(s.getHolderCalls(), 1)
+  assert.equal(s.isHeld(), false)
+  assert.deepEqual(s.old.f.s.files, beforeLocal)
+  assert.deepEqual(s.old.f.s.secrets, beforeSecrets)
+  assert.deepEqual(s.walFiles, beforeWal)
+  assert.equal(s.old.f.s.getWrites(), writes)
+})
+
+test("D259 D247 rejects Source Config drift after full Destination scan during old Backup reread", async () => {
+  const s = await d247Scenario()
+  const destGit = s.input.current.destination.destinationGit
+  const oldGit = s.input.backup.backupGit
+  const originalBlob = destGit.getBlob
+  const originalRef = oldGit.getGitRef
+  const remote = s.input.current.destination.remote
+  const beforeLocal = new Map(s.old.f.s.files)
+  const beforeWal = new Map(s.walFiles)
+  const beforeSecrets = new Map(s.old.f.s.secrets)
+  const writes = s.old.f.s.getWrites()
+  let destinationScanned = false
+  let changed = false
+  destGit.getBlob = async sha => {
+    const bytes = await originalBlob(sha)
+    destinationScanned = true
+    return bytes
+  }
+  oldGit.getGitRef = async () => {
+    const ref = await originalRef()
+    if (destinationScanned && !changed) {
+      changed = true
+      const config = remote.sourceConfig
+      assert.ok(config.kdfParams)
+      remote.sourceConfig = {
+        ...config,
+        kdfParams: { ...config.kdfParams, salt: toBase64Url(enc("d259-race-forged-old-source-salt")) },
+      }
+    }
+    return ref
+  }
+  try {
+    const report = await inspectV4ColdStartCompleteRecovery(s.input)
+    assert.equal(destinationScanned, true)
+    assert.equal(changed, true)
+    assert.equal(report.observation, "manual-recovery-required")
+    assert.equal(report.completeDestinationContentsReverified, false)
+    assert.equal(report.localCutoverAuthorized, false)
+    assert.equal(report.remoteWritesAuthorized, false)
+    assert.equal(s.getHolderCalls(), 1)
+    assert.equal(s.isHeld(), false)
+    assert.deepEqual(s.old.f.s.files, beforeLocal)
+    assert.deepEqual(s.old.f.s.secrets, beforeSecrets)
+    assert.deepEqual(s.walFiles, beforeWal)
+    assert.equal(s.old.f.s.getWrites(), writes)
+  } finally {
+    destGit.getBlob = originalBlob
+    oldGit.getGitRef = originalRef
+  }
 })
 
 test("D258 D247 refuses Destination ref move during the final old Backup readback", async () => {

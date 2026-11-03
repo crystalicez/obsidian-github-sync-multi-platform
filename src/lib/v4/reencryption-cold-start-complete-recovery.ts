@@ -7,6 +7,10 @@ import {
   type V4ColdStartWalDestinationInput,
 } from "./reencryption-cold-start-wal-destination"
 import { assertV4ReencryptionCutoverSnapshotContract } from "./reencryption-cutover-snapshot-contract"
+import { readImmutableGitFile } from "./immutable-git-read"
+import { assertV4GitBlobIdentity } from "./git-blob-identity"
+import { decodeV4RemoteConfig } from "./remote-index"
+import { V4_CONFIG_PATH } from "./protocol-types"
 
 /**
  * One exclusively held, read-only recovery scope. The old-key source/Backup
@@ -89,6 +93,7 @@ export async function inspectV4ColdStartCompleteRecovery(
     assertV4ReencryptionCutoverSnapshotContract(current.contract)
     const { contract, wal, destination } = current
     const contractText = JSON.stringify(contract)
+    const destinationRemoteText = JSON.stringify(destination.remote)
     const oldKey = wal.originalJournalKey
     keyCopy = Uint8Array.from(oldKey)
     const immutable = {
@@ -158,6 +163,7 @@ export async function inspectV4ColdStartCompleteRecovery(
       && destination.destinationGit.getTreeAt === immutable.destinationTree
       && destination.destinationGit.getBlob === immutable.destinationBlob
       && destination.remote === immutable.destinationRemote
+      && JSON.stringify(destination.remote) === destinationRemoteText
       && wal.assertLiveOwner === immutable.backupOwner
       && destination.assertLiveOwner === immutable.backupOwner
       && destination.adapter === immutable.backupAdapter
@@ -174,6 +180,30 @@ export async function inspectV4ColdStartCompleteRecovery(
         throw Error("D247 existing WAL checkpoint not verified.")
       }
       check()
+    }
+    const assertPinnedSourceConfig = async () => {
+      await boundary()
+      const sourceFile = await readImmutableGitFile(
+        V4_CONFIG_PATH, contract.identity.sourceCommitSha, {
+          getCommit: async sha => {
+            const commit = await immutable.backupCommit.call(immutable.backupGit, sha)
+            if (commit.sha !== sha || commit.treeSha !== contract.identity.sourceTreeSha) {
+              throw Error("D259 old Source Config commit/tree changed.")
+            }
+            return commit
+          },
+          getTree: sha => immutable.backupTree.call(immutable.backupGit, sha, false),
+          getBlob: sha => immutable.backupBlob.call(immutable.backupGit, sha),
+        },
+      )
+      await boundary()
+      if (!sourceFile) throw Error("D259 immutable Frozen Backup is missing Source Config.")
+      assertV4GitBlobIdentity(sourceFile.bytes, sourceFile.sha)
+      const actual = decodeV4RemoteConfig(sourceFile.bytes)
+      if (actual.repoId !== contract.identity.sourceRepoId
+        || JSON.stringify(actual) !== JSON.stringify(destination.remote.sourceConfig)) {
+        throw Error("D259 Destination proof Source Config differs from the authenticated old Backup.")
+      }
     }
     let entered = false
     let reentryAttempted = false
@@ -207,6 +237,7 @@ export async function inspectV4ColdStartCompleteRecovery(
         || !first.recoveredKeyAndContractBoundToCaller) {
         throw Error("D247 original key/Backup not authenticated.")
       }
+      await assertPinnedSourceConfig()
       await boundary()
       const currentReport = await inspectV4ColdStartWalDestination({
         ...current,
@@ -234,6 +265,7 @@ export async function inspectV4ColdStartCompleteRecovery(
         || second.diagnosticIndexRoot !== first.diagnosticIndexRoot) {
         throw Error("D247 frozen old Backup changed during Destination readback.")
       }
+      await assertPinnedSourceConfig()
       await boundary()
       const lastPhysical = await immutable.backupGit.getRepositoryIdentity()
       await boundary()
