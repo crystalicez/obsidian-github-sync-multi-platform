@@ -198,6 +198,8 @@ export async function releaseLocal({
   }
 
   const recheckSourceAndEvidence = async ({ requireStable, requireReleaseAbsent = false, requireDraft = false } = {}) => {
+    // Choice B must stay qualified at every irreversible publication boundary.
+    await s.requireReencryptionWizardReleaseGate({ cwd });
     const currentSha = s.requireCleanMaster({ runner: releaseRunner, cwd });
     if (currentSha !== sha) throw new Error("Local HEAD changed during release");
     s.requireCanonicalOriginEndpoints({ runner: releaseRunner, cwd });
@@ -270,6 +272,9 @@ export async function releaseLocal({
     runner: releaseRunner, repo: CANONICAL_REPOSITORY, version, release: finalDraftState.release,
     localArtifacts: packaged.assets, tempRoot: join(packaged.stagingDir, "verify-final"), env: releaseEnv, cwd,
   });
+  // Final asset verification is asynchronous. Recheck Choice B immediately
+  // before the publish mutation too; a lapsed gate leaves the draft untouched.
+  await s.requireReencryptionWizardReleaseGate({ cwd });
 
   phase("publish");
   const publishResult = s.runGitHubCli({ runner: releaseRunner, args: s.publishDraftArgs({ repo: CANONICAL_REPOSITORY, version }), env: releaseEnv, cwd });

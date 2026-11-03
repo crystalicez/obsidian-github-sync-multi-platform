@@ -11,7 +11,8 @@ export const REENCRYPTION_RELEASE_CHECKS = Object.freeze([
   "nativeDesktopAndMobileAcceptance",
 ]);
 
-const MANIFEST_KEYS = Object.freeze(["schemaVersion", "gate", "status", "backupPolicy", "checks"]);
+const MANIFEST_KEYS = Object.freeze(["schemaVersion", "gate", "status", "firstReleasePolicy", "backupPolicy", "checks"]);
+const FIRST_RELEASE_POLICY_KEYS = Object.freeze(["mode", "syncOnlyReleaseAllowed"]);
 const BACKUP_POLICY_KEYS = Object.freeze([
   "acceptedMode", "sharedRepositoryFailureDomainAccepted", "independentCopyRequired",
 ]);
@@ -44,6 +45,10 @@ export async function requireReencryptionWizardReleaseGate({
     || manifest.schemaVersion !== 1
     || manifest.gate !== "first-public-release-reencryption-wizard"
     || manifest.status !== "qualified"
+    // Owner choice B: no stable release with Sync alone or a preview-only Wizard.
+    || !hasExactKeys(manifest.firstReleasePolicy, FIRST_RELEASE_POLICY_KEYS)
+    || manifest.firstReleasePolicy.mode !== "sync-and-reencryption-together"
+    || manifest.firstReleasePolicy.syncOnlyReleaseAllowed !== false
     // Choice B accepts a verified same-repository backup, NOT unverified or independent storage.
     || !hasExactKeys(manifest.backupPolicy, BACKUP_POLICY_KEYS)
     || manifest.backupPolicy.acceptedMode !== "verified-same-repository-branch"

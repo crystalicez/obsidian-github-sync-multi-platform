@@ -147,6 +147,10 @@ test("D74 release gate records owner-approved orphan topology but continues to b
     new URL("../../docs/release-gates/reencryption-wizard.json", import.meta.url), "utf8",
   ));
   assert.equal(manifest.status, "blocked");
+  assert.deepEqual(manifest.firstReleasePolicy, {
+    mode: "sync-and-reencryption-together",
+    syncOnlyReleaseAllowed: false,
+  });
   assert.deepEqual(manifest.backupPolicy, {
     acceptedMode: "verified-same-repository-branch",
     sharedRepositoryFailureDomainAccepted: true,
@@ -167,7 +171,12 @@ test("first public release fails closed until the Re-encryption Wizard acceptanc
   const cwd = await mkdtemp(join(tmpdir(), "rekey-release-gate-"));
   const fileName = "docs/release-gates/reencryption-wizard.json";
   const blocked = { schemaVersion: 1, gate: "first-public-release-reencryption-wizard",
-    status: "blocked", backupPolicy: {
+    status: "blocked",
+    firstReleasePolicy: {
+      mode: "sync-and-reencryption-together",
+      syncOnlyReleaseAllowed: false,
+    },
+    backupPolicy: {
       acceptedMode: "verified-same-repository-branch",
       sharedRepositoryFailureDomainAccepted: true,
       independentCopyRequired: false,
@@ -219,6 +228,13 @@ test("first public release fails closed until the Re-encryption Wizard acceptanc
   };
   for (const [label, manifest] of [
     ["unknown top-level criterion", { ...qualified, futureAcceptance: "pending" }],
+    ["release policy removed", { ...qualified, firstReleasePolicy: undefined }],
+    ["sync-only first release", { ...qualified,
+      firstReleasePolicy: { mode: "sync-only-first", syncOnlyReleaseAllowed: true } }],
+    ["policy booleans disagree", { ...qualified,
+      firstReleasePolicy: { mode: "sync-and-reencryption-together", syncOnlyReleaseAllowed: true } }],
+    ["extra policy field", { ...qualified,
+      firstReleasePolicy: { ...qualified.firstReleasePolicy, waiveNativeAcceptance: true } }],
     ["unknown backup policy", { ...qualified,
       backupPolicy: { ...qualified.backupPolicy, secondCopyRequired: "pending" } }],
     ["future pending check", { ...qualified,
@@ -247,6 +263,70 @@ test("first public release fails closed until the Re-encryption Wizard acceptanc
     /Re-encryption Wizard acceptance blocked/u,
   );
   assert.deepEqual(h.calls, [], "blocked release must perform no remote or artifact operations");
+});
+
+test("choice B release gate is rechecked before stable ref creation after lengthy qualification", async () => {
+  const h = await harness();
+  let checks = 0;
+  h.services.requireReencryptionWizardReleaseGate = () => {
+    checks++;
+    if (checks === 2) throw new Error("Re-encryption full-release evidence changed");
+  };
+  await assert.rejects(
+    () => releaseLocal({ cwd: "/repo", version: "1.0.8", services: h.services,
+      runtimeNodeVersion: "v24.11.0", onProgress: event => h.events.push(event) }),
+    /full-release evidence changed/u,
+  );
+  assert.equal(checks, 2);
+  assert.equal(h.calls.includes("stable-create"), false);
+  assert.equal(h.calls.some(c => c.startsWith("gh:")), false);
+  assert.equal(h.getRelease(), null);
+  assert.equal(h.events.at(-1)?.phase, "final-pre-mutation-check");
+});
+
+test("choice B release gate is rechecked before publishing a draft; it never publishes a lapsed gate", async () => {
+  const h = await harness();
+  let checks = 0;
+  h.services.requireReencryptionWizardReleaseGate = () => {
+    checks++;
+    if (checks === 4) throw new Error("Re-encryption complete acceptance lapsed");
+  };
+  await assert.rejects(
+    () => releaseLocal({ cwd: "/repo", version: "1.0.8", services: h.services,
+      runtimeNodeVersion: "v24.11.0", onProgress: event => h.events.push(event) }),
+    /complete acceptance lapsed/u,
+  );
+  assert.equal(checks, 4);
+  assert.equal(h.calls.includes("stable-create"), true);
+  assert.equal(h.calls.some(c => c.startsWith("gh:release:create")), true);
+  assert.equal(h.calls.some(c => c.startsWith("gh:release:edit")), false);
+  assert.equal(h.getRelease()?.draft, true, "Uncertain/partial state must remain a draft for manual inspection");
+  assert.equal(h.events.at(-1)?.phase, "final-publish-check");
+});
+
+test("choice B checks immediately after final asynchronous asset verification, before publish", async () => {
+  const h = await harness();
+  let checks = 0;
+  let assetChecks = 0;
+  let evidenceValid = true;
+  h.services.requireReencryptionWizardReleaseGate = () => {
+    checks++;
+    if (!evidenceValid) throw new Error("Re-encryption evidence revoked during final asset readback");
+  };
+  h.services.verifyReleaseAssets = async () => {
+    assetChecks++;
+    if (assetChecks === 2) evidenceValid = false;
+  };
+  await assert.rejects(
+    () => releaseLocal({ cwd: "/repo", version: "1.0.8", services: h.services,
+      runtimeNodeVersion: "v24.11.0", onProgress: event => h.events.push(event) }),
+    /evidence revoked during final asset readback/u,
+  );
+  assert.equal(checks, 5);
+  assert.equal(assetChecks, 2);
+  assert.equal(h.calls.some(c => c.startsWith("gh:release:edit")), false);
+  assert.equal(h.getRelease()?.draft, true);
+  assert.equal(h.events.at(-1)?.phase, "final-publish-check");
 });
 
 test("public release is unreachable before all exact verification phases", async () => {

@@ -2,6 +2,10 @@
   "schemaVersion": 1,
   "gate": "first-public-release-reencryption-wizard",
   "status": "blocked",
+  "firstReleasePolicy": {
+    "mode": "sync-and-reencryption-together",
+    "syncOnlyReleaseAllowed": false
+  },
   "backupPolicy": {
     "acceptedMode": "verified-same-repository-branch",
     "sharedRepositoryFailureDomainAccepted": true,
