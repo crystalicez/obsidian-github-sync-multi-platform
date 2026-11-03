@@ -385,6 +385,9 @@ export class V4PluginRuntime {
       }) | undefined
       const nativeRead = native?.read
       const nativeExists = native?.exists
+      const nativeStat = native?.stat
+      const nativeList = native?.list
+      const nativeGetFullPath = native?.getFullPath
       const secretStorage = this.plugin.app.secretStorage
       const getSecret = secretStorage.getSecret
       const loadData = this.plugin.loadData
@@ -408,6 +411,8 @@ export class V4PluginRuntime {
           || this.plugin.settings !== settings || this.plugin.manifest.id !== pluginId
           || this.credentialGeneration !== generation || Platform.isDesktopApp !== desktop
           || native.read !== nativeRead || native.exists !== nativeExists
+          || native.stat !== nativeStat || native.list !== nativeList
+          || native.getFullPath !== nativeGetFullPath
           || settings.githubOwner !== pinned.owner || settings.githubRepo !== pinned.repo
           || settings.githubBranch !== pinned.branch || settings.githubToken !== pinned.token
           || settings.githubTokenSecretId !== pinned.tokenSecretId
@@ -632,6 +637,9 @@ export class V4PluginRuntime {
       const generation = this.credentialGeneration
       const indexRead = backing?.read
       const indexExists = backing?.exists
+      const nativeStat = backing?.stat
+      const nativeList = backing?.list
+      const nativeGetFullPath = backing?.getFullPath
       const source = {
         owner: settings.githubOwner, repo: settings.githubRepo,
         branch: settings.githubBranch, token: settings.githubToken,
@@ -650,6 +658,8 @@ export class V4PluginRuntime {
           || secretStorage.getSecret !== getSecret || this.plugin.loadData !== loadData
           || Platform.isDesktopApp !== desktop
           || backing.read !== indexRead || backing.exists !== indexExists
+          || backing.stat !== nativeStat || backing.list !== nativeList
+          || backing.getFullPath !== nativeGetFullPath
           || settings.githubOwner !== source.owner || settings.githubRepo !== source.repo
           || settings.githubBranch !== source.branch || settings.githubToken !== source.token
           || settings.githubTokenSecretId !== source.tokenSecretId

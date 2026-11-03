@@ -3612,9 +3612,29 @@ test("D248/D250/D252/D260/D262 Mobile existing WAL, one-owner proof and in-proce
   }
   assert.deepEqual(files, before)
   const platformWasDesktop = Platform.isDesktopApp
+  const originalReadForRuntime = adapter.read
+  const originalStatForRuntime = adapter.stat
+  const originalListForRuntime = adapter.list
   let runtime: V4PluginRuntime | undefined
   try {
     Platform.isDesktopApp = false
+    let contractReadCount = 0
+    let swapAtContractRead = 0
+    let methodToSwap: "stat" | "list" | undefined
+    adapter.read = async name => {
+      const value = await originalReadForRuntime(name)
+      if (name.endsWith("/contract.json")) {
+        contractReadCount++
+        if (methodToSwap && contractReadCount === swapAtContractRead) {
+          if (methodToSwap === "stat") {
+            adapter.stat = async path => originalStatForRuntime(path)
+          } else {
+            adapter.list = async path => originalListForRuntime(path)
+          }
+        }
+      }
+      return value
+    }
     const settings = (JSON.parse(s.old.saved) as { settings: Record<string, unknown> }).settings
     runtime = new V4PluginRuntime({
       settings, manifest: { id: pluginId }, loadData: async () => JSON.parse(s.old.saved),
@@ -3632,6 +3652,27 @@ test("D248/D250/D252/D260/D262 Mobile existing WAL, one-owner proof and in-proce
     assert.equal(structure.installedObsidianAcceptanceProven, false)
     assert.equal(structure.localCutoverAuthorized, false)
     assert.equal(structure.resumeSyncAuthorized, false)
+    const finalContractRead = contractReadCount
+    assert.ok(finalContractRead >= 2, "the existing-WAL preflight re-reads its candidate contract")
+    for (const changedMethod of ["stat", "list"] as const) {
+      contractReadCount = 0
+      swapAtContractRead = finalContractRead
+      methodToSwap = changedMethod
+      try {
+        const drifted = await runtime.inspectFencedReencryptionExistingWalStructure()
+        assert.equal(contractReadCount, finalContractRead, "inject after final candidate contract read")
+        assert.notEqual(adapter[changedMethod],
+          changedMethod === "stat" ? originalStatForRuntime : originalListForRuntime)
+        assert.equal(drifted.observation, "manual-recovery-required",
+          "installed Mobile must refuse late " + changedMethod + " reader replacement")
+        assert.equal(drifted.resumeSyncAuthorized, false)
+        assert.equal(drifted.walAuthenticated, false)
+      } finally {
+        methodToSwap = undefined
+        adapter.stat = originalStatForRuntime
+        adapter.list = originalListForRuntime
+      }
+    }
     settings["githubToken"] = "offline-d252-mobile-test-token"
     const methods = [
       "getRepositoryIdentity", "getRepositoryDefaultBranch", "getGitRef",
@@ -3669,6 +3710,9 @@ test("D248/D250/D252/D260/D262 Mobile existing WAL, one-owner proof and in-proce
     assert.deepEqual(files, before, "installed Mobile preflight cannot mutate WAL")
   } finally {
     runtime?.dispose()
+    adapter.read = originalReadForRuntime
+    adapter.stat = originalStatForRuntime
+    adapter.list = originalListForRuntime
     Platform.isDesktopApp = platformWasDesktop
   }
   const cooperativeLease = evidence.assertCooperativeRecoveryLease
