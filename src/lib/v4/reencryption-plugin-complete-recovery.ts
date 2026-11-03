@@ -191,6 +191,10 @@ export async function inspectV4MobilePluginCompleteRecovery(
     if (!adapter || typeof adapter !== "object" || activeMobileRecoveryAdapters.has(adapter)) {
       return manual(isolation)
     }
+    const { configDir, pluginId, runId, assertLiveOwner } = owner
+    const nativeMethods = {
+      stat: adapter.stat, list: adapter.list, read: adapter.read,
+    }
     activeMobileRecoveryAdapters.add(adapter)
     reservedAdapter = adapter
     const reader = await openV4MobilePluginWalForRecovery(owner)
@@ -199,7 +203,12 @@ export async function inspectV4MobilePluginCompleteRecovery(
       if (input.owner !== owner || input.backup !== backup || input.contract !== contract
         || input.destination !== destination || input.originalJournalKey !== originalJournalKey
         || input.withExclusiveCooperativeRecoveryLease !== holder
-        || input.assertCooperativeRecoveryLease !== lease) {
+        || input.assertCooperativeRecoveryLease !== lease
+        || owner.adapter !== adapter || owner.configDir !== configDir
+        || owner.pluginId !== pluginId || owner.runId !== runId
+        || owner.assertLiveOwner !== assertLiveOwner
+        || adapter.stat !== nativeMethods.stat || adapter.list !== nativeMethods.list
+        || adapter.read !== nativeMethods.read) {
         throw Error("Re-encryption Mobile diagnostic evidence or cooperative lease changed.")
       }
     }

@@ -3393,7 +3393,7 @@ test("D248/D250/D252 verifies Desktop WAL lock, installed physical readback and 
   }
 })
 
-test("D248/D250/D252/D260 Mobile existing WAL, in-process exclusion and old-key authentication stay non-authorizing", async () => {
+test("D248/D250/D252/D260/D262 Mobile existing WAL, one-owner proof and in-process exclusion stay non-authorizing", async () => {
   const s = await d247Scenario()
   const runId = s.contract.identity.runId
   const configDir = ".obsidian"
@@ -3520,6 +3520,65 @@ test("D248/D250/D252/D260 Mobile existing WAL, in-process exclusion and old-key 
     "a completed scan must release its in-process Mobile adapter reservation")
   assert.equal(sequential.resumeSyncAuthorized, false)
   assert.equal(leaseCount, 2)
+  assert.deepEqual(files, before)
+  // D262: D247 has already authenticated the complete old/new proof. The
+  // injected held callback swaps the *installed vault adapter* after that
+  // proof, before D248's last owner check. Owner object and runId are stable.
+  const beforeAdapter = owner.adapter
+  const holdDiagnostic = evidence.withExclusiveCooperativeRecoveryLease
+  evidence.withExclusiveCooperativeRecoveryLease = async <T>(body: () => Promise<T>): Promise<T> =>
+    holdDiagnostic(async () => {
+      const completed = await body()
+      owner.adapter = { ...adapter }
+      return completed
+    })
+  try {
+    const swapped = await inspectV4MobilePluginCompleteRecovery(evidence)
+    assert.equal(swapped.observation, "manual-recovery-required")
+    assert.equal(swapped.completeDestinationContentsReverified, false)
+    assert.equal(swapped.resumeSyncAuthorized, false)
+    assert.equal(swapped.remoteWritesAuthorized, false)
+    assert.equal(swapped.installedObsidianAcceptanceProven, false)
+  } finally {
+    owner.adapter = beforeAdapter
+    evidence.withExclusiveCooperativeRecoveryLease = holdDiagnostic
+  }
+  assert.equal(held, false)
+  assert.deepEqual(files, before, "late owner swap must not touch WAL ciphertext")
+  for (const property of ["configDir", "pluginId"] as const) {
+    const originalValue = owner[property]
+    evidence.withExclusiveCooperativeRecoveryLease = async <T>(body: () => Promise<T>): Promise<T> =>
+      holdDiagnostic(async () => {
+        const completed = await body()
+        owner[property] = originalValue + "-swapped"
+        return completed
+      })
+    try {
+      const drifted = await inspectV4MobilePluginCompleteRecovery(evidence)
+      assert.equal(drifted.observation, "manual-recovery-required",
+        "late Mobile " + property + " replacement must invalidate completed proof")
+      assert.equal(drifted.resumeSyncAuthorized, false)
+    } finally {
+      owner[property] = originalValue
+      evidence.withExclusiveCooperativeRecoveryLease = holdDiagnostic
+    }
+  }
+  const originalMethod = adapter.read
+  evidence.withExclusiveCooperativeRecoveryLease = async <T>(body: () => Promise<T>): Promise<T> =>
+    holdDiagnostic(async () => {
+      const completed = await body()
+      adapter.read = async path => originalMethod(path)
+      return completed
+    })
+  try {
+    const driftedMethod = await inspectV4MobilePluginCompleteRecovery(evidence)
+    assert.equal(driftedMethod.observation, "manual-recovery-required",
+      "late Mobile adapter reader replacement must invalidate completed proof")
+    assert.equal(driftedMethod.remoteWritesAuthorized, false)
+  } finally {
+    adapter.read = originalMethod
+    evidence.withExclusiveCooperativeRecoveryLease = holdDiagnostic
+  }
   assert.deepEqual(files, before)
   const platformWasDesktop = Platform.isDesktopApp
   let runtime: V4PluginRuntime | undefined
