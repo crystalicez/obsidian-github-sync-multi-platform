@@ -46,6 +46,12 @@ export interface V4ColdStartWalSnapshotInput {
    * against the exact immutable Destination commit; NOT full contents/crypto.
    */
   readonly destinationCiphertextReadback?: V4WalReceiptDestinationReadback
+  /**
+   * Invoked only after D237 reauthenticates both WAL slots, validates their
+   * Cutover digest and matches every pinned Destination ciphertext receipt.
+   * Does not return receipts or raw keys through a public report.
+   */
+  readonly verifyAuthenticatedReceipts?: (receipts: readonly V4ReencryptionObjectReceipt[]) => Promise<boolean>
   /** Validates the current plugin/vault owner at every awaited boundary. */
   readonly assertLiveOwner: () => void
 }
@@ -97,7 +103,7 @@ export async function inspectV4ColdStartWalSnapshot(
   let originalKey: Uint8Array | undefined
   try {
     const { adapter, root, contract, originalJournalKey, expectedReceipts,
-      destinationCiphertextReadback, assertLiveOwner } = input
+      destinationCiphertextReadback, verifyAuthenticatedReceipts, assertLiveOwner } = input
     if (!adapter || typeof adapter.exists !== "function" || typeof adapter.read !== "function"
       || typeof assertLiveOwner !== "function"
       || !(originalJournalKey instanceof Uint8Array)
@@ -117,6 +123,7 @@ export async function inspectV4ColdStartWalSnapshot(
         || input.originalJournalKey !== originalJournalKey
         || input.expectedReceipts !== expectedReceipts
         || input.destinationCiphertextReadback !== destinationCiphertextReadback
+        || input.verifyAuthenticatedReceipts !== verifyAuthenticatedReceipts
         || JSON.stringify(expectedReceipts) !== receiptText
         || input.assertLiveOwner !== assertLiveOwner
         || adapter.read !== read || adapter.exists !== exists
@@ -190,6 +197,18 @@ export async function inspectV4ColdStartWalSnapshot(
     if (JSON.stringify(afterGit) !== JSON.stringify(first)
       || JSON.stringify(await capture()) !== JSON.stringify(before)) return MANUAL
     check()
+    if (!verifyAuthenticatedReceipts) {
+      return Object.freeze({ ...OBSERVED, destinationCiphertextReceiptsReverified: true })
+    }
+    if (!await verifyAuthenticatedReceipts(first.receipts)) return MANUAL
+    check()
+    const final = await journal.assertHealthySnapshot(contract.identity.walGeneration)
+    check()
+    if (JSON.stringify(final) !== JSON.stringify(first)
+      || JSON.stringify(await capture()) !== JSON.stringify(before)) return MANUAL
+    check()
+    // D237 cannot claim what an injected callback verified. Only its
+    // trusted caller can interpret the callback it supplied.
     return Object.freeze({ ...OBSERVED, destinationCiphertextReceiptsReverified: true })
   } catch {
     return MANUAL

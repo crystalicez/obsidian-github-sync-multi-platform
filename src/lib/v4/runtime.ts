@@ -364,10 +364,10 @@ export class V4PluginRuntime {
   }
 
   /**
-   * D252 read-only old-key Frozen Backup plus AES-GCM WAL authentication.
-   * Physical plugin-private WAL is opened under the existing Desktop
-   * cooperative lock, or via Mobile's best-effort Obsidian reader.
-   * This is NOT a complete Destination proof or a Sync/Cutover permission.
+   * Read-only old-key Frozen Backup, WAL and complete new-key Destination
+   * scan, using the installed plugin-private WAL and current SecretStorage.
+   * Desktop holds the existing cooperative WAL lock; Mobile is best-effort.
+   * This does not grant Recovery, Sync or Cutover authority.
    */
   async verifyFencedReencryptionAuthenticatedWal(): Promise<V4ReencryptionColdStartJournalReport | null> {
     try {
@@ -454,6 +454,7 @@ export class V4PluginRuntime {
           await reader.assertExclusiveStageLease()
           const result = await this.verifyFencedReencryptionOriginalKeyWithWal({
             adapter: reader.adapter, root: layout.journalRoot, destinationGit,
+            fullDestination: true,
           })
           checkOwner()
           await reader.assertBestEffortCheckpoint()
@@ -469,6 +470,7 @@ export class V4PluginRuntime {
       checkOwner()
       const result = await this.verifyFencedReencryptionOriginalKeyWithWal({
         adapter: reader.adapter, root: reader.journalRoot, destinationGit,
+        fullDestination: true,
       })
       checkOwner()
       return result

@@ -2239,6 +2239,165 @@ async function d247Scenario() {
   }
 }
 
+test("D255 reads all new-key Destination plaintext using only old-key WAL receipts and pinned Source Config", async () => {
+  const s = await d247Scenario()
+  const walEvidence = {
+    root: s.input.current.wal.root, adapter: s.input.current.wal.adapter,
+    destinationGit: s.input.current.destination.destinationGit, fullDestination: true,
+  }
+  const beforeFiles = new Map(s.old.f.s.files)
+  const beforeSecrets = new Map(s.old.f.s.secrets)
+  const beforeWal = new Map(s.walFiles)
+  const writes = s.old.f.s.getWrites()
+  const result = await inspectV4ReencryptionColdStartJournalKey({ ...s.old.input, walEvidence })
+  assert.equal(result.observation, "authenticated-local-route-still-fenced")
+  assert.equal(result.originalKeyAuthenticated, true)
+  assert.equal(result.destinationCiphertextReceiptsReverified, true)
+  assert.equal(result.sourceShadowSnapshotsReverified, true)
+  assert.equal(result.destinationNewKeyHeadAuthenticated, true)
+  assert.equal(result.completeDestinationContentsReverified, true)
+  assert.equal(result.resumeSyncAuthorized, false)
+  assert.equal(result.localCutoverAuthorized, false)
+  assert.equal(result.remoteWritesAuthorized, false)
+  assert.equal(result.oldPassphraseCleanupAuthorized, false)
+  assert.deepEqual(s.old.f.s.files, beforeFiles)
+  assert.deepEqual(s.old.f.s.secrets, beforeSecrets)
+  assert.deepEqual(s.walFiles, beforeWal)
+  assert.equal(s.old.f.s.getWrites(), writes)
+})
+
+test("D255 rejects corrupted new-key Destination encrypted shard without writes or Recovery rights", async () => {
+  const s = await d247Scenario()
+  const git = s.input.current.destination.destinationGit
+  const tree = await git.getTreeAt(s.contract.identity.destinationTreeSha, true)
+  const shard = tree.tree.find(entry => entry.type === "blob" && entry.path.includes("/index/")
+    && entry.path.endsWith(".enc"))
+  assert.ok(shard, "fixture must include an encrypted Destination index shard")
+  const originalGetBlob = git.getBlob
+  const walEvidence = {
+    root: s.input.current.wal.root, adapter: s.input.current.wal.adapter,
+    destinationGit: git, fullDestination: true,
+  }
+  const beforeFiles = new Map(s.old.f.s.files)
+  const beforeWal = new Map(s.walFiles)
+  const writes = s.old.f.s.getWrites()
+  try {
+    git.getBlob = async sha => {
+      const bytes = Uint8Array.from(await originalGetBlob(sha))
+      if (sha === shard.sha) bytes[0] ^= 0xff
+      return bytes
+    }
+    const result = await inspectV4ReencryptionColdStartJournalKey({ ...s.old.input, walEvidence })
+    assert.equal(result.observation, "manual-recovery-required")
+    assert.equal(result.completeDestinationContentsReverified, false)
+    assert.equal(result.localCutoverAuthorized, false)
+    assert.equal(result.resumeSyncAuthorized, false)
+    assert.equal(result.remoteWritesAuthorized, false)
+    assert.deepEqual(s.old.f.s.files, beforeFiles)
+    assert.deepEqual(s.walFiles, beforeWal)
+    assert.equal(s.old.f.s.getWrites(), writes)
+  } finally {
+    git.getBlob = originalGetBlob
+  }
+})
+
+test("D255 refuses WAL slot drift during the full Destination plaintext scan", async () => {
+  const s = await d247Scenario()
+  const git = s.input.current.destination.destinationGit
+  const tree = await git.getTreeAt(s.contract.identity.destinationTreeSha, true)
+  const shard = tree.tree.find(entry => entry.type === "blob"
+    && entry.path.includes("/index/") && entry.path.endsWith(".enc"))
+  assert.ok(shard)
+  const root = s.input.current.wal.root
+  const slot = root + "/slot-" + (s.contract.identity.walGeneration % 2) + ".json"
+  const beforeFiles = new Map(s.old.f.s.files)
+  const beforeWal = new Map(s.walFiles)
+  const writes = s.old.f.s.getWrites()
+  const originalGetBlob = git.getBlob
+  let touched = false
+  try {
+    git.getBlob = async sha => {
+      const bytes = await originalGetBlob(sha)
+      if (sha === shard.sha && !touched) {
+        touched = true
+        s.walFiles.set(slot, "{torn-during-new-key-git-scan")
+      }
+      return bytes
+    }
+    const result = await inspectV4ReencryptionColdStartJournalKey({
+      ...s.old.input,
+      walEvidence: {
+        root, adapter: s.input.current.wal.adapter, destinationGit: git, fullDestination: true,
+      },
+    })
+    assert.equal(touched, true, "test must reach full decrypted shard scan")
+    assert.equal(result.observation, "manual-recovery-required")
+    assert.equal(result.completeDestinationContentsReverified, false)
+    assert.equal(result.resumeSyncAuthorized, false)
+    assert.equal(result.remoteWritesAuthorized, false)
+    assert.deepEqual(s.old.f.s.files, beforeFiles)
+    assert.equal(s.old.f.s.getWrites(), writes)
+    assert.equal(s.walFiles.get(slot), "{torn-during-new-key-git-scan")
+  } finally {
+    git.getBlob = originalGetBlob
+    s.walFiles.clear()
+    for (const [key, value] of beforeWal) s.walFiles.set(key, value)
+  }
+  assert.deepEqual(s.walFiles, beforeWal)
+})
+
+test("D255 rejects Destination ref moved after the plaintext scan but before final old Backup readback", async () => {
+  const s = await d247Scenario()
+  const git = s.input.current.destination.destinationGit
+  const backup = s.old.input.backupGit
+  const tree = await git.getTreeAt(s.contract.identity.destinationTreeSha, true)
+  const shard = tree.tree.find(node => node.type === "blob"
+    && node.path.includes("/index/") && node.path.endsWith(".enc"))
+  assert.ok(shard)
+  let contentRead = false
+  let changed = false
+  const originalBlob = git.getBlob
+  const originalDestRef = git.getGitRef
+  const originalBackupRef = backup.getGitRef
+  const beforeFiles = new Map(s.old.f.s.files)
+  const beforeWal = new Map(s.walFiles)
+  const writes = s.old.f.s.getWrites()
+  try {
+    git.getBlob = async sha => {
+      const bytes = await originalBlob(sha)
+      if (sha === shard.sha) contentRead = true
+      return bytes
+    }
+    git.getGitRef = async () => ({
+      ...(await originalDestRef()), sha: changed ? "9".repeat(40) : s.contract.identity.destinationCommitSha,
+    })
+    backup.getGitRef = async () => {
+      const ref = await originalBackupRef()
+      if (contentRead) changed = true
+      return ref
+    }
+    const report = await inspectV4ReencryptionColdStartJournalKey({
+      ...s.old.input,
+      walEvidence: {
+        root: s.input.current.wal.root, adapter: s.input.current.wal.adapter,
+        destinationGit: git, fullDestination: true,
+      },
+    })
+    assert.equal(contentRead, true)
+    assert.equal(changed, true)
+    assert.equal(report.observation, "manual-recovery-required")
+    assert.equal(report.completeDestinationContentsReverified, false)
+    assert.equal(report.remoteWritesAuthorized, false)
+    assert.deepEqual(s.old.f.s.files, beforeFiles)
+    assert.deepEqual(s.walFiles, beforeWal)
+    assert.equal(s.old.f.s.getWrites(), writes)
+  } finally {
+    git.getBlob = originalBlob
+    git.getGitRef = originalDestRef
+    backup.getGitRef = originalBackupRef
+  }
+})
+
 test("D254 reconstructs pinned Source/Shadow snapshots and decrypts new-key Destination HEAD without Cutover", async () => {
   const s = await d247Scenario()
   const walEvidence = {
@@ -2846,7 +3005,7 @@ test("D248/D250/D252 verifies Desktop WAL lock, installed physical readback and 
         assert.equal(authenticated?.destinationCiphertextReceiptsReverified, true)
         assert.equal(authenticated?.sourceShadowSnapshotsReverified, true)
         assert.equal(authenticated?.destinationNewKeyHeadAuthenticated, true)
-        assert.equal(authenticated?.completeDestinationContentsReverified, false)
+        assert.equal(authenticated?.completeDestinationContentsReverified, true)
         assert.equal(authenticated?.resumeSyncAuthorized, false)
         assert.equal(authenticated?.localCutoverAuthorized, false)
         drift = true
@@ -3015,7 +3174,7 @@ test("D248/D250/D252 Mobile existing WAL and installed old-key authentication re
       assert.equal(authenticated?.sourceShadowSnapshotsReverified, true)
       assert.equal(authenticated?.destinationNewKeyHeadAuthenticated, true)
       assert.equal(authenticated?.completeBackupContentsReverified, true)
-      assert.equal(authenticated?.completeDestinationContentsReverified, false)
+      assert.equal(authenticated?.completeDestinationContentsReverified, true)
       assert.equal(authenticated?.resumeSyncAuthorized, false)
     } finally {
       methods.forEach((name, i) => { prototype[name] = originals[i]! })

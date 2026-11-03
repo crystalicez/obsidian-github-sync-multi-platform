@@ -19,6 +19,7 @@ import {
   type V4ColdStartWalSnapshotInput,
 } from "./reencryption-cold-start-wal-snapshot"
 import { inspectV4ColdStartDestinationMetadata } from "./reencryption-cold-start-destination-metadata"
+import { inspectV4ColdStartFullDestination } from "./reencryption-cold-start-full-destination"
 
 const SHA = /^[0-9a-f]{40}$/u
 type BackupGit = Pick<GitHubClient,
@@ -42,6 +43,8 @@ export interface V4ReencryptionColdStartJournalInput
    */
   readonly walEvidence?: Pick<V4ColdStartWalSnapshotInput, "adapter" | "root"> & {
     readonly destinationGit?: NonNullable<V4ColdStartWalSnapshotInput["destinationCiphertextReadback"]>["git"]
+    /** Explicit opt-in for costly full read-only Destination plaintext scan. */
+    readonly fullDestination?: boolean
   }
   /** Refuse if the plugin instance, adapter or GitHub credentials changed. */
   readonly assertLiveOwner: () => void
@@ -54,7 +57,7 @@ export interface V4ReencryptionColdStartJournalReport {
   readonly pinnedBackupConfigAndEncryptedHeadVerified: boolean
   readonly completeBackupContentsReverified: boolean
   readonly recoveredKeyAndContractBoundToCaller: boolean
-  readonly completeDestinationContentsReverified: false
+  readonly completeDestinationContentsReverified: boolean
   readonly coldStartWalReverified: boolean
   readonly destinationCiphertextReceiptsReverified: boolean
   readonly sourceShadowSnapshotsReverified: boolean
@@ -125,6 +128,8 @@ export async function inspectV4ReencryptionColdStartJournalKey(
     const walRead = walAdapter?.read
     const walExists = walAdapter?.exists
     const walDestinationGit = walEvidence?.destinationGit
+    const fullDestination = walEvidence?.fullDestination === true
+    if (fullDestination && !walDestinationGit) return MANUAL
     if (walEvidence && (typeof walRoot !== "string" || !walRoot
       || !walAdapter || typeof walRead !== "function"
       || typeof walExists !== "function")) return MANUAL
@@ -144,6 +149,13 @@ export async function inspectV4ReencryptionColdStartJournalKey(
       blob: backupGit.getBlob, branch: backupGit.branchName,
       read: adapter.read, exists: adapter.exists,
     }
+    const destinationMethods = walDestinationGit ? {
+      branch: walDestinationGit.branchName,
+      repository: walDestinationGit.getRepositoryIdentity,
+      defaultBranch: walDestinationGit.getRepositoryDefaultBranch,
+      ref: walDestinationGit.getGitRef, commit: walDestinationGit.getGitCommit,
+      tree: walDestinationGit.getTreeAt, blob: walDestinationGit.getBlob,
+    } : null
     const unchanged = () => backupGit.getRepositoryIdentity === pinned.repo
       && backupGit.getRepositoryDefaultBranch === pinned.defaultBranch
       && backupGit.getGitRef === pinned.ref
@@ -160,7 +172,16 @@ export async function inspectV4ReencryptionColdStartJournalKey(
       && (!walEvidence || (walEvidence.root === walRoot
         && walEvidence.adapter === walAdapter
         && walEvidence.destinationGit === walDestinationGit
+        && (walEvidence.fullDestination === true) === fullDestination
         && walAdapter?.read === walRead && walAdapter.exists === walExists))
+      && (!walDestinationGit || (destinationMethods !== null
+        && walDestinationGit.branchName === destinationMethods.branch
+        && walDestinationGit.getRepositoryIdentity === destinationMethods.repository
+        && walDestinationGit.getRepositoryDefaultBranch === destinationMethods.defaultBranch
+        && walDestinationGit.getGitRef === destinationMethods.ref
+        && walDestinationGit.getGitCommit === destinationMethods.commit
+        && walDestinationGit.getTreeAt === destinationMethods.tree
+        && walDestinationGit.getBlob === destinationMethods.blob))
       && (!expectedRecoveryBinding || (
         expectedRecoveryBinding.originalJournalKey === boundKey
         && expectedRecoveryBinding.contract === boundContract
@@ -296,6 +317,7 @@ export async function inspectV4ReencryptionColdStartJournalKey(
     let destinationCiphertextReceiptsReverified = false
     let sourceShadowSnapshotsReverified = false
     let destinationNewKeyHeadAuthenticated = false
+    let completeDestinationContentsReverified = false
     if (walEvidence) {
       // Only the independently authenticated old key can decrypt both
       // existing WAL slots. The owner must separately establish physical
@@ -334,6 +356,38 @@ export async function inspectV4ReencryptionColdStartJournalKey(
           || !afterMetadata.walMatchesCutoverContract) return MANUAL
         sourceShadowSnapshotsReverified = true
         destinationNewKeyHeadAuthenticated = true
+        if (fullDestination) {
+          let fullContentChecked = false
+          const fullWal = await inspectV4ColdStartWalSnapshot({
+            adapter: walEvidence.adapter, root: walEvidence.root,
+            contract, originalJournalKey: keyring.journalKey,
+            destinationCiphertextReadback: {
+              git: walDestinationGit, expectedPhysicalRepositoryId: physical.id,
+            },
+            verifyAuthenticatedReceipts: async receipts => {
+              const verified = await inspectV4ColdStartFullDestination({
+                contract, adapter, destinationGit: walDestinationGit,
+                expectedPhysicalRepositoryId: physical.id,
+                sourceConfig: config, sourceDefaultBranch: defaultBranch,
+                receipts, destinationPassphrase, getSecret, assertLiveOwner: check,
+              })
+              fullContentChecked = verified
+              return verified
+            },
+            assertLiveOwner: check,
+          })
+          check()
+          if (fullWal.observation !== "authenticated-current-wal-still-fenced"
+            || !fullContentChecked) return MANUAL
+          // Re-read every original-key Backup object after the new-key scan.
+          const finalFull = await verifyGitHubFrozenReencryptionBackup(fullInput)
+          check()
+          if (!finalFull.backupContentsReadbackVerified
+            || finalFull.verifiedFileCount !== firstFull.verifiedFileCount
+            || finalFull.verifiedRemoteObjectCount !== firstFull.verifiedRemoteObjectCount
+            || finalFull.verifiedPlaintextBytes !== firstFull.verifiedPlaintextBytes) return MANUAL
+          completeDestinationContentsReverified = true
+        }
       }
     }
 
@@ -358,6 +412,29 @@ export async function inspectV4ReencryptionColdStartJournalKey(
       || getSecret(identity.sourcePassphraseSecretId) !== originalPassphrase
       || getSecret(identity.destinationPassphraseSecretId) !== destinationPassphrase) return MANUAL
     check()
+    if (fullDestination && walDestinationGit && destinationMethods && walEvidence) {
+      const [destRef, destCommit, destPhysical, destDefault] = await Promise.all([
+        destinationMethods.ref.call(walDestinationGit),
+        destinationMethods.commit.call(walDestinationGit, identity.destinationCommitSha),
+        destinationMethods.repository.call(walDestinationGit),
+        destinationMethods.defaultBranch.call(walDestinationGit),
+      ])
+      check()
+      if (destRef.ref !== "refs/heads/" + parseId(identity.destinationRepoId).branch
+        || destRef.type !== "commit" || destRef.sha !== identity.destinationCommitSha
+        || destCommit.sha !== identity.destinationCommitSha
+        || destCommit.treeSha !== identity.destinationTreeSha
+        || !Array.isArray(destCommit.parentShas) || destCommit.parentShas.length !== 0
+        || destPhysical.id !== physical.id || destPhysical.fullName !== physical.fullName
+        || destDefault !== defaultBranch) return MANUAL
+      const finalWal = await inspectV4ColdStartWalSnapshot({
+        adapter: walEvidence.adapter, root: walEvidence.root,
+        contract, originalJournalKey: keyring.journalKey, assertLiveOwner: check,
+      })
+      check()
+      if (finalWal.observation !== "authenticated-current-wal-still-fenced"
+        || !finalWal.walSnapshotAuthenticated || !finalWal.walMatchesCutoverContract) return MANUAL
+    }
     return Object.freeze({
       ...BASE, observation: "authenticated-local-route-still-fenced",
       diagnosticIndexRoot: keyed.diagnosticIndexRoot,
@@ -365,6 +442,7 @@ export async function inspectV4ReencryptionColdStartJournalKey(
       originalKeyAuthenticated: true,
       pinnedBackupConfigAndEncryptedHeadVerified: true,
       completeBackupContentsReverified: true,
+      completeDestinationContentsReverified,
       coldStartWalReverified: walReverified,
       destinationCiphertextReceiptsReverified,
       sourceShadowSnapshotsReverified,
