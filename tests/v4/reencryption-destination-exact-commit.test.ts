@@ -3,8 +3,8 @@ import test from "node:test"
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises"
 import path from "node:path"
 
-import { sha256Hex, toBase64Url, utf8ToBytes } from "../../src/lib/bytes"
-import { deriveV4Keyring } from "../../src/lib/v4/crypto"
+import { sha256Hex, toBase64, toBase64Url, utf8ToBytes } from "../../src/lib/bytes"
+import { deriveV4Keyring, encryptV4Payload } from "../../src/lib/v4/crypto"
 import { computeV4GitBlobSha1 } from "../../src/lib/v4/git-blob-identity"
 import { planV4OrphanReencryptionDestination } from "../../src/lib/v4/reencryption-orphan-branch"
 import { verifyV4ReencryptionDestinationExactCommit } from "../../src/lib/v4/reencryption-destination-exact-commit"
@@ -41,6 +41,7 @@ import { assertV4ReencryptionSyncFenceClear, V4_REENCRYPTION_SYNC_FENCE_ROOT } f
 import { inspectV4ReencryptionColdStartJournalKey } from "../../src/lib/v4/reencryption-cold-start-journal-key"
 import { inspectV4ColdStartDestination } from "../../src/lib/v4/reencryption-cold-start-destination"
 import { inspectV4ColdStartWalDestination } from "../../src/lib/v4/reencryption-cold-start-wal-destination"
+import { inspectV4ColdStartCompleteRecovery } from "../../src/lib/v4/reencryption-cold-start-complete-recovery"
 import { createV4ReencryptionRecoveryJournal } from "../../src/lib/v4/reencryption-recovery-journal"
 import { acquireV4DesktopRekeyWalStorage } from "../../src/lib/v4/reencryption-desktop-wal"
 import { openV4ExistingDesktopWalForRecovery } from "../../src/lib/v4/reencryption-desktop-wal-recovery"
@@ -2063,6 +2064,327 @@ test("D235 rederives the original journal key from immutable encrypted Backup co
   assert.deepEqual(s.f.s.files, oldFiles)
   assert.deepEqual(s.f.s.secrets, oldSecrets)
   await assert.rejects(assertV4ReencryptionSyncFenceClear(s.f.s.adapter))
+})
+
+async function d247WalSlot(
+  state: V4ReencryptionJournalSnapshot,
+  contract: V4ReencryptionCutoverSnapshotContract,
+  journalKey: Uint8Array,
+): Promise<string> {
+  const identity = contract.identity
+  const plaintext = enc(JSON.stringify({
+    status: "staging-only",
+    receipts: state.receipts,
+    pendingIntents: state.pendingIntents,
+    refIntents: state.pendingRefIntents,
+    refReceipts: state.verifiedRefObservations,
+    stageHandoffStarted: state.stageHandoffStarted,
+    candidatePreparationSha256: state.candidatePreparationSha256,
+    preparedCandidateReceipt: state.preparedCandidateReceipt,
+  }))
+  const ciphertext = toBase64(await encryptV4Payload(journalKey, plaintext, {
+    kind: "journal",
+    aad: `v4-rekey-wal:${identity.destinationRepoId}:${identity.sourceCommitSha}:${identity.runId}:${state.generation}`,
+  }))
+  plaintext.fill(0)
+  const slot = {
+    schemaVersion: 1, generation: state.generation,
+    runId: identity.runId, sourceCommitSha: identity.sourceCommitSha,
+    destinationRepoId: identity.destinationRepoId, ciphertext,
+  }
+  return JSON.stringify({ ...slot, digest: await sha256Hex(enc(JSON.stringify(slot))) })
+}
+
+async function d247Scenario() {
+  const old = await d235Scenario()
+  const destinationSource = await d238Scenario()
+  const id = old.f.id
+  const originalContractText = await old.input.adapter.read(
+    V4_RUNTIME_INDEX_ROOT + "-rekey-cutover-candidate-" + id.runId + "/contract.json",
+  )
+  const contract = decodeV4ReencryptionCutoverCandidateManifest(originalContractText)
+  const latest = old.f.s.getWal()
+  const destRef = latest.verifiedRefObservations.find(ref => ref.role === "destination")!
+  assert.ok(destRef)
+  assert.equal(latest.generation, contract.identity.walGeneration)
+  const predecessor: V4ReencryptionJournalSnapshot = {
+    ...latest,
+    generation: latest.generation - 1,
+    pendingRefIntents: [destRef],
+    verifiedRefObservations: latest.verifiedRefObservations.filter(ref => ref.role !== "destination"),
+  }
+  const root = "reencryption/d247-recovered"
+  const walFiles = new Map<string, string>([
+    [root + "/slot-" + (predecessor.generation % 2) + ".json",
+      await d247WalSlot(predecessor, contract, old.oldJournalKey)],
+    [root + "/slot-" + (latest.generation % 2) + ".json",
+      await d247WalSlot(latest, contract, old.oldJournalKey)],
+  ])
+  const walAdapter: Pick<V4LocalIndexAdapter, "read" | "exists"> = {
+    async read(file) {
+      const text = walFiles.get(file)
+      if (!text) throw Error("missing encrypted WAL slot")
+      return text
+    },
+    async exists(file) { return walFiles.has(file) },
+  }
+  const source = old.input
+  const destination = {
+    ...destinationSource.input, adapter: source.adapter,
+    getSecret: source.getSecret, assertLiveOwner: source.assertLiveOwner,
+  }
+  const current = {
+    contract,
+    wal: {
+      adapter: walAdapter, root, originalJournalKey: Uint8Array.from(old.oldJournalKey),
+      assertLiveOwner: source.assertLiveOwner,
+    },
+    destination: {
+      adapter: source.adapter,
+      destinationGit: destination.destinationGit,
+      remote: destination.remote,
+      expectedPhysicalRepositoryId: destination.expectedPhysicalRepositoryId,
+      getSecret: source.getSecret,
+      assertLiveOwner: source.assertLiveOwner,
+    },
+  }
+  let held = false
+  let leaseLive = true
+  let holderCalls = 0
+  const input = {
+    backup: source, current,
+    withExclusiveRecoveryLease: async <T>(body: () => Promise<T>): Promise<T> => {
+      assert.equal(held, false, "recovery lease must not be reentered")
+      held = true
+      holderCalls++
+      try { return await body() }
+      finally { held = false }
+    },
+    assertExclusiveRecoveryLease: async () => {
+      assert.equal(held, true)
+      if (!leaseLive) throw Error("D247 exclusive recovery lease revoked")
+    },
+    assertBestEffortWalCheckpoint: async (): Promise<"best-effort-readback-only"> => {
+      assert.equal(held, true)
+      return "best-effort-readback-only"
+    },
+  }
+  return { old, destinationSource, walFiles, contract, input,
+    isHeld: () => held, getHolderCalls: () => holderCalls,
+    revokeLease() { leaseLive = false },
+  }
+}
+
+test("D247 joins real old frozen Backup key, encrypted WAL and full Destination under one recovery lease", async () => {
+  const s = await d247Scenario()
+  const beforeLocal = new Map(s.old.f.s.files)
+  const beforeWal = new Map(s.walFiles)
+  const beforeSecrets = new Map(s.old.f.s.secrets)
+  const writesBefore = s.old.f.s.getWrites()
+  const report = await inspectV4ColdStartCompleteRecovery(s.input)
+  assert.equal(report.observation, "authenticated-complete-recovery-evidence-still-fenced")
+  assert.equal(report.originalKeyAuthenticated, true)
+  assert.equal(report.completeOldBackupReverified, true)
+  assert.equal(report.walReceiptsBoundToDestination, true)
+  assert.equal(report.completeDestinationContentsReverified, true)
+  assert.equal(report.verifiedFileCount, 3)
+  assert.equal(report.resumeSyncAuthorized, false)
+  assert.equal(report.localCutoverAuthorized, false)
+  assert.equal(report.commitDecisionAuthorized, false)
+  assert.equal(report.remoteWritesAuthorized, false)
+  assert.equal(report.powerLossDurabilityProven, false)
+  assert.equal(report.oldPassphraseCleanupAuthorized, false)
+  assert.equal(s.getHolderCalls(), 1, "one outer lease across Backup, WAL and Destination")
+  assert.equal(s.isHeld(), false)
+  assert.equal(s.old.f.s.getWrites(), writesBefore)
+  assert.deepEqual(s.old.f.s.files, beforeLocal)
+  assert.deepEqual(s.walFiles, beforeWal)
+  assert.deepEqual(s.old.f.s.secrets, beforeSecrets)
+})
+
+test("D247 uses a freshly reopened, OS-locked Windows WAL and physical read-only Index under one lease", async () => {
+  const s = await d247Scenario()
+  await mkdir(path.join(process.cwd(), ".tmp"), { recursive: true })
+  const temporary = await mkdtemp(path.join(process.cwd(), ".tmp", "d247-physical-"))
+  const walRoot = path.join(temporary, "wal")
+  const indexRoot = path.join(temporary, "index")
+  await mkdir(walRoot)
+  await mkdir(indexRoot)
+  let writer: Awaited<ReturnType<typeof acquireV4DesktopRekeyWalStorage>> | undefined
+  let reader: Awaited<ReturnType<typeof openV4ExistingDesktopWalForRecovery>> | undefined
+  try {
+    for (const [name, value] of s.old.f.s.files) {
+      const absolute = path.join(indexRoot, name)
+      await mkdir(path.dirname(absolute), { recursive: true })
+      await writeFile(absolute, value)
+    }
+    const index: Pick<V4LocalIndexAdapter, "read" | "exists"> = {
+      read(name) { return readFile(path.join(indexRoot, name), "utf8") },
+      async exists(name) {
+        try { await stat(path.join(indexRoot, name)); return true }
+        catch { return false }
+      },
+    }
+    writer = await acquireV4DesktopRekeyWalStorage({
+      rootAbsolute: walRoot, journalRoot: s.input.current.wal.root,
+    })
+    for (const [name, ciphertext] of s.walFiles) {
+      await writer.adapter.write(name, ciphertext)
+    }
+    assert.equal(await writer.assertBestEffortCheckpoint(), "best-effort-readback-only")
+    await writer.release()
+    writer = undefined
+    reader = await openV4ExistingDesktopWalForRecovery({
+      rootAbsolute: walRoot, journalRoot: s.input.current.wal.root,
+    })
+    s.input.backup = { ...s.input.backup, adapter: index }
+    s.input.current.destination.adapter = index
+    s.input.current.wal.adapter = {
+      read: name => reader!.adapter.read(name),
+      exists: name => reader!.adapter.exists(name),
+    }
+    s.input.withExclusiveRecoveryLease = async <T>(body: () => Promise<T>) => {
+      await reader!.assertExclusiveStageLease()
+      return body()
+    }
+    s.input.assertExclusiveRecoveryLease = () => reader!.assertExclusiveStageLease()
+    s.input.assertBestEffortWalCheckpoint = () => reader!.assertBestEffortCheckpoint()
+    const result = await inspectV4ColdStartCompleteRecovery(s.input)
+    assert.equal(result.observation, "authenticated-complete-recovery-evidence-still-fenced")
+    assert.equal(result.resumeSyncAuthorized, false)
+    assert.equal(result.powerLossDurabilityProven, false)
+    for (const [name, text] of s.walFiles) {
+      assert.equal(await reader.adapter.read(name), text)
+    }
+    for (const [name, text] of s.old.f.s.files) {
+      assert.equal(await readFile(path.join(indexRoot, name), "utf8"), text)
+    }
+  } finally {
+    await reader?.release()
+    await writer?.release()
+    await rm(temporary, { recursive: true, force: true })
+  }
+})
+
+test("D247 requires one owner, physical Index and SecretStorage and never invokes a lease for foreign inputs", async () => {
+  const s = await d247Scenario()
+  const originalOwner = s.input.current.wal.assertLiveOwner
+  const originalAdapter = s.input.current.destination.adapter
+  const originalSecret = s.input.current.destination.getSecret
+  for (const reason of ["wal owner", "index adapter", "secret"] as const) {
+    if (reason === "wal owner") s.input.current.wal.assertLiveOwner = () => {}
+    if (reason === "index adapter") s.input.current.destination.adapter = {
+      ...originalAdapter,
+    }
+    if (reason === "secret") s.input.current.destination.getSecret = id => originalSecret(id)
+    const report = await inspectV4ColdStartCompleteRecovery(s.input)
+    assert.equal(report.observation, "manual-recovery-required", reason)
+    assert.equal(report.localCutoverAuthorized, false, reason)
+    assert.equal(s.getHolderCalls(), 0, reason)
+    s.input.current.wal.assertLiveOwner = originalOwner
+    s.input.current.destination.adapter = originalAdapter
+    s.input.current.destination.getSecret = originalSecret
+  }
+})
+
+test("D247 rejects an independently recovered wrong key without touching either encrypted WAL slot", async () => {
+  const s = await d247Scenario()
+  const bytes = new Map(s.walFiles)
+  const local = new Map(s.old.f.s.files)
+  s.input.current.wal.originalJournalKey[0] ^= 1
+  const report = await inspectV4ColdStartCompleteRecovery(s.input)
+  assert.equal(report.observation, "manual-recovery-required")
+  assert.equal(report.originalKeyAuthenticated, false)
+  assert.equal(report.completeDestinationContentsReverified, false)
+  assert.equal(report.resumeSyncAuthorized, false)
+  assert.deepEqual(s.walFiles, bytes)
+  assert.deepEqual(s.old.f.s.files, local)
+  assert.equal(s.getHolderCalls(), 1)
+  assert.equal(s.isHeld(), false)
+})
+
+test("D247 rechecks frozen Backup after Destination scan and refuses changed old ref", async () => {
+  const s = await d247Scenario()
+  const newGit = s.input.current.destination.destinationGit
+  const readBlob = newGit.getBlob
+  let changed = false
+  newGit.getBlob = async sha => {
+    const bytes = await readBlob(sha)
+    if (!changed) {
+      changed = true
+      s.old.b.setRef("9".repeat(40))
+    }
+    return bytes
+  }
+  const wal = new Map(s.walFiles)
+  const writes = s.old.f.s.getWrites()
+  const report = await inspectV4ColdStartCompleteRecovery(s.input)
+  assert.equal(changed, true)
+  assert.equal(report.observation, "manual-recovery-required")
+  assert.equal(report.resumeSyncAuthorized, false)
+  assert.equal(s.isHeld(), false)
+  assert.equal(s.getHolderCalls(), 1)
+  assert.deepEqual(s.walFiles, wal)
+  assert.equal(s.old.f.s.getWrites(), writes)
+})
+
+test("D247 rejects old Backup client method replacement during new-key Git scan", async () => {
+  const s = await d247Scenario()
+  const git = s.input.current.destination.destinationGit
+  const readBlob = git.getBlob
+  let altered = false
+  git.getBlob = async sha => {
+    const data = await readBlob(sha)
+    if (!altered) {
+      altered = true
+      const backupBlob = s.old.input.backupGit.getBlob
+      s.old.input.backupGit.getBlob = async blobSha => backupBlob(blobSha)
+    }
+    return data
+  }
+  const report = await inspectV4ColdStartCompleteRecovery(s.input)
+  assert.equal(altered, true)
+  assert.equal(report.observation, "manual-recovery-required")
+  assert.equal(report.resumeSyncAuthorized, false)
+  assert.equal(s.getHolderCalls(), 1)
+  assert.equal(s.isHeld(), false)
+})
+
+test("D247 revoked exclusive recovery lease during Destination ciphertext scan fails closed", async () => {
+  const s = await d247Scenario()
+  const git = s.input.current.destination.destinationGit
+  const readBlob = git.getBlob
+  let revoked = false
+  git.getBlob = async sha => {
+    const value = await readBlob(sha)
+    if (!revoked) {
+      revoked = true
+      s.revokeLease()
+    }
+    return value
+  }
+  const report = await inspectV4ColdStartCompleteRecovery(s.input)
+  assert.equal(revoked, true)
+  assert.equal(report.observation, "manual-recovery-required")
+  assert.equal(report.walReceiptsBoundToDestination, false)
+  assert.equal(report.remoteWritesAuthorized, false)
+  assert.equal(s.isHeld(), false)
+})
+
+test("D247 refuses a torn encrypted WAL and leaves both original-key Backup and physical slots untouched", async () => {
+  const s = await d247Scenario()
+  const slot = s.input.current.wal.root + "/slot-" + (s.contract.identity.walGeneration % 2) + ".json"
+  s.walFiles.set(slot, s.walFiles.get(slot)!.slice(0, 40))
+  const walBefore = new Map(s.walFiles)
+  const filesBefore = new Map(s.old.f.s.files)
+  const report = await inspectV4ColdStartCompleteRecovery(s.input)
+  assert.equal(report.observation, "manual-recovery-required")
+  assert.equal(report.completeOldBackupReverified, false)
+  assert.equal(report.completeDestinationContentsReverified, false)
+  assert.equal(report.localCutoverAuthorized, false)
+  assert.equal(s.isHeld(), false)
+  assert.deepEqual(s.walFiles, walBefore)
+  assert.deepEqual(s.old.f.s.files, filesBefore)
 })
 
 test("D240 independently recovered Backup key and saved Cutover Contract bind to one exact D239 input", async () => {
