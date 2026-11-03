@@ -174,8 +174,13 @@ export async function inspectV4ColdStartWalDestination(
     }
 
     let invoked = false
+    let reentryAttempted = false
+    let verifiedReport: V4ColdStartWalDestinationReport | undefined
     const report = await holder(async () => {
-      if (invoked) throw Error("D239 recovery holder entered twice.")
+      if (invoked) {
+        reentryAttempted = true
+        throw Error("D239 recovery holder entered twice.")
+      }
       invoked = true
       const firstGit = await currentGit()
       await boundary()
@@ -200,16 +205,18 @@ export async function inspectV4ColdStartWalDestination(
         throw Error("D239 Destination ref or repository changed during combined scan.")
       }
       await boundary()
-      return Object.freeze({
+      verifiedReport = Object.freeze({
         ...BASE, observation: "authenticated-wal-and-destination-still-fenced" as const,
         walReceiptsBoundToDestination: true,
         completeDestinationContentsReverified: true,
         verifiedFileCount: destinationReport.verifiedFileCount,
         verifiedPlaintextBytes: destinationReport.verifiedPlaintextBytes,
       })
+      return verifiedReport
     })
     check()
-    return invoked && report.observation === "authenticated-wal-and-destination-still-fenced"
+    return invoked && !reentryAttempted && verifiedReport === report
+      && report.observation === "authenticated-wal-and-destination-still-fenced"
       ? report : MANUAL
   } catch {
     return MANUAL

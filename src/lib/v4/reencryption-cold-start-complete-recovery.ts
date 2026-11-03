@@ -176,8 +176,13 @@ export async function inspectV4ColdStartCompleteRecovery(
       check()
     }
     let entered = false
+    let reentryAttempted = false
+    let verifiedReport: V4ColdStartCompleteRecoveryReport | undefined
     const report = await holder(async () => {
-      if (entered) throw Error("D247 recovery lease was reentered.")
+      if (entered) {
+        reentryAttempted = true
+        throw Error("D247 recovery lease was reentered.")
+      }
       entered = true
       await boundary()
       const physical = await immutable.backupGit.getRepositoryIdentity()
@@ -231,7 +236,7 @@ export async function inspectV4ColdStartCompleteRecovery(
       if (lastPhysical.id !== physical.id || lastPhysical.fullName !== physical.fullName) {
         throw Error("D247 physical Backup repository changed during readback.")
       }
-      return Object.freeze({
+      verifiedReport = Object.freeze({
         ...BASE,
         observation: "authenticated-complete-recovery-evidence-still-fenced" as const,
         originalKeyAuthenticated: true,
@@ -241,9 +246,11 @@ export async function inspectV4ColdStartCompleteRecovery(
         verifiedFileCount: currentReport.verifiedFileCount,
         verifiedPlaintextBytes: currentReport.verifiedPlaintextBytes,
       })
+      return verifiedReport
     })
     check()
-    return entered && report.observation === "authenticated-complete-recovery-evidence-still-fenced"
+    return entered && !reentryAttempted && verifiedReport === report
+      && report.observation === "authenticated-complete-recovery-evidence-still-fenced"
       ? report : MANUAL
   } catch {
     return MANUAL

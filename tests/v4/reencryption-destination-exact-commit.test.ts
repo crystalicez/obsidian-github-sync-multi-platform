@@ -1099,6 +1099,44 @@ test("D239 rejects Git ref and SecretStorage drift after WAL revalidation", asyn
   }
 })
 
+test("D257 D239 rejects a suppressed reentrant lease callback without changing evidence", async () => {
+  const s = await d239Scenario()
+  const originalHolder = s.input.withExclusiveRecoveryLease
+  let swallowed = false
+  const beforeWal = new Map(s.walFiles)
+  const beforeLocal = new Map(s.files)
+  const walWrites = s.getWalWrites()
+  const localWrites = s.getWrites()
+  s.input.withExclusiveRecoveryLease = async <T>(body: () => Promise<T>) => originalHolder(async () => {
+    const first = await body()
+    try { await body() } catch { swallowed = true }
+    return first
+  })
+  const result = await inspectV4ColdStartWalDestination(s.input)
+  assert.equal(swallowed, true)
+  assert.equal(result.observation, "manual-recovery-required")
+  assert.equal(result.completeDestinationContentsReverified, false)
+  assert.equal(result.resumeSyncAuthorized, false)
+  assert.equal(s.isHeld(), false)
+  assert.deepEqual(s.walFiles, beforeWal)
+  assert.deepEqual(s.files, beforeLocal)
+  assert.equal(s.getWalWrites(), walWrites)
+  assert.equal(s.getWrites(), localWrites)
+})
+
+test("D257 D239 rejects a lease holder that replaces its successful report", async () => {
+  const s = await d239Scenario()
+  const originalHolder = s.input.withExclusiveRecoveryLease
+  s.input.withExclusiveRecoveryLease = async <T>(body: () => Promise<T>) => originalHolder(async () => {
+    const real = await body()
+    return { ...(real as object) } as T
+  })
+  const result = await inspectV4ColdStartWalDestination(s.input)
+  assert.equal(result.observation, "manual-recovery-required")
+  assert.equal(result.remoteWritesAuthorized, false)
+  assert.equal(s.isHeld(), false)
+})
+
 test("D239 refuses unavailable best-effort checkpoint, missing fence and reentrant lease", async () => {
   const uncheckpointed = await d239Scenario()
   uncheckpointed.input.assertBestEffortWalCheckpoint = async () => {
@@ -2834,6 +2872,45 @@ test("D247 joins real old frozen Backup key, encrypted WAL and full Destination 
   assert.deepEqual(s.old.f.s.files, beforeLocal)
   assert.deepEqual(s.walFiles, beforeWal)
   assert.deepEqual(s.old.f.s.secrets, beforeSecrets)
+})
+
+test("D257 D247 rejects a suppressed reentrant owner lease with all evidence untouched", async () => {
+  const s = await d247Scenario()
+  const originalHolder = s.input.withExclusiveRecoveryLease
+  let swallowed = false
+  const beforeLocal = new Map(s.old.f.s.files)
+  const beforeSecrets = new Map(s.old.f.s.secrets)
+  const beforeWal = new Map(s.walFiles)
+  const localWrites = s.old.f.s.getWrites()
+  s.input.withExclusiveRecoveryLease = async <T>(body: () => Promise<T>) => originalHolder(async () => {
+    const first = await body()
+    try { await body() } catch { swallowed = true }
+    return first
+  })
+  const report = await inspectV4ColdStartCompleteRecovery(s.input)
+  assert.equal(swallowed, true)
+  assert.equal(report.observation, "manual-recovery-required")
+  assert.equal(report.completeDestinationContentsReverified, false)
+  assert.equal(report.localCutoverAuthorized, false)
+  assert.equal(s.isHeld(), false)
+  assert.deepEqual(s.old.f.s.files, beforeLocal)
+  assert.deepEqual(s.old.f.s.secrets, beforeSecrets)
+  assert.deepEqual(s.walFiles, beforeWal)
+  assert.equal(s.old.f.s.getWrites(), localWrites)
+})
+
+test("D257 D247 rejects replaced lease-holder proof rather than trusting a copy", async () => {
+  const s = await d247Scenario()
+  const originalHolder = s.input.withExclusiveRecoveryLease
+  s.input.withExclusiveRecoveryLease = async <T>(body: () => Promise<T>) => originalHolder(async () => {
+    const result = await body()
+    return { ...(result as object) } as T
+  })
+  const report = await inspectV4ColdStartCompleteRecovery(s.input)
+  assert.equal(report.observation, "manual-recovery-required")
+  assert.equal(report.walReceiptsBoundToDestination, false)
+  assert.equal(report.resumeSyncAuthorized, false)
+  assert.equal(s.isHeld(), false)
 })
 
 test("D247 uses a freshly reopened, OS-locked Windows WAL and physical read-only Index under one lease", async () => {
