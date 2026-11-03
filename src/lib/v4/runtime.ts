@@ -57,6 +57,9 @@ const V4_INDEX_ROOT = V4_RUNTIME_INDEX_ROOT
 const V4_STAGE_ROOT = "github-sync-v4-stage"
 const V4_RECOVERY_ROOT = "github-sync-v4-recovery"
 const fallbackStores = new WeakMap<object, Map<string, string>>()
+// Mobile cannot acquire an OS WAL lock. Serialize authenticated read-only
+// recovery diagnostics by the actual Obsidian vault adapter in this process.
+const activeMobileAuthenticatedRecoveryAdapters = new WeakSet<object>()
 
 type V4RuntimeConfigSource = "observed-remote" | "speculative-empty"
 interface V4RuntimeConfigSelection {
@@ -375,6 +378,7 @@ export class V4PluginRuntime {
   async verifyFencedReencryptionAuthenticatedWal(): Promise<V4ReencryptionColdStartJournalReport | null> {
     if (this.recoveryDiagnosticInProgress) return null
     this.recoveryDiagnosticInProgress = true
+    let reservedMobileAdapter: object | undefined
     try {
       this.assertNotDisposed()
       const vault = this.plugin.app.vault
@@ -395,6 +399,11 @@ export class V4PluginRuntime {
       const configDir = originalConfigDir || ".obsidian"
       const pluginId = this.plugin.manifest.id
       const desktop = Platform.isDesktopApp === true
+      if (!desktop && native && typeof native === "object") {
+        if (activeMobileAuthenticatedRecoveryAdapters.has(native)) return null
+        activeMobileAuthenticatedRecoveryAdapters.add(native)
+        reservedMobileAdapter = native
+      }
       const generation = this.credentialGeneration
       const pinned = {
         owner: settings.githubOwner, repo: settings.githubRepo,
@@ -524,6 +533,9 @@ export class V4PluginRuntime {
     } catch {
       return null
     } finally {
+      if (reservedMobileAdapter) {
+        activeMobileAuthenticatedRecoveryAdapters.delete(reservedMobileAdapter)
+      }
       this.recoveryDiagnosticInProgress = false
     }
   }

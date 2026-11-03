@@ -3621,9 +3621,19 @@ test("D248/D250/D252/D260/D262 Mobile existing WAL, one-owner proof and in-proce
     let contractReadCount = 0
     let swapAtContractRead = 0
     let methodToSwap: "stat" | "list" | undefined
+    let pauseOneContractRead = false
+    let signalPausedRead: (() => void) | undefined
+    let releasePausedRead: (() => void) | undefined
+    const pausedRead = new Promise<void>(resolve => { signalPausedRead = resolve })
+    const resumeRead = new Promise<void>(resolve => { releasePausedRead = resolve })
     adapter.read = async name => {
       const value = await originalReadForRuntime(name)
       if (name.endsWith("/contract.json")) {
+        if (pauseOneContractRead) {
+          pauseOneContractRead = false
+          signalPausedRead?.()
+          await resumeRead
+        }
         contractReadCount++
         if (methodToSwap && contractReadCount === swapAtContractRead) {
           if (methodToSwap === "stat") {
@@ -3704,6 +3714,38 @@ test("D248/D250/D252/D260/D262 Mobile existing WAL, one-owner proof and in-proce
       assert.equal(authenticated?.completeDestinationContentsReverified, true)
       assert.equal(authenticated?.recoveryLeaseReverified, true)
       assert.equal(authenticated?.resumeSyncAuthorized, false)
+      // Two installed Runtime instances can briefly share one Obsidian vault
+      // adapter (e.g. hot reload). Mobile cannot claim an OS WAL lock.
+      const otherRuntime = new V4PluginRuntime({
+        settings, manifest: { id: pluginId }, loadData: async () => JSON.parse(s.old.saved),
+        isSyncInProgress: false,
+        app: {
+          vault: { configDir, adapter },
+          secretStorage: { getSecret: (id: string) => s.old.f.s.secrets.get(id) ?? null },
+        },
+      } as never)
+      try {
+        pauseOneContractRead = true
+        const firstAcrossRuntimes = runtime.verifyFencedReencryptionAuthenticatedWal()
+        await pausedRead
+        let overlappingReport: Awaited<ReturnType<V4PluginRuntime["verifyFencedReencryptionAuthenticatedWal"]>>
+        try {
+          overlappingReport = await otherRuntime.verifyFencedReencryptionAuthenticatedWal()
+        } finally {
+          releasePausedRead?.()
+        }
+        const firstCompleted = await firstAcrossRuntimes
+        assert.equal(firstCompleted?.observation, "authenticated-local-route-still-fenced")
+        assert.equal(overlappingReport, null,
+          "two installed Mobile Runtime instances must not inspect one vault WAL concurrently")
+        const afterRelease = await otherRuntime.verifyFencedReencryptionAuthenticatedWal()
+        assert.equal(afterRelease?.observation, "authenticated-local-route-still-fenced",
+          "the process-local Mobile adapter reservation must be released")
+        assert.equal(afterRelease?.resumeSyncAuthorized, false)
+      } finally {
+        releasePausedRead?.()
+        otherRuntime.dispose()
+      }
     } finally {
       methods.forEach((name, i) => { prototype[name] = originals[i]! })
     }
