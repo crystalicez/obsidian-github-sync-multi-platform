@@ -31,6 +31,10 @@ import { openV4NewMobilePluginWalWriter, type V4MobilePluginWalWriter } from "./
 import { openV4DesktopPluginWalForRecovery } from "./reencryption-desktop-plugin-wal-recovery"
 import { openV4MobilePluginWalForRecovery, type V4MobilePluginWalOwner } from "./reencryption-mobile-wal-recovery"
 import { planV4PluginPrivateWalLocation } from "./reencryption-plugin-wal-location"
+import {
+  inspectV4ReencryptionCandidateGitRefs,
+  type V4ReencryptionCandidateGitRefsReport,
+} from "./reencryption-candidate-ref-preflight"
 import { armV4ReencryptionSyncFence, assertV4ReencryptionSyncFenceClear, V4ReencryptionSyncFencedError, type V4ReencryptionSyncFenceReport } from "./reencryption-sync-fence"
 import type { V4InitiatorLocalReader } from "./reencryption-initiator-parity"
 import { createV4StagingStore, type V4StagingStore } from "./staging-store"
@@ -350,6 +354,91 @@ export class V4PluginRuntime {
         }
       },
     })
+  }
+
+  /**
+   * Read-only D251 check of the saved candidate's current remote ref topology.
+   * A Git ref matching local claims does not authenticate its encrypted files.
+   */
+  async inspectFencedReencryptionCandidateGitRefs(): Promise<V4ReencryptionCandidateGitRefsReport | null> {
+    try {
+      this.assertNotDisposed()
+      const vault = this.plugin.app.vault
+      const adapterBacking = this.indexAdapterBacking
+      const settings = this.plugin.settings
+      const secretStorage = this.plugin.app.secretStorage
+      const getSecret = secretStorage.getSecret
+      const loadData = this.plugin.loadData
+      const pluginId = this.plugin.manifest.id
+      const configDir = vault.configDir
+      const generation = this.credentialGeneration
+      const token = settings.githubToken
+      const owner = settings.githubOwner
+      const repo = settings.githubRepo
+      const branch = settings.githubBranch
+      const tokenSecretId = settings.githubTokenSecretId
+      const passphraseSecretId = settings.encryptionPassphraseSecretId
+      const encryptionMode = settings.encryptionMode
+      const checkOwner = () => {
+        this.assertNotDisposed()
+        if (this.plugin.app.vault !== vault || vault.adapter !== adapterBacking
+          || this.indexAdapterBacking !== adapterBacking || vault.configDir !== configDir
+          || this.plugin.manifest.id !== pluginId
+          || this.plugin.settings !== settings || this.credentialGeneration !== generation
+          || settings.githubToken !== token || settings.githubOwner !== owner
+          || settings.githubRepo !== repo || settings.githubBranch !== branch
+          || settings.githubTokenSecretId !== tokenSecretId
+          || settings.encryptionPassphraseSecretId !== passphraseSecretId
+          || settings.encryptionMode !== encryptionMode
+          || this.plugin.app.secretStorage !== secretStorage
+          || secretStorage.getSecret !== getSecret || this.plugin.loadData !== loadData
+          || this.plugin.isSyncInProgress || this.plugin.isSettingsSaveInProgress?.()
+          || this.coordinator.isSyncing || this.coordinator.pendingCount > 0
+          || this.debounceRunActive || this.recentlyStagedPaths.size > 0) {
+          throw Error("Re-encryption Git ref diagnostic owner changed.")
+        }
+      }
+      checkOwner()
+      if (!token || !owner || !repo) return null
+      const routing = await this.inspectFencedReencryptionIndexRoute()
+      checkOwner()
+      if (routing.observation !== "destination-shadow-diagnostic-only"
+        && routing.observation !== "source-settings-pending") return null
+      const markerText = await this.adapter.read(V4_REENCRYPTION_RUNTIME_ROUTE_PATH)
+      checkOwner()
+      const marker: unknown = JSON.parse(markerText)
+      const runId = (marker as { runId?: unknown } | null)?.runId
+      if (typeof runId !== "string" || !/^[A-Za-z0-9_-]{8,128}$/u.test(runId)) return null
+      const contractPath = V4_INDEX_ROOT + "-rekey-cutover-candidate-" + runId + "/contract.json"
+      const contractText = await this.adapter.read(contractPath)
+      checkOwner()
+      const contract = decodeV4ReencryptionCutoverCandidateManifest(contractText)
+      const id = contract.identity
+      const matchRepo = owner + "/" + repo + "#"
+      const matchBackup = /^([^/#]+)\/([^/#]+)#(.+)$/u.exec(id.backupRepoId)
+      const matchDestination = /^([^/#]+)\/([^/#]+)#(.+)$/u.exec(id.destinationRepoId)
+      if (runId !== id.runId || !id.sourceRepoId.startsWith(matchRepo)
+        || !id.backupRepoId.startsWith(matchRepo)
+        || !id.destinationRepoId.startsWith(matchRepo)
+        || !matchBackup || !matchDestination) return null
+
+      const backupGit = new GitHubClient({ token, owner, repo, branch: matchBackup[3]! })
+      const destinationGit = new GitHubClient({ token, owner, repo, branch: matchDestination[3]! })
+      const result = await inspectV4ReencryptionCandidateGitRefs({
+        contract, backupGit, destinationGit, assertLiveOwner: checkOwner,
+      })
+      checkOwner()
+      const after = await this.inspectFencedReencryptionIndexRoute()
+      checkOwner()
+      if (after.observation !== routing.observation
+        || after.diagnosticIndexRoot !== routing.diagnosticIndexRoot
+        || await this.adapter.read(V4_REENCRYPTION_RUNTIME_ROUTE_PATH) !== markerText
+        || await this.adapter.read(contractPath) !== contractText) return null
+      checkOwner()
+      return result
+    } catch {
+      return null
+    }
   }
 
   /**

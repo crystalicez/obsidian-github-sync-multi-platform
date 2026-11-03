@@ -204,8 +204,14 @@ export default class FastSync extends Plugin {
             const wal = await this.v4Runtime.inspectFencedReencryptionExistingWalStructure()
             if (this.unloaded) return
             new Notice(wal.observation === "existing-wal-structure-observed-untrusted"
-              ? "GitHub Sync: Original Frozen Backup verified; two existing WAL slots read back structurally ONLY (not authenticated). Destination and complete Recovery remain unverified. Sync stays paused."
+              ? "GitHub Sync: Original Frozen Backup verified; two existing WAL slots read back structurally ONLY (not authenticated). Complete Recovery remains unverified. Sync stays paused."
               : "GitHub Sync: Original Frozen Backup verified, but existing WAL structure could not be confirmed. Full Recovery unverified; preserve both passphrases and review Manual Recovery. Sync stays paused.",
+            12000)
+            const refs = await this.v4Runtime.inspectFencedReencryptionCandidateGitRefs()
+            if (this.unloaded) return
+            new Notice(refs?.destinationOrphanTopologyObserved
+              ? "GitHub Sync: GitHub Backup/Destination branch and commit identities match the saved candidate. This does NOT verify Destination contents, WAL authenticity or authorize recovery. Sync stays paused."
+              : "GitHub Sync: Destination GitHub ref topology is unavailable or differs from the saved candidate. Preserve both passphrases; Manual Recovery may be needed. Sync stays paused.",
             12000)
           } catch {
             if (!this.unloaded) new Notice(

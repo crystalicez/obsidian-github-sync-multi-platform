@@ -2239,6 +2239,68 @@ async function d247Scenario() {
   }
 }
 
+test("D251 installed read-only Git ref inspection pins live Settings across awaited GitHub reads", async () => {
+  const s = await d247Scenario()
+  const savedSettings = (JSON.parse(s.old.saved) as { settings: Record<string, unknown> }).settings
+  const settings = { ...savedSettings, githubToken: "offline-d251-token" } as {
+    githubBranch: string; githubToken: string
+  }
+  const disk = s.old.f.s.adapter
+  const prefix = ".obsidian/plugins/test-d251/"
+  const nativeAdapter = {
+    read: (name: string) => disk.read(name.replace(prefix, "")),
+    write: (name: string, value: string) => disk.write(name.replace(prefix, ""), value),
+    exists: (name: string) => disk.exists(name.replace(prefix, "")),
+    mkdir: (name: string) => disk.mkdir(name.replace(prefix, "")),
+  }
+  const plugin = {
+    settings, manifest: { id: "test-d251" },
+    isSyncInProgress: false,
+    app: {
+      vault: { configDir: ".obsidian", adapter: nativeAdapter },
+      secretStorage: { getSecret: (id: string) => s.old.f.s.secrets.get(id) ?? null },
+    },
+    loadData: async () => JSON.parse(s.old.saved) as unknown,
+  }
+  const id = s.contract.identity
+  const backupBranch = id.backupRepoId.split("#")[1]
+  const backupGit = s.input.backup.backupGit
+  const destinationGit = s.input.current.destination.destinationGit
+  const methods = ["getRepositoryIdentity", "getRepositoryDefaultBranch",
+    "getGitRef", "getGitCommit"] as const
+  type Stub = (this: GitHubClient, ...args: never[]) => Promise<unknown>
+  const prototype = GitHubClient.prototype as unknown as Record<string, Stub>
+  const originals = methods.map(name => prototype[name]!)
+  const sourceBranch = settings.githubBranch
+  let drift = false
+  const before = new Map(s.old.f.s.files)
+  const runtime = new V4PluginRuntime(plugin as never)
+  try {
+    for (const name of methods) {
+      prototype[name] = function (this: GitHubClient, ...args: never[]) {
+        if (name === "getRepositoryIdentity" && drift) {
+          settings.githubBranch = "mutated-during-github-read"
+        }
+        const git = this.branchName === backupBranch ? backupGit : destinationGit
+        return (git[name] as Stub).call(git as never, ...args)
+      }
+    }
+    const good = await runtime.inspectFencedReencryptionCandidateGitRefs()
+    assert.equal(good?.observation, "candidate-remote-refs-observed-untrusted")
+    assert.equal(good?.destinationOrphanTopologyObserved, true)
+    assert.equal(good?.fullDestinationContentsReverified, false)
+    assert.equal(good?.resumeSyncAuthorized, false)
+    drift = true
+    const changed = await runtime.inspectFencedReencryptionCandidateGitRefs()
+    assert.equal(changed, null, "Settings changes while Git is pending must fail closed")
+    settings.githubBranch = sourceBranch
+    assert.deepEqual(s.old.f.s.files, before, "Git ref readback must not alter local Index")
+  } finally {
+    methods.forEach((name, i) => { prototype[name] = originals[i]! })
+    runtime.dispose()
+  }
+})
+
 test("D247 joins real old frozen Backup key, encrypted WAL and full Destination under one recovery lease", async () => {
   const s = await d247Scenario()
   const beforeLocal = new Map(s.old.f.s.files)
