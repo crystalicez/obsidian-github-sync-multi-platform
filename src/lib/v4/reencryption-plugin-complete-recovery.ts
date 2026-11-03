@@ -7,6 +7,11 @@ import { planV4PluginPrivateWalLocation } from "./reencryption-plugin-wal-locati
 type Backup = V4ColdStartCompleteRecoveryInput["backup"]
 type Current = V4ColdStartCompleteRecoveryInput["current"]
 
+// Mobile offers no OS WAL lock. Deny overlapping read-only Recovery attempts
+// in this JavaScript process even if an injected cooperative holder is faulty.
+// Key by the actual vault adapter, not a cloneable owner/run wrapper.
+const activeMobileRecoveryAdapters = new WeakSet<object>()
+
 interface V4PluginRecoveryEvidence {
   /** Must be the installed plugin's actual Index and persisted Settings. */
   readonly backup: Backup
@@ -175,12 +180,19 @@ export async function inspectV4MobilePluginCompleteRecovery(
   input: V4MobilePluginCompleteRecoveryInput,
 ): Promise<V4PluginCompleteRecoveryReport> {
   const isolation = "mobile-cooperative-best-effort-only"
+  let reservedAdapter: object | undefined
   try {
     const { owner, backup, contract, destination, originalJournalKey,
       withExclusiveCooperativeRecoveryLease: holder,
       assertCooperativeRecoveryLease: lease } = input
     checkEvidence(input, owner)
     if (typeof holder !== "function" || typeof lease !== "function") return manual(isolation)
+    const adapter = owner.adapter
+    if (!adapter || typeof adapter !== "object" || activeMobileRecoveryAdapters.has(adapter)) {
+      return manual(isolation)
+    }
+    activeMobileRecoveryAdapters.add(adapter)
+    reservedAdapter = adapter
     const reader = await openV4MobilePluginWalForRecovery(owner)
     const pinned = () => {
       checkEvidence(input, owner)
@@ -220,5 +232,7 @@ export async function inspectV4MobilePluginCompleteRecovery(
     return observation(report, isolation)
   } catch {
     return manual(isolation)
+  } finally {
+    if (reservedAdapter) activeMobileRecoveryAdapters.delete(reservedAdapter)
   }
 }

@@ -3393,7 +3393,7 @@ test("D248/D250/D252 verifies Desktop WAL lock, installed physical readback and 
   }
 })
 
-test("D248/D250/D252 Mobile existing WAL and installed old-key authentication remain non-authorizing", async () => {
+test("D248/D250/D252/D260 Mobile existing WAL, in-process exclusion and old-key authentication stay non-authorizing", async () => {
   const s = await d247Scenario()
   const runId = s.contract.identity.runId
   const configDir = ".obsidian"
@@ -3475,6 +3475,51 @@ test("D248/D250/D252 Mobile existing WAL and installed old-key authentication re
   assert.equal(held, false)
   assert.equal(leaseCount, 1)
   assert.ok(readCount > 8)
+  assert.deepEqual(files, before)
+  // D260: even a broken caller-provided "exclusive" holder must not permit
+  // concurrent read-only D248 diagnostics against the same real vault adapter.
+  // A cloned owner object must not bypass the one-process adapter identity.
+  const originalRead = adapter.read
+  let blockOnce = true
+  let signalReadStarted: (() => void) | undefined
+  let releaseBlockedRead: (() => void) | undefined
+  const readStarted = new Promise<void>(resolve => { signalReadStarted = resolve })
+  const blockedRead = new Promise<void>(resolve => { releaseBlockedRead = resolve })
+  adapter.read = async name => {
+    if (blockOnce && name.endsWith("/slot-0.json")) {
+      blockOnce = false
+      signalReadStarted?.()
+      await blockedRead
+    }
+    return originalRead(name)
+  }
+  const originalHolder = evidence.withExclusiveCooperativeRecoveryLease
+  const originalLeaseAssertion = evidence.assertCooperativeRecoveryLease
+  evidence.withExclusiveCooperativeRecoveryLease = async <T>(body: () => Promise<T>) => body()
+  evidence.assertCooperativeRecoveryLease = async () => {}
+  const firstConcurrent = inspectV4MobilePluginCompleteRecovery(evidence)
+  await readStarted
+  try {
+    const overlap = await inspectV4MobilePluginCompleteRecovery({
+      ...evidence, owner: { ...owner },
+    })
+    assert.equal(overlap.observation, "manual-recovery-required")
+    assert.equal(overlap.completeDestinationContentsReverified, false)
+    assert.equal(overlap.resumeSyncAuthorized, false)
+    assert.equal(overlap.mobileOsLockProven, false)
+  } finally {
+    releaseBlockedRead?.()
+    const firstCompleted = await firstConcurrent
+    assert.equal(firstCompleted.observation, "authenticated-complete-recovery-evidence-still-fenced")
+    evidence.withExclusiveCooperativeRecoveryLease = originalHolder
+    evidence.assertCooperativeRecoveryLease = originalLeaseAssertion
+  }
+  assert.deepEqual(files, before, "concurrent Mobile diagnostic guard must not mutate WAL")
+  const sequential = await inspectV4MobilePluginCompleteRecovery(evidence)
+  assert.equal(sequential.observation, "authenticated-complete-recovery-evidence-still-fenced",
+    "a completed scan must release its in-process Mobile adapter reservation")
+  assert.equal(sequential.resumeSyncAuthorized, false)
+  assert.equal(leaseCount, 2)
   assert.deepEqual(files, before)
   const platformWasDesktop = Platform.isDesktopApp
   let runtime: V4PluginRuntime | undefined
