@@ -262,7 +262,17 @@ export class V4PluginRuntime {
 
     const settings = this.plugin.settings
     const token = settings.githubToken
-    if (!token || !settings.githubOwner || !settings.githubRepo) {
+    const owner = settings.githubOwner
+    const repo = settings.githubRepo
+    const branch = settings.githubBranch
+    const tokenSecretId = settings.githubTokenSecretId
+    const passphraseSecretId = settings.encryptionPassphraseSecretId
+    const encryptionMode = settings.encryptionMode
+    const originalVault = this.plugin.app.vault
+    const configDir = originalVault.configDir
+    const pluginId = this.plugin.manifest.id
+    const credentialGeneration = this.credentialGeneration
+    if (!token || !owner || !repo) {
       throw new Error("Re-encryption read-only verification needs the configured GitHub token.")
     }
     const raw: unknown = JSON.parse(await this.adapter.read(V4_REENCRYPTION_RUNTIME_ROUTE_PATH))
@@ -275,24 +285,35 @@ export class V4PluginRuntime {
     )
     const id = contract.identity
     const match = /^([^/#]+)\/([^/#]+)#(.+)$/u.exec(id.backupRepoId)
-    if (!match || match[1] !== settings.githubOwner || match[2] !== settings.githubRepo
-      || id.runId !== runId) {
+    if (!match || match[1] !== owner || match[2] !== repo || id.runId !== runId) {
       throw new Error("Re-encryption Backup repo differs from live plugin credentials.")
     }
     const backing = this.indexAdapterBacking
-    const github = new GitHubClient({
-      token, owner: settings.githubOwner, repo: settings.githubRepo, branch: match[3]!,
-    })
+    const secretStorage = this.plugin.app.secretStorage
+    const getSecret = secretStorage.getSecret
+    const loadData = this.plugin.loadData
+    const github = new GitHubClient({ token, owner, repo, branch: match[3]! })
     return inspectV4ReencryptionColdStartJournalKey({
       adapter: this.adapter,
-      readPersistedPluginData: () => this.plugin.loadData(),
-      getSecret: secretId => this.plugin.app.secretStorage.getSecret(secretId),
+      readPersistedPluginData: () => loadData.call(this.plugin),
+      getSecret: secretId => getSecret.call(secretStorage, secretId),
       backupGit: github,
       assertLiveOwner: () => {
         if (this.disposed || this.indexAdapterBacking !== backing
+          || this.plugin.app.vault !== originalVault
+          || originalVault.configDir !== configDir
+          || this.plugin.manifest.id !== pluginId
           || this.plugin.app.vault.adapter !== backing
-          || this.plugin.settings !== settings || settings.githubToken !== token
-          || this.plugin.isSyncInProgress) {
+          || this.plugin.settings !== settings || this.credentialGeneration !== credentialGeneration
+          || settings.githubToken !== token || settings.githubOwner !== owner
+          || settings.githubRepo !== repo || settings.githubBranch !== branch
+          || settings.githubTokenSecretId !== tokenSecretId
+          || settings.encryptionPassphraseSecretId !== passphraseSecretId
+          || settings.encryptionMode !== encryptionMode
+          || this.plugin.app.secretStorage !== secretStorage
+          || secretStorage.getSecret !== getSecret
+          || this.plugin.loadData !== loadData
+          || this.plugin.isSyncInProgress || this.plugin.isSettingsSaveInProgress?.()) {
           throw Error("Re-encryption owner changed during read-only verification.")
         }
       },

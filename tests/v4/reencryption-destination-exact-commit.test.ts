@@ -49,6 +49,7 @@ import { acquireV4DesktopRekeyWalStorage } from "../../src/lib/v4/reencryption-d
 import { openV4ExistingDesktopWalForRecovery } from "../../src/lib/v4/reencryption-desktop-wal-recovery"
 import type { V4ReencryptionCutoverSnapshotContract } from "../../src/lib/v4/reencryption-cutover-snapshot-contract"
 import { V4PluginRuntime } from "../../src/lib/v4/runtime"
+import { GitHubClient } from "../../src/lib/github-api"
 import { inspectV4ReencryptionPendingCutoverIntent } from "../../src/lib/v4/reencryption-cutover-intent-crypto"
 import { inspectV4ReencryptionCutoverCandidateAfterRestart } from "../../src/lib/v4/reencryption-cutover-candidate-restart"
 import { decodeV4ReencryptionCutoverCandidateManifest } from "../../src/lib/v4/reencryption-cutover-candidate-manifest"
@@ -2066,6 +2067,66 @@ test("D235 rederives the original journal key from immutable encrypted Backup co
   assert.deepEqual(s.f.s.files, oldFiles)
   assert.deepEqual(s.f.s.secrets, oldSecrets)
   await assert.rejects(assertV4ReencryptionSyncFenceClear(s.f.s.adapter))
+})
+
+test("D249 installed read-only recovery refuses mutable Settings branch drift during Git inspection", async () => {
+  const s = await d235Scenario()
+  const persisted = JSON.parse(s.saved) as { settings: Record<string, unknown> }
+  const settings = {
+    ...persisted.settings, githubToken: "offline-d249-test-token",
+  } as { githubBranch: string; githubOwner: string; githubRepo: string; githubToken: string }
+  const prefix = ".obsidian/plugins/test-d249/"
+  const disk = s.f.s.adapter
+  const nativeAdapter = {
+    read: (name: string) => disk.read(name.replace(prefix, "")),
+    write: (name: string, value: string) => disk.write(name.replace(prefix, ""), value),
+    exists: (name: string) => disk.exists(name.replace(prefix, "")),
+    mkdir: (name: string) => disk.mkdir(name.replace(prefix, "")),
+  }
+  const plugin = {
+    settings, manifest: { id: "test-d249" },
+    isSyncInProgress: false,
+    app: {
+      vault: { configDir: ".obsidian", adapter: nativeAdapter },
+      secretStorage: { getSecret: (id: string) => s.f.s.secrets.get(id) ?? null },
+    },
+    loadData: async () => JSON.parse(s.saved) as unknown,
+  }
+  const methods = [
+    "getRepositoryIdentity", "getRepositoryDefaultBranch", "getGitRef",
+    "getGitCommit", "getTreeAt", "getBlob",
+  ] as const
+  type Stub = (...args: never[]) => Promise<unknown>
+  const prototype = GitHubClient.prototype as unknown as Record<string, Stub>
+  const backupGit = s.b.github as unknown as Record<string, Stub>
+  const originals = methods.map(name => prototype[name]!)
+  const before = new Map(s.f.s.files)
+  const savedBranch = settings.githubBranch
+  let drift = true
+  const runtime = new V4PluginRuntime(plugin as never)
+  try {
+    for (const name of methods) {
+      prototype[name] = (...args: never[]) => {
+        if (name === "getRepositoryIdentity" && drift) {
+          settings.githubBranch = "unexpected-in-place-change"
+        }
+        return backupGit[name]!(...args)
+      }
+    }
+    const result = await runtime.verifyFencedReencryptionOriginalKey()
+    assert.equal(result?.observation, "manual-recovery-required")
+    assert.equal(result?.originalKeyAuthenticated, false)
+    settings.githubBranch = savedBranch
+    drift = false
+    const stable = await runtime.verifyFencedReencryptionOriginalKey()
+    assert.equal(stable?.observation, "authenticated-local-route-still-fenced")
+    assert.equal(stable?.completeBackupContentsReverified, true)
+    assert.equal(stable?.resumeSyncAuthorized, false)
+    assert.deepEqual(s.f.s.files, before, "no local WAL or Index is altered")
+  } finally {
+    methods.forEach((name, index) => { prototype[name] = originals[index]! })
+    runtime.dispose()
+  }
 })
 
 async function d247WalSlot(
