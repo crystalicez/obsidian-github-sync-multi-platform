@@ -1,5 +1,6 @@
 import assert from "node:assert/strict"
 import test from "node:test"
+import { Platform } from "obsidian"
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises"
 import path from "node:path"
 
@@ -2450,7 +2451,7 @@ test("D247 refuses a torn encrypted WAL and leaves both original-key Backup and 
   assert.deepEqual(s.old.f.s.files, filesBefore)
 })
 
-test("D248 derives a real Desktop plugin-private WAL path and holds its OS recovery lock across D247", async () => {
+test("D248/D250 verifies Desktop physical WAL isolation and installed structural-only preflight", async () => {
   const s = await d247Scenario()
   await mkdir(path.join(process.cwd(), ".tmp"), { recursive: true })
   const temporary = await mkdtemp(path.join(process.cwd(), ".tmp", "d248-owner-"))
@@ -2487,13 +2488,57 @@ test("D248 derives a real Desktop plugin-private WAL path and holds its OS recov
     }
     const before = await Promise.all([readFile(path.join(physicalWal, "slot-0.json")),
       readFile(path.join(physicalWal, "slot-1.json"))])
-    // A different OS-lock holder is still writing: a Recovery opener must
-    // NEVER reclaim or ignore that lock, even with both valid ciphertexts.
     const competing = await inspectV4DesktopPluginCompleteRecovery(evidence)
     assert.equal(competing.observation, "manual-recovery-required")
     assert.equal(competing.resumeSyncAuthorized, false)
-    await seeded.release()
-    seeded = undefined
+    // D250: exercise the actual installed Runtime against the same disposable
+    // physical WAL. This is structural evidence ONLY, not key authentication.
+    const local = s.old.f.s.adapter
+    const prefix = configDir + "/plugins/" + pluginId + "/"
+    const settings = (JSON.parse(s.old.saved) as { settings: Record<string, unknown> }).settings
+    const installedAdapter = {
+      ...owner.adapter,
+      read: (name: string) => local.read(name.replace(prefix, "")),
+      write: (name: string, value: string) => local.write(name.replace(prefix, ""), value),
+      exists: (name: string) => local.exists(name.replace(prefix, "")),
+      mkdir: (name: string) => local.mkdir(name.replace(prefix, "")),
+    }
+    const runtime = new V4PluginRuntime({
+      settings, manifest: { id: pluginId }, loadData: async () => JSON.parse(s.old.saved),
+      isSyncInProgress: false,
+      app: {
+        vault: { configDir, adapter: installedAdapter },
+        secretStorage: { getSecret: (id: string) => s.old.f.s.secrets.get(id) ?? null },
+      },
+    } as never)
+    try {
+      const blocked = await runtime.inspectFencedReencryptionExistingWalStructure()
+      assert.equal(blocked.observation, "manual-recovery-required",
+        "a competing writer must refuse even a structural WAL report")
+      assert.equal(blocked.walAuthenticated, false)
+      await seeded.release()
+      seeded = undefined
+      const structure = await runtime.inspectFencedReencryptionExistingWalStructure()
+      assert.equal(structure.observation, "existing-wal-structure-observed-untrusted")
+      assert.equal(structure.walAuthenticated, false)
+      assert.equal(structure.completeRecoveryProven, false)
+      assert.equal(structure.powerLossDurabilityProven, false)
+      assert.equal(structure.installedObsidianAcceptanceProven, false)
+      assert.equal(structure.resumeSyncAuthorized, false)
+      assert.equal(structure.localCutoverAuthorized, false)
+      const originalRead = installedAdapter.read
+      installedAdapter.read = async (name: string) => {
+        const value = await originalRead(name)
+        settings["githubBranch"] = "changed-during-read"
+        return value
+      }
+      const changed = await runtime.inspectFencedReencryptionExistingWalStructure()
+      assert.equal(changed.observation, "manual-recovery-required")
+      installedAdapter.read = originalRead
+    } finally {
+      runtime.dispose()
+    }
+    // D250 released the competing writer without changing either WAL slot.
     const result = await inspectV4DesktopPluginCompleteRecovery(evidence)
     assert.equal(result.observation, "authenticated-complete-recovery-evidence-still-fenced")
     assert.equal(result.completeOldBackupReverified, true)
@@ -2519,7 +2564,7 @@ test("D248 derives a real Desktop plugin-private WAL path and holds its OS recov
   }
 })
 
-test("D248 Mobile existing-only Adapter reads all D247 evidence under a separate cooperative lease, never OS authority", async () => {
+test("D248/D250 Mobile existing-only Adapter and installed structural preflight remain non-authorizing", async () => {
   const s = await d247Scenario()
   const runId = s.contract.identity.runId
   const configDir = ".obsidian"
@@ -2556,9 +2601,19 @@ test("D248 Mobile existing-only Adapter reads all D247 evidence under a separate
     async read(name: string) {
       readCount++
       const value = files.get(name)
-      if (value === undefined) throw Error("missing Mobile ciphertext")
-      return value
+      if (value !== undefined) return value
+      const prefix = configDir + "/plugins/" + pluginId + "/"
+      if (name.startsWith(prefix)) return s.old.f.s.adapter.read(name.slice(prefix.length))
+      throw Error("missing Mobile ciphertext or local recovery Index")
     },
+    async exists(name: string) {
+      if (files.has(name)) return true
+      const prefix = configDir + "/plugins/" + pluginId + "/"
+      return name.startsWith(prefix)
+        ? s.old.f.s.adapter.exists(name.slice(prefix.length)) : false
+    },
+    async write() { throw Error("D250 installed physical WAL preflight must not write") },
+    async mkdir() { throw Error("D250 installed physical WAL preflight must not mkdir") },
   }
   let held = false
   let leaseCount = 0
@@ -2592,6 +2647,32 @@ test("D248 Mobile existing-only Adapter reads all D247 evidence under a separate
   assert.equal(leaseCount, 1)
   assert.ok(readCount > 8)
   assert.deepEqual(files, before)
+  const platformWasDesktop = Platform.isDesktopApp
+  let runtime: V4PluginRuntime | undefined
+  try {
+    Platform.isDesktopApp = false
+    const settings = (JSON.parse(s.old.saved) as { settings: Record<string, unknown> }).settings
+    runtime = new V4PluginRuntime({
+      settings, manifest: { id: pluginId }, loadData: async () => JSON.parse(s.old.saved),
+      isSyncInProgress: false,
+      app: {
+        vault: { configDir, adapter },
+        secretStorage: { getSecret: (id: string) => s.old.f.s.secrets.get(id) ?? null },
+      },
+    } as never)
+    const structure = await runtime.inspectFencedReencryptionExistingWalStructure()
+    assert.equal(structure.observation, "existing-wal-structure-observed-untrusted")
+    assert.equal(structure.walAuthenticated, false)
+    assert.equal(structure.completeRecoveryProven, false)
+    assert.equal(structure.powerLossDurabilityProven, false)
+    assert.equal(structure.installedObsidianAcceptanceProven, false)
+    assert.equal(structure.localCutoverAuthorized, false)
+    assert.equal(structure.resumeSyncAuthorized, false)
+    assert.deepEqual(files, before, "installed Mobile preflight cannot mutate WAL")
+  } finally {
+    runtime?.dispose()
+    Platform.isDesktopApp = platformWasDesktop
+  }
   const cooperativeLease = evidence.assertCooperativeRecoveryLease
   evidence.assertCooperativeRecoveryLease = async () => {
     throw Error("cooperative lease was revoked")

@@ -28,6 +28,9 @@ import { createV4DesktopInitiatorLocalReader } from "./reencryption-desktop-init
 import { createV4MobileInitiatorLocalReader } from "./reencryption-mobile-initiator-reader"
 import { openV4NewDesktopPluginWalWriter, type V4DesktopPluginWalWriter } from "./reencryption-desktop-plugin-wal-writer"
 import { openV4NewMobilePluginWalWriter, type V4MobilePluginWalWriter } from "./reencryption-mobile-plugin-wal-writer"
+import { openV4DesktopPluginWalForRecovery } from "./reencryption-desktop-plugin-wal-recovery"
+import { openV4MobilePluginWalForRecovery, type V4MobilePluginWalOwner } from "./reencryption-mobile-wal-recovery"
+import { planV4PluginPrivateWalLocation } from "./reencryption-plugin-wal-location"
 import { armV4ReencryptionSyncFence, assertV4ReencryptionSyncFenceClear, V4ReencryptionSyncFencedError, type V4ReencryptionSyncFenceReport } from "./reencryption-sync-fence"
 import type { V4InitiatorLocalReader } from "./reencryption-initiator-parity"
 import { createV4StagingStore, type V4StagingStore } from "./staging-store"
@@ -56,6 +59,35 @@ interface V4RuntimeConfigSelection {
   config: V4RemoteConfig
   source: V4RuntimeConfigSource
 }
+
+/** Presence and repeated byte readback of untrusted physical WAL slots only. */
+export interface V4ReencryptionExistingWalStructureReport {
+  readonly integrityScope: "read-only-untrusted-existing-wal-structure"
+  readonly observation: "existing-wal-structure-observed-untrusted" | "manual-recovery-required"
+  readonly walAuthenticated: false
+  readonly completeRecoveryProven: false
+  readonly powerLossDurabilityProven: false
+  readonly installedObsidianAcceptanceProven: false
+  readonly resumeSyncAuthorized: false
+  readonly localCutoverAuthorized: false
+  readonly remoteWritesAuthorized: false
+  readonly oldPassphraseCleanupAuthorized: false
+}
+
+const V4_WAL_STRUCTURE_BASE = Object.freeze({
+  integrityScope: "read-only-untrusted-existing-wal-structure" as const,
+  walAuthenticated: false as const,
+  completeRecoveryProven: false as const,
+  powerLossDurabilityProven: false as const,
+  installedObsidianAcceptanceProven: false as const,
+  resumeSyncAuthorized: false as const,
+  localCutoverAuthorized: false as const,
+  remoteWritesAuthorized: false as const,
+  oldPassphraseCleanupAuthorized: false as const,
+})
+const V4_WAL_STRUCTURE_MANUAL: V4ReencryptionExistingWalStructureReport = Object.freeze({
+  ...V4_WAL_STRUCTURE_BASE, observation: "manual-recovery-required",
+})
 
 interface V4ArmedReencryptionInitiator {
   readonly runId: string
@@ -318,6 +350,149 @@ export class V4PluginRuntime {
         }
       },
     })
+  }
+
+  /**
+   * Installed D250 structural-only preflight of an EXISTING plugin-private WAL.
+   * No ciphertext is authenticated; no migration, Sync or Cutover can follow.
+   * Desktop temporarily creates only the existing WAL's cooperative lock.
+   */
+  async inspectFencedReencryptionExistingWalStructure(): Promise<V4ReencryptionExistingWalStructureReport> {
+    try {
+      this.assertNotDisposed()
+      const vault = this.plugin.app.vault
+      const settings = this.plugin.settings
+      const secretStorage = this.plugin.app.secretStorage
+      const getSecret = secretStorage.getSecret
+      const loadData = this.plugin.loadData
+      const backing = this.indexAdapterBacking as (V4MobilePluginWalOwner["adapter"] & {
+        exists(path: string): Promise<boolean>
+        getFullPath?: (path: string) => string
+      }) | undefined
+      const originalConfigDir = vault.configDir
+      const configDir = originalConfigDir || ".obsidian"
+      const pluginId = this.plugin.manifest.id
+      const desktop = Platform.isDesktopApp === true
+      const generation = this.credentialGeneration
+      const indexRead = backing?.read
+      const indexExists = backing?.exists
+      const source = {
+        owner: settings.githubOwner, repo: settings.githubRepo,
+        branch: settings.githubBranch, token: settings.githubToken,
+        tokenSecretId: settings.githubTokenSecretId,
+        passphraseSecretId: settings.encryptionPassphraseSecretId,
+        mode: settings.encryptionMode,
+      }
+      const assertOwner = () => {
+        this.assertNotDisposed()
+        if (!backing || this.indexAdapterBacking !== backing
+          || vault !== this.plugin.app.vault || vault.adapter !== backing
+          || vault.configDir !== originalConfigDir
+          || this.plugin.manifest.id !== pluginId
+          || this.plugin.settings !== settings || this.credentialGeneration !== generation
+          || this.plugin.app.secretStorage !== secretStorage
+          || secretStorage.getSecret !== getSecret || this.plugin.loadData !== loadData
+          || Platform.isDesktopApp !== desktop
+          || backing.read !== indexRead || backing.exists !== indexExists
+          || settings.githubOwner !== source.owner || settings.githubRepo !== source.repo
+          || settings.githubBranch !== source.branch || settings.githubToken !== source.token
+          || settings.githubTokenSecretId !== source.tokenSecretId
+          || settings.encryptionPassphraseSecretId !== source.passphraseSecretId
+          || settings.encryptionMode !== source.mode
+          || this.plugin.isSyncInProgress || this.plugin.isSettingsSaveInProgress?.()
+          || this.coordinator.isSyncing || this.coordinator.pendingCount > 0
+          || this.debounceRunActive || this.recentlyStagedPaths.size > 0) {
+          throw Error("Re-encryption physical WAL diagnostic owner changed.")
+        }
+      }
+      assertOwner()
+      if (!backing || !source.owner || !source.repo || (desktop && this.uncVault)) {
+        return V4_WAL_STRUCTURE_MANUAL
+      }
+      const route = await this.inspectFencedReencryptionIndexRoute()
+      assertOwner()
+      if (route.observation !== "destination-shadow-diagnostic-only"
+        && route.observation !== "source-settings-pending") return V4_WAL_STRUCTURE_MANUAL
+      const markerText = await this.adapter.read(V4_REENCRYPTION_RUNTIME_ROUTE_PATH)
+      assertOwner()
+      const marker: unknown = JSON.parse(markerText)
+      const runId = (marker as { runId?: unknown } | null)?.runId
+      if (typeof runId !== "string" || !/^[A-Za-z0-9_-]{8,128}$/u.test(runId)) {
+        return V4_WAL_STRUCTURE_MANUAL
+      }
+      const candidatePath = V4_INDEX_ROOT + "-rekey-cutover-candidate-" + runId + "/contract.json"
+      const contractText = await this.adapter.read(candidatePath)
+      assertOwner()
+      const contract = decodeV4ReencryptionCutoverCandidateManifest(contractText)
+      const id = contract.identity
+      const physicalRepo = source.owner + "/" + source.repo + "#"
+      if (id.runId !== runId || !id.sourceRepoId.startsWith(physicalRepo)
+        || !id.backupRepoId.startsWith(physicalRepo)
+        || !id.destinationRepoId.startsWith(physicalRepo)) return V4_WAL_STRUCTURE_MANUAL
+      const layout = await planV4PluginPrivateWalLocation({ configDir, pluginId, runId })
+      assertOwner()
+      const slots = [layout.journalRoot + "/slot-0.json", layout.journalRoot + "/slot-1.json"]
+      const doubleRead = async (reader: Pick<V4LocalIndexAdapter, "read" | "exists">) => {
+        const values: string[] = []
+        for (const slot of slots) {
+          assertOwner()
+          if (!(await reader.exists(slot))) throw Error("Re-encryption WAL slot missing.")
+          const text = await reader.read(slot)
+          assertOwner()
+          if (typeof text !== "string" || !text.length || text.length > 2 * 1024 * 1024) {
+            throw Error("Re-encryption WAL slot malformed or oversized.")
+          }
+          values.push(text)
+        }
+        for (const [i, slot] of slots.entries()) {
+          assertOwner()
+          if (await reader.read(slot) !== values[i]) {
+            throw Error("Re-encryption WAL slot changed between reads.")
+          }
+          assertOwner()
+        }
+      }
+      const recheck = async () => {
+        assertOwner()
+        const again = await this.inspectFencedReencryptionIndexRoute()
+        assertOwner()
+        if (again.observation !== route.observation
+          || again.diagnosticIndexRoot !== route.diagnosticIndexRoot
+          || await this.adapter.read(V4_REENCRYPTION_RUNTIME_ROUTE_PATH) !== markerText
+          || await this.adapter.read(candidatePath) !== contractText) {
+          throw Error("Re-encryption WAL route changed during readback.")
+        }
+        assertOwner()
+      }
+      if (desktop) {
+        if (typeof backing.getFullPath !== "function") return V4_WAL_STRUCTURE_MANUAL
+        const reader = await openV4DesktopPluginWalForRecovery({
+          adapter: backing as typeof backing & { getFullPath(path: string): string },
+          configDir, pluginId, runId, assertLiveOwner: assertOwner,
+        })
+        try {
+          await reader.assertExclusiveStageLease()
+          await doubleRead(reader.adapter)
+          await reader.assertBestEffortCheckpoint()
+          await recheck()
+        } finally {
+          await reader.release()
+        }
+      } else {
+        const reader = await openV4MobilePluginWalForRecovery({
+          adapter: backing, configDir, pluginId, runId, assertLiveOwner: assertOwner,
+        })
+        await doubleRead(reader.adapter)
+        await recheck()
+      }
+      assertOwner()
+      return Object.freeze({
+        ...V4_WAL_STRUCTURE_BASE,
+        observation: "existing-wal-structure-observed-untrusted" as const,
+      })
+    } catch {
+      return V4_WAL_STRUCTURE_MANUAL
+    }
   }
 
   /** Read local Destination Shadow for Manual Recovery, not as a Sync writer. */

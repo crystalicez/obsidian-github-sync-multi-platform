@@ -190,28 +190,30 @@ export default class FastSync extends Plugin {
       id: "verify-reencryption-recovery-read-only",
       name: "GitHub Sync: Verify Re-encryption Recovery (Read-only)",
       callback: () => {
-        void this.v4Runtime.verifyFencedReencryptionOriginalKey().then(
-          result => {
+        void (async () => {
+          try {
+            const backup = await this.v4Runtime.verifyFencedReencryptionOriginalKey()
             if (this.unloaded) return
-            if (result?.originalKeyAuthenticated && result.completeBackupContentsReverified) {
-              new Notice(
-                "GitHub Sync: Original key and all encrypted Frozen Backup files verified. Destination, WAL and recovery remain unverified; Sync stays paused.",
-                10000,
-              )
-            } else {
+            if (!backup?.originalKeyAuthenticated || !backup.completeBackupContentsReverified) {
               new Notice(
                 "GitHub Sync: Re-encryption recovery is incomplete or cannot be authenticated. Sync stays paused; keep both passphrases.",
                 10000,
               )
+              return
             }
-          },
-          () => {
+            const wal = await this.v4Runtime.inspectFencedReencryptionExistingWalStructure()
+            if (this.unloaded) return
+            new Notice(wal.observation === "existing-wal-structure-observed-untrusted"
+              ? "GitHub Sync: Original Frozen Backup verified; two existing WAL slots read back structurally ONLY (not authenticated). Destination and complete Recovery remain unverified. Sync stays paused."
+              : "GitHub Sync: Original Frozen Backup verified, but existing WAL structure could not be confirmed. Full Recovery unverified; preserve both passphrases and review Manual Recovery. Sync stays paused.",
+            12000)
+          } catch {
             if (!this.unloaded) new Notice(
-              "GitHub Sync: Read-only Backup verification unavailable. Sync stays paused; review Manual Recovery.",
+              "GitHub Sync: Read-only Backup/WAL verification unavailable. Sync stays paused; review Manual Recovery.",
               10000,
             )
-          },
-        )
+          }
+        })()
       },
     })
 
