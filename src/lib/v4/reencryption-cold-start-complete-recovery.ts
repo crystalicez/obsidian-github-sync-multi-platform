@@ -190,6 +190,10 @@ export async function inspectV4ColdStartCompleteRecovery(
       if (!physical || physical.id !== destination.expectedPhysicalRepositoryId) {
         throw Error("D247 frozen Backup and Destination physical repositories differ.")
       }
+      const initialDestinationDefault = await immutable.destinationDefault.call(
+        immutable.destinationGit,
+      )
+      await boundary()
       // Never copy the key back into a caller-visible report. D236 independently
       // authenticates it against the old frozen encrypted HEAD and full tree.
       const expectedRecoveryBinding = {
@@ -235,6 +239,32 @@ export async function inspectV4ColdStartCompleteRecovery(
       await boundary()
       if (lastPhysical.id !== physical.id || lastPhysical.fullName !== physical.fullName) {
         throw Error("D247 physical Backup repository changed during readback.")
+      }
+      // The Destination may be moved *after* D239 finishes while the second
+      // complete old-key Backup scan is still reading Git. Never return a
+      // joined success based on the stale D239 ref observation.
+      const [lastDestinationRepo, lastDestinationDefault, lastDestinationRef, lastDestinationCommit] =
+        await Promise.all([
+          immutable.destinationRepo.call(immutable.destinationGit),
+          immutable.destinationDefault.call(immutable.destinationGit),
+          immutable.destinationRef.call(immutable.destinationGit),
+          immutable.destinationCommit.call(immutable.destinationGit, contract.identity.destinationCommitSha),
+        ])
+      await boundary()
+      const [expectedRepo, expectedBranch] = contract.identity.destinationRepoId.split("#")
+      if (!expectedRepo || !expectedBranch
+        || lastDestinationRepo.id !== destination.expectedPhysicalRepositoryId
+        || lastDestinationRepo.fullName.toLowerCase() !== expectedRepo.toLowerCase()
+        || lastDestinationDefault !== initialDestinationDefault
+        || lastDestinationDefault === expectedBranch
+        || lastDestinationRef.ref !== "refs/heads/" + expectedBranch
+        || lastDestinationRef.type !== "commit"
+        || lastDestinationRef.sha !== contract.identity.destinationCommitSha
+        || lastDestinationCommit.sha !== contract.identity.destinationCommitSha
+        || lastDestinationCommit.treeSha !== contract.identity.destinationTreeSha
+        || !Array.isArray(lastDestinationCommit.parentShas)
+        || lastDestinationCommit.parentShas.length !== 0) {
+        throw Error("D247 Destination ref or orphan commit changed after old Backup scan.")
       }
       verifiedReport = Object.freeze({
         ...BASE,

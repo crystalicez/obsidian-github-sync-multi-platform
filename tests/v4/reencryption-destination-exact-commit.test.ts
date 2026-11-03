@@ -3039,6 +3039,54 @@ test("D247 rechecks frozen Backup after Destination scan and refuses changed old
   assert.equal(s.old.f.s.getWrites(), writes)
 })
 
+test("D258 D247 refuses Destination ref move during the final old Backup readback", async () => {
+  const s = await d247Scenario()
+  const destGit = s.input.current.destination.destinationGit
+  const backupGit = s.old.input.backupGit
+  const originalDestRef = destGit.getGitRef
+  const originalBackupRef = backupGit.getGitRef
+  const originalDestBlob = destGit.getBlob
+  const beforeLocal = new Map(s.old.f.s.files)
+  const beforeWal = new Map(s.walFiles)
+  const beforeSecrets = new Map(s.old.f.s.secrets)
+  const writes = s.old.f.s.getWrites()
+  let destinationScanned = false
+  let refMoved = false
+  destGit.getBlob = async sha => {
+    const data = await originalDestBlob(sha)
+    destinationScanned = true
+    return data
+  }
+  backupGit.getGitRef = async () => {
+    const ref = await originalBackupRef()
+    if (destinationScanned) refMoved = true
+    return ref
+  }
+  destGit.getGitRef = async () => {
+    const ref = await originalDestRef()
+    return refMoved ? { ...ref, sha: "9".repeat(40) } : ref
+  }
+  try {
+    const report = await inspectV4ColdStartCompleteRecovery(s.input)
+    assert.equal(destinationScanned, true, "full Destination scan must finish before the late ref move")
+    assert.equal(refMoved, true, "ref must move during D247 second old Backup read")
+    assert.equal(report.observation, "manual-recovery-required")
+    assert.equal(report.completeDestinationContentsReverified, false)
+    assert.equal(report.resumeSyncAuthorized, false)
+    assert.equal(report.remoteWritesAuthorized, false)
+    assert.equal(s.getHolderCalls(), 1)
+    assert.equal(s.isHeld(), false)
+    assert.deepEqual(s.old.f.s.files, beforeLocal)
+    assert.deepEqual(s.old.f.s.secrets, beforeSecrets)
+    assert.deepEqual(s.walFiles, beforeWal)
+    assert.equal(s.old.f.s.getWrites(), writes)
+  } finally {
+    destGit.getBlob = originalDestBlob
+    destGit.getGitRef = originalDestRef
+    backupGit.getGitRef = originalBackupRef
+  }
+})
+
 test("D247 rejects old Backup client method replacement during new-key Git scan", async () => {
   const s = await d247Scenario()
   const git = s.input.current.destination.destinationGit
