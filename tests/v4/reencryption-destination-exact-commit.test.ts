@@ -2239,6 +2239,141 @@ async function d247Scenario() {
   }
 }
 
+test("D256 binds complete installed read-only Destination proof to one held owner lease and checkpoint", async () => {
+  const s = await d247Scenario()
+  let held = false
+  let holderCalls = 0
+  let checkpointCalls = 0
+  const beforeFiles = new Map(s.old.f.s.files)
+  const beforeWal = new Map(s.walFiles)
+  const beforeSecrets = new Map(s.old.f.s.secrets)
+  const writes = s.old.f.s.getWrites()
+  const result = await inspectV4ReencryptionColdStartJournalKey({
+    ...s.old.input,
+    walEvidence: {
+      root: s.input.current.wal.root, adapter: s.input.current.wal.adapter,
+      destinationGit: s.input.current.destination.destinationGit, fullDestination: true,
+    },
+    recoveryScope: {
+      withExclusiveRecoveryLease: async <T>(body: () => Promise<T>) => {
+        assert.equal(held, false)
+        held = true
+        holderCalls++
+        try { return await body() } finally { held = false }
+      },
+      assertExclusiveRecoveryLease: async () => { assert.equal(held, true) },
+      assertBestEffortWalCheckpoint: async (): Promise<"best-effort-readback-only"> => {
+        assert.equal(held, true)
+        checkpointCalls++
+        return "best-effort-readback-only"
+      },
+    },
+  })
+  assert.equal(result.observation, "authenticated-local-route-still-fenced")
+  assert.equal(result.completeDestinationContentsReverified, true)
+  assert.equal(result.recoveryLeaseReverified, true)
+  assert.equal(result.resumeSyncAuthorized, false)
+  assert.equal(result.localCutoverAuthorized, false)
+  assert.equal(result.remoteWritesAuthorized, false)
+  assert.equal(held, false)
+  assert.equal(holderCalls, 1)
+  assert.ok(checkpointCalls >= 2)
+  assert.deepEqual(s.old.f.s.files, beforeFiles)
+  assert.deepEqual(s.old.f.s.secrets, beforeSecrets)
+  assert.deepEqual(s.walFiles, beforeWal)
+  assert.equal(s.old.f.s.getWrites(), writes)
+})
+
+test("D256 refuses revoked owner recovery lease during full Git readback without writes", async () => {
+  const s = await d247Scenario()
+  const git = s.input.current.destination.destinationGit
+  const originalGetBlob = git.getBlob
+  const tree = await git.getTreeAt(s.contract.identity.destinationTreeSha, true)
+  const shard = tree.tree.find(node => node.type === "blob"
+    && node.path.includes("/index/") && node.path.endsWith(".enc"))
+  assert.ok(shard)
+  let held = false
+  let revoked = false
+  const beforeFiles = new Map(s.old.f.s.files)
+  const beforeWal = new Map(s.walFiles)
+  const writes = s.old.f.s.getWrites()
+  try {
+    git.getBlob = async sha => {
+      const bytes = await originalGetBlob(sha)
+      if (sha === shard.sha) revoked = true
+      return bytes
+    }
+    const result = await inspectV4ReencryptionColdStartJournalKey({
+      ...s.old.input,
+      walEvidence: {
+        root: s.input.current.wal.root, adapter: s.input.current.wal.adapter,
+        destinationGit: git, fullDestination: true,
+      },
+      recoveryScope: {
+        withExclusiveRecoveryLease: async <T>(body: () => Promise<T>) => {
+          assert.equal(held, false)
+          held = true
+          try { return await body() } finally { held = false }
+        },
+        assertExclusiveRecoveryLease: async () => {
+          if (!held || revoked) throw Error("D256 recovered owner lease lost")
+        },
+        assertBestEffortWalCheckpoint: async () => "best-effort-readback-only" as const,
+      },
+    })
+    assert.equal(revoked, true)
+    assert.equal(result.observation, "manual-recovery-required")
+    assert.equal(result.recoveryLeaseReverified, false)
+    assert.equal(result.completeDestinationContentsReverified, false)
+    assert.equal(result.resumeSyncAuthorized, false)
+    assert.equal(result.remoteWritesAuthorized, false)
+    assert.equal(held, false)
+    assert.deepEqual(s.old.f.s.files, beforeFiles)
+    assert.deepEqual(s.walFiles, beforeWal)
+    assert.equal(s.old.f.s.getWrites(), writes)
+  } finally {
+    git.getBlob = originalGetBlob
+  }
+})
+
+test("D256 refuses reentrant recovery callback even if lease holder suppresses the second error", async () => {
+  const s = await d247Scenario()
+  let held = false
+  let suppressed = false
+  const before = new Map(s.old.f.s.files)
+  const walBefore = new Map(s.walFiles)
+  const writes = s.old.f.s.getWrites()
+  const result = await inspectV4ReencryptionColdStartJournalKey({
+    ...s.old.input,
+    walEvidence: {
+      root: s.input.current.wal.root, adapter: s.input.current.wal.adapter,
+      destinationGit: s.input.current.destination.destinationGit, fullDestination: true,
+    },
+    recoveryScope: {
+      withExclusiveRecoveryLease: async <T>(body: () => Promise<T>) => {
+        held = true
+        try {
+          const accepted = await body()
+          try { await body() } catch { suppressed = true }
+          return accepted
+        } finally { held = false }
+      },
+      assertExclusiveRecoveryLease: async () => {
+        if (!held) throw Error("reentrant scope owner not held")
+      },
+      assertBestEffortWalCheckpoint: async () => "best-effort-readback-only" as const,
+    },
+  })
+  assert.equal(suppressed, true)
+  assert.equal(result.observation, "manual-recovery-required")
+  assert.equal(result.recoveryLeaseReverified, false)
+  assert.equal(result.completeDestinationContentsReverified, false)
+  assert.equal(result.localCutoverAuthorized, false)
+  assert.deepEqual(s.old.f.s.files, before)
+  assert.deepEqual(s.walFiles, walBefore)
+  assert.equal(s.old.f.s.getWrites(), writes)
+})
+
 test("D255 reads all new-key Destination plaintext using only old-key WAL receipts and pinned Source Config", async () => {
   const s = await d247Scenario()
   const walEvidence = {
@@ -2997,7 +3132,10 @@ test("D248/D250/D252 verifies Desktop WAL lock, installed physical readback and 
             return selected[name]!.call(selected as never, ...args)
           }
         }
-        const authenticated = await runtime.verifyFencedReencryptionAuthenticatedWal()
+        const firstDiagnostic = runtime.verifyFencedReencryptionAuthenticatedWal()
+        const overlap = await runtime.verifyFencedReencryptionAuthenticatedWal()
+        assert.equal(overlap, null, "one Runtime cannot run overlapping recovery diagnostics")
+        const authenticated = await firstDiagnostic
         assert.equal(authenticated?.observation, "authenticated-local-route-still-fenced")
         assert.equal(authenticated?.originalKeyAuthenticated, true)
         assert.equal(authenticated?.completeBackupContentsReverified, true)
@@ -3006,6 +3144,7 @@ test("D248/D250/D252 verifies Desktop WAL lock, installed physical readback and 
         assert.equal(authenticated?.sourceShadowSnapshotsReverified, true)
         assert.equal(authenticated?.destinationNewKeyHeadAuthenticated, true)
         assert.equal(authenticated?.completeDestinationContentsReverified, true)
+        assert.equal(authenticated?.recoveryLeaseReverified, true)
         assert.equal(authenticated?.resumeSyncAuthorized, false)
         assert.equal(authenticated?.localCutoverAuthorized, false)
         drift = true
@@ -3167,7 +3306,10 @@ test("D248/D250/D252 Mobile existing WAL and installed old-key authentication re
           return selected[name]!.call(selected as never, ...args)
         }
       }
-      const authenticated = await runtime.verifyFencedReencryptionAuthenticatedWal()
+      const firstDiagnostic = runtime.verifyFencedReencryptionAuthenticatedWal()
+      const overlap = await runtime.verifyFencedReencryptionAuthenticatedWal()
+      assert.equal(overlap, null, "Mobile has one cooperating diagnostic owner")
+      const authenticated = await firstDiagnostic
       assert.equal(authenticated?.observation, "authenticated-local-route-still-fenced")
       assert.equal(authenticated?.coldStartWalReverified, true)
       assert.equal(authenticated?.destinationCiphertextReceiptsReverified, true)
@@ -3175,6 +3317,7 @@ test("D248/D250/D252 Mobile existing WAL and installed old-key authentication re
       assert.equal(authenticated?.destinationNewKeyHeadAuthenticated, true)
       assert.equal(authenticated?.completeBackupContentsReverified, true)
       assert.equal(authenticated?.completeDestinationContentsReverified, true)
+      assert.equal(authenticated?.recoveryLeaseReverified, true)
       assert.equal(authenticated?.resumeSyncAuthorized, false)
     } finally {
       methods.forEach((name, i) => { prototype[name] = originals[i]! })

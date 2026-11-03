@@ -48,6 +48,15 @@ export interface V4ReencryptionColdStartJournalInput
   }
   /** Refuse if the plugin instance, adapter or GitHub credentials changed. */
   readonly assertLiveOwner: () => void
+  /**
+   * Caller-held read-only recovery scope. The installed owner must supply
+   * actual physical WAL exclusion and checkpoint, not untrusted WAL metadata.
+   */
+  readonly recoveryScope?: {
+    readonly withExclusiveRecoveryLease: <T>(body: () => Promise<T>) => Promise<T>
+    readonly assertExclusiveRecoveryLease: () => Promise<void>
+    readonly assertBestEffortWalCheckpoint: () => Promise<"best-effort-readback-only">
+  }
 }
 export interface V4ReencryptionColdStartJournalReport {
   readonly integrityScope: "authenticated-original-key-and-complete-pinned-backup"
@@ -58,6 +67,7 @@ export interface V4ReencryptionColdStartJournalReport {
   readonly completeBackupContentsReverified: boolean
   readonly recoveredKeyAndContractBoundToCaller: boolean
   readonly completeDestinationContentsReverified: boolean
+  readonly recoveryLeaseReverified: boolean
   readonly coldStartWalReverified: boolean
   readonly destinationCiphertextReceiptsReverified: boolean
   readonly sourceShadowSnapshotsReverified: boolean
@@ -74,6 +84,7 @@ const BASE = Object.freeze({
   completeBackupContentsReverified: false as const,
   recoveredKeyAndContractBoundToCaller: false as const,
   completeDestinationContentsReverified: false as const,
+  recoveryLeaseReverified: false as const,
   coldStartWalReverified: false as const,
   destinationCiphertextReceiptsReverified: false as const,
   sourceShadowSnapshotsReverified: false as const,
@@ -107,17 +118,89 @@ function eraseKeyring(keyring: V4Keyring): void {
 }
 
 /**
- * A fresh Obsidian process rederives the original journal key from the
- * immutable frozen Backup's config and SecretStorage, never from an
- * unauthenticated local salt or the Destination's new password.
- *
- * The encrypted HEAD authenticates the recovered key before a complete
- * old-key Frozen Backup readback across every live object. Destination
- * content and cold-start WAL are NOT inferred; no result can resume Sync.
+ * D256: wrap the full D255 read-only scan in one caller-held owner lease.
+ * Lease and WAL checkpoint claims remain best-effort unless the installed
+ * platform independently establishes physical exclusion.
+ */
+async function inspectV4ColdStartJournalKeyUnderLease(
+  input: V4ReencryptionColdStartJournalInput,
+): Promise<V4ReencryptionColdStartJournalReport> {
+  try {
+    const scope = input.recoveryScope
+    const wal = input.walEvidence
+    if (!scope || wal?.fullDestination !== true
+      || typeof scope.withExclusiveRecoveryLease !== "function"
+      || typeof scope.assertExclusiveRecoveryLease !== "function"
+      || typeof scope.assertBestEffortWalCheckpoint !== "function") return MANUAL
+    const holder = scope.withExclusiveRecoveryLease
+    const lease = scope.assertExclusiveRecoveryLease
+    const checkpoint = scope.assertBestEffortWalCheckpoint
+    const originalOwner = input.assertLiveOwner
+    let held = false
+    let entered = false
+    let reentryAttempted = false
+    let checkedReport: V4ReencryptionColdStartJournalReport | undefined
+    const assertPinned = () => {
+      originalOwner()
+      if (!held || input.recoveryScope !== scope || input.walEvidence !== wal
+        || input.assertLiveOwner !== originalOwner
+        || scope.withExclusiveRecoveryLease !== holder
+        || scope.assertExclusiveRecoveryLease !== lease
+        || scope.assertBestEffortWalCheckpoint !== checkpoint) {
+        throw Error("D256 original owner or recovery lease changed.")
+      }
+    }
+    const boundary = async () => {
+      assertPinned()
+      await lease()
+      assertPinned()
+      if (await checkpoint() !== "best-effort-readback-only") {
+        throw Error("D256 read-only WAL checkpoint unavailable.")
+      }
+      assertPinned()
+    }
+    const returned = await holder(async () => {
+      if (entered) {
+        reentryAttempted = true
+        throw Error("D256 recovery holder must enter once.")
+      }
+      entered = true
+      held = true
+      try {
+        await boundary()
+        const { recoveryScope: _recoveryScope, ...unscoped } = input
+        const report = await inspectV4ReencryptionColdStartJournalKey({
+          ...unscoped, assertLiveOwner: assertPinned,
+        })
+        await boundary()
+        if (report.observation !== "authenticated-local-route-still-fenced"
+          || !report.completeBackupContentsReverified
+          || !report.coldStartWalReverified
+          || !report.completeDestinationContentsReverified) return MANUAL
+        checkedReport = Object.freeze({ ...report, recoveryLeaseReverified: true })
+        return checkedReport
+      } finally {
+        held = false
+      }
+    })
+    originalOwner()
+    if (!entered || held || reentryAttempted || !checkedReport
+      || returned !== checkedReport) return MANUAL
+    return checkedReport
+  } catch {
+    return MANUAL
+  }
+}
+
+/**
+ * A fresh Obsidian process rederives the original key from the pinned frozen
+ * Backup, then authenticates the saved route, WAL and optional Destination.
+ * No observation permits writes, Cutover, rollback or Sync resume.
  */
 export async function inspectV4ReencryptionColdStartJournalKey(
   input: V4ReencryptionColdStartJournalInput,
 ): Promise<V4ReencryptionColdStartJournalReport> {
+  if (input.recoveryScope) return inspectV4ColdStartJournalKeyUnderLease(input)
   let keyring: V4Keyring | undefined
   let boundKeyCopy: Uint8Array | undefined
   try {

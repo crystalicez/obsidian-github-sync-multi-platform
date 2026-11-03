@@ -220,6 +220,7 @@ export class V4PluginRuntime {
   private debounceRunActive = false
   private reencryptionSyncFenced = false
   private reencryptionFencePending = false
+  private recoveryDiagnosticInProgress = false
   /** Set only after this live Runtime successfully persists the D173 Fence. */
   private armedReencryptionInitiator: V4ArmedReencryptionInitiator | undefined
   private disposed = false
@@ -296,6 +297,7 @@ export class V4PluginRuntime {
 
   private async verifyFencedReencryptionOriginalKeyWithWal(
     walEvidence?: V4ReencryptionColdStartJournalInput["walEvidence"],
+    recoveryScope?: V4ReencryptionColdStartJournalInput["recoveryScope"],
   ): Promise<V4ReencryptionColdStartJournalReport | null> {
     this.assertNotDisposed()
     const route = await this.inspectFencedReencryptionIndexRoute()
@@ -341,6 +343,7 @@ export class V4PluginRuntime {
       getSecret: secretId => getSecret.call(secretStorage, secretId),
       backupGit: github,
       ...(walEvidence ? { walEvidence } : {}),
+      ...(recoveryScope ? { recoveryScope } : {}),
       assertLiveOwner: () => {
         if (this.disposed || this.indexAdapterBacking !== backing
           || this.plugin.app.vault !== originalVault
@@ -370,6 +373,8 @@ export class V4PluginRuntime {
    * This does not grant Recovery, Sync or Cutover authority.
    */
   async verifyFencedReencryptionAuthenticatedWal(): Promise<V4ReencryptionColdStartJournalReport | null> {
+    if (this.recoveryDiagnosticInProgress) return null
+    this.recoveryDiagnosticInProgress = true
     try {
       this.assertNotDisposed()
       const vault = this.plugin.app.vault
@@ -412,7 +417,8 @@ export class V4PluginRuntime {
           || secretStorage.getSecret !== getSecret || this.plugin.loadData !== loadData
           || this.plugin.isSyncInProgress || this.plugin.isSettingsSaveInProgress?.()
           || this.coordinator.isSyncing || this.coordinator.pendingCount > 0
-          || this.debounceRunActive || this.recentlyStagedPaths.size > 0) {
+          || this.debounceRunActive || this.recentlyStagedPaths.size > 0
+          || !this.recoveryDiagnosticInProgress) {
           throw Error("Re-encryption authenticated WAL owner changed.")
         }
       }
@@ -452,9 +458,21 @@ export class V4PluginRuntime {
         })
         try {
           await reader.assertExclusiveStageLease()
+          const assertLease = async () => {
+            checkOwner()
+            await reader.assertExclusiveStageLease()
+            checkOwner()
+          }
           const result = await this.verifyFencedReencryptionOriginalKeyWithWal({
             adapter: reader.adapter, root: layout.journalRoot, destinationGit,
             fullDestination: true,
+          }, {
+            withExclusiveRecoveryLease: async <T>(body: () => Promise<T>) => {
+              await assertLease()
+              return body()
+            },
+            assertExclusiveRecoveryLease: assertLease,
+            assertBestEffortWalCheckpoint: () => reader.assertBestEffortCheckpoint(),
           })
           checkOwner()
           await reader.assertBestEffortCheckpoint()
@@ -468,14 +486,40 @@ export class V4PluginRuntime {
         adapter: native, configDir, pluginId, runId, assertLiveOwner: checkOwner,
       })
       checkOwner()
+      // Mobile has one in-process diagnostic owner, but no cross-process OS lock.
+      // Read both existing WAL slots at each boundary and refuse any drift.
+      const assertCooperativeLease = async () => { checkOwner() }
+      let firstSlots: readonly string[] | undefined
+      const checkpoint = async (): Promise<"best-effort-readback-only"> => {
+        await assertCooperativeLease()
+        const slots = await Promise.all([
+          reader.adapter.read(reader.journalRoot + "/slot-0.json"),
+          reader.adapter.read(reader.journalRoot + "/slot-1.json"),
+        ])
+        await assertCooperativeLease()
+        if (firstSlots && slots.some((slot, i) => slot !== firstSlots![i])) {
+          throw Error("Re-encryption Mobile recovery WAL slots changed.")
+        }
+        firstSlots = slots
+        return "best-effort-readback-only"
+      }
       const result = await this.verifyFencedReencryptionOriginalKeyWithWal({
         adapter: reader.adapter, root: reader.journalRoot, destinationGit,
         fullDestination: true,
+      }, {
+        withExclusiveRecoveryLease: async <T>(body: () => Promise<T>) => {
+          await assertCooperativeLease()
+          return body()
+        },
+        assertExclusiveRecoveryLease: assertCooperativeLease,
+        assertBestEffortWalCheckpoint: checkpoint,
       })
       checkOwner()
       return result
     } catch {
       return null
+    } finally {
+      this.recoveryDiagnosticInProgress = false
     }
   }
 

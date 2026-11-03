@@ -203,8 +203,8 @@ export default class FastSync extends Plugin {
               return
             }
             new Notice(
-              backup.completeDestinationContentsReverified
-                ? "GitHub Sync: Old Frozen Backup, encrypted WAL and ALL new-key Destination file plaintext verified read-only against Git and Shadow. Full D248 Recovery, multi-device Cutover and Sync restart are still UNVERIFIED. Sync stays paused."
+              backup.completeDestinationContentsReverified && backup.recoveryLeaseReverified
+                ? "GitHub Sync: Old Frozen Backup, encrypted WAL and ALL new-key Destination file plaintext verified within one owner-held read-only recovery scope. Mobile is cooperative best-effort only. D248 full Recovery, multi-device Cutover and Sync restart are still UNVERIFIED. Sync stays paused."
                 : backup.destinationCiphertextReceiptsReverified
                 ? (backup.destinationNewKeyHeadAuthenticated && backup.sourceShadowSnapshotsReverified
                   ? "GitHub Sync: Old Backup, AES-GCM WAL and listed Destination Git ciphertext receipts verified; Source/Shadow snapshots match and new-key Destination HEAD decrypted. File plaintext, full Recovery and Cutover are UNVERIFIED. Sync stays paused."
@@ -215,7 +215,7 @@ export default class FastSync extends Plugin {
             const refs = await this.v4Runtime.inspectFencedReencryptionCandidateGitRefs()
             if (this.unloaded) return
             new Notice(refs?.destinationOrphanTopologyObserved
-              ? (backup.completeDestinationContentsReverified
+              ? (backup.completeDestinationContentsReverified && backup.recoveryLeaseReverified
                 ? "GitHub Sync: Backup/Destination Git ref identities also match the saved candidate. Full Recovery/Cutover is not authorized, and Sync remains paused."
                 : "GitHub Sync: GitHub Backup/Destination branch and commit identities match the saved candidate. This does NOT verify Destination contents or authorize full Recovery. Sync stays paused.")
               : "GitHub Sync: Destination GitHub ref topology is unavailable or differs from the saved candidate. Preserve both passphrases; Manual Recovery may be needed. Sync stays paused.",
