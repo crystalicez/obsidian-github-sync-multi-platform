@@ -52,7 +52,7 @@ import { V4_RUNTIME_INDEX_ROOT } from "./reencryption-index-root"
 import { inspectV4ReencryptionColdStartIndexRoute, type V4ReencryptionColdStartRouteReport } from "./reencryption-runtime-index-route"
 import { decodeV4ReencryptionCutoverCandidateManifest } from "./reencryption-cutover-candidate-manifest"
 import { V4_REENCRYPTION_RUNTIME_ROUTE_PATH } from "./reencryption-index-root"
-import { inspectV4ReencryptionColdStartJournalKey, type V4ReencryptionColdStartJournalReport } from "./reencryption-cold-start-journal-key"
+import { inspectV4ReencryptionColdStartJournalKey, type V4ReencryptionColdStartJournalReport, type V4ReencryptionColdStartJournalInput } from "./reencryption-cold-start-journal-key"
 const V4_INDEX_ROOT = V4_RUNTIME_INDEX_ROOT
 const V4_STAGE_ROOT = "github-sync-v4-stage"
 const V4_RECOVERY_ROOT = "github-sync-v4-recovery"
@@ -291,6 +291,12 @@ export class V4PluginRuntime {
    * recovering the original key cannot authorize mutation.
    */
   async verifyFencedReencryptionOriginalKey(): Promise<V4ReencryptionColdStartJournalReport | null> {
+    return this.verifyFencedReencryptionOriginalKeyWithWal()
+  }
+
+  private async verifyFencedReencryptionOriginalKeyWithWal(
+    walEvidence?: V4ReencryptionColdStartJournalInput["walEvidence"],
+  ): Promise<V4ReencryptionColdStartJournalReport | null> {
     this.assertNotDisposed()
     const route = await this.inspectFencedReencryptionIndexRoute()
     if (route.observation !== "destination-shadow-diagnostic-only"
@@ -334,6 +340,7 @@ export class V4PluginRuntime {
       readPersistedPluginData: () => loadData.call(this.plugin),
       getSecret: secretId => getSecret.call(secretStorage, secretId),
       backupGit: github,
+      ...(walEvidence ? { walEvidence } : {}),
       assertLiveOwner: () => {
         if (this.disposed || this.indexAdapterBacking !== backing
           || this.plugin.app.vault !== originalVault
@@ -354,6 +361,106 @@ export class V4PluginRuntime {
         }
       },
     })
+  }
+
+  /**
+   * D252 read-only old-key Frozen Backup plus AES-GCM WAL authentication.
+   * Physical plugin-private WAL is opened under the existing Desktop
+   * cooperative lock, or via Mobile's best-effort Obsidian reader.
+   * This is NOT a complete Destination proof or a Sync/Cutover permission.
+   */
+  async verifyFencedReencryptionAuthenticatedWal(): Promise<V4ReencryptionColdStartJournalReport | null> {
+    try {
+      this.assertNotDisposed()
+      const vault = this.plugin.app.vault
+      const settings = this.plugin.settings
+      const native = this.indexAdapterBacking as (V4MobilePluginWalOwner["adapter"] & {
+        exists(path: string): Promise<boolean>
+        getFullPath?: (path: string) => string
+      }) | undefined
+      const nativeRead = native?.read
+      const nativeExists = native?.exists
+      const secretStorage = this.plugin.app.secretStorage
+      const getSecret = secretStorage.getSecret
+      const loadData = this.plugin.loadData
+      const originalConfigDir = vault.configDir
+      const configDir = originalConfigDir || ".obsidian"
+      const pluginId = this.plugin.manifest.id
+      const desktop = Platform.isDesktopApp === true
+      const generation = this.credentialGeneration
+      const pinned = {
+        owner: settings.githubOwner, repo: settings.githubRepo,
+        branch: settings.githubBranch, token: settings.githubToken,
+        tokenSecretId: settings.githubTokenSecretId,
+        passphraseSecretId: settings.encryptionPassphraseSecretId,
+        mode: settings.encryptionMode,
+      }
+      const checkOwner = () => {
+        this.assertNotDisposed()
+        if (!native || native !== this.indexAdapterBacking
+          || this.plugin.app.vault !== vault || vault.adapter !== native
+          || vault.configDir !== originalConfigDir
+          || this.plugin.settings !== settings || this.plugin.manifest.id !== pluginId
+          || this.credentialGeneration !== generation || Platform.isDesktopApp !== desktop
+          || native.read !== nativeRead || native.exists !== nativeExists
+          || settings.githubOwner !== pinned.owner || settings.githubRepo !== pinned.repo
+          || settings.githubBranch !== pinned.branch || settings.githubToken !== pinned.token
+          || settings.githubTokenSecretId !== pinned.tokenSecretId
+          || settings.encryptionPassphraseSecretId !== pinned.passphraseSecretId
+          || settings.encryptionMode !== pinned.mode
+          || this.plugin.app.secretStorage !== secretStorage
+          || secretStorage.getSecret !== getSecret || this.plugin.loadData !== loadData
+          || this.plugin.isSyncInProgress || this.plugin.isSettingsSaveInProgress?.()
+          || this.coordinator.isSyncing || this.coordinator.pendingCount > 0
+          || this.debounceRunActive || this.recentlyStagedPaths.size > 0) {
+          throw Error("Re-encryption authenticated WAL owner changed.")
+        }
+      }
+      checkOwner()
+      if (!native || !pinned.owner || !pinned.repo || !pinned.token
+        || (desktop && this.uncVault)) return null
+      const route = await this.inspectFencedReencryptionIndexRoute()
+      checkOwner()
+      if (route.observation !== "source-settings-pending"
+        && route.observation !== "destination-shadow-diagnostic-only") return null
+      const rawText = await this.adapter.read(V4_REENCRYPTION_RUNTIME_ROUTE_PATH)
+      checkOwner()
+      const raw: unknown = JSON.parse(rawText)
+      const runId = (raw as { runId?: unknown } | null)?.runId
+      if (typeof runId !== "string" || !/^[A-Za-z0-9_-]{8,128}$/u.test(runId)) return null
+      const layout = await planV4PluginPrivateWalLocation({ configDir, pluginId, runId })
+      checkOwner()
+      if (desktop) {
+        if (typeof native.getFullPath !== "function") return null
+        const reader = await openV4DesktopPluginWalForRecovery({
+          adapter: native as typeof native & { getFullPath(path: string): string },
+          configDir, pluginId, runId, assertLiveOwner: checkOwner,
+        })
+        try {
+          await reader.assertExclusiveStageLease()
+          const result = await this.verifyFencedReencryptionOriginalKeyWithWal({
+            adapter: reader.adapter, root: layout.journalRoot,
+          })
+          checkOwner()
+          await reader.assertBestEffortCheckpoint()
+          checkOwner()
+          return result
+        } finally {
+          await reader.release()
+        }
+      }
+      const reader = await openV4MobilePluginWalForRecovery({
+        adapter: native, configDir, pluginId, runId, assertLiveOwner: checkOwner,
+      })
+      checkOwner()
+      const result = await this.verifyFencedReencryptionOriginalKeyWithWal({
+        adapter: reader.adapter, root: reader.journalRoot,
+      })
+      checkOwner()
+      return result
+    } catch {
+      return null
+    }
   }
 
   /**

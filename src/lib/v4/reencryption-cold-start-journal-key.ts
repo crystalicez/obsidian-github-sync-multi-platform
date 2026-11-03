@@ -14,6 +14,10 @@ import {
 import { V4_REENCRYPTION_RUNTIME_ROUTE_PATH } from "./reencryption-index-root"
 import { proposeV4SameRepositoryReencryptionBackupBranch } from "./reencryption-owner-decisions"
 import { verifyGitHubFrozenReencryptionBackup } from "./reencryption-trusted-loader"
+import {
+  inspectV4ColdStartWalSnapshot,
+  type V4ColdStartWalSnapshotInput,
+} from "./reencryption-cold-start-wal-snapshot"
 
 const SHA = /^[0-9a-f]{40}$/u
 type BackupGit = Pick<GitHubClient,
@@ -30,6 +34,12 @@ export interface V4ReencryptionColdStartJournalInput
     readonly contract: V4ReencryptionCutoverSnapshotContract
     readonly originalJournalKey: Uint8Array
   }
+  /**
+   * Optional read-only physical two-slot WAL supplied by the owner. This
+   * module authenticates it with the independently recovered old key only
+   * after proving the complete frozen Backup; it cannot prove OS isolation.
+   */
+  readonly walEvidence?: Pick<V4ColdStartWalSnapshotInput, "adapter" | "root">
   /** Refuse if the plugin instance, adapter or GitHub credentials changed. */
   readonly assertLiveOwner: () => void
 }
@@ -42,7 +52,7 @@ export interface V4ReencryptionColdStartJournalReport {
   readonly completeBackupContentsReverified: boolean
   readonly recoveredKeyAndContractBoundToCaller: boolean
   readonly completeDestinationContentsReverified: false
-  readonly coldStartWalReverified: false
+  readonly coldStartWalReverified: boolean
   readonly commitDecisionAuthorized: false
   readonly localCutoverAuthorized: false
   readonly resumeSyncAuthorized: false
@@ -100,7 +110,14 @@ export async function inspectV4ReencryptionColdStartJournalKey(
   let boundKeyCopy: Uint8Array | undefined
   try {
     const { adapter, backupGit, getSecret, readPersistedPluginData, assertLiveOwner,
-      expectedRecoveryBinding } = input
+      expectedRecoveryBinding, walEvidence } = input
+    const walRoot = walEvidence?.root
+    const walAdapter = walEvidence?.adapter
+    const walRead = walAdapter?.read
+    const walExists = walAdapter?.exists
+    if (walEvidence && (typeof walRoot !== "string" || !walRoot
+      || !walAdapter || typeof walRead !== "function"
+      || typeof walExists !== "function")) return MANUAL
     const boundKey = expectedRecoveryBinding?.originalJournalKey
     const boundContract = expectedRecoveryBinding?.contract
     if (expectedRecoveryBinding && (!(boundKey instanceof Uint8Array)
@@ -129,6 +146,10 @@ export async function inspectV4ReencryptionColdStartJournalKey(
       && input.getSecret === getSecret && input.readPersistedPluginData === readPersistedPluginData
       && input.assertLiveOwner === assertLiveOwner
       && input.expectedRecoveryBinding === expectedRecoveryBinding
+      && input.walEvidence === walEvidence
+      && (!walEvidence || (walEvidence.root === walRoot
+        && walEvidence.adapter === walAdapter
+        && walAdapter?.read === walRead && walAdapter.exists === walExists))
       && (!expectedRecoveryBinding || (
         expectedRecoveryBinding.originalJournalKey === boundKey
         && expectedRecoveryBinding.contract === boundContract
@@ -260,6 +281,22 @@ export async function inspectV4ReencryptionColdStartJournalKey(
       || firstFull.verifiedRemoteObjectCount !== secondFull.verifiedRemoteObjectCount
       || firstFull.verifiedPlaintextBytes !== secondFull.verifiedPlaintextBytes) return MANUAL
 
+    let walReverified = false
+    if (walEvidence) {
+      // Only the independently authenticated old key can decrypt both
+      // existing WAL slots. The owner must separately establish physical
+      // path/isolation; WAL cryptography is NOT Cutover or Sync authority.
+      const wal = await inspectV4ColdStartWalSnapshot({
+        adapter: walEvidence.adapter, root: walEvidence.root,
+        contract, originalJournalKey: keyring.journalKey,
+        assertLiveOwner: check,
+      })
+      check()
+      if (wal.observation !== "authenticated-current-wal-still-fenced"
+        || !wal.walSnapshotAuthenticated || !wal.walMatchesCutoverContract) return MANUAL
+      walReverified = true
+    }
+
     const finalRoute = await inspectV4ReencryptionColdStartIndexRoute({
       adapter, readPersistedPluginData, getSecret, journalKey: keyring.journalKey,
     })
@@ -288,6 +325,7 @@ export async function inspectV4ReencryptionColdStartJournalKey(
       originalKeyAuthenticated: true,
       pinnedBackupConfigAndEncryptedHeadVerified: true,
       completeBackupContentsReverified: true,
+      coldStartWalReverified: walReverified,
     })
   } catch {
     return MANUAL

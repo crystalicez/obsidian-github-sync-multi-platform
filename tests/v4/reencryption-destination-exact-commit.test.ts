@@ -2239,6 +2239,38 @@ async function d247Scenario() {
   }
 }
 
+test("D252 original-key full Backup proof authenticates saved encrypted WAL, refuses torn slot without any writes", async () => {
+  const s = await d247Scenario()
+  const walEvidence = { root: s.input.current.wal.root, adapter: s.input.current.wal.adapter }
+  const before = new Map(s.walFiles)
+  const filesBefore = new Map(s.old.f.s.files)
+  const secretsBefore = new Map(s.old.f.s.secrets)
+  const writesBefore = s.old.f.s.getWrites()
+  const positive = await inspectV4ReencryptionColdStartJournalKey({
+    ...s.old.input, walEvidence,
+  })
+  assert.equal(positive.observation, "authenticated-local-route-still-fenced")
+  assert.equal(positive.completeBackupContentsReverified, true)
+  assert.equal(positive.coldStartWalReverified, true)
+  assert.equal(positive.completeDestinationContentsReverified, false)
+  assert.equal(positive.resumeSyncAuthorized, false)
+  assert.equal(positive.localCutoverAuthorized, false)
+  assert.deepEqual(s.walFiles, before)
+  const slot = walEvidence.root + "/slot-" + (s.contract.identity.walGeneration % 2) + ".json"
+  s.walFiles.set(slot, s.walFiles.get(slot)!.slice(0, 38))
+  const torn = new Map(s.walFiles)
+  const refused = await inspectV4ReencryptionColdStartJournalKey({
+    ...s.old.input, walEvidence,
+  })
+  assert.equal(refused.observation, "manual-recovery-required")
+  assert.equal(refused.coldStartWalReverified, false)
+  assert.equal(refused.resumeSyncAuthorized, false)
+  assert.deepEqual(s.walFiles, torn)
+  assert.deepEqual(s.old.f.s.files, filesBefore)
+  assert.deepEqual(s.old.f.s.secrets, secretsBefore)
+  assert.equal(s.old.f.s.getWrites(), writesBefore)
+})
+
 test("D251 installed read-only Git ref inspection pins live Settings across awaited GitHub reads", async () => {
   const s = await d247Scenario()
   const savedSettings = (JSON.parse(s.old.saved) as { settings: Record<string, unknown> }).settings
@@ -2513,7 +2545,7 @@ test("D247 refuses a torn encrypted WAL and leaves both original-key Backup and 
   assert.deepEqual(s.old.f.s.files, filesBefore)
 })
 
-test("D248/D250 verifies Desktop physical WAL isolation and installed structural-only preflight", async () => {
+test("D248/D250/D252 verifies Desktop WAL lock, installed physical readback and old-key authentication", async () => {
   const s = await d247Scenario()
   await mkdir(path.join(process.cwd(), ".tmp"), { recursive: true })
   const temporary = await mkdtemp(path.join(process.cwd(), ".tmp", "d248-owner-"))
@@ -2574,6 +2606,9 @@ test("D248/D250 verifies Desktop physical WAL isolation and installed structural
       },
     } as never)
     try {
+      settings["githubToken"] = "offline-d252-test-token"
+      const blockedCrypto = await runtime.verifyFencedReencryptionAuthenticatedWal()
+      assert.equal(blockedCrypto, null, "competing WAL writer blocks D252 original-key authentication")
       const blocked = await runtime.inspectFencedReencryptionExistingWalStructure()
       assert.equal(blocked.observation, "manual-recovery-required",
         "a competing writer must refuse even a structural WAL report")
@@ -2589,6 +2624,7 @@ test("D248/D250 verifies Desktop physical WAL isolation and installed structural
       assert.equal(structure.resumeSyncAuthorized, false)
       assert.equal(structure.localCutoverAuthorized, false)
       const originalRead = installedAdapter.read
+      const sourceBranch = settings["githubBranch"]
       installedAdapter.read = async (name: string) => {
         const value = await originalRead(name)
         settings["githubBranch"] = "changed-during-read"
@@ -2597,6 +2633,42 @@ test("D248/D250 verifies Desktop physical WAL isolation and installed structural
       const changed = await runtime.inspectFencedReencryptionExistingWalStructure()
       assert.equal(changed.observation, "manual-recovery-required")
       installedAdapter.read = originalRead
+      settings["githubBranch"] = sourceBranch
+
+      const methods = [
+        "getRepositoryIdentity", "getRepositoryDefaultBranch", "getGitRef",
+        "getGitCommit", "getTreeAt", "getBlob",
+      ] as const
+      type Stub = (...args: never[]) => Promise<unknown>
+      const prototype = GitHubClient.prototype as unknown as Record<string, Stub>
+      const originalMethods = methods.map(name => prototype[name]!)
+      const backupGit = s.old.input.backupGit as unknown as Record<string, Stub>
+      let drift = false
+      try {
+        for (const name of methods) {
+          prototype[name] = (...args: never[]) => {
+            if (name === "getRepositoryIdentity" && drift) {
+              settings["githubBranch"] = "changed-after-opening-wal"
+            }
+            return backupGit[name]!(...args)
+          }
+        }
+        const authenticated = await runtime.verifyFencedReencryptionAuthenticatedWal()
+        assert.equal(authenticated?.observation, "authenticated-local-route-still-fenced")
+        assert.equal(authenticated?.originalKeyAuthenticated, true)
+        assert.equal(authenticated?.completeBackupContentsReverified, true)
+        assert.equal(authenticated?.coldStartWalReverified, true)
+        assert.equal(authenticated?.completeDestinationContentsReverified, false)
+        assert.equal(authenticated?.resumeSyncAuthorized, false)
+        assert.equal(authenticated?.localCutoverAuthorized, false)
+        drift = true
+        const changedOwner = await runtime.verifyFencedReencryptionAuthenticatedWal()
+        assert.ok(changedOwner === null || changedOwner.observation === "manual-recovery-required")
+        settings["githubBranch"] = sourceBranch
+        drift = false
+      } finally {
+        methods.forEach((name, i) => { prototype[name] = originalMethods[i]! })
+      }
     } finally {
       runtime.dispose()
     }
@@ -2626,7 +2698,7 @@ test("D248/D250 verifies Desktop physical WAL isolation and installed structural
   }
 })
 
-test("D248/D250 Mobile existing-only Adapter and installed structural preflight remain non-authorizing", async () => {
+test("D248/D250/D252 Mobile existing WAL and installed old-key authentication remain non-authorizing", async () => {
   const s = await d247Scenario()
   const runId = s.contract.identity.runId
   const configDir = ".obsidian"
@@ -2730,6 +2802,26 @@ test("D248/D250 Mobile existing-only Adapter and installed structural preflight 
     assert.equal(structure.installedObsidianAcceptanceProven, false)
     assert.equal(structure.localCutoverAuthorized, false)
     assert.equal(structure.resumeSyncAuthorized, false)
+    settings["githubToken"] = "offline-d252-mobile-test-token"
+    const methods = [
+      "getRepositoryIdentity", "getRepositoryDefaultBranch", "getGitRef",
+      "getGitCommit", "getTreeAt", "getBlob",
+    ] as const
+    type Stub = (...args: never[]) => Promise<unknown>
+    const prototype = GitHubClient.prototype as unknown as Record<string, Stub>
+    const originals = methods.map(name => prototype[name]!)
+    const backupGit = s.old.input.backupGit as unknown as Record<string, Stub>
+    try {
+      for (const name of methods) prototype[name] = (...args: never[]) => backupGit[name]!(...args)
+      const authenticated = await runtime.verifyFencedReencryptionAuthenticatedWal()
+      assert.equal(authenticated?.observation, "authenticated-local-route-still-fenced")
+      assert.equal(authenticated?.coldStartWalReverified, true)
+      assert.equal(authenticated?.completeBackupContentsReverified, true)
+      assert.equal(authenticated?.completeDestinationContentsReverified, false)
+      assert.equal(authenticated?.resumeSyncAuthorized, false)
+    } finally {
+      methods.forEach((name, i) => { prototype[name] = originals[i]! })
+    }
     assert.deepEqual(files, before, "installed Mobile preflight cannot mutate WAL")
   } finally {
     runtime?.dispose()
