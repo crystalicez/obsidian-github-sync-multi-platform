@@ -17,7 +17,7 @@ test("GitHubClient pins the API version and paginates commit history", async () 
       json: [{
         sha: "commit-1",
         commit: { message: "obsidian-sync-v4:journal-1", author: { date: "2026-07-13T00:00:00Z", name: "Sync" } },
-        parents: [{ sha: "parent-1" }],
+        parents: [{ sha: "a".repeat(40) }],
       }],
     };
   });
@@ -26,7 +26,7 @@ test("GitHubClient pins the API version and paginates commit history", async () 
     const commits = await client.listCommits({ page: 2, perPage: 50 });
 
     assert.equal(commits[0].sha, "commit-1");
-    assert.deepEqual(commits[0].parentShas, ["parent-1"]);
+    assert.deepEqual(commits[0].parentShas, ["a".repeat(40)]);
     assert.match(requests[0].url, /commits\?sha=main&per_page=50&page=2/u);
     assert.equal(requests[0].headers["X-GitHub-Api-Version"], "2026-03-10");
   } finally {
@@ -560,6 +560,63 @@ test("immutable commit and content reads omit timestamp cache-busting while ref 
     assert.equal(urls[0].includes("&_="), false)
     assert.equal(urls[1].includes("?_="), false)
     assert.match(urls[2], /\?_=/u)
+  } finally {
+    setRequestUrlHandler(null)
+  }
+})
+
+test("D251 commit history parser rejects absent parents instead of fabricating a root", async () => {
+  const commitSha = "a".repeat(40)
+  const client = new GitHubClient(
+    { token: "token", owner: "owner", repo: "repo", branch: "main" },
+    { transportPolicy: { mutationSpacingMs: 0 } },
+  )
+  try {
+    for (const parents of [undefined, null, {}, [null], [{}], [{ sha: "invalid" }]]) {
+      setRequestUrlHandler(async () => ({
+        status: 200, text: "", headers: {},
+        json: [{ sha: commitSha, commit: { message: "test" },
+          ...(parents === undefined ? {} : { parents }) }],
+      }))
+      await assert.rejects(() => client.listCommits(), /parent/i)
+    }
+    setRequestUrlHandler(async () => ({
+      status: 200, text: "", headers: {},
+      json: [{ sha: commitSha, commit: { message: "root" }, parents: [] }],
+    }))
+    assert.deepEqual((await client.listCommits())[0]?.parentShas, [])
+  } finally {
+    setRequestUrlHandler(null)
+  }
+})
+
+test("D251 Git commit parser refuses missing or malformed parent evidence instead of fabricating an orphan", async () => {
+  const sha = "a".repeat(40)
+  const treeSha = "b".repeat(40)
+  const parentSha = "c".repeat(40)
+  const client = new GitHubClient(
+    { token: "token", owner: "owner", repo: "repo", branch: "main" },
+    { transportPolicy: { mutationSpacingMs: 0 } },
+  )
+  try {
+    for (const parents of [undefined, null, {}, [null], [{}],
+      [{ sha: "" }], [{ sha: "invalid-parent" }]]) {
+      setRequestUrlHandler(async () => ({
+        status: 200, text: "", headers: {},
+        json: { sha, tree: { sha: treeSha }, ...(parents === undefined ? {} : { parents }) },
+      }))
+      await assert.rejects(() => client.getGitCommit(sha), /parent/i)
+    }
+    setRequestUrlHandler(async () => ({
+      status: 200, text: "", headers: {},
+      json: { sha, tree: { sha: treeSha }, parents: [] },
+    }))
+    assert.deepEqual((await client.getGitCommit(sha)).parentShas, [])
+    setRequestUrlHandler(async () => ({
+      status: 200, text: "", headers: {},
+      json: { sha, tree: { sha: treeSha }, parents: [{ sha: parentSha }] },
+    }))
+    assert.deepEqual((await client.getGitCommit(sha)).parentShas, [parentSha])
   } finally {
     setRequestUrlHandler(null)
   }

@@ -27,6 +27,20 @@ import { readImmutableGitFile } from "./v4/immutable-git-read";
 const V4_BOOTSTRAP_PATH = ".obsidian-github-sync-v4/bootstrap";
 const GIT_COMMIT_SHA = /^[0-9a-f]{40}$/iu;
 
+function parseGitHubCommitParentShas(parents: unknown): string[] {
+  if (!Array.isArray(parents)) {
+    throw new Error("Invalid GitHub commit parent metadata.");
+  }
+  return parents.map((parent: unknown) => {
+    if (!parent || typeof parent !== "object" || Array.isArray(parent)
+      || !("sha" in parent) || typeof parent.sha !== "string"
+      || !GIT_COMMIT_SHA.test(parent.sha)) {
+      throw new Error("Invalid GitHub commit parent SHA.");
+    }
+    return parent.sha;
+  });
+}
+
 class GitHubTransportUnconfirmedError extends Error {
   constructor() {
     super("GitHub transport request failed; remote result is unconfirmed.");
@@ -322,7 +336,7 @@ export class GitHubClient {
       message: commit.commit?.message ?? "",
       authorName: commit.commit?.author?.name ?? "",
       authoredAt: commit.commit?.author?.date ?? "",
-      parentShas: (commit.parents ?? []).map(parent => parent.sha ?? "").filter(Boolean),
+      parentShas: parseGitHubCommitParentShas(commit.parents),
     }));
   }
 
@@ -508,13 +522,18 @@ export class GitHubClient {
       throw: false,
     });
     if (response.status !== 200) throw this.gitHttpError("Failed to get git commit", response.status);
-    const json = response.json as { sha?: string; message?: string; tree?: { sha?: string }; parents?: Array<{ sha?: string }> };
+    const json = response.json as { sha?: string; message?: string; tree?: { sha?: string }; parents?: Array<{ sha?: string }> } | null;
+    // Missing parent metadata must never be treated as evidence of an orphan.
+    if (!json || typeof json !== "object" || Array.isArray(json)) {
+      throw new Error("Invalid GitHub commit response.");
+    }
+    const parentShas = parseGitHubCommitParentShas(json.parents);
     // A mismatched or omitted immutable commit identity is not proof of the
     // requested commit's tree. Never infer remote-file absence from that body.
     if (GIT_COMMIT_SHA.test(sha) && json.sha !== sha) {
       throw new Error(`GitHub immutable commit identity mismatch (SHA): requested ${sha}, received ${String(json.sha)}.`);
     }
-    return { sha: json.sha ?? sha, treeSha: json.tree?.sha ?? "", parentShas: (json.parents ?? []).map(parent => parent.sha ?? "").filter(Boolean), message: json.message };
+    return { sha: json.sha ?? sha, treeSha: json.tree?.sha ?? "", parentShas, message: json.message };
   }
 
   async createGitBlob(content: Uint8Array | ArrayBuffer): Promise<string> {
