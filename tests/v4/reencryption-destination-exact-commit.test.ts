@@ -42,6 +42,8 @@ import { inspectV4ReencryptionColdStartJournalKey } from "../../src/lib/v4/reenc
 import { inspectV4ColdStartDestination } from "../../src/lib/v4/reencryption-cold-start-destination"
 import { inspectV4ColdStartWalDestination } from "../../src/lib/v4/reencryption-cold-start-wal-destination"
 import { inspectV4ColdStartCompleteRecovery } from "../../src/lib/v4/reencryption-cold-start-complete-recovery"
+import { inspectV4DesktopPluginCompleteRecovery, inspectV4MobilePluginCompleteRecovery } from "../../src/lib/v4/reencryption-plugin-complete-recovery"
+import { planV4PluginPrivateWalLocation } from "../../src/lib/v4/reencryption-plugin-wal-location"
 import { createV4ReencryptionRecoveryJournal } from "../../src/lib/v4/reencryption-recovery-journal"
 import { acquireV4DesktopRekeyWalStorage } from "../../src/lib/v4/reencryption-desktop-wal"
 import { openV4ExistingDesktopWalForRecovery } from "../../src/lib/v4/reencryption-desktop-wal-recovery"
@@ -2385,6 +2387,163 @@ test("D247 refuses a torn encrypted WAL and leaves both original-key Backup and 
   assert.equal(s.isHeld(), false)
   assert.deepEqual(s.walFiles, walBefore)
   assert.deepEqual(s.old.f.s.files, filesBefore)
+})
+
+test("D248 derives a real Desktop plugin-private WAL path and holds its OS recovery lock across D247", async () => {
+  const s = await d247Scenario()
+  await mkdir(path.join(process.cwd(), ".tmp"), { recursive: true })
+  const temporary = await mkdtemp(path.join(process.cwd(), ".tmp", "d248-owner-"))
+  const vault = path.join(temporary, "vault")
+  const configDir = ".obsidian"
+  const pluginId = "github-sync-d248"
+  const runId = s.contract.identity.runId
+  const layout = await planV4PluginPrivateWalLocation({ configDir, pluginId, runId })
+  const pluginRoot = path.join(vault, ...layout.pluginStorageRoot.split("/"))
+  await mkdir(pluginRoot, { recursive: true })
+  const physicalWal = path.join(pluginRoot, ...layout.journalRoot.split("/"))
+  let seeded: Awaited<ReturnType<typeof acquireV4DesktopRekeyWalStorage>> | undefined
+  try {
+    seeded = await acquireV4DesktopRekeyWalStorage({
+      rootAbsolute: pluginRoot, journalRoot: layout.journalRoot,
+      requireNewJournalRoot: true,
+    })
+    for (const [name, ciphertext] of s.walFiles) {
+      await seeded.adapter.write(layout.journalRoot + "/" + path.posix.basename(name), ciphertext)
+    }
+    const owner = {
+      adapter: {
+        getFullPath(location: string) {
+          return location ? path.join(vault, ...location.split("/")) : vault
+        },
+      },
+      configDir, pluginId, runId,
+      assertLiveOwner: s.input.backup.assertLiveOwner,
+    }
+    const evidence = {
+      owner, backup: s.input.backup, contract: s.contract,
+      destination: s.input.current.destination,
+      originalJournalKey: Uint8Array.from(s.input.current.wal.originalJournalKey),
+    }
+    const before = await Promise.all([readFile(path.join(physicalWal, "slot-0.json")),
+      readFile(path.join(physicalWal, "slot-1.json"))])
+    // A different OS-lock holder is still writing: a Recovery opener must
+    // NEVER reclaim or ignore that lock, even with both valid ciphertexts.
+    const competing = await inspectV4DesktopPluginCompleteRecovery(evidence)
+    assert.equal(competing.observation, "manual-recovery-required")
+    assert.equal(competing.resumeSyncAuthorized, false)
+    await seeded.release()
+    seeded = undefined
+    const result = await inspectV4DesktopPluginCompleteRecovery(evidence)
+    assert.equal(result.observation, "authenticated-complete-recovery-evidence-still-fenced")
+    assert.equal(result.completeOldBackupReverified, true)
+    assert.equal(result.walReceiptsBoundToDestination, true)
+    assert.equal(result.isolation, "desktop-os-cooperative-wal-lock")
+    assert.equal(result.mobileOsLockProven, false)
+    assert.equal(result.installedObsidianAcceptanceProven, false)
+    assert.equal(result.localCutoverAuthorized, false)
+    assert.equal(result.resumeSyncAuthorized, false)
+    const after = await Promise.all([readFile(path.join(physicalWal, "slot-0.json")),
+      readFile(path.join(physicalWal, "slot-1.json"))])
+    assert.deepEqual(after, before)
+    assert.deepEqual((await (await import("node:fs/promises")).readdir(physicalWal)).sort(),
+      ["slot-0.json", "slot-1.json"])
+    const wrong = await inspectV4DesktopPluginCompleteRecovery({
+      ...evidence, owner: { ...owner, runId: "not-the-saved-run" },
+    })
+    assert.equal(wrong.observation, "manual-recovery-required")
+    assert.equal(wrong.resumeSyncAuthorized, false)
+  } finally {
+    await seeded?.release()
+    await rm(temporary, { recursive: true, force: true })
+  }
+})
+
+test("D248 Mobile existing-only Adapter reads all D247 evidence under a separate cooperative lease, never OS authority", async () => {
+  const s = await d247Scenario()
+  const runId = s.contract.identity.runId
+  const configDir = ".obsidian"
+  const pluginId = "github-sync-d248-mobile"
+  const layout = await planV4PluginPrivateWalLocation({ configDir, pluginId, runId })
+  const directories = new Set<string>([
+    configDir, configDir + "/plugins", layout.pluginStorageRoot,
+    layout.pluginStorageRoot + "/reencryption-wal", layout.vaultLogicalWalRoot,
+  ])
+  const files = new Map<string, string>()
+  for (const [name, ciphertext] of s.walFiles) {
+    files.set(layout.vaultLogicalWalRoot + "/" + name.slice(name.lastIndexOf("/") + 1),
+      ciphertext)
+  }
+  let readCount = 0
+  const adapter = {
+    async stat(name: string) {
+      if (directories.has(name)) return { type: "folder" as const, size: 0, mtime: 5 }
+      const value = files.get(name)
+      return value === undefined ? null : {
+        type: "file" as const, size: enc(value).length, mtime: 5,
+      }
+    },
+    async list(name: string) {
+      if (!directories.has(name)) throw Error("missing Mobile folder")
+      const prefix = name + "/"
+      return {
+        files: [...files.keys()].filter(key => key.startsWith(prefix)
+          && !key.slice(prefix.length).includes("/")),
+        folders: [...directories].filter(key => key.startsWith(prefix)
+          && !key.slice(prefix.length).includes("/")),
+      }
+    },
+    async read(name: string) {
+      readCount++
+      const value = files.get(name)
+      if (value === undefined) throw Error("missing Mobile ciphertext")
+      return value
+    },
+  }
+  let held = false
+  let leaseCount = 0
+  const owner = { adapter, configDir, pluginId, runId,
+    assertLiveOwner: s.input.backup.assertLiveOwner }
+  const evidence = {
+    owner, backup: s.input.backup, contract: s.contract,
+    destination: s.input.current.destination,
+    originalJournalKey: Uint8Array.from(s.input.current.wal.originalJournalKey),
+    withExclusiveCooperativeRecoveryLease: async <T>(body: () => Promise<T>): Promise<T> => {
+      if (held) throw Error("reentrant Mobile recovery lease")
+      held = true
+      leaseCount++
+      try { return await body() }
+      finally { held = false }
+    },
+    assertCooperativeRecoveryLease: async () => {
+      if (!held) throw Error("Mobile recovery lease lost")
+    },
+  }
+  const before = new Map(files)
+  const result = await inspectV4MobilePluginCompleteRecovery(evidence)
+  assert.equal(result.observation, "authenticated-complete-recovery-evidence-still-fenced")
+  assert.equal(result.isolation, "mobile-cooperative-best-effort-only")
+  assert.equal(result.mobileOsLockProven, false)
+  assert.equal(result.installedObsidianAcceptanceProven, false)
+  assert.equal(result.powerLossDurabilityProven, false)
+  assert.equal(result.localCutoverAuthorized, false)
+  assert.equal(result.resumeSyncAuthorized, false)
+  assert.equal(held, false)
+  assert.equal(leaseCount, 1)
+  assert.ok(readCount > 8)
+  assert.deepEqual(files, before)
+  const cooperativeLease = evidence.assertCooperativeRecoveryLease
+  evidence.assertCooperativeRecoveryLease = async () => {
+    throw Error("cooperative lease was revoked")
+  }
+  const revoked = await inspectV4MobilePluginCompleteRecovery(evidence)
+  assert.equal(revoked.observation, "manual-recovery-required")
+  assert.deepEqual(files, before)
+  evidence.assertCooperativeRecoveryLease = cooperativeLease
+  files.set(layout.vaultLogicalWalRoot + "/slot-0.json", "{torn")
+  const failed = await inspectV4MobilePluginCompleteRecovery(evidence)
+  assert.equal(failed.observation, "manual-recovery-required")
+  assert.equal(failed.localCutoverAuthorized, false)
+  assert.equal(files.get(layout.vaultLogicalWalRoot + "/slot-0.json"), "{torn")
 })
 
 test("D240 independently recovered Backup key and saved Cutover Contract bind to one exact D239 input", async () => {
