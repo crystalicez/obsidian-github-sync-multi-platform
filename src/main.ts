@@ -204,7 +204,9 @@ export default class FastSync extends Plugin {
             }
             new Notice(
               backup.destinationCiphertextReceiptsReverified
-                ? "GitHub Sync: Old key, Frozen Backup and AES-GCM WAL authenticated; Destination Git blobs match listed WAL SHA-1/size receipts. New-key plaintext, complete Recovery and Cutover are UNVERIFIED. Sync stays paused."
+                ? (backup.destinationNewKeyHeadAuthenticated && backup.sourceShadowSnapshotsReverified
+                  ? "GitHub Sync: Old Backup, AES-GCM WAL and listed Destination Git ciphertext receipts verified; Source/Shadow snapshots match and new-key Destination HEAD decrypted. File plaintext, full Recovery and Cutover are UNVERIFIED. Sync stays paused."
+                  : "GitHub Sync: Old key, Frozen Backup and AES-GCM WAL authenticated; Destination Git blobs match WAL SHA-1/size receipts only. New-key HEAD and full Recovery are UNVERIFIED. Sync stays paused.")
                 : "GitHub Sync: Original key, Frozen Backup and AES-GCM WAL authenticated; no nonempty Destination ciphertext receipt proof. Complete Recovery remains unverified. Sync stays paused.",
               12000,
             )

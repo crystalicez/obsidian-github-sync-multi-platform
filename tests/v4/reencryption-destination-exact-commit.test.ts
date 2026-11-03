@@ -2239,6 +2239,97 @@ async function d247Scenario() {
   }
 }
 
+test("D254 reconstructs pinned Source/Shadow snapshots and decrypts new-key Destination HEAD without Cutover", async () => {
+  const s = await d247Scenario()
+  const walEvidence = {
+    root: s.input.current.wal.root, adapter: s.input.current.wal.adapter,
+    destinationGit: s.input.current.destination.destinationGit,
+  }
+  const filesBefore = new Map(s.old.f.s.files)
+  const secretsBefore = new Map(s.old.f.s.secrets)
+  const writesBefore = s.old.f.s.getWrites()
+  const report = await inspectV4ReencryptionColdStartJournalKey({ ...s.old.input, walEvidence })
+  assert.equal(report.observation, "authenticated-local-route-still-fenced")
+  assert.equal(report.coldStartWalReverified, true)
+  assert.equal(report.destinationCiphertextReceiptsReverified, true)
+  assert.equal(report.sourceShadowSnapshotsReverified, true)
+  assert.equal(report.destinationNewKeyHeadAuthenticated, true)
+  assert.equal(report.completeDestinationContentsReverified, false)
+  assert.equal(report.resumeSyncAuthorized, false)
+  assert.equal(report.localCutoverAuthorized, false)
+  assert.deepEqual(s.old.f.s.files, filesBefore)
+  assert.deepEqual(s.old.f.s.secrets, secretsBefore)
+  assert.equal(s.old.f.s.getWrites(), writesBefore)
+
+  const shadowFile = s.contract.identity.indexRoot + "-rekey-" + s.contract.identity.runId + "/index.json"
+  s.old.f.s.files.set(shadowFile, "{torn-shadow")
+  const corrupted = await inspectV4ReencryptionColdStartJournalKey({ ...s.old.input, walEvidence })
+  assert.equal(corrupted.observation, "manual-recovery-required")
+  assert.equal(corrupted.sourceShadowSnapshotsReverified, false)
+  assert.equal(corrupted.destinationNewKeyHeadAuthenticated, false)
+  s.old.f.s.files.set(shadowFile, filesBefore.get(shadowFile)!)
+  assert.deepEqual(s.old.f.s.files, filesBefore)
+})
+
+test("D254 refuses Shadow mutation while the new-key Git HEAD is being checked", async () => {
+  const s = await d247Scenario()
+  const git = s.input.current.destination.destinationGit
+  const walEvidence = {
+    root: s.input.current.wal.root, adapter: s.input.current.wal.adapter,
+    destinationGit: git,
+  }
+  const shadowFile = s.contract.identity.indexRoot + "-rekey-" + s.contract.identity.runId + "/index.json"
+  const before = new Map(s.old.f.s.files)
+  const originalRef = git.getGitRef
+  let refReads = 0
+  const beforeWrites = s.old.f.s.getWrites()
+  try {
+    git.getGitRef = async () => {
+      const result = await originalRef()
+      refReads++
+      if (refReads === 3) s.old.f.s.files.set(shadowFile, "{changed-while-reading-git")
+      return result
+    }
+    const report = await inspectV4ReencryptionColdStartJournalKey({ ...s.old.input, walEvidence })
+    assert.ok(refReads >= 3, "test must reach the D254 Git metadata scan")
+    assert.equal(report.observation, "manual-recovery-required")
+    assert.equal(report.sourceShadowSnapshotsReverified, false)
+    assert.equal(report.destinationNewKeyHeadAuthenticated, false)
+    assert.equal(report.resumeSyncAuthorized, false)
+    assert.equal(report.remoteWritesAuthorized, false)
+    assert.equal(s.old.f.s.files.get(shadowFile), "{changed-while-reading-git")
+    assert.equal(s.old.f.s.getWrites(), beforeWrites)
+  } finally {
+    git.getGitRef = originalRef
+    s.old.f.s.files.set(shadowFile, before.get(shadowFile)!)
+  }
+  assert.deepEqual(s.old.f.s.files, before)
+})
+
+test("D254 denies wrong new passphrase without changing WAL, Shadow or SecretStorage", async () => {
+  const s = await d247Scenario()
+  const walEvidence = {
+    root: s.input.current.wal.root, adapter: s.input.current.wal.adapter,
+    destinationGit: s.input.current.destination.destinationGit,
+  }
+  const secret = s.contract.identity.destinationPassphraseSecretId
+  const old = s.old.f.s.secrets.get(secret)
+  assert.ok(old)
+  s.old.f.s.secrets.set(secret, "not-the-actual-destination-passphrase")
+  const beforeFiles = new Map(s.old.f.s.files)
+  const beforeSecrets = new Map(s.old.f.s.secrets)
+  const beforeWal = new Map(s.walFiles)
+  const writesBefore = s.old.f.s.getWrites()
+  const refused = await inspectV4ReencryptionColdStartJournalKey({ ...s.old.input, walEvidence })
+  assert.equal(refused.observation, "manual-recovery-required")
+  assert.equal(refused.destinationNewKeyHeadAuthenticated, false)
+  assert.equal(refused.resumeSyncAuthorized, false)
+  assert.deepEqual(s.old.f.s.files, beforeFiles)
+  assert.deepEqual(s.old.f.s.secrets, beforeSecrets)
+  assert.deepEqual(s.walFiles, beforeWal)
+  assert.equal(s.old.f.s.getWrites(), writesBefore)
+})
+
 test("D253 binds old-key authenticated WAL receipt bytes to pinned Destination commit without granting recovery", async () => {
   const s = await d247Scenario()
   const git = s.input.current.destination.destinationGit
@@ -2753,6 +2844,8 @@ test("D248/D250/D252 verifies Desktop WAL lock, installed physical readback and 
         assert.equal(authenticated?.completeBackupContentsReverified, true)
         assert.equal(authenticated?.coldStartWalReverified, true)
         assert.equal(authenticated?.destinationCiphertextReceiptsReverified, true)
+        assert.equal(authenticated?.sourceShadowSnapshotsReverified, true)
+        assert.equal(authenticated?.destinationNewKeyHeadAuthenticated, true)
         assert.equal(authenticated?.completeDestinationContentsReverified, false)
         assert.equal(authenticated?.resumeSyncAuthorized, false)
         assert.equal(authenticated?.localCutoverAuthorized, false)
@@ -2919,6 +3012,8 @@ test("D248/D250/D252 Mobile existing WAL and installed old-key authentication re
       assert.equal(authenticated?.observation, "authenticated-local-route-still-fenced")
       assert.equal(authenticated?.coldStartWalReverified, true)
       assert.equal(authenticated?.destinationCiphertextReceiptsReverified, true)
+      assert.equal(authenticated?.sourceShadowSnapshotsReverified, true)
+      assert.equal(authenticated?.destinationNewKeyHeadAuthenticated, true)
       assert.equal(authenticated?.completeBackupContentsReverified, true)
       assert.equal(authenticated?.completeDestinationContentsReverified, false)
       assert.equal(authenticated?.resumeSyncAuthorized, false)

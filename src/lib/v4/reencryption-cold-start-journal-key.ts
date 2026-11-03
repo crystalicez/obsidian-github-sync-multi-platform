@@ -18,6 +18,7 @@ import {
   inspectV4ColdStartWalSnapshot,
   type V4ColdStartWalSnapshotInput,
 } from "./reencryption-cold-start-wal-snapshot"
+import { inspectV4ColdStartDestinationMetadata } from "./reencryption-cold-start-destination-metadata"
 
 const SHA = /^[0-9a-f]{40}$/u
 type BackupGit = Pick<GitHubClient,
@@ -56,6 +57,8 @@ export interface V4ReencryptionColdStartJournalReport {
   readonly completeDestinationContentsReverified: false
   readonly coldStartWalReverified: boolean
   readonly destinationCiphertextReceiptsReverified: boolean
+  readonly sourceShadowSnapshotsReverified: boolean
+  readonly destinationNewKeyHeadAuthenticated: boolean
   readonly commitDecisionAuthorized: false
   readonly localCutoverAuthorized: false
   readonly resumeSyncAuthorized: false
@@ -70,6 +73,8 @@ const BASE = Object.freeze({
   completeDestinationContentsReverified: false as const,
   coldStartWalReverified: false as const,
   destinationCiphertextReceiptsReverified: false as const,
+  sourceShadowSnapshotsReverified: false as const,
+  destinationNewKeyHeadAuthenticated: false as const,
   commitDecisionAuthorized: false as const,
   localCutoverAuthorized: false as const, resumeSyncAuthorized: false as const,
   rollbackAuthorized: false as const, remoteWritesAuthorized: false as const,
@@ -289,6 +294,8 @@ export async function inspectV4ReencryptionColdStartJournalKey(
 
     let walReverified = false
     let destinationCiphertextReceiptsReverified = false
+    let sourceShadowSnapshotsReverified = false
+    let destinationNewKeyHeadAuthenticated = false
     if (walEvidence) {
       // Only the independently authenticated old key can decrypt both
       // existing WAL slots. The owner must separately establish physical
@@ -307,6 +314,27 @@ export async function inspectV4ReencryptionColdStartJournalKey(
         || !wal.walSnapshotAuthenticated || !wal.walMatchesCutoverContract) return MANUAL
       walReverified = true
       destinationCiphertextReceiptsReverified = wal.destinationCiphertextReceiptsReverified
+      if (walDestinationGit && destinationCiphertextReceiptsReverified) {
+        // D253 proves only immutable ciphertext receipts. D254 additionally
+        // validates real Source/Shadow snapshots and decrypts the new-key HEAD.
+        const metadata = await inspectV4ColdStartDestinationMetadata({
+          contract, adapter, destinationGit: walDestinationGit,
+          expectedPhysicalRepositoryId: physical.id,
+          destinationPassphrase, assertLiveOwner: check,
+        })
+        check()
+        if (!metadata) return MANUAL
+        const afterMetadata = await inspectV4ColdStartWalSnapshot({
+          adapter: walEvidence.adapter, root: walEvidence.root,
+          contract, originalJournalKey: keyring.journalKey,
+          assertLiveOwner: check,
+        })
+        check()
+        if (!afterMetadata.walSnapshotAuthenticated
+          || !afterMetadata.walMatchesCutoverContract) return MANUAL
+        sourceShadowSnapshotsReverified = true
+        destinationNewKeyHeadAuthenticated = true
+      }
     }
 
     const finalRoute = await inspectV4ReencryptionColdStartIndexRoute({
@@ -339,6 +367,8 @@ export async function inspectV4ReencryptionColdStartJournalKey(
       completeBackupContentsReverified: true,
       coldStartWalReverified: walReverified,
       destinationCiphertextReceiptsReverified,
+      sourceShadowSnapshotsReverified,
+      destinationNewKeyHeadAuthenticated,
     })
   } catch {
     return MANUAL
