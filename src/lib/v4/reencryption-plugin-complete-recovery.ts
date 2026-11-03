@@ -3,14 +3,11 @@ import { inspectV4ColdStartCompleteRecovery } from "./reencryption-cold-start-co
 import { openV4DesktopPluginWalForRecovery, type V4DesktopPluginWalOwner } from "./reencryption-desktop-plugin-wal-recovery"
 import { openV4MobilePluginWalForRecovery, type V4MobilePluginWalOwner } from "./reencryption-mobile-wal-recovery"
 import { planV4PluginPrivateWalLocation } from "./reencryption-plugin-wal-location"
+import { tryReserveV4MobileRecoveryAdapter } from "./reencryption-mobile-recovery-reservation"
 
 type Backup = V4ColdStartCompleteRecoveryInput["backup"]
 type Current = V4ColdStartCompleteRecoveryInput["current"]
 
-// Mobile offers no OS WAL lock. Deny overlapping read-only Recovery attempts
-// in this JavaScript process even if an injected cooperative holder is faulty.
-// Key by the actual vault adapter, not a cloneable owner/run wrapper.
-const activeMobileRecoveryAdapters = new WeakSet<object>()
 
 interface V4PluginRecoveryEvidence {
   /** Must be the installed plugin's actual Index and persisted Settings. */
@@ -187,7 +184,7 @@ export async function inspectV4MobilePluginCompleteRecovery(
   input: V4MobilePluginCompleteRecoveryInput,
 ): Promise<V4PluginCompleteRecoveryReport> {
   const isolation = "mobile-cooperative-best-effort-only"
-  let reservedAdapter: object | undefined
+  let releaseMobileReservation: (() => void) | undefined
   try {
     const { owner, backup, contract, destination, originalJournalKey,
       withExclusiveCooperativeRecoveryLease: holder,
@@ -195,15 +192,14 @@ export async function inspectV4MobilePluginCompleteRecovery(
     checkEvidence(input, owner)
     if (typeof holder !== "function" || typeof lease !== "function") return manual(isolation)
     const adapter = owner.adapter
-    if (!adapter || typeof adapter !== "object" || activeMobileRecoveryAdapters.has(adapter)) {
-      return manual(isolation)
-    }
+    if (!adapter || typeof adapter !== "object") return manual(isolation)
+    const release = tryReserveV4MobileRecoveryAdapter(adapter)
+    if (!release) return manual(isolation)
+    releaseMobileReservation = release
     const { configDir, pluginId, runId, assertLiveOwner } = owner
     const nativeMethods = {
       stat: adapter.stat, list: adapter.list, read: adapter.read,
     }
-    activeMobileRecoveryAdapters.add(adapter)
-    reservedAdapter = adapter
     const reader = await openV4MobilePluginWalForRecovery(owner)
     const pinned = () => {
       checkEvidence(input, owner)
@@ -249,6 +245,6 @@ export async function inspectV4MobilePluginCompleteRecovery(
   } catch {
     return manual(isolation)
   } finally {
-    if (reservedAdapter) activeMobileRecoveryAdapters.delete(reservedAdapter)
+    releaseMobileReservation?.()
   }
 }

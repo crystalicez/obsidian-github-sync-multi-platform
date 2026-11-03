@@ -3746,6 +3746,70 @@ test("D248/D250/D252/D260/D262 Mobile existing WAL, one-owner proof and in-proce
         releasePausedRead?.()
         otherRuntime.dispose()
       }
+      const originalHelperHolder = evidence.withExclusiveCooperativeRecoveryLease
+      let signalHelperHeld: (() => void) | undefined
+      let releaseHelperHeld: (() => void) | undefined
+      const helperHeld = new Promise<void>(resolve => { signalHelperHeld = resolve })
+      const helperUnblocked = new Promise<void>(resolve => { releaseHelperHeld = resolve })
+      evidence.withExclusiveCooperativeRecoveryLease = async <T>(body: () => Promise<T>) =>
+        originalHelperHolder(async () => {
+          signalHelperHeld?.()
+          await helperUnblocked
+          return body()
+        })
+      const heldHelper = inspectV4MobilePluginCompleteRecovery(evidence)
+      try {
+        await helperHeld
+        const runtimeWhileHelperHeld = await runtime.verifyFencedReencryptionAuthenticatedWal()
+        assert.equal(runtimeWhileHelperHeld, null,
+          "installed Mobile runtime must refuse the same adapter while D248 complete recovery holds it")
+      } finally {
+        releaseHelperHeld?.()
+        const helperCompleted = await heldHelper
+        evidence.withExclusiveCooperativeRecoveryLease = originalHelperHolder
+        assert.equal(helperCompleted.observation,
+          "authenticated-complete-recovery-evidence-still-fenced")
+        assert.equal(helperCompleted.resumeSyncAuthorized, false)
+      }
+      const unchangedRuntimeRead = adapter.read
+      let pauseRuntimeAtContract = true
+      let signalRuntimeHeld: (() => void) | undefined
+      let releaseRuntimeHeld: (() => void) | undefined
+      const runtimeHeld = new Promise<void>(resolve => { signalRuntimeHeld = resolve })
+      const runtimeUnblocked = new Promise<void>(resolve => { releaseRuntimeHeld = resolve })
+      adapter.read = async name => {
+        const value = await unchangedRuntimeRead(name)
+        if (pauseRuntimeAtContract && name.endsWith("/contract.json")) {
+          pauseRuntimeAtContract = false
+          signalRuntimeHeld?.()
+          await runtimeUnblocked
+        }
+        return value
+      }
+      const heldRuntimeDiagnostic = runtime.verifyFencedReencryptionAuthenticatedWal()
+      try {
+        await runtimeHeld
+        const helperWhileRuntimeHeld = await inspectV4MobilePluginCompleteRecovery(evidence)
+        assert.equal(helperWhileRuntimeHeld.observation, "manual-recovery-required",
+          "D248 complete Mobile recovery must refuse an installed Runtime holding the same adapter")
+        assert.equal(helperWhileRuntimeHeld.completeDestinationContentsReverified, false)
+        assert.equal(helperWhileRuntimeHeld.resumeSyncAuthorized, false)
+      } finally {
+        releaseRuntimeHeld?.()
+        try {
+          const runtimeCompleted = await heldRuntimeDiagnostic
+          assert.equal(runtimeCompleted?.observation, "authenticated-local-route-still-fenced")
+          assert.equal(runtimeCompleted?.resumeSyncAuthorized, false)
+        } finally {
+          adapter.read = unchangedRuntimeRead
+        }
+      }
+      const helperAfterRuntime = await inspectV4MobilePluginCompleteRecovery(evidence)
+      assert.equal(helperAfterRuntime.observation,
+        "authenticated-complete-recovery-evidence-still-fenced",
+        "both Mobile diagnostic entrypoints must release their adapter reservations")
+      assert.equal(helperAfterRuntime.resumeSyncAuthorized, false)
+      assert.deepEqual(files, before, "cross-entrypoint overlap must leave original WAL unchanged")
     } finally {
       methods.forEach((name, i) => { prototype[name] = originals[i]! })
     }
