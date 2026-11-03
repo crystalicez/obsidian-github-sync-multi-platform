@@ -197,13 +197,15 @@ export default class FastSync extends Plugin {
             if (!backup?.originalKeyAuthenticated || !backup.completeBackupContentsReverified
               || !backup.coldStartWalReverified) {
               new Notice(
-                "GitHub Sync: Frozen Backup and encrypted WAL could not both be authenticated. Full Recovery unverified; keep both passphrases and review Manual Recovery. Sync stays paused.",
+                "GitHub Sync: Frozen Backup, encrypted WAL and Destination ciphertext receipt verification is incomplete. Full Recovery unverified; keep both passphrases and review Manual Recovery. Sync stays paused.",
                 12000,
               )
               return
             }
             new Notice(
-              "GitHub Sync: Original key, complete Frozen Backup and encrypted WAL snapshot authenticated. Destination contents and full Recovery remain UNVERIFIED; Sync stays paused.",
+              backup.destinationCiphertextReceiptsReverified
+                ? "GitHub Sync: Old key, Frozen Backup and AES-GCM WAL authenticated; Destination Git blobs match listed WAL SHA-1/size receipts. New-key plaintext, complete Recovery and Cutover are UNVERIFIED. Sync stays paused."
+                : "GitHub Sync: Original key, Frozen Backup and AES-GCM WAL authenticated; no nonempty Destination ciphertext receipt proof. Complete Recovery remains unverified. Sync stays paused.",
               12000,
             )
             const refs = await this.v4Runtime.inspectFencedReencryptionCandidateGitRefs()

@@ -428,6 +428,20 @@ export class V4PluginRuntime {
       const raw: unknown = JSON.parse(rawText)
       const runId = (raw as { runId?: unknown } | null)?.runId
       if (typeof runId !== "string" || !/^[A-Za-z0-9_-]{8,128}$/u.test(runId)) return null
+      const contractText = await this.adapter.read(
+        V4_INDEX_ROOT + "-rekey-cutover-candidate-" + runId + "/contract.json",
+      )
+      checkOwner()
+      const candidate = decodeV4ReencryptionCutoverCandidateManifest(contractText)
+      const destination = candidate.identity.destinationRepoId
+      const destinationPrefix = pinned.owner + "/" + pinned.repo + "#"
+      const destinationBranch = destination.startsWith(destinationPrefix)
+        ? destination.slice(destinationPrefix.length) : ""
+      if (candidate.identity.runId !== runId || !destinationBranch
+        || !pinned.token || !pinned.owner || !pinned.repo) return null
+      const destinationGit = new GitHubClient({
+        token: pinned.token, owner: pinned.owner, repo: pinned.repo, branch: destinationBranch,
+      })
       const layout = await planV4PluginPrivateWalLocation({ configDir, pluginId, runId })
       checkOwner()
       if (desktop) {
@@ -439,7 +453,7 @@ export class V4PluginRuntime {
         try {
           await reader.assertExclusiveStageLease()
           const result = await this.verifyFencedReencryptionOriginalKeyWithWal({
-            adapter: reader.adapter, root: layout.journalRoot,
+            adapter: reader.adapter, root: layout.journalRoot, destinationGit,
           })
           checkOwner()
           await reader.assertBestEffortCheckpoint()
@@ -454,7 +468,7 @@ export class V4PluginRuntime {
       })
       checkOwner()
       const result = await this.verifyFencedReencryptionOriginalKeyWithWal({
-        adapter: reader.adapter, root: reader.journalRoot,
+        adapter: reader.adapter, root: reader.journalRoot, destinationGit,
       })
       checkOwner()
       return result

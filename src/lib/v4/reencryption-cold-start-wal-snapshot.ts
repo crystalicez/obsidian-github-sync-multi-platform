@@ -7,6 +7,10 @@ import {
   type V4ReencryptionCutoverSnapshotContract,
 } from "./reencryption-cutover-snapshot-contract"
 import { matchesV4ReencryptionPreparedWal } from "./reencryption-proposed-commit-receipt"
+import {
+  inspectV4WalReceiptDestinationCiphertexts,
+  type V4WalReceiptDestinationReadback,
+} from "./reencryption-cold-start-receipt-ciphertexts"
 
 const MAX_SLOT_TEXT = 2 * 1024 * 1024
 
@@ -37,6 +41,11 @@ export interface V4ColdStartWalSnapshotInput {
   readonly originalJournalKey: Uint8Array
   /** When provided, require an exact set match with authenticated WAL ciphertext receipts. */
   readonly expectedReceipts?: readonly V4ReencryptionObjectReceipt[]
+  /**
+   * Optional D253: compare AUTHENTICATED WAL ciphertext receipt bytes
+   * against the exact immutable Destination commit; NOT full contents/crypto.
+   */
+  readonly destinationCiphertextReadback?: V4WalReceiptDestinationReadback
   /** Validates the current plugin/vault owner at every awaited boundary. */
   readonly assertLiveOwner: () => void
 }
@@ -46,6 +55,7 @@ export interface V4ColdStartWalSnapshotReport {
   readonly observation: "authenticated-current-wal-still-fenced" | "manual-recovery-required"
   readonly walSnapshotAuthenticated: boolean
   readonly walMatchesCutoverContract: boolean
+  readonly destinationCiphertextReceiptsReverified: boolean
   readonly bestEffortReadbackOnly: true
   readonly commitDecisionAuthorized: false
   readonly localCutoverAuthorized: false
@@ -58,6 +68,7 @@ export interface V4ColdStartWalSnapshotReport {
 const BASE = Object.freeze({
   integrityScope: "read-only-encrypted-wal-and-exact-cutover-contract" as const,
   bestEffortReadbackOnly: true as const,
+  destinationCiphertextReceiptsReverified: false as const,
   commitDecisionAuthorized: false as const,
   localCutoverAuthorized: false as const,
   resumeSyncAuthorized: false as const,
@@ -85,7 +96,8 @@ export async function inspectV4ColdStartWalSnapshot(
   let key: Uint8Array | undefined
   let originalKey: Uint8Array | undefined
   try {
-    const { adapter, root, contract, originalJournalKey, expectedReceipts, assertLiveOwner } = input
+    const { adapter, root, contract, originalJournalKey, expectedReceipts,
+      destinationCiphertextReadback, assertLiveOwner } = input
     if (!adapter || typeof adapter.exists !== "function" || typeof adapter.read !== "function"
       || typeof assertLiveOwner !== "function"
       || !(originalJournalKey instanceof Uint8Array)
@@ -104,6 +116,7 @@ export async function inspectV4ColdStartWalSnapshot(
       if (input.adapter !== adapter || input.root !== root || input.contract !== contract
         || input.originalJournalKey !== originalJournalKey
         || input.expectedReceipts !== expectedReceipts
+        || input.destinationCiphertextReadback !== destinationCiphertextReadback
         || JSON.stringify(expectedReceipts) !== receiptText
         || input.assertLiveOwner !== assertLiveOwner
         || adapter.read !== read || adapter.exists !== exists
@@ -164,7 +177,20 @@ export async function inspectV4ColdStartWalSnapshot(
       || await sha256Hex(utf8ToBytes(JSON.stringify(second))) !== contract.walSnapshotSha256
       || JSON.stringify(await capture()) !== JSON.stringify(before)) return MANUAL
     check()
-    return OBSERVED
+    if (!destinationCiphertextReadback || first.receipts.length === 0) return OBSERVED
+    if (!await inspectV4WalReceiptDestinationCiphertexts({
+      contract, receipts: first.receipts, readback: destinationCiphertextReadback,
+      assertLiveOwner: check,
+    })) return MANUAL
+    check()
+    // An awaited Git scan gives a cooperating WAL writer time to advance.
+    // Reauthenticate after the scan; stale receipt bytes are never success.
+    const afterGit = await journal.assertHealthySnapshot(contract.identity.walGeneration)
+    check()
+    if (JSON.stringify(afterGit) !== JSON.stringify(first)
+      || JSON.stringify(await capture()) !== JSON.stringify(before)) return MANUAL
+    check()
+    return Object.freeze({ ...OBSERVED, destinationCiphertextReceiptsReverified: true })
   } catch {
     return MANUAL
   } finally {

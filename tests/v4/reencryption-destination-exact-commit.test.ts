@@ -2239,6 +2239,97 @@ async function d247Scenario() {
   }
 }
 
+test("D253 binds old-key authenticated WAL receipt bytes to pinned Destination commit without granting recovery", async () => {
+  const s = await d247Scenario()
+  const git = s.input.current.destination.destinationGit
+  const walEvidence = {
+    root: s.input.current.wal.root,
+    adapter: s.input.current.wal.adapter,
+    destinationGit: git,
+  }
+  assert.ok(s.input.current.destination.remote.expectedReceipts.length > 0)
+  const beforeWal = new Map(s.walFiles)
+  const beforeFiles = new Map(s.old.f.s.files)
+  const beforeSecrets = new Map(s.old.f.s.secrets)
+  const beforeWrites = s.old.f.s.getWrites()
+  const good = await inspectV4ReencryptionColdStartJournalKey({ ...s.old.input, walEvidence })
+  assert.equal(good.observation, "authenticated-local-route-still-fenced")
+  assert.equal(good.coldStartWalReverified, true)
+  assert.equal(good.destinationCiphertextReceiptsReverified, true)
+  assert.equal(good.completeDestinationContentsReverified, false)
+  assert.equal(good.resumeSyncAuthorized, false)
+  assert.equal(good.localCutoverAuthorized, false)
+  assert.equal(good.remoteWritesAuthorized, false)
+  assert.deepEqual(s.walFiles, beforeWal)
+  assert.deepEqual(s.old.f.s.files, beforeFiles)
+  assert.deepEqual(s.old.f.s.secrets, beforeSecrets)
+  assert.equal(s.old.f.s.getWrites(), beforeWrites)
+  const getBlob = git.getBlob
+  git.getBlob = async (sha: string) => {
+    const bytes = await getBlob(sha)
+    const altered = Uint8Array.from(bytes)
+    if (altered.length) altered[0] ^= 0xff
+    return altered
+  }
+  try {
+    const corrupt = await inspectV4ReencryptionColdStartJournalKey({ ...s.old.input, walEvidence })
+    assert.equal(corrupt.observation, "manual-recovery-required")
+    assert.equal(corrupt.destinationCiphertextReceiptsReverified, false)
+    assert.equal(corrupt.resumeSyncAuthorized, false)
+    assert.deepEqual(s.walFiles, beforeWal)
+    assert.deepEqual(s.old.f.s.files, beforeFiles)
+  } finally {
+    git.getBlob = getBlob
+  }
+})
+
+test("D253 refuses WAL mutation during Destination ciphertext scan and changed ref on second observation", async () => {
+  const s = await d247Scenario()
+  const git = s.input.current.destination.destinationGit
+  const root = s.input.current.wal.root
+  const walEvidence = { root, adapter: s.input.current.wal.adapter, destinationGit: git }
+  const originalBlob = git.getBlob
+  const originalRef = git.getGitRef
+  const slot = root + "/slot-" + (s.contract.identity.walGeneration % 2) + ".json"
+  const slotText = s.walFiles.get(slot)!
+  let changed = false
+  const beforeFiles = new Map(s.old.f.s.files)
+  try {
+    git.getBlob = async sha => {
+      const bytes = await originalBlob(sha)
+      if (!changed) {
+        changed = true
+        s.walFiles.set(slot, "{interrupted-during-git-read")
+      }
+      return bytes
+    }
+    const raced = await inspectV4ReencryptionColdStartJournalKey({ ...s.old.input, walEvidence })
+    assert.equal(changed, true)
+    assert.equal(raced.observation, "manual-recovery-required")
+    assert.equal(raced.destinationCiphertextReceiptsReverified, false)
+    assert.equal(raced.localCutoverAuthorized, false)
+    assert.equal(s.walFiles.get(slot), "{interrupted-during-git-read")
+    s.walFiles.set(slot, slotText)
+    git.getBlob = originalBlob
+    let refReads = 0
+    git.getGitRef = async () => {
+      const ref = await originalRef()
+      refReads++
+      return refReads > 1 ? { ...ref, sha: "9".repeat(40) } : ref
+    }
+    const moved = await inspectV4ReencryptionColdStartJournalKey({ ...s.old.input, walEvidence })
+    assert.ok(refReads >= 2)
+    assert.equal(moved.observation, "manual-recovery-required")
+    assert.equal(moved.destinationCiphertextReceiptsReverified, false)
+    assert.equal(moved.resumeSyncAuthorized, false)
+    assert.deepEqual(s.old.f.s.files, beforeFiles)
+  } finally {
+    git.getBlob = originalBlob
+    git.getGitRef = originalRef
+    s.walFiles.set(slot, slotText)
+  }
+})
+
 test("D252 original-key full Backup proof authenticates saved encrypted WAL, refuses torn slot without any writes", async () => {
   const s = await d247Scenario()
   const walEvidence = { root: s.input.current.wal.root, adapter: s.input.current.wal.adapter }
@@ -2639,18 +2730,21 @@ test("D248/D250/D252 verifies Desktop WAL lock, installed physical readback and 
         "getRepositoryIdentity", "getRepositoryDefaultBranch", "getGitRef",
         "getGitCommit", "getTreeAt", "getBlob",
       ] as const
-      type Stub = (...args: never[]) => Promise<unknown>
+      type Stub = (this: GitHubClient, ...args: never[]) => Promise<unknown>
       const prototype = GitHubClient.prototype as unknown as Record<string, Stub>
       const originalMethods = methods.map(name => prototype[name]!)
       const backupGit = s.old.input.backupGit as unknown as Record<string, Stub>
+      const destinationGit = s.input.current.destination.destinationGit as unknown as Record<string, Stub>
+      const backupBranch = s.contract.identity.backupRepoId.split("#")[1]
       let drift = false
       try {
         for (const name of methods) {
-          prototype[name] = (...args: never[]) => {
+          prototype[name] = function (this: GitHubClient, ...args: never[]) {
             if (name === "getRepositoryIdentity" && drift) {
               settings["githubBranch"] = "changed-after-opening-wal"
             }
-            return backupGit[name]!(...args)
+            const selected = this.branchName === backupBranch ? backupGit : destinationGit
+            return selected[name]!.call(selected as never, ...args)
           }
         }
         const authenticated = await runtime.verifyFencedReencryptionAuthenticatedWal()
@@ -2658,6 +2752,7 @@ test("D248/D250/D252 verifies Desktop WAL lock, installed physical readback and 
         assert.equal(authenticated?.originalKeyAuthenticated, true)
         assert.equal(authenticated?.completeBackupContentsReverified, true)
         assert.equal(authenticated?.coldStartWalReverified, true)
+        assert.equal(authenticated?.destinationCiphertextReceiptsReverified, true)
         assert.equal(authenticated?.completeDestinationContentsReverified, false)
         assert.equal(authenticated?.resumeSyncAuthorized, false)
         assert.equal(authenticated?.localCutoverAuthorized, false)
@@ -2807,15 +2902,23 @@ test("D248/D250/D252 Mobile existing WAL and installed old-key authentication re
       "getRepositoryIdentity", "getRepositoryDefaultBranch", "getGitRef",
       "getGitCommit", "getTreeAt", "getBlob",
     ] as const
-    type Stub = (...args: never[]) => Promise<unknown>
+    type Stub = (this: GitHubClient, ...args: never[]) => Promise<unknown>
     const prototype = GitHubClient.prototype as unknown as Record<string, Stub>
     const originals = methods.map(name => prototype[name]!)
     const backupGit = s.old.input.backupGit as unknown as Record<string, Stub>
+    const destinationGit = s.input.current.destination.destinationGit as unknown as Record<string, Stub>
+    const backupBranch = s.contract.identity.backupRepoId.split("#")[1]
     try {
-      for (const name of methods) prototype[name] = (...args: never[]) => backupGit[name]!(...args)
+      for (const name of methods) {
+        prototype[name] = function (this: GitHubClient, ...args: never[]) {
+          const selected = this.branchName === backupBranch ? backupGit : destinationGit
+          return selected[name]!.call(selected as never, ...args)
+        }
+      }
       const authenticated = await runtime.verifyFencedReencryptionAuthenticatedWal()
       assert.equal(authenticated?.observation, "authenticated-local-route-still-fenced")
       assert.equal(authenticated?.coldStartWalReverified, true)
+      assert.equal(authenticated?.destinationCiphertextReceiptsReverified, true)
       assert.equal(authenticated?.completeBackupContentsReverified, true)
       assert.equal(authenticated?.completeDestinationContentsReverified, false)
       assert.equal(authenticated?.resumeSyncAuthorized, false)

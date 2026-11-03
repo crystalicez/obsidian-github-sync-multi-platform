@@ -39,7 +39,9 @@ export interface V4ReencryptionColdStartJournalInput
    * module authenticates it with the independently recovered old key only
    * after proving the complete frozen Backup; it cannot prove OS isolation.
    */
-  readonly walEvidence?: Pick<V4ColdStartWalSnapshotInput, "adapter" | "root">
+  readonly walEvidence?: Pick<V4ColdStartWalSnapshotInput, "adapter" | "root"> & {
+    readonly destinationGit?: NonNullable<V4ColdStartWalSnapshotInput["destinationCiphertextReadback"]>["git"]
+  }
   /** Refuse if the plugin instance, adapter or GitHub credentials changed. */
   readonly assertLiveOwner: () => void
 }
@@ -53,6 +55,7 @@ export interface V4ReencryptionColdStartJournalReport {
   readonly recoveredKeyAndContractBoundToCaller: boolean
   readonly completeDestinationContentsReverified: false
   readonly coldStartWalReverified: boolean
+  readonly destinationCiphertextReceiptsReverified: boolean
   readonly commitDecisionAuthorized: false
   readonly localCutoverAuthorized: false
   readonly resumeSyncAuthorized: false
@@ -66,6 +69,7 @@ const BASE = Object.freeze({
   recoveredKeyAndContractBoundToCaller: false as const,
   completeDestinationContentsReverified: false as const,
   coldStartWalReverified: false as const,
+  destinationCiphertextReceiptsReverified: false as const,
   commitDecisionAuthorized: false as const,
   localCutoverAuthorized: false as const, resumeSyncAuthorized: false as const,
   rollbackAuthorized: false as const, remoteWritesAuthorized: false as const,
@@ -115,6 +119,7 @@ export async function inspectV4ReencryptionColdStartJournalKey(
     const walAdapter = walEvidence?.adapter
     const walRead = walAdapter?.read
     const walExists = walAdapter?.exists
+    const walDestinationGit = walEvidence?.destinationGit
     if (walEvidence && (typeof walRoot !== "string" || !walRoot
       || !walAdapter || typeof walRead !== "function"
       || typeof walExists !== "function")) return MANUAL
@@ -149,6 +154,7 @@ export async function inspectV4ReencryptionColdStartJournalKey(
       && input.walEvidence === walEvidence
       && (!walEvidence || (walEvidence.root === walRoot
         && walEvidence.adapter === walAdapter
+        && walEvidence.destinationGit === walDestinationGit
         && walAdapter?.read === walRead && walAdapter.exists === walExists))
       && (!expectedRecoveryBinding || (
         expectedRecoveryBinding.originalJournalKey === boundKey
@@ -282,6 +288,7 @@ export async function inspectV4ReencryptionColdStartJournalKey(
       || firstFull.verifiedPlaintextBytes !== secondFull.verifiedPlaintextBytes) return MANUAL
 
     let walReverified = false
+    let destinationCiphertextReceiptsReverified = false
     if (walEvidence) {
       // Only the independently authenticated old key can decrypt both
       // existing WAL slots. The owner must separately establish physical
@@ -289,12 +296,17 @@ export async function inspectV4ReencryptionColdStartJournalKey(
       const wal = await inspectV4ColdStartWalSnapshot({
         adapter: walEvidence.adapter, root: walEvidence.root,
         contract, originalJournalKey: keyring.journalKey,
+        ...(walDestinationGit ? { destinationCiphertextReadback: {
+          git: walDestinationGit,
+          expectedPhysicalRepositoryId: physical.id,
+        } } : {}),
         assertLiveOwner: check,
       })
       check()
       if (wal.observation !== "authenticated-current-wal-still-fenced"
         || !wal.walSnapshotAuthenticated || !wal.walMatchesCutoverContract) return MANUAL
       walReverified = true
+      destinationCiphertextReceiptsReverified = wal.destinationCiphertextReceiptsReverified
     }
 
     const finalRoute = await inspectV4ReencryptionColdStartIndexRoute({
@@ -326,6 +338,7 @@ export async function inspectV4ReencryptionColdStartJournalKey(
       pinnedBackupConfigAndEncryptedHeadVerified: true,
       completeBackupContentsReverified: true,
       coldStartWalReverified: walReverified,
+      destinationCiphertextReceiptsReverified,
     })
   } catch {
     return MANUAL
