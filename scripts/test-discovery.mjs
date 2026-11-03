@@ -46,6 +46,24 @@ export async function discoverTests(root) {
   return output;
 }
 
+/**
+ * Deterministic one-based file partitions after tier/filter selection.
+ * Across 1..total, every selected file appears exactly once. This never
+ * filters individual tests from a file and keeps unsharded runs unchanged.
+ */
+export function shardSelectedTests(selected, shard = "") {
+  if (!shard) return selected;
+  const match = /^([1-9]\d*)\/([1-9]\d*)$/u.exec(shard);
+  if (!match) throw new RangeError("Invalid --shard: expected INDEX/TOTAL, starting at 1.");
+  const index = Number(match[1]);
+  const total = Number(match[2]);
+  if (!Number.isSafeInteger(index) || !Number.isSafeInteger(total)
+    || total > 128 || index > total || total > selected.length) {
+    throw new RangeError("Invalid --shard: require 1 <= INDEX <= TOTAL <= selected file count and TOTAL <= 128.");
+  }
+  return selected.filter((_, position) => position % total === index - 1);
+}
+
 export function selectTests(discovered, { tier = "fast", filter = "" } = {}) {
   const normalizedFilter = normalizeTestPath(filter).toLowerCase();
   return discovered.filter(item => {

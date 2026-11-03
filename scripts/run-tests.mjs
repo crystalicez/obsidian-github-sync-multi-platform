@@ -3,7 +3,7 @@ import { lstat, mkdir, mkdtemp, rm } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import path from "node:path";
 
-import { discoverTests, selectTests } from "./test-discovery.mjs";
+import { discoverTests, selectTests, shardSelectedTests } from "./test-discovery.mjs";
 
 const root = process.cwd();
 const outputRoot = path.join(root, ".tmp");
@@ -18,6 +18,8 @@ const tier = optionValue("tier", "fast");
 const filter = optionValue("filter", "");
 // Native Node test-name filtering keeps expensive encrypted integration repros focused.
 const namePattern = optionValue("name-pattern", "");
+// Optional one-based file partition: run all 1..TOTAL shards to qualify a tier.
+const shard = optionValue("shard", "");
 const knownTiers = new Set(["fast", "feasibility", "resource", "recovery", "github-e2e", "soak", "device"]);
 if (!knownTiers.has(tier)) {
   console.error(`Unknown test tier: ${tier}`);
@@ -32,11 +34,20 @@ const typeCheck = spawnSync(
 if (typeCheck.status !== 0) process.exit(typeCheck.status ?? 1);
 
 const discovered = await discoverTests(root);
-const selected = selectTests(discovered, { tier, filter });
+const eligible = selectTests(discovered, { tier, filter });
+let selected;
+try {
+  selected = shardSelectedTests(eligible, shard);
+} catch (error) {
+  console.error(error instanceof Error ? error.message : error);
+  process.exit(2);
+}
 if (selected.length === 0) {
   console.error(`No tests matched tier=${tier}${filter ? ` filter=${filter}` : ""}`);
   process.exit(2);
 }
+
+console.log(`Selected ${selected.length}/${eligible.length} ${tier} test files${shard ? ` (shard ${shard})` : ""}.`);
 
 // A shared .tmp/tests directory made parallel tiers and repeat runs delete one
 // another's bundles (ENOTEMPTY/ENOENT). Only remove this invocation's directory.
