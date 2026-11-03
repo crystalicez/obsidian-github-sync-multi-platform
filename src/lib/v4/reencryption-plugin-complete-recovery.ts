@@ -123,9 +123,12 @@ export async function inspectV4DesktopPluginCompleteRecovery(
 ): Promise<V4PluginCompleteRecoveryReport> {
   const isolation = "desktop-os-cooperative-wal-lock"
   let opened: Awaited<ReturnType<typeof openV4DesktopPluginWalForRecovery>> | undefined
+  let keyCopy: Uint8Array | undefined
   try {
     const { owner, backup, contract, destination, originalJournalKey } = input
     checkEvidence(input, owner)
+    keyCopy = Uint8Array.from(originalJournalKey)
+    const contractText = JSON.stringify(contract)
     const { adapter, configDir, pluginId, runId, assertLiveOwner } = owner
     const getFullPath = adapter.getFullPath
     const openedReader = await openV4DesktopPluginWalForRecovery(owner)
@@ -133,7 +136,9 @@ export async function inspectV4DesktopPluginCompleteRecovery(
     const pinned = () => {
       checkEvidence(input, owner)
       if (input.owner !== owner || input.backup !== backup || input.contract !== contract
+        || JSON.stringify(contract) !== contractText
         || input.destination !== destination || input.originalJournalKey !== originalJournalKey
+        || originalJournalKey.some((byte, i) => byte !== keyCopy![i])
         || owner.adapter !== adapter || owner.configDir !== configDir
         || owner.pluginId !== pluginId || owner.runId !== runId
         || owner.assertLiveOwner !== assertLiveOwner
@@ -171,6 +176,7 @@ export async function inspectV4DesktopPluginCompleteRecovery(
   } catch {
     return manual(isolation)
   } finally {
+    keyCopy?.fill(0)
     await opened?.release()
   }
 }
@@ -185,11 +191,14 @@ export async function inspectV4MobilePluginCompleteRecovery(
 ): Promise<V4PluginCompleteRecoveryReport> {
   const isolation = "mobile-cooperative-best-effort-only"
   let releaseMobileReservation: (() => void) | undefined
+  let keyCopy: Uint8Array | undefined
   try {
     const { owner, backup, contract, destination, originalJournalKey,
       withExclusiveCooperativeRecoveryLease: holder,
       assertCooperativeRecoveryLease: lease } = input
     checkEvidence(input, owner)
+    keyCopy = Uint8Array.from(originalJournalKey)
+    const contractText = JSON.stringify(contract)
     if (typeof holder !== "function" || typeof lease !== "function") return manual(isolation)
     const adapter = owner.adapter
     if (!adapter || typeof adapter !== "object") return manual(isolation)
@@ -204,7 +213,9 @@ export async function inspectV4MobilePluginCompleteRecovery(
     const pinned = () => {
       checkEvidence(input, owner)
       if (input.owner !== owner || input.backup !== backup || input.contract !== contract
+        || JSON.stringify(contract) !== contractText
         || input.destination !== destination || input.originalJournalKey !== originalJournalKey
+        || originalJournalKey.some((byte, i) => byte !== keyCopy![i])
         || input.withExclusiveCooperativeRecoveryLease !== holder
         || input.assertCooperativeRecoveryLease !== lease
         || owner.adapter !== adapter || owner.configDir !== configDir
@@ -245,6 +256,7 @@ export async function inspectV4MobilePluginCompleteRecovery(
   } catch {
     return manual(isolation)
   } finally {
+    keyCopy?.fill(0)
     releaseMobileReservation?.()
   }
 }

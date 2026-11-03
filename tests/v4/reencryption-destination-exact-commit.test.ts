@@ -3408,6 +3408,75 @@ test("D248/D250/D252 verifies Desktop WAL lock, installed physical readback and 
       owner.adapter = originalAdapter
       Object.defineProperty(evidence, "owner", evidenceOwner)
     }
+    const savedKeyProperty = Object.getOwnPropertyDescriptor(evidence, "originalJournalKey")!
+    const originalKeyBytes = evidence.originalJournalKey
+    const firstKeyByte = originalKeyBytes[0]!
+    let keyAccesses = 0
+    Object.defineProperty(evidence, "originalJournalKey", {
+      configurable: true, enumerable: true,
+      get: () => { keyAccesses++; return originalKeyBytes },
+    })
+    try {
+      const steady = await inspectV4DesktopPluginCompleteRecovery(evidence)
+      assert.equal(steady.observation, "authenticated-complete-recovery-evidence-still-fenced")
+      const finalKeyRead = keyAccesses
+      assert.ok(finalKeyRead > 1)
+      keyAccesses = 0
+      Object.defineProperty(evidence, "originalJournalKey", {
+        configurable: true, enumerable: true,
+        get: () => {
+          keyAccesses++
+          if (keyAccesses === finalKeyRead) originalKeyBytes[0] = firstKeyByte ^ 1
+          return originalKeyBytes
+        },
+      })
+      const altered = await inspectV4DesktopPluginCompleteRecovery(evidence)
+      assert.equal(keyAccesses, finalKeyRead, "mutate the key at the final D248 Desktop boundary")
+      assert.equal(altered.observation, "manual-recovery-required",
+        "Desktop must not report a proof after its original key bytes changed")
+      assert.equal(altered.completeOldBackupReverified, false)
+      assert.equal(altered.resumeSyncAuthorized, false)
+      assert.equal(altered.remoteWritesAuthorized, false)
+    } finally {
+      originalKeyBytes[0] = firstKeyByte
+      Object.defineProperty(evidence, "originalJournalKey", savedKeyProperty)
+    }
+    const savedContractProperty = Object.getOwnPropertyDescriptor(evidence, "contract")!
+    const savedContract = evidence.contract
+    const originalSourceSha = savedContract.identity.sourceCommitSha
+    const tamperedSourceSha = (originalSourceSha[0] === "0" ? "1" : "0") + originalSourceSha.slice(1)
+    let contractAccesses = 0
+    Object.defineProperty(evidence, "contract", {
+      configurable: true, enumerable: true,
+      get: () => { contractAccesses++; return savedContract },
+    })
+    try {
+      const steady = await inspectV4DesktopPluginCompleteRecovery(evidence)
+      assert.equal(steady.observation, "authenticated-complete-recovery-evidence-still-fenced")
+      const finalContractRead = contractAccesses
+      assert.ok(finalContractRead > 1)
+      contractAccesses = 0
+      Object.defineProperty(evidence, "contract", {
+        configurable: true, enumerable: true,
+        get: () => {
+          contractAccesses++
+          if (contractAccesses === finalContractRead) {
+            Object.assign(savedContract.identity, { sourceCommitSha: tamperedSourceSha })
+          }
+          return savedContract
+        },
+      })
+      const altered = await inspectV4DesktopPluginCompleteRecovery(evidence)
+      assert.equal(contractAccesses, finalContractRead,
+        "change the saved Contract at the final D248 Desktop boundary")
+      assert.equal(altered.observation, "manual-recovery-required",
+        "Desktop must not report a proof after its saved Contract changed")
+      assert.equal(altered.completeOldBackupReverified, false)
+      assert.equal(altered.resumeSyncAuthorized, false)
+    } finally {
+      Object.assign(savedContract.identity, { sourceCommitSha: originalSourceSha })
+      Object.defineProperty(evidence, "contract", savedContractProperty)
+    }
     const after = await Promise.all([readFile(path.join(physicalWal, "slot-0.json")),
       readFile(path.join(physicalWal, "slot-1.json"))])
     assert.deepEqual(after, before)
@@ -3821,6 +3890,77 @@ test("D248/D250/D252/D260/D262 Mobile existing WAL, one-owner proof and in-proce
     adapter.list = originalListForRuntime
     Platform.isDesktopApp = platformWasDesktop
   }
+  const originalKeyBytes = evidence.originalJournalKey
+  const firstKeyByte = originalKeyBytes[0]!
+  const savedKeyProperty = Object.getOwnPropertyDescriptor(evidence, "originalJournalKey")!
+  let keyAccesses = 0
+  Object.defineProperty(evidence, "originalJournalKey", {
+    configurable: true, enumerable: true,
+    get: () => { keyAccesses++; return originalKeyBytes },
+  })
+  try {
+    const steady = await inspectV4MobilePluginCompleteRecovery(evidence)
+    assert.equal(steady.observation, "authenticated-complete-recovery-evidence-still-fenced")
+    const finalKeyRead = keyAccesses
+    assert.ok(finalKeyRead > 1)
+    keyAccesses = 0
+    Object.defineProperty(evidence, "originalJournalKey", {
+      configurable: true, enumerable: true,
+      get: () => {
+        keyAccesses++
+        if (keyAccesses === finalKeyRead) originalKeyBytes[0] = firstKeyByte ^ 1
+        return originalKeyBytes
+      },
+    })
+    const altered = await inspectV4MobilePluginCompleteRecovery(evidence)
+    assert.equal(keyAccesses, finalKeyRead, "mutate the key at the final D248 Mobile boundary")
+    assert.equal(altered.observation, "manual-recovery-required",
+      "the verified original key must remain byte-identical through D248 report delivery")
+    assert.equal(altered.completeOldBackupReverified, false)
+    assert.equal(altered.resumeSyncAuthorized, false)
+    assert.equal(altered.remoteWritesAuthorized, false)
+  } finally {
+    originalKeyBytes[0] = firstKeyByte
+    Object.defineProperty(evidence, "originalJournalKey", savedKeyProperty)
+  }
+  assert.deepEqual(files, before, "final old-key drift must not change physical Mobile WAL")
+  const savedContractProperty = Object.getOwnPropertyDescriptor(evidence, "contract")!
+  const savedContract = evidence.contract
+  const originalSourceSha = savedContract.identity.sourceCommitSha
+  const tamperedSourceSha = (originalSourceSha[0] === "0" ? "1" : "0") + originalSourceSha.slice(1)
+  let contractAccesses = 0
+  Object.defineProperty(evidence, "contract", {
+    configurable: true, enumerable: true,
+    get: () => { contractAccesses++; return savedContract },
+  })
+  try {
+    const steady = await inspectV4MobilePluginCompleteRecovery(evidence)
+    assert.equal(steady.observation, "authenticated-complete-recovery-evidence-still-fenced")
+    const finalContractRead = contractAccesses
+    assert.ok(finalContractRead > 1)
+    contractAccesses = 0
+    Object.defineProperty(evidence, "contract", {
+      configurable: true, enumerable: true,
+      get: () => {
+        contractAccesses++
+        if (contractAccesses === finalContractRead) {
+          Object.assign(savedContract.identity, { sourceCommitSha: tamperedSourceSha })
+        }
+        return savedContract
+      },
+    })
+    const altered = await inspectV4MobilePluginCompleteRecovery(evidence)
+    assert.equal(contractAccesses, finalContractRead,
+      "change the saved Contract at the final D248 Mobile boundary")
+    assert.equal(altered.observation, "manual-recovery-required",
+      "the saved Contract bytes must remain unchanged through D248 report delivery")
+    assert.equal(altered.completeOldBackupReverified, false)
+    assert.equal(altered.resumeSyncAuthorized, false)
+  } finally {
+    Object.assign(savedContract.identity, { sourceCommitSha: originalSourceSha })
+    Object.defineProperty(evidence, "contract", savedContractProperty)
+  }
+  assert.deepEqual(files, before, "final Contract drift must not change physical Mobile WAL")
   const cooperativeLease = evidence.assertCooperativeRecoveryLease
   evidence.assertCooperativeRecoveryLease = async () => {
     throw Error("cooperative lease was revoked")
