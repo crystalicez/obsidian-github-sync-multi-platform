@@ -3368,6 +3368,12 @@ test("D248/D250/D252 verifies Desktop WAL lock, installed physical readback and 
       runtime.dispose()
     }
     // D250 released the competing writer without changing either WAL slot.
+    let ownerAccesses = 0
+    const evidenceOwner = Object.getOwnPropertyDescriptor(evidence, "owner")!
+    Object.defineProperty(evidence, "owner", {
+      configurable: true, enumerable: true,
+      get: () => { ownerAccesses++; return owner },
+    })
     const result = await inspectV4DesktopPluginCompleteRecovery(evidence)
     assert.equal(result.observation, "authenticated-complete-recovery-evidence-still-fenced")
     assert.equal(result.completeOldBackupReverified, true)
@@ -3377,6 +3383,31 @@ test("D248/D250/D252 verifies Desktop WAL lock, installed physical readback and 
     assert.equal(result.installedObsidianAcceptanceProven, false)
     assert.equal(result.localCutoverAuthorized, false)
     assert.equal(result.resumeSyncAuthorized, false)
+    const finalOwnerAccess = ownerAccesses
+    assert.ok(finalOwnerAccess > 1)
+    ownerAccesses = 0
+    const originalAdapter = owner.adapter
+    Object.defineProperty(evidence, "owner", {
+      configurable: true, enumerable: true,
+      get: () => {
+        ownerAccesses++
+        if (ownerAccesses === finalOwnerAccess) owner.adapter = { ...originalAdapter }
+        return owner
+      },
+    })
+    try {
+      const lateSwapped = await inspectV4DesktopPluginCompleteRecovery(evidence)
+      assert.equal(ownerAccesses, finalOwnerAccess,
+        "the adapter switch must occur at the final Desktop report boundary")
+      assert.equal(lateSwapped.observation, "manual-recovery-required")
+      assert.equal(lateSwapped.completeDestinationContentsReverified, false)
+      assert.equal(lateSwapped.localCutoverAuthorized, false)
+      assert.equal(lateSwapped.resumeSyncAuthorized, false)
+      assert.equal(lateSwapped.remoteWritesAuthorized, false)
+    } finally {
+      owner.adapter = originalAdapter
+      Object.defineProperty(evidence, "owner", evidenceOwner)
+    }
     const after = await Promise.all([readFile(path.join(physicalWal, "slot-0.json")),
       readFile(path.join(physicalWal, "slot-1.json"))])
     assert.deepEqual(after, before)

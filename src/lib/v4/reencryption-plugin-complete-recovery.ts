@@ -129,12 +129,18 @@ export async function inspectV4DesktopPluginCompleteRecovery(
   try {
     const { owner, backup, contract, destination, originalJournalKey } = input
     checkEvidence(input, owner)
+    const { adapter, configDir, pluginId, runId, assertLiveOwner } = owner
+    const getFullPath = adapter.getFullPath
     const openedReader = await openV4DesktopPluginWalForRecovery(owner)
     opened = openedReader
     const pinned = () => {
       checkEvidence(input, owner)
       if (input.owner !== owner || input.backup !== backup || input.contract !== contract
-        || input.destination !== destination || input.originalJournalKey !== originalJournalKey) {
+        || input.destination !== destination || input.originalJournalKey !== originalJournalKey
+        || owner.adapter !== adapter || owner.configDir !== configDir
+        || owner.pluginId !== pluginId || owner.runId !== runId
+        || owner.assertLiveOwner !== assertLiveOwner
+        || adapter.getFullPath !== getFullPath) {
         throw Error("Re-encryption Desktop diagnostic evidence changed.")
       }
     }
@@ -162,6 +168,7 @@ export async function inspectV4DesktopPluginCompleteRecovery(
         return value
       },
     })
+    await lease()
     pinned()
     return observation(report, isolation)
   } catch {
