@@ -3230,6 +3230,104 @@ test("D247 refuses a torn encrypted WAL and leaves both original-key Backup and 
   assert.deepEqual(s.old.f.s.files, filesBefore)
 })
 
+async function assertD248LateNestedEvidenceDrift<T extends {
+  backup: { backupGit: { readonly branchName: string } }
+  destination: {
+    destinationGit: { readonly branchName: string }
+    remote: { sourceConfig: { readonly repoId: string } }
+  }
+}>(
+  evidence: T,
+  inspect: (input: T) => Promise<{
+    observation: string
+    completeOldBackupReverified: boolean
+    localCutoverAuthorized: boolean
+    resumeSyncAuthorized: boolean
+    remoteWritesAuthorized: boolean
+  }>,
+  platform: string,
+): Promise<void> {
+  for (const field of ["backup", "destination"] as const) {
+    const git = field === "backup"
+      ? evidence.backup.backupGit : evidence.destination.destinationGit
+    const originalBranch = git.branchName
+    const originalDescriptor = Object.getOwnPropertyDescriptor(evidence, field)!
+    const originalEvidence = evidence[field]
+    let accesses = 0
+    Object.defineProperty(evidence, field, {
+      configurable: true, enumerable: true,
+      get: () => { accesses++; return originalEvidence },
+    })
+    try {
+      const steady = await inspect(evidence)
+      assert.equal(steady.observation, "authenticated-complete-recovery-evidence-still-fenced")
+      const finalRead = accesses
+      assert.ok(finalRead > 1)
+      accesses = 0
+      Object.defineProperty(evidence, field, {
+        configurable: true, enumerable: true,
+        get: () => {
+          accesses++
+          if (accesses === finalRead) {
+            Object.assign(git, { branchName: originalBranch + "-late-drift" })
+          }
+          return originalEvidence
+        },
+      })
+      const changed = await inspect(evidence)
+      assert.equal(accesses, finalRead,
+        platform + " " + field + " Git branch drift must occur at final D248 report boundary")
+      assert.equal(changed.observation, "manual-recovery-required",
+        platform + " must reject changed nested " + field + " Git evidence after full proof")
+      assert.equal(changed.completeOldBackupReverified, false)
+      assert.equal(changed.localCutoverAuthorized, false)
+      assert.equal(changed.resumeSyncAuthorized, false)
+      assert.equal(changed.remoteWritesAuthorized, false)
+    } finally {
+      Object.assign(git, { branchName: originalBranch })
+      Object.defineProperty(evidence, field, originalDescriptor)
+    }
+  }
+  const originalDescriptor = Object.getOwnPropertyDescriptor(evidence, "destination")!
+  const destination = evidence.destination
+  const sourceConfig = destination.remote.sourceConfig
+  const originalRepoId = sourceConfig.repoId
+  let accesses = 0
+  Object.defineProperty(evidence, "destination", {
+    configurable: true, enumerable: true,
+    get: () => { accesses++; return destination },
+  })
+  try {
+    const steady = await inspect(evidence)
+    assert.equal(steady.observation, "authenticated-complete-recovery-evidence-still-fenced")
+    const finalRead = accesses
+    assert.ok(finalRead > 1)
+    accesses = 0
+    Object.defineProperty(evidence, "destination", {
+      configurable: true, enumerable: true,
+      get: () => {
+        accesses++
+        if (accesses === finalRead) {
+          Object.assign(sourceConfig, { repoId: originalRepoId + "-late-drift" })
+        }
+        return destination
+      },
+    })
+    const changed = await inspect(evidence)
+    assert.equal(accesses, finalRead,
+      platform + " remote Source Config drift must occur at final D248 report boundary")
+    assert.equal(changed.observation, "manual-recovery-required",
+      platform + " must reject mutated nested Destination Remote Config after full proof")
+    assert.equal(changed.completeOldBackupReverified, false)
+    assert.equal(changed.localCutoverAuthorized, false)
+    assert.equal(changed.resumeSyncAuthorized, false)
+    assert.equal(changed.remoteWritesAuthorized, false)
+  } finally {
+    Object.assign(sourceConfig, { repoId: originalRepoId })
+    Object.defineProperty(evidence, "destination", originalDescriptor)
+  }
+}
+
 test("D248/D250/D252 verifies Desktop WAL lock, installed physical readback and old-key authentication", async () => {
   const s = await d247Scenario()
   await mkdir(path.join(process.cwd(), ".tmp"), { recursive: true })
@@ -3477,6 +3575,7 @@ test("D248/D250/D252 verifies Desktop WAL lock, installed physical readback and 
       Object.assign(savedContract.identity, { sourceCommitSha: originalSourceSha })
       Object.defineProperty(evidence, "contract", savedContractProperty)
     }
+    await assertD248LateNestedEvidenceDrift(evidence, inspectV4DesktopPluginCompleteRecovery, "Desktop")
     const after = await Promise.all([readFile(path.join(physicalWal, "slot-0.json")),
       readFile(path.join(physicalWal, "slot-1.json"))])
     assert.deepEqual(after, before)
@@ -3961,6 +4060,8 @@ test("D248/D250/D252/D260/D262 Mobile existing WAL, one-owner proof and in-proce
     Object.defineProperty(evidence, "contract", savedContractProperty)
   }
   assert.deepEqual(files, before, "final Contract drift must not change physical Mobile WAL")
+  await assertD248LateNestedEvidenceDrift(evidence, inspectV4MobilePluginCompleteRecovery, "Mobile")
+  assert.deepEqual(files, before, "nested Git drift must not change physical Mobile WAL")
   const cooperativeLease = evidence.assertCooperativeRecoveryLease
   evidence.assertCooperativeRecoveryLease = async () => {
     throw Error("cooperative lease was revoked")

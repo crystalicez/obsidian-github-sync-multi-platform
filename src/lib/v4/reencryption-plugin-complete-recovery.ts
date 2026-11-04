@@ -78,6 +78,57 @@ function checkEvidence(input: V4PluginRecoveryEvidence, owner: {
   }
 }
 
+function pinGitReader(git: Backup["backupGit"]): () => boolean {
+  const { branchName, getRepositoryIdentity, getRepositoryDefaultBranch,
+    getGitRef, getGitCommit, getTreeAt, getBlob } = git
+  return () => git.branchName === branchName
+    && git.getRepositoryIdentity === getRepositoryIdentity
+    && git.getRepositoryDefaultBranch === getRepositoryDefaultBranch
+    && git.getGitRef === getGitRef
+    && git.getGitCommit === getGitCommit
+    && git.getTreeAt === getTreeAt
+    && git.getBlob === getBlob
+}
+
+function pinReadOnlyRecoverySources(
+  backup: Backup, destination: Current["destination"],
+): () => void {
+  const backupGit = backup.backupGit
+  const destinationGit = destination.destinationGit
+  const backupGitPinned = pinGitReader(backupGit)
+  const destinationGitPinned = pinGitReader(destinationGit)
+  const backupAdapter = backup.adapter
+  const backupRead = backupAdapter.read
+  const backupExists = backupAdapter.exists
+  const backupSecret = backup.getSecret
+  const backupOwner = backup.assertLiveOwner
+  const backupPersisted = backup.readPersistedPluginData
+  const backupWalEvidence = backup.walEvidence
+  const backupRecoveryScope = backup.recoveryScope
+  const destinationRemote = destination.remote
+  const destinationRemoteText = JSON.stringify(destinationRemote)
+  const destinationPhysicalRepo = destination.expectedPhysicalRepositoryId
+  return () => {
+    if (backup.backupGit !== backupGit || !backupGitPinned()
+      || backup.adapter !== backupAdapter
+      || backupAdapter.read !== backupRead || backupAdapter.exists !== backupExists
+      || backup.getSecret !== backupSecret || backup.assertLiveOwner !== backupOwner
+      || backup.readPersistedPluginData !== backupPersisted
+      || backup.walEvidence !== backupWalEvidence
+      || backup.recoveryScope !== backupRecoveryScope
+      || Object.hasOwn(backup, "expectedRecoveryBinding")
+      || destination.destinationGit !== destinationGit || !destinationGitPinned()
+      || destination.adapter !== backupAdapter
+      || destination.getSecret !== backupSecret
+      || destination.assertLiveOwner !== backupOwner
+      || destination.expectedPhysicalRepositoryId !== destinationPhysicalRepo
+      || destination.remote !== destinationRemote
+      || JSON.stringify(destinationRemote) !== destinationRemoteText) {
+      throw Error("Re-encryption Recovery nested Backup or Destination evidence changed.")
+    }
+  }
+}
+
 function compose(
   input: V4PluginRecoveryEvidence,
   wal: {
@@ -129,6 +180,7 @@ export async function inspectV4DesktopPluginCompleteRecovery(
     checkEvidence(input, owner)
     keyCopy = Uint8Array.from(originalJournalKey)
     const contractText = JSON.stringify(contract)
+    const pinNested = pinReadOnlyRecoverySources(backup, destination)
     const { adapter, configDir, pluginId, runId, assertLiveOwner } = owner
     const getFullPath = adapter.getFullPath
     const openedReader = await openV4DesktopPluginWalForRecovery(owner)
@@ -145,6 +197,7 @@ export async function inspectV4DesktopPluginCompleteRecovery(
         || adapter.getFullPath !== getFullPath) {
         throw Error("Re-encryption Desktop diagnostic evidence changed.")
       }
+      pinNested()
     }
     pinned()
     // The D242 owner opener validates the actual physical path. D237 uses
@@ -199,6 +252,7 @@ export async function inspectV4MobilePluginCompleteRecovery(
     checkEvidence(input, owner)
     keyCopy = Uint8Array.from(originalJournalKey)
     const contractText = JSON.stringify(contract)
+    const pinNested = pinReadOnlyRecoverySources(backup, destination)
     if (typeof holder !== "function" || typeof lease !== "function") return manual(isolation)
     const adapter = owner.adapter
     if (!adapter || typeof adapter !== "object") return manual(isolation)
@@ -225,6 +279,7 @@ export async function inspectV4MobilePluginCompleteRecovery(
         || adapter.read !== nativeMethods.read) {
         throw Error("Re-encryption Mobile diagnostic evidence or cooperative lease changed.")
       }
+      pinNested()
     }
     pinned()
     const boundary = async () => { pinned(); await lease(); pinned() }
