@@ -4032,6 +4032,11 @@ test("D248/D250/D252/D260/D262 Mobile existing WAL, one-owner proof and in-proce
         const runtimeWhileHelperHeld = await runtime.verifyFencedReencryptionAuthenticatedWal()
         assert.equal(runtimeWhileHelperHeld, null,
           "installed Mobile runtime must refuse the same adapter while D248 complete recovery holds it")
+        const structureWhileHelperHeld = await runtime.inspectFencedReencryptionExistingWalStructure()
+        assert.equal(structureWhileHelperHeld.observation, "manual-recovery-required",
+          "Mobile structural scan must also refuse D248 Complete Recovery holding the same vault adapter")
+        assert.equal(structureWhileHelperHeld.walAuthenticated, false)
+        assert.equal(structureWhileHelperHeld.resumeSyncAuthorized, false)
       } finally {
         releaseHelperHeld?.()
         const helperCompleted = await heldHelper
@@ -4061,6 +4066,11 @@ test("D248/D250/D252/D260/D262 Mobile existing WAL, one-owner proof and in-proce
         const helperWhileRuntimeHeld = await inspectV4MobilePluginCompleteRecovery(evidence)
         assert.equal(helperWhileRuntimeHeld.observation, "manual-recovery-required",
           "D248 complete Mobile recovery must refuse an installed Runtime holding the same adapter")
+        const structureWhileRuntimeHeld = await runtime.inspectFencedReencryptionExistingWalStructure()
+        assert.equal(structureWhileRuntimeHeld.observation, "manual-recovery-required",
+          "Mobile structural scan must refuse installed authenticated Runtime holding the same adapter")
+        assert.equal(structureWhileRuntimeHeld.walAuthenticated, false)
+        assert.equal(structureWhileRuntimeHeld.remoteWritesAuthorized, false)
         assert.equal(helperWhileRuntimeHeld.completeDestinationContentsReverified, false)
         assert.equal(helperWhileRuntimeHeld.resumeSyncAuthorized, false)
       } finally {
@@ -4078,6 +4088,49 @@ test("D248/D250/D252/D260/D262 Mobile existing WAL, one-owner proof and in-proce
         "authenticated-complete-recovery-evidence-still-fenced",
         "both Mobile diagnostic entrypoints must release their adapter reservations")
       assert.equal(helperAfterRuntime.resumeSyncAuthorized, false)
+      // Structural-only inspection must hold the SAME real mobile Adapter
+      // reservation, even though its result never authenticates ciphertext.
+      const structuralRead = adapter.read
+      let pauseStructuralContract = true
+      let signalStructuralHeld: (() => void) | undefined
+      let releaseStructuralHeld: (() => void) | undefined
+      const structuralHeld = new Promise<void>(resolve => { signalStructuralHeld = resolve })
+      const structuralUnblocked = new Promise<void>(resolve => { releaseStructuralHeld = resolve })
+      adapter.read = async name => {
+        const value = await structuralRead(name)
+        if (pauseStructuralContract && name.endsWith("/contract.json")) {
+          pauseStructuralContract = false
+          signalStructuralHeld?.()
+          await structuralUnblocked
+        }
+        return value
+      }
+      const heldStructural = runtime.inspectFencedReencryptionExistingWalStructure()
+      try {
+        await structuralHeld
+        const authenticatedWhileStructural = await runtime.verifyFencedReencryptionAuthenticatedWal()
+        assert.equal(authenticatedWhileStructural, null,
+          "installed Mobile authenticated Runtime must refuse a held structural-only scan")
+        const helperWhileStructural = await inspectV4MobilePluginCompleteRecovery(evidence)
+        assert.equal(helperWhileStructural.observation, "manual-recovery-required",
+          "D248 Mobile Complete Recovery must refuse a held structural-only scan")
+        assert.equal(helperWhileStructural.completeOldBackupReverified, false)
+        assert.equal(helperWhileStructural.resumeSyncAuthorized, false)
+      } finally {
+        releaseStructuralHeld?.()
+        try {
+          const completedStructural = await heldStructural
+          assert.equal(completedStructural.observation, "existing-wal-structure-observed-untrusted")
+          assert.equal(completedStructural.walAuthenticated, false)
+          assert.equal(completedStructural.resumeSyncAuthorized, false)
+        } finally {
+          adapter.read = structuralRead
+        }
+      }
+      const afterStructural = await runtime.inspectFencedReencryptionExistingWalStructure()
+      assert.equal(afterStructural.observation, "existing-wal-structure-observed-untrusted",
+        "completed Mobile structural scan must release the shared adapter reservation")
+      assert.equal(afterStructural.resumeSyncAuthorized, false)
       assert.deepEqual(files, before, "cross-entrypoint overlap must leave original WAL unchanged")
     } finally {
       methods.forEach((name, i) => { prototype[name] = originals[i]! })

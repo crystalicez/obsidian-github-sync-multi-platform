@@ -632,6 +632,7 @@ export class V4PluginRuntime {
    * Desktop temporarily creates only the existing WAL's cooperative lock.
    */
   async inspectFencedReencryptionExistingWalStructure(): Promise<V4ReencryptionExistingWalStructureReport> {
+    let releaseMobileReservation: (() => void) | undefined
     try {
       this.assertNotDisposed()
       const vault = this.plugin.app.vault
@@ -687,6 +688,11 @@ export class V4PluginRuntime {
       assertOwner()
       if (!backing || !source.owner || !source.repo || (desktop && this.uncVault)) {
         return V4_WAL_STRUCTURE_MANUAL
+      }
+      if (!desktop) {
+        const release = tryReserveV4MobileRecoveryAdapter(backing)
+        if (!release) return V4_WAL_STRUCTURE_MANUAL
+        releaseMobileReservation = release
       }
       const route = await this.inspectFencedReencryptionIndexRoute()
       assertOwner()
@@ -771,6 +777,8 @@ export class V4PluginRuntime {
       })
     } catch {
       return V4_WAL_STRUCTURE_MANUAL
+    } finally {
+      releaseMobileReservation?.()
     }
   }
 
