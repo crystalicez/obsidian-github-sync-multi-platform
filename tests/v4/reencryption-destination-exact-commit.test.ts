@@ -3455,6 +3455,57 @@ test("D248/D250/D252 verifies Desktop WAL lock, installed physical readback and 
         assert.equal(authenticated?.recoveryLeaseReverified, true)
         assert.equal(authenticated?.resumeSyncAuthorized, false)
         assert.equal(authenticated?.localCutoverAuthorized, false)
+        // The installed Desktop Runtime, unlike the D248 helper, also
+        // returns from try before awaiting its physical WAL lock release.
+        const physicalLock = path.join(physicalWal, ".exclusive.lock")
+        const savedBranchDescriptor = Object.getOwnPropertyDescriptor(settings, "githubBranch")!
+        const branchBeforeLockRelease = settings["githubBranch"]
+        let currentBranch = branchBeforeLockRelease
+        let lockedBranchReads = 0
+        Object.defineProperty(settings, "githubBranch", {
+          configurable: true, enumerable: true,
+          get: () => {
+            if (existsSync(physicalLock)) lockedBranchReads++
+            return currentBranch
+          },
+          set: value => { currentBranch = value },
+        })
+        try {
+          const control = await runtime.verifyFencedReencryptionAuthenticatedWal()
+          assert.equal(control?.observation, "authenticated-local-route-still-fenced")
+          const finalLockedBranchRead = lockedBranchReads
+          assert.ok(finalLockedBranchRead > 1)
+          lockedBranchReads = 0
+          let mutatedDuringRelease = false
+          Object.defineProperty(settings, "githubBranch", {
+            configurable: true, enumerable: true,
+            get: () => {
+              if (existsSync(physicalLock)) {
+                lockedBranchReads++
+                if (lockedBranchReads === finalLockedBranchRead) {
+                  queueMicrotask(() => {
+                    mutatedDuringRelease = true
+                    currentBranch = "changed-during-installed-desktop-release"
+                  })
+                }
+              }
+              return currentBranch
+            },
+            set: value => { currentBranch = value },
+          })
+          const lateDrift = await runtime.verifyFencedReencryptionAuthenticatedWal()
+          assert.equal(mutatedDuringRelease, true,
+            "installed Runtime branch must drift as its Desktop WAL lock is released")
+          assert.equal(lockedBranchReads, finalLockedBranchRead,
+            "the injected drift must follow the final under-lock Runtime owner check")
+          assert.ok(lateDrift === null || lateDrift.observation === "manual-recovery-required",
+            "installed Desktop Runtime must not return stale authenticated evidence after WAL unlock")
+          assert.equal(lateDrift?.resumeSyncAuthorized ?? false, false)
+          assert.equal(existsSync(physicalLock), false, "Desktop WAL lock must be released before reporting")
+        } finally {
+          Object.defineProperty(settings, "githubBranch", savedBranchDescriptor)
+          settings["githubBranch"] = branchBeforeLockRelease
+        }
         drift = true
         const changedOwner = await runtime.verifyFencedReencryptionAuthenticatedWal()
         assert.ok(changedOwner === null || changedOwner.observation === "manual-recovery-required")

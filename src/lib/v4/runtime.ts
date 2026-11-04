@@ -469,6 +469,7 @@ export class V4PluginRuntime {
           adapter: native as typeof native & { getFullPath(path: string): string },
           configDir, pluginId, runId, assertLiveOwner: checkOwner,
         })
+        let result: V4ReencryptionColdStartJournalReport | null = null
         try {
           await reader.assertExclusiveStageLease()
           const assertLease = async () => {
@@ -476,7 +477,7 @@ export class V4PluginRuntime {
             await reader.assertExclusiveStageLease()
             checkOwner()
           }
-          const result = await this.verifyFencedReencryptionOriginalKeyWithWal({
+          result = await this.verifyFencedReencryptionOriginalKeyWithWal({
             adapter: reader.adapter, root: layout.journalRoot, destinationGit,
             fullDestination: true,
           }, {
@@ -490,10 +491,13 @@ export class V4PluginRuntime {
           checkOwner()
           await reader.assertBestEffortCheckpoint()
           checkOwner()
-          return result
         } finally {
           await reader.release()
         }
+        // The OS-cooperative WAL release is async. Do not deliver a stale
+        // authenticated report if the installed owner changes during unlock.
+        checkOwner()
+        return result
       }
       const reader = await openV4MobilePluginWalForRecovery({
         adapter: native, configDir, pluginId, runId, assertLiveOwner: checkOwner,
