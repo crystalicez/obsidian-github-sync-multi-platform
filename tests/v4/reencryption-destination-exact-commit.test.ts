@@ -1,5 +1,6 @@
 import assert from "node:assert/strict"
 import test from "node:test"
+import { existsSync } from "node:fs"
 import { Platform } from "obsidian"
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises"
 import path from "node:path"
@@ -3576,6 +3577,55 @@ test("D248/D250/D252 verifies Desktop WAL lock, installed physical readback and 
       Object.defineProperty(evidence, "contract", savedContractProperty)
     }
     await assertD248LateNestedEvidenceDrift(evidence, inspectV4DesktopPluginCompleteRecovery, "Desktop")
+    const savedOwnerProperty = Object.getOwnPropertyDescriptor(evidence, "owner")!
+    const lockPath = path.join(physicalWal, ".exclusive.lock")
+    const backupGitReader = evidence.backup.backupGit
+    const originalBackupBranch = backupGitReader.branchName
+    let ownerReadsWithLock = 0
+    Object.defineProperty(evidence, "owner", {
+      configurable: true, enumerable: true,
+      get: () => {
+        if (existsSync(lockPath)) ownerReadsWithLock++
+        return owner
+      },
+    })
+    try {
+      const steady = await inspectV4DesktopPluginCompleteRecovery(evidence)
+      assert.equal(steady.observation, "authenticated-complete-recovery-evidence-still-fenced")
+      const finalLockedRead = ownerReadsWithLock
+      assert.ok(finalLockedRead > 1)
+      ownerReadsWithLock = 0
+      let mutatedDuringCleanup = false
+      Object.defineProperty(evidence, "owner", {
+        configurable: true, enumerable: true,
+        get: () => {
+          if (existsSync(lockPath)) {
+            ownerReadsWithLock++
+            if (ownerReadsWithLock === finalLockedRead) {
+              queueMicrotask(() => {
+                mutatedDuringCleanup = true
+                Object.assign(backupGitReader, { branchName: originalBackupBranch + "-during-release" })
+              })
+            }
+          }
+          return owner
+        },
+      })
+      const altered = await inspectV4DesktopPluginCompleteRecovery(evidence)
+      assert.equal(mutatedDuringCleanup, true,
+        "the original Backup Git reader must drift in the async Desktop WAL release window")
+      assert.equal(ownerReadsWithLock, finalLockedRead,
+        "the mutation must occur after the final under-lock owner check")
+      assert.equal(altered.observation, "manual-recovery-required",
+        "Desktop must not return authenticated evidence that changed while its WAL lock released")
+      assert.equal(altered.completeOldBackupReverified, false)
+      assert.equal(altered.resumeSyncAuthorized, false)
+      assert.equal(altered.remoteWritesAuthorized, false)
+      assert.equal(existsSync(lockPath), false, "the OS WAL lock must be released before the report")
+    } finally {
+      Object.assign(backupGitReader, { branchName: originalBackupBranch })
+      Object.defineProperty(evidence, "owner", savedOwnerProperty)
+    }
     const after = await Promise.all([readFile(path.join(physicalWal, "slot-0.json")),
       readFile(path.join(physicalWal, "slot-1.json"))])
     assert.deepEqual(after, before)

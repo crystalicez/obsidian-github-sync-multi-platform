@@ -175,6 +175,8 @@ export async function inspectV4DesktopPluginCompleteRecovery(
   const isolation = "desktop-os-cooperative-wal-lock"
   let opened: Awaited<ReturnType<typeof openV4DesktopPluginWalForRecovery>> | undefined
   let keyCopy: Uint8Array | undefined
+  let result = manual(isolation)
+  let verifyAfterRelease: (() => void) | undefined
   try {
     const { owner, backup, contract, destination, originalJournalKey } = input
     checkEvidence(input, owner)
@@ -225,13 +227,21 @@ export async function inspectV4DesktopPluginCompleteRecovery(
     })
     await lease()
     pinned()
-    return observation(report, isolation)
+    result = observation(report, isolation)
+    verifyAfterRelease = pinned
   } catch {
-    return manual(isolation)
+    result = manual(isolation)
   } finally {
-    keyCopy?.fill(0)
-    await opened?.release()
+    try {
+      await opened?.release()
+      verifyAfterRelease?.()
+    } catch {
+      result = manual(isolation)
+    } finally {
+      keyCopy?.fill(0)
+    }
   }
+  return result
 }
 
 /**
