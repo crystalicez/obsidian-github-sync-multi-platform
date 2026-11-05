@@ -14,6 +14,7 @@ import {
   type V4LocalIndexAdapter,
 } from "./local-index"
 import { decodeV4RemoteConfig } from "./remote-index"
+import { assertV4GitBlobIdentity } from "./git-blob-identity"
 import { createV4ScopePredicate, isPathInV4SyncScope } from "./scope"
 import { assertV4PathLayoutCompatible, V4ChangeGuardError, V4PublishedLocalApplyError, V4RecoveryReplanRequiredError, V4SyncSession, type V4SyncRunState } from "./sync-session"
 import type { V4ConflictResolution } from "./conflicts"
@@ -32,6 +33,10 @@ import { openV4DesktopPluginWalForRecovery } from "./reencryption-desktop-plugin
 import { openV4MobilePluginWalForRecovery, type V4MobilePluginWalOwner } from "./reencryption-mobile-wal-recovery"
 import { tryReserveV4MobileRecoveryAdapter } from "./reencryption-mobile-recovery-reservation"
 import { planV4PluginPrivateWalLocation } from "./reencryption-plugin-wal-location"
+import { inspectV4ColdStartWalSnapshot } from "./reencryption-cold-start-wal-snapshot"
+import { planV4OrphanReencryptionDestination } from "./reencryption-orphan-branch"
+import { inspectV4DesktopPluginCompleteRecovery, inspectV4MobilePluginCompleteRecovery, type V4PluginCompleteRecoveryReport } from "./reencryption-plugin-complete-recovery"
+import type { V4ReencryptionObjectReceipt } from "./reencryption-staging-receipts"
 import {
   inspectV4ReencryptionCandidateGitRefs,
   type V4ReencryptionCandidateGitRefsReport,
@@ -53,7 +58,7 @@ import { V4_RUNTIME_INDEX_ROOT } from "./reencryption-index-root"
 import { inspectV4ReencryptionColdStartIndexRoute, type V4ReencryptionColdStartRouteReport } from "./reencryption-runtime-index-route"
 import { decodeV4ReencryptionCutoverCandidateManifest } from "./reencryption-cutover-candidate-manifest"
 import { V4_REENCRYPTION_RUNTIME_ROUTE_PATH } from "./reencryption-index-root"
-import { inspectV4ReencryptionColdStartJournalKey, type V4ReencryptionColdStartJournalReport, type V4ReencryptionColdStartJournalInput } from "./reencryption-cold-start-journal-key"
+import { inspectV4ReencryptionColdStartJournalKey, type V4ReencryptionColdStartJournalReport, type V4ReencryptionColdStartJournalInput, type V4VerifiedOriginalJournalKeyScope } from "./reencryption-cold-start-journal-key"
 const V4_INDEX_ROOT = V4_RUNTIME_INDEX_ROOT
 const V4_STAGE_ROOT = "github-sync-v4-stage"
 const V4_RECOVERY_ROOT = "github-sync-v4-recovery"
@@ -93,6 +98,18 @@ const V4_WAL_STRUCTURE_BASE = Object.freeze({
 })
 const V4_WAL_STRUCTURE_MANUAL: V4ReencryptionExistingWalStructureReport = Object.freeze({
   ...V4_WAL_STRUCTURE_BASE, observation: "manual-recovery-required",
+})
+const V4_COLD_START_ROUTE_MANUAL: V4ReencryptionColdStartRouteReport = Object.freeze({
+  integrityScope: "read-only-persisted-index-route-hint",
+  observation: "manual-recovery-required",
+  diagnosticIndexRoot: null,
+  routingHintAuthenticated: false,
+  commitDecisionAuthorized: false,
+  localCutoverAuthorized: false,
+  resumeSyncAuthorized: false,
+  rollbackAuthorized: false,
+  remoteWritesAuthorized: false,
+  oldPassphraseCleanupAuthorized: false,
 })
 
 interface V4ArmedReencryptionInitiator {
@@ -275,13 +292,52 @@ export class V4PluginRuntime {
   /** Read native disk evidence after restart; never authorizes Sync. */
   async inspectFencedReencryptionIndexRoute(): Promise<V4ReencryptionColdStartRouteReport> {
     this.assertNotDisposed()
-    const observed = await inspectV4ReencryptionColdStartIndexRoute({
-      adapter: this.adapter,
-      readPersistedPluginData: () => this.plugin.loadData(),
-      getSecret: id => this.plugin.app.secretStorage.getSecret(id),
-    })
-    this.coldStartIndexRoute = observed
-    return observed
+    const vault = this.plugin.app.vault
+    const backing = this.indexAdapterBacking as Pick<V4LocalIndexAdapter, "read" | "exists" | "stat"> | undefined
+    const nativeRead = backing?.read
+    const nativeExists = backing?.exists
+    const nativeStat = backing?.stat
+    const configDir = vault.configDir
+    const pluginId = this.plugin.manifest.id
+    const settings = this.plugin.settings
+    const generation = this.credentialGeneration
+    const secretStorage = this.plugin.app.secretStorage
+    const getSecret = secretStorage.getSecret
+    const loadData = this.plugin.loadData
+    const source = {
+      owner: settings?.githubOwner, repo: settings?.githubRepo,
+      branch: settings?.githubBranch, token: settings?.githubToken,
+      tokenSecretId: settings?.githubTokenSecretId,
+      passphraseSecretId: settings?.encryptionPassphraseSecretId,
+      mode: settings?.encryptionMode,
+    }
+    const stillOwned = () => !this.disposed && !!backing
+      && this.plugin.app.vault === vault && vault.adapter === backing
+      && this.indexAdapterBacking === backing && vault.configDir === configDir
+      && backing.read === nativeRead && backing.exists === nativeExists
+      && backing.stat === nativeStat
+      && this.plugin.manifest.id === pluginId && this.plugin.settings === settings
+      && this.credentialGeneration === generation
+      && this.plugin.app.secretStorage === secretStorage
+      && secretStorage.getSecret === getSecret && this.plugin.loadData === loadData
+      && settings?.githubOwner === source.owner && settings?.githubRepo === source.repo
+      && settings?.githubBranch === source.branch && settings?.githubToken === source.token
+      && settings?.githubTokenSecretId === source.tokenSecretId
+      && settings?.encryptionPassphraseSecretId === source.passphraseSecretId
+      && settings?.encryptionMode === source.mode
+      && !this.plugin.isSyncInProgress && !this.plugin.isSettingsSaveInProgress?.()
+      && !this.coordinator.isSyncing && this.coordinator.pendingCount === 0
+      && !this.debounceRunActive && this.recentlyStagedPaths.size === 0
+    const observed = stillOwned()
+      ? await inspectV4ReencryptionColdStartIndexRoute({
+        adapter: this.adapter,
+        readPersistedPluginData: () => loadData.call(this.plugin),
+        getSecret: id => getSecret.call(secretStorage, id),
+      })
+      : V4_COLD_START_ROUTE_MANUAL
+    const result = stillOwned() ? observed : V4_COLD_START_ROUTE_MANUAL
+    this.coldStartIndexRoute = result
+    return result
   }
 
   getReencryptionColdStartIndexRoute(): V4ReencryptionColdStartRouteReport | undefined {
@@ -300,6 +356,7 @@ export class V4PluginRuntime {
   private async verifyFencedReencryptionOriginalKeyWithWal(
     walEvidence?: V4ReencryptionColdStartJournalInput["walEvidence"],
     recoveryScope?: V4ReencryptionColdStartJournalInput["recoveryScope"],
+    withVerifiedOriginalJournalKey?: (evidence: V4VerifiedOriginalJournalKeyScope) => Promise<void>,
   ): Promise<V4ReencryptionColdStartJournalReport | null> {
     this.assertNotDisposed()
     const route = await this.inspectFencedReencryptionIndexRoute()
@@ -318,26 +375,54 @@ export class V4PluginRuntime {
     const configDir = originalVault.configDir
     const pluginId = this.plugin.manifest.id
     const credentialGeneration = this.credentialGeneration
+    const backing = this.indexAdapterBacking as Pick<V4LocalIndexAdapter, "read" | "exists" | "stat"> | undefined
+    const nativeRead = backing?.read
+    const nativeExists = backing?.exists
+    const nativeStat = backing?.stat
+    const secretStorage = this.plugin.app.secretStorage
+    const getSecret = secretStorage.getSecret
+    const loadData = this.plugin.loadData
+    const stillOwned = () => !this.disposed && !!backing
+      && this.indexAdapterBacking === backing
+      && this.plugin.app.vault === originalVault && originalVault.adapter === backing
+      && originalVault.configDir === configDir && this.plugin.manifest.id === pluginId
+      && backing.read === nativeRead && backing.exists === nativeExists
+      && backing.stat === nativeStat
+      && this.plugin.settings === settings && this.credentialGeneration === credentialGeneration
+      && settings.githubToken === token && settings.githubOwner === owner
+      && settings.githubRepo === repo && settings.githubBranch === branch
+      && settings.githubTokenSecretId === tokenSecretId
+      && settings.encryptionPassphraseSecretId === passphraseSecretId
+      && settings.encryptionMode === encryptionMode
+      && this.plugin.app.secretStorage === secretStorage
+      && secretStorage.getSecret === getSecret && this.plugin.loadData === loadData
+      && !this.plugin.isSyncInProgress && !this.plugin.isSettingsSaveInProgress?.()
+      && !this.coordinator.isSyncing && this.coordinator.pendingCount === 0
+      && !this.debounceRunActive && this.recentlyStagedPaths.size === 0
+    const assertOwner = () => {
+      if (!stillOwned()) throw Error("Re-encryption owner changed during read-only verification.")
+    }
     if (!token || !owner || !repo) {
       throw new Error("Re-encryption read-only verification needs the configured GitHub token.")
     }
-    const raw: unknown = JSON.parse(await this.adapter.read(V4_REENCRYPTION_RUNTIME_ROUTE_PATH))
+    if (!stillOwned()) return null
+    const rawText = await this.adapter.read(V4_REENCRYPTION_RUNTIME_ROUTE_PATH)
+    if (!stillOwned()) return null
+    const raw: unknown = JSON.parse(rawText)
     const runId = (raw as { runId?: unknown })?.runId
     if (typeof runId !== "string" || !/^[A-Za-z0-9_-]{8,128}$/u.test(runId)) {
       throw new Error("Re-encryption routing Intent is not valid.")
     }
-    const contract = decodeV4ReencryptionCutoverCandidateManifest(
-      await this.adapter.read(V4_INDEX_ROOT + "-rekey-cutover-candidate-" + runId + "/contract.json"),
+    const contractText = await this.adapter.read(
+      V4_INDEX_ROOT + "-rekey-cutover-candidate-" + runId + "/contract.json",
     )
+    if (!stillOwned()) return null
+    const contract = decodeV4ReencryptionCutoverCandidateManifest(contractText)
     const id = contract.identity
     const match = /^([^/#]+)\/([^/#]+)#(.+)$/u.exec(id.backupRepoId)
     if (!match || match[1] !== owner || match[2] !== repo || id.runId !== runId) {
       throw new Error("Re-encryption Backup repo differs from live plugin credentials.")
     }
-    const backing = this.indexAdapterBacking
-    const secretStorage = this.plugin.app.secretStorage
-    const getSecret = secretStorage.getSecret
-    const loadData = this.plugin.loadData
     const github = new GitHubClient({ token, owner, repo, branch: match[3]! })
     return inspectV4ReencryptionColdStartJournalKey({
       adapter: this.adapter,
@@ -346,25 +431,8 @@ export class V4PluginRuntime {
       backupGit: github,
       ...(walEvidence ? { walEvidence } : {}),
       ...(recoveryScope ? { recoveryScope } : {}),
-      assertLiveOwner: () => {
-        if (this.disposed || this.indexAdapterBacking !== backing
-          || this.plugin.app.vault !== originalVault
-          || originalVault.configDir !== configDir
-          || this.plugin.manifest.id !== pluginId
-          || this.plugin.app.vault.adapter !== backing
-          || this.plugin.settings !== settings || this.credentialGeneration !== credentialGeneration
-          || settings.githubToken !== token || settings.githubOwner !== owner
-          || settings.githubRepo !== repo || settings.githubBranch !== branch
-          || settings.githubTokenSecretId !== tokenSecretId
-          || settings.encryptionPassphraseSecretId !== passphraseSecretId
-          || settings.encryptionMode !== encryptionMode
-          || this.plugin.app.secretStorage !== secretStorage
-          || secretStorage.getSecret !== getSecret
-          || this.plugin.loadData !== loadData
-          || this.plugin.isSyncInProgress || this.plugin.isSettingsSaveInProgress?.()) {
-          throw Error("Re-encryption owner changed during read-only verification.")
-        }
-      },
+      ...(withVerifiedOriginalJournalKey ? { withVerifiedOriginalJournalKey } : {}),
+      assertLiveOwner: assertOwner,
     })
   }
 
@@ -542,6 +610,267 @@ export class V4PluginRuntime {
   }
 
   /**
+   * D277: join an independently authenticated, short-lived Old Journal Key
+   * with the actual installed WAL and D248 full Destination proof. Both
+   * platform paths remain read-only and return no Sync/Cutover authority.
+   */
+  async inspectFencedReencryptionCompleteRecovery(): Promise<V4PluginCompleteRecoveryReport | null> {
+    if (this.recoveryDiagnosticInProgress) return null
+    this.recoveryDiagnosticInProgress = true
+    try {
+      this.assertNotDisposed()
+      const vault = this.plugin.app.vault
+      const native = this.indexAdapterBacking as (V4MobilePluginWalOwner["adapter"] & {
+        exists(path: string): Promise<boolean>
+        getFullPath?: (path: string) => string
+      }) | undefined
+      if (!native) return null
+      const settings = this.plugin.settings
+      const configDir = vault.configDir || ".obsidian"
+      const pluginId = this.plugin.manifest.id
+      const generation = this.credentialGeneration
+      const desktop = Platform.isDesktopApp === true
+      const secretStorage = this.plugin.app.secretStorage
+      const getSecret = secretStorage.getSecret
+      const loadData = this.plugin.loadData
+      const methods = {
+        read: native?.read, exists: native?.exists,
+        stat: native?.stat, list: native?.list, fullPath: native?.getFullPath,
+      }
+      const credentials = {
+        owner: settings.githubOwner, repo: settings.githubRepo,
+        token: settings.githubToken, branch: settings.githubBranch,
+        tokenSecretId: settings.githubTokenSecretId,
+        passphraseSecretId: settings.encryptionPassphraseSecretId,
+        mode: settings.encryptionMode,
+      }
+      const checkOwner = () => {
+        this.assertNotDisposed()
+        if (!native || this.indexAdapterBacking !== native
+          || this.plugin.app.vault !== vault || vault.adapter !== native
+          || (vault.configDir || ".obsidian") !== configDir
+          || this.plugin.manifest.id !== pluginId || this.plugin.settings !== settings
+          || this.credentialGeneration !== generation || Platform.isDesktopApp !== desktop
+          || native.read !== methods.read || native.exists !== methods.exists
+          || native.stat !== methods.stat || native.list !== methods.list
+          || native.getFullPath !== methods.fullPath
+          || settings.githubOwner !== credentials.owner || settings.githubRepo !== credentials.repo
+          || settings.githubToken !== credentials.token || settings.githubBranch !== credentials.branch
+          || settings.githubTokenSecretId !== credentials.tokenSecretId
+          || settings.encryptionPassphraseSecretId !== credentials.passphraseSecretId
+          || settings.encryptionMode !== credentials.mode
+          || this.plugin.app.secretStorage !== secretStorage
+          || secretStorage.getSecret !== getSecret || this.plugin.loadData !== loadData
+          || this.plugin.isSyncInProgress || this.plugin.isSettingsSaveInProgress?.()
+          || this.coordinator.isSyncing || this.coordinator.pendingCount > 0
+          || this.debounceRunActive || this.recentlyStagedPaths.size > 0
+          || !this.recoveryDiagnosticInProgress) {
+          throw Error("Re-encryption complete Recovery installed owner changed.")
+        }
+      }
+      checkOwner()
+      if (!credentials.token || !credentials.owner || !credentials.repo
+        || (desktop && this.uncVault)) return null
+      const resultBox: { complete?: V4PluginCompleteRecoveryReport } = {}
+      const original = await this.verifyFencedReencryptionOriginalKeyWithWal(
+        undefined, undefined, async evidence => {
+          checkOwner()
+          const { contract, originalJournalKey, sourceConfig,
+            physicalRepositoryId, sourceDefaultBranch } = evidence
+          const id = contract.identity
+          const prefix = credentials.owner + "/" + credentials.repo + "#"
+          if (!id.sourceRepoId.startsWith(prefix)
+            || !id.backupRepoId.startsWith(prefix)
+            || !id.destinationRepoId.startsWith(prefix)) {
+            throw Error("Re-encryption Complete Recovery cross-repository Contract.")
+          }
+          const backupBranch = id.backupRepoId.slice(prefix.length)
+          const destinationBranch = id.destinationRepoId.slice(prefix.length)
+          if (!backupBranch || !destinationBranch || backupBranch === destinationBranch) {
+            throw Error("Re-encryption Complete Recovery invalid saved branch.")
+          }
+          const backupGit = new GitHubClient({
+            token: credentials.token, owner: credentials.owner,
+            repo: credentials.repo, branch: backupBranch,
+          })
+          const destinationGit = new GitHubClient({
+            token: credentials.token, owner: credentials.owner,
+            repo: credentials.repo, branch: destinationBranch,
+          })
+          const destinationCommit = await destinationGit.getGitCommit(id.destinationCommitSha)
+          checkOwner()
+          if (destinationCommit.sha !== id.destinationCommitSha
+            || destinationCommit.treeSha !== id.destinationTreeSha
+            || destinationCommit.parentShas.length !== 0) {
+            throw Error("Re-encryption Destination orphan commit changed.")
+          }
+          const tree = await destinationGit.getTreeAt(id.destinationTreeSha, true)
+          checkOwner()
+          if (tree.sha !== id.destinationTreeSha || tree.truncated !== false
+            || !Array.isArray(tree.tree) || tree.tree.length > 100_000) {
+            throw Error("Re-encryption Destination tree cannot be trusted.")
+          }
+          const entries = tree.tree.filter(node => node.path === V4_CONFIG_PATH)
+          if (entries.length !== 1 || entries[0]?.type !== "blob"
+            || entries[0].mode !== "100644") {
+            throw Error("Re-encryption Destination immutable config missing.")
+          }
+          const destinationConfigBytes = await destinationGit.getBlob(entries[0].sha)
+          checkOwner()
+          assertV4GitBlobIdentity(destinationConfigBytes, entries[0].sha)
+          const destinationConfig = decodeV4RemoteConfig(destinationConfigBytes)
+          if (destinationConfig.mode !== "encrypted"
+            || destinationConfig.repoId !== id.destinationRepoId) {
+            throw Error("Re-encryption Destination config does not match the Contract.")
+          }
+          const plan = planV4OrphanReencryptionDestination({
+            sourceRepoId: id.sourceRepoId,
+            destinationRepoId: id.destinationRepoId,
+            sourceCommitSha: id.sourceCommitSha,
+            sourcePhysicalRepositoryId: physicalRepositoryId,
+            destinationPhysicalRepositoryId: physicalRepositoryId,
+            expectedPhysicalRepositoryId: physicalRepositoryId,
+            defaultBranch: sourceDefaultBranch,
+          })
+          const layout = await planV4PluginPrivateWalLocation({
+            configDir, pluginId, runId: id.runId,
+          })
+          checkOwner()
+          let receipts: V4ReencryptionObjectReceipt[] | undefined
+          let releaseDesktop: (() => Promise<void>) | undefined
+          let releaseMobile: (() => void) | undefined
+          try {
+            let walAdapter: Pick<V4LocalIndexAdapter, "read" | "exists">
+            if (desktop) {
+              if (typeof native.getFullPath !== "function") {
+                throw Error("Re-encryption Desktop WAL path resolver unavailable.")
+              }
+              const wal = await openV4DesktopPluginWalForRecovery({
+                adapter: native as typeof native & { getFullPath(path: string): string },
+                configDir, pluginId, runId: id.runId, assertLiveOwner: checkOwner,
+              })
+              releaseDesktop = wal.release
+              await wal.assertExclusiveStageLease()
+              walAdapter = wal.adapter
+            } else {
+              const reserve = tryReserveV4MobileRecoveryAdapter(native)
+              if (!reserve) throw Error("Re-encryption Mobile Recovery already active.")
+              releaseMobile = reserve
+              const wal = await openV4MobilePluginWalForRecovery({
+                adapter: native, configDir, pluginId, runId: id.runId,
+                assertLiveOwner: checkOwner,
+              })
+              walAdapter = wal.adapter
+            }
+            checkOwner()
+            const evidenceReport = await inspectV4ColdStartWalSnapshot({
+              adapter: walAdapter, root: layout.journalRoot, contract,
+              originalJournalKey,
+              destinationCiphertextReadback: {
+                git: destinationGit, expectedPhysicalRepositoryId: physicalRepositoryId,
+              },
+              verifyAuthenticatedReceipts: async authenticated => {
+                checkOwner()
+                receipts = authenticated.map(receipt => ({ ...receipt }))
+                return true
+              },
+              assertLiveOwner: checkOwner,
+            })
+            checkOwner()
+            if (evidenceReport.observation !== "authenticated-current-wal-still-fenced"
+              || !evidenceReport.destinationCiphertextReceiptsReverified
+              || !receipts?.length) {
+              throw Error("Re-encryption WAL receipts unavailable after authenticated readback.")
+            }
+          } finally {
+            try {
+              await releaseDesktop?.()
+            } finally {
+              releaseMobile?.()
+            }
+          }
+          checkOwner()
+          const getSecretPinned = (id: string) => getSecret.call(secretStorage, id)
+          const passphrase = getSecretPinned(id.destinationPassphraseSecretId)
+          if (!passphrase) throw Error("Re-encryption Destination passphrase unavailable.")
+          const backup = {
+            adapter: this.adapter,
+            backupGit,
+            readPersistedPluginData: () => loadData.call(this.plugin),
+            getSecret: getSecretPinned,
+            assertLiveOwner: checkOwner,
+          }
+          const destination = {
+            adapter: this.adapter,
+            destinationGit,
+            expectedPhysicalRepositoryId: physicalRepositoryId,
+            getSecret: getSecretPinned,
+            assertLiveOwner: checkOwner,
+            remote: {
+              plan,
+              sourceConfig,
+              sourceTreeSha: id.sourceTreeSha,
+              expectedDestinationConfig: destinationConfig,
+              destinationCommitSha: id.destinationCommitSha,
+              expectedReceipts: receipts,
+              destinationPassphrase: passphrase,
+            },
+          }
+          const owner = {
+            adapter: native, configDir, pluginId, runId: id.runId,
+            assertLiveOwner: checkOwner,
+          }
+          let complete: V4PluginCompleteRecoveryReport
+          if (desktop) {
+            if (typeof native.getFullPath !== "function") {
+              throw Error("Re-encryption Desktop WAL path resolver unavailable.")
+            }
+            complete = await inspectV4DesktopPluginCompleteRecovery({
+              owner: { ...owner, adapter: native as typeof native & { getFullPath(path: string): string } },
+              backup, contract, destination, originalJournalKey,
+            })
+          } else {
+            let entered = false
+            let held = false
+            const assertLease = async () => {
+              checkOwner()
+              if (!held) throw Error("Re-encryption Mobile cooperative lease absent.")
+            }
+            complete = await inspectV4MobilePluginCompleteRecovery({
+              owner, backup, contract, destination, originalJournalKey,
+              withExclusiveCooperativeRecoveryLease: async <T>(body: () => Promise<T>): Promise<T> => {
+                if (entered || held) throw Error("Re-encryption Mobile recovery holder reentered.")
+                entered = true
+                held = true
+                try { checkOwner(); return await body() }
+                finally { held = false }
+              },
+              assertCooperativeRecoveryLease: assertLease,
+            })
+          }
+          checkOwner()
+          if (complete.observation !== "authenticated-complete-recovery-evidence-still-fenced"
+            || !complete.originalKeyAuthenticated || !complete.completeOldBackupReverified
+            || !complete.walReceiptsBoundToDestination
+            || !complete.completeDestinationContentsReverified) {
+            throw Error("Re-encryption D248 Complete Recovery remains unverified.")
+          }
+          resultBox.complete = complete
+        },
+      )
+      checkOwner()
+      const verified = resultBox.complete
+      return original?.originalKeyAuthenticated && original.completeBackupContentsReverified
+        && verified?.observation === "authenticated-complete-recovery-evidence-still-fenced"
+        ? verified : null
+    } catch {
+      return null
+    } finally {
+      this.recoveryDiagnosticInProgress = false
+    }
+  }
+
+  /**
    * Read-only D251 check of the saved candidate's current remote ref topology.
    * A Git ref matching local claims does not authenticate its encrypted files.
    */
@@ -549,7 +878,10 @@ export class V4PluginRuntime {
     try {
       this.assertNotDisposed()
       const vault = this.plugin.app.vault
-      const adapterBacking = this.indexAdapterBacking
+      const adapterBacking = this.indexAdapterBacking as Pick<V4LocalIndexAdapter, "read" | "exists" | "stat"> | undefined
+      const nativeRead = adapterBacking?.read
+      const nativeExists = adapterBacking?.exists
+      const nativeStat = adapterBacking?.stat
       const settings = this.plugin.settings
       const secretStorage = this.plugin.app.secretStorage
       const getSecret = secretStorage.getSecret
@@ -568,6 +900,8 @@ export class V4PluginRuntime {
         this.assertNotDisposed()
         if (this.plugin.app.vault !== vault || vault.adapter !== adapterBacking
           || this.indexAdapterBacking !== adapterBacking || vault.configDir !== configDir
+          || adapterBacking?.read !== nativeRead || adapterBacking?.exists !== nativeExists
+          || adapterBacking?.stat !== nativeStat
           || this.plugin.manifest.id !== pluginId
           || this.plugin.settings !== settings || this.credentialGeneration !== generation
           || settings.githubToken !== token || settings.githubOwner !== owner
@@ -785,13 +1119,52 @@ export class V4PluginRuntime {
   /** Read local Destination Shadow for Manual Recovery, not as a Sync writer. */
   async readFencedReencryptionDestinationIndexForRecovery(): Promise<V4LocalIndex | null> {
     this.assertNotDisposed()
+    const vault = this.plugin.app.vault
+    const backing = this.indexAdapterBacking
+    const nativeReader = backing as Pick<V4LocalIndexAdapter, "read" | "exists" | "stat"> | undefined
+    const nativeRead = nativeReader?.read
+    const nativeExists = nativeReader?.exists
+    const nativeStat = nativeReader?.stat
+    const configDir = vault.configDir
+    const pluginId = this.plugin.manifest.id
+    const settings = this.plugin.settings
+    const generation = this.credentialGeneration
+    const secretStorage = this.plugin.app.secretStorage
+    const getSecret = secretStorage.getSecret
+    const loadData = this.plugin.loadData
+    const source = {
+      owner: settings?.githubOwner, repo: settings?.githubRepo,
+      branch: settings?.githubBranch, token: settings?.githubToken,
+      tokenSecretId: settings?.githubTokenSecretId,
+      passphraseSecretId: settings?.encryptionPassphraseSecretId,
+      mode: settings?.encryptionMode,
+    }
+    const stillOwned = () => !this.disposed && !!backing
+      && this.plugin.app.vault === vault && vault.adapter === backing
+      && this.indexAdapterBacking === backing && vault.configDir === configDir
+      && nativeReader?.read === nativeRead && nativeReader?.exists === nativeExists
+      && nativeReader?.stat === nativeStat
+      && this.plugin.manifest.id === pluginId && this.plugin.settings === settings
+      && this.credentialGeneration === generation
+      && this.plugin.app.secretStorage === secretStorage
+      && secretStorage.getSecret === getSecret && this.plugin.loadData === loadData
+      && settings?.githubOwner === source.owner && settings?.githubRepo === source.repo
+      && settings?.githubBranch === source.branch && settings?.githubToken === source.token
+      && settings?.githubTokenSecretId === source.tokenSecretId
+      && settings?.encryptionPassphraseSecretId === source.passphraseSecretId
+      && settings?.encryptionMode === source.mode
+      && !this.plugin.isSyncInProgress && !this.plugin.isSettingsSaveInProgress?.()
+      && !this.coordinator.isSyncing && this.coordinator.pendingCount === 0
+      && !this.debounceRunActive && this.recentlyStagedPaths.size === 0
+    if (!stillOwned()) return null
     const observed = await this.inspectFencedReencryptionIndexRoute()
-    if (observed.observation !== "destination-shadow-diagnostic-only"
+    if (!stillOwned() || observed.observation !== "destination-shadow-diagnostic-only"
       || !observed.diagnosticIndexRoot) return null
     const root = observed.diagnosticIndexRoot
     const candidate = await loadV4LocalIndex(this.adapter, root)
+    if (!stillOwned()) return null
     const after = await this.inspectFencedReencryptionIndexRoute()
-    if (after.observation !== "destination-shadow-diagnostic-only"
+    if (!stillOwned() || after.observation !== "destination-shadow-diagnostic-only"
       || after.diagnosticIndexRoot !== root) return null
     return candidate
   }

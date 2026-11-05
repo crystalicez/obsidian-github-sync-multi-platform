@@ -4,7 +4,7 @@ import { deriveV4Keyring, type V4Keyring } from "./crypto"
 import { assertV4GitBlobIdentity } from "./git-blob-identity"
 import { readImmutableGitFile } from "./immutable-git-read"
 import { decodeV4RemoteConfig, decodeV4RemoteHead } from "./remote-index"
-import { V4_CONFIG_PATH, V4_HEAD_PATH } from "./protocol-types"
+import { V4_CONFIG_PATH, V4_HEAD_PATH, type V4RemoteConfig } from "./protocol-types"
 import { decodeV4ReencryptionCutoverCandidateManifest } from "./reencryption-cutover-candidate-manifest"
 import type { V4ReencryptionCutoverSnapshotContract } from "./reencryption-cutover-snapshot-contract"
 import {
@@ -25,12 +25,30 @@ const SHA = /^[0-9a-f]{40}$/u
 type BackupGit = Pick<GitHubClient,
   "branchName" | "getRepositoryIdentity" | "getRepositoryDefaultBranch" | "getGitRef" | "getGitCommit" | "getTreeAt" | "getBlob">
 
+export interface V4VerifiedOriginalJournalKeyScope {
+  /** Temporary copy; filled with zeros as soon as the awaited callback settles. */
+  readonly originalJournalKey: Uint8Array
+  readonly contract: V4ReencryptionCutoverSnapshotContract
+  readonly sourceConfig: V4RemoteConfig
+  readonly sourceDefaultBranch: string
+  readonly physicalRepositoryId: number
+}
+
 export interface V4ReencryptionColdStartJournalInput
   extends Omit<V4ReencryptionColdStartRouteInput, "journalKey" | "getSecret"> {
   /** A read-only client for the SAME GitHub repo, scoped to the frozen Backup branch. */
   readonly backupGit: BackupGit
   /** Reads the original key from Obsidian SecretStorage, never persists it. */
   readonly getSecret: (id: string) => string | null
+  /**
+   * Trusted installed caller only. Runs once after D235's complete immutable
+   * Backup/Contract proof; the only key reference passed to the caller is
+   * zeroed when this awaited scope ends. Never retain or persist a copy.
+   * Cannot be combined with a caller-held WAL recovery scope.
+   */
+  readonly withVerifiedOriginalJournalKey?: (
+    evidence: V4VerifiedOriginalJournalKeyScope,
+  ) => Promise<void>
   /** Optional D240 cross-check. Neither value is trusted until the frozen Backup authenticates it. */
   readonly expectedRecoveryBinding?: {
     readonly contract: V4ReencryptionCutoverSnapshotContract
@@ -200,12 +218,15 @@ async function inspectV4ColdStartJournalKeyUnderLease(
 export async function inspectV4ReencryptionColdStartJournalKey(
   input: V4ReencryptionColdStartJournalInput,
 ): Promise<V4ReencryptionColdStartJournalReport> {
+  if (input.recoveryScope && input.withVerifiedOriginalJournalKey) return MANUAL
   if (input.recoveryScope) return inspectV4ColdStartJournalKeyUnderLease(input)
   let keyring: V4Keyring | undefined
   let boundKeyCopy: Uint8Array | undefined
   try {
     const { adapter, backupGit, getSecret, readPersistedPluginData, assertLiveOwner,
-      expectedRecoveryBinding, walEvidence } = input
+      expectedRecoveryBinding, walEvidence, withVerifiedOriginalJournalKey: consumeKey } = input
+    if (consumeKey !== undefined && (typeof consumeKey !== "function"
+      || walEvidence || expectedRecoveryBinding)) return MANUAL
     const walRoot = walEvidence?.root
     const walAdapter = walEvidence?.adapter
     const walRead = walAdapter?.read
@@ -251,6 +272,7 @@ export async function inspectV4ReencryptionColdStartJournalKey(
       && input.getSecret === getSecret && input.readPersistedPluginData === readPersistedPluginData
       && input.assertLiveOwner === assertLiveOwner
       && input.expectedRecoveryBinding === expectedRecoveryBinding
+      && input.withVerifiedOriginalJournalKey === consumeKey
       && input.walEvidence === walEvidence
       && (!walEvidence || (walEvidence.root === walRoot
         && walEvidence.adapter === walAdapter
@@ -517,6 +539,38 @@ export async function inspectV4ReencryptionColdStartJournalKey(
       check()
       if (finalWal.observation !== "authenticated-current-wal-still-fenced"
         || !finalWal.walSnapshotAuthenticated || !finalWal.walMatchesCutoverContract) return MANUAL
+    }
+    if (consumeKey) {
+      const temporaryKey = Uint8Array.from(keyring.journalKey)
+      const sourceConfigText = JSON.stringify(config)
+      try {
+        check()
+        await consumeKey(Object.freeze({
+          originalJournalKey: temporaryKey, contract,
+          sourceConfig: config, sourceDefaultBranch: defaultBranch,
+          physicalRepositoryId: physical.id,
+        }))
+        check()
+        if (!same32Bytes(temporaryKey, keyring.journalKey)
+          || JSON.stringify(config) !== sourceConfigText) return MANUAL
+        const [afterRef, afterPhysical, afterDefault] = await Promise.all([
+          pinned.ref.call(backupGit), pinned.repo.call(backupGit),
+          pinned.defaultBranch.call(backupGit),
+        ])
+        check()
+        if (afterRef.ref !== expectedRef || afterRef.type !== "commit"
+          || afterRef.sha !== identity.sourceCommitSha
+          || afterPhysical.id !== physical.id || afterPhysical.fullName !== physical.fullName
+          || afterDefault !== defaultBranch
+          || await pinned.read.call(adapter, V4_REENCRYPTION_RUNTIME_ROUTE_PATH) !== routeText
+          || await pinned.read.call(adapter,
+            "github-sync-v4-index-rekey-cutover-candidate-" + data.runId + "/contract.json") !== manifestText
+          || getSecret(identity.sourcePassphraseSecretId) !== originalPassphrase
+          || getSecret(identity.destinationPassphraseSecretId) !== destinationPassphrase) return MANUAL
+        check()
+      } finally {
+        temporaryKey.fill(0)
+      }
     }
     return Object.freeze({
       ...BASE, observation: "authenticated-local-route-still-fenced",

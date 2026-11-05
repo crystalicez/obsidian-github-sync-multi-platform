@@ -2109,6 +2109,87 @@ test("D235 rederives the original journal key from immutable encrypted Backup co
   await assert.rejects(assertV4ReencryptionSyncFenceClear(s.f.s.adapter))
 })
 
+test("D277 verified Old Journal Key is available only inside an awaited scope, then wiped", async () => {
+  const s = await d235Scenario()
+  const files = new Map(s.f.s.files)
+  const secrets = new Map(s.f.s.secrets)
+  const writes = s.f.s.getWrites()
+  let retained: Uint8Array | undefined
+  let calls = 0
+  const good = await inspectV4ReencryptionColdStartJournalKey({
+    ...s.input,
+    withVerifiedOriginalJournalKey: async evidence => {
+      calls++
+      retained = evidence.originalJournalKey
+      assert.deepEqual(evidence.originalJournalKey, s.oldJournalKey)
+      assert.equal(evidence.contract.identity.runId, s.f.id.runId)
+      assert.equal(evidence.sourceConfig.repoId, s.f.id.sourceRepoId)
+      assert.equal(evidence.sourceDefaultBranch, "main")
+      assert.equal(evidence.physicalRepositoryId, 88)
+      await Promise.resolve()
+      assert.deepEqual(retained, s.oldJournalKey, "the scoped key remains usable across awaited read-only work")
+    },
+  })
+  assert.equal(good.observation, "authenticated-local-route-still-fenced")
+  assert.equal(calls, 1)
+  assert.ok(retained?.every(byte => byte === 0), "the callback's retained key reference is zeroed on return")
+  assert.equal(good.resumeSyncAuthorized, false)
+  assert.equal(good.localCutoverAuthorized, false)
+
+  retained = undefined
+  const rejected = await inspectV4ReencryptionColdStartJournalKey({
+    ...s.input,
+    withVerifiedOriginalJournalKey: async evidence => {
+      retained = evidence.originalJournalKey
+      throw Error("D277 simulated interrupted proof")
+    },
+  })
+  assert.equal(rejected.observation, "manual-recovery-required")
+  assert.equal(rejected.originalKeyAuthenticated, false)
+  assert.ok(retained?.every(byte => byte === 0), "the callback's key is zeroed after a rejection")
+  retained = undefined
+  const alteredKey = await inspectV4ReencryptionColdStartJournalKey({
+    ...s.input,
+    withVerifiedOriginalJournalKey: async evidence => {
+      retained = evidence.originalJournalKey
+      evidence.originalJournalKey[0] = evidence.originalJournalKey[0]! ^ 1
+    },
+  })
+  assert.equal(alteredKey.observation, "manual-recovery-required",
+    "a callback that changes its scoped key cannot publish authenticated recovery evidence")
+  assert.equal(alteredKey.originalKeyAuthenticated, false)
+  assert.ok(retained?.every(byte => byte === 0), "a mutated key reference must still be wiped")
+  const sourceSecretId = s.f.id.sourcePassphraseSecretId
+  s.f.s.secrets.set(sourceSecretId, "wrong-old-recovery-passphrase")
+  let rejectedCallbackCalled = false
+  try {
+    const untrusted = await inspectV4ReencryptionColdStartJournalKey({
+      ...s.input,
+      withVerifiedOriginalJournalKey: async () => { rejectedCallbackCalled = true },
+    })
+    assert.equal(untrusted.observation, "manual-recovery-required")
+    assert.equal(rejectedCallbackCalled, false,
+      "a wrong old passphrase must not enter the key-bearing callback")
+  } finally {
+    s.f.s.secrets.set(sourceSecretId, secrets.get(sourceSecretId)!)
+  }
+  const forbiddenScope = await inspectV4ReencryptionColdStartJournalKey({
+    ...s.input,
+    withVerifiedOriginalJournalKey: async () => { rejectedCallbackCalled = true },
+    recoveryScope: {
+      withExclusiveRecoveryLease: async <T>(body: () => Promise<T>) => body(),
+      assertExclusiveRecoveryLease: async () => {},
+      assertBestEffortWalCheckpoint: async () => "best-effort-readback-only" as const,
+    },
+  })
+  assert.equal(forbiddenScope.observation, "manual-recovery-required")
+  assert.equal(rejectedCallbackCalled, false,
+    "a separate WAL lease cannot be smuggled into the ephemeral key scope")
+  assert.deepEqual(s.f.s.files, files)
+  assert.deepEqual(s.f.s.secrets, secrets)
+  assert.equal(s.f.s.getWrites(), writes)
+})
+
 test("D249 installed read-only recovery refuses mutable Settings branch drift during Git inspection", async () => {
   const s = await d235Scenario()
   const persisted = JSON.parse(s.saved) as { settings: Record<string, unknown> }
@@ -2162,6 +2243,57 @@ test("D249 installed read-only recovery refuses mutable Settings branch drift du
     assert.equal(stable?.observation, "authenticated-local-route-still-fenced")
     assert.equal(stable?.completeBackupContentsReverified, true)
     assert.equal(stable?.resumeSyncAuthorized, false)
+    const originalNativeRead = nativeAdapter.read
+    const originalNativeExists = nativeAdapter.exists
+    const stableIdentityStub = prototype["getRepositoryIdentity"]!
+    for (const replaced of ["read", "exists"] as const) {
+      let replacedNativeReaderDuringGit = false
+      prototype["getRepositoryIdentity"] = async (...args: never[]) => {
+        const identity = await backupGit["getRepositoryIdentity"]!(...args)
+        if (!replacedNativeReaderDuringGit) {
+          replacedNativeReaderDuringGit = true
+          if (replaced === "read") nativeAdapter.read = async path => originalNativeRead(path)
+          else nativeAdapter.exists = async path => originalNativeExists(path)
+        }
+        return identity
+      }
+      try {
+        const raced = await runtime.verifyFencedReencryptionOriginalKey()
+        assert.equal(replacedNativeReaderDuringGit, true,
+          "switch the same physical Adapter's " + replaced + " method during old Backup Git verification")
+        assert.ok(raced === null || raced.observation === "manual-recovery-required",
+          "replaced native reader must never return authenticated Old Key evidence")
+        assert.equal(raced?.originalKeyAuthenticated ?? false, false)
+        assert.equal(raced?.resumeSyncAuthorized ?? false, false)
+      } finally {
+        nativeAdapter.read = originalNativeRead
+        nativeAdapter.exists = originalNativeExists
+        prototype["getRepositoryIdentity"] = stableIdentityStub
+      }
+    }
+    let contractReads = 0
+    nativeAdapter.read = async path => {
+      const contents = await originalNativeRead(path)
+      if (path.includes("-rekey-cutover-candidate-") && path.endsWith("/contract.json")) {
+        contractReads++
+        if (contractReads === 2) nativeAdapter.read = async next => originalNativeRead(next)
+      }
+      return contents
+    }
+    try {
+      const racedContract = await runtime.verifyFencedReencryptionOriginalKey()
+      assert.equal(contractReads, 2,
+        "change the native reader on the installed Contract read after the cold-start route")
+      assert.ok(racedContract === null || racedContract.observation === "manual-recovery-required")
+      assert.equal(racedContract?.originalKeyAuthenticated ?? false, false)
+    } finally {
+      nativeAdapter.read = originalNativeRead
+    }
+    const restored = await runtime.verifyFencedReencryptionOriginalKey()
+    assert.equal(restored?.observation, "authenticated-local-route-still-fenced",
+      "original key can be verified again after restoring the installed Adapter")
+    assert.equal(restored?.originalKeyAuthenticated, true)
+    assert.equal(restored?.resumeSyncAuthorized, false)
     assert.deepEqual(s.f.s.files, before, "no local WAL or Index is altered")
   } finally {
     methods.forEach((name, index) => { prototype[name] = originals[index]! })
@@ -2843,6 +2975,34 @@ test("D251 installed read-only Git ref inspection pins live Settings across awai
     assert.equal(good?.destinationOrphanTopologyObserved, true)
     assert.equal(good?.fullDestinationContentsReverified, false)
     assert.equal(good?.resumeSyncAuthorized, false)
+    const originalNativeRead = nativeAdapter.read
+    const originalNativeExists = nativeAdapter.exists
+    for (const replaced of ["read", "exists"] as const) {
+      let swappedDuringContractRead = false
+      nativeAdapter.read = async path => {
+        const contents = await originalNativeRead(path)
+        if (!swappedDuringContractRead && path.includes("rekey-cutover-candidate-")
+          && path.endsWith("/contract.json")) {
+          swappedDuringContractRead = true
+          if (replaced === "read") nativeAdapter.read = async next => originalNativeRead(next)
+          else nativeAdapter.exists = async next => originalNativeExists(next)
+        }
+        return contents
+      }
+      try {
+        const raced = await runtime.inspectFencedReencryptionCandidateGitRefs()
+        assert.equal(swappedDuringContractRead, true,
+          "inject a same-Adapter reader switch on the installed candidate Contract read")
+        assert.equal(raced, null,
+          "a replaced native " + replaced + " method must invalidate read-only Git ref preflight")
+      } finally {
+        nativeAdapter.read = originalNativeRead
+        nativeAdapter.exists = originalNativeExists
+      }
+    }
+    const restored = await runtime.inspectFencedReencryptionCandidateGitRefs()
+    assert.equal(restored?.observation, "candidate-remote-refs-observed-untrusted",
+      "stable native reader methods can inspect Git refs again")
     drift = true
     const changed = await runtime.inspectFencedReencryptionCandidateGitRefs()
     assert.equal(changed, null, "Settings changes while Git is pending must fail closed")
@@ -3455,6 +3615,43 @@ test("D248/D250/D252 verifies Desktop WAL lock, installed physical readback and 
         assert.equal(authenticated?.recoveryLeaseReverified, true)
         assert.equal(authenticated?.resumeSyncAuthorized, false)
         assert.equal(authenticated?.localCutoverAuthorized, false)
+        const firstComplete = runtime.inspectFencedReencryptionCompleteRecovery()
+        assert.equal(await runtime.inspectFencedReencryptionCompleteRecovery(), null,
+          "a second Complete Recovery invocation must not overlap the first installed owner")
+        const complete = await firstComplete
+        assert.equal(complete?.observation, "authenticated-complete-recovery-evidence-still-fenced",
+          "D277 installed Runtime must independently join the authenticated old key with physical WAL and full Destination")
+        assert.equal(complete?.completeOldBackupReverified, true)
+        assert.equal(complete?.walReceiptsBoundToDestination, true)
+        assert.equal(complete?.completeDestinationContentsReverified, true)
+        assert.equal(complete?.localCutoverAuthorized, false)
+        assert.equal(complete?.resumeSyncAuthorized, false)
+        const stableDestinationCommit = destinationGit["getGitCommit"]!
+        destinationGit["getGitCommit"] = async (...args: never[]) => {
+          const commit = (await stableDestinationCommit.call(destinationGit as never, ...args)) as {
+            sha: string; treeSha: string; parentShas: string[]
+          }
+          return { ...commit, treeSha: "0".repeat(40) }
+        }
+        try {
+          const stale = await runtime.inspectFencedReencryptionCompleteRecovery()
+          assert.equal(stale, null,
+            "a Destination commit with wrong tree must not produce installed Complete Recovery proof")
+        } finally {
+          destinationGit["getGitCommit"] = stableDestinationCommit
+        }
+        const afterRestore = await runtime.inspectFencedReencryptionCompleteRecovery()
+        assert.equal(afterRestore?.observation, "authenticated-complete-recovery-evidence-still-fenced",
+          "a failed Git identity check must release the WAL owner for a valid retry")
+        const competingReader = await openV4ExistingDesktopWalForRecovery({
+          rootAbsolute: pluginRoot, journalRoot: layout.journalRoot,
+        })
+        try {
+          assert.equal(await runtime.inspectFencedReencryptionCompleteRecovery(), null,
+            "D277 installed Desktop Complete Recovery must refuse a competing WAL OS lock")
+        } finally {
+          await competingReader.release()
+        }
         // The installed Desktop Runtime, unlike the D248 helper, also
         // returns from try before awaiting its physical WAL lock release.
         const physicalLock = path.join(physicalWal, ".exclusive.lock")
@@ -3983,6 +4180,31 @@ test("D248/D250/D252/D260/D262 Mobile existing WAL, one-owner proof and in-proce
       assert.equal(authenticated?.completeDestinationContentsReverified, true)
       assert.equal(authenticated?.recoveryLeaseReverified, true)
       assert.equal(authenticated?.resumeSyncAuthorized, false)
+      const firstComplete = runtime.inspectFencedReencryptionCompleteRecovery()
+      assert.equal(await runtime.inspectFencedReencryptionCompleteRecovery(), null,
+        "the installed Mobile owner must refuse overlapping complete diagnostics")
+      const complete = await firstComplete
+      assert.equal(complete?.observation, "authenticated-complete-recovery-evidence-still-fenced",
+        "D277 Mobile installed Runtime reauthenticates the old key, WAL and full Destination")
+      assert.equal(complete?.isolation, "mobile-cooperative-best-effort-only")
+      assert.equal(complete?.mobileOsLockProven, false)
+      assert.equal(complete?.installedObsidianAcceptanceProven, false)
+      assert.equal(complete?.powerLossDurabilityProven, false)
+      assert.equal(complete?.completeOldBackupReverified, true)
+      assert.equal(complete?.completeDestinationContentsReverified, true)
+      assert.equal(complete?.resumeSyncAuthorized, false)
+      const slotPath = layout.vaultLogicalWalRoot + "/slot-0.json"
+      const slot = files.get(slotPath)!
+      const corrupt = JSON.parse(slot) as { digest: string }
+      corrupt.digest = (corrupt.digest[0] === "0" ? "1" : "0") + corrupt.digest.slice(1)
+      files.set(slotPath, JSON.stringify(corrupt))
+      try {
+        const refused = await runtime.inspectFencedReencryptionCompleteRecovery()
+        assert.equal(refused, null, "corrupt physical Mobile WAL must not yield Complete Recovery proof")
+      } finally {
+        files.set(slotPath, slot)
+      }
+      assert.deepEqual(files, before, "D277 Mobile Recovery must preserve WAL bytes")
       // Two installed Runtime instances can briefly share one Obsidian vault
       // adapter (e.g. hot reload). Mobile cannot claim an OS WAL lock.
       const otherRuntime = new V4PluginRuntime({
@@ -4499,9 +4721,14 @@ test("D234 Runtime read-only Destination Shadow route uses native persistent plu
     mkdir: (path: string) => disk.mkdir(path.replace(prefix, "")),
     exists: (path: string) => disk.exists(path.replace(prefix, "")),
   }
+  const vault = { configDir: ".obsidian", adapter: nativeAdapter }
+  const runtimeSettings = {
+    ...(JSON.parse(s.saved) as { settings: Record<string, string> }).settings,
+  }
   const runtime = new V4PluginRuntime({
+    settings: runtimeSettings,
     app: {
-      vault: { configDir: ".obsidian", adapter: nativeAdapter },
+      vault,
       secretStorage: { getSecret: (id: string) => s.f.s.secrets.get(id) ?? null },
     },
     manifest: { id: "test-d234" },
@@ -4514,6 +4741,127 @@ test("D234 Runtime read-only Destination Shadow route uses native persistent plu
     const shadow = await runtime.readFencedReencryptionDestinationIndexForRecovery()
     assert.equal(shadow?.repoId, s.f.id.destinationRepoId)
     assert.equal(shadow?.remoteCommitSha, s.f.id.destinationCommitSha)
+    const originalRead = nativeAdapter.read
+    let swappedDuringStartupRead = false
+    nativeAdapter.read = async path => {
+      const value = await originalRead(path)
+      if (!swappedDuringStartupRead && path.includes("/github-sync-v4-index-rekey-")
+        && path.endsWith("/index.json")) {
+        swappedDuringStartupRead = true
+        vault.adapter = { ...nativeAdapter }
+      }
+      return value
+    }
+    try {
+      const racedRoute = await runtime.inspectFencedReencryptionIndexRoute()
+      assert.equal(swappedDuringStartupRead, true, "inject while startup reads the real shadow Index")
+      assert.equal(racedRoute.observation, "manual-recovery-required",
+        "a replaced vault Adapter must not leave a stale startup recovery route")
+      assert.equal(racedRoute.diagnosticIndexRoot, null)
+      assert.equal(runtime.getReencryptionColdStartIndexRoute(), racedRoute,
+        "a stale startup report must not remain in the cache")
+    } finally {
+      vault.adapter = nativeAdapter
+      nativeAdapter.read = originalRead
+    }
+    const reopenedRoute = await runtime.inspectFencedReencryptionIndexRoute()
+    assert.equal(reopenedRoute.observation, "destination-shadow-diagnostic-only",
+      "a stable startup owner can inspect the route again")
+    const startupExists = nativeAdapter.exists
+    for (const drift of ["branch", "read", "exists"] as const) {
+      const originalBranch = runtimeSettings.githubBranch
+      let changedDuringStartupRead = false
+      nativeAdapter.read = async path => {
+        const text = await originalRead(path)
+        if (!changedDuringStartupRead && path.includes("/github-sync-v4-index-rekey-")
+          && path.endsWith("/index.json")) {
+          changedDuringStartupRead = true
+          if (drift === "branch") runtimeSettings.githubBranch = originalBranch + "-startup-race"
+          else if (drift === "read") nativeAdapter.read = async next => originalRead(next)
+          else nativeAdapter.exists = async next => startupExists(next)
+        }
+        return text
+      }
+      try {
+        const racedRoute = await runtime.inspectFencedReencryptionIndexRoute()
+        assert.equal(changedDuringStartupRead, true)
+        assert.equal(racedRoute.observation, "manual-recovery-required",
+          "a same-owner " + drift + " change must invalidate startup recovery evidence")
+        assert.equal(racedRoute.diagnosticIndexRoot, null)
+        assert.equal(runtime.getReencryptionColdStartIndexRoute(), racedRoute)
+      } finally {
+        runtimeSettings.githubBranch = originalBranch
+        nativeAdapter.read = originalRead
+        nativeAdapter.exists = startupExists
+      }
+    }
+    assert.equal((await runtime.inspectFencedReencryptionIndexRoute()).observation,
+      "destination-shadow-diagnostic-only", "startup scan succeeds after restoring the owner")
+    let swappedDuringShadowRead = false
+    nativeAdapter.read = async path => {
+      const value = await originalRead(path)
+      if (!swappedDuringShadowRead && path.includes("/github-sync-v4-index-rekey-")
+        && path.endsWith("/index.json")) {
+        swappedDuringShadowRead = true
+        vault.adapter = { ...nativeAdapter }
+      }
+      return value
+    }
+    try {
+      const raced = await runtime.readFencedReencryptionDestinationIndexForRecovery()
+      assert.equal(swappedDuringShadowRead, true, "inject on the real shadow header read")
+      assert.equal(raced, null,
+        "a switched vault adapter must invalidate the read-only Destination report")
+    } finally {
+      vault.adapter = nativeAdapter
+      nativeAdapter.read = originalRead
+    }
+    const originalBranch = runtimeSettings.githubBranch
+    let changedBranchDuringShadowRead = false
+    nativeAdapter.read = async path => {
+      const value = await originalRead(path)
+      if (!changedBranchDuringShadowRead && path.includes("/github-sync-v4-index-rekey-")
+        && path.endsWith("/index.json")) {
+        changedBranchDuringShadowRead = true
+        runtimeSettings.githubBranch = originalBranch + "-changed"
+      }
+      return value
+    }
+    try {
+      const raced = await runtime.readFencedReencryptionDestinationIndexForRecovery()
+      assert.equal(changedBranchDuringShadowRead, true)
+      assert.equal(raced, null,
+        "changed credentials on the same Settings object must invalidate Destination recovery")
+    } finally {
+      runtimeSettings.githubBranch = originalBranch
+      nativeAdapter.read = originalRead
+    }
+    const originalExists = nativeAdapter.exists
+    for (const changedMethod of ["read", "exists"] as const) {
+      let replacedDuringShadowRead = false
+      nativeAdapter.read = async path => {
+        const value = await originalRead(path)
+        if (!replacedDuringShadowRead && path.includes("/github-sync-v4-index-rekey-")
+          && path.endsWith("/index.json")) {
+          replacedDuringShadowRead = true
+          if (changedMethod === "read") nativeAdapter.read = async next => originalRead(next)
+          else nativeAdapter.exists = async next => originalExists(next)
+        }
+        return value
+      }
+      try {
+        const raced = await runtime.readFencedReencryptionDestinationIndexForRecovery()
+        assert.equal(replacedDuringShadowRead, true)
+        assert.equal(raced, null,
+          "replacing the same vault Adapter's " + changedMethod + " method must invalidate the recovery read")
+      } finally {
+        nativeAdapter.read = originalRead
+        nativeAdapter.exists = originalExists
+      }
+    }
+    const restored = await runtime.readFencedReencryptionDestinationIndexForRecovery()
+    assert.equal(restored?.repoId, s.f.id.destinationRepoId,
+      "a stable live owner can inspect the Destination Shadow again")
     assert.equal(s.f.s.getWrites(), writes, "the read-only Runtime recovery route never writes")
     await assert.rejects(() => runtime.assertReencryptionSettingsSaveAllowed(),
       /Re-encryption|pending/i)

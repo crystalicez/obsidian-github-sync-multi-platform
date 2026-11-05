@@ -230,6 +230,44 @@ export default class FastSync extends Plugin {
       },
     })
 
+    this.addCommand({
+      id: "verify-reencryption-complete-recovery-read-only",
+      name: "GitHub Sync: Verify Complete Re-encryption Recovery (Read-only)",
+      callback: () => {
+        new Notice(
+          "GitHub Sync: Checking Old Backup, encrypted WAL and Destination (read-only). This may take time; no Cutover or Sync will run.",
+          8000,
+        )
+        void (async () => {
+          try {
+            const report = await this.v4Runtime.inspectFencedReencryptionCompleteRecovery()
+            if (this.unloaded) return
+            if (report?.observation === "authenticated-complete-recovery-evidence-still-fenced"
+              && report.originalKeyAuthenticated && report.completeOldBackupReverified
+              && report.walReceiptsBoundToDestination
+              && report.completeDestinationContentsReverified) {
+              new Notice(
+                report.isolation === "mobile-cooperative-best-effort-only"
+                  ? "GitHub Sync: Old Backup, encrypted WAL and full Destination verified in a read-only Mobile scan. Mobile exclusion is best-effort only; no OS lock or power-loss durability is proven. Cutover and Sync stay blocked."
+                  : "GitHub Sync: Old Backup, encrypted WAL and full Destination verified in a read-only Desktop scan with a cooperative WAL lock. Cutover, Sync restart and multi-device safety are not authorized.",
+                12000,
+              )
+            } else {
+              new Notice(
+                "GitHub Sync: Complete Re-encryption Recovery could not be independently verified. Keep both passphrases and all recovery files; use Manual Recovery. Sync stays paused.",
+                12000,
+              )
+            }
+          } catch {
+            if (!this.unloaded) new Notice(
+              "GitHub Sync: Read-only Complete Recovery check unavailable. Keep both passphrases; Sync stays paused.",
+              12000,
+            )
+          }
+        })()
+      },
+    })
+
     // After the workspace layout is ready, run the startup sync once, then enable real-time watch
     this.app.workspace.onLayoutReady(() => {
       if (shouldRunStartupSync(this.settings)) {
