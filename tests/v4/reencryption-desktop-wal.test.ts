@@ -162,6 +162,25 @@ test("D119 overlapping leaf flushes fail closed in either completion order until
   }
 })
 
+test("D292 invalidation during a pending WAL leaf fsync cannot resurrect old crash-durability proof", async () => {
+  const proof = new V4RekeyWalDirectorySyncProof()
+  let resolveFlush!: (synced: boolean) => void
+  const pending = new Promise<boolean>(resolve => { resolveFlush = resolve })
+  const flushing = proof.refresh(true, () => pending)
+  assert.throws(() => proof.assertConfirmed(), /fsync|durability/i)
+
+  // A new WAL mutation can invalidate an in-flight directory flush.
+  // Its later successful completion must NOT certify the newer generation.
+  proof.invalidate()
+  resolveFlush(true)
+  await flushing
+  assert.throws(() => proof.assertConfirmed(), /fsync|durability/i,
+    "a completed stale fsync cannot reauthorize crash durability after invalidation")
+
+  await proof.refresh(true, async () => true)
+  proof.assertConfirmed()
+})
+
 test("D126 real Windows WAL lease serializes two journal instances sharing its live adapter", async () => {
   const t = await sandbox()
   try {

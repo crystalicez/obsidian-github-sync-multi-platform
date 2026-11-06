@@ -62,10 +62,12 @@ export class V4RekeyWalDirectorySyncProof {
     }
   }
 
-  // Any new WAL mutation invalidates prior fsync evidence synchronously,
-  // BEFORE its first asynchronous filesystem operation or rename.
+  // Any new WAL mutation invalidates prior and still-pending fsync evidence
+  // synchronously, BEFORE its first asynchronous filesystem operation or rename.
   invalidate(): void {
     this.confirmed = false
+    // A pending refresh must not revive durability after this mutation.
+    this.latestAttempt++
   }
 
   assertConfirmed(): void {
