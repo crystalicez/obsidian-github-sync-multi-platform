@@ -301,6 +301,7 @@ export class V4PluginRuntime {
     const pluginId = this.plugin.manifest.id
     const settings = this.plugin.settings
     const generation = this.credentialGeneration
+    const syncGeneration = this.coordinator.syncExecutionGeneration
     const secretStorage = this.plugin.app.secretStorage
     const getSecret = secretStorage.getSecret
     const loadData = this.plugin.loadData
@@ -318,6 +319,7 @@ export class V4PluginRuntime {
       && backing.stat === nativeStat
       && this.plugin.manifest.id === pluginId && this.plugin.settings === settings
       && this.credentialGeneration === generation
+      && this.coordinator.syncExecutionGeneration === syncGeneration
       && this.plugin.app.secretStorage === secretStorage
       && secretStorage.getSecret === getSecret && this.plugin.loadData === loadData
       && settings?.githubOwner === source.owner && settings?.githubRepo === source.repo
@@ -375,6 +377,7 @@ export class V4PluginRuntime {
     const configDir = originalVault.configDir
     const pluginId = this.plugin.manifest.id
     const credentialGeneration = this.credentialGeneration
+    const syncGeneration = this.coordinator.syncExecutionGeneration
     const backing = this.indexAdapterBacking as Pick<V4LocalIndexAdapter, "read" | "exists" | "stat"> | undefined
     const nativeRead = backing?.read
     const nativeExists = backing?.exists
@@ -389,6 +392,7 @@ export class V4PluginRuntime {
       && backing.read === nativeRead && backing.exists === nativeExists
       && backing.stat === nativeStat
       && this.plugin.settings === settings && this.credentialGeneration === credentialGeneration
+      && this.coordinator.syncExecutionGeneration === syncGeneration
       && settings.githubToken === token && settings.githubOwner === owner
       && settings.githubRepo === repo && settings.githubBranch === branch
       && settings.githubTokenSecretId === tokenSecretId
@@ -472,6 +476,7 @@ export class V4PluginRuntime {
         releaseMobileReservation = release
       }
       const generation = this.credentialGeneration
+      const syncGeneration = this.coordinator.syncExecutionGeneration
       const pinned = {
         owner: settings.githubOwner, repo: settings.githubRepo,
         branch: settings.githubBranch, token: settings.githubToken,
@@ -486,6 +491,7 @@ export class V4PluginRuntime {
           || vault.configDir !== originalConfigDir
           || this.plugin.settings !== settings || this.plugin.manifest.id !== pluginId
           || this.credentialGeneration !== generation || Platform.isDesktopApp !== desktop
+          || this.coordinator.syncExecutionGeneration !== syncGeneration
           || native.read !== nativeRead || native.exists !== nativeExists
           || native.stat !== nativeStat || native.list !== nativeList
           || native.getFullPath !== nativeGetFullPath
@@ -629,6 +635,7 @@ export class V4PluginRuntime {
       const configDir = vault.configDir || ".obsidian"
       const pluginId = this.plugin.manifest.id
       const generation = this.credentialGeneration
+      const syncGeneration = this.coordinator.syncExecutionGeneration
       const desktop = Platform.isDesktopApp === true
       const secretStorage = this.plugin.app.secretStorage
       const getSecret = secretStorage.getSecret
@@ -651,6 +658,7 @@ export class V4PluginRuntime {
           || (vault.configDir || ".obsidian") !== configDir
           || this.plugin.manifest.id !== pluginId || this.plugin.settings !== settings
           || this.credentialGeneration !== generation || Platform.isDesktopApp !== desktop
+          || this.coordinator.syncExecutionGeneration !== syncGeneration
           || native.read !== methods.read || native.exists !== methods.exists
           || native.stat !== methods.stat || native.list !== methods.list
           || native.getFullPath !== methods.fullPath
@@ -889,6 +897,7 @@ export class V4PluginRuntime {
       const pluginId = this.plugin.manifest.id
       const configDir = vault.configDir
       const generation = this.credentialGeneration
+      const syncGeneration = this.coordinator.syncExecutionGeneration
       const token = settings.githubToken
       const owner = settings.githubOwner
       const repo = settings.githubRepo
@@ -904,6 +913,7 @@ export class V4PluginRuntime {
           || adapterBacking?.stat !== nativeStat
           || this.plugin.manifest.id !== pluginId
           || this.plugin.settings !== settings || this.credentialGeneration !== generation
+          || this.coordinator.syncExecutionGeneration !== syncGeneration
           || settings.githubToken !== token || settings.githubOwner !== owner
           || settings.githubRepo !== repo || settings.githubBranch !== branch
           || settings.githubTokenSecretId !== tokenSecretId
@@ -983,6 +993,7 @@ export class V4PluginRuntime {
       const pluginId = this.plugin.manifest.id
       const desktop = Platform.isDesktopApp === true
       const generation = this.credentialGeneration
+      const syncGeneration = this.coordinator.syncExecutionGeneration
       const indexRead = backing?.read
       const indexExists = backing?.exists
       const nativeStat = backing?.stat
@@ -1002,6 +1013,7 @@ export class V4PluginRuntime {
           || vault.configDir !== originalConfigDir
           || this.plugin.manifest.id !== pluginId
           || this.plugin.settings !== settings || this.credentialGeneration !== generation
+          || this.coordinator.syncExecutionGeneration !== syncGeneration
           || this.plugin.app.secretStorage !== secretStorage
           || secretStorage.getSecret !== getSecret || this.plugin.loadData !== loadData
           || Platform.isDesktopApp !== desktop
@@ -1129,6 +1141,7 @@ export class V4PluginRuntime {
     const pluginId = this.plugin.manifest.id
     const settings = this.plugin.settings
     const generation = this.credentialGeneration
+    const syncGeneration = this.coordinator.syncExecutionGeneration
     const secretStorage = this.plugin.app.secretStorage
     const getSecret = secretStorage.getSecret
     const loadData = this.plugin.loadData
@@ -1146,6 +1159,7 @@ export class V4PluginRuntime {
       && nativeReader?.stat === nativeStat
       && this.plugin.manifest.id === pluginId && this.plugin.settings === settings
       && this.credentialGeneration === generation
+      && this.coordinator.syncExecutionGeneration === syncGeneration
       && this.plugin.app.secretStorage === secretStorage
       && secretStorage.getSecret === getSecret && this.plugin.loadData === loadData
       && settings?.githubOwner === source.owner && settings?.githubRepo === source.repo
@@ -1311,6 +1325,7 @@ export class V4PluginRuntime {
   }
 
   get isSyncing(): boolean { return this.coordinator.isSyncing }
+  get syncExecutionGeneration(): number { return this.coordinator.syncExecutionGeneration }
   get pendingCount(): number { return this.coordinator.pendingCount }
 
   /**

@@ -98,6 +98,373 @@ function setupUi() {
 
 const tick = () => new Promise<void>(resolve => setImmediate(resolve))
 
+test("D278 read-only Complete Recovery command never starts after unload and keeps results non-authorizing", async () => {
+  const ui = setupUi()
+  Notice.messages.length = 0
+  try {
+    await ui.plugin.onload()
+    const invoke = ui.commands.get("verify-reencryption-complete-recovery-read-only")
+    assert.ok(invoke, "the installed Command Palette entry exists")
+    let attempts = 0
+    const scope = ui.plugin.v4Runtime as Record<string, any>
+    const report = {
+      observation: "authenticated-complete-recovery-evidence-still-fenced",
+      originalKeyAuthenticated: true,
+      completeOldBackupReverified: true,
+      walReceiptsBoundToDestination: true,
+      completeDestinationContentsReverified: true,
+      integrityScope: "read-only-original-backup-encrypted-wal-complete-destination",
+      isolation: "desktop-os-cooperative-wal-lock",
+      powerLossDurabilityProven: false,
+      mobileOsLockProven: false,
+      installedObsidianAcceptanceProven: false,
+      commitDecisionAuthorized: false,
+      rollbackAuthorized: false,
+      oldPassphraseCleanupAuthorized: false,
+      localCutoverAuthorized: false,
+      resumeSyncAuthorized: false,
+      remoteWritesAuthorized: false,
+    }
+    scope.inspectFencedReencryptionCompleteRecovery = async () => {
+      attempts++
+      return report
+    }
+    invoke()
+    await tick()
+    assert.equal(attempts, 1)
+    assert.equal(Notice.messages.length, 2, "start and completion notices only")
+    assert.match(Notice.messages[1]!, /read-only Desktop scan/)
+    assert.match(Notice.messages[1]!, /Cutover, Sync restart/)
+    assert.deepEqual(ui.attempts, [], "no Sync or remote write operation starts from the recovery command")
+
+    scope.inspectFencedReencryptionCompleteRecovery = async () => {
+      attempts++
+      return null
+    }
+    Notice.messages.length = 0
+    invoke()
+    await tick()
+    assert.equal(Notice.messages.length, 2)
+    assert.match(Notice.messages[1]!, /Manual Recovery/)
+    assert.match(Notice.messages[1]!, /Sync stays paused/)
+
+    scope.inspectFencedReencryptionCompleteRecovery = async () => {
+      attempts++
+      throw Error("sensitive-token-never-display")
+    }
+    Notice.messages.length = 0
+    invoke()
+    await tick()
+    assert.equal(Notice.messages.length, 2)
+    assert.match(Notice.messages[1]!, /check unavailable/)
+    assert.ok(Notice.messages.every(message => !message.includes("sensitive-token-never-display")))
+
+    ui.plugin.onunload()
+    Notice.messages.length = 0
+    const before = attempts
+    invoke()
+    await tick()
+    assert.equal(attempts, before, "an unloaded plugin must not start Complete Recovery")
+    assert.deepEqual(Notice.messages, [], "an unloaded plugin cannot display a stale recovery notice")
+  } finally {
+    ui.cleanup()
+    Notice.messages.length = 0
+  }
+})
+
+test("D283 Complete Recovery Command refuses contradictory authority and unknown WAL isolation", async () => {
+  const ui = setupUi()
+  Notice.messages.length = 0
+  try {
+    await ui.plugin.onload()
+    const invoke = ui.commands.get("verify-reencryption-complete-recovery-read-only")
+    assert.ok(invoke)
+    const runtime = ui.plugin.v4Runtime as Record<string, any>
+    const verified = {
+      observation: "authenticated-complete-recovery-evidence-still-fenced",
+      originalKeyAuthenticated: true,
+      completeOldBackupReverified: true,
+      walReceiptsBoundToDestination: true,
+      completeDestinationContentsReverified: true,
+      integrityScope: "read-only-original-backup-encrypted-wal-complete-destination",
+      isolation: "desktop-os-cooperative-wal-lock",
+      powerLossDurabilityProven: false,
+      mobileOsLockProven: false,
+      installedObsidianAcceptanceProven: false,
+      commitDecisionAuthorized: false,
+      rollbackAuthorized: false,
+      oldPassphraseCleanupAuthorized: false,
+      localCutoverAuthorized: false,
+      resumeSyncAuthorized: false,
+      remoteWritesAuthorized: false,
+    }
+    for (const report of [
+      { ...verified, isolation: "unknown-untrusted-platform" },
+      { ...verified, isolation: undefined },
+      { ...verified, integrityScope: "untrusted-summary-only" },
+      { ...verified, commitDecisionAuthorized: true },
+      { ...verified, powerLossDurabilityProven: true },
+      { ...verified, installedObsidianAcceptanceProven: true },
+      { ...verified, localCutoverAuthorized: true },
+      { ...verified, resumeSyncAuthorized: true },
+      { ...verified, remoteWritesAuthorized: true },
+    ]) {
+      Notice.messages.length = 0
+      runtime.inspectFencedReencryptionCompleteRecovery = async () => report
+      invoke()
+      await tick()
+      assert.equal(Notice.messages.length, 2, "progress and one result notice only")
+      assert.match(Notice.messages[1]!, /could not be independently verified/i,
+        "contradictory Recovery must fail closed rather than claim a Desktop WAL lock")
+      assert.match(Notice.messages[1]!, /Manual Recovery/i)
+      assert.doesNotMatch(Notice.messages[1]!, /read-only Desktop scan/i)
+    }
+    assert.deepEqual(ui.attempts, [], "no authorizing Sync from inconsistent Recovery evidence")
+  } finally {
+    ui.cleanup()
+    Notice.messages.length = 0
+  }
+})
+
+test("D278 duplicate Complete Recovery command does not produce a false Manual Recovery warning", async () => {
+  const ui = setupUi()
+  Notice.messages.length = 0
+  try {
+    await ui.plugin.onload()
+    const invoke = ui.commands.get("verify-reencryption-complete-recovery-read-only")
+    assert.ok(invoke)
+    let finish!: (report: null) => void
+    const pending = new Promise<null>(resolve => { finish = resolve })
+    let attempts = 0
+    const runtime = ui.plugin.v4Runtime as Record<string, any>
+    runtime.inspectFencedReencryptionCompleteRecovery = () => {
+      attempts++
+      return pending
+    }
+    invoke()
+    invoke()
+    await tick()
+    assert.equal(attempts, 1, "duplicate command must not start a second Recovery scan")
+    assert.equal(Notice.messages.length, 1, "only one progress notice while the first scan is pending")
+    finish(null)
+    await tick()
+    assert.equal(Notice.messages.length, 2)
+    assert.match(Notice.messages[1]!, /Manual Recovery/)
+    runtime.inspectFencedReencryptionCompleteRecovery = async () => {
+      attempts++
+      return null
+    }
+    invoke()
+    await tick()
+    assert.equal(attempts, 2, "after first scan completes the user may run a new read-only scan")
+    assert.equal(Notice.messages.length, 4)
+    assert.deepEqual(ui.attempts, [], "Recovery command must not launch Sync")
+  } finally {
+    ui.cleanup()
+    Notice.messages.length = 0
+  }
+})
+
+test("D278 legacy and Complete Recovery commands share one exclusive UI diagnostic", async () => {
+  const ui = setupUi()
+  Notice.messages.length = 0
+  try {
+    await ui.plugin.onload()
+    const legacy = ui.commands.get("verify-reencryption-recovery-read-only")
+    const complete = ui.commands.get("verify-reencryption-complete-recovery-read-only")
+    assert.ok(legacy && complete)
+    let finish!: (value: null) => void
+    const pending = new Promise<null>(resolve => { finish = resolve })
+    const runtime = ui.plugin.v4Runtime as Record<string, any>
+    let oldReads = 0
+    let newReads = 0
+    runtime.verifyFencedReencryptionAuthenticatedWal = () => {
+      oldReads++
+      return pending
+    }
+    runtime.inspectFencedReencryptionCompleteRecovery = async () => {
+      newReads++
+      return null
+    }
+    legacy()
+    complete()
+    await tick()
+    assert.equal(oldReads, 1)
+    assert.equal(newReads, 0, "Complete Recovery must not overlap an old WAL diagnostic")
+    assert.deepEqual(Notice.messages, [], "an ignored overlap must not report failure")
+    finish(null)
+    await tick()
+    assert.equal(Notice.messages.length, 1)
+    assert.match(Notice.messages[0]!, /Recovery unverified/)
+    complete()
+    await tick()
+    assert.equal(newReads, 1, "a completed legacy WAL inspection releases the UI diagnostic")
+    assert.match(Notice.messages.at(-1)!, /Manual Recovery/)
+  } finally {
+    ui.cleanup()
+    Notice.messages.length = 0
+  }
+})
+
+test("D279 old Recovery result cannot report success or inspect a replacement Runtime", async () => {
+  for (const commandId of [
+    "verify-reencryption-complete-recovery-read-only",
+    "verify-reencryption-recovery-read-only",
+  ] as const) {
+    const ui = setupUi()
+    Notice.messages.length = 0
+    try {
+      await ui.plugin.onload()
+      const invoke = ui.commands.get(commandId)
+      assert.ok(invoke)
+      const oldRuntime = ui.plugin.v4Runtime as Record<string, any>
+      let release!: (report: unknown) => void
+      const pending = new Promise<unknown>(resolve => { release = resolve })
+      if (commandId === "verify-reencryption-complete-recovery-read-only") {
+        oldRuntime.inspectFencedReencryptionCompleteRecovery = () => pending
+      } else {
+        oldRuntime.verifyFencedReencryptionAuthenticatedWal = () => pending
+      }
+      invoke()
+      const messagesWhilePending = Notice.messages.length
+      let replacementReads = 0
+      ui.plugin.v4Runtime = {
+        ...oldRuntime,
+        inspectFencedReencryptionCandidateGitRefs: async () => {
+          replacementReads++
+          return { destinationOrphanTopologyObserved: true }
+        },
+      }
+      release(commandId === "verify-reencryption-complete-recovery-read-only"
+        ? {
+          observation: "authenticated-complete-recovery-evidence-still-fenced",
+          originalKeyAuthenticated: true,
+          completeOldBackupReverified: true,
+          walReceiptsBoundToDestination: true,
+          completeDestinationContentsReverified: true,
+          isolation: "desktop-os-cooperative-wal-lock",
+        }
+        : {
+          originalKeyAuthenticated: true,
+          completeBackupContentsReverified: true,
+          coldStartWalReverified: true,
+          completeDestinationContentsReverified: true,
+          recoveryLeaseReverified: true,
+        })
+      await tick()
+      assert.equal(Notice.messages.length, messagesWhilePending,
+        "old Runtime's authenticated result cannot become an authoritative UI message")
+      assert.equal(replacementReads, 0, "legacy callback cannot inspect Git refs using replacement Runtime")
+    } finally {
+      ui.cleanup()
+      Notice.messages.length = 0
+    }
+  }
+})
+
+test("D279 stale Recovery rejection must not show an error from a replaced Runtime", async () => {
+  for (const commandId of [
+    "verify-reencryption-complete-recovery-read-only",
+    "verify-reencryption-recovery-read-only",
+  ] as const) {
+    const ui = setupUi()
+    Notice.messages.length = 0
+    try {
+      await ui.plugin.onload()
+      const invoke = ui.commands.get(commandId)
+      assert.ok(invoke)
+      const runtime = ui.plugin.v4Runtime as Record<string, any>
+      let rejectPending!: (error: Error) => void
+      const pending = new Promise<never>((_resolve, reject) => {
+        rejectPending = reject
+      })
+      if (commandId === "verify-reencryption-complete-recovery-read-only") {
+        runtime.inspectFencedReencryptionCompleteRecovery = () => pending
+      } else {
+        runtime.verifyFencedReencryptionAuthenticatedWal = () => pending
+      }
+      invoke()
+      const previousNotices = Notice.messages.length
+      ui.plugin.v4Runtime = { ...runtime }
+      rejectPending(Error("stale-internal-credential-error"))
+      await tick()
+      assert.equal(Notice.messages.length, previousNotices,
+        "a rejected stale Runtime cannot produce a misleading Recovery error")
+      assert.ok(Notice.messages.every(message => !message.includes("stale-internal-credential-error")))
+    } finally {
+      ui.cleanup()
+      Notice.messages.length = 0
+    }
+  }
+})
+
+test("D279 reloading a plugin instance invalidates old Recovery notices without freeing a new diagnostic", async () => {
+  const ui = setupUi()
+  Notice.messages.length = 0
+  try {
+    await ui.plugin.onload()
+    const runtime = ui.plugin.v4Runtime as Record<string, any>
+    const pending: Array<(value: unknown) => void> = []
+    let invoked = 0
+    runtime.inspectFencedReencryptionCompleteRecovery = () => {
+      invoked++
+      return new Promise(resolve => { pending.push(resolve) })
+    }
+    ui.commands.get("verify-reencryption-complete-recovery-read-only")!()
+    assert.equal(invoked, 1)
+    ui.plugin.onunload()
+    await ui.plugin.onload()
+    const current = ui.commands.get("verify-reencryption-complete-recovery-read-only")!
+    current()
+    assert.equal(invoked, 2, "the new plugin lifecycle must admit a fresh diagnostic")
+    pending[0]!({
+      observation: "authenticated-complete-recovery-evidence-still-fenced",
+      originalKeyAuthenticated: true,
+      completeOldBackupReverified: true,
+      walReceiptsBoundToDestination: true,
+      completeDestinationContentsReverified: true,
+      isolation: "desktop-os-cooperative-wal-lock",
+    })
+    await tick()
+    assert.equal(Notice.messages.filter(message => /verified in a read-only Desktop scan/u.test(message)).length, 0,
+      "an old lifecycle cannot announce authenticated evidence in the new lifecycle")
+    current()
+    assert.equal(invoked, 2,
+      "the late completion of an old lifecycle must not release the new in-flight diagnostic")
+    pending[1]!(null)
+    await tick()
+    assert.equal(Notice.messages.filter(message => /use Manual Recovery/u.test(message)).length, 1)
+    assert.deepEqual(ui.attempts, [], "neither lifecycle starts Sync")
+  } finally {
+    ui.cleanup()
+    Notice.messages.length = 0
+  }
+})
+
+test("D278 legacy read-only Recovery command does not start after plugin unload", async () => {
+  const ui = setupUi()
+  Notice.messages.length = 0
+  try {
+    await ui.plugin.onload()
+    const legacy = ui.commands.get("verify-reencryption-recovery-read-only")
+    assert.ok(legacy)
+    let reads = 0
+    const runtime = ui.plugin.v4Runtime as Record<string, any>
+    runtime.verifyFencedReencryptionAuthenticatedWal = async () => {
+      reads++
+      return null
+    }
+    ui.plugin.onunload()
+    legacy()
+    await tick()
+    assert.equal(reads, 0)
+    assert.equal(Notice.messages.length, 0)
+  } finally {
+    ui.cleanup()
+    Notice.messages.length = 0
+  }
+})
+
 test("D156 actual Ribbon/Command/Status Bar/Startup/Scheduler and Sync Center callbacks contain detached rejection", async () => {
   const ui = setupUi()
   resetModalTestState()

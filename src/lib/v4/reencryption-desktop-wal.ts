@@ -169,16 +169,53 @@ export async function acquireV4DesktopRekeyWalStorage(options: {
   initializingNewWalRoot = false
   if (options.recoveryExistingOnly === true) {
     const entries = await fs.readdir(directory)
+    const assertSafeExistingSlots = async (): Promise<void> => {
+      for (const slot of ["slot-0.json", "slot-1.json"]) {
+        let info: Awaited<ReturnType<typeof fs.lstat>>
+        try { info = await fs.lstat(path.join(directory, slot)) }
+        catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+            throw new V4DesktopRekeyWalRecoveryRequiredError()
+          }
+          throw error
+        }
+        if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1
+          || info.size > MAX_SLOT_BYTES) {
+          throw new V4DesktopRekeyWalRecoveryRequiredError()
+        }
+      }
+    }
+    // A competing read-only recovery holder temporarily adds only its own
+    // .exclusive.lock to the two-slot WAL. Report busy (never reclaim it),
+    // not corrupt/manual-recovery. Unknown temp/third-party files still
+    // require Manual Recovery; never open through an ambiguous directory.
+    if (entries.length === 3 && entries.includes(".exclusive.lock")
+      && entries.includes("slot-0.json") && entries.includes("slot-1.json")) {
+      // Only a regular, unaliased lock file is consistent with a cooperating
+      // holder. A directory, symlink or hardlink at the lock pathname is
+      // unexplained recovery evidence, not a normal busy reader. Never
+      // rename, delete or automatically reclaim any pre-existing lock.
+      let lockInfo: Awaited<ReturnType<typeof fs.lstat>>
+      try { lockInfo = await fs.lstat(lockPath) }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+          // The holder may have released after our directory listing.
+          throw new V4DesktopRekeyWalLockError()
+        }
+        throw error
+      }
+      if (!lockInfo.isFile() || lockInfo.isSymbolicLink() || lockInfo.nlink !== 1) {
+        throw new V4DesktopRekeyWalRecoveryRequiredError()
+      }
+      // Even a well-formed holder lock must not conceal unsafe WAL slot
+      // inodes. Corrupt or aliased evidence requires Manual Recovery.
+      await assertSafeExistingSlots()
+      throw new V4DesktopRekeyWalLockError()
+    }
     if (entries.length !== 2 || !entries.includes("slot-0.json") || !entries.includes("slot-1.json")) {
       throw new V4DesktopRekeyWalRecoveryRequiredError()
     }
-    for (const slot of ["slot-0.json", "slot-1.json"]) {
-      const info = await fs.lstat(path.join(directory, slot))
-      if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1
-        || info.size > MAX_SLOT_BYTES) {
-        throw new V4DesktopRekeyWalRecoveryRequiredError()
-      }
-    }
+    await assertSafeExistingSlots()
   }
   const token = toBase64Url(randomBytes(24))
   let lockHandle: Awaited<ReturnType<typeof fs.open>>

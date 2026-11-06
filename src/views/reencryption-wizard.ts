@@ -30,7 +30,10 @@ const STEPS = [
   "Finish & switch",
 ] as const
 
+const STALE_WIZARD_RUNTIME = "Runtime changed during verification. Close and reopen Preview."
+
 const SAFE_BRANCH_CHECK_ERRORS = new Set([
+  STALE_WIZARD_RUNTIME,
   "Wizard settings changed during verification.",
   "A proposed branch already exists. Choose unused branch names.",
   "Repository identity changed.",
@@ -57,11 +60,14 @@ interface RefCheck {
 export class V4ReencryptionWizardModal extends Modal {
   private step = 0
   private readonly initialSettings: PluginSettings
+  private readonly initialRuntime: FastSync["v4Runtime"]
+  private readonly initialSyncExecutionGeneration: number
   private source: VerifiedSource | undefined
   private checked: RefCheck | undefined
   private busy = false
   private closed = false
   private requestEpoch = 0
+  private renderEpoch = 0
   private abortController: AbortController | undefined
   private errorMessage = ""
   private destinationBranch = ""
@@ -74,6 +80,8 @@ export class V4ReencryptionWizardModal extends Modal {
     super(plugin.app)
     // Copy the connection at open time; Obsidian Settings may be mutated in place.
     this.initialSettings = Object.freeze({ ...plugin.settings })
+    this.initialRuntime = plugin.v4Runtime
+    this.initialSyncExecutionGeneration = this.initialRuntime.syncExecutionGeneration
     const provisional = suggestV4ReencryptionBranchNames(
       new Date(), "0".repeat(40),
     )
@@ -88,6 +96,7 @@ export class V4ReencryptionWizardModal extends Modal {
 
   override onClose(): void {
     this.closed = true
+    this.renderEpoch++
     this.requestEpoch++
     this.busy = false
     this.abortController?.abort()
@@ -102,7 +111,8 @@ export class V4ReencryptionWizardModal extends Modal {
   private matchesConnection(): boolean {
     const current = this.plugin.settings
     const snapshot = this.initialSettings
-    return current.githubOwner === snapshot.githubOwner
+    return this.plugin.v4Runtime === this.initialRuntime
+      && current.githubOwner === snapshot.githubOwner
       && current.githubRepo === snapshot.githubRepo
       && current.githubBranch === snapshot.githubBranch
       && current.githubToken === snapshot.githubToken
@@ -118,7 +128,11 @@ export class V4ReencryptionWizardModal extends Modal {
   // request is in flight. Never mark an old Preview observation as ready
   // while a local Sync is actively changing the vault/connection state.
   private assertSyncStillIdle(): void {
-    if (this.plugin.v4Runtime.isSyncing) {
+    if (this.plugin.v4Runtime !== this.initialRuntime) {
+      throw new Error(STALE_WIZARD_RUNTIME)
+    }
+    if (this.initialRuntime.isSyncing
+      || this.initialRuntime.syncExecutionGeneration !== this.initialSyncExecutionGeneration) {
       throw new Error("Sync started during verification. Wait for it to finish and verify again.")
     }
   }
@@ -141,6 +155,9 @@ export class V4ReencryptionWizardModal extends Modal {
   }
 
   private plan(): V4ReencryptionWizardProposal {
+    if (this.plugin.v4Runtime !== this.initialRuntime) {
+      throw new Error(STALE_WIZARD_RUNTIME)
+    }
     if (!this.source || !this.matchesConnection()) {
       throw new Error("Verify the encrypted source and save any changed connection settings first.")
     }
@@ -161,7 +178,7 @@ export class V4ReencryptionWizardModal extends Modal {
   }
 
   private async verifySource(): Promise<void> {
-    if (this.busy) return
+    if (this.closed || this.busy) return
     this.source = undefined
     this.checked = undefined
     this.errorMessage = ""
@@ -226,8 +243,10 @@ export class V4ReencryptionWizardModal extends Modal {
       if (!this.closed && !controller.signal.aborted && epoch === this.requestEpoch) {
         // Network/backend exceptions can include sensitive request context.
         // Never display raw error text or vault filenames here.
-        this.errorMessage = error instanceof Error && error.message.startsWith("Sync started during verification.")
-          ? "Sync started during verification. Wait for it to finish and verify again."
+        this.errorMessage = error instanceof Error && error.message === STALE_WIZARD_RUNTIME
+          ? STALE_WIZARD_RUNTIME
+          : error instanceof Error && error.message.startsWith("Sync started during verification.")
+            ? "Sync started during verification. Wait for it to finish and verify again."
           : error instanceof Error && /identity|settings changed|passphrase/i.test(error.message)
             ? "Source verification failed: check repository identity, configuration, passphrase and connection."
             : "Source verification failed. Check connection, credentials and remote data integrity."
@@ -242,7 +261,7 @@ export class V4ReencryptionWizardModal extends Modal {
   }
 
   private async checkBranchAvailability(): Promise<void> {
-    if (this.busy) return
+    if (this.closed || this.busy) return
     this.checked = undefined
     this.errorMessage = ""
     let proposal: V4ReencryptionWizardProposal
@@ -353,6 +372,7 @@ export class V4ReencryptionWizardModal extends Modal {
   }
 
   private renderPreflight(container: HTMLElement): void {
+    const epoch = this.renderEpoch
     const s = this.initialSettings
     this.row(container, "Current source (read-only)", `${s.githubOwner}/${s.githubRepo}#${s.githubBranch}`)
     this.row(container, "Mode", s.encryptionMode === "encrypted" ? "Encrypted V4 source required" : "Current connection is not encrypted")
@@ -367,7 +387,9 @@ export class V4ReencryptionWizardModal extends Modal {
       .addButton(button => button
         .setButtonText(this.busy ? "Verifying…" : this.source ? "Verify again" : "Verify source (read-only)")
         .setDisabled(this.busy)
-        .onClick(() => void this.verifySource()))
+        .onClick(() => {
+          if (!this.closed && this.renderEpoch === epoch) void this.verifySource()
+        }))
     if (this.source) {
       this.row(container, "Pinned source snapshot", this.source.pinnedSourceCommitSha)
       this.row(container, "Actual default branch", this.source.defaultBranch)
@@ -375,6 +397,7 @@ export class V4ReencryptionWizardModal extends Modal {
   }
 
   private renderDestination(container: HTMLElement): void {
+    const epoch = this.renderEpoch
     container.createEl("p", { text: "The destination is a newly encrypted orphan branch. The separate frozen backup preserves the source snapshot; the old branch remains active." })
     container.createEl("p", {
       cls: "github-sync-rekey__warning",
@@ -383,6 +406,7 @@ export class V4ReencryptionWizardModal extends Modal {
     new Setting(container).setName("New destination branch")
       .setDesc("Must not exist, equal the source, backup or default branch.")
       .addText(text => text.setValue(this.destinationBranch).onChange(value => {
+        if (this.closed || this.renderEpoch !== epoch) return
         this.destinationBranch = value
         this.checked = undefined
         this.errorMessage = ""
@@ -390,6 +414,7 @@ export class V4ReencryptionWizardModal extends Modal {
     new Setting(container).setName("Pinned backup branch")
       .setDesc("Separate from destination and source. This name must not exist.")
       .addText(text => text.setValue(this.backupBranch).onChange(value => {
+        if (this.closed || this.renderEpoch !== epoch) return
         this.backupBranch = value
         this.checked = undefined
         this.errorMessage = ""
@@ -399,6 +424,7 @@ export class V4ReencryptionWizardModal extends Modal {
       .addText(text => {
         text.inputEl.type = "password"
         text.setValue(this.newPassphrase).onChange(value => {
+          if (this.closed || this.renderEpoch !== epoch) return
           this.newPassphrase = value
           this.checked = undefined
           this.errorMessage = ""
@@ -408,6 +434,7 @@ export class V4ReencryptionWizardModal extends Modal {
       .addText(text => {
         text.inputEl.type = "password"
         text.setValue(this.confirmPassphrase).onChange(value => {
+          if (this.closed || this.renderEpoch !== epoch) return
           this.confirmPassphrase = value
           this.checked = undefined
           this.errorMessage = ""
@@ -420,6 +447,7 @@ export class V4ReencryptionWizardModal extends Modal {
         .setValue(this.iterations)
         .setDynamicTooltip()
         .onChange(value => {
+          if (this.closed || this.renderEpoch !== epoch) return
           this.iterations = value
           this.checked = undefined
           this.errorMessage = ""
@@ -427,6 +455,7 @@ export class V4ReencryptionWizardModal extends Modal {
   }
 
   private renderReview(container: HTMLElement): void {
+    const epoch = this.renderEpoch
     const proposal = this.plan()
     this.row(container, "Source (continues to Sync independently)", proposal.sourceRepoId)
     this.row(container, "Frozen backup (pinned source commit)", proposal.backupRepoId)
@@ -453,7 +482,9 @@ export class V4ReencryptionWizardModal extends Modal {
         : "Not checked. Confirm both new names are absent and the verified Source has not changed.")
       .addButton(button => button.setButtonText(this.busy ? "Checking…" : "Check both branches")
         .setDisabled(this.busy)
-        .onClick(() => void this.checkBranchAvailability()))
+        .onClick(() => {
+          if (!this.closed && this.renderEpoch === epoch) void this.checkBranchAvailability()
+        }))
     this.row(container, "Publication authorization", "BLOCKED — the production migration, best-effort WAL recovery, safe cutover and installed-device release gates are unfinished.")
   }
 
@@ -506,6 +537,8 @@ export class V4ReencryptionWizardModal extends Modal {
 
   private render(): void {
     if (this.closed) return
+    const epoch = ++this.renderEpoch
+    const live = () => !this.closed && this.renderEpoch === epoch
     this.titleEl.setText("Create encrypted branch · Preview only")
     const content = this.contentEl
     content.empty()
@@ -535,11 +568,14 @@ export class V4ReencryptionWizardModal extends Modal {
     }
     const navigation = content.createDiv({ cls: "github-sync-rekey__navigation" })
     const close = navigation.createEl("button", { text: "Close" })
-    close.onclick = () => this.close()
+    close.onclick = () => {
+      if (live()) this.close()
+    }
     if (this.step > 0) {
       const back = navigation.createEl("button", { text: "Back" })
       back.disabled = this.busy
       back.onclick = () => {
+        if (!live() || this.busy) return
         this.step--
         this.errorMessage = ""
         this.render()
@@ -552,9 +588,25 @@ export class V4ReencryptionWizardModal extends Modal {
       })
       next.disabled = this.busy || (this.step === 0 && !this.source) || (this.step === 2 && !this.checked)
       next.onclick = () => {
-        if (this.busy) return
+        if (!live() || this.busy) return
         this.errorMessage = ""
         try {
+          if (this.plugin.v4Runtime !== this.initialRuntime) {
+            this.source = undefined
+            this.checked = undefined
+            throw new Error(STALE_WIZARD_RUNTIME)
+          }
+          if (!this.matchesConnection()) {
+            this.source = undefined
+            this.checked = undefined
+            throw new Error("Wizard connection changed. Verify the encrypted Source again.")
+          }
+          if (this.initialRuntime.isSyncing
+            || this.initialRuntime.syncExecutionGeneration !== this.initialSyncExecutionGeneration) {
+            this.source = undefined
+            this.checked = undefined
+            throw new Error("Sync started during verification. Wait for it to finish and verify again.")
+          }
           if (this.step === 0 && !this.source) return
           if (this.step >= 1 && this.step <= 2) {
             const proposal = this.plan()

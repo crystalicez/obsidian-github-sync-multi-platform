@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { mkdir, mkdtemp, readdir, rm, stat, writeFile } from "node:fs/promises"
+import { link, mkdir, mkdtemp, readdir, rm, stat, writeFile } from "node:fs/promises"
 import path from "node:path"
 
 import { sha256Hex, utf8ToBytes } from "../../src/lib/bytes"
@@ -8,7 +8,7 @@ import { inspectV4ColdStartWalSnapshot } from "../../src/lib/v4/reencryption-col
 import type { V4ReencryptionCutoverSnapshotContract } from "../../src/lib/v4/reencryption-cutover-snapshot-contract"
 import type { V4LocalIndexAdapter } from "../../src/lib/v4/local-index"
 import { createV4ReencryptionRecoveryJournal } from "../../src/lib/v4/reencryption-recovery-journal"
-import { acquireV4DesktopRekeyWalStorage } from "../../src/lib/v4/reencryption-desktop-wal"
+import { acquireV4DesktopRekeyWalStorage, V4DesktopRekeyWalLockError, V4DesktopRekeyWalRecoveryRequiredError } from "../../src/lib/v4/reencryption-desktop-wal"
 import { openV4ExistingDesktopWalForRecovery } from "../../src/lib/v4/reencryption-desktop-wal-recovery"
 
 const sourceCommitSha = "a".repeat(40)
@@ -288,24 +288,111 @@ test("D241 rejects incomplete, foreign-temp and already-locked WAL without chang
     await writeFile(slot0, "encrypted-slot-evidence")
     await assert.rejects(openV4ExistingDesktopWalForRecovery({
       rootAbsolute: root, journalRoot: walRoot,
-    }))
+    }), V4DesktopRekeyWalRecoveryRequiredError)
     assert.deepEqual(await readdir(dir), ["slot-0.json"])
     await writeFile(slot1, "encrypted-slot-evidence")
     await writeFile(path.join(dir, ".slot-interrupted.tmp"), "newer-recovery-evidence")
     await assert.rejects(openV4ExistingDesktopWalForRecovery({
       rootAbsolute: root, journalRoot: walRoot,
-    }))
+    }), V4DesktopRekeyWalRecoveryRequiredError)
     assert.deepEqual((await readdir(dir)).sort(),
       [".slot-interrupted.tmp", "slot-0.json", "slot-1.json"].sort())
     await rm(path.join(dir, ".slot-interrupted.tmp"))
     await writeFile(path.join(dir, ".exclusive.lock"), "another process owns this")
     await assert.rejects(openV4ExistingDesktopWalForRecovery({
       rootAbsolute: root, journalRoot: walRoot,
-    }))
+    }), V4DesktopRekeyWalLockError,
+    "exact two-slot WAL with an existing owner lock is BUSY, not corrupted")
     assert.equal(await stat(path.join(dir, ".exclusive.lock")).then(s => s.isFile()), true)
     assert.equal(await readdir(dir).then(items => items.includes(".exclusive.lock")), true)
+    // Even if another holder's lock is present, an interrupted temporary
+    // writer file is not a harmless "busy" directory: preserve evidence and
+    // demand Manual Recovery instead of guessing the third-party state.
+    await writeFile(path.join(dir, ".slot-interrupted.tmp"), "torn-staging-evidence")
+    await assert.rejects(openV4ExistingDesktopWalForRecovery({
+      rootAbsolute: root, journalRoot: walRoot,
+    }), V4DesktopRekeyWalRecoveryRequiredError,
+    "OS lock plus unknown WAL residue must not be downgraded to busy")
+    assert.equal(await stat(path.join(dir, ".slot-interrupted.tmp")).then(s => s.isFile()), true)
+    await rm(path.join(dir, ".slot-interrupted.tmp"))
     assert.equal(await stat(slot0).then(s => s.size), "encrypted-slot-evidence".length)
     assert.equal(await stat(slot1).then(s => s.size), "encrypted-slot-evidence".length)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("D289 existing-only recovery treats nonfile or hardlinked lock as forensic evidence, never busy", async () => {
+  await mkdir(path.join(process.cwd(), ".tmp"), { recursive: true })
+  const root = await mkdtemp(path.join(process.cwd(), ".tmp", "d289-wal-lock-type-"))
+  const dir = path.join(root, ...walRoot.split("/"))
+  const lock = path.join(dir, ".exclusive.lock")
+  const slot0 = path.join(dir, "slot-0.json")
+  const slot1 = path.join(dir, "slot-1.json")
+  const alias = path.join(root, "lock-hardlink-alias")
+  try {
+    await mkdir(dir, { recursive: true })
+    await writeFile(slot0, "encrypted-slot-0")
+    await writeFile(slot1, "encrypted-slot-1")
+
+    // A real holder never creates a DIRECTORY at the lock pathname.
+    await mkdir(lock)
+    await assert.rejects(openV4ExistingDesktopWalForRecovery({
+      rootAbsolute: root, journalRoot: walRoot,
+    }), V4DesktopRekeyWalRecoveryRequiredError,
+    "a directory posing as the WAL OS lock is not a legitimate busy reader")
+    assert.deepEqual((await readdir(dir)).sort(),
+      [".exclusive.lock", "slot-0.json", "slot-1.json"])
+    await rm(lock, { recursive: true })
+
+    // Even a normal-looking file is untrusted if another path aliases its inode.
+    await writeFile(lock, "test-stale-lock")
+    await link(lock, alias)
+    await assert.rejects(openV4ExistingDesktopWalForRecovery({
+      rootAbsolute: root, journalRoot: walRoot,
+    }), V4DesktopRekeyWalRecoveryRequiredError,
+    "a hardlinked lock cannot be accepted as a well-formed exclusive lease")
+    assert.equal(await stat(lock).then(s => s.nlink), 2)
+    assert.equal(await stat(slot0).then(s => s.size), "encrypted-slot-0".length)
+    assert.equal(await stat(slot1).then(s => s.size), "encrypted-slot-1".length)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("D290 existing-only recovery never reports busy when lock is valid but WAL slots are unsafe", async () => {
+  await mkdir(path.join(process.cwd(), ".tmp"), { recursive: true })
+  const root = await mkdtemp(path.join(process.cwd(), ".tmp", "d290-wal-locked-slots-"))
+  const dir = path.join(root, ...walRoot.split("/"))
+  const slot0 = path.join(dir, "slot-0.json")
+  const slot1 = path.join(dir, "slot-1.json")
+  const lock = path.join(dir, ".exclusive.lock")
+  const alias = path.join(root, "slot-hardlink-alias")
+  try {
+    await mkdir(dir, { recursive: true })
+    await writeFile(slot0, "encrypted-slot-0")
+    await writeFile(slot1, "encrypted-slot-1")
+    await writeFile(lock, "another holder's well-formed lock")
+
+    // The lock alone is not proof that the WAL slots are safe to recover.
+    await rm(slot0)
+    await mkdir(slot0)
+    await assert.rejects(openV4ExistingDesktopWalForRecovery({
+      rootAbsolute: root, journalRoot: walRoot,
+    }), V4DesktopRekeyWalRecoveryRequiredError,
+    "a directory posing as a slot is recovery evidence even when another lock exists")
+    await rm(slot0, { recursive: true })
+    await writeFile(slot0, "encrypted-slot-0")
+
+    await link(slot1, alias)
+    await assert.rejects(openV4ExistingDesktopWalForRecovery({
+      rootAbsolute: root, journalRoot: walRoot,
+    }), V4DesktopRekeyWalRecoveryRequiredError,
+    "a hardlinked WAL slot must not be concealed by the busy lock classification")
+    assert.equal(await stat(slot1).then(info => info.nlink), 2)
+    assert.equal(await stat(lock).then(info => info.isFile()), true)
+    assert.equal(await stat(slot0).then(info => info.size), "encrypted-slot-0".length)
+    assert.equal(await stat(slot1).then(info => info.size), "encrypted-slot-1".length)
   } finally {
     await rm(root, { recursive: true, force: true })
   }

@@ -51,6 +51,7 @@ import { acquireV4DesktopRekeyWalStorage } from "../../src/lib/v4/reencryption-d
 import { openV4ExistingDesktopWalForRecovery } from "../../src/lib/v4/reencryption-desktop-wal-recovery"
 import type { V4ReencryptionCutoverSnapshotContract } from "../../src/lib/v4/reencryption-cutover-snapshot-contract"
 import { V4PluginRuntime } from "../../src/lib/v4/runtime"
+import type { V4SyncCoordinator } from "../../src/lib/v4/sync-coordinator"
 import { GitHubClient } from "../../src/lib/github-api"
 import { inspectV4ReencryptionPendingCutoverIntent } from "../../src/lib/v4/reencryption-cutover-intent-crypto"
 import { inspectV4ReencryptionCutoverCandidateAfterRestart } from "../../src/lib/v4/reencryption-cutover-candidate-restart"
@@ -3626,6 +3627,41 @@ test("D248/D250/D252 verifies Desktop WAL lock, installed physical readback and 
         assert.equal(complete?.completeDestinationContentsReverified, true)
         assert.equal(complete?.localCutoverAuthorized, false)
         assert.equal(complete?.resumeSyncAuthorized, false)
+        // D282: a short Sync can begin AND finish while an awaited GitHub
+        // identity read is pending. The installed Recovery owner must not
+        // accept the stale proof merely because isSyncing becomes false.
+        const coordinator = (runtime as unknown as {
+          coordinator: V4SyncCoordinator
+        }).coordinator
+        const options = (coordinator as unknown as {
+          options: {
+            execute: (request: unknown, changes: unknown, signal: AbortSignal) =>
+              Promise<{ changedFiles: number }>
+          }
+        }).options
+        const savedExecute = options.execute
+        const savedBackupIdentity = backupGit["getRepositoryIdentity"]!
+        let syncFinishedDuringRead = false
+        options.execute = async () => ({ changedFiles: 0 })
+        backupGit["getRepositoryIdentity"] = async (...args: never[]) => {
+          const result = await savedBackupIdentity.call(backupGit as never, ...args)
+          if (!syncFinishedDuringRead) {
+            const completed = await coordinator.run({ operation: "normal", trigger: "manual" })
+            assert.equal(completed.status, "completed")
+            assert.equal(coordinator.isSyncing, false)
+            syncFinishedDuringRead = true
+          }
+          return result
+        }
+        try {
+          const staleAfterSync = await runtime.inspectFencedReencryptionCompleteRecovery()
+          assert.equal(syncFinishedDuringRead, true, "the test executed a completed Sync inside the Git read")
+          assert.equal(staleAfterSync, null,
+            "installed Complete Recovery cannot accept authenticated evidence across a completed Sync")
+        } finally {
+          backupGit["getRepositoryIdentity"] = savedBackupIdentity
+          options.execute = savedExecute
+        }
         const stableDestinationCommit = destinationGit["getGitCommit"]!
         destinationGit["getGitCommit"] = async (...args: never[]) => {
           const commit = (await stableDestinationCommit.call(destinationGit as never, ...args)) as {

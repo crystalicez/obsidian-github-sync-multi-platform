@@ -19,6 +19,34 @@ class FakeTimers {
   }
 }
 
+test("D282 Sync execution generation records completed or failed runs but not skipped attempts", async () => {
+  let release!: () => void
+  const blocker = new Promise<void>(resolve => { release = resolve })
+  let calls = 0
+  const coordinator = new V4SyncCoordinator({
+    execute: async () => {
+      calls++
+      if (calls === 1) await blocker
+      if (calls === 2) throw Error("simulated failed Sync")
+      return { changedFiles: 0 }
+    },
+  })
+  assert.equal(coordinator.syncExecutionGeneration, 0)
+  const first = coordinator.run({ operation: "normal", trigger: "manual" })
+  assert.equal(coordinator.syncExecutionGeneration, 1, "Sync start changes generation synchronously")
+  assert.equal((await coordinator.run({ operation: "normal", trigger: "scheduled" })).status, "skipped")
+  assert.equal(coordinator.syncExecutionGeneration, 1, "skipped ticks cannot invent a Sync run")
+  release()
+  assert.equal((await first).status, "completed")
+  assert.equal(coordinator.isSyncing, false)
+  assert.equal(coordinator.syncExecutionGeneration, 1, "completed Sync leaves durable in-Runtime evidence")
+  await assert.rejects(coordinator.run({ operation: "normal", trigger: "manual" }), /simulated failed Sync/)
+  assert.equal(coordinator.syncExecutionGeneration, 2, "failed Sync still invalidates an in-flight Preview")
+  coordinator.dispose()
+  assert.equal((await coordinator.run({ operation: "normal", trigger: "startup" })).status, "skipped")
+  assert.equal(coordinator.syncExecutionGeneration, 2)
+})
+
 test("D174 synchronous Re-encryption reservation refuses active Sync and preserves its original completion", async () => {
   let finish!: () => void
   const hold = new Promise<void>(resolve => { finish = resolve })

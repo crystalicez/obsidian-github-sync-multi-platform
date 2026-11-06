@@ -131,6 +131,7 @@ export class V4SyncCoordinator {
   private reencryptionReserved = false;
   private reencryptionDirty = false;
   private disposed = false;
+  private executionGeneration = 0;
   private readonly schedule: (callback: () => void, delay: number) => unknown;
   private readonly cancel: (handle: any) => void;
   private readonly debounceMs: number;
@@ -142,6 +143,8 @@ export class V4SyncCoordinator {
   }
 
   get isSyncing(): boolean { return this.active !== undefined; }
+  /** Monotonic per-runtime evidence that a Sync started, even after it finished. */
+  get syncExecutionGeneration(): number { return this.executionGeneration; }
   get pendingCount(): number { return this.disposed ? 0 : coalesceV4Changes(this.pending).length; }
 
   /**
@@ -247,6 +250,7 @@ export class V4SyncCoordinator {
 
   private start(request: V4SyncRequest, changes: V4QueuedChange[]): Promise<V4CoordinatorRunResult> {
     if (this.disposed || this.reencryptionReserved) return Promise.resolve({ status: "skipped", changedFiles: 0 });
+    this.executionGeneration++;
     const controller = new AbortController();
     this.activeController = controller;
     let resolveExecution!: (result: V4CoordinatorRunResult) => void;

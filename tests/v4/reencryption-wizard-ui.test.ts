@@ -1,8 +1,9 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { setRequestUrlHandler } from "obsidian"
+import { Setting, setRequestUrlHandler, settingSliderControls } from "obsidian"
 import type FastSync from "../../src/main"
 import { GitHubClient } from "../../src/lib/github-api"
+import { V4SyncCoordinator } from "../../src/lib/v4/sync-coordinator"
 import { V4ReencryptionWizardModal } from "../../src/views/reencryption-wizard"
 
 function fakePlugin(
@@ -19,7 +20,7 @@ function fakePlugin(
       encryptionMode: mode,
       encryptionPassphrase: "source-passphrase-never-render",
     },
-    v4Runtime: { isSyncing: active },
+    v4Runtime: { isSyncing: active, syncExecutionGeneration: 0 },
   } as unknown as FastSync
 }
 
@@ -479,7 +480,7 @@ test("D154 Wizard discards async preview reads if Sync starts, settings change o
     status, text: status === 200 ? "" : "unavailable", json, headers: {},
   })
   for (const mode of ["source", "branches"] as const) {
-    for (const interruption of ["sync", "settings", "close"] as const) {
+    for (const interruption of ["sync", "sync-finished", "settings", "close", "runtime"] as const) {
       const plugin = fakePlugin()
       const wizard = new V4ReencryptionWizardModal(plugin)
       const view = wizard as unknown as {
@@ -538,8 +539,18 @@ test("D154 Wizard discards async preview reads if Sync starts, settings change o
         await requestEntered
         if (interruption === "sync") {
           (plugin.v4Runtime as unknown as {isSyncing: boolean}).isSyncing = true
+        } else if (interruption === "sync-finished") {
+          const runtime = plugin.v4Runtime as unknown as {
+            isSyncing: boolean
+            syncExecutionGeneration: number
+          }
+          runtime.isSyncing = true
+          runtime.syncExecutionGeneration++
+          runtime.isSyncing = false
         } else if (interruption === "settings") {
           plugin.settings.githubToken = "changed-token-never-render"
+        } else if (interruption === "runtime") {
+          plugin.v4Runtime = { isSyncing: false } as FastSync["v4Runtime"]
         } else {
           wizard.onClose()
         }
@@ -551,8 +562,12 @@ test("D154 Wizard discards async preview reads if Sync starts, settings change o
           assert.ok(requests.length <= 2, "no full encrypted source scan after interrupted preflight")
         }
         const content = (wizard.contentEl as unknown as {flattenText(): string}).flattenText()
-        if (interruption === "sync") {
+        if (interruption === "sync" || interruption === "sync-finished") {
           assert.match(content, /Sync started during verification/i)
+        }
+        if (interruption === "runtime") {
+          assert.match(content, /Runtime changed during verification/i,
+            "the preview must explicitly reject a superseded Runtime owner")
         }
         assert.doesNotMatch(content, /source-passphrase-never-render|source-token-never-render|changed-token-never-render|new-preview-only-secret/u)
         assert.ok(requests.every(r => r.method === "GET" && r.body === undefined))
@@ -562,6 +577,299 @@ test("D154 Wizard discards async preview reads if Sync starts, settings change o
         setRequestUrlHandler(null)
       }
     }
+  }
+})
+
+test("D280 Wizard stale Preflight Next refuses a changed Runtime owner without GitHub I/O", () => {
+  const plugin = fakePlugin()
+  const wizard = new V4ReencryptionWizardModal(plugin)
+  const internal = wizard as unknown as {
+    step: number; render(): void
+    source?: {
+      physicalRepositoryId: number; defaultBranch: string; pinnedSourceCommitSha: string
+      verifiedFileCount: number; verifiedRemoteObjectCount: number
+      totalVerifiedPlaintextBytes: string
+    }
+  }
+  let calls = 0
+  setRequestUrlHandler(async () => {
+    calls++
+    throw Error("Stale Next cannot contact GitHub.")
+  })
+  try {
+    wizard.onOpen()
+    internal.source = {
+      physicalRepositoryId: 123, defaultBranch: "main",
+      pinnedSourceCommitSha: "a".repeat(40),
+      verifiedFileCount: 0, verifiedRemoteObjectCount: 0,
+      totalVerifiedPlaintextBytes: "0",
+    }
+    internal.render()
+    const view = wizard.contentEl as unknown as {
+      findByText(text: string): { disabled: boolean; onclick?: () => void } | undefined
+      flattenText(): string
+    }
+    const next = view.findByText("Next")
+    assert.ok(next && !next.disabled, "Next was available after an earlier source Preview")
+    plugin.v4Runtime = { isSyncing: false } as FastSync["v4Runtime"]
+    next.onclick?.()
+    assert.equal(internal.step, 0, "stale Runtime source proof must never advance the Wizard")
+    assert.equal(internal.source, undefined, "stale Preflight source must be discarded")
+    assert.match(view.flattenText(), /Runtime changed during verification/i)
+    assert.equal(calls, 0, "stale navigation cannot perform network access")
+  } finally {
+    wizard.onClose()
+    setRequestUrlHandler(null)
+  }
+})
+
+test("D280 Wizard invalidates Preflight Next on Settings drift or an active Sync", () => {
+  for (const change of ["settings", "sync", "sync-finished"] as const) {
+    const plugin = fakePlugin()
+    const wizard = new V4ReencryptionWizardModal(plugin)
+    const internal = wizard as unknown as {
+      step: number; render(): void
+      source?: {
+        physicalRepositoryId: number; defaultBranch: string; pinnedSourceCommitSha: string
+        verifiedFileCount: number; verifiedRemoteObjectCount: number
+        totalVerifiedPlaintextBytes: string
+      }
+    }
+    let calls = 0
+    setRequestUrlHandler(async () => {
+      calls++
+      throw Error("Invalidated Preflight Next must not contact GitHub.")
+    })
+    try {
+      wizard.onOpen()
+      internal.source = {
+        physicalRepositoryId: 123, defaultBranch: "main",
+        pinnedSourceCommitSha: "a".repeat(40),
+        verifiedFileCount: 0, verifiedRemoteObjectCount: 0,
+        totalVerifiedPlaintextBytes: "0",
+      }
+      internal.render()
+      const view = wizard.contentEl as unknown as {
+        findByText(text: string): { disabled: boolean; onclick?: () => void } | undefined
+        flattenText(): string
+      }
+      const next = view.findByText("Next")
+      assert.ok(next && !next.disabled)
+      if (change === "settings") {
+        plugin.settings.githubBranch = "changed-source"
+      } else if (change === "sync") {
+        (plugin.v4Runtime as { isSyncing: boolean }).isSyncing = true
+      } else {
+        const runtime = plugin.v4Runtime as { isSyncing: boolean; syncExecutionGeneration: number }
+        runtime.isSyncing = true
+        runtime.syncExecutionGeneration++
+        runtime.isSyncing = false
+      }
+      next.onclick?.()
+      assert.equal(internal.step, 0, change + ": no stale source navigation")
+      assert.equal(internal.source, undefined, change + ": stale source discarded")
+      assert.match(view.flattenText(),
+        change === "settings" ? /Wizard connection changed/i : /Sync started during verification/i)
+      assert.equal(calls, 0)
+    } finally {
+      wizard.onClose()
+      setRequestUrlHandler(null)
+    }
+  }
+})
+
+test("D281 a closed Wizard refuses a queued Preflight verification before GitHub I/O", async () => {
+  const wizard = new V4ReencryptionWizardModal(fakePlugin())
+  let requests = 0
+  setRequestUrlHandler(async () => {
+    requests++
+    throw Error("A closed Wizard must never contact GitHub")
+  })
+  try {
+    wizard.onOpen()
+    wizard.onClose()
+    await (wizard as unknown as { verifySource(): Promise<void> }).verifySource()
+    assert.equal(requests, 0, "a stale Preflight click cannot start any remote read after close")
+    assert.equal((wizard.contentEl as unknown as { flattenText(): string }).flattenText(), "",
+      "closed Preview remains empty even after a stale callback")
+  } finally {
+    wizard.onClose()
+    setRequestUrlHandler(null)
+  }
+})
+
+test("D281 stale navigation cannot advance a reopened Wizard while the current button can", () => {
+  const wizard = new V4ReencryptionWizardModal(fakePlugin())
+  const view = wizard as unknown as { step: number; render(): void }
+  const content = wizard.contentEl as unknown as {
+    findByText(text: string): { onclick?: () => void } | undefined
+    flattenText(): string
+  }
+  try {
+    wizard.onOpen()
+    view.step = 3
+    view.render()
+    const obsoleteNext = content.findByText("View planned finish")
+    assert.ok(obsoleteNext?.onclick, "first Preview generated an actionable Next button")
+    wizard.onClose()
+    wizard.onOpen()
+    view.step = 3
+    view.render()
+    const freshNext = content.findByText("View planned finish")
+    assert.ok(freshNext?.onclick)
+    obsoleteNext.onclick()
+    assert.equal(view.step, 3, "old detached Next must not move the reopened Preview")
+    freshNext.onclick()
+    assert.equal(view.step, 4, "new Preview can still navigate with its own button")
+  } finally {
+    wizard.onClose()
+  }
+})
+
+test("D281 stale PBKDF2 slider event cannot mutate a closed or newly reopened Preview", () => {
+  const wizard = new V4ReencryptionWizardModal(fakePlugin())
+  const view = wizard as unknown as { step: number; render(): void; iterations: number }
+  try {
+    wizard.onOpen()
+    view.step = 1
+    view.render()
+    const previous = settingSliderControls.at(-1)
+    assert.ok(previous?.change, "destination form must expose a PBKDF2 slider")
+    assert.equal(view.iterations, 600_000)
+    wizard.onClose()
+
+    // Re-opening the same Modal object is supported for stale-event defense.
+    wizard.onOpen()
+    view.step = 1
+    view.render()
+    const current = settingSliderControls.at(-1)
+    assert.ok(current?.change)
+    previous.change(1_200_000)
+    assert.equal(view.iterations, 600_000, "detached old slider cannot change newly opened policy")
+    current.change(700_000)
+    assert.equal(view.iterations, 700_000, "current slider still works")
+    wizard.onClose()
+    current.change(1_200_000)
+    assert.equal(view.iterations, 700_000, "closed Wizard ignores delayed slider events")
+  } finally {
+    wizard.onClose()
+  }
+})
+
+test("D281 old passphrase-input events cannot revive cleared secrets after Wizard close", () => {
+  const textHandlers: Array<(value: string) => void> = []
+  const setting = Setting.prototype as unknown as {
+    addText(callback: (input: {
+      inputEl: { type: string }
+      setValue(value: string): unknown
+      onChange(callback: (value: string) => void): unknown
+    }) => void): Setting
+  }
+  const originalAddText = setting.addText
+  setting.addText = function(callback) {
+    callback({
+      inputEl: { type: "text" },
+      setValue(_value: string) { return this },
+      onChange(listener: (value: string) => void) {
+        textHandlers.push(listener)
+        return this
+      },
+    })
+    return this
+  }
+
+  const wizard = new V4ReencryptionWizardModal(fakePlugin())
+  const view = wizard as unknown as {
+    step: number
+    render(): void
+    newPassphrase: string
+    confirmPassphrase: string
+  }
+  try {
+    wizard.onOpen()
+    view.step = 1
+    view.render()
+    const oldInputs = textHandlers.slice(-4)
+    assert.equal(oldInputs.length, 4, "four destination/backup/secret inputs are attached")
+    oldInputs[2]!("first-private-secret")
+    oldInputs[3]!("first-private-secret")
+    assert.equal(view.newPassphrase, "first-private-secret")
+    wizard.onClose()
+    assert.equal(view.newPassphrase, "")
+    assert.equal(view.confirmPassphrase, "")
+    oldInputs[2]!("stale-secret-must-not-return")
+    oldInputs[3]!("stale-secret-must-not-return")
+    assert.equal(view.newPassphrase, "")
+    assert.equal(view.confirmPassphrase, "")
+
+    wizard.onOpen()
+    view.step = 1
+    view.render()
+    const newInputs = textHandlers.slice(-4)
+    oldInputs[2]!("stale-after-reopen")
+    assert.equal(view.newPassphrase, "", "old detached input cannot mutate new Preview")
+    newInputs[2]!("fresh-private-secret")
+    newInputs[3]!("fresh-private-secret")
+    assert.equal(view.newPassphrase, "fresh-private-secret")
+    assert.equal(view.confirmPassphrase, "fresh-private-secret")
+    wizard.onClose()
+    newInputs[2]!("late-after-second-close")
+    newInputs[3]!("late-after-second-close")
+    assert.equal(view.newPassphrase, "")
+    assert.equal(view.confirmPassphrase, "")
+  } finally {
+    wizard.onClose()
+    setting.addText = originalAddText
+  }
+})
+
+test("D282 real Sync Coordinator start-and-finish invalidates a held Wizard Git read", async () => {
+  const coordinator = new V4SyncCoordinator({
+    execute: async () => ({ changedFiles: 0 }),
+  })
+  const plugin = fakePlugin()
+  plugin.v4Runtime = coordinator as unknown as FastSync["v4Runtime"]
+  const wizard = new V4ReencryptionWizardModal(plugin)
+  const view = wizard as unknown as {
+    source?: { pinnedSourceCommitSha: string }
+    verifySource(): Promise<void>
+  }
+  let entered!: () => void
+  let release!: () => void
+  const firstReadEntered = new Promise<void>(resolve => { entered = resolve })
+  const firstReadReleased = new Promise<void>(resolve => { release = resolve })
+  const requests: Array<{ method?: string; body?: unknown }> = []
+  setRequestUrlHandler(async raw => {
+    const request = raw as { method?: string; body?: unknown }
+    requests.push(request)
+    assert.equal(request.method, "GET")
+    assert.equal(request.body, undefined)
+    entered()
+    await firstReadReleased
+    return { status: 200, text: "", headers: {},
+      json: { id: 444, full_name: "owner/vault", default_branch: "main" } }
+  })
+  try {
+    wizard.onOpen()
+    const pending = view.verifySource()
+    await firstReadEntered
+    assert.equal(coordinator.syncExecutionGeneration, 0)
+    assert.equal(coordinator.isSyncing, false)
+    const result = await coordinator.run({ operation: "normal", trigger: "manual" })
+    assert.equal(result.status, "completed")
+    assert.equal(coordinator.isSyncing, false, "Sync has completed before GitHub returns")
+    assert.equal(coordinator.syncExecutionGeneration, 1)
+    release()
+    await pending
+    assert.equal(view.source, undefined, "Wizard cannot accept proof made during an intervening Sync")
+    assert.equal(requests.length, 1, "Wizard rejects evidence before more GitHub reads")
+    const content = (wizard.contentEl as unknown as { flattenText(): string }).flattenText()
+    assert.match(content, /Sync started during verification/i)
+  } finally {
+    release?.()
+    wizard.onClose()
+    coordinator.dispose()
+    setRequestUrlHandler(null)
   }
 })
 

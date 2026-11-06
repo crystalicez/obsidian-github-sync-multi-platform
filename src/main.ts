@@ -40,6 +40,8 @@ export default class FastSync extends Plugin {
   /** Synchronously checked by the Re-encryption arming gate before disk I/O. */
   isSettingsSaveInProgress(): boolean { return this.settingsSaveInProgress }
   private unloaded = false
+  private recoveryReadOnlyCommandInProgress = false
+  private recoveryReadOnlyEpoch = 0
   private statusDisplaySignature: string | undefined
   private cooldownStore?: V4RateLimitCooldownStore
 
@@ -82,6 +84,8 @@ export default class FastSync extends Plugin {
 
   override async onload() {
     this.unloaded = false
+    this.recoveryReadOnlyEpoch++
+    this.recoveryReadOnlyCommandInProgress = false
     await this.loadSettings()
     if (this.secretsMigrated) {
       if (await this.canMigrateStartupSecrets()) await this.persistData()
@@ -190,10 +194,16 @@ export default class FastSync extends Plugin {
       id: "verify-reencryption-recovery-read-only",
       name: "GitHub Sync: Verify Re-encryption Recovery (Read-only)",
       callback: () => {
+        if (this.unloaded || this.recoveryReadOnlyCommandInProgress) return
+        const runtime = this.v4Runtime
+        const epoch = this.recoveryReadOnlyEpoch
+        const current = () => !this.unloaded
+          && this.recoveryReadOnlyEpoch === epoch && this.v4Runtime === runtime
+        this.recoveryReadOnlyCommandInProgress = true
         void (async () => {
           try {
-            const backup = await this.v4Runtime.verifyFencedReencryptionAuthenticatedWal()
-            if (this.unloaded) return
+            const backup = await runtime.verifyFencedReencryptionAuthenticatedWal()
+            if (!current()) return
             if (!backup?.originalKeyAuthenticated || !backup.completeBackupContentsReverified
               || !backup.coldStartWalReverified) {
               new Notice(
@@ -212,8 +222,8 @@ export default class FastSync extends Plugin {
                 : "GitHub Sync: Original key, Frozen Backup and AES-GCM WAL authenticated; no nonempty Destination ciphertext receipt proof. Complete Recovery remains unverified. Sync stays paused.",
               12000,
             )
-            const refs = await this.v4Runtime.inspectFencedReencryptionCandidateGitRefs()
-            if (this.unloaded) return
+            const refs = await runtime.inspectFencedReencryptionCandidateGitRefs()
+            if (!current()) return
             new Notice(refs?.destinationOrphanTopologyObserved
               ? (backup.completeDestinationContentsReverified && backup.recoveryLeaseReverified
                 ? "GitHub Sync: Backup/Destination Git ref identities also match the saved candidate. Full Recovery/Cutover is not authorized, and Sync remains paused."
@@ -221,10 +231,12 @@ export default class FastSync extends Plugin {
               : "GitHub Sync: Destination GitHub ref topology is unavailable or differs from the saved candidate. Preserve both passphrases; Manual Recovery may be needed. Sync stays paused.",
             12000)
           } catch {
-            if (!this.unloaded) new Notice(
+            if (current()) new Notice(
               "GitHub Sync: Read-only Backup/WAL verification unavailable. Sync stays paused; review Manual Recovery.",
               10000,
             )
+          } finally {
+            if (this.recoveryReadOnlyEpoch === epoch) this.recoveryReadOnlyCommandInProgress = false
           }
         })()
       },
@@ -234,18 +246,35 @@ export default class FastSync extends Plugin {
       id: "verify-reencryption-complete-recovery-read-only",
       name: "GitHub Sync: Verify Complete Re-encryption Recovery (Read-only)",
       callback: () => {
-        new Notice(
-          "GitHub Sync: Checking Old Backup, encrypted WAL and Destination (read-only). This may take time; no Cutover or Sync will run.",
-          8000,
-        )
+        if (this.unloaded || this.recoveryReadOnlyCommandInProgress) return
+        const runtime = this.v4Runtime
+        const epoch = this.recoveryReadOnlyEpoch
+        const current = () => !this.unloaded
+          && this.recoveryReadOnlyEpoch === epoch && this.v4Runtime === runtime
+        this.recoveryReadOnlyCommandInProgress = true
         void (async () => {
           try {
-            const report = await this.v4Runtime.inspectFencedReencryptionCompleteRecovery()
-            if (this.unloaded) return
+            new Notice(
+              "GitHub Sync: Checking Old Backup, encrypted WAL and Destination (read-only). This may take time; no Cutover or Sync will run.",
+              8000,
+            )
+            const report = await runtime.inspectFencedReencryptionCompleteRecovery()
+            if (!current()) return
             if (report?.observation === "authenticated-complete-recovery-evidence-still-fenced"
+              && report.integrityScope === "read-only-original-backup-encrypted-wal-complete-destination"
+              && (report.isolation === "desktop-os-cooperative-wal-lock"
+                || report.isolation === "mobile-cooperative-best-effort-only")
               && report.originalKeyAuthenticated && report.completeOldBackupReverified
-              && report.walReceiptsBoundToDestination
-              && report.completeDestinationContentsReverified) {
+              && report.walReceiptsBoundToDestination && report.completeDestinationContentsReverified
+              && report.powerLossDurabilityProven === false
+              && report.mobileOsLockProven === false
+              && report.installedObsidianAcceptanceProven === false
+              && report.commitDecisionAuthorized === false
+              && report.localCutoverAuthorized === false
+              && report.resumeSyncAuthorized === false
+              && report.rollbackAuthorized === false
+              && report.remoteWritesAuthorized === false
+              && report.oldPassphraseCleanupAuthorized === false) {
               new Notice(
                 report.isolation === "mobile-cooperative-best-effort-only"
                   ? "GitHub Sync: Old Backup, encrypted WAL and full Destination verified in a read-only Mobile scan. Mobile exclusion is best-effort only; no OS lock or power-loss durability is proven. Cutover and Sync stay blocked."
@@ -259,10 +288,12 @@ export default class FastSync extends Plugin {
               )
             }
           } catch {
-            if (!this.unloaded) new Notice(
+            if (current()) new Notice(
               "GitHub Sync: Read-only Complete Recovery check unavailable. Keep both passphrases; Sync stays paused.",
               12000,
             )
+          } finally {
+            if (this.recoveryReadOnlyEpoch === epoch) this.recoveryReadOnlyCommandInProgress = false
           }
         })()
       },
@@ -300,6 +331,8 @@ export default class FastSync extends Plugin {
 
   override onunload() {
     this.unloaded = true
+    this.recoveryReadOnlyEpoch++
+    this.recoveryReadOnlyCommandInProgress = false
     if (this.scheduledSyncTimer) window.clearInterval(this.scheduledSyncTimer);
     this.scheduledSyncTimer = null;
     if (this.startupSyncTimeout !== null) window.clearTimeout(this.startupSyncTimeout);

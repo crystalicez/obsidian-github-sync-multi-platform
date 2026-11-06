@@ -48,6 +48,10 @@ if (selected.length === 0) {
 }
 
 console.log(`Selected ${selected.length}/${eligible.length} ${tier} test files${shard ? ` (shard ${shard})` : ""}.`);
+if (process.argv.includes("--list")) {
+  for (const item of selected) console.log(item.path);
+  process.exit(0);
+}
 
 // A shared .tmp/tests directory made parallel tiers and repeat runs delete one
 // another's bundles (ENOTEMPTY/ENOENT). Only remove this invocation's directory.

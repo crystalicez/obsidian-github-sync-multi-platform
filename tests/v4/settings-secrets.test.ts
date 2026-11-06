@@ -28,8 +28,12 @@ function deferred<T>() {
 
 test("D226 installed startup never rewrites legacy secrets or plugin data under a migration fence", async () => {
   const root = ".obsidian/plugins/test/github-sync-v4-rekey-sync-fence";
+  const routeRoot = ".obsidian/plugins/test/github-sync-v4-rekey-runtime-route";
   const scenarios = [
     { name: "clear startup migrates", paths: [], inaccessible: false, allowed: true },
+    { name: "orphan route root without fence", paths: [routeRoot], inaccessible: false },
+    { name: "orphan route marker without fence", paths: [routeRoot + "/intent.json"], inaccessible: false },
+    { name: "orphan route root and marker without fence", paths: [routeRoot, routeRoot + "/intent.json"], inaccessible: false },
     { name: "root only", paths: [root], inaccessible: false },
     { name: "marker only", paths: [root + "/active.json"], inaccessible: false },
     { name: "root and marker", paths: [root, root + "/active.json"], inaccessible: false },
