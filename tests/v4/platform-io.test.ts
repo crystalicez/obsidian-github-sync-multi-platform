@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { collectV4ContentSource } from "../../src/lib/v4/content-source";
+import { collectV4ContentSource, createV4ContentSource } from "../../src/lib/v4/content-source";
 import {
   createV4PlatformIo,
   V4BoundedIoUnavailableError,
@@ -40,6 +40,26 @@ test("mobile without a proven bounded read path capability-fails instead of call
   assert.equal(wholeReadCalls, 0);
 });
 
+test("D363 ordinary Mobile Sync large-file source independently fails closed without bounded reads", async () => {
+  let wholeReads = 0;
+  const io = createV4PlatformIo({
+    platform: "mobile",
+    adapter: { async readBinary() { wholeReads++; return new ArrayBuffer(0); } },
+  });
+  assert.equal(io.capabilities.boundedRead, false);
+  assert.equal(io.capabilities.recoveryStagedCommit, false);
+  await assert.rejects(() => createV4ContentSource({
+    kind: "vault", path: "large.md",
+    expectedSize: 32 * 1024 * 1024 + 1, expectedMtime: 1, expectedHash: "0".repeat(64),
+  }, {
+    readVaultWhole: path => io.readWhole(path),
+    openVaultBounded: (path, size) => io.openBoundedSource(path, size),
+  }), error => error instanceof V4BoundedIoUnavailableError && error.capability === "bounded-read");
+  assert.equal(wholeReads, 0, "no unbounded Mobile readBinary fallback for oversized normal Sync uploads");
+  // This is an isolated runtime capability negative, NOT actual device-level
+  // Mobile Sync acceptance for large files or a claim about remote downloads.
+});
+
 test("mobile bounded append is feature-detected and never assumed by the declared minimum", async () => {
   const events: string[] = [];
   const io = createV4PlatformIo({
@@ -54,6 +74,24 @@ test("mobile bounded append is feature-detected and never assumed by the declare
   await io.writeStage("stage.bin", new Uint8Array([1, 2]));
   await io.appendStage("stage.bin", new Uint8Array([3]));
   assert.deepEqual(events, ["write:stage.bin:2", "append:stage.bin:1"]);
+});
+
+test("D406 mobile missing remove capability cannot claim successful stage cleanup", async () => {
+  const stages = new Map<string, Uint8Array>();
+  const io = createV4PlatformIo({
+    platform: "mobile",
+    adapter: {
+      async writeBinary(path, data) { stages.set(path, new Uint8Array(data)); },
+      async appendBinary(path, data) {
+        stages.set(path, new Uint8Array([...(stages.get(path) ?? []), ...new Uint8Array(data)]));
+      },
+      // Deliberately no remove(): existing adapter would silently no-op.
+    },
+  });
+  await io.writeStage("private/stage/residue.bin", new Uint8Array([1, 2]));
+  await assert.rejects(io.removeStage("private/stage/residue.bin"), /stage-cleanup.*unavailable/i,
+    "missing mobile cleanup must not count as a deleted staged file");
+  assert.deepEqual(stages.get("private/stage/residue.bin"), new Uint8Array([1, 2]));
 });
 
 test("mobile without appendBinary rejects bounded append", async () => {

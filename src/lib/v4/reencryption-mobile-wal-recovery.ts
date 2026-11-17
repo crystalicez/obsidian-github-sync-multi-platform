@@ -1,4 +1,4 @@
-import { utf8ToBytes } from "../bytes"
+import { sha256Hex, utf8ToBytes } from "../bytes"
 import type { V4LocalIndexAdapter } from "./local-index"
 import { planV4PluginPrivateWalLocation } from "./reencryption-plugin-wal-location"
 
@@ -105,6 +105,7 @@ export async function openV4MobilePluginWalForRecovery(
   }
   await assertContents()
   const firstStats: MobileWalStat[] = []
+  const pinnedSlotSha256: string[] = []
   for (const slot of slots) {
     const info = await readStat(slot)
     if (!validStat(info, "file")) {
@@ -124,15 +125,26 @@ export async function openV4MobilePluginWalForRecovery(
     checkOwner()
     const first = await methods.read.call(adapter, full)
     checkOwner()
-    if (typeof first !== "string" || utf8ToBytes(first).length > MAX_SLOT_BYTES) {
-      throw Error("Re-encryption Mobile WAL returned invalid or oversized data.")
+    if (typeof first !== "string") {
+      throw Error("Re-encryption Mobile WAL returned invalid data.")
+    }
+    const bytes = utf8ToBytes(first)
+    if (bytes.length > MAX_SLOT_BYTES || bytes.length !== before!.size) {
+      throw Error("Re-encryption Mobile WAL returned invalid or inconsistent data.")
     }
     const second = await methods.read.call(adapter, full)
     checkOwner()
     if (second !== first || !unchangedStat(firstStats[index]!, await readStat(full))) {
       throw Error("Re-encryption Mobile WAL slot changed during readback.")
     }
+    const sha = await sha256Hex(bytes)
+    checkOwner()
+    const pinned = pinnedSlotSha256[index]
+    if (pinned !== undefined && sha !== pinned) {
+      throw Error("Re-encryption Mobile WAL slot changed since the Recovery reader opened.")
+    }
     await assertContents()
+    if (pinned === undefined) pinnedSlotSha256[index] = sha
     return first
   }
   await verifyRead(layout.journalRoot + "/slot-0.json")

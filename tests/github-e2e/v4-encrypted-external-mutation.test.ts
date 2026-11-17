@@ -45,8 +45,8 @@ function installRequestUrlBridge(): void {
     const request = raw as { url: string; method?: string; headers?: Record<string, string>; body?: string };
     const response = await fetch(request.url, {
       method: request.method ?? "GET",
-      headers: request.headers,
-      body: request.body,
+      ...(request.headers ? { headers: request.headers } : {}),
+      ...(request.body === undefined ? {} : { body: request.body }),
     });
     const arrayBuffer = await response.arrayBuffer();
     const text = new TextDecoder().decode(arrayBuffer);

@@ -7,8 +7,10 @@ import { assertV4GitBlobIdentity } from "./git-blob-identity"
 import { readImmutableGitFile } from "./immutable-git-read"
 import { verifyV4ReencryptionSourceObjects, type V4ReencryptionVerifiedSource } from "./reencryption-content-verifier"
 import { decodeV4RemoteConfig, decodeV4RemoteHead, decodeV4RemoteShard, v4RemoteShardPath, type V4RemoteShard } from "./remote-index"
-import { V4_CONFIG_PATH, V4_HEAD_PATH } from "./protocol-types"
+import { V4_CONFIG_PATH, V4_HEAD_PATH, type V4RemoteConfig, type V4RemoteHead } from "./protocol-types"
 import type { V4SameRepoReencryptionBackupBranchProposal } from "./reencryption-owner-decisions"
+import type { V4InitiatorSourceRecord } from "./reencryption-initiator-parity"
+import type { V4IndexFileRecord } from "./local-index"
 
 /**
  * Trusted read-only bridge between the public GitHub Git API and D69's
@@ -23,6 +25,30 @@ export interface V4GitHubReencryptionSourceInput {
   readonly expectedBranch: string
   readonly passphrase: string
   readonly signal?: AbortSignal | undefined
+}
+
+export interface V4GitHubForkSourceParityInventory {
+  readonly pinnedSourceCommitSha: string
+  readonly verifiedSource: V4ReencryptionVerifiedSource
+  readonly sourceRecords: readonly V4InitiatorSourceRecord[]
+  readonly initiatorLocalParityVerified: false
+  readonly permissionToPublish: false
+  readonly cutoverAuthorized: false
+}
+
+/** Authenticated full metadata for offline transcode, NEVER publication authority. */
+export interface V4GitHubForkSourceTranscodeInventory {
+  readonly pinnedSourceCommitSha: string
+  readonly verifiedSource: V4ReencryptionVerifiedSource
+  /** Fully authenticated source metadata for the existing whole-Vault staging engine. */
+  readonly sourceConfig: Readonly<V4RemoteConfig>
+  readonly sourceHead: Readonly<V4RemoteHead>
+  readonly sourceShards: Readonly<Record<string, V4RemoteShard>>
+  /** Live records point into the same frozen shard graph, without duplication. */
+  readonly sourceRecords: readonly V4IndexFileRecord[]
+  readonly initiatorLocalParityVerified: false
+  readonly permissionToPublish: false
+  readonly cutoverAuthorized: false
 }
 
 interface V4GitHubVerifiedSnapshotInput extends V4GitHubReencryptionSourceInput {
@@ -72,6 +98,9 @@ function clearKeyring(keyring: V4Keyring): void {
 
 async function verifyGitHubReencryptionSnapshotAtRef(
   input: V4GitHubVerifiedSnapshotInput,
+  captureAuthenticatedLiveRecords?: (records: readonly V4InitiatorSourceRecord[]) => void,
+  captureAuthenticatedTranscodeRecords?: (snapshot: Pick<V4GitHubForkSourceTranscodeInventory,
+    "sourceConfig" | "sourceHead" | "sourceShards" | "sourceRecords">) => void,
 ): Promise<V4ReencryptionVerifiedSource> {
   throwIfV4Aborted(input.signal)
   assertSafeGitHubBranch(input.expectedBranch)
@@ -227,6 +256,60 @@ async function verifyGitHubReencryptionSnapshotAtRef(
     if (finalPhysicalId !== initialPhysicalId) {
       throw new Error("Re-encryption GitHub repository identity switched during verification.")
     }
+    if (captureAuthenticatedLiveRecords || captureAuthenticatedTranscodeRecords) {
+      const parityRecords: V4InitiatorSourceRecord[] = []
+      const transcodeRecords: V4IndexFileRecord[] = []
+      let totalBytes = BigInt(0)
+      let liveCount = 0
+      for (const shard of Object.values(shards)) {
+        for (const item of Object.values(shard.records)) {
+          if (captureAuthenticatedTranscodeRecords) {
+            // These decoded shard records have not escaped this function.
+            // Freeze the verified graph rather than duplicating each record.
+            if (item.partPaths) Object.freeze(item.partPaths)
+            Object.freeze(item)
+          }
+          if (item.deleted) continue
+          liveCount++
+          if (captureAuthenticatedLiveRecords) {
+            parityRecords.push(Object.freeze({
+              path: item.path,
+              size: item.size,
+              plaintextSha256: item.plaintextSha256,
+              deleted: false as const,
+            }))
+          }
+          if (captureAuthenticatedTranscodeRecords) {
+            transcodeRecords.push(item)
+          }
+          totalBytes += BigInt(item.size)
+        }
+        if (captureAuthenticatedTranscodeRecords) {
+          Object.freeze(shard.records)
+          Object.freeze(shard)
+        }
+      }
+      if (liveCount !== verified.verifiedFileCount
+        || totalBytes.toString() !== verified.totalVerifiedPlaintextBytes) {
+        throw new Error("Re-encryption authenticated source inventory differs from verified totals.")
+      }
+      if (captureAuthenticatedLiveRecords) {
+        captureAuthenticatedLiveRecords(Object.freeze(parityRecords))
+      }
+      if (captureAuthenticatedTranscodeRecords) {
+        if (config.kdfParams) Object.freeze(config.kdfParams)
+        Object.freeze(config)
+        Object.freeze(head.shardHashes)
+        Object.freeze(head)
+        Object.freeze(shards)
+        captureAuthenticatedTranscodeRecords(Object.freeze({
+          sourceConfig: config,
+          sourceHead: head,
+          sourceShards: shards,
+          sourceRecords: Object.freeze(transcodeRecords),
+        }))
+      }
+    }
     return verified
   } finally {
     salt.fill(0)
@@ -252,6 +335,59 @@ export function verifyGitHubReencryptionForkSource(
 ): Promise<V4ReencryptionVerifiedSource> {
   return verifyGitHubReencryptionSnapshotAtRef({
     ...input, sourceRefPolicy: "pinned-immutable-commit",
+  })
+}
+
+/**
+ * D340: pass the authenticated pinned-commit live inventory to the existing
+ * initiating-device local parity engine. Only minimum logical record fields
+ * survive; no ciphertext, keyring, credentials or write authority escape the
+ * trusted reader. A real exclusive WAL lease and physical-vault parity are
+ * still necessary before any migration or cutover.
+ */
+export async function verifyGitHubReencryptionForkSourceWithParityInventory(
+  input: V4GitHubReencryptionSourceInput,
+): Promise<V4GitHubForkSourceParityInventory> {
+  let sourceRecords: readonly V4InitiatorSourceRecord[] | undefined
+  const verifiedSource = await verifyGitHubReencryptionSnapshotAtRef({
+    ...input, sourceRefPolicy: "pinned-immutable-commit",
+  }, records => { sourceRecords = records })
+  if (!sourceRecords) {
+    throw new Error("Re-encryption authenticated source inventory was not captured.")
+  }
+  return Object.freeze({
+    pinnedSourceCommitSha: verifiedSource.pinnedSourceCommitSha,
+    verifiedSource,
+    sourceRecords,
+    initiatorLocalParityVerified: false,
+    permissionToPublish: false,
+    cutoverAuthorized: false,
+  })
+}
+
+/**
+ * D346: expose full immutable metadata for offline stream transcoding from
+ * the same pinned commit whose live ciphertext bytes were authenticated.
+ * This never permits publication, WAL mutation or local Cutover.
+ */
+export async function verifyGitHubReencryptionForkSourceWithTranscodeInventory(
+  input: V4GitHubReencryptionSourceInput,
+): Promise<V4GitHubForkSourceTranscodeInventory> {
+  let metadata: Pick<V4GitHubForkSourceTranscodeInventory,
+    "sourceConfig" | "sourceHead" | "sourceShards" | "sourceRecords"> | undefined
+  const verifiedSource = await verifyGitHubReencryptionSnapshotAtRef({
+    ...input, sourceRefPolicy: "pinned-immutable-commit",
+  }, undefined, snapshot => { metadata = snapshot })
+  if (!metadata) {
+    throw new Error("Re-encryption authenticated transcode inventory was not captured.")
+  }
+  return Object.freeze({
+    pinnedSourceCommitSha: verifiedSource.pinnedSourceCommitSha,
+    verifiedSource,
+    ...metadata,
+    initiatorLocalParityVerified: false,
+    permissionToPublish: false,
+    cutoverAuthorized: false,
   })
 }
 

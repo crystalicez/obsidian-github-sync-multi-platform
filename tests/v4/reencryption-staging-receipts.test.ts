@@ -257,6 +257,109 @@ test("D81 binds D79 staging to WAL intent BEFORE upload and confirms exact Git S
   assert.ok(!serialized.includes(result.receipts[0]!.path));
 });
 
+test("D394 three-branch WAL staging refuses replaced lease, durability or Git writer before any mutation", async () => {
+  for (const replaced of ["lease", "durability", "upload"] as const) {
+    const f = await fixture();
+    const wal = journal();
+    let current = await wal.begin();
+    const backupRef = {
+      role: "backup" as const, repoId: "owner/repo#backup/frozen",
+      commitSha: sha, treeSha: "b".repeat(40),
+    };
+    current = await wal.recordRefIntent(backupRef, current.generation);
+    current = await wal.markRefReadbackObserved(backupRef, current.generation);
+    const approvedGeneration = current.generation;
+    let changed = false;
+    let uploads = 0;
+    let changeOwner = () => {};
+    const input = {
+      ...f.input,
+      journal: wal,
+      beginAfterVerifiedBackup: { expectedJournalGeneration: approvedGeneration, backupRef },
+      async assertExclusiveStageLease() {
+        await Promise.resolve();
+        if (!changed) {
+          changed = true;
+          changeOwner();
+        }
+      },
+      async assertCrashDurable() {},
+      async stageImmutableObject(path: string, data: Uint8Array) {
+        uploads++;
+        return f.input.stageImmutableObject(path, data);
+      },
+    };
+    changeOwner = () => {
+      if (replaced === "lease") input.assertExclusiveStageLease = async () => {};
+      else if (replaced === "durability") input.assertCrashDurable = async () => {};
+      else input.stageImmutableObject = async (path, data) => {
+        uploads++;
+        return f.input.stageImmutableObject(path, data);
+      };
+    };
+
+    await assert.rejects(
+      () => stageV4ReencryptionVaultObjectsWithJournal(input),
+      /staging.*(callback|authority|owner).*changed/i,
+      "D394 must not accept substituted " + replaced + " authority from an awaited callback",
+    );
+    assert.equal(changed, true, "test must change owner during an awaited lease check");
+    assert.equal(uploads, 0, "no Git Blob writer may execute after " + replaced + " substitution");
+    const after = await wal.load();
+    assert.equal(after?.generation, approvedGeneration,
+      "no Staging WAL handoff or blob intent may be persisted after authority substitution");
+    assert.equal(after?.stageHandoffStarted, false);
+    assert.equal(after?.pendingIntents.length, 0);
+  }
+});
+
+test("D394 mutated writer after encrypted upload intent stays unresolved and cannot be retried", async () => {
+  const f = await fixture();
+  const ready = await d167BackupReady();
+  let changed = false;
+  let uploads = 0;
+  let replaceWriter = () => {};
+  const input = {
+    ...f.input, ...ready,
+    async assertExclusiveStageLease() {},
+    async assertCrashDurable() {
+      const state = await ready.journal.load();
+      if (!changed && state?.pendingIntents.length) {
+        changed = true;
+        replaceWriter();
+      }
+    },
+    async stageImmutableObject(path: string, data: Uint8Array) {
+      uploads++;
+      return f.input.stageImmutableObject(path, data);
+    },
+  };
+  replaceWriter = () => {
+    input.stageImmutableObject = async () => {
+      uploads++;
+      return "f".repeat(40);
+    };
+  };
+  await assert.rejects(
+    () => stageV4ReencryptionVaultObjectsWithJournal(input),
+    /staging.*(callback|authority|owner).*changed/i,
+  );
+  assert.equal(changed, true);
+  assert.equal(uploads, 0, "no replacement Git writer may receive any ciphertext");
+  const pending = await ready.journal.load();
+  assert.equal(pending?.stageHandoffStarted, true);
+  assert.equal(pending?.pendingIntents.length, 1);
+  assert.equal(pending?.receipts.length, 0);
+  assert.equal(pending?.permissionToPublish, false);
+  assert.equal(pending?.cutoverAuthorized, false);
+  await assert.rejects(
+    () => stageV4ReencryptionVaultObjectsWithJournal(input),
+    /previous run requires manual recovery/i,
+    "a failed authority check after an intent must not permit automatic Blob POST replay",
+  );
+  assert.equal(uploads, 0);
+});
+
 test("D102 D90 three-branch flow stages fresh ciphertext AFTER explicitly verified Backup WAL ref, not a new journal", async () => {
   const f = await fixture();
   const wal = journal();

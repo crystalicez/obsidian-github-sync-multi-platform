@@ -29,7 +29,7 @@ test("custom-branch empty bootstrap replans when another initializer creates onl
           status: 200,
           text: "",
           headers: {},
-          json: [{ ref: "refs/heads/main", object: { sha: "winner-bootstrap", type: "commit" } }],
+          json: [{ ref: "refs/heads/main", object: { sha: "c".repeat(40), type: "commit" } }],
         }
     }
     if (request.method === "PUT" && request.url.includes("/contents/.obsidian-github-sync-v4/bootstrap")) {
@@ -52,7 +52,7 @@ test("custom-branch empty bootstrap replans when another initializer creates onl
     assert.equal(error.code, "V4_PUBLICATION_RACE")
     assert.equal(error.phase, "bootstrap-publish")
     assert.equal(error.expectedHeadSha, null)
-    assert.equal(error.observedHeadSha, "winner-bootstrap")
+    assert.equal(error.observedHeadSha, "c".repeat(40))
     assert.equal(error.publicationOutcome, "unknown")
     assert.equal(error.evidence, "bootstrap-repository-state-changed")
     assert.equal(refInspections, 2, "definitive bootstrap conflict must re-inspect repository state")

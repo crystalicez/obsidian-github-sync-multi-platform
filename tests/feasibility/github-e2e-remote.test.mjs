@@ -39,6 +39,72 @@ const config = (branch = "e2e/run-1", expectedRepoId = "123") => ({
   owner: "test", repo: "repo", branch, token: "secret", expectedRepoId,
 });
 
+test("D314 exported E2E GitHub readers refuse URL-normalizing coordinates and ref paths before credentialed I/O", async () => {
+  const unsafeCoordinates = [
+    ["..", "repo"], [".", "repo"], ["test", ".."], ["test", "."],
+    ["test", "%2e%2e"], ["te?st", "repo"], ["test", "repo#fragment"],
+    ["test", "repo\\other"],
+  ];
+  const escapedUrl = new URL("https://api.github.com/repos/../repo").pathname;
+  assert.equal(escapedUrl, "/repo", "dot owner would redirect the requested API path");
+  for (const [owner, repo] of unsafeCoordinates) {
+    const calls = [];
+    await assert.rejects(() => readE2ERepository({
+      fetchImpl: fakeFetch([], calls), owner, repo, token: "private-token",
+    }), /invalid|unsafe/i, owner + "/" + repo);
+    assert.equal(calls.length, 0, "unsafe repository coordinates must not send credentials");
+    await assert.rejects(() => readE2EBranch({
+      fetchImpl: fakeFetch([], calls), owner, repo, branch: "e2e/safe",
+      token: "private-token",
+    }), /invalid|unsafe/i);
+    assert.equal(calls.length, 0, "unsafe ref lookup must not send credentials");
+  }
+  for (const branch of ["e2e/../../protected", "safe/./protected", "safe/%2e%2e/protected"]) {
+    const calls = [];
+    await assert.rejects(() => readE2EBranch({
+      fetchImpl: fakeFetch([], calls), owner: "test", repo: "repo",
+      branch, token: "private-token",
+    }), /invalid|unsafe/i, branch);
+    assert.equal(calls.length, 0, "unsafe ref path must not send credentials");
+  }
+});
+
+test("D314 E2E preflight and cleanup reject unsafe repository coordinates before even the first GET", async () => {
+  for (const [owner, repo] of [["..", "repo"], ["test", ".."], ["test", "repo#fragment"]]) {
+    const calls = [];
+    await assert.rejects(() => preflightE2ERemote({
+      fetchImpl: fakeFetch([], calls),
+      config: {...config(), owner, repo},
+    }), /invalid|unsafe/i);
+    await assert.rejects(() => cleanupE2EBranch({
+      fetchImpl: fakeFetch([], calls), owner, repo,
+      branch: "obsidian-sync-e2e/local-123456abcdef-fixture",
+      token: "private-token", expectedRepoId: "123", currentSourceRepoId: "777",
+      sleep: async () => {},
+    }), /invalid|unsafe/i);
+    assert.equal(calls.length, 0, "a dangerous target path must fail closed before any API request");
+  }
+});
+
+test("D312 direct remote preflight rejects an unsafe branch without any network requests", async () => {
+  const calls = [];
+  await assert.rejects(() => preflightE2ERemote({
+    fetchImpl: fakeFetch([], calls),
+    config: config("e2e/../../trunk"),
+  }), /unsafe|invalid.*branch/i);
+  assert.equal(calls.length, 0);
+});
+
+test("D312 remote repository metadata refuses a URL-normalizing default branch", async () => {
+  const calls = [];
+  await assert.rejects(() => preflightE2ERemote({
+    fetchImpl: fakeFetch([repo(123, "e2e/../../protected"), ref()], calls),
+    config: config(),
+  }), /default branch|unsafe/i);
+  assert.equal(calls.length, 1,
+    "an untrusted remote default-branch name must not be turned into a Git ref request");
+});
+
 test("remote preflight rejects actual default branch before mutation", async () => {
   await assert.rejects(() => preflightE2ERemote({
     fetchImpl: fakeFetch([repo()]),
@@ -111,6 +177,41 @@ test("branch lookup distinguishes absent, present, and unknown", async () => {
   }), /network error/i);
 });
 
+test("D312 destructive E2E cleanup rejects a dot-segment branch before contacting GitHub", async () => {
+  const branch = "obsidian-sync-e2e/local-safe/../../protected";
+  const rawDelete = "https://api.github.com/repos/test/repo/git/refs/heads/" + branch;
+  assert.equal(new URL(rawDelete).pathname, "/repos/test/repo/git/refs/heads/protected",
+    "URL normalization would redirect deletion from the disposable prefix to an unrelated Git branch");
+  const calls = [];
+  const fetchImpl = fakeFetch([
+    repo(), ref(), response(200, { object: { sha: PRESENT_SHA } }),
+    response(204), repo(), ref(), response(404),
+  ], calls);
+  await assert.rejects(() => cleanupE2EBranch({
+    fetchImpl, owner: "test", repo: "repo", branch,
+    token: "secret", expectedRepoId: "123", currentSourceRepoId: "777", sleep: async () => {},
+  }), /restricted|unsafe|invalid.*branch/i);
+  assert.equal(calls.length, 0, "ref-path validation must run before any network request, especially DELETE");
+});
+
+test("D312 destructive E2E cleanup rejects disguised branch delimiters and extra path segments", async () => {
+  for (const branch of [
+    "obsidian-sync-e2e/local-safe/../protected",
+    "obsidian-sync-e2e/local-safe/%2e%2e/protected",
+    "obsidian-sync-e2e/local-safe/extra",
+    "obsidian-sync-e2e/local-safe?ref=protected",
+    "obsidian-sync-e2e/local-safe#protected",
+    "obsidian-sync-e2e/local-safe\\..\\protected",
+  ]) {
+    const calls = [];
+    await assert.rejects(() => cleanupE2EBranch({
+      fetchImpl: fakeFetch([], calls), owner: "test", repo: "repo", branch,
+      token: "secret", expectedRepoId: "123", currentSourceRepoId: "777", sleep: async () => {},
+    }), /restricted|unsafe|invalid.*branch/i, branch);
+    assert.equal(calls.length, 0, "unsafe cleanup name must not generate even a GET request: " + branch);
+  }
+});
+
 test("cleanup rejects non-local branch namespaces before any remote request", async () => {
   const fetchImpl = fakeFetch([]);
   await assert.rejects(() => cleanupE2EBranch({
@@ -146,7 +247,7 @@ test("cleanup succeeds for an absent branch only when absence is re-read after t
   assert.equal(fetchImpl.remaining(), 0);
 });
 
-test("cleanup does not accept stale absence if the disposable branch reappears during final proof", async () => {
+test("D311 cleanup never deletes a disposable-name branch which reappeared after confirmed absence", async () => {
   const calls = [];
   const fetchImpl = fakeFetch([
     repo(), ref(), response(404),
@@ -154,12 +255,29 @@ test("cleanup does not accept stale absence if the disposable branch reappears d
     response(204),
     repo(), ref(), response(404),
   ], calls);
-  await cleanupE2EBranch({
+  await assert.rejects(() => cleanupE2EBranch({
     fetchImpl, owner: "test", repo: "repo", branch: "obsidian-sync-e2e/local-recreated",
     token: "secret", expectedRepoId: "123", currentSourceRepoId: "777", sleep: async () => {},
-  });
-  assert.equal(calls.some(call => call.options?.method === "DELETE"), true);
-  assert.equal(fetchImpl.remaining(), 0);
+  }), /reappeared|unexpected branch|manual cleanup/i);
+  assert.equal(calls.some(call => call.options?.method === "DELETE"), false,
+    "a new unknown owner must never be deleted because its name matches the test prefix");
+});
+
+test("D311 cleanup never retries DELETE against a branch whose Git commit changed", async () => {
+  const calls = [];
+  const fetchImpl = fakeFetch([
+    repo(), ref(), response(200, { object: { sha: PRESENT_SHA } }), response(500),
+    repo(), ref(), response(200, { object: { sha: DEFAULT_SHA } }),
+    repo(), ref(), response(200, { object: { sha: DEFAULT_SHA } }), response(204),
+    repo(), ref(), response(404),
+  ], calls);
+  await assert.rejects(() => cleanupE2EBranch({
+    fetchImpl, owner: "test", repo: "repo", branch: "obsidian-sync-e2e/local-changed",
+    token: "secret", expectedRepoId: "123", currentSourceRepoId: "777", sleep: async () => {},
+    maxAttempts: 3,
+  }), /changed|different commit|manual cleanup/i);
+  assert.equal(calls.filter(call => call.options?.method === "DELETE").length, 1,
+    "a changed branch may belong to another writer and cannot be deleted a second time");
 });
 
 test("cleanup retries a failed server-side delete after verifying the branch remains", async () => {
@@ -214,11 +332,14 @@ test("cleanup treats auth and network failures as unknown, not success", async (
   }), /network error/i);
 });
 
-test("branch path encodes each branch segment safely", async () => {
+test("valid E2E branch path retains its exact repository and ref identity", async () => {
   const calls = [];
   await readE2EBranch({
-    fetchImpl: fakeFetch([response(404)], calls), owner: "o wner", repo: "r#po", branch: "a b/x#y", token: "secret",
+    fetchImpl: fakeFetch([response(404)], calls),
+    owner: "test-owner", repo: "repo.snapshot", branch: "e2e/safe-v1.2",
+    token: "secret",
   });
-  assert.match(calls[0].url, /repos\/o%20wner\/r%23po\/git\/ref\/heads\/a%20b\/x%23y$/u);
+  assert.equal(new URL(calls[0].url).pathname,
+    "/repos/test-owner/repo.snapshot/git/ref/heads/e2e/safe-v1.2");
   assert.doesNotMatch(calls[0].url, /secret/u);
 });

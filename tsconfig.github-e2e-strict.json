@@ -1,0 +1,19 @@
+{
+  "extends": "./tsconfig.maximum-strict.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "target": "ES2022",
+    "module": "ESNext",
+    "lib": [
+      "DOM",
+      "DOM.Iterable",
+      "ES2022"
+    ]
+  },
+  "include": [
+    "tests/github-e2e/v4-real-github-e2e.test.ts",
+    "tests/github-e2e/v4-copy-contract-github-e2e.test.ts",
+    "tests/github-e2e/v4-encrypted-external-mutation.test.ts",
+    "tests/github-e2e/obsidian-runtime-stub.d.ts"
+  ]
+}

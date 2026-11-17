@@ -370,28 +370,42 @@ type BestEffortJournalBinding = {
 }
 
 function bestEffortJournalCheckpoint(input: BestEffortJournalBinding): JournalCheckpoint {
-  const { plan, journal, wal } = input
+  const { plan, journal, wal, signal } = input
+  const lease = wal.assertExclusiveStageLease
+  const checkpoint = wal.assertBestEffortCheckpoint
+  const read = journal.assertHealthySnapshot
+  const load = journal.load
+  const source = plan.pinnedSourceCommitSha
+  const destination = plan.destinationRepoId
+  const assertOwner = () => {
+    throwIfV4Aborted(signal)
+    if (input.wal !== wal || input.journal !== journal || input.plan !== plan
+      || input.signal !== signal
+      || wal.assertExclusiveStageLease !== lease
+      || wal.assertBestEffortCheckpoint !== checkpoint
+      || journal.assertHealthySnapshot !== read || journal.load !== load
+      || plan.pinnedSourceCommitSha !== source || plan.destinationRepoId !== destination) {
+      throw new Error("Best-effort Re-encryption WAL initiating owner changed; Manual Recovery required.")
+    }
+  }
   return async (requestedGeneration) => {
-    throwIfV4Aborted(input.signal)
-    await wal.assertExclusiveStageLease()
-    throwIfV4Aborted(input.signal)
-    const generation = requestedGeneration ?? (await journal.load())?.generation
+    assertOwner()
+    await lease.call(wal)
+    assertOwner()
+    const generation = requestedGeneration ?? (await load.call(journal))?.generation
+    assertOwner()
     if (!generation) throw new Error("Best-effort Re-encryption needs an existing authenticated WAL run.")
     const report = await inspectV4BestEffortWalRecovery({
       storage: wal, journal,
-      expected: {
-        sourceCommitSha: plan.pinnedSourceCommitSha,
-        destinationRepoId: plan.destinationRepoId,
-        generation,
-      },
+      expected: { sourceCommitSha: source, destinationRepoId: destination, generation },
     })
-    throwIfV4Aborted(input.signal)
+    assertOwner()
     if (report.observation !== "authenticated-uncommitted"
       || report.generation !== generation || report.remoteWritesAuthorized !== false) {
       throw new Error("Best-effort Re-encryption WAL is uncertain; Manual Recovery is required.")
     }
-    await wal.assertExclusiveStageLease()
-    throwIfV4Aborted(input.signal)
+    await lease.call(wal)
+    assertOwner()
   }
 }
 

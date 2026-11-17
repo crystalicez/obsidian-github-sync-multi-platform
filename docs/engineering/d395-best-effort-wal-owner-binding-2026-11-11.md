@@ -1,0 +1,31 @@
+# D395: keep the same best-effort WAL owner across GitHub awaits
+
+Date: 2026-11-11. This is an engineering proof in the inherited dirty D87 worktree. **Release is still blocked.**
+
+## What failed
+
+The coordinator at `src/lib/v4/reencryption-ref-journal-coordinator.ts` creates one best-effort WAL checkpoint callback for verified Backup, Staging, orphan-candidate preparation, Destination publication, and read-only recovery. It previously re-read `wal.assertExclusiveStageLease` each time it resumed after an asynchronous callback. The WAL reader separately authenticated one generation, but it did not prevent the outer coordinator from accepting a **different lease method between checkpoint invocations**.
+
+Before D395, a test could replace the lease method inside its first awaited lease. The frozen Backup flow then finished instead of rejecting it. This did not show an exploit of the real Desktop WAL, which exposes a frozen storage object, but it exposed an unsafe boundary when a caller or adapter changes during a long-running operation.
+
+## Change
+
+`bestEffortJournalCheckpoint()` now pins the original WAL object and its lease/checkpoint methods, original journal and its load/authenticated-read methods, source commit, destination identity, cancellation signal, and plan. It rejects a replacement before and after each original lease call, before and after WAL generation discovery, and after the independent WAL authentication readback. It invokes the captured original lease method with the original WAL object as its receiver. The existing `inspectV4BestEffortWalRecovery()` still performs its two independent authenticated readbacks; a successful readback is **not** a durability or Cutover claim.
+
+No network, Config, 8 MiB part policy, 32 MiB Mobile-initiation limit, automatic retry, or user-facing Wizard behavior changed.
+
+## Behavioral evidence
+
+- **RED:** `node scripts/run-tests.mjs --tier=fast --filter=tests/v4/reencryption-trusted-loader.test.ts --name-pattern=^D395` failed before the implementation, task `ab0c8d62-9824-4196-a27a-25f9106b8aa4`, exit 1: `Missing expected rejection` after a callback substituted the WAL lease during an awaited check.
+- **GREEN:** Same D395 focused suite after the fix, task `a32ccc38-5beb-4acd-b5ad-dd00554d0f88`, **2/2 PASS**. One test replaces either the lease or best-effort checkpoint before the first Backup ref intent and requires zero GitHub mutations. Another substitutes the lease during an actual remote Backup preflight *after* encrypted intent persistence. It requires that the original pending WAL generation remain, no created ref or verified receipt exist, and no subsequent callback be accepted.
+- The complete `reencryption-trusted-loader.test.ts` suite, task `8e9ab6fe-3294-4f4c-a534-aef9546b1968`, **EXIT 0**.
+- `pnpm typecheck:max-strict`, task `ff5c86a4-7f2a-41b5-8464-95d151ce9eec`, and `pnpm build` task `c6f5df71-1ad8-4c49-9cc1-95f03852696d`, both **EXIT 0**. `pnpm typecheck:github-e2e` `41951fa4-b95a-4ab1-a949-c46fe5cf222c` and 3 GitHub E2E bundles `9a998081-daf1-402e-aa17-5a3b52f4a2fa` also **EXIT 0**.
+- **LIVE GitHub Destination PASS:** `node scripts/run-github-e2e-disposable.mjs wal-publish-encrypted`, task `b89ccaed-317d-4696-9d71-d6c9c2e22712`, exit 0 with one focused test passing. It authenticated the frozen old-key Backup even after Source advanced; staged 7 new-key ciphertext objects for 7 files / 1,048,689 logical bytes; prepared and published create-only orphan Destination commit `52708853c8a0365202e8b1a376b8a0850035a1d0`; independently verified 7 Destination files and scratch restored the same 7 files; reopened unchanged encrypted WAL generation 22; accepted the new passphrase and rejected the old passphrase. No local Cutover, no blind retry, no physical power-loss durability claim. Test Source `obsidian-sync-e2e/local-65046b2929db-d24-wal-publish-encrypted-e0ae1c1481d2`, frozen Backup `obsidian-sync-e2e/local-backup-e1401597dc0093671b7de532ec005240`, and orphan Destination `obsidian-sync-e2e/local-destination-47cd5954aa4b01434c1096a8596a0ae8` were all `CLEANUP_VERIFIED_TWICE` on approved physical GitHub test repo ID `1284153873`. One real remote E2E PASS, zero persistent test refs.
+- **Installed native Obsidian PASS (scope limited):** `node scripts/run-github-e2e-disposable.mjs installed-source-parity-encrypted`, task `b9dd39e6-a9c4-44fd-b909-b90b9f425221`, exit 0. Three installed Windows Obsidian modes `normal`, same-size Source `tamper`, and revoked initiating `lease` passed using authenticated pinned remote Source SHA `44fb54cda4b2f3e65770539a1d00416601abc8d5`; the actual installed plugin ran physical Source parity and encrypted pending-only WAL and reopened the same WAL after a true process restart. All temporary Vaults removed. GitHub test branch `obsidian-sync-e2e/local-65046b2929db-d24-installed-source-parity-encrypted-038aac7c6c89` was `CLEANUP_VERIFIED_TWICE` on ID `1284153873`. This installed test does **not** run remote Backup/Staging/Destination mutation through Obsidian and does not exercise D395's coordinator directly; it is a native compatibility check, not installed full-migration proof.
+- **Full Fast:** Final current-source `pnpm test:fast:offline-qualified` outcome and fingerprint must be copied into the D395 handoff only **after** final terminal result, without editing this document during the qualification.
+
+## What this does not prove
+
+This code repair does not make Windows directory fsync reliable, create an OS-wide lock around all foreign writers, or authorize unattended recovery. Source→Backup→Staging→Destination remains unproven end-to-end **inside one installed Obsidian initiating process**. Restart-safe Settings/Selector/Index Cutover, cross-device stale-client handling, and physical Android/iOS acceptance remain release blockers. User-approved first-release policy still includes both Sync and Re-encryption, and `docs/release-gates/reencryption-wizard.json` must remain `blocked`.
+
+Only the approved disposable GitHub E2E repository and branches may be mutated during live tests. The user Vault, canonical repository, release refs, and GitHub Actions are not part of this work. Changes remain uncommitted in the inherited D87 worktree pending audit of its much larger accumulated diff.

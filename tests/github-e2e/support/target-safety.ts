@@ -1,7 +1,17 @@
 import type { GitHubConfig } from "../../../src/lib/github-api"
+import { CANONICAL_REPOSITORY, CANONICAL_REPOSITORY_ID } from "../../../scripts/github-repo.mjs"
 
 const API = "https://api.github.com"
 const FORBIDDEN_LOCAL_BRANCHES = new Set(["main", "master", "production", "prod", "release", "stable"])
+// Destructive reset is permitted only for a single-purpose, generated test ref.
+// Do not accept an arbitrary non-default branch: it could belong to a person.
+const ISOLATED_E2E_BRANCH = /^obsidian-sync-e2e\/local-[A-Za-z0-9_-]{6,105}$/u
+
+function assertIsolatedDisposableBranch(branch: string): void {
+  if (!ISOLATED_E2E_BRANCH.test(branch)) {
+    throw new Error("GitHub E2E destructive branch must use the isolated disposable namespace.")
+  }
+}
 
 export interface GitHubE2ETargetEnvironment {
   owner: string
@@ -40,21 +50,23 @@ export function readGitHubE2ETargetEnvironment(env = process.env): GitHubE2ETarg
   if (!/^[1-9][0-9]*$/u.test(expectedRepositoryId)) {
     throw new Error("GITHUB_E2E_EXPECTED_REPO_ID must be a numeric GitHub repository ID.")
   }
-  const sourceRepositoryId = env.GITHUB_E2E_SOURCE_REPO_ID?.trim() || undefined
+  const sourceRepositoryId = env["GITHUB_E2E_SOURCE_REPO_ID"]?.trim() || undefined
   if (sourceRepositoryId && !/^[1-9][0-9]*$/u.test(sourceRepositoryId)) {
     throw new Error("GITHUB_E2E_SOURCE_REPO_ID must be a numeric GitHub repository ID when provided.")
   }
   if (FORBIDDEN_LOCAL_BRANCHES.has(branch.toLowerCase())) {
     throw new Error(`Refusing destructive GitHub E2E branch: ${branch}`)
   }
+  assertIsolatedDisposableBranch(branch)
   return {
     owner: required(env, "GITHUB_E2E_OWNER"),
     repo: required(env, "GITHUB_E2E_REPO"),
     branch,
     token: required(env, "GITHUB_E2E_TOKEN"),
     expectedRepositoryId,
-    sourceRepositoryId,
-    requiredBranch: env.GITHUB_E2E_REQUIRED_BRANCH?.trim() || undefined,
+    ...(sourceRepositoryId ? { sourceRepositoryId } : {}),
+    ...(env["GITHUB_E2E_REQUIRED_BRANCH"]?.trim()
+      ? { requiredBranch: env["GITHUB_E2E_REQUIRED_BRANCH"]!.trim() } : {}),
   }
 }
 
@@ -87,6 +99,11 @@ export async function resolveGitHubE2ETarget(
   input: GitHubE2ETargetEnvironment,
   request: GitHubE2EFetch = fetch,
 ): Promise<ResolvedGitHubE2ETarget> {
+  // Source repository is never a valid destructive E2E target, even if the
+  // optional sourceRepositoryId was omitted or the API route is an alias.
+  if (`${input.owner}/${input.repo}`.toLowerCase() === CANONICAL_REPOSITORY.toLowerCase()) {
+    throw new Error("GitHub E2E target must not be the canonical source repository.")
+  }
   const route = `${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repo)}`
   const metadata = await json<{ id?: number; full_name?: string; default_branch?: string }>(
     await request(`${API}/repos/${route}`, { headers: headers(input.token) }),
@@ -94,6 +111,10 @@ export async function resolveGitHubE2ETarget(
     "Cannot inspect GitHub E2E repository",
   )
   const repositoryId = String(metadata.id ?? "")
+  if (repositoryId === CANONICAL_REPOSITORY_ID
+    || metadata.full_name?.toLowerCase() === CANONICAL_REPOSITORY.toLowerCase()) {
+    throw new Error("GitHub E2E target must not be the canonical source repository.")
+  }
   if (repositoryId !== input.expectedRepositoryId) {
     throw new Error("GitHub E2E target repository ID does not match the pinned repository ID.")
   }
@@ -144,6 +165,9 @@ export async function resetGitHubE2EDisposableBranch(
   request: GitHubE2EFetch = fetch,
   options: GitHubE2EResetOptions = {},
 ): Promise<ResolvedGitHubE2ETarget> {
+  // This public helper accepts typed objects as well as parsed environments.
+  // Validate again at the destructive boundary, before any network request.
+  assertIsolatedDisposableBranch(input.branch)
   const verificationTimeoutMs = positiveDuration(options.verificationTimeoutMs, 15_000, "verificationTimeoutMs")
   const verificationPollMs = positiveDuration(options.verificationPollMs, 500, "verificationPollMs")
   let target = await resolveGitHubE2ETarget(input, request)

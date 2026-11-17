@@ -1,9 +1,12 @@
-import { Modal, Setting } from "obsidian"
+import { Modal, Platform, Setting } from "obsidian"
 import type FastSync from "../main"
 import type { PluginSettings } from "../setting"
 import { GitHubClient } from "../lib/github-api"
+import { DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES } from "../lib/v4/content-source"
+import { inspectV4MobileReencryptionFileSizePreflight, V4_MOBILE_REENCRYPTION_OVERSIZE_MESSAGE, V4_MOBILE_REENCRYPTION_SOURCE_INVENTORY_MESSAGE } from "../lib/v4/reencryption-mobile-initiator-reader"
 import { V4_DEFAULT_PBKDF2_ITERATIONS, V4_MAX_PBKDF2_ITERATIONS, V4_MIN_NEW_PBKDF2_ITERATIONS } from "../lib/v4/kdf-policy"
-import { verifyGitHubReencryptionForkSource } from "../lib/v4/reencryption-trusted-loader"
+import { verifyGitHubReencryptionForkSource, verifyGitHubReencryptionForkSourceWithParityInventory } from "../lib/v4/reencryption-trusted-loader"
+import type { V4InitiatorSourceRecord } from "../lib/v4/reencryption-initiator-parity"
 import {
   proposeV4ReencryptionWizardDraft,
   suggestV4ReencryptionBranchNames,
@@ -31,14 +34,17 @@ const STEPS = [
 ] as const
 
 const STALE_WIZARD_RUNTIME = "Runtime changed during verification. Close and reopen Preview."
+const LOCAL_RECOVERY_PENDING = "Local Re-encryption Recovery may be pending. Preview is blocked; inspect Recovery read-only before trying again."
 
 const SAFE_BRANCH_CHECK_ERRORS = new Set([
   STALE_WIZARD_RUNTIME,
+  LOCAL_RECOVERY_PENDING,
   "Wizard settings changed during verification.",
   "A proposed branch already exists. Choose unused branch names.",
   "Repository identity changed.",
   "Source branch or default branch changed. Return to Preflight and verify the source again.",
   "Sync started during verification. Wait for it to finish and verify again.",
+  "Settings save started during verification. Wait for it to finish and verify again.",
 ])
 
 interface VerifiedSource {
@@ -60,8 +66,13 @@ interface RefCheck {
 export class V4ReencryptionWizardModal extends Modal {
   private step = 0
   private readonly initialSettings: PluginSettings
+  private readonly initialMobile: boolean
   private readonly initialRuntime: FastSync["v4Runtime"]
   private readonly initialSyncExecutionGeneration: number
+  private readonly initialSettingsSaveGeneration: number
+  private readonly initialVault: FastSync["app"]["vault"]
+  private readonly initialAdapter: FastSync["app"]["vault"]["adapter"]
+  private readonly initialConfigDir: string
   private source: VerifiedSource | undefined
   private checked: RefCheck | undefined
   private busy = false
@@ -70,6 +81,7 @@ export class V4ReencryptionWizardModal extends Modal {
   private renderEpoch = 0
   private abortController: AbortController | undefined
   private errorMessage = ""
+  private recoveryInspection: "not-checked" | "authenticated-fenced" | "manual-recovery" | "unavailable" = "not-checked"
   private destinationBranch = ""
   private backupBranch = ""
   private newPassphrase = ""
@@ -80,8 +92,13 @@ export class V4ReencryptionWizardModal extends Modal {
     super(plugin.app)
     // Copy the connection at open time; Obsidian Settings may be mutated in place.
     this.initialSettings = Object.freeze({ ...plugin.settings })
+    this.initialMobile = Platform.isDesktopApp !== true
     this.initialRuntime = plugin.v4Runtime
     this.initialSyncExecutionGeneration = this.initialRuntime.syncExecutionGeneration
+    this.initialSettingsSaveGeneration = plugin.settingsSaveGeneration
+    this.initialVault = plugin.app.vault
+    this.initialAdapter = plugin.app.vault?.adapter
+    this.initialConfigDir = plugin.app.vault?.configDir || ".obsidian"
     const provisional = suggestV4ReencryptionBranchNames(
       new Date(), "0".repeat(40),
     )
@@ -103,6 +120,7 @@ export class V4ReencryptionWizardModal extends Modal {
     this.abortController = undefined
     this.source = undefined
     this.checked = undefined
+    this.recoveryInspection = "not-checked"
     this.newPassphrase = ""
     this.confirmPassphrase = ""
     this.contentEl.empty()
@@ -112,12 +130,26 @@ export class V4ReencryptionWizardModal extends Modal {
     const current = this.plugin.settings
     const snapshot = this.initialSettings
     return this.plugin.v4Runtime === this.initialRuntime
+      && (Platform.isDesktopApp !== true) === this.initialMobile
       && current.githubOwner === snapshot.githubOwner
       && current.githubRepo === snapshot.githubRepo
       && current.githubBranch === snapshot.githubBranch
       && current.githubToken === snapshot.githubToken
       && current.encryptionMode === snapshot.encryptionMode
       && current.encryptionPassphrase === snapshot.encryptionPassphrase
+      && this.plugin.settingsSaveGeneration === this.initialSettingsSaveGeneration
+      // A verified remote source is not a valid initiator snapshot if the
+      // local Sync file set, Vault or credential ownership changes mid-read.
+      && current.githubTokenSecretId === snapshot.githubTokenSecretId
+      && current.encryptionPassphraseSecretId === snapshot.encryptionPassphraseSecretId
+      && current.vault === snapshot.vault
+      && current.ignorePathRegex === snapshot.ignorePathRegex
+      && current.syncObsidianConfig === snapshot.syncObsidianConfig
+      && current.syncBookmarks === snapshot.syncBookmarks
+      && current.syncPlugins === snapshot.syncPlugins
+      && this.plugin.app.vault === this.initialVault
+      && this.plugin.app.vault?.adapter === this.initialAdapter
+      && (this.plugin.app.vault?.configDir || ".obsidian") === this.initialConfigDir
       && snapshot.githubOwner.length > 0 && snapshot.githubRepo.length > 0
       && snapshot.githubBranch.length > 0 && snapshot.githubToken.length > 0
       && snapshot.encryptionMode === "encrypted"
@@ -131,10 +163,53 @@ export class V4ReencryptionWizardModal extends Modal {
     if (this.plugin.v4Runtime !== this.initialRuntime) {
       throw new Error(STALE_WIZARD_RUNTIME)
     }
-    if (this.initialRuntime.isSyncing
+    if (this.initialRuntime.isSyncing || this.plugin.isSyncInProgress
       || this.initialRuntime.syncExecutionGeneration !== this.initialSyncExecutionGeneration) {
       throw new Error("Sync started during verification. Wait for it to finish and verify again.")
     }
+    if (this.plugin.isSettingsSaveInProgress?.()
+      || this.plugin.settingsSaveGeneration !== this.initialSettingsSaveGeneration) {
+      throw new Error("Settings save started during verification. Wait for it to finish and verify again.")
+    }
+  }
+
+  /** This read-only check never arms or clears a migration fence. */
+  private async assertLocalPreviewRecoveryClear(): Promise<void> {
+    try {
+      await this.initialRuntime.assertReencryptionSettingsSaveAllowed()
+    } catch {
+      // Do not expose physical WAL paths, credentials or backend exceptions.
+      throw new Error(LOCAL_RECOVERY_PENDING)
+    }
+    this.assertSyncStillIdle()
+    if (!this.matchesConnection()) {
+      throw new Error("Wizard settings changed during verification.")
+    }
+  }
+
+  /** Read-only file-size capability scan; never grants execution or acquires a fake lease. */
+  private async assertMobileInitiationCapability(
+    signal: AbortSignal, expectedSourceFiles?: readonly Readonly<Pick<V4InitiatorSourceRecord, "path" | "size">>[],
+  ): Promise<void> {
+    if (!this.initialMobile) return
+    const s = this.initialSettings
+    await inspectV4MobileReencryptionFileSizePreflight({
+      adapter: this.initialAdapter,
+      ...(expectedSourceFiles === undefined ? {} : { expectedSourceFiles }),
+      scope: {
+        configDir: this.initialConfigDir,
+        pluginId: this.plugin.manifest.id,
+        ignorePathRegex: s.ignorePathRegex,
+        syncObsidianConfig: s.syncObsidianConfig,
+        syncBookmarks: s.syncBookmarks,
+        syncPlugins: s.syncPlugins,
+      },
+      assertPreviewStable: async () => {
+        if (signal.aborted || this.closed) throw new Error(STALE_WIZARD_RUNTIME)
+        this.assertSyncStillIdle()
+        if (!this.matchesConnection()) throw new Error(STALE_WIZARD_RUNTIME)
+      },
+    })
   }
 
   private sourceRepoId(): string {
@@ -187,8 +262,14 @@ export class V4ReencryptionWizardModal extends Modal {
       this.render()
       return
     }
-    if (this.plugin.v4Runtime.isSyncing) {
-      this.errorMessage = "A Sync operation is active. Try again after it finishes."
+    if (this.initialRuntime.syncExecutionGeneration !== this.initialSyncExecutionGeneration) {
+      this.errorMessage = "Sync started since this Preview opened. Close and reopen Preview."
+      this.render()
+      return
+    }
+    if (this.plugin.v4Runtime.isSyncing || this.plugin.isSyncInProgress
+      || this.plugin.isSettingsSaveInProgress?.()) {
+      this.errorMessage = "A Sync or Settings save operation is active. Try again after it finishes."
       this.render()
       return
     }
@@ -198,6 +279,9 @@ export class V4ReencryptionWizardModal extends Modal {
     this.abortController = controller
     this.render()
     try {
+      await this.assertLocalPreviewRecoveryClear()
+      await this.assertMobileInitiationCapability(controller.signal)
+      if (this.closed || controller.signal.aborted || epoch !== this.requestEpoch) return
       const client = this.scopedClient(this.initialSettings.githubBranch)
       const expectedFullName = `${this.initialSettings.githubOwner}/${this.initialSettings.githubRepo}`
       const repo = await client.getRepositoryIdentity()
@@ -210,12 +294,20 @@ export class V4ReencryptionWizardModal extends Modal {
       if (this.closed || controller.signal.aborted || epoch !== this.requestEpoch) return
       this.assertSyncStillIdle()
       if (!this.matchesConnection()) throw new Error("Connection settings changed during verification.")
-      const proof = await verifyGitHubReencryptionForkSource({
+      const proofInput = {
         github: client, expectedRepoId: this.sourceRepoId(),
         expectedBranch: this.initialSettings.githubBranch,
         passphrase: this.initialSettings.encryptionPassphrase,
         signal: controller.signal,
-      })
+      }
+      // Mobile needs the authenticated per-file Source inventory, not just
+      // aggregate counts: a missing local >32 MiB file must also refuse.
+      // Desktop keeps the existing summary-only verification path.
+      const mobileProof = this.initialMobile
+        ? await verifyGitHubReencryptionForkSourceWithParityInventory(proofInput)
+        : undefined
+      const proof = mobileProof?.verifiedSource
+        ?? await verifyGitHubReencryptionForkSource(proofInput)
       if (this.closed || controller.signal.aborted || epoch !== this.requestEpoch) return
       this.assertSyncStillIdle()
       const repoAfter = await client.getRepositoryIdentity()
@@ -227,6 +319,9 @@ export class V4ReencryptionWizardModal extends Modal {
         throw new Error("Repository identity or default branch changed during source verification.")
       }
       if (!this.matchesConnection()) throw new Error("Connection settings changed during verification.")
+      await this.assertLocalPreviewRecoveryClear()
+      await this.assertMobileInitiationCapability(controller.signal, mobileProof?.sourceRecords)
+      if (this.closed || controller.signal.aborted || epoch !== this.requestEpoch) return
       this.source = {
         physicalRepositoryId: repo.id,
         defaultBranch,
@@ -243,10 +338,18 @@ export class V4ReencryptionWizardModal extends Modal {
       if (!this.closed && !controller.signal.aborted && epoch === this.requestEpoch) {
         // Network/backend exceptions can include sensitive request context.
         // Never display raw error text or vault filenames here.
-        this.errorMessage = error instanceof Error && error.message === STALE_WIZARD_RUNTIME
+        this.errorMessage = error instanceof Error && error.message === V4_MOBILE_REENCRYPTION_OVERSIZE_MESSAGE
+          ? V4_MOBILE_REENCRYPTION_OVERSIZE_MESSAGE
+          : error instanceof Error && error.message === V4_MOBILE_REENCRYPTION_SOURCE_INVENTORY_MESSAGE
+          ? V4_MOBILE_REENCRYPTION_SOURCE_INVENTORY_MESSAGE
+          : error instanceof Error && error.message === LOCAL_RECOVERY_PENDING
+          ? LOCAL_RECOVERY_PENDING
+          : error instanceof Error && error.message === STALE_WIZARD_RUNTIME
           ? STALE_WIZARD_RUNTIME
           : error instanceof Error && error.message.startsWith("Sync started during verification.")
             ? "Sync started during verification. Wait for it to finish and verify again."
+          : error instanceof Error && error.message.startsWith("Settings save started during verification.")
+            ? "Settings save started during verification. Wait for it to finish and verify again."
           : error instanceof Error && /identity|settings changed|passphrase/i.test(error.message)
             ? "Source verification failed: check repository identity, configuration, passphrase and connection."
             : "Source verification failed. Check connection, credentials and remote data integrity."
@@ -255,6 +358,56 @@ export class V4ReencryptionWizardModal extends Modal {
       if (epoch === this.requestEpoch) {
         this.busy = false
         this.abortController = undefined
+        if (!this.closed) this.render()
+      }
+    }
+  }
+
+  /**
+   * D411: Make the installed read-only Recovery inspector accessible in the
+   * first Wizard step, including when an old migration Fence blocks Preview.
+   * Inspecting Recovery is NOT a migration preflight proof, an Execute
+   * authorization, or permission to resume Sync.
+   */
+  private async inspectRecovery(): Promise<void> {
+    if (this.closed || this.busy) return
+    this.recoveryInspection = "not-checked"
+    this.busy = true
+    const epoch = ++this.requestEpoch
+    this.render()
+    try {
+      // Do NOT use assertLocalPreviewRecoveryClear here. The entire purpose
+      // is to inspect a pending Fence without silently clearing it.
+      this.assertSyncStillIdle()
+      if (!this.matchesConnection()) throw new Error(STALE_WIZARD_RUNTIME)
+      const report = await this.initialRuntime.inspectFencedReencryptionCompleteRecovery()
+      if (this.closed || this.requestEpoch !== epoch) return
+      this.assertSyncStillIdle()
+      if (!this.matchesConnection()) throw new Error(STALE_WIZARD_RUNTIME)
+      if (!report) {
+        this.recoveryInspection = "unavailable"
+      } else if (report.observation === "authenticated-complete-recovery-evidence-still-fenced"
+        && report.integrityScope === "read-only-original-backup-encrypted-wal-complete-destination"
+        && report.originalKeyAuthenticated && report.completeOldBackupReverified
+        && report.walReceiptsBoundToDestination && report.completeDestinationContentsReverified
+        && report.commitDecisionAuthorized === false && report.localCutoverAuthorized === false
+        && report.resumeSyncAuthorized === false && report.rollbackAuthorized === false
+        && report.remoteWritesAuthorized === false && report.oldPassphraseCleanupAuthorized === false
+        && report.powerLossDurabilityProven === false && report.mobileOsLockProven === false
+        && report.installedObsidianAcceptanceProven === false
+        && (report.isolation === "desktop-os-cooperative-wal-lock"
+          || report.isolation === "mobile-cooperative-best-effort-only")) {
+        this.recoveryInspection = "authenticated-fenced"
+      } else {
+        this.recoveryInspection = "manual-recovery"
+      }
+    } catch {
+      // Runtime/GitHub exceptions can contain private paths, URLs, tokens and
+      // secret IDs. Show only fixed non-authorizing text.
+      if (!this.closed && this.requestEpoch === epoch) this.recoveryInspection = "unavailable"
+    } finally {
+      if (this.requestEpoch === epoch) {
+        this.busy = false
         if (!this.closed) this.render()
       }
     }
@@ -272,8 +425,19 @@ export class V4ReencryptionWizardModal extends Modal {
       this.render()
       return
     }
-    if (this.plugin.v4Runtime.isSyncing) {
-      this.errorMessage = "Wait for the active Sync to finish before checking the branch names."
+    // Remote branch checks can take seconds. The final result must belong to
+    // the exact encryption draft that started the request, not merely the same
+    // branch names. Do not place either passphrase in the returned RefCheck.
+    const proposedNewPassphrase = this.newPassphrase
+    const proposedConfirmation = this.confirmPassphrase
+    if (this.initialRuntime.syncExecutionGeneration !== this.initialSyncExecutionGeneration) {
+      this.errorMessage = "Sync started since this Preview opened. Close and reopen Preview."
+      this.render()
+      return
+    }
+    if (this.plugin.v4Runtime.isSyncing || this.plugin.isSyncInProgress
+      || this.plugin.isSettingsSaveInProgress?.()) {
+      this.errorMessage = "Wait for the active Sync or Settings save to finish before checking the branch names."
       this.render()
       return
     }
@@ -283,6 +447,8 @@ export class V4ReencryptionWizardModal extends Modal {
     this.abortController = controller
     this.render()
     try {
+      await this.assertLocalPreviewRecoveryClear()
+      if (this.closed || controller.signal.aborted || epoch !== this.requestEpoch) return
       const destinationClient = this.scopedClient(this.destinationBranch)
       const backupClient = this.scopedClient(this.backupBranch)
       const [destination, backup] = await Promise.all([
@@ -342,10 +508,16 @@ export class V4ReencryptionWizardModal extends Modal {
         || sourceRefAfter.sha !== proposal.pinnedSourceCommitSha) {
         throw new Error("Source branch or default branch changed. Return to Preflight and verify the source again.")
       }
-      if (!this.matchesConnection() || this.plan().destinationRepoId !== proposal.destinationRepoId
+      if (!this.matchesConnection()
+        || this.iterations !== proposal.requestedIterations
+        || this.newPassphrase !== proposedNewPassphrase
+        || this.confirmPassphrase !== proposedConfirmation
+        || this.plan().destinationRepoId !== proposal.destinationRepoId
         || this.plan().backupRepoId !== proposal.backupRepoId) {
         throw new Error("Wizard settings changed during verification.")
       }
+      await this.assertLocalPreviewRecoveryClear()
+      if (this.closed || controller.signal.aborted || epoch !== this.requestEpoch) return
       this.checked = {
         destinationRepoId: proposal.destinationRepoId,
         backupRepoId: proposal.backupRepoId,
@@ -378,9 +550,30 @@ export class V4ReencryptionWizardModal extends Modal {
     this.row(container, "Mode", s.encryptionMode === "encrypted" ? "Encrypted V4 source required" : "Current connection is not encrypted")
     this.row(container, "Vault change detection (planned)",
       "Cross-platform best-effort: recheck file inventory, hashes, open editors and Sync state. External apps can still write after the last check; this is NOT an OS-wide write lock.")
+    this.row(container, "Mobile Re-encryption initiation policy (approved)",
+      `Mobile may initiate only if EVERY included file is at most ${DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES / (1024 * 1024)} MiB because the DataAdapter readBinary() parity reader allocates whole-file buffers. This Preview checks physical file metadata against the authenticated Source file inventory without reading local contents or pausing Sync. Larger included files require initiating on Desktop. Ordinary Mobile Sync above 32 MiB is a SEPARATE, currently unverified capability and is not authorized by this policy. Full leased parity and all release gates are still required before Execute.`)
     this.row(container, "Remote source verification", this.source
       ? `Verified ${this.source.verifiedFileCount} files, ${this.source.verifiedRemoteObjectCount} objects (${this.source.totalVerifiedPlaintextBytes} plaintext bytes) at immutable commit ${this.source.pinnedSourceCommitSha}`
       : "Not verified. This read-only check decrypts and validates every live source object from one pinned Git commit and may be expensive.")
+    const recoveryExplanation = (this.recoveryInspection === "authenticated-fenced"
+      || this.recoveryInspection === "manual-recovery") && !this.matchesConnection()
+      ? "Preview connection or Runtime changed. Close and reopen to inspect current installed Recovery; earlier evidence is not authoritative."
+      : this.recoveryInspection === "authenticated-fenced"
+      ? "Authenticated Re-encryption Recovery evidence was inspected; still fenced. Sync and Cutover remain blocked. The report does not authorize Execute, rollback or passphrase cleanup."
+      : this.recoveryInspection === "manual-recovery"
+        ? "Installed Recovery inspection indicates Manual Recovery is required. Sync and Cutover remain blocked; preserve both passphrases and all recovery files."
+        : this.recoveryInspection === "unavailable"
+          ? "Installed Recovery inspection unavailable or inconclusive. This does NOT prove no pending WAL or Fence. Sync and Cutover remain blocked; use Manual Recovery if needed."
+          : "Not inspected. This optional installed Runtime diagnostic reads Recovery/WAL and authenticated GitHub evidence without changing branches, Settings or notes. It is not a migration readiness gate."
+    new Setting(container)
+      .setName("Installed Re-encryption Recovery")
+      .setDesc(recoveryExplanation)
+      .addButton(button => button
+        .setButtonText(this.busy ? "Inspecting…" : "Inspect installed Recovery (read-only)")
+        .setDisabled(this.busy)
+        .onClick(() => {
+          if (!this.closed && this.renderEpoch === epoch) void this.inspectRecovery()
+        }))
     new Setting(container)
       .setName("Check encrypted source")
       .setDesc("Read GitHub only. No backup or destination branch will be created.")
@@ -466,6 +659,8 @@ export class V4ReencryptionWizardModal extends Modal {
       "One confirmation before execution will include acknowledgement of best-effort power-loss risk and authorize a fully verified migration. No second confirmation after successful completion.")
     this.row(container, "Best-effort change detection (planned)",
       "Uniform cross-platform detection; cannot prevent changes by external programs. Abort on detected drift. Never treat this as a full Vault write fence.")
+    this.row(container, "Mobile Re-encryption size limitation (current)",
+      `Mobile initiating-vault parity currently refuses individual files above ${DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES / (1024 * 1024)} MiB because DataAdapter readBinary() loads the whole file. This has NOT passed large-file Android/iOS acceptance. Do not treat this Preview as executable or migration-ready.`)
     container.createEl("p", {
       cls: "github-sync-rekey__warning",
       text: "OLD PASSPHRASE WARNING: Save a secure copy of your old passphrase before confirming. After a fully verified cutover, this device is planned to clear its old passphrase from Obsidian SecretStorage, with no extra confirmation. The Source and Backup branches and old encrypted Git history remain unchanged and still need that old passphrase to decrypt. This is a planned policy; no secrets are cleared in Preview.",
@@ -516,7 +711,9 @@ export class V4ReencryptionWizardModal extends Modal {
     for (const step of recoverySteps) checklist.createEl("li", { text: step })
     container.createEl("h4", { text: "Manual Recovery examples — not a live scan" })
     container.createEl("p", {
-      text: "These examples explain possible future crash-window evidence; this Preview has NOT inspected local WAL/Selector/Receipt or current Git branches. Even a fully authenticated test pair is NOT a committed migration. No example authorizes Sync Resume, rollback, a branch switch, or old-key deletion.",
+      text: this.recoveryInspection === "not-checked"
+        ? "These examples explain possible future crash-window evidence; this Preview has NOT inspected local WAL/Selector/Receipt or current Git branches. Even a fully authenticated test pair is NOT a committed migration. No example authorizes Sync Resume, rollback, a branch switch, or old-key deletion."
+        : "These are illustrative crash-window examples, NOT findings of the optional installed read-only Recovery inspection. Even authenticated evidence does NOT commit migration or authorize Sync Resume, rollback, a branch switch, or old-key deletion.",
     })
     for (const condition of V4_MANUAL_RECOVERY_PREVIEW_CONDITIONS) {
       const guidance = V4_MANUAL_RECOVERY_GUIDANCE[condition]
@@ -559,7 +756,11 @@ export class V4ReencryptionWizardModal extends Modal {
     else if (this.step === 2) {
       try { this.renderReview(section) }
       catch (error) {
-        this.errorMessage = error instanceof Error ? error.message : "Invalid proposed branches."
+        // Do not replace an actionable fail-closed verification error with
+        // a generic plan error when settings or local Sync scope drifted.
+        if (!this.errorMessage) {
+          this.errorMessage = error instanceof Error ? error.message : "Invalid proposed branches."
+        }
       }
     } else if (this.step === 3) this.renderRun(section)
     else this.renderFinish(section)
@@ -601,11 +802,17 @@ export class V4ReencryptionWizardModal extends Modal {
             this.checked = undefined
             throw new Error("Wizard connection changed. Verify the encrypted Source again.")
           }
-          if (this.initialRuntime.isSyncing
+          if (this.initialRuntime.isSyncing || this.plugin.isSyncInProgress
             || this.initialRuntime.syncExecutionGeneration !== this.initialSyncExecutionGeneration) {
             this.source = undefined
             this.checked = undefined
             throw new Error("Sync started during verification. Wait for it to finish and verify again.")
+          }
+          if (this.plugin.isSettingsSaveInProgress?.()
+            || this.plugin.settingsSaveGeneration !== this.initialSettingsSaveGeneration) {
+            this.source = undefined
+            this.checked = undefined
+            throw new Error("Settings save started during verification. Wait for it to finish and verify again.")
           }
           if (this.step === 0 && !this.source) return
           if (this.step >= 1 && this.step <= 2) {
@@ -617,6 +824,46 @@ export class V4ReencryptionWizardModal extends Modal {
               || this.checked.physicalRepositoryId !== proposal.physicalRepositoryId)) {
               throw new Error("Check the destination and backup ref names again.")
             }
+          }
+          // A read-only Preview may have been verified minutes ago. A
+          // persisted migration/recovery Fence can appear AFTER that proof.
+          // Revalidate locally before advancing from a verified Source or
+          // checked branch plan; this never authorizes Execute or Cutover.
+          if (this.step === 0 || this.step === 2) {
+            const pendingStep = this.step
+            const epoch = ++this.requestEpoch
+            this.busy = true
+            this.render()
+            void this.assertLocalPreviewRecoveryClear()
+              .then(() => {
+                if (this.closed || this.requestEpoch !== epoch || this.step !== pendingStep) return
+                if (pendingStep === 0 && !this.source) {
+                  throw new Error("Verify the encrypted source again.")
+                }
+                if (pendingStep === 2) {
+                  const fresh = this.plan()
+                  if (!this.checked || this.checked.destinationRepoId !== fresh.destinationRepoId
+                    || this.checked.backupRepoId !== fresh.backupRepoId
+                    || this.checked.pinnedSourceCommitSha !== fresh.pinnedSourceCommitSha
+                    || this.checked.physicalRepositoryId !== fresh.physicalRepositoryId) {
+                    throw new Error("Check the destination and backup ref names again.")
+                  }
+                }
+                this.step++
+              })
+              .catch(error => {
+                if (this.closed || this.requestEpoch !== epoch || this.step !== pendingStep) return
+                this.source = undefined
+                this.checked = undefined
+                this.errorMessage = error instanceof Error && SAFE_BRANCH_CHECK_ERRORS.has(error.message)
+                  ? error.message : "Preview evidence became stale. Verify the Source and branch names again."
+              })
+              .finally(() => {
+                if (this.requestEpoch !== epoch) return
+                this.busy = false
+                if (!this.closed) this.render()
+              })
+            return
           }
           this.step++
         } catch (error) {

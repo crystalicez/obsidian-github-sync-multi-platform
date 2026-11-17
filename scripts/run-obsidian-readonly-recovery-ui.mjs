@@ -2,11 +2,13 @@
 // Isolated real Obsidian command smoke. No GitHub credentials, no remote writes.
 // Never use a user's live vault or default Obsidian profile.
 import assert from "node:assert/strict"
+import { createHash } from "node:crypto"
 import { spawn, spawnSync } from "node:child_process"
-import { copyFile, lstat, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
+import { copyFile, lstat, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import path from "node:path"
 import esbuild from "esbuild"
 import { fileURLToPath } from "node:url"
+import { buildNativePluginReadyExpression } from "./native-obsidian-plugin-ready.mjs"
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..")
 const args = process.argv.slice(2)
@@ -18,6 +20,11 @@ const commandId = pluginId + ":verify-reencryption-complete-recovery-read-only"
 const port = Number(option("port", String(25000 + process.pid % 30000)))
 const tmpRoot = path.join(root, ".tmp", "obsidian-readonly-recovery-ui")
 const staleRun = option("cleanup-run", "")
+// Test-only fault injection, confined to a verified disposable Obsidian Vault.
+// The injected error message is deliberately sensitive and must never be logged.
+const reloadFault = option("fault-inject-reload", "")
+assert.ok(["", "load-plugin", "renderer-exception"].includes(reloadFault),
+  "Unknown isolated reload fault-injection stage")
 
 // The test deletes synthetic vaults. Refuse a linked/junction test root before
 // creating, cleaning or following any child path, including --cleanup-run.
@@ -43,6 +50,7 @@ let runRoot
 let child
 let ws
 let nativeResult
+let nativeInitiatorReaderEvidence
 let nativeOutcomes
 let nativeDiskEvidence
 let nativeReloadEvidence
@@ -54,10 +62,20 @@ let nativeAuthenticatedWalContract
 let nativeAuthenticatedWalRestart
 let nativeAuthenticatedWalOrphanRestart
 let nativeOsLockProof
+let nativeDesktopRecoveryEvidence
+let nativeDesktopRecoveryDenials
 let walProofBundle
 let passed = false
 let cleanup = "not-started"
 let nativePhase = "initial"
+// Only fixed, non-sensitive labels may be reported if CDP itself throws while
+// an installed Obsidian plugin unloads/reloads. Never read exception messages.
+const safeReloadStages = new Set([
+  "initial", "read-original-evidence", "unload-plugin", "load-plugin",
+  "inspect-reloaded-instance", "inspect-recovery-route",
+  "inspect-settings-save-fence", "inspect-existing-wal",
+  "inspect-complete-recovery", "confirm-evidence-unchanged",
+])
 const pending = new Map()
 let nextId = 0
 
@@ -80,9 +98,35 @@ async function send(method, params = {}, timeoutMs = 15000) {
 async function evaluate(expression, timeoutMs = 20000) {
   const reply = await send("Runtime.evaluate",
     { expression, awaitPromise: true, returnByValue: true }, timeoutMs)
-  if (reply.exceptionDetails) throw Error(
-    "Isolated Obsidian UI evaluation threw in " + nativePhase
-    + " at expression line " + String(reply.exceptionDetails.lineNumber ?? "unknown"))
+  if (reply.exceptionDetails) {
+    // Only expose the safe exception class and source position. A raw CDP
+    // exception description may contain credentials, Vault paths or secrets.
+    const exceptionType = reply.exceptionDetails.exception?.className
+    const safeType = ["SyntaxError", "TypeError", "ReferenceError", "Error", "RangeError"]
+      .includes(exceptionType) ? exceptionType : "unclassified"
+    let safeReloadStage = ""
+    if (nativePhase === "first plugin reload") {
+      // A renderer exception can bypass the evaluation's own catch. Read
+      // only a whitelisted stage label from the already isolated renderer.
+      // Failure to obtain it is diagnostic uncertainty, never success.
+      let stage = "unknown"
+      try {
+        const snapshot = await send("Runtime.evaluate", {
+          expression: "globalThis.__d338NativeReloadStage",
+          returnByValue: true,
+        }, 3500)
+        const value = snapshot?.result?.value
+        if (!snapshot?.exceptionDetails && safeReloadStages.has(value)) stage = value
+      } catch { /* CDP may be unavailable during lifecycle teardown. */ }
+      safeReloadStage = " at safe reload stage " + stage
+    }
+    throw Error(
+      "Isolated Obsidian UI evaluation threw in " + nativePhase
+      + safeReloadStage
+      + " at expression line " + String(reply.exceptionDetails.lineNumber ?? "unknown")
+      + ", column " + String(reply.exceptionDetails.columnNumber ?? "unknown")
+      + ", type " + safeType)
+  }
   return reply.result?.value
 }
 async function findIsolatedPage() {
@@ -136,6 +180,19 @@ async function attachIsolatedPage(vault) {
   )
   assert.equal(identity.base.toLowerCase(), vault.toLowerCase(),
     "Refusing to inspect a non-isolated Obsidian vault")
+  // The vault can become readable before Obsidian has finished initializing
+  // its plugin manager. A process restart must not call loadPlugin too early.
+  await waitForValue(
+    "(()=>{if(typeof app==='undefined')return false;"
+      + "const p=app.plugins;return !!p"
+      + "&&typeof p.isEnabled==='function'"
+      + "&&typeof p.setEnable==='function'"
+      + "&&typeof p.enablePluginAndSave==='function'"
+      + "&&typeof p.loadPlugin==='function'"
+      + "&&typeof p.enabledPlugins?.has==='function'})()",
+    "the isolated plugin manager",
+    60,
+  )
 }
 
 async function installNativeWalProof() {
@@ -180,15 +237,7 @@ async function restartIsolatedProcess(profile, vault) {
   child.on("error", () => {})
   child.unref()
   await attachIsolatedPage(vault)
-  const loaded = await evaluate("(async()=>{const id=" + JSON.stringify(pluginId)
-    + ";if(!app.plugins.isEnabled())await app.plugins.setEnable(true);"
-    + "if(!app.plugins.enabledPlugins.has(id))await app.plugins.enablePluginAndSave(id);"
-    + "await app.plugins.loadPlugin(id);"
-    + "for(let i=0;i<40&&!app.plugins.plugins[id];i++){"
-    + "await new Promise(resolve=>setTimeout(resolve,200));"
-    + "if(app.plugins.isEnabled()&&app.plugins.manifests[id]&&!app.plugins.loadingPluginId)"
-    + "await app.plugins.loadPlugin(id)};"
-    + "return !!app.plugins.plugins[id]})()", 35000)
+  const loaded = await evaluate(buildNativePluginReadyExpression(pluginId), 35000)
   assert.equal(loaded, true, "Fresh synthetic Obsidian process failed to load plugin")
   await waitForValue("(()=>{const p=app.plugins.plugins["
     + JSON.stringify(pluginId)
@@ -233,27 +282,101 @@ try {
     JSON.stringify({ vaults: { "c307ab4210380d12": {
       path: vault, ts: Date.now(), open: true,
     } } }) + "\n")
+  // One known plaintext note in this disposable Vault. The installed Runtime
+  // must discover/read it via the real Desktop reader, not Obsidian's cache.
+  const initiatorNote = "Notes/D323-🪄-physical.md"
+  const initiatorText = "D323 physical initiator bytes: สวัสดี 🪄"
+  await mkdir(path.join(vault, "Notes"))
+  await writeFile(path.join(vault, "Notes", "D323-🪄-physical.md"), initiatorText, "utf8")
   child = spawn(exe, [
     "--user-data-dir=" + profile, "--remote-debugging-port=" + port,
   ], { detached: true, windowsHide: false, stdio: "ignore" })
   child.on("error", () => {})
   child.unref()
   await attachIsolatedPage(vault)
-  const loaded = await evaluate("(async()=>{const id=" + JSON.stringify(pluginId)
-    + ";if(!app.plugins.isEnabled())await app.plugins.setEnable(true);"
-    + "if(!app.plugins.enabledPlugins.has(id))await app.plugins.enablePluginAndSave(id);"
-    + "await app.plugins.loadPlugin(id);"
-    + "for(let i=0;i<40&&!app.plugins.plugins[id];i++){"
-    + "await new Promise(resolve=>setTimeout(resolve,200));"
-    + "if(app.plugins.isEnabled()&&app.plugins.manifests[id]&&!app.plugins.loadingPluginId)"
-    + "await app.plugins.loadPlugin(id)};"
-    + "return !!app.plugins.plugins[id]})()", 35000)
+  const loaded = await evaluate(buildNativePluginReadyExpression(pluginId), 35000)
   assert.equal(loaded, true, "Plugin failed to load in real Obsidian")
   await waitForValue("(()=>{const p=app.plugins.plugins["
     + JSON.stringify(pluginId)
     + "];return !!p?.settings&&!!p?.v4Runtime"
     + "&&typeof p.v4Runtime.inspectFencedReencryptionIndexRoute==='function'})()",
     "initialized V4 runtime")
+  nativePhase = "installed desktop initiating-reader read-only proof"
+  nativeInitiatorReaderEvidence = await evaluate(`(async()=>{
+    let stage="init";
+    try {
+    const id=${JSON.stringify(pluginId)};
+    const note=${JSON.stringify("Notes/D323-🪄-physical.md")};
+    const expected=${JSON.stringify("D323 physical initiator bytes: สวัสดี 🪄")};
+    const plugin=app.plugins.plugins[id];
+    if(!plugin || plugin.settings.githubToken || plugin.settings.githubOwner
+      || plugin.settings.githubRepo)throw Error("Expected an unconfigured isolated plugin");
+    stage="reader-construction";
+    const before=JSON.stringify(plugin.settings);
+    let mockLeaseChecks=0;
+    const reader=plugin.v4Runtime.createReencryptionInitiatorLocalReader(
+      async()=>{ mockLeaseChecks++ }
+    );
+    stage="physical-list";
+    const files=await reader.listFiles();
+    const found=files.filter(file=>file.path===note);
+    stage="physical-open";
+    const opened=await reader.openFile(note);
+    stage="physical-chunks";
+    const chunks=[];
+    for await(const part of opened.chunks(7)) chunks.push(part);
+    stage="bytes";
+    const total=chunks.reduce((sum,bytes)=>sum+bytes.length,0);
+    const copied=new Uint8Array(total);
+    let offset=0;
+    for(const bytes of chunks){copied.set(bytes,offset);offset+=bytes.length}
+    stage="digest";
+    const digest=await crypto.subtle.digest("SHA-256",copied);
+    const hex=Array.from(new Uint8Array(digest),b=>b.toString(16).padStart(2,"0")).join("");
+    const expectedDigest=await crypto.subtle.digest(
+      "SHA-256",new TextEncoder().encode(expected));
+    const expectedHex=Array.from(new Uint8Array(expectedDigest),
+      b=>b.toString(16).padStart(2,"0")).join("");
+    stage="guards";
+    await reader.assertExclusiveInitiatorLease();
+    await reader.assertIdleAndNoPendingEdits();
+    await reader.assertSourceConfigurationUnchanged();
+    return {
+      installedRuntimeReader:true,
+      exactPhysicalInventory:found.length===1
+        && found[0].size===new TextEncoder().encode(expected).length,
+      boundedPhysicalBytesMatch:opened.size===total && hex===expectedHex,
+      localConfigurationUnchanged:JSON.stringify(plugin.settings)===before,
+      // The physical Desktop reader now checks live authority throughout
+      // listing, file opening and bounded chunks, not once at parity entry.
+      // This is still a test callback, NOT a proven OS migration lock.
+      testOnlyLeaseUsed:mockLeaseChecks>=3,
+      testOnlyLeaseCheckCount:mockLeaseChecks,
+      noGitHubUsed:true,
+      cutoverAuthorized:false,
+      osLeaseProven:false
+    };
+    } catch (error) {
+      return { failedAt:stage, safeErrorClass:
+        error?.name==="TypeError" ? "TypeError" :
+        error?.name==="Error" ? "Error" : "unknown" };
+    }
+  })()`, 40000)
+  if (nativeInitiatorReaderEvidence?.failedAt) {
+    throw Error("Installed Desktop initiating-reader probe refused at safe stage: "
+      + nativeInitiatorReaderEvidence.failedAt + " ("
+      + nativeInitiatorReaderEvidence.safeErrorClass + ")")
+  }
+  for(const key of ["installedRuntimeReader","exactPhysicalInventory",
+    "boundedPhysicalBytesMatch","localConfigurationUnchanged",
+    "testOnlyLeaseUsed","noGitHubUsed"]){
+    assert.equal(nativeInitiatorReaderEvidence[key],true,
+      "Installed Desktop initiating-reader proof failed: "+key)
+  }
+  assert.equal(nativeInitiatorReaderEvidence.cutoverAuthorized,false)
+  assert.equal(nativeInitiatorReaderEvidence.osLeaseProven,false)
+  assert.equal(await readFile(path.join(vault, ...initiatorNote.split("/")), "utf8"),
+    initiatorText, "Read-only installed initiating-reader probe altered its source note")
   // Test-only isolated renderer bundle uses the genuine V4 WAL journal and
   // read-only D237 cryptographic inspector with this actual Vault adapter.
   // It does not call installed Complete Recovery or prove any remote evidence.
@@ -319,6 +442,64 @@ try {
   assert.equal(nativeOsLockProof.remoteGitHubUsed, false)
   assert.equal(nativeOsLockProof.cutoverAuthorized, false)
   assert.equal(nativeOsLockProof.powerLossDurabilityProven, false)
+  // This probe must execute as CommonJS, like the installed plugin, rather
+  // than through the browser IIFE which has no lexical Node require/exports.
+  const rendererBundle = await esbuild.build({
+    entryPoints: [path.join(root, "scripts", "native-desktop-wal-renderer-probe.ts")],
+    bundle: true, write: false, platform: "node", format: "cjs",
+    target: "node22", minify: true, logLevel: "silent",
+  })
+  const rendererCode = rendererBundle.outputFiles?.[0]?.text
+  assert.ok(rendererCode && rendererCode.length < 550_000,
+    "Native renderer recovery proof must have a bounded CommonJS bundle")
+  nativePhase = "load synthetic CommonJS recovery probe inside verified Obsidian renderer"
+  const rendererLoaded = await evaluate(
+    "(()=>{const module={exports:{}};const exports=module.exports;"
+      + rendererCode
+      + ";globalThis.__d324DesktopWalProbe=module.exports;return true})()", 45000)
+  assert.equal(rendererLoaded, true, "Synthetic CommonJS recovery probe did not load")
+  nativePhase = "native Electron Desktop existing-WAL recovery owner"
+  nativeDesktopRecoveryEvidence = await evaluate(`(async()=>{
+    const id=${JSON.stringify(pluginId)};
+    const pinned=${JSON.stringify(slotSha256)};
+    const plugin=app.plugins.plugins[id];
+    if(!plugin || plugin.settings.githubToken || plugin.settings.githubOwner
+      || plugin.settings.githubRepo)
+      throw Error("Desktop WAL recovery requires an unconfigured isolated plugin");
+    return globalThis.__d324DesktopWalProbe.verifyNativeDesktopWalRecovery(
+      app.vault.adapter, id, pinned);
+  })()`, 60000)
+  for(const key of ["existingOnlyOpened","immutableEncryptedSlots",
+    "osLeaseReleased","bestEffortOnly"]){
+    assert.equal(nativeDesktopRecoveryEvidence[key], true,
+      "Native Electron Desktop recovery owner failed: "+key)
+  }
+  for(const key of ["remoteGitHubUsed","cutoverAuthorized","powerLossDurabilityProven"]){
+    assert.equal(nativeDesktopRecoveryEvidence[key], false,
+      "Native Electron recovery owner must not elevate: "+key)
+  }
+  nativePhase = "native Electron Desktop WAL owner negative recovery checks"
+  nativeDesktopRecoveryDenials = await evaluate(`(async()=>{
+    const id=${JSON.stringify(pluginId)};
+    const pinned=${JSON.stringify(slotSha256)};
+    const plugin=app.plugins.plugins[id];
+    if(!plugin || plugin.settings.githubToken || plugin.settings.githubOwner
+      || plugin.settings.githubRepo)
+      throw Error("Desktop negative recovery requires unconfigured isolated plugin");
+    return globalThis.__d324DesktopWalProbe.verifyNativeDesktopWalRecoveryDenials(
+      app.vault.adapter, id, pinned);
+  })()`, 60000)
+  for (const key of [
+    "wrongPinnedDigestRejected", "concurrentRecoveryReaderRejected",
+    "revokedOwnerReadRejected", "revokedOwnerCheckpointRejected",
+    "revokedOwnerLeaseRejected", "ciphertextSlotsPreserved",
+    "lockReleasedAfterRevocation",
+  ]) {
+    assert.equal(nativeDesktopRecoveryDenials[key], true,
+      "Native Electron Desktop negative recovery invariant failed: " + key)
+  }
+  assert.equal(nativeDesktopRecoveryDenials.remoteGitHubUsed, false)
+  assert.equal(nativeDesktopRecoveryDenials.cutoverAuthorized, false)
   // Seed only this verified disposable Vault through Obsidian's real native
   // adapter. These intentionally malformed bytes cannot prove crypto or
   // authorize Cutover: the acceptance is strictly fail-closed and read-only.
@@ -436,6 +617,15 @@ try {
   // or a fresh Obsidian process boot, and never proves cryptographic success.
   nativePhase = "first plugin reload"
   nativeReloadEvidence = await evaluate(`(async()=>{
+  // Preserve only allowlisted fixed stage names, never a thrown plugin error.
+  let stage="initial";
+  const setStage=(label)=>{stage=label;globalThis.__d338NativeReloadStage=label};
+  setStage("initial");
+  // Test-only CDP exception injected before any unload or settings mutation.
+  if (${JSON.stringify(reloadFault)} === "renderer-exception") {
+    throw Error("synthetic-sensitive-token-never-display");
+  }
+  try {
   const id=${JSON.stringify(pluginId)};
   const first=app.plugins.plugins[id];
   if(!first)throw Error("Initial isolated plugin Runtime missing");
@@ -448,24 +638,33 @@ try {
   const sha=Array.from(new Uint8Array(digest),b=>b.toString(16).padStart(2,"0")).join("");
   const walRoot=root+"/reencryption-wal/"+sha;
   const paths=[pathFence,pathRoute,walRoot+"/slot-0.json",walRoot+"/slot-1.json"];
+  setStage("read-original-evidence");
   const before=await Promise.all(paths.map(x=>adapter.read(x)));
   const unchanged=async()=>{
     const after=await Promise.all(paths.map(x=>adapter.read(x)));
     return after.every((text,i)=>text===before[i]);
   };
+  setStage("unload-plugin");
   await app.plugins.unloadPlugin(id);
   const removed=!app.plugins.plugins[id];
+  setStage("load-plugin");
+  if (${JSON.stringify(reloadFault)} === "load-plugin") {
+    throw Error("synthetic-sensitive-token-never-display");
+  }
   await app.plugins.loadPlugin(id);
+  setStage("inspect-reloaded-instance");
   const next=app.plugins.plugins[id];
   if(!next)throw Error("Isolated plugin failed to reload");
   const fresh=next!==first&&next.v4Runtime!==first.v4Runtime;
   const credentialsStayedAbsent=!next.settings.githubToken
     && !next.settings.githubOwner&&!next.settings.githubRepo;
+  setStage("inspect-recovery-route");
   const route=await next.v4Runtime.inspectFencedReencryptionIndexRoute();
   const routeRefused=route.observation==="manual-recovery-required"
     && route.routingHintAuthenticated===false
     && route.localCutoverAuthorized===false
     && route.resumeSyncAuthorized===false;
+  setStage("inspect-settings-save-fence");
   let settingsSaveDenied=false;
   try{await next.v4Runtime.assertReencryptionSettingsSaveAllowed()}
   catch{settingsSaveDenied=true}
@@ -475,35 +674,48 @@ try {
   const dataBefore=await readData();
   const activeSettings=next.settings;
   const formerConfig=next.settings.syncObsidianConfig;
+  const saveGenerationBefore=next.settingsSaveGeneration;
   let realSettingsSaveDenied=false;
   try {
     await next.saveSettings({...next.settings,syncObsidianConfig:!formerConfig});
   } catch {
     realSettingsSaveDenied=true;
   }
+  const settingsSaveGenerationAdvanced=Number.isSafeInteger(saveGenerationBefore)
+    && next.settingsSaveGeneration===saveGenerationBefore+1;
   const actualSettingsUnchanged=next.settings===activeSettings
     && next.settings.syncObsidianConfig===formerConfig
     && !next.isSettingsSaveInProgress?.();
   const persistedDataUnchanged=(await readData())===dataBefore;
+  setStage("inspect-existing-wal");
   const structure=await next.v4Runtime.inspectFencedReencryptionExistingWalStructure();
   const walRefused=structure.observation==="manual-recovery-required"
     && structure.walAuthenticated===false
     && structure.completeRecoveryProven===false;
+  setStage("inspect-complete-recovery");
   const complete=await next.v4Runtime.inspectFencedReencryptionCompleteRecovery();
   const noRecovery=complete===null;
+  setStage("confirm-evidence-unchanged");
   const diskPreserved=await unchanged();
   return {
     unloaded:removed,freshRuntime:fresh,credentialsStayedAbsent,
     routeRefused,settingsSaveDenied,realSettingsSaveDenied,
-    actualSettingsUnchanged,persistedDataUnchanged,
+    settingsSaveGenerationAdvanced,actualSettingsUnchanged,persistedDataUnchanged,
     walRefused,noRecovery,diskPreserved,
     userVaultUsed:false,realProcessRestart:false,remoteGitHubUsed:false,
     cryptoSuccessProven:false
   };
+  } catch {
+    return { reloadFailedAt: stage };
+  }
 })()`, 40000)
+  if (nativeReloadEvidence?.reloadFailedAt) {
+    throw Error("Isolated native plugin reload failed at safe stage: "
+      + nativeReloadEvidence.reloadFailedAt)
+  }
   for (const key of [
     "unloaded", "freshRuntime", "credentialsStayedAbsent", "routeRefused",
-    "settingsSaveDenied", "realSettingsSaveDenied",
+    "settingsSaveDenied", "realSettingsSaveDenied", "settingsSaveGenerationAdvanced",
     "actualSettingsUnchanged", "persistedDataUnchanged",
     "walRefused", "noRecovery", "diskPreserved",
   ]) {
@@ -513,16 +725,20 @@ try {
   assert.equal(nativeReloadEvidence.realProcessRestart, false)
   assert.equal(nativeReloadEvidence.remoteGitHubUsed, false)
   assert.equal(nativeReloadEvidence.cryptoSuccessProven, false)
-  // Compare the *persisted* plugin Settings digest across the actual process
-  // restart; no secrets or raw settings are exported to this test runner.
-  nativeSettingsDigestBeforeRestart = await evaluate(`(async()=>{
-    const path=".obsidian/plugins/"+${JSON.stringify(pluginId)}+"/data.json";
-    const adapter=app.vault.adapter;
-    if(!await adapter.exists(path))return "absent";
-    const raw=await adapter.read(path);
-    const digest=await crypto.subtle.digest("SHA-256",new TextEncoder().encode(raw));
-    return Array.from(new Uint8Array(digest),b=>b.toString(16).padStart(2,"0")).join("");
-  })()`)
+  // Compare an independent physical read of the synthetic plugin Settings
+  // against the Obsidian adapter's fresh-process SHA-256. Avoid a second
+  // renderer evaluation during plugin lifecycle teardown.
+  const settingsFile = path.join(pluginRoot, "data.json")
+  try {
+    const info = await lstat(settingsFile)
+    assert.ok(info.isFile() && !info.isSymbolicLink(),
+      "Refusing nonregular synthetic Settings file")
+    const bytes = await readFile(settingsFile)
+    nativeSettingsDigestBeforeRestart = createHash("sha256").update(bytes).digest("hex")
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error
+    nativeSettingsDigestBeforeRestart = "absent"
+  }
   // A real process-level restart, NOT a physical power interruption.
   await restartIsolatedProcess(profile, vault)
   nativePhase = "first process restart validation"
@@ -751,17 +967,30 @@ try {
     + "(el.textContent||'').includes('Development preview')&&"
     + "(el.textContent||'').includes('Preflight & snapshot'));"
     + "const modalText=modal?.textContent||'';"
+    + "const wizardMobileLimitDisclosed=!!modal&&"
+    + "modalText.includes('Mobile Re-encryption initiation policy (approved)')&&"
+    + "modalText.includes('32 MiB')&&"
+    + "modalText.includes('readBinary()');"
     + "const wizardPreviewBlocked=!!modal&&"
     + "modalText.includes('production safety gates pass')&&"
     + "modalText.includes('Preview')&&"
     + "modalText.includes('No backup or destination branch will be created');"
+    + "const inspector=[...(modal?.querySelectorAll('button')||[])].find(button=>"
+    + "button.textContent?.trim()==='Inspect installed Recovery (read-only)');"
+    + "const wizardRecoveryInspectorVisible=!!inspector&&!inspector.disabled;"
+    + "inspector?.click();"
+    + "await new Promise(resolve=>setTimeout(resolve,150));"
+    + "const wizardRecoveryInspectorFailClosed=!!modal&&"
+    + "(modal.textContent||'').includes('inspection unavailable or inconclusive')&&"
+    + "(modal.textContent||'').includes('Sync and Cutover remain blocked');"
     + "const wizardNoExecute=!!modal&&!['Execute','Cutover','Publish now'].some(label=>"
     + "[...modal.querySelectorAll('button')].some(button=>button.textContent?.trim()===label));"
     + "const close=[...(modal?.querySelectorAll('button')||[])].find(button=>button.textContent?.trim()==='Close');"
     + "close?.click();"
     + "return {available,configured:false,completeReads,syncStarts,duplicateCalls,"
     + "manualRecoveryNotice:notices.some(text=>text.includes('Manual Recovery')),"
-    + "wizardPreviewBlocked,wizardNoExecute,noticeCount:notices.length}})()", 30000)
+    + "wizardPreviewBlocked,wizardMobileLimitDisclosed,wizardNoExecute,"
+    + "wizardRecoveryInspectorVisible,wizardRecoveryInspectorFailClosed,noticeCount:notices.length}})()", 30000)
   // UI-only synthetic result injection; native Obsidian and Notices are real.
   // This does NOT prove installed encrypted WAL or cryptographic authenticity.
   nativeOutcomes = await evaluate(`(async()=>{
@@ -892,6 +1121,12 @@ try {
     "Missing or unconfigured Recovery evidence must show Manual Recovery")
   assert.equal(nativeResult.wizardPreviewBlocked, true,
     "Native Re-encryption Wizard must show Preview-only and blocked publication")
+  assert.equal(nativeResult.wizardMobileLimitDisclosed, true,
+    "Installed Wizard must disclose the 32 MiB Mobile readBinary limit in Preflight")
+  assert.equal(nativeResult.wizardRecoveryInspectorVisible, true,
+    "Installed Wizard must expose the read-only Recovery button before Source verification")
+  assert.equal(nativeResult.wizardRecoveryInspectorFailClosed, true,
+    "Installed Wizard must safely report inconclusive Recovery without credentials or Cutover")
   assert.equal(nativeResult.wizardNoExecute, true,
     "Native Re-encryption Preview cannot expose executable publication or cutover actions")
   passed = true
@@ -928,6 +1163,9 @@ try {
   console.log(JSON.stringify({
     status: passed && !process.exitCode ? "PASS" : "FAIL",
     nativeWindowsCommandAvailable: nativeResult?.available ?? false,
+    installedDesktopInitiatorReader: nativeInitiatorReaderEvidence?.installedRuntimeReader === true
+      && nativeInitiatorReaderEvidence?.exactPhysicalInventory === true
+      && nativeInitiatorReaderEvidence?.boundedPhysicalBytesMatch === true,
     diagnosticRuns: nativeResult?.completeReads ?? 0,
     duplicateNativeInvocations: nativeResult?.duplicateCalls ?? 0,
     syncStarts: nativeResult?.syncStarts ?? 0,
@@ -955,6 +1193,18 @@ try {
       && nativeOsLockProof?.secondProcessBlocked === true
       && nativeOsLockProof?.releasedAndReopened === true
       && nativeOsLockProof?.encryptedSlotsPreserved === true,
+    nativeElectronExistingWalRecovery: nativeDesktopRecoveryEvidence?.existingOnlyOpened === true
+      && nativeDesktopRecoveryEvidence?.immutableEncryptedSlots === true
+      && nativeDesktopRecoveryEvidence?.osLeaseReleased === true
+      && nativeDesktopRecoveryEvidence?.bestEffortOnly === true,
+    nativeElectronRecoveryDeniedUnsafeCases:
+      nativeDesktopRecoveryDenials?.wrongPinnedDigestRejected === true
+      && nativeDesktopRecoveryDenials?.concurrentRecoveryReaderRejected === true
+      && nativeDesktopRecoveryDenials?.revokedOwnerReadRejected === true
+      && nativeDesktopRecoveryDenials?.revokedOwnerCheckpointRejected === true
+      && nativeDesktopRecoveryDenials?.revokedOwnerLeaseRejected === true
+      && nativeDesktopRecoveryDenials?.ciphertextSlotsPreserved === true
+      && nativeDesktopRecoveryDenials?.lockReleasedAfterRevocation === true,
     nativeAuthenticatedWalCryptoReadback: nativeAuthenticatedWalEvidence?.authenticatedTwoSlots === true
       && nativeAuthenticatedWalEvidence?.wrongKeyRejected === true
       && nativeAuthenticatedWalEvidence?.tamperedCiphertextWithRehashedHeaderRejected === true,
@@ -978,6 +1228,7 @@ try {
     mockedUnloadCallbackBlocked: nativeOutcomes?.staleInvocationSuppressed ?? false,
     mockedSyncStarts: nativeOutcomes?.syncStarts ?? -1,
     wizardPreviewBlocked: nativeResult?.wizardPreviewBlocked ?? false,
+    wizardMobileLimitDisclosed: nativeResult?.wizardMobileLimitDisclosed ?? false,
     wizardNoExecute: nativeResult?.wizardNoExecute ?? false,
     cleanup,
     remoteGitHubUsed: false,

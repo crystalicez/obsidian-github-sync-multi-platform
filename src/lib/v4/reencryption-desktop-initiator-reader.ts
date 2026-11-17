@@ -31,6 +31,14 @@ function safeLogicalPath(value: string): readonly string[] {
 }
 
 async function nativeIO() {
+  // The installed Obsidian plugin runs as CommonJS in Electron. Renderer-side
+  // dynamic import("node:*") can fail even though Node require is available.
+  if (typeof exports === "object" && typeof require === "function") {
+    const fs = require("node:fs/promises") as typeof import("node:fs/promises")
+    const path = require("node:path") as typeof import("node:path")
+    const constants = require("node:fs") as typeof import("node:fs")
+    return { fs, path, constants: constants.constants }
+  }
   const [fs, path, constants] = await Promise.all([
     import("node:fs/promises"), import("node:path"), import("node:fs"),
   ])
@@ -61,9 +69,59 @@ export function createV4DesktopInitiatorLocalReader(
   const capturedScope = Object.freeze({ ...input.scope })
   const inScope = createV4ScopePredicate(capturedScope)
   const rootAbsolute = input.rootAbsolute
+  const owner = {
+    scope: input.scope,
+    lease: input.assertExclusiveInitiatorLease,
+    idle: input.assertIdleAndNoPendingEdits,
+    source: input.assertSourceConfigurationUnchanged,
+    editors: input.listOpenEditorPaths,
+  }
+  const assertOwner = () => {
+    const scope = input.scope
+    if (input.rootAbsolute !== rootAbsolute || scope !== owner.scope
+      || scope.configDir !== capturedScope.configDir
+      || scope.pluginId !== capturedScope.pluginId
+      || scope.ignorePathRegex !== capturedScope.ignorePathRegex
+      || scope.syncObsidianConfig !== capturedScope.syncObsidianConfig
+      || scope.syncBookmarks !== capturedScope.syncBookmarks
+      || scope.syncPlugins !== capturedScope.syncPlugins
+      || input.assertExclusiveInitiatorLease !== owner.lease
+      || input.assertIdleAndNoPendingEdits !== owner.idle
+      || input.assertSourceConfigurationUnchanged !== owner.source
+      || input.listOpenEditorPaths !== owner.editors) {
+      throw new Error("Re-encryption Desktop reader input owner changed during parity.")
+    }
+  }
+
+  /** Cooperative best-effort live fence, not an OS-wide filesystem lock. */
+  const assertLiveReady = async (signal?: AbortSignal): Promise<void> => {
+    const assertNotAborted = () => {
+      if (signal?.aborted) throw signal.reason ?? new Error("Re-encryption desktop reader aborted.")
+    }
+    assertOwner()
+    assertNotAborted()
+    await owner.lease.call(input)
+    await owner.idle.call(input)
+    await owner.source.call(input)
+    const open = await owner.editors.call(input)
+    if (!Array.isArray(open) || open.length) {
+      throw new Error("Re-encryption desktop reader cannot verify while an editor is open or unknown.")
+    }
+    // Obsidian editor enumeration can yield: recheck every live owner
+    // after its await rather than trusting the earlier observations.
+    assertOwner()
+    assertNotAborted()
+    await owner.lease.call(input)
+    await owner.source.call(input)
+    await owner.idle.call(input)
+    assertOwner()
+    assertNotAborted()
+  }
 
   async function trustedRoot() {
+    await assertLiveReady()
     const io = await nativeIO()
+    assertOwner()
     const { fs, path } = io
     if (!path.isAbsolute(rootAbsolute) || path.resolve(rootAbsolute) !== rootAbsolute) {
       throw new Error("Re-encryption desktop reader requires a canonical absolute vault root.")
@@ -73,6 +131,7 @@ export function createV4DesktopInitiatorLocalReader(
       || (await fs.realpath(rootAbsolute)).toLowerCase() !== rootAbsolute.toLowerCase()) {
       throw new Error("Re-encryption desktop reader cannot trust a symlink or junction vault root.")
     }
+    await assertLiveReady()
     return io
   }
 
@@ -99,6 +158,7 @@ export function createV4DesktopInitiatorLocalReader(
       if (path.resolve(actual).toLowerCase() !== path.resolve(current).toLowerCase()) {
         throw new Error("Re-encryption desktop reader refuses a junction or redirected vault path.")
       }
+      assertOwner()
     }
     if (!stat) throw new Error("Re-encryption desktop reader has no physical file identity.")
     return { full: current, stat }
@@ -117,12 +177,14 @@ export function createV4DesktopInitiatorLocalReader(
       const pending: Array<readonly string[]> = [[]]
       let counted = 0
       while (pending.length) {
+        await assertLiveReady()
         const parts = pending.pop()!
         if (parts.length > MAX_DIRECTORY_DEPTH) {
           throw new Error("Re-encryption desktop reader directory depth exceeds the safe limit.")
         }
         if (parts.length) await safeEntry(io, parts, "directory")
         const entries = await fs.readdir(path.join(rootAbsolute, ...parts), { withFileTypes: true })
+        await assertLiveReady()
         for (const entry of entries) {
           if (++counted > MAX_SCAN_ENTRIES) {
             throw new Error("Re-encryption desktop reader vault inventory exceeds the safe limit.")
@@ -158,6 +220,7 @@ export function createV4DesktopInitiatorLocalReader(
           }
         }
       }
+      await assertLiveReady()
       return Object.freeze(files.sort((a, b) => a.path.localeCompare(b.path)))
     },
     async openFile(logical: string) {
@@ -168,12 +231,14 @@ export function createV4DesktopInitiatorLocalReader(
       const io = await trustedRoot()
       const { fs, constants } = io
       const initial = await safeEntry(io, parts, "file")
+      await assertLiveReady()
       if (!Number.isSafeInteger(initial.stat.size) || initial.stat.size < 0) {
         throw new Error("Re-encryption desktop reader unsafe physical file size.")
       }
       return Object.freeze({
         size: Number(initial.stat.size),
         async *chunks(chunkSize: number, signal?: AbortSignal): AsyncIterable<Uint8Array> {
+          await assertLiveReady(signal)
           if (!Number.isSafeInteger(chunkSize) || chunkSize < 1 || chunkSize > MAX_CHUNK_BYTES) {
             throw new Error("Re-encryption desktop reader refuses unbounded chunk sizes.")
           }
@@ -181,8 +246,11 @@ export function createV4DesktopInitiatorLocalReader(
           try {
             if (signal?.aborted) throw signal.reason ?? new Error("Re-encryption reader aborted.")
             await safeEntry(io, parts, "file")
+            await assertLiveReady(signal)
             handle = await fs.open(initial.full, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
+            await assertLiveReady(signal)
             const opened = await handle.stat()
+            await assertLiveReady(signal)
             if (!opened.isFile() || opened.isSymbolicLink()
               || opened.size !== initial.stat.size
               || opened.dev !== initial.stat.dev || opened.ino !== initial.stat.ino
@@ -192,11 +260,13 @@ export function createV4DesktopInitiatorLocalReader(
             }
             let position = 0
             while (position < opened.size) {
+              await assertLiveReady(signal)
               if (signal?.aborted) throw signal.reason ?? new Error("Re-encryption reader aborted.")
               const buffer = new Uint8Array(Math.min(chunkSize, opened.size - position))
               let filled = 0
               while (filled < buffer.byteLength) {
                 const result = await handle.read(buffer, filled, buffer.byteLength - filled, position + filled)
+                await assertLiveReady(signal)
                 if (result.bytesRead === 0) throw new Error("Re-encryption desktop reader detected truncated physical file.")
                 filled += result.bytesRead
               }
@@ -205,6 +275,7 @@ export function createV4DesktopInitiatorLocalReader(
             }
             const finalHandle = await handle.stat()
             const finalPath = await safeEntry(io, parts, "file")
+            await assertLiveReady(signal)
             if (finalHandle.dev !== opened.dev || finalHandle.ino !== opened.ino
               || finalHandle.size !== opened.size || finalHandle.mtimeMs !== opened.mtimeMs
               || finalHandle.ctimeMs !== opened.ctimeMs || finalPath.stat.dev !== opened.dev

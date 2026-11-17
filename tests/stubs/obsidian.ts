@@ -203,7 +203,31 @@ export class Setting {
   addText(_cb: unknown) { return this; }
   addTextArea(_cb: unknown) { return this; }
   addDropdown(_cb: unknown) { return this; }
-  addButton(_cb: unknown) { return this; }
+  addButton(cb: (button: {
+    setButtonText(text: string): unknown;
+    setDisabled(disabled: boolean): unknown;
+    setWarning(): unknown;
+    setCta(): unknown;
+    setTooltip(text: string): unknown;
+    setIcon(icon: string): unknown;
+    onClick(handler: () => void): unknown;
+  }) => void) {
+    // Mirror the interactive text, disabled state and onClick of Obsidian's
+    // Setting button. Use a span to keep unrelated modalButtons fixture
+    // tracking reserved for the modal's own native buttons.
+    const target = this.container.createEl("span");
+    const button = {
+      setButtonText(text: string) { target.setText(text); return this; },
+      setDisabled(disabled: boolean) { target.disabled = disabled; return this; },
+      setWarning() { return this; },
+      setCta() { return this; },
+      setTooltip(_text: string) { return this; },
+      setIcon(_icon: string) { return this; },
+      onClick(handler: () => void) { target.onclick = handler; return this; },
+    };
+    cb(button);
+    return this;
+  }
   addSlider(cb: (slider: {
     setLimits(min: number, max: number, step: number): unknown;
     setValue(value: number): unknown;

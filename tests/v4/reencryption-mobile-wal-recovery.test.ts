@@ -3,6 +3,30 @@ import test from "node:test"
 
 import { planV4PluginPrivateWalLocation } from "../../src/lib/v4/reencryption-plugin-wal-location"
 import { openV4MobilePluginWalForRecovery } from "../../src/lib/v4/reencryption-mobile-wal-recovery"
+import { tryReserveV4MobileRecoveryAdapter } from "../../src/lib/v4/reencryption-mobile-recovery-reservation"
+
+test("D294 stale Mobile Recovery release must not evict a newer adapter reservation", () => {
+  const adapter = {}
+  const first = tryReserveV4MobileRecoveryAdapter(adapter)
+  assert.ok(first)
+  assert.equal(tryReserveV4MobileRecoveryAdapter(adapter), null,
+    "another cooperative holder must not enter during the first reservation")
+
+  first()
+  const second = tryReserveV4MobileRecoveryAdapter(adapter)
+  assert.ok(second)
+  try {
+    first() // stale caller must not release the second owner's reservation
+    assert.equal(tryReserveV4MobileRecoveryAdapter(adapter), null,
+      "releasing an old reservation twice must never free the new holder")
+  } finally {
+    second()
+  }
+
+  const third = tryReserveV4MobileRecoveryAdapter(adapter)
+  assert.ok(third, "the current owner can release normally")
+  third()
+})
 
 const configDir = ".obsidian"
 const pluginId = "obsidian-encrypted-github-sync"
@@ -126,6 +150,42 @@ test("D242 Mobile does not silently accept a same-size changed slot on two succe
   active = true
   await assert.rejects(opened.adapter.read(f.layout.journalRoot + "/slot-0.json"),
     /changed during readback/u)
+})
+
+test("D306 Mobile Recovery refuses a slot replaced after open with identical size and mtime", async () => {
+  const f = await fixture()
+  const reader = await openV4MobilePluginWalForRecovery(f.input)
+  const full = f.layout.vaultLogicalWalRoot + "/slot-0.json"
+  const logical = f.layout.journalRoot + "/slot-0.json"
+  const original = f.files.get(full)
+  assert.ok(original)
+  const replacement = original.replace("zero", "ZERO")
+  assert.notEqual(replacement, original)
+  assert.equal(new TextEncoder().encode(replacement).length,
+    new TextEncoder().encode(original).length,
+    "replacement must preserve stat.size so only content evidence can detect drift")
+  f.files.set(full, replacement)
+  assert.equal((await f.adapter.stat(full))?.mtime, 1)
+
+  await assert.rejects(reader.adapter.read(logical), /slot changed/u)
+  await assert.rejects(reader.adapter.exists(logical), /slot changed/u)
+  assert.equal(f.files.get(full), replacement,
+    "Recovery detection must never replace or delete ambiguous WAL evidence")
+})
+
+test("D306 Mobile Recovery refuses a stable Adapter stat size that disagrees with read bytes", async () => {
+  const f = await fixture()
+  const originalStat = f.adapter.stat
+  const full = f.layout.vaultLogicalWalRoot + "/slot-0.json"
+  f.adapter.stat = async path => {
+    const info = await originalStat(path)
+    return info && path === full ? { ...info, size: info.size + 1 } : info
+  }
+  const snapshot = new Map(f.files)
+  await assert.rejects(openV4MobilePluginWalForRecovery(f.input),
+    /invalid or inconsistent data/u)
+  assert.deepEqual(f.files, snapshot,
+    "Inconsistent Adapter metadata must leave the original WAL untouched")
 })
 
 test("D242 Mobile refuses unknown requested paths rather than reading arbitrary vault data", async () => {

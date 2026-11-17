@@ -7,6 +7,7 @@ import { sha256Hex, utf8ToBytes } from "../../src/lib/bytes"
 import { createV4DesktopInitiatorLocalReader } from "../../src/lib/v4/reencryption-desktop-initiator-reader"
 import { verifyV4ReencryptionInitiatorLocalParity } from "../../src/lib/v4/reencryption-initiator-parity"
 import { V4PluginRuntime } from "../../src/lib/v4/runtime"
+import { V4SyncCoordinator } from "../../src/lib/v4/sync-coordinator"
 import type { V4IndexFileRecord } from "../../src/lib/v4/local-index"
 import type { V4ScopeSettings } from "../../src/lib/v4/scope"
 
@@ -58,6 +59,193 @@ async function exactSource(paths: ReadonlyArray<{ path: string; bytes: Uint8Arra
     },
   }
 }
+
+test("D361 Desktop physical reader fails closed on live Sync, lease and Source loss before direct disk access", async () => {
+  const f = await sandbox()
+  try {
+    await f.write("notes/a.md", "immutable physical content")
+    for (const changed of ["sync", "lease", "source"] as const) {
+      let syncing = false
+      let lease = true
+      let sourceValid = true
+      const reader = createV4DesktopInitiatorLocalReader({
+        rootAbsolute: f.root,
+        scope,
+        async assertExclusiveInitiatorLease() { if (!lease) throw new Error("lease lost") },
+        async assertIdleAndNoPendingEdits() { if (syncing) throw new Error("sync active") },
+        async assertSourceConfigurationUnchanged() { if (!sourceValid) throw new Error("source changed") },
+        async listOpenEditorPaths() { return [] },
+      })
+      if (changed === "sync") syncing = true
+      else if (changed === "lease") lease = false
+      else sourceValid = false
+      const expected = changed === "source" ? /source/i : changed === "lease" ? /lease/i : /sync/i
+      await assert.rejects(() => reader.listFiles(), expected,
+        "a standalone Desktop inventory must not bypass live " + changed + " guard")
+      await assert.rejects(() => reader.openFile("notes/a.md"), expected,
+        "a standalone Desktop file handle must not bypass live " + changed + " guard")
+    }
+  } finally {
+    await f.cleanup()
+  }
+})
+
+test("D361 Desktop physical reader refuses the next bounded chunk after live authority is lost", async () => {
+  const f = await sandbox()
+  try {
+    await f.write("notes/a.md", "read this content in several small bounded chunks")
+    for (const changed of ["sync", "lease", "source"] as const) {
+      let syncing = false
+      let lease = true
+      let sourceValid = true
+      const reader = createV4DesktopInitiatorLocalReader({
+        rootAbsolute: f.root,
+        scope,
+        async assertExclusiveInitiatorLease() { if (!lease) throw new Error("lease lost") },
+        async assertIdleAndNoPendingEdits() { if (syncing) throw new Error("sync active") },
+        async assertSourceConfigurationUnchanged() { if (!sourceValid) throw new Error("source changed") },
+        async listOpenEditorPaths() { return [] },
+      })
+      const file = await reader.openFile("notes/a.md")
+      const iterator = file.chunks(4)[Symbol.asyncIterator]()
+      assert.equal((await iterator.next()).done, false)
+      if (changed === "sync") syncing = true
+      else if (changed === "lease") lease = false
+      else sourceValid = false
+      await assert.rejects(() => iterator.next(),
+        changed === "source" ? /source/i : changed === "lease" ? /lease/i : /sync/i,
+        "a direct physical stream must refuse all subsequent chunks after " + changed + " loss")
+      await iterator.return?.()
+    }
+  } finally {
+    await f.cleanup()
+  }
+})
+
+test("D361 Desktop rechecks live authority after async editor enumeration", async () => {
+  const f = await sandbox()
+  try {
+    await f.write("notes/a.md", "safe physical note")
+    for (const changed of ["sync", "lease", "source"] as const) {
+      let syncing = false
+      let lease = true
+      let sourceValid = true
+      let injected = false
+      const reader = createV4DesktopInitiatorLocalReader({
+        rootAbsolute: f.root, scope,
+        async assertExclusiveInitiatorLease() { if (!lease) throw new Error("lease lost") },
+        async assertIdleAndNoPendingEdits() { if (syncing) throw new Error("sync active") },
+        async assertSourceConfigurationUnchanged() { if (!sourceValid) throw new Error("source changed") },
+        async listOpenEditorPaths() {
+          await Promise.resolve()
+          if (!injected) {
+            injected = true
+            if (changed === "sync") syncing = true
+            else if (changed === "lease") lease = false
+            else sourceValid = false
+          }
+          return []
+        },
+      })
+      await assert.rejects(() => reader.openFile("notes/a.md"),
+        changed === "source" ? /source/i : changed === "lease" ? /lease/i : /sync/i,
+        "an async editor check must not mask a revoked " + changed + " owner")
+      assert.equal(injected, true)
+    }
+  } finally {
+    await f.cleanup()
+  }
+})
+
+test("D343 completed Sync revokes old Desktop parity reader without preventing fresh verification", async () => {
+  const f = await sandbox()
+  const coordinator = new V4SyncCoordinator({ execute: async () => ({ changedFiles: 0 }) })
+  try {
+    const content = utf8ToBytes("unchanged physical Desktop note")
+    await f.write("notes/a.md", new TextDecoder().decode(content))
+    const plugin = {
+      settings: {
+        githubOwner: "owner", githubRepo: "vault", githubBranch: "main",
+        githubToken: "offline-only", encryptionMode: "encrypted", encryptionPassphrase: "offline-only",
+        ignorePathRegex: "", syncObsidianConfig: false, syncBookmarks: false, syncPlugins: false,
+      },
+      manifest: { id: scope.pluginId },
+      app: {
+        vault: {
+          configDir: ".obsidian",
+          adapter: {
+            getFullPath(path: string) { return join(f.root, ...path.split("/")) },
+            async read() { return "" }, async write() {}, async mkdir() {}, async exists() { return false },
+          },
+          getFiles() { return [] },
+        },
+        workspace: { activeEditor: null, iterateAllLeaves(_visitor: unknown) {} },
+      },
+      isSyncInProgress: false,
+      isSettingsSaveInProgress() { return false },
+      settingsSaveGeneration: 0,
+      addIgnoredFile() {}, removeIgnoredFile() {},
+    }
+    const runtime = new V4PluginRuntime(plugin as never)
+    try {
+      ;(runtime as unknown as { coordinator: V4SyncCoordinator }).coordinator = coordinator
+      const oldReader = runtime.createReencryptionInitiatorLocalReader(async () => {})
+      const pinned = await exactSource([{ path: "notes/a.md", bytes: content }])
+      assert.equal((await verifyV4ReencryptionInitiatorLocalParity({
+        ...pinned, reader: oldReader,
+      })).checkedFileCount, 1)
+      assert.equal((await coordinator.run({ operation: "normal", trigger: "manual" })).status, "completed")
+      assert.equal(coordinator.isSyncing, false)
+      assert.equal(coordinator.syncExecutionGeneration, 1)
+      await assert.rejects(
+        () => verifyV4ReencryptionInitiatorLocalParity({ ...pinned, reader: oldReader }),
+        /Sync.*(started|changed|generation)/i,
+        "Desktop must reject completed intervening Sync even when files did not change",
+      )
+      const freshReader = runtime.createReencryptionInitiatorLocalReader(async () => {})
+      assert.equal((await verifyV4ReencryptionInitiatorLocalParity({
+        ...pinned, reader: freshReader,
+      })).checkedFileCount, 1)
+    } finally { runtime.dispose() }
+  } finally {
+    coordinator.dispose()
+    await f.cleanup()
+  }
+})
+
+test("D342 desktop parity revokes a replaced input owner and checks in-flight hash chunks", async () => {
+  const f = await sandbox()
+  try {
+    const data = utf8ToBytes("physical bytes for a pinned owner")
+    await f.write("notes/a.md", new TextDecoder().decode(data))
+    const proof = await exactSource([{ path: "notes/a.md", bytes: data }])
+    for (const replaced of ["lease", "idle", "source", "editors", "root", "scope", "scope-in-place"] as const) {
+      const input = { rootAbsolute: f.root, scope: { ...scope }, ...f.guard }
+      const reader = createV4DesktopInitiatorLocalReader(input)
+      const stable = await verifyV4ReencryptionInitiatorLocalParity({ ...proof, reader })
+      assert.equal(stable.checkedFileCount, 1)
+      if (replaced === "lease") input.assertExclusiveInitiatorLease = async () => {}
+      else if (replaced === "idle") input.assertIdleAndNoPendingEdits = async () => {}
+      else if (replaced === "source") input.assertSourceConfigurationUnchanged = async () => {}
+      else if (replaced === "editors") input.listOpenEditorPaths = async () => []
+      else if (replaced === "root") input.rootAbsolute = f.root + "-replaced"
+      else if (replaced === "scope") input.scope = { ...scope, syncBookmarks: true }
+      else input.scope.syncBookmarks = true
+      await assert.rejects(() => verifyV4ReencryptionInitiatorLocalParity({ ...proof, reader }),
+        /Desktop.*owner.*changed/i, "a changed " + replaced + " must revoke proof")
+    }
+
+    const input = { rootAbsolute: f.root, scope, ...f.guard }
+    const reader = createV4DesktopInitiatorLocalReader(input)
+    const opened = await reader.openFile("notes/a.md")
+    const iterator = opened.chunks(4)[Symbol.asyncIterator]()
+    assert.equal((await iterator.next()).done, false)
+    input.assertExclusiveInitiatorLease = async () => {}
+    await assert.rejects(async () => {
+      while (!(await iterator.next()).done) {}
+    }, /Desktop.*owner.*changed/i, "owner replacement between yielded chunks must abort hashing")
+  } finally { await f.cleanup() }
+})
 
 test("D106 REAL local Windows/Node disk reader lists scoped files and verifies complete SHA256 without writes", async () => {
   const f = await sandbox()
@@ -259,6 +447,9 @@ test("D106 installed-runtime adapter binds real physical files, live scope, conn
         },
         getFiles() { return [] }, // Intentionally stale Obsidian metadata cache.
       } },
+      isSyncInProgress: false,
+      isSettingsSaveInProgress() { return false },
+      settingsSaveGeneration: 0,
       addIgnoredFile() {}, removeIgnoredFile() {},
     }
     const runtime = new V4PluginRuntime(plugin as never)
@@ -290,6 +481,35 @@ test("D106 installed-runtime adapter binds real physical files, live scope, conn
       mutableSettings.githubBranch = "different"
       await assert.rejects(() => verifyV4ReencryptionInitiatorLocalParity({ ...proof, reader }), /connection|scope/i)
       mutableSettings.githubBranch = "main"
+
+      const originalVault = plugin.app.vault
+      plugin.app.vault = { ...originalVault }
+      await assert.rejects(
+        () => verifyV4ReencryptionInitiatorLocalParity({ ...proof, reader }),
+        /Vault|connection|scope|identity/i,
+        "desktop physical reader cannot certify a replaced Obsidian Vault with the same adapter",
+      )
+      plugin.app.vault = originalVault
+      plugin.isSyncInProgress = true
+      await assert.rejects(
+        () => verifyV4ReencryptionInitiatorLocalParity({ ...proof, reader }),
+        /Sync|idle|mutation/i,
+        "plugin-level Sync must block desktop parity before the coordinator reports it",
+      )
+      plugin.isSyncInProgress = false
+      plugin.isSettingsSaveInProgress = () => true
+      await assert.rejects(
+        () => verifyV4ReencryptionInitiatorLocalParity({ ...proof, reader }),
+        /Settings|idle|mutation/i,
+        "in-progress plugin Settings save must block desktop parity",
+      )
+      plugin.isSettingsSaveInProgress = () => false
+      plugin.settingsSaveGeneration++
+      await assert.rejects(
+        () => verifyV4ReencryptionInitiatorLocalParity({ ...proof, reader }),
+        /Settings|connection|scope|identity/i,
+        "a completed Settings save must invalidate stale Desktop parity with unchanged Settings values",
+      )
 
       leaseOwned = false
       await assert.rejects(() => verifyV4ReencryptionInitiatorLocalParity({ ...proof, reader }), /lease lost/i)

@@ -10,7 +10,7 @@ import { isV4PublicationRaceError } from "../../src/lib/v4/publication-race";
 import { expectedV4PathLayout, V4_FORMAT_VERSION, type V4RemoteConfig, type V4StorageMode } from "../../src/lib/v4/protocol-types";
 import { V4SyncSession, type V4SessionVault, type V4SyncRunState } from "../../src/lib/v4/sync-session";
 import {
-  encodeGitHubE2ERefPath,
+
   readGitHubE2ETargetEnvironment,
   resetGitHubE2EDisposableBranch,
   resolveGitHubE2ETarget,
@@ -19,27 +19,14 @@ import {
 const encoder = new TextEncoder();
 type E2ESession = Pick<V4SyncSession, "sync">;
 
-function branchPath(config: GitHubConfig): string {
-  return encodeGitHubE2ERefPath(config.branch);
-}
-
-async function githubRequest(config: GitHubConfig, apiPath: string, init: RequestInit = {}): Promise<Response> {
-  return fetch(`https://api.github.com/repos/${config.owner}/${config.repo}${apiPath}`, {
-    ...init,
-    headers: {
-      Authorization: `Bearer ${config.token}`,
-      Accept: "application/vnd.github+json",
-      "Content-Type": "application/json",
-      "X-GitHub-Api-Version": "2022-11-28",
-      ...(init.headers ?? {}),
-    },
-  });
-}
-
 function installRequestUrlBridge(): void {
   setRequestUrlHandler(async raw => {
     const request = raw as { url: string; method?: string; headers?: Record<string, string>; body?: string };
-    const response = await fetch(request.url, { method: request.method ?? "GET", headers: request.headers, body: request.body });
+    const response = await fetch(request.url, {
+      method: request.method ?? "GET",
+      ...(request.headers ? { headers: request.headers } : {}),
+      ...(request.body === undefined ? {} : { body: request.body }),
+    });
     const arrayBuffer = await response.arrayBuffer();
     const text = new TextDecoder().decode(arrayBuffer);
     let json: unknown;
@@ -96,10 +83,10 @@ function device(name: string, github: GitHubConfig, context: ModeContext, now?: 
     vault,
     index,
     config: context.config,
-    keyring: context.keyring,
+    ...(context.keyring ? { keyring: context.keyring } : {}),
     conflictPolicy: "copy" as const,
     abortChangePercent: 0,
-    now,
+    ...(now ? { now } : {}),
   };
   const session: E2ESession = {
     async sync(options) {

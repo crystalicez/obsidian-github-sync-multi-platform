@@ -36,9 +36,13 @@ export default class FastSync extends Plugin {
   startupSyncTimeout: number | null = null
   secretsMigrated: boolean = false
   private settingsSaveInProgress = false
+  // Monotonic in-memory epoch: even a failed or no-op save can race
+  // an in-flight migration preflight. Never reset it on completion.
+  private settingsSaveAttemptGeneration = 0
 
   /** Synchronously checked by the Re-encryption arming gate before disk I/O. */
   isSettingsSaveInProgress(): boolean { return this.settingsSaveInProgress }
+  get settingsSaveGeneration(): number { return this.settingsSaveAttemptGeneration }
   private unloaded = false
   private recoveryReadOnlyCommandInProgress = false
   private recoveryReadOnlyEpoch = 0
@@ -446,20 +450,20 @@ export default class FastSync extends Plugin {
     const runtime = this.v4Runtime
     const backing = this.app.vault.adapter
     const original = this.settings
-    const identity = (settings: PluginSettings) => JSON.stringify({
-      githubOwner: settings.githubOwner, githubRepo: settings.githubRepo,
-      githubBranch: settings.githubBranch, encryptionMode: settings.encryptionMode,
-      encryptionPassphraseSecretId: settings.encryptionPassphraseSecretId,
-      vault: settings.vault,
-    })
-    const originalId = identity(original)
+    // A Cutover must not silently overwrite concurrent in-memory settings
+    // edits (ignore rules, conflict policy, schedules, etc.), even when the
+    // six Source connection fields remain unchanged. Keep a complete snapshot
+    // in memory only; never log it because it includes credentials.
+    const originalSettingsSnapshot = JSON.stringify(original)
     const assertOwner = () => {
       if (this.unloaded || !this.settingsSaveInProgress || this.isSyncInProgress
         || this.v4Runtime !== runtime || this.app.vault.adapter !== backing
-        || this.settings !== original || identity(this.settings) !== originalId) {
+        || this.settings !== original
+        || JSON.stringify(this.settings) !== originalSettingsSnapshot) {
         throw new Error("Re-encryption Settings Cutover lost plugin/Settings ownership.")
       }
     }
+    this.settingsSaveAttemptGeneration++
     this.settingsSaveInProgress = true
     try {
       return await persistV4FencedDestinationSettings({
@@ -500,6 +504,7 @@ export default class FastSync extends Plugin {
     const newPassphraseId = prepared.encryptionPassphraseSecretId !== previous.encryptionPassphraseSecretId
       ? prepared.encryptionPassphraseSecretId : ""
     const storage = this.app.secretStorage
+    this.settingsSaveAttemptGeneration++
     this.settingsSaveInProgress = true
     try {
       // Preserve the original key and pinned Settings during Manual Recovery.

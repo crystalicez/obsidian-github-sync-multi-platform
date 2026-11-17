@@ -87,6 +87,14 @@ function validRelativeRoot(root: string): readonly string[] {
 }
 
 async function desktopIo() {
+  // Installed Obsidian runs the plugin as CommonJS in Electron; renderer
+  // dynamic imports of node:* can fail even when Node require is available.
+  if (typeof exports === "object" && typeof require === "function") {
+    return {
+      fs: require("node:fs/promises") as typeof import("node:fs/promises"),
+      path: require("node:path") as typeof import("node:path"),
+    }
+  }
   const [fs, path] = await Promise.all([
     import("node:fs/promises"), import("node:path"),
   ])
@@ -233,6 +241,9 @@ export async function acquireV4DesktopRekeyWalStorage(options: {
   let closed = false
   let releasing = false
   let writing = false
+  // A completed interleaved write is invisible to the `writing` flag alone.
+  // The epoch changes synchronously before each slot write begins.
+  let writeEpoch = 0
   let activeOperations = 0
   let finishDrain: (() => void) | undefined
   // Claim synchronously, before the first fs await. A release must NEVER
@@ -307,6 +318,16 @@ export async function acquireV4DesktopRekeyWalStorage(options: {
         || currentBytes.toString("utf8", 0, bytesRead) !== token) {
         throw new V4DesktopRekeyWalLockError()
       }
+      // The token belongs to the pinned descriptor, but an external actor
+      // may detach/replace its pathname while the token read is in flight.
+      // Revalidate ownership of that path before certifying this lease.
+      const afterToken = await fs.lstat(lockPath)
+      if (!afterToken.isFile() || afterToken.isSymbolicLink()
+        || afterToken.nlink !== 1 || afterToken.size !== token.length
+        || afterToken.ino === 0 || afterToken.dev !== held.dev
+        || afterToken.ino !== held.ino) {
+        throw new V4DesktopRekeyWalLockError()
+      }
     } catch {
       throw new V4DesktopRekeyWalLockError()
     }
@@ -328,10 +349,22 @@ export async function acquireV4DesktopRekeyWalStorage(options: {
       throw new V4DesktopRekeyWalRecoveryRequiredError()
     }
   } catch (error) {
-    await lockHandle.close()
-    // The lock was exclusively created by this operation, so it may be
-    // removed on construction failure. NEVER reclaim a preexisting lock.
-    await fs.unlink(lockPath)
+    // Even a lock created with wx+ can lose its pathname during an awaited
+    // initialization I/O. Closing then blindly unlinking by pathname would
+    // erase another owner's replacement lock. Only clean up the same inode.
+    const created = await lockHandle.stat({ bigint: true }).finally(() => lockHandle.close())
+    if (created.isFile() && created.nlink === BigInt(1) && created.ino !== BigInt(0)) {
+      let current: Awaited<ReturnType<typeof fs.lstat>> | undefined
+      try { current = await fs.lstat(lockPath, { bigint: true }) }
+      catch (cleanupError) {
+        if ((cleanupError as NodeJS.ErrnoException).code !== "ENOENT") throw cleanupError
+      }
+      if (current?.isFile() && !current.isSymbolicLink()
+        && current.nlink === BigInt(1) && current.dev === created.dev
+        && current.ino === created.ino) {
+        await fs.unlink(lockPath)
+      }
+    }
     throw error
   }
   const prefixes = new Set(parts.map((_, i) => parts.slice(0, i + 1).join("/")))
@@ -375,7 +408,9 @@ export async function acquireV4DesktopRekeyWalStorage(options: {
         if (!current.isFile() || current.isSymbolicLink() || current.nlink !== BigInt(1)
           || !opened.isFile() || opened.nlink !== BigInt(1)
           || current.ino === BigInt(0) || opened.ino === BigInt(0)
-          || current.dev !== opened.dev || current.ino !== opened.ino) {
+          || current.dev !== opened.dev || current.ino !== opened.ino
+          || current.size !== opened.size
+          || current.mtimeNs !== opened.mtimeNs || current.ctimeNs !== opened.ctimeNs) {
           throw new Error("Re-encryption Desktop WAL slot changed during read.")
         }
         if (opened.size > BigInt(MAX_SLOT_BYTES)) throw new Error("Re-encryption Desktop WAL slot exceeds size limit.")
@@ -391,6 +426,23 @@ export async function acquireV4DesktopRekeyWalStorage(options: {
           chunks.push(chunk.subarray(0, bytesRead))
         }
         if (count > MAX_SLOT_BYTES) throw new Error("Re-encryption Desktop WAL slot exceeds size limit.")
+        // A foreign process can overwrite the same inode after the initial
+        // descriptor/path check. Detect late size, inode or timestamp changes
+        // before returning any bytes to the authenticated WAL reader.
+        const afterRead = await handle.stat({ bigint: true })
+        const pathAfterRead = await fs.lstat(filename, { bigint: true })
+        if (!afterRead.isFile() || !pathAfterRead.isFile()
+          || pathAfterRead.isSymbolicLink()
+          || afterRead.nlink !== BigInt(1) || pathAfterRead.nlink !== BigInt(1)
+          || afterRead.dev !== opened.dev || afterRead.ino !== opened.ino
+          || pathAfterRead.dev !== opened.dev || pathAfterRead.ino !== opened.ino
+          || afterRead.size !== opened.size || pathAfterRead.size !== opened.size
+          || BigInt(count) !== opened.size
+          || afterRead.mtimeNs !== opened.mtimeNs || afterRead.ctimeNs !== opened.ctimeNs
+          || pathAfterRead.mtimeNs !== opened.mtimeNs
+          || pathAfterRead.ctimeNs !== opened.ctimeNs) {
+          throw new Error("Re-encryption Desktop WAL slot changed during read.")
+        }
         return Buffer.concat(chunks, count).toString("utf8")
       } finally {
         await handle.close()
@@ -410,22 +462,53 @@ export async function acquireV4DesktopRekeyWalStorage(options: {
       await safeFile(target)
       const temporary = path.join(directory, ".slot-" + toBase64Url(randomBytes(18)) + ".tmp")
       let handle: Awaited<ReturnType<typeof fs.open>> | undefined
+      let temporaryIdentity: import("node:fs").BigIntStats | undefined
+      const stillOwnTemporary = async (): Promise<boolean> => {
+        if (!temporaryIdentity) return false
+        let current: import("node:fs").BigIntStats
+        try { current = await fs.lstat(temporary, { bigint: true }) }
+        catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "ENOENT") return false
+          throw error
+        }
+        return current.isFile() && !current.isSymbolicLink()
+          && current.nlink === BigInt(1) && current.ino !== BigInt(0)
+          && current.dev === temporaryIdentity.dev && current.ino === temporaryIdentity.ino
+          && current.size === temporaryIdentity.size
+          && current.mtimeNs === temporaryIdentity.mtimeNs
+          && current.ctimeNs === temporaryIdentity.ctimeNs
+      }
       try {
         handle = await fs.open(temporary, "wx", 0o600)
+        temporaryIdentity = await handle.stat({ bigint: true })
+        if (!temporaryIdentity.isFile() || temporaryIdentity.nlink !== BigInt(1)
+          || temporaryIdentity.ino === BigInt(0)) {
+          throw new Error("Re-encryption Desktop WAL temporary slot identity unavailable.")
+        }
         await handle.writeFile(text, "utf8")
         await handle.sync() // file data + inode flushed before atomic rename
+        temporaryIdentity = await handle.stat({ bigint: true })
+        if (!temporaryIdentity.isFile() || temporaryIdentity.nlink !== BigInt(1)
+          || temporaryIdentity.ino === BigInt(0)
+          || temporaryIdentity.size !== BigInt(Buffer.byteLength(text, "utf8"))) {
+          throw new Error("Re-encryption Desktop WAL temporary slot changed.")
+        }
         await handle.close()
         handle = undefined
         await assertHeld()
         await safeFile(target) // reject late symlink before rename
+        // A foreign rename/replacement must not overwrite a valid WAL slot.
+        // This is best-effort pathname verification, not atomic OS fencing.
+        if (!(await stillOwnTemporary())) {
+          throw new Error("Re-encryption Desktop WAL temporary slot changed before rename.")
+        }
         await fs.rename(temporary, target) // never unlink the prior valid slot
         await syncDirectory()
       } finally {
         await handle?.close()
-        try { await fs.unlink(temporary) }
-        catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
-        }
+        // Another process may have replaced our random temporary pathname.
+        // Preserve its file and the interrupted-WAL evidence for manual recovery.
+        if (await stillOwnTemporary()) await fs.unlink(temporary)
       }
     },
   })
@@ -443,6 +526,7 @@ export async function acquireV4DesktopRekeyWalStorage(options: {
         throw new V4DesktopRekeyWalLockError("Re-encryption Desktop WAL already has an active writer.")
       }
       writing = true
+      writeEpoch++
       // A previously fsynced generation cannot certify a newly begun write.
       directorySyncProof.invalidate()
       try { await withLiveLease(() => rawAdapter.write(logical, value)) }
@@ -461,9 +545,10 @@ export async function acquireV4DesktopRekeyWalStorage(options: {
       directorySyncProof.assertConfirmed()
     }),
     assertBestEffortCheckpoint: () => withLiveLease(async () => {
+      const expectedWriteEpoch = writeEpoch
       await assertHeld()
-      if (writing) {
-        throw new Error("Re-encryption Desktop WAL has an active write; retry after it settles.")
+      if (writing || writeEpoch !== expectedWriteEpoch) {
+        throw new Error("Re-encryption Desktop WAL changed during best-effort checkpoint readback.")
       }
       const entries = await fs.readdir(directory)
       if (entries.some(entry => ![".exclusive.lock", "slot-0.json", "slot-1.json"].includes(entry))) {
@@ -485,7 +570,7 @@ export async function acquireV4DesktopRekeyWalStorage(options: {
         }
       }
       await assertHeld()
-      if (writing) {
+      if (writing || writeEpoch !== expectedWriteEpoch) {
         throw new Error("Re-encryption Desktop WAL changed during recovery checkpoint readback.")
       }
       return "best-effort-readback-only" as const
@@ -501,6 +586,19 @@ export async function acquireV4DesktopRekeyWalStorage(options: {
       try {
         await drainActiveOperations()
         await assertHeld()
+        // A foreign process can replace the pathname after the token check.
+        // Check against our pinned descriptor immediately before unlink.
+        const held = await lockHandle.stat({ bigint: true })
+        let current: import("node:fs").BigIntStats
+        try { current = await fs.lstat(lockPath, { bigint: true }) }
+        catch { throw new V4DesktopRekeyWalLockError() }
+        if (!held.isFile() || held.nlink !== BigInt(1)
+          || held.ino === BigInt(0) || !current.isFile()
+          || current.isSymbolicLink() || current.nlink !== BigInt(1)
+          || current.size !== BigInt(token.length)
+          || current.dev !== held.dev || current.ino !== held.ino) {
+          throw new V4DesktopRekeyWalLockError()
+        }
         await fs.unlink(lockPath)
         closed = true
         try { await syncDirectory() } finally { await lockHandle.close() }

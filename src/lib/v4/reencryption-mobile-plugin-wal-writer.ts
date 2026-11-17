@@ -1,12 +1,10 @@
 import { utf8ToBytes } from "../bytes"
 import type { V4LocalIndexAdapter } from "./local-index"
 import { createV4PersistedWalFenceAssertion } from "./reencryption-persisted-wal-fence"
+import { tryReserveV4MobileWalAdapter } from "./reencryption-mobile-recovery-reservation"
 import { planV4PluginPrivateWalLocation } from "./reencryption-plugin-wal-location"
 
 const MAX_SLOT_BYTES = 2 * 1024 * 1024
-
-/** Only a local, per-Adapter cooperating writer guard. NOT an OS/file lock. */
-const activeAdapters = new WeakSet<object>()
 
 interface MobileStat {
   readonly type: "file" | "folder"
@@ -75,8 +73,10 @@ export async function openV4NewMobilePluginWalWriter(
     || typeof assertExclusiveInitiatorLease !== "function"
     || typeof assertSyncFenceArmed !== "function") manual()
 
-  if (activeAdapters.has(adapter)) manual()
-  activeAdapters.add(adapter)
+  // Recovery diagnostics and WAL writers must not concurrently read/mutate
+  // the same Adapter. Only a cooperative in-process reservation, never an OS lock.
+  const releaseWalReservation = tryReserveV4MobileWalAdapter(adapter)
+  if (!releaseWalReservation) manual()
   try {
     const methods = {
       stat: adapter.stat, list: adapter.list, read: adapter.read,
@@ -129,7 +129,9 @@ export async function openV4NewMobilePluginWalWriter(
     }
     const dir = async (name: string) => {
       const info = await stat(name)
-      if (info?.type !== "folder") manual()
+      if (!info || info.type !== "folder"
+        || !Number.isSafeInteger(info.size) || info.size < 0
+        || !Number.isFinite(info.mtime) || info.mtime < 0) manual()
     }
     const list = async () => {
       owner()
@@ -144,17 +146,22 @@ export async function openV4NewMobilePluginWalWriter(
       const before = await stat(name)
       if (!before || before.type !== "file"
         || !Number.isSafeInteger(before.size) || before.size < 0
-        || before.size > MAX_SLOT_BYTES || !Number.isFinite(before.mtime)) manual()
+        || before.size > MAX_SLOT_BYTES
+        || !Number.isFinite(before.mtime) || before.mtime < 0) manual()
+      // An Obsidian Adapter may reuse and mutate the same stat object on the
+      // next call. Pin primitive metadata before any awaited read.
+      const pinnedSize = before.size
+      const pinnedMtime = before.mtime
       owner()
       const first = await methods.read.call(adapter, name)
       owner()
       if (typeof first !== "string" || first !== expectedText
-        || utf8ToBytes(first).length !== before.size) manual()
+        || utf8ToBytes(first).length !== pinnedSize) manual()
       const second = await methods.read.call(adapter, name)
       owner()
       const after = await stat(name)
       if (second !== first || after?.type !== "file"
-        || after.size !== before.size || after.mtime !== before.mtime) manual()
+        || after.size !== pinnedSize || after.mtime !== pinnedMtime) manual()
       return first
     }
     const inventory = async () => {
@@ -241,10 +248,13 @@ export async function openV4NewMobilePluginWalWriter(
       assertBestEffortCheckpoint: () => checked(
         async () => "best-effort-double-read-only" as const, false),
       release: () => {
-        if (mutationActive) manual()
+        // Keep the cooperative reservation until every in-flight adapter
+        // operation settles. Releasing during an awaited read previously let
+        // a second holder enter while the first was still touching the WAL.
+        if (mutationActive || activeReaders > 0) manual()
         if (!released) {
           released = true
-          activeAdapters.delete(adapter)
+          releaseWalReservation()
         }
       },
       cooperativeOsLeaseProven: false as const,
@@ -254,7 +264,7 @@ export async function openV4NewMobilePluginWalWriter(
       cutoverAuthorized: false as const,
     })
   } catch (error) {
-    activeAdapters.delete(adapter)
+    releaseWalReservation()
     throw error
   }
 }

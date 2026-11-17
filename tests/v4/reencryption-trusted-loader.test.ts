@@ -9,14 +9,20 @@ import { deriveV4Keyring } from "../../src/lib/v4/crypto";
 import { buildV4RemoteMetadata } from "../../src/lib/v4/remote-index";
 import type { V4RemoteConfig, V4RemoteHead } from "../../src/lib/v4/protocol-types";
 import { V4StorageCodec } from "../../src/lib/v4/storage-codec";
-import { verifyGitHubReencryptionSource, verifyGitHubReencryptionForkSource, verifyGitHubFrozenReencryptionBackup } from "../../src/lib/v4/reencryption-trusted-loader";
+import { verifyGitHubReencryptionSource, verifyGitHubReencryptionForkSource, verifyGitHubReencryptionForkSourceWithParityInventory, verifyGitHubReencryptionForkSourceWithTranscodeInventory, verifyGitHubFrozenReencryptionBackup } from "../../src/lib/v4/reencryption-trusted-loader";
+import { verifyV4ReencryptionInitiatorLocalParity } from "../../src/lib/v4/reencryption-initiator-parity"
+import { inspectV4MobileReencryptionFileSizePreflight } from "../../src/lib/v4/reencryption-mobile-initiator-reader";
+import { planV4OrphanReencryptionDestination } from "../../src/lib/v4/reencryption-orphan-branch";
+import { createV4ReencryptedObjectStream } from "../../src/lib/v4/reencryption-stream-transcode";
+import { stageV4ReencryptionVaultObjects } from "../../src/lib/v4/reencryption-staging-receipts";
+import { readImmutableGitFile } from "../../src/lib/v4/immutable-git-read";
 import { proposeV4SameRepositoryReencryptionBackupBranch } from "../../src/lib/v4/reencryption-owner-decisions";
 import { inspectV4FencedFrozenBackupContentAfterRestart } from "../../src/lib/v4/reencryption-fenced-backup-content";
 import { V4_REENCRYPTION_SYNC_FENCE_ROOT } from "../../src/lib/v4/reencryption-sync-fence";
 import type { V4ReencryptionProposedCommitIdentity } from "../../src/lib/v4/reencryption-proposed-commit-receipt";
 import { inspectV4FrozenBackupAfterAmbiguousCreate } from "../../src/lib/v4/reencryption-backup-reconcile";
 import { createAndVerifyV4FrozenBackupRef } from "../../src/lib/v4/reencryption-backup-create-verified";
-import { createV4JournaledFrozenBackup, createV4BestEffortJournaledFrozenBackup, reconcileV4PendingFrozenBackupWithJournal, reconcileV4PendingFrozenBackupWithJournalBestEffort } from "../../src/lib/v4/reencryption-ref-journal-coordinator";
+import { createV4JournaledFrozenBackup, createV4BestEffortJournaledFrozenBackup, reconcileV4PendingFrozenBackupWithJournal, reconcileV4PendingFrozenBackupWithJournalBestEffort, stageV4BestEffortJournaledThreeBranchVault } from "../../src/lib/v4/reencryption-ref-journal-coordinator";
 import { acquireV4DesktopRekeyWalStorage } from "../../src/lib/v4/reencryption-desktop-wal";
 import { createV4ReencryptionRecoveryJournal } from "../../src/lib/v4/reencryption-recovery-journal";
 import type { V4LocalIndexAdapter } from "../../src/lib/v4/local-index";
@@ -30,7 +36,7 @@ const managedTreeSha = "c".repeat(40);
 const validBranch = "main";
 const repoId = "owner/repo#main";
 
-async function createFixture() {
+async function createFixture(includeChunkedFile = false) {
   const config: V4RemoteConfig = {
     formatVersion: 4, mode: "encrypted", repoId, pathLayout: "opaque-stable-v1",
     algorithm: "AES-GCM", kdf: "PBKDF2-SHA-256",
@@ -39,16 +45,39 @@ async function createFixture() {
   const keyring = await deriveV4Keyring({ passphrase: "correct", repoId, salt: enc("salt"), iterations: 10 });
   const codec = new V4StorageCodec({ mode: "encrypted", pathLayout: "opaque-stable-v1", keyring });
   const file = await codec.prepare("Unicode/秘密 🪄.md", enc("File content secret"), "v1", 123, "file-1");
-  const record = { ...file.record, path: "Unicode/秘密 🪄.md" };
-  const hash = await sha256Hex(enc(JSON.stringify([record])));
+  const writes = [{ path: "Unicode/秘密 🪄.md", write: file }];
+  if (includeChunkedFile) {
+    writes.push({
+      path: "attachments/chunked.bin",
+      write: await codec.prepare("attachments/chunked.bin",
+        new Uint8Array(8 * 1024 * 1024 + 31).fill(0x31), "v2", 456, "file-2"),
+    });
+  }
+  const records = writes.map(item => ({ ...item.write.record, path: item.path }));
+  const buckets = new Map<string, typeof records>();
+  for (const record of records) {
+    const bucket = record.pathId.slice(0, 2);
+    const items = buckets.get(bucket) ?? [];
+    items.push(record);
+    buckets.set(bucket, items);
+  }
+  const shardHashes: Record<string, string> = Object.create(null) as Record<string, string>;
+  for (const [bucket, items] of buckets) {
+    shardHashes[bucket] = await sha256Hex(enc(JSON.stringify(
+      [...items].sort((a, b) => a.pathId.localeCompare(b.pathId)),
+    )));
+  }
   const head: V4RemoteHead = {
     formatVersion: 4, mode: "encrypted", epoch: 1, generation: 1,
-    journalId: "j", shardHashes: { [record.pathId.slice(0, 2)]: hash },
-    updatedAt: 1, deviceId: "device",
+    journalId: "j", shardHashes, updatedAt: 1, deviceId: "device",
   };
-  const prepared = await buildV4RemoteMetadata({ config, head, records: [record], keyring });
+  const prepared = await buildV4RemoteMetadata({ config, head, records, keyring });
   const files = new Map(prepared.map(f => [f.path, { bytes: f.bytes, sha: gitBlobSha(f.bytes) }]));
-  for (const object of file.files) files.set(object.path, { bytes: object.bytes, sha: gitBlobSha(object.bytes) });
+  for (const item of writes) {
+    for (const object of item.write.files) {
+      files.set(object.path, { bytes: object.bytes, sha: gitBlobSha(object.bytes) });
+    }
+  }
   const trees = new Map<string, { sha: string; truncated: false; tree: Array<{ path: string; type: "tree" | "blob"; mode: "040000" | "100644"; sha: string }> }>();
   const treeIds = new Map<string, string>([["", rootTreeSha]]);
   let nextTree = 0;
@@ -332,6 +361,308 @@ test("D95 authenticated fork source pins initial immutable commit while other de
   assert.equal(malicious.blobReads, 0)
 })
 
+test("D340 authenticated fork source supplies minimal immutable records for local parity without publication authority", async () => {
+  const f = await createFixture()
+  f.onBlobRead(() => f.setCurrentSha("d".repeat(40)))
+  const result = await verifyGitHubReencryptionForkSourceWithParityInventory({
+    github: f.github, expectedRepoId: repoId, expectedBranch: "main",
+    passphrase: "correct",
+  })
+  assert.equal(result.pinnedSourceCommitSha, commitSha)
+  assert.equal(result.verifiedSource.integrityScope, "all-live-objects")
+  assert.equal(result.verifiedSource.verifiedFileCount, 1)
+  assert.equal(result.sourceRecords.length, 1)
+  assert.deepEqual(Object.keys(result.sourceRecords[0]!).sort(), [
+    "deleted", "path", "plaintextSha256", "size",
+  ])
+  assert.equal(result.sourceRecords[0]!.deleted, false)
+  assert.equal(result.sourceRecords[0]!.path, "Unicode/秘密 🪄.md")
+  assert.equal(result.sourceRecords[0]!.size, enc("File content secret").byteLength)
+  assert.match(result.sourceRecords[0]!.plaintextSha256, /^[0-9a-f]{64}$/u)
+  assert.equal(Object.isFrozen(result.sourceRecords), true)
+  assert.equal(Object.isFrozen(result.sourceRecords[0]), true)
+  assert.equal(result.initiatorLocalParityVerified, false)
+  assert.equal(result.permissionToPublish, false)
+  assert.equal(result.cutoverAuthorized, false)
+  assert.equal(f.refReads, 1, "fork verification reads one pinned HEAD, not mutable re-fetches")
+  assert.equal(f.repoReads, 2)
+  assert.ok(f.blobReads > 0, "every authenticated ciphertext blob must be verified")
+  assert.equal(JSON.stringify(result).includes("File content secret"), false,
+    "the record handoff must not contain decrypted plaintext")
+  assert.equal(JSON.stringify(result).includes("correct"), false,
+    "the handoff must not expose the old passphrase")
+
+  let leaseChecks = 0
+  let physicalOpens = 0
+  const localBytes = enc("File content secret")
+  const localParity = await verifyV4ReencryptionInitiatorLocalParity({
+    pinnedSourceCommitSha: result.pinnedSourceCommitSha,
+    verifiedSource: result.verifiedSource,
+    sourceRecords: result.sourceRecords,
+    reader: {
+      async listFiles() {
+        return [{ path: "Unicode/秘密 🪄.md", size: localBytes.byteLength, mtime: 123 }]
+      },
+      async openFile(path) {
+        assert.equal(path, "Unicode/秘密 🪄.md")
+        physicalOpens++
+        return { size: localBytes.byteLength, async *chunks() { yield localBytes.slice() } }
+      },
+      async listOpenEditorPaths() { return [] },
+      async assertIdleAndNoPendingEdits() {},
+      async assertSourceConfigurationUnchanged() {},
+      async assertExclusiveInitiatorLease() { leaseChecks++ },
+    },
+  })
+  assert.equal(localParity.allFilesContentVerified, true)
+  assert.equal(localParity.checkedFileCount, 1)
+  assert.equal(localParity.checkedPlaintextBytes, String(localBytes.byteLength))
+  assert.equal(localParity.initiatorLocalCutoverAuthorized, false)
+  assert.equal(physicalOpens, 2, "local parity must hash each file twice")
+  assert.ok(leaseChecks > 2, "local parity must repeatedly check a live lease")
+
+  const wrong = await createFixture()
+  await assert.rejects(() => verifyGitHubReencryptionForkSourceWithParityInventory({
+    github: wrong.github, expectedRepoId: repoId, expectedBranch: "main",
+    passphrase: "incorrect",
+  }), /decrypt|passphrase|auth/i)
+})
+
+test("D364 cryptographically authenticated pinned GitHub Source inventory feeds Mobile metadata-only eligibility", async () => {
+  const fixture = await createFixture()
+  const source = await verifyGitHubReencryptionForkSourceWithParityInventory({
+    github: fixture.github, expectedRepoId: repoId, expectedBranch: "main", passphrase: "correct",
+  })
+  let contentReads = 0
+  let localExists = true
+  const scopedPath = "Unicode/秘密 🪄.md"
+  const adapter = {
+    async list(path: string) {
+      if (path === "/") return { files: [], folders: ["Unicode"] }
+      if (path === "Unicode") return { files: localExists ? [scopedPath] : [], folders: [] }
+      throw Error("unexpected physical directory probe")
+    },
+    async stat(path: string) {
+      if (path === "Unicode") return { type: "folder" as const, size: 0, mtime: 10 }
+      if (path === scopedPath && localExists) {
+        return { type: "file" as const, size: enc("File content secret").byteLength, mtime: 11 }
+      }
+      return null
+    },
+    async readBinary() { contentReads++; throw Error("eligibility must never read local plaintext") },
+  }
+  const input = {
+    adapter,
+    scope: {
+      configDir: ".obsidian", pluginId: "D364",
+      ignorePathRegex: "", syncObsidianConfig: false,
+      syncBookmarks: false, syncPlugins: false,
+    },
+    expectedSourceFiles: source.sourceRecords,
+    assertPreviewStable: async () => {},
+  }
+  assert.equal((await inspectV4MobileReencryptionFileSizePreflight(input)).checkedFileCount, 1)
+  assert.equal(contentReads, 0)
+  localExists = false
+  await assert.rejects(() => inspectV4MobileReencryptionFileSizePreflight(input),
+    /physical Vault inventory differs from authenticated GitHub Source/i)
+  assert.equal(contentReads, 0)
+  assert.equal(source.permissionToPublish, false)
+  assert.equal(source.cutoverAuthorized, false)
+})
+
+test("D346 authenticated Source metadata feeds real streaming re-encryption without granting publication", async () => {
+  const f = await createFixture()
+  f.onBlobRead(() => f.setCurrentSha("d".repeat(40)))
+  const snapshot = await verifyGitHubReencryptionForkSourceWithTranscodeInventory({
+    github: f.github, expectedRepoId: repoId, expectedBranch: "main", passphrase: "correct",
+  })
+  assert.equal(snapshot.pinnedSourceCommitSha, commitSha)
+  assert.equal(snapshot.verifiedSource.verifiedFileCount, 1)
+  assert.equal(snapshot.sourceRecords.length, 1)
+  const sourceRecord = snapshot.sourceRecords[0]!
+  for (const key of ["fileId", "pathId", "storage", "remotePath", "remoteVersion", "plaintextSha256"]) {
+    assert.ok(Object.hasOwn(sourceRecord, key), "transcoding needs authenticated " + key)
+  }
+  assert.equal(Object.isFrozen(snapshot), true)
+  assert.equal(Object.isFrozen(snapshot.sourceRecords), true)
+  assert.equal(Object.isFrozen(sourceRecord), true)
+  assert.equal(snapshot.initiatorLocalParityVerified, false)
+  assert.equal(snapshot.permissionToPublish, false)
+  assert.equal(snapshot.cutoverAuthorized, false)
+  assert.equal(JSON.stringify(snapshot).includes("File content secret"), false)
+  assert.equal(JSON.stringify(snapshot).includes("correct"), false)
+
+  const destinationRepoId = "owner/repo#rekey/d346"
+  const destinationSalt = enc("D346-independent-destination-salt")
+  const destinationConfig: V4RemoteConfig = {
+    ...f.config, repoId: destinationRepoId,
+    kdfParams: { salt: toBase64Url(destinationSalt), iterations: 600_000 },
+  }
+  const destinationKey = await deriveV4Keyring({
+    passphrase: "different-new-secret", repoId: destinationRepoId,
+    salt: destinationSalt, iterations: 600_000,
+  })
+  const newCodec = new V4StorageCodec({
+    mode: "encrypted", pathLayout: "opaque-stable-v1", keyring: destinationKey,
+  })
+  const plan = planV4OrphanReencryptionDestination({
+    sourceRepoId: repoId, destinationRepoId, sourceCommitSha: commitSha,
+    sourcePhysicalRepositoryId: 1284153873, destinationPhysicalRepositoryId: 1284153873,
+    expectedPhysicalRepositoryId: 1284153873, defaultBranch: "main",
+  })
+  let immutableReads = 0
+  const prepared = await createV4ReencryptedObjectStream({
+    plan, sourceConfig: f.config, destinationConfig,
+    sourceKeyring: f.keyring, destinationKeyring: destinationKey, sourceRecord,
+    async readSourceObject(path, sha) {
+      assert.equal(sha, snapshot.pinnedSourceCommitSha)
+      immutableReads++
+      const found = await readImmutableGitFile(path, sha, {
+        getCommit: commit => f.github.getGitCommit(commit),
+        getTree: tree => f.github.getTreeAt(tree, false),
+        getBlob: blob => f.github.getBlob(blob),
+      })
+      return found?.bytes ?? null
+    },
+    async verifySourceStillPinned() {
+      assert.equal(snapshot.pinnedSourceCommitSha, commitSha)
+    },
+  })
+  const encoded = new Map<string, Uint8Array>()
+  for await (const object of prepared.objects()) {
+    assert.equal(encoded.has(object.path), false)
+    encoded.set(object.path, object.bytes)
+    object.release?.()
+  }
+  const next = await prepared.finalize()
+  assert.equal(immutableReads > 0, true)
+  assert.equal(next.plaintextSha256, sourceRecord.plaintextSha256)
+  assert.equal(next.fileId === sourceRecord.fileId, false)
+  assert.equal(next.pathId === sourceRecord.pathId, false)
+  assert.equal(next.remotePath === sourceRecord.remotePath, false)
+  assert.deepEqual(await newCodec.read(next, async path => {
+    const ciphertext = encoded.get(path)
+    assert.ok(ciphertext)
+    return ciphertext
+  }), enc("File content secret"))
+  assert.equal(snapshot.permissionToPublish, false,
+    "successful object-level transcode does not authorize a Git commit/ref or local cutover")
+})
+
+test("D346 authenticated transcode inventory refuses wrong old passphrase before producing records", async () => {
+  const f = await createFixture()
+  await assert.rejects(() => verifyGitHubReencryptionForkSourceWithTranscodeInventory({
+    github: f.github, expectedRepoId: repoId, expectedBranch: "main",
+    passphrase: "incorrect",
+  }), /decrypt|passphrase|auth|integrity/i)
+})
+
+test("D347 fully authenticated fork snapshot stages the entire destination via existing pipeline without refs", async () => {
+  const f = await createFixture(true)
+  // Other old-branch devices may advance HEAD; the new destination stays bound
+  // to exactly the first authenticated commit, including its HEAD/shards.
+  f.onBlobRead(() => f.setCurrentSha("d".repeat(40)))
+  const source = await verifyGitHubReencryptionForkSourceWithTranscodeInventory({
+    github: f.github, expectedRepoId: repoId, expectedBranch: "main", passphrase: "correct",
+  })
+  assert.equal(source.pinnedSourceCommitSha, commitSha)
+  assert.equal(source.sourceRecords.length, 2, "full Source includes single and chunked files")
+  const chunked = source.sourceRecords.find(record => record.path === "attachments/chunked.bin")
+  assert.equal(chunked?.storage, "chunked")
+  assert.equal(Object.isFrozen(chunked?.partPaths), true)
+  assert.throws(() => chunked!.partPaths!.push("forged-part"),
+    TypeError, "authenticated multipart paths must remain immutable")
+  assert.equal(source.sourceConfig.repoId, repoId)
+  assert.equal(source.sourceHead.formatVersion, 4)
+  assert.ok(Object.keys(source.sourceShards).length > 0)
+  assert.equal(Object.isFrozen(source.sourceConfig), true)
+  assert.equal(Object.isFrozen(source.sourceConfig.kdfParams), true)
+  assert.equal(Object.isFrozen(source.sourceHead), true)
+  assert.equal(Object.isFrozen(source.sourceHead.shardHashes), true)
+  assert.equal(Object.isFrozen(source.sourceShards), true)
+  const shard = Object.values(source.sourceShards)[0]!
+  assert.equal(Object.isFrozen(shard), true)
+  assert.equal(Object.isFrozen(shard.records), true)
+  assert.strictEqual(Object.values(shard.records)[0], source.sourceRecords[0],
+    "full-Vault staging must share the frozen authenticated records, not make a mutable second copy")
+  assert.equal(f.refReads, 1, "source proof must pin exactly one immutable commit")
+
+  const destRepoId = "owner/repo#rekey/d347"
+  const salt = enc("D347-fresh-destination-salt")
+  const destinationConfig: V4RemoteConfig = {
+    ...f.config,
+    repoId: destRepoId,
+    kdfParams: { salt: toBase64Url(salt), iterations: 600_000 },
+  }
+  const destinationKey = await deriveV4Keyring({
+    passphrase: "another-synthetic-new-key", repoId: destRepoId, salt, iterations: 600_000,
+  })
+  const plan = planV4OrphanReencryptionDestination({
+    sourceRepoId: repoId, destinationRepoId: destRepoId, sourceCommitSha: commitSha,
+    sourcePhysicalRepositoryId: 1284153873, destinationPhysicalRepositoryId: 1284153873,
+    expectedPhysicalRepositoryId: 1284153873, defaultBranch: "main",
+  })
+  const stagedBytes = new Map<string, Uint8Array>()
+  let reads = 0
+  const staged = await stageV4ReencryptionVaultObjects({
+    plan,
+    sourceConfig: source.sourceConfig,
+    sourceHead: source.sourceHead,
+    sourceShards: source.sourceShards,
+    sourceKeyring: f.keyring,
+    destinationConfig,
+    destinationKeyring: destinationKey,
+    async readSourceObject(path, pinnedSha) {
+      assert.equal(pinnedSha, commitSha)
+      reads++
+      const found = await readImmutableGitFile(path, pinnedSha, {
+        getCommit: sha => f.github.getGitCommit(sha),
+        getTree: sha => f.github.getTreeAt(sha, false),
+        getBlob: sha => f.github.getBlob(sha),
+      })
+      return found?.bytes ?? null
+    },
+    async verifySourceStillPinned() {
+      assert.equal(source.pinnedSourceCommitSha, commitSha)
+    },
+    async stageImmutableObject(path, bytes) {
+      assert.equal(stagedBytes.has(path), false)
+      stagedBytes.set(path, Uint8Array.from(bytes))
+      return gitBlobSha(bytes)
+    },
+  })
+  assert.ok(reads > 0)
+  assert.equal(staged.preview.integrityScope, "staged-immutable-blobs-only")
+  assert.equal(staged.preview.finalizedFileCount, source.verifiedSource.verifiedFileCount)
+  assert.equal(staged.preview.totalPlaintextBytes, source.verifiedSource.totalVerifiedPlaintextBytes)
+  assert.equal(staged.preview.validatedReceiptCount, stagedBytes.size)
+  assert.equal(staged.preview.permissionToPublish, false)
+  assert.equal(staged.preview.cutoverAuthorized, false)
+  assert.equal(staged.records.length, source.sourceRecords.length)
+  const newCodec = new V4StorageCodec({
+    mode: "encrypted", pathLayout: "opaque-stable-v1", keyring: destinationKey,
+  })
+  for (const record of staged.records) {
+    const old = source.sourceRecords.find(item => item.path === record.path)!
+    assert.notEqual(record.fileId, old.fileId)
+    assert.notEqual(record.pathId, old.pathId)
+    assert.equal(record.plaintextSha256, old.plaintextSha256)
+    const plaintext = await newCodec.read(record, async path => {
+      const bytes = stagedBytes.get(path)
+      assert.ok(bytes)
+      return bytes
+    })
+    const expected = record.path === "attachments/chunked.bin"
+      ? new Uint8Array(8 * 1024 * 1024 + 31).fill(0x31)
+      : enc("File content secret")
+    assert.deepEqual(plaintext, expected)
+  }
+  assert.equal(staged.records.filter(record => record.storage === "chunked").length, 1)
+  assert.equal(stagedBytes.size, 3, "one encrypted single object and two bounded encrypted parts")
+  assert.equal(f.refReads, 1, "no mutable HEAD reads, commits or refs are written by this staging test")
+})
+
 test("D70 source proof aborts before any Git read on cancellation", async () => {
   const f = await createFixture();
   const controller = new AbortController();
@@ -375,6 +706,414 @@ function frozenBackupClient(f: GitFixture) {
     },
   }
 }
+
+test("D350 real best-effort WAL creates verified Backup before full-Vault staging, exactly once", async () => {
+  const f = await D99BackupFixture(true)
+  const source = await verifyGitHubReencryptionForkSourceWithTranscodeInventory({
+    github: f.f.github, expectedRepoId: repoId, expectedBranch: "main", passphrase: "correct",
+  })
+  assert.equal(source.verifiedSource.verifiedFileCount, 2)
+  const parent = join(process.cwd(), ".tmp")
+  await mkdir(parent, { recursive: true })
+  const root = await mkdtemp(join(parent, "d350-backup-then-stage-"))
+  const wal = await acquireV4DesktopRekeyWalStorage({
+    rootAbsolute: root, journalRoot: "rekey/wal",
+  })
+  try {
+    const journal = createV4ReencryptionRecoveryJournal({
+      adapter: wal.adapter, root: "rekey/wal",
+      sourceCommitSha: source.pinnedSourceCommitSha,
+      destinationRepoId: frozenPlan.destinationRepoId,
+      runId: "d350-backup-and-staging", journalKey: new Uint8Array(32).fill(0x53),
+    })
+    await journal.begin()
+    let backupIntentObservedBeforeCreate = false
+    const originalCreate = f.input.backup.createGitRef
+    f.input.backup.createGitRef = async sha => {
+      const pending = await journal.load()
+      backupIntentObservedBeforeCreate = pending?.pendingRefIntents.length === 1
+        && pending.pendingRefIntents[0]?.role === "backup"
+        && pending.pendingRefIntents[0]?.repoId === frozenPlan.backupRepoId
+        && pending.pendingRefIntents[0]?.commitSha === source.pinnedSourceCommitSha
+        && pending.pendingRefIntents[0]?.treeSha === rootTreeSha
+        && pending?.cutoverAuthorized === false
+      assert.equal(backupIntentObservedBeforeCreate, true,
+        "the Backup create-only request must see its own exact authenticated WAL intent")
+      return originalCreate(sha)
+    }
+    const acknowledgement = "accept-best-effort-power-loss-recovery-risk" as const
+    const backup = await createV4BestEffortJournaledFrozenBackup({
+      ...f.input, journal, wal, acknowledgement,
+    })
+    assert.equal(backupIntentObservedBeforeCreate, true)
+    assert.equal(backup.backupContentsReadbackVerified, true)
+    assert.equal(backup.verifiedFileCount, 2)
+    assert.equal(backup.verifiedPlaintextBytes, source.verifiedSource.totalVerifiedPlaintextBytes)
+    assert.equal(backup.initiatingDeviceCutoverAuthorized, false)
+    assert.equal(f.createAttempts, 1, "create the real mock Backup ref exactly once")
+    const afterBackup = await journal.load()
+    assert.ok(afterBackup)
+    assert.equal(afterBackup.pendingRefIntents.length, 0)
+    assert.equal(afterBackup.verifiedRefObservations.length, 1)
+    const backupRef = afterBackup.verifiedRefObservations[0]!
+    assert.equal(backupRef.role, "backup")
+    assert.equal(backupRef.commitSha, source.pinnedSourceCommitSha)
+    assert.equal(backupRef.treeSha, rootTreeSha)
+    assert.equal(afterBackup.permissionToPublish, false)
+    assert.equal(afterBackup.cutoverAuthorized, false)
+
+    // A second device can advance the old source independently. The staging
+    // reader must keep using the authenticated pinned commit, not live HEAD.
+    f.f.setCurrentSha("d".repeat(40))
+    const salt = enc("d350-synthetic-destination-salt")
+    const destRepoId = frozenPlan.destinationRepoId
+    const destinationConfig: V4RemoteConfig = {
+      ...source.sourceConfig, repoId: destRepoId,
+      kdfParams: { salt: toBase64Url(salt), iterations: 600_000 },
+    }
+    const destinationKeyring = await deriveV4Keyring({
+      passphrase: "d350-new-test-only-secret",
+      repoId: destRepoId, salt, iterations: 600_000,
+    })
+    const codec = new V4StorageCodec({
+      mode: "encrypted", pathLayout: "opaque-stable-v1", keyring: destinationKeyring,
+    })
+    const plan = planV4OrphanReencryptionDestination({
+      sourceRepoId: repoId, destinationRepoId: destRepoId,
+      sourceCommitSha: source.pinnedSourceCommitSha,
+      sourcePhysicalRepositoryId: 1284153873,
+      destinationPhysicalRepositoryId: 1284153873,
+      expectedPhysicalRepositoryId: 1284153873, defaultBranch: "main",
+    })
+    const stagedBytes = new Map<string, Uint8Array>()
+    let stageWrites = 0
+    const stagingInput = {
+      plan, journal, wal, acknowledgement,
+      beginAfterVerifiedBackup: {
+        expectedJournalGeneration: afterBackup.generation, backupRef,
+      },
+      sourceConfig: source.sourceConfig,
+      sourceHead: source.sourceHead,
+      sourceShards: source.sourceShards,
+      sourceKeyring: f.f.keyring,
+      destinationConfig, destinationKeyring,
+      async readSourceObject(path: string, sha: string) {
+        assert.equal(sha, source.pinnedSourceCommitSha)
+        const found = await readImmutableGitFile(path, sha, {
+          getCommit: commit => f.f.github.getGitCommit(commit),
+          getTree: tree => f.f.github.getTreeAt(tree, false),
+          getBlob: blob => f.f.github.getBlob(blob),
+        })
+        return found?.bytes ?? null
+      },
+      async verifySourceStillPinned() {
+        assert.equal(source.pinnedSourceCommitSha, plan.pinnedSourceCommitSha)
+      },
+      async stageImmutableObject(path: string, bytes: Uint8Array) {
+        stageWrites++
+        const pending = await journal.load()
+        assert.equal(pending?.pendingIntents.length, 1)
+        assert.equal(pending.pendingIntents[0]?.path, path)
+        assert.equal(pending.pendingIntents[0]?.sha, gitBlobSha(bytes))
+        assert.equal(pending.cutoverAuthorized, false)
+        stagedBytes.set(path, Uint8Array.from(bytes))
+        return gitBlobSha(bytes)
+      },
+    }
+    const staged = await stageV4BestEffortJournaledThreeBranchVault(stagingInput)
+    assert.equal(staged.preview.finalizedFileCount, 2)
+    assert.equal(staged.receipts.length, 3)
+    assert.equal(stageWrites, 3)
+    assert.equal(staged.journalSnapshot.pendingIntents.length, 0)
+    assert.equal(staged.journalSnapshot.verifiedRefObservations.length, 1)
+    assert.equal(staged.journalSnapshot.permissionToPublish, false)
+    assert.equal(staged.journalSnapshot.cutoverAuthorized, false)
+    for (const record of staged.records) {
+      const actual = await codec.read(record, async path => {
+        const bytes = stagedBytes.get(path)
+        assert.ok(bytes)
+        return bytes
+      })
+      const expected = record.path === "attachments/chunked.bin"
+        ? new Uint8Array(8 * 1024 * 1024 + 31).fill(0x31)
+        : enc("File content secret")
+      assert.deepEqual(actual, expected)
+    }
+    await assert.rejects(
+      () => stageV4BestEffortJournaledThreeBranchVault(stagingInput),
+      /Manual Recovery|previous run/i,
+    )
+    assert.equal(stageWrites, 3, "the completed WAL must never replay staged uploads")
+    await assert.rejects(
+      () => createV4BestEffortJournaledFrozenBackup({
+        ...f.input, journal, wal, acknowledgement,
+      }),
+      /previous ref intent|manual recovery/i,
+    )
+    assert.equal(f.createAttempts, 1, "the previously verified Backup must not be recreated")
+  } finally {
+    await wal.release()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("D350 ambiguous Backup creation cannot forge a WAL handoff into destination staging", async () => {
+  const f = await D99BackupFixture()
+  const source = await verifyGitHubReencryptionForkSourceWithTranscodeInventory({
+    github: f.f.github, expectedRepoId: repoId, expectedBranch: "main", passphrase: "correct",
+  })
+  const parent = join(process.cwd(), ".tmp")
+  await mkdir(parent, { recursive: true })
+  const root = await mkdtemp(join(parent, "d350-unverified-backup-"))
+  const wal = await acquireV4DesktopRekeyWalStorage({
+    rootAbsolute: root, journalRoot: "rekey/wal",
+  })
+  try {
+    const journal = createV4ReencryptionRecoveryJournal({
+      adapter: wal.adapter, root: "rekey/wal",
+      sourceCommitSha: source.pinnedSourceCommitSha,
+      destinationRepoId: frozenPlan.destinationRepoId,
+      runId: "d350-ambiguous-backup", journalKey: new Uint8Array(32).fill(0x54),
+    })
+    await journal.begin()
+    // Simulate a create-only Git ref that may exist remotely, but whose
+    // response and subsequent independent readback are both unavailable.
+    f.loseCreateResponse()
+    let attempted = false
+    const originalCreate = f.input.backup.createGitRef
+    f.input.backup.createGitRef = async sha => {
+      attempted = true
+      return originalCreate(sha)
+    }
+    const originalRead = f.input.backup.getGitRefOrNull
+    f.input.backup.getGitRefOrNull = async () => {
+      if (attempted) throw new Error("D350 synthetic remote readback unavailable")
+      return originalRead()
+    }
+    const acknowledgement = "accept-best-effort-power-loss-recovery-risk" as const
+    await assert.rejects(
+      () => createV4BestEffortJournaledFrozenBackup({
+        ...f.input, journal, wal, acknowledgement,
+      }), /ambiguous|Manual Recovery|readback unavailable|recovery/i,
+    )
+    assert.equal(f.createAttempts, 1, "uncertain GitHub create must happen at most once")
+    const previous = await journal.load()
+    assert.ok(previous)
+    assert.equal(previous.pendingRefIntents.length, 1)
+    assert.equal(previous.verifiedRefObservations.length, 0)
+    assert.equal(previous.pendingRefIntents[0]?.role, "backup")
+    assert.equal(previous.cutoverAuthorized, false)
+
+    const plan = planV4OrphanReencryptionDestination({
+      sourceRepoId: repoId, destinationRepoId: frozenPlan.destinationRepoId,
+      sourceCommitSha: source.pinnedSourceCommitSha,
+      sourcePhysicalRepositoryId: 1284153873,
+      destinationPhysicalRepositoryId: 1284153873,
+      expectedPhysicalRepositoryId: 1284153873,
+      defaultBranch: "main",
+    })
+    const salt = enc("d350-unverified-backup-destination-salt")
+    const destinationConfig: V4RemoteConfig = {
+      ...source.sourceConfig,
+      repoId: frozenPlan.destinationRepoId,
+      kdfParams: { salt: toBase64Url(salt), iterations: 600_000 },
+    }
+    const destinationKeyring = await deriveV4Keyring({
+      passphrase: "synthetic-d350-recovery-passphrase",
+      repoId: frozenPlan.destinationRepoId, salt, iterations: 600_000,
+    })
+    let uploadAttempts = 0
+    await assert.rejects(
+      () => stageV4BestEffortJournaledThreeBranchVault({
+        plan, journal, wal, acknowledgement,
+        beginAfterVerifiedBackup: {
+          expectedJournalGeneration: previous.generation,
+          backupRef: {
+            role: "backup", repoId: frozenPlan.backupRepoId,
+            commitSha: source.pinnedSourceCommitSha, treeSha: rootTreeSha,
+          },
+        },
+        sourceConfig: source.sourceConfig, sourceHead: source.sourceHead,
+        sourceShards: source.sourceShards, sourceKeyring: f.f.keyring,
+        destinationConfig, destinationKeyring,
+        async readSourceObject() {
+          throw new Error("An unverified Backup must not read Source objects for staging")
+        },
+        async verifySourceStillPinned() {
+          throw new Error("An unverified Backup must not start staging")
+        },
+        async stageImmutableObject() {
+          uploadAttempts++
+          throw new Error("No staging after ambiguous Backup")
+        },
+      }), /verified|Backup|handoff|Manual Recovery|generation|readback/i,
+    )
+    assert.equal(uploadAttempts, 0)
+    await assert.rejects(
+      () => createV4BestEffortJournaledFrozenBackup({
+        ...f.input, journal, wal, acknowledgement,
+      }), /previous ref intent|Manual Recovery|reconcile/i,
+    )
+    assert.equal(f.createAttempts, 1, "never replay an ambiguous Backup ref POST")
+  } finally {
+    await wal.release()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test("D348 verified pinned Source and frozen Backup feed one-shot real desktop WAL staging", async () => {
+  const f = await createFixture(true)
+  f.onBlobRead(() => f.setCurrentSha("d".repeat(40)))
+  const source = await verifyGitHubReencryptionForkSourceWithTranscodeInventory({
+    github: f.github, expectedRepoId: repoId, expectedBranch: "main", passphrase: "correct",
+  })
+  const backup = await verifyGitHubFrozenReencryptionBackup({
+    github: frozenBackupClient(f), plan: frozenPlan,
+    expectedSourceTreeSha: rootTreeSha, passphrase: "correct",
+  })
+  assert.equal(backup.backupContentsReadbackVerified, true)
+  assert.equal(backup.pinnedSourceCommitSha, source.pinnedSourceCommitSha)
+  assert.equal(backup.verifiedFileCount, source.verifiedSource.verifiedFileCount)
+  assert.equal(backup.verifiedPlaintextBytes, source.verifiedSource.totalVerifiedPlaintextBytes)
+  assert.equal(backup.destinationPublicationAuthorized, false)
+  const sourceRefReads = f.refReads
+
+  const destRepoId = frozenPlan.destinationRepoId
+  const salt = enc("d348-test-only-independent-salt")
+  const destinationConfig: V4RemoteConfig = {
+    ...source.sourceConfig, repoId: destRepoId,
+    kdfParams: { iterations: 600_000, salt: toBase64Url(salt) },
+  }
+  const destinationKeyring = await deriveV4Keyring({
+    passphrase: "d348-test-only-new-passphrase",
+    repoId: destRepoId, salt, iterations: 600_000,
+  })
+  const destinationCodec = new V4StorageCodec({
+    mode: "encrypted", pathLayout: "opaque-stable-v1", keyring: destinationKeyring,
+  })
+  const plan = planV4OrphanReencryptionDestination({
+    sourceRepoId: repoId, destinationRepoId: destRepoId,
+    sourceCommitSha: source.pinnedSourceCommitSha,
+    sourcePhysicalRepositoryId: 1284153873, destinationPhysicalRepositoryId: 1284153873,
+    expectedPhysicalRepositoryId: 1284153873, defaultBranch: "main",
+  })
+  const backupRef = {
+    role: "backup" as const, repoId: frozenPlan.backupRepoId,
+    commitSha: backup.pinnedSourceCommitSha, treeSha: backup.pinnedSourceTreeSha,
+  }
+  const parent = join(process.cwd(), ".tmp")
+  await mkdir(parent, { recursive: true })
+  const root = await mkdtemp(join(parent, "d348-pinned-source-best-effort-wal-"))
+  try {
+    // These two runs use independent disposable OS-bound WALs. The backup
+    // creation POST remains simulated; only readback is authenticated above.
+    for (const loseSecondReply of [false, true]) {
+      const walRoot = join(root, loseSecondReply ? "interrupted" : "complete")
+      await mkdir(walRoot)
+      const wal = await acquireV4DesktopRekeyWalStorage({
+        rootAbsolute: walRoot, journalRoot: "rekey/wal",
+      })
+      try {
+        const journal = createV4ReencryptionRecoveryJournal({
+          adapter: wal.adapter, root: "rekey/wal",
+          sourceCommitSha: source.pinnedSourceCommitSha, destinationRepoId: destRepoId,
+          runId: loseSecondReply ? "d348-interrupted" : "d348-complete",
+          journalKey: new Uint8Array(32).fill(0x55),
+        })
+        let previous = await journal.begin()
+        previous = await journal.recordRefIntent(backupRef, previous.generation)
+        previous = await journal.markRefReadbackObserved(backupRef, previous.generation)
+        const beginAfterVerifiedBackup = {
+          expectedJournalGeneration: previous.generation, backupRef,
+        }
+        let uploadAttempts = 0
+        const stagedBlobs = new Map<string, Uint8Array>()
+        const input = {
+          plan, journal, wal, beginAfterVerifiedBackup,
+          acknowledgement: "accept-best-effort-power-loss-recovery-risk" as const,
+          sourceConfig: source.sourceConfig,
+          sourceHead: source.sourceHead,
+          sourceShards: source.sourceShards,
+          sourceKeyring: f.keyring,
+          destinationConfig, destinationKeyring,
+          async readSourceObject(path: string, sha: string) {
+            assert.equal(sha, source.pinnedSourceCommitSha)
+            const found = await readImmutableGitFile(path, sha, {
+              getCommit: commit => f.github.getGitCommit(commit),
+              getTree: tree => f.github.getTreeAt(tree, false),
+              getBlob: blob => f.github.getBlob(blob),
+            })
+            return found?.bytes ?? null
+          },
+          async verifySourceStillPinned() {
+            assert.equal(source.pinnedSourceCommitSha, plan.pinnedSourceCommitSha)
+          },
+          async stageImmutableObject(path: string, bytes: Uint8Array) {
+            uploadAttempts++
+            const onDisk = await journal.load()
+            assert.equal(onDisk?.stageHandoffStarted, true)
+            assert.equal(onDisk?.pendingIntents.length, 1,
+              "an authenticated intent must be on disk before each blob upload")
+            assert.equal(onDisk.pendingIntents[0]!.path, path)
+            assert.equal(onDisk.pendingIntents[0]!.sha, gitBlobSha(bytes))
+            if (loseSecondReply && uploadAttempts === 2) {
+              throw new Error("D348 synthetic lost Git blob response")
+            }
+            stagedBlobs.set(path, Uint8Array.from(bytes))
+            return gitBlobSha(bytes)
+          },
+        }
+        if (loseSecondReply) {
+          await assert.rejects(
+            () => stageV4BestEffortJournaledThreeBranchVault(input),
+            /D348 synthetic lost Git blob response/,
+          )
+          const interrupted = await journal.load()
+          assert.equal(interrupted?.receipts.length, 1)
+          assert.equal(interrupted.pendingIntents.length, 1)
+          assert.equal(interrupted.requiresRemoteRevalidation, true)
+          assert.equal(interrupted.cutoverAuthorized, false)
+          await assert.rejects(
+            () => stageV4BestEffortJournaledThreeBranchVault(input),
+            /Manual Recovery|previous run/i,
+          )
+          assert.equal(uploadAttempts, 2, "ambiguous second POST must not be retried")
+        } else {
+          const staged = await stageV4BestEffortJournaledThreeBranchVault(input)
+          assert.equal(staged.preview.finalizedFileCount, 2)
+          assert.equal(staged.receipts.length, 3)
+          assert.equal(staged.journalSnapshot.receipts.length, 3)
+          assert.equal(staged.journalSnapshot.pendingIntents.length, 0)
+          assert.equal(staged.journalSnapshot.requiresRemoteRevalidation, true)
+          assert.equal(staged.journalSnapshot.permissionToPublish, false)
+          assert.equal(staged.journalSnapshot.cutoverAuthorized, false)
+          for (const record of staged.records) {
+            const plaintext = await destinationCodec.read(record, async path => {
+              const bytes = stagedBlobs.get(path)
+              assert.ok(bytes)
+              return bytes
+            })
+            const expected = record.path === "attachments/chunked.bin"
+              ? new Uint8Array(8 * 1024 * 1024 + 31).fill(0x31)
+              : enc("File content secret")
+            assert.deepEqual(plaintext, expected)
+          }
+          await assert.rejects(
+            () => stageV4BestEffortJournaledThreeBranchVault(input),
+            /Manual Recovery|previous run/i,
+          )
+          assert.equal(uploadAttempts, 3, "completed journal cannot silently replay uploads")
+        }
+      } finally {
+        await wal.release()
+      }
+    }
+    assert.equal(f.refReads, sourceRefReads,
+      "no new mutable source HEAD lookup or Git ref mutation is needed for WAL staging")
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
 
 test("D94 authenticates all frozen backup contents even when old source HEAD advances independently", async () => {
   const f = await createFixture()
@@ -683,8 +1422,8 @@ test("D95 refuses wrong physical identity, wrong client scope, invalid plan and 
   }), /default branch changed/)
 })
 
-async function D99BackupFixture() {
-  const f = await createFixture()
+async function D99BackupFixture(includeChunkedFile = false) {
+  const f = await createFixture(includeChunkedFile)
   const verifiedSource = await verifyGitHubReencryptionForkSource({
     github: f.github, expectedRepoId: repoId, expectedBranch: "main", passphrase: "correct",
   })
@@ -753,6 +1492,52 @@ test("D99 creates a single frozen backup ref then decrypts and verifies the COMP
   assert.equal(report.initiatingDeviceCutoverAuthorized, false)
   assert.equal(f.createAttempts, 1)
   assert.ok(Object.isFrozen(report))
+})
+
+test("D396 frozen Backup rejects a changed Git ref writer after remote preflight but before POST", async () => {
+  const f = await D99BackupFixture()
+  let leaseChecks = 0
+  let substitutedWriterCalls = 0
+  await assert.rejects(
+    () => createAndVerifyV4FrozenBackupRef({
+      ...f.input,
+      assertExclusiveMigrationLease: async () => {
+        if (++leaseChecks === 2) {
+          f.input.backup.createGitRef = async () => {
+            substitutedWriterCalls++
+            f.occupy(commitSha)
+          }
+        }
+      },
+    }),
+    /frozen backup.*(writer|client|authority).*changed|manual recovery/i,
+    "replacing a scoped create-only GitHub ref writer cannot authorize Backup",
+  )
+  assert.equal(leaseChecks, 2, "mutation must occur at the second lease check after GitHub preflight")
+  assert.equal(substitutedWriterCalls, 0, "substituted GitHub method must not run")
+  assert.equal(f.createAttempts, 0, "original GitHub ref writer must not run")
+})
+
+test("D396 frozen Backup does not certify success after its Git ref writer is replaced post-POST", async () => {
+  const f = await D99BackupFixture()
+  const originalWriter = f.input.backup.createGitRef
+  let substitutedWriterCalls = 0
+  let postCompleted = false
+  f.input.backup.createGitRef = async sha => {
+    await originalWriter.call(f.input.backup, sha)
+    postCompleted = true
+    f.input.backup.createGitRef = async () => {
+      substitutedWriterCalls++
+    }
+  }
+  await assert.rejects(
+    () => createAndVerifyV4FrozenBackupRef(f.input),
+    /frozen backup.*(writer|client|authority).*changed|manual recovery/i,
+    "a completed ref POST cannot be certified from a changed GitHub client",
+  )
+  assert.equal(postCompleted, true, "the test must pass the actual create-only POST boundary")
+  assert.equal(f.createAttempts, 1, "one real writer invocation, no retry")
+  assert.equal(substitutedWriterCalls, 0, "the replacement writer cannot be used")
 })
 
 test("D99 ambiguous backup create response is fully reconciled without retry or old branch freeze", async () => {
@@ -916,6 +1701,84 @@ test("D166 best-effort Backup explicitly accepts risk, authenticates WAL around 
     ...input, journal: j.open(),
   }), /previous ref intent/i)
   assert.equal(f.createAttempts, 1)
+})
+
+test("D395 best-effort Backup refuses replaced WAL lease or checkpoint before first ref intent", async () => {
+  for (const replacement of ["lease", "checkpoint"] as const) {
+    const f = await D99BackupFixture()
+    const j = await D102Journal()
+    let originalChecks = 0
+    let replacementCalls = 0
+    const wal = {
+      async assertExclusiveStageLease() {
+        originalChecks++
+        if (originalChecks === 1) {
+          if (replacement === "lease") wal.assertExclusiveStageLease = async () => {
+            replacementCalls++
+          }
+          else wal.assertBestEffortCheckpoint = async () => {
+            replacementCalls++
+            return "best-effort-readback-only" as const
+          }
+        }
+      },
+      async assertBestEffortCheckpoint() {
+        return "best-effort-readback-only" as const
+      },
+    }
+    await assert.rejects(
+      () => createV4BestEffortJournaledFrozenBackup({
+        ...f.input, journal: j.journal, wal,
+        acknowledgement: "accept-best-effort-power-loss-recovery-risk",
+      }),
+      /best-effort.*(WAL|lease|checkpoint).*changed|Manual Recovery/i,
+      "D395 may not trust " + replacement + " substituted during an awaited WAL lease",
+    )
+    assert.equal(originalChecks, 1)
+    assert.equal(replacementCalls, 0, "new callback must not be invoked")
+    assert.equal(f.createAttempts, 0, "no GitHub ref may be created")
+    const persisted = await j.journal.load()
+    assert.equal(persisted?.generation, 1)
+    assert.equal(persisted?.pendingRefIntents.length, 0)
+    assert.equal(persisted?.cutoverAuthorized, false)
+  }
+})
+
+test("D395 Backup retains pending intent when remote preflight swaps the WAL lease owner", async () => {
+  const f = await D99BackupFixture()
+  const j = await D102Journal()
+  let substitutedCalls = 0
+  let swapped = false
+  const wal = {
+    async assertExclusiveStageLease() {},
+    async assertBestEffortCheckpoint() {
+      return "best-effort-readback-only" as const
+    },
+  }
+  const readBackupRef = f.input.backup.getGitRefOrNull
+  f.input.backup.getGitRefOrNull = async () => {
+    const pending = await j.journal.load()
+    if (!swapped && pending?.pendingRefIntents.length === 1) {
+      swapped = true
+      wal.assertExclusiveStageLease = async () => { substitutedCalls++ }
+    }
+    return readBackupRef.call(f.input.backup)
+  }
+  await assert.rejects(
+    () => createV4BestEffortJournaledFrozenBackup({
+      ...f.input, journal: j.journal, wal,
+      acknowledgement: "accept-best-effort-power-loss-recovery-risk",
+    }),
+    /best-effort.*WAL.*changed|Manual Recovery/i,
+  )
+  assert.equal(swapped, true, "test must change lease during a real Backup Git preflight")
+  assert.equal(substitutedCalls, 0, "substituted callback must not authorize ref creation")
+  assert.equal(f.createAttempts, 0)
+  const pending = await j.journal.load()
+  assert.equal(pending?.generation, 2)
+  assert.equal(pending?.pendingRefIntents.length, 1)
+  assert.equal(pending?.verifiedRefObservations.length, 0)
+  assert.equal(pending?.cutoverAuthorized, false)
 })
 
 test("D166 missing best-effort risk acknowledgement fails before WAL or network writes", async () => {

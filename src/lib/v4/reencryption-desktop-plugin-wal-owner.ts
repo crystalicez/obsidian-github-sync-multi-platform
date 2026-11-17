@@ -18,9 +18,16 @@ export async function resolveV4DesktopPluginWalOwner(input: V4DesktopPluginWalOw
   }
   const resolveFull = adapter.getFullPath
   const layout = await planV4PluginPrivateWalLocation({ configDir, pluginId, runId })
-  const [fs, path] = await Promise.all([
-    import("node:fs/promises"), import("node:path"),
-  ])
+  // Installed Obsidian uses CommonJS in Electron, where renderer dynamic
+  // import("node:*") may fail even though Node require is available.
+  const [fs, path] = typeof exports === "object" && typeof require === "function"
+    ? [
+      require("node:fs/promises") as typeof import("node:fs/promises"),
+      require("node:path") as typeof import("node:path"),
+    ]
+    : await Promise.all([
+      import("node:fs/promises"), import("node:path"),
+    ])
   const vaultRoot = resolveFull.call(adapter, "")
   const pluginRoot = resolveFull.call(adapter, layout.pluginStorageRoot)
   if (typeof vaultRoot !== "string" || typeof pluginRoot !== "string"

@@ -6,6 +6,7 @@ import type { V4LocalIndexAdapter } from "../../src/lib/v4/local-index"
 import { createV4ReencryptionRecoveryJournal } from "../../src/lib/v4/reencryption-recovery-journal"
 import { openV4NewMobilePluginWalWriter } from "../../src/lib/v4/reencryption-mobile-plugin-wal-writer"
 import { openV4MobilePluginWalForRecovery } from "../../src/lib/v4/reencryption-mobile-wal-recovery"
+import { tryReserveV4MobileRecoveryAdapter } from "../../src/lib/v4/reencryption-mobile-recovery-reservation"
 import { planV4PluginPrivateWalLocation } from "../../src/lib/v4/reencryption-plugin-wal-location"
 import { armV4ReencryptionSyncFence } from "../../src/lib/v4/reencryption-sync-fence"
 
@@ -30,6 +31,7 @@ async function fixture() {
   let writes = 0
   let readCount = 0
   let interceptWrite: ((path: string, text: string) => Promise<void>) | undefined
+  let interceptLease: (() => Promise<void>) | undefined
 
   const adapter = {
     async stat(name: string) {
@@ -81,12 +83,14 @@ async function fixture() {
     assertLiveOwner() { if (!ownerLive) throw Error("lost mobile owner") },
     async assertExclusiveInitiatorLease() {
       if (!leaseLive) throw Error("lost initiating lease")
+      await interceptLease?.()
     },
     async assertSyncFenceArmed() { if (!fenceLive) throw Error("lost Sync Fence guard") },
   }
   return {
     input, adapter, files, directories, layout, index,
     setWriteFault(fn: (path: string, text: string) => Promise<void>) { interceptWrite = fn },
+    setLeaseWait(fn: () => Promise<void>) { interceptLease = fn },
     inject(name: string, text: string, mtime = 7) { files.set(name, { text, mtime }) },
     loseLease() { leaseLive = false },
     loseOwner() { ownerLive = false },
@@ -133,6 +137,85 @@ test("D245 mobile adapter writes two real encrypted WAL generations and reopens 
     })
     assert.deepEqual(await recovery.assertHealthySnapshot(latest.generation), latest)
     assert.ok(f.getReads() >= 12)
+  } finally { writer.release() }
+})
+
+test("D309 Mobile WAL writer refuses invalid plugin-root folder metadata without creating a journal", async () => {
+  for (const invalid of [
+    { size: -1, mtime: 1 },
+    { size: 0.5, mtime: 1 },
+    { size: 0, mtime: -1 },
+    { size: 0, mtime: Number.NaN },
+  ]) {
+    const f = await fixture()
+    const originalStat = f.adapter.stat
+    f.adapter.stat = async path => {
+      const stat = await originalStat(path)
+      return path === f.layout.pluginStorageRoot && stat?.type === "folder"
+        ? { ...stat, ...invalid } : stat
+    }
+    const snapshot = new Map(f.files)
+    await assert.rejects(openV4NewMobilePluginWalWriter(f.input), /Manual Recovery/u)
+    assert.deepEqual(f.files, snapshot, "invalid adapter metadata must preserve persisted evidence")
+    assert.equal(f.directories.has(f.layout.vaultLogicalWalRoot), false)
+    assert.equal(f.getWrites(), 0, "WAL bytes must not be written")
+  }
+})
+
+test("D309 Mobile WAL writer rejects an acknowledged slot with invalid stat mtime and freezes", async () => {
+  const f = await fixture()
+  const slot = f.layout.vaultLogicalWalRoot + "/slot-0.json"
+  const originalStat = f.adapter.stat
+  f.adapter.stat = async path => {
+    const stat = await originalStat(path)
+    return path === slot && stat?.type === "file" ? { ...stat, mtime: -1 } : stat
+  }
+  const writer = await openV4NewMobilePluginWalWriter(f.input)
+  try {
+    await assert.rejects(writer.adapter.write(writer.journalRoot + "/slot-0.json", "ciphertext"), /Manual Recovery/u)
+    assert.equal(f.files.get(slot)?.text, "ciphertext",
+      "uncertain acknowledged bytes must be preserved for manual recovery")
+    await assert.rejects(writer.adapter.write(writer.journalRoot + "/slot-1.json", "retry"), /Manual Recovery/u)
+    assert.equal(f.getWrites(), 1, "failed writer must never retry WAL mutations")
+  } finally { writer.release() }
+})
+
+test("D310 Mobile WAL writer refuses changed mtime when Adapter reuses one mutable stat object", async () => {
+  const f = await fixture()
+  const slot = f.layout.vaultLogicalWalRoot + "/slot-0.json"
+  const originalStat = f.adapter.stat
+  const originalRead = f.adapter.read
+  const sharedSlotStat = { type: "file" as const, size: 0, mtime: 0 }
+  f.adapter.stat = async name => {
+    const result = await originalStat(name)
+    if (name === slot && result?.type === "file") {
+      sharedSlotStat.size = result.size
+      sharedSlotStat.mtime = result.mtime
+      return sharedSlotStat
+    }
+    return result
+  }
+  let changed = false
+  f.adapter.read = async name => {
+    const text = await originalRead(name)
+    if (name === slot && !changed) {
+      const stored = f.files.get(slot)
+      assert.ok(stored)
+      f.files.set(slot, { ...stored, mtime: stored.mtime + 1 })
+      changed = true
+    }
+    return text
+  }
+  const writer = await openV4NewMobilePluginWalWriter(f.input)
+  try {
+    await assert.rejects(writer.adapter.write(writer.journalRoot + "/slot-0.json", "encrypted WAL"),
+      /Manual Recovery/u, "mtime drift must be detected despite reused Adapter.stat object")
+    assert.equal(changed, true)
+    assert.equal(f.files.get(slot)?.text, "encrypted WAL",
+      "write ambiguity must preserve the acknowledged WAL bytes")
+    await assert.rejects(writer.adapter.write(writer.journalRoot + "/slot-1.json", "retry"),
+      /Manual Recovery/u)
+    assert.equal(f.getWrites(), 1, "ambiguous WAL must never be overwritten by retries")
   } finally { writer.release() }
 })
 
@@ -285,6 +368,96 @@ test("D245 owner, lease, Fence and reader mutation each block WAL writes without
       assert.equal(f.getWrites(), 1)
       assert.equal(f.files.get(f.layout.vaultLogicalWalRoot + "/slot-0.json")?.text, "first")
     } finally { writer.release() }
+  }
+})
+
+test("D297 failed Mobile WAL mkdir acknowledgement releases only its reservation and preserves partial directory", async () => {
+  const f = await fixture()
+  const originalMkdir = f.adapter.mkdir
+  f.adapter.mkdir = async name => {
+    await originalMkdir(name)
+    if (name === f.layout.vaultLogicalWalRoot) {
+      // The filesystem created the directory but the Adapter lost its reply.
+      throw Error("simulated lost WAL mkdir acknowledgement")
+    }
+  }
+  await assert.rejects(openV4NewMobilePluginWalWriter(f.input),
+    /lost WAL mkdir acknowledgement/u)
+  const wal = f.layout.vaultLogicalWalRoot
+  assert.equal(f.directories.has(wal), true,
+    "uncertain WAL directory must not be automatically deleted")
+  assert.equal(f.getWrites(), 0)
+
+  const recovery = tryReserveV4MobileRecoveryAdapter(f.adapter)
+  assert.ok(recovery, "failed constructor must release its in-process reservation")
+  try {
+    assert.equal(tryReserveV4MobileRecoveryAdapter(f.adapter), null)
+    // The now-available read-only Recovery still must reject this incomplete
+    // disk image; releasing an in-process guard is NOT evidence of WAL health.
+    const snapshot = new Map(f.files)
+    await assert.rejects(openV4MobilePluginWalForRecovery({
+      adapter: f.adapter, configDir, pluginId, runId,
+      assertLiveOwner: () => {},
+    }), /missing a slot|foreign artifacts/u)
+    assert.deepEqual(f.files, snapshot, "failed readback must preserve WAL evidence")
+  } finally {
+    recovery()
+  }
+  await assert.rejects(openV4NewMobilePluginWalWriter(f.input),
+    /Manual Recovery/u, "a leftover run directory must never be reused")
+  assert.equal(f.directories.has(wal), true)
+  assert.equal(f.getWrites(), 0)
+})
+
+test("D296 Mobile WAL writer and read-only Recovery must share one cooperative Adapter reservation", async () => {
+  const f = await fixture()
+  const recovery = tryReserveV4MobileRecoveryAdapter(f.adapter)
+  assert.ok(recovery)
+  try {
+    // A read-only Recovery owns this exact Adapter: no Writer may create a WAL.
+    await assert.rejects(openV4NewMobilePluginWalWriter(f.input), /Manual Recovery/u)
+    assert.equal(f.getWrites(), 0)
+    assert.equal(f.directories.has(f.layout.vaultLogicalWalRoot), false)
+  } finally {
+    recovery()
+  }
+  const writer = await openV4NewMobilePluginWalWriter(f.input)
+  try {
+    // This Writer has now claimed the same Adapter. Another diagnostic must
+    // refuse rather than concurrently observe partially updated WAL slots.
+    assert.equal(tryReserveV4MobileRecoveryAdapter(f.adapter), null)
+  } finally {
+    writer.release()
+  }
+  const afterRelease = tryReserveV4MobileRecoveryAdapter(f.adapter)
+  assert.ok(afterRelease, "current Writer release must relinquish the joint reservation")
+  afterRelease()
+})
+
+test("D295 Mobile writer cannot release a cooperative reservation while an async read is in flight", async () => {
+  const f = await fixture()
+  const writer = await openV4NewMobilePluginWalWriter(f.input)
+  let notifyEntered!: () => void
+  let resumeLease!: () => void
+  const entered = new Promise<void>(resolve => { notifyEntered = resolve })
+  const pause = new Promise<void>(resolve => { resumeLease = resolve })
+  let suspended = false
+  f.setLeaseWait(async () => {
+    if (!suspended) {
+      suspended = true
+      notifyEntered()
+      await pause
+    }
+  })
+  const reading = writer.adapter.exists(writer.journalRoot + "/slot-0.json")
+  try {
+    await entered
+    assert.throws(() => writer.release(), /Manual Recovery/u,
+      "the same-process reservation must remain held while an earlier read is pending")
+  } finally {
+    resumeLease()
+    await reading
+    writer.release()
   }
 })
 

@@ -28,7 +28,7 @@ import { effectiveV4PathLayout, expectedV4PathLayout, V4_CONFIG_PATH, V4_HEAD_PA
 import { loadV4RemoteConfig, loadV4RemoteState, remoteV4StateFromLocalIndex, type V4RemoteState } from "./remote-loader"
 import { V4StorageCodec } from "./storage-codec"
 import { collectV4ContentSource, createV4WholeBufferContentSource, DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES, type V4ContentHandle, type V4ContentSource } from "./content-source"
-import type { V4StageRef } from "./staging-store"
+import { abortV4StageAfterFailure, type V4StageRef } from "./staging-store"
 import { V4BoundedIoUnavailableError } from "./platform-io"
 import { shouldWriteV4Parts, V4_PART_BYTES } from "./large-files"
 import { hashV4StableContentSource, V4SourceChangedError } from "./object-stream"
@@ -49,7 +49,7 @@ import {
   type V4ResourceLimits,
 } from "./resource-controller"
 import type { V4QueuedChange } from "./sync-coordinator"
-import { applyV4RecoveryLocalMutations, type V4RecoveryStore } from "./recovery-store"
+import { applyV4RecoveryLocalMutations, assertUniqueV4RecoveryStageOwners, V4RecoveryRequiredError, type V4RecoveryStore } from "./recovery-store"
 import type { V4RecoveryLocalMutation, V4RecoveryPayload } from "./recovery-types"
 import type { V4DirectionalProgress, V4SyncProgressPatch } from "./progress"
 import { deferV4Cancellation, throwIfV4Aborted } from "./cancellation"
@@ -1623,8 +1623,7 @@ export class V4SyncSession {
       ownedStages.push(stage)
       return stage
     } catch (error) {
-      await sink.abort()
-      throw error
+      return abortV4StageAfterFailure(sink, error)
     }
   }
 
@@ -1680,9 +1679,22 @@ export class V4SyncSession {
         })
       }
     }
-    const stagedIds = new Set(mutations.flatMap(mutation => mutation.kind === "stage-write" ? [mutation.stage.stageId] : []))
+    const stageOwners = new Map<string, { path: string; stage: V4StageRef }>()
+    for (const mutation of mutations) {
+      if (mutation.kind === "stage-write") stageOwners.set(mutation.stage.stageId, mutation)
+    }
     for (const copy of this.input.runState?.conflictCopyStages?.values() ?? []) {
-      if (stagedIds.has(copy.stage.stageId)) continue
+      const existing = stageOwners.get(copy.stage.stageId)
+      if (existing) {
+        // A carried conflict copy can already be a planned pull. Only that
+        // identical target/receipt may be coalesced; a different target using
+        // the same physical stage ID would silently lose its WAL mutation.
+        if (existing.path !== copy.path || existing.stage.hash !== copy.stage.hash
+          || existing.stage.size !== copy.stage.size || existing.stage.mtime !== copy.stage.mtime) {
+          throw new V4RecoveryRequiredError("V4 WAL stage ID is shared by distinct target writes; manual recovery required.")
+        }
+        continue
+      }
       const stat = this.localIo.stat ? await this.localIo.stat(copy.path) : null
       const precondition: V4LocalTargetPrecondition = stat
         ? { path: copy.path, exists: true, size: stat.size, mtime: stat.mtime }
@@ -1694,7 +1706,11 @@ export class V4SyncSession {
         stage: copy.stage,
         precondition,
       })
+      stageOwners.set(copy.stage.stageId, { path: copy.path, stage: copy.stage })
     }
+    // Use the same invariant as WAL replay, before any WAL save, remote
+    // publication, or target precondition read can have side effects.
+    assertUniqueV4RecoveryStageOwners(mutations)
     // Pin original file identities for ALL mutations before persisting WAL.
     // A same-size/same-mtime edit between the scan and publication must not
     // authorize an overwrite or trash, including on the small-file path.

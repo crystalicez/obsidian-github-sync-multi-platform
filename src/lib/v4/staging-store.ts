@@ -48,10 +48,42 @@ export class V4InsufficientStagingSpaceError extends Error {
   }
 }
 
+/** The temporary stage still may exist; do not attest a successful abort. */
+export class V4StagingCleanupError extends Error {
+  constructor(
+    readonly partialPath: string,
+    readonly cleanupFailure: unknown,
+    readonly stageFailure?: unknown,
+  ) {
+    super("V4 staging partial-file cleanup failed; manual recovery may be required.", { cause: cleanupFailure })
+    this.name = "V4StagingCleanupError"
+  }
+}
+
 export interface V4StagedSink {
   append(bytes: Uint8Array): Promise<void>
   finish(result: { plaintextSha256: string; size: number }): Promise<V4StageRef>
   abort(): Promise<void>
+}
+
+/**
+ * Called by streaming owners after a staging error. A second abort failure
+ * must not hide the original I/O / remote-read fault. If abort can remove a
+ * previously unresolved partial stage, report only the original fault.
+ */
+export async function abortV4StageAfterFailure(sink: V4StagedSink, failure: unknown): Promise<never> {
+  const originalFailure = failure instanceof V4StagingCleanupError && failure.stageFailure !== undefined
+    ? failure.stageFailure : failure
+  try {
+    await sink.abort()
+  } catch (cleanupFailure) {
+    if (cleanupFailure instanceof V4StagingCleanupError) {
+      throw new V4StagingCleanupError(cleanupFailure.partialPath, cleanupFailure.cleanupFailure, originalFailure)
+    }
+    throw new AggregateError([originalFailure, cleanupFailure],
+      "V4 staging failed and partial-file cleanup also failed; manual recovery may be required.")
+  }
+  throw originalFailure
 }
 
 export interface V4StagingStore {
@@ -124,6 +156,7 @@ export function createV4StagingStore(options: {
     let state: "open" | "finishing" | "finished" | "aborting" | "aborted" | "failed" = "open"
     let failed = false
     let firstFailure: unknown
+    let abortInFlight: Promise<void> | undefined
     // Serialize backend mutations so finish cannot attest unflushed append
     // operations, and abort cannot remove before a pending write recreates it.
     let pending: Promise<void> = Promise.resolve()
@@ -132,11 +165,22 @@ export function createV4StagingStore(options: {
       pending = operation.then(() => undefined, () => undefined)
       return operation
     }
-    const removePartial = async () => { try { await options.backend.remove(path) } catch {} }
+    const removePartial = async () => {
+      try { await options.backend.remove(path) }
+      catch (error) {
+        // A never-created or already-removed partial stage is clean. Do not
+        // hide permission, I/O or unknown errors as a successful abort.
+        if ((error as { code?: unknown } | null)?.code !== "ENOENT") throw error
+      }
+    }
     const poison = async (error: unknown): Promise<never> => {
       if (!failed) { failed = true; firstFailure = error }
       state = "failed"
-      await removePartial()
+      try { await removePartial() }
+      catch (cleanupFailure) {
+        firstFailure = new V4StagingCleanupError(path, cleanupFailure, firstFailure)
+        throw firstFailure
+      }
       throw error
     }
     const closedError = () => new Error("V4 staged sink is already closed.")
@@ -144,16 +188,20 @@ export function createV4StagingStore(options: {
       append(bytes) {
         if (state !== "open") return Promise.reject(closedError())
         if (stageOptions.signal?.aborted) return Promise.reject(stageOptions.signal.reason ?? new Error("V4 staging aborted."))
+        // The writer can be queued behind an earlier asynchronous append.
+        // Retain an owned copy now: a stream may reuse its source buffer before
+        // the backend receives these bytes, otherwise the stage can be corrupt.
+        const ownedBytes = new Uint8Array(bytes)
         return enqueue(async () => {
           if (failed) throw firstFailure
           if (state === "aborting" || state === "aborted") throw closedError()
           if (stageOptions.signal?.aborted) throw stageOptions.signal.reason ?? new Error("V4 staging aborted.")
-          if (total + bytes.byteLength > stageOptions.expectedSize)
+          if (total + ownedBytes.byteLength > stageOptions.expectedSize)
             return poison(new Error("V4 staged sink received more bytes than declared."))
           try {
-            if (first) { await options.backend.write(path, bytes); first = false }
-            else await options.backend.append(path, bytes)
-            total += bytes.byteLength
+            if (first) { await options.backend.write(path, ownedBytes); first = false }
+            else await options.backend.append(path, ownedBytes)
+            total += ownedBytes.byteLength
           } catch (error) {
             return poison(error)
           }
@@ -184,12 +232,20 @@ export function createV4StagingStore(options: {
       },
       abort() {
         if (state === "finished" || state === "aborted") return Promise.resolve()
-        if (state === "aborting") return pending
+        if (abortInFlight) return abortInFlight
         state = "aborting"
-        return enqueue(async () => {
-          await removePartial()
+        const operation = enqueue(async () => {
+          try { await removePartial() }
+          catch (cleanupFailure) {
+            state = "failed"
+            throw new V4StagingCleanupError(path, cleanupFailure, failed ? firstFailure : undefined)
+          }
           state = "aborted"
         })
+        // Concurrent callers receive the same rejection, not the queue's
+        // deliberately swallowed result. Failed cleanup remains retryable.
+        abortInFlight = operation.finally(() => { abortInFlight = undefined })
+        return abortInFlight
       },
     }
   }
@@ -217,8 +273,7 @@ export function createV4StagingStore(options: {
         }
         return await sink.finish({ plaintextSha256: hash.digestHex(), size: total })
       } catch (error) {
-        await sink.abort()
-        throw error
+        return abortV4StageAfterFailure(sink, error)
       }
     },
     async open(ref) {

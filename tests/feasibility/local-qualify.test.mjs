@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { qualifyLocal } from "../../scripts/local-qualify.mjs";
+import { deriveGitHubE2EDestinationBranch, deriveGitHubE2EFrozenBackupBranch } from "../../scripts/github-e2e-env.mjs";
 import { QUALIFICATION_GATES, qualificationRefName, qualificationTagName } from "../../scripts/local-release-lib.mjs";
 
 const CANONICAL_HTTPS = "https://github.com/crystalicez/obsidian-github-sync-multi-platform.git";
@@ -45,15 +46,27 @@ function response(status, body = {}) {
   return { status, async json() { return body; } };
 }
 
-function makeFetch({ cleanupStatus = 404 } = {}) {
+function makeFetch({ cleanupStatus = 404, backupCleanupStatus, destinationCleanupStatus } = {}) {
   const calls = [];
+  const branchReads = new Map();
   const impl = async (url, options = {}) => {
     calls.push({ url, options });
     if (!url.includes("/git/ref") && !url.includes("/git/refs")) return response(200, { id: 123, default_branch: "main" });
     if (url.includes("/git/ref/heads/main")) return response(200, { object: { sha: "d".repeat(40) } });
-    if (cleanupStatus === "network") throw new Error("network");
-    if (cleanupStatus === 403) return response(403, {});
-    return response(cleanupStatus, {});
+    if (url.includes("/git/ref/heads/obsidian-sync-e2e/local-")) {
+      const reads = (branchReads.get(url) ?? 0) + 1;
+      branchReads.set(url, reads);
+      // The qualification's first two probes must show safe absence.
+      // Later reads simulate cleanup availability or failure.
+      if (reads <= 2) return response(404, {});
+    }
+    const selected = url.includes("/git/ref/heads/obsidian-sync-e2e/local-backup-")
+      ? (backupCleanupStatus ?? cleanupStatus)
+      : url.includes("/git/ref/heads/obsidian-sync-e2e/local-destination-")
+        ? (destinationCleanupStatus ?? cleanupStatus) : cleanupStatus;
+    if (selected === "network") throw new Error("network");
+    if (selected === 403) return response(403, {});
+    return response(selected, {});
   };
   return { impl, calls };
 }
@@ -125,6 +138,7 @@ function baseOptions(f, extras = {}) {
   return {
     progress,
     runnerEvents,
+    fetchCalls: fetcher.calls,
     options: {
       cwd: f.work,
       runner,
@@ -176,6 +190,77 @@ test("qualification executes exact v1 gate order, isolates token, and overrides 
   const remote = git(f.work, ["ls-remote", "--refs", f.bare, result.qualificationRef]).stdout.trim();
   assert.match(remote, new RegExp(`^${result.qualificationTagObjectSha}\\s`));
 });
+
+test("D374 qualifier independently proves absence and cleanup for Source, Backup and Destination refs", async () => {
+  const f = await fixture();
+  const { options, runnerEvents, fetchCalls } = baseOptions(f);
+  await qualifyLocal(options);
+  const source = runnerEvents.find(e => e.name === "github-e2e-live")?.branch;
+  assert.match(source ?? "", /^obsidian-sync-e2e\/local-/u);
+  const backup = deriveGitHubE2EFrozenBackupBranch(source);
+  const destination = deriveGitHubE2EDestinationBranch(source);
+  const sourceReads = fetchCalls.filter(call => call.url.endsWith(`/git/ref/heads/${source}`));
+  const backupReads = fetchCalls.filter(call => call.url.endsWith(`/git/ref/heads/${backup}`));
+  const destinationReads = fetchCalls.filter(call => call.url.endsWith(`/git/ref/heads/${destination}`));
+  assert.ok(sourceReads.length >= 4, "source must be proven absent before and after child");
+  assert.ok(backupReads.length >= 4, "derived backup must be proven absent before and after child");
+  assert.ok(destinationReads.length >= 4, "derived destination must be proven absent before and after child");
+});
+
+test("D373 only-Backup cleanup failure blocks qualification despite Source cleanup success", async () => {
+  const f = await fixture();
+  const { options, progress, runnerEvents, fetchCalls } = baseOptions(f, {
+    fetch: { backupCleanupStatus: 403 },
+  });
+  await assert.rejects(() => qualifyLocal(options), /cleanup verification failed/i);
+  assert.equal(progress.some(e => e.name === "github-e2e-cleanup-verified"), false);
+  const source = runnerEvents.find(e => e.name === "github-e2e-live")?.branch;
+  assert.match(source ?? "", /^obsidian-sync-e2e\/local-/u);
+  const backup = deriveGitHubE2EFrozenBackupBranch(source);
+  assert.ok(fetchCalls.filter(c => c.url.endsWith(`/git/ref/heads/${source}`)).length >= 4,
+    "Source cleanup must still complete when Backup cleanup is denied");
+  assert.ok(fetchCalls.filter(c => c.url.endsWith(`/git/ref/heads/${backup}`)).length >= 3);
+  const ref = qualificationRefName("1.0.8", f.sha);
+  assert.equal(git(f.work, ["ls-remote", "--refs", f.bare, ref]).stdout.trim(), "");
+});
+
+test("D374 only-Destination cleanup failure blocks release receipt and still verifies Source and Backup cleanup", async () => {
+
+  const f = await fixture();
+
+  const { options, progress, runnerEvents, fetchCalls } = baseOptions(f, {
+
+    fetch: { destinationCleanupStatus: 403 },
+
+  });
+
+  await assert.rejects(() => qualifyLocal(options), /cleanup verification failed/i);
+
+  assert.equal(progress.some(e => e.name === "github-e2e-cleanup-verified"), false);
+
+  const source = runnerEvents.find(e => e.name === "github-e2e-live")?.branch;
+
+  assert.match(source ?? "", /^obsidian-sync-e2e\/local-/u);
+
+  const backup = deriveGitHubE2EFrozenBackupBranch(source);
+
+  const destination = deriveGitHubE2EDestinationBranch(source);
+
+  for (const branch of [source, backup]) {
+
+    assert.ok(fetchCalls.filter(c => c.url.endsWith(`/git/ref/heads/${branch}`)).length >= 4);
+
+  }
+
+  assert.ok(fetchCalls.filter(c => c.url.endsWith(`/git/ref/heads/${destination}`)).length >= 3);
+
+  assert.equal(git(f.work, ["ls-remote", "--refs", f.bare,
+
+    qualificationRefName("1.0.8", f.sha)]).stdout.trim(), "");
+
+});
+
+
 
 test("valid existing remote receipt short-circuits without E2E credentials or gates", async () => {
   const f = await fixture();

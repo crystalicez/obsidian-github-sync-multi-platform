@@ -2,6 +2,8 @@ import assert from "node:assert/strict"
 import test from "node:test"
 import { existsSync } from "node:fs"
 import { Platform } from "obsidian"
+import FastSync from "../../src/main"
+import { DEFAULT_SETTINGS } from "../../src/setting"
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises"
 import path from "node:path"
 
@@ -2941,6 +2943,7 @@ test("D251 installed read-only Git ref inspection pins live Settings across awai
   }
   const plugin = {
     settings, manifest: { id: "test-d251" },
+    settingsSaveGeneration: 0,
     isSyncInProgress: false,
     app: {
       vault: { configDir: ".obsidian", adapter: nativeAdapter },
@@ -2959,6 +2962,8 @@ test("D251 installed read-only Git ref inspection pins live Settings across awai
   const originals = methods.map(name => prototype[name]!)
   const sourceBranch = settings.githubBranch
   let drift = false
+  let completedSaveDuringGitRead = false
+  let injectCompletedSave = false
   const before = new Map(s.old.f.s.files)
   const runtime = new V4PluginRuntime(plugin as never)
   try {
@@ -2966,6 +2971,11 @@ test("D251 installed read-only Git ref inspection pins live Settings across awai
       prototype[name] = function (this: GitHubClient, ...args: never[]) {
         if (name === "getRepositoryIdentity" && drift) {
           settings.githubBranch = "mutated-during-github-read"
+        }
+        if (name === "getRepositoryIdentity" && injectCompletedSave
+          && !completedSaveDuringGitRead) {
+          completedSaveDuringGitRead = true
+          plugin.settingsSaveGeneration++
         }
         const git = this.branchName === backupBranch ? backupGit : destinationGit
         return (git[name] as Stub).call(git as never, ...args)
@@ -2976,6 +2986,16 @@ test("D251 installed read-only Git ref inspection pins live Settings across awai
     assert.equal(good?.destinationOrphanTopologyObserved, true)
     assert.equal(good?.fullDestinationContentsReverified, false)
     assert.equal(good?.resumeSyncAuthorized, false)
+    injectCompletedSave = true
+    const staleAfterSave = await runtime.inspectFencedReencryptionCandidateGitRefs()
+    injectCompletedSave = false
+    assert.equal(completedSaveDuringGitRead, true,
+      "the Settings save must finish during a remote Git identity read")
+    assert.equal(staleAfterSave, null,
+      "a completed Settings save cannot certify the old remote Git ref topology")
+    const stableAfterSave = await runtime.inspectFencedReencryptionCandidateGitRefs()
+    assert.equal(stableAfterSave?.observation, "candidate-remote-refs-observed-untrusted",
+      "a stable Settings generation permits a new read-only Git ref inspection")
     const originalNativeRead = nativeAdapter.read
     const originalNativeExists = nativeAdapter.exists
     for (const replaced of ["read", "exists"] as const) {
@@ -3542,14 +3562,16 @@ test("D248/D250/D252 verifies Desktop WAL lock, installed physical readback and 
       exists: (name: string) => local.exists(name.replace(prefix, "")),
       mkdir: (name: string) => local.mkdir(name.replace(prefix, "")),
     }
-    const runtime = new V4PluginRuntime({
+    const runtimePlugin = {
       settings, manifest: { id: pluginId }, loadData: async () => JSON.parse(s.old.saved),
+      settingsSaveGeneration: 0,
       isSyncInProgress: false,
       app: {
         vault: { configDir, adapter: installedAdapter },
         secretStorage: { getSecret: (id: string) => s.old.f.s.secrets.get(id) ?? null },
       },
-    } as never)
+    }
+    const runtime = new V4PluginRuntime(runtimePlugin as never)
     try {
       settings["githubToken"] = "offline-d252-test-token"
       const blockedCrypto = await runtime.verifyFencedReencryptionAuthenticatedWal()
@@ -3579,6 +3601,26 @@ test("D248/D250/D252 verifies Desktop WAL lock, installed physical readback and 
       assert.equal(changed.observation, "manual-recovery-required")
       installedAdapter.read = originalRead
       settings["githubBranch"] = sourceBranch
+      // An accepted Settings save can start and finish while a local
+      // contract read is awaiting its Adapter. No Settings values need change.
+      let completedSaveDuringStructure = false
+      installedAdapter.read = async name => {
+        const value = await originalRead(name)
+        if (name.endsWith("/contract.json") && !completedSaveDuringStructure) {
+          completedSaveDuringStructure = true
+          runtimePlugin.settingsSaveGeneration++
+        }
+        return value
+      }
+      try {
+        const staleStructure = await runtime.inspectFencedReencryptionExistingWalStructure()
+        assert.equal(completedSaveDuringStructure, true)
+        assert.equal(staleStructure.observation, "manual-recovery-required",
+          "completed Settings save must revoke stale Desktop WAL structure evidence")
+        assert.equal(staleStructure.resumeSyncAuthorized, false)
+      } finally {
+        installedAdapter.read = originalRead
+      }
 
       const methods = [
         "getRepositoryIdentity", "getRepositoryDefaultBranch", "getGitRef",
@@ -3616,6 +3658,25 @@ test("D248/D250/D252 verifies Desktop WAL lock, installed physical readback and 
         assert.equal(authenticated?.recoveryLeaseReverified, true)
         assert.equal(authenticated?.resumeSyncAuthorized, false)
         assert.equal(authenticated?.localCutoverAuthorized, false)
+        const originalBackupIdentity = backupGit["getRepositoryIdentity"]!
+        let completedSaveDuringRemoteRead = false
+        backupGit["getRepositoryIdentity"] = async (...args: never[]) => {
+          const result = await originalBackupIdentity.call(backupGit as never, ...args)
+          if (!completedSaveDuringRemoteRead) {
+            completedSaveDuringRemoteRead = true
+            runtimePlugin.settingsSaveGeneration++
+          }
+          return result
+        }
+        try {
+          const staleAuth = await runtime.verifyFencedReencryptionAuthenticatedWal()
+          assert.equal(completedSaveDuringRemoteRead, true,
+            "a completed Settings save must occur during the pinned GitHub read")
+          assert.equal(staleAuth, null,
+            "completed Settings save cannot certify stale authenticated Desktop WAL")
+        } finally {
+          backupGit["getRepositoryIdentity"] = originalBackupIdentity
+        }
         const firstComplete = runtime.inspectFencedReencryptionCompleteRecovery()
         assert.equal(await runtime.inspectFencedReencryptionCompleteRecovery(), null,
           "a second Complete Recovery invocation must not overlap the first installed owner")
@@ -3627,6 +3688,26 @@ test("D248/D250/D252 verifies Desktop WAL lock, installed physical readback and 
         assert.equal(complete?.completeDestinationContentsReverified, true)
         assert.equal(complete?.localCutoverAuthorized, false)
         assert.equal(complete?.resumeSyncAuthorized, false)
+        // A no-op or failed Settings save can finish inside the nested
+        // authenticated Backup read and still invalidate Complete Recovery.
+        const completeBackupIdentity = backupGit["getRepositoryIdentity"]!
+        let completedSaveDuringComplete = false
+        backupGit["getRepositoryIdentity"] = async (...args: never[]) => {
+          const result = await completeBackupIdentity.call(backupGit as never, ...args)
+          if (!completedSaveDuringComplete) {
+            completedSaveDuringComplete = true
+            runtimePlugin.settingsSaveGeneration++
+          }
+          return result
+        }
+        try {
+          const staleComplete = await runtime.inspectFencedReencryptionCompleteRecovery()
+          assert.equal(completedSaveDuringComplete, true)
+          assert.equal(staleComplete, null,
+            "completed Settings save must revoke installed Complete Recovery evidence")
+        } finally {
+          backupGit["getRepositoryIdentity"] = completeBackupIdentity
+        }
         // D282: a short Sync can begin AND finish while an awaited GitHub
         // identity read is pending. The installed Recovery owner must not
         // accept the stale proof merely because isSyncing becomes false.
@@ -4148,14 +4229,16 @@ test("D248/D250/D252/D260/D262 Mobile existing WAL, one-owner proof and in-proce
       return value
     }
     const settings = (JSON.parse(s.old.saved) as { settings: Record<string, unknown> }).settings
-    runtime = new V4PluginRuntime({
+    const runtimePlugin = {
       settings, manifest: { id: pluginId }, loadData: async () => JSON.parse(s.old.saved),
+      settingsSaveGeneration: 0,
       isSyncInProgress: false,
       app: {
         vault: { configDir, adapter },
         secretStorage: { getSecret: (id: string) => s.old.f.s.secrets.get(id) ?? null },
       },
-    } as never)
+    }
+    runtime = new V4PluginRuntime(runtimePlugin as never)
     const structure = await runtime.inspectFencedReencryptionExistingWalStructure()
     assert.equal(structure.observation, "existing-wal-structure-observed-untrusted")
     assert.equal(structure.walAuthenticated, false)
@@ -4184,6 +4267,26 @@ test("D248/D250/D252/D260/D262 Mobile existing WAL, one-owner proof and in-proce
         adapter.stat = originalStatForRuntime
         adapter.list = originalListForRuntime
       }
+    }
+    const readerBeforeSave = adapter.read
+    let completedSaveDuringMobileStructure = false
+    adapter.read = async name => {
+      const value = await readerBeforeSave(name)
+      if (name.endsWith("/contract.json") && !completedSaveDuringMobileStructure) {
+        completedSaveDuringMobileStructure = true
+        runtimePlugin.settingsSaveGeneration++
+      }
+      return value
+    }
+    try {
+      const staleStructure = await runtime.inspectFencedReencryptionExistingWalStructure()
+      assert.equal(completedSaveDuringMobileStructure, true)
+      assert.equal(staleStructure.observation, "manual-recovery-required",
+        "completed Settings save must revoke stale Mobile WAL structure evidence")
+      assert.equal(staleStructure.walAuthenticated, false)
+      assert.equal(staleStructure.resumeSyncAuthorized, false)
+    } finally {
+      adapter.read = readerBeforeSave
     }
     settings["githubToken"] = "offline-d252-mobile-test-token"
     const methods = [
@@ -4761,15 +4864,17 @@ test("D234 Runtime read-only Destination Shadow route uses native persistent plu
   const runtimeSettings = {
     ...(JSON.parse(s.saved) as { settings: Record<string, string> }).settings,
   }
-  const runtime = new V4PluginRuntime({
+  const plugin = {
     settings: runtimeSettings,
+    settingsSaveGeneration: 0,
     app: {
       vault,
       secretStorage: { getSecret: (id: string) => s.f.s.secrets.get(id) ?? null },
     },
     manifest: { id: "test-d234" },
     loadData: async () => JSON.parse(s.saved),
-  } as never)
+  }
+  const runtime = new V4PluginRuntime(plugin as never)
   try {
     const observed = await runtime.inspectFencedReencryptionIndexRoute()
     assert.equal(observed.observation, "destination-shadow-diagnostic-only")
@@ -4833,6 +4938,29 @@ test("D234 Runtime read-only Destination Shadow route uses native persistent plu
     }
     assert.equal((await runtime.inspectFencedReencryptionIndexRoute()).observation,
       "destination-shadow-diagnostic-only", "startup scan succeeds after restoring the owner")
+    let savedDuringStartupRead = false
+    nativeAdapter.read = async path => {
+      const value = await originalRead(path)
+      if (!savedDuringStartupRead && path.includes("/github-sync-v4-index-rekey-")
+        && path.endsWith("/index.json")) {
+        savedDuringStartupRead = true
+        plugin.settingsSaveGeneration++
+      }
+      return value
+    }
+    try {
+      const staleRoute = await runtime.inspectFencedReencryptionIndexRoute()
+      assert.equal(savedDuringStartupRead, true)
+      assert.equal(staleRoute.observation, "manual-recovery-required",
+        "a completed Settings save invalidates the startup recovery route")
+      assert.equal(staleRoute.diagnosticIndexRoot, null)
+      assert.equal(runtime.getReencryptionColdStartIndexRoute(), staleRoute)
+    } finally {
+      nativeAdapter.read = originalRead
+    }
+    assert.equal((await runtime.inspectFencedReencryptionIndexRoute()).observation,
+      "destination-shadow-diagnostic-only",
+      "a stable Settings generation restores the read-only startup route")
     let swappedDuringShadowRead = false
     nativeAdapter.read = async path => {
       const value = await originalRead(path)
@@ -4894,6 +5022,28 @@ test("D234 Runtime read-only Destination Shadow route uses native persistent plu
         nativeAdapter.read = originalRead
         nativeAdapter.exists = originalExists
       }
+    }
+    let shadowIndexReads = 0
+    let savedDuringShadowRead = false
+    nativeAdapter.read = async path => {
+      const value = await originalRead(path)
+      if (path.includes("/github-sync-v4-index-rekey-") && path.endsWith("/index.json")) {
+        shadowIndexReads++
+        if (shadowIndexReads === 3) {
+          savedDuringShadowRead = true
+          plugin.settingsSaveGeneration++
+        }
+      }
+      return value
+    }
+    try {
+      const staleShadow = await runtime.readFencedReencryptionDestinationIndexForRecovery()
+      assert.equal(savedDuringShadowRead, true,
+        "complete Settings save after route inspection but during Destination Shadow read")
+      assert.equal(staleShadow, null,
+        "an old Destination Shadow must not be returned after a completed Settings save")
+    } finally {
+      nativeAdapter.read = originalRead
     }
     const restored = await runtime.readFencedReencryptionDestinationIndexForRecovery()
     assert.equal(restored?.repoId, s.f.id.destinationRepoId,
@@ -5004,6 +5154,111 @@ async function d233Scenario(journalKey?: Uint8Array) {
     setPersisted(value: unknown) { persisted = value },
   }
 }
+
+test("D368 installed plugin Settings Cutover must reject in-memory ignore-rule drift before Intent or native save", async () => {
+  const s = await d233Scenario()
+  const plugin = new FastSync()
+  plugin.app = { vault: { adapter: s.f.s.adapter } } as never
+  plugin.settings = { ...DEFAULT_SETTINGS, ...s.f.prepared.restart.settings }
+  plugin.v4Runtime = {} as V4PluginRuntime
+  let reads = 0
+  let nativeWrites = 0
+  const beforeFiles = new Map(s.f.s.files)
+  plugin.loadData = async () => {
+    reads++
+    if (reads === 1) {
+      // D233 has already passed plugin owner checks and awaited Git/Selector
+      // proofs. Simulate a settings editor mutating the SAME object in-place
+      // while native loadData() resumes. Connection identity stays unchanged.
+      plugin.settings.ignorePathRegex = "^ChangedDuringCutover/"
+    }
+    return JSON.parse(s.saved)
+  }
+  plugin.saveData = async (data: unknown) => {
+    nativeWrites++
+    s.setPersisted(data)
+  }
+  await assert.rejects(
+    () => plugin.persistFencedReencryptionDestinationSettings(s.cutover),
+    /Settings ownership|Settings.*changed/i,
+    "in-memory scope drift cannot be silently overwritten by a stale native Settings cutover",
+  )
+  assert.equal(reads >= 1, true, "regression must reach native persisted Settings read")
+  assert.equal(plugin.settings.ignorePathRegex, "^ChangedDuringCutover/")
+  assert.equal(nativeWrites, 0, "must refuse before native Settings save")
+  assert.equal(s.saved, s.initial, "must preserve persisted original Source Settings")
+  assert.deepEqual(s.f.s.files, beforeFiles, "must not write a partial local Intent or Route")
+  assert.equal(s.f.s.holderCounts().held, false, "exclusive owner lease must be released")
+})
+
+test("D368 a late in-memory Settings edit during final persisted read refuses before Intent creation", async () => {
+  const s = await d233Scenario()
+  const plugin = new FastSync()
+  plugin.app = { vault: { adapter: s.f.s.adapter } } as never
+  plugin.settings = { ...DEFAULT_SETTINGS, ...s.f.prepared.restart.settings }
+  plugin.v4Runtime = {} as V4PluginRuntime
+  const beforeFiles = new Map(s.f.s.files)
+  let reads = 0
+  let nativeWrites = 0
+  plugin.loadData = async () => {
+    if (++reads === 2) {
+      // The first native read and full Git proof were stable. A settings
+      // editor changes the same object during the final pre-Intent read.
+      plugin.settings.ignorePathRegex = "^EditedAfterProof/"
+    }
+    return JSON.parse(s.saved)
+  }
+  plugin.saveData = async (data: unknown) => {
+    nativeWrites++
+    s.setPersisted(data)
+  }
+  await assert.rejects(
+    () => plugin.persistFencedReencryptionDestinationSettings(s.cutover),
+    /Settings ownership|Settings.*changed/i,
+  )
+  assert.ok(reads >= 2, "the race must occur after full proof, in the last read before Intent")
+  assert.equal(plugin.settings.ignorePathRegex, "^EditedAfterProof/")
+  assert.equal(nativeWrites, 0, "no native Settings write is allowed after losing ownership")
+  assert.equal(s.saved, s.initial)
+  assert.deepEqual(s.f.s.files, beforeFiles, "late in-memory drift must not create Intent or Route")
+  assert.equal(s.f.s.holderCounts().held, false)
+})
+test("D368 restart Settings observer refuses late in-memory preference drift before reporting Destination", async () => {
+  const s = await d233Scenario()
+  await persistV4FencedDestinationSettings(s.cutover)
+  const beforeFiles = new Map(s.f.s.files)
+  const beforeSaved = s.saved
+  const beforeWrites = s.f.s.getWrites()
+  const liveSettings = { ...DEFAULT_SETTINGS, ...s.f.prepared.restart.settings }
+  const pinnedSettings = JSON.stringify(liveSettings)
+  let reads = 0
+  s.cutover.assertLivePluginOwner = () => {
+    assert.equal(s.f.s.holderCounts().held, true)
+    if (JSON.stringify(liveSettings) !== pinnedSettings) {
+      throw Error("live plugin Settings changed during restart readback")
+    }
+  }
+  s.cutover.readPersistedPluginData = async () => {
+    if (++reads === 3) {
+      // The final native read returns the same disk data, but an editor
+      // changes the in-memory Settings while that read is pending.
+      liveSettings.ignorePathRegex = "^ChangedDuringRestart/"
+    }
+    return JSON.parse(s.saved)
+  }
+  const observed = await inspectV4FencedDestinationSettingsAfterRestart(s.cutover)
+  assert.ok(reads >= 3, "race must occur in the final post-Git native read")
+  assert.equal(observed.observation, "manual-recovery-required",
+    "a stale live Settings owner must never receive a verified Destination observation")
+  assert.equal(observed.artifactWindow, "foreign-or-torn")
+  assert.equal(observed.resumeSyncAuthorized, false)
+  assert.equal(s.saved, beforeSaved, "read-only restart inspection cannot change Settings")
+  assert.equal(s.f.s.getWrites(), beforeWrites, "inspection cannot write a local WAL or Route")
+  assert.deepEqual(s.f.s.files, beforeFiles)
+  assert.equal(s.f.s.holderCounts().held, false)
+})
+
+
 
 test("D233 native plugin-data Settings commit preserves preferences and both passphrases under full post-Selector Git proof", async () => {
   const s = await d233Scenario()

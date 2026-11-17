@@ -1,5 +1,6 @@
 import type { GitHubClient } from "../github-api"
 import { throwIfV4Aborted } from "./cancellation"
+import { computeV4ReencryptionCandidateManifestDigest } from "./reencryption-candidate-manifest-digest"
 import {
   captureV4ReencryptionInitiatorParityEvidence,
   verifyV4ReencryptionInitiatorLocalParity,
@@ -133,59 +134,155 @@ async function publishThreeBranchDestination(
     input.initiatorLocalParity,
   )
 
+  // Backup/Scratch/Topology reports are TypeScript-readonly, NOT runtime
+  // immutable. The journal-intent callback and remote reads yield to external
+  // code before Git ref creation. Bind every accepted proof to this one run;
+  // do not let a caller replace an affirmative Backup or scratch proof while
+  // the initiating-vault parity still happens to match.
+  const proofIdentity = JSON.stringify({
+    plan, backupPlan: b, prepared: p, backup: proof, scratch,
+    sourceTreeSha: input.sourceTreeSha, sourceConfig: input.sourceConfig,
+  })
+  const manifestIdentity = computeV4ReencryptionCandidateManifestDigest({
+    prepared: p, sourceTreeSha: input.sourceTreeSha,
+    destinationConfig: input.expectedDestinationConfig,
+    expectedRecords: input.expectedRecords, expectedReceipts: input.expectedReceipts,
+  })
+  // A stable client object does not imply stable methods. A caller may swap
+  // the Backup observer or Destination create method while WAL/GitHub awaits.
+  const backupTransport = {
+    branchName: input.backupRefReader.branchName,
+    getRepositoryIdentity: input.backupRefReader.getRepositoryIdentity,
+    getRepositoryDefaultBranch: input.backupRefReader.getRepositoryDefaultBranch,
+    getGitRefOrNull: input.backupRefReader.getGitRefOrNull,
+    getGitCommit: input.backupRefReader.getGitCommit,
+  }
+  const destinationTransport = {
+    branchName: input.github.branchName,
+    getRepositoryIdentity: input.github.getRepositoryIdentity,
+    getRepositoryDefaultBranch: input.github.getRepositoryDefaultBranch,
+    getGitRef: input.github.getGitRef,
+    getGitRefOrNull: input.github.getGitRefOrNull,
+    getGitCommit: input.github.getGitCommit,
+    getTreeAt: input.github.getTreeAt,
+    getBlob: input.github.getBlob,
+    createGitRef: input.github.createGitRef,
+  }
+  const captured = {
+    plan, backupPlan: b, prepared: p, backup: proof, scratch,
+    records: input.expectedRecords, receipts: input.expectedReceipts,
+    sourceConfig: input.sourceConfig, destinationConfig: input.expectedDestinationConfig,
+    parity: input.initiatorLocalParity, backupReader: input.backupRefReader,
+    github: input.github, sourceTreeSha: input.sourceTreeSha,
+    signal: input.signal,
+    destinationPassphrase: input.destinationPassphrase,
+    assertExclusiveMigrationLease: input.assertExclusiveMigrationLease,
+    assertInitiatingVaultUnchanged: input.assertInitiatingVaultUnchanged,
+    assertDurablePublicationIntent: input.assertDurablePublicationIntent,
+  }
+  const assertEvidencePinned = () => {
+    // Keep the original cancellation authority from crossing an async WAL or
+    // GitHub boundary; callers cannot replace an aborted signal with a fresh one.
+    throwIfV4Aborted(captured.signal)
+    if (input.signal !== captured.signal
+      || input.plan !== captured.plan || input.backupPlan !== captured.backupPlan
+      || input.prepared !== captured.prepared || input.createdAndVerifiedBackup !== captured.backup
+      || input.scratchRestore !== captured.scratch
+      || input.expectedRecords !== captured.records || input.expectedReceipts !== captured.receipts
+      || input.sourceConfig !== captured.sourceConfig
+      || input.expectedDestinationConfig !== captured.destinationConfig
+      || input.initiatorLocalParity !== captured.parity
+      || input.backupRefReader !== captured.backupReader || input.github !== captured.github
+      || input.backupRefReader.branchName !== backupTransport.branchName
+      || input.backupRefReader.getRepositoryIdentity !== backupTransport.getRepositoryIdentity
+      || input.backupRefReader.getRepositoryDefaultBranch !== backupTransport.getRepositoryDefaultBranch
+      || input.backupRefReader.getGitRefOrNull !== backupTransport.getGitRefOrNull
+      || input.backupRefReader.getGitCommit !== backupTransport.getGitCommit
+      || input.github.branchName !== destinationTransport.branchName
+      || input.github.getRepositoryIdentity !== destinationTransport.getRepositoryIdentity
+      || input.github.getRepositoryDefaultBranch !== destinationTransport.getRepositoryDefaultBranch
+      || input.github.getGitRef !== destinationTransport.getGitRef
+      || input.github.getGitRefOrNull !== destinationTransport.getGitRefOrNull
+      || input.github.getGitCommit !== destinationTransport.getGitCommit
+      || input.github.getTreeAt !== destinationTransport.getTreeAt
+      || input.github.getBlob !== destinationTransport.getBlob
+      || input.github.createGitRef !== destinationTransport.createGitRef
+      || input.sourceTreeSha !== captured.sourceTreeSha
+      || input.destinationPassphrase !== captured.destinationPassphrase
+      || input.assertExclusiveMigrationLease !== captured.assertExclusiveMigrationLease
+      || input.assertInitiatingVaultUnchanged !== captured.assertInitiatingVaultUnchanged
+      || input.assertDurablePublicationIntent !== captured.assertDurablePublicationIntent
+      || JSON.stringify({
+        plan, backupPlan: b, prepared: p, backup: proof, scratch,
+        sourceTreeSha: input.sourceTreeSha, sourceConfig: input.sourceConfig,
+      }) !== proofIdentity
+      || computeV4ReencryptionCandidateManifestDigest({
+        prepared: p, sourceTreeSha: input.sourceTreeSha,
+        destinationConfig: input.expectedDestinationConfig,
+        expectedRecords: input.expectedRecords, expectedReceipts: input.expectedReceipts,
+      }) !== manifestIdentity) {
+      throw new Error("Re-encryption three-branch publication evidence changed after validation.")
+    }
+  }
+
   // A D99 snapshot report does not prove the frozen Backup ref has not
   // subsequently moved. Reobserve it before mutation and after publication.
   const assertBackupStillFrozen = async () => {
-    throwIfV4Aborted(input.signal)
+    assertEvidencePinned()
+    throwIfV4Aborted(captured.signal)
     const reader = input.backupRefReader
     const expectedRepo = b.backupRepoId.split("#")[0]
     if (!reader || reader.branchName !== b.backupBranch || !expectedRepo) {
       throw new Error("Re-encryption frozen Backup observer must use the exact Backup branch.")
     }
     const actualRepo = await reader.getRepositoryIdentity()
-    throwIfV4Aborted(input.signal)
+    throwIfV4Aborted(captured.signal)
     if (actualRepo.id !== b.physicalRepositoryId
       || actualRepo.fullName.toLowerCase() !== expectedRepo.toLowerCase()) {
       throw new Error("Re-encryption frozen Backup physical GitHub repository switched.")
     }
     const currentDefault = await reader.getRepositoryDefaultBranch()
-    throwIfV4Aborted(input.signal)
+    throwIfV4Aborted(captured.signal)
     if (currentDefault === b.backupBranch || currentDefault === plan.destinationBranch) {
       throw new Error("Re-encryption frozen Backup or Destination must not be the GitHub default branch.")
     }
     const observed = await reader.getGitRefOrNull()
-    throwIfV4Aborted(input.signal)
+    throwIfV4Aborted(captured.signal)
     if (!observed || observed.ref !== `refs/heads/${b.backupBranch}`
       || observed.type !== "commit" || observed.sha !== b.pinnedSourceCommitSha) {
       throw new Error("Re-encryption frozen Backup ref disappeared or changed from the pinned original.")
     }
     const commit = await reader.getGitCommit(b.pinnedSourceCommitSha)
-    throwIfV4Aborted(input.signal)
+    throwIfV4Aborted(captured.signal)
     if (commit.sha !== b.pinnedSourceCommitSha
       || commit.treeSha !== input.sourceTreeSha
       || !Array.isArray(commit.parentShas)) {
       throw new Error("Re-encryption frozen Backup Git commit or tree changed.")
     }
+    assertEvidencePinned()
   }
 
   const guard = async () => {
+    assertEvidencePinned()
     await assertBackupStillFrozen()
-    throwIfV4Aborted(input.signal)
+    throwIfV4Aborted(captured.signal)
     await input.assertExclusiveMigrationLease()
-    throwIfV4Aborted(input.signal)
+    throwIfV4Aborted(captured.signal)
     await input.assertInitiatingVaultUnchanged()
-    throwIfV4Aborted(input.signal)
+    throwIfV4Aborted(captured.signal)
     const parity = await verifyV4ReencryptionInitiatorLocalParity({
-      ...pinnedLocalParity, signal: input.signal,
+      ...pinnedLocalParity, signal: captured.signal,
     })
     if (parity.initiatorLocalCutoverAuthorized !== false
       || parity.checkedFileCount !== proof.verifiedFileCount
       || parity.checkedPlaintextBytes !== proof.verifiedPlaintextBytes) {
       throw new Error("Re-encryption initiating-device full local content parity failed.")
     }
-    throwIfV4Aborted(input.signal)
+    throwIfV4Aborted(captured.signal)
+    assertEvidencePinned()
     await checkpoint()
-    throwIfV4Aborted(input.signal)
+    throwIfV4Aborted(captured.signal)
+    assertEvidencePinned()
   }
   await guard()
   const published: V4ReencryptionVerifiedOrphanPublishReport =
@@ -199,8 +296,9 @@ async function publishThreeBranchDestination(
       expectedRecords: input.expectedRecords,
       expectedReceipts: input.expectedReceipts,
       destinationPassphrase: input.destinationPassphrase,
-      signal: input.signal,
+      signal: captured.signal,
       assertExclusiveMigrationLease: guard,
+      assertPublicationEvidenceUnchanged: assertEvidencePinned,
       assertDurablePublicationIntent: async () => {
         await guard()
         // Persist the full exact ref+candidate intent (with caller-owned WAL).
@@ -209,6 +307,7 @@ async function publishThreeBranchDestination(
       },
     })
   await guard()
+  assertEvidencePinned()
   if (!published || published.destinationContentsReadbackVerified !== true
     || published.destinationRepoId !== plan.destinationRepoId
     || published.destinationCommitSha !== p.commitSha

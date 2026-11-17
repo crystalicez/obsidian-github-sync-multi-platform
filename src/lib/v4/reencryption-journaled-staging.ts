@@ -43,12 +43,62 @@ function sameReceipt(a: V4ReencryptionObjectReceipt, b: V4ReencryptionObjectRece
 export async function stageV4ReencryptionVaultObjectsWithJournal(
   input: V4JournaledReencryptionStageInput,
 ): Promise<V4JournaledReencryptionStagingResult> {
-  throwIfV4Aborted(input.signal)
+  // An external caller cannot replace WAL authority or its remote writer
+  // during an awaited lease, source read, or encrypted journal checkpoint.
+  const owner = {
+    lease: input.assertExclusiveStageLease,
+    durable: input.assertCrashDurable,
+    bestEffort: input.assertBestEffortWalCheckpoint,
+    upload: input.stageImmutableObject,
+    verifySource: input.verifySourceStillPinned,
+    readSource: input.readSourceObject,
+    journal: input.journal,
+    plan: input.plan,
+    handoff: input.beginAfterVerifiedBackup,
+    sourceConfig: input.sourceConfig,
+    sourceHead: input.sourceHead,
+    sourceShards: input.sourceShards,
+    sourceKeyring: input.sourceKeyring,
+    destinationConfig: input.destinationConfig,
+    destinationKeyring: input.destinationKeyring,
+    signal: input.signal,
+  }
+  const assertOwner = () => {
+    throwIfV4Aborted(owner.signal)
+    if (input.assertExclusiveStageLease !== owner.lease
+      || input.assertCrashDurable !== owner.durable
+      || input.assertBestEffortWalCheckpoint !== owner.bestEffort
+      || input.stageImmutableObject !== owner.upload
+      || input.verifySourceStillPinned !== owner.verifySource
+      || input.readSourceObject !== owner.readSource
+      || input.journal !== owner.journal || input.plan !== owner.plan
+      || input.beginAfterVerifiedBackup !== owner.handoff
+      || input.sourceConfig !== owner.sourceConfig
+      || input.sourceHead !== owner.sourceHead
+      || input.sourceShards !== owner.sourceShards
+      || input.sourceKeyring !== owner.sourceKeyring
+      || input.destinationConfig !== owner.destinationConfig
+      || input.destinationKeyring !== owner.destinationKeyring
+      || input.signal !== owner.signal) {
+      throw new Error("Re-encryption staging callback or authority changed during WAL operation.")
+    }
+  }
+  const holdLease = async () => {
+    assertOwner()
+    await owner.lease()
+    assertOwner()
+  }
+  const verifySource = async () => {
+    assertOwner()
+    await owner.verifySource()
+    assertOwner()
+  }
+  assertOwner()
   if (input.journal.sourceCommitSha !== input.plan.pinnedSourceCommitSha
     || input.journal.destinationRepoId !== input.plan.destinationRepoId) {
     throw new Error("Re-encryption WAL source/destination binding mismatch.")
   }
-  await input.assertExclusiveStageLease()
+  await holdLease()
   throwIfV4Aborted(input.signal)
   if (input.beginAfterVerifiedBackup
     ? (typeof input.assertCrashDurable === "function")
@@ -57,17 +107,18 @@ export async function stageV4ReencryptionVaultObjectsWithJournal(
     throw new Error("Re-encryption three-branch Staging requires exactly one crash-durable WAL barrier or authenticated best-effort checkpoint.")
   }
   const assertThreeBranchWalCheckpoint = async (generation?: number) => {
-    throwIfV4Aborted(input.signal)
-    await input.assertExclusiveStageLease()
+    assertOwner()
+    await holdLease()
     throwIfV4Aborted(input.signal)
     if (input.beginAfterVerifiedBackup) {
-      if (input.assertCrashDurable) {
-        await input.assertCrashDurable()
+      if (owner.durable) {
+        await owner.durable()
       } else {
-        await input.assertBestEffortWalCheckpoint!(generation ?? input.beginAfterVerifiedBackup.expectedJournalGeneration)
+        await owner.bestEffort!(generation ?? owner.handoff!.expectedJournalGeneration)
       }
-      throwIfV4Aborted(input.signal)
+      assertOwner()
     }
+    assertOwner()
   }
   await assertThreeBranchWalCheckpoint()
   // Authenticate the inventory before recording handoff or touching GitHub.
@@ -78,10 +129,11 @@ export async function stageV4ReencryptionVaultObjectsWithJournal(
     keyring: input.sourceKeyring,
     pinnedSourceCommitSha: input.plan.pinnedSourceCommitSha,
   })
-  await input.verifySourceStillPinned()
-  await input.assertExclusiveStageLease()
+  await verifySource()
+  await holdLease()
   throwIfV4Aborted(input.signal)
   const previous = await input.journal.load()
+  assertOwner()
   let progress: V4ReencryptionJournalSnapshot
   if (previous) {
     const handoff = input.beginAfterVerifiedBackup
@@ -117,8 +169,15 @@ export async function stageV4ReencryptionVaultObjectsWithJournal(
   let stagedObjects = 0
   const result = await stageV4ReencryptionVaultObjects({
     ...input,
+    verifySourceStillPinned: verifySource,
+    readSourceObject: async (path, pinnedSha) => {
+      assertOwner()
+      const bytes = await owner.readSource(path, pinnedSha)
+      assertOwner()
+      return bytes
+    },
     async stageImmutableObject(path, ciphertext) {
-      await input.assertExclusiveStageLease()
+      await holdLease()
       throwIfV4Aborted(input.signal)
       const planned: V4ReencryptionObjectReceipt = Object.freeze({
         path, sha: computeV4GitBlobSha1(ciphertext), byteLength: ciphertext.byteLength,
@@ -130,11 +189,13 @@ export async function stageV4ReencryptionVaultObjectsWithJournal(
       await assertThreeBranchWalCheckpoint(progress.generation)
       await input.journal.assertHealthySnapshot(progress.generation)
       throwIfV4Aborted(input.signal)
-      const returnedSha = await input.stageImmutableObject(path, ciphertext)
+      assertOwner()
+      const returnedSha = await owner.upload(path, ciphertext)
+      assertOwner()
       // The remote may have written a blob even when this throws. Never retry
       // automatically or turn an unmatched reply into a confirmed receipt.
       throwIfV4Aborted(input.signal)
-      await input.assertExclusiveStageLease()
+      await holdLease()
       throwIfV4Aborted(input.signal)
       if (returnedSha !== planned.sha || computeV4GitBlobSha1(ciphertext) !== planned.sha) {
         throw new Error("Re-encryption WAL staged immutable blob SHA mismatch; intent remains unresolved.")
@@ -145,7 +206,7 @@ export async function stageV4ReencryptionVaultObjectsWithJournal(
       return returnedSha
     },
   })
-  await input.assertExclusiveStageLease()
+  await holdLease()
   throwIfV4Aborted(input.signal)
   const verifiedJournal = await input.journal.load()
   await assertThreeBranchWalCheckpoint(progress.generation)
@@ -156,7 +217,7 @@ export async function stageV4ReencryptionVaultObjectsWithJournal(
     || !verifiedJournal.receipts.every((receipt, i) => sameReceipt(receipt, result.receipts[i]!))) {
     throw new Error("Re-encryption WAL staged receipts disagree with the completed vault manifest.")
   }
-  await input.verifySourceStillPinned()
+  await verifySource()
   throwIfV4Aborted(input.signal)
   return Object.freeze({
     ...result,

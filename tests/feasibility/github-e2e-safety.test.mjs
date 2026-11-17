@@ -14,6 +14,9 @@ import {
   loadGitHubE2EEnv,
   parseEnvLine,
   qualificationE2EBranch,
+  deriveGitHubE2EFrozenBackupBranch,
+  deriveGitHubE2EDestinationBranch,
+  freshIsolatedGitHubE2EBranch,
   resolvePinnedGitHubE2ERepoId,
   sanitizeGitHubE2ELiveEnv,
   validateGitHubE2EConfig,
@@ -27,6 +30,27 @@ function fakeGit({ fetchUrls = [], pushUrls = [], status = 0 } = {}) {
     throw new Error(`Unexpected command: ${args.join(" ")}`);
   };
 }
+
+test("D373 frozen backup E2E branch is deterministic, isolated and bounded at maximum qualifier run ID", () => {
+  const source = qualificationE2EBranch("a".repeat(40), "r".repeat(64));
+  const derived = deriveGitHubE2EFrozenBackupBranch(source);
+  assert.match(derived, /^obsidian-sync-e2e\/local-backup-[0-9a-f]{32}$/u);
+  assert.ok(derived.length <= 105, "Derived backup branch must fit strict E2E reset limits");
+  assert.equal(derived, deriveGitHubE2EFrozenBackupBranch(source));
+  assert.notEqual(derived, source);
+  assert.notEqual(derived, deriveGitHubE2EFrozenBackupBranch(source.replace(/r$/u, "s")));
+  const destination = deriveGitHubE2EDestinationBranch(source);
+  assert.match(destination, /^obsidian-sync-e2e\/local-destination-[0-9a-f]{32}$/u);
+  assert.ok(destination.length <= 105);
+  assert.equal(destination, deriveGitHubE2EDestinationBranch(source));
+  assert.notEqual(destination, source);
+  assert.notEqual(destination, derived);
+  assert.notEqual(destination, deriveGitHubE2EDestinationBranch(source.replace(/r$/u, "s")));
+  for (const unsafe of ["feature/important", "main", "obsidian-sync-e2e/local-../main", "obsidian-sync-e2e/local-", ""]) {
+    assert.throws(() => deriveGitHubE2EFrozenBackupBranch(unsafe));
+    assert.throws(() => deriveGitHubE2EDestinationBranch(unsafe));
+  }
+});
 
 test("canonical source identity pins both name and stable numeric ID", () => {
   assert.equal(CANONICAL_REPOSITORY, "crystalicez/obsidian-github-sync-multi-platform");
@@ -109,6 +133,56 @@ test("E2E config rejects missing credentials, invalid target IDs, and protected 
   assert.throws(() => validateGitHubE2EConfig({ owner: "owner", repo: "repo", branch: "e2e", token: "secret", expectedRepoId: "" }), /EXPECTED_REPO_ID/i);
   assert.throws(() => validateGitHubE2EConfig({ owner: "owner", repo: "repo", branch: "e2e", token: "secret", expectedRepoId: "01" }), /EXPECTED_REPO_ID/i);
   assert.equal(validateGitHubE2EConfig({ owner: "owner", repo: "repo", branch: "e2e", token: "secret", expectedRepoId: "123" }).expectedRepoId, "123");
+});
+
+test("D314 E2E config rejects URL-normalizing owner or repo path segments", () => {
+  const base = { owner: "owner", repo: "repo", branch: "e2e/run", token: "secret", expectedRepoId: "123" };
+  for (const [owner, repo] of [
+    ["..", "repo"], [".", "repo"], ["owner", ".."], ["owner", "."],
+    ["ow?ner", "repo"], ["owner", "repo#fragment"], ["owner", "repo\\other"],
+    ["owner", "%2e%2e"], ["owner", "repo "],
+  ]) assert.throws(() => validateGitHubE2EConfig({...base, owner, repo}),
+    /invalid|unsafe/i, owner + "/" + repo);
+  assert.equal(validateGitHubE2EConfig({
+    ...base, owner: "legitimate-org", repo: "vault.snapshot-2",
+  }).targetRepository, "legitimate-org/vault.snapshot-2");
+});
+
+test("D312 E2E connection rejects URL-normalizing Git ref paths before credentialed network use", () => {
+  const base = { owner: "owner", repo: "repo", token: "secret", expectedRepoId: "123" };
+  for (const branch of [
+    "e2e/../../main",
+    "obsidian-sync-e2e/local-safe/../../protected",
+    "e2e/%2e%2e/main",
+    "e2e/./trunk",
+    "e2e//trunk",
+    "e2e/test?branch=main",
+    "e2e/test#main",
+    "e2e\\..\\main",
+  ]) {
+    assert.throws(() => validateGitHubE2EConfig({ ...base, branch }),
+      /invalid|unsafe|branch/i, branch);
+  }
+  assert.equal(validateGitHubE2EConfig({
+    ...base, branch: "obsidian-sync-e2e/local-aaaaaaaaaaaa-safe_run",
+  }).branch, "obsidian-sync-e2e/local-aaaaaaaaaaaa-safe_run");
+  assert.equal(validateGitHubE2EConfig({
+    ...base, branch: "test/rekey-v1.2",
+  }).branch, "test/rekey-v1.2");
+});
+
+test("D371 fresh GitHub E2E branch must use an isolated random-size ref name", () => {
+  const branch = freshIsolatedGitHubE2EBranch("a".repeat(32));
+  assert.equal(branch, "obsidian-sync-e2e/local-" + "a".repeat(32));
+  assert.equal(validateGitHubE2EConfig({
+    owner: "isolated-owner", repo: "isolated-repo", branch, token: "dummy",
+    expectedRepoId: "123456",
+  }).branch, branch);
+  for (const unsafe of ["", "abcd", "A".repeat(32), "x".repeat(32), "a".repeat(33),
+    "../".repeat(8), "a".repeat(31) + "/", undefined]) {
+    assert.throws(() => freshIsolatedGitHubE2EBranch(unsafe),
+      /random|128-bit/i, "must refuse predictable, malformed or unsafe run IDs");
+  }
 });
 
 test("native GUI E2E requires a pinned repository ID and rejects conflicting pins", () => {

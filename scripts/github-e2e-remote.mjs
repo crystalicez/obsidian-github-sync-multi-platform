@@ -1,4 +1,5 @@
 import { CANONICAL_REPOSITORY_ID } from "./github-repo.mjs";
+import { assertSafeGitHubE2EBranch, assertSafeGitHubE2ECoordinates } from "./github-e2e-env.mjs";
 const API_BASE = "https://api.github.com";
 const API_VERSION = "2022-11-28";
 const SHA_RE = /^[0-9a-f]{40}$/u;
@@ -45,14 +46,17 @@ function apiStatusError(label, status) {
 }
 
 function repositoryUrl(owner, repo) {
+  assertSafeGitHubE2ECoordinates(owner, repo);
   return `${API_BASE}/repos/${encoded(owner)}/${encoded(repo)}`;
 }
 
 function branchReadUrl(owner, repo, branch) {
+  assertSafeGitHubE2EBranch(branch);
   return `${repositoryUrl(owner, repo)}/git/ref/heads/${encodedBranch(branch)}`;
 }
 
 function branchDeleteUrl(owner, repo, branch) {
+  assertSafeGitHubE2EBranch(branch);
   return `${repositoryUrl(owner, repo)}/git/refs/heads/${encodedBranch(branch)}`;
 }
 
@@ -69,6 +73,11 @@ export async function readE2ERepository({ fetchImpl = fetch, owner, repo, token 
   if (!/^[1-9][0-9]*$/u.test(id)) throw new Error("GitHub E2E repository lookup returned no valid repository ID");
   if (typeof body.default_branch !== "string" || body.default_branch.trim() === "") {
     throw new Error("GitHub E2E repository lookup returned no valid default branch");
+  }
+  try {
+    assertSafeGitHubE2EBranch(body.default_branch);
+  } catch {
+    throw new Error("GitHub E2E repository lookup returned an unsafe default branch.");
   }
   return { id, defaultBranch: body.default_branch };
 }
@@ -91,6 +100,7 @@ export async function readE2EBranch({ fetchImpl = fetch, owner, repo, branch, to
 }
 
 export async function preflightE2ERemote({ fetchImpl = fetch, config }) {
+  assertSafeGitHubE2EBranch(config.branch);
   const repository = await readE2ERepository({
     fetchImpl,
     owner: config.owner,
@@ -132,13 +142,26 @@ export async function cleanupE2EBranch({
   if (!Number.isInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > 10) {
     throw new Error("maxAttempts must be an integer between 1 and 10");
   }
-  if (typeof branch !== "string" || !branch.startsWith("obsidian-sync-e2e/local-")) {
-    throw new Error("Local qualification cleanup is restricted to obsidian-sync-e2e/local-* branches");
+  // The writer generates a SINGLE fixed-prefix leaf. A second slash, dot,
+  // URL delimiter or percent escape can redirect GitHub DELETE after URL
+  // canonicalization; never treat a string prefix alone as ownership proof.
+  if (typeof branch !== "string"
+    || !/^obsidian-sync-e2e\/local-[A-Za-z0-9_-]{1,160}$/u.test(branch)) {
+    throw new Error("Local qualification cleanup is restricted to safe obsidian-sync-e2e/local-* branch leaves");
   }
+  assertSafeGitHubE2EBranch(branch);
   const config = { owner, repo, branch, token, expectedRepoId, currentSourceRepoId };
+  // A cleanup retry may only touch the same observed Git ref. GitHub DELETE
+  // cannot compare-and-swap its expected SHA, so never delete a newly created
+  // or replaced branch after our reads show a different owner/commit.
+  let pinnedPresentSha;
   const proveAbsentAfterTargetProof = async () => {
     await preflightE2ERemote({ fetchImpl, config });
     const observed = await readE2EBranch({ fetchImpl, owner, repo, branch, token });
+    if (observed.kind === "present" && pinnedPresentSha !== undefined
+      && observed.sha !== pinnedPresentSha) {
+      throw new Error("Disposable GitHub E2E branch changed during cleanup; manual cleanup required.");
+    }
     return observed.kind === "absent";
   };
 
@@ -146,7 +169,14 @@ export async function cleanupE2EBranch({
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     await preflightE2ERemote({ fetchImpl, config });
     const before = await readE2EBranch({ fetchImpl, owner, repo, branch, token });
-    if (before.kind === "absent" && await proveAbsentAfterTargetProof()) return;
+    if (before.kind === "absent") {
+      if (await proveAbsentAfterTargetProof()) return;
+      throw new Error("Disposable GitHub E2E branch reappeared after absence; manual cleanup required.");
+    }
+    if (pinnedPresentSha !== undefined && before.sha !== pinnedPresentSha) {
+      throw new Error("Disposable GitHub E2E branch changed during cleanup; manual cleanup required.");
+    }
+    pinnedPresentSha = before.sha;
 
     const deleted = await fetchResponse(
       fetchImpl,

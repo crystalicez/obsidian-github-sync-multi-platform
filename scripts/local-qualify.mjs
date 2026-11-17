@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { pathToFileURL } from "node:url";
-import { loadGitHubE2EEnv, qualificationE2EBranch, sanitizeGitHubE2ELiveEnv, validateGitHubE2EConfig } from "./github-e2e-env.mjs";
-import { cleanupE2EBranch, preflightE2ERemote } from "./github-e2e-remote.mjs";
+import { deriveGitHubE2EDestinationBranch, deriveGitHubE2EFrozenBackupBranch, loadGitHubE2EEnv, qualificationE2EBranch, sanitizeGitHubE2ELiveEnv, validateGitHubE2EConfig } from "./github-e2e-env.mjs";
+import { cleanupE2EBranch, preflightE2ERemote, readE2EBranch } from "./github-e2e-remote.mjs";
 import { CANONICAL_REPOSITORY, CANONICAL_REPOSITORY_ID, requireCanonicalOriginEndpoints } from "./github-repo.mjs";
 import {
   createQualificationReceipt,
@@ -145,6 +145,20 @@ export async function qualifyLocal({
     currentSourceRepo: CANONICAL_REPOSITORY,
   });
   await preflightE2ERemote({ fetchImpl, config: { ...e2eConfig, currentSourceRepoId: CANONICAL_REPOSITORY_ID } });
+  const ownedE2EBranches = [officialBranch, deriveGitHubE2EFrozenBackupBranch(officialBranch), deriveGitHubE2EDestinationBranch(officialBranch)];
+  for (const branch of ownedE2EBranches) {
+    const ref = {
+      fetchImpl, owner: e2eConfig.owner, repo: e2eConfig.repo,
+      branch, token: e2eConfig.token,
+    };
+    // The full Live suite can create Source, frozen Backup, and new-key Destination.
+    // Neither ref may preexist before the child can issue any mutations.
+    const first = await readE2EBranch(ref);
+    const second = await readE2EBranch(ref);
+    if (first.kind !== "absent" || second.kind !== "absent") {
+      throw new Error(`Qualification E2E ref already exists or cannot be proven absent: ${branch}`);
+    }
+  }
   onProgress({ kind: "e2e-branch", branch: officialBranch });
 
   onProgress({ kind: "gate", name: "metadata-validation" });
@@ -158,22 +172,28 @@ export async function qualifyLocal({
   onProgress({ kind: "gate", name: "github-e2e-live" });
   const liveEnv = sanitizeGitHubE2ELiveEnv({ ...raw, GITHUB_E2E_BRANCH: officialBranch });
   const liveResult = runPnpmGate("github-e2e-live", { cwd, env: liveEnv, platform, comspec, runner });
-  let cleanupError = null;
-  try {
-    await cleanupE2EBranch({
-      fetchImpl,
-      owner: e2eConfig.owner,
-      repo: e2eConfig.repo,
-      branch: officialBranch,
-      token: e2eConfig.token,
-      expectedRepoId: e2eConfig.expectedRepoId,
-      currentSourceRepoId: CANONICAL_REPOSITORY_ID,
-      sleep,
-    });
-    onProgress({ kind: "gate", name: "github-e2e-cleanup-verified" });
-  } catch (error) {
-    cleanupError = error;
+  const cleanupFailures = [];
+  // A child process can stop after creating the frozen Backup, bypassing
+  // its own finally hook. Prove EVERY authorized ref absent before receipt.
+  for (const branch of ownedE2EBranches) {
+    try {
+      await cleanupE2EBranch({
+        fetchImpl,
+        owner: e2eConfig.owner,
+        repo: e2eConfig.repo,
+        branch,
+        token: e2eConfig.token,
+        expectedRepoId: e2eConfig.expectedRepoId,
+        currentSourceRepoId: CANONICAL_REPOSITORY_ID,
+        sleep,
+      });
+    } catch (error) {
+      cleanupFailures.push(`${branch}: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
+  const cleanupError = cleanupFailures.length
+    ? new Error(cleanupFailures.join("; ")) : null;
+  if (!cleanupError) onProgress({ kind: "gate", name: "github-e2e-cleanup-verified" });
 
   if (!liveResult || liveResult.status !== 0) {
     if (cleanupError) throw new Error(`GitHub E2E live gate failed; cleanup also failed for ${officialBranch}: ${cleanupError.message}`);

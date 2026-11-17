@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import { CANONICAL_REPOSITORY, repositoriesEqual } from "./github-repo.mjs";
@@ -65,18 +66,41 @@ export function resolvePinnedGitHubE2ERepoId(envPinned, cliPinned) {
   return requireRepositoryId(fromCli || fromEnv);
 }
 
-function requireSafeSegment(value, name) {
-  if (typeof value !== "string" || value.trim() === "" || value.includes("/") || /\s/u.test(value)) {
-    throw new Error(`Invalid ${name}`);
+// Match the public GitHub username and repository boundaries before any
+// credentialed URL is built. encodeURIComponent does NOT escape "."/"..":
+// those segments would be normalized into a different API path by fetch.
+const E2E_OWNER = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/u;
+const E2E_REPO = /^[A-Za-z0-9._-]{1,100}$/u;
+export function assertSafeGitHubE2ECoordinates(owner, repo) {
+  if (typeof owner !== "string" || !E2E_OWNER.test(owner)) {
+    throw new Error("Invalid GITHUB_E2E_OWNER");
   }
-  return value.trim();
+  if (typeof repo !== "string" || !E2E_REPO.test(repo)
+    || repo === "." || repo === "..") {
+    throw new Error("Invalid GITHUB_E2E_REPO");
+  }
+}
+
+// E2E branch strings are interpolated into GitHub API URLs. URL parsers
+// normalize "." / ".." path segments BEFORE a request is sent; a prefix
+// check on the unparsed string is not a safe ref-identity boundary.
+const SAFE_E2E_REF_SEGMENT = /^[A-Za-z0-9_-][A-Za-z0-9._-]*$/u;
+export function assertSafeGitHubE2EBranch(branch) {
+  if (typeof branch !== "string" || branch.length === 0 || branch.length > 200
+    || branch.includes("..") || branch.endsWith(".")
+    || branch.split("/").some(segment => !SAFE_E2E_REF_SEGMENT.test(segment)
+      || segment.endsWith(".lock"))) {
+    throw new Error("Invalid GITHUB_E2E_BRANCH: unsafe GitHub branch path.");
+  }
 }
 
 export function validateGitHubE2EConfig({ owner, repo, branch, token, expectedRepoId, currentSourceRepo }) {
-  const safeOwner = requireSafeSegment(owner, "GITHUB_E2E_OWNER");
-  const safeRepo = requireSafeSegment(repo, "GITHUB_E2E_REPO");
+  assertSafeGitHubE2ECoordinates(owner, repo);
+  const safeOwner = owner;
+  const safeRepo = repo;
   if (typeof branch !== "string" || branch.trim() === "") throw new Error("Missing GITHUB_E2E_BRANCH");
-  const safeBranch = branch.trim();
+  assertSafeGitHubE2EBranch(branch);
+  const safeBranch = branch;
   if (FORBIDDEN_BRANCHES.has(safeBranch.toLowerCase())) {
     throw new Error(`Refusing destructive GitHub E2E against protected-looking branch: ${safeBranch}`);
   }
@@ -118,6 +142,33 @@ export function sanitizeGitHubE2ELiveEnv(env = {}) {
   const next = { ...env };
   for (const key of ["GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"]) delete next[key];
   return next;
+}
+
+function deriveIsolatedE2EBranch(sourceBranch, purpose) {
+  // Never inherit arbitrary source refs; destination and backup must both
+  // remain bounded single leaves even for maximum-size qualification run IDs.
+  assertSafeGitHubE2EBranch(sourceBranch);
+  if (!/^obsidian-sync-e2e\/local-[A-Za-z0-9_-]{6,160}$/u.test(sourceBranch)
+    || (purpose !== "backup" && purpose !== "destination")) {
+    throw new Error("Derived E2E ref needs a safe isolated generated source branch and purpose");
+  }
+  const leaf = createHash("sha256").update(sourceBranch + ":" + purpose, "utf8").digest("hex").slice(0, 32);
+  return `obsidian-sync-e2e/local-${purpose}-${leaf}`;
+}
+
+export function deriveGitHubE2EFrozenBackupBranch(sourceBranch) {
+  return deriveIsolatedE2EBranch(sourceBranch, "backup");
+}
+
+export function deriveGitHubE2EDestinationBranch(sourceBranch) {
+  return deriveIsolatedE2EBranch(sourceBranch, "destination");
+}
+
+export function freshIsolatedGitHubE2EBranch(runId) {
+  if (typeof runId !== "string" || !/^[0-9a-f]{32}$/u.test(runId)) {
+    throw new Error("A fresh isolated E2E branch needs a cryptographically random 128-bit hex run ID");
+  }
+  return `obsidian-sync-e2e/local-${runId}`;
 }
 
 export function qualificationE2EBranch(sha, runId) {

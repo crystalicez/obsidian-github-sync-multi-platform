@@ -241,7 +241,11 @@ export async function prepareV4ReencryptionOrphanCommit(
   if (!SHA.test(treeSha)) throw new Error("Re-encryption orphan root tree SHA is malformed.")
   await check()
   const commitSha = await github.createGitCommit(
-    "obsidian-sync-v4:re-encrypted-orphan-root",
+    // V4 Sync authenticates a first-device generation-one root by matching
+    // the commit subject to the AES-GCM-authenticated HEAD journalId.
+    // A fixed migration-only subject would incorrectly classify this valid
+    // new-key orphan as an external encrypted commit on fresh devices.
+    `obsidian-sync-v4:${head.journalId}`,
     treeSha, [], { originalCannotBeReachable: true },
   )
   if (!SHA.test(commitSha) || commitSha === plan.pinnedSourceCommitSha) {
@@ -262,9 +266,32 @@ export async function prepareV4ReencryptionOrphanCommit(
   if (storedTree.sha !== treeSha || storedTree.truncated !== false || !Array.isArray(storedTree.tree)) {
     throw new Error("Re-encryption orphan tree readback is incomplete.")
   }
+  const expectedBlobs = new Set(entries.map(entry => entry.path))
+  const expectedDirectories = new Set<string>()
+  for (const path of expectedBlobs) {
+    const segments = path.split("/")
+    for (let i = 1; i < segments.length; i++) {
+      expectedDirectories.add(segments.slice(0, i).join("/"))
+    }
+  }
   const observed = new Map<string, string>()
+  const seenNodes = new Set<string>()
   for (const entry of storedTree.tree) {
-    if (entry.type !== "blob" || entry.mode !== "100644" || observed.has(entry.path) || !SHA.test(entry.sha)) {
+    if (!entry || typeof entry.path !== "string" || !entry.path
+      || entry.path.startsWith("/") || entry.path.split("/").some(part => !part || part === "." || part === "..")
+      || !SHA.test(entry.sha) || seenNodes.has(entry.path)) {
+      throw new Error("Re-encryption orphan contains unexpected Git tree entries.")
+    }
+    seenNodes.add(entry.path)
+    // GitHub's recursive Git tree API includes directory entries. Accept
+    // only required ancestors of expected blobs, never arbitrary trees.
+    if (entry.type === "tree") {
+      if (entry.mode !== "040000" || !expectedDirectories.has(entry.path)) {
+        throw new Error("Re-encryption orphan contains unexpected Git tree entries.")
+      }
+      continue
+    }
+    if (entry.type !== "blob" || entry.mode !== "100644" || !expectedBlobs.has(entry.path)) {
       throw new Error("Re-encryption orphan contains unexpected Git tree entries.")
     }
     observed.set(entry.path, entry.sha)

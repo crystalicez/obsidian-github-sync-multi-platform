@@ -19,9 +19,9 @@ import { DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES, type V4ContentHandle, type V4Con
 import { planV4PackGroups } from "../../src/lib/v4/pack-planner";
 import { waitForCondition } from "../helpers/wait-for";
 import { V4SourceChangedError } from "../../src/lib/v4/object-stream";
-import { createV4StagingStore, type V4StageRef } from "../../src/lib/v4/staging-store";
+import { createV4StagingStore, V4StagingCleanupError, type V4StageRef } from "../../src/lib/v4/staging-store";
 import { V4LocalTargetChangedError } from "../../src/lib/v4/local-io";
-import { createV4RecoveryStore, type V4RecoveryStore } from "../../src/lib/v4/recovery-store";
+import { createV4RecoveryStore, V4RecoveryRequiredError, type V4RecoveryStore } from "../../src/lib/v4/recovery-store";
 
 const enc = (value: string) => new TextEncoder().encode(value);
 const dec = (value: Uint8Array) => new TextDecoder().decode(value);
@@ -230,6 +230,51 @@ async function unknownBaseFixture(mode: "plaintext" | "encrypted", localContent:
   return { github, vault, index, remoteConfig, keyring, remoteRecord, remoteBytes };
 }
 
+test("D407 Sync remote pull preserves write and cleanup failures without applying data", async () => {
+  const fixture = await unknownBaseFixture("plaintext", null);
+  const writeFailure = new Error("injected staged download write failure");
+  const cleanupFailure = new Error("injected staged download cleanup failure");
+  const partialStages = new Map<string, Uint8Array>();
+  const stagePath = "private/stage/pull-failed.bin";
+  let removals = 0;
+  fixture.vault.staging = createV4StagingStore({
+    root: "private/stage",
+    wholeBufferCeilingBytes: DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES,
+    randomId: () => "pull-failed",
+    backend: {
+      boundedAppend: true,
+      async write(path, bytes) {
+        partialStages.set(path, new Uint8Array(bytes));
+        throw writeFailure;
+      },
+      async append() { throw new Error("unexpected second chunk"); },
+      async remove() { removals++; throw cleanupFailure; },
+      async openSource() { throw new Error("must never open failed stage"); },
+      async freeBytes() { return Number.MAX_SAFE_INTEGER; },
+    },
+  });
+  const headBefore = fixture.github.ref!.sha;
+  await assert.rejects(
+    new V4SyncSession({
+      github: fixture.github, vault: fixture.vault, index: fixture.index,
+      config: fixture.remoteConfig, conflictPolicy: "newer", abortChangePercent: 0,
+      recoveryStore: {
+        async load() { return null; },
+        async save() { throw new Error("recovery WAL must not be persisted after a failed remote stage"); },
+      },
+    }).sync({ operation: "normal", allowThresholdOverride: false }),
+    error => error instanceof V4StagingCleanupError
+      && error.stageFailure === writeFailure
+      && error.cleanupFailure === cleanupFailure
+      && error.partialPath === stagePath,
+    "the user-visible Sync failure must preserve the root cause and unresolved cleanup",
+  );
+  assert.ok(removals >= 2, "the pull boundary must attempt abort after failed streaming");
+  assert.ok(partialStages.has(stagePath), "failed partial file must not be treated as committed");
+  assert.equal(fixture.vault.files.size, 0, "no downloaded content may be applied");
+  assert.equal(fixture.github.ref!.sha, headBefore, "no GitHub publication");
+});
+
 async function queuedUnknownBaseFixture(
   mode: "plaintext" | "encrypted",
   remoteFiles: Array<[path: string, content: string]>,
@@ -268,6 +313,88 @@ async function queuedUnknownBaseFixture(
   for (const [path, content] of localFiles) vault.files.set(path, { bytes: enc(content), mtime: 30 });
   return { mode, github, vault, index, remoteConfig, keyring, remoteRecords };
 }
+
+test("D410 WAL producer refuses duplicate staged target IDs before saving WAL or publishing", async () => {
+  const fixture = await queuedUnknownBaseFixture("plaintext",
+    [["A.md", "remote-A"], ["B.md", "remote-B"]], []);
+  const originalStaging = fixture.vault.staging;
+  let completedStages = 0;
+  let firstStageId: string | undefined;
+  fixture.vault.staging = {
+    ...originalStaging,
+    async beginStage(options) {
+      const sink = await originalStaging.beginStage(options);
+      return {
+        ...sink,
+        async finish(result) {
+          const stage = await sink.finish(result);
+          completedStages++;
+          if (!firstStageId) { firstStageId = stage.stageId; return stage; }
+          // Simulate an accidentally reused opaque stage identity from the
+          // existing staging adapter, while each target has distinct content.
+          return { ...stage, stageId: firstStageId };
+        },
+      };
+    },
+  };
+  const beforeIndex = structuredClone(fixture.index);
+  const beforeHead = fixture.github.ref!.sha;
+  const beforeCommits = fixture.github.commits.size;
+  let walWrites = 0;
+  await assert.rejects(
+    () => new V4SyncSession({
+      github: fixture.github, vault: fixture.vault, index: fixture.index,
+      config: fixture.remoteConfig, conflictPolicy: "newer", abortChangePercent: 0,
+      recoveryStore: {
+        async load() { return null; },
+        async save() { walWrites++; throw new Error("duplicate stage must never enter WAL"); },
+      },
+    }).sync({ operation: "normal", allowThresholdOverride: false }),
+    error => error instanceof V4RecoveryRequiredError && /stage.*(duplicate|shared|multiple|reuse)/i.test(error.message),
+    "reused stage ID must be rejected by the WAL producer, not merely by later Recovery",
+  );
+  assert.equal(completedStages, 2, "both distinct remote pulls must be fully staged before WAL preflight");
+  assert.equal(walWrites, 0, "never persist a WAL that replay will refuse");
+  assert.deepEqual(fixture.index, beforeIndex);
+  assert.equal(fixture.vault.files.size, 0, "no local target may be applied");
+  assert.equal(fixture.github.ref!.sha, beforeHead);
+  assert.equal(fixture.github.commits.size, beforeCommits);
+});
+
+test("D410 carried conflict-copy stage collision cannot silently omit its WAL target", async () => {
+  const fixture = await queuedUnknownBaseFixture("plaintext", [["A.md", "remote-A"]], []);
+  const beforeIndex = structuredClone(fixture.index);
+  const headBefore = fixture.github.ref!.sha;
+  const commitCount = fixture.github.commits.size;
+  let walWrites = 0;
+  // Existing synthetic carried copies are included in the planner, even when
+  // they are not yet present in the Vault. A stage-ID alias must not cause
+  // their separate target mutation to vanish from the WAL.
+  const stage = { stageId: "stage1", hash: await sha256Hex(enc("remote-A")), size: enc("remote-A").length, mtime: 20 };
+  await assert.rejects(
+    () => new V4SyncSession({
+      github: fixture.github, vault: fixture.vault, index: fixture.index,
+      config: fixture.remoteConfig, conflictPolicy: "newer", abortChangePercent: 0,
+      runState: {
+        conflictCopies: new Map(),
+        conflictCopyStages: new Map([["copy-ID", {
+          path: "independent-copy.md", fileId: "copy-ID", includeInSync: true, stage,
+        }]]),
+      },
+      recoveryStore: {
+        async load() { return null; },
+        async save() { walWrites++; throw new Error("collision should be rejected before WAL"); },
+      },
+    }).sync({ operation: "normal", allowThresholdOverride: false }),
+    error => error instanceof V4RecoveryRequiredError && /stage.*(shared|duplicate|multiple|reuse)/i.test(error.message),
+    "a carried copy on another path may not share the staged pull's physical backup identity",
+  );
+  assert.equal(walWrites, 0);
+  assert.deepEqual(fixture.index, beforeIndex);
+  assert.equal(fixture.github.ref!.sha, headBefore, "no publication of missing conflict-copy target");
+  assert.equal(fixture.github.commits.size, commitCount);
+  assert.equal(fixture.vault.files.size, 0);
+});
 
 type QueuedUnknownBaseFixture = Awaited<ReturnType<typeof queuedUnknownBaseFixture>>;
 

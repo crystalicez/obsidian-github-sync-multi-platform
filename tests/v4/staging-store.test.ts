@@ -7,6 +7,7 @@ import {
   estimateV4StagingSpace,
   V4InsufficientStagingSpaceError,
   V4UnknownStagingSpaceError,
+  V4StagingCleanupError,
 } from "../../src/lib/v4/staging-store";
 
 function source(data: Uint8Array, width = 3): V4ContentSource {
@@ -24,6 +25,49 @@ function gate() {
   const promise = new Promise<void>(resolve => { open = resolve; });
   return { promise, open };
 }
+
+test("D405 queued staging appends retain the supplied bytes after caller buffer reuse", async () => {
+  const files = new Map<string, Uint8Array>();
+  const firstEntered = gate(), continueFirst = gate();
+  const store = createV4StagingStore({
+    root: "private/stage", wholeBufferCeilingBytes: 8, randomId: () => "buffer-reuse",
+    backend: {
+      boundedAppend: true,
+      async write(path, bytes) {
+        firstEntered.open();
+        await continueFirst.promise;
+        files.set(path, new Uint8Array(bytes));
+      },
+      async append(path, bytes) {
+        const previous = files.get(path) ?? new Uint8Array();
+        const next = new Uint8Array(previous.length + bytes.length);
+        next.set(previous); next.set(bytes, previous.length); files.set(path, next);
+      },
+      async remove(path) { files.delete(path); },
+      async openSource() { throw new Error("not needed"); },
+      async freeBytes() { return 1024; },
+    },
+  });
+  const sink = await store.beginStage({
+    expectedSize: 4, existingTargetBytes: 0, atomicReplace: true, mtime: 7,
+  });
+  const firstBuffer = new Uint8Array([1, 2]);
+  const pendingFirst = sink.append(firstBuffer);
+  await firstEntered.promise;
+  const secondBuffer = new Uint8Array([3, 4]);
+  const pendingSecond = sink.append(secondBuffer);
+  // Streaming callers may release/recycle a byte buffer while another
+  // queued operation is waiting for the OS backend. Stage must own its input.
+  firstBuffer.fill(9);
+  secondBuffer.fill(8);
+  continueFirst.open();
+  await Promise.all([pendingFirst, pendingSecond]);
+  const claimedHash = "9f64a747e1b97f131fabb6b447296c9b6f0201e79fb3c5356e6c77e89b6a806a";
+  const stage = await sink.finish({ plaintextSha256: claimedHash, size: 4 });
+  assert.equal(stage.size, 4);
+  assert.deepEqual(files.get("private/stage/buffer-reuse.bin"), new Uint8Array([1, 2, 3, 4]),
+    "queued writes must preserve both chunks as originally submitted");
+});
 
 test("staging serializes two overlapping appends and finish never certifies pending bytes", async () => {
   const files = new Map<string, Uint8Array>();
@@ -94,6 +138,176 @@ test("abort during an in-flight initial stage write cannot leave a resurrected p
   await assert.rejects(sink.finish({ plaintextSha256: "b".repeat(64), size: 2 }), /closed|abort/i);
 });
 
+
+test("D407 stageSource preserves both source failure and failed abort cleanup", async () => {
+  const partial = new Map<string, Uint8Array>();
+  const sourceFailure = new Error("injected streaming source lost its next chunk");
+  const cleanupFailure = new Error("injected access denied deleting partial stage");
+  let removals = 0;
+  const store = createV4StagingStore({
+    root: "private/stage", wholeBufferCeilingBytes: 16, randomId: () => "stream-fail",
+    backend: {
+      boundedAppend: true,
+      async write(path, bytes) { partial.set(path, new Uint8Array(bytes)); },
+      async append() { throw new Error("unexpected append"); },
+      async remove() { removals++; throw cleanupFailure; },
+      async openSource() { throw new Error("unexpected read"); },
+      async freeBytes() { return 1024; },
+    },
+  });
+  const interruptedSource: V4ContentSource = {
+    size: 4,
+    async *chunks() {
+      yield new Uint8Array([7, 8]);
+      throw sourceFailure;
+    },
+  };
+  await assert.rejects(
+    store.stageSource(interruptedSource, { mtime: 1, existingTargetBytes: 0, atomicReplace: true }),
+    error => error instanceof V4StagingCleanupError
+      && error.stageFailure === sourceFailure
+      && error.cleanupFailure === cleanupFailure
+      && error.partialPath === "private/stage/stream-fail.bin",
+    "the streaming error must remain visible even if abort cannot remove the partial stage",
+  );
+  assert.equal(removals, 1);
+  assert.deepEqual(partial.get("private/stage/stream-fail.bin"), new Uint8Array([7, 8]));
+});
+
+test("D407 stageSource reports its original write failure after abort successfully recovers a failed first cleanup", async () => {
+  const partial = new Map<string, Uint8Array>();
+  const writeFailure = new Error("injected partial stage write failure");
+  const transientRemoveFailure = new Error("injected transient cleanup failure");
+  let removals = 0;
+  const store = createV4StagingStore({
+    root: "private/stage", wholeBufferCeilingBytes: 16, randomId: () => "retry-clean",
+    backend: {
+      boundedAppend: true,
+      async write(path, bytes) {
+        partial.set(path, new Uint8Array(bytes));
+        throw writeFailure;
+      },
+      async append() { throw new Error("unexpected append"); },
+      async remove(path) {
+        if (++removals === 1) throw transientRemoveFailure;
+        partial.delete(path);
+      },
+      async openSource() { throw new Error("unexpected read"); },
+      async freeBytes() { return 1024; },
+    },
+  });
+  await assert.rejects(
+    store.stageSource(source(new Uint8Array([5, 6])), {
+      mtime: 1, existingTargetBytes: 0, atomicReplace: true,
+    }),
+    error => error === writeFailure,
+    "once cleanup succeeds, the original write error must be returned, not a stale cleanup warning",
+  );
+  assert.equal(removals, 2);
+  assert.equal(partial.size, 0);
+});
+
+test("D406 abort reports failed partial cleanup and retries instead of falsely claiming deletion", async () => {
+  const files = new Map<string, Uint8Array>();
+  const stagePath = "private/stage/remove-failure.bin";
+  const cleanupFailure = new Error("simulated access denied during stage removal");
+  let removes = 0;
+  const store = createV4StagingStore({
+    root: "private/stage", wholeBufferCeilingBytes: 16, randomId: () => "remove-failure",
+    backend: {
+      boundedAppend: true,
+      async write(path, data) { files.set(path, new Uint8Array(data)); },
+      async append() { throw new Error("unexpected append"); },
+      async remove(path) {
+        if (++removes === 1) throw cleanupFailure;
+        files.delete(path);
+      },
+      async openSource() { throw new Error("unused"); },
+      async freeBytes() { return 1024; },
+    },
+  });
+  const sink = await store.beginStage({
+    expectedSize: 2, existingTargetBytes: 0, atomicReplace: true, mtime: 1,
+  });
+  await sink.append(new Uint8Array([5, 6]));
+  const firstAbort = sink.abort();
+  const concurrentAbort = sink.abort();
+  for (const pendingAbort of [firstAbort, concurrentAbort]) {
+    await assert.rejects(pendingAbort, error =>
+      error instanceof V4StagingCleanupError
+      && error.cleanupFailure === cleanupFailure
+      && error.partialPath === stagePath,
+      "both concurrent abort callers must observe the same typed cleanup failure");
+  }
+  assert.deepEqual(files.get(stagePath), new Uint8Array([5, 6]),
+    "unknown partial data remains after the failed cleanup");
+  await sink.abort();
+  assert.equal(removes, 2, "a subsequent abort must retry removing the remaining file");
+  assert.equal(files.has(stagePath), false);
+});
+
+test("D406 abort with an explicit absent stage is idempotent, not a recovery failure", async () => {
+  const missing = Object.assign(new Error("stage never created"), { code: "ENOENT" });
+  let attempts = 0;
+  const store = createV4StagingStore({
+    root: "private/stage", wholeBufferCeilingBytes: 16, randomId: () => "never-created",
+    backend: {
+      boundedAppend: true,
+      async write() { throw new Error("unexpected write"); },
+      async append() { throw new Error("unexpected append"); },
+      async remove() { attempts++; throw missing; },
+      async openSource() { throw new Error("unused"); },
+      async freeBytes() { return 1024; },
+    },
+  });
+  const sink = await store.beginStage({
+    expectedSize: 2, existingTargetBytes: 0, atomicReplace: true, mtime: 1,
+  });
+  await sink.abort();
+  await sink.abort();
+  assert.equal(attempts, 1, "a reported ENOENT proves no stage remains to retry");
+});
+
+test("D406 failed staged write does not hide a second failure to remove its partial bytes", async () => {
+  const files = new Map<string, Uint8Array>();
+  const stagePath = "private/stage/failed-write-cleanup.bin";
+  const failedWrite = new Error("simulated write failed after partial persistence");
+  const cleanupFailure = new Error("simulated stage cleanup disk error");
+  let removes = 0;
+  const store = createV4StagingStore({
+    root: "private/stage", wholeBufferCeilingBytes: 16,
+    randomId: () => "failed-write-cleanup",
+    backend: {
+      boundedAppend: true,
+      async write(path, data) {
+        files.set(path, new Uint8Array(data));
+        throw failedWrite;
+      },
+      async append() { throw new Error("append must never happen"); },
+      async remove(path) {
+        if (++removes === 1) throw cleanupFailure;
+        files.delete(path);
+      },
+      async openSource() { throw new Error("unused"); },
+      async freeBytes() { return 1024; },
+    },
+  });
+  const sink = await store.beginStage({
+    expectedSize: 2, existingTargetBytes: 0, atomicReplace: true, mtime: 1,
+  });
+  await assert.rejects(
+    sink.append(new Uint8Array([7, 8])),
+    error => error instanceof V4StagingCleanupError
+      && error.stageFailure === failedWrite
+      && error.cleanupFailure === cleanupFailure
+      && error.partialPath === stagePath,
+    "both the original partial write error and failed cleanup must remain observable",
+  );
+  assert.equal(files.has(stagePath), true);
+  await sink.abort();
+  assert.equal(files.has(stagePath), false, "caller must be able to retry partial cleanup");
+  await assert.rejects(sink.finish({ plaintextSha256: "a".repeat(64), size: 2 }), /closed/i);
+});
 
 test("staging preserves first backend write failure and skips queued writes or finish", async () => {
   const entered = gate(), proceed = gate();

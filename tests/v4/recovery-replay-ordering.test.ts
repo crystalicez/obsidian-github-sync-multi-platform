@@ -5,7 +5,7 @@ import { sha256Hex, utf8ToBytes } from "../../src/lib/bytes"
 import { createV4WholeBufferContentSource } from "../../src/lib/v4/content-source"
 import type { V4LocalIndexAdapter } from "../../src/lib/v4/local-index"
 import type { V4LocalIo } from "../../src/lib/v4/local-io"
-import { createV4RecoveryStore, recoverV4PendingState, V4RecoveryRequiredError } from "../../src/lib/v4/recovery-store"
+import { applyV4RecoveryLocalMutations, createV4RecoveryStore, discardV4RecoveryStages, recoverV4PendingState, V4RecoveryRequiredError } from "../../src/lib/v4/recovery-store"
 import type { V4RecoveryPayload } from "../../src/lib/v4/recovery-types"
 import { createV4StagingStore } from "../../src/lib/v4/staging-store"
 
@@ -28,6 +28,116 @@ function recoveryAdapter() {
   }
   return { adapter, slots }
 }
+
+async function sharedStageDiscardFixture(completedMutationIds: string[] = []) {
+  const { adapter } = recoveryAdapter()
+  const store = createV4RecoveryStore({ adapter, root: "d408/wal", repoId: "o/r#main" })
+  const stage = {
+    stageId: "shared-stage", hash: "a".repeat(64), size: 2, mtime: 10,
+  }
+  const mutations: V4RecoveryPayload["mutations"] = ["first.md", "second.md"].map((path, i) => ({
+    kind: "stage-write" as const, id: `write-${i}`, path, stage,
+    precondition: { path, exists: false },
+  }))
+  const snapshot = await store.save({
+    runId: "d408-stage-reuse", phase: "replan-required", expectedRemoteHead: null,
+    payload: { mutations, completedMutationIds },
+  })
+  // The WAL accepts two distinct write mutations with one shared stage id.
+  assert.equal(snapshot.payload?.mutations.length, 2)
+  const operations: string[] = []
+  let stageExists = true
+  const staging = createV4StagingStore({
+    root: "d408/private-stage", wholeBufferCeilingBytes: 16,
+    backend: {
+      boundedAppend: true,
+      async write() { throw new Error("not staging any new data") },
+      async append() { throw new Error("not appending new data") },
+      async remove(path) {
+        assert.equal(path, "d408/private-stage/shared-stage.bin")
+        assert.equal(stageExists, true, "stage must not be removed twice")
+        operations.push("remove:shared-stage")
+        stageExists = false
+      },
+      async openSource() { throw new Error("not reading staged data") },
+      async freeBytes() { return 1024 },
+    },
+  })
+  const denied = async () => { throw new Error("unexpected local mutation") }
+  const io: V4LocalIo = {
+    listFiles: denied, read: denied, write: denied, trash: denied,
+    staging,
+    async rollbackStage({ path }) {
+      assert.equal(stageExists, true, "stage must still exist during every rollback")
+      operations.push(`rollback:${path}`)
+    },
+    async finalizeStage({ path }) {
+      assert.equal(stageExists, true, "stage must still exist during every finalization")
+      operations.push(`finalize:${path}`)
+    },
+  }
+  return { store, snapshot, io, operations, stageExists: () => stageExists }
+}
+
+test("D408 shared recovery stage must finish each target rollback/finalize before deleting the stage", async () => {
+  const fixture = await sharedStageDiscardFixture(["write-0"])
+  await discardV4RecoveryStages(fixture.snapshot, fixture.io)
+  assert.deepEqual(fixture.operations, [
+    "finalize:first.md", "rollback:second.md", "remove:shared-stage",
+  ])
+  assert.equal(fixture.stageExists(), false)
+})
+
+test("D408 recovery discard retains shared stage when a later target rollback fails", async () => {
+  const fixture = await sharedStageDiscardFixture()
+  const laterFailure = new Error("second target's original is not safely restored")
+  let attempts = 0
+  fixture.io.rollbackStage = async ({ path }) => {
+    attempts++
+    if (attempts === 2) throw laterFailure
+    assert.equal(fixture.stageExists(), true)
+    fixture.operations.push(`rollback:${path}`)
+  }
+  await assert.rejects(
+    discardV4RecoveryStages(fixture.snapshot, fixture.io),
+    error => error === laterFailure,
+    "a failed subsequent rollback must not be bypassed or converted to cleanup success",
+  )
+  assert.equal(fixture.stageExists(), true,
+    "shared stage must remain available for manual recovery if any rollback fails")
+  assert.deepEqual(fixture.operations, ["rollback:first.md"])
+})
+
+test("D409 Native recovery refuses shared stage IDs before any target commit or receipt", async () => {
+  const fixture = await sharedStageDiscardFixture()
+  const { snapshot, io, operations } = fixture
+  let localOps = 0
+  io.preferStagedCommit = true
+  io.commitStage = async () => { localOps++; throw new Error("native commit must never run with ambiguous shared staging") }
+  io.stat = async () => { localOps++; throw new Error("local stat must not precede shared-stage ownership rejection") }
+  const { store } = fixture
+  // Use the persisted fixture WAL; the guard must run before any receipt.
+  await assert.rejects(
+    applyV4RecoveryLocalMutations({ store, snapshot, io }),
+    error => error instanceof V4RecoveryRequiredError && /shared.*stage|stage.*multiple.*target/i.test(error.message),
+    "the same stage cannot be consumed as the native replacement for two targets",
+  )
+  assert.equal(localOps, 0)
+  assert.deepEqual(operations, [])
+  assert.equal(fixture.stageExists(), true)
+})
+
+test("D409 Native recovery discard rejects shared stage IDs before touching any sidecar or target", async () => {
+  const fixture = await sharedStageDiscardFixture(["write-0"])
+  fixture.io.preferStagedCommit = true
+  await assert.rejects(
+    discardV4RecoveryStages(fixture.snapshot, fixture.io),
+    error => error instanceof V4RecoveryRequiredError && /shared.*stage|stage.*multiple.*target/i.test(error.message),
+    "stage-derived .target-backup and .replacement-residue cannot identify two different original targets",
+  )
+  assert.deepEqual(fixture.operations, [], "must reject before first finalize or rollback")
+  assert.equal(fixture.stageExists(), true, "do not delete either target's recovery evidence")
+})
 
 for (const ordering of ["stage-before-trash", "trash-before-stage"] as const) {
   test(`D55 replay of corrupted same-size stage (${ordering}) records only mutations actually applied`, async () => {

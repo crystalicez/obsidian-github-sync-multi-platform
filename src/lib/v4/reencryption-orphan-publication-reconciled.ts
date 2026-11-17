@@ -19,6 +19,8 @@ export interface V4ReencryptionVerifiedOrphanPublishInput extends Omit<V4OrphanP
   /** A caller MUST persist a crash-DURABLE ref intent before returning. */
   readonly assertDurablePublicationIntent: () => Promise<void>
   readonly assertExclusiveMigrationLease: () => Promise<void>
+  /** D362: synchronous, caller-bound proof check at the exact Git ref POST boundary. */
+  readonly assertPublicationEvidenceUnchanged?: () => void
 }
 
 export interface V4ReencryptionVerifiedOrphanPublishReport {
@@ -68,6 +70,9 @@ export async function publishAndVerifyV4ReencryptionOrphanRef(
     getGitRefOrNull: () => input.github.getGitRefOrNull(),
     getGitCommit: (sha: string) => input.github.getGitCommit(sha),
     async createGitRef(sha: string) {
+      // Last possible synchronous check before GitHub may observe a create.
+      // Reject proof drift BEFORE marking this as an ambiguous mutation.
+      input.assertPublicationEvidenceUnchanged?.()
       createAttempted = true
       await input.github.createGitRef(sha)
       createResponseReceived = true

@@ -18,6 +18,7 @@ import {
   type V4ResourceController,
 } from "./v4/resource-controller";
 import { V4RequestScheduler } from "./v4/request-scheduler";
+import { V4_GITHUB_REST_SAFE_WRITER_BYTES } from "./v4/large-files";
 import { V4CancelledError } from "./v4/cancellation";
 import type { V4RateLimitCooldownStore } from "./v4/rate-limit-cooldown";
 import { V4TransportMetrics, type V4TransportMetricsSnapshot } from "./v4/transport-metrics";
@@ -105,7 +106,7 @@ interface MutationRequestInput {
 }
 
 export class GitHubClient {
-  private config: GitHubConfig;
+  private readonly config: Readonly<GitHubConfig>;
   private readonly requestScheduler: V4RequestScheduler;
   private readonly transportPolicy: V4TransportPolicy;
   private readonly transportMetrics: V4TransportMetrics;
@@ -119,7 +120,12 @@ export class GitHubClient {
     // Fail before creating a scheduler or constructing an API URL for unsafe refs.
     assertSafeGitHubRepositoryCoordinates(config.owner, config.repo)
     assertSafeGitHubBranch(config.branch)
-    this.config = config;
+    // The caller owns config; a later mutation must not retarget an in-flight
+    // repository lookup, ref mutation, or credential-scoped request.
+    this.config = Object.freeze({
+      owner: config.owner, repo: config.repo,
+      branch: config.branch, token: config.token,
+    });
     this.cooldownStore = options.cooldownStore;
     // Token-scoped because GitHub rate limits apply across repos for one token.
     this.cooldownScope = options.cooldownStore
@@ -422,7 +428,7 @@ export class GitHubClient {
     // Do not fabricate ref/type fields missing from an untrusted GitHub reply.
     if (!json || typeof json !== "object" || Array.isArray(json)
       || json.ref !== `refs/heads/${this.config.branch}`
-      || typeof json.object?.sha !== "string" || json.object.sha.length === 0
+      || typeof json.object?.sha !== "string" || !GIT_COMMIT_SHA.test(json.object.sha)
       || json.object.type !== "commit") {
       throw new Error("Invalid GitHub ref response: missing explicit ref, commit SHA or object type.");
     }
@@ -445,9 +451,25 @@ export class GitHubClient {
       throw: false,
     });
     if (response.status === 200 && Array.isArray(response.json)) {
-      const first = (response.json as Array<{ ref?: string; object?: { sha?: string; type?: string } }>)[0];
-      if (!first) return null;
-      return { ref: first.ref ?? "", sha: first.object?.sha ?? "", type: first.object?.type ?? "commit" };
+      const first = (response.json as unknown[])[0];
+      if (first === undefined) return null;
+      // Never synthesize Git ref fields from an untrusted bootstrap listing.
+      if (!first || typeof first !== "object" || Array.isArray(first)) {
+        throw new Error("Invalid GitHub refs listing response.");
+      }
+      const ref = (first as { ref?: unknown }).ref;
+      const object = (first as { object?: unknown }).object;
+      if (typeof ref !== "string" || !ref.startsWith("refs/") || ref.length <= "refs/".length
+        || !object || typeof object !== "object" || Array.isArray(object)) {
+        throw new Error("Invalid GitHub refs listing response.");
+      }
+      const { sha, type } = object as { sha?: unknown; type?: unknown };
+      if (typeof sha !== "string" || !GIT_COMMIT_SHA.test(sha)
+        || typeof type !== "string" || !["commit", "tag", "tree", "blob"].includes(type)
+        || (ref.startsWith("refs/heads/") && type !== "commit")) {
+        throw new Error("Invalid GitHub refs listing response.");
+      }
+      return { ref, sha, type };
     }
     if (response.status === 404 || response.status === 409) return null;
     throw this.gitHttpError("Failed to inspect git refs", response.status);
@@ -528,6 +550,10 @@ export class GitHubClient {
       throw new Error("Invalid GitHub commit response.");
     }
     const parentShas = parseGitHubCommitParentShas(json.parents);
+    if (!json.tree || typeof json.tree !== "object" || Array.isArray(json.tree)
+      || typeof json.tree.sha !== "string" || !GIT_COMMIT_SHA.test(json.tree.sha)) {
+      throw new Error("Invalid GitHub immutable commit tree SHA response.");
+    }
     // A mismatched or omitted immutable commit identity is not proof of the
     // requested commit's tree. Never infer remote-file absence from that body.
     if (GIT_COMMIT_SHA.test(sha) && json.sha !== sha) {
@@ -538,6 +564,9 @@ export class GitHubClient {
 
   async createGitBlob(content: Uint8Array | ArrayBuffer): Promise<string> {
     const bytes = content instanceof Uint8Array ? content : new Uint8Array(content);
+    if (bytes.byteLength > V4_GITHUB_REST_SAFE_WRITER_BYTES) {
+      throw new RangeError("Git Blob exceeds the 8 MiB REST writer limit.");
+    }
     const transientBytes = estimateV4GitBlobTransportBytes(bytes.byteLength);
     return this.transportResources.withTransportBytes(transientBytes, async () => {
       const bodyValue = { content: toBase64(bytes), encoding: "base64" };

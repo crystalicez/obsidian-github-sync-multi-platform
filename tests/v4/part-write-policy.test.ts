@@ -32,6 +32,18 @@ test("writer chooses the largest MiB-aligned part allowed by measured transport 
   assert.ok(estimateV4GitBlobTransportBytes(selected + MiB) <= 128 * MiB, "REST compatibility, not RAM, must cap the writer")
 })
 
+test("D356 current REST writer rejects a 5 GiB new revision before allocating or publishing blobs", () => {
+  const fiveGiB = 5 * 1024 * MiB
+  assert.ok(Math.ceil(fiveGiB / (8 * MiB)) > V4_GITHUB_SAFE_CONTENT_MUTATIONS_PER_REVISION)
+  for (const mode of ["plaintext", "encrypted"] as const) {
+    assert.throws(() => selectV4WriterPartBytes({
+      logicalBytes: fiveGiB,
+      maxTransportTransientBytes: 256 * MiB,
+      mode,
+    }), /no safe V4 writer part size/iu, mode)
+  }
+})
+
 test("writer rejects a transport budget that would violate safe mutation headroom", () => {
   assert.throws(() => selectV4WriterPartBytes({
     logicalBytes: 100_000_000,

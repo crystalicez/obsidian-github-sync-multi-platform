@@ -3,7 +3,7 @@ import { lstat, mkdir, mkdtemp, rm } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import path from "node:path";
 
-import { discoverTests, selectTests, shardSelectedTests } from "./test-discovery.mjs";
+import { discoverTests, excludeSelectedTestFile, selectTests, shardSelectedTests } from "./test-discovery.mjs";
 
 const root = process.cwd();
 const outputRoot = path.join(root, ".tmp");
@@ -20,6 +20,8 @@ const filter = optionValue("filter", "");
 const namePattern = optionValue("name-pattern", "");
 // Optional one-based file partition: run all 1..TOTAL shards to qualify a tier.
 const shard = optionValue("shard", "");
+// Optional exact-file exclusion, for the independently covered large Fast file.
+const excludeFile = optionValue("exclude-file", "");
 const knownTiers = new Set(["fast", "feasibility", "resource", "recovery", "github-e2e", "soak", "device"]);
 if (!knownTiers.has(tier)) {
   console.error(`Unknown test tier: ${tier}`);
@@ -37,7 +39,7 @@ const discovered = await discoverTests(root);
 const eligible = selectTests(discovered, { tier, filter });
 let selected;
 try {
-  selected = shardSelectedTests(eligible, shard);
+  selected = shardSelectedTests(excludeSelectedTestFile(eligible, excludeFile), shard);
 } catch (error) {
   console.error(error instanceof Error ? error.message : error);
   process.exit(2);
@@ -47,7 +49,7 @@ if (selected.length === 0) {
   process.exit(2);
 }
 
-console.log(`Selected ${selected.length}/${eligible.length} ${tier} test files${shard ? ` (shard ${shard})` : ""}.`);
+console.log(`Selected ${selected.length}/${eligible.length} ${tier} test files${shard ? ` (shard ${shard})` : ""}${excludeFile ? " (explicit exclusion)" : ""}.`);
 if (process.argv.includes("--list")) {
   for (const item of selected) console.log(item.path);
   process.exit(0);

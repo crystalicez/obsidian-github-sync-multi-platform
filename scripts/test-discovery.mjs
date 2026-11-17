@@ -64,6 +64,17 @@ export function shardSelectedTests(selected, shard = "") {
   return selected.filter((_, position) => position % total === index - 1);
 }
 
+/** Explicit exact-file exclusion for offline qualification plans. A missing
+ * expected file is a hard error, never a silently shortened suite. */
+export function excludeSelectedTestFile(selected, exactPath = "") {
+  if (!exactPath) return selected;
+  const matches = selected.filter(item => item.path === exactPath);
+  if (matches.length !== 1) {
+    throw new RangeError("Excluded test file must exist exactly once in the selected tier.");
+  }
+  return selected.filter(item => item.path !== exactPath);
+}
+
 export function selectTests(discovered, { tier = "fast", filter = "" } = {}) {
   const normalizedFilter = normalizeTestPath(filter).toLowerCase();
   return discovered.filter(item => {

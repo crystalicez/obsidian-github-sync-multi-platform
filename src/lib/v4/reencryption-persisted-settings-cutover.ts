@@ -302,6 +302,10 @@ export async function persistV4FencedDestinationSettings(
         session, original.serialized, target,
         state.receipt, state.selector, state.contract.transactionId,
       )
+      // Revalidate after the last asynchronous proof, immediately before
+      // creating the irreversible recovery Intent.
+      await session.check()
+      check()
       const sealed = JSON.stringify(intent)
       await session.methods.write.call(session.adapter, path, sealed)
       await session.check()
@@ -444,6 +448,10 @@ export async function inspectV4FencedDestinationSettingsAfterRestart(
         }
         completed = manual("intent-only-source-settings")
       }
+      // The final persisted read and Runtime route read can await an editor
+      // mutation. Recheck the owner after all I/O, before reporting a result.
+      await session.check()
+      scope.check()
       return completed
     })
     return calls === 1 && completed !== null && returned === completed && session.unchanged()

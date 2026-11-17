@@ -26,19 +26,19 @@ function scriptedFetch(steps: Array<{ method?: string; path: string; status: num
 const base: GitHubE2ETargetEnvironment = {
   owner: "TargetOwner",
   repo: "TargetRepo",
-  branch: "obsidian-sync-e2e/run-77",
+  branch: "obsidian-sync-e2e/local-run-77",
   token: "redacted-test-token",
   expectedRepositoryId: "222",
   sourceRepositoryId: "111",
-  requiredBranch: "obsidian-sync-e2e/run-77",
+  requiredBranch: "obsidian-sync-e2e/local-run-77",
 }
 
 const metadata = { id: 222, full_name: "CanonicalOwner/CanonicalRepo", default_branch: "trunk" }
 const defaultRef = { object: { sha: "d".repeat(40) } }
 const repositoryPath = "/repos/TargetOwner/TargetRepo"
 const defaultRefPath = "/repos/CanonicalOwner/CanonicalRepo/git/ref/heads/trunk"
-const exactReadPath = "/repos/CanonicalOwner/CanonicalRepo/git/ref/heads/obsidian-sync-e2e/run-77"
-const exactDeletePath = "/repos/CanonicalOwner/CanonicalRepo/git/refs/heads/obsidian-sync-e2e/run-77"
+const exactReadPath = "/repos/CanonicalOwner/CanonicalRepo/git/ref/heads/obsidian-sync-e2e/local-run-77"
+const exactDeletePath = "/repos/CanonicalOwner/CanonicalRepo/git/refs/heads/obsidian-sync-e2e/local-run-77"
 
 function resolvedSteps() {
   return [
@@ -51,6 +51,29 @@ test("rejects a route resolving to the source repository ID", async () => {
   await assert.rejects(resolveGitHubE2ETarget({ ...base, expectedRepositoryId: "111" }, scriptedFetch([
     { path: repositoryPath, status: 200, body: { ...metadata, id: 111 } },
   ])), /must not be the source repository/u)
+})
+
+test("D372 blocks the canonical source repository route before GitHub E2E network access", async () => {
+  let calls = 0
+  const fake: GitHubE2EFetch = async () => {
+    calls++
+    throw new Error("canonical source request must not be sent")
+  }
+  await assert.rejects(resolveGitHubE2ETarget({
+    ...base, owner: "crystalicez", repo: "obsidian-github-sync-multi-platform",
+    sourceRepositoryId: undefined,
+  }, fake), /canonical source repository/u)
+  assert.equal(calls, 0)
+})
+
+test("D372 refuses the immutable canonical source repository ID even through an alias", async () => {
+  await assert.rejects(resolveGitHubE2ETarget({
+    ...base, expectedRepositoryId: "1282135059", sourceRepositoryId: undefined,
+  }, scriptedFetch([
+    { path: repositoryPath, status: 200, body: {
+      id: 1282135059, full_name: "AliasOwner/AliasRepo", default_branch: "trunk",
+    } },
+  ])), /canonical source repository/u)
 })
 
 test("rejects resolved target ID that differs from pinned ID", async () => {
@@ -82,6 +105,37 @@ test("unreadable default ref fails closed", async () => {
     { path: repositoryPath, status: 200, body: metadata },
     { path: defaultRefPath, status: 404, body: { message: "Not Found" } },
   ])), /Git-ref read capability/u)
+})
+
+test("D372 refuses destructive cleanup of any branch outside the isolated E2E namespace before network I/O", async () => {
+  for (const branch of ["team/notes", "obsidian-sync-e2e/run-77", "obsidian-sync-e2e/local-",
+    "obsidian-sync-e2e/local-../main", "refs/heads/obsidian-sync-e2e/local-safe"]) {
+    let requests = 0
+    const fake: GitHubE2EFetch = async () => {
+      requests++
+      throw new Error("network must not be reached for a non-disposable branch")
+    }
+    await assert.rejects(resetGitHubE2EDisposableBranch({
+      ...base, branch, requiredBranch: branch,
+    }, fake), /isolated disposable namespace/u)
+    assert.equal(requests, 0, `refusing ${branch} must not call GitHub`)
+  }
+})
+
+test("D372 rejects a non-disposable manual E2E branch during environment parsing", () => {
+  const env = {
+    GITHUB_E2E_OWNER: "sandbox-owner",
+    GITHUB_E2E_REPO: "sandbox-repo",
+    GITHUB_E2E_BRANCH: "feature/important-work",
+    GITHUB_E2E_TOKEN: "synthetic-test-token",
+    GITHUB_E2E_EXPECTED_REPO_ID: "222",
+  }
+  assert.throws(() => readGitHubE2ETargetEnvironment(env),
+    /isolated disposable namespace/u)
+  const safe = readGitHubE2ETargetEnvironment({
+    ...env, GITHUB_E2E_BRANCH: "obsidian-sync-e2e/local-synthetic-run-123",
+  })
+  assert.equal(safe.branch, "obsidian-sync-e2e/local-synthetic-run-123")
 })
 
 test("exact disposable 404 is accepted only after a second target proof and absence read", async () => {

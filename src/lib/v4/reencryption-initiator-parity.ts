@@ -32,11 +32,15 @@ export interface V4InitiatorLocalReader {
   assertExclusiveInitiatorLease(): Promise<void>
 }
 
+export type V4InitiatorSourceRecord = Readonly<Pick<
+  V4IndexFileRecord, "path" | "size" | "plaintextSha256" | "deleted"
+>>
+
 export interface V4ReencryptionInitiatorParityInput {
   readonly pinnedSourceCommitSha: string
   readonly verifiedSource: V4ReencryptionVerifiedSource
   /** Authenticated remote records decoded from exactly pinned source commit. */
-  readonly sourceRecords: readonly V4IndexFileRecord[]
+  readonly sourceRecords: readonly V4InitiatorSourceRecord[]
   readonly reader: V4InitiatorLocalReader
   readonly signal?: AbortSignal | undefined
 }
@@ -80,7 +84,8 @@ export function captureV4ReencryptionInitiatorParityEvidence(
 export async function verifyV4ReencryptionInitiatorLocalParity(
   input: V4ReencryptionInitiatorParityInput,
 ): Promise<V4ReencryptionInitiatorParityReport> {
-  throwIfV4Aborted(input.signal)
+  const signal = input.signal
+  throwIfV4Aborted(signal)
   const { reader, pinnedSourceCommitSha } = input
   // Capture authenticated remote evidence by VALUE before the first await.
   // Readonly TypeScript annotations are not runtime immutability: a caller
@@ -106,7 +111,31 @@ export async function verifyV4ReencryptionInitiatorLocalParity(
     throw new Error("Re-encryption initiator needs authenticated source records and trusted live-vault reader.")
   }
 
-  const expected = new Map<string, V4IndexFileRecord>()
+  // This exported verifier can be called directly, without a publisher's
+  // outer evidence fence. Pin the original cancellation and live physical
+  // reader authority before any asynchronous Vault or editor callback.
+  const methods = {
+    listFiles: reader.listFiles,
+    openFile: reader.openFile,
+    listOpenEditorPaths: reader.listOpenEditorPaths,
+    assertIdleAndNoPendingEdits: reader.assertIdleAndNoPendingEdits,
+    assertSourceConfigurationUnchanged: reader.assertSourceConfigurationUnchanged,
+    assertExclusiveInitiatorLease: reader.assertExclusiveInitiatorLease,
+  }
+  const assertPinnedAuthority = () => {
+    throwIfV4Aborted(signal)
+    if (input.signal !== signal || input.reader !== reader
+      || reader.listFiles !== methods.listFiles
+      || reader.openFile !== methods.openFile
+      || reader.listOpenEditorPaths !== methods.listOpenEditorPaths
+      || reader.assertIdleAndNoPendingEdits !== methods.assertIdleAndNoPendingEdits
+      || reader.assertSourceConfigurationUnchanged !== methods.assertSourceConfigurationUnchanged
+      || reader.assertExclusiveInitiatorLease !== methods.assertExclusiveInitiatorLease) {
+      throw new Error("Re-encryption initiator live reader or cancellation authority changed during parity.")
+    }
+  }
+
+  const expected = new Map<string, V4InitiatorSourceRecord>()
   const expectedCanonical = new Map<string, string>()
   let expectedTotal = BigInt(0)
   for (const record of sourceRecords) {
@@ -130,15 +159,15 @@ export async function verifyV4ReencryptionInitiatorLocalParity(
   }
 
   const fence = async () => {
-    throwIfV4Aborted(input.signal)
+    assertPinnedAuthority()
     await reader.assertExclusiveInitiatorLease()
-    throwIfV4Aborted(input.signal)
+    assertPinnedAuthority()
     await reader.assertIdleAndNoPendingEdits()
-    throwIfV4Aborted(input.signal)
+    assertPinnedAuthority()
     await reader.assertSourceConfigurationUnchanged()
-    throwIfV4Aborted(input.signal)
+    assertPinnedAuthority()
     const open = await reader.listOpenEditorPaths()
-    throwIfV4Aborted(input.signal)
+    assertPinnedAuthority()
     // An uncommitted new note need not exist on disk or in sourceRecords.
     // Reject *all* open file editors, not just paths in the pinned remote
     // manifest. Otherwise parity can falsely claim no editors were observed
@@ -146,12 +175,21 @@ export async function verifyV4ReencryptionInitiatorLocalParity(
     if (!Array.isArray(open) || open.length > 0) {
       throw new Error("Re-encryption initiator cannot verify migration while any editor remains open.")
     }
+    // Editor enumeration may await Obsidian state after the earlier guards.
+    // Recheck lease, Source scope, and the Sync generation after that await.
+    // This is best-effort evidence, not an atomic filesystem snapshot.
+    await reader.assertExclusiveInitiatorLease()
+    assertPinnedAuthority()
+    await reader.assertSourceConfigurationUnchanged()
+    assertPinnedAuthority()
+    await reader.assertIdleAndNoPendingEdits()
+    assertPinnedAuthority()
   }
 
   const observe = async (): Promise<Map<string, V4InitiatingFile>> => {
     await fence()
     const listed = await reader.listFiles()
-    throwIfV4Aborted(input.signal)
+    assertPinnedAuthority()
     if (!Array.isArray(listed)) {
       throw new Error("Re-encryption initiator physical vault listing unavailable.")
     }
@@ -203,14 +241,14 @@ export async function verifyV4ReencryptionInitiatorLocalParity(
     for (const [path, record] of expected) {
       await fence()
       const opened = await reader.openFile(path)
-      throwIfV4Aborted(input.signal)
+      assertPinnedAuthority()
       if (!opened || opened.size !== record.size || typeof opened.chunks !== "function") {
         throw new Error("Re-encryption initiator local file size or stream changed.")
       }
       let read = 0
       const hasher = createV4IncrementalSha256()
-      for await (const chunk of opened.chunks(MAX_CHUNK_BYTES, input.signal)) {
-        throwIfV4Aborted(input.signal)
+      for await (const chunk of opened.chunks(MAX_CHUNK_BYTES, signal)) {
+        assertPinnedAuthority()
         if (!(chunk instanceof Uint8Array) || !chunk.byteLength
           || chunk.byteLength > MAX_CHUNK_BYTES || read + chunk.byteLength > record.size) {
           throw new Error("Re-encryption initiator local content chunk is invalid or too large.")
@@ -218,7 +256,7 @@ export async function verifyV4ReencryptionInitiatorLocalParity(
         hasher.update(chunk)
         read += chunk.byteLength
       }
-      throwIfV4Aborted(input.signal)
+      assertPinnedAuthority()
       if (read !== record.size || hasher.digestHex() !== record.plaintextSha256) {
         throw new Error("Re-encryption initiator local content does not match authenticated source SHA-256.")
       }

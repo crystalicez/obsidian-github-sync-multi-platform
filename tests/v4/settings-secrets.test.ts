@@ -205,11 +205,16 @@ test("D65 core settings save never exposes a draft or new key before durable sto
     await barrier;
   };
   const draft = { ...previous, encryptionPassphrase: "new-pass", newVaultKdfIterations: 900_000 };
+  assert.equal(plugin.settingsSaveGeneration, 0, "no Settings save has started yet");
   const running = plugin.saveSettings(draft);
+  assert.equal(plugin.settingsSaveGeneration, 1,
+    "starting even a pending Settings save must immediately invalidate old read-only evidence");
   await assert.rejects(
     () => plugin.saveSettings({ ...draft, newVaultKdfIterations: 1_200_000 }),
     /already in progress/u,
   );
+  assert.equal(plugin.settingsSaveGeneration, 1,
+    "a rejected duplicate save is not a new accepted Settings write");
   assert.equal(plugin.settings.encryptionPassphrase, "old-pass", "new passphrase must not appear before durable settings write");
   assert.equal(stored.get(previous.encryptionPassphraseSecretId), "old-pass", "never overwrite the active secret ID");
   assert.equal(invalidations, 0, "do not invalidate the running keyring before durable save");
@@ -221,6 +226,8 @@ test("D65 core settings save never exposes a draft or new key before durable sto
   assert.equal(stored.get(plugin.settings.encryptionPassphraseSecretId), "new-pass");
   assert.deepEqual((written as { settings: { newVaultKdfIterations: number } }).settings.newVaultKdfIterations, 900_000);
   assert.equal(invalidations, 1);
+  assert.equal(plugin.settingsSaveGeneration, 1,
+    "the generation remains advanced after a successful Settings save");
 });
 
 test("D65 failed settings persistence keeps previous settings and active credentials", async () => {
@@ -247,6 +254,8 @@ test("D65 failed settings persistence keeps previous settings and active credent
   await assert.rejects(() => plugin.saveSettings({
     ...previous, githubToken: "rotated-token", encryptionPassphrase: "rotated-pass",
   }), /synthetic disk failure/u);
+  assert.equal(plugin.settingsSaveGeneration, 1,
+    "a failed or ambiguous save must still invalidate earlier parity evidence");
   assert.deepEqual(plugin.settings, previous);
   assert.equal(stored.get(previous.githubTokenSecretId), "old-token");
   assert.equal(stored.get(previous.encryptionPassphraseSecretId), "old-pass");

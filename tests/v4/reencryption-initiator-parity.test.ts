@@ -2,6 +2,7 @@ import assert from "node:assert/strict"
 import test from "node:test"
 import { sha256Hex, utf8ToBytes } from "../../src/lib/bytes"
 import type { V4IndexFileRecord } from "../../src/lib/v4/local-index"
+import { V4SyncCoordinator } from "../../src/lib/v4/sync-coordinator"
 import {
   verifyV4ReencryptionInitiatorLocalParity,
   type V4ReencryptionInitiatorParityInput,
@@ -82,6 +83,140 @@ async function fixture(names: string[] = ["notes/a.md", "notes/🪄.md"]) {
     loseLease() { lockLost = true },
   }
 }
+
+test("D367 direct parity cannot replace an aborted original signal during the awaited editor check", async () => {
+  const f = await fixture(["notes/a.md"])
+  const original = new AbortController()
+  let substituted = false
+  const mutable = {
+    ...f.input,
+    signal: original.signal,
+    reader: { ...f.input.reader },
+  }
+  const originalOpenEditors = mutable.reader.listOpenEditorPaths
+  mutable.reader.listOpenEditorPaths = async () => {
+    if (!substituted) {
+      substituted = true
+      original.abort()
+      mutable.signal = new AbortController().signal
+    }
+    return originalOpenEditors()
+  }
+  await assert.rejects(
+    () => verifyV4ReencryptionInitiatorLocalParity(mutable),
+    /cancel|abort|authority|changed/i,
+    "aborting the ORIGINAL verification signal must revoke parity even if a caller replaces its input property",
+  )
+  assert.equal(substituted, true, "test must abort inside an actual awaited reader callback")
+})
+
+test("D367 direct parity cannot replace its live lease guard with a no-op during the awaited editor check", async () => {
+  const f = await fixture(["notes/a.md"])
+  let leaseLive = true
+  let substituted = false
+  const reader = {
+    ...f.input.reader,
+    async assertExclusiveInitiatorLease() {
+      if (!leaseLive) throw Error("Original initiating-device lease lost")
+    },
+  }
+  const originalOpenEditors = reader.listOpenEditorPaths
+  reader.listOpenEditorPaths = async () => {
+    if (!substituted) {
+      substituted = true
+      leaseLive = false
+      reader.assertExclusiveInitiatorLease = async () => {}
+    }
+    return originalOpenEditors()
+  }
+  await assert.rejects(
+    () => verifyV4ReencryptionInitiatorLocalParity({ ...f.input, reader }),
+    /lease|authority|changed/i,
+    "replacing an active lease check with a no-op cannot produce a complete local parity proof",
+  )
+  assert.equal(substituted, true, "test must revoke lease authority during the awaited editor enumeration")
+})
+
+test("D344 completed Sync during the final awaited editor check revokes the local parity report", async () => {
+  const f = await fixture(["notes/a.md"])
+  const coordinator = new V4SyncCoordinator({
+    execute: async () => ({ changedFiles: 0 }),
+  })
+  const original = f.input.reader
+  const generation = coordinator.syncExecutionGeneration
+  let inventories = 0
+  let started = false
+  const reader = {
+    ...original,
+    async listFiles() {
+      const result = await original.listFiles()
+      inventories++
+      return result
+    },
+    async assertIdleAndNoPendingEdits() {
+      await original.assertIdleAndNoPendingEdits()
+      if (coordinator.syncExecutionGeneration !== generation) {
+        throw new Error("Re-encryption Sync generation changed after local parity began.")
+      }
+    },
+    async listOpenEditorPaths() {
+      if (inventories === 3 && !started) {
+        started = true
+        const result = await coordinator.run({ operation: "normal", trigger: "manual" })
+        assert.equal(result.status, "completed")
+        assert.equal(coordinator.isSyncing, false)
+      }
+      return original.listOpenEditorPaths()
+    },
+  }
+  try {
+    await assert.rejects(
+      () => verifyV4ReencryptionInitiatorLocalParity({ ...f.input, reader }),
+      /Sync generation changed/i,
+      "Sync completed during the last awaited editor check must not leave successful parity evidence",
+    )
+    assert.equal(started, true, "regression must exercise the last awaited editor check")
+    assert.equal(coordinator.syncExecutionGeneration, generation + 1)
+    assert.equal(f.files.size, 1, "this regression does not mutate the test Vault")
+  } finally {
+    coordinator.dispose()
+  }
+})
+
+test("D344 final editor check must not conceal a lost lease or changed Source scope", async () => {
+  for (const changedState of ["lease", "scope"] as const) {
+    const f = await fixture(["notes/a.md"])
+    const original = f.input.reader
+    let inventories = 0
+    let changed = false
+    const reader = {
+      ...original,
+      async listFiles() {
+        const listed = await original.listFiles()
+        inventories++
+        return listed
+      },
+      async listOpenEditorPaths() {
+        if (inventories === 3) changed = true
+        return original.listOpenEditorPaths()
+      },
+      async assertExclusiveInitiatorLease() {
+        if (changed && changedState === "lease") throw Error("initiating WAL lease lost")
+        return original.assertExclusiveInitiatorLease()
+      },
+      async assertSourceConfigurationUnchanged() {
+        if (changed && changedState === "scope") throw Error("Source scope changed")
+        return original.assertSourceConfigurationUnchanged()
+      },
+    }
+    await assert.rejects(
+      () => verifyV4ReencryptionInitiatorLocalParity({ ...f.input, reader }),
+      changedState === "lease" ? /lease lost/ : /scope changed/,
+      "final editor await must not conceal a lost " + changedState + " proof",
+    )
+    assert.equal(changed, true)
+  }
+})
 
 test("D105 whole initiating vault is compared byte-for-byte to immutable remote plaintext source, without changing the vault", async () => {
   const f = await fixture()

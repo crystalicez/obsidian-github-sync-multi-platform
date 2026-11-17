@@ -64,6 +64,46 @@ test("compile-only refuses to delete a caller-owned non-empty output directory",
   assert.equal(await readFile(sentinel, "utf8"), "keep\n");
 });
 
+test("D371 fresh isolated E2E preflight fails closed without a dedicated repository and secret", async t => {
+  const folder = await mkdtemp(resolve(tmpdir(), "d371-isolated-e2e-"));
+  t.after(() => rm(folder, { recursive: true, force: true }));
+  const envFile = resolve(folder, "empty.env");
+  await writeFile(envFile, "# intentionally no GitHub credentials\n");
+  const env = { ...process.env, GITHUB_E2E_ENV_FILE: envFile };
+  for (const key of ["GITHUB_E2E_COMPILE_ONLY", "GITHUB_E2E_OWNER", "GITHUB_E2E_REPO",
+    "GITHUB_E2E_BRANCH", "GITHUB_E2E_TOKEN", "GITHUB_E2E_EXPECTED_REPO_ID"]) delete env[key];
+  const result = spawnSync(process.execPath, [
+    resolve("scripts/run-github-e2e.mjs"), "--preflight-only", "--fresh-isolated-branch",
+  ], { cwd: resolve("."), env, encoding: "utf8" });
+  assert.equal(result.status, 2, result.stderr || result.stdout);
+  assert.match(result.stderr, /Missing required GitHub E2E env vars/u);
+  assert.doesNotMatch(result.stdout, /Fresh isolated GitHub E2E branch|bundle compiled|preflight passed/u);
+});
+
+test("D371 fresh isolated E2E preflight refuses canonical source before credentialed network I/O", async t => {
+  const folder = await mkdtemp(resolve(tmpdir(), "d371-e2e-source-"));
+  t.after(() => rm(folder, { recursive: true, force: true }));
+  const envFile = resolve(folder, "empty.env");
+  await writeFile(envFile, "# credentials supplied as harmless fake environment only\n");
+  const marker = "D371_DO_NOT_LOG_FAKE_TOKEN";
+  const env = {
+    ...process.env,
+    GITHUB_E2E_ENV_FILE: envFile,
+    GITHUB_E2E_OWNER: "crystalicez",
+    GITHUB_E2E_REPO: "obsidian-github-sync-multi-platform",
+    GITHUB_E2E_EXPECTED_REPO_ID: "1282135059",
+    GITHUB_E2E_TOKEN: marker,
+  };
+  delete env.GITHUB_E2E_COMPILE_ONLY;
+  const result = spawnSync(process.execPath, [
+    resolve("scripts/run-github-e2e.mjs"), "--preflight-only", "--fresh-isolated-branch",
+  ], { cwd: resolve("."), env, encoding: "utf8" });
+  assert.equal(result.status, 2, result.stderr || result.stdout);
+  assert.match(result.stderr, /source repository/u);
+  assert.doesNotMatch(result.stderr + result.stdout, new RegExp(marker));
+  assert.doesNotMatch(result.stdout, /Fresh isolated GitHub E2E branch|preflight passed/u);
+});
+
 test("credentialed runner requires expected target repository ID before execution", () => {
   const env = { ...process.env };
   delete env.GITHUB_E2E_ENV_FILE;

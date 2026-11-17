@@ -26,7 +26,7 @@ import { createV4ContentSource, createV4WholeBufferContentSource, DEFAULT_V4_WHO
 import { createV4PlatformIo, V4ManualRecoveryRequiredError, type V4BinaryAdapterLike, type V4PlatformIo } from "./platform-io"
 import { isV4UncVaultPath, V4_NETWORK_VAULT_WARNING } from "./network-storage"
 import { createV4DesktopInitiatorLocalReader } from "./reencryption-desktop-initiator-reader"
-import { createV4MobileInitiatorLocalReader } from "./reencryption-mobile-initiator-reader"
+import { createV4MobileInitiatorLocalReader, inspectV4MobileReencryptionFileSizePreflight } from "./reencryption-mobile-initiator-reader"
 import { openV4NewDesktopPluginWalWriter, type V4DesktopPluginWalWriter } from "./reencryption-desktop-plugin-wal-writer"
 import { openV4NewMobilePluginWalWriter, type V4MobilePluginWalWriter } from "./reencryption-mobile-plugin-wal-writer"
 import { openV4DesktopPluginWalForRecovery } from "./reencryption-desktop-plugin-wal-recovery"
@@ -302,6 +302,7 @@ export class V4PluginRuntime {
     const settings = this.plugin.settings
     const generation = this.credentialGeneration
     const syncGeneration = this.coordinator.syncExecutionGeneration
+    const settingsSaveGeneration = this.plugin.settingsSaveGeneration
     const secretStorage = this.plugin.app.secretStorage
     const getSecret = secretStorage.getSecret
     const loadData = this.plugin.loadData
@@ -320,6 +321,7 @@ export class V4PluginRuntime {
       && this.plugin.manifest.id === pluginId && this.plugin.settings === settings
       && this.credentialGeneration === generation
       && this.coordinator.syncExecutionGeneration === syncGeneration
+      && this.plugin.settingsSaveGeneration === settingsSaveGeneration
       && this.plugin.app.secretStorage === secretStorage
       && secretStorage.getSecret === getSecret && this.plugin.loadData === loadData
       && settings?.githubOwner === source.owner && settings?.githubRepo === source.repo
@@ -378,6 +380,7 @@ export class V4PluginRuntime {
     const pluginId = this.plugin.manifest.id
     const credentialGeneration = this.credentialGeneration
     const syncGeneration = this.coordinator.syncExecutionGeneration
+    const settingsSaveGeneration = this.plugin.settingsSaveGeneration
     const backing = this.indexAdapterBacking as Pick<V4LocalIndexAdapter, "read" | "exists" | "stat"> | undefined
     const nativeRead = backing?.read
     const nativeExists = backing?.exists
@@ -393,6 +396,7 @@ export class V4PluginRuntime {
       && backing.stat === nativeStat
       && this.plugin.settings === settings && this.credentialGeneration === credentialGeneration
       && this.coordinator.syncExecutionGeneration === syncGeneration
+      && this.plugin.settingsSaveGeneration === settingsSaveGeneration
       && settings.githubToken === token && settings.githubOwner === owner
       && settings.githubRepo === repo && settings.githubBranch === branch
       && settings.githubTokenSecretId === tokenSecretId
@@ -477,6 +481,7 @@ export class V4PluginRuntime {
       }
       const generation = this.credentialGeneration
       const syncGeneration = this.coordinator.syncExecutionGeneration
+      const settingsSaveGeneration = this.plugin.settingsSaveGeneration
       const pinned = {
         owner: settings.githubOwner, repo: settings.githubRepo,
         branch: settings.githubBranch, token: settings.githubToken,
@@ -492,6 +497,7 @@ export class V4PluginRuntime {
           || this.plugin.settings !== settings || this.plugin.manifest.id !== pluginId
           || this.credentialGeneration !== generation || Platform.isDesktopApp !== desktop
           || this.coordinator.syncExecutionGeneration !== syncGeneration
+          || this.plugin.settingsSaveGeneration !== settingsSaveGeneration
           || native.read !== nativeRead || native.exists !== nativeExists
           || native.stat !== nativeStat || native.list !== nativeList
           || native.getFullPath !== nativeGetFullPath
@@ -636,6 +642,7 @@ export class V4PluginRuntime {
       const pluginId = this.plugin.manifest.id
       const generation = this.credentialGeneration
       const syncGeneration = this.coordinator.syncExecutionGeneration
+      const settingsSaveGeneration = this.plugin.settingsSaveGeneration
       const desktop = Platform.isDesktopApp === true
       const secretStorage = this.plugin.app.secretStorage
       const getSecret = secretStorage.getSecret
@@ -659,6 +666,7 @@ export class V4PluginRuntime {
           || this.plugin.manifest.id !== pluginId || this.plugin.settings !== settings
           || this.credentialGeneration !== generation || Platform.isDesktopApp !== desktop
           || this.coordinator.syncExecutionGeneration !== syncGeneration
+          || this.plugin.settingsSaveGeneration !== settingsSaveGeneration
           || native.read !== methods.read || native.exists !== methods.exists
           || native.stat !== methods.stat || native.list !== methods.list
           || native.getFullPath !== methods.fullPath
@@ -898,6 +906,7 @@ export class V4PluginRuntime {
       const configDir = vault.configDir
       const generation = this.credentialGeneration
       const syncGeneration = this.coordinator.syncExecutionGeneration
+      const settingsSaveGeneration = this.plugin.settingsSaveGeneration
       const token = settings.githubToken
       const owner = settings.githubOwner
       const repo = settings.githubRepo
@@ -914,6 +923,7 @@ export class V4PluginRuntime {
           || this.plugin.manifest.id !== pluginId
           || this.plugin.settings !== settings || this.credentialGeneration !== generation
           || this.coordinator.syncExecutionGeneration !== syncGeneration
+          || this.plugin.settingsSaveGeneration !== settingsSaveGeneration
           || settings.githubToken !== token || settings.githubOwner !== owner
           || settings.githubRepo !== repo || settings.githubBranch !== branch
           || settings.githubTokenSecretId !== tokenSecretId
@@ -994,6 +1004,7 @@ export class V4PluginRuntime {
       const desktop = Platform.isDesktopApp === true
       const generation = this.credentialGeneration
       const syncGeneration = this.coordinator.syncExecutionGeneration
+      const settingsSaveGeneration = this.plugin.settingsSaveGeneration
       const indexRead = backing?.read
       const indexExists = backing?.exists
       const nativeStat = backing?.stat
@@ -1014,6 +1025,7 @@ export class V4PluginRuntime {
           || this.plugin.manifest.id !== pluginId
           || this.plugin.settings !== settings || this.credentialGeneration !== generation
           || this.coordinator.syncExecutionGeneration !== syncGeneration
+          || this.plugin.settingsSaveGeneration !== settingsSaveGeneration
           || this.plugin.app.secretStorage !== secretStorage
           || secretStorage.getSecret !== getSecret || this.plugin.loadData !== loadData
           || Platform.isDesktopApp !== desktop
@@ -1142,6 +1154,7 @@ export class V4PluginRuntime {
     const settings = this.plugin.settings
     const generation = this.credentialGeneration
     const syncGeneration = this.coordinator.syncExecutionGeneration
+    const settingsSaveGeneration = this.plugin.settingsSaveGeneration
     const secretStorage = this.plugin.app.secretStorage
     const getSecret = secretStorage.getSecret
     const loadData = this.plugin.loadData
@@ -1160,6 +1173,7 @@ export class V4PluginRuntime {
       && this.plugin.manifest.id === pluginId && this.plugin.settings === settings
       && this.credentialGeneration === generation
       && this.coordinator.syncExecutionGeneration === syncGeneration
+      && this.plugin.settingsSaveGeneration === settingsSaveGeneration
       && this.plugin.app.secretStorage === secretStorage
       && secretStorage.getSecret === getSecret && this.plugin.loadData === loadData
       && settings?.githubOwner === source.owner && settings?.githubRepo === source.repo
@@ -1239,10 +1253,16 @@ export class V4PluginRuntime {
     if (typeof assertExclusiveInitiatorLease !== "function") {
       throw new Error("Re-encryption initiating-vault parity requires a real exclusive WAL lease.")
     }
+    if (this.coordinator.isSyncing || this.plugin.isSyncInProgress) {
+      throw new Error("Re-encryption initiating-vault reader cannot start while Sync is active.")
+    }
     const initial = { ...this.plugin.settings }
     const generation = this.credentialGeneration
+    const settingsSaveGeneration = this.plugin.settingsSaveGeneration
+    const syncGeneration = this.coordinator.syncExecutionGeneration
+    const initialVault = this.plugin.app.vault
     const sourceScope = {
-      configDir: this.plugin.app.vault.configDir || ".obsidian",
+      configDir: initialVault.configDir || ".obsidian",
       pluginId: this.plugin.manifest.id,
       ignorePathRegex: initial.ignorePathRegex,
       syncObsidianConfig: initial.syncObsidianConfig,
@@ -1253,6 +1273,7 @@ export class V4PluginRuntime {
       this.assertNotDisposed()
       const latest = this.plugin.settings
       if (this.credentialGeneration !== generation
+        || this.plugin.settingsSaveGeneration !== settingsSaveGeneration
         || latest.githubOwner !== initial.githubOwner || latest.githubRepo !== initial.githubRepo
         || latest.githubBranch !== initial.githubBranch || latest.githubToken !== initial.githubToken
         || latest.encryptionMode !== initial.encryptionMode
@@ -1264,10 +1285,11 @@ export class V4PluginRuntime {
         || latest.syncObsidianConfig !== initial.syncObsidianConfig
         || latest.syncBookmarks !== initial.syncBookmarks
         || latest.syncPlugins !== initial.syncPlugins
+        || this.plugin.app.vault !== initialVault
         || (this.plugin.app.vault.configDir || ".obsidian") !== sourceScope.configDir
         || this.plugin.manifest.id !== sourceScope.pluginId
         || this.plugin.app.vault.adapter !== this.indexAdapterBacking) {
-        throw new Error("Re-encryption source connection or local Sync scope changed.")
+        throw new Error("Re-encryption source connection, Vault identity or local Sync scope changed.")
       }
     }
     const guards = {
@@ -1275,9 +1297,13 @@ export class V4PluginRuntime {
       assertExclusiveInitiatorLease,
       assertIdleAndNoPendingEdits: async () => {
         this.assertNotDisposed()
+        if (this.coordinator.syncExecutionGeneration !== syncGeneration) {
+          throw new Error("Re-encryption source Sync started since the initiating reader was created.")
+        }
         if (this.coordinator.isSyncing || this.coordinator.pendingCount > 0
+          || this.plugin.isSyncInProgress || this.plugin.isSettingsSaveInProgress?.()
           || this.debounceRunActive || this.recentlyStagedPaths.size > 0) {
-          throw new Error("Re-encryption source Sync or pending local mutations are not idle.")
+          throw new Error("Re-encryption source Sync, Settings save or pending local mutations are not idle.")
         }
       },
       assertSourceConfigurationUnchanged: assertConnection,
@@ -1357,6 +1383,8 @@ export class V4PluginRuntime {
       throw new Error("Re-encryption requires no active, pending or staged Sync work.")
     }
     const originalGeneration = this.credentialGeneration
+    const originalSyncGeneration = this.coordinator.syncExecutionGeneration
+    const originalMobile = Platform.isDesktopApp !== true
     // Pin the caller's migration identity and lease function before ANY await.
     // The input object can be mutated by the caller while disk I/O is pending.
     const runId = input.runId
@@ -1374,6 +1402,7 @@ export class V4PluginRuntime {
         || this.plugin.manifest.id !== originalPluginId
         || this.plugin.app.vault.adapter !== this.indexAdapterBacking
         || this.credentialGeneration !== originalGeneration
+        || (Platform.isDesktopApp !== true) !== originalMobile
         || now.githubOwner !== initial.githubOwner || now.githubRepo !== initial.githubRepo
         || now.githubBranch !== initial.githubBranch || now.githubToken !== initial.githubToken
         || now.encryptionMode !== initial.encryptionMode
@@ -1389,7 +1418,39 @@ export class V4PluginRuntime {
         throw new Error("Re-encryption Source or Sync status changed; Manual Recovery required.")
       }
     }
-    // The coordinator synchronously rejects new Syncs BEFORE the first await.
+    // Mobile must refuse unsupported included file sizes BEFORE the one-way
+    // Sync reservation, persisted fence write or watch shutdown. This scan
+    // checks only physical metadata and is not an authenticated parity proof.
+    // Sync can run while this read-only scan awaits, so pin the generation
+    // and recheck the Source, lease and pending edits at every I/O boundary.
+    if (originalMobile) {
+      const assertPreFenceStable = async () => {
+        assertPinned()
+        if (this.coordinator.syncExecutionGeneration !== originalSyncGeneration
+          || this.coordinator.isSyncing || this.coordinator.pendingCount !== 0) {
+          throw new Error("Re-encryption Mobile preflight lost the idle Sync generation.")
+        }
+        await initiatorLease()
+        assertPinned()
+        if (this.coordinator.syncExecutionGeneration !== originalSyncGeneration
+          || this.coordinator.isSyncing || this.coordinator.pendingCount !== 0) {
+          throw new Error("Re-encryption Mobile preflight lost the idle Sync generation.")
+        }
+      }
+      await inspectV4MobileReencryptionFileSizePreflight({
+        adapter: originalVault.adapter,
+        scope: {
+          configDir: originalConfigDir, pluginId: originalPluginId,
+          ignorePathRegex: initial.ignorePathRegex,
+          syncObsidianConfig: initial.syncObsidianConfig,
+          syncBookmarks: initial.syncBookmarks, syncPlugins: initial.syncPlugins,
+        },
+        assertPreviewStable: assertPreFenceStable,
+      })
+      await assertPreFenceStable()
+    }
+    // Desktop reserves synchronously before its first await. Mobile reserves
+    // only after the read-only capability scan has passed without Sync drift.
     const assertQuiescent = this.coordinator.reserveReencryptionQuiescence()
     this.reencryptionFencePending = true
     try {

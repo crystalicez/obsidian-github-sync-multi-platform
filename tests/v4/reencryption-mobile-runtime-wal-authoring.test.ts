@@ -4,6 +4,7 @@ import { Platform } from "obsidian"
 
 import { utf8ToBytes } from "../../src/lib/bytes"
 import { V4PluginRuntime } from "../../src/lib/v4/runtime"
+import { V4SyncCoordinator } from "../../src/lib/v4/sync-coordinator"
 import { planV4PluginPrivateWalLocation } from "../../src/lib/v4/reencryption-plugin-wal-location"
 import { openV4MobilePluginWalForRecovery } from "../../src/lib/v4/reencryption-mobile-wal-recovery"
 import { createV4ReencryptionRecoveryJournal } from "../../src/lib/v4/reencryption-recovery-journal"
@@ -30,8 +31,8 @@ async function fixture() {
         size: utf8ToBytes(file.text).length, mtime: file.mtime } : null
     },
     async list(name: string) {
-      if (!directories.has(name)) throw Error("missing folder")
-      const prefix = name + "/"
+      if (name !== "/" && !directories.has(name)) throw Error("missing folder")
+      const prefix = name === "/" ? "" : name + "/"
       return {
         files: [...files.keys()].filter(n => n.startsWith(prefix)
           && !n.slice(prefix.length).includes("/")),
@@ -80,6 +81,63 @@ async function fixture() {
     }),
   }
 }
+
+test("D363 Mobile rejects an in-scope >32 MiB file before arming its one-way migration Sync fence", async () => {
+  const previous = Platform.isDesktopApp
+  Platform.isDesktopApp = false
+  const f = await fixture()
+  let reads = 0
+  const originalList = f.adapter.list.bind(f.adapter)
+  const originalStat = f.adapter.stat.bind(f.adapter)
+  try {
+    f.adapter.list = async path => {
+      const listed = await originalList(path)
+      return path === "/" ? { ...listed, files: [...listed.files, "oversized.md"] } : listed
+    }
+    f.adapter.stat = async path => path === "oversized.md"
+      ? { type: "file" as const, size: 32 * 1024 * 1024 + 1, mtime: 4 }
+      : originalStat(path)
+    Object.assign(f.adapter, {
+      async readBinary() { reads++; throw Error("must not allocate Mobile whole-file read") },
+    })
+    await assert.rejects(() => f.arm(), /32 MiB.*Desktop/i)
+    assert.equal(f.watchDisabled, false, "failed capability check must not disable ordinary Sync")
+    assert.equal(reads, 0)
+    assert.equal(f.files.size, 0, "no persisted Sync fence, WAL or Vault mutation on capability failure")
+  } finally {
+    f.runtime.dispose()
+    Platform.isDesktopApp = previous
+  }
+})
+
+test("D363 Mobile rejects a completed Sync during awaited size enumeration before any fence", async () => {
+  const previous = Platform.isDesktopApp
+  Platform.isDesktopApp = false
+  const f = await fixture()
+  const coordinator = new V4SyncCoordinator({ execute: async () => ({ changedFiles: 0 }) })
+  ;(f.runtime as unknown as { coordinator: V4SyncCoordinator }).coordinator = coordinator
+  const originalList = f.adapter.list.bind(f.adapter)
+  let synced = false
+  try {
+    f.adapter.list = async path => {
+      const listed = await originalList(path)
+      if (!synced && path === "/") {
+        synced = true
+        const result = await coordinator.run({ operation: "normal", trigger: "manual" })
+        assert.equal(result.status, "completed")
+      }
+      return listed
+    }
+    await assert.rejects(() => f.arm(), /Sync generation/i)
+    assert.equal(synced, true)
+    assert.equal(coordinator.syncExecutionGeneration, 1)
+    assert.equal(f.watchDisabled, false)
+    assert.equal(f.files.size, 0)
+  } finally {
+    f.runtime.dispose()
+    Platform.isDesktopApp = previous
+  }
+})
 
 test("D245 live Mobile Runtime arms persisted Fence, writes AES-GCM WAL and reopens with adapter-only Recovery", async () => {
   const previous = Platform.isDesktopApp

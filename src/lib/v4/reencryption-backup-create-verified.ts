@@ -91,6 +91,15 @@ async function createAndVerifyBackup(
 ): Promise<V4CreatedAndVerifiedBackupReport> {
   throwIfV4Aborted(input.signal)
   const { plan, verifiedSource, backup, source } = input
+  const originalRefWriter = backup.createGitRef
+  const originalBackupBranch = backup.branchName
+  const assertRefWriterUnchanged = () => {
+    throwIfV4Aborted(input.signal)
+    if (input.backup !== backup || backup.branchName !== originalBackupBranch
+      || backup.createGitRef !== originalRefWriter) {
+      throw new Error("Frozen backup GitHub writer changed; Manual Recovery required.")
+    }
+  }
   if (!plan || !verifiedSource
     || verifiedSource.integrityScope !== "all-live-objects"
     || verifiedSource.pinnedSourceCommitSha !== plan.pinnedSourceCommitSha
@@ -110,6 +119,7 @@ async function createAndVerifyBackup(
 
   // Explicit delegation (not a spread of GitHubClient: methods live on its
   // prototype). Tracks the actual irreversible mutation boundary precisely.
+  assertRefWriterUnchanged()
   const scopedBackup = {
     branchName: backup.branchName,
     getRepositoryIdentity: () => backup.getRepositoryIdentity(),
@@ -121,24 +131,27 @@ async function createAndVerifyBackup(
       // remote preflight is running. Recheck at the mutation boundary.
       throwIfV4Aborted(input.signal)
       await input.assertExclusiveMigrationLease()
-      throwIfV4Aborted(input.signal)
+      assertRefWriterUnchanged()
       createAttempted = true
-      await backup.createGitRef(sha)
+      await originalRefWriter.call(backup, sha)
       createResponseReceived = true
+      assertRefWriterUnchanged()
     },
   }
   try {
     // Intent is stored before D93 can send its create-only GitHub request.
     // Preflight failures may leave a harmless intent, never a false mutation.
     await checkpoint()
-    throwIfV4Aborted(input.signal)
+    assertRefWriterUnchanged()
     await createV4FrozenSameRepositoryBackupRef({
       plan, verifiedSource, source, backup: scopedBackup,
       expectedSourceTreeSha: input.expectedSourceTreeSha,
       signal: input.signal,
     })
+    assertRefWriterUnchanged()
   } catch (error) {
     throwIfV4Aborted(input.signal)
+    assertRefWriterUnchanged()
     if (!createAttempted
       || (!createResponseReceived && classifyV4MutationFailure(error) === "definitive")) throw error
     originalError = error
@@ -151,8 +164,10 @@ async function createAndVerifyBackup(
       originalPassphrase: input.originalPassphrase,
       signal: input.signal,
     })
+    assertRefWriterUnchanged()
   } catch (error) {
     throwIfV4Aborted(input.signal)
+    assertRefWriterUnchanged()
     if (originalError !== undefined) {
       throw new Error("Frozen backup creation remains ambiguous; independent encrypted recovery failed.", {
         cause: error,
@@ -171,7 +186,7 @@ async function createAndVerifyBackup(
   }
   throwIfV4Aborted(input.signal)
   await input.assertExclusiveMigrationLease()
-  throwIfV4Aborted(input.signal)
+  assertRefWriterUnchanged()
   if (!createAttempted) {
     throw new Error("Frozen backup cannot claim creation without sending an authenticated ref request.")
   }

@@ -1,7 +1,8 @@
 import assert from "node:assert/strict"
 import test from "node:test"
 import { execFileSync } from "node:child_process"
-import { link, mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises"
+import { createRequire, syncBuiltinESMExports } from "node:module"
+import { link, mkdtemp, mkdir, readFile, readdir, rename, rm, symlink, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 
 import { createV4ReencryptionRecoveryJournal } from "../../src/lib/v4/reencryption-recovery-journal"
@@ -29,6 +30,426 @@ async function sandbox() {
   const root = await mkdtemp(join(testRoot, "d86-desktop-wal-"))
   return { root, async cleanup() { await rm(root, { recursive: true, force: true }) } }
 }
+
+test("D402 WAL initialization failure cleans up its own unchanged lock", async () => {
+  const t = await sandbox()
+  const directory = join(t.root, "rekey", "wal")
+  const lock = join(directory, ".exclusive.lock")
+  const unexpected = join(directory, "interrupted-evidence.tmp")
+  const fs = createRequire(import.meta.url)("node:fs/promises") as {
+    readdir: (...args: unknown[]) => Promise<unknown>
+  }
+  const originalReaddir = fs.readdir
+  let injected = false
+  try {
+    fs.readdir = async (...args: unknown[]) => {
+      if (!injected && args[0] === directory) {
+        injected = true
+        await writeFile(unexpected, "retain incomplete WAL evidence", "utf8")
+      }
+      return originalReaddir(...args)
+    }
+    syncBuiltinESMExports()
+    await assert.rejects(
+      acquireV4DesktopRekeyWalStorage({ rootAbsolute: t.root, journalRoot }),
+      /pre-existing or interrupted recovery evidence/i,
+    )
+    assert.equal(injected, true)
+    await assert.rejects(readFile(lock, "utf8"), { code: "ENOENT" },
+      "the initializer may clean up only its own unchanged lock")
+    assert.equal(await readFile(unexpected, "utf8"), "retain incomplete WAL evidence")
+  } finally {
+    fs.readdir = originalReaddir
+    syncBuiltinESMExports()
+    await t.cleanup()
+  }
+})
+
+test("D402 WAL initialization failure preserves a foreign replacement lock", async () => {
+  const t = await sandbox()
+  const directory = join(t.root, "rekey", "wal")
+  const lock = join(directory, ".exclusive.lock")
+  const displaced = join(directory, "displaced-original-lock")
+  const unexpected = join(directory, "interrupted-evidence.tmp")
+  let foreignToken = ""
+  const fs = createRequire(import.meta.url)("node:fs/promises") as {
+    readdir: (...args: unknown[]) => Promise<unknown>
+  }
+  const originalReaddir = fs.readdir
+  let swapped = false
+  try {
+    fs.readdir = async (...args: unknown[]) => {
+      if (!swapped && args[0] === directory) {
+        swapped = true
+        // During initialization, the initial owner loses its pathname. A
+        // different owner then establishes a new lock at the same pathname.
+        await rename(lock, displaced)
+        // A new owner could reproduce the original token bytes. Pathname
+        // identity must be checked independently of token contents.
+        foreignToken = await readFile(displaced, "utf8")
+        await writeFile(lock, foreignToken, "utf8")
+        await writeFile(unexpected, "preserve possible interrupted WAL evidence", "utf8")
+      }
+      return originalReaddir(...args)
+    }
+    syncBuiltinESMExports()
+    await assert.rejects(
+      acquireV4DesktopRekeyWalStorage({ rootAbsolute: t.root, journalRoot }),
+      /pre-existing or interrupted recovery evidence/i,
+    )
+    assert.equal(swapped, true, "test must replace the lock during initialization")
+    assert.equal(await readFile(lock, "utf8"), foreignToken,
+      "initialization cleanup must not unlink another owner's lock")
+    assert.equal(await readFile(unexpected, "utf8"),
+      "preserve possible interrupted WAL evidence",
+      "interrupted evidence must remain available for Manual Recovery")
+    assert.equal((await readFile(displaced, "utf8")).length, 32)
+  } finally {
+    fs.readdir = originalReaddir
+    syncBuiltinESMExports()
+    await t.cleanup()
+  }
+})
+
+test("D404 releasing a displaced lock preserves a foreign same-token replacement", async () => {
+  const t = await sandbox()
+  const directory = join(t.root, "rekey", "wal")
+  const lockPath = join(directory, ".exclusive.lock")
+  const displaced = join(directory, "original-lock-displaced-after-token")
+  const fs = createRequire(import.meta.url)("node:fs/promises") as {
+    lstat: typeof import("node:fs/promises").lstat
+  }
+  const originalLstat = fs.lstat
+  let lockChecks = 0
+  let swapped = false
+  let store: Awaited<ReturnType<typeof acquireV4DesktopRekeyWalStorage>> | undefined
+  try {
+    store = await acquireV4DesktopRekeyWalStorage({ rootAbsolute: t.root, journalRoot })
+    await makeJournal(store.adapter).begin()
+    const token = await readFile(lockPath, "utf8")
+    fs.lstat = (async (...args: Parameters<typeof originalLstat>) => {
+      const observed = await originalLstat(...args)
+      if (args[0] === lockPath && ++lockChecks === 2) {
+        // The second lock pathname stat is assertHeld's post-token check.
+        // The lock is replaced after that observation, before release unlinks.
+        await rename(lockPath, displaced)
+        await writeFile(lockPath, token, "utf8")
+        swapped = true
+      }
+      return observed
+    }) as typeof originalLstat
+    syncBuiltinESMExports()
+    await assert.rejects(store.release(), V4DesktopRekeyWalLockError,
+      "release must not unlink a foreign lock installed after its token check")
+    assert.equal(swapped, true, "the real Windows lock must change at the release boundary")
+    assert.equal(await readFile(lockPath, "utf8"), token,
+      "the new owner's same-token lock must remain for Manual Recovery")
+    assert.equal(await readFile(displaced, "utf8"), token,
+      "the detached original owner's evidence must be preserved")
+    // Once the original lock is restored, its owner can still release it.
+    // A failed first release must not corrupt its in-process lease state.
+    fs.lstat = originalLstat
+    syncBuiltinESMExports()
+    await rm(lockPath, { force: true })
+    await rename(displaced, lockPath)
+    swapped = false
+    await store.release()
+    await assert.rejects(readFile(lockPath, "utf8"), { code: "ENOENT" })
+  } finally {
+    fs.lstat = originalLstat
+    syncBuiltinESMExports()
+    if (swapped) {
+      await rm(lockPath, { force: true })
+      await rename(displaced, lockPath)
+    }
+    try { await store?.release() } catch {
+      // Original (RED) behavior may already have released the lease.
+    }
+    await t.cleanup()
+  }
+})
+
+test("D403 temporary-slot replacement cannot overwrite a valid WAL checkpoint", async () => {
+  const t = await sandbox()
+  const directory = join(t.root, "rekey", "wal")
+  const target = join(directory, "slot-1.json")
+  const foreign = join(directory, "foreign-temp")
+  const fs = createRequire(import.meta.url)("node:fs/promises") as {
+    lstat: typeof import("node:fs/promises").lstat
+  }
+  const previousLstat = fs.lstat
+  let checks = 0
+  let replaced = ""
+  let store: Awaited<ReturnType<typeof acquireV4DesktopRekeyWalStorage>> | undefined
+  try {
+    store = await acquireV4DesktopRekeyWalStorage({ rootAbsolute: t.root, journalRoot })
+    await makeJournal(store.adapter).begin()
+    const before = await readFile(target, "utf8")
+    fs.lstat = (async (...args: Parameters<typeof previousLstat>) => {
+      if (args[0] === target && ++checks === 2) {
+        const name = (await readdir(directory)).find(s => s.startsWith(".slot-") && s.endsWith(".tmp"))
+        assert.ok(name)
+        replaced = join(directory, name)
+        await rename(replaced, foreign)
+        await writeFile(replaced, "foreign file", "utf8")
+      }
+      return previousLstat(...args)
+    }) as typeof previousLstat
+    syncBuiltinESMExports()
+    await assert.rejects(store.adapter.write(journalRoot + "/slot-1.json", before), /temporary|changed|identity|replaced/i)
+    assert.equal(checks, 2)
+    assert.equal(await readFile(target, "utf8"), before)
+    assert.equal(await readFile(replaced, "utf8"), "foreign file")
+  } finally {
+    fs.lstat = previousLstat
+    syncBuiltinESMExports()
+    await store?.release()
+    await t.cleanup()
+  }
+})
+
+test("D403 failed WAL rename preserves another owner's temporary file", async () => {
+  const t = await sandbox()
+  const directory = join(t.root, "rekey", "wal")
+  const target = join(directory, "slot-1.json")
+  const displaced = join(directory, "displaced-original-temp")
+  const fs = createRequire(import.meta.url)("node:fs/promises") as {
+    rename: typeof import("node:fs/promises").rename
+  }
+  const previousRename = fs.rename
+  let foreignTemp = ""
+  let store: Awaited<ReturnType<typeof acquireV4DesktopRekeyWalStorage>> | undefined
+  try {
+    store = await acquireV4DesktopRekeyWalStorage({ rootAbsolute: t.root, journalRoot })
+    await makeJournal(store.adapter).begin()
+    const before = await readFile(target, "utf8")
+    fs.rename = (async (...args: Parameters<typeof previousRename>) => {
+      const source = String(args[0])
+      if (!foreignTemp && source.startsWith(join(directory, ".slot-")) && args[1] === target) {
+        foreignTemp = source
+        await previousRename(source, displaced)
+        await writeFile(source, "foreign interrupted evidence", "utf8")
+        throw new Error("injected rename error after foreign replacement")
+      }
+      return previousRename(...args)
+    }) as typeof previousRename
+    syncBuiltinESMExports()
+    await assert.rejects(store.adapter.write(journalRoot + "/slot-1.json", before),
+      /injected rename error after foreign replacement/)
+    assert.ok(foreignTemp, "the test must replace a real temporary WAL file")
+    assert.equal(await readFile(target, "utf8"), before)
+    assert.equal(await readFile(foreignTemp, "utf8"), "foreign interrupted evidence")
+  } finally {
+    fs.rename = previousRename
+    syncBuiltinESMExports()
+    await store?.release()
+    await t.cleanup()
+  }
+})
+
+test("D403 failed WAL rename cleans up an unchanged writer-owned temporary file", async () => {
+  const t = await sandbox()
+  const directory = join(t.root, "rekey", "wal")
+  const target = join(directory, "slot-1.json")
+  const fs = createRequire(import.meta.url)("node:fs/promises") as {
+    rename: typeof import("node:fs/promises").rename
+  }
+  const previousRename = fs.rename
+  let injected = false
+  let store: Awaited<ReturnType<typeof acquireV4DesktopRekeyWalStorage>> | undefined
+  try {
+    store = await acquireV4DesktopRekeyWalStorage({ rootAbsolute: t.root, journalRoot })
+    await makeJournal(store.adapter).begin()
+    const before = await readFile(target, "utf8")
+    fs.rename = (async (...args: Parameters<typeof previousRename>) => {
+      if (!injected && String(args[0]).startsWith(join(directory, ".slot-")) && args[1] === target) {
+        injected = true
+        throw new Error("injected transient WAL rename error")
+      }
+      return previousRename(...args)
+    }) as typeof previousRename
+    syncBuiltinESMExports()
+    await assert.rejects(store.adapter.write(journalRoot + "/slot-1.json", before),
+      /injected transient WAL rename error/)
+    assert.equal(injected, true)
+    assert.equal(await readFile(target, "utf8"), before)
+    assert.deepEqual((await readdir(directory)).sort(), [".exclusive.lock", "slot-1.json"],
+      "an unchanged writer-owned temporary file may be cleaned safely")
+  } finally {
+    fs.rename = previousRename
+    syncBuiltinESMExports()
+    await store?.release()
+    await t.cleanup()
+  }
+})
+
+test("D401 Desktop WAL lease refuses a detached or same-token replacement lock during token read", async () => {
+  for (const mode of ["detached", "same-token-replaced"] as const) {
+  const t = await sandbox()
+  const lockPath = join(t.root, "rekey", "wal", ".exclusive.lock")
+  const displaced = join(t.root, "rekey", "wal", "displaced-lock")
+  const fs = createRequire(import.meta.url)("node:fs/promises") as {
+    open: typeof import("node:fs/promises").open
+  }
+  const originalOpen = fs.open
+  let armed = false
+  let intercepted = false
+  let moved = false
+  let entered!: () => void
+  let resumeRead!: () => void
+  const reading = new Promise<void>(resolve => { entered = resolve })
+  const resumed = new Promise<void>(resolve => { resumeRead = resolve })
+  let store: Awaited<ReturnType<typeof acquireV4DesktopRekeyWalStorage>> | undefined
+  try {
+    fs.open = (async (...args: Parameters<typeof originalOpen>) => {
+      const handle = await originalOpen(...args)
+      if (args[0] === lockPath && args[1] === "wx+") {
+        const originalRead = handle.read.bind(handle)
+        Object.defineProperty(handle, "read", {
+          configurable: true,
+          value: async (buffer: Buffer, offset: number, length: number, position: number) => {
+            if (armed && !intercepted) {
+              intercepted = true
+              entered()
+              await resumed
+            }
+            return originalRead(buffer, offset, length, position)
+          },
+        })
+      }
+      return handle
+    }) as typeof originalOpen
+    syncBuiltinESMExports()
+    store = await acquireV4DesktopRekeyWalStorage({ rootAbsolute: t.root, journalRoot })
+    armed = true
+    const check = store.assertExclusiveStageLease()
+    await reading
+    // The descriptor still holds its original token, but the pathname no
+    // longer identifies an exclusively owned lock at the end of this check.
+    await rename(lockPath, displaced)
+    moved = true
+    if (mode === "same-token-replaced") {
+      await writeFile(lockPath, await readFile(displaced, "utf8"))
+    }
+    resumeRead()
+    await assert.rejects(check, /lock|lease/i,
+      "a detached lock path must not certify an exclusive writer lease")
+  } finally {
+    resumeRead()
+    fs.open = originalOpen
+    syncBuiltinESMExports()
+    if (moved) {
+      if (mode === "same-token-replaced") await rm(lockPath)
+      await rename(displaced, lockPath)
+    }
+    await store?.release()
+    await t.cleanup()
+  }
+  }
+})
+
+test("D400 Desktop WAL read refuses external in-place modification after descriptor validation", async () => {
+  const t = await sandbox()
+  const fs = createRequire(import.meta.url)("node:fs/promises") as {
+    open: typeof import("node:fs/promises").open
+  }
+  const originalOpen = fs.open
+  const slot = join(t.root, "rekey", "wal", "slot-1.json")
+  let readStarted!: () => void
+  let resumeRead!: () => void
+  const entered = new Promise<void>(resolve => { readStarted = resolve })
+  const resume = new Promise<void>(resolve => { resumeRead = resolve })
+  let intercepted = false
+  let storage: Awaited<ReturnType<typeof acquireV4DesktopRekeyWalStorage>> | undefined
+  try {
+    storage = await acquireV4DesktopRekeyWalStorage({ rootAbsolute: t.root, journalRoot })
+    await makeJournal(storage.adapter).begin()
+    const prior = await storage.adapter.read(journalRoot + "/slot-1.json")
+    fs.open = (async (...args: Parameters<typeof originalOpen>) => {
+      const handle = await originalOpen(...args)
+      if (!intercepted && args[0] === slot && args[1] === "r") {
+        intercepted = true
+        const read = handle.read.bind(handle)
+        Object.defineProperty(handle, "read", {
+          configurable: true,
+          value: async (buffer: Buffer, offset: number, length: number, position: number) => {
+            readStarted()
+            await resume
+            return read(buffer, offset, length, position)
+          },
+        })
+      }
+      return handle
+    }) as typeof originalOpen
+    syncBuiltinESMExports()
+
+    const pending = storage.adapter.read(journalRoot + "/slot-1.json")
+    await entered
+    // A foreign, uncooperative actor writes the same number of bytes directly
+    // through the OS path; it does not touch our cooperative WAL write epoch.
+    await writeFile(slot, "Z".repeat(Buffer.byteLength(prior, "utf8")), "utf8")
+    resumeRead()
+    await assert.rejects(pending, /slot changed during read/i,
+      "post-read slot metadata must reject foreign changes even when the FD stayed open")
+  } finally {
+    resumeRead()
+    fs.open = originalOpen
+    syncBuiltinESMExports()
+    await storage?.release()
+    await t.cleanup()
+  }
+})
+
+test("D399 best-effort WAL readback rejects a completed write interleaved with its checkpoint", async () => {
+  const t = await sandbox()
+  const store = await acquireV4DesktopRekeyWalStorage({
+    rootAbsolute: t.root, journalRoot,
+  })
+  // Node's built-in ESM fs exports are synced from the CJS module so the
+  // actual WAL storage hits this test-controlled directory read barrier.
+  const fs = createRequire(import.meta.url)("node:fs/promises") as {
+    readdir: (...args: unknown[]) => Promise<unknown>
+  }
+  const originalReaddir = fs.readdir
+  const walDirectory = join(t.root, "rekey", "wal")
+  let entered!: () => void
+  let continueRead!: () => void
+  const intercepted = new Promise<void>(resolve => { entered = resolve })
+  const resumed = new Promise<void>(resolve => { continueRead = resolve })
+  let interceptedOnce = false
+  try {
+    await makeJournal(store.adapter).begin()
+    const slot = journalRoot + "/slot-1.json"
+    const persisted = await store.adapter.read(slot)
+    fs.readdir = async (...args: unknown[]) => {
+      if (!interceptedOnce && args[0] === walDirectory) {
+        interceptedOnce = true
+        entered()
+        await resumed
+      }
+      return originalReaddir(...args)
+    }
+    syncBuiltinESMExports()
+
+    const checkpoint = store.assertBestEffortCheckpoint()
+    await intercepted
+    // Complete a real create-only temporary-file write and rename while
+    // the checkpoint is suspended. Both final reads then see stable bytes.
+    await store.adapter.write(slot, persisted)
+    continueRead()
+    await assert.rejects(checkpoint, /WAL.*changed|checkpoint.*changed|readback.*changed/i,
+      "a second real WAL write cannot be invisible merely because it completed between checks")
+    assert.equal((await makeJournal(store.adapter).assertHealthySnapshot(1)).generation, 1)
+    assert.equal(await store.assertBestEffortCheckpoint(), "best-effort-readback-only",
+      "a fresh, non-overlapping readback still succeeds")
+  } finally {
+    continueRead()
+    fs.readdir = originalReaddir
+    syncBuiltinESMExports()
+    await store.release()
+    await t.cleanup()
+  }
+})
 
 test("D164 best-effort WAL checkpoint verifies settled disk readback but never claims physical durability", async () => {
   const t = await sandbox()

@@ -272,6 +272,23 @@ async function targetMatchesStage(io: V4LocalIo, path: string, stage: V4StageRef
   }
 }
 
+/**
+ * Stage IDs are physical owners of one stage path (and, on Desktop, one
+ * .target-backup / .replacement-residue pair). A stage may not stand in for
+ * two distinct WAL mutations: its first commit consumes the path, and its
+ * backup cannot prove ownership of another target. Reject before any mutation.
+ */
+export function assertUniqueV4RecoveryStageOwners(mutations: readonly V4RecoveryPayload["mutations"][number][]): void {
+  const used = new Set<string>()
+  for (const mutation of mutations) {
+    if (mutation.kind !== "stage-write") continue
+    if (used.has(mutation.stage.stageId)) {
+      throw new V4RecoveryRequiredError("V4 recovery stage is shared by multiple target mutations; manual recovery required.")
+    }
+    used.add(mutation.stage.stageId)
+  }
+}
+
 export async function applyV4RecoveryLocalMutations(input: {
   store: V4RecoveryStore
   snapshot: V4RecoverySnapshot
@@ -284,6 +301,9 @@ export async function applyV4RecoveryLocalMutations(input: {
   const payload: V4RecoveryPayload = snapshot.payload
     ? { mutations: snapshot.payload.mutations, completedMutationIds: [...snapshot.payload.completedMutationIds] }
     : { mutations: [], completedMutationIds: [] }
+  // Verify stage ownership before stat/commit/receipt/finalize on any target.
+  // Shared stage paths cannot be applied twice, even in a non-native fallback.
+  assertUniqueV4RecoveryStageOwners(payload.mutations)
   const completed = new Set(payload.completedMutationIds)
 
   const receipt = async (id: string): Promise<void> => {
@@ -418,18 +438,28 @@ export async function markV4RecoveryIndexCommitted(store: V4RecoveryStore, runId
 }
 
 export async function discardV4RecoveryStages(snapshot: V4RecoverySnapshot, io: V4LocalIo, keepStageIds: ReadonlySet<string> = new Set()): Promise<void> {
+  // On native Desktop, stage-derived sidecars do not encode the target path.
+  // A shared stage ID can never establish which target owns a backup; do not
+  // attempt even the first rollback/finalization or delete any stage bytes.
+  if (io.preferStagedCommit) assertUniqueV4RecoveryStageOwners(snapshot.payload?.mutations ?? [])
   const done = new Set(snapshot.payload?.completedMutationIds ?? [])
-  const processed = new Set<string>()
+  // A valid WAL may reference the same staged bytes from several target
+  // mutations. Finish *every* target's rollback/finalization before deleting
+  // any stage: deduplicating before rollback silently skipped later targets
+  // and could delete the only recovery input before a later rollback failed.
+  const stagesToRemove = new Map<string, V4StageRef>()
   for (const mutation of snapshot.payload?.mutations ?? []) {
     if (mutation.kind !== "stage-write") continue
-    if (keepStageIds.has(mutation.stage.stageId) || processed.has(mutation.stage.stageId)) continue
-    processed.add(mutation.stage.stageId)
+    if (keepStageIds.has(mutation.stage.stageId)) continue
     const request = { stage: mutation.stage, path: mutation.path, precondition: mutation.precondition }
     // Never remove the staged file while an unresolved target-backup might
     // be the only copy of the user's original content.
     if (done.has(mutation.id)) await io.finalizeStage?.(request)
     else await io.rollbackStage?.(request)
-    try { await io.staging?.remove(mutation.stage) } catch {}
+    stagesToRemove.set(mutation.stage.stageId, mutation.stage)
+  }
+  for (const stage of stagesToRemove.values()) {
+    try { await io.staging?.remove(stage) } catch {}
   }
 }
 

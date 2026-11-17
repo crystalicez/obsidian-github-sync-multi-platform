@@ -2,7 +2,7 @@ import type { V4ContentSource } from "./content-source"
 import { createV4IncrementalSha256 } from "./incremental-hash"
 
 export type V4PlatformKind = "desktop" | "mobile" | "other"
-export type V4BoundedIoCapability = "bounded-read" | "bounded-append" | "free-space" | "stage-commit"
+export type V4BoundedIoCapability = "bounded-read" | "bounded-append" | "free-space" | "stage-commit" | "stage-cleanup"
 
 export class V4ManualRecoveryRequiredError extends Error {
   constructor(public readonly targetPath: string, reason: string) {
@@ -315,7 +315,8 @@ export function createV4PlatformIo(options: V4PlatformIoOptions): V4PlatformIo {
         await fs.rm(full(path), { force: true })
         return
       }
-      if (options.adapter?.remove) await options.adapter.remove(path)
+      if (!options.adapter?.remove) throw new V4BoundedIoUnavailableError("stage-cleanup", path)
+      await options.adapter.remove(path)
     },
     async freeBytes(path) {
       if (!desktopReady) return undefined

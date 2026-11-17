@@ -1,0 +1,31 @@
+# D394: refuse Staging callback replacement during an encrypted WAL run
+
+Date: 2026-11-11. The changes are local to the inherited `.worktrees/d87-owner-rekey-policy` worktree. The release gate remains blocked.
+
+## Issue
+
+`stageV4ReencryptionVaultObjectsWithJournal()` carries a source-commit-bound journal from the verified frozen Backup through the one-shot Staging handoff and immutable Git blob uploads. It previously re-read its mutable input object after asynchronous lease and journal callbacks. A caller could replace `assertExclusiveStageLease`, `assertCrashDurable`, or `stageImmutableObject` during an awaited check. Later invocations then used the substituted callback rather than the one that started the migration. This could let an unapproved blob writer run after the original callback had ceased to be authoritative.
+
+This is not an indication that the installed production Desktop WAL or its methods were replaced in normal use. It is an exposed fail-closed contract defect at the async authoring boundary, and a test can reproduce it without network access.
+
+## Change
+
+At entry, the journaled Staging function captures one run owner, containing the original lease, strict durability or best-effort checkpoint, source verification and physical read, Git blob writer, input journal, plan, keys and config references, handoff, and cancellation signal. It checks that the input still refers to the same owner after asynchronous callback boundaries. The lease callback is invoked through the captured reference and checked both before and after awaiting it. Staging's downstream transcode receives bounded, owner-checked original source verifier and reader functions. The blob writer is checked and invoked through the captured reference, not a potentially replaced input property.
+
+This change does not grant new publication, automatic retry, Settings/Selector/Index Cutover, WAL durability, or native mobile platform authority. In-place mutation of a captured object's internal fields is not addressed solely by the referential check; the existing inventory, sealed candidate, and WAL receipt verifiers retain responsibility for content values.
+
+## Behavioral verification
+
+- **Before the source fix**, `node scripts/run-tests.mjs --tier=fast --filter=tests/v4/reencryption-staging-receipts.test.ts --name-pattern=^D394` failed as expected: `Missing expected rejection: ... substituted lease authority`, task `1bece8cd-c019-4768-a047-d66ba9f97f1a`, exit 1. The test modified the source input during an awaited original lease.
+- **After the fix**, D394 tests passed, task `206290eb-d0ce-4b5b-bd78-f6bbf5027c6b`, 2/2, exit 0. The first test independently substitutes lease, durability and Git blob writer before any one-shot Staging handoff or remote writer call; all three mutations are refused with no new WAL state. The second substitutes the writer **after** a genuine encrypted blob-upload intent is persisted: Staging refuses to upload, preserves the pending WAL intent, reports no validated receipt, and rejects an automatic rerun.
+- Complete `tests/v4/reencryption-staging-receipts.test.ts` suite, task `cb187e53-46c2-4fef-b850-0969ea7e42c2`: **29/29 PASS**.
+- `pnpm typecheck:max-strict` task `8b0a4fcb-36e3-4cf5-9852-3a4a0deed982`, `pnpm typecheck:github-e2e` task `2ea12a06-8ff1-450c-849b-ed36a8e37f12`, `pnpm build` task `0b423e6b-c740-4856-b29a-f903828c12cd`, and GitHub E2E three-bundle compilation task `a0ae69a0-067a-4ac5-8c4a-2d4ed292fef0`: all exited 0.
+- **LIVE PASS:** `node scripts/run-github-e2e-disposable.mjs wal-stage-encrypted`, task `3cb46a57-b9dd-40cd-89ea-46636a6d2efb`, exit 0. One focused real GitHub E2E passed. It authenticated the frozen Backup even after Source advanced, staged 7 new-key encrypted Git blobs for 7 files and 1,048,689 plaintext bytes, independently decrypted with the new key, rejected the old key, and reopened the encrypted WAL at generation 18 with unchanged bytes. No candidate/Destination publication and no Cutover. The Source branch `obsidian-sync-e2e/local-65046b2929db-d24-wal-stage-encrypted-5add4ec6d318`, Backup `obsidian-sync-e2e/local-backup-afc1142565cc6515ad2f95d958c2c373` and unused Destination `obsidian-sync-e2e/local-destination-cea4dfb358df340b8ec95d0c3ea152df` were each `CLEANUP_VERIFIED_TWICE` on approved physical GitHub repository ID `1284153873`. This Node E2E does not prove the same operations inside installed Obsidian or OS power-loss durability.
+
+- **LIVE DESTINATION PASS:** `node scripts/run-github-e2e-disposable.mjs wal-publish-encrypted`, task `49f3e5bb-b863-41f6-a052-2ce3632e08ff`, **exit 0, 1/1 focused GitHub E2E PASS**. Exact create-only orphan Destination commit `4c94d39cbff051c51537c6ddacb5f2a42109bc34` published and independently verified: 7 files, 1,048,689 logical plaintext bytes, 7 new-key staged blobs, 9 candidate metadata objects, new key authenticated, old key rejected, scratch restore matched 7 files, WAL reopened unchanged at generation 22. No unknown-response retry, power-loss durability claim, or Cutover. Disposable Source `obsidian-sync-e2e/local-65046b2929db-d24-wal-publish-encrypted-454d14a6572b`, Backup `obsidian-sync-e2e/local-backup-e010d0942e2036982a783586338cc782` and Destination `obsidian-sync-e2e/local-destination-f9be6e9f3f605a2ab843dfac6179b22a` were each `CLEANUP_VERIFIED_TWICE` on approved physical GitHub repo ID `1284153873`. This is a Node E2E using a disposable GitHub test repository, **not** a completed installed Obsidian migration or local Settings Cutover.
+
+## Remaining scope and release boundary
+
+The first public release still requires **Sync and Re-encryption together**. The existing 8 MiB encrypted transport part size, capability-gated Mobile initiation <=32 MiB, best-effort Manual Recovery after process or power-loss uncertainty, no real power-cut experiments, and GitHub Actions disabled remain unchanged.
+
+The integrated *installed Obsidian process* authenticating original Source, physically verifying the initiating Vault, and safely authoring the same WAL Backup→Staging→orphan Destination transaction is still not proven. Neither restart-safe Settings/Selector/Index Cutover nor stale-client and Android/iOS real-device acceptance has been completed. Keep `docs/release-gates/reencryption-wizard.json` at `blocked`. No project commit, push or merge is part of this stage.
