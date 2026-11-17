@@ -58,7 +58,16 @@ import { V4_RUNTIME_INDEX_ROOT } from "./reencryption-index-root"
 import { inspectV4ReencryptionColdStartIndexRoute, type V4ReencryptionColdStartRouteReport } from "./reencryption-runtime-index-route"
 import { decodeV4ReencryptionCutoverCandidateManifest } from "./reencryption-cutover-candidate-manifest"
 import { V4_REENCRYPTION_RUNTIME_ROUTE_PATH } from "./reencryption-index-root"
+import { planV4ReencryptionSeparatedRoots } from "./reencryption-separated-selector"
+import { V4_REENCRYPTION_SYNC_FENCE_ROOT } from "./reencryption-sync-fence"
 import { inspectV4ReencryptionColdStartJournalKey, type V4ReencryptionColdStartJournalReport, type V4ReencryptionColdStartJournalInput, type V4VerifiedOriginalJournalKeyScope } from "./reencryption-cold-start-journal-key"
+import {
+  inspectV4InstalledPreCutoverRecoveryAfterRestart,
+  runV4InstalledPreCutoverRehearsal,
+  type V4InstalledPreCutoverRecoveryReport,
+  type V4InstalledPreCutoverRehearsalReport,
+  type V4InstalledRehearsalPhase,
+} from "./reencryption-installed-rehearsal"
 const V4_INDEX_ROOT = V4_RUNTIME_INDEX_ROOT
 const V4_STAGE_ROOT = "github-sync-v4-stage"
 const V4_RECOVERY_ROOT = "github-sync-v4-recovery"
@@ -1582,6 +1591,311 @@ export class V4PluginRuntime {
       assertLiveOwner: owner.assertLiveOwner,
       assertExclusiveInitiatorLease: owner.assertExclusiveInitiatorLease,
       assertSyncFenceArmed: async () => { owner.assertLiveOwner() },
+    })
+  }
+
+  /**
+   * D412: Internal fenced pre-cutover Desktop rehearsal from immutable Source
+   * through verified Backup, staging, isolated scratch restore, orphan
+   * candidate and full Destination publication WITHOUT Settings/Index Cutover.
+   */
+  async runFencedReencryptionPreCutoverRehearsal(input: {
+    readonly runId: string
+    readonly backupBranch: string
+    readonly destinationBranch: string
+    readonly newPassphrase: string
+    readonly requestedIterations: number
+    readonly journalKey: Uint8Array
+    readonly acknowledgement: "accept-best-effort-power-loss-recovery-risk"
+    readonly assertExclusiveInitiatorLease: () => Promise<void>
+    readonly createGitHubClient?: ((branch: string) => GitHubClient) | undefined
+    readonly newSalt?: Uint8Array | undefined
+    readonly createdAt?: number | undefined
+    readonly signal?: AbortSignal | undefined
+    readonly onPhase?: ((phase: V4InstalledRehearsalPhase) => void | Promise<void>) | undefined
+  }): Promise<V4InstalledPreCutoverRehearsalReport> {
+    this.assertNotDisposed()
+    if (Platform.isDesktopApp !== true || this.uncVault || !this.desktopVaultRoot) {
+      throw new Error("Re-encryption pre-cutover Desktop rehearsal requires a local Desktop Vault.")
+    }
+    const settings = this.plugin.settings
+    const vault = this.plugin.app.vault
+    const backing = this.indexAdapterBacking
+    if (!backing || vault.adapter !== backing
+      || settings.encryptionMode !== "encrypted" || !settings.encryptionPassphrase
+      || !settings.githubOwner || !settings.githubRepo || !settings.githubBranch
+      || !settings.githubToken || !settings.vault) {
+      throw new Error("Re-encryption pre-cutover rehearsal requires an encrypted GitHub connection.")
+    }
+    const configDir = vault.configDir || ".obsidian"
+    const pluginId = this.plugin.manifest.id
+    if (!/^[A-Za-z0-9_-]{8,128}$/u.test(input.runId)) {
+      throw new Error("Re-encryption pre-cutover rehearsal requires a valid run ID.")
+    }
+    await planV4PluginPrivateWalLocation({ configDir, pluginId, runId: input.runId })
+    const scratchRelRoot = `${configDir}/plugins/${pluginId}/rekey-scratch-${input.runId}`
+    const adapterWithFullPath = backing as typeof backing & { getFullPath?: (path: string) => string }
+    if (typeof adapterWithFullPath.getFullPath !== "function") {
+      throw new Error("Re-encryption Desktop rehearsal requires native path resolution.")
+    }
+    const scratchAbsRoot = adapterWithFullPath.getFullPath(scratchRelRoot)
+    const [fs, nodePath] = typeof exports === "object" && typeof require === "function"
+      ? [require("node:fs/promises") as typeof import("node:fs/promises"), require("node:path") as typeof import("node:path")]
+      : await Promise.all([import("node:fs/promises"), import("node:path")])
+    const initialCredentialGen = this.credentialGeneration
+    const initialSettingsSaveGen = this.plugin.settingsSaveGeneration
+    const initialSyncGen = this.coordinator.syncExecutionGeneration
+    const initialSnapshot = {
+      owner: settings.githubOwner,
+      repo: settings.githubRepo,
+      branch: settings.githubBranch,
+      token: settings.githubToken,
+      tokenSecretId: settings.githubTokenSecretId,
+      passphrase: settings.encryptionPassphrase,
+      passphraseSecretId: settings.encryptionPassphraseSecretId,
+      deviceId: settings.vault,
+      mode: settings.encryptionMode,
+      ignorePathRegex: settings.ignorePathRegex,
+      syncObsidianConfig: settings.syncObsidianConfig,
+      syncBookmarks: settings.syncBookmarks,
+      syncPlugins: settings.syncPlugins,
+    }
+    const assertRuntimeOwner = () => {
+      this.assertNotDisposed()
+      const current = this.plugin.settings
+      if (this.indexAdapterBacking !== backing
+        || this.credentialGeneration !== initialCredentialGen
+        || this.plugin.settingsSaveGeneration !== initialSettingsSaveGen
+        || this.coordinator.syncExecutionGeneration !== initialSyncGen
+        || this.coordinator.isSyncing || this.coordinator.pendingCount !== 0
+        || this.debounceRunActive || this.recentlyStagedPaths.size !== 0
+        || this.plugin.isSyncInProgress || this.plugin.isSettingsSaveInProgress?.()
+        || this.plugin.settings !== settings || this.plugin.app.vault !== vault
+        || vault.adapter !== backing || (vault.configDir || ".obsidian") !== configDir
+        || this.plugin.manifest.id !== pluginId
+        || current.githubOwner !== initialSnapshot.owner
+        || current.githubRepo !== initialSnapshot.repo
+        || current.githubBranch !== initialSnapshot.branch
+        || current.githubToken !== initialSnapshot.token
+        || current.githubTokenSecretId !== initialSnapshot.tokenSecretId
+        || current.encryptionPassphrase !== initialSnapshot.passphrase
+        || current.encryptionPassphraseSecretId !== initialSnapshot.passphraseSecretId
+        || current.vault !== initialSnapshot.deviceId
+        || current.encryptionMode !== initialSnapshot.mode
+        || current.ignorePathRegex !== initialSnapshot.ignorePathRegex
+        || current.syncObsidianConfig !== initialSnapshot.syncObsidianConfig
+        || current.syncBookmarks !== initialSnapshot.syncBookmarks
+        || current.syncPlugins !== initialSnapshot.syncPlugins) {
+        throw new Error("Re-encryption pre-cutover rehearsal lost live plugin ownership.")
+      }
+    }
+    const assertScratchInsideVault = async () => {
+      const resolvedVault = await fs.realpath(this.desktopVaultRoot!)
+      const resolvedScratch = await fs.realpath(scratchAbsRoot)
+      const rel = nodePath.relative(resolvedVault, resolvedScratch)
+      if (!rel || rel.startsWith("..") || nodePath.isAbsolute(rel)) {
+        throw new Error("Re-encryption scratch directory escaped the local Vault root.")
+      }
+      const info = await fs.lstat(scratchAbsRoot)
+      if (!info.isDirectory() || info.isSymbolicLink()
+        || nodePath.resolve(resolvedScratch).toLowerCase() !== nodePath.resolve(scratchAbsRoot).toLowerCase()) {
+        throw new Error("Re-encryption scratch directory is not an isolated real directory.")
+      }
+    }
+    const createClient = input.createGitHubClient ?? ((branch: string) => new GitHubClient({
+      token: initialSnapshot.token,
+      owner: initialSnapshot.owner,
+      repo: initialSnapshot.repo,
+      branch,
+    }))
+    return runV4InstalledPreCutoverRehearsal({
+      runId: input.runId,
+      owner: initialSnapshot.owner,
+      repo: initialSnapshot.repo,
+      sourceBranch: initialSnapshot.branch,
+      backupBranch: input.backupBranch,
+      destinationBranch: input.destinationBranch,
+      oldPassphrase: initialSnapshot.passphrase,
+      newPassphrase: input.newPassphrase,
+      requestedIterations: input.requestedIterations,
+      deviceId: initialSnapshot.deviceId,
+      journalKey: input.journalKey,
+      acknowledgement: input.acknowledgement,
+      assertExclusiveInitiatorLease: input.assertExclusiveInitiatorLease,
+      createGitHubClient: createClient,
+      newSalt: input.newSalt,
+      createdAt: input.createdAt,
+      signal: input.signal,
+      onPhase: input.onPhase,
+      runtimeOwner: {
+        assertOwnerStillValid: assertRuntimeOwner,
+        armFenceAndOpenWal: async ({ runId, destinationRepoId, assertExclusiveInitiatorLease }) => {
+          await this.armReencryptionSyncFence({
+            runId,
+            destinationRepoId,
+            assertExclusiveInitiatorLease,
+          })
+          const wal = await this.openNewReencryptionDesktopWalForArmedRun()
+          const initiatorReader = this.createReencryptionInitiatorLocalReader(() => wal.assertExclusiveStageLease())
+          if (await fs.lstat(scratchAbsRoot).then(() => true, () => false)) {
+            throw new Error("Pre-existing Re-encryption scratch directory requires Manual Recovery.")
+          }
+          await fs.mkdir(scratchAbsRoot)
+          await assertScratchInsideVault()
+          const scratch = createRuntimeStagingStore(this.platformIo, scratchRelRoot)
+          return {
+            wal,
+            initiatorReader,
+            scratch,
+            assertScratchIsIsolated: async () => {
+              assertRuntimeOwner()
+              this.reencryptionWalOwner()
+              await assertScratchInsideVault()
+            },
+            cleanupScratch: async () => {
+              assertRuntimeOwner()
+              await assertScratchInsideVault()
+              await fs.rm(scratchAbsRoot, { recursive: true, force: true })
+            },
+          }
+        },
+      },
+    })
+  }
+
+  /**
+   * D412: Read-only post-restart recovery verification for a fenced
+   * pre-cutover rehearsal (before Cutover route or Settings changes).
+   */
+  async inspectFencedReencryptionPreCutoverRecovery(input: {
+    readonly runId: string
+    readonly backupBranch: string
+    readonly destinationBranch: string
+    readonly pinnedSourceCommitSha: string
+    readonly sourceTreeSha: string
+    readonly destinationCommitSha: string
+    readonly destinationTreeSha: string
+    readonly expectedFinalWalGeneration: number
+    readonly expectedFileCount: number
+    readonly expectedPlaintextBytes: string
+    readonly newPassphrase: string
+    readonly expectedPhysicalRepositoryId: number
+    readonly defaultBranch: string
+    readonly journalKey: Uint8Array
+    readonly createGitHubClient?: ((branch: string) => GitHubClient) | undefined
+    readonly signal?: AbortSignal | undefined
+  }): Promise<V4InstalledPreCutoverRecoveryReport> {
+    this.assertNotDisposed()
+    const vault = this.plugin.app.vault
+    const backing = this.indexAdapterBacking as (typeof vault.adapter & { getFullPath?: (path: string) => string }) | undefined
+    const settings = this.plugin.settings
+    const configDir = vault.configDir || ".obsidian"
+    const pluginId = this.plugin.manifest.id
+    const initialCredentialGen = this.credentialGeneration
+    const initialSettingsSaveGen = this.plugin.settingsSaveGeneration
+    const initialSyncGen = this.coordinator.syncExecutionGeneration
+    const pinned = {
+      owner: settings.githubOwner,
+      repo: settings.githubRepo,
+      branch: settings.githubBranch,
+      token: settings.githubToken,
+      tokenSecretId: settings.githubTokenSecretId,
+      passphrase: settings.encryptionPassphrase,
+      passphraseSecretId: settings.encryptionPassphraseSecretId,
+      mode: settings.encryptionMode,
+      vault: settings.vault,
+    }
+    const assertOwner = () => {
+      this.assertNotDisposed()
+      const current = this.plugin.settings
+      if (Platform.isDesktopApp !== true || this.uncVault || !backing || vault.adapter !== backing
+        || this.indexAdapterBacking !== backing
+        || typeof backing.getFullPath !== "function"
+        || this.credentialGeneration !== initialCredentialGen
+        || this.plugin.settingsSaveGeneration !== initialSettingsSaveGen
+        || this.coordinator.syncExecutionGeneration !== initialSyncGen
+        || this.coordinator.isSyncing || this.coordinator.pendingCount !== 0
+        || this.debounceRunActive || this.recentlyStagedPaths.size !== 0
+        || this.plugin.isSyncInProgress || this.plugin.isSettingsSaveInProgress?.()
+        || this.plugin.settings !== settings || this.plugin.app.vault !== vault
+        || (vault.configDir || ".obsidian") !== configDir
+        || this.plugin.manifest.id !== pluginId
+        || current.githubOwner !== pinned.owner || current.githubRepo !== pinned.repo
+        || current.githubBranch !== pinned.branch || current.githubToken !== pinned.token
+        || current.githubTokenSecretId !== pinned.tokenSecretId
+        || current.encryptionPassphrase !== pinned.passphrase
+        || current.encryptionPassphraseSecretId !== pinned.passphraseSecretId
+        || current.encryptionMode !== pinned.mode || current.vault !== pinned.vault) {
+        throw new Error("Re-encryption pre-cutover recovery lost live owner.")
+      }
+    }
+    const createClient = input.createGitHubClient ?? ((branch: string) => new GitHubClient({
+      token: pinned.token,
+      owner: pinned.owner,
+      repo: pinned.repo,
+      branch,
+    }))
+    return inspectV4InstalledPreCutoverRecoveryAfterRestart({
+      runId: input.runId,
+      owner: pinned.owner,
+      repo: pinned.repo,
+      sourceBranch: pinned.branch,
+      backupBranch: input.backupBranch,
+      destinationBranch: input.destinationBranch,
+      pinnedSourceCommitSha: input.pinnedSourceCommitSha,
+      sourceTreeSha: input.sourceTreeSha,
+      destinationCommitSha: input.destinationCommitSha,
+      destinationTreeSha: input.destinationTreeSha,
+      expectedFinalWalGeneration: input.expectedFinalWalGeneration,
+      expectedFileCount: input.expectedFileCount,
+      expectedPlaintextBytes: input.expectedPlaintextBytes,
+      oldPassphrase: pinned.passphrase,
+      newPassphrase: input.newPassphrase,
+      expectedPhysicalRepositoryId: input.expectedPhysicalRepositoryId,
+      defaultBranch: input.defaultBranch,
+      journalKey: input.journalKey,
+      assertPersistedFenceActive: () => assertV4ReencryptionSyncFenceClear(this.adapter),
+      inspectRoute: () => this.inspectFencedReencryptionIndexRoute(),
+      inspectFenceAndNoPartialCutover: async () => {
+        assertOwner()
+        const fenceText = await this.adapter.read(`${V4_REENCRYPTION_SYNC_FENCE_ROOT}/active.json`)
+        const expectedFence = JSON.stringify({
+          schemaVersion: 1,
+          phase: "migration-fenced-uncommitted",
+          runId: input.runId,
+          sourceRepoId: `${pinned.owner}/${pinned.repo}#${pinned.branch}`,
+          destinationRepoId: `${pinned.owner}/${pinned.repo}#${input.destinationBranch}`,
+        })
+        if (fenceText !== expectedFence) return false
+        const roots = planV4ReencryptionSeparatedRoots(V4_RUNTIME_INDEX_ROOT, input.runId)
+        const candidateRoot = `${V4_RUNTIME_INDEX_ROOT}-rekey-cutover-candidate-${input.runId}`
+        const checks = await Promise.all([
+          this.adapter.exists(candidateRoot),
+          this.adapter.exists(roots.shadowIndexRoot),
+          this.adapter.exists(roots.selectorPath),
+          this.adapter.exists(V4_REENCRYPTION_RUNTIME_ROUTE_PATH),
+        ])
+        assertOwner()
+        return checks.every(exists => exists === false)
+      },
+      openReadOnlyWal: async () => {
+        assertOwner()
+        const layout = await planV4PluginPrivateWalLocation({ configDir, pluginId, runId: input.runId })
+        const reader = await openV4DesktopPluginWalForRecovery({
+          adapter: backing as typeof backing & { getFullPath(path: string): string },
+          configDir,
+          pluginId,
+          runId: input.runId,
+          assertLiveOwner: assertOwner,
+        })
+        return {
+          ...reader,
+          journalRoot: layout.journalRoot,
+        }
+      },
+      createGitHubClient: createClient,
+      assertOwnerStillValid: assertOwner,
+      signal: input.signal,
     })
   }
 
