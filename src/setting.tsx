@@ -1,5 +1,6 @@
 import { App, PluginSettingTab, Notice, Setting, Platform } from "obsidian";
 import { KofiImage } from "./lib/icons";
+import { GitHubClient } from "./lib/github-api";
 
 import FastSync from "./main";
 import { dump } from "./lib/helps";
@@ -80,6 +81,70 @@ export class SettingTab extends PluginSettingTab {
   tempSettings: PluginSettings | null = null
   bannerEl: HTMLElement | null = null
   private settingsSavePending = false
+  private connectionCheckGeneration = 0
+  private connectionCheckBusy = false
+  private connectionCheckResult = ""
+  private connectionCheckMessageEl: HTMLElement | null = null
+  private connectionCheckFields: Readonly<{
+    owner: string; repo: string; branch: string; token: string
+  }> | null = null
+
+  private matchesConnectionCheck(fields: NonNullable<SettingTab["connectionCheckFields"]>): boolean {
+    const current = this.tempSettings
+    return !!current && current.githubOwner === fields.owner
+      && current.githubRepo === fields.repo && current.githubBranch === fields.branch
+      && current.githubToken === fields.token
+  }
+
+  private async testGitHubConnection(): Promise<void> {
+    if (!this.tempSettings || this.connectionCheckBusy) return
+    const fields = {
+      owner: this.tempSettings.githubOwner,
+      repo: this.tempSettings.githubRepo,
+      branch: this.tempSettings.githubBranch,
+      token: this.tempSettings.githubToken,
+    }
+    const generation = ++this.connectionCheckGeneration
+    this.connectionCheckFields = fields
+    this.connectionCheckBusy = true
+    this.connectionCheckResult = "Checking repository and branch (read-only)…"
+    this.display()
+
+    let result: string
+    try {
+      if (!fields.owner || !fields.repo || !fields.branch || !fields.token) {
+        result = "Enter a GitHub owner, repository, branch and token before testing."
+      } else {
+        const github = new GitHubClient(fields)
+        const identity = await github.getRepositoryIdentity()
+        if (generation !== this.connectionCheckGeneration || !this.matchesConnectionCheck(fields)) {
+          result = "Connection settings changed during the check. Test again."
+        } else if (identity.fullName.toLowerCase() !== `${fields.owner}/${fields.repo}`.toLowerCase()) {
+          result = "Repository identity differs from these settings. Check owner and repository."
+        } else if (await github.getGitRefOrNull()) {
+          result = "Repository and branch are accessible. Save changes to use this configuration."
+        } else {
+          result = "Configured branch was not found. Repository is accessible; create or initialize the branch before normal Sync."
+        }
+      }
+    } catch (error) {
+      const status = (error as { status?: unknown } | null)?.status
+      if (status === 401) {
+        result = "GitHub rejected the token. Check or replace the token."
+      } else if (status === 403 || status === 429) {
+        result = "GitHub denied the request or applied a rate limit. Check token permissions and try again."
+      } else if (status === 404) {
+        result = "Repository is not accessible. Check its name and token permissions."
+      } else {
+        result = "Connection could not be verified. Check owner, repository, branch and network access."
+      }
+    }
+    if (generation !== this.connectionCheckGeneration || !this.tempSettings) return
+    this.connectionCheckBusy = false
+    this.connectionCheckResult = this.matchesConnectionCheck(fields)
+      ? result : "Connection settings changed during the check. Test again."
+    this.display()
+  }
 
   constructor(app: App, plugin: FastSync) {
     super(app, plugin)
@@ -93,6 +158,10 @@ export class SettingTab extends PluginSettingTab {
   }
 
   updateDirtyState(): void {
+    if (this.connectionCheckFields && !this.matchesConnectionCheck(this.connectionCheckFields)) {
+      this.connectionCheckResult = "Connection settings changed. Test again."
+      this.connectionCheckMessageEl?.setText(this.connectionCheckResult)
+    }
     if (!this.bannerEl) return
     this.bannerEl.empty()
     if (this.isDirty()) {
@@ -144,6 +213,11 @@ export class SettingTab extends PluginSettingTab {
   }
 
   override hide(): void {
+    this.connectionCheckGeneration++
+    this.connectionCheckBusy = false
+    this.connectionCheckResult = ""
+    this.connectionCheckFields = null
+    this.connectionCheckMessageEl = null
     this.tempSettings = null
   }
 
@@ -315,6 +389,18 @@ export class SettingTab extends PluginSettingTab {
             this.updateDirtyState()
           })
       })
+
+    new Setting(set)
+      .setName("Connection check")
+      .setDesc("Checks access to this repository and branch with the values above. Read-only; no settings or GitHub data are changed.")
+      .addButton(button => button
+        .setButtonText("Test GitHub connection")
+        .setDisabled(this.connectionCheckBusy)
+        .onClick(() => { void this.testGitHubConnection() }))
+    this.connectionCheckMessageEl = set.createEl("p", {
+      cls: "setting-item-description",
+      text: this.connectionCheckResult || "Not checked. Run this before the first Sync.",
+    })
 
     new Setting(set)
       .setName("Remote repository name")

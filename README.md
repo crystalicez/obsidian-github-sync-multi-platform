@@ -49,8 +49,9 @@ Unlike traditional Git-based plugins, this tool interacts directly with the GitH
     -   **Owner**: Your GitHub username.
     -   **Repo**: Your private notes repository name.
     -   **Branch**: Typically `main`.
-3.  **Sync Options**: Configure startup, five-second debounced local-change, and interval synchronization independently.
-4.  **Safety and scope**: Choose a conflict policy, ignore-path regexes, a modification-percentage guard, and independent `.obsidian`, bookmark, and plugin scopes.
+3.  **Check connection**: Use **Test GitHub connection** in Settings before syncing. It checks repository and branch read access using the current form values, even before saving. The check sends only GET requests and does not verify write permissions, encryption compatibility, or whether a new branch can be created. Save any changes before Sync.
+4.  **Sync Options**: Configure startup, five-second debounced local-change, and interval synchronization independently.
+5.  **Safety and scope**: Choose a conflict policy, ignore-path regexes, a modification-percentage guard, and independent `.obsidian`, bookmark, and plugin scopes.
 
 ## 🔐 Encrypted Sync Mode
 
