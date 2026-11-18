@@ -104,8 +104,7 @@ class MemoryObsidianVault {
   async createFolder(_path: string) {}
 }
 
-function pluginFixture() {
-  const githubClient = new MemoryGitHub()
+function pluginFixture(githubClient = new MemoryGitHub()) {
   const vault = new MemoryObsidianVault()
   const ignoredFiles = new Set<string>()
   const plugin = {
@@ -186,6 +185,50 @@ for (const mode of ["plaintext", "encrypted"] as const) {
       assert.equal(runtime.progressSnapshot.lifecycle, "no-change", "a second unchanged Sync should be a no-op")
       assert.equal((second as { changedFiles?: number }).changedFiles, 0)
       assert.equal(githubClient.ref?.sha, firstSha, "a no-op must not advance GitHub history")
+    } finally {
+      runtime.dispose()
+    }
+  })
+}
+
+for (const mode of ["plaintext", "encrypted"] as const) {
+  test(`D421 empty-vault first Sync initializes a missing ${mode} branch without fake no-change`, async () => {
+    const { plugin, githubClient, vault } = pluginFixture()
+    plugin.settings.encryptionMode = mode
+    plugin.settings.encryptionPassphrase = mode === "encrypted" ? "synthetic-test-passphrase" : ""
+    const runtime = new V4PluginRuntime(plugin as never)
+    try {
+      assert.equal(vault.getFiles().length, 0, "initial Vault really has no user notes")
+      assert.equal(githubClient.ref, null, "branch is not initialized yet")
+      const first = await runtime.manualSync()
+      assert.equal((first as { changedFiles: number }).changedFiles, 0, "initialization should not claim any note changed")
+      assert.equal(runtime.progressSnapshot.lifecycle, "success",
+        `a new empty branch must initialize: ${runtime.progressSnapshot.errorMessage ?? ""}`)
+      assert.ok(githubClient.ref?.sha, "a first Sync must create the missing branch")
+      assert.ok(githubClient.files.has(".obsidian-github-sync-v4/config.json"))
+      assert.ok(githubClient.files.has(".obsidian-github-sync-v4/head"),
+        "the initialized branch must contain V4 HEAD metadata")
+      const initializedSha = githubClient.ref.sha
+      const second = await runtime.manualSync()
+      assert.equal((second as { changedFiles: number }).changedFiles, 0)
+      assert.equal(runtime.progressSnapshot.lifecycle, "no-change",
+        "a second Sync with no new notes must not publish anything")
+      assert.equal(githubClient.ref?.sha, initializedSha, "repeat Sync must not make extra commits")
+      const peer = pluginFixture(githubClient)
+      peer.plugin.settings.encryptionMode = mode
+      peer.plugin.settings.encryptionPassphrase = plugin.settings.encryptionPassphrase
+      peer.plugin.settings.vault = "different-second-device"
+      const peerRuntime = new V4PluginRuntime(peer.plugin as never)
+      try {
+        const peerResult = await peerRuntime.manualSync()
+        assert.equal((peerResult as { changedFiles: number }).changedFiles, 0)
+        assert.equal(peerRuntime.progressSnapshot.lifecycle, "no-change",
+          `a fresh device must accept the empty V4 branch: ${peerRuntime.progressSnapshot.errorMessage ?? ""}`)
+        assert.equal(githubClient.ref?.sha, initializedSha,
+          "a new empty peer must not create a second remote commit")
+      } finally {
+        peerRuntime.dispose()
+      }
     } finally {
       runtime.dispose()
     }

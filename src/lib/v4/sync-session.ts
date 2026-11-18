@@ -674,7 +674,9 @@ export class V4SyncSession {
       this.report({ phase: "blocked", currentPath: undefined, currentDirection: undefined, ...counters(conflictsResolved) })
       throw new V4ChangeGuardError(guard.changePercent, guard.thresholdPercent)
     }
-    if (changedFiles === 0 && options.operation !== "forcePush" && !externalMetadataNeedsRepair) {
+    // A genuinely absent branch still needs its first authenticated V4 config/HEAD,
+    // even when the local vault has no notes. Existing V4 no-ops must stay read-only.
+    if (changedFiles === 0 && remote && options.operation !== "forcePush" && !externalMetadataNeedsRepair) {
       if (remote) this.replaceIndex(allRemoteRecords, remote.head, remote.commitSha)
       this.localReadCache.clear()
       return { mode: "noop", operation: options.operation, changedFiles: 0, pushedFiles: 0, pulledFiles: 0 }
@@ -860,7 +862,9 @@ export class V4SyncSession {
       }
     }
 
-    if (batch.pushes.length === 0 && options.operation !== "forcePush" && !externalReconciled) {
+    // No-push short-circuit requires a real remote V4 HEAD. Missing branches must
+    // flow through the ordinary safe first-publication path (including recovery).
+    if (batch.pushes.length === 0 && remote && options.operation !== "forcePush" && !externalReconciled) {
       if (this.input.recoveryStore && recoveryPlan) {
         preserveStagesForRecovery = recoveryPlan.payload.mutations.length > 0
         let recovery = await this.input.recoveryStore.save({

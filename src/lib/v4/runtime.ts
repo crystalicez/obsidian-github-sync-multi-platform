@@ -2412,8 +2412,16 @@ export class V4PluginRuntime {
             : undefined
           const recoveryRunId = result.recoveryRunId ?? recoveredRunId
           if (recoveryRunId) await markV4RecoveryIndexCommitted(recoveryStore, recoveryRunId)
-          if (result.changedFiles === 0 && request.trigger === "manual") new Notice("GitHub Sync: No changes")
-          this.progressStore.finish(result.changedFiles === 0 ? "no-change" : "success", { lastSyncTime: Date.now() })
+          // Initializing an empty branch creates a real remote config/HEAD commit,
+          // despite changing zero logical files. Existing force/no-op UX stays unchanged.
+          const initializedEmptyBranch = result.changedFiles === 0
+            && request.operation === "normal"
+            && configSelection.source === "speculative-empty"
+            && !!result.commitSha
+          if (result.changedFiles === 0 && request.trigger === "manual" && !initializedEmptyBranch) {
+            new Notice("GitHub Sync: No changes")
+          }
+          this.progressStore.finish(result.changedFiles === 0 && !initializedEmptyBranch ? "no-change" : "success", { lastSyncTime: Date.now() })
           syncConsoleLog(settings, "info", "V4 sync completed", {
             operation: request.operation,
             trigger: request.trigger,
