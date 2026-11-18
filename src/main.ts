@@ -35,6 +35,7 @@ export default class FastSync extends Plugin {
   scheduledSyncTimer: number | null = null
   startupSyncTimeout: number | null = null
   secretsMigrated: boolean = false
+  private secretStorageReadUnavailable = false
   private settingsSaveInProgress = false
   // Monotonic in-memory epoch: even a failed or no-op save can race
   // an in-flight migration preflight. Never reset it on completion.
@@ -91,7 +92,9 @@ export default class FastSync extends Plugin {
     this.recoveryReadOnlyEpoch++
     this.recoveryReadOnlyCommandInProgress = false
     await this.loadSettings()
-    if (this.settings.githubOwner && this.settings.githubRepo) {
+    if (this.secretStorageReadUnavailable) {
+      new Notice("GitHub Sync: Obsidian SecretStorage is unavailable. Sync cannot run or save Settings; restore secure storage and restart Obsidian.", 12000)
+    } else if (this.settings.githubOwner && this.settings.githubRepo) {
       if (this.settings.githubTokenSecretId && !this.settings.githubToken) {
         new Notice("GitHub Sync: Saved GitHub token is unavailable after restart. Re-enter the token in Settings before Sync.")
       }
@@ -429,19 +432,41 @@ export default class FastSync extends Plugin {
     const merged = Object.assign({}, DEFAULT_SETTINGS, savedSettings);
     // Validate persisted runtime data before any legacy secret migration writes.
     assertPluginSettingsRuntimeSafe(merged)
-    if (!await this.canMigrateStartupSecrets()) {
-      // Fenced startup must not overwrite existing SecretStorage values.
-      this.settings = hydrateV4SecretsReadOnly(merged, this.app.secretStorage) as PluginSettings
-      this.secretsMigrated = false
-      return
+    this.secretStorageReadUnavailable = false
+    let storageUnavailable = false
+    const storage = this.app.secretStorage
+    const observedStorage = {
+      getSecret: (id: string) => {
+        try { return storage.getSecret(id) }
+        catch (error) { storageUnavailable = true; throw error }
+      },
+      setSecret: (id: string, value: string) => {
+        try { storage.setSecret(id, value) }
+        catch (error) { storageUnavailable = true; throw error }
+      },
     }
-    const result = migrateV4Secrets(
-      merged,
-      this.app.secretStorage,
-      prefix => this.createSecretId(prefix),
-    )
-    this.settings = result.settings as PluginSettings
-    this.secretsMigrated = result.migrated
+    try {
+      if (!await this.canMigrateStartupSecrets()) {
+        // Fenced startup must not overwrite existing SecretStorage values.
+        this.settings = hydrateV4SecretsReadOnly(merged, observedStorage) as PluginSettings
+        this.secretsMigrated = false
+        return
+      }
+      const result = migrateV4Secrets(
+        merged, observedStorage, prefix => this.createSecretId(prefix),
+      )
+      this.settings = result.settings as PluginSettings
+      this.secretsMigrated = result.migrated
+    } catch (error) {
+      if (!storageUnavailable) throw error
+      // Keep persisted IDs and legacy values unchanged. Never use unverified
+      // credentials or allow a Settings save to scrub them during this session.
+      this.settings = { ...merged, githubToken: "", encryptionPassphrase: "",
+        githubTokenSecretId: merged.githubTokenSecretId || "",
+        encryptionPassphraseSecretId: merged.encryptionPassphraseSecretId || "" } as PluginSettings
+      this.secretsMigrated = false
+      this.secretStorageReadUnavailable = true
+    }
   }
 
   /**
@@ -491,6 +516,7 @@ export default class FastSync extends Plugin {
     // Never publish a draft to running syncs or overwrite active credentials
     // before its persisted settings record has committed.
     assertPluginSettingsRuntimeSafe(nextSettings)
+    if (this.secretStorageReadUnavailable) throw new Error("GitHub Sync: SecretStorage unavailable. Restart Obsidian after restoring secure storage before saving Settings.")
     if (this.settingsSaveInProgress) throw new Error("GitHub Sync: Settings save already in progress.")
     const previous = this.settings
     const settingsRuntime = this.v4Runtime

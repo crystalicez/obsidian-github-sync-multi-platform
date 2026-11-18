@@ -61,6 +61,8 @@ Object sizes, commit timing, and plugin use may remain observable. Use the same 
 
 When you save a new GitHub token or encryption passphrase, the plugin checks that Obsidian SecretStorage can read the new nonempty value back before committing Settings. If SecretStorage silently rejects the write, the save fails and the previous active credentials remain in use. This immediate check is not proof that a sudden crash or power loss cannot lose recent SecretStorage changes.
 
+If Obsidian SecretStorage throws an error during startup (for example, while the operating system credential store is unavailable), the plugin opens Settings without loading unverified credentials. Automatic Sync and Settings saves remain disabled for that session. Restore access to the operating system credential store and restart Obsidian; do not replace the encryption passphrase just to bypass a temporary storage failure. The plugin keeps existing saved secret IDs and legacy settings unchanged for a safe retry.
+
 ### Encrypted Sync Controls
 
 - Manual sync runs a normal pull-before-push operation immediately.
