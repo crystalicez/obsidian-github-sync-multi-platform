@@ -47,6 +47,16 @@ test("D415 Settings connection check uses unsaved credentials for read-only repo
   }
 })
 
+test("D420 Settings distinguishes the local device ID from the remote GitHub repository", () => {
+  const tab = tabFor()
+  const visible = tab.containerEl.flattenText()
+  assert.match(visible, /Device ID \(this Obsidian vault\)/u)
+  assert.match(visible, /not the GitHub repository name/u)
+  assert.match(visible, /different ID on each device/u)
+  assert.doesNotMatch(visible, /Remote repository name/u,
+    "this setting is used for local device identity, not the remote repository")
+})
+
 test("D415 missing branch and inaccessible private repository receive distinct safe instructions", async () => {
   let status = 404
   setRequestUrlHandler(async raw => {
@@ -69,6 +79,10 @@ test("D415 missing branch and inaccessible private repository receive distinct s
     second.onclick?.()
     await waitForCondition(() => tab.containerEl.flattenText().includes("Configured branch was not found"),
       "missing branch status")
+    assert.match(tab.containerEl.flattenText(), /Save changes, then press Sync now to create the branch/u,
+      "a missing branch is a supported first-run state, not a reason to perform a force operation")
+    assert.match(tab.containerEl.flattenText(), /not verified write permission/u,
+      "the read-only connection check cannot promise that a token can create the branch")
     assert.doesNotMatch(tab.containerEl.flattenText(), /private-token-must-not-appear/u)
   } finally {
     setRequestUrlHandler(null)

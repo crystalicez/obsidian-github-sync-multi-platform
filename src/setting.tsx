@@ -124,7 +124,7 @@ export class SettingTab extends PluginSettingTab {
         } else if (await github.getGitRefOrNull()) {
           result = "Repository and branch are accessible. Save changes to use this configuration."
         } else {
-          result = "Configured branch was not found. Repository is accessible; create or initialize the branch before normal Sync."
+          result = "Configured branch was not found. Repository is accessible. Save changes, then press Sync now to create the branch. This read-only check has not verified write permission."
         }
       }
     } catch (error) {
@@ -365,7 +365,7 @@ export class SettingTab extends PluginSettingTab {
 
     new Setting(set)
       .setName("GitHub branch")
-      .setDesc("Enter your GitHub branch name (e.g., main)")
+      .setDesc("Enter the branch name (e.g., main). A new branch can be created by your first Sync now after saving Settings.")
       .addText((text) =>
         text
           .setPlaceholder("Enter your GitHub branch name (e.g., main)")
@@ -403,11 +403,11 @@ export class SettingTab extends PluginSettingTab {
     })
 
     new Setting(set)
-      .setName("Remote repository name")
-      .setDesc("Remote repository name")
+      .setName("Device ID (this Obsidian vault)")
+      .setDesc("Local identity used for sync history and conflict copies; not the GitHub repository name. Choose a different ID on each device and keep it stable.")
       .addText((text) =>
         text
-          .setPlaceholder("Remote repository name")
+          .setPlaceholder("Enter a device ID (e.g., laptop-notes)")
           .setValue(this.tempSettings!.vault)
           .onChange((value) => {
             this.tempSettings!.vault = value
