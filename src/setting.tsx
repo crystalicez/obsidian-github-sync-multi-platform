@@ -3,7 +3,7 @@ import { KofiImage } from "./lib/icons";
 import { GitHubClient } from "./lib/github-api";
 
 import FastSync from "./main";
-import { dump } from "./lib/helps";
+import { assertPluginSettingsRuntimeSafe } from "./lib/plugin-settings-validation";
 import { createDebugPayload } from "./lib/debug";
 import { V4_NETWORK_VAULT_WARNING } from "./lib/v4/network-storage";
 import { V4_DEFAULT_PBKDF2_ITERATIONS, V4_MAX_PBKDF2_ITERATIONS, V4_MIN_NEW_PBKDF2_ITERATIONS } from "./lib/v4/kdf-policy";
@@ -230,6 +230,7 @@ export class SettingTab extends PluginSettingTab {
     this.connectionCheckResult = ""
     this.connectionCheckFields = null
     this.connectionCheckMessageEl = null
+    this.plugin.clipboardReadTip = ""
     this.tempSettings = null
   }
 
@@ -237,38 +238,54 @@ export class SettingTab extends PluginSettingTab {
    * Read GitHub configuration JSON from the clipboard and populate settings automatically
    */
   async handleClipboardPaste(tipEl: HTMLElement): Promise<void> {
-    const showTip = (msg: string) => {
-      tipEl.setText(msg)
-      setTimeout(() => tipEl.setText(""), 2000)
+    const draft = this.tempSettings
+    if (!draft || this.settingsSavePending) {
+      tipEl.setText("Finish saving Settings before importing a configuration.")
+      return
     }
-
+    const draftSnapshot = JSON.stringify(draft)
     try {
-      if (!navigator.clipboard) {
-        showTip("No configuration detected!")
-        return
+      if (typeof navigator === "undefined" || !navigator.clipboard) {
+        throw new Error("Clipboard unavailable")
       }
       const text = await navigator.clipboard.readText()
-      const parsed = JSON.parse(text)
-      if (typeof parsed === "object" && parsed !== null) {
-        const hasOwner = "githubOwner" in parsed || "owner" in parsed
-        const hasRepo = "githubRepo" in parsed || "repo" in parsed
-        const hasToken = "githubToken" in parsed || "token" in parsed
-        if (hasOwner && hasRepo && hasToken) {
-          if (this.tempSettings) {
-            this.tempSettings.githubOwner = parsed.githubOwner || parsed.owner
-            this.tempSettings.githubRepo = parsed.githubRepo || parsed.repo
-            this.tempSettings.githubBranch = parsed.githubBranch || parsed.branch || "main"
-            this.tempSettings.githubToken = parsed.githubToken || parsed.token
-          }
-          this.display()
-          showTip("Configuration pasted into settings!")
-          return
-        }
+      // If the tab closed, a Save completed, or a user edited the draft while
+      // waiting for clipboard permission, never apply stale clipboard values.
+      if (this.tempSettings !== draft || this.settingsSavePending
+        || JSON.stringify(draft) !== draftSnapshot) return
+      if (text.length > 65_536) throw new Error("Clipboard configuration too large")
+      const parsed: unknown = JSON.parse(text)
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw new Error("Clipboard configuration is not an object")
       }
-      showTip("No configuration detected!")
-    } catch (err) {
-      dump(err)
-      showTip("No configuration detected!")
+      const fields = parsed as Record<string, unknown>
+      const owner = fields["githubOwner"] ?? fields["owner"]
+      const repo = fields["githubRepo"] ?? fields["repo"]
+      const token = fields["githubToken"] ?? fields["token"]
+      const branch = fields["githubBranch"] ?? fields["branch"] ?? "main"
+      if (typeof owner !== "string" || !owner.trim()
+        || typeof repo !== "string" || !repo.trim()
+        || typeof token !== "string" || !token.trim()
+        || typeof branch !== "string" || !branch.trim()) {
+        throw new Error("Clipboard configuration fields are invalid")
+      }
+      // Use the same validation as a persisted configuration before replacing
+      // the draft; invalid JSON must never render object-valued Settings fields.
+      assertPluginSettingsRuntimeSafe({
+        ...DEFAULT_SETTINGS, githubOwner: owner, githubRepo: repo,
+        githubBranch: branch, githubToken: token,
+      })
+      this.tempSettings = {
+        ...draft, githubOwner: owner, githubRepo: repo,
+        githubBranch: branch, githubToken: token,
+      }
+      this.plugin.clipboardReadTip = "Configuration pasted. Review and Save changes."
+      this.display()
+    } catch {
+      // JSON parse errors may include fragments of clipboard credentials.
+      // Never log raw clipboard content or parsing exceptions.
+      if (this.tempSettings !== draft) return
+      tipEl.setText("No configuration detected!")
     }
   }
 

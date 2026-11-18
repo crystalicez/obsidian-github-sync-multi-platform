@@ -18,6 +18,99 @@ const tabFor = () => {
   return tab
 }
 
+const clipboardInTest = async <T>(readText: () => Promise<string>, run: () => Promise<T>): Promise<T> => {
+  const original = Object.getOwnPropertyDescriptor(globalThis, "navigator")
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true, value: { clipboard: { readText } },
+  })
+  try { return await run() } finally {
+    if (original) Object.defineProperty(globalThis, "navigator", original)
+    else Reflect.deleteProperty(globalThis, "navigator")
+  }
+}
+
+test("D423 clipboard import rejects invalid JSON fields without damaging a working Settings draft", async () => {
+  const importedToken = "private-pasted-token-should-never-be-logged"
+  const tab = tabFor()
+  const before = structuredClone(tab.tempSettings)
+  const tip = tab.containerEl.findByClass("clipboard-read-description")
+  assert.ok(tip)
+  await clipboardInTest(async () => JSON.stringify({
+    githubOwner: { incorrect: "not-a-string" },
+    githubRepo: "notes", githubToken: importedToken,
+  }), async () => tab.handleClipboardPaste(tip as never))
+  assert.deepEqual(tab.tempSettings, before, "malformed clipboard values must not mutate live Settings")
+  assert.equal(tab.isDirty(), false, "an invalid import must not leave an accidental Save prompt")
+  assert.match(tab.containerEl.flattenText(), /No configuration detected/u)
+  assert.doesNotMatch(tab.containerEl.flattenText(), /private-pasted-token-should-never-be-logged/u)
+
+  const branch = tab.containerEl.findByClass("clipboard-read-description")
+  assert.ok(branch)
+  await clipboardInTest(async () => JSON.stringify({
+    owner: "owner", repo: "notes", token: importedToken, branch: "../main",
+  }), async () => tab.handleClipboardPaste(branch as never))
+  assert.deepEqual(tab.tempSettings, before)
+  assert.equal(tab.isDirty(), false)
+})
+
+test("D423 clipboard import atomically accepts aliases and shows a visible, secret-free Save reminder", async () => {
+  const importedToken = "private-pasted-token-should-never-be-logged"
+  const settings = { ...DEFAULT_SETTINGS }
+  const plugin = { settings, clipboardReadTip: "" }
+  const tab = new SettingTab({} as never, plugin as never)
+  tab.display()
+  const tip = tab.containerEl.findByClass("clipboard-read-description")
+  assert.ok(tip)
+  await clipboardInTest(async () => JSON.stringify({
+    owner: "new-owner", repo: "new-notes", branch: "device-notes", token: importedToken,
+  }), async () => tab.handleClipboardPaste(tip as never))
+  assert.equal(tab.tempSettings?.githubOwner, "new-owner")
+  assert.equal(tab.tempSettings?.githubRepo, "new-notes")
+  assert.equal(tab.tempSettings?.githubBranch, "device-notes")
+  assert.equal(tab.tempSettings?.githubToken, importedToken)
+  assert.equal(tab.isDirty(), true, "an imported configuration must require explicit Save")
+  assert.deepEqual(plugin.settings, settings, "import must not publish credentials or start Sync before Save")
+  assert.match(tab.containerEl.flattenText(), /Configuration pasted.*Save changes/u,
+    "the confirmation must remain attached after the Settings panel redraw")
+  assert.doesNotMatch(tab.containerEl.flattenText(), /private-pasted-token-should-never-be-logged/u)
+  tab.hide()
+  tab.display()
+  assert.doesNotMatch(tab.containerEl.flattenText(), /Configuration pasted.*Save changes/u,
+    "a new Settings session must not display a stale import success hint")
+})
+
+test("D423 a delayed clipboard response cannot overwrite Settings edited or closed meanwhile", async () => {
+  for (const changedDuringRead of ["edited", "hidden"] as const) {
+    const tab = tabFor()
+    let release!: (value: string) => void
+    const pending = new Promise<string>(resolve => { release = resolve })
+    const tip = tab.containerEl.findByClass("clipboard-read-description")
+    assert.ok(tip)
+    await clipboardInTest(async () => pending, async () => {
+      const importing = tab.handleClipboardPaste(tip as never)
+      if (changedDuringRead === "hidden") {
+        tab.hide()
+      } else {
+        tab.tempSettings!.githubRepo = "user-new-edit"
+        tab.updateDirtyState()
+      }
+      release(JSON.stringify({
+        owner: "stale-owner", repo: "stale-repo",
+        token: "stale-credential-never-to-import",
+      }))
+      await importing
+      assert.notEqual(tab.tempSettings?.githubRepo, "stale-repo",
+        "a stale clipboard response must never replace newer user state")
+      if (changedDuringRead === "hidden") {
+        assert.equal(tab.tempSettings, null, "closing Settings must leave no editable draft")
+      } else {
+        assert.equal(tab.tempSettings?.githubRepo, "user-new-edit")
+      }
+      assert.doesNotMatch(tab.containerEl.flattenText(), /stale-credential-never-to-import/u)
+    })
+  }
+})
+
 test("D415 Settings connection check uses unsaved credentials for read-only repository and branch requests", async () => {
   const requests: Array<{ method: string; url: string; authorization: string; body?: string }> = []
   setRequestUrlHandler(async raw => {
