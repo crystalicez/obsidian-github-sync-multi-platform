@@ -374,6 +374,71 @@ test("aliased token and passphrase secret IDs fail before any secret write", () 
   assert.deepEqual(writes, [], "duplicate generated IDs must fail before writes");
 });
 
+test("D414 silent legacy SecretStorage write loss fails migration before plaintext is removed", () => {
+  const saved = new Map<string, string>([["github-token", "original-token"], ["encryption-passphrase", "original-pass"]]);
+  const storage = {
+    getSecret: (id: string) => saved.get(id) ?? null,
+    setSecret: (id: string, value: string) => {
+      if (id === "encryption-passphrase" && value === "replacement-pass") return;
+      saved.set(id, value);
+    },
+  };
+  assert.throws(() => migrateV4Secrets({
+    githubToken: "replacement-token", encryptionPassphrase: "replacement-pass",
+    githubTokenSecretId: "github-token", encryptionPassphraseSecretId: "encryption-passphrase",
+  }, storage, prefix => prefix), /SecretStorage.*readback|secret.*verify|secret.*retain/iu);
+  assert.equal(saved.get("github-token"), "original-token", "migration must roll back a verified first write");
+  assert.equal(saved.get("encryption-passphrase"), "original-pass", "a silently skipped second write must never count as migrated");
+});
+
+test("D414 silent SecretStorage loss blocks Settings commit and retains active credentials", async () => {
+  const plugin = new FastSync();
+  const previous = { ...DEFAULT_SETTINGS, githubToken: "old-token", encryptionPassphrase: "old-pass",
+    githubTokenSecretId: "github-token-existing", encryptionPassphraseSecretId: "encryption-passphrase-existing" };
+  plugin.settings = previous;
+  const saved = new Map<string, string>([
+    [previous.githubTokenSecretId, previous.githubToken],
+    [previous.encryptionPassphraseSecretId, previous.encryptionPassphrase],
+  ]);
+  plugin.app = { secretStorage: {
+    getSecret(id: string) { return saved.get(id) ?? null; },
+    setSecret(id: string, value: string) {
+      if (id.startsWith("encryption-passphrase-") && id !== previous.encryptionPassphraseSecretId
+        && value !== "") return;
+      saved.set(id, value);
+    },
+  } } as never;
+  let persisted = 0;
+  let invalidations = 0;
+  (plugin as unknown as { saveData(value: unknown): Promise<void> }).saveData = async () => { persisted++; };
+  plugin.v4Runtime = { credentialsChanged() { invalidations++; } } as never;
+  plugin.initGitHubClient = () => {};
+  plugin.registerScheduledSync = () => {};
+  plugin.updateRibbonIcon = () => {};
+  await assert.rejects(
+    () => plugin.saveSettings({ ...previous, encryptionPassphrase: "new-pass" }),
+    /SecretStorage.*readback|secret.*verify|secret.*retain/iu,
+  );
+  assert.equal(persisted, 0, "never persist a secret reference that cannot be read back");
+  assert.equal(invalidations, 0, "a rejected Settings save must not activate a new key");
+  assert.equal(plugin.settings, previous, "retain the active connection and in-memory passphrase");
+  assert.equal(saved.get(previous.encryptionPassphraseSecretId), "old-pass");
+  assert.equal(saved.get(previous.githubTokenSecretId), "old-token");
+});
+
+test("D414 deliberately empty credentials remain optional when SecretStorage reports no value", () => {
+  const writes: Array<[string, string]> = [];
+  const storage = {
+    getSecret: (_id: string) => null,
+    setSecret: (id: string, value: string) => { writes.push([id, value]); },
+  };
+  assert.doesNotThrow(() => storeV4Secrets({
+    githubTokenSecretId: "new-empty-token", githubToken: "",
+    encryptionPassphraseSecretId: "new-empty-passphrase", encryptionPassphrase: "",
+  }, storage));
+  assert.deepEqual(writes, [["new-empty-token", ""], ["new-empty-passphrase", ""]]);
+});
+
 test("partial legacy secret migration write failure rolls back the first saved secret", () => {
   const saved = new Map<string, string>([["github-token", "old-token"], ["encryption-passphrase", "old-pass"]]);
   let failOnce = true;

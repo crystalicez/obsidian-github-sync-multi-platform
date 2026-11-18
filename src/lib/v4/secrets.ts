@@ -33,6 +33,12 @@ function loadSecret(storage: SecretStorageLike, id: string): string {
   return id ? storage.getSecret(id) ?? "" : ""
 }
 
+function assertSecretReadback(storage: SecretStorageLike, id: string, expected: string): void {
+  if (expected && storage.getSecret(id) !== expected) {
+    throw new Error("GitHub Sync: SecretStorage readback could not verify a new credential.")
+  }
+}
+
 /**
  * Hydrate credentials without allocating IDs or writing SecretStorage.
  * Fenced or unreadable startup recovery must not alter either old key.
@@ -89,6 +95,8 @@ export function migrateV4Secrets<T extends V4SecretBackedSettings>(
       storage.setSecret(encryptionPassphraseSecretId, legacyPassphrase)
       migrated = true
     }
+    if (legacyToken) assertSecretReadback(storage, githubTokenSecretId, legacyToken)
+    if (legacyPassphrase) assertSecretReadback(storage, encryptionPassphraseSecretId, legacyPassphrase)
   } catch (error) {
     for (const [id, value] of previous) {
       try { storage.setSecret(id, value ?? "") } catch { /* Preserve first error; rollback best-effort. */ }
@@ -122,6 +130,12 @@ export function storeV4Secrets(
       settings.encryptionPassphraseSecretId,
       settings.encryptionPassphrase ?? "",
     )
+  }
+  if (settings.githubTokenSecretId) {
+    assertSecretReadback(storage, settings.githubTokenSecretId, settings.githubToken ?? "")
+  }
+  if (settings.encryptionPassphraseSecretId) {
+    assertSecretReadback(storage, settings.encryptionPassphraseSecretId, settings.encryptionPassphrase ?? "")
   }
 }
 

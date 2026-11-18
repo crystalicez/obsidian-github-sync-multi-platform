@@ -58,6 +58,8 @@ Encrypted mode hides every directory name, filename, extension, and file content
 
 Object sizes, commit timing, and plugin use may remain observable. Use the same passphrase on every device. GitHub tokens and passphrases are stored with Obsidian SecretStorage rather than in plugin `data.json`. Encrypted V4 must start on a new empty repository or branch. The plugin refuses to retain plaintext Git history while switching a populated branch to encryption. Existing V1/V2/V3 remotes must be replaced with an explicitly confirmed V4 Force Push; V4 Force Pull never guesses how to read a legacy layout.
 
+When you save a new GitHub token or encryption passphrase, the plugin checks that Obsidian SecretStorage can read the new nonempty value back before committing Settings. If SecretStorage silently rejects the write, the save fails and the previous active credentials remain in use. This immediate check is not proof that a sudden crash or power loss cannot lose recent SecretStorage changes.
+
 ### Encrypted Sync Controls
 
 - Manual sync runs a normal pull-before-push operation immediately.
