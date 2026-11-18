@@ -91,6 +91,15 @@ export default class FastSync extends Plugin {
     this.recoveryReadOnlyEpoch++
     this.recoveryReadOnlyCommandInProgress = false
     await this.loadSettings()
+    if (this.settings.githubOwner && this.settings.githubRepo) {
+      if (this.settings.githubTokenSecretId && !this.settings.githubToken) {
+        new Notice("GitHub Sync: Saved GitHub token is unavailable after restart. Re-enter the token in Settings before Sync.")
+      }
+      if (this.settings.encryptionMode === "encrypted"
+        && this.settings.encryptionPassphraseSecretId && !this.settings.encryptionPassphrase) {
+        new Notice("GitHub Sync: Saved encryption passphrase is unavailable after restart. Re-enter it in Settings before encrypted Sync.")
+      }
+    }
     if (this.secretsMigrated) {
       if (await this.canMigrateStartupSecrets()) await this.persistData()
       else this.secretsMigrated = false

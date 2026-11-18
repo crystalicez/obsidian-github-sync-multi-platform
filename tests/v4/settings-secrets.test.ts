@@ -597,7 +597,7 @@ function plaintextRuntimeFixture(pathInput: string | string[] = "secret.md", git
     } },
     manifest: { id: "test" },
     githubClient: github,
-    settings: { githubOwner: "o", githubRepo: "r", githubBranch: "main", vault: deviceId, encryptionMode: "plaintext", encryptionPassphrase: "", conflictPolicy: "copy", abortChangePercent: 0, ignorePathRegex: "", syncObsidianConfig: false, syncBookmarks: false, syncPlugins: false, syncEnabled: true, syncOnLocalChange: true },
+    settings: { githubOwner: "o", githubRepo: "r", githubBranch: "main", githubToken: "fixture-token", vault: deviceId, encryptionMode: "plaintext", encryptionPassphrase: "", conflictPolicy: "copy", abortChangePercent: 0, ignorePathRegex: "", syncObsidianConfig: false, syncBookmarks: false, syncPlugins: false, syncEnabled: true, syncOnLocalChange: true },
     ignoredFiles: new Set<string>(), isWatchEnabled: true, isSyncInProgress: false,
     enableWatch() { this.isWatchEnabled = true; }, updateStatusBar() {}, addIgnoredFile() {}, removeIgnoredFile() {},
   };

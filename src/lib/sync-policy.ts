@@ -3,6 +3,8 @@ export interface SyncPolicySettings {
   githubToken?: string;
   githubOwner?: string;
   githubRepo?: string;
+  encryptionMode?: "plaintext" | "encrypted";
+  encryptionPassphrase?: string;
   syncOnStartup?: boolean;
   scheduledSyncEnabled?: boolean;
   scheduledSyncIntervalSeconds?: unknown;
@@ -11,7 +13,8 @@ export interface SyncPolicySettings {
 const MIN_SCHEDULED_SYNC_INTERVAL_SECONDS = 30;
 
 export function hasGitHubSyncConfig(settings: SyncPolicySettings): boolean {
-  return Boolean(settings.githubToken && settings.githubOwner && settings.githubRepo);
+  return Boolean(settings.githubToken && settings.githubOwner && settings.githubRepo
+    && (settings.encryptionMode !== "encrypted" || settings.encryptionPassphrase));
 }
 
 export function shouldRunStartupSync(settings: SyncPolicySettings): boolean {
@@ -19,7 +22,7 @@ export function shouldRunStartupSync(settings: SyncPolicySettings): boolean {
 }
 
 export function shouldRunScheduledSync(settings: SyncPolicySettings): boolean {
-  return Boolean(settings.syncEnabled && settings.scheduledSyncEnabled);
+  return Boolean(settings.syncEnabled && settings.scheduledSyncEnabled && hasGitHubSyncConfig(settings));
 }
 
 export function normalizeScheduledSyncIntervalSeconds(value: unknown): number {

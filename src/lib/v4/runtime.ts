@@ -3,6 +3,7 @@ import type FastSync from "../../main"
 import { GitHubClient } from "../github-api"
 import { fromBase64Url, randomBytes, sha256Hex, toBase64Url, utf8ToBytes } from "../bytes"
 import { syncConsoleLog } from "../debug"
+import { hasGitHubSyncConfig } from "../sync-policy"
 import { readVaultFileBytes, writeVaultFileBytes, trashVaultFileIfExists } from "../vault"
 import { deriveV4BootstrapRecoveryKey, deriveV4Keyring, type V4Keyring } from "./crypto"
 import { assertV4Pbkdf2Iterations, V4_DEFAULT_PBKDF2_ITERATIONS, V4_MIN_NEW_PBKDF2_ITERATIONS } from "./kdf-policy"
@@ -1950,7 +1951,8 @@ export class V4PluginRuntime {
 
   private enqueue(change: V4QueuedChange): void {
     if (this.disposed || this.reencryptionSyncFenced) return
-    if (!this.plugin.settings.syncEnabled || !this.plugin.settings.syncOnLocalChange || !this.plugin.isWatchEnabled) return
+    if (!this.plugin.settings.syncEnabled || !this.plugin.settings.syncOnLocalChange || !this.plugin.isWatchEnabled
+      || !hasGitHubSyncConfig(this.plugin.settings)) return
     if (change.type === "rescan") {
       this.coordinator.enqueue(change)
       this.markWaiting()

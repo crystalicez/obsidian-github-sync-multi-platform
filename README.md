@@ -50,7 +50,7 @@ Unlike traditional Git-based plugins, this tool interacts directly with the GitH
     -   **Repo**: Your private notes repository name.
     -   **Branch**: Typically `main`.
 3.  **Check connection**: Use **Test GitHub connection** in Settings before syncing. It checks repository and branch read access using the current form values, even before saving. The check sends only GET requests and does not verify write permissions, encryption compatibility, or whether a new branch can be created. Save any changes before Sync.
-4.  **Sync Options**: Configure startup, five-second debounced local-change, and interval synchronization independently.
+4.  **Sync Options**: Configure startup, five-second debounced local-change, and interval synchronization independently. Automatic Sync waits until owner, repository and token are configured; encrypted mode also requires a passphrase. If a previously saved token or passphrase cannot be read after restart, Obsidian shows a notice to re-enter it in Settings rather than repeatedly trying an incomplete automatic Sync.
 5.  **Safety and scope**: Choose a conflict policy, ignore-path regexes, a modification-percentage guard, and independent `.obsidian`, bookmark, and plugin scopes.
 
 ## 🔐 Encrypted Sync Mode
