@@ -404,11 +404,11 @@ export class V4SyncSession {
     const remote = ref && remoteConfig && remoteConfig.mode !== "encrypted" && localCacheComplete && ref.sha === this.input.index.remoteCommitSha && this.input.index.pathLayout === effectiveV4PathLayout(remoteConfig)
       ? remoteV4StateFromLocalIndex(this.input.index, ref.sha, remoteConfig)
       : await loadV4RemoteState({ github: this.input.github, index: this.input.index, ...(this.input.keyring === undefined ? {} : { keyring: this.input.keyring }) }, ref?.sha, remoteConfig)
-    if (!remote && options.operation !== "forcePush") {
-      throw new Error("Remote is not V4. Force Push is required before sync or Force Pull.")
-    }
     if (!remote && ref && this.input.config.mode === "encrypted") {
       throw new Error("Encrypted V4 requires a new empty repository or branch to avoid retaining plaintext history.")
+    }
+    if (!remote && options.operation !== "forcePush" && (ref !== null || options.operation !== "normal")) {
+      throw new Error("Remote is not V4. Force Push is required before sync or Force Pull.")
     }
     if (remote && remote.config.mode !== this.input.config.mode) {
       if (this.input.config.mode === "encrypted") {

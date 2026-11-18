@@ -158,6 +158,97 @@ async function initializeFixture() {
   return { ...fixture, runtime }
 }
 
+for (const mode of ["plaintext", "encrypted"] as const) {
+  test(`D419 first use: Sync now initializes a missing ${mode} GitHub branch without Force Push`, async () => {
+    const { plugin, githubClient, vault } = pluginFixture()
+    const note = new TextEncoder().encode("First note from an isolated Obsidian vault.\\n")
+    vault.set("note.md", note, 1)
+    plugin.settings.encryptionMode = mode
+    plugin.settings.encryptionPassphrase = mode === "encrypted" ? "disposable-test-passphrase" : ""
+    const runtime = new V4PluginRuntime(plugin as never)
+    try {
+      assert.equal(githubClient.ref, null, "fresh repository branch must not exist yet")
+      const first = await runtime.manualSync()
+      assert.equal(runtime.progressSnapshot.lifecycle, "success", "normal first Sync must publish the note")
+      assert.equal((first as { changedFiles?: number }).changedFiles, 1)
+      assert.ok(githubClient.ref?.sha, "the first Sync must create the target branch")
+      assert.ok(githubClient.files.has(".obsidian-github-sync-v4/config.json"))
+      const paths = [...githubClient.files.keys()]
+      if (mode === "encrypted") {
+        assert.ok(!paths.includes("note.md"), "encrypted Sync must not expose the logical path")
+        assert.ok(![...githubClient.files.values()].some(bytes =>
+          Buffer.from(bytes).includes(Buffer.from("First note from an isolated Obsidian vault."))))
+      } else {
+        assert.ok(paths.includes("note.md"), "plaintext Sync must publish the note")
+      }
+      const firstSha = githubClient.ref.sha
+      const second = await runtime.manualSync()
+      assert.equal(runtime.progressSnapshot.lifecycle, "no-change", "a second unchanged Sync should be a no-op")
+      assert.equal((second as { changedFiles?: number }).changedFiles, 0)
+      assert.equal(githubClient.ref?.sha, firstSha, "a no-op must not advance GitHub history")
+    } finally {
+      runtime.dispose()
+    }
+  })
+}
+
+test("D419 encrypted Sync explains that an existing non-V4 branch needs a fresh empty branch", async () => {
+  const { plugin, githubClient, vault } = pluginFixture()
+  const blob = await githubClient.createGitBlob(new TextEncoder().encode("Unrelated history.\\n"))
+  const tree = await githubClient.createGitTree([{ path: "README.md", mode: "100644", type: "blob", sha: blob }])
+  const sha = await githubClient.createGitCommit("Unrelated initial commit", tree, [])
+  await githubClient.createGitRef(sha)
+  plugin.settings.encryptionMode = "encrypted"
+  plugin.settings.encryptionPassphrase = "disposable-password"
+  vault.set("private.md", new TextEncoder().encode("Sensitive test note.\\n"), 1)
+  const runtime = new V4PluginRuntime(plugin as never)
+  try {
+    await runtime.manualSync()
+    assert.equal(runtime.progressSnapshot.lifecycle, "failed")
+    assert.match(runtime.progressSnapshot.errorMessage ?? "", /Encrypted V4 requires a new empty repository or branch/u)
+    assert.equal(githubClient.ref?.sha, sha, "the existing remote must remain unchanged")
+  } finally {
+    runtime.dispose()
+  }
+})
+
+test("D419 Force Pull cannot invent remote history when the branch does not exist", async () => {
+  const { plugin, githubClient, vault } = pluginFixture()
+  vault.set("local-only.md", new TextEncoder().encode("Local data must be preserved.\\n"), 1)
+  const runtime = new V4PluginRuntime(plugin as never)
+  try {
+    await runtime.forcePull(false)
+    assert.equal(runtime.progressSnapshot.lifecycle, "failed")
+    assert.match(runtime.progressSnapshot.errorMessage ?? "", /Remote is not V4.*Force Push/u)
+    assert.equal(githubClient.ref, null)
+    assert.deepEqual(vault.bytes.get("local-only.md"),
+      new TextEncoder().encode("Local data must be preserved.\\n"))
+  } finally {
+    runtime.dispose()
+  }
+})
+
+test("D419 normal first use refuses a branch containing non-V4 history", async () => {
+  const { plugin, githubClient, vault } = pluginFixture()
+  const contents = new TextEncoder().encode("Pre-existing unrelated user history.\\n")
+  const blob = await githubClient.createGitBlob(contents)
+  const tree = await githubClient.createGitTree([{ path: "README.md", mode: "100644", type: "blob", sha: blob }])
+  const sha = await githubClient.createGitCommit("Unrelated pre-existing commit", tree, [])
+  await githubClient.createGitRef(sha)
+  const originalFiles = new Map(githubClient.files)
+  vault.set("note.md", new TextEncoder().encode("User note.\\n"), 1)
+  const runtime = new V4PluginRuntime(plugin as never)
+  try {
+    await runtime.manualSync()
+    assert.equal(runtime.progressSnapshot.lifecycle, "failed", "non-V4 history needs explicit user review")
+    assert.match(runtime.progressSnapshot.errorMessage ?? "", /Remote is not V4.*Force Push/u)
+    assert.equal(githubClient.ref?.sha, sha, "normal Sync must never replace an unrelated branch")
+    assert.deepEqual(githubClient.files, originalFiles, "no remote objects may change")
+  } finally {
+    runtime.dispose()
+  }
+})
+
 test("runtime does not retry an arbitrary stale-ref message without structured race evidence", async () => {
   const { runtime, githubClient, vault } = await initializeFixture()
   vault.set("note.md", new TextEncoder().encode("changed\n"), 2)

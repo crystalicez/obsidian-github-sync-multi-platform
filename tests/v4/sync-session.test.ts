@@ -230,6 +230,28 @@ async function unknownBaseFixture(mode: "plaintext" | "encrypted", localContent:
   return { github, vault, index, remoteConfig, keyring, remoteRecord, remoteBytes };
 }
 
+test("D419 a fresh second device restores first published notes with normal Sync", async () => {
+  for (const mode of ["plaintext", "encrypted"] as const) {
+    const { github, remoteConfig, keyring } = await unknownBaseFixture(mode, null)
+    const originalHead = github.ref!.sha
+    const vault = new MemoryVault()
+    const freshIndex = createEmptyV4LocalIndex({
+      repoId: "o/r#main",
+      deviceId: "new-device",
+      mode,
+      pathLayout: mode === "encrypted" ? "opaque-stable-v1" : "plaintext-v1",
+    })
+    const restored = await new V4SyncSession({
+      github, vault, index: freshIndex, config: remoteConfig, keyring,
+      conflictPolicy: "copy", abortChangePercent: 0,
+    }).sync({ operation: "normal", allowThresholdOverride: false })
+    assert.equal(restored.changedFiles, 1, "normal Sync should restore the first remote note")
+    assert.equal(dec(vault.files.get("note.md")!.bytes), "remote-newer")
+    assert.equal(freshIndex.remoteCommitSha, originalHead)
+    assert.equal(github.ref!.sha, originalHead, "download must not publish a second GitHub commit")
+  }
+})
+
 test("D407 Sync remote pull preserves write and cleanup failures without applying data", async () => {
   const fixture = await unknownBaseFixture("plaintext", null);
   const writeFailure = new Error("injected staged download write failure");

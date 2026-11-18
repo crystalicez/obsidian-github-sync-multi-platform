@@ -234,18 +234,18 @@ try{
      mode:p.settings.encryptionMode,passphrasePresent:!!p.settings.encryptionPassphrase,autoEnabled:p.settings.syncOnLocalChange};
   })()`);
   assertTrue(setup?.configured&&setup?.mode===mode&&setup.passphrasePresent===(mode==="encrypted")&&!setup?.autoEnabled,"GitHub credentials not safely installed");
-  // First initialization via plugin runtime on an absent, random test branch.
+  // First initialization must work through normal Sync, without Force Push.
   // Then test the *actual Sync Center button* for the next mutation.
   const initial=await evaluate(`(async()=>{
    const p=app.plugins.plugins[${JSON.stringify(id)}];
    try{
-    const value=await p.v4Runtime.forcePush(false);
+    const value=await p.v4Runtime.manualSync();
     return {ok:true,status:value?.status??null,lifecycle:p.v4Runtime.progressSnapshot.lifecycle,phase:p.v4Runtime.progressSnapshot.failurePhase??null,error:p.v4Runtime.progressSnapshot.errorMessage?.slice(0,180)??null};
    }catch(err){return {ok:false,error:String(err?.message||err).slice(0,210),lifecycle:p.v4Runtime.progressSnapshot.lifecycle};}
   })()`,240000);
-  assertTrue(initial.ok&&["success","no-change"].includes(initial.lifecycle),"Initial synthetic branch forcePush failed: "+JSON.stringify(initial));
+  assertTrue(initial.ok&&initial.lifecycle==="success","Initial normal Sync on a missing branch failed: "+JSON.stringify(initial));
   const initRemote=await readState(configuration);
-  assertTrue(initRemote.kind==="present","Initial Force Push did not create random remote branch");
+  assertTrue(initRemote.kind==="present","First normal Sync did not create the isolated branch");
   initialSha=initRemote.sha;
   const updated=await evaluate(`(async()=>{
    const note=app.vault.getAbstractFileByPath("UI-smoke.md");
