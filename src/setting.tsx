@@ -157,6 +157,18 @@ export class SettingTab extends PluginSettingTab {
     return JSON.stringify(this.tempSettings) !== JSON.stringify(this.plugin.settings)
   }
 
+  // A Settings draft is not the active GitHub target. Never run a manual or
+  // destructive operation using previously saved credentials while the form
+  // shows a different target (or its Save result is still unknown).
+  private runSavedSettingsManualAction(action: () => void): void {
+    if (!this.tempSettings) return
+    if (this.settingsSavePending || this.isDirty()) {
+      new Notice("GitHub Sync: Save or discard pending settings changes before syncing.")
+      return
+    }
+    action()
+  }
+
   updateDirtyState(): void {
     if (this.connectionCheckFields && !this.matchesConnectionCheck(this.connectionCheckFields)) {
       this.connectionCheckResult = "Connection settings changed. Test again."
@@ -477,7 +489,8 @@ export class SettingTab extends PluginSettingTab {
       .setDesc("Pull remote changes, resolve conflicts, then push only the required local changes.")
       .addButton((button) =>
         button.setButtonText("Sync now").onClick(() => {
-          void this.plugin.v4Runtime.manualSync()
+          this.runSavedSettingsManualAction(() =>
+            this.plugin.runSyncFromUi(() => this.plugin.v4Runtime.manualSync()))
         })
       )
 
@@ -488,7 +501,9 @@ export class SettingTab extends PluginSettingTab {
         button
           .setWarning()
           .setButtonText("Force push")
-          .onClick(() => void this.plugin.showForceConfirm("forcePush"))
+          .onClick(() => this.runSavedSettingsManualAction(() => {
+            void this.plugin.showForceConfirm("forcePush")
+          }))
       )
 
     new Setting(set)
@@ -498,7 +513,9 @@ export class SettingTab extends PluginSettingTab {
         button
           .setWarning()
           .setButtonText("Force pull")
-          .onClick(() => void this.plugin.showForceConfirm("forcePull"))
+          .onClick(() => this.runSavedSettingsManualAction(() => {
+            void this.plugin.showForceConfirm("forcePull")
+          }))
       )
 
     // ==========================================

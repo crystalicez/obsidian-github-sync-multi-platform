@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { setRequestUrlHandler } from "obsidian"
+import { Notice, setRequestUrlHandler } from "obsidian"
 import { DEFAULT_SETTINGS, SettingTab } from "../../src/setting"
 import { waitForCondition } from "../helpers/wait-for"
 
@@ -55,6 +55,95 @@ test("D420 Settings distinguishes the local device ID from the remote GitHub rep
   assert.match(visible, /different ID on each device/u)
   assert.doesNotMatch(visible, /Remote repository name/u,
     "this setting is used for local device identity, not the remote repository")
+})
+
+test("D422 Settings Sync and force actions never target saved GitHub settings while edits are unsaved", () => {
+  const operations: string[] = []
+  const settings = { ...source }
+  const plugin = {
+    settings,
+    clipboardReadTip: "",
+    v4Runtime: {
+      manualSync: async () => { operations.push("manual-sync") },
+    },
+    runSyncFromUi(operation: () => Promise<unknown>) {
+      operations.push("observed-ui-sync")
+      void operation()
+    },
+    showForceConfirm(kind: string) { operations.push(kind) },
+  }
+  const tab = new SettingTab({} as never, plugin as never)
+  tab.display()
+  const action = (label: string) => {
+    const button = tab.containerEl.findByText(label)
+    assert.ok(button, `Settings must show ${label}`)
+    button.onclick?.()
+  }
+  const noticesBefore = Notice.messages.length
+  tab.tempSettings!.githubRepo = "different-repository"
+  tab.updateDirtyState()
+  action("Sync now")
+  action("Force push")
+  action("Force pull")
+  assert.deepEqual(operations, [], "pending drafts must not trigger work against the prior GitHub repository")
+  const notices = Notice.messages.slice(noticesBefore)
+  assert.equal(notices.length, 3, "every rejected operation should explain why it was skipped")
+  assert.ok(notices.every(message => /Save or discard.*settings/u.test(message)))
+  assert.ok(notices.every(message => !message.includes(token)), "warnings must not expose tokens")
+
+  tab.tempSettings = { ...settings }
+  tab.display()
+  action("Sync now")
+  action("Force push")
+  action("Force pull")
+  assert.deepEqual(operations, ["observed-ui-sync", "manual-sync", "forcePush", "forcePull"],
+    "saved Settings must use the observed UI Sync path and retain confirm-gated force actions")
+})
+
+test("D422 Settings manual actions stay blocked while an asynchronous Save is pending", async () => {
+  const operations: string[] = []
+  const settings = { ...source }
+  let saveStarted!: () => void
+  let releaseSave!: () => void
+  const started = new Promise<void>(resolve => { saveStarted = resolve })
+  const savingGate = new Promise<void>(resolve => { releaseSave = resolve })
+  const plugin = {
+    settings,
+    clipboardReadTip: "",
+    v4Runtime: { manualSync: async () => { operations.push("manual-sync") } },
+    runSyncFromUi(operation: () => Promise<unknown>) {
+      operations.push("observed-ui-sync")
+      void operation()
+    },
+    showForceConfirm(kind: string) { operations.push(kind) },
+    async saveSettings(next: typeof settings) {
+      saveStarted()
+      await savingGate
+      plugin.settings = next
+    },
+    updateStatusBar() {},
+  }
+  const tab = new SettingTab({} as never, plugin as never)
+  tab.display()
+  try {
+    tab.tempSettings!.githubRepo = "new-saved-repository"
+    tab.updateDirtyState()
+    assert.ok(tab.isDirty())
+    const save = tab.containerEl.findByText("Save changes")
+    assert.ok(save)
+    save.onclick?.()
+    await started
+    for (const label of ["Sync now", "Force push", "Force pull"]) {
+      tab.containerEl.findByText(label)?.onclick?.()
+    }
+    assert.deepEqual(operations, [], "an unresolved Settings Save cannot be bypassed by manual buttons")
+    releaseSave()
+    await waitForCondition(() => !tab.isDirty(), "Settings commit finishes before manual Sync")
+    tab.containerEl.findByText("Sync now")?.onclick?.()
+    assert.deepEqual(operations, ["observed-ui-sync", "manual-sync"])
+  } finally {
+    releaseSave?.()
+  }
 })
 
 test("D415 missing branch and inaccessible private repository receive distinct safe instructions", async () => {
