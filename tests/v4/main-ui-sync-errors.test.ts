@@ -36,6 +36,7 @@ function setupUi() {
   const attempts: Task[] = []
   let mode: "reject" | "throw" | "resolve" = "reject"
   let disposed = false
+  const savedSecrets = new Map<string, string>()
   const run = (kind: Task): Promise<unknown> => {
     attempts.push(kind)
     if (mode === "throw") throw new Error("secret synchronous network failure")
@@ -51,11 +52,15 @@ function setupUi() {
     scheduledSync: () => run("scheduled"),
     forcePush: () => run("forcePush"), forcePull: () => run("forcePull"),
     dispose() { disposed = true },
+    credentialsChanged() {},
     enqueueModify() {}, enqueueDelete() {}, enqueueRename() {},
     enqueueFolderDelete() {}, enqueueFolderRename() {},
   }
   plugin.app = {
-    secretStorage: {},
+    secretStorage: {
+      getSecret(id: string) { return savedSecrets.get(id) ?? null },
+      setSecret(id: string, value: string) { savedSecrets.set(id, value) },
+    },
     vault: { configDir: ".obsidian", getFiles: () => [], on: () => ({}) },
     workspace: { onLayoutReady: (callback: () => void) => callback() },
   }
@@ -462,6 +467,106 @@ test("D278 legacy read-only Recovery command does not start after plugin unload"
   } finally {
     ui.cleanup()
     Notice.messages.length = 0
+  }
+})
+
+test("D418 disabling Sync while startup is queued prevents both old automatic triggers", async () => {
+  const ui = setupUi()
+  try {
+    ui.setMode("resolve")
+    await ui.plugin.onload()
+    const startup = [...ui.timers.values()].find(timer => timer.kind === "timeout")?.callback
+    const scheduled = [...ui.timers.values()].find(timer => timer.kind === "interval")?.callback
+    assert.ok(startup)
+    assert.ok(scheduled)
+    await ui.plugin.saveSettings({ ...ui.plugin.settings, syncEnabled: false })
+    ui.plugin.disableWatch()
+    startup()
+    scheduled()
+    await tick()
+    assert.deepEqual(ui.attempts, [],
+      "already queued callbacks must not Sync after the user disabled the feature")
+    assert.equal(ui.plugin.isWatchEnabled, true,
+      "a skipped startup run must not leave local watch paused")
+  } finally {
+    ui.cleanup()
+  }
+})
+
+test("D418 changing the repository retires stale startup and interval callbacks", async () => {
+  const ui = setupUi()
+  try {
+    ui.setMode("resolve")
+    await ui.plugin.onload()
+    const startup = [...ui.timers.values()].find(timer => timer.kind === "timeout")?.callback
+    const scheduled = [...ui.timers.values()].find(timer => timer.kind === "interval")?.callback
+    assert.ok(startup)
+    assert.ok(scheduled)
+    await ui.plugin.saveSettings({ ...ui.plugin.settings, githubRepo: "other-disposable-repository" })
+    startup()
+    scheduled()
+    await tick()
+    assert.deepEqual(ui.attempts, [],
+      "old callbacks must not send data to a newly selected repository")
+    const replacement = [...ui.timers.values()].find(timer => timer.kind === "interval")?.callback
+    assert.ok(replacement)
+    replacement()
+    await tick()
+    assert.deepEqual(ui.attempts, ["scheduled"],
+      "a new timer registered for saved settings must still work")
+  } finally {
+    ui.cleanup()
+  }
+})
+
+test("D418 a pending Settings save cannot race a queued automatic GitHub write", async () => {
+  const ui = setupUi()
+  let finishSave: (() => void) | undefined
+  try {
+    ui.setMode("resolve")
+    await ui.plugin.onload()
+    const startup = [...ui.timers.values()].find(timer => timer.kind === "timeout")?.callback
+    const scheduled = [...ui.timers.values()].find(timer => timer.kind === "interval")?.callback
+    assert.ok(startup)
+    assert.ok(scheduled)
+    ui.plugin.persistData = async () => {
+      await new Promise<void>(resolve => { finishSave = resolve })
+    }
+    const saving = ui.plugin.saveSettings({ ...ui.plugin.settings, githubRepo: "pending-change" })
+    startup()
+    scheduled()
+    await tick()
+    assert.deepEqual(ui.attempts, [], "no remote work while a Settings save is unresolved")
+    finishSave?.()
+    await saving
+    assert.deepEqual(ui.attempts, [], "resolving a save must not replay old scheduled work")
+  } finally {
+    finishSave?.()
+    ui.cleanup()
+  }
+})
+
+test("D418 a failed Settings save retires uncertain automatic callbacks until restart", async () => {
+  const ui = setupUi()
+  try {
+    ui.setMode("resolve")
+    await ui.plugin.onload()
+    const startup = [...ui.timers.values()].find(timer => timer.kind === "timeout")?.callback
+    const scheduled = [...ui.timers.values()].find(timer => timer.kind === "interval")?.callback
+    assert.ok(startup)
+    assert.ok(scheduled)
+    ui.plugin.persistData = async () => { throw new Error("simulated-disk-save-failure") }
+    await assert.rejects(
+      () => ui.plugin.saveSettings({ ...ui.plugin.settings, githubRepo: "uncommitted-repository" }),
+      /simulated-disk-save-failure/u,
+    )
+    startup()
+    scheduled()
+    await tick()
+    assert.deepEqual(ui.attempts, [],
+      "uncertain durable Settings must not trigger an automatic GitHub write")
+  } finally {
+    ui.cleanup()
   }
 })
 

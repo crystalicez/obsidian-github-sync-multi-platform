@@ -317,18 +317,26 @@ export default class FastSync extends Plugin {
 
     // After the workspace layout is ready, run the startup sync once, then enable real-time watch
     this.app.workspace.onLayoutReady(() => {
+      if (this.unloaded) return
       if (shouldRunStartupSync(this.settings)) {
-        // Delay 1.5 s to let Obsidian finish initialising
+        const startupSettings = this.settings
+        const startupSettingsGeneration = this.settingsSaveAttemptGeneration
+        // Delay 1.5 s to let Obsidian finish initialising.
         this.startupSyncTimeout = window.setTimeout(() => {
-          this.startupSyncTimeout = null;
-          const runtime = this.v4Runtime;
-          if (runtime) this.runSyncFromUi(() => runtime.startupSync());
-        }, 1500);
+          this.startupSyncTimeout = null
+          if (this.unloaded) return
+          if (this.settingsSaveInProgress || this.settingsSaveAttemptGeneration !== startupSettingsGeneration
+            || this.settings !== startupSettings || !shouldRunStartupSync(this.settings)) {
+            this.enableWatch()
+            return
+          }
+          const runtime = this.v4Runtime
+          if (runtime) this.runSyncFromUi(() => runtime.startupSync())
+        }, 1500)
       } else {
-        // Not configured – enable watch immediately
-        this.enableWatch();
+        this.enableWatch()
       }
-    });
+    })
   }
 
   initGitHubClient() {
@@ -364,10 +372,14 @@ export default class FastSync extends Plugin {
     if (this.scheduledSyncTimer) window.clearInterval(this.scheduledSyncTimer);
     this.scheduledSyncTimer = null;
     if (!shouldRunScheduledSync(this.settings)) return;
-    const seconds = normalizeScheduledSyncIntervalSeconds(this.settings.scheduledSyncIntervalSeconds);
+    const seconds = normalizeScheduledSyncIntervalSeconds(this.settings.scheduledSyncIntervalSeconds)
+    const scheduledSettings = this.settings
+    const scheduledGeneration = this.settingsSaveAttemptGeneration
     this.scheduledSyncTimer = window.setInterval(() => {
+      if (this.unloaded || this.settingsSaveInProgress || this.settingsSaveAttemptGeneration !== scheduledGeneration
+        || this.settings !== scheduledSettings || !shouldRunScheduledSync(this.settings)) return
       this.runSyncFromUi(() => this.v4Runtime.scheduledSync())
-    }, seconds * 1000);
+    }, seconds * 1000)
   }
 
   updateRibbonIcon(status: boolean) {
