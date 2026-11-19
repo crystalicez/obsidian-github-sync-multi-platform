@@ -68,6 +68,58 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
+test("D435 changing commit pages clears the old selected commit and loads only the chosen page", async () => {
+  const source = new FakeProgressSource();
+  const plugin = createSyncCenterPluginFixture(source, () => undefined);
+  const first = { sha: "first-page-sha", message: "First page commit", authoredAt: "", source: "plugin" as const };
+  const second = { sha: "second-page-sha", message: "Second page commit", authoredAt: "", source: "plugin" as const };
+  const pages: number[] = [];
+  const inspected: string[] = [];
+  plugin.v4Runtime.createHistoryService = async () => ({
+    async listCommits(page: number) {
+      pages.push(page);
+      return { items: [page === 1 ? first : second], hasMore: page === 1 };
+    },
+    async getCommitChanges(commit: typeof first) {
+      inspected.push(commit.sha);
+      return [{ kind: "modify" as const, path: `Notes/${commit.sha}.md` }];
+    },
+    async getFileVersions() { return []; },
+    async previewChange(): Promise<never> { throw new Error("not used"); },
+  });
+  const view = new V4SyncCenterView(new WorkspaceLeaf(plugin.app), plugin as never);
+  try {
+    await view.onOpen();
+    view.contentEl.findByClass("github-sync-center__row")?.onclick?.();
+    await waitForCondition(() => view.contentEl.flattenText().includes("Notes/first-page-sha.md"),
+      "first page commit details are shown");
+
+    view.contentEl.findByText("Next")?.onclick?.();
+    await waitForCondition(() => view.contentEl.flattenText().includes("Second page commit"),
+      "second page is shown");
+    assert.match(view.contentEl.flattenText(), /Page 2/u);
+    assert.match(view.contentEl.flattenText(), /Select a commit to inspect its changes/u);
+    assert.doesNotMatch(view.contentEl.flattenText(), /Notes\/first-page-sha\.md/u,
+      "details from a different page must not be displayed");
+    assert.deepEqual(inspected, ["first-page-sha"],
+      "changing pages must not load a previous page's selected commit again");
+
+    view.contentEl.findByClass("github-sync-center__row")?.onclick?.();
+    await waitForCondition(() => view.contentEl.flattenText().includes("Notes/second-page-sha.md"),
+      "second page commit details are shown");
+    view.contentEl.findByText("Previous")?.onclick?.();
+    await waitForCondition(() => view.contentEl.flattenText().includes("First page commit"),
+      "first page is restored");
+    assert.match(view.contentEl.flattenText(), /Page 1/u);
+    assert.match(view.contentEl.flattenText(), /Select a commit to inspect its changes/u);
+    assert.doesNotMatch(view.contentEl.flattenText(), /Notes\/second-page-sha\.md/u);
+    assert.deepEqual(inspected, ["first-page-sha", "second-page-sha"]);
+    assert.deepEqual(pages, [1, 2, 1]);
+  } finally {
+    await view.onClose();
+  }
+});
+
 test("D430 first successful Sync reloads visible Commit history without polling on progress ticks", async () => {
   const source = new FakeProgressSource();
   const plugin = createSyncCenterPluginFixture(source, () => undefined);

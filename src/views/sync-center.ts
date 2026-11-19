@@ -389,11 +389,11 @@ export class V4SyncCenterView extends ItemView {
       const pager = body.createDiv({ cls: "github-sync-center__pager" })
       const previous = pager.createEl("button", { text: "Previous" })
       previous.disabled = this.page <= 1
-      previous.onclick = () => { this.page--; void this.renderCommitMode() }
+      previous.onclick = () => { this.page--; this.selected = undefined; void this.renderCommitMode() }
       pager.createEl("span", { text: `Page ${this.page}` })
       const next = pager.createEl("button", { text: "Next" })
       next.disabled = !page.hasMore
-      next.onclick = () => { this.page++; void this.renderCommitMode() }
+      next.onclick = () => { this.page++; this.selected = undefined; void this.renderCommitMode() }
       if (page.items.length === 0) body.createEl("p", { text: "No commits found." })
       for (const commit of page.items) {
         const row = body.createEl("button", { cls: "github-sync-center__row" })
