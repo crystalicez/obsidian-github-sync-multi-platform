@@ -603,6 +603,9 @@ export default class FastSync extends Plugin {
         this.initGitHubClient()
         this.registerScheduledSync()
         this.updateRibbonIcon(!!(prepared.githubToken && prepared.githubOwner && prepared.githubRepo))
+        for (const leaf of this.app.workspace?.getLeavesOfType?.(V4_SYNC_CENTER_VIEW) ?? []) {
+          if (leaf.view instanceof V4SyncCenterView) leaf.view.onSettingsSaved()
+        }
       }
       // Scrub old credentials only after the new record is durable.
       for (const [oldId, newId] of [

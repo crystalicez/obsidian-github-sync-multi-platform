@@ -68,6 +68,80 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
+test("D427 switching saved GitHub repositories refreshes Sync Center history instead of reusing old service", async () => {
+  const source = new FakeProgressSource();
+  const plugin = Object.assign(createSyncCenterPluginFixture(source, () => undefined), {
+    settings: { githubRepo: "old-repo" },
+    githubClient: { id: "old" },
+  });
+  let created = 0;
+  plugin.v4Runtime.createHistoryService = async () => {
+    const repo = plugin.settings.githubRepo;
+    created++;
+    return {
+      async listCommits() {
+        return { items: [{ sha: "abc12345", message: `History for ${repo}`, authoredAt: "2026-11-19", source: "plugin" as const }], hasMore: false };
+      },
+      async getCommitChanges() { return []; },
+      async getFileVersions() { return []; },
+      async previewChange(): Promise<never> { throw new Error("not used"); },
+    };
+  };
+  const view = new V4SyncCenterView(new WorkspaceLeaf(plugin.app), plugin as never);
+  try {
+    await view.onOpen();
+    assert.match(view.contentEl.flattenText(), /History for old-repo/u);
+    plugin.settings = { githubRepo: "new-repo" };
+    plugin.githubClient = { id: "new" };
+    view.contentEl.findByText("Commits")?.onclick?.();
+    await waitForCondition(() => view.contentEl.flattenText().includes("History for new-repo"),
+      "history from newly saved repository");
+    assert.doesNotMatch(view.contentEl.flattenText(), /History for old-repo/u);
+    assert.equal(created, 2, "the old repository history service must not be reused");
+  } finally {
+    await view.onClose();
+  }
+});
+
+test("D427 a late old GitHub history result cannot overwrite the saved repository's current history", async () => {
+  const source = new FakeProgressSource();
+  const plugin = Object.assign(createSyncCenterPluginFixture(source, () => undefined), {
+    settings: { githubRepo: "old-repo" },
+    githubClient: { id: "old" },
+  });
+  const oldRequest = deferred<{ items: Array<{ sha: string; message: string; authoredAt: string; source: "plugin" }>; hasMore: boolean }>();
+  let requestedOld = false;
+  plugin.v4Runtime.createHistoryService = async () => {
+    const repo = plugin.settings.githubRepo;
+    return {
+      async listCommits() {
+        if (repo === "old-repo") { requestedOld = true; return oldRequest.promise; }
+        return { items: [{ sha: "bbbbbbbb", message: "Current new-repo history", authoredAt: "2026-11-19", source: "plugin" as const }], hasMore: false };
+      },
+      async getCommitChanges() { return []; },
+      async getFileVersions() { return []; },
+      async previewChange(): Promise<never> { throw new Error("not used"); },
+    };
+  };
+  const view = new V4SyncCenterView(new WorkspaceLeaf(plugin.app), plugin as never);
+  const opening = view.onOpen();
+  try {
+    await waitForCondition(() => requestedOld, "old GitHub history request starts");
+    plugin.settings = { githubRepo: "new-repo" };
+    plugin.githubClient = { id: "new" };
+    (view as unknown as { onSettingsSaved(): void }).onSettingsSaved();
+    await waitForCondition(() => view.contentEl.flattenText().includes("Current new-repo history"),
+      "new repository history refreshed automatically after Save");
+    oldRequest.resolve({ items: [{ sha: "aaaaaaaa", message: "Old repository private history", authoredAt: "2026-11-19", source: "plugin" }], hasMore: false });
+    await opening;
+    assert.match(view.contentEl.flattenText(), /Current new-repo history/u);
+    assert.doesNotMatch(view.contentEl.flattenText(), /Old repository private history/u);
+  } finally {
+    oldRequest.resolve({ items: [], hasMore: false });
+    await view.onClose();
+  }
+});
+
 test("D426 Sync Center shows a safe history failure and allows retry after malformed adapter errors", async () => {
   const source = new FakeProgressSource();
   const secret = "github_pat_private-credential-must-not-be-displayed";

@@ -2,10 +2,12 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { readFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
-import { modalButtons, Notice, resetModalTestState, settingSliderControls, TFile } from "obsidian";
+import { modalButtons, Notice, resetModalTestState, settingSliderControls, TFile, WorkspaceLeaf } from "obsidian";
 
 import { DEFAULT_SETTINGS, SettingTab } from "../../src/setting";
 import FastSync from "../../src/main";
+import { V4SyncCenterView, V4_SYNC_CENTER_VIEW } from "../../src/views/sync-center";
+import { createIdleV4Progress } from "../../src/lib/v4/progress";
 import type { GitHubCreateTreeEntry } from "../../src/lib/github-git-types";
 import { deriveV4Keyring } from "../../src/lib/v4/crypto";
 import { publishV4TreeChanges } from "../../src/lib/v4/git-tree-writer";
@@ -2060,6 +2062,77 @@ test("v4 runtime keyring cache reuses one derived keyring until credential gener
   assert.notEqual(first, third)
   fixture.runtime.dispose()
 })
+
+test("D427 a durable Settings Save refreshes open Sync Center history only after commit", async () => {
+  const plugin = new FastSync();
+  const previous = { ...DEFAULT_SETTINGS, githubOwner: "owner", githubRepo: "notes-old",
+    githubBranch: "scratch", githubToken: "synthetic-token", githubTokenSecretId: "token-old" };
+  plugin.settings = previous;
+  const stored = new Map([["token-old", "synthetic-token"]]);
+  const leaves: Array<{ view: V4SyncCenterView }> = [];
+  plugin.app = {
+    secretStorage: {
+      getSecret(id: string) { return stored.get(id) ?? null; },
+      setSecret(id: string, value: string) { stored.set(id, value); },
+    },
+    workspace: {
+      getActiveFile: () => ({ path: "Note.md" }),
+      getLeavesOfType(type: string) {
+        assert.equal(type, V4_SYNC_CENTER_VIEW);
+        return leaves;
+      },
+    },
+  } as never;
+  plugin.githubClient = { id: "old" } as never;
+  let created = 0;
+  plugin.v4Runtime = {
+    credentialsChanged() {},
+    subscribeProgress() { return () => {}; },
+    get progressSnapshot() { return createIdleV4Progress(); },
+    async createHistoryService() {
+      const repo = plugin.settings.githubRepo;
+      created++;
+      return {
+        async listCommits() {
+          return { items: [{ sha: "aaaaaaaa", message: `Repo ${repo} history`, authoredAt: "", source: "plugin" as const }], hasMore: false };
+        },
+        async getCommitChanges() { return []; },
+        async getFileVersions() { return []; },
+      };
+    },
+  } as never;
+  plugin.initGitHubClient = () => { plugin.githubClient = { id: plugin.settings.githubRepo } as never; };
+  plugin.registerScheduledSync = () => {};
+  plugin.updateRibbonIcon = () => {};
+  let writeStarted = false;
+  let finishWrite!: () => void;
+  const writeBarrier = new Promise<void>(resolve => { finishWrite = resolve; });
+  plugin.saveData = async () => {
+    writeStarted = true;
+    await writeBarrier;
+  };
+  const view = new V4SyncCenterView(new WorkspaceLeaf(plugin.app), plugin);
+  leaves.push({ view });
+  try {
+    await view.onOpen();
+    assert.match(view.contentEl.flattenText(), /Repo notes-old history/u);
+    assert.equal(created, 1);
+    const saving = plugin.saveSettings({ ...previous, githubRepo: "notes-new" });
+    await waitForCondition(() => writeStarted, "Settings persistence in progress");
+    assert.match(view.contentEl.flattenText(), /Repo notes-old history/u,
+      "pending Save must not display an uncommitted remote target");
+    assert.equal(created, 1);
+    finishWrite();
+    await saving;
+    await waitForCondition(() => view.contentEl.flattenText().includes("Repo notes-new history"),
+      "committed Settings refresh live Sync Center");
+    assert.doesNotMatch(view.contentEl.flattenText(), /Repo notes-old history/u);
+    assert.equal(created, 2);
+  } finally {
+    finishWrite();
+    await view.onClose();
+  }
+});
 
 test("main settings save invalidates the runtime credential generation before future sync work", async () => {
   const source = await readFile("src/main.ts", "utf8")

@@ -16,10 +16,16 @@ export const V4_SYNC_CENTER_VIEW = "github-sync-v4-center"
 interface V4ViewRenderGeneration {
   open: number
   render: number
+  settings: FastSync["settings"]
+  githubClient: FastSync["githubClient"]
+  runtime: FastSync["v4Runtime"]
 }
 
 export class V4SyncCenterView extends ItemView {
   private service: V4HistoryService | undefined
+  private serviceSettings: FastSync["settings"] | undefined
+  private serviceGithubClient: FastSync["githubClient"] | undefined
+  private serviceRuntime: FastSync["v4Runtime"] | undefined
   private page = 1
   private selected: V4HistoryCommit | undefined
   private objectUrl: string | undefined
@@ -61,22 +67,65 @@ export class V4SyncCenterView extends ItemView {
     this.unsubscribeProgress = undefined
     this.clearProgressElements()
     this.releaseObjectUrl()
+    this.clearHistoryService()
+    this.selected = undefined
+  }
+
+  onSettingsSaved(): void {
+    this.clearHistoryService()
+    this.selected = undefined
+    this.page = 1
+    this.renderGeneration++
+    this.releaseObjectUrl()
+    if (this.isOpen) void this.renderCommitMode()
   }
 
   private beginRender(): V4ViewRenderGeneration | undefined {
     if (!this.isOpen) return undefined
-    return { open: this.openGeneration, render: ++this.renderGeneration }
+    return {
+      open: this.openGeneration,
+      render: ++this.renderGeneration,
+      settings: this.plugin.settings,
+      githubClient: this.plugin.githubClient,
+      runtime: this.plugin.v4Runtime,
+    }
   }
 
   private isCurrent(generation: V4ViewRenderGeneration): boolean {
     return this.isOpen
       && generation.open === this.openGeneration
       && generation.render === this.renderGeneration
+      && generation.settings === this.plugin.settings
+      && generation.githubClient === this.plugin.githubClient
+      && generation.runtime === this.plugin.v4Runtime
+  }
+
+  private clearHistoryService(): void {
+    this.service = undefined
+    this.serviceSettings = undefined
+    this.serviceGithubClient = undefined
+    this.serviceRuntime = undefined
   }
 
   private async ensureService(): Promise<V4HistoryService> {
-    this.service ??= await this.plugin.v4Runtime.createHistoryService()
-    return this.service
+    const settings = this.plugin.settings
+    const githubClient = this.plugin.githubClient
+    const runtime = this.plugin.v4Runtime
+    if (this.service && this.serviceSettings === settings
+      && this.serviceGithubClient === githubClient && this.serviceRuntime === runtime) {
+      return this.service
+    }
+    this.clearHistoryService()
+    const service = await runtime.createHistoryService()
+    if (this.plugin.settings !== settings || this.plugin.githubClient !== githubClient
+      || this.plugin.v4Runtime !== runtime) throw new Error("GitHub Settings changed while history was loading.")
+    this.service = service
+    this.serviceSettings = settings
+    this.serviceGithubClient = githubClient
+    this.serviceRuntime = runtime
+    this.selected = undefined
+    this.page = 1
+    return service
   }
 
   private shell(title: string): { body: HTMLElement; detail: HTMLElement } {
