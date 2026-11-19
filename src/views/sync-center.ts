@@ -48,6 +48,7 @@ export class V4SyncCenterView extends ItemView {
   private historyMode: "commits" | "file" = "commits"
   private currentFilePath: string | undefined
   private fileOpenRef: EventRef | undefined
+  private renameRef: EventRef | undefined
   private observedSyncLifecycle: V4SyncProgressSnapshot["lifecycle"] | undefined
 
   constructor(leaf: WorkspaceLeaf, private readonly plugin: FastSync) { super(leaf) }
@@ -76,10 +77,9 @@ export class V4SyncCenterView extends ItemView {
       }
     })
     if (this.fileOpenRef) this.app.workspace.offref(this.fileOpenRef)
-    this.fileOpenRef = this.app.workspace.on?.("file-open", () => {
-      if (!this.isOpen || this.historyMode !== "file") return
-      if (this.app.workspace.getActiveFile()?.path !== this.currentFilePath) void this.renderFileMode()
-    })
+    this.fileOpenRef = this.app.workspace.on?.("file-open", () => this.refreshFileHistoryForActivePathChange())
+    if (this.renameRef) this.app.vault?.offref(this.renameRef)
+    this.renameRef = this.app.vault?.on("rename", () => this.refreshFileHistoryForActivePathChange())
     await this.renderCommitMode()
   }
   override async onClose(): Promise<void> {
@@ -90,6 +90,8 @@ export class V4SyncCenterView extends ItemView {
     this.unsubscribeProgress = undefined
     if (this.fileOpenRef) this.app.workspace.offref(this.fileOpenRef)
     this.fileOpenRef = undefined
+    if (this.renameRef) this.app.vault?.offref(this.renameRef)
+    this.renameRef = undefined
     this.currentFilePath = undefined
     this.clearProgressElements()
     this.releaseObjectUrl()
@@ -108,6 +110,11 @@ export class V4SyncCenterView extends ItemView {
       if (this.historyMode === "file") void this.renderFileMode()
       else void this.renderCommitMode()
     }
+  }
+
+  private refreshFileHistoryForActivePathChange(): void {
+    if (!this.isOpen || this.historyMode !== "file") return
+    if (this.app.workspace.getActiveFile()?.path !== this.currentFilePath) void this.renderFileMode()
   }
 
   private beginRender(): V4ViewRenderGeneration | undefined {

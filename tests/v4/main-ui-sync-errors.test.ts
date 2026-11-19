@@ -61,7 +61,7 @@ function setupUi() {
       getSecret(id: string) { return savedSecrets.get(id) ?? null },
       setSecret(id: string, value: string) { savedSecrets.set(id, value) },
     },
-    vault: { configDir: ".obsidian", getFiles: () => [], on: () => ({}) },
+    vault: { configDir: ".obsidian", getFiles: () => [], on: () => ({}), offref: () => undefined },
     workspace: { onLayoutReady: (callback: () => void) => callback() },
   }
   plugin.manifest = { id: "test" }

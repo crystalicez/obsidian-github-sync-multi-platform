@@ -175,6 +175,77 @@ test("D430 stale history response cannot repaint the Sync Center after a success
   }
 });
 
+test("D434 renaming the active note refreshes Current file versions without a file-open event", async () => {
+  const source = new FakeProgressSource();
+  const plugin = createSyncCenterPluginFixture(source, () => undefined);
+  const active = { path: "Notes/starting.md" };
+  const renameListeners = new Set<(file: { path: string }, oldPath: string) => void>();
+  Object.assign(plugin.app.workspace, { getActiveFile: () => active });
+  Object.assign(plugin.app, {
+    vault: {
+      on(event: string, listener: (file: { path: string }, oldPath: string) => void) {
+        assert.equal(event, "rename");
+        renameListeners.add(listener);
+        return { listener };
+      },
+      offref(ref: { listener: (file: { path: string }, oldPath: string) => void }) {
+        renameListeners.delete(ref.listener);
+      },
+    },
+  });
+  const reads: string[] = [];
+  const oldVersions = deferred<Array<{
+    commit: { sha: string; message: string; authoredAt: string; source: "plugin" };
+    change: { kind: "add"; path: string; source: "plugin"; fileId: string };
+  }>>();
+  plugin.v4Runtime.fileIdForPath = async path => path;
+  plugin.v4Runtime.createHistoryService = async () => ({
+    async listCommits() { return { items: [], hasMore: false }; },
+    async getCommitChanges() { return []; },
+    async getFileVersions(fileId: string) {
+      reads.push(fileId);
+      if (fileId === "Notes/starting.md") return oldVersions.promise;
+      return [{ commit: { sha: "new", message: "renamed", authoredAt: "", source: "plugin" as const },
+        change: { kind: "add" as const, path: fileId, source: "plugin" as const, fileId } }];
+    },
+    async previewChange(): Promise<never> { throw new Error("not used"); },
+  });
+  const view = new V4SyncCenterView(new WorkspaceLeaf(plugin.app), plugin as never);
+  const fireRename = (file: { path: string }, oldPath: string) => {
+    for (const listener of [...renameListeners]) listener(file, oldPath);
+  };
+  try {
+    await view.onOpen();
+    assert.equal(renameListeners.size, 1, "Sync Center listens for Obsidian note renames");
+    await view.onOpen();
+    assert.equal(renameListeners.size, 1, "reopening a view does not retain duplicate vault listeners");
+    view.contentEl.findByText("Current file")?.onclick?.();
+    await waitForCondition(() => reads.length === 1, "initial file history request starts");
+    fireRename({ path: "Notes/unrelated.md" }, "Notes/another.md");
+    await Promise.resolve();
+    assert.deepEqual(reads, ["Notes/starting.md"], "an unrelated rename must not refetch history");
+
+    active.path = "Archive/starting.md";
+    fireRename(active, "Notes/starting.md");
+    await waitForCondition(() => view.contentEl.flattenText().includes("ADD · Archive/starting.md"),
+      "renamed note versions appear without file-open");
+    oldVersions.resolve([{ commit: { sha: "old", message: "old path", authoredAt: "", source: "plugin" },
+      change: { kind: "add", path: "Notes/starting.md", source: "plugin", fileId: "Notes/starting.md" } }]);
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.match(view.contentEl.flattenText(), /Versions of Archive\/starting\.md/u);
+    assert.doesNotMatch(view.contentEl.flattenText(), /ADD · Notes\/starting\.md/u);
+    assert.deepEqual(reads, ["Notes/starting.md", "Archive/starting.md"]);
+  } finally {
+    oldVersions.resolve([]);
+    await view.onClose();
+  }
+  assert.equal(renameListeners.size, 0, "closing Sync Center removes the rename listener");
+  fireRename(active, "Notes/starting.md");
+  assert.deepEqual(reads, ["Notes/starting.md", "Archive/starting.md"],
+    "closed view must not fetch file history");
+});
+
 test("D433 Current file history follows opened notes, ignores duplicate opens and unsubscribes on close", async () => {
   const source = new FakeProgressSource();
   const plugin = createSyncCenterPluginFixture(source, () => undefined);
