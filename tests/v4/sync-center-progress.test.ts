@@ -68,6 +68,113 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
+test("D430 first successful Sync reloads visible Commit history without polling on progress ticks", async () => {
+  const source = new FakeProgressSource();
+  const plugin = createSyncCenterPluginFixture(source, () => undefined);
+  const commit = { sha: "new-commit-sha", message: "First synced notes", authoredAt: "2026-11-19", source: "plugin" as const };
+  let committed = false;
+  let requests = 0;
+  plugin.v4Runtime.createHistoryService = async () => ({
+    async listCommits() {
+      requests++;
+      return { items: committed ? [commit] : [], hasMore: false };
+    },
+    async getCommitChanges() { return []; },
+    async getFileVersions() { return []; },
+    async previewChange(): Promise<never> { throw new Error("not used"); },
+  });
+  const view = new V4SyncCenterView(new WorkspaceLeaf(plugin.app), plugin as never);
+  try {
+    await view.onOpen();
+    assert.match(view.contentEl.flattenText(), /No commits found/u);
+    assert.equal(requests, 1);
+    source.publish(uploadingFixture);
+    committed = true;
+    source.publish({ ...uploadingFixture, lifecycle: "success", phase: undefined, currentPath: undefined });
+    await waitForCondition(() => view.contentEl.flattenText().includes("First synced notes"),
+      "new GitHub commit appears after successful Sync");
+    assert.equal(requests, 2);
+    source.publish({ ...uploadingFixture, lifecycle: "success", phase: undefined,
+      currentPath: undefined, totalElapsedMs: uploadingFixture.totalElapsedMs + 2000 });
+    await Promise.resolve();
+    assert.equal(requests, 2, "completed-run progress ticks must not refetch GitHub history");
+  } finally {
+    await view.onClose();
+  }
+  source.publish(uploadingFixture);
+  source.publish({ ...uploadingFixture, lifecycle: "no-change", phase: undefined, currentPath: undefined });
+  assert.equal(requests, 2, "closing the view stops history refresh");
+});
+
+test("D430 successful first Sync refreshes Current file versions without switching modes", async () => {
+  const source = new FakeProgressSource();
+  const plugin = createSyncCenterPluginFixture(source, () => undefined);
+  const commit = { sha: "new-commit-sha", message: "first upload", authoredAt: "2026-11-19", source: "plugin" as const };
+  const change = { kind: "add" as const, path: "Notes/project.md", source: "plugin" as const, fileId: "file-id" };
+  let committed = false;
+  let versionRequests = 0;
+  plugin.v4Runtime.fileIdForPath = async () => committed ? "file-id" : undefined;
+  plugin.v4Runtime.createHistoryService = async () => ({
+    async listCommits() { return { items: [], hasMore: false }; },
+    async getCommitChanges() { return []; },
+    async getFileVersions() {
+      versionRequests++;
+      return committed ? [{ commit, change }] : [];
+    },
+    async previewChange(): Promise<never> { throw new Error("not used"); },
+  });
+  const view = new V4SyncCenterView(new WorkspaceLeaf(plugin.app), plugin as never);
+  try {
+    await view.onOpen();
+    view.contentEl.findByText("Current file")?.onclick?.();
+    await waitForCondition(() => view.contentEl.flattenText().includes("not been synced by V4 yet"),
+      "new local file is initially unsynced");
+    source.publish(uploadingFixture);
+    committed = true;
+    source.publish({ ...uploadingFixture, lifecycle: "no-change", phase: undefined, currentPath: undefined });
+    await waitForCondition(() => view.contentEl.flattenText().includes("ADD · Notes/project.md"),
+      "new file version displayed after successful no-change sync");
+    assert.match(view.contentEl.flattenText(), /Versions of Notes\/project\.md/u);
+    assert.equal(versionRequests, 1);
+  } finally {
+    await view.onClose();
+  }
+});
+
+test("D430 stale history response cannot repaint the Sync Center after a successful Sync", async () => {
+  const source = new FakeProgressSource();
+  const plugin = createSyncCenterPluginFixture(source, () => undefined);
+  const stale = deferred<{ items: Array<{ sha: string; message: string; authoredAt: string; source: "plugin" }>; hasMore: boolean }>();
+  let requests = 0;
+  plugin.v4Runtime.createHistoryService = async () => ({
+    async listCommits() {
+      requests++;
+      if (requests === 1) return stale.promise;
+      return { items: [{ sha: "new", message: "Current synced content", authoredAt: "", source: "plugin" as const }], hasMore: false };
+    },
+    async getCommitChanges() { return []; },
+    async getFileVersions() { return []; },
+    async previewChange(): Promise<never> { throw new Error("not used"); },
+  });
+  const view = new V4SyncCenterView(new WorkspaceLeaf(plugin.app), plugin as never);
+  const opening = view.onOpen();
+  try {
+    await waitForCondition(() => requests === 1, "initial old commit request");
+    source.publish(uploadingFixture);
+    source.publish({ ...uploadingFixture, lifecycle: "success", phase: undefined, currentPath: undefined });
+    await waitForCondition(() => view.contentEl.flattenText().includes("Current synced content"),
+      "new commit history painted after Sync");
+    stale.resolve({ items: [{ sha: "old", message: "Superseded cached history", authoredAt: "", source: "plugin" }], hasMore: false });
+    await opening;
+    assert.match(view.contentEl.flattenText(), /Current synced content/u);
+    assert.doesNotMatch(view.contentEl.flattenText(), /Superseded cached history/u);
+    assert.equal(requests, 2);
+  } finally {
+    stale.resolve({ items: [], hasMore: false });
+    await view.onClose();
+  }
+});
+
 test("D427 switching saved GitHub repositories refreshes Sync Center history instead of reusing old service", async () => {
   const source = new FakeProgressSource();
   const plugin = Object.assign(createSyncCenterPluginFixture(source, () => undefined), {

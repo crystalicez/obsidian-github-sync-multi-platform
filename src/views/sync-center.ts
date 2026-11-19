@@ -45,6 +45,8 @@ export class V4SyncCenterView extends ItemView {
   private openGeneration = 0
   private renderGeneration = 0
   private isOpen = false
+  private historyMode: "commits" | "file" = "commits"
+  private observedSyncLifecycle: V4SyncProgressSnapshot["lifecycle"] | undefined
 
   constructor(leaf: WorkspaceLeaf, private readonly plugin: FastSync) { super(leaf) }
   getViewType(): string { return V4_SYNC_CENTER_VIEW }
@@ -55,8 +57,22 @@ export class V4SyncCenterView extends ItemView {
     this.isOpen = true
     this.openGeneration++
     this.renderGeneration++
+    this.observedSyncLifecycle = undefined
     this.unsubscribeProgress?.()
-    this.unsubscribeProgress = this.plugin.v4Runtime.subscribeProgress(snapshot => this.renderProgressCard(snapshot))
+    this.unsubscribeProgress = this.plugin.v4Runtime.subscribeProgress(snapshot => {
+      const previous = this.observedSyncLifecycle
+      this.observedSyncLifecycle = snapshot.lifecycle
+      this.renderProgressCard(snapshot)
+      if ((previous === "active" || previous === "waiting")
+        && (snapshot.lifecycle === "success" || snapshot.lifecycle === "no-change") && this.isOpen) {
+        if (this.historyMode === "file") void this.renderFileMode()
+        else {
+          this.page = 1
+          this.selected = undefined
+          void this.renderCommitMode()
+        }
+      }
+    })
     await this.renderCommitMode()
   }
   override async onClose(): Promise<void> {
@@ -69,6 +85,7 @@ export class V4SyncCenterView extends ItemView {
     this.releaseObjectUrl()
     this.clearHistoryService()
     this.selected = undefined
+    this.observedSyncLifecycle = undefined
   }
 
   onSettingsSaved(): void {
@@ -340,6 +357,7 @@ export class V4SyncCenterView extends ItemView {
   private async renderCommitMode(): Promise<void> {
     const generation = this.beginRender()
     if (!generation) return
+    this.historyMode = "commits"
     const { body, detail } = this.shell("Commit history")
     body.createEl("p", { text: "Loading commits…", cls: "github-sync-center__muted" })
     try {
@@ -400,6 +418,7 @@ export class V4SyncCenterView extends ItemView {
   private async renderFileMode(): Promise<void> {
     const generation = this.beginRender()
     if (!generation) return
+    this.historyMode = "file"
     const active = this.app.workspace.getActiveFile()
     const { body, detail } = this.shell(active ? `Versions of ${active.path}` : "File versions")
     if (!active) { body.createEl("p", { text: "Open a file to view its versions." }); return }
