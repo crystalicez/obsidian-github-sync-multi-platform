@@ -94,7 +94,10 @@ export class V4SyncCenterView extends ItemView {
     this.page = 1
     this.renderGeneration++
     this.releaseObjectUrl()
-    if (this.isOpen) void this.renderCommitMode()
+    if (this.isOpen) {
+      if (this.historyMode === "file") void this.renderFileMode()
+      else void this.renderCommitMode()
+    }
   }
 
   private beginRender(): V4ViewRenderGeneration | undefined {

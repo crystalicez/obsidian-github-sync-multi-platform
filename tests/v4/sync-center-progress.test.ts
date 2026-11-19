@@ -175,6 +175,94 @@ test("D430 stale history response cannot repaint the Sync Center after a success
   }
 });
 
+test("D432 saving a different GitHub branch keeps Current file open and loads the saved branch versions", async () => {
+  const source = new FakeProgressSource();
+  const plugin = Object.assign(createSyncCenterPluginFixture(source, () => undefined), {
+    settings: { githubBranch: "old-branch" },
+    githubClient: { branch: "old-branch" },
+  });
+  let commitReads = 0;
+  const versionsByBranch: string[] = [];
+  plugin.v4Runtime.createHistoryService = async () => {
+    const branch = plugin.settings.githubBranch;
+    return {
+      async listCommits() { commitReads++; return { items: [], hasMore: false }; },
+      async getCommitChanges() { return []; },
+      async getFileVersions() {
+        versionsByBranch.push(branch);
+        return [{ commit: { sha: branch, message: "sync", authoredAt: "", source: "plugin" as const },
+          change: { kind: "add" as const, path: `Notes/${branch}.md`, source: "plugin" as const, fileId: "file-id" } }];
+      },
+      async previewChange(): Promise<never> { throw new Error("not used"); },
+    };
+  };
+  const view = new V4SyncCenterView(new WorkspaceLeaf(plugin.app), plugin as never);
+  try {
+    await view.onOpen();
+    view.contentEl.findByText("Current file")?.onclick?.();
+    await waitForCondition(() => view.contentEl.flattenText().includes("Notes/old-branch.md"),
+      "old branch's current file history");
+    const priorCommitReads = commitReads;
+    plugin.settings = { githubBranch: "new-branch" };
+    plugin.githubClient = { branch: "new-branch" };
+    view.onSettingsSaved();
+    await waitForCondition(() => view.contentEl.flattenText().includes("Notes/new-branch.md"),
+      "new saved branch's current file history");
+    const visible = view.contentEl.flattenText();
+    assert.match(visible, /Versions of Notes\/project\.md/u);
+    assert.doesNotMatch(visible, /Notes\/old-branch\.md/u);
+    assert.equal(commitReads, priorCommitReads,
+      "saving Settings must not unexpectedly switch the user's Current file view to Commits");
+    assert.deepEqual(versionsByBranch, ["old-branch", "new-branch"]);
+  } finally {
+    await view.onClose();
+  }
+});
+
+test("D432 late old branch file versions cannot overwrite the saved branch's Current file view", async () => {
+  const source = new FakeProgressSource();
+  const plugin = Object.assign(createSyncCenterPluginFixture(source, () => undefined), {
+    settings: { githubBranch: "old-branch" },
+    githubClient: { branch: "old-branch" },
+  });
+  const oldVersions = deferred<Array<{ commit: { sha: string; message: string; authoredAt: string; source: "plugin" }; change: { kind: "add"; path: string; source: "plugin"; fileId: string } }>>();
+  let requestedOld = false;
+  plugin.v4Runtime.createHistoryService = async () => {
+    const branch = plugin.settings.githubBranch;
+    return {
+      async listCommits() { return { items: [], hasMore: false }; },
+      async getCommitChanges() { return []; },
+      async getFileVersions() {
+        if (branch === "old-branch") { requestedOld = true; return oldVersions.promise; }
+        return [{ commit: { sha: "new", message: "new version", authoredAt: "", source: "plugin" as const },
+          change: { kind: "add" as const, path: "Notes/new-saved-branch.md", source: "plugin" as const, fileId: "file-id" } }];
+      },
+      async previewChange(): Promise<never> { throw new Error("not used"); },
+    };
+  };
+  const view = new V4SyncCenterView(new WorkspaceLeaf(plugin.app), plugin as never);
+  try {
+    await view.onOpen();
+    view.contentEl.findByText("Current file")?.onclick?.();
+    await waitForCondition(() => requestedOld, "old branch file versions request starts");
+    plugin.settings = { githubBranch: "new-branch" };
+    plugin.githubClient = { branch: "new-branch" };
+    view.onSettingsSaved();
+    await waitForCondition(() => view.contentEl.flattenText().includes("Notes/new-saved-branch.md"),
+      "new branch versions appear without changing Current file mode");
+    oldVersions.resolve([{ commit: { sha: "old", message: "stale version", authoredAt: "", source: "plugin" },
+      change: { kind: "add", path: "Notes/stale-old-branch.md", source: "plugin", fileId: "file-id" } }]);
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.match(view.contentEl.flattenText(), /Notes\/new-saved-branch\.md/u);
+    assert.doesNotMatch(view.contentEl.flattenText(), /Notes\/stale-old-branch\.md/u);
+    assert.match(view.contentEl.flattenText(), /Versions of Notes\/project\.md/u);
+  } finally {
+    oldVersions.resolve([]);
+    await view.onClose();
+  }
+});
+
 test("D427 switching saved GitHub repositories refreshes Sync Center history instead of reusing old service", async () => {
   const source = new FakeProgressSource();
   const plugin = Object.assign(createSyncCenterPluginFixture(source, () => undefined), {
