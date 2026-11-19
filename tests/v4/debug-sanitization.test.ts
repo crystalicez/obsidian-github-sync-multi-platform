@@ -49,6 +49,33 @@ test("console logging preserves an allowlisted nested error cause chain without 
   assert.equal(JSON.stringify(details).includes("must-not-leak"), false)
 })
 
+test("D431 Debug Console redacts configured credentials embedded in arbitrary log strings and Error causes", () => {
+  const githubToken = "github_pat_d431-credential";
+  const encryptionPassphrase = "d431-passphrase-secret";
+  const warnings: unknown[][] = [];
+  const previousWarn = console.warn;
+  console.warn = (...args: unknown[]) => { warnings.push(args); };
+  try {
+    syncConsoleLog({ consoleLoggingEnabled: true, githubToken, encryptionPassphrase }, "warn",
+      "V4 sync failed", {
+        endpoint: `GitHub request with ${githubToken}`,
+        error: Object.assign(new Error(`GitHub rejected ${githubToken}`), {
+          cause: new Error(`Key mismatch: ${encryptionPassphrase}`),
+        }),
+        nested: [{ detail: `Retry after checking ${encryptionPassphrase}` }],
+        [`HTTP-${githubToken}`]: `Repeat ${githubToken} for diagnosis`,
+      });
+  } finally {
+    console.warn = previousWarn;
+  }
+  assert.equal(warnings.length, 1);
+  const text = JSON.stringify(warnings);
+  assert.doesNotMatch(text, /github_pat_d431-credential|d431-passphrase-secret/u);
+  assert.match(text, /GitHub rejected/u);
+  assert.match(text, /Key mismatch/u);
+  assert.match(text, /Retry after checking/u);
+});
+
 test("console logging and debug settings redact security-sensitive keys case-insensitively", () => {
   const warnings: unknown[][] = []
   const originalWarn = console.warn

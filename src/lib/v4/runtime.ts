@@ -2,7 +2,7 @@ import { Modal, Notice, Platform, TFile } from "obsidian"
 import type FastSync from "../../main"
 import { GitHubClient } from "../github-api"
 import { fromBase64Url, randomBytes, sha256Hex, toBase64Url, utf8ToBytes } from "../bytes"
-import { syncConsoleLog } from "../debug"
+import { redactConfiguredSecrets, syncConsoleLog } from "../debug"
 import { hasGitHubSyncConfig } from "../sync-policy"
 import { readVaultFileBytes, writeVaultFileBytes, trashVaultFileIfExists } from "../vault"
 import { deriveV4BootstrapRecoveryKey, deriveV4Keyring, type V4Keyring } from "./crypto"
@@ -2478,7 +2478,7 @@ export class V4PluginRuntime {
       // value. Never throw again while publishing the terminal failed state,
       // or expose a raw non-Error payload (which may contain credentials).
       const message = error instanceof Error && typeof error.message === "string" && error.message.trim()
-        ? error.message
+        ? redactConfiguredSecrets(error.message, settings)
         : "Unexpected Sync failure. Review Sync status before retrying manually."
       const snapshot = this.progressStore.snapshot
       const publicationRace = isV4PublicationRaceError(error) ? error : undefined
@@ -2501,9 +2501,9 @@ export class V4PluginRuntime {
         this.askUserToReviewOpenEditor(error)
       } else if (error instanceof V4ManualRecoveryRequiredError) {
         // Never present a destructive override when backup evidence is missing.
-        this.askUserToReviewRecovery(error)
+        this.askUserToReviewRecovery(error, message)
       } else if (error instanceof V4PublishedLocalApplyError) {
-        this.askUserToReviewPublishedMerge(error)
+        this.askUserToReviewPublishedMerge(error, message)
       } else {
         new Notice(`GitHub Sync failed: ${message}`)
       }
@@ -2519,7 +2519,7 @@ export class V4PluginRuntime {
     }
   }
 
-  private askUserToReviewPublishedMerge(error: V4PublishedLocalApplyError): void {
+  private askUserToReviewPublishedMerge(error: V4PublishedLocalApplyError, safeMessage: string): void {
     const modal = new Modal(this.plugin.app)
     modal.titleEl.setText("GitHub Sync: Published Merge needs manual review")
     modal.contentEl.createEl("p", { text: "GitHub accepted the new commit, but this device could not finish applying the merged note locally. The Local Index may still reference the older commit." })
@@ -2529,7 +2529,7 @@ export class V4PluginRuntime {
     const buttons = modal.contentEl.createDiv()
     buttons.createEl("button", { text: "Keep files unchanged" }).onclick = () => modal.close()
     buttons.createEl("button", { text: "Copy recovery details" }).onclick = () => {
-      void navigator.clipboard?.writeText(error.message).catch(() => new Notice("Could not copy recovery details."))
+      void navigator.clipboard?.writeText(safeMessage).catch(() => new Notice("Could not copy recovery details."))
     }
     modal.open()
   }
@@ -2544,17 +2544,17 @@ export class V4PluginRuntime {
     modal.open()
   }
 
-  private askUserToReviewRecovery(error: V4ManualRecoveryRequiredError): void {
+  private askUserToReviewRecovery(error: V4ManualRecoveryRequiredError, safeMessage: string): void {
     const modal = new Modal(this.plugin.app)
     modal.titleEl.setText("GitHub Sync: Recovery needs your review")
     modal.contentEl.createEl("p", { text: "Automatic recovery has paused because the plugin cannot prove which file should be restored safely." })
     modal.contentEl.createEl("p", { text: `Affected file: ${error.targetPath}` })
-    modal.contentEl.createEl("p", { text: error.message })
+    modal.contentEl.createEl("p", { text: safeMessage })
     modal.contentEl.createEl("p", { text: "No automatic overwrite or backup deletion will be attempted. Keep the .target-backup and .replacement-residue files. Review a copy of the vault before making any manual changes." })
     const buttons = modal.contentEl.createDiv()
     buttons.createEl("button", { text: "Keep files unchanged" }).onclick = () => modal.close()
     buttons.createEl("button", { text: "Copy recovery details" }).onclick = () => {
-      void navigator.clipboard?.writeText(error.message).catch(() => new Notice("Could not copy recovery details."))
+      void navigator.clipboard?.writeText(safeMessage).catch(() => new Notice("Could not copy recovery details."))
     }
     modal.open()
   }

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { readFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
-import { modalButtons, Notice, resetModalTestState, settingSliderControls, TFile, WorkspaceLeaf } from "obsidian";
+import { Modal, modalButtons, Notice, resetModalTestState, settingSliderControls, TFile, WorkspaceLeaf } from "obsidian";
 
 import { DEFAULT_SETTINGS, SettingTab } from "../../src/setting";
 import FastSync from "../../src/main";
@@ -13,6 +13,7 @@ import { deriveV4Keyring } from "../../src/lib/v4/crypto";
 import { publishV4TreeChanges } from "../../src/lib/v4/git-tree-writer";
 import { migrateV4Secrets, sanitizeV4SettingsForPersistence, storeV4Secrets } from "../../src/lib/v4/secrets";
 import { selectV4RuntimeConfig, V4PluginRuntime } from "../../src/lib/v4/runtime";
+import { V4ManualRecoveryRequiredError } from "../../src/lib/v4/platform-io";
 import type { V4SyncCoordinator } from "../../src/lib/v4/sync-coordinator";
 import { buildV4RemoteMetadata } from "../../src/lib/v4/remote-index";
 import { V4StorageCodec } from "../../src/lib/v4/storage-codec";
@@ -871,6 +872,65 @@ test("D160 genuine Error upload failure still retains actionable terminal phase 
   } finally {
     fixture.runtime.dispose();
     Notice.messages.length = 0;
+  }
+});
+
+test("D431 credential-bearing GitHub Error is safe in Sync progress, Notice and opt-in Debug Console", async () => {
+  for (const credential of ["githubToken", "encryptionPassphrase"] as const) {
+    const fixture = plaintextRuntimeFixture();
+    const secret = credential === "githubToken"
+      ? "github_pat_D431-synthetic-token"
+      : "D431-synthetic-encryption-passphrase";
+    fixture.plugin.settings[credential] = secret;
+    fixture.plugin.settings.consoleLoggingEnabled = true;
+    fixture.github.createBlobOverride = async () => {
+      throw new Error(`Upload failed for secret.md: ${credential}=${secret}; retry connection`);
+    };
+    const previousWarn = console.warn;
+    const warnings: unknown[][] = [];
+    console.warn = (...args: unknown[]) => { warnings.push(args); };
+    Notice.messages.length = 0;
+    try {
+      await fixture.runtime.forcePush();
+      const snapshot = fixture.runtime.progressSnapshot;
+      assert.equal(snapshot.lifecycle, "failed");
+      assert.equal(snapshot.failurePhase, "uploading");
+      assert.match(snapshot.errorMessage ?? "", /Upload failed.*retry connection/u,
+        "keep helpful failure context");
+      assert.doesNotMatch(snapshot.errorMessage ?? "", new RegExp(secret, "u"));
+      assert.ok(Notice.messages.some(message => message.startsWith("GitHub Sync failed:")));
+      assert.doesNotMatch(Notice.messages.join(" "), new RegExp(secret, "u"));
+      assert.ok(warnings.some(args => args[1] === "V4 sync failed"), "enabled Debug Console receives the failure");
+      assert.doesNotMatch(JSON.stringify(warnings), new RegExp(secret, "u"));
+      assert.equal(fixture.github.ref, null, "failed upload cannot publish a commit");
+    } finally {
+      fixture.runtime.dispose();
+      console.warn = previousWarn;
+      Notice.messages.length = 0;
+    }
+  }
+});
+
+test("D431 recovery review dialog does not expose a configured credential from a failed adapter", async () => {
+  const fixture = plaintextRuntimeFixture();
+  const secret = "github_pat_D431-recovery-dialog-secret";
+  fixture.plugin.settings.githubToken = secret;
+  fixture.github.createBlobOverride = async () => {
+    throw new V4ManualRecoveryRequiredError("secret.md", `upload interrupted: ${secret}`);
+  };
+  try {
+    await fixture.runtime.forcePush();
+    const snapshot = fixture.runtime.progressSnapshot;
+    assert.equal(snapshot.lifecycle, "failed");
+    assert.doesNotMatch(snapshot.errorMessage ?? "", new RegExp(secret, "u"));
+    const dialog = Modal.lastCreated;
+    assert.ok(dialog, "Manual Recovery dialog must open instead of hiding the failure");
+    assert.match(dialog.contentEl.flattenText(), /Automatic recovery has paused/u);
+    assert.doesNotMatch(dialog.contentEl.flattenText(), new RegExp(secret, "u"));
+    assert.match(dialog.contentEl.flattenText(), /upload interrupted/u);
+    assert.equal(fixture.github.ref, null);
+  } finally {
+    fixture.runtime.dispose();
   }
 });
 
