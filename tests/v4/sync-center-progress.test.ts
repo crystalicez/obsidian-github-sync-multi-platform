@@ -4,6 +4,7 @@ import test from "node:test";
 import { Notice, WorkspaceLeaf } from "obsidian";
 import { createIdleV4Progress, V4ProgressStore, type V4SyncProgressSnapshot } from "../../src/lib/v4/progress";
 import { V4SyncCenterView } from "../../src/views/sync-center";
+import { V4HistoryNotInitializedError } from "../../src/lib/v4/history-service";
 import { waitForCondition } from "../helpers/wait-for";
 
 const uploadingFixture: V4SyncProgressSnapshot = {
@@ -67,6 +68,71 @@ function deferred<T>() {
   const promise = new Promise<T>(accept => { resolve = accept; });
   return { promise, resolve };
 }
+
+test("D436 first-use empty V4 branch shows safe Sync-now guidance and refreshes after initial Sync", async () => {
+  const source = new FakeProgressSource();
+  let initialized = false;
+  let historyReads = 0;
+  let manualCalls = 0;
+  const plugin = createSyncCenterPluginFixture(source, () => undefined);
+  plugin.runManualSyncFromUi = () => { manualCalls++; };
+  plugin.v4Runtime.createHistoryService = async () => {
+    historyReads++;
+    if (!initialized) throw new V4HistoryNotInitializedError();
+    return {
+      async listCommits() {
+        return { items: [{ sha: "initial-sha", message: "My first Sync", authoredAt: "", source: "plugin" as const }], hasMore: false };
+      },
+      async getCommitChanges() { return []; },
+      async getFileVersions() { return []; },
+      async previewChange(): Promise<never> { throw new Error("not used"); },
+    };
+  };
+  const noticesBefore = Notice.messages.length;
+  const view = new V4SyncCenterView(new WorkspaceLeaf(plugin.app), plugin as never);
+  try {
+    await view.onOpen();
+    const initialText = view.contentEl.flattenText();
+    assert.match(initialText, /No V4 Sync history on this branch yet/u);
+    assert.match(initialText, /empty branch.*Sync now/u);
+    assert.match(initialText, /existing.*use a new empty branch/u);
+    assert.doesNotMatch(initialText, /Force Push first|Could not load history/u);
+    assert.equal(Notice.messages.length, noticesBefore, "missing first-use history is not a connection failure");
+    assert.equal(manualCalls, 0, "opening history must never automatically trigger a write");
+    assert.equal(historyReads, 1);
+
+    initialized = true;
+    source.publish(uploadingFixture);
+    source.publish({ ...uploadingFixture, lifecycle: "success", phase: undefined, currentPath: undefined });
+    await waitForCondition(() => view.contentEl.flattenText().includes("My first Sync"),
+      "first published history appears automatically");
+    assert.doesNotMatch(view.contentEl.flattenText(), /No V4 Sync history on this branch yet/u);
+    assert.equal(historyReads, 2);
+    assert.equal(manualCalls, 0);
+  } finally {
+    await view.onClose();
+  }
+});
+
+test("D436 missing first-use V4 history in Current file is guidance, not a GitHub connection error", async () => {
+  const source = new FakeProgressSource();
+  const plugin = createSyncCenterPluginFixture(source, () => undefined);
+  plugin.v4Runtime.createHistoryService = async () => { throw new V4HistoryNotInitializedError(); };
+  plugin.v4Runtime.fileIdForPath = async () => { throw new V4HistoryNotInitializedError(); };
+  const noticesBefore = Notice.messages.length;
+  const view = new V4SyncCenterView(new WorkspaceLeaf(plugin.app), plugin as never);
+  try {
+    await view.onOpen();
+    view.contentEl.findByText("Current file")?.onclick?.();
+    await waitForCondition(() => view.contentEl.flattenText().includes("No V4 Sync history on this branch yet"),
+      "first-use guidance in Current file mode");
+    assert.match(view.contentEl.flattenText(), /empty branch.*Sync now/u);
+    assert.doesNotMatch(view.contentEl.flattenText(), /Force Push first|Could not load history/u);
+    assert.equal(Notice.messages.length, noticesBefore);
+  } finally {
+    await view.onClose();
+  }
+});
 
 test("D435 changing commit pages clears the old selected commit and loads only the chosen page", async () => {
   const source = new FakeProgressSource();

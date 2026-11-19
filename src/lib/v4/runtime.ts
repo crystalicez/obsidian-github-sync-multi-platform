@@ -21,7 +21,7 @@ import { assertV4PathLayoutCompatible, V4ChangeGuardError, V4PublishedLocalApply
 import type { V4ConflictResolution } from "./conflicts"
 import { V4SyncCoordinator, type V4QueuedChange, type V4SyncRequest } from "./sync-coordinator"
 import { expectedV4PathLayout, V4_FORMAT_VERSION, V4_CONFIG_PATH, type V4RemoteConfig, type V4StorageMode } from "./protocol-types"
-import { V4HistoryService } from "./history-service"
+import { V4HistoryNotInitializedError, V4HistoryService } from "./history-service"
 import type { V4SessionVault } from "./local-io"
 import { createV4ContentSource, createV4WholeBufferContentSource, DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES, type V4ContentSource } from "./content-source"
 import { createV4PlatformIo, V4ManualRecoveryRequiredError, type V4BinaryAdapterLike, type V4PlatformIo } from "./platform-io"
@@ -1920,7 +1920,7 @@ export class V4PluginRuntime {
   async createHistoryService(): Promise<V4HistoryService> {
     this.assertNotDisposed()
     const loaded = await this.loadConfiguredRemoteConfig()
-    if (!loaded) throw new Error("V4 history is not initialized. Force Push first.")
+    if (!loaded) throw new V4HistoryNotInitializedError()
     const { remoteConfig, config } = loaded
     assertV4PathLayoutCompatible(remoteConfig, config, "normal")
     const keyring = config.mode === "encrypted"
@@ -1932,7 +1932,7 @@ export class V4PluginRuntime {
   async fileIdForPath(path: string): Promise<string | null> {
     this.assertNotDisposed()
     const loaded = await this.loadConfiguredRemoteConfig()
-    if (!loaded) throw new Error("V4 history is not initialized. Force Push first.")
+    if (!loaded) throw new V4HistoryNotInitializedError()
     assertV4PathLayoutCompatible(loaded.remoteConfig, loaded.config, "normal")
     const config = loaded.config
     const index = await this.loadIndex(config)

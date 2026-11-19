@@ -8,6 +8,13 @@ import { expectedV4PathLayout, V4_ROOT, type V4RemoteConfig } from "./protocol-t
 import { V4StorageCodec } from "./storage-codec"
 import { assertV4PathLayoutCompatible } from "./sync-session"
 
+export class V4HistoryNotInitializedError extends Error {
+  constructor() {
+    super("V4 history is not initialized on this GitHub branch.")
+    this.name = "V4HistoryNotInitializedError"
+  }
+}
+
 export interface V4HistoryGithub {
   listCommits(options?: { page?: number; perPage?: number }): Promise<GitHubCommitSummary[]>
   getFileBytes(path: string, ref?: string): Promise<{ bytes: Uint8Array; sha: string } | null>

@@ -4,6 +4,7 @@ import { TFile } from "obsidian"
 
 import type { GitHubCreateTreeEntry } from "../../src/lib/github-git-types"
 import { V4PluginRuntime } from "../../src/lib/v4/runtime"
+import { V4HistoryNotInitializedError } from "../../src/lib/v4/history-service"
 import { computeV4GitBlobSha1 } from "../../src/lib/v4/git-blob-identity"
 
 class MemoryGitHub {
@@ -190,6 +191,25 @@ for (const mode of ["plaintext", "encrypted"] as const) {
     }
   })
 }
+
+test("D436 an empty branch has typed missing history until normal first Sync initializes it", async () => {
+  const { plugin, githubClient } = pluginFixture()
+  const runtime = new V4PluginRuntime(plugin as never)
+  try {
+    await assert.rejects(() => runtime.createHistoryService(), V4HistoryNotInitializedError)
+    await assert.rejects(() => runtime.fileIdForPath("Notes/missing.md"), V4HistoryNotInitializedError)
+    assert.equal(githubClient.ref, null, "read-only history checks must not create a GitHub branch")
+
+    await runtime.manualSync()
+    assert.equal(runtime.progressSnapshot.lifecycle, "success", "normal Sync initializes the empty branch")
+    assert.ok(githubClient.ref?.sha)
+    const history = await runtime.createHistoryService()
+    assert.ok(history)
+    assert.equal(await runtime.fileIdForPath("Notes/missing.md"), null)
+  } finally {
+    runtime.dispose()
+  }
+})
 
 for (const mode of ["plaintext", "encrypted"] as const) {
   test(`D421 empty-vault first Sync initializes a missing ${mode} branch without fake no-change`, async () => {
