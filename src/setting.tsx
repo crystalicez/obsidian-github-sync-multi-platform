@@ -85,6 +85,7 @@ export class SettingTab extends PluginSettingTab {
   private connectionCheckBusy = false
   private connectionCheckResult = ""
   private connectionCheckMessageEl: HTMLElement | null = null
+  private connectionCheckButton: { setDisabled(disabled: boolean): unknown } | null = null
   private connectionCheckFields: Readonly<{
     owner: string; repo: string; branch: string; token: string
   }> | null = null
@@ -171,8 +172,13 @@ export class SettingTab extends PluginSettingTab {
 
   updateDirtyState(): void {
     if (this.connectionCheckFields && !this.matchesConnectionCheck(this.connectionCheckFields)) {
+      // Supersede this request when its credentials change, even if it stalls.
+      this.connectionCheckGeneration++
+      this.connectionCheckBusy = false
+      this.connectionCheckFields = null
       this.connectionCheckResult = "Connection settings changed. Test again."
       this.connectionCheckMessageEl?.setText(this.connectionCheckResult)
+      this.connectionCheckButton?.setDisabled(false)
     }
     if (!this.bannerEl) return
     this.bannerEl.empty()
@@ -230,6 +236,7 @@ export class SettingTab extends PluginSettingTab {
     this.connectionCheckResult = ""
     this.connectionCheckFields = null
     this.connectionCheckMessageEl = null
+    this.connectionCheckButton = null
     this.plugin.clipboardReadTip = ""
     this.tempSettings = null
   }
@@ -422,10 +429,12 @@ export class SettingTab extends PluginSettingTab {
     new Setting(set)
       .setName("Connection check")
       .setDesc("Checks access to this repository and branch with the values above. Read-only; no settings or GitHub data are changed.")
-      .addButton(button => button
-        .setButtonText("Test GitHub connection")
-        .setDisabled(this.connectionCheckBusy)
-        .onClick(() => { void this.testGitHubConnection() }))
+      .addButton(button => {
+        this.connectionCheckButton = button
+        button.setButtonText("Test GitHub connection")
+          .setDisabled(this.connectionCheckBusy)
+          .onClick(() => { void this.testGitHubConnection() })
+      })
     this.connectionCheckMessageEl = set.createEl("p", {
       cls: "setting-item-description",
       text: this.connectionCheckResult || "Not checked. Run this before the first Sync.",

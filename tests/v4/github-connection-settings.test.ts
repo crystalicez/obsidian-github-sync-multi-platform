@@ -111,6 +111,54 @@ test("D423 a delayed clipboard response cannot overwrite Settings edited or clos
   }
 })
 
+test("D424 editing repository during a stalled connection check lets users retry without waiting", async () => {
+  let releaseOld!: () => void
+  const oldRequest = new Promise<void>(resolve => { releaseOld = resolve })
+  const requests: string[] = []
+  setRequestUrlHandler(async raw => {
+    const url = (raw as { url: string }).url
+    requests.push(url)
+    if (url.endsWith("/repos/owner/notes")) {
+      await oldRequest
+      return response(200, { id: 123, full_name: "owner/notes" })
+    }
+    if (url.endsWith("/repos/owner/revised")) {
+      return response(200, { id: 456, full_name: "owner/revised" })
+    }
+    return response(200, { ref: "refs/heads/main", object: { sha: "a".repeat(40), type: "commit" } })
+  })
+  try {
+    const tab = tabFor()
+    tab.containerEl.findByText("Test GitHub connection")?.onclick?.()
+    await waitForCondition(() => requests.length === 1, "initial read-only GitHub request")
+    assert.equal(tab.containerEl.findByText("Test GitHub connection")?.disabled, true,
+      "duplicate checks for the unchanged draft should stay disabled")
+
+    tab.tempSettings!.githubRepo = "revised"
+    tab.updateDirtyState()
+    const retryButton = tab.containerEl.findByText("Test GitHub connection")
+    assert.equal(retryButton?.disabled, false,
+      "after editing the repository, retry must be available even if the old request stalls")
+    retryButton?.onclick?.()
+    await waitForCondition(() => tab.containerEl.flattenText().includes("Repository and branch are accessible"),
+      "new repository connection check")
+    assert.deepEqual(requests.map(url => url.split("?")[0]), [
+      "https://api.github.com/repos/owner/notes",
+      "https://api.github.com/repos/owner/revised",
+      "https://api.github.com/repos/owner/revised/git/ref/heads/main",
+    ], "retry should use only the new repository and read-only GET requests")
+
+    releaseOld()
+    await new Promise(resolve => setTimeout(resolve, 20))
+    assert.match(tab.containerEl.flattenText(), /Repository and branch are accessible/u,
+      "a late old response must not overwrite the newer success")
+    assert.doesNotMatch(tab.containerEl.flattenText(), /private-token-must-not-appear/u)
+  } finally {
+    releaseOld?.()
+    setRequestUrlHandler(null)
+  }
+})
+
 test("D415 Settings connection check uses unsaved credentials for read-only repository and branch requests", async () => {
   const requests: Array<{ method: string; url: string; authorization: string; body?: string }> = []
   setRequestUrlHandler(async raw => {
