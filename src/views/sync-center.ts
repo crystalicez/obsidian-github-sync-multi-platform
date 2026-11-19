@@ -1,4 +1,4 @@
-import { ItemView, Notice, WorkspaceLeaf } from "obsidian"
+import { ItemView, Notice, WorkspaceLeaf, type EventRef } from "obsidian"
 import type FastSync from "../main"
 import type { V4HistoryChange, V4HistoryCommit, V4HistoryService, V4VersionPreview } from "../lib/v4/history-service"
 import {
@@ -46,6 +46,8 @@ export class V4SyncCenterView extends ItemView {
   private renderGeneration = 0
   private isOpen = false
   private historyMode: "commits" | "file" = "commits"
+  private currentFilePath: string | undefined
+  private fileOpenRef: EventRef | undefined
   private observedSyncLifecycle: V4SyncProgressSnapshot["lifecycle"] | undefined
 
   constructor(leaf: WorkspaceLeaf, private readonly plugin: FastSync) { super(leaf) }
@@ -73,6 +75,11 @@ export class V4SyncCenterView extends ItemView {
         }
       }
     })
+    if (this.fileOpenRef) this.app.workspace.offref(this.fileOpenRef)
+    this.fileOpenRef = this.app.workspace.on?.("file-open", () => {
+      if (!this.isOpen || this.historyMode !== "file") return
+      if (this.app.workspace.getActiveFile()?.path !== this.currentFilePath) void this.renderFileMode()
+    })
     await this.renderCommitMode()
   }
   override async onClose(): Promise<void> {
@@ -81,6 +88,9 @@ export class V4SyncCenterView extends ItemView {
     this.renderGeneration++
     this.unsubscribeProgress?.()
     this.unsubscribeProgress = undefined
+    if (this.fileOpenRef) this.app.workspace.offref(this.fileOpenRef)
+    this.fileOpenRef = undefined
+    this.currentFilePath = undefined
     this.clearProgressElements()
     this.releaseObjectUrl()
     this.clearHistoryService()
@@ -423,6 +433,7 @@ export class V4SyncCenterView extends ItemView {
     if (!generation) return
     this.historyMode = "file"
     const active = this.app.workspace.getActiveFile()
+    this.currentFilePath = active?.path
     const { body, detail } = this.shell(active ? `Versions of ${active.path}` : "File versions")
     if (!active) { body.createEl("p", { text: "Open a file to view its versions." }); return }
     body.createEl("p", { text: "Loading versions…", cls: "github-sync-center__muted" })

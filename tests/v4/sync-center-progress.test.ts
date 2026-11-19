@@ -175,6 +175,119 @@ test("D430 stale history response cannot repaint the Sync Center after a success
   }
 });
 
+test("D433 Current file history follows opened notes, ignores duplicate opens and unsubscribes on close", async () => {
+  const source = new FakeProgressSource();
+  const plugin = createSyncCenterPluginFixture(source, () => undefined);
+  let activePath: string | null = "Notes/one.md";
+  const fileOpenListeners = new Set<() => void>();
+  Object.assign(plugin.app.workspace, {
+    getActiveFile: () => activePath ? { path: activePath } : null,
+    on(event: string, listener: () => void) {
+      assert.equal(event, "file-open");
+      fileOpenListeners.add(listener);
+      return { listener };
+    },
+    offref(ref: { listener: () => void }) { fileOpenListeners.delete(ref.listener); },
+  });
+  const reads: string[] = [];
+  plugin.v4Runtime.fileIdForPath = async path => path;
+  plugin.v4Runtime.createHistoryService = async () => ({
+    async listCommits() { return { items: [], hasMore: false }; },
+    async getCommitChanges() { return []; },
+    async getFileVersions(fileId: string) {
+      reads.push(fileId);
+      return [{ commit: { sha: fileId, message: "version", authoredAt: "", source: "plugin" as const },
+        change: { kind: "add" as const, path: fileId, source: "plugin" as const, fileId } }];
+    },
+    async previewChange(): Promise<never> { throw new Error("not used"); },
+  });
+  const view = new V4SyncCenterView(new WorkspaceLeaf(plugin.app), plugin as never);
+  const fireFileOpen = () => { for (const listener of [...fileOpenListeners]) listener(); };
+  try {
+    await view.onOpen();
+    assert.equal(fileOpenListeners.size, 1, "an open Sync Center subscribes to Obsidian file changes");
+    await view.onOpen();
+    assert.equal(fileOpenListeners.size, 1, "reopening a view must not duplicate active-file listeners");
+    view.contentEl.findByText("Current file")?.onclick?.();
+    await waitForCondition(() => view.contentEl.flattenText().includes("ADD · Notes/one.md"),
+      "first note versions");
+    activePath = "Notes/two.md";
+    fireFileOpen();
+    await waitForCondition(() => view.contentEl.flattenText().includes("ADD · Notes/two.md"),
+      "second note versions appear automatically");
+    assert.doesNotMatch(view.contentEl.flattenText(), /Notes\/one\.md/u);
+    const readCount = reads.length;
+    fireFileOpen();
+    await Promise.resolve();
+    assert.equal(reads.length, readCount, "reopening the same note does not refetch versions");
+    activePath = null;
+    fireFileOpen();
+    assert.match(view.contentEl.flattenText(), /Open a file to view its versions/u);
+    assert.equal(reads.length, readCount, "no active note requires no GitHub call");
+    view.contentEl.findByText("Commits")?.onclick?.();
+    activePath = "Notes/three.md";
+    fireFileOpen();
+    assert.match(view.contentEl.flattenText(), /Commit history/u);
+    assert.equal(reads.length, readCount, "file-open must not replace the user's Commits view");
+  } finally {
+    await view.onClose();
+  }
+  assert.equal(fileOpenListeners.size, 0, "closing the view unregisters the file-open listener");
+  const readsAfterClose = reads.length;
+  fireFileOpen();
+  assert.equal(reads.length, readsAfterClose);
+});
+
+test("D433 pending old file versions cannot repaint a newly opened note", async () => {
+  const source = new FakeProgressSource();
+  const plugin = createSyncCenterPluginFixture(source, () => undefined);
+  let activePath = "Notes/old.md";
+  const listeners = new Set<() => void>();
+  Object.assign(plugin.app.workspace, {
+    getActiveFile: () => ({ path: activePath }),
+    on(_event: string, listener: () => void) {
+      listeners.add(listener);
+      return { listener };
+    },
+    offref(ref: { listener: () => void }) { listeners.delete(ref.listener); },
+  });
+  const oldVersions = deferred<Array<{
+    commit: { sha: string; message: string; authoredAt: string; source: "plugin" };
+    change: { kind: "add"; path: string; source: "plugin"; fileId: string };
+  }>>();
+  let oldReadStarted = false;
+  plugin.v4Runtime.fileIdForPath = async path => path;
+  plugin.v4Runtime.createHistoryService = async () => ({
+    async listCommits() { return { items: [], hasMore: false }; },
+    async getCommitChanges() { return []; },
+    async getFileVersions(fileId: string) {
+      if (fileId === "Notes/old.md") { oldReadStarted = true; return oldVersions.promise; }
+      return [{ commit: { sha: "new", message: "current", authoredAt: "", source: "plugin" as const },
+        change: { kind: "add" as const, path: fileId, source: "plugin" as const, fileId } }];
+    },
+    async previewChange(): Promise<never> { throw new Error("not used"); },
+  });
+  const view = new V4SyncCenterView(new WorkspaceLeaf(plugin.app), plugin as never);
+  try {
+    await view.onOpen();
+    view.contentEl.findByText("Current file")?.onclick?.();
+    await waitForCondition(() => oldReadStarted, "old note's slow history request");
+    activePath = "Notes/new.md";
+    for (const listener of [...listeners]) listener();
+    await waitForCondition(() => view.contentEl.flattenText().includes("ADD · Notes/new.md"),
+      "new note versions shown without waiting on old request");
+    oldVersions.resolve([{ commit: { sha: "old", message: "stale", authoredAt: "", source: "plugin" },
+      change: { kind: "add", path: "Notes/old.md", source: "plugin", fileId: "Notes/old.md" } }]);
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.match(view.contentEl.flattenText(), /Versions of Notes\/new\.md/u);
+    assert.doesNotMatch(view.contentEl.flattenText(), /Notes\/old\.md/u);
+  } finally {
+    oldVersions.resolve([]);
+    await view.onClose();
+  }
+});
+
 test("D432 saving a different GitHub branch keeps Current file open and loads the saved branch versions", async () => {
   const source = new FakeProgressSource();
   const plugin = Object.assign(createSyncCenterPluginFixture(source, () => undefined), {
