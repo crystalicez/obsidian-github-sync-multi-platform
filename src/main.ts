@@ -50,6 +50,15 @@ export default class FastSync extends Plugin {
   private statusDisplaySignature: string | undefined
   private cooldownStore?: V4RateLimitCooldownStore
 
+  runManualSyncFromUi(): void {
+    if (this.unloaded) return
+    if (this.settingsSaveInProgress || this.settingTab?.isDirty()) {
+      new Notice("GitHub Sync: Save or discard pending settings changes before syncing.")
+      return
+    }
+    this.runSyncFromUi(() => this.v4Runtime.manualSync())
+  }
+
   /**
    * UI and host timers do not await callback Promises. Observe unexpected
    * errors without repeating a Sync whose remote outcome may be unknown.
@@ -145,7 +154,7 @@ export default class FastSync extends Plugin {
 
     // Create Ribbon Icons
     this.ribbonIcon = this.addRibbonIcon("loader-circle", "GitHub Sync: Sync", () => {
-      this.runSyncFromUi(() => this.v4Runtime.manualSync())
+      this.runManualSyncFromUi()
     })
 
     this.addRibbonIcon("arrow-up-circle", "GitHub Sync: Force Push", () => {
@@ -191,7 +200,7 @@ export default class FastSync extends Plugin {
     this.addCommand({
       id: "sync-all-files",
       name: "GitHub Sync: Sync",
-      callback: () => this.runSyncFromUi(() => this.v4Runtime.manualSync()),
+      callback: () => this.runManualSyncFromUi(),
     })
 
     this.addCommand({
@@ -660,7 +669,7 @@ export default class FastSync extends Plugin {
     span.onclick = () => {
       if (runtime && !runtime.isSyncing) {
         if (this.unloaded) return
-        this.runSyncFromUi(() => runtime.manualSync())
+        this.runManualSyncFromUi()
       }
     };
     this.statusDisplaySignature = signature;
@@ -675,6 +684,11 @@ export default class FastSync extends Plugin {
   }
 
   async showForceConfirm(operation: "forcePush" | "forcePull"): Promise<void> {
+    if (this.unloaded) return
+    if (this.settingsSaveInProgress || this.settingTab?.isDirty()) {
+      new Notice("GitHub Sync: Save or discard pending settings changes before syncing.")
+      return
+    }
     await new Promise<void>((resolve) => {
       const modal = new Modal(this.app)
       const confirmedSettings = { ...this.settings }

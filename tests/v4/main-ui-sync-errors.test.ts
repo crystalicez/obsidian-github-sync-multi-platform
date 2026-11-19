@@ -570,6 +570,84 @@ test("D418 a failed Settings save retires uncertain automatic callbacks until re
   }
 })
 
+test("D428 unsaved Settings block manual Sync and Force across the installed UI while preserving saved Sync", async () => {
+  const ui = setupUi()
+  resetModalTestState()
+  Notice.messages.length = 0
+  try {
+    ui.setMode("resolve")
+    await ui.plugin.onload()
+    ui.plugin.settingTab.display()
+    ui.plugin.settingTab.tempSettings!.githubRepo = "different-not-yet-saved-repository"
+    ui.plugin.settingTab.updateDirtyState()
+
+    const view = new V4SyncCenterView(new WorkspaceLeaf(ui.plugin.app), ui.plugin)
+    await view.onOpen()
+    const centerSync = (view.contentEl as unknown as ElementStub).findByText("Sync now")
+    assert.ok(centerSync)
+
+    const actions = [
+      ui.ribbons.get("GitHub Sync: Sync")!,
+      ui.commands.get("sync-all-files")!,
+      () => { ui.plugin.updateStatusBar(); ui.statusRoot.children[0]?.onclick?.() },
+      () => centerSync.onclick?.(),
+    ]
+    const noticeStart = Notice.messages.length
+    const buttonsBefore = modalButtons.length
+    for (const action of actions) action()
+    ui.ribbons.get("GitHub Sync: Force Push")!()
+    ui.commands.get("force-pull-all-files")!()
+    await tick()
+    assert.deepEqual(ui.attempts, [], "every UI must refuse the old remote while a different target is drafted")
+    assert.equal(modalButtons.length, buttonsBefore, "force actions must not open a confirmation for an outdated repository")
+    const notices = Notice.messages.slice(noticeStart)
+    assert.equal(notices.length, 6, "each skipped user action needs an explicit instruction")
+    assert.ok(notices.every(message => /Save or discard pending settings changes/u.test(message)))
+
+    ui.plugin.settingTab.tempSettings = { ...ui.plugin.settings }
+    ui.plugin.settingTab.display()
+    for (const action of actions) { action(); await tick() }
+    assert.deepEqual(ui.attempts, ["manual", "manual", "manual", "manual"],
+      "all four manual Sync controls work after the draft is discarded")
+    await view.onClose()
+  } finally {
+    ui.cleanup()
+    resetModalTestState()
+    Notice.messages.length = 0
+  }
+})
+
+test("D428 in-progress Settings persistence also blocks non-Settings manual Sync", async () => {
+  const ui = setupUi()
+  Notice.messages.length = 0
+  let release!: () => void
+  const gate = new Promise<void>(resolve => { release = resolve })
+  let entered = false
+  try {
+    ui.setMode("resolve")
+    await ui.plugin.onload()
+    ui.plugin.persistData = async () => { entered = true; await gate }
+    const saving = ui.plugin.saveSettings({ ...ui.plugin.settings, githubRepo: "new-saved-repository" })
+    await tick()
+    assert.equal(entered, true, "the Settings disk write is pending")
+    const before = Notice.messages.length
+    ui.ribbons.get("GitHub Sync: Sync")!()
+    ui.commands.get("sync-all-files")!()
+    await tick()
+    assert.deepEqual(ui.attempts, [])
+    assert.equal(Notice.messages.length - before, 2)
+    release()
+    await saving
+    ui.ribbons.get("GitHub Sync: Sync")!()
+    await tick()
+    assert.deepEqual(ui.attempts, ["manual"], "a committed Settings target is usable")
+  } finally {
+    release()
+    ui.cleanup()
+    Notice.messages.length = 0
+  }
+})
+
 test("D156 actual Ribbon/Command/Status Bar/Startup/Scheduler and Sync Center callbacks contain detached rejection", async () => {
   const ui = setupUi()
   resetModalTestState()
