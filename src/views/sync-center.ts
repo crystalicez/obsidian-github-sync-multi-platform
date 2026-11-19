@@ -407,9 +407,10 @@ export class V4SyncCenterView extends ItemView {
   }
 
   private releaseObjectUrl(): void { if (this.objectUrl) URL.revokeObjectURL(this.objectUrl); this.objectUrl = undefined }
-  private renderError(container: HTMLElement, error: unknown): void {
+  private renderError(container: HTMLElement, _error: unknown): void {
+    // External history adapters can throw arbitrary values or credential-bearing errors.
+    const message = "Could not load history. Check the GitHub connection and retry using Commits or Current file."
     container.empty()
-    const message = (error as Error).message
     container.createEl("p", { text: message, cls: "github-sync-center__error" })
     new Notice(`GitHub Sync Center: ${message}`)
   }

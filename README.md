@@ -77,7 +77,7 @@ If Obsidian SecretStorage throws an error during startup (for example, while the
 
 ### Live Sync Status
 
-The status bar shows the current sync phase with separate pull and push counts; its tooltip includes the complete logical vault path plus completed, total, and remaining work in each direction. The Sync Center keeps the same live status above commit and current-file history, including operation, trigger, attempt, failure context, total duration, and an ordered per-phase timing summary. Repeated phases aggregate their duration and display the number of attempts.
+The status bar shows the current sync phase with separate pull and push counts; its tooltip includes the complete logical vault path plus completed, total, and remaining work in each direction. The Sync Center keeps the same live status above commit and current-file history, including operation, trigger, attempt, failure context, total duration, and an ordered per-phase timing summary. Repeated phases aggregate their duration and display the number of attempts. If history cannot load, the Sync Center shows a safe error without raw GitHub responses; check your connection in Settings, then select **Commits** or **Current file** to retry.
 
 Phase changes appear immediately. Rapid path and counter changes are published at most once every 400 ms, while an active phase's elapsed time refreshes once per second. The latest completed run remains visible until the next run begins. Logical paths and timing details exist only in runtime memory and are never saved to plugin settings, the local index, or GitHub.
 

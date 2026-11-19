@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { WorkspaceLeaf } from "obsidian";
+import { Notice, WorkspaceLeaf } from "obsidian";
 import { createIdleV4Progress, V4ProgressStore, type V4SyncProgressSnapshot } from "../../src/lib/v4/progress";
 import { V4SyncCenterView } from "../../src/views/sync-center";
+import { waitForCondition } from "../helpers/wait-for";
 
 const uploadingFixture: V4SyncProgressSnapshot = {
   ...createIdleV4Progress(),
@@ -66,6 +67,40 @@ function deferred<T>() {
   const promise = new Promise<T>(accept => { resolve = accept; });
   return { promise, resolve };
 }
+
+test("D426 Sync Center shows a safe history failure and allows retry after malformed adapter errors", async () => {
+  const source = new FakeProgressSource();
+  const secret = "github_pat_private-credential-must-not-be-displayed";
+  let attempts = 0;
+  const plugin = createSyncCenterPluginFixture(source, () => {
+    attempts++;
+    if (attempts === 1) throw null;
+    if (attempts === 2) throw new Error(`History read failed: ${secret}`);
+  });
+  const noticesBefore = Notice.messages.length;
+  const view = new V4SyncCenterView(new WorkspaceLeaf(plugin.app), plugin);
+  try {
+    await view.onOpen();
+    const first = view.contentEl.flattenText();
+    assert.match(first, /Could not load history/u, "a malformed rejection must not strand the loading spinner");
+    assert.doesNotMatch(first, /Loading commits/u);
+    assert.ok(view.contentEl.findByText("Commits"), "retry action must remain visible");
+
+    view.contentEl.findByText("Commits")?.onclick?.();
+    await waitForCondition(() => attempts === 2 && view.contentEl.flattenText().includes("Could not load history"),
+      "second failed history request");
+    assert.doesNotMatch(view.contentEl.flattenText(), /github_pat_private-credential-must-not-be-displayed/u);
+    assert.ok(Notice.messages.slice(noticesBefore).every(message => !message.includes(secret)),
+      "history errors must not leak access credentials through Obsidian Notices");
+
+    view.contentEl.findByText("Commits")?.onclick?.();
+    await waitForCondition(() => attempts === 3 && view.contentEl.flattenText().includes("Page 1"), "history retry success");
+    assert.equal(attempts, 3);
+    assert.doesNotMatch(view.contentEl.flattenText(), /Could not load history/u);
+  } finally {
+    await view.onClose();
+  }
+});
 
 test("Sync Center progress card updates in isolation and unsubscribes on close", async () => {
   const source = new FakeProgressSource();
