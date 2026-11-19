@@ -159,6 +159,50 @@ test("D424 editing repository during a stalled connection check lets users retry
   }
 })
 
+test("D425 failed Settings Save never exposes storage exception secrets and remains retryable", async () => {
+  const passphrase = "private-passphrase-must-not-appear"
+  const settings = { ...source, encryptionMode: "encrypted" as const, encryptionPassphrase: passphrase }
+  let attempts = 0
+  const plugin = {
+    settings, clipboardReadTip: "",
+    async saveSettings(next: typeof settings) {
+      attempts++
+      if (attempts === 1) {
+        throw new Error(`Failed to store token ${token} and passphrase ${passphrase}`)
+      }
+      plugin.settings = next
+    },
+    updateStatusBar() {},
+  }
+  const tab = new SettingTab({} as never, plugin as never)
+  tab.display()
+  tab.tempSettings!.githubRepo = "new-repository"
+  tab.updateDirtyState()
+  const noticesBefore = Notice.messages.length
+  const save = tab.containerEl.findByText("Save changes")
+  assert.ok(save)
+  save.onclick?.()
+  await waitForCondition(() => Notice.messages.length > noticesBefore, "failed Settings Save notice")
+  const failureMessages = Notice.messages.slice(noticesBefore)
+  assert.ok(failureMessages.some(message => /Settings not saved/u.test(message)))
+  assert.ok(failureMessages.every(message => !message.includes(token) && !message.includes(passphrase)),
+    "an untrusted storage error must never expose the saved credentials")
+  assert.ok(failureMessages.some(message => /retry/u.test(message)),
+    "failed Save should tell the user what to do next")
+  assert.equal(plugin.settings.githubRepo, "notes", "failed Save must not replace active GitHub target")
+  assert.equal(tab.tempSettings?.githubRepo, "new-repository", "failed Save must preserve the user's draft")
+  assert.equal(tab.isDirty(), true)
+
+  const retry = tab.containerEl.findByText("Save changes")
+  assert.ok(retry)
+  retry.onclick?.()
+  await waitForCondition(() => !tab.isDirty(), "retry after storage recovers")
+  assert.equal(attempts, 2)
+  assert.equal(plugin.settings.githubRepo, "new-repository")
+  assert.ok(Notice.messages.slice(noticesBefore).every(message =>
+    !message.includes(token) && !message.includes(passphrase)))
+})
+
 test("D415 Settings connection check uses unsaved credentials for read-only repository and branch requests", async () => {
   const requests: Array<{ method: string; url: string; authorization: string; body?: string }> = []
   setRequestUrlHandler(async raw => {

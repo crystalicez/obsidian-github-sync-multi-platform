@@ -209,9 +209,9 @@ export class SettingTab extends PluginSettingTab {
             }
             this.display()
           }
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error)
-          new Notice(`GitHub Sync: Settings not saved: ${message}`)
+        } catch {
+          // Secure-storage and persistence errors can contain credential values.
+          new Notice("GitHub Sync: Settings not saved. Review the values and secure storage before retrying. If Recovery is active, resolve it first.")
         } finally {
           this.settingsSavePending = false
           this.updateDirtyState()
