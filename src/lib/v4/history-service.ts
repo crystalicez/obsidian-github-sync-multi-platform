@@ -1,6 +1,6 @@
 import type { GitHubCommitSummary, GitHubTree } from "../github-api"
 import { bytesToUtf8 } from "../bytes"
-import { decryptV4Payload, type V4Keyring } from "./crypto"
+import { decryptV4Payload, V4_ENCRYPTED_PAYLOAD_OVERHEAD_BYTES, type V4Keyring } from "./crypto"
 import { assertV4MetadataBytes } from "./metadata-bounds"
 import type { V4JournalChange, V4JournalPage, V4VersionDescriptor } from "./history-journal"
 import type { V4IndexFileRecord } from "./local-index"
@@ -74,6 +74,9 @@ export class V4HistoryService {
   async previewChange(commit: V4HistoryCommit, change: V4HistoryChange): Promise<V4VersionPreview> {
     const descriptor = change.after ?? change.before
     if (!descriptor) return { kind: "binary", bytes: new Uint8Array() }
+    if (!Number.isSafeInteger(descriptor.size) || descriptor.size < 0) {
+      throw new Error("V4 history preview has an invalid declared size.")
+    }
     if (descriptor.size > V4_HISTORY_PREVIEW_MAX_BYTES) {
       throw new Error(`V4 history preview exceeds the ${V4_HISTORY_PREVIEW_MAX_BYTES}-byte preview limit.`)
     }
@@ -83,15 +86,28 @@ export class V4HistoryService {
     const versionCommit = change.after ? gitCommit : await this.input.github.getGitCommit(parentSha!)
     const tree = await this.input.github.getTreeAt(versionCommit.treeSha, true)
     if (tree.truncated) throw new Error("Historical Git tree is truncated; preview is unsafe.")
-    const shas = new Map(tree.tree.filter(node => node.type === "blob").map(node => [node.path, node.sha]))
+    const blobs = new Map(tree.tree.filter(node => node.type === "blob").map(node => [node.path, node]))
     const record = this.recordFromDescriptor(change, descriptor)
+    const maxSingleBlobBytes = V4_HISTORY_PREVIEW_MAX_BYTES
+      + (this.input.config.mode === "encrypted" ? V4_ENCRYPTED_PAYLOAD_OVERHEAD_BYTES : 0)
     const bytes = await this.codec.read(record, async path => {
-      const sha = shas.get(path)
-      if (!sha) throw new Error(`Version blob is missing: ${path}`)
-      return this.input.github.getBlob(sha)
+      const blob = blobs.get(path)
+      if (!blob) throw new Error(`Version blob is missing: ${path}`)
+      if (record.storage === "single" && blob.size !== undefined
+        && (!Number.isSafeInteger(blob.size) || blob.size < 0 || blob.size > maxSingleBlobBytes)) {
+        throw new Error("V4 history preview exceeds the single-blob size limit.")
+      }
+      const fetched = await this.input.github.getBlob(blob.sha)
+      if (record.storage === "single" && fetched.byteLength > maxSingleBlobBytes) {
+        throw new Error("V4 history preview exceeds the single-blob size limit.")
+      }
+      return fetched
     })
+    if (bytes.byteLength > V4_HISTORY_PREVIEW_MAX_BYTES) {
+      throw new Error("V4 history preview exceeds the decoded content size limit.")
+    }
     const ext = extension(change.path)
-    if (TEXT_EXTENSIONS.has(ext) && bytes.byteLength <= 5 * 1024 * 1024) return { kind: "text", text: bytesToUtf8(bytes), bytes }
+    if (TEXT_EXTENSIONS.has(ext)) return { kind: "text", text: bytesToUtf8(bytes), bytes }
     if (IMAGE_MIME[ext]) return { kind: "image", mime: IMAGE_MIME[ext], bytes }
     return { kind: "binary", bytes }
   }

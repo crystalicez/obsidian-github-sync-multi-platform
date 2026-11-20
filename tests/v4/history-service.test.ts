@@ -304,6 +304,57 @@ test("v4 encrypted history follows one fileId across file and folder renames", a
   assert.equal((versions.at(-1)!.change.after ?? versions.at(-1)!.change.before)!.remotePath, initial.remotePath);
 });
 
+test("D453 historical preview refuses underreported file sizes before or after downloading bytes", async () => {
+  const max = 5 * 1024 * 1024;
+  const commit = { sha: "history-commit", message: "obsidian-sync-v4:safe", authorName: "A", authoredAt: "",
+    parentShas: [], source: "plugin" as const, journalId: "safe" };
+  for (const [treeSize, expectedBlobReads] of [[max + 1, 0], [1, 1]] as const) {
+    let reads = 0;
+    const github = {
+      async listCommits() { return []; },
+      async getFileBytes() { return null; },
+      async getGitCommit(sha: string) { return { sha, treeSha: "history-tree", parentShas: [] }; },
+      async getTreeAt() {
+        return { sha: "history-tree", url: "", truncated: false,
+          tree: [{ path: "important.md", mode: "100644", type: "blob" as const, sha: "blob-sha", size: treeSize, url: "" }] };
+      },
+      async getBlob() { reads++; return new Uint8Array(max + 1); },
+    };
+    const service = new V4HistoryService({ github, config: {
+      formatVersion: V4_FORMAT_VERSION, mode: "plaintext", repoId: "o/r#main",
+    } });
+    await assert.rejects(() => service.previewChange(commit, {
+      source: "plugin", fileId: "important", kind: "modify", path: "important.md",
+      after: { remotePath: "important.md", sha: "blob-sha", size: 1 },
+    }), /history preview.*(size|limit)|preview.*limit/iu);
+    assert.equal(reads, expectedBlobReads,
+      "a known oversized Git tree blob must be rejected before network blob fetch");
+  }
+});
+
+test("D453 historical preview refuses invalid declared sizes before any GitHub request", async () => {
+  let reads = 0;
+  const github = {
+    async listCommits() { return []; },
+    async getFileBytes() { return null; },
+    async getGitCommit(sha: string) { reads++; return { sha, treeSha: "tree", parentShas: [] }; },
+    async getTreeAt() { reads++; return { sha: "tree", url: "", truncated: false, tree: [] }; },
+    async getBlob() { reads++; return new Uint8Array(); },
+  };
+  const service = new V4HistoryService({ github, config: {
+    formatVersion: V4_FORMAT_VERSION, mode: "plaintext", repoId: "o/r#main",
+  } });
+  const commit = { sha: "c", message: "", authorName: "A", authoredAt: "", parentShas: [],
+    source: "plugin" as const, journalId: "safe" };
+  for (const size of [-1, Number.NaN, Number.POSITIVE_INFINITY, 1.5]) {
+    await assert.rejects(() => service.previewChange(commit, {
+      source: "plugin", fileId: "f", kind: "create", path: "important.md",
+      after: { remotePath: "important.md", sha: "blob", size },
+    }), /preview.*size|preview.*limit/iu);
+  }
+  assert.equal(reads, 0, "invalid remote metadata must be rejected without network requests");
+});
+
 test("v4 history refuses an oversized preview before loading blob bytes", async () => {
   let blobReads = 0;
   const github = {
