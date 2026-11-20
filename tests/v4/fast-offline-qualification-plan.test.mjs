@@ -9,6 +9,7 @@ import {
 } from "../../scripts/fast-offline-source-fingerprint.mjs";
 
 import { discoverTests, excludeSelectedTestFile } from "../../scripts/test-discovery.mjs";
+import { createOfflineFastTaskReceipt, summarizeOfflineFastTaskReceipts } from "../../scripts/fast-offline-qualification-receipts.mjs";
 import {
   collectHeavyFastTestNames,
   createOfflineFastQualificationPlan,
@@ -41,6 +42,42 @@ test("D299 offline plan covers every discovered Fast file and every literal heav
   assert.equal(new Set(named).size, named.length);
   assert.deepEqual(named.slice().sort(), collectHeavyFastTestNames(source).slice().sort());
   assert.ok(plan.tasks.every(task => task.files.length === task.fileCount));
+  const bounded = plan.tasks.filter(task => /^D23[0-9]$/u.test(task.label));
+  assert.ok(bounded.length >= 8, "D230–239 must be split into bounded, individually rerunnable cases");
+  assert.ok(bounded.every(task => task.expectedNames.length > 0 && task.expectedNames.length <= 10),
+    "a formerly 45-case D23 cohort must never timeout as one uninterruptible qualification task");
+});
+
+test("D441 resumable Offline Fast requires complete, source-matched, exact-plan receipts", async () => {
+  const discovered = await discoverTests(process.cwd());
+  const heavySource = await readFile(HEAVY_FAST_TEST_FILE, "utf8");
+  const plan = createOfflineFastQualificationPlan(discovered, heavySource);
+  const digest = "a".repeat(64);
+  const receipts = plan.tasks.map(task => {
+    const names = task.expectedNames ?? [];
+    const count = task.expectedNames === null ? task.fileCount : names.length;
+    return createOfflineFastTaskReceipt({ task, sourceDigest: digest,
+      status: 0, stdout: goodSummary(count, names) });
+  });
+  const result = summarizeOfflineFastTaskReceipts(plan, digest, receipts);
+  assert.equal(result.tasks, plan.tasks.length);
+  assert.equal(result.eligibleFiles, plan.eligibleFiles);
+  assert.equal(result.passed, receipts.reduce((total, receipt) => total + receipt.passed, 0));
+
+  assert.throws(() => summarizeOfflineFastTaskReceipts(plan, digest, receipts.slice(1)), /Incomplete/u);
+  assert.throws(() => summarizeOfflineFastTaskReceipts(plan, "b".repeat(64), receipts), /mismatched/u);
+  const changed = (index, patch) => receipts.map((receipt, at) => at === index ? { ...receipt, ...patch } : receipt);
+  assert.throws(() => summarizeOfflineFastTaskReceipts(plan, digest, changed(0, { passed: 0 })), /mismatched/u);
+  assert.throws(() => summarizeOfflineFastTaskReceipts(plan, digest, changed(0, { sourceDigest: "b".repeat(64) })), /mismatched/u);
+  assert.throws(() => summarizeOfflineFastTaskReceipts(plan, digest, changed(0, { taskLabel: receipts[1].taskLabel })), /duplicate/u);
+  assert.throws(() => summarizeOfflineFastTaskReceipts(plan, digest, changed(0, { args: ["--tier=fast"] })), /mismatched/u);
+  assert.throws(() => summarizeOfflineFastTaskReceipts(plan, digest, changed(0, { files: [] })), /mismatched/u);
+  assert.throws(() => summarizeOfflineFastTaskReceipts(plan, digest, changed(0, { skipped: 1 })), /Invalid/u);
+  const heavyTask = plan.tasks.find(task => task.expectedNames !== null);
+  assert.ok(heavyTask);
+  assert.throws(() => createOfflineFastTaskReceipt({ task: heavyTask, sourceDigest: digest,
+    status: 0, stdout: goodSummary(heavyTask.expectedNames.length, heavyTask.expectedNames).replace("ℹ skipped 0", "ℹ skipped 1") }),
+  /did not pass/u);
 });
 
 test("D299 qualification plan fails closed on missing, duplicated or unsupported heavy cases", () => {
@@ -52,13 +89,14 @@ test("D299 qualification plan fails closed on missing, duplicated or unsupported
   const source = [
     'test("D83 simple", () => {})',
     'test("D220 distinct", () => {})',
-    'test("D230 distinct", () => {})',
+    ...[230, 231, 232, 233, 234, 235, 236, 238, 239].map(n =>
+      `test("D${n} distinct", () => {})`),
     'test("D240 distinct", () => {})',
     'test("D250 distinct", () => {})',
     'test("D368 explicit", () => {})',
   ].join("\n");
   const valid = createOfflineFastQualificationPlan(discovered, source, 2);
-  assert.equal(valid.tasks.length, 8);
+  assert.equal(valid.tasks.length, 2 + HEAVY_TEST_COHORTS.length);
   assert.throws(() => createOfflineFastQualificationPlan(discovered.slice(1), source, 2), /exactly once/u);
   assert.throws(() => createOfflineFastQualificationPlan([...discovered, discovered[0]], source, 2), /duplicate/u);
   assert.throws(() => collectHeavyFastTestNames(source + '\ntest("D300 newer", () => {})'), /Unclassified/u);

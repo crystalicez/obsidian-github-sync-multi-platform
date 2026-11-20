@@ -30,7 +30,15 @@ export const OFFLINE_FAST_SHARDS = 12;
 export const HEAVY_TEST_COHORTS = Object.freeze([
   { label: "D0-199", pattern: String.raw`^D(?:\d{1,2}|1\d\d)(?!\d)`, matches: /^D(?:\d{1,2}|1\d\d)(?!\d)/u },
   { label: "D200-229", pattern: String.raw`^D2[0-2]\d(?!\d)`, matches: /^D2[0-2]\d(?!\d)/u },
-  { label: "D230-239", pattern: String.raw`^D23\d(?!\d)`, matches: /^D23\d(?!\d)/u },
+  { label: "D230", pattern: String.raw`^D230(?!\d)`, matches: /^D230(?!\d)/u },
+  { label: "D231", pattern: String.raw`^D231(?!\d)`, matches: /^D231(?!\d)/u },
+  { label: "D232", pattern: String.raw`^D232(?!\d)`, matches: /^D232(?!\d)/u },
+  { label: "D233", pattern: String.raw`^D233(?!\d)`, matches: /^D233(?!\d)/u },
+  { label: "D234", pattern: String.raw`^D234(?!\d)`, matches: /^D234(?!\d)/u },
+  { label: "D235", pattern: String.raw`^D235(?!\d)`, matches: /^D235(?!\d)/u },
+  { label: "D236", pattern: String.raw`^D236(?!\d)`, matches: /^D236(?!\d)/u },
+  { label: "D238", pattern: String.raw`^D238(?!\d)`, matches: /^D238(?!\d)/u },
+  { label: "D239", pattern: String.raw`^D239(?!\d)`, matches: /^D239(?!\d)/u },
   { label: "D240-249", pattern: String.raw`^D24\d(?!\d)`, matches: /^D24\d(?!\d)/u },
   { label: "D250-299", pattern: String.raw`^D2[5-9]\d(?!\d)`, matches: /^D2[5-9]\d(?!\d)/u },
   // Explicit new D368 Settings Cutover regression. Other D3xx cases still
