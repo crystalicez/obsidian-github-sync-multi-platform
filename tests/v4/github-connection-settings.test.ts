@@ -1,5 +1,6 @@
 import assert from "node:assert/strict"
 import test from "node:test"
+import { createHash } from "node:crypto"
 import { Notice, setRequestUrlHandler } from "obsidian"
 import { DEFAULT_SETTINGS, SettingTab } from "../../src/setting"
 import { waitForCondition } from "../helpers/wait-for"
@@ -10,6 +11,13 @@ const source = { ...DEFAULT_SETTINGS, githubOwner: "owner", githubRepo: "notes",
 const response = (status: number, json: unknown) => ({
   status, json, text: "private-token-must-not-appear", headers: {}, arrayBuffer: new ArrayBuffer(0),
 })
+const v4ConfigResponse = (repoId: string, mode: "plaintext" | "encrypted" = "plaintext") => {
+  const bytes = Buffer.from(JSON.stringify({ formatVersion: 4, mode, repoId,
+    pathLayout: mode === "encrypted" ? "opaque-stable-v1" : "plaintext-v1" }))
+  const sha = createHash("sha1").update(`blob ${bytes.byteLength}\0`).update(bytes).digest("hex")
+  return response(200, { encoding: "base64", content: bytes.toString("base64"), sha })
+}
+
 const tabFor = () => {
   const tab = new SettingTab({} as never, {
     settings: { ...source }, clipboardReadTip: "",
@@ -125,6 +133,7 @@ test("D424 editing repository during a stalled connection check lets users retry
     if (url.endsWith("/repos/owner/revised")) {
       return response(200, { id: 456, full_name: "owner/revised" })
     }
+    if (url.includes("/repos/owner/revised/contents/")) return v4ConfigResponse("owner/revised#main")
     return response(200, { ref: "refs/heads/main", object: { sha: "a".repeat(40), type: "commit" } })
   })
   try {
@@ -146,6 +155,7 @@ test("D424 editing repository during a stalled connection check lets users retry
       "https://api.github.com/repos/owner/notes",
       "https://api.github.com/repos/owner/revised",
       "https://api.github.com/repos/owner/revised/git/ref/heads/main",
+      "https://api.github.com/repos/owner/revised/contents/.obsidian-github-sync-v4/config.json",
     ], "retry should use only the new repository and read-only GET requests")
 
     releaseOld()
@@ -212,6 +222,9 @@ test("D415 Settings connection check uses unsaved credentials for read-only repo
     if (request.url.endsWith("/repos/owner/notes")) {
       return response(200, { id: 123, full_name: "owner/notes" })
     }
+    if (request.url.includes("/contents/.obsidian-github-sync-v4/config.json")) {
+      return v4ConfigResponse("owner/notes#main")
+    }
     return response(200, { ref: "refs/heads/main", object: { sha: "a".repeat(40), type: "commit" } })
   })
   try {
@@ -221,13 +234,116 @@ test("D415 Settings connection check uses unsaved credentials for read-only repo
     check.onclick?.()
     await waitForCondition(() => tab.containerEl.flattenText().includes("Repository and branch are accessible"),
       "read-only connection result")
-    assert.equal(requests.length, 2)
+    assert.equal(requests.length, 3)
     assert.ok(requests.every(r => r.method === "GET" && r.body === undefined),
       "connection check may not publish or mutate any remote content")
     assert.ok(requests.every(r => r.authorization === "Bearer " + token))
     assert.doesNotMatch(tab.containerEl.flattenText(), /private-token-must-not-appear/u)
     assert.match(tab.containerEl.flattenText(), /Save changes to use this configuration/u)
   } finally {
+    setRequestUrlHandler(null)
+  }
+})
+
+test("D438 existing branch without V4 config warns before first Sync instead of certifying readiness", async () => {
+  const requests: Array<{ method: string; url: string }> = []
+  setRequestUrlHandler(async raw => {
+    const request = raw as { method: string; url: string }
+    requests.push({ method: request.method, url: request.url })
+    if (request.url.endsWith("/repos/owner/notes")) {
+      return response(200, { id: 123, full_name: "owner/notes" })
+    }
+    if (request.url.includes("/git/ref/heads/main?")) {
+      return response(200, { ref: "refs/heads/main", object: { sha: "a".repeat(40), type: "commit" } })
+    }
+    if (request.url.includes("/contents/.obsidian-github-sync-v4/config.json")) {
+      return response(404, { message: token })
+    }
+    throw new Error("Unexpected GitHub request")
+  })
+  try {
+    const tab = tabFor()
+    tab.containerEl.findByText("Test GitHub connection")?.onclick?.()
+    await waitForCondition(() => tab.containerEl.findByText("Test GitHub connection")?.disabled === false,
+      "read-only check completes")
+    const text = tab.containerEl.flattenText()
+    assert.match(text, /no V4 (configuration|config)/iu)
+    assert.match(text, /new empty branch/iu)
+    assert.doesNotMatch(text, /Repository and branch are accessible|Force Push first|private-token-must-not-appear/iu)
+    assert.ok(requests.every(request => request.method === "GET"), "connection test must remain read-only")
+    assert.equal(requests.length, 3, "only repository, branch, and V4 config should be fetched")
+  } finally {
+    setRequestUrlHandler(null)
+  }
+})
+
+test("D438 connection check warns on mismatched V4 storage mode and repository identity", async () => {
+  const cases = [
+    { mode: "encrypted" as const, repoId: "owner/notes#main", expected: /uses encrypted storage, but Settings use plaintext/u },
+    { mode: "plaintext" as const, repoId: "other/notes#main", expected: /different repository identity/u },
+  ]
+  for (const scenario of cases) {
+    const requests: string[] = []
+    setRequestUrlHandler(async raw => {
+      const request = raw as { method: string; url: string }
+      assert.equal(request.method, "GET")
+      requests.push(request.url)
+      if (request.url.endsWith("/repos/owner/notes")) return response(200, { id: 123, full_name: "owner/notes" })
+      if (request.url.includes("/git/ref/heads/main?")) {
+        return response(200, { ref: "refs/heads/main", object: { sha: "a".repeat(40), type: "commit" } })
+      }
+      if (request.url.includes("/contents/.obsidian-github-sync-v4/config.json")) {
+        return v4ConfigResponse(scenario.repoId, scenario.mode)
+      }
+      throw new Error("Unexpected GitHub request")
+    })
+    try {
+      const tab = tabFor()
+      tab.containerEl.findByText("Test GitHub connection")?.onclick?.()
+      await waitForCondition(() => tab.containerEl.findByText("Test GitHub connection")?.disabled === false,
+        "V4 compatibility check completes")
+      const rendered = tab.containerEl.flattenText()
+      assert.match(rendered, scenario.expected)
+      assert.doesNotMatch(rendered, /Repository and branch are accessible|private-token-must-not-appear/u)
+      assert.equal(requests.length, 3)
+    } finally {
+      setRequestUrlHandler(null)
+    }
+  }
+})
+
+test("D438 changing encryption mode during a V4 config read revokes the old success", async () => {
+  let release!: () => void
+  let entered!: () => void
+  const waiting = new Promise<void>(resolve => { entered = resolve })
+  const gate = new Promise<void>(resolve => { release = resolve })
+  setRequestUrlHandler(async raw => {
+    const url = (raw as { url: string }).url
+    if (url.endsWith("/repos/owner/notes")) return response(200, { id: 123, full_name: "owner/notes" })
+    if (url.includes("/git/ref/heads/main?")) {
+      return response(200, { ref: "refs/heads/main", object: { sha: "a".repeat(40), type: "commit" } })
+    }
+    if (url.includes("/contents/.obsidian-github-sync-v4/config.json")) {
+      entered()
+      await gate
+      return v4ConfigResponse("owner/notes#main")
+    }
+    throw new Error("Unexpected GitHub request")
+  })
+  try {
+    const tab = tabFor()
+    tab.containerEl.findByText("Test GitHub connection")?.onclick?.()
+    await waiting
+    tab.tempSettings!.encryptionMode = "encrypted"
+    tab.display()
+    assert.equal(tab.containerEl.findByText("Test GitHub connection")?.disabled, false,
+      "the changed mode should immediately permit a new check")
+    release()
+    await new Promise(resolve => setTimeout(resolve, 20))
+    assert.match(tab.containerEl.flattenText(), /Connection settings changed.*Test again/u)
+    assert.doesNotMatch(tab.containerEl.flattenText(), /Repository and branch are accessible/u)
+  } finally {
+    release?.()
     setRequestUrlHandler(null)
   }
 })

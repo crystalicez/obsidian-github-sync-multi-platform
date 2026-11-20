@@ -1,6 +1,8 @@
 import { App, PluginSettingTab, Notice, Setting, Platform } from "obsidian";
 import { KofiImage } from "./lib/icons";
 import { GitHubClient } from "./lib/github-api";
+import { decodeV4RemoteConfig } from "./lib/v4/remote-index";
+import { V4_CONFIG_PATH, effectiveV4PathLayout, expectedV4PathLayout } from "./lib/v4/protocol-types";
 
 import FastSync from "./main";
 import { assertPluginSettingsRuntimeSafe } from "./lib/plugin-settings-validation";
@@ -87,14 +89,36 @@ export class SettingTab extends PluginSettingTab {
   private connectionCheckMessageEl: HTMLElement | null = null
   private connectionCheckButton: { setDisabled(disabled: boolean): unknown } | null = null
   private connectionCheckFields: Readonly<{
-    owner: string; repo: string; branch: string; token: string
+    owner: string; repo: string; branch: string; token: string; mode: PluginSettings["encryptionMode"]
   }> | null = null
 
   private matchesConnectionCheck(fields: NonNullable<SettingTab["connectionCheckFields"]>): boolean {
     const current = this.tempSettings
     return !!current && current.githubOwner === fields.owner
       && current.githubRepo === fields.repo && current.githubBranch === fields.branch
-      && current.githubToken === fields.token
+      && current.githubToken === fields.token && current.encryptionMode === fields.mode
+  }
+
+  private existingBranchCheckResult(bytes: Uint8Array | undefined, fields: NonNullable<SettingTab["connectionCheckFields"]>): string {
+    if (!bytes) {
+      return "Existing branch has no V4 configuration. Normal Sync will not overwrite unrelated history. Choose a new empty branch in Settings."
+    }
+    let remote
+    try {
+      remote = decodeV4RemoteConfig(bytes)
+    } catch {
+      return "Existing branch has an invalid or unsupported V4 configuration. Choose a new empty branch in Settings; do not overwrite it."
+    }
+    if (remote.repoId !== `${fields.owner}/${fields.repo}#${fields.branch}`) {
+      return "Existing V4 branch has a different repository identity. Check owner, repository and branch, or choose a new empty branch."
+    }
+    if (remote.mode !== fields.mode) {
+      return `Existing V4 branch uses ${remote.mode} storage, but Settings use ${fields.mode}. Select the matching mode or a new empty branch.`
+    }
+    if (effectiveV4PathLayout(remote) !== expectedV4PathLayout(remote.mode)) {
+      return "Existing V4 branch uses an older path layout. Choose a new empty branch instead of starting normal Sync."
+    }
+    return "Repository and branch are accessible with matching V4 configuration. Save changes to use this configuration. This read-only check has not verified write permission or the passphrase."
   }
 
   private async testGitHubConnection(): Promise<void> {
@@ -104,6 +128,7 @@ export class SettingTab extends PluginSettingTab {
       repo: this.tempSettings.githubRepo,
       branch: this.tempSettings.githubBranch,
       token: this.tempSettings.githubToken,
+      mode: this.tempSettings.encryptionMode,
     }
     const generation = ++this.connectionCheckGeneration
     this.connectionCheckFields = fields
@@ -122,10 +147,16 @@ export class SettingTab extends PluginSettingTab {
           result = "Connection settings changed during the check. Test again."
         } else if (identity.fullName.toLowerCase() !== `${fields.owner}/${fields.repo}`.toLowerCase()) {
           result = "Repository identity differs from these settings. Check owner and repository."
-        } else if (await github.getGitRefOrNull()) {
-          result = "Repository and branch are accessible. Save changes to use this configuration."
         } else {
-          result = "Configured branch was not found. Repository is accessible. Save changes, then press Sync now to create the branch. This read-only check has not verified write permission."
+          const ref = await github.getGitRefOrNull()
+          if (generation !== this.connectionCheckGeneration || !this.matchesConnectionCheck(fields)) {
+            result = "Connection settings changed during the check. Test again."
+          } else if (!ref) {
+            result = "Configured branch was not found. Repository is accessible. Save changes, then press Sync now to create the branch. This read-only check has not verified write permission."
+          } else {
+            const config = await github.getFileBytes(V4_CONFIG_PATH, fields.branch)
+            result = this.existingBranchCheckResult(config?.bytes, fields)
+          }
         }
       }
     } catch (error) {
@@ -428,7 +459,7 @@ export class SettingTab extends PluginSettingTab {
 
     new Setting(set)
       .setName("Connection check")
-      .setDesc("Checks access to this repository and branch with the values above. Read-only; no settings or GitHub data are changed.")
+      .setDesc("Checks repository and branch access and the existing V4 configuration. Read-only; does not verify write access or the encryption passphrase.")
       .addButton(button => {
         this.connectionCheckButton = button
         button.setButtonText("Test GitHub connection")
