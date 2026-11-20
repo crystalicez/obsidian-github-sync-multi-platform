@@ -39,6 +39,7 @@ const TEXT_EXTENSIONS = new Set(["md", "txt", "json", "canvas", "yaml", "yml", "
 export const V4_HISTORY_PREVIEW_MAX_BYTES = 5 * 1024 * 1024
 
 const IMAGE_MIME: Record<string, string> = { png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp", svg: "image/svg+xml", bmp: "image/bmp" }
+const SAFE_JOURNAL_ID = /^[A-Za-z0-9_-]{1,128}$/u
 
 function extension(path: string): string { return path.split(".").at(-1)?.toLowerCase() ?? "" }
 
@@ -58,7 +59,9 @@ export class V4HistoryService {
   async listCommits(page = 1): Promise<V4CommitPage> {
     const items = (await this.input.github.listCommits({ page, perPage: 50 })).map(commit => {
       const match = /^obsidian-sync-v4:([^\s]+)$/u.exec(commit.message.split("\n", 1)[0] ?? "")
-      return { ...commit, source: match ? "plugin" as const : "external" as const, journalId: match?.[1] }
+      const journalId = match?.[1]
+      const isPluginCommit = journalId !== undefined && SAFE_JOURNAL_ID.test(journalId)
+      return { ...commit, source: isPluginCommit ? "plugin" as const : "external" as const, journalId: isPluginCommit ? journalId : undefined }
     })
     return { items, page, hasMore: items.length === 50 }
   }
@@ -106,6 +109,7 @@ export class V4HistoryService {
   }
 
   private async readJournal(journalId: string, commitSha: string): Promise<V4HistoryChange[]> {
+    if (!SAFE_JOURNAL_ID.test(journalId)) throw new Error("Invalid V4 history journal ID.")
     const first = await this.readJournalPage(journalId, 0, commitSha)
     const pages = [first]
     for (let page = 1; page < first.pageCount; page++) {

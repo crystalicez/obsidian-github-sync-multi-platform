@@ -108,6 +108,43 @@ test("v4 history paginates 50 commits, reads journal changes, and loads preview 
   assert.equal(blobReads, 1);
 });
 
+test("D449 malformed GitHub commit markers cannot select history journal paths", async () => {
+  const invalidIds = ["../private", "subdir/journal", "back\\slash", "dot.name", "%2f", "x".repeat(129)];
+  const reads: string[] = [];
+  const github = {
+    async listCommits() {
+      return [...invalidIds, "safe-1"].map((id, index) => ({
+        sha: `commit-${index}`, message: `obsidian-sync-v4:${id}`,
+        authorName: "A", authoredAt: "", parentShas: [],
+      }));
+    },
+    async getFileBytes(path: string) {
+      reads.push(path);
+      return { bytes: enc(JSON.stringify({ journalId: "safe-1", page: 0, pageCount: 1, changes: [] })), sha: "journal" };
+    },
+    async getGitCommit(sha: string) { return { sha, treeSha: sha, parentShas: [] }; },
+    async getTreeAt() { return { sha: "tree", url: "", truncated: false, tree: [] }; },
+    async getBlob(): Promise<never> { throw new Error("unused"); },
+  };
+  const service = new V4HistoryService({
+    github, config: { formatVersion: V4_FORMAT_VERSION, mode: "plaintext", repoId: "o/r#main" },
+  });
+  const commits = (await service.listCommits()).items;
+  assert.deepEqual(commits.map(commit => commit.source), [...invalidIds.map(() => "external"), "plugin"]);
+  for (const commit of commits.slice(0, -1)) {
+    assert.deepEqual(await service.getCommitChanges(commit), [], "invalid markers stay inspectable as external commits");
+  }
+  assert.deepEqual(reads, [], "invalid markers must not request arbitrary journal paths");
+  await assert.rejects(
+    service.getCommitChanges({ ...commits[0]!, source: "plugin", journalId: "../private" }),
+    /invalid.*journal/i,
+  );
+  assert.deepEqual(reads, [], "even a caller-supplied plugin marker cannot escape the journal directory");
+  assert.deepEqual(await service.getCommitChanges(commits.at(-1)!), []);
+  assert.equal(reads.length, 1);
+  assert.match(reads[0]!, /\/journals\/safe-1\/000000\.json$/u);
+});
+
 test("D437 rejects invalid journal page counts before fetching any continuation", async () => {
   for (const count of [0, -1, 1.5, 257, "2", null]) {
     let reads = 0;
