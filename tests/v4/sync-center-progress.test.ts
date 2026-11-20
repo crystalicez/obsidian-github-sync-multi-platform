@@ -74,6 +74,120 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
+test("D452 Current file lists newest versions first and copies historical note text only on click", async () => {
+  const originalNavigator = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+  const copied: string[] = [];
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    value: { clipboard: { async writeText(value: string) { copied.push(value); } } },
+  });
+  const source = new FakeProgressSource();
+  const plugin = createSyncCenterPluginFixture(source, () => undefined);
+  const old = { commit: { sha: "old", message: "old", authoredAt: "2026-11-01", source: "plugin" as const },
+    change: { kind: "modify" as const, path: "Notes/project.md", fileId: "file-id", source: "plugin" as const } };
+  const latest = { commit: { sha: "latest", message: "latest", authoredAt: "2026-11-20", source: "plugin" as const },
+    change: { kind: "modify" as const, path: "Notes/project.md", fileId: "file-id", source: "plugin" as const } };
+  let previewReads = 0;
+  Object.assign(plugin.v4Runtime, {
+    async createHistoryService() {
+      return {
+        async listCommits() { return { items: [], hasMore: false }; },
+        async getCommitChanges() { return []; },
+        async getFileVersions() { return [old, latest]; },
+        async previewChange(commit: typeof latest.commit) {
+          previewReads++;
+          const text = commit.sha === "latest" ? "# Latest private note" : "# Old private note";
+          return { kind: "text" as const, text, bytes: new TextEncoder().encode(text) };
+        },
+      };
+    },
+  });
+  const noticesBefore = Notice.messages.length;
+  const view = new V4SyncCenterView(new WorkspaceLeaf(plugin.app), plugin as never);
+  try {
+    await view.onOpen();
+    view.contentEl.findByText("Current file")?.onclick?.();
+    await waitForCondition(() => view.contentEl.flattenText().includes("2026-11-20"),
+      "two historical versions become visible");
+    const firstRow = view.contentEl.findByClass("github-sync-center__master")?.findByClass("github-sync-center__row");
+    assert.ok(firstRow);
+    assert.match(firstRow.flattenText(), /2026-11-20/u, "the most recently synced version is first");
+    assert.equal(previewReads, 0, "listing versions does not decrypt their contents");
+    assert.deepEqual(copied, [], "opening history must never copy secrets to the clipboard");
+    firstRow.onclick?.();
+    await waitForCondition(() => view.contentEl.flattenText().includes("# Latest private note"),
+      "latest historical note preview appears");
+    const copy = view.contentEl.findByText("Copy version text");
+    assert.ok(copy, "text preview provides a recovery action");
+    assert.deepEqual(copied, [], "preview alone must not copy decrypted data");
+    copy.onclick?.();
+    await waitForCondition(() => copied.length === 1, "explicit copy action completes");
+    assert.deepEqual(copied, ["# Latest private note"]);
+    assert.equal(Notice.messages.length, noticesBefore + 1);
+    assert.match(Notice.messages.at(-1) ?? "", /Version text copied/u);
+  } finally {
+    await view.onClose();
+    if (originalNavigator) Object.defineProperty(globalThis, "navigator", originalNavigator);
+    else Reflect.deleteProperty(globalThis, "navigator");
+    Notice.messages.length = noticesBefore;
+  }
+});
+
+test("D452 rejected clipboard and stale preview actions do not leak or copy private history", async () => {
+  const originalNavigator = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+  let writes = 0;
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    value: { clipboard: { async writeText(_text: string) {
+      writes++;
+      throw new Error("secret-history-text-not-for-notices");
+    } } },
+  });
+  const source = new FakeProgressSource();
+  const plugin = createSyncCenterPluginFixture(source, () => undefined);
+  const commit = { sha: "latest", message: "latest", authoredAt: "2026-11-20", source: "plugin" as const };
+  const change = { kind: "modify" as const, path: "Notes/private.md", fileId: "file-id", source: "plugin" as const };
+  Object.assign(plugin.v4Runtime, {
+    async createHistoryService() {
+      return {
+        async listCommits() { return { items: [], hasMore: false }; },
+        async getCommitChanges() { return []; },
+        async getFileVersions() { return [{ commit, change }]; },
+        async previewChange() {
+          return { kind: "text" as const, text: "private encrypted text", bytes: new Uint8Array([1]) };
+        },
+      };
+    },
+  });
+  const noticesBefore = Notice.messages.length;
+  const view = new V4SyncCenterView(new WorkspaceLeaf(plugin.app), plugin as never);
+  try {
+    await view.onOpen();
+    view.contentEl.findByText("Current file")?.onclick?.();
+    await waitForCondition(() => view.contentEl.findByClass("github-sync-center__row") !== undefined,
+      "historical version appears");
+    view.contentEl.findByClass("github-sync-center__row")?.onclick?.();
+    await waitForCondition(() => view.contentEl.findByText("Copy version text") !== undefined,
+      "historical text can be selected for copying");
+    const copy = view.contentEl.findByText("Copy version text");
+    copy?.onclick?.();
+    await waitForCondition(() => Notice.messages.length > noticesBefore, "clipboard rejection is reported");
+    assert.equal(writes, 1);
+    assert.match(Notice.messages.at(-1) ?? "", /Could not copy version text/u);
+    assert.ok(Notice.messages.slice(noticesBefore).every(value => !value.includes("secret-history")),
+      "raw clipboard errors and private note content must stay out of Notices");
+    await view.onClose();
+    copy?.onclick?.();
+    await Promise.resolve();
+    assert.equal(writes, 1, "closing the history view retires old copy actions");
+  } finally {
+    await view.onClose();
+    if (originalNavigator) Object.defineProperty(globalThis, "navigator", originalNavigator);
+    else Reflect.deleteProperty(globalThis, "navigator");
+    Notice.messages.length = noticesBefore;
+  }
+});
+
 test("D450 incomplete first-use connection shows setup guidance without GitHub reads, then recovers after Save", async () => {
   const source = new FakeProgressSource();
   const plugin = createSyncCenterPluginFixture(source, () => undefined);

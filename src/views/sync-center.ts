@@ -456,7 +456,7 @@ export class V4SyncCenterView extends ItemView {
       const versions = await service.getFileVersions(fileId)
       if (!this.isCurrent(generation)) return
       body.empty()
-      for (const version of versions) {
+      for (const version of [...versions].reverse()) {
         const row = body.createEl("button", { cls: "github-sync-center__row" })
         row.createDiv({ text: `${version.change.kind.toUpperCase()} · ${version.change.path}`, cls: "github-sync-center__row-title" })
         row.createDiv({ text: version.commit.authoredAt || version.commit.sha.slice(0, 8), cls: "github-sync-center__muted" })
@@ -480,14 +480,31 @@ export class V4SyncCenterView extends ItemView {
       if (!this.isCurrent(generation)) return
       container.empty()
       container.createEl("h4", { text: change.path })
-      this.appendPreview(container, preview)
+      this.appendPreview(container, preview, generation)
     } catch (error) { if (this.isCurrent(generation)) this.renderError(container, error) }
   }
 
-  private appendPreview(container: HTMLElement, preview: V4VersionPreview): void {
+  private appendPreview(container: HTMLElement, preview: V4VersionPreview, generation: V4ViewRenderGeneration): void {
     this.releaseObjectUrl()
     if (preview.kind === "text") {
+      const copy = container.createEl("button", { text: "Copy version text" })
       container.createEl("pre", { text: preview.text, cls: "github-sync-center__text-preview" })
+      copy.onclick = () => {
+        if (!this.isCurrent(generation)) return
+        void (async () => {
+          try {
+            if (typeof navigator === "undefined" || !navigator.clipboard?.writeText) {
+              throw new Error("Clipboard is unavailable.")
+            }
+            await navigator.clipboard.writeText(preview.text)
+            if (this.isCurrent(generation)) new Notice("GitHub Sync Center: Version text copied.")
+          } catch {
+            if (this.isCurrent(generation)) {
+              new Notice("GitHub Sync Center: Could not copy version text. Select the preview text manually.")
+            }
+          }
+        })()
+      }
       return
     }
     if (preview.kind === "image") {
