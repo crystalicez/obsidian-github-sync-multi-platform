@@ -18,6 +18,8 @@
     "zip": "node scripts/zip-source.mjs",
     "test:fast": "node scripts/run-tests.mjs --tier=fast",
     "test:fast:offline-qualified": "node scripts/run-fast-offline-qualified.mjs",
+    "test:obsidian:offline-first-use:preflight": "node scripts/run-obsidian-offline-first-use.mjs --preflight-only",
+    "test:obsidian:offline-first-use": "node scripts/run-obsidian-offline-first-use.mjs --run",
     "test:repeat": "node scripts/run-test-repeat.mjs",
     "test:feasibility": "node scripts/run-tests.mjs --tier=feasibility",
     "test:resource": "node scripts/run-tests.mjs --tier=resource",

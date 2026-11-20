@@ -1,0 +1,24 @@
+# D445 — Real installed Obsidian offline first-use smoke
+
+**Scope:** Windows desktop Obsidian installed at `C:\Program Files\Obsidian\Obsidian.exe` with the current worktree's built `main.js`, `manifest.json`, and `styles.css`. This test **never configures GitHub credentials or calls GitHub APIs** and does not qualify cross-device Sync or a release from a clean checkout.
+
+Run from the active repository worktree after `pnpm build`:
+
+```sh
+pnpm test:obsidian:offline-first-use:preflight
+pnpm test:obsidian:offline-first-use
+```
+
+Preflight is read-only: it checks installed Obsidian, three production plugin artifacts, and exclusive availability of the chosen local CDP port **before creating any temporary files or starting a process**. A missing executable/build or occupied port fails closed, without claiming native qualification. The command does not accept a user-supplied Vault path, profile path, CDP port, executable path, remote branch or GitHub token.
+
+The real smoke creates a fresh, randomly named Vault and separate Electron profile under `.tmp/obsidian-offline-first-use/`. It copies only the built plugin artifacts, loads the plugin in an isolated Obsidian instance, and verifies the **actual Vault adapter path before invoking any plugin code**. It then proves that a new installation generates a well-formed random Device ID; the Sync Center opens and displays **Sync now** without clicking it; GitHub owner, repo, token and encryption passphrase are blank; Settings Save persists the Device ID; terminating and **restarting the same isolated Obsidian profile** preserves that ID; and a synthetic note remains unchanged.
+
+On a fresh install, an initial startup **SecretStorage-ID migration may write `data.json` before an explicit Save**. This is not a failure: the smoke checks that any early persisted ID equals the running plugin's ID and that the file contains no plaintext GitHub token or encryption passphrase. Existing Device IDs are never intentionally rotated.
+
+The runner sanitizes credential-like environment variables before spawning Obsidian. It checks for CDP port collisions, terminates **only the PID it spawned**, and deletes **only its verified synthetic run directory** after stopping the native process. It reports `syntheticCleanup: synthetic-only` on success; an unsuccessful cleanup is explicitly reported and is **not** considered a passed run. Native failure output is limited to a stage and fixed diagnostic label, not raw renderer exceptions, token contents or a user Vault path.
+
+### Evidence and remaining gates
+
+On **2026-11-20**, preflight passed on an installed Windows Obsidian and the full native `--run` smoke passed: plugin loaded, generated and saved Device ID survived a real process restart, Sync Center opened, synthetic notes preserved, no GitHub credentials installed, and synthetic cleanup succeeded. Initial test attempts incorrectly assumed that a fresh plugin never writes `data.json` before Save; the check was corrected to account for the existing startup SecretStorage migration rather than changing established production behavior. A subsequent run exposed an Obsidian timing race where plugin onload finished before Workspace layout was ready; the smoke now awaits `app.workspace.onLayoutReady` before opening Sync Center, and reports only a fixed safe stage if the native renderer refuses a step. The final `pnpm test:obsidian:offline-first-use` passed **twice consecutively** with synthetic cleanup confirmed on both runs.
+
+This **does not** verify a real GitHub first Sync, encrypted storage interoperability, Linux/macOS desktop, Android/iOS, crash/power-loss recovery, clean-checkout packaging, or Re-encryption Cutover. Those remain independently gated. All test source work is under `E:\Coding\obsidian-github-sync-multi-platform-forked`, and the production/personal Vault is never an input.
