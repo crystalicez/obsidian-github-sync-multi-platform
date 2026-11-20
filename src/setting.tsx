@@ -1,8 +1,8 @@
 import { App, PluginSettingTab, Notice, Setting, Platform } from "obsidian";
 import { KofiImage } from "./lib/icons";
 import { GitHubClient } from "./lib/github-api";
-import { decodeV4RemoteConfig } from "./lib/v4/remote-index";
-import { V4_CONFIG_PATH, effectiveV4PathLayout, expectedV4PathLayout } from "./lib/v4/protocol-types";
+import { decodeV4RemoteConfig, decodeV4RemoteHead } from "./lib/v4/remote-index";
+import { V4_CONFIG_PATH, V4_HEAD_PATH, effectiveV4PathLayout, expectedV4PathLayout } from "./lib/v4/protocol-types";
 
 import FastSync from "./main";
 import { assertPluginSettingsRuntimeSafe } from "./lib/plugin-settings-validation";
@@ -99,7 +99,7 @@ export class SettingTab extends PluginSettingTab {
       && current.githubToken === fields.token && current.encryptionMode === fields.mode
   }
 
-  private existingBranchCheckResult(bytes: Uint8Array | undefined, fields: NonNullable<SettingTab["connectionCheckFields"]>): string {
+  private async existingBranchCheckResult(bytes: Uint8Array | undefined, fields: NonNullable<SettingTab["connectionCheckFields"]>, github: GitHubClient): Promise<string> {
     if (!bytes) {
       return "Existing branch has no V4 configuration. Normal Sync will not overwrite unrelated history. Choose a new empty branch in Settings."
     }
@@ -118,7 +118,18 @@ export class SettingTab extends PluginSettingTab {
     if (effectiveV4PathLayout(remote) !== expectedV4PathLayout(remote.mode)) {
       return "Existing V4 branch uses an older path layout. Choose a new empty branch instead of starting normal Sync."
     }
-    return "Repository and branch are accessible with matching V4 configuration. Save changes to use this configuration. This read-only check has not verified write permission or the passphrase."
+    const head = await github.getFileBytes(V4_HEAD_PATH, fields.branch)
+    if (!head) {
+      return "Existing V4 branch is incomplete: required V4 head metadata is missing. Use a new empty branch in Settings or restore this branch from a backup; do not Force Push."
+    }
+    if (remote.mode === "plaintext") {
+      try {
+        await decodeV4RemoteHead(head.bytes, remote)
+      } catch {
+        return "Existing V4 branch has invalid head metadata. Use a new empty branch in Settings or restore this branch from a backup; do not Force Push."
+      }
+    }
+    return "Repository and branch are accessible with matching V4 configuration and head metadata. Save changes to use this configuration. This read-only check has not verified write permission, encrypted HEAD integrity or the passphrase."
   }
 
   private async testGitHubConnection(): Promise<void> {
@@ -155,7 +166,9 @@ export class SettingTab extends PluginSettingTab {
             result = "Configured branch was not found. Repository is accessible. Save changes, then press Sync now to create the branch. This read-only check has not verified write permission."
           } else {
             const config = await github.getFileBytes(V4_CONFIG_PATH, fields.branch)
-            result = this.existingBranchCheckResult(config?.bytes, fields)
+            result = generation !== this.connectionCheckGeneration || !this.matchesConnectionCheck(fields)
+              ? "Connection settings changed during the check. Test again."
+              : await this.existingBranchCheckResult(config?.bytes, fields, github)
           }
         }
       }
@@ -459,7 +472,7 @@ export class SettingTab extends PluginSettingTab {
 
     new Setting(set)
       .setName("Connection check")
-      .setDesc("Checks repository and branch access and the existing V4 configuration. Read-only; does not verify write access or the encryption passphrase.")
+      .setDesc("Checks repository and branch access plus existing V4 configuration and HEAD metadata. Read-only; does not verify write access, encrypted HEAD integrity or the passphrase.")
       .addButton(button => {
         this.connectionCheckButton = button
         button.setButtonText("Test GitHub connection")

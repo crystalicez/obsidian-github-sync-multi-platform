@@ -18,6 +18,15 @@ const v4ConfigResponse = (repoId: string, mode: "plaintext" | "encrypted" = "pla
   return response(200, { encoding: "base64", content: bytes.toString("base64"), sha })
 }
 
+const v4HeadResponse = (head: unknown = {
+  formatVersion: 4, mode: "plaintext", epoch: 0, generation: 1,
+  journalId: "initial", shardHashes: {}, updatedAt: 1, deviceId: "device-test",
+}) => {
+  const bytes = Buffer.from(JSON.stringify(head))
+  const sha = createHash("sha1").update(`blob ${bytes.byteLength}\0`).update(bytes).digest("hex")
+  return response(200, { encoding: "base64", content: bytes.toString("base64"), sha })
+}
+
 const tabFor = () => {
   const tab = new SettingTab({} as never, {
     settings: { ...source }, clipboardReadTip: "",
@@ -133,6 +142,7 @@ test("D424 editing repository during a stalled connection check lets users retry
     if (url.endsWith("/repos/owner/revised")) {
       return response(200, { id: 456, full_name: "owner/revised" })
     }
+    if (url.includes("/repos/owner/revised/contents/.obsidian-github-sync-v4/head")) return v4HeadResponse()
     if (url.includes("/repos/owner/revised/contents/")) return v4ConfigResponse("owner/revised#main")
     return response(200, { ref: "refs/heads/main", object: { sha: "a".repeat(40), type: "commit" } })
   })
@@ -156,6 +166,7 @@ test("D424 editing repository during a stalled connection check lets users retry
       "https://api.github.com/repos/owner/revised",
       "https://api.github.com/repos/owner/revised/git/ref/heads/main",
       "https://api.github.com/repos/owner/revised/contents/.obsidian-github-sync-v4/config.json",
+      "https://api.github.com/repos/owner/revised/contents/.obsidian-github-sync-v4/head",
     ], "retry should use only the new repository and read-only GET requests")
 
     releaseOld()
@@ -225,6 +236,7 @@ test("D415 Settings connection check uses unsaved credentials for read-only repo
     if (request.url.includes("/contents/.obsidian-github-sync-v4/config.json")) {
       return v4ConfigResponse("owner/notes#main")
     }
+    if (request.url.includes("/contents/.obsidian-github-sync-v4/head")) return v4HeadResponse()
     return response(200, { ref: "refs/heads/main", object: { sha: "a".repeat(40), type: "commit" } })
   })
   try {
@@ -234,12 +246,108 @@ test("D415 Settings connection check uses unsaved credentials for read-only repo
     check.onclick?.()
     await waitForCondition(() => tab.containerEl.flattenText().includes("Repository and branch are accessible"),
       "read-only connection result")
-    assert.equal(requests.length, 3)
+    assert.equal(requests.length, 4)
     assert.ok(requests.every(r => r.method === "GET" && r.body === undefined),
       "connection check may not publish or mutate any remote content")
     assert.ok(requests.every(r => r.authorization === "Bearer " + token))
     assert.doesNotMatch(tab.containerEl.flattenText(), /private-token-must-not-appear/u)
     assert.match(tab.containerEl.flattenText(), /Save changes to use this configuration/u)
+  } finally {
+    setRequestUrlHandler(null)
+  }
+})
+
+test("D439 encrypted V4 HEAD presence stays read-only without claiming passphrase verification", async () => {
+  const requests: string[] = []
+  setRequestUrlHandler(async raw => {
+    const { url, method } = raw as { url: string; method: string }
+    assert.equal(method, "GET")
+    requests.push(url)
+    if (url.endsWith("/repos/owner/notes")) return response(200, { id: 123, full_name: "owner/notes" })
+    if (url.includes("/git/ref/heads/main?")) {
+      return response(200, { ref: "refs/heads/main", object: { sha: "a".repeat(40), type: "commit" } })
+    }
+    if (url.includes("/contents/.obsidian-github-sync-v4/config.json")) {
+      return v4ConfigResponse("owner/notes#main", "encrypted")
+    }
+    if (url.includes("/contents/.obsidian-github-sync-v4/head")) return v4HeadResponse({ opaque: "not decrypted by read-only check" })
+    throw new Error("Unexpected GitHub read")
+  })
+  try {
+    const tab = tabFor()
+    tab.tempSettings!.encryptionMode = "encrypted"
+    tab.display()
+    tab.containerEl.findByText("Test GitHub connection")?.onclick?.()
+    await waitForCondition(() => tab.containerEl.flattenText().includes("Repository and branch are accessible"),
+      "encrypted V4 HEAD existence check")
+    assert.match(tab.containerEl.flattenText(), /not verified.*encrypted HEAD integrity or the passphrase/iu)
+    assert.equal(requests.length, 4)
+  } finally {
+    setRequestUrlHandler(null)
+  }
+})
+
+test("D439 invalid plaintext V4 HEAD gives recovery guidance, not connection success", async () => {
+  const reads: string[] = []
+  setRequestUrlHandler(async raw => {
+    const { url, method } = raw as { url: string; method: string }
+    assert.equal(method, "GET")
+    reads.push(url)
+    if (url.endsWith("/repos/owner/notes")) return response(200, { id: 123, full_name: "owner/notes" })
+    if (url.includes("/git/ref/heads/main?")) {
+      return response(200, { ref: "refs/heads/main", object: { sha: "a".repeat(40), type: "commit" } })
+    }
+    if (url.includes("/contents/.obsidian-github-sync-v4/config.json")) {
+      return v4ConfigResponse("owner/notes#main")
+    }
+    if (url.includes("/contents/.obsidian-github-sync-v4/head")) {
+      return v4HeadResponse({ formatVersion: 4, mode: "plaintext", generation: -1 })
+    }
+    throw new Error("Unexpected GitHub read")
+  })
+  try {
+    const tab = tabFor()
+    tab.containerEl.findByText("Test GitHub connection")?.onclick?.()
+    await waitForCondition(() => tab.containerEl.findByText("Test GitHub connection")?.disabled === false,
+      "invalid HEAD verification completes")
+    const message = tab.containerEl.flattenText()
+    assert.match(message, /invalid head metadata/iu)
+    assert.match(message, /new empty branch/iu)
+    assert.doesNotMatch(message, /Repository and branch are accessible|private-token-must-not-appear/iu)
+    assert.equal(reads.length, 4)
+  } finally {
+    setRequestUrlHandler(null)
+  }
+})
+
+test("D439 existing V4 config without HEAD is not ready for first Sync", async () => {
+  const requests: Array<{ method: string; url: string }> = []
+  setRequestUrlHandler(async raw => {
+    const request = raw as { method: string; url: string }
+    requests.push(request)
+    if (request.url.endsWith("/repos/owner/notes")) return response(200, { id: 123, full_name: "owner/notes" })
+    if (request.url.includes("/git/ref/heads/main?")) {
+      return response(200, { ref: "refs/heads/main", object: { sha: "a".repeat(40), type: "commit" } })
+    }
+    if (request.url.includes("/contents/.obsidian-github-sync-v4/config.json")) {
+      return v4ConfigResponse("owner/notes#main")
+    }
+    if (request.url.includes("/contents/.obsidian-github-sync-v4/head")) {
+      return response(404, { message: token })
+    }
+    throw new Error("Unexpected GitHub read")
+  })
+  try {
+    const tab = tabFor()
+    tab.containerEl.findByText("Test GitHub connection")?.onclick?.()
+    await waitForCondition(() => tab.containerEl.findByText("Test GitHub connection")?.disabled === false,
+      "existing V4 metadata check completes")
+    const message = tab.containerEl.flattenText()
+    assert.match(message, /V4.*head.*missing/iu)
+    assert.match(message, /new empty branch/iu)
+    assert.doesNotMatch(message, /Repository and branch are accessible|Force Push first|private-token-must-not-appear/iu)
+    assert.equal(requests.length, 4, "branch readiness needs to inspect HEAD, not only config")
+    assert.ok(requests.every(r => r.method === "GET"), "read-only connection check must never mutate GitHub")
   } finally {
     setRequestUrlHandler(null)
   }
