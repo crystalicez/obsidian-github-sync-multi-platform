@@ -270,6 +270,73 @@ async function performFirstUse() {
   return { generatedDeviceId: report.generatedDeviceId, savedDeviceId: report.newDeviceId }
 }
 
+async function performNativeHistoricalRecovery() {
+  stage = "native-history-recovery"
+  // The history version is synthetic, but the installed plugin renders its
+  // real action and Obsidian Vault.create persists the resulting note.
+  const result = await evaluate(`(async()=>{
+    let step="locate-installed-history-view";
+    try {
+      const plugin=app.plugins.plugins[${JSON.stringify(pluginId)}];
+      if(plugin.githubClient || plugin.settings.githubOwner || plugin.settings.githubToken)
+        throw Error("Unexpected real GitHub connection");
+      const leaf=app.workspace.getLeavesOfType("github-sync-v4-center")[0];
+      const view=leaf?.view;
+      if(typeof view?.appendPreview!=="function" || typeof view?.beginRender!=="function")
+        throw Error("Installed history preview unavailable");
+      const source=app.vault.getAbstractFileByPath("D445-synthetic-first-use.md");
+      if(!source)throw Error("Synthetic source note unavailable");
+      const original=await app.vault.read(source);
+      step="prepare-collision";
+      const existingName="Recovered-D445-synthetic-first-use-abcdef12.md";
+      const recoveredName="Recovered-D445-synthetic-first-use-abcdef12-2.md";
+      const already=app.vault.getAbstractFileByPath(existingName);
+      if(already||app.vault.getAbstractFileByPath(recoveredName))
+        throw Error("Synthetic recovery path already exists");
+      await app.vault.create(existingName,"# Earlier synthetic recovery\\n");
+      step="render-installed-preview";
+      const container=view.contentEl.querySelector(".github-sync-center__detail");
+      if(!container)throw Error("Installed history detail unavailable");
+      container.empty();
+      view.appendPreview(container,
+        {kind:"text",text:"# Native historical recovery\\n",bytes:new TextEncoder().encode("# Native historical recovery\\n")},
+        view.beginRender(),
+        {sha:"abcdef1234567890",message:"synthetic history",authoredAt:"",source:"plugin"},
+        {kind:"modify",path:"D445-synthetic-first-use.md",fileId:"synthetic",source:"plugin"});
+      const action=[...container.querySelectorAll("button")].find(button=>button.textContent.trim()==="Restore as new note");
+      if(!action)throw Error("Installed history restore action unavailable");
+      step="click-installed-restore";
+      action.click();
+      action.click();
+      const start=Date.now();
+      while(!app.vault.getAbstractFileByPath(recoveredName)&&Date.now()-start<8000)
+        await new Promise(resolve=>setTimeout(resolve,120));
+      const recovered=app.vault.getAbstractFileByPath(recoveredName);
+      if(!recovered)throw Error("Installed Obsidian did not create recovery copy");
+      step="verify-original-and-copies";
+      if(await app.vault.read(source)!==original)throw Error("Recovery overwrote original note");
+      const prior=app.vault.getAbstractFileByPath(existingName);
+      if(!prior||await app.vault.read(prior)!=="# Earlier synthetic recovery\\n")
+        throw Error("Recovery overwrote existing copy");
+      if(await app.vault.read(recovered)!=="# Native historical recovery\\n")
+        throw Error("Recovered bytes mismatch");
+      if(app.vault.getAbstractFileByPath("Recovered-D445-synthetic-first-use-abcdef12-3.md"))
+        throw Error("Repeated recovery action created a second copy");
+      if(!action.disabled)throw Error("Repeated recovery action remains enabled");
+      if(plugin.githubClient)throw Error("Recovery created a GitHub connection");
+      return {restored:true,originalPreserved:true,collisionPreserved:true,doubleClickSafe:true};
+    }catch{return {failedAt:step}}
+  })()`, 35000)
+  if (result?.failedAt) {
+    stage = "native-history-recovery:" + result.failedAt
+    throw Error("Native history recovery failed")
+  }
+  assert.equal(result?.restored, true)
+  assert.equal(result.originalPreserved, true)
+  assert.equal(result.collisionPreserved, true)
+  assert.equal(result.doubleClickSafe, true)
+}
+
 try {
   // Preflight MUST precede even the creation of synthetic .tmp directories.
   await preflight()
@@ -321,6 +388,7 @@ try {
       assert.equal("encryptionPassphrase" in earlySettings, false)
     }
     const firstInstall = await performFirstUse()
+    await performNativeHistoricalRecovery()
     const originalDeviceId = firstInstall.savedDeviceId
     stage = "check-saved-disk"
     const disk = JSON.parse(await readFile(beforePath, "utf8"))
@@ -343,6 +411,12 @@ try {
     assert.equal(reloaded.noCredentials, true)
     const note = await readFile(path.join(vault, "D445-synthetic-first-use.md"), "utf8")
     assert.equal(note, "# D445 offline installation test\nNo GitHub account configured.\n")
+    assert.equal(await readFile(path.join(vault, "Recovered-D445-synthetic-first-use-abcdef12.md"), "utf8"),
+      "# Earlier synthetic recovery\n")
+    assert.equal(await readFile(path.join(vault, "Recovered-D445-synthetic-first-use-abcdef12-2.md"), "utf8"),
+      "# Native historical recovery\n")
+    assert.equal(await stat(path.join(vault, "Recovered-D445-synthetic-first-use-abcdef12-3.md")).catch(() => null), null,
+      "Native restore must never create a duplicate on double click")
 
     // D448: A second *fresh* profile/vault must not inherit the first one's
     // random identity. Each installation uses the real native UI and restart.
@@ -398,7 +472,8 @@ try {
       nativeIndependentInstallations: 2, distinctGeneratedDeviceIds: true,
       syncCenterReady: true, nativeSettingsUiSave: true,
       noCredentialSyncRejected: true, noGitHubCredentials: true, remoteGitHubUsed: false,
-      syntheticNotesPreserved: true }))
+      syntheticNotesPreserved: true, nativeHistoryRestoreCopy: true,
+      nativeHistoryRestorePersistedAfterRestart: true }))
   }
 } catch (error) {
   // Do not claim qualification on missing Windows Obsidian, CDP failure or startup fault.
