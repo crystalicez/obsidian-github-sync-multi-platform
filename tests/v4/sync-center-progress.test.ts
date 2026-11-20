@@ -60,7 +60,12 @@ function createSyncCenterPluginFixture(source: FakeProgressSource | { progressSn
     async fileIdForPath() { return "file-id"; },
     async manualSync() { return {}; },
   });
-  return { app, v4Runtime: runtime };
+  return {
+    app,
+    settings: { githubToken: "test-token", githubOwner: "test-owner", githubRepo: "test-repo",
+      githubBranch: "main", encryptionMode: "plaintext" as "plaintext" | "encrypted", encryptionPassphrase: "test-passphrase" },
+    v4Runtime: runtime,
+  };
 }
 
 function deferred<T>() {
@@ -68,6 +73,68 @@ function deferred<T>() {
   const promise = new Promise<T>(accept => { resolve = accept; });
   return { promise, resolve };
 }
+
+test("D450 incomplete first-use connection shows setup guidance without GitHub reads, then recovers after Save", async () => {
+  const source = new FakeProgressSource();
+  const plugin = createSyncCenterPluginFixture(source, () => undefined);
+  let historyRequests = 0;
+  let fileLookups = 0;
+  plugin.settings = { ...plugin.settings, githubToken: "" };
+  plugin.v4Runtime.createHistoryService = async () => {
+    historyRequests++;
+    return {
+      async listCommits() { return { items: [], hasMore: false }; },
+      async getCommitChanges() { return []; },
+      async getFileVersions() { return []; },
+      async previewChange(): Promise<never> { throw new Error("not used"); },
+    };
+  };
+  plugin.v4Runtime.fileIdForPath = async () => { fileLookups++; return "file-id"; };
+  const noticesBefore = Notice.messages.length;
+  const view = new V4SyncCenterView(new WorkspaceLeaf(plugin.app), plugin as never);
+  try {
+    await view.onOpen();
+    assert.match(view.contentEl.flattenText(), /GitHub Sync is not configured.*Settings.*Encrypted GitHub Sync \(Multi-Platform\).*token.*Save changes/su);
+    assert.equal(historyRequests, 0, "unconfigured Commit history must not contact GitHub");
+    assert.equal(fileLookups, 0);
+
+    view.contentEl.findByText("Current file")?.onclick?.();
+    await waitForCondition(() => view.contentEl.flattenText().includes("GitHub Sync is not configured"),
+      "Current file setup guidance");
+    assert.equal(historyRequests, 0);
+    assert.equal(fileLookups, 0, "unconfigured Current file history must not load a remote index");
+
+    plugin.settings = { ...plugin.settings, githubToken: "test-token" };
+    view.onSettingsSaved();
+    await waitForCondition(() => view.contentEl.flattenText().includes("No versions found"),
+      "Current file history becomes available after configuring the connection");
+    assert.equal(fileLookups, 1);
+    assert.equal(historyRequests, 1);
+    assert.equal(Notice.messages.length, noticesBefore,
+      "missing first-use configuration should not produce an error Notice");
+  } finally {
+    await view.onClose();
+  }
+});
+
+test("D450 encrypted history without a saved passphrase shows setup guidance offline", async () => {
+  const source = new FakeProgressSource();
+  const plugin = createSyncCenterPluginFixture(source, () => undefined);
+  plugin.settings = { ...plugin.settings, encryptionMode: "encrypted", encryptionPassphrase: "" };
+  let historyRequests = 0;
+  plugin.v4Runtime.createHistoryService = async () => {
+    historyRequests++;
+    throw new Error("History must not be loaded without the encryption passphrase");
+  };
+  const view = new V4SyncCenterView(new WorkspaceLeaf(plugin.app), plugin as never);
+  try {
+    await view.onOpen();
+    assert.match(view.contentEl.flattenText(), /GitHub Sync is not configured.*passphrase.*Save changes/su);
+    assert.equal(historyRequests, 0);
+  } finally {
+    await view.onClose();
+  }
+});
 
 test("D436 first-use empty V4 branch shows safe Sync-now guidance and refreshes after initial Sync", async () => {
   const source = new FakeProgressSource();
@@ -480,7 +547,8 @@ test("D433 pending old file versions cannot repaint a newly opened note", async 
 test("D432 saving a different GitHub branch keeps Current file open and loads the saved branch versions", async () => {
   const source = new FakeProgressSource();
   const plugin = Object.assign(createSyncCenterPluginFixture(source, () => undefined), {
-    settings: { githubBranch: "old-branch" },
+    settings: { githubToken: "test-token", githubOwner: "test-owner", githubRepo: "test-repo",
+      githubBranch: "old-branch", encryptionMode: "plaintext" as const },
     githubClient: { branch: "old-branch" },
   });
   let commitReads = 0;
@@ -505,7 +573,7 @@ test("D432 saving a different GitHub branch keeps Current file open and loads th
     await waitForCondition(() => view.contentEl.flattenText().includes("Notes/old-branch.md"),
       "old branch's current file history");
     const priorCommitReads = commitReads;
-    plugin.settings = { githubBranch: "new-branch" };
+    plugin.settings = { ...plugin.settings, githubBranch: "new-branch" };
     plugin.githubClient = { branch: "new-branch" };
     view.onSettingsSaved();
     await waitForCondition(() => view.contentEl.flattenText().includes("Notes/new-branch.md"),
@@ -524,7 +592,8 @@ test("D432 saving a different GitHub branch keeps Current file open and loads th
 test("D432 late old branch file versions cannot overwrite the saved branch's Current file view", async () => {
   const source = new FakeProgressSource();
   const plugin = Object.assign(createSyncCenterPluginFixture(source, () => undefined), {
-    settings: { githubBranch: "old-branch" },
+    settings: { githubToken: "test-token", githubOwner: "test-owner", githubRepo: "test-repo",
+      githubBranch: "old-branch", encryptionMode: "plaintext" as const },
     githubClient: { branch: "old-branch" },
   });
   const oldVersions = deferred<Array<{ commit: { sha: string; message: string; authoredAt: string; source: "plugin" }; change: { kind: "add"; path: string; source: "plugin"; fileId: string } }>>();
@@ -547,7 +616,7 @@ test("D432 late old branch file versions cannot overwrite the saved branch's Cur
     await view.onOpen();
     view.contentEl.findByText("Current file")?.onclick?.();
     await waitForCondition(() => requestedOld, "old branch file versions request starts");
-    plugin.settings = { githubBranch: "new-branch" };
+    plugin.settings = { ...plugin.settings, githubBranch: "new-branch" };
     plugin.githubClient = { branch: "new-branch" };
     view.onSettingsSaved();
     await waitForCondition(() => view.contentEl.flattenText().includes("Notes/new-saved-branch.md"),
@@ -568,7 +637,8 @@ test("D432 late old branch file versions cannot overwrite the saved branch's Cur
 test("D427 switching saved GitHub repositories refreshes Sync Center history instead of reusing old service", async () => {
   const source = new FakeProgressSource();
   const plugin = Object.assign(createSyncCenterPluginFixture(source, () => undefined), {
-    settings: { githubRepo: "old-repo" },
+    settings: { githubToken: "test-token", githubOwner: "test-owner", githubRepo: "old-repo",
+      githubBranch: "main", encryptionMode: "plaintext" as const },
     githubClient: { id: "old" },
   });
   let created = 0;
@@ -588,7 +658,7 @@ test("D427 switching saved GitHub repositories refreshes Sync Center history ins
   try {
     await view.onOpen();
     assert.match(view.contentEl.flattenText(), /History for old-repo/u);
-    plugin.settings = { githubRepo: "new-repo" };
+    plugin.settings = { ...plugin.settings, githubRepo: "new-repo" };
     plugin.githubClient = { id: "new" };
     view.contentEl.findByText("Commits")?.onclick?.();
     await waitForCondition(() => view.contentEl.flattenText().includes("History for new-repo"),
@@ -603,7 +673,8 @@ test("D427 switching saved GitHub repositories refreshes Sync Center history ins
 test("D427 a late old GitHub history result cannot overwrite the saved repository's current history", async () => {
   const source = new FakeProgressSource();
   const plugin = Object.assign(createSyncCenterPluginFixture(source, () => undefined), {
-    settings: { githubRepo: "old-repo" },
+    settings: { githubToken: "test-token", githubOwner: "test-owner", githubRepo: "old-repo",
+      githubBranch: "main", encryptionMode: "plaintext" as const },
     githubClient: { id: "old" },
   });
   const oldRequest = deferred<{ items: Array<{ sha: string; message: string; authoredAt: string; source: "plugin" }>; hasMore: boolean }>();
@@ -624,7 +695,7 @@ test("D427 a late old GitHub history result cannot overwrite the saved repositor
   const opening = view.onOpen();
   try {
     await waitForCondition(() => requestedOld, "old GitHub history request starts");
-    plugin.settings = { githubRepo: "new-repo" };
+    plugin.settings = { ...plugin.settings, githubRepo: "new-repo" };
     plugin.githubClient = { id: "new" };
     (view as unknown as { onSettingsSaved(): void }).onSettingsSaved();
     await waitForCondition(() => view.contentEl.flattenText().includes("Current new-repo history"),

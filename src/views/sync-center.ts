@@ -1,5 +1,6 @@
 import { ItemView, Notice, WorkspaceLeaf, type EventRef } from "obsidian"
 import type FastSync from "../main"
+import { hasGitHubSyncConfig } from "../lib/sync-policy"
 import { V4HistoryNotInitializedError, type V4HistoryChange, type V4HistoryCommit, type V4HistoryService, type V4VersionPreview } from "../lib/v4/history-service"
 import {
   formatV4Duration,
@@ -379,6 +380,7 @@ export class V4SyncCenterView extends ItemView {
     if (!generation) return
     this.historyMode = "commits"
     const { body, detail } = this.shell("Commit history")
+    if (this.showMissingHistoryConfiguration(body)) return
     body.createEl("p", { text: "Loading commits…", cls: "github-sync-center__muted" })
     try {
       const service = await this.ensureService()
@@ -443,6 +445,7 @@ export class V4SyncCenterView extends ItemView {
     this.currentFilePath = active?.path
     const { body, detail } = this.shell(active ? `Versions of ${active.path}` : "File versions")
     if (!active) { body.createEl("p", { text: "Open a file to view its versions." }); return }
+    if (this.showMissingHistoryConfiguration(body)) return
     body.createEl("p", { text: "Loading versions…", cls: "github-sync-center__muted" })
     try {
       const fileId = await this.plugin.v4Runtime.fileIdForPath(active.path)
@@ -493,6 +496,16 @@ export class V4SyncCenterView extends ItemView {
       return
     }
     container.createEl("p", { text: `Binary file · ${preview.bytes.byteLength.toLocaleString()} bytes` })
+  }
+
+  private showMissingHistoryConfiguration(container: HTMLElement): boolean {
+    if (hasGitHubSyncConfig(this.plugin.settings)) return false
+    container.empty()
+    container.createEl("p", {
+      text: "GitHub Sync is not configured. Open Obsidian Settings → Encrypted GitHub Sync (Multi-Platform), enter your GitHub token, repository owner and name, and encryption passphrase if enabled, then Save changes. Sync Center will check the saved branch.",
+      cls: "github-sync-center__muted",
+    })
+    return true
   }
 
   private releaseObjectUrl(): void { if (this.objectUrl) URL.revokeObjectURL(this.objectUrl); this.objectUrl = undefined }
