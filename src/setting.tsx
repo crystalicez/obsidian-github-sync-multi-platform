@@ -99,7 +99,7 @@ export class SettingTab extends PluginSettingTab {
       && current.githubToken === fields.token && current.encryptionMode === fields.mode
   }
 
-  private async existingBranchCheckResult(bytes: Uint8Array | undefined, fields: NonNullable<SettingTab["connectionCheckFields"]>, github: GitHubClient): Promise<string> {
+  private async existingBranchCheckResult(bytes: Uint8Array | undefined, fields: NonNullable<SettingTab["connectionCheckFields"]>, github: GitHubClient, commitSha: string): Promise<string> {
     if (!bytes) {
       return "Existing branch has no V4 configuration. Normal Sync will not overwrite unrelated history. Choose a new empty branch in Settings."
     }
@@ -118,7 +118,7 @@ export class SettingTab extends PluginSettingTab {
     if (effectiveV4PathLayout(remote) !== expectedV4PathLayout(remote.mode)) {
       return "Existing V4 branch uses an older path layout. Choose a new empty branch instead of starting normal Sync."
     }
-    const head = await github.getFileBytes(V4_HEAD_PATH, fields.branch)
+    const head = await github.getFileBytes(V4_HEAD_PATH, commitSha)
     if (!head) {
       return "Existing V4 branch is incomplete: required V4 head metadata is missing. Use a new empty branch in Settings or restore this branch from a backup; do not Force Push."
     }
@@ -129,7 +129,7 @@ export class SettingTab extends PluginSettingTab {
         return "Existing V4 branch has invalid head metadata. Use a new empty branch in Settings or restore this branch from a backup; do not Force Push."
       }
     }
-    return "Repository and branch are accessible with matching V4 configuration and head metadata. Save changes to use this configuration. This read-only check has not verified write permission, encrypted HEAD integrity or the passphrase."
+    return "Repository and branch are accessible at the checked commit with matching V4 configuration and head metadata. Save changes to use this configuration. Sync will recheck GitHub. This read-only check has not verified write permission, encrypted HEAD integrity or the passphrase."
   }
 
   private async testGitHubConnection(): Promise<void> {
@@ -165,10 +165,10 @@ export class SettingTab extends PluginSettingTab {
           } else if (!ref) {
             result = "Configured branch was not found. Repository is accessible. Save changes, then press Sync now to create the branch. This read-only check has not verified write permission."
           } else {
-            const config = await github.getFileBytes(V4_CONFIG_PATH, fields.branch)
+            const config = await github.getFileBytes(V4_CONFIG_PATH, ref.sha)
             result = generation !== this.connectionCheckGeneration || !this.matchesConnectionCheck(fields)
               ? "Connection settings changed during the check. Test again."
-              : await this.existingBranchCheckResult(config?.bytes, fields, github)
+              : await this.existingBranchCheckResult(config?.bytes, fields, github, ref.sha)
           }
         }
       }

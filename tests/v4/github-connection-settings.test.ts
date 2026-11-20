@@ -27,6 +27,16 @@ const v4HeadResponse = (head: unknown = {
   return response(200, { encoding: "base64", content: bytes.toString("base64"), sha })
 }
 
+const missingImmutablePathResponse = (url: string) => {
+  if (url.includes("/git/commits/" + "a".repeat(40))) {
+    return response(200, { sha: "a".repeat(40), tree: { sha: "c".repeat(40) }, parents: [] })
+  }
+  if (url.includes("/git/trees/" + "c".repeat(40))) {
+    return response(200, { sha: "c".repeat(40), tree: [], truncated: false })
+  }
+  return null
+}
+
 const tabFor = () => {
   const tab = new SettingTab({} as never, {
     settings: { ...source }, clipboardReadTip: "",
@@ -257,6 +267,42 @@ test("D415 Settings connection check uses unsaved credentials for read-only repo
   }
 })
 
+test("D440 existing branch preflight reads config and HEAD from one pinned commit, not the moving branch", async () => {
+  const initialSha = "a".repeat(40)
+  const newerSha = "b".repeat(40)
+  const metadataReads: string[] = []
+  let branchReads = 0
+  setRequestUrlHandler(async raw => {
+    const request = raw as { url: string; method: string }
+    assert.equal(request.method, "GET")
+    const { url } = request
+    if (url.endsWith("/repos/owner/notes")) return response(200, { id: 123, full_name: "owner/notes" })
+    if (url.includes("/git/ref/heads/main?")) {
+      branchReads++
+      return response(200, { ref: "refs/heads/main", object: { sha: branchReads === 1 ? initialSha : newerSha, type: "commit" } })
+    }
+    if (url.includes("/contents/.obsidian-github-sync-v4/")) {
+      metadataReads.push(url)
+      if (url.includes("/config.json")) return v4ConfigResponse("owner/notes#main")
+      return v4HeadResponse()
+    }
+    throw new Error("Unexpected read")
+  })
+  try {
+    const tab = tabFor()
+    tab.containerEl.findByText("Test GitHub connection")?.onclick?.()
+    await waitForCondition(() => tab.containerEl.findByText("Test GitHub connection")?.disabled === false, "GitHub preflight completes")
+    assert.match(tab.containerEl.flattenText(), /Repository and branch are accessible at the checked commit/u)
+    assert.match(tab.containerEl.flattenText(), /Sync will recheck GitHub/u)
+    assert.equal(metadataReads.length, 2)
+    assert.ok(metadataReads.every(url => new URL(url).searchParams.get("ref") === initialSha),
+      "the validated V4 config and HEAD must both belong to the initially observed immutable commit")
+    assert.equal(branchReads, 1, "do not inspect unrelated moving branch tips")
+  } finally {
+    setRequestUrlHandler(null)
+  }
+})
+
 test("D439 encrypted V4 HEAD presence stays read-only without claiming passphrase verification", async () => {
   const requests: string[] = []
   setRequestUrlHandler(async raw => {
@@ -335,6 +381,8 @@ test("D439 existing V4 config without HEAD is not ready for first Sync", async (
     if (request.url.includes("/contents/.obsidian-github-sync-v4/head")) {
       return response(404, { message: token })
     }
+    const fallback = missingImmutablePathResponse(request.url)
+    if (fallback) return fallback
     throw new Error("Unexpected GitHub read")
   })
   try {
@@ -346,7 +394,7 @@ test("D439 existing V4 config without HEAD is not ready for first Sync", async (
     assert.match(message, /V4.*head.*missing/iu)
     assert.match(message, /new empty branch/iu)
     assert.doesNotMatch(message, /Repository and branch are accessible|Force Push first|private-token-must-not-appear/iu)
-    assert.equal(requests.length, 4, "branch readiness needs to inspect HEAD, not only config")
+    assert.equal(requests.length, 6, "missing immutable HEAD falls back to the Git tree for reliable absence")
     assert.ok(requests.every(r => r.method === "GET"), "read-only connection check must never mutate GitHub")
   } finally {
     setRequestUrlHandler(null)
@@ -367,6 +415,8 @@ test("D438 existing branch without V4 config warns before first Sync instead of 
     if (request.url.includes("/contents/.obsidian-github-sync-v4/config.json")) {
       return response(404, { message: token })
     }
+    const fallback = missingImmutablePathResponse(request.url)
+    if (fallback) return fallback
     throw new Error("Unexpected GitHub request")
   })
   try {
@@ -379,7 +429,7 @@ test("D438 existing branch without V4 config warns before first Sync instead of 
     assert.match(text, /new empty branch/iu)
     assert.doesNotMatch(text, /Repository and branch are accessible|Force Push first|private-token-must-not-appear/iu)
     assert.ok(requests.every(request => request.method === "GET"), "connection test must remain read-only")
-    assert.equal(requests.length, 3, "only repository, branch, and V4 config should be fetched")
+    assert.equal(requests.length, 5, "missing immutable config falls back to commit and Git tree for reliable absence")
   } finally {
     setRequestUrlHandler(null)
   }
