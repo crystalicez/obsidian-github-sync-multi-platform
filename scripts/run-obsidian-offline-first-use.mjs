@@ -191,11 +191,64 @@ async function performFirstUse() {
       if(!view||![...view.querySelectorAll("button")]
         .some(button=>button.textContent.trim()==="Sync now"))
         throw Error("Native Sync Center action unavailable");
-      step="save-first-settings";
-      await plugin.saveSettings({...fresh,syncOnStartup:false,
-        syncOnLocalChange:false,scheduledSyncEnabled:false});
-      if(plugin.settings.vault!==originalId)throw Error("Device identity changed on Save");
-      return {newDeviceId:originalId,persisted:true,syncCenterOpen:true,
+      step="unconfigured-sync";
+      if(plugin.githubClient)throw Error("Unexpected GitHub client on fresh installation");
+      const syncButton=[...view.querySelectorAll("button")]
+        .find(button=>button.textContent.trim()==="Sync now");
+      syncButton.click();
+      const syncStart=Date.now();
+      while(plugin.v4Runtime.progressSnapshot.lifecycle!=="failed"
+        &&Date.now()-syncStart<9000)
+        await new Promise(resolve=>setTimeout(resolve,100));
+      const result=plugin.v4Runtime.progressSnapshot;
+      if(result.lifecycle!=="failed"
+        ||!result.errorMessage?.includes("GitHub connection is not configured.")
+        ||plugin.githubClient)
+        throw Error("No-token Sync did not fail closed with guidance");
+      step="open-native-settings-tab";
+      const host=app.setting;
+      if(!host||typeof host.open!=="function"||typeof host.openTabById!=="function")
+        throw Error("Obsidian native Settings host unavailable");
+      host.open();
+      host.openTabById(${JSON.stringify(pluginId)});
+      const tab=plugin.settingTab;
+      const rowForDevice=()=>[...tab.containerEl.querySelectorAll(".setting-item")]
+        .find(row=>row.querySelector(".setting-item-name")?.textContent?.trim()
+          ==="Device ID (this Obsidian vault)");
+      const editStart=Date.now();
+      while((!tab.containerEl.isConnected||!rowForDevice())
+        &&Date.now()-editStart<9000)
+        await new Promise(resolve=>setTimeout(resolve,120));
+      const deviceInput=rowForDevice()?.querySelector("input");
+      if(!tab.containerEl.isConnected||!deviceInput)
+        throw Error("Native Settings Device ID input unavailable");
+      step="edit-native-device-id";
+      const newId="native-ui-"+originalId.slice(-12);
+      const setter=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,"value")?.set;
+      if(!setter)throw Error("Native input property missing");
+      setter.call(deviceInput,newId);
+      deviceInput.dispatchEvent(new Event("input",{bubbles:true}));
+      const saveStart=Date.now();
+      let saveButton;
+      while(!saveButton&&Date.now()-saveStart<6000){
+        saveButton=[...tab.containerEl.querySelectorAll("button")]
+          .find(button=>button.textContent.trim()==="Save changes");
+        if(!saveButton)await new Promise(resolve=>setTimeout(resolve,100));
+      }
+      if(!tab.isDirty()||!saveButton||saveButton.disabled)
+        throw Error("Edited Device ID did not expose Save changes");
+      step="click-native-save-changes";
+      saveButton.click();
+      const savedStart=Date.now();
+      while((plugin.settings.vault!==newId||tab.isDirty())
+        &&Date.now()-savedStart<9000)
+        await new Promise(resolve=>setTimeout(resolve,120));
+      if(plugin.settings.vault!==newId||tab.isDirty())
+        throw Error("Native UI Save did not persist Device ID");
+      if(plugin.githubClient)throw Error("Native UI Save unexpectedly configured GitHub");
+      host.close();
+      return {newDeviceId:newId,persisted:true,syncCenterOpen:true,
+        nativeSaveClicked:true,noCredentialSyncRejected:true,
         noCredentials:!(plugin.settings.githubToken||plugin.settings.githubOwner
           ||plugin.settings.githubRepo||plugin.settings.encryptionPassphrase)};
     } catch {
@@ -207,9 +260,11 @@ async function performFirstUse() {
     throw Error("Native first-use step failed")
   }
   stage = "check-native-first-use-result"
-  assert.match(report?.newDeviceId ?? "", /^device-[a-f0-9]{32}$/u)
+  assert.match(report?.newDeviceId ?? "", /^native-ui-[a-f0-9]{12}$/u)
   assert.equal(report.persisted, true)
   assert.equal(report.syncCenterOpen, true)
+  assert.equal(report.nativeSaveClicked, true)
+  assert.equal(report.noCredentialSyncRejected, true)
   assert.equal(report.noCredentials, true)
   return report.newDeviceId
 }
@@ -289,7 +344,8 @@ try {
     passed = true
     console.log(JSON.stringify({ nativeOfflineFirstUse: "PASS", installed: true,
       settingsSaved: true, deviceIdPersistedAcrossRestart: true,
-      syncCenterReady: true, noGitHubCredentials: true, remoteGitHubUsed: false,
+      syncCenterReady: true, nativeSettingsUiSave: true,
+      noCredentialSyncRejected: true, noGitHubCredentials: true, remoteGitHubUsed: false,
       syntheticNotesPreserved: true }))
   }
 } catch (error) {
