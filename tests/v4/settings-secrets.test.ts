@@ -112,6 +112,44 @@ test("D226 installed startup never rewrites legacy secrets or plugin data under 
   }
 });
 
+test("D442 fresh installations get different Device IDs while existing installations keep theirs", async () => {
+  const launch = async (persisted: unknown) => {
+    const plugin = new FastSync()
+    const writes: unknown[] = []
+    plugin.app = {
+      vault: {},
+      secretStorage: {
+        getSecret: () => null,
+        setSecret: () => { throw new Error("startup must not mutate secrets") },
+      },
+    } as never
+    plugin.loadData = async () => persisted
+    plugin.saveData = async value => { writes.push(value) }
+    await plugin.loadSettings()
+    return { settings: plugin.settings, writes }
+  }
+
+  const first = await launch(null)
+  const second = await launch(undefined)
+  assert.match(first.settings.vault, /^device-[a-f0-9]{32}$/u)
+  assert.match(second.settings.vault, /^device-[a-f0-9]{32}$/u)
+  assert.notEqual(first.settings.vault, second.settings.vault,
+    "fresh devices must not share the old static defaultVault identity")
+  assert.deepEqual(first.writes, [], "new device ID must not write plugin data until an explicit Save")
+  assert.deepEqual(second.writes, [])
+
+  const saved = await launch({ settings: { ...first.settings } })
+  assert.equal(saved.settings.vault, first.settings.vault, "saved generated ID must survive restart")
+  const legacy = await launch({ settings: { ...DEFAULT_SETTINGS, vault: "defaultVault" } })
+  assert.equal(legacy.settings.vault, "defaultVault", "existing defaultVault IDs must not change")
+  const custom = await launch({ settings: { ...DEFAULT_SETTINGS, vault: "phone-vault" } })
+  assert.equal(custom.settings.vault, "phone-vault")
+  const partial = await launch({ githubOwner: "old-owner", githubRepo: "old-repo" })
+  assert.equal(partial.settings.vault, DEFAULT_SETTINGS.vault,
+    "legacy records missing a Device ID must retain their historical fallback")
+  for (const existing of [saved, legacy, custom, partial]) assert.deepEqual(existing.writes, [])
+})
+
 test("v4 settings defaults keep sensitive scopes and modification guard disabled", () => {
   assert.equal(DEFAULT_SETTINGS.syncObsidianConfig, false);
   assert.equal(DEFAULT_SETTINGS.syncBookmarks, false);

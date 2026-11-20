@@ -486,7 +486,7 @@ export class SettingTab extends PluginSettingTab {
 
     new Setting(set)
       .setName("Device ID (this Obsidian vault)")
-      .setDesc("Local identity used for sync history and conflict copies; not the GitHub repository name. Choose a different ID on each device and keep it stable.")
+      .setDesc("Local identity for sync history and conflict copies; not the GitHub repository name. New installations receive a random Device ID; keep your saved ID stable and use a different ID on each device.")
       .addText((text) =>
         text
           .setPlaceholder("Enter a device ID (e.g., laptop-notes)")

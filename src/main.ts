@@ -447,10 +447,16 @@ export default class FastSync extends Plugin {
   }
 
   async loadSettings() {
-    const data = await this.loadData() ?? {};
-    // Backward compatibility: older versions stored settings fields directly at the top level
+    const persisted = await this.loadData();
+    const data = persisted ?? {};
+    // Backward compatibility: older versions stored settings fields directly at the top level.
     const savedSettings = data.settings ?? data;
     const merged = Object.assign({}, DEFAULT_SETTINGS, savedSettings);
+    // Only a genuinely new installation receives a unique local identity.
+    // Preserve every existing (including legacy defaultVault) ID to avoid
+    // splitting an established device's local index and conflict history.
+    // The generated ID is persisted on the user's first normal Settings Save.
+    if (persisted == null) merged.vault = this.createSecretId("device");
     // Validate persisted runtime data before any legacy secret migration writes.
     assertPluginSettingsRuntimeSafe(merged)
     this.secretStorageReadUnavailable = false
