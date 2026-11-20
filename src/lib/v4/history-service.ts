@@ -108,7 +108,11 @@ export class V4HistoryService {
   private async readJournal(journalId: string, commitSha: string): Promise<V4HistoryChange[]> {
     const first = await this.readJournalPage(journalId, 0, commitSha)
     const pages = [first]
-    for (let page = 1; page < first.pageCount; page++) pages.push(await this.readJournalPage(journalId, page, commitSha))
+    for (let page = 1; page < first.pageCount; page++) {
+      const continuation = await this.readJournalPage(journalId, page, commitSha)
+      if (continuation.pageCount !== first.pageCount) throw new Error("V4 history journal page count is inconsistent.")
+      pages.push(continuation)
+    }
     return pages.flatMap(page => page.changes.map(change => ({ ...change, source: "plugin" as const })))
   }
 
@@ -122,9 +126,20 @@ export class V4HistoryService {
       ? await decryptV4Payload(this.input.keyring!.journalKey, file.bytes, { kind: "journal", aad: `${this.input.config.repoId}:${journalId}:${page}` })
       : file.bytes
     assertV4MetadataBytes(bytes, "journal")
-    const journal = JSON.parse(bytesToUtf8(bytes)) as V4JournalPage
+    const parsed: unknown = JSON.parse(bytesToUtf8(bytes))
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("V4 history journal is malformed.")
+    }
+    const journal = parsed as Partial<V4JournalPage>
     if (journal.journalId !== journalId || journal.page !== page) throw new Error("V4 history journal identity mismatch.")
-    return journal
+    if (typeof journal.pageCount !== "number" || !Number.isSafeInteger(journal.pageCount)
+      || journal.pageCount < 1 || journal.pageCount > 256) {
+      throw new Error("V4 history journal page count exceeds the protocol limit.")
+    }
+    if (!Array.isArray(journal.changes) || journal.changes.length > 500) {
+      throw new Error("V4 history journal change count exceeds the per-page limit.")
+    }
+    return journal as V4JournalPage
   }
 
   private async diffExternalCommit(commit: V4HistoryCommit): Promise<V4HistoryChange[]> {

@@ -108,6 +108,83 @@ test("v4 history paginates 50 commits, reads journal changes, and loads preview 
   assert.equal(blobReads, 1);
 });
 
+test("D437 rejects invalid journal page counts before fetching any continuation", async () => {
+  for (const count of [0, -1, 1.5, 257, "2", null]) {
+    let reads = 0;
+    const github = {
+      async listCommits() { return []; },
+      async getFileBytes() {
+        reads++;
+        return { bytes: enc(JSON.stringify({ journalId: "j", page: 0, pageCount: count, changes: [] })), sha: "journal" };
+      },
+      async getGitCommit(): Promise<never> { throw new Error("unused"); },
+      async getTreeAt(): Promise<never> { throw new Error("unused"); },
+      async getBlob(): Promise<never> { throw new Error("unused"); },
+    };
+    const service = new V4HistoryService({ github, config: { formatVersion: V4_FORMAT_VERSION, mode: "plaintext", repoId: "o/r#main" } });
+    await assert.rejects(() => service.getCommitChanges({
+      sha: "c", message: "obsidian-sync-v4:j", authorName: "", authoredAt: "", parentShas: [],
+      source: "plugin", journalId: "j",
+    }), /journal page count/i);
+    assert.equal(reads, 1, "an invalid journal header must never trigger follow-up requests");
+  }
+});
+
+test("D437 valid two-page history remains complete", async () => {
+  const reads: string[] = [];
+  const github = {
+    async listCommits() { return []; },
+    async getFileBytes(path: string) {
+      reads.push(path);
+      const page = path.includes("000001.") ? 1 : 0;
+      const journal = {
+        journalId: "j", page, pageCount: 2,
+        changes: [{ fileId: "f", kind: "modify", path: page === 0 ? "one.md" : "two.md" }],
+      };
+      return { bytes: enc(JSON.stringify(journal)), sha: "journal" };
+    },
+    async getGitCommit(): Promise<never> { throw new Error("unused"); },
+    async getTreeAt(): Promise<never> { throw new Error("unused"); },
+    async getBlob(): Promise<never> { throw new Error("unused"); },
+  };
+  const service = new V4HistoryService({ github, config: { formatVersion: V4_FORMAT_VERSION, mode: "plaintext", repoId: "o/r#main" } });
+  const changes = await service.getCommitChanges({
+    sha: "c", message: "obsidian-sync-v4:j", authorName: "", authoredAt: "", parentShas: [],
+    source: "plugin", journalId: "j",
+  });
+  assert.deepEqual(changes.map(change => change.path), ["one.md", "two.md"]);
+  assert.equal(reads.length, 2);
+});
+
+test("D437 refuses inconsistent journal continuation and unbounded change counts", async () => {
+  for (const later of [
+    { pageCount: 3, changes: [] },
+    { pageCount: 2, changes: "invalid" },
+    { pageCount: 2, changes: Array.from({ length: 501 }, () => ({})) },
+  ]) {
+    const reads: string[] = [];
+    const github = {
+      async listCommits() { return []; },
+      async getFileBytes(path: string) {
+        reads.push(path);
+        const journal = path.includes("000001.")
+          ? { journalId: "j", page: 1, ...later }
+          : { journalId: "j", page: 0, pageCount: 2, changes: [] };
+        return { bytes: enc(JSON.stringify(journal)), sha: "journal" };
+      },
+      async getGitCommit(): Promise<never> { throw new Error("unused"); },
+      async getTreeAt(): Promise<never> { throw new Error("unused"); },
+      async getBlob(): Promise<never> { throw new Error("unused"); },
+    };
+    const service = new V4HistoryService({ github, config: { formatVersion: V4_FORMAT_VERSION, mode: "plaintext", repoId: "o/r#main" } });
+    await assert.rejects(() => service.getCommitChanges({
+      sha: "c", message: "obsidian-sync-v4:j", authorName: "", authoredAt: "", parentShas: [],
+      source: "plugin", journalId: "j",
+    }), /journal (page count|change count|changes)/i);
+    assert.equal(reads.length, 2, "do not keep reading after the first invalid continuation");
+  }
+});
+
 for (const mode of ["plaintext", "encrypted"] as const) {
   test(`v4 history previews a deleted ${mode} file from the parent commit`, async () => {
     const repoId = "o/r#main";
