@@ -230,6 +230,94 @@ async function unknownBaseFixture(mode: "plaintext" | "encrypted", localContent:
   return { github, vault, index, remoteConfig, keyring, remoteRecord, remoteBytes };
 }
 
+for (const mode of ["plaintext", "encrypted"] as const) {
+  test(`D444 copied configured Vault first normal Sync preserves identical notes and divergent local edits in ${mode}`, async () => {
+    const github = new MemoryGitHub();
+    const remoteVault = new MemoryVault();
+    remoteVault.files.set("Notes/shared.md", { bytes: enc("original content"), mtime: 100 });
+    remoteVault.files.set("Notes/untouched.md", { bytes: enc("unchanged content"), mtime: 100 });
+    const remoteConfig: V4RemoteConfig = mode === "plaintext" ? config() : {
+      formatVersion: V4_FORMAT_VERSION, mode: "encrypted", repoId: "o/r#main",
+      pathLayout: "opaque-stable-v1", algorithm: "AES-GCM", kdf: "PBKDF2-SHA-256",
+      kdfParams: { iterations: 10, salt: "c2FsdA" },
+    };
+    const keyring = mode === "encrypted"
+      ? await deriveV4Keyring({ passphrase: "correct", repoId: "o/r#main", salt: enc("salt"), iterations: 10 })
+      : undefined;
+    const remoteIndex = createEmptyV4LocalIndex({
+      repoId: "o/r#main", deviceId: "original-device", mode,
+      pathLayout: mode === "encrypted" ? "opaque-stable-v1" : "plaintext-v1",
+    });
+    const first = await new V4SyncSession({
+      github, vault: remoteVault, index: remoteIndex, config: remoteConfig, keyring,
+      conflictPolicy: "copy", abortChangePercent: 0,
+    }).sync({ operation: "normal", allowThresholdOverride: false });
+    assert.ok(first.pushedFiles >= 2);
+    const published = github.ref!.sha;
+    const commitCount = github.commits.size;
+    const originalRemoteObject = indexRecordByPath(remoteIndex, "Notes/shared.md").remotePath;
+
+    const copyNotes = () => {
+      const vault = new MemoryVault();
+      vault.files = new Map([...remoteVault.files].map(([path, file]) =>
+        [path, { bytes: new Uint8Array(file.bytes), mtime: file.mtime }]));
+      return vault;
+    };
+    const newIndex = (deviceId: string) => createEmptyV4LocalIndex({
+      repoId: "o/r#main", deviceId, mode,
+      pathLayout: mode === "encrypted" ? "opaque-stable-v1" : "plaintext-v1",
+    });
+    const clonedVault = copyNotes();
+    const clonedIndex = newIndex("second-device");
+    const noChange = await new V4SyncSession({
+      github, vault: clonedVault, index: clonedIndex, config: remoteConfig, keyring,
+      conflictPolicy: "copy", abortChangePercent: 0,
+    }).sync({ operation: "normal", allowThresholdOverride: false });
+    assert.equal(noChange.changedFiles, 0, "unchanged copied notes must not be uploaded or deleted");
+    assert.equal(github.ref!.sha, published, "identical clone must not publish a duplicate commit");
+    assert.equal(github.commits.size, commitCount);
+    assert.deepEqual([...clonedVault.files.entries()].map(([path, f]) => [path, dec(f.bytes)]),
+      [...remoteVault.files.entries()].map(([path, f]) => [path, dec(f.bytes)]));
+    assert.equal(clonedIndex.deviceId, "second-device");
+    assert.equal(clonedIndex.remoteCommitSha, published);
+    assert.equal(indexRecordByPath(clonedIndex, "Notes/shared.md").fileId,
+      indexRecordByPath(remoteIndex, "Notes/shared.md").fileId);
+
+    const changedVault = copyNotes();
+    changedVault.files.set("Notes/shared.md", { bytes: enc("second device edit"), mtime: 200 });
+    const changedIndex = newIndex("third-device");
+    await new V4SyncSession({
+      github, vault: changedVault, index: changedIndex, config: remoteConfig, keyring,
+      conflictPolicy: "copy", abortChangePercent: 0,
+    }).sync({ operation: "normal", allowThresholdOverride: false });
+    assert.equal(changedIndex.deviceId, "third-device");
+    assert.ok([...changedVault.files.values()].some(file => dec(file.bytes) === "second device edit"),
+      "the edited note from a clone with unknown base must remain locally recoverable");
+    const remoteCopy = [...changedVault.files.entries()].find(([path, file]) =>
+      path.includes(".conflict-remote-") && dec(file.bytes) === "original content");
+    assert.ok(remoteCopy, "copy policy must preserve the original GitHub version as a readable conflict copy");
+    assert.equal(dec(changedVault.files.get("Notes/shared.md")!.bytes), "second device edit");
+    assert.ok([...changedVault.files.values()].some(file => dec(file.bytes) === "unchanged content"),
+      "unchanged sibling notes must be retained");
+    assert.ok(github.files.has(originalRemoteObject), "remote shared note must still be present");
+
+    const peerVault = new MemoryVault();
+    const peerIndex = newIndex("fourth-device");
+    await new V4SyncSession({
+      github, vault: peerVault, index: peerIndex, config: remoteConfig, keyring,
+      conflictPolicy: "copy", abortChangePercent: 0,
+    }).sync({ operation: "normal", allowThresholdOverride: false });
+    assert.equal(dec(peerVault.files.get("Notes/shared.md")!.bytes), "second device edit");
+    assert.equal(dec(peerVault.files.get(remoteCopy[0])!.bytes), "original content",
+      "the previous GitHub contents must survive a second device restore");
+    assert.equal(dec(peerVault.files.get("Notes/untouched.md")!.bytes), "unchanged content");
+    if (mode === "encrypted") {
+      assert.ok([...github.files.keys()].every(path => !path.includes("Notes/shared.md") && !path.includes("Notes/untouched.md")),
+        "encrypted remote paths must never reveal note names");
+    }
+  });
+}
+
 test("D419 a fresh second device restores first published notes with normal Sync", async () => {
   for (const mode of ["plaintext", "encrypted"] as const) {
     const { github, remoteConfig, keyring } = await unknownBaseFixture(mode, null)
