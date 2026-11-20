@@ -696,21 +696,38 @@ export default class FastSync extends Plugin {
       return
     }
     await new Promise<void>((resolve) => {
-      const modal = new Modal(this.app)
       const confirmedSettings = { ...this.settings }
       const confirmedGithubClient = this.githubClient
-      // File counts alone would miss a delete-and-recreate with a different
-      // path. Compare the visible path inventory, not only its total.
-      const visibleVaultPaths = () => this.app.vault.getFiles()
+      // Bind approval to visible paths and file metadata, not just the count.
+      // Background edits can change notes while the modal is open.
+      const visibleVaultFiles = () => this.app.vault.getFiles()
         .filter(file => !file.path.startsWith(`${this.app.vault.configDir}/`))
-        .map(file => file.path)
-        .sort()
-      const confirmedLocalPaths = visibleVaultPaths()
+        .map(file => {
+          const { size, mtime } = file.stat
+          if (!Number.isFinite(size) || size < 0 || !Number.isFinite(mtime)) {
+            throw new Error("Invalid local file metadata.")
+          }
+          return { path: file.path, size, mtime }
+        })
+        .sort((a, b) => a.path.localeCompare(b.path))
+      let confirmedLocalFiles: ReturnType<typeof visibleVaultFiles>
+      try {
+        confirmedLocalFiles = visibleVaultFiles()
+      } catch {
+        new Notice("GitHub Sync: Could not inspect local vault files. Force confirmation is unavailable until the vault can be read.")
+        resolve()
+        return
+      }
+      const modal = new Modal(this.app)
       const sameVisibleVaultInventory = (): boolean => {
         try {
-          const currentPaths = visibleVaultPaths()
-          return currentPaths.length === confirmedLocalPaths.length
-            && currentPaths.every((path, index) => path === confirmedLocalPaths[index])
+          const currentFiles = visibleVaultFiles()
+          return currentFiles.length === confirmedLocalFiles.length
+            && currentFiles.every((file, index) => {
+              const confirmed = confirmedLocalFiles[index]
+              return confirmed !== undefined && file.path === confirmed.path
+                && file.size === confirmed.size && file.mtime === confirmed.mtime
+            })
         } catch {
           // Never authorize a destructive operation if the Vault inventory
           // cannot be re-observed at confirmation time.
@@ -746,7 +763,7 @@ export default class FastSync extends Plugin {
       }
       const repo = `${confirmedSettings.githubOwner}/${confirmedSettings.githubRepo}`
       const branch = confirmedSettings.githubBranch || "main"
-      const localFileCount = confirmedLocalPaths.length
+      const localFileCount = confirmedLocalFiles.length
 
       const title = operation === "forcePush" ? "Force push local vault to remote?" : "Force pull remote vault to local?";
       const message = operation === "forcePush"
@@ -799,7 +816,7 @@ export default class FastSync extends Plugin {
           resolved = true
           modal.close()
           if (!this.unloaded) {
-            new Notice("GitHub Sync: Force confirmation expired because Sync settings changed. Review the current target and confirm again.")
+            new Notice("GitHub Sync: Force confirmation expired because Sync settings or local vault files changed. Review the current target and confirm again.")
           }
           return
         }

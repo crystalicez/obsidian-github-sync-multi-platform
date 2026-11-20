@@ -740,6 +740,81 @@ test("D156 after deliberate slider confirmation Force Push/Pull failures are con
 
 
 
+test("D451 Force confirmation refuses unavailable or malformed local file metadata before opening", async () => {
+  for (const kind of ["forcePush", "forcePull"] as const) {
+    const ui = setupUi()
+    resetModalTestState()
+    Notice.messages.length = 0
+    try {
+      await ui.plugin.onload()
+      ui.setMode("resolve")
+      for (const list of [
+        () => { throw new Error("private directory failure") },
+        () => [{ path: "Notes/important.md", stat: { mtime: Number.NaN, size: 10 } }],
+      ]) {
+        ui.plugin.app.vault.getFiles = list
+        const previousNoticeCount = Notice.messages.length
+        await assert.doesNotReject(() => ui.plugin.showForceConfirm(kind))
+        assert.deepEqual(ui.attempts, [], "Force is never attempted without a valid local file inventory")
+        assert.equal(Notice.messages.length, previousNoticeCount + 1)
+        assert.match(Notice.messages.at(-1) ?? "", /Could not inspect local vault files/u)
+        assert.ok(Notice.messages.every(message => !/private directory failure/u.test(message)))
+      }
+    } finally {
+      ui.cleanup()
+      resetModalTestState()
+      Notice.messages.length = 0
+    }
+  }
+})
+
+test("D451 Force confirmation expires when a same-path local note changes before approval", async () => {
+  for (const kind of ["forcePush", "forcePull"] as const) {
+    const ui = setupUi()
+    resetModalTestState()
+    Notice.messages.length = 0
+    try {
+      await ui.plugin.onload()
+      ui.setMode("resolve")
+      let saved = { path: "Notes/important.md", stat: { mtime: 1000, size: 12 } }
+      ui.plugin.app.vault.getFiles = () => [saved]
+      const label = kind === "forcePush" ? "Force push" : "Force pull"
+      for (const edited of [
+        { path: "Notes/important.md", stat: { mtime: 1001, size: 12 } },
+        { path: "Notes/important.md", stat: { mtime: 1000, size: 13 } },
+      ]) {
+        resetModalTestState()
+        const pending = ui.plugin.showForceConfirm(kind)
+        const confirm = modalButtons.find(button => button.text === label)
+        const slider = Modal.lastCreated?.contentEl.findByClass("github-sync-force-confirm-slider")
+        assert.ok(confirm && slider)
+        assert.match(Modal.lastCreated!.contentEl.flattenText(), /Local vault files: 1/u)
+        slider.onpointerdown?.({ pointerId: 1, clientX: 300 } as PointerEvent)
+        saved = edited
+        confirm.click()
+        await pending
+        await tick()
+        assert.deepEqual(ui.attempts, [], "an edited note must not be overwritten or uploaded from a stale confirmation")
+        assert.match(Notice.messages.at(-1) ?? "", /Force confirmation expired.*local vault files changed/u)
+      }
+      resetModalTestState()
+      const valid = ui.plugin.showForceConfirm(kind)
+      const confirm = modalButtons.find(button => button.text === label)
+      const slider = Modal.lastCreated?.contentEl.findByClass("github-sync-force-confirm-slider")
+      assert.ok(confirm && slider)
+      slider.onpointerdown?.({ pointerId: 1, clientX: 300 } as PointerEvent)
+      confirm.click()
+      await valid
+      await tick()
+      assert.deepEqual(ui.attempts, [kind], "a new approval for the changed note remains possible")
+    } finally {
+      ui.cleanup()
+      resetModalTestState()
+      Notice.messages.length = 0
+    }
+  }
+})
+
 test("D158 Force confirmation refuses a swapped GitHub client or a changed visible vault inventory", async () => {
   for (const kind of ["forcePush", "forcePull"] as const) {
     const ui = setupUi()
@@ -751,6 +826,7 @@ test("D158 Force confirmation refuses a swapped GitHub client or a changed visib
       const originalClient = { id: "first-connection" }
       ui.plugin.githubClient = originalClient
       const actionLabel = kind === "forcePush" ? "Force push" : "Force pull"
+      const withStats = (path: string) => [{ path, stat: { mtime: 1000, size: 12 } }]
       const startDialog = () => {
         resetModalTestState()
         const done = ui.plugin.showForceConfirm(kind)
@@ -774,22 +850,22 @@ test("D158 Force confirmation refuses a swapped GitHub client or a changed visib
       // Count change: the displayed vault inventory was no longer accurate.
       ui.plugin.githubClient = originalClient
       const changedCount = startDialog()
-      ui.plugin.app.vault.getFiles = () => [{ path: "added.md" }]
+      ui.plugin.app.vault.getFiles = () => withStats("added.md")
       changedCount.action.click()
       await changedCount.done
       assert.deepEqual(ui.attempts, [], kind + " must reject a changed file count")
 
       // Even a same-count rename is a distinct visible vault inventory.
-      ui.plugin.app.vault.getFiles = () => [{ path: "original.md" }]
+      ui.plugin.app.vault.getFiles = () => withStats("original.md")
       const changedPaths = startDialog()
       assert.match(Modal.lastCreated!.contentEl.flattenText(), /Local vault files: 1/u)
-      ui.plugin.app.vault.getFiles = () => [{ path: "renamed.md" }]
+      ui.plugin.app.vault.getFiles = () => withStats("renamed.md")
       changedPaths.action.click()
       await changedPaths.done
       assert.deepEqual(ui.attempts, [], kind + " must reject changed file paths at equal count")
 
       // A read failure must fail closed, not authorize destructive writes.
-      ui.plugin.app.vault.getFiles = () => [{ path: "recover.md" }]
+      ui.plugin.app.vault.getFiles = () => withStats("recover.md")
       const unavailableInventory = startDialog()
       ui.plugin.app.vault.getFiles = () => { throw new Error("private path enumeration failure") }
       unavailableInventory.action.click()
@@ -799,7 +875,7 @@ test("D158 Force confirmation refuses a swapped GitHub client or a changed visib
 
       // Opening fresh confirmation against the current client and inventory
       // still allows a single intentionally authorized force operation.
-      ui.plugin.app.vault.getFiles = () => [{ path: "recover.md" }]
+      ui.plugin.app.vault.getFiles = () => withStats("recover.md")
       const valid = startDialog()
       valid.action.click()
       valid.action.click()
