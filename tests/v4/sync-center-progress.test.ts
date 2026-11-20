@@ -4,7 +4,7 @@ import test from "node:test";
 import { Notice, WorkspaceLeaf } from "obsidian";
 import { createIdleV4Progress, V4ProgressStore, type V4SyncProgressSnapshot } from "../../src/lib/v4/progress";
 import { V4SyncCenterView } from "../../src/views/sync-center";
-import { V4HistoryNotInitializedError } from "../../src/lib/v4/history-service";
+import { V4HistoryNotInitializedError, V4HistoryPreviewLimitError } from "../../src/lib/v4/history-service";
 import { waitForCondition } from "../helpers/wait-for";
 
 const uploadingFixture: V4SyncProgressSnapshot = {
@@ -73,6 +73,43 @@ function deferred<T>() {
   const promise = new Promise<T>(accept => { resolve = accept; });
   return { promise, resolve };
 }
+
+test("D456 oversized history preview explains the 5 MiB limit without suggesting a GitHub connection failure", async () => {
+  const source = new FakeProgressSource();
+  const plugin = createSyncCenterPluginFixture(source, () => undefined);
+  const commit = { sha: "old", message: "old", authoredAt: "2026-11-01", source: "plugin" as const };
+  const change = { kind: "modify" as const, path: "Notes/big.md", fileId: "file-id", source: "plugin" as const };
+  Object.assign(plugin.v4Runtime, {
+    async createHistoryService() {
+      return {
+        async listCommits() { return { items: [], hasMore: false }; },
+        async getCommitChanges() { return []; },
+        async getFileVersions() { return [{ commit, change }]; },
+        async previewChange(): Promise<never> {
+          throw new V4HistoryPreviewLimitError("private file data in an untrusted exception");
+        },
+      };
+    },
+  });
+  const beforeNotices = Notice.messages.length;
+  const view = new V4SyncCenterView(new WorkspaceLeaf(plugin.app), plugin as never);
+  try {
+    await view.onOpen();
+    view.contentEl.findByText("Current file")?.onclick?.();
+    await waitForCondition(() => view.contentEl.findByClass("github-sync-center__row") !== undefined,
+      "historical version row");
+    view.contentEl.findByClass("github-sync-center__row")?.onclick?.();
+    await waitForCondition(() => view.contentEl.flattenText().includes("Could not load history")
+      || view.contentEl.flattenText().includes("cannot be previewed"), "preview error appears");
+    assert.match(view.contentEl.flattenText(), /cannot be previewed.*5 MiB.*Vault/iu);
+    assert.doesNotMatch(view.contentEl.flattenText(), /Check the GitHub connection/iu);
+    assert.doesNotMatch(view.contentEl.flattenText(), /private file data/iu);
+    assert.equal(Notice.messages.length, beforeNotices + 1);
+  } finally {
+    await view.onClose();
+    Notice.messages.length = beforeNotices;
+  }
+});
 
 test("D454 restoring a historical Markdown note creates one separate file without overwriting or directly syncing", async () => {
   const source = new FakeProgressSource();

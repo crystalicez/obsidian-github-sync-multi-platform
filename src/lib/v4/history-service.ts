@@ -15,6 +15,13 @@ export class V4HistoryNotInitializedError extends Error {
   }
 }
 
+export class V4HistoryPreviewLimitError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = "V4HistoryPreviewLimitError"
+  }
+}
+
 export interface V4HistoryGithub {
   listCommits(options?: { page?: number; perPage?: number }): Promise<GitHubCommitSummary[]>
   getFileBytes(path: string, ref?: string): Promise<{ bytes: Uint8Array; sha: string } | null>
@@ -75,10 +82,10 @@ export class V4HistoryService {
     const descriptor = change.after ?? change.before
     if (!descriptor) return { kind: "binary", bytes: new Uint8Array() }
     if (!Number.isSafeInteger(descriptor.size) || descriptor.size < 0) {
-      throw new Error("V4 history preview has an invalid declared size.")
+      throw new V4HistoryPreviewLimitError("V4 history preview has an invalid declared size.")
     }
     if (descriptor.size > V4_HISTORY_PREVIEW_MAX_BYTES) {
-      throw new Error(`V4 history preview exceeds the ${V4_HISTORY_PREVIEW_MAX_BYTES}-byte preview limit.`)
+      throw new V4HistoryPreviewLimitError(`V4 history preview exceeds the ${V4_HISTORY_PREVIEW_MAX_BYTES}-byte preview limit.`)
     }
     const gitCommit = await this.input.github.getGitCommit(commit.sha)
     const parentSha = gitCommit.parentShas[0] ?? commit.parentShas[0]
@@ -88,23 +95,68 @@ export class V4HistoryService {
     if (tree.truncated) throw new Error("Historical Git tree is truncated; preview is unsafe.")
     const blobs = new Map(tree.tree.filter(node => node.type === "blob").map(node => [node.path, node]))
     const record = this.recordFromDescriptor(change, descriptor)
-    const maxSingleBlobBytes = V4_HISTORY_PREVIEW_MAX_BYTES
-      + (this.input.config.mode === "encrypted" ? V4_ENCRYPTED_PAYLOAD_OVERHEAD_BYTES : 0)
-    const bytes = await this.codec.read(record, async path => {
+    const encryptionOverhead = this.input.config.mode === "encrypted" ? V4_ENCRYPTED_PAYLOAD_OVERHEAD_BYTES : 0
+    const maxSingleBlobBytes = V4_HISTORY_PREVIEW_MAX_BYTES + encryptionOverhead
+    const partPaths = record.storage === "chunked" ? record.partPaths : undefined
+    let maxChunkWireBytes = V4_HISTORY_PREVIEW_MAX_BYTES
+    if (record.storage === "chunked") {
+      if (!Array.isArray(partPaths) || partPaths.length === 0 || partPaths.length > 256
+        || !partPaths.every(path => typeof path === "string" && path.length > 0)
+        || new Set(partPaths).size !== partPaths.length) {
+        throw new V4HistoryPreviewLimitError("V4 history preview part count or paths exceed the safe limit.")
+      }
+      maxChunkWireBytes += partPaths.length * encryptionOverhead
+      let remainingBytes = maxChunkWireBytes
+      for (const path of partPaths) {
+        const blob = blobs.get(path)
+        if (!blob) throw new Error(`Version blob is missing: ${path}`)
+        if (!Number.isSafeInteger(blob.size) || blob.size === undefined || blob.size < 0
+          || blob.size > remainingBytes) {
+          throw new V4HistoryPreviewLimitError("V4 history preview chunk sizes exceed the safe limit.")
+        }
+        remainingBytes -= blob.size
+      }
+    }
+    let fetchedChunkBytes = 0
+    const readBlob = async (path: string): Promise<Uint8Array> => {
       const blob = blobs.get(path)
       if (!blob) throw new Error(`Version blob is missing: ${path}`)
       if (record.storage === "single" && blob.size !== undefined
         && (!Number.isSafeInteger(blob.size) || blob.size < 0 || blob.size > maxSingleBlobBytes)) {
-        throw new Error("V4 history preview exceeds the single-blob size limit.")
+        throw new V4HistoryPreviewLimitError("V4 history preview exceeds the single-blob size limit.")
       }
       const fetched = await this.input.github.getBlob(blob.sha)
       if (record.storage === "single" && fetched.byteLength > maxSingleBlobBytes) {
-        throw new Error("V4 history preview exceeds the single-blob size limit.")
+        throw new V4HistoryPreviewLimitError("V4 history preview exceeds the single-blob size limit.")
+      }
+      if (record.storage === "chunked") {
+        fetchedChunkBytes += fetched.byteLength
+        if (fetchedChunkBytes > maxChunkWireBytes) {
+          throw new V4HistoryPreviewLimitError("V4 history preview exceeds the multipart size limit.")
+        }
       }
       return fetched
-    })
+    }
+    let bytes: Uint8Array
+    if (record.storage === "chunked") {
+      bytes = new Uint8Array(record.size)
+      let offset = 0
+      // readToSink fetches one part at a time, rather than launching all
+      // remote blob requests at once for a historical multipart preview.
+      await this.codec.readToSink({
+        record,
+        reader: readBlob,
+        sink: {
+          async append(part) { bytes.set(part, offset); offset += part.byteLength },
+          async finish() { throw new Error("History preview does not persist a stage.") },
+          async abort() {},
+        },
+      })
+    } else {
+      bytes = await this.codec.read(record, readBlob)
+    }
     if (bytes.byteLength > V4_HISTORY_PREVIEW_MAX_BYTES) {
-      throw new Error("V4 history preview exceeds the decoded content size limit.")
+      throw new V4HistoryPreviewLimitError("V4 history preview exceeds the decoded content size limit.")
     }
     const ext = extension(change.path)
     if (TEXT_EXTENSIONS.has(ext)) return { kind: "text", text: bytesToUtf8(bytes), bytes }

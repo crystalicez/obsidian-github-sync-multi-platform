@@ -5,7 +5,7 @@ import type { GitHubCreateTreeEntry } from "../../src/lib/github-git-types";
 import { V4HistoryService } from "../../src/lib/v4/history-service";
 import { createEmptyV4LocalIndex, type V4LocalIndex } from "../../src/lib/v4/local-index";
 import { expectedV4PathLayout, V4_FORMAT_VERSION, type V4RemoteConfig } from "../../src/lib/v4/protocol-types";
-import { deriveV4Keyring } from "../../src/lib/v4/crypto";
+import { deriveV4Keyring, encryptV4Payload } from "../../src/lib/v4/crypto";
 import { V4StorageCodec } from "../../src/lib/v4/storage-codec";
 import { V4SyncSession, type V4SessionVault } from "../../src/lib/v4/sync-session";
 
@@ -302,6 +302,173 @@ test("v4 encrypted history follows one fileId across file and folder renames", a
   ]);
   assert.equal(new Set(versions.map(version => (version.change.after ?? version.change.before)!.remotePath)).size, 1);
   assert.equal((versions.at(-1)!.change.after ?? versions.at(-1)!.change.before)!.remotePath, initial.remotePath);
+});
+
+test("D456 historical chunked preview rejects excessive total Git tree size before downloading parts", async () => {
+  const partPaths = ["v4/parts/000001.enc", "v4/parts/000002.enc"];
+  let reads = 0;
+  const github = {
+    async listCommits() { return []; },
+    async getFileBytes() { return null; },
+    async getGitCommit(sha: string) { return { sha, treeSha: "historical-tree", parentShas: [] }; },
+    async getTreeAt() {
+      return { sha: "historical-tree", url: "", truncated: false,
+        tree: partPaths.map((path, index) => ({
+          path, mode: "100644", type: "blob" as const, sha: `blob-${index}`,
+          size: 3 * 1024 * 1024, url: "",
+        })) };
+    },
+    async getBlob() { reads++; return enc("a"); },
+  };
+  const service = new V4HistoryService({ github, config: {
+    formatVersion: V4_FORMAT_VERSION, mode: "plaintext", repoId: "o/r#main",
+  } });
+  const commit = { sha: "history-commit", message: "", authorName: "", authoredAt: "",
+    parentShas: [], source: "plugin" as const };
+  await assert.rejects(() => service.previewChange(commit, {
+    source: "plugin", fileId: "f", kind: "modify", path: "note.md",
+    after: { storage: "chunked", remotePath: partPaths[0]!, partPaths, sha: "", size: 4 },
+  }), /history preview.*limit/iu);
+  assert.equal(reads, 0, "known oversized multipart content must not start parallel blob reads");
+});
+
+test("D456 historical chunked preview rejects pathological part counts before downloading", async () => {
+  const partPaths = Array.from({ length: 257 }, (_, i) => `large/file/part-${i}`);
+  let reads = 0;
+  const github = {
+    async listCommits() { return []; },
+    async getFileBytes() { return null; },
+    async getGitCommit(sha: string) { return { sha, treeSha: "historical-tree", parentShas: [] }; },
+    async getTreeAt() {
+      return { sha: "historical-tree", url: "", truncated: false,
+        tree: partPaths.map((path, index) => ({
+          path, mode: "100644", type: "blob" as const, sha: `blob-${index}`, size: 1, url: "",
+        })) };
+    },
+    async getBlob() { reads++; return enc("a"); },
+  };
+  const service = new V4HistoryService({ github, config: {
+    formatVersion: V4_FORMAT_VERSION, mode: "plaintext", repoId: "o/r#main",
+  } });
+  await assert.rejects(() => service.previewChange({
+    sha: "history-commit", message: "", authorName: "", authoredAt: "", parentShas: [], source: "plugin",
+  }, {
+    source: "plugin", fileId: "f", kind: "modify", path: "note.md",
+    after: { storage: "chunked", remotePath: partPaths[0]!, partPaths, sha: "", size: partPaths.length },
+  }), /history preview.*limit/iu);
+  assert.equal(reads, 0, "invalid part count must be rejected before any blob request");
+});
+
+test("D456 an underreported multipart GitHub blob stops preview before fetching other parts", async () => {
+  const partPaths = ["large/part-1", "large/part-2"];
+  const requested: string[] = [];
+  const github = {
+    async listCommits() { return []; },
+    async getFileBytes() { return null; },
+    async getGitCommit(sha: string) { return { sha, treeSha: "historical-tree", parentShas: [] }; },
+    async getTreeAt() {
+      return { sha: "historical-tree", url: "", truncated: false,
+        tree: partPaths.map((path, index) => ({
+          path, mode: "100644", type: "blob" as const, sha: `blob-${index}`, size: 1, url: "",
+        })) };
+    },
+    async getBlob(sha: string) {
+      requested.push(sha);
+      return sha === "blob-0" ? new Uint8Array(5 * 1024 * 1024 + 1) : enc("second");
+    },
+  };
+  const service = new V4HistoryService({ github, config: {
+    formatVersion: V4_FORMAT_VERSION, mode: "plaintext", repoId: "o/r#main",
+  } });
+  await assert.rejects(() => service.previewChange({
+    sha: "history-commit", message: "", authorName: "", authoredAt: "", parentShas: [], source: "plugin",
+  }, {
+    source: "plugin", fileId: "f", kind: "modify", path: "note.md",
+    after: { storage: "chunked", remotePath: partPaths[0]!, partPaths, sha: "", size: 2 },
+  }), /history preview.*limit/iu);
+  assert.deepEqual(requested, ["blob-0"], "oversized first part must not trigger more GitHub downloads");
+});
+
+test("D456 small legacy multipart note still renders as text", async () => {
+  const parts = [enc("hello "), enc("world")];
+  const partPaths = ["part/000001", "part/000002"];
+  const blobs = new Map(partPaths.map((path, index) => [`blob-${index}`, parts[index]!]));
+  let reads = 0;
+  const github = {
+    async listCommits() { return []; },
+    async getFileBytes() { return null; },
+    async getGitCommit(sha: string) { return { sha, treeSha: "historical-tree", parentShas: [] }; },
+    async getTreeAt() {
+      return { sha: "historical-tree", url: "", truncated: false,
+        tree: partPaths.map((path, index) => ({
+          path, mode: "100644", type: "blob" as const, sha: `blob-${index}`,
+          size: parts[index]!.byteLength, url: "",
+        })) };
+    },
+    async getBlob(sha: string) { reads++; return blobs.get(sha)!; },
+  };
+  const service = new V4HistoryService({ github, config: {
+    formatVersion: V4_FORMAT_VERSION, mode: "plaintext", repoId: "o/r#main",
+  } });
+  const preview = await service.previewChange({
+    sha: "history-commit", message: "", authorName: "", authoredAt: "", parentShas: [], source: "plugin",
+  }, {
+    source: "plugin", fileId: "f", kind: "modify", path: "note.md",
+    after: {
+      storage: "chunked", remotePath: partPaths[0]!, partPaths, sha: "", size: 11,
+      plaintextSha256: "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9",
+    },
+  });
+  assert.equal(preview.kind, "text");
+  if (preview.kind === "text") assert.equal(preview.text, "hello world");
+  assert.equal(reads, 2);
+});
+
+test("D456 valid encrypted multipart history still decrypts sequentially", async () => {
+  const repoId = "o/r#main";
+  const keyring = await deriveV4Keyring({ passphrase: "pass", repoId, salt: enc("salt"), iterations: 10 });
+  const config: V4RemoteConfig = {
+    formatVersion: V4_FORMAT_VERSION, mode: "encrypted", repoId,
+    pathLayout: "opaque-stable-v1", algorithm: "AES-GCM", kdf: "PBKDF2-SHA-256",
+    kdfParams: { iterations: 10, salt: "c2FsdA" },
+  };
+  const parts = [enc("hello "), enc("world")];
+  const paths = ["opaque/part-1.enc", "opaque/part-2.enc"];
+  const blobs = new Map<string, Uint8Array>();
+  for (let index = 0; index < parts.length; index++) {
+    blobs.set(`blob-${index}`, await encryptV4Payload(keyring.contentKey, parts[index]!, {
+      kind: "part", aad: `file-1:version-1:${index}`,
+    }));
+  }
+  const requested: string[] = [];
+  const github = {
+    async listCommits() { return []; },
+    async getFileBytes() { return null; },
+    async getGitCommit(sha: string) { return { sha, treeSha: "encrypted-tree", parentShas: [] }; },
+    async getTreeAt() {
+      return { sha: "encrypted-tree", url: "", truncated: false,
+        tree: paths.map((path, index) => ({
+          path, mode: "100644", type: "blob" as const, sha: `blob-${index}`,
+          size: blobs.get(`blob-${index}`)!.byteLength, url: "",
+        })) };
+    },
+    async getBlob(sha: string) { requested.push(sha); return blobs.get(sha)!; },
+  };
+  const service = new V4HistoryService({ github, config, keyring });
+  const preview = await service.previewChange({
+    sha: "history-commit", message: "", authorName: "", authoredAt: "",
+    parentShas: [], source: "plugin",
+  }, {
+    source: "plugin", fileId: "file-1", kind: "modify", path: "note.md",
+    after: {
+      storage: "chunked", remotePath: paths[0]!, partPaths: paths, sha: "",
+      remoteVersion: "version-1", size: 11,
+      plaintextSha256: "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9",
+    },
+  });
+  assert.equal(preview.kind, "text");
+  if (preview.kind === "text") assert.equal(preview.text, "hello world");
+  assert.deepEqual(requested, ["blob-0", "blob-1"]);
 });
 
 test("D453 historical preview refuses underreported file sizes before or after downloading bytes", async () => {
