@@ -518,6 +518,24 @@ export class V4SyncCenterView extends ItemView {
               const path = await createV4HistoricalMarkdownCopy(this.app.vault, change.path, commit.sha, preview.bytes)
               if (this.isCurrent(generation)) {
                 new Notice(`GitHub Sync Center: Recovered note saved as ${path}. Original note untouched.`)
+                const open = actions.createEl("button", { text: "Open recovered note" })
+                let opening = false
+                open.onclick = () => {
+                  if (opening || !this.isCurrent(generation)) return
+                  opening = true
+                  open.disabled = true
+                  void (async () => {
+                    try {
+                      await this.app.workspace.openLinkText(path, "", true)
+                    } catch {
+                      if (this.isCurrent(generation)) {
+                        opening = false
+                        open.disabled = false
+                        new Notice("GitHub Sync Center: Could not open recovered note. Find the saved file in the Vault file explorer.")
+                      }
+                    }
+                  })()
+                }
               }
             } catch {
               if (this.isCurrent(generation)) {

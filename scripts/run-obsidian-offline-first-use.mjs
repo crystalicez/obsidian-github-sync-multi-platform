@@ -323,8 +323,23 @@ async function performNativeHistoricalRecovery() {
       if(app.vault.getAbstractFileByPath("Recovered-D445-synthetic-first-use-abcdef12-3.md"))
         throw Error("Repeated recovery action created a second copy");
       if(!action.disabled)throw Error("Repeated recovery action remains enabled");
+      step="check-explicit-native-open";
+      if(app.workspace.getActiveFile()?.path===recoveredName)
+        throw Error("Restore changed the active note without consent");
+      const open=[...container.querySelectorAll("button")].find(button=>button.textContent.trim()==="Open recovered note");
+      if(!open)throw Error("Installed history recovery lacks Open recovered note");
+      open.click();
+      open.click();
+      const openedStart=Date.now();
+      while(app.workspace.getActiveFile()?.path!==recoveredName&&Date.now()-openedStart<8000)
+        await new Promise(resolve=>setTimeout(resolve,120));
+      if(app.workspace.getActiveFile()?.path!==recoveredName)
+        throw Error("Installed Open recovered note did not navigate to the saved file");
+      if(!open.disabled)throw Error("Repeated Open recovered note remains enabled");
+      if(await app.vault.read(recovered)!=="# Native historical recovery\\n")
+        throw Error("Opening recovered note changed its contents");
       if(plugin.githubClient)throw Error("Recovery created a GitHub connection");
-      return {restored:true,originalPreserved:true,collisionPreserved:true,doubleClickSafe:true};
+      return {restored:true,originalPreserved:true,collisionPreserved:true,doubleClickSafe:true,explicitOpen:true};
     }catch{return {failedAt:step}}
   })()`, 35000)
   if (result?.failedAt) {
@@ -335,6 +350,7 @@ async function performNativeHistoricalRecovery() {
   assert.equal(result.originalPreserved, true)
   assert.equal(result.collisionPreserved, true)
   assert.equal(result.doubleClickSafe, true)
+  assert.equal(result.explicitOpen, true)
 }
 
 try {
@@ -473,7 +489,8 @@ try {
       syncCenterReady: true, nativeSettingsUiSave: true,
       noCredentialSyncRejected: true, noGitHubCredentials: true, remoteGitHubUsed: false,
       syntheticNotesPreserved: true, nativeHistoryRestoreCopy: true,
-      nativeHistoryRestorePersistedAfterRestart: true }))
+      nativeHistoryRestorePersistedAfterRestart: true,
+      nativeHistoryOpenAfterRestore: true }))
   }
 } catch (error) {
   // Do not claim qualification on missing Windows Obsidian, CDP failure or startup fault.

@@ -74,6 +74,128 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
+test("D459 restored Markdown offers an explicit Open recovered note action after Vault.create succeeds", async () => {
+  const source = new FakeProgressSource();
+  const plugin = createSyncCenterPluginFixture(source, () => undefined) as any;
+  const writes: string[] = [];
+  const opened: Array<{ path: string; sourcePath: string; newLeaf: boolean }> = [];
+  plugin.app.workspace.openLinkText = async (path: string, sourcePath: string, newLeaf: boolean) => {
+    opened.push({ path, sourcePath, newLeaf });
+  };
+  plugin.app.vault = {
+    on: () => ({}), offref: () => undefined,
+    getAbstractFileByPath: () => null,
+    async create(path: string, content: string) {
+      assert.equal(content, "# Historical working copy");
+      writes.push(path);
+      return { path };
+    },
+  };
+  const commit = { sha: "abc12345-more", message: "old", authoredAt: "2026-11-01", source: "plugin" as const };
+  const change = { kind: "modify" as const, path: "Notes/project.md", fileId: "file-id", source: "plugin" as const };
+  plugin.v4Runtime.createHistoryService = async () => ({
+    async listCommits() { return { items: [], hasMore: false }; },
+    async getCommitChanges() { return []; },
+    async getFileVersions() { return [{ commit, change }]; },
+    async previewChange() {
+      const text = "# Historical working copy";
+      return { kind: "text" as const, text, bytes: new TextEncoder().encode(text) };
+    },
+  });
+  const view = new V4SyncCenterView(new WorkspaceLeaf(plugin.app), plugin);
+  const noticeStart = Notice.messages.length;
+  try {
+    await view.onOpen();
+    view.contentEl.findByText("Current file")?.onclick?.();
+    await waitForCondition(() => view.contentEl.findByClass("github-sync-center__row") !== undefined,
+      "historical version loaded");
+    view.contentEl.findByClass("github-sync-center__row")?.onclick?.();
+    await waitForCondition(() => view.contentEl.findByText("Restore as new note") !== undefined,
+      "restore button loaded");
+    assert.equal(view.contentEl.findByText("Open recovered note"), undefined,
+      "cannot open a note that has not been created");
+    view.contentEl.findByText("Restore as new note")?.onclick?.();
+    await waitForCondition(() => view.contentEl.findByText("Open recovered note") !== undefined,
+      "open button appears after successful create");
+    assert.deepEqual(writes, ["Recovered-project-abc12345.md"]);
+    assert.deepEqual(opened, [], "saving does not switch away from the active note");
+    const open = view.contentEl.findByText("Open recovered note");
+    assert.ok(open);
+    open.onclick?.();
+    await waitForCondition(() => opened.length === 1, "explicit open succeeds");
+    assert.deepEqual(opened, [
+      { path: "Recovered-project-abc12345.md", sourcePath: "", newLeaf: true },
+    ]);
+    assert.equal(writes.length, 1, "opening recovered note must not write again");
+    assert.equal(open.disabled, true, "opening twice must not create duplicate tabs");
+    open.onclick?.();
+    await Promise.resolve();
+    assert.equal(opened.length, 1, "double-clicking Open recovered note must not open two tabs");
+    await view.onClose();
+    open.onclick?.();
+    await Promise.resolve();
+    assert.equal(opened.length, 1, "opening a closed view must not act on stale recovery controls");
+  } finally {
+    await view.onClose();
+    Notice.messages.length = noticeStart;
+  }
+});
+
+test("D459 failed navigation keeps recovered file and hides private errors", async () => {
+  const source = new FakeProgressSource();
+  const plugin = createSyncCenterPluginFixture(source, () => undefined) as any;
+  let attempts = 0;
+  plugin.app.vault = {
+    on: () => ({}), offref: () => undefined,
+    getAbstractFileByPath: () => null,
+    async create(path: string) { attempts++; return { path }; },
+  };
+  let shouldFailOpening = true;
+  let openCalls = 0;
+  plugin.app.workspace.openLinkText = async () => {
+    openCalls++;
+    if (shouldFailOpening) throw new Error("private note content and token must never enter a Notice");
+  };
+  const commit = { sha: "abc12345", message: "old", authoredAt: "2026-11-01", source: "plugin" as const };
+  const change = { kind: "modify" as const, path: "Notes/project.md", fileId: "file-id", source: "plugin" as const };
+  plugin.v4Runtime.createHistoryService = async () => ({
+    async listCommits() { return { items: [], hasMore: false }; },
+    async getCommitChanges() { return []; },
+    async getFileVersions() { return [{ commit, change }]; },
+    async previewChange() {
+      return { kind: "text" as const, text: "historical", bytes: new TextEncoder().encode("historical") };
+    },
+  });
+  const view = new V4SyncCenterView(new WorkspaceLeaf(plugin.app), plugin);
+  const noticeStart = Notice.messages.length;
+  try {
+    await view.onOpen();
+    view.contentEl.findByText("Current file")?.onclick?.();
+    await waitForCondition(() => view.contentEl.findByClass("github-sync-center__row") !== undefined,
+      "historical version loaded");
+    view.contentEl.findByClass("github-sync-center__row")?.onclick?.();
+    await waitForCondition(() => view.contentEl.findByText("Restore as new note") !== undefined,
+      "restore button loaded");
+    view.contentEl.findByText("Restore as new note")?.onclick?.();
+    await waitForCondition(() => view.contentEl.findByText("Open recovered note") !== undefined,
+      "open button added");
+    const open = view.contentEl.findByText("Open recovered note");
+    open?.onclick?.();
+    await waitForCondition(() => Notice.messages.some((m, index) => index >= noticeStart && m.includes("Could not open")),
+      "opening error reported");
+    assert.ok(Notice.messages.slice(noticeStart).every(m => !m.includes("private note content")));
+    assert.equal(attempts, 1, "navigation errors must not retry Vault.create");
+    assert.equal(open?.disabled, false, "failed navigation may be retried without recovery");
+    shouldFailOpening = false;
+    open?.onclick?.();
+    await waitForCondition(() => openCalls === 2, "navigation retry succeeded");
+    assert.equal(attempts, 1);
+  } finally {
+    await view.onClose();
+    Notice.messages.length = noticeStart;
+  }
+});
+
 test("D458 malformed historical Markdown cannot be restored or copied as replacement text", async () => {
   const source = new FakeProgressSource();
   const plugin = createSyncCenterPluginFixture(source, () => undefined);
@@ -241,6 +363,8 @@ test("D454 failed, stale, or non-Markdown history recovery cannot overwrite curr
     await waitForCondition(() => Notice.messages.length > noticesBefore, "failure notice appears");
     assert.equal(writes, 1);
     assert.match(Notice.messages.at(-1) ?? "", /Could not confirm recovery/u);
+    assert.equal(view.contentEl.findByText("Open recovered note"), undefined,
+      "a failed file write cannot offer navigation to a nonexistent copy");
     assert.doesNotMatch(Notice.messages.at(-1) ?? "", /private note content/u);
     recovery?.onclick?.();
     await Promise.resolve();
