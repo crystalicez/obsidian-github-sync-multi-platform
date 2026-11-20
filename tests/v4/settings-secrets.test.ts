@@ -1992,14 +1992,14 @@ test("v4 runtime recovers after a published commit whose second local shard save
   runtime.dispose();
 });
 
-function runtimeFixture(input: { remoteConfig: V4RemoteConfig; localIndexRepoId: string; localIndexPathLayout?: V4PathLayout; cachedShard?: boolean }) {
+function runtimeFixture(input: { remoteConfig: V4RemoteConfig; localIndexRepoId: string; localIndexPathLayout?: V4PathLayout; cachedShard?: boolean; localIndexDeviceId?: string }) {
   const files = new Map<string, string>();
   const indexPath = ".obsidian/plugins/test/github-sync-v4-index/index.json";
   const shardHashes = input.cachedShard ? { aa: "legacy-hash" } : {};
   files.set(indexPath, JSON.stringify({
     formatVersion: V4_FORMAT_VERSION,
     repoId: input.localIndexRepoId,
-    deviceId: "device",
+    deviceId: input.localIndexDeviceId ?? "device",
     mode: "encrypted",
     ...(input.localIndexPathLayout ? { pathLayout: input.localIndexPathLayout } : {}),
     remoteCommitSha: "remote",
@@ -2016,13 +2016,14 @@ function runtimeFixture(input: { remoteConfig: V4RemoteConfig; localIndexRepoId:
     files.set(".obsidian/plugins/test/github-sync-v4-index/shards/aa.json", JSON.stringify({ bucket: "aa", hash: "legacy-hash", contentDigest, records }));
   }
   let vaultLists = 0;
+  let indexWrites = 0;
   const plugin = {
     app: {
       vault: {
         configDir: ".obsidian",
         adapter: {
           async read(path: string) { const value = files.get(path); if (value === undefined) throw new Error(`missing ${path}`); return value; },
-          async write(path: string, value: string) { files.set(path, value); },
+          async write(path: string, value: string) { indexWrites++; files.set(path, value); },
           async exists(path: string) { return files.has(path); },
           async mkdir(_path: string) {},
         },
@@ -2063,7 +2064,7 @@ function runtimeFixture(input: { remoteConfig: V4RemoteConfig; localIndexRepoId:
     addIgnoredFile() {},
     removeIgnoredFile() {},
   };
-  return { runtime: new V4PluginRuntime(plugin as never), plugin, get vaultLists() { return vaultLists; } };
+  return { runtime: new V4PluginRuntime(plugin as never), plugin, get vaultLists() { return vaultLists; }, get indexWrites() { return indexWrites; }, get storedDeviceId() { return (JSON.parse(files.get(indexPath)!) as { deviceId: string }).deviceId; } };
 }
 
 test("v4 runtime reuses a local index only when repository, mode, and path layout all match", async () => {
@@ -2099,6 +2100,50 @@ test("v4 runtime reuses a local index only when repository, mode, and path layou
   assert.equal(reused.generation, 1);
   assert.equal(Object.values(reused.shards.aa.records)[0].fileId, "legacy-file");
   matching.runtime.dispose();
+});
+
+test("D443 cloned configured vault rebinds local index to changed Device ID without trusting source cache or writing", async () => {
+  const remote: V4RemoteConfig = {
+    formatVersion: V4_FORMAT_VERSION, mode: "encrypted",
+    repoId: "b/r#main", pathLayout: "opaque-stable-v1",
+    algorithm: "AES-GCM", kdf: "PBKDF2-SHA-256",
+    kdfParams: { iterations: 10, salt: "c2FsdA" },
+  };
+  const fixture = runtimeFixture({
+    remoteConfig: remote,
+    localIndexRepoId: remote.repoId,
+    localIndexPathLayout: "opaque-stable-v1",
+    localIndexDeviceId: "original-device",
+    cachedShard: true,
+  });
+  const config = selectV4RuntimeConfig(remote, "encrypted", remote.repoId);
+  const load = async () => (
+    fixture.runtime as unknown as { loadIndex(config: V4RemoteConfig): Promise<V4LocalIndex> }
+  ).loadIndex(config);
+
+  try {
+    fixture.plugin.settings.vault = "original-device";
+    const original = await load();
+    assert.equal(original.deviceId, "original-device");
+    assert.equal(original.remoteCommitSha, "remote");
+    assert.equal(original.generation, 1);
+    assert.equal(Object.values(original.shards.aa.records)[0].fileId, "legacy-file");
+
+    fixture.plugin.settings.vault = "cloned-device";
+    const cloned = await load();
+    assert.equal(cloned.deviceId, "cloned-device",
+      "copied local index must not retain another device's sync identity");
+    assert.equal(cloned.remoteCommitSha, undefined,
+      "the previous device's committed state is not proof for this device");
+    assert.equal(cloned.generation, 0);
+    assert.deepEqual(cloned.shardHashes, {});
+    assert.deepEqual(cloned.shards, {});
+    assert.equal(fixture.indexWrites, 0, "index rebind is in-memory until an ordinary Sync succeeds");
+    assert.equal(fixture.storedDeviceId, "original-device", "old local index stays untouched until Sync");
+    assert.equal(fixture.vaultLists, 0, "rebind never scans or mutates personal notes");
+  } finally {
+    fixture.runtime.dispose();
+  }
 });
 
 test("v4 runtime rejects a remote repo identity mismatch before vault access or A-scoped index reuse", async () => {

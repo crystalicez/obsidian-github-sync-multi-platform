@@ -2070,7 +2070,8 @@ export class V4PluginRuntime {
   private async loadIndex(config: V4RemoteConfig, deviceId = this.plugin.settings.vault): Promise<V4LocalIndex> {
     const loaded = await loadV4LocalIndex(this.adapter, V4_INDEX_ROOT)
     const pathLayout = config.pathLayout ?? expectedV4PathLayout(config.mode)
-    if (loaded.repoId === config.repoId && loaded.mode === config.mode && loaded.pathLayout === pathLayout) return loaded
+    if (loaded.repoId === config.repoId && loaded.deviceId === deviceId
+      && loaded.mode === config.mode && loaded.pathLayout === pathLayout) return loaded
     return createEmptyV4LocalIndex({ repoId: config.repoId, deviceId: deviceId || "defaultVault", mode: config.mode, pathLayout })
   }
 
