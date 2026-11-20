@@ -1,6 +1,7 @@
 import type { GitHubCommitSummary, GitHubTree } from "../github-api"
 import { bytesToUtf8 } from "../bytes"
 import { decryptV4Payload, V4_ENCRYPTED_PAYLOAD_OVERHEAD_BYTES, type V4Keyring } from "./crypto"
+import { V4_GITHUB_REST_SAFE_WRITER_BYTES } from "./large-files"
 import { assertV4MetadataBytes } from "./metadata-bounds"
 import type { V4JournalChange, V4JournalPage, V4VersionDescriptor } from "./history-journal"
 import type { V4IndexFileRecord } from "./local-index"
@@ -121,11 +122,20 @@ export class V4HistoryService {
     const readBlob = async (path: string): Promise<Uint8Array> => {
       const blob = blobs.get(path)
       if (!blob) throw new Error(`Version blob is missing: ${path}`)
+      if (record.storage === "pack"
+        && (!Number.isSafeInteger(blob.size) || blob.size === undefined
+          || blob.size < V4_ENCRYPTED_PAYLOAD_OVERHEAD_BYTES
+          || blob.size > V4_GITHUB_REST_SAFE_WRITER_BYTES)) {
+        throw new V4HistoryPreviewLimitError("V4 history preview pack exceeds the 8 MiB safe transport limit or has invalid size metadata.")
+      }
       if (record.storage === "single" && blob.size !== undefined
         && (!Number.isSafeInteger(blob.size) || blob.size < 0 || blob.size > maxSingleBlobBytes)) {
         throw new V4HistoryPreviewLimitError("V4 history preview exceeds the single-blob size limit.")
       }
       const fetched = await this.input.github.getBlob(blob.sha)
+      if (record.storage === "pack" && fetched.byteLength > V4_GITHUB_REST_SAFE_WRITER_BYTES) {
+        throw new V4HistoryPreviewLimitError("V4 history preview pack exceeds the 8 MiB safe transport limit.")
+      }
       if (record.storage === "single" && fetched.byteLength > maxSingleBlobBytes) {
         throw new V4HistoryPreviewLimitError("V4 history preview exceeds the single-blob size limit.")
       }

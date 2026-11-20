@@ -551,7 +551,7 @@ export class V4SyncCenterView extends ItemView {
   private releaseObjectUrl(): void { if (this.objectUrl) URL.revokeObjectURL(this.objectUrl); this.objectUrl = undefined }
   private renderError(container: HTMLElement, error: unknown): void {
     if (error instanceof V4HistoryPreviewLimitError) {
-      const message = "This version cannot be previewed: its content or part metadata exceeds the safe 5 MiB preview limit. No Vault or GitHub files were changed."
+      const message = "This version cannot be previewed: decoded content is limited to 5 MiB and encrypted Pack archives to 8 MiB. The file or its remote size metadata exceeds a safe preview limit. No Vault or GitHub files were changed."
       container.empty()
       container.createEl("p", { text: message, cls: "github-sync-center__muted" })
       new Notice(`GitHub Sync Center: ${message}`)

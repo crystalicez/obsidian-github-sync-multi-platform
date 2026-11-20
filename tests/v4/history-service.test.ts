@@ -304,6 +304,118 @@ test("v4 encrypted history follows one fileId across file and folder renames", a
   assert.equal((versions.at(-1)!.change.after ?? versions.at(-1)!.change.before)!.remotePath, initial.remotePath);
 });
 
+test("D457 packed history refuses a Git tree blob above the 8 MiB preview transport limit before fetch", async () => {
+  const repoId = "o/r#main";
+  const keyring = await deriveV4Keyring({ passphrase: "test-passphrase", repoId, salt: enc("salt"), iterations: 10 });
+  let blobReads = 0;
+  const path = ".obsidian-github-sync-v4/packs/test.enc";
+  const github = {
+    async listCommits() { return []; },
+    async getFileBytes() { return null; },
+    async getGitCommit(sha: string) { return { sha, treeSha: "historical-tree", parentShas: [] }; },
+    async getTreeAt() { return { sha: "historical-tree", url: "", truncated: false,
+      tree: [{ path, mode: "100644", type: "blob" as const, sha: "pack-blob", size: 8 * 1024 * 1024 + 1, url: "" }] }; },
+    async getBlob() { blobReads++; return enc("unused"); },
+  };
+  const service = new V4HistoryService({ github, config: {
+    formatVersion: V4_FORMAT_VERSION, mode: "encrypted", repoId, pathLayout: "opaque-stable-v1",
+  }, keyring });
+  await assert.rejects(() => service.previewChange({
+    sha: "c", message: "", authorName: "", authoredAt: "", parentShas: [], source: "plugin",
+  }, {
+    source: "plugin", fileId: "note", kind: "modify", path: "note.md",
+    after: { storage: "pack", remotePath: path, packId: "pack-1", sha: "pack-blob", size: 10 },
+  }), /history preview.*(pack|limit)/iu);
+  assert.equal(blobReads, 0, "oversized historical packs are never downloaded for preview");
+});
+
+test("D457 packed history fails closed when Git tree size is absent or invalid", async () => {
+  const repoId = "o/r#main";
+  const keyring = await deriveV4Keyring({ passphrase: "test-passphrase", repoId, salt: enc("salt"), iterations: 10 });
+  for (const size of [undefined, -1, Number.NaN, Number.POSITIVE_INFINITY, 1.5]) {
+    let blobReads = 0;
+    const path = ".obsidian-github-sync-v4/packs/test.enc";
+    const github = {
+      async listCommits() { return []; },
+      async getFileBytes() { return null; },
+      async getGitCommit(sha: string) { return { sha, treeSha: "historical-tree", parentShas: [] }; },
+      async getTreeAt() { return { sha: "historical-tree", url: "", truncated: false,
+        tree: [{ path, mode: "100644", type: "blob" as const, sha: "pack-blob", size, url: "" }] }; },
+      async getBlob() { blobReads++; return enc("unused"); },
+    };
+    const service = new V4HistoryService({ github, config: {
+      formatVersion: V4_FORMAT_VERSION, mode: "encrypted", repoId, pathLayout: "opaque-stable-v1",
+    }, keyring });
+    await assert.rejects(() => service.previewChange({
+      sha: "c", message: "", authorName: "", authoredAt: "", parentShas: [], source: "plugin",
+    }, {
+      source: "plugin", fileId: "note", kind: "modify", path: "note.md",
+      after: { storage: "pack", remotePath: path, packId: "pack-1", sha: "pack-blob", size: 10 },
+    }), /history preview.*(pack|limit)/iu);
+    assert.equal(blobReads, 0, "unknown or invalid packed blob size cannot authorize download");
+  }
+});
+
+test("D457 packed history rejects a Blob response larger than its reported Git tree size", async () => {
+  const repoId = "o/r#main";
+  const keyring = await deriveV4Keyring({ passphrase: "test-passphrase", repoId, salt: enc("salt"), iterations: 10 });
+  let blobReads = 0;
+  const path = ".obsidian-github-sync-v4/packs/test.enc";
+  const github = {
+    async listCommits() { return []; },
+    async getFileBytes() { return null; },
+    async getGitCommit(sha: string) { return { sha, treeSha: "historical-tree", parentShas: [] }; },
+    async getTreeAt() { return { sha: "historical-tree", url: "", truncated: false,
+      tree: [{ path, mode: "100644", type: "blob" as const, sha: "pack-blob", size: 100, url: "" }] }; },
+    async getBlob() { blobReads++; return new Uint8Array(8 * 1024 * 1024 + 1); },
+  };
+  const service = new V4HistoryService({ github, config: {
+    formatVersion: V4_FORMAT_VERSION, mode: "encrypted", repoId, pathLayout: "opaque-stable-v1",
+  }, keyring });
+  await assert.rejects(() => service.previewChange({
+    sha: "c", message: "", authorName: "", authoredAt: "", parentShas: [], source: "plugin",
+  }, {
+    source: "plugin", fileId: "note", kind: "modify", path: "note.md",
+    after: { storage: "pack", remotePath: path, packId: "pack-1", sha: "pack-blob", size: 10 },
+  }), /history preview.*(pack|limit)/iu);
+  assert.equal(blobReads, 1, "one mismatched transport response can be buffered but not decoded");
+});
+
+test("D457 valid encrypted packed note remains previewable with sibling notes in its archive", async () => {
+  const repoId = "o/r#main";
+  const keyring = await deriveV4Keyring({ passphrase: "test-passphrase", repoId, salt: enc("salt"), iterations: 10 });
+  const config: V4RemoteConfig = {
+    formatVersion: V4_FORMAT_VERSION, mode: "encrypted", repoId, pathLayout: "opaque-stable-v1",
+  };
+  const codec = new V4StorageCodec({ mode: "encrypted", pathLayout: "opaque-stable-v1", keyring });
+  const first = await codec.prepare("Notes/important.md", enc("# Recovered from history"), "v1", 1, "first-file");
+  const second = await codec.prepare("Notes/other.md", enc("other private note"), "v1", 1, "second-file");
+  const packed = await codec.preparePack("pack-history-1", [
+    { record: first.record, plaintext: enc("# Recovered from history") },
+    { record: second.record, plaintext: enc("other private note") },
+  ]);
+  let blobReads = 0;
+  const github = {
+    async listCommits() { return []; },
+    async getFileBytes() { return null; },
+    async getGitCommit(sha: string) { return { sha, treeSha: "historical-tree", parentShas: [] }; },
+    async getTreeAt() { return { sha: "historical-tree", url: "", truncated: false,
+      tree: [{ path: packed.file.path, mode: "100644", type: "blob" as const,
+        sha: "pack-blob", size: packed.file.bytes.byteLength, url: "" }] }; },
+    async getBlob() { blobReads++; return packed.file.bytes; },
+  };
+  const service = new V4HistoryService({ github, config, keyring });
+  const preview = await service.previewChange({
+    sha: "c", message: "", authorName: "", authoredAt: "", parentShas: [], source: "plugin",
+  }, {
+    source: "plugin", fileId: "first-file", kind: "modify", path: "Notes/important.md",
+    after: { ...packed.records[0]!, sha: "pack-blob" },
+  });
+  assert.equal(preview.kind, "text");
+  if (preview.kind === "text") assert.equal(preview.text, "# Recovered from history");
+  assert.equal(blobReads, 1, "history retrieves a single packed archive on demand");
+});
+
 test("D456 historical chunked preview rejects excessive total Git tree size before downloading parts", async () => {
   const partPaths = ["v4/parts/000001.enc", "v4/parts/000002.enc"];
   let reads = 0;

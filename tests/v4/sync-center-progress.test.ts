@@ -101,7 +101,7 @@ test("D456 oversized history preview explains the 5 MiB limit without suggesting
     view.contentEl.findByClass("github-sync-center__row")?.onclick?.();
     await waitForCondition(() => view.contentEl.flattenText().includes("Could not load history")
       || view.contentEl.flattenText().includes("cannot be previewed"), "preview error appears");
-    assert.match(view.contentEl.flattenText(), /cannot be previewed.*5 MiB.*Vault/iu);
+    assert.match(view.contentEl.flattenText(), /cannot be previewed.*5 MiB.*8 MiB.*Vault/iu);
     assert.doesNotMatch(view.contentEl.flattenText(), /Check the GitHub connection/iu);
     assert.doesNotMatch(view.contentEl.flattenText(), /private file data/iu);
     assert.equal(Notice.messages.length, beforeNotices + 1);
