@@ -247,7 +247,7 @@ async function performFirstUse() {
         throw Error("Native UI Save did not persist Device ID");
       if(plugin.githubClient)throw Error("Native UI Save unexpectedly configured GitHub");
       host.close();
-      return {newDeviceId:newId,persisted:true,syncCenterOpen:true,
+      return {generatedDeviceId:originalId,newDeviceId:newId,persisted:true,syncCenterOpen:true,
         nativeSaveClicked:true,noCredentialSyncRejected:true,
         noCredentials:!(plugin.settings.githubToken||plugin.settings.githubOwner
           ||plugin.settings.githubRepo||plugin.settings.encryptionPassphrase)};
@@ -260,13 +260,14 @@ async function performFirstUse() {
     throw Error("Native first-use step failed")
   }
   stage = "check-native-first-use-result"
+  assert.match(report?.generatedDeviceId ?? "", /^device-[a-f0-9]{32}$/u)
   assert.match(report?.newDeviceId ?? "", /^native-ui-[a-f0-9]{12}$/u)
   assert.equal(report.persisted, true)
   assert.equal(report.syncCenterOpen, true)
   assert.equal(report.nativeSaveClicked, true)
   assert.equal(report.noCredentialSyncRejected, true)
   assert.equal(report.noCredentials, true)
-  return report.newDeviceId
+  return { generatedDeviceId: report.generatedDeviceId, savedDeviceId: report.newDeviceId }
 }
 
 try {
@@ -319,7 +320,8 @@ try {
       assert.equal("githubToken" in earlySettings, false)
       assert.equal("encryptionPassphrase" in earlySettings, false)
     }
-    const originalDeviceId = await performFirstUse()
+    const firstInstall = await performFirstUse()
+    const originalDeviceId = firstInstall.savedDeviceId
     stage = "check-saved-disk"
     const disk = JSON.parse(await readFile(beforePath, "utf8"))
     assert.equal(disk.settings?.vault ?? disk.vault, originalDeviceId,
@@ -341,9 +343,59 @@ try {
     assert.equal(reloaded.noCredentials, true)
     const note = await readFile(path.join(vault, "D445-synthetic-first-use.md"), "utf8")
     assert.equal(note, "# D445 offline installation test\nNo GitHub account configured.\n")
+
+    // D448: A second *fresh* profile/vault must not inherit the first one's
+    // random identity. Each installation uses the real native UI and restart.
+    stage = "prepare-independent-second-install"
+    stopOwnedProcess()
+    await sleep(850)
+    const peerVault = path.join(runRoot, "peer-vault")
+    const peerProfile = path.join(runRoot, "peer-profile")
+    const peerPluginDir = path.join(peerVault, ".obsidian", "plugins", pluginId)
+    await mkdir(peerPluginDir, { recursive: true })
+    await mkdir(peerProfile)
+    for (const filename of ["main.js", "manifest.json", "styles.css"]) {
+      await copyFile(path.join(root, filename), path.join(peerPluginDir, filename))
+    }
+    await writeFile(path.join(peerVault, ".obsidian", "community-plugins.json"),
+      JSON.stringify([pluginId]) + "\n")
+    await writeFile(path.join(peerProfile, "obsidian.json"),
+      JSON.stringify({ vaults: { d448second: {
+        path: peerVault, ts: Date.now(), open: true,
+      } } }) + "\n")
+    await writeFile(path.join(peerVault, "D445-synthetic-first-use.md"),
+      "# D445 offline installation test\nNo GitHub account configured.\n")
+
+    stage = "independent-second-native-launch"
+    await launch(peerProfile, peerVault)
+    const secondInstall = await performFirstUse()
+    assert.notEqual(secondInstall.generatedDeviceId, firstInstall.generatedDeviceId,
+      "Separate native installations must have different initial Device IDs")
+    assert.notEqual(secondInstall.savedDeviceId, originalDeviceId,
+      "Separate native Settings Saves must retain independent device identities")
+    stage = "verify-independent-second-settings"
+    const peerDisk = JSON.parse(await readFile(path.join(peerPluginDir, "data.json"), "utf8"))
+    assert.equal(peerDisk.settings?.vault ?? peerDisk.vault, secondInstall.savedDeviceId,
+      "Second native installation did not save its own Device ID")
+    stopOwnedProcess()
+    await sleep(850)
+    stage = "independent-second-native-restart"
+    await launch(peerProfile, peerVault)
+    const peerReloaded = await evaluate(`(()=>{
+      const plugin=app.plugins.plugins[${JSON.stringify(pluginId)}];
+      return { deviceId:plugin.settings.vault,
+        noCredentials:!(plugin.settings.githubToken||plugin.settings.githubOwner
+          ||plugin.settings.githubRepo||plugin.settings.encryptionPassphrase) };
+    })()`)
+    assert.equal(peerReloaded?.deviceId, secondInstall.savedDeviceId,
+      "Second native installation lost its own Device ID on restart")
+    assert.equal(peerReloaded.noCredentials, true)
+    const peerNote = await readFile(path.join(peerVault, "D445-synthetic-first-use.md"), "utf8")
+    assert.equal(peerNote, "# D445 offline installation test\nNo GitHub account configured.\n")
     passed = true
     console.log(JSON.stringify({ nativeOfflineFirstUse: "PASS", installed: true,
       settingsSaved: true, deviceIdPersistedAcrossRestart: true,
+      nativeIndependentInstallations: 2, distinctGeneratedDeviceIds: true,
       syncCenterReady: true, nativeSettingsUiSave: true,
       noCredentialSyncRejected: true, noGitHubCredentials: true, remoteGitHubUsed: false,
       syntheticNotesPreserved: true }))
