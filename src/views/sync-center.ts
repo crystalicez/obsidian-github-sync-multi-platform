@@ -515,7 +515,7 @@ export class V4SyncCenterView extends ItemView {
           restore.disabled = true
           void (async () => {
             try {
-              const path = await createV4HistoricalMarkdownCopy(this.app.vault, change.path, commit.sha, preview.text)
+              const path = await createV4HistoricalMarkdownCopy(this.app.vault, change.path, commit.sha, preview.bytes)
               if (this.isCurrent(generation)) {
                 new Notice(`GitHub Sync Center: Recovered note saved as ${path}. Original note untouched.`)
               }
@@ -533,6 +533,13 @@ export class V4SyncCenterView extends ItemView {
     if (preview.kind === "image") {
       this.objectUrl = URL.createObjectURL(new Blob([preview.bytes as BlobPart], { type: preview.mime }))
       container.createEl("img", { attr: { src: this.objectUrl, alt: "Historical version preview" } })
+      return
+    }
+    if (/\.md$/iu.test(change.path)) {
+      container.createEl("p", {
+        text: "This Markdown version is not readable as UTF-8. Text copy and restore are unavailable to avoid changing the original bytes.",
+        cls: "github-sync-center__muted",
+      })
       return
     }
     container.createEl("p", { text: `Binary file · ${preview.bytes.byteLength.toLocaleString()} bytes` })

@@ -10,10 +10,17 @@ export async function createV4HistoricalMarkdownCopy(
   vault: RecoveryVault,
   originalPath: string,
   commitSha: string,
-  content: string,
+  bytes: Uint8Array,
 ): Promise<string> {
   const basename = originalPath.split("/").at(-1) ?? ""
   if (!/\.md$/iu.test(basename)) throw new Error("Only Markdown history can be restored as a note.")
+
+  let content: string
+  try {
+    content = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes)
+  } catch {
+    throw new Error("Historical Markdown is not valid UTF-8; no recovery file was created.")
+  }
 
   const stem = basename.slice(0, -3).normalize("NFC")
     .replace(/[^\p{L}\p{N}\p{M}_-]/gu, "-")

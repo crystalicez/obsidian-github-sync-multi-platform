@@ -74,6 +74,47 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
+test("D458 malformed historical Markdown cannot be restored or copied as replacement text", async () => {
+  const source = new FakeProgressSource();
+  const plugin = createSyncCenterPluginFixture(source, () => undefined);
+  const commit = { sha: "old", message: "old", authoredAt: "2026-11-01", source: "plugin" as const };
+  const change = { kind: "modify" as const, path: "Notes/important.md", fileId: "file-id", source: "plugin" as const };
+  let writes = 0;
+  Object.assign(plugin.app, {
+    vault: {
+      on: () => ({}), offref: () => undefined,
+      async create() { writes++; throw new Error("unexpected write"); },
+    },
+  });
+  Object.assign(plugin.v4Runtime, {
+    async createHistoryService() {
+      return {
+        async listCommits() { return { items: [], hasMore: false }; },
+        async getCommitChanges() { return []; },
+        async getFileVersions() { return [{ commit, change }]; },
+        async previewChange() {
+          return { kind: "binary" as const, bytes: new Uint8Array([0x23, 0x20, 0xff]) };
+        },
+      };
+    },
+  });
+  const view = new V4SyncCenterView(new WorkspaceLeaf(plugin.app), plugin as never);
+  try {
+    await view.onOpen();
+    view.contentEl.findByText("Current file")?.onclick?.();
+    await waitForCondition(() => view.contentEl.findByClass("github-sync-center__row") !== undefined,
+      "malformed historical Markdown version appears");
+    view.contentEl.findByClass("github-sync-center__row")?.onclick?.();
+    await waitForCondition(() => view.contentEl.flattenText().includes("not readable as UTF-8"),
+      "unsupported Markdown encoding is explained");
+    assert.equal(view.contentEl.findByText("Restore as new note"), undefined);
+    assert.equal(view.contentEl.findByText("Copy version text"), undefined);
+    assert.equal(writes, 0);
+  } finally {
+    await view.onClose();
+  }
+});
+
 test("D456 oversized history preview explains the 5 MiB limit without suggesting a GitHub connection failure", async () => {
   const source = new FakeProgressSource();
   const plugin = createSyncCenterPluginFixture(source, () => undefined);

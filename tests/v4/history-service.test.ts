@@ -304,6 +304,80 @@ test("v4 encrypted history follows one fileId across file and folder renames", a
   assert.equal((versions.at(-1)!.change.after ?? versions.at(-1)!.change.before)!.remotePath, initial.remotePath);
 });
 
+test("D458 historical Markdown preview never silently replaces invalid UTF-8 or removes a BOM", async () => {
+  for (const [label, original] of [
+    ["invalid", new Uint8Array([0x23, 0x20, 0xff, 0x0a])],
+    ["bom", new Uint8Array([0xef, 0xbb, 0xbf, 0x23, 0x20, 0x41, 0x0a])],
+  ] as const) {
+    const github = {
+      async listCommits() { return []; },
+      async getFileBytes() { return null; },
+      async getGitCommit(sha: string) { return { sha, treeSha: "history-tree", parentShas: [] }; },
+      async getTreeAt() { return { sha: "history-tree", url: "", truncated: false,
+        tree: [{ path: "Notes/important.md", mode: "100644", type: "blob" as const,
+          sha: "historical-blob", size: original.byteLength, url: "" }] }; },
+      async getBlob() { return original; },
+    };
+    const service = new V4HistoryService({ github, config: {
+      formatVersion: V4_FORMAT_VERSION, mode: "plaintext", repoId: "o/r#main",
+    } });
+    const preview = await service.previewChange({
+      sha: "history-commit", message: "", authorName: "", authoredAt: "",
+      parentShas: [], source: "plugin",
+    }, {
+      source: "plugin", fileId: "file-1", kind: "modify", path: "Notes/important.md",
+      after: { storage: "single", remotePath: "Notes/important.md", sha: "historical-blob",
+        size: original.byteLength },
+    });
+    if (label === "invalid") {
+      assert.equal(preview.kind, "binary", "malformed UTF-8 cannot offer text-copy or Markdown restore");
+    } else {
+      assert.equal(preview.kind, "text");
+      if (preview.kind === "text") {
+        assert.deepEqual(new TextEncoder().encode(preview.text), original,
+          "UTF-8 BOM and line endings must survive history decoding");
+      }
+    }
+  }
+});
+
+test("D458 encrypted historical Markdown keeps valid BOM bytes and blocks invalid UTF-8", async () => {
+  const repoId = "o/r#main";
+  const keyring = await deriveV4Keyring({ passphrase: "pass", repoId, salt: enc("salt"), iterations: 10 });
+  const codec = new V4StorageCodec({ mode: "encrypted", pathLayout: "opaque-stable-v1", keyring });
+  for (const [label, plaintext] of [
+    ["bom", new Uint8Array([0xef, 0xbb, 0xbf, 0x23, 0x20, 0x41, 0x0a])],
+    ["invalid", new Uint8Array([0x23, 0x20, 0xff])],
+  ] as const) {
+    const prepared = await codec.prepare("Notes/important.md", plaintext, "v1", 1, "file-1");
+    const stored = prepared.files[0]!;
+    const github = {
+      async listCommits() { return []; },
+      async getFileBytes() { return null; },
+      async getGitCommit(sha: string) { return { sha, treeSha: "history-tree", parentShas: [] }; },
+      async getTreeAt() { return { sha: "history-tree", url: "", truncated: false,
+        tree: [{ path: stored.path, mode: "100644", type: "blob" as const, sha: "encrypted-blob",
+          size: stored.bytes.byteLength, url: "" }] }; },
+      async getBlob() { return stored.bytes; },
+    };
+    const service = new V4HistoryService({ github, config: {
+      formatVersion: V4_FORMAT_VERSION, mode: "encrypted", repoId, pathLayout: "opaque-stable-v1",
+    }, keyring });
+    const preview = await service.previewChange({
+      sha: "history-commit", message: "", authorName: "", authoredAt: "",
+      parentShas: [], source: "plugin",
+    }, {
+      source: "plugin", fileId: "file-1", kind: "modify", path: "Notes/important.md",
+      after: { ...prepared.record, sha: "encrypted-blob" },
+    });
+    if (label === "invalid") assert.equal(preview.kind, "binary");
+    else {
+      assert.equal(preview.kind, "text");
+      if (preview.kind === "text") assert.deepEqual(new TextEncoder().encode(preview.text), plaintext);
+    }
+  }
+});
+
 test("D457 packed history refuses a Git tree blob above the 8 MiB preview transport limit before fetch", async () => {
   const repoId = "o/r#main";
   const keyring = await deriveV4Keyring({ passphrase: "test-passphrase", repoId, salt: enc("salt"), iterations: 10 });

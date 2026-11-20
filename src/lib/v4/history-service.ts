@@ -169,7 +169,14 @@ export class V4HistoryService {
       throw new V4HistoryPreviewLimitError("V4 history preview exceeds the decoded content size limit.")
     }
     const ext = extension(change.path)
-    if (TEXT_EXTENSIONS.has(ext)) return { kind: "text", text: bytesToUtf8(bytes), bytes }
+    if (TEXT_EXTENSIONS.has(ext)) {
+      try {
+        const text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes)
+        return { kind: "text", text, bytes }
+      } catch {
+        return { kind: "binary", bytes }
+      }
+    }
     if (IMAGE_MIME[ext]) return { kind: "image", mime: IMAGE_MIME[ext], bytes }
     return { kind: "binary", bytes }
   }
