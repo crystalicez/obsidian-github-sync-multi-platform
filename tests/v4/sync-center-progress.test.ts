@@ -74,6 +74,115 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
+test("D454 restoring a historical Markdown note creates one separate file without overwriting or directly syncing", async () => {
+  const source = new FakeProgressSource();
+  const plugin = createSyncCenterPluginFixture(source, () => undefined) as any;
+  const files = new Map<string, string>([
+    ["Notes/project.md", "# Current unsaved edits"],
+    ["Recovered-project-abc12345.md", "# Existing recovery"],
+  ]);
+  const writes: string[] = [];
+  const syncCalls: string[] = [];
+  plugin.app.vault = {
+    on: () => ({}), offref: () => undefined,
+    getAbstractFileByPath: (path: string) => files.has(path) ? { path } : null,
+    async create(path: string, content: string) {
+      if (files.has(path)) throw new Error("Already exists");
+      files.set(path, content);
+      writes.push(path);
+      return { path };
+    },
+  };
+  plugin.runManualSyncFromUi = () => { syncCalls.push("sync"); };
+  const commit = { sha: "abc12345-more", message: "old", authoredAt: "2026-11-01", source: "plugin" as const };
+  const change = { kind: "modify" as const, path: "Notes/project.md", fileId: "file-id", source: "plugin" as const };
+  plugin.v4Runtime.createHistoryService = async () => ({
+    async listCommits() { return { items: [], hasMore: false }; },
+    async getCommitChanges() { return []; },
+    async getFileVersions() { return [{ commit, change }]; },
+    async previewChange() { return { kind: "text" as const, text: "# Historical safe copy", bytes: new TextEncoder().encode("# Historical safe copy") }; },
+  });
+  const noticesBefore = Notice.messages.length;
+  const view = new V4SyncCenterView(new WorkspaceLeaf(plugin.app), plugin);
+  try {
+    await view.onOpen();
+    view.contentEl.findByText("Current file")?.onclick?.();
+    await waitForCondition(() => view.contentEl.findByClass("github-sync-center__row") !== undefined, "historical markdown row");
+    view.contentEl.findByClass("github-sync-center__row")?.onclick?.();
+    await waitForCondition(() => view.contentEl.findByText("Restore as new note") !== undefined, "markdown recovery action");
+    assert.deepEqual(writes, [], "opening and previewing history cannot write to Vault");
+    const restore = view.contentEl.findByText("Restore as new note");
+    assert.ok(restore);
+    restore.onclick?.();
+    restore.onclick?.();
+    await waitForCondition(() => writes.length === 1, "one historical recovery copy is created");
+    restore.onclick?.();
+    await Promise.resolve();
+    assert.deepEqual(writes, ["Recovered-project-abc12345-2.md"], "existing recovery file is not overwritten or duplicated");
+    assert.equal(restore.disabled, true, "one preview authorizes at most one recovery creation");
+    assert.equal(files.get("Recovered-project-abc12345-2.md"), "# Historical safe copy");
+    assert.equal(files.get("Notes/project.md"), "# Current unsaved edits");
+    assert.equal(files.get("Recovered-project-abc12345.md"), "# Existing recovery");
+    assert.deepEqual(syncCalls, [], "recovery does not call manual or Force Sync");
+    await waitForCondition(() => Notice.messages.length > noticesBefore, "recovery confirmation appears");
+    assert.match(Notice.messages.at(-1) ?? "", /Recovered-project-abc12345-2\.md/u);
+    assert.doesNotMatch(Notice.messages.at(-1) ?? "", /Historical safe copy/u);
+  } finally {
+    await view.onClose();
+    Notice.messages.length = noticesBefore;
+  }
+});
+
+test("D454 failed, stale, or non-Markdown history recovery cannot overwrite current notes", async () => {
+  const source = new FakeProgressSource();
+  const plugin = createSyncCenterPluginFixture(source, () => undefined) as any;
+  let writes = 0;
+  plugin.app.vault = {
+    on: () => ({}), offref: () => undefined,
+    getAbstractFileByPath: () => null,
+    async create() { writes++; throw new Error("private note content must not be logged"); },
+  };
+  const commit = { sha: "abc12345", message: "old", authoredAt: "2026-11-01", source: "plugin" as const };
+  const change = { kind: "modify" as const, path: "Notes/project.md", fileId: "file-id", source: "plugin" as const };
+  plugin.v4Runtime.createHistoryService = async () => ({
+    async listCommits() { return { items: [], hasMore: false }; },
+    async getCommitChanges() { return []; },
+    async getFileVersions() { return [{ commit, change }]; },
+    async previewChange() { return { kind: "text" as const, text: "# Historical", bytes: new Uint8Array([1]) }; },
+  });
+  const noticesBefore = Notice.messages.length;
+  const view = new V4SyncCenterView(new WorkspaceLeaf(plugin.app), plugin);
+  try {
+    await view.onOpen();
+    view.contentEl.findByText("Current file")?.onclick?.();
+    await waitForCondition(() => view.contentEl.findByClass("github-sync-center__row") !== undefined, "version available");
+    view.contentEl.findByClass("github-sync-center__row")?.onclick?.();
+    await waitForCondition(() => view.contentEl.findByText("Restore as new note") !== undefined, "recovery offered");
+    const recovery = view.contentEl.findByText("Restore as new note");
+    recovery?.onclick?.();
+    await waitForCondition(() => Notice.messages.length > noticesBefore, "failure notice appears");
+    assert.equal(writes, 1);
+    assert.match(Notice.messages.at(-1) ?? "", /Could not confirm recovery/u);
+    assert.doesNotMatch(Notice.messages.at(-1) ?? "", /private note content/u);
+    recovery?.onclick?.();
+    await Promise.resolve();
+    assert.equal(writes, 1, "ambiguous failed file creation must not be automatically retried");
+
+    await view.onClose();
+    recovery?.onclick?.();
+    await Promise.resolve();
+    assert.equal(writes, 1, "old view controls cannot write a file after closing");
+    await view.onOpen();
+    await (view as any).renderPreview(commit, { ...change, path: "Notes/settings.json" },
+      view.contentEl.findByClass("github-sync-center__detail"));
+    assert.equal(view.contentEl.findByText("Restore as new note"), undefined,
+      "unsupported history text types cannot silently become Markdown notes");
+  } finally {
+    await view.onClose();
+    Notice.messages.length = noticesBefore;
+  }
+});
+
 test("D452 Current file lists newest versions first and copies historical note text only on click", async () => {
   const originalNavigator = Object.getOwnPropertyDescriptor(globalThis, "navigator");
   const copied: string[] = [];

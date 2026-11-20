@@ -1,6 +1,7 @@
 import { ItemView, Notice, WorkspaceLeaf, type EventRef } from "obsidian"
 import type FastSync from "../main"
 import { hasGitHubSyncConfig } from "../lib/sync-policy"
+import { createV4HistoricalMarkdownCopy } from "../lib/v4/history-recovery"
 import { V4HistoryNotInitializedError, type V4HistoryChange, type V4HistoryCommit, type V4HistoryService, type V4VersionPreview } from "../lib/v4/history-service"
 import {
   formatV4Duration,
@@ -480,15 +481,15 @@ export class V4SyncCenterView extends ItemView {
       if (!this.isCurrent(generation)) return
       container.empty()
       container.createEl("h4", { text: change.path })
-      this.appendPreview(container, preview, generation)
+      this.appendPreview(container, preview, generation, commit, change)
     } catch (error) { if (this.isCurrent(generation)) this.renderError(container, error) }
   }
 
-  private appendPreview(container: HTMLElement, preview: V4VersionPreview, generation: V4ViewRenderGeneration): void {
+  private appendPreview(container: HTMLElement, preview: V4VersionPreview, generation: V4ViewRenderGeneration, commit: V4HistoryCommit, change: V4HistoryChange): void {
     this.releaseObjectUrl()
     if (preview.kind === "text") {
-      const copy = container.createEl("button", { text: "Copy version text" })
-      container.createEl("pre", { text: preview.text, cls: "github-sync-center__text-preview" })
+      const actions = container.createDiv({ cls: "github-sync-center__actions" })
+      const copy = actions.createEl("button", { text: "Copy version text" })
       copy.onclick = () => {
         if (!this.isCurrent(generation)) return
         void (async () => {
@@ -505,6 +506,28 @@ export class V4SyncCenterView extends ItemView {
           }
         })()
       }
+      if (/\.md$/iu.test(change.path)) {
+        const restore = actions.createEl("button", { text: "Restore as new note" })
+        let attempted = false
+        restore.onclick = () => {
+          if (attempted || !this.isCurrent(generation)) return
+          attempted = true
+          restore.disabled = true
+          void (async () => {
+            try {
+              const path = await createV4HistoricalMarkdownCopy(this.app.vault, change.path, commit.sha, preview.text)
+              if (this.isCurrent(generation)) {
+                new Notice(`GitHub Sync Center: Recovered note saved as ${path}. Original note untouched.`)
+              }
+            } catch {
+              if (this.isCurrent(generation)) {
+                new Notice("GitHub Sync Center: Could not confirm recovery. Check the Vault for a recovered note before reopening the preview to retry.")
+              }
+            }
+          })()
+        }
+      }
+      container.createEl("pre", { text: preview.text, cls: "github-sync-center__text-preview" })
       return
     }
     if (preview.kind === "image") {
