@@ -362,12 +362,14 @@ export default class FastSync extends Plugin {
   }
 
   initGitHubClient() {
-    if (this.settings.githubToken && this.settings.githubOwner && this.settings.githubRepo) {
+    // Never create a client for incomplete saved Settings or silently target main.
+    if (hasGitHubSyncConfig(this.settings) && this.settings.githubBranch?.trim()
+      && this.settings.vault?.trim()) {
       this.githubClient = new GitHubClient({
         token: this.settings.githubToken,
         owner: this.settings.githubOwner,
         repo: this.settings.githubRepo,
-        branch: this.settings.githubBranch || "main",
+        branch: this.settings.githubBranch,
       }, {
         cooldownStore: this.cooldownStore,
         sleep: selectV4GitHubSchedulerSleep(Platform.isDesktopApp === true),

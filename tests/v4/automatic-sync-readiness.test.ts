@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { Notice, ElementStub } from "obsidian"
+import { Notice, ElementStub, Platform } from "obsidian"
 import FastSync from "../../src/main"
 import { DEFAULT_SETTINGS } from "../../src/setting"
 import { hasGitHubSyncConfig, shouldRunScheduledSync, shouldRunStartupSync } from "../../src/lib/sync-policy"
@@ -35,6 +35,46 @@ test("D476 a blank saved GitHub branch blocks startup and scheduled Sync despite
   }
   assert.equal(hasGitHubSyncConfig(plaintext), true,
     "an explicit branch still permits normal Sync")
+})
+
+test("D479 incomplete saved settings never create a GitHub client or silently target main", () => {
+  const broken = [
+    { ...plaintext, githubBranch: "" },
+    { ...plaintext, githubBranch: " \t " },
+    { ...plaintext, vault: "" },
+    { ...plaintext, vault: " \t " },
+    { ...plaintext, githubToken: " \t " },
+    { ...plaintext, githubOwner: "" },
+    { ...plaintext, githubRepo: "" },
+    { ...encrypted, encryptionPassphrase: "" },
+  ]
+  const plugin = new FastSync()
+  const desktop = Platform.isDesktopApp
+  Platform.isDesktopApp = false // Exercise the real client policy without Node-only Desktop timer imports.
+  try {
+    for (const settings of broken) {
+      plugin.settings = settings
+      plugin.initGitHubClient()
+      assert.equal(plugin.githubClient, undefined,
+        "a missing Sync prerequisite must not create an authenticated GitHub client")
+    }
+    plugin.settings = { ...plaintext, githubBranch: "notes-v4" }
+    plugin.initGitHubClient()
+    assert.ok(plugin.githubClient,
+      "a complete plaintext configuration must still create a usable GitHub client")
+    assert.equal((plugin.githubClient as unknown as { config: { branch: string } }).config.branch,
+      "notes-v4", "a valid explicit branch must be used without fallback")
+    plugin.settings = encrypted
+    plugin.initGitHubClient()
+    assert.ok(plugin.githubClient,
+      "a complete encrypted configuration must still create a usable GitHub client")
+    plugin.settings = { ...plaintext, githubBranch: "" }
+    plugin.initGitHubClient()
+    assert.equal(plugin.githubClient, undefined,
+      "clearing a formerly valid branch must revoke the existing client, never retarget main")
+  } finally {
+    Platform.isDesktopApp = desktop
+  }
 })
 
 test("D477 whitespace-only GitHub tokens do not arm unattended Sync", () => {

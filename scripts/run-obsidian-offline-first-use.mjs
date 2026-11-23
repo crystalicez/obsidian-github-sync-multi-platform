@@ -185,6 +185,26 @@ async function performFirstUse() {
         step="native-unconfigured-ribbon-incorrect";
         throw Error("Ribbon claimed readiness without a GitHub configuration");
       }
+      // D479: Do not construct a credentialed client for a stale, partial
+      // saved configuration. These ephemeral values are never persisted or sent.
+      step="reject-incomplete-native-github-client";
+      const savedSettingsRef=plugin.settings;
+      try {
+        const fake={githubOwner:"synthetic-owner",githubRepo:"synthetic-repo",githubToken:"offline-only-fake"};
+        for(const patch of [
+          {...fake,githubBranch:""},
+          {...fake,githubBranch:"main",vault:" "},
+          {...fake,githubBranch:"main",encryptionMode:"encrypted",encryptionPassphrase:""},
+        ]){
+          plugin.settings={...savedSettingsRef,...patch};
+          plugin.initGitHubClient();
+          if(plugin.githubClient)throw Error("Incomplete Settings unexpectedly constructed a GitHub client");
+        }
+      } finally {
+        plugin.settings=savedSettingsRef;
+        plugin.initGitHubClient();
+      }
+      if(plugin.githubClient)throw Error("Incomplete test left an unexpected GitHub client");
       step="wait-workspace-layout";
       await new Promise(resolve=>app.workspace.onLayoutReady(resolve));
       step="open-sync-center";
@@ -323,7 +343,8 @@ async function performFirstUse() {
       host.close();
       return {generatedDeviceId:originalId,newDeviceId:newId,persisted:true,syncCenterOpen:true,
         nativeSaveClicked:true,invalidBranchRejectedBeforeSave:true,emptyBranchRejectedBeforeSave:true,
-        nativeUnconfiguredRibbonAccurate:true,noCredentialSyncRejected:true,
+        nativeUnconfiguredRibbonAccurate:true,nativeIncompleteClientRefused:true,
+        noCredentialSyncRejected:true,
         noCredentials:!(plugin.settings.githubToken||plugin.settings.githubOwner
           ||plugin.settings.githubRepo||plugin.settings.encryptionPassphrase)};
     } catch {
@@ -344,6 +365,7 @@ async function performFirstUse() {
   assert.equal(report.emptyBranchRejectedBeforeSave, true)
   assert.equal(report.noCredentialSyncRejected, true)
   assert.equal(report.nativeUnconfiguredRibbonAccurate, true)
+  assert.equal(report.nativeIncompleteClientRefused, true)
   assert.equal(report.noCredentials, true)
   return { generatedDeviceId: report.generatedDeviceId, savedDeviceId: report.newDeviceId }
 }
@@ -608,7 +630,7 @@ try {
       syncCenterReady: true, nativeSettingsUiSave: true,
       nativeInvalidBranchRejectedBeforeSave: true,
       nativeEmptyBranchRejectedBeforeSave: true,
-      nativeUnconfiguredRibbonAccurate: true,
+      nativeUnconfiguredRibbonAccurate: true, nativeIncompleteClientRefused: true,
       noCredentialSyncRejected: true, noGitHubCredentials: true, remoteGitHubUsed: false,
       syntheticNotesPreserved: true, nativeHistoryRestoreCopy: true,
       nativeHistoryRestorePersistedAfterRestart: true,
