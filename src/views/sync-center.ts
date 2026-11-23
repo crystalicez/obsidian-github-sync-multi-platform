@@ -46,6 +46,7 @@ export class V4SyncCenterView extends ItemView {
   private unsubscribeProgress: (() => void) | undefined
   private openGeneration = 0
   private renderGeneration = 0
+  private historyListGeneration = 0
   private isOpen = false
   private historyMode: "commits" | "file" = "commits"
   private currentFilePath: string | undefined
@@ -376,12 +377,21 @@ export class V4SyncCenterView extends ItemView {
     return trigger ? labels[trigger] : ""
   }
 
-  private appendHistoryRefresh(container: HTMLElement, generation: V4ViewRenderGeneration, retry = false): void {
+  private isHistoryListCurrent(generation: V4ViewRenderGeneration, listGeneration: number, mode: "commits" | "file"): boolean {
+    return this.isOpen && this.historyMode === mode && this.historyListGeneration === listGeneration
+      && generation.open === this.openGeneration
+      && generation.settings === this.plugin.settings
+      && generation.githubClient === this.plugin.githubClient
+      && generation.runtime === this.plugin.v4Runtime
+  }
+
+  private appendHistoryRefresh(container: HTMLElement, generation: V4ViewRenderGeneration, listGeneration: number, retry = false): void {
+    const mode = this.historyMode
     const button = container.createEl("button", { text: retry ? "Retry history" : "Refresh history" })
     button.onclick = () => {
-      if (!this.isCurrent(generation)) return
+      if (!this.isHistoryListCurrent(generation, listGeneration, mode)) return
       this.selected = undefined
-      this.page = 1
+      if (!retry) this.page = 1
       if (this.historyMode === "file") void this.renderFileMode()
       else void this.renderCommitMode()
     }
@@ -391,6 +401,7 @@ export class V4SyncCenterView extends ItemView {
     const generation = this.beginRender()
     if (!generation) return
     this.historyMode = "commits"
+    const listGeneration = ++this.historyListGeneration
     const { body, detail } = this.shell("Commit history")
     if (this.showMissingHistoryConfiguration(body)) return
     body.createEl("p", { text: "Loading commits…", cls: "github-sync-center__muted" })
@@ -401,14 +412,26 @@ export class V4SyncCenterView extends ItemView {
       if (!this.isCurrent(generation)) return
       body.empty()
       const pager = body.createDiv({ cls: "github-sync-center__pager" })
-      this.appendHistoryRefresh(pager, generation)
+      this.appendHistoryRefresh(pager, generation, listGeneration)
       const previous = pager.createEl("button", { text: "Previous" })
       previous.disabled = this.page <= 1
-      previous.onclick = () => { this.page--; this.selected = undefined; void this.renderCommitMode() }
+      previous.onclick = () => {
+        if (!this.isHistoryListCurrent(generation, listGeneration, "commits") || previous.disabled) return
+        previous.disabled = true
+        this.page--
+        this.selected = undefined
+        void this.renderCommitMode()
+      }
       pager.createEl("span", { text: `Page ${this.page}` })
       const next = pager.createEl("button", { text: "Next" })
       next.disabled = !page.hasMore
-      next.onclick = () => { this.page++; this.selected = undefined; void this.renderCommitMode() }
+      next.onclick = () => {
+        if (!this.isHistoryListCurrent(generation, listGeneration, "commits") || next.disabled) return
+        next.disabled = true
+        this.page++
+        this.selected = undefined
+        void this.renderCommitMode()
+      }
       if (page.items.length === 0) body.createEl("p", { text: "No commits found." })
       for (const commit of page.items) {
         const row = body.createEl("button", { cls: "github-sync-center__row" })
@@ -424,7 +447,7 @@ export class V4SyncCenterView extends ItemView {
     } catch (error) {
       if (this.isCurrent(generation)) {
         this.renderError(body, error)
-        this.appendHistoryRefresh(body, generation, true)
+        this.appendHistoryRefresh(body, generation, listGeneration, true)
       }
     }
   }
@@ -459,6 +482,7 @@ export class V4SyncCenterView extends ItemView {
     const generation = this.beginRender()
     if (!generation) return
     this.historyMode = "file"
+    const listGeneration = ++this.historyListGeneration
     const active = this.app.workspace.getActiveFile()
     this.currentFilePath = active?.path
     const { body, detail } = this.shell(active ? `Versions of ${active.path}` : "File versions")
@@ -474,7 +498,7 @@ export class V4SyncCenterView extends ItemView {
       const versions = await service.getFileVersions(fileId)
       if (!this.isCurrent(generation)) return
       body.empty()
-      this.appendHistoryRefresh(body.createDiv({ cls: "github-sync-center__pager" }), generation)
+      this.appendHistoryRefresh(body.createDiv({ cls: "github-sync-center__pager" }), generation, listGeneration)
       for (const version of [...versions].reverse()) {
         const row = body.createEl("button", { cls: "github-sync-center__row" })
         row.createDiv({ text: `${version.change.kind.toUpperCase()} · ${version.change.path}`, cls: "github-sync-center__row-title" })
@@ -485,7 +509,7 @@ export class V4SyncCenterView extends ItemView {
     } catch (error) {
       if (this.isCurrent(generation)) {
         this.renderError(body, error)
-        this.appendHistoryRefresh(body, generation, true)
+        this.appendHistoryRefresh(body, generation, listGeneration, true)
       }
     }
   }

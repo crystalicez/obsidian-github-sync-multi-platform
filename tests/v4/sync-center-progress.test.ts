@@ -74,6 +74,158 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
+test("D464 double-click Next waits for page two, not three", async () => {
+  const source = new FakeProgressSource();
+  const plugin = createSyncCenterPluginFixture(source, () => undefined);
+  const calls: number[] = [];
+  const second = deferred<{items: Array<{sha: string; message: string; authoredAt: string; source: "plugin"}>; hasMore: boolean}>();
+  plugin.v4Runtime.createHistoryService = async () => ({
+    async listCommits(page: number) {
+      calls.push(page);
+      if (page === 2) return second.promise;
+      return { items: [{ sha: String(page), message: "First page", authoredAt: "", source: "plugin" as const }], hasMore: true };
+    },
+    async getCommitChanges() { return []; },
+    async getFileVersions() { return []; },
+    async previewChange(): Promise<never> { throw Error("unused"); },
+  });
+  const view = new V4SyncCenterView(new WorkspaceLeaf(plugin.app), plugin as never);
+  try {
+    await view.onOpen();
+    const next = view.contentEl.findByText("Next");
+    assert.ok(next);
+    next.onclick?.();
+    next.onclick?.();
+    await waitForCondition(() => calls.length >= 2, "page two request");
+    assert.deepEqual(calls, [1, 2], "a double-click must not skip or duplicate pages");
+    second.resolve({ items: [{ sha: "two", message: "Second page loaded", authoredAt: "", source: "plugin" }], hasMore: true });
+    await waitForCondition(() => view.contentEl.flattenText().includes("Second page loaded"), "second page appears");
+    assert.match(view.contentEl.flattenText(), /Page 2/u);
+    const previous = view.contentEl.findByText("Previous");
+    assert.ok(previous);
+    previous.onclick?.();
+    previous.onclick?.();
+    await waitForCondition(() => view.contentEl.flattenText().includes("First page"), "first page returns");
+    assert.match(view.contentEl.flattenText(), /Page 1/u);
+    assert.deepEqual(calls, [1, 2, 1], "repeated Previous must never jump past page 1");
+  } finally {
+    second.resolve({ items: [], hasMore: false });
+    await view.onClose();
+  }
+});
+
+test("D464 Retry after a page two network failure stays on page two", async () => {
+  const source = new FakeProgressSource();
+  const plugin = createSyncCenterPluginFixture(source, () => undefined);
+  const calls: number[] = [];
+  plugin.v4Runtime.createHistoryService = async () => ({
+    async listCommits(page: number) {
+      calls.push(page);
+      if (page === 2 && calls.filter(p => p === 2).length === 1) throw Error("private GitHub response");
+      return { items: [{ sha: String(page), message: `History page ${page}`, authoredAt: "", source: "plugin" as const }], hasMore: true };
+    },
+    async getCommitChanges() { return []; },
+    async getFileVersions() { return []; },
+    async previewChange(): Promise<never> { throw Error("unused"); },
+  });
+  const view = new V4SyncCenterView(new WorkspaceLeaf(plugin.app), plugin as never);
+  const notices = Notice.messages.length;
+  try {
+    await view.onOpen();
+    view.contentEl.findByText("Next")?.onclick?.();
+    await waitForCondition(() => view.contentEl.findByText("Retry history") !== undefined, "page two error");
+    assert.doesNotMatch(view.contentEl.flattenText(), /private GitHub response/u);
+    view.contentEl.findByText("Retry history")?.onclick?.();
+    await waitForCondition(() => view.contentEl.flattenText().includes("History page 2"), "page two retry succeeds");
+    assert.match(view.contentEl.flattenText(), /Page 2/u);
+    assert.deepEqual(calls, [1, 2, 2]);
+  } finally {
+    await view.onClose();
+    Notice.messages.length = notices;
+  }
+});
+
+test("D464 old Next buttons cannot change an open Current file or closed view", async () => {
+  const source = new FakeProgressSource();
+  const plugin = createSyncCenterPluginFixture(source, () => undefined);
+  const calls: number[] = [];
+  plugin.v4Runtime.createHistoryService = async () => ({
+    async listCommits(page: number) {
+      calls.push(page);
+      return { items: [{ sha: String(page), message: "History", authoredAt: "", source: "plugin" as const }], hasMore: true };
+    },
+    async getCommitChanges() { return []; },
+    async getFileVersions() { return []; },
+    async previewChange(): Promise<never> { throw Error("unused"); },
+  });
+  const view = new V4SyncCenterView(new WorkspaceLeaf(plugin.app), plugin as never);
+  try {
+    await view.onOpen();
+    const oldNext = view.contentEl.findByText("Next");
+    assert.ok(oldNext);
+    view.contentEl.findByText("Current file")?.onclick?.();
+    await waitForCondition(() => view.contentEl.flattenText().includes("Versions of Notes/project.md"), "Current file mode");
+    oldNext.onclick?.();
+    await Promise.resolve();
+    assert.match(view.contentEl.flattenText(), /Versions of Notes\/project\.md/u);
+    assert.deepEqual(calls, [1], "stale page control must not request commits");
+    await view.onClose();
+    oldNext.onclick?.();
+    assert.deepEqual(calls, [1], "old controls cannot run after closing Sync Center");
+  } finally {
+    await view.onClose();
+  }
+});
+
+test("D464 Refresh history remains usable while inspecting a commit and a file preview", async () => {
+  const source = new FakeProgressSource();
+  const plugin = createSyncCenterPluginFixture(source, () => undefined);
+  let commitReads = 0;
+  let versionReads = 0;
+  let syncs = 0;
+  plugin.v4Runtime.manualSync = async () => { syncs++; return {}; };
+  const change = { kind: "modify" as const, path: "Notes/project.md", fileId: "file-id", source: "plugin" as const };
+  const commit = { sha: "history-1", message: "History for project", authoredAt: "2026-11-23", source: "plugin" as const };
+  plugin.v4Runtime.createHistoryService = async () => ({
+    async listCommits() {
+      commitReads++;
+      return { items: [{ ...commit, message: `Remote commit load ${commitReads}` }], hasMore: false };
+    },
+    async getCommitChanges() { return [change]; },
+    async getFileVersions() {
+      versionReads++;
+      return [{ commit: { ...commit, authoredAt: `Version load ${versionReads}` }, change }];
+    },
+    async previewChange() {
+      return { kind: "text" as const, text: "# Preview stays selectable", bytes: new TextEncoder().encode("# Preview stays selectable") };
+    },
+  });
+  const view = new V4SyncCenterView(new WorkspaceLeaf(plugin.app), plugin as never);
+  try {
+    await view.onOpen();
+    view.contentEl.findByClass("github-sync-center__row")?.onclick?.();
+    await waitForCondition(() => view.contentEl.flattenText().includes("Notes/project.md"),
+      "commit details loaded");
+    view.contentEl.findByText("Refresh history")?.onclick?.();
+    await waitForCondition(() => view.contentEl.flattenText().includes("Remote commit load 2"),
+      "refresh remains available after selecting commit details");
+    view.contentEl.findByText("Current file")?.onclick?.();
+    await waitForCondition(() => view.contentEl.flattenText().includes("Version load 1"),
+      "file versions loaded");
+    view.contentEl.findByClass("github-sync-center__row")?.onclick?.();
+    await waitForCondition(() => view.contentEl.flattenText().includes("# Preview stays selectable"),
+      "historical note preview loaded");
+    view.contentEl.findByText("Refresh history")?.onclick?.();
+    await waitForCondition(() => view.contentEl.flattenText().includes("Version load 2"),
+      "file refresh remains available after selecting historical preview");
+    assert.equal(commitReads, 2);
+    assert.equal(versionReads, 2);
+    assert.equal(syncs, 0);
+  } finally {
+    await view.onClose();
+  }
+});
+
 test("D463 Commit history refresh loads another device's commits and resets paging without Sync", async () => {
   const source = new FakeProgressSource();
   const plugin = createSyncCenterPluginFixture(source, () => undefined);
