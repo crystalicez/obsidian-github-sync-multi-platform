@@ -570,6 +570,56 @@ test("D418 a failed Settings save retires uncertain automatic callbacks until re
   }
 })
 
+test("D476 saved empty GitHub branch refuses manual and Force Sync until corrected", async () => {
+  const ui = setupUi()
+  resetModalTestState()
+  Notice.messages.length = 0
+  try {
+    ui.setMode("resolve")
+    await ui.plugin.onload()
+    ui.plugin.settings = { ...ui.plugin.settings, githubBranch: "" }
+    ui.plugin.settingTab.tempSettings = null
+    ui.plugin.settingTab.display()
+    const view = new V4SyncCenterView(new WorkspaceLeaf(ui.plugin.app), ui.plugin)
+    await view.onOpen()
+    const center = (view.contentEl as unknown as ElementStub).findByText("Sync now")
+    const settingsSync = (ui.plugin.settingTab.containerEl as unknown as ElementStub).findByText("Sync now")
+    assert.ok(center && settingsSync)
+    const actions: Array<() => void> = [
+      ui.ribbons.get("GitHub Sync: Sync")!,
+      ui.commands.get("sync-all-files")!,
+      () => { ui.plugin.updateStatusBar(); ui.statusRoot.children[0]?.onclick?.() },
+      () => center.onclick?.(),
+      () => settingsSync.onclick?.(),
+      ui.ribbons.get("GitHub Sync: Force Push")!,
+      ui.commands.get("force-pull-all-files")!,
+    ]
+    const initialModals = modalButtons.length
+    for (const action of actions) {
+      const before = Notice.messages.length
+      action()
+      await tick()
+      assert.deepEqual(ui.attempts, [], "empty branch must not start any Runtime operation")
+      assert.equal(modalButtons.length, initialModals, "Force confirmation must not open for a blank branch")
+      assert.equal(Notice.messages.length, before + 1)
+      assert.match(Notice.messages.at(-1)!, /GitHub branch.*Settings.*Save changes/u)
+      assert.doesNotMatch(Notice.messages.at(-1)!, /secret-token/u)
+    }
+    ui.plugin.settings = { ...ui.plugin.settings, githubBranch: "main" }
+    ui.plugin.settingTab.tempSettings = null
+    ui.plugin.settingTab.display()
+    ui.commands.get("sync-all-files")!()
+    await tick()
+    assert.deepEqual(ui.attempts, ["manual"],
+      "once repaired the explicit branch must still allow ordinary Sync")
+    await view.onClose()
+  } finally {
+    ui.cleanup()
+    resetModalTestState()
+    Notice.messages.length = 0
+  }
+})
+
 test("D475 a blank persisted Device ID refuses manual and Force Sync with an actionable Settings notice", async () => {
   const ui = setupUi()
   resetModalTestState()

@@ -3,6 +3,7 @@ export interface SyncPolicySettings {
   githubToken?: string;
   githubOwner?: string;
   githubRepo?: string;
+  githubBranch?: string;
   vault?: string;
   encryptionMode?: "plaintext" | "encrypted";
   encryptionPassphrase?: string;
@@ -18,6 +19,7 @@ export function missingGitHubSyncConfigFields(settings: SyncPolicySettings): str
   const missing: string[] = []
   if (!settings.githubOwner) missing.push("GitHub owner")
   if (!settings.githubRepo) missing.push("GitHub repository")
+  if (settings.githubBranch !== undefined && !settings.githubBranch.trim()) missing.push("GitHub branch")
   if (!settings.githubToken) missing.push("GitHub token")
   if (settings.vault !== undefined && !settings.vault.trim()) missing.push("Device ID")
   if (settings.encryptionMode === "encrypted" && !settings.encryptionPassphrase) {
@@ -28,6 +30,7 @@ export function missingGitHubSyncConfigFields(settings: SyncPolicySettings): str
 
 export function hasGitHubSyncConfig(settings: SyncPolicySettings): boolean {
   return Boolean(settings.githubToken && settings.githubOwner && settings.githubRepo
+    && (settings.githubBranch === undefined || settings.githubBranch.trim())
     && (settings.vault === undefined || settings.vault.trim())
     && (settings.encryptionMode !== "encrypted" || settings.encryptionPassphrase));
 }

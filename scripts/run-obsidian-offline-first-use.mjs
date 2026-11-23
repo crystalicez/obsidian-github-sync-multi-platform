@@ -267,6 +267,23 @@ async function performFirstUse() {
       if(plugin.settings.githubBranch!=="main"){step="native-invalid-branch-was-persisted";throw Error("Invalid branch published");}
       if(!tab.isDirty()){step="native-invalid-branch-draft-discarded";throw Error("Invalid branch draft lost");}
       if(tab.tempSettings.githubBranch!=="invalid..branch"){step="native-invalid-branch-draft-mutated";throw Error("Invalid branch value mutated");}
+      // D476: a completely empty branch must be rejected by the installed
+      // Settings Save UI, not silently interpreted as main by Runtime.
+      step="reject-empty-native-github-branch";
+      setter.call(branchInput,"");
+      branchInput.dispatchEvent(new Event("input",{bubbles:true}));
+      if(tab.tempSettings.githubBranch!==""){step="native-blank-branch-input-not-applied";throw Error("Native blank branch input event failed");}
+      const blankSave=[...tab.containerEl.querySelectorAll("button")]
+        .find(button=>button.textContent.trim()==="Save changes");
+      if(!blankSave||blankSave.disabled){step="native-blank-branch-save-missing";throw Error("Native blank branch Save unavailable");}
+      blankSave.click();
+      await new Promise(resolve=>setTimeout(resolve,150));
+      if(saveAttempts!==0){step="native-blank-branch-invoked-persistence";throw Error("Blank GitHub branch invoked Settings persistence");}
+      if(plugin.settings.githubBranch!=="main"||!tab.isDirty()
+        ||tab.tempSettings.githubBranch!==""){
+        step="native-blank-branch-draft-or-saved-value-changed";
+        throw Error("Blank branch Save changed saved settings or removed editable draft");
+      }
       setter.call(branchInput,"main");
       branchInput.dispatchEvent(new Event("input",{bubbles:true}));
       step="edit-native-device-id";
@@ -295,7 +312,8 @@ async function performFirstUse() {
       if(plugin.githubClient)throw Error("Native UI Save unexpectedly configured GitHub");
       host.close();
       return {generatedDeviceId:originalId,newDeviceId:newId,persisted:true,syncCenterOpen:true,
-        nativeSaveClicked:true,invalidBranchRejectedBeforeSave:true,noCredentialSyncRejected:true,
+        nativeSaveClicked:true,invalidBranchRejectedBeforeSave:true,emptyBranchRejectedBeforeSave:true,
+        noCredentialSyncRejected:true,
         noCredentials:!(plugin.settings.githubToken||plugin.settings.githubOwner
           ||plugin.settings.githubRepo||plugin.settings.encryptionPassphrase)};
     } catch {
@@ -313,6 +331,7 @@ async function performFirstUse() {
   assert.equal(report.syncCenterOpen, true)
   assert.equal(report.nativeSaveClicked, true)
   assert.equal(report.invalidBranchRejectedBeforeSave, true)
+  assert.equal(report.emptyBranchRejectedBeforeSave, true)
   assert.equal(report.noCredentialSyncRejected, true)
   assert.equal(report.noCredentials, true)
   return { generatedDeviceId: report.generatedDeviceId, savedDeviceId: report.newDeviceId }
@@ -577,6 +596,7 @@ try {
       nativeIndependentInstallations: 2, distinctGeneratedDeviceIds: true,
       syncCenterReady: true, nativeSettingsUiSave: true,
       nativeInvalidBranchRejectedBeforeSave: true,
+      nativeEmptyBranchRejectedBeforeSave: true,
       noCredentialSyncRejected: true, noGitHubCredentials: true, remoteGitHubUsed: false,
       syntheticNotesPreserved: true, nativeHistoryRestoreCopy: true,
       nativeHistoryRestorePersistedAfterRestart: true,

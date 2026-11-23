@@ -119,6 +119,9 @@ export default class FastSync extends Plugin {
         new Notice("GitHub Sync: Saved encryption passphrase is unavailable after restart. Re-enter it in Settings before encrypted Sync.")
       }
     }
+    if (!this.settings.githubBranch.trim()) {
+      new Notice("GitHub Sync: Saved GitHub branch is empty. Enter the branch name in Settings and Save changes before syncing.")
+    }
     if (!this.settings.vault.trim()) {
       new Notice("GitHub Sync: Saved Device ID is empty. Enter a unique Device ID in Settings and Save changes before syncing.")
     }

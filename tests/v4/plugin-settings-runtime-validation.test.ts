@@ -32,6 +32,52 @@ test("settings validator preserves valid defaults and nested Git branch while re
   }
 });
 
+test("D476 a legacy saved blank GitHub branch loads read-only for Settings repair", async () => {
+  const secretWrites: string[] = []
+  const saved = { ...valid, githubBranch: "", githubToken: "" }
+  const fake = {
+    loadData: async () => ({ settings: saved }),
+    canMigrateStartupSecrets: async () => false,
+    app: { secretStorage: {
+      getSecret: () => null,
+      setSecret: (id: string) => { secretWrites.push(id) },
+    } },
+  } as unknown as FastSync
+  await FastSync.prototype.loadSettings.call(fake)
+  assert.equal(fake.settings.githubBranch, "",
+    "existing blank branch must remain visible and editable instead of silently switching to main")
+  assert.deepEqual(secretWrites, [])
+})
+
+test("D476 direct Settings Save refuses blank GitHub branch before SecretStorage or persistence", async () => {
+  const saved = { ...valid, githubTokenSecretId: "token-id", encryptionPassphraseSecretId: "pass-id" }
+  const secretWrites: string[] = []
+  let diskWrites = 0
+  const plugin = {
+    settings: saved,
+    secretStorageReadUnavailable: false,
+    settingsSaveInProgress: false,
+    settingsSaveAttemptGeneration: 0,
+    app: { secretStorage: {
+      getSecret: () => null,
+      setSecret: (id: string) => { secretWrites.push(id) },
+    } },
+    v4Runtime: { assertReencryptionSettingsSaveAllowed: async () => undefined },
+    persistData: async () => { diskWrites++ },
+    initGitHubClient: () => undefined,
+    registerScheduledSync: () => undefined,
+    createSecretId: () => { throw new Error("unexpected new secret allocation") },
+  } as unknown as FastSync
+  for (const githubBranch of ["", " \t "]) {
+    await assert.rejects(() => FastSync.prototype.saveSettings.call(plugin,
+      { ...saved, githubBranch }), /GitHub branch/u)
+    assert.deepEqual(secretWrites, [], "invalid branch must not change credentials")
+    assert.equal(diskWrites, 0, "invalid branch must not persist")
+    assert.equal(plugin.settings.githubBranch, saved.githubBranch,
+      "failed Save must not replace the active remote branch")
+  }
+})
+
 test("D475 legacy saved blank Device ID remains loadable for Settings repair without secret mutation", async () => {
   const writes: string[] = []
   const legacy = { ...valid, vault: "", githubToken: "" }

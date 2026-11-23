@@ -243,6 +243,7 @@ test("D449 invalid user-editable Settings show specific secret-free guidance bef
     { field: "githubOwner", invalid: "owner with spaces", valid: "different-owner", guidance: /GitHub owner/u },
     { field: "githubRepo", invalid: "repo/path", valid: "other-notes", guidance: /GitHub repository/u },
     { field: "githubBranch", invalid: "bad..branch", valid: "feature/notes", guidance: /GitHub branch.*\.\./u },
+    { field: "githubBranch", invalid: "", valid: "feature/notes", guidance: /GitHub branch/u },
     { field: "vault", invalid: "  \t  ", valid: "device-laptop-01", guidance: /Device ID/u },
     { field: "ignorePathRegex", invalid: "(?<private-regex-DO-NOT-LEAK>", valid: "^Archive/", guidance: /Ignore.path regex/u },
   ] as const
@@ -270,7 +271,7 @@ test("D449 invalid user-editable Settings show specific secret-free guidance bef
     const messages = Notice.messages.slice(noticesBefore)
     assert.ok(messages.some(message => scenario.guidance.test(message)),
       scenario.field + ": user should know which input needs fixing")
-    assert.ok(messages.every(message => !message.includes(scenario.invalid)
+    assert.ok(messages.every(message => (!scenario.invalid || !message.includes(scenario.invalid))
       && !message.includes(sensitiveToken) && !message.includes(sensitivePassphrase)
       && !message.includes("private-regex-DO-NOT-LEAK")),
     "validation notices may never display raw field contents or credentials")

@@ -21,6 +21,9 @@ function settingsSaveValidationHint(error: unknown): string {
   if (message === "Invalid GitHub repository.") {
     return "Check GitHub repository: enter only the repository name, not a URL or path."
   }
+  if (message === "GitHub branch is required.") {
+    return "Enter a GitHub branch name, such as main, then Save changes."
+  }
   if (message === "Invalid GitHub branch.") {
     return "Check GitHub branch: remove spaces, '..', repeated slashes, trailing dots, or invalid characters."
   }
