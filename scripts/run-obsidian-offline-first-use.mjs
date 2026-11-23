@@ -217,6 +217,35 @@ async function performFirstUse() {
       if(!view||![...view.querySelectorAll("button")]
         .some(button=>button.textContent.trim()==="Sync now"))
         throw Error("Native Sync Center action unavailable");
+      // D480: test the actual installed History view with synthetic *in-memory*
+      // saved settings. Its message must name the missing field, not any secret.
+      step="native-history-missing-field-guidance";
+      const installedHistory=app.workspace.getLeavesOfType("github-sync-v4-center")[0]?.view;
+      if(typeof installedHistory?.onSettingsSaved!=="function")
+        throw Error("Installed Sync Center History refresh unavailable");
+      const originalHistorySettings=plugin.settings;
+      try {
+        for(const scenario of [
+          {patch:{githubBranch:""},field:"GitHub branch"},
+          {patch:{vault:"  "},field:"Device ID"},
+          {patch:{encryptionMode:"encrypted",encryptionPassphrase:""},field:"encryption passphrase"},
+        ]){
+          plugin.settings={...originalHistorySettings,
+            githubOwner:"offline-test-owner",githubRepo:"offline-test-repo",
+            githubToken:"offline-test-secret-never-render",githubBranch:"main",
+            ...scenario.patch};
+          installedHistory.onSettingsSaved();
+          const guidance=installedHistory.contentEl.textContent||"";
+          if(!guidance.includes("GitHub Sync is not configured")
+            ||!guidance.includes(scenario.field)
+            ||guidance.includes("offline-test-secret-never-render"))
+            throw Error("Installed History missing-field guidance was inaccurate or unsafe");
+        }
+      } finally {
+        plugin.settings=originalHistorySettings;
+        installedHistory.onSettingsSaved();
+      }
+      if(plugin.githubClient)throw Error("History guidance unexpectedly created GitHub client");
       step="unconfigured-sync";
       if(plugin.githubClient)throw Error("Unexpected GitHub client on fresh installation");
       const syncButton=[...view.querySelectorAll("button")]
@@ -344,7 +373,7 @@ async function performFirstUse() {
       return {generatedDeviceId:originalId,newDeviceId:newId,persisted:true,syncCenterOpen:true,
         nativeSaveClicked:true,invalidBranchRejectedBeforeSave:true,emptyBranchRejectedBeforeSave:true,
         nativeUnconfiguredRibbonAccurate:true,nativeIncompleteClientRefused:true,
-        noCredentialSyncRejected:true,
+        nativeHistoryMissingFieldGuidance:true,noCredentialSyncRejected:true,
         noCredentials:!(plugin.settings.githubToken||plugin.settings.githubOwner
           ||plugin.settings.githubRepo||plugin.settings.encryptionPassphrase)};
     } catch {
@@ -366,6 +395,7 @@ async function performFirstUse() {
   assert.equal(report.noCredentialSyncRejected, true)
   assert.equal(report.nativeUnconfiguredRibbonAccurate, true)
   assert.equal(report.nativeIncompleteClientRefused, true)
+  assert.equal(report.nativeHistoryMissingFieldGuidance, true)
   assert.equal(report.noCredentials, true)
   return { generatedDeviceId: report.generatedDeviceId, savedDeviceId: report.newDeviceId }
 }
@@ -631,7 +661,7 @@ try {
       nativeInvalidBranchRejectedBeforeSave: true,
       nativeEmptyBranchRejectedBeforeSave: true,
       nativeUnconfiguredRibbonAccurate: true, nativeIncompleteClientRefused: true,
-      noCredentialSyncRejected: true, noGitHubCredentials: true, remoteGitHubUsed: false,
+      nativeHistoryMissingFieldGuidance: true, noCredentialSyncRejected: true, noGitHubCredentials: true, remoteGitHubUsed: false,
       syntheticNotesPreserved: true, nativeHistoryRestoreCopy: true,
       nativeHistoryRestorePersistedAfterRestart: true,
       nativeHistoryOpenAfterRestore: true,

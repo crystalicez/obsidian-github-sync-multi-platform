@@ -1,6 +1,6 @@
 import { ItemView, Notice, WorkspaceLeaf, type EventRef } from "obsidian"
 import type FastSync from "../main"
-import { hasGitHubSyncConfig } from "../lib/sync-policy"
+import { missingGitHubSyncConfigFields } from "../lib/sync-policy"
 import { createV4HistoricalMarkdownCopy } from "../lib/v4/history-recovery"
 import { V4_SYNC_PAUSED_GUIDANCE } from "../lib/v4/status"
 import { V4HistoryNotInitializedError, V4HistoryPreviewLimitError, type V4HistoryChange, type V4HistoryCommit, type V4HistoryService, type V4VersionPreview } from "../lib/v4/history-service"
@@ -613,10 +613,12 @@ export class V4SyncCenterView extends ItemView {
   }
 
   private showMissingHistoryConfiguration(container: HTMLElement): boolean {
-    if (hasGitHubSyncConfig(this.plugin.settings)) return false
+    const missing = missingGitHubSyncConfigFields(this.plugin.settings)
+    if (missing.length === 0) return false
     container.empty()
     container.createEl("p", {
-      text: "GitHub Sync is not configured. Open Obsidian Settings → Encrypted GitHub Sync (Multi-Platform), enter your GitHub token, repository owner and name, and encryption passphrase if enabled, then Save changes. Sync Center will check the saved branch.",
+      // Use fixed policy field labels only. Never display credentials or unsaved drafts.
+      text: `GitHub Sync is not configured. Open Obsidian Settings → Encrypted GitHub Sync (Multi-Platform), correct ${missing.join(", ")}, then Save changes. Sync Center will check the saved branch.`,
       cls: "github-sync-center__muted",
     })
     return true

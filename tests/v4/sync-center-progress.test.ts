@@ -878,6 +878,60 @@ test("D450 incomplete first-use connection shows setup guidance without GitHub r
   }
 });
 
+test("D480 History identifies the actual missing saved field in Commit and Current file modes", async () => {
+  for (const scenario of [
+    { patch: { githubBranch: "" }, corrected: { githubBranch: "notes-v4" }, field: "GitHub branch" },
+    { patch: { vault: " \t " }, corrected: { vault: "device-restored" }, field: "Device ID" },
+    { patch: { githubToken: " \t " }, corrected: { githubToken: "test-token" }, field: "GitHub token" },
+  ]) {
+    const source = new FakeProgressSource();
+    const plugin = createSyncCenterPluginFixture(source, () => undefined);
+    const secret = "secret-never-show-in-history-guidance";
+    plugin.settings = { ...plugin.settings, githubToken: secret, vault: "valid-device", ...scenario.patch };
+    let historyReads = 0;
+    let fileLookups = 0;
+    plugin.v4Runtime.createHistoryService = async () => {
+      historyReads++;
+      return {
+        async listCommits() { return { items: [], hasMore: false }; },
+        async getCommitChanges() { return []; },
+        async getFileVersions() { return []; },
+        async previewChange(): Promise<never> { throw new Error("not used"); },
+      };
+    };
+    plugin.v4Runtime.fileIdForPath = async () => { fileLookups++; return "file-id"; };
+    const view = new V4SyncCenterView(new WorkspaceLeaf(plugin.app), plugin as never);
+    try {
+      await view.onOpen();
+      const commitMessage = view.contentEl.flattenText();
+      assert.match(commitMessage, /GitHub Sync is not configured/u);
+      assert.ok(commitMessage.includes(scenario.field),
+        `Commit History must identify the missing ${scenario.field}`);
+      assert.doesNotMatch(commitMessage, /secret-never-show-in-history-guidance/u);
+      assert.equal(historyReads, 0, "missing configuration must never read remote history");
+
+      view.contentEl.findByText("Current file")?.onclick?.();
+      await waitForCondition(() => view.contentEl.flattenText().includes("GitHub Sync is not configured"),
+        "Current file missing-field guidance");
+      const fileMessage = view.contentEl.flattenText();
+      assert.ok(fileMessage.includes(scenario.field),
+        `File History must identify the missing ${scenario.field}`);
+      assert.doesNotMatch(fileMessage, /secret-never-show-in-history-guidance/u);
+      assert.equal(fileLookups, 0, "missing configuration must not read the remote index");
+      assert.equal(historyReads, 0);
+
+      plugin.settings = { ...plugin.settings, ...scenario.corrected };
+      view.onSettingsSaved();
+      await waitForCondition(() => view.contentEl.flattenText().includes("No versions found"),
+        "corrected Settings should restore History without a restart");
+      assert.equal(fileLookups, 1);
+      assert.equal(historyReads, 1);
+    } finally {
+      await view.onClose();
+    }
+  }
+});
+
 test("D450 encrypted history without a saved passphrase shows setup guidance offline", async () => {
   const source = new FakeProgressSource();
   const plugin = createSyncCenterPluginFixture(source, () => undefined);
