@@ -338,8 +338,42 @@ async function performNativeHistoricalRecovery() {
       if(!open.disabled)throw Error("Repeated Open recovered note remains enabled");
       if(await app.vault.read(recovered)!=="# Native historical recovery\\n")
         throw Error("Opening recovered note changed its contents");
+      step="restore-markdown-bom-with-installed-vault";
+      const bomBytes=new Uint8Array([0xef,0xbb,0xbf,0x23,0x20,0xe2,0x9c,0x85,0x0d,0x0a]);
+      const bomName="Recovered-D445-synthetic-first-use-b0b0b0b0.md";
+      if(app.vault.getAbstractFileByPath(bomName))throw Error("BOM recovery path already present");
+      container.empty();
+      view.appendPreview(container,
+        {kind:"text",text:new TextDecoder("utf-8",{fatal:true,ignoreBOM:true}).decode(bomBytes),bytes:bomBytes},
+        view.beginRender(),
+        {sha:"b0b0b0b012345678",message:"synthetic BOM history",authoredAt:"",source:"plugin"},
+        {kind:"modify",path:"D445-synthetic-first-use.md",fileId:"synthetic",source:"plugin"});
+      const bomRestore=[...container.querySelectorAll("button")].find(button=>button.textContent.trim()==="Restore as new note");
+      if(!bomRestore)throw Error("BOM historical recovery action missing");
+      bomRestore.click();
+      const bomStart=Date.now();
+      while(!app.vault.getAbstractFileByPath(bomName)&&Date.now()-bomStart<8000)
+        await new Promise(resolve=>setTimeout(resolve,120));
+      const bomFile=app.vault.getAbstractFileByPath(bomName);
+      if(!bomFile)throw Error("Installed Vault did not save the BOM recovery");
+      const actualBom=new Uint8Array(await app.vault.readBinary(bomFile));
+      if(actualBom.length!==bomBytes.length||actualBom.some((byte,index)=>byte!==bomBytes[index]))
+        throw Error("Installed Vault changed BOM, Unicode or CRLF bytes");
+      step="reject-invalid-markdown-history";
+      container.empty();
+      view.appendPreview(container,
+        {kind:"binary",bytes:new Uint8Array([0x23,0x20,0xff])},
+        view.beginRender(),
+        {sha:"badutf812345678",message:"malformed synthetic history",authoredAt:"",source:"plugin"},
+        {kind:"modify",path:"D445-synthetic-first-use.md",fileId:"synthetic",source:"plugin"});
+      if([...container.querySelectorAll("button")].some(button=>
+        button.textContent.trim()==="Restore as new note"||button.textContent.trim()==="Copy version text"))
+        throw Error("Invalid UTF-8 Markdown offered a lossy restore");
+      if(!container.textContent.includes("not readable as UTF-8"))
+        throw Error("Invalid UTF-8 Markdown did not explain why restore is unavailable");
       if(plugin.githubClient)throw Error("Recovery created a GitHub connection");
-      return {restored:true,originalPreserved:true,collisionPreserved:true,doubleClickSafe:true,explicitOpen:true};
+      return {restored:true,originalPreserved:true,collisionPreserved:true,
+        doubleClickSafe:true,explicitOpen:true,bomPreserved:true,invalidUtf8Refused:true};
     }catch{return {failedAt:step}}
   })()`, 35000)
   if (result?.failedAt) {
@@ -351,6 +385,8 @@ async function performNativeHistoricalRecovery() {
   assert.equal(result.collisionPreserved, true)
   assert.equal(result.doubleClickSafe, true)
   assert.equal(result.explicitOpen, true)
+  assert.equal(result.bomPreserved, true)
+  assert.equal(result.invalidUtf8Refused, true)
 }
 
 try {
@@ -433,6 +469,11 @@ try {
       "# Native historical recovery\n")
     assert.equal(await stat(path.join(vault, "Recovered-D445-synthetic-first-use-abcdef12-3.md")).catch(() => null), null,
       "Native restore must never create a duplicate on double click")
+    assert.deepEqual(await readFile(path.join(vault, "Recovered-D445-synthetic-first-use-b0b0b0b0.md")),
+      Buffer.from([0xef, 0xbb, 0xbf, 0x23, 0x20, 0xe2, 0x9c, 0x85, 0x0d, 0x0a]),
+      "Native BOM recovery must preserve the exact UTF-8, Unicode and CRLF bytes after restart")
+    assert.equal(await stat(path.join(vault, "Recovered-D445-synthetic-first-use-badutf81.md")).catch(() => null), null,
+      "Malformed historical Markdown must not create a recovered note")
 
     // D448: A second *fresh* profile/vault must not inherit the first one's
     // random identity. Each installation uses the real native UI and restart.
@@ -490,7 +531,9 @@ try {
       noCredentialSyncRejected: true, noGitHubCredentials: true, remoteGitHubUsed: false,
       syntheticNotesPreserved: true, nativeHistoryRestoreCopy: true,
       nativeHistoryRestorePersistedAfterRestart: true,
-      nativeHistoryOpenAfterRestore: true }))
+      nativeHistoryOpenAfterRestore: true,
+      nativeHistoryBomPreservedAfterRestart: true,
+      nativeHistoryInvalidUtf8Refused: true }))
   }
 } catch (error) {
   // Do not claim qualification on missing Windows Obsidian, CDP failure or startup fault.
