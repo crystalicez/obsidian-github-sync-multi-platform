@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test from "node:test";
 import { setRequestUrlHandler } from "obsidian";
 
@@ -208,6 +209,82 @@ test("D357 exactly 8 MiB Git Blob remains writable through the mocked REST trans
   }
 });
 
+test("D467 raw Git Blob read rejects mismatched bytes despite HTTP 200", async () => {
+  const expected = new TextEncoder().encode("# Original note\n");
+  const wrong = new TextEncoder().encode("# Wrong note\n");
+  const header = new TextEncoder().encode(`blob ${expected.byteLength}\0`);
+  const gitSha = createHash("sha1").update(header).update(expected).digest("hex");
+  const requests: string[] = [];
+  setRequestUrlHandler(async (options: unknown) => {
+    const { url } = options as { url: string };
+    requests.push(url);
+    return { status: 200, text: "", headers: {}, arrayBuffer: wrong.buffer, json: undefined };
+  });
+  try {
+    const client = new GitHubClient(
+      { token: "token", owner: "owner", repo: "repo", branch: "main" },
+      { transportPolicy: { mutationSpacingMs: 0 } },
+    );
+    await assert.rejects(() => client.getBlob(gitSha), /Git Blob.*(SHA|integrity|mismatch)/i,
+      "HTTP 200 must never authorize corrupted historical Markdown");
+    assert.equal(requests.length, 1, "do not silently retry a mismatched 200");
+  } finally {
+    setRequestUrlHandler(null);
+  }
+});
+
+test("D467 Git Blob reader accepts exact bytes and rejects corrupted Contents fallback", async () => {
+  const bytes = new TextEncoder().encode("# Original note\r\n");
+  const header = new TextEncoder().encode(`blob ${bytes.byteLength}\0`);
+  const gitSha = createHash("sha1").update(header).update(bytes).digest("hex");
+  let altered = false;
+  let blobReads = 0;
+  setRequestUrlHandler(async (options: unknown) => {
+    const { url } = options as { url: string };
+    if (url.includes("/contents/")) {
+      return { status: 200, text: "", headers: {}, json: { sha: gitSha, encoding: "none" },
+        arrayBuffer: new ArrayBuffer(0) };
+    }
+    blobReads++;
+    const raw = altered ? new TextEncoder().encode("# Incorrect note\r\n") : bytes;
+    return { status: 200, text: "", headers: {}, json: undefined, arrayBuffer: raw.buffer };
+  });
+  try {
+    const client = new GitHubClient(
+      { token: "token", owner: "owner", repo: "repo", branch: "main" },
+      { transportPolicy: { mutationSpacingMs: 0 } },
+    );
+    assert.deepEqual(await client.getBlob(gitSha), bytes);
+    assert.deepEqual((await client.getFileBytes("Notes/a.md", "commit-sha"))?.bytes, bytes);
+    altered = true;
+    await assert.rejects(() => client.getFileBytes("Notes/a.md", "commit-sha"),
+      /Git Blob.*(SHA|integrity|mismatch)/i, "unverified fallback bytes may not enter file restoration");
+    assert.equal(blobReads, 3);
+  } finally {
+    setRequestUrlHandler(null);
+  }
+});
+
+test("D467 raw Git Blob reader refuses malformed IDs and missing bytes without a false success", async () => {
+  let requests = 0;
+  setRequestUrlHandler(async () => {
+    requests++;
+    return { status: 200, text: "not raw bytes", headers: {}, json: { content: "not a blob" } };
+  });
+  try {
+    const client = new GitHubClient(
+      { token: "token", owner: "owner", repo: "repo", branch: "main" },
+      { transportPolicy: { mutationSpacingMs: 0 } },
+    );
+    await assert.rejects(() => client.getBlob("../unsafe"), /Invalid Git Blob SHA/u);
+    assert.equal(requests, 0, "a malformed object ID must never reach the network");
+    await assert.rejects(() => client.getBlob("a".repeat(40)), /Git Blob.*no raw bytes/u);
+    assert.equal(requests, 1);
+  } finally {
+    setRequestUrlHandler(null);
+  }
+});
+
 test("GitHubClient pins file reads to an explicit commit SHA", async () => {
   const requestUrls: string[] = [];
   let accept = "";
@@ -290,7 +367,7 @@ test("GitHubClient falls back to the canonical Git Blob when Contents transforms
   }
 })
 
-test("GitHubClient falls back to the canonical Git Blob when SHA verification fails", async () => {
+test("GitHubClient refuses unverified fallback when SHA calculation fails", async () => {
   const raw = Uint8Array.from([79, 71, 83, 52, 1, 253, 142, 97])
   const blobSha = "0123456789abcdef0123456789abcdef01234567"
   const requests: string[] = []
@@ -315,9 +392,8 @@ test("GitHubClient falls back to the canonical Git Blob when SHA verification fa
       { token: "token", owner: "owner", repo: "repo", branch: "main" },
       { transportPolicy: { mutationSpacingMs: 0 } },
     )
-    const file = await client.getFileBytes("binary.enc", "commit-sha")
-    assert.deepEqual(file?.bytes, raw)
-    assert.equal(file?.sha, blobSha)
+    await assert.rejects(() => client.getFileBytes("binary.enc", "commit-sha"),
+      /forced digest failure/, "a failed checksum must not approve raw fallback bytes")
     assert.equal(requests.length, 2)
     assert.equal(requests.filter(url => url.endsWith(`/git/blobs/${blobSha}`)).length, 1)
   } finally {
@@ -436,22 +512,25 @@ test("GitHubClient creates a configured custom branch after empty-repository boo
   }
 });
 
-test("GitHubClient falls back to Git Blob bytes when Contents omits a large payload", async () => {
+test("GitHubClient falls back to verified Git Blob bytes when Contents omits a large payload", async () => {
   const requests: string[] = [];
+  const raw = new TextEncoder().encode("large payload");
+  const blobSha = createHash("sha1")
+    .update(new TextEncoder().encode(`blob ${raw.byteLength}\0`)).update(raw).digest("hex");
   setRequestUrlHandler(async (options: unknown) => {
     const url = (options as { url: string }).url;
     requests.push(url);
     if (url.includes("/contents/")) {
-      return { status: 200, text: "", headers: {}, json: { content: "", encoding: "none", sha: "ffffffffffffffffffffffffffffffffffffffff" }, arrayBuffer: new ArrayBuffer(0) };
+      return { status: 200, text: "", headers: {}, json: { content: "", encoding: "none", sha: blobSha }, arrayBuffer: new ArrayBuffer(0) };
     }
-    return { status: 200, text: "payload", headers: {}, json: undefined, arrayBuffer: new TextEncoder().encode("large payload").buffer };
+    return { status: 200, text: "payload", headers: {}, json: undefined, arrayBuffer: raw.buffer };
   });
   try {
     const client = new GitHubClient({ token: "token", owner: "owner", repo: "repo", branch: "main" }, { transportPolicy: { mutationSpacingMs: 0 } });
     const file = await client.getFileBytes("large.bin", "commit-sha");
     assert.equal(new TextDecoder().decode(file!.bytes), "large payload");
-    assert.equal(file!.sha, "ffffffffffffffffffffffffffffffffffffffff");
-    assert.equal(requests.some(url => url.endsWith("/git/blobs/ffffffffffffffffffffffffffffffffffffffff")), true);
+    assert.equal(file!.sha, blobSha);
+    assert.equal(requests.some(url => url.endsWith(`/git/blobs/${blobSha}`)), true);
   } finally {
     setRequestUrlHandler(null);
   }
