@@ -1,5 +1,6 @@
 import assert from "node:assert/strict"
 import test from "node:test"
+import { createHash } from "node:crypto"
 import { setRequestUrlHandler } from "obsidian"
 
 import { GitHubClient } from "../../src/lib/github-api"
@@ -8,7 +9,9 @@ const COMMIT_SHA = "0".repeat(40)
 const ROOT_TREE_SHA = "1".repeat(40)
 const DIR_TREE_SHA = "2".repeat(40)
 const NESTED_TREE_SHA = "3".repeat(40)
-const BLOB_SHA = "4".repeat(40)
+function gitBlobSha(bytes: Uint8Array): string {
+  return createHash("sha1").update(`blob ${bytes.byteLength}\0`).update(bytes).digest("hex")
+}
 
 function response(input: { status: number; json?: unknown; bytes?: Uint8Array; text?: string }) {
   const bytes = input.bytes ?? new Uint8Array()
@@ -31,6 +34,7 @@ function treePayload(sha: string, truncated: boolean, tree: unknown[]) {
 
 test("immutable fallback descends through an exact positive entry in a truncated intermediate tree", async () => {
   const payload = new TextEncoder().encode("deep-positive\n")
+  const BLOB_SHA = gitBlobSha(payload)
   const urls: string[] = []
   setRequestUrlHandler(async (options: unknown) => {
     const url = (options as { url: string }).url
@@ -76,6 +80,7 @@ test("immutable fallback descends through an exact positive entry in a truncated
 
 test("immutable fallback verifies Git tree after unconfirmed Contents failures regardless of claimed HTTP status", async () => {
   const payload = new TextEncoder().encode("thrown-404-fallback\n")
+  const BLOB_SHA = gitBlobSha(payload)
   let contentsCalls = 0
   setRequestUrlHandler(async (options: unknown) => {
     const url = (options as { url: string }).url

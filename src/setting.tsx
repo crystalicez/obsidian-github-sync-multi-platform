@@ -10,6 +10,25 @@ import { createDebugPayload } from "./lib/debug";
 import { V4_NETWORK_VAULT_WARNING } from "./lib/v4/network-storage";
 import { V4_DEFAULT_PBKDF2_ITERATIONS, V4_MAX_PBKDF2_ITERATIONS, V4_MIN_NEW_PBKDF2_ITERATIONS } from "./lib/v4/kdf-policy";
 
+// Validation errors can contain user-supplied regex source or other sensitive text.
+// Match only known error categories and show fixed, secret-free recovery guidance.
+function settingsSaveValidationHint(error: unknown): string {
+  const message = error instanceof Error ? error.message : ""
+  if (message === "Invalid GitHub owner.") {
+    return "Check GitHub owner: enter a username or organization without spaces or slashes."
+  }
+  if (message === "Invalid GitHub repository.") {
+    return "Check GitHub repository: enter only the repository name, not a URL or path."
+  }
+  if (message === "Invalid GitHub branch.") {
+    return "Check GitHub branch: remove spaces, '..', repeated slashes, trailing dots, or invalid characters."
+  }
+  if (error instanceof SyntaxError) {
+    return "Check Ignore-path regex: correct the invalid regular expression."
+  }
+  return "Review the Settings values and retry."
+}
+
 export interface PluginSettings {
   // Whether auto-upload is enabled
   syncEnabled: boolean
@@ -239,6 +258,12 @@ export class SettingTab extends PluginSettingTab {
         const draft = this.tempSettings
         const draftSnapshot = JSON.stringify(draft)
         const nextSettings = JSON.parse(draftSnapshot) as PluginSettings
+        try {
+          assertPluginSettingsRuntimeSafe(nextSettings)
+        } catch (error) {
+          new Notice(`GitHub Sync: Settings not saved. ${settingsSaveValidationHint(error)}`)
+          return
+        }
         this.settingsSavePending = true
         saveBtn.disabled = true
         discardBtn.disabled = true

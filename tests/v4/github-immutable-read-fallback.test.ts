@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { createHash } from "node:crypto";
 import { setRequestUrlHandler } from "obsidian";
 
 import { GitHubClient } from "../../src/lib/github-api";
@@ -12,6 +13,10 @@ const BLOB_SHA = "4".repeat(40);
 const EXEC_BLOB_SHA = "5".repeat(40);
 const OTHER_TREE_SHA = "6".repeat(40);
 const GITLINK_SHA = "7".repeat(40);
+
+function gitBlobSha(bytes: Uint8Array): string {
+  return createHash("sha1").update(`blob ${bytes.byteLength}\0`).update(bytes).digest("hex");
+}
 
 function response(input: { status: number; json?: unknown; bytes?: Uint8Array; text?: string }) {
   const bytes = input.bytes ?? new Uint8Array();
@@ -75,6 +80,7 @@ async function runScenario<T>(path: string, ref: string, scenario: Scenario, tas
 
 test("immutable Contents 404 traverses only the exact deep path with non-recursive trees", async () => {
   const payload = new TextEncoder().encode("freshly-published\n");
+  const BLOB_SHA = gitBlobSha(payload);
   await runScenario("dir/nested/file.md", COMMIT_SHA, {
     trees: {
       [ROOT_TREE_SHA]: { json: treePayload(ROOT_TREE_SHA, false, [treeNode("dir", "tree", "040000", DIR_TREE_SHA), treeNode("unrelated", "tree", "040000", OTHER_TREE_SHA)]) },
@@ -96,28 +102,31 @@ test("immutable Contents 404 traverses only the exact deep path with non-recursi
 
 test("exact Unicode/punctuation paths, executable blobs, and positive truncated entries succeed", async () => {
   const unicodePayload = new TextEncoder().encode("unicode\n");
+  const unicodeSha = gitBlobSha(unicodePayload);
   const unicodePath = "folder space/π ![]()#.md";
   await runScenario(unicodePath, COMMIT_SHA, {
     trees: {
       [ROOT_TREE_SHA]: { json: treePayload(ROOT_TREE_SHA, false, [treeNode("folder space", "tree", "040000", DIR_TREE_SHA)]) },
-      [DIR_TREE_SHA]: { json: treePayload(DIR_TREE_SHA, false, [treeNode("π ![]()#.md", "blob", "100644", BLOB_SHA)]) },
+      [DIR_TREE_SHA]: { json: treePayload(DIR_TREE_SHA, false, [treeNode("π ![]()#.md", "blob", "100644", unicodeSha)]) },
     },
-    blobs: { [BLOB_SHA]: { bytes: unicodePayload } },
+    blobs: { [unicodeSha]: { bytes: unicodePayload } },
   }, async (client, urls) => {
     assert.deepEqual((await client.getFileBytes(unicodePath, COMMIT_SHA))?.bytes, unicodePayload);
     assert.equal(urls.some(url => url.includes("folder%20space/%CF%80%20!%5B%5D()%23.md")), true);
   });
 
   const executable = new TextEncoder().encode("#!/bin/sh\n");
+  const executableSha = gitBlobSha(executable);
   await runScenario("tool.sh", COMMIT_SHA, {
-    trees: { [ROOT_TREE_SHA]: { json: treePayload(ROOT_TREE_SHA, false, [treeNode("tool.sh", "blob", "100755", EXEC_BLOB_SHA)]) } },
-    blobs: { [EXEC_BLOB_SHA]: { bytes: executable } },
+    trees: { [ROOT_TREE_SHA]: { json: treePayload(ROOT_TREE_SHA, false, [treeNode("tool.sh", "blob", "100755", executableSha)]) } },
+    blobs: { [executableSha]: { bytes: executable } },
   }, async client => assert.deepEqual((await client.getFileBytes("tool.sh", COMMIT_SHA))?.bytes, executable));
 
   const positive = new TextEncoder().encode("positive\n");
+  const positiveSha = gitBlobSha(positive);
   await runScenario("found.md", COMMIT_SHA, {
-    trees: { [ROOT_TREE_SHA]: { json: treePayload(ROOT_TREE_SHA, true, [treeNode("found.md", "blob", "100644", BLOB_SHA)]) } },
-    blobs: { [BLOB_SHA]: { bytes: positive } },
+    trees: { [ROOT_TREE_SHA]: { json: treePayload(ROOT_TREE_SHA, true, [treeNode("found.md", "blob", "100644", positiveSha)]) } },
+    blobs: { [positiveSha]: { bytes: positive } },
   }, async client => assert.deepEqual((await client.getFileBytes("found.md", COMMIT_SHA))?.bytes, positive));
 });
 

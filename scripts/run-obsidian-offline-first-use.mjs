@@ -222,10 +222,43 @@ async function performFirstUse() {
       const deviceInput=rowForDevice()?.querySelector("input");
       if(!tab.containerEl.isConnected||!deviceInput)
         throw Error("Native Settings Device ID input unavailable");
-      step="edit-native-device-id";
-      const newId="native-ui-"+originalId.slice(-12);
       const setter=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,"value")?.set;
       if(!setter)throw Error("Native input property missing");
+      // D449: Prove that invalid Git ref input never reaches the settings
+      // persistence API, then a corrected edit saves using the real UI.
+      step="reject-invalid-native-github-branch";
+      const branchRow=[...tab.containerEl.querySelectorAll(".setting-item")]
+        .find(row=>row.querySelector(".setting-item-name")?.textContent?.trim()==="GitHub branch");
+      const branchInput=branchRow?.querySelector("input");
+      if(!branchInput){step="native-branch-input-unavailable";throw Error("Native GitHub branch input unavailable");}
+      setter.call(branchInput,"invalid..branch");
+      branchInput.dispatchEvent(new Event("input",{bubbles:true}));
+      if(tab.tempSettings.githubBranch!=="invalid..branch"){
+        step="native-invalid-branch-input-not-applied";
+        throw Error("Native invalid branch input event did not update draft");
+      }
+      const invalidSave=[...tab.containerEl.querySelectorAll("button")]
+        .find(button=>button.textContent.trim()==="Save changes");
+      if(!invalidSave||invalidSave.disabled){step="native-invalid-save-action-missing";throw Error("Native invalid Save action missing");}
+      const originalSaveSettings=plugin.saveSettings.bind(plugin);
+      let saveAttempts=0;
+      plugin.saveSettings=async (...args)=>{
+        saveAttempts++;
+        return originalSaveSettings(...args);
+      };
+      invalidSave.click();
+      await new Promise(resolve=>setTimeout(resolve,150));
+      if(saveAttempts!==0){
+        step="native-invalid-branch-invoked-persistence";
+        throw Error("Invalid GitHub branch invoked Settings persistence");
+      }
+      if(plugin.settings.githubBranch!=="main"){step="native-invalid-branch-was-persisted";throw Error("Invalid branch published");}
+      if(!tab.isDirty()){step="native-invalid-branch-draft-discarded";throw Error("Invalid branch draft lost");}
+      if(tab.tempSettings.githubBranch!=="invalid..branch"){step="native-invalid-branch-draft-mutated";throw Error("Invalid branch value mutated");}
+      setter.call(branchInput,"main");
+      branchInput.dispatchEvent(new Event("input",{bubbles:true}));
+      step="edit-native-device-id";
+      const newId="native-ui-"+originalId.slice(-12);
       setter.call(deviceInput,newId);
       deviceInput.dispatchEvent(new Event("input",{bubbles:true}));
       const saveStart=Date.now();
@@ -245,10 +278,12 @@ async function performFirstUse() {
         await new Promise(resolve=>setTimeout(resolve,120));
       if(plugin.settings.vault!==newId||tab.isDirty())
         throw Error("Native UI Save did not persist Device ID");
+      if(saveAttempts!==1)throw Error("Corrected native UI Save did not use persistence exactly once");
+      plugin.saveSettings=originalSaveSettings;
       if(plugin.githubClient)throw Error("Native UI Save unexpectedly configured GitHub");
       host.close();
       return {generatedDeviceId:originalId,newDeviceId:newId,persisted:true,syncCenterOpen:true,
-        nativeSaveClicked:true,noCredentialSyncRejected:true,
+        nativeSaveClicked:true,invalidBranchRejectedBeforeSave:true,noCredentialSyncRejected:true,
         noCredentials:!(plugin.settings.githubToken||plugin.settings.githubOwner
           ||plugin.settings.githubRepo||plugin.settings.encryptionPassphrase)};
     } catch {
@@ -265,6 +300,7 @@ async function performFirstUse() {
   assert.equal(report.persisted, true)
   assert.equal(report.syncCenterOpen, true)
   assert.equal(report.nativeSaveClicked, true)
+  assert.equal(report.invalidBranchRejectedBeforeSave, true)
   assert.equal(report.noCredentialSyncRejected, true)
   assert.equal(report.noCredentials, true)
   return { generatedDeviceId: report.generatedDeviceId, savedDeviceId: report.newDeviceId }
@@ -528,6 +564,7 @@ try {
       settingsSaved: true, deviceIdPersistedAcrossRestart: true,
       nativeIndependentInstallations: 2, distinctGeneratedDeviceIds: true,
       syncCenterReady: true, nativeSettingsUiSave: true,
+      nativeInvalidBranchRejectedBeforeSave: true,
       noCredentialSyncRejected: true, noGitHubCredentials: true, remoteGitHubUsed: false,
       syntheticNotesPreserved: true, nativeHistoryRestoreCopy: true,
       nativeHistoryRestorePersistedAfterRestart: true,

@@ -190,6 +190,56 @@ test("D424 editing repository during a stalled connection check lets users retry
   }
 })
 
+test("D449 invalid user-editable Settings show specific secret-free guidance before any Save writes", async () => {
+  const sensitiveToken = "private-token-DO-NOT-LEAK"
+  const sensitivePassphrase = "private-passphrase-DO-NOT-LEAK"
+  const cases = [
+    { field: "githubOwner", invalid: "owner with spaces", valid: "different-owner", guidance: /GitHub owner/u },
+    { field: "githubRepo", invalid: "repo/path", valid: "other-notes", guidance: /GitHub repository/u },
+    { field: "githubBranch", invalid: "bad..branch", valid: "feature/notes", guidance: /GitHub branch.*\.\./u },
+    { field: "ignorePathRegex", invalid: "(?<private-regex-DO-NOT-LEAK>", valid: "^Archive/", guidance: /Ignore.path regex/u },
+  ] as const
+
+  for (const scenario of cases) {
+    let attempts = 0
+    const plugin = {
+      settings: { ...source, encryptionMode: "encrypted" as const,
+        githubToken: sensitiveToken, encryptionPassphrase: sensitivePassphrase },
+      clipboardReadTip: "",
+      async saveSettings(next: typeof plugin.settings) {
+        attempts++
+        plugin.settings = next
+      },
+      updateStatusBar() {},
+    }
+    const tab = new SettingTab({} as never, plugin as never)
+    tab.display()
+    tab.tempSettings![scenario.field] = scenario.invalid
+    tab.updateDirtyState()
+    assert.equal(tab.isDirty(), true)
+    const noticesBefore = Notice.messages.length
+    tab.containerEl.findByText("Save changes")?.onclick?.()
+    await waitForCondition(() => Notice.messages.length > noticesBefore, "invalid Save guidance")
+    const messages = Notice.messages.slice(noticesBefore)
+    assert.ok(messages.some(message => scenario.guidance.test(message)),
+      scenario.field + ": user should know which input needs fixing")
+    assert.ok(messages.every(message => !message.includes(scenario.invalid)
+      && !message.includes(sensitiveToken) && !message.includes(sensitivePassphrase)
+      && !message.includes("private-regex-DO-NOT-LEAK")),
+    "validation notices may never display raw field contents or credentials")
+    assert.equal(attempts, 0, "invalid input must be rejected before secure storage or plugin Save")
+    assert.equal(tab.tempSettings?.[scenario.field], scenario.invalid,
+      "failed validation should not clear the user's editable draft")
+    assert.equal(tab.isDirty(), true)
+    tab.tempSettings![scenario.field] = scenario.valid
+    tab.updateDirtyState()
+    tab.containerEl.findByText("Save changes")?.onclick?.()
+    await waitForCondition(() => !tab.isDirty(), "corrected user settings saved")
+    assert.equal(attempts, 1, "correction should allow Save without reopening the tab")
+    assert.equal(plugin.settings[scenario.field], scenario.valid)
+  }
+})
+
 test("D425 failed Settings Save never exposes storage exception secrets and remains retryable", async () => {
   const passphrase = "private-passphrase-must-not-appear"
   const settings = { ...source, encryptionMode: "encrypted" as const, encryptionPassphrase: passphrase }
