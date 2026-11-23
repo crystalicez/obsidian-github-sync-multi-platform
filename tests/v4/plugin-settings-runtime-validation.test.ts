@@ -32,6 +32,51 @@ test("settings validator preserves valid defaults and nested Git branch while re
   }
 });
 
+test("D475 legacy saved blank Device ID remains loadable for Settings repair without secret mutation", async () => {
+  const writes: string[] = []
+  const legacy = { ...valid, vault: "", githubToken: "" }
+  const fake = {
+    loadData: async () => ({ settings: legacy }),
+    canMigrateStartupSecrets: async () => false,
+    app: { secretStorage: {
+      getSecret: () => null,
+      setSecret: (id: string) => { writes.push(id) },
+    } },
+  } as unknown as FastSync
+  await FastSync.prototype.loadSettings.call(fake)
+  assert.equal(fake.settings.vault, "",
+    "loading an old blank ID must not silently replace the device identity or prevent Settings access")
+  assert.deepEqual(writes, [], "startup must not rewrite saved secrets")
+})
+
+test("D475 an empty Device ID is rejected at the direct Save boundary before secrets or disk writes", async () => {
+  const saved = { ...valid, vault: "existing-device", githubTokenSecretId: "token-id", encryptionPassphraseSecretId: "pass-id" }
+  const secretWrites: string[] = []
+  let diskWrites = 0
+  const plugin = {
+    settings: saved,
+    secretStorageReadUnavailable: false,
+    settingsSaveInProgress: false,
+    settingsSaveAttemptGeneration: 0,
+    app: { secretStorage: {
+      getSecret: () => null,
+      setSecret: (id: string) => { secretWrites.push(id) },
+    } },
+    v4Runtime: { assertReencryptionSettingsSaveAllowed: async () => undefined },
+    persistData: async () => { diskWrites++ },
+    initGitHubClient: () => undefined,
+    registerScheduledSync: () => undefined,
+    createSecretId: () => { throw new Error("no new secrets should be allocated") },
+  } as unknown as FastSync
+  for (const vault of ["", "  \t "]) {
+    await assert.rejects(() => FastSync.prototype.saveSettings.call(plugin,
+      { ...saved, vault }), /Device ID/u)
+    assert.deepEqual(secretWrites, [])
+    assert.equal(diskWrites, 0)
+    assert.equal(plugin.settings.vault, "existing-device")
+  }
+})
+
 test("corrupt saved settings are rejected before startup secret migration side effects", async () => {
   const writes: string[] = [];
   const fake = {

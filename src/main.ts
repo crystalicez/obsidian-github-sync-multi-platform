@@ -2,7 +2,7 @@ import { Plugin, setIcon, Modal, Notice, TFile, TFolder, Platform } from "obsidi
 
 import { SettingTab, PluginSettings, DEFAULT_SETTINGS } from "./setting";
 import { GitHubClient } from "./lib/github-api";
-import { assertPluginSettingsRuntimeSafe } from "./lib/plugin-settings-validation";
+import { assertPluginSettingsRuntimeSafe, assertPluginSettingsSavable } from "./lib/plugin-settings-validation";
 import { V4RateLimitCooldownStore } from "./lib/v4/rate-limit-cooldown";
 import { selectV4GitHubSchedulerSleep } from "./lib/v4/desktop-transport-timer";
 import { missingGitHubSyncConfigFields, normalizeScheduledSyncIntervalSeconds, shouldRunScheduledSync, shouldRunStartupSync } from "./lib/sync-policy";
@@ -118,6 +118,9 @@ export default class FastSync extends Plugin {
         && this.settings.encryptionPassphraseSecretId && !this.settings.encryptionPassphrase) {
         new Notice("GitHub Sync: Saved encryption passphrase is unavailable after restart. Re-enter it in Settings before encrypted Sync.")
       }
+    }
+    if (!this.settings.vault.trim()) {
+      new Notice("GitHub Sync: Saved Device ID is empty. Enter a unique Device ID in Settings and Save changes before syncing.")
     }
     if (this.secretsMigrated) {
       if (await this.canMigrateStartupSecrets()) await this.persistData()
@@ -549,7 +552,7 @@ export default class FastSync extends Plugin {
   async saveSettings(nextSettings: PluginSettings = this.settings) {
     // Never publish a draft to running syncs or overwrite active credentials
     // before its persisted settings record has committed.
-    assertPluginSettingsRuntimeSafe(nextSettings)
+    assertPluginSettingsSavable(nextSettings)
     if (this.secretStorageReadUnavailable) throw new Error("GitHub Sync: SecretStorage unavailable. Restart Obsidian after restoring secure storage before saving Settings.")
     if (this.settingsSaveInProgress) throw new Error("GitHub Sync: Settings save already in progress.")
     const previous = this.settings
@@ -567,7 +570,7 @@ export default class FastSync extends Plugin {
     if (!prepared.encryptionPassphraseSecretId || prepared.encryptionPassphrase !== previous.encryptionPassphrase) {
       prepared.encryptionPassphraseSecretId = this.createSecretId("encryption-passphrase")
     }
-    assertPluginSettingsRuntimeSafe(prepared)
+    assertPluginSettingsSavable(prepared)
     const newTokenId = prepared.githubTokenSecretId !== previous.githubTokenSecretId
       ? prepared.githubTokenSecretId : ""
     const newPassphraseId = prepared.encryptionPassphraseSecretId !== previous.encryptionPassphraseSecretId

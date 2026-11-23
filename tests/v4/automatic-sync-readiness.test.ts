@@ -26,10 +26,22 @@ test("D416 incomplete credentials never arm startup or interval Sync; valid plai
   assert.equal(shouldRunScheduledSync(encrypted), true)
 })
 
+test("D475 an empty saved Device ID pauses startup and scheduled Sync even with valid credentials", () => {
+  for (const vault of ["", " ", "  \t  "]) {
+    const invalid = { ...plaintext, vault }
+    assert.equal(hasGitHubSyncConfig(invalid), false)
+    assert.equal(shouldRunStartupSync(invalid), false)
+    assert.equal(shouldRunScheduledSync(invalid), false)
+  }
+  assert.equal(hasGitHubSyncConfig(plaintext), true,
+    "ordinary nonempty identities must continue to synchronize")
+})
+
 test("D416 file-change auto Sync skips incomplete credentials without scheduling a doomed run", () => {
   for (const settings of [
     { ...DEFAULT_SETTINGS, syncEnabled: true, syncOnLocalChange: true },
     { ...encrypted, encryptionPassphrase: "", syncOnLocalChange: true },
+    { ...plaintext, vault: "  ", syncOnLocalChange: true },
   ]) {
     const plugin = {
       settings, isWatchEnabled: true, ignoredFiles: new Set<string>(),

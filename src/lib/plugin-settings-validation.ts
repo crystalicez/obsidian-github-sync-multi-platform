@@ -100,3 +100,10 @@ export function assertPluginSettingsRuntimeSafe(value: unknown): void {
     "consoleLoggingEnabled",
   ]) optionalBoolean(settings, key)
 }
+
+/** Existing saved identities may be empty; load them for user repair, but never commit a new blank identity. */
+export function assertPluginSettingsSavable(value: unknown): void {
+  assertPluginSettingsRuntimeSafe(value)
+  const settings = value as RuntimeSettings
+  if (!(settings["vault"] as string).trim()) throw new Error("Device ID is required.")
+}

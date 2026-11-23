@@ -6,7 +6,7 @@ import { decodeV4RemoteConfig, decodeV4RemoteHead } from "./lib/v4/remote-index"
 import { V4_CONFIG_PATH, V4_HEAD_PATH, effectiveV4PathLayout, expectedV4PathLayout } from "./lib/v4/protocol-types";
 
 import FastSync from "./main";
-import { assertPluginSettingsRuntimeSafe } from "./lib/plugin-settings-validation";
+import { assertPluginSettingsRuntimeSafe, assertPluginSettingsSavable } from "./lib/plugin-settings-validation";
 import { createDebugPayload } from "./lib/debug";
 import { V4_NETWORK_VAULT_WARNING } from "./lib/v4/network-storage";
 import { V4_DEFAULT_PBKDF2_ITERATIONS, V4_MAX_PBKDF2_ITERATIONS, V4_MIN_NEW_PBKDF2_ITERATIONS } from "./lib/v4/kdf-policy";
@@ -23,6 +23,9 @@ function settingsSaveValidationHint(error: unknown): string {
   }
   if (message === "Invalid GitHub branch.") {
     return "Check GitHub branch: remove spaces, '..', repeated slashes, trailing dots, or invalid characters."
+  }
+  if (message === "Device ID is required.") {
+    return "Enter a Device ID for this Obsidian vault. Keep it unique per device, then Save changes."
   }
   if (error instanceof SyntaxError) {
     return "Check Ignore-path regex: correct the invalid regular expression."
@@ -273,7 +276,7 @@ export class SettingTab extends PluginSettingTab {
         const draftSnapshot = JSON.stringify(draft)
         const nextSettings = JSON.parse(draftSnapshot) as PluginSettings
         try {
-          assertPluginSettingsRuntimeSafe(nextSettings)
+          assertPluginSettingsSavable(nextSettings)
         } catch (error) {
           new Notice(`GitHub Sync: Settings not saved. ${settingsSaveValidationHint(error)}`)
           return
