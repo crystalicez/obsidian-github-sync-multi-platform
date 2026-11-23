@@ -724,13 +724,18 @@ export default class FastSync extends Plugin {
     await new Promise<void>((resolve) => {
       const confirmedSettings = { ...this.settings }
       const confirmedGithubClient = this.githubClient
+      const confirmedRuntime = this.v4Runtime
+      const confirmedVault = this.app.vault
+      const confirmedConfigDir = confirmedVault.configDir || ".obsidian"
+      const confirmedPluginId = this.manifest.id
+      const confirmedSaveGeneration = this.settingsSaveGeneration
       // Force approval must cover the SAME scope as Sync, including eligible
       // .obsidian files selected by Bookmarks, Plugins and Config toggles.
       let inForceScope: (path: string) => boolean
       try {
         inForceScope = createV4ScopePredicate({
-          configDir: this.app.vault.configDir || ".obsidian",
-          pluginId: this.manifest.id,
+          configDir: confirmedConfigDir,
+          pluginId: confirmedPluginId,
           ignorePathRegex: confirmedSettings.ignorePathRegex,
           syncObsidianConfig: confirmedSettings.syncObsidianConfig,
           syncBookmarks: confirmedSettings.syncBookmarks,
@@ -743,7 +748,7 @@ export default class FastSync extends Plugin {
       }
       // Bind approval to scoped paths and file metadata, not just the count.
       // Background edits can change notes while the modal is open.
-      const visibleVaultFiles = () => this.app.vault.getFiles()
+      const visibleVaultFiles = () => confirmedVault.getFiles()
         .filter(file => inForceScope(file.path))
         .map(file => {
           const { size, mtime } = file.stat
@@ -777,10 +782,10 @@ export default class FastSync extends Plugin {
         if (isVisible(file.path)) visibleVaultChanged = true
       }
       const changeRefs = [
-        this.app.vault.on("create", onFileChange),
-        this.app.vault.on("modify", onFileChange),
-        this.app.vault.on("delete", onFileChange),
-        this.app.vault.on("rename", (file, oldPath) => {
+        confirmedVault.on("create", onFileChange),
+        confirmedVault.on("modify", onFileChange),
+        confirmedVault.on("delete", onFileChange),
+        confirmedVault.on("rename", (file, oldPath) => {
           if (isVisible(file.path) || isVisible(oldPath)) visibleVaultChanged = true
         }),
       ]
@@ -788,7 +793,7 @@ export default class FastSync extends Plugin {
       const releaseChangeListeners = () => {
         if (listenersReleased) return
         listenersReleased = true
-        for (const ref of changeRefs) this.app.vault.offref(ref)
+        for (const ref of changeRefs) confirmedVault.offref(ref)
       }
       const sameVisibleVaultInventory = (): boolean => {
         try {
@@ -814,7 +819,12 @@ export default class FastSync extends Plugin {
         "scheduledSyncEnabled", "scheduledSyncIntervalSeconds",
       ])
       const stillConfirmed = () => !this.settingsSaveInProgress
+        && this.settingsSaveGeneration === confirmedSaveGeneration
         && !visibleVaultChanged
+        && this.v4Runtime === confirmedRuntime
+        && this.app.vault === confirmedVault
+        && (confirmedVault.configDir || ".obsidian") === confirmedConfigDir
+        && this.manifest.id === confirmedPluginId
         && this.githubClient === confirmedGithubClient
         && sameVisibleVaultInventory()
         && !this.settingTab?.isDirty()
@@ -895,8 +905,8 @@ export default class FastSync extends Plugin {
         }
         resolved = true
         modal.close()
-        if (operation === "forcePush") this.runSyncFromUi(() => this.v4Runtime.forcePush())
-        else this.runSyncFromUi(() => this.v4Runtime.forcePull())
+        if (operation === "forcePush") this.runSyncFromUi(() => confirmedRuntime.forcePush())
+        else this.runSyncFromUi(() => confirmedRuntime.forcePull())
         finish()
       }
       confirmButton.onclick = runConfirmedOperation

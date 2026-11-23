@@ -1324,6 +1324,102 @@ test("D158 Force confirmation refuses a swapped GitHub client or a changed visib
   }
 })
 
+test("D484 Force approval pins Runtime, Vault and settings save generation and cleans the owning Vault listeners", async () => {
+  for (const kind of ["forcePush", "forcePull"] as const) {
+    const ui = setupUi()
+    resetModalTestState()
+    Notice.messages.length = 0
+    try {
+      await ui.plugin.onload()
+      ui.setMode("resolve")
+      const pinnedRuntime = ui.plugin.v4Runtime
+      const pinnedVault = ui.plugin.app.vault
+      const pinnedPluginId = ui.plugin.manifest.id
+      const pinnedConfigDir = pinnedVault.configDir
+      let subscribed = 0
+      let released = 0
+      let wrongRuntimeOperations = 0
+      let wrongVaultCleanup = 0
+      pinnedVault.getFiles = () => [{ path: "Notes/synthetic.md", stat: { size: 12, mtime: 1000 } }]
+      pinnedVault.on = (event: string, callback: (...args: any[]) => void) => {
+        subscribed += 1
+        return { event, callback, owner: pinnedVault }
+      }
+      pinnedVault.offref = (ref: { owner: unknown }) => {
+        assert.equal(ref.owner, pinnedVault, "listener must be released by its registering Vault")
+        released += 1
+      }
+
+      const actionLabel = kind === "forcePush" ? "Force push" : "Force pull"
+      const launch = () => {
+        resetModalTestState()
+        const done = ui.plugin.showForceConfirm(kind)
+        const action = modalButtons.find(button => button.text === actionLabel)
+        const slider = Modal.lastCreated?.contentEl.findByClass("github-sync-force-confirm-slider")
+        assert.ok(action && slider)
+        slider.onpointerdown?.({ pointerId: 1, clientX: 300 } as PointerEvent)
+        return { done, action }
+      }
+      const scenarios = [
+        { name: "Runtime replacement", change: () => {
+          ui.plugin.v4Runtime = {
+            ...pinnedRuntime,
+            forcePush: async () => { wrongRuntimeOperations += 1 },
+            forcePull: async () => { wrongRuntimeOperations += 1 },
+          }
+        } },
+        { name: "Vault replacement with identical file inventory", change: () => {
+          ui.plugin.app.vault = {
+            ...pinnedVault,
+            getFiles: pinnedVault.getFiles,
+            offref: () => { wrongVaultCleanup += 1 },
+          }
+        } },
+        { name: "Vault config directory changed without a file stat change", change: () => {
+          pinnedVault.configDir = ".different-config"
+        } },
+        { name: "Plugin identity changed without a file stat change", change: () => {
+          ui.plugin.manifest.id = "different-plugin"
+        } },
+        { name: "Intervening Settings save attempt with the same final field values", change: () => {
+          ui.plugin.settingsSaveAttemptGeneration += 1
+        } },
+      ]
+      for (const scenario of scenarios) {
+        const { done, action } = launch()
+        const before = ui.attempts.length
+        scenario.change()
+        action.click()
+        await done
+        assert.equal(ui.attempts.length, before,
+          `old ${kind} confirmation must expire after ${scenario.name}`)
+        assert.equal(wrongRuntimeOperations, 0,
+          "old Force approval must not authorize a replacement Runtime")
+        assert.match(Notice.messages.at(-1) ?? "", /Force confirmation expired/u)
+        assert.equal(released, subscribed,
+          "change listeners must be removed from the original Vault after expiration")
+        assert.equal(wrongVaultCleanup, 0,
+          "replacement Vault must not be asked to release another Vault's listeners")
+        ui.plugin.v4Runtime = pinnedRuntime
+        ui.plugin.app.vault = pinnedVault
+        pinnedVault.configDir = pinnedConfigDir
+        ui.plugin.manifest.id = pinnedPluginId
+      }
+
+      const fresh = launch()
+      fresh.action.click()
+      await fresh.done
+      await tick()
+      assert.deepEqual(ui.attempts, [kind], "fresh approval still executes once")
+      assert.equal(released, subscribed, "fresh confirmation must also release listeners")
+    } finally {
+      ui.cleanup()
+      resetModalTestState()
+      Notice.messages.length = 0
+    }
+  }
+})
+
 test("D157 stale Force confirmation cannot switch repository, branch, credentials, encryption, vault or scope", async () => {
   const scenarios = [
     { name: "repository replacement", apply: (s: typeof DEFAULT_SETTINGS) => ({ ...s, githubRepo: "different-repository" }) },

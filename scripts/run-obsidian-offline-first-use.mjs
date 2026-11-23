@@ -410,8 +410,9 @@ async function performNativeForceChangeRefusal() {
     if(plugin.githubClient || plugin.settings.githubToken)
       return {failedAt:"unexpected-native-credential"};
     const original=plugin.settings;
-    const originalPush=plugin.v4Runtime.forcePush;
-    const originalPull=plugin.v4Runtime.forcePull;
+    const originalRuntime=plugin.v4Runtime;
+    const originalPush=originalRuntime.forcePush;
+    const originalPull=originalRuntime.forcePull;
     const note=app.vault.getAbstractFileByPath("D445-synthetic-first-use.md");
     let attempts=0;
     let activeModal;
@@ -428,6 +429,7 @@ async function performNativeForceChangeRefusal() {
         for(const scenario of [
           {name:"note",path:note.path,syncBookmarks:false},
           {name:"bookmarks",path:".obsidian/bookmarks.json",syncBookmarks:true},
+          {name:"runtime-replaced",path:note.path,syncBookmarks:false},
         ]) {
         plugin.settings={...plugin.settings,syncBookmarks:scenario.syncBookmarks};
         step="open-"+operation+"-"+scenario.name;
@@ -453,7 +455,15 @@ async function performNativeForceChangeRefusal() {
         if(button.style.display==="none")throw Error("Force action did not unlock");
         step="invalidate-"+operation;
         const size=note.stat.size,mtime=note.stat.mtime;
-        app.vault.trigger("modify",scenario.name==="note"?note:{path:scenario.path}); // Event only; no file mutation.
+        if(scenario.name==="runtime-replaced") {
+          // Deliberately replace the plugin Runtime with a harmless mock
+          // while the already-unlocked real Obsidian modal is still open.
+          plugin.v4Runtime={...originalRuntime,
+            forcePush:async()=>{attempts++;},
+            forcePull:async()=>{attempts++;}};
+        } else {
+          app.vault.trigger("modify",scenario.name==="note"?note:{path:scenario.path}); // Event only; no file mutation.
+        }
         if(note.stat.size!==size||note.stat.mtime!==mtime)
           throw Error("Synthetic metadata changed");
         button.click();
@@ -461,6 +471,7 @@ async function performNativeForceChangeRefusal() {
           setTimeout(()=>reject(Error("Force modal did not settle")),4500))]);
         activeModal=undefined;
         if(attempts!==0)throw Error("Stale Force actually executed");
+        plugin.v4Runtime=originalRuntime;
         }
       }
       if(plugin.githubClient)throw Error("Synthetic Force created GitHub client");
@@ -473,8 +484,9 @@ async function performNativeForceChangeRefusal() {
         cancel?.click();
       }
       plugin.settings=original;
-      plugin.v4Runtime.forcePush=originalPush;
-      plugin.v4Runtime.forcePull=originalPull;
+      plugin.v4Runtime=originalRuntime;
+      originalRuntime.forcePush=originalPush;
+      originalRuntime.forcePull=originalPull;
     }
   })()`, 36000)
   if (result?.failedAt) {
