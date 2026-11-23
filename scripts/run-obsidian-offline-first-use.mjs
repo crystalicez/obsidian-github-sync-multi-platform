@@ -425,7 +425,12 @@ async function performNativeForceChangeRefusal() {
         githubToken:"synthetic-not-a-real-token",
         syncEnabled:false,syncOnLocalChange:false,scheduledSyncEnabled:false};
       for(const operation of ["forcePush","forcePull"]) {
-        step="open-"+operation;
+        for(const scenario of [
+          {name:"note",path:note.path,syncBookmarks:false},
+          {name:"bookmarks",path:".obsidian/bookmarks.json",syncBookmarks:true},
+        ]) {
+        plugin.settings={...plugin.settings,syncBookmarks:scenario.syncBookmarks};
+        step="open-"+operation+"-"+scenario.name;
         const pending=plugin.showForceConfirm(operation);
         const start=Date.now();
         let slider,button;
@@ -448,7 +453,7 @@ async function performNativeForceChangeRefusal() {
         if(button.style.display==="none")throw Error("Force action did not unlock");
         step="invalidate-"+operation;
         const size=note.stat.size,mtime=note.stat.mtime;
-        app.vault.trigger("modify",note); // Event only: no file mutation.
+        app.vault.trigger("modify",scenario.name==="note"?note:{path:scenario.path}); // Event only; no file mutation.
         if(note.stat.size!==size||note.stat.mtime!==mtime)
           throw Error("Synthetic metadata changed");
         button.click();
@@ -456,6 +461,7 @@ async function performNativeForceChangeRefusal() {
           setTimeout(()=>reject(Error("Force modal did not settle")),4500))]);
         activeModal=undefined;
         if(attempts!==0)throw Error("Stale Force actually executed");
+        }
       }
       if(plugin.githubClient)throw Error("Synthetic Force created GitHub client");
       return {noForceExecuted:true};

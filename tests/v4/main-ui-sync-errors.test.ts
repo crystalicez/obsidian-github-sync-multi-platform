@@ -1159,6 +1159,95 @@ test("D482 Force confirmation expires on Vault file events even when path, size 
   }
 })
 
+test("D483 Force approval tracks explicitly synchronized Obsidian config, bookmarks and plugins", async () => {
+  for (const kind of ["forcePush", "forcePull"] as const) {
+    const ui = setupUi()
+    resetModalTestState()
+    Notice.messages.length = 0
+    try {
+      await ui.plugin.onload()
+      ui.setMode("resolve")
+      const listeners = new Map<string, Set<(...args: any[]) => void>>()
+      let subscribed = 0
+      let released = 0
+      ui.plugin.app.vault.on = (event: string, cb: (...args: any[]) => void) => {
+        const handlers = listeners.get(event) ?? new Set<(...args: any[]) => void>()
+        handlers.add(cb)
+        listeners.set(event, handlers)
+        subscribed++
+        return { event, cb }
+      }
+      ui.plugin.app.vault.offref = (ref: { event: string, cb: (...args: any[]) => void }) => {
+        if (listeners.get(ref.event)?.delete(ref.cb)) released++
+      }
+      const trackedPath = (path: string) => ({ path, stat: { size: 12, mtime: 1000 } })
+      const label = kind === "forcePush" ? "Force push" : "Force pull"
+      const emit = (event: string, ...args: unknown[]) => {
+        for (const handler of listeners.get(event) ?? []) handler(...args)
+      }
+      const launch = () => {
+        resetModalTestState()
+        const pending = ui.plugin.showForceConfirm(kind)
+        const action = modalButtons.find(button => button.text === label)
+        const slider = Modal.lastCreated?.contentEl.findByClass("github-sync-force-confirm-slider")
+        assert.ok(action && slider)
+        slider.onpointerdown?.({ pointerId: 1, clientX: 300 } as PointerEvent)
+        return { pending, action }
+      }
+
+      for (const scenario of [
+        { settings: { syncObsidianConfig: true }, path: ".obsidian/hotkeys.json", event: "modify" },
+        { settings: { syncBookmarks: true }, path: ".obsidian/bookmarks.json", event: "modify" },
+        { settings: { syncPlugins: true }, path: ".obsidian/community-plugins.json", event: "modify" },
+        { settings: { syncPlugins: true }, path: ".obsidian/plugins/other-plugin/main.js", event: "create" },
+        { settings: { syncBookmarks: true }, path: ".obsidian/bookmarks.json", event: "rename" },
+      ]) {
+        ui.plugin.settings = { ...ui.plugin.settings,
+          syncObsidianConfig: false, syncBookmarks: false, syncPlugins: false,
+          ...scenario.settings }
+        ui.plugin.app.vault.getFiles = () => [trackedPath("Notes/readme.md"), trackedPath(scenario.path)]
+        const before = ui.attempts.length
+        const { pending, action } = launch()
+        assert.match(Modal.lastCreated!.contentEl.flattenText(), /Local vault files: 2/u,
+          `Force confirmation must show the synchronized ${scenario.path} in its inventory`)
+        if (scenario.event === "rename") emit("rename", trackedPath(".obsidian/new-file.md"), scenario.path)
+        else emit(scenario.event, trackedPath(scenario.path))
+        action.click()
+        await pending
+        assert.equal(ui.attempts.length, before,
+          `stale ${kind} cannot authorize after changed synced config ${scenario.path}`)
+        assert.match(Notice.messages.at(-1) ?? "", /Force confirmation expired/u)
+        assert.equal(released, subscribed, "closed dialog must unregister all four change listeners")
+      }
+
+      // Disabled scopes, workspace metadata, our plugin directory, and ignored
+      // paths must NOT force needless reconfirmation when they cannot Sync.
+      ui.plugin.settings = { ...ui.plugin.settings, syncObsidianConfig: false,
+        syncBookmarks: false, syncPlugins: false, ignorePathRegex: "^Ignored/" }
+      ui.plugin.app.vault.getFiles = () => [
+        trackedPath("Notes/readme.md"), trackedPath("Ignored/log.md"),
+        trackedPath(".obsidian/bookmarks.json"), trackedPath(".obsidian/hotkeys.json"),
+      ]
+      const unaffected = launch()
+      assert.match(Modal.lastCreated!.contentEl.flattenText(), /Local vault files: 1/u,
+        "only files eligible for Sync should appear in Force's count")
+      for (const path of ["Ignored/log.md", ".obsidian/bookmarks.json", ".obsidian/hotkeys.json",
+        ".obsidian/workspace.json", ".obsidian/plugins/test/data.json"]) {
+        emit("modify", trackedPath(path))
+      }
+      unaffected.action.click()
+      await unaffected.pending
+      await tick()
+      assert.deepEqual(ui.attempts, [kind], "excluded file events must not invalidate Force")
+      assert.equal(released, subscribed)
+    } finally {
+      ui.cleanup()
+      resetModalTestState()
+      Notice.messages.length = 0
+    }
+  }
+})
+
 test("D158 Force confirmation refuses a swapped GitHub client or a changed visible vault inventory", async () => {
   for (const kind of ["forcePush", "forcePull"] as const) {
     const ui = setupUi()

@@ -9,6 +9,7 @@ import { hasGitHubSyncConfig, missingGitHubSyncConfigFields, normalizeScheduledS
 import { hydrateV4SecretsReadOnly, migrateV4Secrets, sanitizeV4SettingsForPersistence, storeV4Secrets } from "./lib/v4/secrets";
 import { assertV4ReencryptionSyncFenceClear } from "./lib/v4/reencryption-sync-fence";
 import { V4PluginRuntime } from "./lib/v4/runtime";
+import { createV4ScopePredicate } from "./lib/v4/scope";
 import { persistV4FencedDestinationSettings, type V4FencedPluginSettingsCutoverReport } from "./lib/v4/reencryption-persisted-settings-cutover";
 import type { V4FencedPendingCommitPreflightInput } from "./lib/v4/reencryption-fenced-pending-commit-preflight";
 import { createIdleV4Progress } from "./lib/v4/progress";
@@ -723,10 +724,27 @@ export default class FastSync extends Plugin {
     await new Promise<void>((resolve) => {
       const confirmedSettings = { ...this.settings }
       const confirmedGithubClient = this.githubClient
-      // Bind approval to visible paths and file metadata, not just the count.
+      // Force approval must cover the SAME scope as Sync, including eligible
+      // .obsidian files selected by Bookmarks, Plugins and Config toggles.
+      let inForceScope: (path: string) => boolean
+      try {
+        inForceScope = createV4ScopePredicate({
+          configDir: this.app.vault.configDir || ".obsidian",
+          pluginId: this.manifest.id,
+          ignorePathRegex: confirmedSettings.ignorePathRegex,
+          syncObsidianConfig: confirmedSettings.syncObsidianConfig,
+          syncBookmarks: confirmedSettings.syncBookmarks,
+          syncPlugins: confirmedSettings.syncPlugins,
+        })
+      } catch {
+        new Notice("GitHub Sync: Cannot inspect configured Sync scope. Review Settings before Force.")
+        resolve()
+        return
+      }
+      // Bind approval to scoped paths and file metadata, not just the count.
       // Background edits can change notes while the modal is open.
       const visibleVaultFiles = () => this.app.vault.getFiles()
-        .filter(file => !file.path.startsWith(`${this.app.vault.configDir}/`))
+        .filter(file => inForceScope(file.path))
         .map(file => {
           const { size, mtime } = file.stat
           if (!Number.isFinite(size) || size < 0 || !Number.isFinite(mtime)) {
@@ -749,7 +767,12 @@ export default class FastSync extends Plugin {
       // even when a second inventory scan cannot distinguish the contents.
       // Keep the metadata scan as a separate safety check for missed events.
       let visibleVaultChanged = false
-      const isVisible = (path: string) => !path.startsWith(`${this.app.vault.configDir}/`)
+      // An unexpected malformed event path must fail closed, not crash the
+      // listener or accidentally authorize a destructive operation.
+      const isVisible = (path: string): boolean => {
+        try { return inForceScope(path) }
+        catch { return true }
+      }
       const onFileChange = (file: { path: string }) => {
         if (isVisible(file.path)) visibleVaultChanged = true
       }
