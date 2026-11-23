@@ -129,11 +129,12 @@ export function coalesceV4Changes(changes: V4QueuedChange[]): V4QueuedChange[] {
 }
 
 export class V4SyncCoordinator {
-  private readonly pending: V4QueuedChange[] = [];
+  private pending: V4QueuedChange[] = [];
   private active: Promise<V4CoordinatorRunResult> | undefined;
   private activeController: AbortController | undefined;
   private timer?: unknown;
   private flushAfterActive = false;
+  private automaticSyncPaused = false;
   private reencryptionReserved = false;
   private reencryptionDirty = false;
   private disposed = false;
@@ -195,6 +196,10 @@ export class V4SyncCoordinator {
 
   async run(request: V4SyncRequest): Promise<V4CoordinatorRunResult> {
     if (this.disposed) return { status: "skipped", changedFiles: 0 };
+    if (this.automaticSyncPaused && (request.trigger === "scheduled"
+      || request.trigger === "startup" || request.trigger === "localChange")) {
+      return { status: "skipped", changedFiles: 0 };
+    }
     if (this.reencryptionReserved) {
       if (request.trigger === "scheduled" || request.trigger === "startup") return { status: "skipped", changedFiles: 0 };
       this.options.notice?.("GitHub Sync: Re-encryption preparation has paused Sync. Review migration recovery before retrying.");
@@ -229,7 +234,7 @@ export class V4SyncCoordinator {
     void run.catch(() => {
       if (this.disposed) return;
       try {
-        this.options.notice?.("GitHub Sync: Automatic Sync stopped unexpectedly. Review Sync status before retrying manually.");
+        this.options.notice?.("GitHub Sync: Automatic Sync stopped unexpectedly and is paused for this session. Review Sync status, then run Sync now manually.");
       } catch {
         // Even a broken notification handler must not create another unhandled
         // rejection from this detached background task.
@@ -238,7 +243,9 @@ export class V4SyncCoordinator {
   }
 
   private async flushLocalChanges(): Promise<V4CoordinatorRunResult> {
-    if (this.disposed || this.reencryptionReserved) return { status: "skipped", changedFiles: 0 };
+    if (this.disposed || this.reencryptionReserved || this.automaticSyncPaused) {
+      return { status: "skipped", changedFiles: 0 };
+    }
     if (this.active) {
       this.flushAfterActive = true;
       return { status: "busy", changedFiles: 0 };
@@ -274,19 +281,35 @@ export class V4SyncCoordinator {
         this.flushAfterActive = false;
         return;
       }
+      if (this.automaticSyncPaused) {
+        this.flushAfterActive = false;
+        return;
+      }
       if (this.pending.length > 0 && this.flushAfterActive) {
         this.flushAfterActive = false;
         this.observeBackgroundRun(this.flushLocalChanges());
       }
     });
     this.active = tracked;
+    const fail = (error: unknown): void => {
+      if (!this.disposed) {
+        this.automaticSyncPaused = true;
+        this.pending = changes.concat(this.pending);
+      }
+      rejectExecution(error);
+    };
     try {
       this.options.execute(request, changes, controller.signal).then(
-        result => resolveExecution({ status: "completed", ...result }),
-        rejectExecution,
+        result => {
+          if (request.trigger === "manual" || request.trigger === "forcePush" || request.trigger === "forcePull") {
+            this.automaticSyncPaused = false;
+          }
+          resolveExecution({ status: "completed", ...result });
+        },
+        fail,
       );
     } catch (error) {
-      rejectExecution(error);
+      fail(error);
     }
     return tracked;
   }

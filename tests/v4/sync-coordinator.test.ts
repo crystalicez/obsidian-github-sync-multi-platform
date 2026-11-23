@@ -150,6 +150,130 @@ test("v4 coordinator globally debounces and coalesces local changes for five sec
   assert.equal(executions[0].request.trigger, "localChange");
 });
 
+test("D468 failed Sync with a due follow-up holds queued edits until explicit reconciliation", async () => {
+  const timers = new FakeTimers();
+  let release!: () => void;
+  const paused = new Promise<void>(resolve => { release = resolve; });
+  const executions: V4QueuedChange[][] = [];
+  const coordinator = new V4SyncCoordinator({
+    execute: async (_request, changes) => {
+      executions.push(changes);
+      if (executions.length === 1) {
+        await paused;
+        throw Error("uncertain remote write");
+      }
+      return { changedFiles: changes.length };
+    },
+    schedule: timers.schedule,
+    cancel: timers.cancel,
+  });
+  const first = coordinator.run({ operation: "normal", trigger: "manual" });
+  coordinator.enqueue({ type: "modify", path: "during.md", mtime: 2 });
+  timers.fireLatest();
+  release();
+  await assert.rejects(first, /uncertain remote write/);
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(executions.length, 1, "failed Sync must not launch a queued automatic follow-up");
+  assert.equal(coordinator.pendingCount, 1, "edits arriving during the failed Sync stay queued");
+  assert.equal((await coordinator.run({ operation: "normal", trigger: "scheduled" })).status, "skipped");
+  assert.equal((await coordinator.run({ operation: "normal", trigger: "manual" })).status, "completed");
+  assert.deepEqual(executions[1], [{ type: "modify", path: "during.md", mtime: 2 }]);
+  assert.equal(coordinator.pendingCount, 0);
+});
+
+test("D468 failed automatic Sync retains original changes and pauses later automatic retries", async () => {
+  const timers = new FakeTimers();
+  const executions: V4QueuedChange[][] = [];
+  const notices: string[] = [];
+  const coordinator = new V4SyncCoordinator({
+    execute: async (_request, changes) => {
+      executions.push(changes);
+      if (executions.length === 1) throw Error("uncertain remote error containing private content");
+      return { changedFiles: changes.length };
+    },
+    notice: message => notices.push(message),
+    schedule: timers.schedule,
+    cancel: timers.cancel,
+  });
+  coordinator.enqueue({ type: "modify", path: "before.md", mtime: 1 });
+  timers.fireLatest();
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(coordinator.pendingCount, 1, "a failed attempt must not discard flushed file events");
+  coordinator.enqueue({ type: "modify", path: "after.md", mtime: 2 });
+  timers.fireLatest();
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(executions.length, 1, "a new event must not silently resume automatic writes after uncertainty");
+  assert.equal(coordinator.pendingCount, 2);
+  assert.equal(notices.length, 1);
+  assert.doesNotMatch(notices[0]!, /private|before\.md|after\.md/u);
+  assert.equal((await coordinator.run({ operation: "normal", trigger: "manual" })).status, "completed");
+  assert.deepEqual(executions[1], [
+    { type: "modify", path: "before.md", mtime: 1 },
+    { type: "modify", path: "after.md", mtime: 2 },
+  ]);
+  coordinator.enqueue({ type: "modify", path: "later.md", mtime: 3 });
+  timers.fireLatest();
+  await coordinator.whenIdle();
+  assert.deepEqual(executions[2], [{ type: "modify", path: "later.md", mtime: 3 }],
+    "a successful explicit reconciliation re-enables automatic Sync");
+});
+
+test("D468 failing manual Sync keeps pending debounce events without an unattended retry", async () => {
+  const timers = new FakeTimers();
+  let release!: () => void;
+  const paused = new Promise<void>(resolve => { release = resolve; });
+  let attempts = 0;
+  const coordinator = new V4SyncCoordinator({
+    execute: async () => {
+      attempts++;
+      if (attempts === 1) {
+        await paused;
+        throw Error("remote publish result unknown");
+      }
+      return { changedFiles: 1 };
+    },
+    schedule: timers.schedule,
+    cancel: timers.cancel,
+  });
+  const manual = coordinator.run({ operation: "normal", trigger: "manual" });
+  coordinator.enqueue({ type: "modify", path: "waiting.md", mtime: 10 });
+  release();
+  await assert.rejects(manual, /remote publish result unknown/u);
+  timers.fireLatest();
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(attempts, 1);
+  assert.equal(coordinator.pendingCount, 1);
+  await coordinator.run({ operation: "normal", trigger: "manual" });
+  assert.equal(attempts, 2);
+  assert.equal(coordinator.pendingCount, 0);
+});
+
+test("D468 a synchronous GitHub failure retains thousands of distinct pending file changes", async () => {
+  const timers = new FakeTimers();
+  const requests: V4QueuedChange[][] = [];
+  const coordinator = new V4SyncCoordinator({
+    execute: (_request, changes) => {
+      requests.push(changes);
+      if (requests.length === 1) throw Error("synchronous transport exception");
+      return Promise.resolve({ changedFiles: changes.length });
+    },
+    schedule: timers.schedule,
+    cancel: timers.cancel,
+  });
+  for (let i = 0; i < 8_000; i++) {
+    coordinator.enqueue({ type: "modify", path: `Imported/note-${i}.md`, mtime: i });
+  }
+  await assert.rejects(coordinator.run({ operation: "normal", trigger: "manual" }), /synchronous transport exception/u);
+  assert.equal(coordinator.pendingCount, 8_000, "a thrown transport adapter cannot discard imported file events");
+  assert.equal((await coordinator.run({ operation: "normal", trigger: "scheduled" })).status, "skipped");
+  assert.equal((await coordinator.run({ operation: "normal", trigger: "manual" })).status, "completed");
+  assert.equal(requests.length, 2);
+  assert.equal(requests[1]?.length, 8_000);
+  assert.deepEqual(requests[1]?.[0], { type: "modify", path: "Imported/note-0.md", mtime: 0 });
+  assert.deepEqual(requests[1]?.at(-1), { type: "modify", path: "Imported/note-7999.md", mtime: 7999 });
+  assert.equal(coordinator.pendingCount, 0);
+});
+
 test("D155 debounced automatic Sync catches unexpected rejection without retrying a remote mutation", async () => {
   const timers = new FakeTimers();
   const notices: string[] = [];
@@ -213,7 +337,7 @@ test("D155 after-active local-change follow-up also contains rejection without a
   assert.equal(executions.length, 3);
 });
 
-test("D155 manual rejection remains observable and failed background work after disposal shows no notice", async () => {
+test("D155 manual rejection remains observable and a later automatic retry stays paused after disposal", async () => {
   const notices: string[] = [];
   let attempts = 0;
   const timers = new FakeTimers();
@@ -235,7 +359,7 @@ test("D155 manual rejection remains observable and failed background work after 
   timers.fireLatest();
   coordinator.dispose();
   await new Promise<void>(resolve => setImmediate(resolve));
-  assert.equal(attempts, 2);
+  assert.equal(attempts, 1, "automatic Sync cannot retry after a failed manual operation");
   assert.deepEqual(notices, [], "closing the plugin suppresses stale detached failure notices");
 });
 
