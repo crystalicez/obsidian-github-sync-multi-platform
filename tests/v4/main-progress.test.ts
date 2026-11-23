@@ -58,7 +58,11 @@ function createMainProgressFixture() {
     workspace: { onLayoutReady: (callback: () => void) => callback() },
   };
   plugin.manifest = { id: "test" };
-  plugin.loadSettings = async () => { plugin.settings = { ...DEFAULT_SETTINGS, statusBarStatusEnabled: true }; };
+  // These tests exercise a usable status bar action, not unconfigured first-use refusal.
+  plugin.loadSettings = async () => { plugin.settings = {
+    ...DEFAULT_SETTINGS, statusBarStatusEnabled: true, syncOnStartup: false,
+    githubOwner: "fixture-owner", githubRepo: "fixture-notes", githubToken: "local-test-token",
+  }; };
   plugin.persistData = async () => undefined;
   plugin.initGitHubClient = () => undefined;
   plugin.registerScheduledSync = () => undefined;

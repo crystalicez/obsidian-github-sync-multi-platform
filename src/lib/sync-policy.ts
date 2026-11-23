@@ -12,6 +12,18 @@ export interface SyncPolicySettings {
 
 const MIN_SCHEDULED_SYNC_INTERVAL_SECONDS = 30;
 
+/** Fixed field labels only; never include credentials in a first-use Notice. */
+export function missingGitHubSyncConfigFields(settings: SyncPolicySettings): string[] {
+  const missing: string[] = []
+  if (!settings.githubOwner) missing.push("GitHub owner")
+  if (!settings.githubRepo) missing.push("GitHub repository")
+  if (!settings.githubToken) missing.push("GitHub token")
+  if (settings.encryptionMode === "encrypted" && !settings.encryptionPassphrase) {
+    missing.push("encryption passphrase")
+  }
+  return missing
+}
+
 export function hasGitHubSyncConfig(settings: SyncPolicySettings): boolean {
   return Boolean(settings.githubToken && settings.githubOwner && settings.githubRepo
     && (settings.encryptionMode !== "encrypted" || settings.encryptionPassphrase));

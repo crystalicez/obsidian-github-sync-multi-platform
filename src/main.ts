@@ -5,7 +5,7 @@ import { GitHubClient } from "./lib/github-api";
 import { assertPluginSettingsRuntimeSafe } from "./lib/plugin-settings-validation";
 import { V4RateLimitCooldownStore } from "./lib/v4/rate-limit-cooldown";
 import { selectV4GitHubSchedulerSleep } from "./lib/v4/desktop-transport-timer";
-import { normalizeScheduledSyncIntervalSeconds, shouldRunScheduledSync, shouldRunStartupSync } from "./lib/sync-policy";
+import { missingGitHubSyncConfigFields, normalizeScheduledSyncIntervalSeconds, shouldRunScheduledSync, shouldRunStartupSync } from "./lib/sync-policy";
 import { hydrateV4SecretsReadOnly, migrateV4Secrets, sanitizeV4SettingsForPersistence, storeV4Secrets } from "./lib/v4/secrets";
 import { assertV4ReencryptionSyncFenceClear } from "./lib/v4/reencryption-sync-fence";
 import { V4PluginRuntime } from "./lib/v4/runtime";
@@ -50,6 +50,13 @@ export default class FastSync extends Plugin {
   private statusDisplaySignature: string | undefined
   private cooldownStore?: V4RateLimitCooldownStore
 
+  private requireConfiguredGitHubForUi(): boolean {
+    const missing = missingGitHubSyncConfigFields(this.settings)
+    if (missing.length === 0) return true
+    new Notice(`GitHub Sync: Configure ${missing.join(", ")} in Settings and Save changes before syncing.`)
+    return false
+  }
+
   runManualSyncFromUi(): void {
     if (this.unloaded) return
     if (this.settingsSaveInProgress || this.settingTab?.isDirty()) {
@@ -65,7 +72,7 @@ export default class FastSync extends Plugin {
    * Normal V4 runtime failures already display their own status and Notice.
    */
   runSyncFromUi(operation: () => Promise<unknown>): void {
-    if (this.unloaded) return
+    if (this.unloaded || !this.requireConfiguredGitHubForUi()) return
     const reportUnexpectedFailure = () => {
       if (this.unloaded) return
       try {
@@ -695,6 +702,7 @@ export default class FastSync extends Plugin {
       new Notice("GitHub Sync: Save or discard pending settings changes before syncing.")
       return
     }
+    if (!this.requireConfiguredGitHubForUi()) return
     await new Promise<void>((resolve) => {
       const confirmedSettings = { ...this.settings }
       const confirmedGithubClient = this.githubClient

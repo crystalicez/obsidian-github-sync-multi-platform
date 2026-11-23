@@ -570,6 +570,87 @@ test("D418 a failed Settings save retires uncertain automatic callbacks until re
   }
 })
 
+test("D472 first-use Sync controls refuse a missing token without starting or pausing Runtime", async () => {
+  const ui = setupUi()
+  resetModalTestState()
+  Notice.messages.length = 0
+  try {
+    ui.setMode("resolve")
+    await ui.plugin.onload()
+    ui.plugin.settings = { ...ui.plugin.settings, githubToken: "" }
+    ui.plugin.settingTab.display()
+    const view = new V4SyncCenterView(new WorkspaceLeaf(ui.plugin.app), ui.plugin)
+    await view.onOpen()
+    const center = (view.contentEl as unknown as ElementStub).findByText("Sync now")
+    const settingsSync = (ui.plugin.settingTab.containerEl as unknown as ElementStub).findByText("Sync now")
+    const settingsForce = (ui.plugin.settingTab.containerEl as unknown as ElementStub).findByText("Force push")
+    assert.ok(center && settingsSync && settingsForce)
+    const actions: Array<() => void> = [
+      ui.ribbons.get("GitHub Sync: Sync")!,
+      ui.commands.get("sync-all-files")!,
+      () => { ui.plugin.updateStatusBar(); ui.statusRoot.children[0]?.onclick?.() },
+      () => center.onclick?.(),
+      () => settingsSync.onclick?.(),
+      ui.ribbons.get("GitHub Sync: Force Push")!,
+      ui.commands.get("force-pull-all-files")!,
+      () => settingsForce.onclick?.(),
+    ]
+    const modalCount = modalButtons.length
+    for (const action of actions) {
+      const before = Notice.messages.length
+      action()
+      await tick()
+      assert.deepEqual(ui.attempts, [], "missing credentials must not start any Runtime operation")
+      assert.equal(modalButtons.length, modalCount,
+        "unconfigured Force operations must not open a destructive confirmation dialog")
+      assert.equal(Notice.messages.length, before + 1,
+        "each attempt must explain why Sync cannot start")
+      assert.match(Notice.messages.at(-1)!, /GitHub token.*Settings.*Save changes/u)
+      assert.doesNotMatch(Notice.messages.at(-1)!, /secret-token|private-token/u)
+    }
+
+    ui.plugin.settings = { ...ui.plugin.settings, githubToken: "restored-test-token" }
+    ui.plugin.settingTab.tempSettings = null
+    ui.plugin.settingTab.display()
+    ui.ribbons.get("GitHub Sync: Sync")!()
+    await tick()
+    assert.deepEqual(ui.attempts, ["manual"],
+      "after configuration, the ordinary Sync entrypoint must still execute")
+    await view.onClose()
+  } finally {
+    ui.cleanup()
+    resetModalTestState()
+    Notice.messages.length = 0
+  }
+})
+
+test("D472 first-use Sync names the missing owner, repository or encrypted passphrase", async () => {
+  const cases = [
+    { missing: { githubOwner: "" }, guidance: /GitHub owner/u },
+    { missing: { githubRepo: "" }, guidance: /GitHub repository/u },
+    { missing: { encryptionMode: "encrypted" as const, encryptionPassphrase: "" }, guidance: /encryption passphrase/u },
+  ]
+  for (const scenario of cases) {
+    const ui = setupUi()
+    Notice.messages.length = 0
+    try {
+      ui.setMode("resolve")
+      await ui.plugin.onload()
+      ui.plugin.settings = { ...ui.plugin.settings, ...scenario.missing }
+      ui.commands.get("sync-all-files")!()
+      await tick()
+      assert.deepEqual(ui.attempts, [], "incomplete saved configuration must not reach Runtime")
+      assert.equal(Notice.messages.length, 1)
+      assert.match(Notice.messages[0]!, scenario.guidance)
+      assert.match(Notice.messages[0]!, /Settings.*Save changes/u)
+      assert.doesNotMatch(Notice.messages[0]!, /secret-token|private-token/u)
+    } finally {
+      ui.cleanup()
+      Notice.messages.length = 0
+    }
+  }
+})
+
 test("D428 unsaved Settings block manual Sync and Force across the installed UI while preserving saved Sync", async () => {
   const ui = setupUi()
   resetModalTestState()
