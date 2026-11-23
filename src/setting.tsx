@@ -1,6 +1,7 @@
 import { App, PluginSettingTab, Notice, Setting, Platform } from "obsidian";
 import { KofiImage } from "./lib/icons";
 import { GitHubClient } from "./lib/github-api";
+import { assertSafeGitHubBranch, assertSafeGitHubRepositoryCoordinates } from "./lib/github-config";
 import { decodeV4RemoteConfig, decodeV4RemoteHead } from "./lib/v4/remote-index";
 import { V4_CONFIG_PATH, V4_HEAD_PATH, effectiveV4PathLayout, expectedV4PathLayout } from "./lib/v4/protocol-types";
 
@@ -27,6 +28,16 @@ function settingsSaveValidationHint(error: unknown): string {
     return "Check Ignore-path regex: correct the invalid regular expression."
   }
   return "Review the Settings values and retry."
+}
+
+function connectionCheckValidationHint(fields: { owner: string; repo: string; branch: string }): string | undefined {
+  try {
+    assertSafeGitHubRepositoryCoordinates(fields.owner, fields.repo)
+    assertSafeGitHubBranch(fields.branch)
+  } catch (error) {
+    return settingsSaveValidationHint(error)
+  }
+  return undefined
 }
 
 export interface PluginSettings {
@@ -167,9 +178,12 @@ export class SettingTab extends PluginSettingTab {
     this.display()
 
     let result: string
+    const invalidFields = connectionCheckValidationHint(fields)
     try {
       if (!fields.owner || !fields.repo || !fields.branch || !fields.token) {
         result = "Enter a GitHub owner, repository, branch and token before testing."
+      } else if (invalidFields) {
+        result = invalidFields
       } else {
         const github = new GitHubClient(fields)
         const identity = await github.getRepositoryIdentity()

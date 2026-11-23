@@ -190,6 +190,52 @@ test("D424 editing repository during a stalled connection check lets users retry
   }
 })
 
+test("D471 invalid GitHub connection fields give actionable guidance without touching GitHub", async () => {
+  const cases = [
+    { field: "githubOwner", invalid: "owner with spaces", expected: /Check GitHub owner/u },
+    { field: "githubRepo", invalid: "repo/path", expected: /Check GitHub repository/u },
+    { field: "githubBranch", invalid: "bad..branch", expected: /Check GitHub branch/u },
+  ] as const
+  for (const scenario of cases) {
+    const calls: Array<{ url: string; method: string }> = []
+    setRequestUrlHandler(async raw => {
+      const req = raw as { url: string; method: string }
+      calls.push(req)
+      if (req.url.endsWith("/repos/owner/notes")) {
+        return response(200, { id: 123, full_name: "owner/notes" })
+      }
+      return response(404, { message: token })
+    })
+    try {
+      const tab = tabFor()
+      tab.tempSettings![scenario.field] = scenario.invalid
+      tab.updateDirtyState()
+      tab.containerEl.findByText("Test GitHub connection")?.onclick?.()
+      await waitForCondition(() => tab.containerEl.flattenText().includes("Connection could not be verified")
+        || tab.containerEl.flattenText().includes("Check GitHub"),
+      "connection check provides an outcome for an invalid " + scenario.field)
+      assert.match(tab.containerEl.flattenText(), scenario.expected,
+        "invalid input should identify the exact field rather than report a network failure")
+      assert.deepEqual(calls, [], "invalid coordinates must not make an avoidable GitHub API request")
+      assert.equal(tab.tempSettings![scenario.field], scenario.invalid,
+        "checking must not clear or mutate the draft")
+      assert.doesNotMatch(tab.containerEl.flattenText(), /private-token-must-not-appear/u)
+
+      tab.tempSettings![scenario.field] = source[scenario.field]
+      tab.updateDirtyState()
+      tab.containerEl.findByText("Test GitHub connection")?.onclick?.()
+      await waitForCondition(() => tab.containerEl.flattenText().includes("Configured branch was not found"),
+        "corrected read-only connection check")
+      assert.equal(calls.length, 2, "corrected connection still verifies repository and configured branch")
+      assert.ok(calls.every(call => call.method === "GET"), "the check must not write GitHub data")
+      assert.equal(tab.isDirty(), false, "connection check never persists a draft")
+      assert.doesNotMatch(tab.containerEl.flattenText(), /private-token-must-not-appear/u)
+    } finally {
+      setRequestUrlHandler(null)
+    }
+  }
+})
+
 test("D449 invalid user-editable Settings show specific secret-free guidance before any Save writes", async () => {
   const sensitiveToken = "private-token-DO-NOT-LEAK"
   const sensitivePassphrase = "private-passphrase-DO-NOT-LEAK"
