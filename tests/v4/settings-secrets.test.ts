@@ -878,7 +878,7 @@ test("D160 runtime records failed state for unusual adapter throws without refle
     Notice.messages.length = 0;
     try {
       const result = await fixture.runtime.forcePush();
-      assert.equal(result.status, "completed", "runtime catches errors and reports failure through its progress state");
+      assert.equal(result.status, "failed", "a handled GitHub upload failure remains a failed Sync result");
       assert.equal(fixture.runtime.progressSnapshot.lifecycle, "failed");
       assert.equal(fixture.runtime.progressSnapshot.failurePhase, "uploading");
       assert.equal(fixture.runtime.progressSnapshot.errorMessage, unexpected);
@@ -1530,14 +1530,14 @@ test("D173 live V4 runtime pauses every Sync trigger and Force operation before 
   fixture.indexFiles.set(".obsidian/plugins/test/github-sync-v4-rekey-sync-fence", "directory-present")
   Object.assign(fixture.plugin, { disableWatch() { fixture.plugin.isWatchEnabled = false } })
   const operations = [
-    () => fixture.runtime.manualSync(),
-    () => fixture.runtime.startupSync(),
-    () => fixture.runtime.forcePush(),
-    () => fixture.runtime.forcePull(),
-  ]
-  for (const sync of operations) {
+    [() => fixture.runtime.manualSync(), "failed"],
+    [() => fixture.runtime.startupSync(), "skipped"],
+    [() => fixture.runtime.forcePush(), "failed"],
+    [() => fixture.runtime.forcePull(), "failed"],
+  ] as const
+  for (const [sync, expectedStatus] of operations) {
     const result = await sync() as { status: string; changedFiles: number }
-    assert.deepEqual(result, { status: "completed", changedFiles: 0 })
+    assert.deepEqual(result, { status: expectedStatus, changedFiles: 0 })
     assert.equal(fixture.runtime.progressSnapshot.lifecycle, "failed")
     assert.match(fixture.runtime.progressSnapshot.errorMessage ?? "", /Re-encryption is pending/)
     assert.equal(fixture.github.refReads, githubCalls)

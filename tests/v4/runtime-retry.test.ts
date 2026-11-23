@@ -176,3 +176,50 @@ test("one manual sync automatically retries a recoverable stale-ref publication 
 
   runtime.dispose();
 });
+
+test("D470 a real handled GitHub failure pauses automatic Sync and retains the user's edits", async () => {
+  const { plugin, githubClient, vault } = pluginFixture();
+  Object.assign(plugin.settings, { githubToken: "fixture-token" });
+  vault.set("note.md", new TextEncoder().encode("before\n"), 1);
+  const runtime = new V4PluginRuntime(plugin as never);
+  try {
+    assert.equal((await runtime.forcePush() as { status: string }).status, "completed");
+    vault.set("note.md", new TextEncoder().encode("new edit\n"), 2);
+    vault.set("during.md", new TextEncoder().encode("created during failure\n"), 3);
+    runtime.enqueueModify("note.md", 2);
+    const readRef = githubClient.getGitRefOrNull.bind(githubClient);
+    let reads = 0;
+    let fail = true;
+    githubClient.getGitRefOrNull = async () => {
+      reads++;
+      if (fail) {
+        runtime.enqueueModify("during.md", 3);
+        throw Error("simulated unconfirmed GitHub HEAD");
+      }
+      return readRef();
+    };
+
+    const failed = await runtime.manualSync() as { status: string; changedFiles: number };
+    assert.equal(runtime.progressSnapshot.lifecycle, "failed", "the actual runtime reports the GitHub failure");
+    assert.equal(failed.status, "failed", "a handled Runtime failure must not be reported as completed");
+    assert.equal(runtime.pendingCount, 2, "uncertain Sync retains the original edit and another made during the failed attempt");
+    vault.set("after.md", new TextEncoder().encode("while paused\\n"), 4);
+    runtime.enqueueModify("after.md", 4);
+    assert.equal(runtime.pendingCount, 3, "new edits while paused remain queued");
+    assert.equal(runtime.progressSnapshot.lifecycle, "failed",
+      "a new local edit must not replace the paused failure with a false debouncing state");
+    const beforeAutomatic = reads;
+    assert.deepEqual(await runtime.startupSync(), { status: "skipped", changedFiles: 0 });
+    assert.equal(reads, beforeAutomatic, "startup must not repeat an uncertain GitHub read/write unattended");
+    assert.equal(runtime.progressSnapshot.lifecycle, "failed", "skipped automatic Sync must not clear the failure");
+
+    fail = false;
+    assert.equal((await runtime.manualSync() as { status: string }).status, "completed");
+    assert.equal(runtime.pendingCount, 0);
+    assert.equal(runtime.progressSnapshot.lifecycle, "success");
+    assert.equal((await runtime.startupSync() as { status: string }).status, "completed",
+      "a successful explicit manual reconciliation re-enables automatic Sync");
+  } finally {
+    runtime.dispose();
+  }
+});

@@ -150,6 +150,38 @@ test("v4 coordinator globally debounces and coalesces local changes for five sec
   assert.equal(executions[0].request.trigger, "localChange");
 });
 
+test("D470 handled Sync failure pauses automatic work without a second error notice", async () => {
+  const timers = new FakeTimers();
+  const attempts: V4QueuedChange[][] = [];
+  const notices: string[] = [];
+  const coordinator = new V4SyncCoordinator({
+    execute: async (_request, changes) => {
+      attempts.push(changes);
+      return attempts.length === 1
+        ? { changedFiles: 0, failed: true }
+        : { changedFiles: changes.length };
+    },
+    notice: message => notices.push(message),
+    schedule: timers.schedule, cancel: timers.cancel,
+  });
+  coordinator.enqueue({ type: "modify", path: "notes.md", mtime: 1 });
+  assert.deepEqual(await coordinator.run({ operation: "normal", trigger: "manual" }),
+    { status: "failed", changedFiles: 0 });
+  assert.equal(coordinator.pendingCount, 1);
+  assert.deepEqual(await coordinator.run({ operation: "normal", trigger: "scheduled" }),
+    { status: "skipped", changedFiles: 0 });
+  assert.equal(attempts.length, 1);
+  assert.deepEqual(notices, [], "Runtime already displayed the user-facing failure");
+  assert.deepEqual(await coordinator.run({ operation: "normal", trigger: "manual" }),
+    { status: "completed", changedFiles: 1 });
+  assert.equal(coordinator.pendingCount, 0);
+  coordinator.enqueue({ type: "modify", path: "later.md", mtime: 2 });
+  timers.fireLatest();
+  await coordinator.whenIdle();
+  assert.equal(attempts.length, 3, "successful manual reconciliation resumes automatic Sync");
+  coordinator.dispose();
+});
+
 test("D468 failed Sync with a due follow-up holds queued edits until explicit reconciliation", async () => {
   const timers = new FakeTimers();
   let release!: () => void;
@@ -382,7 +414,7 @@ test("v4 coordinator rejects repeated user operations while a sync is active", a
 
 test("v4 coordinator rejects synchronous execute re-entry before starting another sync", async () => {
   let executions = 0;
-  let nested: Promise<{ status: "completed" | "busy" | "skipped"; changedFiles: number }> | undefined;
+  let nested: Promise<{ status: "completed" | "busy" | "skipped" | "failed"; changedFiles: number }> | undefined;
   const notices: string[] = [];
   let coordinator!: V4SyncCoordinator;
   coordinator = new V4SyncCoordinator({

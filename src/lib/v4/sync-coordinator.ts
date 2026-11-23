@@ -19,8 +19,8 @@ export interface V4SyncRequest {
   allowThresholdOverride?: boolean;
 }
 
-export interface V4CoordinatorExecutionResult { changedFiles: number; }
-export interface V4CoordinatorRunResult extends V4CoordinatorExecutionResult { status: "completed" | "busy" | "skipped"; }
+export interface V4CoordinatorExecutionResult { changedFiles: number; failed?: true; }
+export interface V4CoordinatorRunResult { changedFiles: number; status: "completed" | "busy" | "skipped" | "failed"; }
 
 export interface V4SyncCoordinatorOptions {
   execute(request: V4SyncRequest, changes: V4QueuedChange[], signal: AbortSignal): Promise<V4CoordinatorExecutionResult>;
@@ -150,6 +150,7 @@ export class V4SyncCoordinator {
   }
 
   get isSyncing(): boolean { return this.active !== undefined; }
+  get isAutomaticSyncPaused(): boolean { return this.automaticSyncPaused; }
   /** Monotonic per-runtime evidence that a Sync started, even after it finished. */
   get syncExecutionGeneration(): number { return this.executionGeneration; }
   get pendingCount(): number { return this.disposed ? 0 : coalesceV4Changes(this.pending).length; }
@@ -291,20 +292,28 @@ export class V4SyncCoordinator {
       }
     });
     this.active = tracked;
-    const fail = (error: unknown): void => {
+    const retainFailedChanges = (): void => {
       if (!this.disposed) {
         this.automaticSyncPaused = true;
         this.pending = changes.concat(this.pending);
       }
+    };
+    const fail = (error: unknown): void => {
+      retainFailedChanges();
       rejectExecution(error);
     };
     try {
       this.options.execute(request, changes, controller.signal).then(
         result => {
+          if (result.failed) {
+            retainFailedChanges();
+            resolveExecution({ status: "failed", changedFiles: result.changedFiles });
+            return;
+          }
           if (request.trigger === "manual" || request.trigger === "forcePush" || request.trigger === "forcePull") {
             this.automaticSyncPaused = false;
           }
-          resolveExecution({ status: "completed", ...result });
+          resolveExecution({ status: "completed", changedFiles: result.changedFiles });
         },
         fail,
       );

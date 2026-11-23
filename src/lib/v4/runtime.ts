@@ -19,7 +19,7 @@ import { assertV4GitBlobIdentity } from "./git-blob-identity"
 import { createV4ScopePredicate, isPathInV4SyncScope } from "./scope"
 import { assertV4PathLayoutCompatible, V4ChangeGuardError, V4PublishedLocalApplyError, V4RecoveryReplanRequiredError, V4SyncSession, type V4SyncRunState } from "./sync-session"
 import type { V4ConflictResolution } from "./conflicts"
-import { V4SyncCoordinator, type V4QueuedChange, type V4SyncRequest } from "./sync-coordinator"
+import { V4SyncCoordinator, type V4CoordinatorExecutionResult, type V4QueuedChange, type V4SyncRequest } from "./sync-coordinator"
 import { expectedV4PathLayout, V4_FORMAT_VERSION, V4_CONFIG_PATH, type V4RemoteConfig, type V4StorageMode } from "./protocol-types"
 import { V4HistoryNotInitializedError, V4HistoryService } from "./history-service"
 import type { V4SessionVault } from "./local-io"
@@ -1971,7 +1971,7 @@ export class V4PluginRuntime {
   }
 
   private markWaiting(): void {
-    if (this.coordinator.isSyncing) return
+    if (this.coordinator.isSyncing || this.coordinator.isAutomaticSyncPaused) return
     this.beginWaitingRun()
   }
 
@@ -2202,7 +2202,7 @@ export class V4PluginRuntime {
     }
   }
 
-  private async execute(request: V4SyncRequest, changes: V4QueuedChange[], signal: AbortSignal): Promise<{ changedFiles: number }> {
+  private async execute(request: V4SyncRequest, changes: V4QueuedChange[], signal: AbortSignal): Promise<V4CoordinatorExecutionResult> {
     // A Settings save may replace the GitHub client while the run is suspended.
     // Pin repository/client/encryption identity across retries and WAL recovery.
     // Attempt-scoped conflict and ignore policies are captured separately below.
@@ -2508,14 +2508,14 @@ export class V4PluginRuntime {
       } else {
         new Notice(`GitHub Sync failed: ${message}`)
       }
-      return { changedFiles: 0 }
+      return { changedFiles: 0, failed: true }
     } finally {
       bootstrapRecoveryKeyCache?.key.fill(0)
       ;(github as unknown as { setV4AbortSignal?(signal?: AbortSignal): void } | undefined)?.setV4AbortSignal?.(undefined)
       this.plugin.isSyncInProgress = false
       if (!this.disposed && !this.reencryptionSyncFenced) {
         this.plugin.enableWatch()
-        if (this.coordinator.pendingCount > 0) this.beginWaitingRun()
+        if (this.coordinator.pendingCount > 0 && this.progressStore.snapshot.lifecycle !== "failed") this.beginWaitingRun()
       }
     }
   }
