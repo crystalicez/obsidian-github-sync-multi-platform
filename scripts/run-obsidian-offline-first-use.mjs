@@ -179,6 +179,12 @@ async function performFirstUse() {
         throw Error("Expected blank synthetic GitHub configuration");
       const originalId=fresh.vault;
       if(!/^device-[a-f0-9]{32}$/u.test(originalId))throw Error("First device ID invalid");
+      // D478: the installed ribbon must not advertise a usable Sync before setup.
+      const ribbonReadiness=()=>plugin.ribbonIcon?.getAttribute("aria-label")||"";
+      if(!ribbonReadiness().includes("(Not Configured)")){
+        step="native-unconfigured-ribbon-incorrect";
+        throw Error("Ribbon claimed readiness without a GitHub configuration");
+      }
       step="wait-workspace-layout";
       await new Promise(resolve=>app.workspace.onLayoutReady(resolve));
       step="open-sync-center";
@@ -310,10 +316,14 @@ async function performFirstUse() {
       if(saveAttempts!==1)throw Error("Corrected native UI Save did not use persistence exactly once");
       plugin.saveSettings=originalSaveSettings;
       if(plugin.githubClient)throw Error("Native UI Save unexpectedly configured GitHub");
+      if(!ribbonReadiness().includes("(Not Configured)")){
+        step="native-save-unconfigured-ribbon-incorrect";
+        throw Error("Ribbon claimed readiness after a partial Settings Save");
+      }
       host.close();
       return {generatedDeviceId:originalId,newDeviceId:newId,persisted:true,syncCenterOpen:true,
         nativeSaveClicked:true,invalidBranchRejectedBeforeSave:true,emptyBranchRejectedBeforeSave:true,
-        noCredentialSyncRejected:true,
+        nativeUnconfiguredRibbonAccurate:true,noCredentialSyncRejected:true,
         noCredentials:!(plugin.settings.githubToken||plugin.settings.githubOwner
           ||plugin.settings.githubRepo||plugin.settings.encryptionPassphrase)};
     } catch {
@@ -333,6 +343,7 @@ async function performFirstUse() {
   assert.equal(report.invalidBranchRejectedBeforeSave, true)
   assert.equal(report.emptyBranchRejectedBeforeSave, true)
   assert.equal(report.noCredentialSyncRejected, true)
+  assert.equal(report.nativeUnconfiguredRibbonAccurate, true)
   assert.equal(report.noCredentials, true)
   return { generatedDeviceId: report.generatedDeviceId, savedDeviceId: report.newDeviceId }
 }
@@ -597,6 +608,7 @@ try {
       syncCenterReady: true, nativeSettingsUiSave: true,
       nativeInvalidBranchRejectedBeforeSave: true,
       nativeEmptyBranchRejectedBeforeSave: true,
+      nativeUnconfiguredRibbonAccurate: true,
       noCredentialSyncRejected: true, noGitHubCredentials: true, remoteGitHubUsed: false,
       syntheticNotesPreserved: true, nativeHistoryRestoreCopy: true,
       nativeHistoryRestorePersistedAfterRestart: true,

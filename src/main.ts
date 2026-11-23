@@ -5,7 +5,7 @@ import { GitHubClient } from "./lib/github-api";
 import { assertPluginSettingsRuntimeSafe, assertPluginSettingsSavable } from "./lib/plugin-settings-validation";
 import { V4RateLimitCooldownStore } from "./lib/v4/rate-limit-cooldown";
 import { selectV4GitHubSchedulerSleep } from "./lib/v4/desktop-transport-timer";
-import { missingGitHubSyncConfigFields, normalizeScheduledSyncIntervalSeconds, shouldRunScheduledSync, shouldRunStartupSync } from "./lib/sync-policy";
+import { hasGitHubSyncConfig, missingGitHubSyncConfigFields, normalizeScheduledSyncIntervalSeconds, shouldRunScheduledSync, shouldRunStartupSync } from "./lib/sync-policy";
 import { hydrateV4SecretsReadOnly, migrateV4Secrets, sanitizeV4SettingsForPersistence, storeV4Secrets } from "./lib/v4/secrets";
 import { assertV4ReencryptionSyncFenceClear } from "./lib/v4/reencryption-sync-fence";
 import { V4PluginRuntime } from "./lib/v4/runtime";
@@ -182,7 +182,7 @@ export default class FastSync extends Plugin {
       void this.openSyncCenter()
     })
 
-    this.updateRibbonIcon(!!(this.settings.githubToken && this.settings.githubOwner && this.settings.githubRepo))
+    this.updateRibbonIcon(hasGitHubSyncConfig(this.settings))
 
     // Register every vault file event; the V4 scope policy applies exclusions and .obsidian options.
     // Disable watch on startup to prevent vault indexing from triggering many concurrent API calls
@@ -630,7 +630,7 @@ export default class FastSync extends Plugin {
       if (!this.unloaded) {
         this.initGitHubClient()
         this.registerScheduledSync()
-        this.updateRibbonIcon(!!(prepared.githubToken && prepared.githubOwner && prepared.githubRepo))
+        this.updateRibbonIcon(hasGitHubSyncConfig(prepared))
         for (const leaf of this.app.workspace?.getLeavesOfType?.(V4_SYNC_CENTER_VIEW) ?? []) {
           if (leaf.view instanceof V4SyncCenterView) leaf.view.onSettingsSaved()
         }

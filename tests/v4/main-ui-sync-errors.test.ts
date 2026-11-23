@@ -570,6 +570,41 @@ test("D418 a failed Settings save retires uncertain automatic callbacks until re
   }
 })
 
+test("D478 Ribbon reflects saved Sync readiness across startup and Settings repair", async () => {
+  const invalid = [
+    { patch: { githubBranch: "" }, fixed: { githubBranch: "repaired-branch" } },
+    { patch: { vault: " \t " }, fixed: { vault: "repaired-device" } },
+    { patch: { githubToken: " \t " }, fixed: { githubToken: "repaired-token" } },
+    { patch: { githubOwner: "" }, fixed: { githubOwner: "repaired-owner" } },
+    { patch: { githubRepo: "" }, fixed: { githubRepo: "repaired-repo" } },
+    { patch: { githubToken: "" }, fixed: { githubToken: "repaired-token" } },
+    { patch: { encryptionMode: "encrypted" as const, encryptionPassphrase: "" },
+      fixed: { encryptionPassphrase: "repaired-passphrase" } },
+  ]
+  for (const scenario of invalid) {
+    const ui = setupUi()
+    try {
+      ui.setMode("resolve")
+      const loadSettings = ui.plugin.loadSettings.bind(ui.plugin)
+      ui.plugin.loadSettings = async () => {
+        await loadSettings()
+        ui.plugin.settings = { ...ui.plugin.settings, ...scenario.patch }
+      }
+      ui.plugin.updateRibbonIcon = FastSync.prototype.updateRibbonIcon.bind(ui.plugin)
+      await ui.plugin.onload()
+      const ribbon = ui.plugin.ribbonIcon as unknown as ElementStub
+      assert.match(ribbon.attributes["aria-label"] ?? "", /\(Not Configured\)/u,
+        "the ribbon must never claim a broken saved configuration is ready")
+      await ui.plugin.saveSettings({ ...ui.plugin.settings, ...scenario.fixed })
+      assert.match(ribbon.attributes["aria-label"] ?? "", /\(Configured\)/u,
+        "saving a corrected configuration should visibly restore the ready ribbon")
+      assert.deepEqual(ui.attempts, [], "readiness indicators do not start Sync")
+    } finally {
+      ui.cleanup()
+    }
+  }
+})
+
 test("D477 whitespace-only saved GitHub token refuses manual and Force Sync without a doomed request", async () => {
   const ui = setupUi()
   resetModalTestState()
