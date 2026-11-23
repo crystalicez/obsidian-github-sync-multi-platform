@@ -74,6 +74,148 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
+test("D463 Commit history refresh loads another device's commits and resets paging without Sync", async () => {
+  const source = new FakeProgressSource();
+  const plugin = createSyncCenterPluginFixture(source, () => undefined);
+  let requests: number[] = [];
+  let changedRemotely = false;
+  let manualSyncs = 0;
+  plugin.v4Runtime.manualSync = async () => { manualSyncs++; return {}; };
+  plugin.v4Runtime.createHistoryService = async () => ({
+    async listCommits(page: number) {
+      requests.push(page);
+      const commit = (sha: string, message: string) => ({ sha, message, authoredAt: "", source: "plugin" as const });
+      if (page === 2) return { items: [commit("old", "Older device history")], hasMore: false };
+      return { items: [commit(changedRemotely ? "new" : "initial", changedRemotely ? "Other device latest commit" : "Original commit")], hasMore: true };
+    },
+    async getCommitChanges() { return []; },
+    async getFileVersions() { return []; },
+    async previewChange(): Promise<never> { throw Error("not used"); },
+  });
+  const view = new V4SyncCenterView(new WorkspaceLeaf(plugin.app), plugin as never);
+  try {
+    await view.onOpen();
+    assert.ok(view.contentEl.findByText("Refresh history"));
+    assert.match(view.contentEl.flattenText(), /Original commit/u);
+    view.contentEl.findByText("Next")?.onclick?.();
+    await waitForCondition(() => view.contentEl.flattenText().includes("Older device history"),
+      "older page appears");
+    changedRemotely = true;
+    view.contentEl.findByText("Refresh history")?.onclick?.();
+    await waitForCondition(() => view.contentEl.flattenText().includes("Other device latest commit"),
+      "new remote commit appears after a manual refresh");
+    assert.match(view.contentEl.flattenText(), /Page 1/u);
+    assert.doesNotMatch(view.contentEl.flattenText(), /Older device history/u);
+    assert.deepEqual(requests, [1, 2, 1]);
+    assert.equal(manualSyncs, 0, "reading history must never invoke a manual Sync");
+  } finally {
+    await view.onClose();
+  }
+});
+
+test("D463 Current file refreshes remote note versions without changing the active file or syncing", async () => {
+  const source = new FakeProgressSource();
+  const plugin = createSyncCenterPluginFixture(source, () => undefined);
+  let remoteUpdated = false;
+  let requests = 0;
+  let syncs = 0;
+  plugin.v4Runtime.manualSync = async () => { syncs++; return {}; };
+  const commit = { sha: "new-sha", message: "remote", authoredAt: "2026-11-23", source: "plugin" as const };
+  const change = { kind: "modify" as const, path: "Notes/project.md", fileId: "file-id", source: "plugin" as const };
+  plugin.v4Runtime.createHistoryService = async () => ({
+    async listCommits() { return { items: [], hasMore: false }; },
+    async getCommitChanges() { return []; },
+    async getFileVersions() { requests++; return remoteUpdated ? [{ commit, change }] : []; },
+    async previewChange(): Promise<never> { throw Error("not used"); },
+  });
+  const view = new V4SyncCenterView(new WorkspaceLeaf(plugin.app), plugin as never);
+  try {
+    await view.onOpen();
+    view.contentEl.findByText("Current file")?.onclick?.();
+    await waitForCondition(() => view.contentEl.flattenText().includes("No versions found"),
+      "current file has no recorded versions yet");
+    assert.ok(view.contentEl.findByText("Refresh history"));
+    remoteUpdated = true;
+    view.contentEl.findByText("Refresh history")?.onclick?.();
+    await waitForCondition(() => view.contentEl.flattenText().includes("MODIFY · Notes/project.md"),
+      "history updated without running Sync");
+    assert.equal(requests, 2);
+    assert.equal(syncs, 0);
+    assert.match(view.contentEl.flattenText(), /Versions of Notes\/project\.md/u);
+  } finally {
+    await view.onClose();
+  }
+});
+
+test("D463 retry handles temporary History API failures and stale closed buttons are inert", async () => {
+  const source = new FakeProgressSource();
+  const plugin = createSyncCenterPluginFixture(source, () => undefined);
+  let requests = 0;
+  plugin.v4Runtime.createHistoryService = async () => ({
+    async listCommits() {
+      requests++;
+      if (requests === 1) throw Error("a private GitHub credential appeared in an exception");
+      return { items: [{ sha: "new", message: "Recovered history load", authoredAt: "", source: "plugin" as const }], hasMore: false };
+    },
+    async getCommitChanges() { return []; },
+    async getFileVersions() { return []; },
+    async previewChange(): Promise<never> { throw Error("not used"); },
+  });
+  const noticeStart = Notice.messages.length;
+  const view = new V4SyncCenterView(new WorkspaceLeaf(plugin.app), plugin as never);
+  try {
+    await view.onOpen();
+    assert.match(view.contentEl.flattenText(), /Could not load history/u);
+    assert.doesNotMatch(view.contentEl.flattenText(), /private GitHub credential/u);
+    const retry = view.contentEl.findByText("Retry history");
+    assert.ok(retry);
+    retry.onclick?.();
+    await waitForCondition(() => view.contentEl.flattenText().includes("Recovered history load"),
+      "retry after GitHub error works without restarting Obsidian");
+    assert.equal(requests, 2);
+    await view.onClose();
+    retry.onclick?.();
+    await Promise.resolve();
+    assert.equal(requests, 2, "stale buttons cannot load history after view closes");
+  } finally {
+    await view.onClose();
+    Notice.messages.length = noticeStart;
+  }
+});
+
+test("D463 Current file Retry history restores versions after a transient GitHub failure", async () => {
+  const source = new FakeProgressSource();
+  const plugin = createSyncCenterPluginFixture(source, () => undefined);
+  let requests = 0;
+  plugin.v4Runtime.createHistoryService = async () => ({
+    async listCommits() { return { items: [], hasMore: false }; },
+    async getCommitChanges() { return []; },
+    async getFileVersions() {
+      requests++;
+      if (requests === 1) throw Error("sensitive remote response");
+      return [{ commit: { sha: "latest", message: "latest", authoredAt: "", source: "plugin" as const },
+        change: { source: "plugin" as const, kind: "modify" as const, path: "Notes/project.md", fileId: "file-id" } }];
+    },
+    async previewChange(): Promise<never> { throw Error("not used"); },
+  });
+  const view = new V4SyncCenterView(new WorkspaceLeaf(plugin.app), plugin as never);
+  const noticeStart = Notice.messages.length;
+  try {
+    await view.onOpen();
+    view.contentEl.findByText("Current file")?.onclick?.();
+    await waitForCondition(() => view.contentEl.findByText("Retry history") !== undefined,
+      "a failed Current file lookup exposes retry");
+    assert.doesNotMatch(view.contentEl.flattenText(), /sensitive remote response/u);
+    view.contentEl.findByText("Retry history")?.onclick?.();
+    await waitForCondition(() => view.contentEl.flattenText().includes("MODIFY · Notes/project.md"),
+      "Current file versions recover after retry");
+    assert.equal(requests, 2);
+  } finally {
+    await view.onClose();
+    Notice.messages.length = noticeStart;
+  }
+});
+
 test("D459 restored Markdown offers an explicit Open recovered note action after Vault.create succeeds", async () => {
   const source = new FakeProgressSource();
   const plugin = createSyncCenterPluginFixture(source, () => undefined) as any;

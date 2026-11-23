@@ -376,6 +376,17 @@ export class V4SyncCenterView extends ItemView {
     return trigger ? labels[trigger] : ""
   }
 
+  private appendHistoryRefresh(container: HTMLElement, generation: V4ViewRenderGeneration, retry = false): void {
+    const button = container.createEl("button", { text: retry ? "Retry history" : "Refresh history" })
+    button.onclick = () => {
+      if (!this.isCurrent(generation)) return
+      this.selected = undefined
+      this.page = 1
+      if (this.historyMode === "file") void this.renderFileMode()
+      else void this.renderCommitMode()
+    }
+  }
+
   private async renderCommitMode(): Promise<void> {
     const generation = this.beginRender()
     if (!generation) return
@@ -390,6 +401,7 @@ export class V4SyncCenterView extends ItemView {
       if (!this.isCurrent(generation)) return
       body.empty()
       const pager = body.createDiv({ cls: "github-sync-center__pager" })
+      this.appendHistoryRefresh(pager, generation)
       const previous = pager.createEl("button", { text: "Previous" })
       previous.disabled = this.page <= 1
       previous.onclick = () => { this.page--; this.selected = undefined; void this.renderCommitMode() }
@@ -409,7 +421,12 @@ export class V4SyncCenterView extends ItemView {
         if (!this.isCurrent(generation)) return
       }
       else detail.createEl("p", { text: "Select a commit to inspect its changes.", cls: "github-sync-center__muted" })
-    } catch (error) { if (this.isCurrent(generation)) this.renderError(body, error) }
+    } catch (error) {
+      if (this.isCurrent(generation)) {
+        this.renderError(body, error)
+        this.appendHistoryRefresh(body, generation, true)
+      }
+    }
   }
 
   private async renderCommitDetail(commit: V4HistoryCommit, detail: HTMLElement): Promise<void> {
@@ -457,6 +474,7 @@ export class V4SyncCenterView extends ItemView {
       const versions = await service.getFileVersions(fileId)
       if (!this.isCurrent(generation)) return
       body.empty()
+      this.appendHistoryRefresh(body.createDiv({ cls: "github-sync-center__pager" }), generation)
       for (const version of [...versions].reverse()) {
         const row = body.createEl("button", { cls: "github-sync-center__row" })
         row.createDiv({ text: `${version.change.kind.toUpperCase()} · ${version.change.path}`, cls: "github-sync-center__row-title" })
@@ -464,7 +482,12 @@ export class V4SyncCenterView extends ItemView {
         row.onclick = () => void this.renderPreview(version.commit, version.change, detail)
       }
       if (versions.length === 0) body.createEl("p", { text: "No versions found in the loaded history." })
-    } catch (error) { if (this.isCurrent(generation)) this.renderError(body, error) }
+    } catch (error) {
+      if (this.isCurrent(generation)) {
+        this.renderError(body, error)
+        this.appendHistoryRefresh(body, generation, true)
+      }
+    }
   }
 
   private async renderPreview(commit: V4HistoryCommit, change: V4HistoryChange, container: HTMLElement): Promise<void> {
