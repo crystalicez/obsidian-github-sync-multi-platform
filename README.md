@@ -71,7 +71,7 @@ If Obsidian SecretStorage throws an error during startup (for example, while the
 - Manual sync runs a normal pull-before-push operation immediately.
 - Force push makes the V4 remote match the local vault; Force Pull mirrors the V4 remote locally and can delete files in scope. If visible local files change their path, size or modification time while the Force confirmation is open, the approval expires and you must review the current vault before confirming again. This metadata check is best-effort and does not replace a separate backup or verify file contents byte-for-byte.
 - Ignore regex rules match plaintext vault paths before encryption.
-- A global five-second debounce coalesces create, edit, delete, and rename bursts into one commit. Repeated manual or force actions report that a sync is already running.
+- A global five-second debounce coalesces create, edit, delete, and rename bursts into one commit. Large imports with many file events no longer abort event coalescing because of JavaScript argument limits; when a rescan is needed, ambiguous rename/delete events remain available for reconciliation. Repeated manual or force actions report that a sync is already running.
 - New REST uploads above 8 MiB use ordered parts capped at 8 MiB (12 data parts for a 100,000,000-byte file), with full-file SHA-256 verification; older 48 MiB parts and larger historical single blobs remain readable. Encrypted packs are also capped at 8 MiB of ciphertext.
 - The modification guard applies to normal and force operations. A blocked force operation requires a separate one-time override confirmation.
 

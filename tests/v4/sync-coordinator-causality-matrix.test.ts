@@ -9,6 +9,41 @@ function types(changes: V4QueuedChange[]): string[] {
   return coalesceV4Changes(changes).map(change => change.type);
 }
 
+test("D466 a large imported Vault burst can coalesce a rescan without overflowing JS arguments", () => {
+  const burst: V4QueuedChange[] = Array.from({ length: 160_000 }, (_, mtime) => (
+    { type: "modify", path: "Imported/note.md", mtime }
+  ));
+  const result = coalesceV4Changes([...burst, rescan(5)]);
+  assert.deepEqual(result, [{ type: "rescan", mtime: 159_999 }],
+    "the newest file event determines rescan mtime even after a large import burst");
+});
+
+test("D466 a large rename/delete burst preserves the safe rescan fallback", () => {
+  const burst: V4QueuedChange[] = Array.from({ length: 160_000 }, (_, mtime) => (
+    { type: "modify", path: "Imported/note.md", mtime }
+  ));
+  burst.push({ type: "rename", oldPath: "old.md", path: "moved.md", mtime: 160_000 });
+  burst.push({ type: "delete", path: "moved.md", mtime: 160_001 });
+  const result = coalesceV4Changes(burst);
+  assert.equal(result.at(-1)?.type, "rescan", "ambiguous rename/delete requires a full rescan");
+  assert.equal(result.at(-1)?.mtime, 160_001, "fallback preserves latest event time");
+  assert.equal(result.some(change => change.type === "rename"), true);
+  assert.equal(result.some(change => change.type === "delete"), true);
+});
+
+test("D466 a large ambiguous rename chain still requests a rescan safely", () => {
+  const burst: V4QueuedChange[] = Array.from({ length: 160_000 }, (_, mtime) => ({
+    type: "modify", path: "Imported/note.md", mtime,
+  }));
+  burst.push({ type: "rename", oldPath: "source.md", path: "first.md", mtime: 160_000 });
+  burst.push({ type: "rename", oldPath: "source.md", path: "second.md", mtime: 160_001 });
+  const result = coalesceV4Changes(burst);
+  assert.equal(result.at(-1)?.type, "rescan");
+  assert.equal(result.at(-1)?.mtime, 160_001);
+  assert.equal(result.filter(change => change.type === "rename").length, 2,
+    "ambiguous renames must retain their causal events for the reconciliation plan");
+});
+
 test("v4 rescan preserves identity-breaking file causality", () => {
   const cases: Array<{ name: string; changes: V4QueuedChange[]; expected: string[] }> = [
     {

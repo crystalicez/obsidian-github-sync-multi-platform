@@ -105,6 +105,30 @@ test("D174 changes arriving while a fence is being written poison quiescence wit
   assert.match(notices[0]!, /Re-encryption preparation/)
 })
 
+test("D466 a large Vault import still starts automatic Sync with a safe rescan", async () => {
+  const timers = new FakeTimers();
+  const executions: V4QueuedChange[][] = [];
+  const coordinator = new V4SyncCoordinator({
+    execute: async (_request, changes) => {
+      executions.push(changes);
+      return { changedFiles: changes.length };
+    },
+    schedule: timers.schedule,
+    cancel: timers.cancel,
+  });
+  for (let mtime = 0; mtime < 160_000; mtime++) {
+    coordinator.enqueue({ type: "modify", path: "Imported/note.md", mtime });
+  }
+  coordinator.enqueue({ type: "rescan", mtime: 5 });
+  assert.equal(coordinator.pendingCount, 1,
+    "large pending event bursts must remain inspectable without a RangeError");
+  timers.fireLatest();
+  await coordinator.whenIdle();
+  assert.deepEqual(executions, [[{ type: "rescan", mtime: 159_999 }]],
+    "an imported Vault burst must still trigger a normal debounced rescan");
+  assert.equal(coordinator.pendingCount, 0);
+});
+
 test("v4 coordinator globally debounces and coalesces local changes for five seconds", async () => {
   const timers = new FakeTimers();
   const executions: Array<{ request: V4SyncRequest; changes: V4QueuedChange[] }> = [];

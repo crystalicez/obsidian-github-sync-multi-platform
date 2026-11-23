@@ -30,9 +30,15 @@ export interface V4SyncCoordinatorOptions {
   debounceMs?: number;
 }
 
+function latestV4ChangeMtime(changes: readonly V4QueuedChange[]): number {
+  let latest = -Infinity;
+  for (const change of changes) latest = Math.max(latest, change.mtime);
+  return latest;
+}
+
 export function coalesceV4Changes(changes: V4QueuedChange[]): V4QueuedChange[] {
   if (changes.some(change => change.type === "rescan")) {
-    const rescanMtime = Math.max(...changes.map(change => change.mtime));
+    const rescanMtime = latestV4ChangeMtime(changes);
     const coalesced = coalesceV4Changes(changes.filter(change => change.type !== "rescan"));
     const causalChanges = coalesced.filter(change => change.type !== "rescan");
     return causalChanges.some(change => change.type !== "modify")
@@ -61,11 +67,11 @@ export function coalesceV4Changes(changes: V4QueuedChange[]): V4QueuedChange[] {
     const priorRenameDestinations = new Set<string>();
     for (const change of pathChanges) {
       if (change.type === "delete" && priorRenameDestinations.has(change.path)) {
-        return [...pathChanges, { type: "rescan", mtime: Math.max(...pathChanges.map(item => item.mtime)) }];
+        return [...pathChanges, { type: "rescan", mtime: latestV4ChangeMtime(pathChanges) }];
       }
       if (change.type !== "rename") continue;
       if (priorRenameEndpoints.has(change.oldPath) || priorRenameEndpoints.has(change.path)) {
-        return [...pathChanges, { type: "rescan", mtime: Math.max(...pathChanges.map(item => item.mtime)) }];
+        return [...pathChanges, { type: "rescan", mtime: latestV4ChangeMtime(pathChanges) }];
       }
       priorRenameEndpoints.add(change.oldPath);
       priorRenameEndpoints.add(change.path);
