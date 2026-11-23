@@ -156,14 +156,42 @@ test("D475 an empty Device ID is rejected at the direct Save boundary before sec
   }
 })
 
-test("corrupt saved settings are rejected before startup secret migration side effects", async () => {
+test("D481 malformed legacy saved GitHub routing is repairable without implicit SecretStorage migration", async () => {
+  for (const [field, value] of [
+    ["githubOwner", "../unsafe"],
+    ["githubRepo", "notes/other"],
+    ["githubBranch", "bad@{branch"],
+  ] as const) {
+    const writes: string[] = []
+    const settings = { ...valid, githubToken: "legacy-secret-not-logged", [field]: value }
+    const plugin = {
+      loadData: async () => ({ settings }),
+      canMigrateStartupSecrets: async () => true,
+      createSecretId: () => { throw Error("invalid routes must not allocate credentials") },
+      app: { secretStorage: {
+        getSecret: () => null,
+        setSecret: (id: string) => { writes.push(id) },
+      } },
+    } as unknown as FastSync
+    await FastSync.prototype.loadSettings.call(plugin)
+    assert.equal(plugin.settings[field], value,
+      "an existing invalid routing value must remain visible for explicit Settings repair")
+    assert.equal(plugin.secretsMigrated, false)
+    assert.deepEqual(writes, [], "invalid routing must never migrate legacy credentials at startup")
+    assert.throws(() => assertPluginSettingsSavable(plugin.settings),
+      /Invalid GitHub (?:owner|repository|branch)/u,
+      "normal Settings Save must still reject unsafe routing")
+  }
+})
+
+test("corrupt non-routing saved settings still reject before startup secret migration side effects", async () => {
   const writes: string[] = [];
   const fake = {
-    loadData: async () => ({ settings: { githubOwner: "../unsafe", githubToken: "synthetic-token" } }),
+    loadData: async () => ({ settings: { syncEnabled: "not-a-boolean", githubToken: "synthetic-token" } }),
     app: { secretStorage: { getSecret: () => null, setSecret: (id: string) => { writes.push(id); } } },
     createSecretId: (prefix: string) => prefix,
   } as unknown as FastSync;
-  await assert.rejects(() => FastSync.prototype.loadSettings.call(fake), /Invalid GitHub owner/iu);
+  await assert.rejects(() => FastSync.prototype.loadSettings.call(fake), /syncEnabled must be a boolean/iu);
   assert.deepEqual(writes, [], "invalid persisted configuration must not touch saved secrets");
 });
 

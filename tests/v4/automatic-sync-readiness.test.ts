@@ -77,6 +77,38 @@ test("D479 incomplete saved settings never create a GitHub client or silently ta
   }
 })
 
+test("D481 malformed saved GitHub coordinates are not treated as configured", () => {
+  const bad = [
+    { patch: { githubOwner: "../unsafe" }, missing: "GitHub owner" },
+    { patch: { githubOwner: "with spaces" }, missing: "GitHub owner" },
+    { patch: { githubRepo: "another/repo" }, missing: "GitHub repository" },
+    { patch: { githubRepo: ".." }, missing: "GitHub repository" },
+    { patch: { githubBranch: "bad@{name" }, missing: "GitHub branch" },
+    { patch: { githubBranch: "invalid..ref" }, missing: "GitHub branch" },
+  ]
+  const plugin = new FastSync()
+  const desktop = Platform.isDesktopApp
+  Platform.isDesktopApp = false
+  try {
+    for (const item of bad) {
+      const settings = { ...plaintext, ...item.patch }
+      assert.equal(hasGitHubSyncConfig(settings), false,
+        `${item.missing} must not enable Sync with an invalid value`)
+      assert.equal(shouldRunStartupSync(settings), false)
+      assert.equal(shouldRunScheduledSync(settings), false)
+      plugin.settings = settings
+      plugin.initGitHubClient()
+      assert.equal(plugin.githubClient, undefined,
+        "invalid saved routing must not construct a GitHub client")
+    }
+    plugin.settings = plaintext
+    plugin.initGitHubClient()
+    assert.ok(plugin.githubClient, "correcting malformed routing restores the normal client")
+  } finally {
+    Platform.isDesktopApp = desktop
+  }
+})
+
 test("D477 whitespace-only GitHub tokens do not arm unattended Sync", () => {
   for (const githubToken of [" ", " \t\r\n "]) {
     const invalid = { ...plaintext, githubToken }

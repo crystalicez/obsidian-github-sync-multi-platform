@@ -2,7 +2,7 @@ import { Plugin, setIcon, Modal, Notice, TFile, TFolder, Platform } from "obsidi
 
 import { SettingTab, PluginSettings, DEFAULT_SETTINGS } from "./setting";
 import { GitHubClient } from "./lib/github-api";
-import { assertPluginSettingsRuntimeSafe, assertPluginSettingsSavable } from "./lib/plugin-settings-validation";
+import { assertPluginSettingsRepairableOnLoad, assertPluginSettingsSavable } from "./lib/plugin-settings-validation";
 import { V4RateLimitCooldownStore } from "./lib/v4/rate-limit-cooldown";
 import { selectV4GitHubSchedulerSleep } from "./lib/v4/desktop-transport-timer";
 import { hasGitHubSyncConfig, missingGitHubSyncConfigFields, normalizeScheduledSyncIntervalSeconds, shouldRunScheduledSync, shouldRunStartupSync } from "./lib/sync-policy";
@@ -35,6 +35,7 @@ export default class FastSync extends Plugin {
   scheduledSyncTimer: number | null = null
   startupSyncTimeout: number | null = null
   secretsMigrated: boolean = false
+  private savedGitHubRoutingNeedsRepair = false
   private secretStorageReadUnavailable = false
   private settingsSaveInProgress = false
   // Monotonic in-memory epoch: even a failed or no-op save can race
@@ -118,6 +119,12 @@ export default class FastSync extends Plugin {
         && this.settings.encryptionPassphraseSecretId && !this.settings.encryptionPassphrase) {
         new Notice("GitHub Sync: Saved encryption passphrase is unavailable after restart. Re-enter it in Settings before encrypted Sync.")
       }
+    }
+    if (this.savedGitHubRoutingNeedsRepair) {
+      const fields = missingGitHubSyncConfigFields(this.settings)
+        .filter(field => field === "GitHub owner" || field === "GitHub repository"
+          || field === "GitHub branch")
+      new Notice(`GitHub Sync: Saved GitHub routing needs repair (${fields.join(", ")}). Correct it in Settings and Save changes; Sync stays disabled.`, 12000)
     }
     if (!this.settings.githubBranch.trim()) {
       new Notice("GitHub Sync: Saved GitHub branch is empty. Enter the branch name in Settings and Save changes before syncing.")
@@ -472,8 +479,10 @@ export default class FastSync extends Plugin {
     // splitting an established device's local index and conflict history.
     // The generated ID is persisted on the user's first normal Settings Save.
     if (persisted == null) merged.vault = this.createSecretId("device");
-    // Validate persisted runtime data before any legacy secret migration writes.
-    assertPluginSettingsRuntimeSafe(merged)
+    // Preserve malformed legacy GitHub routing only for explicit user repair.
+    // Every other persisted field remains strictly validated before secrets.
+    const unsafeLegacyRouting = assertPluginSettingsRepairableOnLoad(merged)
+    this.savedGitHubRoutingNeedsRepair = unsafeLegacyRouting
     this.secretStorageReadUnavailable = false
     let storageUnavailable = false
     const storage = this.app.secretStorage
@@ -488,7 +497,7 @@ export default class FastSync extends Plugin {
       },
     }
     try {
-      if (!await this.canMigrateStartupSecrets()) {
+      if (unsafeLegacyRouting || !await this.canMigrateStartupSecrets()) {
         // Fenced startup must not overwrite existing SecretStorage values.
         this.settings = hydrateV4SecretsReadOnly(merged, observedStorage) as PluginSettings
         this.secretsMigrated = false

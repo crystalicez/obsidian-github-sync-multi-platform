@@ -653,10 +653,108 @@ try {
     assert.equal(peerReloaded.noCredentials, true)
     const peerNote = await readFile(path.join(peerVault, "D445-synthetic-first-use.md"), "utf8")
     assert.equal(peerNote, "# D445 offline installation test\nNo GitHub account configured.\n")
+
+    // D481: A separate, owned synthetic installation begins with malformed
+    // legacy GitHub routing persisted BEFORE Obsidian loads the plugin.
+    // Verify its real Settings UI can repair the value without GitHub I/O.
+    stage = "prepare-repairable-legacy-install"
+    stopOwnedProcess()
+    await sleep(850)
+    const legacyVault = path.join(runRoot, "legacy-vault")
+    const legacyProfile = path.join(runRoot, "legacy-profile")
+    const legacyPluginDir = path.join(legacyVault, ".obsidian", "plugins", pluginId)
+    await mkdir(legacyPluginDir, { recursive: true })
+    await mkdir(legacyProfile)
+    for (const filename of ["main.js", "manifest.json", "styles.css"]) {
+      await copyFile(path.join(root, filename), path.join(legacyPluginDir, filename))
+    }
+    await writeFile(path.join(legacyVault, ".obsidian", "community-plugins.json"),
+      JSON.stringify([pluginId]) + "\n")
+    await writeFile(path.join(legacyProfile, "obsidian.json"),
+      JSON.stringify({ vaults: { d481legacy: { path: legacyVault, ts: Date.now(), open: true } } }) + "\n")
+    const legacySettings = {
+      ...(peerDisk.settings ?? peerDisk), githubOwner: "../unsafe",
+      githubRepo: "synthetic-repo", githubBranch: "main",
+      githubToken: "", vault: "native-legacy-device",
+    }
+    const legacyData = peerDisk.settings
+      ? { ...peerDisk, settings: legacySettings } : legacySettings
+    const legacyDataPath = path.join(legacyPluginDir, "data.json")
+    await writeFile(legacyDataPath, JSON.stringify(legacyData) + "\n")
+    stage = "launch-repairable-legacy-install"
+    await launch(legacyProfile, legacyVault)
+    const beforeRepair = JSON.parse(await readFile(legacyDataPath, "utf8"))
+    assert.deepEqual(beforeRepair, legacyData,
+      "Invalid saved routing must never rewrite local plugin data on startup")
+    stage = "repair-legacy-settings-through-native-ui"
+    const repaired = await evaluate(`(async()=>{
+      let step="verify-malformed-startup";
+      try {
+        const plugin=app.plugins.plugins[${JSON.stringify(pluginId)}];
+        if(plugin.settings.githubOwner!=="../unsafe" || plugin.githubClient)
+          throw Error("Unsafe legacy routing did not remain fenced for repair");
+        if(!(plugin.ribbonIcon?.getAttribute("aria-label")||"").includes("(Not Configured)"))
+          throw Error("Invalid GitHub owner incorrectly advertised ready Sync");
+        step="open-legacy-native-settings";
+        const host=app.setting;
+        host.open();
+        host.openTabById(${JSON.stringify(pluginId)});
+        const tab=plugin.settingTab;
+        const row=()=>[...tab.containerEl.querySelectorAll(".setting-item")]
+          .find(node=>node.querySelector(".setting-item-name")?.textContent?.trim()==="GitHub owner");
+        const start=Date.now();
+        while((!tab.containerEl.isConnected||!row())&&Date.now()-start<9000)
+          await new Promise(resolve=>setTimeout(resolve,120));
+        const input=row()?.querySelector("input");
+        if(!input||input.value!=="../unsafe")
+          throw Error("Legacy GitHub owner not editable in native Settings");
+        step="save-repaired-native-owner";
+        const setter=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,"value")?.set;
+        if(!setter)throw Error("Native input setter unavailable");
+        setter.call(input,"native-repaired-owner");
+        input.dispatchEvent(new Event("input",{bubbles:true}));
+        const save=[...tab.containerEl.querySelectorAll("button")]
+          .find(button=>button.textContent.trim()==="Save changes");
+        if(!tab.isDirty()||!save||save.disabled)
+          throw Error("Corrected GitHub owner did not offer Save changes");
+        save.click();
+        const saveStart=Date.now();
+        while((plugin.settings.githubOwner!=="native-repaired-owner"||tab.isDirty())
+          &&Date.now()-saveStart<9000)
+          await new Promise(resolve=>setTimeout(resolve,120));
+        if(plugin.settings.githubOwner!=="native-repaired-owner"||tab.isDirty())
+          throw Error("Native Settings failed to persist repaired GitHub owner");
+        if(plugin.githubClient||plugin.settings.githubToken)
+          throw Error("Repair unexpectedly configured a GitHub credential");
+        host.close();
+        return {repaired:true};
+      } catch { return {failedAt:step} }
+    })()`, 36000)
+    if (repaired?.failedAt) {
+      stage = "native-legacy-routing:" + repaired.failedAt
+      throw Error("Native legacy routing repair failed")
+    }
+    assert.equal(repaired?.repaired, true)
+    const legacySaved = JSON.parse(await readFile(legacyDataPath, "utf8"))
+    assert.equal((legacySaved.settings ?? legacySaved).githubOwner, "native-repaired-owner")
+    stage = "restart-repaired-legacy-install"
+    stopOwnedProcess()
+    await sleep(850)
+    await launch(legacyProfile, legacyVault)
+    const repairedReloaded = await evaluate(`(()=>{
+      const plugin=app.plugins.plugins[${JSON.stringify(pluginId)}];
+      return { owner:plugin.settings.githubOwner, deviceId:plugin.settings.vault,
+        noClient:!plugin.githubClient, noCredentials:!plugin.settings.githubToken };
+    })()`)
+    assert.equal(repairedReloaded?.owner, "native-repaired-owner")
+    assert.equal(repairedReloaded.deviceId, "native-legacy-device")
+    assert.equal(repairedReloaded.noClient, true)
+    assert.equal(repairedReloaded.noCredentials, true)
     passed = true
     console.log(JSON.stringify({ nativeOfflineFirstUse: "PASS", installed: true,
       settingsSaved: true, deviceIdPersistedAcrossRestart: true,
-      nativeIndependentInstallations: 2, distinctGeneratedDeviceIds: true,
+      nativeIndependentInstallations: 2, nativeLegacyRepairInstallation: 1,
+      nativeLegacyRoutingRepair: true, distinctGeneratedDeviceIds: true,
       syncCenterReady: true, nativeSettingsUiSave: true,
       nativeInvalidBranchRejectedBeforeSave: true,
       nativeEmptyBranchRejectedBeforeSave: true,

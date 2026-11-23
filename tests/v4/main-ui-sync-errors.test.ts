@@ -573,6 +573,9 @@ test("D418 a failed Settings save retires uncertain automatic callbacks until re
 test("D478 Ribbon reflects saved Sync readiness across startup and Settings repair", async () => {
   const invalid = [
     { patch: { githubBranch: "" }, fixed: { githubBranch: "repaired-branch" } },
+    { patch: { githubBranch: "unsafe..ref" }, fixed: { githubBranch: "repaired-branch" } },
+    { patch: { githubOwner: "../unsafe" }, fixed: { githubOwner: "repaired-owner" } },
+    { patch: { githubRepo: "another/repo" }, fixed: { githubRepo: "repaired-repo" } },
     { patch: { vault: " \t " }, fixed: { vault: "repaired-device" } },
     { patch: { githubToken: " \t " }, fixed: { githubToken: "repaired-token" } },
     { patch: { githubOwner: "" }, fixed: { githubOwner: "repaired-owner" } },

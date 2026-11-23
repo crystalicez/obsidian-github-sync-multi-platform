@@ -30,14 +30,16 @@ function optionalBoolean(settings: RuntimeSettings, key: string): void {
   }
 }
 
-export function assertPluginSettingsRuntimeSafe(value: unknown): void {
+function assertPluginSettingsSafe(value: unknown, allowUnsafeLegacyRouting: boolean): void {
   const settings = asRecord(value)
 
   const githubOwner = requireString(settings, "githubOwner")
   const githubRepo = requireString(settings, "githubRepo")
   const githubBranch = requireString(settings, "githubBranch")
-  assertSafeGitHubRepositoryCoordinates(githubOwner, githubRepo, { allowEmpty: true })
-  assertSafeGitHubBranch(githubBranch, true)
+  if (!allowUnsafeLegacyRouting) {
+    assertSafeGitHubRepositoryCoordinates(githubOwner, githubRepo, { allowEmpty: true })
+    assertSafeGitHubBranch(githubBranch, true)
+  }
   requireString(settings, "vault")
   const ignorePathRegex = requireString(settings, "ignorePathRegex")
   compileV4IgnorePathRegex(ignorePathRegex)
@@ -99,6 +101,31 @@ export function assertPluginSettingsRuntimeSafe(value: unknown): void {
     "statusBarStatusEnabled",
     "consoleLoggingEnabled",
   ]) optionalBoolean(settings, key)
+}
+
+/** Runtime and Settings Save always enforce strict GitHub routing. */
+export function assertPluginSettingsRuntimeSafe(value: unknown): void {
+  assertPluginSettingsSafe(value, false)
+}
+
+/**
+ * Only startup loading may retain malformed legacy routing values for repair.
+ * Every other validation remains strict. The caller must disable GitHub client
+ * construction and secret migration until explicit repair and Settings Save.
+ * Returns true when malformed (not merely missing) saved routing is present.
+ */
+export function assertPluginSettingsRepairableOnLoad(value: unknown): boolean {
+  assertPluginSettingsSafe(value, true)
+  const settings = value as RuntimeSettings
+  try {
+    assertSafeGitHubRepositoryCoordinates(
+      settings["githubOwner"] as string, settings["githubRepo"] as string, { allowEmpty: true },
+    )
+    assertSafeGitHubBranch(settings["githubBranch"] as string, true)
+    return false
+  } catch {
+    return true
+  }
 }
 
 /** Load legacy blank branch/Device ID values for repair, but never save them again. */
