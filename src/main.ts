@@ -593,7 +593,10 @@ export default class FastSync extends Plugin {
     const storage = this.app.secretStorage
     this.settingsSaveAttemptGeneration++
     this.settingsSaveInProgress = true
+    let saveCommitted = false
     try {
+      // Pause old-target local debounces before the first awaited Settings write.
+      settingsRuntime?.settingsSaveStarted?.()
       // Preserve the original key and pinned Settings during Manual Recovery.
       await assertReencryptionSafe()
       // Allocate immutable IDs for replacements so failed writes cannot
@@ -636,6 +639,7 @@ export default class FastSync extends Plugin {
       // Never publish changed Settings or clear the old secret in that case.
       await assertReencryptionSafe()
       this.settings = prepared
+      saveCommitted = true
       // In-progress sessions pin their original settings and GitHub client.
       // The next session must not reuse a derived key after credential changes.
       this.v4Runtime?.credentialsChanged()
@@ -660,6 +664,8 @@ export default class FastSync extends Plugin {
       }
     } finally {
       this.settingsSaveInProgress = false
+      // An ambiguous Save failure cannot rearm unattended GitHub writes.
+      settingsRuntime?.settingsSaveFinished?.(saveCommitted)
     }
   }
 

@@ -496,6 +496,69 @@ async function performNativeForceChangeRefusal() {
   assert.equal(result?.noForceExecuted, true)
 }
 
+async function performNativeSettingsSaveDebounceFence() {
+  stage = "native-settings-save-debounce-fence"
+  // Only synthetic Vault/Profile plugin data may be saved. Replace the
+  // coordinator execution with a local counter: no GitHub client or remote I/O.
+  const result = await evaluate(`(async()=>{
+    let step="prepare-coordinator";
+    const plugin=app.plugins.plugins[${JSON.stringify(pluginId)}];
+    if(plugin.githubClient || plugin.settings.githubToken)
+      return {failedAt:"unexpected-native-credential"};
+    const coordinator=plugin.v4Runtime?.coordinator;
+    if(!coordinator || coordinator.pendingCount!==0)
+      return {failedAt:"non-idle-coordinator"};
+    const originalSettings={...plugin.settings};
+    const originalExecute=coordinator.options.execute;
+    const originalSchedule=coordinator.schedule;
+    const originalCancel=coordinator.cancel;
+    let staleCallback, executions=0, changedSettings=false;
+    try {
+      coordinator.schedule=(callback)=>{ staleCallback=callback; return "synthetic-d485-timer"; };
+      coordinator.cancel=()=>{};
+      coordinator.options.execute=async()=>{ executions++; return {changedFiles:0}; };
+      coordinator.enqueue({type:"modify",path:"D445-synthetic-first-use.md",mtime:1000});
+      if(!staleCallback||coordinator.pendingCount!==1)
+        throw Error("No synthetic local-change debounce queued");
+      step="save-settings-with-pending-debounce";
+      await plugin.saveSettings({...originalSettings,
+        statusBarStatusEnabled:!originalSettings.statusBarStatusEnabled});
+      changedSettings=true;
+      step="fire-old-host-debounce-after-save";
+      staleCallback(); // Host timer callback delivered after cancellation.
+      await Promise.resolve();
+      await Promise.resolve();
+      if(executions!==0||coordinator.pendingCount!==1||!coordinator.isAutomaticSyncPaused)
+        throw Error("Stale local debounce started Sync or discarded queued edits");
+      step="explicit-manual-reconciliation";
+      const review=await coordinator.run({operation:"normal",trigger:"manual"});
+      if(review.status!=="completed"||executions!==1||coordinator.pendingCount!==0)
+        throw Error("Manual reconciliation did not drain queued edits exactly once");
+      step="restore-synthetic-settings";
+      await plugin.saveSettings(originalSettings);
+      changedSettings=false;
+      if(coordinator.isAutomaticSyncPaused)
+        throw Error("Clean Settings Save should allow future Auto Sync");
+      if(plugin.githubClient||plugin.settings.githubToken)
+        throw Error("Synthetic test created a credentialed client");
+      return {settingsDebounceFenced:true};
+    } catch {return {failedAt:step};}
+    finally {
+      coordinator.options.execute=originalExecute;
+      coordinator.schedule=originalSchedule;
+      coordinator.cancel=originalCancel;
+      if(changedSettings) {
+        try {await plugin.saveSettings(originalSettings);} catch {}
+      }
+    }
+  })()`, 45000)
+  if (result?.failedAt) {
+    stage = "native-settings-save-debounce-fence:" + result.failedAt
+    throw Error("Installed Settings-save debounce fence failed")
+  }
+  assert.equal(result?.settingsDebounceFenced, true)
+}
+
 async function performNativeHistoricalRecovery() {
   stage = "native-history-recovery"
   // The history version is synthetic, but the installed plugin renders its
@@ -668,6 +731,7 @@ try {
     const firstInstall = await performFirstUse()
     await performNativeHistoricalRecovery()
     await performNativeForceChangeRefusal()
+    await performNativeSettingsSaveDebounceFence()
     const originalDeviceId = firstInstall.savedDeviceId
     stage = "check-saved-disk"
     const disk = JSON.parse(await readFile(beforePath, "utf8"))
@@ -857,6 +921,7 @@ try {
       nativeEmptyBranchRejectedBeforeSave: true,
       nativeUnconfiguredRibbonAccurate: true, nativeIncompleteClientRefused: true,
       nativeHistoryMissingFieldGuidance: true, nativeForceChangeRefusal: true,
+      nativeSettingsSaveDebounceFence: true,
       noCredentialSyncRejected: true, noGitHubCredentials: true, remoteGitHubUsed: false,
       syntheticNotesPreserved: true, nativeHistoryRestoreCopy: true,
       nativeHistoryRestorePersistedAfterRestart: true,

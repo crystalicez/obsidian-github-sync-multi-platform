@@ -288,6 +288,41 @@ export class V4PluginRuntime {
     )
   }
 
+  /**
+   * Settings persistence may commit an entirely new remote target. Never
+   * allow the preceding local-change debounce to run across that boundary.
+   * Edits are retained for explicit Manual Sync rather than discarded.
+   */
+  settingsSaveStarted(): void {
+    if (this.disposed) return
+    this.coordinator.pauseAutomaticForSettingsSave()
+    if (this.debounceRunActive && !this.coordinator.isSyncing) {
+      this.debounceRunActive = false
+      this.progressStore.finish("failed", {
+        phase: "blocked",
+        errorMessage: "Automatic Sync paused during Settings Save. Review and run Sync now manually to reconcile queued local changes.",
+      })
+    }
+  }
+
+  settingsSaveFinished(committed: boolean): void {
+    if (this.disposed) return
+    const resumed = this.coordinator.finishSettingsSave(committed)
+    const queued = this.coordinator.pendingCount
+    if (committed && !resumed && queued > 0) {
+      if (!this.coordinator.isSyncing) {
+        this.debounceRunActive = false
+        this.progressStore.finish("failed", {
+          phase: "blocked",
+          errorMessage: "Settings saved. Queued local edits need Manual Sync before automatic syncing resumes.",
+        })
+      }
+      new Notice("GitHub Sync: Settings saved. Queued local edits were not sent automatically. Review the saved repository and run Sync now manually.", 10000)
+    } else if (!committed) {
+      new Notice("GitHub Sync: Settings save did not complete. Automatic Sync is paused for safety; review Settings and run Sync now manually after resolving the error.", 10000)
+    }
+  }
+
   credentialsChanged(): void {
     if (this.disposed) return
     this.credentialGeneration++

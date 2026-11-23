@@ -135,6 +135,11 @@ export class V4SyncCoordinator {
   private timer?: unknown;
   private flushAfterActive = false;
   private automaticSyncPaused = false;
+  private settingsSavePending = false;
+  private settingsChangeRequiresManual = false;
+  private settingsSaveGeneration = 0;
+  private automaticPausedBeforeSettingsSave = false;
+  private debounceGeneration = 0;
   private reencryptionReserved = false;
   private reencryptionDirty = false;
   private disposed = false;
@@ -154,6 +159,42 @@ export class V4SyncCoordinator {
   /** Monotonic per-runtime evidence that a Sync started, even after it finished. */
   get syncExecutionGeneration(): number { return this.executionGeneration; }
   get pendingCount(): number { return this.disposed ? 0 : coalesceV4Changes(this.pending).length; }
+
+  /**
+   * A Settings write can commit even if saveData rejects. Retire the queued
+   * automatic debounce before the first awaited Settings/SecretStorage write.
+   * Preserve all pending local edits for explicit Manual Sync reconciliation.
+   */
+  pauseAutomaticForSettingsSave(): void {
+    if (this.disposed) return;
+    if (!this.settingsSavePending) this.automaticPausedBeforeSettingsSave = this.automaticSyncPaused;
+    this.settingsSavePending = true;
+    this.settingsSaveGeneration++;
+    this.settingsChangeRequiresManual = true;
+    this.automaticSyncPaused = true;
+    this.debounceGeneration++;
+    if (this.timer !== undefined) this.cancel(this.timer);
+    this.timer = undefined;
+    this.flushAfterActive = false;
+  }
+
+  /**
+   * On a verified successful Save with no in-flight/queued edits, resume
+   * automatic syncing of future edits. An ambiguous failure, prior Sync
+   * failure, or pending old-target edits requires a successful Manual Sync.
+   */
+  finishSettingsSave(committed: boolean): boolean {
+    if (this.disposed || !this.settingsSavePending) return !this.automaticSyncPaused;
+    this.settingsSavePending = false;
+    const canResume = committed && !this.automaticPausedBeforeSettingsSave
+      && !this.active && this.pending.length === 0 && !this.reencryptionReserved;
+    this.automaticPausedBeforeSettingsSave = false;
+    if (canResume) {
+      this.automaticSyncPaused = false;
+      this.settingsChangeRequiresManual = false;
+    }
+    return !this.automaticSyncPaused;
+  }
 
   /**
    * Irreversible in this runtime. Reserve synchronously, before any awaited
@@ -188,8 +229,14 @@ export class V4SyncCoordinator {
     if (this.disposed) return;
     if (this.reencryptionReserved) { this.reencryptionDirty = true; return; }
     this.pending.push(change);
+    // Preserve the historical failure-debounce contract. Only Settings
+    // changes retire the old-target timer entirely until Manual Sync.
+    if (this.automaticSyncPaused && this.settingsChangeRequiresManual) return;
     if (this.timer !== undefined) this.cancel(this.timer);
+    const generation = ++this.debounceGeneration;
     this.timer = this.schedule(() => {
+      // A callback already queued by the host can fire after cancellation.
+      if (this.disposed || this.automaticSyncPaused || generation !== this.debounceGeneration) return;
       this.timer = undefined;
       this.observeBackgroundRun(this.flushLocalChanges());
     }, this.debounceMs);
@@ -197,6 +244,12 @@ export class V4SyncCoordinator {
 
   async run(request: V4SyncRequest): Promise<V4CoordinatorRunResult> {
     if (this.disposed) return { status: "skipped", changedFiles: 0 };
+    if (this.settingsSavePending) {
+      if (request.trigger === "scheduled" || request.trigger === "startup"
+        || request.trigger === "localChange") return { status: "skipped", changedFiles: 0 };
+      this.options.notice?.("GitHub Sync: Wait for Settings Save to finish before syncing.");
+      return { status: "busy", changedFiles: 0 };
+    }
     if (this.automaticSyncPaused && (request.trigger === "scheduled"
       || request.trigger === "startup" || request.trigger === "localChange")) {
       return { status: "skipped", changedFiles: 0 };
@@ -265,6 +318,7 @@ export class V4SyncCoordinator {
   private start(request: V4SyncRequest, changes: V4QueuedChange[]): Promise<V4CoordinatorRunResult> {
     if (this.disposed || this.reencryptionReserved) return Promise.resolve({ status: "skipped", changedFiles: 0 });
     this.executionGeneration++;
+    const startingSettingsSaveGeneration = this.settingsSaveGeneration;
     const controller = new AbortController();
     this.activeController = controller;
     let resolveExecution!: (result: V4CoordinatorRunResult) => void;
@@ -310,8 +364,12 @@ export class V4SyncCoordinator {
             resolveExecution({ status: "failed", changedFiles: result.changedFiles });
             return;
           }
-          if (request.trigger === "manual" || request.trigger === "forcePush" || request.trigger === "forcePull") {
+          // A run begun before a Settings Save must never rearm automatic
+          // changes, even if it finishes after an ambiguous failed Save.
+          if (!this.settingsSavePending && startingSettingsSaveGeneration === this.settingsSaveGeneration
+            && (request.trigger === "manual" || request.trigger === "forcePush" || request.trigger === "forcePull")) {
             this.automaticSyncPaused = false;
+            this.settingsChangeRequiresManual = false;
           }
           resolveExecution({ status: "completed", changedFiles: result.changedFiles });
         },

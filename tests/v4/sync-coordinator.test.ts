@@ -19,6 +19,114 @@ class FakeTimers {
   }
 }
 
+test("D485 a Settings save cannot replay an old or due local debounce against changed GitHub routing", async () => {
+  const timers = new FakeTimers()
+  const executions: Array<{ trigger: string; paths: string[] }> = []
+  const coordinator = new V4SyncCoordinator({
+    schedule: timers.schedule, cancel: timers.cancel,
+    execute: async (request, changes) => {
+      executions.push({ trigger: request.trigger, paths: changes.map(change => change.path) })
+      return { changedFiles: changes.length }
+    },
+  })
+  try {
+    coordinator.enqueue({ type: "modify", path: "before-save.md", mtime: 1 })
+    const staleCallback = [...timers.timers.values()][0]!.callback
+    assert.equal(coordinator.pendingCount, 1)
+    coordinator.pauseAutomaticForSettingsSave()
+    assert.equal(timers.timers.size, 0, "the old debouncer must be cancelled synchronously")
+    coordinator.enqueue({ type: "modify", path: "while-saving.md", mtime: 2 })
+    staleCallback()
+    await new Promise<void>(resolve => setImmediate(resolve))
+    assert.deepEqual(executions, [], "a fired cancelled timer must not execute Sync during Save")
+    assert.equal(coordinator.pendingCount, 2, "old and concurrent edits remain available to Manual Sync")
+    assert.equal(coordinator.finishSettingsSave(true), false,
+      "queued old-target changes must not auto-sync to the newly saved target")
+    assert.equal(coordinator.isAutomaticSyncPaused, true)
+    assert.deepEqual(executions, [])
+    assert.equal(timers.timers.size, 0)
+    assert.deepEqual(await coordinator.run({ operation: "normal", trigger: "scheduled" }),
+      { status: "skipped", changedFiles: 0 })
+    assert.deepEqual(await coordinator.run({ operation: "normal", trigger: "manual" }),
+      { status: "completed", changedFiles: 2 })
+    assert.deepEqual(executions, [{ trigger: "manual", paths: ["before-save.md", "while-saving.md"] }])
+    assert.equal(coordinator.isAutomaticSyncPaused, false)
+    coordinator.enqueue({ type: "modify", path: "after-manual.md", mtime: 3 })
+    timers.fireLatest()
+    await coordinator.whenIdle()
+    assert.deepEqual(executions.at(-1), { trigger: "localChange", paths: ["after-manual.md"] })
+  } finally { coordinator.dispose() }
+})
+
+test("D485 a pre-Save Manual Sync finishing during or after Settings persistence cannot rearm stale local Auto Sync", async () => {
+  for (const ordering of ["manual-finishes-during-save", "manual-finishes-after-failed-save"] as const) {
+    const timers = new FakeTimers()
+    let complete!: () => void
+    const blocked = new Promise<void>(resolve => { complete = resolve })
+    const attempts: string[] = []
+    const coordinator = new V4SyncCoordinator({
+      schedule: timers.schedule, cancel: timers.cancel,
+      execute: async request => {
+        attempts.push(request.trigger)
+        if (attempts.length === 1) await blocked
+        return { changedFiles: 0 }
+      },
+    })
+    try {
+      const inFlight = coordinator.run({ operation: "normal", trigger: "manual" })
+      coordinator.pauseAutomaticForSettingsSave()
+      coordinator.enqueue({ type: "modify", path: "during-save.md", mtime: 3 })
+      assert.equal(coordinator.pendingCount, 1)
+      if (ordering === "manual-finishes-after-failed-save") {
+        assert.equal(coordinator.finishSettingsSave(false), false)
+      }
+      complete()
+      await inFlight
+      assert.equal(coordinator.isAutomaticSyncPaused, true,
+        "a pre-Save Manual completion must not authorize later unattended writes")
+      assert.equal(timers.timers.size, 0)
+      if (ordering === "manual-finishes-during-save") {
+        assert.equal(coordinator.finishSettingsSave(true), false)
+      }
+      assert.equal((await coordinator.run({ operation: "normal", trigger: "scheduled" })).status,
+        "skipped")
+      assert.deepEqual(attempts, ["manual"])
+      await coordinator.run({ operation: "normal", trigger: "manual" })
+      assert.deepEqual(attempts, ["manual", "manual"],
+        "a new explicit post-Save Manual Sync must still reconcile queued edits")
+      assert.equal(coordinator.isAutomaticSyncPaused, false)
+    } finally { complete(); coordinator.dispose() }
+  }
+})
+
+test("D485 successful idle Settings Save resumes future automatic changes, failed Save requires manual review", async () => {
+  const timers = new FakeTimers()
+  let executions = 0
+  const coordinator = new V4SyncCoordinator({
+    schedule: timers.schedule, cancel: timers.cancel,
+    execute: async () => { executions += 1; return { changedFiles: 0 } },
+  })
+  try {
+    coordinator.pauseAutomaticForSettingsSave()
+    assert.equal(coordinator.finishSettingsSave(true), true,
+      "a committed Settings change with no old pending events should keep Auto Sync usable")
+    coordinator.enqueue({ type: "modify", path: "fresh.md", mtime: 4 })
+    timers.fireLatest()
+    await coordinator.whenIdle()
+    assert.equal(executions, 1)
+
+    coordinator.pauseAutomaticForSettingsSave()
+    assert.equal(coordinator.finishSettingsSave(false), false,
+      "an ambiguous failed Settings persistence must not silently rearm automatic GitHub writes")
+    coordinator.enqueue({ type: "modify", path: "after-failure.md", mtime: 5 })
+    assert.equal(timers.timers.size, 0)
+    assert.equal(executions, 1)
+    await coordinator.run({ operation: "normal", trigger: "manual" })
+    assert.equal(executions, 2)
+    assert.equal(coordinator.isAutomaticSyncPaused, false)
+  } finally { coordinator.dispose() }
+})
+
 test("D282 Sync execution generation records completed or failed runs but not skipped attempts", async () => {
   let release!: () => void
   const blocker = new Promise<void>(resolve => { release = resolve })

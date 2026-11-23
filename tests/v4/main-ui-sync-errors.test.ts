@@ -470,6 +470,57 @@ test("D278 legacy read-only Recovery command does not start after plugin unload"
   }
 })
 
+test("D485 Settings Save synchronously fences pending local debounce and only resumes on durable success", async () => {
+  const ui = setupUi()
+  const phases: string[] = []
+  let release!: () => void
+  const persistBarrier = new Promise<void>(resolve => { release = resolve })
+  try {
+    ui.setMode("resolve")
+    await ui.plugin.onload()
+    const runtime = ui.plugin.v4Runtime as unknown as Record<string, any>
+    runtime.settingsSaveStarted = () => {
+      assert.equal(ui.plugin.isSettingsSaveInProgress(), true)
+      phases.push("paused")
+    }
+    runtime.settingsSaveFinished = (committed: boolean) => {
+      assert.equal(ui.plugin.isSettingsSaveInProgress(), false)
+      phases.push(committed ? "committed" : "failed")
+    }
+    ui.plugin.persistData = async () => {
+      phases.push("persist-start")
+      await persistBarrier
+      phases.push("persist-finish")
+    }
+    const saving = ui.plugin.saveSettings({ ...ui.plugin.settings, githubRepo: "new-test-target" })
+    assert.equal(phases[0], "paused", "a queued debounce must be fenced before Save's first await")
+    await tick()
+    assert.deepEqual(phases, ["paused", "persist-start"])
+    release()
+    await saving
+    assert.deepEqual(phases, ["paused", "persist-start", "persist-finish", "committed"])
+    assert.equal(ui.plugin.settings.githubRepo, "new-test-target")
+    assert.deepEqual(ui.attempts, [], "Settings Save cannot initiate a GitHub Sync")
+
+    phases.length = 0
+    ui.plugin.persistData = async () => {
+      phases.push("persist-failed")
+      throw Error("synthetic write refusal")
+    }
+    await assert.rejects(
+      () => ui.plugin.saveSettings({ ...ui.plugin.settings, githubRepo: "failed-target" }),
+      /synthetic write refusal/u,
+    )
+    assert.deepEqual(phases, ["paused", "persist-failed", "failed"],
+      "ambiguous failed persist must leave automatic Sync fenced until explicit Manual Sync")
+    assert.equal(ui.plugin.settings.githubRepo, "new-test-target",
+      "failed persistence must not publish the new target in memory")
+  } finally {
+    release()
+    ui.cleanup()
+  }
+})
+
 test("D418 disabling Sync while startup is queued prevents both old automatic triggers", async () => {
   const ui = setupUi()
   try {
