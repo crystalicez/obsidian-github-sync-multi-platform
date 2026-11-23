@@ -22,10 +22,24 @@ export async function createV4HistoricalMarkdownCopy(
     throw new Error("Historical Markdown is not valid UTF-8; no recovery file was created.")
   }
 
-  const stem = basename.slice(0, -3).normalize("NFC")
+  const safeName = basename.slice(0, -3).normalize("NFC")
     .replace(/[^\p{L}\p{N}\p{M}_-]/gu, "-")
     .replace(/^-+|-+$/gu, "")
-    .slice(0, 64) || "note"
+  // Iterate by Unicode scalar, not UTF-16 units: slicing can split a
+  // supplementary CJK letter into an invalid lone surrogate. Bound UTF-8
+  // bytes as well so recovered Markdown names work on Windows and mobile.
+  const encoder = new TextEncoder()
+  let stem = ""
+  let stemBytes = 0
+  let characters = 0
+  for (const character of safeName) {
+    const bytes = encoder.encode(character).byteLength
+    if (characters === 64 || stemBytes + bytes > 192) break
+    stem += character
+    stemBytes += bytes
+    characters++
+  }
+  stem ||= "note"
   const commitLabel = commitSha.replace(/[^A-Za-z0-9]/gu, "").slice(0, 8) || "history"
 
   for (let index = 1; index <= 100; index++) {

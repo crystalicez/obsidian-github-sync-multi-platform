@@ -1,6 +1,47 @@
 import assert from "node:assert/strict"
 import test from "node:test"
 import { createV4HistoricalMarkdownCopy } from "../../src/lib/v4/history-recovery"
+import { normalizeV4VaultPath } from "../../src/lib/v4/paths"
+
+test("D474 History Restore preserves complete supplementary Unicode characters at its filename boundary", async () => {
+  const created: Array<{ path: string; content: string }> = []
+  const vault = {
+    getAbstractFileByPath() { return null },
+    async create(path: string, content: string) {
+      assert.equal(normalizeV4VaultPath(path), path, "the recovered path must be portable before Vault.create")
+      created.push({ path, content })
+      return { path }
+    },
+  }
+  const original = `Notes/${"a".repeat(63)}𠀀.md`
+  const bytes = new TextEncoder().encode("# Recovered CJK history\n")
+  const restored = await createV4HistoricalMarkdownCopy(vault as never, original, "abcdef12", bytes)
+  assert.equal(created.length, 1)
+  assert.equal(restored, created[0]!.path)
+  assert.match(restored, /𠀀-abcdef12\.md$/u,
+    "a supplementary Unicode letter must not be split into an invalid surrogate")
+  assert.deepEqual(new TextEncoder().encode(created[0]!.content), bytes)
+})
+
+test("D474 History Restore keeps long supplementary-Unicode recovery names portable within 255 UTF-8 bytes", async () => {
+  const created: string[] = []
+  const vault = {
+    getAbstractFileByPath() { return null },
+    async create(path: string, content: string) {
+      assert.equal(normalizeV4VaultPath(path), path)
+      created.push(path)
+      assert.equal(content, "# Unicode restoration")
+      return { path }
+    },
+  }
+  const path = await createV4HistoricalMarkdownCopy(vault as never,
+    `Notes/${"𠀀".repeat(64)}.md`, "abcdef12", new TextEncoder().encode("# Unicode restoration"))
+  assert.equal(path, created[0])
+  assert.ok(new TextEncoder().encode(path).byteLength <= 255,
+    "a real Windows/mobile filename must fit a 255-byte portable segment")
+  assert.ok([...path.matchAll(/𠀀/gu)].length > 32,
+    "Unicode-scalar bounding should preserve more than the old 32 supplemental letters")
+})
 
 test("D458 recovery retains the original UTF-8 BOM when creating a Markdown copy", async () => {
   const created: Array<{ path: string; content: string }> = []
