@@ -744,6 +744,29 @@ export default class FastSync extends Plugin {
         return
       }
       const modal = new Modal(this.app)
+      // A same-size rewrite can retain its mtime (e.g. editor replace/restore).
+      // Invalidate the one-time destructive approval on Obsidian Vault events,
+      // even when a second inventory scan cannot distinguish the contents.
+      // Keep the metadata scan as a separate safety check for missed events.
+      let visibleVaultChanged = false
+      const isVisible = (path: string) => !path.startsWith(`${this.app.vault.configDir}/`)
+      const onFileChange = (file: { path: string }) => {
+        if (isVisible(file.path)) visibleVaultChanged = true
+      }
+      const changeRefs = [
+        this.app.vault.on("create", onFileChange),
+        this.app.vault.on("modify", onFileChange),
+        this.app.vault.on("delete", onFileChange),
+        this.app.vault.on("rename", (file, oldPath) => {
+          if (isVisible(file.path) || isVisible(oldPath)) visibleVaultChanged = true
+        }),
+      ]
+      let listenersReleased = false
+      const releaseChangeListeners = () => {
+        if (listenersReleased) return
+        listenersReleased = true
+        for (const ref of changeRefs) this.app.vault.offref(ref)
+      }
       const sameVisibleVaultInventory = (): boolean => {
         try {
           const currentFiles = visibleVaultFiles()
@@ -768,6 +791,7 @@ export default class FastSync extends Plugin {
         "scheduledSyncEnabled", "scheduledSyncIntervalSeconds",
       ])
       const stillConfirmed = () => !this.settingsSaveInProgress
+        && !visibleVaultChanged
         && this.githubClient === confirmedGithubClient
         && sameVisibleVaultInventory()
         && !this.settingTab?.isDirty()
@@ -783,11 +807,12 @@ export default class FastSync extends Plugin {
         resolve()
       }
       modal.onClose = () => {
+        releaseChangeListeners()
         resolved = true
         finish()
       }
       const repo = `${confirmedSettings.githubOwner}/${confirmedSettings.githubRepo}`
-      const branch = confirmedSettings.githubBranch || "main"
+      const branch = confirmedSettings.githubBranch
       const localFileCount = confirmedLocalFiles.length
 
       const title = operation === "forcePush" ? "Force push local vault to remote?" : "Force pull remote vault to local?";

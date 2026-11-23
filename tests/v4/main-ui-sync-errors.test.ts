@@ -1082,6 +1082,83 @@ test("D451 Force confirmation expires when a same-path local note changes before
   }
 })
 
+test("D482 Force confirmation expires on Vault file events even when path, size and mtime are unchanged", async () => {
+  for (const kind of ["forcePush", "forcePull"] as const) {
+    const ui = setupUi()
+    resetModalTestState()
+    Notice.messages.length = 0
+    try {
+      await ui.plugin.onload()
+      ui.setMode("resolve")
+      const listeners = new Map<string, Set<(...args: any[]) => void>>()
+      let subscribed = 0
+      let released = 0
+      ui.plugin.app.vault.on = (event: string, callback: (...args: any[]) => void) => {
+        const handlers = listeners.get(event) ?? new Set<(...args: any[]) => void>()
+        handlers.add(callback)
+        listeners.set(event, handlers)
+        subscribed++
+        return { event, callback }
+      }
+      ui.plugin.app.vault.offref = (ref: { event: string, callback: (...args: any[]) => void }) => {
+        if (listeners.get(ref.event)?.delete(ref.callback)) released++
+      }
+      ui.plugin.app.vault.getFiles = () => [
+        { path: "Notes/important.md", stat: { size: 12, mtime: 1000 } },
+      ]
+      const label = kind === "forcePush" ? "Force push" : "Force pull"
+      const emit = (event: string, ...args: unknown[]) => {
+        for (const handler of listeners.get(event) ?? []) handler(...args)
+      }
+      const launch = () => {
+        resetModalTestState()
+        const pending = ui.plugin.showForceConfirm(kind)
+        const action = modalButtons.find(button => button.text === label)
+        const slider = Modal.lastCreated?.contentEl.findByClass("github-sync-force-confirm-slider")
+        assert.ok(action && slider)
+        slider.onpointerdown?.({ pointerId: 1, clientX: 300 } as PointerEvent)
+        return { pending, action }
+      }
+
+      for (const [event, args] of [
+        ["modify", [{ path: "Notes/important.md" }]],
+        ["delete", [{ path: "Notes/important.md" }]],
+        ["create", [{ path: "Notes/new.md" }]],
+        ["rename", [{ path: "Notes/important.md" }, "Notes/before.md"]],
+      ] as const) {
+        const { pending, action } = launch()
+        emit(event, ...args)
+        action.click()
+        await pending
+        assert.deepEqual(ui.attempts, [],
+          `${kind} must not authorize after a real Vault ${event} event with unchanged metadata`)
+        assert.match(Notice.messages.at(-1) ?? "", /Force confirmation expired/u)
+        assert.equal(subscribed, released, "Force modal must remove change listeners after expiry")
+      }
+
+      // Configuration files outside the visible Force inventory are not part
+      // of this confirmation, and must not turn every Obsidian UI save into a
+      // stale Force confirmation.
+      const unaffected = launch()
+      emit("modify", { path: ".obsidian/workspace.json" })
+      unaffected.action.click()
+      await unaffected.pending
+      await tick()
+      assert.deepEqual(ui.attempts, [kind], "unrelated Obsidian workspace changes must not block a fresh Force")
+      assert.equal(subscribed, released, "all Force listeners must be released after success")
+
+      const cancelled = launch()
+      Modal.lastCreated!.close()
+      await cancelled.pending
+      assert.equal(subscribed, released, "cancelled Force confirmation must not retain Vault listeners")
+    } finally {
+      ui.cleanup()
+      resetModalTestState()
+      Notice.messages.length = 0
+    }
+  }
+})
+
 test("D158 Force confirmation refuses a swapped GitHub client or a changed visible vault inventory", async () => {
   for (const kind of ["forcePush", "forcePull"] as const) {
     const ui = setupUi()

@@ -400,6 +400,84 @@ async function performFirstUse() {
   return { generatedDeviceId: report.generatedDeviceId, savedDeviceId: report.newDeviceId }
 }
 
+async function performNativeForceChangeRefusal() {
+  stage = "native-force-change-refusal"
+  // In-memory fake coordinates only. Replace BOTH destructive Runtime actions
+  // with counters; no action under test can write to GitHub or user Vaults.
+  const result = await evaluate(`(async()=>{
+    let step="prepare-synthetic-force-modal";
+    const plugin=app.plugins.plugins[${JSON.stringify(pluginId)}];
+    if(plugin.githubClient || plugin.settings.githubToken)
+      return {failedAt:"unexpected-native-credential"};
+    const original=plugin.settings;
+    const originalPush=plugin.v4Runtime.forcePush;
+    const originalPull=plugin.v4Runtime.forcePull;
+    const note=app.vault.getAbstractFileByPath("D445-synthetic-first-use.md");
+    let attempts=0;
+    let activeModal;
+    try {
+      if(!note)throw Error("Synthetic note not found");
+      plugin.disableWatch();
+      plugin.v4Runtime.forcePush=async()=>{ attempts++; };
+      plugin.v4Runtime.forcePull=async()=>{ attempts++; };
+      plugin.settings={...original,githubOwner:"synthetic-test-owner",
+        githubRepo:"synthetic-test-repo",githubBranch:"main",
+        githubToken:"synthetic-not-a-real-token",
+        syncEnabled:false,syncOnLocalChange:false,scheduledSyncEnabled:false};
+      for(const operation of ["forcePush","forcePull"]) {
+        step="open-"+operation;
+        const pending=plugin.showForceConfirm(operation);
+        const start=Date.now();
+        let slider,button;
+        const label=operation==="forcePush"?"Force push":"Force pull";
+        while(Date.now()-start<6000) {
+          slider=document.querySelector(".github-sync-force-confirm-slider");
+          button=slider?.closest(".modal")&&[...slider.closest(".modal").querySelectorAll("button")]
+            .find(node=>node.textContent.trim()===label);
+          if(slider&&button)break;
+          await new Promise(resolve=>setTimeout(resolve,80));
+        }
+        if(!slider||!button)throw Error("Native Force dialog unavailable");
+        activeModal=slider.closest(".modal");
+        step="unlock-"+operation;
+        const rect=slider.getBoundingClientRect();
+        if(rect.width<=0)throw Error("Native slider has no width");
+        // Drive the actual UI handler while avoiding synthetic pointer capture.
+        slider.setPointerCapture=()=>{};
+        slider.onpointerdown?.({pointerId:9,clientX:rect.right});
+        if(button.style.display==="none")throw Error("Force action did not unlock");
+        step="invalidate-"+operation;
+        const size=note.stat.size,mtime=note.stat.mtime;
+        app.vault.trigger("modify",note); // Event only: no file mutation.
+        if(note.stat.size!==size||note.stat.mtime!==mtime)
+          throw Error("Synthetic metadata changed");
+        button.click();
+        await Promise.race([pending,new Promise((_r,reject)=>
+          setTimeout(()=>reject(Error("Force modal did not settle")),4500))]);
+        activeModal=undefined;
+        if(attempts!==0)throw Error("Stale Force actually executed");
+      }
+      if(plugin.githubClient)throw Error("Synthetic Force created GitHub client");
+      return {noForceExecuted:true};
+    } catch { return {failedAt:step}; }
+    finally {
+      if(activeModal){
+        const cancel=[...activeModal.querySelectorAll("button")]
+          .find(node=>node.textContent.trim()==="Cancel");
+        cancel?.click();
+      }
+      plugin.settings=original;
+      plugin.v4Runtime.forcePush=originalPush;
+      plugin.v4Runtime.forcePull=originalPull;
+    }
+  })()`, 36000)
+  if (result?.failedAt) {
+    stage = "native-force-change-refusal:" + result.failedAt
+    throw Error("Installed Force change-refusal smoke failed")
+  }
+  assert.equal(result?.noForceExecuted, true)
+}
+
 async function performNativeHistoricalRecovery() {
   stage = "native-history-recovery"
   // The history version is synthetic, but the installed plugin renders its
@@ -571,6 +649,7 @@ try {
     }
     const firstInstall = await performFirstUse()
     await performNativeHistoricalRecovery()
+    await performNativeForceChangeRefusal()
     const originalDeviceId = firstInstall.savedDeviceId
     stage = "check-saved-disk"
     const disk = JSON.parse(await readFile(beforePath, "utf8"))
@@ -759,7 +838,8 @@ try {
       nativeInvalidBranchRejectedBeforeSave: true,
       nativeEmptyBranchRejectedBeforeSave: true,
       nativeUnconfiguredRibbonAccurate: true, nativeIncompleteClientRefused: true,
-      nativeHistoryMissingFieldGuidance: true, noCredentialSyncRejected: true, noGitHubCredentials: true, remoteGitHubUsed: false,
+      nativeHistoryMissingFieldGuidance: true, nativeForceChangeRefusal: true,
+      noCredentialSyncRejected: true, noGitHubCredentials: true, remoteGitHubUsed: false,
       syntheticNotesPreserved: true, nativeHistoryRestoreCopy: true,
       nativeHistoryRestorePersistedAfterRestart: true,
       nativeHistoryOpenAfterRestore: true,
