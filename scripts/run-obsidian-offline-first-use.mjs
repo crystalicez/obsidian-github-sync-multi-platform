@@ -512,6 +512,7 @@ async function performNativeSettingsSaveDebounceFence() {
     const originalExecute=coordinator.options.execute;
     const originalSchedule=coordinator.schedule;
     const originalCancel=coordinator.cancel;
+    const originalPersistData=plugin.persistData;
     let staleCallback, executions=0, changedSettings=false;
     try {
       coordinator.schedule=(callback)=>{ staleCallback=callback; return "synthetic-d485-timer"; };
@@ -539,14 +540,33 @@ async function performNativeSettingsSaveDebounceFence() {
       changedSettings=false;
       if(coordinator.isAutomaticSyncPaused)
         throw Error("Clean Settings Save should allow future Auto Sync");
+      step="failed-settings-save-without-queued-edits";
+      plugin.persistData=async()=>{throw Error("synthetic-native-save-failure");};
+      let rejected=false;
+      try {
+        await plugin.saveSettings({...originalSettings,
+          statusBarStatusEnabled:!originalSettings.statusBarStatusEnabled});
+      } catch(error) {
+        if(!String(error).includes("synthetic-native-save-failure"))throw error;
+        rejected=true;
+      } finally {plugin.persistData=originalPersistData;}
+      if(!rejected || coordinator.pendingCount!==0 || !coordinator.isAutomaticSyncPaused
+        || plugin.v4Runtime.progressSnapshot.lifecycle!=="failed"
+        || !/Settings save|Automatic Sync paused/i.test(plugin.v4Runtime.progressSnapshot.errorMessage||""))
+        throw Error("Failed Settings Save left misleading healthy Sync status");
+      step="manual-reconciliation-after-failed-settings-save";
+      const retry=await coordinator.run({operation:"normal",trigger:"manual"});
+      if(retry.status!=="completed" || coordinator.isAutomaticSyncPaused || executions!==2)
+        throw Error("Manual reconciliation after failed Settings Save did not resume automatic Sync");
       if(plugin.githubClient||plugin.settings.githubToken)
         throw Error("Synthetic test created a credentialed client");
-      return {settingsDebounceFenced:true};
+      return {settingsDebounceFenced:true,failedSavePauseVisible:true};
     } catch {return {failedAt:step};}
     finally {
       coordinator.options.execute=originalExecute;
       coordinator.schedule=originalSchedule;
       coordinator.cancel=originalCancel;
+      plugin.persistData=originalPersistData;
       if(changedSettings) {
         try {await plugin.saveSettings(originalSettings);} catch {}
       }
@@ -557,6 +577,7 @@ async function performNativeSettingsSaveDebounceFence() {
     throw Error("Installed Settings-save debounce fence failed")
   }
   assert.equal(result?.settingsDebounceFenced, true)
+  assert.equal(result?.failedSavePauseVisible, true)
 }
 
 async function performNativeHistoricalRecovery() {
@@ -921,7 +942,7 @@ try {
       nativeEmptyBranchRejectedBeforeSave: true,
       nativeUnconfiguredRibbonAccurate: true, nativeIncompleteClientRefused: true,
       nativeHistoryMissingFieldGuidance: true, nativeForceChangeRefusal: true,
-      nativeSettingsSaveDebounceFence: true,
+      nativeSettingsSaveDebounceFence: true, nativeFailedSavePauseVisible: true,
       noCredentialSyncRejected: true, noGitHubCredentials: true, remoteGitHubUsed: false,
       syntheticNotesPreserved: true, nativeHistoryRestoreCopy: true,
       nativeHistoryRestorePersistedAfterRestart: true,

@@ -309,14 +309,27 @@ export class V4PluginRuntime {
     if (this.disposed) return
     const resumed = this.coordinator.finishSettingsSave(committed)
     const queued = this.coordinator.pendingCount
-    if (committed && !resumed && queued > 0) {
-      if (!this.coordinator.isSyncing) {
+    if (!resumed) {
+      // A failed Save with no queued edits must never leave a green/idle
+      // status while automatic syncing is paused. Likewise an older Sync
+      // that completes *after* this Save cannot replace the pause with an
+      // apparently healthy success. Preserve real Sync failure details.
+      const reportPause = () => {
+        if (this.disposed || this.coordinator.isSyncing || !this.coordinator.isAutomaticSyncPaused
+          || this.progressStore.snapshot.lifecycle === "failed") return
         this.debounceRunActive = false
         this.progressStore.finish("failed", {
           phase: "blocked",
-          errorMessage: "Settings saved. Queued local edits need Manual Sync before automatic syncing resumes.",
+          errorMessage: committed
+            ? "Automatic Sync paused after Settings Save. Review the saved repository and run Sync now manually before automatic syncing resumes."
+            : "Settings save did not complete. Automatic Sync is paused; review Settings and run Sync now manually after resolving the error.",
         })
       }
+      if (this.coordinator.isSyncing) {
+        void this.coordinator.whenIdle().then(reportPause, reportPause)
+      } else reportPause()
+    }
+    if (committed && !resumed && queued > 0) {
       new Notice("GitHub Sync: Settings saved. Queued local edits were not sent automatically. Review the saved repository and run Sync now manually.", 10000)
     } else if (!committed) {
       new Notice("GitHub Sync: Settings save did not complete. Automatic Sync is paused for safety; review Settings and run Sync now manually after resolving the error.", 10000)

@@ -7,14 +7,14 @@ import { Modal, modalButtons, Notice, resetModalTestState, settingSliderControls
 import { DEFAULT_SETTINGS, SettingTab } from "../../src/setting";
 import FastSync from "../../src/main";
 import { V4SyncCenterView, V4_SYNC_CENTER_VIEW } from "../../src/views/sync-center";
-import { createIdleV4Progress } from "../../src/lib/v4/progress";
+import { createIdleV4Progress, V4ProgressStore } from "../../src/lib/v4/progress";
 import type { GitHubCreateTreeEntry } from "../../src/lib/github-git-types";
 import { deriveV4Keyring } from "../../src/lib/v4/crypto";
 import { publishV4TreeChanges } from "../../src/lib/v4/git-tree-writer";
 import { migrateV4Secrets, sanitizeV4SettingsForPersistence, storeV4Secrets } from "../../src/lib/v4/secrets";
 import { selectV4RuntimeConfig, V4PluginRuntime } from "../../src/lib/v4/runtime";
 import { V4ManualRecoveryRequiredError } from "../../src/lib/v4/platform-io";
-import type { V4SyncCoordinator } from "../../src/lib/v4/sync-coordinator";
+import type { V4SyncCoordinator, V4SyncRequest, V4QueuedChange } from "../../src/lib/v4/sync-coordinator";
 import { buildV4RemoteMetadata } from "../../src/lib/v4/remote-index";
 import { V4StorageCodec } from "../../src/lib/v4/storage-codec";
 import { computeV4GitBlobSha1 } from "../../src/lib/v4/git-blob-identity";
@@ -2276,6 +2276,86 @@ test("D427 a durable Settings Save refreshes open Sync Center history only after
     await view.onClose();
   }
 });
+
+test("D486 failed Settings Save without pending local changes publishes Auto-Sync paused status", async () => {
+  const f = plaintextRuntimeFixture()
+  try {
+    const coordinator = (f.runtime as unknown as { coordinator: V4SyncCoordinator }).coordinator
+    assert.equal(f.runtime.progressSnapshot.lifecycle, "idle")
+    assert.equal(coordinator.pendingCount, 0)
+    f.runtime.settingsSaveStarted()
+    f.runtime.settingsSaveFinished(false)
+    assert.equal(coordinator.isAutomaticSyncPaused, true)
+    assert.equal(f.runtime.progressSnapshot.lifecycle, "failed",
+      "the status bar and Sync Center must not still show the previous idle/success after uncertain Save")
+    assert.match(f.runtime.progressSnapshot.errorMessage ?? "", /Settings save|Automatic Sync paused/iu)
+    assert.equal((await f.runtime.scheduledSync() as { status: string }).status, "skipped")
+  } finally {
+    f.runtime.dispose()
+  }
+})
+
+test("D486 a pre-Save in-flight Sync finishing later cannot leave a green success while Auto-Sync is paused", async () => {
+  const f = plaintextRuntimeFixture()
+  const coordinator = (f.runtime as unknown as { coordinator: V4SyncCoordinator }).coordinator
+  let release!: () => void
+  const gate = new Promise<void>(resolve => { release = resolve })
+  try {
+    // Drive the real runtime progress store, while preventing any remote I/O.
+    const progress = (f.runtime as unknown as { progressStore: V4ProgressStore }).progressStore
+    const execute = (coordinator as unknown as {
+      options: { execute: (request: V4SyncRequest, changes: V4QueuedChange[], signal: AbortSignal) => Promise<{ changedFiles: number }> }
+    }).options
+    execute.execute = async () => {
+      progress.beginRun({ operation: "normal", trigger: "manual", phase: "checking-remote" })
+      await gate
+      progress.finish("success")
+      return { changedFiles: 0 }
+    }
+    const oldRun = f.runtime.manualSync()
+    assert.equal(coordinator.isSyncing, true)
+    f.runtime.settingsSaveStarted()
+    f.runtime.settingsSaveFinished(true)
+    assert.equal(coordinator.isAutomaticSyncPaused, true)
+    release()
+    await oldRun
+    await new Promise<void>(resolve => setImmediate(resolve))
+    assert.equal(coordinator.isAutomaticSyncPaused, true)
+    assert.equal(f.runtime.progressSnapshot.lifecycle, "failed",
+      "the pre-save run's success cannot mask a still-paused automatic synchronizer")
+    assert.match(f.runtime.progressSnapshot.errorMessage ?? "", /Manual Sync|Settings Save/iu)
+  } finally {
+    release()
+    f.runtime.dispose()
+  }
+})
+
+test("D486 idle successful Save keeps Auto-Sync ready and earlier real Sync failures remain visible", () => {
+  const clean = plaintextRuntimeFixture()
+  const failed = plaintextRuntimeFixture()
+  try {
+    const cleanCoordinator = (clean.runtime as unknown as { coordinator: V4SyncCoordinator }).coordinator
+    clean.runtime.settingsSaveStarted()
+    clean.runtime.settingsSaveFinished(true)
+    assert.equal(cleanCoordinator.isAutomaticSyncPaused, false)
+    assert.equal(clean.runtime.progressSnapshot.lifecycle, "idle",
+      "a clean committed Settings Save must not invent a failure")
+
+    const progress = (failed.runtime as unknown as { progressStore: V4ProgressStore }).progressStore
+    progress.beginRun({ operation: "normal", trigger: "manual", phase: "uploading" })
+    progress.finish("failed", { errorMessage: "Prior remote publication outcome unknown" })
+    failed.runtime.settingsSaveStarted()
+    failed.runtime.settingsSaveFinished(false)
+    assert.equal(failed.runtime.progressSnapshot.lifecycle, "failed")
+    assert.equal(failed.runtime.progressSnapshot.errorMessage,
+      "Prior remote publication outcome unknown",
+      "a Settings warning must never erase evidence of the more serious previous Sync failure")
+    assert.equal(failed.runtime.progressSnapshot.failurePhase, "uploading")
+  } finally {
+    clean.runtime.dispose()
+    failed.runtime.dispose()
+  }
+})
 
 test("main settings save invalidates the runtime credential generation before future sync work", async () => {
   const source = await readFile("src/main.ts", "utf8")
