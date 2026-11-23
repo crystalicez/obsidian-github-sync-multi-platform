@@ -5,6 +5,7 @@ import type { GitHubCreateTreeEntry } from "../../src/lib/github-git-types";
 import { createEmptyV4LocalIndex, type V4LocalIndex } from "../../src/lib/v4/local-index";
 import { V4_FORMAT_VERSION, type V4RemoteConfig } from "../../src/lib/v4/protocol-types";
 import { V4SyncSession, type V4SessionVault } from "../../src/lib/v4/sync-session";
+import { normalizeV4VaultPath } from "../../src/lib/v4/paths";
 import { computeV4GitBlobSha1 } from "../../src/lib/v4/git-blob-identity";
 
 const enc = (value: string) => new TextEncoder().encode(value);
@@ -141,6 +142,85 @@ async function baseFixture(path = "shared.md") {
 function session(github: MemoryGitHub, vault: MemoryVault, index: V4LocalIndex, now = () => 424242) {
   return new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0, now });
 }
+
+test("D473 user-edited unsafe Device IDs still keep remote conflicts as portable sibling notes", async () => {
+  for (const deviceId of ["my/laptop", "Windows:device?", "x".repeat(250), "../other"]) {
+    const fixture = await baseFixture("Folder/shared.md")
+    fixture.localIndex.deviceId = deviceId
+    fixture.remoteVault.files.set("Folder/shared.md", { bytes: enc("remote change\\n"), mtime: 2 })
+    await session(fixture.github, fixture.remoteVault, fixture.remoteIndex)
+      .sync({ operation: "normal", allowThresholdOverride: false,
+        changes: [{ type: "modify", path: "Folder/shared.md", mtime: 2 }] })
+
+    fixture.localVault.files.set("Folder/shared.md", { bytes: enc("local change\\n"), mtime: 3 })
+    await session(fixture.github, fixture.localVault, fixture.localIndex)
+      .sync({ operation: "normal", allowThresholdOverride: false,
+        changes: [{ type: "modify", path: "Folder/shared.md", mtime: 3 }] })
+
+    const copies = [...fixture.localVault.files.keys()].filter(path => path.includes(".conflict-remote-"))
+    assert.equal(copies.length, 1, "one separately recoverable remote copy must exist")
+    const copyPath = copies[0]!
+    assert.match(copyPath, /^Folder\/shared\.conflict-remote-[A-Za-z0-9_-]+-424242\.md$/u,
+      "device-provided delimiters must not become directories or invalid filenames")
+    assert.equal(normalizeV4VaultPath(copyPath), copyPath, "copy must have a portable V4 path")
+    assert.ok(new TextEncoder().encode(copyPath.split("/").at(-1)!).byteLength <= 255,
+      "the copy basename must fit cross-platform filesystem limits")
+    assert.deepEqual(fixture.localVault.files.get("Folder/shared.md")?.bytes, enc("local change\\n"))
+    assert.deepEqual(fixture.localVault.files.get(copyPath)?.bytes, enc("remote change\\n"))
+    assert.equal(fixture.localIndex.deviceId, deviceId,
+      "safening the copy filename must not replace device identity or reset the index")
+    assert.equal(recordAt(fixture.localIndex, copyPath).path, copyPath,
+      "the portable copy must remain tracked for sync to another device")
+  }
+})
+
+test("D473 long valid note names retain a portable recoverable Markdown conflict copy", async () => {
+  const originalPath = `Folder/${"n".repeat(245)}.md`
+  const fixture = await baseFixture(originalPath)
+  fixture.localIndex.deviceId = "laptop-01"
+  fixture.remoteVault.files.set(originalPath, { bytes: enc("remote long note\\n"), mtime: 2 })
+  await session(fixture.github, fixture.remoteVault, fixture.remoteIndex)
+    .sync({ operation: "normal", allowThresholdOverride: false,
+      changes: [{ type: "modify", path: originalPath, mtime: 2 }] })
+  fixture.localVault.files.set(originalPath, { bytes: enc("local long note\\n"), mtime: 3 })
+  await session(fixture.github, fixture.localVault, fixture.localIndex)
+    .sync({ operation: "normal", allowThresholdOverride: false,
+      changes: [{ type: "modify", path: originalPath, mtime: 3 }] })
+
+  const copies = [...fixture.localVault.files.keys()].filter(path => path.includes(".conflict-remote-"))
+  assert.equal(copies.length, 1)
+  const copyPath = copies[0]!
+  assert.match(copyPath, /^Folder\/n+-[0-9a-f]{12}\.conflict-remote-laptop-01-424242\.md$/u)
+  assert.equal(normalizeV4VaultPath(copyPath), copyPath)
+  assert.ok(enc(copyPath.slice("Folder/".length)).byteLength <= 255)
+  assert.deepEqual(fixture.localVault.files.get(originalPath)?.bytes, enc("local long note\\n"))
+  assert.deepEqual(fixture.localVault.files.get(copyPath)?.bytes, enc("remote long note\\n"))
+  assert.equal(recordAt(fixture.localIndex, copyPath).path, copyPath)
+})
+
+test("D473 two distinct near-limit filenames cannot silently alias the same conflict copy", async () => {
+  const copies: string[] = []
+  for (const tail of ["a", "b"]) {
+    const originalPath = `Folder/${"n".repeat(244)}${tail}.md`
+    const fixture = await baseFixture(originalPath)
+    fixture.localIndex.deviceId = "laptop-01"
+    fixture.remoteVault.files.set(originalPath, { bytes: enc("remote"), mtime: 2 })
+    await session(fixture.github, fixture.remoteVault, fixture.remoteIndex)
+      .sync({ operation: "normal", allowThresholdOverride: false,
+        changes: [{ type: "modify", path: originalPath, mtime: 2 }] })
+    fixture.localVault.files.set(originalPath, { bytes: enc("local"), mtime: 3 })
+    await session(fixture.github, fixture.localVault, fixture.localIndex)
+      .sync({ operation: "normal", allowThresholdOverride: false,
+        changes: [{ type: "modify", path: originalPath, mtime: 3 }] })
+    const copyPath = [...fixture.localVault.files.keys()].find(path => path.includes(".conflict-remote-"))
+    assert.ok(copyPath)
+    assert.equal(normalizeV4VaultPath(copyPath), copyPath)
+    assert.deepEqual(fixture.localVault.files.get(copyPath)?.bytes, enc("remote"))
+    copies.push(copyPath)
+  }
+  assert.notEqual(copies[0], copies[1],
+    "different full source names must not alias after portable basename shortening")
+})
 
 test("copy policy keeps local edit canonical and preserves one remote conflict copy", async () => {
   const fixture = await baseFixture();

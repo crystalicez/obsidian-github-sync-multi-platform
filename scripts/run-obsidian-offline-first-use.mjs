@@ -195,16 +195,28 @@ async function performFirstUse() {
       if(plugin.githubClient)throw Error("Unexpected GitHub client on fresh installation");
       const syncButton=[...view.querySelectorAll("button")]
         .find(button=>button.textContent.trim()==="Sync now");
+      const before=plugin.v4Runtime.progressSnapshot;
+      const generation=plugin.v4Runtime.coordinator.syncExecutionGeneration;
       syncButton.click();
-      const syncStart=Date.now();
-      while(plugin.v4Runtime.progressSnapshot.lifecycle!=="failed"
-        &&Date.now()-syncStart<9000)
-        await new Promise(resolve=>setTimeout(resolve,100));
+      // D472 first-use guard refuses the action before Runtime and shows
+      // specific guidance; entering a failed Sync would spuriously pause auto.
+      await new Promise(resolve=>setTimeout(resolve,180));
       const result=plugin.v4Runtime.progressSnapshot;
-      if(result.lifecycle!=="failed"
-        ||!result.errorMessage?.includes("GitHub connection is not configured.")
-        ||plugin.githubClient)
-        throw Error("No-token Sync did not fail closed with guidance");
+      if(result.lifecycle!==before.lifecycle
+        ||plugin.v4Runtime.coordinator.syncExecutionGeneration!==generation
+        ||plugin.githubClient){
+        step="unconfigured-sync-started-runtime";
+        throw Error("No-token Sync unexpectedly started Runtime");
+      }
+      const notices=[...document.querySelectorAll(".notice")]
+        .map(node=>node.textContent||"");
+      if(!notices.some(message=>message.includes("Configure GitHub owner")
+        &&message.includes("GitHub repository")
+        &&message.includes("GitHub token")
+        &&message.includes("Save changes"))){
+        step="unconfigured-sync-guidance-unavailable";
+        throw Error("No-token Sync did not show missing-field guidance");
+      }
       step="open-native-settings-tab";
       const host=app.setting;
       if(!host||typeof host.open!=="function"||typeof host.openTabById!=="function")

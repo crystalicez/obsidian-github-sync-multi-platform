@@ -768,7 +768,7 @@ export class V4SyncSession {
         if (resolution.action === "keep-local-copy-remote" && conflict.remote && remoteRecord) {
           let reservedCopy = this.input.runState?.conflictCopies.get(conflict.fileId)
           if (!reservedCopy) {
-            const path = this.conflictCopyPath(conflict.remote.path)
+            const path = await this.conflictCopyPath(conflict.remote.path)
             reservedCopy = { path, fileId: await this.newFileId(path), includeInSync: includePath(path) }
             this.input.runState?.conflictCopies.set(conflict.fileId, reservedCopy)
           }
@@ -1979,10 +1979,45 @@ export class V4SyncSession {
     return { fileId: after.fileId, kind: "modify", path: after.path, before, after }
   }
 
-  private conflictCopyPath(path: string): string {
-    const dot = path.lastIndexOf(".")
-    const suffix = `.conflict-remote-${this.input.index.deviceId}-${this.now()}`
-    return dot > path.lastIndexOf("/") ? `${path.slice(0, dot)}${suffix}${path.slice(dot)}` : `${path}${suffix}`
+  private async conflictCopyPath(path: string): Promise<string> {
+    // Device IDs identify logical sync writers, not filesystem path segments.
+    // Keep ordinary IDs readable; use a deterministic collision-resistant label
+    // for user-entered IDs containing separators or long/unsafe characters.
+    const deviceId = this.input.index.deviceId
+    const label = /^[A-Za-z0-9_-]{1,48}$/u.test(deviceId)
+      ? deviceId
+      : `device-${(await sha256Hex(utf8ToBytes(deviceId))).slice(0, 16)}`
+    const suffix = `.conflict-remote-${label}-${this.now()}`
+    const slash = path.lastIndexOf("/")
+    const directory = path.slice(0, slash + 1)
+    const filename = path.slice(slash + 1)
+    const dot = filename.lastIndexOf(".")
+    let stem = dot > 0 ? filename.slice(0, dot) : filename
+    let extension = dot > 0 ? filename.slice(dot) : ""
+    const suffixBytes = utf8ToBytes(suffix).byteLength
+    // A source filename may already consume 255 bytes. Keep the copy
+    // within the portable per-segment bound without modifying the source.
+    if (utf8ToBytes(extension).byteLength >= 255 - suffixBytes) {
+      stem = filename
+      extension = ""
+    }
+    const budget = 255 - suffixBytes - utf8ToBytes(extension).byteLength
+    if (utf8ToBytes(stem).byteLength > budget) {
+      // Two long names may differ only beyond the shortened prefix. Keep a
+      // stable digest of the full source path to avoid aliasing their copies.
+      const disambiguator = `-${(await sha256Hex(utf8ToBytes(path))).slice(0, 12)}`
+      const prefixBudget = budget - utf8ToBytes(disambiguator).byteLength
+      let trimmed = ""
+      let size = 0
+      for (const char of stem) {
+        const bytes = utf8ToBytes(char).byteLength
+        if (size + bytes > prefixBudget) break
+        trimmed += char
+        size += bytes
+      }
+      stem = `${trimmed}${disambiguator}`
+    }
+    return normalizeV4VaultPath(`${directory}${stem}${suffix}${extension}`)
   }
 
   private async newFileId(seed: string): Promise<string> {
