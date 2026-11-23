@@ -3,12 +3,15 @@ import test from "node:test";
 
 import FastSync from "../../src/main";
 import { DEFAULT_SETTINGS } from "../../src/setting";
-import { assertPluginSettingsRuntimeSafe } from "../../src/lib/plugin-settings-validation";
+import { assertPluginSettingsRuntimeSafe, assertPluginSettingsSavable } from "../../src/lib/plugin-settings-validation";
 
 const valid = { ...DEFAULT_SETTINGS, githubOwner: "safe-org", githubRepo: "repo.test", githubBranch: "feature/safe-test" };
 
 test("settings validator preserves valid defaults and nested Git branch while refusing unsafe persistent fields", () => {
   assert.doesNotThrow(() => assertPluginSettingsRuntimeSafe(valid));
+  assert.doesNotThrow(() => assertPluginSettingsSavable({ ...valid, githubToken: "" }),
+    "users can save a partially configured connection without a token")
+  assert.doesNotThrow(() => assertPluginSettingsSavable({ ...valid, githubToken: "real-token" }));
   const invalid: Array<{ patch: Record<string, unknown>; message: RegExp }> = [
     { patch: { githubOwner: "../wrong" }, message: /Invalid GitHub owner/iu },
     { patch: { githubBranch: "branch@{1}" }, message: /Invalid GitHub branch/iu },
@@ -75,6 +78,36 @@ test("D476 direct Settings Save refuses blank GitHub branch before SecretStorage
     assert.equal(diskWrites, 0, "invalid branch must not persist")
     assert.equal(plugin.settings.githubBranch, saved.githubBranch,
       "failed Save must not replace the active remote branch")
+  }
+})
+
+test("D477 direct Save rejects whitespace-only GitHub token before SecretStorage and plugin data writes", async () => {
+  const saved = { ...valid, githubToken: "previous-token",
+    githubTokenSecretId: "token-id", encryptionPassphraseSecretId: "pass-id" }
+  const secretWrites: string[] = []
+  let diskWrites = 0
+  const plugin = {
+    settings: saved,
+    secretStorageReadUnavailable: false,
+    settingsSaveInProgress: false,
+    settingsSaveAttemptGeneration: 0,
+    app: { secretStorage: {
+      getSecret: () => null,
+      setSecret: (id: string) => { secretWrites.push(id) },
+    } },
+    v4Runtime: { assertReencryptionSettingsSaveAllowed: async () => undefined },
+    persistData: async () => { diskWrites++ },
+    initGitHubClient: () => undefined,
+    registerScheduledSync: () => undefined,
+    createSecretId: () => { throw new Error("unexpected secret allocation") },
+  } as unknown as FastSync
+  for (const githubToken of [" ", "  \t  "]) {
+    await assert.rejects(() => FastSync.prototype.saveSettings.call(plugin,
+      { ...saved, githubToken }), /GitHub token/u)
+    assert.deepEqual(secretWrites, [], "invalid token must not write SecretStorage")
+    assert.equal(diskWrites, 0, "invalid token must not persist")
+    assert.equal(plugin.settings.githubToken, "previous-token",
+      "failed Save must preserve working credentials")
   }
 })
 

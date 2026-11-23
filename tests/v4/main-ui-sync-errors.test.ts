@@ -570,6 +570,55 @@ test("D418 a failed Settings save retires uncertain automatic callbacks until re
   }
 })
 
+test("D477 whitespace-only saved GitHub token refuses manual and Force Sync without a doomed request", async () => {
+  const ui = setupUi()
+  resetModalTestState()
+  Notice.messages.length = 0
+  try {
+    ui.setMode("resolve")
+    await ui.plugin.onload()
+    ui.plugin.settings = { ...ui.plugin.settings, githubToken: " \t " }
+    ui.plugin.settingTab.tempSettings = null
+    ui.plugin.settingTab.display()
+    const view = new V4SyncCenterView(new WorkspaceLeaf(ui.plugin.app), ui.plugin)
+    await view.onOpen()
+    const center = (view.contentEl as unknown as ElementStub).findByText("Sync now")
+    const settings = (ui.plugin.settingTab.containerEl as unknown as ElementStub).findByText("Sync now")
+    assert.ok(center && settings)
+    const actions: Array<() => void> = [
+      ui.ribbons.get("GitHub Sync: Sync")!,
+      ui.commands.get("sync-all-files")!,
+      () => { ui.plugin.updateStatusBar(); ui.statusRoot.children[0]?.onclick?.() },
+      () => center.onclick?.(),
+      () => settings.onclick?.(),
+      ui.ribbons.get("GitHub Sync: Force Push")!,
+      ui.commands.get("force-pull-all-files")!,
+    ]
+    const initialModals = modalButtons.length
+    for (const action of actions) {
+      const before = Notice.messages.length
+      action()
+      await tick()
+      assert.deepEqual(ui.attempts, [], "blank token must not start Runtime")
+      assert.equal(modalButtons.length, initialModals, "Force confirmation must not open")
+      assert.equal(Notice.messages.length, before + 1)
+      assert.match(Notice.messages.at(-1)!, /GitHub token.*Settings.*Save changes/u)
+      assert.doesNotMatch(Notice.messages.at(-1)!, /secret-token/u)
+    }
+    ui.plugin.settings = { ...ui.plugin.settings, githubToken: "repaired-token" }
+    ui.plugin.settingTab.tempSettings = null
+    ui.plugin.settingTab.display()
+    ui.commands.get("sync-all-files")!()
+    await tick()
+    assert.deepEqual(ui.attempts, ["manual"], "a repaired token allows ordinary manual Sync")
+    await view.onClose()
+  } finally {
+    ui.cleanup()
+    resetModalTestState()
+    Notice.messages.length = 0
+  }
+})
+
 test("D476 saved empty GitHub branch refuses manual and Force Sync until corrected", async () => {
   const ui = setupUi()
   resetModalTestState()

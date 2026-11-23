@@ -105,6 +105,11 @@ export function assertPluginSettingsRuntimeSafe(value: unknown): void {
 export function assertPluginSettingsSavable(value: unknown): void {
   assertPluginSettingsRuntimeSafe(value)
   const settings = value as RuntimeSettings
+  const token = settings["githubToken"]
+  // Permit an intentionally unconfigured token, but not a nonempty unusable credential.
+  if (typeof token === "string" && token.length > 0 && !token.trim()) {
+    throw new Error("GitHub token must not contain only spaces.")
+  }
   if (!(settings["githubBranch"] as string).trim()) throw new Error("GitHub branch is required.")
   if (!(settings["vault"] as string).trim()) throw new Error("Device ID is required.")
 }

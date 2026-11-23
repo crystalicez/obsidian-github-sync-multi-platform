@@ -20,7 +20,7 @@ export function missingGitHubSyncConfigFields(settings: SyncPolicySettings): str
   if (!settings.githubOwner) missing.push("GitHub owner")
   if (!settings.githubRepo) missing.push("GitHub repository")
   if (settings.githubBranch !== undefined && !settings.githubBranch.trim()) missing.push("GitHub branch")
-  if (!settings.githubToken) missing.push("GitHub token")
+  if (!settings.githubToken?.trim()) missing.push("GitHub token")
   if (settings.vault !== undefined && !settings.vault.trim()) missing.push("Device ID")
   if (settings.encryptionMode === "encrypted" && !settings.encryptionPassphrase) {
     missing.push("encryption passphrase")
@@ -29,7 +29,7 @@ export function missingGitHubSyncConfigFields(settings: SyncPolicySettings): str
 }
 
 export function hasGitHubSyncConfig(settings: SyncPolicySettings): boolean {
-  return Boolean(settings.githubToken && settings.githubOwner && settings.githubRepo
+  return Boolean(settings.githubToken?.trim() && settings.githubOwner && settings.githubRepo
     && (settings.githubBranch === undefined || settings.githubBranch.trim())
     && (settings.vault === undefined || settings.vault.trim())
     && (settings.encryptionMode !== "encrypted" || settings.encryptionPassphrase));

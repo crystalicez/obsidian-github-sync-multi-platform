@@ -190,6 +190,35 @@ test("D424 editing repository during a stalled connection check lets users retry
   }
 })
 
+test("D477 whitespace-only token on Connection check requests a real token without contacting GitHub", async () => {
+  const calls: string[] = []
+  setRequestUrlHandler(async raw => {
+    const url = (raw as { url: string }).url
+    calls.push(url)
+    if (url.endsWith("/repos/owner/notes")) return response(200, { id: 123, full_name: "owner/notes" })
+    return response(404, { message: "not found" })
+  })
+  try {
+    const tab = tabFor()
+    tab.tempSettings!.githubToken = " \t "
+    tab.updateDirtyState()
+    tab.containerEl.findByText("Test GitHub connection")?.onclick?.()
+    await waitForCondition(() => tab.containerEl.flattenText().includes("Enter a GitHub owner"),
+      "token correction guidance")
+    assert.deepEqual(calls, [], "invalid token should not initiate a network request")
+    assert.equal(tab.tempSettings?.githubToken, " \t ", "check must preserve unsaved draft")
+    tab.tempSettings!.githubToken = token
+    tab.updateDirtyState()
+    tab.containerEl.findByText("Test GitHub connection")?.onclick?.()
+    await waitForCondition(() => tab.containerEl.flattenText().includes("Configured branch was not found"),
+      "valid token allows read-only branch check")
+    assert.equal(calls.length, 2)
+    assert.doesNotMatch(tab.containerEl.flattenText(), /private-token-must-not-appear/u)
+  } finally {
+    setRequestUrlHandler(null)
+  }
+})
+
 test("D471 invalid GitHub connection fields give actionable guidance without touching GitHub", async () => {
   const cases = [
     { field: "githubOwner", invalid: "owner with spaces", expected: /Check GitHub owner/u },
@@ -245,6 +274,7 @@ test("D449 invalid user-editable Settings show specific secret-free guidance bef
     { field: "githubBranch", invalid: "bad..branch", valid: "feature/notes", guidance: /GitHub branch.*\.\./u },
     { field: "githubBranch", invalid: "", valid: "feature/notes", guidance: /GitHub branch/u },
     { field: "vault", invalid: "  \t  ", valid: "device-laptop-01", guidance: /Device ID/u },
+    { field: "githubToken", invalid: " \t ", valid: "repaired-token", guidance: /GitHub token.*spaces/u },
     { field: "ignorePathRegex", invalid: "(?<private-regex-DO-NOT-LEAK>", valid: "^Archive/", guidance: /Ignore.path regex/u },
   ] as const
 

@@ -27,6 +27,9 @@ function settingsSaveValidationHint(error: unknown): string {
   if (message === "Invalid GitHub branch.") {
     return "Check GitHub branch: remove spaces, '..', repeated slashes, trailing dots, or invalid characters."
   }
+  if (message === "GitHub token must not contain only spaces.") {
+    return "Check GitHub token: enter a valid token or leave it empty until configured; spaces alone cannot be saved."
+  }
   if (message === "Device ID is required.") {
     return "Enter a Device ID for this Obsidian vault. Keep it unique per device, then Save changes."
   }
@@ -186,7 +189,7 @@ export class SettingTab extends PluginSettingTab {
     let result: string
     const invalidFields = connectionCheckValidationHint(fields)
     try {
-      if (!fields.owner || !fields.repo || !fields.branch || !fields.token) {
+      if (!fields.owner || !fields.repo || !fields.branch || !fields.token.trim()) {
         result = "Enter a GitHub owner, repository, branch and token before testing."
       } else if (invalidFields) {
         result = invalidFields

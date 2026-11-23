@@ -37,6 +37,17 @@ test("D476 a blank saved GitHub branch blocks startup and scheduled Sync despite
     "an explicit branch still permits normal Sync")
 })
 
+test("D477 whitespace-only GitHub tokens do not arm unattended Sync", () => {
+  for (const githubToken of [" ", " \t\r\n "]) {
+    const invalid = { ...plaintext, githubToken }
+    assert.equal(hasGitHubSyncConfig(invalid), false)
+    assert.equal(shouldRunStartupSync(invalid), false)
+    assert.equal(shouldRunScheduledSync(invalid), false)
+  }
+  assert.equal(hasGitHubSyncConfig(plaintext), true,
+    "a nonblank saved token still permits normal Sync")
+})
+
 test("D475 an empty saved Device ID pauses startup and scheduled Sync even with valid credentials", () => {
   for (const vault of ["", " ", "  \t  "]) {
     const invalid = { ...plaintext, vault }
@@ -54,6 +65,7 @@ test("D416 file-change auto Sync skips incomplete credentials without scheduling
     { ...encrypted, encryptionPassphrase: "", syncOnLocalChange: true },
     { ...plaintext, vault: "  ", syncOnLocalChange: true },
     { ...plaintext, githubBranch: "", syncOnLocalChange: true },
+    { ...plaintext, githubToken: " \t ", syncOnLocalChange: true },
   ]) {
     const plugin = {
       settings, isWatchEnabled: true, ignoredFiles: new Set<string>(),
