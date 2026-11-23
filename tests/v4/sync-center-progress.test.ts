@@ -4,7 +4,8 @@ import test from "node:test";
 import { Notice, WorkspaceLeaf } from "obsidian";
 import { createIdleV4Progress, V4ProgressStore, type V4SyncProgressSnapshot } from "../../src/lib/v4/progress";
 import { V4SyncCenterView } from "../../src/views/sync-center";
-import { V4HistoryNotInitializedError, V4HistoryPreviewLimitError } from "../../src/lib/v4/history-service";
+import { V4HistoryNotInitializedError, V4HistoryPreviewLimitError, V4HistoryService } from "../../src/lib/v4/history-service";
+import { V4_FORMAT_VERSION } from "../../src/lib/v4/protocol-types";
 import { waitForCondition } from "../helpers/wait-for";
 
 const uploadingFixture: V4SyncProgressSnapshot = {
@@ -73,6 +74,47 @@ function deferred<T>() {
   const promise = new Promise<T>(accept => { resolve = accept; });
   return { promise, resolve };
 }
+
+test("D465 closing Current file during a delayed GitHub response stops further journal requests", async () => {
+  const source = new FakeProgressSource();
+  const plugin = createSyncCenterPluginFixture(source, () => undefined);
+  const remotePage = deferred<Array<{ sha: string; message: string; authorName: string; authoredAt: string; parentShas: string[] }>>();
+  let pageCalls = 0;
+  let journalReads = 0;
+  const github = {
+    async listCommits() {
+      pageCalls++;
+      if (pageCalls === 1) return [];
+      return remotePage.promise;
+    },
+    async getFileBytes() { journalReads++; throw new Error("stale History read must not occur"); },
+    async getGitCommit() { throw new Error("unused"); },
+    async getTreeAt() { throw new Error("unused"); },
+    async getBlob() { throw new Error("unused"); },
+  };
+  const service = new V4HistoryService({ github, config: {
+    formatVersion: V4_FORMAT_VERSION, mode: "plaintext", repoId: "o/r#main",
+  } });
+  plugin.v4Runtime.createHistoryService = async () => service;
+  const view = new V4SyncCenterView(new WorkspaceLeaf(plugin.app), plugin as never);
+  try {
+    await view.onOpen();
+    view.contentEl.findByText("Current file")?.onclick?.();
+    await waitForCondition(() => pageCalls === 2, "Current file history is pending a remote page");
+    await view.onClose();
+    remotePage.resolve(Array.from({ length: 50 }, (_, i) => ({
+      sha: `commit-${i}`, message: `obsidian-sync-v4:journal-${i}`,
+      authorName: "A", authoredAt: "", parentShas: [],
+    })));
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.equal(journalReads, 0, "closed History view must not download old commit journals");
+    assert.equal(pageCalls, 2, "closed History view must not advance to further GitHub pages");
+  } finally {
+    remotePage.resolve([]);
+    await view.onClose();
+  }
+});
 
 test("D464 double-click Next waits for page two, not three", async () => {
   const source = new FakeProgressSource();

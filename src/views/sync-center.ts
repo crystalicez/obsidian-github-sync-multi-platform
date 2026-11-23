@@ -495,7 +495,7 @@ export class V4SyncCenterView extends ItemView {
       if (!fileId) { body.empty(); body.createEl("p", { text: "This file has not been synced by V4 yet." }); return }
       const service = await this.ensureService()
       if (!this.isCurrent(generation)) return
-      const versions = await service.getFileVersions(fileId)
+      const versions = await service.getFileVersions(fileId, 20, () => this.isCurrent(generation))
       if (!this.isCurrent(generation)) return
       body.empty()
       this.appendHistoryRefresh(body.createDiv({ cls: "github-sync-center__pager" }), generation, listGeneration)

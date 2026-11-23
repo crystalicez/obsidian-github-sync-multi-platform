@@ -304,6 +304,97 @@ test("v4 encrypted history follows one fileId across file and folder renames", a
   assert.equal((versions.at(-1)!.change.after ?? versions.at(-1)!.change.before)!.remotePath, initial.remotePath);
 });
 
+test("D465 canceled file history stops remote reads after a pending commit page returns", async () => {
+  let resolvePage!: (items: Array<{sha: string; message: string; authorName: string; authoredAt: string; parentShas: string[]}>) => void;
+  const pendingPage = new Promise<Array<{sha: string; message: string; authorName: string; authoredAt: string; parentShas: string[]}>>(resolve => { resolvePage = resolve; });
+  const pages: number[] = [];
+  let journalReads = 0;
+  let active = true;
+  const github = {
+    async listCommits({ page }: { page?: number } = {}) {
+      pages.push(page ?? 1);
+      return page === 1 ? pendingPage : [];
+    },
+    async getFileBytes() { journalReads++; throw Error("a canceled history scan cannot read a journal"); },
+    async getGitCommit() { throw Error("unused"); },
+    async getTreeAt() { throw Error("unused"); },
+    async getBlob() { throw Error("unused"); },
+  };
+  const service = new V4HistoryService({ github, config: {
+    formatVersion: V4_FORMAT_VERSION, mode: "plaintext", repoId: "o/r#main",
+  } });
+  const scan = service.getFileVersions("file-id", 20, () => active);
+  active = false;
+  resolvePage(Array.from({ length: 50 }, (_, i) => ({
+    sha: `commit-${i}`, message: `obsidian-sync-v4:journal-${i}`,
+    authorName: "A", authoredAt: "2026-11-01", parentShas: [],
+  })));
+  assert.deepEqual(await scan, [], "canceled history returns no partial old-version list");
+  assert.deepEqual(pages, [1], "a canceled response cannot trigger more paginated GitHub requests");
+  assert.equal(journalReads, 0, "old commit journals must not be read after a view is closed");
+});
+
+test("D465 canceling a file-version scan while reading journal stops later journal downloads", async () => {
+  let active = true;
+  const pages: number[] = [];
+  const journals: string[] = [];
+  const github = {
+    async listCommits({ page }: { page?: number } = {}) {
+      pages.push(page ?? 1);
+      return Array.from({ length: 50 }, (_, i) => ({
+        sha: `commit-${i}`, message: `obsidian-sync-v4:journal-${i}`,
+        authorName: "A", authoredAt: "2026-11-01", parentShas: [],
+      }));
+    },
+    async getFileBytes(path: string) {
+      journals.push(path);
+      active = false;
+      const journalId = /\/(journal-\d+)\//u.exec(path)?.[1];
+      return { bytes: enc(JSON.stringify({ journalId, page: 0, pageCount: 1, changes: [
+        { fileId: "file-id", path: "note.md", kind: "modify" },
+      ] })), sha: "journal-blob" };
+    },
+    async getGitCommit() { throw Error("unused"); },
+    async getTreeAt() { throw Error("unused"); },
+    async getBlob() { throw Error("unused"); },
+  };
+  const service = new V4HistoryService({ github, config: {
+    formatVersion: V4_FORMAT_VERSION, mode: "plaintext", repoId: "o/r#main",
+  } });
+  assert.deepEqual(await service.getFileVersions("file-id", 20, () => active), [],
+    "partially scanned historical notes are discarded after cancellation");
+  assert.deepEqual(pages, [1]);
+  assert.equal(journals.length, 1, "closing a view stops additional commit-journal downloads");
+});
+
+test("D465 canceled multi-page journal does not download later journal pages", async () => {
+  let active = true;
+  const journalPaths: string[] = [];
+  const github = {
+    async listCommits() {
+      return [{ sha: "commit-1", message: "obsidian-sync-v4:journal-1",
+        authorName: "A", authoredAt: "2026-11-23", parentShas: [] }];
+    },
+    async getFileBytes(path: string) {
+      journalPaths.push(path);
+      active = false;
+      return { bytes: enc(JSON.stringify({
+        journalId: "journal-1", page: 0, pageCount: 20,
+        changes: [{ fileId: "file-id", path: "note.md", kind: "modify" }],
+      })), sha: "journal-blob" };
+    },
+    async getGitCommit() { throw Error("unused"); },
+    async getTreeAt() { throw Error("unused"); },
+    async getBlob() { throw Error("unused"); },
+  };
+  const service = new V4HistoryService({ github, config: {
+    formatVersion: V4_FORMAT_VERSION, mode: "plaintext", repoId: "o/r#main",
+  } });
+  assert.deepEqual(await service.getFileVersions("file-id", 20, () => active), []);
+  assert.equal(journalPaths.length, 1,
+    "a canceled multi-page journal must not fetch more continuation pages from GitHub");
+});
+
 test("D458 historical Markdown preview never silently replaces invalid UTF-8 or removes a BOM", async () => {
   for (const [label, original] of [
     ["invalid", new Uint8Array([0x23, 0x20, 0xff, 0x0a])],

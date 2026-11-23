@@ -74,8 +74,9 @@ export class V4HistoryService {
     return { items, page, hasMore: items.length === 50 }
   }
 
-  async getCommitChanges(commit: V4HistoryCommit): Promise<V4HistoryChange[]> {
-    if (commit.source === "plugin" && commit.journalId) return this.readJournal(commit.journalId, commit.sha)
+  async getCommitChanges(commit: V4HistoryCommit, shouldContinue: () => boolean = () => true): Promise<V4HistoryChange[]> {
+    if (!shouldContinue()) return []
+    if (commit.source === "plugin" && commit.journalId) return this.readJournal(commit.journalId, commit.sha, shouldContinue)
     return this.diffExternalCommit(commit)
   }
 
@@ -181,27 +182,43 @@ export class V4HistoryService {
     return { kind: "binary", bytes }
   }
 
-  async getFileVersions(fileId: string, maxPages = 20): Promise<Array<{ commit: V4HistoryCommit; change: V4HistoryChange }>> {
+  async getFileVersions(
+    fileId: string,
+    maxPages = 20,
+    shouldContinue: () => boolean = () => true,
+  ): Promise<Array<{ commit: V4HistoryCommit; change: V4HistoryChange }>> {
     const versions: Array<{ commit: V4HistoryCommit; change: V4HistoryChange }> = []
     for (let page = 1; page <= maxPages; page++) {
+      if (!shouldContinue()) return []
       const commits = await this.listCommits(page)
+      if (!shouldContinue()) return []
       for (const commit of commits.items.filter(item => item.source === "plugin")) {
-        for (const change of await this.getCommitChanges(commit)) if (change.fileId === fileId) versions.push({ commit, change })
+        if (!shouldContinue()) return []
+        const changes = await this.getCommitChanges(commit, shouldContinue)
+        if (!shouldContinue()) return []
+        for (const change of changes) if (change.fileId === fileId) versions.push({ commit, change })
       }
       if (!commits.hasMore) break
     }
     return versions.reverse()
   }
 
-  private async readJournal(journalId: string, commitSha: string): Promise<V4HistoryChange[]> {
+  private async readJournal(
+    journalId: string,
+    commitSha: string,
+    shouldContinue: () => boolean,
+  ): Promise<V4HistoryChange[]> {
     if (!SAFE_JOURNAL_ID.test(journalId)) throw new Error("Invalid V4 history journal ID.")
+    if (!shouldContinue()) return []
     const first = await this.readJournalPage(journalId, 0, commitSha)
     const pages = [first]
     for (let page = 1; page < first.pageCount; page++) {
+      if (!shouldContinue()) return []
       const continuation = await this.readJournalPage(journalId, page, commitSha)
       if (continuation.pageCount !== first.pageCount) throw new Error("V4 history journal page count is inconsistent.")
       pages.push(continuation)
     }
+    if (!shouldContinue()) return []
     return pages.flatMap(page => page.changes.map(change => ({ ...change, source: "plugin" as const })))
   }
 
