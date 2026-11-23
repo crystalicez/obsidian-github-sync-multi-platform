@@ -28,6 +28,22 @@ test("unknown totals never render as zero totals", () => {
   assert.match(display.title, /Push: 0\/\? · remaining unknown/u);
 });
 
+test("D469 failed Sync status explains automatic pause and safe explicit recovery", () => {
+  const snapshot: V4SyncProgressSnapshot = {
+    ...createIdleV4Progress(),
+    lifecycle: "failed",
+    phase: "uploading",
+    errorMessage: "Remote write outcome unknown",
+  };
+  const failed = formatV4ActiveSyncStatus(snapshot);
+  assert.match(failed.text, /Paused/u, "failed Sync must not look like an ordinary idle state");
+  assert.match(failed.title, /Automatic Sync.*paused/u);
+  assert.match(failed.title, /Sync now/u);
+  assert.match(failed.title, /review.*GitHub|inspect.*GitHub/i);
+  const resumed = formatV4ActiveSyncStatus({ ...snapshot, lifecycle: "success", errorMessage: undefined });
+  assert.doesNotMatch(resumed.text + resumed.title, /paused/i, "a completed explicit reconciliation clears pause messaging");
+});
+
 test("failure tooltip keeps phase path counters and error", () => {
   const snapshot: V4SyncProgressSnapshot = {
     ...createIdleV4Progress(),

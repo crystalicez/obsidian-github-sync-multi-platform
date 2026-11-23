@@ -87,6 +87,27 @@ function createMainProgressFixture() {
   };
 }
 
+test("D469 status bar keeps failed automatic Sync visible as paused until explicit success", async () => {
+  const fixture = createMainProgressFixture();
+  await fixture.plugin.onload();
+  try {
+    fixture.runtime.publishProgressForTest({
+      ...uploadingFixture, lifecycle: "failed", errorMessage: "Remote state may have changed",
+    });
+    assert.match(fixture.statusSpan.text, /Paused/u);
+    assert.match(fixture.statusSpan.title, /Automatic Sync.*paused/u);
+    assert.match(fixture.statusSpan.title, /Sync now/u);
+    fixture.statusSpan.click();
+    assert.equal(fixture.manualSyncCalls, 1, "paused status bar remains an explicit manual recovery action");
+    fixture.runtime.publishProgressForTest({
+      ...createIdleV4Progress(), lifecycle: "success", lastSyncTime: Date.now(),
+    });
+    assert.doesNotMatch(fixture.statusSpan.text + fixture.statusSpan.title, /paused/iu);
+  } finally {
+    fixture.plugin.onunload();
+  }
+});
+
 test("status bar subscribes to detailed progress and cleans up once", async () => {
   const fixture = createMainProgressFixture();
   await fixture.plugin.onload();

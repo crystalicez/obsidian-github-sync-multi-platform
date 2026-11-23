@@ -1589,6 +1589,27 @@ test("elapsed ticks do not repaint diagnostics when no measured data is availabl
   await view.onClose();
 });
 
+test("D469 failed Sync Center shows automatic pause and safe manual recovery guidance", async () => {
+  const source = new FakeProgressSource();
+  const plugin = createSyncCenterPluginFixture(source, () => undefined);
+  const view = new V4SyncCenterView(new WorkspaceLeaf(plugin.app), plugin as never);
+  try {
+    await view.onOpen();
+    source.publish({
+      ...uploadingFixture, lifecycle: "failed",
+      errorMessage: "GitHub write result unknown",
+    });
+    const message = view.contentEl.flattenText();
+    assert.match(message, /Auto-Sync paused/u);
+    assert.match(message, /Sync now/u);
+    assert.match(message, /inspect.*GitHub|review.*GitHub/iu);
+    source.publish({ ...createIdleV4Progress(), lifecycle: "success", lastSyncTime: Date.now() });
+    assert.doesNotMatch(view.contentEl.flattenText(), /Auto-Sync paused/u);
+  } finally {
+    await view.onClose();
+  }
+});
+
 test("Sync Center shows failure context and does not duplicate subscriptions", async () => {
   const source = new FakeProgressSource();
   const plugin = createSyncCenterPluginFixture(source, () => undefined);

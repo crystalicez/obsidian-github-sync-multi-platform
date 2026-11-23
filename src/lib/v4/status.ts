@@ -5,6 +5,8 @@ import {
   type V4SyncProgressSnapshot,
 } from "./progress";
 
+export const V4_SYNC_PAUSED_GUIDANCE = "Automatic Sync is paused for this session. Review GitHub state, then run Sync now manually to reconcile. Do not Force Push just to retry.";
+
 export interface V4StatusDisplay {
   text: string;
   title: string;
@@ -44,8 +46,9 @@ export function formatV4ActiveSyncStatus(snapshot: V4SyncProgressSnapshot): V4St
       formatCounterTitle("Pull", snapshot.pull),
       formatCounterTitle("Push", snapshot.push),
       snapshot.errorMessage && `Error: ${snapshot.errorMessage}`,
+      V4_SYNC_PAUSED_GUIDANCE,
     ].filter((value): value is string => Boolean(value)).join("\n");
-    return { text: "❌ GH Sync: Failed", title };
+    return { text: "⏸ GH Sync: Paused", title };
   }
   if (snapshot.lifecycle === "success") return { text: "✅ GH Sync: Success", title: ["Success", ...detailLines].join("\n") };
   if (snapshot.lifecycle === "no-change") return { text: "GH Sync: No changes", title: ["No changes", ...detailLines].join("\n") };

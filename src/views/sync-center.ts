@@ -2,6 +2,7 @@ import { ItemView, Notice, WorkspaceLeaf, type EventRef } from "obsidian"
 import type FastSync from "../main"
 import { hasGitHubSyncConfig } from "../lib/sync-policy"
 import { createV4HistoricalMarkdownCopy } from "../lib/v4/history-recovery"
+import { V4_SYNC_PAUSED_GUIDANCE } from "../lib/v4/status"
 import { V4HistoryNotInitializedError, V4HistoryPreviewLimitError, type V4HistoryChange, type V4HistoryCommit, type V4HistoryService, type V4VersionPreview } from "../lib/v4/history-service"
 import {
   formatV4Duration,
@@ -294,6 +295,7 @@ export class V4SyncCenterView extends ItemView {
       if (snapshot.failurePhase) failure.createDiv({ text: `Failed phase: ${formatV4PhaseLabel(snapshot.failurePhase)}` })
       if (snapshot.failurePath) this.renderPath(failure, snapshot.failurePath, "Failed path")
       if (snapshot.errorMessage) failure.createDiv({ text: `Error: ${snapshot.errorMessage}`, cls: "github-sync-center__error" })
+      failure.createDiv({ text: V4_SYNC_PAUSED_GUIDANCE, cls: "github-sync-center__muted" })
     }
 
     if (snapshot.lifecycle !== "idle") {
@@ -333,7 +335,7 @@ export class V4SyncCenterView extends ItemView {
   }
 
   private progressHeading(snapshot: V4SyncProgressSnapshot): string {
-    if (snapshot.lifecycle === "failed") return "Failed"
+    if (snapshot.lifecycle === "failed") return "Failed · Auto-Sync paused"
     if (snapshot.lifecycle === "success") return "Success"
     if (snapshot.lifecycle === "no-change") return "No changes"
     if (snapshot.lifecycle === "idle") return "Idle"
