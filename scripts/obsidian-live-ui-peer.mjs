@@ -176,7 +176,7 @@ export async function restoreEncryptedToSecondObsidian({
   await mkdir(evidenceDir,{recursive:true});
   const evidencePath=path.join(evidenceDir,path.basename(runRoot)+"-peer-restored.png");
   await writeFile(evidencePath,bytes);
-  let peerMutated=false,peerConverged=false,peerFinalInventoryCount=0;
+  let peerMutated=false,peerConverged=false,peerOpenEditorGuardVerified=false,peerFinalInventoryCount=0;
   if(exercisePeerConflict){
    const result=await evaluate(`(async()=>{
     const p=app.plugins.plugins[${JSON.stringify(pluginId)}];
@@ -189,13 +189,36 @@ export async function restoreEncryptedToSecondObsidian({
    peerMutated=true;
    if(convergeAfterPeerEdit){
     const expected=await convergeAfterPeerEdit();
+    // The installed runtime deliberately defers writes to an open note.
+    // Prove the real protection and user recovery workflow, not a Force Pull.
+    const blocked=await evaluate(`(async()=>{
+     const p=app.plugins.plugins[${JSON.stringify(pluginId)}];
+     const file=app.vault.getAbstractFileByPath("UI-smoke.md");
+     const before=await app.vault.read(file);
+     const open=app.workspace.getLeavesOfType("markdown").some(l=>l.view?.file?.path===file.path);
+     const outcome=await p.v4Runtime.manualSync();
+     const s=p.v4Runtime.progressSnapshot;
+     const modal=[...document.querySelectorAll(".modal")].find(m=>m.innerText.includes("Open note needs review"));
+     return {status:outcome?.status,lifecycle:s.lifecycle,error:s.errorMessage,open,originalPreserved:(await app.vault.read(file))===before&&before.includes("Peer conflicting revision."),modalVisible:!!modal,paused:p.v4Runtime.coordinator.isAutomaticSyncPaused};
+    })()`,240000);
+    assert.ok(blocked.open&&blocked.status==="failed"&&blocked.lifecycle==="failed"&&blocked.originalPreserved&&blocked.paused&&blocked.modalVisible&&/open in an Obsidian editor/u.test(blocked.error??""),"Expected real open-editor guard with preserved bytes and recovery guidance: "+JSON.stringify(blocked));
+    const closed=await evaluate(`(async()=>{
+     const modal=[...document.querySelectorAll(".modal")].find(m=>m.innerText.includes("Open note needs review"));
+     const button=[...modal?.querySelectorAll("button")??[]].find(b=>b.textContent.trim()==="Keep files unchanged");
+     if(!button)return false;
+     button.click();
+     for(const leaf of app.workspace.getLeavesOfType("markdown"))if(leaf.view?.file?.path==="UI-smoke.md")leaf.detach();
+     return !app.workspace.getLeavesOfType("markdown").some(l=>l.view?.file?.path==="UI-smoke.md");
+    })()`);
+    assert.equal(closed,true,"Could not close only the saved synthetic editor");
     const caughtUp=await evaluate(`(async()=>{
      const p=app.plugins.plugins[${JSON.stringify(pluginId)}];
      const outcome=await p.v4Runtime.manualSync();
-     return {status:outcome?.status,lifecycle:p.v4Runtime.progressSnapshot.lifecycle};
+     const s=p.v4Runtime.progressSnapshot;
+     return {status:outcome?.status,lifecycle:s.lifecycle,error:s.errorMessage,paused:p.v4Runtime.coordinator.isAutomaticSyncPaused};
     })()`,240000);
-    assert.equal(caughtUp.status,"completed","Peer normal catch-up did not complete");
-    assert.equal(caughtUp.lifecycle,"success","Peer normal catch-up did not apply conflict result");
+    assert.ok(caughtUp.status==="completed"&&caughtUp.lifecycle==="success"&&!caughtUp.paused,"Peer normal recovery after closing editor failed: "+JSON.stringify(caughtUp));
+    peerOpenEditorGuardVerified=true;
     const actual=await evaluate(nativeVaultInventoryExpression,240000);
     assert.deepEqual(actual,expected,"Final native Vault path/size/SHA-256 inventories differ");
     const noop=await evaluate(`(async()=>{
@@ -208,7 +231,7 @@ export async function restoreEncryptedToSecondObsidian({
     peerFinalInventoryCount=actual.length;
    }
   }
-  return {peerConverged,peerFinalInventoryCount,peerRestored:true,peerVaultPathMatches:true,filenameMatched:true,bytesRestored:Buffer.byteLength(restored.content,"utf8"),peerScreenshot:evidencePath,verifiedJourneyFiles:verifiedFiles.length,peerMutated,peerDiagnostics:restored.diagnostics,peerPullWallMs:restored.peerPullWallMs};
+  return {peerConverged,peerOpenEditorGuardVerified,peerFinalInventoryCount,peerRestored:true,peerVaultPathMatches:true,filenameMatched:true,bytesRestored:Buffer.byteLength(restored.content,"utf8"),peerScreenshot:evidencePath,verifiedJourneyFiles:verifiedFiles.length,peerMutated,peerDiagnostics:restored.diagnostics,peerPullWallMs:restored.peerPullWallMs};
  }finally{
   if(ws){try{ws.close()}catch{}}
   if(child?.pid){

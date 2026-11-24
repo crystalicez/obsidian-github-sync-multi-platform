@@ -432,9 +432,9 @@ try{
    }
    const afterPull=await readState(configuration);
    if(autoJourney){
-    assertTrue(restored.peerMutated&&restored.peerConverged&&restored.peerFinalInventoryCount>=5,"Final installed peer convergence not proven");
+    assertTrue(restored.peerMutated&&restored.peerConverged&&restored.peerOpenEditorGuardVerified&&restored.peerFinalInventoryCount>=5,"Final installed peer convergence not proven");
     assertTrue(afterPull.kind==="present"&&afterPull.sha===finalSha,"Peer catch-up or no-op advanced GitHub HEAD");
-    peerConvergenceEvidence={exactPathSizeSha256:true,files:restored.peerFinalInventoryCount,peerNoOp:true,headUnchanged:true};
+    peerConvergenceEvidence={openEditorGuardVerified:true,recoveredAfterClose:true,exactPathSizeSha256:true,files:restored.peerFinalInventoryCount,peerNoOp:true,headUnchanged:true};
     journeySteps.push("both actual native Vaults converged by path, byte length and SHA-256 after conflict");
    }else if(journey){
     assertTrue(restored.peerMutated&&afterPull.kind==="present"&&afterPull.sha!==finalSha,
