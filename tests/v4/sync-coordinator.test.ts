@@ -19,6 +19,49 @@ class FakeTimers {
   }
 }
 
+test("D490 a new edit supersedes a due follow-up while Sync is active", async () => {
+  for (const latestDue of [false, true]) {
+    const timers = new FakeTimers()
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const executions: V4QueuedChange[][] = []
+    const coordinator = new V4SyncCoordinator({
+      schedule: timers.schedule, cancel: timers.cancel,
+      execute: async (_request, changes) => {
+        executions.push(changes)
+        if (executions.length === 1) await gate
+        return { changedFiles: changes.length }
+      },
+    })
+    try {
+      const active = coordinator.run({ operation: "normal", trigger: "manual" })
+      coordinator.enqueue({ type: "modify", path: "first.md", mtime: 1 })
+      timers.fireLatest()
+      assert.equal(executions.length, 1)
+      coordinator.enqueue({ type: "modify", path: "newer.md", mtime: 2 })
+      assert.equal(timers.timers.size, 1)
+      if (latestDue) timers.fireLatest()
+      release()
+      await active
+      if (!latestDue) {
+        assert.equal(executions.length, 1, "new edit must get the full latest debounce")
+        assert.equal(coordinator.pendingCount, 2)
+        assert.equal(timers.timers.size, 1)
+        assert.equal((await coordinator.run({ operation: "normal", trigger: "scheduled" })).status, "skipped")
+        timers.fireLatest()
+      }
+      await coordinator.whenIdle()
+      assert.deepEqual(executions, [[], [
+        { type: "modify", path: "first.md", mtime: 1 },
+        { type: "modify", path: "newer.md", mtime: 2 },
+      ]])
+      assert.equal(coordinator.pendingCount, 0)
+      assert.equal(timers.timers.size, 0)
+      assert.equal((await coordinator.run({ operation: "normal", trigger: "scheduled" })).status, "completed")
+    } finally { release(); coordinator.dispose() }
+  }
+})
+
 test("D489 a due debounce during ordinary failure recovery is rearmed only after successful reconciliation", async () => {
   for (const outcome of ["success", "failure", "newer-save", "disposed"] as const) {
     const timers = new FakeTimers()

@@ -236,6 +236,8 @@ export class V4SyncCoordinator {
   }
 
   private scheduleLocalDebounce(): void {
+    // A newer edit supersedes any due follow-up from an older debounce.
+    this.flushAfterActive = false;
     if (this.timer !== undefined) this.cancel(this.timer);
     const generation = ++this.debounceGeneration;
     this.timer = this.schedule(() => {
