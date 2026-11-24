@@ -182,10 +182,11 @@ export async function restoreEncryptedToSecondObsidian({
     const p=app.plugins.plugins[${JSON.stringify(pluginId)}];
     const file=app.vault.getAbstractFileByPath("UI-smoke.md");
     await app.vault.modify(file,"# Synthetic remote UI E2E\\n\\nPeer conflicting revision.\\n");
-    await p.v4Runtime.manualSync();
-    return {lifecycle:p.v4Runtime.progressSnapshot.lifecycle};
+    const outcome=await p.v4Runtime.manualSync();
+    const s=p.v4Runtime.progressSnapshot;
+    return {status:outcome?.status,lifecycle:s.lifecycle,trigger:s.trigger,changedFiles:outcome?.changedFiles,failurePhase:s.failurePhase,apiRequests:s.diagnostics?.apiRequests,apiFailures:s.diagnostics?.apiFailures,error:s.errorMessage?.slice(0,240)};
    })()`,240000);
-   assert.equal(result.lifecycle,"success","Second real Obsidian peer edit must publish");
+   assert.ok(result.status==="completed"&&result.lifecycle==="success"&&result.trigger==="manual"&&result.changedFiles>0,"Second real Obsidian peer edit must publish: "+JSON.stringify(result));
    peerMutated=true;
    if(convergeAfterPeerEdit){
     const expected=await convergeAfterPeerEdit();
