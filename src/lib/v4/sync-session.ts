@@ -50,7 +50,7 @@ import {
 } from "./resource-controller"
 import type { V4QueuedChange } from "./sync-coordinator"
 import { applyV4RecoveryLocalMutations, assertUniqueV4RecoveryStageOwners, V4RecoveryRequiredError, type V4RecoveryStore } from "./recovery-store"
-import type { V4RecoveryLocalMutation, V4RecoveryPayload } from "./recovery-types"
+import type { V4RecoveryLocalMutation, V4RecoveryPayload, V4RecoverySnapshot } from "./recovery-types"
 import type { V4DirectionalProgress, V4SyncProgressPatch } from "./progress"
 import { deferV4Cancellation, throwIfV4Aborted } from "./cancellation"
 
@@ -80,6 +80,7 @@ export interface V4SyncSessionInput {
   onHashingMeasured?: (milliseconds: number) => void
   runState?: V4SyncRunState | undefined
   recoveryStore?: V4RecoveryStore | undefined
+  recoveredLocalState?: V4RecoverySnapshot | undefined
   resourceLimits?: Partial<V4ResourceLimits>
   signal?: AbortSignal | undefined
 }
@@ -615,7 +616,43 @@ export class V4SyncSession {
       .filter(copy => copy.includeInSync)
       .map(copy => [copy.path, copy.fileId] as const))
     const identitySeedByPath = new Map([...causalState?.identityByPath ?? [], ...runCopyIdentityByPath])
-    const localFiles = (await this.scanLocalStable(identityBaseRecords, options.changes ?? [], identitySeedByPath, runCopyIdentityByPath)).filter(file => includePath(file.path))
+    // A resumed pull can have created a remote file before the old index was
+    // replaced. Reuse its identity only from a completed WAL receipt for
+    // this exact verified remote commit, with independently matching bytes.
+    // Never coalesce unrelated same-name files or an explicit delete/rename.
+    const recovery = this.input.recoveredLocalState
+    const recoveredPulls = new Map<string, V4IndexFileRecord>()
+    const changes = options.changes ?? []
+    if (options.operation === "normal" && remote && !isLayoutMigration && hasKnownBase
+      && recovery?.header.phase === "replan-required"
+      && recovery.header.verifiedRemoteHead === remote.commitSha
+      && changes.every(change => change.type === "modify" || change.type === "rescan")) {
+      const completed = new Set(recovery.payload?.completedMutationIds ?? [])
+      const remoteByPath = new Map(remoteRecords.filter(record => !record.deleted).map(record => [record.path, record]))
+      const basePaths = new Set(identityBaseRecords.map(record => record.path.normalize("NFC").toLowerCase()))
+      const baseIds = new Set(identityBaseRecords.map(record => record.fileId))
+      for (const mutation of recovery.payload?.mutations ?? []) {
+        if (mutation.kind !== "stage-write" || mutation.precondition.exists || !completed.has(mutation.id)) continue
+        const record = remoteByPath.get(mutation.path)
+        if (!record || mutation.id !== `pull:${record.fileId}:write`
+          || basePaths.has(record.path.normalize("NFC").toLowerCase()) || baseIds.has(record.fileId)
+          || mutation.stage.hash !== record.plaintextSha256 || mutation.stage.size !== record.size) continue
+        recoveredPulls.set(record.path, record)
+      }
+    }
+    const scanChanges: V4QueuedChange[] = recoveredPulls.size > 0
+      ? [...changes, { type: "rescan", mtime: this.now() }]
+      : changes
+    const localFiles = (await this.scanLocalStable(identityBaseRecords, scanChanges, identitySeedByPath, runCopyIdentityByPath)).filter(file => includePath(file.path))
+    const localIds = new Set(localFiles.map(file => file.fileId))
+    for (const file of localFiles) {
+      const record = recoveredPulls.get(file.path)
+      if (!record || file.hash !== record.plaintextSha256 || file.size !== record.size
+        || localIds.has(record.fileId)) continue
+      localIds.delete(file.fileId)
+      file.fileId = record.fileId
+      localIds.add(file.fileId)
+    }
     const syntheticConflictCopyIds = new Set<string>()
     for (const copy of this.input.runState?.conflictCopyStages?.values() ?? []) {
       if (!copy.includeInSync || localFiles.some(file => file.fileId === copy.fileId || file.path === copy.path)) continue

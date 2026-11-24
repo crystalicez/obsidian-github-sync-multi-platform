@@ -2435,6 +2435,7 @@ export class V4PluginRuntime {
             includePath,
             runState,
             recoveryStore,
+            recoveredLocalState: reconciledRecovery ?? undefined,
             signal,
             onEncryptionMeasured: milliseconds => {
               if (!Number.isFinite(milliseconds) || milliseconds < 0) return

@@ -217,7 +217,7 @@ export async function restoreEncryptedToSecondObsidian({
      const s=p.v4Runtime.progressSnapshot;
      return {status:outcome?.status,lifecycle:s.lifecycle,error:s.errorMessage,paused:p.v4Runtime.coordinator.isAutomaticSyncPaused};
     })()`,240000);
-    assert.ok(caughtUp.status==="completed"&&caughtUp.lifecycle==="success"&&!caughtUp.paused,"Peer normal recovery after closing editor failed: "+JSON.stringify(caughtUp));
+    assert.ok(caughtUp.status==="completed"&&["success","no-change"].includes(caughtUp.lifecycle)&&!caughtUp.paused,"Peer normal recovery after closing editor failed: "+JSON.stringify(caughtUp));
     peerOpenEditorGuardVerified=true;
     const actual=await evaluate(nativeVaultInventoryExpression,240000);
     assert.deepEqual(actual,expected,"Final native Vault path/size/SHA-256 inventories differ");

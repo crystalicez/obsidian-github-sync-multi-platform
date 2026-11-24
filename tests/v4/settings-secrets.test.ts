@@ -2277,6 +2277,67 @@ test("D427 a durable Settings Save refreshes open Sync Center history only after
   }
 });
 
+test("D494 peer recovery binds only the exact recovered conflict copy identity after an open-editor block", async () => {
+  for (const edited of [false, true]) {
+    const github = new RuntimeMemoryGitHub()
+    const source = plaintextRuntimeFixture("UI-smoke.md", github, "source")
+    const peer = plaintextRuntimeFixture([], github, "peer")
+    let open = false
+    Object.assign(peer.plugin.app, { workspace: { iterateAllLeaves(callback: (leaf: unknown) => void) {
+      if (open) callback({ view: { file: { path: "UI-smoke.md" } } })
+    } } })
+    const modify = (f: typeof source, value: string, mtime: number) => {
+      const file = f.vaultFiles.find(candidate => candidate.path === "UI-smoke.md")
+      assert.ok(file)
+      const bytes = new TextEncoder().encode(value)
+      f.contents.set(file.path, bytes)
+      file.stat = { size: bytes.byteLength, mtime }
+    }
+    try {
+      await source.runtime.forcePush()
+      await peer.runtime.forcePull()
+      modify(peer, "peer conflicting revision", 2)
+      assert.equal((await peer.runtime.manualSync() as { status: string }).status, "completed")
+      modify(source, "source conflicting revision", 3)
+      assert.equal((await source.runtime.manualSync() as { status: string }).status, "completed")
+      const head = github.ref?.sha
+      const expected = [...source.contents].sort(([a], [b]) => a.localeCompare(b))
+      assert.equal(expected.length, 2)
+      open = true
+      assert.equal((await peer.runtime.manualSync() as { status: string }).status, "failed")
+      assert.match(peer.runtime.progressSnapshot.errorMessage ?? "", /open in an Obsidian editor/u)
+      assert.equal(new TextDecoder().decode(peer.contents.get("UI-smoke.md")), "peer conflicting revision")
+      assert.equal(github.ref?.sha, head)
+      const copyPath = expected.find(([path]) => path !== "UI-smoke.md")![0]
+      assert.ok(peer.contents.has(copyPath), "first attempt must have completed the conflict-copy pull")
+      const editedBytes = new TextEncoder().encode("user changed the recovered copy")
+      if (edited) {
+        peer.contents.set(copyPath, editedBytes)
+        const copyFile = peer.vaultFiles.find(file => file.path === copyPath)!
+        copyFile.stat = { size: editedBytes.byteLength, mtime: 4 }
+      }
+      open = false
+      const result = await peer.runtime.manualSync() as { status: string }
+      if (edited) {
+        assert.equal(result.status, "failed")
+        assert.match(peer.runtime.progressSnapshot.errorMessage ?? "", /path collision/u)
+        assert.deepEqual(peer.contents.get(copyPath), editedBytes)
+        assert.equal(github.ref?.sha, head)
+        continue
+      }
+      assert.equal(result.status, "completed", peer.runtime.progressSnapshot.errorMessage)
+      assert.deepEqual([...peer.contents].sort(([a], [b]) => a.localeCompare(b)), expected)
+      assert.equal(github.ref?.sha, head)
+      await peer.runtime.manualSync()
+      assert.equal(peer.runtime.progressSnapshot.lifecycle, "no-change")
+      assert.equal(github.ref?.sha, head)
+    } finally {
+      source.runtime.dispose()
+      peer.runtime.dispose()
+    }
+  }
+})
+
 test("D491 two Runtime devices converge after failed upload and a queued edit during recovery", async () => {
   const github = new RuntimeMemoryGitHub()
   const writer = plaintextRuntimeFixture(["first.md", "second.md"], github, "writer")
