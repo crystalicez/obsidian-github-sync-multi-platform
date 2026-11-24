@@ -2277,6 +2277,43 @@ test("D427 a durable Settings Save refreshes open Sync Center history only after
   }
 });
 
+test("D487 queued edits report the final Settings Save outcome and recover after Manual Sync", async () => {
+  for (const committed of [false, true]) {
+    const f = plaintextRuntimeFixture()
+    try {
+      await f.runtime.forcePush()
+      const coordinator = (f.runtime as unknown as { coordinator: V4SyncCoordinator }).coordinator
+      f.runtime.enqueueModify("secret.md", 2)
+      assert.equal(f.runtime.progressSnapshot.lifecycle, "waiting")
+      f.runtime.settingsSaveStarted()
+      assert.match(f.runtime.progressSnapshot.errorMessage ?? "", /during Settings Save/u)
+      f.runtime.settingsSaveFinished(committed)
+      assert.equal(coordinator.isAutomaticSyncPaused, true)
+      assert.equal(coordinator.pendingCount, 1)
+      assert.equal(f.runtime.progressSnapshot.lifecycle, "failed")
+      assert.match(f.runtime.progressSnapshot.errorMessage ?? "", committed
+        ? /after Settings Save/u : /Settings save did not complete/u)
+      // Repairing Settings (or another failed Save) before Manual Sync must
+      // replace the previous Settings warning with the latest outcome.
+      f.runtime.settingsSaveStarted()
+      f.runtime.settingsSaveFinished(!committed)
+      assert.equal(coordinator.isAutomaticSyncPaused, true)
+      assert.equal(coordinator.pendingCount, 1)
+      assert.match(f.runtime.progressSnapshot.errorMessage ?? "", committed
+        ? /Settings save did not complete/u : /after Settings Save/u)
+      assert.equal((await f.runtime.scheduledSync() as { status: string }).status, "skipped")
+      assert.equal((await f.runtime.manualSync() as { status: string }).status, "completed")
+      assert.equal(coordinator.isAutomaticSyncPaused, false)
+      assert.equal(coordinator.pendingCount, 0)
+      assert.notEqual(f.runtime.progressSnapshot.lifecycle, "failed")
+      f.runtime.enqueueModify("secret.md", 3)
+      assert.equal(f.runtime.progressSnapshot.lifecycle, "waiting")
+    } finally {
+      f.runtime.dispose()
+    }
+  }
+})
+
 test("D486 failed Settings Save without pending local changes publishes Auto-Sync paused status", async () => {
   const f = plaintextRuntimeFixture()
   try {

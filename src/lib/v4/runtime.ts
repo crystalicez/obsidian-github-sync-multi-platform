@@ -227,6 +227,12 @@ export class V4OpenEditorConflictError extends Error {
   }
 }
 
+const SETTINGS_SAVE_PAUSE_MESSAGES = {
+  pending: "Automatic Sync paused during Settings Save. Review and run Sync now manually to reconcile queued local changes.",
+  committed: "Automatic Sync paused after Settings Save. Review the saved repository and run Sync now manually before automatic syncing resumes.",
+  failed: "Settings save did not complete. Automatic Sync is paused; review Settings and run Sync now manually after resolving the error.",
+} as const
+
 export class V4PluginRuntime {
   private readonly coordinator: V4SyncCoordinator
   private readonly adapter: V4LocalIndexAdapter
@@ -300,7 +306,7 @@ export class V4PluginRuntime {
       this.debounceRunActive = false
       this.progressStore.finish("failed", {
         phase: "blocked",
-        errorMessage: "Automatic Sync paused during Settings Save. Review and run Sync now manually to reconcile queued local changes.",
+        errorMessage: SETTINGS_SAVE_PAUSE_MESSAGES.pending,
       })
     }
   }
@@ -315,14 +321,16 @@ export class V4PluginRuntime {
       // that completes *after* this Save cannot replace the pause with an
       // apparently healthy success. Preserve real Sync failure details.
       const reportPause = () => {
-        if (this.disposed || this.coordinator.isSyncing || !this.coordinator.isAutomaticSyncPaused
-          || this.progressStore.snapshot.lifecycle === "failed") return
+        if (this.disposed || this.coordinator.isSyncing || !this.coordinator.isAutomaticSyncPaused) return
+        const snapshot = this.progressStore.snapshot
+        // Settings pause messages are not genuine Sync failures. Reflect the
+        // latest Save outcome while preserving actual Sync error evidence.
+        if (snapshot.lifecycle === "failed"
+          && !Object.values(SETTINGS_SAVE_PAUSE_MESSAGES).some(message => message === snapshot.errorMessage)) return
         this.debounceRunActive = false
         this.progressStore.finish("failed", {
           phase: "blocked",
-          errorMessage: committed
-            ? "Automatic Sync paused after Settings Save. Review the saved repository and run Sync now manually before automatic syncing resumes."
-            : "Settings save did not complete. Automatic Sync is paused; review Settings and run Sync now manually after resolving the error.",
+          errorMessage: committed ? SETTINGS_SAVE_PAUSE_MESSAGES.committed : SETTINGS_SAVE_PAUSE_MESSAGES.failed,
         })
       }
       if (this.coordinator.isSyncing) {
