@@ -2277,6 +2277,101 @@ test("D427 a durable Settings Save refreshes open Sync Center history only after
   }
 });
 
+test("D491 two Runtime devices converge after failed upload and a queued edit during recovery", async () => {
+  const github = new RuntimeMemoryGitHub()
+  const writer = plaintextRuntimeFixture(["first.md", "second.md"], github, "writer")
+  const reader = plaintextRuntimeFixture([], github, "reader")
+  const coordinator = (writer.runtime as unknown as { coordinator: V4SyncCoordinator }).coordinator
+  const timers = new Map<number, () => void>()
+  let timerId = 0
+  Object.assign(coordinator, {
+    schedule(callback: () => void) { const id = ++timerId; timers.set(id, callback); return id },
+    cancel(id: number) { timers.delete(id) },
+  })
+  const fire = () => {
+    const latest = [...timers.entries()].at(-1)
+    assert.ok(latest)
+    timers.delete(latest[0])
+    latest[1]()
+  }
+  const modify = (path: string, content: string, mtime: number) => {
+    const file = writer.vaultFiles.find(candidate => candidate.path === path)
+    assert.ok(file)
+    const bytes = new TextEncoder().encode(content)
+    writer.contents.set(path, bytes)
+    file.stat = { size: bytes.byteLength, mtime }
+    writer.runtime.enqueueModify(path, mtime)
+  }
+  const textAt = (files: Map<string, Uint8Array>, path: string) => {
+    const bytes = files.get(path)
+    assert.ok(bytes, "missing " + path)
+    return new TextDecoder().decode(bytes)
+  }
+  const entered = deferred<void>()
+  const release = deferred<void>()
+  try {
+    assert.equal((await writer.runtime.forcePush() as { status: string }).status, "completed")
+    assert.equal((await reader.runtime.forcePull() as { status: string }).status, "completed")
+    const initialHead = github.ref?.sha
+    modify("first.md", "first recovered edit", 2)
+    github.blobFailuresRemaining = 1
+    fire()
+    await coordinator.whenIdle()
+    assert.equal(writer.runtime.progressSnapshot.lifecycle, "failed")
+    assert.equal(coordinator.isAutomaticSyncPaused, true)
+    assert.equal(coordinator.pendingCount, 1)
+    assert.equal(github.ref?.sha, initialHead, "failed upload must not advance HEAD")
+    assert.equal(textAt(github.files, "first.md"), "body")
+    assert.equal((await writer.runtime.scheduledSync() as { status: string }).status, "skipped")
+
+    const update = github.updateGitRef.bind(github)
+    github.updateGitRef = async (sha, expected) => {
+      entered.resolve()
+      await release.promise
+      await update(sha, expected)
+    }
+    const recovering = writer.runtime.manualSync()
+    await Promise.race([entered.promise, recovering.then(() => {
+      throw new Error("recovery completed before publication barrier")
+    })])
+    modify("second.md", "second edit during recovery", 3)
+    fire()
+    assert.equal(coordinator.pendingCount, 1)
+    assert.equal(coordinator.isAutomaticSyncPaused, true)
+    assert.equal(github.ref?.sha, initialHead)
+    release.resolve()
+    assert.equal((await recovering as { status: string }).status, "completed", writer.runtime.progressSnapshot.errorMessage)
+    github.updateGitRef = update
+    assert.equal(coordinator.isAutomaticSyncPaused, false)
+    assert.equal(coordinator.pendingCount, 1)
+    assert.equal(writer.runtime.progressSnapshot.lifecycle, "waiting")
+    assert.equal(timers.size, 1, "expired timer must be rearmed without another local edit")
+    assert.equal(textAt(github.files, "first.md"), "first recovered edit")
+    assert.equal(textAt(github.files, "second.md"), "body")
+    fire()
+    await coordinator.whenIdle()
+    assert.equal(writer.runtime.progressSnapshot.lifecycle, "success", writer.runtime.progressSnapshot.errorMessage)
+    assert.equal(coordinator.pendingCount, 0)
+    assert.equal(timers.size, 0)
+    assert.equal((await reader.runtime.manualSync() as { status: string }).status, "completed")
+    for (const [path, expected] of [["first.md", "first recovered edit"], ["second.md", "second edit during recovery"]] as const) {
+      assert.equal(textAt(writer.contents, path), expected)
+      assert.equal(textAt(github.files, path), expected)
+      assert.equal(textAt(reader.contents, path), expected)
+    }
+    const convergedHead = github.ref?.sha
+    for (const device of [writer, reader]) {
+      assert.equal((await device.runtime.manualSync() as { status: string }).status, "completed")
+      assert.equal(device.runtime.progressSnapshot.lifecycle, "no-change", device.runtime.progressSnapshot.errorMessage)
+    }
+    assert.equal(github.ref?.sha, convergedHead, "converged devices must not create redundant commits")
+  } finally {
+    release.resolve()
+    writer.runtime.dispose()
+    reader.runtime.dispose()
+  }
+})
+
 test("D487 queued edits report the final Settings Save outcome and recover after Manual Sync", async () => {
   for (const committed of [false, true]) {
     const f = plaintextRuntimeFixture()
