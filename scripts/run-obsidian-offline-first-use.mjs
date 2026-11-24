@@ -14,7 +14,10 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..")
 const pluginId = "encrypted-github-sync-multi-platform"
 const exe = "C:\\Program Files\\Obsidian\\Obsidian.exe"
 const testRoot = path.join(root, ".tmp", "obsidian-offline-first-use")
-const port = 30000 + (process.pid % 24000)
+const firstPort = 30000 + (process.pid % 24000)
+let port = firstPort
+let launchCount = 0
+let cdpLaunchRetries = 0
 const args = process.argv.slice(2)
 assert.ok(args.length === 1 && ["--preflight-only", "--run"].includes(args[0]),
   "Usage: node scripts/run-obsidian-offline-first-use.mjs --preflight-only|--run")
@@ -45,6 +48,9 @@ async function preflight() {
   const executable = await stat(exe).catch(() => null)
   assert.ok(executable?.isFile(),
     "Installed Obsidian.exe not found. Native acceptance remains unqualified")
+  await requireUnusedCdpPort()
+}
+async function requireUnusedCdpPort() {
   assert.ok(Number.isSafeInteger(port) && port > 1024 && port < 65535)
   try {
     const response = await fetch("http://127.0.0.1:" + port + "/json/list", {
@@ -94,6 +100,8 @@ async function waitFor(expression, description, attempts = 80) {
   throw Error("Isolated renderer readiness failed: " + description)
 }
 async function connectVerifiedVault(vault) {
+  const launchStage = stage
+  stage = launchStage + ":cdp-target"
   let target
   for (let n = 0; n < 155; n++) {
     try {
@@ -108,6 +116,7 @@ async function connectVerifiedVault(vault) {
     await sleep(350)
   }
   assert.ok(target, "Isolated native Obsidian window did not start")
+  stage = launchStage + ":cdp-handshake"
   socket = new WebSocket(target.webSocketDebuggerUrl)
   await new Promise((resolve, reject) => {
     socket.addEventListener("open", resolve, { once: true })
@@ -125,33 +134,56 @@ async function connectVerifiedVault(vault) {
   })
   await send("Runtime.enable")
   // Verify native Obsidian's ACTUAL adapter path before evaluating plugin code.
+  stage = launchStage + ":vault-identity"
   const identity = await waitFor(
     "(()=>typeof app==='undefined'?null:app.vault?.adapter?.getBasePath?.())()",
     "Vault identity",
   )
   assert.equal(identity.toLowerCase(), vault.toLowerCase(),
     "Refusing plugin actions in a non-disposable Vault")
+  stage = launchStage + ":plugin-manager"
   await waitFor(
     "(()=>{const p=app.plugins;return !!p&&typeof p.isEnabled==='function'"
       + "&&typeof p.setEnable==='function'&&typeof p.enablePluginAndSave==='function'"
       + "&&typeof p.loadPlugin==='function'&&typeof p.enabledPlugins?.has==='function'})()",
     "Obsidian plugin manager",
   )
+  stage = launchStage + ":plugin-load"
   const loaded = await evaluate(buildNativePluginReadyExpression(pluginId), 35000)
   assert.equal(loaded, true, "Production plugin failed native startup")
+  stage = launchStage + ":plugin-onload"
   await waitFor("(()=>{const p=app.plugins.plugins[" + JSON.stringify(pluginId)
     + "];return !!p?.settings&&!!p?.v4Runtime&&!!p?.settingTab&&!!p?.ribbonIcon})()",
   "Plugin onload and Settings UI")
+  stage = launchStage
 }
 async function launch(profile, vault) {
   // Never open the user's default profile or any externally supplied Vault.
-  child = spawn(exe, ["--user-data-dir=" + profile, "--remote-debugging-port=" + port], {
-    detached: true, windowsHide: true, stdio: "ignore",
-    env: sanitizeOfflineFastChildEnvironment(process.env),
-  })
-  child.on("error", () => {})
-  child.unref()
-  await connectVerifiedVault(vault)
+  const launchStage = stage
+  for (let attempt = 0; attempt < 2; attempt++) {
+    // An owned process restart must not reuse a previous renderer endpoint.
+    port = firstPort + launchCount++
+    stage = launchStage + ":cdp-port"
+    await requireUnusedCdpPort()
+    stage = launchStage
+    child = spawn(exe, ["--user-data-dir=" + profile, "--remote-debugging-port=" + port], {
+      detached: true, windowsHide: true, stdio: "ignore",
+      env: sanitizeOfflineFastChildEnvironment(process.env),
+    })
+    child.on("error", () => {})
+    child.unref()
+    try {
+      await connectVerifiedVault(vault)
+      return
+    } catch (error) {
+      // Retry only a missing target, before any renderer evaluation. Never
+      // retry identity, handshake, plugin-load or actual assertion failures.
+      if (attempt !== 0 || stage !== launchStage + ":cdp-target") throw error
+      stopOwnedProcess()
+      cdpLaunchRetries++
+      await sleep(1200)
+    }
+  }
 }
 function stopOwnedProcess() {
   try { socket?.close() } catch {}
@@ -936,6 +968,7 @@ try {
     console.log(JSON.stringify({ nativeOfflineFirstUse: "PASS", installed: true,
       settingsSaved: true, deviceIdPersistedAcrossRestart: true,
       nativeIndependentInstallations: 2, nativeLegacyRepairInstallation: 1,
+      cdpLaunchRetries,
       nativeLegacyRoutingRepair: true, distinctGeneratedDeviceIds: true,
       syncCenterReady: true, nativeSettingsUiSave: true,
       nativeInvalidBranchRejectedBeforeSave: true,
@@ -953,7 +986,7 @@ try {
 } catch (error) {
   // Do not claim qualification on missing Windows Obsidian, CDP failure or startup fault.
   console.error(JSON.stringify({ nativeOfflineFirstUse: "BLOCKED_OR_FAIL",
-    stage, reason: safeFailure(error), installedAcceptance: false, remoteGitHubUsed: false }))
+    stage, reason: safeFailure(error), cdpLaunchRetries, installedAcceptance: false, remoteGitHubUsed: false }))
   process.exitCode = 1
 } finally {
   try {
