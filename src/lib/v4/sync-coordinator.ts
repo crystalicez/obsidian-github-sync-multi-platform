@@ -232,6 +232,10 @@ export class V4SyncCoordinator {
     // Preserve the historical failure-debounce contract. Only Settings
     // changes retire the old-target timer entirely until Manual Sync.
     if (this.automaticSyncPaused && this.settingsChangeRequiresManual) return;
+    this.scheduleLocalDebounce();
+  }
+
+  private scheduleLocalDebounce(): void {
     if (this.timer !== undefined) this.cancel(this.timer);
     const generation = ++this.debounceGeneration;
     this.timer = this.schedule(() => {
@@ -366,10 +370,15 @@ export class V4SyncCoordinator {
           }
           // A run begun before a Settings Save must never rearm automatic
           // changes, even if it finishes after an ambiguous failed Save.
-          if (!this.settingsSavePending && startingSettingsSaveGeneration === this.settingsSaveGeneration
+          if (!this.disposed && !this.settingsSavePending && startingSettingsSaveGeneration === this.settingsSaveGeneration
             && (request.trigger === "manual" || request.trigger === "forcePush" || request.trigger === "forcePull")) {
+            const needsFreshDebounce = this.settingsChangeRequiresManual && this.pending.length > 0;
             this.automaticSyncPaused = false;
             this.settingsChangeRequiresManual = false;
+            // Edits arriving during explicit post-Settings reconciliation had
+            // no timer. Once this fresh run succeeds, debounce those edits even
+            // if the user never changes another file.
+            if (needsFreshDebounce) this.scheduleLocalDebounce();
           }
           resolveExecution({ status: "completed", changedFiles: result.changedFiles });
         },

@@ -19,6 +19,56 @@ class FakeTimers {
   }
 }
 
+test("D488 edits during post-Settings Manual Sync are debounced after recovery succeeds, never after failure or a newer Save", async () => {
+  for (const outcome of ["success", "failure", "newer-save", "disposed"] as const) {
+    const timers = new FakeTimers()
+    const executions: Array<{ trigger: string; changes: V4QueuedChange[] }> = []
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const coordinator = new V4SyncCoordinator({
+      schedule: timers.schedule, cancel: timers.cancel,
+      execute: async (request, changes) => {
+        executions.push({ trigger: request.trigger, changes })
+        if (executions.length === 1) {
+          await gate
+          if (outcome === "failure") return { changedFiles: 0, failed: true }
+        }
+        return { changedFiles: changes.length }
+      },
+    })
+    try {
+      coordinator.enqueue({ type: "modify", path: "before-save.md", mtime: 1 })
+      coordinator.pauseAutomaticForSettingsSave()
+      coordinator.finishSettingsSave(false)
+      const recovery = coordinator.run({ operation: "normal", trigger: "manual" })
+      coordinator.enqueue({ type: "modify", path: "during-recovery.md", mtime: 2 })
+      assert.equal(timers.timers.size, 0, "no unattended upload during recovery")
+      assert.equal(coordinator.pendingCount, 1)
+      if (outcome === "newer-save") {
+        coordinator.pauseAutomaticForSettingsSave()
+        coordinator.finishSettingsSave(true)
+      } else if (outcome === "disposed") coordinator.dispose()
+      release()
+      await recovery
+      assert.equal(executions.length, 1)
+      if (outcome === "success") {
+        assert.equal(coordinator.isAutomaticSyncPaused, false)
+        assert.equal(timers.timers.size, 1, "queued edit needs a fresh debounce even without a new Vault event")
+        timers.fireLatest()
+        await coordinator.whenIdle()
+        assert.deepEqual(executions[1], { trigger: "localChange", changes: [{ type: "modify", path: "during-recovery.md", mtime: 2 }] })
+        assert.equal(coordinator.pendingCount, 0)
+      } else {
+        assert.equal(timers.timers.size, 0, "failed, stale or disposed recovery cannot schedule writes")
+        if (outcome !== "disposed") {
+          assert.equal(coordinator.isAutomaticSyncPaused, true)
+          assert.equal(coordinator.pendingCount, outcome === "failure" ? 2 : 1)
+        }
+      }
+    } finally { release(); coordinator.dispose() }
+  }
+})
+
 test("D485 a Settings save cannot replay an old or due local debounce against changed GitHub routing", async () => {
   const timers = new FakeTimers()
   const executions: Array<{ trigger: string; paths: string[] }> = []
