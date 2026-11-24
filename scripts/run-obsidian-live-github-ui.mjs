@@ -14,7 +14,7 @@ import {CANONICAL_REPOSITORY_ID,readOriginFetchRepository} from "./github-repo.m
 import {verifyPngBytes,visibleIntersection} from "./ui-visual-assertions.mjs";
 import {parseLiveUiMode,assertEncryptedRemoteTree} from "./obsidian-live-ui-mode.mjs";
 import {cleanupGeneratedUiRun,cleanupGeneratedUiEvidence} from "./obsidian-live-ui-cleanup.mjs";
-import {restoreEncryptedToSecondObsidian} from "./obsidian-live-ui-peer.mjs";
+import {restoreEncryptedToSecondObsidian,nativeVaultInventoryExpression} from "./obsidian-live-ui-peer.mjs";
 
 const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),"..");
 const opts=process.argv.slice(2);
@@ -24,10 +24,13 @@ const dryRun=opts.includes("--preflight-only");
 const mode=parseLiveUiMode(option("mode",undefined));
 const verifyPeer=opts.includes("--verify-peer");
 const journey=opts.includes("--journey");
+const autoJourney=opts.includes("--auto-journey");
+assert.ok(!autoJourney||(journey&&verifyPeer&&mode==="encrypted"),"Auto journey requires encrypted peer journey");
 const native100mb=opts.includes("--native-100mb");
 const nativeThousandNotes=opts.includes("--native-1000-notes");
 assert.ok(!nativeThousandNotes||(mode==="encrypted"&&verifyPeer),"Native 1,000-note test requires encrypted mode and a second real Obsidian vault");
 const assertDiagnostics=opts.includes("--assert-diagnostics");
+assert.ok(!autoJourney||(!native100mb&&!nativeThousandNotes),"Auto journey is a bounded small-Vault acceptance test");
 assert.ok(!native100mb||(mode==="encrypted"&&verifyPeer),"Native 100 MB test requires encrypted mode and a second real Obsidian vault");
 assert.ok(!verifyPeer||mode==="encrypted","A second-vault restore requires --mode=encrypted");
 const passphrase=mode==="encrypted"?randomBytes(32).toString("base64url"):"";
@@ -75,6 +78,7 @@ let processHandle,ws,configuration,branch,verified=false,passed=false,initialSha
 let cleanupState="not-started",screenBytes=0,remoteEncryptionVerified=false,peerRestored=false,peerScreenshot=null;
 const sendErrors=[];
 const journeySteps=[];
+let autoSyncEvidence=null,peerConvergenceEvidence=null;
 let nativeBinary=null;
 let nativeUploadWallMs=null;
 let nativeDownloadWallMs=null;
@@ -312,6 +316,27 @@ try{
    const checked=await evaluate("(async()=>{const expected="+JSON.stringify(expectedPeerFiles)+";for(const entry of expected){const file=app.vault.getAbstractFileByPath(entry.path);if(!file||(await app.vault.read(file))!==entry.content)return {ok:false};}return {ok:!app.vault.getAbstractFileByPath("+JSON.stringify(original)+")};})()");
    assertTrue(checked?.ok,"Native source files diverged after combined changes");
   }
+  if(autoJourney){
+   const pluginExpr="app.plugins.plugins["+JSON.stringify(id)+"]";
+   const autoPath="Auto-สวัสดี.md";
+   const autoText="# Native Auto Sync\n\nFinal local event revision.\n";
+   const before=finalSha;
+   const enabled=await evaluate("(async()=>{const p="+pluginExpr+";await p.saveSettings({...p.settings,syncOnLocalChange:true});return {enabled:p.settings.syncOnLocalChange,watch:p.isWatchEnabled,paused:p.v4Runtime.coordinator.isAutomaticSyncPaused};})()");
+   assertTrue(enabled.enabled&&enabled.watch&&!enabled.paused,"Native Auto Sync not enabled or watch paused");
+   const queued=await evaluate("(async()=>{const p="+pluginExpr+";const baseline=p.v4Runtime.progressSnapshot.lastSyncTime;const file=await app.vault.create("+JSON.stringify(autoPath)+",'Initial local event.\\n');await app.vault.modify(file,"+JSON.stringify(autoText)+");const s=p.v4Runtime.progressSnapshot;return {baseline,lifecycle:s.lifecycle,phase:s.phase,trigger:s.trigger,pending:p.v4Runtime.pendingCount};})()");
+   assertTrue(queued.lifecycle==="waiting"&&queued.phase==="debouncing"&&queued.trigger==="localChange"&&queued.pending>0,"Actual Vault events did not enqueue a local debounce: "+JSON.stringify(queued));
+   const terminal=await waitUntil(()=>evaluate("(()=>{const p="+pluginExpr+";const s=p.v4Runtime.progressSnapshot;return s.trigger==='localChange'&&['success','failed','no-change'].includes(s.lifecycle)&&!p.isSyncInProgress?{lifecycle:s.lifecycle,lastSyncTime:s.lastSyncTime,pending:p.v4Runtime.pendingCount,error:s.errorMessage,apiRequests:s.diagnostics?.apiRequests,apiFailures:s.diagnostics?.apiFailures}:null;})()"),180000,"native local-event Auto Sync");
+   assertTrue(terminal.lifecycle==="success"&&terminal.lastSyncTime>queued.baseline&&terminal.pending===0&&terminal.apiRequests>0&&terminal.apiFailures===0,"Native local-event Auto Sync failed: "+redact(JSON.stringify(terminal)));
+   const remote=await readState(configuration);
+   assertTrue(remote.kind==="present"&&remote.sha!==before,"Auto Sync did not publish a new GitHub commit");
+   finalSha=remote.sha;
+   expectedPeerFiles.push({path:autoPath,content:autoText});
+   const disabled=await evaluate("(async()=>{const p="+pluginExpr+";await p.saveSettings({...p.settings,syncOnLocalChange:false});return !p.settings.syncOnLocalChange;})()");
+   assertTrue(disabled,"Could not restore manual-only mode before conflict journey");
+   autoSyncEvidence={trigger:"localChange",waitingObserved:true,remoteHeadChanged:true,pendingAfter:terminal.pending,apiRequests:terminal.apiRequests,apiFailures:terminal.apiFailures};
+   journeySteps.push("real Vault create/modify triggered automatic GitHub Sync without manual action");
+   await verifyNoop("after-native-auto-sync");
+  }
   if(nativeThousandNotes){
    const filler="x".repeat(480);
    const expression="(async()=>{await app.vault.createFolder('Bulk');const text="+JSON.stringify(filler)+";for(let i=0;i<1000;i++){const path='Bulk/note-'+String(i).padStart(4,'0')+'.md';await app.vault.create(path,'# Bulk '+i+'\\n\\n'+text+'\\n')}return app.vault.getFiles().filter(f=>f.path.startsWith('Bulk/')).length})()";
@@ -369,10 +394,22 @@ try{
    journeySteps.push("real Obsidian indexed and uploaded exact 100 MB binary");
   }
   if(verifyPeer){
+   const reconcileSourceConflict=async()=>{
+    const localEdit=await evaluate("(async()=>{const p=app.plugins.plugins["+JSON.stringify(id)+"];const file=app.vault.getAbstractFileByPath('UI-smoke.md');await app.vault.modify(file,'# Synthetic remote UI E2E\\n\\nMain conflicting revision.\\n');await p.v4Runtime.manualSync();const s=p.v4Runtime.progressSnapshot;return {lifecycle:s.lifecycle,error:s.errorMessage?.slice(0,240),failurePhase:s.failurePhase,apiFailures:s.diagnostics?.apiFailures};})()",240000);
+    assertTrue(localEdit.lifecycle==="success","Real Obsidian conflict reconciliation did not succeed: "+redact(JSON.stringify(localEdit)));
+    const checked=await evaluate("(async()=>{const files=app.vault.getFiles();let local=false,peer=false;for(const file of files){if(!file.path.endsWith('.md'))continue;const text=await app.vault.read(file);if(text.includes('Main conflicting revision.'))local=true;if(text.includes('Peer conflicting revision.'))peer=true;}return {local,peer,count:files.length};})()",240000);
+    assertTrue(checked.local&&checked.peer,"Local/remote conflicting text was not preserved in two Obsidian notes: "+JSON.stringify(checked));
+    journeySteps.push("two-device simultaneous conflict retained both revisions");
+    finalSha=(await readState(configuration)).sha;
+    if(autoJourney){
+     await verifyNoop("source-after-conflict");
+     return await evaluate(nativeVaultInventoryExpression,240000);
+    }
+   };
    const restored=await restoreEncryptedToSecondObsidian({
     exe,runRoot,port:port+1,pluginId:id,sourceRoot:root,configuration,passphrase,
     expectedContent:"# Synthetic remote UI E2E\n\nSecond revision from Obsidian.\n",
-    expectedFiles:journey?expectedPeerFiles:[],absentPaths:journey?["Notes/สวัสดี 🌏.md"]:[],exercisePeerConflict:journey,expectedBinary:nativeBinary,
+    expectedFiles:journey?expectedPeerFiles:[],absentPaths:journey?["Notes/สวัสดี 🌏.md"]:[],exercisePeerConflict:journey,expectedBinary:nativeBinary,convergeAfterPeerEdit:autoJourney?reconcileSourceConflict:null,
    });
    assertTrue(restored.peerRestored&&restored.bytesRestored>0,"Second real Obsidian vault could not decrypt remote data");
    nativeDownloadWallMs=restored.peerPullWallMs??null;
@@ -384,15 +421,15 @@ try{
     peerDiagnosticEvidence=d;
    }
    const afterPull=await readState(configuration);
-   if(journey){
+   if(autoJourney){
+    assertTrue(restored.peerMutated&&restored.peerConverged&&restored.peerFinalInventoryCount>=5,"Final installed peer convergence not proven");
+    assertTrue(afterPull.kind==="present"&&afterPull.sha===finalSha,"Peer catch-up or no-op advanced GitHub HEAD");
+    peerConvergenceEvidence={exactPathSizeSha256:true,files:restored.peerFinalInventoryCount,peerNoOp:true,headUnchanged:true};
+    journeySteps.push("both actual native Vaults converged by path, byte length and SHA-256 after conflict");
+   }else if(journey){
     assertTrue(restored.peerMutated&&afterPull.kind==="present"&&afterPull.sha!==finalSha,
      "Real peer edit did not publish a competing GitHub commit");
-    const localEdit=await evaluate("(async()=>{const p=app.plugins.plugins["+JSON.stringify(id)+"];const file=app.vault.getAbstractFileByPath('UI-smoke.md');await app.vault.modify(file,'# Synthetic remote UI E2E\\n\\nMain conflicting revision.\\n');await p.v4Runtime.manualSync();const s=p.v4Runtime.progressSnapshot;return {lifecycle:s.lifecycle,error:s.errorMessage?.slice(0,240),failurePhase:s.failurePhase,apiFailures:s.diagnostics?.apiFailures};})()",240000);
-    assertTrue(localEdit.lifecycle==="success","Real Obsidian conflict reconciliation did not succeed: "+redact(JSON.stringify(localEdit)));
-    const checked=await evaluate("(async()=>{const files=app.vault.getFiles();let local=false,peer=false;for(const file of files){if(!file.path.endsWith('.md'))continue;const text=await app.vault.read(file);if(text.includes('Main conflicting revision.'))local=true;if(text.includes('Peer conflicting revision.'))peer=true;}return {local,peer,count:files.length};})()",240000);
-    assertTrue(checked.local&&checked.peer,"Local/remote conflicting text was not preserved in two Obsidian notes: "+JSON.stringify(checked));
-    journeySteps.push("two-device simultaneous conflict retained both revisions");
-    finalSha=(await readState(configuration)).sha;
+    if(!autoJourney) await reconcileSourceConflict();
    }else{
     assertTrue(afterPull.kind==="present"&&afterPull.sha===finalSha,"Second-device Force Pull unexpectedly changed GitHub HEAD");
    }
@@ -426,5 +463,5 @@ try{
   try{await cleanupGeneratedUiEvidence(runRoot,{repoRoot:root});}catch(error){console.error("WARNING: synthetic UI evidence cleanup incomplete ("+String(error?.code||"unknown").slice(0,30)+")");process.exitCode=1;}
  }
  console.log(JSON.stringify({status:passed&&!process.exitCode?"PASS":"FAIL",cleanup:cleanupState,remoteHeadChanged:Boolean(initialSha&&finalSha&&initialSha!==finalSha),
-  screenshotCaptured:screenBytes>1000,screenshotPath:null,uiExceptions:sendErrors.length,mode,remoteEncryptionVerified,peerRestored,peerScreenshot:null,journeySteps,noOpEvidence,bulkEvidence,diagnostics:diagnosticEvidence,peerDiagnostics:peerDiagnosticEvidence,nativeUploadWallMs,nativeDownloadWallMs,native100mbBytes:nativeBinary?.size??0,native100mbSha256:nativeBinary?.sha256??null,runBranch:branch,repository:configuration?.targetRepository,token:"[not reported]"}));
+  screenshotCaptured:screenBytes>1000,screenshotPath:null,uiExceptions:sendErrors.length,mode,remoteEncryptionVerified,peerRestored,peerScreenshot:null,journeySteps,autoSyncEvidence,peerConvergenceEvidence,noOpEvidence,bulkEvidence,diagnostics:diagnosticEvidence,peerDiagnostics:peerDiagnosticEvidence,nativeUploadWallMs,nativeDownloadWallMs,native100mbBytes:nativeBinary?.size??0,native100mbSha256:nativeBinary?.sha256??null,runBranch:branch,repository:configuration?.targetRepository,token:"[not reported]"}));
 }

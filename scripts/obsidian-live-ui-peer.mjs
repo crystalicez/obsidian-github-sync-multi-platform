@@ -15,9 +15,19 @@ export function assertSecondVaultRestore(state,expectedContent){
  assert.equal(state.content,expectedContent,"Second-vault decrypted content mismatch");
  return true;
 }
+// Observe the actual installed Vault bytes, not a fixture or remote inventory.
+export const nativeVaultInventoryExpression = `(async()=>{
+ const result=[];
+ for(const file of app.vault.getFiles()){
+  const bytes=await app.vault.readBinary(file);
+  const digest=new Uint8Array(await crypto.subtle.digest("SHA-256",bytes));
+  result.push({path:file.path,size:bytes.byteLength,sha256:[...digest].map(b=>b.toString(16).padStart(2,"0")).join("")});
+ }
+ return result.sort((a,b)=>a.path<b.path?-1:a.path>b.path?1:0);
+})()`;
 export async function restoreEncryptedToSecondObsidian({
  exe,runRoot,port,pluginId,sourceRoot,configuration,passphrase,expectedContent,
- expectedFiles=[],absentPaths=[],exercisePeerConflict=false,expectedBinary=null,
+ expectedFiles=[],absentPaths=[],exercisePeerConflict=false,expectedBinary=null,convergeAfterPeerEdit=null,
 }){
  assert.ok(Number.isInteger(port)&&port>=1024&&port<=65535,"Second CDP port is unsafe");
  assert.ok(path.basename(runRoot).match(/^[0-9a-f]{16}$/u),"Second vault requires a synthetic random run ID");
@@ -166,7 +176,7 @@ export async function restoreEncryptedToSecondObsidian({
   await mkdir(evidenceDir,{recursive:true});
   const evidencePath=path.join(evidenceDir,path.basename(runRoot)+"-peer-restored.png");
   await writeFile(evidencePath,bytes);
-  let peerMutated=false;
+  let peerMutated=false,peerConverged=false,peerFinalInventoryCount=0;
   if(exercisePeerConflict){
    const result=await evaluate(`(async()=>{
     const p=app.plugins.plugins[${JSON.stringify(pluginId)}];
@@ -177,8 +187,28 @@ export async function restoreEncryptedToSecondObsidian({
    })()`,240000);
    assert.equal(result.lifecycle,"success","Second real Obsidian peer edit must publish");
    peerMutated=true;
+   if(convergeAfterPeerEdit){
+    const expected=await convergeAfterPeerEdit();
+    const caughtUp=await evaluate(`(async()=>{
+     const p=app.plugins.plugins[${JSON.stringify(pluginId)}];
+     const outcome=await p.v4Runtime.manualSync();
+     return {status:outcome?.status,lifecycle:p.v4Runtime.progressSnapshot.lifecycle};
+    })()`,240000);
+    assert.equal(caughtUp.status,"completed","Peer normal catch-up did not complete");
+    assert.equal(caughtUp.lifecycle,"success","Peer normal catch-up did not apply conflict result");
+    const actual=await evaluate(nativeVaultInventoryExpression,240000);
+    assert.deepEqual(actual,expected,"Final native Vault path/size/SHA-256 inventories differ");
+    const noop=await evaluate(`(async()=>{
+     const p=app.plugins.plugins[${JSON.stringify(pluginId)}];
+     const outcome=await p.v4Runtime.manualSync();
+     return {status:outcome?.status,changedFiles:outcome?.changedFiles,lifecycle:p.v4Runtime.progressSnapshot.lifecycle,uploadBytes:p.v4Runtime.progressSnapshot.diagnostics?.uploadBytes};
+    })()`,240000);
+    assert.deepEqual(noop,{status:"completed",changedFiles:0,lifecycle:"no-change",uploadBytes:0},"Converged peer must be a no-op");
+    peerConverged=true;
+    peerFinalInventoryCount=actual.length;
+   }
   }
-  return {peerRestored:true,peerVaultPathMatches:true,filenameMatched:true,bytesRestored:Buffer.byteLength(restored.content,"utf8"),peerScreenshot:evidencePath,verifiedJourneyFiles:verifiedFiles.length,peerMutated,peerDiagnostics:restored.diagnostics,peerPullWallMs:restored.peerPullWallMs};
+  return {peerConverged,peerFinalInventoryCount,peerRestored:true,peerVaultPathMatches:true,filenameMatched:true,bytesRestored:Buffer.byteLength(restored.content,"utf8"),peerScreenshot:evidencePath,verifiedJourneyFiles:verifiedFiles.length,peerMutated,peerDiagnostics:restored.diagnostics,peerPullWallMs:restored.peerPullWallMs};
  }finally{
   if(ws){try{ws.close()}catch{}}
   if(child?.pid){
