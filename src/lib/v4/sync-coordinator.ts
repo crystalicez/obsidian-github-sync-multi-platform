@@ -240,8 +240,9 @@ export class V4SyncCoordinator {
     const generation = ++this.debounceGeneration;
     this.timer = this.schedule(() => {
       // A callback already queued by the host can fire after cancellation.
-      if (this.disposed || this.automaticSyncPaused || generation !== this.debounceGeneration) return;
+      if (this.disposed || generation !== this.debounceGeneration) return;
       this.timer = undefined;
+      if (this.automaticSyncPaused) return;
       this.observeBackgroundRun(this.flushLocalChanges());
     }, this.debounceMs);
   }
@@ -272,6 +273,7 @@ export class V4SyncCoordinator {
       return { status: "skipped", changedFiles: 0 };
     }
     if (this.timer !== undefined) {
+      ++this.debounceGeneration;
       this.cancel(this.timer);
       this.timer = undefined;
     }
@@ -372,12 +374,11 @@ export class V4SyncCoordinator {
           // changes, even if it finishes after an ambiguous failed Save.
           if (!this.disposed && !this.settingsSavePending && startingSettingsSaveGeneration === this.settingsSaveGeneration
             && (request.trigger === "manual" || request.trigger === "forcePush" || request.trigger === "forcePull")) {
-            const needsFreshDebounce = this.settingsChangeRequiresManual && this.pending.length > 0;
+            const needsFreshDebounce = this.automaticSyncPaused && this.pending.length > 0 && this.timer === undefined;
             this.automaticSyncPaused = false;
             this.settingsChangeRequiresManual = false;
-            // Edits arriving during explicit post-Settings reconciliation had
-            // no timer. Once this fresh run succeeds, debounce those edits even
-            // if the user never changes another file.
+            // Recovery may have suppressed or outlasted the local debounce.
+            // Rearm pending edits after success without requiring another edit.
             if (needsFreshDebounce) this.scheduleLocalDebounce();
           }
           resolveExecution({ status: "completed", changedFiles: result.changedFiles });

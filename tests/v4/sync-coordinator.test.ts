@@ -19,6 +19,86 @@ class FakeTimers {
   }
 }
 
+test("D489 a due debounce during ordinary failure recovery is rearmed only after successful reconciliation", async () => {
+  for (const outcome of ["success", "failure", "newer-save", "disposed"] as const) {
+    const timers = new FakeTimers()
+    const executions: V4QueuedChange[][] = []
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const coordinator = new V4SyncCoordinator({
+      schedule: timers.schedule, cancel: timers.cancel,
+      execute: async (_request, changes) => {
+        executions.push(changes)
+        if (executions.length === 1) return { changedFiles: 0, failed: true }
+        if (executions.length === 2) {
+          await gate
+          if (outcome === "failure") return { changedFiles: 0, failed: true }
+        }
+        return { changedFiles: changes.length }
+      },
+    })
+    try {
+      coordinator.enqueue({ type: "modify", path: "offline.md", mtime: 1 })
+      assert.equal((await coordinator.run({ operation: "normal", trigger: "manual" })).status, "failed")
+      const recovery = coordinator.run({ operation: "normal", trigger: "manual" })
+      coordinator.enqueue({ type: "modify", path: "during-recovery.md", mtime: 2 })
+      timers.fireLatest()
+      assert.equal(executions.length, 2)
+      if (outcome === "newer-save") {
+        coordinator.pauseAutomaticForSettingsSave()
+        coordinator.finishSettingsSave(true)
+      } else if (outcome === "disposed") coordinator.dispose()
+      release()
+      await recovery
+      assert.equal(executions.length, 2)
+      if (outcome === "success") {
+        assert.equal(coordinator.isAutomaticSyncPaused, false)
+        assert.equal(timers.timers.size, 1, "a timer that expired during recovery needs a fresh debounce")
+        timers.fireLatest()
+        await coordinator.whenIdle()
+        assert.deepEqual(executions[2], [{ type: "modify", path: "during-recovery.md", mtime: 2 }])
+        assert.equal(coordinator.pendingCount, 0)
+        assert.equal((await coordinator.run({ operation: "normal", trigger: "scheduled" })).status, "completed")
+      } else {
+        assert.equal(timers.timers.size, 0)
+        if (outcome !== "disposed") {
+          assert.equal(coordinator.isAutomaticSyncPaused, true)
+          assert.equal(coordinator.pendingCount, outcome === "failure" ? 2 : 1)
+        }
+      }
+    } finally { release(); coordinator.dispose() }
+  }
+})
+
+test("D489 a canceled manual-entry timer cannot consume the next debounce", async () => {
+  const timers = new FakeTimers()
+  let release!: () => void
+  const gate = new Promise<void>(resolve => { release = resolve })
+  const executions: V4QueuedChange[][] = []
+  const coordinator = new V4SyncCoordinator({
+    schedule: timers.schedule, cancel: timers.cancel,
+    execute: async (_request, changes) => {
+      executions.push(changes)
+      if (executions.length === 1) await gate
+      return { changedFiles: changes.length }
+    },
+  })
+  try {
+    coordinator.enqueue({ type: "modify", path: "first.md", mtime: 1 })
+    const stale = [...timers.timers.values()][0]!.callback
+    const manual = coordinator.run({ operation: "normal", trigger: "manual" })
+    stale()
+    coordinator.enqueue({ type: "modify", path: "later.md", mtime: 2 })
+    release()
+    await manual
+    assert.equal(executions.length, 1, "canceled timer cannot set a due follow-up flag")
+    assert.equal(timers.timers.size, 1)
+    timers.fireLatest()
+    await coordinator.whenIdle()
+    assert.deepEqual(executions[1], [{ type: "modify", path: "later.md", mtime: 2 }])
+  } finally { release(); coordinator.dispose() }
+})
+
 test("D488 edits during post-Settings Manual Sync are debounced after recovery succeeds, never after failure or a newer Save", async () => {
   for (const outcome of ["success", "failure", "newer-save", "disposed"] as const) {
     const timers = new FakeTimers()
