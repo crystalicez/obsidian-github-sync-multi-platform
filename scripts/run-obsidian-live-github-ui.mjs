@@ -5,7 +5,7 @@
 import assert from "node:assert/strict";
 import {spawn,spawnSync} from "node:child_process";
 import {createHash,randomBytes} from "node:crypto";
-import {copyFile,mkdir,open,stat,writeFile} from "node:fs/promises";
+import {copyFile,mkdir,open,readFile,stat,writeFile} from "node:fs/promises";
 import path from "node:path";
 import {fileURLToPath} from "node:url";
 import {loadGitHubE2EEnv,qualificationE2EBranch,resolvePinnedGitHubE2ERepoId,validateGitHubE2EConfig} from "./github-e2e-env.mjs";
@@ -395,8 +395,18 @@ try{
   }
   if(verifyPeer){
    const reconcileSourceConflict=async()=>{
-    const localEdit=await evaluate("(async()=>{const p=app.plugins.plugins["+JSON.stringify(id)+"];const file=app.vault.getAbstractFileByPath('UI-smoke.md');await app.vault.modify(file,'# Synthetic remote UI E2E\\n\\nMain conflicting revision.\\n');await p.v4Runtime.manualSync();const s=p.v4Runtime.progressSnapshot;return {lifecycle:s.lifecycle,error:s.errorMessage?.slice(0,240),failurePhase:s.failurePhase,apiFailures:s.diagnostics?.apiFailures};})()",240000);
-    assertTrue(localEdit.lifecycle==="success","Real Obsidian conflict reconciliation did not succeed: "+redact(JSON.stringify(localEdit)));
+    // Publication success may precede REST ref visibility. Observe the peer's
+    // competing commit before starting the source conflict, not after it.
+    if(autoJourney){
+     const peerHead=await waitUntil(async()=>{const h=await readState(configuration);return h.kind==="present"&&h.sha!==finalSha?h:null;},30000,"peer competing GitHub HEAD visibility");
+     assertTrue(peerHead.sha!==finalSha,"Peer did not publish a competing commit");
+    }
+    const expectedMain="# Synthetic remote UI E2E\n\nMain conflicting revision.\n";
+    const beforeEdit=await evaluate("(async()=>{const p=app.plugins.plugins["+JSON.stringify(id)+"];const f=app.vault.getAbstractFileByPath('UI-smoke.md');const before=await app.vault.read(f);await app.vault.modify(f,"+JSON.stringify(expectedMain)+");const after=await app.vault.read(f);return {beforeMatches:before.includes('Second revision from Obsidian.'),afterMatches:after==="+JSON.stringify(expectedMain)+",pending:p.v4Runtime.pendingCount,active:p.v4Runtime.coordinator.isSyncing,auto:p.settings.syncOnLocalChange,mtime:f.stat.mtime,size:f.stat.size};})()");
+    assertTrue(beforeEdit.beforeMatches&&beforeEdit.afterMatches&&!beforeEdit.active&&!beforeEdit.auto,"Native source edit precondition failed: "+JSON.stringify(beforeEdit));
+    assertTrue((await readFile(path.join(vault,"UI-smoke.md"),"utf8"))===expectedMain,"Actual source note disk bytes differ before conflict Sync");
+    const localEdit=await evaluate("(async()=>{const p=app.plugins.plugins["+JSON.stringify(id)+"];const outcome=await p.v4Runtime.manualSync();const s=p.v4Runtime.progressSnapshot;const f=app.vault.getAbstractFileByPath('UI-smoke.md');return {status:outcome?.status,changedFiles:outcome?.changedFiles,lifecycle:s.lifecycle,trigger:s.trigger,pending:p.v4Runtime.pendingCount,push:s.push,pull:s.pull,error:s.errorMessage?.slice(0,240),failurePhase:s.failurePhase,apiRequests:s.diagnostics?.apiRequests,apiFailures:s.diagnostics?.apiFailures,mainStillPresent:!!f&&(await app.vault.read(f)).includes('Main conflicting revision.')};})()",240000);
+    assertTrue(localEdit.status==="completed"&&localEdit.lifecycle==="success"&&localEdit.trigger==="manual","Real Obsidian conflict reconciliation did not succeed: "+redact(JSON.stringify({beforeEdit,localEdit})));
     const checked=await evaluate("(async()=>{const files=app.vault.getFiles();let local=false,peer=false;for(const file of files){if(!file.path.endsWith('.md'))continue;const text=await app.vault.read(file);if(text.includes('Main conflicting revision.'))local=true;if(text.includes('Peer conflicting revision.'))peer=true;}return {local,peer,count:files.length};})()",240000);
     assertTrue(checked.local&&checked.peer,"Local/remote conflicting text was not preserved in two Obsidian notes: "+JSON.stringify(checked));
     journeySteps.push("two-device simultaneous conflict retained both revisions");
