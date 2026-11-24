@@ -129,7 +129,7 @@ async function waitUntil(predicate,ms,label){
  throw Error("Timed out: "+label);
 }
 async function captureSyncedCenter({requireFileWork=false}={}){
- const dims=await evaluate(`(()=>{
+ const measure=()=>evaluate(`(()=>{
   const el=document.querySelector(".github-sync-center");
   if(!el)return null;const b=el.getBoundingClientRect();
   return {rect:{x:b.x,y:b.y,width:b.width,height:b.height},viewport:{width:innerWidth,height:innerHeight},dpr:devicePixelRatio,
@@ -141,16 +141,20 @@ async function captureSyncedCenter({requireFileWork=false}={}){
     leakedToken:el.innerText.includes(app.plugins.plugins["encrypted-github-sync-multi-platform"].settings.githubToken),
     leakedPassphrase:!!app.plugins.plugins["encrypted-github-sync-multi-platform"].settings.encryptionPassphrase&&el.innerText.includes(app.plugins.plugins["encrypted-github-sync-multi-platform"].settings.encryptionPassphrase)};
  })()`);
+ let dims=await measure();
+ if(assertDiagnostics&&dims?.lifecycle==="success"&&(dims.metrics?.inFlightApiRequests!==0||dims.metrics?.oldestInFlightApiMs!==0)){
+  dims=await waitUntil(async()=>{const next=await measure();assertTrue(next?.lifecycle==="success","Sync status changed while awaiting UI diagnostics");return next.metrics?.inFlightApiRequests===0&&next.metrics?.oldestInFlightApiMs===0?next:null;},30000,"post-Sync UI API requests to settle");
+ }
  assertTrue(dims?.syncAction && dims?.lifecycle==="success" && !dims?.leakedToken && !dims?.leakedPassphrase,"Sync Center must show a completed sync without leaking credentials");
  if(assertDiagnostics){
   const d=dims.metrics;
   console.log(JSON.stringify({kind:"native-ui-metrics",metrics:d??null,rowsVisible:dims.diagnosticRows}));
   assertTrue(dims.diagnosticRows&&d?.apiRequests>0&&d?.uploadBytes>0&&d?.downloadBytes>0,
    "Live Obsidian UI did not render real GitHub throughput and API request metrics");
-  assertTrue(d.apiLatencyMs>0&&d.inFlightApiRequests===0&&d.oldestInFlightApiMs===0,
+  assertTrue(d.apiLatencyMs>0&&d.apiFailures===0&&d.inFlightApiRequests===0&&d.oldestInFlightApiMs===0,
    "Live Obsidian API request metrics did not settle after completed Sync");
   if(requireFileWork)assertTrue(d.hashingMs>0&&d.encryptionMs>0,
-   "Native 100 MB Obsidian upload did not record real hashing and encryption work");
+   "Native Obsidian binary upload did not record real hashing and encryption work");
   assertTrue(d.peakRendererRssBytes>0,"Live Windows Obsidian renderer RSS was not sampled");
   diagnosticEvidence=d;
  }
@@ -165,7 +169,7 @@ async function captureSyncedCenter({requireFileWork=false}={}){
  return {width:size.width,height:size.height,bytes:screenBytes};
 }
 try{
- assertTrue(Number.isInteger(port)&&port>=1024&&port<=(verifyPeer?65534:65535),"Safe CDP port required");
+ assertTrue(Number.isInteger(port)&&port>=1024&&port<=(restartJourney?65533:verifyPeer?65534:65535),"Safe CDP port required");
  const sha=runGit(["rev-parse","HEAD"]);
  assertTrue(sha.status===0&&/^[0-9a-f]{40}$/u.test(sha.stdout.trim()),"Valid pinned source SHA required");
  const status=runGit(["status","--porcelain"]);
