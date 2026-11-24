@@ -5,6 +5,7 @@
 import assert from "node:assert/strict";
 import {spawn,spawnSync} from "node:child_process";
 import {createHash,randomBytes} from "node:crypto";
+import {createReadStream} from "node:fs";
 import {copyFile,mkdir,open,readFile,stat,writeFile} from "node:fs/promises";
 import path from "node:path";
 import {fileURLToPath} from "node:url";
@@ -27,11 +28,17 @@ const journey=opts.includes("--journey");
 const autoJourney=opts.includes("--auto-journey");
 assert.ok(!autoJourney||(journey&&verifyPeer&&mode==="encrypted"),"Auto journey requires encrypted peer journey");
 const native100mb=opts.includes("--native-100mb");
+const fileMiB=option("native-file-mib",undefined);
+assert.ok(!native100mb||fileMiB===undefined,"Choose exactly one binary fixture size");
+assert.ok(fileMiB===undefined||(/^[1-9][0-9]{0,2}$/u.test(fileMiB)&&Number(fileMiB)<=500),"Native file size must be an integer from 1 to 500 MiB");
+const nativeLargeBytes=native100mb?100_000_000:fileMiB===undefined?0:Number(fileMiB)*1024*1024;
+const restartJourney=opts.includes("--restart-journey");
+assert.ok(!restartJourney||verifyPeer,"Restart journey requires second real Vault verification");
 const nativeThousandNotes=opts.includes("--native-1000-notes");
 assert.ok(!nativeThousandNotes||(mode==="encrypted"&&verifyPeer),"Native 1,000-note test requires encrypted mode and a second real Obsidian vault");
 const assertDiagnostics=opts.includes("--assert-diagnostics");
-assert.ok(!autoJourney||(!native100mb&&!nativeThousandNotes),"Auto journey is a bounded small-Vault acceptance test");
-assert.ok(!native100mb||(mode==="encrypted"&&verifyPeer),"Native 100 MB test requires encrypted mode and a second real Obsidian vault");
+assert.ok(!autoJourney||(!nativeLargeBytes&&!nativeThousandNotes),"Auto journey is a bounded small-Vault acceptance test");
+assert.ok(!nativeLargeBytes||(mode==="encrypted"&&verifyPeer),"Native binary test requires encrypted mode and a second real Obsidian vault");
 assert.ok(!verifyPeer||mode==="encrypted","A second-vault restore requires --mode=encrypted");
 const passphrase=mode==="encrypted"?randomBytes(32).toString("base64url"):"";
 const id="encrypted-github-sync-multi-platform";
@@ -40,7 +47,8 @@ const runRoot=path.join(root,".tmp","obsidian-live-github-e2e",runId);
 const vault=path.join(runRoot,"vault");
 const profile=path.join(runRoot,"profile");
 const screenshot=path.join(root,".tmp","obsidian-live-github-e2e-evidence",runId+"-sync-center.png");
-const port=Number(option("port",String(20000+process.pid%35000)));
+const firstPort=Number(option("port",String(20000+process.pid%35000)));
+let port=firstPort;
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 const assertTrue=(condition,message)=>assert.ok(condition,message);
 const readState=async({owner,repo,branch,token})=>readE2EBranch({owner,repo,branch,token});
@@ -78,7 +86,7 @@ let processHandle,ws,configuration,branch,verified=false,passed=false,initialSha
 let cleanupState="not-started",screenBytes=0,remoteEncryptionVerified=false,peerRestored=false,peerScreenshot=null;
 const sendErrors=[];
 const journeySteps=[];
-let autoSyncEvidence=null,peerConvergenceEvidence=null;
+let autoSyncEvidence=null,peerConvergenceEvidence=null,restartEvidence=null;
 let nativeBinary=null;
 let nativeUploadWallMs=null;
 let nativeDownloadWallMs=null;
@@ -184,39 +192,50 @@ try{
   await writeFile(path.join(vault,".obsidian","community-plugins.json"),JSON.stringify([id])+"\n");
   await writeFile(path.join(vault,"UI-smoke.md"),"# Synthetic remote UI E2E\n\nFirst revision.\n");
   await writeFile(path.join(profile,"obsidian.json"),JSON.stringify({vaults:{"da9d8e727d6c1aba":{path:vault,ts:Date.now(),open:true}}})+"\n");
-  processHandle=spawn(exe,[`--user-data-dir=${profile}`,`--remote-debugging-port=${port}`],{detached:true,windowsHide:false,stdio:"ignore"});
-  processHandle.on("error",()=>{});
-  processHandle.unref();
-  const target=await waitApp();
-  ws=new WebSocket(target.webSocketDebuggerUrl);
-  await new Promise((resolve,reject)=>{ws.onopen=resolve;ws.onerror=()=>reject(Error("Isolated CDP attach failed"));});
-  ws.onmessage=({data})=>{
-   const msg=JSON.parse(String(data));
-   if(msg.method==="Runtime.exceptionThrown")sendErrors.push("Uncaught UI exception");
-   if(!msg.id)return;const waiter=requestMap.get(msg.id);if(!waiter)return;
-   requestMap.delete(msg.id);
-   if(msg.error)waiter.reject(Error(String(msg.error.message).slice(0,200)));else waiter.resolve(msg.result);
-  };
-  await send("Runtime.enable");await send("Page.enable");
-  const identity=await waitUntil(()=>evaluate(`(()=>{
-   if(typeof app==="undefined"||!app.vault?.adapter?.getBasePath)return null;
-   return {base:app.vault.adapter.getBasePath(),name:app.vault.getName()};
-  })()`),45000,"isolated Obsidian vault API");
-  assertTrue(identity.base.toLowerCase()===vault.toLowerCase()&&identity.name===path.basename(vault),
-   "Refusing live GitHub credentials: Obsidian vault is not the new synthetic vault");
-  const loaded=await evaluate(`(async()=>{
-   const pid=${JSON.stringify(id)};
-   if(!app.plugins.isEnabled())await app.plugins.setEnable(true);
-   if(!app.plugins.enabledPlugins.has(pid))await app.plugins.enablePluginAndSave(pid);
-   await app.plugins.loadPlugin(pid);
-   const deadline=Date.now()+15000;
-   while(!app.plugins.plugins[pid]&&Date.now()<deadline){
-    await new Promise(r=>setTimeout(r,250));
-    if(app.plugins.isEnabled()&&app.plugins.manifests[pid]&&!app.plugins.loadingPluginId)await app.plugins.loadPlugin(pid);
+  async function launchInstalled(restarting=false){
+   if(restarting){
+    try{
+     const existing=await fetch(`http://127.0.0.1:${port}/json/list`,{signal:AbortSignal.timeout(1200)});
+     if(existing.ok)throw Error("Restart CDP port already occupied");
+    }catch(e){if(!/fetch failed|ECONNREFUSED|timed out|TimeoutError/u.test(String(e)))throw e;}
    }
-   return !!app.plugins.plugins[pid];
-  })()`);
-  assertTrue(loaded,"Production plugin did not load in synthetic Obsidian vault");
+   processHandle=spawn(exe,[`--user-data-dir=${profile}`,`--remote-debugging-port=${port}`],{detached:true,windowsHide:false,stdio:"ignore"});
+   processHandle.on("error",()=>{});
+   processHandle.unref();
+   const target=await waitApp();
+   ws=new WebSocket(target.webSocketDebuggerUrl);
+   await new Promise((resolve,reject)=>{ws.onopen=resolve;ws.onerror=()=>reject(Error("Isolated CDP attach failed"));});
+   ws.onmessage=({data})=>{
+    const msg=JSON.parse(String(data));
+    if(msg.method==="Runtime.exceptionThrown")sendErrors.push("Uncaught UI exception");
+    if(!msg.id)return;const waiter=requestMap.get(msg.id);if(!waiter)return;
+    requestMap.delete(msg.id);
+    if(msg.error)waiter.reject(Error(String(msg.error.message).slice(0,200)));else waiter.resolve(msg.result);
+   };
+   await send("Runtime.enable");await send("Page.enable");
+   const identity=await waitUntil(()=>evaluate(`(()=>{
+    if(typeof app==="undefined"||!app.vault?.adapter?.getBasePath)return null;
+    return {base:app.vault.adapter.getBasePath(),name:app.vault.getName()};
+   })()`),45000,"isolated Obsidian vault API");
+   assertTrue(identity.base.toLowerCase()===vault.toLowerCase()&&identity.name===path.basename(vault),
+    "Refusing live GitHub credentials: Obsidian vault is not the new synthetic vault");
+   const loaded=restarting
+    ? await waitUntil(()=>evaluate("(()=>{const p=app.plugins.plugins["+JSON.stringify(id)+"];return !!p?.settings&&!!p?.v4Runtime&&!!p?.ribbonIcon;})()"),65000,"persisted installed plugin after restart")
+    : await evaluate(`(async()=>{
+    const pid=${JSON.stringify(id)};
+    if(!app.plugins.isEnabled())await app.plugins.setEnable(true);
+    if(!app.plugins.enabledPlugins.has(pid))await app.plugins.enablePluginAndSave(pid);
+    await app.plugins.loadPlugin(pid);
+    const deadline=Date.now()+15000;
+    while(!app.plugins.plugins[pid]&&Date.now()<deadline){
+     await new Promise(r=>setTimeout(r,250));
+     if(app.plugins.isEnabled()&&app.plugins.manifests[pid]&&!app.plugins.loadingPluginId)await app.plugins.loadPlugin(pid);
+    }
+    return !!app.plugins.plugins[pid];
+   })()`);
+   assertTrue(loaded,"Production plugin did not load in synthetic Obsidian vault");
+  }
+  await launchInstalled();
   // Credential does not enter stdout, screenshot, console or a tracked file.
   // The vault/profile are securely disposed after the isolated process exits.
   const prepared={
@@ -359,39 +378,78 @@ try{
    await verifyNoop("warm-1000-notes");
    journeySteps.push("real Obsidian encrypted 1,000-note batch sync");
   }
-  if(native100mb){
-   const name="Assets/payload-100mb.bin";
-   const size=100_000_000;
+  if(nativeLargeBytes){
+   const size=nativeLargeBytes;
+   const name="Assets/payload-"+size+".bin";
    const before=finalSha;
    await evaluate("(async()=>{await app.vault.createFolder('Assets');return true;})()");
-   const full=path.join(vault,"Assets","payload-100mb.bin");
-   const block=Buffer.allocUnsafe(8*1024*1024);
-   for(let i=0;i<block.length;i++)block[i]=(i*31+17)&255;
+   const full=path.join(vault,...name.split("/"));
    const checksum=createHash("sha256");
    const handle=await open(full,"wx");
    let written=0;
    try{
     while(written<size){
-     const wanted=Math.min(block.length,size-written);
+     const wanted=Math.min(8*1024*1024,size-written);
+     const block=randomBytes(wanted);
      const next=await handle.write(block,0,wanted,written);
-     assertTrue(next.bytesWritten>0,"Native 100 MB fixture write did not advance");
+     assertTrue(next.bytesWritten>0,"Native binary fixture write did not advance");
      checksum.update(block.subarray(0,next.bytesWritten));
      written+=next.bytesWritten;
     }
    }finally{await handle.close();}
-   assertTrue((await stat(full)).size===size,"Native 100 MB fixture size changed");
-   const observed=await waitUntil(()=>evaluate("(()=>{const f=app.vault.getAbstractFileByPath('Assets/payload-100mb.bin');return f?.stat?.size===100000000?{size:f.stat.size}:null;})()"),60000,"real Obsidian indexed new 100 MB binary");
-   assertTrue(observed.size===size,"Native Obsidian did not index the synthetic 100 MB file");
-   const uploaded=await evaluate("(async()=>{const p=app.plugins.plugins["+JSON.stringify(id)+"];const started=performance.now();await p.v4Runtime.manualSync();const s=p.v4Runtime.progressSnapshot;return {lifecycle:s.lifecycle,trigger:s.trigger,wallMs:performance.now()-started,error:s.errorMessage?.slice(0,480),failurePhase:s.failurePhase,failurePath:s.failurePath,phase:s.phase,diagnostics:s.diagnostics};})()",480000);
+   assertTrue((await stat(full)).size===size,"Native binary fixture size changed");
+   const observed=await waitUntil(()=>evaluate("(()=>{const f=app.vault.getAbstractFileByPath("+JSON.stringify(name)+");return f?.stat?.size==="+size+"?{size:f.stat.size}:null;})()"),60000,"real Obsidian indexed new binary");
+   assertTrue(observed.size===size,"Native Obsidian did not index the synthetic binary file");
+   const uploaded=await evaluate("(async()=>{const p=app.plugins.plugins["+JSON.stringify(id)+"];const started=performance.now();await p.v4Runtime.manualSync();const s=p.v4Runtime.progressSnapshot;return {lifecycle:s.lifecycle,trigger:s.trigger,wallMs:performance.now()-started,error:s.errorMessage?.slice(0,480),failurePhase:s.failurePhase,failurePath:s.failurePath,phase:s.phase,diagnostics:s.diagnostics};})()",nativeLargeBytes>100_000_000?1200000:480000);
    nativeUploadWallMs=uploaded.wallMs;
-   assertTrue(uploaded.lifecycle==="success"&&uploaded.trigger==="manual","Native Obsidian 100 MB GitHub Push failed: "+redact(JSON.stringify(uploaded)));
+   assertTrue(uploaded.lifecycle==="success"&&uploaded.trigger==="manual","Native Obsidian binary GitHub Push failed: "+redact(JSON.stringify(uploaded)));
    const remote=await readState(configuration);
-   assertTrue(remote.kind==="present"&&remote.sha!==before,"Native Obsidian 100 MB upload did not publish a commit");
+   assertTrue(remote.kind==="present"&&remote.sha!==before,"Native Obsidian binary upload did not publish a commit");
    finalSha=remote.sha;
    nativeBinary={path:name,size,sha256:checksum.digest("hex")};
+   const diskHash=createHash("sha256");
+   for await(const chunk of createReadStream(full,{highWaterMark:8*1024*1024}))diskHash.update(chunk);
+   assertTrue(diskHash.digest("hex")===nativeBinary.sha256,"Source disk bytes changed after upload");
+   console.log(JSON.stringify({kind:"native-binary-upload",size,sha256:nativeBinary.sha256,wallMs:uploaded.wallMs,diagnostics:uploaded.diagnostics}));
    if(assertDiagnostics) await captureSyncedCenter({requireFileWork:true});
-   await verifyNoop("warm-100mb-vault");
-   journeySteps.push("real Obsidian indexed and uploaded exact 100 MB binary");
+   await verifyNoop("warm-native-binary-vault");
+   journeySteps.push("real Obsidian indexed and uploaded exact "+size+" byte binary");
+  }
+  const restartFiles=[];
+  if(restartJourney){
+   const before=finalSha;
+   const prior=await evaluate("(()=>{const p=app.plugins.plugins["+JSON.stringify(id)+"];return {device:p.settings.vault,active:p.isSyncInProgress,pending:p.v4Runtime.pendingCount};})()");
+   assertTrue(/^device-[a-f0-9]{32}$/u.test(prior.device)&&!prior.active&&prior.pending===0,"Restart requires idle isolated source");
+   assertTrue(requestMap.size===0,"Restart requires all CDP requests settled");
+   ws.close();ws=undefined;
+   const stopped=spawnSync("taskkill",["/PID",String(processHandle.pid),"/T","/F"],{timeout:15000,encoding:"utf8"});
+   assertTrue(stopped.status===0,"Could not stop owned source Obsidian process");
+   processHandle=undefined;
+   await sleep(1500);
+   port=firstPort+2;
+   await launchInstalled(true);
+   const persisted=await evaluate(`(()=>{const p=app.plugins.plugins[${JSON.stringify(id)}];const d=${JSON.stringify(prepared)};return {device:p.settings.vault,credentials:p.settings.githubOwner===d.owner&&p.settings.githubRepo===d.repo&&p.settings.githubBranch===d.branch&&p.settings.githubToken===d.token&&p.settings.encryptionPassphrase===d.passphrase,mode:p.settings.encryptionMode,enabled:p.settings.syncEnabled};})()`);
+   assertTrue(persisted.device===prior.device&&persisted.credentials&&persisted.mode===mode&&persisted.enabled,"Persisted identity or credentials differ after restart");
+   await verifyNoop("after-actual-process-restart");
+   assertTrue((await readState(configuration)).sha===before,"Restart no-op changed HEAD");
+   if(nativeBinary){
+    const full=path.join(vault,...nativeBinary.path.split("/"));
+    assertTrue((await stat(full)).size===nativeBinary.size,"Restart changed attachment size");
+    const digest=createHash("sha256");
+    for await(const chunk of createReadStream(full,{highWaterMark:8*1024*1024}))digest.update(chunk);
+    assertTrue(digest.digest("hex")===nativeBinary.sha256,"Restart changed attachment content");
+   }
+   const item={path:"After-restart.md",content:"# Native restart\n\nCreated after reopening without re-entering credentials.\n"};
+   const outcome=await evaluate("(async()=>{const p=app.plugins.plugins["+JSON.stringify(id)+"];await app.vault.create("+JSON.stringify(item.path)+","+JSON.stringify(item.content)+");const outcome=await p.v4Runtime.manualSync();const s=p.v4Runtime.progressSnapshot;return {status:outcome?.status,lifecycle:s.lifecycle,changedFiles:outcome?.changedFiles,error:s.errorMessage?.slice(0,240),apiFailures:s.diagnostics?.apiFailures};})()",240000);
+   assertTrue(outcome.status==="completed"&&outcome.lifecycle==="success"&&outcome.changedFiles>0,"Post-restart native Sync failed: "+redact(JSON.stringify(outcome)));
+   const after=await readState(configuration);
+   assertTrue(after.kind==="present"&&after.sha!==before,"Post-restart edit did not publish");
+   finalSha=after.sha;
+   restartFiles.push(item);
+   restartEvidence={forcedOwnedProcessRestart:true,persistedCredentials:true,deviceIdUnchanged:true,noOpHeadUnchanged:true,attachmentPreserved:nativeBinary?true:null,postRestartEditPublished:true};
+   journeySteps.push("actual source process restart, persisted credentials and new note published");
+   await verifyNoop("after-restart-edit");
+   console.log(JSON.stringify({kind:"native-restart",...restartEvidence}));
   }
   if(verifyPeer){
    const reconcileSourceConflict=async()=>{
@@ -417,9 +475,9 @@ try{
     }
    };
    const restored=await restoreEncryptedToSecondObsidian({
-    exe,runRoot,port:port+1,pluginId:id,sourceRoot:root,configuration,passphrase,
+    exe,runRoot,port:firstPort+1,pluginId:id,sourceRoot:root,configuration,passphrase,
     expectedContent:"# Synthetic remote UI E2E\n\nSecond revision from Obsidian.\n",
-    expectedFiles:journey?expectedPeerFiles:[],absentPaths:journey?["Notes/สวัสดี 🌏.md"]:[],exercisePeerConflict:journey,expectedBinary:nativeBinary,convergeAfterPeerEdit:autoJourney?reconcileSourceConflict:null,
+    expectedFiles:[...(journey?expectedPeerFiles:[]),...restartFiles],absentPaths:journey?["Notes/สวัสดี 🌏.md"]:[],exercisePeerConflict:journey,expectedBinary:nativeBinary,convergeAfterPeerEdit:autoJourney?reconcileSourceConflict:null,
    });
    assertTrue(restored.peerRestored&&restored.bytesRestored>0,"Second real Obsidian vault could not decrypt remote data");
    nativeDownloadWallMs=restored.peerPullWallMs??null;
@@ -427,7 +485,7 @@ try{
     const d=restored.peerDiagnostics;
     assertTrue(d?.apiRequests>0&&d?.downloadBytes>0&&d?.decryptionMs>0&&d?.peakRendererRssBytes>0,
      "Second native Obsidian did not measure GitHub download/decryption/RAM");
-    if(native100mb)assertTrue(d.downloadBytes>=100_000_000,"Second native Obsidian did not download 100 MB through measured API requests");
+    if(nativeLargeBytes)assertTrue(d.downloadBytes>=nativeLargeBytes,"Second native Obsidian did not download the full binary through measured API requests");
     peerDiagnosticEvidence=d;
    }
    const afterPull=await readState(configuration);
@@ -473,5 +531,5 @@ try{
   try{await cleanupGeneratedUiEvidence(runRoot,{repoRoot:root});}catch(error){console.error("WARNING: synthetic UI evidence cleanup incomplete ("+String(error?.code||"unknown").slice(0,30)+")");process.exitCode=1;}
  }
  console.log(JSON.stringify({status:passed&&!process.exitCode?"PASS":"FAIL",cleanup:cleanupState,remoteHeadChanged:Boolean(initialSha&&finalSha&&initialSha!==finalSha),
-  screenshotCaptured:screenBytes>1000,screenshotPath:null,uiExceptions:sendErrors.length,mode,remoteEncryptionVerified,peerRestored,peerScreenshot:null,journeySteps,autoSyncEvidence,peerConvergenceEvidence,noOpEvidence,bulkEvidence,diagnostics:diagnosticEvidence,peerDiagnostics:peerDiagnosticEvidence,nativeUploadWallMs,nativeDownloadWallMs,native100mbBytes:nativeBinary?.size??0,native100mbSha256:nativeBinary?.sha256??null,runBranch:branch,repository:configuration?.targetRepository,token:"[not reported]"}));
+  screenshotCaptured:screenBytes>1000,screenshotPath:null,uiExceptions:sendErrors.length,mode,remoteEncryptionVerified,peerRestored,peerScreenshot:null,journeySteps,autoSyncEvidence,peerConvergenceEvidence,restartEvidence,noOpEvidence,bulkEvidence,diagnostics:diagnosticEvidence,peerDiagnostics:peerDiagnosticEvidence,nativeUploadWallMs,nativeDownloadWallMs,nativeBinaryBytes:nativeBinary?.size??0,nativeBinarySha256:nativeBinary?.sha256??null,native100mbBytes:native100mb?nativeBinary?.size??0:0,native100mbSha256:native100mb?nativeBinary?.sha256??null:null,runBranch:branch,repository:configuration?.targetRepository,token:"[not reported]"}));
 }

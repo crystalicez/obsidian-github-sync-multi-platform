@@ -136,7 +136,7 @@ export async function restoreEncryptedToSecondObsidian({
    const content=await app.vault.read(file);
    await app.workspace.getLeaf("tab").openFile(file);
    return {status:s.lifecycle,filename:file.path,content,diagnostics:s.diagnostics,peerPullWallMs};
-  })()`,expectedFiles.length>=1000?900000:300000);
+  })()`,expectedBinary?.size>100_000_000?1200000:expectedFiles.length>=1000?900000:300000);
   assertSecondVaultRestore(restored,expectedContent);
   const verifiedFiles=await evaluate(`(async()=>{
    const expected=${JSON.stringify(expectedFiles)};
@@ -156,15 +156,15 @@ export async function restoreEncryptedToSecondObsidian({
   })()`);
   assert.equal(verifiedFiles.length,expectedFiles.length,"Second Obsidian journey file count");
   if(expectedBinary){
-   assert.equal(expectedBinary.size,100_000_000,"Native binary fixture must be exactly 100 MB");
+   assert.ok(Number.isSafeInteger(expectedBinary.size)&&expectedBinary.size>0&&expectedBinary.size<=500*1024*1024,"Native binary fixture must not exceed 500 MiB");
    assert.ok(/^Assets\/[A-Za-z0-9-]+\.bin$/u.test(expectedBinary.path),"Expected native binary must stay inside test Assets");
    const indexed=await evaluate("(()=>{const f=app.vault.getAbstractFileByPath("+JSON.stringify(expectedBinary.path)+");return {size:f?.stat?.size??null};})()");
-   assert.equal(indexed.size,expectedBinary.size,"Second Obsidian did not index restored 100 MB file");
+   assert.equal(indexed.size,expectedBinary.size,"Second Obsidian did not index restored binary file");
    const full=path.join(vault,...expectedBinary.path.split("/"));
    assert.equal((await stat(full)).size,expectedBinary.size);
    const digest=createHash("sha256");
    for await(const chunk of createReadStream(full,{highWaterMark:8*1024*1024}))digest.update(chunk);
-   assert.equal(digest.digest("hex"),expectedBinary.sha256,"Native Obsidian peer 100 MB bytes changed after GitHub Force Pull");
+   assert.equal(digest.digest("hex"),expectedBinary.sha256,"Native Obsidian peer binary bytes changed after GitHub Force Pull");
   }
   await pause(500);
   const visible=await evaluate(`(()=>({shown:document.body.innerText.includes("Second revision from Obsidian."),settingsVisible:!!document.querySelector(".vertical-tab-header")}))()`);
