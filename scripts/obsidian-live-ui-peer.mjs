@@ -27,12 +27,13 @@ export const nativeVaultInventoryExpression = `(async()=>{
  return result.sort((a,b)=>a.path<b.path?-1:a.path>b.path?1:0);
 })()`;
 export async function restoreEncryptedToSecondObsidian({
- exe,runRoot,port,pluginId,sourceRoot,configuration,passphrase,expectedContent,
+ exe,runRoot,port,pluginId,sourceRoot,configuration,passphrase,expectedContent,mode="encrypted",
  expectedFiles=[],absentPaths=[],exercisePeerConflict=false,expectedBinary=null,convergeAfterPeerEdit=null,peerBinaryJourneys=[],beforePeerBinary=null,afterPeerBinary=null,
 }){
  assert.ok(Number.isInteger(port)&&port>=1024&&port<=65535,"Second CDP port is unsafe");
  assert.ok(path.basename(runRoot).match(/^[0-9a-f]{16}$/u),"Second vault requires a synthetic random run ID");
- assert.ok(typeof passphrase==="string"&&passphrase.length>=32,"Second vault requires a strong ephemeral test passphrase");
+ assert.ok(mode==="encrypted"||mode==="plaintext","Invalid peer mode");
+ assert.ok(typeof passphrase==="string"&&(mode==="encrypted"?passphrase.length>=32:passphrase===""),"Peer passphrase must match test mode");
  const vault=path.join(runRoot,"peer-vault");
  const profile=path.join(runRoot,"peer-profile");
  let child,ws,serial=0;
@@ -110,7 +111,7 @@ export async function restoreEncryptedToSecondObsidian({
   })()`);
   assert.ok(loaded,"Second Obsidian did not load the production plugin");
   const configForPeer={owner:configuration.owner,repo:configuration.repo,
-   branch:configuration.branch,token:configuration.token,passphrase};
+   branch:configuration.branch,token:configuration.token,passphrase,mode};
   const restored=await evaluate(`(async()=>{
    const pid=${JSON.stringify(pluginId)};
    const p=app.plugins.plugins[pid];
@@ -121,11 +122,12 @@ export async function restoreEncryptedToSecondObsidian({
     throw Error("Second vault unexpectedly contained the sample note before restore");
    const nextSettings = {...p.settings,
     githubOwner:data.owner,githubRepo:data.repo,githubBranch:data.branch,githubToken:data.token,
-    encryptionMode:"encrypted",encryptionPassphrase:data.passphrase,
+    encryptionMode:data.mode,encryptionPassphrase:data.passphrase,
     syncEnabled:true,syncOnStartup:false,syncOnLocalChange:false,scheduledSyncEnabled:false,
     syncObsidianConfig:false,syncBookmarks:false,syncPlugins:false,
    };
    await p.saveSettings(nextSettings);
+   if(p.settings.encryptionMode!==data.mode||!!p.settings.encryptionPassphrase!==(data.mode==="encrypted"))throw Error("Peer saved encryption mode mismatch");
    const started=performance.now();
    try{
     await p.v4Runtime.forcePull(false);

@@ -27,7 +27,7 @@ const mode=parseLiveUiMode(option("mode",undefined));
 const verifyPeer=opts.includes("--verify-peer");
 const journey=opts.includes("--journey");
 const autoJourney=opts.includes("--auto-journey");
-assert.ok(!autoJourney||(journey&&verifyPeer&&mode==="encrypted"),"Auto journey requires encrypted peer journey");
+assert.ok(!autoJourney||(journey&&verifyPeer),"Auto journey requires peer journey");
 const native100mb=opts.includes("--native-100mb");
 const fileMiB=option("native-file-mib",undefined);
 assert.ok(!native100mb||fileMiB===undefined,"Choose exactly one binary fixture size");
@@ -42,7 +42,7 @@ assert.ok(!nativeThousandNotes||(mode==="encrypted"&&verifyPeer),"Native 1,000-n
 const assertDiagnostics=opts.includes("--assert-diagnostics");
 assert.ok(!autoJourney||(!nativeLargeBytes&&!nativeThousandNotes),"Auto journey is a bounded small-Vault acceptance test");
 assert.ok(!nativeLargeBytes||(mode==="encrypted"&&verifyPeer),"Native binary test requires encrypted mode and a second real Obsidian vault");
-assert.ok(!verifyPeer||mode==="encrypted","A second-vault restore requires --mode=encrypted");
+// Both encrypted and plaintext use the independently verified second Vault.
 const passphrase=mode==="encrypted"?randomBytes(32).toString("base64url"):"";
 const id="encrypted-github-sync-multi-platform";
 const runId=randomBytes(8).toString("hex");
@@ -514,15 +514,15 @@ try{
     }
    };
    const restored=await restoreEncryptedToSecondObsidian({
-    exe,runRoot,port:firstPort+1,pluginId:id,sourceRoot:root,configuration,passphrase,
+    exe,runRoot,port:firstPort+1,pluginId:id,sourceRoot:root,configuration,passphrase,mode,
     expectedContent:"# Synthetic remote UI E2E\n\nSecond revision from Obsidian.\n",
     expectedFiles:selectNativePeerFiles({journey,journeyFiles:expectedPeerFiles,bulkFiles,restartFiles}),absentPaths:journey?["Notes/สวัสดี 🌏.md"]:[],exercisePeerConflict:journey,expectedBinary:nativeBinary,convergeAfterPeerEdit:autoJourney?reconcileSourceConflict:null,
    });
-   assertTrue(restored.peerRestored&&restored.bytesRestored>0,"Second real Obsidian vault could not decrypt remote data");
+   assertTrue(restored.peerRestored&&restored.bytesRestored>0,"Second real Obsidian vault could not restore remote data");
    nativeDownloadWallMs=restored.peerPullWallMs??null;
    if(assertDiagnostics){
     const d=restored.peerDiagnostics;
-    assertTrue(d?.apiRequests>0&&d?.downloadBytes>0&&d?.decryptionMs>0&&d?.peakRendererRssBytes>0,
+    assertTrue(d?.apiRequests>0&&d?.downloadBytes>0&&(mode==="plaintext"||d?.decryptionMs>0)&&d?.peakRendererRssBytes>0,
      "Second native Obsidian did not measure GitHub download/decryption/RAM");
     if(nativeLargeBytes)assertTrue(d.downloadBytes>=nativeLargeBytes,"Second native Obsidian did not download the full binary through measured API requests");
     peerDiagnosticEvidence=d;
