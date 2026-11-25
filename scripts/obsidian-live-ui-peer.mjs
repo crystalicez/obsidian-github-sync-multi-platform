@@ -5,6 +5,7 @@ import {spawn,spawnSync} from "node:child_process";
 import {createHash,randomBytes} from "node:crypto";
 import {createReadStream} from "node:fs";
 import {copyFile,mkdir,stat,writeFile} from "node:fs/promises";
+import {verifyNativeBulkDisk} from "./obsidian-live-ui-mode.mjs";
 import {verifyPngBytes} from "./ui-visual-assertions.mjs";
 import path from "node:path";
 
@@ -153,8 +154,9 @@ export async function restoreEncryptedToSecondObsidian({
     if(app.vault.getAbstractFileByPath(path))throw Error("Peer retains a deleted/renamed original");
    }
    return files;
-  })()`);
+  })()`,expectedFiles.length>=1000?240000:25000);
   assert.equal(verifiedFiles.length,expectedFiles.length,"Second Obsidian journey file count");
+  await verifyNativeBulkDisk(vault,expectedFiles);
   if(expectedBinary){
    assert.ok(Number.isSafeInteger(expectedBinary.size)&&expectedBinary.size>0&&expectedBinary.size<=500*1024*1024,"Native binary fixture must not exceed 500 MiB");
    assert.ok(/^Assets\/[A-Za-z0-9-]+\.bin$/u.test(expectedBinary.path),"Expected native binary must stay inside test Assets");

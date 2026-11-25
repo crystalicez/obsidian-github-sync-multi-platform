@@ -1,4 +1,31 @@
 import assert from "node:assert/strict";
+import {readFile,readdir} from "node:fs/promises";
+import path from "node:path";
+
+// One canonical fixture list is used for both creation and independent peer verification.
+export function createNativeBulkNotes() {
+ return Array.from({length:1000},(_,i)=>({
+  path:"Bulk/note-"+String(i).padStart(4,"0")+".md",
+  content:"# Bulk "+i+"\n\n"+"x".repeat(480)+"\n",
+ }));
+}
+
+export function selectNativePeerFiles({journey,journeyFiles,bulkFiles,restartFiles}) {
+ return [...(journey?journeyFiles:[]),...bulkFiles,...restartFiles];
+}
+
+export async function verifyNativeBulkDisk(vault,expectedFiles) {
+ const bulkFiles=expectedFiles.filter(item=>item.path.startsWith("Bulk/"));
+ if(!bulkFiles.length)return;
+ for(const item of bulkFiles)assert.match(item.path,/^Bulk\/note-[0-9]{4}\.md$/u,"Unexpected synthetic bulk path");
+ const directory=path.join(vault,"Bulk");
+ const diskNames=await readdir(directory);
+ assert.deepEqual(diskNames.sort(),bulkFiles.map(item=>item.path.slice(5)).sort(),"Second Obsidian bulk disk inventory differs");
+ for(const item of bulkFiles){
+  const actual=await readFile(path.join(directory,item.path.slice(5)));
+  assert.deepEqual(actual,Buffer.from(item.content,"utf8"),"Second Obsidian bulk disk bytes differ: "+item.path);
+ }
+}
 
 export function parseLiveUiMode(value) {
  const mode=value===undefined?"plaintext":value;

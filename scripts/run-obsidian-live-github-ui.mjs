@@ -13,7 +13,7 @@ import {loadGitHubE2EEnv,qualificationE2EBranch,resolvePinnedGitHubE2ERepoId,val
 import {preflightE2ERemote,readE2EBranch,cleanupE2EBranch} from "./github-e2e-remote.mjs";
 import {CANONICAL_REPOSITORY_ID,readOriginFetchRepository} from "./github-repo.mjs";
 import {verifyPngBytes,visibleIntersection} from "./ui-visual-assertions.mjs";
-import {parseLiveUiMode,assertEncryptedRemoteTree} from "./obsidian-live-ui-mode.mjs";
+import {parseLiveUiMode,assertEncryptedRemoteTree,createNativeBulkNotes,selectNativePeerFiles} from "./obsidian-live-ui-mode.mjs";
 import {cleanupGeneratedUiRun,cleanupGeneratedUiEvidence} from "./obsidian-live-ui-cleanup.mjs";
 import {restoreEncryptedToSecondObsidian,nativeVaultInventoryExpression} from "./obsidian-live-ui-peer.mjs";
 import {createIsolatedGitHubTunnel} from "./obsidian-live-network-probe.mjs";
@@ -316,6 +316,7 @@ try{
    noOpEvidence.push({label,...result});
   };
   await verifyNoop("warm-small-vault");
+  const bulkFiles=nativeThousandNotes?createNativeBulkNotes():[];
   const expectedPeerFiles=[
    {path:"Notes/renamed-สวัสดี 🌏.md",content:"# Native combined test\n\nEdited after rename.\n"},
    {path:"Scratch.md",content:"Recreated after deletion.\n"},
@@ -366,8 +367,8 @@ try{
    await verifyNoop("after-native-auto-sync");
   }
   if(nativeThousandNotes){
-   const filler="x".repeat(480);
-   const expression="(async()=>{await app.vault.createFolder('Bulk');const text="+JSON.stringify(filler)+";for(let i=0;i<1000;i++){const path='Bulk/note-'+String(i).padStart(4,'0')+'.md';await app.vault.create(path,'# Bulk '+i+'\\n\\n'+text+'\\n')}return app.vault.getFiles().filter(f=>f.path.startsWith('Bulk/')).length})()";
+   // The same fixture list is independently verified in the peer Vault.
+   const expression="(async()=>{await app.vault.createFolder('Bulk');const files="+JSON.stringify(bulkFiles)+";for(const item of files)await app.vault.create(item.path,item.content);return app.vault.getFiles().filter(f=>f.path.startsWith('Bulk/')).length})()";
    const started=performance.now();
    const created=await evaluate(expression,480000);
    assertTrue(created===1000,"Real Obsidian did not index 1,000 notes");
@@ -382,7 +383,7 @@ try{
    const tree=await githubReadJson("git/trees/"+commit.tree.sha+"?recursive=1");
    assertTrue(tree.truncated===false&&!tree.tree.some(item=>item.path.startsWith("Bulk/")),
     "Encrypted GitHub tree leaks logical 1,000-note paths");
-   for(let i=0;i<1000;i++)expectedPeerFiles.push({path:"Bulk/note-"+String(i).padStart(4,"0")+".md",content:"# Bulk "+i+"\n\n"+filler+"\n"});
+   // Bulk fixtures are passed to the peer even without --journey.
    bulkEvidence={count:1000,createdWallMs,...output};
    await verifyNoop("warm-1000-notes");
    journeySteps.push("real Obsidian encrypted 1,000-note batch sync");
@@ -515,7 +516,7 @@ try{
    const restored=await restoreEncryptedToSecondObsidian({
     exe,runRoot,port:firstPort+1,pluginId:id,sourceRoot:root,configuration,passphrase,
     expectedContent:"# Synthetic remote UI E2E\n\nSecond revision from Obsidian.\n",
-    expectedFiles:[...(journey?expectedPeerFiles:[]),...restartFiles],absentPaths:journey?["Notes/สวัสดี 🌏.md"]:[],exercisePeerConflict:journey,expectedBinary:nativeBinary,convergeAfterPeerEdit:autoJourney?reconcileSourceConflict:null,
+    expectedFiles:selectNativePeerFiles({journey,journeyFiles:expectedPeerFiles,bulkFiles,restartFiles}),absentPaths:journey?["Notes/สวัสดี 🌏.md"]:[],exercisePeerConflict:journey,expectedBinary:nativeBinary,convergeAfterPeerEdit:autoJourney?reconcileSourceConflict:null,
    });
    assertTrue(restored.peerRestored&&restored.bytesRestored>0,"Second real Obsidian vault could not decrypt remote data");
    nativeDownloadWallMs=restored.peerPullWallMs??null;
