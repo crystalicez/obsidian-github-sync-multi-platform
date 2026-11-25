@@ -55,7 +55,7 @@ import { V4CancelledError, throwIfV4Aborted } from "./cancellation"
 import { V4PublicationRaceError, isV4PublicationRaceError } from "./publication-race"
 import { assertV4SpeculativeConfigStillAbsent, guardV4SpeculativeConfigGithub } from "./speculative-config-guard"
 
-import { installedSecretReceiptRoot } from "./reencryption-installed-secret"
+import { discoverV4InstalledSecretIdentity, installedSecretReceiptRoot } from "./reencryption-installed-secret"
 import { V4_RUNTIME_INDEX_ROOT } from "./reencryption-index-root"
 import { inspectV4ReencryptionColdStartIndexRoute, type V4ReencryptionColdStartRouteReport } from "./reencryption-runtime-index-route"
 import { decodeV4ReencryptionCutoverCandidateManifest } from "./reencryption-cutover-candidate-manifest"
@@ -1863,6 +1863,69 @@ export class V4PluginRuntime {
     readonly signal?: AbortSignal | undefined
   }): Promise<V4InstalledPreCutoverRecoveryReport> {
     return this.recoverInstalledPreCutover(input, false)
+  }
+
+  /** Discover only nonsecret routing hints from disk. The existing owner-bound
+   * recovery scope must authenticate the encrypted receipt before returning
+   * verified results or repairing a missing secret. No caller-supplied refs. */
+  private async discoverInstalledStagedRecovery() {
+    this.assertNotDisposed()
+    const settings = this.plugin.settings
+    const adapter = this.adapter
+    const sourceRepoId = `${settings.githubOwner}/${settings.githubRepo}#${settings.githubBranch}`
+    const deviceId = settings.vault
+    const credentialGeneration = this.credentialGeneration
+    const settingsSaveGeneration = this.plugin.settingsSaveGeneration
+    const identity = await discoverV4InstalledSecretIdentity({ adapter, sourceRepoId, deviceId })
+    const locatorDigest = await sha256Hex(utf8ToBytes(JSON.stringify(identity)))
+    this.assertNotDisposed()
+    if (this.adapter !== adapter || this.plugin.settings !== settings
+      || this.credentialGeneration !== credentialGeneration || this.plugin.settingsSaveGeneration !== settingsSaveGeneration
+      || `${settings.githubOwner}/${settings.githubRepo}#${settings.githubBranch}` !== sourceRepoId || settings.vault !== deviceId) {
+      throw Error("Installed migration owner changed during discovery.")
+    }
+    const prefix = sourceRepoId.slice(0, sourceRepoId.indexOf("#") + 1)
+    return {
+      locatorDigest,
+      input: {
+        runId: identity.runId,
+        backupBranch: identity.backupRepoId.slice(prefix.length),
+        destinationBranch: identity.destinationRepoId.slice(prefix.length),
+        pinnedSourceCommitSha: identity.pinnedSourceCommitSha,
+        sourceTreeSha: identity.sourceTreeSha,
+        destinationCommitSha: identity.destinationCommitSha,
+        destinationTreeSha: identity.destinationTreeSha,
+        expectedFinalWalGeneration: identity.finalWalGeneration,
+        expectedFileCount: identity.verifiedFileCount,
+        expectedPlaintextBytes: identity.verifiedPlaintextBytes,
+        expectedPhysicalRepositoryId: identity.physicalRepositoryId,
+        defaultBranch: identity.defaultBranch,
+        verifyShadowIndex: true,
+        recoverStagedSecret: true,
+      },
+    }
+  }
+
+  async inspectInstalledStagedRecoveryFromDisk(createGitHubClient?: (branch: string) => GitHubClient): Promise<{
+    locatorDigest: string; report: V4InstalledPreCutoverRecoveryReport
+  } | null> {
+    try {
+      const discovered = await this.discoverInstalledStagedRecovery()
+      const report = await this.inspectFencedReencryptionPreCutoverRecovery({ ...discovered.input, createGitHubClient })
+      return { locatorDigest: discovered.locatorDigest, report }
+    } catch { return null }
+  }
+
+  async restoreInstalledStagedSecretFromDisk(input: {
+    readonly expectedLocatorDigest: string; readonly newPassphrase: string
+    readonly createGitHubClient?: ((branch: string) => GitHubClient) | undefined
+  }): Promise<V4InstalledPreCutoverRecoveryReport | null> {
+    try {
+      if (!/^[a-f0-9]{64}$/u.test(input.expectedLocatorDigest) || !input.newPassphrase) return null
+      const discovered = await this.discoverInstalledStagedRecovery()
+      if (discovered.locatorDigest !== input.expectedLocatorDigest) return null
+      return await this.restoreFencedReencryptionStagedSecret({ ...discovered.input, newPassphrase: input.newPassphrase, createGitHubClient: input.createGitHubClient })
+    } catch { return null }
   }
 
   /** Explicit, fenced repair of a missing staged Destination secret. No Cutover. */

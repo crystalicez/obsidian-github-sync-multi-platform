@@ -533,14 +533,33 @@ test("D412 installed Runtime orchestrates Source -> Backup -> Staging -> Scratch
     // D515: real Obsidian may lose a just-staged secret across forced exit.
     // Inspection stays read-only; only explicit re-entry may repair absence.
     vault.secrets.delete(stagedId)
-    const missing = await runtime2.runtime.inspectFencedReencryptionPreCutoverRecovery(recoveryInput)
-    assert.equal(missing.observation, "manual-recovery-required")
-    assert.equal(missing.stagedSecretMissing, true)
+    const missing = await runtime2.runtime.inspectInstalledStagedRecoveryFromDisk(makeClientFactory())
+    assert.equal(missing?.report.observation, "manual-recovery-required")
+    assert.equal(missing?.report.stagedSecretMissing, true)
+    assert.ok(missing?.locatorDigest)
     assert.equal(vault.secrets.has(stagedId), false)
-    const wrongRepair = await runtime2.runtime.restoreFencedReencryptionStagedSecret({ ...recoveryInput, newPassphrase: "wrong-key" })
-    assert.equal(wrongRepair.observation, "manual-recovery-required")
+    const restoreInput = { expectedLocatorDigest: missing.locatorDigest, createGitHubClient: makeClientFactory() }
+    const wrongRepair = await runtime2.runtime.restoreInstalledStagedSecretFromDisk({ ...restoreInput, newPassphrase: "wrong-key" })
+    assert.equal(wrongRepair?.observation, "manual-recovery-required")
     assert.equal(vault.secrets.has(stagedId), false)
-    const restored = await runtime2.runtime.restoreFencedReencryptionStagedSecret({ ...recoveryInput, newPassphrase: NEW_PASSPHRASE })
+    const locatorPath = `${CONFIG_DIR}/plugins/${PLUGIN_ID}/${V4_RUNTIME_INDEX_ROOT}-rekey-secret-${runId}/locator.json`
+    const locator = await vault.adapter.read(locatorPath)
+    assert.ok(!locator.includes(NEW_PASSPHRASE) && !locator.includes(OLD_PASSPHRASE))
+    const foreign = JSON.parse(locator)
+    foreign.identity.backupRepoId = "foreign/repo#backup"
+    await vault.adapter.write(locatorPath, JSON.stringify(foreign))
+    let foreignCalls = 0
+    assert.equal(await runtime2.runtime.inspectInstalledStagedRecoveryFromDisk(() => { foreignCalls++; throw Error("Foreign locator must not reach GitHub") }), null)
+    assert.equal(foreignCalls, 0)
+    assert.equal(vault.secrets.has(stagedId), false)
+    const tamperedLocator = JSON.parse(locator)
+    tamperedLocator.identity.verifiedFileCount += 1
+    await vault.adapter.write(locatorPath, JSON.stringify(tamperedLocator))
+    assert.equal(await runtime2.runtime.restoreInstalledStagedSecretFromDisk({ ...restoreInput, newPassphrase: NEW_PASSPHRASE }), null)
+    assert.equal(vault.secrets.has(stagedId), false)
+    await vault.adapter.write(locatorPath, locator)
+    const restored = await runtime2.runtime.restoreInstalledStagedSecretFromDisk({ ...restoreInput, newPassphrase: NEW_PASSPHRASE })
+    assert.ok(restored)
     assert.equal(restored.observation, "authenticated-pre-cutover-destination-still-fenced")
     assert.equal(restored.integrityScope, "installed-pre-cutover-staged-secret-recovery")
     assert.equal(restored.stagedSecretRestored, true)

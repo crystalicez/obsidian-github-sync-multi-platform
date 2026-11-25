@@ -3,6 +3,7 @@ import { decryptV4Payload, encryptV4Payload } from "./crypto"
 import { fitsV4LocalJsonSizeLimit, type V4LocalIndexAdapter } from "./local-index"
 import type { SecretStorageLike } from "./secrets"
 import { V4_RUNTIME_INDEX_ROOT } from "./reencryption-index-root"
+import { V4_REENCRYPTION_SYNC_FENCE_ROOT } from "./reencryption-sync-fence"
 
 export interface V4InstalledSecretIdentity {
   readonly runId: string
@@ -40,6 +41,75 @@ export function installedSecretReceiptRoot(runId: string): string {
   if (!/^[A-Za-z0-9_-]{8,128}$/u.test(runId)) throw Error("Invalid installed SecretStorage run.")
   return V4_RUNTIME_INDEX_ROOT + "-rekey-secret-" + runId
 }
+const IDENTITY_KEYS = [
+  "runId", "deviceId", "sourceRepoId", "backupRepoId", "destinationRepoId",
+  "pinnedSourceCommitSha", "sourceTreeSha", "destinationCommitSha", "destinationTreeSha",
+  "finalWalGeneration", "verifiedFileCount", "verifiedPlaintextBytes", "physicalRepositoryId", "defaultBranch",
+] as const
+const SHA = /^[a-f0-9]{40}$/u
+function safeBranch(branch: string): boolean {
+  return branch.length > 0 && branch.length <= 512 && /^[A-Za-z0-9_./-]+$/u.test(branch)
+    && !branch.includes("..") && branch.split("/").every(part => !!part && !part.startsWith(".") && !part.endsWith(".lock"))
+    && !branch.endsWith(".")
+}
+function validIdentity(value: unknown): value is V4InstalledSecretIdentity {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false
+  const i = value as Partial<V4InstalledSecretIdentity>
+  if (Object.keys(i).length !== IDENTITY_KEYS.length || !IDENTITY_KEYS.every(key => Object.hasOwn(i, key))) return false
+  if (typeof i.runId !== "string" || !/^[A-Za-z0-9_-]{8,128}$/u.test(i.runId)
+    || typeof i.deviceId !== "string" || i.deviceId.length < 1 || i.deviceId.length > 256
+    || typeof i.sourceRepoId !== "string" || typeof i.backupRepoId !== "string" || typeof i.destinationRepoId !== "string"
+    || typeof i.defaultBranch !== "string" || !safeBranch(i.defaultBranch)) return false
+  const source = i.sourceRepoId.split("#")
+  if (source.length !== 2 || !source[0] || !source[1] || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u.test(source[0])) return false
+  const prefix = source[0] + "#"
+  const branches = [i.sourceRepoId, i.backupRepoId, i.destinationRepoId]
+  if (new Set(branches).size !== 3 || branches.some(ref => !ref.startsWith(prefix) || !safeBranch(ref.slice(prefix.length)))
+    || i.backupRepoId === prefix + i.defaultBranch || i.destinationRepoId === prefix + i.defaultBranch) return false
+  if (![i.pinnedSourceCommitSha, i.sourceTreeSha, i.destinationCommitSha, i.destinationTreeSha].every(v => typeof v === "string" && SHA.test(v))
+    || i.pinnedSourceCommitSha === i.destinationCommitSha) return false
+  return Number.isSafeInteger(i.finalWalGeneration) && (i.finalWalGeneration ?? 0) > 0
+    && Number.isSafeInteger(i.verifiedFileCount) && (i.verifiedFileCount ?? -1) >= 0
+    && typeof i.verifiedPlaintextBytes === "string" && /^(0|[1-9][0-9]{0,29})$/u.test(i.verifiedPlaintextBytes)
+    && Number.isSafeInteger(i.physicalRepositoryId) && (i.physicalRepositoryId ?? 0) > 0
+}
+async function readBoundedText(adapter: V4LocalIndexAdapter, path: string): Promise<string> {
+  const stat = await adapter.stat?.(path)
+  if (stat && (!Number.isSafeInteger(stat.size) || stat.size < 1 || stat.size > MAX)) throw Error("Invalid installed recovery metadata size.")
+  const text = await adapter.read(path)
+  if (!fitsV4LocalJsonSizeLimit(text, MAX)) throw Error("Invalid installed recovery metadata size.")
+  return text
+}
+function locatorBody(identity: V4InstalledSecretIdentity): string {
+  if (!validIdentity(identity)) throw Error("Invalid installed migration identity.")
+  // Only non-secret Git/run metadata; the encrypted receipt is authoritative.
+  return JSON.stringify({ schemaVersion: 1, identity })
+}
+
+/** Untrusted locator, scoped to the active local fence and current Source.
+ * Never treat this as authentication or permission for any write. */
+export async function discoverV4InstalledSecretIdentity(input: {
+  adapter: V4LocalIndexAdapter; sourceRepoId: string; deviceId: string
+}): Promise<V4InstalledSecretIdentity> {
+  const { adapter, sourceRepoId, deviceId } = input
+  const fencePath = V4_REENCRYPTION_SYNC_FENCE_ROOT + "/active.json"
+  const fenceText = await readBoundedText(adapter, fencePath)
+  const fence = JSON.parse(fenceText) as { runId?: unknown; destinationRepoId?: unknown }
+  if (typeof fence.runId !== "string" || typeof fence.destinationRepoId !== "string") throw Error("Invalid installed migration fence.")
+  const expectedFence = JSON.stringify({ schemaVersion: 1, phase: "migration-fenced-uncommitted", runId: fence.runId,
+    sourceRepoId, destinationRepoId: fence.destinationRepoId })
+  if (fenceText !== expectedFence) throw Error("Foreign installed migration fence.")
+  const path = installedSecretReceiptRoot(fence.runId) + "/locator.json"
+  const text = await readBoundedText(adapter, path)
+  const parsed = JSON.parse(text) as { identity?: unknown }
+  if (!validIdentity(parsed.identity)) throw Error("Invalid installed migration locator.")
+  const identity = parsed.identity
+  if (identity.runId !== fence.runId || identity.sourceRepoId !== sourceRepoId || identity.deviceId !== deviceId
+    || identity.destinationRepoId !== fence.destinationRepoId || text !== locatorBody(identity)) throw Error("Foreign installed migration locator.")
+  if (await readBoundedText(adapter, fencePath) !== fenceText || await readBoundedText(adapter, path) !== text) throw Error("Installed migration locator changed.")
+  return Object.freeze(identity)
+}
+
 function assertActive(owner: V4InstalledSecretOwner): void {
   owner.assertOwner()
   const { storage, sourcePassphraseSecretId: old, githubTokenSecretId: token } = owner
@@ -58,7 +128,11 @@ function context(runId: string) {
 }
 async function readReceipt(adapter: V4LocalIndexAdapter, identity: V4InstalledSecretIdentity,
   owner: V4InstalledSecretOwner, key: Uint8Array): Promise<string> {
-  const path = installedSecretReceiptRoot(identity.runId) + "/receipt.enc"
+  const root = installedSecretReceiptRoot(identity.runId)
+  const locatorPath = root + "/locator.json"
+  // Legacy internal rehearsal receipts lacked a locator; if present it must match.
+  if (await adapter.exists(locatorPath) && await readBoundedText(adapter, locatorPath) !== locatorBody(identity)) throw Error("Foreign installed migration locator.")
+  const path = root + "/receipt.enc"
   const stat = await adapter.stat?.(path)
   if (stat && (!Number.isSafeInteger(stat.size) || stat.size < 1 || stat.size > MAX)) throw Error("Invalid staged secret receipt size.")
   const encoded = await adapter.read(path)
@@ -83,6 +157,7 @@ export async function stageV4InstalledDestinationSecret(input: {
 }): Promise<V4InstalledSecretReport> {
   const { adapter, identity, owner, key, newPassphrase, assertLease, checkpoint } = input
   const root = installedSecretReceiptRoot(identity.runId)
+  const locator = locatorBody(identity)
   await assertLease()
   assertActive(owner)
   if (!newPassphrase || newPassphrase === owner.oldPassphrase || await adapter.exists(root)) throw Error("Existing or invalid staged secret requires Manual Recovery.")
@@ -98,7 +173,9 @@ export async function stageV4InstalledDestinationSecret(input: {
   if (await adapter.exists(root)) throw Error("Existing staged secret receipt requires Manual Recovery.")
   await adapter.mkdir(root)
   await adapter.write(root + "/receipt.enc", encoded)
+  await adapter.write(root + "/locator.json", locator)
   await checkpoint()
+  if (await readBoundedText(adapter, root + "/locator.json") !== locator) throw Error("Staged secret locator readback failed.")
   if (await readReceipt(adapter, identity, owner, key) !== id) throw Error("Staged secret receipt readback failed.")
   await assertLease()
   assertActive(owner)
@@ -106,7 +183,8 @@ export async function stageV4InstalledDestinationSecret(input: {
   owner.storage.setSecret(id, newPassphrase)
   if (owner.storage.getSecret(id) !== newPassphrase) throw Error("Destination SecretStorage readback failed.")
   await checkpoint()
-  if (await readReceipt(adapter, identity, owner, key) !== id) throw Error("Staged secret receipt changed.")
+  if (await readReceipt(adapter, identity, owner, key) !== id
+    || await readBoundedText(adapter, root + "/locator.json") !== locator) throw Error("Staged secret receipt or locator changed.")
   await assertLease()
   assertActive(owner)
   if (owner.storage.getSecret(id) !== newPassphrase) throw Error("Destination SecretStorage changed.")

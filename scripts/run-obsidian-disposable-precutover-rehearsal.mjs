@@ -31,9 +31,11 @@ const tmpParent = path.join(root, ".tmp", "obsidian-installed-precutover-rehears
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const staleClientMode = process.argv.includes("--stale-client");
 const secretMode = process.argv.includes("--stage-secret");
+const uiRecoveryMode = process.argv.includes("--recover-via-ui");
+assert.ok(!uiRecoveryMode || (secretMode && !staleClientMode), "--recover-via-ui requires single-Vault --stage-secret.");
 const shadowMode = secretMode || process.argv.includes("--shadow-index");
-assert.ok(process.argv.slice(2).every(arg => arg === "--stale-client" || arg === "--shadow-index" || arg === "--stage-secret"),
-  "Only --stale-client, --shadow-index and --stage-secret are supported; all writes must remain in approved disposable branches.");
+assert.ok(process.argv.slice(2).every(arg => arg === "--stale-client" || arg === "--shadow-index" || arg === "--stage-secret" || arg === "--recover-via-ui"),
+  "Only --stale-client, --shadow-index, --stage-secret and --recover-via-ui are supported; all writes must remain in approved disposable branches.");
 
 const oldPassphrase = "d412-old-" + randomBytes(18).toString("base64url");
 const newPassphrase = "d412-new-" + randomBytes(18).toString("base64url");
@@ -484,12 +486,36 @@ try {
       expectedPhysicalRepositoryId:1284153873,
       defaultBranch:${JSON.stringify(target.defaultBranch)},
     };
-    const readOnly=await p.v4Runtime.inspectFencedReencryptionPreCutoverRecovery(recoveryInput);
+    const discovered=${JSON.stringify(secretMode)} ? await p.v4Runtime.inspectInstalledStagedRecoveryFromDisk() : null;
+    const readOnly=${JSON.stringify(secretMode)} ? discovered?.report : await p.v4Runtime.inspectFencedReencryptionPreCutoverRecovery(recoveryInput);
+    if(!readOnly) throw Error("Installed recovery discovery unavailable");
     let recovered=readOnly;
+    let restoredViaUi=false;
     const secretId=${JSON.stringify(rehearsal.report.stagedSecret?.destinationPassphraseSecretId ?? "")};
     const missingAfterRestart=${JSON.stringify(secretMode)} && !app.secretStorage.getSecret(secretId);
     if(${JSON.stringify(secretMode)} && readOnly.stagedSecretMissing===true && missingAfterRestart){
-      recovered=await p.v4Runtime.restoreFencedReencryptionStagedSecret({...recoveryInput,newPassphrase:${JSON.stringify(newPassphrase)}});
+      if(${JSON.stringify(uiRecoveryMode)}){
+        const started=app.commands.executeCommandById(${JSON.stringify(pluginId+":recover-staged-reencryption-key")});
+        if(!started) throw Error("Installed Recovery command not registered");
+        const waitUntil=async(fn,limit)=>{const start=Date.now();while(Date.now()-start<limit){if(fn())return true;await new Promise(r=>setTimeout(r,250))}return false};
+        if(!await waitUntil(()=>document.querySelector(".github-sync-staged-secret-recovery input[type=password]"),180000))throw Error("Recovery password modal not opened");
+        const modal=document.querySelector(".github-sync-staged-secret-recovery");
+        const field=modal.querySelector("input[type=password]");
+        const button=modal.querySelector("button");
+        if(!button.disabled)throw Error("Empty passphrase submit was enabled");
+        field.value=${JSON.stringify(newPassphrase)};
+        field.dispatchEvent(new Event("input",{bubbles:true}));
+        if(button.disabled)throw Error("Recovery submit remained disabled");
+        button.click();
+        if(!await waitUntil(()=>!p.recoveryReadOnlyCommandInProgress,240000))throw Error("Recovery command did not settle");
+        if(field.value!==""||document.querySelector(".github-sync-staged-secret-recovery input[type=password]"))throw Error("Recovery password field not cleared");
+        restoredViaUi=app.secretStorage.getSecret(secretId)===${JSON.stringify(newPassphrase)};
+        recovered=(await p.v4Runtime.inspectInstalledStagedRecoveryFromDisk())?.report;
+        if(!recovered)throw Error("Independent post-UI recovery verification unavailable");
+      }else{
+        recovered=await p.v4Runtime.restoreInstalledStagedSecretFromDisk({expectedLocatorDigest:discovered.locatorDigest,newPassphrase:${JSON.stringify(newPassphrase)}});
+        if(!recovered)throw Error("Installed secret restoration unavailable");
+      }
     }
     // Open Wizard UI, verifySource fails closed for pending recovery, and click Inspect Recovery button.
     p.openReencryptionWizard();
@@ -520,6 +546,7 @@ try {
       readOnlyFailureStage:readOnly.failureStage??null,
       readOnlyMissing:readOnly.stagedSecretMissing===true,
       missingAfterRestart,
+      restoredViaUi,
       stagedSecretPresent: ${JSON.stringify(secretMode)} ? !!app.secretStorage.getSecret(${JSON.stringify(rehearsal.report.stagedSecret?.destinationPassphraseSecretId ?? "")}) : null,
       stagedSecretMatches: ${JSON.stringify(secretMode)} ? app.secretStorage.getSecret(${JSON.stringify(rehearsal.report.stagedSecret?.destinationPassphraseSecretId ?? "")}) === ${JSON.stringify(newPassphrase)} : null,
       sourceSecretMatches: app.secretStorage.getSecret(p.settings.encryptionPassphraseSecretId) === ${JSON.stringify(oldPassphrase)},
@@ -530,23 +557,26 @@ try {
       leakedSecret,
       branchStillSource:p.settings.githubBranch===${JSON.stringify(sourceBranch)}
     };
-  })()`, 240000);
+  })()`, secretMode ? 600000 : 240000);
 
   assert.equal(postRestart.settingsFenceDenied, true);
   if (secretMode) {
     console.log(JSON.stringify({status:"SECRET_RESTART_OBSERVATION",missingAfterRestart:postRestart.missingAfterRestart,
       readOnlyObservation:postRestart.readOnlyObservation,readOnlyMissing:postRestart.readOnlyMissing,
-      readOnlyFailureStage:postRestart.readOnlyFailureStage,restored:postRestart.recovered.stagedSecretRestored===true,
+      readOnlyFailureStage:postRestart.readOnlyFailureStage,restored:postRestart.recovered.stagedSecretRestored===true || postRestart.restoredViaUi,
+      restoredViaUi:postRestart.restoredViaUi,
       recoveryFailureStage:postRestart.recovered.failureStage??null,stagedSecretMatches:postRestart.stagedSecretMatches,
       sourceSecretMatches:postRestart.sourceSecretMatches,tokenSecretMatches:postRestart.tokenSecretMatches}));
     if(postRestart.missingAfterRestart) {
       assert.equal(postRestart.readOnlyObservation,"manual-recovery-required");
       assert.equal(postRestart.readOnlyMissing,true);
-      assert.equal(postRestart.recovered.stagedSecretRestored,true);
+      if(uiRecoveryMode) assert.equal(postRestart.restoredViaUi,true);
+      else assert.equal(postRestart.recovered.stagedSecretRestored,true);
     } else {
       assert.equal(postRestart.readOnlyObservation,"authenticated-pre-cutover-destination-still-fenced");
       assert.equal(postRestart.recovered.stagedSecretRestored,undefined);
     }
+    if(uiRecoveryMode) assert.equal(postRestart.missingAfterRestart && postRestart.restoredViaUi,true,"Actual missing-secret UI journey must be exercised");
     assert.equal(postRestart.stagedSecretMatches,true);
     assert.equal(postRestart.sourceSecretMatches,true);
     assert.equal(postRestart.tokenSecretMatches,true);
@@ -732,7 +762,7 @@ try {
     destinationCommitSha: rehearsal.report.destinationCommitSha,
     finalWalGeneration: rehearsal.report.finalWalGeneration,
     ...(shadowMode ? {shadow:rehearsal.report.shadow,shadowReverified:postRestart.recovered.shadowReverified} : {}),
-    ...(secretMode ? {stagedSecretReverified:postRestart.recovered.stagedSecretReverified,distinctSecretId:rehearsal.stagedSecretVerified} : {}),
+    ...(secretMode ? {stagedSecretReverified:postRestart.recovered.stagedSecretReverified,distinctSecretId:rehearsal.stagedSecretVerified,restoredViaUi:postRestart.restoredViaUi} : {}),
     verifiedFileCount: rehearsal.report.verifiedFileCount,
     verifiedPlaintextBytes: rehearsal.report.verifiedPlaintextBytes,
     postRestartObservation: postRestart.recovered.observation,

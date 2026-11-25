@@ -48,6 +48,7 @@ export default class FastSync extends Plugin {
   get settingsSaveGeneration(): number { return this.settingsSaveAttemptGeneration }
   private unloaded = false
   private recoveryReadOnlyCommandInProgress = false
+  private stagedRecoveryModal: Modal | null = null
   private recoveryReadOnlyEpoch = 0
   private statusDisplaySignature: string | undefined
   private cooldownStore?: V4RateLimitCooldownStore
@@ -345,6 +346,12 @@ export default class FastSync extends Plugin {
       },
     })
 
+    this.addCommand({
+      id: "recover-staged-reencryption-key",
+      name: "GitHub Sync: Recover staged Re-encryption key",
+      callback: () => { void this.openStagedReencryptionKeyRecovery() },
+    })
+
     // After the workspace layout is ready, run the startup sync once, then enable real-time watch
     this.app.workspace.onLayoutReady(() => {
       if (this.unloaded) return
@@ -385,9 +392,83 @@ export default class FastSync extends Plugin {
     } else this.githubClient = undefined as unknown as GitHubClient
   }
 
+  /** Installed recovery entry point. No branch/commit input from the user;
+   * an authenticated missing slot is the only repairable state. */
+  private async openStagedReencryptionKeyRecovery(): Promise<void> {
+    if (this.unloaded || this.recoveryReadOnlyCommandInProgress) return
+    const runtime = this.v4Runtime
+    const epoch = this.recoveryReadOnlyEpoch
+    const current = () => !this.unloaded && this.v4Runtime === runtime && this.recoveryReadOnlyEpoch === epoch
+    this.recoveryReadOnlyCommandInProgress = true
+    let modalOpened = false
+    const release = () => {
+      if (this.recoveryReadOnlyEpoch === epoch) this.recoveryReadOnlyCommandInProgress = false
+    }
+    try {
+      new Notice("GitHub Sync: Checking staged Re-encryption recovery. Sync stays paused.", 8000)
+      const inspected = await runtime.inspectInstalledStagedRecoveryFromDisk()
+      if (!current()) return
+      if (inspected?.report.observation === "authenticated-pre-cutover-destination-still-fenced"
+        && inspected.report.stagedSecretReverified) {
+        new Notice("GitHub Sync: Staged key and Destination verified. Cutover is not authorized; Sync stays paused.", 10000)
+        return
+      }
+      if (!inspected?.report.stagedSecretMissing) {
+        new Notice("GitHub Sync: Staged recovery could not be verified. Keep both passphrases and recovery files; use Manual Recovery. Sync stays paused.", 12000)
+        return
+      }
+      const modal = new Modal(this.app)
+      this.stagedRecoveryModal = modal
+      let submitting = false
+      modal.titleEl.setText("Recover staged Re-encryption key")
+      modal.contentEl.addClass("github-sync-staged-secret-recovery")
+      modal.contentEl.createEl("p", { text: "The new staged key is missing from SecretStorage. Enter the new passphrase used for this migration. The Destination must verify before the missing key is restored. Your old key and Settings remain unchanged; Sync stays paused." })
+      const field = modal.contentEl.createEl("input", { type: "password", attr: { "aria-label": "New migration passphrase", autocomplete: "off" } })
+      const button = modal.contentEl.createEl("button", { text: "Verify and restore missing key" })
+      button.disabled = true
+      field.addEventListener("input", () => { button.disabled = !field.value || submitting })
+      modal.onClose = () => {
+        field.value = ""
+        modal.contentEl.empty()
+        if (this.stagedRecoveryModal === modal) this.stagedRecoveryModal = null
+        if (!submitting) release()
+      }
+      button.addEventListener("click", () => {
+        if (!current() || submitting || this.stagedRecoveryModal !== modal || !field.value) return
+        submitting = true
+        button.disabled = true
+        const passphrase = field.value
+        field.value = ""
+        modal.close()
+        void (async () => {
+          try {
+            new Notice("GitHub Sync: Verifying the new passphrase against the frozen migration. Sync stays paused.", 8000)
+            const report = await runtime.restoreInstalledStagedSecretFromDisk({
+              expectedLocatorDigest: inspected.locatorDigest, newPassphrase: passphrase,
+            })
+            if (!current()) return
+            new Notice(report?.stagedSecretRestored && report.stagedSecretReverified
+              ? "GitHub Sync: Missing staged key restored and Destination verified. Keep both passphrases; Cutover is not authorized and Sync stays paused."
+              : "GitHub Sync: Could not restore the missing staged key. Check the new passphrase and keep the recovery files. Sync stays paused.", 12000)
+          } catch {
+            if (current()) new Notice("GitHub Sync: Staged key recovery unavailable. Sync stays paused.", 10000)
+          } finally { release() }
+        })()
+      })
+      modal.open()
+      modalOpened = true
+    } catch {
+      if (current()) new Notice("GitHub Sync: Staged key recovery unavailable. Keep the recovery files; Sync stays paused.", 10000)
+    } finally {
+      if (!modalOpened) release()
+    }
+  }
+
   override onunload() {
     this.unloaded = true
     this.recoveryReadOnlyEpoch++
+    this.stagedRecoveryModal?.close()
+    this.stagedRecoveryModal = null
     this.recoveryReadOnlyCommandInProgress = false
     if (this.scheduledSyncTimer) window.clearInterval(this.scheduledSyncTimer);
     this.scheduledSyncTimer = null;
