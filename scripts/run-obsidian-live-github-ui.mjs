@@ -34,11 +34,13 @@ assert.ok(!native100mb||fileMiB===undefined,"Choose exactly one binary fixture s
 assert.ok(fileMiB===undefined||(/^[1-9][0-9]{0,2}$/u.test(fileMiB)&&Number(fileMiB)<=500),"Native file size must be an integer from 1 to 500 MiB");
 const nativeLargeBytes=native100mb?100_000_000:fileMiB===undefined?0:Number(fileMiB)*1024*1024;
 const restartJourney=opts.includes("--restart-journey");
+const publicationCrashJourney=opts.includes("--publication-crash-journey");
 const networkJourney=opts.includes("--network-journey");
 assert.ok(!networkJourney||(nativeLargeBytes>=8*1024*1024&&nativeLargeBytes<=32*1024*1024&&!restartJourney&&!autoJourney&&!journey),"Network journey requires a separate 8–32 MiB binary roundtrip");
 assert.ok(!restartJourney||verifyPeer,"Restart journey requires second real Vault verification");
 const nativeThousandNotes=opts.includes("--native-1000-notes");
 assert.ok(!nativeThousandNotes||(mode==="encrypted"&&verifyPeer),"Native 1,000-note test requires encrypted mode and a second real Obsidian vault");
+assert.ok(!publicationCrashJourney||(mode==="encrypted"&&verifyPeer&&!journey&&!autoJourney&&!restartJourney&&!networkJourney&&!nativeLargeBytes&&!nativeThousandNotes),"Publication crash requires isolated encrypted small-Vault peer journey");
 const assertDiagnostics=opts.includes("--assert-diagnostics");
 assert.ok(!autoJourney||(!nativeLargeBytes&&!nativeThousandNotes),"Auto journey is a bounded small-Vault acceptance test");
 assert.ok(!nativeLargeBytes||(mode==="encrypted"&&verifyPeer),"Native binary test requires encrypted mode and a second real Obsidian vault");
@@ -109,7 +111,7 @@ let processHandle,ws,configuration,branch,networkTunnel,verified=false,passed=fa
 let cleanupState="not-started",screenBytes=0,remoteEncryptionVerified=false,peerRestored=false,peerScreenshot=null;
 const sendErrors=[];
 const journeySteps=[];
-let autoSyncEvidence=null,peerConvergenceEvidence=null,restartEvidence=null,networkEvidence=null;
+let autoSyncEvidence=null,peerConvergenceEvidence=null,restartEvidence=null,networkEvidence=null,publicationCrashEvidence=null;
 let nativeBinary=null;
 let nativeUploadWallMs=null;
 let nativeDownloadWallMs=null;
@@ -189,7 +191,7 @@ async function captureSyncedCenter({requireFileWork=false}={}){
  return {width:size.width,height:size.height,bytes:screenBytes};
 }
 try{
- assertTrue(Number.isInteger(port)&&port>=1024&&port<=(restartJourney?65533:verifyPeer?65534:65535),"Safe CDP port required");
+ assertTrue(Number.isInteger(port)&&port>=1024&&port<=((restartJourney||publicationCrashJourney)?65533:verifyPeer?65534:65535),"Safe CDP port required");
  const sha=runGit(["rev-parse","HEAD"]);
  assertTrue(sha.status===0&&/^[0-9a-f]{40}$/u.test(sha.stdout.trim()),"Valid pinned source SHA required");
  const status=runGit(["status","--porcelain"]);
@@ -216,6 +218,12 @@ try{
   await mkdir(runRoot);await mkdir(vault);await mkdir(profile);
   await mkdir(path.join(vault,".obsidian","plugins",id),{recursive:true});
   for(const file of ["main.js","manifest.json","styles.css"])await copyFile(path.join(root,file),path.join(vault,".obsidian","plugins",id,file));
+  if(publicationCrashJourney){
+   assertTrue(configuration.expectedRepoId==="1284153873","Publication crash target must be the pinned disposable repository");
+   const bundle=path.join(root,".tmp","d501-android-transport-test","main.js");
+   assertTrue((await readFile(bundle,"utf8")).includes("__obsidianD501NativeRequest"),"Missing explicit test-only transport bundle");
+   await copyFile(bundle,path.join(vault,".obsidian","plugins",id,"main.js"));
+  }
   await writeFile(path.join(vault,".obsidian","community-plugins.json"),JSON.stringify([id])+"\n");
   await writeFile(path.join(vault,"UI-smoke.md"),"# Synthetic remote UI E2E\n\nFirst revision.\n");
   await writeFile(path.join(profile,"obsidian.json"),JSON.stringify({vaults:{"da9d8e727d6c1aba":{path:vault,ts:Date.now(),open:true}}})+"\n");
@@ -510,6 +518,75 @@ try{
    journeySteps.push("real Obsidian indexed and uploaded exact "+size+" byte binary");
   }
   const restartFiles=[];
+  if(publicationCrashJourney){
+   const before=finalSha;
+   const repoIdentity=await githubReadJson("");
+   assertTrue(String(repoIdentity.id)==="1284153873"&&typeof repoIdentity.node_id==="string","Pinned repository identity missing");
+   const item={path:"Publication-crash-"+runId+".md",content:"# Native publication crash\n\n"+randomBytes(32).toString("hex")+"\n"};
+   const bytes=Buffer.from(item.content,"utf8");
+   const hash=createHash("sha256").update(bytes).digest("hex");
+   const spec={vault,owner:configuration.owner,repo:configuration.repo,branch:configuration.branch,repositoryId:repoIdentity.node_id,expected:before,item};
+   const prior=await evaluate(`(async()=>{
+    const p=app.plugins.plugins[${JSON.stringify(id)}];const d=${JSON.stringify(spec)};
+    if(app.vault.adapter.getBasePath().toLowerCase()!==d.vault.toLowerCase()||p.settings.githubOwner!==d.owner||p.settings.githubRepo!==d.repo||p.settings.githubBranch!==d.branch||p.settings.syncOnLocalChange||p.isSyncInProgress||globalThis.__obsidianD501NativeRequest)throw Error("Publication crash scope or idle state mismatch");
+    const h={calls:0,accepted:false,candidate:null,status:null,settled:false,phase:null,observed:0};
+    globalThis.__d510PublicationCrash=h;
+    globalThis.__obsidianD501NativeRequest=async(original,request)=>{
+     if(app.vault.adapter.getBasePath().toLowerCase()!==d.vault.toLowerCase()||p.settings.githubBranch!==d.branch||p.settings.githubOwner!==d.owner||p.settings.githubRepo!==d.repo)throw Error("Publication crash scope changed");
+     h.observed++;
+     if(request.url!=="https://api.github.com/graphql"||String(request.method).toUpperCase()!=="POST")return original(request);
+     const body=JSON.parse(request.body??"{}");
+     if(!String(body.query??"").includes("updateRefs(input:"))return original(request);
+     const input=body.variables?.input,ref=input?.refUpdates?.[0];
+     if(input?.repositoryId!==d.repositoryId||input.refUpdates.length!==1||ref.name!=="refs/heads/"+d.branch||ref.beforeOid!==d.expected||ref.force!==false||!/^[a-f0-9]{40}$/.test(ref.afterOid)||ref.afterOid===d.expected||++h.calls!==1)throw Error("Publication crash strict CAS scope mismatch");
+     h.candidate=ref.afterOid;h.phase=p.v4Runtime.progressSnapshot.phase;
+     const response=await original(request);
+     if(response.status!==200||!response.json?.data?.updateRefs||response.json?.errors?.length)throw Error("Publication crash actual CAS not accepted");
+     h.status=response.status;h.accepted=true;
+     // No success or rejection reaches the runtime: kill the owned process here.
+     return new Promise(()=>{});
+    };
+    await app.vault.create(d.item.path,d.item.content);
+    return {device:p.settings.vault,active:p.isSyncInProgress};
+   })()`);
+   assertTrue(/^device-[a-f0-9]{32}$/u.test(prior.device)&&!prior.active,"Publication crash requires idle initialized source");
+   assert.deepEqual(await readFile(path.join(vault,item.path)),bytes,"Synthetic publication note disk bytes differ");
+   await evaluate(`(()=>{const p=app.plugins.plugins[${JSON.stringify(id)}];const h=globalThis.__d510PublicationCrash;void p.v4Runtime.manualSync().then(()=>{h.settled=true},()=>{h.settled=true});return true;})()`);
+   const accepted=await waitUntil(()=>evaluate(`(()=>{const h=globalThis.__d510PublicationCrash;const p=app.plugins.plugins[${JSON.stringify(id)}];if(h.settled)throw Error("Sync settled before injected publication crash");return h.accepted?{calls:h.calls,accepted:h.accepted,candidate:h.candidate,status:h.status,phase:h.phase,observed:h.observed,active:p.v4Runtime.coordinator.isSyncing}:null;})()`),180000,"real strict CAS response held pending");
+   assertTrue(accepted.calls===1&&accepted.status===200&&accepted.active&&accepted.observed>0,"Actual pending strict CAS not proven");
+   publicationCrashEvidence={...accepted,before,fixtureSha256:hash,forcedOwnedProcessRestart:false,recovered:false};
+   const published=await waitUntil(async()=>{const head=await readState(configuration);return head.kind==="present"&&head.sha===accepted.candidate?head:null;},30000,"external published candidate visibility");
+   const commit=await githubReadJson("git/commits/"+published.sha);
+   assertTrue(commit.parents?.length===1&&commit.parents[0].sha===before,"Published candidate parent differs from expected HEAD");
+   assertTrue(await evaluate("(()=>{const h=globalThis.__d510PublicationCrash;return h.accepted&&!h.settled&&h.calls===1;})()"),"Runtime received CAS result before crash");
+   console.log(JSON.stringify({kind:"native-publication-cas-held",...publicationCrashEvidence}));
+   assertTrue(requestMap.size===0&&processHandle?.pid,"Owned process or CDP state unsafe");
+   ws.close();ws=undefined;
+   const stopped=spawnSync("taskkill",["/PID",String(processHandle.pid),"/T","/F"],{timeout:15000,encoding:"utf8"});
+   assertTrue(stopped.status===0,"Could not terminate owned publication source process");
+   processHandle=undefined;
+   publicationCrashEvidence.forcedOwnedProcessRestart=true;
+   await sleep(1500);
+   const production=path.join(root,"main.js");
+   assertTrue(!(await readFile(production,"utf8")).includes("__obsidianD501NativeRequest"),"Production restart bundle must be uninstrumented");
+   await copyFile(production,path.join(vault,".obsidian","plugins",id,"main.js"));
+   port=firstPort+2;
+   await launchInstalled(true);
+   const persisted=await evaluate(`(()=>{const p=app.plugins.plugins[${JSON.stringify(id)}];const d=${JSON.stringify(prepared)};return {device:p.settings.vault,credentials:p.settings.githubOwner===d.owner&&p.settings.githubRepo===d.repo&&p.settings.githubBranch===d.branch&&p.settings.githubToken===d.token&&p.settings.encryptionPassphrase===d.passphrase,manualOnly:!p.settings.syncOnStartup&&!p.settings.syncOnLocalChange&&!p.settings.scheduledSyncEnabled,hookAbsent:!globalThis.__obsidianD501NativeRequest&&!globalThis.__d510PublicationCrash};})()`);
+   assertTrue(persisted.device===prior.device&&persisted.credentials&&persisted.manualOnly&&persisted.hookAbsent,"Restart changed identity, credentials or manual-only state");
+   assert.deepEqual(await readFile(path.join(vault,item.path)),bytes,"Crash changed local note bytes");
+   assertTrue((await readState(configuration)).sha===accepted.candidate,"Remote HEAD changed during restart");
+   const recovery=await evaluate(`(async()=>{const p=app.plugins.plugins[${JSON.stringify(id)}];const outcome=await p.v4Runtime.manualSync();const s=p.v4Runtime.progressSnapshot;return {status:outcome?.status,lifecycle:s.lifecycle,changedFiles:outcome?.changedFiles,uploadBytes:s.diagnostics?.uploadBytes,apiFailures:s.diagnostics?.apiFailures,error:s.errorMessage?.slice(0,180)};})()`,240000);
+   console.log(JSON.stringify({kind:"native-publication-crash-recovery",recovery}));
+   assertTrue(recovery.status==="completed"&&recovery.lifecycle==="no-change"&&recovery.changedFiles===0&&recovery.uploadBytes===0&&recovery.apiFailures===0,"Ordinary recovery after publication crash failed: "+redact(JSON.stringify(recovery)));
+   assertTrue((await readState(configuration)).sha===accepted.candidate,"Recovery republished or changed HEAD");
+   assert.deepEqual(await readFile(path.join(vault,item.path)),bytes,"Recovery changed local note bytes");
+   finalSha=accepted.candidate;
+   restartFiles.push(item);
+   await verifyNoop("after-native-publication-crash");
+   Object.assign(publicationCrashEvidence,{recovered:true,persistedCredentials:true,productionBundleRestart:true,noDuplicateCommit:true,recovery});
+   journeySteps.push("actual strict CAS accepted, response held, owned process killed, ordinary production restart recovered without duplicate commit");
+  }
   if(restartJourney){
    const before=finalSha;
    const prior=await evaluate("(()=>{const p=app.plugins.plugins["+JSON.stringify(id)+"];return {device:p.settings.vault,active:p.isSyncInProgress,pending:p.v4Runtime.pendingCount};})()");
@@ -595,6 +672,12 @@ try{
    }else{
     assertTrue(afterPull.kind==="present"&&afterPull.sha===finalSha,"Second-device Force Pull unexpectedly changed GitHub HEAD");
    }
+   if(publicationCrashJourney){
+    assertTrue(restored.verifiedJourneyFiles===1&&publicationCrashEvidence?.recovered,"Publication crash peer proof missing");
+    const peerBytes=await readFile(path.join(runRoot,"peer-vault",restartFiles[0].path));
+    assertTrue(createHash("sha256").update(peerBytes).digest("hex")===publicationCrashEvidence.fixtureSha256,"Peer disk bytes differ after publication crash recovery");
+    publicationCrashEvidence.peerDiskVerified=true;
+   }
    peerRestored=true;
    peerScreenshot=restored.peerScreenshot;
   }
@@ -626,5 +709,5 @@ try{
   try{await cleanupGeneratedUiEvidence(runRoot,{repoRoot:root});}catch(error){console.error("WARNING: synthetic UI evidence cleanup incomplete ("+String(error?.code||"unknown").slice(0,30)+")");process.exitCode=1;}
  }
  console.log(JSON.stringify({status:passed&&!process.exitCode?"PASS":"FAIL",cleanup:cleanupState,remoteHeadChanged:Boolean(initialSha&&finalSha&&initialSha!==finalSha),
-  screenshotCaptured:screenBytes>1000,screenshotPath:null,uiExceptions:sendErrors.length,mode,remoteEncryptionVerified,peerRestored,peerScreenshot:null,journeySteps,autoSyncEvidence,peerConvergenceEvidence,restartEvidence,networkEvidence,noOpEvidence,bulkEvidence,diagnostics:diagnosticEvidence,peerDiagnostics:peerDiagnosticEvidence,nativeUploadWallMs,nativeDownloadWallMs,nativeBinaryBytes:nativeBinary?.size??0,nativeBinarySha256:nativeBinary?.sha256??null,native100mbBytes:native100mb?nativeBinary?.size??0:0,native100mbSha256:native100mb?nativeBinary?.sha256??null:null,runBranch:branch,repository:configuration?.targetRepository,token:"[not reported]"}));
+  screenshotCaptured:screenBytes>1000,screenshotPath:null,uiExceptions:sendErrors.length,mode,remoteEncryptionVerified,peerRestored,peerScreenshot:null,journeySteps,autoSyncEvidence,peerConvergenceEvidence,restartEvidence,networkEvidence,publicationCrashEvidence,noOpEvidence,bulkEvidence,diagnostics:diagnosticEvidence,peerDiagnostics:peerDiagnosticEvidence,nativeUploadWallMs,nativeDownloadWallMs,nativeBinaryBytes:nativeBinary?.size??0,nativeBinarySha256:nativeBinary?.sha256??null,native100mbBytes:native100mb?nativeBinary?.size??0:0,native100mbSha256:native100mb?nativeBinary?.sha256??null:null,runBranch:branch,repository:configuration?.targetRepository,token:"[not reported]"}));
 }
