@@ -15,6 +15,7 @@ import { planV4PluginPrivateWalLocation } from "../../src/lib/v4/reencryption-pl
 import { verifyGitHubReencryptionForkSource, verifyGitHubReencryptionForkSourceWithTranscodeInventory } from "../../src/lib/v4/reencryption-trusted-loader"
 import { createEmptyV4LocalIndex, saveV4LocalIndex, loadV4LocalIndex } from "../../src/lib/v4/local-index"
 import { deriveV4Keyring } from "../../src/lib/v4/crypto"
+import { stageV4InstalledDestinationSecret, readV4InstalledDestinationSecret, installedSecretReceiptRoot } from "../../src/lib/v4/reencryption-installed-secret"
 import { createV4ReencryptionRecoveryJournal } from "../../src/lib/v4/reencryption-recovery-journal"
 import { V4StorageCodec } from "../../src/lib/v4/storage-codec"
 import { buildV4RemoteMetadata } from "../../src/lib/v4/remote-index"
@@ -318,13 +319,15 @@ async function createInstalledVaultFixture(files: ReadonlyArray<{ path: string; 
       vault: "installed-desktop-device",
     },
   }
+  const secrets = new Map<string, string>([[settings.githubTokenSecretId, settings.githubToken], [settings.encryptionPassphraseSecretId, settings.encryptionPassphrase]])
+  const secretStorage = { getSecret: (id: string) => secrets.get(id) ?? null, setSecret: (id: string, value: string) => { secrets.set(id, value) } }
   const makeRuntime = () => {
     let watchEnabled = true
     const plugin = {
       app: {
         vault: { configDir: CONFIG_DIR, adapter },
         workspace: { iterateAllLeaves: () => {}, activeEditor: null },
-        secretStorage: { getSecret: () => null },
+        secretStorage,
       },
       manifest: { id: PLUGIN_ID },
       settings: { ...settings },
@@ -349,6 +352,7 @@ async function createInstalledVaultFixture(files: ReadonlyArray<{ path: string; 
     adapter,
     settings,
     persistedData,
+    secrets,
     makeRuntime,
     cleanup: () => rm(root, { recursive: true, force: true }),
   }
@@ -402,6 +406,7 @@ test("D412 installed Runtime orchestrates Source -> Backup -> Staging -> Scratch
       newPassphrase: NEW_PASSPHRASE,
       requestedIterations: 700_000,
       prepareShadowIndex: true,
+      stageDestinationSecret: true,
       acknowledgement: "accept-best-effort-power-loss-recovery-risk",
       assertExclusiveInitiatorLease: async () => {},
       createGitHubClient: makeClientFactory(),
@@ -417,6 +422,14 @@ test("D412 installed Runtime orchestrates Source -> Backup -> Staging -> Scratch
     assert.equal(report.shadow?.verifiedFileCount, 2)
     assert.equal(report.shadow?.destinationCommitSha, report.destinationCommitSha)
     assert.equal(report.shadow?.resumeSyncAuthorized, false)
+    assert.equal(report.stagedSecret?.status, "destination-secret-staged-uncommitted")
+    const stagedId = report.stagedSecret!.destinationPassphraseSecretId
+    assert.notEqual(stagedId, vault.settings.encryptionPassphraseSecretId)
+    assert.notEqual(stagedId, vault.settings.githubTokenSecretId)
+    assert.equal(vault.secrets.get(stagedId), NEW_PASSPHRASE)
+    assert.equal(vault.secrets.get(vault.settings.encryptionPassphraseSecretId), OLD_PASSPHRASE)
+    assert.equal(vault.secrets.get(vault.settings.githubTokenSecretId), vault.settings.githubToken)
+    assert.equal(runtime1.plugin.settings.encryptionPassphraseSecretId, vault.settings.encryptionPassphraseSecretId)
     assert.deepEqual(await loadV4LocalIndex(vault.adapter, sourceRoot), sourceBefore)
     const shadowRoot = `${sourceRoot}-rekey-${runId}`
     const shadow = await loadV4LocalIndex(vault.adapter, shadowRoot)
@@ -507,15 +520,30 @@ test("D412 installed Runtime orchestrates Source -> Backup -> Staging -> Scratch
       destinationTreeSha: report.destinationTreeSha,
       expectedFinalWalGeneration: report.finalWalGeneration,
       verifyShadowIndex: true,
+      recoverStagedSecret: true,
       expectedFileCount: 2,
       expectedPlaintextBytes: String(noteBytes.byteLength + binBytes.byteLength),
-      newPassphrase: NEW_PASSPHRASE,
       expectedPhysicalRepositoryId: PHYSICAL_REPO_ID,
       defaultBranch: DEFAULT_BRANCH,
       createGitHubClient: makeClientFactory(),
     }
     const recovered = await runtime2.runtime.inspectFencedReencryptionPreCutoverRecovery(recoveryInput)
     assert.equal(recovered.shadowReverified, true)
+    assert.equal(recovered.stagedSecretReverified, true)
+    vault.secrets.set(stagedId, "wrong-staged-key")
+    const wrongSecret = await runtime2.runtime.inspectFencedReencryptionPreCutoverRecovery(recoveryInput)
+    assert.equal(wrongSecret.observation, "manual-recovery-required")
+    assert.equal(wrongSecret.resumeSyncAuthorized, false)
+    vault.secrets.set(stagedId, NEW_PASSPHRASE)
+    const receiptPath = `${CONFIG_DIR}/plugins/${PLUGIN_ID}/${V4_RUNTIME_INDEX_ROOT}-rekey-secret-${runId}/receipt.enc`
+    const receipt = await vault.adapter.read(receiptPath)
+    assert.ok(!receipt.includes(NEW_PASSPHRASE) && !receipt.includes(OLD_PASSPHRASE))
+    await vault.adapter.write(receiptPath, receipt.slice(0,-8) + "AAAAAAAA")
+    const wrongReceipt = await runtime2.runtime.inspectFencedReencryptionPreCutoverRecovery(recoveryInput)
+    assert.equal(wrongReceipt.observation, "manual-recovery-required")
+    assert.equal(wrongReceipt.resumeSyncAuthorized, false)
+    await vault.adapter.write(receiptPath, receipt)
+    assert.equal(vault.secrets.get(vault.settings.encryptionPassphraseSecretId), OLD_PASSPHRASE)
 
     assert.equal(recovered.observation, "authenticated-pre-cutover-destination-still-fenced")
     assert.equal(recovered.walAuthenticated, true)
@@ -546,6 +574,60 @@ test("D412 installed Runtime orchestrates Source -> Backup -> Staging -> Scratch
     runtime2?.runtime.dispose()
     setRequestUrlHandler(null)
     await vault.cleanup()
+  }
+})
+
+test("D515 SecretStorage failed or uncertain write preserves old custody and never overwrites staged receipt", async () => {
+  for (const fault of ["before-write", "after-write", "bad-readback"] as const) {
+    const files = new Map<string, string>()
+    const dirs = new Set<string>()
+    const adapter = {
+      read: async (p: string) => { const v = files.get(p); if (v === undefined) throw Error("missing"); return v },
+      write: async (p: string, v: string) => { files.set(p, v) },
+      exists: async (p: string) => files.has(p) || dirs.has(p),
+      mkdir: async (p: string) => { dirs.add(p) },
+    }
+    const secrets = new Map([["old", "old-secret"], ["token", "token-value"]])
+    let attemptedId = ""
+    let writes = 0
+    const storage = {
+      getSecret: (id: string) => secrets.get(id) ?? null,
+      setSecret: (id: string, value: string) => {
+        writes++
+        attemptedId = id
+        assert.ok(files.has(installedSecretReceiptRoot("d515-fault-run") + "/receipt.enc"))
+        if (fault === "before-write") throw Error("write refused")
+        secrets.set(id, fault === "bad-readback" ? "" : value)
+        if (fault === "after-write") throw Error("acknowledgement lost")
+      },
+    }
+    const identity = { runId: "d515-fault-run", deviceId: "device",
+      sourceRepoId: "owner/repo#source", backupRepoId: "owner/repo#backup", destinationRepoId: "owner/repo#destination",
+      pinnedSourceCommitSha: "a".repeat(40), sourceTreeSha: "b".repeat(40),
+      destinationCommitSha: "c".repeat(40), destinationTreeSha: "d".repeat(40),
+      finalWalGeneration: 12, verifiedFileCount: 2, verifiedPlaintextBytes: "2116",
+      physicalRepositoryId: 1, defaultBranch: "main" }
+    const owner = { storage, sourcePassphraseSecretId: "old", githubTokenSecretId: "token",
+      oldPassphrase: "old-secret", token: "token-value", assertOwner: () => {} }
+    const key = new Uint8Array(32).fill(7)
+    const input = { adapter, identity, owner, key, newPassphrase: "new-secret",
+      assertLease: async () => {}, checkpoint: async () => {} }
+    await assert.rejects(() => stageV4InstalledDestinationSecret(input))
+    assert.equal(secrets.get("old"), "old-secret")
+    assert.equal(secrets.get("token"), "token-value")
+    assert.notEqual(attemptedId, "old")
+    assert.notEqual(attemptedId, "token")
+    const receipt = files.get(installedSecretReceiptRoot(identity.runId) + "/receipt.enc")
+    assert.ok(receipt)
+    await assert.rejects(() => stageV4InstalledDestinationSecret(input), /Manual Recovery/u)
+    assert.equal(writes, 1)
+    assert.equal(files.get(installedSecretReceiptRoot(identity.runId) + "/receipt.enc"), receipt)
+    if (fault === "after-write") {
+      const recovered = await readV4InstalledDestinationSecret(input)
+      assert.equal(recovered.id, attemptedId)
+      assert.equal(recovered.passphrase, "new-secret")
+    } else await assert.rejects(() => readV4InstalledDestinationSecret(input))
+    key.fill(0)
   }
 })
 

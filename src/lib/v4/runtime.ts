@@ -55,6 +55,7 @@ import { V4CancelledError, throwIfV4Aborted } from "./cancellation"
 import { V4PublicationRaceError, isV4PublicationRaceError } from "./publication-race"
 import { assertV4SpeculativeConfigStillAbsent, guardV4SpeculativeConfigGithub } from "./speculative-config-guard"
 
+import { installedSecretReceiptRoot } from "./reencryption-installed-secret"
 import { V4_RUNTIME_INDEX_ROOT } from "./reencryption-index-root"
 import { inspectV4ReencryptionColdStartIndexRoute, type V4ReencryptionColdStartRouteReport } from "./reencryption-runtime-index-route"
 import { decodeV4ReencryptionCutoverCandidateManifest } from "./reencryption-cutover-candidate-manifest"
@@ -1666,6 +1667,7 @@ export class V4PluginRuntime {
     readonly assertExclusiveInitiatorLease: () => Promise<void>
     readonly createGitHubClient?: ((branch: string) => GitHubClient) | undefined
     readonly prepareShadowIndex?: boolean | undefined
+    readonly stageDestinationSecret?: boolean | undefined
     readonly newSalt?: Uint8Array | undefined
     readonly createdAt?: number | undefined
     readonly signal?: AbortSignal | undefined
@@ -1746,6 +1748,18 @@ export class V4PluginRuntime {
         throw new Error("Re-encryption pre-cutover rehearsal lost live plugin ownership.")
       }
     }
+    const stageDestinationSecret = input.stageDestinationSecret === true
+    const storage = this.plugin.app.secretStorage
+    const assertSecretOwner = () => {
+      assertRuntimeOwner()
+      if (this.plugin.app.secretStorage !== storage) throw Error("Re-encryption SecretStorage owner changed.")
+    }
+    if (stageDestinationSecret && (input.prepareShadowIndex !== true || !initialSnapshot.passphraseSecretId
+      || !initialSnapshot.tokenSecretId || initialSnapshot.passphraseSecretId === initialSnapshot.tokenSecretId
+      || storage.getSecret(initialSnapshot.passphraseSecretId) !== initialSnapshot.passphrase
+      || storage.getSecret(initialSnapshot.tokenSecretId) !== initialSnapshot.token)) {
+      throw Error("Re-encryption requires existing Source SecretStorage custody and Shadow staging.")
+    }
     const assertScratchInsideVault = async () => {
       const resolvedVault = await fs.realpath(this.desktopVaultRoot!)
       const resolvedScratch = await fs.realpath(scratchAbsRoot)
@@ -1780,6 +1794,11 @@ export class V4PluginRuntime {
       assertExclusiveInitiatorLease: input.assertExclusiveInitiatorLease,
       createGitHubClient: createClient,
       shadowAdapter: input.prepareShadowIndex === true ? this.adapter : undefined,
+      secretOwner: stageDestinationSecret ? {
+        storage, sourcePassphraseSecretId: initialSnapshot.passphraseSecretId,
+        githubTokenSecretId: initialSnapshot.tokenSecretId, oldPassphrase: initialSnapshot.passphrase,
+        token: initialSnapshot.token, assertOwner: assertSecretOwner,
+      } : undefined,
       newSalt: input.newSalt,
       createdAt: input.createdAt,
       signal: input.signal,
@@ -1834,9 +1853,10 @@ export class V4PluginRuntime {
     readonly destinationTreeSha: string
     readonly expectedFinalWalGeneration: number
     readonly verifyShadowIndex?: boolean | undefined
+    readonly recoverStagedSecret?: boolean | undefined
     readonly expectedFileCount: number
     readonly expectedPlaintextBytes: string
-    readonly newPassphrase: string
+    readonly newPassphrase?: string | undefined
     readonly expectedPhysicalRepositoryId: number
     readonly defaultBranch: string
     readonly createGitHubClient?: ((branch: string) => GitHubClient) | undefined
@@ -1887,6 +1907,12 @@ export class V4PluginRuntime {
       }
     }
     const verifyShadowIndex = input.verifyShadowIndex === true
+    const recoverStagedSecret = input.recoverStagedSecret === true
+    const storage = this.plugin.app.secretStorage
+    const assertSecretOwner = () => {
+      assertOwner()
+      if (this.plugin.app.secretStorage !== storage) throw Error("Re-encryption SecretStorage owner changed.")
+    }
     const createClient = input.createGitHubClient ?? ((branch: string) => new GitHubClient({
       token: pinned.token,
       owner: pinned.owner,
@@ -1914,6 +1940,11 @@ export class V4PluginRuntime {
       assertPersistedFenceActive: () => assertV4ReencryptionSyncFenceClear(this.adapter),
       inspectRoute: () => this.inspectFencedReencryptionIndexRoute(),
       shadow: verifyShadowIndex ? { adapter: this.adapter, deviceId: pinned.vault } : undefined,
+      secretOwner: recoverStagedSecret ? {
+        storage, sourcePassphraseSecretId: pinned.passphraseSecretId,
+        githubTokenSecretId: pinned.tokenSecretId, oldPassphrase: pinned.passphrase,
+        token: pinned.token, assertOwner: assertSecretOwner,
+      } : undefined,
       inspectFenceAndNoPartialCutover: async () => {
         assertOwner()
         const fenceText = await this.adapter.read(`${V4_REENCRYPTION_SYNC_FENCE_ROOT}/active.json`)
@@ -1932,10 +1963,12 @@ export class V4PluginRuntime {
           this.adapter.exists(roots.shadowIndexRoot),
           this.adapter.exists(roots.selectorPath),
           this.adapter.exists(V4_REENCRYPTION_RUNTIME_ROUTE_PATH),
+          this.adapter.exists(installedSecretReceiptRoot(input.runId)),
         ])
         assertOwner()
         return checks[0] === false && checks[1] === verifyShadowIndex
           && checks[2] === false && checks[3] === false
+          && checks[4] === recoverStagedSecret && (!recoverStagedSecret || verifyShadowIndex)
       },
       openReadOnlyWal: async () => {
         assertOwner()

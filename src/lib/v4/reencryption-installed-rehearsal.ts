@@ -6,6 +6,7 @@ import { deriveV4Keyring, type V4Keyring } from "./crypto"
 import { readImmutableGitFile } from "./immutable-git-read"
 import { assertV4Pbkdf2Iterations, V4_MIN_NEW_PBKDF2_ITERATIONS } from "./kdf-policy"
 import type { V4LocalIndexAdapter } from "./local-index"
+import { stageV4InstalledDestinationSecret, readV4InstalledDestinationSecret, type V4InstalledSecretOwner, type V4InstalledSecretReport } from "./reencryption-installed-secret"
 import { stageV4InstalledReencryptionShadow, verifyV4InstalledReencryptionShadow, type V4InstalledShadowReport } from "./reencryption-installed-shadow"
 import { expectedV4PathLayout, V4_CONFIG_PATH, type V4RemoteConfig } from "./protocol-types"
 import { inspectV4BestEffortWalRecovery } from "./reencryption-best-effort-wal-recovery"
@@ -91,6 +92,7 @@ export interface V4InstalledPreCutoverRehearsalInput {
   readonly createGitHubClient: (branch: string) => GitHubClient
   readonly runtimeOwner: V4InstalledPreCutoverRehearsalOwner
   readonly shadowAdapter?: V4LocalIndexAdapter | undefined
+  readonly secretOwner?: V4InstalledSecretOwner | undefined
   readonly newSalt?: Uint8Array | undefined
   readonly createdAt?: number | undefined
   readonly signal?: AbortSignal | undefined
@@ -113,6 +115,7 @@ export interface V4InstalledPreCutoverRehearsalReport {
   readonly verifiedFileCount: number
   readonly verifiedPlaintextBytes: string
   readonly shadow?: V4InstalledShadowReport | undefined
+  readonly stagedSecret?: V4InstalledSecretReport | undefined
   readonly stagedBlobCount: number
   readonly scratchRestoredFileCount: number
   readonly cutoverAuthorized: false
@@ -137,7 +140,8 @@ export interface V4InstalledPreCutoverRecoveryInput {
   readonly expectedFileCount: number
   readonly expectedPlaintextBytes: string
   readonly oldPassphrase: string
-  readonly newPassphrase: string
+  readonly newPassphrase?: string | undefined
+  readonly secretOwner?: V4InstalledSecretOwner | undefined
   readonly expectedPhysicalRepositoryId: number
   readonly defaultBranch: string
   readonly assertPersistedFenceActive: () => Promise<void>
@@ -157,6 +161,7 @@ export interface V4InstalledPreCutoverRecoveryReport {
   readonly backupReverified: boolean
   readonly destinationReverified: boolean
   readonly shadowReverified?: true | undefined
+  readonly stagedSecretReverified?: true | undefined
   readonly verifiedFileCount: number
   readonly verifiedPlaintextBytes: string
   readonly cutoverAuthorized: false
@@ -648,6 +653,32 @@ export async function runV4InstalledPreCutoverRehearsal(
         await journal.assertHealthySnapshot(finalWal.generation)
       },
     }) : undefined
+    const stagedSecret = input.secretOwner && shadow && input.shadowAdapter ? await stageV4InstalledDestinationSecret({
+      adapter: input.shadowAdapter, owner: input.secretOwner, key: oldKeyring.journalKey,
+      identity: {
+        runId: input.runId, deviceId: input.deviceId, sourceRepoId: wizardProposal.sourceRepoId,
+        backupRepoId: wizardProposal.backupRepoId, destinationRepoId: wizardProposal.destinationRepoId,
+        pinnedSourceCommitSha, sourceTreeSha: pinnedCommit.treeSha,
+        destinationCommitSha: published.destinationCommitSha, destinationTreeSha: prepared.treeSha,
+        finalWalGeneration: finalWal.generation, verifiedFileCount: published.verifiedFileCount,
+        verifiedPlaintextBytes: published.verifiedPlaintextBytes, physicalRepositoryId: sourceIdentity.id, defaultBranch,
+      },
+      newPassphrase: input.newPassphrase,
+      assertLease: async () => {
+        await combinedLease()
+        await wal!.assertExclusiveStageLease()
+        const [sourceRef, backupRef, destinationRef] = await Promise.all([
+          sourceClient.getGitRef(), backupReadbackClient.getGitRef(), destinationReadbackClient.getGitRef(),
+        ])
+        if (sourceRef.sha !== pinnedSourceCommitSha || backupRef.sha !== pinnedSourceCommitSha
+          || destinationRef.sha !== published.destinationCommitSha) throw Error("Re-encryption refs changed during secret staging.")
+        await combinedLease()
+      },
+      checkpoint: async () => {
+        await wal!.assertBestEffortCheckpoint()
+        await journal.assertHealthySnapshot(finalWal.generation)
+      },
+    }) : undefined
     await advance("candidate-prepared", "destination-published-no-cutover")
     succeeded = true
     return Object.freeze({
@@ -666,6 +697,7 @@ export async function runV4InstalledPreCutoverRehearsal(
       verifiedFileCount: published.verifiedFileCount,
       verifiedPlaintextBytes: published.verifiedPlaintextBytes,
       ...(shadow ? { shadow } : {}),
+      ...(stagedSecret ? { stagedSecret } : {}),
       stagedBlobCount: staged.receipts.length,
       scratchRestoredFileCount: scratchRestore.roundTripFileCount,
       cutoverAuthorized: false,
@@ -710,7 +742,7 @@ export async function inspectV4InstalledPreCutoverRecoveryAfterRestart(
     || !COMMIT_SHA.test(input.sourceTreeSha)
     || !COMMIT_SHA.test(input.destinationCommitSha)
     || !COMMIT_SHA.test(input.destinationTreeSha)
-    || !input.oldPassphrase || !input.newPassphrase || input.oldPassphrase === input.newPassphrase
+    || !input.oldPassphrase || (!input.secretOwner && !input.newPassphrase) || input.oldPassphrase === input.newPassphrase
     || !Number.isSafeInteger(input.expectedFinalWalGeneration) || input.expectedFinalWalGeneration < 1) {
     return manualRecoveryReport()
   }
@@ -876,11 +908,24 @@ export async function inspectV4InstalledPreCutoverRecoveryAfterRestart(
     }
     if (!blobByPath.has(V4_CONFIG_PATH)) return manualRecoveryReport()
 
+    const stagedSecret = input.secretOwner && input.shadow ? await readV4InstalledDestinationSecret({
+      adapter: input.shadow.adapter, owner: input.secretOwner, key: oldKeyring.journalKey,
+      identity: {
+        runId: input.runId, deviceId: input.shadow.deviceId, sourceRepoId, backupRepoId, destinationRepoId,
+        pinnedSourceCommitSha: input.pinnedSourceCommitSha, sourceTreeSha: input.sourceTreeSha,
+        destinationCommitSha: input.destinationCommitSha, destinationTreeSha: input.destinationTreeSha,
+        finalWalGeneration: input.expectedFinalWalGeneration, verifiedFileCount: input.expectedFileCount,
+        verifiedPlaintextBytes: input.expectedPlaintextBytes, physicalRepositoryId: input.expectedPhysicalRepositoryId,
+        defaultBranch: input.defaultBranch,
+      },
+    }) : undefined
+    const destinationPassphrase = stagedSecret?.passphrase ?? input.newPassphrase
+    if (!destinationPassphrase || (input.secretOwner && !stagedSecret)) return manualRecoveryReport()
     const destInventory = await verifyGitHubReencryptionForkSourceWithTranscodeInventory({
       github: destinationClient,
       expectedRepoId: destinationRepoId,
       expectedBranch: input.destinationBranch,
-      passphrase: input.newPassphrase,
+      passphrase: destinationPassphrase,
       signal: input.signal,
     })
     if (destInventory.pinnedSourceCommitSha !== input.destinationCommitSha
@@ -927,6 +972,7 @@ export async function inspectV4InstalledPreCutoverRecoveryAfterRestart(
       || finalDestinationRef.sha !== input.destinationCommitSha) return manualRecoveryReport()
     await wal.assertExclusiveStageLease()
     await readOnlyJournal.assertHealthySnapshot(input.expectedFinalWalGeneration)
+    if (stagedSecret && input.secretOwner?.storage.getSecret(stagedSecret.id) !== stagedSecret.passphrase) return manualRecoveryReport()
     destinationReverified = true
 
     input.assertOwnerStillValid?.()
@@ -937,6 +983,7 @@ export async function inspectV4InstalledPreCutoverRecoveryAfterRestart(
       backupReverified,
       destinationReverified,
       ...(input.shadow ? { shadowReverified: true as const } : {}),
+      ...(stagedSecret ? { stagedSecretReverified: true as const } : {}),
       verifiedFileCount: destInventory.verifiedSource.verifiedFileCount,
       verifiedPlaintextBytes: destInventory.verifiedSource.totalVerifiedPlaintextBytes,
       cutoverAuthorized: false,

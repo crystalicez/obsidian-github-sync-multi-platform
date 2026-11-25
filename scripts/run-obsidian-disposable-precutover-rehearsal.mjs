@@ -30,9 +30,10 @@ let port = initiatorPort;
 const tmpParent = path.join(root, ".tmp", "obsidian-installed-precutover-rehearsal");
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const staleClientMode = process.argv.includes("--stale-client");
-const shadowMode = process.argv.includes("--shadow-index");
-assert.ok(process.argv.slice(2).every(arg => arg === "--stale-client" || arg === "--shadow-index"),
-  "Only --stale-client and --shadow-index are supported; all writes must remain in approved disposable branches.");
+const secretMode = process.argv.includes("--stage-secret");
+const shadowMode = secretMode || process.argv.includes("--shadow-index");
+assert.ok(process.argv.slice(2).every(arg => arg === "--stale-client" || arg === "--shadow-index" || arg === "--stage-secret"),
+  "Only --stale-client, --shadow-index and --stage-secret are supported; all writes must remain in approved disposable branches.");
 
 const oldPassphrase = "d412-old-" + randomBytes(18).toString("base64url");
 const newPassphrase = "d412-new-" + randomBytes(18).toString("base64url");
@@ -397,11 +398,16 @@ try {
       newPassphrase:${JSON.stringify(newPassphrase)},
       requestedIterations:600000,
       prepareShadowIndex:${JSON.stringify(shadowMode)},
+      stageDestinationSecret:${JSON.stringify(secretMode)},
       acknowledgement:"accept-best-effort-power-loss-recovery-risk",
       assertExclusiveInitiatorLease:async()=>{}
     });
     return {
       report,
+      ...(report.stagedSecret ? { stagedSecretVerified: app.secretStorage.getSecret(report.stagedSecret.destinationPassphraseSecretId)===${JSON.stringify(newPassphrase)}
+        && report.stagedSecret.destinationPassphraseSecretId!==p.settings.encryptionPassphraseSecretId
+        && report.stagedSecret.destinationPassphraseSecretId!==p.settings.githubTokenSecretId
+        && app.secretStorage.getSecret(p.settings.encryptionPassphraseSecretId)===${JSON.stringify(oldPassphrase)} } : {}),
       branchStillSource:p.settings.githubBranch===${JSON.stringify(sourceBranch)},
       passphraseStillOld:p.settings.encryptionPassphrase===${JSON.stringify(oldPassphrase)},
       scratchExists:await app.vault.adapter.exists(".obsidian/plugins/${pluginId}/rekey-scratch-${runId}")
@@ -427,6 +433,14 @@ try {
     assert.equal(rehearsal.report.shadow?.powerLossDurabilityProven, false);
   }
 
+  if (secretMode) {
+    assert.equal(rehearsal.report.stagedSecret?.status, "destination-secret-staged-uncommitted");
+    assert.equal(rehearsal.stagedSecretVerified, true);
+    assert.equal(rehearsal.report.stagedSecret?.oldPassphraseCleanupAuthorized, false);
+    const data = await readFile(path.join(vault, ".obsidian/plugins", pluginId, "data.json"), "utf8");
+    assert.ok(!data.includes(newPassphrase) && !data.includes(oldPassphrase));
+    assert.ok(!data.includes(rehearsal.report.stagedSecret.destinationPassphraseSecretId));
+  }
   // Confirm both Backup and Destination refs exist on real GitHub.
   const backupRemote = await readWithRetry(refs[1]);
   const destRemote = await readWithRetry(refs[2]);
@@ -455,9 +469,10 @@ try {
       destinationTreeSha:${JSON.stringify(rehearsal.report.destinationTreeSha)},
       expectedFinalWalGeneration:${rehearsal.report.finalWalGeneration},
       verifyShadowIndex:${JSON.stringify(shadowMode)},
+      recoverStagedSecret:${JSON.stringify(secretMode)},
       expectedFileCount:${rehearsal.report.verifiedFileCount},
       expectedPlaintextBytes:${JSON.stringify(rehearsal.report.verifiedPlaintextBytes)},
-      newPassphrase:${JSON.stringify(newPassphrase)},
+      ${secretMode ? "" : "newPassphrase:" + JSON.stringify(newPassphrase) + ","}
       expectedPhysicalRepositoryId:1284153873,
       defaultBranch:${JSON.stringify(target.defaultBranch)},
     });
@@ -500,6 +515,7 @@ try {
   assert.equal(postRestart.recovered.backupReverified, true);
   assert.equal(postRestart.recovered.destinationReverified, true);
   assert.equal(postRestart.recovered.shadowReverified, shadowMode ? true : undefined);
+  assert.equal(postRestart.recovered.stagedSecretReverified, secretMode ? true : undefined);
   assert.equal(postRestart.recovered.verifiedFileCount, 2);
   assert.equal(postRestart.recovered.cutoverAuthorized, false);
   assert.equal(postRestart.recovered.localCutoverAuthorized, false);
@@ -593,9 +609,10 @@ try {
         destinationTreeSha:${JSON.stringify(rehearsal.report.destinationTreeSha)},
         expectedFinalWalGeneration:${rehearsal.report.finalWalGeneration},
       verifyShadowIndex:${JSON.stringify(shadowMode)},
+      recoverStagedSecret:${JSON.stringify(secretMode)},
         expectedFileCount:${rehearsal.report.verifiedFileCount},
         expectedPlaintextBytes:${JSON.stringify(rehearsal.report.verifiedPlaintextBytes)},
-        newPassphrase:${JSON.stringify(newPassphrase)},
+        ${secretMode ? "" : "newPassphrase:" + JSON.stringify(newPassphrase) + ","}
         expectedPhysicalRepositoryId:1284153873,
         defaultBranch:${JSON.stringify(target.defaultBranch)},
       });
@@ -611,6 +628,7 @@ try {
           backupReverified:recovered.backupReverified,
           destinationReverified:recovered.destinationReverified,
           ...(recovered.shadowReverified ? {shadowReverified:true} : {}),
+          ...(recovered.stagedSecretReverified ? {stagedSecretReverified:true} : {}),
           verifiedFileCount:recovered.verifiedFileCount,
           resumeSyncAuthorized:recovered.resumeSyncAuthorized,
           cutoverAuthorized:recovered.cutoverAuthorized
@@ -629,6 +647,7 @@ try {
       walAuthenticated:true,backupReverified:true,
       destinationReverified:true,verifiedFileCount:2,
       ...(shadowMode ? {shadowReverified:true} : {}),
+      ...(secretMode ? {stagedSecretReverified:true} : {}),
       resumeSyncAuthorized:false,cutoverAuthorized:false
     }, "After stale old Source advances, the initiating device must re-authenticate the ORIGINAL frozen Backup, WAL and destination");
     staleClientReport = {
@@ -656,6 +675,7 @@ try {
     destinationCommitSha: rehearsal.report.destinationCommitSha,
     finalWalGeneration: rehearsal.report.finalWalGeneration,
     ...(shadowMode ? {shadow:rehearsal.report.shadow,shadowReverified:postRestart.recovered.shadowReverified} : {}),
+    ...(secretMode ? {stagedSecretReverified:postRestart.recovered.stagedSecretReverified,distinctSecretId:rehearsal.stagedSecretVerified} : {}),
     verifiedFileCount: rehearsal.report.verifiedFileCount,
     verifiedPlaintextBytes: rehearsal.report.verifiedPlaintextBytes,
     postRestartObservation: postRestart.recovered.observation,
