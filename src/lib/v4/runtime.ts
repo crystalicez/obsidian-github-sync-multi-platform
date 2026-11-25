@@ -1662,7 +1662,6 @@ export class V4PluginRuntime {
     readonly destinationBranch: string
     readonly newPassphrase: string
     readonly requestedIterations: number
-    readonly journalKey: Uint8Array
     readonly acknowledgement: "accept-best-effort-power-loss-recovery-risk"
     readonly assertExclusiveInitiatorLease: () => Promise<void>
     readonly createGitHubClient?: ((branch: string) => GitHubClient) | undefined
@@ -1776,7 +1775,6 @@ export class V4PluginRuntime {
       newPassphrase: input.newPassphrase,
       requestedIterations: input.requestedIterations,
       deviceId: initialSnapshot.deviceId,
-      journalKey: input.journalKey,
       acknowledgement: input.acknowledgement,
       assertExclusiveInitiatorLease: input.assertExclusiveInitiatorLease,
       createGitHubClient: createClient,
@@ -1838,7 +1836,6 @@ export class V4PluginRuntime {
     readonly newPassphrase: string
     readonly expectedPhysicalRepositoryId: number
     readonly defaultBranch: string
-    readonly journalKey: Uint8Array
     readonly createGitHubClient?: ((branch: string) => GitHubClient) | undefined
     readonly signal?: AbortSignal | undefined
   }): Promise<V4InstalledPreCutoverRecoveryReport> {
@@ -1910,7 +1907,6 @@ export class V4PluginRuntime {
       newPassphrase: input.newPassphrase,
       expectedPhysicalRepositoryId: input.expectedPhysicalRepositoryId,
       defaultBranch: input.defaultBranch,
-      journalKey: input.journalKey,
       assertPersistedFenceActive: () => assertV4ReencryptionSyncFenceClear(this.adapter),
       inspectRoute: () => this.inspectFencedReencryptionIndexRoute(),
       inspectFenceAndNoPartialCutover: async () => {

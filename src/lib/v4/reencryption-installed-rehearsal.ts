@@ -86,7 +86,6 @@ export interface V4InstalledPreCutoverRehearsalInput {
   readonly newPassphrase: string
   readonly requestedIterations: number
   readonly deviceId: string
-  readonly journalKey: Uint8Array
   readonly acknowledgement: typeof RISK_ACKNOWLEDGEMENT
   readonly assertExclusiveInitiatorLease: () => Promise<void>
   readonly createGitHubClient: (branch: string) => GitHubClient
@@ -139,7 +138,6 @@ export interface V4InstalledPreCutoverRecoveryInput {
   readonly newPassphrase: string
   readonly expectedPhysicalRepositoryId: number
   readonly defaultBranch: string
-  readonly journalKey: Uint8Array
   readonly assertPersistedFenceActive: () => Promise<void>
   readonly inspectRoute: () => Promise<V4ReencryptionColdStartRouteReport>
   readonly inspectFenceAndNoPartialCutover?: (() => Promise<boolean>) | undefined
@@ -237,7 +235,6 @@ export async function runV4InstalledPreCutoverRehearsal(
   if (!input || input.acknowledgement !== RISK_ACKNOWLEDGEMENT
     || typeof input.runId !== "string" || !RUN_ID.test(input.runId)
     || typeof input.deviceId !== "string" || !input.deviceId
-    || !(input.journalKey instanceof Uint8Array) || input.journalKey.byteLength !== 32
     || typeof input.assertExclusiveInitiatorLease !== "function"
     || typeof input.createGitHubClient !== "function"
     || typeof input.runtimeOwner?.armFenceAndOpenWal !== "function"
@@ -246,12 +243,10 @@ export async function runV4InstalledPreCutoverRehearsal(
   }
   assertV4Pbkdf2Iterations(input.requestedIterations, V4_MIN_NEW_PBKDF2_ITERATIONS)
 
-  const localJournalKey = Uint8Array.from(input.journalKey)
   const newSalt = input.newSalt
     ? Uint8Array.from(input.newSalt)
     : crypto.getRandomValues(new Uint8Array(16))
   if (newSalt.byteLength !== 16) {
-    localJournalKey.fill(0)
     throw new Error("Installed pre-cutover rehearsal requires a 16-byte destination salt.")
   }
 
@@ -399,7 +394,7 @@ export async function runV4InstalledPreCutoverRehearsal(
       runId: input.runId,
       sourceCommitSha: pinnedSourceCommitSha,
       destinationRepoId: wizardProposal.destinationRepoId,
-      journalKey: localJournalKey,
+      journalKey: oldKeyring.journalKey,
     })
     await journal.begin()
     await advance("source-verified", "fenced-and-wal-opened")
@@ -655,7 +650,6 @@ export async function runV4InstalledPreCutoverRehearsal(
       powerLossDurabilityProven: false,
     })
   } finally {
-    localJournalKey.fill(0)
     newSalt.fill(0)
     oldSalt?.fill(0)
     wipeKeyring(oldKeyring)
@@ -685,7 +679,7 @@ export async function runV4InstalledPreCutoverRehearsal(
 export async function inspectV4InstalledPreCutoverRecoveryAfterRestart(
   input: V4InstalledPreCutoverRecoveryInput,
 ): Promise<V4InstalledPreCutoverRecoveryReport> {
-  if (!input || !(input.journalKey instanceof Uint8Array) || input.journalKey.byteLength !== 32
+  if (!input
     || !RUN_ID.test(input.runId)
     || !COMMIT_SHA.test(input.pinnedSourceCommitSha)
     || !COMMIT_SHA.test(input.sourceTreeSha)
@@ -696,7 +690,8 @@ export async function inspectV4InstalledPreCutoverRecoveryAfterRestart(
     return manualRecoveryReport()
   }
 
-  const localJournalKey = Uint8Array.from(input.journalKey)
+  let oldKeyring: V4Keyring | undefined
+  let oldSalt: Uint8Array | undefined
   let wal: V4InstalledRehearsalReadOnlyWal | undefined
   let walAuthenticated = false
   let backupReverified = false
@@ -723,20 +718,77 @@ export async function inspectV4InstalledPreCutoverRecoveryAfterRestart(
       return manualRecoveryReport()
     }
 
-    // 2. Authenticate encrypted WAL on disk at expected final generation.
+    // Hold the read-only WAL lease while authenticating the immutable Backup.
     wal = await input.openReadOnlyWal()
     await wal.assertExclusiveStageLease()
     const sourceRepoId = `${input.owner}/${input.repo}#${input.sourceBranch}`
     const backupRepoId = `${input.owner}/${input.repo}#${input.backupBranch}`
     const destinationRepoId = `${input.owner}/${input.repo}#${input.destinationBranch}`
 
+    const backupPlan = proposeV4SameRepositoryReencryptionBackupBranch({
+      sourceRepoId,
+      backupRepoId,
+      destinationRepoId,
+      pinnedSourceCommitSha: input.pinnedSourceCommitSha,
+      sourcePhysicalRepositoryId: input.expectedPhysicalRepositoryId,
+      backupPhysicalRepositoryId: input.expectedPhysicalRepositoryId,
+      destinationPhysicalRepositoryId: input.expectedPhysicalRepositoryId,
+      expectedPhysicalRepositoryId: input.expectedPhysicalRepositoryId,
+      defaultBranch: input.defaultBranch,
+    })
+    const backupClient = input.createGitHubClient(input.backupBranch)
+    const verifiedBackup = await verifyGitHubFrozenReencryptionBackup({
+      github: backupClient,
+      plan: backupPlan,
+      expectedSourceTreeSha: input.sourceTreeSha,
+      passphrase: input.oldPassphrase,
+      signal: input.signal,
+    })
+    if (!verifiedBackup.backupContentsReadbackVerified
+      || verifiedBackup.verifiedFileCount !== input.expectedFileCount
+      || verifiedBackup.verifiedPlaintextBytes !== input.expectedPlaintextBytes) {
+      return manualRecoveryReport()
+    }
+    // Recover the original journal key from the exact frozen snapshot, never
+    // from an advancing Source tip or a caller-supplied random key.
+    const backupInventory = await verifyGitHubReencryptionForkSourceWithTranscodeInventory({
+      github: backupClient,
+      expectedRepoId: sourceRepoId,
+      expectedBranch: input.backupBranch,
+      expectedPinnedCommitSha: input.pinnedSourceCommitSha,
+      expectedSourceTreeSha: input.sourceTreeSha,
+      expectedPhysicalRepositoryId: input.expectedPhysicalRepositoryId,
+      passphrase: input.oldPassphrase,
+      signal: input.signal,
+    })
+    const sourceKdf = backupInventory.sourceConfig.kdfParams
+    if (!sourceKdf || backupInventory.pinnedSourceCommitSha !== input.pinnedSourceCommitSha
+      || backupInventory.verifiedSource.verifiedFileCount !== input.expectedFileCount
+      || backupInventory.verifiedSource.totalVerifiedPlaintextBytes !== input.expectedPlaintextBytes) {
+      return manualRecoveryReport()
+    }
+    const backupSalt = sourceKdf.salt
+    const backupLiveFiles = new Map<string, { size: number; sha: string }>()
+    for (const rec of backupInventory.sourceRecords) {
+      if (!rec.deleted) backupLiveFiles.set(rec.path, { size: rec.size, sha: rec.plaintextSha256 })
+    }
+    oldSalt = fromBase64Url(sourceKdf.salt)
+    oldKeyring = await deriveV4Keyring({
+      passphrase: input.oldPassphrase, repoId: sourceRepoId,
+      salt: oldSalt, iterations: sourceKdf.iterations,
+    })
+    await wal.assertExclusiveStageLease()
+    input.assertOwnerStillValid?.()
+    backupReverified = true
+
+    // Authenticate the original encrypted WAL at its expected generation.
     const readOnlyJournal = createV4ReencryptionRecoveryJournal({
       adapter: createReadOnlyIndexAdapter(wal.adapter),
       root: wal.journalRoot,
       runId: input.runId,
       sourceCommitSha: input.pinnedSourceCommitSha,
       destinationRepoId,
-      journalKey: localJournalKey,
+      journalKey: oldKeyring.journalKey,
     })
     const walCheck = await inspectV4BestEffortWalRecovery({
       storage: wal,
@@ -768,73 +820,6 @@ export async function inspectV4InstalledPreCutoverRecoveryAfterRestart(
       return manualRecoveryReport()
     }
     walAuthenticated = true
-
-    // 3. Re-verify frozen Backup with original passphrase & capture authenticated inventory.
-    const backupPlan = proposeV4SameRepositoryReencryptionBackupBranch({
-      sourceRepoId,
-      backupRepoId,
-      destinationRepoId,
-      pinnedSourceCommitSha: input.pinnedSourceCommitSha,
-      sourcePhysicalRepositoryId: input.expectedPhysicalRepositoryId,
-      backupPhysicalRepositoryId: input.expectedPhysicalRepositoryId,
-      destinationPhysicalRepositoryId: input.expectedPhysicalRepositoryId,
-      expectedPhysicalRepositoryId: input.expectedPhysicalRepositoryId,
-      defaultBranch: input.defaultBranch,
-    })
-    const backupClient = input.createGitHubClient(input.backupBranch)
-    const verifiedBackup = await verifyGitHubFrozenReencryptionBackup({
-      github: backupClient,
-      plan: backupPlan,
-      expectedSourceTreeSha: input.sourceTreeSha,
-      passphrase: input.oldPassphrase,
-      signal: input.signal,
-    })
-    if (!verifiedBackup.backupContentsReadbackVerified
-      || verifiedBackup.verifiedFileCount !== input.expectedFileCount
-      || verifiedBackup.verifiedPlaintextBytes !== input.expectedPlaintextBytes) {
-      return manualRecoveryReport()
-    }
-    // Extract Backup's source config salt and per-file inventory for cross-verification.
-    const backupInventory = await verifyGitHubReencryptionForkSourceWithTranscodeInventory({
-      github: input.createGitHubClient(input.sourceBranch),
-      expectedRepoId: sourceRepoId,
-      expectedBranch: input.sourceBranch,
-      passphrase: input.oldPassphrase,
-      signal: input.signal,
-    }).catch(() => null)
-    const backupLiveFiles = new Map<string, { size: number; sha: string }>()
-    let backupSalt = backupInventory?.sourceConfig.kdfParams?.salt
-    if (backupInventory && backupInventory.pinnedSourceCommitSha === input.pinnedSourceCommitSha) {
-      for (const rec of backupInventory.sourceRecords) {
-        if (!rec.deleted) backupLiveFiles.set(rec.path, { size: rec.size, sha: rec.plaintextSha256 })
-      }
-    } else {
-      // Source branch may have moved independently; inspect Backup commit directly via backupPlan.
-      const backupSnapshotInv = await verifyGitHubReencryptionForkSourceWithTranscodeInventory({
-        github: {
-          getRepositoryIdentity: () => backupClient.getRepositoryIdentity(),
-          getGitRef: () => backupClient.getGitRef(),
-          getGitCommit: sha => backupClient.getGitCommit(sha),
-          getTreeAt: (sha, rec) => backupClient.getTreeAt(sha, rec),
-          getBlob: sha => backupClient.getBlob(sha),
-        },
-        expectedRepoId: sourceRepoId,
-        expectedBranch: input.backupBranch,
-        expectedPinnedCommitSha: input.pinnedSourceCommitSha,
-        expectedSourceTreeSha: input.sourceTreeSha,
-        expectedPhysicalRepositoryId: input.expectedPhysicalRepositoryId,
-        passphrase: input.oldPassphrase,
-        signal: input.signal,
-      })
-      if (backupSnapshotInv.pinnedSourceCommitSha !== input.pinnedSourceCommitSha) {
-        return manualRecoveryReport()
-      }
-      backupSalt = backupSnapshotInv.sourceConfig.kdfParams?.salt
-      for (const rec of backupSnapshotInv.sourceRecords) {
-        if (!rec.deleted) backupLiveFiles.set(rec.path, { size: rec.size, sha: rec.plaintextSha256 })
-      }
-    }
-    backupReverified = true
 
     // 4. Re-verify zero-parent Destination commit, tree hygiene, KDF policy, WAL receipts 1:1, and full new-key content.
     const destinationClient = input.createGitHubClient(input.destinationBranch)
@@ -902,6 +887,15 @@ export async function inspectV4InstalledPreCutoverRecoveryAfterRestart(
       || snapshot.receipts.some(receipt => !expectedObjectPaths.has(receipt.path) || blobByPath.get(receipt.path) !== receipt.sha)) {
       return manualRecoveryReport()
     }
+    // Bind the final observation to the same exact refs and WAL generation
+    // after all awaited content reads, not a moving branch.
+    const [finalBackupRef, finalDestinationRef] = await Promise.all([
+      backupClient.getGitRef(), destinationClient.getGitRef(),
+    ])
+    if (finalBackupRef.sha !== input.pinnedSourceCommitSha
+      || finalDestinationRef.sha !== input.destinationCommitSha) return manualRecoveryReport()
+    await wal.assertExclusiveStageLease()
+    await readOnlyJournal.assertHealthySnapshot(input.expectedFinalWalGeneration)
     destinationReverified = true
 
     input.assertOwnerStillValid?.()
@@ -922,7 +916,8 @@ export async function inspectV4InstalledPreCutoverRecoveryAfterRestart(
   } catch {
     return manualRecoveryReport()
   } finally {
-    localJournalKey.fill(0)
+    oldSalt?.fill(0)
+    wipeKeyring(oldKeyring)
     await wal?.release().catch(() => {})
   }
 }

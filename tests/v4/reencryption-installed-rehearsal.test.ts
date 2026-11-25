@@ -14,6 +14,7 @@ import { V4_REENCRYPTION_SYNC_FENCE_ROOT } from "../../src/lib/v4/reencryption-s
 import { planV4PluginPrivateWalLocation } from "../../src/lib/v4/reencryption-plugin-wal-location"
 import { verifyGitHubReencryptionForkSource } from "../../src/lib/v4/reencryption-trusted-loader"
 import { deriveV4Keyring } from "../../src/lib/v4/crypto"
+import { createV4ReencryptionRecoveryJournal } from "../../src/lib/v4/reencryption-recovery-journal"
 import { V4StorageCodec } from "../../src/lib/v4/storage-codec"
 import { buildV4RemoteMetadata } from "../../src/lib/v4/remote-index"
 import type { V4RemoteConfig, V4RemoteHead } from "../../src/lib/v4/protocol-types"
@@ -377,7 +378,6 @@ test("D412 installed Runtime orchestrates Source -> Backup -> Staging -> Scratch
     const runId = "d412-rehearsal-run-01"
     const backupBranch = "backup/d412-rehearsal"
     const destinationBranch = "rekey/d412-rehearsal"
-    const journalKey = new Uint8Array(32).fill(0x5a)
 
     const report = await runtime1.runtime.runFencedReencryptionPreCutoverRehearsal({
       runId,
@@ -385,7 +385,6 @@ test("D412 installed Runtime orchestrates Source -> Backup -> Staging -> Scratch
       destinationBranch,
       newPassphrase: NEW_PASSPHRASE,
       requestedIterations: 700_000,
-      journalKey: Uint8Array.from(journalKey),
       acknowledgement: "accept-best-effort-power-loss-recovery-risk",
       assertExclusiveInitiatorLease: async () => {},
       createGitHubClient: makeClientFactory(),
@@ -434,6 +433,33 @@ test("D412 installed Runtime orchestrates Source -> Backup -> Staging -> Scratch
       passphrase: OLD_PASSPHRASE,
     }))
 
+    // Independently authenticate the on-disk journal using the original
+    // Source key derived from known fixture metadata, not a rehearsal secret.
+    const layout = await planV4PluginPrivateWalLocation({ configDir: CONFIG_DIR, pluginId: PLUGIN_ID, runId })
+    const journalAdapter = {
+      read: (relative: string) => readFile(path.join(vault.pluginDir, relative), "utf8"),
+      exists: async (relative: string) => stat(path.join(vault.pluginDir, relative)).then(() => true, () => false),
+      write: async () => { throw Error("Read-only independent journal check") },
+      mkdir: async () => { throw Error("Read-only independent journal check") },
+    }
+    const keyring = await deriveV4Keyring({
+      passphrase: OLD_PASSPHRASE, repoId: `${OWNER}/${REPO}#${SOURCE_BRANCH}`,
+      salt: utf8ToBytes("d412-source-salt"), iterations: 600_000,
+    })
+    const journalInput = {
+      adapter: journalAdapter, root: layout.journalRoot, runId,
+      sourceCommitSha: pinnedSourceCommitSha, destinationRepoId: `${OWNER}/${REPO}#${destinationBranch}`,
+    }
+    try {
+      const independent = createV4ReencryptionRecoveryJournal({ ...journalInput, journalKey: keyring.journalKey })
+      const snapshot = await independent.assertHealthySnapshot(report.finalWalGeneration)
+      assert.equal(snapshot.verifiedRefObservations.length, 2)
+      const foreign = createV4ReencryptionRecoveryJournal({ ...journalInput, journalKey: new Uint8Array(32).fill(0x5a) })
+      await assert.rejects(() => foreign.assertHealthySnapshot(report.finalWalGeneration))
+    } finally {
+      for (const key of Object.values(keyring)) key.fill(0)
+    }
+
     // Simulate real Obsidian restart with a brand-new Runtime on the same Vault.
     runtime1.runtime.dispose()
     runtime1 = undefined
@@ -460,7 +486,6 @@ test("D412 installed Runtime orchestrates Source -> Backup -> Staging -> Scratch
       newPassphrase: NEW_PASSPHRASE,
       expectedPhysicalRepositoryId: PHYSICAL_REPO_ID,
       defaultBranch: DEFAULT_BRANCH,
-      journalKey: Uint8Array.from(journalKey),
       createGitHubClient: makeClientFactory(),
     })
 
@@ -502,10 +527,9 @@ test("D414 installed post-restart Recovery authenticates frozen Backup after ind
     const runId = "d414-source-advanced-01"
     const backupBranch = "backup/d414-frozen"
     const destinationBranch = "rekey/d414-orphan"
-    const journalKey = new Uint8Array(32).fill(0x45)
     const report = await before.runtime.runFencedReencryptionPreCutoverRehearsal({
       runId, backupBranch, destinationBranch, newPassphrase: NEW_PASSPHRASE,
-      requestedIterations: 700_000, journalKey: Uint8Array.from(journalKey),
+      requestedIterations: 700_000,
       acknowledgement: "accept-best-effort-power-loss-recovery-risk",
       assertExclusiveInitiatorLease: async () => {},
       createGitHubClient: makeClientFactory(),
@@ -540,7 +564,7 @@ test("D414 installed post-restart Recovery authenticates frozen Backup after ind
       expectedFileCount: 1, expectedPlaintextBytes: String(noteBytes.byteLength),
       newPassphrase: NEW_PASSPHRASE,
       expectedPhysicalRepositoryId: PHYSICAL_REPO_ID,
-      defaultBranch: DEFAULT_BRANCH, journalKey: Uint8Array.from(journalKey),
+      defaultBranch: DEFAULT_BRANCH,
       createGitHubClient: makeClientFactory(),
     })
     const recovered = await inspect()
@@ -591,7 +615,6 @@ test("D412 refuses rehearsal before arming Sync fence when Backup or Destination
         destinationBranch: "rekey/unused-dest",
         newPassphrase: NEW_PASSPHRASE,
         requestedIterations: 600_000,
-        journalKey: new Uint8Array(32).fill(0x33),
         acknowledgement: "accept-best-effort-power-loss-recovery-risk",
         assertExclusiveInitiatorLease: async () => {},
         createGitHubClient: makeClientFactory(),
@@ -629,7 +652,6 @@ test("D412 rejects physical Vault drift before publishing Destination ref and pr
         destinationBranch,
         newPassphrase: NEW_PASSPHRASE,
         requestedIterations: 600_000,
-        journalKey: new Uint8Array(32).fill(0x44),
         acknowledgement: "accept-best-effort-power-loss-recovery-risk",
         assertExclusiveInitiatorLease: async () => {},
         createGitHubClient: makeClientFactory(),
@@ -666,7 +688,6 @@ test("D412 post-restart recovery fails closed on wrong new passphrase or tampere
     const runId = "d412-tamper-recovery-01"
     const backupBranch = "backup/d412-tamper"
     const destinationBranch = "rekey/d412-tamper"
-    const journalKey = new Uint8Array(32).fill(0x66)
 
     const report = await runtime1.runtime.runFencedReencryptionPreCutoverRehearsal({
       runId,
@@ -674,7 +695,6 @@ test("D412 post-restart recovery fails closed on wrong new passphrase or tampere
       destinationBranch,
       newPassphrase: NEW_PASSPHRASE,
       requestedIterations: 600_000,
-      journalKey: Uint8Array.from(journalKey),
       acknowledgement: "accept-best-effort-power-loss-recovery-risk",
       assertExclusiveInitiatorLease: async () => {},
       createGitHubClient: makeClientFactory(),
@@ -697,7 +717,6 @@ test("D412 post-restart recovery fails closed on wrong new passphrase or tampere
       newPassphrase: "wrong-new-passphrase",
       expectedPhysicalRepositoryId: PHYSICAL_REPO_ID,
       defaultBranch: DEFAULT_BRANCH,
-      journalKey: Uint8Array.from(journalKey),
       createGitHubClient: makeClientFactory(),
     })
     assert.equal(wrongPass.observation, "manual-recovery-required")
@@ -721,7 +740,6 @@ test("D412 post-restart recovery fails closed on wrong new passphrase or tampere
       newPassphrase: NEW_PASSPHRASE,
       expectedPhysicalRepositoryId: PHYSICAL_REPO_ID,
       defaultBranch: DEFAULT_BRANCH,
-      journalKey: Uint8Array.from(journalKey),
       createGitHubClient: makeClientFactory(),
     })
     assert.equal(partialCutover.observation, "manual-recovery-required")
@@ -748,7 +766,6 @@ test("D412 post-restart recovery fails closed on wrong new passphrase or tampere
       newPassphrase: NEW_PASSPHRASE,
       expectedPhysicalRepositoryId: PHYSICAL_REPO_ID,
       defaultBranch: DEFAULT_BRANCH,
-      journalKey: Uint8Array.from(journalKey),
       createGitHubClient: makeClientFactory(),
     })
     assert.equal(tamperedWal.observation, "manual-recovery-required")

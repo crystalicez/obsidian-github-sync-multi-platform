@@ -35,7 +35,6 @@ assert.ok(process.argv.slice(2).every(arg => arg === "--stale-client"),
 
 const oldPassphrase = "d412-old-" + randomBytes(18).toString("base64url");
 const newPassphrase = "d412-new-" + randomBytes(18).toString("base64url");
-const journalKeyB64 = randomBytes(32).toString("base64");
 const runId = "d412live" + randomBytes(6).toString("hex");
 const noteText = "# D412 Real Obsidian Rehearsal\n\nสวัสดีครับ 🌍\n";
 const binaryBytes = Buffer.from(Array.from({ length: 2048 }, (_, i) => (i * 29 + 3) & 0xff));
@@ -59,7 +58,7 @@ const ownedProcessIds = new Set();
 
 const redact = value => {
   let msg = String(value?.message ?? value ?? "");
-  for (const secret of [configuration?.token, oldPassphrase, newPassphrase, journalKeyB64].filter(Boolean)) {
+  for (const secret of [configuration?.token, oldPassphrase, newPassphrase].filter(Boolean)) {
     msg = msg.replaceAll(secret, "[redacted]");
   }
   return msg
@@ -390,20 +389,15 @@ try {
   // Run D412 pre-cutover rehearsal inside live installed Obsidian.
   const rehearsal = await evalInVault(`(async()=>{
     const p=app.plugins.plugins[${JSON.stringify(pluginId)}];
-    const keyBytes=Uint8Array.from(atob(${JSON.stringify(journalKeyB64)}),c=>c.charCodeAt(0));
-    let report;
-    try{
-      report=await p.v4Runtime.runFencedReencryptionPreCutoverRehearsal({
-        runId:${JSON.stringify(runId)},
-        backupBranch:${JSON.stringify(backupBranch)},
-        destinationBranch:${JSON.stringify(destinationBranch)},
-        newPassphrase:${JSON.stringify(newPassphrase)},
-        requestedIterations:600000,
-        journalKey:keyBytes,
-        acknowledgement:"accept-best-effort-power-loss-recovery-risk",
-        assertExclusiveInitiatorLease:async()=>{}
-      });
-    }finally{keyBytes.fill(0)}
+    const report=await p.v4Runtime.runFencedReencryptionPreCutoverRehearsal({
+      runId:${JSON.stringify(runId)},
+      backupBranch:${JSON.stringify(backupBranch)},
+      destinationBranch:${JSON.stringify(destinationBranch)},
+      newPassphrase:${JSON.stringify(newPassphrase)},
+      requestedIterations:600000,
+      acknowledgement:"accept-best-effort-power-loss-recovery-risk",
+      assertExclusiveInitiatorLease:async()=>{}
+    });
     return {
       report,
       branchStillSource:p.settings.githubBranch===${JSON.stringify(sourceBranch)},
@@ -442,26 +436,21 @@ try {
     let settingsFenceDenied=false;
     try{await p.v4Runtime.assertReencryptionSettingsSaveAllowed()}
     catch{settingsFenceDenied=true}
-    const keyBytes=Uint8Array.from(atob(${JSON.stringify(journalKeyB64)}),c=>c.charCodeAt(0));
-    let recovered;
-    try{
-      recovered=await p.v4Runtime.inspectFencedReencryptionPreCutoverRecovery({
-        runId:${JSON.stringify(runId)},
-        backupBranch:${JSON.stringify(backupBranch)},
-        destinationBranch:${JSON.stringify(destinationBranch)},
-        pinnedSourceCommitSha:${JSON.stringify(rehearsal.report.pinnedSourceCommitSha)},
-        sourceTreeSha:${JSON.stringify(rehearsal.report.sourceTreeSha)},
-        destinationCommitSha:${JSON.stringify(rehearsal.report.destinationCommitSha)},
-        destinationTreeSha:${JSON.stringify(rehearsal.report.destinationTreeSha)},
-        expectedFinalWalGeneration:${rehearsal.report.finalWalGeneration},
-        expectedFileCount:${rehearsal.report.verifiedFileCount},
-        expectedPlaintextBytes:${JSON.stringify(rehearsal.report.verifiedPlaintextBytes)},
-        newPassphrase:${JSON.stringify(newPassphrase)},
-        expectedPhysicalRepositoryId:1284153873,
-        defaultBranch:${JSON.stringify(target.defaultBranch)},
-        journalKey:keyBytes
-      });
-    }finally{keyBytes.fill(0)}
+    const recovered=await p.v4Runtime.inspectFencedReencryptionPreCutoverRecovery({
+      runId:${JSON.stringify(runId)},
+      backupBranch:${JSON.stringify(backupBranch)},
+      destinationBranch:${JSON.stringify(destinationBranch)},
+      pinnedSourceCommitSha:${JSON.stringify(rehearsal.report.pinnedSourceCommitSha)},
+      sourceTreeSha:${JSON.stringify(rehearsal.report.sourceTreeSha)},
+      destinationCommitSha:${JSON.stringify(rehearsal.report.destinationCommitSha)},
+      destinationTreeSha:${JSON.stringify(rehearsal.report.destinationTreeSha)},
+      expectedFinalWalGeneration:${rehearsal.report.finalWalGeneration},
+      expectedFileCount:${rehearsal.report.verifiedFileCount},
+      expectedPlaintextBytes:${JSON.stringify(rehearsal.report.verifiedPlaintextBytes)},
+      newPassphrase:${JSON.stringify(newPassphrase)},
+      expectedPhysicalRepositoryId:1284153873,
+      defaultBranch:${JSON.stringify(target.defaultBranch)},
+    });
     // Open Wizard UI, verifySource fails closed for pending recovery, and click Inspect Recovery button.
     p.openReencryptionWizard();
     await new Promise(r=>setTimeout(r,200));
@@ -583,26 +572,21 @@ try {
       let fenced=false;
       try{await p.v4Runtime.assertReencryptionSettingsSaveAllowed()}
       catch{fenced=true}
-      const keyBytes=Uint8Array.from(atob(${JSON.stringify(journalKeyB64)}),c=>c.charCodeAt(0));
-      let recovered;
-      try{
-        recovered=await p.v4Runtime.inspectFencedReencryptionPreCutoverRecovery({
-          runId:${JSON.stringify(runId)},
-          backupBranch:${JSON.stringify(backupBranch)},
-          destinationBranch:${JSON.stringify(destinationBranch)},
-          pinnedSourceCommitSha:${JSON.stringify(rehearsal.report.pinnedSourceCommitSha)},
-          sourceTreeSha:${JSON.stringify(rehearsal.report.sourceTreeSha)},
-          destinationCommitSha:${JSON.stringify(rehearsal.report.destinationCommitSha)},
-          destinationTreeSha:${JSON.stringify(rehearsal.report.destinationTreeSha)},
-          expectedFinalWalGeneration:${rehearsal.report.finalWalGeneration},
-          expectedFileCount:${rehearsal.report.verifiedFileCount},
-          expectedPlaintextBytes:${JSON.stringify(rehearsal.report.verifiedPlaintextBytes)},
-          newPassphrase:${JSON.stringify(newPassphrase)},
-          expectedPhysicalRepositoryId:1284153873,
-          defaultBranch:${JSON.stringify(target.defaultBranch)},
-          journalKey:keyBytes
-        });
-      }finally{keyBytes.fill(0)}
+      const recovered=await p.v4Runtime.inspectFencedReencryptionPreCutoverRecovery({
+        runId:${JSON.stringify(runId)},
+        backupBranch:${JSON.stringify(backupBranch)},
+        destinationBranch:${JSON.stringify(destinationBranch)},
+        pinnedSourceCommitSha:${JSON.stringify(rehearsal.report.pinnedSourceCommitSha)},
+        sourceTreeSha:${JSON.stringify(rehearsal.report.sourceTreeSha)},
+        destinationCommitSha:${JSON.stringify(rehearsal.report.destinationCommitSha)},
+        destinationTreeSha:${JSON.stringify(rehearsal.report.destinationTreeSha)},
+        expectedFinalWalGeneration:${rehearsal.report.finalWalGeneration},
+        expectedFileCount:${rehearsal.report.verifiedFileCount},
+        expectedPlaintextBytes:${JSON.stringify(rehearsal.report.verifiedPlaintextBytes)},
+        newPassphrase:${JSON.stringify(newPassphrase)},
+        expectedPhysicalRepositoryId:1284153873,
+        defaultBranch:${JSON.stringify(target.defaultBranch)},
+      });
       return {
         fenced,
         stillSource:p.settings.githubBranch===${JSON.stringify(sourceBranch)},
