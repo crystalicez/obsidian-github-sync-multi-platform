@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import {spawn,spawnSync} from "node:child_process";
 import {createHash,randomBytes} from "node:crypto";
 import {createReadStream} from "node:fs";
-import {copyFile,mkdir,stat,writeFile} from "node:fs/promises";
+import {copyFile,mkdir,stat,writeFile,readFile} from "node:fs/promises";
 import {verifyNativeBulkDisk} from "./obsidian-live-ui-mode.mjs";
 import {verifyPngBytes} from "./ui-visual-assertions.mjs";
 import path from "node:path";
@@ -28,7 +28,7 @@ export const nativeVaultInventoryExpression = `(async()=>{
 })()`;
 export async function restoreEncryptedToSecondObsidian({
  exe,runRoot,port,pluginId,sourceRoot,configuration,passphrase,expectedContent,mode="encrypted",
- expectedFiles=[],absentPaths=[],exercisePeerConflict=false,expectedBinary=null,convergeAfterPeerEdit=null,peerBinaryJourneys=[],beforePeerBinary=null,afterPeerBinary=null,
+ expectedFiles=[],absentPaths=[],exercisePeerConflict=false,expectedBinary=null,convergeAfterPeerEdit=null,peerBinaryJourneys=[],beforePeerBinary=null,afterPeerBinary=null,publicationAdvanceNote=null,
 }){
  assert.ok(Number.isInteger(port)&&port>=1024&&port<=65535,"Second CDP port is unsafe");
  assert.ok(path.basename(runRoot).match(/^[0-9a-f]{16}$/u),"Second vault requires a synthetic random run ID");
@@ -284,7 +284,27 @@ export async function restoreEncryptedToSecondObsidian({
     peerFinalInventoryCount=actual.length;
    }
   }
-  return {binaryJourneys,peerConverged,peerOpenEditorGuardVerified,peerFinalInventoryCount,peerRestored:true,peerVaultPathMatches:true,filenameMatched:true,bytesRestored:Buffer.byteLength(restored.content,"utf8"),peerScreenshot:evidencePath,verifiedJourneyFiles:verifiedFiles.length,peerMutated,peerDiagnostics:restored.diagnostics,peerPullWallMs:restored.peerPullWallMs};
+  let publicationAdvance=null;
+  if(publicationAdvanceNote){
+   assert.match(publicationAdvanceNote.path,/^Publication-peer-[a-f0-9]{16}\.md$/u);
+   assert.ok(typeof publicationAdvanceNote.content==="string"&&Buffer.byteLength(publicationAdvanceNote.content)<4096);
+   const result=await evaluate(`(async()=>{
+    const p=app.plugins.plugins[${JSON.stringify(pluginId)}];const item=${JSON.stringify(publicationAdvanceNote)};
+    if(app.vault.getAbstractFileByPath(item.path)||p.isSyncInProgress||p.settings.githubBranch!==${JSON.stringify(configuration.branch)})throw Error("Unexpected peer publication state");
+    await app.vault.create(item.path,item.content);
+    const outcome=await p.v4Runtime.manualSync();const s=p.v4Runtime.progressSnapshot;
+    return {status:outcome?.status,lifecycle:s.lifecycle,changedFiles:outcome?.changedFiles,apiFailures:s.diagnostics?.apiFailures};
+   })()`,240000);
+   assert.ok(result.status==="completed"&&result.lifecycle==="success"&&result.changedFiles>0&&result.apiFailures===0,"Peer publication while source stopped failed: "+JSON.stringify(result));
+   const expected=[{path:"UI-smoke.md",content:expectedContent},...expectedFiles,publicationAdvanceNote].map(item=>({path:item.path,size:Buffer.byteLength(item.content),sha256:createHash("sha256").update(item.content).digest("hex")})).sort((a,b)=>a.path<b.path?-1:a.path>b.path?1:0);
+   const inventory=await evaluate(nativeVaultInventoryExpression,240000);
+   assert.deepEqual(inventory,expected,"Peer exact inventory after publication differs");
+   for(const item of expected)assert.equal(createHash("sha256").update(await readFile(path.join(vault,item.path))).digest("hex"),item.sha256,"Peer disk hash mismatch");
+   const noop=await evaluate(`(async()=>{const p=app.plugins.plugins[${JSON.stringify(pluginId)}];const outcome=await p.v4Runtime.manualSync();const s=p.v4Runtime.progressSnapshot;return {status:outcome?.status,lifecycle:s.lifecycle,changedFiles:outcome?.changedFiles,uploadBytes:s.diagnostics?.uploadBytes,apiFailures:s.diagnostics?.apiFailures};})()`,240000);
+   assert.deepEqual(noop,{status:"completed",lifecycle:"no-change",changedFiles:0,uploadBytes:0,apiFailures:0},"Peer after advance must be no-op");
+   publicationAdvance={result,inventory,noop};
+  }
+  return {publicationAdvance,binaryJourneys,peerConverged,peerOpenEditorGuardVerified,peerFinalInventoryCount,peerRestored:true,peerVaultPathMatches:true,filenameMatched:true,bytesRestored:Buffer.byteLength(restored.content,"utf8"),peerScreenshot:evidencePath,verifiedJourneyFiles:verifiedFiles.length,peerMutated,peerDiagnostics:restored.diagnostics,peerPullWallMs:restored.peerPullWallMs};
  }finally{
   if(ws){try{ws.close()}catch{}}
   if(child?.pid){

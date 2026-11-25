@@ -35,6 +35,8 @@ assert.ok(fileMiB===undefined||(/^[1-9][0-9]{0,2}$/u.test(fileMiB)&&Number(fileM
 const nativeLargeBytes=native100mb?100_000_000:fileMiB===undefined?0:Number(fileMiB)*1024*1024;
 const restartJourney=opts.includes("--restart-journey");
 const publicationCrashJourney=opts.includes("--publication-crash-journey");
+const publicationAdvancedHead=opts.includes("--publication-advanced-head");
+assert.ok(!publicationAdvancedHead||publicationCrashJourney,"Advanced HEAD requires publication crash journey");
 const networkJourney=opts.includes("--network-journey");
 assert.ok(!networkJourney||(nativeLargeBytes>=8*1024*1024&&nativeLargeBytes<=32*1024*1024&&!restartJourney&&!autoJourney&&!journey),"Network journey requires a separate 8–32 MiB binary roundtrip");
 assert.ok(!restartJourney||verifyPeer,"Restart journey requires second real Vault verification");
@@ -567,6 +569,25 @@ try{
    processHandle=undefined;
    publicationCrashEvidence.forcedOwnedProcessRestart=true;
    await sleep(1500);
+   let expectedHead=accepted.candidate,advancedPeer=null;
+   if(publicationAdvancedHead){
+    const peerNote={path:"Publication-peer-"+runId+".md",content:"# Native peer publication while source stopped\n\n"+randomBytes(32).toString("hex")+"\n"};
+    assertTrue(!processHandle&&!ws,"Source must remain stopped during independent peer publication");
+    advancedPeer=await restoreEncryptedToSecondObsidian({
+     exe,runRoot,port:firstPort+1,pluginId:id,sourceRoot:root,configuration,passphrase,mode,
+     expectedContent:"# Synthetic remote UI E2E\n\nSecond revision from Obsidian.\n",
+     expectedFiles:[item],publicationAdvanceNote:peerNote,
+    });
+    assertTrue(advancedPeer.peerRestored&&advancedPeer.verifiedJourneyFiles===1&&advancedPeer.publicationAdvance?.inventory.length===3,"Independent peer publication proof missing");
+    const next=await waitUntil(async()=>{const h=await readState(configuration);return h.kind==="present"&&h.sha!==accepted.candidate?h:null;},30000,"peer advanced HEAD visibility");
+    const nextCommit=await githubReadJson("git/commits/"+next.sha);
+    assertTrue(nextCommit.parents?.length===1&&nextCommit.parents[0].sha===accepted.candidate,"Peer commit must directly descend from accepted candidate");
+    expectedHead=next.sha;
+    restartFiles.push(peerNote);
+    publicationCrashEvidence.advancedHead=expectedHead;
+    publicationCrashEvidence.peerAdvance=advancedPeer.publicationAdvance;
+    console.log(JSON.stringify({kind:"native-publication-peer-advanced",candidate:accepted.candidate,advancedHead:expectedHead,inventory:advancedPeer.publicationAdvance.inventory}));
+   }
    const production=path.join(root,"main.js");
    assertTrue(!(await readFile(production,"utf8")).includes("__obsidianD501NativeRequest"),"Production restart bundle must be uninstrumented");
    await copyFile(production,path.join(vault,".obsidian","plugins",id,"main.js"));
@@ -575,14 +596,22 @@ try{
    const persisted=await evaluate(`(()=>{const p=app.plugins.plugins[${JSON.stringify(id)}];const d=${JSON.stringify(prepared)};return {device:p.settings.vault,credentials:p.settings.githubOwner===d.owner&&p.settings.githubRepo===d.repo&&p.settings.githubBranch===d.branch&&p.settings.githubToken===d.token&&p.settings.encryptionPassphrase===d.passphrase,manualOnly:!p.settings.syncOnStartup&&!p.settings.syncOnLocalChange&&!p.settings.scheduledSyncEnabled,hookAbsent:!globalThis.__obsidianD501NativeRequest&&!globalThis.__d510PublicationCrash};})()`);
    assertTrue(persisted.device===prior.device&&persisted.credentials&&persisted.manualOnly&&persisted.hookAbsent,"Restart changed identity, credentials or manual-only state");
    assert.deepEqual(await readFile(path.join(vault,item.path)),bytes,"Crash changed local note bytes");
-   assertTrue((await readState(configuration)).sha===accepted.candidate,"Remote HEAD changed during restart");
+   assertTrue((await readState(configuration)).sha===expectedHead,"Remote HEAD changed during restart");
    const recovery=await evaluate(`(async()=>{const p=app.plugins.plugins[${JSON.stringify(id)}];const outcome=await p.v4Runtime.manualSync();const s=p.v4Runtime.progressSnapshot;return {status:outcome?.status,lifecycle:s.lifecycle,changedFiles:outcome?.changedFiles,uploadBytes:s.diagnostics?.uploadBytes,apiFailures:s.diagnostics?.apiFailures,error:s.errorMessage?.slice(0,180)};})()`,240000);
    console.log(JSON.stringify({kind:"native-publication-crash-recovery",recovery}));
-   assertTrue(recovery.status==="completed"&&recovery.lifecycle==="no-change"&&recovery.changedFiles===0&&recovery.uploadBytes===0&&recovery.apiFailures===0,"Ordinary recovery after publication crash failed: "+redact(JSON.stringify(recovery)));
-   assertTrue((await readState(configuration)).sha===accepted.candidate,"Recovery republished or changed HEAD");
+   assertTrue(recovery.status==="completed"&&(publicationAdvancedHead?recovery.lifecycle==="success"&&recovery.changedFiles>0:recovery.lifecycle==="no-change"&&recovery.changedFiles===0)&&recovery.uploadBytes===0&&recovery.apiFailures===0,"Ordinary recovery after publication crash failed: "+redact(JSON.stringify(recovery)));
+   assertTrue((await readState(configuration)).sha===expectedHead,"Recovery republished or changed HEAD");
    assert.deepEqual(await readFile(path.join(vault,item.path)),bytes,"Recovery changed local note bytes");
-   finalSha=accepted.candidate;
+   finalSha=expectedHead;
    restartFiles.push(item);
+   if(advancedPeer){
+    const inventory=await evaluate(nativeVaultInventoryExpression,240000);
+    assert.deepEqual(inventory,advancedPeer.publicationAdvance.inventory,"Recovered source exact inventory differs from independent peer");
+    for(const entry of inventory)assertTrue(createHash("sha256").update(await readFile(path.join(vault,entry.path))).digest("hex")===entry.sha256,"Recovered source disk bytes differ");
+    publicationCrashEvidence.peerDiskVerified=true;
+    publicationCrashEvidence.exactConvergence=true;
+    peerRestored=true;peerDiagnosticEvidence=advancedPeer.peerDiagnostics;nativeDownloadWallMs=advancedPeer.peerPullWallMs;
+   }
    await verifyNoop("after-native-publication-crash");
    Object.assign(publicationCrashEvidence,{recovered:true,persistedCredentials:true,productionBundleRestart:true,noDuplicateCommit:true,recovery});
    journeySteps.push("actual strict CAS accepted, response held, owned process killed, ordinary production restart recovered without duplicate commit");
@@ -622,7 +651,7 @@ try{
    await verifyNoop("after-restart-edit");
    console.log(JSON.stringify({kind:"native-restart",...restartEvidence}));
   }
-  if(verifyPeer){
+  if(verifyPeer&&!publicationAdvancedHead){
    const reconcileSourceConflict=async()=>{
     // Publication success may precede REST ref visibility. Observe the peer's
     // competing commit before starting the source conflict, not after it.
