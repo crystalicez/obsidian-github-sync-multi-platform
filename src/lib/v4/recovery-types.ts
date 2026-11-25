@@ -38,7 +38,16 @@ export interface V4RecoveryTrashMutation {
 
 export type V4RecoveryLocalMutation = V4RecoveryStageMutation | V4RecoveryTrashMutation
 
+/** Candidate-bound identity evidence for a new file published from the local Vault. */
+export interface V4RecoveryPublishedCreate {
+  path: string
+  fileId: string
+  hash: string
+  size: number
+}
+
 export interface V4RecoveryPayload {
+  publishedCreates?: V4RecoveryPublishedCreate[] | undefined
   mutations: V4RecoveryLocalMutation[]
   completedMutationIds: string[]
 }

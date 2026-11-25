@@ -2338,6 +2338,64 @@ test("D494 peer recovery binds only the exact recovered conflict copy identity a
   }
 })
 
+test("D502 a confirmed publication with lost response and unavailable readback reuses only exact new local identity", async () => {
+  for (const edited of [false, true]) {
+    const github = new RuntimeMemoryGitHub()
+    const source = plaintextRuntimeFixture("base.md", github, "writer")
+    const peer = plaintextRuntimeFixture([], github, "reader")
+    try {
+      assert.equal((await source.runtime.forcePush() as { status: string }).status, "completed")
+      const previous = github.ref?.sha
+      const note = new TextEncoder().encode("new locally published file")
+      const path = "publication.md"
+      const file = await source.plugin.app.vault.createBinary(path, note.buffer)
+      file.stat = { size: note.byteLength, mtime: 2 }
+      const update = github.updateGitRef.bind(github)
+      const read = github.getGitRefOrNull.bind(github)
+      let unavailable = false
+      let updates = 0
+      github.updateGitRef = async (sha, expected) => {
+        updates++
+        await update(sha, expected)
+        unavailable = true
+        throw Error("simulated lost successful CAS response")
+      }
+      github.getGitRefOrNull = async () => {
+        if (unavailable) throw Error("simulated unavailable ref readback")
+        return read()
+      }
+      assert.equal((await source.runtime.manualSync() as { status: string }).status, "failed")
+      const candidate = github.ref?.sha
+      assert.notEqual(candidate, previous)
+      assert.equal(updates, 1)
+      unavailable = false
+      const replacement = new TextEncoder().encode("edited after publication")
+      if (edited) {
+        source.contents.set(path, replacement)
+        file.stat = { size: replacement.byteLength, mtime: 3 }
+      }
+      const recovered = await source.runtime.manualSync() as { status: string }
+      if (edited) {
+        assert.equal(recovered.status, "failed")
+        assert.match(source.runtime.progressSnapshot.errorMessage ?? "", /path collision/u)
+        assert.deepEqual(source.contents.get(path), replacement)
+      } else {
+        assert.equal(recovered.status, "completed", source.runtime.progressSnapshot.errorMessage)
+        assert.deepEqual(source.contents.get(path), note)
+        assert.equal((await peer.runtime.forcePull() as { status: string }).status, "completed")
+        assert.deepEqual(peer.contents.get(path), note)
+        await source.runtime.manualSync()
+        assert.equal(source.runtime.progressSnapshot.lifecycle, "no-change")
+      }
+      assert.equal(updates, 1)
+      assert.equal(github.ref?.sha, candidate)
+    } finally {
+      source.runtime.dispose()
+      peer.runtime.dispose()
+    }
+  }
+})
+
 test("D491 two Runtime devices converge after failed upload and a queued edit during recovery", async () => {
   const github = new RuntimeMemoryGitHub()
   const writer = plaintextRuntimeFixture(["first.md", "second.md"], github, "writer")

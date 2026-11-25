@@ -631,6 +631,16 @@ export class V4SyncSession {
       const remoteByPath = new Map(remoteRecords.filter(record => !record.deleted).map(record => [record.path, record]))
       const basePaths = new Set(identityBaseRecords.map(record => record.path.normalize("NFC").toLowerCase()))
       const baseIds = new Set(identityBaseRecords.map(record => record.fileId))
+      // Recover an exact locally published create only at the verified candidate.
+      if (recovery.header.candidateCommitSha === remote.commitSha) {
+        for (const receipt of recovery.payload?.publishedCreates ?? []) {
+          const record = remoteByPath.get(receipt.path)
+          if (!record || record.fileId !== receipt.fileId
+            || basePaths.has(record.path.normalize("NFC").toLowerCase()) || baseIds.has(record.fileId)
+            || receipt.hash !== record.plaintextSha256 || receipt.size !== record.size) continue
+          recoveredPulls.set(record.path, record)
+        }
+      }
       for (const mutation of recovery.payload?.mutations ?? []) {
         if (mutation.kind !== "stage-write" || mutation.precondition.exists || !completed.has(mutation.id)) continue
         const record = remoteByPath.get(mutation.path)
@@ -1272,6 +1282,20 @@ export class V4SyncSession {
       entries: [...streamedEntries, ...uploaded.entries],
       deletions: [...deletions],
     })
+    const publishedCreates = options.operation === "normal" ? pushContexts.flatMap(context => {
+      const { binding, change, previous, after } = context
+      if (previous || change.kind !== "create" || !after || binding.source?.kind !== "vault"
+        || binding.source.path !== after.path) return []
+      const scanned = localById.get(after.fileId)
+      const record = recordsById.get(after.fileId)
+      if (!scanned || !record || scanned.path !== record.path || scanned.hash !== record.plaintextSha256
+        || scanned.size !== record.size) return []
+      return [{ path: record.path, fileId: record.fileId, hash: record.plaintextSha256, size: record.size }]
+    }) : []
+    const publicationPayload: V4RecoveryPayload = {
+      ...(recoveryPlan?.payload ?? { mutations: [], completedMutationIds: [] }),
+      ...(publishedCreates.length ? { publishedCreates } : {}),
+    }
     let recoverySnapshot = this.input.recoveryStore
       ? await this.input.recoveryStore.save({
         runId: batch.runId,
@@ -1279,7 +1303,7 @@ export class V4SyncSession {
         phase: "publish-intent",
         expectedRemoteHead: candidate.previousHeadSha ?? null,
         candidateCommitSha: candidate.commitSha,
-        payload: recoveryPlan?.payload ?? { mutations: [], completedMutationIds: [] },
+        payload: publicationPayload,
       })
       : undefined
     preserveStagesForRecovery = !!recoverySnapshot && (recoveryPlan?.payload.mutations.length ?? 0) > 0
@@ -1306,7 +1330,7 @@ export class V4SyncSession {
         expectedRemoteHead: candidate.previousHeadSha ?? null,
         candidateCommitSha: candidate.commitSha,
         verifiedRemoteHead: candidate.commitSha,
-        payload: recoveryPlan?.payload ?? { mutations: [], completedMutationIds: [] },
+        payload: publicationPayload,
       })
       if (recoveryPlan) {
         const applied = await applyV4RecoveryLocalMutations({

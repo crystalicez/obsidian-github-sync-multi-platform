@@ -123,6 +123,22 @@ function isPayload(value: unknown): value is V4RecoveryPayload {
     if (candidate.kind === "trash") continue
     if (candidate.kind !== "stage-write" || !isValidRecoveryStage(candidate.stage)) return false
   }
+  if (payload.publishedCreates !== undefined) {
+    if (!Array.isArray(payload.publishedCreates)) return false
+    const paths = new Set<string>()
+    const fileIds = new Set<string>()
+    for (const entry of payload.publishedCreates) {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)
+        || !isNormalizedRecoveryPath(entry.path)
+        || typeof entry.fileId !== "string" || !entry.fileId
+        || typeof entry.hash !== "string" || !/^[0-9a-f]{64}$/u.test(entry.hash)
+        || !Number.isSafeInteger(entry.size) || entry.size < 0) return false
+      const pathKey = entry.path.normalize("NFC").toLowerCase()
+      if (paths.has(pathKey) || fileIds.has(entry.fileId)) return false
+      paths.add(pathKey)
+      fileIds.add(entry.fileId)
+    }
+  }
   const completed = new Set<string>()
   for (const id of payload.completedMutationIds) {
     if (typeof id !== "string" || !ids.has(id) || completed.has(id)) return false
@@ -299,7 +315,7 @@ export async function applyV4RecoveryLocalMutations(input: {
 }): Promise<V4RecoveryLocalApplyResult> {
   let snapshot = input.snapshot
   const payload: V4RecoveryPayload = snapshot.payload
-    ? { mutations: snapshot.payload.mutations, completedMutationIds: [...snapshot.payload.completedMutationIds] }
+    ? { ...snapshot.payload, completedMutationIds: [...snapshot.payload.completedMutationIds] }
     : { mutations: [], completedMutationIds: [] }
   // Verify stage ownership before stat/commit/receipt/finalize on any target.
   // Shared stage paths cannot be applied twice, even in a non-native fallback.
