@@ -2396,6 +2396,85 @@ test("D502 a confirmed publication with lost response and unavailable readback r
   }
 })
 
+test("D511 advanced HEAD recovery reuses only unchanged published create with proven ancestry", async () => {
+  for (const variant of ["unchanged", "local-edited", "remote-edited", "unrelated-history"] as const) {
+    const github = new RuntimeMemoryGitHub()
+    const source = plaintextRuntimeFixture("base.md", github, "writer")
+    const peer = plaintextRuntimeFixture([], github, "reader")
+    try {
+      assert.equal((await source.runtime.forcePush() as { status: string }).status, "completed")
+      const previous = github.ref!.sha
+      const path = "publication.md"
+      const note = new TextEncoder().encode("new locally published file")
+      const file = await source.plugin.app.vault.createBinary(path, note.buffer)
+      file.stat = { size: note.byteLength, mtime: 2 }
+      const update = github.updateGitRef.bind(github)
+      const read = github.getGitRefOrNull.bind(github)
+      let unavailable = false
+      let updates = 0
+      github.updateGitRef = async (sha, expected) => {
+        updates++
+        await update(sha, expected)
+        unavailable = true
+        throw Error("simulated lost successful CAS response")
+      }
+      github.getGitRefOrNull = async () => {
+        if (unavailable) throw Error("simulated unavailable ref readback")
+        return read()
+      }
+      assert.equal((await source.runtime.manualSync() as { status: string }).status, "failed")
+      const candidate = github.ref!.sha
+      assert.notEqual(candidate, previous)
+      assert.equal(updates, 1)
+      unavailable = false
+      github.updateGitRef = async (sha, expected) => { updates++; await update(sha, expected) }
+      assert.equal((await peer.runtime.forcePull() as { status: string }).status, "completed")
+      assert.deepEqual(peer.contents.get(path), note)
+      const peerBytes = new TextEncoder().encode("peer new note")
+      const peerFile = await peer.plugin.app.vault.createBinary("peer.md", peerBytes.buffer)
+      peerFile.stat = { size: peerBytes.byteLength, mtime: 3 }
+      const replacement = new TextEncoder().encode("changed after publication")
+      if (variant === "remote-edited") {
+        peer.contents.set(path, replacement)
+        peer.vaultFiles.find(item => item.path === path)!.stat = { size: replacement.byteLength, mtime: 4 }
+      }
+      assert.equal((await peer.runtime.manualSync() as { status: string }).status, "completed")
+      const advanced = github.ref!.sha
+      assert.notEqual(advanced, candidate)
+      assert.deepEqual(github.commits.get(advanced)!.parents, [candidate])
+      if (variant === "unrelated-history") {
+        // Same remote record and bytes are not proof of this candidate's publication.
+        github.commits.get(advanced)!.parents = [previous]
+      }
+      if (variant === "local-edited") {
+        source.contents.set(path, replacement)
+        file.stat = { size: replacement.byteLength, mtime: 4 }
+      }
+      const beforeUpdates = updates
+      const beforeCommits = github.commits.size
+      const result = await source.runtime.manualSync() as { status: string }
+      if (variant === "unchanged") {
+        assert.equal(result.status, "completed", source.runtime.progressSnapshot.errorMessage)
+        assert.deepEqual(source.contents.get(path), note)
+        assert.deepEqual(source.contents.get("peer.md"), peerBytes)
+        assert.deepEqual([...source.contents.keys()].sort(), [...peer.contents.keys()].sort())
+        await source.runtime.manualSync()
+        assert.equal(source.runtime.progressSnapshot.lifecycle, "no-change")
+      } else {
+        assert.equal(result.status, "failed", variant)
+        assert.match(source.runtime.progressSnapshot.errorMessage ?? "", /path collision/u)
+        assert.deepEqual(source.contents.get(path), variant === "local-edited" ? replacement : note)
+      }
+      assert.equal(updates, beforeUpdates, variant)
+      assert.equal(github.commits.size, beforeCommits, variant)
+      assert.equal(github.ref?.sha, advanced, variant)
+    } finally {
+      source.runtime.dispose()
+      peer.runtime.dispose()
+    }
+  }
+})
+
 test("D491 two Runtime devices converge after failed upload and a queued edit during recovery", async () => {
   const github = new RuntimeMemoryGitHub()
   const writer = plaintextRuntimeFixture(["first.md", "second.md"], github, "writer")

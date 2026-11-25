@@ -509,7 +509,16 @@ export async function reconcileV4RecoveryPublishIntent(input: {
     phase: "replan-required",
     expectedRemoteHead: snapshot.header.expectedRemoteHead,
     candidateCommitSha: candidate,
-    verifiedRemoteHead: undefined,
+    // Preserve exact descendant evidence for create identity recovery only.
+    // Remain in replan-required: never replay stale local mutations.
+    verifiedRemoteHead: candidate
+      && result.status === "published-advanced"
+      && result.evidence === "candidate-ancestor"
+      && result.publishedCommitSha === candidate
+      && result.currentHeadSha !== candidate
+      && result.currentHeadSha === result.verifiedHeadSha
+      ? result.verifiedHeadSha
+      : undefined,
     payload: snapshot.payload,
   })
 }

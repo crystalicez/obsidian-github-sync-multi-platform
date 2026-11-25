@@ -631,8 +631,8 @@ export class V4SyncSession {
       const remoteByPath = new Map(remoteRecords.filter(record => !record.deleted).map(record => [record.path, record]))
       const basePaths = new Set(identityBaseRecords.map(record => record.path.normalize("NFC").toLowerCase()))
       const baseIds = new Set(identityBaseRecords.map(record => record.fileId))
-      // Recover an exact locally published create only at the verified candidate.
-      if (recovery.header.candidateCommitSha === remote.commitSha) {
+      // Recover a published create at the verified candidate or its proven descendant.
+      if (recovery.header.candidateCommitSha) {
         for (const receipt of recovery.payload?.publishedCreates ?? []) {
           const record = remoteByPath.get(receipt.path)
           if (!record || record.fileId !== receipt.fileId
@@ -641,7 +641,10 @@ export class V4SyncSession {
           recoveredPulls.set(record.path, record)
         }
       }
-      for (const mutation of recovery.payload?.mutations ?? []) {
+      // Descendant evidence does not authorize reusing stale pull receipts.
+      const advancedPublication = recovery.header.candidateCommitSha !== undefined
+        && recovery.header.candidateCommitSha !== remote.commitSha
+      for (const mutation of advancedPublication ? [] : recovery.payload?.mutations ?? []) {
         if (mutation.kind !== "stage-write" || mutation.precondition.exists || !completed.has(mutation.id)) continue
         const record = remoteByPath.get(mutation.path)
         if (!record || mutation.id !== `pull:${record.fileId}:write`
