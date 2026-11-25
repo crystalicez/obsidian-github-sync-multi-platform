@@ -58,8 +58,28 @@ const readState=async({owner,repo,branch,token})=>readE2EBranch({owner,repo,bran
 async function githubReadJson(route){
  const url=`https://api.github.com/repos/${encodeURIComponent(configuration.owner)}/${encodeURIComponent(configuration.repo)}/${route}`;
  const response=await fetch(url,{headers:{Authorization:`Bearer ${configuration.token}`,Accept:"application/vnd.github+json","X-GitHub-Api-Version":"2022-11-28"},signal:AbortSignal.timeout(20000)});
- if(!response.ok)throw Error(`Encrypted remote read returned GitHub HTTP ${response.status}`);
+ if(!response.ok)throw Error(`Native remote read returned GitHub HTTP ${response.status}`);
  return response.json();
+}
+// Plaintext journey uses only synthetic notes; read the exact immutable Git tree
+// and blob bytes independently of the plugin's local index or progress status.
+async function inspectPlaintextGitHubInventory(commitSha){
+ assertTrue(/^[0-9a-f]{40}$/u.test(commitSha),"Invalid plaintext commit SHA");
+ const commit=await githubReadJson(`git/commits/${commitSha}`);
+ assertTrue(/^[0-9a-f]{40}$/u.test(commit?.tree?.sha??""),"Plaintext commit has no valid Git tree");
+ const tree=await githubReadJson(`git/trees/${commit.tree.sha}?recursive=1`);
+ assertTrue(tree?.truncated===false&&Array.isArray(tree.tree),"Plaintext Git tree is incomplete");
+ const nodes=tree.tree.filter(node=>node.type==="blob"&&!node.path.startsWith(".obsidian-github-sync-v4/"));
+ assertTrue(nodes.length<=16&&nodes.every(node=>node.size<=65536&&/^[0-9a-f]{40}$/u.test(node.sha)),"Unexpected plaintext synthetic inventory");
+ const files=[];
+ for(const node of nodes){
+  const blob=await githubReadJson(`git/blobs/${node.sha}`);
+  assertTrue(blob.encoding==="base64"&&typeof blob.content==="string","Plaintext Git blob is not base64");
+  const bytes=Buffer.from(blob.content.replace(/\s/gu,""),"base64");
+  assertTrue(bytes.length===node.size,"Plaintext Git blob size mismatch");
+  files.push({path:node.path,size:bytes.length,sha256:createHash("sha256").update(bytes).digest("hex")});
+ }
+ return files.sort((a,b)=>a.path<b.path?-1:a.path>b.path?1:0);
 }
 async function verifyEncryptedGitHubTree(commitSha){
  const commit=await githubReadJson(`git/commits/${commitSha}`);
@@ -325,32 +345,58 @@ try{
    const original="Notes/สวัสดี 🌏.md";
    const renamed=expectedPeerFiles[0].path;
    const pluginExpr="app.plugins.plugins["+JSON.stringify(id)+"]";
-   const step=async(label,mutation)=>{
+   const baselineNote={path:"UI-smoke.md",content:"# Synthetic remote UI E2E\n\nSecond revision from Obsidian.\n"};
+   const initialNested={path:original,content:"# Native combined test\n\nInitial Unicode name.\n"};
+   const initialScratch={path:"Scratch.md",content:"Temporary note.\n"};
+   const expectedInventory=notes=>notes.map(note=>{
+    const bytes=Buffer.from(note.content,"utf8");
+    return {path:note.path,size:bytes.length,sha256:createHash("sha256").update(bytes).digest("hex")};
+   }).sort((a,b)=>a.path<b.path?-1:a.path>b.path?1:0);
+   const step=async(label,mutation,expectedNotes)=>{
     const before=finalSha;
     const inventoryBefore=await evaluate(nativeVaultInventoryExpression,120000);
+    if(mode==="plaintext")assert.deepEqual(await inspectPlaintextGitHubInventory(before),inventoryBefore,"Plaintext baseline differs from committed Git tree: "+label);
     const result=await evaluate(mutation,120000);
     assertTrue(result?.ok,"Native combined action failed: "+label+" "+JSON.stringify(result));
     const inventoryAfter=await evaluate(nativeVaultInventoryExpression,120000);
+    if(mode==="plaintext"){
+     // Observe the very same scoped listing the runtime gives V4SyncSession,
+     // not just the Obsidian UI's TFile cache; no writes or event injection.
+     const runtimeFiles=await evaluate("(async()=>{const p="+pluginExpr+";return (await p.v4Runtime.sessionVault().listFiles()).sort((a,b)=>a.path<b.path?-1:a.path>b.path?1:0);})()",120000);
+     console.log(JSON.stringify({kind:"native-plaintext-runtime-scan",label,files:runtimeFiles}));
+     assert.deepEqual(runtimeFiles.map(({path,size})=>({path,size})),inventoryAfter.map(({path,size})=>({path,size})),"Runtime scoped scan differs from Obsidian inventory: "+label);
+    }
     console.log(JSON.stringify({kind:"native-combined-local-inventory",label,before:inventoryBefore,after:inventoryAfter}));
     assertTrue(JSON.stringify(inventoryAfter)!==JSON.stringify(inventoryBefore),"Synthetic local inventory did not change before Sync: "+label);
+    assert.deepEqual(inventoryAfter,expectedInventory([baselineNote,...expectedNotes]),"Obsidian did not perform the intended synthetic local mutation: "+label);
     for(const entry of inventoryAfter){
      assertTrue(typeof entry.path==="string"&&entry.path.split("/").every(part=>part&&part!=="."&&part!==".."&&!part.includes("\\")&&!part.includes(":")),"Unsafe synthetic inventory path");
      const bytes=await readFile(path.join(vault,...entry.path.split("/")));
      assertTrue(bytes.length===entry.size&&createHash("sha256").update(bytes).digest("hex")===entry.sha256,"Source indexed and disk bytes differ: "+entry.path);
     }
+    for(const entry of inventoryBefore.filter(old=>!inventoryAfter.some(current=>current.path===old.path))){
+     assertTrue(typeof entry.path==="string"&&entry.path.split("/").every(part=>part&&part!=="."&&part!==".."&&!part.includes("\\")&&!part.includes(":")),"Unsafe removed synthetic inventory path");
+     const absent=await stat(path.join(vault,...entry.path.split("/"))).then(()=>false,error=>{if(error?.code==="ENOENT")return true;throw error;});
+     assertTrue(absent,"Renamed/deleted original still exists on disk: "+entry.path);
+    }
     const outcome=await evaluate("(async()=>{const p="+pluginExpr+";let thrown=null;try{await p.v4Runtime.manualSync()}catch(e){thrown=String(e?.message??e).slice(0,180)}const s=p.v4Runtime.progressSnapshot;return {lifecycle:s.lifecycle,trigger:s.trigger,phase:s.phase,failurePhase:s.failurePhase,error:s.errorMessage?.slice(0,250),thrown,apiFailures:s.diagnostics?.apiFailures};})()",240000);
-    assertTrue(outcome.lifecycle==="success"&&outcome.trigger==="manual","Native combined sync failed: "+label+" "+redact(JSON.stringify(outcome)));
     const remote=await readState(configuration);
+    if(mode==="plaintext"&&remote.kind==="present"){
+     const remoteInventory=await inspectPlaintextGitHubInventory(remote.sha);
+     console.log(JSON.stringify({kind:"native-plaintext-remote-inventory",label,headChanged:remote.sha!==before,lifecycle:outcome.lifecycle,phase:outcome.phase,remoteInventory}));
+     assert.deepEqual(remoteInventory,inventoryAfter,"Plaintext remote bytes differ from intended local inventory: "+label);
+    }
+    assertTrue(outcome.lifecycle==="success"&&outcome.trigger==="manual","Native combined sync failed: "+label+" "+redact(JSON.stringify(outcome)));
     assertTrue(remote.kind==="present"&&remote.sha!==before,"Combined user action was not published: "+label);
     finalSha=remote.sha;
     journeySteps.push(label);
    };
    await step("create nested Unicode and scratch notes",
-    "(async()=>{await app.vault.createFolder('Notes');await app.vault.create("+JSON.stringify(original)+",'# Native combined test\\n\\nInitial Unicode name.\\n');await app.vault.create('Scratch.md','Temporary note.\\n');return {ok:true};})()");
+    "(async()=>{await app.vault.createFolder('Notes');await app.vault.create("+JSON.stringify(original)+",'# Native combined test\\n\\nInitial Unicode name.\\n');await app.vault.create('Scratch.md','Temporary note.\\n');return {ok:true};})()",[initialNested,initialScratch]);
    await step("rename, modify, and delete together",
-    "(async()=>{const file=app.vault.getAbstractFileByPath("+JSON.stringify(original)+");const scratch=app.vault.getAbstractFileByPath('Scratch.md');if(!file||!scratch)return {ok:false};await app.vault.rename(file,"+JSON.stringify(renamed)+");await app.vault.modify(file,"+JSON.stringify(expectedPeerFiles[0].content)+");await app.vault.delete(scratch);return {ok:true};})()");
+    "(async()=>{const file=app.vault.getAbstractFileByPath("+JSON.stringify(original)+");const scratch=app.vault.getAbstractFileByPath('Scratch.md');if(!file||!scratch)return {ok:false};await app.vault.rename(file,"+JSON.stringify(renamed)+");await app.vault.modify(file,"+JSON.stringify(expectedPeerFiles[0].content)+");await app.vault.delete(scratch);return {ok:true};})()",[expectedPeerFiles[0]]);
    await step("recreate deleted note",
-    "(async()=>{if(app.vault.getAbstractFileByPath('Scratch.md'))return {ok:false};await app.vault.create('Scratch.md',"+JSON.stringify(expectedPeerFiles[1].content)+");return {ok:true};})()");
+    "(async()=>{if(app.vault.getAbstractFileByPath('Scratch.md'))return {ok:false};await app.vault.create('Scratch.md',"+JSON.stringify(expectedPeerFiles[1].content)+");return {ok:true};})()",expectedPeerFiles);
    const checked=await evaluate("(async()=>{const expected="+JSON.stringify(expectedPeerFiles)+";for(const entry of expected){const file=app.vault.getAbstractFileByPath(entry.path);if(!file||(await app.vault.read(file))!==entry.content)return {ok:false};}return {ok:!app.vault.getAbstractFileByPath("+JSON.stringify(original)+")};})()");
    assertTrue(checked?.ok,"Native source files diverged after combined changes");
   }
