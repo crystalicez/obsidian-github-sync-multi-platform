@@ -15,13 +15,15 @@ const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),"..");
 const port=Number(process.argv.find(x=>x.startsWith("--port="))?.slice(7));
 const probe=process.argv.includes("--probe");
 const boundary=process.argv.includes("--mobile-boundary");
+const remoteOversize=process.argv.includes("--remote-oversize");
+assert.ok(!remoteOversize||!boundary,"Choose a single mobile journey");
 const resumeBoundary=process.argv.includes("--resume-d498");
 assert.ok(!resumeBoundary||boundary,"D498 resume requires boundary journey");
 const previousAutoPath="Auto-Android-037923305d0ee124.md";
 const previousIncoming={path:"Assets/android-from-windows-1mib.bin",size:1048576,sha256:"e3d86672bd222a49d50bc59b4a0b24f9675c2b9a49d43de53bd4a509a1c6c785"};
-const reuse=boundary||process.argv.includes("--reuse-fixtures");
+const reuse=remoteOversize||boundary||process.argv.includes("--reuse-fixtures");
 const transport=Number(process.argv.find(x=>x.startsWith("--transport="))?.slice(12));
-assert.ok(!boundary||Number.isSafeInteger(transport)&&transport>0,"Boundary journey needs explicit ADB transport ID");
+assert.ok(!(boundary||remoteOversize)||Number.isSafeInteger(transport)&&transport>0,"Boundary journey needs explicit ADB transport ID");
 assert.ok(Number.isInteger(port)&&port>1024&&port<=65535);
 const name="ObsidianSync-D496-Disposable";
 const pluginId="encrypted-github-sync-multi-platform";
@@ -62,7 +64,7 @@ try{
  const identity=await evaluate(identityExpression);
  console.log(JSON.stringify({kind:"android-identity",...identity}));
  assert.ok(identity.correct&&identity.loaded&&!identity.configured,"Expected exact unconfigured disposable Android Vault and loaded plugin");
- assert.deepEqual(identity.fileNames,resumeBoundary?["Assets/android-1mib.bin",previousIncoming.path,previousAutoPath,"Smoke.md","UI-smoke.md"].sort():reuse?["Assets/android-1mib.bin","Smoke.md","UI-smoke.md"]:["Smoke.md"]);
+ assert.deepEqual(identity.fileNames,remoteOversize?["Assets/android-1mib.bin",previousIncoming.path,"Assets/android-from-windows-32mib.bin",previousAutoPath,"Smoke.md","UI-smoke.md"].sort():resumeBoundary?["Assets/android-1mib.bin",previousIncoming.path,previousAutoPath,"Smoke.md","UI-smoke.md"].sort():reuse?["Assets/android-1mib.bin","Smoke.md","UI-smoke.md"]:["Smoke.md"]);
  if(probe){ok=true;}else{
   const sha=git(["rev-parse","HEAD"]);assert.equal(sha.status,0);
   assert.equal(git(["status","--porcelain"]).stdout.trim(),"","Clean checkout required");
@@ -72,13 +74,19 @@ try{
   await preflightE2ERemote({config:{...config,currentSourceRepoId:CANONICAL_REPOSITORY_ID}});verified=true;
   assert.equal((await readE2EBranch(config)).kind,"absent");
   console.log(JSON.stringify({kind:"preflight",branch:config.branch,repoId:config.expectedRepoId,sourceSHA:sha.stdout.trim()}));
-  const expectedContent=boundary?"# Synthetic remote UI E2E\n\nPeer conflicting revision.\n":"# Synthetic remote UI E2E\n\nAndroid source revision.\n";
+  const expectedContent=(boundary||remoteOversize)?"# Synthetic remote UI E2E\n\nPeer conflicting revision.\n":"# Synthetic remote UI E2E\n\nAndroid source revision.\n";
   const smoke=await guarded('return await app.vault.read(app.vault.getAbstractFileByPath("Smoke.md"));');
   assert.equal(smoke,"# D496 disposable Android qualification\n\nSynthetic note only. No personal data or GitHub credentials.\n");
   const expectedBinary={path:"Assets/android-1mib.bin",size:1048576};
   const fixture=reuse?null:randomBytes(expectedBinary.size);
-  if(reuse){const existing=await guarded(`const note=await app.vault.read(app.vault.getAbstractFileByPath("UI-smoke.md"));const b=await app.vault.readBinary(app.vault.getAbstractFileByPath(${JSON.stringify(expectedBinary.path)}));const h=new Uint8Array(await crypto.subtle.digest("SHA-256",b));return {note,size:b.byteLength,sha256:Array.from(h,x=>x.toString(16).padStart(2,"0")).join("")};`);assert.equal(existing.note,expectedContent);assert.equal(existing.size,expectedBinary.size);assert.match(existing.sha256,/^[a-f0-9]{64}$/u);expectedBinary.sha256=existing.sha256;if(boundary)assert.equal(existing.sha256,"794b7f16e056bc9c3afd0e3f71efe45c6b32b16b2757c698bf48719fe539c653");}else expectedBinary.sha256=createHash("sha256").update(fixture).digest("hex");
-  if(resumeBoundary){const previous=await guarded(`const f=app.vault.getAbstractFileByPath(${JSON.stringify(previousIncoming.path)});const b=await app.vault.readBinary(f);const h=new Uint8Array(await crypto.subtle.digest("SHA-256",b));return {size:b.byteLength,sha256:Array.from(h,x=>x.toString(16).padStart(2,"0")).join(""),auto:await app.vault.read(app.vault.getAbstractFileByPath(${JSON.stringify(previousAutoPath)}))};`);assert.deepEqual(previous,{size:previousIncoming.size,sha256:previousIncoming.sha256,auto:"# Android auto sync\n\nFinal native local event.\n"});console.log(JSON.stringify({kind:"android-resumed-fixtures",...previousIncoming,autoPath:previousAutoPath}));}
+  if(reuse){const existing=await guarded(`const note=await app.vault.read(app.vault.getAbstractFileByPath("UI-smoke.md"));const b=await app.vault.readBinary(app.vault.getAbstractFileByPath(${JSON.stringify(expectedBinary.path)}));const h=new Uint8Array(await crypto.subtle.digest("SHA-256",b));return {note,size:b.byteLength,sha256:Array.from(h,x=>x.toString(16).padStart(2,"0")).join("")};`);assert.equal(existing.note,expectedContent);assert.equal(existing.size,expectedBinary.size);assert.match(existing.sha256,/^[a-f0-9]{64}$/u);expectedBinary.sha256=existing.sha256;if(boundary||remoteOversize)assert.equal(existing.sha256,"794b7f16e056bc9c3afd0e3f71efe45c6b32b16b2757c698bf48719fe539c653");}else expectedBinary.sha256=createHash("sha256").update(fixture).digest("hex");
+  if(resumeBoundary||remoteOversize){const previous=await guarded(`const f=app.vault.getAbstractFileByPath(${JSON.stringify(previousIncoming.path)});const b=await app.vault.readBinary(f);const h=new Uint8Array(await crypto.subtle.digest("SHA-256",b));return {size:b.byteLength,sha256:Array.from(h,x=>x.toString(16).padStart(2,"0")).join(""),auto:await app.vault.read(app.vault.getAbstractFileByPath(${JSON.stringify(previousAutoPath)}))};`);assert.deepEqual(previous,{size:previousIncoming.size,sha256:previousIncoming.sha256,auto:"# Android auto sync\n\nFinal native local event.\n"});console.log(JSON.stringify({kind:"android-resumed-fixtures",...previousIncoming,autoPath:previousAutoPath}));}
+  if(remoteOversize){
+   const existing=await guarded('const f=app.vault.getAbstractFileByPath("Assets/android-from-windows-32mib.bin");return f?.stat?.size??null;');
+   assert.equal(existing,32*1024*1024);
+   const disk=spawnSync("adb",["-t",String(transport),"shell","sha256sum","/sdcard/Documents/"+name+"/Assets/android-from-windows-32mib.bin"],{cwd:root,encoding:"utf8",shell:false,timeout:30000});
+   assert.equal(disk.status,0);assert.equal(disk.stdout.trim().split(/\s+/u)[0],"034c9f70be9932cb5d9f132df2a75b14bdd04e00136df5997ac07163ef757b63");
+  }
   const d={owner:config.owner,repo:config.repo,branch:config.branch,token:config.token,passphrase};
   settingsAttempted=true;
   const configured=await guarded(`const d=${JSON.stringify(d)};if(p.settings.githubToken||p.settings.githubOwner||p.settings.githubRepo)throw Error("Already configured");const nextSettings={...p.settings,githubOwner:d.owner,githubRepo:d.repo,githubBranch:d.branch,githubToken:d.token,encryptionMode:"encrypted",encryptionPassphrase:d.passphrase,syncEnabled:true,syncOnStartup:false,syncOnLocalChange:false,scheduledSyncEnabled:false,syncObsidianConfig:false,syncBookmarks:false,syncPlugins:false};await p.saveSettings(nextSettings);return p.settings.githubBranch===d.branch&&p.settings.githubToken===d.token&&p.settings.encryptionPassphrase===d.passphrase;`);
@@ -92,7 +100,41 @@ try{
   assert.deepEqual(await verifyBinary(),{size:expectedBinary.size,sha256:expectedBinary.sha256});
   const noop=await guarded("const outcome=await p.v4Runtime.manualSync();"+summary,240000);
   assert.equal(noop.lifecycle,"no-change");assert.equal(noop.changedFiles,0);assert.equal((await readE2EBranch(config)).sha,head.sha);
-  if(boundary){
+  if(remoteOversize){
+   const exe="C:\\Program Files\\Obsidian\\Obsidian.exe";
+   const target="Assets/android-from-windows-oversize.bin";
+   const bytes=32*1024*1024+1;
+   const digest=async file=>{const out=spawnSync("adb",["-t",String(transport),"shell","sha256sum","/sdcard/Documents/"+name+"/"+file],{cwd:root,encoding:"utf8",shell:false,timeout:30000});assert.equal(out.status,0);return out.stdout.trim().split(/\s+/u)[0];};
+   const fileSize=async file=>guarded(`const f=app.vault.getAbstractFileByPath(${JSON.stringify(file)});return f?.stat?.size??null;`);
+   const existingHash=await digest("Assets/android-from-windows-32mib.bin");
+   let current=head.sha,refusalVerified=false,recovered=false;
+   await mkdir(runRoot,{recursive:true});
+   const peer=await restoreEncryptedToSecondObsidian({exe,runRoot,port:20000+process.pid%35000,pluginId,sourceRoot:root,configuration:config,passphrase,expectedContent,expectedFiles:[{path:"Smoke.md",content:smoke},{path:previousAutoPath,content:"# Android auto sync\n\nFinal native local event.\n"}],expectedBinary,peerBinaryJourneys:[{path:target,size:bytes,reduceToSize:1048576}],afterPeerBinary:async spec=>{
+    const remote=await readE2EBranch(config);assert.ok(remote.kind==="present"&&remote.sha!==current);current=remote.sha;
+    assert.equal(await fileSize(target),null,"Unexpected local target before remote pull");
+    const result=await guarded("const outcome=await p.v4Runtime.manualSync();"+summary,240000);
+    console.log(JSON.stringify({kind:spec.reduced?"android-reduced-recovery":"android-remote-oversize-refusal",...spec,outcome:result}));
+    if(!spec.reduced){
+     assert.ok(result.status==="failed"&&result.lifecycle==="failed"&&result.changedFiles===0&&result.diagnostics?.uploadBytes===0&&result.diagnostics?.downloadBytes<1048576,"Oversized pull did not fail before content transfer");
+     assert.match(result.error??"",/cannot download files larger than 32 MiB/u);
+     assert.match(result.error??"",/desktop device/u);
+     assert.equal(await fileSize(target),null);assert.equal(await digest("Assets/android-from-windows-32mib.bin"),existingHash);
+     assert.equal((await readE2EBranch(config)).sha,current);
+     refusalVerified=true;
+    }else{
+     assert.ok(result.status==="completed"&&result.lifecycle==="success"&&result.diagnostics?.apiFailures===0,"Reduced-file normal retry failed");
+     assert.equal(await fileSize(target),spec.size);assert.equal(await digest(target),spec.sha256);
+     assert.equal(await digest("Assets/android-from-windows-32mib.bin"),existingHash);
+     assert.equal((await readE2EBranch(config)).sha,current);
+     const noop=await guarded("const outcome=await p.v4Runtime.manualSync();const s=p.v4Runtime.progressSnapshot;return {status:outcome?.status,lifecycle:s.lifecycle,changedFiles:outcome?.changedFiles,paused:p.v4Runtime.coordinator.isAutomaticSyncPaused};",240000);
+     assert.ok(noop.status==="completed"&&noop.lifecycle==="no-change"&&noop.changedFiles===0&&!noop.paused,"Reduced-file recovery did not settle: "+JSON.stringify(noop));
+     assert.equal((await readE2EBranch(config)).sha,current);recovered=true;
+    }
+   }});
+   assert.ok(peer.peerRestored&&refusalVerified&&recovered&&peer.binaryJourneys.length===1);
+   console.log(JSON.stringify({kind:"android-remote-oversize-complete",refusalVerified,recovered,originalPreserved:true,noOp:true}));
+   ok=true;
+  }else if(boundary){
    const autoPath=resumeBoundary?previousAutoPath:"Auto-Android-"+runId+".md";
    const autoText="# Android auto sync\n\nFinal native local event.\n";
    let current=head.sha;

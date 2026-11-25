@@ -181,8 +181,8 @@ export async function restoreEncryptedToSecondObsidian({
   let peerMutated=false,peerConverged=false,peerOpenEditorGuardVerified=false,peerFinalInventoryCount=0;
   const binaryJourneys=[];
   for(const spec of peerBinaryJourneys){
-   assert.match(spec.path,/^Assets\/android-from-windows-[0-9]+mib\.bin$/u);
-   assert.ok(Number.isSafeInteger(spec.size)&&spec.size>0&&spec.size<=32*1024*1024);
+   assert.match(spec.path,/^Assets\/android-from-windows-(?:[0-9]+mib|oversize)\.bin$/u);
+   assert.ok(Number.isSafeInteger(spec.size)&&spec.size>0&&spec.size<=32*1024*1024+1);
    const full=path.join(vault,...spec.path.split("/"));
    const bytes=randomBytes(spec.size);
    const sha256=createHash("sha256").update(bytes).digest("hex");
@@ -204,7 +204,25 @@ export async function restoreEncryptedToSecondObsidian({
     const digest=createHash("sha256");for await(const chunk of createReadStream(full,{highWaterMark:8*1024*1024}))digest.update(chunk);
     assert.equal(digest.digest("hex"),returned.expectedReturnHash,"Windows disk bytes differ from Android revision");
    }
-   binaryJourneys.push({...spec,sha256,returned:!!returned?.expectedReturnHash});
+   if(spec.reduceToSize!==undefined){
+    assert.ok(Number.isSafeInteger(spec.reduceToSize)&&spec.reduceToSize>0&&spec.reduceToSize<spec.size);
+    const digest=createHash("sha256");for await(const chunk of createReadStream(full,{highWaterMark:8*1024*1024}))digest.update(chunk);
+    assert.equal(digest.digest("hex"),sha256,"Refusing to change unknown peer fixture");
+    const reduced=bytes.subarray(0,spec.reduceToSize);
+    const reducedHash=createHash("sha256").update(reduced).digest("hex");
+    await writeFile(full,reduced);
+    const stop=Date.now()+45000;let ready=false;
+    while(Date.now()<stop&&!ready){
+     ready=await evaluate("(()=>{const f=app.vault.getAbstractFileByPath("+JSON.stringify(spec.path)+");return f?.stat?.size==="+spec.reduceToSize+";})()");
+     if(!ready)await pause(250);
+    }
+    assert.ok(ready,"Windows peer did not index reduced fixture");
+    const result=await evaluate(`(async()=>{const p=app.plugins.plugins[${JSON.stringify(pluginId)}];const outcome=await p.v4Runtime.manualSync();const s=p.v4Runtime.progressSnapshot;return {status:outcome?.status,lifecycle:s.lifecycle,changedFiles:outcome?.changedFiles,error:s.errorMessage?.slice(0,180),diagnostics:s.diagnostics};})()`,240000);
+    assert.ok(result.status==="completed"&&result.lifecycle==="success"&&result.changedFiles>0,"Windows reduced fixture publication failed: "+JSON.stringify(result));
+    console.log(JSON.stringify({kind:"windows-reduced-binary-published",path:spec.path,size:spec.reduceToSize,sha256:reducedHash,diagnostics:result.diagnostics}));
+    await afterPeerBinary?.({path:spec.path,size:spec.reduceToSize,sha256:reducedHash,reduced:true});
+    binaryJourneys.push({...spec,sha256,reducedHash,returned:!!returned?.expectedReturnHash});
+   }else binaryJourneys.push({...spec,sha256,returned:!!returned?.expectedReturnHash});
   }
   if(exercisePeerConflict){
    const result=await evaluate(`(async()=>{
