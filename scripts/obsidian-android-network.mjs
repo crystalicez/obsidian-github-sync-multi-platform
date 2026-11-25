@@ -27,19 +27,19 @@ export async function runAndroidNetworkJourney({root,transport,name,guarded,conf
  });
  const hookKey="__obsidianD501_"+runId;
  const key=JSON.stringify(hookKey);
- const restore=async()=>guarded(`const h=globalThis[${key}];if(!h)return false;if(globalThis.Capacitor.nativePromise!==h.wrapper)throw Error("Unexpected bridge replacement");globalThis.Capacitor.nativePromise=h.original;delete globalThis[${key}];return true;`);
+ const restore=async()=>guarded(`const h=globalThis[${key}];if(!h)return false;if(globalThis.__obsidianD501NativeRequest!==h.wrapper)throw Error("Unexpected test hook replacement");delete globalThis.__obsidianD501NativeRequest;delete globalThis[${key}];return true;`);
  try{
   await new Promise((resolve,reject)=>{sink.once("error",reject);sink.listen(0,"127.0.0.1",resolve);});
   const addr=sink.address();assert.ok(addr&&typeof addr!=="string");
   reversePort=Number(adb(["reverse","tcp:0","tcp:"+addr.port]));assert.ok(Number.isInteger(reversePort)&&reversePort>1024&&reversePort<=65535);
   const options={prefix:"https://api.github.com/repos/"+configuration.owner+"/"+configuration.repo+"/",branch:configuration.branch,file,faultUrl:"https://127.0.0.1:"+reversePort+"/d501"};
-  const hookInstalled=await guarded(`const cap=globalThis.Capacitor;const opts=${JSON.stringify(options)};if(globalThis[${key}]||typeof cap?.nativePromise!=="function"||p.settings.githubBranch!==opts.branch)throw Error("Unexpected native bridge state");const original=cap.nativePromise;const h={original,wrapper:null,blocked:false,observed:0,blobs:0,redirects:0,nativeRejections:0,unexpectedSuccess:0,phaseAtFault:null};h.wrapper=function(plugin,method,request,...rest){const matches=plugin==="CapacitorHttp"&&request&&typeof request.url==="string"&&request.url.startsWith(opts.prefix)&&p.settings.githubBranch===opts.branch&&app.vault.getName()===${JSON.stringify(name)};if(!matches)return original.call(this,plugin,method,request,...rest);h.observed++;const blob=request.url===opts.prefix+"git/blobs"&&String(request.method??method).toUpperCase()==="POST";if(blob)h.blobs++;if(!blob||!h.blocked)return original.call(this,plugin,method,request,...rest);h.redirects++;const s=p.v4Runtime.progressSnapshot;h.phaseAtFault={phase:s.phase,path:s.currentPath,active:p.isSyncInProgress};return Promise.resolve(original.call(this,plugin,method,{url:opts.faultUrl,method:"GET",headers:{},connectTimeout:4000,readTimeout:4000})).then(()=>{h.unexpectedSuccess++;throw Error("Fault sink unexpectedly returned HTTP response");},error=>{h.nativeRejections++;throw error;});};globalThis[${key}]=h;cap.nativePromise=h.wrapper;return cap.nativePromise===h.wrapper;`);
+  const hookInstalled=await guarded(`const opts=${JSON.stringify(options)};if(globalThis[${key}]||globalThis.__obsidianD501NativeRequest||p.settings.githubBranch!==opts.branch)throw Error("Unexpected test hook state");const h={wrapper:null,blocked:false,observed:0,blobs:0,redirects:0,nativeRejections:0,unexpectedSuccess:0,phaseAtFault:null};h.wrapper=function(original,request){const matches=request&&typeof request.url==="string"&&request.url.startsWith(opts.prefix)&&p.settings.githubBranch===opts.branch&&app.vault.getName()===${JSON.stringify(name)};if(!matches)return original(request);h.observed++;const blob=request.url===opts.prefix+"git/blobs"&&String(request.method??"GET").toUpperCase()==="POST";if(blob)h.blobs++;if(!blob||!h.blocked)return original(request);h.redirects++;const s=p.v4Runtime.progressSnapshot;h.phaseAtFault={phase:s.phase,path:s.currentPath,active:p.isSyncInProgress};return Promise.resolve(original({url:opts.faultUrl,method:"GET",headers:{},throw:true})).then(()=>{h.unexpectedSuccess++;throw Error("Fault sink unexpectedly returned HTTP response");},error=>{h.nativeRejections++;throw error;});};globalThis[${key}]=h;globalThis.__obsidianD501NativeRequest=h.wrapper;return globalThis.__obsidianD501NativeRequest===h.wrapper;`);
   assert.equal(hookInstalled,true);installed=true;
   const observe=()=>guarded(`const h=globalThis[${key}];return {observed:h.observed,blobs:h.blobs,redirects:h.redirects,nativeRejections:h.nativeRejections,unexpectedSuccess:h.unexpectedSuccess,phaseAtFault:h.phaseAtFault};`);
   const baseline=await guarded("const outcome=await p.v4Runtime.manualSync();"+summary,240000);
   const seen=await observe();
   console.log(JSON.stringify({kind:"android-transport-route",observed:seen.observed,baseline:baseline.lifecycle}));
-  assert.ok(baseline.status==="completed"&&baseline.lifecycle==="no-change"&&seen.observed>0,"Native HTTP bridge route not observed; cannot safely inject fault");
+  assert.ok(baseline.status==="completed"&&baseline.lifecycle==="no-change"&&seen.observed>0,"Test-only requestUrl hook route not observed; cannot safely inject fault");
   assert.equal((await readState()).sha,head.sha);
   await writeFile(path.join(runRoot,"android-network-fixture.bin"),fixture,{flag:"wx"});
   assert.equal(await guarded(`return app.vault.getAbstractFileByPath(${JSON.stringify(file)})??null;`),null);
@@ -66,7 +66,7 @@ export async function runAndroidNetworkJourney({root,transport,name,guarded,conf
   const noop=await guarded("const outcome=await p.v4Runtime.manualSync();"+summary,240000);
   assert.ok(noop.status==="completed"&&noop.lifecycle==="no-change"&&noop.changedFiles===0);
   assert.equal((await readState()).sha,advanced.sha);
-  console.log(JSON.stringify({kind:"android-transport-complete",nativeFaultInjection:true,actualGitHubSocketCut:false,size,sha256,file,sourcePreserved:true,headUnchangedDuringFailure:true,autoResumed:true,peerVerified:true,finalNoop:true}));
+  console.log(JSON.stringify({kind:"android-transport-complete",nativeFaultInjection:true,instrumentedTestBundle:true,actualGitHubSocketCut:false,size,sha256,file,sourcePreserved:true,headUnchangedDuringFailure:true,autoResumed:true,peerVerified:true,finalNoop:true}));
  }finally{
   if(installed)assert.equal(await restore(),true);
   try{if(reversePort)adb(["reverse","--remove","tcp:"+reversePort]);}finally{for(const socket of sockets)socket.destroy();await new Promise(resolve=>sink.close(resolve));}
