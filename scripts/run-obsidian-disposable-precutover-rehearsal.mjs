@@ -501,6 +501,10 @@ try {
     return {
       settingsFenceDenied,
       recovered,
+      stagedSecretPresent: ${JSON.stringify(secretMode)} ? !!app.secretStorage.getSecret(${JSON.stringify(rehearsal.report.stagedSecret?.destinationPassphraseSecretId ?? "")}) : null,
+      stagedSecretMatches: ${JSON.stringify(secretMode)} ? app.secretStorage.getSecret(${JSON.stringify(rehearsal.report.stagedSecret?.destinationPassphraseSecretId ?? "")}) === ${JSON.stringify(newPassphrase)} : null,
+      sourceSecretMatches: app.secretStorage.getSecret(p.settings.encryptionPassphraseSecretId) === ${JSON.stringify(oldPassphrase)},
+      tokenSecretMatches: app.secretStorage.getSecret(p.settings.githubTokenSecretId) === p.settings.githubToken,
       errorText,
       wizardBlockedNext:!![...document.querySelectorAll(".github-sync-rekey__navigation button")].find(b=>b.textContent==="Next"&&b.disabled),
       wizardInspectedInconclusiveBeforeCutover:modalText.includes("Installed Recovery inspection unavailable or inconclusive"),
@@ -510,7 +514,7 @@ try {
   })()`, 240000);
 
   assert.equal(postRestart.settingsFenceDenied, true);
-  assert.equal(postRestart.recovered.observation, "authenticated-pre-cutover-destination-still-fenced");
+  assert.equal(postRestart.recovered.observation, "authenticated-pre-cutover-destination-still-fenced", JSON.stringify({recovery:postRestart.recovered,stagedSecretPresent:postRestart.stagedSecretPresent,stagedSecretMatches:postRestart.stagedSecretMatches,sourceSecretMatches:postRestart.sourceSecretMatches,tokenSecretMatches:postRestart.tokenSecretMatches}));
   assert.equal(postRestart.recovered.walAuthenticated, true);
   assert.equal(postRestart.recovered.backupReverified, true);
   assert.equal(postRestart.recovered.destinationReverified, true);

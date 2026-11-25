@@ -162,6 +162,7 @@ export interface V4InstalledPreCutoverRecoveryReport {
   readonly destinationReverified: boolean
   readonly shadowReverified?: true | undefined
   readonly stagedSecretReverified?: true | undefined
+  readonly failureStage?: "fence" | "backup" | "wal" | "destination" | "secret" | "shadow" | "final-readback" | undefined
   readonly verifiedFileCount: number
   readonly verifiedPlaintextBytes: string
   readonly cutoverAuthorized: false
@@ -199,10 +200,11 @@ function createReadOnlyIndexAdapter(
   }
 }
 
-function manualRecoveryReport(): V4InstalledPreCutoverRecoveryReport {
+function manualRecoveryReport(failureStage?: V4InstalledPreCutoverRecoveryReport["failureStage"]): V4InstalledPreCutoverRecoveryReport {
   return Object.freeze({
     integrityScope: "read-only-installed-pre-cutover-wal-backup-and-destination",
     observation: "manual-recovery-required",
+    ...(failureStage ? { failureStage } : {}),
     walAuthenticated: false,
     backupReverified: false,
     destinationReverified: false,
@@ -753,6 +755,8 @@ export async function inspectV4InstalledPreCutoverRecoveryAfterRestart(
   let walAuthenticated = false
   let backupReverified = false
   let destinationReverified = false
+  let failureStage: V4InstalledPreCutoverRecoveryReport["failureStage"] = "fence"
+  const fail = () => manualRecoveryReport(failureStage)
 
   try {
     throwIfV4Aborted(input.signal)
@@ -765,14 +769,14 @@ export async function inspectV4InstalledPreCutoverRecoveryAfterRestart(
     } catch (error) {
       settingsDenied = error instanceof V4ReencryptionSyncFencedError
     }
-    if (!settingsDenied) return manualRecoveryReport()
+    if (!settingsDenied) return fail()
 
     const route = await input.inspectRoute()
     if (route.observation !== "fenced-before-routing-intent" || route.localCutoverAuthorized !== false) {
-      return manualRecoveryReport()
+      return fail()
     }
     if (input.inspectFenceAndNoPartialCutover && !(await input.inspectFenceAndNoPartialCutover())) {
-      return manualRecoveryReport()
+      return fail()
     }
 
     // Hold the read-only WAL lease while authenticating the immutable Backup.
@@ -782,6 +786,7 @@ export async function inspectV4InstalledPreCutoverRecoveryAfterRestart(
     const backupRepoId = `${input.owner}/${input.repo}#${input.backupBranch}`
     const destinationRepoId = `${input.owner}/${input.repo}#${input.destinationBranch}`
 
+    failureStage = "backup"
     const backupPlan = proposeV4SameRepositoryReencryptionBackupBranch({
       sourceRepoId,
       backupRepoId,
@@ -804,7 +809,7 @@ export async function inspectV4InstalledPreCutoverRecoveryAfterRestart(
     if (!verifiedBackup.backupContentsReadbackVerified
       || verifiedBackup.verifiedFileCount !== input.expectedFileCount
       || verifiedBackup.verifiedPlaintextBytes !== input.expectedPlaintextBytes) {
-      return manualRecoveryReport()
+      return fail()
     }
     // Recover the original journal key from the exact frozen snapshot, never
     // from an advancing Source tip or a caller-supplied random key.
@@ -822,7 +827,7 @@ export async function inspectV4InstalledPreCutoverRecoveryAfterRestart(
     if (!sourceKdf || backupInventory.pinnedSourceCommitSha !== input.pinnedSourceCommitSha
       || backupInventory.verifiedSource.verifiedFileCount !== input.expectedFileCount
       || backupInventory.verifiedSource.totalVerifiedPlaintextBytes !== input.expectedPlaintextBytes) {
-      return manualRecoveryReport()
+      return fail()
     }
     const backupSalt = sourceKdf.salt
     const backupLiveFiles = new Map<string, { size: number; sha: string }>()
@@ -839,6 +844,7 @@ export async function inspectV4InstalledPreCutoverRecoveryAfterRestart(
     backupReverified = true
 
     // Authenticate the original encrypted WAL at its expected generation.
+    failureStage = "wal"
     const readOnlyJournal = createV4ReencryptionRecoveryJournal({
       adapter: createReadOnlyIndexAdapter(wal.adapter),
       root: wal.journalRoot,
@@ -858,7 +864,7 @@ export async function inspectV4InstalledPreCutoverRecoveryAfterRestart(
     })
     if (walCheck.observation !== "authenticated-uncommitted"
       || walCheck.generation !== input.expectedFinalWalGeneration) {
-      return manualRecoveryReport()
+      return fail()
     }
     const snapshot = await readOnlyJournal.assertHealthySnapshot(input.expectedFinalWalGeneration)
     const backupObs = snapshot.verifiedRefObservations.find(item => item.role === "backup")
@@ -874,11 +880,12 @@ export async function inspectV4InstalledPreCutoverRecoveryAfterRestart(
       || snapshot.preparedCandidateReceipt.treeSha !== input.destinationTreeSha
       || (destObs.manifestSha256 !== undefined
         && destObs.manifestSha256 !== snapshot.preparedCandidateReceipt.manifestSha256)) {
-      return manualRecoveryReport()
+      return fail()
     }
     walAuthenticated = true
 
     // 4. Re-verify zero-parent Destination commit, tree hygiene, KDF policy, WAL receipts 1:1, and full new-key content.
+    failureStage = "destination"
     const destinationClient = input.createGitHubClient(input.destinationBranch)
     const [destIdentity, destRef, destCommit, destTree] = await Promise.all([
       destinationClient.getRepositoryIdentity(),
@@ -893,21 +900,22 @@ export async function inspectV4InstalledPreCutoverRecoveryAfterRestart(
       || destCommit.parentShas.length !== 0
       || destTree.sha !== input.destinationTreeSha
       || destTree.truncated !== false) {
-      return manualRecoveryReport()
+      return fail()
     }
     const blobByPath = new Map<string, string>()
     for (const node of destTree.tree) {
       if (node.type === "tree") {
-        if (node.mode !== "040000") return manualRecoveryReport()
+        if (node.mode !== "040000") return fail()
         continue
       }
       if (node.type !== "blob" || node.mode !== "100644" || blobByPath.has(node.path)) {
-        return manualRecoveryReport()
+        return fail()
       }
       blobByPath.set(node.path, node.sha)
     }
-    if (!blobByPath.has(V4_CONFIG_PATH)) return manualRecoveryReport()
+    if (!blobByPath.has(V4_CONFIG_PATH)) return fail()
 
+    failureStage = "secret"
     const stagedSecret = input.secretOwner && input.shadow ? await readV4InstalledDestinationSecret({
       adapter: input.shadow.adapter, owner: input.secretOwner, key: oldKeyring.journalKey,
       identity: {
@@ -920,7 +928,8 @@ export async function inspectV4InstalledPreCutoverRecoveryAfterRestart(
       },
     }) : undefined
     const destinationPassphrase = stagedSecret?.passphrase ?? input.newPassphrase
-    if (!destinationPassphrase || (input.secretOwner && !stagedSecret)) return manualRecoveryReport()
+    if (!destinationPassphrase || (input.secretOwner && !stagedSecret)) return fail()
+    failureStage = "destination"
     const destInventory = await verifyGitHubReencryptionForkSourceWithTranscodeInventory({
       github: destinationClient,
       expectedRepoId: destinationRepoId,
@@ -932,21 +941,21 @@ export async function inspectV4InstalledPreCutoverRecoveryAfterRestart(
       || destInventory.verifiedSource.verifiedFileCount !== input.expectedFileCount
       || destInventory.verifiedSource.totalVerifiedPlaintextBytes !== input.expectedPlaintextBytes
       || !destInventory.sourceConfig.kdfParams) {
-      return manualRecoveryReport()
+      return fail()
     }
     assertV4Pbkdf2Iterations(destInventory.sourceConfig.kdfParams.iterations, V4_MIN_NEW_PBKDF2_ITERATIONS)
     if (backupSalt && destInventory.sourceConfig.kdfParams.salt === backupSalt) {
-      return manualRecoveryReport()
+      return fail()
     }
 
     // Verify 1:1 per-file content parity against Backup inventory and 1:1 WAL receipts against live Destination objects.
     const destLiveRecords = destInventory.sourceRecords.filter(rec => !rec.deleted)
-    if (destLiveRecords.length !== backupLiveFiles.size) return manualRecoveryReport()
+    if (destLiveRecords.length !== backupLiveFiles.size) return fail()
     const expectedObjectPaths = new Set<string>()
     for (const rec of destLiveRecords) {
       const expectedFile = backupLiveFiles.get(rec.path)
       if (!expectedFile || expectedFile.size !== rec.size || expectedFile.sha !== rec.plaintextSha256) {
-        return manualRecoveryReport()
+        return fail()
       }
       const paths = rec.storage === "chunked" ? (rec.partPaths ?? []) : [rec.remotePath]
       for (const objectPath of paths) expectedObjectPaths.add(objectPath)
@@ -955,8 +964,9 @@ export async function inspectV4InstalledPreCutoverRecoveryAfterRestart(
     if (receiptPaths.size !== snapshot.receipts.length
       || receiptPaths.size !== expectedObjectPaths.size
       || snapshot.receipts.some(receipt => !expectedObjectPaths.has(receipt.path) || blobByPath.get(receipt.path) !== receipt.sha)) {
-      return manualRecoveryReport()
+      return fail()
     }
+    failureStage = "shadow"
     if (input.shadow) {
       await verifyV4InstalledReencryptionShadow({
         adapter: input.shadow.adapter, runId: input.runId, deviceId: input.shadow.deviceId,
@@ -965,14 +975,15 @@ export async function inspectV4InstalledPreCutoverRecoveryAfterRestart(
     }
     // Bind the final observation to the same exact refs and WAL generation
     // after all awaited content reads, not a moving branch.
+    failureStage = "final-readback"
     const [finalBackupRef, finalDestinationRef] = await Promise.all([
       backupClient.getGitRef(), destinationClient.getGitRef(),
     ])
     if (finalBackupRef.sha !== input.pinnedSourceCommitSha
-      || finalDestinationRef.sha !== input.destinationCommitSha) return manualRecoveryReport()
+      || finalDestinationRef.sha !== input.destinationCommitSha) return fail()
     await wal.assertExclusiveStageLease()
     await readOnlyJournal.assertHealthySnapshot(input.expectedFinalWalGeneration)
-    if (stagedSecret && input.secretOwner?.storage.getSecret(stagedSecret.id) !== stagedSecret.passphrase) return manualRecoveryReport()
+    if (stagedSecret && input.secretOwner?.storage.getSecret(stagedSecret.id) !== stagedSecret.passphrase) return fail()
     destinationReverified = true
 
     input.assertOwnerStillValid?.()
@@ -993,7 +1004,7 @@ export async function inspectV4InstalledPreCutoverRecoveryAfterRestart(
       powerLossDurabilityProven: false,
     })
   } catch {
-    return manualRecoveryReport()
+    return fail()
   } finally {
     oldSalt?.fill(0)
     wipeKeyring(oldKeyring)
