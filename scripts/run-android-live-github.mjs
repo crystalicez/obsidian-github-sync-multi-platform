@@ -22,6 +22,9 @@ const remoteOversize=process.argv.includes("--remote-oversize");
 const restart=process.argv.includes("--restart-journey");
 const network=process.argv.includes("--network-journey");
 const publication=process.argv.includes("--publication-journey");
+const resumePublication=process.argv.includes("--resume-d502");
+assert.ok(!resumePublication||publication,"D502 resume requires publication journey");
+const priorPublicationPath="Publication-9c2ebf1cc8750cd5.md";
 assert.ok([remoteOversize,boundary,restart,network,publication].filter(Boolean).length<=1,"Choose a single mobile journey");
 const resumeBoundary=process.argv.includes("--resume-d498");
 assert.ok(!resumeBoundary||boundary,"D498 resume requires boundary journey");
@@ -77,7 +80,7 @@ try{
  const identity=await evaluate(identityExpression);
  console.log(JSON.stringify({kind:"android-identity",...identity}));
  assert.ok(identity.correct&&identity.loaded&&!identity.configured,"Expected exact unconfigured disposable Android Vault and loaded plugin");
- assert.deepEqual(identity.fileNames,publication?["Assets/android-1mib.bin",previousIncoming.path,"Assets/android-from-windows-2mib.bin","Assets/android-from-windows-32mib.bin",reducedFixture.path,"Assets/android-network-02197b9cb990415e.bin",previousAutoPath,"Smoke.md","UI-smoke.md"].sort():network?["Assets/android-1mib.bin",previousIncoming.path,"Assets/android-from-windows-2mib.bin","Assets/android-from-windows-32mib.bin",reducedFixture.path,previousAutoPath,"Smoke.md","UI-smoke.md"].sort():restart?["Assets/android-1mib.bin",previousIncoming.path,"Assets/android-from-windows-32mib.bin",reducedFixture.path,previousAutoPath,"Smoke.md","UI-smoke.md"].sort():remoteOversize?["Assets/android-1mib.bin",previousIncoming.path,"Assets/android-from-windows-32mib.bin",previousAutoPath,"Smoke.md","UI-smoke.md"].sort():resumeBoundary?["Assets/android-1mib.bin",previousIncoming.path,previousAutoPath,"Smoke.md","UI-smoke.md"].sort():reuse?["Assets/android-1mib.bin","Smoke.md","UI-smoke.md"]:["Smoke.md"]);
+ assert.deepEqual(identity.fileNames,publication?["Assets/android-1mib.bin",previousIncoming.path,"Assets/android-from-windows-2mib.bin","Assets/android-from-windows-32mib.bin",reducedFixture.path,"Assets/android-network-02197b9cb990415e.bin",previousAutoPath,"Smoke.md","UI-smoke.md",...(resumePublication?[priorPublicationPath]:[])].sort():network?["Assets/android-1mib.bin",previousIncoming.path,"Assets/android-from-windows-2mib.bin","Assets/android-from-windows-32mib.bin",reducedFixture.path,previousAutoPath,"Smoke.md","UI-smoke.md"].sort():restart?["Assets/android-1mib.bin",previousIncoming.path,"Assets/android-from-windows-32mib.bin",reducedFixture.path,previousAutoPath,"Smoke.md","UI-smoke.md"].sort():remoteOversize?["Assets/android-1mib.bin",previousIncoming.path,"Assets/android-from-windows-32mib.bin",previousAutoPath,"Smoke.md","UI-smoke.md"].sort():resumeBoundary?["Assets/android-1mib.bin",previousIncoming.path,previousAutoPath,"Smoke.md","UI-smoke.md"].sort():reuse?["Assets/android-1mib.bin","Smoke.md","UI-smoke.md"]:["Smoke.md"]);
  if(probe){ok=true;}else{
   const sha=git(["rev-parse","HEAD"]);assert.equal(sha.status,0);
   assert.equal(git(["status","--porcelain"]).stdout.trim(),"","Clean checkout required");
@@ -114,6 +117,11 @@ try{
   if(publication){
    const out=spawnSync("adb",["-t",String(transport),"shell","sha256sum","/sdcard/Documents/"+name+"/Assets/android-network-02197b9cb990415e.bin"],{cwd:root,encoding:"utf8",shell:false,timeout:30000});
    assert.equal(out.status,0);assert.equal(out.stdout.trim().split(/\s+/u)[0],"eab88ffb974dd84649c255db2137cf268866c00d6ed5f048185d1a3482bbe7d2");
+  }
+  if(resumePublication){
+   const prior=await guarded(`return await app.vault.read(app.vault.getAbstractFileByPath(${JSON.stringify(priorPublicationPath)}));`);
+   assert.match(prior,/^# D502 publication recovery\n\n[0-9a-f]{64}\n$/u);
+   assert.equal(createHash("sha256").update(prior).digest("hex"),"edfe669a94c547072928f676fb470eb16c31e5e048e17dfd5d01d0ef736dfed8","Prior publication fixture changed");
   }
   const d={owner:config.owner,repo:config.repo,branch:config.branch,token:config.token,passphrase};
   settingsAttempted=true;
