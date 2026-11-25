@@ -149,6 +149,18 @@ async function connect(vaultPath) {
   assert.ok(managerReady, "Native plugin manager not ready");
   const loaded = await evalInVault(buildNativePluginReadyExpression(pluginId), 30000);
   assert.equal(loaded, true, "Production plugin failed to load");
+  // A plugin object may exist before async onload finishes. Match actual
+  // Settings UI readiness before seeding credentials and starting Sync.
+  let uiReady = false;
+  for (let i = 0; i < 80; i++) {
+    uiReady = await evalInVault(`(()=>{
+      const p=app.plugins.plugins[${JSON.stringify(pluginId)}];
+      return !!p?.ribbonIcon && !!p?.v4Runtime && !!p?.settingTab;
+    })()`, 15000);
+    if (uiReady) break;
+    await sleep(180);
+  }
+  assert.equal(uiReady, true, "Installed plugin UI not ready before Settings save");
 }
 
 async function launch(profilePath, vaultPath) {
@@ -280,13 +292,13 @@ try {
       syncEnabled:true,syncOnStartup:false,syncOnLocalChange:false,scheduledSyncEnabled:false,
       encryptionMode:"encrypted",
       encryptionPassphrase:${JSON.stringify(oldPassphrase)},
-      pbkdf2Iterations:600000,
+      newVaultKdfIterations:600000,
       syncObsidianConfig:false,syncBookmarks:false,syncPlugins:false
     });
     const pushed=await p.v4Runtime.forcePush(false);
     const snap=p.v4Runtime.progressSnapshot;
     if(!["success","no-change"].includes(snap.lifecycle))
-      throw Error("Seed forcePush failed: "+snap.lifecycle);
+      throw Error("Seed forcePush failed: "+JSON.stringify({lifecycle:snap.lifecycle,phase:snap.failurePhase??snap.phase,error:snap.errorMessage?.slice(0,220),apiFailures:snap.diagnostics?.apiFailures}));
     return {status:pushed?.status??null,lifecycle:snap.lifecycle};
   })()`, 240000);
 
