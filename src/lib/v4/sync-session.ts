@@ -29,7 +29,7 @@ import { loadV4RemoteConfig, loadV4RemoteState, remoteV4StateFromLocalIndex, typ
 import { V4StorageCodec } from "./storage-codec"
 import { collectV4ContentSource, createV4WholeBufferContentSource, DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES, type V4ContentHandle, type V4ContentSource } from "./content-source"
 import { abortV4StageAfterFailure, type V4StageRef } from "./staging-store"
-import { V4BoundedIoUnavailableError } from "./platform-io"
+import { V4BoundedIoUnavailableError, V4SyncFileSizeCapabilityError } from "./platform-io"
 import { shouldWriteV4Parts, V4_PART_BYTES } from "./large-files"
 import { hashV4StableContentSource, V4SourceChangedError } from "./object-stream"
 import { selectV4WriterPartBytes } from "./part-write-policy"
@@ -865,6 +865,13 @@ export class V4SyncSession {
       batch.pushes.map(binding => binding.change),
     )
 
+    // Reject unsupported incoming sizes before staging or applying any pull.
+    for (const binding of batch.pulls) {
+      if (binding.change.kind !== "delete" && binding.remoteRecord) {
+        this.assertSyncFileSize("download", binding.change.path, binding.remoteRecord.size)
+      }
+    }
+
     if (!this.input.recoveryStore) {
       for (const binding of batch.stagedWrites) {
         await this.assertStagedWritePreconditions(binding, localById)
@@ -1644,6 +1651,7 @@ export class V4SyncSession {
   private async stageRemotePull(binding: V4PullBinding, ownedStages: V4StageRef[]): Promise<V4StageRef> {
     const record = binding.remoteRecord
     if (!record) throw new Error(`Missing V4 remote record for ${binding.change.path}`)
+    this.assertSyncFileSize("download", binding.change.path, record.size)
     if (!this.localIo.staging) throw new V4BoundedIoUnavailableError("bounded-append", binding.change.path)
     const existingTargetBytes = binding.change.before?.path === binding.change.path ? binding.change.before.size : 0
     const sink = await this.localIo.staging.beginStage({
@@ -1938,7 +1946,15 @@ export class V4SyncSession {
     }
   }
 
+  private assertSyncFileSize(direction: "upload" | "download", path: string, size: number): void {
+    const ceiling = this.localIo.maxSyncFileBytes
+    if (ceiling !== undefined && size > ceiling) {
+      throw new V4SyncFileSizeCapabilityError(direction, path, ceiling)
+    }
+  }
+
   private async hashLocal(path: string, expectedBytes: number, expectedMtime: number): Promise<string> {
+    this.assertSyncFileSize("upload", path, expectedBytes)
     const handle: Extract<V4ContentHandle, { kind: "vault" }> = {
       kind: "vault",
       path,
@@ -2005,6 +2021,7 @@ export class V4SyncSession {
   }
 
   private async readRecord(record: V4IndexFileRecord, remoteCommitSha?: string): Promise<Uint8Array> {
+    this.assertSyncFileSize("download", record.path, record.size)
     return this.codec.read(record, path => this.readRemoteRecordObject(path, record, remoteCommitSha), this.input.signal)
   }
 

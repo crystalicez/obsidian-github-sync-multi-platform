@@ -19,6 +19,18 @@ export interface V4StageCommitOptions {
   assertNoOpenEditor?: () => void
 }
 
+/** Device capability limit for ordinary Sync; not a repository or migration limit. */
+export class V4SyncFileSizeCapabilityError extends Error {
+  constructor(public readonly direction: "upload" | "download", public readonly path: string, public readonly maxBytes: number) {
+    const limit = maxBytes / (1024 * 1024)
+    const action = direction === "upload"
+      ? "Keep a backup outside the synced Vault and reduce the file to the supported size. Moving a previously synced file out of the Vault may sync a deletion."
+      : "Use a desktop device to back up and reduce this file, then sync the change there first."
+    super(`This device cannot ${direction} files larger than ${limit} MiB: ${path}. ${action} Then retry normal Sync. Do not use Force Push or Force Pull to bypass this limit.`)
+    this.name = "V4SyncFileSizeCapabilityError"
+  }
+}
+
 export class V4BoundedIoUnavailableError extends Error {
   readonly capability: V4BoundedIoCapability
   readonly path?: string | undefined

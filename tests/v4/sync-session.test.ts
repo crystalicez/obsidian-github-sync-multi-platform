@@ -4676,6 +4676,48 @@ test("D11 direct staged Pull finalizes verified backup before reporting mutation
   assert.deepEqual(events, ["commit","finalize","completed"]);
 });
 
+test("D499 device file ceiling refuses local oversize before content read or publication", async () => {
+  const github = new MemoryGitHub();
+  const vault = Object.assign(new MemoryVault(), { maxSyncFileBytes: 1024 * 1024 });
+  const index = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "mobile", mode: "plaintext" });
+  vault.files.set("large.bin", { bytes: new Uint8Array(vault.maxSyncFileBytes + 1), mtime: 1 });
+  const session = () => new V4SyncSession({ github, vault, index, config: config(), conflictPolicy: "copy", abortChangePercent: 0 });
+  await assert.rejects(session().sync({ operation: "normal", allowThresholdOverride: false }), /cannot upload files larger than 1 MiB: large.bin.*retry normal Sync/u);
+  assert.equal(vault.operations.length, 0);
+  assert.equal(github.ref, null);
+  assert.equal(vault.files.get("large.bin")?.bytes.byteLength, vault.maxSyncFileBytes + 1);
+  vault.files.set("large.bin", { bytes: new Uint8Array(vault.maxSyncFileBytes), mtime: 2 });
+  assert.equal((await session().sync({ operation: "normal", allowThresholdOverride: false })).pushedFiles, 1);
+});
+
+test("D499 device file ceiling refuses remote oversize before payload reads or any local mutation", async () => {
+  const github = new MemoryGitHub();
+  const desktop = new MemoryVault();
+  const desktopIndex = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "desktop", mode: "plaintext" });
+  const local = Object.assign(new MemoryVault(), { maxSyncFileBytes: 1024 * 1024 });
+  const localIndex = createEmptyV4LocalIndex({ repoId: "o/r#main", deviceId: "mobile", mode: "plaintext" });
+  desktop.files.set("small.md", { bytes: enc("small"), mtime: 1 });
+  desktop.files.set("oversize.bin", { bytes: new Uint8Array(local.maxSyncFileBytes + 1), mtime: 1 });
+  const desktopSession = () => new V4SyncSession({ github, vault: desktop, index: desktopIndex, config: config(), conflictPolicy: "copy", abortChangePercent: 0 });
+  await desktopSession().sync({ operation: "normal", allowThresholdOverride: false });
+  const remoteHead = github.ref?.sha;
+  const remotePath = indexRecordByPath(desktopIndex, "oversize.bin").remotePath;
+  github.readPaths.length = 0;
+  const mobileSession = () => new V4SyncSession({ github, vault: local, index: localIndex, config: config(), conflictPolicy: "copy", abortChangePercent: 0 });
+  await assert.rejects(mobileSession().sync({ operation: "normal", allowThresholdOverride: false }), /cannot download files larger than 1 MiB: oversize.bin.*desktop device.*retry normal Sync/u);
+  assert.equal(github.readPaths.includes(remotePath), false);
+  assert.equal(github.readPaths.includes("small.md"), false);
+  assert.equal(local.operations.length, 0);
+  assert.equal(local.files.size, 0);
+  assert.equal(github.ref?.sha, remoteHead);
+  desktop.files.set("oversize.bin", { bytes: new Uint8Array(local.maxSyncFileBytes), mtime: 2 });
+  await desktopSession().sync({ operation: "normal", allowThresholdOverride: false });
+  const recovered = await mobileSession().sync({ operation: "normal", allowThresholdOverride: false });
+  assert.equal(recovered.pulledFiles, 2);
+  assert.equal(local.files.get("oversize.bin")?.bytes.byteLength, local.maxSyncFileBytes);
+  assert.equal(dec(local.files.get("small.md")!.bytes), "small");
+});
+
 test("v4 medium REST-safe chunked push uses bounded source instead of whole-buffer vault read", async () => {
   const github = new MemoryGitHub();
   const vault = new MemoryVault();

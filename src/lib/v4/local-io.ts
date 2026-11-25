@@ -17,6 +17,8 @@ export interface V4SessionVault {
   trash(path: string): Promise<void>
   openContentSource?(handle: V4ContentHandle, signal?: AbortSignal): Promise<V4ContentSource>
   staging?: V4StagingStore
+  /** Explicit platform ceiling; absence permits bounded desktop transfers. */
+  maxSyncFileBytes?: number
   /** Desktop: small WAL writes must use a crash-recoverable staged commit. */
   preferStagedCommit?: boolean
   commitStage?(input: { stage: V4StageRef; path: string; precondition: V4LocalTargetPrecondition }): Promise<void>
@@ -36,6 +38,7 @@ export function createV4LocalIo(vault: V4SessionVault): V4LocalIo {
   if (vault.stat) localIo.stat = path => vault.stat!(path)
   if (vault.openContentSource) localIo.openContentSource = (handle, signal) => vault.openContentSource!(handle, signal)
   if (vault.staging) localIo.staging = vault.staging
+  if (vault.maxSyncFileBytes !== undefined) localIo.maxSyncFileBytes = vault.maxSyncFileBytes
   if (vault.preferStagedCommit) localIo.preferStagedCommit = true
   if (vault.commitStage) localIo.commitStage = input => vault.commitStage!(input)
   if (vault.rollbackStage) localIo.rollbackStage = input => vault.rollbackStage!(input)

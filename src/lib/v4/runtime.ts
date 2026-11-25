@@ -2224,6 +2224,7 @@ export class V4PluginRuntime {
         openStage: (stageId, expectedSize) => this.stagingStore.open({ stageId, size: expectedSize }),
       }, signal),
       staging: this.stagingStore,
+      ...(this.platformIo.capabilities.platform === "mobile" ? { maxSyncFileBytes: DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES } : {}),
       // Only Desktop with a verifiable vault root can safely replay a staged small-file swap.
       preferStagedCommit: this.platformIo.capabilities.recoveryStagedCommit,
       commitStage: async ({ stage, path, precondition }) => {
