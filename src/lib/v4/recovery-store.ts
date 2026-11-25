@@ -139,6 +139,10 @@ function isPayload(value: unknown): value is V4RecoveryPayload {
       fileIds.add(entry.fileId)
     }
   }
+  if (payload.publishedCreateVerifiedHead !== undefined
+    && (typeof payload.publishedCreateVerifiedHead !== "string"
+      || !payload.publishedCreateVerifiedHead
+      || !payload.publishedCreates?.length)) return false
   const completed = new Set<string>()
   for (const id of payload.completedMutationIds) {
     if (typeof id !== "string" || !ids.has(id) || completed.has(id)) return false
@@ -503,22 +507,27 @@ export async function reconcileV4RecoveryPublishIntent(input: {
       payload: snapshot.payload,
     })
   }
+  // Descendant evidence applies only to exact published creates. Keep the
+  // previous verifiedRemoteHead contract: never authorize stale local replay.
+  const payload = snapshot.payload ? { ...snapshot.payload } : undefined
+  if (payload) {
+    delete payload.publishedCreateVerifiedHead
+    if (payload.publishedCreates?.length && candidate
+      && result.status === "published-advanced"
+      && result.evidence === "candidate-ancestor"
+      && result.publishedCommitSha === candidate
+      && result.currentHeadSha !== candidate
+      && result.currentHeadSha === result.verifiedHeadSha) {
+      payload.publishedCreateVerifiedHead = result.verifiedHeadSha
+    }
+  }
   return input.store.save({
     runId: snapshot.header.runId,
     journalId: snapshot.header.journalId,
     phase: "replan-required",
     expectedRemoteHead: snapshot.header.expectedRemoteHead,
     candidateCommitSha: candidate,
-    // Preserve exact descendant evidence for create identity recovery only.
-    // Remain in replan-required: never replay stale local mutations.
-    verifiedRemoteHead: candidate
-      && result.status === "published-advanced"
-      && result.evidence === "candidate-ancestor"
-      && result.publishedCommitSha === candidate
-      && result.currentHeadSha !== candidate
-      && result.currentHeadSha === result.verifiedHeadSha
-      ? result.verifiedHeadSha
-      : undefined,
-    payload: snapshot.payload,
+    verifiedRemoteHead: undefined,
+    payload,
   })
 }

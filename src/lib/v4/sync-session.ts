@@ -625,14 +625,16 @@ export class V4SyncSession {
     const changes = options.changes ?? []
     if (options.operation === "normal" && remote && !isLayoutMigration && hasKnownBase
       && recovery?.header.phase === "replan-required"
-      && recovery.header.verifiedRemoteHead === remote.commitSha
+      && (recovery.header.verifiedRemoteHead === remote.commitSha
+        || recovery.payload?.publishedCreateVerifiedHead === remote.commitSha)
       && changes.every(change => change.type === "modify" || change.type === "rescan")) {
       const completed = new Set(recovery.payload?.completedMutationIds ?? [])
       const remoteByPath = new Map(remoteRecords.filter(record => !record.deleted).map(record => [record.path, record]))
       const basePaths = new Set(identityBaseRecords.map(record => record.path.normalize("NFC").toLowerCase()))
       const baseIds = new Set(identityBaseRecords.map(record => record.fileId))
       // Recover a published create at the verified candidate or its proven descendant.
-      if (recovery.header.candidateCommitSha) {
+      if (recovery.header.candidateCommitSha === remote.commitSha
+        || (recovery.header.candidateCommitSha && recovery.payload?.publishedCreateVerifiedHead === remote.commitSha)) {
         for (const receipt of recovery.payload?.publishedCreates ?? []) {
           const record = remoteByPath.get(receipt.path)
           if (!record || record.fileId !== receipt.fileId
@@ -642,9 +644,7 @@ export class V4SyncSession {
         }
       }
       // Descendant evidence does not authorize reusing stale pull receipts.
-      const advancedPublication = recovery.header.candidateCommitSha !== undefined
-        && recovery.header.candidateCommitSha !== remote.commitSha
-      for (const mutation of advancedPublication ? [] : recovery.payload?.mutations ?? []) {
+      for (const mutation of recovery.header.verifiedRemoteHead === remote.commitSha ? recovery.payload?.mutations ?? [] : []) {
         if (mutation.kind !== "stage-write" || mutation.precondition.exists || !completed.has(mutation.id)) continue
         const record = remoteByPath.get(mutation.path)
         if (!record || mutation.id !== `pull:${record.fileId}:write`

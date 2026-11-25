@@ -146,6 +146,57 @@ test("recovery marks advanced or divergent publication evidence for replan inste
   assert.equal(reconciled.header.verifiedRemoteHead, undefined)
 })
 
+test("D511 descendant create proof persists separately from local replay authorization", async () => {
+  for (const evidence of ["candidate-ancestor", "marker-equivalent", "unrelated-head", "ancestry-read-failure"] as const) {
+    const adapter = new MemoryAdapter()
+    const store = createV4RecoveryStore({ adapter, root: "recovery", repoId: "owner/repo#main" })
+    const snapshot = await store.save({
+      runId: "run-create",
+      journalId: "j-create",
+      phase: "publish-intent",
+      expectedRemoteHead: "base",
+      candidateCommitSha: "candidate",
+      payload: {
+        publishedCreates: [{ path: "new.md", fileId: "file", hash: "a".repeat(64), size: 1 }],
+        mutations: [],
+        completedMutationIds: [],
+      },
+    })
+    const reconciled = await reconcileV4RecoveryPublishIntent({
+      store,
+      snapshot,
+      result: {
+        status: evidence === "candidate-ancestor" || evidence === "marker-equivalent" ? "published-advanced" : evidence === "unrelated-head" ? "diverged" : "indeterminate",
+        evidence,
+        currentHeadSha: "later",
+        publishedCommitSha: evidence === "marker-equivalent" ? "equivalent" : "candidate",
+        verifiedHeadSha: "later",
+      },
+    })
+    assert.equal(reconciled.header.phase, "replan-required")
+    assert.equal(reconciled.header.verifiedRemoteHead, undefined)
+    assert.equal(reconciled.payload?.publishedCreateVerifiedHead, evidence === "candidate-ancestor" ? "later" : undefined)
+    // JSON persistence omits optional undefined header keys.
+    const reopened = await store.load()
+    assert.deepEqual(reopened?.payload, reconciled.payload)
+    assert.equal(reopened?.header.integrity, reconciled.header.integrity)
+    assert.equal(reopened?.header.phase, "replan-required")
+    assert.equal(reopened?.header.verifiedRemoteHead, undefined)
+  }
+})
+
+test("D511 descendant proof without create receipts is rejected", async () => {
+  const store = createV4RecoveryStore({ adapter: new MemoryAdapter(), root: "recovery", repoId: "owner/repo#main" })
+  await assert.rejects(() => store.save({
+    runId: "run-create",
+    phase: "replan-required",
+    expectedRemoteHead: "base",
+    candidateCommitSha: "candidate",
+    payload: { publishedCreateVerifiedHead: "later", mutations: [], completedMutationIds: [] },
+  }), /payload shape is invalid/u)
+  assert.equal(await store.load(), null)
+})
+
 test("startup recovery reconciles an advanced head through exact candidate ancestry before replanning", async () => {
   const { recoverV4PendingState } = await import("../../src/lib/v4/recovery-store")
   const adapter = new MemoryAdapter()

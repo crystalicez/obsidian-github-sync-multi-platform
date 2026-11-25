@@ -48,6 +48,8 @@ export interface V4RecoveryPublishedCreate {
 
 export interface V4RecoveryPayload {
   publishedCreates?: V4RecoveryPublishedCreate[] | undefined
+  /** Exact descendant HEAD proven to contain the published candidate; never a local replay authorization. */
+  publishedCreateVerifiedHead?: string | undefined
   mutations: V4RecoveryLocalMutation[]
   completedMutationIds: string[]
 }
