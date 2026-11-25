@@ -57,6 +57,8 @@ let remoteCleanupErrors = [];
 let staleClientReport;
 let staleSession;
 const ownedProcessIds = new Set();
+const phaseNames = new Set(["source-verified", "fenced-and-wal-opened", "backup-created", "staged", "scratch-restored", "candidate-prepared", "destination-published-no-cutover"]);
+let lastPhase = "not-started";
 
 const redact = value => {
   let msg = String(value?.message ?? value ?? "");
@@ -87,7 +89,7 @@ function send(method, params = {}, timeoutMs = 25000) {
     const id = ++nextId;
     const timer = setTimeout(() => {
       pending.delete(id);
-      reject(new Error(`CDP timeout: ${method}`));
+      reject(new Error(`CDP timeout: ${method}; last migration phase: ${lastPhase}`));
     }, timeoutMs);
     pending.set(id, {
       resolve: value => { clearTimeout(timer); resolve(value); },
@@ -129,6 +131,11 @@ async function connect(vaultPath) {
   ws.addEventListener("message", event => {
     const msg = JSON.parse(String(event.data));
     if (msg.method === "Runtime.exceptionThrown") uiExceptions.push("Uncaught UI exception");
+    if (msg.method === "Runtime.consoleAPICalled" && msg.params?.args?.length === 2
+      && msg.params.args[0]?.value === "D515_NATIVE_REKEY_PHASE" && phaseNames.has(msg.params.args[1]?.value)) {
+      lastPhase = msg.params.args[1].value;
+      console.log(JSON.stringify({status:"NATIVE_REKEY_PHASE",phase:lastPhase}));
+    }
     if (!msg.id) return;
     const waiter = pending.get(msg.id);
     if (!waiter) return;
@@ -400,7 +407,8 @@ try {
       prepareShadowIndex:${JSON.stringify(shadowMode)},
       stageDestinationSecret:${JSON.stringify(secretMode)},
       acknowledgement:"accept-best-effort-power-loss-recovery-risk",
-      assertExclusiveInitiatorLease:async()=>{}
+      assertExclusiveInitiatorLease:async()=>{},
+      onPhase:phase=>console.info("D515_NATIVE_REKEY_PHASE",phase)
     });
     return {
       report,
@@ -412,7 +420,7 @@ try {
       passphraseStillOld:p.settings.encryptionPassphrase===${JSON.stringify(oldPassphrase)},
       scratchExists:await app.vault.adapter.exists(".obsidian/plugins/${pluginId}/rekey-scratch-${runId}")
     };
-  })()`, 300000);
+  })()`, secretMode ? 600000 : 300000);
 
   assert.equal(rehearsal.report.status, "destination-published-fenced-no-cutover");
   assert.equal(rehearsal.report.cutoverAuthorized, false);
