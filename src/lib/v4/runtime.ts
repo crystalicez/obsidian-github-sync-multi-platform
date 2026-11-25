@@ -1854,6 +1854,8 @@ export class V4PluginRuntime {
     readonly expectedFinalWalGeneration: number
     readonly verifyShadowIndex?: boolean | undefined
     readonly recoverStagedSecret?: boolean | undefined
+    /** Fresh local physical parity and current Source ref, without activation. */
+    readonly verifyPhysicalVault?: boolean | undefined
     readonly expectedFileCount: number
     readonly expectedPlaintextBytes: string
     readonly newPassphrase?: string | undefined
@@ -1913,6 +1915,16 @@ export class V4PluginRuntime {
       const discovered = await this.discoverInstalledStagedRecovery()
       const report = await this.inspectFencedReencryptionPreCutoverRecovery({ ...discovered.input, createGitHubClient })
       return { locatorDigest: discovered.locatorDigest, report }
+    } catch { return null }
+  }
+
+  /** Read-only activation preflight from persisted identity; never an activation grant. */
+  async inspectInstalledCutoverReadinessFromDisk(createGitHubClient?: (branch: string) => GitHubClient): Promise<V4InstalledPreCutoverRecoveryReport | null> {
+    try {
+      const discovered = await this.discoverInstalledStagedRecovery()
+      return await this.inspectFencedReencryptionPreCutoverRecovery({
+        ...discovered.input, verifyPhysicalVault: true, createGitHubClient,
+      })
     } catch { return null }
   }
 
@@ -2045,6 +2057,7 @@ export class V4PluginRuntime {
           && checks[2] === false && checks[3] === false
           && checks[4] === recoverStagedSecret && (!recoverStagedSecret || verifyShadowIndex)
       },
+      createInitiatorReader: input.verifyPhysicalVault === true ? lease => this.createReencryptionInitiatorLocalReader(lease) : undefined,
       openReadOnlyWal: async () => {
         assertOwner()
         const layout = await planV4PluginPrivateWalLocation({ configDir, pluginId, runId: input.runId })

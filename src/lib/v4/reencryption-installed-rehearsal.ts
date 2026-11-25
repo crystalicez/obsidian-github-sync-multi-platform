@@ -149,6 +149,8 @@ export interface V4InstalledPreCutoverRecoveryInput {
   readonly inspectRoute: () => Promise<V4ReencryptionColdStartRouteReport>
   readonly shadow?: { readonly adapter: V4LocalIndexAdapter; readonly deviceId: string } | undefined
   readonly inspectFenceAndNoPartialCutover?: (() => Promise<boolean>) | undefined
+  /** Optional activation-readiness scan, never used for missing-key repair. */
+  readonly createInitiatorReader?: ((assertLease: () => Promise<void>) => V4InitiatorLocalReader) | undefined
   readonly openReadOnlyWal: () => Promise<V4InstalledRehearsalReadOnlyWal>
   readonly createGitHubClient: (branch: string) => GitHubClient
   readonly assertOwnerStillValid?: (() => void) | undefined
@@ -165,7 +167,9 @@ export interface V4InstalledPreCutoverRecoveryReport {
   readonly stagedSecretReverified?: true | undefined
   readonly stagedSecretMissing?: true | undefined
   readonly stagedSecretRestored?: true | undefined
-  readonly failureStage?: "fence" | "backup" | "wal" | "destination" | "secret" | "shadow" | "final-readback" | undefined
+  readonly physicalParityReverified?: true | undefined
+  readonly sourceRefReverified?: true | undefined
+  readonly failureStage?: "fence" | "backup" | "wal" | "destination" | "secret" | "shadow" | "physical-parity" | "source-ref" | "final-readback" | undefined
   readonly verifiedFileCount: number
   readonly verifiedPlaintextBytes: string
   readonly cutoverAuthorized: false
@@ -749,7 +753,8 @@ export async function inspectV4InstalledPreCutoverRecoveryAfterRestart(
     || !COMMIT_SHA.test(input.destinationCommitSha)
     || !COMMIT_SHA.test(input.destinationTreeSha)
     || !input.oldPassphrase || (!input.secretOwner && !input.newPassphrase) || input.oldPassphrase === input.newPassphrase
-    || (input.restoreMissingSecret && (!input.secretOwner || !input.shadow || !input.newPassphrase))
+    || (input.restoreMissingSecret && (!input.secretOwner || !input.shadow || !input.newPassphrase || input.createInitiatorReader))
+    || (input.createInitiatorReader && (!input.secretOwner || !input.shadow || !input.inspectFenceAndNoPartialCutover))
     || !Number.isSafeInteger(input.expectedFinalWalGeneration) || input.expectedFinalWalGeneration < 1) {
     return manualRecoveryReport()
   }
@@ -793,6 +798,25 @@ export async function inspectV4InstalledPreCutoverRecoveryAfterRestart(
     const backupRepoId = `${input.owner}/${input.repo}#${input.backupBranch}`
     const destinationRepoId = `${input.owner}/${input.repo}#${input.destinationBranch}`
 
+    // Recovery can use the immutable Backup after an old client advances Source.
+    // Activation readiness cannot silently discard that divergence.
+    const sourceClient = input.createInitiatorReader ? input.createGitHubClient(input.sourceBranch) : undefined
+    const assertSourceStillPinned = async () => {
+      if (!sourceClient) return
+      await wal!.assertExclusiveStageLease()
+      input.assertOwnerStillValid?.()
+      const [identity, defaultBranch, ref] = await Promise.all([
+        sourceClient.getRepositoryIdentity(), sourceClient.getRepositoryDefaultBranch(), sourceClient.getGitRef(),
+      ])
+      if (sourceClient.branchName !== input.sourceBranch || identity.id !== input.expectedPhysicalRepositoryId
+        || identity.fullName.toLowerCase() !== (input.owner + "/" + input.repo).toLowerCase()
+        || defaultBranch !== input.defaultBranch || ref.ref !== "refs/heads/" + input.sourceBranch
+        || ref.sha !== input.pinnedSourceCommitSha) throw Error("Source advanced or changed before activation.")
+      await wal!.assertExclusiveStageLease()
+      input.assertOwnerStillValid?.()
+    }
+    failureStage = "source-ref"
+    await assertSourceStillPinned()
     failureStage = "backup"
     const backupPlan = proposeV4SameRepositoryReencryptionBackupBranch({
       sourceRepoId,
@@ -1020,6 +1044,36 @@ export async function inspectV4InstalledPreCutoverRecoveryAfterRestart(
       if (finalSecret.id !== stagedSecret.id || finalSecret.passphrase !== destinationPassphrase) return fail()
       await assertRestoreLease()
     }
+    if (input.createInitiatorReader) {
+      // Reuse authenticated frozen Backup inventory, not the local cache.
+      // The lease remains held across the live physical scan and final ref checks.
+      failureStage = "physical-parity"
+      const assertLease = async () => {
+        throwIfV4Aborted(input.signal)
+        input.assertOwnerStillValid?.()
+        await wal!.assertExclusiveStageLease()
+        if (!await input.inspectFenceAndNoPartialCutover!()) throw Error("Recovery fence changed.")
+      }
+      const parity = await verifyV4ReencryptionInitiatorLocalParity({
+        pinnedSourceCommitSha: input.pinnedSourceCommitSha,
+        verifiedSource: backupInventory.verifiedSource,
+        sourceRecords: backupInventory.sourceRecords.filter(record => !record.deleted),
+        reader: input.createInitiatorReader(assertLease),
+        signal: input.signal,
+      })
+      if (parity.checkedFileCount !== input.expectedFileCount
+        || parity.checkedPlaintextBytes !== input.expectedPlaintextBytes) return fail()
+      failureStage = "source-ref"
+      await assertSourceStillPinned()
+      failureStage = "final-readback"
+      const [backup, destination] = await Promise.all([backupClient.getGitRef(), destinationClient.getGitRef()])
+      if (backup.sha !== input.pinnedSourceCommitSha || destination.sha !== input.destinationCommitSha) return fail()
+      await assertLease()
+      await readOnlyJournal.assertHealthySnapshot(input.expectedFinalWalGeneration)
+      const finalSecret = await inspectV4InstalledDestinationSecret(secretInput!)
+      if (finalSecret.id !== stagedSecret!.id || finalSecret.passphrase !== destinationPassphrase) return fail()
+      await assertLease()
+    }
     input.assertOwnerStillValid?.()
     return Object.freeze({
       integrityScope: restore ? "installed-pre-cutover-staged-secret-recovery" : "read-only-installed-pre-cutover-wal-backup-and-destination",
@@ -1030,6 +1084,7 @@ export async function inspectV4InstalledPreCutoverRecoveryAfterRestart(
       ...(input.shadow ? { shadowReverified: true as const } : {}),
       ...(stagedSecret ? { stagedSecretReverified: true as const } : {}),
       ...(restore ? { stagedSecretRestored: true as const } : {}),
+      ...(input.createInitiatorReader ? { physicalParityReverified: true as const, sourceRefReverified: true as const } : {}),
       verifiedFileCount: destInventory.verifiedSource.verifiedFileCount,
       verifiedPlaintextBytes: destInventory.verifiedSource.totalVerifiedPlaintextBytes,
       cutoverAuthorized: false,
