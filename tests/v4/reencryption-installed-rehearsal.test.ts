@@ -12,7 +12,8 @@ import { V4_RUNTIME_INDEX_ROOT } from "../../src/lib/v4/reencryption-index-root"
 import { V4_REENCRYPTION_RUNTIME_ROUTE_PATH } from "../../src/lib/v4/reencryption-runtime-index-route"
 import { V4_REENCRYPTION_SYNC_FENCE_ROOT } from "../../src/lib/v4/reencryption-sync-fence"
 import { planV4PluginPrivateWalLocation } from "../../src/lib/v4/reencryption-plugin-wal-location"
-import { verifyGitHubReencryptionForkSource } from "../../src/lib/v4/reencryption-trusted-loader"
+import { verifyGitHubReencryptionForkSource, verifyGitHubReencryptionForkSourceWithTranscodeInventory } from "../../src/lib/v4/reencryption-trusted-loader"
+import { createEmptyV4LocalIndex, saveV4LocalIndex, loadV4LocalIndex } from "../../src/lib/v4/local-index"
 import { deriveV4Keyring } from "../../src/lib/v4/crypto"
 import { createV4ReencryptionRecoveryJournal } from "../../src/lib/v4/reencryption-recovery-journal"
 import { V4StorageCodec } from "../../src/lib/v4/storage-codec"
@@ -374,6 +375,21 @@ test("D412 installed Runtime orchestrates Source -> Backup -> Staging -> Scratch
   let runtime2: ReturnType<typeof vault.makeRuntime> | undefined
   try {
     const pinnedSourceCommitSha = await seedEncryptedSource(server, fixtureFiles)
+    const source = await verifyGitHubReencryptionForkSourceWithTranscodeInventory({
+      github: makeClientFactory()(SOURCE_BRANCH), expectedRepoId: `${OWNER}/${REPO}#${SOURCE_BRANCH}`,
+      expectedBranch: SOURCE_BRANCH, passphrase: OLD_PASSPHRASE,
+    })
+    const sourceRoot = `${CONFIG_DIR}/plugins/${PLUGIN_ID}/${V4_RUNTIME_INDEX_ROOT}`
+    const sourceIndex = createEmptyV4LocalIndex({ repoId: source.sourceConfig.repoId, deviceId: vault.settings.vault, mode: "encrypted" })
+    sourceIndex.remoteCommitSha = pinnedSourceCommitSha
+    sourceIndex.epoch = source.sourceHead.epoch
+    sourceIndex.generation = source.sourceHead.generation
+    sourceIndex.shardHashes = { ...source.sourceHead.shardHashes }
+    for (const [bucket, shard] of Object.entries(source.sourceShards)) {
+      sourceIndex.shards[bucket] = { bucket, hash: sourceIndex.shardHashes[bucket]!, records: structuredClone(shard.records) }
+    }
+    await saveV4LocalIndex(vault.adapter, sourceRoot, sourceIndex)
+    const sourceBefore = await loadV4LocalIndex(vault.adapter, sourceRoot)
     runtime1 = vault.makeRuntime()
     const runId = "d412-rehearsal-run-01"
     const backupBranch = "backup/d412-rehearsal"
@@ -385,6 +401,7 @@ test("D412 installed Runtime orchestrates Source -> Backup -> Staging -> Scratch
       destinationBranch,
       newPassphrase: NEW_PASSPHRASE,
       requestedIterations: 700_000,
+      prepareShadowIndex: true,
       acknowledgement: "accept-best-effort-power-loss-recovery-risk",
       assertExclusiveInitiatorLease: async () => {},
       createGitHubClient: makeClientFactory(),
@@ -397,6 +414,14 @@ test("D412 installed Runtime orchestrates Source -> Backup -> Staging -> Scratch
     assert.equal(report.verifiedFileCount, 2)
     assert.equal(report.verifiedPlaintextBytes, String(noteBytes.byteLength + binBytes.byteLength))
     assert.equal(report.scratchRestoredFileCount, 2)
+    assert.equal(report.shadow?.verifiedFileCount, 2)
+    assert.equal(report.shadow?.destinationCommitSha, report.destinationCommitSha)
+    assert.equal(report.shadow?.resumeSyncAuthorized, false)
+    assert.deepEqual(await loadV4LocalIndex(vault.adapter, sourceRoot), sourceBefore)
+    const shadowRoot = `${sourceRoot}-rekey-${runId}`
+    const shadow = await loadV4LocalIndex(vault.adapter, shadowRoot)
+    assert.equal(shadow.remoteCommitSha, report.destinationCommitSha)
+    assert.equal(shadow.repoId, report.destinationRepoId)
     assert.equal(report.cutoverAuthorized, false)
     assert.equal(report.localCutoverExecuted, false)
     assert.equal(report.resumeSyncAuthorized, false)
@@ -472,7 +497,7 @@ test("D412 installed Runtime orchestrates Source -> Backup -> Staging -> Scratch
     const scheduledAfterRestart = await runtime2.runtime.scheduledSync() as { status?: string; changedFiles?: number }
     assert.equal(scheduledAfterRestart.status, "skipped")
 
-    const recovered = await runtime2.runtime.inspectFencedReencryptionPreCutoverRecovery({
+    const recoveryInput = {
       runId,
       backupBranch,
       destinationBranch,
@@ -481,13 +506,16 @@ test("D412 installed Runtime orchestrates Source -> Backup -> Staging -> Scratch
       destinationCommitSha: report.destinationCommitSha,
       destinationTreeSha: report.destinationTreeSha,
       expectedFinalWalGeneration: report.finalWalGeneration,
+      verifyShadowIndex: true,
       expectedFileCount: 2,
       expectedPlaintextBytes: String(noteBytes.byteLength + binBytes.byteLength),
       newPassphrase: NEW_PASSPHRASE,
       expectedPhysicalRepositoryId: PHYSICAL_REPO_ID,
       defaultBranch: DEFAULT_BRANCH,
       createGitHubClient: makeClientFactory(),
-    })
+    }
+    const recovered = await runtime2.runtime.inspectFencedReencryptionPreCutoverRecovery(recoveryInput)
+    assert.equal(recovered.shadowReverified, true)
 
     assert.equal(recovered.observation, "authenticated-pre-cutover-destination-still-fenced")
     assert.equal(recovered.walAuthenticated, true)
@@ -499,6 +527,16 @@ test("D412 installed Runtime orchestrates Source -> Backup -> Staging -> Scratch
     assert.equal(recovered.resumeSyncAuthorized, false)
     assert.equal(recovered.oldPassphraseCleanupAuthorized, false)
     assert.equal(recovered.powerLossDurabilityProven, false)
+
+    // Even a valid local cache digest cannot authorize a forged remote identity.
+    const firstShard = Object.values(shadow.shards)[0]!
+    const firstRecord = Object.values(firstShard.records)[0]!
+    firstRecord.fileId = "forged-file-identity"
+    await saveV4LocalIndex(vault.adapter, shadowRoot, shadow)
+    const tampered = await runtime2.runtime.inspectFencedReencryptionPreCutoverRecovery(recoveryInput)
+    assert.equal(tampered.observation, "manual-recovery-required")
+    assert.equal(tampered.resumeSyncAuthorized, false)
+    assert.deepEqual(await loadV4LocalIndex(vault.adapter, sourceRoot), sourceBefore)
 
     // Physical Vault notes remain identical to original fixture.
     assert.deepEqual(new Uint8Array(await vault.adapter.readBinary("Notes/สวัสดี.md")), noteBytes)

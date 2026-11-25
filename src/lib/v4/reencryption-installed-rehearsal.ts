@@ -6,6 +6,7 @@ import { deriveV4Keyring, type V4Keyring } from "./crypto"
 import { readImmutableGitFile } from "./immutable-git-read"
 import { assertV4Pbkdf2Iterations, V4_MIN_NEW_PBKDF2_ITERATIONS } from "./kdf-policy"
 import type { V4LocalIndexAdapter } from "./local-index"
+import { stageV4InstalledReencryptionShadow, verifyV4InstalledReencryptionShadow, type V4InstalledShadowReport } from "./reencryption-installed-shadow"
 import { expectedV4PathLayout, V4_CONFIG_PATH, type V4RemoteConfig } from "./protocol-types"
 import { inspectV4BestEffortWalRecovery } from "./reencryption-best-effort-wal-recovery"
 import type { V4DesktopRekeyWalStorage } from "./reencryption-desktop-wal"
@@ -27,7 +28,6 @@ import type { V4ReencryptionColdStartRouteReport } from "./reencryption-runtime-
 import { V4ReencryptionSyncFencedError } from "./reencryption-sync-fence"
 import {
   verifyGitHubFrozenReencryptionBackup,
-  verifyGitHubReencryptionForkSource,
   verifyGitHubReencryptionForkSourceWithTranscodeInventory,
 } from "./reencryption-trusted-loader"
 import { proposeV4ReencryptionWizardDraft } from "./reencryption-wizard-plan"
@@ -90,6 +90,7 @@ export interface V4InstalledPreCutoverRehearsalInput {
   readonly assertExclusiveInitiatorLease: () => Promise<void>
   readonly createGitHubClient: (branch: string) => GitHubClient
   readonly runtimeOwner: V4InstalledPreCutoverRehearsalOwner
+  readonly shadowAdapter?: V4LocalIndexAdapter | undefined
   readonly newSalt?: Uint8Array | undefined
   readonly createdAt?: number | undefined
   readonly signal?: AbortSignal | undefined
@@ -111,6 +112,7 @@ export interface V4InstalledPreCutoverRehearsalReport {
   readonly finalWalGeneration: number
   readonly verifiedFileCount: number
   readonly verifiedPlaintextBytes: string
+  readonly shadow?: V4InstalledShadowReport | undefined
   readonly stagedBlobCount: number
   readonly scratchRestoredFileCount: number
   readonly cutoverAuthorized: false
@@ -140,6 +142,7 @@ export interface V4InstalledPreCutoverRecoveryInput {
   readonly defaultBranch: string
   readonly assertPersistedFenceActive: () => Promise<void>
   readonly inspectRoute: () => Promise<V4ReencryptionColdStartRouteReport>
+  readonly shadow?: { readonly adapter: V4LocalIndexAdapter; readonly deviceId: string } | undefined
   readonly inspectFenceAndNoPartialCutover?: (() => Promise<boolean>) | undefined
   readonly openReadOnlyWal: () => Promise<V4InstalledRehearsalReadOnlyWal>
   readonly createGitHubClient: (branch: string) => GitHubClient
@@ -153,6 +156,7 @@ export interface V4InstalledPreCutoverRecoveryReport {
   readonly walAuthenticated: boolean
   readonly backupReverified: boolean
   readonly destinationReverified: boolean
+  readonly shadowReverified?: true | undefined
   readonly verifiedFileCount: number
   readonly verifiedPlaintextBytes: string
   readonly cutoverAuthorized: false
@@ -601,13 +605,14 @@ export async function runV4InstalledPreCutoverRehearsal(
     })
 
     // Confirm independent read-only Destination verification & final WAL generation.
-    const verifiedDestination = await verifyGitHubReencryptionForkSource({
+    const destInventory = await verifyGitHubReencryptionForkSourceWithTranscodeInventory({
       github: destinationReadbackClient,
       expectedRepoId: wizardProposal.destinationRepoId,
       expectedBranch: input.destinationBranch,
       passphrase: input.newPassphrase,
       signal: input.signal,
     })
+    const verifiedDestination = destInventory.verifiedSource
     const destReadbackIdentity = await destinationReadbackClient.getRepositoryIdentity()
     if (destReadbackIdentity.id !== sourceIdentity.id
       || verifiedDestination.pinnedSourceCommitSha !== published.destinationCommitSha
@@ -624,6 +629,25 @@ export async function runV4InstalledPreCutoverRehearsal(
     }
 
     await combinedLease()
+    const shadow = input.shadowAdapter ? await stageV4InstalledReencryptionShadow({
+      adapter: input.shadowAdapter, runId: input.runId, deviceId: input.deviceId,
+      source: sourceInventory, destination: destInventory,
+      assertLeaseAndOwner: async () => {
+        await combinedLease()
+        await wal!.assertExclusiveStageLease()
+        const [sourceRef, backupRef, destinationRef] = await Promise.all([
+          sourceClient.getGitRef(), backupReadbackClient.getGitRef(), destinationReadbackClient.getGitRef(),
+        ])
+        if (sourceRef.sha !== pinnedSourceCommitSha || backupRef.sha !== pinnedSourceCommitSha
+          || destinationRef.sha !== published.destinationCommitSha) throw Error("Re-encryption refs changed during Shadow staging.")
+        await combinedLease()
+      },
+      assertPhysicalParity: async () => { await verifyV4ReencryptionInitiatorLocalParity(initiatorLocalParity) },
+      checkpoint: async () => {
+        await wal!.assertBestEffortCheckpoint()
+        await journal.assertHealthySnapshot(finalWal.generation)
+      },
+    }) : undefined
     await advance("candidate-prepared", "destination-published-no-cutover")
     succeeded = true
     return Object.freeze({
@@ -641,6 +665,7 @@ export async function runV4InstalledPreCutoverRehearsal(
       finalWalGeneration: finalWal.generation,
       verifiedFileCount: published.verifiedFileCount,
       verifiedPlaintextBytes: published.verifiedPlaintextBytes,
+      ...(shadow ? { shadow } : {}),
       stagedBlobCount: staged.receipts.length,
       scratchRestoredFileCount: scratchRestore.roundTripFileCount,
       cutoverAuthorized: false,
@@ -887,6 +912,12 @@ export async function inspectV4InstalledPreCutoverRecoveryAfterRestart(
       || snapshot.receipts.some(receipt => !expectedObjectPaths.has(receipt.path) || blobByPath.get(receipt.path) !== receipt.sha)) {
       return manualRecoveryReport()
     }
+    if (input.shadow) {
+      await verifyV4InstalledReencryptionShadow({
+        adapter: input.shadow.adapter, runId: input.runId, deviceId: input.shadow.deviceId,
+        source: backupInventory, destination: destInventory,
+      })
+    }
     // Bind the final observation to the same exact refs and WAL generation
     // after all awaited content reads, not a moving branch.
     const [finalBackupRef, finalDestinationRef] = await Promise.all([
@@ -905,6 +936,7 @@ export async function inspectV4InstalledPreCutoverRecoveryAfterRestart(
       walAuthenticated,
       backupReverified,
       destinationReverified,
+      ...(input.shadow ? { shadowReverified: true as const } : {}),
       verifiedFileCount: destInventory.verifiedSource.verifiedFileCount,
       verifiedPlaintextBytes: destInventory.verifiedSource.totalVerifiedPlaintextBytes,
       cutoverAuthorized: false,

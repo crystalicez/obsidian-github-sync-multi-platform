@@ -1665,6 +1665,7 @@ export class V4PluginRuntime {
     readonly acknowledgement: "accept-best-effort-power-loss-recovery-risk"
     readonly assertExclusiveInitiatorLease: () => Promise<void>
     readonly createGitHubClient?: ((branch: string) => GitHubClient) | undefined
+    readonly prepareShadowIndex?: boolean | undefined
     readonly newSalt?: Uint8Array | undefined
     readonly createdAt?: number | undefined
     readonly signal?: AbortSignal | undefined
@@ -1778,6 +1779,7 @@ export class V4PluginRuntime {
       acknowledgement: input.acknowledgement,
       assertExclusiveInitiatorLease: input.assertExclusiveInitiatorLease,
       createGitHubClient: createClient,
+      shadowAdapter: input.prepareShadowIndex === true ? this.adapter : undefined,
       newSalt: input.newSalt,
       createdAt: input.createdAt,
       signal: input.signal,
@@ -1831,6 +1833,7 @@ export class V4PluginRuntime {
     readonly destinationCommitSha: string
     readonly destinationTreeSha: string
     readonly expectedFinalWalGeneration: number
+    readonly verifyShadowIndex?: boolean | undefined
     readonly expectedFileCount: number
     readonly expectedPlaintextBytes: string
     readonly newPassphrase: string
@@ -1883,6 +1886,7 @@ export class V4PluginRuntime {
         throw new Error("Re-encryption pre-cutover recovery lost live owner.")
       }
     }
+    const verifyShadowIndex = input.verifyShadowIndex === true
     const createClient = input.createGitHubClient ?? ((branch: string) => new GitHubClient({
       token: pinned.token,
       owner: pinned.owner,
@@ -1909,6 +1913,7 @@ export class V4PluginRuntime {
       defaultBranch: input.defaultBranch,
       assertPersistedFenceActive: () => assertV4ReencryptionSyncFenceClear(this.adapter),
       inspectRoute: () => this.inspectFencedReencryptionIndexRoute(),
+      shadow: verifyShadowIndex ? { adapter: this.adapter, deviceId: pinned.vault } : undefined,
       inspectFenceAndNoPartialCutover: async () => {
         assertOwner()
         const fenceText = await this.adapter.read(`${V4_REENCRYPTION_SYNC_FENCE_ROOT}/active.json`)
@@ -1929,7 +1934,8 @@ export class V4PluginRuntime {
           this.adapter.exists(V4_REENCRYPTION_RUNTIME_ROUTE_PATH),
         ])
         assertOwner()
-        return checks.every(exists => exists === false)
+        return checks[0] === false && checks[1] === verifyShadowIndex
+          && checks[2] === false && checks[3] === false
       },
       openReadOnlyWal: async () => {
         assertOwner()

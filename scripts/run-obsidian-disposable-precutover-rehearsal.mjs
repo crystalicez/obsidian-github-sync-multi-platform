@@ -30,8 +30,9 @@ let port = initiatorPort;
 const tmpParent = path.join(root, ".tmp", "obsidian-installed-precutover-rehearsal");
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const staleClientMode = process.argv.includes("--stale-client");
-assert.ok(process.argv.slice(2).every(arg => arg === "--stale-client"),
-  "Only --stale-client is supported; all writes must remain in approved disposable branches.");
+const shadowMode = process.argv.includes("--shadow-index");
+assert.ok(process.argv.slice(2).every(arg => arg === "--stale-client" || arg === "--shadow-index"),
+  "Only --stale-client and --shadow-index are supported; all writes must remain in approved disposable branches.");
 
 const oldPassphrase = "d412-old-" + randomBytes(18).toString("base64url");
 const newPassphrase = "d412-new-" + randomBytes(18).toString("base64url");
@@ -395,6 +396,7 @@ try {
       destinationBranch:${JSON.stringify(destinationBranch)},
       newPassphrase:${JSON.stringify(newPassphrase)},
       requestedIterations:600000,
+      prepareShadowIndex:${JSON.stringify(shadowMode)},
       acknowledgement:"accept-best-effort-power-loss-recovery-risk",
       assertExclusiveInitiatorLease:async()=>{}
     });
@@ -417,6 +419,13 @@ try {
   assert.equal(rehearsal.branchStillSource, true);
   assert.equal(rehearsal.passphraseStillOld, true);
   assert.equal(rehearsal.scratchExists, false);
+  if (shadowMode) {
+    assert.equal(rehearsal.report.shadow?.status, "shadow-index-staged-uncommitted");
+    assert.equal(rehearsal.report.shadow?.verifiedFileCount, 2);
+    assert.equal(rehearsal.report.shadow?.destinationCommitSha, rehearsal.report.destinationCommitSha);
+    assert.equal(rehearsal.report.shadow?.resumeSyncAuthorized, false);
+    assert.equal(rehearsal.report.shadow?.powerLossDurabilityProven, false);
+  }
 
   // Confirm both Backup and Destination refs exist on real GitHub.
   const backupRemote = await readWithRetry(refs[1]);
@@ -445,6 +454,7 @@ try {
       destinationCommitSha:${JSON.stringify(rehearsal.report.destinationCommitSha)},
       destinationTreeSha:${JSON.stringify(rehearsal.report.destinationTreeSha)},
       expectedFinalWalGeneration:${rehearsal.report.finalWalGeneration},
+      verifyShadowIndex:${JSON.stringify(shadowMode)},
       expectedFileCount:${rehearsal.report.verifiedFileCount},
       expectedPlaintextBytes:${JSON.stringify(rehearsal.report.verifiedPlaintextBytes)},
       newPassphrase:${JSON.stringify(newPassphrase)},
@@ -489,6 +499,7 @@ try {
   assert.equal(postRestart.recovered.walAuthenticated, true);
   assert.equal(postRestart.recovered.backupReverified, true);
   assert.equal(postRestart.recovered.destinationReverified, true);
+  assert.equal(postRestart.recovered.shadowReverified, shadowMode ? true : undefined);
   assert.equal(postRestart.recovered.verifiedFileCount, 2);
   assert.equal(postRestart.recovered.cutoverAuthorized, false);
   assert.equal(postRestart.recovered.localCutoverAuthorized, false);
@@ -581,6 +592,7 @@ try {
         destinationCommitSha:${JSON.stringify(rehearsal.report.destinationCommitSha)},
         destinationTreeSha:${JSON.stringify(rehearsal.report.destinationTreeSha)},
         expectedFinalWalGeneration:${rehearsal.report.finalWalGeneration},
+      verifyShadowIndex:${JSON.stringify(shadowMode)},
         expectedFileCount:${rehearsal.report.verifiedFileCount},
         expectedPlaintextBytes:${JSON.stringify(rehearsal.report.verifiedPlaintextBytes)},
         newPassphrase:${JSON.stringify(newPassphrase)},
@@ -598,6 +610,7 @@ try {
           walAuthenticated:recovered.walAuthenticated,
           backupReverified:recovered.backupReverified,
           destinationReverified:recovered.destinationReverified,
+          ...(recovered.shadowReverified ? {shadowReverified:true} : {}),
           verifiedFileCount:recovered.verifiedFileCount,
           resumeSyncAuthorized:recovered.resumeSyncAuthorized,
           cutoverAuthorized:recovered.cutoverAuthorized
@@ -615,6 +628,7 @@ try {
       observation:"authenticated-pre-cutover-destination-still-fenced",
       walAuthenticated:true,backupReverified:true,
       destinationReverified:true,verifiedFileCount:2,
+      ...(shadowMode ? {shadowReverified:true} : {}),
       resumeSyncAuthorized:false,cutoverAuthorized:false
     }, "After stale old Source advances, the initiating device must re-authenticate the ORIGINAL frozen Backup, WAL and destination");
     staleClientReport = {
@@ -641,6 +655,7 @@ try {
     pinnedSourceCommitSha: rehearsal.report.pinnedSourceCommitSha,
     destinationCommitSha: rehearsal.report.destinationCommitSha,
     finalWalGeneration: rehearsal.report.finalWalGeneration,
+    ...(shadowMode ? {shadow:rehearsal.report.shadow,shadowReverified:postRestart.recovered.shadowReverified} : {}),
     verifiedFileCount: rehearsal.report.verifiedFileCount,
     verifiedPlaintextBytes: rehearsal.report.verifiedPlaintextBytes,
     postRestartObservation: postRestart.recovered.observation,
