@@ -114,16 +114,52 @@ export async function stageV4InstalledDestinationSecret(input: {
     localCutoverAuthorized: false, resumeSyncAuthorized: false, oldPassphraseCleanupAuthorized: false })
 }
 
-/** Recover the staged new secret only after authenticating its exact receipt
- * with the original Source WAL key. Caller must independently verify Git. */
-export async function readV4InstalledDestinationSecret(input: {
+interface StagedSecretInput {
   adapter: V4LocalIndexAdapter; identity: V4InstalledSecretIdentity; owner: V4InstalledSecretOwner; key: Uint8Array
-}): Promise<{ id: string; passphrase: string }> {
+}
+
+/** Authenticate the receipt even if the platform lost the secret on restart.
+ * Empty/absent is the only repairable state; a nonempty value must be verified. */
+export async function inspectV4InstalledDestinationSecret(input: StagedSecretInput): Promise<{ id: string; passphrase: string | null }> {
   const { adapter, identity, owner, key } = input
   assertActive(owner)
   const id = await readReceipt(adapter, identity, owner, key)
   assertActive(owner)
   const passphrase = owner.storage.getSecret(id)
-  if (!passphrase || passphrase === owner.oldPassphrase) throw Error("Staged Destination SecretStorage unavailable.")
-  return { id, passphrase }
+  if (passphrase === owner.oldPassphrase) throw Error("Staged Destination SecretStorage aliases Source.")
+  return { id, passphrase: passphrase || null }
+}
+
+/** Read-only custody check. Caller must independently verify Git. */
+export async function readV4InstalledDestinationSecret(input: StagedSecretInput): Promise<{ id: string; passphrase: string }> {
+  const staged = await inspectV4InstalledDestinationSecret(input)
+  if (!staged.passphrase) throw Error("Staged Destination SecretStorage unavailable.")
+  return { id: staged.id, passphrase: staged.passphrase }
+}
+
+/** Explicit repair of an authenticated missing slot, only after full
+ * Destination verification by the owner-bound recovery transaction.
+ * Never overwrite a nonempty slot, create a new receipt, or remove old keys.
+ * SecretStorage readback proves process-local custody, not crash durability. */
+export async function restoreV4InstalledMissingDestinationSecret(input: StagedSecretInput & {
+  expectedId: string; verifiedPassphrase: string; assertLease: () => Promise<void>; checkpoint: () => Promise<void>
+}): Promise<void> {
+  const { owner, expectedId, verifiedPassphrase, assertLease, checkpoint } = input
+  if (!verifiedPassphrase || verifiedPassphrase === owner.oldPassphrase) throw Error("Invalid Destination recovery passphrase.")
+  await assertLease()
+  const first = await inspectV4InstalledDestinationSecret(input)
+  if (first.id !== expectedId || first.passphrase !== null) throw Error("Staged SecretStorage is not missing.")
+  await checkpoint()
+  const second = await inspectV4InstalledDestinationSecret(input)
+  if (second.id !== expectedId || second.passphrase !== null) throw Error("Staged SecretStorage changed.")
+  await assertLease()
+  assertActive(owner)
+  if (owner.storage.getSecret(expectedId)) throw Error("Staged SecretStorage became occupied.")
+  owner.storage.setSecret(expectedId, verifiedPassphrase)
+  if (owner.storage.getSecret(expectedId) !== verifiedPassphrase) throw Error("Restored SecretStorage readback failed.")
+  await checkpoint()
+  const final = await inspectV4InstalledDestinationSecret(input)
+  if (final.id !== expectedId || final.passphrase !== verifiedPassphrase) throw Error("Restored SecretStorage changed.")
+  await assertLease()
+  assertActive(owner)
 }

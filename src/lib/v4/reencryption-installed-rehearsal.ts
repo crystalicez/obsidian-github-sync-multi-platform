@@ -6,7 +6,7 @@ import { deriveV4Keyring, type V4Keyring } from "./crypto"
 import { readImmutableGitFile } from "./immutable-git-read"
 import { assertV4Pbkdf2Iterations, V4_MIN_NEW_PBKDF2_ITERATIONS } from "./kdf-policy"
 import type { V4LocalIndexAdapter } from "./local-index"
-import { stageV4InstalledDestinationSecret, readV4InstalledDestinationSecret, type V4InstalledSecretOwner, type V4InstalledSecretReport } from "./reencryption-installed-secret"
+import { stageV4InstalledDestinationSecret, inspectV4InstalledDestinationSecret, restoreV4InstalledMissingDestinationSecret, type V4InstalledSecretOwner, type V4InstalledSecretReport } from "./reencryption-installed-secret"
 import { stageV4InstalledReencryptionShadow, verifyV4InstalledReencryptionShadow, type V4InstalledShadowReport } from "./reencryption-installed-shadow"
 import { expectedV4PathLayout, V4_CONFIG_PATH, type V4RemoteConfig } from "./protocol-types"
 import { inspectV4BestEffortWalRecovery } from "./reencryption-best-effort-wal-recovery"
@@ -142,6 +142,7 @@ export interface V4InstalledPreCutoverRecoveryInput {
   readonly oldPassphrase: string
   readonly newPassphrase?: string | undefined
   readonly secretOwner?: V4InstalledSecretOwner | undefined
+  readonly restoreMissingSecret?: true | undefined
   readonly expectedPhysicalRepositoryId: number
   readonly defaultBranch: string
   readonly assertPersistedFenceActive: () => Promise<void>
@@ -155,13 +156,15 @@ export interface V4InstalledPreCutoverRecoveryInput {
 }
 
 export interface V4InstalledPreCutoverRecoveryReport {
-  readonly integrityScope: "read-only-installed-pre-cutover-wal-backup-and-destination"
+  readonly integrityScope: "read-only-installed-pre-cutover-wal-backup-and-destination" | "installed-pre-cutover-staged-secret-recovery"
   readonly observation: "authenticated-pre-cutover-destination-still-fenced" | "manual-recovery-required"
   readonly walAuthenticated: boolean
   readonly backupReverified: boolean
   readonly destinationReverified: boolean
   readonly shadowReverified?: true | undefined
   readonly stagedSecretReverified?: true | undefined
+  readonly stagedSecretMissing?: true | undefined
+  readonly stagedSecretRestored?: true | undefined
   readonly failureStage?: "fence" | "backup" | "wal" | "destination" | "secret" | "shadow" | "final-readback" | undefined
   readonly verifiedFileCount: number
   readonly verifiedPlaintextBytes: string
@@ -200,10 +203,11 @@ function createReadOnlyIndexAdapter(
   }
 }
 
-function manualRecoveryReport(failureStage?: V4InstalledPreCutoverRecoveryReport["failureStage"]): V4InstalledPreCutoverRecoveryReport {
+function manualRecoveryReport(failureStage?: V4InstalledPreCutoverRecoveryReport["failureStage"], restore = false, missing = false): V4InstalledPreCutoverRecoveryReport {
   return Object.freeze({
-    integrityScope: "read-only-installed-pre-cutover-wal-backup-and-destination",
+    integrityScope: restore ? "installed-pre-cutover-staged-secret-recovery" : "read-only-installed-pre-cutover-wal-backup-and-destination",
     observation: "manual-recovery-required",
+    ...(missing ? { stagedSecretMissing: true as const } : {}),
     ...(failureStage ? { failureStage } : {}),
     walAuthenticated: false,
     backupReverified: false,
@@ -745,6 +749,7 @@ export async function inspectV4InstalledPreCutoverRecoveryAfterRestart(
     || !COMMIT_SHA.test(input.destinationCommitSha)
     || !COMMIT_SHA.test(input.destinationTreeSha)
     || !input.oldPassphrase || (!input.secretOwner && !input.newPassphrase) || input.oldPassphrase === input.newPassphrase
+    || (input.restoreMissingSecret && (!input.secretOwner || !input.shadow || !input.newPassphrase))
     || !Number.isSafeInteger(input.expectedFinalWalGeneration) || input.expectedFinalWalGeneration < 1) {
     return manualRecoveryReport()
   }
@@ -756,7 +761,9 @@ export async function inspectV4InstalledPreCutoverRecoveryAfterRestart(
   let backupReverified = false
   let destinationReverified = false
   let failureStage: V4InstalledPreCutoverRecoveryReport["failureStage"] = "fence"
-  const fail = () => manualRecoveryReport(failureStage)
+  const restore = input.restoreMissingSecret === true
+  let missing = false
+  const fail = () => manualRecoveryReport(failureStage, restore, missing)
 
   try {
     throwIfV4Aborted(input.signal)
@@ -916,7 +923,7 @@ export async function inspectV4InstalledPreCutoverRecoveryAfterRestart(
     if (!blobByPath.has(V4_CONFIG_PATH)) return fail()
 
     failureStage = "secret"
-    const stagedSecret = input.secretOwner && input.shadow ? await readV4InstalledDestinationSecret({
+    const secretInput = input.secretOwner && input.shadow ? {
       adapter: input.shadow.adapter, owner: input.secretOwner, key: oldKeyring.journalKey,
       identity: {
         runId: input.runId, deviceId: input.shadow.deviceId, sourceRepoId, backupRepoId, destinationRepoId,
@@ -926,7 +933,11 @@ export async function inspectV4InstalledPreCutoverRecoveryAfterRestart(
         verifiedPlaintextBytes: input.expectedPlaintextBytes, physicalRepositoryId: input.expectedPhysicalRepositoryId,
         defaultBranch: input.defaultBranch,
       },
-    }) : undefined
+    } : undefined
+    const stagedSecret = secretInput ? await inspectV4InstalledDestinationSecret(secretInput) : undefined
+    missing = stagedSecret?.passphrase === null
+    if (missing && !restore) return fail()
+    if (restore && (!missing || !secretInput || !stagedSecret)) return fail()
     const destinationPassphrase = stagedSecret?.passphrase ?? input.newPassphrase
     if (!destinationPassphrase || (input.secretOwner && !stagedSecret)) return fail()
     failureStage = "destination"
@@ -983,18 +994,42 @@ export async function inspectV4InstalledPreCutoverRecoveryAfterRestart(
       || finalDestinationRef.sha !== input.destinationCommitSha) return fail()
     await wal.assertExclusiveStageLease()
     await readOnlyJournal.assertHealthySnapshot(input.expectedFinalWalGeneration)
-    if (stagedSecret && input.secretOwner?.storage.getSecret(stagedSecret.id) !== stagedSecret.passphrase) return fail()
-    destinationReverified = true
 
+    destinationReverified = true
+    if (secretInput && stagedSecret) {
+      failureStage = "secret"
+      const assertRestoreLease = async () => {
+        throwIfV4Aborted(input.signal)
+        input.assertOwnerStillValid?.()
+        await wal!.assertExclusiveStageLease()
+        if (!input.inspectFenceAndNoPartialCutover || !(await input.inspectFenceAndNoPartialCutover())) throw Error("Recovery fence changed.")
+        const [backup, destination] = await Promise.all([backupClient.getGitRef(), destinationClient.getGitRef()])
+        if (backup.sha !== input.pinnedSourceCommitSha || destination.sha !== input.destinationCommitSha) throw Error("Recovery refs changed.")
+        await readOnlyJournal.assertHealthySnapshot(input.expectedFinalWalGeneration)
+        input.assertOwnerStillValid?.()
+      }
+      if (restore) {
+        await restoreV4InstalledMissingDestinationSecret({
+          ...secretInput, expectedId: stagedSecret.id, verifiedPassphrase: destinationPassphrase,
+          assertLease: assertRestoreLease,
+          checkpoint: async () => { await wal!.assertBestEffortCheckpoint(); await readOnlyJournal.assertHealthySnapshot(input.expectedFinalWalGeneration) },
+        })
+        missing = false
+      }
+      const finalSecret = await inspectV4InstalledDestinationSecret(secretInput)
+      if (finalSecret.id !== stagedSecret.id || finalSecret.passphrase !== destinationPassphrase) return fail()
+      await assertRestoreLease()
+    }
     input.assertOwnerStillValid?.()
     return Object.freeze({
-      integrityScope: "read-only-installed-pre-cutover-wal-backup-and-destination",
+      integrityScope: restore ? "installed-pre-cutover-staged-secret-recovery" : "read-only-installed-pre-cutover-wal-backup-and-destination",
       observation: "authenticated-pre-cutover-destination-still-fenced",
       walAuthenticated,
       backupReverified,
       destinationReverified,
       ...(input.shadow ? { shadowReverified: true as const } : {}),
       ...(stagedSecret ? { stagedSecretReverified: true as const } : {}),
+      ...(restore ? { stagedSecretRestored: true as const } : {}),
       verifiedFileCount: destInventory.verifiedSource.verifiedFileCount,
       verifiedPlaintextBytes: destInventory.verifiedSource.totalVerifiedPlaintextBytes,
       cutoverAuthorized: false,

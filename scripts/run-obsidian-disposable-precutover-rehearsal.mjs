@@ -459,7 +459,7 @@ try {
     let settingsFenceDenied=false;
     try{await p.v4Runtime.assertReencryptionSettingsSaveAllowed()}
     catch{settingsFenceDenied=true}
-    const recovered=await p.v4Runtime.inspectFencedReencryptionPreCutoverRecovery({
+    const recoveryInput={
       runId:${JSON.stringify(runId)},
       backupBranch:${JSON.stringify(backupBranch)},
       destinationBranch:${JSON.stringify(destinationBranch)},
@@ -475,7 +475,14 @@ try {
       ${secretMode ? "" : "newPassphrase:" + JSON.stringify(newPassphrase) + ","}
       expectedPhysicalRepositoryId:1284153873,
       defaultBranch:${JSON.stringify(target.defaultBranch)},
-    });
+    };
+    const readOnly=await p.v4Runtime.inspectFencedReencryptionPreCutoverRecovery(recoveryInput);
+    let recovered=readOnly;
+    const secretId=${JSON.stringify(rehearsal.report.stagedSecret?.destinationPassphraseSecretId ?? "")};
+    const missingAfterRestart=${JSON.stringify(secretMode)} && !app.secretStorage.getSecret(secretId);
+    if(${JSON.stringify(secretMode)} && readOnly.stagedSecretMissing===true && missingAfterRestart){
+      recovered=await p.v4Runtime.restoreFencedReencryptionStagedSecret({...recoveryInput,newPassphrase:${JSON.stringify(newPassphrase)}});
+    }
     // Open Wizard UI, verifySource fails closed for pending recovery, and click Inspect Recovery button.
     p.openReencryptionWizard();
     await new Promise(r=>setTimeout(r,200));
@@ -501,6 +508,10 @@ try {
     return {
       settingsFenceDenied,
       recovered,
+      readOnlyObservation:readOnly.observation,
+      readOnlyFailureStage:readOnly.failureStage??null,
+      readOnlyMissing:readOnly.stagedSecretMissing===true,
+      missingAfterRestart,
       stagedSecretPresent: ${JSON.stringify(secretMode)} ? !!app.secretStorage.getSecret(${JSON.stringify(rehearsal.report.stagedSecret?.destinationPassphraseSecretId ?? "")}) : null,
       stagedSecretMatches: ${JSON.stringify(secretMode)} ? app.secretStorage.getSecret(${JSON.stringify(rehearsal.report.stagedSecret?.destinationPassphraseSecretId ?? "")}) === ${JSON.stringify(newPassphrase)} : null,
       sourceSecretMatches: app.secretStorage.getSecret(p.settings.encryptionPassphraseSecretId) === ${JSON.stringify(oldPassphrase)},
@@ -514,7 +525,25 @@ try {
   })()`, 240000);
 
   assert.equal(postRestart.settingsFenceDenied, true);
-  assert.equal(postRestart.recovered.observation, "authenticated-pre-cutover-destination-still-fenced", JSON.stringify({recovery:postRestart.recovered,stagedSecretPresent:postRestart.stagedSecretPresent,stagedSecretMatches:postRestart.stagedSecretMatches,sourceSecretMatches:postRestart.sourceSecretMatches,tokenSecretMatches:postRestart.tokenSecretMatches}));
+  if (secretMode) {
+    console.log(JSON.stringify({status:"SECRET_RESTART_OBSERVATION",missingAfterRestart:postRestart.missingAfterRestart,
+      readOnlyObservation:postRestart.readOnlyObservation,readOnlyMissing:postRestart.readOnlyMissing,
+      readOnlyFailureStage:postRestart.readOnlyFailureStage,restored:postRestart.recovered.stagedSecretRestored===true,
+      recoveryFailureStage:postRestart.recovered.failureStage??null,stagedSecretMatches:postRestart.stagedSecretMatches,
+      sourceSecretMatches:postRestart.sourceSecretMatches,tokenSecretMatches:postRestart.tokenSecretMatches}));
+    if(postRestart.missingAfterRestart) {
+      assert.equal(postRestart.readOnlyObservation,"manual-recovery-required");
+      assert.equal(postRestart.readOnlyMissing,true);
+      assert.equal(postRestart.recovered.stagedSecretRestored,true);
+    } else {
+      assert.equal(postRestart.readOnlyObservation,"authenticated-pre-cutover-destination-still-fenced");
+      assert.equal(postRestart.recovered.stagedSecretRestored,undefined);
+    }
+    assert.equal(postRestart.stagedSecretMatches,true);
+    assert.equal(postRestart.sourceSecretMatches,true);
+    assert.equal(postRestart.tokenSecretMatches,true);
+  }
+  assert.equal(postRestart.recovered.observation, "authenticated-pre-cutover-destination-still-fenced", "Native Recovery failed at "+(postRestart.recovered.failureStage??"unknown"));
   assert.equal(postRestart.recovered.walAuthenticated, true);
   assert.equal(postRestart.recovered.backupReverified, true);
   assert.equal(postRestart.recovered.destinationReverified, true);
@@ -603,7 +632,7 @@ try {
       let fenced=false;
       try{await p.v4Runtime.assertReencryptionSettingsSaveAllowed()}
       catch{fenced=true}
-      const recovered=await p.v4Runtime.inspectFencedReencryptionPreCutoverRecovery({
+      const recoveryInput={
         runId:${JSON.stringify(runId)},
         backupBranch:${JSON.stringify(backupBranch)},
         destinationBranch:${JSON.stringify(destinationBranch)},
@@ -619,9 +648,17 @@ try {
         ${secretMode ? "" : "newPassphrase:" + JSON.stringify(newPassphrase) + ","}
         expectedPhysicalRepositoryId:1284153873,
         defaultBranch:${JSON.stringify(target.defaultBranch)},
-      });
+      };
+      const readOnly=await p.v4Runtime.inspectFencedReencryptionPreCutoverRecovery(recoveryInput);
+      let recovered=readOnly;
+      const secretId=${JSON.stringify(rehearsal.report.stagedSecret?.destinationPassphraseSecretId ?? "")};
+      const missingAfterRestart=${JSON.stringify(secretMode)} && !app.secretStorage.getSecret(secretId);
+      if(${JSON.stringify(secretMode)} && readOnly.stagedSecretMissing===true && missingAfterRestart){
+        recovered=await p.v4Runtime.restoreFencedReencryptionStagedSecret({...recoveryInput,newPassphrase:${JSON.stringify(newPassphrase)}});
+      }
       return {
         fenced,
+        ...( ${JSON.stringify(secretMode)} ? {secretRestart:{missingAfterRestart,readOnlyMissing:readOnly.stagedSecretMissing===true,restored:recovered.stagedSecretRestored===true,stagedSecretMatches:app.secretStorage.getSecret(secretId)===${JSON.stringify(newPassphrase)},failureStage:recovered.failureStage??null}} : {}),
         stillSource:p.settings.githubBranch===${JSON.stringify(sourceBranch)},
         stillOldPassphrase:p.settings.encryptionPassphrase===${JSON.stringify(oldPassphrase)},
         noSyncActive:!p.v4Runtime.isSyncing,
@@ -641,10 +678,12 @@ try {
     })()`, 240000);
     assert.deepEqual({
       ...initiatorAfterStale,
+      ...(secretMode ? {secretRestart:undefined} : {}),
       afterStaleRecovery:undefined
     }, {
       fenced:true,stillSource:true,stillOldPassphrase:true,
-      noSyncActive:true,originalNoteUnchanged:true,afterStaleRecovery:undefined
+      noSyncActive:true,originalNoteUnchanged:true,afterStaleRecovery:undefined,
+      ...(secretMode ? {secretRestart:undefined} : {})
     }, "An advancing stale Source must not silently cut over or resume the fenced initiating device");
     assert.deepEqual(initiatorAfterStale.afterStaleRecovery, {
       observation:"authenticated-pre-cutover-destination-still-fenced",
@@ -654,6 +693,12 @@ try {
       ...(secretMode ? {stagedSecretReverified:true} : {}),
       resumeSyncAuthorized:false,cutoverAuthorized:false
     }, "After stale old Source advances, the initiating device must re-authenticate the ORIGINAL frozen Backup, WAL and destination");
+    if (secretMode) {
+      console.log(JSON.stringify({status:"SECRET_AFTER_STALE_RESTART",...initiatorAfterStale.secretRestart}));
+      assert.equal(initiatorAfterStale.secretRestart.stagedSecretMatches,true);
+      assert.equal(initiatorAfterStale.secretRestart.restored,initiatorAfterStale.secretRestart.missingAfterRestart);
+      assert.equal(initiatorAfterStale.secretRestart.readOnlyMissing,initiatorAfterStale.secretRestart.missingAfterRestart);
+    }
     staleClientReport = {
       secondInstalledObsidianVault: true,
       staleClientUsedOldSourceAndKey: staleAfter.remainsOnOldSource && staleAfter.retainsOldPassphrase,

@@ -1862,6 +1862,17 @@ export class V4PluginRuntime {
     readonly createGitHubClient?: ((branch: string) => GitHubClient) | undefined
     readonly signal?: AbortSignal | undefined
   }): Promise<V4InstalledPreCutoverRecoveryReport> {
+    return this.recoverInstalledPreCutover(input, false)
+  }
+
+  /** Explicit, fenced repair of a missing staged Destination secret. No Cutover. */
+  async restoreFencedReencryptionStagedSecret(input: Parameters<V4PluginRuntime["inspectFencedReencryptionPreCutoverRecovery"]>[0] & {
+    readonly newPassphrase: string
+  }): Promise<V4InstalledPreCutoverRecoveryReport> {
+    return this.recoverInstalledPreCutover({ ...input, verifyShadowIndex: true, recoverStagedSecret: true }, true)
+  }
+
+  private async recoverInstalledPreCutover(input: Parameters<V4PluginRuntime["inspectFencedReencryptionPreCutoverRecovery"]>[0], restoreMissing: boolean): Promise<V4InstalledPreCutoverRecoveryReport> {
     this.assertNotDisposed()
     const vault = this.plugin.app.vault
     const backing = this.indexAdapterBacking as (typeof vault.adapter & { getFullPath?: (path: string) => string }) | undefined
@@ -1935,6 +1946,7 @@ export class V4PluginRuntime {
       expectedPlaintextBytes: input.expectedPlaintextBytes,
       oldPassphrase: pinned.passphrase,
       newPassphrase: input.newPassphrase,
+      restoreMissingSecret: restoreMissing ? true : undefined,
       expectedPhysicalRepositoryId: input.expectedPhysicalRepositoryId,
       defaultBranch: input.defaultBranch,
       assertPersistedFenceActive: () => assertV4ReencryptionSyncFenceClear(this.adapter),
