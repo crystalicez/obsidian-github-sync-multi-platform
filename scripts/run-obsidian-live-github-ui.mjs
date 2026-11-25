@@ -58,7 +58,7 @@ const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 const assertTrue=(condition,message)=>assert.ok(condition,message);
 const readState=async({owner,repo,branch,token})=>readE2EBranch({owner,repo,branch,token});
 async function githubReadJson(route){
- const url=`https://api.github.com/repos/${encodeURIComponent(configuration.owner)}/${encodeURIComponent(configuration.repo)}/${route}`;
+ const url=`https://api.github.com/repos/${encodeURIComponent(configuration.owner)}/${encodeURIComponent(configuration.repo)}${route?"/"+route:""}`;
  const response=await fetch(url,{headers:{Authorization:`Bearer ${configuration.token}`,Accept:"application/vnd.github+json","X-GitHub-Api-Version":"2022-11-28"},signal:AbortSignal.timeout(20000)});
  if(!response.ok)throw Error(`Native remote read returned GitHub HTTP ${response.status}`);
  return response.json();
