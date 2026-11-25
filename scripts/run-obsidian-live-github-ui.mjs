@@ -327,8 +327,17 @@ try{
    const pluginExpr="app.plugins.plugins["+JSON.stringify(id)+"]";
    const step=async(label,mutation)=>{
     const before=finalSha;
+    const inventoryBefore=await evaluate(nativeVaultInventoryExpression,120000);
     const result=await evaluate(mutation,120000);
     assertTrue(result?.ok,"Native combined action failed: "+label+" "+JSON.stringify(result));
+    const inventoryAfter=await evaluate(nativeVaultInventoryExpression,120000);
+    console.log(JSON.stringify({kind:"native-combined-local-inventory",label,before:inventoryBefore,after:inventoryAfter}));
+    assertTrue(JSON.stringify(inventoryAfter)!==JSON.stringify(inventoryBefore),"Synthetic local inventory did not change before Sync: "+label);
+    for(const entry of inventoryAfter){
+     assertTrue(typeof entry.path==="string"&&entry.path.split("/").every(part=>part&&part!=="."&&part!==".."&&!part.includes("\\")&&!part.includes(":")),"Unsafe synthetic inventory path");
+     const bytes=await readFile(path.join(vault,...entry.path.split("/")));
+     assertTrue(bytes.length===entry.size&&createHash("sha256").update(bytes).digest("hex")===entry.sha256,"Source indexed and disk bytes differ: "+entry.path);
+    }
     const outcome=await evaluate("(async()=>{const p="+pluginExpr+";let thrown=null;try{await p.v4Runtime.manualSync()}catch(e){thrown=String(e?.message??e).slice(0,180)}const s=p.v4Runtime.progressSnapshot;return {lifecycle:s.lifecycle,trigger:s.trigger,phase:s.phase,failurePhase:s.failurePhase,error:s.errorMessage?.slice(0,250),thrown,apiFailures:s.diagnostics?.apiFailures};})()",240000);
     assertTrue(outcome.lifecycle==="success"&&outcome.trigger==="manual","Native combined sync failed: "+label+" "+redact(JSON.stringify(outcome)));
     const remote=await readState(configuration);
