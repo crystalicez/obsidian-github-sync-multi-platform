@@ -529,6 +529,27 @@ test("D96 Wizard rejects in-place and replacement connection edits after dialog 
   }
 })
 
+test("D413 Wizard warns stale Source-device edits do not migrate automatically before verification and at planned finish", () => {
+  const wizard = new V4ReencryptionWizardModal(fakePlugin())
+  const originalSettings = JSON.stringify(fakePlugin().settings)
+  const debug = wizard as unknown as { step: number; render(): void }
+  const visible = () => (wizard.contentEl as unknown as { flattenText(): string }).flattenText()
+  try {
+    wizard.onOpen()
+    assert.match(visible(), /other devices.*old Source.*not automatically.*new Destination/i,
+      "migration Preflight must explain that old-key devices can write an independently diverging Source")
+    debug.step = 4
+    debug.render()
+    assert.match(visible(), /old Source.*do not move.*new Destination automatically/i,
+      "Finish must warn against silently assuming post-snapshot Source edits reached Destination")
+    assert.doesNotMatch(visible(), /source-token-never-render|source-passphrase-never-render/i)
+    assert.doesNotMatch(visible(), /Execute migration|Publish now/i)
+    assert.equal(JSON.stringify((wizard as unknown as { plugin: FastSync }).plugin.settings), originalSettings)
+  } finally {
+    wizard.onClose()
+  }
+})
+
 test("D130 Wizard preview explains cross-platform best-effort and one-confirmation automatic finish without authorizing execution", () => {
   const wizard = new V4ReencryptionWizardModal(fakePlugin())
   wizard.onOpen()

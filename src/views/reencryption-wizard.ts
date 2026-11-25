@@ -550,6 +550,8 @@ export class V4ReencryptionWizardModal extends Modal {
     this.row(container, "Mode", s.encryptionMode === "encrypted" ? "Encrypted V4 source required" : "Current connection is not encrypted")
     this.row(container, "Vault change detection (planned)",
       "Cross-platform best-effort: recheck file inventory, hashes, open editors and Sync state. External apps can still write after the last check; this is NOT an OS-wide write lock.")
+    this.row(container, "Other devices and old Source edits",
+      "Before starting, stop Sync on all other devices. Devices left on the old Source can continue writing its old-key branch after the snapshot; these late edits are not automatically copied or merged into the new Destination. Review any Source divergence manually before reconfiguring another device.")
     this.row(container, "Mobile Re-encryption initiation policy (approved)",
       `Mobile may initiate only if EVERY included file is at most ${DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES / (1024 * 1024)} MiB because the DataAdapter readBinary() parity reader allocates whole-file buffers. This Preview checks physical file metadata against the authenticated Source file inventory without reading local contents or pausing Sync. Larger included files require initiating on Desktop. Ordinary Mobile Sync above 32 MiB is a SEPARATE, currently unverified capability and is not authorized by this policy. Full leased parity and all release gates are still required before Execute.`)
     this.row(container, "Remote source verification", this.source
@@ -726,6 +728,8 @@ export class V4ReencryptionWizardModal extends Modal {
     this.row(container, "Initiating device",
       "After one confirmation before execution, automatically switch branch, passphrase and local index ONLY after verified end-to-end completion and best-effort recovery checks. No second confirmation, no Force Pull/Push.")
     this.row(container, "Other devices", "Stay on the old branch, or manually enter the new branch and passphrase whenever desired.")
+    this.row(container, "Late old Source edits",
+      "Other devices still on the old Source may write new notes there after the snapshot. Those edits do not move to the new Destination automatically; there is no cross-branch merge. Preserve both branches and review differences before switching another device.")
     this.row(container, "Retention", "Never auto-delete source or backup branches.")
     this.row(container, "Old passphrase cleanup (planned)",
       "Clear the old passphrase from this device's SecretStorage only AFTER verified cutover and recovery commit. The old Source/Backup still need it; keep your own copy if required. No cleanup is implemented in Preview.")

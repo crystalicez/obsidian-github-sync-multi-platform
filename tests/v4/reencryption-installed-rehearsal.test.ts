@@ -486,6 +486,93 @@ test("D412 installed Runtime orchestrates Source -> Backup -> Staging -> Scratch
   }
 })
 
+test("D414 installed post-restart Recovery authenticates frozen Backup after independent old Source advancement", async () => {
+  const server = createMemoryGitHubServer()
+  setRequestUrlHandler(server.handler)
+  const noteBytes = utf8ToBytes("# D414 old Source advances independently after snapshot\\n")
+  const file = { path: "Notes/stale-source.md", bytes: noteBytes, mtime: 171 }
+  const vault = await createInstalledVaultFixture([file])
+  let before: ReturnType<typeof vault.makeRuntime> | undefined
+  let after: ReturnType<typeof vault.makeRuntime> | undefined
+  try {
+    const pinned = await seedEncryptedSource(server, [file])
+    const original = server.commits.get(pinned)
+    assert.ok(original)
+    before = vault.makeRuntime()
+    const runId = "d414-source-advanced-01"
+    const backupBranch = "backup/d414-frozen"
+    const destinationBranch = "rekey/d414-orphan"
+    const journalKey = new Uint8Array(32).fill(0x45)
+    const report = await before.runtime.runFencedReencryptionPreCutoverRehearsal({
+      runId, backupBranch, destinationBranch, newPassphrase: NEW_PASSPHRASE,
+      requestedIterations: 700_000, journalKey: Uint8Array.from(journalKey),
+      acknowledgement: "accept-best-effort-power-loss-recovery-risk",
+      assertExclusiveInitiatorLease: async () => {},
+      createGitHubClient: makeClientFactory(),
+    })
+    assert.equal(report.status, "destination-published-fenced-no-cutover")
+    assert.equal(server.refs.get(backupBranch), pinned)
+    assert.equal(server.refs.get(destinationBranch), report.destinationCommitSha)
+
+    // An independent existing old-key device advances Source AFTER frozen
+    // Backup and new-key Destination publication. Use a valid descendant with
+    // the same immutable source tree to isolate ref divergence; the live D413
+    // two-Obsidian test additionally exercises an actual changed note.
+    const advanced = gitSha1("commit", utf8ToBytes("D414 source advance " + pinned))
+    server.commits.set(advanced, {
+      sha: advanced, treeSha: original.treeSha,
+      parents: [pinned], message: "Old-key peer advanced Source independently",
+    })
+    server.refs.set(SOURCE_BRANCH, advanced)
+    assert.notEqual(server.refs.get(SOURCE_BRANCH), pinned)
+    assert.equal(server.refs.get(backupBranch), pinned)
+
+    before.runtime.dispose()
+    before = undefined
+    after = vault.makeRuntime()
+    const inspect = () => after!.runtime.inspectFencedReencryptionPreCutoverRecovery({
+      runId, backupBranch, destinationBranch,
+      pinnedSourceCommitSha: pinned,
+      sourceTreeSha: report.sourceTreeSha,
+      destinationCommitSha: report.destinationCommitSha,
+      destinationTreeSha: report.destinationTreeSha,
+      expectedFinalWalGeneration: report.finalWalGeneration,
+      expectedFileCount: 1, expectedPlaintextBytes: String(noteBytes.byteLength),
+      newPassphrase: NEW_PASSPHRASE,
+      expectedPhysicalRepositoryId: PHYSICAL_REPO_ID,
+      defaultBranch: DEFAULT_BRANCH, journalKey: Uint8Array.from(journalKey),
+      createGitHubClient: makeClientFactory(),
+    })
+    const recovered = await inspect()
+    assert.equal(recovered.observation, "authenticated-pre-cutover-destination-still-fenced")
+    assert.equal(recovered.walAuthenticated, true)
+    assert.equal(recovered.backupReverified, true)
+    assert.equal(recovered.destinationReverified, true)
+    assert.equal(recovered.verifiedFileCount, 1)
+    assert.equal(recovered.cutoverAuthorized, false)
+    assert.equal(recovered.resumeSyncAuthorized, false)
+    assert.equal(server.refs.get(SOURCE_BRANCH), advanced)
+    assert.equal(server.refs.get(backupBranch), pinned)
+    assert.equal(server.refs.get(destinationBranch), report.destinationCommitSha)
+    // Fail closed even when the wrong Backup points at a valid old Source
+    // descendant with byte-identical tree: its immutable pinned identity is
+    // an essential part of the recovery proof.
+    server.refs.set(backupBranch, advanced)
+    const wrongBackup = await inspect()
+    assert.equal(wrongBackup.observation, "manual-recovery-required")
+    assert.equal(wrongBackup.cutoverAuthorized, false)
+    assert.equal(wrongBackup.resumeSyncAuthorized, false)
+    server.refs.set(backupBranch, pinned)
+    await assert.rejects(() => after!.runtime.assertReencryptionSettingsSaveAllowed())
+    assert.deepEqual(new Uint8Array(await vault.adapter.readBinary(file.path)), noteBytes)
+  } finally {
+    before?.runtime.dispose()
+    after?.runtime.dispose()
+    setRequestUrlHandler(null)
+    await vault.cleanup()
+  }
+})
+
 test("D412 refuses rehearsal before arming Sync fence when Backup or Destination branch already exists", async () => {
   const server = createMemoryGitHubServer()
   setRequestUrlHandler(server.handler)

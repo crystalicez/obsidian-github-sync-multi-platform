@@ -371,7 +371,11 @@ export async function verifyGitHubReencryptionForkSourceWithParityInventory(
  * This never permits publication, WAL mutation or local Cutover.
  */
 export async function verifyGitHubReencryptionForkSourceWithTranscodeInventory(
-  input: V4GitHubReencryptionSourceInput,
+  // A frozen Backup may retain the Source's embedded repoId even though its
+  // physical Git ref has a different branch name. In that case the caller
+  // pins the exact immutable commit/tree and physical repository: the
+  // shared trusted reader validates all three before decrypting.
+  input: V4GitHubVerifiedSnapshotInput,
 ): Promise<V4GitHubForkSourceTranscodeInventory> {
   let metadata: Pick<V4GitHubForkSourceTranscodeInventory,
     "sourceConfig" | "sourceHead" | "sourceShards" | "sourceRecords"> | undefined

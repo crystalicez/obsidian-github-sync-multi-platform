@@ -24,9 +24,14 @@ import { CANONICAL_REPOSITORY_ID, readOriginFetchRepository } from "./github-rep
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const pluginId = "encrypted-github-sync-multi-platform";
 const exe = "C:\\Program Files\\Obsidian\\Obsidian.exe";
-const port = 28000 + (process.pid % 27000);
+const initiatorPort = 28000 + (process.pid % 27000);
+const stalePort = initiatorPort + 1;
+let port = initiatorPort;
 const tmpParent = path.join(root, ".tmp", "obsidian-installed-precutover-rehearsal");
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+const staleClientMode = process.argv.includes("--stale-client");
+assert.ok(process.argv.slice(2).every(arg => arg === "--stale-client"),
+  "Only --stale-client is supported; all writes must remain in approved disposable branches.");
 
 const oldPassphrase = "d412-old-" + randomBytes(18).toString("base64url");
 const newPassphrase = "d412-new-" + randomBytes(18).toString("base64url");
@@ -48,6 +53,9 @@ const uiExceptions = [];
 let passed = false;
 let cleanupState = "not-started";
 let remoteCleanupErrors = [];
+let staleClientReport;
+let staleSession;
+const ownedProcessIds = new Set();
 
 const redact = value => {
   let msg = String(value?.message ?? value ?? "");
@@ -149,6 +157,19 @@ async function connect(vaultPath) {
   assert.ok(managerReady, "Native plugin manager not ready");
   const loaded = await evalInVault(buildNativePluginReadyExpression(pluginId), 30000);
   assert.equal(loaded, true, "Production plugin failed to load");
+  // Obsidian's manager may expose plugins[id] before its async onload()
+  // finishes creating the ribbon. Saving Settings in that interval is not
+  // equivalent to user interaction with a fully mounted plugin UI.
+  let uiReady = false;
+  for (let i = 0; i < 80; i++) {
+    uiReady = await evalInVault(`(()=>{
+      const p=app.plugins.plugins[${JSON.stringify(pluginId)}];
+      return !!p?.ribbonIcon && !!p?.v4Runtime && !!p?.settingTab;
+    })()`, 15000);
+    if (uiReady) break;
+    await sleep(180);
+  }
+  assert.equal(uiReady, true, "Installed plugin onload/ribbon not completed before simulated Settings interaction");
 }
 
 async function launch(profilePath, vaultPath) {
@@ -156,6 +177,7 @@ async function launch(profilePath, vaultPath) {
     detached: true, windowsHide: false, stdio: "ignore",
   });
   child.on("error", () => {});
+  if (child.pid) ownedProcessIds.add(child.pid);
   child.unref();
   await connect(vaultPath);
 }
@@ -168,16 +190,19 @@ function terminate() {
     encoding: "utf8", timeout: 18000, shell: false,
   });
   assert.equal(stop.status, 0, "Failed to terminate disposable Obsidian process");
+  ownedProcessIds.delete(child.pid);
   child = undefined;
 }
 
 try {
-  // Check CDP port is free.
-  try {
-    const existing = await fetch(`http://127.0.0.1:${port}/json/list`, { signal: AbortSignal.timeout(1200) });
-    if (existing.ok) throw new Error("CDP port already occupied");
-  } catch (err) {
-    if (!/fetch failed|ECONNREFUSED|timed out|TimeoutError/u.test(String(err))) throw err;
+  // Check both fixed CDP ports before starting ANY disposable process.
+  for (const checkPort of staleClientMode ? [initiatorPort, stalePort] : [initiatorPort]) {
+    try {
+      const existing = await fetch(`http://127.0.0.1:${checkPort}/json/list`, { signal: AbortSignal.timeout(1200) });
+      if (existing.ok) throw new Error("CDP port already occupied");
+    } catch (err) {
+      if (!/fetch failed|ECONNREFUSED|timed out|TimeoutError/u.test(String(err))) throw err;
+    }
   }
 
   for (const location of [path.dirname(tmpParent), tmpParent]) {
@@ -251,6 +276,10 @@ try {
   runRoot = await mkdtemp(path.join(tmpParent, "run-"));
   const vault = path.join(runRoot, "vault");
   const profile = path.join(runRoot, "profile");
+  // D413: the separate old-key client is a second REAL Obsidian Vault and
+  // profile, never the initiator's encrypted credentials or Index.
+  const staleVault = path.join(runRoot, "stale-vault");
+  const staleProfile = path.join(runRoot, "stale-profile");
   const pluginDir = path.join(vault, ".obsidian", "plugins", pluginId);
   await mkdir(pluginDir, { recursive: true });
   await mkdir(profile, { recursive: true });
@@ -263,6 +292,19 @@ try {
   }) + "\n");
   await writeFile(path.join(vault, "D412-unicode-สวัสดี.md"), noteText, "utf8");
   await writeFile(path.join(vault, "D412-binary.bin"), binaryBytes);
+  if (staleClientMode) {
+    const stalePluginDir = path.join(staleVault, ".obsidian", "plugins", pluginId);
+    await mkdir(stalePluginDir, { recursive: true });
+    await mkdir(staleProfile, { recursive: true });
+    for (const name of ["main.js", "manifest.json", "styles.css"]) {
+      await copyFile(path.join(root, name), path.join(stalePluginDir, name));
+    }
+    await writeFile(path.join(staleVault, ".obsidian", "community-plugins.json"),
+      JSON.stringify([pluginId]) + "\n");
+    await writeFile(path.join(staleProfile, "obsidian.json"), JSON.stringify({
+      vaults: { d413stale: { path: staleVault, ts: Date.now(), open: true } },
+    }) + "\n");
+  }
 
   await launch(profile, vault);
 
@@ -280,18 +322,70 @@ try {
       syncEnabled:true,syncOnStartup:false,syncOnLocalChange:false,scheduledSyncEnabled:false,
       encryptionMode:"encrypted",
       encryptionPassphrase:${JSON.stringify(oldPassphrase)},
-      pbkdf2Iterations:600000,
+      newVaultKdfIterations:600000,
       syncObsidianConfig:false,syncBookmarks:false,syncPlugins:false
     });
     const pushed=await p.v4Runtime.forcePush(false);
     const snap=p.v4Runtime.progressSnapshot;
     if(!["success","no-change"].includes(snap.lifecycle))
-      throw Error("Seed forcePush failed: "+snap.lifecycle);
+      throw Error("Seed forcePush failed: "+JSON.stringify({lifecycle:snap.lifecycle,phase:snap.failurePhase??snap.phase,apiFailures:snap.diagnostics?.apiFailures}));
     return {status:pushed?.status??null,lifecycle:snap.lifecycle};
   })()`, 240000);
 
   const seededRef = await readWithRetry(refs[0]);
   assert.equal(seededRef.kind, "present");
+
+  if (staleClientMode) {
+    // D413: establish a second, fully installed old-key client BEFORE
+    // migration. Its local index must be pinned to the pre-rekey Source tip.
+    // Keep BOTH processes alive: a stale client must retain its original
+    // in-memory credentials and pre-rekey Index while the initiator migrates.
+    // A SIGKILL immediately after first saving a brand-new profile may lose
+    // SecretStorage writes (best-effort durability), which is a different test.
+    const initiatorSession = { child, ws };
+    child = undefined;
+    ws = undefined;
+    port = stalePort;
+    await launch(staleProfile, staleVault);
+    const staleBefore = await evalInVault(`(async()=>{
+      const p=app.plugins.plugins[${JSON.stringify(pluginId)}];
+      if(!p||p.settings.githubToken||p.settings.githubOwner||p.settings.githubRepo)
+        throw Error("Stale Vault must begin with independent, empty settings");
+      await p.saveSettings({
+        ...p.settings,
+        githubOwner:${JSON.stringify(configuration.owner)},
+        githubRepo:${JSON.stringify(configuration.repo)},
+        githubBranch:${JSON.stringify(sourceBranch)},
+        githubToken:${JSON.stringify(configuration.token)},
+        syncEnabled:true,syncOnStartup:false,syncOnLocalChange:false,scheduledSyncEnabled:false,
+        encryptionMode:"encrypted",
+        encryptionPassphrase:${JSON.stringify(oldPassphrase)},
+        newVaultKdfIterations:600000,
+        syncObsidianConfig:false,syncBookmarks:false,syncPlugins:false
+      });
+      await p.v4Runtime.forcePull(false);
+      const note=await app.vault.adapter.read("D412-unicode-สวัสดี.md");
+      const binary=await app.vault.adapter.readBinary("D412-binary.bin");
+      return {
+        sourceSelected:p.settings.githubBranch===${JSON.stringify(sourceBranch)},
+        oldKeySelected:p.settings.encryptionPassphrase===${JSON.stringify(oldPassphrase)},
+        pulledNote:note===${JSON.stringify(noteText)},
+        pulledBinaryBytes:binary.byteLength,
+        lifecycle:p.v4Runtime.progressSnapshot.lifecycle
+      };
+    })()`, 240000);
+    assert.equal(staleBefore.sourceSelected, true);
+    assert.equal(staleBefore.oldKeySelected, true);
+    assert.equal(staleBefore.pulledNote, true);
+    assert.equal(staleBefore.pulledBinaryBytes, binaryBytes.byteLength);
+    assert.ok(["success", "no-change"].includes(staleBefore.lifecycle));
+    assert.equal((await readWithRetry(refs[0])).sha, seededRef.sha,
+      "Stale old-key initialization must not publish any remote change");
+    staleSession = { child, ws };
+    child = initiatorSession.child;
+    ws = initiatorSession.ws;
+    port = initiatorPort;
+  }
 
   // Run D412 pre-cutover rehearsal inside live installed Obsidian.
   const rehearsal = await evalInVault(`(async()=>{
@@ -418,12 +512,147 @@ try {
   assert.equal(postRestart.branchStillSource, true);
   assert.equal(uiExceptions.length, 0);
 
+  if (staleClientMode) {
+    // D413: a second installed Obsidian, whose old-key Index predates the
+    // migration, independently publishes a new edit to its original Source.
+    // Nothing in this flow configures it with the new Destination passphrase.
+    const sourceBeforeStale = await readWithRetry(refs[0]);
+    assert.equal(sourceBeforeStale.kind, "present");
+    assert.equal(sourceBeforeStale.sha, rehearsal.report.pinnedSourceCommitSha);
+    assert.ok(staleSession?.child?.pid && staleSession.ws,
+      "The old-key client must have stayed alive independently of the migrating Obsidian");
+    const initiatorSession = { child, ws };
+    child = staleSession.child;
+    ws = staleSession.ws;
+    port = stalePort;
+    const staleAfter = await evalInVault(`(async()=>{
+      const p=app.plugins.plugins[${JSON.stringify(pluginId)}];
+      const branchMatches=p.settings.githubBranch===${JSON.stringify(sourceBranch)};
+      const oldKeyMatches=p.settings.encryptionPassphrase===${JSON.stringify(oldPassphrase)};
+      const tokenPresent=!!p.settings.githubToken;
+      if(!branchMatches||!oldKeyMatches||!tokenPresent)
+        return { credentialCheckFailed:true, branchMatches, oldKeyMatches,
+          tokenPresent, hasKeyId:!!p.settings.encryptionPassphraseSecretId,
+          hasTokenId:!!p.settings.githubTokenSecretId };
+      const note=app.vault.getAbstractFileByPath("D412-unicode-สวัสดี.md");
+      if(!note)throw Error("Stale client's original note is missing");
+      await app.vault.modify(note, ${JSON.stringify(noteText + "\nD413 late stale Source edit only\n")});
+      const outcome=await p.v4Runtime.manualSync();
+      const snap=p.v4Runtime.progressSnapshot;
+      return {
+        lifecycle:snap.lifecycle, status:outcome?.status??null,
+        remainsOnOldSource:p.settings.githubBranch===${JSON.stringify(sourceBranch)},
+        retainsOldPassphrase:p.settings.encryptionPassphrase===${JSON.stringify(oldPassphrase)},
+        noteChanged:(await app.vault.read(note)).includes("D413 late stale Source edit only")
+      };
+    })()`, 240000);
+    if (staleAfter.credentialCheckFailed) {
+      console.log(JSON.stringify({ status:"D413_STALE_SETTINGS_READBACK_CHECK",
+        branchMatches:staleAfter.branchMatches,
+        oldKeyMatches:staleAfter.oldKeyMatches,
+        tokenPresent:staleAfter.tokenPresent,
+        hasKeyId:staleAfter.hasKeyId,
+        hasTokenId:staleAfter.hasTokenId }));
+      throw new Error("Stale installed device's persisted branch or secrets did not survive process restart.");
+    }
+    assert.ok(["success", "no-change"].includes(staleAfter.lifecycle),
+      "Stale device's own Source Sync did not finish cleanly");
+    assert.equal(staleAfter.remainsOnOldSource, true);
+    assert.equal(staleAfter.retainsOldPassphrase, true);
+    assert.equal(staleAfter.noteChanged, true);
+    const advancedSource = await readWithRetry(refs[0]);
+    const unchangedBackup = await readWithRetry(refs[1]);
+    const unchangedDestination = await readWithRetry(refs[2]);
+    assert.equal(advancedSource.kind, "present");
+    assert.notEqual(advancedSource.sha, sourceBeforeStale.sha,
+      "The actual stale client must publish its late edit to old Source");
+    assert.equal(unchangedBackup.sha, rehearsal.report.pinnedSourceCommitSha,
+      "Stale old-key client must never modify immutable Backup");
+    assert.equal(unchangedDestination.sha, rehearsal.report.destinationCommitSha,
+      "Stale old-key client must never publish to new-key Destination");
+    // Reboot the initiating app again AFTER the still-running old-key client
+    // advances Source. Its durable Fence must keep Sync and Cutover blocked.
+    child = initiatorSession.child;
+    ws = initiatorSession.ws;
+    port = initiatorPort;
+    terminate();
+    await sleep(900);
+    await launch(profile, vault);
+    const initiatorAfterStale = await evalInVault(`(async()=>{
+      const p=app.plugins.plugins[${JSON.stringify(pluginId)}];
+      let fenced=false;
+      try{await p.v4Runtime.assertReencryptionSettingsSaveAllowed()}
+      catch{fenced=true}
+      const keyBytes=Uint8Array.from(atob(${JSON.stringify(journalKeyB64)}),c=>c.charCodeAt(0));
+      let recovered;
+      try{
+        recovered=await p.v4Runtime.inspectFencedReencryptionPreCutoverRecovery({
+          runId:${JSON.stringify(runId)},
+          backupBranch:${JSON.stringify(backupBranch)},
+          destinationBranch:${JSON.stringify(destinationBranch)},
+          pinnedSourceCommitSha:${JSON.stringify(rehearsal.report.pinnedSourceCommitSha)},
+          sourceTreeSha:${JSON.stringify(rehearsal.report.sourceTreeSha)},
+          destinationCommitSha:${JSON.stringify(rehearsal.report.destinationCommitSha)},
+          destinationTreeSha:${JSON.stringify(rehearsal.report.destinationTreeSha)},
+          expectedFinalWalGeneration:${rehearsal.report.finalWalGeneration},
+          expectedFileCount:${rehearsal.report.verifiedFileCount},
+          expectedPlaintextBytes:${JSON.stringify(rehearsal.report.verifiedPlaintextBytes)},
+          newPassphrase:${JSON.stringify(newPassphrase)},
+          expectedPhysicalRepositoryId:1284153873,
+          defaultBranch:${JSON.stringify(target.defaultBranch)},
+          journalKey:keyBytes
+        });
+      }finally{keyBytes.fill(0)}
+      return {
+        fenced,
+        stillSource:p.settings.githubBranch===${JSON.stringify(sourceBranch)},
+        stillOldPassphrase:p.settings.encryptionPassphrase===${JSON.stringify(oldPassphrase)},
+        noSyncActive:!p.v4Runtime.isSyncing,
+        originalNoteUnchanged:(await app.vault.adapter.read("D412-unicode-สวัสดี.md"))===${JSON.stringify(noteText)},
+        afterStaleRecovery: {
+          observation:recovered.observation,
+          walAuthenticated:recovered.walAuthenticated,
+          backupReverified:recovered.backupReverified,
+          destinationReverified:recovered.destinationReverified,
+          verifiedFileCount:recovered.verifiedFileCount,
+          resumeSyncAuthorized:recovered.resumeSyncAuthorized,
+          cutoverAuthorized:recovered.cutoverAuthorized
+        }
+      };
+    })()`, 240000);
+    assert.deepEqual({
+      ...initiatorAfterStale,
+      afterStaleRecovery:undefined
+    }, {
+      fenced:true,stillSource:true,stillOldPassphrase:true,
+      noSyncActive:true,originalNoteUnchanged:true,afterStaleRecovery:undefined
+    }, "An advancing stale Source must not silently cut over or resume the fenced initiating device");
+    assert.deepEqual(initiatorAfterStale.afterStaleRecovery, {
+      observation:"authenticated-pre-cutover-destination-still-fenced",
+      walAuthenticated:true,backupReverified:true,
+      destinationReverified:true,verifiedFileCount:2,
+      resumeSyncAuthorized:false,cutoverAuthorized:false
+    }, "After stale old Source advances, the initiating device must re-authenticate the ORIGINAL frozen Backup, WAL and destination");
+    staleClientReport = {
+      secondInstalledObsidianVault: true,
+      staleClientUsedOldSourceAndKey: staleAfter.remainsOnOldSource && staleAfter.retainsOldPassphrase,
+      staleSourceCommitAdvanced: true,
+      frozenBackupUnchanged: true,
+      destinationUnchanged: true,
+      initiatingDeviceStillFencedAfterRestart: true,
+      autoCrossBranchMerge: false,
+    };
+  }
+
   assert.equal(await readFile(path.join(vault, "D412-unicode-สวัสดี.md"), "utf8"), noteText);
   assert.deepEqual(await readFile(path.join(vault, "D412-binary.bin")), binaryBytes);
   passed = true;
 
   console.log(JSON.stringify({
-    status: "D412_LIVE_OBSIDIAN_PRE_CUTOVER_PASS",
+    status: staleClientMode
+      ? "D413_LIVE_OBSIDIAN_STALE_SOURCE_ISOLATION_PASS"
+      : "D412_LIVE_OBSIDIAN_PRE_CUTOVER_PASS",
+    ...(staleClientMode ? { staleClientReport } : {}),
     repoId: target.id,
     pinnedSourceCommitSha: rehearsal.report.pinnedSourceCommitSha,
     destinationCommitSha: rehearsal.report.destinationCommitSha,
@@ -440,6 +669,16 @@ try {
 } finally {
   try {
     if (child?.pid) terminate();
+    try { staleSession?.ws?.close(); } catch {}
+    // Also terminate independently held synthetic Vault processes on ANY
+    // exception path, not only the currently selected CDP session.
+    for (const ownedPid of [...ownedProcessIds]) {
+      const stopped = spawnSync("taskkill", ["/PID", String(ownedPid), "/T", "/F"], {
+        encoding: "utf8", timeout: 18000, shell: false,
+      });
+      assert.equal(stopped.status, 0, "Failed to stop a held disposable Obsidian process");
+      ownedProcessIds.delete(ownedPid);
+    }
   } catch {
     cleanupState = "process-termination-unconfirmed";
     process.exitCode = 1;

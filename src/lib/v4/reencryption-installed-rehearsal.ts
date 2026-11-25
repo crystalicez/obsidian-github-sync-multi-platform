@@ -820,6 +820,9 @@ export async function inspectV4InstalledPreCutoverRecoveryAfterRestart(
         },
         expectedRepoId: sourceRepoId,
         expectedBranch: input.backupBranch,
+        expectedPinnedCommitSha: input.pinnedSourceCommitSha,
+        expectedSourceTreeSha: input.sourceTreeSha,
+        expectedPhysicalRepositoryId: input.expectedPhysicalRepositoryId,
         passphrase: input.oldPassphrase,
         signal: input.signal,
       })
