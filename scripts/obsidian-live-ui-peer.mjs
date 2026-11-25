@@ -2,7 +2,7 @@
 // Only the caller's newly created synthetic run directory can be touched.
 import assert from "node:assert/strict";
 import {spawn,spawnSync} from "node:child_process";
-import {createHash} from "node:crypto";
+import {createHash,randomBytes} from "node:crypto";
 import {createReadStream} from "node:fs";
 import {copyFile,mkdir,stat,writeFile} from "node:fs/promises";
 import {verifyPngBytes} from "./ui-visual-assertions.mjs";
@@ -27,7 +27,7 @@ export const nativeVaultInventoryExpression = `(async()=>{
 })()`;
 export async function restoreEncryptedToSecondObsidian({
  exe,runRoot,port,pluginId,sourceRoot,configuration,passphrase,expectedContent,
- expectedFiles=[],absentPaths=[],exercisePeerConflict=false,expectedBinary=null,convergeAfterPeerEdit=null,
+ expectedFiles=[],absentPaths=[],exercisePeerConflict=false,expectedBinary=null,convergeAfterPeerEdit=null,peerBinaryJourneys=[],afterPeerBinary=null,
 }){
  assert.ok(Number.isInteger(port)&&port>=1024&&port<=65535,"Second CDP port is unsafe");
  assert.ok(path.basename(runRoot).match(/^[0-9a-f]{16}$/u),"Second vault requires a synthetic random run ID");
@@ -179,6 +179,33 @@ export async function restoreEncryptedToSecondObsidian({
   const evidencePath=path.join(evidenceDir,path.basename(runRoot)+"-peer-restored.png");
   await writeFile(evidencePath,bytes);
   let peerMutated=false,peerConverged=false,peerOpenEditorGuardVerified=false,peerFinalInventoryCount=0;
+  const binaryJourneys=[];
+  for(const spec of peerBinaryJourneys){
+   assert.match(spec.path,/^Assets\/android-from-windows-[0-9]+mib\.bin$/u);
+   assert.ok(Number.isSafeInteger(spec.size)&&spec.size>0&&spec.size<=32*1024*1024);
+   const full=path.join(vault,...spec.path.split("/"));
+   const bytes=randomBytes(spec.size);
+   const sha256=createHash("sha256").update(bytes).digest("hex");
+   await writeFile(full,bytes,{flag:"wx"});
+   const deadline=Date.now()+45000;
+   let indexed=false;
+   while(Date.now()<deadline&&!indexed){
+    indexed=await evaluate("(()=>{const f=app.vault.getAbstractFileByPath("+JSON.stringify(spec.path)+");return f?.stat?.size==="+spec.size+";})()");
+    if(!indexed)await pause(250);
+   }
+   assert.ok(indexed,"Windows peer did not index new binary");
+   const published=await evaluate(`(async()=>{const p=app.plugins.plugins[${JSON.stringify(pluginId)}];const outcome=await p.v4Runtime.manualSync();const s=p.v4Runtime.progressSnapshot;return {status:outcome?.status,lifecycle:s.lifecycle,changedFiles:outcome?.changedFiles,error:s.errorMessage?.slice(0,180),diagnostics:s.diagnostics};})()`,240000);
+   assert.ok(published.status==="completed"&&published.lifecycle==="success"&&published.changedFiles>0,"Windows binary publication failed: "+JSON.stringify(published));
+   console.log(JSON.stringify({kind:"windows-binary-published",...spec,sha256,diagnostics:published.diagnostics}));
+   const returned=await afterPeerBinary?.({...spec,sha256});
+   if(returned?.expectedReturnHash){
+    const result=await evaluate(`(async()=>{const p=app.plugins.plugins[${JSON.stringify(pluginId)}];const outcome=await p.v4Runtime.manualSync();const s=p.v4Runtime.progressSnapshot;return {status:outcome?.status,lifecycle:s.lifecycle,changedFiles:outcome?.changedFiles,error:s.errorMessage?.slice(0,180)};})()`,240000);
+    assert.ok(result.status==="completed"&&result.lifecycle==="success","Windows did not receive Android binary revision: "+JSON.stringify(result));
+    const digest=createHash("sha256");for await(const chunk of createReadStream(full,{highWaterMark:8*1024*1024}))digest.update(chunk);
+    assert.equal(digest.digest("hex"),returned.expectedReturnHash,"Windows disk bytes differ from Android revision");
+   }
+   binaryJourneys.push({...spec,sha256,returned:!!returned?.expectedReturnHash});
+  }
   if(exercisePeerConflict){
    const result=await evaluate(`(async()=>{
     const p=app.plugins.plugins[${JSON.stringify(pluginId)}];
@@ -234,7 +261,7 @@ export async function restoreEncryptedToSecondObsidian({
     peerFinalInventoryCount=actual.length;
    }
   }
-  return {peerConverged,peerOpenEditorGuardVerified,peerFinalInventoryCount,peerRestored:true,peerVaultPathMatches:true,filenameMatched:true,bytesRestored:Buffer.byteLength(restored.content,"utf8"),peerScreenshot:evidencePath,verifiedJourneyFiles:verifiedFiles.length,peerMutated,peerDiagnostics:restored.diagnostics,peerPullWallMs:restored.peerPullWallMs};
+  return {binaryJourneys,peerConverged,peerOpenEditorGuardVerified,peerFinalInventoryCount,peerRestored:true,peerVaultPathMatches:true,filenameMatched:true,bytesRestored:Buffer.byteLength(restored.content,"utf8"),peerScreenshot:evidencePath,verifiedJourneyFiles:verifiedFiles.length,peerMutated,peerDiagnostics:restored.diagnostics,peerPullWallMs:restored.peerPullWallMs};
  }finally{
   if(ws){try{ws.close()}catch{}}
   if(child?.pid){
