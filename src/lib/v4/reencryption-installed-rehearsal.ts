@@ -7,6 +7,7 @@ import { readImmutableGitFile } from "./immutable-git-read"
 import { assertV4Pbkdf2Iterations, V4_MIN_NEW_PBKDF2_ITERATIONS } from "./kdf-policy"
 import type { V4LocalIndexAdapter } from "./local-index"
 import { stageV4InstalledDestinationSecret, inspectV4InstalledDestinationSecret, restoreV4InstalledMissingDestinationSecret, type V4InstalledSecretOwner, type V4InstalledSecretReport } from "./reencryption-installed-secret"
+import { captureV4InstalledCutoverSourceSettings, writeV4InstalledDestinationSettings, type V4InstalledSettingsIo } from "./reencryption-installed-settings-cutover"
 import { stageV4InstalledReencryptionShadow, verifyV4InstalledReencryptionShadow, type V4InstalledShadowReport } from "./reencryption-installed-shadow"
 import { expectedV4PathLayout, V4_CONFIG_PATH, type V4RemoteConfig } from "./protocol-types"
 import { inspectV4BestEffortWalRecovery } from "./reencryption-best-effort-wal-recovery"
@@ -151,6 +152,7 @@ export interface V4InstalledPreCutoverRecoveryInput {
   readonly inspectFenceAndNoPartialCutover?: (() => Promise<boolean>) | undefined
   /** Optional activation-readiness scan, never used for missing-key repair. */
   readonly createInitiatorReader?: ((assertLease: () => Promise<void>) => V4InitiatorLocalReader) | undefined
+  readonly stageDestinationSettings?: V4InstalledSettingsIo | undefined
   readonly openReadOnlyWal: () => Promise<V4InstalledRehearsalReadOnlyWal>
   readonly createGitHubClient: (branch: string) => GitHubClient
   readonly assertOwnerStillValid?: (() => void) | undefined
@@ -169,7 +171,8 @@ export interface V4InstalledPreCutoverRecoveryReport {
   readonly stagedSecretRestored?: true | undefined
   readonly physicalParityReverified?: true | undefined
   readonly sourceRefReverified?: true | undefined
-  readonly failureStage?: "fence" | "backup" | "wal" | "destination" | "secret" | "shadow" | "physical-parity" | "source-ref" | "final-readback" | undefined
+  readonly destinationSettingsWrittenFenced?: true | undefined
+  readonly failureStage?: "fence" | "backup" | "wal" | "destination" | "secret" | "shadow" | "physical-parity" | "source-ref" | "settings-write" | "final-readback" | undefined
   readonly verifiedFileCount: number
   readonly verifiedPlaintextBytes: string
   readonly cutoverAuthorized: false
@@ -755,6 +758,7 @@ export async function inspectV4InstalledPreCutoverRecoveryAfterRestart(
     || !input.oldPassphrase || (!input.secretOwner && !input.newPassphrase) || input.oldPassphrase === input.newPassphrase
     || (input.restoreMissingSecret && (!input.secretOwner || !input.shadow || !input.newPassphrase || input.createInitiatorReader))
     || (input.createInitiatorReader && (!input.secretOwner || !input.shadow || !input.inspectFenceAndNoPartialCutover))
+    || (input.stageDestinationSettings && (!input.createInitiatorReader || input.restoreMissingSecret))
     || !Number.isSafeInteger(input.expectedFinalWalGeneration) || input.expectedFinalWalGeneration < 1) {
     return manualRecoveryReport()
   }
@@ -791,6 +795,7 @@ export async function inspectV4InstalledPreCutoverRecoveryAfterRestart(
       return fail()
     }
 
+    const originalData = input.stageDestinationSettings ? await captureV4InstalledCutoverSourceSettings(input.stageDestinationSettings) : undefined
     // Hold the read-only WAL lease while authenticating the immutable Backup.
     wal = await input.openReadOnlyWal()
     await wal.assertExclusiveStageLease()
@@ -1073,6 +1078,33 @@ export async function inspectV4InstalledPreCutoverRecoveryAfterRestart(
       const finalSecret = await inspectV4InstalledDestinationSecret(secretInput!)
       if (finalSecret.id !== stagedSecret!.id || finalSecret.passphrase !== destinationPassphrase) return fail()
       await assertLease()
+      if (input.stageDestinationSettings && originalData !== undefined) {
+        failureStage = "settings-write"
+        const reader = input.createInitiatorReader(assertLease)
+        await writeV4InstalledDestinationSettings({
+          ...secretInput!, io: input.stageDestinationSettings, originalData,
+          destinationIterations: destInventory.sourceConfig.kdfParams.iterations,
+          assertProof: async () => {
+            await assertLease()
+            await verifyV4InstalledReencryptionShadow({
+              adapter: input.shadow!.adapter, runId: input.runId, deviceId: input.shadow!.deviceId,
+              source: backupInventory, destination: destInventory,
+            })
+            await verifyV4ReencryptionInitiatorLocalParity({
+              pinnedSourceCommitSha: input.pinnedSourceCommitSha,
+              verifiedSource: backupInventory.verifiedSource,
+              sourceRecords: backupInventory.sourceRecords.filter(record => !record.deleted),
+              reader, signal: input.signal,
+            })
+            await assertSourceStillPinned()
+            const [backup, destination] = await Promise.all([backupClient.getGitRef(), destinationClient.getGitRef()])
+            if (backup.sha !== input.pinnedSourceCommitSha || destination.sha !== input.destinationCommitSha) throw Error("Cutover refs changed.")
+            await readOnlyJournal.assertHealthySnapshot(input.expectedFinalWalGeneration)
+            await assertLease()
+          },
+          checkpoint: async () => { await wal!.assertBestEffortCheckpoint(); await readOnlyJournal.assertHealthySnapshot(input.expectedFinalWalGeneration) },
+        })
+      }
     }
     input.assertOwnerStillValid?.()
     return Object.freeze({
@@ -1085,6 +1117,7 @@ export async function inspectV4InstalledPreCutoverRecoveryAfterRestart(
       ...(stagedSecret ? { stagedSecretReverified: true as const } : {}),
       ...(restore ? { stagedSecretRestored: true as const } : {}),
       ...(input.createInitiatorReader ? { physicalParityReverified: true as const, sourceRefReverified: true as const } : {}),
+      ...(input.stageDestinationSettings ? { destinationSettingsWrittenFenced: true as const } : {}),
       verifiedFileCount: destInventory.verifiedSource.verifiedFileCount,
       verifiedPlaintextBytes: destInventory.verifiedSource.totalVerifiedPlaintextBytes,
       cutoverAuthorized: false,

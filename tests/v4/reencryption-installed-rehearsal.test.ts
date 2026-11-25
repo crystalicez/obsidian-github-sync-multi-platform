@@ -15,7 +15,8 @@ import { planV4PluginPrivateWalLocation } from "../../src/lib/v4/reencryption-pl
 import { verifyGitHubReencryptionForkSource, verifyGitHubReencryptionForkSourceWithTranscodeInventory } from "../../src/lib/v4/reencryption-trusted-loader"
 import { createEmptyV4LocalIndex, saveV4LocalIndex, loadV4LocalIndex } from "../../src/lib/v4/local-index"
 import { deriveV4Keyring } from "../../src/lib/v4/crypto"
-import { stageV4InstalledDestinationSecret, readV4InstalledDestinationSecret, installedSecretReceiptRoot } from "../../src/lib/v4/reencryption-installed-secret"
+import { inspectV4InstalledSettingsCutover, V4_INSTALLED_CUTOVER_INTENT_PATH } from "../../src/lib/v4/reencryption-installed-settings-cutover"
+import { discoverV4InstalledSecretIdentity, stageV4InstalledDestinationSecret, readV4InstalledDestinationSecret, installedSecretReceiptRoot } from "../../src/lib/v4/reencryption-installed-secret"
 import { createV4ReencryptionRecoveryJournal } from "../../src/lib/v4/reencryption-recovery-journal"
 import { V4StorageCodec } from "../../src/lib/v4/storage-codec"
 import { buildV4RemoteMetadata } from "../../src/lib/v4/remote-index"
@@ -335,11 +336,14 @@ async function createInstalledVaultFixture(files: ReadonlyArray<{ path: string; 
       isSyncInProgress: false,
       isSettingsSaveInProgress: () => false,
       loadData: async () => structuredClone(persistedData),
+      saveData: async (data: unknown) => { persistedData = structuredClone(data) as Record<string, unknown> },
+      v4Runtime: undefined as V4PluginRuntime | undefined,
       disableWatch: () => { watchEnabled = false },
       addIgnoredFile() {},
       removeIgnoredFile() {},
     }
     const runtime = new V4PluginRuntime(plugin as never)
+    plugin.v4Runtime = runtime
     return {
       plugin,
       runtime,
@@ -351,7 +355,7 @@ async function createInstalledVaultFixture(files: ReadonlyArray<{ path: string; 
     pluginDir,
     adapter,
     settings,
-    persistedData,
+    get persistedData() { return persistedData },
     secrets,
     makeRuntime,
     cleanup: () => rm(root, { recursive: true, force: true }),
@@ -621,6 +625,7 @@ test("D412 installed Runtime orchestrates Source -> Backup -> Staging -> Scratch
     assert.equal(recovered.powerLossDurabilityProven, false)
 
     // Even a valid local cache digest cannot authorize a forged remote identity.
+    const verifiedShadow = structuredClone(shadow)
     const firstShard = Object.values(shadow.shards)[0]!
     const firstRecord = Object.values(firstShard.records)[0]!
     firstRecord.fileId = "forged-file-identity"
@@ -629,6 +634,64 @@ test("D412 installed Runtime orchestrates Source -> Backup -> Staging -> Scratch
     assert.equal(tampered.observation, "manual-recovery-required")
     assert.equal(tampered.resumeSyncAuthorized, false)
     assert.deepEqual(await loadV4LocalIndex(vault.adapter, sourceRoot), sourceBefore)
+
+    // D519 actual persisted destination Settings under the owner-held WAL lease.
+    // The active runtime must remain on Source and both roots/keys intact.
+    const stageInput = { expectedLocatorDigest: missing.locatorDigest,
+      acknowledgement: "accept-best-effort-power-loss-recovery-risk" as const, createGitHubClient: makeClientFactory() }
+    const beforeCutover = structuredClone(vault.persistedData)
+    const denied = await runtime2.runtime.stageInstalledDestinationSettingsFromDisk(stageInput)
+    assert.equal(denied?.observation, "manual-recovery-required")
+    assert.deepEqual(vault.persistedData, beforeCutover)
+    await saveV4LocalIndex(vault.adapter, shadowRoot, verifiedShadow)
+    const invalidDigest = await runtime2.runtime.stageInstalledDestinationSettingsFromDisk({ ...stageInput, expectedLocatorDigest: "0".repeat(64) })
+    assert.equal(invalidDigest, null)
+    assert.deepEqual(vault.persistedData, beforeCutover)
+    const oldRoot = await loadV4LocalIndex(vault.adapter, sourceRoot)
+    const newRoot = await loadV4LocalIndex(vault.adapter, shadowRoot)
+    const cutoverIdentity = await discoverV4InstalledSecretIdentity({
+      adapter: journalAdapter as never, sourceRepoId: OWNER + "/" + REPO + "#" + SOURCE_BRANCH, deviceId: vault.settings.vault,
+    })
+    const written = await runtime2.runtime.stageInstalledDestinationSettingsFromDisk(stageInput)
+    assert.equal(written?.destinationSettingsWrittenFenced, true)
+    assert.equal(written?.resumeSyncAuthorized, false)
+    assert.deepEqual(vault.persistedData, { settings: { ...(beforeCutover.settings as object),
+      githubBranch: destinationBranch, encryptionPassphraseSecretId: stagedId,
+      pbkdf2Iterations: 700_000,
+    } })
+    assert.equal(runtime2.plugin.settings.githubBranch, SOURCE_BRANCH)
+    assert.equal(vault.secrets.get(vault.settings.encryptionPassphraseSecretId), OLD_PASSPHRASE)
+    assert.equal(vault.secrets.get(stagedId), NEW_PASSPHRASE)
+    assert.deepEqual(await loadV4LocalIndex(vault.adapter, sourceRoot), oldRoot)
+    assert.deepEqual(await loadV4LocalIndex(vault.adapter, shadowRoot), newRoot)
+    const cutoverKey = await deriveV4Keyring({
+      passphrase: OLD_PASSPHRASE, repoId: OWNER + "/" + REPO + "#" + SOURCE_BRANCH,
+      salt: utf8ToBytes("d412-source-salt"), iterations: 600_000,
+    })
+    try {
+      const inspect = { adapter: journalAdapter as never, identity: cutoverIdentity,
+        key: cutoverKey.journalKey, sourceSecretId: vault.settings.encryptionPassphraseSecretId,
+        io: { read: async () => structuredClone(vault.persistedData) } }
+      assert.equal(await inspectV4InstalledSettingsCutover(inspect), "destination-settings-observed-fenced")
+      assert.equal(await inspectV4InstalledSettingsCutover({ ...inspect, key: new Uint8Array(32) }), "manual-recovery-required")
+      assert.equal(await inspectV4InstalledSettingsCutover({ ...inspect, io: { read: async () => beforeCutover } }), "source-settings-intent-pending")
+      assert.equal(await inspectV4InstalledSettingsCutover({ ...inspect, io: { read: async () => ({ settings: {} }) } }), "manual-recovery-required")
+    } finally { for (const key of Object.values(cutoverKey)) key.fill(0) }
+    const intentPath = CONFIG_DIR + "/plugins/" + PLUGIN_ID + "/" + V4_INSTALLED_CUTOVER_INTENT_PATH
+    const intentText = await vault.adapter.read(intentPath)
+    assert.ok(!intentText.includes(OLD_PASSPHRASE) && !intentText.includes(NEW_PASSPHRASE) && !intentText.includes(vault.settings.githubToken))
+    assert.equal((await runtime2.runtime.stageInstalledDestinationSettingsFromDisk(stageInput))?.observation, "manual-recovery-required")
+    assert.equal(await vault.adapter.read(intentPath), intentText)
+    runtime2.runtime.dispose()
+    runtime2 = vault.makeRuntime()
+    runtime2.plugin.settings.githubBranch = destinationBranch
+    runtime2.plugin.settings.encryptionPassphraseSecretId = stagedId
+    runtime2.plugin.settings.encryptionPassphrase = NEW_PASSPHRASE
+    await assert.rejects(() => runtime2!.runtime.assertReencryptionSettingsSaveAllowed())
+    await runtime2.runtime.manualSync()
+    assert.equal(runtime2.runtime.progressSnapshot.lifecycle, "failed")
+    assert.equal(server.refs.get(SOURCE_BRANCH), pinnedSourceCommitSha)
+    assert.equal(server.refs.get(destinationBranch), destSha)
 
     // Physical Vault notes remain identical to original fixture.
     assert.deepEqual(new Uint8Array(await vault.adapter.readBinary("Notes/สวัสดี.md")), noteBytes)

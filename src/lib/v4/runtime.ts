@@ -1928,6 +1928,28 @@ export class V4PluginRuntime {
     } catch { return null }
   }
 
+  /**
+   * Internal fenced Settings transaction. Explicit acknowledgement, fresh
+   * disk identity and the same owner-held WAL proof as readiness. Never
+   * publish to in-memory Settings or resume Sync before restart recovery.
+   * Not wired to Wizard Execute until activation/recovery is complete.
+   */
+  async stageInstalledDestinationSettingsFromDisk(input: {
+    readonly expectedLocatorDigest: string
+    readonly acknowledgement: "accept-best-effort-power-loss-recovery-risk"
+    readonly createGitHubClient?: ((branch: string) => GitHubClient) | undefined
+  }): Promise<V4InstalledPreCutoverRecoveryReport | null> {
+    try {
+      if (input.acknowledgement !== "accept-best-effort-power-loss-recovery-risk"
+        || !/^[a-f0-9]{64}$/u.test(input.expectedLocatorDigest)) return null
+      const discovered = await this.discoverInstalledStagedRecovery()
+      if (discovered.locatorDigest !== input.expectedLocatorDigest) return null
+      return await this.recoverInstalledPreCutover({
+        ...discovered.input, verifyPhysicalVault: true, createGitHubClient: input.createGitHubClient,
+      }, false, true)
+    } catch { return null }
+  }
+
   async restoreInstalledStagedSecretFromDisk(input: {
     readonly expectedLocatorDigest: string; readonly newPassphrase: string
     readonly createGitHubClient?: ((branch: string) => GitHubClient) | undefined
@@ -1947,7 +1969,7 @@ export class V4PluginRuntime {
     return this.recoverInstalledPreCutover({ ...input, verifyShadowIndex: true, recoverStagedSecret: true }, true)
   }
 
-  private async recoverInstalledPreCutover(input: Parameters<V4PluginRuntime["inspectFencedReencryptionPreCutoverRecovery"]>[0], restoreMissing: boolean): Promise<V4InstalledPreCutoverRecoveryReport> {
+  private async recoverInstalledPreCutover(input: Parameters<V4PluginRuntime["inspectFencedReencryptionPreCutoverRecovery"]>[0], restoreMissing: boolean, stageSettings = false): Promise<V4InstalledPreCutoverRecoveryReport> {
     this.assertNotDisposed()
     const vault = this.plugin.app.vault
     const backing = this.indexAdapterBacking as (typeof vault.adapter & { getFullPath?: (path: string) => string }) | undefined
@@ -1957,6 +1979,9 @@ export class V4PluginRuntime {
     const initialCredentialGen = this.credentialGeneration
     const initialSettingsSaveGen = this.plugin.settingsSaveGeneration
     const initialSyncGen = this.coordinator.syncExecutionGeneration
+    const fullSettingsSnapshot = stageSettings ? JSON.stringify(settings) : undefined
+    const loadData = this.plugin.loadData
+    const saveData = this.plugin.saveData
     const pinned = {
       owner: settings.githubOwner,
       repo: settings.githubRepo,
@@ -1988,7 +2013,10 @@ export class V4PluginRuntime {
         || current.githubTokenSecretId !== pinned.tokenSecretId
         || current.encryptionPassphrase !== pinned.passphrase
         || current.encryptionPassphraseSecretId !== pinned.passphraseSecretId
-        || current.encryptionMode !== pinned.mode || current.vault !== pinned.vault) {
+        || current.encryptionMode !== pinned.mode || current.vault !== pinned.vault
+        || (stageSettings && (JSON.stringify(current) !== fullSettingsSnapshot || this.plugin.v4Runtime !== this
+          || typeof loadData !== "function" || typeof saveData !== "function"
+          || this.plugin.loadData !== loadData || this.plugin.saveData !== saveData))) {
         throw new Error("Re-encryption pre-cutover recovery lost live owner.")
       }
     }
@@ -2057,6 +2085,10 @@ export class V4PluginRuntime {
           && checks[2] === false && checks[3] === false
           && checks[4] === recoverStagedSecret && (!recoverStagedSecret || verifyShadowIndex)
       },
+      stageDestinationSettings: stageSettings ? {
+        read: async () => { assertOwner(); return loadData.call(this.plugin) },
+        write: async data => { assertOwner(); await saveData.call(this.plugin, data); assertOwner() },
+      } : undefined,
       createInitiatorReader: input.verifyPhysicalVault === true ? lease => this.createReencryptionInitiatorLocalReader(lease) : undefined,
       openReadOnlyWal: async () => {
         assertOwner()
