@@ -14,6 +14,7 @@ import {cleanupGeneratedUiRun,cleanupGeneratedUiEvidence} from "./obsidian-live-
 const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),"..");
 const port=Number(process.argv.find(x=>x.startsWith("--port="))?.slice(7));
 const probe=process.argv.includes("--probe");
+const reuse=process.argv.includes("--reuse-fixtures");
 assert.ok(Number.isInteger(port)&&port>1024&&port<=65535);
 const name="ObsidianSync-D496-Disposable";
 const pluginId="encrypted-github-sync-multi-platform";
@@ -54,7 +55,7 @@ try{
  const identity=await evaluate(identityExpression);
  console.log(JSON.stringify({kind:"android-identity",...identity}));
  assert.ok(identity.correct&&identity.loaded&&!identity.configured,"Expected exact unconfigured disposable Android Vault and loaded plugin");
- assert.deepEqual(identity.fileNames,["Smoke.md"]);
+ assert.deepEqual(identity.fileNames,reuse?["Assets/android-1mib.bin","Smoke.md","UI-smoke.md"]:["Smoke.md"]);
  if(probe){ok=true;}else{
   const sha=git(["rev-parse","HEAD"]);assert.equal(sha.status,0);
   assert.equal(git(["status","--porcelain"]).stdout.trim(),"","Clean checkout required");
@@ -68,15 +69,17 @@ try{
   const smoke=await guarded('return await app.vault.read(app.vault.getAbstractFileByPath("Smoke.md"));');
   assert.equal(smoke,"# D496 disposable Android qualification\n\nSynthetic note only. No personal data or GitHub credentials.\n");
   const expectedBinary={path:"Assets/android-1mib.bin",size:1048576};
-  const fixture=randomBytes(expectedBinary.size);expectedBinary.sha256=createHash("sha256").update(fixture).digest("hex");
+  const fixture=reuse?null:randomBytes(expectedBinary.size);
+  if(reuse){const existing=await guarded(`const note=await app.vault.read(app.vault.getAbstractFileByPath("UI-smoke.md"));const b=await app.vault.readBinary(app.vault.getAbstractFileByPath(${JSON.stringify(expectedBinary.path)}));const h=new Uint8Array(await crypto.subtle.digest("SHA-256",b));return {note,size:b.byteLength,sha256:Array.from(h,x=>x.toString(16).padStart(2,"0")).join("")};`);assert.equal(existing.note,expectedContent);assert.equal(existing.size,expectedBinary.size);assert.match(existing.sha256,/^[a-f0-9]{64}$/u);expectedBinary.sha256=existing.sha256;}else expectedBinary.sha256=createHash("sha256").update(fixture).digest("hex");
   const d={owner:config.owner,repo:config.repo,branch:config.branch,token:config.token,passphrase};
   settingsAttempted=true;
   const configured=await guarded(`const d=${JSON.stringify(d)};if(p.settings.githubToken||p.settings.githubOwner||p.settings.githubRepo)throw Error("Already configured");const nextSettings={...p.settings,githubOwner:d.owner,githubRepo:d.repo,githubBranch:d.branch,githubToken:d.token,encryptionMode:"encrypted",encryptionPassphrase:d.passphrase,syncEnabled:true,syncOnStartup:false,syncOnLocalChange:false,scheduledSyncEnabled:false,syncObsidianConfig:false,syncBookmarks:false,syncPlugins:false};await p.saveSettings(nextSettings);return p.settings.githubBranch===d.branch&&p.settings.githubToken===d.token&&p.settings.encryptionPassphrase===d.passphrase;`);
   assert.equal(configured,true);
-  const init=await guarded(`await app.vault.create("UI-smoke.md",${JSON.stringify(expectedContent)});await app.vault.createFolder("Assets");const raw=Uint8Array.from(atob(${JSON.stringify(fixture.toString("base64"))}),c=>c.charCodeAt(0));await app.vault.createBinary(${JSON.stringify(expectedBinary.path)},raw.buffer);const outcome=await p.v4Runtime.manualSync();${summary}`,240000);
+  const create=reuse?"":`await app.vault.create("UI-smoke.md",${JSON.stringify(expectedContent)});await app.vault.createFolder("Assets");const raw=Uint8Array.from(atob(${JSON.stringify(fixture.toString("base64"))}),c=>c.charCodeAt(0));await app.vault.createBinary(${JSON.stringify(expectedBinary.path)},raw.buffer);`;
+  const init=await guarded(`${create}const outcome=await p.v4Runtime.manualSync();${summary}`,240000);
   console.log("android-initial "+safeError(JSON.stringify(init)));
   assert.equal(init.status,"completed");assert.equal(init.lifecycle,"success");
-  const head=await readE2EBranch(config);assert.equal(head.kind,"present");
+  const head=await readE2EBranch(config);assert.equal(head.kind,"present");console.log(JSON.stringify({kind:"android-published",binaryBytes:expectedBinary.size,sha256:expectedBinary.sha256,reusedFixture:reuse}));
   const verifyBinary=async()=>guarded(`const f=app.vault.getAbstractFileByPath(${JSON.stringify(expectedBinary.path)});const b=await app.vault.readBinary(f);const h=new Uint8Array(await crypto.subtle.digest("SHA-256",b));return {size:b.byteLength,sha256:Array.from(h,x=>x.toString(16).padStart(2,"0")).join("")};`);
   assert.deepEqual(await verifyBinary(),{size:expectedBinary.size,sha256:expectedBinary.sha256});
   const noop=await guarded("const outcome=await p.v4Runtime.manualSync();"+summary,240000);

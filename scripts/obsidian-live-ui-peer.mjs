@@ -167,7 +167,9 @@ export async function restoreEncryptedToSecondObsidian({
    assert.equal(digest.digest("hex"),expectedBinary.sha256,"Native Obsidian peer binary bytes changed after GitHub Force Pull");
   }
   await pause(500);
-  const visible=await evaluate(`(()=>({shown:document.body.innerText.includes("Second revision from Obsidian."),settingsVisible:!!document.querySelector(".vertical-tab-header")}))()`);
+  const visibleText=expectedContent.trim().split(/\r?\n/u).filter(line=>line.trim()&&!line.startsWith("#")).at(-1);
+  assert.ok(visibleText,"Peer expected content must include a visible text line");
+  const visible=await evaluate(`(()=>({shown:document.body.innerText.includes(${JSON.stringify(visibleText)}),settingsVisible:!!document.querySelector(".vertical-tab-header")}))()`);
   assert.ok(visible.shown&&!visible.settingsVisible,"Restored synthetic note is not visible in the second Obsidian editor");
   const image=await send("Page.captureScreenshot",{format:"png",captureBeyondViewport:false,fromSurface:true});
   const bytes=Buffer.from(image?.data??"","base64");
