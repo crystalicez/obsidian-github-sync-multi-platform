@@ -27,7 +27,7 @@ export const nativeVaultInventoryExpression = `(async()=>{
 })()`;
 export async function restoreEncryptedToSecondObsidian({
  exe,runRoot,port,pluginId,sourceRoot,configuration,passphrase,expectedContent,
- expectedFiles=[],absentPaths=[],exercisePeerConflict=false,expectedBinary=null,convergeAfterPeerEdit=null,peerBinaryJourneys=[],afterPeerBinary=null,
+ expectedFiles=[],absentPaths=[],exercisePeerConflict=false,expectedBinary=null,convergeAfterPeerEdit=null,peerBinaryJourneys=[],beforePeerBinary=null,afterPeerBinary=null,
 }){
  assert.ok(Number.isInteger(port)&&port>=1024&&port<=65535,"Second CDP port is unsafe");
  assert.ok(path.basename(runRoot).match(/^[0-9a-f]{16}$/u),"Second vault requires a synthetic random run ID");
@@ -183,6 +183,7 @@ export async function restoreEncryptedToSecondObsidian({
   for(const spec of peerBinaryJourneys){
    assert.match(spec.path,/^Assets\/android-from-windows-(?:[0-9]+mib|oversize)\.bin$/u);
    assert.ok(Number.isSafeInteger(spec.size)&&spec.size>0&&spec.size<=32*1024*1024+1);
+   await beforePeerBinary?.(spec);
    const full=path.join(vault,...spec.path.split("/"));
    const bytes=randomBytes(spec.size);
    const sha256=createHash("sha256").update(bytes).digest("hex");
