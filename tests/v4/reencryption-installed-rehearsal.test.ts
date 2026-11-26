@@ -1001,29 +1001,72 @@ test("D412 installed Runtime orchestrates Source -> Backup -> Staging -> Scratch
     assert.equal(server.refs.get(SOURCE_BRANCH), pinnedSourceCommitSha)
     assert.equal(server.refs.get(backupBranch), pinnedSourceCommitSha)
     assert.equal(await vault.adapter.read(activePath), activeText)
-    // D524: an independently configured device with its own physical Vault,
-    // device ID and ordinary Index (no Migration route) advances Destination.
-    const peer = await createInstalledVaultFixture([
-      { path: "Notes/สวัสดี.md", bytes: utf8ToBytes(localEdit) },
-      { path: "Attachments/data.bin", bytes: binBytes },
-    ])
-    const peerRuntime = peer.makeRuntime()
+    // D525: an independent EMPTY physical Vault, no pre-seeded Index or
+    // notes. Save the new connection through the actual Settings transaction.
+    const peer = await createInstalledVaultFixture([])
+    let peerRuntime = peer.makeRuntime()
     const peerEdit = localEdit + "\nIndependent Destination device edit"
     let peerHead: string
     try {
-      peerRuntime.plugin.settings.githubBranch = destinationBranch
-      peerRuntime.plugin.settings.vault = "independent-destination-device"
-      peerRuntime.plugin.settings.encryptionPassphrase = NEW_PASSPHRASE
-      peerRuntime.plugin.githubClient = makeClientFactory()(destinationBranch)
-      const peerIndex = createEmptyV4LocalIndex({ repoId: repairedInventory.sourceConfig.repoId, deviceId: peerRuntime.plugin.settings.vault, mode: "encrypted" })
-      peerIndex.remoteCommitSha = repairedHead
-      peerIndex.epoch = repairedInventory.sourceHead.epoch
-      peerIndex.generation = repairedInventory.sourceHead.generation
-      peerIndex.shardHashes = { ...repairedInventory.sourceHead.shardHashes }
-      for (const [bucket, shard] of Object.entries(repairedInventory.sourceShards)) {
-        peerIndex.shards[bucket] = { bucket, hash: peerIndex.shardHashes[bucket]!, records: structuredClone(shard.records) }
+      let keySerial = 0
+      const wireSettings = () => {
+        const p = Object.assign(peerRuntime.plugin, {
+          settingsSaveInProgress: false, settingsSaveAttemptGeneration: 0, secretStorageReadUnavailable: false,
+          persistData: FastSync.prototype.persistData,
+          initGitHubClient: () => { p.githubClient = makeClientFactory()(p.settings.githubBranch) },
+          registerScheduledSync: () => {}, updateRibbonIcon: () => {},
+          createSecretId: () => "peer-destination-key-" + ++keySerial,
+        })
+        p.isSettingsSaveInProgress = () => p.settingsSaveInProgress
+        Object.defineProperty(p, "settingsSaveGeneration", { get: () => p.settingsSaveAttemptGeneration })
+        return p
       }
-      await saveV4LocalIndex(peer.adapter, sourceRoot, peerIndex)
+      const p = wireSettings()
+      const wrongPassphrase = "wrong-peer-passphrase"
+      const connection = { ...p.settings, githubBranch: destinationBranch, vault: "independent-destination-device", encryptionPassphrase: wrongPassphrase }
+      await FastSync.prototype.saveSettings.call(p as unknown as FastSync, connection)
+      assert.equal(p.settings.encryptionPassphraseSecretId, "peer-destination-key-1")
+      assert.equal(peer.secrets.get("peer-destination-key-1"), wrongPassphrase)
+      assert.equal(Object.hasOwn(peer.persistedData.settings as object, "encryptionPassphrase"), false)
+      assert.equal(Object.hasOwn(peer.persistedData.settings as object, "githubToken"), false)
+      assert.equal(await peer.adapter.exists(sourceRoot), false)
+      assert.equal(await peer.adapter.exists("Notes/สวัสดี.md"), false)
+      assert.equal(await peer.adapter.exists("Attachments/data.bin"), false)
+      // Simulate restart by hydrating the saved secret, not by constructing
+      // an Index from the independently verified remote inventory.
+      peerRuntime.runtime.dispose()
+      peerRuntime = peer.makeRuntime()
+      peerRuntime.plugin.settings.encryptionPassphrase = peer.secrets.get(peerRuntime.plugin.settings.encryptionPassphraseSecretId)!
+      peerRuntime.plugin.githubClient = makeClientFactory()(destinationBranch)
+      const beforePull = server.commits.size
+      const beforeBlobs = server.blobs.size
+      // Wrong key must fail without populating the Vault or mutating Git.
+      assert.equal(peerRuntime.plugin.settings.encryptionPassphrase, wrongPassphrase)
+      await peerRuntime.runtime.manualSync()
+      assert.equal(peerRuntime.runtime.progressSnapshot.lifecycle, "failed")
+      assert.equal(await peer.adapter.exists("Notes/สวัสดี.md"), false)
+      assert.equal(await peer.adapter.exists(sourceRoot + "/index.json"), false)
+      assert.equal(server.commits.size, beforePull)
+      const corrected = wireSettings()
+      await FastSync.prototype.saveSettings.call(corrected as unknown as FastSync, { ...corrected.settings, encryptionPassphrase: NEW_PASSPHRASE })
+      assert.equal(corrected.settings.encryptionPassphraseSecretId, "peer-destination-key-2")
+      assert.equal(peer.secrets.get("peer-destination-key-2"), NEW_PASSPHRASE)
+      assert.equal(peer.secrets.get("peer-destination-key-1"), "")
+      assert.equal(Object.hasOwn(peer.persistedData.settings as object, "encryptionPassphrase"), false)
+      await peerRuntime.runtime.manualSync()
+      assert.equal(peerRuntime.runtime.progressSnapshot.lifecycle, "success", peerRuntime.runtime.progressSnapshot.errorMessage)
+      assert.equal(await peer.adapter.read("Notes/สวัสดี.md"), localEdit)
+      assert.deepEqual(new Uint8Array(await peer.adapter.readBinary("Attachments/data.bin")), binBytes)
+      assert.equal(server.refs.get(destinationBranch), repairedHead)
+      assert.equal(server.commits.size, beforePull)
+      assert.equal(server.blobs.size, beforeBlobs)
+      const peerIndex = await loadV4LocalIndex(peer.adapter, sourceRoot)
+      assert.equal(peerIndex.remoteCommitSha, repairedHead)
+      assert.equal(peerIndex.deviceId, "independent-destination-device")
+      assert.equal(peerIndex.repoId, repairedInventory.sourceConfig.repoId)
+      assert.deepEqual(peerIndex.shardHashes, repairedInventory.sourceHead.shardHashes)
+      await peerRuntime.runtime.manualSync()
+      assert.equal(peerRuntime.runtime.progressSnapshot.lifecycle, "no-change", peerRuntime.runtime.progressSnapshot.errorMessage)
       await peer.adapter.write("Notes/สวัสดี.md", peerEdit)
       await peerRuntime.runtime.manualSync()
       assert.equal(peerRuntime.runtime.progressSnapshot.lifecycle, "success", peerRuntime.runtime.progressSnapshot.errorMessage)
