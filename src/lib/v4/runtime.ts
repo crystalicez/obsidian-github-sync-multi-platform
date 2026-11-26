@@ -55,7 +55,8 @@ import { V4CancelledError, throwIfV4Aborted } from "./cancellation"
 import { V4PublicationRaceError, isV4PublicationRaceError } from "./publication-race"
 import { assertV4SpeculativeConfigStillAbsent, guardV4SpeculativeConfigGithub } from "./speculative-config-guard"
 
-import { resolveV4InstalledActiveIndexRoot, V4_INSTALLED_ACTIVE_ROUTE_PATH } from "./reencryption-installed-active-route"
+import { sanitizeV4SettingsForPersistence } from "./secrets"
+import { protectedV4InstalledSettings, resolveV4InstalledActiveIndexRoot, V4_INSTALLED_ACTIVE_ROUTE_PATH, V4InstalledActiveIndexRecoveryError, type V4InstalledActiveRouteObservation } from "./reencryption-installed-active-route"
 import { discoverV4InstalledSettingsIntent, V4_INSTALLED_CUTOVER_INTENT_PATH } from "./reencryption-installed-settings-cutover"
 import { discoverV4InstalledSecretIdentity, installedSecretReceiptRoot } from "./reencryption-installed-secret"
 import { V4_RUNTIME_INDEX_ROOT } from "./reencryption-index-root"
@@ -1266,7 +1267,33 @@ export class V4PluginRuntime {
     return candidate
   }
 
-  async assertReencryptionSettingsSaveAllowed(): Promise<void> {
+  async assertReencryptionSettingsSaveAllowed(proposed?: FastSync["settings"]): Promise<void> {
+    // Only the existing Settings transaction may save safe preferences on a
+    // fully activated route; never permit a credential or scope replacement.
+    if (proposed && await this.adapter.exists(V4_INSTALLED_ACTIVE_ROUTE_PATH)) {
+      try {
+        const current = this.plugin.settings
+        const github = this.plugin.githubClient
+        const generation = this.credentialGeneration
+        const saveGeneration = this.plugin.settingsSaveGeneration
+        const currentSnapshot = JSON.stringify(current)
+        const proposedSnapshot = JSON.stringify(proposed)
+        if (this.disposed || this.reencryptionFencePending || !github
+          || this.coordinator.isSyncing || this.plugin.isSyncInProgress
+          || this.plugin.isSettingsSaveInProgress?.() !== true
+          || protectedV4InstalledSettings({ settings: current }) !== protectedV4InstalledSettings({ settings: proposed })) throw new V4ReencryptionSyncFencedError()
+        const loaded = await this.loadConfiguredRemoteConfig(github, this.repoId(current))
+        if (!loaded || loaded.config.mode !== "encrypted") throw new V4ReencryptionSyncFencedError()
+        const keyring = await this.keyringForConfig(loaded.config, current.encryptionPassphrase, undefined, generation)
+        if (this.plugin.settings !== current || this.plugin.settingsSaveGeneration !== saveGeneration
+          || JSON.stringify(current) !== currentSnapshot || JSON.stringify(proposed) !== proposedSnapshot) throw new V4ReencryptionSyncFencedError()
+        await this.resolveInstalledSyncIndexRoot({
+          settings: { ...current }, github, config: loaded.config, keyring,
+          credentialGeneration: generation, operation: "normal", settingsSaveCandidate: proposed,
+        })
+        return
+      } catch { throw new V4ReencryptionSyncFencedError() }
+    }
     if (this.disposed || this.reencryptionSyncFenced || this.reencryptionFencePending
       || !this.indexAdapterBacking
       || this.plugin.app.vault.adapter !== this.indexAdapterBacking) {
@@ -1963,6 +1990,37 @@ export class V4PluginRuntime {
     } catch { return null }
   }
 
+  /** After activation, do not try to replay the frozen migration or replace
+   * an evolving ordinary Sync cache with the old Shadow. Diagnostic only. */
+  async inspectInstalledActiveRouteFromDisk(): Promise<V4InstalledActiveRouteObservation> {
+    try {
+      this.assertNotDisposed()
+      if (!await this.adapter.exists(V4_INSTALLED_ACTIVE_ROUTE_PATH)) return "not-present"
+      const owner = this.plugin.settings
+      const settings = { ...owner }
+      const github = this.plugin.githubClient
+      const credentialGeneration = this.credentialGeneration
+      const saveGeneration = this.plugin.settingsSaveGeneration
+      const syncGeneration = this.coordinator.syncExecutionGeneration
+      const idle = () => !this.disposed && this.plugin.settings === owner
+        && JSON.stringify(this.plugin.settings) === JSON.stringify(settings)
+        && this.plugin.githubClient === github && this.credentialGeneration === credentialGeneration
+        && this.plugin.settingsSaveGeneration === saveGeneration && this.coordinator.syncExecutionGeneration === syncGeneration
+        && !this.coordinator.isSyncing && !this.plugin.isSyncInProgress && !this.plugin.isSettingsSaveInProgress?.()
+      if (!idle() || !github || !settings.encryptionPassphrase) return "active-route-unverified"
+      const loaded = await this.loadConfiguredRemoteConfig(github, this.repoId(settings))
+      if (!loaded || loaded.config.mode !== "encrypted" || !idle()) return "active-route-unverified"
+      const keyring = await this.keyringForConfig(loaded.config, settings.encryptionPassphrase, undefined, credentialGeneration)
+      if (!idle()) return "active-route-unverified"
+      const root = await this.resolveInstalledSyncIndexRoot({
+        settings, github, config: loaded.config, keyring, credentialGeneration, operation: "normal", diagnostic: true,
+      })
+      return idle() && root !== V4_INDEX_ROOT ? "active-route-verified" : "active-route-unverified"
+    } catch (error) {
+      return error instanceof V4InstalledActiveIndexRecoveryError ? "active-index-needs-manual-recovery" : "active-route-unverified"
+    }
+  }
+
   /** Read-only activation preflight from persisted identity; never an activation grant. */
   async inspectInstalledCutoverReadinessFromDisk(createGitHubClient?: (branch: string) => GitHubClient): Promise<V4InstalledPreCutoverRecoveryReport | null> {
     try {
@@ -2392,13 +2450,17 @@ export class V4PluginRuntime {
   private async resolveInstalledSyncIndexRoot(input: {
     settings: FastSync["settings"]; github: GitHubClient; config: V4RemoteConfig; keyring: V4Keyring | undefined
     credentialGeneration: number; operation: V4SyncRequest["operation"]
+    settingsSaveCandidate?: FastSync["settings"]
+    diagnostic?: true
   }): Promise<string> {
     if (!await this.adapter.exists(V4_INSTALLED_ACTIVE_ROUTE_PATH)) {
+      if (input.settingsSaveCandidate || input.diagnostic) throw new V4ReencryptionSyncFencedError()
       await assertV4ReencryptionSyncFenceClear(this.adapter)
       return V4_INDEX_ROOT
     }
     try {
-      const { settings, github, config, keyring, credentialGeneration, operation } = input
+      const { settings, github, config, keyring, credentialGeneration, operation, settingsSaveCandidate } = input
+      const proposedSnapshot = settingsSaveCandidate ? JSON.stringify(settingsSaveCandidate) : undefined
       const storage = this.plugin.app.secretStorage
       const current = this.plugin.settings
       const generation = this.plugin.settingsSaveGeneration
@@ -2416,9 +2478,14 @@ export class V4PluginRuntime {
           || current.githubToken !== settings.githubToken || current.githubTokenSecretId !== settings.githubTokenSecretId
           || current.ignorePathRegex !== settings.ignorePathRegex || current.syncObsidianConfig !== settings.syncObsidianConfig
           || current.syncBookmarks !== settings.syncBookmarks || current.syncPlugins !== settings.syncPlugins
+          || protectedV4InstalledSettings({ settings: current }) !== protectedV4InstalledSettings({ settings })
           || storage.getSecret(settings.encryptionPassphraseSecretId) !== settings.encryptionPassphrase
           || storage.getSecret(settings.githubTokenSecretId) !== settings.githubToken
-          || this.plugin.isSettingsSaveInProgress?.()) throw new V4ReencryptionSyncFencedError()
+          || (settingsSaveCandidate ? (this.plugin.isSettingsSaveInProgress?.() !== true
+            || this.coordinator.isSyncing || this.plugin.isSyncInProgress || this.reencryptionFencePending
+            || JSON.stringify(settingsSaveCandidate) !== proposedSnapshot
+            || protectedV4InstalledSettings({ settings: current }) !== protectedV4InstalledSettings({ settings: settingsSaveCandidate }))
+            : this.plugin.isSettingsSaveInProgress?.())) throw new V4ReencryptionSyncFencedError()
       }
       if (operation !== "normal" || !keyring || config.mode !== "encrypted" || config.repoId !== repoId
         || !settings.encryptionPassphrase || !settings.githubToken || github.branchName !== settings.githubBranch) throw new V4ReencryptionSyncFencedError()
@@ -2429,10 +2496,15 @@ export class V4PluginRuntime {
         adapter: this.adapter, repoId, deviceId: settings.vault, physicalRepositoryId: remote.id,
         destinationSecretId: settings.encryptionPassphraseSecretId, tokenSecretId: settings.githubTokenSecretId,
         key: keyring.journalKey, readSettings: () => load.call(this.plugin), assertOwner,
+        liveSettings: { settings: sanitizeV4SettingsForPersistence(settings) },
+        ...(settingsSaveCandidate ? { proposedSettings: { settings: sanitizeV4SettingsForPersistence(settingsSaveCandidate) } } : {}),
       })
       assertOwner()
       return root
-    } catch { throw new V4ReencryptionSyncFencedError() }
+    } catch (error) {
+      if (input.diagnostic && error instanceof V4InstalledActiveIndexRecoveryError) throw error
+      throw new V4ReencryptionSyncFencedError()
+    }
   }
 
   private async assertInstalledSyncRouteMayBeChecked(operation: V4SyncRequest["operation"]): Promise<void> {

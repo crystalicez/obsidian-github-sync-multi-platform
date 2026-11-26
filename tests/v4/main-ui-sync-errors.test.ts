@@ -103,6 +103,42 @@ function setupUi() {
 
 const tick = () => new Promise<void>(resolve => setImmediate(resolve))
 
+test("D522 installed Recovery command distinguishes active route from damaged active cache without mutation", async () => {
+  const ui = setupUi()
+  try {
+    await ui.plugin.onload()
+    const invoke = ui.commands.get("recover-staged-reencryption-key")
+    assert.ok(invoke)
+    const runtime = ui.plugin.v4Runtime as Record<string, any>
+    let stagedReads = 0
+    runtime.inspectInstalledStagedRecoveryFromDisk = async () => { stagedReads++; return null }
+    for (const [observation, message] of [
+      ["active-route-verified", /Active Destination Index route verified/],
+      ["active-index-needs-manual-recovery", /do not rebuild from the old migration snapshot/],
+      ["active-route-unverified", /Active Destination route could not be verified/],
+    ] as const) {
+      runtime.inspectInstalledActiveRouteFromDisk = async () => observation
+      Notice.messages.length = 0
+      invoke()
+      await tick()
+      assert.equal(Notice.messages.length, 1)
+      assert.match(Notice.messages[0]!, message)
+      assert.equal(stagedReads, 0)
+      assert.deepEqual(ui.attempts, [])
+    }
+    runtime.inspectInstalledActiveRouteFromDisk = async () => "not-present"
+    Notice.messages.length = 0
+    invoke()
+    await tick()
+    assert.equal(stagedReads, 1)
+    assert.match(Notice.messages.at(-1)!, /Staged recovery could not be verified/)
+    assert.deepEqual(ui.attempts, [])
+  } finally {
+    ui.cleanup()
+    Notice.messages.length = 0
+  }
+})
+
 test("D278 read-only Complete Recovery command never starts after unload and keeps results non-authorizing", async () => {
   const ui = setupUi()
   Notice.messages.length = 0

@@ -178,7 +178,7 @@ export async function writeV4InstalledDestinationSettings(input: {
     if (!identity.destinationRepoId.startsWith(prefix) || identity.destinationRepoId === identity.sourceRepoId) throw Error("Foreign Cutover destination.")
     const target = settingsData({ ...original.wrapper, settings: { ...original.settings,
       githubBranch: identity.destinationRepoId.slice(prefix.length),
-      encryptionPassphraseSecretId: staged.id, pbkdf2Iterations: input.destinationIterations,
+      encryptionPassphraseSecretId: staged.id, newVaultKdfIterations: input.destinationIterations,
     } })
     const indexes = await indexDigests(adapter, identity)
     const intent: Intent = { schemaVersion: 1, phase: "installed-destination-settings-intent-fence-held",

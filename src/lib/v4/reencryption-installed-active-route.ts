@@ -8,6 +8,13 @@ import { planV4ReencryptionSeparatedRoots } from "./reencryption-separated-selec
 import { V4_REENCRYPTION_SYNC_FENCE_ROOT } from "./reencryption-sync-fence"
 
 export const V4_INSTALLED_ACTIVE_ROUTE_PATH = V4_REENCRYPTION_RUNTIME_ROUTE_ROOT + "/active-destination.json"
+export class V4InstalledActiveIndexRecoveryError extends Error {
+  constructor() {
+    super("Active Destination Index is missing or inconsistent; preserve the cache and use Manual Recovery.")
+    this.name = "V4InstalledActiveIndexRecoveryError"
+  }
+}
+export type V4InstalledActiveRouteObservation = "not-present" | "active-route-verified" | "active-index-needs-manual-recovery" | "active-route-unverified"
 const MAX = 64 * 1024
 const RUN = /^[A-Za-z0-9_-]{8,128}$/u
 const SHA = /^[a-f0-9]{40}$/u
@@ -17,7 +24,7 @@ const context = (repoId: string) => ({ kind: "journal" as const, aad: "installed
 const fencePath = V4_REENCRYPTION_SYNC_FENCE_ROOT + "/active.json"
 
 interface Route {
-  schemaVersion: 1
+  schemaVersion: 1 | 2
   phase: "installed-destination-index-active"
   runId: string
   sourceRepoId: string
@@ -47,6 +54,8 @@ interface Scope {
   key: Uint8Array
   readSettings: () => Promise<unknown>
   assertOwner: () => void
+  proposedSettings?: unknown
+  liveSettings?: unknown
 }
 async function read(adapter: V4LocalIndexAdapter, path: string): Promise<string> {
   const stat = await adapter.stat?.(path)
@@ -55,8 +64,30 @@ async function read(adapter: V4LocalIndexAdapter, path: string): Promise<string>
   if (!fitsV4LocalJsonSizeLimit(text, MAX)) throw Error("Invalid active route size.")
   return text
 }
-async function settingsDigest(scope: Scope): Promise<string> {
-  const data = JSON.stringify(await scope.readSettings())
+// Only operational/UI preferences may change; unknown keys stay bound.
+const mutablePreferences = new Set([
+  "syncEnabled", "syncOnStartup", "syncOnLocalChange", "scheduledSyncEnabled",
+  "scheduledSyncIntervalSeconds", "statusBarStatusEnabled", "consoleLoggingEnabled",
+  "clipboardReadTip", "lastSyncTime",
+])
+function record(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    && (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null)
+}
+function canonicalFields(value: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(Object.entries(value).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0))
+}
+export function protectedV4InstalledSettings(value: unknown): string {
+  if (!record(value) || !record(value["settings"])) throw Error("Invalid active route Settings.")
+  const serialized = JSON.stringify(value)
+  if (!fitsV4LocalJsonSizeLimit(serialized, 256 * 1024)) throw Error("Invalid active route Settings size.")
+  return JSON.stringify(canonicalFields({ ...value, settings: canonicalFields(Object.fromEntries(
+    Object.entries(value["settings"]).filter(([k]) => !mutablePreferences.has(k)),
+  )) }))
+}
+async function settingsDigest(scope: Scope, version: 1 | 2): Promise<string> {
+  const raw = await scope.readSettings()
+  const data = version === 2 ? protectedV4InstalledSettings(raw) : JSON.stringify(raw)
   if (typeof data !== "string" || !fitsV4LocalJsonSizeLimit(data, 256 * 1024)) throw Error("Invalid active route Settings.")
   return digest(data)
 }
@@ -66,7 +97,7 @@ async function decode(scope: Scope, text: string): Promise<Route> {
   const bytes = await decryptV4Payload(scope.key, fromBase64Url(envelope.ciphertext), context(scope.repoId))
   try {
     const r = JSON.parse(bytesToUtf8(bytes)) as Route
-    if (r.schemaVersion !== 1 || r.phase !== "installed-destination-index-active" || !RUN.test(r.runId)
+    if ((r.schemaVersion !== 1 && r.schemaVersion !== 2) || r.phase !== "installed-destination-index-active" || !RUN.test(r.runId)
       || typeof r.sourceRepoId !== "string" || r.sourceRepoId === r.destinationRepoId
       || r.sourceRepoId.split("#")[0] !== scope.repoId.split("#")[0]
       || r.destinationRepoId !== scope.repoId || r.deviceId !== scope.deviceId
@@ -102,18 +133,22 @@ async function verifyLocal(scope: Scope, route: Route, initial: boolean): Promis
     || await adapter.exists(V4_RUNTIME_INDEX_ROOT + "-rekey-cutover-candidate-" + route.runId)
     || await digest(await read(adapter, fencePath)) !== route.fenceSha256
     || await digest(await read(adapter, V4_INSTALLED_CUTOVER_INTENT_PATH)) !== route.intentSha256
-    || await settingsDigest(scope) !== route.settingsSha256) throw Error("Active route evidence changed.")
+    || await settingsDigest(scope, route.schemaVersion) !== route.settingsSha256
+    || (route.schemaVersion === 2 && scope.liveSettings !== undefined
+      && await digest(protectedV4InstalledSettings(scope.liveSettings)) !== route.settingsSha256)
+    || (scope.proposedSettings !== undefined && (route.schemaVersion !== 2
+      || await digest(protectedV4InstalledSettings(scope.proposedSettings)) !== route.settingsSha256))) throw Error("Active route evidence changed.")
   const source = await loadV4LocalIndex(adapter, roots.sourceIndexRoot)
-  const shadow = await loadV4LocalIndex(adapter, roots.shadowIndexRoot)
   if (source.repoId !== route.sourceRepoId || source.deviceId !== scope.deviceId || source.remoteCommitSha !== route.sourceCommitSha
-    || await digest(JSON.stringify(source)) !== route.sourceIndexSha256
-    || shadow.repoId !== scope.repoId || shadow.deviceId !== scope.deviceId || shadow.mode !== "encrypted"
+    || await digest(JSON.stringify(source)) !== route.sourceIndexSha256) throw Error("Historical Source Index changed.")
+  const shadow = await loadV4LocalIndex(adapter, roots.shadowIndexRoot).catch(() => { throw new V4InstalledActiveIndexRecoveryError() })
+  if (shadow.repoId !== scope.repoId || shadow.deviceId !== scope.deviceId || shadow.mode !== "encrypted"
     || shadow.pathLayout !== "opaque-stable-v1" || !shadow.remoteCommitSha || !SHA.test(shadow.remoteCommitSha)
     || !isV4LocalIndexCacheComplete(shadow) || shadow.epoch < route.initialEpoch
     || (shadow.epoch === route.initialEpoch && shadow.generation < route.initialGeneration)
     || (shadow.remoteCommitSha === route.destinationCommitSha && await remoteRecordsDigest(shadow) !== route.initialRemoteRecordsSha256)
     || (initial && (shadow.remoteCommitSha !== route.destinationCommitSha || await digest(JSON.stringify(shadow)) !== route.initialShadowSha256))) {
-    throw Error("Active route Index identity or state changed.")
+    throw new V4InstalledActiveIndexRecoveryError()
   }
   scope.assertOwner()
   return roots.shadowIndexRoot
@@ -136,7 +171,7 @@ export async function activateV4InstalledDestinationIndex(input: Scope & {
   const source = await loadV4LocalIndex(adapter, roots.sourceIndexRoot)
   const shadow = await loadV4LocalIndex(adapter, roots.shadowIndexRoot)
   const route: Route = {
-    schemaVersion: 1, phase: "installed-destination-index-active", runId: identity.runId,
+    schemaVersion: 2, phase: "installed-destination-index-active", runId: identity.runId,
     sourceRepoId: identity.sourceRepoId, destinationRepoId: identity.destinationRepoId,
     deviceId: identity.deviceId, physicalRepositoryId: identity.physicalRepositoryId,
     destinationSecretId: input.destinationSecretId, tokenSecretId: input.tokenSecretId,
@@ -144,7 +179,7 @@ export async function activateV4InstalledDestinationIndex(input: Scope & {
     sourceIndexSha256: await digest(JSON.stringify(source)), initialShadowSha256: await digest(JSON.stringify(shadow)),
     initialRemoteRecordsSha256: await remoteRecordsDigest(shadow),
     initialEpoch: shadow.epoch, initialGeneration: shadow.generation,
-    settingsSha256: await settingsDigest(input), intentSha256: await digest(await read(adapter, V4_INSTALLED_CUTOVER_INTENT_PATH)),
+    settingsSha256: await settingsDigest(input, 2), intentSha256: await digest(await read(adapter, V4_INSTALLED_CUTOVER_INTENT_PATH)),
     fenceSha256: await digest(await read(adapter, fencePath)),
   }
   if (await adapter.exists(V4_INSTALLED_ACTIVE_ROUTE_PATH)) throw Error("Active route already committed.")
@@ -188,7 +223,8 @@ export async function resolveV4InstalledActiveIndexRoot(input: Scope): Promise<s
   if (await read(input.adapter, roots.selectorPath) !== text) throw Error("Active selector differs.")
   const root = await verifyLocal(input, route, false)
   if (await read(input.adapter, V4_INSTALLED_ACTIVE_ROUTE_PATH) !== text
-    || await read(input.adapter, roots.selectorPath) !== text) throw Error("Active route changed.")
+    || await read(input.adapter, roots.selectorPath) !== text
+    || await settingsDigest(input, route.schemaVersion) !== route.settingsSha256) throw Error("Active route changed.")
   input.assertOwner()
   return root
 }

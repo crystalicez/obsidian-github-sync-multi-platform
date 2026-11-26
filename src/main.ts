@@ -405,6 +405,16 @@ export default class FastSync extends Plugin {
       if (this.recoveryReadOnlyEpoch === epoch) this.recoveryReadOnlyCommandInProgress = false
     }
     try {
+      const active = await runtime.inspectInstalledActiveRouteFromDisk()
+      if (!current()) return
+      if (active !== "not-present") {
+        new Notice(active === "active-route-verified"
+          ? "GitHub Sync: Active Destination Index route verified. Use ordinary Sync to check for changes. This inspection did not modify files, Settings or keys."
+          : active === "active-index-needs-manual-recovery"
+            ? "GitHub Sync: Active Destination Index is missing or inconsistent. Preserve both Indexes, recovery files and keys; do not rebuild from the old migration snapshot. Manual Recovery is required."
+            : "GitHub Sync: Active Destination route could not be verified. Keep both keys and all recovery files. Review the saved connection and use Manual Recovery.", 12000)
+        return
+      }
       new Notice("GitHub Sync: Checking staged Re-encryption recovery. Sync stays paused.", 8000)
       const inspected = await runtime.inspectInstalledStagedRecoveryFromDisk()
       if (!current()) return
@@ -657,7 +667,7 @@ export default class FastSync extends Plugin {
       if (this.v4Runtime !== settingsRuntime) {
         throw new Error("Re-encryption Settings runtime changed; Manual Recovery required.")
       }
-      await settingsRuntime?.assertReencryptionSettingsSaveAllowed?.()
+      await settingsRuntime?.assertReencryptionSettingsSaveAllowed?.(prepared)
     }
     const prepared = { ...nextSettings }
     if (!prepared.githubTokenSecretId || prepared.githubToken !== previous.githubToken) {

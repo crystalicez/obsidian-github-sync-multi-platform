@@ -7,6 +7,7 @@ import { setRequestUrlHandler } from "obsidian"
 
 import { fromBase64, sha256Hex, toBase64, toBase64Url, utf8ToBytes } from "../../src/lib/bytes"
 import { GitHubClient } from "../../src/lib/github-api"
+import FastSync from "../../src/main"
 import { V4PluginRuntime } from "../../src/lib/v4/runtime"
 import { V4_INSTALLED_ACTIVE_ROUTE_PATH } from "../../src/lib/v4/reencryption-installed-active-route"
 import { planV4ReencryptionSeparatedRoots } from "../../src/lib/v4/reencryption-separated-selector"
@@ -16,6 +17,7 @@ import { V4_REENCRYPTION_SYNC_FENCE_ROOT } from "../../src/lib/v4/reencryption-s
 import { planV4PluginPrivateWalLocation } from "../../src/lib/v4/reencryption-plugin-wal-location"
 import { verifyGitHubReencryptionForkSource, verifyGitHubReencryptionForkSourceWithTranscodeInventory } from "../../src/lib/v4/reencryption-trusted-loader"
 import { createEmptyV4LocalIndex, saveV4LocalIndex, loadV4LocalIndex } from "../../src/lib/v4/local-index"
+import { sanitizeV4SettingsForPersistence } from "../../src/lib/v4/secrets"
 import { deriveV4Keyring } from "../../src/lib/v4/crypto"
 import { inspectV4InstalledSettingsCutover, V4_INSTALLED_CUTOVER_INTENT_PATH } from "../../src/lib/v4/reencryption-installed-settings-cutover"
 import { discoverV4InstalledSecretIdentity, stageV4InstalledDestinationSecret, readV4InstalledDestinationSecret, installedSecretReceiptRoot } from "../../src/lib/v4/reencryption-installed-secret"
@@ -323,24 +325,25 @@ async function createInstalledVaultFixture(files: ReadonlyArray<{ path: string; 
     encryptionMode: "encrypted" as const,
     encryptionPassphrase: OLD_PASSPHRASE,
     encryptionPassphraseSecretId: "old-passphrase-secret-id",
-    pbkdf2Iterations: 600_000,
+    newVaultKdfIterations: 600_000,
     vault: "installed-desktop-device",
     ignorePathRegex: "",
     syncObsidianConfig: false,
     syncBookmarks: false,
     syncPlugins: false,
+    abortChangePercent: 100,
+    conflictPolicy: "copy" as const,
+    syncEnabled: true,
+    syncOnStartup: false,
+    syncOnLocalChange: false,
+    scheduledSyncEnabled: false,
+    scheduledSyncIntervalSeconds: 300,
+    statusBarStatusEnabled: true,
+    consoleLoggingEnabled: false,
+    clipboardReadTip: "",
+    lastSyncTime: 0,
   }
-  let persistedData: Record<string, unknown> = {
-    settings: {
-      githubOwner: OWNER,
-      githubRepo: REPO,
-      githubBranch: SOURCE_BRANCH,
-      encryptionMode: "encrypted",
-      githubTokenSecretId: "token-secret-id",
-      encryptionPassphraseSecretId: "old-passphrase-secret-id",
-      vault: "installed-desktop-device",
-    },
-  }
+  let persistedData: Record<string, unknown> = { settings: sanitizeV4SettingsForPersistence(settings) }
   const secrets = new Map<string, string>([[settings.githubTokenSecretId, settings.githubToken], [settings.encryptionPassphraseSecretId, settings.encryptionPassphrase]])
   const secretStorage = { getSecret: (id: string) => secrets.get(id) ?? null, setSecret: (id: string, value: string) => { secrets.set(id, value) } }
   const makeRuntime = () => {
@@ -352,7 +355,7 @@ async function createInstalledVaultFixture(files: ReadonlyArray<{ path: string; 
         secretStorage,
       },
       manifest: { id: PLUGIN_ID },
-      settings: { ...settings, abortChangePercent: 100, conflictPolicy: "local" },
+      settings: { ...settings, ...(persistedData.settings as Partial<typeof settings>) },
       githubClient: makeClientFactory()(SOURCE_BRANCH),
       settingsSaveGeneration: 0,
       isSyncInProgress: false,
@@ -680,7 +683,7 @@ test("D412 installed Runtime orchestrates Source -> Backup -> Staging -> Scratch
     assert.equal(written?.resumeSyncAuthorized, false)
     assert.deepEqual(vault.persistedData, { settings: { ...(beforeCutover.settings as object),
       githubBranch: destinationBranch, encryptionPassphraseSecretId: stagedId,
-      pbkdf2Iterations: 700_000,
+      newVaultKdfIterations: 700_000,
     } })
     assert.equal(runtime2.plugin.settings.githubBranch, SOURCE_BRANCH)
     assert.equal(vault.secrets.get(vault.settings.encryptionPassphraseSecretId), OLD_PASSPHRASE)
@@ -800,7 +803,15 @@ test("D412 installed Runtime orchestrates Source -> Backup -> Staging -> Scratch
     runtime2.plugin.settings.encryptionPassphrase = NEW_PASSPHRASE
     runtime2.plugin.githubClient = makeClientFactory()(destinationBranch)
     const activeText = await vault.adapter.read(activePath)
+    assert.equal(await runtime2.runtime.inspectInstalledActiveRouteFromDisk(), "active-route-verified")
+    const shadowHeaderPath = shadowRoot + "/index.json"
+    const shadowHeader = await vault.adapter.read(shadowHeaderPath)
+    await vault.adapter.write(shadowHeaderPath, "{")
+    assert.equal(await runtime2.runtime.inspectInstalledActiveRouteFromDisk(), "active-index-needs-manual-recovery")
+    assert.equal(await vault.adapter.read(shadowHeaderPath), "{")
+    await vault.adapter.write(shadowHeaderPath, shadowHeader)
     await vault.adapter.write(activePath, activeText.slice(0, -3) + 'AAA')
+    assert.equal(await runtime2.runtime.inspectInstalledActiveRouteFromDisk(), "active-route-unverified")
     await runtime2.runtime.manualSync()
     assert.equal(runtime2.runtime.progressSnapshot.lifecycle, "failed")
     assert.equal(server.refs.get(destinationBranch), destSha)
@@ -809,6 +820,38 @@ test("D412 installed Runtime orchestrates Source -> Backup -> Staging -> Scratch
     assert.equal(runtime2.runtime.progressSnapshot.lifecycle, "no-change", runtime2.runtime.progressSnapshot.errorMessage)
     assert.equal(server.refs.get(destinationBranch), destSha)
     await assert.rejects(() => runtime2!.runtime.assertReencryptionSettingsSaveAllowed())
+    // The existing Settings transaction may persist preferences, but not any
+    // credential, branch, scope or deletion/conflict-policy change.
+    const preferences = { ...runtime2.plugin.settings, syncOnStartup: true, scheduledSyncIntervalSeconds: 900, consoleLoggingEnabled: true }
+    const originalData = structuredClone(vault.persistedData)
+    runtime2.plugin.isSettingsSaveInProgress = () => true
+    const checkSave = (next: typeof preferences) => runtime2!.runtime.assertReencryptionSettingsSaveAllowed(next as never)
+    for (const change of [
+      { githubBranch: SOURCE_BRANCH }, { githubToken: "other" }, { githubTokenSecretId: "foreign-token" },
+      { encryptionPassphrase: OLD_PASSPHRASE }, { encryptionPassphraseSecretId: vault.settings.encryptionPassphraseSecretId },
+      { ignorePathRegex: ".*" }, { syncPlugins: true }, { conflictPolicy: "newer" }, { abortChangePercent: 0 },
+      { newVaultKdfIterations: 900000 }, { vault: "other-device" },
+    ]) await assert.rejects(() => checkSave({ ...preferences, ...change } as typeof preferences))
+    // Exercise the real FastSync.saveSettings transaction, not only its guard.
+    const plugin = Object.assign(runtime2.plugin, {
+      settingsSaveInProgress: false, settingsSaveAttemptGeneration: 0, secretStorageReadUnavailable: false,
+      persistData: FastSync.prototype.persistData,
+      initGitHubClient: () => {}, registerScheduledSync: () => {}, updateRibbonIcon: () => {},
+      createSecretId: () => "denied-candidate-id",
+    })
+    plugin.isSettingsSaveInProgress = () => plugin.settingsSaveInProgress
+    Object.defineProperty(plugin, "settingsSaveGeneration", { get: () => plugin.settingsSaveAttemptGeneration })
+    await assert.rejects(() => FastSync.prototype.saveSettings.call(plugin as unknown as FastSync, { ...preferences, githubBranch: SOURCE_BRANCH }))
+    assert.deepEqual(vault.persistedData, originalData)
+    await FastSync.prototype.saveSettings.call(plugin as unknown as FastSync, preferences)
+    assert.equal(plugin.settings.syncOnStartup, true)
+    assert.equal(plugin.settings.scheduledSyncIntervalSeconds, 900)
+    assert.equal(plugin.settingsSaveInProgress, false)
+    assert.notDeepEqual(vault.persistedData, originalData)
+    assert.equal(await vault.adapter.read(activePath), activeText)
+    assert.equal(await vault.adapter.read(selectorPath), activeText)
+    assert.equal(vault.secrets.get(stagedId), NEW_PASSPHRASE)
+    assert.equal(vault.secrets.get(vault.settings.encryptionPassphraseSecretId), OLD_PASSPHRASE)
     await runtime2.runtime.forcePush(true)
     assert.equal(runtime2.runtime.progressSnapshot.lifecycle, "failed")
     assert.equal(server.refs.get(destinationBranch), destSha)
@@ -840,6 +883,8 @@ test("D412 installed Runtime orchestrates Source -> Backup -> Staging -> Scratch
     await runtime2.runtime.manualSync()
     assert.equal(runtime2.runtime.progressSnapshot.lifecycle, "no-change", runtime2.runtime.progressSnapshot.errorMessage)
     assert.equal(server.refs.get(destinationBranch), nextDest)
+    assert.equal(await runtime2.runtime.inspectInstalledActiveRouteFromDisk(), "active-route-verified")
+    assert.equal(runtime2.plugin.settings.scheduledSyncIntervalSeconds, 900)
     assert.equal(await runtime2.runtime.fileIdForPath("Notes/สวัสดี.md"), verifiedDest.sourceRecords.find(r => r.path === "Notes/สวัสดี.md")?.fileId)
     assert.deepEqual(await loadV4LocalIndex(vault.adapter, sourceRoot), oldRoot)
     // Missing active marker does not authorize falling back to Source.

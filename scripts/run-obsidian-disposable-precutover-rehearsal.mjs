@@ -486,7 +486,7 @@ try {
     assert.equal(stagedSettings.sourceSecretMatches,true);
     destinationSettingsData=JSON.parse(await readFile(settingsPath,"utf8"));
     assert.deepEqual(destinationSettingsData,{...sourceSettingsData,settings:{...sourceSettingsData.settings,
-      githubBranch:destinationBranch,encryptionPassphraseSecretId:rehearsal.report.stagedSecret.destinationPassphraseSecretId,pbkdf2Iterations:600000}});
+      githubBranch:destinationBranch,encryptionPassphraseSecretId:rehearsal.report.stagedSecret.destinationPassphraseSecretId,newVaultKdfIterations:600000}});
     console.log(JSON.stringify({status:"NATIVE_DESTINATION_SETTINGS_WRITTEN_FENCED"}));
   }
   // Real Obsidian process restart.
