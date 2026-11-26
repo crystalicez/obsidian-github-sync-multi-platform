@@ -32,10 +32,12 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const staleClientMode = process.argv.includes("--stale-client");
 const secretMode = process.argv.includes("--stage-secret");
 const uiRecoveryMode = process.argv.includes("--recover-via-ui");
+const settingsCutoverMode = process.argv.includes("--stage-settings");
+assert.ok(!settingsCutoverMode || (secretMode && !staleClientMode), "--stage-settings requires single-Vault --stage-secret.");
 assert.ok(!uiRecoveryMode || (secretMode && !staleClientMode), "--recover-via-ui requires single-Vault --stage-secret.");
 const shadowMode = secretMode || process.argv.includes("--shadow-index");
-assert.ok(process.argv.slice(2).every(arg => arg === "--stale-client" || arg === "--shadow-index" || arg === "--stage-secret" || arg === "--recover-via-ui"),
-  "Only --stale-client, --shadow-index, --stage-secret and --recover-via-ui are supported; all writes must remain in approved disposable branches.");
+assert.ok(process.argv.slice(2).every(arg => arg === "--stale-client" || arg === "--shadow-index" || arg === "--stage-secret" || arg === "--recover-via-ui" || arg === "--stage-settings"),
+  "Only --stale-client, --shadow-index, --stage-secret, --recover-via-ui and --stage-settings are supported; all writes must remain in approved disposable branches.");
 
 const oldPassphrase = "d412-old-" + randomBytes(18).toString("base64url");
 const newPassphrase = "d412-new-" + randomBytes(18).toString("base64url");
@@ -459,6 +461,32 @@ try {
   assert.equal(destRemote.kind, "present");
   assert.equal(destRemote.sha, rehearsal.report.destinationCommitSha);
 
+  // Stage actual Settings in this disposable native Vault while keeping Sync fenced.
+  const settingsPath = path.join(vault, ".obsidian/plugins", pluginId, "data.json");
+  const sourceSettingsData = JSON.parse(await readFile(settingsPath, "utf8"));
+  const sourceSecretId = sourceSettingsData.settings.encryptionPassphraseSecretId;
+  let destinationSettingsData;
+  if (settingsCutoverMode) {
+    const stagedSettings = await evalInVault(`(async()=>{
+      const p=app.plugins.plugins[${JSON.stringify(pluginId)}];
+      const discovered=await p.v4Runtime.inspectInstalledStagedRecoveryFromDisk();
+      if(!discovered?.report.stagedSecretReverified)throw Error("Pre-Settings recovery not verified");
+      const report=await p.v4Runtime.stageInstalledDestinationSettingsFromDisk({
+        expectedLocatorDigest:discovered.locatorDigest,
+        acknowledgement:"accept-best-effort-power-loss-recovery-risk"
+      });
+      return {report,liveSource:p.settings.githubBranch===${JSON.stringify(sourceBranch)},
+        sourceSecretMatches:app.secretStorage.getSecret(p.settings.encryptionPassphraseSecretId)===${JSON.stringify(oldPassphrase)}};
+    })()`, 600000);
+    assert.equal(stagedSettings.report?.destinationSettingsWrittenFenced,true,"Native Settings staging failed at "+(stagedSettings.report?.failureStage??"unknown"));
+    assert.equal(stagedSettings.report.resumeSyncAuthorized,false);
+    assert.equal(stagedSettings.liveSource,true);
+    assert.equal(stagedSettings.sourceSecretMatches,true);
+    destinationSettingsData=JSON.parse(await readFile(settingsPath,"utf8"));
+    assert.deepEqual(destinationSettingsData,{...sourceSettingsData,settings:{...sourceSettingsData.settings,
+      githubBranch:destinationBranch,encryptionPassphraseSecretId:rehearsal.report.stagedSecret.destinationPassphraseSecretId,pbkdf2Iterations:600000}});
+    console.log(JSON.stringify({status:"NATIVE_DESTINATION_SETTINGS_WRITTEN_FENCED"}));
+  }
   // Real Obsidian process restart.
   terminate();
   await sleep(900);
@@ -517,7 +545,9 @@ try {
         if(!recovered)throw Error("Installed secret restoration unavailable");
       }
     }
-    // Open Wizard UI, verifySource fails closed for pending recovery, and click Inspect Recovery button.
+    // Open Wizard UI for the established pre-Settings journey only.
+    let errorText="",modalText="",wizardBlockedNext=false;
+    if(!${JSON.stringify(settingsCutoverMode)}){
     p.openReencryptionWizard();
     await new Promise(r=>setTimeout(r,200));
     const buttons=[...document.querySelectorAll(".github-sync-rekey button")];
@@ -527,7 +557,7 @@ try {
       await new Promise(r=>setTimeout(r,150));
       if(document.querySelector(".github-sync-rekey__error"))break;
     }
-    const errorText=document.querySelector(".github-sync-rekey__error")?.textContent??"";
+    errorText=document.querySelector(".github-sync-rekey__error")?.textContent??"";
     const inspectBtn=[...document.querySelectorAll(".github-sync-rekey button")].find(b=>b.textContent?.includes("Inspect installed Recovery"));
     inspectBtn?.click();
     for(let i=0;i<30;i++){
@@ -535,10 +565,12 @@ try {
       const text=document.querySelector(".github-sync-rekey")?.textContent??"";
       if(text.includes("unavailable or inconclusive")||text.includes("Authenticated Re-encryption Recovery"))break;
     }
-    const modalText=document.querySelector(".github-sync-rekey")?.textContent??"";
-    const leakedSecret=modalText.includes(p.settings.githubToken)
-      ||modalText.includes(p.settings.encryptionPassphrase)
-      ||modalText.includes(${JSON.stringify(newPassphrase)});
+    modalText=document.querySelector(".github-sync-rekey")?.textContent??"";
+    wizardBlockedNext=!![...document.querySelectorAll(".github-sync-rekey__navigation button")].find(b=>b.textContent==="Next"&&b.disabled);
+    }
+    const leakedSecret=[p.settings.githubToken,p.settings.encryptionPassphrase,${JSON.stringify(newPassphrase)}].filter(Boolean).some(v=>modalText.includes(v));
+    if(${JSON.stringify(settingsCutoverMode)})await p.v4Runtime.manualSync();
+    const manualSyncDenied=p.v4Runtime.progressSnapshot.lifecycle==="failed";
     return {
       settingsFenceDenied,
       recovered,
@@ -549,10 +581,11 @@ try {
       restoredViaUi,
       stagedSecretPresent: ${JSON.stringify(secretMode)} ? !!app.secretStorage.getSecret(${JSON.stringify(rehearsal.report.stagedSecret?.destinationPassphraseSecretId ?? "")}) : null,
       stagedSecretMatches: ${JSON.stringify(secretMode)} ? app.secretStorage.getSecret(${JSON.stringify(rehearsal.report.stagedSecret?.destinationPassphraseSecretId ?? "")}) === ${JSON.stringify(newPassphrase)} : null,
-      sourceSecretMatches: app.secretStorage.getSecret(p.settings.encryptionPassphraseSecretId) === ${JSON.stringify(oldPassphrase)},
+      sourceSecretMatches: app.secretStorage.getSecret(${JSON.stringify(sourceSecretId)}) === ${JSON.stringify(oldPassphrase)},
       tokenSecretMatches: app.secretStorage.getSecret(p.settings.githubTokenSecretId) === p.settings.githubToken,
       errorText,
-      wizardBlockedNext:!![...document.querySelectorAll(".github-sync-rekey__navigation button")].find(b=>b.textContent==="Next"&&b.disabled),
+      wizardBlockedNext, manualSyncDenied,
+      branchDestination:p.settings.githubBranch===${JSON.stringify(destinationBranch)},
       wizardInspectedInconclusiveBeforeCutover:modalText.includes("Installed Recovery inspection unavailable or inconclusive"),
       leakedSecret,
       branchStillSource:p.settings.githubBranch===${JSON.stringify(sourceBranch)}
@@ -592,11 +625,21 @@ try {
   assert.equal(postRestart.recovered.localCutoverAuthorized, false);
   assert.equal(postRestart.recovered.resumeSyncAuthorized, false);
   assert.equal(postRestart.recovered.oldPassphraseCleanupAuthorized, false);
-  assert.match(postRestart.errorText, /Local Re-encryption Recovery may be pending/u);
-  assert.equal(postRestart.wizardBlockedNext, true);
-  assert.equal(postRestart.wizardInspectedInconclusiveBeforeCutover, true);
+  if(settingsCutoverMode){
+    assert.equal(postRestart.recovered.settingsCutoverObservation,"destination-settings-observed-fenced");
+    assert.equal(postRestart.branchDestination,true);
+    assert.equal(postRestart.manualSyncDenied,true);
+    assert.deepEqual(JSON.parse(await readFile(settingsPath,"utf8")),destinationSettingsData);
+    assert.equal((await readWithRetry(refs[0])).sha,rehearsal.report.pinnedSourceCommitSha);
+    assert.equal((await readWithRetry(refs[1])).sha,rehearsal.report.pinnedSourceCommitSha);
+    assert.equal((await readWithRetry(refs[2])).sha,rehearsal.report.destinationCommitSha);
+  }else{
+    assert.match(postRestart.errorText, /Local Re-encryption Recovery may be pending/u);
+    assert.equal(postRestart.wizardBlockedNext, true);
+    assert.equal(postRestart.wizardInspectedInconclusiveBeforeCutover, true);
+    assert.equal(postRestart.branchStillSource, true);
+  }
   assert.equal(postRestart.leakedSecret, false);
-  assert.equal(postRestart.branchStillSource, true);
   assert.equal(uiExceptions.length, 0);
 
   if (staleClientMode) {
@@ -755,7 +798,8 @@ try {
   console.log(JSON.stringify({
     status: staleClientMode
       ? "D413_LIVE_OBSIDIAN_STALE_SOURCE_ISOLATION_PASS"
-      : "D412_LIVE_OBSIDIAN_PRE_CUTOVER_PASS",
+      : settingsCutoverMode ? "D520_LIVE_OBSIDIAN_SETTINGS_RESTART_PASS" : "D412_LIVE_OBSIDIAN_PRE_CUTOVER_PASS",
+    ...(settingsCutoverMode ? {settingsCutoverObservation:postRestart.recovered.settingsCutoverObservation,manualSyncDenied:postRestart.manualSyncDenied} : {}),
     ...(staleClientMode ? { staleClientReport } : {}),
     repoId: target.id,
     pinnedSourceCommitSha: rehearsal.report.pinnedSourceCommitSha,

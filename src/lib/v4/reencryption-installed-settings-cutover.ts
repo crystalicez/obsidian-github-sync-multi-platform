@@ -2,8 +2,9 @@ import { bytesToUtf8, fromBase64Url, sha256Hex, toBase64Url, utf8ToBytes } from 
 import { decryptV4Payload, encryptV4Payload } from "./crypto"
 import { assertV4Pbkdf2Iterations, V4_MIN_NEW_PBKDF2_ITERATIONS } from "./kdf-policy"
 import { fitsV4LocalJsonSizeLimit, loadV4LocalIndex, type V4LocalIndexAdapter } from "./local-index"
-import { inspectV4InstalledDestinationSecret, type V4InstalledSecretIdentity, type V4InstalledSecretOwner } from "./reencryption-installed-secret"
+import { discoverV4InstalledSecretIdentity, inspectV4InstalledDestinationSecret, type V4InstalledSecretIdentity, type V4InstalledSecretOwner } from "./reencryption-installed-secret"
 import { V4_RUNTIME_INDEX_ROOT, V4_REENCRYPTION_RUNTIME_ROUTE_ROOT, V4_REENCRYPTION_RUNTIME_ROUTE_PATH } from "./reencryption-index-root"
+import { V4_REENCRYPTION_SYNC_FENCE_ROOT } from "./reencryption-sync-fence"
 import { planV4ReencryptionSeparatedRoots } from "./reencryption-separated-selector"
 
 export const V4_INSTALLED_CUTOVER_INTENT_PATH = V4_REENCRYPTION_RUNTIME_ROUTE_ROOT + "/installed-settings-intent.json"
@@ -86,23 +87,71 @@ async function decodeIntent(text: string, key: Uint8Array, identity: V4Installed
   } finally { bytes.fill(0) }
 }
 
+/** Untrusted hints only. Restrict the historical Source to the current physical
+ * repository and device before a client or secret lookup can be attempted. */
+export async function discoverV4InstalledSettingsIntent(input: {
+  adapter: V4LocalIndexAdapter; currentRepoId: string; deviceId: string
+}): Promise<{ identity: V4InstalledSecretIdentity; sourceSecretId: string; intentText: string }> {
+  const { adapter, currentRepoId, deviceId } = input
+  const path = V4_REENCRYPTION_SYNC_FENCE_ROOT + "/active.json"
+  const stat = await adapter.stat?.(path)
+  if (stat && (!Number.isSafeInteger(stat.size) || stat.size < 1 || stat.size > MAX)) throw Error("Invalid Cutover fence size.")
+  const fence = await adapter.read(path)
+  if (!fitsV4LocalJsonSizeLimit(fence, MAX)) throw Error("Invalid Cutover fence size.")
+  const raw = JSON.parse(fence) as { sourceRepoId?: unknown; destinationRepoId?: unknown }
+  if (typeof raw.sourceRepoId !== "string" || typeof raw.destinationRepoId !== "string"
+    || !currentRepoId.includes("#") || !raw.sourceRepoId.startsWith(currentRepoId.split("#")[0] + "#")
+    || (currentRepoId !== raw.sourceRepoId && currentRepoId !== raw.destinationRepoId)) throw Error("Foreign Cutover fence.")
+  const identity = await discoverV4InstalledSecretIdentity({ adapter, sourceRepoId: raw.sourceRepoId, deviceId })
+  const intentText = await readIntent(adapter)
+  const hint = JSON.parse(intentText) as { runId?: unknown; sourceSecretId?: unknown; ciphertext?: unknown }
+  if (hint.runId !== identity.runId || typeof hint.sourceSecretId !== "string"
+    || hint.sourceSecretId.length < 1 || hint.sourceSecretId.length > 256
+    || typeof hint.ciphertext !== "string"
+    || JSON.stringify({ runId: identity.runId, sourceSecretId: hint.sourceSecretId, ciphertext: hint.ciphertext }) !== intentText
+    || await adapter.read(path) !== fence || await readIntent(adapter) !== intentText) throw Error("Invalid Cutover intent hint.")
+  return Object.freeze({ identity, sourceSecretId: hint.sourceSecretId, intentText })
+}
+
+export interface V4InstalledSettingsRestartBinding {
+  readonly intentText: string
+  readonly currentRepoId: string
+  readonly currentSecretId: string
+  readonly tokenSecretId: string
+  readonly io: Pick<V4InstalledSettingsIo, "read">
+}
+
 export type V4InstalledSettingsCutoverObservation = "source-settings-intent-pending" | "destination-settings-observed-fenced" | "manual-recovery-required"
 
 /** Authenticated disk observation under a caller-owned recovery key/lease.
  * Still never permits Sync, old-key cleanup or rollback. */
 export async function inspectV4InstalledSettingsCutover(input: {
   adapter: V4LocalIndexAdapter; identity: V4InstalledSecretIdentity; key: Uint8Array; sourceSecretId: string; io: Pick<V4InstalledSettingsIo, "read">
+  binding?: V4InstalledSettingsRestartBinding | undefined; stagedId?: string | undefined
 }): Promise<V4InstalledSettingsCutoverObservation> {
   try {
     const text = await readIntent(input.adapter)
+    if (input.binding && text !== input.binding.intentText) return "manual-recovery-required"
     const intent = await decodeIntent(text, input.key, input.identity, input.sourceSecretId)
+    if (input.binding && (intent.destinationSecretId !== input.stagedId || intent.tokenSecretId !== input.binding.tokenSecretId)) return "manual-recovery-required"
     const idx = await indexDigests(input.adapter, input.identity)
     if (Object.entries(idx).some(([k, v]) => intent[k as keyof Intent] !== v)) return "manual-recovery-required"
     const data = settingsData(await input.io.read())
     const hash = await digest(data.serialized)
     if (await readIntent(input.adapter) !== text || settingsData(await input.io.read()).serialized !== data.serialized) return "manual-recovery-required"
-    return hash === intent.sourceDataSha256 ? "source-settings-intent-pending"
-      : hash === intent.destinationDataSha256 ? "destination-settings-observed-fenced" : "manual-recovery-required"
+    const source = hash === intent.sourceDataSha256
+    const destination = hash === intent.destinationDataSha256
+    if (input.binding) {
+      const { currentRepoId, currentSecretId, tokenSecretId } = input.binding
+      const s = data.settings
+      if (s["githubOwner"] + "/" + s["githubRepo"] + "#" + s["githubBranch"] !== currentRepoId
+        || s["encryptionPassphraseSecretId"] !== currentSecretId || s["githubTokenSecretId"] !== tokenSecretId
+        || s["vault"] !== input.identity.deviceId || s["encryptionMode"] !== "encrypted"
+        || !(source && currentRepoId === input.identity.sourceRepoId && currentSecretId === intent.sourceSecretId
+          || destination && currentRepoId === input.identity.destinationRepoId && currentSecretId === intent.destinationSecretId)) return "manual-recovery-required"
+    }
+    return source ? "source-settings-intent-pending"
+      : destination ? "destination-settings-observed-fenced" : "manual-recovery-required"
   } catch { return "manual-recovery-required" }
 }
 

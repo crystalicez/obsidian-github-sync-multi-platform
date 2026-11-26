@@ -7,7 +7,7 @@ import { readImmutableGitFile } from "./immutable-git-read"
 import { assertV4Pbkdf2Iterations, V4_MIN_NEW_PBKDF2_ITERATIONS } from "./kdf-policy"
 import type { V4LocalIndexAdapter } from "./local-index"
 import { stageV4InstalledDestinationSecret, inspectV4InstalledDestinationSecret, restoreV4InstalledMissingDestinationSecret, type V4InstalledSecretOwner, type V4InstalledSecretReport } from "./reencryption-installed-secret"
-import { captureV4InstalledCutoverSourceSettings, writeV4InstalledDestinationSettings, type V4InstalledSettingsIo } from "./reencryption-installed-settings-cutover"
+import { captureV4InstalledCutoverSourceSettings, inspectV4InstalledSettingsCutover, writeV4InstalledDestinationSettings, type V4InstalledSettingsIo, type V4InstalledSettingsRestartBinding, type V4InstalledSettingsCutoverObservation } from "./reencryption-installed-settings-cutover"
 import { stageV4InstalledReencryptionShadow, verifyV4InstalledReencryptionShadow, type V4InstalledShadowReport } from "./reencryption-installed-shadow"
 import { expectedV4PathLayout, V4_CONFIG_PATH, type V4RemoteConfig } from "./protocol-types"
 import { inspectV4BestEffortWalRecovery } from "./reencryption-best-effort-wal-recovery"
@@ -153,6 +153,7 @@ export interface V4InstalledPreCutoverRecoveryInput {
   /** Optional activation-readiness scan, never used for missing-key repair. */
   readonly createInitiatorReader?: ((assertLease: () => Promise<void>) => V4InitiatorLocalReader) | undefined
   readonly stageDestinationSettings?: V4InstalledSettingsIo | undefined
+  readonly restartSettingsBinding?: V4InstalledSettingsRestartBinding | undefined
   readonly openReadOnlyWal: () => Promise<V4InstalledRehearsalReadOnlyWal>
   readonly createGitHubClient: (branch: string) => GitHubClient
   readonly assertOwnerStillValid?: (() => void) | undefined
@@ -172,6 +173,7 @@ export interface V4InstalledPreCutoverRecoveryReport {
   readonly physicalParityReverified?: true | undefined
   readonly sourceRefReverified?: true | undefined
   readonly destinationSettingsWrittenFenced?: true | undefined
+  readonly settingsCutoverObservation?: Exclude<V4InstalledSettingsCutoverObservation, "manual-recovery-required"> | undefined
   readonly failureStage?: "fence" | "backup" | "wal" | "destination" | "secret" | "shadow" | "physical-parity" | "source-ref" | "settings-write" | "final-readback" | undefined
   readonly verifiedFileCount: number
   readonly verifiedPlaintextBytes: string
@@ -759,6 +761,7 @@ export async function inspectV4InstalledPreCutoverRecoveryAfterRestart(
     || (input.restoreMissingSecret && (!input.secretOwner || !input.shadow || !input.newPassphrase || input.createInitiatorReader))
     || (input.createInitiatorReader && (!input.secretOwner || !input.shadow || !input.inspectFenceAndNoPartialCutover))
     || (input.stageDestinationSettings && (!input.createInitiatorReader || input.restoreMissingSecret))
+    || (input.restartSettingsBinding && (!input.secretOwner || !input.shadow || !input.inspectFenceAndNoPartialCutover || input.createInitiatorReader || input.stageDestinationSettings))
     || !Number.isSafeInteger(input.expectedFinalWalGeneration) || input.expectedFinalWalGeneration < 1) {
     return manualRecoveryReport()
   }
@@ -772,6 +775,7 @@ export async function inspectV4InstalledPreCutoverRecoveryAfterRestart(
   let failureStage: V4InstalledPreCutoverRecoveryReport["failureStage"] = "fence"
   const restore = input.restoreMissingSecret === true
   let missing = false
+  let settingsCutoverObservation: Exclude<V4InstalledSettingsCutoverObservation, "manual-recovery-required"> | undefined
   const fail = () => manualRecoveryReport(failureStage, restore, missing)
 
   try {
@@ -788,7 +792,7 @@ export async function inspectV4InstalledPreCutoverRecoveryAfterRestart(
     if (!settingsDenied) return fail()
 
     const route = await input.inspectRoute()
-    if (route.observation !== "fenced-before-routing-intent" || route.localCutoverAuthorized !== false) {
+    if ((!input.restartSettingsBinding && route.observation !== "fenced-before-routing-intent") || route.localCutoverAuthorized !== false) {
       return fail()
     }
     if (input.inspectFenceAndNoPartialCutover && !(await input.inspectFenceAndNoPartialCutover())) {
@@ -964,6 +968,20 @@ export async function inspectV4InstalledPreCutoverRecoveryAfterRestart(
       },
     } : undefined
     const stagedSecret = secretInput ? await inspectV4InstalledDestinationSecret(secretInput) : undefined
+    const assertRestartSettings = async () => {
+      if (!input.restartSettingsBinding) return
+      if (!secretInput || !stagedSecret) throw Error("Missing authenticated Settings intent custody.")
+      const observation = await inspectV4InstalledSettingsCutover({
+        adapter: secretInput.adapter, identity: secretInput.identity, key: secretInput.key,
+        sourceSecretId: secretInput.owner.sourcePassphraseSecretId, io: input.restartSettingsBinding.io,
+        binding: input.restartSettingsBinding, stagedId: stagedSecret.id,
+      })
+      if (observation === "manual-recovery-required" || (settingsCutoverObservation && observation !== settingsCutoverObservation)) throw Error("Settings intent changed or failed authentication.")
+      settingsCutoverObservation = observation
+    }
+    failureStage = "settings-write"
+    await assertRestartSettings()
+    failureStage = "secret"
     missing = stagedSecret?.passphrase === null
     if (missing && !restore) return fail()
     if (restore && (!missing || !secretInput || !stagedSecret)) return fail()
@@ -1035,6 +1053,7 @@ export async function inspectV4InstalledPreCutoverRecoveryAfterRestart(
         const [backup, destination] = await Promise.all([backupClient.getGitRef(), destinationClient.getGitRef()])
         if (backup.sha !== input.pinnedSourceCommitSha || destination.sha !== input.destinationCommitSha) throw Error("Recovery refs changed.")
         await readOnlyJournal.assertHealthySnapshot(input.expectedFinalWalGeneration)
+        await assertRestartSettings()
         input.assertOwnerStillValid?.()
       }
       if (restore) {
@@ -1118,6 +1137,7 @@ export async function inspectV4InstalledPreCutoverRecoveryAfterRestart(
       ...(restore ? { stagedSecretRestored: true as const } : {}),
       ...(input.createInitiatorReader ? { physicalParityReverified: true as const, sourceRefReverified: true as const } : {}),
       ...(input.stageDestinationSettings ? { destinationSettingsWrittenFenced: true as const } : {}),
+      ...(settingsCutoverObservation ? { settingsCutoverObservation } : {}),
       verifiedFileCount: destInventory.verifiedSource.verifiedFileCount,
       verifiedPlaintextBytes: destInventory.verifiedSource.totalVerifiedPlaintextBytes,
       cutoverAuthorized: false,

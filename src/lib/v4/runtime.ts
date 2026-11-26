@@ -55,11 +55,12 @@ import { V4CancelledError, throwIfV4Aborted } from "./cancellation"
 import { V4PublicationRaceError, isV4PublicationRaceError } from "./publication-race"
 import { assertV4SpeculativeConfigStillAbsent, guardV4SpeculativeConfigGithub } from "./speculative-config-guard"
 
+import { discoverV4InstalledSettingsIntent, V4_INSTALLED_CUTOVER_INTENT_PATH } from "./reencryption-installed-settings-cutover"
 import { discoverV4InstalledSecretIdentity, installedSecretReceiptRoot } from "./reencryption-installed-secret"
 import { V4_RUNTIME_INDEX_ROOT } from "./reencryption-index-root"
 import { inspectV4ReencryptionColdStartIndexRoute, type V4ReencryptionColdStartRouteReport } from "./reencryption-runtime-index-route"
 import { decodeV4ReencryptionCutoverCandidateManifest } from "./reencryption-cutover-candidate-manifest"
-import { V4_REENCRYPTION_RUNTIME_ROUTE_PATH } from "./reencryption-index-root"
+import { V4_REENCRYPTION_RUNTIME_ROUTE_ROOT, V4_REENCRYPTION_RUNTIME_ROUTE_PATH } from "./reencryption-index-root"
 import { planV4ReencryptionSeparatedRoots } from "./reencryption-separated-selector"
 import { V4_REENCRYPTION_SYNC_FENCE_ROOT } from "./reencryption-sync-fence"
 import { inspectV4ReencryptionColdStartJournalKey, type V4ReencryptionColdStartJournalReport, type V4ReencryptionColdStartJournalInput, type V4VerifiedOriginalJournalKeyScope } from "./reencryption-cold-start-journal-key"
@@ -1908,10 +1909,53 @@ export class V4PluginRuntime {
     }
   }
 
+  /** Cold-start after the Settings intent: current branch can be Destination,
+   * so recover the historical Source only from the fenced, bounded hint.
+   * The hint grants nothing until the frozen Backup, WAL and intent agree. */
+  private async discoverInstalledSettingsRecovery() {
+    this.assertNotDisposed()
+    const settings = this.plugin.settings
+    const snapshot = JSON.stringify(settings)
+    const storage = this.plugin.app.secretStorage
+    const identity = await discoverV4InstalledSettingsIntent({
+      adapter: this.adapter,
+      currentRepoId: this.repoId(settings), deviceId: settings.vault,
+    })
+    const { sourceSecretId } = identity
+    if (sourceSecretId === settings.githubTokenSecretId) throw Error("Invalid historical Source key ID.")
+    const oldPassphrase = storage.getSecret(sourceSecretId)
+    if (!oldPassphrase || !settings.githubToken || storage.getSecret(settings.githubTokenSecretId) !== settings.githubToken
+      || (this.repoId(settings) === identity.identity.sourceRepoId
+        && (sourceSecretId !== settings.encryptionPassphraseSecretId || oldPassphrase !== settings.encryptionPassphrase))) throw Error("Historical Source custody unavailable.")
+    const i = identity.identity
+    const prefix = i.sourceRepoId.slice(0, i.sourceRepoId.indexOf("#") + 1)
+    const locatorDigest = await sha256Hex(utf8ToBytes(JSON.stringify([i, identity.intentText, this.repoId(settings), settings.encryptionPassphraseSecretId])))
+    this.assertNotDisposed()
+    if (this.plugin.settings !== settings || JSON.stringify(settings) !== snapshot || this.plugin.app.secretStorage !== storage) throw Error("Cutover owner changed during discovery.")
+    return {
+      locatorDigest,
+      restart: { ...identity, oldPassphrase, settings, snapshot, storage },
+      input: {
+        runId: i.runId, backupBranch: i.backupRepoId.slice(prefix.length),
+        destinationBranch: i.destinationRepoId.slice(prefix.length),
+        pinnedSourceCommitSha: i.pinnedSourceCommitSha, sourceTreeSha: i.sourceTreeSha,
+        destinationCommitSha: i.destinationCommitSha, destinationTreeSha: i.destinationTreeSha,
+        expectedFinalWalGeneration: i.finalWalGeneration, expectedFileCount: i.verifiedFileCount,
+        expectedPlaintextBytes: i.verifiedPlaintextBytes, expectedPhysicalRepositoryId: i.physicalRepositoryId,
+        defaultBranch: i.defaultBranch, verifyShadowIndex: true, recoverStagedSecret: true,
+      },
+    }
+  }
+
   async inspectInstalledStagedRecoveryFromDisk(createGitHubClient?: (branch: string) => GitHubClient): Promise<{
     locatorDigest: string; report: V4InstalledPreCutoverRecoveryReport
   } | null> {
     try {
+      if (await this.adapter.exists(V4_INSTALLED_CUTOVER_INTENT_PATH)) {
+        const discovered = await this.discoverInstalledSettingsRecovery()
+        const report = await this.recoverInstalledPreCutover({ ...discovered.input, createGitHubClient }, false, false, discovered.restart)
+        return { locatorDigest: discovered.locatorDigest, report }
+      }
       const discovered = await this.discoverInstalledStagedRecovery()
       const report = await this.inspectFencedReencryptionPreCutoverRecovery({ ...discovered.input, createGitHubClient })
       return { locatorDigest: discovered.locatorDigest, report }
@@ -1956,6 +2000,11 @@ export class V4PluginRuntime {
   }): Promise<V4InstalledPreCutoverRecoveryReport | null> {
     try {
       if (!/^[a-f0-9]{64}$/u.test(input.expectedLocatorDigest) || !input.newPassphrase) return null
+      if (await this.adapter.exists(V4_INSTALLED_CUTOVER_INTENT_PATH)) {
+        const discovered = await this.discoverInstalledSettingsRecovery()
+        if (discovered.locatorDigest !== input.expectedLocatorDigest) return null
+        return await this.recoverInstalledPreCutover({ ...discovered.input, newPassphrase: input.newPassphrase, createGitHubClient: input.createGitHubClient }, true, false, discovered.restart)
+      }
       const discovered = await this.discoverInstalledStagedRecovery()
       if (discovered.locatorDigest !== input.expectedLocatorDigest) return null
       return await this.restoreFencedReencryptionStagedSecret({ ...discovered.input, newPassphrase: input.newPassphrase, createGitHubClient: input.createGitHubClient })
@@ -1969,7 +2018,7 @@ export class V4PluginRuntime {
     return this.recoverInstalledPreCutover({ ...input, verifyShadowIndex: true, recoverStagedSecret: true }, true)
   }
 
-  private async recoverInstalledPreCutover(input: Parameters<V4PluginRuntime["inspectFencedReencryptionPreCutoverRecovery"]>[0], restoreMissing: boolean, stageSettings = false): Promise<V4InstalledPreCutoverRecoveryReport> {
+  private async recoverInstalledPreCutover(input: Parameters<V4PluginRuntime["inspectFencedReencryptionPreCutoverRecovery"]>[0], restoreMissing: boolean, stageSettings = false, restart?: Awaited<ReturnType<V4PluginRuntime["discoverInstalledSettingsRecovery"]>>["restart"]): Promise<V4InstalledPreCutoverRecoveryReport> {
     this.assertNotDisposed()
     const vault = this.plugin.app.vault
     const backing = this.indexAdapterBacking as (typeof vault.adapter & { getFullPath?: (path: string) => string }) | undefined
@@ -1979,7 +2028,10 @@ export class V4PluginRuntime {
     const initialCredentialGen = this.credentialGeneration
     const initialSettingsSaveGen = this.plugin.settingsSaveGeneration
     const initialSyncGen = this.coordinator.syncExecutionGeneration
-    const fullSettingsSnapshot = stageSettings ? JSON.stringify(settings) : undefined
+    const fullSettingsSnapshot = stageSettings || restart ? JSON.stringify(settings) : undefined
+    const historicalBranch = restart ? restart.identity.sourceRepoId.split("#")[1]! : settings.githubBranch
+    const historicalSecretId = restart?.sourceSecretId ?? settings.encryptionPassphraseSecretId
+    const historicalPassphrase = restart?.oldPassphrase ?? settings.encryptionPassphrase
     const loadData = this.plugin.loadData
     const saveData = this.plugin.saveData
     const pinned = {
@@ -2014,6 +2066,9 @@ export class V4PluginRuntime {
         || current.encryptionPassphrase !== pinned.passphrase
         || current.encryptionPassphraseSecretId !== pinned.passphraseSecretId
         || current.encryptionMode !== pinned.mode || current.vault !== pinned.vault
+        || (restart && (restart.settings !== settings || restart.snapshot !== fullSettingsSnapshot || JSON.stringify(current) !== fullSettingsSnapshot
+          || this.plugin.app.secretStorage !== restart.storage || restart.storage.getSecret(historicalSecretId) !== historicalPassphrase
+          || this.plugin.v4Runtime !== this || this.plugin.loadData !== loadData))
         || (stageSettings && (JSON.stringify(current) !== fullSettingsSnapshot || this.plugin.v4Runtime !== this
           || typeof loadData !== "function" || typeof saveData !== "function"
           || this.plugin.loadData !== loadData || this.plugin.saveData !== saveData))) {
@@ -2037,7 +2092,7 @@ export class V4PluginRuntime {
       runId: input.runId,
       owner: pinned.owner,
       repo: pinned.repo,
-      sourceBranch: pinned.branch,
+      sourceBranch: historicalBranch,
       backupBranch: input.backupBranch,
       destinationBranch: input.destinationBranch,
       pinnedSourceCommitSha: input.pinnedSourceCommitSha,
@@ -2047,7 +2102,7 @@ export class V4PluginRuntime {
       expectedFinalWalGeneration: input.expectedFinalWalGeneration,
       expectedFileCount: input.expectedFileCount,
       expectedPlaintextBytes: input.expectedPlaintextBytes,
-      oldPassphrase: pinned.passphrase,
+      oldPassphrase: historicalPassphrase,
       newPassphrase: input.newPassphrase,
       restoreMissingSecret: restoreMissing ? true : undefined,
       expectedPhysicalRepositoryId: input.expectedPhysicalRepositoryId,
@@ -2056,8 +2111,8 @@ export class V4PluginRuntime {
       inspectRoute: () => this.inspectFencedReencryptionIndexRoute(),
       shadow: verifyShadowIndex ? { adapter: this.adapter, deviceId: pinned.vault } : undefined,
       secretOwner: recoverStagedSecret ? {
-        storage, sourcePassphraseSecretId: pinned.passphraseSecretId,
-        githubTokenSecretId: pinned.tokenSecretId, oldPassphrase: pinned.passphrase,
+        storage, sourcePassphraseSecretId: historicalSecretId,
+        githubTokenSecretId: pinned.tokenSecretId, oldPassphrase: historicalPassphrase,
         token: pinned.token, assertOwner: assertSecretOwner,
       } : undefined,
       inspectFenceAndNoPartialCutover: async () => {
@@ -2067,7 +2122,7 @@ export class V4PluginRuntime {
           schemaVersion: 1,
           phase: "migration-fenced-uncommitted",
           runId: input.runId,
-          sourceRepoId: `${pinned.owner}/${pinned.repo}#${pinned.branch}`,
+          sourceRepoId: `${pinned.owner}/${pinned.repo}#${historicalBranch}`,
           destinationRepoId: `${pinned.owner}/${pinned.repo}#${input.destinationBranch}`,
         })
         if (fenceText !== expectedFence) return false
@@ -2080,11 +2135,19 @@ export class V4PluginRuntime {
           this.adapter.exists(V4_REENCRYPTION_RUNTIME_ROUTE_PATH),
           this.adapter.exists(installedSecretReceiptRoot(input.runId)),
         ])
+        if (restart && (!await this.adapter.exists(V4_REENCRYPTION_RUNTIME_ROUTE_ROOT)
+          || await this.adapter.read(V4_INSTALLED_CUTOVER_INTENT_PATH) !== restart.intentText)) return false
+        if (!restart && !stageSettings && await this.adapter.exists(V4_REENCRYPTION_RUNTIME_ROUTE_ROOT)) return false
         assertOwner()
         return checks[0] === false && checks[1] === verifyShadowIndex
           && checks[2] === false && checks[3] === false
           && checks[4] === recoverStagedSecret && (!recoverStagedSecret || verifyShadowIndex)
       },
+      restartSettingsBinding: restart ? {
+        intentText: restart.intentText, currentRepoId: this.repoId(settings),
+        currentSecretId: pinned.passphraseSecretId, tokenSecretId: pinned.tokenSecretId,
+        io: { read: async () => { assertOwner(); return loadData.call(this.plugin) } },
+      } : undefined,
       stageDestinationSettings: stageSettings ? {
         read: async () => { assertOwner(); return loadData.call(this.plugin) },
         write: async data => { assertOwner(); await saveData.call(this.plugin, data); assertOwner() },
