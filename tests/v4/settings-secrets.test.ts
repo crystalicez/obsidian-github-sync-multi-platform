@@ -725,16 +725,21 @@ test("D225 persisted Re-encryption fence blocks Settings Save across restarts wi
 })
 
 test("D225 missing or swapped Obsidian disk adapter never permits a Settings write", async () => {
-  for (const cause of ["missing", "swapped-during-check"] as const) {
+  for (const cause of ["missing", "swapped-before-check", "swapped-during-check", "swapped-during-active-probe", "active-probe-unreadable", "active-probe-nonboolean"] as const) {
     const h = d225SettingsAndRuntimeFixture()
     if (cause === "missing") {
       Object.assign(h.f.plugin.app.vault, { adapter: undefined })
     } else {
       const adapter = h.f.indexAdapter
+      const route = ".obsidian/plugins/test/github-sync-v4-rekey-runtime-route/active-destination.json"
+      if (cause === "swapped-before-check") Object.assign(h.f.plugin.app.vault, { adapter: { ...adapter } })
       adapter.exists = async path => {
-        if (path === h.root) {
+        if ((cause === "swapped-during-check" && path === h.root)
+          || (cause === "swapped-during-active-probe" && path === route)) {
           Object.assign(h.f.plugin.app.vault, { adapter: { ...adapter } })
         }
+        if (cause === "active-probe-unreadable" && path === route) throw Error("simulated inaccessible active route")
+        if (cause === "active-probe-nonboolean" && path === route) return undefined as unknown as boolean
         return false
       }
     }

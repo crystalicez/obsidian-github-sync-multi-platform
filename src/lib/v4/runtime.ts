@@ -1268,9 +1268,25 @@ export class V4PluginRuntime {
   }
 
   async assertReencryptionSettingsSaveAllowed(proposed?: FastSync["settings"]): Promise<void> {
+    // Check the backing before probing the active route: the wrapper follows
+    // the live Vault adapter, which may have disappeared or been replaced.
+    const assertBacking = () => {
+      if (this.disposed || this.reencryptionFencePending || !this.indexAdapterBacking
+        || this.plugin.app.vault.adapter !== this.indexAdapterBacking) throw new V4ReencryptionSyncFencedError()
+    }
+    let active = false
+    try {
+      assertBacking()
+      if (proposed) {
+        const exists = await this.adapter.exists(V4_INSTALLED_ACTIVE_ROUTE_PATH)
+        if (exists !== true && exists !== false) throw new V4ReencryptionSyncFencedError()
+        active = exists
+      }
+      assertBacking()
+    } catch { throw new V4ReencryptionSyncFencedError() }
     // Only the existing Settings transaction may save safe preferences on a
     // fully activated route; never permit a credential or scope replacement.
-    if (proposed && await this.adapter.exists(V4_INSTALLED_ACTIVE_ROUTE_PATH)) {
+    if (proposed && active) {
       try {
         const current = this.plugin.settings
         const github = this.plugin.githubClient
@@ -1285,6 +1301,7 @@ export class V4PluginRuntime {
         const loaded = await this.loadConfiguredRemoteConfig(github, this.repoId(current))
         if (!loaded || loaded.config.mode !== "encrypted") throw new V4ReencryptionSyncFencedError()
         const keyring = await this.keyringForConfig(loaded.config, current.encryptionPassphrase, undefined, generation)
+        assertBacking()
         if (this.plugin.settings !== current || this.plugin.settingsSaveGeneration !== saveGeneration
           || JSON.stringify(current) !== currentSnapshot || JSON.stringify(proposed) !== proposedSnapshot) throw new V4ReencryptionSyncFencedError()
         await this.resolveInstalledSyncIndexRoot({
