@@ -411,7 +411,7 @@ export default class FastSync extends Plugin {
         new Notice(active === "active-route-verified"
           ? "GitHub Sync: Active Destination Index route verified. Use ordinary Sync to check for changes. This inspection did not modify files, Settings or keys."
           : active === "active-index-needs-manual-recovery"
-            ? "GitHub Sync: Active Destination Index is missing or inconsistent. Preserve both Indexes, recovery files and keys; do not rebuild from the old migration snapshot. Manual Recovery is required."
+            ? "GitHub Sync: Active Destination Index is missing or inconsistent. Preserve both Indexes, recovery files and keys; do not rebuild from the old migration snapshot. Sync now may repair missing Index files from a verified checkpoint. Damaged files or failed verification require Manual Recovery."
             : "GitHub Sync: Active Destination route could not be verified. Keep both keys and all recovery files. Review the saved connection and use Manual Recovery.", 12000)
         return
       }

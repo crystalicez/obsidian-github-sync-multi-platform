@@ -1,6 +1,6 @@
 import { bytesToUtf8, fromBase64Url, sha256Hex, toBase64Url, utf8ToBytes } from "../bytes"
 import { decryptV4Payload, encryptV4Payload } from "./crypto"
-import { fitsV4LocalJsonSizeLimit, isV4LocalIndexCacheComplete, loadV4LocalIndex, type V4LocalIndexAdapter, type V4LocalIndex } from "./local-index"
+import { fitsV4LocalJsonSizeLimit, isV4LocalIndexCacheComplete, loadV4LocalIndex, saveV4LocalIndex, V4_LOCAL_INDEX_HEADER_MAX_BYTES, V4_LOCAL_INDEX_SHARD_MAX_BYTES, type V4LocalIndexAdapter, type V4LocalIndex } from "./local-index"
 import { V4_RUNTIME_INDEX_ROOT, V4_REENCRYPTION_RUNTIME_ROUTE_ROOT, V4_REENCRYPTION_RUNTIME_ROUTE_PATH } from "./reencryption-index-root"
 import { V4_INSTALLED_CUTOVER_INTENT_PATH } from "./reencryption-installed-settings-cutover"
 import type { V4InstalledSecretIdentity } from "./reencryption-installed-secret"
@@ -56,6 +56,8 @@ interface Scope {
   assertOwner: () => void
   proposedSettings?: unknown
   liveSettings?: unknown
+  repairMissing?: (head: string) => Promise<string>
+  checkpointIndex?: (head: string) => Promise<string>
 }
 async function read(adapter: V4LocalIndexAdapter, path: string): Promise<string> {
   const stat = await adapter.stat?.(path)
@@ -124,7 +126,7 @@ async function remoteRecordsDigest(index: V4LocalIndex): Promise<string> {
       })]),
   }))
 }
-async function verifyLocal(scope: Scope, route: Route, initial: boolean): Promise<string> {
+async function verifyHistorical(scope: Scope, route: Route): Promise<string> {
   scope.assertOwner()
   const { adapter } = scope
   const roots = planV4ReencryptionSeparatedRoots(V4_RUNTIME_INDEX_ROOT, route.runId)
@@ -141,7 +143,10 @@ async function verifyLocal(scope: Scope, route: Route, initial: boolean): Promis
   const source = await loadV4LocalIndex(adapter, roots.sourceIndexRoot)
   if (source.repoId !== route.sourceRepoId || source.deviceId !== scope.deviceId || source.remoteCommitSha !== route.sourceCommitSha
     || await digest(JSON.stringify(source)) !== route.sourceIndexSha256) throw Error("Historical Source Index changed.")
-  const shadow = await loadV4LocalIndex(adapter, roots.shadowIndexRoot).catch(() => { throw new V4InstalledActiveIndexRecoveryError() })
+  scope.assertOwner()
+  return roots.shadowIndexRoot
+}
+async function verifyShadow(scope: Scope, route: Route, shadow: V4LocalIndex, initial: boolean): Promise<void> {
   if (shadow.repoId !== scope.repoId || shadow.deviceId !== scope.deviceId || shadow.mode !== "encrypted"
     || shadow.pathLayout !== "opaque-stable-v1" || !shadow.remoteCommitSha || !SHA.test(shadow.remoteCommitSha)
     || !isV4LocalIndexCacheComplete(shadow) || shadow.epoch < route.initialEpoch
@@ -151,7 +156,12 @@ async function verifyLocal(scope: Scope, route: Route, initial: boolean): Promis
     throw new V4InstalledActiveIndexRecoveryError()
   }
   scope.assertOwner()
-  return roots.shadowIndexRoot
+}
+async function verifyLocal(scope: Scope, route: Route, initial: boolean): Promise<string> {
+  const root = await verifyHistorical(scope, route)
+  const shadow = await loadV4LocalIndex(scope.adapter, root).catch(() => { throw new V4InstalledActiveIndexRecoveryError() })
+  await verifyShadow(scope, route, shadow, initial)
+  return root
 }
 
 /** Called only inside the existing authenticated installed recovery session
@@ -213,6 +223,117 @@ export async function activateV4InstalledDestinationIndex(input: Scope & {
   return root
 }
 
+// The checkpoint is separate from both Source and the active Index. Its
+// sealed digest authenticates the *persisted* baseline (not an in-memory
+// result), including local bookkeeping. A torn checkpoint is unusable.
+const checkpointContext = (repoId: string) => ({ kind: "journal" as const, aad: "installed-active-index-checkpoint-v1:" + repoId })
+const checkpointRoot = (root: string) => root + "-checkpoint"
+interface CheckpointSeal {
+  schemaVersion: 1
+  routeSha256: string
+  indexSha256: string
+  remoteCommitSha: string
+  walEvidenceSha256: string
+}
+async function readCheckpoint(scope: Scope, route: Route, root: string, routeText: string): Promise<{ index: V4LocalIndex; walEvidenceSha256: string }> {
+  const backup = checkpointRoot(root)
+  const text = await read(scope.adapter, backup + "/seal.json")
+  const envelope = JSON.parse(text) as { ciphertext?: unknown }
+  if (typeof envelope.ciphertext !== "string" || JSON.stringify({ ciphertext: envelope.ciphertext }) !== text) throw Error("Invalid Index checkpoint.")
+  const bytes = await decryptV4Payload(scope.key, fromBase64Url(envelope.ciphertext), checkpointContext(scope.repoId))
+  try {
+    const seal = JSON.parse(bytesToUtf8(bytes)) as CheckpointSeal
+    const index = await loadV4LocalIndex(scope.adapter, backup)
+    await verifyShadow(scope, route, index, false)
+    if (seal.schemaVersion !== 1 || !DIGEST.test(seal.walEvidenceSha256) || seal.routeSha256 !== await digest(routeText)
+      || seal.remoteCommitSha !== index.remoteCommitSha || seal.indexSha256 !== await digest(JSON.stringify(index))
+      || await read(scope.adapter, backup + "/seal.json") !== text) throw Error("Index checkpoint evidence changed.")
+    return { index, walEvidenceSha256: seal.walEvidenceSha256 }
+  } finally { bytes.fill(0) }
+}
+async function checkpointActiveIndex(scope: Scope, route: Route, root: string, routeText: string, checkRoute: () => Promise<void>): Promise<void> {
+  const backup = checkpointRoot(root)
+  const index = await loadV4LocalIndex(scope.adapter, root)
+  await verifyShadow(scope, route, index, false)
+  const indexSha256 = await digest(JSON.stringify(index))
+  const walEvidenceSha256 = await scope.checkpointIndex!(index.remoteCommitSha!)
+  if (!DIGEST.test(walEvidenceSha256)) throw Error("Invalid checkpoint WAL evidence.")
+  const unchangedShards: Record<string, string> = {}
+  try {
+    const previous = await readCheckpoint(scope, route, root, routeText)
+    if (previous.walEvidenceSha256 === walEvidenceSha256 && await digest(JSON.stringify(previous.index)) === indexSha256) return
+    for (const [bucket, shard] of Object.entries(index.shards)) {
+      if (JSON.stringify(shard) === JSON.stringify(previous.index.shards[bucket])) unchangedShards[bucket] = shard.hash
+    }
+  } catch { /* The active Index is verified; replace only the redundant checkpoint. */ }
+  await checkRoute()
+  await saveV4LocalIndex(scope.adapter, backup, index, unchangedShards)
+  const loaded = await loadV4LocalIndex(scope.adapter, backup)
+  if (await digest(JSON.stringify(loaded)) !== indexSha256) throw Error("Index checkpoint readback differs.")
+  const seal: CheckpointSeal = { schemaVersion: 1, routeSha256: await digest(routeText), indexSha256, remoteCommitSha: index.remoteCommitSha!, walEvidenceSha256 }
+  const bytes = utf8ToBytes(JSON.stringify(seal))
+  try {
+    const text = JSON.stringify({ ciphertext: toBase64Url(await encryptV4Payload(scope.key, bytes, checkpointContext(scope.repoId))) })
+    await checkRoute()
+    if (await digest(JSON.stringify(await loadV4LocalIndex(scope.adapter, root))) !== indexSha256
+      || await scope.checkpointIndex!(index.remoteCommitSha!) !== walEvidenceSha256) throw Error("Active Index or WAL changed before checkpoint.")
+    await scope.adapter.write(backup + "/seal.json", text)
+    await readCheckpoint(scope, route, root, routeText)
+  } finally { bytes.fill(0) }
+}
+async function restoreMissingCheckpointFiles(scope: Scope, route: Route, root: string, routeText: string, checkRoute: () => Promise<void>): Promise<void> {
+  const { adapter } = scope
+  const { index, walEvidenceSha256 } = await readCheckpoint(scope, route, root, routeText)
+  const indexSha256 = await digest(JSON.stringify(index))
+  const head = index.remoteCommitSha!
+  const prove = async () => {
+    await checkRoute()
+    if (await scope.repairMissing!(head) !== walEvidenceSha256) throw Error("Ordinary WAL changed since the Index checkpoint.")
+    const current = await readCheckpoint(scope, route, root, routeText)
+    if (current.walEvidenceSha256 !== walEvidenceSha256 || await digest(JSON.stringify(current.index)) !== indexSha256) throw Error("Index checkpoint changed.")
+    scope.assertOwner()
+  }
+  const { shards, ...header } = index
+  const paths = [...Object.keys(shards).map(bucket => ({ path: "shards/" + bucket + ".json", max: V4_LOCAL_INDEX_SHARD_MAX_BYTES, expected: () => JSON.stringify(shards[bucket]) })),
+    { path: "index.json", max: V4_LOCAL_INDEX_HEADER_MAX_BYTES, expected: () => JSON.stringify(header) }]
+  const readBounded = async (path: string, max: number) => {
+    const stat = await adapter.stat?.(path)
+    if (stat && (!Number.isSafeInteger(stat.size) || stat.size < 1 || stat.size > max)) throw Error("Invalid checkpoint file size.")
+    const value = await adapter.read(path)
+    if (!fitsV4LocalJsonSizeLimit(value, max)) throw Error("Invalid checkpoint file size.")
+    return value
+  }
+  const inspect = async () => {
+    const missing: typeof paths = []
+    for (const file of paths) {
+      const target = root + "/" + file.path
+      if (!await adapter.exists(target)) missing.push(file)
+      else if (await readBounded(target, file.max) !== file.expected()) {
+        throw Error("Existing Index artifact differs; preserve it for Manual Recovery.")
+      }
+    }
+    return missing
+  }
+  await prove()
+  const missing = await inspect()
+  if (!missing.length) throw new V4InstalledActiveIndexRecoveryError()
+  if (!await adapter.exists(root)) await adapter.mkdir(root)
+  if (!await adapter.exists(root + "/shards")) await adapter.mkdir(root + "/shards")
+  // Preflight ALL existing files before writing anything. Only fill absent
+  // paths, header last. Never overwrite a malformed or divergent artifact.
+  for (const file of missing) {
+    const target = root + "/" + file.path
+    const value = file.expected()
+    if (!fitsV4LocalJsonSizeLimit(value, file.max)) throw Error("Invalid checkpoint file size.")
+    if (await adapter.exists(target)) throw Error("Index artifact appeared during repair.")
+    scope.assertOwner()
+    await adapter.write(target, value)
+    if (await readBounded(target, file.max) !== value) throw Error("Index repair readback differs.")
+  }
+  await prove()
+  if ((await inspect()).length || await digest(JSON.stringify(await loadV4LocalIndex(adapter, root))) !== indexSha256) throw Error("Index repair incomplete.")
+}
+
 /** Ordinary Sync must authenticate this every attempt, not merely trust a path
  * or a successful activation report. Historical proof remains immutable;
  * the selected Destination cache can evolve through ordinary Sync. */
@@ -221,7 +342,22 @@ export async function resolveV4InstalledActiveIndexRoot(input: Scope): Promise<s
   const route = await decode(input, text)
   const roots = planV4ReencryptionSeparatedRoots(V4_RUNTIME_INDEX_ROOT, route.runId)
   if (await read(input.adapter, roots.selectorPath) !== text) throw Error("Active selector differs.")
-  const root = await verifyLocal(input, route, false)
+  const root = await verifyHistorical(input, route)
+  const checkRoute = async () => {
+    if (await read(input.adapter, V4_INSTALLED_ACTIVE_ROUTE_PATH) !== text
+      || await read(input.adapter, roots.selectorPath) !== text
+      || await verifyHistorical(input, route) !== root) throw Error("Active route changed.")
+    input.assertOwner()
+  }
+  try {
+    const index = await loadV4LocalIndex(input.adapter, root).catch(() => { throw new V4InstalledActiveIndexRecoveryError() })
+    await verifyShadow(input, route, index, false)
+  } catch (error) {
+    if (!(error instanceof V4InstalledActiveIndexRecoveryError) || !input.repairMissing) throw error
+    await restoreMissingCheckpointFiles(input, route, root, text, checkRoute)
+    await verifyLocal(input, route, false)
+  }
+  if (input.checkpointIndex) await checkpointActiveIndex(input, route, root, text, checkRoute)
   if (await read(input.adapter, V4_INSTALLED_ACTIVE_ROUTE_PATH) !== text
     || await read(input.adapter, roots.selectorPath) !== text
     || await settingsDigest(input, route.schemaVersion) !== route.settingsSha256) throw Error("Active route changed.")

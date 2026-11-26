@@ -1,11 +1,11 @@
 import assert from "node:assert/strict"
 import { createHash } from "node:crypto"
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises"
 import path from "node:path"
 import test from "node:test"
 import { setRequestUrlHandler } from "obsidian"
 
-import { fromBase64, sha256Hex, toBase64, toBase64Url, utf8ToBytes } from "../../src/lib/bytes"
+import { fromBase64, fromBase64Url, sha256Hex, toBase64, toBase64Url, utf8ToBytes } from "../../src/lib/bytes"
 import { GitHubClient } from "../../src/lib/github-api"
 import FastSync from "../../src/main"
 import { V4PluginRuntime } from "../../src/lib/v4/runtime"
@@ -21,6 +21,7 @@ import { sanitizeV4SettingsForPersistence } from "../../src/lib/v4/secrets"
 import { deriveV4Keyring } from "../../src/lib/v4/crypto"
 import { inspectV4InstalledSettingsCutover, V4_INSTALLED_CUTOVER_INTENT_PATH } from "../../src/lib/v4/reencryption-installed-settings-cutover"
 import { discoverV4InstalledSecretIdentity, stageV4InstalledDestinationSecret, readV4InstalledDestinationSecret, installedSecretReceiptRoot } from "../../src/lib/v4/reencryption-installed-secret"
+import { createV4RecoveryStore } from "../../src/lib/v4/recovery-store"
 import { createV4ReencryptionRecoveryJournal } from "../../src/lib/v4/reencryption-recovery-journal"
 import { V4StorageCodec } from "../../src/lib/v4/storage-codec"
 import { buildV4RemoteMetadata } from "../../src/lib/v4/remote-index"
@@ -894,6 +895,112 @@ test("D412 installed Runtime orchestrates Source -> Backup -> Staging -> Scratch
     assert.equal(server.refs.get(destinationBranch), nextDest)
     assert.deepEqual(await loadV4LocalIndex(vault.adapter, sourceRoot), oldRoot)
     await vault.adapter.write(activePath, activeText)
+    // D523: recover only missing files from the latest authenticated ordinary
+    // Sync checkpoint. Never substitute the frozen Migration baseline.
+    const checkpoint = shadowRoot + "-checkpoint"
+    const checkpointSealPath = checkpoint + "/seal.json"
+    const baseline = await loadV4LocalIndex(vault.adapter, shadowRoot)
+    assert.equal(baseline.remoteCommitSha, nextDest)
+    assert.deepEqual(await loadV4LocalIndex(vault.adapter, checkpoint), baseline)
+    const seal = await vault.adapter.read(checkpointSealPath)
+    const headerPath = shadowRoot + "/index.json"
+    const shardPath = shadowRoot + "/shards/" + Object.keys(baseline.shards)[0]! + ".json"
+    const baselineHeader = await vault.adapter.read(headerPath)
+    const baselineShard = await vault.adapter.read(shardPath)
+    await vault.adapter.remove(headerPath)
+    // A remaining corrupt artifact must be preserved, even if another
+    // missing file could be restored from a valid checkpoint.
+    await vault.adapter.write(shardPath, "{")
+    await runtime2.runtime.manualSync()
+    assert.equal(runtime2.runtime.progressSnapshot.lifecycle, "failed")
+    assert.equal(await vault.adapter.exists(headerPath), false)
+    assert.equal(await vault.adapter.read(shardPath), "{")
+    await vault.adapter.write(shardPath, baselineShard)
+    await vault.adapter.remove(shardPath)
+    await vault.adapter.write(checkpointSealPath, seal.slice(0, -3) + "AAA")
+    await runtime2.runtime.manualSync()
+    assert.equal(runtime2.runtime.progressSnapshot.lifecycle, "failed")
+    assert.equal(await vault.adapter.exists(headerPath), false)
+    assert.equal(await vault.adapter.exists(shardPath), false)
+    await vault.adapter.write(checkpointSealPath, seal)
+    // A different but valid Destination HEAD is not authority to restore
+    // an older baseline. Restore the fixture ref after this denial.
+    server.refs.set(destinationBranch, destSha)
+    await runtime2.runtime.manualSync()
+    assert.equal(runtime2.runtime.progressSnapshot.lifecycle, "failed")
+    assert.equal(await vault.adapter.exists(headerPath), false)
+    assert.equal(await vault.adapter.exists(shardPath), false)
+    server.refs.set(destinationBranch, nextDest)
+    // Real ordinary Sync WAL, not just a mocked "pending" boolean.
+    const destRepoId = verifiedDest.sourceConfig.repoId
+    const ordinaryRoot = CONFIG_DIR + "/plugins/" + PLUGIN_ID + "/github-sync-v4-recovery/" + (await sha256Hex(utf8ToBytes(destRepoId))).slice(0, 32)
+    const destKeys = await deriveV4Keyring({
+      passphrase: NEW_PASSPHRASE, repoId: destRepoId,
+      salt: fromBase64Url(verifiedDest.sourceConfig.kdfParams!.salt),
+      iterations: verifiedDest.sourceConfig.kdfParams!.iterations,
+    })
+    try {
+      const store = createV4RecoveryStore({ adapter: vault.adapter, root: ordinaryRoot, repoId: destRepoId, payloadKey: destKeys.journalKey })
+      const slots = await Promise.all([0, 1].map(async slot => {
+        const file = ordinaryRoot + "/slot-" + slot + ".json"
+        return { file, text: await vault.adapter.exists(file) ? await vault.adapter.read(file) : null }
+      }))
+      const pendingFixture = await store.save({ runId: "d523-pending-fixture", phase: "remote-verified",
+        expectedRemoteHead: nextDest, verifiedRemoteHead: nextDest,
+        payload: { mutations: [], completedMutationIds: [] } })
+      await runtime2.runtime.manualSync()
+      assert.equal(runtime2.runtime.progressSnapshot.lifecycle, "failed")
+      assert.equal((await store.load())?.header.phase, "remote-verified")
+      assert.equal(await vault.adapter.exists(headerPath), false)
+      assert.equal(await vault.adapter.exists(shardPath), false)
+      // Torn newer WAL can fall back to the older terminal slot. The
+      // checkpoint must still refuse since the raw slots differ.
+      await vault.adapter.write(ordinaryRoot + "/slot-" + pendingFixture.header.generation % 2 + ".json", "{")
+      assert.equal((await store.load())?.header.phase, "index-committed")
+      await runtime2.runtime.manualSync()
+      assert.equal(runtime2.runtime.progressSnapshot.lifecycle, "failed")
+      assert.equal(await vault.adapter.exists(headerPath), false)
+      assert.equal(await vault.adapter.exists(shardPath), false)
+      // Restore only the original disposable fixture WAL bytes.
+      for (const slot of slots) {
+        if (slot.text === null) await vault.adapter.remove(slot.file)
+        else await vault.adapter.write(slot.file, slot.text)
+      }
+    } finally { for (const key of Object.values(destKeys)) key.fill(0) }
+    assert.equal(await runtime2.runtime.inspectInstalledActiveRouteFromDisk(), "active-index-needs-manual-recovery")
+    assert.equal(await vault.adapter.exists(headerPath), false)
+    // Startup cannot perform the repair. Explicit manual Sync can, while
+    // scanning all physical bytes to preserve a same-size unsynced edit.
+    await runtime2.runtime.startupSync()
+    assert.equal(runtime2.runtime.progressSnapshot.lifecycle, "failed")
+    assert.equal(await vault.adapter.exists(headerPath), false)
+    const localEdit = updatedNote.replace("D521", "D523")
+    assert.equal(localEdit.length, updatedNote.length)
+    const baselineNote = Object.values(baseline.shards).flatMap(shard => Object.values(shard.records)).find(record => record.path === "Notes/สวัสดี.md")!
+    await vault.adapter.write("Notes/สวัสดี.md", localEdit)
+    await utimes(path.join(vault.root, "Notes", "สวัสดี.md"), new Date(baselineNote.mtime), new Date(baselineNote.mtime))
+    const editedStat = await vault.adapter.stat("Notes/สวัสดี.md")
+    assert.equal(editedStat?.size, baselineNote.size)
+    assert.equal(editedStat?.mtime, baselineNote.mtime, "force hash must detect edit even with identical cached stat")
+    await runtime2.runtime.manualSync()
+    assert.equal(runtime2.runtime.progressSnapshot.lifecycle, "success", runtime2.runtime.progressSnapshot.errorMessage)
+    const repairedHead = server.refs.get(destinationBranch)!
+    assert.notEqual(repairedHead, nextDest)
+    assert.equal(await vault.adapter.exists(headerPath), true)
+    assert.equal(await vault.adapter.exists(shardPath), true)
+    assert.notEqual(await vault.adapter.read(headerPath), baselineHeader)
+    assert.equal((await loadV4LocalIndex(vault.adapter, checkpoint)).remoteCommitSha, repairedHead)
+    assert.equal((await loadV4LocalIndex(vault.adapter, shadowRoot)).remoteCommitSha, repairedHead)
+    const repairedInventory = await verifyGitHubReencryptionForkSourceWithTranscodeInventory({
+      github: makeClientFactory()(destinationBranch), expectedRepoId: OWNER + "/" + REPO + "#" + destinationBranch,
+      expectedBranch: destinationBranch, passphrase: NEW_PASSPHRASE,
+    })
+    assert.equal(repairedInventory.sourceRecords.find(r => r.path === "Notes/สวัสดี.md")?.plaintextSha256, await sha256Hex(utf8ToBytes(localEdit)))
+    assert.equal(await vault.adapter.read("Notes/สวัสดี.md"), localEdit)
+    assert.deepEqual(await loadV4LocalIndex(vault.adapter, sourceRoot), oldRoot)
+    assert.equal(server.refs.get(SOURCE_BRANCH), pinnedSourceCommitSha)
+    assert.equal(server.refs.get(backupBranch), pinnedSourceCommitSha)
+    assert.equal(await vault.adapter.read(activePath), activeText)
     await vault.adapter.writeBinary("Notes/สวัสดี.md", Uint8Array.from(noteBytes).buffer)
     // Physical Vault notes remain identical to original fixture.
     assert.deepEqual(new Uint8Array(await vault.adapter.readBinary("Notes/สวัสดี.md")), noteBytes)

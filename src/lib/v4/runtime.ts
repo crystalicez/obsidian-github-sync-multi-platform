@@ -2452,6 +2452,8 @@ export class V4PluginRuntime {
     credentialGeneration: number; operation: V4SyncRequest["operation"]
     settingsSaveCandidate?: FastSync["settings"]
     diagnostic?: true
+    repairMissing?: true
+    checkpointIndex?: true
   }): Promise<string> {
     if (!await this.adapter.exists(V4_INSTALLED_ACTIVE_ROUTE_PATH)) {
       if (input.settingsSaveCandidate || input.diagnostic) throw new V4ReencryptionSyncFencedError()
@@ -2498,6 +2500,33 @@ export class V4PluginRuntime {
         key: keyring.journalKey, readSettings: () => load.call(this.plugin), assertOwner,
         liveSettings: { settings: sanitizeV4SettingsForPersistence(settings) },
         ...(settingsSaveCandidate ? { proposedSettings: { settings: sanitizeV4SettingsForPersistence(settingsSaveCandidate) } } : {}),
+        ...(input.repairMissing || input.checkpointIndex ? (() => {
+          const evidence = async (head: string) => {
+            assertOwner()
+            const namespace = (await sha256Hex(utf8ToBytes(config.repoId))).slice(0, 32)
+            const root = `${V4_RECOVERY_ROOT}/${namespace}`
+            const store = createV4RecoveryStore({ adapter: this.adapter, root, repoId: config.repoId, payloadKey: keyring.journalKey })
+            // Bind both raw slots, not only load()'s highest valid generation.
+            // A torn newer slot may otherwise look like an older terminal WAL.
+            const slots = async () => {
+              const values: Array<string | null> = []
+              for (const slot of [0, 1]) {
+                const path = root + "/slot-" + slot + ".json"
+                values.push(await this.adapter.exists(path) ? await sha256Hex(utf8ToBytes(await this.adapter.read(path))) : null)
+              }
+              return JSON.stringify(values)
+            }
+            const before = await slots()
+            const pending = await store.load()
+            if ((pending && pending.header.phase !== "index-committed") || (await github.getGitRefOrNull())?.sha !== head) throw new V4ReencryptionSyncFencedError()
+            const latest = await store.load()
+            if (JSON.stringify(latest?.header ?? null) !== JSON.stringify(pending?.header ?? null)
+              || await slots() !== before) throw new V4ReencryptionSyncFencedError()
+            assertOwner()
+            return sha256Hex(utf8ToBytes(before))
+          }
+          return { ...(input.repairMissing ? { repairMissing: evidence } : {}), ...(input.checkpointIndex ? { checkpointIndex: evidence } : {}) }
+        })() : {}),
       })
       assertOwner()
       return root
@@ -2733,7 +2762,7 @@ export class V4PluginRuntime {
             ? await this.keyringForConfig(authenticationConfig, passphrase, signal, runCredentialGeneration)
             : undefined
           const routeInput = { settings, github, config, keyring, credentialGeneration: runCredentialGeneration, operation: request.operation }
-          const indexRoot = await this.resolveInstalledSyncIndexRoot(routeInput)
+          const indexRoot = await this.resolveInstalledSyncIndexRoot({ ...routeInput, ...(request.trigger === "manual" && configSelection.source === "observed-remote" ? { repairMissing: true as const } : {}) })
           if (indexRoot !== V4_INDEX_ROOT && configSelection.source !== "observed-remote") throw new V4ReencryptionSyncFencedError()
           if (request.trigger === "startup") this.plugin.enableWatch()
           this.reencryptionSyncFenced = false
@@ -2811,6 +2840,7 @@ export class V4PluginRuntime {
             index,
             config,
             keyring,
+            forceFullLocalHash: indexRoot !== V4_INDEX_ROOT && request.trigger === "manual",
             conflictPolicy: attemptSettings.conflictPolicy,
             abortChangePercent: attemptSettings.abortChangePercent,
             askConflict: input => this.askConflict(input.path),
@@ -2853,6 +2883,17 @@ export class V4PluginRuntime {
             : undefined
           const recoveryRunId = result.recoveryRunId ?? recoveredRunId
           if (recoveryRunId) await markV4RecoveryIndexCommitted(recoveryStore, recoveryRunId)
+          if (indexRoot !== V4_INDEX_ROOT) {
+            // A failed redundant checkpoint must not replay an already committed Sync.
+            // The checkpoint's authenticated readback will reject torn copies.
+            try {
+              const terminal = await recoveryStore.load()
+              if (terminal && terminal.header.phase !== "index-committed") throw Error("Ordinary recovery remains pending.")
+              if (await this.resolveInstalledSyncIndexRoot({ ...routeInput, checkpointIndex: true }) !== indexRoot) throw Error("Active checkpoint route changed.")
+            } catch {
+              if (!this.disposed) new Notice("GitHub Sync: Sync completed, but the redundant Destination Index checkpoint could not be verified. Keep recovery files.", 10000)
+            }
+          }
           // Initializing an empty branch creates a real remote config/HEAD commit,
           // despite changing zero logical files. Existing force/no-op UX stays unchanged.
           const initializedEmptyBranch = result.changedFiles === 0

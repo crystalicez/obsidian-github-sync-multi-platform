@@ -64,6 +64,8 @@ export interface V4SessionGithub extends V4GitTreeGithub {
 }
 
 export interface V4SyncSessionInput {
+  /** Manual active-route recovery must hash physical bytes even when stat matches the restored baseline. */
+  forceFullLocalHash?: boolean
   github: V4SessionGithub
   vault: V4SessionVault
   index: V4LocalIndex
@@ -1456,7 +1458,7 @@ export class V4SyncSession {
     this.report({ phase: "scanning-local", currentPath: undefined, currentDirection: undefined })
     const pathChanges = changes.filter((change): change is Exclude<V4QueuedChange, { type: "rescan" }> => change.type !== "rescan")
     const hasFolderChange = pathChanges.some(change => change.type === "folderRename" || change.type === "folderDelete")
-    if (changes.length > 0 && pathChanges.length === changes.length && !hasFolderChange && baseRecords.length > 0 && this.localIo.stat) {
+    if (!this.input.forceFullLocalHash && changes.length > 0 && pathChanges.length === changes.length && !hasFolderChange && baseRecords.length > 0 && this.localIo.stat) {
       const byPath = new Map(logical(baseRecords).map(file => [file.path, file]))
       for (const change of pathChanges) {
         if (change.type === "delete") { byPath.delete(change.path); continue }
@@ -1538,7 +1540,7 @@ export class V4SyncSession {
       this.report({ phase: "scanning-local", currentPath: file.path, currentDirection: undefined })
       const identity = identityByPath.get(file.path)
       const existing = identity ?? undefined
-      const unchangedStat = existing && existing.size === file.size && existing.mtime === file.mtime
+      const unchangedStat = !this.input.forceFullLocalHash && existing && existing.size === file.size && existing.mtime === file.mtime
       if (!unchangedStat) this.report({ phase: "hashing", currentPath: file.path, currentDirection: undefined })
       const fileId = identity === null
         ? await this.newFileId(file.path)

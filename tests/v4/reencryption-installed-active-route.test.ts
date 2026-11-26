@@ -92,6 +92,53 @@ test("D521 selector and active route fail closed at every physical write boundar
       assert.equal(await resolveV4InstalledActiveIndexRoot(input), roots.shadowIndexRoot)
       assert.deepEqual(await loadV4LocalIndex(adapter, roots.sourceIndexRoot), sourceBefore)
       await assert.rejects(() => assertV4ReencryptionSyncFenceClear(adapter))
+      if (fault === "none") {
+        // D523: only the authenticated latest checkpoint is usable. An
+        // interrupted repair must never overwrite an existing artifact.
+        const shadow = roots.shadowIndexRoot
+        const backup = shadow + "-checkpoint"
+        const header = shadow + "/index.json"
+        const seal = backup + "/seal.json"
+        const baseline = await loadV4LocalIndex(adapter, shadow)
+        await resolveV4InstalledActiveIndexRoot({ ...input, checkpointIndex: async () => "f".repeat(64) })
+        assert.deepEqual(await loadV4LocalIndex(adapter, backup), baseline)
+        const originalSeal = await adapter.read(seal)
+        await rm(abs(header))
+        let proofCalls = 0
+        const blocked = { ...input, repairMissing: async () => { proofCalls++; throw Error("pending WAL") } }
+        await assert.rejects(() => resolveV4InstalledActiveIndexRoot(blocked))
+        assert.equal(proofCalls, 1)
+        assert.equal(await adapter.exists(header), false)
+        await assert.rejects(() => resolveV4InstalledActiveIndexRoot({ ...input, repairMissing: async () => "e".repeat(64) }))
+        assert.equal(await adapter.exists(header), false)
+        await adapter.write(seal, "{")
+        const repair = { ...input, repairMissing: async (head: string) => { assert.equal(head, identity.destinationCommitSha); return "f".repeat(64) } }
+        await assert.rejects(() => resolveV4InstalledActiveIndexRoot(repair))
+        assert.equal(await adapter.exists(header), false)
+        await adapter.write(seal, originalSeal)
+        // A valid seal cannot authenticate a modified checkpoint header.
+        const backupHeader = await adapter.read(backup + "/index.json")
+        await adapter.write(backup + "/index.json", JSON.stringify({ ...JSON.parse(backupHeader), generation: 2 }))
+        await assert.rejects(() => resolveV4InstalledActiveIndexRoot(repair))
+        assert.equal(await adapter.exists(header), false)
+        await adapter.write(backup + "/index.json", backupHeader)
+        const failAfterWrite = { ...adapter, write: async (p: string, value: string) => {
+          if (p === header) {
+            await adapter.write(p, value.slice(0, 12))
+            throw Error("Torn repair write")
+          }
+          await adapter.write(p, value)
+        } }
+        await assert.rejects(() => resolveV4InstalledActiveIndexRoot({ ...repair, adapter: failAfterWrite }))
+        const partial = await adapter.read(header)
+        await assert.rejects(() => resolveV4InstalledActiveIndexRoot(repair))
+        assert.equal(await adapter.read(header), partial)
+        // Explicit test-only removal of the failed artifact permits retry.
+        await rm(abs(header))
+        assert.equal(await resolveV4InstalledActiveIndexRoot(repair), shadow)
+        assert.deepEqual(await loadV4LocalIndex(adapter, shadow), baseline)
+        assert.deepEqual(await loadV4LocalIndex(adapter, roots.sourceIndexRoot), sourceBefore)
+      }
     } finally {
       key.fill(0)
       await rm(root, { recursive: true, force: true })
