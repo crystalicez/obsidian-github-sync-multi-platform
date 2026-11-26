@@ -14,13 +14,13 @@ import {
   type V4LocalIndex,
   type V4LocalIndexAdapter,
 } from "./local-index"
-import { decodeV4RemoteConfig } from "./remote-index"
+import { decodeV4RemoteConfig, decodeV4RemoteHead } from "./remote-index"
 import { assertV4GitBlobIdentity } from "./git-blob-identity"
 import { createV4ScopePredicate, isPathInV4SyncScope } from "./scope"
-import { assertV4PathLayoutCompatible, V4ChangeGuardError, V4PublishedLocalApplyError, V4RecoveryReplanRequiredError, V4SyncSession, type V4SyncRunState } from "./sync-session"
+import { assertV4ActiveDestinationBaseline, sameV4ActiveDestinationConfig, assertV4PathLayoutCompatible, V4ChangeGuardError, V4PublishedLocalApplyError, V4RecoveryReplanRequiredError, V4SyncSession, type V4SyncRunState } from "./sync-session"
 import type { V4ConflictResolution } from "./conflicts"
 import { V4SyncCoordinator, type V4CoordinatorExecutionResult, type V4QueuedChange, type V4SyncRequest } from "./sync-coordinator"
-import { expectedV4PathLayout, V4_FORMAT_VERSION, V4_CONFIG_PATH, type V4RemoteConfig, type V4StorageMode } from "./protocol-types"
+import { expectedV4PathLayout, V4_FORMAT_VERSION, V4_CONFIG_PATH, V4_HEAD_PATH, type V4RemoteConfig, type V4StorageMode } from "./protocol-types"
 import { V4HistoryNotInitializedError, V4HistoryService } from "./history-service"
 import type { V4SessionVault } from "./local-io"
 import { createV4ContentSource, createV4WholeBufferContentSource, DEFAULT_V4_WHOLE_BUFFER_CEILING_BYTES, type V4ContentSource } from "./content-source"
@@ -2454,9 +2454,10 @@ export class V4PluginRuntime {
     diagnostic?: true
     repairMissing?: true
     checkpointIndex?: true
+    expectActiveRoute?: true
   }): Promise<string> {
     if (!await this.adapter.exists(V4_INSTALLED_ACTIVE_ROUTE_PATH)) {
-      if (input.settingsSaveCandidate || input.diagnostic) throw new V4ReencryptionSyncFencedError()
+      if (input.settingsSaveCandidate || input.diagnostic || input.expectActiveRoute) throw new V4ReencryptionSyncFencedError()
       await assertV4ReencryptionSyncFenceClear(this.adapter)
       return V4_INDEX_ROOT
     }
@@ -2532,6 +2533,45 @@ export class V4PluginRuntime {
       return root
     } catch (error) {
       if (input.diagnostic && error instanceof V4InstalledActiveIndexRecoveryError) throw error
+      throw new V4ReencryptionSyncFencedError()
+    }
+  }
+
+  /** Pending ordinary WAL replay is a local write too. Before replay, prove
+   * the current authenticated Destination is still on the known lineage.
+   * The session independently repeats the stronger content/tree checks. */
+  private async assertActiveDestinationRecoveryHead(github: GitHubClient, config: V4RemoteConfig, keyring: V4Keyring, index: V4LocalIndex, signal: AbortSignal): Promise<string> {
+    try {
+      const ref = await github.getGitRefOrNull()
+      if (!ref) throw new V4ReencryptionSyncFencedError()
+      const raw = await github.getFileBytes(V4_CONFIG_PATH, ref.sha)
+      if (!raw || !sameV4ActiveDestinationConfig(decodeV4RemoteConfig(raw.bytes), config)) throw new V4ReencryptionSyncFencedError()
+      const readHead = async (sha: string) => {
+        throwIfV4Aborted(signal)
+        const file = await github.getFileBytes(V4_HEAD_PATH, sha)
+        if (!file) throw new V4ReencryptionSyncFencedError()
+        return decodeV4RemoteHead(file.bytes, config, keyring)
+      }
+      let sha = ref.sha
+      let head = await readHead(sha)
+      assertV4ActiveDestinationBaseline(index, head, sha)
+      while (sha !== index.remoteCommitSha) {
+        throwIfV4Aborted(signal)
+        const commit = await github.getGitCommit(sha)
+        const parent = commit.parentShas[0]
+        if (commit.sha !== sha || commit.message?.split("\n", 1)[0] !== `obsidian-sync-v4:${head.journalId}`
+          || commit.parentShas.length !== 1 || !parent) throw new V4ReencryptionSyncFencedError()
+        const previous = await readHead(parent)
+        if (previous.epoch !== head.epoch || previous.generation + 1 !== head.generation
+          || previous.journalId === head.journalId) throw new V4ReencryptionSyncFencedError()
+        sha = parent
+        head = previous
+        assertV4ActiveDestinationBaseline(index, head, sha)
+      }
+      if ((await github.getGitRefOrNull())?.sha !== ref.sha) throw new V4ReencryptionSyncFencedError()
+      return ref.sha
+    } catch (error) {
+      throwIfV4Aborted(signal)
       throw new V4ReencryptionSyncFencedError()
     }
   }
@@ -2716,6 +2756,7 @@ export class V4PluginRuntime {
     })
     try {
       await this.assertInstalledSyncRouteMayBeChecked(request.operation)
+      const activeRouteAtStart = await this.adapter.exists(V4_INSTALLED_ACTIVE_ROUTE_PATH)
       if (this.uncVault && !this.networkStorageNoticeShown) {
         this.networkStorageNoticeShown = true
         new Notice(`GitHub Sync: UNC network vault detected. ${V4_NETWORK_VAULT_WARNING}`, 10000)
@@ -2742,6 +2783,7 @@ export class V4PluginRuntime {
             currentDirection: undefined,
           })
           const configSelection = await this.remoteOrNewConfig(github, settings, repoId)
+          if (activeRouteAtStart && configSelection.source !== "observed-remote") throw new V4ReencryptionSyncFencedError()
           const discovered = configSelection.config
           const desiredMode = settings.encryptionMode
           if (discovered.mode !== desiredMode && desiredMode === "encrypted") {
@@ -2761,7 +2803,8 @@ export class V4PluginRuntime {
           const keyring = authenticationConfig
             ? await this.keyringForConfig(authenticationConfig, passphrase, signal, runCredentialGeneration)
             : undefined
-          const routeInput = { settings, github, config, keyring, credentialGeneration: runCredentialGeneration, operation: request.operation }
+          const routeInput = { settings, github, config, keyring, credentialGeneration: runCredentialGeneration, operation: request.operation,
+            ...(activeRouteAtStart ? { expectActiveRoute: true as const } : {}) }
           const indexRoot = await this.resolveInstalledSyncIndexRoot({ ...routeInput, ...(request.trigger === "manual" && configSelection.source === "observed-remote" ? { repairMissing: true as const } : {}) })
           if (indexRoot !== V4_INDEX_ROOT && configSelection.source !== "observed-remote") throw new V4ReencryptionSyncFencedError()
           if (request.trigger === "startup") this.plugin.enableWatch()
@@ -2808,7 +2851,9 @@ export class V4PluginRuntime {
           }
           let reconciledRecovery = pendingRecovery
           if (pendingRecovery && pendingRecovery.header.phase !== "index-committed") {
-            const recoveryHead = (await github.getGitRefOrNull())?.sha ?? null
+            const recoveryHead = indexRoot !== V4_INDEX_ROOT
+              ? await this.assertActiveDestinationRecoveryHead(github, config, keyring!, index, signal)
+              : (await github.getGitRefOrNull())?.sha ?? null
             const recovered = await recoverV4PendingState({
               store: recoveryStore,
               snapshot: pendingRecovery,
@@ -2840,6 +2885,7 @@ export class V4PluginRuntime {
             index,
             config,
             keyring,
+            ...(indexRoot !== V4_INDEX_ROOT ? { activeDestinationOnly: true as const } : {}),
             forceFullLocalHash: indexRoot !== V4_INDEX_ROOT && request.trigger === "manual",
             conflictPolicy: attemptSettings.conflictPolicy,
             abortChangePercent: attemptSettings.abortChangePercent,

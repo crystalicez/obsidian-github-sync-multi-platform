@@ -53,6 +53,7 @@ import { applyV4RecoveryLocalMutations, assertUniqueV4RecoveryStageOwners, V4Rec
 import type { V4RecoveryLocalMutation, V4RecoveryPayload, V4RecoverySnapshot } from "./recovery-types"
 import type { V4DirectionalProgress, V4SyncProgressPatch } from "./progress"
 import { deferV4Cancellation, throwIfV4Aborted } from "./cancellation"
+import { V4ReencryptionSyncFencedError } from "./reencryption-sync-fence"
 
 export type { V4SessionVault, V4SessionVaultFile } from "./local-io"
 export { assertV4PathLayoutCompatible } from "./remote-loader"
@@ -63,9 +64,28 @@ export interface V4SessionGithub extends V4GitTreeGithub {
   getTreeAt?(treeSha: string, recursive?: boolean): Promise<GitHubTree>
 }
 
+export function sameV4ActiveDestinationConfig(actual: V4RemoteConfig, expected: V4RemoteConfig): boolean {
+  return actual.mode === "encrypted" && expected.mode === "encrypted"
+    && actual.repoId === expected.repoId && actual.formatVersion === expected.formatVersion
+    && actual.pathLayout === "opaque-stable-v1" && expected.pathLayout === actual.pathLayout
+    && actual.algorithm === "AES-GCM" && actual.algorithm === expected.algorithm
+    && actual.kdf === "PBKDF2-SHA-256" && actual.kdf === expected.kdf
+    && !!actual.kdfParams && actual.kdfParams.salt === expected.kdfParams?.salt
+    && actual.kdfParams.iterations === expected.kdfParams?.iterations
+}
+
+export function assertV4ActiveDestinationBaseline(index: V4LocalIndex, head: V4RemoteHead, sha: string): void {
+  if (!index.remoteCommitSha || index.mode !== "encrypted" || head.mode !== "encrypted" || head.epoch !== index.epoch
+    || (sha === index.remoteCommitSha
+      ? head.generation !== index.generation || JSON.stringify(Object.entries(head.shardHashes).sort()) !== JSON.stringify(Object.entries(index.shardHashes).sort())
+      : head.generation <= index.generation)) throw new V4ReencryptionSyncFencedError()
+}
+
 export interface V4SyncSessionInput {
   /** Manual active-route recovery must hash physical bytes even when stat matches the restored baseline. */
   forceFullLocalHash?: boolean
+  /** A migrated Destination must never bootstrap or reconcile an unrelated Git history. */
+  activeDestinationOnly?: true
   github: V4SessionGithub
   vault: V4SessionVault
   index: V4LocalIndex
@@ -402,11 +422,17 @@ export class V4SyncSession {
     const baseCommitSha = this.input.index.remoteCommitSha
     this.report({ phase: "checking-remote", currentPath: undefined, currentDirection: undefined })
     const ref = await this.input.github.getGitRefOrNull()
+    if (this.input.activeDestinationOnly && !ref) throw new V4ReencryptionSyncFencedError()
     const remoteConfig = await loadV4RemoteConfig({ github: this.input.github, desiredConfig: this.input.config }, ref?.sha, options.operation)
+    if (this.input.activeDestinationOnly && (!remoteConfig || !sameV4ActiveDestinationConfig(remoteConfig, this.input.config))) throw new V4ReencryptionSyncFencedError()
     const localCacheComplete = isV4LocalIndexCacheComplete(this.input.index)
     const remote = ref && remoteConfig && remoteConfig.mode !== "encrypted" && localCacheComplete && ref.sha === this.input.index.remoteCommitSha && this.input.index.pathLayout === effectiveV4PathLayout(remoteConfig)
       ? remoteV4StateFromLocalIndex(this.input.index, ref.sha, remoteConfig)
       : await loadV4RemoteState({ github: this.input.github, index: this.input.index, ...(this.input.keyring === undefined ? {} : { keyring: this.input.keyring }) }, ref?.sha, remoteConfig)
+    if (this.input.activeDestinationOnly) {
+      if (!remote || !ref || !localCacheComplete || !baseCommitSha) throw new V4ReencryptionSyncFencedError()
+      assertV4ActiveDestinationBaseline(this.input.index, remote.head, ref.sha)
+    }
     if (!remote && ref && this.input.config.mode === "encrypted") {
       throw new Error("Encrypted V4 requires a new empty repository or branch to avoid retaining plaintext history.")
     }
@@ -459,6 +485,7 @@ export class V4SyncSession {
         }
         if (commit.sha === remote.commitSha) precedingHead = parentHead
         if (parentSha === baseCommitSha) {
+          if (this.input.activeDestinationOnly) assertV4ActiveDestinationBaseline(this.input.index, parentHead, parentSha)
           hasCoherentPluginAdvance = true
           break
         }
@@ -583,6 +610,7 @@ export class V4SyncSession {
         }
       }
       if (!hasCoherentPluginAdvance) {
+        if (this.input.activeDestinationOnly) throw new V4ReencryptionSyncFencedError()
         await this.reconcileExternalCommit(remote, tip.treeSha, tipTree)
         externalReconciled = true
       }

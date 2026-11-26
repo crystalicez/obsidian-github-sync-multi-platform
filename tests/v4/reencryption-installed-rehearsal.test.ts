@@ -1001,6 +1001,137 @@ test("D412 installed Runtime orchestrates Source -> Backup -> Staging -> Scratch
     assert.equal(server.refs.get(SOURCE_BRANCH), pinnedSourceCommitSha)
     assert.equal(server.refs.get(backupBranch), pinnedSourceCommitSha)
     assert.equal(await vault.adapter.read(activePath), activeText)
+    // D524: an independently configured device with its own physical Vault,
+    // device ID and ordinary Index (no Migration route) advances Destination.
+    const peer = await createInstalledVaultFixture([
+      { path: "Notes/สวัสดี.md", bytes: utf8ToBytes(localEdit) },
+      { path: "Attachments/data.bin", bytes: binBytes },
+    ])
+    const peerRuntime = peer.makeRuntime()
+    const peerEdit = localEdit + "\nIndependent Destination device edit"
+    let peerHead: string
+    try {
+      peerRuntime.plugin.settings.githubBranch = destinationBranch
+      peerRuntime.plugin.settings.vault = "independent-destination-device"
+      peerRuntime.plugin.settings.encryptionPassphrase = NEW_PASSPHRASE
+      peerRuntime.plugin.githubClient = makeClientFactory()(destinationBranch)
+      const peerIndex = createEmptyV4LocalIndex({ repoId: repairedInventory.sourceConfig.repoId, deviceId: peerRuntime.plugin.settings.vault, mode: "encrypted" })
+      peerIndex.remoteCommitSha = repairedHead
+      peerIndex.epoch = repairedInventory.sourceHead.epoch
+      peerIndex.generation = repairedInventory.sourceHead.generation
+      peerIndex.shardHashes = { ...repairedInventory.sourceHead.shardHashes }
+      for (const [bucket, shard] of Object.entries(repairedInventory.sourceShards)) {
+        peerIndex.shards[bucket] = { bucket, hash: peerIndex.shardHashes[bucket]!, records: structuredClone(shard.records) }
+      }
+      await saveV4LocalIndex(peer.adapter, sourceRoot, peerIndex)
+      await peer.adapter.write("Notes/สวัสดี.md", peerEdit)
+      await peerRuntime.runtime.manualSync()
+      assert.equal(peerRuntime.runtime.progressSnapshot.lifecycle, "success", peerRuntime.runtime.progressSnapshot.errorMessage)
+      peerHead = server.refs.get(destinationBranch)!
+      assert.notEqual(peerHead, repairedHead)
+      assert.equal((await loadV4LocalIndex(peer.adapter, sourceRoot)).remoteCommitSha, peerHead)
+    } finally {
+      peerRuntime.runtime.dispose()
+      await peer.cleanup()
+    }
+    // A valid encrypted HEAD with advanced generation is not sufficient:
+    // the exact parent lineage must connect to the active device baseline.
+    const legitimatePeerCommit = server.commits.get(peerHead)!
+    const foreignParent = destSha
+    const foreignPayload = utf8ToBytes(JSON.stringify({
+      message: legitimatePeerCommit.message, tree: legitimatePeerCommit.treeSha, parents: [foreignParent],
+    }))
+    const foreignSha = gitSha1("commit", foreignPayload)
+    server.commits.set(foreignSha, { ...legitimatePeerCommit, sha: foreignSha, parents: [foreignParent] })
+    server.refs.set(destinationBranch, foreignSha)
+    await runtime2.runtime.manualSync()
+    assert.equal(runtime2.runtime.progressSnapshot.lifecycle, "failed")
+    assert.equal(server.refs.get(destinationBranch), foreignSha)
+    assert.equal(await vault.adapter.read("Notes/สวัสดี.md"), localEdit)
+    assert.equal((await loadV4LocalIndex(vault.adapter, shadowRoot)).remoteCommitSha, repairedHead)
+    server.refs.set(destinationBranch, peerHead)
+    // Active initiator accepts a coherent encrypted peer advance, and pulls.
+    await runtime2.runtime.manualSync()
+    assert.equal(runtime2.runtime.progressSnapshot.lifecycle, "success", runtime2.runtime.progressSnapshot.errorMessage)
+    assert.equal(await vault.adapter.read("Notes/สวัสดี.md"), peerEdit)
+    assert.equal(server.refs.get(destinationBranch), peerHead)
+    const activeAfterPeer = await loadV4LocalIndex(vault.adapter, shadowRoot)
+    assert.equal(activeAfterPeer.remoteCommitSha, peerHead)
+    assert.equal((await loadV4LocalIndex(vault.adapter, checkpoint)).remoteCommitSha, peerHead)
+    const commitsBeforeDenials = server.commits.size
+    const blobsBeforeDenials = server.blobs.size
+    const assertUnchanged = async () => {
+      assert.equal(server.commits.size, commitsBeforeDenials)
+      assert.equal(server.blobs.size, blobsBeforeDenials)
+      assert.equal(await vault.adapter.read("Notes/สวัสดี.md"), peerEdit)
+      assert.deepEqual(await loadV4LocalIndex(vault.adapter, shadowRoot), activeAfterPeer)
+      assert.deepEqual(await loadV4LocalIndex(vault.adapter, sourceRoot), oldRoot)
+      assert.equal(server.refs.get(SOURCE_BRANCH), pinnedSourceCommitSha)
+      assert.equal(server.refs.get(backupBranch), pinnedSourceCommitSha)
+    }
+    // Known older Destination is valid encrypted history, but not the
+    // current baseline. Refuse rollback before local writes or uploads.
+    server.refs.set(destinationBranch, repairedHead)
+    await runtime2.runtime.manualSync()
+    assert.equal(runtime2.runtime.progressSnapshot.lifecycle, "failed")
+    assert.equal(server.refs.get(destinationBranch), repairedHead)
+    await assertUnchanged()
+    server.refs.set(destinationBranch, peerHead)
+    // Pending ordinary recovery must not change WAL or local notes when the
+    // authenticated remote HEAD has been rewound. Save/restore only fixture slots.
+    const recoveryKeys = await deriveV4Keyring({
+      passphrase: NEW_PASSPHRASE, repoId: repairedInventory.sourceConfig.repoId,
+      salt: fromBase64Url(repairedInventory.sourceConfig.kdfParams!.salt),
+      iterations: repairedInventory.sourceConfig.kdfParams!.iterations,
+    })
+    try {
+      const slots = await Promise.all([0, 1].map(async slot => {
+        const file = ordinaryRoot + "/slot-" + slot + ".json"
+        return { file, text: await vault.adapter.exists(file) ? await vault.adapter.read(file) : null }
+      }))
+      const store = createV4RecoveryStore({ adapter: vault.adapter, root: ordinaryRoot, repoId: repairedInventory.sourceConfig.repoId, payloadKey: recoveryKeys.journalKey })
+      await store.save({ runId: "d524-pending-fixture", phase: "remote-verified",
+        expectedRemoteHead: peerHead, verifiedRemoteHead: repairedHead, payload: { mutations: [], completedMutationIds: [] } })
+      const pending = await store.load()
+      server.refs.set(destinationBranch, repairedHead)
+      await runtime2.runtime.manualSync()
+      assert.equal(runtime2.runtime.progressSnapshot.lifecycle, "failed")
+      assert.deepEqual(await store.load(), pending)
+      await assertUnchanged()
+      for (const slot of slots) {
+        if (slot.text === null) await vault.adapter.remove(slot.file)
+        else await vault.adapter.write(slot.file, slot.text)
+      }
+    } finally {
+      for (const key of Object.values(recoveryKeys)) key.fill(0)
+      server.refs.set(destinationBranch, peerHead)
+    }
+    // Actual race after the Runtime has read existing Config at a pinned
+    // commit, before the session's independent current ref lookup.
+    const activeGithub = runtime2.plugin.githubClient
+    const originalGetRef = activeGithub.getGitRefOrNull.bind(activeGithub)
+    let removedAfterLookup = false
+    activeGithub.getGitRefOrNull = async () => {
+      const ref = await originalGetRef()
+      if (!removedAfterLookup && ref?.sha === peerHead) {
+        removedAfterLookup = true
+        server.refs.delete(destinationBranch)
+      }
+      return ref
+    }
+    try {
+      await runtime2.runtime.manualSync()
+      assert.equal(removedAfterLookup, true)
+      assert.equal(runtime2.runtime.progressSnapshot.lifecycle, "failed")
+      assert.equal(server.refs.has(destinationBranch), false, "Active Sync must not recreate missing Destination")
+      await assertUnchanged()
+    } finally {
+      activeGithub.getGitRefOrNull = originalGetRef
+      server.refs.set(destinationBranch, peerHead)
+    }
+    await runtime2.runtime.manualSync()
+    assert.equal(runtime2.runtime.progressSnapshot.lifecycle, "no-change", runtime2.runtime.progressSnapshot.errorMessage)
+    assert.equal(server.refs.get(destinationBranch), peerHead)
     await vault.adapter.writeBinary("Notes/สวัสดี.md", Uint8Array.from(noteBytes).buffer)
     // Physical Vault notes remain identical to original fixture.
     assert.deepEqual(new Uint8Array(await vault.adapter.readBinary("Notes/สวัสดี.md")), noteBytes)
