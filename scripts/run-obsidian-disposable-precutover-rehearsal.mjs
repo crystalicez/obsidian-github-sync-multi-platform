@@ -33,11 +33,13 @@ const staleClientMode = process.argv.includes("--stale-client");
 const secretMode = process.argv.includes("--stage-secret");
 const uiRecoveryMode = process.argv.includes("--recover-via-ui");
 const settingsCutoverMode = process.argv.includes("--stage-settings");
+const injectMissingSecret = process.argv.includes("--inject-missing-secret");
+assert.ok(!injectMissingSecret || (settingsCutoverMode && uiRecoveryMode), "--inject-missing-secret requires --stage-settings --recover-via-ui in a disposable profile.");
 assert.ok(!settingsCutoverMode || (secretMode && !staleClientMode), "--stage-settings requires single-Vault --stage-secret.");
 assert.ok(!uiRecoveryMode || (secretMode && !staleClientMode), "--recover-via-ui requires single-Vault --stage-secret.");
 const shadowMode = secretMode || process.argv.includes("--shadow-index");
-assert.ok(process.argv.slice(2).every(arg => arg === "--stale-client" || arg === "--shadow-index" || arg === "--stage-secret" || arg === "--recover-via-ui" || arg === "--stage-settings"),
-  "Only --stale-client, --shadow-index, --stage-secret, --recover-via-ui and --stage-settings are supported; all writes must remain in approved disposable branches.");
+assert.ok(process.argv.slice(2).every(arg => arg === "--stale-client" || arg === "--shadow-index" || arg === "--stage-secret" || arg === "--recover-via-ui" || arg === "--stage-settings" || arg === "--inject-missing-secret"),
+  "Only --stale-client, --shadow-index, --stage-secret, --recover-via-ui, --stage-settings and --inject-missing-secret are supported; all writes must remain in approved disposable branches.");
 
 const oldPassphrase = "d412-old-" + randomBytes(18).toString("base64url");
 const newPassphrase = "d412-new-" + randomBytes(18).toString("base64url");
@@ -514,14 +516,35 @@ try {
       expectedPhysicalRepositoryId:1284153873,
       defaultBranch:${JSON.stringify(target.defaultBranch)},
     };
-    const discovered=${JSON.stringify(secretMode)} ? await p.v4Runtime.inspectInstalledStagedRecoveryFromDisk() : null;
-    const readOnly=${JSON.stringify(secretMode)} ? discovered?.report : await p.v4Runtime.inspectFencedReencryptionPreCutoverRecovery(recoveryInput);
+    let discovered=${JSON.stringify(secretMode)} ? await p.v4Runtime.inspectInstalledStagedRecoveryFromDisk() : null;
+    let readOnly=${JSON.stringify(secretMode)} ? discovered?.report : await p.v4Runtime.inspectFencedReencryptionPreCutoverRecovery(recoveryInput);
     if(!readOnly) throw Error("Installed recovery discovery unavailable");
-    let recovered=readOnly;
     let restoredViaUi=false;
     const secretId=${JSON.stringify(rehearsal.report.stagedSecret?.destinationPassphraseSecretId ?? "")};
     const missingAfterRestart=${JSON.stringify(secretMode)} && !app.secretStorage.getSecret(secretId);
-    if(${JSON.stringify(secretMode)} && readOnly.stagedSecretMissing===true && missingAfterRestart){
+    let injectedMissing=false;
+    if(${JSON.stringify(injectMissingSecret)} && !missingAfterRestart){
+      // Explicit fault injection only in the exact disposable Destination
+      // profile. First qualify intact native Settings and key custody.
+      if(readOnly.settingsCutoverObservation!=="destination-settings-observed-fenced"
+        || readOnly.stagedSecretReverified!==true || readOnly.resumeSyncAuthorized!==false
+        || p.settings.githubOwner!==${JSON.stringify(configuration.owner)}
+        || p.settings.githubRepo!==${JSON.stringify(configuration.repo)}
+        || p.settings.githubBranch!==${JSON.stringify(destinationBranch)}
+        || p.settings.encryptionPassphraseSecretId!==secretId
+        || secretId===${JSON.stringify(sourceSecretId)} || secretId===p.settings.githubTokenSecretId
+        || !/^rekey-passphrase-[a-f0-9]{32}$/.test(secretId)
+        || app.secretStorage.getSecret(secretId)!==${JSON.stringify(newPassphrase)})throw Error("Disposable missing-key injection guard failed");
+      app.secretStorage.setSecret(secretId,"");
+      if(app.secretStorage.getSecret(secretId))throw Error("Disposable key injection failed");
+      injectedMissing=true;
+      discovered=await p.v4Runtime.inspectInstalledStagedRecoveryFromDisk();
+      readOnly=discovered?.report;
+      if(!readOnly)throw Error("Missing-key injection recovery discovery unavailable");
+    }
+    let recovered=readOnly;
+    const missingBeforeRecovery=missingAfterRestart||injectedMissing;
+    if(${JSON.stringify(secretMode)} && readOnly.stagedSecretMissing===true && missingBeforeRecovery){
       if(${JSON.stringify(uiRecoveryMode)}){
         const started=app.commands.executeCommandById(${JSON.stringify(pluginId+":recover-staged-reencryption-key")});
         if(!started) throw Error("Installed Recovery command not registered");
@@ -577,7 +600,7 @@ try {
       readOnlyObservation:readOnly.observation,
       readOnlyFailureStage:readOnly.failureStage??null,
       readOnlyMissing:readOnly.stagedSecretMissing===true,
-      missingAfterRestart,
+      missingAfterRestart, injectedMissing, missingBeforeRecovery,
       restoredViaUi,
       stagedSecretPresent: ${JSON.stringify(secretMode)} ? !!app.secretStorage.getSecret(${JSON.stringify(rehearsal.report.stagedSecret?.destinationPassphraseSecretId ?? "")}) : null,
       stagedSecretMatches: ${JSON.stringify(secretMode)} ? app.secretStorage.getSecret(${JSON.stringify(rehearsal.report.stagedSecret?.destinationPassphraseSecretId ?? "")}) === ${JSON.stringify(newPassphrase)} : null,
@@ -594,13 +617,13 @@ try {
 
   assert.equal(postRestart.settingsFenceDenied, true);
   if (secretMode) {
-    console.log(JSON.stringify({status:"SECRET_RESTART_OBSERVATION",missingAfterRestart:postRestart.missingAfterRestart,
+    console.log(JSON.stringify({status:"SECRET_RESTART_OBSERVATION",missingAfterRestart:postRestart.missingAfterRestart,injectedMissing:postRestart.injectedMissing,missingBeforeRecovery:postRestart.missingBeforeRecovery,
       readOnlyObservation:postRestart.readOnlyObservation,readOnlyMissing:postRestart.readOnlyMissing,
       readOnlyFailureStage:postRestart.readOnlyFailureStage,restored:postRestart.recovered.stagedSecretRestored===true || postRestart.restoredViaUi,
       restoredViaUi:postRestart.restoredViaUi,
       recoveryFailureStage:postRestart.recovered.failureStage??null,stagedSecretMatches:postRestart.stagedSecretMatches,
       sourceSecretMatches:postRestart.sourceSecretMatches,tokenSecretMatches:postRestart.tokenSecretMatches}));
-    if(postRestart.missingAfterRestart) {
+    if(postRestart.missingBeforeRecovery) {
       assert.equal(postRestart.readOnlyObservation,"manual-recovery-required");
       assert.equal(postRestart.readOnlyMissing,true);
       if(uiRecoveryMode) assert.equal(postRestart.restoredViaUi,true);
@@ -609,7 +632,7 @@ try {
       assert.equal(postRestart.readOnlyObservation,"authenticated-pre-cutover-destination-still-fenced");
       assert.equal(postRestart.recovered.stagedSecretRestored,undefined);
     }
-    if(uiRecoveryMode) assert.equal(postRestart.missingAfterRestart && postRestart.restoredViaUi,true,"Actual missing-secret UI journey must be exercised");
+    if(uiRecoveryMode) assert.equal((injectMissingSecret ? postRestart.missingBeforeRecovery : postRestart.missingAfterRestart) && postRestart.restoredViaUi,true,"Missing-secret UI journey must be exercised with explicitly selected fault mode");
     assert.equal(postRestart.stagedSecretMatches,true);
     assert.equal(postRestart.sourceSecretMatches,true);
     assert.equal(postRestart.tokenSecretMatches,true);
@@ -799,7 +822,7 @@ try {
     status: staleClientMode
       ? "D413_LIVE_OBSIDIAN_STALE_SOURCE_ISOLATION_PASS"
       : settingsCutoverMode ? "D520_LIVE_OBSIDIAN_SETTINGS_RESTART_PASS" : "D412_LIVE_OBSIDIAN_PRE_CUTOVER_PASS",
-    ...(settingsCutoverMode ? {settingsCutoverObservation:postRestart.recovered.settingsCutoverObservation,manualSyncDenied:postRestart.manualSyncDenied} : {}),
+    ...(settingsCutoverMode ? {settingsCutoverObservation:postRestart.recovered.settingsCutoverObservation,manualSyncDenied:postRestart.manualSyncDenied,missingAfterRestart:postRestart.missingAfterRestart,injectedMissing:postRestart.injectedMissing} : {}),
     ...(staleClientMode ? { staleClientReport } : {}),
     repoId: target.id,
     pinnedSourceCommitSha: rehearsal.report.pinnedSourceCommitSha,
