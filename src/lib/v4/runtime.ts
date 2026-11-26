@@ -55,6 +55,7 @@ import { V4CancelledError, throwIfV4Aborted } from "./cancellation"
 import { V4PublicationRaceError, isV4PublicationRaceError } from "./publication-race"
 import { assertV4SpeculativeConfigStillAbsent, guardV4SpeculativeConfigGithub } from "./speculative-config-guard"
 
+import { resolveV4InstalledActiveIndexRoot, V4_INSTALLED_ACTIVE_ROUTE_PATH } from "./reencryption-installed-active-route"
 import { discoverV4InstalledSettingsIntent, V4_INSTALLED_CUTOVER_INTENT_PATH } from "./reencryption-installed-settings-cutover"
 import { discoverV4InstalledSecretIdentity, installedSecretReceiptRoot } from "./reencryption-installed-secret"
 import { V4_RUNTIME_INDEX_ROOT } from "./reencryption-index-root"
@@ -1994,6 +1995,29 @@ export class V4PluginRuntime {
     } catch { return null }
   }
 
+  /** Explicit activation of the exact recovered Destination, never a
+   * Settings/Force override. A fresh Runtime must have hydrated its new key. */
+  async activateInstalledDestinationIndexFromDisk(input: {
+    readonly expectedLocatorDigest: string
+    readonly acknowledgement: "accept-best-effort-power-loss-recovery-risk"
+    readonly createGitHubClient?: ((branch: string) => GitHubClient) | undefined
+  }): Promise<V4InstalledPreCutoverRecoveryReport | null> {
+    try {
+      if (input.acknowledgement !== "accept-best-effort-power-loss-recovery-risk"
+        || !/^[a-f0-9]{64}$/u.test(input.expectedLocatorDigest)
+        || await this.adapter.exists(V4_INSTALLED_ACTIVE_ROUTE_PATH)) return null
+      const discovered = await this.discoverInstalledSettingsRecovery()
+      const settings = discovered.restart.settings
+      if (discovered.locatorDigest !== input.expectedLocatorDigest
+        || this.repoId(settings) !== discovered.restart.identity.destinationRepoId
+        || !settings.encryptionPassphrase
+        || discovered.restart.storage.getSecret(settings.encryptionPassphraseSecretId) !== settings.encryptionPassphrase) return null
+      return await this.recoverInstalledPreCutover({
+        ...discovered.input, verifyPhysicalVault: true, createGitHubClient: input.createGitHubClient,
+      }, false, false, discovered.restart, true)
+    } catch { return null }
+  }
+
   async restoreInstalledStagedSecretFromDisk(input: {
     readonly expectedLocatorDigest: string; readonly newPassphrase: string
     readonly createGitHubClient?: ((branch: string) => GitHubClient) | undefined
@@ -2018,7 +2042,7 @@ export class V4PluginRuntime {
     return this.recoverInstalledPreCutover({ ...input, verifyShadowIndex: true, recoverStagedSecret: true }, true)
   }
 
-  private async recoverInstalledPreCutover(input: Parameters<V4PluginRuntime["inspectFencedReencryptionPreCutoverRecovery"]>[0], restoreMissing: boolean, stageSettings = false, restart?: Awaited<ReturnType<V4PluginRuntime["discoverInstalledSettingsRecovery"]>>["restart"]): Promise<V4InstalledPreCutoverRecoveryReport> {
+  private async recoverInstalledPreCutover(input: Parameters<V4PluginRuntime["inspectFencedReencryptionPreCutoverRecovery"]>[0], restoreMissing: boolean, stageSettings = false, restart?: Awaited<ReturnType<V4PluginRuntime["discoverInstalledSettingsRecovery"]>>["restart"], activateIndex = false): Promise<V4InstalledPreCutoverRecoveryReport> {
     this.assertNotDisposed()
     const vault = this.plugin.app.vault
     const backing = this.indexAdapterBacking as (typeof vault.adapter & { getFullPath?: (path: string) => string }) | undefined
@@ -2068,7 +2092,8 @@ export class V4PluginRuntime {
         || current.encryptionMode !== pinned.mode || current.vault !== pinned.vault
         || (restart && (restart.settings !== settings || restart.snapshot !== fullSettingsSnapshot || JSON.stringify(current) !== fullSettingsSnapshot
           || this.plugin.app.secretStorage !== restart.storage || restart.storage.getSecret(historicalSecretId) !== historicalPassphrase
-          || this.plugin.v4Runtime !== this || this.plugin.loadData !== loadData))
+          || this.plugin.v4Runtime !== this || this.plugin.loadData !== loadData
+          || (activateIndex && (restart.storage.getSecret(pinned.passphraseSecretId) !== pinned.passphrase || !pinned.passphrase))))
         || (stageSettings && (JSON.stringify(current) !== fullSettingsSnapshot || this.plugin.v4Runtime !== this
           || typeof loadData !== "function" || typeof saveData !== "function"
           || this.plugin.loadData !== loadData || this.plugin.saveData !== saveData))) {
@@ -2136,13 +2161,15 @@ export class V4PluginRuntime {
           this.adapter.exists(installedSecretReceiptRoot(input.runId)),
         ])
         if (restart && (!await this.adapter.exists(V4_REENCRYPTION_RUNTIME_ROUTE_ROOT)
-          || await this.adapter.read(V4_INSTALLED_CUTOVER_INTENT_PATH) !== restart.intentText)) return false
+          || await this.adapter.read(V4_INSTALLED_CUTOVER_INTENT_PATH) !== restart.intentText
+          || await this.adapter.exists(V4_INSTALLED_ACTIVE_ROUTE_PATH))) return false
         if (!restart && !stageSettings && await this.adapter.exists(V4_REENCRYPTION_RUNTIME_ROUTE_ROOT)) return false
         assertOwner()
         return checks[0] === false && checks[1] === verifyShadowIndex
-          && checks[2] === false && checks[3] === false
+          && (activateIndex || checks[2] === false) && checks[3] === false
           && checks[4] === recoverStagedSecret && (!recoverStagedSecret || verifyShadowIndex)
       },
+      activateDestinationIndex: activateIndex ? true : undefined,
       restartSettingsBinding: restart ? {
         intentText: restart.intentText, currentRepoId: this.repoId(settings),
         currentSecretId: pinned.passphraseSecretId, tokenSecretId: pinned.tokenSecretId,
@@ -2209,7 +2236,13 @@ export class V4PluginRuntime {
     if (!loaded) throw new V4HistoryNotInitializedError()
     assertV4PathLayoutCompatible(loaded.remoteConfig, loaded.config, "normal")
     const config = loaded.config
-    const index = await this.loadIndex(config)
+    const settings = { ...this.plugin.settings }
+    const root = await this.adapter.exists(V4_INSTALLED_ACTIVE_ROUTE_PATH) ? await this.resolveInstalledSyncIndexRoot({
+      settings, github: this.plugin.githubClient, config,
+      keyring: config.mode === "encrypted" ? await this.keyringForConfig(config, settings.encryptionPassphrase) : undefined,
+      credentialGeneration: this.credentialGeneration, operation: "normal",
+    }) : V4_INDEX_ROOT
+    const index = await this.loadIndex(config, settings.vault, root)
     for (const shard of Object.values(index.shards)) {
       for (const record of Object.values(shard.records)) if (!record.deleted && record.path === path) return record.fileId
     }
@@ -2341,16 +2374,70 @@ export class V4PluginRuntime {
     return { config: selectV4RuntimeConfig(null, mode, repoId), source: "speculative-empty" }
   }
 
-  private async loadIndex(config: V4RemoteConfig, deviceId = this.plugin.settings.vault): Promise<V4LocalIndex> {
-    const loaded = await loadV4LocalIndex(this.adapter, V4_INDEX_ROOT)
+  private async loadIndex(config: V4RemoteConfig, deviceId = this.plugin.settings.vault, root = V4_INDEX_ROOT): Promise<V4LocalIndex> {
+    const loaded = await loadV4LocalIndex(this.adapter, root)
     const pathLayout = config.pathLayout ?? expectedV4PathLayout(config.mode)
     if (loaded.repoId === config.repoId && loaded.deviceId === deviceId
       && loaded.mode === config.mode && loaded.pathLayout === pathLayout) return loaded
+    if (root !== V4_INDEX_ROOT) throw new V4ReencryptionSyncFencedError()
     return createEmptyV4LocalIndex({ repoId: config.repoId, deviceId: deviceId || "defaultVault", mode: config.mode, pathLayout })
   }
 
-  private async saveIndex(index: V4LocalIndex, previousShardHashes: Record<string, string> = {}): Promise<void> {
-    await saveV4LocalIndex(this.adapter, V4_INDEX_ROOT, index, previousShardHashes)
+  private async saveIndex(index: V4LocalIndex, previousShardHashes: Record<string, string> = {}, root = V4_INDEX_ROOT): Promise<void> {
+    await saveV4LocalIndex(this.adapter, root, index, previousShardHashes)
+  }
+
+  /** A persisted route is never a bare path override. Pin the live owner
+   * and authenticate every attempt. Never fall back to the historical Source. */
+  private async resolveInstalledSyncIndexRoot(input: {
+    settings: FastSync["settings"]; github: GitHubClient; config: V4RemoteConfig; keyring: V4Keyring | undefined
+    credentialGeneration: number; operation: V4SyncRequest["operation"]
+  }): Promise<string> {
+    if (!await this.adapter.exists(V4_INSTALLED_ACTIVE_ROUTE_PATH)) {
+      await assertV4ReencryptionSyncFenceClear(this.adapter)
+      return V4_INDEX_ROOT
+    }
+    try {
+      const { settings, github, config, keyring, credentialGeneration, operation } = input
+      const storage = this.plugin.app.secretStorage
+      const current = this.plugin.settings
+      const generation = this.plugin.settingsSaveGeneration
+      const repoId = this.repoId(settings)
+      const load = this.plugin.loadData
+      const assertOwner = () => {
+        this.assertNotDisposed()
+        if (this.plugin.settings !== current || this.plugin.githubClient !== github
+          || this.plugin.app.vault.adapter !== this.indexAdapterBacking
+          || this.plugin.app.secretStorage !== storage || this.plugin.loadData !== load
+          || this.credentialGeneration !== credentialGeneration || this.plugin.settingsSaveGeneration !== generation
+          || this.repoId(current) !== repoId || current.vault !== settings.vault
+          || current.encryptionMode !== "encrypted" || current.encryptionPassphrase !== settings.encryptionPassphrase
+          || current.encryptionPassphraseSecretId !== settings.encryptionPassphraseSecretId
+          || current.githubToken !== settings.githubToken || current.githubTokenSecretId !== settings.githubTokenSecretId
+          || current.ignorePathRegex !== settings.ignorePathRegex || current.syncObsidianConfig !== settings.syncObsidianConfig
+          || current.syncBookmarks !== settings.syncBookmarks || current.syncPlugins !== settings.syncPlugins
+          || storage.getSecret(settings.encryptionPassphraseSecretId) !== settings.encryptionPassphrase
+          || storage.getSecret(settings.githubTokenSecretId) !== settings.githubToken
+          || this.plugin.isSettingsSaveInProgress?.()) throw new V4ReencryptionSyncFencedError()
+      }
+      if (operation !== "normal" || !keyring || config.mode !== "encrypted" || config.repoId !== repoId
+        || !settings.encryptionPassphrase || !settings.githubToken || github.branchName !== settings.githubBranch) throw new V4ReencryptionSyncFencedError()
+      assertOwner()
+      const remote = await github.getRepositoryIdentity()
+      if (remote.fullName.toLowerCase() !== (settings.githubOwner + "/" + settings.githubRepo).toLowerCase()) throw new V4ReencryptionSyncFencedError()
+      const root = await resolveV4InstalledActiveIndexRoot({
+        adapter: this.adapter, repoId, deviceId: settings.vault, physicalRepositoryId: remote.id,
+        destinationSecretId: settings.encryptionPassphraseSecretId, tokenSecretId: settings.githubTokenSecretId,
+        key: keyring.journalKey, readSettings: () => load.call(this.plugin), assertOwner,
+      })
+      assertOwner()
+      return root
+    } catch { throw new V4ReencryptionSyncFencedError() }
+  }
+
+  private async assertInstalledSyncRouteMayBeChecked(operation: V4SyncRequest["operation"]): Promise<void> {
+    if (operation === "normal" && await this.adapter.exists(V4_INSTALLED_ACTIVE_ROUTE_PATH)) return
+    await assertV4ReencryptionSyncFenceClear(this.adapter)
   }
 
   /**
@@ -2527,8 +2614,7 @@ export class V4PluginRuntime {
       trigger: request.trigger,
     })
     try {
-      await assertV4ReencryptionSyncFenceClear(this.adapter)
-      if (request.trigger === "startup") this.plugin.enableWatch()
+      await this.assertInstalledSyncRouteMayBeChecked(request.operation)
       if (this.uncVault && !this.networkStorageNoticeShown) {
         this.networkStorageNoticeShown = true
         new Notice(`GitHub Sync: UNC network vault detected. ${V4_NETWORK_VAULT_WARNING}`, 10000)
@@ -2546,7 +2632,7 @@ export class V4PluginRuntime {
         const attemptScope = this.scopePredicate(attemptSettings)
         try {
           throwIfV4Aborted(signal)
-          await assertV4ReencryptionSyncFenceClear(this.adapter)
+          await this.assertInstalledSyncRouteMayBeChecked(request.operation)
           progressAttempt++
           this.progressStore.update({
             phase: "checking-remote",
@@ -2565,8 +2651,6 @@ export class V4PluginRuntime {
           }
           const config = selectV4RuntimeConfig(discovered, desiredMode, repoId, settings.newVaultKdfIterations)
           this.progressStore.update({ phase: "loading-index", currentPath: undefined, currentDirection: undefined })
-          const index = await this.loadIndex(config, settings.vault)
-          const previousShardHashes = { ...index.shardHashes }
           if (configSelection.source === "speculative-empty") {
             await assertV4SpeculativeConfigStillAbsent(github, config.repoId)
           }
@@ -2576,6 +2660,13 @@ export class V4PluginRuntime {
           const keyring = authenticationConfig
             ? await this.keyringForConfig(authenticationConfig, passphrase, signal, runCredentialGeneration)
             : undefined
+          const routeInput = { settings, github, config, keyring, credentialGeneration: runCredentialGeneration, operation: request.operation }
+          const indexRoot = await this.resolveInstalledSyncIndexRoot(routeInput)
+          if (indexRoot !== V4_INDEX_ROOT && configSelection.source !== "observed-remote") throw new V4ReencryptionSyncFencedError()
+          if (request.trigger === "startup") this.plugin.enableWatch()
+          this.reencryptionSyncFenced = false
+          const index = await this.loadIndex(config, settings.vault, indexRoot)
+          const previousShardHashes = { ...index.shardHashes }
           const recoveryNamespace = (await sha256Hex(utf8ToBytes(config.repoId))).slice(0, 32)
           const recoveryRoot = `${V4_RECOVERY_ROOT}/${recoveryNamespace}`
           let recoveryPayloadKey: Uint8Array | undefined
@@ -2674,7 +2765,8 @@ export class V4PluginRuntime {
             },
           }).sync({ operation: request.operation, allowThresholdOverride: !!request.allowThresholdOverride, changes })
           this.progressStore.update({ phase: "saving-index", currentPath: undefined, currentDirection: undefined })
-          await this.saveIndex(index, previousShardHashes)
+          if (await this.resolveInstalledSyncIndexRoot(routeInput) !== indexRoot) throw new V4ReencryptionSyncFencedError()
+          await this.saveIndex(index, previousShardHashes, indexRoot)
           const recoveredRunId = !result.recoveryRunId
             && reconciledRecovery
             && reconciledRecovery.header.phase !== "index-committed"

@@ -8,6 +8,8 @@ import { setRequestUrlHandler } from "obsidian"
 import { fromBase64, sha256Hex, toBase64, toBase64Url, utf8ToBytes } from "../../src/lib/bytes"
 import { GitHubClient } from "../../src/lib/github-api"
 import { V4PluginRuntime } from "../../src/lib/v4/runtime"
+import { V4_INSTALLED_ACTIVE_ROUTE_PATH } from "../../src/lib/v4/reencryption-installed-active-route"
+import { planV4ReencryptionSeparatedRoots } from "../../src/lib/v4/reencryption-separated-selector"
 import { V4_RUNTIME_INDEX_ROOT } from "../../src/lib/v4/reencryption-index-root"
 import { V4_REENCRYPTION_RUNTIME_ROUTE_PATH } from "../../src/lib/v4/reencryption-runtime-index-route"
 import { V4_REENCRYPTION_SYNC_FENCE_ROOT } from "../../src/lib/v4/reencryption-sync-fence"
@@ -111,6 +113,25 @@ function createMemoryGitHubServer() {
     const ok = (json: unknown, status = 200) => ({ status, text: JSON.stringify(json), headers: {}, json })
     const err = (status: number, message: string) => ({ status, text: JSON.stringify({ message }), headers: {}, json: { message } })
 
+    // Ordinary publication uses strict server-side GraphQL beforeOid CAS.
+    if (method === "POST" && pathName === "/graphql") {
+      const body = JSON.parse(req.body ?? "{}")
+      if (body.query.includes("repository(owner:")) {
+        if (body.variables.owner !== OWNER || body.variables.repo !== REPO) return err(404, "Wrong repository")
+        return ok({ data: { repository: { id: "fixture-node-id" } } })
+      }
+      if (body.query.includes("updateRefs(")) {
+        const input = body.variables.input
+        if (input.repositoryId !== "fixture-node-id" || input.refUpdates.length !== 1) return err(400, "Wrong repository or updates")
+        const update = input.refUpdates[0]
+        const branch = update.name.replace(/^refs\/heads\//u, "")
+        if (update.force !== false || refs.get(branch) !== update.beforeOid || !commits.has(update.afterOid)
+          || !commits.get(update.afterOid)!.parents.includes(update.beforeOid)) return ok({ errors: [{ message: "CAS rejected" }] })
+        refs.set(branch, update.afterOid)
+        return ok({ data: { updateRefs: { clientMutationId: null } } })
+      }
+      return err(400, "Unknown GraphQL operation")
+    }
     if (method === "GET" && pathName === repoPrefix) {
       return ok({ id: PHYSICAL_REPO_ID, full_name: `${OWNER}/${REPO}`, default_branch: DEFAULT_BRANCH })
     }
@@ -326,12 +347,13 @@ async function createInstalledVaultFixture(files: ReadonlyArray<{ path: string; 
     let watchEnabled = true
     const plugin = {
       app: {
-        vault: { configDir: CONFIG_DIR, adapter },
+        vault: { configDir: CONFIG_DIR, adapter, getFiles: () => files.map(file => ({ path: file.path, stat: { size: file.bytes.length, mtime: 1000 } })) },
         workspace: { iterateAllLeaves: () => {}, activeEditor: null },
         secretStorage,
       },
       manifest: { id: PLUGIN_ID },
-      settings: { ...settings },
+      settings: { ...settings, abortChangePercent: 100, conflictPolicy: "local" },
+      githubClient: makeClientFactory()(SOURCE_BRANCH),
       settingsSaveGeneration: 0,
       isSyncInProgress: false,
       isSettingsSaveInProgress: () => false,
@@ -339,6 +361,7 @@ async function createInstalledVaultFixture(files: ReadonlyArray<{ path: string; 
       saveData: async (data: unknown) => { persistedData = structuredClone(data) as Record<string, unknown> },
       v4Runtime: undefined as V4PluginRuntime | undefined,
       disableWatch: () => { watchEnabled = false },
+      enableWatch: () => { watchEnabled = true },
       addIgnoredFile() {},
       removeIgnoredFile() {},
     }
@@ -741,6 +764,92 @@ test("D412 installed Runtime orchestrates Source -> Backup -> Staging -> Scratch
     assert.equal(server.refs.get(SOURCE_BRANCH), pinnedSourceCommitSha)
     assert.equal(server.refs.get(destinationBranch), destSha)
 
+    // Actual activation after a fresh hydrated Destination runtime. Before
+    // this point, a lost key repair deliberately leaves memory unchanged.
+    runtime2.runtime.dispose()
+    runtime2 = vault.makeRuntime()
+    runtime2.plugin.settings.githubBranch = destinationBranch
+    runtime2.plugin.settings.encryptionPassphraseSecretId = stagedId
+    runtime2.plugin.settings.encryptionPassphrase = NEW_PASSPHRASE
+    runtime2.plugin.githubClient = makeClientFactory()(destinationBranch)
+    const activationRecovery = await runtime2.runtime.inspectInstalledStagedRecoveryFromDisk(makeClientFactory())
+    assert.equal(activationRecovery?.report.settingsCutoverObservation, "destination-settings-observed-fenced")
+    const activate = { expectedLocatorDigest: activationRecovery!.locatorDigest,
+      acknowledgement: "accept-best-effort-power-loss-recovery-risk" as const, createGitHubClient: makeClientFactory() }
+    const activePath = CONFIG_DIR + "/plugins/" + PLUGIN_ID + "/" + V4_INSTALLED_ACTIVE_ROUTE_PATH
+    const selectorPath = CONFIG_DIR + "/plugins/" + PLUGIN_ID + "/" + planV4ReencryptionSeparatedRoots(V4_RUNTIME_INDEX_ROOT, runId).selectorPath
+    assert.equal(await runtime2.runtime.activateInstalledDestinationIndexFromDisk({ ...activate, expectedLocatorDigest: "0".repeat(64) }), null)
+    const activationDrift = Uint8Array.from(noteBytes)
+    activationDrift[0] ^= 1
+    await vault.adapter.writeBinary("Notes/สวัสดี.md", activationDrift.buffer)
+    const blocked = await runtime2.runtime.activateInstalledDestinationIndexFromDisk(activate)
+    assert.equal(blocked?.failureStage, "physical-parity")
+    assert.equal(await vault.adapter.exists(activePath), false)
+    await vault.adapter.writeBinary("Notes/สวัสดี.md", Uint8Array.from(noteBytes).buffer)
+    const activated = await runtime2.runtime.activateInstalledDestinationIndexFromDisk(activate)
+    assert.equal(activated?.destinationIndexActivated, true)
+    assert.equal(await vault.adapter.read(activePath), await vault.adapter.read(selectorPath))
+    assert.deepEqual(await loadV4LocalIndex(vault.adapter, sourceRoot), oldRoot)
+    assert.deepEqual(await loadV4LocalIndex(vault.adapter, shadowRoot), newRoot)
+    assert.equal(vault.secrets.get(vault.settings.encryptionPassphraseSecretId), OLD_PASSPHRASE)
+    // Fresh Runtime has no in-memory activation grant. Load route from disk.
+    runtime2.runtime.dispose()
+    runtime2 = vault.makeRuntime()
+    runtime2.plugin.settings.githubBranch = destinationBranch
+    runtime2.plugin.settings.encryptionPassphraseSecretId = stagedId
+    runtime2.plugin.settings.encryptionPassphrase = NEW_PASSPHRASE
+    runtime2.plugin.githubClient = makeClientFactory()(destinationBranch)
+    const activeText = await vault.adapter.read(activePath)
+    await vault.adapter.write(activePath, activeText.slice(0, -3) + 'AAA')
+    await runtime2.runtime.manualSync()
+    assert.equal(runtime2.runtime.progressSnapshot.lifecycle, "failed")
+    assert.equal(server.refs.get(destinationBranch), destSha)
+    await vault.adapter.write(activePath, activeText)
+    await runtime2.runtime.manualSync()
+    assert.equal(runtime2.runtime.progressSnapshot.lifecycle, "no-change", runtime2.runtime.progressSnapshot.errorMessage)
+    assert.equal(server.refs.get(destinationBranch), destSha)
+    await assert.rejects(() => runtime2!.runtime.assertReencryptionSettingsSaveAllowed())
+    await runtime2.runtime.forcePush(true)
+    assert.equal(runtime2.runtime.progressSnapshot.lifecycle, "failed")
+    assert.equal(server.refs.get(destinationBranch), destSha)
+    assert.deepEqual(await loadV4LocalIndex(vault.adapter, sourceRoot), oldRoot)
+    // Ordinary sync edits the Destination only, even after an earlier refusal.
+    const updatedNote = "# D521 ordinary Destination update"
+    await vault.adapter.write("Notes/สวัสดี.md", updatedNote)
+    await runtime2.runtime.manualSync()
+    assert.equal(runtime2.runtime.progressSnapshot.lifecycle, "success", runtime2.runtime.progressSnapshot.errorMessage)
+    const nextDest = server.refs.get(destinationBranch)!
+    assert.notEqual(nextDest, destSha)
+    assert.equal(server.refs.get(SOURCE_BRANCH), pinnedSourceCommitSha)
+    assert.equal(server.refs.get(backupBranch), pinnedSourceCommitSha)
+    assert.equal((await loadV4LocalIndex(vault.adapter, shadowRoot)).remoteCommitSha, nextDest)
+    assert.deepEqual(await loadV4LocalIndex(vault.adapter, sourceRoot), oldRoot)
+    const verifiedDest = await verifyGitHubReencryptionForkSourceWithTranscodeInventory({
+      github: makeClientFactory()(destinationBranch), expectedRepoId: OWNER + "/" + REPO + "#" + destinationBranch,
+      expectedBranch: destinationBranch, passphrase: NEW_PASSPHRASE,
+    })
+    assert.equal(verifiedDest.sourceRecords.find(r => r.path === "Notes/สวัสดี.md")?.plaintextSha256, await sha256Hex(utf8ToBytes(updatedNote)))
+    // A second cold runtime must still select the advanced Shadow, not
+    // reapply the old baseline or overwrite the historical Source.
+    runtime2.runtime.dispose()
+    runtime2 = vault.makeRuntime()
+    runtime2.plugin.settings.githubBranch = destinationBranch
+    runtime2.plugin.settings.encryptionPassphraseSecretId = stagedId
+    runtime2.plugin.settings.encryptionPassphrase = NEW_PASSPHRASE
+    runtime2.plugin.githubClient = makeClientFactory()(destinationBranch)
+    await runtime2.runtime.manualSync()
+    assert.equal(runtime2.runtime.progressSnapshot.lifecycle, "no-change", runtime2.runtime.progressSnapshot.errorMessage)
+    assert.equal(server.refs.get(destinationBranch), nextDest)
+    assert.equal(await runtime2.runtime.fileIdForPath("Notes/สวัสดี.md"), verifiedDest.sourceRecords.find(r => r.path === "Notes/สวัสดี.md")?.fileId)
+    assert.deepEqual(await loadV4LocalIndex(vault.adapter, sourceRoot), oldRoot)
+    // Missing active marker does not authorize falling back to Source.
+    await vault.adapter.remove(activePath)
+    await runtime2.runtime.manualSync()
+    assert.equal(runtime2.runtime.progressSnapshot.lifecycle, "failed")
+    assert.equal(server.refs.get(destinationBranch), nextDest)
+    assert.deepEqual(await loadV4LocalIndex(vault.adapter, sourceRoot), oldRoot)
+    await vault.adapter.write(activePath, activeText)
+    await vault.adapter.writeBinary("Notes/สวัสดี.md", Uint8Array.from(noteBytes).buffer)
     // Physical Vault notes remain identical to original fixture.
     assert.deepEqual(new Uint8Array(await vault.adapter.readBinary("Notes/สวัสดี.md")), noteBytes)
     assert.deepEqual(new Uint8Array(await vault.adapter.readBinary("Attachments/data.bin")), binBytes)

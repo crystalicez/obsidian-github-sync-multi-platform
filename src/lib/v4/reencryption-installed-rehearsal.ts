@@ -7,6 +7,7 @@ import { readImmutableGitFile } from "./immutable-git-read"
 import { assertV4Pbkdf2Iterations, V4_MIN_NEW_PBKDF2_ITERATIONS } from "./kdf-policy"
 import type { V4LocalIndexAdapter } from "./local-index"
 import { stageV4InstalledDestinationSecret, inspectV4InstalledDestinationSecret, restoreV4InstalledMissingDestinationSecret, type V4InstalledSecretOwner, type V4InstalledSecretReport } from "./reencryption-installed-secret"
+import { activateV4InstalledDestinationIndex } from "./reencryption-installed-active-route"
 import { captureV4InstalledCutoverSourceSettings, inspectV4InstalledSettingsCutover, writeV4InstalledDestinationSettings, type V4InstalledSettingsIo, type V4InstalledSettingsRestartBinding, type V4InstalledSettingsCutoverObservation } from "./reencryption-installed-settings-cutover"
 import { stageV4InstalledReencryptionShadow, verifyV4InstalledReencryptionShadow, type V4InstalledShadowReport } from "./reencryption-installed-shadow"
 import { expectedV4PathLayout, V4_CONFIG_PATH, type V4RemoteConfig } from "./protocol-types"
@@ -154,6 +155,7 @@ export interface V4InstalledPreCutoverRecoveryInput {
   readonly createInitiatorReader?: ((assertLease: () => Promise<void>) => V4InitiatorLocalReader) | undefined
   readonly stageDestinationSettings?: V4InstalledSettingsIo | undefined
   readonly restartSettingsBinding?: V4InstalledSettingsRestartBinding | undefined
+  readonly activateDestinationIndex?: true | undefined
   readonly openReadOnlyWal: () => Promise<V4InstalledRehearsalReadOnlyWal>
   readonly createGitHubClient: (branch: string) => GitHubClient
   readonly assertOwnerStillValid?: (() => void) | undefined
@@ -162,7 +164,7 @@ export interface V4InstalledPreCutoverRecoveryInput {
 
 export interface V4InstalledPreCutoverRecoveryReport {
   readonly integrityScope: "read-only-installed-pre-cutover-wal-backup-and-destination" | "installed-pre-cutover-staged-secret-recovery"
-  readonly observation: "authenticated-pre-cutover-destination-still-fenced" | "manual-recovery-required"
+  readonly observation: "authenticated-pre-cutover-destination-still-fenced" | "authenticated-destination-index-activated" | "manual-recovery-required"
   readonly walAuthenticated: boolean
   readonly backupReverified: boolean
   readonly destinationReverified: boolean
@@ -173,8 +175,10 @@ export interface V4InstalledPreCutoverRecoveryReport {
   readonly physicalParityReverified?: true | undefined
   readonly sourceRefReverified?: true | undefined
   readonly destinationSettingsWrittenFenced?: true | undefined
+  /** Narrow ordinary-Sync route committed; legacy blanket grants stay false. */
+  readonly destinationIndexActivated?: true | undefined
   readonly settingsCutoverObservation?: Exclude<V4InstalledSettingsCutoverObservation, "manual-recovery-required"> | undefined
-  readonly failureStage?: "fence" | "backup" | "wal" | "destination" | "secret" | "shadow" | "physical-parity" | "source-ref" | "settings-write" | "final-readback" | undefined
+  readonly failureStage?: "fence" | "backup" | "wal" | "destination" | "secret" | "shadow" | "physical-parity" | "source-ref" | "settings-write" | "index-activation" | "final-readback" | undefined
   readonly verifiedFileCount: number
   readonly verifiedPlaintextBytes: string
   readonly cutoverAuthorized: false
@@ -761,7 +765,8 @@ export async function inspectV4InstalledPreCutoverRecoveryAfterRestart(
     || (input.restoreMissingSecret && (!input.secretOwner || !input.shadow || !input.newPassphrase || input.createInitiatorReader))
     || (input.createInitiatorReader && (!input.secretOwner || !input.shadow || !input.inspectFenceAndNoPartialCutover))
     || (input.stageDestinationSettings && (!input.createInitiatorReader || input.restoreMissingSecret))
-    || (input.restartSettingsBinding && (!input.secretOwner || !input.shadow || !input.inspectFenceAndNoPartialCutover || input.createInitiatorReader || input.stageDestinationSettings))
+    || (input.restartSettingsBinding && (!input.secretOwner || !input.shadow || !input.inspectFenceAndNoPartialCutover || (input.createInitiatorReader && !input.activateDestinationIndex) || input.stageDestinationSettings))
+    || (input.activateDestinationIndex && (!input.restartSettingsBinding || !input.createInitiatorReader || input.restoreMissingSecret))
     || !Number.isSafeInteger(input.expectedFinalWalGeneration) || input.expectedFinalWalGeneration < 1) {
     return manualRecoveryReport()
   }
@@ -981,6 +986,7 @@ export async function inspectV4InstalledPreCutoverRecoveryAfterRestart(
     }
     failureStage = "settings-write"
     await assertRestartSettings()
+    if (input.activateDestinationIndex && settingsCutoverObservation !== "destination-settings-observed-fenced") return fail()
     failureStage = "secret"
     missing = stagedSecret?.passphrase === null
     if (missing && !restore) return fail()
@@ -1097,6 +1103,50 @@ export async function inspectV4InstalledPreCutoverRecoveryAfterRestart(
       const finalSecret = await inspectV4InstalledDestinationSecret(secretInput!)
       if (finalSecret.id !== stagedSecret!.id || finalSecret.passphrase !== destinationPassphrase) return fail()
       await assertLease()
+      if (input.activateDestinationIndex) {
+        failureStage = "index-activation"
+        const binding = input.restartSettingsBinding!
+        if (!secretInput || !stagedSecret || !stagedSecret.passphrase || !destInventory.sourceConfig.kdfParams) return fail()
+        const kdf = destInventory.sourceConfig.kdfParams
+        const salt = fromBase64Url(kdf.salt)
+        let destKeyring: V4Keyring | undefined
+        try {
+          destKeyring = await deriveV4Keyring({ passphrase: destinationPassphrase, repoId: destinationRepoId, salt, iterations: kdf.iterations })
+          const reader = input.createInitiatorReader(assertLease)
+          await activateV4InstalledDestinationIndex({
+            adapter: secretInput.adapter, identity: secretInput.identity, key: destKeyring.journalKey,
+            repoId: destinationRepoId, deviceId: secretInput.identity.deviceId,
+            physicalRepositoryId: input.expectedPhysicalRepositoryId,
+            destinationSecretId: stagedSecret.id, tokenSecretId: binding.tokenSecretId,
+            readSettings: binding.io.read, assertOwner: secretInput.owner.assertOwner,
+            assertProof: async () => {
+              await assertLease()
+              await assertRestartSettings()
+              if (settingsCutoverObservation !== "destination-settings-observed-fenced") throw Error("Destination Settings not verified.")
+              await verifyV4InstalledReencryptionShadow({
+                adapter: input.shadow!.adapter, runId: input.runId, deviceId: input.shadow!.deviceId,
+                source: backupInventory, destination: destInventory,
+              })
+              await verifyV4ReencryptionInitiatorLocalParity({
+                pinnedSourceCommitSha: input.pinnedSourceCommitSha, verifiedSource: backupInventory.verifiedSource,
+                sourceRecords: backupInventory.sourceRecords.filter(record => !record.deleted), reader, signal: input.signal,
+              })
+              await assertSourceStillPinned()
+              const [backup, destination] = await Promise.all([backupClient.getGitRef(), destinationClient.getGitRef()])
+              if (backup.sha !== input.pinnedSourceCommitSha || destination.sha !== input.destinationCommitSha) throw Error("Activation refs changed.")
+              await readOnlyJournal.assertHealthySnapshot(input.expectedFinalWalGeneration)
+              const final = await inspectV4InstalledDestinationSecret(secretInput)
+              if (final.id !== stagedSecret.id || final.passphrase !== destinationPassphrase) throw Error("Activation custody changed.")
+              await assertLease()
+              await assertRestartSettings()
+            },
+            checkpoint: async () => { await wal!.assertBestEffortCheckpoint(); await readOnlyJournal.assertHealthySnapshot(input.expectedFinalWalGeneration) },
+          })
+        } finally {
+          salt.fill(0)
+          if (destKeyring) for (const k of Object.values(destKeyring)) k.fill(0)
+        }
+      }
       if (input.stageDestinationSettings && originalData !== undefined) {
         failureStage = "settings-write"
         const reader = input.createInitiatorReader(assertLease)
@@ -1128,7 +1178,7 @@ export async function inspectV4InstalledPreCutoverRecoveryAfterRestart(
     input.assertOwnerStillValid?.()
     return Object.freeze({
       integrityScope: restore ? "installed-pre-cutover-staged-secret-recovery" : "read-only-installed-pre-cutover-wal-backup-and-destination",
-      observation: "authenticated-pre-cutover-destination-still-fenced",
+      observation: input.activateDestinationIndex ? "authenticated-destination-index-activated" : "authenticated-pre-cutover-destination-still-fenced",
       walAuthenticated,
       backupReverified,
       destinationReverified,
@@ -1137,6 +1187,7 @@ export async function inspectV4InstalledPreCutoverRecoveryAfterRestart(
       ...(restore ? { stagedSecretRestored: true as const } : {}),
       ...(input.createInitiatorReader ? { physicalParityReverified: true as const, sourceRefReverified: true as const } : {}),
       ...(input.stageDestinationSettings ? { destinationSettingsWrittenFenced: true as const } : {}),
+      ...(input.activateDestinationIndex ? { destinationIndexActivated: true as const } : {}),
       ...(settingsCutoverObservation ? { settingsCutoverObservation } : {}),
       verifiedFileCount: destInventory.verifiedSource.verifiedFileCount,
       verifiedPlaintextBytes: destInventory.verifiedSource.totalVerifiedPlaintextBytes,
