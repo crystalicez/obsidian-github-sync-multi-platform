@@ -738,6 +738,7 @@ test("D412 installed Runtime orchestrates Source -> Backup -> Staging -> Scratch
     runtime2.plugin.settings.githubBranch = destinationBranch
     runtime2.plugin.settings.encryptionPassphraseSecretId = stagedId
     runtime2.plugin.settings.encryptionPassphrase = ""
+    assert.equal(await runtime2.runtime.inspectInstalledCutoverReadinessFromDisk(makeClientFactory()), null)
     const missingAfterCutover = await runtime2.runtime.inspectInstalledStagedRecoveryFromDisk(makeClientFactory())
     assert.equal(missingAfterCutover?.report.stagedSecretMissing, true)
     assert.ok(missingAfterCutover?.locatorDigest)
@@ -776,6 +777,24 @@ test("D412 installed Runtime orchestrates Source -> Backup -> Staging -> Scratch
     runtime2.plugin.settings.encryptionPassphraseSecretId = stagedId
     runtime2.plugin.settings.encryptionPassphrase = NEW_PASSPHRASE
     runtime2.plugin.githubClient = makeClientFactory()(destinationBranch)
+    // D530: verify physical readiness on the freshly hydrated Destination
+    // without activating it or changing settings, keys, source or shadow.
+    const beforeReadyData = structuredClone(vault.persistedData)
+    const beforeReadySecrets = new Map(vault.secrets)
+    const beforeReadyRefs = new Map(server.refs)
+    const destinationReady = await runtime2.runtime.inspectInstalledCutoverReadinessFromDisk(makeClientFactory())
+    assert.equal(destinationReady?.observation, "authenticated-pre-cutover-destination-still-fenced")
+    assert.equal(destinationReady?.settingsCutoverObservation, "destination-settings-observed-fenced")
+    assert.equal(destinationReady?.physicalParityReverified, true)
+    assert.equal(destinationReady?.sourceRefReverified, true)
+    assert.equal(destinationReady?.resumeSyncAuthorized, false)
+    assert.equal(destinationReady?.oldPassphraseCleanupAuthorized, false)
+    assert.notEqual(destinationReady?.destinationIndexActivated, true)
+    assert.deepEqual(vault.persistedData, beforeReadyData)
+    assert.deepEqual(vault.secrets, beforeReadySecrets)
+    assert.deepEqual(server.refs, beforeReadyRefs)
+    assert.deepEqual(await loadV4LocalIndex(vault.adapter, sourceRoot), oldRoot)
+    assert.deepEqual(await loadV4LocalIndex(vault.adapter, shadowRoot), newRoot)
     const activationRecovery = await runtime2.runtime.inspectInstalledStagedRecoveryFromDisk(makeClientFactory())
     assert.equal(activationRecovery?.report.settingsCutoverObservation, "destination-settings-observed-fenced")
     const activate = { expectedLocatorDigest: activationRecovery!.locatorDigest,
@@ -786,12 +805,16 @@ test("D412 installed Runtime orchestrates Source -> Backup -> Staging -> Scratch
     const activationDrift = Uint8Array.from(noteBytes)
     activationDrift[0] ^= 1
     await vault.adapter.writeBinary("Notes/สวัสดี.md", activationDrift.buffer)
+    const driftReadiness = await runtime2.runtime.inspectInstalledCutoverReadinessFromDisk(makeClientFactory())
+    assert.equal(driftReadiness?.observation, "manual-recovery-required")
+    assert.equal(driftReadiness?.failureStage, "physical-parity")
     const blocked = await runtime2.runtime.activateInstalledDestinationIndexFromDisk(activate)
     assert.equal(blocked?.failureStage, "physical-parity")
     assert.equal(await vault.adapter.exists(activePath), false)
     await vault.adapter.writeBinary("Notes/สวัสดี.md", Uint8Array.from(noteBytes).buffer)
     const activated = await runtime2.runtime.activateInstalledDestinationIndexFromDisk(activate)
     assert.equal(activated?.destinationIndexActivated, true)
+    assert.equal(await runtime2.runtime.inspectInstalledCutoverReadinessFromDisk(makeClientFactory()), null)
     assert.equal(await vault.adapter.read(activePath), await vault.adapter.read(selectorPath))
     assert.deepEqual(await loadV4LocalIndex(vault.adapter, sourceRoot), oldRoot)
     assert.deepEqual(await loadV4LocalIndex(vault.adapter, shadowRoot), newRoot)

@@ -765,7 +765,7 @@ export async function inspectV4InstalledPreCutoverRecoveryAfterRestart(
     || (input.restoreMissingSecret && (!input.secretOwner || !input.shadow || !input.newPassphrase || input.createInitiatorReader))
     || (input.createInitiatorReader && (!input.secretOwner || !input.shadow || !input.inspectFenceAndNoPartialCutover))
     || (input.stageDestinationSettings && (!input.createInitiatorReader || input.restoreMissingSecret))
-    || (input.restartSettingsBinding && (!input.secretOwner || !input.shadow || !input.inspectFenceAndNoPartialCutover || (input.createInitiatorReader && !input.activateDestinationIndex) || input.stageDestinationSettings))
+    || (input.restartSettingsBinding && (!input.secretOwner || !input.shadow || !input.inspectFenceAndNoPartialCutover || input.stageDestinationSettings))
     || (input.activateDestinationIndex && (!input.restartSettingsBinding || !input.createInitiatorReader || input.restoreMissingSecret))
     || !Number.isSafeInteger(input.expectedFinalWalGeneration) || input.expectedFinalWalGeneration < 1) {
     return manualRecoveryReport()
@@ -1102,6 +1102,9 @@ export async function inspectV4InstalledPreCutoverRecoveryAfterRestart(
       await readOnlyJournal.assertHealthySnapshot(input.expectedFinalWalGeneration)
       const finalSecret = await inspectV4InstalledDestinationSecret(secretInput!)
       if (finalSecret.id !== stagedSecret!.id || finalSecret.passphrase !== destinationPassphrase) return fail()
+      // Restart readiness must bind the same Settings intent after the full
+      // physical scan, even when no activation is requested.
+      await assertRestartSettings()
       await assertLease()
       if (input.activateDestinationIndex) {
         failureStage = "index-activation"

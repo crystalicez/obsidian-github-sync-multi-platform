@@ -2038,10 +2038,27 @@ export class V4PluginRuntime {
     }
   }
 
-  /** Read-only activation preflight from persisted identity; never an activation grant. */
+  /** Read-only activation preflight from persisted identity, before or after
+   * the Settings transaction. Never an activation grant or a resume action. */
   async inspectInstalledCutoverReadinessFromDisk(createGitHubClient?: (branch: string) => GitHubClient): Promise<V4InstalledPreCutoverRecoveryReport | null> {
     try {
+      if (await this.readInstalledActiveRoutePresence()) return null
+      const intent = await this.adapter.exists(V4_INSTALLED_CUTOVER_INTENT_PATH)
+      this.assertInstalledSyncRouteBacking()
+      if (intent !== true && intent !== false) return null
+      if (intent) {
+        const discovered = await this.discoverInstalledSettingsRecovery()
+        const { settings, storage, identity } = discovered.restart
+        // A recovered but not yet hydrated Destination key is not readiness.
+        if (this.repoId(settings) === identity.destinationRepoId
+          && (!settings.encryptionPassphrase || storage.getSecret(settings.encryptionPassphraseSecretId) !== settings.encryptionPassphrase)) return null
+        if (await this.readInstalledActiveRoutePresence()) return null
+        return await this.recoverInstalledPreCutover({
+          ...discovered.input, verifyPhysicalVault: true, createGitHubClient,
+        }, false, false, discovered.restart)
+      }
       const discovered = await this.discoverInstalledStagedRecovery()
+      if (await this.readInstalledActiveRoutePresence()) return null
       return await this.inspectFencedReencryptionPreCutoverRecovery({
         ...discovered.input, verifyPhysicalVault: true, createGitHubClient,
       })

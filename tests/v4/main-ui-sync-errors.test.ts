@@ -139,6 +139,55 @@ test("D522 installed Recovery command distinguishes active route from damaged ac
   }
 })
 
+test("D530 installed Cutover readiness command distinguishes stages and never activates", async () => {
+  const ui = setupUi()
+  try {
+    await ui.plugin.onload()
+    const invoke = ui.commands.get("verify-reencryption-cutover-readiness-read-only")
+    assert.ok(invoke)
+    const runtime = ui.plugin.v4Runtime as Record<string, any>
+    const valid = {
+      observation: "authenticated-pre-cutover-destination-still-fenced",
+      integrityScope: "read-only-installed-pre-cutover-wal-backup-and-destination",
+      walAuthenticated: true, backupReverified: true, destinationReverified: true,
+      shadowReverified: true, stagedSecretReverified: true,
+      physicalParityReverified: true, sourceRefReverified: true,
+      cutoverAuthorized: false, localCutoverAuthorized: false,
+      resumeSyncAuthorized: false, oldPassphraseCleanupAuthorized: false, powerLossDurabilityProven: false,
+    }
+    let calls = 0
+    for (const [report, message] of [
+      [valid, /before Settings Cutover/],
+      [{ ...valid, settingsCutoverObservation: "source-settings-intent-pending" }, /Source Settings remain selected/],
+      [{ ...valid, settingsCutoverObservation: "destination-settings-observed-fenced" }, /Index activation is still disabled/],
+      [{ ...valid, physicalParityReverified: false }, /could not be verified/],
+      [{ ...valid, resumeSyncAuthorized: true }, /could not be verified/],
+      [{ ...valid, destinationIndexActivated: true }, /could not be verified/],
+      [null, /could not be verified/],
+    ] as const) {
+      runtime.inspectInstalledCutoverReadinessFromDisk = async () => { calls++; return report }
+      Notice.messages.length = 0
+      const previous = calls
+      invoke()
+      invoke()
+      await tick()
+      assert.equal(calls, previous + 1)
+      assert.equal(Notice.messages.length, 2)
+      assert.match(Notice.messages.at(-1)!, message)
+      assert.deepEqual(ui.attempts, [])
+    }
+    runtime.inspectInstalledCutoverReadinessFromDisk = async () => { throw Error("private token") }
+    Notice.messages.length = 0
+    invoke()
+    await tick()
+    assert.match(Notice.messages.at(-1)!, /check unavailable/)
+    assert.doesNotMatch(Notice.messages.join(" "), /private token/)
+  } finally {
+    ui.cleanup()
+    Notice.messages.length = 0
+  }
+})
+
 test("D278 read-only Complete Recovery command never starts after unload and keeps results non-authorizing", async () => {
   const ui = setupUi()
   Notice.messages.length = 0

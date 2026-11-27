@@ -347,6 +347,12 @@ export default class FastSync extends Plugin {
     })
 
     this.addCommand({
+      id: "verify-reencryption-cutover-readiness-read-only",
+      name: "GitHub Sync: Verify Re-encryption Cutover Readiness (Read-only)",
+      callback: () => { void this.openInstalledCutoverReadiness() },
+    })
+
+    this.addCommand({
       id: "recover-staged-reencryption-key",
       name: "GitHub Sync: Recover staged Re-encryption key",
       callback: () => { void this.openStagedReencryptionKeyRecovery() },
@@ -390,6 +396,44 @@ export default class FastSync extends Plugin {
         sleep: selectV4GitHubSchedulerSleep(Platform.isDesktopApp === true),
       });
     } else this.githubClient = undefined as unknown as GitHubClient
+  }
+
+  /** Inspect actual persisted migration readiness without granting activation. */
+  private async openInstalledCutoverReadiness(): Promise<void> {
+    if (this.unloaded || this.recoveryReadOnlyCommandInProgress) return
+    const runtime = this.v4Runtime
+    const epoch = this.recoveryReadOnlyEpoch
+    const current = () => !this.unloaded && this.v4Runtime === runtime && this.recoveryReadOnlyEpoch === epoch
+    this.recoveryReadOnlyCommandInProgress = true
+    try {
+      new Notice("GitHub Sync: Verifying physical Vault, Source, Backup, Destination and staged recovery (read-only). Sync stays paused if a migration is pending.", 8000)
+      const report = await runtime.inspectInstalledCutoverReadinessFromDisk()
+      if (!current()) return
+      const verified = report?.observation === "authenticated-pre-cutover-destination-still-fenced"
+        && report.integrityScope === "read-only-installed-pre-cutover-wal-backup-and-destination"
+        && report.walAuthenticated === true && report.backupReverified === true && report.destinationReverified === true
+        && report.shadowReverified === true && report.stagedSecretReverified === true
+        && report.physicalParityReverified === true && report.sourceRefReverified === true
+        && report.cutoverAuthorized === false && report.localCutoverAuthorized === false
+        && report.resumeSyncAuthorized === false && report.oldPassphraseCleanupAuthorized === false
+        && report.powerLossDurabilityProven === false
+        && report.destinationIndexActivated === undefined && report.destinationSettingsWrittenFenced === undefined
+      if (!verified) {
+        new Notice("GitHub Sync: Cutover readiness could not be verified or is not applicable. Keep recovery files and both passphrases if a migration is pending. Use Re-encryption Recovery; no activation was attempted.", 12000)
+      } else if (report.settingsCutoverObservation === "destination-settings-observed-fenced") {
+        new Notice("GitHub Sync: Destination Settings, physical Vault and migration evidence verified. Index activation is still disabled; Sync stays paused. Keep both passphrases.", 12000)
+      } else if (report.settingsCutoverObservation === "source-settings-intent-pending") {
+        new Notice("GitHub Sync: Source Settings remain selected with a pending Cutover intent. Migration evidence verified, but Settings completion requires Manual Recovery. Sync stays paused.", 12000)
+      } else if (report.settingsCutoverObservation === undefined) {
+        new Notice("GitHub Sync: Physical Vault and staged migration evidence verified before Settings Cutover. Cutover and Sync remain disabled; keep both passphrases.", 12000)
+      } else {
+        new Notice("GitHub Sync: Unrecognized Cutover state. Preserve both keys and recovery files; use Manual Recovery.", 12000)
+      }
+    } catch {
+      if (current()) new Notice("GitHub Sync: Read-only Cutover readiness check unavailable. No activation was attempted.", 12000)
+    } finally {
+      if (this.recoveryReadOnlyEpoch === epoch) this.recoveryReadOnlyCommandInProgress = false
+    }
   }
 
   /** Installed recovery entry point. No branch/commit input from the user;
