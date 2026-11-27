@@ -2471,11 +2471,14 @@ export class V4PluginRuntime {
     diagnostic?: true
     repairMissing?: true
     checkpointIndex?: true
-    expectActiveRoute?: true
+    expectActiveRoute?: boolean
   }): Promise<string> {
-    if (!await this.adapter.exists(V4_INSTALLED_ACTIVE_ROUTE_PATH)) {
-      if (input.settingsSaveCandidate || input.diagnostic || input.expectActiveRoute) throw new V4ReencryptionSyncFencedError()
+    const active = await this.readInstalledActiveRoutePresence()
+    if (input.expectActiveRoute !== undefined && active !== input.expectActiveRoute) throw new V4ReencryptionSyncFencedError()
+    if (!active) {
+      if (input.settingsSaveCandidate || input.diagnostic) throw new V4ReencryptionSyncFencedError()
       await assertV4ReencryptionSyncFenceClear(this.adapter)
+      this.assertInstalledSyncRouteBacking()
       return V4_INDEX_ROOT
     }
     try {
@@ -2593,9 +2596,31 @@ export class V4PluginRuntime {
     }
   }
 
-  private async assertInstalledSyncRouteMayBeChecked(operation: V4SyncRequest["operation"]): Promise<void> {
-    if (operation === "normal" && await this.adapter.exists(V4_INSTALLED_ACTIVE_ROUTE_PATH)) return
-    await assertV4ReencryptionSyncFenceClear(this.adapter)
+  private assertInstalledSyncRouteBacking(): void {
+    if (this.disposed || this.reencryptionFencePending || !this.indexAdapterBacking
+      || this.plugin.app.vault.adapter !== this.indexAdapterBacking) throw new V4ReencryptionSyncFencedError()
+  }
+
+  private async readInstalledActiveRoutePresence(): Promise<boolean> {
+    try {
+      this.assertInstalledSyncRouteBacking()
+      const active = await this.adapter.exists(V4_INSTALLED_ACTIVE_ROUTE_PATH)
+      this.assertInstalledSyncRouteBacking()
+      if (active !== true && active !== false) throw new V4ReencryptionSyncFencedError()
+      return active
+    } catch { throw new V4ReencryptionSyncFencedError() }
+  }
+
+  private async assertInstalledSyncRouteMayBeChecked(operation: V4SyncRequest["operation"], expectedActive?: boolean): Promise<boolean> {
+    const active = await this.readInstalledActiveRoutePresence()
+    if (expectedActive !== undefined && active !== expectedActive) throw new V4ReencryptionSyncFencedError()
+    if (active) {
+      if (operation !== "normal") throw new V4ReencryptionSyncFencedError()
+    } else {
+      await assertV4ReencryptionSyncFenceClear(this.adapter)
+    }
+    this.assertInstalledSyncRouteBacking()
+    return active
   }
 
   /**
@@ -2772,8 +2797,7 @@ export class V4PluginRuntime {
       trigger: request.trigger,
     })
     try {
-      await this.assertInstalledSyncRouteMayBeChecked(request.operation)
-      const activeRouteAtStart = await this.adapter.exists(V4_INSTALLED_ACTIVE_ROUTE_PATH)
+      const activeRouteAtStart = await this.assertInstalledSyncRouteMayBeChecked(request.operation)
       if (this.uncVault && !this.networkStorageNoticeShown) {
         this.networkStorageNoticeShown = true
         new Notice(`GitHub Sync: UNC network vault detected. ${V4_NETWORK_VAULT_WARNING}`, 10000)
@@ -2791,7 +2815,7 @@ export class V4PluginRuntime {
         const attemptScope = this.scopePredicate(attemptSettings)
         try {
           throwIfV4Aborted(signal)
-          await this.assertInstalledSyncRouteMayBeChecked(request.operation)
+          await this.assertInstalledSyncRouteMayBeChecked(request.operation, activeRouteAtStart)
           progressAttempt++
           this.progressStore.update({
             phase: "checking-remote",
@@ -2821,7 +2845,7 @@ export class V4PluginRuntime {
             ? await this.keyringForConfig(authenticationConfig, passphrase, signal, runCredentialGeneration)
             : undefined
           const routeInput = { settings, github, config, keyring, credentialGeneration: runCredentialGeneration, operation: request.operation,
-            ...(activeRouteAtStart ? { expectActiveRoute: true as const } : {}) }
+            expectActiveRoute: activeRouteAtStart }
           const indexRoot = await this.resolveInstalledSyncIndexRoot({ ...routeInput, ...(request.trigger === "manual" && configSelection.source === "observed-remote" ? { repairMissing: true as const } : {}) })
           if (indexRoot !== V4_INDEX_ROOT && configSelection.source !== "observed-remote") throw new V4ReencryptionSyncFencedError()
           if (request.trigger === "startup") this.plugin.enableWatch()

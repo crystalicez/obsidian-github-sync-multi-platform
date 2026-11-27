@@ -1557,6 +1557,44 @@ test("D173 live V4 runtime pauses every Sync trigger and Force operation before 
   fixture.runtime.dispose()
 })
 
+test("D528 Sync refuses missing, replaced or unstable route adapter before mutation", async () => {
+  for (const cause of ["missing", "swapped-before", "swapped-during-route", "swapped-during-fence", "unreadable-route", "nonboolean-route", "route-disappears", "route-appears", "route-appears-after-config"] as const) {
+    const f = plaintextRuntimeFixture()
+    Object.assign(f.plugin, { disableWatch() { f.plugin.isWatchEnabled = false } })
+    const adapter = f.indexAdapter
+    const route = ".obsidian/plugins/test/github-sync-v4-rekey-runtime-route/active-destination.json"
+    const fence = ".obsidian/plugins/test/github-sync-v4-rekey-sync-fence"
+    let routeReads = 0
+    if (cause === "missing") Object.assign(f.plugin.app.vault, { adapter: undefined })
+    if (cause === "swapped-before") Object.assign(f.plugin.app.vault, { adapter: { ...adapter } })
+    adapter.exists = async path => {
+      if (path === route) {
+        routeReads++
+        if (cause === "swapped-during-route") Object.assign(f.plugin.app.vault, { adapter: { ...adapter } })
+        if (cause === "unreadable-route") throw Error("private adapter exception")
+        if (cause === "nonboolean-route") return undefined as unknown as boolean
+        if (cause === "route-disappears") return routeReads === 1
+        if (cause === "route-appears") return routeReads >= 2
+        if (cause === "route-appears-after-config") return routeReads >= 3
+      }
+      if (path === fence && cause === "swapped-during-fence") Object.assign(f.plugin.app.vault, { adapter: { ...adapter } })
+      return false
+    }
+    const original = new Map(f.contents)
+    const result = await f.runtime.manualSync()
+    assert.deepEqual(result, { status: "failed", changedFiles: 0 }, cause)
+    assert.match(f.runtime.progressSnapshot.errorMessage ?? "", /Re-encryption is pending/i, cause)
+    if (cause === "route-appears-after-config") assert.ok(f.github.refReads > 0, cause)
+    else assert.equal(f.github.refReads, 0, cause)
+    assert.equal(f.github.blobAttempts, 0, cause)
+    assert.deepEqual(f.contents, original, cause)
+    assert.equal(f.indexFiles.size, 0, cause)
+    assert.equal(f.plugin.isWatchEnabled, false, cause)
+    assert.deepEqual(await f.runtime.scheduledSync(), { status: "skipped", changedFiles: 0 }, cause)
+    f.runtime.dispose()
+  }
+})
+
 test("v4 runtime retains terminal timings until the next run begins", async () => {
   const fixture = plaintextRuntimeFixture();
   await fixture.runtime.forcePush();
