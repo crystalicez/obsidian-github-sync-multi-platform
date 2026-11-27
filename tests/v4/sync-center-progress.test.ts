@@ -4,6 +4,7 @@ import test from "node:test";
 import { Notice, WorkspaceLeaf } from "obsidian";
 import { createIdleV4Progress, V4ProgressStore, type V4SyncProgressSnapshot } from "../../src/lib/v4/progress";
 import { V4SyncCenterView } from "../../src/views/sync-center";
+import { V4ReencryptionSyncFencedError } from "../../src/lib/v4/reencryption-sync-fence";
 import { V4HistoryNotInitializedError, V4HistoryPreviewLimitError, V4HistoryService } from "../../src/lib/v4/history-service";
 import { V4_FORMAT_VERSION } from "../../src/lib/v4/protocol-types";
 import { waitForCondition } from "../helpers/wait-for";
@@ -1014,6 +1015,25 @@ test("D436 missing first-use V4 history in Current file is guidance, not a GitHu
   } finally {
     await view.onClose();
   }
+});
+
+test("D529 Current file shows migration recovery guidance instead of unsynced or connection error", async () => {
+  const source = new FakeProgressSource();
+  let manualCalls = 0;
+  const plugin = createSyncCenterPluginFixture(source, () => undefined);
+  Object.assign(plugin, { runManualSyncFromUi: () => { manualCalls++; } });
+  plugin.v4Runtime.fileIdForPath = async () => { throw new V4ReencryptionSyncFencedError(); };
+  const view = new V4SyncCenterView(new WorkspaceLeaf(plugin.app), plugin as never);
+  try {
+    await view.onOpen();
+    view.contentEl.findByText("Current file")?.onclick?.();
+    await waitForCondition(() => view.contentEl.flattenText().includes("Current file history is unavailable"), "migration history guidance");
+    const guidance = view.contentEl.flattenText();
+    assert.match(guidance, /Keep the recovery files and both keys/u);
+    assert.match(guidance, /do not Force Sync/u);
+    assert.doesNotMatch(guidance, /has not been synced|Could not load history/u);
+    assert.equal(manualCalls, 0);
+  } finally { await view.onClose(); }
 });
 
 test("D435 changing commit pages clears the old selected commit and loads only the chosen page", async () => {

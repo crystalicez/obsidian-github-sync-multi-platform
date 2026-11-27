@@ -2307,17 +2307,36 @@ export class V4PluginRuntime {
 
   async fileIdForPath(path: string): Promise<string | null> {
     this.assertNotDisposed()
-    const loaded = await this.loadConfiguredRemoteConfig()
+    const owner = this.plugin.settings
+    const settings = { ...owner }
+    const github = this.plugin.githubClient
+    const credentialGeneration = this.credentialGeneration
+    const saveGeneration = this.plugin.settingsSaveGeneration
+    const assertOwner = () => {
+      this.assertInstalledSyncRouteBacking()
+      if (this.plugin.settings !== owner || JSON.stringify(owner) !== JSON.stringify(settings)
+        || this.plugin.githubClient !== github || this.credentialGeneration !== credentialGeneration
+        || this.plugin.settingsSaveGeneration !== saveGeneration || this.plugin.isSettingsSaveInProgress?.()) {
+        throw new V4ReencryptionSyncFencedError()
+      }
+    }
+    const active = await this.assertInstalledSyncRouteMayBeChecked("normal")
+    assertOwner()
+    const loaded = await this.loadConfiguredRemoteConfig(github, this.repoId(settings))
+    await this.assertInstalledSyncRouteMayBeChecked("normal", active)
+    assertOwner()
     if (!loaded) throw new V4HistoryNotInitializedError()
     assertV4PathLayoutCompatible(loaded.remoteConfig, loaded.config, "normal")
     const config = loaded.config
-    const settings = { ...this.plugin.settings }
-    const root = await this.adapter.exists(V4_INSTALLED_ACTIVE_ROUTE_PATH) ? await this.resolveInstalledSyncIndexRoot({
-      settings, github: this.plugin.githubClient, config,
-      keyring: config.mode === "encrypted" ? await this.keyringForConfig(config, settings.encryptionPassphrase) : undefined,
-      credentialGeneration: this.credentialGeneration, operation: "normal",
-    }) : V4_INDEX_ROOT
+    const root = await this.resolveInstalledSyncIndexRoot({
+      settings, github, config,
+      keyring: active && config.mode === "encrypted" ? await this.keyringForConfig(config, settings.encryptionPassphrase, undefined, credentialGeneration) : undefined,
+      credentialGeneration, operation: "normal", expectActiveRoute: active,
+    })
+    assertOwner()
     const index = await this.loadIndex(config, settings.vault, root)
+    await this.assertInstalledSyncRouteMayBeChecked("normal", active)
+    assertOwner()
     for (const shard of Object.values(index.shards)) {
       for (const record of Object.values(shard.records)) if (!record.deleted && record.path === path) return record.fileId
     }

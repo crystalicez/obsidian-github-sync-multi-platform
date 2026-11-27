@@ -888,8 +888,9 @@ test("D412 installed Runtime orchestrates Source -> Backup -> Staging -> Scratch
     assert.equal(runtime2.plugin.settings.scheduledSyncIntervalSeconds, 900)
     assert.equal(await runtime2.runtime.fileIdForPath("Notes/สวัสดี.md"), verifiedDest.sourceRecords.find(r => r.path === "Notes/สวัสดี.md")?.fileId)
     assert.deepEqual(await loadV4LocalIndex(vault.adapter, sourceRoot), oldRoot)
-    // Missing active marker does not authorize falling back to Source.
+    // Missing active marker does not authorize falling back to Source, even for History.
     await vault.adapter.remove(activePath)
+    await assert.rejects(() => runtime2.runtime.fileIdForPath("Notes/สวัสดี.md"), /Re-encryption is pending/i)
     await runtime2.runtime.manualSync()
     assert.equal(runtime2.runtime.progressSnapshot.lifecycle, "failed")
     assert.equal(server.refs.get(destinationBranch), nextDest)

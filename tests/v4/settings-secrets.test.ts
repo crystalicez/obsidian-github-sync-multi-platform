@@ -1595,6 +1595,46 @@ test("D528 Sync refuses missing, replaced or unstable route adapter before mutat
   }
 })
 
+test("D529 current file history never falls back to an uncertain migration Index", async () => {
+  for (const cause of ["pending-fence", "missing-adapter", "swapped-adapter", "nonboolean-route", "route-appears-during-config", "route-appears-during-index"] as const) {
+    const f = plaintextRuntimeFixture()
+    try {
+      await f.runtime.manualSync()
+      assert.equal(f.runtime.progressSnapshot.lifecycle, "success")
+      const id = await f.runtime.fileIdForPath("secret.md")
+      assert.ok(id, cause)
+      const adapter = f.indexAdapter
+      const route = ".obsidian/plugins/test/github-sync-v4-rekey-runtime-route/active-destination.json"
+      const fence = ".obsidian/plugins/test/github-sync-v4-rekey-sync-fence"
+      const exists = adapter.exists
+      const read = adapter.read
+      const remote = f.github.getGitRefOrNull.bind(f.github)
+      if (cause === "pending-fence") f.indexFiles.set(fence, "present")
+      if (cause === "missing-adapter") Object.assign(f.plugin.app.vault, { adapter: undefined })
+      if (cause === "swapped-adapter") Object.assign(f.plugin.app.vault, { adapter: { ...adapter } })
+      if (cause === "nonboolean-route") adapter.exists = async path => path === route ? undefined as unknown as boolean : exists(path)
+      if (cause === "route-appears-during-config") f.github.getGitRefOrNull = async () => {
+        const result = await remote()
+        f.indexFiles.set(route, "unverified")
+        return result
+      }
+      if (cause === "route-appears-during-index") adapter.read = async path => {
+        const result = await read(path)
+        if (path.endsWith("/index.json")) f.indexFiles.set(route, "unverified")
+        return result
+      }
+      const refReads = f.github.refReads
+      const blobs = f.github.blobAttempts
+      const original = new Map(f.contents)
+      await assert.rejects(() => f.runtime.fileIdForPath("secret.md"), /Re-encryption is pending/i, cause)
+      if (!cause.includes("during")) assert.equal(f.github.refReads, refReads, cause)
+      assert.equal(f.github.blobAttempts, blobs, cause)
+      assert.deepEqual(f.contents, original, cause)
+      assert.equal(f.runtime.progressSnapshot.lifecycle, "success", "read-only History must not alter Sync status")
+    } finally { f.runtime.dispose() }
+  }
+})
+
 test("v4 runtime retains terminal timings until the next run begins", async () => {
   const fixture = plaintextRuntimeFixture();
   await fixture.runtime.forcePush();

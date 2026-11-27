@@ -3,6 +3,7 @@ import type FastSync from "../main"
 import { missingGitHubSyncConfigFields } from "../lib/sync-policy"
 import { createV4HistoricalMarkdownCopy } from "../lib/v4/history-recovery"
 import { V4_SYNC_PAUSED_GUIDANCE } from "../lib/v4/status"
+import { V4ReencryptionSyncFencedError } from "../lib/v4/reencryption-sync-fence"
 import { V4HistoryNotInitializedError, V4HistoryPreviewLimitError, type V4HistoryChange, type V4HistoryCommit, type V4HistoryService, type V4VersionPreview } from "../lib/v4/history-service"
 import {
   formatV4Duration,
@@ -626,6 +627,14 @@ export class V4SyncCenterView extends ItemView {
 
   private releaseObjectUrl(): void { if (this.objectUrl) URL.revokeObjectURL(this.objectUrl); this.objectUrl = undefined }
   private renderError(container: HTMLElement, error: unknown): void {
+    if (error instanceof V4ReencryptionSyncFencedError) {
+      container.empty()
+      container.createEl("p", {
+        text: "Current file history is unavailable while the migration Index or local route cannot be verified. Keep the recovery files and both keys. Review Re-encryption Recovery before retrying; do not Force Sync to repair history.",
+        cls: "github-sync-center__muted",
+      })
+      return
+    }
     if (error instanceof V4HistoryPreviewLimitError) {
       const message = "This version cannot be previewed: decoded content is limited to 5 MiB and encrypted Pack archives to 8 MiB. The file or its remote size metadata exceeds a safe preview limit. No Vault or GitHub files were changed."
       container.empty()
