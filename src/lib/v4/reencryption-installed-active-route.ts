@@ -192,29 +192,39 @@ export async function activateV4InstalledDestinationIndex(input: Scope & {
     settingsSha256: await settingsDigest(input, 2), intentSha256: await digest(await read(adapter, V4_INSTALLED_CUTOVER_INTENT_PATH)),
     fenceSha256: await digest(await read(adapter, fencePath)),
   }
-  if (await adapter.exists(V4_INSTALLED_ACTIVE_ROUTE_PATH)) throw Error("Active route already committed.")
+  const exists = async (p: string): Promise<boolean> => {
+    const result = await adapter.exists(p)
+    if (result !== true && result !== false) throw Error("Unverifiable activation artifact.")
+    input.assertOwner()
+    return result
+  }
+  if (await exists(V4_INSTALLED_ACTIVE_ROUTE_PATH)) throw Error("Active route already committed.")
   let text: string
   const parent = roots.selectorPath.slice(0, roots.selectorPath.lastIndexOf("/"))
-  if (await adapter.exists(roots.selectorPath)) {
+  if (await exists(roots.selectorPath)) {
     text = await read(adapter, roots.selectorPath)
     if (JSON.stringify(await decode(input, text)) !== JSON.stringify(route)) throw Error("Existing selector differs; Manual Recovery required.")
   } else {
     // An empty/torn selector directory is not permission to overwrite.
-    if (await adapter.exists(parent)) throw Error("Partial selector requires Manual Recovery.")
+    if (await exists(parent)) throw Error("Partial selector requires Manual Recovery.")
     const bytes = utf8ToBytes(JSON.stringify(route))
     try { text = JSON.stringify({ ciphertext: toBase64Url(await encryptV4Payload(input.key, bytes, context(input.repoId))) }) }
     finally { bytes.fill(0) }
     await input.assertProof()
     await verifyLocal(input, route, true)
-    if (await adapter.exists(parent) || await adapter.exists(V4_INSTALLED_ACTIVE_ROUTE_PATH)) throw Error("Concurrent selector.")
+    if (await exists(parent) || await exists(V4_INSTALLED_ACTIVE_ROUTE_PATH)) throw Error("Concurrent selector.")
     await adapter.mkdir(parent)
+    // mkdir is an awaited operation: recheck both commit artifacts before
+    // writing. Never overwrite evidence that appeared during that operation.
+    if (await exists(roots.selectorPath) || await exists(V4_INSTALLED_ACTIVE_ROUTE_PATH)) throw Error("Concurrent activation artifact.")
+    input.assertOwner()
     await adapter.write(roots.selectorPath, text)
     await input.checkpoint()
   }
   if (await read(adapter, roots.selectorPath) !== text || JSON.stringify(await decode(input, text)) !== JSON.stringify(route)) throw Error("Selector readback failed.")
   await input.assertProof()
   await verifyLocal(input, route, true)
-  if (await adapter.exists(V4_INSTALLED_ACTIVE_ROUTE_PATH) || await read(adapter, roots.selectorPath) !== text) throw Error("Activation evidence changed.")
+  if (await read(adapter, roots.selectorPath) !== text || await exists(V4_INSTALLED_ACTIVE_ROUTE_PATH)) throw Error("Activation evidence changed.")
   input.assertOwner()
   await adapter.write(V4_INSTALLED_ACTIVE_ROUTE_PATH, text)
   await input.checkpoint()

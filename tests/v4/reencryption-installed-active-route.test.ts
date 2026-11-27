@@ -12,7 +12,7 @@ import { activateV4InstalledDestinationIndex, resolveV4InstalledActiveIndexRoot,
 // Physical artifacts with deterministic I/O fault injection; trusted recovery
 // proof is a fixture here, independently exercised by the installed Runtime test.
 test("D521 selector and active route fail closed at every physical write boundary", async () => {
-  for (const fault of ["selector-torn", "selector-checkpoint", "route-torn", "route-ack-lost", "none"] as const) {
+  for (const fault of ["selector-appears-in-mkdir", "route-appears-in-mkdir", "nonboolean-active", "selector-torn", "selector-checkpoint", "route-torn", "route-ack-lost", "none"] as const) {
     await mkdir(".tmp", { recursive: true })
     const root = await mkdtemp(path.resolve(".tmp", "d521-active-route-"))
     const abs = (p: string) => path.join(root, p)
@@ -27,6 +27,8 @@ test("D521 selector and active route fail closed at every physical write boundar
     const roots = planV4ReencryptionSeparatedRoots(V4_RUNTIME_INDEX_ROOT, identity.runId)
     let inject = false
     let checkpoints = 0
+    const foreign = "unexpected-existing-artifact"
+    const selectorParent = roots.selectorPath.slice(0, roots.selectorPath.lastIndexOf("/"))
     const adapter = {
       read: (p: string) => readFile(abs(p), "utf8"),
       write: async (p: string, text: string) => {
@@ -37,8 +39,15 @@ test("D521 selector and active route fail closed at every physical write boundar
         await writeFile(abs(p), text)
         if (inject && fault === "route-ack-lost" && p === V4_INSTALLED_ACTIVE_ROUTE_PATH) throw Error("Lost test acknowledgement")
       },
-      mkdir: async (p: string) => { await mkdir(abs(p), { recursive: true }) },
-      exists: (p: string) => stat(abs(p)).then(() => true, () => false),
+      mkdir: async (p: string) => {
+        await mkdir(abs(p), { recursive: true })
+        if (inject && p === selectorParent && fault === "selector-appears-in-mkdir") await writeFile(abs(roots.selectorPath), foreign)
+        if (inject && p === selectorParent && fault === "route-appears-in-mkdir") await writeFile(abs(V4_INSTALLED_ACTIVE_ROUTE_PATH), foreign)
+      },
+      exists: async (p: string) => {
+        if (inject && p === V4_INSTALLED_ACTIVE_ROUTE_PATH && fault === "nonboolean-active") return undefined as unknown as boolean
+        return stat(abs(p)).then(() => true, () => false)
+      },
     }
     const key = new Uint8Array(32).fill(9)
     const data = { settings: { githubBranch: "destination", encryptionPassphraseSecretId: "destination-id" } }
@@ -66,6 +75,21 @@ test("D521 selector and active route fail closed at every physical write boundar
       if (fault === "none") assert.equal(await activateV4InstalledDestinationIndex(input), roots.shadowIndexRoot)
       else await assert.rejects(() => activateV4InstalledDestinationIndex(input))
       inject = false
+      if (fault === "selector-appears-in-mkdir" || fault === "route-appears-in-mkdir" || fault === "nonboolean-active") {
+        if (fault === "selector-appears-in-mkdir") {
+          assert.equal(await adapter.read(roots.selectorPath), foreign)
+          assert.equal(await adapter.exists(V4_INSTALLED_ACTIVE_ROUTE_PATH), false)
+        } else if (fault === "route-appears-in-mkdir") {
+          assert.equal(await adapter.read(V4_INSTALLED_ACTIVE_ROUTE_PATH), foreign)
+          assert.equal(await adapter.exists(roots.selectorPath), false)
+        } else {
+          assert.equal(await adapter.exists(V4_INSTALLED_ACTIVE_ROUTE_PATH), false)
+          assert.equal(await adapter.exists(roots.selectorPath), false)
+        }
+        await assert.rejects(() => resolveV4InstalledActiveIndexRoot(input))
+        assert.deepEqual(await loadV4LocalIndex(adapter, roots.sourceIndexRoot), sourceBefore)
+        continue
+      }
       if (fault === "selector-checkpoint") {
         assert.equal(await adapter.exists(V4_INSTALLED_ACTIVE_ROUTE_PATH), false)
         await assert.rejects(() => resolveV4InstalledActiveIndexRoot(input))
