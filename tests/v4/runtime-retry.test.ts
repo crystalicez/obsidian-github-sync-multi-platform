@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { createRuntimeMemoryIndexAdapter } from "./runtime-memory-index-adapter";
 import { TFile } from "obsidian";
 
 import type { GitHubCreateTreeEntry } from "../../src/lib/github-git-types";
@@ -85,6 +86,7 @@ class MemoryGitHub {
 
 class MemoryObsidianVault {
   configDir = ".obsidian";
+  readonly adapter = createRuntimeMemoryIndexAdapter();
   readonly bytes = new Map<string, Uint8Array>();
   readonly files = new Map<string, TFile>();
 
